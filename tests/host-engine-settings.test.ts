@@ -11,6 +11,9 @@ import { startHubControl } from "../src/hub/service.js";
 import { LocalHostClient } from "../src/host-cli/client.js";
 import { runHostCli } from "../src/host-cli/cli.js";
 import { BotManager } from "../src/hub/bot-manager.js";
+import { resolveBridgeConfig } from "../src/config.js";
+import { inspectEngines } from "../src/host-cli/doctor.js";
+import { buildHostEnvironment } from "../src/host-cli/environment.js";
 
 const roots: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -33,6 +36,24 @@ it("persists explicit paths without executing, and reset restores the original e
   expect(f.env.CODEX_EXECUTABLE).toBe(process.execPath);
   const cleared = await f.settings.update({ engine: "codex", path: null, requestId: "reset", revision: set.revision }, apply => apply());
   expect(cleared.engines.find(e => e.id === "codex")).toMatchObject({ source: "environment", override: null, executable: process.execPath });
+});
+it("keeps saved DeepSeek paths ahead of environment defaults and fails closed after removal", async () => {
+  const f = await fixture();
+  await f.settings.update({ engine: "deepseek", path: f.executable, requestId: "dsh", revision: "default" }, apply => apply());
+  const env = hostEngineEnvironment(f.root, f.env);
+  expect(resolveBridgeConfig(env).deepseekExecutable).toBe(f.executable);
+  expect(inspectEngines(env).find(row => row.engine === "deepseek")?.executable).toBe(f.executable);
+  expect(f.settings.status().engines.find(row => row.id === "deepseek")).toMatchObject({ source: "setting", executable: f.executable });
+  await rm(f.executable);
+  expect(f.settings.status().engines.find(row => row.id === "deepseek")).toMatchObject({ source: "setting", available: false });
+  expect(inspectEngines(env).find(row => row.engine === "deepseek")?.installed).toBe(false);
+  expect(resolveBridgeConfig(env).deepseekExecutable).toBe(f.executable);
+});
+it.skipIf(process.platform === "win32")("does not apply Windows DeepSeek environment normalization on Unix", async () => {
+  const f = await fixture(), env = { HOME: f.home, PATH: "", dsh_executable: f.executable };
+  expect(hostEngineEnvironment(f.root, env)).toMatchObject({ dsh_executable: f.executable });
+  expect(hostEngineEnvironment(f.root, env).DSH_EXECUTABLE).toBeUndefined();
+  expect(() => buildHostEnvironment({ home: f.home, env: { ...env, DSH_EXECUTABLE: `"${f.executable}"` } })).toThrow("host_service_engine_override_absolute_path_required");
 });
 it("rejects invalid files and paths without changing the saved settings", async () => {
   const f = await fixture();

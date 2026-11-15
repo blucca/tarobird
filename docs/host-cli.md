@@ -315,6 +315,10 @@ tarobot bus prepare --coordinator COORDINATOR_BOT_ID --members MEMBER_ID,OTHER_M
 
 先在同一系统用户下完成各引擎登录或配置。`doctor` 检查终端与后台服务的可执行文件，**找到程序不代表账号已经登录或模型额度可用**。不会擅自发起收费模型调用。
 
+Windows 的 DeepSeek 自动检测保留显式路径和 npm CLI 的优先级，接着使用已有 PATH；都未找到时，再检查 `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd`。不需要自己创建 npm 转发脚本。自定义安装位置可在「引擎程序」设置中手动指定，或使用 `DSH_EXECUTABLE`；保存的主机设置优先于环境变量，路径失效不会自动换成另一份 CLI。
+
+检测只确认 CLI 文件存在。TaroBird 使用 `dsh web`：CLI 已找到但 web profile 缺失或损坏，属于运行环境未就绪，不能据此改报“CLI 未安装”。自动发现不会创建或修复 profile。
+
 ```sh
 tarobot bots catalog
 tarobot bots create --name "写作助手" --engine claude

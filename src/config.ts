@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { normalizeInstanceName } from "./instance.js";
 import type { AppConfig } from "./types.js";
+import { resolveDeepSeekExecutable } from "./runtime/deepseek-executable.js";
 
 export interface EnvSource {
   BRAVE_API_KEY?: string;
@@ -14,6 +15,9 @@ export interface EnvSource {
   TAROBOT_MAX_CONCURRENT_TURNS?: string;
   HOME?: string;
   APPDATA?: string;
+  LOCALAPPDATA?: string;
+  PATH?: string;
+  PATHEXT?: string;
   USERPROFILE?: string;
   CODEX_HOME?: string;
   CLAUDE_CONFIG_DIR?: string;
@@ -126,24 +130,6 @@ function resolveDefaultKimiExecutable(env: EnvSource): string {
   return "kimi";
 }
 
-function resolveDefaultDeepSeekExecutable(env: EnvSource): string {
-  if (env.DSH_EXECUTABLE) {
-    return normalizeExecutablePath(env.DSH_EXECUTABLE);
-  }
-
-  if (isWindows) {
-    const appData = env.APPDATA
-      ?? (env.USERPROFILE ? path.join(env.USERPROFILE, "AppData", "Roaming") : undefined);
-    if (appData) {
-      const windowsDshCmd = path.join(appData, "npm", "dsh.cmd");
-      if (existsSync(windowsDshCmd)) {
-        return windowsDshCmd;
-      }
-    }
-  }
-  return "dsh";
-}
-
 function resolveDeepSeekHome(env: EnvSource): string {
   if (env.DSH_HOME?.trim()) {
     return normalizeExecutablePath(env.DSH_HOME);
@@ -210,7 +196,7 @@ function resolveBaseConfig(env: EnvSource, telegramBotToken: string): AppConfig 
     sessionStatePath: joinStatePath(stateDir, "session.json"),
     runtimeLogPath: joinStatePath(stateDir, "runtime.log"),
     codexExecutable: resolveDefaultCodexExecutable(env),
-    deepseekExecutable: resolveDefaultDeepSeekExecutable(env),
+    deepseekExecutable: resolveDeepSeekExecutable(env),
     deepseekHome: resolveDeepSeekHome(env),
     kimiExecutable: resolveDefaultKimiExecutable(env),
     antigravityExecutable: resolveDefaultAntigravityExecutable(env),

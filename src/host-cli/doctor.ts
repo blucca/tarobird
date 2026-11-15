@@ -4,6 +4,7 @@ import { hostEngineEnvironment } from "../runtime/host-engine-settings.js";
 import { readHubConfig } from "../hub/config.js";
 import { inspectHubService } from "../hub/service.js";
 import { resolveEngineExecutable } from "../runtime/engine-process.js";
+import { deepseekExecutableOverride, resolveDeepSeekExecutable } from "../runtime/deepseek-executable.js";
 import { HubDatabase } from "../hub/database.js";
 import { exists, resolveDesktopHostDirectory } from "./paths.js";
 import { readHostProfile } from "./setup.js";
@@ -17,7 +18,7 @@ export function inspectEngines(env: NodeJS.ProcessEnv = process.env) {
   return ([
     ["codex", env.CODEX_EXECUTABLE || "codex"], ["claude", env.CLAUDE_EXECUTABLE || "claude"],
     ["antigravity", env.ANTIGRAVITY_EXECUTABLE || "agy"], ["kimi", env.KIMI_EXECUTABLE || "kimi"],
-    ["deepseek", env.DSH_EXECUTABLE || "dsh"],
+    ["deepseek", resolveDeepSeekExecutable(env)],
   ] as const).map(([engine, command]) => {
     const executable = resolveEngineExecutable(command, env);
     return { engine, installed: !!executable, ...(executable ? { executable } : {}), authentication: "unverified" as const };
@@ -48,8 +49,9 @@ export async function inspectHost(directory: string, env: NodeJS.ProcessEnv = pr
     const search = lookup("PATH");
     if (search && !/[\x00-\x1f\x7f]/.test(search)) fallback.PATH = search;
     for (const key of HOST_ENGINE_EXECUTABLE_KEYS) {
-      const value = lookup(key);
-      if (value && path.isAbsolute(value) && !/[\x00-\x1f\x7f]/.test(value)) fallback[key] = value;
+      const raw = lookup(key);
+      const value = process.platform === "win32" && key === "DSH_EXECUTABLE" ? deepseekExecutableOverride({ DSH_EXECUTABLE: raw }) : raw;
+      if (raw && value && path.isAbsolute(value) && !/[\x00-\x1f\x7f]/.test(raw)) fallback[key] = value;
     }
     // The fallback still applies the Host's saved paths: reporting a different
     // program than the Host would start, or hiding a damaged file, is a silent fallback.

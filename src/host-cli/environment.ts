@@ -3,6 +3,7 @@ import { access, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { discoverEngineDirectories } from "./engine-discovery.js";
+import { deepseekExecutableOverride } from "../runtime/deepseek-executable.js";
 
 export const HOST_ENGINE_EXECUTABLE_KEYS = ["CODEX_EXECUTABLE", "CLAUDE_EXECUTABLE", "ANTIGRAVITY_EXECUTABLE", "KIMI_EXECUTABLE", "DSH_EXECUTABLE"] as const;
 export const HOST_CONFIG_DIRECTORY_KEYS = ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "DSH_HOME", "KIMI_CODE_HOME"] as const;
@@ -46,7 +47,11 @@ export function buildHostEnvironment(options: HostEnvironmentOptions = {}): Reco
     if (extensions.length) environment.PATHEXT = extensions.join(";");
   }
   for (const key of HOST_ENGINE_EXECUTABLE_KEYS) if (lookup(key)) {
-    const value = lookup(key)!;
+    const raw = lookup(key)!;
+    // Match the DeepSeek worker's quoted-path support without trimming away
+    // invalid control characters or changing the other engines' validation.
+    const value = windows && key === "DSH_EXECUTABLE" && !/[\x00-\x1f\x7f]/.test(raw)
+      ? deepseekExecutableOverride({ DSH_EXECUTABLE: raw }, platform) ?? raw : raw;
     if (!p.isAbsolute(value)) throw new Error(`host_service_engine_override_absolute_path_required: ${key}`);
     environment[key] = value;
   }

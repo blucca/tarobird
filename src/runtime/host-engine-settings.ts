@@ -40,6 +40,13 @@ export function hostEngineEnvironment(directory: string, base: NodeJS.ProcessEnv
   // The entrypoint already built the baseline PATH. Do not prepend the desktop
   // defaults again: callers can deliberately supply an isolated environment.
   const env = { ...base }, home = process.platform === "win32" ? base.USERPROFILE ?? base.HOME : base.HOME ?? base.USERPROFILE;
+  if (process.platform === "win32") {
+    // Canonicalize only a real inherited override, never an auto-discovered
+    // path. Worker-local bot.env must not outrank a differently-cased Host key.
+    const explicit = base.DSH_EXECUTABLE ?? Object.entries(base).find(([key, value]) => key.toUpperCase() === "DSH_EXECUTABLE" && value !== undefined)?.[1];
+    for (const key of Object.keys(env)) if (key !== "DSH_EXECUTABLE" && key.toUpperCase() === "DSH_EXECUTABLE") delete env[key];
+    if (explicit !== undefined) env.DSH_EXECUTABLE = explicit;
+  }
   if (home && process.platform !== "win32") env.PATH = [...new Set([...(base.PATH ?? "").split(path.delimiter).filter(Boolean), ...discoverEngineDirectories(home, base, process.platform)])].join(path.delimiter);
   for (const engine of hostEngineSchema.options) if (settings.paths[engine]) env[ENGINE_ENV_KEYS[engine]] = settings.paths[engine];
   return env;

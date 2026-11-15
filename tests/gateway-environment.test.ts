@@ -4,6 +4,7 @@ import path from "node:path";
 import { expect, it } from "vitest";
 import { loadGatewayEnvironment } from "../src/gateway/environment.js";
 import { createGatewayBridge } from "../src/gateway/worker.js";
+import { resolveDeepSeekExecutable } from "../src/runtime/deepseek-executable.js";
 
 it("initializes Kimi workspace instructions with the Gateway profile before the first turn", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "gateway-kimi-startup-"));
@@ -33,5 +34,20 @@ it("loads shared MCP credentials and instance ASR settings without changing engi
     expect(await loadGatewayEnvironment(state, "alpha", { HOME: home, CODEX_HOME: "/explicit/codex", CLAUDE_CONFIG_DIR: "/explicit/claude", IFIND_TOKEN: "process-token" })).toMatchObject({ CODEX_HOME: "/explicit/codex", CLAUDE_CONFIG_DIR: "/explicit/claude", IFIND_TOKEN: "process-token" });
     const fresh = path.join(home, "hub", "bots", "fresh"); await mkdir(fresh);
     expect(await loadGatewayEnvironment(fresh, "fresh", { HOME: home })).toMatchObject({ IFIND_TOKEN: "shared-token", BRAVE_API_KEY: "shared-brave" });
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+it("does not let automatic DeepSeek discovery mask the Bot's explicit runtime setting", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "gateway-dsh-env-"));
+  try {
+    const state = path.join(home, "bot"); await mkdir(state);
+    const custom = path.join(home, "custom-dsh");
+    await writeFile(path.join(state, "bot.env"), `DSH_EXECUTABLE=${custom}\n`);
+    const base: NodeJS.ProcessEnv = { HOME: home, USERPROFILE: home, PATH: "" };
+    resolveDeepSeekExecutable(base);
+    expect(base.DSH_EXECUTABLE).toBeUndefined();
+    const loaded = await loadGatewayEnvironment(state, "example", base);
+    expect(resolveDeepSeekExecutable(loaded)).toBe(custom);
+    expect(resolveDeepSeekExecutable(await loadGatewayEnvironment(state, "example", { ...base, DSH_EXECUTABLE: process.execPath }))).toBe(process.execPath);
   } finally { await rm(home, { recursive: true, force: true }); }
 });

@@ -9,7 +9,7 @@ import { executableCandidates, npmShimEntrypoint } from "../src/runtime/engine-p
 let directory: string | undefined;
 afterEach(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
 it("uses bounded, case-insensitive, per-host Windows named pipes, including long Unicode paths", () => {
-  const dir = "C:\\Users\\测试用户\\AppData\\Roaming\\" + "long".repeat(80);
+  const dir = "C:\\Users\\example\\AppData\\Roaming\\测试路径\\" + "long".repeat(80);
   const pipe = controlPath(dir, "win32");
   expect(pipe).toMatch(/^\\\\\.\\pipe\\tarobot-hub-[a-f0-9]{64}$/);
   expect(controlPath(dir.toUpperCase(), "win32")).toBe(pipe);
@@ -20,6 +20,7 @@ it("finds Windows executable and npm shims using Path/PATHEXT without searching 
   expect(executableCandidates("codex", env, "win32")).toContain("C:\\Users\\Test\\AppData\\Roaming\\npm\\codex.CMD");
   expect(executableCandidates('"C:\\Tools\\claude.exe"', env, "win32")).toEqual(["C:\\Tools\\claude.exe"]);
   expect(executableCandidates("codex", { Path: ";;" }, "win32")).toEqual([]);
+  for (const invalid of ["", "   ", '""', "dsh\u0000"]) expect(executableCandidates(invalid, env, "win32")).toEqual([]);
 });
 it("resolves npm JS launchers directly, retaining spaces and scoped packages", async () => {
   directory = await mkdtemp(path.join(os.tmpdir(), "tb-shim-"));
@@ -29,6 +30,17 @@ it("resolves npm JS launchers directly, retaining spaces and scoped packages", a
   await writeFile(shim, '@ECHO OFF\r\n"%_prog%" "%dp0%\\node_modules\\@example\\cli\\main.mjs" %*\r\n');
   expect(npmShimEntrypoint(shim)).toBe(entry);
   await writeFile(shim, '@ECHO OFF\r\necho custom launcher\r\n');
+  expect(npmShimEntrypoint(shim)).toBeUndefined();
+});
+it("does not rewrite the Desktop Harness launcher as a Node npm shim", async () => {
+  directory = await mkdtemp(path.join(os.tmpdir(), "dsh-desktop-shim-"));
+  const bin = path.join(directory, "resources", "runtime", "cli", "bin");
+  const entry = path.join(directory, "resources", "app.asar", "dsh", "node_modules", "@deepseek-ai", "dsh-desktop-host", "lib", "cli.js");
+  await mkdir(bin, { recursive: true }); await mkdir(path.dirname(entry), { recursive: true }); await writeFile(entry, "");
+  const shim = path.join(bin, "dsh.cmd");
+  // Upstream apps/desktop/cli/dsh.cmd, blob 73af33537af9d5220784917ed361caf8ab3c9b03.
+  // Preserve its Electron runtime, flag and environment instead of substituting Node.
+  await writeFile(shim, '@echo off\r\nsetlocal DisableDelayedExpansion\r\nset "ELECTRON_RUN_AS_NODE=1"\r\n"%~dp0..\\..\\..\\..\\DeepSeek Harness.exe" --expose-internals "%~dp0..\\..\\..\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js" %*\r\nexit /b %errorlevel%\r\n');
   expect(npmShimEntrypoint(shim)).toBeUndefined();
 });
 it("rejects unauthenticated stop requests and closes its control channel cleanly", async () => {

@@ -55,13 +55,56 @@ running login shells, interactive profiles, installers or engine programs.
 New Bot still refreshes its model catalog through the existing model-discovery
 code, which can invoke a detected CLI; no Bot task or restart is submitted. Shell-only custom paths,
 unsupported selectors and nonstandard installations can use the manual path.
-Windows keeps its existing automatic discovery and gains the same manual
-setting/API. Existing service manifests retain their captured environment.
+Windows retains the same manual setting/API. The later DeepSeek Desktop
+fallback is described below. Existing service manifests retain their captured environment.
 
 The layouts follow the upstream [nvm usage](https://github.com/nvm-sh/nvm#usage),
 [fnm alias implementation](https://github.com/Schniz/fnm/blob/master/src/alias.rs)
 and [fnm base directory order](https://github.com/Schniz/fnm/blob/master/src/directories.rs).
 This change upgrades no dependencies or engine CLIs.
+
+## Windows DeepSeek Desktop discovery
+
+The shared `runtime/deepseek-executable.ts` policy is used by worker config,
+Bot availability, the settings API, and CLI `init`/`status`/`doctor` discovery.
+Saved Host settings still override Host environment values; Bot-specific
+`bot.env` remains a worker-local fallback for explicit runtime settings.
+An invalid explicit path never falls back to another installation.
+Windows normalizes the case of an existing DSH_EXECUTABLE before loading a
+Bot's environment, so a lowercase Host key cannot lose precedence. Quoted
+DeepSeek paths, including surrounding spaces, are accepted consistently by
+Windows worker and service/Doctor validation. Doctor retains that override
+when an unrelated environment error requires its diagnostic fallback.
+
+Without an explicit override, Windows selects the existing npm `dsh.cmd`, then
+an existing controlled-PATH command, then the single default Desktop launcher:
+`%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd`.
+Missing APPDATA/LOCALAPPDATA may be derived from an absolute USERPROFILE.
+Invalid roots are ignored when deriving DeepSeek installation candidates;
+existing controlled-PATH rules are preserved, including relative PATH entries.
+Non-file candidates are ignored. Custom and machine-wide
+installations use the existing manual path setting. No directory/registry scan
+or executable probe is added. Detection does not modify PATH, persist a
+discovered DSH_EXECUTABLE, or restart a running Bot. This preserves existing
+PATH choices, Bot overrides, automatic-source labels and service manifests.
+Other engines' discovery priorities and macOS/Linux manager discovery are
+unchanged. The shared executable resolver now rejects empty names and names
+containing control characters for every engine and platform.
+
+CLI presence is separate from authentication and web-profile readiness. The
+[official Desktop launcher](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/desktop/cli/dsh.cmd)
+uses its own Electron runtime; its command, flags and environment must be
+preserved. The pinned launcher fixture guards against treating it as an npm
+Node entrypoint. Discovery tests do not prove that a Desktop installation can
+run a complete TaroBird Bot session.
+
+Coverage: `deepseek-windows-discovery` exercises actual consumers using a
+synthetic Windows filesystem on any OS; `deepseek-windows-installation` is a
+real Windows filesystem/settings fixture and is skipped elsewhere. Both are
+included in the Windows installer workflow. Neither test executes Harness.
+Before claiming Desktop-runtime acceptance, verify a real Windows Bot reply,
+an App tool call, and stop/restart/worker-termination cleanup. That runtime and
+installed-App acceptance remains separate from source and fixture validation.
 
 ## Entry points and verification
 

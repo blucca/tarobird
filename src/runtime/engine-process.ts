@@ -6,6 +6,7 @@ import crossSpawn from "cross-spawn";
 export function executableCandidates(command: string, env: NodeJS.ProcessEnv, platform = process.platform): string[] {
   const windows = platform === "win32", paths = windows ? path.win32 : path;
   const name = command.trim().replace(/^"(.*)"$/, "$1");
+  if (!name || /[\x00-\x1f\x7f]/.test(name)) return [];
   const lookup = (key: string) => env[key] ?? (windows ? Object.entries(env).find(([name]) => name.toUpperCase() === key)?.[1] : undefined);
   const dirs = paths.isAbsolute(name) ? [""] : (lookup("PATH") ?? "").split(windows ? ";" : ":").map(dir => dir.replace(/^"(.*)"$/, "$1")).filter(Boolean);
   // Windows does not treat extensionless npm shims as executables. Prefer the
@@ -14,9 +15,9 @@ export function executableCandidates(command: string, env: NodeJS.ProcessEnv, pl
   return dirs.flatMap(dir => extensions.map(ext => paths.join(dir, name + ext)));
 }
 
-export function resolveEngineExecutable(command: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
-  return executableCandidates(command, env).find(file => {
-    try { accessSync(file, process.platform === "win32" ? constants.F_OK : constants.X_OK); return statSync(file).isFile(); } catch { return false; }
+export function resolveEngineExecutable(command: string, env: NodeJS.ProcessEnv = process.env, platform = process.platform): string | undefined {
+  return executableCandidates(command, env, platform).find(file => {
+    try { accessSync(file, platform === "win32" ? constants.F_OK : constants.X_OK); return statSync(file).isFile(); } catch { return false; }
   });
 }
 

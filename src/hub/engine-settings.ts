@@ -3,6 +3,7 @@ import { open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { withFileMutex } from "../state/file-mutex.js";
 import { resolveEngineExecutable } from "../runtime/engine-process.js";
+import { deepseekExecutableOverride, resolveDeepSeekExecutable } from "../runtime/deepseek-executable.js";
 import { EngineSettingsReadError, ENGINE_COMMANDS, ENGINE_ENV_KEYS, engineSettingsFile, hostEngineEnvironment, readHostEngineSettings, type StoredEngineSettings } from "../runtime/host-engine-settings.js";
 import { engineSettingsUpdateSchema, hostEngineSchema, type EngineSettingsState, type EngineSettingsUpdate } from "../client-protocol/engine-settings.js";
 import { HubError } from "./store.js";
@@ -19,8 +20,10 @@ export class HubEngineSettings {
     return { revision: settings.revision, platform: process.platform, searchPaths: (env.PATH ?? "").split(path.delimiter).filter(Boolean),
       receipt: receipt ? { requestId: receipt.requestId, revision: receipt.revision } : null,
       engines: hostEngineSchema.options.map(id => {
-        const command = env[ENGINE_ENV_KEYS[id]] || ENGINE_COMMANDS[id], executable = resolveEngineExecutable(command, env) ?? null;
-        return { id, override: settings.paths[id] ?? null, source: settings.paths[id] ? "setting" : base[ENGINE_ENV_KEYS[id]] ? "environment" : "auto", command, executable, available: !!executable };
+        const command = id === "deepseek" ? resolveDeepSeekExecutable(env) : env[ENGINE_ENV_KEYS[id]] || ENGINE_COMMANDS[id];
+        const executable = resolveEngineExecutable(command, env) ?? null;
+        const explicit = id === "deepseek" ? deepseekExecutableOverride(base) !== undefined : !!base[ENGINE_ENV_KEYS[id]];
+        return { id, override: settings.paths[id] ?? null, source: settings.paths[id] ? "setting" : explicit ? "environment" : "auto", command, executable, available: !!executable };
       }),
     };
   }

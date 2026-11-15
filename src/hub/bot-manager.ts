@@ -2,6 +2,7 @@ import { EngineSettingsReadError, hostEngineEnvironment } from "../runtime/host-
 import { assignNewBotAvatar } from "./bot-avatar-default.js";
 import { publishExclusive } from "../state/publish-exclusive.js";
 import { resolveEngineExecutable } from "../runtime/engine-process.js";
+import { resolveDeepSeekExecutable } from "../runtime/deepseek-executable.js";
 import { killProcessTree } from "../codex/process-tree.js";
 import { applyPermission, currentPermission, defaultPermission, permissionOptions } from "../state/permission-options.js";
 import { isRunActive, runSummarySchema } from "../client-protocol/run.js";
@@ -65,7 +66,7 @@ export class BotManager {
   }
   capabilities(engine: InstanceEngine) { return readEngineCapabilities(engine, { env: this.env }); }
   private engineBinaries(env = this.env): Record<InstanceEngine, string> {
-    return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: env.DSH_EXECUTABLE || "dsh", antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy" };
+    return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: resolveDeepSeekExecutable(env), antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy" };
   }
   engineAvailable(engine: InstanceEngine): boolean { const env = this.env; return !!resolveEngineExecutable(this.engineBinaries(env)[engine], env); }
   async catalog(): Promise<BotCatalog> {
