@@ -16,8 +16,14 @@ font-scan mitigation and its scoped watchdog, and Windows DeepSeek Desktop CLI
 discovery. The shared Host/CLI changes require a matching standalone package and
 isolated clean-install/upgrade verification.
 
-Dependencies, editor pins, adapted skills, native identities, signing identities
-and update protocols are unchanged. Baoyu remains at 2.15.2; no canvas paste
+Editor pins, adapted skills, mobile dependencies, native identities, signing
+identities and update protocols are unchanged. The owner approved the sole
+post-freeze security exception on 2026-11-15: update the bundled desktop Node
+runtime from 24.22.2 to the 24.22.3 security release and rebuild/revalidate the
+Mac and Windows packages. This changes only the pinned runtime and official
+archive checksums. The standalone CLI uses its externally installed Node runtime.
+The original security review omitted this runtime advisory; record the corrected
+review and a new source freeze before publication. Baoyu remains at 2.15.2; no canvas paste
 backport or new clipboard flow is included. Baoyu updates are no longer a
 mandatory release item under the 2026-11-15 owner amendment. Check the remaining
 listed integrations and shipped-code advisories before freeze without performing

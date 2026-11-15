@@ -13,7 +13,7 @@ const { values } = parseArgs({ options: { platform: { type: 'string', default: p
 const platform = values.platform, arch = values.arch;
 if (!['darwin-arm64', 'win32-x64'].includes(`${platform}-${arch}`)) throw new Error('Verified host targets: darwin-arm64, win32-x64 (also usable under Windows ARM64 x64 emulation)');
 const windows = platform === 'win32';
-const version = 'v24.22.2', basename = `node-${version}-${windows ? 'win' : platform}-${arch}`, archive = basename + (windows ? '.zip' : '.tar.gz');
+const version = 'v24.22.3', basename = `node-${version}-${windows ? 'win' : platform}-${arch}`, archive = basename + (windows ? '.zip' : '.tar.gz');
 const cache = process.env.TAROBOT_NODE_CACHE || path.join(root, '.desktop-runtime-cache');
 await mkdir(cache, { recursive: true });
 async function download(url, file, expected) {
@@ -27,11 +27,11 @@ async function download(url, file, expected) {
   }
   return bytes;
 }
-// Pinned from https://nodejs.org/dist/v24.22.2/SHASUMS256.txt. A compromised
+// Pinned from https://nodejs.org/dist/v24.22.3/SHASUMS256.txt. A compromised
 // download endpoint must not be able to replace both archive and checksum.
 const expected = {
-  'node-v24.22.2-darwin-arm64.tar.gz': 'aa9549349e47dffaa42dcf95d6e06ade8c4bdafc980979883b88767670df385a',
-  'node-v24.22.2-win-x64.zip': 'ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2',
+  'node-v24.22.3-darwin-arm64.tar.gz': 'ff6e17d4874b76d272212b908cc020d6e815fba5a6c7eaaa06add725840307fd',
+  'node-v24.22.3-win-x64.zip': 'e612af99f626ab415ea225af6bce5c971feb448cb5cae250bb1c3fa50c5f7d9f',
 }[archive];
 if (!expected || !/^[a-f0-9]{64}$/.test(expected)) throw new Error('Node archive checksum unavailable');
 const archiveFile = path.join(cache, archive);
