@@ -1,5 +1,8 @@
 # Entrypoint Map
 
+[1.4.2 preflight](client/release-1.4.2-preflight.md) records the post-1.4.1 fixes,
+unchanged editor/dependency scope and Windows owner-acceptance boundary.
+
 [1.4.1 patch preflight](client/release-1.4.1-preflight.md) records the language,
 pairing-feedback and attachment-layout delta and per-platform acceptance limits.
 
