@@ -1,5 +1,5 @@
 import { chunkMarkdown } from "./markdown-chunks.js";
-import { extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError, renderMalformedToolInputError, type FailureCategory } from "./error-classification.js";
+import { extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError, renderMalformedToolInputError, renderDeepSeekOfficeTimeout, type FailureCategory } from "./error-classification.js";
 
 import type { Locale } from "./locale.js";
 export type { Locale } from "./locale.js";
@@ -198,6 +198,8 @@ export function renderCategorizedErrorMessage(
   locale: Locale = "en",
   engine?: EngineName,
 ): string {
+  const officeTimeout = category === "engine-timeout" ? renderDeepSeekOfficeTimeout(detail, locale) : undefined;
+  if (officeTimeout) return officeTimeout;
   if (category === "engine-settings") return renderEngineSettingsError(detail, locale);
   if (category === "engine-busy") return renderEngineBusyError(locale, detail);
   if (category === "engine-tool-input") return renderMalformedToolInputError(locale);

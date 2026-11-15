@@ -39,6 +39,8 @@ export const DEEPSEEK_GOAL_FINAL_TURN_TIMEOUT_MS = 60_000;
 export const DEEPSEEK_SESSION_APPROVAL_GRANT_LIMIT = 128;
 
 export interface DeepSeekHarnessGateway {
+  /** Host-owned macOS Office mitigation; absent on other platforms/gateways. */
+  readonly officeToolTimeoutMs?: number | null;
   installAppTools?(input: DeepSeekAppToolBinding): Promise<boolean>;
   cancelPrompt?(sessionId: string, sourceRpcId: string): Promise<import("./deepseek-app-tools.js").DeepSeekPromptStop>;
   steerPrompt?(input: import("./deepseek-app-tools.js").DeepSeekSteerInput): Promise<import("./deepseek-app-tools.js").DeepSeekPromptSteer>;
@@ -155,6 +157,8 @@ type PendingTurn = {
   usageByStep: Map<string, Usage>;
   toolCalls: Map<string, ToolCall>;
   outstandingToolCalls: Set<string>;
+  officeToolTimers: Map<string, ReturnType<typeof setTimeout>>;
+  officeApprovalWaits: Map<string, Set<symbol>>;
   liveJobs: Set<string>;
   sawBackground: boolean;
   awaitingReview: boolean;
@@ -944,6 +948,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
           pending.toolCalls.set(callId, call);
           pending.outstandingToolCalls.add(callId);
           this.noteTurnActivity(pending);
+          if (turn !== undefined && pending.activeTurns.has(turn)) this.armOfficeToolTimeout(pending, callId, name);
           await this.emit(pending, {
             type: "tool_use",
             toolName: name,
@@ -1252,6 +1257,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
   private async handleToolResult(pending: PendingTurn, data: Record<string, unknown>): Promise<void> {
     for (const event of deepseekToolResults(data, pending.toolCalls, pending.sessionId)) {
       pending.outstandingToolCalls.delete(event.toolUseId!);
+      this.clearOfficeToolTimeout(pending, event.toolUseId!);
       this.noteTurnActivity(pending);
       await this.emit(pending, event);
     }
@@ -1506,6 +1512,32 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
   }
 
   private async handleApproval(frame: DeepSeekHarnessServerRequest): Promise<void> {
+    const sessionId = stringValue(frame.payload.sessionId), callId = stringValue(frame.payload.callId);
+    const owner = sessionId ? this.activeClaimForSession(sessionId) : undefined;
+    const pending = sessionId && owner ? this.pendingForClaim(sessionId, owner) : undefined;
+    const call = pending && callId ? pending.toolCalls.get(callId) : undefined;
+    if (!pending || !callId || !call || call.name !== frame.payload.toolName || pending.abortController.signal.aborted
+      || (!pending.officeToolTimers.has(callId) && !pending.officeApprovalWaits.has(callId))) {
+      return this.handleApprovalDecision(frame);
+    }
+    // App approval is a known user wait, unlike a renderer blocked in a native
+    // permission syscall. Exclude it from the Office execution deadline only.
+    this.clearOfficeToolTimeout(pending, callId);
+    const waits = pending.officeApprovalWaits.get(callId) ?? new Set<symbol>();
+    const token = Symbol(); waits.add(token); pending.officeApprovalWaits.set(callId, waits);
+    try {
+      await this.handleApprovalDecision(frame);
+    } finally {
+      waits.delete(token);
+      if (waits.size === 0 && pending.officeApprovalWaits.get(callId) === waits) {
+        pending.officeApprovalWaits.delete(callId);
+        if (this.pendingTurns.get(pending.sessionId) === pending && !pending.abortController.signal.aborted
+          && pending.outstandingToolCalls.has(callId)) this.armOfficeToolTimeout(pending, callId, call.name);
+      }
+    }
+  }
+
+  private async handleApprovalDecision(frame: DeepSeekHarnessServerRequest): Promise<void> {
     const payload = frame.payload;
     const sessionId = stringValue(payload.sessionId);
     const approvalId = stringValue(payload.approvalId);
@@ -1877,6 +1909,8 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       usageByStep: new Map(),
       toolCalls: new Map(),
       outstandingToolCalls: new Set(),
+      officeToolTimers: new Map(),
+      officeApprovalWaits: new Map(),
       liveJobs: new Set(),
       sawBackground: false,
       awaitingReview: false,
@@ -1998,6 +2032,9 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       return;
     }
     pending.settled = true;
+    for (const timer of pending.officeToolTimers.values()) clearTimeout(timer);
+    pending.officeToolTimers.clear();
+    pending.officeApprovalWaits.clear();
     if (pending.settleTimer) {
       clearTimeout(pending.settleTimer);
     }
@@ -2017,6 +2054,30 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     if (this.pendingTurns.get(pending.sessionId) === pending) {
       this.pendingTurns.delete(pending.sessionId);
     }
+  }
+
+  private clearOfficeToolTimeout(pending: PendingTurn, callId: string): void {
+    const timer = pending.officeToolTimers.get(callId);
+    if (timer !== undefined) clearTimeout(timer);
+    pending.officeToolTimers.delete(callId);
+  }
+
+  private armOfficeToolTimeout(pending: PendingTurn, callId: string, name: string): void {
+    const limit = this.gateway.officeToolTimeoutMs;
+    if (pending.settled || pending.settling || pending.timeoutsDisabled || pending.officeToolTimers.has(callId) || pending.officeApprovalWaits.has(callId)
+      || !["office_render", "office_convert", "office_recalculate"].includes(name)
+      || typeof limit !== "number" || !Number.isSafeInteger(limit) || limit <= 0 || limit > 2_147_483_647) return;
+    const timer = setTimeout(() => {
+      if (pending.officeToolTimers.get(callId) !== timer) return;
+      pending.officeToolTimers.delete(callId);
+      // An old event/timer must never cancel a new turn in the same session.
+      if (this.pendingTurns.get(pending.sessionId) !== pending || pending.settled || pending.settling
+        || pending.abortController.signal.aborted || !pending.outstandingToolCalls.has(callId)) return;
+      this.cancelTimedOutTurn(pending,
+        `DeepSeek Harness turn timed out after ${formatTimeoutMinutes(limit)} waiting for ${name}; check the host for a permission prompt`);
+    }, limit);
+    pending.officeToolTimers.set(callId, timer);
+    timer.unref?.();
   }
 
   private armTurnTimeouts(pending: PendingTurn): void {

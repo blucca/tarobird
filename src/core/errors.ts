@@ -1,5 +1,5 @@
 import { archiveReadErrorMessage } from "../runtime/zip-archive.js";
-import { classifyFailure, extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError, renderMalformedToolInputError } from "../runtime/error-classification.js";
+import { classifyFailure, extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError, renderMalformedToolInputError, renderDeepSeekOfficeTimeout } from "../runtime/error-classification.js";
 import { EngineCancellationUnconfirmedError, EngineContextCompactionPendingError, EngineIncompleteResponseError, EngineStopTooLateError } from "../codex/adapter.js";
 import { formatCoreFileSize, isCoreAttachmentTooLargeError } from "./files.js";
 import type { Locale } from "../runtime/locale.js";
@@ -127,6 +127,8 @@ export function renderCoreUserFacingError(
     return tooLarge;
   }
   const category = classifyFailure(error);
+  const officeTimeout = category === "engine-timeout" ? renderDeepSeekOfficeTimeout(error, locale) : undefined;
+  if (officeTimeout) return officeTimeout;
   if (category === "engine-tool-input") return renderMalformedToolInputError(locale);
   if (category === "engine-settings") return renderEngineSettingsError(error, locale);
   if (category === "engine-busy") return renderEngineBusyError(locale, error);

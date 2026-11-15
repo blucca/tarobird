@@ -54,6 +54,16 @@ export function renderMalformedToolInputError(locale: "zh" | "en"): string {
     : "The model response contained malformed tool arguments, so this turn stopped. Review completed operations before continuing the unfinished task. No instance restart is needed.";
 }
 
+/** An Office-specific wait is not evidence that the user needs to remove all
+ * runtime limits. Keep the recovery advice consistent across App and CLI. */
+export function renderDeepSeekOfficeTimeout(error: unknown, locale: "zh" | "en"): string | undefined {
+  const minutes = normalizeErrorText(error).match(/DeepSeek Harness turn timed out after (\d+) minutes? waiting for office_(?:render|convert|recalculate);/)?.[1];
+  if (!minutes) return undefined;
+  return locale === "zh"
+    ? `Office 工具超过 ${minutes} 分钟未返回，本轮已停止。请先检查运行 Bot 的 Mac 上是否有待处理的权限提示；若文件已经生成，可让 Bot 先发送文件，再重试预览或转换。`
+    : `The Office tool did not return within ${minutes} minutes, so this turn was stopped. Check the Mac running the Bot for a pending permission prompt. If the file was already created, ask the Bot to send it before retrying the preview or conversion.`;
+}
+
 export function extractModelEffortMismatch(error: unknown): { model: string; effort: string; available: string[] } | undefined {
   const text = normalizeErrorText(error);
   if (!/invalid model selection/i.test(text)) return undefined;

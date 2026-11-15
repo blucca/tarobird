@@ -394,6 +394,17 @@ describe("classifyFailure specificity", () => {
     expect(getBusErrorSemantics("engine-busy")).toEqual({ code: "engine_busy", retryable: true });
   });
 
+  it.each(["zh", "en"] as const)("explains an Office stall in %s without advising timeout opt-out", locale => {
+    const error = new Error("DeepSeek Harness turn timed out after 10 minutes waiting for office_render; check the host for a permission prompt");
+    expect(classifyFailure(error)).toBe("engine-timeout");
+    for (const text of [renderCoreUserFacingError(error, "engine", locale), renderCategorizedErrorMessage("engine-timeout", error.message, locale)]) {
+      expect(text).toContain("10");
+      expect(text).toContain(locale === "zh" ? "权限提示" : "permission prompt");
+      expect(text).toContain(locale === "zh" ? "发送文件" : "send it");
+      expect(text).not.toContain("/timeout");
+    }
+  });
+
   it("renders an accurate time-cap message pointing at /timeout, not the misleading 'restart' one", () => {
     const err = new Error("Codex app-server turn timed out after 60 minutes");
     const zh = renderCoreUserFacingError(err, "engine", "zh");

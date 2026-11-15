@@ -3678,6 +3678,12 @@ session, Gateway, Bus and scoped App-tool suites listed in the audit.
 - `src/codex/deepseek-harness-host.ts`
   Private per-instance `dsh web` lifecycle, isolated `DSH_HOME`, permissions,
   crash diagnostics, backoff, and safe process shutdown.
+  `deepseek-office-fonts.ts` applies macOS-only local Office font defaults from
+  the CLI's boot-free composed config, preserving user settings and avoiding
+  implicit protected-container scans. It also supplies the foreground Office
+  call watchdog budget, leaving other tools and platforms unchanged. Shared
+  error renderers provide Office-specific recovery guidance in both languages. Tests:
+  `deepseek-office-fonts`, `deepseek-harness-host`, `deepseek-harness-adapter`. See [rendering mitigation and native evidence](client/deepseek-office-render-2026-11-15.md).
 - `src/codex/deepseek-harness-adapter.ts`
   DeepSeek session/stream/tool mapping, approvals/questions, compact/context,
   steering, native Goals, background jobs, and ordered reconnect recovery.

@@ -1,3 +1,4 @@
+import { classifyFailure } from "../src/runtime/error-classification.js";
 import { nativeRunProbe } from "./helpers/native-run.js";
 import { runEntryTitle, runDiff, runPlan } from "../client/src/run-presentation.js";
 import { summarizeRun } from "../src/core/run-record.js";
@@ -32,6 +33,7 @@ type GatewayResponse = unknown | ((payload: unknown) => unknown | Promise<unknow
 
 class FakeGateway extends EventEmitter implements DeepSeekHarnessGateway {
   readonly calls: GatewayCall[] = [];
+  officeToolTimeoutMs: number | null = null;
   readonly responses = new Map<string, GatewayResponse>();
   readonly clientResponses: Array<{ rpcId: string; value: unknown }> = [];
   readonly clientErrors: Array<{
@@ -512,6 +514,147 @@ describe("DeepSeekHarnessAdapter", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it.each(["office_render", "office_convert", "office_recalculate"])("bounds a stuck %s call without resetting on unrelated activity", async name => {
+    vi.useFakeTimers();
+    const gateway = new FakeGateway();
+    gateway.officeToolTimeoutMs = 10 * 60_000;
+    const { adapter } = createAdapter(gateway, { turnTimeoutMs: null, inactivityTimeoutMs: null });
+    try {
+      const { sessionId } = await adapter.createSession(310);
+      const turn = adapter.sendUserMessage(sessionId, { text: "render", files: [] });
+      const rejected = expect(turn).rejects.toThrow(/turn timed out after 10 minutes.*office_/);
+      await waitForCall(gateway, "session.prompt");
+      await gateway.emitSessionEvent(sessionId, "turn/start", { turn: 1 }, 1);
+      await gateway.emitSessionEvent(sessionId, "tool/call", { turn: 1, step: 1, callId: "office-1", name, arguments: "{}" }, 2);
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      await gateway.emitSessionEvent(sessionId, "assistant/chunk", { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "waiting" } }, 3);
+      expect(gateway.calls.some(call => call.method === "native.cancelPrompt")).toBe(false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await rejected;
+      expect(classifyFailure(await turn.catch(error => error))).toBe("engine-timeout");
+      expect(gateway.calls.filter(call => call.method === "native.cancelPrompt")).toEqual([{ method: "native.cancelPrompt", payload: { sessionId, sourceRpcId: gateway.lastPromptId(sessionId) } }]);
+      expect(gateway.calls.some(call => call.method === "session.cancel")).toBe(false);
+    } finally { await adapter.destroy(); vi.useRealTimers(); }
+  });
+
+  it.each(["completed", "failed"])("clears the Office watchdog after a %s result and does not cancel a later turn", async result => {
+    vi.useFakeTimers();
+    const gateway = new FakeGateway();
+    gateway.officeToolTimeoutMs = 10 * 60_000;
+    const { adapter } = createAdapter(gateway, { turnTimeoutMs: null, inactivityTimeoutMs: null });
+    try {
+      const { sessionId } = await adapter.createSession(311);
+      const turn = adapter.sendUserMessage(sessionId, { text: "render", files: [] });
+      await waitForCall(gateway, "session.prompt");
+      await gateway.emitSessionEvent(sessionId, "turn/start", { turn: 1 }, 1);
+      await gateway.emitSessionEvent(sessionId, "tool/call", { turn: 1, step: 1, callId: "office-1", name: "office_render", arguments: "{}" }, 2);
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      await gateway.emitSessionEvent(sessionId, "tool/result", { turn: 1, step: 1, message: { content: [{ type: "tool-result", toolCallId: "office-1", content: result, isError: result === "failed" }] } }, 3);
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      expect(gateway.calls.some(call => call.method === "native.cancelPrompt")).toBe(false);
+      await gateway.emitSessionEvent(sessionId, "turn/end", { turn: 1, reason: completedReason() }, 4);
+      await vi.advanceTimersByTimeAsync(1);
+      await turn;
+      const later = adapter.sendUserMessage(sessionId, { text: "next", files: [] });
+      await waitForCall(gateway, "session.prompt", 2);
+      await gateway.emitSessionEvent(sessionId, "turn/start", { turn: 2 }, 5);
+      await gateway.emitSessionEvent(sessionId, "tool/call", { turn: 1, step: 1, callId: "late-old-call", name: "office_render", arguments: "{}" }, 6);
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      expect(gateway.calls.some(call => call.method === "native.cancelPrompt")).toBe(false);
+      await gateway.emitSessionEvent(sessionId, "turn/end", { turn: 2, reason: completedReason() }, 7);
+      await vi.advanceTimersByTimeAsync(1);
+      await later;
+    } finally { await adapter.destroy(); vi.useRealTimers(); }
+  });
+
+  it.each([["allow", "call-first"], ["deny", "call-first"], ["allow", "approval-first"]] as const)("excludes a user's Office approval wait, then resumes after %s (%s)", async (behavior, order) => {
+    vi.useFakeTimers();
+    const gateway = new FakeGateway(); gateway.officeToolTimeoutMs = 600_000;
+    const { adapter } = createAdapter(gateway, { turnTimeoutMs: null, inactivityTimeoutMs: null });
+    let answer!: (decision: { behavior: "allow" | "deny" }) => void;
+    const onApprovalRequest = vi.fn(() => new Promise<{ behavior: "allow" | "deny" }>(resolve => { answer = resolve; }));
+    try {
+      const { sessionId } = await adapter.createSession(314);
+      const turn = adapter.sendUserMessage(sessionId, { text: "render", files: [], onApprovalRequest });
+      const rejected = expect(turn).rejects.toThrow(/waiting for office_render/);
+      await waitForCall(gateway, "session.prompt");
+      await gateway.emitSessionEvent(sessionId, "turn/start", { turn: 1 }, 1);
+      if (order === "call-first") await gateway.emitSessionEvent(sessionId, "tool/call", { turn: 1, step: 1, callId: "office-1", name: "office_render", arguments: "{}" }, 2);
+      const approval = gateway.emitMux({ type: "approval/requested", sessionId, approvalId: "office-approval", callId: "office-1", toolName: "office_render" }, "office-rpc");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(onApprovalRequest).toHaveBeenCalledTimes(1);
+      const lateCall = order === "approval-first" ? gateway.emitSessionEvent(sessionId, "tool/call", { turn: 1, step: 1, callId: "office-1", name: "office_render", arguments: "{}" }, 2) : Promise.resolve();
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      expect(gateway.calls.some(call => call.method === "native.cancelPrompt")).toBe(false);
+      answer({ behavior }); await approval; await lateCall;
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      expect(gateway.calls.some(call => call.method === "native.cancelPrompt")).toBe(false);
+      await vi.advanceTimersByTimeAsync(60_000); await rejected;
+    } finally { await adapter.destroy(); vi.useRealTimers(); }
+  });
+
+  it("does not revive an Office watchdog after a stopped approval returns", async () => {
+    vi.useFakeTimers();
+    const gateway = new FakeGateway(); gateway.officeToolTimeoutMs = 600_000;
+    const { adapter } = createAdapter(gateway, { turnTimeoutMs: null, inactivityTimeoutMs: null });
+    const abort = new AbortController();
+    let answer!: (decision: { behavior: "allow" }) => void;
+    try {
+      const { sessionId } = await adapter.createSession(315);
+      const turn = adapter.sendUserMessage(sessionId, { text: "render", files: [], abortSignal: abort.signal,
+        onApprovalRequest: () => new Promise<{ behavior: "allow" }>(resolve => { answer = resolve; }) });
+      const rejected = expect(turn).rejects.toThrow(/aborted/);
+      await waitForCall(gateway, "session.prompt");
+      await gateway.emitSessionEvent(sessionId, "turn/start", { turn: 1 }, 1);
+      await gateway.emitSessionEvent(sessionId, "tool/call", { turn: 1, step: 1, callId: "office-1", name: "office_render", arguments: "{}" }, 2);
+      const approval = gateway.emitMux({ type: "approval/requested", sessionId, approvalId: "office-approval", callId: "office-1", toolName: "office_render" }, "office-rpc");
+      await vi.advanceTimersByTimeAsync(1); abort.abort(); await rejected;
+      answer({ behavior: "allow" }); await approval;
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      expect(gateway.calls.filter(call => call.method === "native.cancelPrompt")).toHaveLength(1);
+      expect(gateway.clientResponses.at(-1)?.value).toMatchObject({ outcome: "rejected" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { await adapter.destroy(); vi.useRealTimers(); }
+  });
+
+  it("cleans the Office timer when a turn ends without a tool result", async () => {
+    vi.useFakeTimers();
+    const gateway = new FakeGateway(); gateway.officeToolTimeoutMs = 600_000;
+    const { adapter } = createAdapter(gateway, { turnTimeoutMs: null, inactivityTimeoutMs: null });
+    try {
+      const { sessionId } = await adapter.createSession(313);
+      const turn = adapter.sendUserMessage(sessionId, { text: "render", files: [] });
+      await waitForCall(gateway, "session.prompt");
+      await gateway.emitSessionEvent(sessionId, "turn/start", { turn: 1 }, 1);
+      await gateway.emitSessionEvent(sessionId, "tool/call", { turn: 1, step: 1, callId: "office-1", name: "office_render", arguments: "{}" }, 2);
+      await gateway.emitSessionEvent(sessionId, "turn/end", { turn: 1, reason: completedReason() }, 3);
+      await vi.advanceTimersByTimeAsync(1); await turn;
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(gateway.calls.some(call => call.method === "native.cancelPrompt")).toBe(false);
+    } finally { await adapter.destroy(); vi.useRealTimers(); }
+  });
+
+  it.each(["disabled-turn", "disabled-host", "long-bash"])("preserves existing behavior for %s", async mode => {
+    vi.useFakeTimers();
+    const gateway = new FakeGateway();
+    gateway.officeToolTimeoutMs = mode === "disabled-host" ? null : 10 * 60_000;
+    const { adapter } = createAdapter(gateway, { turnTimeoutMs: null, inactivityTimeoutMs: null });
+    try {
+      const { sessionId } = await adapter.createSession(312);
+      const turn = adapter.sendUserMessage(sessionId, { text: "work", files: [], disableRuntimeTimeout: mode === "disabled-turn" });
+      await waitForCall(gateway, "session.prompt");
+      await gateway.emitSessionEvent(sessionId, "turn/start", { turn: 1 }, 1);
+      await gateway.emitSessionEvent(sessionId, "tool/call", { turn: 1, step: 1, callId: "call-1", name: mode === "long-bash" ? "bash" : "office_render", arguments: "{}" }, 2);
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      expect(gateway.calls.some(call => call.method === "native.cancelPrompt")).toBe(false);
+      await gateway.emitSessionEvent(sessionId, "tool/result", { turn: 1, step: 1, message: { source: { callId: "call-1" }, content: [{ type: "text", text: "done" }] } }, 3);
+      await gateway.emitSessionEvent(sessionId, "turn/end", { turn: 1, reason: completedReason() }, 4);
+      await vi.advanceTimersByTimeAsync(1);
+      await turn;
+    } finally { await adapter.destroy(); vi.useRealTimers(); }
   });
 
   it("rejects on timeout even when the event delivery callback never settles", async () => {

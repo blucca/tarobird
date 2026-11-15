@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Readable, Writable } from "node:stream";
 import { killProcessTree } from "./process-tree.js";
 import { deepseekParentGuardEnvironment } from "./deepseek-parent-guard.js";
+import { createDeepSeekOfficeFontPatch, deepSeekOfficeToolTimeout, DEEPSEEK_OFFICE_TOOL_TIMEOUT_MS, macOfficeFontDirectories, readDeepSeekOfficeConfig } from "./deepseek-office-fonts.js";
 import { DeepSeekAppTools, type DeepSeekAppToolBinding } from "./deepseek-app-tools.js";
 
 import {
@@ -125,6 +126,8 @@ export function createDeepSeekHarnessProtocolOptions(
 }
 
 export class DeepSeekHarnessHost {
+  private officeTimeout: number | null = null;
+  get officeToolTimeoutMs(): number | null { return this.officeTimeout; }
   private readonly executable: string;
   private readonly options: DeepSeekHarnessHostOptions;
   private readonly spawnDsh: SpawnDeepSeekHarness;
@@ -248,11 +251,13 @@ export class DeepSeekHarnessHost {
       searchMcp: this.options.searchMcp,
       onDiagnostic: this.options.onDiagnostic,
       appPluginPath: fileURLToPath(new URL("./deepseek-app-plugin.js", import.meta.url)),
+      readOfficeConfig: home => readDeepSeekOfficeConfig(this.executable, home, this.options.workspacePath, this.options.childEnv ?? process.env),
     });
     if (this.closing || generation !== this.generation) {
       throw new Error("DeepSeek Harness host closed during startup");
     }
 
+    this.officeTimeout = prepared.officeToolTimeoutMs;
     const child = this.spawnDsh(this.executable, [...WEB_ARGS], {
       cwd: this.options.workspacePath,
       env: {
@@ -426,11 +431,13 @@ export interface PrepareDeepSeekHarnessHomeOptions {
   searchMcp?: DeepSeekHarnessSearchMcp;
   onDiagnostic?: (message: string) => void;
   appPluginPath?: string;
+  readOfficeConfig?: (privateHome: string) => Promise<string>;
 }
 
 export type DeepSeekHarnessSearchMcpOwner = "bridge" | "plugin";
 
 export interface PreparedDeepSeekHarnessHome {
+  officeToolTimeoutMs: number | null;
   home: string;
   patchPath: string;
   searchMcpOwner: DeepSeekHarnessSearchMcpOwner;
@@ -546,8 +553,21 @@ export async function prepareDeepSeekHarnessHome(
   ];
   const patch = `${prefix ? `${prefix}\n` : ""}${localPatches.join("\n")}`;
   await writeFileAtomically(patchPath, patch, 0o600);
+  let officeToolTimeoutMs: number | null = process.platform === "darwin" ? DEEPSEEK_OFFICE_TOOL_TIMEOUT_MS : null;
+  if (process.platform === "darwin" && options.readOfficeConfig) {
+    try {
+      const composed = await options.readOfficeConfig(home);
+      officeToolTimeoutMs = deepSeekOfficeToolTimeout(composed);
+      const officePatch = createDeepSeekOfficeFontPatch(composed, await macOfficeFontDirectories());
+      if (officePatch) await writeFileAtomically(patchPath, `${patch}\n# Local Office font defaults; preserve composed profile settings.\n${officePatch}`, 0o600);
+    } catch {
+      // Never expose the dump, parser snippets, profile paths or exec stderr.
+      // An older/custom CLI without dump support must still start normally.
+      options.onDiagnostic?.("DeepSeek Office font defaults could not be inspected; existing Office settings were retained.");
+    }
+  }
 
-  return { home, patchPath, searchMcpOwner };
+  return { home, patchPath, searchMcpOwner, officeToolTimeoutMs };
 }
 
 async function detectSearchMcpOwner(

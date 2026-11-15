@@ -20,6 +20,11 @@ import type {
 } from "../src/codex/deepseek-harness-protocol.js";
 import { removeTempRoot } from "./helpers/temp-files.js";
 
+vi.mock("../src/codex/deepseek-office-fonts.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/codex/deepseek-office-fonts.js")>(),
+  readDeepSeekOfficeConfig: vi.fn(async () => "[]"),
+}));
+
 const roots: string[] = [];
 
 const SEARCH_PLUGIN_NAME = "deepseek-harness-web-search-plugin";
@@ -79,6 +84,73 @@ afterEach(async () => {
 });
 
 describe("prepareDeepSeekHarnessHome", () => {
+  it("adds Mac Office defaults only after composing the private home and preserves shared files", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    try {
+      const root = await mkdtemp(path.join(os.tmpdir(), "deepseek-office-home-")); roots.push(root);
+      const sharedHome = path.join(root, "shared"), stateDir = path.join(root, "instance");
+      await mkdir(path.join(sharedHome, "profiles", "web"), { recursive: true });
+      await writeFile(path.join(sharedHome, ".credentials.yaml"), "fixture: synthetic\n");
+      const sharedPatch = "- id: office-kit\n  config:\n    timeoutMs: 19000\n";
+      await writeFile(path.join(sharedHome, "cordis.patch.yml"), sharedPatch);
+      const readOfficeConfig = vi.fn(async (home: string) => {
+        expect(home).toBe(path.join(stateDir, "dsh-home"));
+        const existing = await readFile(path.join(home, "cordis.patch.yml"), "utf8");
+        expect(existing).toContain(sharedPatch.trim());
+        expect(existing).not.toContain("fontDirectories");
+        return "- id: office-kit\n  name: '@deepseek-ai/dsh-office-kit'\n  config:\n    timeoutMs: 19000\n    maxReaders: 3\n    outputDirectory: !!js dshHomePath('office-kit', 'custom')\n";
+      });
+      const prepared = await prepareDeepSeekHarnessHome({ sharedHome, stateDir, readOfficeConfig });
+      const patch = await readFile(prepared.patchPath, "utf8");
+      expect(readOfficeConfig).toHaveBeenCalledTimes(1);
+      expect(prepared.officeToolTimeoutMs).toBe(600_000);
+      expect(patch).toContain("fontDirectories:");
+      expect(patch).toContain("maxReaders: 3");
+      expect(patch).toContain("timeoutMs: 19000");
+      expect(patch).toContain("!!js");
+      expect(patch).not.toMatch(/Group Containers|FontCache/);
+      expect((await lstat(prepared.patchPath)).mode & 0o777).toBe(0o600);
+      expect(await readFile(path.join(sharedHome, "cordis.patch.yml"), "utf8")).toBe(sharedPatch);
+      // Rebuilding the home must not feed our previous override back into the dump.
+      await prepareDeepSeekHarnessHome({ sharedHome, stateDir, readOfficeConfig });
+      expect((await readFile(prepared.patchPath, "utf8")).match(/fontDirectories:/g)).toHaveLength(1);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
+  it.each(["win32", "linux"])("does not inspect or patch Office fonts on %s", async (value) => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value });
+    try {
+      const root = await mkdtemp(path.join(os.tmpdir(), "deepseek-office-other-")); roots.push(root);
+      const sharedHome = path.join(root, "shared");
+      await mkdir(path.join(sharedHome, "profiles", "web"), { recursive: true });
+      await writeFile(path.join(sharedHome, ".credentials.yaml"), "fixture: synthetic\n");
+      const readOfficeConfig = vi.fn(async () => { throw new Error("must not run"); });
+      const prepared = await prepareDeepSeekHarnessHome({ sharedHome, stateDir: path.join(root, "instance"), readOfficeConfig });
+      expect(readOfficeConfig).not.toHaveBeenCalled();
+      expect(prepared.officeToolTimeoutMs).toBeNull();
+      expect(await readFile(prepared.patchPath, "utf8")).not.toContain("fontDirectories");
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
+  it("retains existing settings and reports only sanitized config inspection failure", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    try {
+      const root = await mkdtemp(path.join(os.tmpdir(), "deepseek-office-failure-")); roots.push(root);
+      const sharedHome = path.join(root, "shared");
+      await mkdir(path.join(sharedHome, "profiles", "web"), { recursive: true });
+      await writeFile(path.join(sharedHome, ".credentials.yaml"), "fixture: synthetic\n");
+      const onDiagnostic = vi.fn();
+      const prepared = await prepareDeepSeekHarnessHome({ sharedHome, stateDir: path.join(root, "instance"), onDiagnostic,
+        readOfficeConfig: async () => { throw new Error("PRIVATE_CONFIG_SENTINEL"); } });
+      expect(prepared.officeToolTimeoutMs).toBe(600_000);
+      expect(onDiagnostic).toHaveBeenCalledWith("DeepSeek Office font defaults could not be inspected; existing Office settings were retained.");
+      expect(await readFile(prepared.patchPath, "utf8")).not.toMatch(/fontDirectories|PRIVATE_CONFIG_SENTINEL/);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
   it("isolates mutable settings while linking shared profiles and credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "deepseek-harness-home-"));
     roots.push(root);
