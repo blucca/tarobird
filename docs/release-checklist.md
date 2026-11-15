@@ -81,7 +81,6 @@ upstream check-and-upgrade gate:
 | --- | --- |
 | Excalidraw | Whiteboard integration and its bundled/adapted skill resources |
 | Vditor | Markdown editor integration and its bundled/adapted skill resources |
-| baoyu-design | Canvas and PPT integrations, including Baoyu Design/PPT skill files |
 
 This is a closed list. Add a future integration only when the owner explicitly
 names it for inclusion. Package manifests, vendor manifests and `LICENSING.md`
@@ -90,6 +89,16 @@ A listed product remains in this category even if distributed through npm.
 Other npm/Gradle/Cargo libraries, AndroidX, Firebase, OkHttp, frameworks and build
 tools are **ordinary dependencies**, not this release gate.
 
+**Baoyu Design/PPT exception (2026-11-15):** the canvas/PPT integrations and
+their adapted skills are not mandatory pre-release upstream checks or upgrades.
+Keep verified pins unless the owner scopes an update or a specific needed fix;
+an available new upstream version or an unavailable upstream lookup does not
+block a release that retains those pins. For an actual change, review bound
+upstream code fragments, preserve saved content and native PPT routing, keep
+skill/editor provenance accurate, and validate the affected flows. Shipped-code
+security review, freeze rules and validation still apply. A scoped backport is
+not a claim that the whole upstream editor was upgraded.
+
 Before freezing a full release, complete the following for the listed products:
 
 - Include the skill entrypoints, authoring references and helper scripts of the
@@ -97,8 +106,9 @@ Before freezing a full release, complete the following for the listed products:
   Review SKILL.md diffs even when package/editor versions have not changed. Keep
   skill/editor pins aligned; adapt upstream guidance to the App protocol rather
   than copying standalone server instructions. Verify skill resources in the
-  standalone/App host package and selected global install locations; smoke explicit
-  Baoyu Design/PPT routing and preserve default skills for ordinary PPT requests.
+  standalone/App host package and selected global install locations. Baoyu
+  Design/PPT routing checks belong to an actual change to that integration;
+  preserve default skills for ordinary PPT requests.
 - Check each official upstream repository/release feed against the version or
   commit actually bundled. Use the latest stable release; for commit-pinned
   projects without a release channel, check the latest upstream commit.
@@ -192,6 +202,14 @@ verbatim policy is retained here as a citable source; operational guidance above
 must not expand it.
 
 ### Owner policy text
+
+Owner amendment dated **2026-11-15**, recorded in `docs/release-checklist.md`:
+
+> 还有agent.md改一下，以后baoyu design的更新不是我们每次发版前的必备项
+
+This amendment removes Baoyu Design/PPT from the mandatory upstream gate. It
+supersedes that part of item 1 below; the earlier wording is retained as a dated
+historical quotation, not as a competing current requirement.
 
 Verbatim owner instruction dated **2026-11-11**, recorded in
 `docs/release-checklist.md`:

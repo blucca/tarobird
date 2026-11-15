@@ -5050,7 +5050,9 @@ skill and distinguishes that from binary PPTX import. New tool contract v13 uses
 neutral labels; old schema digests remain exact and receive the corrected guide.
 `install-skills.sh --skill ...` copies
 references as well as SKILL.md; the Host package includes the same allowlisted
-resources. Release upstream checks include both skills and editor assets.
+resources. When this integration is updated, review both skills and editor assets.
+Baoyu Design/PPT updates are not a mandatory pre-release item; see the
+2026-11-15 amendment in [the release checklist](release-checklist.md#full-release-upstream-gate).
 
 PPT reuses `design.*` and storage but has `format:slides`, `designFormat:slides`,
 `deck.json` v4 and slide HTML. Host `workbench.design.slides.v1` / App

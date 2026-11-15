@@ -152,13 +152,22 @@ profile in [the release checklist](docs/release-checklist.md#scoped-patch-releas
 It may retain unchanged dependencies and baseline evidence for unaffected code;
 new artifact signatures, privacy scans and download readback are never inherited.
 The [upstream gate](docs/release-checklist.md#full-release-upstream-gate) applies
-only to this explicit integrated-product list: Excalidraw, Vditor and baoyu-design
-(Baoyu Design and Baoyu PPT), including their skill files, references and helper
-scripts. New integrations join this list only when the owner names them for
-inclusion. A package manifest or license inventory does not expand this list.
+only to this explicit integrated-product list: Excalidraw and Vditor, including
+their skill files, references and helper scripts. New integrations join this list
+only when the owner names them for inclusion. A package manifest or license
+inventory does not expand this list.
 Complete the upstream checks, upgrades and affected validation before freezing;
-keep adapted skills aligned with the pinned editor and preserve ordinary native
-PPT routing. The existing owner-authorized scoped-patch exception above remains.
+keep adapted skills aligned with the pinned editor. The existing owner-authorized
+scoped-patch exception above remains.
+
+Baoyu Design/PPT and their adapted skills are not a mandatory pre-release
+upstream check or upgrade item. Retain the verified pins unless the owner scopes
+an update or a specific needed fix; a newer upstream version alone does not block
+a release. When changing them, review the bound upstream code fragments, keep
+skill/editor provenance accurate, validate the affected flows and preserve
+ordinary native PPT routing. This exception does not waive the shipped-dependency
+security review, freeze rules or validation for changes actually made. See the
+2026-11-15 owner amendment in the release checklist.
 
 Ordinary dependencies are not an upstream release gate: npm/Gradle/Cargo
 libraries, AndroidX, Firebase, OkHttp, frameworks and build tools are not subject
