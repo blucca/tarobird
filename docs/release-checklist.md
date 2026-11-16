@@ -376,8 +376,11 @@ path with the final artifacts, not merely by opening a new test database.
 Keep versioned installer links, current App/CLI version mappings and checksums in
 the corresponding GitHub Release and its verification document. The English and
 Chinese READMEs link to the stable Releases page from the installation guide;
-do not restore a Downloads table or update the homepage for each version bump.
-Update homepage feature descriptions and product images when the product changes.
+do not restore a Downloads table or update the GitHub README solely for each
+version bump. Update README feature descriptions and product images when the
+product changes. The separate official website must be synchronized with every
+release, including actual per-platform availability and deployed download-link
+verification; follow [official homepage and release updates](../AGENTS.md#official-homepage-and-release-updates).
 
 For iOS, follow [the iOS build and TestFlight guide](client/ios-build.md). Run the
 release-plan tests and ad-hoc-signed Simulator build before a distribution archive/export.

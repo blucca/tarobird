@@ -27,6 +27,28 @@ downloads and verify a one-time upgrade path without changing App identities,
 signing keys, saved Host data or credentials. See
 [repository migration](docs/repository-migration.md).
 
+## Official homepage and release updates
+
+The official homepage is <https://cloveric.github.io/tarobird-site/>; its source
+repository is **cloveric/tarobird-site**. For every owner-authorized release,
+update and deploy the homepage to reflect the published version, platform
+downloads, release link and affected feature descriptions or screenshots. Keep
+the existing page structure and keep its Chinese and English content aligned.
+
+Use each platform's actual availability: retain working downloads for platforms
+still pending, and do not describe an uploaded iOS build as available in
+TestFlight before it is released to the intended testers. Ready platforms may
+still publish independently; update the homepage again as the others become
+available.
+
+Read the site repository's instructions before editing it, and apply the upload
+privacy gate to its outgoing changes and media. After deployment, read back the
+live page and verify the displayed versions and download destinations. Include
+the site commit/deployment and read-back result in release evidence; explicitly
+report any unfinished homepage update. This website requirement is separate
+from the GitHub README policy of linking to stable Releases instead of adding
+per-version download tables.
+
 ## Mandatory GitHub upload gate
 
 Every push to `main` **and every PR branch/update**, including merges and
