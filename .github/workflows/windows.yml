@@ -92,7 +92,7 @@ jobs:
       - name: Packaged host end-to-end smoke
         run: client/src-tauri/host/node.exe scripts/verify-desktop-host.mjs client/src-tauri/host
       - name: Windows host control and engine discovery
-        run: npx vitest run tests/windows-host.test.ts tests/deepseek-windows-discovery.test.ts tests/deepseek-windows-installation.test.ts tests/windows-state-sync.test.ts tests/host-cli-package.test.ts
+        run: npx vitest run tests/windows-host.test.ts tests/deepseek-windows-discovery.test.ts tests/deepseek-windows-installation.test.ts tests/deepseek-desktop-launcher.test.ts tests/windows-state-sync.test.ts tests/host-cli-package.test.ts
       - name: Final installer runtime dependencies
         shell: pwsh
         run: |

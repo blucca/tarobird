@@ -98,10 +98,24 @@ preserved. The pinned launcher fixture guards against treating it as an npm
 Node entrypoint. Discovery tests do not prove that a Desktop installation can
 run a complete TaroBird Bot session.
 
+`engine-process.ts` recognizes that exact vendor `dsh.cmd` and starts its
+existing Electron executable and CLI entrypoint directly, retaining
+`--expose-internals`, `ELECTRON_RUN_AS_NODE=1`, arguments, working directory and
+stdio. Avoiding `cmd.exe` preserves the native App-tool pipe launch route.
+npm shims still use the bundled Node; other batch files retain their previous
+route. Modified vendor scripts or missing Desktop resources also fall back to
+the old route. This narrowly fixes the recognized launcher; it does not claim
+that arbitrary wrapper scripts can pass App-tool pipes successfully.
+
 Coverage: `deepseek-windows-discovery` exercises actual consumers using a
 synthetic Windows filesystem on any OS; `deepseek-windows-installation` is a
 real Windows filesystem/settings fixture and is skipped elsewhere. Both are
 included in the Windows installer workflow. Neither test executes Harness.
+`deepseek-desktop-launcher` covers vendor matching on every OS and mocked spawn
+routing on Windows. It is included in the manually triggered Windows installer
+workflow; the ordinary Linux/macOS PR jobs skip its Windows-only cases. Passing
+these mocks checks argument, environment and stdio forwarding, not actual
+Electron pipe inheritance.
 Before claiming Desktop-runtime acceptance, verify a real Windows Bot reply,
 an App tool call, and stop/restart/worker-termination cleanup. That runtime and
 installed-App acceptance remains separate from source and fixture validation.
