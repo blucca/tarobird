@@ -1478,6 +1478,12 @@ and the existing network/run/delete suites listed in that audit.
   without rewriting scrollTop on live journal refreshes. Regressions:
   `message-reading`, `run-details-refresh`, `conversation-entry`, `composer-size`,
   `outbox-refresh`. [Touch behavior and acceptance](client/touch-reading-2026-10-14.md).
+  Desktop main run replies can individually use the available chat width through
+  `reply-width.ts` and `RunPresentation.tsx`. Memory-only choices are scoped by
+  host/device/conversation/message and survive row virtualization. The existing
+  viewport observer and virtualizer own geometry; mobile, ADHD and scoped replies
+  are excluded. Tests: `client-reply-width`, browser `reply-width`, table and
+  reading/following suites. See [desktop reply width](client/desktop-reply-width-2026-11-16.md).
   `reading-scroll.ts` preserves the iOS reading anchor during row measurement
   and transfers the logical offset back without a post-gesture jump. Host-pool
   cache notifications and run/question subscriptions are scoped;

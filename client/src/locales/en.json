@@ -2484,6 +2484,8 @@
   "最近的消息会显示在这里": "Recent messages appear here",
   "停止请求未发送，请恢复连接后重试。": "The stop request was not sent. Reconnect and try again.",
   "运行回复": "Run response",
+  "加宽这条回复": "Widen reply",
+  "恢复阅读宽度": "Restore width",
   "连接中断，当前状态待确认": "Connection lost. Current status is unconfirmed.",
   "截至最近一次事件": "As of the latest event",
   "最后确认：{0}": "Last confirmed: {0}",

@@ -1,8 +1,8 @@
 import { TurnStopContext } from "./use-turn-stop.js";
 import { DiffViewerTrigger } from "./DiffViewerTrigger.js";
 import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { createPortal } from "react-dom";
-import { Check, ChevronRight, ChevronsLeft, ChevronsRight, CircleStop, Copy, Download, GitBranch, ListTree, LoaderCircle, RefreshCw, Search } from "lucide-react";
+import { createPortal, flushSync } from "react-dom";
+import { ArrowLeftFromLine, ArrowRightToLine, Check, ChevronRight, ChevronsLeft, ChevronsRight, CircleStop, Copy, Download, GitBranch, ListTree, LoaderCircle, RefreshCw, Search } from "lucide-react";
 import type { Block, Message } from "../../src/client-protocol/index.js";
 import { RUN_ENTRY_LIMIT, runPageSchema, scopedJournal, isGoalTurnEnded, type ScopedJournal, type RunEntry, type RunPage, type RunSummary } from "../../src/client-protocol/run.js";
 import type { HubConnection } from "./connection.js";
@@ -19,6 +19,7 @@ import { scopedTaskLabelSchema } from "../../src/client-protocol/engine-tasks.js
 import { BackgroundTaskReference, type BackgroundSource } from "./BackgroundTaskReference.js";
 import { useMessageOverlay } from "./message-overlay.js";
 import { useRunReaderState } from "./run-reader-state.js";
+import { ReplyWidthContext, replyWidthKey, setReplyWide, useReplyWide } from "./reply-width.js";
 import { useRunReportPreview } from "./RunReportPreview.js";
 import { RunReport } from "./RunReport.js";
 import { ScopedTaskDescription } from "./ScopedTaskDescription.js";
@@ -49,6 +50,32 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
   const detailFocus = useMemo(() => ({ get current() { return compact && !trigger.current?.getClientRects().length ? compactReturnFocus?.current ?? trigger.current : trigger.current; } }), [compact, compactReturnFocus]);
   const reportFocus = useMemo(() => ({ get current() { return reportTrigger.current ?? detailFocus.current ?? card.current; } }), [detailFocus]);
   const scoped = block.extra?.scopedRun !== undefined;
+  // Only the desktop main list offers a width control, and only on a main reply.
+  const replyWidth = useContext(ReplyWidthContext);
+  const widthKey = replyWidth && !compact && !scoped ? replyWidthKey(connection.identity.hubPublicKey, connection.identity.deviceId, message.conversationId, message.id) : undefined;
+  const wide = useReplyWide(widthKey);
+  // Commit the row's new width within the click, then give the list its new
+  // height. Left to the list's resize observer, the rows below stay where they
+  // were for a few frames: a gap when widening, an overlap when restoring.
+  const widthSettle = useRef({ frame: 0, timer: 0 });
+  const stopWidthSettle = () => { cancelAnimationFrame(widthSettle.current.frame); clearTimeout(widthSettle.current.timer); };
+  useEffect(() => stopWidthSettle, []);
+  const toggleWidth = () => {
+    if (!widthKey) return;
+    const row = card.current?.closest("article"), settle = widthSettle.current;
+    flushSync(() => setReplyWide(widthKey, !wide));
+    replyWidth?.measure(row);
+    // Content can settle a frame later (a table gains or loses its tools row),
+    // and the list's observer reports every size one frame late. For a few
+    // frames, measure after that observer has run so no stale height is painted:
+    // each next check is queued once the frame's observers have been delivered.
+    let frames = 6;
+    const follow = () => {
+      flushSync(() => replyWidth?.measure(row));
+      if (--frames > 0) settle.timer = window.setTimeout(() => { settle.frame = requestAnimationFrame(follow); });
+    };
+    stopWidthSettle(); settle.frame = requestAnimationFrame(follow);
+  };
   const goalTurnEnded = isGoalTurnEnded(block, run);
   const taskLabel = scopedTaskLabelSchema.safeParse(block.extra?.scopedTask);
   const scopeUnsupported = scoped && state.runScopesAvailable === false;
@@ -136,6 +163,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
       <span>{phaseLabel}</span>
       <time title={t(ticking ? "本次运行总耗时" : "截至最近一次事件")}>{formatRunDuration(elapsed)}</time>
     </div>
+    {widthKey && <button type="button" className="native-run-width" aria-pressed={wide} aria-label={wide ? t("恢复阅读宽度") : t("加宽这条回复")} title={wide ? t("恢复阅读宽度") : t("加宽这条回复")} onClick={toggleWidth}>{wide ? <ArrowLeftFromLine size={14} aria-hidden="true"/> : <ArrowRightToLine size={14} aria-hidden="true"/>}</button>}
     </div>
     {scoped && notice && <BackgroundTaskReference notice={notice} message={message} source={backgroundSource} compact/>}
     {scoped && taskLabel.success && <ScopedTaskDescription key={taskLabel.data.label} text={taskLabel.data.label}/>}

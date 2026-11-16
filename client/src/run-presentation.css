@@ -82,6 +82,18 @@
    every chat pane. Previews contain plain text, so clipping hides no controls. */
 .native-run-heading{display:flex;align-items:center;gap:4px 10px;min-width:0;flex-wrap:wrap}
 .native-run-heading>.native-run-status{flex:1;min-width:0}
+/* Desktop main chat: one reply can take the chat area's full width. Workspace
+   renders the control only there; it shows, and the widened row applies, only
+   while that area has real room beyond the reading width (attribute kept by the
+   list's own size observer). The negative block margin keeps the heading 22px
+   high. No width transition: the virtual list positions each row. */
+.native-run-width{display:none;flex:none;width:28px;height:28px;margin:-3px -7px -3px -4px;padding:0;border:0;border-radius:var(--radius-sm);color:var(--muted)}
+[data-reply-width-room] .native-run-width{display:inline-flex}
+.native-run-width:hover:not(:disabled){background:var(--hover);color:var(--text)}
+.native-run-width[aria-pressed=true]{background:color-mix(in srgb,var(--mono-mark,var(--accent)) 20%,transparent);color:var(--grey)}
+.native-run-width[aria-pressed=true]:hover:not(:disabled){background:color-mix(in srgb,var(--mono-mark,var(--accent)) 30%,transparent);color:var(--text)}
+[data-reply-width-room] .message.bot:has(.native-run-width[aria-pressed=true]){max-width:none}
+:root[data-palette=cli] .native-run-width{margin-inline-end:0}
 .is-scoped .native-run-status{flex-basis:160px}
 .is-scoped .native-run-status>span:not(.run-state-dot){white-space:normal;overflow:visible}
 .is-scoped .run-scope-heading{display:flex;align-items:center;gap:5px;flex:none;margin:0;color:var(--text);font-size:12px;line-height:22px}
