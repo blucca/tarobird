@@ -1,5 +1,8 @@
 # Entrypoint Map
 
+[1.5.0 preflight](client/release-1.5.0-preflight.md) records desktop reply width,
+Windows DeepSeek Desktop launch routing and the separate platform acceptance boundaries.
+
 [1.4.2 preflight](client/release-1.4.2-preflight.md) records the post-1.4.1 fixes,
 unchanged editor/dependency scope and Windows owner-acceptance boundary.
 
