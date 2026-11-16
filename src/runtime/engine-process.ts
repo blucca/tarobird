@@ -27,6 +27,12 @@ export function spawnEngine(command: string, args: string[], options: SpawnOptio
   if (process.platform !== "win32") return spawn(command, args, options);
   const resolved = resolveEngineExecutable(command, options.env);
   if (resolved && /\.cmd$/i.test(resolved)) {
+    // cmd.exe loses the extra App-tool pipes. Electron may then reuse those fd
+    // numbers for its ASAR archive, so keep the official Desktop runtime direct.
+    const desktop = deepseekDesktopLauncher(resolved);
+    if (desktop) return spawn(desktop.executable, ["--expose-internals", desktop.entrypoint, ...args], {
+      ...options, env: { ...(options.env ?? process.env), ELECTRON_RUN_AS_NODE: "1" }, shell: false, windowsHide: true,
+    });
     // npm's JS launcher can run directly with our bundled Node. Avoiding an
     // intermediate cmd.exe preserves DSH's additional IPC pipe handles too.
     const entry = npmShimEntrypoint(resolved);
@@ -34,6 +40,26 @@ export function spawnEngine(command: string, args: string[], options: SpawnOptio
   }
   if (/\.ps1$/i.test(command)) return spawn("powershell.exe", ["-NoLogo", "-NoProfile", "-File", resolved ?? command, ...args], { ...options, shell: false, windowsHide: true });
   return crossSpawn(resolved ?? command, args, { ...options, shell: false, windowsHide: true });
+}
+
+/** Recognize only the vendor's exact Desktop shim, never arbitrary batch code. */
+export function deepseekDesktopLauncher(shim: string): { executable: string; entrypoint: string } | undefined {
+  try {
+    if (path.basename(shim).toLowerCase() !== "dsh.cmd" || statSync(shim).size > 16384) return;
+    const body = readFileSync(shim, "utf8").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trim();
+    const expected = [
+      "@echo off",
+      "setlocal DisableDelayedExpansion",
+      'set "ELECTRON_RUN_AS_NODE=1"',
+      '"%~dp0..\\..\\..\\..\\DeepSeek Harness.exe" --expose-internals "%~dp0..\\..\\..\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js" %*',
+      "exit /b %errorlevel%",
+    ].join("\n");
+    if (body !== expected) return;
+    const executable = path.resolve(path.dirname(shim), "../../../..", "DeepSeek Harness.exe");
+    const archive = path.resolve(path.dirname(shim), "../../..", "app.asar");
+    if (!statSync(executable).isFile() || !statSync(archive).isFile()) return;
+    return { executable, entrypoint: path.join(archive, "dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js") };
+  } catch { /* Other launchers retain their original behavior. */ }
 }
 
 export function npmShimEntrypoint(shim: string): string | undefined {
