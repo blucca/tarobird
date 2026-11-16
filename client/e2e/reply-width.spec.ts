@@ -209,7 +209,10 @@ test("widening stops at the chat area, withdraws when the area is narrow and ret
     // A side panel takes its space from the chat area; the reply ends there too.
     await page.getByRole("button", { name: "工作台", exact: true }).click();
     const panel = page.locator(".conversation-side-panel").first(); await expect(panel).toBeVisible();
-    await expect.poll(async () => { const now = await layout(page), edge = (await panel.boundingBox())!.x; return [now.rows.table!.right <= Math.min(now.list.right, edge) + 0.5, now.overflow <= 0, now.seam < 1, now.room ? Math.round(now.rows.table!.width) === Math.round(now.list.width) : Math.round(now.rows.table!.width) === Math.round(now.rows.short!.width)]; }).toEqual([true, true, true, true]);
+    // The loading fallback can be replaced between visibility and measurement.
+    // A missing box is not success: keep polling until the real panel is visible
+    // and all of the original layout assertions hold together.
+    await expect.poll(async () => { const box = await panel.boundingBox(); if (!box) return [false, false, false, false]; const now = await layout(page), edge = box.x; return [now.rows.table!.right <= Math.min(now.list.right, edge) + 0.5, now.overflow <= 0, now.seam < 1, now.room ? Math.round(now.rows.table!.width) === Math.round(now.list.width) : Math.round(now.rows.table!.width) === Math.round(now.rows.short!.width)]; }).toEqual([true, true, true, true]);
     await page.screenshot({ path: info.outputPath("desktop-side-panel.png"), animations: "disabled" });
   } finally { await page.close(); await f.close(); }
 });
