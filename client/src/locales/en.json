@@ -5255,5 +5255,14 @@
   "从列表选择 Bot": "Choose a Bot from the list",
   "已保存授权，并从接收主机核对生效。": "Permissions saved and verified with the receiving host.",
   "仅可撤销的授权": "Revoke-only permissions",
-  "来源为内部执行者，仅可撤销": "Source is an internal worker; revoke only"
+  "来源为内部执行者，仅可撤销": "Source is an internal worker; revoke only",
+  "发送方电脑": "Sending computer",
+  "发送方 Bot": "Sending Bot",
+  "发送方 Bot ID": "Sending Bot ID",
+  "允许联系的本机 Bot": "Allowed local Bots",
+  "此设备尚未连接发送方电脑，或发送方电脑暂时离线。连接后可按名称选择；也可填写准确的 Bot ID。": "This device is not connected to the sending computer, or it is offline. Connect to choose by name, or enter the exact Bot ID.",
+  "请核对发送方 Bot ID；这里不会自动验证它的名称或创建新 Bot。": "Check the sending Bot ID carefully. Its name is not verified here, and no new Bot will be created.",
+  "这个 Bot 不在发送方电脑当前列表中，只能撤销已有授权。": "This Bot isn't in the sending computer's current list; you can only revoke its existing permissions.",
+  "发送方电脑当前不可用，仅可撤销": "Sending computer unavailable; revoke only",
+  "保存或放弃修改后，可以切换发送方。": "Save or discard your changes before switching the sender."
 }

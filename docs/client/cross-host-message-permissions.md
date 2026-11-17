@@ -9,13 +9,14 @@ Open the **receiving host** in the App, then **Settings → Bot message permissi
 the recipient. The Local scope continues to manage messages within one host.
 
 1. Join the hosts to the same TaroBird network in Devices & Network.
-2. Choose the source host and requesting Bot. This host's Bots are listed below
+2. Choose **Sending computer** and **Sending Bot**. This host's Bots are listed below
+   under **Allowed local Bots**
    with their avatars and presence; existing permissions are already checked.
 3. Check or clear several receiving Bots, then select **Save permissions**. The
    App signs only the changed targets as one command with the receiving owner's
    authenticated device, then reads every change back from that host.
 
-The layout follows the Local scope. Source host and requesting Bot use the
+The layout follows the Local scope. Sending computer and Sending Bot use the
 platform's select; same-name entries carry an ID tail. Source Bot names come
 from another host and are shown as text only; this host's avatars and presence
 appear only for receiving Bots. Choosing a source, searching or discarding

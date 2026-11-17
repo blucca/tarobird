@@ -42,7 +42,7 @@ const pageState = async (page: Page) => JSON.parse(await page.getByTestId("page-
 const box = (p: Locator, id: string) => p.locator(`.message-grants-target[data-bot-id="${id}"] input[type="checkbox"]`);
 const options = (select: Locator) => select.locator("option").allTextContents();
 const controls = (p: Locator) => ({
-  host: p.getByLabel("来源主机", { exact: true }), source: p.getByLabel("发起方 Bot", { exact: true }),
+  host: p.getByLabel("发送方电脑", { exact: true }), source: p.getByLabel("发送方 Bot", { exact: true }),
   save: p.getByRole("button", { name: "保存授权", exact: true }), discard: p.getByRole("button", { name: "放弃修改", exact: true }),
 });
 
@@ -127,12 +127,12 @@ test("switching sources, searching and discarding never write; a draft locks eve
   await host.selectOption({ label: "实验室主机" });
   // No connected directory and no records: an exact ID is the only way to name a source.
   await expect(source).toHaveCount(0);
-  const exact = p.getByLabel("发起方 Bot ID", { exact: true });
-  await expect(p.getByText("此设备尚未连接来源主机，或来源主机暂时离线。连接后可按名称选择；也可填写准确的 Bot ID。", { exact: true })).toBeVisible();
+  const exact = p.getByLabel("发送方 Bot ID", { exact: true });
+  await expect(p.getByText("此设备尚未连接发送方电脑，或发送方电脑暂时离线。连接后可按名称选择；也可填写准确的 Bot ID。", { exact: true })).toBeVisible();
   await expect(box(p, "alpha")).toBeDisabled();
   await exact.fill("lab_bot");
   await expect(box(p, "alpha")).toBeEnabled();
-  await expect(p.getByText("请核对来源 Bot ID；这里不会自动验证它的名称或创建新 Bot。", { exact: true })).toBeVisible();
+  await expect(p.getByText("请核对发送方 Bot ID；这里不会自动验证它的名称或创建新 Bot。", { exact: true })).toBeVisible();
   expect((await pageState(page)).dirty).toBe(false);
   await host.selectOption({ label: "演示来源主机" });
   await expect(source).toHaveValue("alpha");
@@ -157,7 +157,7 @@ test("switching sources, searching and discarding never write; a draft locks eve
   await expect(host).toBeEnabled();
   // The secondary entry switches to an exact ID without creating a draft.
   await p.getByRole("button", { name: "使用 Bot ID", exact: true }).click();
-  await expect(p.getByLabel("发起方 Bot ID", { exact: true })).toBeFocused();
+  await expect(p.getByLabel("发送方 Bot ID", { exact: true })).toBeFocused();
   await p.getByRole("button", { name: "从列表选择 Bot", exact: true }).click();
   await expect(source).toHaveValue("alpha");
   expect((await pageState(page)).dirty).toBe(false);
@@ -213,7 +213,7 @@ test("departed sources, deleted recipients and internal sources are revoke-only 
   expect(await options(host)).not.toContain("已离网主机");
   await expect(p.locator('.message-grants-target[data-bot-id="retired"]')).toHaveCount(0);
   const edge = section.locator(".cross-grants-edge").filter({ hasText: "已离网主机" });
-  await expect(edge).toContainText("来源主机当前不可用，仅可撤销");
+  await expect(edge).toContainText("发送方电脑当前不可用，仅可撤销");
   await expect(edge).toContainText("接收 Bot 已不可用，仅可撤销");
   const revoke = edge.getByRole("button", { name: "撤销 已离网主机 · legacy_bot → 演示接收主机 · 已删除助手", exact: true });
   // One transaction at a time: a list draft must be saved or discarded first.
@@ -238,7 +238,7 @@ test("the same Bot ID on another host is another endpoint, and directory changes
   expect(await commands(page)).toEqual([expect.objectContaining({ sourceHost: twinA, sourceBot: "twin_bot", changes: [{ targetBot: "alpha", allowed: true }] })]);
   // The other same-name host has no directory here; its twin_bot borrows nothing.
   await host.selectOption(twinB);
-  await p.getByLabel("发起方 Bot ID", { exact: true }).fill("twin_bot");
+  await p.getByLabel("发送方 Bot ID", { exact: true }).fill("twin_bot");
   await expect(box(p, "alpha")).not.toBeChecked();
   await host.selectOption(studio);
   await expect(source).toHaveValue("alpha");
@@ -249,12 +249,12 @@ test("the same Bot ID on another host is another endpoint, and directory changes
   await expect(save).toBeDisabled();
   // It left the live directory instead: its records could be revoked, nothing granted.
   await page.evaluate(() => { const f = window.grantFixture; delete f.sources.studio!.bots[0]!.role; f.sources.studio!.bots.splice(0, 1); f.render(); });
-  await expect(p.getByText("这个 Bot 不在来源主机当前列表中，只能撤销已有授权。", { exact: true })).toBeVisible();
+  await expect(p.getByText("这个 Bot 不在发送方电脑当前列表中，只能撤销已有授权。", { exact: true })).toBeVisible();
   await expect(save).toBeDisabled();
   await expect(box(p, "beta")).toBeEnabled();
   // The whole directory went away: the existing exact-ID path applies.
   await page.evaluate(() => { const f = window.grantFixture; f.sources.studio!.status = "offline"; f.render(); });
-  await expect(p.getByText("请核对来源 Bot ID；这里不会自动验证它的名称或创建新 Bot。", { exact: true })).toBeVisible();
+  await expect(p.getByText("请核对发送方 Bot ID；这里不会自动验证它的名称或创建新 Bot。", { exact: true })).toBeVisible();
   await expect(source).toHaveValue("alpha");
   await save.click();
   await expect(p.getByRole("status")).toHaveText("已保存授权，并从接收主机核对生效。");
@@ -289,7 +289,7 @@ for (const layout of layouts) for (const language of ["zh", "en"] as const) test
   const page = await context.newPage();
   try {
     const p = await openCross(page, `mount=section&lang=${language}`);
-    const words = language === "zh" ? { bot: "发起方 Bot", more: "说明与手动 Bot ID", save: "保存授权", discard: "放弃修改" } : { bot: "Requesting Bot", more: "Details and manual Bot ID", save: "Save permissions", discard: "Discard changes" };
+    const words = language === "zh" ? { bot: "发送方 Bot", more: "说明与手动 Bot ID", save: "保存授权", discard: "放弃修改" } : { bot: "Sending Bot", more: "Details and manual Bot ID", save: "Save permissions", discard: "Discard changes" };
     await p.getByLabel(words.bot, { exact: true }).selectOption("long_name_bot");
     await box(p, "alpha").check();
     await p.getByText(words.more, { exact: true }).click();

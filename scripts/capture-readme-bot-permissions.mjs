@@ -61,7 +61,7 @@ try{
    await page.getByRole('navigation',{name:word('Settings categories','设置分类')}).getByRole('button',{name:word('Bot message permissions','Bot 消息授权'),exact:true}).click();
    await page.getByRole('button',{name:word('Cross-host','跨主机'),exact:true}).click();
    const panel=page.locator('.cross-host-message-grants');
-   await panel.getByLabel(word('Requesting Bot','发起方 Bot'),{exact:true}).selectOption('coordinator');
+   await panel.getByLabel(word('Sending Bot','发送方 Bot'),{exact:true}).selectOption('coordinator');
    await panel.locator('.message-grants-target[data-bot-id="build"] input[type="checkbox"]').check();
    await panel.getByRole('button',{name:word('Save permissions','保存授权'),exact:true}).click();
    await panel.getByRole('status').filter({hasText:word('Permissions saved and verified','已保存授权，并从接收主机核对生效')}).waitFor();

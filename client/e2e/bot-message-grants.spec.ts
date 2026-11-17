@@ -76,13 +76,13 @@ for (const width of [390, 1360]) test(`cross-host permissions grant, verify repl
     const p = page.locator('.cross-host-message-grants');
     await expect(p.getByText('接收主机：授权验收主机', { exact: true })).toBeVisible();
     // Not connected to the source host: its recorded Bot is listed by ID, with the CLI grant checked.
-    await expect(p.getByLabel('发起方 Bot', { exact: true })).toHaveValue('existing');
+    await expect(p.getByLabel('发送方 Bot', { exact: true })).toHaveValue('existing');
     await expect(p.getByRole('checkbox', { name: '允许 来源电脑 · existing → 复核助手', exact: true })).toBeChecked();
     const input = { operation: 'resolve' as const, host: f.host, bot: 'alpha', requestId: 'ui-cross-task', data: {} };
     await expect(remote.sender.local(input, 'remote', guard, true)).rejects.toThrow('not_authorized');
     await p.getByText('说明与手动 Bot ID', { exact: true }).click();
     await p.getByRole('button', { name: '使用 Bot ID', exact: true }).click();
-    await p.getByLabel('发起方 Bot ID', { exact: true }).fill('remote');
+    await p.getByLabel('发送方 Bot ID', { exact: true }).fill('remote');
     // The receiving Bots are this host's own list, as on the Local page.
     await expect(p.locator('.message-grants-target strong')).toHaveText(['研究助手', '复核助手', '离线资料助手']);
     const allow = p.getByRole('checkbox', { name: '允许 来源电脑 · remote → 研究助手', exact: true });
@@ -122,7 +122,7 @@ test("cross-host source names come from an authenticated App connection, hide wo
     await page.getByLabel('筛选运行主机').filter({ visible: true }).first().selectOption({ label: '授权验收主机' });
     await openGrants(page); await page.getByRole('button', { name: '跨主机', exact: true }).click();
     const p = page.locator('.cross-host-message-grants');
-    const source = p.getByLabel('发起方 Bot', { exact: true });
+    const source = p.getByLabel('发送方 Bot', { exact: true });
     // Names come from the authenticated connection; the internal worker is not offered.
     await expect(source.locator('option')).toHaveText(['来源助手 existing · 已授权 1 个', '来源助手 remote']);
     await expect(source).toHaveValue('existing');
@@ -131,7 +131,7 @@ test("cross-host source names come from an authenticated App connection, hide wo
     await expect(page.getByRole('button', { name: '本机', exact: true })).toBeEnabled();
     await p.getByText('说明与手动 Bot ID', { exact: true }).click();
     await p.getByRole('button', { name: '使用 Bot ID', exact: true }).click();
-    await p.getByLabel('发起方 Bot ID', { exact: true }).fill('worker');
+    await p.getByLabel('发送方 Bot ID', { exact: true }).fill('worker');
     await expect(p.getByRole('checkbox', { name: '允许 来源电脑 · worker → 研究助手', exact: true })).toBeDisabled();
     await expect(p.getByRole('alert')).toHaveText('内部执行者不参与手动消息授权，请选择普通 Bot。');
     await p.getByRole('button', { name: '从列表选择 Bot', exact: true }).click();
@@ -144,7 +144,7 @@ test("cross-host source names come from an authenticated App connection, hide wo
     await page.locator('#language').selectOption('en');
     await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: /^Bot message permissions/ }).click();
     await page.getByRole('button', { name: 'Cross-host', exact: true }).click();
-    await p.getByLabel('Requesting Bot', { exact: true }).selectOption('remote');
+    await p.getByLabel('Sending Bot', { exact: true }).selectOption('remote');
     await expect(p.getByText('Receiving host: 授权验收主机', { exact: true })).toBeVisible();
     const granted = p.getByRole('checkbox', { name: 'Allow 来源电脑 · 来源助手 remote → 研究助手', exact: true });
     await expect(granted).toBeChecked();
@@ -167,7 +167,7 @@ for (const action of ["allow", "revoke"]) test(`cross-host ${action} loss of rec
     if (action === 'allow') {
       await p.getByText('说明与手动 Bot ID', { exact: true }).click();
       await p.getByRole('button', { name: '使用 Bot ID', exact: true }).click();
-      await p.getByLabel('发起方 Bot ID', { exact: true }).fill('remote');
+      await p.getByLabel('发送方 Bot ID', { exact: true }).fill('remote');
       await choice.check();
     } else await choice.uncheck();
     let writes = 0;
@@ -198,7 +198,7 @@ test("cross-host expired device verification explains recovery without claiming 
     const p = page.locator('.cross-host-message-grants');
     await p.getByText('说明与手动 Bot ID', { exact: true }).click();
     await p.getByRole('button', { name: '使用 Bot ID', exact: true }).click();
-    await p.getByLabel('发起方 Bot ID', { exact: true }).fill('remote');
+    await p.getByLabel('发送方 Bot ID', { exact: true }).fill('remote');
     await p.getByRole('checkbox', { name: '允许 来源电脑 · remote → 研究助手', exact: true }).check();
     await page.route('**/api/devices/challenge', route => route.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'device_action_expired' }) }), { times: 1 });
     await p.getByRole('button', { name: '保存授权', exact: true }).click();
@@ -221,7 +221,7 @@ test("cross-host changes block stale drafts and leave removed sources and delete
     const p = page.locator('.cross-host-message-grants');
     await p.getByText('说明与手动 Bot ID', { exact: true }).click();
     await p.getByRole('button', { name: '使用 Bot ID', exact: true }).click();
-    await p.getByLabel('发起方 Bot ID', { exact: true }).fill('remote');
+    await p.getByLabel('发送方 Bot ID', { exact: true }).fill('remote');
     await p.getByRole('checkbox', { name: '允许 来源电脑 · remote → 研究助手', exact: true }).check();
     const row = await f.hub.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='private-network:v1'");
     const state = JSON.parse(row!.value);
@@ -234,7 +234,7 @@ test("cross-host changes block stale drafts and leave removed sources and delete
     await expect(p.getByRole('alert')).toContainText('状态已变化');
     await expect(p.getByRole('button', { name: '撤销 来源电脑 · existing → 授权验收主机 · 复核助手', exact: true })).toBeDisabled();
     await p.getByRole('button', { name: '重新载入并核对', exact: true }).click();
-    await expect(p.getByText('来源主机当前不可用，仅可撤销', { exact: true })).toBeVisible();
+    await expect(p.getByText('发送方电脑当前不可用，仅可撤销', { exact: true })).toBeVisible();
     await expect(p.getByText('接收 Bot 已不可用，仅可撤销', { exact: true })).toBeVisible();
     await p.getByRole('button', { name: '撤销 来源电脑 · existing → 授权验收主机 · 复核助手', exact: true }).click();
     await expect(p.getByRole('status')).toHaveText('已撤销授权，并从接收主机核对生效。');
@@ -615,7 +615,7 @@ test(`cross-host sticky feedback does not expose clipped text below its notice a
     const p = page.locator('.cross-host-message-grants');
     await p.getByText('Details and manual Bot ID', { exact: true }).click();
     await p.getByRole('button', { name: 'Use Bot ID', exact: true }).click();
-    await p.getByLabel('Requesting Bot ID', { exact: true }).fill('remote');
+    await p.getByLabel('Sending Bot ID', { exact: true }).fill('remote');
     await p.getByRole('checkbox', { name: 'Allow 来源电脑 · remote → 研究助手', exact: true }).check();
     await p.getByRole('button', { name: 'Save permissions', exact: true }).click();
     await expect(p.getByRole('status')).toContainText('Permissions saved and verified');

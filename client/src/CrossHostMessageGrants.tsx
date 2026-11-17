@@ -201,7 +201,7 @@ export function CrossHostMessageGrants({ connection, initialBotId, active, onlin
   const direction = (edge: Edge) => { const [from, to] = edgeParts(edge); return <><span>{from}</span>{" "}<span>→ {to}</span></>; };
   // One unsaved-changes mark for the pair, as the Local page has for its one select.
   const sourceTitle = (text: string, mark = false) => <span className="message-grants-source-title"><span>{text}</span>{mark && dirty && <small>{t("有未保存的修改")}</small>}</span>;
-  const sourceLock = dirty ? t("保存或放弃修改后，可以切换来源。") : undefined;
+  const sourceLock = dirty ? t("保存或放弃修改后，可以切换发送方。") : undefined;
   const reload = <button type="button" className="secondary" disabled={busy || checking || !online} onClick={() => { void refresh(true, true); }}>{checking ? t("正在载入…") : t("重新载入并核对")}</button>;
   return <div className="cross-host-message-grants">
     <div className="message-grants-intro"><p>{t("允许其他主机的指定 Bot 向这台主机发送协作消息与文件。")}</p>
@@ -213,27 +213,27 @@ export function CrossHostMessageGrants({ connection, initialBotId, active, onlin
       <p className="empty-state">{t("暂无可授权的其他主机。请先在「设备与网络」中将两台主机加入同一网络。")}</p>
       {(stale || uncertain || error) && <div className="message-grants-actions">{reload}</div>}
     </> : <>
-      <label className="message-grants-source">{sourceTitle(t("来源主机"), true)}
-        <select aria-label={t("来源主机")} title={sourceLock} value={sourceHost} disabled={busy || checking || dirty} onChange={event => chooseHost(event.target.value)}>
+      <label className="message-grants-source">{sourceTitle(t("发送方电脑"), true)}
+        <select aria-label={t("发送方电脑")} title={sourceLock} value={sourceHost} disabled={busy || checking || dirty} onChange={event => chooseHost(event.target.value)}>
           {hosts.map(host => <option key={host.id} value={host.id}>{host.available ? hostName(host.id) : `${hostName(host.id)} · ${t("不可用")}`}</option>)}
         </select></label>
-      {byId ? <label className="message-grants-source">{sourceTitle(t("发起方 Bot ID"))}
-          <input ref={idField} aria-label={t("发起方 Bot ID")} title={sourceLock} autoComplete="off" autoCapitalize="off" spellCheck={false} maxLength={128} value={sourceBot} disabled={busy || checking || dirty} onChange={event => { setSourceBot(event.target.value); setNotice(""); }}/></label>
-        : <label className="message-grants-source">{sourceTitle(t("发起方 Bot"))}
-          <select aria-label={t("发起方 Bot")} title={sourceLock} value={source} disabled={busy || checking || dirty} onChange={event => { if (!Object.keys(draft.current).length) { setSourceBot(event.target.value); setNotice(""); } }}>
+      {byId ? <label className="message-grants-source">{sourceTitle(t("发送方 Bot ID"))}
+          <input ref={idField} aria-label={t("发送方 Bot ID")} title={sourceLock} autoComplete="off" autoCapitalize="off" spellCheck={false} maxLength={128} value={sourceBot} disabled={busy || checking || dirty} onChange={event => { setSourceBot(event.target.value); setNotice(""); }}/></label>
+        : <label className="message-grants-source">{sourceTitle(t("发送方 Bot"))}
+          <select aria-label={t("发送方 Bot")} title={sourceLock} value={source} disabled={busy || checking || dirty} onChange={event => { if (!Object.keys(draft.current).length) { setSourceBot(event.target.value); setNotice(""); } }}>
             {choices.map(id => { const count = recorded.filter(grant => grant.sourceBot === id).length, text = sourceName(sourceHost, id);
               return <option key={id} value={id}>{count ? t("{0} · 已授权 {1} 个", text, count) : text}</option>; })}
           </select></label>}
-      {!sources.length && <p className="message-grants-hint">{t("此设备尚未连接来源主机，或来源主机暂时离线。连接后可按名称选择；也可填写准确的 Bot ID。")}</p>}
-      {(manual || !sources.length) && validSource && !internalSource && <p className="message-grants-hint">{t("请核对来源 Bot ID；这里不会自动验证它的名称或创建新 Bot。")}</p>}
+      {!sources.length && <p className="message-grants-hint">{t("此设备尚未连接发送方电脑，或发送方电脑暂时离线。连接后可按名称选择；也可填写准确的 Bot ID。")}</p>}
+      {(manual || !sources.length) && validSource && !internalSource && <p className="message-grants-hint">{t("请核对发送方 Bot ID；这里不会自动验证它的名称或创建新 Bot。")}</p>}
       {internalSource && <p role="alert" className="message-grants-error">{t("内部执行者不参与手动消息授权，请选择普通 Bot。")}</p>}
-      {!manual && !!sources.length && validSource && !liveSource && !internalSource && <p className="message-grants-hint">{t("这个 Bot 不在来源主机当前列表中，只能撤销已有授权。")}</p>}
+      {!manual && !!sources.length && validSource && !liveSource && !internalSource && <p className="message-grants-hint">{t("这个 Bot 不在发送方电脑当前列表中，只能撤销已有授权。")}</p>}
       <details className="cross-grants-more"><summary>{t("说明与手动 Bot ID")}</summary>
         <p className="message-grants-hint">{t("由接收主机的所有者确认。仅授权所选方向；原任务的结果回复无需反向授权。")}</p>
         <p className="message-grants-hint">{t("授权允许列出接收 Bot 的对话名称、发送消息与文件；只可取回自身任务的回复。")}</p>
         {listed.length > 0 && <button type="button" className="text-button" title={sourceLock} disabled={busy || checking || dirty} onClick={toggleManual}>{manual ? t("从列表选择 Bot") : t("使用 Bot ID")}</button>}
       </details>
-      <div className="message-grants-heading"><h4 id={titleId}><ArrowUpRight size={17}/>{t("它可以请求谁")}</h4><span>{t("已选择 {0} 个", selectedCount)}</span></div>
+      <div className="message-grants-heading"><h4 id={titleId}><ArrowUpRight size={17}/>{t("允许联系的本机 Bot")}</h4><span>{t("已选择 {0} 个", selectedCount)}</span></div>
       <p className="message-grants-hint">{t("只设置这个方向；接收方可以返回原任务结果，无需反向授权。")}</p>
       {targets.length > 6 && <label className="message-grants-search"><Search size={16}/><input aria-label={t("查找接收方 Bot")} placeholder={t("查找接收方 Bot")} value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === "Escape" && query) { event.preventDefault(); event.stopPropagation(); setQuery(""); } }}/></label>}
       <div className="message-grants-targets" role="group" aria-labelledby={titleId}>
@@ -258,7 +258,7 @@ export function CrossHostMessageGrants({ connection, initialBotId, active, onlin
       <p className="message-grants-hint">{t("包含通过命令行设置的授权。主机离网后授权不会放行，仍可在此撤销记录。")}</p>
       {records.length > 6 && <label className="message-grants-search"><Search size={16} aria-hidden="true"/><input aria-label={t("查找跨主机授权")} placeholder={t("查找跨主机授权")} value={recordQuery} onChange={event => setRecordQuery(event.target.value)}/></label>}
       {shownRecords.slice(0, 100).map(edge => <div className="cross-grants-edge" key={JSON.stringify(edge)}><div><strong>{direction(edge)}</strong>
-        {!available(edge.sourceHost) && <small>{t("来源主机当前不可用，仅可撤销")}</small>}
+        {!available(edge.sourceHost) && <small>{t("发送方电脑当前不可用，仅可撤销")}</small>}
         {!live(edge.targetBot) && <small>{t("接收 Bot 已不可用，仅可撤销")}</small>}
         {internal(edge) && <small>{t("来源为内部执行者，仅可撤销")}</small>}</div>
         <button type="button" className="text-danger" disabled={blocked || dirty} onClick={() => revoke(edge)} aria-label={t("撤销 {0}", edgeText(edge))}>{t("撤销授权")}</button></div>)}
