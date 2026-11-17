@@ -19,6 +19,14 @@ public class AndroidUpdatePolicyTest {
         assertSame(mock, transfer.interceptors().get(0));
         assertEquals(300000, api.callTimeoutMillis());
     }
+    @Test public void playDistributionDisablesTheGitHubUpdater() {
+        boolean play = "play".equals(System.getProperty("tarobot.distribution"));
+        assertEquals(!play, BuildConfig.TAROBOT_IN_APP_UPDATES);
+        if (play) { assertEquals("", BuildConfig.TAROBOT_UPDATE_REPOSITORY); assertEquals("", BuildConfig.TAROBOT_UPDATE_CLIENT_ID); }
+        assertTrue(AndroidUpdatePolicy.enabled(true, "owner/repo", "Ov23.testing"));
+        assertFalse(AndroidUpdatePolicy.enabled(false, "owner/repo", "Ov23.testing"));
+        assertFalse(AndroidUpdatePolicy.enabled(true, "", ""));
+    }
     private JSONObject release(String version, long id) throws Exception {
         return new JSONObject().put("tag_name", "android-tarobot-v" + version).put("draft", false).put("prerelease", false).put("body", "Notes")
             .put("assets", new JSONArray().put(new JSONObject().put("name", "TaroBot-" + version + "-android.apk").put("id", id).put("size", 100)

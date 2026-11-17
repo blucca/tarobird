@@ -1,5 +1,12 @@
 apply plugin: 'com.android.application'
 
+// `github` (default) is the GitHub Releases APK with the in-app updater.
+// `play` is the Google Play build: Play owns updates, so it has no in-app
+// updater, no updater identity and no REQUEST_INSTALL_PACKAGES.
+def distribution = providers.gradleProperty('tarobotDistribution').getOrElse('github')
+if (!(distribution in ['github', 'play'])) throw new GradleException('tarobotDistribution must be github or play')
+def inAppUpdates = distribution == 'github'
+
 android {
     buildFeatures { buildConfig true }
     namespace = "com.tarobot.client"
@@ -16,21 +23,27 @@ android {
         versionName providers.gradleProperty('tarobotVersionName').orElse('1.5.0').get()
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         // Public OAuth application identity only. User credentials stay in AndroidKeyStore.
-        def updateRepository = providers.gradleProperty('tarobotUpdateRepository').orElse(providers.environmentVariable('TAROBOT_GITHUB_REPOSITORY')).getOrElse('')
-        def updateClientId = providers.gradleProperty('tarobotUpdateClientId').orElse(providers.environmentVariable('TAROBOT_GITHUB_CLIENT_ID')).getOrElse('')
+        def updateRepository = inAppUpdates ? providers.gradleProperty('tarobotUpdateRepository').orElse(providers.environmentVariable('TAROBOT_GITHUB_REPOSITORY')).getOrElse('') : ''
+        def updateClientId = inAppUpdates ? providers.gradleProperty('tarobotUpdateClientId').orElse(providers.environmentVariable('TAROBOT_GITHUB_CLIENT_ID')).getOrElse('') : ''
         if (updateRepository && !(updateRepository ==~ /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/)) throw new GradleException('Invalid update repository')
         if (updateClientId && !(updateClientId ==~ /[A-Za-z0-9._-]{8,128}/)) throw new GradleException('Invalid public OAuth client ID')
         buildConfigField 'String', 'TAROBOT_UPDATE_REPOSITORY', '"' + updateRepository + '"'
         buildConfigField 'String', 'TAROBOT_UPDATE_CLIENT_ID', '"' + updateClientId + '"'
+        buildConfigField 'boolean', 'TAROBOT_IN_APP_UPDATES', String.valueOf(inAppUpdates)
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
-    sourceSets { androidTest.assets.srcDir("../../e2e/fixtures/media") }
+    sourceSets {
+        androidTest.assets.srcDir("../../e2e/fixtures/media")
+        // Build-type manifests outrank main, so this overlay's tools:node="remove"
+        // drops the install permission from every Play variant.
+        if (!inAppUpdates) { debug.manifest.srcFile 'src/play/AndroidManifest.xml'; release.manifest.srcFile 'src/play/AndroidManifest.xml' }
+    }
     testOptions {
-        unitTests.all { systemProperty "tarobot.repoRoot", rootProject.projectDir.parentFile.parentFile.absolutePath }
+        unitTests.all { systemProperty "tarobot.repoRoot", rootProject.projectDir.parentFile.parentFile.absolutePath; systemProperty "tarobot.distribution", distribution }
     }
     buildTypes {
         release {
@@ -42,7 +55,7 @@ android {
 
 tasks.matching { it.name == 'preReleaseBuild' }.configureEach {
     doFirst {
-        if (android.defaultConfig.buildConfigFields['TAROBOT_UPDATE_REPOSITORY'].value == '""' || android.defaultConfig.buildConfigFields['TAROBOT_UPDATE_CLIENT_ID'].value == '""') {
+        if (inAppUpdates && (android.defaultConfig.buildConfigFields['TAROBOT_UPDATE_REPOSITORY'].value == '""' || android.defaultConfig.buildConfigFields['TAROBOT_UPDATE_CLIENT_ID'].value == '""')) {
             throw new GradleException('Android releases require TAROBOT_GITHUB_REPOSITORY and TAROBOT_GITHUB_CLIENT_ID (public OAuth client ID)')
         }
     }

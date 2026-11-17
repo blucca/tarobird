@@ -60,3 +60,10 @@ test("Android verification failure blocks installation and retains an explicit r
   expect(await page.evaluate(() => (window as any).updateFixture.calls.includes('install'))).toBe(false);
   await expect(page.getByRole("button", { name: "下载并安装", exact: true })).toBeVisible();
 });
+test("Play build hides App updates and never starts a GitHub check", async ({ page }) => {
+  await page.evaluate(() => (window as any).updateFixture.unmount());
+  await page.evaluate(() => { const f = (window as any).updateFixture; f.calls.length = 0; f.state = { phase: 'disabled', inAppUpdates: false, configured: false, version: '1.0.88', authenticated: false }; f.mount(); });
+  await expect(page.getByRole("heading", { name: "应用更新" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "登录 GitHub", exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).updateFixture.calls)).toEqual([]);
+});

@@ -28,6 +28,7 @@ final class AndroidUpdateService {
     interface Changed { void changed(JSONObject value); }
     final Context context;
     private final String repo, clientId;
+    private final boolean inAppUpdates;
     private final DeviceKeyStore vault;
     private final SharedPreferences prefs;
     private final Changed changed;
@@ -43,8 +44,10 @@ final class AndroidUpdateService {
     private volatile JSONObject flow;
     private long received, nextPoll;
     private boolean loaded, verified;
-    AndroidUpdateService(Context context, String repo, String clientId, Changed changed) {
-        this.context = context; this.repo = repo; this.clientId = clientId; this.changed = changed;
+    AndroidUpdateService(Context context, String repo, String clientId, Changed changed) { this(context, repo, clientId, changed, true); }
+    /** {@code inAppUpdates=false} (Play build): never log in, check, download, verify or install. */
+    AndroidUpdateService(Context context, String repo, String clientId, Changed changed, boolean inAppUpdates) {
+        this.context = context; this.repo = repo; this.clientId = clientId; this.changed = changed; this.inAppUpdates = inAppUpdates;
         vault = new DeviceKeyStore(context); prefs = context.getSharedPreferences("tarobot_android_updates_v1", Context.MODE_PRIVATE);
     }
     private PackageInfo installed() throws Exception { return context.getPackageManager().getPackageInfo(context.getPackageName(), flags()); }
@@ -61,7 +64,7 @@ final class AndroidUpdateService {
     synchronized JSONObject snapshot() {
         JSONObject out = new JSONObject();
         try {
-            out.put("phase", phase).put("configured", AndroidUpdatePolicy.configured(repo, clientId)).put("version", installed().versionName).put("authenticated", token != null).put("bytes", received).put("downloaded", verified);
+            out.put("phase", phase).put("configured", AndroidUpdatePolicy.enabled(inAppUpdates, repo, clientId)).put("inAppUpdates", inAppUpdates).put("version", installed().versionName).put("authenticated", token != null).put("bytes", received).put("downloaded", verified);
             if (login != null) out.put("login", login); if (error != null) out.put("error", error);
             if (offer != null) out.put("nextVersion", offer.getString("version")).put("notes", offer.optString("notes")).put("total", offer.getLong("size"));
         } catch (Exception ignored) { try { out.put("error", "github_update_failed"); } catch (Exception impossible) { /* JSONObject literals */ } }
@@ -70,7 +73,7 @@ final class AndroidUpdateService {
     synchronized void state(String next) { phase = next; error = null; changed.changed(snapshot()); }
     synchronized void fail(Exception failure) {
         String value = failure.getMessage();
-        error = value != null && value.matches("github_update_(login_required|denied|expired|network|configuration|repo_unavailable|signature|invalid_offer|cancelled|response|manifest|keychain|install|busy|bounds|failed|permissions)") ? value : "github_update_failed";
+        error = value != null && value.matches("github_update_(login_required|denied|expired|network|configuration|repo_unavailable|signature|invalid_offer|cancelled|response|manifest|keychain|install|busy|bounds|failed|permissions|unsupported)") ? value : "github_update_failed";
         if ("github_update_login_required".equals(error)) { token = null; login = null; }
         phase = "error"; changed.changed(snapshot());
     }
@@ -81,6 +84,8 @@ final class AndroidUpdateService {
         if (raw != null) { JSONObject saved = new JSONObject(raw); token = saved.getString("token"); login = saved.getString("login"); }
         loaded = true;
         raw = prefs.getString("offer", null);
+        // A Play build never resumes a download left by an earlier GitHub APK.
+        if (raw != null && !inAppUpdates) { clearDownload(); raw = null; }
         if (raw != null) {
             try {
                 offer = new JSONObject(raw);
@@ -88,8 +93,9 @@ final class AndroidUpdateService {
                 else if (apk().isFile()) { verify(); state("ready"); return; }
             } catch (Exception invalid) { clearDownload(); offer = null; }
         }
-        state(!AndroidUpdatePolicy.configured(repo, clientId) ? "disabled" : "initial");
+        state(!AndroidUpdatePolicy.enabled(inAppUpdates, repo, clientId) ? "disabled" : "initial");
     }
+    private void supported() throws IOException { if (!inAppUpdates) throw new IOException("github_update_unsupported"); }
     private String credential() throws IOException { if (token == null) throw new IOException("github_update_login_required"); return token; }
     private String request(Request request, boolean authenticated) throws Exception {
         active = http.newCall(request);
@@ -109,6 +115,7 @@ final class AndroidUpdateService {
         return new JSONObject(request(new Request.Builder().url("https://github.com/login/" + endpoint).header("Accept", "application/json").header("User-Agent", "TaroBot-Android-Updater").post(body).build(), false));
     }
     JSONObject startLogin() throws Exception {
+        supported();
         if (!AndroidUpdatePolicy.configured(repo, clientId)) throw new IOException("github_update_configuration");
         flow = null;
         JSONObject result = oauth("device/code", new FormBody.Builder().add("client_id", clientId).add("scope", "repo").build());
@@ -149,7 +156,7 @@ final class AndroidUpdateService {
         clearDownload(); offer = null; state("initial");
     }
     void check() throws Exception {
-        load(); if (!AndroidUpdatePolicy.configured(repo, clientId)) { state("disabled"); return; }
+        load(); if (!AndroidUpdatePolicy.enabled(inAppUpdates, repo, clientId)) { state("disabled"); return; }
         if (token == null) { state("login-required"); return; }
         state("checking"); JSONArray all = new JSONArray();
         for (int page = 1; page <= 3; page++) {
@@ -165,6 +172,7 @@ final class AndroidUpdateService {
     }
     void cancel() { cancelled = true; Call call = active; if (call != null) call.cancel(); }
     void download() throws Exception {
+        supported();
         if (offer == null || !("available".equals(phase) || "error".equals(phase))) throw new IOException("github_update_invalid_offer");
         cancelled = false; received = 0; verified = false; state("downloading");
         File part = partial();
@@ -206,7 +214,7 @@ final class AndroidUpdateService {
         finally { active = null; }
     }
     void verify() throws Exception {
-        verified = false;
+        verified = false; supported();
         if (offer == null || !apk().isFile() || apk().length() != offer.getLong("size")) throw new IOException("github_update_signature");
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         try (var in = new FileInputStream(apk())) { byte[] buffer = new byte[65536]; int n; while ((n = in.read(buffer)) != -1) digest.update(buffer, 0, n); }

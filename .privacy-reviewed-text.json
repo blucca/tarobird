@@ -1404,6 +1404,18 @@
           "fingerprint": "bdf9ce3b6fad26286e88dc74fe508107913344140b3282382d6ee4c290e7175c"
         }
       ]
+    },
+    {
+      "path": "docs/client/android-build.md",
+      "sha256": "db4cbd88e52e42731a7169cea19408892c0aff41ee3cf631a13266bd2d925ad6",
+      "reviewer": "claude",
+      "note": "Google Play bundle section added; the only finding is the pre-existing portable JDK version string, not an address; no owner data.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "a3fbe876b99abf7560a3958436975de3ac938a9d7776f3c94651e288c69ff0e2"
+        }
+      ]
     }
   ]
 }

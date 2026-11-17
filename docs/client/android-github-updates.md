@@ -61,7 +61,9 @@ drain/restart flow. Mac/Windows updater behavior is unchanged.
 ## Build and release
 
 Set `TAROBOT_GITHUB_REPOSITORY` and `TAROBOT_GITHUB_CLIENT_ID` (public values only)
-when building Android. Release builds fail if these are missing. Debug builds
+when building Android. Release builds fail if these are missing. The Google Play
+bundle (`-PtarobotDistribution=play`) has no in-app updater and needs neither; see
+[Android build](android-build.md#google-play-bundle). Debug builds
 may omit them and display updates as unconfigured. Keep increasing `versionCode`
 and sign every published APK with the original release key. Do not put a GitHub
 PAT, OAuth access token, client secret or signing private key in BuildConfig.

@@ -3,7 +3,8 @@ import type { UpdateInvoke } from "./github-update-backend.js";
 
 export interface AndroidUpdateState {
   phase: "initial" | "disabled" | "login-required" | "checking" | "current" | "available" | "downloading" | "verifying" | "ready" | "install-pending" | "error";
-  configured?: boolean; version?: string; authenticated?: boolean; login?: string;
+  /** false in store (Google Play) builds: the store owns updates. */
+  inAppUpdates?: boolean; configured?: boolean; version?: string; authenticated?: boolean; login?: string;
   nextVersion?: string; notes?: string; bytes?: number; total?: number; downloaded?: boolean; error?: string;
 }
 export interface AndroidUpdateBridge {
@@ -13,6 +14,8 @@ export interface AndroidUpdateBridge {
   openLogin(): Promise<void>;
   addListener(event: "state", callback: (state: AndroidUpdateState) => void): Promise<{ remove(): Promise<void> }>;
 }
+/** Older native shells omit the flag; only an explicit false hides updates. */
+export const androidInAppUpdates = (state: AndroidUpdateState) => state.inAppUpdates !== false;
 /** Native owns transfer/install state, including navigation out of Settings.
  * Opening the system installer is pending, never an installed-success state. */
 export class AndroidUpdateController {
@@ -30,9 +33,9 @@ export class AndroidUpdateController {
     if (this.pending) return this.pending;
     this.pending = work().catch(error => this.fail(error)).finally(() => { this.pending = undefined; }); return this.pending;
   }
-  check() { return this.run(async () => { this.receive({ ...this.state, phase: "checking", error: undefined }); this.receive(await this.invoke("check") as AndroidUpdateState); }); }
+  check() { if (!androidInAppUpdates(this.state)) return Promise.resolve(); return this.run(async () => { this.receive({ ...this.state, phase: "checking", error: undefined }); this.receive(await this.invoke("check") as AndroidUpdateState); }); }
   install() {
-    if (!this.state.nextVersion || !["available", "ready", "error"].includes(this.state.phase)) return Promise.resolve();
+    if (!androidInAppUpdates(this.state) || !this.state.nextVersion || !["available", "ready", "error"].includes(this.state.phase)) return Promise.resolve();
     return this.run(async () => {
       if (!this.state.downloaded) {
         this.receive({ ...this.state, phase: "downloading", error: undefined, bytes: 0 });

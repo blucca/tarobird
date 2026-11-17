@@ -44,3 +44,8 @@ test("revoked authorization cannot be interpreted as current or installed", asyn
   const f = fixture(); f.controller.bridge.invoke = async () => { throw new Error("github_update_login_required"); };
   await f.controller.check(); expect(f.controller.snapshot()).toMatchObject({ phase: "error", error: "github_update_login_required", authenticated: false });
 });
+test("Play build reports in-app updates off and the controller never asks native to check or install", async () => {
+  const f = fixture(); f.state({ phase: "disabled", inAppUpdates: false, configured: false, version: "1.0.88", nextVersion: "1.0.89", downloaded: true });
+  await f.controller.refresh(); await f.controller.check(); await f.controller.install();
+  expect(f.calls).toEqual([]); expect(f.controller.snapshot()).toMatchObject({ phase: "disabled", inAppUpdates: false });
+});

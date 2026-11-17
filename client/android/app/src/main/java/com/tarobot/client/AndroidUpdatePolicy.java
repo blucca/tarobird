@@ -14,6 +14,8 @@ final class AndroidUpdatePolicy {
     static boolean configured(String repo, String client) {
         return repo.matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+") && client.matches("[A-Za-z0-9._-]{8,128}");
     }
+    /** Store (Google Play) builds update only through the store, whatever else is configured. */
+    static boolean enabled(boolean inAppUpdates, String repo, String client) { return inAppUpdates && configured(repo, client); }
     static int compare(String a, String b) {
         if (!a.matches("[0-9]{1,8}\\.[0-9]{1,8}\\.[0-9]{1,8}") || !b.matches("[0-9]{1,8}\\.[0-9]{1,8}\\.[0-9]{1,8}")) throw new IllegalArgumentException("github_update_manifest");
         String[] x = a.split("\\."), y = b.split("\\.");

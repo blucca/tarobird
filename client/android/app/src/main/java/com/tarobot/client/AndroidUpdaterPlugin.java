@@ -25,7 +25,12 @@ public final class AndroidUpdaterPlugin extends Plugin {
     private AndroidUpdateService service;
     @Override public void load() {
         service = new AndroidUpdateService(getContext(), BuildConfig.TAROBOT_UPDATE_REPOSITORY, BuildConfig.TAROBOT_UPDATE_CLIENT_ID,
-            value -> notifyListeners("state", object(value)));
+            value -> notifyListeners("state", object(value)), BuildConfig.TAROBOT_IN_APP_UPDATES);
+    }
+    /** Play builds report status ({@code inAppUpdates: false}) and refuse every updater action. */
+    private static boolean unsupported(PluginCall call) {
+        if (BuildConfig.TAROBOT_IN_APP_UPDATES) return false;
+        call.reject("github_update_unsupported"); return true;
     }
     private static JSObject object(JSONObject value) { try { return new JSObject(value.toString()); } catch (Exception impossible) { return new JSObject(); } }
     private void failed(PluginCall call, Exception failure) { service.fail(failure); call.reject(service.snapshot().optString("error", "github_update_failed")); }
@@ -35,10 +40,12 @@ public final class AndroidUpdaterPlugin extends Plugin {
     @PluginMethod public void cancel(PluginCall call) { service.cancel(); call.resolve(); }
     /** Fixed browser destination; the renderer cannot supply an arbitrary URL. */
     @PluginMethod public void openLogin(PluginCall call) {
+        if (unsupported(call)) return;
         try { getActivity().startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/login/device"))); call.resolve(); }
         catch (Exception failure) { call.reject("github_update_browser"); }
     }
     @PluginMethod public void invoke(PluginCall call) {
+        if (unsupported(call)) return;
         String command = call.getString("command", "");
         if ("github_update_login_cancel".equals(command)) { service.cancelLogin(call.getString("flowId", "")); call.resolve(); return; }
         if (!busy.compareAndSet(false, true)) { call.reject("github_update_busy"); return; }

@@ -1,6 +1,7 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { t, useLocale } from "./i18n.js";
 import { androidUpdater, isAndroidUpdater, startAndroidUpdateChecks } from "./android-updates.js";
+import { androidInAppUpdates } from "./android-update-controller.js";
 import { GitHubUpdateLoginController } from "./github-update-backend.js";
 import { updateErrorMessage } from "./DesktopUpdates.js";
 import { CreationDialog } from "./CreationDialog.js";
@@ -11,7 +12,8 @@ export function AndroidUpdates() {
   const loginState = useSyncExternalStore(login.subscribe, login.snapshot);
   const [confirm, setConfirm] = useState(false);
   useEffect(() => { if (!isAndroidUpdater()) return; const close = startAndroidUpdateChecks(); void androidUpdater.refresh(); return () => { close(); void login.cancel(); }; }, [login]);
-  if (!isAndroidUpdater()) return null;
+  // Store (Google Play) builds update through the store: no App updates section.
+  if (!isAndroidUpdater() || !androidInAppUpdates(state)) return null;
   const busy = ["checking", "downloading", "verifying", "install-pending"].includes(state.phase);
   const signingIn = loginState.phase === "starting" || loginState.phase === "waiting";
   const installable = state.nextVersion && (state.authenticated || state.downloaded) && ["available", "ready", "error"].includes(state.phase);

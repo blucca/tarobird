@@ -80,6 +80,40 @@ under `/Volumes/gdrive/tarobot-signing/android-test`. These are local machine pa
 not files shipped to users. Google SDK tools were installed for this APK build;
 earlier dated notes below describe the pre-installation state.
 
+## Google Play bundle
+
+The default build (`-PtarobotDistribution=github`) is the GitHub Releases APK
+described above, with the in-app updater. Google Play forbids Play-distributed
+apps from updating themselves outside Play and restricts
+`REQUEST_INSTALL_PACKAGES`, so Play uses a separate build option. After
+building and syncing web assets:
+
+```sh
+cd client/android
+./gradlew --no-daemon bundleRelease -PtarobotDistribution=play \
+  -PtarobotVersionCode=CODE -PtarobotVersionName=X.Y.Z
+```
+
+Output is `client/android/app/build/outputs/bundle/release/app-release.aab`,
+unsigned. With `play`:
+
+- `src/play/AndroidManifest.xml` removes `REQUEST_INSTALL_PACKAGES` from the
+  merged manifest of every variant. Task and output names do not change.
+- `BuildConfig.TAROBOT_IN_APP_UPDATES` is `false` and the updater repository and
+  client ID are empty, so the release build does not require
+  `TAROBOT_GITHUB_REPOSITORY` / `TAROBOT_GITHUB_CLIENT_ID`. The native updater
+  reports `phase: "disabled"` with `inAppUpdates: false` and refuses login, check,
+  download and install (`github_update_unsupported`).
+- Settings → Appearance hides **App updates**; Play delivers updates.
+- **Install APK** on a saved `.apk` attachment cannot install in this build
+  because the permission is removed; the button is not hidden yet.
+
+Play rejects a `versionCode` it has already received, so use a new code for each
+upload. Sign the bundle with the Play upload key outside the repository. Before
+uploading, check that the bundle's `base/manifest/AndroidManifest.xml` has no
+`REQUEST_INSTALL_PACKAGES`. `testDebugUnitTest -PtarobotDistribution=play` also
+checks the BuildConfig flag.
+
 ## Push registration source update, 2026-10-11
 
 [Request-bound FCM registration and cleanup](android-fcm-registration-2026-10-11.md)
