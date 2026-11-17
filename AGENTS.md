@@ -68,6 +68,11 @@ upgrade compatibility. Follow [Android build instructions](docs/client/android-b
 and the [release checklist](docs/release-checklist.md#android-distribution-checks).
 Preparing or handing off an AAB is not evidence of store publication.
 
+For the next Android release, carry forward the recorded
+[Play Console optimization and system-bar follow-ups](docs/release-checklist.md#next-android-release-play-console-follow-ups-2026-11-17).
+Resolve or explicitly report their status during preflight; a successful upload
+does not establish that these warnings have been resolved.
+
 ## Mandatory GitHub upload gate
 
 Every push to `main` **and every PR branch/update**, including merges and
