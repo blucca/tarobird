@@ -9,24 +9,21 @@ Open the **receiving host** in the App, then **Settings → Bot message permissi
 the recipient. The Local scope continues to manage messages within one host.
 
 1. Join the hosts to the same TaroBird network in Devices & Network.
-2. Choose the source host and source Bot, then a receiving Bot on this host.
-3. Review the displayed direction and select **Allow sending**. The App signs
-   the exact change with the receiving owner's authenticated device and reads
-   the resulting permission back from that host.
+2. Choose the source host and requesting Bot. This host's Bots are listed below
+   with their avatars and presence; existing permissions are already checked.
+3. Check or clear several receiving Bots, then select **Save permissions**. The
+   App signs only the changed targets as one command with the receiving owner's
+   authenticated device, then reads every change back from that host.
 
-Hosts and Bots are chosen in the App's own chooser, not the platform's select
-list: a bottom sheet on phones and a dialog in larger windows. It names the
-host its entries belong to, searches names and IDs, and shows each entry's ID so
-that same-name entries stay distinct. Source Bots carry a neutral mark, because
-their names come from another host; this host's avatars and presence appear
-only for receiving Bots. Choosing only fills the draft. Closing the chooser
-(Back, Escape, its close button or the backdrop) changes nothing, choosing the
-current entry is not a change, and choosing another source host clears the
-source Bot. While the page may not change its draft (offline, saving, or
-permissions changed elsewhere) the fields are disabled and an open chooser
-stays in place, inert, with the reason. A chooser closes when its page is hidden; the source-Bot chooser also closes
-if its source host or directory changes. A choice is accepted by ID against the
-current lists only.
+The layout follows the Local scope. Source host and requesting Bot use the
+platform's select; same-name entries carry an ID tail. Source Bot names come
+from another host and are shown as text only; this host's avatars and presence
+appear only for receiving Bots. Choosing a source, searching or discarding
+writes nothing and is not an unsaved change. While a change is unsaved, the
+source choices are locked so it can't be applied to another source. Opening the
+page from Bot settings lists that Bot first; it is never checked automatically.
+One save changes at most 256 receiving Bots. Details and the exact-ID entry are
+under **Details and manual Bot ID**.
 
 When this App is connected to the source host, ordinary Bots can be selected by
 name. Internal workers are hidden; a manually entered ID matching a known
@@ -41,9 +38,11 @@ only replies to its own tasks; receiving the original task result does not need
 a reverse grant. Joining a network or connecting the App does not grant Bot
 message access automatically. Bots cannot approve their own access.
 
-Existing CLI permissions appear in the same list. **Revoke access** blocks
+Existing CLI permissions appear in the same list. Clearing a permission blocks
 subsequent sends and result queries without cancelling work already submitted.
-Sources that have left the network and deleted recipients remain revocable.
+Sources that have left the network, deleted recipients and known internal
+sources appear under **Revoke-only permissions**, each with its own
+**Revoke access**; they can't receive new permissions.
 Internal worker-target records remain stored and excluded, consistent with the
 Local scope; existing CLI administration of those records is unchanged.
 
@@ -64,11 +63,11 @@ Regression coverage includes owner/device proofs, replay and command tampering,
 revision changes, removed peers, deleted targets, CLI compatibility, both grant
 and revoke receipt loss, real isolated Hub messaging, source-name selection,
 and Chinese/English browser layouts at phone and desktop widths. Browser
-`cross-host-grant-chooser` covers the chooser against a receiving-Host double:
-search, long and same names, large directories, keyboard and the Android Back
-event, locks, lists that change while it is open, and phone, folding-phone,
-tablet and desktop widths in both languages. The chooser changes no CLI or
-authorization behavior. The sticky
+`cross-host-grant-list` covers the page against a receiving-Host double:
+changed-targets-only batches, draft locks, searching and discarding without
+writes, lost receipts and partial readback, revoke-only records, same IDs on
+two hosts, directory changes, the 256-target limit and 320/390/desktop widths
+in both languages. The list changes no CLI or authorization behavior. The sticky
 status notice covers the scroll container’s bottom inset without exposing or
 allowing clicks through to hidden content; pixel and hit-testing regressions
 cover desktop and phone safe areas. This presentation fix changes no CLI or

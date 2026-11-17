@@ -630,14 +630,17 @@ and the existing network/run/delete suites listed in that audit.
   `bot-message-hosts.ts`; the UI never publishes a peer Bot directory or grants
   network membership. Without a connected source, the owner can enter an exact
   Bot ID with an explicit unverified-name explanation. Internal workers stay
-  out of selectors. `CrossHostGrantPicker.tsx` supplies searchable host-aware
-  fields through `CreationDialog`; selection only edits the draft, and live
-  lists and permission locks are rechecked before accepting a choice.
-  Removed peers and deleted recipients retain revocable
-  records. Save/readback uncertainty never resubmits a change automatically.
+  out of selectors. The page mirrors the Local scope: native source-host and
+  requesting-Bot selects above this host's searchable receiving-Bot checkbox
+  list; one save submits only the changed targets for that source as one
+  `changes[]` command and reads back every item. A draft locks the source
+  choice; `initialBotId` only orders the list. Removed peers, deleted
+  recipients and known internal sources retain revoke-only records in a
+  separate section. Save/readback uncertainty never resubmits a change automatically.
   Regressions include the cross-host grant policy/proof tests, existing
   Bot-message/CLI tests and browser `bot-message-grants` (local and cross-host)
-  and `cross-host-grant-chooser` (layout, search, keyboard, locks and draft state).
+  and `cross-host-grant-list` (batch diff, draft locks, lost/partial readback,
+  revoke-only records, 256-item limit and phone/desktop layouts).
   Browser and isolated Hub evidence does not establish installed mobile or
   physical cross-machine acceptance. [Owner workflow and boundaries](client/cross-host-message-permissions.md).
 

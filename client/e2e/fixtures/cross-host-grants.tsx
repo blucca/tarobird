@@ -95,7 +95,7 @@ const server = {
   ],
 };
 const commands: CrossHostMessageGrantsCommand[] = [];
-const control = { failGet: 0, holdPost: false, release: () => {}, gets: 0 };
+const control = { failGet: 0, holdPost: false, release: () => {}, gets: 0, receipt: "ok" as "ok" | "lose" | "partial" };
 // As on the real Host: a departed source host or a deleted recipient stays in
 // the snapshot only while one of its records remains to be revoked.
 const snapshot = () => ({ revision: revisionText(server.revision), host: server.host, grants: server.grants,
@@ -117,16 +117,32 @@ const connection = {
   saveCrossHostMessageGrants: async (command: CrossHostMessageGrantsCommand, _signal: AbortSignal, submitting?: () => void) => {
     submitting?.(); commands.push(structuredClone(command));
     if (control.holdPost) await new Promise<void>(resolve => { control.release = resolve; });
+    // The real Host's all-or-nothing checks for one source tuple.
     if (command.revision !== revisionText(server.revision)) throw new HubHttpError(409, "bot_message_grants_changed");
+    if (!command.changes.length || command.changes.length > 256 || new Set(command.changes.map(change => change.targetBot)).size !== command.changes.length) throw new HubHttpError(400, "invalid_request");
+    if (!server.hosts.some(host => host.id === command.sourceHost)) throw new HubHttpError(404, "bot_message_host_not_found");
+    if (command.changes.some(change => change.allowed) && !server.hosts.some(host => host.id === command.sourceHost && host.available)) throw new HubHttpError(403, "bot_message_peer_revoked");
+    const has = (targetBot: string) => server.grants.some(grant => grant.sourceHost === command.sourceHost && grant.sourceBot === command.sourceBot && grant.targetBot === targetBot);
     for (const change of command.changes) {
+      const bot = server.bots.find(value => value.id === change.targetBot);
+      if (!bot || change.allowed && bot.deleted) throw new HubHttpError(410, "bot_deleted");
+      if (!change.allowed && !has(change.targetBot)) throw new HubHttpError(409, "bot_message_grant_not_found");
+    }
+    // `partial`: another writer immediately reverts the batch's first change, so
+    // only an every-change readback can notice it. `lose`: committed, receipt lost.
+    const applied = control.receipt === "partial" ? command.changes.slice(1) : command.changes;
+    for (const change of applied) {
       server.grants = server.grants.filter(grant => !(grant.sourceHost === command.sourceHost && grant.sourceBot === command.sourceBot && grant.targetBot === change.targetBot));
       if (change.allowed) server.grants.push({ sourceHost: command.sourceHost, sourceBot: command.sourceBot, targetBot: change.targetBot });
     }
     server.revision++;
+    if (control.receipt === "lose") throw new TypeError("Failed to fetch");
   },
   saveBotMessageGrants: async () => {},
 } as unknown as HubConnection;
-const receivingBot = { ...base, id: "alpha", name: server.bots[0]!.name } as unknown as Bot;
+// Bot settings opens the page for this receiving Bot (`bot=` picks another).
+const receiving = server.bots.find(bot => bot.id === (query.get("bot") ?? "alpha"))!;
+const receivingBot = { ...base, id: receiving.id, name: receiving.name } as unknown as Bot;
 
 function Fixture() {
   const [, render] = useReducer((value: number) => value + 1, 0);

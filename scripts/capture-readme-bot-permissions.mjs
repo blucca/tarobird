@@ -61,14 +61,14 @@ try{
    await page.getByRole('navigation',{name:word('Settings categories','设置分类')}).getByRole('button',{name:word('Bot message permissions','Bot 消息授权'),exact:true}).click();
    await page.getByRole('button',{name:word('Cross-host','跨主机'),exact:true}).click();
    const panel=page.locator('.cross-host-message-grants');
-   await panel.getByLabel(word('Source Bot','来源 Bot'),{exact:true}).selectOption('coordinator');
-   await panel.getByLabel(word('Receiving Bot on this host','本机接收 Bot'),{exact:true}).selectOption('build');
-   await panel.getByRole('button',{name:word('Allow sending','允许发送'),exact:true}).click();
-   await panel.getByRole('status').filter({hasText:word('Sending allowed and verified','已允许发送，并从接收主机核对生效')}).waitFor();
+   await panel.getByLabel(word('Requesting Bot','发起方 Bot'),{exact:true}).selectOption('coordinator');
+   await panel.locator('.message-grants-target[data-bot-id="build"] input[type="checkbox"]').check();
+   await panel.getByRole('button',{name:word('Save permissions','保存授权'),exact:true}).click();
+   await panel.getByRole('status').filter({hasText:word('Permissions saved and verified','已保存授权，并从接收主机核对生效')}).waitFor();
    const snapshot=await receiver.botMessages.readCrossHostGrants('owner',async()=>{});
    assert.deepEqual(snapshot.grants,[{sourceHost:messageHostId(source.auth.publicKey),sourceBot:'coordinator',targetBot:'build'}]);
-   // Scroll the source form to a clean boundary; keep the actual layout and CSS.
-   await panel.locator('.cross-grants-form').evaluate(node=>{
+   // Scroll the source selects to a clean boundary; keep the actual layout and CSS.
+   await panel.locator('.message-grants-source').first().evaluate(node=>{
     const scroller=node.closest('.settings-content');
     scroller.scrollTop+=node.getBoundingClientRect().top-scroller.getBoundingClientRect().top-16;
    });
