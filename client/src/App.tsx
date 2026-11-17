@@ -19,6 +19,7 @@ import { useClaudeSendChoice } from "./use-claude-send-choice.js";
 import { useCodexSendChoice } from "./use-codex-send-choice.js";
 import { ClaudeSendChoice } from "./ClaudeSendChoice.js";
 import { formatMessageTime, navigationItems } from "./conversation-inbox.js";
+import { useLocalDay } from "./local-day.js";
 import { selectionAfterArchive } from "./conversation-bulk.js";
 import { NativeInputContext } from "./NativeInput.js";
 import { controlNativeInput } from "./native-input-request.js";
@@ -167,6 +168,9 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     () => matchMedia("(min-width:761px) and (max-width:860px)").matches,
   );
   const compactTime = !!pane || tightDesktop;
+  // Message timestamps and the phone sheet line are worded relative to today,
+  // so they are rendered again when the local day changes.
+  useLocalDay();
   const compactComposerTools = phone || !["ios", "android"].includes(nativePlatform());
   const cache = connection.cache;
   useEffect(() => { if (!shell && !pane) return startDesktopUpdateChecks(); }, []);

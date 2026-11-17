@@ -7,6 +7,7 @@ import "./bot-conversation-folds.css";
 import { DraftPreviewText, listDraftPreview, useDraftPreviews } from "./DraftPreview.js";
 import { FolderSections, MoveToFolder } from "./ConversationFolders.js";
 import { botAgentSignal, buildBotRows, buildConversationRows, navigationItems, formatRowTime, type InboxRow } from "./conversation-inbox.js";
+import { useLocalDay } from "./local-day.js";
 import { agentSignal } from "./agent-state.js";
 import { AgentAvatar } from "./AgentAvatar.js";
 import { isDispatcher, listedConversations } from "./dispatcher.js";
@@ -43,6 +44,8 @@ export function ConversationList({ connection, hostName, slice, showHostBadge = 
   const sourceHost = showHostBadge && hostName ? <HostSourceBadge name={hostName}/> : null;
   const bulk = useConversationBulk();
   const locale = useLocale(); const labels = useBotLabels(); const prefix = useId();
+  // Row times are worded relative to today; render them again when the local day changes.
+  useLocalDay();
   const state = useConnectionSelection(connection, current => ({ status: current.state.status, user: current.state.user,
     foldersAvailable: current.state.foldersAvailable, conversationAvatarsAvailable: current.state.conversationAvatarsAvailable }));
   const foldScope = connection.identity.hubPublicKey ? JSON.stringify([connection.identity.hubPublicKey, connection.identity.publicKey]) : undefined;

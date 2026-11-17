@@ -179,6 +179,11 @@ function numericDay(date: Date, today: Date, tag: string): string {
     ? { month: 'numeric', day: 'numeric' } : { year: 'numeric', month: 'numeric', day: 'numeric' }).format(date);
 }
 
+/**
+ * Time of a conversation list row: the clock today, then "昨天", a weekday and
+ * finally the numeric day. The wording depends on today, so a component that
+ * shows it calls `useLocalDay()` (local-day.ts) to render again when the day changes.
+ */
 export function formatRowTime(at: number, locale: Locale, now: number = Date.now()): string {
   if (!Number.isFinite(at) || at <= 0) return '';
   const tag = locale === 'zh' ? 'zh-CN' : 'en-US';
@@ -202,6 +207,9 @@ export function formatRowTime(at: number, locale: Locale, now: number = Date.now
  * `compact` is for narrow message columns (board panes, small desktop
  * windows) where the row also reserves the action buttons: every earlier day
  * uses the conversation list's numeric day, and another year shows the day only.
+ *
+ * Like `formatRowTime`, the result depends on today: callers render it in a
+ * component that calls `useLocalDay()`.
  */
 export function formatMessageTime(at: number, locale: Locale, compact = false, now: number = Date.now()): string {
   const date = new Date(at);

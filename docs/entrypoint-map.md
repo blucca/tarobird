@@ -3074,6 +3074,11 @@ and the existing network/run/delete suites listed in that audit.
   offline recovery without changing frames sent to older snapshot clients.
   Tests: `hub-server`, `hub-link-preview`; browser `activity-order`, `snapshot`,
   `stream`, `sidebar-layout`.
+  Row times (`formatRowTime`) and message timestamps (`formatMessageTime`) are
+  worded relative to today. `local-day.ts:useLocalDay` renders their components
+  again at local midnight and when the App returns to the foreground, from one
+  shared timer. Tests: `client-local-day`, `client-message-time`; browser
+  `message-time`.
   Browser `sidebar-layout` covers persistence,
   drafts, narrow layouts and host-scoped actions. Conversation-row Bot names
   and model marks sit immediately after the title, as on phones; short titles

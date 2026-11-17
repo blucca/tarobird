@@ -31,6 +31,7 @@ import { Avatar, AvatarProvider, ConversationAvatar } from './Avatar.js';
 import { BotReferences, ReferencePreview } from './BotReferences.js';
 import type { Bot, HubConnection } from './connection.js';
 import { t, useLocale } from './i18n.js';
+import { useLocalDay } from './local-day.js';
 import { useBackAction } from './back-navigation.js';
 import { useConversationHold } from './useConversationHold.js';
 import { MobileConversationActions } from './MobileConversationActions.js';
@@ -419,6 +420,8 @@ function ConversationRow({ row, connection, conversations, dispatcher, multiHost
 }) {
   const avatarSize = useContext(ListAvatarSize);
   const bulk = useConversationBulk();
+  // The row time is worded relative to today; render it again when the local day changes.
+  useLocalDay();
   const { conversation } = row;
   const draftPreview = useDraftPreviewText(connection.cache, conversation, conversations, true);
   const isGroup = conversation.type === 'group' && !conversation.parentId;
