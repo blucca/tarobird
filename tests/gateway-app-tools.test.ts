@@ -4,7 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAppPlatformTools } from "../src/gateway/app-tools.js";
-import { appAgentInstructions, appTurnInstructions, botCollaborationInstructions } from "../src/gateway/agent-instructions.js";
+import { appAgentInstructions, appCapabilityInstructions, appTurnInstructions, botCollaborationInstructions } from "../src/gateway/agent-instructions.js";
 import { stripAlreadyDeliveredAppArtifacts } from "../src/gateway/app-delivery.js";
 import { GatewayArtifactUploadError } from "../src/gateway/channel.js";
 import { GatewayReceipts } from "../src/gateway/receipts.js";
@@ -31,7 +31,20 @@ describe("App platform contract", () => {
     expect(guide).not.toContain("tasks, reports and follow-ups");
     expect(guide).toContain("pending/unknown outcome is not a rejection");
     expect(guide).toContain("accepted means admission, not task completion");
+    expect(guide).toContain("return clarifying questions as plain text");
+    expect(guide).toContain("a new message will not answer the card");
+    expect(guide).toContain("Never impersonate the owner or bypass native permission approval");
     expect(appAgentInstructions({ context: "discussion" })).toContain("do not delegate");
+  });
+  it.each(["codex", "claude", "kimi", "deepseek", "antigravity"] as const)("keeps %s question guidance consistent for ordinary Bot delegation", engine => {
+    const human = appCapabilityInstructions("questions", { engine });
+    const delegated = appCapabilityInstructions("questions", { engine, botMessageTask: true });
+    expect(delegated).toContain("do not use AskUserQuestion, request_user_input, request_user_input_async, send.choice");
+    expect(delegated).toContain("end the turn with a plain-text reply");
+    expect(delegated).toContain("Native permission approvals are unchanged");
+    expect(human).toContain("Otherwise use the send.choice directive");
+    expect(human).not.toContain("end the turn with a plain-text reply");
+    expect(appAgentInstructions({ engine, botMessageTask: true })).toBe(appAgentInstructions({ engine }));
   });
   it("requires bounded filesystem discovery and does not turn failed reads into missing files", () => {
     const guide = appTurnInstructions("熟悉外置盘 gdrive 项目文件夹", { engine: "claude" });

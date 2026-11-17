@@ -41,12 +41,23 @@ afterEach(async () => {
 });
 
 it("runs a ticket on the worker with its own settings and wakes the dispatcher with the result", async () => {
+  const dispatcherQuestionGuides: string[] = [];
+  replies.set("planner", async input => {
+    dispatcherQuestionGuides.push((await input.appPlatformTools!.call({ name: "app_capability", arguments: { topic: "questions" },
+      callId: `dispatcher-question-guide-${dispatcherQuestionGuides.length}`, sessionId: "dispatcher", abortSignal: new AbortController().signal })).text);
+    return "ok";
+  });
   const home = await hub.store.createConversation("owner", ["planner"], "Planner", "home");
   await hub.store.sendMessage("owner", { conversationId: home.id, clientMsgId: "ask", text: "整理一下笔记", attachments: [] });
   await until(async () => calls.get("planner")?.length === 1);
   expect(calls.get("planner")![0]!.turnInstructions).toContain("Dispatcher role (host-owned)");
   expect(calls.get("planner")![0]!.appPlatformTools?.executionInstructions).toContain("--context-message");
-  replies.set("coder", () => "NOTES DONE");
+  let workerQuestionGuide: string | undefined;
+  replies.set("coder", async input => {
+    workerQuestionGuide = (await input.appPlatformTools!.call({ name: "app_capability", arguments: { topic: "questions" },
+      callId: "worker-question-guide", sessionId: "worker", abortSignal: new AbortController().signal })).text;
+    return "NOTES DONE";
+  });
   const owner = { kind: "owner" as const, userId: "owner" };
   const ticket = await hub.dispatch.create(owner, "planner", { requestId: "t1", title: "笔记", request: "Summarize the notes" });
   await hub.dispatch.dispatch(owner, "planner", { requestId: "d1", ticketId: ticket.id, engine: "codex", model: "gpt-6-luna", effort: "low" });
@@ -55,15 +66,21 @@ it("runs a ticket on the worker with its own settings and wakes the dispatcher w
   expect(work.text).toContain("Summarize the notes");
   expect(work.turnInstructions).toContain("Cross-Bot request for THIS turn");
   expect(work.turnInstructions).not.toContain("Reply in this conversation");
+  expect(work.turnInstructions).not.toContain("end the turn with a plain-text reply");
   expect(work.turnInstructions).not.toContain("Dispatcher role");
   expect(work.appPlatformTools?.executionInstructions).toContain("Worker assistance (host-owned)");
   expect(work.engineOverride).toEqual({ model: "gpt-6-luna", effort: "low" });
   expect(work.workspaceOverride).toBe(path.join(root, "tickets", ticket.id));
   await until(async () => { await hub.dispatch.sweep(); return (await hub.dispatch.show(owner, ticket.id)).status === "needs_review"; });
-  await until(async () => calls.get("planner")?.length === 2);
+  expect(workerQuestionGuide).toContain("Use request_user_input or request_user_input_async when available");
+  expect(workerQuestionGuide).not.toContain("end the turn with a plain-text reply");
+  await until(async () => calls.get("planner")?.length === 2 && dispatcherQuestionGuides.length === 2);
   const wake = calls.get("planner")![1]!;
   expect(wake.text).toContain("【工单完成】");
   expect(wake.text).toContain("NOTES DONE");
+  expect(wake.turnInstructions).not.toContain("end the turn with a plain-text reply");
+  expect(dispatcherQuestionGuides[1]).toBe(dispatcherQuestionGuides[0]);
+  expect(dispatcherQuestionGuides[1]).toContain("Use native AskUserQuestion when available");
   // The worker conversation stays out of ordinary listings.
   const worker = (await hub.dispatch.show(owner, ticket.id)).attempts[0]!.conversationId;
   expect((await hub.store.conversations("owner", { hidden: false })).map(c => c.id)).not.toContain(worker);
