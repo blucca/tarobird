@@ -14,6 +14,20 @@ the recipient. The Local scope continues to manage messages within one host.
    the exact change with the receiving owner's authenticated device and reads
    the resulting permission back from that host.
 
+Hosts and Bots are chosen in the App's own chooser, not the platform's select
+list: a bottom sheet on phones and a dialog in larger windows. It names the
+host its entries belong to, searches names and IDs, and shows each entry's ID so
+that same-name entries stay distinct. Source Bots carry a neutral mark, because
+their names come from another host; this host's avatars and presence appear
+only for receiving Bots. Choosing only fills the draft. Closing the chooser
+(Back, Escape, its close button or the backdrop) changes nothing, choosing the
+current entry is not a change, and choosing another source host clears the
+source Bot. While the page may not change its draft (offline, saving, or
+permissions changed elsewhere) the fields are disabled and an open chooser
+stays in place, inert, with the reason. A chooser closes when its page is hidden; the source-Bot chooser also closes
+if its source host or directory changes. A choice is accepted by ID against the
+current lists only.
+
 When this App is connected to the source host, ordinary Bots can be selected by
 name. Internal workers are hidden; a manually entered ID matching a known
 worker is also rejected. Without a live authenticated source connection, an
@@ -49,7 +63,12 @@ membership and undeleted Bots); no record is created when no current grant exist
 Regression coverage includes owner/device proofs, replay and command tampering,
 revision changes, removed peers, deleted targets, CLI compatibility, both grant
 and revoke receipt loss, real isolated Hub messaging, source-name selection,
-and Chinese/English browser layouts at phone and desktop widths. The sticky
+and Chinese/English browser layouts at phone and desktop widths. Browser
+`cross-host-grant-chooser` covers the chooser against a receiving-Host double:
+search, long and same names, large directories, keyboard and the Android Back
+event, locks, lists that change while it is open, and phone, folding-phone,
+tablet and desktop widths in both languages. The chooser changes no CLI or
+authorization behavior. The sticky
 status notice covers the scroll container’s bottom inset without exposing or
 allowing clicks through to hidden content; pixel and hit-testing regressions
 cover desktop and phone safe areas. This presentation fix changes no CLI or

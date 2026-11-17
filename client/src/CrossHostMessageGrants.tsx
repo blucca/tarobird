@@ -1,11 +1,12 @@
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowRight, Check, RefreshCw, ShieldCheck } from "lucide-react";
+import { ArrowDown, Check, RefreshCw, Search, ShieldCheck } from "lucide-react";
 import { idSchema } from "../../src/client-protocol/index.js";
 import { crossHostMessageGrantsSnapshotSchema, type CrossHostMessageGrantsSnapshot, type CrossHostMessageGrantsCommand } from "../../src/client-protocol/bot-message-grants.js";
 import type { HubConnection } from "./connection.js";
 import { BotMessageHostsContext, isInternalMessageSource, messageSourceBots } from "./bot-message-hosts.js";
 import { HubHttpError } from "./http-error.js";
 import { t } from "./i18n.js";
+import { CrossHostGrantField, CrossHostGrantPicker, type GrantChoice, type GrantChoiceKind } from "./CrossHostGrantPicker.js";
 
 const route = "/api/bot-messages/cross-host-grants";
 type Edge = { sourceHost: string; sourceBot: string; targetBot: string };
@@ -40,6 +41,10 @@ export function CrossHostMessageGrants({ connection, initialBotId, active, onlin
   const focusAfter = useRef(false), focusBefore = useRef<Element | null>(null);
   const selection = useRef({ sourceHost, targetBot });
   selection.current = { sourceHost, targetBot }; current.current = view; draft.current = dirty;
+  // The chooser belongs to one field of one source host; `host` pins that context.
+  const [picker, setPicker] = useState<{ field: GrantChoiceKind; host: string }>();
+  const root = useRef<HTMLDivElement>(null), hadPicker = useRef(false), locked = useRef(false);
+  const hostField = useRef<HTMLButtonElement>(null), sourceField = useRef<HTMLButtonElement>(null), targetField = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => { onDirty(dirty || uncertain); }, [dirty, uncertain, onDirty]);
   useLayoutEffect(() => { onBusy(busy); }, [busy, onBusy]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; generation.current++; request.current?.abort(); }; }, []);
@@ -110,6 +115,48 @@ export function CrossHostMessageGrants({ connection, initialBotId, active, onlin
   const alreadyAllowed = !!view && allowed(view, selectedEdge);
   const blocked = busy || checking || !online || stale || uncertain || !!error;
   const changed = () => { draft.current = true; setDirty(true); setNotice(""); };
+  locked.current = blocked;
+  const byName = !manual && sources.length > 0;
+  const formShown = !!view && view.hosts.some(value => value.available);
+  // A hidden page, a source directory that went away, or a different source
+  // host ends the chooser: it never survives into another context.
+  const choosing = picker && active && formShown && (picker.field !== "sourceBot" || byName && picker.host === sourceHost) ? picker.field : undefined;
+  useEffect(() => { if (picker && !choosing) setPicker(undefined); }, [picker, choosing]);
+  useEffect(() => {
+    if (choosing) { hadPicker.current = true; return; }
+    if (!hadPicker.current) return;
+    hadPicker.current = false;
+    // The dialog returns focus to its field. If that field was disabled or
+    // replaced meanwhile, keep keyboard users in this panel; never take focus
+    // from another screen.
+    if (active && document.activeElement === document.body) (feedback.current ?? root.current)?.focus({ preventScroll: true });
+  }, [choosing, active]);
+  const choose = (field: GrantChoiceKind, id: string) => {
+    // A row can outlive the list it was drawn from. Decide by ID against the
+    // current snapshot and the live source directory; a stale, hidden,
+    // internal or locked choice leaves the draft untouched.
+    const snapshot = current.current;
+    if (!snapshot || locked.current || picker?.field !== field) return;
+    if (field === "sourceHost") {
+      if (!snapshot.hosts.some(value => value.id === id && value.available)) return;
+      if (id !== sourceHost) { setSourceHost(id); setSourceBot(""); setManual(false); changed(); }
+    } else if (field === "sourceBot") {
+      if (!byName || picker.host !== sourceHost || !messageSourceBots(entries, sourceHost).some(bot => bot.id === id) || isInternalMessageSource(entries, sourceHost, id)) return;
+      // A typed ID may carry spaces; every use, including the saved command, is the trimmed one.
+      if (id !== selectedEdge.sourceBot) { setSourceBot(id); changed(); }
+    } else {
+      if (!snapshot.bots.some(bot => bot.id === id && !bot.deleted)) return;
+      if (id !== targetBot) { setTargetBot(id); changed(); }
+    }
+    setPicker(undefined);
+  };
+  const edgeParts = (edge: Edge) => [`${hostName(edge.sourceHost)} · ${sourceName(edge)}`, `${view?.host.name ?? ""} · ${name(view?.bots ?? [], edge.targetBot)}`] as const;
+  const direction = (edge: Edge) => { const [from, to] = edgeParts(edge); return <><span>{from}</span>{" "}<span>→ {to}</span></>; };
+  const targets = view?.bots.filter(bot => !bot.deleted) ?? [];
+  const choices = (): GrantChoice[] => choosing === "sourceHost" ? view!.hosts.map(value => ({ id: value.id, name: value.name, label: hostName(value.id), ...(value.available ? {} : { unavailable: t("来源主机当前不可用，仅可撤销") }) }))
+    : choosing === "sourceBot" ? sources.map(bot => ({ id: bot.id, name: bot.name, label: name(sources, bot.id) }))
+    : targets.map(bot => ({ id: bot.id, name: bot.name, label: name(view!.bots, bot.id), online: bot.online }));
+  const lockReason = !blocked ? "" : !online ? t("连接恢复后即可操作") : busy ? t("正在保存并核对…") : checking ? t("正在载入…") : error || t("授权、Bot 或网络状态已变化，请重新载入后核对。");
   const save = async (edge: Edge, allow: boolean) => {
     const snapshot = current.current;
     if (!snapshot || writing.current || manualRead.current || blocked || allow && (!canAllow || alreadyAllowed) || !allow && (draft.current || !allowed(snapshot, edge))) return;
@@ -134,7 +181,7 @@ export function CrossHostMessageGrants({ connection, initialBotId, active, onlin
     } finally { clearTimeout(timeout); writing.current = false; if (mounted.current && generation.current === epoch) setBusy(false); }
   };
   const grants = view?.grants.filter(edge => edgeText(edge).toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())) ?? [];
-  return <div className="cross-host-message-grants">
+  return <div ref={root} tabIndex={-1} className="cross-host-message-grants">
     <div className="message-grants-intro"><p>{t("允许其他主机的指定 Bot 向这台主机发送协作消息与文件。")}</p>
       <button type="button" className="icon-button" aria-label={t("刷新跨主机授权")} disabled={busy || checking || !online} onClick={() => { void refresh(false, true); }}><RefreshCw size={17}/></button></div>
     {view && <p className="cross-grants-receiver"><ShieldCheck size={16}/>{t("接收主机：{0}", view.host.name)}</p>}
@@ -144,27 +191,28 @@ export function CrossHostMessageGrants({ connection, initialBotId, active, onlin
     {!view && !error && online && <p role="status">{t("正在读取主机授权…")}</p>}
     {view && <>
       {!view.hosts.some(value => value.available) ? <p className="empty-state">{t("暂无可授权的其他主机。请先在「设备与网络」中将两台主机加入同一网络。")}</p> : <div className="cross-grants-form">
-        <label>{t("来源主机")}<select aria-label={t("来源主机")} value={sourceHost} disabled={blocked} onChange={event => { setSourceHost(event.target.value); setSourceBot(""); setManual(false); changed(); }}>
-          {view.hosts.map(value => <option key={value.id} value={value.id} disabled={!value.available}>{hostName(value.id)}{!value.available ? ` · ${t("不可用")}` : ""}</option>)}
-        </select></label>
-        <label>{manual || !sources.length ? t("来源 Bot ID") : t("来源 Bot")}
-          {manual || !sources.length ? <input aria-label={t("来源 Bot ID")} autoComplete="off" spellCheck={false} value={sourceBot} maxLength={128} disabled={blocked} onChange={event => { setSourceBot(event.target.value); changed(); }}/>
-            : <select aria-label={t("来源 Bot")} value={sourceBot} disabled={blocked} onChange={event => { setSourceBot(event.target.value); changed(); }}><option value="">{t("选择来源 Bot")}</option>{sources.map(bot => <option key={bot.id} value={bot.id}>{name(sources, bot.id)}</option>)}</select>}
-        </label>
+        <h4 className="cross-grants-form-title cross-grants-wide">{t("新增授权")}</h4>
+        <CrossHostGrantField label={t("来源主机")} trigger={hostField} disabled={blocked} expanded={choosing === "sourceHost"} placeholder={t("选择来源主机")}
+          value={host ? `${hostName(sourceHost)}${host.available ? "" : ` · ${t("不可用")}`}` : ""} open={() => setPicker({ field: "sourceHost", host: sourceHost })}/>
+        {byName ? <CrossHostGrantField label={t("来源 Bot")} trigger={sourceField} disabled={blocked} expanded={choosing === "sourceBot"} placeholder={t("选择来源 Bot")}
+            value={liveSource ? name(sources, selectedEdge.sourceBot) : ""} problem={sourceBot && !liveSource ? t("所选 Bot 已不可用，请重新选择") : undefined} open={() => setPicker({ field: "sourceBot", host: sourceHost })}/>
+          : <label>{t("来源 Bot ID")}<input aria-label={t("来源 Bot ID")} autoComplete="off" spellCheck={false} value={sourceBot} maxLength={128} disabled={blocked} onChange={event => { setSourceBot(event.target.value); changed(); }}/></label>}
         {!sources.length && <p className="message-grants-hint cross-grants-wide">{t("此设备尚未连接来源主机，或来源主机暂时离线。连接后可按名称选择；也可填写准确的 Bot ID。")}</p>}
         {!!sources.length && <button type="button" className="text-button cross-grants-wide" disabled={blocked} onClick={() => { setManual(!manual); setSourceBot(""); changed(); }}>{manual ? t("按名称选择 Bot") : t("使用 Bot ID")}</button>}
-        <label className="cross-grants-wide">{t("本机接收 Bot")}<select aria-label={t("本机接收 Bot")} value={targetBot} disabled={blocked} onChange={event => { setTargetBot(event.target.value); changed(); }}>{view.bots.filter(bot => !bot.deleted).map(bot => <option key={bot.id} value={bot.id}>{name(view.bots, bot.id)}</option>)}</select></label>
+        <div className="cross-grants-flow cross-grants-wide" aria-hidden="true"><ArrowDown size={15}/></div>
+        <CrossHostGrantField wide label={t("本机接收 Bot")} trigger={targetField} disabled={blocked || !targets.length} expanded={choosing === "targetBot"} placeholder={t("选择 Bot")}
+          value={targets.some(bot => bot.id === targetBot) ? name(view.bots, targetBot) : ""} problem={targetBot && targets.length > 0 && !targets.some(bot => bot.id === targetBot) ? t("所选 Bot 已不可用，请重新选择") : undefined} open={() => setPicker({ field: "targetBot", host: sourceHost })}/>
         {!view.bots.some(bot => !bot.deleted) && <p>{t("主机还没有 Bot。创建 Bot 后即可在这里授权。")}</p>}
-        {sourceBot.trim() && targetBot && <p className="cross-grants-direction cross-grants-wide"><ArrowRight size={17}/><span>{edgeText(selectedEdge)}</span></p>}
+        {sourceBot.trim() && targetBot && <div className="cross-grants-confirm cross-grants-wide"><span>{t("授权方向")}</span><p className="cross-grants-direction">{direction(selectedEdge)}</p></div>}
         {(manual || !sources.length) && sourceBot.trim() && <p className="message-grants-hint cross-grants-wide">{t("请核对来源 Bot ID；这里不会自动验证它的名称或创建新 Bot。")}</p>}
         {internalSource && <p role="alert" className="message-grants-error cross-grants-wide">{t("内部执行者不参与手动消息授权，请选择普通 Bot。")}</p>}
         <div className="message-grants-actions cross-grants-wide"><button type="button" className="primary" disabled={blocked || !canAllow || alreadyAllowed} onClick={() => { void save(selectedEdge, true); }}>{busy ? t("正在保存并核对…") : alreadyAllowed ? t("已授权") : t("允许发送")}</button></div>
       </div>}
       {(dirty || stale || uncertain || error) && <div className="message-grants-actions"><button type="button" disabled={busy || checking || !online} onClick={() => { void refresh(true, true); }}>{checking ? t("正在载入…") : stale || uncertain || error ? t("重新载入并核对") : t("放弃修改")}</button></div>}
       <section className="cross-grants-existing"><h4>{t("已有跨主机授权")}</h4><p className="message-grants-hint">{t("包含通过命令行设置的授权。主机离网后授权不会放行，仍可在此撤销记录。")}</p>
-        {view.grants.length > 6 && <input aria-label={t("查找跨主机授权")} value={query} onChange={event => setQuery(event.target.value)}/>}
+        {view.grants.length > 6 && <label className="message-grants-search"><Search size={16} aria-hidden="true"/><input aria-label={t("查找跨主机授权")} placeholder={t("查找跨主机授权")} value={query} onChange={event => setQuery(event.target.value)}/></label>}
         {!grants.length && <p className="empty-state">{t("暂无匹配的跨主机授权。")}</p>}
-        {grants.slice(0, 100).map(edge => <div className="cross-grants-edge" key={JSON.stringify(edge)}><div><strong>{edgeText(edge)}</strong>
+        {grants.slice(0, 100).map(edge => <div className="cross-grants-edge" key={JSON.stringify(edge)}><div><strong>{direction(edge)}</strong>
           {!view.hosts.find(value => value.id === edge.sourceHost)?.available && <small>{t("来源主机当前不可用，仅可撤销")}</small>}
           {!view.bots.some(bot => bot.id === edge.targetBot && !bot.deleted) && <small>{t("接收 Bot 已不可用，仅可撤销")}</small>}</div>
           <button type="button" className="text-danger" disabled={blocked || dirty} onClick={() => { void save(edge, false); }} aria-label={t("撤销 {0}", edgeText(edge))}>{t("撤销授权")}</button></div>)}
@@ -172,6 +220,11 @@ export function CrossHostMessageGrants({ connection, initialBotId, active, onlin
         {!!view.grants.length && <p className="message-grants-hint">{t("取消授权将阻止后续发送和结果查询，但不会停止或取消已提交的任务。建议取回结果后再取消授权。")}</p>}
       </section>
     </>}
+    {choosing && <CrossHostGrantPicker key={choosing} kind={choosing} choices={choices()} lockReason={lockReason} close={() => setPicker(undefined)} choose={id => choose(choosing, id)}
+      title={choosing === "sourceHost" ? t("选择来源主机") : choosing === "sourceBot" ? t("选择来源 Bot") : t("选择本机接收 Bot")}
+      context={choosing === "sourceBot" ? t("来源主机：{0}", hostName(sourceHost)) : t("接收主机：{0}", view!.host.name)}
+      selected={choosing === "sourceHost" ? sourceHost : choosing === "sourceBot" ? selectedEdge.sourceBot : targetBot}
+      returnFocus={choosing === "sourceHost" ? hostField : choosing === "sourceBot" ? sourceField : targetField}/>}
     {(error || stale || notice) && <div ref={feedback} tabIndex={-1} className="message-grants-feedback cross-grants-feedback" role="group" aria-label={t("跨主机授权状态")}>
       {error && <p role="alert" className="message-grants-error">{error}</p>}
       {stale && !error && <p role="alert" className="message-grants-error">{t("授权、Bot 或网络状态已变化，请重新载入后核对。")}</p>}

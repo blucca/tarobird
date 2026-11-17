@@ -5,13 +5,36 @@
 .message-grants-scopes>button[aria-pressed=true]{background:var(--bg);color:var(--text);box-shadow:0 1px 3px #0000000d}
 .cross-grants-receiver{display:flex;align-items:center;gap:7px;font-weight:600;font-size:13px;overflow-wrap:anywhere}
 .cross-grants-form{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:20px 0;padding:16px;border:1px solid var(--border);border-radius:12px}
-.cross-grants-form>label{display:grid;gap:7px;font-size:12px;font-weight:600;min-width:0}
-.cross-grants-form :is(select,input),.cross-grants-existing>input{width:100%;min-width:0;box-sizing:border-box}
+.cross-grants-form>label,.cross-grants-field{display:grid;gap:7px;font-size:12px;font-weight:600;min-width:0}
+.cross-grants-form input{width:100%;min-width:0;min-height:36px;box-sizing:border-box;font-size:13px;font-weight:400}
 .cross-grants-wide{grid-column:1/-1}
 .cross-grants-form .message-grants-actions{margin:0}
 .cross-grants-form .message-grants-hint{margin:0}
-.cross-grants-direction{display:flex;align-items:flex-start;gap:8px;padding:10px 12px;margin:0;background:color-mix(in srgb,var(--accent) 7%,transparent);border-radius:8px;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
-.cross-grants-direction>svg{flex:none;margin-top:2px}
+/* Cross-host only. Accent marks use the palette's mark token (soft in
+   Monochrome), as the composer and dispatch surfaces do. */
+.cross-host-message-grants{--cross-grants-mark:var(--mono-mark,var(--accent));--cross-grants-field:var(--raised,var(--bg));--cross-grants-field-line:var(--border-strong);--cross-grants-field-radius:var(--radius-sm,6px)}
+/* Porcelain palettes draw dialog fields filled and borderless (porcelain-details.css). */
+:root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .cross-host-message-grants{--cross-grants-field:var(--surface);--cross-grants-field-line:transparent;--cross-grants-field-radius:10px}
+.cross-host-message-grants:focus{outline:none}
+.cross-grants-form-title{margin:0;font-size:13px}
+/* A field that opens a chooser: same box as the neighbouring text field. */
+.cross-grants-select{display:flex;justify-content:space-between;gap:10px;width:100%;min-width:0;min-height:36px;padding:8px 10px;border:1px solid var(--cross-grants-field-line);border-radius:var(--cross-grants-field-radius);background:var(--cross-grants-field);color:var(--text);font-size:13px;font-weight:400;line-height:18px;text-align:start}
+.cross-grants-select:hover:not(:disabled){background:color-mix(in srgb,var(--text) 5%,var(--cross-grants-field))}
+.cross-grants-select[aria-expanded=true]{border-color:var(--focus)}
+.cross-grants-select>svg{flex:none;color:var(--muted)}
+.cross-grants-select-value{flex:1;min-width:0;overflow-wrap:anywhere}
+.cross-grants-select-value[data-state=empty]{color:var(--muted)}
+.cross-grants-select-value[data-state=problem]{color:var(--red)}
+.cross-grants-form .text-button{justify-self:start;padding:4px 0;color:var(--muted);font-size:12px;text-decoration:underline;text-underline-offset:3px}
+.cross-grants-form .text-button:hover:not(:disabled){background:transparent;color:var(--text)}
+.cross-grants-flow{display:flex;align-items:center;gap:10px;color:var(--muted)}
+.cross-grants-flow::before,.cross-grants-flow::after{content:"";flex:1;height:1px;background:var(--border)}
+.cross-grants-confirm{display:grid;gap:3px;min-width:0;padding:10px 12px;border-inline-start:2px solid var(--cross-grants-mark);border-radius:8px;background:color-mix(in srgb,var(--cross-grants-mark) 12%,transparent)}
+.cross-grants-confirm>span{color:var(--muted);font-size:11px;font-weight:600}
+.cross-grants-direction{margin:0;font-size:13px;font-weight:600;line-height:1.6;overflow-wrap:anywhere}
+/* "from" and "→ to" each stay whole while they fit, so a narrow screen breaks
+   at the arrow instead of inside a name. */
+.cross-grants-direction>span,.cross-grants-edge strong>span{display:inline-block;max-width:100%;vertical-align:top}
 .cross-grants-existing{border-top:1px solid var(--border);padding-top:18px;margin-top:20px}
 .cross-grants-existing>h4{font-size:13px;margin:0}
 .cross-grants-edge{display:flex;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid var(--border)}
@@ -24,6 +47,56 @@
 .cross-grants-feedback:last-child::after{content:"";position:absolute;top:100%;left:0;right:0;height:max(28px,var(--app-safe-bottom,0px));background:var(--bg);pointer-events:auto}
 .cross-grants-feedback>p{margin:0}
 @media(max-width:480px){.cross-grants-form{grid-template-columns:1fr;padding:12px}.cross-grants-edge{align-items:flex-start;flex-wrap:wrap}.cross-grants-edge>div{flex-basis:100%}.cross-grants-edge>button{margin-left:auto}}
+/* The chooser reuses CreationDialog (phone bottom sheet, desktop dialog) with
+   the schedule Bot picker's row geometry. Only the list scrolls; the sheet
+   itself scrolls only when even one row no longer fits (landscape keyboard). */
+.creation-dialog.cross-grants-picker{width:460px}
+.creation-dialog.cross-grants-picker[open]{display:flex;flex-direction:column;max-height:min(640px,calc(var(--shell-height,100dvh) - 32px));overflow:hidden auto;overscroll-behavior:contain}
+.cross-grants-picker>header{flex:none}
+.cross-grants-picker>header>h2{min-width:0;overflow-wrap:anywhere}
+.cross-grants-picker-body{display:flex;flex-direction:column;flex:0 1 auto;min-height:0}
+.cross-grants-picker-body>:not(.cross-grants-picker-list){flex:none}
+.cross-grants-picker-context{display:flex;align-items:flex-start;gap:7px;margin:0 0 12px;color:var(--muted);font-size:12px;font-weight:600;line-height:1.5;overflow-wrap:anywhere}
+.cross-grants-picker-context>svg{flex:none;margin-top:2px}
+.cross-grants-picker-lock{margin:0 0 12px;padding:10px 12px;border-inline-start:2px solid var(--orange);border-radius:8px;background:color-mix(in srgb,var(--orange) 10%,transparent);font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+.creation-dialog .cross-grants-picker-search{display:flex;flex-direction:row;align-items:center;gap:8px;margin:0 0 12px;padding:0 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--muted)}
+.cross-grants-picker-search>svg{flex:none}
+/* The label is the field; palette-wide dialog input rules must not draw a second box inside it. */
+.cross-grants-picker-search>input{flex:1;min-width:0;min-height:44px;padding:10px 0;border:0;border-radius:0!important;outline:0;box-shadow:none!important;background:transparent!important;color:var(--text)}
+.cross-grants-picker-search:focus-within{outline:2px solid var(--focus);outline-offset:2px}
+.cross-grants-picker-list{display:grid;align-content:start;gap:4px;flex:0 1 auto;min-height:64px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;padding:2px;outline:0}
+.cross-grants-option{display:flex;align-items:center;gap:12px;min-width:0;min-height:60px;padding:10px 12px;border:1px solid transparent;border-radius:10px;cursor:pointer;-webkit-tap-highlight-color:transparent}
+.cross-grants-option:hover{background:var(--surface)}
+.cross-grants-option[aria-selected=true]{background:color-mix(in srgb,var(--cross-grants-mark) 14%,transparent);border-color:color-mix(in srgb,var(--cross-grants-mark) 60%,transparent)}
+.cross-grants-option[data-active]{outline:2px solid var(--focus);outline-offset:-2px}
+.cross-grants-option[aria-disabled=true]{cursor:not-allowed}
+.cross-grants-option[aria-disabled=true]:hover{background:transparent}
+.cross-grants-option[aria-disabled=true]>:is(.cross-grants-option-icon,.cross-grants-option-copy){opacity:.5}
+@media(hover:none){.cross-grants-option:hover:not([aria-selected=true]){background:transparent}}
+.cross-grants-option-icon{display:grid;place-items:center;flex:none;width:36px;height:36px;border-radius:10px;background:var(--surface);color:var(--muted)}
+.cross-grants-option-copy{display:flex;flex:1;min-width:0;flex-direction:column;gap:3px}
+.cross-grants-option-copy>strong{font-size:14px;font-weight:600;line-height:1.4;overflow-wrap:anywhere}
+.cross-grants-option-copy>small{display:flex;align-items:center;flex-wrap:wrap;gap:3px 6px;color:var(--muted);font-size:12px;line-height:1.4;overflow-wrap:anywhere}
+.cross-grants-option-copy>small>i{width:5px;height:5px;border-radius:50%;background:var(--muted)}
+.cross-grants-option-copy>small>i[data-online=true]{background:var(--green)}
+.cross-grants-option-id{font-variant-numeric:tabular-nums}
+.cross-grants-option-check{flex:none;color:color-mix(in srgb,var(--cross-grants-mark) 75%,var(--text))}
+.cross-grants-picker-empty{margin:28px 0;color:var(--muted);font-size:13px;text-align:center}
+.cross-grants-picker-more{margin:10px 0 0;color:var(--muted);font-size:12px;line-height:1.5}
+@media(max-width:760px){
+  .creation-dialog.cross-grants-picker{width:100%}
+  .creation-dialog.cross-grants-picker[open]{max-height:calc(var(--shell-height,100dvh) - max(20px,var(--app-safe-top,0px)) - 12px)}
+}
+/* Touch: 44px targets, and the 16px field text the native control had. */
+@media(max-width:760px),(hover:none) and (pointer:coarse){
+  .cross-grants-select{min-height:44px;font-size:16px;line-height:22px}
+  .cross-grants-form input{min-height:44px;font-size:16px}
+  .cross-grants-form .text-button{min-height:44px;margin-block:-6px}
+  .cross-grants-form .message-grants-actions>button{min-height:44px}
+  .cross-grants-edge>button{min-width:44px;min-height:44px}
+  .cross-host-message-grants>.message-grants-actions>button{min-height:44px}
+}
+@media(max-width:480px){.cross-grants-form .message-grants-actions>.primary{width:100%}.cross-grants-edge{padding-bottom:2px}}
 .message-grants-entry { width: 100%; margin-top: 12px; text-align: left; }
 .message-grants-intro { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .message-grants-intro p, .message-grants-scope, .message-grants-hint { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 6px 0 12px; }

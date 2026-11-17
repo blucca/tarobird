@@ -79,7 +79,15 @@ for (const width of [390, 1360]) test(`cross-host permissions grant, verify repl
     const input = { operation: 'resolve' as const, host: f.host, bot: 'alpha', requestId: 'ui-cross-task', data: {} };
     await expect(remote.sender.local(input, 'remote', guard, true)).rejects.toThrow('not_authorized');
     await p.getByLabel('来源 Bot ID', { exact: true }).fill('remote');
-    await p.getByLabel('本机接收 Bot', { exact: true }).selectOption('alpha');
+    // The receiving Bot is chosen in the App's own chooser, which names this host.
+    const receiving = p.getByLabel('本机接收 Bot', { exact: true });
+    await receiving.click();
+    const targets = page.getByRole('dialog', { name: '选择本机接收 Bot', exact: true });
+    await expect(targets.getByText('接收主机：授权验收主机', { exact: true })).toBeVisible();
+    await expect(targets.locator('.cross-grants-option strong')).toHaveText(['研究助手', '复核助手', '离线资料助手']);
+    await targets.getByRole('option', { name: '研究助手', exact: true }).click();
+    await expect(targets).toHaveCount(0);
+    await expect(receiving).toHaveAccessibleDescription('研究助手');
     await expect(page.getByRole('button', { name: '本机', exact: true })).toBeDisabled();
     await expect(p.locator('.cross-grants-direction')).toHaveText('来源电脑 · remote → 授权验收主机 · 研究助手');
     await p.getByRole('button', { name: '允许发送', exact: true }).click();
@@ -115,14 +123,29 @@ test("cross-host source names come from an authenticated App connection, hide wo
     await page.getByLabel('筛选运行主机').filter({ visible: true }).first().selectOption({ label: '授权验收主机' });
     await openGrants(page); await page.getByRole('button', { name: '跨主机', exact: true }).click();
     const p = page.locator('.cross-host-message-grants');
-    await expect(p.getByLabel('来源 Bot', { exact: true })).toBeVisible();
-    await expect(p.getByLabel('来源 Bot', { exact: true }).locator('option')).toHaveText(['选择来源 Bot', '来源助手 existing', '来源助手 remote']);
+    const sourceField = p.getByLabel('来源 Bot', { exact: true });
+    await expect(sourceField).toBeVisible();
+    await expect(sourceField).toHaveAccessibleDescription('选择来源 Bot');
+    await sourceField.click();
+    const sources = page.getByRole('dialog', { name: '选择来源 Bot', exact: true });
+    await expect(sources.getByText('来源主机：来源电脑', { exact: true })).toBeVisible();
+    await expect(sources.locator('.cross-grants-option strong')).toHaveText(['来源助手 existing', '来源助手 remote']);
+    await sources.getByRole('combobox', { name: '搜索名称或 ID', exact: true }).fill('worker');
+    await expect(sources.getByRole('option')).toHaveCount(0);
+    // Leaving the chooser is not a change: nothing to save or discard.
+    await page.keyboard.press('Escape');
+    await expect(sources).toHaveCount(0);
+    await expect(sourceField).toBeFocused();
+    await expect(page.getByRole('button', { name: '本机', exact: true })).toBeEnabled();
     await p.getByRole('button', { name: '使用 Bot ID', exact: true }).click();
     await p.getByLabel('来源 Bot ID', { exact: true }).fill('worker');
     await expect(p.getByRole('button', { name: '允许发送', exact: true })).toBeDisabled();
     await expect(p.getByRole('alert')).toHaveText('内部执行者不参与手动消息授权，请选择普通 Bot。');
     await p.getByRole('button', { name: '按名称选择 Bot', exact: true }).click();
-    await p.getByLabel('来源 Bot', { exact: true }).selectOption('remote');
+    await sourceField.click();
+    await sources.getByRole('option', { name: '来源助手 remote', exact: true }).click();
+    await expect(sourceField).toHaveAccessibleDescription('来源助手 remote');
+    await expect(p.locator('.cross-grants-direction')).toHaveText('来源电脑 · 来源助手 remote → 授权验收主机 · 研究助手');
     await p.getByRole('button', { name: '允许发送', exact: true }).click();
     await expect(p.getByRole('status')).toHaveText('已允许发送，并从接收主机核对生效。');
     await page.getByRole('navigation', { name: '设置分类' }).getByRole('button', { name: /^通用/ }).click();
@@ -136,6 +159,16 @@ test("cross-host source names come from an authenticated App connection, hide wo
       await expect.poll(() => p.evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
       await p.getByRole('button', { name: /^Revoke 来源电脑 · 来源助手 remote/ }).scrollIntoViewIfNeeded();
       await page.screenshot({ path: info.outputPath(`cross-host-connected-en-${width}.png`), fullPage: true });
+      // The chooser fits the same widths and closes without a draft.
+      await p.getByLabel('Source Bot', { exact: true }).click();
+      const english = page.getByRole('dialog', { name: 'Choose a source Bot', exact: true });
+      await expect(english.getByText('Source host: 来源电脑', { exact: true })).toBeVisible();
+      await expect(english.getByRole('option', { name: '来源助手 remote', exact: true })).toHaveAttribute('aria-selected', 'true');
+      await expect.poll(() => english.evaluate(node => { const r = node.getBoundingClientRect(); return r.left >= 0 && r.top >= 0 && r.right <= innerWidth + 0.5 && r.bottom <= innerHeight + 0.5 && node.scrollWidth <= node.clientWidth + 1; })).toBe(true);
+      await page.screenshot({ path: info.outputPath(`cross-host-connected-en-chooser-${width}.png`) });
+      await page.keyboard.press('Escape');
+      await expect(english).toHaveCount(0);
+      await expect(page.getByRole('button', { name: 'Local', exact: true })).toBeEnabled();
     }
   } finally { await remote.peer.close(); await f.close(); }
 });
