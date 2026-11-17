@@ -1,5 +1,9 @@
 # Entrypoint Map
 
+[1.5.1 preflight](client/release-1.5.1-preflight.md) records shared Android
+channel versions, cross-host permissions, date refresh, mobile cleanup and the
+owner-deferred R8 follow-up.
+
 [1.5.0 preflight](client/release-1.5.0-preflight.md) records desktop reply width,
 Windows DeepSeek Desktop launch routing and the separate platform acceptance boundaries.
 

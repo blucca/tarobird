@@ -496,6 +496,13 @@ a test without an authorized rollout plan.
 
 ### Next Android release: Play Console follow-ups (2026-11-17)
 
+Owner amendment, 2026-11-18: "这次不要做了 等下次" defers the R8 / DEX
+optimization item below for release 1.5.1. Keep its existing configuration and
+carry the warning forward; this does not defer the already merged system-bar
+changes or their affected validation. GitHub APK and Play AAB use one version
+and code, with their distinct channel policies preserved. See
+[1.5.1 preflight](client/release-1.5.1-preflight.md).
+
 Owner instruction, 2026-11-17: "我们下一版安卓发版要注意", accompanied by three
 Console warnings for **1.5.0 / 2026110414**. Track them in the next release's
 preflight with source changes, package evidence and any remaining limitation.
