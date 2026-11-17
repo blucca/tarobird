@@ -173,6 +173,12 @@ function compareRows(a: InboxRow, b: InboxRow): number {
 }
 
 
+/** Numeric calendar day used wherever space is tight: 11/15, or 2025/12/3 once the year differs. */
+function numericDay(date: Date, today: Date, tag: string): string {
+  return new Intl.DateTimeFormat(tag, date.getFullYear() === today.getFullYear()
+    ? { month: 'numeric', day: 'numeric' } : { year: 'numeric', month: 'numeric', day: 'numeric' }).format(date);
+}
+
 export function formatRowTime(at: number, locale: Locale, now: number = Date.now()): string {
   if (!Number.isFinite(at) || at <= 0) return '';
   const tag = locale === 'zh' ? 'zh-CN' : 'en-US';
@@ -185,9 +191,32 @@ export function formatRowTime(at: number, locale: Locale, now: number = Date.now
   }
   if (at >= startOfDay(1)) return t('昨天');
   if (at >= startOfDay(6)) return new Intl.DateTimeFormat(tag, { weekday: 'short' }).format(date);
-  if (date.getFullYear() === today.getFullYear()) {
-    return new Intl.DateTimeFormat(tag, { month: 'numeric', day: 'numeric' }).format(date);
-  }
-  return new Intl.DateTimeFormat(tag, { year: 'numeric', month: 'numeric', day: 'numeric' }).format(date);
+  return numericDay(date, today, tag);
 }
 
+/**
+ * Timestamp beside a message inside a conversation. Today stays time-only;
+ * older messages add the calendar day (and the year once it differs) so the
+ * reader can tell when they were sent. Days follow the device's local zone.
+ *
+ * `compact` is for narrow message columns (board panes, small desktop
+ * windows) where the row also reserves the action buttons: every earlier day
+ * uses the conversation list's numeric day, and another year shows the day only.
+ */
+export function formatMessageTime(at: number, locale: Locale, compact = false, now: number = Date.now()): string {
+  const date = new Date(at);
+  const time = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (!Number.isFinite(at)) return time;
+  const today = new Date(now);
+  const startOfDay = (daysAgo: number) =>
+    new Date(today.getFullYear(), today.getMonth(), today.getDate() - daysAgo).getTime();
+  if (at >= startOfDay(0)) return time;
+  const tag = locale === 'zh' ? 'zh-CN' : 'en-US';
+  const sameYear = date.getFullYear() === today.getFullYear();
+  if (compact) return sameYear ? `${numericDay(date, today, tag)} ${time}` : numericDay(date, today, tag);
+  if (at >= startOfDay(1)) return `${t('昨天')} ${time}`;
+  // zh-CN "long" months read 11月15日 / 2025年12月3日; en-US "short" reads Nov 15 / Dec 3, 2025.
+  const month = locale === 'zh' ? 'long' : 'short';
+  const day = new Intl.DateTimeFormat(tag, sameYear ? { month, day: 'numeric' } : { year: 'numeric', month, day: 'numeric' });
+  return `${day.format(date)} ${time}`;
+}
