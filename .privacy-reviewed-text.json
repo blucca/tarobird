@@ -1428,6 +1428,18 @@
           "fingerprint": "a3fbe876b99abf7560a3958436975de3ac938a9d7776f3c94651e288c69ff0e2"
         }
       ]
+    },
+    {
+      "path": "docs/client/android-build.md",
+      "sha256": "90d5d2917c4e6cb4ee3e9b1036b164f8e276bf515b3537d2bad5d6dc054554fd",
+      "reviewer": "codex",
+      "note": "Reviewed unchanged public JDK version marker and new disposable-package testing guidance; no private paths, accounts or signing values.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "a3fbe876b99abf7560a3958436975de3ac938a9d7776f3c94651e288c69ff0e2"
+        }
+      ]
     }
   ]
 }

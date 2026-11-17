@@ -148,3 +148,27 @@ for (const name of ["update.apk.", "更新.APK. ", "update.APK", "apk", "a".re
     expect(await page.evaluate(() => (window as any).savedFixture.opened)).toEqual([]);
   } finally { await page.close(); await server.close(); }
 });
+
+
+test("GitHub known non-APK extension keeps the file-open label even with APK MIME", async ({ page }) => {
+  const server = await createServer({ server: { port: 0, host: "127.0.0.1" } }); await server.listen();
+  try {
+    await page.goto(server.resolvedUrls!.local[0] + "e2e/fixtures/android-saved-file.html?channel=github&name=payload.bin&mime=application/vnd.android.package-archive");
+    await page.getByRole("button", { name: "保存到手机 payload.bin", exact: true }).click();
+    await expect(page.getByRole("button", { name: "打开文件", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "安装 APK", exact: true })).toHaveCount(0);
+  } finally { await page.close(); await server.close(); }
+});
+
+for (const platform of ["ios", "web"]) test(`${platform} APK preview never requests Android channel status`, async ({ page }) => {
+  const server = await createServer({ server: { port: 0, host: "127.0.0.1" } }); await server.listen();
+  try {
+    await page.goto(server.resolvedUrls!.local[0] + `e2e/fixtures/android-saved-file.html?draft&platform=${platform}&channel=play&name=update.apk&mime=application/vnd.android.package-archive`);
+    const preview = page.getByRole("dialog");
+    await expect(preview).toBeVisible();
+    await expect(preview.getByRole("button", { name: "用其他应用打开", exact: true })).toHaveCount(platform === "ios" ? 1 : 0);
+    // Allow mounted effects to run before observing the bridge call counter.
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    expect(await page.evaluate(() => (window as any).savedFixture.statusCalls)).toBe(0);
+  } finally { await page.close(); await server.close(); }
+});

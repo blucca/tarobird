@@ -108,7 +108,9 @@ unsigned. With `play`:
 - APK attachments (by extension or MIME) retain save/share, but hide **Install
   APK** and external-open actions in both sent and draft previews. Native saved
   and cached-file open paths also reject APK installation without launching an
-  installer. Ordinary files retain their external readers.
+  installer. Native refusals use `attachment_install_unsupported`; the client
+  explains that saving and sharing remain available. Ordinary files retain their
+  external readers.
 - Starting Play clears only the GitHub updater credential, offer and cached
   update files, without reading that credential or touching Host pairings.
   Cleanup failure cannot enable the updater.
@@ -133,7 +135,10 @@ Verify version/code, target SDK, absence of `REQUEST_INSTALL_PACKAGES`, channel
 behavior and private-data scanning. Run `testDebugUnitTest` separately with both
 channel options and the focused instrumentation tests
 `AttachmentApkInstallTest` / `AndroidUpdaterDistributionTest` on an isolated
-Android device or emulator. An unsigned AAB or successful compilation alone is
+Android device or emulator with a disposable package ID ending in
+`.distributiontest`, for example
+`-PtarobotApplicationId=com.tarobot.client.distributiontest`. The tests refuse
+production package IDs. An unsigned AAB or successful compilation alone is
 not final signed-artifact or installed-App acceptance.
 
 ## Push registration source update, 2026-10-11

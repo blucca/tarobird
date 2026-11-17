@@ -127,7 +127,7 @@ function FileStatus({ allowPackageOpen, phase, cancel, retry, saved, openSaved, 
       {phase.kind === "download" && <button onClick={cancel}>{t("取消下载")}</button>}
       {phase.kind === "error" && <button onClick={() => retry(phase.retry)}>{t("重试")}</button>}
       {saved && ["done", "cancelled", "error"].includes(phase.kind) && <div className="file-saved-actions">
-        {(!saved.apk || allowPackageOpen) && <button aria-disabled={!!saved.action || undefined} title={saved.apk ? t("打开系统安装器") : t("用系统默认应用打开")} onClick={openSaved}>{saved.action === "open" ? t("正在打开…") : saved.apk ? t("安装 APK") : t("打开文件")}</button>}
+        {allowPackageOpen && <button aria-disabled={!!saved.action || undefined} title={saved.apk ? t("打开系统安装器") : t("用系统默认应用打开")} onClick={openSaved}>{saved.action === "open" ? t("正在打开…") : saved.apk ? t("安装 APK") : t("打开文件")}</button>}
         {canRevealSavedAttachment() && <button className="file-status-reveal" aria-disabled={!!saved.action || undefined} title={t("打开文件位置")} aria-label={saved.action === "reveal" ? t("正在定位…") : t("打开文件位置")} onClick={revealSaved}>{saved.action === "reveal" ? <LoaderCircle className="spin" size={16} aria-hidden="true"/> : <FolderOpen size={16} aria-hidden="true"/>}</button>}
       </div>}
     </div>}
@@ -163,7 +163,7 @@ export function AttachmentFile({ connection, block, list = false }: { connection
       const revision = actionRevision.current, attempt = ++check;
       const receipt = await restoreSavedAttachment(savedKey);
       if (disposed || !alive.current || attempt !== check || revision !== actionRevision.current || running.current || receipt === undefined) return;
-      setSaved(receipt ? { ...receipt, scope: savedKey, apk: isAndroidApk(block.name, block.mime) } : undefined);
+      setSaved(receipt ? { ...receipt, scope: savedKey, apk: isAndroidApk(block.name) } : undefined);
       if (!receipt) setPhase(current => current.kind === "done" && current.delivery === "saved" ? { kind: "idle" } : current);
     };
     void restore(); document.addEventListener("visibilitychange", restore);
@@ -233,7 +233,7 @@ export function AttachmentFile({ connection, block, list = false }: { connection
         void source.current?.dispose(); source.current = acquired.retain(); setPreview(next); setPhase({ kind: "idle" }); return;
       }
       // The first stage is reported synchronously, so the finished download's cancel never stays on screen.
-      const accepted = await (action === "external" ? openAttachmentExternally : action === "share" ? shareAttachment : exportAttachment)(blob, block.name, { browserLock: acquired.browserLock, savedKey, stage: (stage) => { seen.stage = stage; show({ kind: stage }); }, delivered: (delivery, savedPath, savedLocation) => { seen.delivery = delivery; seen.location = savedLocation; if (alive.current && delivery === "saved" && savedPath) setSaved({ path: savedPath, location: savedLocation, scope: savedKey, apk: isAndroidApk(block.name, block.mime) }); } });
+      const accepted = await (action === "external" ? openAttachmentExternally : action === "share" ? shareAttachment : exportAttachment)(blob, block.name, { browserLock: acquired.browserLock, savedKey, stage: (stage) => { seen.stage = stage; show({ kind: stage }); }, delivered: (delivery, savedPath, savedLocation) => { seen.delivery = delivery; seen.location = savedLocation; if (alive.current && delivery === "saved" && savedPath) setSaved({ path: savedPath, location: savedLocation, scope: savedKey, apk: isAndroidApk(block.name) }); } });
       show(!accepted ? { kind: "cancelled", step: seen.stage === "sharing" ? "share" : seen.stage === "handoff" ? "download" : "save" } : seen.delivery ? { kind: "done", delivery: seen.delivery, location: seen.location } : { kind: "idle" });
     } catch (error) {
       const message = error instanceof Error ? error.message : t("附件不可用");
@@ -242,7 +242,7 @@ export function AttachmentFile({ connection, block, list = false }: { connection
     } finally { await acquired?.dispose(); running.current = false; opening.current = false; }
   };
   const accessSaved = async (action: "open" | "reveal") => {
-    if (running.current || !saved || !activeRef.current || action === "open" && saved.apk && !allowPackageOpen) return; running.current = true; actionRevision.current++;
+    if (running.current || !saved || !activeRef.current || action === "open" && !allowPackageOpen) return; running.current = true; actionRevision.current++;
     const { action: _previousAction, error: _previousError, ...receipt } = saved; setSaved({ ...receipt, action });
     try { await (action === "open" ? openSavedAttachment : revealSavedAttachment)(receipt.path); if (alive.current) setSaved(receipt); }
     catch (error) { if (alive.current) setSaved({ ...receipt, error: (error as Error).message }); }

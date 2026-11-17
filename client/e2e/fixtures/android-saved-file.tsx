@@ -12,8 +12,9 @@ const previous = JSON.parse(localStorage.getItem("saved-fixture-counts") ?? "{}"
 const state = { shares: 0, statusCalls: 0, releaseStatus: undefined as (() => void) | undefined, downloads: previous.downloads ?? 0, saves: previous.saves ?? 0, opened: [] as string[], fail: "", cancel: false, legacy: false, delayRestore: false, releaseRestore: undefined as (() => void) | undefined, release: undefined as (() => void) | undefined };
 const counts = () => localStorage.setItem("saved-fixture-counts", JSON.stringify({ downloads: state.downloads, saves: state.saves }));
 Object.assign(window, { savedFixture: state });
-Capacitor.isNativePlatform = () => true;
-Capacitor.getPlatform = () => "android";
+const platform = params.get("platform") ?? "android";
+Capacitor.isNativePlatform = () => platform !== "web";
+Capacitor.getPlatform = () => platform;
 const statusGate = params.has("delayed") ? new Promise<void>(resolve => { state.releaseStatus = resolve; }) : Promise.resolve();
 registerPlugin("TaroBotAndroidUpdater", { web: async () => ({
   status: async () => { state.statusCalls++; await statusGate; return { phase: channel === "play" ? "disabled" : "initial", version: "1.5.0", configured: channel !== "play", ...(channel === "legacy" ? {} : { inAppUpdates: channel !== "play" }) }; },
