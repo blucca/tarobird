@@ -1,13 +1,11 @@
 package com.tarobot.client;
 
 import android.app.Activity;
-import android.os.Build;
 import android.view.View;
-import android.view.WindowManager;
 import android.webkit.WebView;
+import androidx.activity.ComponentActivity;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
-import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import com.getcapacitor.BridgeActivity;
 import com.getcapacitor.WebViewListener;
@@ -20,9 +18,6 @@ final class NativeInsets {
     // An immersive reader keeps the whole screen until close. Its overlay
     // controls receive separate safe insets, without resizing the photo.
     private static boolean immersive;
-    // Keep the framework's constant-typed field when saving the mode. A plain
-    // int with a -1 sentinel loses that contract when it is restored.
-    private static WindowManager.LayoutParams savedCutout;
     // UI-thread only. Keep the latest system rectangle per window without
     // retaining destroyed Activities. Window background changes can reset
     // DecorView padding without delivering another set of insets.
@@ -30,8 +25,10 @@ final class NativeInsets {
 
     private NativeInsets() {}
 
-    static void install(Activity activity) {
-        WindowCompat.setDecorFitsSystemWindows(activity.getWindow(), false);
+    static void install(ComponentActivity activity) {
+        // The saved canvas enables edge-to-edge layout on every Android version.
+        // This listener then stays the only owner of the insets.
+        NativeAppearance.restore(activity);
         var decor = activity.getWindow().getDecorView();
         var bridge = activity instanceof BridgeActivity ? ((BridgeActivity) activity).getBridge() : null;
         var keyboard = new long[] { 0, 0 };
@@ -114,25 +111,11 @@ final class NativeInsets {
         webView.evaluateJavascript("window.__tarobotKeyboard={height:" + height + ",at:" + at + "};window.dispatchEvent(new CustomEvent('tarobot-keyboard',{detail:window.__tarobotKeyboard}))", null);
     }
 
-    /** Before hiding bars: also let Android 9-14 draw into a short-edge cutout.
-     * After showing them: restore the window's cutout mode and safe padding. */
+    /** Reselect zero or safe padding. The edge-to-edge window already extends
+     * into a display cutout, so the reader needs no cutout mode of its own. */
     static void setImmersive(Activity activity, boolean value) {
         if (immersive == value) return;
         immersive = value;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            var window = activity.getWindow();
-            var attributes = window.getAttributes();
-            if (value) {
-                savedCutout = new WindowManager.LayoutParams();
-                savedCutout.layoutInDisplayCutoutMode = attributes.layoutInDisplayCutoutMode;
-                attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-                window.setAttributes(attributes);
-            } else if (savedCutout != null) {
-                attributes.layoutInDisplayCutoutMode = savedCutout.layoutInDisplayCutoutMode;
-                savedCutout = null;
-                window.setAttributes(attributes);
-            }
-        }
         ViewCompat.requestApplyInsets(activity.getWindow().getDecorView());
     }
 }

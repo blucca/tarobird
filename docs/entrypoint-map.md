@@ -3074,6 +3074,11 @@ and the existing network/run/delete suites listed in that audit.
   offline recovery without changing frames sent to older snapshot clients.
   Tests: `hub-server`, `hub-link-preview`; browser `activity-order`, `snapshot`,
   `stream`, `sidebar-layout`.
+  Row times (`formatRowTime`) and message timestamps (`formatMessageTime`) are
+  worded relative to today. `local-day.ts:useLocalDay` renders their components
+  again at local midnight and when the App returns to the foreground, from one
+  shared timer. Tests: `client-local-day`, `client-message-time`; browser
+  `message-time`.
   Browser `sidebar-layout` covers persistence,
   drafts, narrow layouts and host-scoped actions. Conversation-row Bot names
   and model marks sit immediately after the title, as on phones; short titles
@@ -3998,6 +4003,13 @@ window backgrounds, which otherwise reset DecorView padding before the next
 inset dispatch. Immersive readers still select zero padding. The same installed
 listener resets reader state on page start; registering it after Bridge
 construction prevents Capacitor's builder from replacing it during startup.
+`NativeAppearance` enables edge-to-edge layout, transparent bars and icon
+contrast through `androidx.activity.EdgeToEdge` with a fixed light or dark
+`SystemBarStyle`; the app calls no deprecated `Window` bar setter and sets no
+cutout mode itself. EdgeToEdge replays its first style when views receive a
+configuration change, so a later DecorView child restores the current canvas in
+that dispatch (`AppearanceTest#viewConfigurationDispatchKeepsCurrentContrast`).
+`NativeInsets` remains the only inset owner.
 The isolated
 `NativeInsetsTest` checks real keyboard frames, rotation, reader exit and reload;
 see [Android canvas refresh regression](client/android-safe-area-refresh-2026-11-14.md).

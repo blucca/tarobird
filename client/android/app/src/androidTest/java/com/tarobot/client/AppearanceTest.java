@@ -182,6 +182,46 @@ public class AppearanceTest {
             if (originalNight.matches("yes|no|auto|custom")) shell("cmd uimode night " + originalNight);
         }
     }
+    /** Views receive a configuration change after the Activity callback. An
+     * earlier in-app theme must not return there, even until the next focus
+     * change. Sample inside that dispatch: later repairs would hide a regression. */
+    @Test public void viewConfigurationDispatchKeepsCurrentContrast() throws Exception {
+        var instrument = InstrumentationRegistry.getInstrumentation(); var context = instrument.getTargetContext();
+        assertTrue("Must use isolated test app", context.getPackageName().endsWith(".appearancetest"));
+        var seen = new java.util.concurrent.CopyOnWriteArrayList<Boolean>();
+        try {
+            instrument.getUiAutomation().setRotation(UiAutomation.ROTATION_FREEZE_0);
+            activity = (MainActivity) instrument.startActivitySync(new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
+            waitFor("!!window.Capacitor?.nativePromise && !!document.querySelector('.pairing-page')");
+            instrument.runOnMainSync(() -> {
+                var window = activity.getWindow();
+                // The last DecorView child is dispatched after every other one.
+                var probe = new android.view.View(activity) {
+                    @Override protected void onConfigurationChanged(android.content.res.Configuration config) {
+                        seen.add(WindowCompat.getInsetsController(window, window.getDecorView()).isAppearanceLightStatusBars());
+                    }
+                };
+                probe.setVisibility(android.view.View.GONE);
+                ((android.view.ViewGroup) window.getDecorView()).addView(probe);
+            });
+            // Both directions: either style may be the first one of this Activity.
+            for (String color : new String[]{"#ffffff", "#141414", "#ffffff"}) {
+                boolean darkIcons = !color.equals("#141414");
+                setCanvas(color, darkIcons);
+                for (int rotation : new int[]{UiAutomation.ROTATION_FREEZE_90, UiAutomation.ROTATION_FREEZE_0}) {
+                    seen.clear();
+                    instrument.getUiAutomation().setRotation(rotation);
+                    long until = System.currentTimeMillis() + 10000;
+                    while (seen.isEmpty() && System.currentTimeMillis() < until) Thread.sleep(20);
+                    assertFalse("Rotation must reach the views", seen.isEmpty());
+                    for (boolean light : seen) assertEquals("Icon contrast inside the view dispatch for " + color, darkIcons, light);
+                }
+            }
+        } finally {
+            instrument.getUiAutomation().setRotation(UiAutomation.ROTATION_UNFREEZE);
+            if (activity != null) instrument.runOnMainSync(activity::finish);
+        }
+    }
     /** Test actual painted pixels, not just onload/naturalWidth or DOM visibility.
      * Package the isolated image-viewer-phone fixture; no Host or upload is used. */
     @Test public void draftPhotoPaintsAfterOpeningAndReopening() throws Exception {

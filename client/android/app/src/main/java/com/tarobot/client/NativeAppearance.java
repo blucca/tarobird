@@ -2,9 +2,14 @@ package com.tarobot.client;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
-import android.os.Build;
+import android.view.View;
+import android.view.ViewGroup;
+import androidx.activity.ComponentActivity;
+import androidx.activity.EdgeToEdge;
+import androidx.activity.SystemBarStyle;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
@@ -18,23 +23,23 @@ final class NativeAppearance {
     private static boolean readerDarkIcons;
     private static boolean immersive;
 
-    static void restore(Activity activity) {
+    static void restore(ComponentActivity activity) {
         var prefs = activity.getSharedPreferences("appearance", Context.MODE_PRIVATE);
         int color = readerColor != null ? readerColor : prefs.getInt("background", Color.WHITE);
         apply(activity, color, readerColor != null ? readerDarkIcons : prefs.getBoolean("darkIcons", true));
         // Focus and resume can reveal hidden bars; re-hide them while the reader asks.
         if (immersive) hideBars(activity);
     }
-    static void save(Activity activity, int color, boolean darkIcons) {
+    static void save(ComponentActivity activity, int color, boolean darkIcons) {
         activity.getSharedPreferences("appearance", Context.MODE_PRIVATE).edit()
             .putInt("background", color).putBoolean("darkIcons", darkIcons).apply();
         restore(activity);
     }
-    static void setReader(Activity activity, Integer color, boolean darkIcons) {
+    static void setReader(ComponentActivity activity, Integer color, boolean darkIcons) {
         readerColor = color; readerDarkIcons = darkIcons;
         restore(activity);
     }
-    static void setImmersive(Activity activity, boolean value) {
+    static void setImmersive(ComponentActivity activity, boolean value) {
         if (immersive == value) { restore(activity); return; }
         immersive = value;
         if (value) {
@@ -48,7 +53,7 @@ final class NativeAppearance {
         }
     }
     /** A reloaded page or recreated Activity cannot release an older reader. */
-    static void resetReader(Activity activity) {
+    static void resetReader(ComponentActivity activity) {
         readerColor = null;
         if (immersive) setImmersive(activity, false);
         restore(activity);
@@ -59,22 +64,31 @@ final class NativeAppearance {
         controller.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
         controller.hide(WindowInsetsCompat.Type.systemBars());
     }
-    @SuppressWarnings("deprecation")
-    private static void apply(Activity activity, int color, boolean darkIcons) {
+    private static void apply(ComponentActivity activity, int color, boolean darkIcons) {
         var window = activity.getWindow();
         window.setBackgroundDrawable(new ColorDrawable(color));
         window.getDecorView().setBackgroundColor(color);
-        window.setStatusBarColor(Color.TRANSPARENT);
-        window.setNavigationBarColor(Color.TRANSPARENT);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            window.setStatusBarContrastEnforced(false);
-            window.setNavigationBarContrastEnforced(false);
-        }
-        var controller = WindowCompat.getInsetsController(window, window.getDecorView());
-        controller.setAppearanceLightStatusBars(darkIcons);
-        controller.setAppearanceLightNavigationBars(darkIcons);
+        // Transparent bars over that canvas on every Android version. A fixed
+        // light or dark style follows the app theme rather than the system one,
+        // and adds no OS contrast scrim behind three-button navigation.
+        var style = darkIcons ? SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT) : SystemBarStyle.dark(Color.TRANSPARENT);
+        EdgeToEdge.enable(activity, style, style);
+        followConfiguration(activity);
         // DecorView's background update can clear the padding owned by
         // NativeInsets. Restore it synchronously, before the next layout/paint.
         NativeInsets.restorePadding(activity);
+    }
+    /** EdgeToEdge keeps a hidden DecorView child that replays the style of its
+     * first call on every configuration change, after the Activity callback.
+     * A later sibling restores the current canvas within that same dispatch. */
+    private static void followConfiguration(ComponentActivity activity) {
+        var decor = (ViewGroup) activity.getWindow().getDecorView();
+        for (int index = decor.getChildCount() - 1; index >= 0; index--) if (decor.getChildAt(index) instanceof Follower) return;
+        decor.addView(new Follower(activity));
+    }
+    private static final class Follower extends View {
+        private final ComponentActivity activity;
+        Follower(ComponentActivity activity) { super(activity); this.activity = activity; setVisibility(GONE); setWillNotDraw(true); }
+        @Override protected void onConfigurationChanged(Configuration newConfig) { restore(activity); }
     }
 }

@@ -527,6 +527,13 @@ an immediate rebuild, dependency upgrade or new publication.
   Preserve one owner for system-bar/keyboard insets; do not blindly add another
   edge-to-edge helper or delete older-Android compatibility handling just to
   suppress a warning.
+  Source status, 2026-11-18: app code now calls `EdgeToEdge.enable()` and no
+  longer calls `setStatusBarColor`, `setNavigationBarColor`,
+  `setStatusBarContrastEnforced` or sets `layoutInDisplayCutoutMode`. The
+  packaged AndroidX activity/core/splash-screen, Material and Cordova classes
+  still contain such calls, so the Console may keep listing them. Android 9-14
+  now keep the window in the display cutout outside the reader as well; that
+  path and the Console readback for a new bundle are not yet verified.
 - Validate the changed **release** packages on isolated devices/emulators:
   Android 15/16 and the older Android branches affected by the change; gesture
   and three-button navigation; light/dark themes; keyboard open/close;
