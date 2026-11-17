@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import type { Message } from "../src/client-protocol/index.js";
-import { affectedBackgroundTasks, turnStopImpact } from "../client/src/turn-stop.js";
+import { affectedBackgroundTasks, stopScopeUnverified, turnStopImpact } from "../client/src/turn-stop.js";
 
 const bots = [{ id: "claude", engine: "claude" as const }, { id: "codex", engine: "codex" as const }];
 function message(id: string, bot: string, scoped = false, phase = "working", waiting = false): Message {
@@ -52,4 +52,15 @@ it("uses declared native stop scope and excludes completed and foreground steps"
   expect(affectedBackgroundTasks({ supported: true, tasks, foregroundStopScope: "subagents" }).map(task => task.id)).toEqual(["agent"]);
   expect(affectedBackgroundTasks({ supported: true, tasks, foregroundStopScope: "all" }).map(task => task.id)).toEqual(["agent", "shell"]);
   for (const snapshot of [undefined, { supported: false, tasks }, { supported: true, tasks }, { supported: true, tasks, foregroundStopScope: "foreground" as const }]) expect(affectedBackgroundTasks(snapshot)).toEqual([]);
+});
+
+it("leaves a stop unverified unless the worker lists its tasks and declares its stop scope", () => {
+  // No snapshot at all.
+  expect(stopScopeUnverified(undefined)).toBe(true);
+  // A worker without native task support.
+  expect(stopScopeUnverified({ supported: false, tasks: [] })).toBe(true);
+  // A list without a live worker behind it carries no scope.
+  expect(stopScopeUnverified({ supported: true, tasks: [] })).toBe(true);
+  // An empty list is still verified once the scope is declared.
+  for (const foregroundStopScope of ["foreground", "subagents", "all"] as const) expect(stopScopeUnverified({ supported: true, tasks: [], foregroundStopScope })).toBe(false);
 });

@@ -1,7 +1,7 @@
 import { createContext, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { Message } from "../../src/client-protocol/index.js";
-import { affectedBackgroundTasks, turnStopImpact } from "./turn-stop.js";
+import { affectedBackgroundTasks, stopScopeUnverified, turnStopImpact } from "./turn-stop.js";
 import { engineTaskSnapshotSchema } from "../../src/client-protocol/engine-tasks.js";
 import { queueRequest } from "./prompt-queue-request.js";
 import type { HubConnection } from "./connection.js";
@@ -41,7 +41,7 @@ export function useTurnStop(connection: HubConnection, conversationId: string, m
       const details = await Promise.all(targets.map(async bot => {
         try {
           const result = engineTaskSnapshotSchema.parse(await lookup!.wait(connection.http(`/api/conversations/${target}/tasks?botId=${encodeURIComponent(bot.id)}`, { signal: lookup!.signal })));
-          return { tasks: affectedBackgroundTasks(result).map(task => ({ id: `${bot.id}:${task.id}`, label: targets.length > 1 ? `${bot.name} · ${task.label}` : task.label })), unverified: !result.supported || !result.foregroundStopScope };
+          return { tasks: affectedBackgroundTasks(result).map(task => ({ id: `${bot.id}:${task.id}`, label: targets.length > 1 ? `${bot.name} · ${task.label}` : task.label })), unverified: stopScopeUnverified(result) };
         } catch { return { tasks: [], unverified: true }; }
       })).finally(() => lookup?.dispose());
       if (!currentScope() || turnStopImpact(latest.current.messages, connection.state.bots, target, botId).identity !== impact.identity) return false;

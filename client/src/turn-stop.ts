@@ -11,6 +11,12 @@ export function affectedBackgroundTasks(snapshot?: EngineTaskSnapshot) {
     && (snapshot.foregroundStopScope === "all" || snapshot.foregroundStopScope === "subagents" && task.kind === "subagent"));
 }
 
+/** Only a worker that lists its tasks and declares its stop scope verifies what
+ * a stop reaches. Any other answer is unverified, and the user confirms first. */
+export function stopScopeUnverified(snapshot?: EngineTaskSnapshot) {
+  return !snapshot?.supported || !snapshot.foregroundStopScope;
+}
+
 export function turnStopImpact(messages: Message[], bots: Pick<Bot, "id" | "engine">[], conversationId: string, botId?: string) {
   const rows = messages.filter(message => message.conversationId === conversationId && message.authorType === "bot" && (!botId || message.authorId === botId) && message.status !== "deleted" && message.status !== "error");
   const foreground = rows.filter(message => !isAgentBusRecord(message) && (message.blocks.some(block => block.type === "card" && nativeRun(block) && isRunActive(nativeRun(block)!.phase))
