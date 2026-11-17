@@ -3998,6 +3998,13 @@ window backgrounds, which otherwise reset DecorView padding before the next
 inset dispatch. Immersive readers still select zero padding. The same installed
 listener resets reader state on page start; registering it after Bridge
 construction prevents Capacitor's builder from replacing it during startup.
+`NativeAppearance` enables edge-to-edge layout, transparent bars and icon
+contrast through `androidx.activity.EdgeToEdge` with a fixed light or dark
+`SystemBarStyle`; the app calls no deprecated `Window` bar setter and sets no
+cutout mode itself. EdgeToEdge replays its first style when views receive a
+configuration change, so a later DecorView child restores the current canvas in
+that dispatch (`AppearanceTest#viewConfigurationDispatchKeepsCurrentContrast`).
+`NativeInsets` remains the only inset owner.
 The isolated
 `NativeInsetsTest` checks real keyboard frames, rotation, reader exit and reload;
 see [Android canvas refresh regression](client/android-safe-area-refresh-2026-11-14.md).
