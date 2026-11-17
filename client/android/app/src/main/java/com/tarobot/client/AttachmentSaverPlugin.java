@@ -130,11 +130,16 @@ public final class AttachmentSaverPlugin extends Plugin {
             } catch (Exception error) { call.reject("attachment_save_failed"); }
         });
     }
+    /** Null when this saved type may be launched. A Play build refuses APKs
+     * before Android is asked: without the manifest permission that call throws. */
+    private String blocked(String mime) {
+        return AttachmentApkPolicy.blocked(BuildConfig.TAROBOT_IN_APP_UPDATES, mime,
+            () -> Build.VERSION.SDK_INT < Build.VERSION_CODES.O || getContext().getPackageManager().canRequestPackageInstalls());
+    }
     @PluginMethod public void openSaved(PluginCall call) {
         String mime = savedTypes.get(call.getString("uri", ""));
         if (mime == null) { call.reject("attachment_saved_uri_invalid"); return; }
-        if ("application/vnd.android.package-archive".equals(mime) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                && !getContext().getPackageManager().canRequestPackageInstalls()) {
+        if (AttachmentApkPolicy.CONSENT_REQUIRED.equals(blocked(mime))) {
             // Only an explicit tap on Install APK reaches this per-app setting.
             // Android still owns the subsequent package confirmation.
             try { startActivityForResult(call, new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
@@ -146,14 +151,17 @@ public final class AttachmentSaverPlugin extends Plugin {
     }
     @ActivityCallback private void installPermissionReturned(PluginCall call, ActivityResult result) {
         if (call == null) return;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !getContext().getPackageManager().canRequestPackageInstalls()) {
-            call.reject("attachment_install_permission_required"); return;
-        }
+        // Only an APK open waits on Settings, whatever this plugin instance still remembers.
+        String blocked = blocked(AttachmentApkPolicy.MIME);
+        if (blocked != null) { call.reject(blocked); return; }
         launchSaved(call);
     }
     private void launchSaved(PluginCall call) {
         String raw = call.getString("uri", ""), mime = savedTypes.get(raw);
         if (mime == null) { call.reject("attachment_saved_uri_invalid"); return; }
+        // Last step before the intent: no caller can reach an installer around the policy.
+        String blocked = blocked(mime);
+        if (blocked != null) { call.reject(blocked); return; }
         Uri uri = Uri.parse(raw);
         try (var descriptor = getContext().getContentResolver().openFileDescriptor(uri, "r")) {
             if (descriptor == null) throw new java.io.IOException();

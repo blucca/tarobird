@@ -1416,6 +1416,18 @@
           "fingerprint": "a3fbe876b99abf7560a3958436975de3ac938a9d7776f3c94651e288c69ff0e2"
         }
       ]
+    },
+    {
+      "path": "docs/client/android-build.md",
+      "sha256": "1586dd07667153d2180e2f426a5626b2cd169a09adde0a763948d405b2a2c7f8",
+      "reviewer": "codex",
+      "note": "Reviewed Android channel build and acceptance instructions; only the existing public JDK version matches an IP pattern. No account, secret or owner-specific path added.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "a3fbe876b99abf7560a3958436975de3ac938a9d7776f3c94651e288c69ff0e2"
+        }
+      ]
     }
   ]
 }

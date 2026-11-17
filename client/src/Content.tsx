@@ -1,3 +1,4 @@
+import { useAndroidPackageOpen } from "./android-package-actions.js";
 import { InlineAudioControls } from "./InlineAudioControls.js";
 import { WorkbenchChartEntry } from "./WorkbenchEntry.js";
 import { nativePlatform } from "./native.js";
@@ -115,7 +116,7 @@ function FileStatusMessage({ phase }: { phase: FilePhase }) {
     <small role={phase.kind === "error" ? "alert" : "status"}>{fileStatusText(phase)}</small>
   </div>;
 }
-function FileStatus({ phase, cancel, retry, saved, openSaved, revealSaved, className, primaryActions, hideMessage }: { phase: FilePhase; cancel: () => void; retry: (action: "open" | "save" | "share" | "external") => void; saved?: SavedFile; openSaved: () => void; revealSaved: () => void; className?: string; primaryActions?: ReactNode; hideMessage?: boolean }) {
+function FileStatus({ allowPackageOpen, phase, cancel, retry, saved, openSaved, revealSaved, className, primaryActions, hideMessage }: { allowPackageOpen: boolean; phase: FilePhase; cancel: () => void; retry: (action: "open" | "save" | "share" | "external") => void; saved?: SavedFile; openSaved: () => void; revealSaved: () => void; className?: string; primaryActions?: ReactNode; hideMessage?: boolean }) {
   if (phase.kind === "idle" && !primaryActions) return null;
   const tone = phase.kind === "error" ? "error" : phase.kind === "done" && phase.delivery === "saved" ? "done" : undefined;
   return <div className={className ? `file-status ${className}` : "file-status"} data-tone={tone} data-local-file={!!saved || undefined}>
@@ -126,7 +127,7 @@ function FileStatus({ phase, cancel, retry, saved, openSaved, revealSaved, class
       {phase.kind === "download" && <button onClick={cancel}>{t("取消下载")}</button>}
       {phase.kind === "error" && <button onClick={() => retry(phase.retry)}>{t("重试")}</button>}
       {saved && ["done", "cancelled", "error"].includes(phase.kind) && <div className="file-saved-actions">
-        <button aria-disabled={!!saved.action || undefined} title={saved.apk ? t("打开系统安装器") : t("用系统默认应用打开")} onClick={openSaved}>{saved.action === "open" ? t("正在打开…") : saved.apk ? t("安装 APK") : t("打开文件")}</button>
+        {(!saved.apk || allowPackageOpen) && <button aria-disabled={!!saved.action || undefined} title={saved.apk ? t("打开系统安装器") : t("用系统默认应用打开")} onClick={openSaved}>{saved.action === "open" ? t("正在打开…") : saved.apk ? t("安装 APK") : t("打开文件")}</button>}
         {canRevealSavedAttachment() && <button className="file-status-reveal" aria-disabled={!!saved.action || undefined} title={t("打开文件位置")} aria-label={saved.action === "reveal" ? t("正在定位…") : t("打开文件位置")} onClick={revealSaved}>{saved.action === "reveal" ? <LoaderCircle className="spin" size={16} aria-hidden="true"/> : <FolderOpen size={16} aria-hidden="true"/>}</button>}
       </div>}
     </div>}
@@ -142,6 +143,7 @@ export function AttachmentFile({ connection, block, list = false }: { connection
   const previewEpoch = useRef(0), opening = useRef(false);
   const phone = useSyncExternalStore(subscribePhone, snapshotPhone);
   const sizeId = useId();
+  const allowPackageOpen = useAndroidPackageOpen(block.name, block.mime);
   const thumbnail = !list && fileKind(block.name, block.mime).kind === "video";
   const [phase, setPhase] = useState<FilePhase>({ kind: "idle" }); const [preview, setPreview] = useState<AttachmentPreview>();
   const savedKey = savedAttachmentKey(connection.identity, block.attachmentId);
@@ -161,12 +163,12 @@ export function AttachmentFile({ connection, block, list = false }: { connection
       const revision = actionRevision.current, attempt = ++check;
       const receipt = await restoreSavedAttachment(savedKey);
       if (disposed || !alive.current || attempt !== check || revision !== actionRevision.current || running.current || receipt === undefined) return;
-      setSaved(receipt ? { ...receipt, scope: savedKey, apk: isAndroidApk(block.name) } : undefined);
+      setSaved(receipt ? { ...receipt, scope: savedKey, apk: isAndroidApk(block.name, block.mime) } : undefined);
       if (!receipt) setPhase(current => current.kind === "done" && current.delivery === "saved" ? { kind: "idle" } : current);
     };
     void restore(); document.addEventListener("visibilitychange", restore);
     return () => { disposed = true; document.removeEventListener("visibilitychange", restore); };
-  }, [savedKey, active, block.name]);
+  }, [savedKey, active, block.name, block.mime]);
   const panel = useRef<HTMLDialogElement>(null);
   const previewBody = useRef<HTMLElement>(null), previewHeader = useRef<HTMLElement>(null);
   useDialogDrag(previewBody, previewHeader, preview?.kind === "video" && active);
@@ -231,7 +233,7 @@ export function AttachmentFile({ connection, block, list = false }: { connection
         void source.current?.dispose(); source.current = acquired.retain(); setPreview(next); setPhase({ kind: "idle" }); return;
       }
       // The first stage is reported synchronously, so the finished download's cancel never stays on screen.
-      const accepted = await (action === "external" ? openAttachmentExternally : action === "share" ? shareAttachment : exportAttachment)(blob, block.name, { browserLock: acquired.browserLock, savedKey, stage: (stage) => { seen.stage = stage; show({ kind: stage }); }, delivered: (delivery, savedPath, savedLocation) => { seen.delivery = delivery; seen.location = savedLocation; if (alive.current && delivery === "saved" && savedPath) setSaved({ path: savedPath, location: savedLocation, scope: savedKey, apk: isAndroidApk(block.name) }); } });
+      const accepted = await (action === "external" ? openAttachmentExternally : action === "share" ? shareAttachment : exportAttachment)(blob, block.name, { browserLock: acquired.browserLock, savedKey, stage: (stage) => { seen.stage = stage; show({ kind: stage }); }, delivered: (delivery, savedPath, savedLocation) => { seen.delivery = delivery; seen.location = savedLocation; if (alive.current && delivery === "saved" && savedPath) setSaved({ path: savedPath, location: savedLocation, scope: savedKey, apk: isAndroidApk(block.name, block.mime) }); } });
       show(!accepted ? { kind: "cancelled", step: seen.stage === "sharing" ? "share" : seen.stage === "handoff" ? "download" : "save" } : seen.delivery ? { kind: "done", delivery: seen.delivery, location: seen.location } : { kind: "idle" });
     } catch (error) {
       const message = error instanceof Error ? error.message : t("附件不可用");
@@ -240,7 +242,7 @@ export function AttachmentFile({ connection, block, list = false }: { connection
     } finally { await acquired?.dispose(); running.current = false; opening.current = false; }
   };
   const accessSaved = async (action: "open" | "reveal") => {
-    if (running.current || !saved || !activeRef.current) return; running.current = true; actionRevision.current++;
+    if (running.current || !saved || !activeRef.current || action === "open" && saved.apk && !allowPackageOpen) return; running.current = true; actionRevision.current++;
     const { action: _previousAction, error: _previousError, ...receipt } = saved; setSaved({ ...receipt, action });
     try { await (action === "open" ? openSavedAttachment : revealSavedAttachment)(receipt.path); if (alive.current) setSaved(receipt); }
     catch (error) { if (alive.current) setSaved({ ...receipt, error: (error as Error).message }); }
@@ -249,7 +251,7 @@ export function AttachmentFile({ connection, block, list = false }: { connection
   const busy = !!saved?.action || !(phase.kind === "idle" || phase.kind === "done" || phase.kind === "cancelled" || phase.kind === "error") || undefined;
   useMessageReader(active && (!!preview || !!busy));
   const feedbackPhase: FilePhase = phase.kind === "idle" && saved ? { kind: "done", delivery: "saved", location: saved.location } : phase;
-  const status = (className?: string, primaryActions?: ReactNode) => <FileStatus primaryActions={primaryActions} hideMessage={!!primaryActions} phase={preview && primaryActions ? { kind: "idle" } : feedbackPhase} saved={preview && primaryActions ? undefined : saved} openSaved={() => { void accessSaved("open"); }} revealSaved={() => { void accessSaved("reveal"); }} className={className} cancel={() => download.current?.abort()} retry={(action) => { void run(action); }}/>;
+  const status = (className?: string, primaryActions?: ReactNode) => <FileStatus allowPackageOpen={allowPackageOpen} primaryActions={primaryActions} hideMessage={!!primaryActions} phase={preview && primaryActions ? { kind: "idle" } : feedbackPhase} saved={preview && primaryActions ? undefined : saved} openSaved={() => { void accessSaved("open"); }} revealSaved={() => { void accessSaved("reveal"); }} className={className} cancel={() => download.current?.abort()} retry={(action) => { void run(action); }}/>;
   const documentCard = !phone && !list && !thumbnail;
   const saveButton = <button className="file-card-save" aria-disabled={busy} aria-label={canOpenAttachmentExternally() ? t("保存到手机 {0}", block.name) : t("另存为 {0}", block.name)} title={attachmentSaveLabel()} onClick={() => { void run("save"); }}><Download size={18}/></button>;
   return <><section className={`file-card${thumbnail ? " has-video-thumbnail" : ""}${documentCard ? " is-document" : ""}`} aria-label={block.name}>{documentCard ? <>
@@ -258,7 +260,7 @@ export function AttachmentFile({ connection, block, list = false }: { connection
   </> : <>
     {thumbnail ? <><VideoThumbnail connection={connection} id={block.attachmentId} name={block.name} size={block.size} busy={busy} source={preview?.kind === "video" ? preview.blob : undefined} opener={opener} open={() => { void run("open"); }}/><span><strong>{block.name}</strong><small id={sizeId}>{formatFileLimit(block.size)}</small></span></> : <button className="file-card-primary" data-message-hold ref={opener} aria-label={t("预览 {0}", block.name)} aria-describedby={sizeId} aria-disabled={busy} onClick={() => { void run("open"); }}><FileTypeIcon name={block.name} mime={block.mime}/><span><strong>{block.name}</strong><small id={sizeId}>{formatFileLimit(block.size)}</small></span></button>}
     {saveButton}{!preview && status()}
-  </>}</section>{preview && active && (preview.kind === "image" ? <LocalImagePreview blob={preview.blob} name={block.name} close={close} saving={busy} save={action => { void run(action); }} feedbackKey={phase.kind === "idle" ? saved?.path : fileStatusText(phase)} feedback={phase.kind !== "idle" || saved ? status("file-preview-status") : undefined}/> : createPortal(<dialog ref={panel} className="lightbox file-preview-lightbox" aria-label={t("文件预览")} onCancel={(event) => { event.preventDefault(); event.stopPropagation(); close(); }} onPointerDown={(event) => { backdropPress.current = event.isPrimary && event.target === event.currentTarget; }} onPointerUp={(event) => { if (event.target !== event.currentTarget) backdropPress.current = false; }} onPointerCancel={() => { backdropPress.current = false; }} onClick={(event) => { if (backdropPress.current && event.target === event.currentTarget) close(); backdropPress.current = false; }}><section ref={previewBody} className={`file-preview${preview.kind === "video" ? " is-movable" : ""}`} onClick={(event) => event.stopPropagation()}><AttachmentPreviewHeader headerRef={previewHeader} name={block.name} busy={busy} save={() => { void run("save"); }} share={() => { void run("share"); }} external={() => { void run("external"); }} close={close}/>{status("file-preview-status")}{preview.kind === "audio" || preview.kind === "video" ? <MediaReader blob={preview.blob} kind={preview.kind} name={block.name} connection={connection} attachmentId={block.attachmentId}/> : preview.kind === "spreadsheet" ? <SpreadsheetReader blob={preview.blob}/> : preview.kind === "docx" ? <DocumentReader blob={preview.blob}/> : preview.kind === "markdown" ? <MarkdownReader text={preview.text} truncated={preview.truncated}/> : preview.kind === "text" ? <><pre>{preview.text}</pre>{preview.truncated && <p>{t("预览显示前 1 MB，另存为可查看完整文件。")}</p>}</> : preview.kind === "pdf" ? <PdfReader blob={preview.blob} name={block.name}/> : <p>{t("此文件不支持内置预览，请另存为后使用对应应用打开。")}</p>}</section></dialog>, document.body))}</>;
+  </>}</section>{preview && active && (preview.kind === "image" ? <LocalImagePreview blob={preview.blob} name={block.name} close={close} saving={busy} save={action => { void run(action); }} feedbackKey={phase.kind === "idle" ? saved?.path : fileStatusText(phase)} feedback={phase.kind !== "idle" || saved ? status("file-preview-status") : undefined}/> : createPortal(<dialog ref={panel} className="lightbox file-preview-lightbox" aria-label={t("文件预览")} onCancel={(event) => { event.preventDefault(); event.stopPropagation(); close(); }} onPointerDown={(event) => { backdropPress.current = event.isPrimary && event.target === event.currentTarget; }} onPointerUp={(event) => { if (event.target !== event.currentTarget) backdropPress.current = false; }} onPointerCancel={() => { backdropPress.current = false; }} onClick={(event) => { if (backdropPress.current && event.target === event.currentTarget) close(); backdropPress.current = false; }}><section ref={previewBody} className={`file-preview${preview.kind === "video" ? " is-movable" : ""}`} onClick={(event) => event.stopPropagation()}><AttachmentPreviewHeader headerRef={previewHeader} name={block.name} mime={block.mime} busy={busy} save={() => { void run("save"); }} share={() => { void run("share"); }} external={() => { void run("external"); }} close={close}/>{status("file-preview-status")}{preview.kind === "audio" || preview.kind === "video" ? <MediaReader blob={preview.blob} kind={preview.kind} name={block.name} connection={connection} attachmentId={block.attachmentId}/> : preview.kind === "spreadsheet" ? <SpreadsheetReader blob={preview.blob}/> : preview.kind === "docx" ? <DocumentReader blob={preview.blob}/> : preview.kind === "markdown" ? <MarkdownReader text={preview.text} truncated={preview.truncated}/> : preview.kind === "text" ? <><pre>{preview.text}</pre>{preview.truncated && <p>{t("预览显示前 1 MB，另存为可查看完整文件。")}</p>}</> : preview.kind === "pdf" ? <PdfReader blob={preview.blob} name={block.name}/> : <p>{t("此文件不支持内置预览，请另存为后使用对应应用打开。")}</p>}</section></dialog>, document.body))}</>;
 }
 type ElementProps = { replyProse?: boolean; element: CardElement; connection: HubConnection; messageId: string; values: Record<string, Json>; change: (name: string, value: Json) => void; act: (element: CardElement, overrides?: Record<string, Json>) => Promise<boolean> };
 function Element({ element: e, connection, messageId, values, change, act, replyProse = false }: ElementProps) {

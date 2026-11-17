@@ -14,6 +14,8 @@ export interface AndroidUpdateBridge {
   openLogin(): Promise<void>;
   addListener(event: "state", callback: (state: AndroidUpdateState) => void): Promise<{ remove(): Promise<void> }>;
 }
+/** A successful legacy status includes configured even without a channel flag. */
+export const androidUpdateStatusKnown = (state: AndroidUpdateState) => typeof state.inAppUpdates === "boolean" || typeof state.configured === "boolean";
 /** Older native shells omit the flag; only an explicit false hides updates. */
 export const androidInAppUpdates = (state: AndroidUpdateState) => state.inAppUpdates !== false;
 /** Native owns transfer/install state, including navigation out of Settings.

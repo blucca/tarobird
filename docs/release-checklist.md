@@ -465,3 +465,31 @@ Desktop/mobile UI and headless operation have different acceptance surfaces.
 Unit tests, cross-compilation, native OS service tests and physical-phone delivery
 must be reported separately. Do not replace a production host merely to complete
 a test without an authorized rollout plan.
+
+
+## Android distribution checks
+
+- Reserve one source/version/code for the GitHub APK and Play AAB, following
+  [the channel counter policy](versioning.md#android-channel-counters). Check the
+  highest code accepted by Play and GitHub, including unreleased drafts.
+- Prepare matching locked dependencies, web resources and the private Firebase
+  configuration for both builds. Build explicitly with
+  `-PtarobotDistribution=github` and `-PtarobotDistribution=play`; stage each
+  output before the next build. Do not infer its channel from its filename.
+- Inspect each final signed artifact and a Play-delivered/generated installable
+  APK: package identity, product version/code, target SDK, signatures, manifest,
+  source/web-resource hashes and privacy scan. Play must omit
+  `REQUEST_INSTALL_PACKAGES` and disable GitHub updates; GitHub must retain its
+  updater. Verify the installed Play **app-signing** certificate separately from
+  the AAB upload certificate before claiming that channel switching preserves
+  the existing installation.
+- On an isolated Android device/emulator, verify Play startup without a GitHub
+  login/update entry, APK attachment save/share with no install/external-open
+  action, direct bridge refusal without a crash, and normal non-APK file opens.
+  Cover GitHub-to-Play upgrade cleanup of only updater credentials/downloads,
+  retaining paired hosts and other credentials. Run the GitHub control for its
+  APK install/update flow. Source/UI tests alone do not satisfy this native gate.
+- Record artifact SHA-256, source SHA, channel, code, signing and runtime evidence.
+  Read back the actual store track/build after the authorized upload; pending
+  review, internal testing and public availability are distinct states. A handoff
+  does not authorize a publisher to bypass its pending owner approval.

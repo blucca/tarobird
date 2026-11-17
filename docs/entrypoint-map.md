@@ -775,6 +775,14 @@ and the existing network/run/delete suites listed in that audit.
   use the native `AndroidUpdaterPlugin`, `AndroidUpdateService` and
   `AndroidUpdatePolicy`. GitHub credentials/downloads stay native; APK digest,
   package, signer and version are rechecked before Android installer confirmation.
+  Play's compile-time distribution disables native updates and clears only the
+  updater credential/offer/cache at startup. `android-package-actions.ts` waits
+  for native channel status before offering APK opens, including draft previews;
+  older GitHub shells remain supported. Native APK guards also cover direct
+  saved/external open calls and permission-return callbacks. Tests:
+  `AttachmentApkPolicyTest`, `AttachmentApkInstallTest`,
+  `AndroidUpdaterDistributionTest`, browser `android-saved-file` /
+  `mobile-file-export`, plus the existing updater tests below.
   Tests: `AndroidUpdatePolicyTest`, isolated `AndroidUpdaterTest`, browser
   `android-updates` / `android-updates-ui`, and existing desktop update suites.
   [Build, security boundaries and acceptance](client/android-github-updates.md).

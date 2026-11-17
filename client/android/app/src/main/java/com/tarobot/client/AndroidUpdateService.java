@@ -77,15 +77,24 @@ final class AndroidUpdateService {
         if ("github_update_login_required".equals(error)) { token = null; login = null; }
         phase = "error"; changed.changed(snapshot());
     }
+    /** A Play build that replaced a GitHub APK drops what that updater left on
+     * this device: its own stored GitHub credential (never decrypted here, and
+     * not revoked at GitHub), the offer and both download files. Best effort,
+     * repeated on the next launch; a failure can never enable the updater. */
+    private void retire() {
+        try { vault.remove("android-updates-github", false); } catch (Exception retried) { /* Stays unread and unused. */ }
+        File dir = new File(context.getCacheDir(), "tarobot-updates");
+        try { prefs.edit().remove("offer").commit(); new File(dir, "update.apk").delete(); new File(dir, "update.part").delete(); dir.delete(); }
+        catch (RuntimeException retried) { /* Nothing here is ever resumed by this build. */ }
+    }
     void load() throws Exception {
         if (loaded) return;
+        if (!inAppUpdates) { retire(); loaded = true; state("disabled"); return; }
         String raw;
         try { raw = vault.read("android-updates-github", false); } catch (Exception failure) { throw new IOException("github_update_keychain"); }
         if (raw != null) { JSONObject saved = new JSONObject(raw); token = saved.getString("token"); login = saved.getString("login"); }
         loaded = true;
         raw = prefs.getString("offer", null);
-        // A Play build never resumes a download left by an earlier GitHub APK.
-        if (raw != null && !inAppUpdates) { clearDownload(); raw = null; }
         if (raw != null) {
             try {
                 offer = new JSONObject(raw);

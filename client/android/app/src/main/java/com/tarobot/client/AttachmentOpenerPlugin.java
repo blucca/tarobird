@@ -26,6 +26,10 @@ public final class AttachmentOpenerPlugin extends Plugin {
             String mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension);
             if (mime == null) mime = call.getString("mime", "application/octet-stream");
             if (mime == null || !mime.matches("[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+")) mime = "application/octet-stream";
+            // A Play build never offers an APK to an installer; the GitHub build
+            // leaves consent to the receiving installer, as before.
+            String blocked = AttachmentApkPolicy.blocked(BuildConfig.TAROBOT_IN_APP_UPDATES, mime, () -> true);
+            if (blocked != null) { call.reject(blocked); return; }
             Intent view = new Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime);
             view.setClipData(ClipData.newRawUri(name, uri));
             view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);

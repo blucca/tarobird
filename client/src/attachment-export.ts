@@ -1,3 +1,6 @@
+import { attachmentFilename } from "./attachment-filename.js";
+export { attachmentFilename } from "./attachment-filename.js";
+import { isAndroidPackage } from "./android-package-actions.js";
 import { Capacitor, registerPlugin } from "@capacitor/core";
 import { invoke, isDesktop, isElectron } from "./desktop-bridge.js";
 import { t } from "./i18n.js";
@@ -6,25 +9,6 @@ import { attachmentMime } from "../../src/client-protocol/attachment-mime.js";
 import { encodeDesktopBytes } from "./desktop-base64.js";
 
 const CHUNK = 1024 * 1024;
-/** A server-supplied label is never a filesystem path. */
-export function attachmentFilename(name: string): string {
-  const leaf = name.split(/[\\/]/).pop() ?? "";
-  const sanitized = leaf.replace(/[\u0000-\u001f\u007f<>:"|?*\u202a-\u202e\u2066-\u2069]/g, "_").replace(/[. ]+$/g, "");
-  const suffix = /\.[a-z0-9]{1,16}$/i.exec(sanitized);
-  const extension = suffix && suffix.index > 0 ? suffix[0] : "";
-  const stem = (extension ? sanitized.slice(0, -extension.length) : sanitized).replace(/[. ]+$/g, "");
-  const prefix = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(stem + extension) ? "_" : "";
-  let clean = "", bytes = prefix.length + extension.length;
-  // Reserve the complete extension and any Windows device-name prefix before
-  // truncating, while keeping Unicode code points and the final byte budget.
-  for (const character of stem) {
-    const size = new TextEncoder().encode(character).length;
-    if (prefix.length + clean.length + character.length + extension.length > 160 || bytes + size > 240) break;
-    clean += character; bytes += size;
-  }
-  clean = clean.replace(/[. ]+$/g, "");
-  return `${prefix}${clean || "attachment"}${extension}`;
-}
 /** Download/save, share and open are distinct operations on every platform. */
 export type ExportStage = "choosing" | "saving" | "preparing" | "sharing" | "handoff" | "opening";
 /** What the platform accepted. Only "saved" means the chosen file was fully
@@ -34,7 +18,7 @@ export type ExportStage = "choosing" | "saving" | "preparing" | "sharing" | "han
 export type ExportDelivery = "saved" | "shared" | "browser" | "opened";
 export type ExportReport = { browserLock?: string; savedKey?: string; stage?: (stage: ExportStage) => void; delivered?: (delivery: ExportDelivery, savedPath?: string, savedLocation?: string) => void };
 export function canRevealSavedAttachment(): boolean { return isDesktop(); }
-export function isAndroidApk(name: string): boolean { return Capacitor.isNativePlatform() && Capacitor.getPlatform() === "android" && /\.apk$/i.test(name); }
+export const isAndroidApk = isAndroidPackage;
 /** Confirmed saves supply a desktop path or Android content URI. Native code
  * rechecks its save grant; references never enter a shell or the Hub. */
 export async function openSavedAttachment(path: string): Promise<void> {
@@ -44,6 +28,7 @@ export async function openSavedAttachment(path: string): Promise<void> {
       await plugin.openSaved({ uri: path }); return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (message === "attachment_install_unsupported") throw new Error(t("此版本不支持安装 APK；仍可保存或分享文件。"), { cause: error });
       if (message === "attachment_install_permission_required") throw new Error(t("请在系统设置中允许 TaroBird 安装未知应用，然后再次点击安装 APK。"), { cause: error });
       throw new Error(t("无法打开已保存的文件，请确认文件未被移动或删除，并已安装对应应用；也可以重新另存为。"), { cause: error });
     }
@@ -172,6 +157,7 @@ export async function exportAttachment(blob: Blob, rawName: string, report: Expo
       // reported as cancelled, so retain the copy for the next export's sweep.
       if (action !== "save" && error instanceof Error && error.message === "Share canceled") return false;
       await Filesystem.rmdir({ path: folder, directory: Directory.Cache, recursive: true }).catch(() => undefined);
+      if ((error instanceof Error ? error.message : String(error)) === "attachment_install_unsupported") throw new Error(t("此版本不支持安装 APK；仍可保存或分享文件。"), { cause: error });
       throw action === "external" ? new Error(t("无法打开文件，请安装对应的阅读应用，或使用另存为。"), { cause: error }) : action === "save" ? new Error(t("保存失败，请检查剩余空间和文件权限后重试。"), { cause: error }) : error;
     } finally {
       // Saved copies live outside this cache. A share/open receiver may still

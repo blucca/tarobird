@@ -49,6 +49,25 @@ report any unfinished homepage update. This website requirement is separate
 from the GitHub README policy of linking to stable Releases instead of adding
 per-version download tables.
 
+## Android distribution channels
+
+For future Android releases, prepare both the GitHub APK and Google Play AAB
+from the same source revision, product version and `androidVersionCode` in
+`release-version.json`. Keep the code greater than every previously accepted
+upload in either channel, including drafts. Do not advance it separately for the
+second channel. Record exceptional rebuilds and their consumed counters.
+
+Build with an explicit `tarobotDistribution=github` or `play` in separate output
+staging directories, and verify the final artifact's channel policy. Play must
+have no `REQUEST_INSTALL_PACKAGES`, GitHub updater or APK installation actions;
+ordinary attachment save/share and opening non-APK files must remain available.
+The GitHub build retains its existing updater and installer behavior. Signing
+material and console identities stay outside Git. Verify the Play app-signing
+certificate, not just the upload certificate, before claiming cross-channel
+upgrade compatibility. Follow [Android build instructions](docs/client/android-build.md)
+and the [release checklist](docs/release-checklist.md#android-distribution-checks).
+Preparing or handing off an AAB is not evidence of store publication.
+
 ## Mandatory GitHub upload gate
 
 Every push to `main` **and every PR branch/update**, including merges and

@@ -70,3 +70,12 @@ test("Android opens only the native receipt without preparing another cached cop
   fail = "attachment_install_permission_required";
   await expect(openSavedAttachment("content://media/external/downloads/42")).rejects.toThrow("允许 TaroBird 安装未知应用");
 });
+
+test("Play native APK rejection is actionable and never reports a successful open", async () => {
+  fail = "attachment_install_unsupported";
+  await expect(openSavedAttachment("content://media/external/downloads/42")).rejects.toThrow("仍可保存或分享文件");
+  const delivered: string[] = [];
+  await expect(openAttachmentExternally(new Blob(["apk"], { type: "application/vnd.android.package-archive" }), "update.apk", { delivered: value => delivered.push(value) })).rejects.toThrow("仍可保存或分享文件");
+  expect(delivered).toEqual([]); expect(opened).toEqual([]);
+  expect(removed.at(-1)).toBe(current.slice(0, current.lastIndexOf("/")));
+});

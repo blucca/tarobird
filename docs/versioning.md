@@ -59,6 +59,21 @@ database schema numbers, tool-schema versions, capability versions and upstream
 dependency versions are not product versions. Advance their own contracts only
 when required. The release manifest still binds their packaged bytes/source.
 
+## Android channel counters
+
+Future Android releases use one visible version and one `androidVersionCode`
+for the GitHub APK and Play AAB, built from the same commit. Check both channels'
+accepted uploads, including Play drafts, before reserving the manifest counter;
+the next release must exceed the highest consumed code. A channel that finishes
+later uses the reserved release code rather than incrementing it independently.
+
+The initial 1.5.0 transition is exceptional: GitHub consumed `2026110412` and
+Play accepted `2026110413`. The Play correction reserves `2026110414` while
+keeping the visible version **1.5.0**. Updating the manifest does not replace the
+already published GitHub APK or publish the Play correction. The next shared
+release must therefore use at least `2026110415`, subject to checking intervening
+uploads. Record any further correction before another channel is packaged.
+
 ## Existing update clients remain compatible
 
 Publish future releases only to `cloveric/tarobird`, with English titles and

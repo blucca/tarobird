@@ -2866,6 +2866,7 @@
   "这个附件可能运行程序或修改系统。请仅在确认来源可信时打开。": "This attachment may run software or change your system. Open it only if you trust its source.",
   "打开可执行附件": "Open executable attachment",
   "安装 APK": "Install APK",
+  "此版本不支持安装 APK；仍可保存或分享文件。": "This version cannot install APKs. You can still save or share the file.",
   "打开系统安装器": "Open system installer",
   "请在系统设置中允许 TaroBird 安装未知应用，然后再次点击安装 APK。": "Allow TaroBird to install unknown apps in system settings, then tap Install APK again.",
   "回复中": "Replying",

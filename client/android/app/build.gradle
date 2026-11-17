@@ -19,7 +19,7 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         // Increase the code for each installable build so Android can update
         // the existing app without discarding its paired hosts and local data.
-        versionCode providers.gradleProperty('tarobotVersionCode').orElse('2026110412').get().toInteger()
+        versionCode providers.gradleProperty('tarobotVersionCode').orElse('2026110414').get().toInteger()
         versionName providers.gradleProperty('tarobotVersionName').orElse('1.5.0').get()
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         // Public OAuth application identity only. User credentials stay in AndroidKeyStore.

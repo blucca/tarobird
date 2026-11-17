@@ -9,9 +9,10 @@ test.beforeAll(async () => {
     import '/src/styles.css'; import '/src/brand-theme.css';
     Capacitor.isNativePlatform=()=>true; Capacitor.getPlatform=()=> 'android';
     const f=window.updateFixture={calls:[],state:{phase:'initial',configured:true,version:'1.0.88',authenticated:false},listeners:new Set(),fail:''};
+    if(window.playStartupProbe){f.state={phase:'disabled',inAppUpdates:false,configured:false,version:'1.5.0',authenticated:false};f.statusGate=new Promise(resolve=>{f.resolveStatus=resolve});}
     f.emit=()=>f.listeners.forEach(cb=>cb({...f.state}));
     registerPlugin('TaroBotAndroidUpdater',{web:async()=>({
-      status:async()=>({...f.state}),addListener:async(name,cb)=>{f.listeners.add(cb);return{remove:async()=>f.listeners.delete(cb)}},openLogin:async()=>f.calls.push('openLogin'),cancel:async()=>{},
+      status:async()=>{if(f.statusGate)await f.statusGate;return({...f.state})},addListener:async(name,cb)=>{f.listeners.add(cb);return{remove:async()=>f.listeners.delete(cb)}},openLogin:async()=>f.calls.push('openLogin'),cancel:async()=>{},
       invoke:async({command})=>{f.calls.push(command);
         if(command==='github_update_login_start')return{flowId:'flow',userCode:'ABCD-EFGH',verificationUri:'https://github.com/login/device',expiresIn:600,interval:5};
         if(command==='github_update_login_poll'){f.state.authenticated=true;f.state.login='demo';return{status:'authorized'}}
@@ -23,7 +24,8 @@ test.beforeAll(async () => {
       }
     })});
     const {AndroidUpdates}=await import('/src/AndroidUpdates.tsx');
-    const root=createRoot(document.getElementById('root'));f.mount=()=>root.render(React.createElement(AndroidUpdates));f.unmount=()=>root.render(null);f.mount();
+    const {androidUpdater}=await import('/src/android-updates.ts');f.snapshot=androidUpdater.snapshot;
+    const root=createRoot(document.getElementById('root'));f.mount=()=>root.render(React.createElement(React.Fragment,null,React.createElement('span',{'data-testid':'update-mounted'},'fixture ready'),React.createElement(AndroidUpdates)));f.unmount=()=>root.render(null);f.mount();
   </script></body></html>`;
   server = await createServer({ plugins: [{ name: "android-update-fixture", configureServer(vite) { vite.middlewares.use(async (req, res, next) => { if (req.url !== "/__android-updates") return next(); res.setHeader("Content-Type", "text/html"); res.end(await vite.transformIndexHtml("/__android-updates", html)); }); } }], server: { host: "127.0.0.1", port: 0 } });
   await server.listen();
@@ -66,4 +68,17 @@ test("Play build hides App updates and never starts a GitHub check", async ({ pa
   await expect(page.getByRole("heading", { name: "应用更新" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "登录 GitHub", exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).updateFixture.calls)).toEqual([]);
+});
+
+test("Play startup never offers GitHub login before the native status arrives", async ({page})=>{
+  await page.addInitScript(()=>{(window as any).playStartupProbe=true;});
+  await page.reload();
+  await expect(page.getByTestId("update-mounted")).toBeVisible();
+  await page.waitForFunction(()=>!!(window as any).updateFixture?.resolveStatus);
+  await expect(page.getByRole("heading",{name:"应用更新"})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"登录 GitHub",exact:true})).toHaveCount(0);
+  await page.evaluate(()=>(window as any).updateFixture.resolveStatus());
+  await page.waitForFunction(()=>(window as any).updateFixture.snapshot().inAppUpdates===false);
+  await expect(page.getByRole("heading",{name:"应用更新"})).toHaveCount(0);
+  expect(await page.evaluate(()=>(window as any).updateFixture.calls)).toEqual([]);
 });

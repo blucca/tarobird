@@ -74,3 +74,77 @@ test("a delayed old receipt check cannot clear a newly saved Android copy", asyn
     await expect.poll(() => page.evaluate(() => (window as any).savedFixture.opened)).toEqual(["content://media/external/downloads/123"]);
   } finally { await page.close(); await server.close(); }
 });
+
+for (const name of ["update.apk", "payload.bin"]) test(`Play ${name} keeps save and share without either APK open action`, async ({ page }) => {
+  const server = await createServer({ server: { port: 0, host: "127.0.0.1" } }); await server.listen();
+  try {
+    await page.goto(server.resolvedUrls!.local[0] + `e2e/fixtures/android-saved-file.html?channel=play&name=${name}&mime=application/vnd.android.package-archive`);
+    await page.getByRole("button", { name: `保存到手机 ${name}`, exact: true }).click();
+    await expect(page.getByRole("status")).toHaveText("已保存到手机");
+    await expect(page.getByRole("button", { name: /^(安装 APK|打开文件)$/ })).toHaveCount(0);
+    await page.getByRole("button", { name: `预览 ${name}`, exact: true }).click();
+    await expect(page.getByRole("dialog")).toBeVisible();
+    await expect(page.getByRole("button", { name: "用其他应用打开", exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "分享附件", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).savedFixture.shares)).toBe(1);
+    expect(await page.evaluate(() => (window as any).savedFixture.opened)).toEqual([]);
+  } finally { await page.close(); await server.close(); }
+});
+
+test("Play ordinary files still have saved and external open actions", async ({ page }) => {
+  const server = await createServer({ server: { port: 0, host: "127.0.0.1" } }); await server.listen();
+  try {
+    await page.goto(server.resolvedUrls!.local[0] + "e2e/fixtures/android-saved-file.html?channel=play&name=notes.txt");
+    await page.getByRole("button", { name: "保存到手机 notes.txt", exact: true }).click();
+    await expect(page.getByRole("button", { name: "打开文件", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "预览 notes.txt", exact: true }).click();
+    await expect(page.getByRole("button", { name: "用其他应用打开", exact: true })).toBeVisible();
+    expect(await page.evaluate(() => (window as any).savedFixture.statusCalls)).toBe(0);
+  } finally { await page.close(); await server.close(); }
+});
+
+for (const channel of ["play", "github", "legacy"]) test(`APK opening waits for native distribution: ${channel}`, async ({ page }) => {
+  const server = await createServer({ server: { port: 0, host: "127.0.0.1" } }); await server.listen();
+  try {
+    await page.goto(server.resolvedUrls!.local[0] + `e2e/fixtures/android-saved-file.html?name=update.apk&channel=${channel}&delayed=1`);
+    await page.getByRole("button", { name: "保存到手机 update.apk", exact: true }).click();
+    await expect(page.getByRole("status")).toHaveText("已保存到手机");
+    await expect(page.getByRole("button", { name: "安装 APK", exact: true })).toHaveCount(0);
+    await page.evaluate(() => (window as any).savedFixture.releaseStatus());
+    if (channel === "play") await expect(page.getByRole("button", { name: "安装 APK", exact: true })).toHaveCount(0);
+    else await expect(page.getByRole("button", { name: "安装 APK", exact: true })).toBeVisible();
+  } finally { await page.close(); await server.close(); }
+});
+
+for (const channel of ["play", "github"]) test(`${channel} draft APK keeps save and share with channel-specific external open`, async ({ page }) => {
+  const server = await createServer({ server: { port: 0, host: "127.0.0.1" } }); await server.listen();
+  try {
+    await page.goto(server.resolvedUrls!.local[0] + `e2e/fixtures/android-saved-file.html?draft&channel=${channel}&name=payload.bin&mime=application/vnd.android.package-archive`);
+    const preview = page.getByRole("dialog");
+    await expect(preview).toBeVisible();
+    await page.waitForFunction(() => (window as any).savedFixture.statusCalls > 0);
+    if (channel === "play") await expect(preview.getByRole("button", { name: "用其他应用打开" })).toHaveCount(0);
+    else await expect(preview.getByRole("button", { name: "用其他应用打开" })).toBeVisible();
+    await preview.getByRole("button", { name: "保存到手机", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).savedFixture.saves)).toBe(1);
+    await preview.getByRole("button", { name: "分享附件" }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).savedFixture.shares)).toBe(1);
+    expect(await page.evaluate(() => (window as any).savedFixture.opened)).toEqual([]);
+  } finally { await page.close(); await server.close(); }
+});
+
+for (const name of ["update.apk.", "更新.APK. ", "update.APK", "apk", "a".repeat(156) + ".apk" + "x".repeat(24)]) test(`Play hides APK actions after export normalizes ${JSON.stringify(name)}`, async ({ page }) => {
+  const server = await createServer({ server: { port: 0, host: "127.0.0.1" } }); await server.listen();
+  try {
+    await page.goto(server.resolvedUrls!.local[0] + "e2e/fixtures/android-saved-file.html?channel=play&name=" + encodeURIComponent(name));
+    await page.getByRole("button", { name: /^保存到手机 / }).click();
+    await expect(page.getByRole("status")).toHaveText("已保存到手机");
+    await expect(page.getByRole("button", { name: /^(安装 APK|打开文件)$/ })).toHaveCount(0);
+    await page.getByRole("button", { name: /^预览 / }).click();
+    await expect(page.getByRole("dialog")).toBeVisible();
+    await expect(page.getByRole("button", { name: "用其他应用打开", exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "分享附件", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).savedFixture.shares)).toBe(1);
+    expect(await page.evaluate(() => (window as any).savedFixture.opened)).toEqual([]);
+  } finally { await page.close(); await server.close(); }
+});

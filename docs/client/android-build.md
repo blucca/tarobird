@@ -70,7 +70,7 @@ cd client/android
 ```
 
 The test key and its password belong outside the repository and build artifacts.
-They are not a Play Store signing setup. The release APK packages bundled web
+A local APK signature alone does not establish Play App Signing configuration. The release APK packages bundled web
 assets and does not need a development web server. Unit tests currently run with
 the debug test variant; release compilation and lint are separate checks.
 
@@ -105,14 +105,36 @@ unsigned. With `play`:
   reports `phase: "disabled"` with `inAppUpdates: false` and refuses login, check,
   download and install (`github_update_unsupported`).
 - Settings → Appearance hides **App updates**; Play delivers updates.
-- **Install APK** on a saved `.apk` attachment cannot install in this build
-  because the permission is removed; the button is not hidden yet.
+- APK attachments (by extension or MIME) retain save/share, but hide **Install
+  APK** and external-open actions in both sent and draft previews. Native saved
+  and cached-file open paths also reject APK installation without launching an
+  installer. Ordinary files retain their external readers.
+- Starting Play clears only the GitHub updater credential, offer and cached
+  update files, without reading that credential or touching Host pairings.
+  Cleanup failure cannot enable the updater.
 
-Play rejects a `versionCode` it has already received, so use a new code for each
-upload. Sign the bundle with the Play upload key outside the repository. Before
-uploading, check that the bundle's `base/manifest/AndroidManifest.xml` has no
-`REQUEST_INSTALL_PACKAGES`. `testDebugUnitTest -PtarobotDistribution=play` also
-checks the BuildConfig flag.
+Use the same product version and reserved `versionCode` for the GitHub APK and
+Play AAB; see [channel counters](../versioning.md#android-channel-counters).
+Play never accepts a consumed code for different bytes, including an earlier
+draft. Stage each channel's output before the next Gradle invocation because
+task/output names are shared. Build the GitHub APK explicitly with
+`assembleRelease -PtarobotDistribution=github` and matching version arguments.
+
+Sign the AAB with the registered upload key outside the repository, using
+`jarsigner` with `SHA256withRSA` and a password file or private prompt, never a
+literal password in commands or logs. AAB upload signing and Play app signing
+are separate roles even when configured to use the same key. Compare the
+installed Play app certificate with the GitHub APK certificate before claiming
+cross-channel upgrade compatibility; preserve the package ID and existing data.
+
+Before uploading, inspect the final signed bundle's manifest (for example,
+`bundletool dump manifest`) and an APK generated/delivered from that bundle.
+Verify version/code, target SDK, absence of `REQUEST_INSTALL_PACKAGES`, channel
+behavior and private-data scanning. Run `testDebugUnitTest` separately with both
+channel options and the focused instrumentation tests
+`AttachmentApkInstallTest` / `AndroidUpdaterDistributionTest` on an isolated
+Android device or emulator. An unsigned AAB or successful compilation alone is
+not final signed-artifact or installed-App acceptance.
 
 ## Push registration source update, 2026-10-11
 

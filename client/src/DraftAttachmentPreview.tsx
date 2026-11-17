@@ -49,7 +49,7 @@ export function DraftAttachmentPreview({ file, close, returnFocus }: { file: Fil
     onClose={event => { if (!event.currentTarget.open) close(); }}
     onCancel={event => { event.preventDefault(); event.stopPropagation(); close(); }}>
     <section ref={previewBody} className={`file-preview${preview?.kind === "video" ? " is-movable" : ""}`}>
-      <AttachmentPreviewHeader headerRef={previewHeader} name={file.name} busy={busy} save={() => { void save(); }} share={() => { void save("share"); }} external={() => { void save("external"); }} close={close}/>
+      <AttachmentPreviewHeader headerRef={previewHeader} name={file.name} mime={file.type} busy={busy} save={() => { void save(); }} share={() => { void save("share"); }} external={() => { void save("external"); }} close={close}/>
       {error && <p role="alert">{error}</p>}{status && <p role="status">{status}</p>}
       {!preview && !error && <p role="status">{t("正在准备预览…")}</p>}
       {preview && (preview.kind === "audio" || preview.kind === "video" ? <MediaReader blob={preview.blob} kind={preview.kind} name={file.name}/>
