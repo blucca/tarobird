@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/cloveric/tarobird/releases/latest"><b>Download</b></a> &nbsp;·&nbsp;
+  <a href="https://apps.apple.com/app/tarobird/id6828071641"><b>iOS App Store</b></a> &nbsp;·&nbsp;
   <a href="https://testflight.apple.com/join/ByFWEfFW"><b>iOS TestFlight beta</b></a> &nbsp;·&nbsp;
   <a href="#quick-start"><b>Quick start</b></a> &nbsp;·&nbsp;
   <a href="#connection-options">Connection options</a> &nbsp;·&nbsp;
@@ -244,7 +245,7 @@ Install and sign in to any one engine on the computer that runs your Bots to get
 
 ### 02 · Pair your phone
 
-1. Install TaroBird on your phone. **iOS:** install Apple’s TestFlight app, then [join the TaroBird public beta](https://testflight.apple.com/join/ByFWEfFW). **Android:** use the APK from [Releases](https://github.com/cloveric/tarobird/releases/latest).
+1. Install TaroBird on your phone. **iOS:** download the stable app from the [App Store](https://apps.apple.com/app/tarobird/id6828071641), or install Apple’s TestFlight app and [join the public beta](https://testflight.apple.com/join/ByFWEfFW). App Store availability varies by country or region; TaroBird is not currently listed in mainland China. **Android:** use the APK from [Releases](https://github.com/cloveric/tarobird/releases/latest).
 2. On the computer, open **Settings → Network & connections → Add device**, choose a [connection option](#connection-options) and generate the QR code. The host restarts briefly the first time, so let current tasks finish first.
 3. On the phone, open TaroBird and tap **Scan connection QR code**, or use **Import a QR image** or **Paste connection details**.
 4. The phone displays an **8-digit pairing code**, valid for 5 minutes. Enter it on the computer and click **Approve pairing**; the phone then opens your chats automatically.

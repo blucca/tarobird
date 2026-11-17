@@ -7,11 +7,15 @@ the source-only migration. For its first release, verify the new repository's
 updater access and the one-time upgrade path from historical binaries, following
 [repository migration](repository-migration.md).
 
-Include the [iOS public TestFlight invitation](https://testflight.apple.com/join/ByFWEfFW)
-in each release’s installation section, labelled **iOS TestFlight public beta**.
-Verify that the invitation still opens TaroBird before publication. Keep the
-English and Chinese README download and phone-setup links aligned with it;
-TestFlight availability does not imply an App Store release.
+Include the [iOS App Store listing](https://apps.apple.com/app/tarobird/id6828071641)
+in each release's installation section, labelled **iOS App Store (stable)**,
+alongside the [iOS public TestFlight invitation](https://testflight.apple.com/join/ByFWEfFW),
+labelled **iOS TestFlight public beta**. Before publication, verify both destinations
+belong to TaroBird and check the App Store's actually available version and regions;
+do not imply a new store build is available merely because it was uploaded or
+released on GitHub. Keep the English and Chinese README download and phone-setup
+links aligned, and retain accurate regional availability notes. TestFlight
+availability does not imply an App Store release.
 
 Before packaging, run `npm run version:check` and follow [versioning](versioning.md).
 All App/CLI artifacts share `release-version.json`'s product version/source.
