@@ -13,9 +13,9 @@ Var BirdMessage
   ${IfNot} ${Silent}
   ${AndIf} $PassiveMode != 1
     !if "${RETRY}" == ""
-      MessageBox MB_ICONSTOP|MB_OK "$BirdMessage"
+      MessageBox MB_ICONSTOP|MB_OK "$BirdMessage" /SD IDOK
     !else
-      MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL|MB_DEFBUTTON2 "$BirdMessage" IDRETRY ${RETRY}
+      MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL|MB_DEFBUTTON2 "$BirdMessage" /SD IDCANCEL IDRETRY ${RETRY}
     !endif
   ${EndIf}
   Abort "$BirdOperation — ${PHASE} (TB-${CODE})"

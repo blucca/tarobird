@@ -22,7 +22,7 @@
 
 ; Checks whether app is running or not and prompts to kill it.
 !macro CheckIfAppIsRunning executablePath productName
-  !define UniqueID ${__LINE__}
+  !define UniqueID ${__COUNTER__}
 
   app_check_retry_${UniqueID}:
   ; Replace {{product_name}} placeholder in the messages with the passed product name

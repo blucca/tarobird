@@ -392,7 +392,10 @@ Function PageLeaveReinstall
       ${EndIf}
 
       ; Other errors? show generic error message and return to select un/reinstall page
-      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)"
+      ${IfNot} ${Silent}
+      ${AndIf} $PassiveMode != 1
+        MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)" /SD IDOK
+      ${EndIf}
       Abort
     ${EndIf}
   reinst_done:
