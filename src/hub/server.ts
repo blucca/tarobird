@@ -15,6 +15,7 @@ import { NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, nativeInputCon
 import { STEERING_OUTCOME_CAPABILITY } from "../client-protocol/steering-outcome.js";
 import { HubEngineSettings } from "./engine-settings.js";
 import { HubEngineQuota } from "./engine-quota.js";
+import { ENGINE_QUOTA_CAPABILITY } from "../client-protocol/engine-quota.js";
 import { hostEngineEnvironment } from "../runtime/host-engine-settings.js";
 import { engineSettingsUpdateSchema } from "../client-protocol/engine-settings.js";
 import { HubWidgetSettings } from "./widget-settings.js";
@@ -142,6 +143,11 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
 type BotConnection = { designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
+/** Hub-only capabilities. The shared CAPABILITIES list is also the App's
+ * `hello` list, which released Hubs cap at 64 entries; a feature only the Hub
+ * serves is advertised here so it never grows the handshake. */
+const SERVER_CAPABILITIES = [...CAPABILITIES, ENGINE_QUOTA_CAPABILITY];
+
 export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
 export class HubServer {
   private readonly relaySources: RelaySources;
@@ -964,7 +970,7 @@ export class HubServer {
           // copy of every conversation/avatar/history merely to list Bots.
           // Authentication and all subsequent HTTP authorization are unchanged.
           if (client.capabilities.includes("management.v1")) {
-            await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: CAPABILITIES,
+            await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES,
               uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations: [], avatars: [] });
             client.readySent = true; client.syncing = false;
             client.pendingPublications.length = 0; client.pendingSync.clear();
@@ -978,7 +984,7 @@ export class HubServer {
             this.options.onWarning?.("conversation_folders_unavailable");
             return undefined;
           });
-          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations, ...(conversationFolders ? { conversationFolders } : {}), avatars: await this.avatars.list(session.userId, session) });
+          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations, ...(conversationFolders ? { conversationFolders } : {}), avatars: await this.avatars.list(session.userId, session) });
           while (client.pendingPublications.length) await this.sendClient(client, client.pendingPublications.shift());
           client.readySent = true;
           if (client.capabilities.includes(CONVERSATION_SYNC_CAPABILITY)) {
