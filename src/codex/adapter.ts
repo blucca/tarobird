@@ -447,8 +447,9 @@ export interface CodexAdapter {
    * target turn is already gone from this session. */
   rewindSession?(sessionId: string, input: { anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
   /** Copy history through `through` (inclusive; omitted = whole) into an independent,
-   * persistent session. The source session is unchanged. */
-  forkSession?(sessionId: string, input: { through?: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
+   * persistent session. The source session is unchanged. `appPlatformTools`
+   * lets an engine that records App tools per session carry the source's. */
+  forkSession?(sessionId: string, input: { through?: EngineHistoryAnchor; workspaceOverride?: string; appPlatformTools?: AppPlatformTools; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
   /** Match an older run (no ledger line) to its anchor in this session; undefined when not unique. */
   resolveHistoryAnchor?(sessionId: string, input: {
     sourceMessageId: string; text: string; startedAt?: number;
