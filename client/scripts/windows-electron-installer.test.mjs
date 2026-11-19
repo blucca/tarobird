@@ -279,6 +279,17 @@ test('running-app shutdown targets only this exe via Restart Manager, guides Tas
     assert.doesNotMatch(src, /taskkill|Stop-Process|tskill/i, `${name} must not kill processes by name`);
   }
 
+  // Community report (#50): a background App held data files open and could
+  // respawn the Host. Close this installation's App before stopping the Host,
+  // and before any backup move, on every path that stops the Host.
+  const stopMacro = hooks.slice(hooks.indexOf('!macro TaroBotStopLocalHost'), hooks.indexOf('!macroend', hooks.indexOf('!macro TaroBotStopLocalHost')));
+  assert.ok(stopMacro.includes('CheckIfAppIsRunning'), 'TaroBotStopLocalHost closes the App');
+  assert.ok(stopMacro.indexOf('CheckIfAppIsRunning') < stopMacro.indexOf('--stop-desktop-host'), 'the App closes before the Host stop request');
+  const backupMacro = hooks.slice(hooks.indexOf('!macro BirdBackup'), hooks.indexOf('!macroend', hooks.indexOf('!macro BirdBackup')));
+  assert.ok(backupMacro.indexOf('CheckIfAppIsRunning') >= 0 && backupMacro.indexOf('CheckIfAppIsRunning') < backupMacro.indexOf('--prepare-fresh-install'), 'the App closes before data moves');
+  const preUninstall = hooks.slice(hooks.indexOf('!macro NSIS_HOOK_PREUNINSTALL'));
+  assert.ok(preUninstall.indexOf('!insertmacro TaroBotStopLocalHost') >= 0 && preUninstall.indexOf('!insertmacro TaroBotStopLocalHost') < preUninstall.indexOf('!insertmacro BirdBackup'), 'uninstall stops the Host (after closing the App) before backing up');
+
   // CheckIfAppIsRunning targets only executablePath via Restart Manager, skips prompts in /S and /P, uses monotonic labels, and retries on failure.
   assert.match(utils, /!define UniqueID \$\{__COUNTER__\}/);
   assert.match(utils, /!insertmacro RestartManager_RegisterFile \$R0 "\$\{executablePath\}"/);
