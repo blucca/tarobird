@@ -28,6 +28,8 @@ import { localDesktopControllersInTransaction } from "./local-controller.js";
 import { groupSettingsSchema, type GroupSettingsInput } from "../client-protocol/groups.js";
 import { GROUP_DISCUSSION_MAX_MEMBERS, GROUP_DISCUSSION_MIN_MEMBERS, automaticGroupDiscussion, defaultGroupDiscussionPolicy, groupDiscussionPolicySchema, type GroupDiscussionPolicy, type GroupSettingsSnapshot } from "../client-protocol/group-discussion.js";
 import { renameBotSchema, type RenameBotInput } from "../client-protocol/bots.js";
+import { forkOriginSchema, type ForkOrigin } from "../client-protocol/history.js";
+import { conversationHistory, type HistoryOpRow } from "./history-records.js";
 
 import { HubError } from "./errors.js";
 export { HubError } from "./errors.js";
@@ -35,7 +37,7 @@ export type User = { id: string; name: string; role: "owner" | "member" };
 export type Device = { id: string; user_id: string; name: string; platform: string; public_key: string; revoked: number; created_at: number; last_seen: number };
 export type DeviceSummary = Omit<Device, "public_key"> & { nameSource?: "host" };
 export type Bot = { id: string; name: string; engine: string; model: string; effort: string; online: number; managed?: number; deletedAt?: number; defaultAvatar?: string; role?: BotRole };
-type ConversationRow = { id: string; type: "direct" | "group"; title: string; owner_id: string; parent_id: string | null; session_id: string | null; binding_id: string | null; archived: number; created_at: number; hidden: number; ticket_json: string | null };
+type ConversationRow = { id: string; type: "direct" | "group"; title: string; owner_id: string; parent_id: string | null; session_id: string | null; binding_id: string | null; archived: number; created_at: number; hidden: number; ticket_json: string | null; fork_json?: string | null };
 type MessageRow = { workbench_receipt_json?: string | null; discussion_json?: string | null; bot_source_json?: string | null; preview_style: string | null; preview_url: string | null; link_preview_json: string | null; forwarded_json: string | null; mentions_json: string; id: string; conversation_id: string; author_id: string; author_type: "user" | "bot" | "system"; blocks_json: string; status: Message["status"]; version: number; client_msg_id: string | null; reply_to: string | null; created_at: number };
 type MessageHeader = Pick<MessageRow, "id" | "conversation_id" | "author_id" | "author_type" | "created_at" | "version" | "client_msg_id">;
 function deletedMessageRow(row: MessageHeader): Message {
@@ -44,6 +46,16 @@ function deletedMessageRow(row: MessageHeader): Message {
 }
 const activeRunPhases = runSummarySchema.shape.phase.options.filter(isRunActive);
 const activeRunPhaseParams = activeRunPhases.map(() => "?").join(",");
+/** Exact busy test of one `messages` row: running/queued replies, pending
+ * inputs, active foreground/background runs and answer follow-ups. Binds
+ * activeRunPhases twice. Shared by clearMessages and history operations. */
+const MESSAGE_BUSY_SQL = `(status IN ('pending','streaming') OR EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id=messages.id AND d.status='pending')
+          OR (status='complete' AND author_type='bot' AND (instr(blocks_json,'"nativeRun"')>0 OR instr(blocks_json,'"scopedRun"')>0 OR instr(blocks_json,'"answerFollowup"')>0)
+            AND CASE WHEN json_valid(blocks_json) THEN EXISTS(SELECT 1 FROM json_each(blocks_json) b WHERE json_extract(b.value,'$.extra.nativeRun.phase') IN (${activeRunPhaseParams})
+              OR json_extract(b.value,'$.extra.scopedRun.phase') IN (${activeRunPhaseParams}) OR json_extract(b.value,'$.extra.answerFollowup.phase') IN ('queued','processing')) ELSE 0 END))`;
+/** Superset prefilter for card actions; hasPendingCardAction decides. */
+const MESSAGE_ACTIONS_SQL = `(author_type='bot' AND status='complete' AND (forwarded_json IS NULL OR forwarded_json='') AND instr(blocks_json,'"actionId"')>0
+          AND (instr(blocks_json,'ask_user_question')>0 OR instr(blocks_json,'"approval"')>0 OR instr(blocks_json,'askq_submit')>0))`;
 export type AttachmentRow = { id: string; conversation_id: string; owner_id: string; sha256: string; size: number; mime: string; name: string; stored_name: string; complete: number; created_at: number };
 export type StoredEvent = { conversation_id: string; seq: number; kind: HubEvent["kind"]; payload_json: string; at: number };
 /** Runs inside an already-owned write transaction; must not reenter db.serial. */
@@ -202,8 +214,12 @@ export class HubStore {
     const row = await this.db.get<ConversationRow>("SELECT * FROM conversations WHERE id=?", [id]);
     if (!row) throw new HubError("conversation_not_found", 404);
     const bots = await this.db.all<{ member_id: string }>("SELECT member_id FROM conversation_members WHERE conversation_id=? AND member_type='bot' ORDER BY member_id", [id]);
+    // #53: completed rewinds are ranges; a fork records its origin. Older Apps drop the field.
+    const rewinds = await this.db.all<Pick<HistoryOpRow, "id" | "user_id" | "anchor_message_id" | "anchor_created_at" | "through_message_id" | "through_created_at" | "updated_at">>(
+      "SELECT id,user_id,anchor_message_id,anchor_created_at,through_message_id,through_created_at,updated_at FROM conversation_history_ops WHERE conversation_id=? AND kind='rewind' AND state='completed' ORDER BY updated_at,rowid", [id]);
+    const history = conversationHistory(rewinds, row.fork_json ?? null);
     return conversationSchema.parse({ id: row.id, type: row.type, title: row.title, ownerId: row.owner_id, ...(row.parent_id ? { parentId: row.parent_id } : {}), botIds: bots.map((b) => b.member_id), archived: !!row.archived, ...(row.session_id ? { sessionId: row.session_id } : {}), ...(row.binding_id ? { bindingId: row.binding_id } : {}), createdAt: row.created_at,
-      ...(row.hidden ? { hidden: true } : {}), ...(row.ticket_json ? { ticket: conversationTicketSchema.parse(JSON.parse(row.ticket_json)) } : {}) });
+      ...(row.hidden ? { hidden: true } : {}), ...(row.ticket_json ? { ticket: conversationTicketSchema.parse(JSON.parse(row.ticket_json)) } : {}), ...(history ? { history } : {}) });
   }
   /** Pass `hidden: false` where a listing reaches a client without dispatch.v1:
    * it would show dispatcher worker conversations as ordinary chats. */
@@ -220,10 +236,12 @@ export class HubStore {
       return this.createConversationInTransaction(userId, botIds, title, clientActionId, options);
     });
   }
-  /** Caller holds db.transaction; Agent Bus creates its dedicated chats atomically with the workspace. */
-  async createConversationInTransaction(userId: string, botIds: string[], title: string, clientActionId: string, options: { type?: "direct" | "group"; parentId?: string; dispatchWorker?: true } = {}): Promise<Conversation> {
+  /** Caller holds db.transaction; Agent Bus creates its dedicated chats atomically with the workspace.
+   * `id` uses an ID reserved earlier (a fork's target, #53); `fork` records its origin. */
+  async createConversationInTransaction(userId: string, botIds: string[], title: string, clientActionId: string, options: { type?: "direct" | "group"; parentId?: string; dispatchWorker?: true; id?: string; fork?: ForkOrigin } = {}): Promise<Conversation> {
     const existing = await this.db.get<{ id: string }>("SELECT id FROM conversations WHERE owner_id=? AND client_action_id=?", [userId, clientActionId]);
     if (existing) {
+      if (options.id !== undefined && existing.id !== options.id) throw new HubError("idempotency_conflict", 409);
       const conversation = await this.conversationRow(existing.id);
       if (conversation.parentId !== options.parentId) throw new HubError("idempotency_conflict", 409);
       return conversation;
@@ -247,13 +265,15 @@ export class HubStore {
       // A dispatcher's engine worker only runs its hidden ticket conversations.
       if (bot.role === "worker" && !options.dispatchWorker) throw new HubError("dispatch_worker_internal", 409);
     }
-    const id = newId("gw");
+    const id = options.id === undefined ? newId("gw") : idSchema.parse(options.id);
+    const fork = options.fork === undefined ? undefined : forkOriginSchema.parse(options.fork);
     const type = parent ? "group" : options.type ?? (ids.length === 1 ? "direct" : "group");
     if (type === "direct" && ids.length !== 1) throw new HubError("direct_requires_one_bot");
+    if (fork && type !== "direct") throw new HubError("direct_requires_one_bot");
     // A dispatcher works through exactly one conversation and is never a group member.
     if (dispatcher && type === "group") throw new HubError("dispatcher_group_forbidden", 409);
     if (dispatcher && await this.db.get("SELECT 1 FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id WHERE m.member_type='bot' AND m.member_id=? AND c.type='direct'", [ids[0]!])) throw new HubError("dispatcher_single_conversation", 409);
-    await this.db.run("INSERT INTO conversations(id,type,title,owner_id,created_at,client_action_id,parent_id) VALUES(?,?,?,?,?,?,?)", [id, type, title, userId, Date.now(), clientActionId, parent?.id ?? null]);
+    await this.db.run("INSERT INTO conversations(id,type,title,owner_id,created_at,client_action_id,parent_id,fork_json) VALUES(?,?,?,?,?,?,?,?)", [id, type, title, userId, Date.now(), clientActionId, parent?.id ?? null, fork ? JSON.stringify(fork) : null]);
     if (parent) await this.db.run("INSERT INTO conversation_members SELECT ?,'user',member_id,0 FROM conversation_members WHERE conversation_id=? AND member_type='user'", [id, parent.id]);
     else await this.db.run("INSERT INTO conversation_members VALUES(?,'user',?,0)", [id, userId]);
     for (const bot of ids) await this.db.run("INSERT INTO conversation_members VALUES(?,'bot',?,0)", [id, bot]);
@@ -985,12 +1005,8 @@ export class HubStore {
       // pending inputs, active foreground/background runs and answer
       // follow-ups); `actions` is a superset prefilter for card actions.
       const rows = await this.db.all<Pick<MessageRow, "id" | "author_id" | "author_type" | "version" | "client_msg_id" | "created_at"> & { busy: number; actions: number }>(`SELECT id,author_id,author_type,version,client_msg_id,created_at,
-        (status IN ('pending','streaming') OR EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id=messages.id AND d.status='pending')
-          OR (status='complete' AND author_type='bot' AND (instr(blocks_json,'"nativeRun"')>0 OR instr(blocks_json,'"scopedRun"')>0 OR instr(blocks_json,'"answerFollowup"')>0)
-            AND CASE WHEN json_valid(blocks_json) THEN EXISTS(SELECT 1 FROM json_each(blocks_json) b WHERE json_extract(b.value,'$.extra.nativeRun.phase') IN (${activeRunPhaseParams})
-              OR json_extract(b.value,'$.extra.scopedRun.phase') IN (${activeRunPhaseParams}) OR json_extract(b.value,'$.extra.answerFollowup.phase') IN ('queued','processing')) ELSE 0 END)) AS busy,
-        (author_type='bot' AND status='complete' AND (forwarded_json IS NULL OR forwarded_json='') AND instr(blocks_json,'"actionId"')>0
-          AND (instr(blocks_json,'ask_user_question')>0 OR instr(blocks_json,'"approval"')>0 OR instr(blocks_json,'askq_submit')>0)) AS actions
+        ${MESSAGE_BUSY_SQL} AS busy,
+        ${MESSAGE_ACTIONS_SQL} AS actions
         FROM messages WHERE conversation_id=? AND rowid<=? AND status!='deleted' AND NOT EXISTS(SELECT 1 FROM message_deletions d WHERE d.message_id=messages.id AND d.user_id=?) ORDER BY rowid LIMIT ?`,
         [...activeRunPhases, ...activeRunPhases, conversationId, through.rowid, userId, MAX_CLEAR_MESSAGES]);
       // Refuse the whole page before any write. Earlier committed pages stay;
@@ -1011,6 +1027,21 @@ export class HubStore {
     });
     for (const event of events) this.emit(event);
     return result;
+  }
+  /** Caller holds db.serial/transaction. The Hub's half of why a history
+   * operation (#53) cannot start: this Bot's pending inputs, then the
+   * clearMessages busy test over the whole conversation, then unanswered
+   * questions/approvals. A personal deletion never hides a running task. */
+  async historyBusyInTransaction(conversationId: string, botId: string): Promise<"running" | "queued" | "pending_action" | undefined> {
+    const delivery = await this.db.get<{ dispatched: number }>("SELECT d.dispatched FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE d.bot_id=? AND m.conversation_id=? AND d.status='pending' ORDER BY d.dispatched DESC LIMIT 1", [botId, conversationId]);
+    if (delivery) return delivery.dispatched ? "running" : "queued";
+    if (await this.db.get(`SELECT 1 FROM messages WHERE conversation_id=? AND status!='deleted' AND ${MESSAGE_BUSY_SQL} LIMIT 1`, [conversationId, ...activeRunPhases, ...activeRunPhases])) return "running";
+    if (await this.db.get("SELECT 1 FROM action_deliveries WHERE conversation_id=? AND status='pending' LIMIT 1", [conversationId])) return "pending_action";
+    for (const row of await this.db.all<{ blocks_json: string }>(`SELECT blocks_json FROM messages WHERE conversation_id=? AND status!='deleted' AND ${MESSAGE_ACTIONS_SQL} ORDER BY rowid DESC`, [conversationId])) {
+      let blocks: unknown; try { blocks = JSON.parse(row.blocks_json); } catch { continue; }
+      if (hasPendingCardAction(blocks)) return "pending_action";
+    }
+    return undefined;
   }
   private async hiddenMessages(userId: string, conversationId: string): Promise<Set<string>> {
     const rows = await this.db.all<{ message_id: string }>("SELECT d.message_id FROM message_deletions d JOIN messages m ON m.id=d.message_id WHERE d.user_id=? AND m.conversation_id=?", [userId, conversationId]);

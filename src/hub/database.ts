@@ -96,6 +96,9 @@ export class HubDatabase {
         if (!conversationColumns.some((c) => c.name === "binding_id")) await result.exec("ALTER TABLE conversations ADD COLUMN binding_id TEXT");
         if (!conversationColumns.some((c) => c.name === "hidden")) await result.exec("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0");
         if (!conversationColumns.some((c) => c.name === "ticket_json")) await result.exec("ALTER TABLE conversations ADD COLUMN ticket_json TEXT");
+        // Additive (#53): a forked conversation's origin. Older writers name
+        // their columns; an older Host simply shows the fork as a plain chat.
+        if (!conversationColumns.some((c) => c.name === "fork_json")) await result.exec("ALTER TABLE conversations ADD COLUMN fork_json TEXT");
         if (version && Number(version.value) < 11) {
           // Old tombstones have empty blocks. Read their own retained events
           // in small pages, using the protocol's attachment traversal so button
@@ -337,6 +340,22 @@ CREATE INDEX IF NOT EXISTS dispatch_assists_child ON dispatch_assists(child_atte
 CREATE INDEX IF NOT EXISTS dispatch_assists_continuation ON dispatch_assists(continuation_attempt_id) WHERE continuation_attempt_id IS NOT NULL;
 -- Assistance allowed since the ticket's latest dispatch; continuations keep it.
 CREATE TABLE IF NOT EXISTS dispatch_assist_windows (ticket_id TEXT PRIMARY KEY REFERENCES dispatch_tickets(id), attempt_id TEXT NOT NULL, remaining INTEGER NOT NULL);
+-- Conversation rewind and fork (#53). One table is the idempotency receipt,
+-- the per-conversation mutex, restart recovery and the rewind ranges (completed
+-- rewind rows). Additive: older Hubs ignore it, so no schema_version bump.
+CREATE TABLE IF NOT EXISTS conversation_history_ops (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL, request_id TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ conversation_id TEXT NOT NULL REFERENCES conversations(id), bot_id TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('rewind','fork')),
+ anchor_message_id TEXT, anchor_created_at INTEGER, through_message_id TEXT, through_created_at INTEGER,
+ target_conversation_id TEXT,
+ state TEXT NOT NULL CHECK(state IN ('started','completed','failed','unknown')),
+ error TEXT, result_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ UNIQUE(user_id,request_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS conversation_history_ops_active ON conversation_history_ops(conversation_id) WHERE state = 'started';
+-- Every conversation listing reads its completed rewinds.
+CREATE INDEX IF NOT EXISTS conversation_history_ops_conversation ON conversation_history_ops(conversation_id,kind,state);
 ${MESSAGE_ACTIVITY_SCHEMA}
 ${EVENT_HISTORY_SCHEMA}
 `;
