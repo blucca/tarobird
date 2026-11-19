@@ -1,0 +1,164 @@
+/* Model quota (EngineQuota.tsx): read-only, one section per Host.
+   Same structure everywhere; only the arrangement follows the available width.
+   Wide (desktop Settings, iPad, unfolded phone): one bordered list per Host,
+   the engine on the left and its windows side by side. Narrow (phones): one
+   raised card per engine, windows stacked. Colours are the active palette's
+   tokens: the data accent for a healthy bar, --orange from 80 % used, --red
+   once used up. Nothing here changes Settings chrome. */
+.engine-quota { min-width: 0; container: quota / inline-size; }
+
+.quota-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px 16px; }
+.settings-content>section>h3:first-child + .engine-quota .quota-toolbar { margin-top: -14px; }
+.engine-quota .quota-lede { flex: 1; min-width: 0; margin: 4px 0 0; font-size: 13px; line-height: 1.6; color: var(--grey); }
+.engine-quota .quota-refresh { flex: none; display: inline-flex; align-items: center; gap: 6px; }
+.engine-quota .quota-refresh[aria-disabled=true] { cursor: default; color: var(--muted); }
+.engine-quota .quota-footnote { margin: 16px 2px 0; font-size: 12px; line-height: 1.6; color: var(--muted); }
+
+/* Host heading: the name is the scope, the dot is this device's connection. */
+.quota-host { margin-top: 20px; min-width: 0; }
+.quota-host-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; margin: 0 2px 8px; }
+.engine-quota .quota-host-heading h4 { display: flex; align-items: center; gap: 6px; min-width: 0; margin: 0; font-size: 13px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--text); }
+.quota-host-heading h4 svg { flex: none; color: var(--muted); }
+.quota-host-heading h4 span { min-width: 0; overflow-wrap: anywhere; }
+.quota-host-state { display: inline-flex; align-items: center; gap: 6px; flex: none; font-size: 12px; color: var(--muted); }
+.quota-host-state i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.quota-host-state[data-tone=online] { color: var(--green); }
+.quota-host-state[data-tone=muted] i { background: transparent; box-shadow: inset 0 0 0 1.5px currentColor; }
+
+/* Host-level notes: offline, older Host, a failed read. */
+.engine-quota .quota-note { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; margin: 0 0 8px; padding: 8px 12px; border-radius: var(--radius-sm); background: var(--surface); color: var(--grey); font-size: 12.5px; line-height: 1.6; }
+.engine-quota .quota-note[data-tone=warning] { background: var(--orange-soft); color: var(--orange); }
+.engine-quota .quota-note span { flex: 1; min-width: 0; }
+
+/* One engine login. */
+.quota-list { min-width: 0; border: 1px solid var(--border); border-radius: 14px; background: var(--raised); }
+/* Narrow by default: name and status on top, figures, then Bots and the reading's age. */
+.quota-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "head chip" "body body" "foot updated"; row-gap: 12px; min-width: 0; padding: 14px 16px; }
+.quota-entry + .quota-entry { border-top: 1px solid var(--border); }
+.quota-entry-head { grid-area: head; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-width: 0; }
+.quota-entry-status { display: contents; }
+.quota-engine { display: inline-flex; align-items: center; gap: 7px; min-width: 0; font-size: 13.5px; color: var(--text); }
+.quota-engine strong { font-weight: 600; overflow-wrap: anywhere; }
+.quota-engine .bot-brand-icon { flex: 0 0 15px; width: 15px; height: 15px; color: var(--grey); }
+.quota-plan { max-width: 100%; padding: 0 6px; border-radius: var(--radius-xs); box-shadow: inset 0 0 0 1px var(--border); color: var(--grey); font-size: 11px; font-weight: 550; line-height: 18px; overflow-wrap: anywhere; }
+.quota-chip { grid-area: chip; align-self: start; justify-self: end; margin-left: 10px; padding: 0 7px; border-radius: var(--radius-xs); background: var(--surface); color: var(--muted); font-size: 11px; font-weight: 600; line-height: 19px; white-space: nowrap; }
+.quota-chip[data-tone=warning] { background: var(--orange-soft); color: var(--orange); }
+.quota-chip[data-tone=danger] { background: var(--red-soft); color: var(--red); }
+
+.quota-entry-body { grid-area: body; display: grid; gap: 12px; min-width: 0; }
+.engine-quota .quota-detail { margin: 0; font-size: 12.5px; line-height: 1.6; color: var(--grey); }
+
+/* Windows: name and figure, the bar, then when it resets. */
+.quota-windows { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; margin: 0; padding: 0; list-style: none; }
+.quota-window { --quota-tone: var(--data-accent, var(--accent)); --quota-track: var(--data-accent-soft, var(--accent-soft)); display: grid; align-content: start; gap: 6px; min-width: 0; }
+.quota-window[data-tone=warning] { --quota-tone: var(--orange); --quota-track: var(--orange-soft); }
+.quota-window[data-tone=danger] { --quota-tone: var(--red); --quota-track: var(--red-soft); }
+.quota-window[data-tone=none] { --quota-track: var(--surface-alt); }
+.quota-window-head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; min-width: 0; line-height: 21px; }
+.quota-window-name { min-width: 0; font-size: 12.5px; color: var(--grey); overflow-wrap: anywhere; }
+.quota-window-name small { margin-left: 6px; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.quota-window-value { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.quota-window-value b { margin: 0 1px; font-size: 14px; font-weight: 650; letter-spacing: -.01em; color: var(--text); }
+.quota-window[data-tone=warning] .quota-window-value b { color: var(--orange); }
+.quota-window[data-tone=danger] .quota-window-value { font-weight: 600; color: var(--red); }
+.quota-meter { height: 6px; border-radius: 999px; background: var(--quota-track); overflow: hidden; }
+.quota-meter span { display: block; width: var(--quota-fill); min-width: 6px; height: 100%; border-radius: 999px; background: var(--quota-tone); transition: width var(--t-slow) var(--ease), background-color var(--t-med) var(--ease); animation: quota-fill 520ms var(--ease-out) both; }
+.quota-window[data-tone=danger] .quota-meter span { display: none; }
+@keyframes quota-fill { from { width: 0; min-width: 0; } }
+/* Re-reading after a reset: the track waits, it never fills by itself. */
+.quota-window-notes { display: grid; gap: 4px; min-width: 0; }
+.quota-window-notes:empty { display: none; }
+.quota-window[data-due] .quota-meter { background: repeating-linear-gradient(-45deg, var(--surface-alt) 0 6px, var(--surface) 6px 12px); }
+/* When it resets: the countdown leads, the clock time sits under the figure. */
+.engine-quota .quota-window-reset { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 12px; margin: 0; font-size: 12px; line-height: 1.5; color: var(--muted); font-variant-numeric: tabular-nums; }
+.engine-quota .quota-window-models { margin: 0; font-size: 11.5px; line-height: 1.5; color: var(--muted); overflow-wrap: anywhere; }
+
+/* Balances keep the upstream's own unit and are never added up. */
+.quota-balances { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 0; }
+.quota-balances div { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.quota-balances dt { font-size: 12.5px; color: var(--grey); overflow-wrap: anywhere; }
+.quota-balances dd { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: -.01em; color: var(--text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+
+/* Figures kept from an earlier reading stay readable but step back. */
+.quota-entry[data-earlier] :is(.quota-meter span, .quota-window-value b, .quota-balances dd) { opacity: .55; }
+.quota-entry[data-earlier] .quota-window { --quota-tone: var(--muted); --quota-track: var(--surface-alt); }
+.quota-entry[data-earlier] .quota-window-value b { color: var(--text); }
+
+.quota-entry-foot { grid-area: foot; display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 14px; min-width: 0; font-size: 12px; line-height: 1.6; color: var(--muted); }
+.quota-entry-foot:empty, .quota-entry-status:empty { display: none; }
+.quota-bots-one { min-width: 0; overflow-wrap: anywhere; }
+.quota-bots { min-width: 0; }
+.quota-bots summary { display: inline-flex; align-items: center; gap: 3px; margin-left: -3px; padding-right: 4px; border-radius: var(--radius-xs); cursor: pointer; list-style: none; color: var(--grey); }
+.quota-bots summary::-webkit-details-marker { display: none; }
+.quota-bots summary svg { flex: none; transition: transform var(--t-fast) var(--ease); }
+.quota-bots[open] summary svg { transform: rotate(90deg); }
+.quota-bots ul { display: flex; flex-wrap: wrap; gap: 4px 6px; margin: 6px 0 2px; padding: 0; list-style: none; }
+.quota-bots li { max-width: 100%; padding: 0 7px; border-radius: var(--radius-xs); background: var(--surface); color: var(--grey); font-size: 11.5px; line-height: 20px; overflow-wrap: anywhere; }
+.quota-updated { grid-area: updated; font-size: 12px; line-height: 1.6; color: var(--muted); white-space: nowrap; }
+.quota-guide { color: var(--grey); text-decoration: underline; text-decoration-color: var(--border-strong, var(--border)); text-underline-offset: 3px; }
+.quota-guide svg { margin-left: 2px; vertical-align: -2px; }
+.quota-guide:hover { color: var(--text); }
+
+/* Wide: the engine keeps a fixed left column; windows sit side by side. */
+@container quota (min-width: 540px) {
+  .quota-entry { grid-template-columns: 156px minmax(0, 1fr); grid-template-rows: auto auto 1fr; grid-template-areas: "head body" "status body" "foot body"; column-gap: 20px; row-gap: 5px; align-items: start; padding: 13px 16px; }
+  .quota-entry-status { grid-area: status; display: flex; align-items: center; flex-wrap: wrap; gap: 3px 8px; min-width: 0; }
+  .quota-entry-foot { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .quota-chip, .quota-updated { grid-area: auto; margin-left: 0; }
+  .quota-windows { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px 24px; }
+  /* Neighbouring windows share their rows, so bars line up under a wrapped name. */
+  @supports (grid-template-rows: subgrid) {
+    .quota-windows { row-gap: 0; }
+    .quota-window { grid-row: span 3; grid-template-rows: subgrid; row-gap: 6px; padding-bottom: 14px; }
+    .quota-windows { margin-bottom: -14px; }
+  }
+  .quota-detail { padding-top: 1px; }
+}
+
+/* Phones and touch tablets: Settings pages use raised cards on the stone. */
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+  .engine-quota .quota-refresh { min-height: 44px; padding: 0 14px; }
+  .settings-content>section>h3:first-child + .engine-quota .quota-toolbar { margin-top: 0; }
+  .quota-toolbar { align-items: center; }
+  .engine-quota .quota-lede { margin: 0; }
+  .quota-host { margin-top: 24px; }
+  .quota-host-heading { margin: 0 4px 10px; }
+  .engine-quota .quota-host-heading h4 { font-size: 14px; }
+  .quota-list { display: grid; gap: 12px; border: 0; border-radius: 0; background: transparent; }
+  .quota-entry { padding: 16px; border-radius: var(--radius-2xl); background: var(--raised); box-shadow: var(--elev-1); }
+  .quota-entry + .quota-entry { border-top: 0; }
+  .quota-engine { font-size: 15px; }
+  .quota-engine .bot-brand-icon { flex-basis: 17px; width: 17px; height: 17px; }
+  .quota-meter { height: 8px; }
+  .quota-window-name { font-size: 13.5px; }
+  .quota-window-value { font-size: 12.5px; }
+  .quota-window-value b { font-size: 16px; }
+  .engine-quota .quota-window-reset, .quota-entry-foot, .quota-updated { font-size: 12.5px; }
+  .quota-balances dt { font-size: 13.5px; }
+  .quota-balances dd { font-size: 16px; }
+  .engine-quota .quota-detail { font-size: 13.5px; }
+  .engine-quota .quota-note { padding: 10px 14px; border-radius: var(--radius-xl); font-size: 13px; }
+  .quota-bots summary { min-height: 32px; }
+  .quota-guide { display: inline-block; padding: 6px 0; }
+  .engine-quota .quota-footnote { margin: 16px 4px 0; font-size: 12.5px; }
+}
+/* A narrow card divides Bots and the reading's age from the figures. */
+@container quota (max-width: 539.98px) {
+  .quota-entry { row-gap: 14px; }
+  .quota-entry-foot, .quota-updated { padding-top: 10px; border-top: 1px solid var(--border); }
+  .quota-entry-foot { align-items: center; }
+  .quota-updated { align-self: stretch; display: flex; align-items: center; justify-content: flex-end; padding-left: 14px; }
+  .quota-entry:has(.quota-entry-foot:empty) .quota-updated { grid-column: 1 / -1; padding-left: 0; }
+  .quota-entry:not(:has(.quota-updated)) .quota-entry-foot { grid-column: 1 / -1; }
+  /* Nothing under the figures: no empty row, so the card keeps even padding. */
+  .quota-entry:not(:has(.quota-updated)):has(.quota-entry-foot:empty) { grid-template-areas: "head chip" "body body"; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .quota-meter span { animation: none; transition: none; }
+  .quota-bots summary svg { transition: none; }
+}
+@media (forced-colors: active) {
+  .quota-meter { border: 1px solid CanvasText; }
+  .quota-meter span { background: Highlight; }
+}

@@ -25,7 +25,7 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import { CalendarClock, Archive as ArchiveIcon, ArrowLeft, Settings, Bell, ShieldCheck, Wifi, WifiOff, RefreshCw } from 'lucide-react';
+import { CalendarClock, Archive as ArchiveIcon, ArrowLeft, Gauge, Settings, Bell, ShieldCheck, Wifi, WifiOff, RefreshCw } from 'lucide-react';
 import type { Conversation } from '../../src/client-protocol/index.js';
 import { Avatar, AvatarProvider, ConversationAvatar } from './Avatar.js';
 import { BotReferences, ReferencePreview } from './BotReferences.js';
@@ -49,7 +49,7 @@ type BotScope = { hostId: string; botId: string };
 export type MobileInboxState = { query: string; filter: MobileFilter; botScope?: BotScope; botQuery?: string };
 export type MobileScrollPositions = Record<MobileTab, number>;
 export type MobileCreateKind = 'bot' | 'group' | 'direct' | 'schedule';
-export type MobileOpenTarget = 'settings' | 'connection' | 'devices' | 'notifications' | 'files' | 'capabilities' | 'operations' | 'schedules' | 'hosts' | 'archives';
+export type MobileOpenTarget = 'settings' | 'connection' | 'devices' | 'notifications' | 'quota' | 'files' | 'capabilities' | 'operations' | 'schedules' | 'hosts' | 'archives';
 type Locale = ReturnType<typeof useLocale>;
 
 export type MobileHomeProps = {
@@ -655,6 +655,11 @@ function MePane({ hosts, activeHost, selectHost, open }: PaneProps) {
           <Cell settingsEntry="connection" icon={<Wifi size={20}/>} label={t('连接状态与线路')} description={computerLabels[hosts.findIndex(host => host.id === activeHost?.id)]} disabled={!activeHost} onClick={() => open('connection')} />
       </ul></section>
 
+      {/* Owner-only and across computers, so it sits outside the selected computer's tools. */}
+      {hosts.some(host => host.connection.state.user?.role === 'owner') && <section><ul className="mh-group">
+          <Cell settingsEntry="quota" icon={<Gauge size={20}/>} label={t('模型额度')} description={t('各引擎剩余额度与重置时间')} onClick={() => open('quota')} />
+      </ul></section>}
+
       <section>
         <h2 className="mh-group-title">
           {t('所选电脑的工具')}
@@ -682,7 +687,7 @@ function MePane({ hosts, activeHost, selectHost, open }: PaneProps) {
 function Cell({ icon, label, description, disabled, onClick, settingsEntry, labelOnly }: {
   description?: string;
   labelOnly?: boolean;
-  settingsEntry?: "settings" | "connection" | "capabilities" | "operations";
+  settingsEntry?: "settings" | "connection" | "capabilities" | "operations" | "quota";
   icon: ReactNode;
   label: string;
   disabled?: boolean;
