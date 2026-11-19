@@ -87,13 +87,18 @@ export function useHostFolderUpdates(hosts: readonly { connection: HubConnection
 }
 
 export function buildCrossHostFolderSources(hosts: readonly CrossHostFolderHost[]): CrossHostFolderSource[] {
-  return hosts.map(host => ({
-    hostId: host.id,
-    hostKey: folderHostIdentity(host.connection.identity, host.id),
-    hostName: host.name,
-    folders: host.connection.state.conversationFolders ?? emptyConversationFolders(),
-    online: host.connection.state.status === 'online',
-  }));
+  return hosts.map(host => {
+    const { state } = host.connection;
+    const online = state.status === 'online';
+    return {
+      hostId: host.id,
+      hostKey: folderHostIdentity(host.connection.identity, host.id),
+      hostName: host.name,
+      folders: state.conversationFolders ?? emptyConversationFolders(),
+      online,
+      foldersAuthoritative: online && state.foldersAvailable === true && state.conversationFolders !== undefined,
+    };
+  });
 }
 
 /** Match the exact folder assignment rules used by FolderSections so visibility

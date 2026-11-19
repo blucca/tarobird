@@ -576,7 +576,7 @@ test('offline/reconnect, folder creation/deletion, and host removal merge stably
   }
 });
 
-for (const locale of ['zh', 'en'] as const) test(`narrow desktop and mobile layouts keep host badges single-line, contained, and untruncated (${locale})`, async ({ page }, info) => {
+for (const locale of ['zh', 'en'] as const) test(`narrow desktop and mobile layouts prioritize folder names over host badges while staying single-line and contained (${locale})`, async ({ page }, info) => {
   test.setTimeout(120_000);
   const root = await mkdtemp(path.join(os.tmpdir(), `cross-host-folder-narrow-${locale}-`));
   const a = await HubServer.start({ stateDir: path.join(root, 'a'), clientDir: path.resolve('dist') });
@@ -606,7 +606,48 @@ for (const locale of ['zh', 'en'] as const) test(`narrow desktop and mobile layo
     await page.reload();
     await waitForClientOnline(page);
 
-    const checkBadges = async (container: Locator) => {
+    const checkHeadingPriority = async (container: Locator, requireFolderUntruncated: readonly string[]) => {
+      const metrics = await container.evaluate(rootNode => {
+        const rootRect = rootNode.getBoundingClientRect();
+        const headings = [...rootNode.querySelectorAll<HTMLElement>('.folder-heading')].filter(el => el.getClientRects().length > 0);
+        return {
+          overflow: rootNode.scrollWidth > rootNode.clientWidth + 1,
+          rows: headings.map(heading => {
+            const nameEl = heading.querySelector<HTMLElement>('.folder-name')!;
+            const badge = heading.querySelector<HTMLElement>('.host-source-badge')!;
+            const badgeSpan = badge.querySelector<HTMLElement>('span')!;
+            const nameRect = nameEl.getBoundingClientRect();
+            const badgeRect = badge.getBoundingClientRect();
+            return {
+              folder: nameEl.textContent?.trim() ?? '',
+              host: badge.textContent?.trim() ?? '',
+              nameWidth: nameRect.width,
+              nameTruncated: nameEl.scrollWidth > nameEl.clientWidth + 1,
+              badgeWidth: badgeRect.width,
+              badgeHeight: badgeRect.height,
+              badgeContained: badgeRect.left >= rootRect.left - 1 && badgeRect.right <= rootRect.right + 1,
+              badgeTruncated: badgeSpan.scrollWidth > badgeSpan.clientWidth + 1,
+            };
+          }),
+        };
+      });
+      expect(metrics.overflow, 'container must not overflow horizontally').toBe(false);
+      expect(metrics.rows.length).toBeGreaterThanOrEqual(4);
+      for (const row of metrics.rows) {
+        expect(row.badgeHeight, `badge "${row.host}" must stay single-line`).toBeLessThanOrEqual(24);
+        expect(row.badgeContained, `badge "${row.host}" must stay within bounds`).toBe(true);
+        expect(row.badgeWidth, `badge "${row.host}" must retain readable minimum width`).toBeGreaterThanOrEqual(36);
+        if (row.nameTruncated) {
+          expect(row.nameWidth, `folder "${row.folder}" must have >= visible width of host badge "${row.host}"`).toBeGreaterThanOrEqual(row.badgeWidth);
+          expect(row.badgeTruncated, `host badge "${row.host}" must shrink before truncating folder "${row.folder}"`).toBe(true);
+        }
+        if (requireFolderUntruncated.includes(row.folder)) {
+          expect(row.nameTruncated, `folder "${row.folder}" must not be truncated`).toBe(false);
+        }
+      }
+    };
+
+    const checkManagerBadges = async (container: Locator) => {
       const metrics = await container.evaluate(rootNode => {
         const badges = [...rootNode.querySelectorAll<HTMLElement>('.host-source-badge')].filter(el => el.getClientRects().length > 0);
         const rootRect = rootNode.getBoundingClientRect();
@@ -625,12 +666,12 @@ for (const locale of ['zh', 'en'] as const) test(`narrow desktop and mobile layo
           }),
         };
       });
-      expect(metrics.overflow, 'container must not overflow horizontally').toBe(false);
+      expect(metrics.overflow, 'manager must not overflow horizontally').toBe(false);
       expect(metrics.count).toBeGreaterThanOrEqual(4);
       for (const badge of metrics.badges) {
-        expect(badge.height, `badge "${badge.text}" must stay single-line`).toBeLessThanOrEqual(24);
-        expect(badge.contained, `badge "${badge.text}" must stay within bounds`).toBe(true);
-        expect(badge.truncated, `badge "${badge.text}" must not be truncated`).toBe(false);
+        expect(badge.height, `manager badge "${badge.text}" must stay single-line`).toBeLessThanOrEqual(24);
+        expect(badge.contained, `manager badge "${badge.text}" must stay within bounds`).toBe(true);
+        expect(badge.truncated, `manager badge "${badge.text}" must not be truncated`).toBe(false);
       }
     };
 
@@ -638,7 +679,8 @@ for (const locale of ['zh', 'en'] as const) test(`narrow desktop and mobile layo
     const sep = workspace(page).getByRole('separator').first();
     await sep.focus();
     await page.keyboard.press('Home');
-    await checkBadges(sidebar(page).locator('.combined-sidebar'));
+    const desktopUntruncated = locale === 'en' ? ['Release Ops', 'Ungrouped'] : ['发布运维', '未分组'];
+    await checkHeadingPriority(sidebar(page).locator('.combined-sidebar'), desktopUntruncated);
     await saveShot(page, info.outputPath(`desktop-narrow-${locale}.png`), `desktop-narrow-${locale}.png`, {
       clip: { x: 0, y: 0, width: 220, height: 680 },
     });
@@ -649,14 +691,16 @@ for (const locale of ['zh', 'en'] as const) test(`narrow desktop and mobile layo
     if (await backBtn.isVisible()) await backBtn.click();
     await expect(mobileHome(page)).toBeVisible();
     await expect(mobileHome(page)).toHaveAttribute('data-tab', 'messages');
-    await checkBadges(mobileHome(page));
+    const phoneUntruncated = locale === 'en' ? ['Product Roadmap', 'Release Ops', 'Ungrouped'] : ['季度产品规划与评审', '发布运维', '未分组'];
+    await checkHeadingPriority(mobileHome(page), phoneUntruncated);
+    await saveShot(page, info.outputPath(`phone-narrow-list-${locale}.png`), `phone-narrow-list-${locale}.png`);
 
     const more = mobileHome(page).getByRole('button', { name: locale === 'en' ? 'List options' : '列表选项', exact: true });
     await more.click();
     await dialog(page, locale === 'en' ? 'List options' : '列表选项').getByRole('button', { name: names.manager, exact: true }).click();
     const mgr = dialog(page, names.manager);
     await expect(mgr).toBeVisible();
-    await checkBadges(mgr);
+    await checkManagerBadges(mgr);
     await saveShot(page, info.outputPath(`phone-narrow-manager-${locale}.png`), `phone-narrow-manager-${locale}.png`);
     await mgr.getByRole('button', { name: names.close, exact: true }).click();
   } finally {

@@ -4,8 +4,8 @@
    :hover after tapping, so also override the shared button hover background. */
 .folder-heading:is(:hover,:active):not(:disabled){background:transparent}
 .folder-heading{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
-.folder-heading>svg{flex:none}.folder-label{display:flex;flex:1;align-items:center;gap:6px;min-width:0}.folder-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.folder-count{flex:none;font-size:11px;font-variant-numeric:tabular-nums}
-.folder-heading>.host-source-badge{flex:0 1 auto;max-width:min(50%,12em)}
+.folder-heading>svg{flex:none}.folder-label{display:flex;flex:1 1 auto;align-items:center;gap:6px;min-width:0}.folder-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.folder-count{flex:none;font-size:11px;font-variant-numeric:tabular-nums}
+.folder-heading>.host-source-badge{flex:0 999 auto;justify-content:flex-end;min-width:3.75em;max-width:min(42%,11em)}
 .folder-heading .unread-badge{font-size:10px;min-width:16px;height:16px;line-height:16px}.folder-attention{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:none}
 .folder-empty{margin:2px 24px 10px;color:var(--muted);font-size:12px}
 .folder-dialog{width:min(420px,calc(100vw - 32px))}.folder-dialog input,.folder-dialog select{width:100%;margin-top:8px}.folder-dialog label{display:block}.folder-dialog label+label,.folder-dialog select+label{margin-top:12px}

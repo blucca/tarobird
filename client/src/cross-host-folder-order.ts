@@ -22,6 +22,8 @@ export type CrossHostFolderSource = {
   hostName: string;
   folders: ConversationFoldersState;
   online?: boolean;
+  /** True only when this host supports folders and an authoritative folder snapshot has been received. */
+  foldersAuthoritative?: boolean;
 };
 
 export type CrossHostFolderItem = {
@@ -223,15 +225,16 @@ function insertMissingByReference(base: string[], reference: readonly string[]):
 function makeOnlineDeletionFilter(sources: readonly CrossHostFolderSource[]): (key: string) => boolean {
   const onlineFolders = new Map<string, ReadonlySet<string>>();
   for (const source of sources) {
-    if (source.online !== true || !source.hostKey) continue;
+    if (source.online !== true || source.foldersAuthoritative !== true || !source.hostKey) continue;
     onlineFolders.set(source.hostKey, new Set(source.folders.folders.map(folder => folder.id)));
   }
   return (key: string) => {
     const ref = parseCrossHostFolderKey(key);
     if (!ref || ref.folderId === null) return false;
     const known = onlineFolders.get(ref.hostKey);
-    // Only prune custom folders confirmed absent on a currently online host.
-    // Offline, filtered, or connecting hosts keep every saved entry intact.
+    // Only prune custom folders confirmed absent on an online host whose
+    // folder snapshot is authoritatively loaded and supported. Offline,
+    // filtered, connecting, legacy, or uncached hosts keep every saved entry.
     return known !== undefined && !known.has(ref.folderId);
   };
 }

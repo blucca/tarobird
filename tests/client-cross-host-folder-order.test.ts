@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ConversationFoldersState } from '../src/client-protocol/conversation-folders.js';
+import type { HubConnection } from '../client/src/connection.js';
 import {
   CROSS_HOST_FOLDER_ORDER_KEY,
   applyCrossHostFolderMove,
@@ -22,13 +23,14 @@ import {
   writeCrossHostFolderOrder,
   type CrossHostFolderSource,
 } from '../client/src/cross-host-folder-order.js';
+import { buildCrossHostFolderSources } from '../client/src/use-cross-host-folder-order.js';
 
 function makeSource(
   hostId: string,
   hostKey: string,
   hostName: string,
   folders: Array<{ id: string; name: string }>,
-  options: { unfiledIndex?: number; pinnedFolderIds?: (string | null)[]; online?: boolean } = {},
+  options: { unfiledIndex?: number; pinnedFolderIds?: (string | null)[]; online?: boolean; foldersAuthoritative?: boolean } = {},
 ): CrossHostFolderSource {
   const state: ConversationFoldersState = {
     revision: 1,
@@ -37,7 +39,15 @@ function makeSource(
     ...(options.unfiledIndex !== undefined ? { unfiledIndex: options.unfiledIndex } : {}),
     ...(options.pinnedFolderIds?.length ? { pinnedFolderIds: options.pinnedFolderIds } : {}),
   };
-  return { hostId, hostKey, hostName, folders: state, online: options.online ?? true };
+  const online = options.online ?? true;
+  return {
+    hostId,
+    hostKey,
+    hostName,
+    folders: state,
+    online,
+    foldersAuthoritative: options.foldersAuthoritative ?? online,
+  };
 }
 
 const k = (hostKey: string, folderId: string | null) => crossHostFolderKey({ hostKey, folderId });
@@ -181,6 +191,69 @@ describe('cross-host folder order resolution and merging', () => {
     expect(describeOrder(all, savedWhileBOffline)).toEqual([
       'keyA/f1', 'keyB/f3', 'keyC/f4', 'keyA/f2', 'keyA/unfiled', 'keyB/unfiled', 'keyC/unfiled',
     ]);
+  });
+
+  it('never prunes saved entries for an online host whose folder snapshot is missing or unsupported', () => {
+    const fakeHost = (
+      id: string,
+      hubPublicKey: string,
+      name: string,
+      state: { status: 'online' | 'offline' | 'connecting'; foldersAvailable?: boolean; conversationFolders?: ConversationFoldersState },
+    ) => ({
+      id,
+      name,
+      connection: { identity: { hubPublicKey }, state } as unknown as HubConnection,
+    });
+
+    const loadedA: ConversationFoldersState = { revision: 1, folders: [{ id: 'a1', name: 'A1' }, { id: 'a2', name: 'A2' }], assignments: [] };
+    const loadedB: ConversationFoldersState = { revision: 1, folders: [{ id: 'b1', name: 'B1' }], assignments: [] };
+    const loadedC: ConversationFoldersState = { revision: 1, folders: [{ id: 'c1', name: 'C1' }], assignments: [] };
+
+    const fullSources = buildCrossHostFolderSources([
+      fakeHost('a', 'keyA', 'Host Alpha', { status: 'online', foldersAvailable: true, conversationFolders: loadedA }),
+      fakeHost('b', 'keyB', 'Host Beta', { status: 'online', foldersAvailable: true, conversationFolders: loadedB }),
+      fakeHost('c', 'keyC', 'Host Gamma', { status: 'online', foldersAvailable: true, conversationFolders: loadedC }),
+    ]);
+    expect(fullSources.every(s => s.foldersAuthoritative === true)).toBe(true);
+
+    // Save custom interleaved order with B1 placed between A1 and A2, and B1 also tested in pinned tier.
+    const custom = commitCrossHostFolderOrder(emptyCrossHostFolderOrder(), fullSources, [
+      k('keyA', 'a1'), k('keyB', 'b1'), k('keyA', 'a2'), k('keyC', 'c1'),
+      k('keyA', null), k('keyB', null), k('keyC', null),
+    ]);
+
+    // Case 1: Host B just came online with cleared cache (conversationFolders === undefined, foldersAvailable: true).
+    const uncachedBSources = buildCrossHostFolderSources([
+      fakeHost('a', 'keyA', 'Host Alpha', { status: 'online', foldersAvailable: true, conversationFolders: loadedA }),
+      fakeHost('b', 'keyB', 'Host Beta', { status: 'online', foldersAvailable: true, conversationFolders: undefined }),
+      fakeHost('c', 'keyC', 'Host Gamma', { status: 'online', foldersAvailable: true, conversationFolders: loadedC }),
+    ]);
+    expect(uncachedBSources[1]!.foldersAuthoritative).toBe(false);
+    const afterReorderUncached = moveCrossHostFolderOrder(custom, uncachedBSources, k('keyC', 'c1'), 'up');
+    expect(afterReorderUncached.ordinary).toContain(k('keyB', 'b1'));
+    expect(describeOrder(fullSources, afterReorderUncached)).toEqual([
+      'keyA/a1', 'keyB/b1', 'keyC/c1', 'keyA/a2', 'keyA/unfiled', 'keyB/unfiled', 'keyC/unfiled',
+    ]);
+
+    // Case 2: Legacy Host B online without folder support (foldersAvailable: false, ready omitted conversationFolders).
+    const legacyBSources = buildCrossHostFolderSources([
+      fakeHost('a', 'keyA', 'Host Alpha', { status: 'online', foldersAvailable: true, conversationFolders: loadedA }),
+      fakeHost('b', 'keyB', 'Host Beta', { status: 'online', foldersAvailable: false, conversationFolders: undefined }),
+      fakeHost('c', 'keyC', 'Host Gamma', { status: 'online', foldersAvailable: true, conversationFolders: loadedC }),
+    ]);
+    expect(legacyBSources[1]!.foldersAuthoritative).toBe(false);
+    const afterReorderLegacy = moveCrossHostFolderOrder(custom, legacyBSources, k('keyC', 'c1'), 'up');
+    expect(afterReorderLegacy.ordinary).toContain(k('keyB', 'b1'));
+
+    // Case 3: Host B online AND authoritative with empty folders -> confirmed deletion IS pruned.
+    const confirmedEmptyBSources = buildCrossHostFolderSources([
+      fakeHost('a', 'keyA', 'Host Alpha', { status: 'online', foldersAvailable: true, conversationFolders: loadedA }),
+      fakeHost('b', 'keyB', 'Host Beta', { status: 'online', foldersAvailable: true, conversationFolders: { revision: 2, folders: [], assignments: [] } }),
+      fakeHost('c', 'keyC', 'Host Gamma', { status: 'online', foldersAvailable: true, conversationFolders: loadedC }),
+    ]);
+    expect(confirmedEmptyBSources[1]!.foldersAuthoritative).toBe(true);
+    const afterConfirmedDelete = moveCrossHostFolderOrder(custom, confirmedEmptyBSources, k('keyC', 'c1'), 'up');
+    expect(afterConfirmedDelete.ordinary).not.toContain(k('keyB', 'b1'));
   });
 
   it('merges newly created folders, deleted folders, and newly added/removed hosts without resetting user order', () => {
