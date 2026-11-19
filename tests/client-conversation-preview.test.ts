@@ -1,7 +1,62 @@
-import { describe, expect, it } from "vitest";
-import { conversationBlocksPreview, conversationPreview } from "../client/src/conversation-preview.js";
-import { blocksText, type Block } from "../src/client-protocol/index.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { conversationActivityPreview, projectConversationPreview, conversationBlocksPreview, conversationPreview } from "../client/src/conversation-preview.js";
+import { blocksText, type Block, type Message } from "../src/client-protocol/index.js";
 import { createRunRecord, recordRunEvent, summarizeRun } from "../src/core/run-record.js";
+
+import { setLocale } from "../client/src/i18n.js";
+
+describe("localized system preview provenance", () => {
+  beforeEach(() => { vi.stubGlobal("document", { documentElement: { lang: "zh-CN" } }); });
+  afterEach(() => { setLocale("zh"); vi.unstubAllGlobals(); });
+  const run = summarizeRun(createRunRecord(), "running");
+  const card = (summary = "任务处理中", phase = run.phase): Extract<Block, { type: "card" }> => ({
+    type: "card", summary, elements: [{ type: "markdown", text: "保留原文" }], extra: { nativeRun: { ...run, phase } },
+  });
+  it.each(["任务处理中", "Task is running"])("renders cached %s in the current language without mutating it", summary => {
+    const message = { authorType: "bot" as const, blocks: [card(summary)] }, original = structuredClone(message);
+    const activity = { ...projectConversationPreview(message, 5), lastContentSeq: 5 };
+    setLocale("en"); expect(conversationActivityPreview(activity)).toBe("Task is running");
+    setLocale("zh"); expect(conversationActivityPreview(activity)).toBe("任务处理中");
+    expect(activity.preview).toBe(summary); expect(message).toEqual(original);
+    // An older client/tab may update the preview while retaining an unknown field.
+    setLocale("en"); expect(conversationActivityPreview({ ...activity, lastContentSeq: 6 })).toBe(summary);
+  });
+  it("keeps authored, terminal, mixed and unverified text verbatim", () => {
+    setLocale("en");
+    const messages: Pick<Message, "blocks" | "authorType">[] = [
+      { authorType: "user", blocks: [card()] },
+      { authorType: "bot", blocks: [{ type: "text", text: "任务处理中" }] },
+      { authorType: "bot", blocks: [{ ...card(), extra: undefined }] },
+      { authorType: "bot", blocks: [{ ...card(), extra: { nativeRun: { phase: "thinking" } } }] },
+      { authorType: "bot", blocks: [{ ...card(), extra: { scopedRun: run } }] },
+      ...["done", "partial", "error", "stopped", "interrupted", "delivering"].map(phase => ({ authorType: "bot" as const, blocks: [card("任务处理中", phase as typeof run.phase)] })),
+      { authorType: "bot", blocks: [card("正在核对报告")] },
+      { authorType: "bot", blocks: [card(), { type: "text", text: "附加正文" }] },
+    ];
+    for (const message of messages) {
+      const activity = { ...projectConversationPreview(message, 5), lastContentSeq: 5 };
+      expect(activity.previewStatus).toBeNull(); expect(conversationActivityPreview(activity)).toBe(activity.preview);
+    }
+  });
+  it.each(["正在交付结果", "Delivering result"])("localizes verified delivery status %s", summary => {
+    const activity = { ...projectConversationPreview({ authorType: "bot", blocks: [card(summary, "delivering")] }, 2), lastContentSeq: 2 };
+    setLocale("en"); expect(conversationActivityPreview(activity)).toBe("Delivering results");
+    setLocale("zh"); expect(conversationActivityPreview(activity)).toBe("正在交付结果");
+  });
+  it("keeps delivery localization while the native run is stopping", () => {
+    const record = createRunRecord(); record.phase = "stopping";
+    const message = { authorType: "bot" as const, blocks: [{ ...card("正在交付结果"), extra: { nativeRun: summarizeRun(record, "delivering") } }] };
+    const activity = { ...projectConversationPreview(message, 2), lastContentSeq: 2 };
+    setLocale("en"); expect(conversationActivityPreview(activity)).toBe("Delivering results");
+  });
+  it("does not replace maintenance previews or guess at a legacy string", () => {
+    const record = createRunRecord(); recordRunEvent(record, { type: "context_compaction", id: "maintenance", status: "started" });
+    setLocale("en");
+    const activity = { ...projectConversationPreview({ authorType: "bot", blocks: [{ ...card(), extra: { nativeRun: summarizeRun(record, "running") } }] }, 1), lastContentSeq: 1 };
+    expect(conversationActivityPreview(activity)).toBe("Compacting context"); expect(activity.previewStatus).toBeNull();
+    expect(conversationActivityPreview({ preview: "任务处理中", lastContentSeq: 1 })).toBe("任务处理中");
+  });
+});
 
 describe("conversation navigation excerpts", () => {
   it("uses card summaries only for navigation and keeps search/copy content unchanged", () => {

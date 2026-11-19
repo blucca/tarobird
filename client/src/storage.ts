@@ -10,7 +10,7 @@ import { boardDocumentSchema, changeWorkbench, workbenchLayoutSchema, type Board
 import { workbenchDraftSchema, type WorkbenchDraft } from "./workbench-draft.js";
 import { applyDesignCommentDelivery, designCommentFingerprint, designCommentReceiptKey, designCommentReceiptSchema, type DesignCommentAcceptance } from "./design-comment-delivery.js";
 import { isUnavailableCardAction } from "./outbox-failure.js";
-import { conversationBlocksPreview } from "./conversation-preview.js";
+import { projectConversationPreview, systemRunPreview, type ConversationPreviewStatus } from "./conversation-preview.js";
 import { reviewReferenceKey, reviewReferencesSchema, validateReviewReferences, type RunReviewReferences } from "./diff-review-reference.js";
 import { networkCanonical, type SignedNetworkManifest } from "../../src/client-protocol/private-network.js";
 import { conversationFoldersSchema, emptyConversationFolders, type ConversationFoldersState } from "../../src/client-protocol/conversation-folders.js";
@@ -39,7 +39,7 @@ export type { Route } from "../../src/client-protocol/routes.js";
 export type PendingPairing = { code: string; expiresAt: number; serverTimeOffset?: number; request?: { invite?: string; requestId: string } };
 export type Identity = { deviceId: string; name: string; privateKey?: CryptoKey; keyRef?: string; platform?: "web" | "macos" | "windows" | "ios" | "android"; publicKey: string; hubPublicKey?: string; deployment?: Deployment; routes: Route[]; pendingPairing?: PendingPairing };
 export type LocalReset = { keyRef?: string };
-export type ConversationActivity = { preview: string; at: number; unread: Record<string, number>; lastContentSeq: number; attention?: Record<string, MessageAttention>; replies?: Record<string, BotReply>; workingReplies?: Record<string, number> };
+export type ConversationActivity = { preview: string; previewStatus?: ConversationPreviewStatus | null; at: number; unread: Record<string, number>; lastContentSeq: number; attention?: Record<string, MessageAttention>; replies?: Record<string, BotReply>; workingReplies?: Record<string, number> };
 export type SidebarLayout = "bots" | "conversations";
 export type Preferences = { sidebarLayout: SidebarLayout; sidebarGroupByHost: boolean; showDisconnectedBots: boolean; showTicketConversations: boolean; layoutDensity: LayoutDensity; theme: "system" | "light" | "dark"; palette: ColorPalette; monoAccent?: MonoAccent; locale: "zh" | "en"; fontSize: number; quietStart: string; quietEnd: string; showModelIcons: boolean; animatedAvatars: boolean; animations: boolean; linkPreviewStyle: LinkPreviewStyle };
 export const defaultPreferences: Preferences = { sidebarLayout: "bots", sidebarGroupByHost: false, showDisconnectedBots: false, showTicketConversations: false, layoutDensity: normalizeLayoutDensity(undefined), theme: DEFAULT_THEME, palette: DEFAULT_PALETTE, monoAccent: DEFAULT_MONO_ACCENT, locale: systemLocale(), fontSize: 14, quietStart: "", quietEnd: "", showModelIcons: true, animatedAvatars: true, animations: true, linkPreviewStyle: "card" };
@@ -1232,7 +1232,7 @@ export class ClientCache {
   async activity(): Promise<Record<string, ConversationActivity>> {
     const tx = (await this.db).transaction("activity"), keys = await tx.store.getAllKeys(), values = await tx.store.getAll();
     const result = Object.fromEntries(keys.map((key, i) => [key, values[i]!]));
-    const legacy = keys.filter((key) => result[key]!.attention === undefined || result[key]!.replies === undefined || result[key]!.workingReplies === undefined);
+    const legacy = keys.filter((key) => result[key]!.attention === undefined || result[key]!.replies === undefined || result[key]!.workingReplies === undefined || result[key]!.previewStatus === undefined && !!systemRunPreview(result[key]!.preview));
     if (legacy.length) {
       // One-time projection for an existing cache. Reread inside the write
       // transaction so sync in another tab cannot be overwritten by backfill.
@@ -1240,7 +1240,7 @@ export class ClientCache {
       // Recover only in-flight replies through the existing status index,
       // once for this batch. Do not reread completed history or its long bodies.
       const working = new Map<string, Cache["messages"]["value"][]>();
-      for (const message of await update.objectStore("messages").index("status").getAll("streaming")) {
+      for (const message of [...await update.objectStore("messages").index("status").getAll("streaming"), ...await update.objectStore("messages").index("status").getAll("pending")]) {
         const rows = working.get(message.conversationId) ?? [];
         rows.push(message); working.set(message.conversationId, rows);
       }
@@ -1265,6 +1265,17 @@ export class ClientCache {
       activity.workingReplies = {};
       for (const message of working ?? await tx.objectStore("messages").index("status").getAll("streaming")) {
         if (message.conversationId === conversationId) projectWorkingReply(activity, message, message.activityAt ?? message.createdAt);
+      }
+    }
+    if (activity.previewStatus === undefined && systemRunPreview(activity.preview)) {
+      // Backfill only an exact in-flight source event, never a completed reply
+      // or a look-alike user phrase. Avoid scanning historical message bodies.
+      activity.previewStatus = null;
+      const candidates = working ?? [...await tx.objectStore("messages").index("status").getAll("streaming"), ...await tx.objectStore("messages").index("status").getAll("pending")];
+      const source = candidates.find(message => message.conversationId === conversationId && message.activitySeq === activity.lastContentSeq);
+      if (source) {
+        const projection = projectConversationPreview(source, activity.lastContentSeq);
+        if (projection.preview === activity.preview) activity.previewStatus = projection.previewStatus;
       }
     }
     return activity;
@@ -1360,18 +1371,18 @@ export class ClientCache {
             oldQuestions.delete(message.id);
             if (message.status !== "deleted") {
               activity.at = Math.max(activity.at, contentAt ?? message.createdAt, message.createdAt);
-              if (contentSeq >= activity.lastContentSeq) { activity.preview = conversationBlocksPreview(message.blocks); activity.lastContentSeq = contentSeq; }
+              if (contentSeq >= activity.lastContentSeq) { Object.assign(activity, projectConversationPreview(message, contentSeq)); activity.lastContentSeq = contentSeq; }
               if (unreadSeq > state.readSeq) activity.unread[message.id] = unreadSeq;
             }
             staged = await staged.continue();
           }
           if (reprojectPreview) {
-            activity.preview = ""; activity.at = 0; activity.lastContentSeq = 0;
+            activity.preview = ""; activity.previewStatus = null; activity.at = 0; activity.lastContentSeq = 0;
             for (let item = await tx.objectStore("messages").index("conversation").openCursor(conversationId); item; item = await item.continue()) {
               const message = item.value;
               if (message.status === "deleted") continue;
               activity.at = Math.max(activity.at, message.activityAt ?? message.createdAt, message.createdAt);
-              if ((message.activitySeq ?? 0) >= activity.lastContentSeq) { activity.preview = conversationBlocksPreview(message.blocks); activity.lastContentSeq = message.activitySeq ?? 0; }
+              if ((message.activitySeq ?? 0) >= activity.lastContentSeq) { Object.assign(activity, projectConversationPreview(message, message.activitySeq ?? 0)); activity.lastContentSeq = message.activitySeq ?? 0; }
             }
           }
           for (const id of oldQuestions) await this.pruneQuestionDrafts(tx, id);
@@ -1409,7 +1420,7 @@ export class ClientCache {
           const activity = await this.projectedActivity(tx, event.conversationId);
           this.projectAttention(activity, message);
           projectReply(activity, message, Math.max(event.at, message.createdAt));
-          activity.preview = conversationBlocksPreview(message.blocks); activity.at = Math.max(activity.at, event.at, message.createdAt); activity.lastContentSeq = event.seq;
+          Object.assign(activity, projectConversationPreview(message, event.seq)); activity.at = Math.max(activity.at, event.at, message.createdAt); activity.lastContentSeq = event.seq;
           await tx.objectStore("activity").put(activity, event.conversationId);
         }
       }
@@ -1427,11 +1438,11 @@ export class ClientCache {
           this.projectAttention(activity, message);
           projectReply(activity, message, Math.max(event.at, message.createdAt));
           // Enriching immutable user messages must not replace a newer sidebar preview.
-          if (message.status !== "deleted" && (!old || message.authorType !== "user")) { activity.preview = conversationBlocksPreview(message.blocks); activity.at = Math.max(activity.at, event.at, message.createdAt); activity.lastContentSeq = event.seq; }
+          if (message.status !== "deleted" && (!old || message.authorType !== "user")) { Object.assign(activity, projectConversationPreview(message, event.seq)); activity.at = Math.max(activity.at, event.at, message.createdAt); activity.lastContentSeq = event.seq; }
           // Queue edits change user text while retaining the original activity
           // time. Refresh only the message currently represented by the preview.
           if (message.status !== "deleted" && old && message.authorType === "user" && old.activitySeq !== undefined && old.activitySeq === activity.lastContentSeq) {
-            activity.preview = conversationBlocksPreview(message.blocks);
+            Object.assign(activity, projectConversationPreview(message, activity.lastContentSeq));
           }
           if (message.authorType === "bot" && ["complete", "error"].includes(message.status) && (!old || old.status === "streaming" || old.status === "pending")) activity.unread[message.id] = event.seq;
           if (message.status === "deleted" && old?.status !== "deleted") {
@@ -1444,7 +1455,7 @@ export class ClientCache {
               const remaining = (await tx.objectStore("messages").index("conversation").getAll(event.conversationId)).filter(item => item.status !== "deleted");
               remaining.sort((a, b) => (b.activityAt ?? b.createdAt) - (a.activityAt ?? a.createdAt) || (b.activitySeq ?? 0) - (a.activitySeq ?? 0));
               const last = remaining[0];
-              activity.preview = last ? conversationBlocksPreview(last.blocks) : "";
+              Object.assign(activity, projectConversationPreview(last, last?.activitySeq ?? 0));
               activity.at = last?.activityAt ?? last?.createdAt ?? 0;
               activity.lastContentSeq = last?.activitySeq ?? 0;
             }

@@ -2535,6 +2535,7 @@
   "等待授权": "Awaiting approval",
   "等待回答": "Awaiting an answer",
   "正在停止，等待确认": "Stopping; awaiting confirmation",
+  "任务处理中": "Task is running",
   "正在交付结果": "Delivering results",
   "部分完成": "Partially completed",
   "已停止": "Stopped",

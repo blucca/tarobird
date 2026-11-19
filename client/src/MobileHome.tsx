@@ -220,7 +220,7 @@ const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
     if (visible && body.current) body.current.scrollTop = positions.current[tab];
   }, [visible, tab, query, filter, botScope?.hostId, botScope?.botId, positions]);
   const showTickets = useTicketConversationsVisible();
-  const rows = useMemo(() => buildMobileRows(hosts), [hosts, showTickets]);
+  const rows = useMemo(() => buildMobileRows(hosts), [hosts, showTickets, locale]);
   const botCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const row of rows) for (const id of row.conversation.botIds) {

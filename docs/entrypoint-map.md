@@ -4443,6 +4443,18 @@ browser `network-device-name`, `host-name-sync`, `device-settings-ux`.
 
 ## App native run presentation
 
+Conversation-list system previews: `client/src/conversation-preview.ts` projects an
+optional event-bound hint for validated foreground native-run cards, then
+translates the exact running/delivering producer labels at display time.
+`storage.ts` preserves the original summary and clears or replaces the hint on
+content updates, deletion and snapshot restore. Existing cache hints are
+recovered once from matching active source events through the status index;
+unverified strings and authored text are left intact. Desktop conversations,
+group topics and the mobile inbox share the display helper, with the mobile
+memo depending on locale. Reply bodies, search/copy/export and CLI behavior are
+unchanged. Regressions: `client-conversation-preview`, `run-presentation-ui`;
+browser `run-preview-language`, `settings-language`, `storage-memory`.
+
 Claude dialogue continuity: `client-protocol/background-task.ts`,
 `core/background-task-notice.ts`, `core/background-task-delivery.ts` and
 `client/BackgroundTaskReference.tsx` keep late reports linked to their original

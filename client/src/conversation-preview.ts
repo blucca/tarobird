@@ -1,6 +1,37 @@
-import { blocksText, type Block } from "../../src/client-protocol/index.js";
-import { isContextMaintenance, nativeRun } from "../../src/client-protocol/run.js";
+import { blocksText, type Block, type Message } from "../../src/client-protocol/index.js";
+import { isContextMaintenance, isRunActive, nativeRun } from "../../src/client-protocol/run.js";
 import { t } from "./i18n.js";
+
+export type ConversationPreviewStatus = { key: "running" | "delivering"; seq: number };
+type Preview = { preview: string; previewStatus?: ConversationPreviewStatus | null; lastContentSeq: number };
+
+/** Exact producer labels only. A matching string alone never proves provenance. */
+export function systemRunPreview(text: string): ConversationPreviewStatus["key"] | undefined {
+  if (text === "任务处理中" || text === "Task is running") return "running";
+  if (text === "正在交付结果" || text === "Delivering result") return "delivering";
+}
+
+/** Keep stored text intact and bind the presentation hint to this content event. */
+export function projectConversationPreview(message: Pick<Message, "blocks" | "authorType"> | undefined, seq: number): Pick<Preview, "preview" | "previewStatus"> {
+  const preview = message ? conversationBlocksPreview(message.blocks) : "";
+  const visible = message?.blocks.filter(block => block.type !== "steering" && !(block.type === "card" && block.extra?.promptQueue));
+  const block = visible?.length === 1 ? visible[0] : undefined;
+  const run = block?.type === "card" ? nativeRun(block) : undefined;
+  const key = systemRunPreview(preview);
+  const status = message?.authorType === "bot" && block?.type === "card" && block.summary?.trim() === preview && run && key
+    && (key === "delivering" ? run.phase === "delivering" || run.phase === "stopping" : isRunActive(run.phase) && run.phase !== "delivering");
+  return { preview, previewStatus: status ? { key, seq } : null };
+}
+
+/** Translate at render time so cached/offline lists follow language changes. */
+export function conversationActivityPreview(activity: Preview | undefined): string {
+  if (!activity) return "";
+  const status = activity.previewStatus;
+  if (status && status.seq === activity.lastContentSeq && status.key === systemRunPreview(activity.preview)) {
+    return status.key === "running" ? t("任务处理中") : t("正在交付结果");
+  }
+  return activity.preview;
+}
 
 /** Sidebar projection only. Card summaries must not replace the full text used
  * by search, copy, export, forwarding or the message itself. */

@@ -3,7 +3,7 @@ import type { Bot, HubConnection } from './connection.js';
 import type { ConversationActivity } from './storage.js';
 import { attentionTargets, type AttentionTarget } from './attention.js';
 import { agentSignal, type AgentSignal } from './agent-state.js';
-import { conversationPreview } from './conversation-preview.js';
+import { conversationPreview, conversationActivityPreview } from './conversation-preview.js';
 import { t } from './i18n.js';
 import { listedConversations } from './dispatcher.js';
 type Locale = 'zh' | 'en';
@@ -150,7 +150,7 @@ export function buildConversationRows(hosts: InboxHost[]): InboxRow[] {
           .filter((name): name is string => Boolean(name)),
         topicTitles: topics.map((topic) => topic.title),
         parentTitle: conversation.parentId ? host.conversations.find(parent => parent.id === conversation.parentId)?.title : undefined,
-        preview: latest ? conversationPreview(latest.preview) : '',
+        preview: latest ? conversationPreview(conversationActivityPreview(latest)) : '',
         previewTopic: latestTopic?.title,
         activityAt,
         sortAt: Math.max(activityAt, conversation.createdAt || 0),

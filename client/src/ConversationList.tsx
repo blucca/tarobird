@@ -20,7 +20,7 @@ import { useConnectionSelection } from "./connection-selection.js";
 import { createPortal } from "react-dom";
 import { t, useLocale } from "./i18n.js";
 import { ReferencePreview, useBotLabels } from "./BotReferences.js";
-import { conversationPreview } from "./conversation-preview.js";
+import { conversationPreview, conversationActivityPreview } from "./conversation-preview.js";
 import { Camera, ListChecks, Check, ChevronDown, ChevronRight, FolderInput, Hash, Plus, Pencil, Settings, MessageSquare, MessageSquarePlus, Plug, Activity, Pin, PinOff, Trash2, UsersRound } from "lucide-react";
 import type { Conversation } from "../../src/client-protocol/index.js";
 import type { Bot, HubConnection } from "./connection.js";
@@ -145,7 +145,7 @@ export function ConversationList({ connection, hostName, slice, showHostBadge = 
     // Nested rows show a preview only when there is one: the parent row already
     // carries the Bot's model/engine, so children do not repeat it (or "独立话题").
     const draftPreview = listDraftPreview(c, conversations, drafts, !!inbox || !!topicFolds.collapsed.has(c.id));
-    const detail = draftPreview ? <DraftPreviewText text={draftPreview}/> : inbox ? (inbox.preview ? <ReferencePreview text={inbox.previewTopic ? t("{0}：{1}", inbox.previewTopic, inbox.preview) : inbox.preview}/> : t("暂无消息")) : activity[c.id]?.preview ? <ReferencePreview text={conversationPreview(activity[c.id]!.preview)}/> : nested ? undefined : c.parentId ? t("独立话题") : c.type === "group" ? t("{0} 个话题 · {1} 个 Bot", children.length, c.botIds.length) : bot?.model || bot?.engine || "TaroBird";
+    const detail = draftPreview ? <DraftPreviewText text={draftPreview}/> : inbox ? (inbox.preview ? <ReferencePreview text={inbox.previewTopic ? t("{0}：{1}", inbox.previewTopic, inbox.preview) : inbox.preview}/> : t("暂无消息")) : activity[c.id]?.preview ? <ReferencePreview text={conversationPreview(conversationActivityPreview(activity[c.id]))}/> : nested ? undefined : c.parentId ? t("独立话题") : c.type === "group" ? t("{0} 个话题 · {1} 个 Bot", children.length, c.botIds.length) : bot?.model || bot?.engine || "TaroBird";
     // A folded ADHD group must still expose requests in its hidden topics.
     // Expanded/search results show each topic marker on its own row.
     const foldedTopics = selection && inbox && isGroup(c) && !filtered && !selection.topics.expanded(c.id);
