@@ -15,6 +15,10 @@ import type {
   ExternalSessionInfo,
 } from "../codex/adapter.js";
 import { findConflictingLockedChatId } from "../state/access-store.js";
+import type { EngineHistoryAnchor } from "../client-protocol/history.js";
+import { FileMutexTimeoutError } from "../state/file-mutex.js";
+import type { SessionRecord } from "../types.js";
+import { isLogicalSessionId } from "./logical-session.js";
 
 /** Native tool adapters may select a previous thread's tool schema. Keep the
  * Bot file reference in that turn too, without changing stable worker settings. */
@@ -66,8 +70,20 @@ export interface SessionManagerLike {
   getLockNamespace?(): Promise<string>;
   getOrCreateSession(scope: number | BridgeConversationScope): Promise<{ sessionId: string }>;
   getExistingSession?(scope: number | BridgeConversationScope): Promise<{ sessionId: string } | null>;
-  bindSession(scope: number | BridgeConversationScope, sessionId: string): Promise<void>;
+  /** `carry.resume` (#53 fork) sets the new record's workspace selection
+   * instead of keeping the destination's previous one. */
+  bindSession(scope: number | BridgeConversationScope, sessionId: string, carry?: { resume: SessionRecord["resume"] }): Promise<void>;
 }
+
+/** #53: a conversation lock or its session lock is held (a turn, command or
+ * another history operation). History operations never queue behind it. */
+export class HistoryOperationBusyError extends Error {
+  constructor() { super("busy"); this.name = "HistoryOperationBusyError"; }
+}
+/** Near-immediate: the file mutex has no try-lock, only a bounded wait. */
+const HISTORY_LOCK_WAIT_MS = 250;
+type HistoryScopeInput = { chatId: number; userId: number; chatType: string; conversationKey: string; locale?: Locale };
+type HistoryCapabilityResult = Awaited<ReturnType<NonNullable<CodexAdapter["historyCapability"]>>>;
 
 export interface BridgeConversationScope {
   chatId: number;
@@ -119,6 +135,12 @@ export interface BridgeAuthorizedMessageInput {
   onTurnLockWait?: (event: BridgeTurnLockWaitEvent) => void | Promise<void>;
   turnPoolWaitNotifyAfterMs?: number;
   onTurnPoolWait?: (event: TurnPoolWaitEvent) => void | Promise<void>;
+  /** #53: the Hub user message this run executes; engines that accept a
+   * client message id receive it on the run's first native input only. */
+  sourceMessageId?: string;
+  /** #53: each engine turn of this run, for the history ledger. Consumed here:
+   * a `turn_anchor` event never reaches onEngineEvent, cards or the Hub. */
+  onTurnAnchor?: (anchor: { sessionId: string; turnId?: string; endSeq?: number }) => void | Promise<void>;
 }
 
 export interface BridgeGroupJoinInput {
@@ -473,6 +495,12 @@ export class Bridge {
     // does). Persist that confirmation too, otherwise the conversation stays
     // absent from session state, backups and runtime controls despite real turns.
     const handleEngineEvent = async (event: EngineStreamEvent): Promise<void> => {
+      if (event.type === "turn_anchor") {
+        // Ledger bookkeeping must never affect the turn or reach any observer.
+        try { await input.onTurnAnchor?.({ sessionId: event.sessionId, ...(event.turnId ? { turnId: event.turnId } : {}), ...(event.endSeq !== undefined ? { endSeq: event.endSeq } : {}) }); }
+        catch { /* best effort */ }
+        return;
+      }
       if (event.type === "subagent_activity") {
         if (event.kind === "completed") unfinishedAgents.delete(event.agentId);
         else unfinishedAgents.add(event.agentId); // An interrupt request alone is not a terminal receipt.
@@ -526,6 +554,9 @@ export class Bridge {
           const botGuidance = this.options.botInstructionsPath ? botInstructionsGuidance(this.options.botInstructionsPath) : undefined;
           const adapterResponse = await this.adapter.sendUserMessage(nativeSessionId, {
             inputOwnerKey: scopeLockId,
+            // Only the original input carries the Hub id; a replay or a
+            // continuation is another native turn of the same run.
+            ...(input.sourceMessageId && !receipt && !continuation ? { sourceMessageId: input.sourceMessageId } : {}),
             ...(input.reviewAdmission && !receipt && !continuation ? { reviewAdmission: input.reviewAdmission, nativeInput: input.nativeInput } : {}),
             text,
             files,
@@ -861,6 +892,79 @@ export class Bridge {
           : side.send(current);
       },
     };
+  }
+
+  /** #53: which history operations the engine adapter implements at all. */
+  historySupport(): { rewind: boolean; fork: boolean } {
+    const capability = typeof this.adapter.historyCapability === "function";
+    return { rewind: capability && typeof this.adapter.rewindSession === "function", fork: capability && typeof this.adapter.forkSession === "function" };
+  }
+
+  /** The conversation's bound engine session. A logical id is not one yet. */
+  async historySession(input: HistoryScopeInput): Promise<{ sessionId: string } | null> {
+    if (!this.sessionManager.getExistingSession) return null;
+    const session = await this.sessionManager.getExistingSession(this.conversationScope(input));
+    return session && !isLogicalSessionId(session.sessionId) ? { sessionId: session.sessionId } : null;
+  }
+
+  /** #53: both locks in the order of an ordinary turn — the conversation lock
+   * (also taken by /reset), then the bound session's lock (other conversations
+   * attached to the same session) — without queueing behind either. */
+  async withHistoryLocks<T>(input: HistoryScopeInput, task: (session: { sessionId: string } | null) => Promise<T>): Promise<T> {
+    if ((await this.checkAccess(input)).kind !== "allow") throw new Error("unsupported");
+    const scopeLockId = bridgeConversationLockId(this.conversationScope(input), await this.sessionManager.getLockNamespace?.());
+    const held = async <R>(lockId: string, work: () => Promise<R>): Promise<R> => {
+      try { return await withBridgeTurnLock(lockId, work, { waitTimeoutMs: HISTORY_LOCK_WAIT_MS }); }
+      catch (error) { throw error instanceof FileMutexTimeoutError ? new HistoryOperationBusyError() : error; }
+    };
+    return await held(scopeLockId, async () => {
+      const session = await this.historySession(input);
+      if (!session) return await task(null);
+      // Another conversation's first turn may drive this session in-process
+      // while still under its provisional id's lock.
+      const owner = this.sessionTurnOwner(session.sessionId);
+      if (owner && owner.scopeLockId !== scopeLockId) throw new HistoryOperationBusyError();
+      return await held(session.sessionId, async () => {
+        if ((await this.historySession(input))?.sessionId !== session.sessionId) throw new HistoryOperationBusyError();
+        return await task(session);
+      });
+    });
+  }
+
+  /** Without `sessionId`: what a new session of this conversation would support. */
+  async historyCapability(input: HistoryScopeInput & { sessionId?: string; workspaceOverride?: string }): Promise<HistoryCapabilityResult> {
+    if (!this.adapter.historyCapability || (await this.checkAccess(input)).kind !== "allow") return { rewind: "none", fork: "none", reason: "unsupported" };
+    // A logical id is never sent to the engine; adapters answer it statically.
+    const sessionId = input.sessionId ?? (await this.sessionManager.getOrCreateSession(this.conversationScope(input))).sessionId;
+    return await this.adapter.historyCapability(sessionId, { workspaceOverride: input.workspaceOverride });
+  }
+
+  /** Call inside withHistoryLocks with the session it supplied. */
+  async rewindHistory(input: HistoryScopeInput & { sessionId: string; anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }> {
+    if (!this.adapter.rewindSession || (await this.checkAccess(input)).kind !== "allow") throw new Error("unsupported");
+    return await this.adapter.rewindSession(input.sessionId, { anchor: input.anchor, workspaceOverride: input.workspaceOverride, abortSignal: input.abortSignal });
+  }
+
+  /** Call inside withHistoryLocks with the session it supplied. */
+  async forkHistory(input: HistoryScopeInput & { sessionId: string; through?: EngineHistoryAnchor; workspaceOverride?: string; appPlatformTools?: AppPlatformTools; abortSignal?: AbortSignal }): Promise<{ sessionId: string }> {
+    if (!this.adapter.forkSession || (await this.checkAccess(input)).kind !== "allow") throw new Error("unsupported");
+    return await this.adapter.forkSession(input.sessionId, { ...(input.through ? { through: input.through } : {}), workspaceOverride: input.workspaceOverride,
+      ...(input.appPlatformTools ? { appPlatformTools: input.appPlatformTools } : {}), abortSignal: input.abortSignal });
+  }
+
+  async resolveHistoryAnchor(input: HistoryScopeInput & { sessionId: string; target: { sourceMessageId: string; text: string; startedAt?: number }; next?: { sourceMessageId: string; text: string; startedAt?: number } }): Promise<EngineHistoryAnchor | undefined> {
+    if (!this.adapter.resolveHistoryAnchor || (await this.checkAccess(input)).kind !== "allow") return undefined;
+    return await this.adapter.resolveHistoryAnchor(input.sessionId, { ...input.target, ...(input.next ? { next: input.next } : {}) });
+  }
+
+  /** The forked session becomes the new conversation's first binding, written
+   * directly: `conversation.bind` only selects sessions already recorded here.
+   * Never replaces an existing binding of that conversation. */
+  async bindForkedHistorySession(input: HistoryScopeInput, sessionId: string, carry?: { resume: SessionRecord["resume"] }): Promise<void> {
+    if ((await this.checkAccess(input)).kind !== "allow") throw new Error("unsupported");
+    const scope = this.conversationScope(input);
+    if (await this.sessionManager.getExistingSession?.(scope)) throw new Error("history_target_bound");
+    await this.sessionManager.bindSession(scope, sessionId, carry);
   }
 
   async recoverSession(input: { chatId: number; conversationKey: string; token: string; isCurrentSession?: () => Promise<boolean> }): Promise<EngineTaskControlResult> {

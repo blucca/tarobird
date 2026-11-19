@@ -22,6 +22,12 @@ import type { BridgeTurnLockWaitEvent } from "../runtime/turn-lock.js";
 import type { TurnPoolWaitEvent } from "../runtime/turn-pool.js";
 import type { CoreChatMode } from "./message-normalizer.js";
 import type { AppDeliveryReceipt, AppDeliveryCache } from "./app-delivery.js";
+import type { EngineHistoryAnchor } from "../client-protocol/history.js";
+import type { SessionRecord } from "../types.js";
+
+/** #53 history operations run on one conversation of an authenticated surface. */
+export type CoreHistoryScope = { chatId: number; userId: number; chatType: string; conversationKey: string; locale?: "en" | "zh" };
+export type CoreHistoryRunHint = { sourceMessageId: string; text: string; startedAt?: number };
 
 export interface CoreSendOptions {
   replyTo?: string;
@@ -165,7 +171,21 @@ export interface CoreBridgeLike {
     onTurnLockWait?: (event: BridgeTurnLockWaitEvent) => void | Promise<void>;
     turnPoolWaitNotifyAfterMs?: number;
     onTurnPoolWait?: (event: TurnPoolWaitEvent) => void | Promise<void>;
+    /** #53: the Hub user message this ordinary run executes. */
+    sourceMessageId?: string;
+    /** #53: each engine turn of this run; consumed by the Bridge, never an engine event. */
+    onTurnAnchor?: (anchor: { sessionId: string; turnId?: string; endSeq?: number }) => void | Promise<void>;
   }): Promise<{ text: string; nativeGoal?: ClaudeNativeGoalReceipt; appDeliveries?: AppDeliveryReceipt[]; usage?: { inputTokens: number; outputTokens: number; cachedTokens?: number; costUsd?: number } }>;
+  /** #53: adapter support, the bound session and the operations. Absent = none. */
+  historySupport?(): { rewind: boolean; fork: boolean };
+  historySession?(input: CoreHistoryScope): Promise<{ sessionId: string } | null>;
+  /** Throws a busy error instead of waiting when either lock is held. */
+  withHistoryLocks?<T>(input: CoreHistoryScope, task: (session: { sessionId: string } | null) => Promise<T>): Promise<T>;
+  historyCapability?(input: CoreHistoryScope & { sessionId?: string; workspaceOverride?: string }): Promise<{ rewind: "turn" | "none"; fork: "turn" | "head" | "none"; reason?: "legacy_history" | "external_session" | "unsupported" }>;
+  rewindHistory?(input: CoreHistoryScope & { sessionId: string; anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
+  forkHistory?(input: CoreHistoryScope & { sessionId: string; through?: EngineHistoryAnchor; workspaceOverride?: string; appPlatformTools?: AppPlatformTools; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
+  resolveHistoryAnchor?(input: CoreHistoryScope & { sessionId: string; target: CoreHistoryRunHint; next?: CoreHistoryRunHint }): Promise<EngineHistoryAnchor | undefined>;
+  bindForkedHistorySession?(input: CoreHistoryScope, sessionId: string, carry?: { resume: SessionRecord["resume"] }): Promise<void>;
   validateCodexThread?(
     threadId: string,
     input?: { workspaceOverride?: string },

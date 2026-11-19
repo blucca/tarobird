@@ -37,11 +37,14 @@ export async function withBridgeTurnLock<T>(
     signal?: AbortSignal;
     waitNotifyAfterMs?: number;
     onWait?: (event: BridgeTurnLockWaitEvent) => void | Promise<void>;
+    /** Bounded wait; a held lock then rejects with FileMutexTimeoutError. */
+    waitTimeoutMs?: number;
   } = {},
 ): Promise<T> {
   return await withFileMutex(resolveBridgeTurnLockPath(sessionId), task, {
     staleLockMs: TURN_LOCK_STALE_MS,
     signal: options.signal,
+    ...(options.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
     waitNotifyAfterMs: options.waitNotifyAfterMs ?? TURN_LOCK_WAIT_NOTIFY_AFTER_MS,
     onWait: options.onWait
       ? async (event) => await options.onWait?.(toBridgeTurnLockWaitEvent(sessionId, event))
