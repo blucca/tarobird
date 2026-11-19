@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { EngineQuotaEntry, EngineQuotaView, EngineQuotaWindow } from "../../src/client-protocol/engine-quota.js";
 import { engineQuotaViewSchema } from "../../src/client-protocol/engine-quota.js";
 import { setLocale } from "./i18n.js";
-import { QUOTA_STALE_AFTER_MS, quotaBalanceText, quotaDueResets, quotaEntryChip, quotaEntryDetail, quotaEntryHasData, quotaEntryStale, quotaNextReset, quotaReading, quotaReset, quotaResetKey, quotaSince, quotaUpdatedText, quotaWindowTitle } from "./engine-quota.js";
+import { QUOTA_STALE_AFTER_MS, quotaWindowGroups, quotaBalanceText, quotaDueResets, quotaEntryChip, quotaEntryDetail, quotaEntryHasData, quotaEntryStale, quotaNextReset, quotaReading, quotaReset, quotaResetKey, quotaSince, quotaUpdatedText, quotaWindowTitle } from "./engine-quota.js";
 
 // Synthetic readings only. Times are built in the runner's own time zone so the
 // "today / tomorrow / weekday" labels do not depend on where the suite runs.
@@ -48,6 +48,37 @@ describe("window names", () => {
     english();
     expect(quotaWindowTitle(window({ windowMinutes: 300 }))).toEqual({ title: "5-hour limit" });
     expect(quotaWindowTitle(window({ windowMinutes: 10_080 }))).toEqual({ title: "7-day limit" });
+  });
+});
+
+describe("windows that share a pool name", () => {
+  const models = ["gemini-pro-latest", "gemini-flash-latest", "gemini-flash-lite-latest"];
+  it("sit under that name once, shorter window first, and are never merged into one figure", () => {
+    const groups = quotaWindowGroups([
+      window({ id: "gemini:week", label: "Gemini Models", windowMinutes: 10_080, usedPercent: 64, models }),
+      window({ id: "gemini:5h", label: "Gemini Models", windowMinutes: 300, usedPercent: 100, models }),
+      window({ id: "other:week", label: "Claude and GPT models", windowMinutes: 10_080, usedPercent: 22, models: ["claude-sonnet-latest"] }),
+      window({ id: "other:5h", label: "Claude and GPT models", windowMinutes: 300, usedPercent: 35, models: ["claude-sonnet-latest"] }),
+      window({ id: "argon:week", label: "Gemini 4 Argon", windowMinutes: 10_080, usedPercent: 8 }),
+    ]);
+    expect(groups.map(group => [group.heading, group.windows.map(item => item.id)])).toEqual([
+      ["Gemini Models", ["gemini:5h", "gemini:week"]], ["Claude and GPT models", ["other:5h", "other:week"]], ["Gemini 4 Argon", ["argon:week"]]]);
+    expect(groups[0]!.models).toEqual(models);
+    expect(groups[0]!.windows.map(item => item.usedPercent)).toEqual([100, 64]);
+    expect(groups[2]!.models).toBeUndefined();
+  });
+  it("leaves unnamed windows as they are and keeps the Host's order without stated lengths", () => {
+    expect(quotaWindowGroups([window({ id: "primary", windowMinutes: 300 }), window({ id: "secondary", windowMinutes: 10_080 })]))
+      .toEqual([{ key: "", windows: [window({ id: "primary", windowMinutes: 300 }), window({ id: "secondary", windowMinutes: 10_080 })] }]);
+    expect(quotaWindowGroups([window({ id: "b", label: "Pool" }), window({ id: "a", label: "Pool", windowMinutes: 300 })])[0]!.windows.map(item => item.id)).toEqual(["b", "a"]);
+    expect(quotaWindowGroups([])).toEqual([]);
+  });
+  it("states models per window when the group's windows differ, and keeps a lone unnamed-length pool's own title", () => {
+    const mixed = quotaWindowGroups([window({ id: "a", label: "Pool", windowMinutes: 300, models: ["one"] }), window({ id: "b", label: "Pool", windowMinutes: 10_080, models: ["two"] })]);
+    expect(mixed[0]).toMatchObject({ heading: "Pool" }); expect(mixed[0]!.models).toBeUndefined();
+    const lone = quotaWindowGroups([window({ id: "pro", label: "Gemini Pro models", models: ["gemini-pro-latest"] })]);
+    expect(lone[0]!.heading).toBeUndefined(); expect(lone[0]!.models).toBeUndefined();
+    expect(quotaWindowTitle(lone[0]!.windows[0]!)).toEqual({ title: "Gemini Pro models", detail: undefined });
   });
 });
 

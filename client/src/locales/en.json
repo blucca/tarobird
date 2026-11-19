@@ -5325,5 +5325,6 @@
   "这台主机还没有可显示的引擎。": "No engines to show on this host yet.",
   "{0} 分钟前": "{0} min ago",
   "{0} 小时前": "{0}h ago",
-  "{0} 天前": "{0}d ago"
+  "{0} 天前": "{0}d ago",
+  "适用 {0} 个模型": "Covers {0} models"
 }

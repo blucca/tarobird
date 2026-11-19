@@ -48,6 +48,17 @@
 .quota-entry-body { grid-area: body; display: grid; gap: 12px; min-width: 0; }
 .engine-quota .quota-detail { margin: 0; font-size: 12.5px; line-height: 1.6; color: var(--grey); }
 
+/* Windows that share an upstream pool name sit under that name once. */
+.quota-groups { display: grid; gap: 14px; min-width: 0; }
+.quota-group { display: grid; gap: 8px; min-width: 0; }
+.quota-group + .quota-group { padding-top: 14px; border-top: 1px solid var(--border); }
+.engine-quota .quota-group-name { margin: 0; font-size: 12.5px; font-weight: 600; line-height: 1.5; letter-spacing: 0; color: var(--text); overflow-wrap: anywhere; }
+/* The group's name leads; the models it covers follow on the same line when they fit. */
+.quota-group-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 2px 12px; min-width: 0; }
+.quota-group-head .quota-models[open] { flex: 1 0 100%; }
+/* A balance belongs to the whole login, not to the last named group above it. */
+.quota-groups:has(.quota-group-head) + .quota-balances { padding-top: 12px; border-top: 1px solid var(--border); }
+
 /* Windows: name and figure, the bar, then when it resets. */
 .quota-windows { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; margin: 0; padding: 0; list-style: none; }
 .quota-window { --quota-tone: var(--data-accent, var(--accent)); --quota-track: var(--data-accent-soft, var(--accent-soft)); display: grid; align-content: start; gap: 6px; min-width: 0; }
@@ -66,11 +77,11 @@
 .quota-window[data-tone=danger] .quota-meter span { display: none; }
 @keyframes quota-fill { from { width: 0; min-width: 0; } }
 /* Re-reading after a reset: the track waits, it never fills by itself. */
-.quota-window-notes { display: grid; gap: 4px; min-width: 0; }
+.quota-window-notes { display: grid; align-content: start; gap: 4px; min-width: 0; }
 .quota-window-notes:empty { display: none; }
 .quota-window[data-due] .quota-meter { background: repeating-linear-gradient(-45deg, var(--surface-alt) 0 6px, var(--surface) 6px 12px); }
 /* When it resets: the countdown leads, the clock time sits under the figure. */
-.engine-quota .quota-window-reset { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 12px; margin: 0; font-size: 12px; line-height: 1.5; color: var(--muted); font-variant-numeric: tabular-nums; }
+.engine-quota .quota-window-reset { display: flex; flex-wrap: wrap; align-content: flex-start; justify-content: space-between; gap: 0 12px; margin: 0; font-size: 12px; line-height: 1.5; color: var(--muted); font-variant-numeric: tabular-nums; }
 .engine-quota .quota-window-models { margin: 0; font-size: 11.5px; line-height: 1.5; color: var(--muted); overflow-wrap: anywhere; }
 
 /* Balances keep the upstream's own unit and are never added up. */
@@ -87,13 +98,15 @@
 .quota-entry-foot { grid-area: foot; display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 14px; min-width: 0; font-size: 12px; line-height: 1.6; color: var(--muted); }
 .quota-entry-foot:empty, .quota-entry-status:empty { display: none; }
 .quota-bots-one { min-width: 0; overflow-wrap: anywhere; }
-.quota-bots { min-width: 0; }
-.quota-bots summary { display: inline-flex; align-items: center; gap: 3px; margin-left: -3px; padding-right: 4px; border-radius: var(--radius-xs); cursor: pointer; list-style: none; color: var(--grey); }
-.quota-bots summary::-webkit-details-marker { display: none; }
-.quota-bots summary svg { flex: none; transition: transform var(--t-fast) var(--ease); }
-.quota-bots[open] summary svg { transform: rotate(90deg); }
-.quota-bots ul { display: flex; flex-wrap: wrap; gap: 4px 6px; margin: 6px 0 2px; padding: 0; list-style: none; }
-.quota-bots li { max-width: 100%; padding: 0 7px; border-radius: var(--radius-xs); background: var(--surface); color: var(--grey); font-size: 11.5px; line-height: 20px; overflow-wrap: anywhere; }
+/* Folded lists: the Bots sharing a login, a longer list of models. */
+.quota-more { min-width: 0; font-size: 12px; line-height: 1.6; color: var(--muted); }
+.quota-more summary { display: inline-flex; align-items: center; gap: 3px; margin-left: -3px; padding-right: 4px; border-radius: var(--radius-xs); cursor: pointer; list-style: none; color: var(--grey); }
+.quota-models summary { color: var(--muted); }
+.quota-more summary::-webkit-details-marker { display: none; }
+.quota-more summary svg { flex: none; transition: transform var(--t-fast) var(--ease); }
+.quota-more[open] summary svg { transform: rotate(90deg); }
+.quota-more ul { display: flex; flex-wrap: wrap; gap: 4px 6px; margin: 6px 0 2px; padding: 0; list-style: none; }
+.quota-more li { max-width: 100%; padding: 0 7px; border-radius: var(--radius-xs); background: var(--surface); color: var(--grey); font-size: 11.5px; line-height: 20px; overflow-wrap: anywhere; }
 .quota-updated { grid-area: updated; font-size: 12px; line-height: 1.6; color: var(--muted); white-space: nowrap; }
 .quota-guide { color: var(--grey); text-decoration: underline; text-decoration-color: var(--border-strong, var(--border)); text-underline-offset: 3px; }
 .quota-guide svg { margin-left: 2px; vertical-align: -2px; }
@@ -138,7 +151,10 @@
   .quota-balances dd { font-size: 16px; }
   .engine-quota .quota-detail { font-size: 13.5px; }
   .engine-quota .quota-note { padding: 10px 14px; border-radius: var(--radius-xl); font-size: 13px; }
-  .quota-bots summary { min-height: 32px; }
+  .quota-more summary { min-height: 32px; }
+  .quota-more { font-size: 12.5px; }
+  .engine-quota .quota-group-name { font-size: 14px; }
+  .quota-group-head { align-items: center; }
   .quota-guide { display: inline-block; padding: 6px 0; }
   .engine-quota .quota-footnote { margin: 16px 4px 0; font-size: 12.5px; }
 }
@@ -156,7 +172,7 @@
 
 @media (prefers-reduced-motion: reduce) {
   .quota-meter span { animation: none; transition: none; }
-  .quota-bots summary svg { transition: none; }
+  .quota-more summary svg { transition: none; }
 }
 @media (forced-colors: active) {
   .quota-meter { border: 1px solid CanvasText; }

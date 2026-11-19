@@ -46,6 +46,30 @@ export function quotaWindowTitle(window: EngineQuotaWindow): { title: string; de
   return { title: duration ?? t("额度") };
 }
 
+export type QuotaWindowGroup = {
+  key: string;
+  /** Shown once above the group's windows; they are then named by their length. */
+  heading?: string;
+  /** Models every window of the group covers, stated once for the group. */
+  models?: string[];
+  windows: EngineQuotaWindow[];
+};
+/** Windows that carry the same upstream pool name (a model group's weekly and
+ * five-hour windows) sit under that name once. They stay separate rows and are
+ * never added up. Groups keep the Host's order; inside a group the shorter
+ * window comes first when every window states its length. */
+export function quotaWindowGroups(windows: readonly EngineQuotaWindow[]): QuotaWindowGroup[] {
+  const groups = new Map<string, EngineQuotaWindow[]>();
+  for (const window of windows) { const key = window.label ?? ""; groups.set(key, [...(groups.get(key) ?? []), window]); }
+  return [...groups].map(([label, members]) => {
+    const ordered = members.every(window => window.windowMinutes) ? [...members].sort((a, b) => a.windowMinutes! - b.windowMinutes!) : members;
+    const lists = ordered.map(window => (window.models ?? []).join("\n")), shared = !!lists[0] && lists.every(list => list === lists[0]);
+    // A lone named window without a length keeps its name as its own title.
+    const heading = label && (ordered.length > 1 || !!ordered[0]!.windowMinutes) ? label : undefined;
+    return { key: label, ...(heading ? { heading } : {}), ...(shared && heading ? { models: ordered[0]!.models! } : {}), windows: ordered };
+  });
+}
+
 const intlLocale = (locale: string) => locale === "en" ? "en" : "zh-CN";
 const dayStart = (ms: number) => { const date = new Date(ms); date.setHours(0, 0, 0, 0); return date.getTime(); };
 

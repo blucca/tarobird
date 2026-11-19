@@ -9,7 +9,7 @@ import { RuntimeHostContext } from "./RuntimeHost.js";
 import { HubHttpError } from "./http-error.js";
 import { timeoutSignal } from "./abort-signals.js";
 import { t, useLocale } from "./i18n.js";
-import { engineQuotaBrands, engineQuotaNames, quotaBalanceText, quotaDueResets, quotaEntryChip, quotaEntryDetail, quotaEntryHasData, quotaEntryStale, quotaExactTime, quotaNextReset, quotaReading, quotaReset, quotaResetKey, quotaSince, quotaUpdatedText, quotaWindowTitle } from "./engine-quota.js";
+import { engineQuotaBrands, engineQuotaNames, quotaBalanceText, quotaDueResets, quotaEntryChip, quotaEntryDetail, quotaEntryHasData, quotaEntryStale, quotaExactTime, quotaNextReset, quotaReading, quotaReset, quotaResetKey, quotaSince, quotaUpdatedText, quotaWindowDuration, quotaWindowGroups, quotaWindowTitle } from "./engine-quota.js";
 import openai from "./assets/model-brands/openai.svg";
 import claude from "./assets/model-brands/claude.svg";
 import gemini from "./assets/model-brands/gemini.svg";
@@ -85,7 +85,7 @@ function useHostQuota(connection: HubConnection, active: boolean, manual: number
     const current = generation.current, token = Symbol(); flight.current = token; setBusy(true); lastAttempt.current = Date.now();
     try {
       const view = engineQuotaViewSchema.parse(await connection.http(kind === "refresh" ? "/api/engines/quota/refresh" : "/api/engines/quota",
-        kind === "refresh" ? { method: "POST", signal: timeoutSignal(20_000) } : { signal: timeoutSignal(15_000) }));
+        kind === "refresh" ? { method: "POST", body: "{}", signal: timeoutSignal(20_000) } : { signal: timeoutSignal(15_000) }));
       if (current !== generation.current) return;
       const next = { view, at: Date.now() }; lastReadings.set(scope, next); setSaved(next); setFailure(undefined); setNow(next.at);
     } catch (cause) {
@@ -154,8 +154,16 @@ function withFigure(text: string, figure: ReactNode): ReactNode {
   return <>{before}{figure}{after}</>;
 }
 
-function QuotaWindowRow({ entry, window, hostNow, locale, rereading }: { entry: EngineQuotaEntry; window: EngineQuotaWindow; hostNow: number; locale: string; rereading: boolean }) {
-  const reading = quotaReading(window), reset = quotaReset(window.resetsAt, hostNow, locale), name = quotaWindowTitle(window);
+/** Two names read inline; a longer list folds behind its count. */
+function QuotaModels({ models, locale }: { models: readonly string[]; locale: string }) {
+  if (!models.length) return null;
+  if (models.length <= 2) return <p className="quota-window-models">{t("适用模型：{0}", models.join(locale === "en" ? ", " : "、"))}</p>;
+  return <details className="quota-more quota-models"><summary data-disclosure-icon><ChevronRight size={14} aria-hidden="true"/>{t("适用 {0} 个模型", models.length)}</summary><ul>{models.map((model, index) => <li key={`${index}:${model}`}>{model}</li>)}</ul></details>;
+}
+
+function QuotaWindowRow({ entry, window, hostNow, locale, rereading, grouped, groupModels }: { entry: EngineQuotaEntry; window: EngineQuotaWindow; hostNow: number; locale: string; rereading: boolean; /** Under a group heading: named by its length only. */ grouped: boolean; /** The group already states the models. */ groupModels: boolean }) {
+  const reading = quotaReading(window), reset = quotaReset(window.resetsAt, hostNow, locale);
+  const name = grouped ? { title: quotaWindowDuration(window.windowMinutes) ?? t("额度"), detail: undefined } : quotaWindowTitle(window);
   // Past its reset the old figure is no longer the pool's state; show neither it nor a full bar.
   const due = reset.state === "due", figure = reading.known && !due;
   const tone = !figure ? "none" : reading.tone;
@@ -169,7 +177,7 @@ function QuotaWindowRow({ entry, window, hostNow, locale, rereading }: { entry: 
       {reset.state === "future" && <p className="quota-window-reset"><time dateTime={reset.iso} title={reset.full}>{reset.relative}</time><span>{reset.exact}</span></p>}
       {due && <p className="quota-window-reset" role="status">{rereading ? t("已到重置时间，正在重新读取…") : t("已到重置时间，等待新数据。")}</p>}
       {!reading.known && !due && <p className="quota-window-reset">{t("上游没有提供用量。")}</p>}
-      {!!window.models?.length && <p className="quota-window-models">{t("适用模型：{0}", window.models.join(locale === "en" ? ", " : "、"))}</p>}
+      {!groupModels && !!window.models?.length && <QuotaModels models={window.models} locale={locale}/>}
     </div>
   </li>;
 }
@@ -191,12 +199,15 @@ function QuotaEntryCard({ entry, hostNow, locale, offline, live, busy, reread }:
     <div className="quota-entry-body">
       {detail && <p className="quota-detail">{detail}</p>}
       {stale && entry.status !== "error" && <p className="quota-detail">{entry.source === "event" ? t("这是较早的读数，下一次对话后更新。") : t("这是较早的读数，可点刷新重新读取。")}</p>}
-      {!!entry.windows.length && <ul className="quota-windows">{entry.windows.map(window => <QuotaWindowRow key={window.id} entry={entry} window={window} hostNow={hostNow} locale={locale} rereading={live && (busy || !reread.has(quotaResetKey(entry, window)))}/>)}</ul>}
+      {!!entry.windows.length && <div className="quota-groups">{quotaWindowGroups(entry.windows).map(group => <section className="quota-group" key={group.key} aria-label={group.heading}>
+        {group.heading && <div className="quota-group-head"><h5 className="quota-group-name">{group.heading}</h5>{group.models && <QuotaModels models={group.models} locale={locale}/>}</div>}
+        <ul className="quota-windows">{group.windows.map(window => <QuotaWindowRow key={window.id} entry={entry} window={window} hostNow={hostNow} locale={locale} grouped={!!group.heading} groupModels={!!group.models} rereading={live && (busy || !reread.has(quotaResetKey(entry, window)))}/>)}</ul>
+      </section>)}</div>}
       {!!entry.balances.length && <dl className="quota-balances">{entry.balances.map(balance => <div key={balance.id}><dt>{balance.label ?? t("余额")}</dt><dd>{quotaBalanceText(balance)}</dd></div>)}</dl>}
     </div>
     <footer className="quota-entry-foot">
       {entry.bots.length === 1 && <span className="quota-bots-one">{t("Bot：{0}", entry.bots[0]!.name)}</span>}
-      {entry.bots.length > 1 && <details className="quota-bots"><summary data-disclosure-icon><ChevronRight size={14} aria-hidden="true"/>{t("{0} 个 Bot 共用", entry.bots.length)}</summary><ul>{entry.bots.map(bot => <li key={bot.id}>{bot.name}</li>)}</ul></details>}
+      {entry.bots.length > 1 && <details className="quota-more quota-bots"><summary data-disclosure-icon><ChevronRight size={14} aria-hidden="true"/>{t("{0} 个 Bot 共用", entry.bots.length)}</summary><ul>{entry.bots.map(bot => <li key={bot.id}>{bot.name}</li>)}</ul></details>}
       {entry.guideUrl && <a className="quota-guide" href={entry.guideUrl} target="_blank" rel="noopener noreferrer">{t("去官方页面查看")}<ArrowUpRight size={13} aria-hidden="true"/></a>}
     </footer>
   </article>;
