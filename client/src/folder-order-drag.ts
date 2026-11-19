@@ -2,19 +2,31 @@ import { useEffect, useRef, type RefObject } from 'react';
 
 /** Capture on the stable list, not the reordered row. Only the handle owns
  * touch gestures; names and other list space keep normal scrolling. */
-export function useFolderOrderDrag(root: RefObject<HTMLOListElement | null>, order: (string | null)[], enabled: boolean, change: (order: (string | null)[]) => void, announce: (order: (string | null)[], index: number) => void, sameSection: (a: string | null, b: string | null) => boolean) {
-  const latest = useRef({ order, change, announce, sameSection }); latest.current = { order, change, announce, sameSection };
+export function useFolderOrderDrag<T extends string | null = string | null>(
+  root: RefObject<HTMLOListElement | null>,
+  order: T[],
+  enabled: boolean,
+  change: (order: T[]) => void,
+  announce: (order: T[], index: number) => void,
+  sameSection: (a: T, b: T) => boolean,
+  decode: (raw: string) => T = (raw => (raw || null) as T),
+) {
+  const latest = useRef({ order, change, announce, sameSection, decode });
+  latest.current = { order, change, announce, sameSection, decode };
   useEffect(() => {
     const list = root.current;
     if (!enabled || !list) return;
     let frame = 0;
-    let drag: { pointerId: number; folderId: string | null; y: number; startY: number; moved: boolean; offset: number; before: (string | null)[]; row: HTMLElement } | undefined;
+    let drag: { pointerId: number; itemId: T; y: number; startY: number; moved: boolean; offset: number; before: T[]; row: HTMLElement } | undefined;
     const stop = (cancel = false) => {
       const previous = drag; if (!previous) return;
       drag = undefined; cancelAnimationFrame(frame); delete list.dataset.dragging;
       delete previous.row.dataset.dragging;
       if (cancel) latest.current.change(previous.before);
-      else latest.current.announce(latest.current.order, latest.current.order.indexOf(previous.folderId));
+      else {
+        const index = latest.current.order.indexOf(previous.itemId);
+        if (index >= 0) latest.current.announce(latest.current.order, index);
+      }
       if (list.hasPointerCapture(previous.pointerId)) list.releasePointerCapture(previous.pointerId);
     };
     const tick = () => {
@@ -26,14 +38,14 @@ export function useFolderOrderDrag(root: RefObject<HTMLOListElement | null>, ord
       const distance = drag.y < bounds.top + 32 ? -8 : drag.y > bounds.bottom - 32 ? 8 : 0;
       if (distance) list.scrollTop += distance;
       const rows = [...list.querySelectorAll<HTMLElement>('[data-order-id]')];
-      let target = 0, nearest = Infinity;
+      let target = -1, nearest = Infinity;
       rows.forEach((row, index) => {
-        if (!latest.current.sameSection(drag!.folderId, row.dataset.orderId || null)) return;
+        if (!latest.current.sameSection(drag!.itemId, latest.current.decode(row.dataset.orderId ?? ''))) return;
         const rect = row.getBoundingClientRect(), delta = Math.abs(drag!.y - drag!.offset - (rect.top + rect.height / 2));
         if (delta < nearest) { nearest = delta; target = index; }
       });
-      const current = latest.current.order, from = current.indexOf(drag.folderId);
-      if (from >= 0 && from !== target) {
+      const current = latest.current.order, from = current.indexOf(drag.itemId);
+      if (target >= 0 && from >= 0 && from !== target) {
         const next = [...current]; next.splice(target, 0, ...next.splice(from, 1));
         latest.current.order = next; latest.current.change(next);
       }
@@ -47,7 +59,7 @@ export function useFolderOrderDrag(root: RefObject<HTMLOListElement | null>, ord
       if (!row || !list.contains(row)) return;
       event.preventDefault();
       const rect = row.getBoundingClientRect();
-      drag = { pointerId: event.pointerId, folderId: row.dataset.orderId || null, y: event.clientY, startY: event.clientY, moved: false, offset: event.clientY - rect.top - rect.height / 2, before: [...latest.current.order], row };
+      drag = { pointerId: event.pointerId, itemId: latest.current.decode(row.dataset.orderId ?? ''), y: event.clientY, startY: event.clientY, moved: false, offset: event.clientY - rect.top - rect.height / 2, before: [...latest.current.order], row };
       list.setPointerCapture(event.pointerId); list.dataset.dragging = 'true'; row.dataset.dragging = 'true';
       frame = requestAnimationFrame(tick);
     };

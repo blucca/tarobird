@@ -6,6 +6,8 @@ import { ConversationBulkProvider, ConversationBulkToolbar, ConversationBulkActi
 import { useSceneMotion } from "./use-scene-motion.js";
 import { DraftPreviewText, useDraftPreviewText } from "./DraftPreview.js";
 import { FolderSections } from "./ConversationFolders.js";
+import { resolveCrossHostFolderOrder, visibleCrossHostFolders } from "./cross-host-folder-order.js";
+import { buildCrossHostFolderSources, buildHostFolderRowCounts, useCrossHostFolderOrder, useHostFolderUpdates } from "./use-cross-host-folder-order.js";
 import { DisconnectedBotsSwitch } from "./SidebarLayoutSwitch.js";
 import { botAgentSignal, buildConversationRows as buildMobileRows, folderSectionHosts, navigationItems, retainsOfflineNavigation, unreadFor, formatRowTime, type InboxHost as MobileHost, type InboxRow as MobileConversationRow } from './conversation-inbox.js';
 export { buildConversationRows as buildMobileRows, unreadFor, formatRowTime, type InboxHost as MobileHost, type InboxRow as MobileConversationRow } from './conversation-inbox.js';
@@ -263,7 +265,7 @@ const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
         </div>
         {searching && <SearchField key={tab} inputRef={searchInput} value={query} onChange={setQuery} close={closeSearch} scoped={tab === 'messages' && !!botScope} />}
         {tab === 'messages' && <div className="mh-filter-toolbar"><FilterBar value={filter} onChange={setFilter}/><MobileListOptions
-          hosts={hosts} scopedHostId={botScope?.hostId} visible={visible} disabled={!!bulk?.active}
+          hosts={hosts} activeHostId={activeHostId} scopedHostId={botScope?.hostId} visible={visible} disabled={!!bulk?.active}
           groupByHost={props.groupByHost ?? false} changeGroupByHost={props.changeGroupByHost}
           showDisconnectedBots={props.showDisconnectedBots ?? false} changeShowDisconnectedBots={props.changeShowDisconnectedBots}
         /></div>}
@@ -314,6 +316,8 @@ type PaneProps = MobileHomeProps & {
 function MessagesPane({
   hosts, rows, hiddenConversations, activeHost, needle, query, filter, locale, select, newChat, settingsBot, create, open, searchHistory, botScope, botCounts, browseBot, openActions, groupByHost = false, showDisconnectedBots = false, visible: paneVisible = true,
 }: PaneProps) {
+  useHostFolderUpdates(hosts);
+  const crossHostOrder = useCrossHostFolderOrder();
   if (hosts.length === 0) {
     return <EmptyState text={t('还没有可用的主机')} action={{ label: t('主机管理'), onClick: () => open('hosts') }} />;
   }
@@ -332,12 +336,23 @@ function MessagesPane({
   const folderHostIds = new Set(folderHosts.map(host => host.id));
   const sectionHosts = grouped ? scopedHosts : folderHosts;
   const filtered = !!needle || filter !== 'all' || !!botScope;
+  const combinedMultiHostFolders = multiHost && !grouped && !botScope && folderHosts.length > 0;
+  const allFolderSources = combinedMultiHostFolders ? buildCrossHostFolderSources(scopedHosts) : [];
+  const crossHostFolders = combinedMultiHostFolders
+    ? visibleCrossHostFolders(
+      resolveCrossHostFolderOrder(buildCrossHostFolderSources(folderHosts), crossHostOrder),
+      buildHostFolderRowCounts(folderHosts, ordinary),
+      filtered,
+    )
+    : [];
+  const crossHostVisibleKeys = crossHostFolders.map(item => item.key);
+  const crossHostHasPinned = crossHostFolders.some(item => item.pinned);
   const hasVisibleRows = (host: MobileHost) => ordinary.some(row => row.hostId === host.id) || !filtered && !!host.connection.state.conversationFolders?.folders.length;
   const renderRow = (row: MobileConversationRow, showHost: boolean) => {
     const host = hostById.get(row.hostId); if (!host) return null;
     return <AvatarProvider connection={host.connection} conversations={host.conversations} directory={host.bots}><BotReferences bots={host.bots}><ConversationRow row={row} connection={host.connection} conversations={host.conversations} dispatcher={row.conversation.type === 'direct' && !row.conversation.parentId && isDispatcher(host.bots.find(bot => bot.id === row.conversation.botIds[0]))} multiHost={showHost} locale={locale} attentionOnly={filter === 'attention'} onSelect={select} onActions={openActions}/></BotReferences></AvatarProvider>;
   };
-  const renderFolders = (host: MobileHost, showHostBadge: boolean) => <FolderSections connection={host.connection} hostName={host.name} showHostBadge={showHostBadge} visible={paneVisible} holdActions rows={ordinary.filter(row => row.hostId === host.id)} filtered={!!needle || filter !== 'all' || !!botScope} renderRow={row => renderRow(row, false)}/>;
+  const renderFolders = (host: MobileHost, showHostBadge: boolean) => <FolderSections connection={host.connection} hostId={host.id} hostName={host.name} showHostBadge={showHostBadge} visible={paneVisible} holdActions rows={ordinary.filter(row => row.hostId === host.id)} filtered={!!needle || filter !== 'all' || !!botScope} renderRow={row => renderRow(row, false)}/>;
   const renderList = (items: MobileConversationRow[], showHost: boolean) => <ul className="mh-list">{items.map(row => <li key={row.key}>{renderRow(row, showHost)}</li>)}</ul>;
   const emptyText = rows.length === 0
     ? hiddenConversations ? t('未连接的 Bot 已隐藏，勾选「显示未连接 Bot」即可查看。') : !scopeAvailable ? t('此 Bot 已不可用，请选择其他 Bot') : botScope ? t('还没有与此 Bot 的会话') : t('还没有会话')
@@ -388,9 +403,27 @@ function MessagesPane({
       {bots.length > 0 && visible.length > 0 && <SectionHead title={t('会话')}/>}
       {globalRows.length > 0 && <GlobalPinSection>{renderList(globalRows, multiHost && !botScope)}</GlobalPinSection>}
       {/* Folders keep their owning host, just like the desktop combined list.
-          Keep their keyed owners mounted across grouping/filter changes so
-          collapsed folders retain their state; label each branch only once. */}
-      {sectionHosts.map(host => <section key={host.id} className="mh-folder-host" data-folder-host={host.id} data-pin-scope={host.connection.identity.hubPublicKey ? JSON.stringify([host.connection.identity.hubPublicKey, host.connection.identity.publicKey]) : undefined} hidden={!hasVisibleRows(host)}>
+          Combined multi-host view interleaves only display order across hosts;
+          grouped and single-host views keep per-host sections and Hub order. */}
+      {combinedMultiHostFolders ? crossHostFolders.map(item => {
+        const host = hostById.get(item.hostId);
+        if (!host) return null;
+        return <section key={item.key} className="mh-folder-host" data-folder-host={host.id} data-pin-scope={host.connection.identity.hubPublicKey ? JSON.stringify([host.connection.identity.hubPublicKey, host.connection.identity.publicKey]) : undefined}>
+          <FolderSections
+            connection={host.connection}
+            hostId={host.id}
+            hostName={host.name}
+            showHostBadge
+            visible={paneVisible}
+            holdActions
+            folderFilter={item.folderId}
+            crossHost={{ sources: allFolderSources, visibleKeys: crossHostVisibleKeys, itemKey: item.key, hasAnyPinned: crossHostHasPinned }}
+            rows={ordinary.filter(row => row.hostId === host.id)}
+            filtered={filtered}
+            renderRow={row => renderRow(row, false)}
+          />
+        </section>;
+      }) : sectionHosts.map(host => <section key={host.id} className="mh-folder-host" data-folder-host={host.id} data-pin-scope={host.connection.identity.hubPublicKey ? JSON.stringify([host.connection.identity.hubPublicKey, host.connection.identity.publicKey]) : undefined} hidden={!hasVisibleRows(host)}>
         {grouped && <h3 className="mh-folder-host-title">{host.name}</h3>}
         {folderHostIds.has(host.id) ? renderFolders(host, multiHost && !grouped && !botScope) : renderList(ordinary.filter(row => row.hostId === host.id), false)}
       </section>)}

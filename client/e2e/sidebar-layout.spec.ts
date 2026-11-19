@@ -214,24 +214,25 @@ test('phone host grouping defaults off, labels each branch once and retains host
     await expect(grouping()).toHaveCount(0);
     await openMobileListOptions(page);
     await expect(grouping()).toBeVisible();
-    await expect(home().getByRole('button', { name: '管理 example-mac 的分组', exact: true })).toBeVisible();
-    await expect(home().getByRole('button', { name: '管理 笔记本 的分组', exact: true })).toBeVisible();
+    await expect(home().getByRole('button', { name: '管理分组', exact: true })).toBeVisible();
     await page.screenshot({ path: info.outputPath('phone-list-options-320.png'), animations: 'disabled' });
     expect(await page.evaluate(() => !window.dispatchEvent(new Event('tarocub-native-back', { cancelable: true })))).toBe(true);
     await expect(page.getByRole('dialog', { name: '列表选项', exact: true })).toHaveCount(0);
     await expect(more).toBeFocused();
-    // Reuse the real manager; a phone menu must not change the active host implicitly.
-    await openFolderManager(page, '笔记本');
+    // Combined view opens the unified cross-host manager without a host-picker step;
+    // creating on a specific host still routes writes strictly to that host.
+    await openFolderManager(page);
     await page.getByRole('button', { name: '新建分组', exact: true }).click();
+    await page.getByLabel('所属主机', { exact: true }).selectOption({ label: '笔记本' });
     await page.getByLabel('分组名称', { exact: true }).fill('手机整理');
     await page.getByRole('button', { name: '保存', exact: true }).click();
     await page.getByRole('button', { name: '关闭分组', exact: true }).click();
     expect((await new ConversationFolders(a.store.db).read('owner')).folders.some(f => f.name === '手机整理')).toBe(false);
     const created = (await new ConversationFolders(b.store.db).read('owner')).folders.find(f => f.name === '手机整理')!;
     expect(created).toBeTruthy();
-    await openFolderManager(page, '笔记本');
-    await page.getByRole('button', { name: '分组操作：手机整理', exact: true }).click();
-    await page.getByRole('button', { name: '删除分组「手机整理」', exact: true }).click();
+    await openFolderManager(page);
+    await page.getByRole('button', { name: '分组操作：手机整理（笔记本）', exact: true }).click();
+    await page.getByRole('button', { name: '删除分组「手机整理（笔记本）」', exact: true }).click();
     await page.getByRole('button', { name: '删除分组', exact: true }).click();
     await page.getByRole('button', { name: '关闭分组', exact: true }).click();
 
@@ -254,6 +255,10 @@ test('phone host grouping defaults off, labels each branch once and retains host
     await expect(home().locator('.mh-folder-host-title')).toHaveText(['example-mac', '笔记本']);
     await expect(home().locator('.host-source-badge')).toHaveCount(0);
     await expectListOption(page, '按主机分组', true);
+    await openMobileListOptions(page);
+    await expect(home().getByRole('button', { name: '管理 example-mac 的分组', exact: true })).toBeVisible();
+    await expect(home().getByRole('button', { name: '管理 笔记本 的分组', exact: true })).toBeVisible();
+    await closeMobileListOptions(page);
     const groupedB = () => home().locator('.mh-folder-host').filter({ has: page.getByRole('heading', { name: '笔记本', exact: true }) });
     await groupedB().locator('[data-conversation-id="same"]').click({ button: 'right' });
     await page.getByRole('dialog', { name: '对话操作', exact: true }).getByRole('button', { name: '重命名', exact: true }).click();

@@ -5265,5 +5265,12 @@
   "请核对发送方 Bot ID；这里不会自动验证它的名称或创建新 Bot。": "Check the sending Bot ID carefully. Its name is not verified here, and no new Bot will be created.",
   "这个 Bot 不在发送方电脑当前列表中，只能撤销已有授权。": "This Bot isn't in the sending computer's current list; you can only revoke its existing permissions.",
   "发送方电脑当前不可用，仅可撤销": "Sending computer unavailable; revoke only",
-  "保存或放弃修改后，可以切换发送方。": "Save or discard your changes before switching the sender."
+  "保存或放弃修改后，可以切换发送方。": "Save or discard your changes before switching the sender.",
+  "{0}（{1}）": "{0} ({1})",
+  "将 {0} 移到同类分组最上面": "Move {0} to top of section",
+  "将 {0} 移到最上面": "Move {0} to top",
+  "跨主机显示顺序仅保存在本设备；分组内容和置顶仍归属各自所属主机。": "Cross-host display order is saved only on this device. Folder contents and pins stay on their owning hosts.",
+  "所属主机": "Host",
+  "{0}（不可用）": "{0} (Unavailable)",
+  "跨主机排序与管理": "Sort and manage across hosts"
 }
