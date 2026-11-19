@@ -2814,7 +2814,9 @@ describe("CodexAppServerAdapter", () => {
       text: `[send-image:${imagePath}]`,
       sessionId: "thread-123",
     });
-    expect(engineEvents).toEqual([
+    // #53: the turn's history anchor is a Bridge-internal event of its own.
+    expect(engineEvents).toContainEqual({ type: "turn_anchor", sessionId: "thread-123", turnId: "turn-1" });
+    expect(engineEvents.filter((event) => (event as { type?: string }).type !== "turn_anchor")).toEqual([
       // The thread is announced before the turn starts so the bridge binds it
       // even if the turn is aborted (see engine-audit3-fixes).
       {

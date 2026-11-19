@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { SessionStore } from "../state/session-store.js";
 import type { CodexAdapter } from "../codex/adapter.js";
+import type { SessionRecord } from "../types.js";
 import { getConversationKey } from "./conversation-key.js";
 import { sessionLockNamespace } from "./turn-lock.js";
 
@@ -72,7 +73,8 @@ export class SessionManager {
     return existing.record ? { sessionId: existing.record.codexSessionId } : null;
   }
 
-  async bindSession(scope: number | { chatId: number; messageThreadId?: number; conversationKey?: string }, sessionId: string): Promise<void> {
+  /** `carry.resume` replaces the destination's workspace selection (#53 fork). */
+  async bindSession(scope: number | { chatId: number; messageThreadId?: number; conversationKey?: string }, sessionId: string, carry?: { resume: SessionRecord["resume"] }): Promise<void> {
     const chatId = typeof scope === "number" ? scope : scope.chatId;
     const messageThreadId = typeof scope === "number" ? undefined : scope.messageThreadId;
     const conversationKey = typeof scope === "number"
@@ -86,7 +88,7 @@ export class SessionManager {
       codexSessionId: sessionId,
       status: "idle",
       updatedAt: new Date().toISOString(),
-      resume: existing?.resume,
+      resume: carry ? carry.resume : existing?.resume,
       suspendedPrevious: existing?.suspendedPrevious,
     });
   }

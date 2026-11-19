@@ -92,7 +92,8 @@ export function recordRunEvent(record: RunRecord, event: EngineStreamEvent, now 
     record.phase = phase; // Child/review activity never changes the parent turn phase.
     return;
   }
-  if (record.endedAt || event.type === "task_notification") return;
+  // #53 turn_anchor feeds the Bot's history ledger only; never a run entry.
+  if (record.endedAt || event.type === "task_notification" || event.type === "turn_anchor") return;
   record.updatedAt = now; record.revision++;
   const sameScope = (entry: RunEntry) => entry.scope?.id === scope?.id;
   const add = (entry: Omit<RunEntry, "seq" | "revision" | "at">) => update(record, { ...entry, ...(scope ? { scope } : {}), seq: record.entries.length + 1, revision: record.revision, at: now });

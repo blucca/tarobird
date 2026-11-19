@@ -16,6 +16,18 @@ function fixture(send?: EngineSideSession["send"], extra: Partial<ConstructorPar
   return { manager, handle, start, finished, open, record, beforeAsk };
 }
 describe("temporary side lifecycle", () => {
+  it("closes every side handle of one conversation after a rewind (#53), leaving others open", async () => {
+    const f = fixture();
+    const main = await f.start("main-open");
+    const other = { ...scope, conversationId: "other" };
+    const opened = f.manager.open(other, "other-open", capability);
+    if (!opened.ok || !opened.view) throw new Error("open failed");
+    await vi.waitFor(() => expect(f.manager.read(other, opened.view!.id).view?.phase).toBe("idle"));
+    await f.manager.closeConversation("main");
+    expect(() => f.manager.read(scope, main)).toThrow("expired");
+    expect(f.manager.read(other, opened.view.id).view?.phase).toBe("idle");
+    expect(f.handle.dispose).toHaveBeenCalledTimes(1);
+  });
   it("binds negotiated delivery to one exchange, revokes it at turn end and leaves legacy sides unchanged", async () => {
     const publish: Array<(value: import("../src/client-protocol/side.js").SideDelivery) => void> = [];
     const tools = { definitions: [], instructions: "Files go to this side.", call: vi.fn(), register: async () => {}, isRegistered: async () => true };

@@ -23,6 +23,7 @@ import type {
   SideCapability,
 } from "./adapter.js";
 import { EngineContextCompactionPendingError } from "./adapter.js";
+import type { EngineHistoryAnchor } from "../client-protocol/history.js";
 import { appendUniqueSendImageTag, extractGeneratedImagePath, sendImageTag } from "./generated-files.js";
 import { killProcessTree } from "./process-tree.js";
 import { normalizeCodexUserInput } from "./codex-user-input.js";
@@ -186,6 +187,10 @@ function isThreadReadTimeoutError(error: unknown): error is ThreadReadTimeoutErr
 }
 
 /** True when another process still owns Codex's cross-process thread writer lock. */
+/** initialize clientInfo.name; Codex records it as the `originator` of the
+ * threads this host creates (#53 rewinds only those). */
+const CODEX_APP_SERVER_CLIENT_NAME = "tarocub";
+
 function isActiveWriterConflict(error: Error): boolean {
   return /already has an active writer/i.test(error.message);
 }
@@ -785,6 +790,97 @@ function decodeProcessChunk(
   return Buffer.isBuffer(chunk) ? decoder.write(chunk) : chunk.toString();
 }
 
+
+// ---------------------------------------------------------------- #53 history
+
+/** One turn as `thread/turns/list` (default summary items) reports it. */
+export interface CodexHistoryTurn {
+  id: string;
+  /** Unix seconds. */
+  startedAt: number | null;
+  /** True when the turn carries a user message (a run's input). */
+  userMessage: boolean;
+  /** `userMessage.clientId`: the Hub message id sent as `clientUserMessageId`. */
+  clientId: string | null;
+  /** Text parts of that user message. */
+  text: string;
+}
+export interface CodexHistoryRunHint { sourceMessageId: string; text: string; startedAt?: number }
+const CODEX_HISTORY_PAGE_SIZE = 50;
+/** Older runs are matched near the tail only; anything further is unresolved. */
+const CODEX_HISTORY_RESOLVE_MAX_TURNS = 500;
+/** Proving a turn is gone needs the whole history; beyond this, refuse. */
+const CODEX_HISTORY_PRESENCE_MAX_PAGES = 400;
+/** A run's first turn starts after its run card (downloads, transcription). */
+const CODEX_HISTORY_MATCH_BEFORE_MS = 60_000;
+const CODEX_HISTORY_MATCH_AFTER_MS = 30 * 60_000;
+
+export function readCodexHistoryTurn(raw: unknown): CodexHistoryTurn | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const turn = raw as { id?: unknown; startedAt?: unknown; items?: unknown };
+  if (typeof turn.id !== "string" || !turn.id) return undefined;
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  const user = items.find((item): item is { type: "userMessage"; clientId?: unknown; content?: unknown } =>
+    !!item && typeof item === "object" && (item as { type?: unknown }).type === "userMessage");
+  const text = user && Array.isArray(user.content)
+    ? user.content.flatMap((part: unknown) => part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string" ? [(part as { text: string }).text] : []).join("\n")
+    : "";
+  return { id: turn.id, startedAt: typeof turn.startedAt === "number" && Number.isFinite(turn.startedAt) ? turn.startedAt : null,
+    userMessage: !!user, clientId: user && typeof user.clientId === "string" && user.clientId ? user.clientId : null, text };
+}
+
+const normalizeHistoryText = (text: string) => text.replace(/\s+/gu, " ").trim();
+
+/** Index of the run's first turn at or after `from`: the turn carrying the Hub
+ * id, else the only user turn near the run's start whose input contains the
+ * message text (the host adds private guidance and attachment lines around
+ * it). Ambiguous or absent: undefined, never a guess. */
+function locateCodexRunTurn(turns: readonly CodexHistoryTurn[], hint: CodexHistoryRunHint, from: number): number | undefined {
+  for (let index = from; index < turns.length; index++) if (turns[index]!.clientId === hint.sourceMessageId) return index;
+  if (hint.startedAt === undefined) return undefined;
+  const text = normalizeHistoryText(hint.text);
+  const candidates: number[] = [];
+  for (let index = from; index < turns.length; index++) {
+    const turn = turns[index]!;
+    // A turn of another message, or without user input (a goal continuation), never starts this run.
+    if (!turn.userMessage || turn.clientId || turn.startedAt === null) continue;
+    const at = turn.startedAt * 1000;
+    if (at < hint.startedAt - CODEX_HISTORY_MATCH_BEFORE_MS || at > hint.startedAt + CODEX_HISTORY_MATCH_AFTER_MS) continue;
+    if (text && !normalizeHistoryText(turn.text).includes(text)) continue;
+    candidates.push(index);
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+/** Old-run reconciliation over turns in ascending order. `lastTurnId` is the
+ * turn before the next run's first turn, or the thread's last turn when the
+ * target is the latest run; absent when the next run cannot be matched. */
+export function resolveCodexHistoryAnchor(turns: readonly CodexHistoryTurn[], input: CodexHistoryRunHint & { next?: CodexHistoryRunHint }): EngineHistoryAnchor | undefined {
+  const first = locateCodexRunTurn(turns, input, 0);
+  if (first === undefined) return undefined;
+  const firstTurnId = turns[first]!.id;
+  if (!input.next) return { firstTurnId, lastTurnId: turns.at(-1)!.id };
+  const next = locateCodexRunTurn(turns, input.next, first + 1);
+  return next === undefined ? { firstTurnId } : { firstTurnId, lastTurnId: turns[next - 1]!.id };
+}
+
+function isMissingCodexMethod(error: unknown, method: string): boolean {
+  if (!(error instanceof Error)) return false;
+  if ((error as { rpcCode?: unknown }).rpcCode === -32601) return true;
+  const escaped = method.replace(/[.*+?^${}()|[\]\\/]/gu, "\\$&");
+  return new RegExp(`method not found|unknown method|unknown variant \`${escaped}\``, "iu").test(error.message);
+}
+
+/** Engine refusals as the Gateway's history error codes (message = code). */
+function codexHistoryError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/thread not found|no rollout found/iu.test(message)) return new Error("no_main_session");
+  if (/turn not found|was not found in the source thread|not a persisted canonical turn/iu.test(message)) return new Error("turn_unresolved");
+  if (/already has an active writer|already has an in-flight turn/iu.test(message)) return new Error("engine_busy");
+  if (/only supports paginated threads|ephemeral threads do not support/iu.test(message)) return new Error("unsupported");
+  return new Error("engine_failed");
+}
+
 export class CodexAppServerAdapter implements CodexAdapter {
   get turnRuntimeLimitMs(): number { return this.turnTimeoutMs; }
   readonly bridgeInstructionMode = "output-directory" as const;
@@ -836,6 +932,10 @@ export class CodexAppServerAdapter implements CodexAdapter {
   // Ephemeral side forks. Never in loadedThreads: sendUserMessage must not
   // resume, adopt or bind them, and their turns never touch the parent thread.
   private readonly sideThreads = new Map<string, SideThread>();
+  /** #53: immutable per-thread facts deciding rewind support. */
+  private readonly threadHistoryInfo = new Map<string, { historyMode: string | null; originator: string | null }>();
+  /** #53: history RPCs this CLI answered with "method not found"; for the process lifetime. */
+  private readonly missingHistoryMethods = new Set<string>();
   // Codex publishes the active context size separately from per-turn billing.
   // Keep it thread-scoped so a long-lived topic can compact before its next turn
   // instead of crossing the model limit and leaking an unrelated old answer.
@@ -995,6 +1095,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
           [],
           turnSettings,
           suppliedTools?.executionInstructions,
+          input.sourceMessageId,
         );
 
         return {
@@ -1590,7 +1691,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
       "initialize",
       {
         clientInfo: {
-          name: "tarocub",
+          name: CODEX_APP_SERVER_CLIENT_NAME,
           title: "TaroCub",
           version: "0.1.0",
         },
@@ -1679,7 +1780,8 @@ export class CodexAppServerAdapter implements CodexAdapter {
         status: parsed.error ? "error" : "ok",
       };
       if (parsed.error) {
-        pending.reject(new Error(parsed.error.message ?? "Unknown app-server error"));
+        // Keep the JSON-RPC code: "method not found" decides capability (#53).
+        pending.reject(Object.assign(new Error(parsed.error.message ?? "Unknown app-server error"), typeof parsed.error.code === "number" ? { rpcCode: parsed.error.code } : {}));
       } else {
         pending.resolve(parsed.result);
       }
@@ -2717,6 +2819,13 @@ export class CodexAppServerAdapter implements CodexAdapter {
     }
     pending.turnId = turnId;
     this.pendingTurnsByTurnId.set(turnId, pending);
+    // #53: every foreground turn of a run is a history position. The Bridge
+    // consumes this event; it never reaches cards or the Hub. Side threads are
+    // ephemeral and have none.
+    if (!pending.ephemeral) {
+      const anchor: EngineStreamEvent = { type: "turn_anchor", sessionId: pending.threadId, turnId };
+      void Promise.resolve().then(() => pending.onEngineEvent?.(anchor)).catch(() => undefined);
+    }
     this.flushUnidentifiedTurnLines(pending);
   }
 
@@ -3194,6 +3303,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
     }
 
     this.loadedThreads.add(threadId);
+    this.rememberThreadHistory(threadId, result.thread);
     // A failed capability receipt must not lose a newly created session. The
     // next isRegistered check selects the compatible prompt for that thread.
     await appTools?.register(threadId).catch(() => undefined);
@@ -3239,6 +3349,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
     }
 
     this.loadedThreads.add(resumedThreadId);
+    this.rememberThreadHistory(resumedThreadId, result.thread);
     return resumedThreadId;
   }
 
@@ -3522,6 +3633,8 @@ export class CodexAppServerAdapter implements CodexAdapter {
     /** turn/start `model`/`effort`; Codex keeps them for this thread's later turns. */
     turnSettings: { model?: string; effort?: string } = {},
     executionContext?: string,
+    /** #53: the Hub message id, read back as `userMessage.clientId`. */
+    clientUserMessageId?: string,
   ): Promise<{ text: string; usage?: AdapterUsage }> {
     if (this.pendingTurns.has(threadId)) {
       throw new Error(`Codex thread ${threadId} already has an in-flight turn`);
@@ -3660,6 +3773,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
           ...(executionContext ? { "tarobot.execution": { kind: "application", value: executionContext } } : {}),
         } } : {}),
         ...turnSettings,
+        ...(clientUserMessageId && !side ? { clientUserMessageId } : {}),
         input: [
           {
             type: "text",
@@ -3875,6 +3989,207 @@ export class CodexAppServerAdapter implements CodexAdapter {
       if (input.throwOnError) throw error;
       return false;
     }
+  }
+
+  // -------------------------------------------------------------- #53 history
+
+  private rememberThreadHistory(threadId: string, thread: unknown): void {
+    if (!thread || typeof thread !== "object") return;
+    const { historyMode, originator } = thread as { historyMode?: unknown; originator?: unknown };
+    // A CLI without these fields says nothing; keep asking rather than cache a guess.
+    if (historyMode === undefined && originator === undefined) return;
+    this.threadHistoryInfo.set(threadId, { historyMode: typeof historyMode === "string" ? historyMode : null, originator: typeof originator === "string" ? originator : null });
+  }
+
+  private async readThreadHistoryInfo(threadId: string): Promise<{ historyMode: string | null; originator: string | null }> {
+    const cached = this.threadHistoryInfo.get(threadId);
+    if (cached) return cached;
+    let read: unknown;
+    try {
+      read = await this.request("thread/read", { threadId, includeTurns: false }, {
+        timeoutMs: this.threadReadTimeoutMs,
+        timeoutMessage: `Codex app-server thread/read timed out after ${Math.max(1, Math.round(this.threadReadTimeoutMs / 1000))} seconds`,
+      });
+    } catch (error) { throw codexHistoryError(error); }
+    this.rememberThreadHistory(threadId, (read as { thread?: unknown } | null)?.thread);
+    return this.threadHistoryInfo.get(threadId) ?? { historyMode: null, originator: null };
+  }
+
+  /** Rewind replaces persisted history: only paginated threads this host
+   * created. A bound/resumed thread of another client (Codex desktop) stays
+   * untouched; forking never changes the source and is always offered. */
+  private historyCapabilityOf(info: { historyMode: string | null; originator: string | null }): Awaited<ReturnType<NonNullable<CodexAdapter["historyCapability"]>>> {
+    const fork = this.missingHistoryMethods.has("thread/fork") ? "none" as const : "turn" as const;
+    if (this.missingHistoryMethods.has("thread/revert") || this.missingHistoryMethods.has("thread/turns/list")) return { rewind: "none", fork, ...(fork === "none" ? { reason: "unsupported" as const } : {}) };
+    if (info.historyMode !== "paginated") return { rewind: "none", fork, reason: "legacy_history" };
+    if (info.originator !== CODEX_APP_SERVER_CLIENT_NAME) return { rewind: "none", fork, reason: "external_session" };
+    return { rewind: "turn", fork };
+  }
+
+  async historyCapability(sessionId: string): Promise<Awaited<ReturnType<NonNullable<CodexAdapter["historyCapability"]>>>> {
+    // A conversation without a native thread yet gets one from this host: paginated, ours.
+    if (isLogicalTelegramSessionId(sessionId)) return this.historyCapabilityOf({ historyMode: "paginated", originator: CODEX_APP_SERVER_CLIENT_NAME });
+    await this.ensureInitialized(await this.loadRuntimeOptions());
+    return this.historyCapabilityOf(await this.readThreadHistoryInfo(sessionId));
+  }
+
+  /** No foreground turn, unidentified start, goal pursuit or compaction may own the thread. */
+  private assertHistoryIdle(threadId: string): void {
+    if (this.pendingTurns.has(threadId) || this.activeTurnEntries.has(threadId) || this.unresolvedTurnStarts.has(threadId)
+      || this.goalWatchers.has(threadId) || this.pendingCompactions.has(threadId)) throw new Error("busy");
+  }
+
+  /** Reserve the thread like a turn: no turn starts on it and the shared child
+   * is not recycled underneath the history operation. */
+  private async withHistoryReservation<T>(threadId: string, operation: () => Promise<T>): Promise<T> {
+    this.assertHistoryIdle(threadId);
+    this.activeTurnEntries.add(threadId);
+    try { return await operation(); } finally {
+      this.activeTurnEntries.delete(threadId);
+      this.notifyIdleWaitersIfIdle();
+    }
+  }
+
+  private async listHistoryTurnsPage(threadId: string, cursor: string | null): Promise<{ turns: CodexHistoryTurn[]; nextCursor: string | null }> {
+    let page: unknown;
+    try {
+      page = await this.request("thread/turns/list", { threadId, sortDirection: "desc", limit: CODEX_HISTORY_PAGE_SIZE, ...(cursor ? { cursor } : {}) }, {
+        timeoutMs: this.threadReadTimeoutMs,
+        timeoutMessage: `Codex app-server thread/turns/list timed out after ${Math.max(1, Math.round(this.threadReadTimeoutMs / 1000))} seconds`,
+      });
+    } catch (error) {
+      if (isMissingCodexMethod(error, "thread/turns/list")) { this.missingHistoryMethods.add("thread/turns/list"); throw new Error("unsupported"); }
+      throw codexHistoryError(error);
+    }
+    const value = page as { data?: unknown; nextCursor?: unknown } | null;
+    if (!value || !Array.isArray(value.data)) throw new Error("engine_failed");
+    const turns = value.data.map(readCodexHistoryTurn);
+    if (turns.some(turn => !turn)) throw new Error("engine_failed");
+    return { turns: turns as CodexHistoryTurn[], nextCursor: typeof value.nextCursor === "string" && value.nextCursor ? value.nextCursor : null };
+  }
+
+  /** Proves presence or absence over the whole history; never guesses absence. */
+  private async historyTurnPresent(threadId: string, turnId: string): Promise<boolean> {
+    let cursor: string | null = null;
+    for (let pages = 0; pages < CODEX_HISTORY_PRESENCE_MAX_PAGES; pages++) {
+      const page = await this.listHistoryTurnsPage(threadId, cursor);
+      if (page.turns.some(turn => turn.id === turnId)) return true;
+      cursor = page.nextCursor;
+      if (!cursor) return false;
+    }
+    throw new Error("engine_failed");
+  }
+
+  /** Remove the anchor turn and everything after it. Re-entrant: a turn id is
+   * unique, so a target already gone was rewound before (a lost reply, a
+   * retried request) and is success, even after later turns. */
+  async rewindSession(sessionId: string, input: { anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }> {
+    const turnId = input.anchor.firstTurnId;
+    if (!turnId) throw new Error("turn_unresolved");
+    if (isLogicalTelegramSessionId(sessionId)) throw new Error("no_main_session");
+    if (this.missingHistoryMethods.has("thread/revert") || this.missingHistoryMethods.has("thread/turns/list")) throw new Error("unsupported");
+    input.abortSignal?.throwIfAborted();
+    await this.ensureInitialized(await this.loadRuntimeOptions());
+    input.abortSignal?.throwIfAborted();
+    return await this.withHistoryReservation(sessionId, async () => {
+      let threadId: string;
+      try { threadId = await this.ensureThreadLoaded(sessionId, input.workspaceOverride ?? this.cwd); }
+      catch (error) { throw error instanceof CodexActiveWriterConflictError ? new Error("engine_busy") : codexHistoryError(error); }
+      if (this.historyCapabilityOf(await this.readThreadHistoryInfo(threadId)).rewind !== "turn") throw new Error("unsupported");
+      const done = () => { this.threadContextUsage.delete(threadId); return { sessionId: threadId }; };
+      if (!await this.historyTurnPresent(threadId, turnId)) return done();
+      input.abortSignal?.throwIfAborted();
+      try {
+        await this.request("thread/revert", { threadId, beforeTurnId: turnId }, {
+          timeoutMs: this.threadReadTimeoutMs,
+          timeoutMessage: `Codex app-server thread/revert timed out after ${Math.max(1, Math.round(this.threadReadTimeoutMs / 1000))} seconds`,
+        });
+      } catch (error) {
+        if (isMissingCodexMethod(error, "thread/revert")) { this.missingHistoryMethods.add("thread/revert"); throw new Error("unsupported"); }
+        // The outcome decides, not the reply: a timeout may still have landed.
+        if (await this.historyTurnPresent(threadId, turnId).catch(() => true)) throw codexHistoryError(error);
+        return done();
+      }
+      if (await this.historyTurnPresent(threadId, turnId)) throw new Error("engine_failed");
+      // Cached context usage described the dropped turns.
+      return done();
+    });
+  }
+
+  /** A persistent, independent copy through `through.lastTurnId` (inclusive;
+   * omitted = whole thread). Same thread settings as a resume of the source;
+   * App tools follow the source's schema; an inherited goal is cleared so the
+   * new conversation never starts working on its own. */
+  async forkSession(sessionId: string, input: { through?: EngineHistoryAnchor; workspaceOverride?: string; appPlatformTools?: AppPlatformTools; abortSignal?: AbortSignal }): Promise<{ sessionId: string }> {
+    if (isLogicalTelegramSessionId(sessionId)) throw new Error("no_main_session");
+    if (this.missingHistoryMethods.has("thread/fork")) throw new Error("unsupported");
+    input.abortSignal?.throwIfAborted();
+    await this.ensureInitialized(await this.loadRuntimeOptions());
+    input.abortSignal?.throwIfAborted();
+    const cwd = input.workspaceOverride ?? this.cwd;
+    const lastTurnId = input.through?.lastTurnId;
+    const forked = await this.withHistoryReservation(sessionId, async () => {
+      const searchConfig = await this.managedSearchConfig(cwd);
+      try {
+        return (await this.request("thread/fork", {
+          threadId: sessionId,
+          ...(lastTurnId ? { lastTurnId } : {}),
+          excludeTurns: true,
+          cwd,
+          ...(this.configPath ? { sandbox: this.currentApprovalMode === "bypass" ? "danger-full-access" : "workspace-write" } : {}),
+          ...(Object.keys(searchConfig).length > 0 ? { config: searchConfig } : {}),
+          approvalPolicy: "never",
+        }, {
+          timeoutMs: this.threadReadTimeoutMs,
+          timeoutMessage: `Codex app-server thread/fork timed out after ${Math.max(1, Math.round(this.threadReadTimeoutMs / 1000))} seconds`,
+        })) as { thread?: { id?: unknown; ephemeral?: unknown } } | null;
+      } catch (error) {
+        if (isMissingCodexMethod(error, "thread/fork")) { this.missingHistoryMethods.add("thread/fork"); throw new Error("unsupported"); }
+        throw codexHistoryError(error);
+      }
+    });
+    const threadId = typeof forked?.thread?.id === "string" ? forked.thread.id : undefined;
+    // Never bind the source, or a fork the CLI will not persist.
+    if (!threadId || threadId === sessionId || forked?.thread?.ephemeral === true) throw new Error("engine_failed");
+    this.loadedThreads.add(threadId);
+    this.rememberThreadHistory(threadId, forked?.thread);
+    // Like startThread: the next turn's prompt matches the tools this thread
+    // was declared with, here the source thread's schema version.
+    const tools = input.appPlatformTools;
+    const inherited = !tools ? undefined : tools.forSession
+      ? await tools.forSession(sessionId).catch(() => undefined)
+      : await tools.isRegistered(sessionId).catch(() => false) ? tools : undefined;
+    await inherited?.register(threadId).catch(() => undefined);
+    await this.clearInheritedGoal(threadId);
+    return { sessionId: threadId };
+  }
+
+  private async clearInheritedGoal(threadId: string): Promise<void> {
+    // A slow goal read must not recycle the shared child for this operation.
+    const options = { timeoutMs: CODEX_APP_SERVER_GOAL_RPC_TIMEOUT_MS };
+    let goal: CodexThreadGoal | null;
+    try { goal = readGoalResponse(await this.request("thread/goal/get", { threadId }, options)).goal; }
+    catch (error) {
+      if (isMissingCodexMethod(error, "thread/goal/get")) return;
+      throw new Error("engine_failed");
+    }
+    if (!goal || goal.status === "complete") return;
+    try { await this.request("thread/goal/clear", { threadId, origin: "user" }, options); }
+    catch { throw new Error("engine_failed"); }
+  }
+
+  /** Old-run reconciliation near the tail of the thread; see resolveCodexHistoryAnchor. */
+  async resolveHistoryAnchor(sessionId: string, input: { sourceMessageId: string; text: string; startedAt?: number; next?: { sourceMessageId: string; text: string; startedAt?: number } }): Promise<EngineHistoryAnchor | undefined> {
+    if (isLogicalTelegramSessionId(sessionId) || this.missingHistoryMethods.has("thread/turns/list")) return undefined;
+    await this.ensureInitialized(await this.loadRuntimeOptions());
+    const descending: CodexHistoryTurn[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await this.listHistoryTurnsPage(sessionId, cursor);
+      descending.push(...page.turns);
+      cursor = page.nextCursor;
+    } while (cursor && descending.length < CODEX_HISTORY_RESOLVE_MAX_TURNS);
+    return resolveCodexHistoryAnchor(descending.reverse(), input);
   }
 
   sideCapability(input?: { tools?: "inherited" }): SideCapability {

@@ -6,6 +6,7 @@ import { personaSettings } from "../runtime/persona-settings.js";
 import { gatewaySteering } from "./steering.js";
 import { gatewayEngineTasks } from "./engine-tasks.js";
 import { gatewaySideSessions, instanceAttachmentDownload } from "./side.js";
+import { gatewayHistory } from "./history.js";
 import { readBotDiagnostics } from "../runtime/diagnostics.js";
 import { routeAlertSchema, type RouteAlert } from "../hub/route-monitor.js";
 import path from "node:path";
@@ -248,9 +249,17 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   // Side audio uses the main transcriber and cloud policy, without its chat progress cards.
   sideSessions = gatewaySideSessions(surface, options.stateDir, options.botId, conversationId => channel.canSteerConversation!(conversationId), instanceAttachmentDownload(channel.transport), runtime.transcribeMedia ?? createDefaultTranscribeVoice(), channel);
   const schedules = gatewaySchedules(options, channel);
+  // #53: same surface, locks and session store as ordinary turns and /side.
+  const history = gatewayHistory({ bridge: surface, runtime, stateDir: options.stateDir,
+    bindingReady: conversationId => channel.canSteerConversation!(conversationId),
+    hasPendingAdmission: conversationId => channel.hasPendingAdmission(conversationId),
+    closeSideSessions: conversationId => sideSessions!.closeConversation(conversationId),
+    // Registration only: the fork's next turn selects the source thread's tool schema.
+    appTools: conversationId => createAppPlatformTools({ channel, stateDir: options.stateDir, conversationId, receipts: appReceipts, signal: AbortSignal.abort() }) });
   channel.onCall = async (method, raw): Promise<Json> => withChannelProfile("gateway", async () => {
     if (method === "tasks.list" || method === "tasks.stop" || method === "tasks.recover") return z.json().parse(await engineTasks(method, raw));
     if (["side.status", "side.open", "side.read", "side.ask", "side.stop", "side.close"].includes(method)) return z.json().parse(await sideSessions!.call(method, raw));
+    if (method === "history.status" || method === "history.rewind" || method === "history.fork") return await history(method, raw);
     if (method === "persona.get" || method === "persona.set") {
       if (method === "persona.get") z.object({}).strict().parse(raw);
       return z.json().parse(await personaSettings(options.stateDir, activeWorkCount, method === "persona.set" ? raw : undefined));

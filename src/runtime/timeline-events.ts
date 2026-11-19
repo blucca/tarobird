@@ -12,7 +12,8 @@ export function shouldPersistEngineTimelineEvent(event: EngineStreamEvent): bool
     if (event.event.type === "scope_status") return true;
     return shouldPersistEngineTimelineEvent(event.event);
   }
-  if (event.type === "thinking" || event.type === "tool_progress") return false;
+  // #53 ledger input: engine turn ids stay out of every log the Hub can read.
+  if (event.type === "thinking" || event.type === "tool_progress" || event.type === "turn_anchor") return false;
   if (event.type === "assistant_text" && event.delta === true) return false;
   return true;
 }

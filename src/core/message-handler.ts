@@ -19,6 +19,8 @@ import type { ChatQueueWaitEvent } from "../runtime/chat-queue.js";
 import type { BridgeTurnLockWaitEvent } from "../runtime/turn-lock.js";
 import type { TurnPoolWaitEvent } from "../runtime/turn-pool.js";
 import { engineEventTimelineMetadata, shouldPersistEngineTimelineEvent } from "../runtime/timeline-events.js";
+import { HistoryLedgerRun, type HistoryLedgerOutcome } from "../runtime/history-ledger.js";
+import { classifyFailure } from "../runtime/error-classification.js";
 import { FileWorkflowStore } from "../state/file-workflow-store.js";
 import {
   hasConversationResume,
@@ -1737,6 +1739,8 @@ async function runNormalizedCoreMessage(
   // - /goal clear (abortGoal) still always ends the pursuit.
   let abortController: AbortController | undefined;
   let releaseRunSlot: (() => void) | undefined;
+  let historyLedger: HistoryLedgerRun | undefined;
+  let historyOutcome: HistoryLedgerOutcome | undefined;
   let workflowRecordId: string | undefined;
   let workflowOutcome: "not_started" | "failed" | "delivered" = "not_started";
   const activateRun = (): AbortController => {
@@ -2100,6 +2104,13 @@ async function runNormalizedCoreMessage(
     }
 
     let runCard: CoreRunCardController | undefined;
+    // #53 history ledger: only an ordinary App user message starts a run that
+    // can anchor a rewind or fork. Steering, slash commands, delegated Bot
+    // input and group discussion write nothing.
+    historyLedger = channelProfile() === "gateway" && !normalized.botSource && !normalized.agentBus && !normalized.groupDiscussion
+      && !normalized.reviewAdmission && !normalized.goalObjective && !commandText.trimStart().startsWith("/") && /^[A-Za-z0-9_-]{1,128}$/.test(normalized.messageId)
+      ? new HistoryLedgerRun({ stateDir: input.stateDir, conversationKey: normalized.conversationKey, sourceMessageId: normalized.messageId, engine: cfg.engine })
+      : undefined;
     let nativeGoalReceipt: ClaudeNativeGoalReceipt | undefined;
     let nativeGoalObserved = false;
     let nativeGoalReplacementRejected = false;
@@ -2550,7 +2561,10 @@ async function runNormalizedCoreMessage(
             [channelProfile() === "gateway" ? "TAROBOT_ACTIVE_INSTANCE" : "CCTB_LARK_ACTIVE_INSTANCE"]: input.instanceName ?? path.basename(input.stateDir),
             [channelProfile() === "gateway" ? "TAROBOT_ACTIVE_STATE_DIR" : "CCTB_LARK_ACTIVE_STATE_DIR"]: input.stateDir,
           },
+          ...(historyLedger ? { sourceMessageId: normalized.messageId, onTurnAnchor: (anchor: { sessionId: string; turnId?: string; endSeq?: number }) => historyLedger?.anchor(anchor) } : {}),
         };
+        // A missing record means this run starts the conversation's engine session.
+        void historyLedger?.start(conversationSession.warning ? undefined : conversationSession.record?.codexSessionId);
         const runBridgeTurn = async (turnInput: Parameters<CoreBridgeLike["handleAuthorizedMessage"]>[0]) => {
           const attempt = ++nativeGoalAttempt;
           nativeGoalAttemptOpen = true;
@@ -2654,7 +2668,7 @@ async function runNormalizedCoreMessage(
           runCard?.beginAnswerAttempt();
           const repaired = await runBridgeTurn({
             ...bridgeTurnInput,
-            reviewAdmission: undefined, nativeInput: undefined,
+            reviewAdmission: undefined, nativeInput: undefined, sourceMessageId: undefined,
             text: coreDeliveryFollowupRepairPrompt(),
             replyContext: undefined,
             onEngineEvent: handleEngineEvent,
@@ -2716,7 +2730,7 @@ async function runNormalizedCoreMessage(
           const repaired = await runBridgeTurn({
             ...bridgeTurnInput,
             text: coreDeliveryPreflightRepairPrompt(initialDeliveryDirectivePreflight),
-            reviewAdmission: undefined, nativeInput: undefined,
+            reviewAdmission: undefined, nativeInput: undefined, sourceMessageId: undefined,
             replyContext: undefined,
             onEngineEvent: handleEngineEvent,
           });
@@ -2773,6 +2787,7 @@ async function runNormalizedCoreMessage(
           result = { ...result, text: [result.text, claudeGoalReceiptText(nativeGoalReceipt, locale)].filter((part) => part.trim()).join("\n\n") };
         }
         completedEngineText = result.text;
+        historyOutcome = "ok";
         if (deliveryLedgerEnabled()) {
           // Durable delivery obligation: the engine's answer now exists only in
           // this local. If the process dies before platform ACK, the next boot
@@ -3067,6 +3082,7 @@ async function runNormalizedCoreMessage(
         return true;
       }
       const terminal = classifyCoreTurnTermination(error, runController.signal);
+      historyOutcome = terminal.kind === "interrupted" ? "failed:interrupted" : terminal.kind === "idle_timeout" ? "failed:engine-timeout" : `failed:${classifyFailure(error)}`;
       const goalStopNote = cfg.engine === "claude" && (claudeGoalSetTurn || nativeGoalObserved)
         ? locale === "en"
           ? "Stopping this turn does not clear a native goal. Use /goal to check it or /goal clear to remove it."
@@ -3109,6 +3125,9 @@ async function runNormalizedCoreMessage(
       return true;
     }
   } finally {
+    // Complete before the run slot frees: a history operation that sees the
+    // conversation idle must also see this run's final line.
+    await historyLedger?.finish(historyOutcome ?? "failed:unknown");
     if (workflowRecordId) await new FileWorkflowStore(input.stateDir)
       .settleProcessing(workflowRecordId, workflowOutcome).catch(() => undefined);
     // Guarded release from claimLarkRunSlot: detaches from a /goal pursuit when
@@ -3637,7 +3656,8 @@ export async function createCoreRunCardController(input: {
     apply: async (event) => {
       // A late engine event after the card was finalized must not mutate the
       // rendered state, nor re-arm a patch that would revert the finished card.
-      if (terminal) {
+      // #53 turn_anchor is Bot-internal and never reaches a card.
+      if (terminal || event.type === "turn_anchor") {
         return;
       }
       const previousPhase = state.nativeRun?.phase;
