@@ -19,6 +19,7 @@ import { normalizeLayoutDensity, type LayoutDensity } from "./layout-density.js"
 import { storedLocale, systemLocale } from "./system-locale.js";
 import type { NamedBot } from "./bot-references.js";
 import { profileCacheSchema, type ProfileCache } from "../../src/client-protocol/avatars.js";
+import { engineQuotaViewSchema, type EngineQuotaView } from "../../src/client-protocol/engine-quota.js";
 import { openDB, type DBSchema, type StoreNames, type IDBPTransaction, type IDBPDatabase } from "idb";
 import { activeQuestionDrafts, questionDraftPrefix, questionDraftSchema, type QuestionDraft } from "./question-draft.js";
 import { messageAttention, type MessageAttention } from "./attention.js";
@@ -781,6 +782,27 @@ export class ClientCache {
     if (current && draftOwner(current) === draftOwner(identity)
       && await settings.get("revokedIdentity") !== JSON.stringify([identity.deviceId, identity.hubPublicKey])) {
       await settings.put(value, `groupReply:${key}`);
+    }
+    await tx.done;
+  }
+  /** The owner's last engine quota reading for this Host, kept so the page can
+   * show it with its time while the Host is offline, also after a restart. It
+   * is a summary only (shares, reset times, plan and Bot names) and is cleared
+   * with the rest of this Host's cache. Another user never reads it. */
+  async engineQuota(userId: string): Promise<{ view: EngineQuotaView; at: number } | undefined> {
+    try {
+      const saved = JSON.parse((await (await this.db).get("settings", "engineQuota")) as string) as { user?: unknown; at?: unknown; view?: unknown };
+      if (saved.user !== userId || typeof saved.at !== "number" || !Number.isFinite(saved.at)) return undefined;
+      return { view: engineQuotaViewSchema.parse(saved.view), at: saved.at };
+    } catch { return undefined; }
+  }
+  /** `undefined` forgets the reading, e.g. once the Host says this user may not see it. */
+  async saveEngineQuota(userId: string, value: { view: EngineQuotaView; at: number } | undefined, identity: Identity): Promise<void> {
+    const tx = await this.write(["settings"]), settings = tx.objectStore("settings");
+    const current = await settings.get("identity") as Identity | undefined;
+    if (current?.deviceId === identity.deviceId && current.hubPublicKey === identity.hubPublicKey) {
+      if (value) await settings.put(JSON.stringify({ user: userId, at: value.at, view: value.view }), "engineQuota");
+      else await settings.delete("engineQuota");
     }
     await tx.done;
   }

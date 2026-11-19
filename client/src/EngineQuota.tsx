@@ -29,12 +29,12 @@ const FOLLOW_UP_MS = 2_500, FOLLOW_UP_LIMIT = 6;
 /** Countdown labels move without asking the Host. */
 const CLOCK_TICK_MS = 30_000;
 
-/** The last reading of each Host for this App session, so reopening the page or
- * losing the connection shows it with its time instead of an empty page. Keyed
- * by Host identity and user: another account on this device never sees it. */
+/** The last reading of each Host, so reopening the page or losing the
+ * connection shows it with its time instead of an empty page. This map serves
+ * the running App; the Host's own cache on this device keeps the same reading
+ * across a restart. Keyed by Host identity and user: another account on this
+ * device never sees it. */
 const lastReadings = new Map<string, { view: EngineQuotaView; at: number }>();
-/** Test seam: fixtures start every case from an empty page. */
-export function forgetEngineQuotaReadings() { lastReadings.clear(); }
 
 export type EngineQuotaHost = { id: string; name: string; connection: HubConnection };
 /** Paired Hosts whose quota this user may read: only where they are the owner.
@@ -80,19 +80,36 @@ function useHostQuota(connection: HubConnection, active: boolean, manual: number
     setBusy(false); setFailure(undefined); setSaved(lastReadings.get(scope)); setReread(new Set());
     return () => { generation.current++; flight.current = undefined; };
   }, [connection, scope]);
+  // A Host that is offline when the page opens still shows what was read last time.
+  useEffect(() => {
+    const user = state.user;
+    if (!user || !owner || lastReadings.has(scope)) return;
+    const current = generation.current; let alive = true;
+    void connection.cache.engineQuota(user).then(stored => {
+      // A reading that arrived meanwhile is newer than anything kept on disk.
+      if (!alive || !stored || current !== generation.current || lastReadings.has(scope)) return;
+      lastReadings.set(scope, stored); setSaved(stored);
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [connection, scope, owner, state.user]);
   const read = useCallback(async (kind: "open" | "refresh") => {
     if (flight.current) return;
-    const current = generation.current, token = Symbol(); flight.current = token; setBusy(true); lastAttempt.current = Date.now();
+    const current = generation.current, token = Symbol(), user = state.user; flight.current = token; setBusy(true); lastAttempt.current = Date.now();
     try {
       const view = engineQuotaViewSchema.parse(await connection.http(kind === "refresh" ? "/api/engines/quota/refresh" : "/api/engines/quota",
         kind === "refresh" ? { method: "POST", body: "{}", signal: timeoutSignal(20_000) } : { signal: timeoutSignal(15_000) }));
       if (current !== generation.current) return;
       const next = { view, at: Date.now() }; lastReadings.set(scope, next); setSaved(next); setFailure(undefined); setNow(next.at);
+      if (user) void connection.cache.saveEngineQuota(user, next, connection.identity).catch(() => undefined);
     } catch (cause) {
-      // The previous reading stays on screen, labelled with its own time.
-      if (current === generation.current) setFailure(cause instanceof HubHttpError && cause.status === 403 ? "forbidden" : cause instanceof HubHttpError && cause.status === 404 ? "outdated" : "failed");
+      if (current !== generation.current) return;
+      const forbidden = cause instanceof HubHttpError && cause.status === 403;
+      // Not this user's to see any more: the kept reading goes too. Any other
+      // failure leaves the previous reading on screen, labelled with its own time.
+      if (forbidden) { lastReadings.delete(scope); setSaved(undefined); if (user) void connection.cache.saveEngineQuota(user, undefined, connection.identity).catch(() => undefined); }
+      setFailure(forbidden ? "forbidden" : cause instanceof HubHttpError && cause.status === 404 ? "outdated" : "failed");
     } finally { if (flight.current === token) { flight.current = undefined; if (current === generation.current) setBusy(false); } }
-  }, [connection, scope]);
+  }, [connection, scope, state.user]);
   // Opening the page reads once. Coming back to it (foreground, reconnect) reads
   // again only when the last attempt is no longer recent.
   useEffect(() => {
