@@ -9,6 +9,11 @@ type Delivery = { message_id: string; bot_id: string; conversation_id: string; q
 // Unknown slash tokens stay barriers too: an engine may add its own commands.
 const commandText = (text: string) => /^\/[a-z][\w.-]*(?:@[a-z0-9_][\w.-]*)?(?=\s|$)/i.test(text.trim());
 const command = (message: Message) => !message.botSource && !message.forwardedFrom && commandText(blocksText(message.blocks));
+/** A slash control input; it never starts an engine run (#53 anchors). */
+export const isQueueCommand = command;
+/** A started rewind/fork (#53) holds new claims in its conversation until it
+ * ends; the operation's end triggers a dispatch. Sending is never blocked. */
+const HISTORY_HOLD_SQL = "SELECT conversation_id FROM conversation_history_ops WHERE state='started'";
 export const supportsPromptQueueEngine = (engine: string): boolean => (PROMPT_QUEUE_ENGINES as readonly string[]).includes(engine);
 
 /** Owns only inputs not yet handed to a Gateway. Claim and edits share the same
@@ -223,9 +228,15 @@ export class HubPromptQueue {
         const entries = byConversation.get(row.conversation_id) ?? []; entries.push(row); byConversation.set(row.conversation_id, entries);
       }
       const messages: Message[] = [], events: HubEvent[] = busEvents;
+      const held = byConversation.size ? new Set((await this.store.db.all<{ conversation_id: string }>(HISTORY_HOLD_SQL)).map(row => row.conversation_id)) : new Set<string>();
       for (const [conversationId, all] of byConversation) {
         const entries = all.filter(row => !busInputs.has(row.message_id));
         if (!entries.length) continue;
+        if (held.has(conversationId)) {
+          // Already-fenced inputs keep their reconnect replay; nothing new is claimed.
+          if (replay) for (const row of entries) if (row.dispatched) messages.push(await this.store.queuedMessageInTransaction(row.message_id));
+          continue;
+        }
         const conversation = await this.store.db.get<{ type: string; parent_id: string | null }>("SELECT type,parent_id FROM conversations WHERE id=?", [conversationId]);
         const members = await this.store.db.get<{ count: number }>("SELECT COUNT(*) AS count FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [conversationId]);
         const managed = queueCapable && conversation?.type === "direct" && !conversation.parent_id && members?.count === 1 && entries.every(row => row.targets === 1);
@@ -259,6 +270,7 @@ export class HubPromptQueue {
       const conversation = await this.store.db.get<{ type: string; parent_id: string | null }>("SELECT type,parent_id FROM conversations WHERE id=?", [conversationId]);
       const members = await this.store.db.get<{ count: number }>("SELECT COUNT(*) AS count FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [conversationId]);
       if (conversation?.type !== "direct" || conversation.parent_id || members?.count !== 1) return;
+      if (await this.store.db.get(`${HISTORY_HOLD_SQL} AND conversation_id=?`, [conversationId])) return;
       const rows = await this.rows(botId, conversationId);
       if (rows.some(row => row.dispatched || row.targets !== 1)) return;
       const row = rows.find(row => !row.queue_paused); if (!row) return;
