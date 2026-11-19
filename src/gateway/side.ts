@@ -94,6 +94,7 @@ export function gatewaySideSessions(bridge: CoreBridgeLike, stateDir: string, bo
   return {
     activeCount: () => sessions.activeCount(),
     close: () => sessions.closeAll(),
+    closeConversation: (conversationId: string) => sessions.closeConversation(conversationId),
     async call(method: string, raw: unknown) {
       try {
         const cfg = await config(), next = signature(cfg);

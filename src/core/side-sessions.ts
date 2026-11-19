@@ -233,6 +233,11 @@ export class CoreSideSessions {
     for (const [id, value] of this.closing) if (value.finished && value.until <= this.now()) this.closing.delete(id);
     for (const [key, value] of this.opens) if (value.until <= this.now()) this.opens.delete(key);
   }
+  /** #53: after a rewind every side handle of the conversation was forked
+   * from history that is gone. Open panels then read `expired`. */
+  async closeConversation(conversationId: string): Promise<void> {
+    await Promise.allSettled([...this.slots.values()].filter(slot => slot.scope.conversationId === conversationId).map(slot => this.close(slot.scope, slot.view.id)));
+  }
   async closeAll(): Promise<void> {
     this.closed = true; clearInterval(this.timer);
     await Promise.allSettled([...this.slots.values()].map(s => this.close(s.scope, s.view.id)));
