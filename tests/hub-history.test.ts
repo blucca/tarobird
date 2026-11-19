@@ -308,6 +308,23 @@ describe("no answer", () => {
     const done = await retried;
     expect(done.body).toMatchObject({ state: "completed", replayed: true, conversationId: call.params.targetConversationId });
   });
+  it("an unknown rewind retried later marks through the messages sent meanwhile", async () => {
+    await hub.close(); await start({ ...fast, unknownAfterMs: 1200 });
+    const { headers, chat, seeded, last } = await fixture();
+    const bot = await gateway();
+    const body = { botId: "alpha", requestId: "u_r", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last };
+    expect((await json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body))).body).toMatchObject({ state: "started" });
+    const { message: later } = await hub.store.sendMessage("owner", { conversationId: chat.id, clientMsgId: "later_r", text: "kept chatting", attachments: [] });
+    await until(async () => (await json(api(headers, `/api/conversations/${chat.id}/history/operations/u_r`))).body.state === "unknown", 5000);
+    await bot.next("instance.message", f => f.message.id === later.id);
+    await wait(450);
+    await hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=?", [later.id]);
+    bot.frames.length = 0;
+    const retried = json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body));
+    const call = await bot.next("instance.call", f => f.method === "history.rewind");
+    bot.reply(call, { ok: true });
+    expect((await retried).body).toMatchObject({ state: "completed", replayed: true, rewind: { throughMessageId: later.id } });
+  });
   it("re-drives started operations after a Hub restart", async () => {
     const { headers, chat, seeded, last } = await fixture();
     let bot = await gateway();

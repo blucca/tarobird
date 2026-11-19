@@ -159,8 +159,15 @@ export class HubHistory {
         if (prior.state === "unknown" && this.hooks.capable(prior.bot_id) === true && !await this.scopeInTransaction(conversationId, prior.bot_id)
           && !await this.activeInTransaction(conversationId) && !await this.store.historyBusyInTransaction(conversationId, prior.bot_id)) {
           const now = Date.now();
-          await this.db.run("UPDATE conversation_history_ops SET state='started',error=NULL,updated_at=? WHERE id=? AND state='unknown'", [now, prior.id]);
-          return { row: { ...prior, state: "started", error: null, updated_at: now }, replayed: true, restarted: true };
+          // A rewind drops everything after its anchor from the engine. If the
+          // first attempt never ran and the user kept chatting, the retry also
+          // drops those turns, so the marked range must reach today's last message.
+          const through = prior.kind === "rewind"
+            ? await this.db.get<{ id: string; created_at: number }>("SELECT id,created_at FROM messages WHERE conversation_id=? AND status!='deleted' ORDER BY created_at DESC,rowid DESC LIMIT 1", [conversationId])
+            : undefined;
+          const throughId = through?.id ?? prior.through_message_id, throughAt = through?.created_at ?? prior.through_created_at;
+          await this.db.run("UPDATE conversation_history_ops SET state='started',error=NULL,through_message_id=?,through_created_at=?,updated_at=? WHERE id=? AND state='unknown'", [throughId, throughAt, now, prior.id]);
+          return { row: { ...prior, state: "started", error: null, through_message_id: throughId, through_created_at: throughAt, updated_at: now }, replayed: true, restarted: true };
         }
         return { row: prior, replayed: true, restarted: false };
       }
