@@ -1,3 +1,4 @@
+import type { EngineHistoryAnchor } from "../client-protocol/history.js";
 import type { NativeInputAction, NativeInputCapability, NativeInputControlResult, NativeInputObserver } from "../client-protocol/native-input.js";
 import type { SteeringApplication } from "../client-protocol/steering-outcome.js";
 import type { RunScope } from "../client-protocol/run.js";
@@ -198,6 +199,13 @@ export type EngineApprovalDecision =
     };
 
 type UnscopedEngineStreamEvent =
+  | { /** #53: the engine started a turn of this run. Gateway-internal: feeds the
+       * history ledger, never leaves the Bot process. Codex: turn id. */
+      type: "turn_anchor";
+      sessionId: string;
+      turnId?: string;
+      endSeq?: number;
+    }
   | { /** Host recovery state after a confirmed terminal or unadmitted request. */
       type: "engine_retry";
       status: "waiting" | "retrying" | "resumed" | "cancelled" | "failed";
@@ -382,6 +390,9 @@ export interface AppPlatformTools {
 export interface CodexUserMessageInput {
   /** Trusted Bridge conversation identity, never supplied by prompt text. */
   inputOwnerKey?: string;
+  /** Hub user message that started this run (#53). Codex sends it as
+   * `clientUserMessageId`, so a turn can be matched back without the ledger. */
+  sourceMessageId?: string;
   /** Authenticated ordinary App input only; absent means wait for the review. */
   reviewAdmission?: "native";
   nativeInput?: NativeInputObserver;
@@ -425,6 +436,24 @@ export interface CodexAdapter {
   /** Pure lifecycle read across live sessions; retained native work can outlive
    * a foreground reply and must settle before a graceful Host restart. */
   hasPendingNativeWork?(): boolean;
+  /** #53 history operations. All optional: an adapter without them supports
+   * neither. Engines join only through a documented, programmatic operation. */
+  historyCapability?(sessionId: string, input?: { workspaceOverride?: string }): Promise<{
+    rewind: "turn" | "none";
+    fork: "turn" | "head" | "none";
+    reason?: "legacy_history" | "external_session" | "unsupported";
+  }>;
+  /** Drop the anchor turn and everything after it. Re-entrant: succeeds when the
+   * target turn is already gone from this session. */
+  rewindSession?(sessionId: string, input: { anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
+  /** Copy history through `through` (inclusive; omitted = whole) into an independent,
+   * persistent session. The source session is unchanged. */
+  forkSession?(sessionId: string, input: { through?: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
+  /** Match an older run (no ledger line) to its anchor in this session; undefined when not unique. */
+  resolveHistoryAnchor?(sessionId: string, input: {
+    sourceMessageId: string; text: string; startedAt?: number;
+    next?: { sourceMessageId: string; text: string; startedAt?: number };
+  }): Promise<EngineHistoryAnchor | undefined>;
   createSession(chatId: number): Promise<CodexSessionHandle>;
   sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse>;
   // Inject additional user input into this session's currently running turn

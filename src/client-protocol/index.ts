@@ -6,6 +6,7 @@ import { nativeInputProgressSchema } from "./native-input.js";
 import { steeringApplicationSchema } from "./steering-outcome.js";
 import { botSourceSchema } from "./bot-messages.js";
 import { DISPATCH_CAPABILITY, conversationTicketSchema } from "./dispatch.js";
+import { conversationHistorySchema } from "./history.js";
 import { linkUrlSchema, linkPreviewSchema, linkPreviewStyleSchema } from "./links.js";
 import { z } from "zod";
 import { PAIRING_INVITES_CAPABILITY } from "./pairing-invites.js";
@@ -72,7 +73,9 @@ export const messageSchema = z.object({ groupDiscussion: groupDiscussionMessageS
 export type Message = z.infer<typeof messageSchema>;
 export const conversationSchema = z.object({ id: idSchema, type: z.enum(["direct", "group"]), title: z.string().max(256), ownerId: idSchema, parentId: idSchema.optional(), botIds: z.array(idSchema), archived: z.boolean(), sessionId: z.string().optional(), bindingId: idSchema.optional(), createdAt: z.number().int(),
   /** dispatch.v1: a dispatcher ticket's worker conversation, kept out of lists. */
-  hidden: z.literal(true).optional(), ticket: conversationTicketSchema.optional() });
+  hidden: z.literal(true).optional(), ticket: conversationTicketSchema.optional(),
+  /** conversations.history.v1 (#53): rewind ranges and fork origin. Older Apps drop it. */
+  history: conversationHistorySchema.optional() });
 export type Conversation = z.infer<typeof conversationSchema>;
 export const eventSchema = z.object({ v: z.literal(1), type: z.literal("event"), conversationId: idSchema, seq: z.number().int().positive(), kind: z.enum(["message.created", "message.updated", "message.deleted", "message.stream", "turn.state", "reaction", "read"]), payload: jsonSchema, at: z.number().int() });
 export type HubEvent = z.infer<typeof eventSchema>;

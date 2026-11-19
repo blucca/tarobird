@@ -116,6 +116,7 @@ export function applyCoreEngineEvent(
 ): CoreRunState {
   switch (event.type) {
     case "scoped": return state; // Recorded separately; never alter the foreground card reducer.
+    case "turn_anchor": return state; // #53 history ledger only; never shown on the card.
     case "engine_retry":
       return { ...state, blocks: closeStreamingText(state.blocks), reasoning: { ...state.reasoning, active: false }, footer: "thinking" };
     case "thinking":
