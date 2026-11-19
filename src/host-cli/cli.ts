@@ -4,6 +4,7 @@ import { runConversationsCommand } from './conversations.js';
 import { runBackupsCommand } from "./backups.js";
 import { runFoldersCommand } from './folders.js';
 import { engineSettingsCommand } from "./engine-settings.js";
+import { engineQuotaCommand } from "./engine-quota.js";
 import { widgetSettingsCommand } from "./widget-settings.js";
 import { runWidgetsCommand, WIDGET_PUBLISH_USAGE } from "./widgets.js";
 import { voiceCommand } from "./voice.js";
@@ -150,6 +151,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   engines status [--request-id ID] [--json]
   engines set --engine ENGINE --path ABSOLUTE_PATH --revision REV [--request-id ID]
   engines reset --engine ENGINE --revision REV [--request-id ID]
+  engines quota [--refresh] [--json]   各引擎剩余额度与重置时间（只读，不发起模型对话）
     路径属于运行主机；保存前只检查文件。新启动的 Bot 生效，已运行的 Bot 请空闲后重启。
   widgets status [--request-id ID] [--json]
   widgets set --enabled on|off --revision REV [--request-id ID] [--json]
@@ -289,7 +291,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     wait: { type: "string" }, from: { type: "string" }, out: { type: "string" }, routes: { type: "string" },
     lan: { type: "boolean" }, tailscale: { type: "boolean" }, address: { type: "string" }, reset: { type: "boolean" },
     role: { type: "string" }, "dispatch-mode": { type: "string" }, "max-concurrent": { type: "string" }, allow: { type: "string" }, assist: { type: "string" }, status: { type: "string" }, note: { type: "string" }, open: { type: "boolean" }, match: { type: "string" }, offset: { type: "string" },
-    folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
+    folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, "dry-run": { type: "boolean" }, refresh: { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
     "html-file": { type: "string" }, "report-file": { type: "string" }, title: { type: "string" }, summary: { type: "string" },
     token: { type: "string" }, target: { type: "string" }, task: { type: "string" }, bot: { type: "string" }, message: { type: "string" }, before: { type: "string" }, through: { type: "string" }, last: { type: "boolean" },
     path: { type: "string" }, operation: { type: "string" }, preview: { type: "boolean" },
@@ -313,7 +315,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
   const allowed: Record<string, string[]> = {
     screens: ["from", "yes", "permission", "request-id"],
     workbench: ["from", "request-id", "context-message", "file"],
-    engines: ["engine", "path", "revision", "request-id"],
+    engines: ["engine", "path", "revision", "request-id", "refresh"],
     backups: ["days", "revision", "request-id"],
     integrations: ["yes", "request-id", "mode", "enabled", "adapter", "threshold-seconds", "revision"], directory: ["from"], init: ["name"], stop: ["wait", "force"], restart: ["wait", "force"], enroll: ["reset", "yes"], name: ["name"], drain: ["wait"],
     service: ["yes"], bots: ["name", "engine", "model", "effort", "workspace", "permission", "request-id", "expected-name", "yes", "revision", "enabled", "role", "dispatch-mode", "max-concurrent", "allow", "from"],
@@ -402,8 +404,15 @@ export async function runHostCli(argv: string[]): Promise<void> {
     return;
   }
   if (command === "engines") {
-    if (argument) throw new Error("请使用 engines status|set|reset --help。");
+    if (argument) throw new Error("请使用 engines status|set|reset|quota --help。");
+    if (sub !== "quota" && v.refresh !== undefined) throw new Error("--refresh 只用于 engines quota。");
+    if (sub === "quota" && (v.engine !== undefined || v.path !== undefined || v.revision !== undefined || v["request-id"] !== undefined)) throw new Error("engines quota 只接受 --refresh 和 --json。");
     const client = await LocalHostClient.connect(directory);
+    if (sub === "quota") {
+      try { await output(await engineQuotaCommand(client, { refresh: v.refresh === true })); }
+      finally { client.close(); }
+      return;
+    }
     try { await output(await engineSettingsCommand(client, sub ?? "", { engine: v.engine, path: v.path, revision: v.revision, requestId: v["request-id"] }, id => console.error(`引擎路径操作编号：${id}。结果未确认时用 engines status --request-id 核对。`))); }
     finally { client.close(); }
     return;

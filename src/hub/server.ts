@@ -14,6 +14,8 @@ import { nativeInputControlRequestSchema } from "../client-protocol/steering.js"
 import { NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, nativeInputControlResultSchema } from "../client-protocol/native-input.js";
 import { STEERING_OUTCOME_CAPABILITY } from "../client-protocol/steering-outcome.js";
 import { HubEngineSettings } from "./engine-settings.js";
+import { HubEngineQuota } from "./engine-quota.js";
+import { hostEngineEnvironment } from "../runtime/host-engine-settings.js";
 import { engineSettingsUpdateSchema } from "../client-protocol/engine-settings.js";
 import { HubWidgetSettings } from "./widget-settings.js";
 import { automaticBackupSummary, readBackupSettings, updateBackupSettings } from "./backup-settings.js";
@@ -152,6 +154,7 @@ export class HubServer {
   readonly workspaceDiff: HubWorkspaceDiff;
   readonly runChanges: HubRunChanges;
   readonly engineSettings: HubEngineSettings;
+  readonly engineQuota: HubEngineQuota;
   readonly widgetSettings: HubWidgetSettings;
   private readonly sideSessions: HubSideSessions;
   readonly voiceSettings: HubVoiceSettings;
@@ -323,6 +326,12 @@ export class HubServer {
     this.runChanges = new HubRunChanges(store);
     this.relaySources = options.relaySources ?? new RelaySources();
     this.engineSettings = new HubEngineSettings(options.stateDir, () => options.managedBots?.env ?? process.env);
+    this.engineQuota = new HubEngineQuota({
+      engines: () => this.engineSettings.status().engines.map(engine => ({ id: engine.id, executable: engine.executable })),
+      env: () => hostEngineEnvironment(options.stateDir, options.managedBots?.env ?? process.env),
+      bots: () => this.store.db.serial(() => this.store.db.all<{ id: string; name: string; engine: string }>("SELECT b.id,b.name,b.engine FROM bots b JOIN managed_bots m ON m.bot_id=b.id WHERE b.deleted_at IS NULL ORDER BY b.name,b.id")),
+      botStateDir: botId => path.join(options.stateDir, "bots", botId),
+    });
     this.widgetSettings = new HubWidgetSettings(options.stateDir);
     this.sideSessions = new HubSideSessions(store, auth, (botId, method, params, timeout) => this.callBot(botId, method, params, timeout));
     this.disposers.push(() => this.sideSessions.dispose());
@@ -1571,6 +1580,9 @@ export class HubServer {
         } else view = this.engineSettings.status(idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined));
         await reply(200, view); return;
       }
+      // Owner-only: a pairing or Bot-messaging grant never widens who sees account quota.
+      if (route === "/api/engines/quota" && req.method === "GET") { await requireOwner(); await reply(200, await this.engineQuota.view()); return; }
+      if (route === "/api/engines/quota/refresh" && req.method === "POST") { await requireOwner(); await reply(200, await this.engineQuota.refresh()); return; }
       if (route === "/api/settings/widgets" && ["GET", "PUT"].includes(req.method ?? "")) {
         await requireOwner();
         let view;

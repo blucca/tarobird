@@ -69,6 +69,7 @@ import { DEFAULT_APPROVAL_MODE, normalizeApprovalMode, type ApprovalMode } from 
 import { readValidatedConfigFile, resolveEngineOverride } from "../state/instance-config.js";
 import { renderBackgroundTaskHeader } from "../runtime/background-task-header.js";
 import { redactSecrets } from "../runtime/secret-redaction.js";
+import { recordClaudeRateLimit } from "../runtime/engine-quota-events.js";
 import { claudeManagedSearchServers, type NativeSearchMcpPlanner } from "../runtime/native-search-mcp.js";
 
 type SpawnOptions = {
@@ -1477,6 +1478,18 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     return claudeGoalFrameContent(goalCommand, context);
   }
 
+  /** Quota evidence only (#47): the public fields of `rate_limit_event` go to
+   * this Bot's state directory, where the Host's quota view reads them. Writes
+   * are serialized and best effort; they never affect the turn. */
+  private rateLimitWrites: Promise<void> = Promise.resolve();
+  private observeRateLimit(parsed: ClaudeStreamEvent): void {
+    const record = parsed as { type?: unknown; rate_limit_info?: unknown };
+    const stateDir = process.env.TAROBOT_STATE_DIR;
+    if (record.type !== "rate_limit_event" || !stateDir || !record.rate_limit_info || typeof record.rate_limit_info !== "object") return;
+    const info = record.rate_limit_info as Parameters<typeof recordClaudeRateLimit>[1];
+    this.rateLimitWrites = this.rateLimitWrites.then(() => recordClaudeRateLimit(stateDir, info)).catch(() => undefined);
+  }
+
   /** Records what Claude itself says about `/goal` on the main thread: the
    * reply to a goal command, each "not met" verdict of the known goal and the
    * consecutive-block cap. Claude reports nothing on this stream when the
@@ -1912,6 +1925,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     if (worker.side?.handle(parsed as Record<string, unknown>)) return;
     // Evidence only: never changes how a frame is routed below.
     this.observeNativeGoal(worker, parsed);
+    this.observeRateLimit(parsed);
     // Host-originated control responses and lifecycle frames; task frames are
     // only observed here and keep their existing routing below.
     if (worker.control.handle(parsed as Record<string, unknown>)) return;
