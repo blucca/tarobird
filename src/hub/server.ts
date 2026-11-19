@@ -19,6 +19,8 @@ import { HubWidgetSettings } from "./widget-settings.js";
 import { automaticBackupSummary, readBackupSettings, updateBackupSettings } from "./backup-settings.js";
 import { backupSettingsUpdateSchema } from "../client-protocol/backup-settings.js";
 import { HubSideSessions } from "./side-sessions.js";
+import { HubHistory, type HistoryTimings } from "./history.js";
+import { HISTORY_CAPABILITY } from "../client-protocol/history.js";
 import { sideOpenSchema, sideAskSchema } from "../client-protocol/side.js";
 import { WIDGET_POLICY_CAPABILITY, widgetSettingsUpdateSchema } from "../client-protocol/widget-settings.js";
 import { widgetBlock } from "../client-protocol/widget.js";
@@ -128,6 +130,9 @@ import { exportGoogleDocument } from "./google-export.js";
 import { ShutdownErrors } from "./shutdown.js";
 
 const SNAPSHOT_WINDOW_MESSAGES = 32, SNAPSHOT_WINDOW_BYTES = 1024 * 1024;
+/** `ready.serverCapabilities`: the shared App list plus Hub-only entries. Never
+ * add these to CAPABILITIES, which is also the App `hello` list (max 64). */
+const SERVER_CAPABILITIES = [...CAPABILITIES, HISTORY_CAPABILITY];
 type SnapshotTransfer = { id: string; sent: number; received: number; bytes: number; pending: { count: number; bytes: number }[]; changed?: () => void };
 type Client = { foreground: boolean; ws: WebSocket; session?: AuthSession; rejected?: "device_revoked" | "session_expired"; capabilities: string[]; cursors: Record<string, number>; syncLineages: Record<string, string>; conversationIds: Set<string>; readySent: boolean; pendingPublications: unknown[]; syncing: boolean; pendingSync: Set<string>; syncingConversations: Set<string>; syncFailures: Set<string>; streams: Map<string, Message>; snapshot?: SnapshotTransfer };
 /** Older gateways parse turn metadata strictly and predate design.open: give
@@ -137,10 +142,10 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
   const { workbench, ...rest } = metadata, { openTarget: _opener, ...context } = workbench;
   return (workbenchOpenerOnly(workbench) ? rest : { ...rest, workbench: context }) as T;
 }
-type BotConnection = { designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
+type BotConnection = { history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
-export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
+export interface HubServerOptions { /** Internal call/expiry overrides for isolated tests. */ historyTimings?: HistoryTimings; voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
 export class HubServer {
   private readonly relaySources: RelaySources;
   private readonly fragmentSockets = new WeakSet<WebSocket>();
@@ -154,6 +159,7 @@ export class HubServer {
   readonly engineSettings: HubEngineSettings;
   readonly widgetSettings: HubWidgetSettings;
   private readonly sideSessions: HubSideSessions;
+  readonly history: HubHistory;
   readonly voiceSettings: HubVoiceSettings;
   readonly asrSetup: QwenAsrSetup;
   readonly profile: HostProfile;
@@ -336,6 +342,16 @@ export class HubServer {
     const conversationsCreated = (userId: string, conversations: Conversation[]) => {
       for (const conversation of conversations) for (const c of this.clients) if (c.session?.userId === userId && (!conversation.hidden || c.capabilities.includes(DISPATCH_CAPABILITY))) { c.conversationIds.add(conversation.id); this.publishClient(c, { v: 1, type: "conversation.updated", conversation }); }
     };
+    this.history = new HubHistory(store, auth, {
+      capable: (botId) => { const connection = this.bots.get(botId); return connection?.ready ? connection.history : undefined; },
+      call: (botId, method, params, timeout) => this.callBot(botId, method, params, timeout),
+      conversationChanged: (conversation) => { for (const c of this.clients) if (c.conversationIds.has(conversation.id)) this.publishClient(c, { v: 1, type: "conversation.updated", conversation }); },
+      conversationCreated: (userId, conversation) => conversationsCreated(userId, [conversation]),
+      released: (botId) => this.scheduleDispatch(botId),
+      stopping: () => this.stopping,
+      track: (work) => this.trackTask(work),
+      warn: (code) => options.onWarning?.(code),
+    }, options.historyTimings);
     this.botMessages = new BotMessages(store, auth, this.network, attachments, undefined,
       botId => { const connection = this.bots.get(botId); return connection?.ready ? connection.botMessages : undefined; },
       (userId, conversation) => conversationsCreated(userId, [conversation]));
@@ -515,6 +531,9 @@ export class HubServer {
       const attachments = new HubAttachments(store, options.stateDir, options.maxFileBytes); await attachments.initialize();
       hub = new HubServer(store, auth, attachments, options);
       hub.releaseIdentityAdmission = releaseIdentity;
+      // With recoverSteering above: rewinds/forks left started wait for their
+      // Bot's reconnect, which resends them; the expiry clock restarts now.
+      await hub.history.recover();
       hub.syncLineage = (await store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='sync_lineage'"))?.value;
       // Runs whose input settled while this Hub was stopped never stay active.
       await hub.agentBuses.reconcile();
@@ -608,6 +627,7 @@ export class HubServer {
     errors.finish("hub_close_failed");
   }
   private async sweep(): Promise<void> {
+    await this.history.sweep().catch(() => this.options.onWarning?.("history_sweep_failed"));
     await this.remoteScreen.sweep();
     for (const client of this.clients) if (client.session) {
       try { await this.auth.validateSession(client.session); }
@@ -955,7 +975,7 @@ export class HubServer {
           // copy of every conversation/avatar/history merely to list Bots.
           // Authentication and all subsequent HTTP authorization are unchanged.
           if (client.capabilities.includes("management.v1")) {
-            await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: CAPABILITIES,
+            await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES,
               uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations: [], avatars: [] });
             client.readySent = true; client.syncing = false;
             client.pendingPublications.length = 0; client.pendingSync.clear();
@@ -969,7 +989,7 @@ export class HubServer {
             this.options.onWarning?.("conversation_folders_unavailable");
             return undefined;
           });
-          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations, ...(conversationFolders ? { conversationFolders } : {}), avatars: await this.avatars.list(session.userId, session) });
+          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations, ...(conversationFolders ? { conversationFolders } : {}), avatars: await this.avatars.list(session.userId, session) });
           while (client.pendingPublications.length) await this.sendClient(client, client.pendingPublications.shift());
           client.readySent = true;
           if (client.capabilities.includes(CONVERSATION_SYNC_CAPABILITY)) {
@@ -1251,7 +1271,7 @@ export class HubServer {
           botId = frame.botId; if (frame.capabilities?.includes(FRAGMENT_CAPABILITY)) this.fragmentSockets.add(ws); clearTimeout(timeout); this.bots.get(botId)?.ws.close(4000, "replaced");
           const queueAdvertised = frame.capabilities?.includes(PROMPT_QUEUE_CAPABILITY) ?? false;
           const queueCapable = queueAdvertised && supportsPromptQueueEngine(frame.engine);
-          const connection: BotConnection = { designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
+          const connection: BotConnection = { history: frame.capabilities?.includes(HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
           // Reserve socket ownership before awaiting SQLite. Concurrent hellos
           // must replace this exact socket, not both replace its predecessor.
           this.bots.set(botId, connection);
@@ -1262,6 +1282,8 @@ export class HubServer {
           // Never await RPC results in this socket's frame chain: its result
           // frames are handled by that same chain after hello completes.
           if (connection.agentBus) this.trackTask(this.replayAbandonedBusStops(connection).catch(() => this.options.onWarning?.("agent_bus_stop_replay_failed")));
+          // Started rewinds/forks of this Bot are resent with their requestIds.
+          this.trackTask(this.history.resume(botId).catch(() => this.options.onWarning?.("history_resume_failed")));
           this.trackTask(this.groupDiscussions.settleBot(botId, true).catch(() => this.options.onWarning?.("group_discussion_settle_failed")));
           this.scheduleDispatch(botId); await this.broadcastBotStatus(botId); return;
         }
@@ -1789,6 +1811,19 @@ export class HubServer {
           else input = { ...(url.searchParams.get("attachments") === "1" ? { withAttachments: true, ...(url.searchParams.get("audio") === "1" ? { withAudio: true } : {}) } : {}), ...(url.searchParams.get("tools") === "1" ? { withTools: true } : {}), ...(url.searchParams.get("delivery") === "1" ? { withDelivery: true } : {}) };
         } else throw new HubError("not_found", 404);
         await reply(200, await this.sideSessions.request(session, conversationId, botId, method, input)); return;
+      }
+      // #53 rewind/fork: user sessions only. Bot passports never reach here
+      // (bot-messages route allow-list) and no slash command triggers them.
+      const historyRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/history(?:\/(rewind|fork)|\/operations\/([A-Za-z0-9_-]+))?$/);
+      if (historyRoute) {
+        const conversationId = historyRoute[1]!, action = historyRoute[2], requestId = historyRoute[3];
+        if (!action && !requestId && req.method === "GET") { await reply(200, await this.history.status(session, conversationId, idSchema.parse(url.searchParams.get("botId")), validateInQueue)); return; }
+        if (action && req.method === "POST") {
+          const body = await this.jsonBody(req, 8192);
+          await reply(200, action === "rewind" ? await this.history.rewind(session, conversationId, body, validateInQueue) : await this.history.fork(session, conversationId, body, validateInQueue)); return;
+        }
+        if (requestId && req.method === "GET") { await reply(200, await this.history.operation(session, conversationId, requestId, validateInQueue)); return; }
+        throw new HubError("method_not_allowed", 405);
       }
       const inputRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/inputs\/([A-Za-z0-9_-]+)$/);
       if (inputRoute && req.method === "POST") {
