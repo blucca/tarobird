@@ -205,3 +205,56 @@ test('after a Tauri upgrade the installer asks the helper, by fixed flag only, t
   // No other hook deletes inside the installation directory recursively.
   assert.doesNotMatch(hooks, /RMDir \/r|RmDir \/r/i);
 });
+
+test('backup exit codes have localized, path-free diagnostics in both NSIS programs', async () => {
+  const read = file => readFile(path.join(TEMPLATE_DIR, file), 'utf8');
+  const [rust, dialog, hooks, utils, en, zh] = await Promise.all([
+    readFile(path.join(client, 'src-tauri/src/fresh_install.rs'), 'utf8'),
+    ...['installer-diagnostics.nsh', 'installer-hooks.nsh', 'utils.nsh', 'English.nsh', 'SimpChinese.nsh'].map(read),
+  ]);
+  const reasons = rust.match(/pub enum Reason \{([^}]+)\}/)[1];
+  const exitCodes = [...reasons.matchAll(/= (\d+),/g)].map(match => Number(match[1]));
+  const handled = [...dialog.matchAll(/\$\{Case\} (\d+)/g)].map(match => Number(match[1]));
+  assert.deepEqual([...handled, 60], exitCodes, '60 is handled separately as incomplete finalization');
+  const required = new Set([...(dialog + hooks + utils).matchAll(/\$\((bird\w+)\)/g)].map(match => match[1]));
+  for (const language of [en, zh]) {
+    const strings = new Map([...language.matchAll(/^LangString (bird\w+) \S+ "(.+)"$/gm)].map(match => [match[1], match[2]]));
+    for (const key of required) {
+      assert.ok(strings.has(key), key);
+      assert.doesNotMatch(strings.get(key).replaceAll('$\\r$\\n', ''), /\$|[\\/]/, key);
+    }
+    assert.notEqual(strings.get('birdInstallBackup'), strings.get('birdUninstallBackup'));
+    assert.match(strings.get('birdCopy'), /Ctrl\+C/);
+  }
+  assert.doesNotMatch(dialog, /\$INSTDIR|\$APPDATA|\$PROFILE|\$TEMP|\$CMDLINE|ReadReg|FileRead|ExecWait/);
+});
+
+test('reset requires consent and safe backup states; later retries stay in their own stage', async () => {
+  const hooks = await readFile(path.join(TEMPLATE_DIR, 'installer-hooks.nsh'), 'utf8');
+  const macro = name => hooks.split('!macro ' + name)[1].split('!macroend')[0];
+  const inOrder = (source, ...fragments) => {
+    let start = 0;
+    for (const fragment of fragments) {
+      const index = source.indexOf(fragment, start);
+      assert.ok(index >= start, 'missing or out of order: ' + fragment);
+      start = index + fragment.length;
+    }
+  };
+  const install = macro('NSIS_HOOK_PREINSTALL');
+  const uninstall = macro('NSIS_HOOK_PREUNINSTALL');
+  const backup = macro('BirdBackup');
+  inOrder(install, '${IfNot} ${Silent}', '$PassiveMode <> 1', '$UpdateMode <> 1',
+    '$TaroBotHadInstallation == ""', 'IDYES tarobot_fresh_install', 'tarobot_fresh_install:', '!insertmacro BirdBackup');
+  inOrder(uninstall, '!insertmacro TaroBotStopLocalHost 0', '$UpdateMode <> 1', '$DeleteAppDataCheckboxState = 1',
+    'IDYES tarobot_uninstall_fresh', 'Abort', 'tarobot_uninstall_fresh:', '!insertmacro BirdBackup', 'StrCpy $DeleteAppDataCheckboxState 0');
+  inOrder(backup, 'bird_backup_retry:', '!insertmacro CheckIfAppIsRunning', '--prepare-fresh-install-v2');
+  inOrder(backup, '$R0 = 0', 'StrCpy $BirdBackupState "$(birdCompleted)"', '$R0 = 10', 'StrCpy $BirdBackupState "$(birdNoData)"');
+  for (const code of ['B60', 'B-UNKNOWN', 'B$R0']) {
+    assert.ok(backup.includes('"$(birdPreserve)" "' + code + '" ""'), code + ' must stop without retry');
+  }
+  const template = await readFile(path.join(TEMPLATE_DIR, 'installer.nsi'), 'utf8');
+  assert.doesNotMatch(template, /RMDir\s+\/r\s+"\$(?:LOCAL)?APPDATA/i);
+  const notificationRetry = uninstall.split('bird_notice_retry:')[1];
+  inOrder(notificationRetry, 'ReadRegStr', 'CheckIfAppIsRunning', '--clear-notification-history', '"NOTICE-CLEAR" bird_notice_retry');
+  assert.doesNotMatch(notificationRetry, /BirdBackup|prepare-fresh-install|RmDir/);
+});

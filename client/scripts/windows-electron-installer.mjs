@@ -24,7 +24,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 export const TEMPLATE_DIR = fileURLToPath(new URL('../windows-electron/', import.meta.url));
-export const TEMPLATE_FILES = ['installer.nsi', 'installer-hooks.nsh', 'utils.nsh', 'FileAssociation.nsh', 'English.nsh', 'SimpChinese.nsh'];
+export const TEMPLATE_FILES = ['installer.nsi', 'installer-hooks.nsh', 'installer-diagnostics.nsh', 'utils.nsh', 'FileAssociation.nsh', 'English.nsh', 'SimpChinese.nsh'];
 export const MAIN_BINARY = 'tarocub-client.exe';
 export const HELPER_BINARY = 'tarobot-installer-helper.exe';
 // The nsis_tauri_utils.dll that tauri-bundler 2.12.1 pins for its template
