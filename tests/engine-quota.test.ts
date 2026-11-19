@@ -24,8 +24,10 @@ const agyUsage = (fraction: number, turns = 0) => JSON.stringify({ status: "SUCC
 ] } } });
 
 describe("engine quota protocol", () => {
-  it("is advertised so older Hubs can be told apart", () => {
-    expect(CAPABILITIES).toContain(ENGINE_QUOTA_CAPABILITY);
+  it("never grows the App handshake that released Hubs cap at 64 entries", () => {
+    // The App sends CAPABILITIES plus its snapshot-activity flag in `hello`.
+    expect(CAPABILITIES).not.toContain(ENGINE_QUOTA_CAPABILITY);
+    expect(CAPABILITIES.length + 1).toBeLessThanOrEqual(64);
   });
 });
 
