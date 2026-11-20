@@ -1,4 +1,4 @@
-# ACCEPTANCE-ONLY TRIAGE BRANCH COPY (#50 native). Never merge this file into main:
+# ACCEPTANCE-ONLY TRIAGE BRANCH COPY (#50 native, pass 2). Never merge this file into main:
 # it builds no installer, signs nothing, uploads nothing and publishes nothing.
 # It reruns only the "Native Rust regressions on the x64 runner" cargo commands
 # and the three native integration tests of windows-acceptance.mjs --scope native
@@ -32,13 +32,6 @@ jobs:
           if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "This acceptance-only workflow copy runs only from an accept/* branch" }
           "runner=$env:RUNNER_ENVIRONMENT os=$env:ImageOS image=$env:ImageVersion ref=$env:REF"
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            client/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -46,72 +39,10 @@ jobs:
         with:
           workspaces: client/src-tauri -> target
           save-if: false
-      - run: npm ci
-      - run: npm ci --prefix client
-      - name: Pinned Host Node runtime (same archive and SHA-256 as scripts/prepare-desktop-host.mjs)
-        shell: pwsh
-        run: |
-          $zip = "$env:RUNNER_TEMP/node-v24.22.3-win-x64.zip"
-          Invoke-WebRequest -Uri 'https://nodejs.org/dist/v24.22.3/node-v24.22.3-win-x64.zip' -OutFile $zip
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne 'e612af99f626ab415ea225af6bce5c971feb448cb5cae250bb1c3fa50c5f7d9f') { throw "Node archive integrity failed: $hash" }
-          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP/host-node" -Force
-          $node = "$env:RUNNER_TEMP/host-node/node-v24.22.3-win-x64/node.exe"
-          if (-not (Test-Path $node)) { throw "node.exe missing from the pinned archive" }
-          "TAROBOT_TEST_NODE=$node" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Toolchain and system state
-        shell: pwsh
-        run: |
-          rustc -Vv; cargo -V; node -v; & $env:TAROBOT_TEST_NODE -v
-          "user=$env:USERNAME temp=$env:TEMP image=$env:ImageVersion"
-          [System.Environment]::OSVersion.VersionString
-          "RUSTFLAGS=[$env:RUSTFLAGS] CARGO_INCREMENTAL=[$env:CARGO_INCREMENTAL]"
-      # Exactly the three commands of step 17, but every command runs so one
-      # failing crate cannot hide another. On failure the same command is run
-      # again with --no-fail-fast (already compiled) to list every failing binary.
-      - name: Native Rust regressions on the x64 runner (step 17 commands)
-        id: step17
-        continue-on-error: true
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
-          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $commands = @(
-            @{ name = 'desktop-core'; cargo = @('test', '--manifest-path', 'client/src-desktop-core/Cargo.toml', '--locked', '--', '--test-threads=1') },
-            @{ name = 'desktop-native'; cargo = @('test', '--manifest-path', 'client/src-desktop-native/Cargo.toml', '--locked', '--no-default-features') },
-            @{ name = 'desktop-updater'; cargo = @('test', '--manifest-path', 'client/src-desktop-updater/Cargo.toml', '--locked', '--lib', '--bins', '--test', 'real_archive') }
-          )
-          $failed = @()
-          $summary = @('### Step 17 native Rust triage')
-          foreach ($c in $commands) {
-            Write-Output "::group::cargo $($c.cargo -join ' ')"
-            & cargo @($c.cargo) 2>&1 | Tee-Object -Variable out | Write-Output
-            $code = $LASTEXITCODE
-            Write-Output "::endgroup::"
-            Write-Output "RESULT $($c.name) exit=$code"
-            $summary += "- $($c.name): exit $code"
-            if ($code -ne 0) {
-              $failed += $c.name
-              $retry = $c.cargo.Clone()
-              $sep = [Array]::IndexOf($retry, '--')
-              if ($sep -ge 0) { $retry = $retry[0..($sep - 1)] + @('--no-fail-fast') + $retry[$sep..($retry.Count - 1)] } else { $retry += '--no-fail-fast' }
-              Write-Output "::group::no-fail-fast cargo $($retry -join ' ')"
-              & cargo @retry 2>&1 | Tee-Object -Variable out2 | Write-Output
-              Write-Output "::endgroup::"
-              $lines = @(@($out) + @($out2) | ForEach-Object { "$_" } | Where-Object { $_ -match '^test result:|^test .* (FAILED|ok)$|panicked at|^error(\[E\d+\])?:|^     Running |^failures:|^    [a-z_:]+$|---- .* stdout ----|assertion|left:|right:' })
-              $summary += '```'; $summary += ($lines | Select-Object -First 200); $summary += '```'
-            }
-          }
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
-          if ($failed.Count) { throw "Step 17 command(s) failed: $($failed -join ', ')" }
-      # The --native-tests part of step 19 (windows-acceptance.mjs --scope native),
-      # same command and environment: RUSTFLAGS removed, static CRT target flags.
-      - name: windows-acceptance native integration tests (step 19 native part)
-        id: native19
-        continue-on-error: true
+      # Second triage pass: is system::a_process_not_started_by_electron_main_is_refused
+      # order-dependent inside one test process? Same command and environment as
+      # the step 19 native part, varying only the test filter.
+      - name: Source-guard isolation check
         shell: pwsh
         env:
           TAROBOT_WINDOWS_ACCEPTANCE: disposable
@@ -121,27 +52,22 @@ jobs:
         run: |
           Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
           Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
-          # Step 19 never had the Host Node variable; keep its environment exact.
-          Remove-Item Env:TAROBOT_TEST_NODE -ErrorAction SilentlyContinue
           $ErrorActionPreference = 'Continue'
-          $cargoArgs = @('test', '--manifest-path', 'client/src-desktop-updater/Cargo.toml', '--locked', '--target', 'x86_64-pc-windows-msvc',
-            '--test', 'windows_runtime', '--test', 'windows_control_job', '--test', 'windows_source_guard', '--', '--test-threads=1', '--nocapture')
-          & cargo @cargoArgs 2>&1 | Tee-Object -Variable out | Write-Output
-          $code = $LASTEXITCODE
-          $retry = $null
-          if ($code -ne 0) {
-            $sep = [Array]::IndexOf($cargoArgs, '--')
-            $nff = $cargoArgs[0..($sep - 1)] + @('--no-fail-fast') + $cargoArgs[$sep..($cargoArgs.Count - 1)]
-            Write-Output "::group::no-fail-fast cargo $($nff -join ' ')"
-            & cargo @nff 2>&1 | Tee-Object -Variable retry | Write-Output
-            Write-Output "::endgroup::"
+          $base = @('test', '--manifest-path', 'client/src-desktop-updater/Cargo.toml', '--locked', '--target', 'x86_64-pc-windows-msvc', '--test', 'windows_source_guard', '--')
+          $cases = [ordered]@{
+            'A-isolated'         = @('--exact', 'system::a_process_not_started_by_electron_main_is_refused', '--nocapture')
+            'B-without-late-app' = @('--test-threads=1', '--skip', 'system::a_late_old_app_finds_the_guard_window_and_its_forward_is_acknowledged')
+            'C-full-binary'      = @('--test-threads=1')
           }
-          $lines = @(@($out) + @($retry) | ForEach-Object { "$_" } | Where-Object { $_ -match '^test result:|^test .* (FAILED|ok|ignored)$|^skipped:|panicked at|^error(\[E\d+\])?:|^     Running |---- .* stdout ----|assertion|left:|right:' })
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value (@('### Step 19 native integration tests', "exit $code", '```') + ($lines | Select-Object -First 200) + @('```'))
-          if ($code -ne 0) { throw "Native integration tests failed (exit $code)" }
-      - name: Triage outcome
-        if: ${{ !cancelled() }}
-        shell: pwsh
-        run: |
-          "step17=${{ steps.step17.outcome }} native19=${{ steps.native19.outcome }}"
-          if ('${{ steps.step17.outcome }}' -ne 'success' -or '${{ steps.native19.outcome }}' -ne 'success') { throw "native triage found failures; see the step logs and summary" }
+          $summary = @('### Source-guard isolation check', '```')
+          foreach ($name in $cases.Keys) {
+            Write-Output "::group::$name cargo $(($base + $cases[$name]) -join ' ')"
+            & cargo @($base + $cases[$name]) 2>&1 | Tee-Object -Variable out | Write-Output
+            $code = $LASTEXITCODE
+            Write-Output "::endgroup::"
+            Write-Output "RESULT $name exit=$code"
+            $summary += "RESULT $name exit=$code"
+            $summary += @(@($out) | ForEach-Object { "$_" } | Where-Object { $_ -match '^test result:|^test .* (FAILED|ok)$|panicked at|left:|right:' })
+          }
+          $summary += '```'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
