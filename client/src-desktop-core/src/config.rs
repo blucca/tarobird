@@ -55,13 +55,24 @@ impl Config {
 mod tests {
     use super::*;
     fn args(values: &[&str]) -> Vec<OsString> { values.iter().map(OsString::from).collect() }
+    // Absolute on the platform under test: Windows needs a drive or UNC prefix,
+    // so `/tmp/a` is relative there and would make every case below vacuous.
+    #[cfg(not(windows))]
     const VALID: &[&str] = &["--state-dir", "/tmp/a", "--keyring-service", "com.tarobot.client.device.test-1",
         "--resources-dir", "/tmp/r", "--host-state-dir", "/tmp/com.tarobot.client"];
+    #[cfg(windows)]
+    const VALID: &[&str] = &["--state-dir", r"C:\tmp\a", "--keyring-service", "com.tarobot.client.device.test-1",
+        "--resources-dir", r"C:\tmp\r", "--host-state-dir", r"C:\tmp\com.tarobot.client"];
+    #[cfg(not(windows))]
+    const BAD_PATHS: &[(usize, &str)] = &[(1, "relative"), (1, "/tmp/../etc"), (5, "r"), (7, "/tmp/x/host"), (7, "/")];
+    // `\tmp\a` has a root but no drive: relative on Windows.
+    #[cfg(windows)]
+    const BAD_PATHS: &[(usize, &str)] = &[(1, "relative"), (1, r"\tmp\a"), (1, r"C:\tmp\..\etc"), (5, "r"), (7, r"C:\tmp\x\host"), (7, r"C:\")];
 
     #[test]
     fn requires_every_fixed_path_once_and_rejects_ambiguity() {
         let config = Config::parse(args(VALID)).unwrap();
-        assert_eq!(config.host_state_dir, PathBuf::from("/tmp/com.tarobot.client"));
+        assert_eq!(config.host_state_dir, PathBuf::from(VALID[7]));
         for skip in (0..VALID.len()).step_by(2) {
             let mut partial = VALID.to_vec(); partial.drain(skip..skip + 2);
             assert!(Config::parse(args(&partial)).is_err(), "missing {}", VALID[skip]);
@@ -76,7 +87,7 @@ mod tests {
 
     #[test]
     fn rejects_relative_traversing_or_resolved_host_paths_and_unsafe_services() {
-        for (index, value) in [(1, "relative"), (1, "/tmp/../etc"), (5, "r"), (7, "/tmp/x/host"), (7, "/")] {
+        for &(index, value) in BAD_PATHS {
             let mut bad = VALID.to_vec(); bad[index] = value;
             assert!(Config::parse(args(&bad)).is_err(), "{value}");
         }
