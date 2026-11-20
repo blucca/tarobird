@@ -1,6 +1,7 @@
 package com.tarobot.client;
 
 import java.io.*;
+import java.lang.management.*;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -42,6 +43,50 @@ public final class NativeScreenAudit {
     }
     static JSONObject command(JSONObject join,String type) throws Exception {return new JSONObject().put("type",type).put("sessionId",join.getJSONObject("session").getString("id")).put("generation",join.getJSONObject("session").getString("generation"));}
     static void frame(JSONObject join,int sequence,boolean malformed) throws Exception {request(new JSONObject().put("action","frame").put("id",join.getJSONObject("session").getString("id")).put("sequence",sequence).put("malformed",malformed));}
+    /** Readers parked on the transport monitor inside HubSocket.onWebsocketPing (its activity report). */
+    static List<ThreadInfo> parkedPings() {
+        List<ThreadInfo> found=new ArrayList<>();
+        for(ThreadInfo info:ManagementFactory.getThreadMXBean().dumpAllThreads(true,false)) {
+            LockInfo lock=info.getLockInfo();
+            if(info.getThreadState()!=Thread.State.BLOCKED||lock==null||lock.getIdentityHashCode()!=System.identityHashCode(transport)) continue;
+            for(StackTraceElement frame:info.getStackTrace()) if(frame.getClassName().equals("com.tarobot.client.HubSocket")&&frame.getMethodName().equals("onWebsocketPing")) { found.add(info); break; }
+        }
+        return found;
+    }
+    /** F-AND-1, normal concurrency: the Hub's heartbeat ping is read while the bridge thread
+     * holds the transport monitor to send (owner -> socket writes). Deterministic: the bridge
+     * holds the monitor until both readers are parked on it inside onWebsocketPing, then sends.
+     * Bounded: a wedged send ends this JVM within 5 s with the thread states, never a hang. */
+    static void pingDuringSend() throws Exception {
+        JSONObject join=join(true);String id=open(join),sid=join.getJSONObject("session").getString("id");
+        JSONObject pongs=request(new JSONObject().put("action","stats")).getJSONObject("pongs");
+        CountDownLatch holding=new CountDownLatch(1),go=new CountDownLatch(1);
+        ExecutorService bridge=Executors.newSingleThreadExecutor(r->{Thread t=new Thread(r,"audit-bridge");t.setDaemon(true);return t;});
+        try {
+            Future<Boolean> sent=bridge.submit(()->{synchronized(transport){holding.countDown();if(!go.await(10,TimeUnit.SECONDS))return false;transport.screenSend(id,command(join,"control").put("frameSequence",1));return true;}});
+            check(holding.await(5,TimeUnit.SECONDS),"bridgeHoldsTransportMonitor");
+            request(new JSONObject().put("action","ping").put("id",sid).put("roles",new JSONArray().put("control").put("media")));
+            long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);List<ThreadInfo> parked;
+            while((parked=parkedPings()).size()<2){if(System.nanoTime()>until)throw new Exception("pingReadersNotParked");Thread.sleep(5);}
+            boolean free=true;for(ThreadInfo info:parked)for(MonitorInfo held:info.getLockedMonitors())if(held.getLockedStackFrame().getClassName().startsWith("com.tarobot.client.HubSocket"))free=false;
+            go.countDown();
+            try{check(sent.get(5,TimeUnit.SECONDS),"sendDuringPingCompletes");}
+            catch(TimeoutException wedged){
+                System.err.println("F-AND-1 deadlock: send blocked behind a ping reader holding its socket monitor="+!free);
+                for(ThreadInfo info:ManagementFactory.getThreadMXBean().dumpAllThreads(true,false))if(info.getThreadState()==Thread.State.BLOCKED)System.err.print(info);
+                System.err.flush();System.exit(3);
+            }
+            check(free,"pingHoldsNoSocketMonitorWhileAwaitingOwner");
+        } finally {go.countDown();bridge.shutdown();}
+        // Once the monitor is free both pings are answered, the command reached the Host and frames still flow.
+        long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);JSONObject stats;
+        while(true){stats=request(new JSONObject().put("action","stats"));JSONObject now=stats.getJSONObject("pongs");if(now.getInt("control")>pongs.getInt("control")&&now.getInt("media")>pongs.getInt("media"))break;if(System.nanoTime()>until)throw new Exception("pingNotAnswered");Thread.sleep(10);}
+        check(true,"pingAnsweredAfterSend");
+        boolean delivered=false;JSONArray commands=stats.getJSONArray("commands");for(int i=0;i<commands.length();i++){JSONObject c=commands.getJSONObject(i);if(sid.equals(c.getString("id"))&&"control".equals(c.getString("role"))&&"control".equals(c.getJSONObject("value").getString("type")))delivered=true;}
+        check(delivered,"commandDuringPingReachedHost");check(transport.screenCurrent(id),"sessionSurvivesPingDuringSend");
+        frame(join,1,false);JSONObject binary=event(id,"binary");long n=binary.getLong("deliverySequence");int total=0;while(total<binary.getInt("byteLength"))total+=transport.screenRead(id,n,total,262144).length;transport.screenAck(id,n);check(true,"framesFlowAfterPingDuringSend");
+        check(transport.screenClose(id),"pingDuringSendClosesNormally");event(id,"close");closedOnPeer(sid);
+    }
     public static void main(String[] args) throws Exception {
         Process fixture=null; AtomicBoolean active=new AtomicBoolean(true);
         try{
@@ -102,6 +147,7 @@ public final class NativeScreenAudit {
             JSONObject renew=command(controlling,"renew").put("leaseId",String.join("",Collections.nCopies(43,"L"))).put("challenge",String.join("",Collections.nCopies(43,"C"))).put("frameSequence",1);
             reject(()->transport.screenSend(controlId,renew),"renewRequiresFocus");transport.screenSend(controlId,command(controlling,"input-focus").put("enabled",true));transport.screenSend(controlId,renew);
             transport.screenSend(controlId,command(controlling,"input-focus").put("enabled",false));reject(()->transport.screenSend(controlId,renew),"blurRejectsQueuedRenew");transport.screenClose(controlId);event(controlId,"close");closedOnPeer(controlling.getJSONObject("session").getString("id"));
+            pingDuringSend();
             JSONObject bound=join(false);String bounded=open(bound);for(int i=1;i<=4;i++)frame(bound,i,false);event(bounded,"close");closedOnPeer(bound.getJSONObject("session").getString("id"));check(true,"fourthPacketClosesBoth");
             JSONObject expiry=join(false);String expired=open(expiry);frame(expiry,1,false);event(expired,"binary");event(expired,"close");closedOnPeer(expiry.getJSONObject("session").getString("id"));check(true,"unackedPacketExpiresAndClosesBoth");
             JSONObject json=join(false);String jsonId=open(json);request(new JSONObject().put("action","json-burst").put("id",json.getJSONObject("session").getString("id")).put("count",9));event(jsonId,"close");closedOnPeer(json.getJSONObject("session").getString("id"));check(true,"jsonQueueBounded");

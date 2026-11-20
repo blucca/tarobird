@@ -134,6 +134,9 @@ final class HubSocket extends WebSocketClient {
     private final boolean binaryAllowed;
     private final int writeLimit, writeFrames;
     private final ScheduledExecutorService deadlines;
+    // writes is innermost: never call the listener, or cancel() (which may
+    // report closed), while holding it. Listeners take their owner's monitor,
+    // and senders already hold that owner when they take writes.
     private final Object lifecycle = new Object(), writes = new Object();
     private volatile Socket wire, tcp;
     private volatile boolean cancelled, localClosing, opened;
@@ -264,16 +267,25 @@ final class HubSocket extends WebSocketClient {
                 // Keep the reader alive until an actual peer Close or deadline.
                 // WebSocketClient.close() stops its read loop before the reply.
                 CloseFrame frame=new CloseFrame(); frame.setCode(code); frame.setReason(reason); frame.isValid();
-                if(!room(125)) { cancel(); return false; }
-                synchronized(receipt) { if(receipt.peerClose) return false; receipt.localCloseSent=true; }
-                sendFrame(frame);
-                synchronized(lifecycle) { if(!cancelled) timeout=deadlines.schedule(this::cancel,5,TimeUnit.SECONDS); }
-                return true;
-            } catch(Exception error) { cancel(); return false; }
+                if(room(125)) {
+                    synchronized(receipt) { if(receipt.peerClose) return false; receipt.localCloseSent=true; }
+                    sendFrame(frame);
+                    synchronized(lifecycle) { if(!cancelled) timeout=deadlines.schedule(this::cancel,5,TimeUnit.SECONDS); }
+                    return true;
+                }
+            } catch(Exception error) { }
         }
+        cancel(); return false; // a full queue or failed Close: abort, outside writes
     }
     @Override public void onWebsocketPing(WebSocket socket, Framedata frame) {
-        synchronized(writes) { if(cancelled || localClosing) return; listener.activity(); if(!room(125)) { cancel(); return; } super.onWebsocketPing(socket,frame); }
+        // Report liveness before taking writes (see its declaration): a sender
+        // holding the owner may be waiting for writes while this reader waits
+        // for the owner, which froze every native transport (F-AND-1).
+        if(cancelled || localClosing) return;
+        listener.activity();
+        boolean full;
+        synchronized(writes) { if(cancelled || localClosing) return; full=!room(125); if(!full) super.onWebsocketPing(socket,frame); }
+        if(full) cancel();
     }
     @Override public void onOpen(ServerHandshake handshake) {
         try {

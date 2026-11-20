@@ -17,7 +17,7 @@ const caDer=new X509Certificate(readFileSync(path.join(root,'ca.crt'))).raw;
 writeFileSync(path.join(root,'ca.der'),caDer);
 const pair=generateKeyPairSync('ed25519'),publicKey=pair.publicKey.export({format:'der',type:'spki'}).toString('base64');
 const wss=new WebSocketServer({noServer:true,maxPayload:16384,perMessageDeflate:false}),joins=new Map(),clients=new Map(),paths=[],chatPaths=[],commands=[];
-let helloCount=0,proofCount=0,holdProof=false;const held=new Map(),pendingAttach=new Map();
+let helloCount=0,proofCount=0,holdProof=false;const pongs={control:0,media:0};const held=new Map(),pendingAttach=new Map();
 const server=createServer({key:readFileSync(path.join(root,'screen.key')),cert},(req,res)=>{
  const nonce=new URL(req.url,'https://localhost').searchParams.get('nonce');
  if(!req.url.startsWith('/api/tls-identity?')||!nonce) {res.writeHead(404);res.end();return;}
@@ -29,7 +29,7 @@ const server=createServer({key:readFileSync(path.join(root,'screen.key')),cert},
 });
 server.on('upgrade',(req,socket,head)=>{(req.url==='/ws'?chatPaths:paths).push(req.url);if(!['/ws','/screen/v1/control','/screen/v1/media'].includes(req.url)){socket.destroy();return;}wss.handleUpgrade(req,socket,head,ws=>wss.emit('connection',ws,req));});
 const stream={type:'stream',streamGeneration:1,geometryRevision:1,codec:'h264',codecString:'avc1.42c01e',width:64,height:64,contentRect:{x:0,y:0,width:64,height:64}};
-wss.on('connection',(ws,req)=>{if(req.url==='/ws'){ws.on('message',data=>ws.send(data.toString()));return;}let entry,role=req.url.endsWith('media')?'media':'control';ws.on('message',data=>{
+wss.on('connection',(ws,req)=>{if(req.url==='/ws'){ws.on('message',data=>ws.send(data.toString()));return;}let entry,role=req.url.endsWith('media')?'media':'control';ws.on('pong',()=>pongs[role]++);ws.on('message',data=>{
  const value=JSON.parse(data.toString()); if(!entry) {
   entry=[...joins.values()].find(j=>(role==='media'?j.mediaTicket:j.controlTicket)===value.ticket);if(value.type!=='hello'||!entry){ws.terminate();return;}helloCount++;
   const group=clients.get(entry.session.id)||{};group[role]=ws;clients.set(entry.session.id,group);
@@ -61,12 +61,13 @@ for await(const line of createInterface({input:process.stdin})){
  } else if(input.action==='json-burst'){for(let n=0;n<input.count;n++)group.control.send(JSON.stringify({type:'frame-ready',sessionId:input.id,generation:joins.get(input.id).session.generation,streamGeneration:1,frameSequence:n+1,expiresAt:Date.now()+1000}));console.log('{}');}
  else if(input.action==='control-state'){const session={...joins.get(input.id).session,state:input.active?'controlling':'viewing'};group.control.send(JSON.stringify({type:'state',session,serverTime:Date.now(),...(input.active?{lease:{id:'L'.repeat(43),challenge:'C'.repeat(43),expiresAt:Date.now()+6000,challengeExpiresAt:Date.now()+6000}}:{})}));console.log('{}');}
  else if(input.action==='message'){group[input.role??'control'].send(JSON.stringify(input.value));console.log('{}');}
+ else if(input.action==='ping'){for(const role of input.roles)group[role].ping();console.log('{}');}
  else if(input.action==='close-media'){group.media.terminate();console.log('{}');}
  else if(input.action==='close-host'){if(!input.role){group.control.send(JSON.stringify({type:'state',session:{...joins.get(input.id).session,state:'closed',reason:input.reason},serverTime:Date.now()}));for(const ws of Object.values(group))ws.close(input.code,input.reason);}else group[input.role].close(input.code,input.reason);console.log('{}');}
  else if(input.action==='attach'){pendingAttach.get(input.id).send(JSON.stringify({type:'attached',sessionId:input.id}));pendingAttach.delete(input.id);console.log('{}');}
  else if(input.action==='hold-proof'){holdProof=input.hold;for(const r of held.keys())r.destroy();held.clear();console.log('{}');}
  else if(input.action==='release-proof'){holdProof=false;for(const respond of held.values())respond();held.clear();console.log('{}');}
- else if(input.action==='stats')console.log(JSON.stringify({paths,chatPaths,helloCount,proofCount,commands,open:[...clients].flatMap(([id,g])=>Object.entries(g).filter(([,s])=>s.readyState===1).map(([role])=>({id,role})))}));
+ else if(input.action==='stats')console.log(JSON.stringify({paths,chatPaths,helloCount,proofCount,commands,pongs,open:[...clients].flatMap(([id,g])=>Object.entries(g).filter(([,s])=>s.readyState===1).map(([role])=>({id,role})))}));
  else if(input.action==='stop'){console.log('{}');break;}
 }
 for(const ws of wss.clients)ws.terminate();await new Promise(r=>server.close(r));
