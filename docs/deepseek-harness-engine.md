@@ -110,16 +110,24 @@ shared credentials, copies mutable `settings.yaml` when the shared
 home has one (current dsh no longer writes it), and installs
 the bridge `AGENTS.md` plus permission presets. dsh saves every model and
 reasoning selection (and other settings edits) as the default in
-`profiles/web/cordis.patch.yml`, so each Bot gets a private `profiles/web`:
-regular files there, including that patch, are private copies, each package
-under `node_modules` links to the shared package, and other directories link to
-the shared ones. Every Host start refreshes the private profile one-way from the
-shared profile; nothing is written back, so a Bot's selection never changes
-another Bot's or the user's own `dsh web` default. Changes made in the user's
-DSH reach a Bot at its next Host start. Shared plugins load as dsh linked roots,
-which supply runtime packages only to plugins that declare them as peers. An
-existing Bot's `profiles` link or junction is replaced by removing the link
-only. Before Search MCP registration,
+`profiles/web/cordis.patch.yml`, so each Bot gets a private `profiles/web`: a
+real copy of the shared profile, its files and its package directories alike.
+dsh routes a plugin by the real path of its modules. A copied plugin lies inside
+the Bot's active profile and resolves the Harness runtime packages exactly as it
+does for the user's own dsh, whether or not it declares them as peers; a plugin
+reached through a link into the shared home would only receive declared peers.
+A link inside the shared profile is recreated inside the copy, and a package the
+user linked from another directory stays a link. Every Host start refreshes the
+private profile one-way from the shared profile; nothing is written back, so a
+Bot's selection never changes another Bot's or the user's own `dsh web` default.
+Changes made in the user's DSH, including installed or updated plugins, reach a
+Bot at its next Host start; an unchanged package file is not copied again. Each
+Bot therefore holds its own copy of the installed plugins on disk.
+`.tarobird-profile-mirror.json` in the private profile lists what TaroBird
+created there. Later starts remove only those entries and bare links, never
+recursively, and keep and report anything else. An existing Bot's `profiles`
+link or junction is replaced by removing the link only. Before Search MCP
+registration,
 it validates the installed plugin marker, declared entrypoint, and the bounded
 package-local Harness patch that registers `mcp-cctb-search` through
 `@deepseek-ai/dsh-mcp-client`. A valid plugin owns the client; otherwise the
