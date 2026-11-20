@@ -207,6 +207,15 @@ pub fn admit(inputs: &[Input], controllable: bool, foreground_higher: Option<boo
     if inputs.iter().any(Input::is_down) && foreground_higher != Some(false) { return Err("screen_input_blocked".into()); }
     Ok(())
 }
+/// Whether crash recovery may read key state now. `GetAsyncKeyState` reports
+/// zero while UI Privilege Isolation keeps this process from the foreground
+/// thread, so with a higher-integrity window in front (or no answer) every
+/// recorded key would read as up and the record would be deleted while a key
+/// may still be down. Recovery then waits, keeping the record, and is retried.
+pub fn recovery_readable(controllable: bool, foreground_higher: Option<bool>) -> Result<(), String> {
+    if !controllable || foreground_higher != Some(false) { return Err("screen_release_pending".into()); }
+    Ok(())
+}
 /// Posts `inputs` and records exactly what Windows took. `post` returns
 /// `SendInput`'s count: how many leading inputs were inserted. Fewer than asked
 /// is a failure and is never retried here: the caller ends the lease, and
@@ -651,9 +660,10 @@ mod os {
         release_all_with(&mut held, watching().as_deref(), now_ms(), &mut post)
     }
     /// See `candidate_releases`. Fails without posting while the session cannot
-    /// take input; the caller keeps its record and tries again.
+    /// take input or key state cannot be trusted (`recovery_readable`); the
+    /// caller keeps its record and tries again.
     pub fn release_candidates(keys: &[u16], buttons: &[Button]) -> Result<u32, String> {
-        if !session_state().controllable() { return Err("screen_release_pending".into()); }
+        recovery_readable(session_state().controllable(), foreground_higher())?;
         let key_down = |descriptor: u16| {
             let vk = unsafe { MapVirtualKeyW((descriptor & 0xff) as u32 | if descriptor & EXTENDED != 0 { 0xe000 } else { 0 }, MAPVK_VSC_TO_VK_EX) };
             vk != 0 && unsafe { GetAsyncKeyState(vk as i32) } < 0
@@ -920,6 +930,14 @@ mod tests {
         // A record that is not a key this backend can press is refused whole.
         assert!(candidate_releases(&[0x1e, 0x00], &[], &|_| true, &|_| true).is_err() && candidate_releases(&[0x2ff], &[], &|_| true, &|_| true).is_err());
         assert!(candidate_releases(&[0x1e; 257], &[], &|_| true, &|_| true).is_err());
+    }
+    #[test]
+    fn recovery_waits_while_an_elevated_or_unknown_foreground_hides_key_state() {
+        // UIPI makes GetAsyncKeyState read zero: reading then would report nothing down and delete the record.
+        assert_eq!(recovery_readable(true, Some(true)), Err("screen_release_pending".into()));
+        assert_eq!(recovery_readable(true, None), Err("screen_release_pending".into()));
+        assert_eq!(recovery_readable(false, Some(false)), Err("screen_release_pending".into()));
+        assert_eq!(recovery_readable(true, Some(false)), Ok(()));
     }
     #[test]
     fn a_button_is_named_by_meaning_and_pressed_as_the_physical_one_windows_will_take_for_it() {
