@@ -144,12 +144,20 @@ export const SCREEN_ERROR_MESSAGES_WINDOWS: Readonly<Record<string, string>> = O
   screen_attach_timeout: "屏幕连接超时，请检查目标电脑和当前线路。",
   screen_socket_timeout: "屏幕连接超时，请检查目标电脑和当前线路。",
 });
-/** Unknown platform is a display-only state when the Host keeps desktop metadata
- * private. Only these three general states reuse neutral computer wording;
- * the default Mac contract and platform-specific guidance stay unchanged. */
-const UNKNOWN_TARGET_REASONS = new Set(["screen_disabled", "screen_not_authorized", "screen_service_offline"]);
+/** For a controlled computer whose platform is unknown (the Host keeps desktop
+ * metadata private, or none was read for this Host), nothing may assume a Mac
+ * or a Windows-only cause. The Windows sentence is used where it names neither;
+ * these replace the ones that describe Windows' lock screen, consent prompts or
+ * elevated windows. A known platform keeps its own sentences. */
+export const SCREEN_ERROR_MESSAGES_UNKNOWN_TARGET: Readonly<Record<string, string>> = Object.freeze({
+  screen_capture_denied: "目标电脑暂时无法共享屏幕，请在那台电脑上检查后重新连接。",
+  screen_locked: "目标电脑已锁定或暂时无法查看，请在那台电脑上处理后重新连接。",
+  screen_accessibility_denied: "目标电脑暂时不接受远程输入，请在那台电脑上检查后再开始控制。",
+  screen_input_denied: "目标电脑没有接受远程输入，控制已停止。请在那台电脑上检查后重试。",
+});
 export function screenError(reason: string, target: "macos" | "windows" | "unknown" = "macos") {
-  const neutral = target === "unknown" && UNKNOWN_TARGET_REASONS.has(reason);
-  const message = (target === "windows" || neutral) && SCREEN_ERROR_MESSAGES_WINDOWS[reason] || SCREEN_ERROR_MESSAGES[reason];
+  const specific = target === "windows" ? SCREEN_ERROR_MESSAGES_WINDOWS[reason]
+    : target === "unknown" ? SCREEN_ERROR_MESSAGES_UNKNOWN_TARGET[reason] ?? SCREEN_ERROR_MESSAGES_WINDOWS[reason] : undefined;
+  const message = specific || SCREEN_ERROR_MESSAGES[reason];
   return message ? t(message) : `${t("屏幕连接已结束，请检查主机状态后重试。")} (${reason.slice(0,120)})`;
 }

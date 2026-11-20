@@ -24,6 +24,8 @@ and open requests opt in with `includeWindows=1`. Legacy requests receive no
 Windows desktop, and cannot open a Windows control session. Mac descriptions
 and signed device-grant policy bodies retain their prior contract. A missing
 native addon, an older Host and a missing device grant are separate conditions.
+Reason sentences follow the target's platform as last read for that Host; when
+it was never disclosed, they name neither a Mac nor a Windows-only cause.
 
 ## iOS and Android viewers
 

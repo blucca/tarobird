@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { afterEach, expect, it, vi } from "vitest";
 import english from "../client/src/locales/en.json" with { type: "json" };
 import { setLocale } from "../client/src/i18n.js";
-import { SCREEN_ERROR_MESSAGES, SCREEN_ERROR_MESSAGES_WINDOWS, screenError } from "../client/src/screen-errors.js";
+import { SCREEN_ERROR_MESSAGES, SCREEN_ERROR_MESSAGES_UNKNOWN_TARGET, SCREEN_ERROR_MESSAGES_WINDOWS, screenError } from "../client/src/screen-errors.js";
 
 afterEach(() => { setLocale("zh"); vi.unstubAllGlobals(); });
 const placeholders = (value: string) => [...value.matchAll(/\{\d+\}/g)].map(match => match[0]).sort().join();
@@ -91,4 +91,27 @@ it("every terminal reason a Host, mobile native session or viewer can end a conn
   expect(screenError("screen_permission_revoked", "windows")).toBe(screenError("screen_permission_revoked"));
   expect(screenError("screen_attach_timeout", "windows")).toBe(screenError("screen_connect_timeout", "windows"));
   expect(screenError("screen_socket_timeout")).toBe(screenError("screen_network_timeout"));
+});
+
+it("when the target's platform is unknown, no sentence assumes a Mac or a Windows-only cause", () => {
+  // The Host withholds desktop metadata, or none was ever read for this Host.
+  const dictionary = english as Record<string, string>;
+  for (const [reason, message] of Object.entries(SCREEN_ERROR_MESSAGES_UNKNOWN_TARGET)) { expect(SCREEN_ERROR_MESSAGES[reason], reason).toBeTruthy(); expect(dictionary[message]?.trim(), reason).toBeTruthy(); }
+  const mac = /Mac|辅助功能|输入监控|录制屏幕/, macEnglish = /Mac|Accessibility|Input Monitoring|Screen Recording/;
+  const windowsOnly = /管理员|安全提示|Windows/, windowsEnglish = /administrator|security prompt|Windows/i;
+  for (const reason of Object.keys(SCREEN_ERROR_MESSAGES)) {
+    const text = screenError(reason, "unknown");
+    expect(mac.test(text) || windowsOnly.test(text), `${reason}: ${text}`).toBe(false);
+  }
+  vi.stubGlobal("document", { documentElement: { lang: "zh-CN" } });
+  setLocale("en");
+  for (const reason of Object.keys(SCREEN_ERROR_MESSAGES)) {
+    const text = screenError(reason, "unknown");
+    expect(text.startsWith(dictionary["屏幕连接已结束，请检查主机状态后重试。"]!), reason).toBe(false);
+    expect(macEnglish.test(text) || windowsEnglish.test(text), `${reason}: ${text}`).toBe(false);
+  }
+  // A known platform keeps its own sentences.
+  setLocale("zh");
+  expect(screenError("screen_locked", "macos")).toBe(SCREEN_ERROR_MESSAGES.screen_locked);
+  expect(screenError("screen_input_denied", "windows")).toBe(SCREEN_ERROR_MESSAGES_WINDOWS.screen_input_denied);
 });
