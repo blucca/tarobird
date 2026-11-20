@@ -6,6 +6,8 @@ import { createRunRecord, recordRunEvent } from "../src/core/run-record.js";
 import type { EngineStreamEvent } from "../src/codex/adapter.js";
 import { CodexAppServerAdapter, codexTransientRetryReason } from "../src/codex/app-server-adapter.js";
 import { EngineRetryableError } from "../src/codex/turn-retry.js";
+import { EngineIncompleteResponseError } from "../src/codex/adapter.js";
+import { renderCoreUserFacingError } from "../src/core/errors.js";
 
 type Frame = { id?: number | string; method?: string; params?: Record<string, any>; result?: unknown; error?: unknown };
 type Notify = (method: string, params?: Record<string, unknown>) => void;
@@ -556,5 +558,60 @@ describe("codexTransientRetryReason", () => {
     [null, undefined],
   ])("maps %j to %s", (info, expected) => {
     expect(codexTransientRetryReason(info)).toBe(expected);
+  });
+});
+
+describe("Codex refused input (structured codexErrorInfo only)", () => {
+  // Frame shapes as codex-cli 0.170.0 sent them against a loopback provider:
+  // OpenAI's invalid-image 400 became Codex's own `badRequest`; any other
+  // provider 400 stayed `other`.
+  const invalidImage = { message: "Invalid image in your last message. Please remove it and try again.", codexErrorInfo: "badRequest", additionalDetails: null, misalignment: null };
+
+  it("reports Codex's badRequest terminal as a refused input that this thread can rewind, without a replay receipt", async () => {
+    const { adapter, child, send } = boot();
+    child.starts.push({ turn: failTurn(invalidImage) });
+    child.starts.push({ turn: (notify, { turnId }) => {
+      // The final notification stands in when turn/completed carries no error.
+      notify("error", { error: invalidImage, willRetry: false });
+      notify("turn/completed", { turn: { id: turnId, status: "failed", items: [] } });
+    } });
+    for (const { error } of [await send("thread-r"), await send("thread-r")]) {
+      expect(error).toBeInstanceOf(EngineIncompleteResponseError);
+      expect(error).not.toBeInstanceOf(EngineRetryableError);
+      expect(error).toMatchObject({ reason: "interrupted", requestRejection: "invalid-argument", nativeRewind: true });
+      expect(renderCoreUserFacingError(error, "engine", "en")).toContain("Rewind to before this message");
+    }
+    expect(child.frames.filter((frame) => frame.method === "turn/start")).toHaveLength(2);
+    adapter.destroy();
+  });
+
+  it.each([
+    ["a provider's plain 400", { message: '{"error":{"message":"Unsupported parameter: \'reasoning.summary\'","type":"invalid_request_error","code":"unsupported_parameter"}}', codexErrorInfo: "other" }],
+    ["provider 400 text without a code", { message: "unexpected status 400 Bad Request: INVALID_ARGUMENT invalid_request_error" }],
+    ["client HTTP status", { message: "unexpected status 400 Bad Request", codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 400 } } }],
+    ["context window", { message: "Codex ran out of room in the model's context window.", codexErrorInfo: "contextWindowExceeded" }],
+    ["missing model", { message: "The model does not exist.", codexErrorInfo: "modelNotFound" }],
+    ["invalid prompt", { message: "Invalid prompt.", codexErrorInfo: "invalidPrompt" }],
+  ])("leaves %s as it was", async (_label, error) => {
+    const { adapter, child, send } = boot();
+    child.starts.push({ turn: failTurn(error) });
+    const result = await send("thread-s");
+    expect(result.error).toBeInstanceOf(Error);
+    expect(result.error).not.toBeInstanceOf(EngineIncompleteResponseError);
+    adapter.destroy();
+  });
+
+  it("ignores a badRequest that Codex was still retrying, and one on a turn that did not fail", async () => {
+    const { adapter, child, send } = boot();
+    child.starts.push({ turn: (notify, { turnId }) => {
+      notify("error", { error: invalidImage, willRetry: true });
+      notify("turn/completed", { turn: { id: turnId, status: "failed", items: [] } });
+    } });
+    child.starts.push({ turn: (notify, { turnId }) => notify("turn/completed", { turn: { id: turnId, status: "interrupted", error: invalidImage, items: [] } }) });
+    for (const { error } of [await send("thread-t"), await send("thread-t")]) {
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(EngineIncompleteResponseError);
+    }
+    adapter.destroy();
   });
 });

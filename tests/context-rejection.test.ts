@@ -19,6 +19,25 @@ it.each(["en", "zh"] as const)("explains a native request rejection without gues
   expect(engineRetryReason(error)).toBeUndefined();
 });
 
+it.each(["en", "zh"] as const)("offers rewind only when the adapter's native history can drop the refused input (%s)", locale => {
+  const rewind = locale === "en" ? "Rewind to before this message" : "回退到这条消息之前";
+  const rewindable = renderCoreUserFacingError(new EngineIncompleteResponseError("private diagnostic", "interrupted", "invalid-argument", true), "engine", locale);
+  expect(rewindable).toContain(rewind);
+  expect(rewindable).toContain(locale === "en" ? "workspace files are not reverted" : "工作区文件不会回滚");
+  expect(rewindable).toContain(locale === "en" ? "If later messages are refused too" : "若之后的消息也被拒收");
+  expect(rewindable).toContain(locale === "en" ? "does not establish" : "不能证明");
+  expect(rewindable).toContain(locale === "en" ? "not automatically replayed" : "未自动重发");
+  expect(rewindable).not.toMatch(/private diagnostic/);
+  // Without native rewind, or without a native refusal, nothing suggests rewinding.
+  for (const error of [
+    new EngineIncompleteResponseError("private diagnostic", "interrupted", "invalid-argument"),
+    new EngineIncompleteResponseError("private diagnostic", "interrupted", "invalid-argument", false),
+    new EngineIncompleteResponseError("private diagnostic", "interrupted", undefined, true),
+  ]) expect(renderCoreUserFacingError(error, "engine", locale)).not.toContain(rewind);
+  expect(classifyFailure(new EngineIncompleteResponseError("x", "interrupted", "invalid-argument", true))).toBe("engine-incomplete");
+  expect(engineRetryReason(new EngineIncompleteResponseError("x", "interrupted", "invalid-argument", true))).toBeUndefined();
+});
+
 it.each([
   new Error("INVALID_ARGUMENT"),
   new EngineIncompleteResponseError("Tool output: INVALID_ARGUMENT", "interrupted"),

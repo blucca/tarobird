@@ -95,6 +95,11 @@ export function renderCoreUserFacingError(
     ? "The model service is still unavailable and automatic recovery has ended. The conversation and completed work are preserved. Once the service recovers, send ‘continue’ to resume the unfinished task."
     : "模型服务仍未恢复，本轮自动恢复已结束。原会话和已完成的工作已保留；服务恢复后发送“继续”，即可接着处理未完成的任务。";
   if (error instanceof EngineIncompleteResponseError && error.reason === "interrupted") {
+    // Rewind is offered only when the adapter's native history can drop the
+    // refused input; the App still shows the action only where it applies.
+    if (error.requestRejection === "invalid-argument" && error.nativeRewind === true) return locale === "en"
+      ? "The model service rejected the request as invalid. Check the selected model, settings and attachments. This does not establish that the conversation is damaged. Prior operations may already have taken effect; the conversation is preserved and the request was not automatically replayed. The refused content can stay in this conversation's context. If later messages are refused too and the message that brought it in offers “Rewind to before this message”, use it (workspace files are not reverted); otherwise start a new conversation."
+      : "模型服务判定本次请求无效，请检查所选模型、设置和附件。这并不能证明对话已损坏。之前的操作可能已执行；原对话已保留，未自动重发请求。被拒收的内容可能仍留在本对话上下文中。若之后的消息也被拒收，且带入该内容的消息上有「回退到这条消息之前」，可用它回退（工作区文件不会回滚）；否则可新开对话。";
     if (error.requestRejection === "invalid-argument") return locale === "en"
       ? "The model service rejected the request as invalid. Check the selected model, settings and attachments. This does not establish that the conversation is damaged. Prior operations may already have taken effect; the conversation is preserved and the request was not automatically replayed. If valid requests continue to fail, start a new conversation."
       : "模型服务判定本次请求无效，请检查所选模型、设置和附件。这并不能证明对话已损坏。之前的操作可能已执行；原对话已保留，未自动重发请求。若确认输入有效后仍持续失败，可新开对话。";

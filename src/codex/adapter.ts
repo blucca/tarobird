@@ -14,6 +14,9 @@ export class EngineIncompleteResponseError extends Error {
   constructor(message: string, readonly reason: "placeholder" | "interrupted" = "placeholder",
     /** Set only from an engine's terminal request error, never tools or stderr. */
     readonly requestRejection?: "invalid-argument",
+    /** Set only by an adapter whose native history can rewind this conversation
+     * to before an earlier input (Codex app-server); never for side turns. */
+    readonly nativeRewind?: boolean,
   ) { super(message); this.name = "EngineIncompleteResponseError"; }
 }
 

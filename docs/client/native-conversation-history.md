@@ -45,6 +45,19 @@ The Claude SDK is an exact build-only dependency bundled into a dedicated helper
 its original component notices ship with the Host. It does not add another Claude
 CLI installation or send a model request to create a fork.
 
+A turn the upstream refused as an invalid input is explained only from the
+engine's own structured terminal signal: Codex app-server `codexErrorInfo:
+badRequest` on a failed foreground turn (0.170.0 raises it for an invalid image
+or unsupported audio) and Claude Code `terminal_reason: image_error`; Antigravity
+keeps its native `INVALID_ARGUMENT` terminal. A provider's plain HTTP 400 (Codex
+`other`, Claude `api_error`, DeepSeek Harness `INVALID_REQUEST`), context
+overflow, a missing model, message text, stderr and tool output do not qualify,
+and one refusal is not presented as a damaged conversation. The request is never
+replayed. Only Codex app-server main threads add the conditional advice to use
+"Rewind to before this message" on the message that brought the content in,
+because the refused input stays in that thread; other engines suggest a new
+conversation if valid requests keep failing.
+
 Kimi's native load can reset session preferences. The adapter restores acknowledged
 preferences before releasing its read reservation. If a read times out while
 native replay continues, an ordinary pending message waits for that same replay

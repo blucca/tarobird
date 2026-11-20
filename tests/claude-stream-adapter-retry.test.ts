@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
-import type { EngineStreamEvent } from "../src/codex/adapter.js";
+import { EngineIncompleteResponseError, type EngineStreamEvent } from "../src/codex/adapter.js";
+import { renderCoreUserFacingError } from "../src/core/errors.js";
 import { ClaudeStreamAdapter, claudeTransientRetryReason } from "../src/codex/claude-stream-adapter.js";
 import { EngineRetryableError } from "../src/codex/turn-retry.js";
 import { ENGINE_RECOVERY_CONTINUATION } from "../src/runtime/engine-recovery.js";
@@ -268,5 +269,53 @@ describe("claudeTransientRetryReason", () => {
     [{}, undefined],
   ])("maps %j to %s", (frame, expected) => {
     expect(claudeTransientRetryReason(frame)).toBe(expected);
+  });
+});
+
+describe("Claude refused input (structured terminal_reason only)", () => {
+  // Frames as Claude Code 2.1.329 wrote them against a loopback API that
+  // answered HTTP 400/404 (assistant envelope first, then the terminal result).
+  const imageText = "API Error: an image in the conversation could not be processed and was removed. Re-read the file with a different approach if you still need it.";
+  const refusal = (error: string, status: number, terminal_reason: string, text: string) => [
+    { type: "assistant", uuid: "a-err", error, api_error_status: status, message: { role: "assistant", content: [{ type: "text", text }] } },
+    { type: "result", subtype: "success", is_error: true, api_error_status: status, terminal_reason, stop_reason: "stop_sequence", result: text },
+  ];
+
+  it("reports Claude's image_error terminal as a refused input, without rewind or a replay receipt", async () => {
+    const { adapter, children, start } = boot();
+    try {
+      const turn = start("tarobot-310");
+      await waitFor(() => children[0]?.stdin.lines.length === 1);
+      children[0]!.send({ type: "system", subtype: "init" });
+      for (const frame of refusal("invalid_request", 400, "image_error", imageText)) children[0]!.send(frame);
+      const { error } = await turn.result;
+      expect(error).toBeInstanceOf(EngineIncompleteResponseError);
+      expect(error).not.toBeInstanceOf(EngineRetryableError);
+      expect(error).toMatchObject({ reason: "interrupted", requestRejection: "invalid-argument" });
+      expect((error as EngineIncompleteResponseError).nativeRewind).toBeUndefined();
+      const text = renderCoreUserFacingError(error, "engine", "en");
+      expect(text).toContain("rejected the request as invalid");
+      expect(text).not.toContain("Rewind");
+      expect(children[0]!.stdin.lines).toHaveLength(1);
+    } finally { await adapter.destroy(); }
+  });
+
+  it.each([
+    ["prompt too long (same invalid_request kind)", refusal("invalid_request", 400, "prompt_too_long", "Prompt is too long")],
+    ["any other 400", refusal("unknown", 400, "api_error", "API Error: 400 max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens for this model")],
+    ["missing model", refusal("model_not_found", 404, "api_error", "There's an issue with the selected model. It may not exist or you may not have access to it.")],
+    ["image text without the terminal reason", [{ type: "result", subtype: "error_during_execution", is_error: true, api_error_status: 400, result: "API Error: 400 Could not process image invalid_request_error INVALID_ARGUMENT" }]],
+  ])("leaves %s as it was", async (_label, frames) => {
+    const { adapter, children, start } = boot();
+    try {
+      const turn = start("tarobot-311");
+      await waitFor(() => children[0]?.stdin.lines.length === 1);
+      children[0]!.send({ type: "system", subtype: "init" });
+      for (const frame of frames) children[0]!.send(frame);
+      const { error } = await turn.result;
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(EngineIncompleteResponseError);
+      expect(error).not.toBeInstanceOf(EngineRetryableError);
+    } finally { await adapter.destroy(); }
   });
 });

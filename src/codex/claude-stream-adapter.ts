@@ -45,7 +45,7 @@ import {
   type ClaudeNativeTask,
 } from "./claude-native-control.js";
 
-import { EngineCancellationUnconfirmedError, EngineStopTooLateError, EngineSteeringRejectedError, EngineNativeInputUnsentError } from "./adapter.js";
+import { EngineCancellationUnconfirmedError, EngineIncompleteResponseError, EngineStopTooLateError, EngineSteeringRejectedError, EngineNativeInputUnsentError } from "./adapter.js";
 import type {
   AdapterUsage,
   CodexAdapter,
@@ -2579,7 +2579,13 @@ export class ClaudeStreamAdapter implements CodexAdapter {
           || pending.assistantText.trim()
           || renderedError
           || "Claude reported an error";
-        this.rejectWithRetryReceipt(worker, pending, parsed, claudeError(appendClaudeMcpWarnings(detail, pending.engineWarnings)));
+        const failure = claudeError(appendClaudeMcpWarnings(detail, pending.engineWarnings));
+        // Claude's own terminal reason for an image the API refused (2.1.329:
+        // assistant `error: invalid_request`, result `terminal_reason:
+        // image_error`). `prompt_too_long` shares that error kind and any other
+        // 400 is `api_error`; only this structured reason is a refused input.
+        this.rejectWithRetryReceipt(worker, pending, parsed, parsed.terminal_reason === "image_error"
+          ? new EngineIncompleteResponseError(failure.message, "interrupted", "invalid-argument") : failure);
         return;
       }
       const rawResultText = parsed.result && !sendNowCut

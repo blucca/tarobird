@@ -30,7 +30,7 @@ import type {
   NativeHistoryState,
   SideCapability,
 } from "./adapter.js";
-import { EngineContextCompactionPendingError } from "./adapter.js";
+import { EngineContextCompactionPendingError, EngineIncompleteResponseError } from "./adapter.js";
 import { appendUniqueSendImageTag, extractGeneratedImagePath, sendImageTag } from "./generated-files.js";
 import { killProcessTree } from "./process-tree.js";
 import { normalizeCodexUserInput } from "./codex-user-input.js";
@@ -203,6 +203,22 @@ export function codexTransientRetryReason(info: unknown): EngineRetryReason | un
   if (status === 429) return "rate-limit";
   if (status === 529) return "capacity";
   return typeof status === "number" && status >= 500 && status <= 599 ? "connection" : undefined;
+}
+
+/**
+ * Codex's own `badRequest` on a failed foreground turn. In 0.170.0
+ * (`core/src/session/turn.rs`, `protocol/src/error.rs` at rust-v0.170.0) a turn
+ * ends with it when the provider refused an input itself: an invalid image
+ * ("Invalid image in your last message") or audio the model cannot take. That
+ * input stays in the thread, so later turns are refused too. A provider's plain
+ * HTTP 400 arrives as `other`, context overflow as `contextWindowExceeded` and a
+ * missing model as `modelNotFound`; none of them is this. Only the structured
+ * code decides, never the message, stderr or tool output.
+ */
+function codexInputRejection(failure: Error, turn: unknown, errorInfo: unknown, rewindable: boolean): EngineIncompleteResponseError | undefined {
+  const status = typeof turn === "object" && turn !== null ? (turn as { status?: unknown }).status : undefined;
+  if (status !== "failed" || errorInfo !== "badRequest") return undefined;
+  return new EngineIncompleteResponseError(failure.message, "interrupted", "invalid-argument", rewindable);
 }
 
 function readCodexErrorInfo(error: unknown): unknown {
@@ -2441,12 +2457,17 @@ export class CodexAppServerAdapter implements CodexAdapter {
         // why the turn finally failed; only a final notification may stand in.
         const finalNotification = useNotification && pending.notificationErrorMessage !== undefined
           && pending.notificationWillRetry !== true;
-        pending.reject(useNotification && !finalNotification ? failure : this.withCompletedTurnRetryReceipt(failure, {
+        const errorInfo = useNotification ? pending.notificationErrorInfo : readCodexErrorInfo((completedTurn as { error?: unknown } | undefined)?.error);
+        // Only this thread's history can drop the refused input: a side turn's
+        // ephemeral thread or a logical session has none to rewind.
+        const rejected = useNotification && !finalNotification ? undefined
+          : codexInputRejection(failure, completedTurn, errorInfo, !pending.ephemeral && !isLogicalTelegramSessionId(threadId));
+        pending.reject(useNotification && !finalNotification ? failure : rejected ?? this.withCompletedTurnRetryReceipt(failure, {
           threadId,
           pending,
           turn: completedTurn,
           providerMessage: failureMessage,
-          errorInfo: useNotification ? pending.notificationErrorInfo : readCodexErrorInfo((completedTurn as { error?: unknown } | undefined)?.error),
+          errorInfo,
         }));
         this.finishCompletingTurn();
         return;
