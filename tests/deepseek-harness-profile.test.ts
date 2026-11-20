@@ -13,6 +13,7 @@ const fsCalls = vi.hoisted(() => ({
   symlinkTypes: [] as Array<string | undefined>,
   symlinkEpermForFiles: false,
   copyFailFor: new Set<string>(),
+  copyFailOnceFor: new Set<string>(),
   unlinkEpermFor: new Set<string>(),
   rmdir: [] as string[],
 }));
@@ -31,7 +32,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     },
     // A copy that dies halfway: part of the destination is written, then it fails.
     copyFile: async (source: string, destination: string, mode?: number) => {
-      if (fsCalls.copyFailFor.has(source)) {
+      if (fsCalls.copyFailOnceFor.delete(source) || fsCalls.copyFailFor.has(source)) {
         await actual.writeFile(destination, "partial");
         throw Object.assign(new Error(`EIO: i/o error, copyfile '${source}' -> '${destination}'`), { code: "EIO" });
       }
@@ -63,6 +64,7 @@ afterEach(async () => {
   fsCalls.symlinkTypes.length = 0;
   fsCalls.symlinkEpermForFiles = false;
   fsCalls.copyFailFor.clear();
+  fsCalls.copyFailOnceFor.clear();
   fsCalls.unlinkEpermFor.clear();
   fsCalls.rmdir.length = 0;
   await Promise.all(roots.splice(0).map((root) => removeTempRoot(root)));
@@ -574,13 +576,15 @@ describe("DeepSeek Harness private profile", () => {
     // Again with something to refresh, and with one of the starts failing.
     await dshSaveDefault(path.join(f.privateProfile, "cordis.patch.yml"), SHARED_PATCH.replace("native-model", "bot-model"));
     const sharedIndex = path.join(f.sharedProfile, "node_modules", "plugin-a", "index.js");
-    fsCalls.copyFailFor.add(path.join(f.sharedProfile, "cordis.patch.yml"));
+    // Exactly one copy fails. Clearing a persistent fault from an outer
+    // rejection callback races the next lock holder on slower CI machines.
+    fsCalls.copyFailOnceFor.add(path.join(f.sharedProfile, "cordis.patch.yml"));
     const failing = prepare(f);
-    const following = failing.then(() => undefined, () => { fsCalls.copyFailFor.clear(); });
     const queued = prepare(f);
-    await following;
-    await expect(failing).rejects.toThrow(/EIO/);
-    await expect(queued).resolves.toEqual([]);
+    // Observe both rejections immediately, not after waiting for the first.
+    const results = await Promise.allSettled([failing, queued]);
+    expect(results[0]).toMatchObject({ status: "rejected", reason: { code: "EIO" } });
+    expect(results[1]).toEqual({ status: "fulfilled", value: [] });
 
     expect(await readFile(path.join(f.privateProfile, "cordis.patch.yml"), "utf8")).toBe(SHARED_PATCH);
     expect(await readFile(path.join(f.privateProfile, "node_modules", "plugin-a", "index.js"), "utf8"))
