@@ -46,7 +46,9 @@ try {
   assert.equal(String((await pipeResult)[0]), 'PRIVATE_PIPE_OK'); await pipesClosed;
   const initial = await desktopHost('resume', directory, entry);
   assert.equal(typeof initial.hostName, 'string'); assert.ok(initial.hostName.trim());
-  assert.deepEqual(initial, { available: true, running: false, hostName: initial.hostName });
+  // First launch: no host directory and no saved enablement yet. The App's
+  // local controller reads both fields to report a stopped host, not a fault.
+  assert.deepEqual(initial, { available: true, running: false, directoryState: 'missing', hostEnabled: false, hostName: initial.hostName });
   const hostName = 'Package host 主机';
   let host = await desktopHost('start', directory, entry, { hostName }); assert.equal(host.running, true); assert.equal(host.hostName, hostName);
   assert.equal((await (await fetch(host.url + '/health')).json()).publicKey, host.publicKey);
