@@ -8,6 +8,15 @@ export type ScreenNativeBridge = {
   invoke<T = unknown>(command: string, args: Record<string, unknown>): Promise<T>;
 };
 export const SCREEN_BRIDGE_CHUNK_BYTES = 256 * 1024;
+/** Native ends a session by queuing its close event, then retiring the slot. A
+ * page call running at that moment is rejected with one of these codes, and the
+ * rejection reaches the page before that close event. The code only says the
+ * call lost to the end; the close event says why. Wait for it, bounded: without
+ * it, the session ended locally and says no more than that. */
+const NATIVE_SESSION_ENDED: ReadonlyMap<string, string> = new Map([
+  ["native_request_cancelled", "screen_disconnected"], ["native_document_retired", "screen_disconnected"], ["screen_inactive", "screen_inactive"],
+]);
+export const SCREEN_NATIVE_CLOSE_GRACE_MS = 1000;
 const CONTROL_BYTES = 16 * 1024, JSON_BYTES = 64 * 1024;
 const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
@@ -16,27 +25,34 @@ const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value))
 export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): ScreenViewerTransport {
   return (join: ScreenJoin) => {
     let allocation: ScreenAllocation | undefined, closed = false, opening = false, focused = false, focusGeneration = 0;
-    let receive: ((value: unknown) => void) | undefined, terminal: string | undefined;
+    let receive: ((value: unknown) => void) | undefined, terminal: string | undefined, ending: ReturnType<typeof setTimeout> | undefined;
     let sequence = 0, jsonCount = 0, jsonBytes = 0, binaryCount = 0, binaryBytes = 0, commands = 0, commandBytes = 0;
     let incoming = Promise.resolve(), outgoing = Promise.resolve();
     const receipts = new Map<number, { deliverySequence: number; bytes: number }>();
     const close = (reason?: string) => {
       if (closed) return;
-      closed = true; focused = false; receipts.clear();
+      closed = true; focused = false; receipts.clear(); clearTimeout(ending);
       allocation?.signal.removeEventListener("abort", retired);
       if (allocation) void bridge.invoke("net_screen_close", { id: allocation.id }).catch(() => undefined);
       if (reason) { terminal = reason; receive?.({ type: "closed", reason }); }
     };
     const retired = () => close("screen_connection_changed");
-    const fail = (error: unknown) => close(error instanceof Error && error.name !== "ZodError" ? error.message : "screen_protocol_invalid");
+    const fail = (error: unknown) => {
+      const reason = error instanceof Error && error.name !== "ZodError" ? error.message : "screen_protocol_invalid";
+      const local = NATIVE_SESSION_ENDED.get(reason);
+      if (!local) { close(reason); return; }
+      if (!closed && ending === undefined) ending = setTimeout(() => close(local), SCREEN_NATIVE_CLOSE_GRACE_MS);
+    };
+    // Once native has said the session ended, nothing more is sent for it.
+    const live = () => !closed && ending === undefined && !!allocation;
     const ack = async (deliverySequence: number) => {
-      if (!closed && allocation) await bridge.invoke("net_screen_ack", { id: allocation.id, deliverySequence });
+      if (live()) await bridge.invoke("net_screen_ack", { id: allocation!.id, deliverySequence });
     };
     const port: ScreenViewerPort = {
       start(deliver) { if (receive) return; receive = deliver; if (terminal) deliver({ type: "closed", reason: terminal }); },
       close: () => close(),
       postMessage(message) {
-        if (closed || !allocation) return;
+        if (!live()) return;
         try {
           if (message.type === "received") {
             const receipt = receipts.get(message.sequence as number);
@@ -55,7 +71,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
           if (++commands > 8 || (commandBytes += bytes) > CONTROL_BYTES) throw new Error("screen_congested");
           outgoing = outgoing.then(async () => {
             if ((command.type === "input" || command.type === "renew") && (!focused || admittedFocus !== focusGeneration)) return;
-            if (!closed && allocation) await bridge.invoke("net_screen_send", { id: allocation.id, command });
+            if (live()) await bridge.invoke("net_screen_send", { id: allocation!.id, command });
           }).catch(fail).finally(() => { commands--; commandBytes -= bytes; });
         } catch (error) { fail(error); }
       },
@@ -65,6 +81,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
       const value = raw as Record<string, unknown>;
       if (value.id !== allocation.id || value.document !== allocation.document) return;
       if (value.kind === "close") { close(typeof value.reason === "string" ? value.reason : "screen_disconnected"); return; }
+      if (ending !== undefined) return;
       try {
         const deliverySequence = value.deliverySequence as number;
         if (!Number.isSafeInteger(deliverySequence) || deliverySequence <= sequence) throw new Error("screen_protocol_invalid");
@@ -83,12 +100,12 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
           const bytes = value.byteLength as number;
           if (!Number.isSafeInteger(bytes) || bytes <= 32 || bytes > SCREEN_PACKET_LIMIT || ++binaryCount > 3 || (binaryBytes += bytes) > 3 * SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
           incoming = incoming.then(async () => {
-            if (closed || !allocation) return;
+            if (!live()) return;
             const buffer = new Uint8Array(bytes);
             for (let offset = 0; offset < bytes;) {
               const maxBytes = Math.min(SCREEN_BRIDGE_CHUNK_BYTES, bytes - offset);
-              const chunk = await bridge.invoke<ArrayBuffer>("net_screen_read", { id: allocation.id, deliverySequence, offset, maxBytes });
-              if (closed) return;
+              const chunk = await bridge.invoke<ArrayBuffer>("net_screen_read", { id: allocation!.id, deliverySequence, offset, maxBytes });
+              if (!live()) return;
               if (!(chunk instanceof ArrayBuffer) || !chunk.byteLength || chunk.byteLength > maxBytes) throw new Error("screen_protocol_invalid");
               buffer.set(new Uint8Array(chunk), offset); offset += chunk.byteLength;
             }
@@ -110,7 +127,8 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
           lease.signal.addEventListener("abort", retired, { once: true });
           events.attach(port);
           if (!closed) await bridge.invoke("net_screen_open", { id: lease.id, network, join, events: { onmessage: event } });
-        } catch (error) { close(); throw error; }
+        // A session native already ended keeps its own reason over the open call's.
+        } catch (error) { close(); throw terminal ? new Error(terminal) : error; }
       },
       close: () => close(),
     };

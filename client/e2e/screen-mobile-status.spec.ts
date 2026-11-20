@@ -14,6 +14,9 @@ const status=(page:Page)=>page.locator(".screen-mobile .screen-state[role=status
 const BACKGROUND="App 已进入后台或设备已锁定。返回后请重新连接，再单独开始控制。";
 const HOST_STOPPED="主机已停止运行，屏幕连接已断开。请在主机恢复后重新连接。";
 const GENERIC="屏幕连接已结束，请检查主机状态后重试。";
+const CONGESTED="连接拥塞，屏幕已断开。请检查线路后重新连接。";
+const REVOKED="远程屏幕已关闭，或此设备的授权已撤销。请检查目标电脑的授权后重新连接。";
+const CLOSED="屏幕连接已关闭。请重新连接，再单独开始控制。";
 const ready=(page:Page)=>page.waitForFunction(()=>!!(window as any).screenMobileFixture);
 const refresh=(page:Page)=>page.evaluate(()=>window.dispatchEvent(new Event("focus")));
 
@@ -91,4 +94,20 @@ test("English UI shows the same reasons in English, without raw client text",asy
     await page.evaluate(()=>(window as any).screenMobileActive(false));await page.evaluate(()=>(window as any).screenMobileActive(true));
     await expect(status(page)).toHaveText(text(BACKGROUND));
   }finally{await context.close();}
+});
+
+// F-AND-2(b): a call native rejects because its session just ended must not replace the
+// reason native sends right behind it, including native's own local reason.
+test("a page call rejected as an Android session ends never hides why it ended",async({page})=>{
+  await page.goto(url("android"));
+  for(const [method,code,reason,text] of [["screenAck","native_document_retired","screen_viewer_congested",CONGESTED],["screenSend","native_request_cancelled","screen_permission_revoked",REVOKED],["screenRead","native_request_cancelled","screen_network_closed",CLOSED]] as const){
+    await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
+    await page.evaluate(value=>{(window as any).screenMobileFixture.endBehind=value;},{method,code,reason});
+    await expect.poll(async()=>(await log(page)).endBehind,method).toBeUndefined();
+    await expect(status(page),method).toHaveText(text);await expect(page.getByText(/native_/)).toHaveCount(0);
+    await expect(page.getByRole("button",{name:"连接屏幕",exact:true})).toBeEnabled();
+  }
+  // An ordinary reconnect follows, and the next session's state replaces the old reason.
+  await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
+  await expect(status(page)).not.toHaveText(CLOSED);
 });

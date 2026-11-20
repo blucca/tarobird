@@ -3,7 +3,7 @@
 import type { HubConnection } from "../../src/connection.js";
 const platform = new URL(location.href).searchParams.get("platform") === "ios" ? "ios" : "android";
 const blocked = new URL(location.href).searchParams.get("blocked");
-const fixture = { calls: [] as { plugin: string; method: string; args: any }[], commands: [] as any[], opens: 0, stops: 0, documents: 0, active: true, locked: false, delayOpen: false, resumeOpen: undefined as (()=>void)|undefined, statusFailure: "" as ""|"abort"|"offline", renewals: false, viewOnly: false };
+const fixture = { calls: [] as { plugin: string; method: string; args: any }[], commands: [] as any[], opens: 0, stops: 0, documents: 0, active: true, locked: false, delayOpen: false, resumeOpen: undefined as (()=>void)|undefined, statusFailure: "" as ""|"abort"|"offline", renewals: false, viewOnly: false, endBehind: undefined as undefined|{ method: string; code: string; reason: string } };
 let challenge = 0;
 let socketListener = (_value: any) => {}, appListener = (_value: any) => {};
 const groups = new Map<string, { join: any; delivery: number; frame: number; generation: number; timer: number; packets: Map<number, Uint8Array>; pending: boolean }>();
@@ -24,6 +24,10 @@ Object.assign(window, { ...(platform === "ios" ? { webkit: { messageHandlers: { 
       if(fixture.delayOpen)await new Promise<void>(resolve=>{fixture.resumeOpen=resolve;});return {};
     }
     const group=groups.get(args.id);
+    // Android's order when a session ends under a running call: native queues the close
+    // event, retires the slot, then rejects that call; the page sees the rejection first.
+    if(group&&fixture.endBehind?.method===method){const {code,reason}=fixture.endBehind;fixture.endBehind=undefined;clearInterval(group.timer);groups.delete(args.id);
+      setTimeout(()=>socketListener({id:args.id,document:doc,kind:"close",reason}),0);throw Error(code);}
     if(method==="screenClose"){if(group){clearInterval(group.timer);groups.delete(args.id);}return {value:true};}
     if(!group)throw Error("screen_inactive");
     if(method==="screenRead"){const bytes=group.packets.get(args.deliverySequence)!;return {data:btoa(String.fromCharCode(...bytes.slice(args.offset,args.offset+args.maxBytes)))};}

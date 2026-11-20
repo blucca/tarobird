@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { createMobileScreenViewerTransport, type ScreenAllocation, type ScreenNativeBridge } from "../src/screen-mobile-transport.js";
+import { createMobileScreenViewerTransport, SCREEN_NATIVE_CLOSE_GRACE_MS, type ScreenAllocation, type ScreenNativeBridge } from "../src/screen-mobile-transport.js";
 import type { ScreenViewerPort } from "../src/screen-viewer-transport.js";
 import type { ScreenJoin } from "../../src/client-protocol/remote-screen.js";
 import { writeScreenFrame } from "../../src/client-protocol/screen-wire.js";
@@ -12,10 +12,12 @@ function fixture() {
   const life = new AbortController(), calls: { name: string; args: Record<string, unknown> }[] = [], values: unknown[] = [];
   let deliver: (value: unknown) => void = () => {}, port: ScreenViewerPort;
   const allocation: ScreenAllocation = { id: "native-group", document: "native-document", signal: life.signal };
-  const options: { allocate?: Promise<ScreenAllocation>; read?: Promise<void>; send?: Promise<void>; bytes: Uint8Array } = { bytes: frame() };
+  const options: { allocate?: Promise<ScreenAllocation>; read?: Promise<void>; send?: Promise<void>; opening?: Promise<void>; reject: Record<string, string>; bytes: Uint8Array } = { bytes: frame(), reject: {} };
   const bridge: ScreenNativeBridge = { allocate: async () => options.allocate ?? allocation, invoke: async <T>(name: string, args: Record<string, unknown>) => {
     calls.push({ name, args });
-    if (name === "net_screen_open") deliver = (args.events as { onmessage(value: unknown): void }).onmessage;
+    if (name === "net_screen_open") { deliver = (args.events as { onmessage(value: unknown): void }).onmessage; await options.opening; }
+    // A native rejection, as the plugin returns it: an Error whose message is the code.
+    if (options.reject[name]) throw new Error(options.reject[name]);
     if (name === "net_screen_send") await options.send;
     if (name === "net_screen_read") { await options.read; return options.bytes.slice(args.offset as number, (args.offset as number) + (args.maxBytes as number)).buffer as T; }
     return {} as T;
@@ -98,4 +100,71 @@ for(const kind of ["input","renew"] as const) test(`blur and refocus cannot revi
   expect(f.calls.filter(value=>value.name==="net_screen_send"&&(value.args.command as any).type==="release")).toHaveLength(1);
   f.post({...command,frameSequence:2});await expect.poll(()=>f.calls.filter(value=>value.name==="net_screen_send"&&(value.args.command as any).type===kind).length).toBe(1);
   expect((f.calls.at(-1)!.args.command as any).frameSequence).toBe(2);f.channel.close();
+});
+
+// F-AND-2(b). Native emits a session's close event and then retires its slot; a page call
+// running at that moment is rejected first, and that rejection reaches the page before the
+// close event queued behind it on the same plugin thread. The rejection only says the call
+// lost to the session's end; the close event carries why the session ended.
+const closes = (values: unknown[]) => values.filter(value => (value as { type?: string })?.type === "closed");
+const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+const attached = (f: ReturnType<typeof fixture>, deliverySequence = 1) => f.event({ kind: "screen", deliverySequence, value: { type: "attached", sessionId: "session" } });
+for (const [call, code] of [["ack", "native_document_retired"], ["ack", "native_request_cancelled"], ["ack", "screen_inactive"], ["receipt", "native_request_cancelled"], ["send", "native_request_cancelled"], ["read", "native_document_retired"]] as const)
+  test(`a ${call} rejected with ${code} does not hide the native close reason that follows it`, async () => {
+    const f = fixture(); f.options.reject[call === "send" ? "net_screen_send" : call === "read" ? "net_screen_read" : "net_screen_ack"] = code; await f.open();
+    if (call === "ack") attached(f);
+    if (call === "receipt") { f.event({ kind: "binary", deliverySequence: 1, byteLength: f.options.bytes.byteLength }); await expect.poll(() => f.values.length).toBe(1); f.post({ type: "received", sequence: 7 }); }
+    if (call === "send") f.post({ type: "keyframe", ...stamp });
+    if (call === "read") f.event({ kind: "binary", deliverySequence: 1, byteLength: f.options.bytes.byteLength });
+    await expect.poll(() => f.calls.some(value => value.name === `net_screen_${call === "receipt" ? "ack" : call}`)).toBe(true); await tick();
+    f.event({ kind: "close", reason: "screen_viewer_congested" });
+    expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_viewer_congested" }]);
+    expect(f.calls.filter(value => value.name === "net_screen_close")).toHaveLength(1);
+  });
+
+test("native's own local close reason is shown as it is, never a guessed Host reason or the raw call code", async () => {
+  const f = fixture(); f.options.reject.net_screen_send = "native_request_cancelled"; await f.open();
+  f.post({ type: "keyframe", ...stamp }); await expect.poll(() => f.calls.some(value => value.name === "net_screen_send")).toBe(true); await tick();
+  f.event({ kind: "close", reason: "screen_network_closed" });
+  expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_network_closed" }]);
+});
+
+test("without a native close the rejected call ends as a plain local disconnect, sending nothing more", async () => {
+  const f = fixture(); f.options.reject.net_screen_ack = "native_request_cancelled"; await f.open(); attached(f);
+  await expect.poll(() => f.calls.some(value => value.name === "net_screen_ack")).toBe(true); await tick();
+  f.post({ type: "keyframe", ...stamp }); await tick();
+  // A close for another document or group is still not this session's.
+  f.event({ document: "retired", kind: "close", reason: "screen_locked" }); f.event({ id: "other-group", kind: "close", reason: "screen_locked" });
+  expect(closes(f.values)).toEqual([]); expect(f.calls.filter(value => value.name === "net_screen_send")).toHaveLength(0);
+  await expect.poll(() => closes(f.values), { timeout: SCREEN_NATIVE_CLOSE_GRACE_MS + 2000 }).toEqual([{ type: "closed", reason: "screen_disconnected" }]);
+  f.event({ kind: "close", reason: "screen_locked" }); expect(closes(f.values)).toHaveLength(1);
+  expect(f.calls.filter(value => value.name === "net_screen_close")).toHaveLength(1);
+});
+
+test("a user disconnect while a rejected call waits for native stays a user disconnect", async () => {
+  const f = fixture(); f.options.reject.net_screen_ack = "native_document_retired"; await f.open(); attached(f);
+  await expect.poll(() => f.calls.some(value => value.name === "net_screen_ack")).toBe(true); await tick();
+  f.channel.close(); f.event({ kind: "close", reason: "screen_viewer_congested" });
+  await new Promise(resolve => setTimeout(resolve, SCREEN_NATIVE_CLOSE_GRACE_MS + 200));
+  expect(closes(f.values)).toEqual([]); expect(f.calls.filter(value => value.name === "net_screen_close")).toHaveLength(1);
+});
+
+test("document retirement while a rejected call waits still ends as a connection change", async () => {
+  const f = fixture(); f.options.reject.net_screen_ack = "native_request_cancelled"; await f.open(); attached(f);
+  await expect.poll(() => f.calls.some(value => value.name === "net_screen_ack")).toBe(true); await tick();
+  f.life.abort(); f.event({ kind: "close", reason: "screen_viewer_congested" });
+  expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_connection_changed" }]);
+});
+
+test("a rejection that is not about the session ending still closes with its own code", async () => {
+  const f = fixture(); f.options.reject.net_screen_ack = "invalid_screen_receipt"; await f.open(); attached(f);
+  await expect.poll(() => closes(f.values)).toEqual([{ type: "closed", reason: "invalid_screen_receipt" }]);
+});
+
+test("an open rejected after native already ended the session reports that session's reason", async () => {
+  const f = fixture(); let release!: () => void; f.options.opening = new Promise(resolve => { release = resolve; }); f.options.reject.net_screen_open = "native_request_cancelled";
+  const opened = f.open(); await expect.poll(() => f.calls.some(value => value.name === "net_screen_open")).toBe(true);
+  f.event({ kind: "close", reason: "screen_permission_revoked" }); release();
+  await expect(opened).rejects.toThrow("screen_permission_revoked");
+  expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_permission_revoked" }]);
 });
