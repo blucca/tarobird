@@ -74,3 +74,13 @@ test("a Mac target is unchanged: Mac shortcuts, a modifier choice only for a Win
  await page.keyboard.down("Control");await page.keyboard.up("Control");
  await expect.poll(()=>keys(page)).toEqual(["MetaLeft:down","MetaLeft:up"]);
 });
+
+test("after a Windows target's desktop goes away, the ending reason still names no Mac",async({page})=>{
+ await open(page,"?target=windows");
+ // The target sleeps or its App quits: later status reads carry no desktop, so no platform.
+ await page.evaluate(()=>{const w=window as any,c=w.screenConnection,read=c.screenStatus;w.desktopGoneReads=0;c.screenStatus=async()=>{w.desktopGoneReads++;return {...(await read()),desktop:null};};});
+ await page.evaluate(()=>(window as any).screenStream({type:"closed",reason:"screen_network_timeout"}));
+ await expect.poll(()=>page.evaluate(()=>(window as any).desktopGoneReads)).toBeGreaterThan(0);
+ await expect(page.getByText("屏幕连接超时，请检查目标电脑和当前线路。",{exact:true})).toBeVisible();
+ await expect(page.getByText("屏幕连接超时，请检查目标 Mac 和当前线路。",{exact:true})).toHaveCount(0);
+});
