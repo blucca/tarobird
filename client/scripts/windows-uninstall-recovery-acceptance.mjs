@@ -76,14 +76,13 @@ export function makeContext(sys, options) {
     const ready = W.join(tmp, `lock-${++counter}.ready`);
     const script = `$ErrorActionPreference = 'Stop'; $f = [System.IO.File]::Open('${ps(file)}', 'Open', 'Read', 'None'); Set-Content -LiteralPath '${ps(ready)}' -Value 'locked'; Start-Sleep -Seconds 1800; $f.Close()`;
     const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
-    let stderr = ''; child.stderr.on('data', chunk => { stderr += chunk; });
-    const exited = new Promise(resolve => child.once('exit', resolve));
-    child.once('error', () => {});
-    for (let waited = 0; waited < 30_000 && !existsSync(ready) && child.exitCode === null; waited += 250) await sys.sleep(250);
-    const held = existsSync(ready) && child.exitCode === null;
+    let stderr = '', done = false; child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise(resolve => { child.once('exit', () => { done = true; resolve(); }); child.once('error', error => { done = true; stderr += String(error); resolve(); }); });
+    for (let waited = 0; waited < 30_000 && !existsSync(ready) && !done; waited += 250) await sys.sleep(250);
+    const held = existsSync(ready) && !done;
     return {
       held, detail: held ? `holding ${file} (FileShare.None, pid ${child.pid})` : `could not lock ${file}: ${stderr.trim().slice(0, 500)}`,
-      release: async () => { if (child.exitCode === null) { child.kill(); await Promise.race([exited, sys.sleep(15_000)]); } },
+      release: async () => { if (!done) { child.kill(); await Promise.race([exited, sys.sleep(15_000)]); } },
     };
   };
   const install = async (receipt, phase, args = ['/S']) => {
@@ -320,12 +319,16 @@ async function driveUi(ctx, mode, { release } = {}) {
   const child = spawn('powershell.exe', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   let stdout = '', stderr = '';
   child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; });
-  const exited = new Promise(resolve => { child.once('exit', resolve); child.once('error', resolve); });
+  let done = false;
+  const exited = new Promise(resolve => { child.once('exit', () => { done = true; resolve(); }); child.once('error', error => { done = true; stderr += String(error); resolve(); }); });
   let released = false;
-  while (child.exitCode === null && child.signalCode === null) {
+  // The driver has its own 300 s budget; never wait for it longer than that.
+  const deadline = Date.now() + 360_000;
+  while (!done && Date.now() < deadline) {
     if (release && !released && existsSync(releaseFile)) { await release(); await writeFile(releasedFile, 'done'); released = true; }
     await Promise.race([exited, ctx.sys.sleep(500)]);
   }
+  if (!done) child.kill();
   try { return { ...JSON.parse(stdout.trim().split(/\r?\n/).pop()), released }; } catch { return { error: `${stdout.slice(-1000)} ${stderr.slice(-1000)}`, events: [], released }; }
 }
 const describe = ui => ui.error ? `driver error: ${ui.error}` : `seen ${ui.seen}, closed ${ui.closed}, ${ui.seconds}s; events: ${(ui.events ?? []).map(e => `${e.kind}${e.kind === 'answer' || e.kind === 'confirm-page' ? `=${e.detail}` : ''}`).join(' → ')}; left ${JSON.stringify(ui.left ?? [])}`;
