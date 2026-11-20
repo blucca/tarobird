@@ -469,8 +469,15 @@ export async function run(options, sys = windowsSystem()) {
   receipt.add('preflight', 'disposable-runner', 'pass', `GitHub-hosted ${meta.image}`);
   await mkdir(options.temp, { recursive: true });
   const ctx = makeContext(sys, options);
+  // A disposable runner: an installation left by an earlier (failed or timed
+  // out) step is removed first, and recorded; only an unremovable one stops us.
   const installed = await ctx.reg(UNINSTALL_KEY);
-  if (installed.state !== 'absent') { receipt.add('preflight', 'no-installation', 'fail', `uninstall key ${installed.state}; an earlier step left an installation`); return { receipt, meta }; }
+  if (installed.state !== 'absent') {
+    receipt.info('preflight', 'earlier-installation', `uninstall key ${installed.state}; removing it before the cases`);
+    await ctx.ensureUninstalled(receipt, 'preflight');
+    const left = await ctx.reg(UNINSTALL_KEY);
+    if (left.state !== 'absent') { receipt.add('preflight', 'no-installation', 'fail', `uninstall key ${left.state} after cleanup`); return { receipt, meta }; }
+  }
   receipt.info('preflight', 'retained-roots', ctx.presentRoots().join(', ') || 'none');
   const deadline = Date.now() + (options.budgetMinutes ?? 50) * 60_000;
   for (const name of options.cases) {
