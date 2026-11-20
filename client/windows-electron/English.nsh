@@ -96,3 +96,5 @@ LangString birdNoticeMissing ${LANG_ENGLISH} "The TaroBird program is missing, s
 LangString birdNoStopper ${LANG_ENGLISH} "The installer helper that confirms the local Host has stopped is missing."
 LangString birdRepairThenUninstall ${LANG_ENGLISH} "Keep data and backups. Reinstall this version to repair, then uninstall again."
 LangString birdSelfKept ${LANG_ENGLISH} "the running uninstaller is left for the installer to replace."
+LangString birdNoteDone ${LANG_ENGLISH} "finished"
+LangString birdNoteKept ${LANG_ENGLISH} "This step is also saved in this Windows user's local folder and is not uploaded. To see it and earlier steps after setup closes, press Win+R, enter %LOCALAPPDATA% and open the TaroBird Setup Notes folder."

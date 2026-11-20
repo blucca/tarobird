@@ -7,9 +7,16 @@ Var BirdCode
 Var BirdReason
 Var BirdNext
 Var BirdMessage
+!include "installer-notes.nsh"
 
 !macro BirdProblem PHASE REASON ACTION CODE RETRY
+  StrCpy $BirdNotePhase "${PHASE}"
+  StrCpy $BirdNoteCode "${CODE}"
+  !insertmacro BirdNoteCall
   StrCpy $BirdMessage "$BirdOperation — ${PHASE}$\r$\n${REASON}$\r$\n$BirdBackupState$\r$\n$BirdNoticeState$\r$\n$\r$\n${ACTION}$\r$\n$\r$\nTaroBird ${VERSION} · TB-${CODE} · $(birdCopy)"
+  ${If} $BirdNoteKept = 1
+    StrCpy $BirdMessage "$BirdMessage$\r$\n$(birdNoteKept)"
+  ${EndIf}
   DetailPrint "$BirdMessage"
   ${IfNot} ${Silent}
   ${AndIf} $PassiveMode != 1
