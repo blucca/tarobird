@@ -30,6 +30,7 @@ Add-Type -Namespace BirdProbe -Name Win32 -MemberDefinition @'
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, System.Text.StringBuilder text);
 [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+[DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hWnd);
 '@
 function Win32Button([int]$hwnd, [string]$name) {
   $child = [IntPtr]::Zero
@@ -42,7 +43,7 @@ function Win32Button([int]$hwnd, [string]$name) {
   } while ($child -ne [IntPtr]::Zero)
   return [IntPtr]::Zero
 }
-function Tree($el) { ((Kids $el | Select-Object -First 30 | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName -replace 'ControlType\.','')/$($_.Current.ClassName)/$($_.Current.Name)" }) -join ' ; ') }
+function Tree($el) { ((Kids $el | Select-Object -First 30 | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName -replace 'ControlType\.','')/$($_.Current.ClassName)/$($_.Current.Name)$(if ($_.Current.ClassName -eq 'Button') { if ([BirdProbe.Win32]::IsWindowEnabled([IntPtr]$_.Current.NativeWindowHandle)) { '+' } else { '-' } })" }) -join ' ; ') }
 $since = @{}; $seenText = @{}; $acted = @{}
 function Note([string]$kind, [string]$detail) {
   [void]$events.Add([ordered]@{ ms = [int]((Get-Date) - $start).TotalMilliseconds; kind = $kind; detail = $detail })
@@ -66,6 +67,13 @@ function Press($el) {
 # matching name in the owner's whole tree.
 $Walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
 function Scope($btn) { $parent = $Walker.GetParent($btn); if ($parent) { $parent } else { $btn } }
+# Enabled state from the control's own window (UIA's IsEnabled was not reliable
+# for these Pane-typed Win32 buttons, probe run 44838505643).
+function Enabled($btn) {
+  $h = [IntPtr]$btn.Current.NativeWindowHandle
+  if ($h -ne [IntPtr]::Zero) { return [BirdProbe.Win32]::IsWindowEnabled($h) }
+  return $btn.Current.IsEnabled
+}
 function Checked($box) {
   try { return [string]$box.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'On' }
   catch { return [int][BirdProbe.Win32]::SendMessage([IntPtr]$box.Current.NativeWindowHandle, 0x00F0, [IntPtr]::Zero, [IntPtr]::Zero) -eq 1 }
@@ -129,7 +137,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
           if ($cancel) { Press $cancel; Note 'answer' 'Cancel' } elseif ($ok) { Press $ok; Note 'answer' 'OK' }
         }
         $answered++; $acted[$key] = $true
-      } elseif ($uninstall -and $uninstall.Current.IsEnabled) {
+      } elseif ($uninstall -and (Enabled $uninstall)) {
         $box = $null
         foreach ($c in (Kids $w)) { if (($c.Current.ControlType -eq $CT::CheckBox -or $c.Current.ClassName -eq 'Button') -and $c.Current.Name -like '*Back up and reset local data*') { $box = $c } }
         if ($box) {
@@ -139,7 +147,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
           Note 'confirm-page' "checkbox=$(if (Checked $box) { 'On' } else { 'Off' }) mode=$Mode"
         } else { Note 'confirm-page' "checkbox not found; text: $(Text $w)" }
         Press $uninstall; Note 'answer' 'Uninstall'; $acted[$key] = $true
-      } elseif ($close -and $close.Current.IsEnabled) {
+      } elseif ($close -and (Enabled $close)) {
         Note 'finished' (Text $w)
         Press $close; $closed = $true; $acted[$key] = $true
       }
