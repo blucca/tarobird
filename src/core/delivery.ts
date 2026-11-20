@@ -1,3 +1,4 @@
+import { renderCodexWebCitations } from "../runtime/codex-web-citations.js";
 import { normalizeAsyncUserInput } from "./async-user-input.js";
 import { channelProfile } from "./channel-profile.js";
 import { readFile, realpath, stat } from "node:fs/promises";
@@ -342,10 +343,10 @@ export async function deliverCoreResponse(input: {
   const cronAddMatches = extractCronAddTagMatches(input.text);
   const matches = extractDeliveryTagMatches(input.text);
   const invalidPseudoMatches = extractInvalidDeliveryPseudoTagMatches(input.text);
-  const cleanedText = renderCodexFileCitations(
+  const cleanedText = renderCodexWebCitations(renderCodexFileCitations(
     stripInvalidDeliveryPseudoTags(stripCronAddTags(stripCoreToolTags(stripDeliveryTags(input.text)))),
     locale,
-  );
+  ), locale);
   const replyOptions = coreReplyOptions(input.replyTo, input.replyInThread);
   if (invalidPseudoMatches.length > 0) {
     ok = false;

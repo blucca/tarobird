@@ -259,7 +259,7 @@ export function buildCoreCronExecutor(input: {
           return;
         }
         const finalText = result.text || renderCoreEmptyCronAgentReply(job);
-        const cardDisplayText = runCard ? cleanCardText(finalText, locale) : finalText;
+        const cardDisplayText = runCard ? cleanCardText(runCard.resolveFinalText(finalText), locale) : finalText;
         const answerChunks = runCard ? splitCoreAnswerIntoCardChunks(cardDisplayText) : [cardDisplayText];
         const spillToContinuationCards = Boolean(runCard)
           && answerChunks.length > 1

@@ -1,3 +1,4 @@
+import { renderCodexWebCitations } from "../../runtime/codex-web-citations.js";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 
@@ -207,7 +208,7 @@ export async function deliverArtifactResponse(
   if (fileCandidates.length > 0 || deliveryTags.length > 0) {
     cleanedText = stripDeliveryTags(cleanedText);
   }
-  cleanedText = renderCodexFileCitations(cleanedText, locale);
+  cleanedText = renderCodexWebCitations(renderCodexFileCitations(cleanedText, locale), locale);
 
   if (cleanedText) {
     const chunks = chunkReplyMessage(cleanedText);

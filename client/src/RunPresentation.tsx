@@ -1,3 +1,4 @@
+import { renderCodexWebCitations } from "../../src/runtime/codex-web-citations.js";
 import { writeClipboardText } from "./clipboard-write.js";
 import { TurnStopContext } from "./use-turn-stop.js";
 import { DiffViewerTrigger } from "./DiffViewerTrigger.js";
@@ -357,6 +358,8 @@ function RunDetails({ goalTurnEnded, scoped, run, phase, observedNow, sync, mess
 }
 
 function RunStep({ entry, initialOpen, change }: { entry: RunEntry; initialOpen: boolean; change: (open: boolean) => void }) {
+  const locale = useLocale();
+  const prose = (text: string) => renderCodexWebCitations(text, locale, { streaming: entry.status === "running" });
   const [open, setOpen] = useState(initialOpen), [copied, setCopied] = useState(false), [copyError, setCopyError] = useState(false);
   const plan = runPlan(entry), diff = runDiff(entry), sources = runKind(entry) === "search" ? runSources([entry.output, ...(entry.sources?.map(source => source.url) ?? [])].join("\n")) : [], exit = runExitCode(entry);
   const activity = entry.kind === "text" && entry.name?.startsWith("subagent_") ? runInput(entry) : undefined;
@@ -371,7 +374,7 @@ function RunStep({ entry, initialOpen, change }: { entry: RunEntry; initialOpen:
         {typeof activity.agentId === "string" && <small>{t("子代理 ID：{0}", activity.agentId)}</small>}
       </> : entry.name && entry.name !== "CodexAgent" && <small>{entry.name}</small>}{entry.truncated && <p className="run-notice">{t("此步骤内容已截短")}</p>}
       {entry.scope && <><small>{t("作用域：{0}", entry.scope.id)}</small>{runScopeParent(entry.scope) && <small>{runScopeParent(entry.scope)}</small>}</>}
-      {exit !== undefined && <p>{t("退出状态：{0}", exit)}</p>}{(entry.durationMs !== undefined || entry.endedAt !== undefined) && <p>{t("耗时：{0}", formatRunDuration(entry.durationMs ?? (entry.endedAt! - entry.at), true))}</p>}{entry.text && <section className={runKind(entry) === "delegate" ? "run-child-progress" : undefined}>{runKind(entry) === "delegate" && <h4>{t("子代理进展")}</h4>}<div className="card-text"><MarkdownText text={entry.text}/></div></section>}
+      {exit !== undefined && <p>{t("退出状态：{0}", exit)}</p>}{(entry.durationMs !== undefined || entry.endedAt !== undefined) && <p>{t("耗时：{0}", formatRunDuration(entry.durationMs ?? (entry.endedAt! - entry.at), true))}</p>}{entry.text && <section className={runKind(entry) === "delegate" ? "run-child-progress" : undefined}>{runKind(entry) === "delegate" && <h4>{t("子代理进展")}</h4>}<div className="card-text"><MarkdownText text={prose(entry.text)}/></div></section>}
       {!!plan.length && <ul className="run-plan">{plan.map((item, index) => <li key={index}><span>{item.status === "completed" ? "✓" : item.status === "in_progress" ? "◉" : "○"}</span><span>{item.content}</span><small>{item.status === "completed" ? t("已完成") : item.status === "in_progress" ? t("执行中") : t("待执行")}</small></li>)}</ul>}
       {diff && <section><h4>{entry.changes?.length ? t("工具返回的差异") : t("请求的修改")}</h4><pre className="run-diff">{diff.split("\n").map((line, i) => <span key={i} className={line.startsWith("+") ? "added" : line.startsWith("-") ? "removed" : ""}>{line}{"\n"}</span>)}</pre></section>}
       {!!sources.length && <section><h4>{t("搜索来源")}</h4><ul>{sources.map(url => <li key={url}><a href={url} target="_blank" rel="noopener noreferrer">{url}</a></li>)}</ul></section>}
@@ -379,8 +382,8 @@ function RunStep({ entry, initialOpen, change }: { entry: RunEntry; initialOpen:
       {childReports !== undefined ? <section className="run-child-result"><h4>{t("子代理回复")}</h4>{childReports.length ? childReports.map(report => <article className="run-agent-report" key={report.id}>
         <header><span>{report.id}</span><strong data-state={report.status === "errored" ? "errored" : undefined}>{codexAgentStatus(report.status)}</strong></header>
         {report.unreadable && <p>{t("回复格式暂不支持，请查看原始输出。")}</p>}
-        {report.message && <div className="card-text"><MarkdownText text={report.message}/></div>}
-      </article>) : <p>{t("尚无子代理状态回执")}</p>}</section> : runKind(entry) === "delegate" && entry.name !== "CodexAgent" && entry.output && <section className="run-child-result"><h4>{t("子代理回复")}</h4><div className="card-text"><MarkdownText text={entry.output}/></div></section>}
+        {report.message && <div className="card-text"><MarkdownText text={prose(report.message)}/></div>}
+      </article>) : <p>{t("尚无子代理状态回执")}</p>}</section> : runKind(entry) === "delegate" && entry.name !== "CodexAgent" && entry.output && <section className="run-child-result"><h4>{t("子代理回复")}</h4><div className="card-text"><MarkdownText text={prose(entry.output)}/></div></section>}
       {entry.output !== undefined && (runKind(entry) === "delegate" ? <details className="run-raw" open={entry.name === "CodexAgent" && childReports === undefined ? true : undefined}><summary>{t("原始输出")}</summary><CodeBlock text={entry.output} className="run-code" copyLabel={t("复制原始输出")}/></details> : <section><h4>{t("原始输出")}</h4>{entry.output ? <CodeBlock text={entry.output} className="run-code" copyLabel={t("复制原始输出")}/> : <p>{t("工具未返回文本输出")}</p>}</section>)}
     </div>}
   </details></li>;

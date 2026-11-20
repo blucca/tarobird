@@ -11,7 +11,7 @@ import { attachGateway } from "../../src/gateway/service.js";
 import { createCoreServiceRuntime } from "../../src/core/runtime.js";
 import { selectConversation, enterMobileChat } from "./fixtures/mobile.js";
 
-async function setup(supported = true, attachments: { images: boolean; files: "any" | "text" } | null = { images: true, files: "any" }, options: { toolAccess?: boolean; delivery?: boolean } = {}) {
+async function setup(supported = true, attachments: { images: boolean; files: "any" | "text" } | null = { images: true, files: "any" }, options: { toolAccess?: boolean; delivery?: boolean; citationGates?: [Promise<void>, Promise<void>] } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "side-ui-")), stateDir = path.join(root, "bot"); await mkdir(stateDir);
   await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "codex", locale: "zh" }));
   const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: path.resolve("dist") });
@@ -40,6 +40,13 @@ async function setup(supported = true, attachments: { images: boolean; files: "a
           const call = { name: "app_send_file", arguments: { path: image, kind: "image", caption: "侧边头像总览" }, sessionId: nativeId, callId: "image-one", abortSignal };
           receipts.push(await appPlatformTools.call(call)); receipts.push(await appPlatformTools.call(call));
           return { text: "已发送到侧边，可点开查看。" };
+        }
+        if (options.citationGates) {
+          await onEngineEvent({ type: "assistant_text", text: "Evidence ci", delta: true });
+          await options.citationGates[0];
+          await onEngineEvent({ type: "assistant_text", text: "teturn2search5 after.", delta: true });
+          await options.citationGates[1];
+          return { text: "Evidence citeturn2search5 after." };
         }
         const received = await Promise.all((files ?? []).map(async file => ({ name: file.name, kind: file.kind, bytes: (await readFile(file.path)).toString("base64") }))); sideFiles.push(received);
         if (text === "慢回答") {
@@ -830,4 +837,32 @@ test("side sends an image without approval, survives navigation and never publis
     await page.getByRole("button", { name: "侧边对话", exact: true }).click();
     await expect(panel.locator(".side-output-attachments")).toHaveCount(0);
   } finally { await page.close(); await f.close(); }
+});
+
+
+test("side citations preserve split streams and sanitize display, copy and insert", async ({ page }) => {
+  let advance!: () => void, finish!: () => void;
+  const gates: [Promise<void>, Promise<void>] = [new Promise(resolve => { advance = resolve; }), new Promise(resolve => { finish = resolve; })];
+  const f = await setup(true, null, { toolAccess: true, citationGates: gates });
+  try {
+    await pair(page, f.hub); await selectConversation(page, f.chat.title);
+    await page.getByRole("button", { name: "侧边对话", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "侧边对话", exact: true });
+    await panel.getByRole("textbox", { name: "侧边问题", exact: true }).fill("Search citation fixture");
+    await panel.getByRole("button", { name: "发送侧边问题", exact: true }).click();
+    await expect(panel.locator(".markdown")).toHaveText("Evidence");
+    advance();
+    const answer = "Evidence （来源链接未提供） after.";
+    await expect(panel.locator(".markdown")).toHaveText(answer);
+    finish();
+    await expect(panel.getByRole("button", { name: "发送侧边问题", exact: true })).toBeVisible();
+    await expect(panel.locator(".markdown")).toHaveText(answer);
+    await page.evaluate(() => Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text: string) => { (window as any).copiedAnswer = text; } } }));
+    await panel.getByRole("button", { name: "复制", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).copiedAnswer)).toBe(answer);
+    await panel.getByRole("button", { name: "插入主输入框", exact: true }).click();
+    await expect(page.getByRole("textbox", { name: "消息", exact: true })).toHaveValue(`> ${answer}`);
+    expect(f.mainCalls).toEqual([]);
+    expect((await f.hub.store.snapshot("owner", f.chat.id)).messages).toHaveLength(1);
+  } finally { advance(); finish(); await page.close(); await f.close(); }
 });

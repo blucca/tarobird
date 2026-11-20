@@ -3713,6 +3713,13 @@ session, Gateway, Bus and scoped App-tool suites listed in the audit.
   Codex one-shot process adapter.
 - `src/codex/app-server-adapter.ts`
   Codex streaming/app-server adapter and the default Codex runtime.
+  Native web-search result IDs are retained for per-run citation resolution by
+  `src/runtime/codex-web-citations.ts` and the shared run-card renderer. Final
+  replies and recovery preserve verified source links; unresolved controls have
+  localized fallback text. No source IDs are guessed. See
+  [citation boundaries](client/codex-search-citations-2026-11-20.md).
+  Tests: `codex-web-citations`, `app-server-adapter`, `core-card-renderer`,
+  `codex-file-citations`, delivery suites; browser `codex-web-citations`.
 - `src/codex/codex-user-input.ts`, `src/codex/codex-mcp-elicitation.ts`
   Validate native Codex questions and standard MCP forms, preserve native IDs and
   typed answer values, and require explicit confirmation for empty MCP forms.

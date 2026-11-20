@@ -12,6 +12,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 
 import type { EngineStreamEvent } from "../codex/adapter.js";
+import { renderCodexWebCitations } from "../runtime/codex-web-citations.js";
 import type { ClaudeNativeGoalReceipt, ClaudeNativeGoalUpdate } from "../codex/claude-native-goal.js";
 import { EngineCancellationUnconfirmedError, EngineSteeringRejectedError, EngineStopTooLateError, EngineNativeInputUnsentError } from "../codex/adapter.js";
 import { checkBudgetAvailability, recordBridgeTurnUsage } from "../runtime/bridge-turn.js";
@@ -3668,7 +3669,12 @@ export async function createCoreRunCardController(input: {
       }
       answerAttemptStartBlock = state.blocks.length;
     },
-    resolveFinalText: (text) => resolveCoreFinalAnswerText(state, text, answerAttemptStartBlock),
+    // Recovery creates a new adapter turn; the card retains sources from all
+    // attempts in this run. Resolve before callers clean or split the answer.
+    resolveFinalText: (text) => renderCodexWebCitations(
+      resolveCoreFinalAnswerText(state, text, answerAttemptStartBlock), input.locale,
+      { sources: state.webSources, preserveUnresolved: true },
+    ),
     beginDelivery: async (text): Promise<CoreRunFinishResult> => {
       const finalText = resolveCoreFinalAnswerText(state, text, answerAttemptStartBlock);
       state = { ...state, finalAnswerBlockStart: answerAttemptStartBlock };

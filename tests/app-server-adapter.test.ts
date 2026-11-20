@@ -1,3 +1,5 @@
+import { applyCoreEngineEvent, initialCoreRunState, renderCoreRunCard } from "../src/core/card-renderer.js";
+import { withChannelProfile } from "../src/core/channel-profile.js";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -608,7 +610,7 @@ async function foregroundFixture() {
     emit("turn/completed", { turn: { id: turnId, status: "completed", items: [{ type: "agentMessage", text: "Done" }] } });
     await turn;
   };
-  return { adapter, events, record, frames, emit, finish, threadId, turnId };
+  return { adapter, events, record, frames, emit, finish, threadId, turnId, turn, child };
 }
 
 class FakeStream extends EventEmitter {
@@ -3997,4 +3999,110 @@ describe("Codex native App platform tools", () => {
       await expect(h.turn).rejects.toThrow("aborted");
     } finally { h.adapter.destroy(); }
   });
+});
+
+
+describe("Codex native web citation delivery", () => {
+  const marker = "citeturn2search5";
+  const search = { type: "webSearch", id: "search", query: "example", results: [
+    { type: "text_result", ref_id: "turn2search5", url: "https://example.com/source", title: "Example" },
+  ] };
+  const message = { type: "agentMessage", text: `Evidence ${marker}` };
+  const expected = "Evidence [example.com](<https://example.com/source>)";
+
+  it("maps completed search items into final replies while preserving delta events", async () => {
+    const f = await foregroundFixture();
+    try {
+      f.emit("item/completed", { turnId: f.turnId, item: search });
+      for (const delta of ["Evidence ", "ci", "teturn2search5"]) f.emit("item/agentMessage/delta", { turnId: f.turnId, delta });
+      f.emit("turn/completed", { turn: { id: f.turnId, status: "completed", items: [] } });
+      expect((await f.turn).text).toBe(expected);
+      expect(f.events.filter(event => event.type === "assistant_text").map(event => event.text).join("")).toBe(message.text);
+      expect(f.events.find(event => event.type === "tool_result" && event.toolName === "WebSearch"))
+        .toMatchObject({ sources: [{ refId: "turn2search5", url: "https://example.com/source", title: "Example" }] });
+    } finally { f.adapter.destroy(); }
+  });
+
+  it("recovers source metadata from the final item summary without extra RPCs", async () => {
+    const f = await foregroundFixture();
+    try {
+      f.emit("turn/completed", { turn: { id: f.turnId, status: "completed", items: [search, message] } });
+      expect((await f.turn).text).toBe(expected);
+      expect(f.frames().some(frame => frame.method === "thread/read")).toBe(false);
+    } finally { f.adapter.destroy(); }
+  });
+
+  it("uses only the requested turn's sources during thread/read recovery", async () => {
+    const f = await foregroundFixture();
+    try {
+      f.emit("turn/completed", { turn: { id: f.turnId, status: "completed", items: [] } });
+      await waitFor(() => f.frames().some(frame => frame.method === "thread/read"));
+      const read = f.frames().find(frame => frame.method === "thread/read")!;
+      f.child.stdout.emitData(JSON.stringify({ id: read.id, result: { thread: { turns: [
+        { id: "previous", items: [{ ...search, results: [{ ...search.results[0], url: "https://wrong.example/" }] }, message] },
+        { id: f.turnId, status: "completed", items: [search, message] },
+      ] } } }) + "\n");
+      expect((await f.turn).text).toBe(expected);
+    } finally { f.adapter.destroy(); }
+  });
+
+  it("does not attach another turn's search source to this reply", async () => {
+    const f = await foregroundFixture();
+    try {
+      f.emit("item/completed", { turnId: "unrelated-turn", item: search });
+      f.emit("turn/completed", { turn: { id: f.turnId, status: "completed", items: [message] } });
+      expect((await f.turn).text).toBe(message.text);
+    } finally { f.adapter.destroy(); }
+  });
+
+  it("keeps recovered final source links consistent with the streamed answer", async () => {
+    const f = await foregroundFixture();
+    const body = "A sufficiently detailed answer that should appear exactly once in the reply. ";
+    try {
+      f.emit("item/agentMessage/delta", { turnId: f.turnId, delta: `${body}${marker}\n\nFinal paragraph.` });
+      f.emit("turn/completed", { turn: { id: f.turnId, status: "completed", items: [search, { ...message, text: `${body}${marker}\n\nFinal paragraph.` }] } });
+      const result = await f.turn;
+      let state = initialCoreRunState("citation-recovery");
+      for (const event of f.events) state = applyCoreEngineEvent(state, event);
+      state = applyCoreEngineEvent(state, { type: "result", text: result.text });
+      const card = withChannelProfile("gateway", () => renderCoreRunCard(state, "en")) as any;
+      const answerText = JSON.stringify(card.body);
+      expect(answerText.split(body)).toHaveLength(2);
+      expect(answerText).not.toContain("Source link unavailable");
+      expect(answerText).toContain("https://example.com/source");
+    } finally { f.adapter.destroy(); }
+  });
+
+  it("does not choose between conflicting streamed and recovered source IDs", async () => {
+    const f = await foregroundFixture();
+    try {
+      f.emit("item/completed", { turnId: f.turnId, item: search });
+      f.emit("turn/completed", { turn: { id: f.turnId, status: "completed", items: [
+        { ...search, results: [{ ...search.results[0], url: "https://conflicting.example/" }] }, message,
+      ] } });
+      const result = await f.turn;
+      expect(result.text).toBe(message.text);
+      let state = initialCoreRunState("citation-conflict");
+      for (const event of f.events) state = applyCoreEngineEvent(state, event);
+      state = applyCoreEngineEvent(state, { type: "result", text: result.text });
+      const card = JSON.stringify(renderCoreRunCard(state, "en"));
+      expect(card).toContain("Source link unavailable");
+      expect(card).not.toContain("https://conflicting.example/");
+    } finally { f.adapter.destroy(); }
+  });
+
+
+  it("resolves a goal watcher's sources when its final summary contains only the answer", async () => {
+    const f = await goalFixture();
+    try {
+      f.emit("turn/started", { turn: { id: "search-goal" } });
+      f.emit("item/completed", { turnId: "search-goal", item: search });
+      f.emit("turn/completed", { turn: { id: "search-goal", status: "completed", items: [message] } });
+      f.emit("thread/goal/updated", { goal: { ...f.goal, status: "complete" } });
+      await f.respond("thread/goal/get", { goal: { ...f.goal, status: "complete" } });
+      await f.watch;
+      expect(f.events).toContainEqual({ type: "result", text: expected, sessionId: f.goal.threadId });
+    } finally { f.abort.abort(); f.adapter.destroy(); }
+  });
+
 });

@@ -180,7 +180,7 @@ export function recordRunEvent(record: RunRecord, event: EngineStreamEvent, now 
       ...(Number.isSafeInteger(event.exitCode) ? { exitCode: event.exitCode } : {}),
       ...(typeof event.durationMs === "number" && Number.isFinite(event.durationMs) && event.durationMs >= 0 ? { durationMs: event.durationMs } : {}),
       ...(event.truncated ? { truncated: true } : {}),
-      ...(event.changes ? { changes: event.changes } : {}), ...(event.sources ? { sources: event.sources } : {}),
+      ...(event.changes ? { changes: event.changes } : {}), ...(event.sources ? { sources: event.sources.map(({ url, title }) => ({ url, ...(title === undefined ? {} : { title }) })) } : {}),
     } : {};
     if (event.type === "tool_progress" && previous && !["running", "waiting"].includes(previous.status)) return;
     if (event.type === "tool_progress" && previous && runToolAction(previous.name) === "delegate") {

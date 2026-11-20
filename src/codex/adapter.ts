@@ -270,7 +270,7 @@ type UnscopedEngineStreamEvent =
       /** Upstream CLI/terminal explicitly reported bounded output. */
       truncated?: boolean;
       changes?: Array<{ path: string; diff: string }>;
-      sources?: Array<{ url: string; title?: string }>;
+      sources?: Array<{ url: string; title?: string; refId?: string }>;
       /** Matches the toolUseId of the originating tool_use event. */
       toolUseId?: string;
       toolName?: string;

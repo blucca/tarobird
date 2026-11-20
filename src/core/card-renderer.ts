@@ -1,3 +1,4 @@
+import { addCodexWebSources, renderCodexWebCitations, type CodexWebCitationOptions } from "../runtime/codex-web-citations.js";
 import { summarizeRun, type RunRecord } from "./run-record.js";
 import type { EngineStreamEvent, EngineApprovalScopes } from "../codex/adapter.js";
 import { approvalScope, approvalScopeLabel } from "./approval-scopes.js";
@@ -34,6 +35,8 @@ export type CoreRunBlock =
   | { kind: "tool"; tool: CoreToolEntry };
 
 export interface CoreRunState {
+  /** Exact source IDs from this run only; never share across conversations. */
+  webSources?: CodexWebCitationOptions["sources"];
   nativeRun?: RunRecord;
   conversationKey: string;
   bridgeChatType?: "private" | "group";
@@ -186,6 +189,7 @@ export function applyCoreEngineEvent(
       return {
         ...state,
         blocks: applyToolResult(state.blocks, event),
+        webSources: addCodexWebSources(state.webSources, event.sources),
       };
     case "tool_progress": {
       const blocks = applyToolProgress(state.blocks, event);
@@ -416,7 +420,7 @@ export function renderCoreRunCard(state: CoreRunState, locale: Locale = "zh"): R
     let streamTextIndex = 0;
     for (const group of groupBlocks(state.blocks)) {
       if (group.kind === "text") {
-        const cleaned = cleanCardText(group.content, locale, { streaming: true });
+        const cleaned = cleanCardText(group.content, locale, { streaming: true, sources: state.webSources });
         if (cleaned) {
           // Cap each streamed text element — a long answer would otherwise
           // overflow Feishu's per-element limit and fail every card update.
@@ -445,7 +449,7 @@ export function renderCoreRunCard(state: CoreRunState, locale: Locale = "zh"): R
     // Once engine output is final, condense: show the answer prominently and fold the
     // whole process (thinking + every tool call) into one collapsed panel, so
     // the card doesn't become a giant scroll of intermediate steps.
-    const answer = cleanCardText(finalAnswerText(state), locale);
+    const answer = cleanCardText(finalAnswerText(state), locale, { sources: state.webSources });
     if (answer) {
       const gateway = channelProfile() === "gateway";
       elements.push(markdownElement(gateway ? answer : truncate(answer, COMPACT_ANSWER_MAX),
@@ -745,7 +749,7 @@ function matchingStreamAnswerId(state: CoreRunState, answer: string, locale: Loc
   let index = 0, matched: string | undefined;
   for (const group of groupBlocks(state.blocks)) {
     if (group.kind !== "text") continue;
-    const text = cleanCardText(group.content, locale, { streaming: true });
+    const text = cleanCardText(group.content, locale, { streaming: true, sources: state.webSources });
     if (!text) continue;
     if (answer.startsWith(text)) matched = streamTextElementId(index);
     index++;
@@ -808,11 +812,11 @@ export function liveRunCardStreamElement(
   }
   let textIndex = -1;
   for (const group of groups) {
-    if (group.kind === "text" && cleanCardText(group.content, locale, { streaming: true })) {
+    if (group.kind === "text" && cleanCardText(group.content, locale, { streaming: true, sources: state.webSources })) {
       textIndex += 1;
     }
   }
-  const cleaned = cleanCardText(last.content, locale, { streaming: true });
+  const cleaned = cleanCardText(last.content, locale, { streaming: true, sources: state.webSources });
   if (!cleaned || textIndex < 0) {
     return null;
   }
@@ -938,7 +942,7 @@ function lastSubstantiveAssistantText(state: CoreRunState): string {
     if (block?.kind !== "text") {
       continue;
     }
-    const cleaned = cleanCardText(block.content).trim();
+    const cleaned = cleanCardText(block.content, "zh", { sources: state.webSources }).trim();
     if (
       Array.from(cleaned).length >= SUBSTANTIVE_FINAL_FALLBACK_MIN_CHARS
       && !isLowInformationTerminalText(cleaned)
@@ -1053,13 +1057,13 @@ function condensedProcessPanel(
   labels: ReturnType<typeof runCardLabels>,
   locale: Locale,
 ): Record<string, unknown> | undefined {
-  const answer = cleanCardText(finalAnswerText(state), locale).trim();
+  const answer = cleanCardText(finalAnswerText(state), locale, { sources: state.webSources }).trim();
   const parts: string[] = [];
   if (state.reasoning.content.trim()) {
     parts.push(`🧠 ${truncate(state.reasoning.content.trim(), 600)}`);
   }
   let toolCount = 0;
-  const finalTextBlockIndex = findFinalAnswerBlockIndex(state.blocks, answer, locale);
+  const finalTextBlockIndex = findFinalAnswerBlockIndex(state, answer, locale);
   for (const [blockIndex, block] of state.blocks.entries()) {
     if (block.kind === "tool") {
       // TodoWrite shows as the dedicated plan panel, not in the process list.
@@ -1070,7 +1074,7 @@ function condensedProcessPanel(
       parts.push(`- ${toolHeaderText(block.tool)}`);
       continue;
     }
-    const text = cleanCardText(block.content, locale).trim();
+    const text = cleanCardText(block.content, locale, { sources: state.webSources }).trim();
     if (!text) {
       continue;
     }
@@ -1115,7 +1119,8 @@ function condensedProcessPanel(
   });
 }
 
-function findFinalAnswerBlockIndex(blocks: CoreRunBlock[], answer: string, locale: Locale): number {
+function findFinalAnswerBlockIndex(state: CoreRunState, answer: string, locale: Locale): number {
+  const { blocks } = state;
   if (!answer) {
     return -1;
   }
@@ -1124,7 +1129,7 @@ function findFinalAnswerBlockIndex(blocks: CoreRunBlock[], answer: string, local
     if (block?.kind !== "text") {
       continue;
     }
-    const text = cleanCardText(block.content, locale).trim();
+    const text = cleanCardText(block.content, locale, { sources: state.webSources }).trim();
     if (text && finalAnswerOverlapLength(text, answer) > 0) {
       return index;
     }
@@ -1182,7 +1187,7 @@ export function renderCoreRunCardCompact(state: CoreRunState, locale: Locale = "
       "run_goal_banner",
     ));
   }
-  const answer = cleanCardText(finalAnswerText(state), locale, { streaming: state.status === "running" });
+  const answer = cleanCardText(finalAnswerText(state), locale, { streaming: state.status === "running", sources: state.webSources });
   if (answer) {
     // Degrade commonly hits MID-RUN on exactly the long, tool-heavy turns the
     // rolling tail shipped for (their full card breaches Feishu's 30KB
@@ -1572,12 +1577,12 @@ function renderToolInput(tool: CoreToolEntry): string {
 export function cleanCardText(
   content: string,
   locale: Locale = "zh",
-  options: { streaming?: boolean } = {},
+  options: CodexWebCitationOptions = {},
 ): string {
   const stripped = stripInvalidDeliveryPseudoTags(
     stripCronAddTags(stripCoreToolTags(stripDeliveryTags(content))),
   );
-  const text = renderCodexFileCitations(stripped, locale, options);
+  const text = renderCodexWebCitations(renderCodexFileCitations(stripped, locale, options), locale, options);
   // The App supports real headings and math. Feishu's compatibility downgrade
   // must not erase their semantics before the shared Markdown reader sees them.
   return normalizeCoreMarkdown(text, channelProfile() === "gateway").trim();
@@ -2522,6 +2527,6 @@ function cardSummary(state: CoreRunState, locale: Locale): string {
     return locale === "en" ? "Auto-stopped" : "无响应已终止";
   }
   if (state.goalTurnEnded) return locale === "en" ? "Turn ended" : "本轮已结束";
-  const text = cleanCardText(finalAnswerText(state), locale);
+  const text = cleanCardText(finalAnswerText(state), locale, { sources: state.webSources });
   return text.trim().slice(0, 80) || (locale === "en" ? "Done" : "已完成");
 }

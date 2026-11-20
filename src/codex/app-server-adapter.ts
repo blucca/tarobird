@@ -1,3 +1,4 @@
+import { addCodexWebSources, renderCodexWebCitations, type CodexWebSource, type CodexWebSources } from "../runtime/codex-web-citations.js";
 import { SIDE_TOOL_INSTRUCTIONS } from "./side-instructions.js";
 import { isLogicalSessionId } from "../runtime/logical-session.js";
 import { wholeFilePatch } from "../core/recorded-diff.js";
@@ -222,6 +223,7 @@ type CodexChildWorkLedger = {
 type PendingTurn = {
   threadId: string;
   chunks: string[];
+  webSources?: CodexWebSources;
   finalText?: string;
   generatedImageTags: string[];
   usage?: AdapterUsage;
@@ -336,7 +338,7 @@ export interface CodexToolItemEvent {
   truncated?: boolean;
   exitCode?: number; durationMs?: number;
   changes?: Array<{ path: string; diff: string }>;
-  sources?: Array<{ url: string; title?: string }>;
+  sources?: CodexWebSource[];
   isError: boolean;
 }
 
@@ -464,10 +466,16 @@ export function extractCodexToolItem(item: unknown): CodexToolItemEvent | null {
       return {
         toolName: "WebSearch",
         ...(query !== undefined ? { toolInput: { query, ...(rec.action ? { action: rec.action } : {}) } } : {}),
-        ...(Array.isArray(rec.sources) ? { sources: rec.sources.flatMap(value => {
+        ...((Array.isArray(rec.sources) || Array.isArray(rec.results)) ? { sources: [
+          ...(Array.isArray(rec.sources) ? rec.sources : []),
+          ...(Array.isArray(rec.results) ? rec.results.filter(value => value?.type === "text_result") : []),
+        ].flatMap(value => {
           if (!value || typeof value !== "object") return [];
           const source = value as Record<string, unknown>;
-          return typeof source.url === "string" ? [{ url: source.url, ...(typeof source.title === "string" ? { title: source.title } : {}) }] : [];
+          return typeof source.url === "string" ? [{ url: source.url,
+            ...(typeof source.title === "string" ? { title: source.title } : {}),
+            ...(typeof source.ref_id === "string" ? { refId: source.ref_id } : {}),
+          }] : [];
         }) } : {}),
         ...(id ? { toolUseId: id } : {}),
         output: str("output", "result") ?? structuredOutput(rec.error ?? rec.result),
@@ -586,7 +594,12 @@ function readTurnUsage(value: unknown): AdapterUsage | undefined {
   return readAdapterUsage(turn.usage) ?? readAdapterUsage(turn);
 }
 
-function readTurnItems(value: unknown): { text: string; generatedImagePaths: string[] } {
+function extractCodexWebSearchItem(item: unknown): CodexToolItemEvent | null {
+  const type = item && typeof item === "object" ? (item as { type?: unknown }).type : undefined;
+  return type === "webSearch" || type === "web_search" ? extractCodexToolItem(item) : null;
+}
+
+function readTurnItems(value: unknown, previousSources?: CodexWebSources): { text: string; generatedImagePaths: string[] } {
   if (!Array.isArray(value)) {
     return { text: "", generatedImagePaths: [] };
   }
@@ -612,7 +625,9 @@ function readTurnItems(value: unknown): { text: string; generatedImagePaths: str
     }
   }
 
-  return { text, generatedImagePaths };
+  let sources: CodexWebSources | undefined = previousSources;
+  for (const item of value) sources = addCodexWebSources(sources, extractCodexWebSearchItem(item)?.sources);
+  return { text: renderCodexWebCitations(text, "en", { sources, preserveUnresolved: true }), generatedImagePaths };
 }
 
 function readThreadGoal(value: unknown): CodexThreadGoal | null {
@@ -674,6 +689,7 @@ function isStoppedGoalStatus(status: CodexThreadGoal["status"]): boolean {
 const GOAL_WATCH_POLL_MS = 30_000;
 export const CODEX_GOAL_FINAL_TURN_TIMEOUT_MS = 60_000;
 type CodexGoalWatcher = {
+  webSources?: CodexWebSources;
   onEngineEvent?: (event: EngineStreamEvent) => void | Promise<void>;
   /** Mode-gated exactly like PendingTurn.onApprovalRequest. */
   onApprovalRequest?: (request: EngineApprovalRequest) => Promise<EngineApprovalDecision>;
@@ -1966,6 +1982,8 @@ export class CodexAppServerAdapter implements CodexAdapter {
       } else if (threadId) {
         const toolEvent = extractCodexToolItem(item);
         if (toolEvent) {
+          const sourceOwner = pending ?? this.matchGoalWatcher(threadId, this.readString(parsed.params?.turnId));
+          if (sourceOwner) sourceOwner.webSources = addCodexWebSources(sourceOwner.webSources, toolEvent.sources);
           if (toolEvent.toolName === "CodexAgent" && !pending && !this.matchGoalWatcher(threadId, this.readString(parsed.params?.turnId))) return;
           // Codex app-server reports a completed tool item in one shot. Emit the
           // tool_use + tool_result pair so the Lark run card renders a finished
@@ -2006,7 +2024,9 @@ export class CodexAppServerAdapter implements CodexAdapter {
       }
       const watcher = this.goalWatchers.get(threadId);
       if (watcher?.activeTurnId === turnId) {
-        const finalText = readTurnItems((parsed.params?.turn as { items?: unknown } | undefined)?.items).text;
+        const items = (parsed.params?.turn as { items?: unknown } | undefined)?.items;
+        this.recoverWebSearchSources(threadId, items);
+        const finalText = readTurnItems(items, watcher.webSources).text;
         if (finalText.trim()) watcher.finalText = finalText;
         watcher.activeTurnId = undefined;
         this.settleGoalAfterFinalTurn(threadId, watcher);
@@ -2049,11 +2069,10 @@ export class CodexAppServerAdapter implements CodexAdapter {
       // item/completed notification can be delayed or dropped independently,
       // and waiting for a redundant read used to make an already-finished turn
       // appear stuck for up to the thread/read timeout.
-      const completedItems = readTurnItems(
-        typeof completedTurn === "object" && completedTurn !== null
-          ? (completedTurn as { items?: unknown }).items
-          : undefined,
-      );
+      const finalItems = typeof completedTurn === "object" && completedTurn !== null
+        ? (completedTurn as { items?: unknown }).items : undefined;
+      this.recoverWebSearchSources(threadId, finalItems, pending);
+      const completedItems = readTurnItems(finalItems, pending.webSources);
       if (completedItems.text.trim()) {
         pending.finalText = completedItems.text;
       }
@@ -4053,6 +4072,24 @@ export class CodexAppServerAdapter implements CodexAdapter {
     })).catch(() => {});
   }
 
+  /** Recovered native items must also reach the card's source map, so its
+   * streamed and final text use identical links even if item/completed was lost. */
+  private recoverWebSearchSources(threadId: string, items: unknown, pending?: PendingTurn): void {
+    if (!Array.isArray(items)) return;
+    for (const item of items) {
+      const tool = extractCodexWebSearchItem(item);
+      if (tool?.toolName !== "WebSearch" || !tool.sources?.some(source => source.refId)) continue;
+      const sourceOwner = pending ?? this.goalWatchers.get(threadId);
+      if (sourceOwner) sourceOwner.webSources = addCodexWebSources(sourceOwner.webSources, tool.sources);
+      // Native v2 webSearch items have an ID. Without one, do not let a
+      // recovery result accidentally complete the latest unrelated tool.
+      if (tool.toolUseId) this.emitEngineEvent(threadId, {
+        type: "tool_result", toolName: tool.toolName, toolUseId: tool.toolUseId,
+        sources: tool.sources, isError: tool.isError, sessionId: threadId,
+      }, pending ?? null);
+    }
+  }
+
   private async completeTurn(threadId: string, turnId: string | undefined, pending: PendingTurn): Promise<void> {
     // Local bridge-side failures (for example, a rejected approval callback)
     // remain fatal. App-server `error` notifications are handled separately:
@@ -4075,7 +4112,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
     }
 
     if (!text) {
-      const turnResult = await this.readTurnResult(threadId, turnId);
+      const turnResult = await this.readTurnResult(threadId, turnId, pending);
       if (turnResult.errorMessage) {
         pending.reject(new Error(turnResult.errorMessage));
         return;
@@ -4090,12 +4127,13 @@ export class CodexAppServerAdapter implements CodexAdapter {
       return;
     }
 
-    pending.resolve({ text, usage: pending.usage });
+    pending.resolve({ text: renderCodexWebCitations(text, "en", { sources: pending.webSources, preserveUnresolved: true }), usage: pending.usage });
   }
 
   private async readTurnResult(
     threadId: string,
     turnId: string | undefined,
+    pending?: PendingTurn,
   ): Promise<{ text: string; usage?: AdapterUsage; errorMessage?: string }> {
     const result = (await this.request("thread/read", {
       threadId,
@@ -4134,7 +4172,8 @@ export class CodexAppServerAdapter implements CodexAdapter {
       };
     }
 
-    const turnItems = readTurnItems(targetTurn?.items);
+    this.recoverWebSearchSources(threadId, targetTurn?.items, pending);
+    const turnItems = readTurnItems(targetTurn?.items, pending?.webSources);
     let text = turnItems.text.trim();
     for (const generatedImagePath of turnItems.generatedImagePaths) {
       const tag = sendImageTag(generatedImagePath);
