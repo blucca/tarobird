@@ -367,3 +367,48 @@ describe("one-shot opaque reads bind the usage snapshot to the current workspace
     expect(await run(withoutRouting, withoutRouting, realLimits(null), "file")).toMatchObject({ state: "ready" });
   });
 });
+
+// Recorded from real codex-cli 0.170.0 against a loopback backend answering 429 (quotafix-evidence/probes/codex-raw-errors.mjs).
+const real429 = {
+  json: { code: -32603, message: "failed to fetch codex rate limits: GET http://127.0.0.1:63831/backend-api/wham/usage failed: 429 Too Many Requests; content-type=application/json; body={\"detail\":\"synthetic rate limit\"}" },
+  text: { code: -32603, message: "failed to fetch codex rate limits: GET http://127.0.0.1:63837/backend-api/wham/usage failed: 429 Too Many Requests; content-type=text/plain; body=Too Many Requests" },
+  // A 429 on account discovery reaches account/read without its status: not identifiable.
+  discovery: { code: -32603, message: "workspace routing discovery failed" },
+  body500: { code: -32603, message: "failed to fetch codex rate limits: GET http://127.0.0.1:63849/backend-api/wham/usage failed: 500 Internal Server Error; content-type=application/json; body={\"detail\":\"upstream said 429 Too Many Requests\"}" },
+};
+describe("native Codex rate limiting on the quota read", () => {
+  const adapterWith = async (child: Child) => {
+    const f = await fixture(), adapter = new ProcessCodexAdapter("codex", f.env, () => child, undefined, undefined, undefined, f.root);
+    disposals.push(() => adapter.destroy()); return adapter;
+  };
+  it.each(["json", "text"] as const)("a real usage 429 (%s body) is rate limited, not sign-in or a generic error", async kind => {
+    const child = new Child(); child.errors = { "account/rateLimits/read": real429[kind] };
+    expect((await (await adapterWith(child)).getAccountQuota({ refresh: true })).snapshot).toMatchObject({ state: "unavailable", reason: "rate_limited", pools: [] });
+  });
+  it.each([
+    ["429 swallowed by account discovery", { "account/read": real429.discovery }],
+    ["500 whose body mentions 429", { "account/rateLimits/read": real429.body500 }],
+    ["429 text on account/read", { "account/read": { code: -32603, message: real429.json.message } }],
+    ["429 text with another JSON-RPC code", { "account/rateLimits/read": { code: -32600, message: real429.json.message } }],
+    ["429 with a suffix instead of the field separator", { "account/rateLimits/read": { code: -32603, message: "failed to fetch codex rate limits: GET http://127.0.0.1:1/backend-api/wham/usage failed: 429 Too Many Requests later" } }],
+  ])("does not guess rate limiting from %s", async (_label, errors) => {
+    const child = new Child(); child.errors = errors;
+    const snapshot = (await (await adapterWith(child)).getAccountQuota({ refresh: true })).snapshot;
+    expect(snapshot.reason).not.toBe("rate_limited"); expect(snapshot.state).not.toBe("login_required");
+  });
+  it("recovers to a fresh reading once the native read succeeds again", async () => {
+    // Each explicit read uses its own short-lived helper process.
+    let errors: Child["errors"] = {};
+    const f = await fixture(), adapter = new ProcessCodexAdapter("codex", f.env, () => { const child = new Child(); child.errors = errors; return child; }, undefined, undefined, undefined, f.root);
+    disposals.push(() => adapter.destroy());
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ state: "ready" });
+    errors = { "account/rateLimits/read": real429.json };
+    const limited = (await adapter.getAccountQuota({ refresh: true })).snapshot;
+    // The earlier reading is kept only as a marked, stale last reading with the limit as its reason.
+    expect(limited).toMatchObject({ state: "stale", reason: "rate_limited" });
+    errors = {};
+    const recovered = (await adapter.getAccountQuota({ refresh: true })).snapshot;
+    expect(recovered).toMatchObject({ state: "ready" }); expect(recovered.reason).toBeUndefined();
+    expect(recovered.pools[0]?.windows[0]).toMatchObject({ usedPercent: 25 });
+  });
+});
