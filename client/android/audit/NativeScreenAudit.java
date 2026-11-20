@@ -32,6 +32,11 @@ public final class NativeScreenAudit {
         for(int i=0;i<3;i++){JSONObject value=event(id,"screen");check(document.equals(value.getString("document")),"documentStamped");transport.screenAck(id,value.getLong("deliverySequence"));}
         return id;
     }
+    /** Registers `join` with a fixture mode (the join itself stays strict) and opens it; a session the peer refuses may already be retired. */
+    static String openMode(JSONObject join,String mode) throws Exception {
+        request(new JSONObject().put("action","register").put("join",new JSONObject(join.toString()).put("fixtureMode",mode)));
+        String id=transport.allocate("screen",document);try{transport.screenOpen(id,network,join);}catch(IOException closing){ }return id;
+    }
     static void closedOnPeer(String sid) throws Exception {
         long end=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);while(true){JSONArray open=request(new JSONObject().put("action","stats")).getJSONArray("open");boolean found=false;for(int i=0;i<open.length();i++)if(sid.equals(open.getJSONObject(i).getString("id")))found=true;if(!found)return;if(System.nanoTime()>end)throw new Exception("peer remained open");Thread.sleep(10);}
     }
@@ -60,18 +65,38 @@ public final class NativeScreenAudit {
                 check(item[3].equals(event(endingId,"close").getString("reason")),"hostCloseReasonCase"+i);
                 closedOnPeer(ending.getJSONObject("session").getString("id"));
             }
-            // A real Hub sends the session's state before "attached" on control: exactly that state may come first.
-            JSONObject first=join(false);JSONObject firstRegistered=new JSONObject(first.toString()).put("fixtureMode","state-first");
-            request(new JSONObject().put("action","register").put("join",firstRegistered));String firstId=transport.allocate("screen",document);transport.screenOpen(firstId,network,first);
+            // A real Hub sends the session's state before "attached" on control. Such a state is held,
+            // bounded, grants nothing and is delivered only after a matching "attached".
+            JSONObject first=join(false);String firstId=openMode(first,"state-first");
             List<String> order=new ArrayList<>();
             for(int i=0;i<3;i++){JSONObject delivered=event(firstId,"screen");order.add(delivered.getJSONObject("value").getString("type"));transport.screenAck(firstId,delivered.getLong("deliverySequence"));}
-            check(order.contains("state")&&order.indexOf("state")<order.indexOf("attached"),"stateBeforeAttachedDelivered");
+            check(order.indexOf("attached")>=0&&order.indexOf("attached")<order.indexOf("state"),"earlyStateDeliveredAfterAttached");
             check(transport.screenClose(firstId),"earlyStateSessionStaysOpen");event(firstId,"close");closedOnPeer(first.getJSONObject("session").getString("id"));
-            // Nothing else may precede it: a state for another session, or a readiness message.
-            String[][] refused={{"foreign-state-first","foreignStateBeforeAttachedRefused"},{"ready-first","readyBeforeAttachedRefused"}};
-            for(String[] item:refused){JSONObject early2=join(false);request(new JSONObject().put("action","register").put("join",new JSONObject(early2.toString()).put("fixtureMode",item[0])));
-                String earlyId=transport.allocate("screen",document);try{transport.screenOpen(earlyId,network,early2);}catch(IOException closing){/* the refusal may already have retired it */}
-                check("screen_protocol_invalid".equals(event(earlyId,"close").getString("reason")),item[1]);closedOnPeer(early2.getJSONObject("session").getString("id"));}
+            JSONObject granted=join(true);String grantedId=openMode(granted,"held-state");String grantedSid=granted.getJSONObject("session").getString("id");
+            JSONObject renewHeld=command(granted,"renew").put("leaseId",String.join("",Collections.nCopies(43,"L"))).put("challenge",String.join("",Collections.nCopies(43,"C"))).put("frameSequence",1);
+            long settle=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);boolean helloed=false;
+            while(!helloed&&System.nanoTime()<settle){JSONArray open=request(new JSONObject().put("action","stats")).getJSONArray("open");for(int i=0;i<open.length();i++)if(grantedSid.equals(open.getJSONObject(i).getString("id"))&&"control".equals(open.getJSONObject(i).getString("role")))helloed=true;if(!helloed)Thread.sleep(10);}
+            check(helloed,"heldStateSessionHelloed");Thread.sleep(300);
+            // Media attaches on its own and may already deliver its stream; nothing from control may arrive yet.
+            synchronized(events){boolean any=false;for(JSONObject e:events)if(grantedId.equals(e.optString("id"))&&"screen".equals(e.optString("kind"))&&!"stream".equals(e.getJSONObject("value").optString("type")))any=true;check(!any,"heldStateNotDeliveredBeforeAttached");}
+            transport.screenSend(grantedId,command(granted,"input-focus").put("enabled",true));
+            reject(()->transport.screenSend(grantedId,renewHeld),"heldStateGrantsNoControlBeforeAttached");
+            request(new JSONObject().put("action","attach").put("id",grantedSid));
+            List<String> controlOrder=new ArrayList<>();
+            while(controlOrder.size()<2){JSONObject delivered=event(grantedId,"screen");String kind=delivered.getJSONObject("value").getString("type");transport.screenAck(grantedId,delivered.getLong("deliverySequence"));if(!kind.equals("stream"))controlOrder.add(kind);}
+            check(controlOrder.equals(Arrays.asList("attached","state")),"heldStateFollowsAttached");
+            transport.screenSend(grantedId,command(granted,"input-focus").put("enabled",true));transport.screenSend(grantedId,renewHeld);check(true,"heldStateGrantsControlOnceAttached");
+            transport.screenClose(grantedId);event(grantedId,"close");closedOnPeer(grantedSid);
+            JSONObject missing=join(true);String missingId=openMode(missing,"held-state");
+            // Its media stream is consumed as the page would; only the absent "attached" ends it.
+            String missingReason=null;long missingEnd=System.nanoTime()+TimeUnit.SECONDS.toNanos(14);
+            while(missingReason==null&&System.nanoTime()<missingEnd){JSONObject next=null;synchronized(events){for(int i=0;i<events.size();i++)if(missingId.equals(events.get(i).optString("id"))){next=events.remove(i);break;}if(next==null)events.wait(50);}
+                if(next==null)continue;if("screen".equals(next.optString("kind")))transport.screenAck(missingId,next.getLong("deliverySequence"));else if("close".equals(next.optString("kind")))missingReason=next.getString("reason");}
+            check("screen_connect_timeout".equals(missingReason),"missingAttachedStillTimesOut");closedOnPeer(missing.getJSONObject("session").getString("id"));
+            // Nothing else may precede "attached", and what is held is bounded.
+            String[][] refused={{"foreign-state-first","foreignStateBeforeAttachedRefused"},{"ready-first","readyBeforeAttachedRefused"},{"wrong-attached","wrongAttachedAfterEarlyStateRefused"},{"state-flood","fifthEarlyStateRefused"},{"state-oversize","earlyStateBytesBounded"}};
+            for(String[] item:refused){JSONObject early=join(false);String earlyId=openMode(early,item[0]);
+                check("screen_protocol_invalid".equals(event(earlyId,"close").getString("reason")),item[1]);closedOnPeer(early.getJSONObject("session").getString("id"));}
             JSONObject controlling=join(true);String controlId=open(controlling);
             request(new JSONObject().put("action","control-state").put("id",controlling.getJSONObject("session").getString("id")).put("active",true));JSONObject leaseEvent=event(controlId,"screen");transport.screenAck(controlId,leaseEvent.getLong("deliverySequence"));
             JSONObject renew=command(controlling,"renew").put("leaseId",String.join("",Collections.nCopies(43,"L"))).put("challenge",String.join("",Collections.nCopies(43,"C"))).put("frameSequence",1);

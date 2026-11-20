@@ -117,14 +117,31 @@ final class HubScreenSession {
         if(reason.equals("session_expired") || reason.equals("device_revoked") || reason.equals("device_revoked_or_expired")) return reason;
         return reason.matches("screen_[a-z_]{1,57}") ? reason : "screen_network_closed";
     }
+    /** Released Hubs (1.5.1 and earlier) notify the session's state from
+     * attachViewer before the control socket replies "attached". Only the control
+     * socket may hold such states: each fully valid for this session, at most
+     * EARLY_STATES messages and EARLY_STATE_BYTES in total. They grant and deliver
+     * nothing until "attached", then follow it in arrival order through the same
+     * state path, so control grant, delivery budgets and the attach deadline are
+     * unchanged. A missing or wrong "attached" still ends the session. */
+    static final int EARLY_STATES=4, EARLY_STATE_BYTES=16384;
+    private final ArrayList<JSONObject> early=new ArrayList<>(); private final ArrayList<Integer> earlySizes=new ArrayList<>(); private int earlyBytes;
     private void receive(boolean isMedia,String text) throws Exception {
         int size=text.getBytes(StandardCharsets.UTF_8).length; if(size>CONTROL_LIMIT) throw invalid();
         JSONObject value=new JSONObject(text); String type=text(value,"type");
+        if(!isMedia && !controlReady && type.equals("state")) {
+            if(early.size()>=EARLY_STATES || earlyBytes+size>EARLY_STATE_BYTES) throw invalid();
+            controlGrant(value); early.add(value); earlySizes.add(size); earlyBytes+=size; return;
+        }
         if(type.equals("attached")) {
             keys(value,"type sessionId",""); if(!sessionId.equals(text(value,"sessionId")) || (isMedia?mediaReady:controlReady)) throw invalid();
-            if(isMedia) mediaReady=true; else { controlReady=true; for(String queued:outgoing) if(!control.sendText(queued)) throw invalid(); outgoing.clear(); outgoingBytes=0; }
-            if(mediaReady&&controlReady) attachmentDeadline.cancel(false);
-            if(isMedia) return;
+            if(isMedia) { mediaReady=true; if(controlReady) attachmentDeadline.cancel(false); return; }
+            controlReady=true; if(mediaReady) attachmentDeadline.cancel(false);
+            if(!deliver(value,size)) return;
+            ArrayList<JSONObject> held=new ArrayList<>(early); ArrayList<Integer> sizes=new ArrayList<>(earlySizes); early.clear(); earlySizes.clear(); earlyBytes=0;
+            for(int i=0;i<held.size();i++) { applyState(held.get(i)); if(!deliver(held.get(i),sizes.get(i))) return; }
+            for(String queued:outgoing) if(!control.sendText(queued)) throw invalid(); outgoing.clear(); outgoingBytes=0;
+            return;
         } else if(isMedia) {
             if(!mediaReady || !type.equals("stream")) throw invalid();
             keys(value,"type streamGeneration geometryRevision codec codecString width height contentRect","");
@@ -137,27 +154,34 @@ final class HubScreenSession {
             if(integer(rect,"x",0,0)!=0||integer(rect,"y",0,0)!=0||integer(rect,"width",1,edgeLimit)!=w||integer(rect,"height",1,edgeLimit)!=h) throw invalid();
             streamGeneration=stream; geometryRevision=geometry; width=w; height=h; codec=c.equals("h264")?1:2; lastFrame=0;
         } else {
-            // A Hub announces the session's state as it attaches the control
-            // socket, before "attached" itself. Only a valid state may precede it.
-            if(!controlReady && !type.equals("state")) throw invalid();
-            if(type.equals("state")) {
-                keys(value,"type session serverTime","controlPending streamGeneration lease"); JSONObject session=object(value,"session");
-                if(!sessionId.equals(text(session,"id"))||!generation.equals(text(session,"generation"))) throw invalid();
-                String state=text(session,"state"); if(!Arrays.asList("connecting","viewing","paused","controlling","closed").contains(state)) throw invalid();
-                integer(value,"serverTime",0,9007199254740991L);
-                if(value.has("controlPending")) bool(value,"controlPending");
-                if(value.has("streamGeneration")) integer(value,"streamGeneration",1,0xffffffffL);
-                if(value.has("lease")) { JSONObject lease=object(value,"lease"); keys(lease,"id expiresAt challenge challengeExpiresAt",""); token(lease,"id"); token(lease,"challenge"); integer(lease,"expiresAt",0,9007199254740991L); integer(lease,"challengeExpiresAt",0,9007199254740991L); }
-                canControl=state.equals("controlling")&&value.has("lease")&&controlAllowed; if(!canControl) inputFocused=false;
-            } else if(type.equals("frame-ready")) {
+            if(!controlReady) throw invalid();
+            if(type.equals("state")) applyState(value);
+            else if(type.equals("frame-ready")) {
                 keys(value,"type sessionId generation streamGeneration frameSequence expiresAt","");
                 if(!sessionId.equals(text(value,"sessionId"))||!generation.equals(text(value,"generation"))) throw invalid();
                 integer(value,"streamGeneration",1,0xffffffffL); integer(value,"frameSequence",1,0xffffffffL); integer(value,"expiresAt",0,9007199254740991L);
             } else throw invalid();
         }
-        if(jsonCount>=8 || jsonBytes+size>65536) { close("screen_viewer_congested"); return; }
+        deliver(value,size);
+    }
+    /** Validates a control state for this session and returns the control it grants; changes nothing. */
+    private boolean controlGrant(JSONObject value) throws Exception {
+        keys(value,"type session serverTime","controlPending streamGeneration lease"); JSONObject session=object(value,"session");
+        if(!sessionId.equals(text(session,"id"))||!generation.equals(text(session,"generation"))||!desktopId.equals(text(session,"desktopId"))) throw invalid();
+        String state=text(session,"state"); if(!Arrays.asList("connecting","viewing","paused","controlling","closed").contains(state)) throw invalid();
+        integer(value,"serverTime",0,9007199254740991L);
+        if(value.has("controlPending")) bool(value,"controlPending");
+        if(value.has("streamGeneration")) integer(value,"streamGeneration",1,0xffffffffL);
+        if(value.has("lease")) { JSONObject lease=object(value,"lease"); keys(lease,"id expiresAt challenge challengeExpiresAt",""); token(lease,"id"); token(lease,"challenge"); integer(lease,"expiresAt",0,9007199254740991L); integer(lease,"challengeExpiresAt",0,9007199254740991L); }
+        return state.equals("controlling")&&value.has("lease")&&controlAllowed;
+    }
+    private void applyState(JSONObject value) throws Exception { canControl=controlGrant(value); if(!canControl) inputFocused=false; }
+    /** Queues one JSON delivery for the page; false when the bound closed the session. */
+    private boolean deliver(JSONObject value,int size) throws Exception {
+        if(jsonCount>=8 || jsonBytes+size>65536) { close("screen_viewer_congested"); return false; }
         Delivery delivery=new Delivery(null,size); long receipt=++sequence; deliveries.put(receipt,delivery); jsonCount++; jsonBytes+=size;
         emit(new JSONObject().put("kind","screen").put("deliverySequence",receipt).put("value",value));
+        return true;
     }
     private void receiveBinary(ByteBuffer raw) throws Exception {
         int length=raw.remaining(); if(!mediaReady||streamGeneration==0||length<=32||length>PACKET_LIMIT) throw invalid();
@@ -212,7 +236,7 @@ final class HubScreenSession {
     void close(String reason) { synchronized(owner) {
         if(closed) return; closed=true;
         if(attachmentDeadline!=null) attachmentDeadline.cancel(false); if(watchdog!=null) watchdog.cancel(false);
-        controlTicket=mediaTicket=null; outgoing.clear(); deliveries.clear(); jsonBytes=jsonCount=binaryCount=outgoingBytes=0; inputFocused=canControl=false;
+        controlTicket=mediaTicket=null; outgoing.clear(); deliveries.clear(); early.clear(); earlySizes.clear(); earlyBytes=0; jsonBytes=jsonCount=binaryCount=outgoingBytes=0; inputFocused=canControl=false;
         if(control!=null) control.cancel(); if(media!=null) media.cancel();
         try { events.send(new JSONObject().put("id",id).put("document",document).put("kind","close").put("reason",reason)); } catch(Exception ignored) { }
         events.closed();

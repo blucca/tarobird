@@ -75,8 +75,11 @@ the viewer can end a connection with has its own explanation;
 The iOS attach deadline starts when both sockets resume, after route
 preparation, so a slow identity check does not consume it. A Hub sends the
 session's state on the control socket as it attaches, before `attached`, and
-released Hosts do so too. A mobile session must accept exactly that validated
-state first and nothing else; the Android audit checks both sides of that rule.
+released Hosts do so too. A mobile session holds at most four such states (16
+KiB), each validated for this session, generation and desktop; they grant no
+control and reach the page only after a matching `attached`, then in arrival
+order. Anything else first, a wrong or missing `attached`, or more than that
+bound ends the session. The Android audit checks each side of the rule.
 
 ## Maintenance and validation
 

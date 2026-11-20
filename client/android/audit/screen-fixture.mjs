@@ -17,7 +17,7 @@ const caDer=new X509Certificate(readFileSync(path.join(root,'ca.crt'))).raw;
 writeFileSync(path.join(root,'ca.der'),caDer);
 const pair=generateKeyPairSync('ed25519'),publicKey=pair.publicKey.export({format:'der',type:'spki'}).toString('base64');
 const wss=new WebSocketServer({noServer:true,maxPayload:16384,perMessageDeflate:false}),joins=new Map(),clients=new Map(),paths=[],chatPaths=[],commands=[];
-let helloCount=0,proofCount=0,holdProof=false;const held=new Map();
+let helloCount=0,proofCount=0,holdProof=false;const held=new Map(),pendingAttach=new Map();
 const server=createServer({key:readFileSync(path.join(root,'screen.key')),cert},(req,res)=>{
  const nonce=new URL(req.url,'https://localhost').searchParams.get('nonce');
  if(!req.url.startsWith('/api/tls-identity?')||!nonce) {res.writeHead(404);res.end();return;}
@@ -34,10 +34,19 @@ wss.on('connection',(ws,req)=>{if(req.url==='/ws'){ws.on('message',data=>ws.send
   entry=[...joins.values()].find(j=>(role==='media'?j.mediaTicket:j.controlTicket)===value.ticket);if(value.type!=='hello'||!entry){ws.terminate();return;}helloCount++;
   const group=clients.get(entry.session.id)||{};group[role]=ws;clients.set(entry.session.id,group);
   if(entry.fixtureMode==='no-attach')return;
-  // A real Hub sends the session's state on control before 'attached'; these modes send one message first.
-  if(role==='control'&&entry.fixtureMode==='state-first')ws.send(JSON.stringify({type:'state',session:{...entry.session,state:'connecting'},serverTime:Date.now(),controlPending:false,streamGeneration:1}));
-  if(role==='control'&&entry.fixtureMode==='foreign-state-first')ws.send(JSON.stringify({type:'state',session:{...entry.session,id:'other-session',state:'connecting'},serverTime:Date.now()}));
-  if(role==='control'&&entry.fixtureMode==='ready-first')ws.send(JSON.stringify({type:'frame-ready',sessionId:entry.session.id,generation:entry.session.generation,streamGeneration:1,frameSequence:1,expiresAt:Date.now()+1000}));
+  // A real Hub sends the session's state on control before 'attached'; these modes send messages first.
+  const early=(state,extra={})=>ws.send(JSON.stringify({type:'state',session:{...entry.session,state,...extra},serverTime:Date.now(),controlPending:false,streamGeneration:1}));
+  if(role==='control'){
+   const mode=entry.fixtureMode;
+   if(mode==='state-first')early('connecting');
+   if(mode==='state-flood')for(let n=0;n<5;n++)early('connecting');
+   if(mode==='state-oversize')for(let n=0;n<2;n++)early('connecting',{deviceName:'x'.repeat(9000)});
+   if(mode==='foreign-state-first')ws.send(JSON.stringify({type:'state',session:{...entry.session,id:'other-session',state:'connecting'},serverTime:Date.now()}));
+   if(mode==='ready-first')ws.send(JSON.stringify({type:'frame-ready',sessionId:entry.session.id,generation:entry.session.generation,streamGeneration:1,frameSequence:1,expiresAt:Date.now()+1000}));
+   if(mode==='wrong-attached'){early('connecting');ws.send(JSON.stringify({type:'attached',sessionId:'other-session'}));return;}
+   // A granted state arrives first and 'attached' waits for the 'attach' action (or never comes).
+   if(mode==='held-state'){ws.send(JSON.stringify({type:'state',session:{...entry.session,state:'controlling'},serverTime:Date.now(),lease:{id:'L'.repeat(43),challenge:'C'.repeat(43),expiresAt:Date.now()+6000,challengeExpiresAt:Date.now()+6000}}));pendingAttach.set(entry.session.id,ws);return;}
+  }
   ws.send(JSON.stringify({type:'attached',sessionId:entry.session.id}));
   if(role==='media'){ws.send(JSON.stringify(stream));if(sample&&entry.fixtureMode==='frame'){const b=Buffer.alloc(32+sample.length);b[0]=1;b[1]=1;b.writeUInt16LE(1,2);b.writeUInt32LE(1,4);b.writeUInt32LE(1,8);b.writeUInt32LE(1,12);b.writeDoubleLE(Date.now(),16);b.writeUInt16LE(64,24);b.writeUInt16LE(64,26);b.writeUInt32LE(sample.length,28);sample.copy(b,32);ws.send(b);}}else ws.send(JSON.stringify({type:'state',session:entry.session,serverTime:Date.now()}));
  } else {commands.push({id:entry.session.id,role,value});if(entry.fixtureMode==='frame'&&entry.session.controlAllowed&&value.type==='control')ws.send(JSON.stringify({type:'state',session:{...entry.session,state:'controlling'},serverTime:Date.now(),lease:{id:'L'.repeat(43),challenge:'C'.repeat(43),expiresAt:Date.now()+6000,challengeExpiresAt:Date.now()+6000}}));}
@@ -54,6 +63,7 @@ for await(const line of createInterface({input:process.stdin})){
  else if(input.action==='message'){group[input.role??'control'].send(JSON.stringify(input.value));console.log('{}');}
  else if(input.action==='close-media'){group.media.terminate();console.log('{}');}
  else if(input.action==='close-host'){if(!input.role){group.control.send(JSON.stringify({type:'state',session:{...joins.get(input.id).session,state:'closed',reason:input.reason},serverTime:Date.now()}));for(const ws of Object.values(group))ws.close(input.code,input.reason);}else group[input.role].close(input.code,input.reason);console.log('{}');}
+ else if(input.action==='attach'){pendingAttach.get(input.id).send(JSON.stringify({type:'attached',sessionId:input.id}));pendingAttach.delete(input.id);console.log('{}');}
  else if(input.action==='hold-proof'){holdProof=input.hold;for(const r of held.keys())r.destroy();held.clear();console.log('{}');}
  else if(input.action==='release-proof'){holdProof=false;for(const respond of held.values())respond();held.clear();console.log('{}');}
  else if(input.action==='stats')console.log(JSON.stringify({paths,chatPaths,helloCount,proofCount,commands,open:[...clients].flatMap(([id,g])=>Object.entries(g).filter(([,s])=>s.readyState===1).map(([role])=>({id,role})))}));
