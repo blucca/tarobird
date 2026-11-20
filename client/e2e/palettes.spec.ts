@@ -260,7 +260,13 @@ test("CLI styles keep drafts, readable content and usable phone controls across 
         if (palette === "cli") {
           await expect(page.locator(".message-meta").first()).toHaveCSS("font-family", /ui-monospace/);
           await expect(draft).toHaveCSS("font-family", /ui-monospace/);
-          await expect(page.locator(".message.user .message-body")).toHaveCSS("align-items", "flex-start");
+          // Check the visible alignment, not the browser's serialization of
+          // flex-start (which can be reported as flow-start).
+          await expect.poll(() => page.locator(".message.user .message-body").evaluate(el => {
+            const style = getComputedStyle(el), body = el.getBoundingClientRect();
+            const contentLeft = body.left + parseFloat(style.borderLeftWidth) + parseFloat(style.paddingLeft);
+            return Math.abs(el.querySelector(".message-meta")!.getBoundingClientRect().left - contentLeft);
+          })).toBeLessThanOrEqual(1);
           // Prompt decoration must not become message or draft content.
           await expect(page.locator(".message.user .markdown")).toHaveText("做一个轻巧的灵感收集工具，帮我理一理第一步。");
         }

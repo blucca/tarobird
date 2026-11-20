@@ -10,7 +10,7 @@
    (cli-typography.css supplies the bundled Latin/CJK font), every turn
    at the left margin, own turns as a `>` prompt band, Bot output in a gutter
    under its name, titled cards as box-drawn panes with the title set in the
-   top rule, `[ ]` tags, reverse-video selection and a prompt-shaped input.
+   top rule, `[ ]` tags, a highlight-bar selection and a prompt-shaped input.
 
    Rules
    - Never touch .message transform/position (react-virtual owns placement);
@@ -23,9 +23,15 @@
    - Custom avatars and uploaded media are never filtered or recoloured.
    ========================================================================== */
 
-/* ---------- Terminal tokens ---------- */
+/* ---------- Terminal tokens ----------
+   The one place CLI colours are defined (cli-typography.css only assigns
+   them to text). A black console: grey-white text on #0c0c0c, blue for the
+   prompt, links, focus and the highlight bar, and ANSI-style green / yellow /
+   red for the agent, warnings and errors. Code adds orange keywords, soft
+   green strings, soft blue names, pale yellow types and purple constants.
+   Text colours keep at least 4.5:1 on the surfaces they are painted on. */
 :root[data-palette=cli], .palette-preview[data-palette=cli], .palette-preview[data-palette=cli] .xp-pane{
-  --canvas:#131313;
+  --canvas:#0c0c0c;
   --canvas-hover:#1c1c1c;
   --selected-row:#262626;
   --bg:#0c0c0c;
@@ -35,44 +41,59 @@
   --hover:#1a1a1a;
   --border:#2b2b2b;
   --border-strong:#5c5c5c;
-  --text:#d8d8d4;
-  --grey:#bdbdb8;
-  --muted:#8f8f8a;
-  --accent:#5fd787;
-  --accent-soft:#15301f;
-  --accent-soft-hover:#1d3f29;
-  --primary-bg:#d8d8d4;
-  --primary-hover:#f0f0ec;
+  --text:#cccccc;
+  --grey:#a6a6a6;
+  --muted:#949494;
+  --accent:#4d8bff;
+  --accent-soft:#162033;
+  --accent-soft-hover:#19253d;
+  --primary-bg:#cccccc;
+  --primary-hover:#f2f2f2;
   --on-primary:#0c0c0c;
-  --focus:#5fd787;
+  --focus:var(--accent);
   --avatar-bg:#1a1a1a;
-  --avatar-fg:#5fd787;
-  --self-message-bg:#1f1f1f;
+  --avatar-fg:var(--accent);
+  --self-message-bg:#1a1a1a;
   --self-message-border:#333333;
-  --self-message-fg:#ecece8;
-  --self-message-muted:#b0b0aa;
-  --self-message-link:#8be3a5;
+  --self-message-fg:var(--text);
+  --self-message-muted:var(--grey);
+  --self-message-link:var(--accent);
   --self-message-line:#4a4a4a;
   --self-code-bg:#171717;
   --self-code-inline-bg:#2c2c2c;
-  --self-code-keyword:#8fb4ff;
-  --self-code-string:#9fe0a8;
-  --self-code-title:#f2c879;
-  --code-keyword:#8fb4ff;
-  --code-string:#9fe0a8;
-  --code-title:#f2c879;
-  --self-error:#ff9e94;
+  --code-keyword:#d8884b;
+  --code-string:#97c67b;
+  --code-title:#75b3db;
+  --self-code-keyword:var(--code-keyword);
+  --self-code-string:var(--code-string);
+  --self-code-title:var(--code-title);
+  --self-error:var(--red);
   --bot-message-bg:#0c0c0c;
-  --composer-focus:#5fd787;
+  --composer-focus:var(--muted);
   --accent-line:#5c5c5c;
   --ring:color-mix(in srgb,var(--accent) 22%,transparent);
   --selection:color-mix(in srgb,var(--accent) 28%,transparent);
   --blue:var(--accent);
   --selected:var(--accent-soft);
+  /* Status, diff and card-template colours. */
+  --green:#16c60c; --green-soft:#0e340f;
+  --orange:#c19c00; --orange-soft:#342c09;
+  --red:#ed5562; --red-soft:#350d0e;
+  --card-blue-bg:var(--accent-soft); --card-blue-fg:var(--accent);
+  --card-green-bg:var(--green-soft); --card-green-fg:var(--green);
+  --card-orange-bg:var(--orange-soft); --card-orange-fg:var(--orange);
+  --card-red-bg:var(--red-soft); --card-red-fg:var(--red);
   --cli-line:#5c5c5c;
-  --cli-rev-bg:#d8d8d4;
-  --cli-rev-fg:#0c0c0c;
-  --cli-prompt:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 12'%3E%3Cpath d='M2 1.5 7.5 6 2 10.5' fill='none' stroke='%235fd787' stroke-width='2.4' stroke-linecap='square'/%3E%3C/svg%3E");
+  /* Highlight bar for the current row, tab, chip and selected text. */
+  --cli-rev-bg:#263f6d;
+  --cli-rev-fg:#f2f2f2;
+  --cli-bright:#f2f2f2;
+  --cli-agent:var(--green);
+  --cli-inline-code:var(--code-keyword);
+  --cli-type:#eede7b;
+  --cli-number:#c678dd;
+  --cli-wordmark:#fff;
+  --cli-prompt:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 12'%3E%3Cpath d='M2 1.5 7.5 6 2 10.5' fill='none' stroke='%234d8bff' stroke-width='2.4' stroke-linecap='square'/%3E%3C/svg%3E");
 }
 
 /* ---------- Shared: square geometry ----------
@@ -93,6 +114,8 @@
    TERMINAL
    ========================================================================== */
 :root[data-palette=cli]{
+  /* System monospace when this sheet is loaded alone; cli-typography.css
+     puts the bundled Latin/CJK faces in front of the same kind of stack. */
   --font-sans:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans Mono CJK SC",monospace;
   --font-mono:var(--font-sans);
   --skin-corner:2px;
@@ -103,7 +126,7 @@
   --shadow:0 0 0 1px var(--cli-line);
   --shadow-lg:0 0 0 1px var(--cli-line);
 }
-/* Monospace is never tracked; selection is reverse video, as in a terminal. */
+/* Monospace is never tracked; selected text takes the highlight bar. */
 :root[data-palette=cli] :not(.palette-preview,.palette-preview *){letter-spacing:0}
 :root[data-palette=cli] ::selection,
 :root[data-palette=cli] .message.user .message-blocks>* ::selection{background:var(--cli-rev-bg);color:var(--cli-rev-fg)}
@@ -112,7 +135,7 @@
 :root[data-palette=cli] :is(.primary,.send-button,.composer-add,.conversation-empty button,.mobile-home .mh-empty-action){box-shadow:none}
 :root[data-palette=cli] :is(.unread-badge,.mobile-home .mh-badge,.mobile-home .mh-tab-badge){font-weight:700}
 
-/* ----- Terminal: sidebar (a file tree with a reverse-video cursor row) ----- */
+/* ----- Terminal: sidebar (a file tree with a highlight-bar cursor row) ----- */
 :root[data-palette=cli] .wordmark-text{font-size:15px;font-weight:700}
 /* The shared flat fox stays independent from Mac status-item refinements.
    Transparent cutouts, without a tile, gradients or shadows. */
@@ -203,7 +226,7 @@
 :root[data-palette=cli] .message :is(.rich-card,.native-run){min-width:0;border:0;background:transparent;box-shadow:none}
 :root[data-palette=cli] .message .native-run{padding:1px 0 4px;border-radius:0}
 :root[data-palette=cli] .message .rich-card>.card-body{padding:1px 0 4px}
-:root[data-palette=cli] .message .rich-card>.card-header{display:flex;align-items:center;gap:1ch;padding:0;background:transparent;font-size:14px;font-weight:700;line-height:1.5;color:var(--text)}
+:root[data-palette=cli] .message .rich-card>.card-header{display:flex;align-items:center;gap:1ch;padding:0;background:transparent;font-size:14px;font-weight:700;line-height:1.5;color:var(--cli-bright)}
 :root[data-palette=cli] .message .rich-card>.card-header::before,
 :root[data-palette=cli] .message .rich-card>.card-header::after{content:"";flex:0 0 1.5ch;align-self:stretch;background:linear-gradient(var(--cli-line),var(--cli-line)) 0 50%/100% 1px no-repeat,linear-gradient(var(--cli-line),var(--cli-line)) 0 100%/1px 50% no-repeat;pointer-events:none}
 :root[data-palette=cli] .message .rich-card>.card-header::after{flex:1 1 2ch;background-position:0 50%,100% 100%}
@@ -215,7 +238,7 @@
 
 /* Markdown as a terminal renders it: visible heading marks, dash bullets,
    dashed code panes with a [复制] tag in the rule, ruled tables. */
-:root[data-palette=cli] .message .markdown :is(h1,h2,h3,h4)::before{font-weight:400;color:var(--muted)}
+:root[data-palette=cli] .message .markdown :is(h1,h2,h3,h4)::before{font-weight:400;color:var(--accent)}
 :root[data-palette=cli] .message .markdown h1::before{content:"# " / ""}
 :root[data-palette=cli] .message .markdown h2::before{content:"## " / ""}
 :root[data-palette=cli] .message .markdown h3::before{content:"### " / ""}
@@ -294,7 +317,7 @@
 .expressive-preview[data-palette=cli] .xp-text{display:block;height:2px;background:var(--text)}
 .expressive-preview[data-palette=cli] .xp-prompt .xp-text{flex:0 1 70%}
 .expressive-preview[data-palette=cli] .xp-box{position:relative;display:flex;flex:1 1 auto;flex-direction:column;justify-content:center;gap:3px;margin-top:2px;padding:3px 4px;border:1px solid var(--cli-line)}
-.expressive-preview[data-palette=cli] .xp-box::before{content:"";position:absolute;top:-2px;left:4px;width:38%;height:3px;background:linear-gradient(var(--text),var(--text)) 0 50%/100% 2px no-repeat,var(--bg);box-shadow:0 0 0 2px var(--bg)}
+.expressive-preview[data-palette=cli] .xp-box::before{content:"";position:absolute;top:-2px;left:4px;width:38%;height:3px;background:linear-gradient(var(--cli-agent),var(--cli-agent)) 0 50%/100% 2px no-repeat,var(--bg);box-shadow:0 0 0 2px var(--bg)}
 .expressive-preview[data-palette=cli] .xp-box>.xp-text{width:86%;background:var(--grey)}
 .expressive-preview[data-palette=cli] .xp-box>.xp-text+.xp-text{width:58%}
 .expressive-preview[data-palette=cli] .xp-cursor{display:block;width:4px;height:7px;background:var(--text)}

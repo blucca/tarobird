@@ -72,7 +72,10 @@ for (const width of [390, 1360]) test(`all chart palettes retain distinct series
     expect((await gap.getAttribute('d'))!.match(/L/g)).toHaveLength(50);
     const sets = new Set<string>();
     for (const palette of colorPalettes) {
-      for (const theme of ['light', 'dark']) {
+      // The App resolves CLI to dark even when the saved preference is light.
+      // A forced CLI/light dataset would combine a dark canvas with light-only
+      // chart colours, a state the appearance controller never produces.
+      for (const theme of palette.id === 'cli' ? ['dark'] : ['light', 'dark']) {
         await page.evaluate(({ palette, theme }) => Object.assign(document.documentElement.dataset, { palette, theme }), { palette: palette.id, theme });
         const actual = await series(page); expect(new Set(actual.map(x => x.color)).size, `${palette.id}/${theme}`).toBe(4);
         expect(new Set(actual.map(x => x.dash)).size).toBe(4);
@@ -114,7 +117,7 @@ for (const width of [390, 1360]) test(`all chart palettes retain distinct series
         await expect(panel.locator('.report-chart > svg [data-series] rect')).toHaveCount(0);
       }
     }
-    expect(sets.size).toBe(colorPalettes.length * 2);
+    expect(sets.size).toBe(colorPalettes.reduce((count, palette) => count + (palette.id === 'cli' ? 1 : 2), 0));
     await page.evaluate(() => Object.assign(document.documentElement.dataset, { palette: 'mono', theme: 'system' }));
     await page.emulateMedia({ colorScheme: 'light' }); const light = await series(page);
     await page.emulateMedia({ colorScheme: 'dark' }); expect(await series(page)).not.toEqual(light);

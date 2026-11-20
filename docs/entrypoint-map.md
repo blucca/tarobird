@@ -1245,8 +1245,11 @@ and the existing network/run/delete suites listed in that audit.
   [Slider and spacing verification](client/font-slider-2026-10-13.md). Tests:
   browser `theme-font-size`, `settings-language`; native `PairingJourneyTest`
   with `fontSettings=true`. [Regression evidence](client/theme-font-size-2026-10-12.md).
-  CLI type/color refinement lives in `cli-typography.css`, with bundled JetBrains
-  Mono Latin and Sarasa Chinese fonts and inherited Markdown table sizes.
+  CLI colours and the preview share tokens in `expressive-themes.css`;
+  `cli-typography.css` maps them to text, with bundled JetBrains Mono Latin and
+  Sarasa Chinese fonts and inherited Markdown table sizes. The
+  [terminal palette refresh](client/cli-terminal-palette-2026-11-20.md) replaces
+  duplicate colour declarations without changing other palettes or preferences.
   [Dark-only CLI and wider Latin](client/cli-dark-readable-2026-10-28.md) resolves
   CLI to dark in `appearance.ts` without overwriting other palettes' saved mode.
   Regressions: `cli-typography`,

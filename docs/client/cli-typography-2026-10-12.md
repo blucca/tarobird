@@ -3,6 +3,9 @@
 Current behavior: the [2026-10-28 revision](cli-dark-readable-2026-10-28.md)
 makes CLI dark-only and uses wider JetBrains Mono Latin text with Sarasa Chinese.
 The earlier light mode and 1:2 mixed-script width measurements below are historical.
+The [2026-11-20 palette refresh](cli-terminal-palette-2026-11-20.md) supersedes
+the cyan/violet colours and grey prompt described below; the reading-size and
+offline-font behavior remain in place.
 
 The Terminal theme keeps its transcript, prompt and ruled layout. Its reading
 text now uses one scale: paragraphs, tables (including expanded tables),
