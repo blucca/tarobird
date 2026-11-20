@@ -60,6 +60,26 @@ test("a dropped Host keeps its localized reason and never shows the client's raw
   await expect(status(page)).toHaveText("尚未连接");
 });
 
+test("a view-only phone session says it is view only, in Chinese and English",async({browser})=>{
+  for(const english of [false,true]){
+    const context=await browser.newContext({viewport:{width:390,height:844},locale:english?"en-US":"zh-CN",hasTouch:true,isMobile:true});const page=await context.newPage();
+    const text=(key:string)=>english?(en as Record<string,string>)[key]??key:key;
+    // The status line ends with the stream size (" · 1280 × 720").
+    const line=(key:string)=>new RegExp("^"+text(key)+" · ");
+    try{
+      await page.goto(url());await ready(page);await page.evaluate(()=>{(window as any).screenMobileFixture.viewOnly=true;});await refresh(page);
+      await page.getByRole("button",{name:text("连接屏幕"),exact:true}).click();
+      await expect(status(page)).toHaveText(line("查看中 · 仅查看"));
+      await expect(page.getByRole("button",{name:text("开始控制"),exact:true})).toHaveCount(0);
+      // A control grant on the next session restores the ordinary hint and button.
+      await page.evaluate(()=>{(window as any).screenMobileFixture.viewOnly=false;});
+      await page.reload();await ready(page);
+      await page.getByRole("button",{name:text("连接屏幕"),exact:true}).click();await expect(page.getByRole("button",{name:text("开始控制"),exact:true})).toBeEnabled();
+      await expect(status(page)).toHaveText(line("查看中 · 点击开始控制后操作"));
+    }finally{await context.close();}
+  }
+});
+
 test("English UI shows the same reasons in English, without raw client text",async({browser})=>{
   const context=await browser.newContext({viewport:{width:390,height:844},locale:"en-US",hasTouch:true,isMobile:true});const page=await context.newPage();
   const text=(key:string)=>(en as Record<string,string>)[key]??key;

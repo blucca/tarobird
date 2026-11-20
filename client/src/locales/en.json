@@ -4945,6 +4945,7 @@
   "尚未连接": "Not connected",
   "画面暂未更新，控制已停止，请等待新画面。": "The picture is stale. Control stopped; waiting for a fresh frame.",
   "查看中 · 点击开始控制后操作": "Viewing · Choose Start control to interact",
+  "查看中 · 仅查看": "Viewing · View only",
   "{0}的远程屏幕": "Remote screen of {0}",
   "发送文本": "Send text",
   "Windows：Ctrl 对应 Control，Win 对应 Command，Alt 对应 Option": "Windows: Ctrl → Control, Win → Command, Alt → Option",
