@@ -43,7 +43,7 @@ function Win32Button([int]$hwnd, [string]$name) {
   return [IntPtr]::Zero
 }
 function Tree($el) { ((Kids $el | Select-Object -First 30 | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName -replace 'ControlType\.','')/$($_.Current.ClassName)/$($_.Current.Name)" }) -join ' ; ') }
-$firstSeen = @{}; $acted = @{}
+$since = @{}; $seenText = @{}; $acted = @{}
 function Note([string]$kind, [string]$detail) {
   [void]$events.Add([ordered]@{ ms = [int]((Get-Date) - $start).TotalMilliseconds; kind = $kind; detail = $detail })
 }
@@ -61,6 +61,11 @@ function Press($el) {
   try { $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
   catch { [void][BirdProbe.Win32]::SendMessage([IntPtr]$el.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) }
 }
+# UI Automation lists an owned message box under its owner window, so a
+# dialog's buttons are taken from the dialog that holds them, never the first
+# matching name in the owner's whole tree.
+$Walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+function Scope($btn) { $parent = $Walker.GetParent($btn); if ($parent) { $parent } else { $btn } }
 function Checked($box) {
   try { return [string]$box.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'On' }
   catch { return [int][BirdProbe.Win32]::SendMessage([IntPtr]$box.Current.NativeWindowHandle, 0x00F0, [IntPtr]::Zero, [IntPtr]::Zero) -eq 1 }
@@ -78,10 +83,13 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
   # The uninstaller may close itself after success: gone for ~7 s after it was seen.
   if ($seen -and $empty -ge 10) { Note 'gone' 'no TaroBird window for ~7 s'; break }
   foreach ($w in $wins) {
+    # A scene is stuck when its visible text has not changed and nothing was
+    # pressed for -SceneTimeoutSec: progress pages keep changing their text.
     $key = "$($w.Current.NativeWindowHandle)|$($w.Current.Name)"
-    if (-not $firstSeen.ContainsKey($key)) { $firstSeen[$key] = Get-Date }
-    elseif (-not $acted.ContainsKey($key) -and ((Get-Date) - $firstSeen[$key]).TotalSeconds -ge $SceneTimeoutSec) {
-      Note 'stuck' "unanswered for ${SceneTimeoutSec}s: $($w.Current.Name) [$($w.Current.ClassName)] pid=$($w.Current.ProcessId); tree: $(Tree $w)"
+    $now = Text $w
+    if (-not $since.ContainsKey($key) -or $seenText[$key] -ne $now -or $acted.ContainsKey($key)) { $since[$key] = Get-Date; $seenText[$key] = $now; [void]$acted.Remove($key) }
+    elseif (((Get-Date) - $since[$key]).TotalSeconds -ge $SceneTimeoutSec) {
+      Note 'stuck' "unchanged and unanswered for ${SceneTimeoutSec}s: $($w.Current.Name) [$($w.Current.ClassName)] pid=$($w.Current.ProcessId); tree: $(Tree $w)"
       $stuck = $true
     }
     try {
@@ -100,12 +108,15 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
       $yes = Btn $w 'Yes'; $no = Btn $w 'No'; $retry = Btn $w 'Retry'; $ok = Btn $w 'OK'
       $uninstall = Btn $w 'Uninstall'; $close = Btn $w 'Close'
       $text = Text $w
-      if ($yes -and $no) {
+      if ($yes -and (Btn (Scope $yes) 'No')) {
+        $dialog = Scope $yes; $no = Btn $dialog 'No'; $text = Text $dialog
         Note 'question' $text
         if ($text -match 'Back up this computer') { if ($Mode -eq 'consent') { Press $yes; Note 'answer' 'Yes' } else { Press $no; Note 'answer' 'No' } }
         else { Press $no; Note 'answer' 'No (unexpected question)' }
         $answered++; $acted[$key] = $true
-      } elseif ($retry -or ($ok -and -not $close -and -not $uninstall -and $text -match 'TB-')) {
+      } elseif ($retry -or ($ok -and (Text (Scope $ok)) -match 'TB-')) {
+        $dialog = Scope $(if ($retry) { $retry } else { $ok }); $text = Text $dialog
+        $retry = Btn $dialog 'Retry'; $ok = Btn $dialog 'OK'
         Note 'problem' $text
         if ($retry -and $ReleaseFile -and -not (Test-Path -LiteralPath $ReleasedFile)) {
           Set-Content -LiteralPath $ReleaseFile -Value 'release'
@@ -114,7 +125,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
           Note 'released' "caller released the induced cause after ${waited}s: $(Test-Path -LiteralPath $ReleasedFile)"
           Press $retry; Note 'answer' 'Retry'
         } else {
-          $cancel = Btn $w 'Cancel'
+          $cancel = Btn $dialog 'Cancel'
           if ($cancel) { Press $cancel; Note 'answer' 'Cancel' } elseif ($ok) { Press $ok; Note 'answer' 'OK' }
         }
         $answered++; $acted[$key] = $true
