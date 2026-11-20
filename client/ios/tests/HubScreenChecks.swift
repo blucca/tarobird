@@ -160,18 +160,175 @@ final class ScreenClock: @unchecked Sendable {
         try check(timeout["reason"] as? String == "screen_attach_timeout", "unattachedSessionStillTimesOutAtFiveSeconds")
         try await peerClosed(fixture, stalled)
     }
+    // Released Hubs (1.5.1 and earlier) notify `state` inside attachViewer, so the
+    // control socket can carry state before its own `attached` reply.
+    static func state(_ join: [String: Any], _ value: String = "connecting", _ extra: [String: Any] = [:]) -> [String: Any] {
+        var session = join["session"] as! [String: Any]; session["state"] = value
+        return ["type": "state", "session": session, "serverTime": Int(Date().timeIntervalSince1970 * 1000), "controlPending": false, "streamGeneration": 1]
+            .merging(extra) { _, right in right }
+    }
+    static func attached(_ join: [String: Any]) -> [String: Any] { ["type": "attached", "sessionId": sid(join)] }
+    static let stream: [String: Any] = ["type": "stream", "streamGeneration": 1, "geometryRevision": 1, "codec": "h264", "codecString": "avc1.42c01e",
+                                        "width": 64, "height": 64, "contentRect": ["x": 0, "y": 0, "width": 64, "height": 64]]
+    static let lease: [String: Any] = ["id": String(repeating: "L", count: 43), "challenge": String(repeating: "C", count: 43),
+                                       "expiresAt": Int(Date().timeIntervalSince1970 * 1000) + 600000, "challengeExpiresAt": Int(Date().timeIntervalSince1970 * 1000) + 600000]
+    static func peer(_ fixture: ScreenFixture, _ join: [String: Any], _ role: String, _ value: [String: Any]) throws {
+        _ = try fixture.request(["action": "message", "id": sid(join), "role": role, "value": value])
+    }
+    /// Both sockets have said hello; the peer has replied nothing yet.
+    static func openUnattached(_ manager: HubTransport, _ fixture: ScreenFixture, _ document: String, _ join: [String: Any]) async throws -> String {
+        var registered = join; registered["fixtureMode"] = "no-attach"
+        _ = try fixture.request(["action": "register", "join": registered])
+        let id = try await call(manager, "allocate", ["document": document, "kind": "screen"])["value"] as! String
+        _ = try await call(manager, "screenOpen", ["id": id, "network": fixture.network, "join": join])
+        let until = ProcessInfo.processInfo.systemUptime + 5
+        while ProcessInfo.processInfo.systemUptime < until {
+            let peers = try fixture.request(["action": "stats"])["open"] as! [[String: Any]]
+            if peers.filter({ $0["id"] as? String == sid(join) }).count == 2 { return id }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw HubNetworkError("peer_hello_missing")
+    }
+    /// What the native session did with a peer sequence: the JSON it delivered
+    /// (each acknowledged through the plugin gate) or its single terminal reason.
+    static func outcome(_ manager: HubTransport, _ log: ScreenEvents, _ id: String, _ count: Int) async throws -> (String, [[String: Any]]) {
+        var values: [[String: Any]] = [], settled: TimeInterval?
+        let until = ProcessInfo.processInfo.systemUptime + 6
+        while ProcessInfo.processInfo.systemUptime < until {
+            if let terminal = log.pop(id, "close") {
+                return ("closed:" + (terminal["reason"] as? String ?? "?") + (values.isEmpty ? "" : "+delivered"), values)
+            }
+            if let event = log.pop(id, "screen") {
+                guard manager.acceptScreenEvent(event) else { continue }
+                _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": event["deliverySequence"]!])
+                values.append(event["value"] as! [String: Any])
+                if values.count == count { settled = ProcessInfo.processInfo.systemUptime + 0.4 }
+            }
+            if let settled = settled, ProcessInfo.processInfo.systemUptime >= settled { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let types = values.map { $0["type"] as! String }
+        return ("control=" + types.filter { $0 != "stream" }.joined(separator: ",") + ";media=" + types.filter { $0 == "stream" }.joined(separator: ","), values)
+    }
+    static func attachOrder(_ fixture: ScreenFixture) async throws {
+        let log = ScreenEvents()
+        let manager = HubTransport { log.append($0) }; defer { manager.reset(destroy: true) }
+        manager.setScreenActive(true)
+        let document = try await call(manager, "document")["value"] as! String
+        typealias Step = (String, ([String: Any]) -> [String: Any])
+        let early: Step = ("control", { state($0) }), attach: Step = ("control", attached)
+        let ready: [Step] = [("media", attached), ("media", { _ in stream })]
+        func earlyWith(_ session: [String: Any], _ extra: [String: Any] = [:]) -> Step {
+            ("control", { join in state(join, "connecting", extra.merging(["session": (join["session"] as! [String: Any]).merging(session) { _, right in right }]) { _, right in right }) })
+        }
+        func repeated(_ step: Step, _ count: Int) -> [Step] { [Step](repeating: step, count: count) }
+        let padded = earlyWith(["state": "connecting", "deviceName": String(repeating: "n", count: 9000)])
+        let frameReady: Step = ("control", { join in ["type": "frame-ready", "sessionId": sid(join), "generation": (join["session"] as! [String: Any])["generation"]!,
+                                                     "streamGeneration": 1, "frameSequence": 1, "expiresAt": 1] })
+        var cases: [(String, [Step], Int, String)] = []
+        cases.append(("realHubStateBeforeAttached", [early, attach] + ready, 3, "control=attached,state;media=stream"))
+        cases.append(("mediaFirstThenEarlyState", ready + [early, attach], 3, "control=attached,state;media=stream"))
+        cases.append(("twoEarlyStatesKeepArrivalOrder", [earlyWith(["state": "connecting"], ["serverTime": 1]), earlyWith(["state": "connecting"], ["serverTime": 2]), attach] + ready, 4,
+                      "control=attached,state,state;media=stream"))
+        cases.append(("fourEarlyStatesIsTheCountLimit", repeated(early, 4) + [attach] + ready, 6, "control=attached,state,state,state,state;media=stream"))
+        cases.append(("fifthEarlyStateRejected", repeated(early, 5) + [attach] + ready, 7, "closed:screen_attach_invalid"))
+        cases.append(("largeEarlyStateWithinByteLimit", [padded, attach] + ready, 3, "control=attached,state;media=stream"))
+        cases.append(("earlyStatesOverByteLimitRejected", repeated(padded, 2) + [attach] + ready, 4, "closed:screen_attach_invalid"))
+        cases.append(("earlyStateOtherSessionRejected", [earlyWith(["id": "other-session"]), attach] + ready, 3, "closed:screen_scope_invalid"))
+        cases.append(("earlyStateOtherGenerationRejected", [earlyWith(["generation": "other-generation"]), attach] + ready, 3, "closed:screen_scope_invalid"))
+        cases.append(("earlyStateOtherDesktopRejected", [earlyWith(["desktopId": "other-desktop"]), attach] + ready, 3, "closed:screen_scope_invalid"))
+        cases.append(("earlyStateUnknownFieldRejected", [earlyWith([:], ["extra": true]), attach] + ready, 3, "closed:screen_protocol_invalid"))
+        cases.append(("earlyFrameReadyStillRejected", [frameReady, attach] + ready, 3, "closed:screen_attach_invalid"))
+        cases.append(("earlyMediaStreamStillRejected", [attach, ("media", { _ in stream }), ("media", attached)], 2, "closed:screen_attach_invalid"))
+        cases.append(("earlyStateOnMediaRejected", [attach, ("media", { state($0) }), ("media", attached)], 2, "closed:screen_attach_invalid"))
+        cases.append(("otherSessionAttachedAfterEarlyStateRejected", [early, ("control", { _ in ["type": "attached", "sessionId": "other-session"] })] + ready, 3, "closed:screen_attach_invalid"))
+        var observed: [String: String] = [:]
+        for (name, steps, count, expected) in cases {
+            let value = join(), id = try await openUnattached(manager, fixture, document, value)
+            for (role, make) in steps { try peer(fixture, value, role, make(value)) }
+            let (seen, values) = try await outcome(manager, log, id, count); observed[name] = seen
+            if seen == expected, name == "twoEarlyStatesKeepArrivalOrder" {
+                observed[name] = seen + (values.compactMap { $0["type"] as? String == "state" ? $0["serverTime"] as? Int : nil } == [1, 2] ? "" : "+reordered")
+            }
+            if name == "realHubStateBeforeAttached", seen == expected {
+                _ = try fixture.request(["action": "frame", "id": sid(value), "sequence": 1, "size": 64])
+                let packet = try await event(manager, log, id, "binary")
+                _ = try await call(manager, "screenRead", ["id": id, "deliverySequence": packet["deliverySequence"]!, "offset": 0, "maxBytes": 64])
+                _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": packet["deliverySequence"]!])
+                try check(log.count(id) == 0, "realHubOrderStillCarriesMedia")
+            }
+            if !seen.hasPrefix("closed:") { _ = try await call(manager, "screenClose", ["id": id]); _ = try await event(manager, log, id, "close") }
+            try await peerClosed(fixture, value)
+            try check(log.count(id) == 1, name + "SingleTerminal")
+        }
+        // The Host may close a session while attaching (service offline): its
+        // closed state precedes the 4000 frame. The host reason must survive.
+        let closing = join(), closingID = try await openUnattached(manager, fixture, document, closing)
+        _ = try fixture.request(["action": "close-host", "id": sid(closing), "code": 4000, "reason": "screen_service_offline"])
+        observed["earlyClosedStateKeepsHostReason"] = try await outcome(manager, log, closingID, 1).0
+        try await peerClosed(fixture, closing)
+        // A buffered state changes nothing before attached; afterwards it is the
+        // same state message as on a new Hub, still bounded by controlAllowed.
+        for (allowed, name, expectRenew) in [(true, "earlyControllingStateAppliesOnlyAfterAttached", true), (false, "viewOnlyEarlyControllingStateNeverGrants", false)] {
+            let value = join(allowed), id = try await openUnattached(manager, fixture, document, value)
+            let renew = command(value, "renew", ["leaseId": lease["id"]!, "challenge": lease["challenge"]!, "frameSequence": 1])
+            try peer(fixture, value, "control", state(value, "controlling", ["lease": lease]))
+            try await Task.sleep(nanoseconds: 300_000_000)
+            var trace: [String] = []
+            _ = try? await call(manager, "screenSend", ["id": id, "command": command(value, "input-focus", ["enabled": true])])
+            do { _ = try await call(manager, "screenSend", ["id": id, "command": renew]); trace.append("renewBeforeAttached=sent") } catch { trace.append("renewBeforeAttached=denied") }
+            try peer(fixture, value, "control", attached(value)); for (role, make) in ready { try peer(fixture, value, role, make(value)) }
+            let (seen, _) = try await outcome(manager, log, id, 3); trace.append(seen)
+            _ = try? await call(manager, "screenSend", ["id": id, "command": command(value, "input-focus", ["enabled": true])])
+            do { _ = try await call(manager, "screenSend", ["id": id, "command": renew]); trace.append("renewAfterAttached=sent") } catch { trace.append("renewAfterAttached=denied") }
+            if expectRenew {
+                var renewed = 0
+                for _ in 0..<200 {
+                    renewed = (try fixture.request(["action": "stats"])["commands"] as! [[String: Any]]).filter { $0["id"] as? String == sid(value) && ($0["value"] as? [String: Any])?["type"] as? String == "renew" }.count
+                    if renewed > 0 { try await Task.sleep(nanoseconds: 200_000_000); break }
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+                renewed = (try fixture.request(["action": "stats"])["commands"] as! [[String: Any]]).filter { $0["id"] as? String == sid(value) && ($0["value"] as? [String: Any])?["type"] as? String == "renew" }.count
+                trace.append("hubRenewCount=\(renewed)")
+            }
+            observed[name] = trace.joined(separator: " ")
+            if !seen.hasPrefix("closed:") { _ = try await call(manager, "screenClose", ["id": id]) }
+            try await peerClosed(fixture, value)
+        }
+        // Early state never buys attach time.
+        let clock = ScreenClock(), clockedLog = ScreenEvents()
+        let clocked = HubTransport(screenNow: { clock.read() }) { clockedLog.append($0) }; defer { clocked.reset(destroy: true) }
+        clocked.setScreenActive(true)
+        let clockedDocument = try await call(clocked, "document")["value"] as! String, slow = join()
+        let slowID = try await openUnattached(clocked, fixture, clockedDocument, slow)
+        try peer(fixture, slow, "control", state(slow)); try peer(fixture, slow, "media", attached(slow))
+        clock.set(4.9); try await Task.sleep(nanoseconds: 350_000_000)
+        let closesBefore = clockedLog.count(slowID)
+        clock.set(5); let timeout = try await event(clocked, clockedLog, slowID, "close")
+        observed["earlyStateDoesNotExtendAttachDeadline"] = "before=\(closesBefore) at5s=\(timeout["reason"] as? String ?? "?")"
+        try await peerClosed(fixture, slow)
+        var expected = Dictionary(uniqueKeysWithValues: cases.map { ($0.0, $0.3) })
+        expected["earlyClosedStateKeepsHostReason"] = "closed:screen_service_offline"
+        expected["earlyControllingStateAppliesOnlyAfterAttached"] = "renewBeforeAttached=denied control=attached,state;media=stream renewAfterAttached=sent hubRenewCount=1"
+        expected["viewOnlyEarlyControllingStateNeverGrants"] = "renewBeforeAttached=denied control=attached,state;media=stream renewAfterAttached=denied"
+        expected["earlyStateDoesNotExtendAttachDeadline"] = "before=0 at5s=screen_attach_timeout"
+        let report = try JSONSerialization.data(withJSONObject: ["observed": observed, "expected": expected], options: [.prettyPrinted, .sortedKeys])
+        FileHandle.standardError.write(report); FileHandle.standardError.write(Data("\n".utf8))
+        for (name, value) in expected.sorted(by: { $0.key < $1.key }) { try check(observed[name] == value, "order_" + name) }
+    }
     static func main() async throws {
         let args = CommandLine.arguments
         let fixture = try ScreenFixture(args[1], args[2]); defer { fixture.stop() }
         if let focus = ProcessInfo.processInfo.environment["SCREEN_AUDIT_FOCUS"] {
             if focus == "close" { try await closeReasons(fixture) }
             else if focus == "clock" { try await attachClock(fixture) }
+            else if focus == "order" { try await attachOrder(fixture) }
             else { throw HubNetworkError("unknown_screen_audit_focus") }
             let receipt: [String: Any] = ["surface": "Apple Foundation production source; real pinned TLS dual sockets; injected monotonic clock only", "checks": checks]
             let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys]); try bytes.write(to: URL(fileURLWithPath: args[3]))
             print(String(data: bytes, encoding: .utf8)!); return
         }
-        try await closeReasons(fixture); try await attachClock(fixture)
+        try await closeReasons(fixture); try await attachClock(fixture); try await attachOrder(fixture)
         let log = ScreenEvents()
         // Event capture does not acknowledge automatically; the same delivery
         // gate used by the plugin is exercised explicitly for every event.

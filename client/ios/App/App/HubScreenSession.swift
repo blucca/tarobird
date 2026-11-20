@@ -31,6 +31,7 @@ final class HubScreenSession: @unchecked Sendable {
     private var deliveries: [Int: Delivery] = [:]
     private var commands: [String] = [], sendingBytes = 0, sendingCount = 0
     private var stream: [String: Any]?
+    private var early: [(value: [String: Any], size: Int)] = [], earlyBytes = 0
     private var timer: DispatchSourceTimer?
     private var started: TimeInterval = 0, nextPing: TimeInterval = 0
     private final class Delivery {
@@ -87,7 +88,7 @@ final class HubScreenSession: @unchecked Sendable {
     func retire() {
         guard !retired else { return }; retired = true
         timer?.setEventHandler {}; timer?.cancel(); timer = nil
-        deliveries.removeAll(); commands.removeAll(); stream = nil; sendingBytes = 0; sendingCount = 0
+        deliveries.removeAll(); commands.removeAll(); stream = nil; sendingBytes = 0; sendingCount = 0; early.removeAll(); earlyBytes = 0
         for channel in channels { channel.ticket = nil; channel.task?.cancel(); channel.task = nil; channel.owner = nil }
         channels.removeAll(); connection?.cancel(); connection = nil
     }
@@ -141,9 +142,25 @@ final class HubScreenSession: @unchecked Sendable {
         guard bytes.count <= 16384, let value = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
               let type = value["type"] as? String else { throw HubNetworkError("screen_protocol_invalid") }
         if !channel.attached {
+            // Released Hubs (1.5.1 and earlier) notify `state` from attachViewer
+            // before the control socket replies `attached`. Only the control socket
+            // may hold such states: each fully valid for this session/generation/
+            // desktop, at most 4 messages and 16 KiB in total. They do nothing until
+            // `attached`, then follow it in arrival order through the same state path,
+            // so control grant, delivery budgets and the attach deadline are unchanged.
+            if channel.role == .control, type == "state" {
+                guard early.count < Self.earlyStateLimit, earlyBytes + bytes.count <= Self.earlyStateBytes else { throw HubNetworkError("screen_attach_invalid") }
+                _ = try controlGrant(value)
+                early.append((value, bytes.count)); earlyBytes += bytes.count; return
+            }
             guard type == "attached", value["sessionId"] as? String == sessionID, value.count == 2 else { throw HubNetworkError("screen_attach_invalid") }
             channel.attached = true
-            if channel.role == .control { try deliver(value: value, size: bytes.count); flush() }
+            if channel.role == .control {
+                try deliver(value: value, size: bytes.count)
+                let held = early; early.removeAll(); earlyBytes = 0
+                for state in held { try applyState(state.value); try deliver(value: state.value, size: state.size) }
+                flush()
+            }
             return
         }
         if channel.role == .media {
@@ -151,22 +168,7 @@ final class HubScreenSession: @unchecked Sendable {
             try validateStream(value); stream = value; lastFrame = 0
         } else {
             switch type {
-            case "state":
-                guard let session = value["session"] as? [String: Any], session["id"] as? String == sessionID,
-                      session["generation"] as? String == generation, session["desktopId"] as? String == desktopID,
-                      let state = session["state"] as? String, ["connecting", "viewing", "paused", "controlling", "closed"].contains(state),
-                      Self.integer(value["serverTime"]) != nil else { throw HubNetworkError("screen_scope_invalid") }
-                try Self.keys(value, "type session serverTime", "controlPending streamGeneration lease")
-                if let pending = value["controlPending"], Self.boolean(pending) == nil { throw HubNetworkError("screen_protocol_invalid") }
-                if let revision = value["streamGeneration"], !Self.revision(revision) { throw HubNetworkError("screen_protocol_invalid") }
-                if let lease = value["lease"] {
-                    guard let lease = lease as? [String: Any], let id = lease["id"] as? String, Self.ticket(id),
-                          let challenge = lease["challenge"] as? String, Self.ticket(challenge), Self.integer(lease["expiresAt"]) != nil,
-                          Self.integer(lease["challengeExpiresAt"]) != nil else { throw HubNetworkError("screen_protocol_invalid") }
-                    try Self.keys(lease, "id expiresAt challenge challengeExpiresAt")
-                }
-                canControl = state == "controlling" && value["lease"] != nil && controlAllowed
-                if !canControl { inputFocused = false }
+            case "state": try applyState(value)
             case "frame-ready":
                 guard value["sessionId"] as? String == sessionID, value["generation"] as? String == generation,
                       Self.revision(value["frameSequence"]), Self.revision(value["streamGeneration"]), Self.integer(value["expiresAt"]) != nil else { throw HubNetworkError("screen_scope_invalid") }
@@ -175,6 +177,28 @@ final class HubScreenSession: @unchecked Sendable {
             }
         }
         try deliver(value: value, size: bytes.count)
+    }
+    private static let earlyStateLimit = 4, earlyStateBytes = 16384
+    /// Validates a control `state` for this session and returns the control it grants.
+    private func controlGrant(_ value: [String: Any]) throws -> Bool {
+        guard let session = value["session"] as? [String: Any], session["id"] as? String == sessionID,
+              session["generation"] as? String == generation, session["desktopId"] as? String == desktopID,
+              let state = session["state"] as? String, ["connecting", "viewing", "paused", "controlling", "closed"].contains(state),
+              Self.integer(value["serverTime"]) != nil else { throw HubNetworkError("screen_scope_invalid") }
+        try Self.keys(value, "type session serverTime", "controlPending streamGeneration lease")
+        if let pending = value["controlPending"], Self.boolean(pending) == nil { throw HubNetworkError("screen_protocol_invalid") }
+        if let revision = value["streamGeneration"], !Self.revision(revision) { throw HubNetworkError("screen_protocol_invalid") }
+        if let lease = value["lease"] {
+            guard let lease = lease as? [String: Any], let id = lease["id"] as? String, Self.ticket(id),
+                  let challenge = lease["challenge"] as? String, Self.ticket(challenge), Self.integer(lease["expiresAt"]) != nil,
+                  Self.integer(lease["challengeExpiresAt"]) != nil else { throw HubNetworkError("screen_protocol_invalid") }
+            try Self.keys(lease, "id expiresAt challenge challengeExpiresAt")
+        }
+        return state == "controlling" && value["lease"] != nil && controlAllowed
+    }
+    private func applyState(_ value: [String: Any]) throws {
+        canControl = try controlGrant(value)
+        if !canControl { inputFocused = false }
     }
     private func validateSize(_ width: Int, _ height: Int, _ codec: String) throws {
         let edge = quality == "sharp" ? 3072 : quality == "smooth" ? 1280 : 1920
