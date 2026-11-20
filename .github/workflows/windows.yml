@@ -1,6 +1,6 @@
-# ACCEPTANCE-ONLY BRANCH COPY (#50). Never merge this file into main as is:
-# it removes signing, publishing and every artifact upload so a disposable
-# GitHub-hosted runner can install/uninstall without releasing unreviewed bytes.
+# ACCEPTANCE-ONLY PROBE (#50 native triage). Never merge into main.
+# Runs only the updater source-guard Rust tests to tell a test-order artifact
+# from a product failure. No installer, no npm, no signing, no uploads.
 name: Windows desktop installer
 on:
   workflow_dispatch:
@@ -12,176 +12,38 @@ on:
         default: x64
 permissions:
   contents: read
-env:
-  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 180
-    env:
-      TAROBOT_SOURCE_COMMIT: ${{ github.sha }}
-    outputs:
-      version: ${{ steps.version.outputs.version }}
+    timeout-minutes: 30
     steps:
       - name: Acceptance-only guard (disposable GitHub-hosted runner, no uploads)
         shell: pwsh
         env:
           REF: ${{ github.ref }}
         run: |
-          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Install/uninstall acceptance runs only on a disposable GitHub-hosted runner" }
-          if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "This acceptance-only workflow copy runs only from an accept/* branch" }
-          "runner=$env:RUNNER_ENVIRONMENT os=$env:ImageOS image=$env:ImageVersion ref=$env:REF"
-      - name: Configure desktop build directories
-        shell: bash
-        run: |
-          printf '%s\n' \
-            "TAROBOT_DESKTOP_OUTPUT=$RUNNER_TEMP/tarobot-electron-output.noindex" \
-            "TAROBOT_ELECTRON_CACHE=$RUNNER_TEMP/tarobot-electron-cache.noindex" \
-            "TAROBOT_DESKTOP_TARGET=$RUNNER_TEMP/tarobot-electron-target.noindex" >> "$GITHUB_ENV"
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Probe runs only on a disposable GitHub-hosted runner" }
+          if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "This probe runs only from an accept/* branch" }
       - uses: actions/checkout@v4
-      - name: Read application version
-        id: version
-        shell: pwsh
-        run: |
-          $client = Get-Content client/package.json -Raw | ConvertFrom-Json
-          $app = Get-Content client/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          if ($client.version -ne $app.version) { throw "Client and native application versions differ" }
-          "version=$($app.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            client/package-lock.json
-      - name: Validate unsigned build settings
-        shell: pwsh
-        run: |
-          node --input-type=module -e "import { windowsBuildPlan } from './client/scripts/windows-build-plan.mjs'; windowsBuildPlan({ signedUpdates: false });"
-          if ($LASTEXITCODE -ne 0) { throw "Build configuration is incomplete" }
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: client/src-tauri -> target
-          # Acceptance branch: restore only, never store build outputs.
-          save-if: false
-      - name: Install NSIS
-        shell: pwsh
-        run: |
-          choco install nsis --no-progress -y
-          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
-      - run: npm ci
-      - run: npm ci --prefix client
-      - name: Build full Windows host installer
-        id: build
-        run: npm run desktop:windows --prefix client -- --arch ${{ inputs.arch }}
-      - name: Packaged host end-to-end smoke
-        run: client/src-tauri/host/node.exe scripts/verify-desktop-host.mjs client/src-tauri/host
-      - name: Windows host control and engine discovery
-        run: npx vitest run tests/windows-host.test.ts tests/deepseek-windows-discovery.test.ts tests/deepseek-windows-installation.test.ts tests/deepseek-desktop-launcher.test.ts tests/windows-state-sync.test.ts tests/host-cli-package.test.ts
-      - name: Final installer runtime dependencies
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe" | Select-Object -First 1
-          if (-not $installer) { throw "No Windows installer was produced" }
-          7z x $installer.FullName -owindows-installer-extracted -y
-          if ($LASTEXITCODE -ne 0) { throw "Installer extraction failed" }
-          node scripts/verify-windows-runtime.mjs windows-installer-extracted
-          if ($LASTEXITCODE -ne 0) { throw "Installer requires an unbundled runtime" }
-      - name: Native Rust regressions on the x64 runner
-        if: inputs.arch == 'x64'
+      - name: Source guard tests, alone and in their default order
         shell: pwsh
         env:
-          TAROBOT_TEST_NODE: ${{ github.workspace }}/client/src-tauri/host/node.exe
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
-          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+          CARGO_TARGET_DIR: ${{ runner.temp }}/guard-probe.noindex
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
         run: |
-          cargo test --manifest-path client/src-desktop-core/Cargo.toml --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Desktop core regressions failed" }
-          cargo test --manifest-path client/src-desktop-native/Cargo.toml --locked --no-default-features
-          if ($LASTEXITCODE -ne 0) { throw "Desktop native regressions failed" }
-          cargo test --manifest-path client/src-desktop-updater/Cargo.toml --locked --lib --bins --test real_archive
-          if ($LASTEXITCODE -ne 0) { throw "Desktop updater regressions failed" }
-      # Record only, never a gate: the real WinRT Setting of a never-registered
-      # AUMID and how windows_status classifies it. A Server runner proves
-      # neither banner delivery nor Windows 10/11 behaviour.
-      - name: Record-only Windows toast status probe (non-blocking)
-        if: inputs.arch == 'x64'
-        continue-on-error: true
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
-          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
-        run: |
-          $output = cargo test --manifest-path client/src-desktop-native/Cargo.toml --locked --no-default-features windows_toast_status_probe -- --ignored --nocapture 2>&1 | Out-String
-          $code = $LASTEXITCODE
-          Write-Output $output
-          $fence = '```'
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Windows toast status probe (record only)', $fence, $output.Trim(), $fence)
-          if ($code -ne 0) { throw "Toast status probe did not classify as prompt/granted; recorded only" }
-      - name: Real Windows install, first launch and uninstall
-        # Acceptance branch: run even when the unrelated packaged-host smoke
-        # assertion fails, so the install/uninstall baseline is still recorded.
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 35
-        shell: pwsh
-        env:
-          TAROBOT_WINDOWS_ACCEPTANCE: disposable
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
-          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
-        run: |
-          $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
-          if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
-          node client/scripts/windows-acceptance.mjs --confirm-disposable-windows --installer $installers[0].FullName `
-            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-acceptance.noindex" `
-            --native-tests client/src-desktop-updater --scope install,native
-          if ($LASTEXITCODE -ne 0) { throw "Windows installation or native acceptance failed; see the receipt" }
-      - name: "#50 uninstall recovery, in-place uninstall, helper backup and dialogs (acceptance only)"
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 75
-        shell: pwsh
-        env:
-          TAROBOT_WINDOWS_ACCEPTANCE: disposable
-        run: |
-          $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
-          if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
-          node client/scripts/windows-uninstall-recovery-acceptance.mjs --confirm-disposable-windows --installer $installers[0].FullName `
-            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex" --budget-minutes 60
-          if ($LASTEXITCODE -ne 0) { throw "#50 uninstall recovery acceptance did not pass; see the receipt in the job summary" }
-      - name: Build isolated Windows migration acceptance package
-        shell: pwsh
-        run: |
-          npm run desktop:build --prefix client -- --platform win32 --arch x64 --development --package-only `
-            --out "$env:RUNNER_TEMP/windows-migration-package.noindex"
-          if ($LASTEXITCODE -ne 0) { throw "Migration acceptance package build failed" }
-      - name: Persistent WebView2 data to Electron content acceptance
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-migration-target.noindex
-        run: |
-          $build = Get-Content "$env:RUNNER_TEMP/windows-migration-package.noindex/desktop-build.json" -Raw | ConvertFrom-Json
-          if ($build.production -or $build.packaged.paths.Count -ne 1) { throw "Expected one isolated development package" }
-          node client/scripts/desktop-persisted-migration-audit.mjs "$env:RUNNER_TEMP/windows-persisted-migration.noindex" $build.packaged.paths[0]
-          if ($LASTEXITCODE -ne 0) { throw "Persistent WebView2 to Electron migration failed" }
-      - name: Show acceptance evidence (log and summary only, no upload)
-        if: always()
-        shell: pwsh
-        run: |
-          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/windows-acceptance.md", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.md" -ErrorAction SilentlyContinue)) {
-            Get-Content -LiteralPath $file.FullName -Raw | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          }
-          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/*.json", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.json", "$env:RUNNER_TEMP/windows-persisted-migration.noindex/*.json" -ErrorAction SilentlyContinue)) {
-            "===== $($file.Name) ====="; Get-Content -LiteralPath $file.FullName -Raw
-          }
-      - name: Installer checksum (log only, the installer is never uploaded)
-        if: always()
-        shell: pwsh
-        run: |
-          Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
-          }
+          $base = @('test', '--manifest-path', 'client/src-desktop-updater/Cargo.toml', '--locked', '--target', 'x86_64-pc-windows-msvc', '--test', 'windows_source_guard', '--')
+          $keep = { param($lines) $lines | ForEach-Object { "$_" } | Where-Object { $_ -match '^test result:|^test .* (FAILED|ok|ignored)$|panicked at|^\s+(left|right):' } }
+          "== A: the parent-unknown test alone (own process) =="
+          $a = & cargo @base '--exact' 'system::a_process_not_started_by_electron_main_is_refused' '--test-threads=1' 2>&1; $codeA = $LASTEXITCODE
+          & $keep $a
+          "== B: all source-guard tests, one thread, default order (as acceptance) =="
+          $b = & cargo @base '--test-threads=1' 2>&1; $codeB = $LASTEXITCODE
+          & $keep $b
+          "== C: the late-old-app test, then the parent-unknown test, same process =="
+          $c = & cargo @base 'system::a_' '--test-threads=1' '--skip' 'a_running_old' 2>&1; $codeC = $LASTEXITCODE
+          & $keep $c
+          "exit codes: A=$codeA B=$codeB C=$codeC"
+          "| run | exit |`n|---|---|`n| A alone | $codeA |`n| B default order | $codeB |`n| C late-old-app then parent-unknown | $codeC |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
