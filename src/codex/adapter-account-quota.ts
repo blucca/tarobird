@@ -89,7 +89,14 @@ export class AdapterQuotaCache {
   response(scope: AdapterQuotaScope, options: EngineQuotaReadOptions): EngineQuotaReadResult | undefined {
     if (options.signal?.aborted) return this.failure(scope, "cancelled");
     if (options.expectedRevision && options.expectedRevision !== scope.revision) { this.cached = undefined; return this.failure(scope, "auth_changed"); }
-    if (!scope.verifiable) { this.cached = undefined; return this.failure(scope, "scope_unverifiable"); }
+    if (!scope.verifiable) {
+      this.cached = undefined;
+      // Codex's public account/read can still answer one explicit read: it reports "not signed in"
+      // natively, and the before/after identity check binds that single reading to one account.
+      // store() never retains it, because later reads cannot prove the opaque source is unchanged.
+      if (this.engine === "codex" && options.refresh) return undefined;
+      return this.failure(scope, "scope_unverifiable");
+    }
     if (scope.authMode !== "subscription") { this.cached = undefined; return { revision: scope.revision, snapshot: unavailableQuota(this.engine, "mode_not_supported", Date.now(), scope.authMode) }; }
     if (this.cached?.revision !== scope.revision) this.cached = undefined;
     if (options.refresh && this.engine === "codex") return undefined;
@@ -99,6 +106,8 @@ export class AdapterQuotaCache {
     return value;
   }
   store(scope: AdapterQuotaScope, value: { snapshot: QuotaSnapshot; proof?: QuotaAccountProof }): EngineQuotaReadResult {
+    // One-shot only: no cache and no account proof for a credential source this Host cannot verify.
+    if (!scope.verifiable) { this.cached = undefined; return { revision: scope.revision, snapshot: structuredClone(value.snapshot) }; }
     const same = this.cached?.revision === scope.revision ? this.cached : undefined;
     if (same && same.snapshot.observedAt && ["unavailable", "offline"].includes(value.snapshot.state)) {
       this.cached = { ...same, snapshot: { ...same.snapshot, state: "stale", reason: value.snapshot.reason, lastAttemptAt: value.snapshot.lastAttemptAt } };

@@ -8,7 +8,7 @@ not establish an account's remaining allowance.
 
 | Engine | Source and limits |
 | --- | --- |
-| Codex | Explicit read of native account and rate-limit APIs for a verifiable subscription identity. API-key/provider balances are not inferred. A cold reader uses a temporary CLI helper without creating a thread or sending a prompt. |
+| Codex | Explicit read of native account and rate-limit APIs for a subscription identity. API-key/provider balances are not inferred. A cold reader uses a temporary CLI helper without creating a thread or sending a prompt. When the Host cannot verify the credential source from files (no `auth.json`, a keyring/auto store or an external helper), an explicit refresh still asks Codex's public `account/read`: "not signed in" becomes login required, and an account answer is shown for that one read only after the before/after identity check. Such a reading is never cached or reused. |
 | Claude | Native quota events observed during an ordinary conversation. Reading the card does not start a conversation or request a model response. An identity that cannot be verified, including an opaque Keychain credential source, remains unknown. |
 | Antigravity | No active reader until a successful public quota response and identity contract are verified. |
 | Kimi | The currently integrated ACP contract has no verified quota reader. |

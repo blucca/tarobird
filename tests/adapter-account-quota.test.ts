@@ -7,6 +7,7 @@ import { CodexAppServerAdapter, type AppServerSpawnCodex } from "../src/codex/ap
 import { ProcessCodexAdapter } from "../src/codex/process-adapter.js";
 import { ClaudeStreamAdapter } from "../src/codex/claude-stream-adapter.js";
 import { AdapterQuotaCache } from "../src/codex/adapter-account-quota.js";
+import { gatewayEngineQuota } from "../src/gateway/engine-quota.js";
 
 const roots: string[] = [];
 const disposals: Array<() => unknown> = [];
@@ -14,11 +15,11 @@ afterEach(async () => { for (const dispose of disposals.splice(0)) await dispose
 const account = { account: { type: "chatgpt", email: "fixture@example.invalid", planType: "pro" }, requiresOpenaiAuth: true, userId: "fixture-user" };
 class Child extends EventEmitter {
   stdout = new EventEmitter(); stderr = new EventEmitter(); methods: string[] = []; killCount = 0; closed = false;
-  hold = new Set<string>(); closeDelayMs = 20;
+  hold = new Set<string>(); closeDelayMs = 20; accounts: unknown[] = [];
   stdin = { write: (line: string, callback?: (error?: Error | null) => void) => {
     const request = JSON.parse(line); this.methods.push(request.method);
     if (request.id != null && !this.hold.has(request.method)) queueMicrotask(() => this.reply(request.id,
-      request.method === "account/read" ? account : request.method === "account/rateLimits/read" ? { accountId: "fixture-account", rateLimits: { primary: { usedPercent: 25 } } } : {}));
+      request.method === "account/read" ? this.accounts.length ? this.accounts.shift() : account : request.method === "account/rateLimits/read" ? { accountId: "fixture-account", rateLimits: { primary: { usedPercent: 25 } } } : {}));
     callback?.(null); return true;
   }, end: () => undefined, on: () => undefined };
   reply(id: unknown, result: unknown) { this.stdout.emit("data", JSON.stringify({ id, result }) + "\n"); }
@@ -136,3 +137,90 @@ it("joins both quota and history helpers on Process adapter destruction", async 
   expect(children.flatMap(child => child.methods)).not.toContain("thread/fork");
   expect(adapter.hasPendingNativeWork()).toBe(false);
 });
+
+// #47-B: Codex's public account/read separates "not signed in" from "credential source cannot be verified".
+// Synthetic identities only; nothing here reads a real login, Keychain item or browser state.
+async function opaqueFixture(kind: "missing" | "keyring") {
+  const f = await fixture();
+  if (kind === "missing") await rm(path.join(f.codexHome, "auth.json"));
+  else { await rm(path.join(f.codexHome, "auth.json")); await writeFile(path.join(f.codexHome, "config.toml"), 'cli_auth_credentials_store = "keyring"\n'); }
+  const children: Child[] = [], accounts: unknown[][] = [];
+  const spawn = vi.fn(() => { const child = new Child(); child.accounts = accounts.shift() ?? []; children.push(child); return child; });
+  const adapter = new ProcessCodexAdapter("codex", f.env, spawn, undefined, undefined, undefined, f.root);
+  disposals.push(() => adapter.destroy());
+  return { adapter, spawn, children, accounts };
+}
+const methodsOf = (child: Child) => child.methods.filter(method => !["initialize", "initialized"].includes(method));
+it("an explicit refresh lets native Codex report that no account is signed in", async () => {
+  const f = await opaqueFixture("missing");
+  const cached = await f.adapter.getAccountQuota({ refresh: false });
+  expect(cached.snapshot).toMatchObject({ state: "unknown", reason: "scope_unverifiable", pools: [] }); expect(f.spawn).not.toHaveBeenCalled();
+  f.accounts.push([{ account: null, requiresOpenaiAuth: true }]);
+  const result = await f.adapter.getAccountQuota({ refresh: true, expectedRevision: cached.revision });
+  expect(result.snapshot).toMatchObject({ state: "login_required", reason: "login_required", pools: [], help: "codex_usage" });
+  expect(methodsOf(f.children[0]!)).toEqual(["account/read"]); expect(f.children[0]!.closed).toBe(true);
+});
+it("a keyring login is read once through native identity checks and never retained", async () => {
+  const f = await opaqueFixture("keyring");
+  const first = await f.adapter.getAccountQuota({ refresh: false });
+  expect(first.snapshot.reason).toBe("scope_unverifiable");
+  const result = await f.adapter.getAccountQuota({ refresh: true, expectedRevision: first.revision });
+  expect(result.snapshot).toMatchObject({ state: "ready", authMode: "subscription" }); expect(result.snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 25 });
+  expect(result).not.toHaveProperty("proof");
+  expect(methodsOf(f.children[0]!)).toEqual(["account/read", "account/rateLimits/read", "account/read"]);
+  // Later cache reads cannot prove the keyring still holds that account.
+  expect((await f.adapter.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+  expect(f.spawn).toHaveBeenCalledOnce();
+});
+it("a keyring account switch during the read is rejected without values", async () => {
+  const f = await opaqueFixture("keyring");
+  f.accounts.push([account, { ...account, account: { ...account.account, email: "second@example.invalid" }, userId: "second-user" }]);
+  const result = await f.adapter.getAccountQuota({ refresh: true });
+  expect(result.snapshot).toMatchObject({ reason: "auth_changed", pools: [] });
+});
+it("a native API-key answer stays unsupported and never reads subscription limits", async () => {
+  const f = await opaqueFixture("missing");
+  f.accounts.push([{ account: { type: "apiKey" }, requiresOpenaiAuth: false }]);
+  const result = await f.adapter.getAccountQuota({ refresh: true });
+  expect(result.snapshot).toMatchObject({ state: "unsupported", reason: "mode_not_supported", authMode: "api_key", pools: [] });
+  expect(methodsOf(f.children[0]!)).toEqual(["account/read"]);
+});
+it("a live keyring worker answers one explicit Gateway refresh without being stopped or cached", async () => {
+  const f = await fixture(), child = new Child();
+  await rm(path.join(f.codexHome, "auth.json")); await writeFile(path.join(f.codexHome, "config.toml"), 'cli_auth_credentials_store = "auto"\n');
+  const adapter = new CodexAppServerAdapter("codex", f.root, f.env, () => child);
+  disposals.push(() => adapter.destroy());
+  await (adapter as any).startChildAndInitialize(["app-server"]);
+  const run = gatewayEngineQuota({ botId: "bot", engine: "codex", read: options => adapter.getAccountQuota(options) });
+  const listed = await run({ scopeId: "bot", refresh: false });
+  expect(listed.value).toMatchObject({ reason: "scope_unverifiable", capability: { mode: "active" } }); expect(child.methods).not.toContain("account/read");
+  const refreshed = await run({ scopeId: "bot", refresh: true, expectedRevision: listed.revision });
+  expect(refreshed.value).toMatchObject({ state: "ready", sharing: "unverified" }); expect(child.killCount).toBe(0);
+  expect((await run({ scopeId: "bot", refresh: false })).value).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+});
+it("Claude's unverifiable passive source stays hidden even on an explicit refresh", async () => {
+  const f = await fixture();
+  const cache = new AdapterQuotaCache("claude", "claude", { HOME: f.home }, f.root);
+  const scope = cache.capture("live");
+  expect(scope.verifiable).toBe(false);
+  expect(cache.response(scope, { refresh: true })?.snapshot).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+});
+// Real-CLI acceptance, opt-in: TAROBIRD_QUOTA_REAL_CODEX=/path/to/codex. Empty isolated home, file credential
+// store, no API key: no real login, Keychain item or network account is consulted, and no thread is created.
+it.skipIf(!process.env.TAROBIRD_QUOTA_REAL_CODEX)("real Codex CLI reports no sign-in for an empty isolated home without starting a turn", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "quota-real-codex-")); roots.push(root);
+  const home = path.join(root, "home"), codexHome = path.join(home, ".codex");
+  await mkdir(codexHome, { recursive: true });
+  const env = { HOME: home, CODEX_HOME: codexHome, PATH: process.env.PATH };
+  const adapter = new ProcessCodexAdapter(process.env.TAROBIRD_QUOTA_REAL_CODEX!, env, undefined, undefined, undefined, undefined, root);
+  disposals.push(() => adapter.destroy());
+  const cached = await adapter.getAccountQuota({ refresh: false });
+  expect(cached.snapshot).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+  const result = await adapter.getAccountQuota({ refresh: true, expectedRevision: cached.revision, timeoutMs: 7000 });
+  expect(result.snapshot).toMatchObject({ state: "login_required", reason: "login_required", pools: [], help: "codex_usage" });
+  expect((await adapter.getAccountQuota({ refresh: false })).snapshot.reason).toBe("scope_unverifiable");
+  expect(adapter.hasPendingNativeWork()).toBe(false);
+  const { readdir } = await import("node:fs/promises");
+  expect(await readdir(codexHome)).not.toContain("sessions");
+  expect(await readdir(codexHome)).not.toContain("auth.json");
+}, 30_000);
