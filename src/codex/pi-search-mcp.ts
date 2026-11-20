@@ -34,7 +34,8 @@ async function readMcpServers(file: string): Promise<Record<string, unknown>> {
 
 /** The owner's Pi MCP registrations for this workspace: global `mcp.json` and the project's `.pi/mcp.json`. */
 export async function collectPiSearchMcpEntries(env: NodeJS.ProcessEnv, workspacePath: string, homeDir?: string): Promise<SearchMcpEntry[]> {
-  const files = [path.join(piAgentDir(env, homeDir), "mcp.json"), path.join(workspacePath, ".pi", "mcp.json")];
+  // Pi runs in the workspace, so a relative PI_CODING_AGENT_DIR is read from there.
+  const files = [path.join(piAgentDir(env, homeDir, workspacePath), "mcp.json"), path.join(workspacePath, ".pi", "mcp.json")];
   const entries: SearchMcpEntry[] = [];
   for (const file of files) {
     for (const [name, server] of Object.entries(await readMcpServers(file))) {

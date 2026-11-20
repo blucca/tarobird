@@ -542,7 +542,8 @@ describe("PiRpcAdapter turns", () => {
     controller.abort();
     await expect(turn).rejects.toMatchObject({ name: "AbortError" });
     const order = commands(r.spawner.last()).map(command => command.type).filter(type => type === "clear_queue" || type === "abort");
-    expect(order).toEqual(["clear_queue", "abort"]);
+    // Queue first, then abort; once the run has settled the queue is cleared again for input that arrived late.
+    expect(order).toEqual(["clear_queue", "abort", "clear_queue"]);
     expect(r.spawner.last().exitCode).toBeNull();
     expect((await r.adapter.sendUserMessage(sessionId, message("after"))).sessionId).toBe(sessionId);
   });
@@ -821,7 +822,7 @@ describe("PiRpcAdapter lifecycle regressions", () => {
     controller.abort();
     await expect(turn).rejects.toMatchObject({ name: "AbortError" });
     const second = r.spawner.processes[1]!;
-    expect(commands(second).map(command => command.type).filter(type => type === "clear_queue" || type === "abort")).toEqual(["clear_queue", "abort"]);
+    expect(commands(second).map(command => command.type).filter(type => type === "clear_queue" || type === "abort")).toEqual(["clear_queue", "abort", "clear_queue"]);
     expect(second.activeRun).toBeUndefined();
     expect(commands(r.spawner.processes[0]!, "abort")).toHaveLength(0);
   });
@@ -984,7 +985,7 @@ describe("PiRpcAdapter lifecycle regressions", () => {
     expect(third.events.filter(event => event.type === "assistant_text").map(event => event.text)).not.toContain("[Pi extension] background job finished");
   });
 
-  it("carries out a built-in typed during a run instead of steering the model with it", async () => {
+  it.each(["/model fakeprov2/dup-model", "  /model fakeprov2/dup-model  "])("carries out the live native command %s instead of steering the model with it", async text => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const r = await rig({ pi: { onPrompt: async run => { await gate; run.reply("done"); run.finish(); } } });
@@ -992,7 +993,7 @@ describe("PiRpcAdapter lifecycle regressions", () => {
     const input = message("long");
     const turn = r.adapter.sendUserMessage(sessionId, input);
     await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
-    expect(await r.adapter.steerActiveTurn(sessionId, { text: "/model fakeprov2/dup-model" })).toBe(true);
+    expect(await r.adapter.steerActiveTurn(sessionId, { text })).toBe(true);
     expect(await r.adapter.steerActiveTurn(sessionId, { text: "/tree" })).toBe(true);
     expect(await r.adapter.steerActiveTurn(sessionId, { text: "/login" })).toBe(true);
     expect(await r.adapter.steerActiveTurn(sessionId, { text: "actually, use tabs" })).toBe(true);
@@ -1708,5 +1709,372 @@ describe("PiRpcAdapter settings errors name the model in canonical form", () => 
     expect(unavailable.message).toMatch(/^Invalid model selection: corp%20gateway\/Other%20Model is not available in Pi\./);
     expect(classifyFailure(unsupported)).toBe("engine-settings");
     expect(classifyFailure(unavailable)).toBe("engine-settings");
+  });
+});
+
+/**
+ * Input typed while a run streams, against what Pi 1.5.2 does natively (lab probes o01–o03):
+ * `!`/`!!` run in Pi's shell at once; steer refuses a registered extension command; steer expands
+ * templates and skills; a steer that arrives after the last reply is parked and would otherwise be
+ * delivered into the next, unrelated run.
+ */
+describe("PiRpcAdapter input during a run", () => {
+  const EXT_REFUSAL = (name: string) => `Extension command "/${name}" cannot be queued. Use prompt() or execute the command when not streaming.`;
+  async function running(config: Record<string, unknown> = { approvalMode: "bypass" }, extra: Partial<CodexUserMessageInput> = {}, pi: FakePiOptions = {}) {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const r = await rig({ config, pi: { onPrompt: async run => { await gate; run.reply("done"); run.finish(); }, ...pi } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("long", extra);
+    const turn = r.adapter.sendUserMessage(sessionId, input);
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    return { r, sessionId, input, turn, release, process: r.spawner.last() };
+  }
+  const texts = (events: EngineStreamEvent[]) => events.filter(event => event.type === "assistant_text").map(event => event.text);
+
+  it.each([
+    { text: "!echo hi", command: "echo hi", excluded: false },
+    { text: "  !!pwd  ", command: "pwd", excluded: true },
+  ])("runs $text in Pi's shell at once instead of steering the model with it", async ({ text, command, excluded }) => {
+    const { r, sessionId, input, turn, release, process } = await running();
+    expect(await r.adapter.steerActiveTurn(sessionId, { text, throwOnError: true })).toBe(true);
+    expect(commands(process, "steer")).toHaveLength(0);
+    expect(commands(process, "bash")).toEqual([expect.objectContaining({ command, ...(excluded ? { excludeFromContext: true } : {}) })]);
+    release(); await turn;
+    const output = texts(input.events).findIndex(line => line.includes("out"));
+    expect(output).toBeGreaterThanOrEqual(0);
+    expect(input.events.findIndex(event => event.type === "result")).toBeGreaterThan(input.events.findIndex(event => event.type === "assistant_text" && event.text.includes("out")));
+  });
+
+  it("asks in normal mode for every `!`, answers the request before the owner decides, and runs it once inside the same turn", async () => {
+    let decide!: (decision: EngineApprovalDecision) => void;
+    const asked: string[] = [];
+    const { r, sessionId, input, turn, release, process } = await running({ approvalMode: "normal" }, {
+      onApprovalRequest: request => { asked.push(`${request.toolName}:${JSON.stringify(request.toolInput)}`); return new Promise<EngineApprovalDecision>(resolve => { decide = resolve; }); },
+    });
+    // Admitted once the card is up: the Hub's steer call must not wait for a person.
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "!rm -rf build", throwOnError: true })).toBe(true);
+    expect(asked).toEqual(['bash:{"command":"rm -rf build"}']);
+    expect(commands(process, "bash")).toHaveLength(0);
+    // The run finishes while the owner is still deciding; the turn waits for the command it accepted.
+    release();
+    let ended = false; void turn.then(() => { ended = true; }, () => { ended = true; });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(ended).toBe(false);
+    decide(allow("session"));
+    const response = await turn;
+    expect(commands(process, "bash").map(command => command.command)).toEqual(["rm -rf build"]);
+    expect(texts(input.events).some(line => line.includes("out"))).toBe(true);
+    expect(response.text).toBe("done");
+    // A session-scope answer is not a standing grant for typed shell commands.
+    const again = message("next", { onApprovalRequest: async request => { asked.push(request.toolName); return { behavior: "deny" }; } });
+    await r.adapter.sendUserMessage(sessionId, message("!rm -rf build", { onApprovalRequest: again.onApprovalRequest! }));
+    expect(asked.at(-1)).toBe("bash");
+    expect(commands(process, "bash")).toHaveLength(1);
+  });
+
+  it("never runs a `!` that was denied, could not be asked, or whose turn was stopped while asking", async () => {
+    const denied = await running({ approvalMode: "normal" }, { onApprovalRequest: async () => ({ behavior: "deny" }) });
+    expect(await denied.r.adapter.steerActiveTurn(denied.sessionId, { text: "!touch x" })).toBe(true);
+    denied.release(); await denied.turn;
+    expect(commands(denied.process, "bash")).toHaveLength(0);
+    expect(texts(denied.input.events)).toContain("Not approved. Nothing was run.");
+
+    const unasked = await running({ approvalMode: "normal" });
+    expect(await unasked.r.adapter.steerActiveTurn(unasked.sessionId, { text: "!touch x" })).toBe(true);
+    unasked.release(); await unasked.turn;
+    expect(commands(unasked.process, "bash")).toHaveLength(0);
+    expect(texts(unasked.input.events).some(line => /need your approval/.test(line))).toBe(true);
+
+    const controller = new AbortController();
+    const stopped = await running({ approvalMode: "normal" }, { abortSignal: controller.signal, onApprovalRequest: () => new Promise<EngineApprovalDecision>(() => {}) });
+    expect(await stopped.r.adapter.steerActiveTurn(stopped.sessionId, { text: "!touch x" })).toBe(true);
+    controller.abort();
+    await expect(stopped.turn).rejects.toThrow(/aborted/);
+    expect(commands(stopped.process, "bash")).toHaveLength(0);
+  });
+
+  it("treats a bare `!` as text, as Pi's editor does", async () => {
+    const { r, sessionId, turn, release, process } = await running();
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "!!" })).toBe(true);
+    expect(commands(process, "bash")).toHaveLength(0);
+    expect(commands(process, "steer").map(command => command.message)).toEqual(["!!"]);
+    release(); await turn;
+  });
+
+  it("refuses a registered extension command before anything reaches Pi, so it can run as a turn of its own", async () => {
+    const { r, sessionId, turn, release, process } = await running(undefined, {}, { commands: [{ name: "labcmd", source: "extension" }, { name: "labtpl", source: "prompt" }, { name: "skill:labskill", source: "skill" }] });
+    const error = await failure(r.adapter.steerActiveTurn(sessionId, { text: "/labcmd now", throwOnError: true }));
+    expect(error).toBeInstanceOf(EngineSteeringRejectedError);
+    expect((error as EngineSteeringRejectedError).reason).toBe("unsupported");
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "/labcmd now" })).toBe(false);
+    expect(process.received.some(command => String(command.message ?? "").startsWith("/labcmd"))).toBe(false);
+    // Templates and skills are steered as typed; Pi expands them itself (o02-A).
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: " /labtpl hi " })).toBe(true);
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "/skill:labskill go" })).toBe(true);
+    expect(commands(process, "steer").map(command => command.message)).toEqual(["/labtpl hi", "/skill:labskill go"]);
+    release(); await turn;
+  });
+
+  it("reports Pi's own refusal of a steer as a definite rejection, never as an uncertain delivery", async () => {
+    const { r, sessionId, turn, release } = await running(undefined, {}, {
+      onCommand: (command, process) => {
+        if (command.type === "steer" && String(command.message).startsWith("/late")) { process.fail(command, EXT_REFUSAL("late")); return true; }
+      },
+    });
+    // The command registered after the adapter looked: Pi refuses it and nothing is queued.
+    const error = await failure(r.adapter.steerActiveTurn(sessionId, { text: "/late x", throwOnError: true }));
+    expect(error).toBeInstanceOf(EngineSteeringRejectedError);
+    expect((error as EngineSteeringRejectedError).reason).toBe("not_ready");
+    release(); await turn;
+  });
+
+  it("does not steer once the last reply ended without tools: Pi would park the text for the next run", async () => {
+    let finish!: () => void;
+    const r = await rig({ pi: { onPrompt: async run => { run.reply("final answer"); await new Promise<void>(resolve => { finish = resolve; }); run.finish(); } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const turn = r.adapter.sendUserMessage(sessionId, message("go"));
+    await waitFor(() => Boolean(finish));
+    await waitFor(() => r.spawner.last().received.some(command => command.type === "prompt"));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const error = await failure(r.adapter.steerActiveTurn(sessionId, { text: "one more thing", throwOnError: true }));
+    expect((error as EngineSteeringRejectedError).reason).toBe("not_ready");
+    expect(commands(r.spawner.last(), "steer")).toHaveLength(0);
+    // A live command still runs: it does not depend on the model reading it.
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "/thinking high" })).toBe(true);
+    finish(); await turn;
+  });
+
+  it("hands back a steer Pi parked after the run instead of letting it reach the next turn", async () => {
+    const { r, sessionId, input, turn, release, process } = await running();
+    r.adapter.piNative.subscribe(sessionId, () => {});
+    const native: PiNativeEvent[] = [];
+    r.adapter.piNative.subscribe(sessionId, event => { native.push(event); });
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "also update the changelog" })).toBe(true);
+    // The fake leaves the steer queued when the run ends: what Pi 1.5.2 does with one that arrives late (o03).
+    release(); await turn;
+    expect(commands(process, "clear_queue")).toHaveLength(1);
+    expect(texts(input.events).some(line => line.includes("also update the changelog") && /did not reach the model/.test(line))).toBe(true);
+    expect(native.some(event => event.type === "editor_text" && event.text === "also update the changelog")).toBe(true);
+    expect((await r.adapter.piNative.getState(sessionId)).pending).toEqual({ steering: [], followUp: [] });
+    const next = message("unrelated");
+    await r.adapter.sendUserMessage(sessionId, next);
+    expect(process.queue).toEqual({ steering: [], followUp: [] });
+  });
+
+  it("leaves a delivered steer alone and hands back exactly what Pi still holds, expanded templates included", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const r = await rig({ pi: { onPrompt: async run => {
+      await gate;
+      // Pi took the first steer into the run; the second arrived late and stayed queued, expanded.
+      run.process.queue = { steering: ["TEMPLATE-EXPANDED hi"], followUp: [] };
+      run.emit({ type: "queue_update", steering: ["TEMPLATE-EXPANDED hi"], followUp: [] });
+      run.reply("done"); run.finish();
+    } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("long");
+    const turn = r.adapter.sendUserMessage(sessionId, input);
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "first" })).toBe(true);
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "/labtpl hi" })).toBe(true);
+    release(); await turn;
+    const handed = texts(input.events).find(line => /did not reach the model/.test(line))!;
+    // clear_queue is the authority: the template as Pi expanded it, never a guess from the order of sends.
+    expect(handed).toContain("TEMPLATE-EXPANDED hi");
+    expect(handed).not.toContain("first");
+  });
+
+  it("trims typed input before looking for a command, as Pi's editor does, also between runs", async () => {
+    const r = await rig();
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("  !echo hi  "));
+    expect(commands(r.spawner.last(), "bash").map(command => command.command)).toEqual(["echo hi"]);
+    await r.adapter.sendUserMessage(sessionId, message("  /labtpl hi  ", { turnInstructions: "PRIVATE-TURN" }));
+    const prompt = commands(r.spawner.last(), "prompt").at(-1)!;
+    expect(prompt.message).toBe("/labtpl hi");
+  });
+
+  it("lists the live process's native commands through the live handle, without the bridge's own, and starts nothing", async () => {
+    const r = await rig({ pi: { commands: [{ name: "labcmd", description: "lab", source: "extension" }, { name: "tarobird-bridge", source: "extension" }, { name: "skill:labskill", source: "skill" }] } });
+    const { sessionId } = await r.adapter.createSession(1);
+    expect(r.adapter.piNative.getLiveSession!(sessionId)).toBeUndefined();
+    await r.adapter.sendUserMessage(sessionId, message("hi"));
+    const live = r.adapter.piNative.getLiveSession!(sessionId)!;
+    expect(await live.listCommands!()).toEqual([
+      expect.objectContaining({ name: "labcmd", source: "extension", description: "lab" }),
+      expect.objectContaining({ name: "skill:labskill", source: "skill" }),
+    ]);
+    expect(r.spawner.processes).toHaveLength(1);
+    // The handle belongs to that process: once it is gone, asking fails and nothing is started in its place.
+    r.spawner.last().exit(1);
+    await waitFor(() => !live.isCurrent());
+    await expect(live.listCommands!()).rejects.toBeInstanceOf(PiNativeRejectedError);
+    expect(commands(r.spawner.last(), "get_commands")).toHaveLength(1);
+    expect(r.spawner.processes).toHaveLength(1);
+  });
+
+  it("does not let a command-list handle outlive a session replacement", async () => {
+    const r = await rig({ pi: { commands: [{ name: "labcmd", source: "extension" }] } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("hi"));
+    const live = r.adapter.piNative.getLiveSession!(sessionId)!;
+    await r.adapter.sendUserMessage(sessionId, message("/new"));
+    expect(live.isCurrent()).toBe(false);
+    await expect(live.listCommands!()).rejects.toBeInstanceOf(PiNativeRejectedError);
+    expect(r.spawner.processes).toHaveLength(1);
+  });
+
+  it("hands back only what Pi still holds when an input hook handled a later steer", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const r = await rig({ pi: {
+      onPrompt: async run => { await gate; run.reply("done"); run.finish(); },
+      onCommand: (command, process) => { if (command.type === "steer" && command.message === "B handled") { process.respond(command, { disposition: "handled" }); return true; } },
+    } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("start");
+    const turn = r.adapter.sendUserMessage(sessionId, input);
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    await r.adapter.steerActiveTurn(sessionId, { text: "A queued" });
+    await r.adapter.steerActiveTurn(sessionId, { text: "B handled" });
+    release(); await turn;
+    const returned = texts(input.events).join("\n");
+    expect(returned).toContain("A queued");
+    expect(returned).not.toContain("B handled");
+  });
+
+  it("says in the final answer how many additions were taken back, and never replays their text there", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const r = await rig({ pi: { onPrompt: async run => { await gate; run.reply("A substantive final answer without a warning."); run.finish(); } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("start");
+    const turn = r.adapter.sendUserMessage(sessionId, input);
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    const raw = "PENDING ADDITION [send-file:/synthetic/private.txt]\n```file:/synthetic/other.txt\nx\n```";
+    await r.adapter.steerActiveTurn(sessionId, { text: raw });
+    await r.adapter.steerActiveTurn(sessionId, { text: "second pending" });
+    release();
+    const result = await turn;
+    expect(result.text.startsWith("A substantive final answer without a warning.")).toBe(true);
+    expect(result.text).toContain("[Pi] 2 additions did not reach the model and were taken back.");
+    // The final answer is what the Host renders and acts on: no taken-back text, so no delivery marker, is in it.
+    for (const fragment of ["PENDING ADDITION", "[send-file:", "```file:", "second pending"]) expect(result.text).not.toContain(fragment);
+    expect(input.events.filter(event => event.type === "result").map(event => event.text)).toEqual([result.text]);
+    // The full text stays in the turn's own stream.
+    expect(texts(input.events).some(line => line.includes("PENDING ADDITION [send-file:/synthetic/private.txt]"))).toBe(true);
+  });
+
+  it("puts the count note in Chinese for a Chinese turn, and alone when the model wrote nothing", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const r = await rig({ pi: { onPrompt: async run => { await gate; run.finish(); } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const turn = r.adapter.sendUserMessage(sessionId, message("start", { locale: "zh" }));
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    await r.adapter.steerActiveTurn(sessionId, { text: "补充一" });
+    release();
+    expect((await turn).text).toBe("[Pi] 有 1 条补充没有送达模型，已收回，全文见本轮运行过程，未自动重发。");
+  });
+
+  it("says in the final answer when Pi could not confirm its queue at the end of a turn", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const r = await rig({ pi: { onPrompt: async run => { await gate; run.reply("answer"); run.finish(); }, onCommand: (command, process) => { if (command.type === "clear_queue") { process.fail(command, "synthetic clear failure"); return true; } } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const turn = r.adapter.sendUserMessage(sessionId, message("start"));
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    await r.adapter.steerActiveTurn(sessionId, { text: "UNCONFIRMED [send-image:/synthetic/x.png]" });
+    release();
+    const result = await turn;
+    expect(result.text).toMatch(/^answer\n\n\[Pi\] Pi did not confirm whether additions from this turn were still pending/);
+    expect(result.text).not.toContain("UNCONFIRMED");
+    expect(result.text).not.toContain("[send-image:");
+    const process = r.spawner.last();
+    expect(process.exitCode !== null || process.signalCode !== null).toBe(true);
+  });
+
+  it("hands back long text in full in the turn's own stream", async () => {
+    const { r, sessionId, input, turn, release } = await running();
+    const text = `${"X".repeat(2_200)}RECOVERY-TAIL`;
+    await r.adapter.steerActiveTurn(sessionId, { text });
+    release(); await turn;
+    expect(texts(input.events).join("\n")).toContain(text);
+  });
+
+  it("after a stop, a steer that Pi queued only after the first clear is cleared too, and never reaches the next turn", async () => {
+    let accept!: () => void;
+    const r = await rig({ pi: { onPrompt: async () => {}, onCommand: (command, process) => {
+      if (command.type === "steer") { accept = () => { process.queue.steering.push(String(command.message)); process.respond(command, { disposition: "queued" }); }; return true; }
+    } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const controller = new AbortController();
+    const input = message("start", { abortSignal: controller.signal });
+    const turn = r.adapter.sendUserMessage(sessionId, input).catch(error => error);
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    const steer = r.adapter.steerActiveTurn(sessionId, { text: "LATE STOP INPUT" });
+    await waitFor(() => Boolean(accept));
+    controller.abort();
+    await waitFor(() => commands(r.spawner.last(), "clear_queue").length > 0);
+    accept(); await steer; await turn;
+    const process = r.spawner.last();
+    expect(process.queue.steering).toEqual([]);
+    expect(process.exitCode).toBeNull();
+    expect(texts(input.events).some(line => line.includes("LATE STOP INPUT") && /stopped/.test(line))).toBe(true);
+  });
+
+  it("does not reuse a process whose stop clear_queue was refused: the queue was not cleared, so the process ends and says so", async () => {
+    const r = await rig({ pi: { onPrompt: async () => {}, onCommand: (command, process) => { if (command.type === "clear_queue") { process.fail(command, "synthetic clear failure"); return true; } } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const controller = new AbortController();
+    const input = message("start", { abortSignal: controller.signal });
+    const turn = r.adapter.sendUserMessage(sessionId, input).catch(error => error);
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    await r.adapter.steerActiveTurn(sessionId, { text: "NOT CLEARED" });
+    controller.abort(); await turn;
+    const process = r.spawner.last();
+    expect(process.exitCode !== null || process.signalCode !== null).toBe(true);
+    // Unconfirmed is never reported as "not delivered", and nothing is sent again.
+    expect(texts(input.events).some(line => /did not confirm/.test(line))).toBe(true);
+    expect(commands(process, "steer")).toHaveLength(1);
+  });
+
+  it("ends the process when a stopped turn's in-flight steer never answers, so it cannot reach the next turn", async () => {
+    const r = await rig({ pi: { onPrompt: async () => {}, onCommand: command => command.type === "steer" ? true : undefined } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const controller = new AbortController();
+    const turn = r.adapter.sendUserMessage(sessionId, message("start", { abortSignal: controller.signal })).catch(error => error);
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    void r.adapter.steerActiveTurn(sessionId, { text: "NEVER ANSWERED" }).catch(() => {});
+    await waitFor(() => commands(r.spawner.last(), "steer").length > 0);
+    controller.abort(); await turn;
+    expect(r.spawner.last().exitCode !== null || r.spawner.last().signalCode !== null).toBe(true);
+  });
+
+  it("does not swallow `/session <args>` when an extension of that name exists: it is that command, so it waits for a turn of its own", async () => {
+    const { r, sessionId, input, turn, release, process } = await running(undefined, {}, { commands: [{ name: "session", source: "extension" }, { name: "copy", source: "prompt" }] });
+    const error = await failure(r.adapter.steerActiveTurn(sessionId, { text: "/session custom-args", throwOnError: true }));
+    expect((error as EngineSteeringRejectedError).reason).toBe("unsupported");
+    // A template of a built-in's name with arguments is that template: Pi expands it as a steer.
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "/copy notes" })).toBe(true);
+    expect(commands(process, "steer").map(command => command.message)).toEqual(["/copy notes"]);
+    // Without arguments it is still the built-in.
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "/session" })).toBe(true);
+    release(); await turn;
+    expect(texts(input.events).some(line => /session/i.test(line) && line !== "done")).toBe(true);
+  });
+
+  it("hands back what was still queued when the turn is stopped, like Pi's Esc", async () => {
+    const r = await rig({ pi: { onPrompt: () => { /* runs until stopped */ } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const controller = new AbortController();
+    const input = message("long", { abortSignal: controller.signal });
+    const turn = r.adapter.sendUserMessage(sessionId, input);
+    await waitFor(() => Boolean(r.spawner.processes[0]?.activeRun));
+    expect(await r.adapter.steerActiveTurn(sessionId, { text: "please also update the changelog" })).toBe(true);
+    controller.abort();
+    await expect(turn).rejects.toThrow(/aborted/);
+    expect(texts(input.events).some(line => line.includes("please also update the changelog") && /stopped/.test(line))).toBe(true);
   });
 });

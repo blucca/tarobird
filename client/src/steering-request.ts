@@ -75,7 +75,7 @@ export async function sendSteering(connection: HubConnection, conversationId: st
       attempt = { botId, requestId: randomNonce(), targetId: status.targetId, text, ...(ordinary && status.nativeInput ? { mode: "message" as const } : {}), ...(workbench ? { workbench: workbenchContextSchema.parse(workbench) } : {}) };
     } finally { request.dispose(); }
     if (!current()) return;
-    // Only the Codex composer opts explicit input into durable draft recovery.
+    // Codex and Pi composers opt run-bound input into durable draft recovery.
     // Other engines/groups retain their existing explicit-steering lifecycle.
     if ((attempt.mode || !ordinary && !!expectedTargetId) && connection.cache && !await connection.cache.updateOperationIfMatches(persistedKey, savedRaw, JSON.stringify(attempt))) throw new Error(t("另一窗口正在发送此消息，请核对回执后重试。"));
     if (!current()) return;

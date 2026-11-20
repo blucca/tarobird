@@ -4,7 +4,7 @@ import { useLayoutEffect, useRef, type ReactNode } from "react";
  * Measure actual space: an IME candidate bar, quote or attachment can all change
  * it independently of window.innerHeight. The menu itself never resizes its
  * anchor, so observing these boxes cannot create a menu/layout feedback loop. */
-export function ComposerSuggestions({ label, children }: { label: string; children: ReactNode }) {
+export function ComposerSuggestions({ label, children, piCommands }: { label: string; children: ReactNode; piCommands?: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const menu = ref.current;
@@ -42,5 +42,5 @@ export function ComposerSuggestions({ label, children }: { label: string; childr
   }, []);
   // Suppress compatibility mouse focus, not touchstart: swiping must still
   // scroll the suggestions, while choosing one must keep the keyboard open.
-  return <div ref={ref} className="command-menu" role="group" aria-label={label} onMouseDown={(event) => { if ((event.target as HTMLElement).closest("button")) event.preventDefault(); }}>{children}</div>;
+  return <div ref={ref} className={`command-menu${piCommands ? " pi-command-menu" : ""}`} role="group" aria-label={label} onMouseDown={(event) => { if ((event.target as HTMLElement).closest("button")) event.preventDefault(); }}>{children}</div>;
 }

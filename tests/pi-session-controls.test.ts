@@ -31,6 +31,7 @@ function bridgeFixture() {
   let binding = "native", current = true;
   const live = {
     token: "opaque_worker_generation", isCurrent: vi.fn(() => current), getState: vi.fn(async () => state),
+    listCommands: vi.fn(async () => [{ name: "lab:2", source: "extension", description: "Native command", filePath: "PRIVATE_SOURCE", scope: "project" }]),
     listModels: vi.fn(async () => [{ provider: "provider", id: "model", name: "Model", reasoning: true, apiKey: "MUST_NOT_LEAVE_HOST", baseUrl: "https://private.invalid" }]),
     setModel: vi.fn(async (_model: unknown, options: { isCurrent: () => Promise<boolean> }) => { if (!await options.isCurrent()) throw new PiNativeRejectedError("stale", "not-found"); return state; }),
     setThinkingLevel: vi.fn(async (_level: unknown, options: { isCurrent: () => Promise<boolean> }) => { if (!await options.isCurrent()) throw new PiNativeRejectedError("stale", "not-found"); return state; }),
@@ -43,6 +44,15 @@ function bridgeFixture() {
 }
 
 describe("Pi live session snapshots and mutation boundaries", () => {
+  it("exposes only current native command metadata without source paths or starting a worker", async () => {
+    const f = bridgeFixture();
+    const snapshot = await f.bridge.getPiSession(scope);
+    expect(snapshot.session?.commands).toEqual([{ name: "lab:2", source: "extension", description: "Native command" }]);
+    expect(JSON.stringify(snapshot)).not.toContain("PRIVATE_SOURCE");
+    expect(f.sessions.getOrCreateSession).not.toHaveBeenCalled();
+    f.live.listCommands.mockImplementation(async () => { f.bind("next"); return []; });
+    expect(await f.bridge.getPiSession(scope)).toEqual({ supported: true });
+  });
   it("clearing only thinking keeps an explicit conversation model", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "pi-controls-thinking-")); dirs.push(dir);
     const configPath = path.join(dir, "config.json");

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { piSessionCommandSchema } from "./pi-commands.js";
 
 /** Live conversation controls; these do not alter the Bot's defaults. */
 export const PI_SESSION_CAPABILITY = "pi.session.v1";
@@ -17,6 +18,7 @@ export const piSessionStateSchema = z.object({
   thinking: piSessionThinkingSchema,
   thinkingLevels: z.array(piSessionThinkingSchema).max(7),
   choices: z.array(z.object({ id: z.string().min(1).max(512), label: z.string().max(700), provider: z.string().max(512), modelId: z.string().max(512), efforts: z.array(z.union([z.literal(""), piSessionThinkingSchema])).max(8) }).strict()).max(5000),
+  commands: z.array(piSessionCommandSchema).max(2000).optional(),
   busy: z.boolean(),
   bridge: z.enum(["connected", "unavailable"]),
   ui: piSessionUiSchema,

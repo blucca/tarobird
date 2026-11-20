@@ -157,6 +157,7 @@ export interface PiNativeLiveSession {
   isCurrent(): boolean;
   getState(): Promise<PiNativeState>;
   listModels(): Promise<unknown[]>;
+  listCommands?(): Promise<PiNativeCommand[]>;
   /** `options.isCurrent` is awaited immediately before each native write. null drops the conversation's own choice. */
   setModel(model: PiModelRef | null, options: { isCurrent: () => Promise<boolean> }): Promise<PiNativeState>;
   setThinkingLevel(level: PiThinkingLevel | null, options: { isCurrent: () => Promise<boolean> }): Promise<PiNativeState>;

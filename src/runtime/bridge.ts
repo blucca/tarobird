@@ -1,3 +1,4 @@
+import { piSessionCommands } from "../client-protocol/pi-commands.js";
 import type { NativeInputAction, NativeInputCapability, NativeInputControlResult, NativeInputObserver } from "../client-protocol/native-input.js";
 import type { ClaudeNativeGoalUpdate } from "../codex/claude-native-goal.js";
 import type { SteeringApplication } from "../client-protocol/steering-outcome.js";
@@ -846,7 +847,7 @@ export class Bridge {
     };
     if (!await isCurrent()) return { supported: true };
     try {
-      const [state, models] = await Promise.all([live.getState(), live.listModels()]);
+      const [state, models, commands] = await Promise.all([live.getState(), live.listModels(), live.listCommands?.().catch(() => []) ?? []]);
       if (!await isCurrent() || state.sessionId !== session.sessionId) return { supported: true };
       const model = state.model ? encodePiModel(state.model.provider, state.model.modelId) : undefined;
       const snapshot = piSessionSnapshotSchema.safeParse({ supported: true, session: {
@@ -854,7 +855,7 @@ export class Bridge {
         ...(model && decodePiModel(model) ? { model } : {}),
         modelSource: state.modelSource, thinking: state.thinkingLevel, thinkingLevels: state.availableThinkingLevels,
         choices: parsePiModels(models).slice(0, 5000), busy: state.isStreaming || state.isCompacting,
-        bridge: state.bridge, ui: piUi(state),
+        bridge: state.bridge, ui: piUi(state), commands: piSessionCommands(commands),
       } });
       return snapshot.success ? snapshot.data : { supported: true };
     } catch { return { supported: true }; }

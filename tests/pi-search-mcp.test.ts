@@ -43,6 +43,15 @@ describe("collectPiSearchMcpEntries", () => {
     ]);
   });
 
+  it("reads a relative PI_CODING_AGENT_DIR from the workspace, where Pi runs, not from the Host's directory", async () => {
+    const { workspace } = await layout();
+    await mkdir(path.join(workspace, ".native-agent"), { recursive: true });
+    await writeFile(path.join(workspace, ".native-agent", "mcp.json"), JSON.stringify({ mcpServers: { relative: { command: "node" } } }));
+    expect(await collectPiSearchMcpEntries({ PI_CODING_AGENT_DIR: ".native-agent" }, workspace)).toEqual([
+      { name: "relative", server: { command: "node" }, disabled: false },
+    ]);
+  });
+
   it("treats missing files and files without servers as empty", async () => {
     const none = await layout();
     expect(await collectPiSearchMcpEntries(none.env, none.workspace)).toEqual([]);

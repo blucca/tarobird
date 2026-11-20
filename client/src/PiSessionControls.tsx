@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { PiSessionCommand } from "../../src/client-protocol/pi-commands.js";
 import { ChevronDown, Cpu } from "lucide-react";
 import { piSessionResultSchema, piSessionSnapshotSchema, type PiSessionChange, type PiSessionSnapshot } from "../../src/client-protocol/pi-session.js";
 import type { Bot, HubConnection } from "./connection.js";
@@ -21,8 +22,9 @@ function pendingFor(connection: HubConnection) {
 }
 
 /** Native conversation controls. Reading this panel cannot start a Pi worker. */
-export function PiSessionControls({ connection, conversationId, bot, owner, online, active, activity }: {
+export function PiSessionControls({ connection, conversationId, bot, owner, online, active, activity, onCommands }: {
   connection: HubConnection; conversationId: string; bot: Bot; owner: boolean; online: boolean; active: boolean; activity: string;
+  onCommands?: (conversationId: string, botId: string, commands: PiSessionCommand[]) => void;
 }) {
   useLocale();
   const [open, setOpen] = useState(false), [snapshot, setSnapshot] = useState<PiSessionSnapshot>();
@@ -34,6 +36,10 @@ export function PiSessionControls({ connection, conversationId, bot, owner, onli
   const scope = `${conversationId}:${bot.id}`, route = `/api/conversations/${conversationId}/pi-session`;
   const uncertain = pendingFor(connection).has(scope);
   const session = snapshot?.session;
+  useEffect(() => {
+    onCommands?.(conversationId, bot.id, active && owner && online && !stale ? session?.commands ?? [] : []);
+    return () => onCommands?.(conversationId, bot.id, []);
+  }, [onCommands, conversationId, bot.id, active, owner, online, stale, session?.commands]);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   useEffect(() => { if (!active || !owner) setOpen(false); }, [active, owner]);
   useEffect(() => {

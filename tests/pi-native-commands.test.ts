@@ -570,13 +570,16 @@ describe("Pi native commands: /fork, /clone, /new, /reload", () => {
 });
 
 describe("Pi native commands: /tree", () => {
-  it("shows user messages and labelled entries, newest first, with branch marks", async () => {
+  it("lists what Pi's tree lists by default (replies included), newest first, with branch marks", async () => {
     const h = harness();
     const { ask, asked } = cards([{ cancelled: true }]);
     await handled("/tree", context(h, { ask }));
     expect(asked[0].options).toEqual([
+      { label: "· other branch answer", description: "reply · other branch", value: "a2b" },
       { label: "· other branch question", description: "[kept idea] · other branch", value: "u2b" },
+      { label: "· second answer", description: "reply · current position", value: "a2" },
       { label: "· second question", description: "current branch", value: "u2" },
+      { label: "first answer", description: "reply · current branch", value: "a1" },
       { label: "first question", description: "current branch", value: "u1" },
     ]);
     expect(h.named("navigateTree")).toEqual([]);
@@ -616,10 +619,11 @@ describe("Pi native commands: /tree", () => {
   it("supports the text forms", async () => {
     const h = harness();
     const listing = (await handled("/tree", context(h))).text;
-    expect(listing).toContain("1. · other branch question ([kept idea] · other branch)");
-    expect(listing).toContain("3. first question (current branch)");
-    expect((await handled("/tree", context(h, { locale: "zh" }))).text).toContain("3. first question（当前分支）");
-    await handled("/tree 3", context(h));
+    expect(listing).toContain("2. · other branch question ([kept idea] · other branch)");
+    expect(listing).toContain("6. first question (current branch)");
+    expect((await handled("/tree", context(h, { locale: "zh" }))).text).toContain("6. first question（当前分支）");
+    expect((await handled("/tree", context(h, { locale: "zh" }))).text).toContain("5. first answer（回复 · 当前分支）");
+    await handled("/tree 6", context(h));
     await handled("/tree u2b summarize focus on the parser", context(h));
     expect(h.named("navigateTree").map(call => call[2])).toEqual([
       { targetId: "u1", summarize: false },
@@ -630,7 +634,7 @@ describe("Pi native commands: /tree", () => {
 
   it("sets and clears labels", async () => {
     const h = harness();
-    expect((await handled("/tree label 2 good start", context(h))).text).toBe("Label set: good start");
+    expect((await handled("/tree label 4 good start", context(h))).text).toBe("Label set: good start");
     expect((await handled("/tree label u2b", context(h))).text).toBe("Label removed.");
     expect(h.named("setLabel").map(call => call[2])).toEqual([{ entryId: "u2", label: "good start" }, { entryId: "u2b", label: null }]);
   });
@@ -638,17 +642,84 @@ describe("Pi native commands: /tree", () => {
   it("reports a cancelled navigation and an empty tree", async () => {
     const h = harness();
     h.navigate = { cancelled: true, leafId: "a2" };
-    expect((await handled("/tree 3", context(h))).text).toContain("Navigation was cancelled");
+    expect((await handled("/tree 6", context(h))).text).toContain("Navigation was cancelled");
     h.tree = { nodes: [], leafId: null };
     expect((await handled("/tree", context(h))).text).toContain("no entries");
   });
 
-  it("falls back to every entry when there are no user messages or labels", async () => {
+  it("keeps an empty filter result empty, as Pi does, and still takes an exact id", async () => {
     const h = harness();
-    h.tree = { leafId: "c1", nodes: [{ id: "c1", parentId: null, type: "model_change", preview: "", childIds: [] }] };
-    const { ask, asked } = cards([{ value: "c1" }]);
-    expect((await handled("/tree", context(h, { ask }))).text).toBe("Already at this point.");
-    expect(asked[0].options[0]).toEqual({ label: "model_change", description: "current position", value: "c1" });
+    h.tree = { leafId: "c1", nodes: [{ id: "c1", parentId: null, type: "model_change", preview: "", childIds: [] }, { id: "c0", parentId: null, type: "thinking_level_change", preview: "high", childIds: [] }] };
+    const { ask, asked } = cards([]);
+    expect((await handled("/tree", context(h, { ask }))).text).toContain('No entries match Pi\'s tree filter "default"');
+    expect(asked).toHaveLength(0);
+    expect((await handled("/tree c1", context(h))).text).toBe("Already at this point.");
+    await handled("/tree c0", context(h));
+    expect(h.named("navigateTree").map(call => call[2])).toEqual([{ targetId: "c0", summarize: false }]);
+    // labeled-only with no labels lists nothing either (root review).
+    const plain = harness();
+    for (const entry of plain.tree.nodes) delete entry.label;
+    const settings = async () => ({ treeFilterMode: "labeled-only", branchSummary: { skipPrompt: true } });
+    const listed = (await handled("/tree", context(plain, { readNativeSettings: settings }))).text;
+    expect(listed).not.toContain("first question");
+    await handled("/tree a1", context(plain, { readNativeSettings: settings }));
+    expect(plain.named("navigateTree").at(-1)![2]).toEqual({ targetId: "a1", summarize: false });
+  });
+
+  it("navigates to a reply and to any entry by its exact id, listed or not", async () => {
+    const h = harness();
+    h.tree.nodes.push({ id: "m1", parentId: "a2b", type: "model_change", preview: "fakeprov/plain-model", childIds: [] });
+    h.tree.nodes.find(node => node.id === "a2b")!.childIds.push("m1");
+    await handled("/tree 5", context(h));
+    await handled("/tree a1", context(h));
+    // Hidden from the default list as bookkeeping, still a point Pi can move to.
+    await handled("/tree m1", context(h));
+    expect(h.named("navigateTree").map(call => call[2])).toEqual([
+      { targetId: "a1", summarize: false }, { targetId: "a1", summarize: false }, { targetId: "m1", summarize: false },
+    ]);
+    expect((await handled("/tree label a1 answer kept", context(h))).text).toBe("Label set: answer kept");
+  });
+
+  it("hides a reply that only called tools unless it is the current position, and keeps a failed one", async () => {
+    const h = harness();
+    h.tree = { leafId: "a3", nodes: [
+      node("u1", null, "user", "run it", ["t1"]),
+      node("t1", "u1", "assistant", "", ["r1"]),
+      node("r1", "t1", "toolResult", "done", ["e1"]),
+      node("e1", "r1", "assistant", "[error] 429 rate limited", ["a3"]),
+      node("a3", "e1", "assistant", "", []),
+      { id: "use1", parentId: null, type: "usage", preview: "", childIds: [] },
+    ] };
+    const listed = (await handled("/tree", context(h))).text;
+    expect(listed).not.toMatch(/\bt1\b|use1/);
+    expect(listed).toContain("[error] 429 rate limited");
+    expect(listed).toContain("1. message (reply · current position)");
+    expect(listed).toContain("tool result");
+    expect((await handled("/tree use1", context(h))).text).toContain("not found");
+  });
+
+  it.each([
+    ["user-only", ["u2b", "u2", "u1"]],
+    ["labeled-only", ["u2b"]],
+    ["no-tools", ["a2b", "u2b", "a2", "u2", "a1", "u1"]],
+    ["nonsense", ["a2b", "u2b", "a2", "u2", "a1", "u1"]],
+  ])("follows Pi's treeFilterMode %s", async (mode, expected) => {
+    const h = harness();
+    const { ask, asked } = cards([{ cancelled: true }]);
+    await handled("/tree", context(h, { ask, readNativeSettings: async () => ({ treeFilterMode: mode }) }));
+    expect(asked[0].options.map(option => option.value)).toEqual(expected);
+  });
+
+  it("skips the summary question when Pi's branchSummary.skipPrompt is on, and uses defaults when settings cannot be read", async () => {
+    const h = harness();
+    const quiet = cards([{ value: "u1" }]);
+    await handled("/tree", context(h, { ask: quiet.ask, readNativeSettings: async () => ({ branchSummary: { skipPrompt: true } }) }));
+    expect(quiet.asked).toHaveLength(1);
+    expect(h.named("navigateTree").at(-1)![2]).toEqual({ targetId: "u1", summarize: false });
+    const failing = cards([{ value: "u1" }, { value: "yes" }]);
+    await handled("/tree", context(h, { ask: failing.ask, readNativeSettings: async () => { throw new Error("bridge gone"); } }));
+    expect(failing.asked).toHaveLength(2);
+    expect(h.named("navigateTree").at(-1)![2]).toEqual({ targetId: "u1", summarize: true });
   });
 });
 
@@ -761,7 +832,7 @@ describe("Pi native commands: failures and cancellation", () => {
   it("explains a busy session and a missing bridge", async () => {
     const h = harness();
     h.fail.navigateTree = new PiNativeBusyError("tree navigation");
-    expect((await handled("/tree 3", context(h))).text).toBe("The session is busy. /tree needs it idle; send it again when the current reply has finished.");
+    expect((await handled("/tree 6", context(h))).text).toBe("The session is busy. /tree needs it idle; send it again when the current reply has finished.");
     h.fail.reload = new PiNativeBridgeUnavailableError("reload");
     expect((await handled("/reload", context(h))).text).toBe("The TaroBird bridge is not connected for this session, so /reload cannot run.");
     h.fail.runUserBash = new PiNativeBusyError("bash");

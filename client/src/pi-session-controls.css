@@ -9,3 +9,8 @@
 .pi-extension-output h3 { margin: 0; font-size: 14px; }
 .pi-extension-output pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 @media (max-width: 600px) { .pi-session-panel input, .pi-session-panel select { font-size: 16px; min-height: 44px; } }
+
+/* Native extensions can register long names; keep their phone menu inside the composer. */
+.command-menu.pi-command-menu button { gap: 12px; }
+.command-menu.pi-command-menu strong { flex: 0 0 45%; min-width: 0; max-width: 45%; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.command-menu.pi-command-menu span { min-width: 0; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }

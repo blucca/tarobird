@@ -6,12 +6,17 @@ Pi is available for ordinary Bots, not Chancellor creation or conversion.
 Keep native session identity and provider/model pairs intact, and distinguish
 isolated RPC/browser evidence from installed-device acceptance. Native process,
 bridge, commands and state ownership are documented in the linked guide;
-`tests/pi-*.test.ts` and the three `client/e2e/pi-*.spec.ts` files cover this path.
+`tests/pi-*.test.ts` and the `client/e2e/pi-*.spec.ts` files cover this path.
 App and CLI use the same owner-authorized live-session route. Discovery with no
 workspace runs in an owner-only temporary directory and disables MCP startup;
 provider extensions remain available. A native control timeout fences that
 worker's later control writes, including Bot-default application; a status read
 cannot prove a late write was cancelled.
+Pi command discovery is scoped to an existing live session and never starts a
+worker. Native extension commands wait for an owned turn while busy; templates
+and skills retain native steering. Stop/settlement drains in-flight input before
+the last queue clear and returns the actual unconsumed text. See the Pi guide
+for terminal-only and independent-extension-run boundaries.
 
 [1.5.1 preflight](client/release-1.5.1-preflight.md) records shared Android
 channel versions, cross-host permissions, date refresh, mobile cleanup and the

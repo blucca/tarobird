@@ -15,11 +15,12 @@ import { DEFAULT_APPROVAL_MODE, normalizeApprovalMode } from "../state/approval-
 import { readValidatedConfigFile, resolveEngineOverride, type EngineOverride } from "../state/instance-config.js";
 import { prependPrivateTurnInstructions } from "./turn-instructions.js";
 import { PI_THINKING_LEVELS, decodePiModel, encodePiModel, parsePiModels, type PiThinkingLevel } from "./pi-models.js";
+import { PI_LIVE_COMMANDS } from "../client-protocol/pi-commands.js";
 import {
   PI_BRIDGE_COMMAND, openPiBridgeEndpoint, resolvePiBridgeExtensionPath,
   type PiBridgeConnection, type PiBridgeEndpoint, type PiBridgeEvent, type PiBridgeHandler, type PiBridgeToolOrigin,
 } from "./pi-bridge-host.js";
-import { runPiNativeCommand, type PiCommandAnswer, type PiCommandQuestion, type PiNativeCommandResult } from "./pi-native-commands.js";
+import { piBuiltinYieldsToSessionCommand, runPiNativeCommand, type PiCommandAnswer, type PiCommandQuestion, type PiNativeCommandResult } from "./pi-native-commands.js";
 import {
   PiNativeBridgeUnavailableError, PiNativeBusyError, PiNativeRejectedError, PiNativeUncertainError,
   type PiNativeBashResult, type PiNativeCommand, type PiNativeCompaction, type PiNativeControls, type PiNativeEvent,
@@ -29,7 +30,7 @@ import {
 import { PiRpcClient, PiRpcCommandError, PiStartupError, queryPiCatalog, type PiLaunchSpec, type PiSpawn } from "./pi-rpc-client.js";
 import {
   PI_TUI_BUILTIN_COMMANDS, classifyPiError, isPiPlaceholderModel, parsePiSlashCommand, samePiModel, sanitizePiErrorText, toPiModelRef,
-  type PiExtensionUiRequest, type PiModel, type PiModelRef, type PiPromptDisposition, type PiSessionEvent, type PiSessionState,
+  type PiAssistantMessage, type PiExtensionUiRequest, type PiModel, type PiModelRef, type PiPromptDisposition, type PiSessionEvent, type PiSessionState,
 } from "./pi-rpc-protocol.js";
 import { piManagedSearchServer, type PiManagedSearchServer } from "./pi-search-mcp.js";
 import { PiSessionStore, hasPiTrustGatedFiles, isSafePiSessionId, piBotDefaultFingerprint, type PiSessionRecord } from "./pi-session-store.js";
@@ -96,6 +97,23 @@ interface Turn {
   emitChain: Promise<void>;
   /** Open human waits; the inactivity timer does not run while the owner is deciding. */
   humanWaits: number;
+  /**
+   * Input this turn accepted while its run was going (live commands, `!`, steers). The turn ends
+   * only after each has been answered, so a reply joins this turn and nothing outlives it unseen.
+   */
+  readonly liveWork: Set<Promise<unknown>>;
+  /** Live commands and `!` run one after another, like input typed into Pi's own editor. */
+  liveChain: Promise<void>;
+  liveQueued: number;
+  /**
+   * The run's last reply needed no tools, so Pi is finishing: a steer arriving now is parked and
+   * then delivered into the next, unrelated run (observed on Pi 1.5.2, opus-probe o03).
+   */
+  wrappingUp: boolean;
+  /** Additions taken back from Pi's queue in this turn; the final answer says how many, never what. */
+  handedBack: number;
+  /** Pi could not confirm its queue at the end of this turn and the process was ended. */
+  queueUnconfirmed?: boolean;
   stopRequested: boolean;
   stopping?: Promise<void>;
   timedOut?: string;
@@ -138,7 +156,6 @@ interface Worker {
 
 const AUTO_ALLOWED_TOOLS: ReadonlySet<string> = new Set(["read", "grep", "find", "ls", "tool_search", "codemode"]);
 /** Built-ins that may run while a model run is in progress; the rest need an idle session. */
-const MID_RUN_COMMANDS: ReadonlySet<string> = new Set(["model", "thinking", "name", "session", "copy", "settings"]);
 const SESSION_GRANT_LIMIT = 128;
 /** The shared question card holds this much editor text; more would be cut, and the extension would get the cut text back as the edit. */
 const EDITOR_PREFILL_LIMIT = 16_000;
@@ -223,9 +240,14 @@ export class PiRpcAdapter implements CodexAdapter {
   }
 
   /**
-   * Input sent while a run is in progress. Ordinary text becomes a native
-   * steer. A terminal built-in (`/model`, `/thinking` …) is carried out at
-   * once, as in Pi's own UI, and never reaches the model as prose.
+   * Input sent while a run is in progress, handled as Pi's own editor does
+   * while streaming (interactive-mode.ts:3326-3510). A terminal built-in
+   * (`/model`, `/thinking` …) and `!`/`!!` are carried out at once and never
+   * reach the model as prose. Other text, including prompt templates and
+   * `/skill:` commands, becomes a native steer; Pi expands those itself.
+   *
+   * Every refusal here is decided before anything reaches Pi, or is Pi's own
+   * refusal, so the caller may queue the input as a new turn instead.
    */
   async steerActiveTurn(sessionId: string, input: { text: string; throwOnError?: boolean }): Promise<boolean> {
     this.assertUsable();
@@ -235,20 +257,144 @@ export class PiRpcAdapter implements CodexAdapter {
     };
     const worker = this.workers.get(sessionId), turn = worker?.turn;
     if (!worker || worker.closed || !turn || turn.stopRequested || turn.done.settled) return reject("stale");
+    const current = () => !worker.closed && worker.turn === turn && !turn.stopRequested && !turn.done.settled;
     // Idle Pi only parks a steer in its queue and never starts a run, so steering needs a live run.
     if (!turn.mapper.runStarted || turn.mapper.settled) return reject("not_ready");
-    const builtin = parsePiSlashCommand(input.text);
-    if (builtin && Object.hasOwn(PI_TUI_BUILTIN_COMMANDS, builtin.name)) {
-      await this.runCommandDuringRun(worker, turn, input.text, builtin.name);
-      return true;
+    // Pi's editor trims what was typed before it looks for a command (interactive-mode.ts:3327).
+    const text = input.text.trim();
+    if (!text) return reject("not_ready");
+    // `!` adds the output to the context and `!!` keeps it out; Pi runs either at once, even while streaming
+    // (interactive-mode.ts:3472-3486), and holds a streaming run's result until that run ends (agent-session.ts:4041-4060).
+    const bang = text.startsWith("!") && Boolean(text.slice(text.startsWith("!!") ? 2 : 1).trim());
+    const builtin = parsePiSlashCommand(text);
+    let sessionCommands: PiNativeCommand[] | undefined;
+    if (builtin && Object.hasOwn(PI_TUI_BUILTIN_COMMANDS, builtin.name) && piBuiltinYieldsToSessionCommand(builtin.name, builtin.args)) {
+      // `/session x` is not the built-in for Pi's editor; with an extension command or template of that name it is that one.
+      try { sessionCommands = await this.nativeCommands(worker); } catch { return reject("not_ready"); }
+      if (!current()) return reject("stale");
     }
+    const yields = Boolean(sessionCommands?.some(command => command.name === builtin!.name));
+    if (bang || (builtin && Object.hasOwn(PI_TUI_BUILTIN_COMMANDS, builtin.name) && !yields)) {
+      return this.admitLiveCommand(worker, turn, text, bang ? "!" : builtin!.name);
+    }
+    if (turn.wrappingUp) return reject("not_ready");
+    if (builtin) {
+      // A registered extension command cannot be steered (agent-session.ts:2435-2445). `prompt` would run it,
+      // but also after this run has ended and outside this turn (opus-probe o02-D), so it waits for a turn of its own.
+      let extension: boolean;
+      try {
+        extension = (sessionCommands ?? await this.nativeCommands(worker)).some(command => command.source === "extension" && command.name === builtin.name);
+      } catch { return reject("not_ready"); }
+      if (!current()) return reject("stale");
+      if (extension) return reject("unsupported");
+      if (turn.mapper.settled || turn.wrappingUp) return reject("not_ready");
+    }
+    const request = worker.client.request({ type: "steer", message: text }, { timeoutMs: 30_000 });
+    this.trackLive(turn, request);
     try {
-      const result = await worker.client.request({ type: "steer", message: input.text }, { timeoutMs: 30_000 });
+      const result = await request;
       return result.disposition === "queued" || result.disposition === "handled";
     } catch (error) {
+      // Pi answered and refused: nothing was queued.
+      if (error instanceof PiRpcCommandError) return reject("not_ready");
       if (input.throwOnError) throw error;
       return false;
     }
+  }
+
+  /**
+   * Accept a live command or `!` for this turn. It runs after the turn's
+   * earlier ones. The caller gets its answer once the command finished or is
+   * waiting for the owner or the shell, so a card or a long command never
+   * holds the request open.
+   */
+  private async admitLiveCommand(worker: Worker, turn: Turn, text: string, name: string): Promise<true> {
+    const admitted = deferred<void>();
+    // Queued behind another command, it is admitted already: the turn runs it, or a stop cancels it.
+    if (turn.liveQueued > 0) admitted.resolve();
+    turn.liveQueued++;
+    const work = turn.liveChain.then(() => this.runCommandDuringRun(worker, turn, text, name, () => admitted.resolve()))
+      .finally(() => { turn.liveQueued--; admitted.resolve(); });
+    turn.liveChain = work.catch(() => {});
+    this.trackLive(turn, work);
+    await Promise.race([work.catch(() => {}), admitted.promise]);
+    return true;
+  }
+
+  private trackLive(turn: Turn, work: Promise<unknown>): void {
+    const tracked = work.then(() => undefined, () => undefined);
+    turn.liveWork.add(tracked);
+    void tracked.then(() => { turn.liveWork.delete(tracked); });
+  }
+
+  /** Wait until everything accepted during the run has been answered; work accepted meanwhile is waited for too. */
+  private async drainLiveWork(turn: Turn): Promise<void> {
+    while (turn.liveWork.size) await Promise.all([...turn.liveWork]);
+  }
+
+  /**
+   * Pi still holds queued input although no run is going: it arrived after
+   * the run had finished. Pi would deliver it into the next, unrelated run,
+   * so it is taken back and returned to the owner instead.
+   */
+  private async handBackParked(turn: Turn): Promise<void> {
+    const worker = turn.worker;
+    if (worker.closed || !worker.client.isAlive) return;
+    let state: PiSessionState;
+    try { state = await this.refreshState(worker); } catch { await this.dropUnconfirmedQueue(turn); return; }
+    // A run that is going (an extension's own) owns its queue.
+    if (state.isStreaming || !state.pendingMessageCount) return;
+    let cleared: { steering: string[]; followUp: string[] };
+    try { cleared = await worker.client.request({ type: "clear_queue" }, { timeoutMs: 3_000 }); } catch { await this.dropUnconfirmedQueue(turn); return; }
+    worker.queue = { steering: [], followUp: [] };
+    this.publishState(worker);
+    await this.handBack(turn, cleared, "late");
+  }
+
+  private handBackNote(turn: Turn, locale: string): string | undefined {
+    const zh = locale === "zh", count = turn.handedBack;
+    const parts: string[] = [];
+    if (count > 0) parts.push(zh
+      ? `[Pi] 有 ${count} 条补充没有送达模型，已收回，全文见本轮运行过程，未自动重发。`
+      : `[Pi] ${count} ${count === 1 ? "addition" : "additions"} did not reach the model and ${count === 1 ? "was" : "were"} taken back. The full text is in this turn's run details; nothing was resent.`);
+    if (turn.queueUnconfirmed) parts.push(zh
+      ? "[Pi] Pi 没有确认是否还留有本轮的补充，已结束该 Pi 进程，未自动重发；请核对补充是否已被采纳。"
+      : "[Pi] Pi did not confirm whether additions from this turn were still pending, so its process was ended. Nothing was resent; check whether they were applied.");
+    return parts.length ? parts.join("\n") : undefined;
+  }
+
+  /**
+   * Pi did not confirm what it still holds. Its queue lives only in this
+   * process, so the process is ended: nothing can reach the next turn. This
+   * says what is known and does not claim the input was never applied.
+   */
+  private async dropUnconfirmedQueue(turn: Turn): Promise<void> {
+    const worker = turn.worker, zh = turn.input.locale === "zh";
+    turn.queueUnconfirmed = true;
+    await this.emit(turn, { type: "assistant_text", sessionId: worker.sessionId, text: zh
+      ? "[Pi] Pi 没有确认它是否还留有本轮的补充。为避免带入下一轮，已结束这个 Pi 进程（会话记录保留）。请核对本轮回复，确认补充是否已被采纳。"
+      : "[Pi] Pi did not confirm whether it still holds additions from this turn. To keep them out of the next turn, this Pi process was ended (the session history is kept). Check this turn's reply to see whether they were applied." });
+    await this.closeWorker(worker, { terminate: true });
+  }
+
+  /**
+   * Show undelivered queued input to the owner, in full, exactly as Pi's
+   * `clear_queue` reports it (a template or skill appears expanded, as Pi held
+   * it). It is never sent again on its own.
+   */
+  private async handBack(turn: Turn, cleared: { steering: string[]; followUp: string[] }, reason: "late" | "stopped"): Promise<void> {
+    const worker = turn.worker;
+    const texts = [...cleared.steering, ...cleared.followUp].filter(text => text.trim());
+    if (!texts.length) return;
+    turn.handedBack += texts.length;
+    const zh = turn.input.locale === "zh";
+    const shown = texts.map(text => `- ${text}`).join("\n");
+    const head = reason === "stopped"
+      ? zh ? "[Pi] 停止时这些补充还没有送达模型，已收回，不会自动重发：" : "[Pi] These additions had not reached the model when the turn stopped. They were taken back and will not be sent again automatically:"
+      : zh ? "[Pi] 这些补充在本轮回复结束后才到达，没有送达模型，已收回，不会自动重发：" : "[Pi] These additions arrived after the reply had finished and did not reach the model. They were taken back and will not be sent again automatically:";
+    worker.ui.editorText = { text: texts.join("\n\n"), revision: ++worker.editorRevision };
+    this.publish(worker.sessionId, { type: "editor_text", text: texts.join("\n\n") });
+    await this.emit(turn, { type: "assistant_text", text: `${head}\n${shown}`, sessionId: worker.sessionId });
   }
 
   async validateExternalSession(sessionId: string, input: { workspaceOverride?: string } = {}): Promise<ExternalSessionInfo> {
@@ -299,7 +445,8 @@ export class PiRpcAdapter implements CodexAdapter {
       await this.emit(turn, { type: "session", sessionId: turn.worker.sessionId });
       this.flushBacklog(turn);
 
-      const text = input.text;
+      // Pi's editor trims before it looks for `/` or `!` (interactive-mode.ts:3327).
+      const text = input.text.trim();
       if (input.files.length === 0 && (text.startsWith("/") || text.startsWith("!"))) {
         const handled = await this.unlessStopped(turn, this.runNativeCommand(turn, text, runtime.gate));
         if (handled.handled) {
@@ -340,6 +487,7 @@ export class PiRpcAdapter implements CodexAdapter {
     const turn: Turn = {
       worker, input, mapper: new PiTurnMapper(worker.sessionId), scope: new AbortController(), done: deferred<void>(), stopped: deferred<void>(),
       notices: [], emitChain: Promise.resolve(), humanWaits: 0, stopRequested: false,
+      liveWork: new Set(), liveChain: Promise.resolve(), liveQueued: 0, wrappingUp: false, handedBack: 0,
     };
     worker.turn = turn;
     worker.lastUsedAt = Date.now();
@@ -412,22 +560,38 @@ export class PiRpcAdapter implements CodexAdapter {
       approvalMode: gate ? "normal" : "bypass",
       ...(input.onApprovalRequest ? { ask: question => this.askCommandQuestion(turn, question), approveBash: command => this.approveUserBash(turn, command) } : {}),
       ...(input.requestOutputDir ? { outputDir: input.requestOutputDir } : {}),
+      // Pi's effective settings through the bridge (`pi.getSettings()`); credentials live elsewhere and are never read.
+      ...(worker.bridge?.isOpen ? { readNativeSettings: () => worker.bridge!.readSettings() } : {}),
       abortSignal: turn.scope.signal,
     });
   }
 
-  /** A built-in typed while the model is running. Its reply joins the running turn's stream. */
-  private async runCommandDuringRun(worker: Worker, turn: Turn, text: string, name: string): Promise<void> {
+  /**
+   * A built-in or `!` typed while the model is running. Its reply joins the
+   * running turn's stream; the turn does not end before it. `onAdmitted` is
+   * called when the command starts waiting for the owner or the shell.
+   *
+   * `!` keeps the idle path's rules: Normal mode asks each time and is
+   * refused when nobody can be asked; the command goes to the session it was
+   * typed for (a replaced session is not found, never substituted), is sent
+   * once, and has no deadline that could lead to sending it again.
+   */
+  private async runCommandDuringRun(worker: Worker, turn: Turn, text: string, name: string, onAdmitted: () => void = () => {}): Promise<void> {
     const zh = turn.input.locale === "zh";
     let reply: string;
-    if (PI_TUI_BUILTIN_COMMANDS[name] !== "terminal" && !MID_RUN_COMMANDS.has(name)) {
+    if (name !== "!" && PI_TUI_BUILTIN_COMMANDS[name] !== "terminal" && !PI_LIVE_COMMANDS.has(name)) {
       reply = zh ? `/${name} 需要等当前回复结束后再执行。` : `/${name} can run once the current reply has finished.`;
     } else {
       try {
+        const sessionId = worker.sessionId;
+        const controls: PiNativeControls = { ...this.piNative, runUserBash: (id, bash) => { onAdmitted(); return this.piNative.runUserBash(id, bash); } };
         const result = await runPiNativeCommand(text, {
-          sessionId: worker.sessionId, controls: this.piNative, locale: turn.input.locale ?? "en",
+          sessionId, controls, locale: turn.input.locale ?? "en",
           approvalMode: worker.gate === false ? "bypass" : "normal",
-          ...(turn.input.onApprovalRequest ? { ask: question => this.askCommandQuestion(turn, question) } : {}),
+          ...(turn.input.onApprovalRequest ? {
+            ask: question => { onAdmitted(); return this.askCommandQuestion(turn, question); },
+            approveBash: command => { onAdmitted(); return this.approveUserBash(turn, command); },
+          } : {}),
           abortSignal: turn.scope.signal,
         });
         reply = result.handled ? result.text : "";
@@ -435,12 +599,15 @@ export class PiRpcAdapter implements CodexAdapter {
         reply = sanitizePiErrorText(error instanceof Error ? error.message : String(error));
       }
     }
-    if (reply && !turn.done.settled) await this.emit(turn, { type: "assistant_text", text: reply, sessionId: worker.sessionId });
+    // A stopped turn reports its own outcome; anything else is still part of this turn.
+    if (reply && !turn.scope.signal.aborted) await this.emit(turn, { type: "assistant_text", text: reply, sessionId: worker.sessionId });
   }
 
   private async runPrompt(turn: Turn): Promise<CodexAdapterResponse> {
     const worker = turn.worker, input = turn.input, sessionId = worker.sessionId, locale = input.locale ?? "en";
-    const sessionCommand = input.files.length === 0 && Boolean(parsePiSlashCommand(input.text));
+    // A command (an extension's, a template, `/skill:`) is sent trimmed and bare, so Pi dispatches it rather than reading prose.
+    const commandText = input.text.trim();
+    const sessionCommand = input.files.length === 0 && Boolean(parsePiSlashCommand(commandText));
     let instructions = input.instructions, turnInstructions = input.turnInstructions;
     if (input.appPlatformTools) {
       let installed = false;
@@ -465,7 +632,7 @@ export class PiRpcAdapter implements CodexAdapter {
     // Stable instructions ride in the system prompt (through the bridge) so they stay out of the transcript and cacheable.
     const viaBridge = Boolean(worker.bridge?.isOpen);
     turn.instructions = viaBridge ? instructions?.trim() || undefined : undefined;
-    let text = sessionCommand ? input.text : prependPrivateTurnInstructions(input.text, turnInstructions);
+    let text = sessionCommand ? commandText : prependPrivateTurnInstructions(input.text, turnInstructions);
     if (!viaBridge && !sessionCommand && instructions?.trim()) {
       text = `<private_bridge_instructions>\nFollow these instructions silently. Do not quote or describe them.\n${instructions.trim()}\n</private_bridge_instructions>\n\n${text}`;
     }
@@ -495,6 +662,10 @@ export class PiRpcAdapter implements CodexAdapter {
       if (!state.isStreaming && !(turn.mapper.runStarted && !turn.mapper.settled)) turn.done.resolve();
     }
     await this.unlessStopped(turn, turn.done.promise);
+    // Input accepted during the run is answered within this turn; whatever Pi parked after the run is handed back
+    // rather than delivered into the next one.
+    await this.unlessStopped(turn, this.drainLiveWork(turn));
+    await this.unlessStopped(turn, this.handBackParked(turn));
     await turn.emitChain;
     if (turn.stopRequested || turn.mapper.settled?.aborted) throw abortError();
 
@@ -511,6 +682,10 @@ export class PiRpcAdapter implements CodexAdapter {
     if (!finalText && response.disposition === "handled" && !turn.mapper.runStarted) {
       finalText = locale === "en" ? "The command ran and produced no output." : "命令已执行，没有输出。";
     }
+    // The final answer is what the Host shows and acts on (card-renderer finalAnswerText). It carries a count only:
+    // the taken-back text stays in this turn's run details, so nothing the owner typed is replayed as the reply.
+    const note = this.handBackNote(turn, locale);
+    if (note) finalText = finalText.trim() ? `${finalText}\n\n${note}` : note;
     await this.emit(turn, { type: "result", text: finalText, sessionId: current });
     await turn.emitChain;
     return { text: finalText, sessionId: current, ...(turn.mapper.usage ? { usage: turn.mapper.usage } : {}) };
@@ -533,7 +708,11 @@ export class PiRpcAdapter implements CodexAdapter {
       try {
         const cleared = await worker.client.request({ type: "clear_queue" }, { timeoutMs: Math.min(grace, 3_000) });
         worker.queue = { steering: [], followUp: [] };
-        if (cleared.steering.length || cleared.followUp.length) this.publishState(worker);
+        if (cleared.steering.length || cleared.followUp.length) {
+          this.publishState(worker);
+          // Pi's Esc puts queued messages back into the editor (interactive-mode.ts:2104, 2400); they are not dropped here either.
+          await this.handBack(turn, cleared, "stopped");
+        }
       } catch { /* the abort below still applies */ }
       // `abort` also cancels a retry wait, a compaction and a branch summary.
       const abort = () => worker.client.request({ type: "abort" }, { timeoutMs: grace }).then(() => true, () => false);
@@ -548,6 +727,24 @@ export class PiRpcAdapter implements CodexAdapter {
       if (running && (await within(turn.done.promise.then(() => true, () => true))) === undefined) {
         // The process is gone after this, so the stop is confirmed either way.
         await this.closeWorker(worker, { terminate: true });
+        turn.done.resolve();
+        return;
+      }
+      // A steer still in flight can be queued after the first clear (an input hook may take its time).
+      // Wait for every answer, then clear once more; whatever cannot be settled ends the process instead.
+      if (turn.liveWork.size && !worker.closed) {
+        const settled = await Promise.race([this.drainLiveWork(turn).then(() => true), sleep(grace).then(() => false)]);
+        if (!settled) { await this.closeWorker(worker, { terminate: true }); turn.done.resolve(); return; }
+      }
+      if (!worker.closed && worker.client.isAlive) {
+        try {
+          const late = await worker.client.request({ type: "clear_queue" }, { timeoutMs: Math.min(grace, 3_000) });
+          worker.queue = { steering: [], followUp: [] };
+          if (late.steering.length || late.followUp.length) { this.publishState(worker); await this.handBack(turn, late, "stopped"); }
+        } catch {
+          // Refused or unanswered, the queue was not cleared, and it lives only in this process: end it, say so, resend nothing.
+          await this.dropUnconfirmedQueue(turn);
+        }
       }
       turn.done.resolve();
     })();
@@ -569,6 +766,9 @@ export class PiRpcAdapter implements CodexAdapter {
     }
     if (!turn) return;
     this.noteActivity(turn);
+    // A reply that ends without tool calls is the last one unless Pi continues (a queued message, a retry, an extension).
+    if (event.type === "message_end" && event.message.role === "assistant") turn.wrappingUp = (event.message as PiAssistantMessage).stopReason !== "toolUse";
+    else if (event.type === "agent_start" || event.type === "turn_start" || (event.type === "message_start" && event.message.role === "assistant")) turn.wrappingUp = false;
     for (const mapped of turn.mapper.apply(event)) void this.emit(turn, mapped);
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") turn.input.onProgress?.(turn.mapper.currentText);
     if (event.type === "agent_settled") turn.done.resolve();
@@ -1070,11 +1270,21 @@ export class PiRpcAdapter implements CodexAdapter {
     await scope.record({ botDefaultThinking: undefined, thinkingBeforeBotDefault: undefined });
   }
 
+  /** Pi's own `get_commands` for this process. Names are Pi's invocation names (a duplicate gets `name:2`, runner.ts:839-849). */
+  private async nativeCommands(worker: Worker): Promise<PiNativeCommand[]> {
+    const { commands } = await worker.client.request({ type: "get_commands" });
+    return commands.filter(command => command.name !== PI_BRIDGE_COMMAND && (command.source === "extension" || command.source === "prompt" || command.source === "skill"))
+      .map((command): PiNativeCommand => ({
+        name: command.name, source: command.source as PiNativeCommand["source"],
+        ...(command.description ? { description: command.description } : {}), ...(command.sourceInfo?.scope ? { scope: command.sourceInfo.scope } : {}),
+      }));
+  }
+
   private liveSession(sessionId: string): PiNativeLiveSession | undefined {
     const worker = this.workers.get(sessionId);
     if (this.destroyed || !worker || worker.closed || !worker.client.isAlive) return;
-    const token = worker.token;
-    const isCurrent = () => !this.destroyed && !worker.closed && worker.client.isAlive && worker.token === token
+    const token = worker.token, generation = worker.generation;
+    const isCurrent = () => !this.destroyed && !worker.closed && worker.client.isAlive && worker.token === token && worker.generation === generation
       && worker.sessionId === sessionId && this.workers.get(sessionId) === worker;
     const stale = () => new PiNativeRejectedError("The Pi session this control was opened for is no longer current; nothing was changed", "not-found");
     const guard = () => { if (!isCurrent()) throw stale(); };
@@ -1089,6 +1299,9 @@ export class PiRpcAdapter implements CodexAdapter {
       token, isCurrent,
       getState: () => read(async () => { await this.refreshState(worker); guard(); return this.describeState(worker); }),
       listModels: () => read(async () => (await worker.client.request({ type: "get_available_models" })).models),
+      // The extension, prompt-template and skill commands of this very process and session generation.
+      // Asked of this worker only: a handle never starts, restarts or substitutes a process.
+      listCommands: () => read(() => this.nativeCommands(worker)),
       setModel: (model, options) => write({ model }, options),
       setThinkingLevel: (level, options) => write({ thinking: level }, options),
     };
@@ -1456,14 +1669,7 @@ export class PiRpcAdapter implements CodexAdapter {
       getLiveSession: sessionId => this.liveSession(sessionId),
       getState: async sessionId => { const worker = await this.live(sessionId); await this.refreshState(worker); return this.describeState(worker); },
       listModels: async sessionId => (await (await this.live(sessionId)).client.request({ type: "get_available_models" })).models,
-      listCommands: async sessionId => {
-        const { commands } = await (await this.live(sessionId)).client.request({ type: "get_commands" });
-        return commands.filter(command => command.name !== PI_BRIDGE_COMMAND && (command.source === "extension" || command.source === "prompt" || command.source === "skill"))
-          .map((command): PiNativeCommand => ({
-            name: command.name, source: command.source as PiNativeCommand["source"],
-            ...(command.description ? { description: command.description } : {}), ...(command.sourceInfo?.scope ? { scope: command.sourceInfo.scope } : {}),
-          }));
-      },
+      listCommands: async sessionId => this.nativeCommands(await this.live(sessionId)),
       getStats: async sessionId => {
         const worker = await this.live(sessionId);
         const stats = await worker.client.request({ type: "get_session_stats" });

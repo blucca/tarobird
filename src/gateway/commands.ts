@@ -1,5 +1,6 @@
 import { CORE_SLASH_COMMANDS } from "../core/slash-command-registry.js";
 import { GatewayGroupModeStore, gatewayRequiresMention } from "./group-mode.js";
+import { PI_APP_COMMANDS } from "./pi-commands.js";
 
 /** Every canonical TaroCub command has an explicit client disposition. The
  * inventory test rejects new registry entries until their semantics are reviewed. */
@@ -16,7 +17,7 @@ export const GATEWAY_COMMAND_POLICIES: Readonly<Record<string, "shared" | "nativ
 };
 
 export function gatewayCommands(engine: string, query = "") {
-  return CORE_SLASH_COMMANDS.filter(({ command }) =>
+  const shared = CORE_SLASH_COMMANDS.filter(({ command }) =>
     (GATEWAY_COMMAND_POLICIES[command] === "shared" || command === "group")
     && (command !== "fast" || engine === "codex")
     && (command !== "ultrareview" || engine === "claude")
@@ -31,6 +32,12 @@ export function gatewayCommands(engine: string, query = "") {
         },
       },
     });
+  if (engine !== "pi") return shared;
+  const native = new Map(PI_APP_COMMANDS.map(command => [command.command, command]));
+  const names = new Set(shared.map(command => command.command));
+  return [...shared.map(command => native.get(command.command) ?? command),
+    ...PI_APP_COMMANDS.filter(command => !names.has(command.command)
+      && command.command.startsWith(query.replace(/^\//, "").toLowerCase()))];
 }
 
 /** Hub membership owns access; only this Bot/conversation's reply policy changes.
@@ -86,7 +93,10 @@ export function renderGatewayHelp(engine: string, locale: "en" | "zh"): string {
       ? "Messages, files, replies and card actions sync across paired devices. Add text to pictures, files or voice recordings before sending. Quote and forward from the message menu."
       : "消息、文件、回复和卡片操作会同步到已配对设备。图片、文件和录音都可附文字一起发送；消息菜单支持引用和转发。",
     ...gatewayCommands(engine).map(({ command, description }) => `- \`/${command}\` — ${english ? description.defaultValue : description.i18n.zh_cn}`),
-    english
+    engine === "pi" ? english
+      ? "Pi model and thinking commands apply to the current conversation; Bot defaults remain separate. While Pi is replying, plain-text Send supplements that task; choose Next turn to use the Host queue. If the task can no longer receive input and delivery is definitely rejected, the unchanged message goes to the next turn; uncertain delivery is never resent automatically. Extension commands wait for their own turn; templates and skills can supplement the current task. Use Pi conversation settings to adjust the live model. Login, logout and terminal-only actions explain their native terminal route."
+      : "Pi 的模型和思考强度命令只调整当前对话，Bot 默认设置另行管理。回复中发送纯文字会补充当前任务；选择「下一轮」进入主机队列。任务已不能接收补充且确认未送达时，未改动的消息会转到下一轮；结果待确认时不会自动重发。扩展命令会单独排队执行；模板和技能可补充当前任务。「Pi 对话设置」可调整运行中的模型。登录、退出登录和终端专属操作会说明原生终端入口。"
+      : english
       ? "Send queues a separate turn while a task is running. Use Steer for a plain-text instruction to the current task; Codex app-server and DeepSeek Harness integrations support this. The App does not apply the automatic /steer window. Engine-specific unsupported operations explain their limits. Engine changes require an idle restart from Operations."
       : "任务执行中，普通发送会排队另起一轮。点击「引导」将纯文字补充给当前任务；Codex app-server／DeepSeek Harness 接入支持此操作。App 不使用 /steer 自动引导窗口。不支持的引擎能力会明确说明。切换引擎后，在「运行状态」安排空闲后重启。",
     english

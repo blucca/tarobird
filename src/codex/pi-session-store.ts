@@ -3,6 +3,7 @@ import { createReadStream } from "node:fs";
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { PiModelSource } from "./pi-native-types.js";
 import type { PiModelRef } from "./pi-rpc-protocol.js";
 
@@ -68,9 +69,62 @@ export function piNativeSessionDir(cwd: string, agentDir: string): string {
   return path.join(path.resolve(agentDir), "sessions", safe);
 }
 
-export function piAgentDir(env: NodeJS.ProcessEnv, homeDir = os.homedir()): string {
+/**
+ * Pi's `normalizePath` for a configured directory (utils/paths.ts:120-145): `~`, `~/…` (and `~\…` on
+ * Windows) and `file://` URLs. Anything else, relative paths included, is left as written.
+ */
+export function expandPiPath(value: string, homeDir = os.homedir()): string {
+  if (value === "~") return homeDir;
+  if (value.startsWith("~/") || (process.platform === "win32" && value.startsWith("~\\"))) return path.join(homeDir, value.slice(2));
+  if (/^file:\/\//.test(value)) { try { return fileURLToPath(value); } catch { return value; } }
+  return value;
+}
+
+/**
+ * Pi's `getAgentDir` (config.ts:630-636): `PI_CODING_AGENT_DIR` with `~` expanded, or `~/.pi/agent`.
+ * Pi resolves a relative value from its own working directory, which is the workspace it runs in, so pass
+ * that as `cwd`; the Host's own directory is never the answer.
+ */
+export function piAgentDir(env: NodeJS.ProcessEnv, homeDir = os.homedir(), cwd?: string): string {
   const override = env.PI_CODING_AGENT_DIR?.trim();
-  return override ? path.resolve(override) : path.join(homeDir, ".pi", "agent");
+  if (!override) return path.join(homeDir, ".pi", "agent");
+  const expanded = expandPiPath(override, homeDir);
+  return cwd ? path.resolve(cwd, expanded) : path.resolve(expanded);
+}
+
+const SETTINGS_MAX_BYTES = 1024 * 1024;
+
+/** One Pi settings file as Pi loads it: missing, oversized or unparsable is `{}` (settings-manager.ts:366-394). Only this file is read. */
+async function readPiSettingsFile(file: string): Promise<Record<string, unknown>> {
+  try {
+    const info = await stat(file);
+    if (!info.isFile() || info.size > SETTINGS_MAX_BYTES) return {};
+    const parsed: unknown = JSON.parse((await readFile(file, "utf8")).replace(/^\uFEFF/, ""));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch { return {}; }
+}
+
+/**
+ * Where Pi itself keeps the sessions it starts in `cwd` (main.ts:739-744, session-manager.ts:1766-1769):
+ * `PI_CODING_AGENT_SESSION_DIR`, else `sessionDir` from the global settings overridden by the project's
+ * `.pi/settings.json` (deep merge, project wins; the startup lookup reads the project file whether or not it
+ * is trusted), else the per-workspace default. A configured directory is flat and shared by every
+ * workspace; `~` is expanded and a relative path is taken from `cwd`, where Pi runs. No credential file is read.
+ */
+export async function piNativeSessionDirFor(cwd: string, env: NodeJS.ProcessEnv, homeDir = os.homedir()): Promise<string> {
+  const resolvedCwd = path.resolve(cwd);
+  const fromEnv = env.PI_CODING_AGENT_SESSION_DIR?.trim();
+  if (fromEnv) return path.resolve(resolvedCwd, expandPiPath(fromEnv, homeDir));
+  const agentDir = piAgentDir(env, homeDir, resolvedCwd);
+  const [global, project] = await Promise.all([
+    readPiSettingsFile(path.join(agentDir, "settings.json")),
+    readPiSettingsFile(path.join(resolvedCwd, ".pi", "settings.json")),
+  ]);
+  // deepMergeObjects skips only undefined, which JSON cannot hold: any project value, null included, wins.
+  const merged = Object.hasOwn(project, "sessionDir") ? project.sessionDir : global.sessionDir;
+  // getSessionDir: an empty value means the default; a non-string would not start Pi at all, so it is not followed.
+  if (typeof merged === "string" && merged) return path.resolve(resolvedCwd, expandPiPath(merged, homeDir));
+  return piNativeSessionDir(resolvedCwd, agentDir);
 }
 
 export function piBotDefaultFingerprint(model: string | undefined, effort: string | undefined): string {
@@ -137,10 +191,9 @@ export class PiSessionStore {
     await mkdir(this.sessionDir, { recursive: true, mode: 0o700 });
   }
 
-  /** Pi's own session directory for a workspace; honours the native relocation variables. */
-  nativeSessionDir(cwd: string): string {
-    const flat = this.options.childEnv.PI_CODING_AGENT_SESSION_DIR?.trim();
-    return flat ? path.resolve(flat) : piNativeSessionDir(cwd, piAgentDir(this.options.childEnv, this.options.homeDir));
+  /** Pi's own session directory for a workspace, resolved as Pi resolves it (see `piNativeSessionDirFor`). */
+  nativeSessionDir(cwd: string): Promise<string> {
+    return piNativeSessionDirFor(cwd, this.options.childEnv, this.options.homeDir);
   }
 
   /** Read and validate a session header. Undefined when the file is not a Pi session. */
@@ -202,7 +255,7 @@ export class PiSessionStore {
       if (found) return found;
     }
     if (cwd) {
-      for (const file of (await this.sessionFilesIn(this.nativeSessionDir(cwd))).filter(name => name.endsWith(suffix))) {
+      for (const file of (await this.sessionFilesIn(await this.nativeSessionDir(cwd))).filter(name => name.endsWith(suffix))) {
         const found = await check(file, "native");
         if (found) return found;
       }
@@ -214,7 +267,7 @@ export class PiSessionStore {
   async list(input: { cwd: string; limit?: number }): Promise<PiSessionFile[]> {
     const cwd = path.resolve(input.cwd), limit = Math.max(1, Math.min(input.limit ?? 50, 500));
     const candidates: Array<{ file: string; origin: PiSessionFile["origin"]; mtime: number }> = [];
-    for (const [dir, origin] of [[this.sessionDir, "bot"], [this.nativeSessionDir(cwd), "native"]] as const) {
+    for (const [dir, origin] of [[this.sessionDir, "bot"], [await this.nativeSessionDir(cwd), "native"]] as const) {
       for (const file of await this.sessionFilesIn(dir)) {
         try { candidates.push({ file, origin, mtime: (await stat(file)).mtimeMs }); } catch { /* removed meanwhile */ }
       }

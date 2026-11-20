@@ -5,8 +5,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  PI_TRUST_GATED_PATHS, PiSessionStore, hasPiTrustGatedFiles, isSafePiSessionId, piAgentDir, piBotDefaultFingerprint,
-  piNativeSessionDir,
+  PI_TRUST_GATED_PATHS, PiSessionStore, expandPiPath, hasPiTrustGatedFiles, isSafePiSessionId, piAgentDir, piBotDefaultFingerprint,
+  piNativeSessionDir, piNativeSessionDirFor,
 } from "../src/codex/pi-session-store.js";
 
 const roots: string[] = [];
@@ -72,9 +72,74 @@ describe("Pi session locations", () => {
 
   it("follows Pi's session directory relocation variable", async () => {
     const { make, cwd, agentDir, root } = await scratch();
-    expect(make().nativeSessionDir(cwd)).toBe(piNativeSessionDir(cwd, agentDir));
+    expect(await make().nativeSessionDir(cwd)).toBe(piNativeSessionDir(cwd, agentDir));
     const flat = path.join(root, "flat-sessions");
-    expect(make({ PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: ` ${flat} ` }).nativeSessionDir(cwd)).toBe(flat);
+    expect(await make({ PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: ` ${flat} ` }).nativeSessionDir(cwd)).toBe(flat);
+  });
+
+  it("expands `~` and file URLs as Pi's normalizePath does, and leaves relative paths for the caller's cwd", async () => {
+    const home = "/synthetic/account";
+    expect(expandPiPath("~", home)).toBe(home);
+    expect(expandPiPath("~/pi/sessions", home)).toBe(path.join(home, "pi/sessions"));
+    expect(expandPiPath("~other/x", home)).toBe("~other/x");
+    expect(expandPiPath("file:///synthetic/x", home)).toBe("/synthetic/x");
+    expect(expandPiPath("rel/dir", home)).toBe("rel/dir");
+    expect(piAgentDir({ PI_CODING_AGENT_DIR: "~/custom-agent" }, home)).toBe(path.join(home, "custom-agent"));
+    // Pi runs in the workspace, so a relative variable is read from there, not from the Host's own directory.
+    expect(await piNativeSessionDirFor("/synthetic/ws", { PI_CODING_AGENT_DIR: "/synthetic/agent", PI_CODING_AGENT_SESSION_DIR: "~/flat" }, home)).toBe(path.join(home, "flat"));
+    expect(await piNativeSessionDirFor("/synthetic/ws", { PI_CODING_AGENT_DIR: "/synthetic/agent", PI_CODING_AGENT_SESSION_DIR: "rel/flat" }, home)).toBe("/synthetic/ws/rel/flat");
+  });
+
+  it("reads a relative PI_CODING_AGENT_DIR from the workspace Pi runs in, never from the Host's own directory", async () => {
+    const { root } = await scratch();
+    const cwd = path.join(root, "project"), agentDir = path.join(cwd, ".native-agent");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ sessionDir: "native-sessions" }));
+    const env = { PI_CODING_AGENT_DIR: ".native-agent" };
+    expect(piAgentDir(env, "/synthetic/account", cwd)).toBe(agentDir);
+    expect(await piNativeSessionDirFor(cwd, env, "/synthetic/account")).toBe(path.join(cwd, "native-sessions"));
+    await rm(path.join(agentDir, "settings.json"));
+    expect(await piNativeSessionDirFor(cwd, env, "/synthetic/account")).toBe(piNativeSessionDir(cwd, agentDir));
+  });
+
+  it("uses `sessionDir` from Pi's settings: the project file over the global one, as Pi merges them", async () => {
+    const { make, cwd, agentDir, root } = await scratch();
+    const home = path.join(root, "account");
+    const settings = async (file: string, value: unknown) => { await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, typeof value === "string" ? value : JSON.stringify(value)); };
+    const globalFile = path.join(agentDir, "settings.json"), projectFile = path.join(cwd, ".pi", "settings.json");
+    await settings(globalFile, { sessionDir: "~/global-sessions", defaultModel: "x" });
+    expect(await make().nativeSessionDir(cwd)).toBe(path.join(home, "global-sessions"));
+    await settings(projectFile, { sessionDir: "local-sessions" });
+    expect(await make().nativeSessionDir(cwd)).toBe(path.join(cwd, "local-sessions"));
+    // Any project value replaces the global one; an empty or null value means Pi's default directory.
+    await settings(projectFile, { sessionDir: null });
+    expect(await make().nativeSessionDir(cwd)).toBe(piNativeSessionDir(cwd, agentDir));
+    await settings(projectFile, { sessionDir: "" });
+    expect(await make().nativeSessionDir(cwd)).toBe(piNativeSessionDir(cwd, agentDir));
+    // A project file Pi cannot parse counts as empty, so the global value applies again; a BOM is tolerated.
+    await settings(projectFile, "{ not json");
+    expect(await make().nativeSessionDir(cwd)).toBe(path.join(home, "global-sessions"));
+    await settings(projectFile, `\uFEFF${JSON.stringify({ sessionDir: "/synthetic/abs-sessions" })}`);
+    expect(await make().nativeSessionDir(cwd)).toBe("/synthetic/abs-sessions");
+    await settings(projectFile, { sessionDir: 42 });
+    expect(await make().nativeSessionDir(cwd)).toBe(piNativeSessionDir(cwd, agentDir));
+    // The variable still wins over both files.
+    expect(await make({ PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: "/synthetic/env" }).nativeSessionDir(cwd)).toBe("/synthetic/env");
+  });
+
+  it("lists and finds terminal sessions in a settings-configured directory, only for this workspace", async () => {
+    const { make, cwd, agentDir, root } = await scratch();
+    const shared = path.join(root, "shared-sessions");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ sessionDir: shared }));
+    const store = make();
+    const mine = await writeSession(shared, "terminal-here", cwd, [nameEntry("Here")], { mtime: 2_000 });
+    await writeSession(shared, "terminal-other", path.join(root, "other-workspace"), [], { mtime: 3_000 });
+    const listed = await store.list({ cwd });
+    expect(listed.map(session => [session.sessionId, session.origin])).toEqual([["terminal-here", "native"]]);
+    expect(await store.find("terminal-here", cwd)).toMatchObject({ path: mine, origin: "native", cwd });
+    // Found by id, it still carries its own workspace, which the adapter compares before binding.
+    expect((await store.find("terminal-other", cwd))?.cwd).toBe(path.join(root, "other-workspace"));
   });
 });
 
@@ -167,14 +232,14 @@ describe("PiSessionStore.find", () => {
 
   it("finds a session in Pi's own directory for the workspace and reports it as native", async () => {
     const { store, cwd } = await scratch();
-    const file = await writeSession(store.nativeSessionDir(cwd), "native-1", cwd, [userEntry("from the terminal")]);
+    const file = await writeSession(await store.nativeSessionDir(cwd), "native-1", cwd, [userEntry("from the terminal")]);
     expect(await store.find("native-1")).toBeUndefined(); // without a workspace there is no native directory to look in
     expect(await store.find("native-1", cwd)).toMatchObject({ sessionId: "native-1", path: file, origin: "native", cwd });
   });
 
   it("prefers the Bot's own copy when both directories hold the id", async () => {
     const { store, cwd } = await scratch();
-    await writeSession(store.nativeSessionDir(cwd), "both", cwd);
+    await writeSession(await store.nativeSessionDir(cwd), "both", cwd);
     const bot = await writeSession(store.sessionDir, "both", cwd);
     expect(await store.find("both", cwd)).toMatchObject({ path: bot, origin: "bot" });
   });
@@ -210,7 +275,7 @@ describe("PiSessionStore.list", () => {
   it("lists the workspace's sessions from both directories, newest first", async () => {
     const { store, cwd } = await scratch();
     await writeSession(store.sessionDir, "old-bot", cwd, [], { mtime: 1_000 });
-    await writeSession(store.nativeSessionDir(cwd), "mid-native", cwd, [nameEntry("Terminal work")], { mtime: 2_000 });
+    await writeSession(await store.nativeSessionDir(cwd), "mid-native", cwd, [nameEntry("Terminal work")], { mtime: 2_000 });
     await writeSession(store.sessionDir, "new-bot", cwd, [], { mtime: 3_000 });
     const sessions = await store.list({ cwd });
     expect(sessions.map(session => [session.sessionId, session.origin])).toEqual([["new-bot", "bot"], ["mid-native", "native"], ["old-bot", "bot"]]);
@@ -226,7 +291,7 @@ describe("PiSessionStore.list", () => {
     await writeFile(path.join(store.sessionDir, "garbage.jsonl"), "{\n");
     await writeFile(path.join(store.sessionDir, "readme.txt"), "x");
     // The same id in Pi's own directory, older: the newer file wins and it is listed once.
-    await writeSession(store.nativeSessionDir(cwd), "mine", cwd, [], { mtime: 4_000 });
+    await writeSession(await store.nativeSessionDir(cwd), "mine", cwd, [], { mtime: 4_000 });
     const sessions = await store.list({ cwd });
     expect(sessions.map(session => session.sessionId)).toEqual(["mine"]);
     expect(sessions[0]!.origin).toBe("bot");

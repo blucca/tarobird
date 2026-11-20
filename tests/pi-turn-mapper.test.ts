@@ -618,6 +618,24 @@ describe("session tree projection", () => {
     expect(a!.childIds).toEqual(["b", "c", "d"]);
   });
 
+  it("previews a shell entry as typed and a failed reply by how it ended, as Pi's tree lists both", () => {
+    const tree = [{
+      entry: { type: "message", id: "s", parentId: null, message: { role: "bashExecution", command: "ls -la", output: "x" } },
+      children: [
+        { entry: { type: "message", id: "e", parentId: "s", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limited" } }, children: [] },
+        { entry: { type: "message", id: "t", parentId: "s", message: { role: "assistant", content: [{ type: "toolCall", id: "c", name: "bash", arguments: {} }], stopReason: "toolUse" } }, children: [] },
+        { entry: { type: "message", id: "k", parentId: "s", message: { role: "assistant", content: [{ type: "text", text: "kept" }], stopReason: "aborted" } }, children: [] },
+      ],
+    }];
+    const [shell, failed, tools, partial] = piNativeTree(tree as never, null).nodes;
+    expect(shell!.preview).toBe("!ls -la");
+    expect(failed!.preview).toBe("[error] 429 rate limited");
+    // Only tool calls and no failure: no text, so Pi's tree hides it.
+    expect(tools!.preview).toBe("");
+    // Text wins over the failure note.
+    expect(partial!.preview).toBe("kept");
+  });
+
   it("accepts several roots, an empty tree and malformed nodes", () => {
     expect(piNativeTree([], null)).toEqual({ nodes: [], leafId: null });
     const tree = [

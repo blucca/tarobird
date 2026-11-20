@@ -302,9 +302,20 @@ export function piDialogResponse(
 export const isPiDialog = (request: PiExtensionUiRequest): boolean =>
   request.method === "select" || request.method === "confirm" || request.method === "input" || request.method === "editor";
 
+/** A reply that failed or was cut off and carries no text is still listed by Pi's tree (tree-selector.ts:347-357); say how it ended. */
+function failedReplyPreview(message: PiMessage): string {
+  if (message.role !== "assistant") return "";
+  const reason = (message as PiAssistantMessage).stopReason;
+  if (!reason || reason === "stop" || reason === "toolUse") return "";
+  const detail = (message as PiAssistantMessage).errorMessage;
+  return `[${String(reason)}]${typeof detail === "string" && detail.trim() ? ` ${detail}` : ""}`;
+}
+
 function entryPreview(node: PiSessionTreeNode, limit = 160): string {
   const entry = node.entry;
-  const raw = entry.message ? piMessageText(entry.message)
+  const message = entry.message as (PiMessage & { command?: unknown }) | undefined;
+  const raw = message?.role === "bashExecution" && typeof message.command === "string" ? `!${message.command}`
+    : message ? piMessageText(message) || failedReplyPreview(message)
     : typeof entry.summary === "string" ? entry.summary
       : entry.type === "model_change" ? `${String(entry.provider ?? "")}/${String(entry.modelId ?? "")}`
         : entry.type === "thinking_level_change" ? String(entry.thinkingLevel ?? "")

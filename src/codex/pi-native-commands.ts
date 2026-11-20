@@ -51,6 +51,11 @@ export interface PiNativeCommandContext {
   approveBash?: (command: string) => Promise<boolean>;
   /** Per-request output directory; exports written here are delivered by the Host. */
   outputDir?: string;
+  /**
+   * Pi's effective (global and project) settings as the running session reads them; never credentials.
+   * Absent or failing, Pi's defaults apply.
+   */
+  readNativeSettings?: () => Promise<Record<string, unknown>>;
   abortSignal?: AbortSignal;
 }
 
@@ -68,6 +73,13 @@ const NOT_HANDLED: PiNativeCommandResult = Object.freeze({ handled: false });
 
 /** Built-ins Pi itself parses with an argument (interactive-mode.ts:3336-3442). */
 const PI_ARGUMENT_BUILTINS: ReadonlySet<string> = new Set(["model", "thinking", "export", "import", "bug", "name", "login", "compact"]);
+/**
+ * Pi's editor matches these built-ins on the exact text only, so `/<name> <args>` is not the built-in there:
+ * it goes to a session command of the same name when one exists (see `runPiNativeCommand`).
+ */
+export function piBuiltinYieldsToSessionCommand(name: string, args: string): boolean {
+  return Boolean(args) && !PI_ARGUMENT_BUILTINS.has(name);
+}
 /** Selector built-ins that get a text form here, for surfaces without cards. */
 const HOST_ARGUMENT_FORMS: ReadonlySet<string> = new Set(["fork", "tree", "settings", "trust", "scoped-models"]);
 
@@ -225,6 +237,7 @@ const EN = {
   forkCancelled: "The fork was cancelled. Nothing was changed.",
 
   treeNone: "This session has no entries yet.",
+  treeNoneFiltered: (filter: string) => `No entries match Pi's tree filter "${filter}". Send \`/tree <entry id>\` to go to a specific entry.`,
   treeTitle: "Session tree",
   treeMessage: "Choose the point to go back to.",
   treePlaceholder: "Type part of a message or label",
@@ -233,6 +246,7 @@ const EN = {
   treeLeaf: "current position",
   treeOnBranch: "current branch",
   treeOtherBranch: "other branch",
+  treeKind: (kind: string) => ({ assistant: "reply", toolResult: "tool result", bashExecution: "shell", compaction: "compaction", branch_summary: "branch summary", custom_message: "extension message" } as Record<string, string>)[kind] ?? kind,
   treeAlready: "Already at this point.",
   treeSummaryTitle: "Summarize branch?",
   treeSummaryMessage: "A summary of the branch you leave can be kept in the session.",
@@ -424,6 +438,7 @@ const ZH: Copy = {
   forkCancelled: "分叉被取消，没有任何改动。",
 
   treeNone: "这个会话还没有任何条目。",
+  treeNoneFiltered: filter => `没有条目符合 Pi 的树过滤设置“${filter}”。可发送 \`/tree <条目 ID>\` 前往指定条目。`,
   treeTitle: "会话树",
   treeMessage: "选择要回到的位置。",
   treePlaceholder: "输入消息或标签的一部分",
@@ -432,6 +447,7 @@ const ZH: Copy = {
   treeLeaf: "当前位置",
   treeOnBranch: "当前分支",
   treeOtherBranch: "其他分支",
+  treeKind: kind => ({ assistant: "回复", toolResult: "工具结果", bashExecution: "命令", compaction: "压缩", branch_summary: "分支摘要", custom_message: "扩展消息" } as Record<string, string>)[kind] ?? kind,
   treeAlready: "已经在这个位置。",
   treeSummaryTitle: "为分支生成摘要？",
   treeSummaryMessage: "可以把即将离开的分支总结成一段摘要，留在会话里。",
@@ -1052,31 +1068,76 @@ async function reloadCommand(run: Run): Promise<Reply> {
 
 interface TreePoint { id: string; node: PiNativeTreeNode; depth: number; mark: string }
 
-/** User messages and labelled entries, newest first; when a session has neither, every entry. */
-function treePoints(run: Run, tree: PiNativeTree): TreePoint[] {
-  const byId = new Map(tree.nodes.map(node => [node.id, node]));
+type TreeFilter = "default" | "no-tools" | "user-only" | "labeled-only" | "all";
+const TREE_FILTERS: readonly TreeFilter[] = ["default", "no-tools", "user-only", "labeled-only", "all"];
+/** Bookkeeping entries Pi's tree hides in its default view (tree-selector.ts:359-367). */
+const TREE_SETTINGS_ENTRIES: ReadonlySet<string> = new Set(["label", "context_edit", "custom", "model_change", "thinking_level_change", "session_info"]);
+
+/** Pi's own tree settings: `treeFilterMode` (default "default") and `branchSummary.skipPrompt` (default false). */
+async function treeSettings(run: Run): Promise<{ filter: TreeFilter; skipSummaryPrompt: boolean }> {
+  let settings: Record<string, unknown> = {};
+  try { settings = (await run.context.readNativeSettings?.()) ?? {}; } catch { /* Pi's defaults */ }
+  const mode = settings.treeFilterMode, summary = settings.branchSummary;
+  return {
+    filter: TREE_FILTERS.includes(mode as TreeFilter) ? mode as TreeFilter : "default",
+    skipSummaryPrompt: Boolean(summary && typeof summary === "object" && (summary as { skipPrompt?: unknown }).skipPrompt === true),
+  };
+}
+
+/** What Pi's tree selector lists (tree-selector.ts:342-390), newest first. */
+function treeVisible(tree: PiNativeTree, filter: TreeFilter): PiNativeTreeNode[] {
+  const navigable = tree.nodes.filter(node => node.type !== "usage");
+  const visible = navigable.filter(node => {
+    // A reply that only called tools carries no text; Pi hides it unless it is the current position or failed (the preview then says so).
+    if (node.type === "message" && node.role === "assistant" && node.id !== tree.leafId && !node.preview) return false;
+    switch (filter) {
+      case "user-only": return node.type === "message" && node.role === "user";
+      case "no-tools": return !TREE_SETTINGS_ENTRIES.has(node.type) && !(node.type === "message" && node.role === "toolResult");
+      case "labeled-only": return node.label !== undefined;
+      case "all": return true;
+      default: return !TREE_SETTINGS_ENTRIES.has(node.type);
+    }
+  });
+  // An empty result stays empty, as in Pi's selector; an exact id still reaches any entry (treeTarget).
+  return visible;
+}
+
+function treePoint(run: Run, tree: PiNativeTree, node: PiNativeTreeNode): TreePoint {
+  const byId = new Map(tree.nodes.map(entry => [entry.id, entry]));
   const onPath = new Set<string>();
   for (let cursor = tree.leafId ? byId.get(tree.leafId) : undefined, guard = 0; cursor && guard <= tree.nodes.length; guard++) {
     onPath.add(cursor.id);
     cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
   }
-  const depthOf = (node: PiNativeTreeNode): number => {
-    let depth = 0;
-    for (let cursor = node.parentId ? byId.get(node.parentId) : undefined, guard = 0; cursor && guard <= tree.nodes.length; guard++) {
-      if (cursor.childIds.length > 1) depth++;
-      cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
-    }
-    return Math.min(depth, 6);
-  };
-  const selectable = tree.nodes.filter(node => (node.type === "message" && node.role === "user") || Boolean(node.label));
-  return (selectable.length ? selectable : tree.nodes).map(node => ({
-    id: node.id, node, depth: depthOf(node),
+  let depth = 0;
+  for (let cursor = node.parentId ? byId.get(node.parentId) : undefined, guard = 0; cursor && guard <= tree.nodes.length; guard++) {
+    if (cursor.childIds.length > 1) depth++;
+    cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+  }
+  return {
+    id: node.id, node, depth: Math.min(depth, 6),
     mark: node.id === tree.leafId ? run.t.treeLeaf : onPath.has(node.id) ? run.t.treeOnBranch : run.t.treeOtherBranch,
-  })).reverse();
+  };
+}
+
+function treePoints(run: Run, tree: PiNativeTree, filter: TreeFilter): TreePoint[] {
+  return treeVisible(tree, filter).map(node => treePoint(run, tree, node)).reverse();
+}
+
+/** A position in the list shown, or the exact id of any entry Pi can navigate to, listed or not. */
+function treeTarget(run: Run, tree: PiNativeTree, points: TreePoint[], token: string): TreePoint | undefined {
+  const listed = selectByArgument(points, token);
+  if (listed) return listed;
+  const node = tree.nodes.find(entry => entry.id === token && entry.type !== "usage");
+  return node ? treePoint(run, tree, node) : undefined;
 }
 
 const treeLabel = (point: TreePoint): string => `${"· ".repeat(point.depth)}${oneLine(point.node.preview) || point.node.type}`;
-const treeDescription = (point: TreePoint): string => [point.node.label ? `[${oneLine(point.node.label, 40)}]` : "", point.mark].filter(Boolean).join(" · ");
+const treeKindOf = (node: PiNativeTreeNode): string | undefined => node.type === "message" ? (node.role && node.role !== "user" ? node.role : undefined) : node.type;
+const treeDescription = (run: Run, point: TreePoint): string => {
+  const kind = treeKindOf(point.node);
+  return [kind ? run.t.treeKind(kind) : "", point.node.label ? `[${oneLine(point.node.label, 40)}]` : "", point.mark].filter(Boolean).join(" · ");
+};
 
 async function summaryChoice(run: Run): Promise<{ summarize: boolean; customInstructions?: string } | undefined> {
   const { t } = run;
@@ -1098,13 +1159,14 @@ async function summaryChoice(run: Run): Promise<{ summarize: boolean; customInst
 
 async function treeCommand(run: Run, args: string): Promise<Reply> {
   const { context, t } = run;
-  const tree = await call(run, context.controls.getTree(context.sessionId));
-  const points = treePoints(run, tree);
-  if (!points.length) return { text: t.treeNone };
+  const [tree, settings] = await call(run, Promise.all([context.controls.getTree(context.sessionId), treeSettings(run)]));
+  const points = treePoints(run, tree, settings.filter);
+  if (!tree.nodes.some(node => node.type !== "usage")) return { text: t.treeNone };
   const words = args ? args.split(/\s+/) : [];
+  if (!points.length && !words.length) return { text: t.treeNoneFiltered(settings.filter) };
 
   if (words[0] === "label") {
-    const target = words[1] ? selectByArgument(points, words[1]) : undefined;
+    const target = words[1] ? treeTarget(run, tree, points, words[1]) : undefined;
     if (!target) return { text: t.rejectedNotFound };
     const label = words.slice(2).join(" ").trim();
     await call(run, context.controls.setLabel(context.sessionId, { entryId: target.id, label: label || null }));
@@ -1114,20 +1176,20 @@ async function treeCommand(run: Run, args: string): Promise<Reply> {
   let target: TreePoint | undefined;
   let summary: { summarize: boolean; customInstructions?: string } | undefined;
   if (words.length) {
-    target = selectByArgument(points, words[0]);
+    target = treeTarget(run, tree, points, words[0]);
     if (!target) return { text: t.rejectedNotFound };
     if (words[1]?.toLowerCase() === "summarize") {
       const instructions = words.slice(2).join(" ").trim();
       summary = { summarize: true, ...(instructions ? { customInstructions: instructions } : {}) };
     }
   } else if (!context.ask) {
-    const lines = points.map((point, index) => `${index + 1}. ${treeLabel(point)}${t.mark(treeDescription(point))}`);
+    const lines = points.map((point, index) => `${index + 1}. ${treeLabel(point)}${t.mark(treeDescription(run, point))}`);
     return { text: [t.treeListHeader, listing(run, lines), t.treeListHint].join("\n") };
   } else {
     const chosen = await pick(run, {
       title: t.treeTitle, message: t.treeMessage, placeholder: t.treePlaceholder,
       items: points.map(point => ({
-        choice: { label: treeLabel(point), description: treeDescription(point), value: point.id },
+        choice: { label: treeLabel(point), description: treeDescription(run, point), value: point.id },
         search: `${point.node.preview}\n${point.node.label ?? ""}\n${point.id}`.toLowerCase(), item: point,
       })),
     });
@@ -1137,7 +1199,9 @@ async function treeCommand(run: Run, args: string): Promise<Reply> {
   }
   if (target.id === tree.leafId) return { text: t.treeAlready };
   if (!summary) {
-    if (context.ask) {
+    // Pi skips the question when the owner chose that (interactive-mode.ts:5782).
+    if (settings.skipSummaryPrompt) summary = { summarize: false };
+    else if (context.ask) {
       summary = await summaryChoice(run);
       if (!summary) return { text: t.cancelled };
     } else {

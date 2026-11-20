@@ -82,6 +82,15 @@ cannot replace the validated path. `/detach` leaves the native history intact.
 Forking or creating a session updates the conversation binding only after Pi
 confirms the new identity.
 
+Native session discovery follows Pi's `PI_CODING_AGENT_SESSION_DIR`, project and
+user `sessionDir` settings, and default workspace directory. Tilde and relative
+paths are resolved in the same workspace context as the Pi process. Discovery
+reads settings without rewriting them.
+
+The native tree includes replies, tool results and summaries, honoring Pi's
+`treeFilterMode` and `branchSummary.skipPrompt`. An exact entry ID can select a
+valid node even when the current filter hides it.
+
 Pi built-ins are intercepted before a model prompt: model and thinking
 selection, session statistics and naming, tree navigation, forks and clones,
 compaction, settings, reload, copy and export use native controls. `/trust` stores
@@ -93,6 +102,43 @@ native usage and a per-model cost breakdown. Commands that
 require Pi's terminal surface explain where to run them; they are not submitted
 to a language model as ordinary text. `!` and `!!` retain Pi shell-command
 semantics and respect Normal-mode approval.
+
+In a direct chat, plain text supplements the current Pi task by default. Choose
+**Next turn** to use TaroBird's visible Host queue. This queue is separate from
+Pi's internal follow-up queue. The composer also routes `/model`, `/thinking`,
+`/name`, `/session`, `/copy` and `/settings` to the live native session rather
+than waiting for the current task to finish. Other App commands retain their
+App behavior. A definite refusal because the task has stopped receiving input
+falls back to the Host queue only while the original draft is unchanged. An
+edited draft is preserved for the owner to send.
+
+If a supplement's admission is uncertain, the App retains its request identity
+across reloads and checks the original receipt. Choosing **Next turn** cannot
+resend that same unresolved input as another task. Edit the text only when you
+intend to send a new message. Once admission is confirmed, editing a different
+draft retires only that confirmed receipt; an intentional later repeat is a new
+send and does not overwrite the intervening draft.
+
+At stop and normal settlement, unconsumed native input is taken back and its full
+text is preserved in the run process; templates and skills appear as the expanded
+text Pi actually held. The final reply includes a short warning when additions
+were not delivered. They are never resent automatically, and existing drafts are
+not overwritten. An in-flight input must finish before the final queue clear;
+if Pi cannot confirm that the queue is empty, the Host ends that Pi process while
+retaining its session history. The warning leaves delivery uncertain rather
+than claiming the additions were never applied.
+
+The command menu lists Pi's public built-ins in both languages. An existing
+live session also contributes its extension commands, prompt templates and
+skills. Reading the menu does not start a worker; one conversation's native
+commands are not shown in another conversation. App commands keep precedence
+when names collide. Descriptions distinguish conversation changes, Bot defaults
+and actions that require the native terminal. While a task is running, prompt
+templates and skills can supplement it. Registered extension commands wait for
+their own Host turn, so asynchronous handlers and their approval requests remain
+owned by a visible task. This differs from Pi's terminal live dispatch: its public
+bridge dispatch API does not expose an awaited completion for those handlers.
+The command remains available; it is not silently dropped or retried.
 
 ## Implementation and verification boundaries
 
@@ -110,7 +156,7 @@ semantics and respect Normal-mode approval.
   in both UI and Host validation.
 
 Use the Pi unit and protocol regressions, then `client/e2e/pi-engine.spec.ts`
-`pi-questions.spec.ts` and `pi-session.spec.ts` for Chinese/English and
+`pi-questions.spec.ts`, `pi-session.spec.ts` and `pi-send-choice.spec.ts` for Chinese/English and
 phone/desktop layouts.
 Credential-free native RPC probes, mocked providers, browser fixtures and an
 installed App are different evidence. Windows native process/pipe behavior,
@@ -147,6 +193,7 @@ a new intended change. Both App and CLI refuse stale sessions or lost access.
 | Built-in read tools and tool approvals | Native calls with the selected Bot permission policy; no inferred approval from tool names. |
 | Settings with native RPC setters | Explicit confirmation before changing Pi's user-wide setting. |
 | Login/logout and settings without RPC setters | Run the indicated native Pi terminal command; no embedded terminal or credential copy. |
+| Runs started independently by extensions outside an owned App turn | Not represented as standalone App tasks; use the native terminal for extensions relying on this behavior. |
 | Terminal-only extension components, themes and hotkeys | Pi's RPC limitations still apply; these are not reproduced in the App. |
 | `/share` and `/bug` | Explain the native terminal route; do not silently upload to upstream services. |
 | Extension status/widgets | Plain text in the live Pi panel; notices and suggested editor text appear in chat. |
