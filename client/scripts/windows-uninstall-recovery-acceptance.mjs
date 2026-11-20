@@ -187,11 +187,18 @@ export function makeContext(sys, options) {
     for (const [name, value] of Object.entries(extra)) { await mkdir(W.dirname(W.join(root, name)), { recursive: true }); await writeFile(W.join(root, name), value); }
     return body;
   };
+  /** Run 44833596317: after a silent install, no "Installer Language" is
+   * stored, so every non-silent entry (GUI uninstaller, `/P`) first shows
+   * NSIS's language picker. Store English as an interactive install would. */
+  const presetLanguage = async (receipt, phase) => {
+    const result = await exec('reg.exe', ['add', LOCATION_KEY, '/v', 'Installer Language', '/t', 'REG_SZ', '/d', '1033', '/f'], { timeout: 30_000 });
+    receipt.info(phase, 'preset-installer-language', `${LOCATION_KEY}\\Installer Language = 1033: ${outcome(result)}`);
+  };
   const helper = async (directory, flag) => {
     const result = await exec(W.join(directory, HELPER), [flag], { timeout: 120_000, capture: true });
     return { code: result.code, stderr: `${result.timedOut ? 'TIMED OUT ' : ''}${result.stderr.trim().slice(0, 300)}` };
   };
-  return { sys, exec, outcome, options, tmp, bases, roots, reg, state, backups, presentRoots, lock, install, snapshot, uninstallRegistered, uninstallSync, recover, ensureUninstalled, seed, helper };
+  return { sys, exec, outcome, options, tmp, bases, roots, reg, state, backups, presentRoots, lock, install, presetLanguage, snapshot, uninstallRegistered, uninstallSync, recover, ensureUninstalled, seed, helper };
 }
 
 /** A failed silent uninstall must keep the recovery entry and data; a retry of
@@ -199,6 +206,8 @@ export function makeContext(sys, options) {
 async function silentLocked(ctx, receipt, phase) {
   const directory = await ctx.install(receipt, phase);
   if (!directory) return;
+  await ctx.seed(W.join(ctx.bases[0], 'com.tarobot.client'));
+  await ctx.seed(W.join(ctx.bases[1], 'com.tarobot.client'));
   const rootsBefore = ctx.presentRoots();
   const target = W.join(directory, ...LOCK_TARGET);
   const held = await ctx.lock(target);
@@ -212,18 +221,19 @@ async function silentLocked(ctx, receipt, phase) {
   receipt.expect(phase, 'deep-link-kept-until-files-removed', after.link.state === 'present', `${PROTOCOL_KEY}: ${after.link.state}`);
   receipt.expect(phase, 'locked-file-kept', existsSync(target), target);
   receipt.info(phase, 'partial-state', await ctx.snapshot(directory));
-  receipt.expect(phase, 'data-untouched', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots before ${rootsBefore.length}, after ${ctx.presentRoots().length}`);
+  receipt.expect(phase, 'data-untouched', rootsBefore.length === 2 && JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore) && rootsBefore.every(root => existsSync(W.join(root, SYNTHETIC))), `roots before ${rootsBefore.length}, after ${ctx.presentRoots().length}`);
   await held.release();
   await ctx.recover(receipt, phase);
   const link = await ctx.reg(PROTOCOL_KEY);
   receipt.expect(phase, 'deep-link-removed-after-recovery', link.state === 'absent' || link.values?.['(Default)'] === undefined, `${PROTOCOL_KEY}: ${link.state}`);
-  receipt.expect(phase, 'data-retained-after-recovery', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().join(', ') || 'none'}`);
+  receipt.expect(phase, 'data-retained-after-recovery', rootsBefore.length === 2 && JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore) && rootsBefore.every(root => existsSync(W.join(root, SYNTHETIC))), `roots ${ctx.presentRoots().join(', ') || 'none'}`);
 }
 
 /** The dialog's other recovery: reinstall this version, then uninstall. */
 async function silentRepair(ctx, receipt, phase) {
   const directory = await ctx.install(receipt, phase);
   if (!directory) return;
+  const rootsBefore = ctx.presentRoots();
   const held = await ctx.lock(W.join(directory, ...LOCK_TARGET));
   if (!held.held) { receipt.add(phase, 'induce-locked-file', 'skip', held.detail); await held.release(); return; }
   const code = await ctx.uninstallSync(directory);
@@ -235,6 +245,8 @@ async function silentRepair(ctx, receipt, phase) {
     receipt.expect(phase, 'reinstall-restores-files', !files.length && repaired.toLowerCase() === directory.toLowerCase(), files.length ? `missing ${files.join(', ')}` : repaired);
   }
   await ctx.uninstallRegistered(receipt, phase, 'uninstall-after-repair-completes');
+  receipt.expect(phase, 'silent-uninstall-keeps-data', rootsBefore.length > 0 && JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore) && rootsBefore.every(root => existsSync(W.join(root, SYNTHETIC))),
+    `roots before ${rootsBefore.join(', ') || 'none'}; after ${ctx.presentRoots().join(', ') || 'none'}`);
 }
 
 /** The installer's own "uninstall before installing" runs `uninstall.exe _?=<dir>`
@@ -256,6 +268,7 @@ async function inPlace(ctx, receipt, phase) {
   // Same-version passive reinstall: PageLeaveReinstall takes reinst_uninstall.
   directory = await ctx.install(receipt, phase);
   if (!directory) return;
+  await ctx.presetLanguage(receipt, phase);
   const passive = await ctx.exec(ctx.options.installer, ['/P'], { timeout: 300_000 });
   const key = await ctx.reg(UNINSTALL_KEY);
   const missing = [EXE, 'uninstall.exe', HELPER, W.join(...LOCK_TARGET)].filter(file => !existsSync(W.join(directory, file)));
@@ -280,11 +293,12 @@ async function helperCase(ctx, receipt, phase) {
   let res = await ctx.helper(directory, '--confirm-host-stopped-v2');
   receipt.expect(phase, 'host-stopped-clean', res.code === 0, `exit ${res.code} ${res.stderr}`);
 
-  // Live Host owner → 41 from both commands; nothing moved. Keep any real lock.
-  const realLock = W.join(l('com.tarobot.client'), 'host', 'instance.lock.json');
+  // Live Host owner → 41 from both commands; nothing moved. The Host directory
+  // is resolved from app_data_dir (Roaming); keep any real lock.
+  const realLock = W.join(r('com.tarobot.client'), 'host', 'instance.lock.json');
   const saved = existsSync(realLock) ? await readFile(realLock) : undefined;
   if (saved) receipt.info(phase, 'pre-existing-host-lock', saved.toString('utf8').slice(0, 300));
-  await ctx.seed(l('com.tarobot.client'), { 'host\\instance.lock.json': JSON.stringify({ pid: process.pid }) });
+  await ctx.seed(r('com.tarobot.client'), { 'host\\instance.lock.json': JSON.stringify({ pid: process.pid }) });
   let before = ctx.presentRoots(), backups = await ctx.backups();
   res = await ctx.helper(directory, '--confirm-host-stopped-v2');
   receipt.expect(phase, 'host-running-confirm-41', res.code === 41, `exit ${res.code} (41 = HostRunning)`);
@@ -292,10 +306,10 @@ async function helperCase(ctx, receipt, phase) {
   receipt.expect(phase, 'host-running-backup-41-nothing-moved', res.code === 41 && JSON.stringify(ctx.presentRoots()) === JSON.stringify(before) && JSON.stringify(await ctx.backups()) === JSON.stringify(backups), `exit ${res.code} ${res.stderr}`);
   if (saved) await writeFile(realLock, saved); else await rm(realLock);
   // Shared CLI service → 40.
-  await writeFile(W.join(l('com.tarobot.client'), 'host', 'host-service.json'), '{}');
+  await writeFile(W.join(r('com.tarobot.client'), 'host', 'host-service.json'), '{}');
   res = await ctx.helper(directory, '--prepare-fresh-install-v2');
   receipt.expect(phase, 'shared-service-40-nothing-moved', res.code === 40 && JSON.stringify(ctx.presentRoots()) === JSON.stringify(before), `exit ${res.code} ${res.stderr}`);
-  await rm(W.join(l('com.tarobot.client'), 'host', 'host-service.json'));
+  await rm(W.join(r('com.tarobot.client'), 'host', 'host-service.json'));
 
   // Not started: the first root (roaming) cannot move → 52/53, nothing moved, retry works.
   await ctx.seed(r('com.tarobot.client'));
@@ -371,9 +385,10 @@ async function driveUi(ctx, mode, { release } = {}) {
   if (!done) child.kill();
   try { return { ...JSON.parse(stdout.trim().split(/\r?\n/).pop()), released }; } catch { return { error: `${stdout.slice(-1000)} ${stderr.slice(-1000)}`, events: [], released }; }
 }
-const describe = ui => ui.error ? `driver error: ${ui.error}` : `seen ${ui.seen}, closed ${ui.closed}, ${ui.seconds}s; events: ${(ui.events ?? []).map(e => `${e.kind}${e.kind === 'answer' || e.kind === 'confirm-page' ? `=${e.detail}` : ''}`).join(' → ')}; left ${JSON.stringify(ui.left ?? [])}`;
+const describe = ui => ui.error ? `driver error: ${ui.error}` : `seen ${ui.seen}, closed ${ui.closed}, ${ui.seconds}s; events: ${(ui.events ?? []).map(e => `${e.kind}${['answer', 'confirm-page', 'unrecognised', 'error', 'language'].includes(e.kind) ? `=${String(e.detail).slice(0, 700)}` : ''}`).join(' → ')}; left ${JSON.stringify(ui.left ?? [])}`;
 
-async function launchGui(ctx, directory) {
+async function launchGui(ctx, directory, receipt, phase) {
+  await ctx.presetLanguage(receipt, phase);
   // Like Settings → Apps: the registered uninstaller with its normal GUI.
   ctx.sys.launch(W.join(directory, 'uninstall.exe'));
 }
@@ -386,7 +401,7 @@ async function guiLocked(ctx, receipt, phase) {
   const rootsBefore = ctx.presentRoots();
   const held = await ctx.lock(W.join(directory, ...LOCK_TARGET));
   if (!held.held) { receipt.add(phase, 'induce-locked-file', 'skip', held.detail); await held.release(); return; }
-  await launchGui(ctx, directory);
+  await launchGui(ctx, directory, receipt, phase);
   const ui = await driveUi(ctx, 'keep', { release: held.release });
   await held.release();
   receipt.info(phase, 'ui-events', describe(ui));
@@ -414,7 +429,7 @@ async function guiRerunAfterPartial(ctx, receipt, phase) {
   await held.release();
   receipt.info(phase, 'partial-state', `exit ${code}; ${await ctx.snapshot(directory)}`);
   if (code === 0) { receipt.add(phase, 'rerun-gui-completes', 'skip', 'the partial uninstall was not induced'); return; }
-  await launchGui(ctx, directory);
+  await launchGui(ctx, directory, receipt, phase);
   const ui = await driveUi(ctx, 'keep');
   receipt.info(phase, 'ui-events', describe(ui));
   if (ui.error || !ui.seen) receipt.add(phase, 'rerun-gui-completes', 'skip', `the uninstaller UI could not be driven: ${describe(ui)}`);
@@ -435,7 +450,7 @@ async function guiConsent(ctx, receipt, phase) {
   await ctx.seed(W.join(roaming, 'com.tarobot.client'));
   await ctx.seed(W.join(local, 'com.tarobot.client'), { 'tarobot-client-installation-v1': 'synthetic-installation-key' });
   const before = ctx.presentRoots(), backups = await ctx.backups();
-  await launchGui(ctx, directory);
+  await launchGui(ctx, directory, receipt, phase);
   const ui = await driveUi(ctx, 'consent');
   receipt.info(phase, 'ui-events', describe(ui));
   if (ui.error || !ui.seen) { receipt.add(phase, 'consent-flow', 'skip', `the uninstaller UI could not be driven: ${describe(ui)}`); return; }

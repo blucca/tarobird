@@ -36,7 +36,7 @@ function Text($el) { ((Kids $el | ForEach-Object { $_.Current.Name } | Where-Obj
 # language picker (if Windows shows it) is "Installer/Uninstaller Language".
 function Windows { @($AE::RootElement.FindAll($TS::Children, $Any) | Where-Object { $_.Current.Name -like '*TaroBird*' -or $_.Current.Name -like '*Language*' }) }
 
-$closed = $false; $seen = $false; $answered = 0; $guard = 0; $empty = 0
+$closed = $false; $seen = $false; $answered = 0; $guard = 0; $empty = 0; $dumped = @{}
 while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
   $wins = Windows
   if ($wins.Count) { $seen = $true; $empty = 0 } else { $empty++ }
@@ -81,6 +81,13 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
       } elseif ($close -and $close.Current.IsEnabled) {
         Note 'finished' (Text $w)
         Press $close; $closed = $true
+      } else {
+        # Unrecognised window: record its control tree once, for diagnosis.
+        $id = "$($w.Current.ProcessId):$($w.Current.Name)"
+        if (-not $dumped.ContainsKey($id) -and ((Get-Date) - $start).TotalSeconds -gt 8) {
+          $dumped[$id] = $true
+          Note 'unrecognised' ("$($w.Current.Name) [$($w.Current.ClassName)]: " + ((Kids $w | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName)='$($_.Current.Name)'" }) -join '; '))
+        }
       }
     } catch { Note 'error' $_.Exception.Message }
   }
