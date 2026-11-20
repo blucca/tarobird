@@ -28,7 +28,7 @@ export interface GatewayHistoryOptions {
   bridge: CoreBridgeLike;
   runtime: CoreServiceRuntime;
   stateDir: string;
-  receipts?: Pick<GatewayReceipts, "run">;
+  receipts?: Pick<GatewayReceipts, "run" | "peek">;
   /** False while a Hub session selection still waits for the main queue. */
   bindingReady?: (conversationId: string) => Promise<boolean>;
   /** A received input not yet admitted to the Core queue. */
@@ -222,11 +222,22 @@ export function gatewayHistory(options: GatewayHistoryOptions) {
     if (method === "history.rewind") {
       const call = historyBotRewindCallSchema.parse(raw);
       const identity = { conversationId: call.conversationId, beforeMessageId: call.beforeMessageId };
-      const receipt = await receipts.run(`history.rewind:${call.userId}:${call.requestId}`, async () => ({ ...identity, reply: await executeRewind(call) }), REWIND_RECEIPT_RETRY_MS);
+      const key = `history.rewind:${call.userId}:${call.requestId}`;
+      const storedReply = (result: Json | undefined) => {
+        const stored = z.object({ conversationId: idSchema, beforeMessageId: idSchema, reply: historyBotRewindReplySchema }).safeParse(result);
+        if (!stored.success) return undefined;
+        return stored.data.conversationId === identity.conversationId && stored.data.beforeMessageId === identity.beforeMessageId ? stored.data.reply : { ok: false as const, error: "history_changed" as const };
+      };
+      if (call.replayOnly) {
+        // Later input already ran on this thread: only a success this request
+        // already produced may be reported; nothing is executed.
+        const receipt = await receipts.peek(key);
+        const reply = receipt?.ok ? storedReply(receipt.result) : undefined;
+        return reply?.ok ? reply : { ok: false, error: "history_changed" };
+      }
+      const receipt = await receipts.run(key, async () => ({ ...identity, reply: await executeRewind(call) }), REWIND_RECEIPT_RETRY_MS);
       if (!receipt.ok) return { ok: false, error: receipt.error === "operation_interrupted" ? "operation_interrupted" : "engine_failed" };
-      const stored = z.object({ conversationId: idSchema, beforeMessageId: idSchema, reply: historyBotRewindReplySchema }).safeParse(receipt.result);
-      if (!stored.success) return { ok: false, error: "engine_failed" };
-      return stored.data.conversationId === identity.conversationId && stored.data.beforeMessageId === identity.beforeMessageId ? stored.data.reply : { ok: false, error: "history_changed" };
+      return storedReply(receipt.result) ?? { ok: false, error: "engine_failed" };
     }
     if (method === "history.fork") {
       const call = historyBotForkCallSchema.parse(raw);

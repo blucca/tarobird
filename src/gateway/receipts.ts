@@ -18,6 +18,17 @@ export class GatewayReceipts {
     if (authorize) return authorize().then(() => this.runAuthorized(key, operation, idempotentRetryMs, authorize));
     return this.runAuthorized(key, operation, idempotentRetryMs);
   }
+  /** The result of `key` without ever executing it: joins an execution in
+   * flight in this process, else the stored complete result, else undefined. */
+  async peek(key: string): Promise<ReceiptResult | undefined> {
+    const existing = this.active.get(key); if (existing) return existing;
+    const old = await this.file(key).read(null);
+    return old?.state === "complete" ? old.result : undefined;
+  }
+  private file(key: string) {
+    const id = createHash("sha256").update(key).digest("hex");
+    return new JsonStore(path.join(this.directory, "gateway-receipts", `${id}.json`), (value) => receiptSchema.nullable().parse(value));
+  }
   private runAuthorized(key: string, operation: () => Promise<Json>, idempotentRetryMs: number, authorize?: () => Promise<void>): Promise<ReceiptResult> {
     const existing = this.active.get(key); if (existing) return existing;
     const task = this.perform(key, operation, idempotentRetryMs, authorize); this.active.set(key, task);
@@ -25,8 +36,7 @@ export class GatewayReceipts {
     return task;
   }
   private async perform(key: string, operation: () => Promise<Json>, idempotentRetryMs: number, authorize?: () => Promise<void>): Promise<ReceiptResult> {
-    const id = createHash("sha256").update(key).digest("hex");
-    const file = new JsonStore(path.join(this.directory, "gateway-receipts", `${id}.json`), (value) => receiptSchema.nullable().parse(value));
+    const file = this.file(key);
     const old = await file.read(null);
     await authorize?.();
     // Only provider-idempotent notifications opt in. Command/approval receipts

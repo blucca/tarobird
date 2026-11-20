@@ -38,11 +38,12 @@ class FakeThread {
 }
 
 let hubDir: string, gwDir: string, hub: HubServer, secret: string, socket: WebSocket | undefined;
+async function start(timings = { rewindMs: 2000, forkMs: 2000, statusMs: 2000, unknownAfterMs: 60_000 }) { hub = await HubServer.start({ stateDir: hubDir, historyTimings: timings }); }
 beforeEach(async () => {
   hubDir = await mkdtemp(path.join(os.tmpdir(), "history-seam-hub-"));
   gwDir = await mkdtemp(path.join(os.tmpdir(), "history-seam-gw-"));
   await writeFile(path.join(gwDir, "config.json"), JSON.stringify({ engine: "codex", locale: "en" }));
-  hub = await HubServer.start({ stateDir: hubDir, historyTimings: { rewindMs: 2000, forkMs: 2000, statusMs: 2000, unknownAfterMs: 60_000 } });
+  await start();
   secret = randomBytes(32).toString("base64url");
   await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('alpha','Alpha',?)", [hashSecret(secret)]);
 });
@@ -69,6 +70,8 @@ async function gateway(conversationId: string, thread: FakeThread) {
   const bridge = new Bridge(access, new SessionManager(store, adapter), adapter).createAuthenticatedSurface();
   const handler = gatewayHistory({ bridge, runtime: createCoreServiceRuntime(), stateDir: gwDir, bindingReady: async () => true });
   const calls: { method: string; params: any; result?: unknown; error?: string }[] = [];
+  /** While set, answers are computed but never sent (a lost reply). */
+  const lose = { replies: false };
   const ws = new WebSocket(hub.instanceUrl.replace("http", "ws") + "/instance"); socket = ws;
   const frames: Frame[] = [];
   const send = (frame: object) => ws.send(JSON.stringify({ v: 1, ...frame }));
@@ -80,13 +83,13 @@ async function gateway(conversationId: string, thread: FakeThread) {
     calls.push(call);
     // Exactly what the Gateway transport does: a thrown handler is an error frame.
     void handler(frame.method, frame.params).then(
-      result => { call.result = result; send({ type: "instance.result", id: frame.id, result: result ?? null }); },
+      result => { call.result = result; if (!lose.replies) send({ type: "instance.result", id: frame.id, result: result ?? null }); },
       error => { call.error = String(error); send({ type: "instance.result", id: frame.id, error: "gateway_call_failed" }); });
   });
   await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
   send({ type: "instance.hello", botId: "alpha", secret, engine: "codex", model: "", effort: "", capabilities: [HISTORY_CAPABILITY] });
   for (let i = 0; !frames.some(f => f.type === "instance.ready"); i++) { if (i > 500) throw new Error("no ready"); await wait(5); }
-  return { adapter, calls, key };
+  return { adapter, calls, key, frames, lose };
 }
 
 const runCard = (startedAt: number): Block => ({ type: "card", elements: [{ type: "markdown", text: "answer" }], extra: { nativeRun: { version: 1, id: `run_${startedAt}`, revision: 2, phase: "done", startedAt, updatedAt: startedAt + 5, count: 0, completed: 0, failed: 0, truncated: false } } });
@@ -134,5 +137,30 @@ describe("Hub calls answered by the real Gateway handler (#53)", () => {
     expect(gw.adapter.forkSession).toHaveBeenCalledWith(SID, expect.objectContaining({ through: { lastTurnId: "t1" } }));
     // Every call the Hub made was accepted by the Gateway's strict schemas.
     expect(gw.calls.map(call => [call.method, call.error])).toEqual([["history.rewind", undefined], ["history.fork", undefined]]);
+  });
+
+  it("a rewind whose answer was lost, retried after later chat, keeps its confirmed range", async () => {
+    await hub.close(); await start({ rewindMs: 300, forkMs: 300, statusMs: 300, unknownAfterMs: 1200 });
+    const { headers, chat, thread, seeded } = await fixture(["first question", "second question", "third question"]);
+    const gw = await gateway(chat.id, thread);
+    const last = await lastId(chat.id);
+    gw.lose.replies = true;
+    const body = { botId: "alpha", requestId: "s_lost", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last };
+    expect((await post(headers, `/api/conversations/${chat.id}/history/rewind`, body)).body).toMatchObject({ state: "started" });
+    // The Gateway rewound the engine; no answer reached the Hub.
+    await vi.waitFor(() => expect(thread.turns.map(turn => turn.id)).toEqual(["t1"]));
+    const status = async () => (await (await fetch(`${hub.url}/api/conversations/${chat.id}/history/operations/s_lost`, { headers })).json() as any).state;
+    await vi.waitFor(async () => expect(await status()).toBe("unknown"), { timeout: 5000 });
+    // Let the send in flight at expiry run out.
+    await wait(450);
+    gw.lose.replies = false;
+    // The user chats on: this run is on the rewound thread and stays live.
+    const [later] = await turns(chat.id, thread, ["kept chatting"]);
+    const retried = await post(headers, `/api/conversations/${chat.id}/history/rewind`, body);
+    expect(gw.calls.at(-1)!.params).toMatchObject({ requestId: "s_lost", replayOnly: true });
+    expect(retried.body).toMatchObject({ state: "completed", replayed: true, rewind: { fromMessageId: seeded[1]!.input.id, throughMessageId: last } });
+    expect(later!.input.createdAt).toBeGreaterThan(retried.body.rewind.throughCreatedAt);
+    expect(gw.adapter.rewindSession).toHaveBeenCalledTimes(1);
+    expect(thread.has(later!.turnId)).toBe(true);
   });
 });

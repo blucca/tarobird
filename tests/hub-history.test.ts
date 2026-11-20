@@ -325,22 +325,70 @@ describe("no answer", () => {
     const done = await retried;
     expect(done.body).toMatchObject({ state: "completed", replayed: true, conversationId: call.params.targetConversationId });
   });
-  it("an unknown rewind retried later marks through the messages sent meanwhile", async () => {
+  /** A rewind left unknown while the user kept chatting; `later` was dispatched and accepted. */
+  async function expiredRewindAfterChat(requestId: string) {
     await hub.close(); await start({ ...fast, unknownAfterMs: 1200 });
     const { headers, chat, seeded, last } = await fixture();
     const bot = await gateway();
-    const body = { botId: "alpha", requestId: "u_r", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last };
+    const body = { botId: "alpha", requestId, beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last };
     expect((await json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body))).body).toMatchObject({ state: "started" });
-    const { message: later } = await hub.store.sendMessage("owner", { conversationId: chat.id, clientMsgId: "later_r", text: "kept chatting", attachments: [] });
-    await until(async () => (await json(api(headers, `/api/conversations/${chat.id}/history/operations/u_r`))).body.state === "unknown", 5000);
+    const first = await bot.next("instance.call", f => f.method === "history.rewind");
+    expect(first.params).not.toHaveProperty("replayOnly");
+    const { message: later } = await hub.store.sendMessage("owner", { conversationId: chat.id, clientMsgId: `later_${requestId}`, text: "kept chatting", attachments: [] });
+    await until(async () => (await json(api(headers, `/api/conversations/${chat.id}/history/operations/${requestId}`))).body.state === "unknown", 5000);
     await bot.next("instance.message", f => f.message.id === later.id);
     await wait(450);
     await hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=?", [later.id]);
+    const laterReply = await hub.store.publishBotMessage("alpha", { conversationId: chat.id, blocks: [runCard(Date.now())], replyTo: later.id });
+    bot.frames.length = 0;
+    return { headers, chat, bot, body, last, later, laterReply };
+  }
+  it("an unknown rewind retried after later input ran only collects a stored result; its range stays the confirmed one", async () => {
+    const { headers, chat, bot, body, last, later, laterReply } = await expiredRewindAfterChat("u_r");
+    const retried = json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body));
+    const call = await bot.next("instance.call", f => f.method === "history.rewind");
+    expect(call.params).toMatchObject({ requestId: "u_r", replayOnly: true });
+    // The Gateway had rewound before `later` ran; only its answer was lost.
+    bot.reply(call, { ok: true });
+    const done = (await retried).body;
+    expect(done).toMatchObject({ state: "completed", replayed: true, rewind: { throughMessageId: last } });
+    expect(later.createdAt).toBeGreaterThan(done.rewind.throughCreatedAt);
+    // The turn chatted afterwards is live: it can be rewound and forked from.
+    const again = json(api(headers, `/api/conversations/${chat.id}/history/rewind`, { botId: "alpha", requestId: "u_r2", beforeMessageId: later.id, expectedLastMessageId: laterReply.id }));
+    const second = await bot.next("instance.call", f => f.method === "history.rewind");
+    expect(second.params).toMatchObject({ requestId: "u_r2", beforeMessageId: later.id });
+    expect(second.params).not.toHaveProperty("replayOnly");
+    bot.reply(second, { ok: true });
+    expect((await again).body).toMatchObject({ state: "completed", rewind: { fromMessageId: later.id, throughMessageId: laterReply.id } });
+  });
+  it("an unknown rewind retried after later input ran fails as history_changed without a stored success", async () => {
+    const { headers, chat, bot, body } = await expiredRewindAfterChat("u_n");
+    const retried = json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body));
+    const call = await bot.next("instance.call", f => f.method === "history.rewind");
+    expect(call.params).toMatchObject({ replayOnly: true });
+    // Even another refusal is reported as a changed history: the user confirms again.
+    bot.reply(call, { ok: false, error: "engine_busy" });
+    expect((await retried).body).toMatchObject({ state: "failed", error: "history_changed", replayed: true });
+    expect((await hub.store.conversations("owner")).find(c => c.id === chat.id)?.history).toBeUndefined();
+  });
+  it("an unknown rewind with nothing dispatched since is simply asked again", async () => {
+    await hub.close(); await start({ ...fast, unknownAfterMs: 1200 });
+    const { headers, chat, seeded, last } = await fixture();
+    const bot = await gateway();
+    const body = { botId: "alpha", requestId: "u_q", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last };
+    expect((await json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body))).body).toMatchObject({ state: "started" });
+    // Sent during the operation and still queued: never reached the engine.
+    const { message: queued } = await hub.store.sendMessage("owner", { conversationId: chat.id, clientMsgId: "queued_q", text: "not yet", attachments: [] });
+    await hub.store.db.run("UPDATE deliveries SET queue_paused=1 WHERE message_id=?", [queued.id]);
+    await until(async () => (await json(api(headers, `/api/conversations/${chat.id}/history/operations/u_q`))).body.state === "unknown", 5000);
+    await wait(450);
+    await hub.store.db.run("UPDATE deliveries SET status='cancelled' WHERE message_id=?", [queued.id]);
     bot.frames.length = 0;
     const retried = json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body));
     const call = await bot.next("instance.call", f => f.method === "history.rewind");
+    expect(call.params).not.toHaveProperty("replayOnly");
     bot.reply(call, { ok: true });
-    expect((await retried).body).toMatchObject({ state: "completed", replayed: true, rewind: { throughMessageId: later.id } });
+    expect((await retried).body).toMatchObject({ state: "completed", replayed: true, rewind: { throughMessageId: last } });
   });
   it("re-drives started operations after a Hub restart", async () => {
     const { headers, chat, seeded, last } = await fixture();

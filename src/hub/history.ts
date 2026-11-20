@@ -159,15 +159,11 @@ export class HubHistory {
         if (prior.state === "unknown" && this.hooks.capable(prior.bot_id) === true && !await this.scopeInTransaction(conversationId, prior.bot_id)
           && !await this.activeInTransaction(conversationId) && !await this.store.historyBusyInTransaction(conversationId, prior.bot_id)) {
           const now = Date.now();
-          // A rewind drops everything after its anchor from the engine. If the
-          // first attempt never ran and the user kept chatting, the retry also
-          // drops those turns, so the marked range must reach today's last message.
-          const through = prior.kind === "rewind"
-            ? await this.db.get<{ id: string; created_at: number }>("SELECT id,created_at FROM messages WHERE conversation_id=? AND status!='deleted' ORDER BY created_at DESC,rowid DESC LIMIT 1", [conversationId])
-            : undefined;
-          const throughId = through?.id ?? prior.through_message_id, throughAt = through?.created_at ?? prior.through_created_at;
-          await this.db.run("UPDATE conversation_history_ops SET state='started',error=NULL,through_message_id=?,through_created_at=?,updated_at=? WHERE id=? AND state='unknown'", [throughId, throughAt, now, prior.id]);
-          return { row: { ...prior, state: "started", error: null, through_message_id: throughId, through_created_at: throughAt, updated_at: now }, replayed: true, restarted: true };
+          // A rewind's range stays the one fixed when it started, which is
+          // what the user confirmed. If input ran since, the resend only
+          // collects a result the Gateway already has (see payload()).
+          await this.db.run("UPDATE conversation_history_ops SET state='started',error=NULL,updated_at=? WHERE id=? AND state='unknown'", [now, prior.id]);
+          return { row: { ...prior, state: "started", error: null, updated_at: now }, replayed: true, restarted: true };
         }
         return { row: prior, replayed: true, restarted: false };
       }
@@ -225,19 +221,21 @@ export class HubHistory {
     if (capable === undefined) return false; // Resent when the Bot reconnects.
     // A downgraded Gateway cannot tell what happened; stop holding dispatch.
     if (!capable) { await this.finish(row, "unknown"); return false; }
-    const payload = await this.payload(row);
+    const { params, replayOnly } = await this.payload(row);
     let raw: Json;
-    try { raw = await this.hooks.call(row.bot_id, `history.${row.kind}`, payload, row.kind === "rewind" ? this.timings.rewindMs : this.timings.forkMs); }
+    try { raw = await this.hooks.call(row.bot_id, `history.${row.kind}`, params, row.kind === "rewind" ? this.timings.rewindMs : this.timings.forkMs); }
     catch (error) {
       if (this.hooks.stopping()) return false;
       if (error instanceof HubError && error.code === "bot_timeout") return this.hooks.capable(row.bot_id) === true;
       if (error instanceof HubError && error.code === "bot_offline") return false;
       // The Gateway answered with an error instead of an outcome.
-      await this.finish(row, "failed", "engine_failed"); return false;
+      await this.finish(row, "failed", replayOnly ? "history_changed" : "engine_failed"); return false;
     }
     if (row.kind === "rewind") {
       const reply = historyBotRewindReplySchema.safeParse(raw);
-      if (!reply.success) await this.finish(row, "failed", "engine_failed");
+      // No stored success: the user confirms again against today's history.
+      if (replayOnly && !(reply.success && reply.data.ok)) await this.finish(row, "failed", "history_changed");
+      else if (!reply.success) await this.finish(row, "failed", "engine_failed");
       else if (!reply.data.ok) await this.finish(row, "failed", reply.data.error === "operation_interrupted" ? "uncertain" : reply.data.error);
       else await this.completeRewind(row, reply.data.restarted === true);
     } else {
@@ -248,7 +246,7 @@ export class HubHistory {
     }
     return false;
   }
-  private payload(row: HistoryOpRow): Promise<unknown> {
+  private payload(row: HistoryOpRow): Promise<{ params: unknown; replayOnly: boolean }> {
     return this.db.serial(async () => {
       const base = { conversationId: row.conversation_id, userId: row.user_id, requestId: row.request_id };
       const target = row.anchor_message_id ? await this.store.queuedMessageInTransaction(row.anchor_message_id) : undefined;
@@ -256,9 +254,23 @@ export class HubHistory {
       // to be the latest, and its matched anchor (persisted by the Gateway,
       // reused by every later operation) would end at the thread's last turn.
       const hints = target ? await this.hints(target, row.bot_id) : undefined;
-      if (row.kind === "rewind") return historyBotRewindCallSchema.parse({ ...base, beforeMessageId: row.anchor_message_id, ...(hints ? { hints } : {}) });
-      return historyBotForkCallSchema.parse({ ...base, targetConversationId: row.target_conversation_id, ...(target ? { throughMessageId: target.id, hints } : {}) });
+      if (row.kind === "rewind") {
+        const replayOnly = await this.ranSinceThroughInTransaction(row);
+        return { replayOnly, params: historyBotRewindCallSchema.parse({ ...base, beforeMessageId: row.anchor_message_id, ...(hints ? { hints } : {}), ...(replayOnly ? { replayOnly: true } : {}) }) };
+      }
+      return { replayOnly: false, params: historyBotForkCallSchema.parse({ ...base, targetConversationId: row.target_conversation_id, ...(target ? { throughMessageId: target.id, hints } : {}) }) };
     });
+  }
+  /** Whether an input after the rewind's fixed `through` reached a Bot. Never
+   * while the operation is `started` (dispatch is held), so only after it
+   * expired as `unknown`: such input ran on whatever the thread was then. If
+   * the Gateway had already rewound and only its answer was lost, executing
+   * again would mark live turns; if it had not, executing would drop turns the
+   * confirmed range does not cover. Either way the resend may only collect a
+   * stored result. A missing `through` row counts every input. */
+  private async ranSinceThroughInTransaction(row: HistoryOpRow): Promise<boolean> {
+    return !!await this.db.get(`SELECT 1 FROM messages m JOIN deliveries d ON d.message_id=m.id
+      WHERE m.conversation_id=? AND (d.dispatched=1 OR d.status='accepted') AND m.rowid>COALESCE((SELECT rowid FROM messages WHERE id=?),-1) LIMIT 1`, [row.conversation_id, row.through_message_id]);
   }
   private async hints(target: Message, botId: string): Promise<HistoryHints> {
     const next = await this.nextInput(target, botId);

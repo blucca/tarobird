@@ -145,6 +145,34 @@ describe("Gateway history handlers (#53)", () => {
     expect(f.adapter.rewindSession).toHaveBeenCalledTimes(1);
   });
 
+  it("a replay-only rewind reports this request's stored success and never executes", async () => {
+    const f = fixture();
+    await bind(f.store, sid);
+    await ledger("msg_a", sid, { firstTurnId: "t1", lastTurnId: "t2" });
+    // Nothing stored: no execution, no receipt written.
+    expect(await rewind(f.history, { requestId: "ro_none", replayOnly: true })).toEqual({ ok: false, error: "history_changed" });
+    // A stored refusal is no success either.
+    f.adapter.rewindSession.mockRejectedValueOnce(new Error("engine_busy"));
+    expect(await rewind(f.history, { requestId: "ro_fail" })).toEqual({ ok: false, error: "engine_busy" });
+    expect(await rewind(f.create(), { requestId: "ro_fail", replayOnly: true })).toEqual({ ok: false, error: "history_changed" });
+    expect(f.adapter.rewindSession).toHaveBeenCalledTimes(1);
+    // A success is replayed, also by a restarted Gateway.
+    expect(await rewind(f.history, { requestId: "ro_ok" })).toEqual({ ok: true });
+    expect(await rewind(f.create(), { requestId: "ro_ok", replayOnly: true })).toEqual({ ok: true });
+    expect(f.adapter.rewindSession).toHaveBeenCalledTimes(2);
+    // An execution still in flight in this process is joined, not repeated.
+    let finish!: () => void;
+    f.adapter.rewindSession.mockImplementationOnce((sessionId: string) => new Promise((resolve) => { finish = () => resolve({ sessionId }); }));
+    const running = rewind(f.history, { requestId: "ro_live" });
+    await vi.waitFor(() => expect(f.adapter.rewindSession).toHaveBeenCalledTimes(3));
+    const joined = rewind(f.history, { requestId: "ro_live", replayOnly: true });
+    finish();
+    expect(await Promise.all([running, joined])).toEqual([{ ok: true }, { ok: true }]);
+    // Asking again still executes nothing.
+    expect(await rewind(f.history, { requestId: "ro_none", replayOnly: true })).toEqual({ ok: false, error: "history_changed" });
+    expect(f.adapter.rewindSession).toHaveBeenCalledTimes(3);
+  });
+
   it("refuses an earlier session's message, a run without an engine turn, and an unmatched older run", async () => {
     const f = fixture();
     await bind(f.store, sid);

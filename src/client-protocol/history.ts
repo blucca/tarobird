@@ -137,6 +137,11 @@ export const historyBotRewindCallSchema = z.object({
   conversationId: id, userId: id, requestId: id,
   beforeMessageId: id,
   hints: historyHintsSchema.optional(),
+  /** Retry of an expired rewind after later input already ran: answer this
+   * request's stored success only, never execute. Executing now would also
+   * drop turns the range does not cover; without a stored success the answer
+   * is `history_changed`. */
+  replayOnly: z.literal(true).optional(),
 }).strict();
 export const historyBotForkCallSchema = z.object({
   conversationId: id, userId: id, requestId: id,
