@@ -3,7 +3,8 @@
 import type { HubConnection } from "../../src/connection.js";
 const platform = new URL(location.href).searchParams.get("platform") === "ios" ? "ios" : "android";
 const blocked = new URL(location.href).searchParams.get("blocked");
-const fixture = { calls: [] as { plugin: string; method: string; args: any }[], commands: [] as any[], opens: 0, stops: 0, documents: 0, active: true, locked: false, delayOpen: false, resumeOpen: undefined as (()=>void)|undefined, statusFailure: "" as ""|"abort"|"offline" };
+const fixture = { calls: [] as { plugin: string; method: string; args: any }[], commands: [] as any[], opens: 0, stops: 0, documents: 0, active: true, locked: false, delayOpen: false, resumeOpen: undefined as (()=>void)|undefined, statusFailure: "" as ""|"abort"|"offline", renewals: false };
+let challenge = 0;
 let socketListener = (_value: any) => {}, appListener = (_value: any) => {};
 const groups = new Map<string, { join: any; delivery: number; frame: number; generation: number; timer: number; packets: Map<number, Uint8Array>; pending: boolean }>();
 let allocation = 0;
@@ -32,6 +33,8 @@ Object.assign(window, { ...(platform === "ios" ? { webkit: { messageHandlers: { 
       if(value.type==="ack"){event(args.id,{type:"frame-ready",sessionId:group.join.session.id,generation:group.join.session.generation,streamGeneration:group.generation,frameSequence:value.frameSequence,expiresAt:Date.now()+2000});if(group.pending){group.pending=false;status(args.id,true);}}
       if(value.type==="control"){group.pending=true;group.generation++;stream(args.id);}
       if(value.type==="release")status(args.id);
+      // Opt-in Host behaviour: each accepted renew issues the next challenge.
+      if(value.type==="renew"&&fixture.renewals)status(args.id,true);
       return {};
     }
     throw Error("unexpected_native_call");
@@ -47,7 +50,7 @@ Object.defineProperty(window,"VideoDecoder",{value:Decoder});
 function event(id:string,value:any){const group=groups.get(id);if(group)socketListener({id,document:doc,kind:"screen",deliverySequence:++group.delivery,value});}
 function frame(id:string){const group=groups.get(id);if(!group)return;const bytes=writeScreenFrame({key:true,codec:"h264",sequence:++group.frame,geometryRevision:1,streamGeneration:group.generation,captureMs:Date.now(),width:1280,height:720},new Uint8Array([1,2,3]));const deliverySequence=++group.delivery;group.packets.set(deliverySequence,bytes);socketListener({id,document:doc,kind:"binary",deliverySequence,byteLength:bytes.byteLength});}
 function stream(id:string){const group=groups.get(id);if(group){event(id,{type:"stream",streamGeneration:group.generation,geometryRevision:1,codec:"h264",codecString:"avc1.42001f",width:1280,height:720,contentRect:{x:0,y:0,width:1280,height:720}});frame(id);}}
-function status(id:string,control=false){const group=groups.get(id);if(group)event(id,{type:"state",session:{...group.join.session,state:control?"controlling":"viewing"},streamGeneration:group.generation,serverTime:Date.now(),...(control?{lease:{id:"l".repeat(43),expiresAt:Date.now()+6000,challenge:"c".repeat(43),challengeExpiresAt:Date.now()+3000}}:{})});}
+function status(id:string,control=false){const group=groups.get(id);if(group)event(id,{type:"state",session:{...group.join.session,state:control?"controlling":"viewing"},streamGeneration:group.generation,serverTime:Date.now(),...(control?{lease:{id:"l".repeat(43),expiresAt:Date.now()+6000,challenge:fixture.renewals?String(++challenge).padStart(43,"c"):"c".repeat(43),challengeExpiresAt:Date.now()+3000}}:{})});}
 const display={id:"display",nativeId:"1",name:"Fixture display",revision:1,x:0,y:0,width:1280,height:720,scale:1,rotation:0};
 const connection={state:{screenAvailable:true,screenQualityAvailable:true},identity:{hubPublicKey:"fixture-key"},screenStatus:async()=>{
   // The two client-side failures seen when the Host drops: the bounded request's abort and the offline guard.
