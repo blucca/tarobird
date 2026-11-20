@@ -190,17 +190,22 @@ export function gatewayHistory(options: GatewayHistoryOptions) {
           if (!await appendHistoryLedgerLine(stateDir, ctx.scope.conversationKey, { ...record, at: Date.now() })) refuse("engine_failed");
         };
         const result = await bridge.rewindHistory!({ ...ctx.scope, sessionId: session.sessionId, anchor, workspaceOverride: ctx.workspaceOverride, beforeRevert });
-        // Side handles were forked from the history that is gone.
+        let reply: { ok: true; throughMessageId?: string } = { ok: true };
+        if (!result.reverted) {
+          // Gone before this call. Turns chatted since that earlier rewind are
+          // live: its own edge bounds the range, never this request's. Without
+          // a record nothing proves where it ended, so nothing is marked.
+          let rewinds: Awaited<ReturnType<typeof readHistoryLedgerEntries>>["rewinds"];
+          try { ({ rewinds } = await readHistoryLedgerEntries(stateDir, ctx.scope.conversationKey)); }
+          catch { return refuse("engine_failed"); }
+          const earlier = lastHistoryLedgerRewind(rewinds, call.beforeMessageId, session.sessionId);
+          if (!earlier?.throughMessageId) return refuse("already_rewound");
+          reply = { ok: true, throughMessageId: earlier.throughMessageId };
+        }
+        // Side handles were forked from the history that is gone (an earlier
+        // attempt may have ended before closing them).
         await options.closeSideSessions?.(call.conversationId).catch(() => undefined);
-        if (result.reverted) return { ok: true as const };
-        // Gone before this call. Turns chatted since that earlier rewind are
-        // live: its own edge bounds the range, never this request's. Without a
-        // record nothing proves where it ended, so nothing is marked.
-        let rewinds: Awaited<ReturnType<typeof readHistoryLedgerEntries>>["rewinds"];
-        try { ({ rewinds } = await readHistoryLedgerEntries(stateDir, ctx.scope.conversationKey)); }
-        catch { return refuse("engine_failed"); }
-        const earlier = lastHistoryLedgerRewind(rewinds, call.beforeMessageId, session.sessionId);
-        return earlier?.throughMessageId ? { ok: true as const, throughMessageId: earlier.throughMessageId } : refuse("already_rewound");
+        return reply;
       });
     } catch (error) {
       // Not an answer: the receipt stays retryable and the Hub asks again.

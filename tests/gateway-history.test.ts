@@ -190,6 +190,8 @@ describe("Gateway history handlers (#53)", () => {
     expect(await rewind(f.history, { requestId: "r2", throughMessageId: "msg_z2" })).toEqual({ ok: true, throughMessageId: "msg_z1" });
     // Gone without any record of how: nothing is marked.
     expect(await rewind(f.history, { requestId: "r3", beforeMessageId: "msg_b", throughMessageId: "msg_z3" })).toEqual({ ok: false, error: "already_rewound" });
+    // Side handles close with every answered rewind, not with a refusal.
+    expect(f.closeSideSessions).toHaveBeenCalledTimes(2);
     // A record from another session, or one without an edge, proves nothing.
     await appendHistoryLedgerLine(stateDir, key, { v: 1, kind: "rewind", requestId: "x1", sessionId: "thr-other", fromMessageId: "msg_b", throughMessageId: "msg_z4", at: 1 });
     expect(await rewind(f.history, { requestId: "r4", beforeMessageId: "msg_b" })).toEqual({ ok: false, error: "already_rewound" });
