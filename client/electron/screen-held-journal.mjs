@@ -44,12 +44,16 @@ function entryPiece(piece) {
 }
 
 export class HeldJournal {
-  #fd; #broken = false; #bytes = 0; #keys = new Set(); #buttons = new Set();
+  // `#residue`: a file of this journal may be on disk, from opening until a removal succeeds.
+  #fd; #broken = false; #residue = false; #bytes = 0; #keys = new Set(); #buttons = new Set();
   /** `login()`: the current login session's name, written once per file.
    * `fs`: the synchronous file functions, replaceable in tests. */
   constructor({ file, login = () => 'unknown', fs = { closeSync, mkdirSync, openSync, rmSync, writeSync } }) { Object.assign(this, { file, login, fs }); }
   get size() { return this.#keys.size + this.#buttons.size; }
   get open() { return this.#fd !== undefined; }
+  /** Whether `clear()` still has work: an open file, a held input, a file that
+   * may be left on disk (a failed removal or open), or a failed append. */
+  get pending() { return this.open || this.size > 0 || this.#residue || this.#broken; }
   #set(kind) { return kind === 'key' ? this.#keys : this.#buttons; }
   /** Writes all of `text` or throws. A short write is continued from where it
    * stopped; one that makes no progress is a failure. After a failure the
@@ -58,6 +62,7 @@ export class HeldJournal {
     if (this.#broken) throw new Error('screen_held_record_failed');
     try {
       if (this.#fd === undefined) {
+        this.#residue = true;
         this.fs.mkdirSync(path.dirname(this.file), { recursive: true });
         // Exclusive: a record that is already there belongs to a recovery that has not finished.
         this.#fd = this.fs.openSync(this.file, 'ax', 0o600);
@@ -89,11 +94,12 @@ export class HeldJournal {
     // Nothing held is the same as no file: a long session does not grow it without bound.
     if (!this.size && this.#bytes > HELD_JOURNAL_COMPACT_BYTES) this.clear();
   }
-  /** Nothing is held any more: the record goes. Throws if it cannot be removed. */
+  /** Nothing is held any more: the record goes. Throws if it cannot be removed;
+   * it is then still `pending`, so the caller tries again. */
   clear() {
     this.close();
     this.fs.rmSync(this.file, { force: true });
-    this.#keys.clear(); this.#buttons.clear(); this.#broken = false; this.#bytes = 0;
+    this.#keys.clear(); this.#buttons.clear(); this.#broken = false; this.#residue = false; this.#bytes = 0;
   }
   /** Closes the file and leaves it where it is, for the next start to read. */
   close() { if (this.#fd === undefined) return; const fd = this.#fd; this.#fd = undefined; try { this.fs.closeSync(fd); } catch { /* nothing more can be written either way */ } }

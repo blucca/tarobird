@@ -379,7 +379,8 @@ test('the control address on Windows is the named pipe the Host derives from its
   // The same directory spelled in another case is the same pipe; another directory is another pipe.
   assert.equal(screenControlAddress('C:\\A\\Host', 'win32'), screenControlAddress('c:\\a\\host', 'win32'));
   assert.notEqual(screenControlAddress('C:\\a\\host', 'win32'), screenControlAddress('C:\\b\\host', 'win32'));
-  assert.equal(screenControlAddress('/tmp/x/host', 'darwin'), '/tmp/x/host/hub-control.sock');
+  // The socket path uses this computer's separator, so the expectation does too (Windows runners).
+  assert.equal(screenControlAddress('/tmp/x/host', 'darwin'), path.join('/tmp/x/host', 'hub-control.sock'));
 });
 
 /** A control endpoint that answers like the Host: nothing at all without the key when `strict`. */
@@ -634,6 +635,31 @@ test('a record that could not be written whole refuses the press; what was alrea
   refuse = false;
   assert.ok(await until(() => !existsSync(next.record) && !existsSync(next.marker), 2500));
   assert.equal(next.service.status().permissions.accessibility, true);
+});
+
+test('a record whose removal failed once is removed on a later try, and the next lease can press again', async t => {
+  // A sharing violation (antivirus, indexer) makes one removal of the record fail.
+  let removals = 0;
+  const heldFs = { ...writing((_fd, _bytes, _offset, _length, real) => real()), rmSync: (file, options) => { if (removals++ === 0) throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' }); return realFs.rmSync(file, options); } };
+  const f = await controlling(t, { heldFs });
+  f.lease(); assert.ok(await f.ready());
+  f.input({ kind: 'key', code: 'KeyA', down: true }); f.input({ kind: 'key', code: 'KeyA', down: false });
+  f.control.receive({ type: 'release', sessionId: 'screen_1', reason: 'screen_control_stopped' });
+  assert.ok(removals >= 1, 'the end of the lease tried to remove the record');
+  // Nothing is held, but the file is still there: it is removed on a later try rather than left behind.
+  assert.ok(await until(() => !existsSync(f.record), 2500), 'the leftover record is removed');
+  // The next lease presses normally; a leftover would have refused its first press as an unfinished recovery.
+  const captureMs = Date.now(), next = 'N'.repeat(43);
+  f.hooks().onMessage({ type: 'frame', sessionId: 'screen_1', sequence: 2, streamGeneration: 1, captureMs, geometryRevision: f.session.display.revision, bytes: new Uint8Array([1]) });
+  f.control.receive({ type: 'ack', sessionId: 'screen_1', frameSequence: 2, streamGeneration: 1 });
+  f.control.sent.length = 0; f.state.calls.length = 0;
+  f.control.receive({ type: 'lease', sessionId: 'screen_1', generation: f.session.generation, leaseId: next, expiresAt: captureMs + 5000, frameSequence: 2, streamGeneration: 1 });
+  assert.ok(await until(() => f.control.sent.some(message => message.type === 'lease-ready')));
+  f.control.receive({ type: 'input', sessionId: 'screen_1', desktopId: f.service.desktopId, generation: f.session.generation, displayId: f.session.display.id, displayRevision: f.session.display.revision,
+    leaseId: next, sequence: 1, frameSequence: 2, expiresAt: captureMs + 2000, event: { kind: 'key', code: 'KeyB', down: true } });
+  assert.deepEqual(f.state.calls.filter(call => call[0] === 'key').map(call => call.slice(1, 3)), [[0x30, true]]);
+  assert.equal(f.control.sent.some(message => message.type === 'lease-denied'), false);
+  assert.equal(readFileSync(f.record, 'utf8'), recorded(['+key 48']));
 });
 
 test('the very first press cannot be recorded: it is not made, and the piece left on disk says nothing was pressed', async t => {
