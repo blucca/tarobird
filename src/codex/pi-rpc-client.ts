@@ -111,6 +111,7 @@ export class PiRpcClient {
 
   /** Spawn Pi in RPC mode and wait until it answers `get_state`. */
   static async start(options: PiRpcClientOptions): Promise<PiRpcClient> {
+    if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
     const spawnFn = options.spawnFn ?? spawnEngine;
     // An injected spawn function receives the command as given; the real launch runs only a resolved file.
     const command = options.spawnFn ? options.launch.command : resolvePiLaunchCommand(options.launch.command, options.env);
@@ -177,7 +178,10 @@ export class PiRpcClient {
         timer = setTimeout(() => { if (this.pending.delete(id)) { cleanup(); reject(new PiRpcTimeoutError(type, timeoutMs)); } }, timeoutMs);
         timer.unref?.();
       }
-      this.write({ id, ...command }).catch(() => {
+      // Backpressure can keep this command in our queue after its caller has
+      // cancelled or timed out. Only a command actually written to stdin may
+      // still take effect; never send an abandoned queued operation later.
+      this.write({ id, ...command }, () => this.pending.has(id)).catch(() => {
         if (this.pending.delete(id)) { cleanup(); reject(new PiRpcClosedError(type, this.exit)); }
       });
     });
@@ -244,9 +248,10 @@ export class PiRpcClient {
     });
   }
 
-  private write(record: object): Promise<void> {
+  private write(record: object, shouldWrite?: () => boolean): Promise<void> {
     const line = encodePiRecord(record);
     const next = this.writeChain.then(() => new Promise<void>((resolve, reject) => {
+      if (shouldWrite && !shouldWrite()) { resolve(); return; }
       const stdin = this.child.stdin;
       if (!stdin || stdin.destroyed || !stdin.writable || this.exit) { reject(new Error("Pi stdin is closed")); return; }
       // Honor backpressure: a large prompt (inline images) must not be interleaved or dropped.

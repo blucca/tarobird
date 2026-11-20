@@ -298,27 +298,60 @@ export const PI_MAX_FRAME_BYTES = 256 * 1024 * 1024;
 /** Strict LF framing over a byte stream; a trailing CR is stripped. */
 export class PiJsonlDecoder {
   private readonly decoder = new StringDecoder("utf8");
-  private buffer = "";
+  private fragments: string[] = [];
+  private frameBytes = 0;
   constructor(private readonly maxFrameBytes = PI_MAX_FRAME_BYTES) {}
   push(chunk: Buffer | string): string[] {
-    this.buffer += typeof chunk === "string" ? chunk : this.decoder.write(chunk);
+    const text = typeof chunk === "string" ? chunk : this.decoder.write(chunk);
     const lines: string[] = [];
-    for (let end = this.buffer.indexOf("\n"); end >= 0; end = this.buffer.indexOf("\n")) {
-      const line = this.buffer.slice(0, end);
-      this.buffer = this.buffer.slice(end + 1);
-      if (line.length > this.maxFrameBytes) throw new PiFrameTooLargeError(this.maxFrameBytes);
+    let start = 0;
+    // Scan only new text and join once per record. Repeatedly concatenating and
+    // searching a growing transcript makes fragmented large records quadratic.
+    for (let end = text.indexOf("\n", start); end >= 0; end = text.indexOf("\n", start)) {
+      let line = text.slice(start, end);
+      // UTF-8 uses at most three bytes per UTF-16 code unit. Ordinary small
+      // complete events need no extra byte-count scan or fragment allocation.
+      if (this.fragments.length) {
+        this.append(line);
+        line = this.take();
+      } else if (line.length * 3 > this.maxFrameBytes && Buffer.byteLength(line, "utf8") > this.maxFrameBytes) {
+        throw new PiFrameTooLargeError(this.maxFrameBytes);
+      }
       const record = line.endsWith("\r") ? line.slice(0, -1) : line;
       if (record.length) lines.push(record);
+      start = end + 1;
     }
-    // UTF-16 length never exceeds the UTF-8 byte length, so this bound is conservative.
-    if (this.buffer.length > this.maxFrameBytes) throw new PiFrameTooLargeError(this.maxFrameBytes);
+    this.append(text.slice(start));
     return lines;
   }
   /** Flush a final unterminated record at end of stream. */
   end(): string[] {
-    const rest = this.buffer + this.decoder.end();
-    this.buffer = "";
+    this.append(this.decoder.end());
+    const rest = this.take();
     return rest.length ? [rest.endsWith("\r") ? rest.slice(0, -1) : rest] : [];
+  }
+
+  private append(text: string): void {
+    if (!text) return;
+    this.frameBytes += Buffer.byteLength(text, "utf8");
+    // Buffer chunks go through StringDecoder. String callers can instead split
+    // a surrogate pair: two standalone replacements (3 + 3) become 4 bytes.
+    const previous = this.fragments.at(-1);
+    const last = previous?.charCodeAt(previous.length - 1), first = text.charCodeAt(0);
+    if (last !== undefined && last >= 0xd800 && last <= 0xdbff && first >= 0xdc00 && first <= 0xdfff) this.frameBytes -= 2;
+    if (this.frameBytes > this.maxFrameBytes) {
+      this.fragments = [];
+      this.frameBytes = 0;
+      throw new PiFrameTooLargeError(this.maxFrameBytes);
+    }
+    this.fragments.push(text);
+  }
+
+  private take(): string {
+    const text = this.fragments.join("");
+    this.fragments = [];
+    this.frameBytes = 0;
+    return text;
   }
 }
 

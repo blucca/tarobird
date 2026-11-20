@@ -187,6 +187,38 @@ describe("PiRpcClient startup", () => {
 });
 
 describe("PiRpcClient requests", () => {
+  it.each(["abort", "timeout"] as const)("does not send a %s request still waiting behind backpressure", async mode => {
+    const { spawner, start } = harness();
+    const client = await start(), process = spawner.last();
+    const write = process.stdin.write.bind(process.stdin);
+    let drain!: () => void;
+    vi.spyOn(process.stdin, "write").mockImplementationOnce(((line: string, callback: (error?: Error | null) => void) => {
+      return write(line, error => { drain = () => callback(error); });
+    }) as typeof process.stdin.write);
+    await client.request({ type: "get_commands" });
+    await waitFor(() => Boolean(drain));
+    const controller = new AbortController(), reason = new Error("cancelled while waiting to write");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const pending = caught(client.request({ type: "set_thinking_level", level: "high" }, {
+      signal: controller.signal, timeoutMs: 100,
+    }));
+    if (mode === "abort") controller.abort(reason);
+    else await vi.advanceTimersByTimeAsync(100);
+    expect(await pending).toMatchObject(mode === "abort" ? { message: reason.message } : { name: "PiRpcTimeoutError" });
+    drain();
+    vi.useRealTimers();
+    expect((await client.request({ type: "get_state" })).thinkingLevel).toBe("medium");
+    expect(process.received.map(command => command.type)).toEqual(["get_state", "get_commands", "get_state"]);
+  });
+
+  it("does not spawn a worker when startup was already cancelled", async () => {
+    const { start, spawner } = harness();
+    const controller = new AbortController(), reason = new Error("cancelled before startup");
+    controller.abort(reason);
+    expect(await caught(start({ signal: controller.signal }))).toBe(reason);
+    expect(spawner.processes).toHaveLength(0);
+  });
+
   it("correlates responses by id, whatever order they arrive in", async () => {
     const { options, held } = holding();
     const { spawner, start } = harness(options);

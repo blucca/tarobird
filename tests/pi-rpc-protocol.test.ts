@@ -205,6 +205,40 @@ describe("parsePiFrame", () => {
 });
 
 describe("PiJsonlDecoder", () => {
+  it("enforces the UTF-8 byte limit for fragmented Unicode records", () => {
+    const exact = new PiJsonlDecoder(7);
+    expect(exact.push(Buffer.from("汉🙂\n"))).toEqual(["汉🙂"]);
+    const tooLarge = new PiJsonlDecoder(6);
+    const bytes = Buffer.from("汉🙂");
+    expect(tooLarge.push(bytes.subarray(0, 5))).toEqual([]);
+    expect(() => tooLarge.push(bytes.subarray(5))).toThrow(PiFrameTooLargeError);
+    expect(() => new PiJsonlDecoder(6).push("汉🙂\n")).toThrow(PiFrameTooLargeError);
+  });
+
+  it("counts an emoji split between string chunks as one UTF-8 character", () => {
+    const decoder = new PiJsonlDecoder(4);
+    expect(decoder.push("\ud83d")).toEqual([]);
+    expect(decoder.push("\ude42\n")).toEqual(["🙂"]);
+  });
+
+  it("checks incomplete UTF-8 flushed at EOF and releases rejected fragments", () => {
+    const decoder = new PiJsonlDecoder(2);
+    expect(decoder.push(Buffer.from([0xe6, 0xb1]))).toEqual([]);
+    expect(() => decoder.end()).toThrow(PiFrameTooLargeError);
+    expect(decoder.end()).toEqual([]);
+    expect(decoder.push("a\n")).toEqual(["a"]);
+  });
+
+  it("reassembles a large fragmented transcript and resets the limit for each record", () => {
+    const frame = JSON.stringify({ text: "汉🙂".repeat(100_000) });
+    const bytes = Buffer.from(frame + "\r\n" + frame + "\n");
+    const decoder = new PiJsonlDecoder(Buffer.byteLength(frame) + 1);
+    const records: string[] = [];
+    for (let i = 0; i < bytes.length; i += 4096) records.push(...decoder.push(bytes.subarray(i, i + 4096)));
+    expect(records).toEqual([frame, frame]);
+    expect(decoder.end()).toEqual([]);
+  });
+
   it("splits on LF only and strips a trailing CR", () => {
     const decoder = new PiJsonlDecoder();
     expect(decoder.push('{"a":1}\n{"b":2}\r\n{"c"')).toEqual(['{"a":1}', '{"b":2}']);

@@ -179,6 +179,8 @@ function abortError(): Error {
   error.name = "AbortError";
   return error;
 }
+/** The adapter was retired under a turn that had not finished. Whatever it produced so far is not an answer. */
+const destroyedTurnError = () => new EngineIncompleteResponseError("Pi adapter was destroyed before the turn finished", "interrupted");
 const minutes = (ms: number) => { const value = Math.max(1, Math.round(ms / 60_000)); return `${value} ${value === 1 ? "minute" : "minutes"}`; };
 const isThinkingLevel = (value: unknown): value is PiThinkingLevel => (PI_THINKING_LEVELS as readonly unknown[]).includes(value);
 /** The Host's canonical form: no whitespace, so the settings-error reader can take the identity whole, and the same value the Bot setting shows. */
@@ -435,6 +437,10 @@ export class PiRpcAdapter implements CodexAdapter {
     if (input.abortSignal?.aborted) throw abortError();
     const cwd = await this.resolveWorkspace(input.workspaceOverride);
     const first = await this.ensureWorker(sessionId, cwd, input.abortSignal);
+    // Readying the workspace and the process can outlast the request. A stop that came meanwhile would
+    // never reach a listener attached from here on, so no turn begins. Nothing has been sent to Pi, and
+    // the process is left as it is: another caller may have started it.
+    if (input.abortSignal?.aborted) throw abortError();
     if (first.turn) throw new Error("Pi session already has a turn in progress");
     if (first.exclusive) throw new PiNativeBusyError(first.exclusive);
     const turn = this.beginTurn(first, input);
@@ -484,6 +490,8 @@ export class PiRpcAdapter implements CodexAdapter {
     await Promise.allSettled([...this.starting.values()]);
     const workers = [...this.workers.values()];
     this.workers.clear();
+    // Ending a process under a running turn is not that turn finishing: what it streamed so far is not an answer.
+    for (const worker of workers) worker.turn?.done.reject(destroyedTurnError());
     await Promise.all(workers.map(worker => this.closeWorker(worker, { graceMs: 3_000 })));
   }
 
@@ -507,6 +515,8 @@ export class PiRpcAdapter implements CodexAdapter {
       turn.turnTimer.unref?.();
     }
     this.noteActivity(turn);
+    // An abort that came before the listener was attached is never delivered to it.
+    if (input.abortSignal?.aborted) stop();
     return turn;
   }
 
@@ -542,6 +552,8 @@ export class PiRpcAdapter implements CodexAdapter {
 
   private throwIfStopped(turn: Turn): void {
     if (turn.stopRequested) throw abortError();
+    // A step that lost its process to `destroy` may still have returned: the command layer turns that loss into reply text.
+    if (this.destroyed) throw destroyedTurnError();
   }
 
   /** Await `work`, but give up as soon as the turn is stopped. The work itself is not cancelled by this. */
@@ -1570,6 +1582,13 @@ export class PiRpcAdapter implements CodexAdapter {
         const registered = await bridge.setMcpServers([{ name: managedSearch.name, config: managedSearch.config }]);
         if (registered.includes(managedSearch.name)) current.managedSearchPrefix = managedSearch.toolPrefix;
       } catch { /* search is an extra; the session works without it */ }
+    }
+    // That registration waited on Pi. The adapter may have been retired meanwhile, or the process may
+    // have ended: neither is handed out, or filed, as this session's live process.
+    if (this.destroyed) { await discard(); throw new Error("Pi adapter has been destroyed"); }
+    if (current.closed) {
+      const failed = new PiStartupError("Pi exited during startup", "exit", await client.exited);
+      throw new PiStartupError(this.startupMessage(failed), failed.reason, failed.exit);
     }
     this.workers.set(sessionId, current);
     return current;

@@ -25,6 +25,10 @@ fingerprints in the Pi session store.
 Pi workspace comparison follows physical directory links and Windows casing,
 while still rejecting cross-workspace session reuse. Settings and runtime errors
 share the App/CLI recovery guidance and retain the native inactivity meaning.
+Pi RPC drops cancelled commands before a queued stdin write, assembles large
+records without rescanning accumulated fragments, and reports unfinished turns
+as interrupted when their adapter is retired. See the
+[scoped verification](client/pi-efficiency-stability-2026-11-20.md).
 
 [1.5.1 preflight](client/release-1.5.1-preflight.md) records shared Android
 channel versions, cross-host permissions, date refresh, mobile cleanup and the

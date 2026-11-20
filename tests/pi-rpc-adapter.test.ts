@@ -37,6 +37,8 @@ class FakeBridge {
   readonly labels: Array<{ entryId: string; label: string | null }> = [];
   readonly mcpServers: Array<Array<{ name: string; config: Record<string, unknown> }>> = [];
   controlResult: { cancelled?: boolean } = {};
+  /** Awaited before the search server registration is answered. */
+  searchRegistration?: () => Promise<void>;
   skipInstall = false;
   open = true;
   private resolveClosed!: () => void;
@@ -53,7 +55,7 @@ class FakeBridge {
       },
       listTools: async () => [{ name: "read", active: true, exposure: "direct", origin: "builtin" as const }],
       setActiveTools: async names => names.map(name => ({ name, active: true, origin: "other" as const })),
-      setMcpServers: async servers => { bridge.mcpServers.push(servers); return servers.map(server => server.name); },
+      setMcpServers: async servers => { bridge.mcpServers.push(servers); await bridge.searchRegistration?.(); return servers.map(server => server.name); },
       setLabel: async (entryId, label) => { bridge.labels.push({ entryId, label }); },
       readSettings: async () => ({}),
       control: async (request, options) => {
@@ -89,6 +91,8 @@ async function rig(input: {
   nativeDefault?: { provider: string; modelId: string; thinkingLevel: string } | null;
   /** Bridge events that arrive while Pi is still starting, before the adapter has a worker for the process. */
   startupEvents?: PiBridgeEvent[];
+  /** Holds the answer to the search server registration, the last wait before a started process is handed out. */
+  searchRegistration?: () => Promise<void>;
 } = {}): Promise<Rig> {
   const root = await mkdtemp(path.join(os.tmpdir(), "pi-adapter-"));
   const stateDir = path.join(root, "state"), workspace = path.join(root, "ws"), configPath = path.join(stateDir, "config.json");
@@ -114,6 +118,7 @@ async function rig(input: {
     spawnFn: spawner.spawn, killProcessTreeFn: pid => { for (const process of spawner.processes) if (process.pid === pid) process.exit(null, "SIGKILL"); },
     openBridgeFn: async ({ handler }) => {
       const bridge = new FakeBridge(); bridge.handler = handler; bridges.push(bridge);
+      if (input.searchRegistration) bridge.searchRegistration = input.searchRegistration;
       for (const event of input.startupEvents ?? []) handler.onEvent(event);
       startupApprovals.push(await handler.approve({ toolName: "bash", toolCallId: "early", origin: "builtin", input: {} }, new AbortController().signal));
       const endpoint: PiBridgeEndpoint = {
@@ -1136,6 +1141,163 @@ describe("PiRpcAdapter lifecycle regressions", () => {
     expect((await turn).message).toMatch(/destroyed/);
     await waitFor(() => r.spawner.last().exitCode !== null || r.spawner.last().signalCode !== null);
     expect(r.adapter.hasPendingNativeWork()).toBe(false);
+  });
+
+  // A stop can arrive after `sendUserMessage` was called and before its turn exists: while the Bot
+  // configuration is read, while a start another caller began is awaited, or while the search server is
+  // registered. An abort listener attached afterwards is never called, so such a turn must not begin.
+  describe("a message stopped before its turn exists", () => {
+    const plan: NativeSearchMcpPlan = { name: MANAGED_SEARCH_MCP_NAME, command: "/synthetic/node", args: ["/synthetic/search-mcp.js"], envKeys: [], processEnv: {} };
+    const sentToPi = (r: Rig) => r.spawner.processes.flatMap(process => commands(process).map(command => command.type))
+      .filter(type => type === "prompt" || type === "abort" || type === "clear_queue");
+
+    it("sends nothing to a live process when the stop comes in the same tick as the message", async () => {
+      const r = await rig();
+      const { sessionId } = await r.adapter.createSession(1);
+      await r.adapter.sendUserMessage(sessionId, message("warm", { workspaceOverride: r.workspace }));
+      // Without an override the workspace is read from the Bot configuration first, which takes a file read.
+      for (const extra of [{ workspaceOverride: r.workspace }, {}]) {
+        const controller = new AbortController();
+        const turn = r.adapter.sendUserMessage(sessionId, message("stopped", { abortSignal: controller.signal, ...extra }));
+        controller.abort();
+        await expect(turn).rejects.toMatchObject({ name: "AbortError" });
+      }
+      expect(sentToPi(r)).toEqual(["prompt"]);
+      // The process was left alone and has no turn: the next message runs on it.
+      expect((await r.adapter.sendUserMessage(sessionId, message("next"))).text).toBe("ok");
+      expect(r.spawner.processes).toHaveLength(1);
+    });
+
+    it("sends nothing when the stop comes while the search server is being registered, and keeps the process", async () => {
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const r = await rig({ options: { nativeSearchMcp: () => plan }, searchRegistration: () => held });
+      const { sessionId } = await r.adapter.createSession(1);
+      const controller = new AbortController();
+      const turn = r.adapter.sendUserMessage(sessionId, message("stopped", { abortSignal: controller.signal }));
+      await waitFor(() => r.bridges.length === 1 && r.bridge().mcpServers.length === 1);
+      controller.abort();
+      release();
+      await expect(turn).rejects.toMatchObject({ name: "AbortError" });
+      expect(sentToPi(r)).toEqual([]);
+      expect((await r.adapter.sendUserMessage(sessionId, message("next"))).text).toBe("ok");
+      expect(r.spawner.processes).toHaveLength(1);
+    });
+
+    it("sends nothing for a stopped message that joined another caller's start, and does not end that process", async () => {
+      let answer: (() => void) | undefined;
+      const r = await rig({ pi: { onCommand: (command, process) => {
+        if (command.type !== "get_state" || process.received.filter(item => item.type === "get_state").length > 1) return false;
+        answer = () => process.respond(command, { ...process.state, messageCount: 0, pendingMessageCount: 0 });
+        return true;
+      } } });
+      const { sessionId } = await r.adapter.createSession(1);
+      const usage = r.adapter.getContextUsage(sessionId, { workspaceOverride: r.workspace });
+      await waitFor(() => Boolean(answer));
+      const controller = new AbortController();
+      const turn = r.adapter.sendUserMessage(sessionId, message("stopped", { abortSignal: controller.signal, workspaceOverride: r.workspace }));
+      // The message is now waiting for the start the usage read began.
+      await new Promise(resolve => setImmediate(resolve));
+      controller.abort();
+      answer!();
+      await expect(turn).rejects.toMatchObject({ name: "AbortError" });
+      expect(await usage).toMatchObject({ contextWindow: 32000 });
+      expect(sentToPi(r)).toEqual([]);
+      expect(r.spawner.last().exitCode).toBeNull();
+      expect((await r.adapter.sendUserMessage(sessionId, message("next"))).text).toBe("ok");
+      expect(r.spawner.processes).toHaveLength(1);
+    });
+
+    it("stops a turn at once when it is begun for a request that is already stopped", async () => {
+      const r = await rig({ pi: { onPrompt: () => { /* runs until stopped */ } } });
+      const { sessionId } = await r.adapter.createSession(1);
+      const internals = r.adapter as unknown as {
+        ensureWorker(sessionId: string, cwd: string): Promise<unknown>;
+        beginTurn(worker: unknown, input: CodexUserMessageInput): { stopRequested: boolean; stopping?: Promise<void> };
+        endTurn(turn: unknown): void;
+      };
+      const worker = await internals.ensureWorker(sessionId, r.workspace);
+      const controller = new AbortController();
+      controller.abort();
+      const turn = internals.beginTurn(worker, message("late", { abortSignal: controller.signal }));
+      expect(turn.stopRequested).toBe(true);
+      await turn.stopping;
+      internals.endTurn(turn);
+      expect(sentToPi(r)).toEqual(["clear_queue", "abort", "clear_queue"]);
+      expect(r.adapter.hasPendingNativeWork()).toBe(false);
+    });
+  });
+
+  it("does not hand out a process when the adapter is destroyed, or Pi exits, while the search server is being registered", async () => {
+    const plan: NativeSearchMcpPlan = { name: MANAGED_SEARCH_MCP_NAME, command: "/synthetic/node", args: ["/synthetic/search-mcp.js"], envKeys: [], processEnv: {} };
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const retired = await rig({ options: { nativeSearchMcp: () => plan }, searchRegistration: () => held });
+    const retiredId = (await retired.adapter.createSession(1)).sessionId;
+    const turn = failure(retired.adapter.sendUserMessage(retiredId, message("hi")));
+    await waitFor(() => retired.bridges.length === 1 && retired.bridge().mcpServers.length === 1);
+    // A second caller waiting for the same start gets no process either.
+    const usage = failure(retired.adapter.getContextUsage(retiredId, { workspaceOverride: retired.workspace }));
+    await new Promise(resolve => setImmediate(resolve));
+    const destroying = retired.adapter.destroy();
+    release();
+    await destroying;
+    expect((await turn).message).toMatch(/destroyed/);
+    expect((await usage).message).toMatch(/destroyed/);
+    expect(commands(retired.spawner.last()).map(command => command.type).filter(type => type === "prompt" || type === "get_session_stats")).toEqual([]);
+    await waitFor(() => retired.spawner.last().exitCode !== null || retired.spawner.last().signalCode !== null);
+    expect(retired.adapter.hasPendingNativeWork()).toBe(false);
+
+    let exits = 0;
+    const gone = await rig({ options: { nativeSearchMcp: () => plan }, searchRegistration: async () => {
+      if (exits++) return;
+      // Pi ends while the registration is still unanswered; answer only after the exit has been seen.
+      const process = gone.spawner.last();
+      const closed = new Promise<void>(resolve => { process.once("close", () => resolve()); });
+      process.exit(1);
+      await closed;
+      await new Promise(resolve => setImmediate(resolve));
+    } });
+    const { sessionId } = await gone.adapter.createSession(1);
+    const error = await failure(gone.adapter.sendUserMessage(sessionId, message("hi")));
+    expect(error).toBeInstanceOf(PiStartupError);
+    expect((error as PiStartupError).reason).toBe("exit");
+    // The ended process was not filed as this session's live one: the next message gets a process of its own.
+    expect(gone.adapter.supportsSessionSteering(sessionId)).toBe(false);
+    expect((await gone.adapter.sendUserMessage(sessionId, message("again"))).text).toBe("ok");
+    expect(gone.spawner.processes).toHaveLength(2);
+  });
+
+  it("fails the turn whose process the adapter ends when it is destroyed, instead of returning the partial reply", async () => {
+    let streamed = false;
+    const r = await rig({ pi: { onPrompt: run => { run.reply("first half of the answer"); streamed = true; /* the run goes on */ } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("long task");
+    const turn = failure(r.adapter.sendUserMessage(sessionId, input));
+    await waitFor(() => streamed && input.events.some(event => event.type === "assistant_text"));
+    await r.adapter.destroy();
+    const error = await turn;
+    expect(error).toBeInstanceOf(EngineIncompleteResponseError);
+    expect((error as EngineIncompleteResponseError).reason).toBe("interrupted");
+    expect(error.message).toMatch(/destroyed/);
+    // What had been streamed is not presented as the finished answer.
+    expect(kinds(input.events)).not.toContain("result");
+  });
+
+  it("fails a command turn the same way when the adapter is destroyed while its command is running", async () => {
+    let asked = false;
+    const r = await rig({ pi: { onCommand: command => { if (command.type !== "get_session_stats") return false; asked = true; return true; /* never answered */ } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("/session");
+    const turn = failure(r.adapter.sendUserMessage(sessionId, input));
+    await waitFor(() => asked);
+    await r.adapter.destroy();
+    const error = await turn;
+    expect(error).toBeInstanceOf(EngineIncompleteResponseError);
+    expect((error as EngineIncompleteResponseError).reason).toBe("interrupted");
+    expect(error.message).toMatch(/destroyed/);
+    // The command layer turns the lost process into reply text; that text is not this turn's result.
+    expect(kinds(input.events)).not.toContain("result");
   });
 
   it("puts the thinking level back when the Bot effort is cleared, unless the conversation chose its own", async () => {

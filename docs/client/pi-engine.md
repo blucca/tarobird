@@ -78,6 +78,21 @@ model or unsupported thinking level, including a reset to the Bot default, is
 a known rejection and does not lock the panel. A write followed by an unconfirmed
 state read remains uncertain.
 
+RPC commands cancelled or timed out while still waiting behind stdin
+backpressure are discarded before writing. Commands already sent retain the
+uncertain-outcome rules above; cancellation is not a rollback. A startup request
+whose signal is already aborted launches no process. Large JSONL replies are assembled from
+fragments without repeatedly rescanning the accumulated history. The per-record
+limit remains 256 MiB and is enforced in UTF-8 bytes, including Unicode and the
+final unterminated record.
+
+A message cancelled while waiting for the workspace or a shared process to
+become ready does not begin a turn or send a prompt. A ready process can still
+serve another caller. Retiring the adapter interrupts unfinished model and
+native-command turns; a partial reply or command failure is not reported as a
+completed result. A process that exits or is retired during final startup
+registration is never published as live.
+
 ## Permissions and tools
 
 Normal mode asks for approval for shell commands, writes and other tools that
