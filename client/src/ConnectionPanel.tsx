@@ -1,5 +1,6 @@
 import { RemoteScreenPanel } from "./RemoteScreenPanel.js";
 import { RemoteScreenSettings } from "./RemoteScreenSettings.js";
+import { isMobileScreenApp } from "./mobile-screen-viewer-transport.js";
 import { useContext, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { ChevronLeft, X } from "lucide-react";
 import type { HubConnection } from "./connection.js";
@@ -43,7 +44,7 @@ export function ConnectionPanel({ connection, close, returnFocus, backLabel, ope
     node?.querySelector<HTMLButtonElement>(".preferences-header button")?.focus();
     return () => { intentionalClose.current = true; node?.close(); if (returnFocus?.current?.isConnected) returnFocus.current.focus({ preventScroll: true }); else restore(); };
   }, [returnFocus]);
-  return <><dialog ref={dialog} className={`preferences-dialog is-movable settings-detail connection-dialog${viewing ? " screen-connection-dialog" : ""}${backLabel ? " connection-subpage" : ""}`} aria-label={t("连接状态与线路")} onCancel={event => { if (event.target !== event.currentTarget) return; event.preventDefault(); event.stopPropagation(); requestClose(); }} onClose={event => {
+  return <><dialog ref={dialog} className={`preferences-dialog is-movable settings-detail connection-dialog${viewing ? " screen-connection-dialog" : ""}${viewing&&isMobileScreenApp()?" screen-mobile-dialog":""}${backLabel ? " connection-subpage" : ""}`} aria-label={t("连接状态与线路")} onCancel={event => { if (event.target !== event.currentTarget) return; event.preventDefault(); event.stopPropagation(); requestClose(); }} onClose={event => {
     if (event.target !== event.currentTarget || intentionalClose.current || event.currentTarget.open) return;
     if (anyBusy || anyDirty) { event.currentTarget.showModal(); if (anyDirty && !anyBusy) setDiscard(true); } else close();
   }}>

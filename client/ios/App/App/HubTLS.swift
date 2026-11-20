@@ -8,6 +8,8 @@ struct HubNetworkError: LocalizedError {
     var errorDescription: String? { code }
 }
 
+enum HubScreenRole: String { case control, media }
+
 enum HubTLS {
     static let readBytes = 256 * 1024
     static let bodyLimit = 8 * 1024 * 1024
@@ -114,7 +116,9 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
     var usable: Bool { dispatchPrecondition(condition: .onQueue(queue)); return !retired }
     var trustFailure: Error? { dispatchPrecondition(condition: .onQueue(queue)); return terminalTrustFailure }
     private var handlers: [Int: HubTaskHandler] = [:]
-    private lazy var session: URLSession = {
+    private var screenConnections: [ObjectIdentifier: HubScreenConnection] = [:]
+    private lazy var session: URLSession = makeSession(delegate: self, screen: false)
+    fileprivate func makeSession(delegate: URLSessionDelegate, screen: Bool) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil
         configuration.urlCredentialStorage = nil
@@ -125,14 +129,17 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
         configuration.httpMaximumConnectionsPerHost = 4
         configuration.waitsForConnectivity = false
         configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 1200
+        // WebSocket tasks otherwise inherit the ordinary request resource
+        // lifetime. Screen attachment, heartbeat and consumption watchdogs
+        // provide their bounds; zero is Foundation's no-resource-expiry value.
+        configuration.timeoutIntervalForResource = screen ? 0 : 1200
         configuration.tlsMinimumSupportedProtocolVersion = .TLSv12
         configuration.connectionProxyDictionary = [:]
         let delegates = OperationQueue()
         delegates.maxConcurrentOperationCount = 1
         delegates.underlyingQueue = queue
-        return URLSession(configuration: configuration, delegate: self, delegateQueue: delegates)
-    }()
+        return URLSession(configuration: configuration, delegate: delegate, delegateQueue: delegates)
+    }
 
     private init(base: URL, queue: DispatchQueue, anchors: [SecCertificate]?) {
         self.base = base; self.queue = queue; self.anchors = anchors
@@ -202,6 +209,17 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
         }
     }
 
+    /// Every viewer group owns a separate native session. It inherits this
+    /// route's verified identity/pin, but never the chat resource deadline.
+    func screenConnection(control: HubTaskHandler, media: HubTaskHandler) throws -> HubScreenConnection {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !retired, pin != nil else { throw HubNetworkError("native_route_not_verified") }
+        let connection = HubScreenConnection(owner: self, control: control, media: media)
+        screenConnections[ObjectIdentifier(connection)] = connection
+        return connection
+    }
+    fileprivate func removeScreen(_ connection: HubScreenConnection) { screenConnections.removeValue(forKey: ObjectIdentifier(connection)) }
+
     func socket(handler: HubTaskHandler) throws -> URLSessionWebSocketTask {
         dispatchPrecondition(condition: .onQueue(queue))
         guard !retired, pin != nil else { throw HubNetworkError("native_route_not_verified") }
@@ -216,7 +234,10 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
     }
 
     func retire() { dispatchPrecondition(condition: .onQueue(queue)); guard !retired else { return }; retired = true; session.finishTasksAndInvalidate() }
-    func cancelAll() { dispatchPrecondition(condition: .onQueue(queue)); retired = true; cancelled = true; session.invalidateAndCancel() }
+    func cancelAll() {
+        dispatchPrecondition(condition: .onQueue(queue)); retired = true; cancelled = true; session.invalidateAndCancel()
+        for connection in Array(screenConnections.values) { connection.cancel() }
+    }
 
     private func rejectTrust(_ code: String, _ completion: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         terminalTrustFailure = HubNetworkError(code)
@@ -224,7 +245,7 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
         cancelAll()
     }
 
-    private func challenge(_ challenge: URLAuthenticationChallenge,
+    fileprivate func challenge(_ challenge: URLAuthenticationChallenge,
                            completion: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         dispatchPrecondition(condition: .onQueue(queue))
         let protection = challenge.protectionSpace
@@ -291,6 +312,50 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
     }
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        handlers[webSocketTask.taskIdentifier]?.socketClosed(closeCode.rawValue, reason: reason)
+    }
+}
+
+/// The delegate is isolated per screen group: URLSession task identifiers are
+/// only unique within one session. It forwards TLS trust to the verified route
+/// and never broadens paths, credentials, redirects or certificate policy.
+final class HubScreenConnection: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
+    private weak var owner: HubTLSSession?
+    private var session: URLSession?
+    private var handlers: [Int: HubTaskHandler] = [:]
+    private(set) var control: URLSessionWebSocketTask!, media: URLSessionWebSocketTask!
+    fileprivate init(owner: HubTLSSession, control: HubTaskHandler, media: HubTaskHandler) {
+        self.owner = owner; super.init()
+        let native = owner.makeSession(delegate: self, screen: true); session = native
+        func task(_ role: HubScreenRole, _ handler: HubTaskHandler) -> URLSessionWebSocketTask {
+            var parts = URLComponents(url: owner.base, resolvingAgainstBaseURL: false)!
+            parts.scheme = "wss"; parts.path = "/screen/v1/" + role.rawValue
+            var request = URLRequest(url: parts.url!); request.timeoutInterval = 5
+            let task = native.webSocketTask(with: request)
+            task.maximumMessageSize = role == .media ? 1048576 : 16384
+            handlers[task.taskIdentifier] = handler; return task
+        }
+        self.control = task(.control, control); self.media = task(.media, media)
+    }
+    func cancel() {
+        guard let native = session else { return }; session = nil
+        control?.cancel(); media?.cancel(); control = nil; media = nil
+        handlers.removeAll(); native.invalidateAndCancel()
+        owner?.removeScreen(self); owner = nil
+    }
+    private func challenge(_ value: URLAuthenticationChallenge, _ completion: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard session != nil, let owner = owner else { completion(.cancelAuthenticationChallenge, nil); return }
+        owner.challenge(value, completion: completion)
+    }
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) { self.challenge(challenge, completionHandler) }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) { self.challenge(challenge, completionHandler) }
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) { handlers.removeValue(forKey: task.taskIdentifier)?.completed(error) }
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) { handlers[webSocketTask.taskIdentifier]?.socketOpened() }
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         handlers[webSocketTask.taskIdentifier]?.socketClosed(closeCode.rawValue, reason: reason)
     }
 }

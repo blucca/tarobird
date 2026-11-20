@@ -211,6 +211,10 @@ jobs:
         working-directory: client
       - run: ./gradlew assembleDebug testDebugUnitTest lintDebug
         working-directory: client/android
+      - name: Native pinned transport and screen loopback regressions
+        run: node client/scripts/android-transport-audit.mjs "$RUNNER_TEMP/android-transport-audit"
+        env:
+          TAROCUB_JVM_CACHE: ${{ runner.temp }}/android-transport-jars
       - uses: actions/upload-artifact@v4
         with:
           name: android-development-apk
@@ -241,3 +245,5 @@ jobs:
         env:
           TAROCUB_IDENTITY_PLATFORM: ios
         run: node client/scripts/mobile-identity-audit.mjs "$RUNNER_TEMP/identity-audit"
+      - name: Native pinned screen lifetime and delivery regressions
+        run: node client/scripts/ios-screen-audit.mjs "$RUNNER_TEMP/ios-screen-audit"

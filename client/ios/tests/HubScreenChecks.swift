@@ -1,0 +1,290 @@
+import Foundation
+
+final class ScreenEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [[String: Any]] = []
+    private var closes: [String: Int] = [:]
+    func append(_ event: [String: Any]) { lock.lock(); defer { lock.unlock() }; pending.append(event); if event["kind"] as? String == "close", let id = event["id"] as? String { closes[id, default: 0] += 1 } }
+    func pop(_ id: String, _ kind: String) -> [String: Any]? { lock.lock(); defer { lock.unlock() }; guard let index = pending.firstIndex(where: { $0["id"] as? String == id && $0["kind"] as? String == kind }) else { return nil }; return pending.remove(at: index) }
+    func count(_ id: String) -> Int { lock.lock(); defer { lock.unlock() }; return closes[id] ?? 0 }
+}
+final class ScreenFixture {
+    let process = Process(), input = Pipe(), output = Pipe()
+    var network: [String: Any] = [:]
+    init(_ repo: String, _ scratch: String) throws {
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env"); process.arguments = ["node", "client/android/audit/screen-fixture.mjs", scratch]
+        process.currentDirectoryURL = URL(fileURLWithPath: repo); process.standardInput = input; process.standardOutput = output
+        try process.run(); network = try read()
+    }
+    private func read() throws -> [String: Any] {
+        var bytes = Data()
+        while let next = try output.fileHandleForReading.read(upToCount: 1), !next.isEmpty {
+            if next[0] == 10 { return try JSONSerialization.jsonObject(with: bytes) as! [String: Any] }
+            bytes.append(next); if bytes.count > 1048576 { throw HubNetworkError("fixture_response_limit") }
+        }
+        throw HubNetworkError("fixture_stopped")
+    }
+    func request(_ value: [String: Any]) throws -> [String: Any] {
+        var bytes = try JSONSerialization.data(withJSONObject: value); bytes.append(10)
+        try input.fileHandleForWriting.write(contentsOf: bytes); return try read()
+    }
+    func stop() { _ = try? request(["action": "stop"]); if process.isRunning { process.terminate() }; process.waitUntilExit() }
+}
+final class ScreenClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 0
+    func read() -> TimeInterval { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ value: TimeInterval) { lock.lock(); self.value = value; lock.unlock() }
+}
+@main struct HubScreenChecks {
+    static var checks: [String: Bool] = [:]
+    static func check(_ value: Bool, _ name: String) throws { guard value else { throw HubNetworkError("FAILED_" + name) }; checks[name] = true }
+    static func reject(_ name: String, _ action: () async throws -> Void) async throws {
+        do { try await action() } catch { checks[name] = true; return }; throw HubNetworkError("NOT_REJECTED_" + name)
+    }
+    static func call(_ manager: HubTransport, _ method: String, _ args: [String: Any] = [:]) async throws -> [String: Any] {
+        try await withCheckedThrowingContinuation { continuation in manager.invoke(method, args) { continuation.resume(with: $0) } }
+    }
+    static func event(_ manager: HubTransport, _ log: ScreenEvents, _ id: String, _ kind: String, notify: Bool = true) async throws -> [String: Any] {
+        let until = ProcessInfo.processInfo.systemUptime + 8
+        while ProcessInfo.processInfo.systemUptime < until {
+            if let value = log.pop(id, kind) { if !notify || manager.acceptScreenEvent(value) { return value } }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw HubNetworkError("event_timeout_" + kind)
+    }
+    static func join(_ control: Bool = false) -> [String: Any] {
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        return ["session": ["id": UUID().uuidString, "generation": UUID().uuidString, "desktopId": "synthetic-desktop", "deviceId": "synthetic-device", "deviceName": "Synthetic viewer",
+                            "display": ["id": "synthetic", "nativeId": "1", "name": "Synthetic", "revision": 1, "x": 0, "y": 0, "width": 64, "height": 64, "scale": 1, "rotation": 0], "controlAllowed": control, "state": "viewing", "createdAt": now],
+                "controlTicket": try! HubTLS.nonce(), "mediaTicket": try! HubTLS.nonce(), "expiresAt": now + 30000, "serverTime": now, "quality": "smooth"]
+    }
+    static func sid(_ join: [String: Any]) -> String { (join["session"] as! [String: Any])["id"] as! String }
+    static func command(_ join: [String: Any], _ type: String, _ extra: [String: Any] = [:]) -> [String: Any] {
+        let session = join["session"] as! [String: Any]
+        return extra.merging(["type": type, "sessionId": session["id"]!, "generation": session["generation"]!]) { _, right in right }
+    }
+    static func open(_ manager: HubTransport, _ log: ScreenEvents, _ fixture: ScreenFixture, _ document: String, _ join: [String: Any]) async throws -> String {
+        _ = try fixture.request(["action": "register", "join": join])
+        let id = try await call(manager, "allocate", ["document": document, "kind": "screen"])["value"] as! String
+        _ = try await call(manager, "screenOpen", ["id": id, "network": fixture.network, "join": join])
+        for _ in 0..<3 {
+            let value = try await event(manager, log, id, "screen")
+            try check(value["document"] as? String == document, "documentStamped")
+            _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": value["deliverySequence"]!])
+        }
+        return id
+    }
+    static func peerClosed(_ fixture: ScreenFixture, _ join: [String: Any]) async throws {
+        let until = ProcessInfo.processInfo.systemUptime + 5
+        while ProcessInfo.processInfo.systemUptime < until {
+            let peers = try fixture.request(["action": "stats"])["open"] as! [[String: Any]]
+            if !peers.contains(where: { $0["id"] as? String == sid(join) }) { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw HubNetworkError("peer_remained_open")
+    }
+    static func closeReasons(_ fixture: ScreenFixture) async throws {
+        let log = ScreenEvents()
+        // Capture the same terminal event that crosses the plugin queue hop.
+        let manager = HubTransport { log.append($0) }; defer { manager.reset(destroy: true) }
+        manager.setScreenActive(true)
+        let document = try await call(manager, "document")["value"] as! String
+        let cases: [(Int, String, String?, String)] = [
+            (4000, "screen_locked", nil, "closedStateAndBothSocketsKeepHostReason"),
+            (4000, "screen_permission_revoked", "media", "mediaFirstKeepsHostReason"),
+            (4000, "screen_display_changed", "control", "controlFirstKeepsHostReason"),
+            (1000, "screen_locked", nil, "nonHostCloseCodeIsGeneric"),
+            (4000, "screen_", nil, "emptyReasonSuffixIsGeneric"),
+            (4000, "screen_locked\n", nil, "newlineReasonIsGeneric"),
+            (4000, "screen_Locked", nil, "uppercaseReasonIsGeneric"),
+            (4000, "screen_locked🔒", nil, "unicodeReasonIsGeneric"),
+            (4000, "screen_" + String(repeating: "a", count: 58), nil, "oversizedReasonIsGeneric"),
+            (4000, "screen_" + String(repeating: "a", count: 57), nil, "maximumBoundedReasonIsPreserved")
+        ]
+        for (code, reason, role, name) in cases {
+            let value = join(), id = try await open(manager, log, fixture, document, value)
+            var input: [String: Any] = ["action": "close-host", "id": sid(value), "code": code, "reason": reason]
+            if let role = role { input["role"] = role }
+            _ = try fixture.request(input)
+            let terminal = try await event(manager, log, id, "close")
+            let expected = name.hasSuffix("IsGeneric") ? "screen_socket_closed" : reason
+            try check(terminal["reason"] as? String == expected, name)
+            try await peerClosed(fixture, value)
+            try await Task.sleep(nanoseconds: 50_000_000)
+            try check(log.count(id) == 1, name + "SingleTerminal")
+            if let queued = log.pop(id, "screen") { try check(!manager.acceptScreenEvent(queued), name + "NoRetiredStateReplay") }
+        }
+    }
+    static func attachClock(_ fixture: ScreenFixture) async throws {
+        let clock = ScreenClock(), log = ScreenEvents()
+        let manager = HubTransport(screenNow: { clock.read() }) { log.append($0) }; defer { manager.reset(destroy: true) }
+        manager.setScreenActive(true)
+        let document = try await call(manager, "document")["value"] as! String, value = join()
+        var registered = value; registered["fixtureMode"] = "no-attach"
+        _ = try fixture.request(["action": "register", "join": registered])
+        let id = try await call(manager, "allocate", ["document": document, "kind": "screen"])["value"] as! String
+        let before = try fixture.request(["action": "stats"])["proofCount"] as! Int
+        _ = try fixture.request(["action": "hold-proof", "hold": true])
+        let opening = Task { try await call(manager, "screenOpen", ["id": id, "network": fixture.network, "join": value]) }
+        for _ in 0..<100 {
+            if (try fixture.request(["action": "stats"])["proofCount"] as! Int) > before { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        clock.set(5)
+        _ = try fixture.request(["action": "release-proof"])
+        _ = try await opening.value
+        try await Task.sleep(nanoseconds: 350_000_000)
+        try check(log.count(id) == 0, "slowRoutePreparationDoesNotConsumeAttachBudget")
+        clock.set(9.9); try await Task.sleep(nanoseconds: 350_000_000)
+        try check(log.count(id) == 0, "attachStillAllowedBeforeFiveSecondsFromResume")
+        for role in ["control", "media"] { _ = try fixture.request(["action": "message", "id": sid(value), "role": role, "value": ["type": "attached", "sessionId": sid(value)]]) }
+        let attached = try await event(manager, log, id, "screen")
+        _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": attached["deliverySequence"]!])
+        clock.set(10.1); try await Task.sleep(nanoseconds: 350_000_000)
+        try check(log.count(id) == 0, "timelyAttachSurvivesElapsedAttachDeadline")
+        _ = try await call(manager, "screenClose", ["id": id]); try await peerClosed(fixture, value)
+        clock.set(20)
+        let stalled = join(); var stalledRegistration = stalled; stalledRegistration["fixtureMode"] = "no-attach"
+        _ = try fixture.request(["action": "register", "join": stalledRegistration])
+        let stalledID = try await call(manager, "allocate", ["document": document, "kind": "screen"])["value"] as! String
+        _ = try await call(manager, "screenOpen", ["id": stalledID, "network": fixture.network, "join": stalled])
+        clock.set(25)
+        let timeout = try await event(manager, log, stalledID, "close")
+        try check(timeout["reason"] as? String == "screen_attach_timeout", "unattachedSessionStillTimesOutAtFiveSeconds")
+        try await peerClosed(fixture, stalled)
+    }
+    static func main() async throws {
+        let args = CommandLine.arguments
+        let fixture = try ScreenFixture(args[1], args[2]); defer { fixture.stop() }
+        if let focus = ProcessInfo.processInfo.environment["SCREEN_AUDIT_FOCUS"] {
+            if focus == "close" { try await closeReasons(fixture) }
+            else if focus == "clock" { try await attachClock(fixture) }
+            else { throw HubNetworkError("unknown_screen_audit_focus") }
+            let receipt: [String: Any] = ["surface": "Apple Foundation production source; real pinned TLS dual sockets; injected monotonic clock only", "checks": checks]
+            let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys]); try bytes.write(to: URL(fileURLWithPath: args[3]))
+            print(String(data: bytes, encoding: .utf8)!); return
+        }
+        try await closeReasons(fixture); try await attachClock(fixture)
+        let log = ScreenEvents()
+        // Event capture does not acknowledge automatically; the same delivery
+        // gate used by the plugin is exercised explicitly for every event.
+        let transport = HubTransport { log.append($0) }; defer { transport.reset(destroy: true) }
+        var document = try await call(transport, "document")["value"] as! String
+        try await reject("inactiveAllocationRejected") { _ = try await call(transport, "allocate", ["kind": "screen", "document": document]) }
+        transport.setScreenActive(true)
+        let good = join(), id = try await open(transport, log, fixture, document, good)
+        try await Task.sleep(nanoseconds: 6_000_000_000)
+        try check(log.count(id) == 0, "healthyIdleSessionSurvivesNativeResourceTimer")
+        _ = try fixture.request(["action": "frame", "id": sid(good), "sequence": 1])
+        let binary = try await event(transport, log, id, "binary"), n = binary["deliverySequence"]!
+        try await reject("partialAckRejected") { _ = try await call(transport, "screenAck", ["id": id, "deliverySequence": n]) }
+        try await reject("nonSequentialReadRejected") { _ = try await call(transport, "screenRead", ["id": id, "deliverySequence": n, "offset": 1, "maxBytes": 262144]) }
+        try await reject("oversizeReadRejected") { _ = try await call(transport, "screenRead", ["id": id, "deliverySequence": n, "offset": 0, "maxBytes": 262145]) }
+        let a = Data(base64Encoded: try await call(transport, "screenRead", ["id": id, "deliverySequence": n, "offset": 0, "maxBytes": 262144])["data"] as! String)!
+        let b = Data(base64Encoded: try await call(transport, "screenRead", ["id": id, "deliverySequence": n, "offset": a.count, "maxBytes": 262144])["data"] as! String)!
+        try check(a.count == 262144 && a.count + b.count == binary["byteLength"] as? Int && b.last == 97, "binaryReassembledExactly")
+        _ = try await call(transport, "screenAck", ["id": id, "deliverySequence": n])
+        try await reject("duplicateAckRejected") { _ = try await call(transport, "screenAck", ["id": id, "deliverySequence": n]) }
+        try await reject("ackedPacketUnavailable") { _ = try await call(transport, "screenRead", ["id": id, "deliverySequence": n, "offset": 0, "maxBytes": 1]) }
+        try await reject("viewOnlyControlRejected") { _ = try await call(transport, "screenSend", ["id": id, "command": command(good, "control", ["frameSequence": 1])]) }
+        var stale = command(good, "keyframe"); stale["generation"] = "stale"
+        try await reject("generationMismatchRejected") { _ = try await call(transport, "screenSend", ["id": id, "command": stale]) }
+        _ = try await call(transport, "screenSend", ["id": id, "command": command(good, "keyframe")])
+        _ = try await call(transport, "screenClose", ["id": id]); _ = try await call(transport, "screenClose", ["id": id])
+        _ = try await event(transport, log, id, "close"); try await peerClosed(fixture, good)
+        try check(log.count(id) == 1, "closeIdempotentAndSingleTerminal")
+        let left = join(), right = join()
+        let leftID = try await open(transport, log, fixture, document, left), rightID = try await open(transport, log, fixture, document, right)
+        _ = try await call(transport, "screenClose", ["id": leftID]); try await peerClosed(fixture, left)
+        _ = try fixture.request(["action": "frame", "id": sid(right), "sequence": 1, "size": 64])
+        let siblingPacket = try await event(transport, log, rightID, "binary")
+        _ = try await call(transport, "screenRead", ["id": rightID, "deliverySequence": siblingPacket["deliverySequence"]!, "offset": 0, "maxBytes": 64])
+        _ = try await call(transport, "screenAck", ["id": rightID, "deliverySequence": siblingPacket["deliverySequence"]!])
+        try check(log.count(rightID) == 0, "closingOneGroupPreservesAnotherNativeSession")
+        _ = try await call(transport, "screenClose", ["id": rightID]); try await peerClosed(fixture, right)
+        for mode in ["fourthPacket", "jsonOverflow", "siblingFailure", "malformed", "unackedTimeout"] {
+            let value = join(), opened = try await open(transport, log, fixture, document, value)
+            if mode == "jsonOverflow" { _ = try fixture.request(["action": "json-burst", "id": sid(value), "count": 9]) }
+            else if mode == "siblingFailure" { _ = try fixture.request(["action": "close-media", "id": sid(value)]) }
+            else { for sequence in 1...(mode == "fourthPacket" ? 4 : 1) { _ = try fixture.request(["action": "frame", "id": sid(value), "sequence": sequence, "malformed": mode == "malformed"]) } }
+            _ = try await event(transport, log, opened, "close"); try await peerClosed(fixture, value)
+            try check(log.count(opened) == 1, mode + "ClosesBothExactlyOnce")
+            if let queued = log.pop(opened, "binary") { try check(!transport.acceptScreenEvent(queued), "retiredBinaryCallbackFiltered") }
+            if let queued = log.pop(opened, "screen") { try check(!transport.acceptScreenEvent(queued), "retiredJSONCallbackFiltered") }
+        }
+        let focusJoin = join(true), focusID = try await open(transport, log, fixture, document, focusJoin)
+        _ = try fixture.request(["action": "control-state", "id": sid(focusJoin), "active": true])
+        let controlState = try await event(transport, log, focusID, "screen")
+        _ = try await call(transport, "screenAck", ["id": focusID, "deliverySequence": controlState["deliverySequence"]!])
+        let renew = command(focusJoin, "renew", ["leaseId": String(repeating: "L", count: 43), "challenge": String(repeating: "C", count: 43), "frameSequence": 1])
+        try await reject("unfocusedRenewRejected") { _ = try await call(transport, "screenSend", ["id": focusID, "command": renew]) }
+        _ = try await call(transport, "screenSend", ["id": focusID, "command": command(focusJoin, "input-focus", ["enabled": true])])
+        _ = try await call(transport, "screenSend", ["id": focusID, "command": renew])
+        _ = try await call(transport, "screenSend", ["id": focusID, "command": command(focusJoin, "input-focus", ["enabled": false])])
+        try await reject("focusLossRejectsRenew") { _ = try await call(transport, "screenSend", ["id": focusID, "command": renew]) }
+        _ = try await call(transport, "screenClose", ["id": focusID]); try await peerClosed(fixture, focusJoin)
+        let chat = try await call(transport, "allocate", ["kind": "socket", "document": document])["value"] as! String
+        _ = try await call(transport, "socketOpen", ["id": chat, "origin": fixture.network["url"]!, "hubKey": fixture.network["publicKey"]!, "certificateAuthority": fixture.network["certificateAuthority"]!])
+        _ = try await event(transport, log, chat, "open")
+        let bg = join(true), bgID = try await open(transport, log, fixture, document, bg)
+        try await reject("alreadyQueuedSendRejectedAcrossBackgroundForeground") {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let latch = DispatchSemaphore(value: 0)
+                transport.queue.async { latch.wait() }
+                transport.invoke("screenSend", ["id": bgID, "command": command(bg, "keyframe")]) { continuation.resume(with: $0.map { _ in () }) }
+                transport.setScreenActive(false); transport.setScreenActive(true); latch.signal()
+            }
+        }
+        _ = try await event(transport, log, bgID, "close"); try await peerClosed(fixture, bg)
+        try await reject("foregroundDoesNotReviveOldGroup") { _ = try await call(transport, "screenSend", ["id": bgID, "command": command(bg, "control", ["frameSequence": 1])]) }
+        _ = try await call(transport, "socketSend", ["id": chat, "text": "synthetic-chat-after-background"])
+        let echo = try await event(transport, log, chat, "message")
+        try check(echo["data"] as? String == "synthetic-chat-after-background", "screenLifecyclePreservesSharedChatSocket")
+        _ = try await call(transport, "socketAck", ["id": chat, "sequence": echo["sequence"]!])
+        _ = try await call(transport, "cancel", ["id": chat])
+        let reload = join(), reloadID = try await open(transport, log, fixture, document, reload)
+        _ = try fixture.request(["action": "frame", "id": sid(reload), "sequence": 1])
+        let pending = try await event(transport, log, reloadID, "binary", notify: false), old = document
+        document = try await call(transport, "document")["value"] as! String
+        try check(!transport.acceptScreenEvent(pending), "newDocumentRejectsQueuedCallback")
+        try await reject("newDocumentRejectsOldPacket") { _ = try await call(transport, "screenRead", ["id": reloadID, "deliverySequence": pending["deliverySequence"]!, "offset": 0, "maxBytes": 1]) }
+        try await reject("oldDocumentRejected") { _ = try await call(transport, "allocate", ["kind": "screen", "document": old]) }
+        try await peerClosed(fixture, reload)
+        let first = try await call(transport, "allocate", ["kind": "screen", "document": document])["value"] as! String
+        let second = try await call(transport, "allocate", ["kind": "screen", "document": document])["value"] as! String
+        try await reject("thirdGroupRejected") { _ = try await call(transport, "allocate", ["kind": "screen", "document": document]) }
+        _ = try await call(transport, "screenClose", ["id": first]); _ = try await call(transport, "screenClose", ["id": second])
+        let before = try fixture.request(["action": "stats"])["helloCount"] as! Int
+        var bad = join(); bad["expiresAt"] = 0
+        let invalid = try await call(transport, "allocate", ["kind": "screen", "document": document])["value"] as! String
+        try await reject("expiredJoinRejectedBeforeNetwork") { _ = try await call(transport, "screenOpen", ["id": invalid, "network": fixture.network, "join": bad]) }
+        var wrongKey = fixture.network; wrongKey["publicKey"] = "MCowBQYDK2VwAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        let untrusted = try await call(transport, "allocate", ["kind": "screen", "document": document])["value"] as! String
+        try await reject("pairedKeyMismatchRejected") { _ = try await call(transport, "screenOpen", ["id": untrusted, "network": wrongKey, "join": join()]) }
+        let pendingTransport = HubTransport { _ in }
+        pendingTransport.setScreenActive(true)
+        let pendingDoc = try await call(pendingTransport, "document")["value"] as! String
+        let pendingID = try await call(pendingTransport, "allocate", ["kind": "screen", "document": pendingDoc])["value"] as! String
+        let proofBefore = try fixture.request(["action": "stats"])["proofCount"] as! Int
+        _ = try fixture.request(["action": "hold-proof", "hold": true])
+        let opening = Task { try await call(pendingTransport, "screenOpen", ["id": pendingID, "network": fixture.network, "join": join()]) }
+        for _ in 0..<100 {
+            if (try fixture.request(["action": "stats"])["proofCount"] as! Int) > proofBefore { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        pendingTransport.setScreenActive(false)
+        try await reject("backgroundCancelsPendingTLSOpen") { _ = try await opening.value }
+        _ = try fixture.request(["action": "hold-proof", "hold": false])
+        pendingTransport.setScreenActive(true)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        pendingTransport.reset(destroy: true)
+        let stats = try fixture.request(["action": "stats"])
+        try check(stats["helloCount"] as? Int == before, "invalidJoinAndTrustSendNoTicket")
+        try check((stats["paths"] as! [String]).allSatisfy { ["/screen/v1/control", "/screen/v1/media"].contains($0) }, "onlyFixedViewerRoutes")
+        try check((stats["open"] as! [Any]).isEmpty, "allPeersClosed")
+        let receipt: [String: Any] = ["surface": "Apple Foundation production source; real pinned TLS and dual WebSockets; synthetic frames only", "checks": checks]
+        let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys]); try bytes.write(to: URL(fileURLWithPath: args[3]))
+        print(String(data: bytes, encoding: .utf8)!)
+    }
+}

@@ -1,14 +1,22 @@
 import Capacitor
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @objc(HubTransportPlugin)
 public final class HubTransportPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "HubTransportPlugin"
     public let jsName = "TaroCubHubTransport"
-    public let pluginMethods: [CAPPluginMethod] = ["document", "allocate", "cancel", "httpOpen", "httpRead", "socketOpen", "socketSend", "socketAck", "socketClose"].map {
+    public let pluginMethods: [CAPPluginMethod] = ["document", "allocate", "cancel", "httpOpen", "httpRead", "socketOpen", "socketSend", "socketAck", "socketClose", "screenOpen", "screenSend", "screenRead", "screenAck", "screenClose"].map {
         CAPPluginMethod(name: $0, returnType: CAPPluginReturnPromise)
     }
     private var transport: HubTransport?
+#if canImport(UIKit)
+    private var screenObservers: [NSObjectProtocol] = []
+    private weak var screenScene: UIWindowScene?
+    private var screenSceneBlocked = false, screenProtectedUnavailable = false
+#endif
     // Epoch is sampled at the ObjC entry before hopping to main. The page nonce
     // also fences calls Capacitor queued before reset but dispatched afterward.
     private let epochLock = NSLock()
@@ -26,10 +34,44 @@ public final class HubTransportPlugin: CAPPlugin, CAPBridgedPlugin {
                 DispatchQueue.main.async {
                     guard let self = self, let document = event["document"] as? String,
                           document == self.activeDocument, let token = self.activePageToken else { return }
+                    guard self.transport?.acceptScreenEvent(event) == true else { return }
                     self.notifyListeners("socket:" + token, data: event)
                 }
             }
+            self.observeScreenLifecycle()
         }
+    }
+    private func observeScreenLifecycle() {
+#if canImport(UIKit)
+        let center = NotificationCenter.default
+        for name in [UIScene.willDeactivateNotification, UIScene.didEnterBackgroundNotification, UIScene.didDisconnectNotification] {
+            screenObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let self = self, let scene = note.object as? UIWindowScene,
+                      scene === self.screenScene || scene === self.webView?.window?.windowScene else { return }
+                self.screenSceneBlocked = true; self.transport?.setScreenActive(false)
+            })
+        }
+        screenObservers.append(center.addObserver(forName: UIApplication.protectedDataWillBecomeUnavailableNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.screenProtectedUnavailable = true; self?.transport?.setScreenActive(false)
+        })
+        screenObservers.append(center.addObserver(forName: UIScene.didActivateNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self = self, let scene = note.object as? UIWindowScene,
+                  scene === self.screenScene || scene === self.webView?.window?.windowScene else { return }
+            self.screenSceneBlocked = false; self.refreshScreenActivity()
+        })
+        screenObservers.append(center.addObserver(forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.screenProtectedUnavailable = false; self?.refreshScreenActivity()
+        })
+#endif
+    }
+    private func refreshScreenActivity() {
+#if canImport(UIKit)
+        let scene = webView?.window?.windowScene
+        screenScene = scene
+        transport?.setScreenActive(!screenSceneBlocked && !screenProtectedUnavailable && scene?.activationState == .foregroundActive && UIApplication.shared.isProtectedDataAvailable)
+#else
+        transport?.setScreenActive(false)
+#endif
     }
     private func onMain(_ action: @escaping () -> Void) {
         if Thread.isMainThread { action() } else { DispatchQueue.main.async(execute: action) }
@@ -82,7 +124,8 @@ public final class HubTransportPlugin: CAPPlugin, CAPBridgedPlugin {
                 return
             }
             guard token == self.activePageToken else { return }
-            if method == "socketOpen", !self.hasListeners("socket:" + token) {
+            if method.hasPrefix("screen") || (method == "allocate" && call.getString("kind") == "screen") { self.refreshScreenActivity() }
+            if (method == "socketOpen" || method == "screenOpen"), !self.hasListeners("socket:" + token) {
                 if let id = call.getString("id") { transport.invoke("cancel", ["id": id]) { _ in } }
                 call.reject("native_socket_listener_required"); return
             }
@@ -113,5 +156,15 @@ public final class HubTransportPlugin: CAPPlugin, CAPBridgedPlugin {
     @objc func socketSend(_ call: CAPPluginCall) { perform("socketSend", call) }
     @objc func socketAck(_ call: CAPPluginCall) { perform("socketAck", call) }
     @objc func socketClose(_ call: CAPPluginCall) { perform("socketClose", call) }
-    deinit { transport?.reset(destroy: true) }
+    @objc func screenOpen(_ call: CAPPluginCall) { perform("screenOpen", call) }
+    @objc func screenSend(_ call: CAPPluginCall) { perform("screenSend", call) }
+    @objc func screenRead(_ call: CAPPluginCall) { perform("screenRead", call) }
+    @objc func screenAck(_ call: CAPPluginCall) { perform("screenAck", call) }
+    @objc func screenClose(_ call: CAPPluginCall) { perform("screenClose", call) }
+    deinit {
+#if canImport(UIKit)
+        screenObservers.forEach { NotificationCenter.default.removeObserver($0) }
+#endif
+        transport?.setScreenActive(false); transport?.reset(destroy: true)
+    }
 }

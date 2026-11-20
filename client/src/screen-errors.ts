@@ -24,6 +24,18 @@ export const SCREEN_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.fr
   screen_desktop_busy: "另一个桌面服务已连接此主机，请检查是否打开了多份 TaroBird。",
   screen_hello_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
   screen_protocol_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
+  screen_mobile_update_required: "请更新此设备上的 TaroBird，以使用手机屏幕查看器。",
+  screen_mobile_decoder_unavailable: "此设备暂不支持屏幕视频解码，请更新手机 App 或系统后重试。",
+  screen_connection_changed: "屏幕连接已关闭。请重新连接，再单独开始控制。",
+  screen_native_inactive: "App 已进入后台或设备已锁定。返回后请重新连接，再单独开始控制。",
+  screen_inactive: "App 已进入后台或设备已锁定。返回后请重新连接，再单独开始控制。",
+  screen_background: "App 已进入后台或设备已锁定。返回后请重新连接，再单独开始控制。",
+  screen_viewer_congested: "连接拥塞，屏幕已断开。请检查线路后重新连接。",
+  screen_control_backpressure: "连接拥塞，屏幕已断开。请检查线路后重新连接。",
+  screen_network_closed: "屏幕连接已关闭。请重新连接，再单独开始控制。",
+  screen_socket_closed: "屏幕连接已关闭。请重新连接，再单独开始控制。",
+  screen_control_closed: "屏幕连接已关闭。请重新连接，再单独开始控制。",
+  screen_socket_failed: "屏幕连接已关闭。请重新连接，再单独开始控制。",
   screen_ticket_invalid: "屏幕服务注册凭据已失效，请重试屏幕服务。",
   screen_rate_limited: "屏幕服务请求过于频繁，请稍候重试。",
   screen_service_start_failed: "屏幕服务启动失败，请重试；若仍失败，请保存工作后重新打开 TaroBird。",
@@ -95,8 +107,12 @@ export const SCREEN_ERROR_MESSAGES_WINDOWS: Readonly<Record<string, string>> = O
   screen_input_denied: "目标电脑没有接受远程输入，控制已停止。以管理员身份运行的窗口和安全提示不能被远程控制。",
   screen_control_timeout: "目标电脑未确认控制，请稍后重试。",
 });
-/** `target`: the controlled computer's platform, when it is known. */
-export function screenError(reason: string, target: "macos" | "windows" = "macos") {
-  const message = target === "windows" && SCREEN_ERROR_MESSAGES_WINDOWS[reason] || SCREEN_ERROR_MESSAGES[reason];
+/** Unknown platform is a display-only state when the Host keeps desktop metadata
+ * private. Only these three general states reuse neutral computer wording;
+ * the default Mac contract and platform-specific guidance stay unchanged. */
+const UNKNOWN_TARGET_REASONS = new Set(["screen_disabled", "screen_not_authorized", "screen_service_offline"]);
+export function screenError(reason: string, target: "macos" | "windows" | "unknown" = "macos") {
+  const neutral = target === "unknown" && UNKNOWN_TARGET_REASONS.has(reason);
+  const message = (target === "windows" || neutral) && SCREEN_ERROR_MESSAGES_WINDOWS[reason] || SCREEN_ERROR_MESSAGES[reason];
   return message ? t(message) : `${t("屏幕连接已结束，请检查主机状态后重试。")} (${reason.slice(0,120)})`;
 }

@@ -7,6 +7,7 @@ import { isElectron } from "./desktop-bridge.js";
 import { WorkbenchLibraryContext, type WorkbenchFileRequest, type WorkbenchFileTarget } from "./workbench-library-context.js";
 import { workbenchErrorText } from "./workbench-error.js";
 import { RemoteScreenPanel } from "./RemoteScreenPanel.js";
+import { isMobileScreenApp } from "./mobile-screen-viewer-transport.js";
 import { annotationDraft, resolveWorkbenchDraft, bindWorkbenchDraft, mergeDesignCommentDraft } from "./workbench-draft.js";
 import { designCommentVersions } from "./design-comment-delivery.js";
 import { useWorkbench } from "./use-workbench.js";
@@ -435,7 +436,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     });
   }, [rightModeScope]);
   const [screenOpened, setScreenOpened] = useState(false);
-  const screenVisible = screenOpened && rightMode === "screen" && visible && !phone && (!pane || pane.expanded) && !details && searchResults === undefined && !settings;
+  const screenVisible = screenOpened && rightMode === "screen" && visible && (!phone || isMobileScreenApp()) && (!pane || !isMobileScreenApp() && pane.expanded) && !details && searchResults === undefined && !settings;
   const closeScreen = () => {
     // The remote viewer is shared within this Host workspace. Closing that
     // viewer must also retire other conversations' references to it.
@@ -1705,6 +1706,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     </div>
   </div>{shell?.multiHost && <HostSourceBadge name={shell.host.name} header/>}{!phone && visible && searchResults === undefined && group && current && <TopicSwitcher compact={!!pane} connection={connection} key={`topic:${current.id}`} group={group} current={current} conversations={conversations} activity={activity} select={selectChat} create={() => setNewChat({ kind: "topic", group })}/>}{sideButton}{workbenchButton}{screenButton}{!phone && current && <button ref={conversationSearchTrigger} className="icon-button conversation-search-trigger" aria-label={t("搜索当前对话")} title={t("搜索当前对话") + " (⌘F / Ctrl+F)"} aria-keyshortcuts="Meta+F Control+F" onClick={searchCurrentConversation}><Search size={18}/></button>}<button className={`connection-pill ${state.status}`} title={state.route?.url} aria-label={t("打开连接设置")} onClick={(event) => { event.currentTarget.focus(); setSettingsFromMenu(false); setSettingsSection("connection"); setSettings(true); }}>{state.status === "online" ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{connectionSummary}</span></button>{(phone || current) && <button ref={chatMoreTrigger} className="icon-button mobile-chat-more" aria-label={t("更多聊天操作")} aria-expanded={phone ? undefined : menu === "chat"} aria-controls={!phone && menu === "chat" ? `${menuId}-chat` : undefined} onClick={(event) => { event.currentTarget.focus(); history.refresh(); if (phone) setChatActions(true); else toggleMenu("chat"); }}><MoreHorizontal size={phone ? 24 : 18}/></button>}
       {pane?.headerTrailing}{!phone && current && <DesktopMenu id={`${menuId}-chat`} label={t("聊天操作")} open={menu === "chat"} close={closeMenu} trigger={chatMoreTrigger} placement="down-end" className="chat-menu">
+        {!pane&&isMobileScreenApp()&&<button className="screen-mobile-entry" onClick={()=>{closeMenu();openScreen();}}><MonitorPlay size={16}/><span className="desktop-menu-label">{t("查看屏幕")}</span></button>}
         {current.botIds.length === 1 && !current.archived && !group?.archived && searchResults === undefined && state.engineTasksAvailable && <button onClick={() => { closeMenu(); setTaskListRequest({ conversationId: selected, id: Date.now() }); }}><ListOrdered size={16}/><span className="desktop-menu-label">{t("子代理与后台任务")}</span></button>}
         {immediateAvailable && <button aria-label={t("立即发送")} disabled={!draft.trim() || steeringBusy || sending} onClick={() => report(sendImmediately())}><ArrowUp size={16}/><span className="desktop-menu-text"><span>{t("立即发送")}</span><small>{t("由 CLI 后台继续工具或中断当前输出，再读入消息")}</small></span></button>}
         {continueCurrent && <button aria-label={t("作为下一轮发送")} disabled={!draft.trim() || steeringBusy || sending} onClick={() => report(send(true))}><ListOrdered size={16}/><span className="desktop-menu-text"><span>{t("作为下一轮发送")}</span><small>{t("等待当前任务结束后再处理")}</small></span></button>}
@@ -1832,7 +1834,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     if (copiesReadableMessages()) prepareMessagePlainText(message.blocks);
   }} copyMessage={(message) => { if (copiesReadableMessages()) copyReadableMessage(message); else report(writeMessageSelection(blocksText(message.blocks))); }} root={scroll} scope={selected} enabled={visible && !phone && !!selected && searchResults === undefined && !deletion.active} deletionAvailable={!!state.messageDeletionAvailable} select={deletion.start} remove={(message, trigger) => deletion.ask([message.id], trigger)} messages={messages} quoteBlocked={groupSending || !!current?.archived || !!group?.archived} quote={(message) => { setReply(message); composer.current?.focus(); }} forward={(message, trigger) => { forwardTrigger.current = trigger; setForwarding(message); }} copy={(text, html) => report(writeMessageSelection(text, html))}/>
   {forwarding && <ForwardMessage message={forwarding} conversations={listedChats} connection={connection} returnFocus={forwardReturn} close={() => setForwarding(undefined)} sent={(id) => { setForwarding(undefined); setSelected(id); setFocusTarget(undefined); closeSearch(); setSidebar(false); followLatest.current = true; }}/>}
-    {settings && settingsSection === "connection" && <ConnectionPanel connection={connection} openScreen={openScreen} close={() => setSettings(false)} returnFocus={settingsFromMenu ? chatMoreTrigger : undefined}/>}
+    {settings && settingsSection === "connection" && <ConnectionPanel connection={connection} openScreen={pane&&isMobileScreenApp()?undefined:openScreen} close={() => setSettings(false)} returnFocus={settingsFromMenu ? chatMoreTrigger : undefined}/>}
     {settings && settingsSection !== "connection" && <PreferencesPanel returnFocus={settingsFromMenu ? chatMoreTrigger : undefined} openWorkbenchFile={openLocalLibraryFile} initialSection={settingsSection === "pairing" ? "devices" : settingsSection} initialPairingStep={settingsSection === "pairing" ? 0 : undefined} connection={connection} manageNetwork={shell ? (beforeLeave, hostKey, options) => shell.manageHosts(beforeLeave, hostKey ?? connection.identity.hubPublicKey, options) : undefined} manageConnections={shell?.manageConnections} forget={async () => { if (shell) setSettings(false); await forget(); }} preferences={preferences} update={setPreferences} close={() => setSettings(false)}/>}
   {/* Keep active turn controls first in the phone menu, including with a draft.
       Idle fallbacks stay below conversation/place actions for runs the tail cannot see. */}
@@ -1852,6 +1854,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       {!isDispatcher(activeBot) && <button onClick={() => { setChatActions(false); setNewChat({ kind: "direct", ...(activeBot ? { botId: activeBot.id } : {}) }); }}><Plus size={20}/>{t("新对话")}</button>}
     </div>
     <div className="mobile-chat-action-list">
+      {!pane&&isMobileScreenApp()&&<button onClick={()=>{setChatActions(false);openScreen();}}><MonitorPlay size={20}/><span className="action-label">{t("查看屏幕")}</span><ChevronRight className="action-chevron" size={18}/></button>}
       <button aria-label={t("打开连接设置")} aria-describedby={`${chatActionNote}-connection`} onClick={() => { setChatActions(false); setSettingsFromMenu(true); setSettingsSection("connection"); setSettings(true); }}>{state.status === "online" ? <Wifi size={20}/> : <WifiOff size={20}/>}<span className="action-label">{t("连接状态与线路")}</span><span id={`${chatActionNote}-connection`} className="action-value">{connectionSummary}</span><ChevronRight className="action-chevron" size={18}/></button>
       <button onClick={() => { setChatActions(false); setArchives(true); }}><Archive size={20}/><span className="action-label">{t("已归档对话")}</span>{archivedChats.length > 0 && <span className="action-value">{archivedChats.length}</span>}<ChevronRight className="action-chevron" size={18}/></button>
     </div>

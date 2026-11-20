@@ -26,9 +26,9 @@ try {
   const module=path.join(scratch,"Capacitor");await mkdir(module);
   await writeFile(path.join(module,"BridgeHeaders.h"),`#import <Foundation/Foundation.h>\n@class UIViewController;\n#import "${headers}/CAPBridgedPlugin.h"\n`);
   await writeFile(path.join(module,"module.modulemap"),'module Capacitor { header "BridgeHeaders.h" export * }\n');
-  await run("swiftc",["-swift-version","5","-target",`${process.arch==="arm64"?"arm64":"x86_64"}-apple-macosx13.0`,"-typecheck","-I",scratch,"client/ios/tests/CapacitorCompileOverlay.swift","client/ios/App/App/HubTLS.swift","client/ios/App/App/HubTransport.swift","client/ios/App/App/HubTransportPlugin.swift"],"plugin-typecheck.log",90_000);
+  await run("swiftc",["-swift-version","5","-target",`${process.arch==="arm64"?"arm64":"x86_64"}-apple-macosx13.0`,"-typecheck","-I",scratch,"client/ios/tests/CapacitorCompileOverlay.swift","client/ios/App/App/HubTLS.swift","client/ios/App/App/HubScreenSession.swift","client/ios/App/App/HubTransport.swift","client/ios/App/App/HubTransportPlugin.swift"],"plugin-typecheck.log",90_000);
   const binary=path.join(scratch,"HubTLSChecks");
-  await run("swiftc",["-D","HUB_TRANSPORT_AUDIT","-swift-version","5","-target",`${process.arch==="arm64"?"arm64":"x86_64"}-apple-macosx13.0`,"-O","client/ios/App/App/HubTLS.swift","client/ios/App/App/HubTransport.swift","client/ios/tests/HubTLSChecks.swift","client/ios/tests/HubTransportChecks.swift","-o",binary],"compile.log",90_000);
+  await run("swiftc",["-D","HUB_TRANSPORT_AUDIT","-swift-version","5","-target",`${process.arch==="arm64"?"arm64":"x86_64"}-apple-macosx13.0`,"-O","client/ios/App/App/HubTLS.swift","client/ios/App/App/HubScreenSession.swift","client/ios/App/App/HubTransport.swift","client/ios/tests/HubTLSChecks.swift","client/ios/tests/HubTransportChecks.swift","-o",binary],"compile.log",90_000);
   await run("/usr/bin/time",["-l",binary,repo,scratch,path.join(output,"ios-foundation-result.json")],"run.log",180_000);
   console.log(await readFile(path.join(output,"ios-foundation-result.json"),"utf8"));
 }finally{await rm(scratch,{recursive:true,force:true});}

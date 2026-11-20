@@ -45,6 +45,8 @@ final class HubSocket extends WebSocketClient {
     interface Listener {
         void opened();
         void message(String text);
+        default void binary(ByteBuffer bytes) { failed(new IOException("binary_websocket_message")); }
+        default void activity() { }
         void closed(int code, String reason, boolean clean);
         void failed(Exception error);
     }
@@ -57,12 +59,14 @@ final class HubSocket extends WebSocketClient {
     }
     static final class BoundedDraft extends Draft_6455 {
         final Receipt receipt;
+        final int frameLimit;
         long messageBytes;
         int fragments, headerBytes, extendedBytes, lengthBytes;
         long payloadLength, remainingPayload;
-        BoundedDraft() { this(new Receipt()); }
-        private BoundedDraft(Receipt receipt) { super(Collections.emptyList(), HubTls.MAX_FRAME); this.receipt=receipt; }
-        @Override public Draft copyInstance() { return new BoundedDraft(receipt); }
+        BoundedDraft() { this(new Receipt(), HubTls.MAX_FRAME); }
+        BoundedDraft(int limit) { this(new Receipt(), limit); }
+        private BoundedDraft(Receipt receipt, int limit) { super(Collections.emptyList(), limit); this.receipt=receipt; this.frameLimit=limit; }
+        @Override public Draft copyInstance() { return new BoundedDraft(receipt, frameLimit); }
         @Override public Handshakedata translateHandshake(ByteBuffer input) throws InvalidHandshakeException {
             // Scan only the HTTP header; a valid upgrade may share its read with
             // the first data frame. Never reject that frame as header overflow.
@@ -91,7 +95,7 @@ final class HubSocket extends WebSocketClient {
                     continue;
                 }
                 payloadLength=(payloadLength<<8)|(scan.get()&255);
-                if(payloadLength>HubTls.MAX_FRAME) throw new InvalidDataException(1009,"native_socket_frame_too_large");
+                if(payloadLength>frameLimit) throw new InvalidDataException(1009,"native_socket_frame_too_large");
                 if(--lengthBytes==0) {
                     if((extendedBytes==2 && payloadLength<126) || (extendedBytes==8 && payloadLength<65536)) throw new InvalidDataException(1002,"nonminimal_frame_length");
                     remainingPayload=payloadLength; headerBytes=0;
@@ -110,7 +114,7 @@ final class HubSocket extends WebSocketClient {
                     // The library bounds individual frames before allocating,
                     // but non-final continuation frames also need a total bound.
                     messageBytes+=frame.getPayloadData().remaining(); fragments++;
-                    if(messageBytes>HubTls.MAX_FRAME || fragments>FRAGMENT_LIMIT) throw new InvalidDataException(1009,"native_socket_message_too_large");
+                    if(messageBytes>frameLimit || fragments>FRAGMENT_LIMIT) throw new InvalidDataException(1009,"native_socket_message_too_large");
                     if(frame.isFin()) { messageBytes=0; fragments=0; }
                 }
                 if(op==Opcode.CLOSING && frame instanceof CloseFrame) {
@@ -127,6 +131,8 @@ final class HubSocket extends WebSocketClient {
     private final HubTls.Route route;
     private final Listener listener;
     private final Receipt receipt;
+    private final boolean binaryAllowed;
+    private final int writeLimit, writeFrames;
     private final ScheduledExecutorService deadlines;
     private final Object lifecycle = new Object(), writes = new Object();
     private volatile Socket wire, tcp;
@@ -134,11 +140,14 @@ final class HubSocket extends WebSocketClient {
     private boolean protocolClosed, finished, failureReported;
     private ScheduledFuture<?> timeout;
     HubSocket(HubTls.Route route, Listener listener, ScheduledExecutorService deadlines) {
-        this(route,listener,deadlines,new BoundedDraft());
+        this(route,listener,deadlines,"/ws",false,WRITE_LIMIT,new BoundedDraft());
     }
-    private HubSocket(HubTls.Route route, Listener listener, ScheduledExecutorService deadlines, BoundedDraft draft) {
-        super(URI.create(route.base.newBuilder().encodedPath("/ws").build().toString().replaceFirst("^https:","wss:")),draft);
-        this.route=route; this.listener=listener; this.deadlines=deadlines; this.receipt=draft.receipt;
+    HubSocket(HubTls.Route route, Listener listener, ScheduledExecutorService deadlines, boolean media) {
+        this(route,listener,deadlines,media?"/screen/v1/media":"/screen/v1/control",media,16384,new BoundedDraft(media?HubTls.MAX_FRAME:16384));
+    }
+    private HubSocket(HubTls.Route route, Listener listener, ScheduledExecutorService deadlines, String path, boolean binaryAllowed, int writeLimit, BoundedDraft draft) {
+        super(URI.create(route.base.newBuilder().encodedPath(path).build().toString().replaceFirst("^https:","wss:")),draft);
+        this.route=route; this.listener=listener; this.deadlines=deadlines; this.receipt=draft.receipt; this.binaryAllowed=binaryAllowed; this.writeLimit=writeLimit; this.writeFrames=writeLimit==WRITE_LIMIT?WRITE_FRAMES:8;
         setProxy(Proxy.NO_PROXY); setConnectionLostTimeout(0); setDaemon(true);
     }
     private void attach(Socket socket) throws IOException {
@@ -238,8 +247,8 @@ final class HubSocket extends WebSocketClient {
     }
     private boolean room(int bytes) {
         long total=bytes+14; int count=0;
-        for(ByteBuffer buffer:((WebSocketImpl)getConnection()).outQueue) { total+=buffer.remaining(); if(++count>=WRITE_FRAMES || total>WRITE_LIMIT) return false; }
-        return total<=WRITE_LIMIT;
+        for(ByteBuffer buffer:((WebSocketImpl)getConnection()).outQueue) { total+=buffer.remaining(); if(++count>=writeFrames || total>writeLimit) return false; }
+        return total<=writeLimit;
     }
     boolean sendText(String text) {
         synchronized(writes) {
@@ -264,7 +273,7 @@ final class HubSocket extends WebSocketClient {
         }
     }
     @Override public void onWebsocketPing(WebSocket socket, Framedata frame) {
-        synchronized(writes) { if(cancelled || localClosing) return; if(!room(125)) { cancel(); return; } super.onWebsocketPing(socket,frame); }
+        synchronized(writes) { if(cancelled || localClosing) return; listener.activity(); if(!room(125)) { cancel(); return; } super.onWebsocketPing(socket,frame); }
     }
     @Override public void onOpen(ServerHandshake handshake) {
         try {
@@ -272,8 +281,11 @@ final class HubSocket extends WebSocketClient {
             listener.opened();
         } catch(IOException error) { fail(error,false); }
     }
-    @Override public void onMessage(String text) { if(!cancelled && !localClosing) listener.message(text); }
-    @Override public void onMessage(ByteBuffer bytes) { fail(new IOException("binary_websocket_message"),false); }
+    @Override public void onMessage(String text) { if(!cancelled && !localClosing) { listener.activity(); listener.message(text); } }
+    @Override public void onMessage(ByteBuffer bytes) {
+        if(!binaryAllowed) { fail(new IOException("binary_websocket_message"),false); return; }
+        if(!cancelled && !localClosing) { listener.activity(); listener.binary(bytes); }
+    }
     private void fail(Exception error,boolean openingDeadline) {
         synchronized(lifecycle) {
             if(finished || failureReported || cancelled || (openingDeadline && opened) || (receipt.peerClose && receipt.closeWritten)) return;

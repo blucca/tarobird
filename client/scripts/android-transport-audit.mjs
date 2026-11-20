@@ -34,7 +34,9 @@ try {
   }
   const classes=path.join(scratch,"classes");await mkdir(classes);
   const classpath=jars.join(path.delimiter),source=path.join(repo,"client/android/app/src/main/java/com/tarobot/client");
-  await run(java("javac"),["--release","8","-cp",classpath,"-d",classes,path.join(source,"HubTls.java"),path.join(source,"HubTransport.java"),path.join(source,"HubSocket.java"),path.join(repo,"client/android/audit/NativeTlsAudit.java")],"compile.log",60_000);
+  await run(java("javac"),["--release","8","-cp",classpath,"-d",classes,path.join(source,"HubTls.java"),path.join(source,"HubTransport.java"),path.join(source,"HubSocket.java"),path.join(source,"HubScreenSession.java"),path.join(repo,"client/android/audit/NativeTlsAudit.java"),path.join(repo,"client/android/audit/NativeScreenAudit.java")],"compile.log",60_000);
   await run(java("java"),["-Xmx512m","-cp",classes+path.delimiter+classpath,"com.tarobot.client.NativeTlsAudit",repo,scratch,path.join(output,"android-jvm-result.json")],"run.log",180_000);
+  await run(java("java"),["-Xmx128m","-cp",classes+path.delimiter+classpath,"com.tarobot.client.NativeScreenAudit",repo,scratch,path.join(output,"android-screen-jvm-result.json")],"screen-run.log",60_000);
   console.log(await readFile(path.join(output,"android-jvm-result.json"),"utf8"));
+  console.log(await readFile(path.join(output,"android-screen-jvm-result.json"),"utf8"));
 } finally { await rm(scratch,{recursive:true,force:true}); }

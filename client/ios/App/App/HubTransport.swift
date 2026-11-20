@@ -8,6 +8,8 @@ final class HubTransport: @unchecked Sendable {
     let queue = DispatchQueue(label: "com.tarobot.hub-transport")
     private let anchors: [SecCertificate]?
     private let events: ([String: Any]) -> Void
+    private let screenNow: () -> TimeInterval
+    private let screenActivity = HubScreenActivity()
     private var document: String?
     private var destroyed = false
     private var slots: [String: HubSlot] = [:]
@@ -21,17 +23,38 @@ final class HubTransport: @unchecked Sendable {
     }
 #endif
 
-    // Constructor-injected roots are test-only and not exposed by the plugin.
+    // Constructor-injected roots/monotonic clock are test-only and not exposed by the plugin.
     // Per-route certificateAuthority is a separate explicit anchor; both paths
     // retain verification against the paired Hub identity.
-    init(anchors: [SecCertificate]? = nil, events: @escaping ([String: Any]) -> Void) {
-        self.anchors = anchors; self.events = events
+    init(anchors: [SecCertificate]? = nil, screenNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }, events: @escaping ([String: Any]) -> Void) {
+        self.anchors = anchors; self.screenNow = screenNow; self.events = events
     }
 
     func invoke(_ command: String, _ args: [String: Any] = [:], reply: @escaping Reply) {
+        let screenCommand = command.hasPrefix("screen") || (command == "allocate" && args["kind"] as? String == "screen")
+        let activityToken = screenCommand ? screenActivity.capture() : nil
         queue.async {
-            do { try self.perform(command, args, reply) }
+            do {
+                if screenCommand, command != "screenClose", !self.screenActivity.permits(activityToken) { throw HubNetworkError("screen_background") }
+                try self.perform(command, args, reply)
+            }
             catch { reply(.failure(error)) }
+        }
+    }
+
+    func setScreenActive(_ active: Bool) {
+        screenActivity.set(active)
+        if !active { queue.async { for slot in Array(self.slots.values) where slot.kind == "screen" { self.finish(slot, HubNetworkError("screen_background")) } } }
+    }
+
+    /// Only the plugin's main-queue delivery boundary calls this. Non-screen
+    /// events retain their original behavior; retired screen callbacks vanish.
+    func acceptScreenEvent(_ event: [String: Any]) -> Bool {
+        guard let kind = event["kind"] as? String, kind == "screen" || kind == "binary" else { return true }
+        return queue.sync {
+            guard let id = event["id"] as? String, let slot = slots[id], owns(slot),
+                  event["document"] as? String == slot.document, let sequence = try? Self.integer(event, "deliverySequence") else { return false }
+            return slot.screen?.markNotified(sequence) ?? false
         }
     }
 
@@ -54,17 +77,48 @@ final class HubTransport: @unchecked Sendable {
         case "allocate":
             guard document != nil, try Self.text(args, "document") == document else { throw HubNetworkError("native_document_retired") }
             let kind = try Self.text(args, "kind")
-            guard kind == "http" || kind == "socket" else { throw HubNetworkError("invalid_native_kind") }
-            guard slots.values.filter({ $0.kind == kind }).count < (kind == "http" ? 32 : 8) else { throw HubNetworkError("native_transport_busy") }
-            let slot = HubSlot(document: document!, kind: kind); slots[slot.id] = slot
+            guard kind == "http" || kind == "socket" || kind == "screen" else { throw HubNetworkError("invalid_native_kind") }
+            guard slots.values.filter({ $0.kind == kind }).count < (kind == "http" ? 32 : kind == "screen" ? 2 : 8) else { throw HubNetworkError("native_transport_busy") }
+            let slot = HubSlot(document: document!, kind: kind); slot.screenToken = kind == "screen" ? screenActivity.capture() : nil; slots[slot.id] = slot
             let deadline = DispatchWorkItem { [weak self, weak slot] in
                 if let self = self, let slot = slot, self.owns(slot) { self.finish(slot, HubNetworkError("native_request_timeout")) }
             }
-            slot.deadline = deadline; queue.asyncAfter(deadline: .now() + (kind == "http" ? 300 : 1200), execute: deadline)
+            slot.deadline = deadline; queue.asyncAfter(deadline: .now() + (kind == "http" ? 300 : kind == "screen" ? 30 : 1200), execute: deadline)
             reply(.success(["value": slot.id]))
         case "cancel":
             if let slot = slots[try Self.text(args, "id")] { finish(slot, HubNetworkError("native_request_cancelled")) }
             reply(.success([:]))
+        case "screenOpen":
+            let slot = try get(args, kind: "screen")
+            guard !slot.started else { throw HubNetworkError("native_request_already_started") }
+            slot.started = true; slot.openReply = reply
+            do {
+                guard let token = slot.screenToken, screenActivity.permits(token),
+                      let network = args["network"] as? [String: Any], let join = args["join"] as? [String: Any] else { throw HubNetworkError("screen_join_invalid") }
+                slot.screen = try HubScreenSession(queue: queue, activity: screenActivity, token: token, join: join, now: screenNow,
+                    emit: { [weak self, weak slot] value in if let self = self, let slot = slot, self.owns(slot) { self.emit(slot, value) } },
+                    failure: { [weak self, weak slot] reason in if let self = self, let slot = slot { self.finish(slot, HubNetworkError(reason)) } })
+                prepare(slot, try Self.text(network, "url"), try Self.text(network, "publicKey"), authority: network["certificateAuthority"] as? String) { connection in
+                    guard self.screenActivity.permits(token), let screen = slot.screen else { throw HubNetworkError("screen_background") }
+                    try screen.open(connection); slot.deadline?.cancel(); slot.deadline = nil
+                    let callback = slot.openReply; slot.openReply = nil; callback?(.success([:]))
+                }
+            } catch { finish(slot, error) }
+        case "screenSend", "screenRead", "screenAck":
+            let slot = try get(args, kind: "screen")
+            guard let screen = slot.screen else { throw HubNetworkError("screen_not_open") }
+            switch command {
+            case "screenSend":
+                guard let value = args["command"] as? [String: Any] else { throw HubNetworkError("screen_command_invalid") }
+                try screen.send(value); reply(.success([:]))
+            case "screenRead":
+                let bytes = try screen.read(sequence: Self.integer(args, "deliverySequence"), offset: Self.integer(args, "offset"), maxBytes: Self.integer(args, "maxBytes"))
+                reply(.success(["data": bytes.base64EncodedString()]))
+            default: try screen.acknowledge(Self.integer(args, "deliverySequence")); reply(.success([:]))
+            }
+        case "screenClose":
+            if let slot = slots[try Self.text(args, "id")], slot.kind == "screen", owns(slot) { finish(slot, HubNetworkError("screen_closed")) }
+            reply(.success(["value": true]))
         case "httpOpen", "socketOpen":
             let slot = try get(args, kind: command == "httpOpen" ? "http" : "socket")
             guard !slot.started else { throw HubNetworkError("native_request_already_started") }
@@ -324,12 +378,14 @@ final class HubTransport: @unchecked Sendable {
         slots.removeValue(forKey: slot.id)
         outgoingBytes -= slot.outgoingBytes; bodyBytes -= slot.bodyBytes
         slot.outgoingBytes = 0; slot.bodyBytes = 0; slot.pendingText = nil; slot.receipts.removeAll()
+        slot.screen?.retire(); slot.screen = nil
         slot.deadline?.cancel(); slot.closeDeadline?.cancel()
         slot.openingTask?.cancel(); slot.readingTask?.cancel(); slot.task?.cancel(); slot.handler = nil; slot.stream = nil; slot.connection = nil
         let failure = error ?? HubNetworkError("native_request_cancelled")
         let open = slot.openReply, read = slot.readReply, sends = Array(slot.sends.values)
         slot.openReply = nil; slot.readReply = nil; slot.sends.removeAll()
         open?(.failure(failure)); read?(.failure(failure)); sends.forEach { $0(.failure(failure)) }
+        if slot.kind == "screen" { emit(slot, ["kind": "close", "reason": (error as? HubNetworkError)?.code ?? "screen_closed"]) }
         if slot.kind == "socket" { emit(slot, close ?? ["kind": "close", "code": 1006, "reason": "", "clean": false]) }
     }
 }
@@ -344,6 +400,7 @@ fileprivate final class HubSlot: @unchecked Sendable {
     let id = UUID().uuidString, document: String, kind: String
     var started = false, head = false, open = false, closing = false, paused = false, receiving = false
     var route: String?, task: URLSessionTask?, handler: HubTaskHandler?
+    var screen: HubScreenSession?, screenToken: UInt64?
     var connection: HubTLSSession?
     var deadline: DispatchWorkItem?, closeDeadline: DispatchWorkItem?
     var openReply: HubTransport.Reply?, readReply: HubTransport.Reply?

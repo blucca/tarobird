@@ -78,3 +78,23 @@
 @media(max-width:440px){.screen-readiness{gap:8px}.screen-permission-row{gap:8px}.screen-settings-heading{gap:6px}.screen-setting-row{flex-wrap:wrap}.screen-setting-row select{max-width:100%}}
 
 .screen-resolution{white-space:nowrap;font-variant-numeric:tabular-nums}
+
+/* Native mobile viewing owns the available window, independently of chat width. */
+.remote-screen-panel.screen-mobile{position:fixed!important;z-index:1000;inset:0!important;width:100%!important;max-width:none!important;min-width:0!important;height:var(--shell-height,100dvh)!important;display:flex;flex-direction:column;margin:0;border:0;background:var(--bg);padding:var(--safe-area-inset-top,0px) var(--safe-area-inset-right,0px) var(--safe-area-inset-bottom,0px) var(--safe-area-inset-left,0px);box-sizing:border-box;transform:none}
+.screen-mobile-dialog{position:fixed!important;inset:0!important;width:100%!important;max-width:none!important;height:var(--shell-height,100dvh)!important;max-height:none!important;margin:0!important;padding:0!important;transform:none!important;border:0!important;border-radius:0!important}
+.chat-menu .screen-mobile-entry{min-height:44px}
+.screen-mobile .screen-heading{flex-wrap:wrap;gap:4px 8px;padding:4px 8px}
+.screen-mobile .screen-title{flex:1;display:block;max-width:none}.screen-mobile .screen-title small{display:block;max-width:100%;font-size:12px}
+.screen-mobile .screen-toolbar{order:2;flex:1 0 100%;gap:8px}.screen-mobile .screen-window-actions{margin-left:0}
+.screen-mobile button,.screen-mobile .screen-window-actions .icon-button,.screen-mobile select{min-width:44px;min-height:44px;font-size:13px}
+.screen-mobile .screen-window-actions .icon-button{width:44px;height:44px;padding:10px}
+.screen-mobile .screen-state{font-size:12px;padding:0 10px 7px}
+.screen-mobile .screen-viewport{min-height:0;overflow:hidden;touch-action:none;contain:layout paint}
+.screen-mobile .screen-viewport canvas{position:absolute;left:50%;top:50%;max-width:none;max-height:none;transform-origin:center}
+.screen-mobile .screen-tools-popover{max-height:calc(var(--shell-height,100dvh) - 170px);overscroll-behavior:contain}
+.screen-mobile .screen-display{gap:8px;flex-wrap:wrap}.screen-mobile .screen-display select{max-width:100%}
+.screen-touch-help{font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+.screen-mobile-keyboard{flex:none;max-height:45%;overflow:auto;overscroll-behavior:contain;padding:6px 8px;background:var(--bg);border-bottom:1px solid var(--border)}
+.screen-mobile-keys{display:flex;gap:5px;overflow:auto;padding-bottom:6px}.screen-mobile-keys>button{flex:none;white-space:nowrap}
+.screen-mobile-keyboard .screen-text{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:0;border:0}
+.screen-mobile-keyboard textarea{min-height:44px;height:54px;font-size:16px;resize:none;margin:0}.screen-mobile-keyboard small{font-size:12px;color:var(--muted);flex:1;min-width:120px;line-height:1.5}
