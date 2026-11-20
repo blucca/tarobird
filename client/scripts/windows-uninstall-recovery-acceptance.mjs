@@ -8,7 +8,7 @@
 //   set TAROBOT_WINDOWS_ACCEPTANCE=disposable
 //   node scripts/windows-uninstall-recovery-acceptance.mjs --confirm-disposable-windows \
 //     --installer <TaroBird_x.y.z_x64-setup.exe> --version x.y.z --report <dir containing .noindex>
-//     [--cases silent-locked,silent-repair,inplace,helper,gui-locked,gui-consent]
+//     [--cases silent-locked,silent-repair,inplace,helper-missing,program-missing,gui-rerun-after-partial,helper,gui-locked,gui-consent]
 //
 // pass/fail/skip per check; a skip (e.g. the cause could not be induced or the
 // UI could not be driven) is never a pass. `info` is evidence, never judged.
@@ -27,7 +27,13 @@ const APP_IDS = ['com.tarobot.client', 'com.tarocub.client'];
 // A program file the uninstaller deletes but that `--clear-notification-history`
 // (run before file removal) does not load; locking app.asar would stop earlier.
 const LOCK_TARGET = ['resources', 'native', 'tarobot-migration-exporter.exe'];
-const ALL_CASES = ['silent-locked', 'silent-repair', 'inplace', 'gui-rerun-after-partial', 'helper', 'gui-locked', 'gui-consent'];
+// The candidate's GUI-free #50 cases run before the interactive ones, so a hung
+// dialog cannot spend their budget.
+const ALL_CASES = ['silent-locked', 'silent-repair', 'inplace', 'helper-missing', 'program-missing', 'gui-rerun-after-partial', 'helper', 'gui-locked', 'gui-consent'];
+// Written by the uninstaller (4b5ed5f) right before it removes the program,
+// after it cleared notifications; any install or repair removes it.
+const NOTICE_RECORD = 'TaroBirdNoticesCleared';
+const RUNTIME = ['resources', 'host', 'node.exe'];
 const SYNTHETIC = 'tarobird-acceptance-synthetic.txt';
 
 class Receipt {
@@ -211,6 +217,9 @@ async function silentLocked(ctx, receipt, phase) {
   receipt.expect(phase, 'locked-file-kept', existsSync(target), target);
   receipt.info(phase, 'partial-state', await ctx.snapshot(directory));
   receipt.expect(phase, 'data-untouched', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots before ${rootsBefore.length}, after ${ctx.presentRoots().length}`);
+  // The program goes first, only after notifications were cleared, and the record says so.
+  receipt.expect(phase, 'program-removed-first-with-notice-record', !existsSync(W.join(directory, EXE)) && after.uninstall.values?.[NOTICE_RECORD] === '1',
+    `${EXE} ${existsSync(W.join(directory, EXE)) ? 'present' : 'absent'}; ${NOTICE_RECORD}=${after.uninstall.values?.[NOTICE_RECORD] ?? 'absent'}`);
   await held.release();
   await ctx.recover(receipt, phase);
   const link = await ctx.reg(PROTOCOL_KEY);
@@ -227,17 +236,23 @@ async function silentRepair(ctx, receipt, phase) {
   const code = await ctx.uninstallSync(directory);
   receipt.expect(phase, 'locked-uninstall-refused', code !== 0, `uninstaller exit ${code}; ${await ctx.snapshot(directory)}`);
   await held.release();
+  const partialRecord = (await ctx.reg(UNINSTALL_KEY)).values?.[NOTICE_RECORD];
+  receipt.info(phase, 'partial-notice-record', `${NOTICE_RECORD}=${partialRecord ?? 'absent'}`);
   const repaired = await ctx.install(receipt, phase);
   if (repaired) {
     const files = [EXE, 'uninstall.exe', HELPER, W.join(...LOCK_TARGET)].filter(file => !existsSync(W.join(repaired, file)));
     receipt.expect(phase, 'reinstall-restores-files', !files.length && repaired.toLowerCase() === directory.toLowerCase(), files.length ? `missing ${files.join(', ')}` : repaired);
+    // A repaired App runs again and clears its own notifications next time.
+    const record = (await ctx.reg(UNINSTALL_KEY)).values?.[NOTICE_RECORD];
+    receipt.expect(phase, 'repair-drops-notice-record', record === undefined, `${NOTICE_RECORD}=${record ?? 'absent'} (before repair: ${partialRecord ?? 'absent'})`);
   }
   await ctx.uninstallRegistered(receipt, phase, 'uninstall-after-repair-completes');
 }
 
 /** The installer's own "uninstall before installing" runs `uninstall.exe _?=<dir>`
- * in place, so the running uninstaller cannot delete itself. Before #50 that
- * Delete failed silently; this records whether it now aborts. */
+ * in place, so the running uninstaller cannot delete itself (NSIS 3.2.2 leaves
+ * it to the caller). 92fdf17 made that an abort; 4b5ed5f exempts only the
+ * running image, so the uninstall completes and leaves just uninstall.exe. */
 async function inPlace(ctx, receipt, phase) {
   let directory = await ctx.install(receipt, phase);
   if (!directory) return;
@@ -249,7 +264,7 @@ async function inPlace(ctx, receipt, phase) {
     `uninstall.exe /S _?=<dir> ${ctx.outcome(inplace)}; uninstall key ${after.uninstall.state}; left ${left.join(', ') || 'none'}`);
   receipt.info(phase, 'inplace-state', await ctx.snapshot(directory));
   if (after.uninstall.state === 'present') await ctx.recover(receipt, phase);
-  else if (existsSync(W.join(directory, 'uninstall.exe'))) receipt.info(phase, 'inplace-self-left', 'uninstall.exe left behind (expected: a running image cannot delete itself)');
+  else receipt.expect(phase, 'inplace-leaves-only-running-uninstaller', left.length === 1 && left[0] === 'uninstall.exe', `left ${left.join(', ') || 'none'}`);
   await ctx.ensureUninstalled(receipt, phase);
   // Same-version passive reinstall: PageLeaveReinstall takes reinst_uninstall.
   directory = await ctx.install(receipt, phase);
@@ -264,6 +279,58 @@ async function inPlace(ctx, receipt, phase) {
     if (repair) receipt.info(phase, 'repair-after-passive', 'silent reinstall restored the installation');
   }
   await ctx.uninstallRegistered(receipt, phase, 'uninstall-after-passive');
+}
+
+/** #50-A (4b5ed5f): a Host runtime whose stopper is missing is never treated as
+ * stopped. Negative: the uninstaller refuses before any change. Positive: the
+ * same-version installer confirms with its own staged helper and repairs, and
+ * without a runtime there is nothing to stop, so the uninstall completes. Only
+ * this run's disposable installation is changed. */
+async function helperMissing(ctx, receipt, phase) {
+  let directory = await ctx.install(receipt, phase);
+  if (!directory) return;
+  const rootsBefore = ctx.presentRoots();
+  await rm(W.join(directory, HELPER));
+  const code = await ctx.uninstallSync(directory);
+  const after = await ctx.state();
+  const kept = [EXE, 'uninstall.exe', W.join(...RUNTIME), 'resources\\app.asar', W.join(...LOCK_TARGET)].filter(file => existsSync(W.join(directory, file)));
+  receipt.expect(phase, 'runtime-without-stopper-refused-before-changes', code !== 0 && after.uninstall.state === 'present' && kept.length === 5 && after.uninstall.values?.[NOTICE_RECORD] === undefined,
+    `exit ${code}; kept ${kept.length}/5; ${await ctx.snapshot(directory)}; ${NOTICE_RECORD}=${after.uninstall.values?.[NOTICE_RECORD] ?? 'absent'}`);
+  receipt.expect(phase, 'data-untouched', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().length}/${rootsBefore.length}`);
+  directory = await ctx.install(receipt, phase);
+  receipt.expect(phase, 'installer-confirms-with-own-helper-and-repairs', !!directory && existsSync(W.join(directory, HELPER)), directory ? await ctx.snapshot(directory) : 'repair install failed');
+  if (!directory) return;
+  await ctx.uninstallRegistered(receipt, phase, 'uninstall-after-repair-completes');
+  directory = await ctx.install(receipt, phase);
+  if (!directory) return;
+  await rm(W.join(directory, HELPER)); await rm(W.join(directory, ...RUNTIME));
+  const free = await ctx.uninstallSync(directory);
+  const done = await ctx.state();
+  receipt.expect(phase, 'no-runtime-no-stopper-uninstall-completes', free === 0 && done.uninstall.state === 'absent' && !existsSync(W.join(directory, EXE)), `exit ${free}; ${await ctx.snapshot(directory)}`);
+  receipt.expect(phase, 'data-retained', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().length}/${rootsBefore.length}`);
+}
+
+/** #50-B (4b5ed5f): the program is missing without this uninstaller's record
+ * (removed by something else). Negative: notifications cannot be cleared, so the
+ * uninstaller stops before removing files instead of offering a futile retry.
+ * Positive: the documented repair restores the program and the uninstall completes. */
+async function programMissing(ctx, receipt, phase) {
+  let directory = await ctx.install(receipt, phase);
+  if (!directory) return;
+  const rootsBefore = ctx.presentRoots();
+  const fresh = await ctx.reg(UNINSTALL_KEY);
+  receipt.expect(phase, 'install-has-no-notice-record', fresh.values?.[NOTICE_RECORD] === undefined, `${NOTICE_RECORD}=${fresh.values?.[NOTICE_RECORD] ?? 'absent'}`);
+  await rm(W.join(directory, EXE));
+  const code = await ctx.uninstallSync(directory);
+  const after = await ctx.state();
+  const kept = ['uninstall.exe', HELPER, W.join(...RUNTIME), 'resources\\app.asar', W.join(...LOCK_TARGET)].filter(file => existsSync(W.join(directory, file)));
+  receipt.expect(phase, 'missing-program-without-record-refused-before-files', code !== 0 && after.uninstall.state === 'present' && after.link.state === 'present' && kept.length === 5,
+    `exit ${code}; kept ${kept.length}/5; ${await ctx.snapshot(directory)}`);
+  receipt.expect(phase, 'data-untouched', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().length}/${rootsBefore.length}`);
+  directory = await ctx.install(receipt, phase);
+  if (!directory) return;
+  await ctx.uninstallRegistered(receipt, phase, 'uninstall-after-repair-completes');
+  receipt.expect(phase, 'data-retained', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().length}/${rootsBefore.length}`);
 }
 
 /** Native backup/reset helper: diagnostic exit codes, no-data, refusal before any
@@ -450,7 +517,7 @@ async function guiConsent(ctx, receipt, phase) {
     `uninstall key ${key}; roots left ${ctx.presentRoots().length}; data in ${created.length} new backup folder(s): ${moved}; installation key removed ${keyGone}`);
 }
 
-const CASES = { 'silent-locked': silentLocked, 'silent-repair': silentRepair, inplace: inPlace, 'gui-rerun-after-partial': guiRerunAfterPartial, helper: helperCase, 'gui-locked': guiLocked, 'gui-consent': guiConsent };
+const CASES = { 'silent-locked': silentLocked, 'silent-repair': silentRepair, inplace: inPlace, 'helper-missing': helperMissing, 'program-missing': programMissing, 'gui-rerun-after-partial': guiRerunAfterPartial, helper: helperCase, 'gui-locked': guiLocked, 'gui-consent': guiConsent };
 
 export async function preflight(sys, options) {
   const problems = [];
