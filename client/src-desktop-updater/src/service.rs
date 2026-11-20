@@ -1010,7 +1010,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn replacement_and_rollback_never_leave_the_install_path_missing() {
+    async fn atomic_replacement_and_rollback_preserve_the_install_path() {
         use crate::macos_core::AppBackup;
         use std::{os::unix::fs::MetadataExt, sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc}};
         let root = std::env::temp_dir().join(format!("tarobot-updater-exchange-{}.noindex", uuid::Uuid::new_v4()));
@@ -1020,7 +1020,7 @@ mod tests {
         let running = std::fs::metadata(&app).unwrap().ino();
         // An observer stands in for Finder, Dock or a relaunch racing the update.
         // A miss records the step in flight and the errno (CI once saw one).
-        const STEPS: [&str; 6] = ["prepare", "stage", "begin", "replace", "rollback", "drop"];
+        const STEPS: [&str; 6] = ["prepare", "stage", "begin", "replace", "rollback", "retain"];
         let (stop, missing, looks) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let (step, misses) = (Arc::new(AtomicUsize::new(0)), Arc::new(std::sync::Mutex::new(Vec::<String>::new())));
         let observer = {
@@ -1034,6 +1034,7 @@ mod tests {
                 }
             })
         };
+        let mut completed_backups = Vec::new();
         for _ in 0..25 {
             step.store(0, Ordering::Relaxed);
             let mut backup = AppBackup::at(&app).await.unwrap();
@@ -1052,10 +1053,15 @@ mod tests {
             rollback(&mut backup, &staged).unwrap();
             assert_eq!(std::fs::metadata(&app).unwrap().ino(), running, "rollback restores the bundle that was running, not a copy");
             step.store(5, Ordering::Relaxed);
-            drop(backup);
+            // A concurrent stat can resolve a swapped-out vnode just before
+            // cleanup removes it, yielding ENOENT without a namespace gap.
+            // Observe every exchange while those objects remain alive; test
+            // their real cleanup after the observer has finished.
+            completed_backups.push(backup);
         }
         stop.store(true, Ordering::Relaxed);
         observer.join().unwrap();
+        drop(completed_backups);
         assert!(looks.load(Ordering::Relaxed) > 0);
         assert_eq!(missing.load(Ordering::Relaxed), 0, "the install path was observed missing: {:?}", misses.lock().unwrap());
         assert_eq!(std::fs::read_to_string(app.join("old")).unwrap(), "previous");
