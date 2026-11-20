@@ -1,3 +1,6 @@
+# ACCEPTANCE-ONLY BRANCH COPY (#50). Never merge this file into main as is:
+# it removes signing, publishing and every artifact upload so a disposable
+# GitHub-hosted runner can install/uninstall without releasing unreviewed bytes.
 name: Windows desktop installer
 on:
   workflow_dispatch:
@@ -7,19 +10,6 @@ on:
         type: choice
         options: [x64]
         default: x64
-      signed_updates:
-        description: Build a signed installer with private GitHub login updates
-        type: boolean
-        default: false
-      publish_update:
-        description: Upload the verified signed build using the selected release stage
-        type: boolean
-        default: false
-      release_stage:
-        description: Keep draft by default; stable requires owner acceptance and explicit approval
-        type: choice
-        options: [draft, rc, stable]
-        default: draft
 permissions:
   contents: read
 env:
@@ -33,6 +23,14 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Acceptance-only guard (disposable GitHub-hosted runner, no uploads)
+        shell: pwsh
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Install/uninstall acceptance runs only on a disposable GitHub-hosted runner" }
+          if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "This acceptance-only workflow copy runs only from an accept/* branch" }
+          "runner=$env:RUNNER_ENVIRONMENT os=$env:ImageOS image=$env:ImageVersion ref=$env:REF"
       - name: Configure desktop build directories
         shell: bash
         run: |
@@ -56,25 +54,19 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             client/package-lock.json
-      - name: Validate explicit updater build settings
-        env:
-          SIGNED_UPDATES: ${{ inputs.signed_updates }}
-          PUBLISH_UPDATE: ${{ inputs.publish_update }}
-          TAROBOT_GITHUB_REPOSITORY: ${{ github.repository }}
-          TAROBOT_GITHUB_CLIENT_ID: ${{ vars.TAROBOT_GITHUB_CLIENT_ID }}
-          TAROBOT_UPDATE_PUBLIC_KEY: ${{ vars.TAROBOT_UPDATE_PUBLIC_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      - name: Validate unsigned build settings
         shell: pwsh
         run: |
-          if ($env:PUBLISH_UPDATE -eq 'true' -and $env:SIGNED_UPDATES -ne 'true') { throw "Publishing requires signed_updates" }
-          node --input-type=module -e "import { windowsBuildPlan } from './client/scripts/windows-build-plan.mjs'; windowsBuildPlan({ signedUpdates: process.env.SIGNED_UPDATES === 'true' });"
-          if ($LASTEXITCODE -ne 0) { throw "Updater configuration is incomplete" }
+          node --input-type=module -e "import { windowsBuildPlan } from './client/scripts/windows-build-plan.mjs'; windowsBuildPlan({ signedUpdates: false });"
+          if ($LASTEXITCODE -ne 0) { throw "Build configuration is incomplete" }
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: client/src-tauri -> target
+          # Acceptance branch: restore only, never store build outputs.
+          save-if: false
       - name: Install NSIS
         shell: pwsh
         run: |
@@ -83,17 +75,7 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix client
       - name: Build full Windows host installer
-        if: ${{ !inputs.signed_updates }}
         run: npm run desktop:windows --prefix client -- --arch ${{ inputs.arch }}
-      - name: Build signed private GitHub updater installer
-        if: inputs.signed_updates
-        env:
-          TAROBOT_GITHUB_REPOSITORY: ${{ github.repository }}
-          TAROBOT_GITHUB_CLIENT_ID: ${{ vars.TAROBOT_GITHUB_CLIENT_ID }}
-          TAROBOT_UPDATE_PUBLIC_KEY: ${{ vars.TAROBOT_UPDATE_PUBLIC_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run desktop:windows --prefix client -- --arch ${{ inputs.arch }} --signed-updates
       - name: Packaged host end-to-end smoke
         run: client/src-tauri/host/node.exe scripts/verify-desktop-host.mjs client/src-tauri/host
       - name: Windows host control and engine discovery
@@ -169,78 +151,20 @@ jobs:
           if ($build.production -or $build.packaged.paths.Count -ne 1) { throw "Expected one isolated development package" }
           node client/scripts/desktop-persisted-migration-audit.mjs "$env:RUNNER_TEMP/windows-persisted-migration.noindex" $build.packaged.paths[0]
           if ($LASTEXITCODE -ne 0) { throw "Persistent WebView2 to Electron migration failed" }
-      - name: Upload Windows acceptance evidence
-        uses: actions/upload-artifact@v4
+      - name: Show acceptance evidence (log and summary only, no upload)
         if: always()
-        with:
-          name: TaroBird-windows-acceptance-${{ inputs.arch }}
-          path: |
-            ${{ runner.temp }}/windows-acceptance.noindex/windows-acceptance.*
-            ${{ runner.temp }}/windows-persisted-migration.noindex/*.json
-            ${{ runner.temp }}/windows-persisted-migration.noindex/*.log
-          if-no-files-found: warn
-      - name: Installer checksums
         shell: pwsh
         run: |
-          $files = Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe"
-          if (-not $files) { throw "No Windows installer was produced" }
-          $files | ForEach-Object {
-            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-            "$hash  $($_.Name)" | Set-Content -Encoding ascii "$($_.FullName).sha256"
+          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/windows-acceptance.md", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.md" -ErrorAction SilentlyContinue)) {
+            Get-Content -LiteralPath $file.FullName -Raw | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           }
-      - name: Verify signed installer and stage private update assets
-        if: inputs.signed_updates
-        env:
-          TAROBOT_UPDATE_PUBLIC_KEY: ${{ vars.TAROBOT_UPDATE_PUBLIC_KEY }}
-          APP_VERSION: ${{ steps.version.outputs.version }}
+          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/*.json", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.json", "$env:RUNNER_TEMP/windows-persisted-migration.noindex/*.json" -ErrorAction SilentlyContinue)) {
+            "===== $($file.Name) ====="; Get-Content -LiteralPath $file.FullName -Raw
+          }
+      - name: Installer checksum (log only, the installer is never uploaded)
+        if: always()
         shell: pwsh
         run: |
-          $files = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
-          if ($files.Count -ne 1) { throw "Expected exactly one Windows installer" }
-          node client/scripts/windows-update-manifest.mjs --verify-only --installer $files[0].FullName --version $env:APP_VERSION
-          if ($LASTEXITCODE -ne 0) { throw "Updater signature or signed version did not verify" }
-          New-Item -ItemType Directory -Path test-results/windows-signed -Force | Out-Null
-          Copy-Item -LiteralPath $files[0].FullName -Destination test-results/windows-signed
-          Copy-Item -LiteralPath ($files[0].FullName + '.sig') -Destination test-results/windows-signed
-      - uses: actions/upload-artifact@v4
-        if: ${{ !inputs.signed_updates }}
-        with:
-          name: TaroBird-windows-${{ inputs.arch }}-unsigned
-          path: |
-            ${{ runner.temp }}/tarobot-electron-output.noindex/*-setup.exe
-            ${{ runner.temp }}/tarobot-electron-output.noindex/*.sha256
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        if: inputs.signed_updates
-        with:
-          name: TaroBird-windows-${{ inputs.arch }}-signed-update
-          path: test-results/windows-signed/*
-          if-no-files-found: error
-  publish-private-update:
-    if: inputs.publish_update && inputs.signed_updates
-    needs: windows
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment: windows-updates
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - uses: actions/download-artifact@v4
-        with:
-          name: TaroBird-windows-${{ inputs.arch }}-signed-update
-          path: test-results/windows-signed
-      - name: Stage or publish complete verified assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAROBOT_UPDATE_PUBLIC_KEY: ${{ vars.TAROBOT_UPDATE_PUBLIC_KEY }}
-          APP_VERSION: ${{ needs.windows.outputs.version }}
-          RELEASE_STAGE: ${{ inputs.release_stage || 'draft' }}
-        shell: bash
-        run: |
-          mapfile -t installers < <(find test-results/windows-signed -maxdepth 1 -type f -name '*-setup.exe')
-          if [[ ${#installers[@]} -ne 1 ]]; then echo 'Expected one verified installer'; exit 1; fi
-          node client/scripts/publish-windows-update.mjs --installer "${installers[0]}" --repository "$GITHUB_REPOSITORY" --version "$APP_VERSION" --commit "$GITHUB_SHA" --stage "$RELEASE_STAGE" --output test-results/private-windows-update-bundle
+          Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          }
