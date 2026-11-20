@@ -1440,6 +1440,18 @@
           "fingerprint": "a3fbe876b99abf7560a3958436975de3ac938a9d7776f3c94651e288c69ff0e2"
         }
       ]
+    },
+    {
+      "path": "client/electron/tests/screen-service.test.mjs",
+      "sha256": "10eb594ea95b0df54efc78d593b811388602613538742269eca53b9847879818",
+      "reviewer": "claude",
+      "note": "Re-reviewed after adding the unsupported-target status test; the only finding is the unchanged synthetic home path in the ticket-error negative case.",
+      "findings": [
+        {
+          "kind": "personal-home-path",
+          "fingerprint": "ffe27392eb3e6ac8cca1fed5637a4c727bca806b99147ec8cf5913c3f82efc98"
+        }
+      ]
     }
   ]
 }
