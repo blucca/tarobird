@@ -262,3 +262,13 @@ test("a Mac without the native screen functions keeps its reinstall notice and c
  await expect(page.getByText("暂不支持",{exact:true})).toHaveCount(0);
  await expect(page.getByText("这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。",{exact:true})).toHaveCount(0);
 });
+
+for(const english of [false,true])test(`a remote Host without a registered desktop points at that computer, not at a Mac (${english?"en":"zh"})`,async({page})=>{
+ const sentence=english?"Screen service isn't registered. Open TaroBird on that computer. Only Macs can be viewed for now.":"屏幕服务尚未注册。请在目标电脑上打开 TaroBird 并检查；目前只有 Mac 可以被远程查看。";
+ await page.goto(url(`?remote&ready${english?"&en":""}`));await expect(page.getByRole("button",{name:english?"View screen":"查看屏幕",exact:true})).toBeEnabled();
+ await page.evaluate(()=>{const f=(window as any).screenSettingsFixture;f.state.status.desktop=null;window.dispatchEvent(new Event("focus"));});
+ await expect(page.getByText(sentence,{exact:true})).toBeVisible();
+ await expect(page.getByText(english?"The screen service is not registered. Check or retry it on the target Mac.":"屏幕服务尚未注册，请在目标 Mac 检查或重试屏幕服务。",{exact:true})).toHaveCount(0);
+ // A remote Host is never probed through this computer's native service.
+ expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.native)).toEqual([]);
+});

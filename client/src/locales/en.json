@@ -5267,5 +5267,6 @@
   "发送方电脑当前不可用，仅可撤销": "Sending computer unavailable; revoke only",
   "保存或放弃修改后，可以切换发送方。": "Save or discard your changes before switching the sender.",
   "暂不支持": "Not supported",
-  "这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。": "This Windows PC can't be viewed or controlled remotely yet. Viewing a Mac from here still works."
+  "这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。": "This Windows PC can't be viewed or controlled remotely yet. Viewing a Mac from here still works.",
+  "屏幕服务尚未注册。请在目标电脑上打开 TaroBird 并检查；目前只有 Mac 可以被远程查看。": "Screen service isn't registered. Open TaroBird on that computer. Only Macs can be viewed for now."
 }

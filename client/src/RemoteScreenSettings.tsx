@@ -162,7 +162,8 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
     : !status ? current?.error ? t("无法读取屏幕状态，请刷新重试。") : t("正在读取屏幕状态，请稍候或刷新。")
     : !status.enabled ? t("请先在目标 Mac 开启允许远程屏幕。")
     : status.permission === "none" ? t("此设备尚未获得查看授权。")
-    : !status.desktop ? t("屏幕服务尚未注册，请在目标 Mac 检查或重试屏幕服务。")
+    // A remote Host does not say which system it runs; only Macs register today.
+    : !status.desktop ? local ? t("屏幕服务尚未注册，请在目标 Mac 检查或重试屏幕服务。") : t("屏幕服务尚未注册。请在目标电脑上打开 TaroBird 并检查；目前只有 Mac 可以被远程查看。")
     : status.desktop.locked ? t("目标 Mac 已锁定，请在本机解锁后重新连接。")
     : status.desktop.capture !== "granted" ? t("请在目标 Mac 允许 TaroBird 录制屏幕，再重新连接。")
     : !status.desktop.displays.length ? t("目标 Mac 没有可用显示器。") : !open ? t("此入口暂时无法打开屏幕，请重新打开连接设置。") : "");
