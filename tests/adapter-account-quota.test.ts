@@ -12,7 +12,8 @@ import { gatewayEngineQuota } from "../src/gateway/engine-quota.js";
 const roots: string[] = [];
 const disposals: Array<() => unknown> = [];
 afterEach(async () => { for (const dispose of disposals.splice(0)) await dispose(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); vi.restoreAllMocks(); });
-const account = { account: { type: "chatgpt", email: "fixture@example.invalid", planType: "pro" }, requiresOpenaiAuth: true, userId: "fixture-user" };
+const routing = (chatgptAccountId: string) => ({ workspaceRouting: { chatgptAccountId, backendOrigin: "https://chatgpt.com", accountRoutingOverride: "NO_CONSTRAINT" } });
+const account = { account: { type: "chatgpt", email: "fixture@example.invalid", planType: "pro" }, requiresOpenaiAuth: true, userId: "fixture-user", ...routing("fixture-account") };
 class Child extends EventEmitter {
   stdout = new EventEmitter(); stderr = new EventEmitter(); methods: string[] = []; killCount = 0; closed = false;
   hold = new Set<string>(); closeDelayMs = 20; accounts: unknown[] = []; limits?: unknown; errors: Record<string, { code: number; message: string }> = {};
@@ -266,7 +267,7 @@ describe("one-shot opaque Codex reads require a distinguishable native account",
   });
   it("still shows a one-shot reading when the native user and billed account are both identified", async () => {
     const f = await opaqueFixture("keyring");
-    const account = chatgpt({ userId: "fixture-user" }, { planType: "pro", email: null });
+    const account = chatgpt({ userId: "fixture-user", ...routing("workspace-B") }, { planType: "pro", email: null });
     f.accounts.push([account, account]); f.limits.push(limitsB);
     const result = await f.adapter.getAccountQuota({ refresh: true });
     expect(result.snapshot).toMatchObject({ state: "ready" }); expect(result.snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 30 });
@@ -319,5 +320,50 @@ describe("native Codex login revocation is reported as login required", () => {
   ])("does not report %s as login required", async (_label, errors) => {
     const snapshot = await read(errors);
     expect(snapshot.state).not.toBe("login_required"); expect(snapshot).toMatchObject({ pools: [] });
+  });
+});
+
+// Q1: neither the stable nor the experimental 0.170.0 protocol ties account/rateLimits/read to
+// workspaceRouting; its accountId is "when supplied by the backend". An opaque one-shot reading is shown
+// only when the user, the workspace in both account/read replies and the usage reply's accountId agree.
+// Shapes below are FABLE's real codex-cli 0.170.0 replies (synthetic login, loopback backend).
+describe("one-shot opaque reads bind the usage snapshot to the current workspace", () => {
+  const realAccount = { account: { type: "chatgpt", email: "synthetic@example.invalid", planType: "pro", workspaceName: "Synthetic Workspace" }, userId: "user-SYNTHETIC-1", requiresOpenaiAuth: true, workspaceRouting: { chatgptAccountId: "acct-SYNTHETIC-1", backendOrigin: "https://chatgpt.com", accountRoutingOverride: "NO_CONSTRAINT" } };
+  const realLimits = (accountId: string | null) => ({ ordinaryUsageAllowed: accountId ? true : null, rateLimits: { limitId: "codex", limitName: null, normalModelSlug: null, primary: { usedPercent: 30, windowDurationMins: 300, resetsAt: 1795213966 }, secondary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: 1795296766 }, credits: { hasCredits: false, unlimited: false, balance: "0" }, individualLimit: null, spendControlReached: null, planType: "pro", rateLimitReachedType: null }, rateLimitResetCredits: null, accountId, rateLimitUpsell: null });
+  const run = async (before: unknown, after: unknown, limits: unknown, kind: "keyring" | "file" = "keyring") => {
+    if (kind === "file") {
+      const f = await fixture(), child = new Child(); child.accounts = [before, after]; child.limits = limits;
+      const adapter = new ProcessCodexAdapter("codex", f.env, () => child, undefined, undefined, undefined, f.root);
+      disposals.push(() => adapter.destroy());
+      return (await adapter.getAccountQuota({ refresh: true })).snapshot;
+    }
+    const f = await opaqueFixture(kind); f.accounts.push([before, after]); f.limits.push(limits);
+    return (await f.adapter.getAccountQuota({ refresh: true })).snapshot;
+  };
+  it("shows the real reply when user, both workspaces and the usage account agree", async () => {
+    const snapshot = await run(realAccount, realAccount, realLimits("acct-SYNTHETIC-1"));
+    expect(snapshot).toMatchObject({ state: "ready" }); expect(snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 30 });
+  });
+  it("keeps unknown when the usage reply does not name its account, even though routing does", async () => {
+    expect(await run(realAccount, realAccount, realLimits(null))).toMatchObject({ state: "unknown", reason: "scope_unverifiable", pools: [] });
+  });
+  it("keeps unknown when account/read gives no workspace to compare with the usage account", async () => {
+    const { workspaceRouting: _omit, ...withoutRouting } = realAccount;
+    expect(await run(withoutRouting, withoutRouting, realLimits("acct-SYNTHETIC-1"))).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+    expect(await run({ ...realAccount, workspaceRouting: null }, { ...realAccount, workspaceRouting: null }, realLimits("acct-SYNTHETIC-1"))).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+  });
+  it("keeps unknown for the real reply without a user id", async () => {
+    const noUser = { ...realAccount, userId: null };
+    expect(await run(noUser, noUser, realLimits("acct-SYNTHETIC-1"))).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+  });
+  it.each([
+    ["workspace changes between the two account reads", { ...realAccount, workspaceRouting: { ...realAccount.workspaceRouting, chatgptAccountId: "acct-SYNTHETIC-2" } }, realLimits("acct-SYNTHETIC-1")],
+    ["usage account differs from the routed workspace", realAccount, realLimits("acct-SYNTHETIC-2")],
+  ])("rejects when the %s", async (_label, after, limits) => {
+    expect(await run(realAccount, after, limits)).toMatchObject({ reason: "auth_changed", pools: [] });
+  });
+  it("keeps a file-verified login readable without usage account or routing", async () => {
+    const { workspaceRouting: _omit, ...withoutRouting } = realAccount;
+    expect(await run(withoutRouting, withoutRouting, realLimits(null), "file")).toMatchObject({ state: "ready" });
   });
 });

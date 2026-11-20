@@ -4,7 +4,8 @@ import { applyClaudeQuotaEvent, parseCodexQuota, unavailableQuota } from "../src
 import { readCodexAccountQuota, type CodexQuotaRequest } from "../src/codex/codex-account-quota.js";
 
 const now = Date.parse("2026-11-21T00:00:00Z");
-const account = { account: { type: "chatgpt", email: "private@example.invalid", planType: "pro", workspaceName: "Private workspace" }, userId: "private-user", requiresOpenaiAuth: true };
+// codex-cli 0.170.0 with experimentalApi returns workspaceRouting; the proof binds usage to it.
+const account = { account: { type: "chatgpt", email: "private@example.invalid", planType: "pro", workspaceName: "Private workspace" }, userId: "private-user", requiresOpenaiAuth: true, workspaceRouting: { chatgptAccountId: "private-account", backendOrigin: "https://chatgpt.com", accountRoutingOverride: "NO_CONSTRAINT" } };
 const limits = { accountId: "private-account", ordinaryUsageAllowed: true, rateLimits: { primary: { usedPercent: 40, windowDurationMins: 300 } } };
 describe("account quota parsers", () => {
   it("prefers multiple pools over the legacy pool, does not expose account data", () => {
@@ -122,6 +123,10 @@ describe("Codex read-only quota reader", () => {
     expect(result.snapshot.state).toBe("ready");
     expect(result.proof).toMatchObject({ scopeStamp: "scope-v1", engine: "codex" });
     expect(JSON.stringify(result)).not.toMatch(/private-user|private-account|example/);
+    // Without a routed workspace to compare, the usage account alone yields no proof (values still parse).
+    const { workspaceRouting: _omit, ...unrouted } = account;
+    const bare = await readCodexAccountQuota({ request: async method => method === "account/read" ? unrouted : limits, captureScope: () => "scope-v1", proofKey, now: () => now });
+    expect(bare.snapshot.state).toBe("ready"); expect(bare.proof).toBeUndefined();
   });
   it("fails closed after an identity or scope change", async () => {
     let calls = 0;

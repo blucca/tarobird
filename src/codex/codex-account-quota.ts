@@ -80,7 +80,12 @@ export async function readCodexAccountQuota(options: {
     const snapshot = parseCodexQuota(after, limits, now());
     const accountId = quotaNativeIdentity(quotaObject(limits).accountId);
     if (afterMode.accountId && accountId && afterMode.accountId !== accountId) throw new QuotaReadError("auth_changed");
-    const proof = proveQuotaAccount(options.proofKey, { engine: "codex", scopeStamp: stamp, accountId, userId: afterMode.userId });
+    // Neither the stable nor the experimental protocol scopes account/rateLimits/read to workspaceRouting;
+    // the usage snapshot names its account only "when supplied by the backend". An account proof therefore
+    // needs that account to be present AND to equal the routed workspace, which the identity comparison
+    // above already holds equal across both account/read replies. Routing never fills in a missing usage account.
+    const proof = afterMode.accountId && accountId === afterMode.accountId
+      ? proveQuotaAccount(options.proofKey, { engine: "codex", scopeStamp: stamp, accountId, userId: afterMode.userId }) : undefined;
     await checkScope();
     return { snapshot, ...(proof ? { proof } : {}) };
   } catch (error) {
