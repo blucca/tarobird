@@ -583,8 +583,12 @@ describe("DeepSeek Harness private profile", () => {
     const queued = prepare(f);
     // Observe both rejections immediately, not after waiting for the first.
     const results = await Promise.allSettled([failing, queued]);
-    expect(results[0]).toMatchObject({ status: "rejected", reason: { code: "EIO" } });
-    expect(results[1]).toEqual({ status: "fulfilled", value: [] });
+    // Async path checks precede the lock, so invocation order is not lock
+    // admission order. Exactly one attempt fails and the other recovers.
+    expect(results.filter(result => result.status === "rejected"))
+      .toEqual([expect.objectContaining({ status: "rejected", reason: expect.objectContaining({ code: "EIO" }) })]);
+    expect(results.filter(result => result.status === "fulfilled"))
+      .toEqual([{ status: "fulfilled", value: [] }]);
 
     expect(await readFile(path.join(f.privateProfile, "cordis.patch.yml"), "utf8")).toBe(SHARED_PATCH);
     expect(await readFile(path.join(f.privateProfile, "node_modules", "plugin-a", "index.js"), "utf8"))
