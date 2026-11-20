@@ -20,6 +20,7 @@ import { defaultDispatcherSettings } from "../client-protocol/dispatch.js";
 import { saveDispatcherSettingsInTransaction } from "./dispatch.js";
 import { CODEX_MODEL_CHOICES } from "../codex/model-capabilities.js";
 import { readModelCatalog } from "../runtime/model-catalog.js";
+import { findDeepSeekModel } from "../codex/deepseek-models.js";
 import { decodePiModel } from "../codex/pi-models.js";
 import { readEngineCapabilities } from "../runtime/bot-capabilities.js";
 import { applyEngineSelection, getEngineEffortValidationError, loadInstanceConfig, readValidatedConfigFile, resolveInstanceWorkspacePath, updateInstanceConfig, type InstanceEngine } from "../state/instance-config.js";
@@ -71,13 +72,13 @@ export class BotManager {
     return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: resolveDeepSeekExecutable(env), antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy", pi: resolvePiExecutable(env) };
   }
   engineAvailable(engine: InstanceEngine): boolean { const env = this.env; return !!resolveEngineExecutable(this.engineBinaries(env)[engine], env); }
-  async catalog(workspace?: string): Promise<BotCatalog> {
+  async catalog(workspace?: string, freshEngine?: InstanceEngine): Promise<BotCatalog> {
     const workspaceAvailable = !workspace || path.isAbsolute(workspace) && await stat(workspace).then(s => s.isDirectory(), () => false);
     const env = this.env, bins = this.engineBinaries(env);
     return { engines: await Promise.all((Object.keys(bins) as InstanceEngine[]).map(async (id) => {
       const available = !!resolveEngineExecutable(bins[id], env);
       const catalog: Awaited<ReturnType<typeof readModelCatalog>> = id === "pi" && !workspaceAvailable ? { choices: [{ id: "", efforts: [""] }], status: "unavailable" }
-        : (id === "antigravity" || id === "pi") && !available ? { choices: [{ id: "", efforts: [""] }] } : await readModelCatalog(id, env, workspace);
+        : (id === "antigravity" || id === "pi" || id === "deepseek") && !available ? { choices: [{ id: "", efforts: [""] }] } : await readModelCatalog(id, env, workspace, freshEngine === id);
       const models = catalog.choices;
       const defaults: Record<string, unknown> = {}; applyEngineSelection(defaults, id);
       if (id === "antigravity") defaults.model = preferredAntigravityModel(models);
@@ -106,8 +107,14 @@ export class BotManager {
       const creating = !row;
       if (!row) {
         if (spec.workspace && (!path.isAbsolute(spec.workspace) || !await stat(spec.workspace).then((s) => s.isDirectory(), () => false))) throw new HubError("bot_workspace_unavailable");
-        const engine = (await this.catalog(spec.engine === "pi" ? spec.workspace : undefined)).engines.find((e) => e.id === spec.engine);
+        const engine = (await this.catalog(spec.engine === "pi" || spec.engine === "deepseek" ? spec.workspace || undefined : undefined, spec.engine === "deepseek" ? "deepseek" : undefined)).engines.find((e) => e.id === spec.engine);
         if (!engine?.available) throw new HubError("bot_engine_unavailable", 409);
+        if (spec.engine === "deepseek") {
+          if (engine.catalogStatus === "unavailable") throw new HubError("model_catalog_unavailable", 409);
+          const selected = findDeepSeekModel(engine.models, spec.model);
+          if (!selected?.provider || !selected.modelId) throw new HubError("model_unavailable", 409);
+          if (!selected.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
+        }
         if (spec.engine === "kimi" && spec.effort && engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort) === false) throw new HubError("bot_effort_incompatible");
         if (spec.engine === "pi" && spec.effort && !engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
         if (spec.engine === "antigravity" && spec.effort && !antigravityEffortChoices(await discoverAntigravityModels(this.env), spec.model).includes(spec.effort)) throw new HubError("bot_effort_incompatible");

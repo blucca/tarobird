@@ -13,7 +13,7 @@ export const modelSettingsSchema = z.object({
   catalogStatus: z.enum(["ready", "no-models", "unavailable"]).optional(),
 }).strict();
 export const modelPatchSchema = z.object({ revision: modelSettingsSchema.shape.revision, model: modelValueSchema, effort: effortValueSchema.optional() }).strict();
-export const modelErrorSchema = z.enum(["model_conflict", "model_effort_incompatible", "model_config_unreadable", "model_engine_changed", "model_id_invalid"]);
+export const modelErrorSchema = z.enum(["model_conflict", "model_effort_incompatible", "model_config_unreadable", "model_engine_changed", "model_id_invalid", "model_catalog_unavailable", "model_unavailable"]);
 export const modelResultSchema = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(true), settings: modelSettingsSchema }),
   z.object({ ok: z.literal(false), error: modelErrorSchema }),

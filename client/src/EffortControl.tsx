@@ -6,8 +6,10 @@ import type { HubConnection } from "./connection.js";
 import { useBotSettingsRequest } from "./bot-settings-request.js";
 import { t, useLocale } from "./i18n.js";
 import { modelEffortPreset } from "./model-selection.js";
+import { DeepSeekModelCatalogNotice, deepSeekCatalogBlocked, deepSeekSettingsErrorText } from "./DeepSeekModelCatalog.js";
 
 function errorText(error: unknown): string {
+  const deepSeekError = deepSeekSettingsErrorText(error); if (deepSeekError) return deepSeekError;
   switch (error instanceof Error ? error.message : "") {
     case "effort_conflict": return t("其他设备或本机已修改设置。请重新读取后再选择，避免覆盖对方的修改。");
     case "effort_incompatible": return t("当前引擎或模型不支持此档位，请重新读取可用选项。");
@@ -29,28 +31,38 @@ export function EffortControl({ connection, bots, summary, online, owner, compac
 function EffortDialog({ connection, bots, online, close, returnFocus }: { connection: HubConnection; bots: Bot[]; online: boolean; close: () => void; returnFocus: React.RefObject<HTMLButtonElement | null> }) {
   const [selection, setBotId] = useState(bots[0]!.id), [draft, setDraft] = useState<EffortSettings["effort"]>("");
   const bot = bots.find((item) => item.id === selection) ?? bots[0]!, botId = bot.id;
-  const { data, busy, saving, error, saved, load, save } = useBotSettingsRequest(connection, botId, "effort", effortSettingsSchema);
+  const { data, busy, saving, error, saved, load, save } = useBotSettingsRequest(connection, botId, "effort", effortSettingsSchema, bot.engine === "deepseek");
   const preset = data && modelEffortPreset(data.engine, data.model, data.choices);
-  useEffect(() => { if (data) setDraft(data.effort); }, [data]);
+  const previousRead = useRef<{ connection: HubConnection; botId: string; effort: EffortSettings["effort"] }>(undefined);
+  useEffect(() => {
+    if (!data) return;
+    const previous = previousRead.current; previousRead.current = { connection, botId, effort: data.effort };
+    if (data.engine === "deepseek" && !saved && previous?.connection === connection && previous.botId === botId && draft !== previous.effort) return;
+    setDraft(data.effort);
+  }, [data]);
+  const catalogBlocked = deepSeekCatalogBlocked(data?.engine ?? bot.engine, data?.catalogStatus);
+  const writeBlocked = busy || !online || catalogBlocked || (data?.engine === "deepseek" && error !== undefined);
   return <CreationDialog mobilePage title={t("思考强度")} closeLabel={t("关闭思考强度")} close={close} busy={saving} returnFocus={returnFocus}>
-    <div className="effort-settings">
+    <div className="effort-settings" data-engine={data?.engine}>
       {bots.length > 1 && <label>{t("选择要调整的 Bot")}<select aria-label={t("选择要调整的 Bot")} value={botId} disabled={busy} onChange={(event) => setBotId(event.target.value)}>{bots.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}
       <p className="effort-scope"><strong>{bot?.name}</strong><span>{t("此 Bot 的所有对话、群聊和话题共用")}</span></p>
       {data && <form onSubmit={(event) => {
-        event.preventDefault(); if (busy || !online) return;
+        event.preventDefault(); if (writeBlocked) return;
         void save({ revision: data.revision, effort: draft });
       }}>
         <p className="muted">{data.engine}{data.model ? ` · ${preset?.model ?? data.model}` : ` · ${t("引擎默认模型")}`}</p>
         <label>{t("Effort 档位")}<select aria-label={t("Effort 档位")} disabled={busy || !online} value={draft} onChange={(event) => setDraft(event.target.value as EffortSettings["effort"])}>
-          {!data.choices.includes(data.effort) && <option value={data.effort} disabled>{data.effort} · {data.engine === "antigravity" ? t("当前值，未确认兼容") : t("当前模型不支持")}</option>}
-          {data.choices.map((value) => <option key={value} value={value}>{value || (preset ? t("沿用模型预设（{0}）", preset.effort) : t("跟随默认（不强制指定）"))}</option>)}
+          {!data.choices.includes(draft) && <option value={draft} disabled>{draft} · {data.engine === "antigravity" || catalogBlocked ? t("当前值，未确认兼容") : t("当前模型不支持")}</option>}
+          {data.choices.map((value) => <option key={value} value={value}>{data.engine === "deepseek" && value === "off" ? t("关闭推理（off）") : value || (preset ? t("沿用模型预设（{0}）", preset.effort) : t("跟随默认（不强制指定）"))}</option>)}
         </select></label>
+        {data.engine === "deepseek" && <DeepSeekModelCatalogNotice status={data.catalogStatus}/>}
         {data.engine === "antigravity" && data.choices.length === 1 && <p className="muted">{t("尚未确认此模型的可用档位。可先跟随默认；选择具体模型或稍后重新读取。")}</p>}
         <p className="muted">{t("各家档位不同，同名档位也不代表相同强度。跟随默认不等于关闭思考。")}</p>
         <p className="muted">{t("后续任务读取新设置；当前任务不打断，后台任务繁忙时可能延后应用。不会新建会话或清空上下文。")}</p>
         {data.activeTurns > 0 && <p className="dashboard-notice">{t("此 Bot 有 {0} 个执行中的任务。", data.activeTurns)}</p>}
         {saved && draft === data.effort && <p role="status" className="dashboard-notice">{t("已保存为 {0}，此 Bot 的其他对话也会沿用。", data.effort || t("跟随默认"))}</p>}
-        <div className="effort-actions"><button type="button" disabled={busy || !online} onClick={() => void load()}>{t("重新读取")}</button><button type="submit" className="primary" disabled={busy || !online || draft === data.effort || !data.choices.includes(draft)}>{busy ? t("保存中…") : t("保存到此 Bot")}</button></div>
+        {busy && !saving && <p role="status" className="muted">{t("正在读取…")}</p>}
+        <div className="effort-actions"><button type="button" disabled={busy || !online} onClick={() => void load()}>{t("重新读取")}</button><button type="submit" className="primary" disabled={writeBlocked || draft === data.effort || !data.choices.includes(draft)}>{saving ? t("保存中…") : t("保存到此 Bot")}</button></div>
       </form>}
       {!data && <button disabled={busy || !online} onClick={() => void load()}>{busy ? t("正在读取…") : t("重新读取")}</button>}
       {!online && <p role="status">{t("连接恢复后即可操作")}</p>}

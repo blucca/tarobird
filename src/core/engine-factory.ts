@@ -14,6 +14,7 @@ import { hasCorePostTurnDelivery } from "./delivery.js";
 import { KimiAcpAdapter } from "../codex/kimi-acp-adapter.js";
 import { ProcessAntigravityAdapter } from "../codex/antigravity-adapter.js";
 import { CodexAppServerAdapter } from "../codex/app-server-adapter.js";
+import { decodeDeepSeekModel } from "../codex/deepseek-models.js";
 import { DeepSeekHarnessAdapter, type DeepSeekHarnessModelSelection } from "../codex/deepseek-harness-adapter.js";
 import { DeepSeekHarnessHost } from "../codex/deepseek-harness-host.js";
 import { createNativeSearchMcpPlanner } from "../runtime/native-search-mcp.js";
@@ -673,14 +674,9 @@ function deepSeekModelSelection(
   if (!model) {
     return { reasoningEffort };
   }
-  const separator = model.indexOf("/");
-  if (separator > 0 && separator < model.length - 1) {
-    return {
-      provider: model.slice(0, separator),
-      model: model.slice(separator + 1),
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-    };
-  }
+  const decoded = decodeDeepSeekModel(model);
+  if (decoded) return { provider: decoded.provider, model: decoded.modelId, ...(reasoningEffort ? { reasoningEffort } : {}) };
+  if (model.startsWith("dsh-model:")) throw new Error("DeepSeek Harness model_id_invalid");
   return { model, ...(reasoningEffort ? { reasoningEffort } : {}) };
 }
 

@@ -24,7 +24,6 @@ describe("Bot effort settings", () => {
     ["claude", "claude-opus-4-5", ["", "low", "medium", "high"]],
     ["claude", "haiku", [""]],
     ["kimi", "kimi-code/k3", ["", "low", "high", "max"]],
-    ["deepseek", "deepseek-official/deepseek-v4-pro", ["", "low", "high", "max"]],
     ["antigravity", "gemini-3.7-flash-high", ["", "high"]],
     ["antigravity", "gemini-3.1-pro-high", ["", "high"]],
     ["antigravity", "gpt-oss-120b-medium", ["", "medium"]],
@@ -63,8 +62,8 @@ describe("Bot effort settings", () => {
     expect(await effortSettings(root, "codex", 0, { revision: current.settings.revision, effort: "low" })).toEqual({ ok: false, error: "effort_conflict" });
   });
   it("clears the override for default without persisting an invented off level", async () => {
-    await config({ engine: "deepseek", effort: "max" }); const before = await effortSettings(root, "deepseek", 0); if (!before.ok) throw new Error(before.error);
-    expect(await effortSettings(root, "deepseek", 0, { revision: before.settings.revision, effort: "" })).toMatchObject({ ok: true, settings: { effort: "" } });
+    await config({ engine: "codex", effort: "max" }); const before = await effortSettings(root, "codex", 0); if (!before.ok) throw new Error(before.error);
+    expect(await effortSettings(root, "codex", 0, { revision: before.settings.revision, effort: "" })).toMatchObject({ ok: true, settings: { effort: "" } });
     expect(JSON.parse(await readFile(path.join(root, "config.json"), "utf8"))).not.toHaveProperty("effort");
   });
   it("reports tasks that start while an effort save waits for the config mutex", async () => {

@@ -24,7 +24,6 @@ describe("getEngineEffortValidationError", () => {
     ["claude", "ultra", undefined, "Claude effort"],
     ["kimi", "medium", undefined, "Kimi effort"],
     ["antigravity", "ultra", undefined, "Antigravity effort"],
-    ["deepseek", "medium", undefined, "DeepSeek Harness effort"],
     ["codex", "ultra", "gpt-5.6-luna", "selected Codex model"],
   ] as const)("rejects %s effort %s when unsupported", (engine, effort, model, message) => {
     expect(getEngineEffortValidationError(engine, effort, model)).toContain(message);
@@ -37,6 +36,8 @@ describe("getEngineEffortValidationError", () => {
     ["antigravity", "xhigh", undefined],
     ["antigravity", "max", undefined],
     ["deepseek", "max", undefined],
+    ["deepseek", "medium", undefined],
+    ["deepseek", "off", undefined],
     ["codex", "ultra", "gpt-5.6-sol"],
     ["codex", "ultra", "gpt-6-astra"],
   ] as const)("accepts %s effort %s when supported", (engine, effort, model) => {

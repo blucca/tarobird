@@ -1366,6 +1366,7 @@ dialog:focus{outline:none}
 .header-effort:focus-visible::after{outline:2px solid var(--focus);outline-offset:2px}
 .header-effort:disabled{opacity:1;cursor:default}
 .effort-settings{font-size:14px;line-height:1.6}
+.effort-settings[data-engine="deepseek"] p{overflow-wrap:anywhere}
 .effort-settings label{display:flex;flex-direction:column;gap:8px;margin:18px 0 10px;font-weight:500}
 .effort-settings select{width:100%;min-height:44px}
 .effort-settings .muted{font-size:12px;margin:12px 0}

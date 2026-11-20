@@ -82,7 +82,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   bots chrome ID --enabled on|off --revision REV
   bots model ID                         读取当前模型、可选模型和 revision
   bots model ID --model M --revision REV [--effort E]
-    --model default 恢复默认；--effort default 恢复默认思考强度；Pi 的 --effort off 关闭思考
+    --model default 恢复默认；--effort default 恢复默认思考强度；Pi / DeepSeek 的 --effort off 显式关闭思考（需模型支持）
   bots persona ID                       读取 Bot 人设小节和 revision
   bots persona ID --from PATCH.json     保存 {revision,text}；text 为空字符串时清空人设
   bots delete ID --expected-name N --yes（保留历史与工作区）
@@ -798,11 +798,11 @@ export async function runHostCli(argv: string[]): Promise<void> {
           await output(await management.botModel(id));
         } else {
           const revision = required(v.revision, "先用 bots model ID 读取 revision，再用 --revision 提交，避免覆盖其他设备的修改。");
-          // Pi's off is an actual thinking level. Resolve the engine from the
+          // Pi/DeepSeek off is an explicit native thinking level. Resolve the engine from the
           // same authenticated settings API, but keep the caller's revision so
           // an intervening engine/settings change still fails as a conflict.
           const clearEffort = v.effort === "default"
-            || v.effort === "off" && (await management.botModel(id)).engine !== "pi";
+            || v.effort === "off" && !["pi", "deepseek"].includes((await management.botModel(id)).engine);
           await output(await management.botModel(id, {
             revision,
             model: ["default", "off"].includes(v.model) ? "" : v.model,

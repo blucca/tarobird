@@ -4,7 +4,9 @@ import { botCapabilitiesSchema } from "./capabilities.js";
 // to avoid an initialization cycle.
 
 const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
-const effort = z.enum(["", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const effort = z.enum(["", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+export const dispatchEngineSelectionValid = (value: { engine: string; model?: string; effort?: string }) => value.engine === "deepseek"
+  || ((!value.model || value.model.length <= 128 && /^(?!-)[A-Za-z0-9._:/@+[\]-]*$/.test(value.model)) && value.effort !== "off" && value.effort !== "minimal");
 
 /** A dispatcher Bot, hidden ticket conversations and the ticket ledger. */
 export const DISPATCH_CAPABILITY = "dispatch.v1";
@@ -47,11 +49,11 @@ export const ticketFailureSchema = z.object({
 export type TicketFailure = z.infer<typeof ticketFailureSchema>;
 
 export const ticketTargetSchema = z.object({
-  botId: id, engine: dispatchEngineSchema, model: z.string().max(128), effort,
-}).strict();
+  botId: id, engine: dispatchEngineSchema, model: z.string().max(512), effort,
+}).strict().refine(dispatchEngineSelectionValid, { message: "engine_selection_invalid" });
 export type TicketTarget = z.infer<typeof ticketTargetSchema>;
 
-export const ticketAttemptSchema = ticketTargetSchema.extend({
+export const ticketAttemptSchema = ticketTargetSchema.safeExtend({
   id, conversationId: id, inputMessageId: id, startedAt: z.number().int(),
   endedAt: z.number().int().optional(),
   /** Durable intent; an RPC acknowledgment alone never proves the turn ended. */
@@ -87,7 +89,7 @@ export type EngineHealth = z.infer<typeof engineHealthSchema>;
 
 /** Conversation marker for a hidden worker conversation (dispatch.v1 clients only). */
 export const conversationTicketSchema = z.object({
-  id, dispatcherBotId: id, model: z.string().max(128).optional(), effort: effort.optional(),
+  id, dispatcherBotId: id, model: z.string().max(512).optional(), effort: effort.optional(),
   /** The ticket's own directory, inside the dispatcher's workspace. */
   workspace: z.string().max(4096).optional(),
 }).strict();
@@ -96,10 +98,10 @@ export type ConversationTicket = z.infer<typeof conversationTicketSchema>;
 export const createTicketSchema = z.object({
   requestId: id, title: z.string().trim().min(1).max(200), request: z.string().trim().min(1).max(20_000),
 }).strict();
-export const dispatchTicketRequestSchema = z.object({
+export const dispatchTicketRequestBaseSchema = z.object({
   requestId: id, ticketId: id, engine: dispatchEngineSchema,
   // Becomes a native CLI argument; never an option-like or shell-like value.
-  model: z.string().trim().max(128).regex(/^(?!-)[A-Za-z0-9._:/@+[\]-]*$/).optional(), effort: effort.optional(),
+  model: z.string().trim().max(512).regex(/^(?!-)[A-Za-z0-9.%_:/@+~!'()*[\]-]*$/).optional(), effort: effort.optional(),
   /** Instruction for the worker; defaults to the ticket request. */
   text: z.string().trim().min(1).max(20_000).optional(),
   /** Dispatch even though the engine is cooling down or needs sign-in. */
@@ -108,6 +110,7 @@ export const dispatchTicketRequestSchema = z.object({
    * ask defaults to none. Continuations never replenish this allowance. */
   assist: z.number().int().min(0).max(2).optional(),
 }).strict();
+export const dispatchTicketRequestSchema = dispatchTicketRequestBaseSchema.refine(dispatchEngineSelectionValid, { message: "engine_selection_invalid" });
 export const updateTicketSchema = z.object({
   ticketId: id,
   status: z.enum(["queued", "needs_answer", "needs_review", "blocked", "done", "cancelled"]).optional(),

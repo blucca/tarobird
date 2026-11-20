@@ -46,9 +46,10 @@ export const DEFAULT_CLAUDE_EFFORT: EffortLevel = "xhigh";
 export const DEFAULT_CODEX_EFFORT: EffortLevel = "xhigh";
 export const KIMI_EFFORT_LEVELS = ["low", "high", "max"] as const satisfies readonly EffortLevel[];
 export const ANTIGRAVITY_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const satisfies readonly EffortLevel[];
-// Clearing the bridge override follows Harness defaults; it does not guarantee
-// that reasoning is disabled. Only explicit non-default effort levels persist.
-export const DEEPSEEK_EFFORT_LEVELS = ["low", "high", "max"] as const satisfies readonly EffortLevel[];
+// DSH reasoning levels are model-owned. This is the shared protocol vocabulary,
+// not a model capability list; catalog/settings and the native adapter validate
+// the exact route. Empty means default, while off is an explicit native choice.
+export const DEEPSEEK_EFFORT_LEVELS = EFFORT_LEVELS;
 
 export function isEffortLevel(value: unknown): value is EffortLevel {
   return typeof value === "string" && EFFORT_LEVELS.includes(value as EffortLevel);
@@ -60,6 +61,7 @@ export function getEngineEffortValidationError(
   model?: string,
 ): string | undefined {
   if (effort === undefined) return undefined;
+  if (engine === "deepseek") return DEEPSEEK_EFFORT_LEVELS.includes(effort) ? undefined : "Unknown DeepSeek Harness effort";
   if (engine === "pi") return effort === "ultra" ? "Pi thinking supports off, minimal, low, medium, high, xhigh, or max" : undefined;
   if (effort === "off" || effort === "minimal") return "This engine does not support Pi thinking levels";
   if (engine === "codex" && isExtendedCodexEffort(effort) && knownCodexModelSupportsEffort(model, effort) !== true) {
@@ -84,12 +86,6 @@ export function getEngineEffortValidationError(
     !ANTIGRAVITY_EFFORT_LEVELS.includes(effort as (typeof ANTIGRAVITY_EFFORT_LEVELS)[number])
   ) {
     return "Antigravity effort supports only low, medium, high, xhigh, or max";
-  }
-  if (
-    engine === "deepseek" &&
-    !DEEPSEEK_EFFORT_LEVELS.includes(effort as (typeof DEEPSEEK_EFFORT_LEVELS)[number])
-  ) {
-    return "DeepSeek Harness effort supports only low, high, or max";
   }
   return undefined;
 }
@@ -212,7 +208,7 @@ function sanitizeConfigCompatibility(config: ConfigFile, configPath: string): Co
   const logReason = engine === "antigravity"
     ? "Antigravity supports only low, medium, high, xhigh, and max"
     : engine === "deepseek"
-      ? "DeepSeek Harness supports only low, high, and max"
+      ? "DeepSeek Harness effort is not recognized"
       : engine === "kimi"
         ? "Kimi ACP supports only low, high, and max"
         : engine === "claude" || engine === "pi"

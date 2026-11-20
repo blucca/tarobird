@@ -1,4 +1,5 @@
-import { modelCatalog, modelEffortChoices } from "./model-catalog.js";
+import { readModelCatalog, modelEffortChoices } from "./model-catalog.js";
+import { findDeepSeekModel } from "../codex/deepseek-models.js";
 import type { ModelSettings } from "../client-protocol/model.js";
 import { createHash, randomUUID } from "node:crypto";
 import { open, readFile, rename, unlink, writeFile } from "node:fs/promises";
@@ -26,15 +27,22 @@ export async function effortSettings(stateDir: string, engine: InstanceEngine, a
   const activeCount = () => typeof activeTurns === "function" ? activeTurns() : activeTurns;
   try {
     const file = path.join(stateDir, "config.json");
-    const initial = engine === "pi" ? await readConfig(file) : undefined;
+    const initial = engine === "pi" || engine === "deepseek" ? await readConfig(file) : undefined;
     const workspace = initial?.workspacePath ?? initial?.resume?.workspacePath ?? path.join(stateDir, "workspace");
-    const models = await modelCatalog(engine, process.env, workspace);
+    const catalog = await readModelCatalog(engine, process.env, workspace, patch !== undefined), models = catalog.choices;
     const settings = await withFileMutex(file, async () => {
       const config = await readConfig(file), before = snapshot(config, engine, activeCount(), models);
-      if (engine === "pi" && (config.workspacePath ?? config.resume?.workspacePath ?? path.join(stateDir, "workspace")) !== workspace) throw new Error("effort_conflict");
+      if (engine === "deepseek") before.catalogStatus = catalog.status;
+      if ((engine === "pi" || engine === "deepseek") && (config.workspacePath ?? config.resume?.workspacePath ?? path.join(stateDir, "workspace")) !== workspace) throw new Error("effort_conflict");
       if (patch === undefined) return before;
       const update = effortPatchSchema.parse(patch);
       if (update.revision !== before.revision) throw new Error("effort_conflict");
+      if (engine === "deepseek" && update.effort === before.effort) return before;
+      if (engine === "deepseek") {
+        if (catalog.status === "unavailable") throw new Error("effort_catalog_unavailable");
+        const selected = findDeepSeekModel(models, before.model);
+        if (!selected?.provider || !selected.modelId) throw new Error("effort_model_unavailable");
+      }
       if (!before.choices.includes(update.effort)) throw new Error("effort_incompatible");
       if (update.effort === before.effort) return before;
       if (update.effort) config.effort = update.effort; else delete config.effort;
@@ -45,7 +53,7 @@ export async function effortSettings(stateDir: string, engine: InstanceEngine, a
         const handle = await open(temporary, "r+"); try { await handle.sync(); } finally { await handle.close(); }
         await rename(temporary, file);
       } finally { await unlink(temporary).catch(() => undefined); }
-      return snapshot(await readConfig(file), engine, activeCount(), models);
+      return { ...snapshot(await readConfig(file), engine, activeCount(), models), ...(engine === "deepseek" ? { catalogStatus: catalog.status } : {}) };
     });
     return { ok: true as const, settings };
   } catch (error) {

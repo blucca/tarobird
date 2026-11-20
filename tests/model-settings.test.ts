@@ -50,7 +50,6 @@ describe("existing Bot model settings", () => {
     ["codex", "gpt-6-astra", "ultra"], ["claude", "claude-opus-5-5[1m]", "xhigh"],
     ["codex", "gpt-6.1-sol", "ultra"], ["codex", "gpt-6-sol", "ultra"], ["codex", "gpt-6-luna", "max"],
     ["antigravity", "gemini-4-argon-medium", "medium"], ["kimi", "kimi-code/k3", "max"],
-    ["deepseek", "deepseek-official/deepseek-v4-pro", "high"],
   ] as const)("saves %s model and effort atomically without touching sessions or other config", async (engine, model, effort) => {
     const preserved = { engine, workspacePath: "/private/unchanged", bus: { secret: "secret-value" }, resume: { sessionId: "old", dirName: "work", workspacePath: "/private/unchanged" }, customField: true };
     await config({ ...preserved, model: "previous-model", effort: "high" }); await writeFile(path.join(root, "session.json"), "unchanged");

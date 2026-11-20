@@ -5451,7 +5451,7 @@ describe("core service compatibility profile", () => {
       const config = JSON.parse(await readFile(path.join(stateDir, "config.json"), "utf8")) as Record<string, unknown>;
       expect(config.effort).toBe("high");
       expect(bridge.handleAuthorizedMessage).not.toHaveBeenCalled();
-      expect(JSON.stringify(channel.send.mock.calls)).toContain("DeepSeek Harness effort 仅支持 low、high、max 或 off");
+      expect(JSON.stringify(channel.send.mock.calls)).toContain("DeepSeek 模型目录或所选模型暂不可用");
     } finally {
       await rm(stateDir, { recursive: true, force: true });
     }

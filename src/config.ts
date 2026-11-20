@@ -133,7 +133,7 @@ function resolveDefaultKimiExecutable(env: EnvSource): string {
   return "kimi";
 }
 
-function resolveDeepSeekHome(env: EnvSource): string {
+export function resolveDeepSeekHome(env: EnvSource): string {
   if (env.DSH_HOME?.trim()) {
     return normalizeExecutablePath(env.DSH_HOME);
   }

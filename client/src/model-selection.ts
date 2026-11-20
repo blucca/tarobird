@@ -15,6 +15,13 @@ const suffix = /^(.*)-(low|medium|high|xhigh|max|ultra)$/;
  * Option values remain real catalog IDs; a family name is never sent to a Hub. */
 export function modelOptions(engine: string, input: readonly CatalogChoice[]): ModelOption[] {
   const choices: Choice[] = input.map(choice => ({ ...choice, efforts: choice.efforts.filter((level): level is Effort => level === "" || order.includes(level as Effort)) }));
+  // The Host owns identity encoding. Provider/model metadata is display-only;
+  // neither slashes nor percent characters in an ID are parsed by the client.
+  if (engine === "deepseek") return choices.map(choice => {
+    if (!choice.id || !choice.provider || !choice.modelId) return { ...choice };
+    const name = choice.label || choice.modelId;
+    return { ...choice, label: `${choice.provider} / ${name}${name === choice.modelId ? "" : ` (${choice.modelId})`}` };
+  });
   if (engine !== "antigravity") return choices.map(choice => ({ ...choice }));
   const groups = new Map<string, { label: string; rows: { choice: Choice; effort: Effort }[] }>();
   for (const choice of choices) {

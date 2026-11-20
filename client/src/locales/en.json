@@ -5398,5 +5398,10 @@
   "分叉已创建，正在同步列表。": "Fork created. Syncing the conversation list.",
   "上下文已回退，正在同步历史。": "Context rewound. Syncing history.",
   "正在同步操作结果…": "Syncing the result…",
-  "结果已保存，显示同步尚未完成。请核对结果。": "The result is saved, but display syncing is incomplete. Check the result."
+  "结果已保存，显示同步尚未完成。请核对结果。": "The result is saved, but display syncing is incomplete. Check the result.",
+  "关闭推理（off）": "Reasoning off (off)",
+  "DeepSeek 未提供可用模型。请检查主机上的提供商配置与授权，然后重新读取；已保存的选择和当前填写内容会保留。": "DeepSeek has no available models. Check provider configuration and authorization on the Host, then refresh. Saved settings and your current draft are kept.",
+  "暂未完整读取 DeepSeek 模型目录。请检查主机上的提供商配置与授权，然后重新读取；已保存的选择和当前填写内容会保留。": "The DeepSeek model catalog could not be fully read. Check provider configuration and authorization on the Host, then refresh. Saved settings and your current draft are kept.",
+  "此主机未提供 DeepSeek 模型目录。可继续使用已有选项或手工填写，更新主机后可读取完整目录。": "This Host does not provide a DeepSeek model catalog. Existing options and manual settings remain available. Update the Host to read the full catalog.",
+  "所选模型已不在主机目录中。请重新读取并选择可用模型；已保存的设置不会被清除。": "The selected model is no longer in the Host catalog. Refresh and choose an available model. Saved settings are kept."
 }

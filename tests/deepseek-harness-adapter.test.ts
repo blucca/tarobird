@@ -1023,13 +1023,13 @@ describe("DeepSeekHarnessAdapter", () => {
       id: "deepseek-official",
       name: "DeepSeek",
       models: [
-        { id: "deepseek-v4-flash", name: "Flash", reasoning: { efforts: [], defaultEffort: "high" } },
-        { id: "deepseek-v4-pro", name: "Pro", reasoning: { efforts: [], defaultEffort: "high" } },
+        { id: "deepseek-v4-flash", name: "Flash", reasoning: { efforts: ["low", "high", "max"].map(id => ({ id })), defaultEffort: "high" } },
+        { id: "deepseek-v4-pro", name: "Pro", reasoning: { efforts: ["low", "high", "max"].map(id => ({ id })), defaultEffort: "high" } },
       ],
     }, {
       id: "openai",
       name: "OpenAI",
-      models: [{ id: "gpt-5", name: "GPT-5", reasoning: { efforts: [], defaultEffort: "medium" } }],
+      models: [{ id: "gpt-5", name: "GPT-5", reasoning: { efforts: [{ id: "medium" }], defaultEffort: "medium" } }],
     }];
     gateway.responses.set("settings.describe", {
       writable: true,
@@ -1126,7 +1126,7 @@ describe("DeepSeekHarnessAdapter", () => {
     gateway.responses.set("settings.describe", { writable: true, hasDocument: true, namespaces: [{ ns: "agent-default-model", value: baseline, schema: {}, applies: "live", secrets: [], revision: 0 }] });
     gateway.responses.set("session.models", (payload: unknown) => ({
       current: { ...current.get((payload as { sessionId: string }).sessionId) ?? baseline }, routable: true, failures: [],
-      groups: [{ id: "deepseek-official", name: "DeepSeek", models: ["deepseek-v4-flash", "deepseek-v4-pro"].map(id => ({ id, name: id, reasoning: { efforts: [], defaultEffort: "high" } })) }],
+      groups: [{ id: "deepseek-official", name: "DeepSeek", models: ["deepseek-v4-flash", "deepseek-v4-pro"].map(id => ({ id, name: id, reasoning: { efforts: ["low", "high", "max"].map(id => ({ id })), defaultEffort: "high" } })) }],
     }));
     gateway.responses.set("session.selectModel", (payload: unknown) => {
       const { sessionId, ...selection } = payload as typeof baseline & { sessionId: string };
@@ -1158,7 +1158,7 @@ describe("DeepSeekHarnessAdapter", () => {
         { sessionId: plain, provider: "deepseek-official", model: "deepseek-v4-pro", reasoningEffort: "max" },
       ]);
       await expect(adapter.sendUserMessage(plain, { text: "fourth", files: [], engineOverride: { effort: "medium" } }))
-        .rejects.toThrow('Invalid model selection: deepseek-official/deepseek-v4-pro has no "medium" effort (available: low, high, max)');
+        .rejects.toThrow('DeepSeek Harness effort_incompatible');
       expect(gateway.calls.filter(call => call.method === "session.prompt")).toHaveLength(3);
       expect(await readFile(configPath, "utf8")).toBe(config);
       await adapter.destroy();
@@ -2444,6 +2444,7 @@ describe("DeepSeekHarnessAdapter", () => {
         reasoningEffort: "high",
       },
     });
+    gateway.responses.set("session.models", { current: { provider: "deepseek-official", model: "deepseek-v4-flash" }, routable: true, failures: [], groups: [{ id: "deepseek-official", models: [{ id: "deepseek-v4", reasoning: { efforts: [{ id: "high" }] } }] }] });
     gateway.responses.set("session.list", {
       items: [{
         sessionId: "session-existing",

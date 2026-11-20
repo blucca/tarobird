@@ -1,5 +1,8 @@
 import { getEngineEffortValidationError } from "../state/instance-config.js";
 import { PI_THINKING_LEVELS } from "../codex/pi-models.js";
+import { modelSettings } from "../runtime/model-settings.js";
+import { effortValueSchema } from "../client-protocol/effort.js";
+import { effortSettings } from "../runtime/effort-settings.js";
 import { modelCatalog, modelEffortChoices } from "../runtime/model-catalog.js";
 import { antigravityPresetEffort } from "../codex/antigravity-models.js";
 import path from "node:path";
@@ -40,7 +43,6 @@ import {
   ANTIGRAVITY_EFFORT_LEVELS,
   applyEngineSelection,
   CLAUDE_MODEL_CHOICES,
-  DEEPSEEK_EFFORT_LEVELS,
   KIMI_EFFORT_LEVELS,
   loadInstanceConfig,
   normalizeModelCommandInput,
@@ -2078,12 +2080,33 @@ function renderCoreModelSelectionMessage(cfg: InstanceConfig, locale: Locale): s
   ].join("\n");
 }
 
+function deepSeekSettingsError(code: string, locale: Locale): string {
+  const description = code.endsWith("conflict")
+    ? (locale === "en" ? "Settings changed; read them again before retrying." : "设置已变化，请重新读取后再试。")
+    : code.endsWith("incompatible")
+      ? (locale === "en" ? "This model does not advertise that effort. Use /effort default or choose a supported level." : "当前模型未提供这个推理档位。请用 /effort default 或选择支持的档位。")
+      : (locale === "en" ? "The DeepSeek model catalog or selection is unavailable. Refresh the catalog and check the native provider configuration." : "DeepSeek 模型目录或所选模型暂不可用。请重新读取目录并检查原生提供商配置。");
+  return `${description} (${code})`;
+}
+
 async function handleCoreModelCommand(
   stateDir: string,
   cfg: InstanceConfig,
   model: string,
   locale: Locale,
 ): Promise<string> {
+  if (cfg.engine === "deepseek") {
+    const before = await modelSettings(stateDir, "deepseek", 0);
+    if (!before.ok) return deepSeekSettingsError(before.error, locale);
+    if (!model) return [renderCoreModelSelectionMessage(cfg, locale),
+      ...(before.settings.catalogStatus === "ready" ? before.settings.choices.filter(choice => choice.id).map(choice => `/model ${choice.id}`) : [deepSeekSettingsError("model_catalog_unavailable", locale)]),
+    ].join("\n");
+    const selected = ["off", "default"].includes(model) ? "" : model;
+    if (selected && (!isSingleTokenCoreModelName(selected) || selected.length > 512)) return locale === "en" ? "Usage: /model <single-token-name|default>" : "用法: /model <单个模型名|default>";
+    const result = await modelSettings(stateDir, "deepseek", 0, { revision: before.settings.revision, model: selected });
+    if (!result.ok) return deepSeekSettingsError(result.error, locale);
+    return result.settings.model ? (locale === "en" ? `Model set to \`${result.settings.model}\`.` : `模型已设为 \`${result.settings.model}\`。`) : (locale === "en" ? "Model reset to default." : "模型已恢复默认。");
+  }
   if (!model) {
     return renderCoreModelSelectionMessage(cfg, locale);
   }
@@ -2137,6 +2160,15 @@ async function handleCoreEffortCommand(
   if (!level) {
     return locale === "en" ? `Current effort: ${cfg.effort ?? "default"}` : `当前 effort: ${cfg.effort ?? "default"}`;
   }
+  if (cfg.engine === "deepseek") {
+    const effort = level === "default" ? "" : level;
+    if (!effortValueSchema.safeParse(effort).success) return deepSeekSettingsError("effort_incompatible", locale);
+    const before = await effortSettings(stateDir, "deepseek", 0);
+    if (!before.ok) return deepSeekSettingsError(before.error, locale);
+    const result = await effortSettings(stateDir, "deepseek", 0, { revision: before.settings.revision, effort });
+    if (!result.ok) return deepSeekSettingsError(result.error, locale);
+    return effort ? (locale === "en" ? `Effort set to ${effort}.` : `Effort 已设为 ${effort}。`) : (locale === "en" ? "Effort reset to default." : "Effort 已恢复默认。");
+  }
   if (level === "default" || level === "off" && cfg.engine !== "pi") {
     await updateInstanceConfig(stateDir, (config) => {
       delete config.effort;
@@ -2161,13 +2193,6 @@ async function handleCoreEffortCommand(
     return locale === "en"
       ? "Kimi effort supports only low, high, max, or off."
       : "Kimi effort 仅支持 low、high、max 或 off。";
-  }
-  if (cfg.engine === "deepseek" && !DEEPSEEK_EFFORT_LEVELS.includes(level as (typeof DEEPSEEK_EFFORT_LEVELS)[number])) {
-    // Anything else is persisted fine but rejected by DSH on every turn
-    // (UNSUPPORTED_REASONING_EFFORT) before a prompt is ever sent.
-    return locale === "en"
-      ? "DeepSeek Harness effort supports only low, high, max, or off."
-      : "DeepSeek Harness effort 仅支持 low、high、max 或 off。";
   }
   if (cfg.engine === "antigravity" && !ANTIGRAVITY_EFFORT_LEVELS.includes(level as (typeof ANTIGRAVITY_EFFORT_LEVELS)[number])) {
     return locale === "en"

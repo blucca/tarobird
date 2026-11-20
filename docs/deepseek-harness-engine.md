@@ -243,13 +243,15 @@ required before release.
 
 ## Effort levels
 
-DeepSeek Harness accepts `low`, `high`, and `max` (its `off` = thinking disabled
-is expressed by clearing the effort with `/effort off`). `medium`, `xhigh`, and
-`ultra` are rejected by both `/effort` handlers and dropped on config load —
-DSH would otherwise reject `session.selectModel` with
-`UNSUPPORTED_REASONING_EFFORT` before every prompt and no turn could run.
-Model/effort alignment runs when the instance config or the transport changes
-(fingerprinted per session), not on every turn.
+DeepSeek effort choices come from the exact provider/model advertised by the
+public `session/modelCatalog` API. Empty/default and explicit `off` are distinct;
+`off`, `medium`, or any other supported App effort is offered only when the native
+model lists it. Config loading preserves known public effort names; creation,
+settings saves, and each native task boundary validate the selected model.
+The native adapter checks exact selection acknowledgements and revalidates even
+when the Bot config has not changed. A changed selection cannot be skipped because
+a remote follow projection is delayed. See [DeepSeek model settings](client/deepseek-model-settings.md)
+for shared catalog behavior, failure handling and private-profile boundaries.
 
 
 ### Goal usage isolation (2026-10-04)

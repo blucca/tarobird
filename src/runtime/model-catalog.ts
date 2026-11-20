@@ -6,8 +6,11 @@ import { CLAUDE_MODEL_CHOICES, getEngineEffortValidationError, type InstanceEngi
 import type { ModelSettings } from "../client-protocol/model.js";
 import { discoverCliModels } from "./cli-model-discovery.js";
 import { discoverPiModels } from "./pi-model-discovery.js";
+import { discoverDeepSeekModels } from "./deepseek-model-discovery.js";
+import { findDeepSeekModel } from "../codex/deepseek-models.js";
 
 export function modelEffortChoices(engine: InstanceEngine, model: string, discovered: ModelSettings["choices"] = []): ModelSettings["customEfforts"] {
+  if (engine === "deepseek") return findDeepSeekModel(discovered, model)?.efforts ?? [""];
   if (engine === "kimi" || engine === "claude" || engine === "codex" || engine === "pi") {
     const known = discovered.find(choice => choice.id === model);
     if (known) return known.efforts;
@@ -18,7 +21,11 @@ export function modelEffortChoices(engine: InstanceEngine, model: string, discov
   return engine === "antigravity" ? antigravityEffortChoices(discovered, model) : ["", ...EFFORT_LEVELS.filter(effort => !getEngineEffortValidationError(engine, effort, model || undefined))];
 }
 /** Creation and existing-Bot settings use the same host-owned catalog. */
-export async function readModelCatalog(engine: InstanceEngine, env = process.env, cwd?: string): Promise<{ choices: ModelSettings["choices"]; status?: "ready" | "no-models" | "unavailable" }> {
+export async function readModelCatalog(engine: InstanceEngine, env = process.env, cwd?: string, fresh = false): Promise<{ choices: ModelSettings["choices"]; status?: "ready" | "no-models" | "unavailable" }> {
+  if (engine === "deepseek") {
+    const result = await discoverDeepSeekModels(env, cwd, fresh), selected = result.models.find(model => model.id === result.defaultModel);
+    return { choices: [{ id: "", ...(selected ? { label: `${selected.provider} / ${selected.label}`, provider: selected.provider, modelId: selected.modelId } : {}), efforts: selected?.efforts ?? [""] }, ...result.models], status: result.status };
+  }
   if (engine === "pi") {
     const result = await discoverPiModels(env, cwd), selected = result.models.find(model => model.id === result.defaultModel);
     return { choices: [{ id: "", ...(selected ? { label: selected.label } : {}), efforts: selected?.efforts ?? [""] }, ...result.models], status: result.status };

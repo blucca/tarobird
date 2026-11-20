@@ -15,6 +15,8 @@ import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import { kimiModelConfig } from "./fixtures/kimi-model-config.js";
 import { discoverPiModels } from "../src/runtime/pi-model-discovery.js";
 import { parsePiModels } from "../src/codex/pi-models.js";
+import { discoverDeepSeekModels } from "../src/runtime/deepseek-model-discovery.js";
+vi.mock("../src/runtime/deepseek-model-discovery.js", () => ({ discoverDeepSeekModels: vi.fn() }));
 vi.mock("../src/runtime/pi-model-discovery.js", () => ({ discoverPiModels: vi.fn() }));
 
 it("CLI lists native Kimi models and resets effort without replacing sessions", async () => {
@@ -85,9 +87,10 @@ it("CLI and App share authenticated model updates, scope, conflicts and permissi
 });
 
 
-it.each(["pi", "codex"] as const)("CLI keeps %s effort off semantics and caller revisions", async engine => {
+it.each(["pi", "codex", "deepseek"] as const)("CLI keeps %s effort off semantics and caller revisions", async engine => {
   const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-off-cli-"));
-  const model = engine === "pi" ? "fixture/reasoning" : "gpt-6.1-sol";
+  vi.mocked(discoverDeepSeekModels).mockResolvedValue({ status: "ready", defaultModel: "fixture/reasoning", models: [{ id: "fixture/reasoning", provider: "fixture", modelId: "reasoning", label: "Reasoning", efforts: ["", "off", "high"] }] });
+  const model = engine !== "codex" ? "fixture/reasoning" : "gpt-6.1-sol";
   vi.mocked(discoverPiModels).mockResolvedValue({ status: "ready", models: parsePiModels([{ provider: "fixture", id: "reasoning", reasoning: true }]), defaultModel: "fixture/reasoning" });
   await initializeHost(root, "Off fixture");
   const hub = await HubServer.start({ stateDir: root }), stateDir = path.join(root, "bot"); await mkdir(stateDir);
@@ -105,7 +108,7 @@ it.each(["pi", "codex"] as const)("CLI keeps %s effort off semantics and caller 
     const before = await management.botModel("bot");
     await cli(["--model", model, "--effort", "off", "--revision", before.revision]);
     let current = await management.botModel("bot");
-    expect(current).toMatchObject({ engine, model, effort: engine === "pi" ? "off" : "" });
+    expect(current).toMatchObject({ engine, model, effort: engine !== "codex" ? "off" : "" });
     // Looking up the engine must not silently replace the caller's old revision.
     await expect(cli(["--model", model, "--effort", "off", "--revision", before.revision])).rejects.toThrow("model_conflict");
     if (engine === "pi") {

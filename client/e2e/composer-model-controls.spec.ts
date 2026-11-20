@@ -226,13 +226,25 @@ test("quick settings hold saves, block uncertain retries, and reread revision co
 for (const spec of [
   {engine:"claude",model:"claude-opus-5-5[1m]",effort:"xhigh",levels:["跟随默认","low","medium","high","xhigh","max"]},
   {engine:"kimi",model:"kimi-for-coding",effort:"high",levels:["跟随默认","low","high","max"]},
-  {engine:"deepseek",model:"deepseek-v4-pro",effort:"high",levels:["跟随默认","low","high","max"]},
+  {engine:"deepseek",model:"fixture/deepseek-v4-pro",effort:"high",levels:["跟随默认","关闭推理（off）","low","medium","high"]},
   {engine:"antigravity",model:"gemini-3.8-flash-high",effort:"",levels:["low","medium","high"]},
 ] as const) test(`quick effort uses ${spec.engine} model capabilities`,async({page})=>{
   const previous=process.env.ANTIGRAVITY_EXECUTABLE;
   if(spec.engine==="antigravity")process.env.ANTIGRAVITY_EXECUTABLE=path.resolve("../tests/fixtures/agy-models.mjs");
   const f=await fixture(page,spec);
+  const deepSeekKeys = ["TAROBOT_MODEL_DISCOVERY", "DSH_EXECUTABLE", "DSH_HOME", "DSH_FIXTURE_CATALOG"] as const;
+  const previousDeepSeek = deepSeekKeys.map(key => process.env[key]);
   try {
+    if (spec.engine === "deepseek") {
+      // Exercise native-shaped discovery through the real Gateway. The fixture
+      // accepts only session/modelCatalog, so no model turn can be submitted.
+      process.env.TAROBOT_MODEL_DISCOVERY = "1";
+      process.env.DSH_EXECUTABLE = path.resolve("../tests/fixtures/deepseek-models.mjs");
+      process.env.DSH_HOME = path.join(f.root, "dsh");
+      process.env.DSH_FIXTURE_CATALOG = path.join(f.root, "catalog.json");
+      await mkdir(process.env.DSH_HOME); await mkdir(path.join(f.root, "alpha", "workspace"));
+      await writeFile(process.env.DSH_FIXTURE_CATALOG, JSON.stringify({ default: { provider: "fixture", model: "deepseek-v4-pro", reasoningEffort: "high" }, groups: [{ id: "fixture", models: [{ id: "deepseek-v4-pro", name: "DeepSeek fixture", reasoning: { efforts: ["off", "low", "medium", "high"].map(id => ({ id })) } }] }], routableProviders: ["fixture"], failures: [] }));
+    }
     await selectConversation(page,f.direct.title);
     const effort=controls(page).getByRole("button",{name:/^思考强度：/});await effort.click();
     const menu=page.getByRole("group",{name:"快捷选择思考强度",exact:true});
@@ -251,5 +263,5 @@ for (const spec of [
       expect(await f.config("alpha")).toMatchObject({model:"gpt-oss-120b-medium",effort:"medium"});
     }
     expect(f.calls()).toBe(0);expect(await readFile(path.join(f.root,"alpha/session.json"),"utf8")).toBe("preserved-session");
-  } finally {await f.dispose();if(previous===undefined)delete process.env.ANTIGRAVITY_EXECUTABLE;else process.env.ANTIGRAVITY_EXECUTABLE=previous;}
+  } finally {await f.dispose();if(previous===undefined)delete process.env.ANTIGRAVITY_EXECUTABLE;else process.env.ANTIGRAVITY_EXECUTABLE=previous;deepSeekKeys.forEach((key, index) => { const value = previousDeepSeek[index]; if (value === undefined) delete process.env[key]; else process.env[key] = value; });}
 });

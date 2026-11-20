@@ -13,6 +13,8 @@ import { describe, expect, it, vi } from "vitest";
 import { handleCoreMessage } from "../src/core/message-handler.js";
 import { stableCoreNumericId } from "../src/core/message-normalizer.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
+import { discoverDeepSeekModels } from "../src/runtime/deepseek-model-discovery.js";
+vi.mock("../src/runtime/deepseek-model-discovery.js", () => ({ discoverDeepSeekModels: vi.fn() }));
 import { SessionStore } from "../src/state/session-store.js";
 import { fakeChannel, fakeLarkMessage, type FakeLarkChannel } from "./helpers/core-compat-fixtures.js";
 
@@ -107,15 +109,17 @@ describe("shared engine command rules", () => {
     });
   });
 
-  it("rejects DeepSeek Harness effort values outside off/low/high/max", async () => {
-    await withCommandInstance({ engine: "deepseek", effort: "high" }, async (send, stateDir) => {
-      for (const level of ["xhigh", "medium", "ultra"]) {
-        expect(await send(`/effort ${level}`)).toContain("DeepSeek Harness effort supports only low, high, max, or off.");
-      }
-      expect((await readConfig(stateDir)).effort).toBe("high");
-      // The supported levels still persist.
-      expect(await send("/effort max")).toContain("Effort set to max.");
-      expect((await readConfig(stateDir)).effort).toBe("max");
+  it("validates DeepSeek slash commands against the catalog and distinguishes off from default", async () => {
+    vi.mocked(discoverDeepSeekModels).mockResolvedValue({ status: "ready", defaultModel: "a/org/model", models: [{ id: "a/org/model", provider: "a", modelId: "org/model", label: "Shared", efforts: ["", "off", "medium"] }] });
+    await withCommandInstance({ engine: "deepseek", model: "a/org/model", effort: "medium" }, async (send, stateDir) => {
+      await send("/effort high"); expect((await readConfig(stateDir)).effort).toBe("medium");
+      await send("/effort off"); expect((await readConfig(stateDir)).effort).toBe("off");
+      await send("/model missing"); expect((await readConfig(stateDir)).model).toBe("a/org/model");
+      await send("/effort default"); expect((await readConfig(stateDir)).effort).toBeUndefined();
+      await send("/model default"); expect((await readConfig(stateDir)).model).toBeUndefined();
+      expect((await send("/model")).join("\n")).toContain("a/org/model");
+      vi.mocked(discoverDeepSeekModels).mockResolvedValue({ status: "unavailable", models: [] });
+      await send("/effort off"); expect((await readConfig(stateDir)).effort).toBeUndefined();
     });
   });
 

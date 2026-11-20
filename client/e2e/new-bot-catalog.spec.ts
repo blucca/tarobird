@@ -28,7 +28,7 @@ test("new Bot catalog failures name their cause and recover without reopening", 
     // and "host" forwards to its real bot_creation_unavailable reply.
     let mode: "error" | "missing" | "host" | "pass" = "error";
     const catalog = { engines: [{ id: "codex", available: true, models: [{ id: "default", efforts: [] }], defaultModel: "default", defaultEffort: "" }] };
-    await page.route("**/api/bots/catalog", route => mode === "host" ? route.continue()
+    await page.route("**/api/bots/catalog*", route => mode === "host" ? route.continue()
       : route.fulfill(mode === "pass" ? { status: 200, json: catalog } : mode === "missing" ? { status: 404, json: { error: "not_found" } } : { status: 503, json: { error: "unavailable" } }));
     await openNewBot(page);
     const alert = page.getByRole("alert").filter({ hasText: "暂时无法读取可用引擎，请重试。" });

@@ -1,3 +1,4 @@
+import { decodeDeepSeekModel, encodeDeepSeekModel } from "./deepseek-models.js";
 import { wholeFilePatch } from "../core/recorded-diff.js";
 import { createHash, randomUUID } from "node:crypto";
 import { EngineCancellationUnconfirmedError, EngineStopTooLateError, EngineSteeringRejectedError } from "./adapter.js";
@@ -2998,10 +2999,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     // Model selection is per Harness session; the fingerprint re-selects when an override changes.
     const runtime = await this.loadRuntimeConfiguration(override);
     const fingerprint = JSON.stringify(runtime);
-    if (this.configuredSessions.get(sessionId) === fingerprint) {
-      return;
-    }
-    await this.executeHarnessCommand(
+    if (this.configuredSessions.get(sessionId) !== fingerprint) await this.executeHarnessCommand(
       sessionId,
       `/permission ${runtime.permissionPreset}`,
       signal,
@@ -3011,6 +3009,9 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
         ? await this.loadHostDefaultModel(signal)
         : undefined;
       const models = asRecord(await this.gateway.request("session.models", { sessionId }, signal));
+      if (!Array.isArray(models?.groups) || !Array.isArray(models?.failures) || models.failures.length) {
+        throw new Error("DeepSeek Harness model_catalog_unavailable");
+      }
       const current = asRecord(models?.current);
       const currentSelection = readModelSelection(current);
       if (!currentSelection) {
@@ -3023,17 +3024,23 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
         groups: Array.isArray(models?.groups) ? models.groups : [],
       });
       if (
-        currentSelection.provider !== target.provider
+        // Remote follow projections can lag the selectModel acknowledgement.
+        // A changed override must be applied even if that old view equals it.
+        this.configuredSessions.get(sessionId) !== fingerprint
+        || currentSelection.provider !== target.provider
         || currentSelection.model !== target.model
-        || (target.reasoningEffort !== undefined
-          && currentSelection.reasoningEffort !== target.reasoningEffort)
+        || currentSelection.reasoningEffort !== target.reasoningEffort
       ) {
-        await this.gateway.request("session.selectModel", {
+        const acknowledgement = asRecord(await this.gateway.request("session.selectModel", {
           sessionId,
           provider: target.provider,
           model: target.model,
           ...(target.reasoningEffort ? { reasoningEffort: target.reasoningEffort } : {}),
-        }, signal);
+        }, signal));
+        const selected = readModelSelection(asRecord(acknowledgement?.selected));
+        if (selected?.provider !== target.provider || selected.model !== target.model || selected.reasoningEffort !== target.reasoningEffort) {
+          throw new Error("DeepSeek Harness selection_unconfirmed");
+        }
       }
     }
     this.configuredSessions.set(sessionId, fingerprint);
@@ -3088,7 +3095,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
   }> {
     if (!this.configPath) {
       const selected = override?.model || override?.effort ? resolveEngineOverride("deepseek", {
-        model: this.model?.model && (this.model.provider ? `${this.model.provider}/${this.model.model}` : this.model.model),
+        model: this.model?.model && (this.model.provider ? encodeDeepSeekModel(this.model.provider, this.model.model) : this.model.model),
         effort: this.model?.reasoningEffort,
       }, override) : undefined;
       const model = selected ? deepSeekModelSelection(selected.model, selected.effort) : this.model;
@@ -3548,20 +3555,15 @@ function deepSeekModelSelection(
   if (!model) {
     return { reasoningEffort: effort };
   }
-  const separator = model.indexOf("/");
-  if (separator > 0 && separator < model.length - 1) {
-    return {
-      provider: model.slice(0, separator),
-      model: model.slice(separator + 1),
-      ...(effort ? { reasoningEffort: effort } : {}),
-    };
-  }
+  const decoded = decodeDeepSeekModel(model);
+  if (decoded) return { provider: decoded.provider, model: decoded.modelId, ...(effort ? { reasoningEffort: effort } : {}) };
+  if (model.startsWith("dsh-model:")) throw new Error("DeepSeek Harness model_id_invalid");
   return { model, ...(effort ? { reasoningEffort: effort } : {}) };
 }
 
 function readModelSelection(value: Record<string, unknown> | undefined): DeepSeekHarnessModelSelection | undefined {
-  const provider = stringValue(value?.provider)?.trim();
-  const model = stringValue(value?.model)?.trim();
+  const provider = stringValue(value?.provider);
+  const model = stringValue(value?.model);
   if (!provider || !model) {
     return undefined;
   }
@@ -3584,66 +3586,27 @@ function resolveModelSelection(input: {
   if (!model) {
     throw new Error("DeepSeek Harness has no model to configure");
   }
-  const preferredProvider = input.configured?.provider ?? base.provider ?? input.current.provider;
-  const provider = input.configured?.provider
-    ?? providerForModel(input.groups, model, preferredProvider)
-    ?? preferredProvider;
-  if (!provider) {
-    throw new Error(`DeepSeek Harness has no provider for model ${model}`);
-  }
-  const reasoningEffort = input.configured?.reasoningEffort
-    ?? (
-      input.configured?.model === undefined
-      && input.configured?.provider === undefined
-      && base.reasoningEffort
-        ? base.reasoningEffort
-        : defaultEffortForModel(input.groups, provider, model)
-    );
-  return {
-    provider,
-    model,
-    ...(reasoningEffort ? { reasoningEffort } : {}),
-  };
-}
-
-function providerForModel(
-  groups: unknown[],
-  model: string,
-  preferredProvider: string | undefined,
-): string | undefined {
-  const candidates = groups.flatMap((rawGroup) => {
+  // A stored full identity never falls back to another provider. Legacy bare
+  // IDs are accepted only when the current native inventory is unambiguous.
+  const candidates = input.groups.flatMap(rawGroup => {
     const group = asRecord(rawGroup);
-    const provider = stringValue(group?.id);
-    const models = Array.isArray(group?.models) ? group.models : [];
-    return provider && models.some((rawModel) => stringValue(asRecord(rawModel)?.id) === model)
-      ? [provider]
-      : [];
-  });
-  if (preferredProvider && candidates.includes(preferredProvider)) {
-    return preferredProvider;
-  }
-  return candidates.length === 1 ? candidates[0] : preferredProvider;
-}
-
-function defaultEffortForModel(
-  groups: unknown[],
-  provider: string,
-  model: string,
-): string | undefined {
-  for (const rawGroup of groups) {
-    const group = asRecord(rawGroup);
-    if (stringValue(group?.id) !== provider || !Array.isArray(group?.models)) {
-      continue;
-    }
-    for (const rawModel of group.models) {
+    if (typeof group?.id !== "string" || !Array.isArray(group.models)) return [];
+    return group.models.flatMap(rawModel => {
       const candidate = asRecord(rawModel);
-      if (stringValue(candidate?.id) !== model) {
-        continue;
-      }
-      return stringValue(asRecord(candidate?.reasoning)?.defaultEffort);
-    }
-  }
-  return undefined;
+      return candidate?.id === model ? [{ provider: group.id as string, metadata: candidate }] : [];
+    });
+  });
+  const requestedProvider = input.configured?.model ? input.configured.provider : base.provider;
+  const matches = requestedProvider ? candidates.filter(candidate => candidate.provider === requestedProvider) : candidates;
+  if (matches.length !== 1) throw new Error("DeepSeek Harness model_unavailable");
+  const { provider, metadata } = matches[0]!;
+  const reasoning = asRecord(metadata.reasoning);
+  if (metadata.reasoning !== undefined && !Array.isArray(reasoning?.efforts)) throw new Error("DeepSeek Harness model_catalog_unavailable");
+  const levels = Array.isArray(reasoning?.efforts) ? reasoning.efforts.map(item => stringValue(asRecord(item)?.id)) : [];
+  const reasoningEffort = input.configured?.reasoningEffort
+    ?? (input.configured?.model === undefined && input.configured?.provider === undefined ? base.reasoningEffort : stringValue(reasoning?.defaultEffort));
+  if (reasoningEffort !== undefined && !levels.includes(reasoningEffort)) throw new Error("DeepSeek Harness effort_incompatible");
+  return { provider, model, ...(reasoningEffort ? { reasoningEffort } : {}) };
 }
 
 function parseQuestion(value: unknown): Question | null {

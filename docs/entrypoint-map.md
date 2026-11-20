@@ -3636,8 +3636,14 @@ retired; see [scope and regression mapping](adapter-retirement-2026-10-21.md).
   share the config mutex, revision and Hub operation queue, update live metadata,
   and leave sessions/active turns intact. `runtime/model-catalog.ts` shares
   creation choices and per-engine compatibility, including host-discovered AGY.
+  DeepSeek `runtime/deepseek-model-discovery.ts` reads public `session/modelCatalog`
+  from a disposable private web profile; `codex/deepseek-models.ts` preserves
+  opaque provider/model identities and exact per-model efforts. DeepSeek uses a
+  seven-second discovery deadline, fresh writes, and explicit off/default semantics.
+  See [DeepSeek model settings](client/deepseek-model-settings.md) for failure,
+  cache, private-profile and native-validation boundaries.
   `tarobot bots model ID [--model M --revision REV --effort E]` uses the same API.
-  CLI discovery has one four-second deadline across initialization and all
+  Codex/Claude CLI discovery has one four-second deadline across initialization and all
   catalog pages, leaving time for settings reads/writes within the Hub's
   ten-second Bot RPC. Model and effort entry points use the same discovered
   effort restrictions, including cold-cache writes and models without effort.

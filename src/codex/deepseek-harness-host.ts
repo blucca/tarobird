@@ -834,7 +834,7 @@ function defaultSpawnDeepSeekHarness(
   }) as unknown as DeepSeekHarnessChildProcess;
 }
 
-async function waitForStartupUrl(
+export async function waitForStartupUrl(
   child: DeepSeekHarnessChildProcess,
   timeoutMs: number,
 ): Promise<string> {
@@ -932,7 +932,7 @@ async function waitForStartupUrl(
   });
 }
 
-async function stopChild(child: DeepSeekHarnessChildProcess, timeoutMs: number): Promise<void> {
+export async function stopChild(child: DeepSeekHarnessChildProcess, timeoutMs: number): Promise<void> {
   await new Promise<void>((resolve) => {
     let settled = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
