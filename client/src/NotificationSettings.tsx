@@ -3,15 +3,16 @@ import { NotificationReadiness } from "./NotificationReadiness.js";
 import { UnifiedPushSettings } from "./UnifiedPushSettings.js";
 import { t, useLocale } from "./i18n.js";
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
-import { Info, MessageCircle, FileText, CircleAlert, Bell, Eye, Volume2, ChevronRight } from "lucide-react";
+import { Info, MessageCircle, FileText, CircleAlert, Bell, Eye, Volume2, ChevronRight, Copy } from "lucide-react";
 import { openSystemNotificationSettings, supportsSystemNotificationSettings } from "./notification-system-settings.js";
-import { DesktopNotificationPermissionError } from "./desktop-notifications.js";
+import { createDesktopNotificationShortcut, DesktopNotificationPermissionError, DesktopNotificationShortcutError, type DesktopNotificationDiagnostics } from "./desktop-notifications.js";
 import { nativePlatform, autostartEnabled, setAutostart } from "./native.js";
 import { enableNotifications, updateNotificationPreferences, type NotificationState } from "./notifications.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
 import { SettingsGroupHeading } from "./SettingsParts.js";
 import type { UnifiedRegistration } from "./unifiedpush-controller.js";
 import type { HubConnection } from "./connection.js";
+import { version } from "../package.json";
 import "./notification-settings.css";
 
 type Platform = ReturnType<typeof nativePlatform>;
@@ -35,6 +36,20 @@ function enableBlocker(platform: Platform, state: NotificationState, unifiedActi
   if (!state.providers.webpush || !state.vapidPublicKey) return { title: t("此主机尚未配置浏览器推送"), detail: t("需要主机管理员在 Hub 配置中启用 Web Push，此浏览器才能在后台收到提醒。配置完成后点「重新检查」。"), recheck: true };
   return browserBlocked() ? blockedBrowser() : undefined;
 }
+/** Windows support data: the failing step's HRESULT and a path-free copy. */
+export function NotificationDiagnostics({ value }: { value: DesktopNotificationDiagnostics }) {
+  const [status, setStatus] = useState("");
+  const text = JSON.stringify({ app: "TaroBird", version, ...value }, null, 2);
+  return <div className="notification-diagnostics">
+    {value.failure && <p className="muted">{t("代码 {0} · {1}", value.failure.code, value.failure.stage)}</p>}
+    <button type="button" className="secondary" onClick={async () => {
+      try { await navigator.clipboard.writeText(text); setStatus(t("诊断信息已复制")); }
+      catch { setStatus(t("复制失败，请选择文字后复制。")); }
+    }}><Copy size={16} aria-hidden="true"/>{t("复制诊断信息")}</button>
+    <span role="status">{status}</span>
+    <details><summary>{t("查看诊断信息")}</summary><pre tabIndex={0}>{text}</pre></details>
+  </div>;
+}
 function quietSummary(start: string, end: string, zone: string): string {
   if (!start || !end || start === end) return t("未设置勿扰时段。");
   return start < end ? t("每天 {0}–{1} 不提醒（时区 {2}）。", start, end, zone) : t("每天 {0} 至次日 {1} 不提醒（时区 {2}）。", start, end, zone);
@@ -44,7 +59,7 @@ export function NotificationSettings({ connection, dirtyChange, busyChange }: { 
   useLocale(); const hostName = useContext(RuntimeHostContext);
   const snapshot = useSyncExternalStore((notify) => connection.subscribe(notify), () => connection.state);
   const state = snapshot.notifications, online = snapshot.status === "online";
-  const [error, setError] = useState<{ area: "status" | "quiet"; text: string; systemPermission?: boolean }>();
+  const [error, setError] = useState<{ area: "status" | "quiet"; text: string; systemPermission?: boolean; shortcut?: boolean; diagnostics?: DesktopNotificationDiagnostics }>();
   const [busy, setBusy] = useState<"toggle" | "choice" | "quiet" | "repair">(), busyRef = useRef(false);
   const [loading, setLoading] = useState(false), [loadFailed, setLoadFailed] = useState(false);
   const [saved, setSaved] = useState(false), [unifiedBusy, setUnifiedBusy] = useState(false);
@@ -87,7 +102,9 @@ export function NotificationSettings({ connection, dirtyChange, busyChange }: { 
       // Refresh failures have their own retry state, never a false write failure.
       void load();
     } catch (e) {
-      if (epoch === lifetime.current) setError({ area: kind === "quiet" ? "quiet" : "status", text: e instanceof Error ? e.message : t("设置失败"), systemPermission: e instanceof DesktopNotificationPermissionError });
+      if (epoch === lifetime.current) setError({ area: kind === "quiet" ? "quiet" : "status", text: e instanceof Error ? e.message : t("设置失败"),
+        systemPermission: e instanceof DesktopNotificationPermissionError && e.systemSettings, shortcut: e instanceof DesktopNotificationShortcutError,
+        diagnostics: e instanceof DesktopNotificationPermissionError || e instanceof DesktopNotificationShortcutError ? e.diagnostics : undefined });
     } finally { if (epoch === lifetime.current) { busyRef.current = false; setBusy(undefined); } }
   };
   const lede = <p className="settings-lede">{hostName ? t("此设备 · 主机「{0}」", hostName) : t("此设备 · 当前主机")}</p>;
@@ -114,8 +131,9 @@ export function NotificationSettings({ connection, dirtyChange, busyChange }: { 
     { key: "needsAttention", label: t("需要处理"), detail: t("需要你确认、补充信息或任务出错时提醒。"), Icon: CircleAlert },
   ] as const;
   const systemLabel = platform === "android" ? t("声音与振动设置") : desktop ? t("声音与横幅设置") : t("声音与锁屏设置");
-  const systemHelp = platform === "macos" ? t("打开系统设置后，选择「通知 → TaroBird」管理声音与横幅。") : platform === "android" ? t("在系统设置中管理通知声音、振动与横幅。") : desktop ? t("打开系统通知设置后，在应用列表中选择 TaroBird。") : t("在系统设置中管理声音、横幅与锁屏预览。");
-  const systemFallback = platform === "macos" ? t("请打开系统设置 → 通知 → TaroBird。") : platform === "windows" ? t("请打开 Windows 设置 → 系统 → 通知 → TaroBird。") : platform === "ios" ? t("请打开 iPhone / iPad 设置 → 通知 → TaroBird。") : t("无法打开系统设置，请在手机设置中进入 TaroBird 的通知设置。");
+  // Windows lists an unpackaged App only after its first notification.
+  const systemHelp = platform === "macos" ? t("打开系统设置后，选择「通知 → TaroBird」管理声音与横幅。") : platform === "android" ? t("在系统设置中管理通知声音、振动与横幅。") : platform === "windows" ? t("打开 Windows 通知设置后，在列表中选择 TaroBird。TaroBird 发出第一条通知后才会出现在该列表中。") : t("在系统设置中管理声音、横幅与锁屏预览。");
+  const systemFallback = platform === "macos" ? t("请打开系统设置 → 通知 → TaroBird。") : platform === "windows" ? t("请打开 Windows 设置 → 系统 → 通知（Windows 10 为「通知和操作」），在列表中找到 TaroBird。") : platform === "ios" ? t("请打开 iPhone / iPad 设置 → 通知 → TaroBird。") : t("无法打开系统设置，请在手机设置中进入 TaroBird 的通知设置。");
   const systemSettings = async () => {
     if (openingSystem) return;
     const id = ++systemRequest.current;
@@ -140,11 +158,16 @@ export function NotificationSettings({ connection, dirtyChange, busyChange }: { 
     {loadNotice}
     {error?.area === "status" && <>
       <p role="alert" className="error-text">{error.text}</p>
+      {platform === "windows" && error.shortcut && <div className="settings-callout notification-shortcut-help"><Info size={16} aria-hidden="true"/><div>
+        <p>{t("TaroBird 会在开始菜单中创建快捷方式，然后发出一条确认通知。")}</p>
+        <button type="button" className="primary" disabled={working || !online} onClick={() => { void act("toggle", async () => { await createDesktopNotificationShortcut(); await enableNotifications(connection, currentState); return { ...preferences, enabled: true }; }); }}>{t("创建快捷方式并开启")}</button>
+      </div></div>}
       {desktop && error.systemPermission && <div className="settings-callout notification-permission-help"><Info size={16} aria-hidden="true"/><div>
         <p>{systemFallback} {t("允许 TaroBird 通知后，返回此页重新开启消息提醒。")}</p>
         <button type="button" className="secondary" disabled={openingSystem || !supportsSystemNotificationSettings()} onClick={() => void systemSettings()}>{openingSystem ? t("正在打开…") : t("前往系统设置")}</button>
         {systemError && <p role={systemError === "failed" ? "alert" : "status"}>{systemError === "failed" ? systemFallback : t("也可手动打开系统设置，选择「通知 → TaroBird」。")}</p>}
       </div></div>}
+      {platform === "windows" && error.diagnostics && <NotificationDiagnostics value={error.diagnostics}/>}
     </>}
     <SettingsGroupHeading>{t("提醒内容")}</SettingsGroupHeading>
     <div className="settings-group" role="group" aria-label={t("提醒内容")}>

@@ -11,7 +11,7 @@ import { currentSystemPushToken, systemPushResetRevision } from "./native-push-t
 import { stopSystemPushMaintenance } from "./system-push.js";
 import { apnsTopicFor, ApnsTopicError, nativeApnsTopic } from "./apns-topic.js";
 import { runtimeHostId, type RuntimeHost } from "./host-registry.js";
-import { clearDesktopNotifications, DesktopNotificationPermissionError, desktopNotificationPermission, desktopNotificationsSupported, listenDesktopNotifications, observeDesktopNotificationIntent, showDesktopNotification, type DesktopNotificationIntent } from "./desktop-notifications.js";
+import { clearDesktopNotifications, desktopNotificationDenied, desktopNotificationPermission, desktopNotificationsSupported, listenDesktopNotifications, observeDesktopNotificationIntent, showDesktopNotification, type DesktopNotificationIntent } from "./desktop-notifications.js";
 
 const pushScope = (id: string) => `/push-host/${id}/`;
 // Retain only in-flight work, not a permanent map of removed host identities.
@@ -45,7 +45,9 @@ export async function enableNotifications(connection: HubConnection, state: Noti
       const permission = await desktopNotificationPermission(false);
       // A denied permission must be changed in System Settings. Requesting it
       // again can reject with a native error instead of showing another prompt.
-      if (permission === "denied" || permission !== "granted" && await desktopNotificationPermission(true) !== "granted") throw new DesktopNotificationPermissionError(t("系统通知已关闭。请在系统设置中允许 TaroBird 通知。"));
+      // Windows "prompt" means not registered yet: the request shows one
+      // confirmation toast, which registers TaroBird with Windows.
+      if (permission === "denied" || permission !== "granted" && await desktopNotificationPermission(true) !== "granted") throw await desktopNotificationDenied();
     } else {
       if (isElectron()) throw new Error("native_notifications_unavailable");
       const notification = await import("@tauri-apps/plugin-notification");

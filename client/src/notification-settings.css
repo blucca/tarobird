@@ -45,3 +45,11 @@
 .notification-readiness[open] .notification-readiness-summary > svg:last-child { transform: rotate(90deg); }
 .notification-settings .notification-readiness-body { padding-inline: 26px 4px; }
 .notification-settings .notification-readiness-actions { padding-inline: 26px 4px; }
+
+/* Windows support data under a notification error: one quiet row, no new palette. */
+.notification-diagnostics { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 8px 0 0; }
+.notification-diagnostics > p { flex-basis: 100%; margin: 0; font-size: .85rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.notification-diagnostics > button { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; }
+.notification-diagnostics > [role=status] { color: var(--muted); font-size: .85rem; }
+.notification-diagnostics > details { flex-basis: 100%; color: var(--muted); font-size: .8rem; }
+.notification-diagnostics pre { max-height: 220px; margin: 6px 0 0; padding: 10px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; border-radius: 8px; background: var(--surface); color: var(--text); }

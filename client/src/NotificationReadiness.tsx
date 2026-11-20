@@ -3,16 +3,19 @@ import { Check, Info, RefreshCw, ChevronRight } from "lucide-react";
 import { nativePlatform } from "./native.js";
 import { t } from "./i18n.js";
 import { checkNotificationReadiness, reconnectSystemNotifications, type NotificationReadiness as Readiness } from "./notification-readiness.js";
+import { createDesktopNotificationShortcut, desktopNotificationDenied, desktopNotificationPermission } from "./desktop-notifications.js";
 import { PUSH_FOREGROUND_EVENT } from "./push-maintenance.js";
 import type { HubConnection } from "./connection.js";
 import type { NotificationState } from "./notifications.js";
 
 function copy(result: Readiness): [string, string] {
-  const browser = nativePlatform() === "web";
+  const browser = nativePlatform() === "web", windows = nativePlatform() === "windows";
   switch (result.reason) {
     case "ready": return [t("接收条件已就绪"), t("权限与接收设置检查通过；实际提醒仍取决于网络、系统和勿扰设置。")];
     case "denied": return [browser ? t("浏览器已阻止通知") : t("系统通知已关闭"), browser ? t("请在浏览器的网站设置中允许此网站发送通知，然后点「重新检查」。") : t("请在系统设置中允许 TaroBird 通知，返回后检查接收状态。")];
-    case "prompt": return [t("尚未允许通知"), t("关闭后重新开启消息提醒，即可申请通知权限。")];
+    // Windows "prompt": the unpackaged App has no notification profile yet.
+    case "prompt": return windows ? [t("Windows 尚未登记通知"), t("TaroBird 还没有在 Windows 中登记通知。点「重新启用通知」会发出一条确认通知完成登记。")] : [t("尚未允许通知"), t("关闭后重新开启消息提醒，即可申请通知权限。")];
+    case "shortcut": return [t("未找到开始菜单快捷方式"), t("未找到 TaroBird 的开始菜单快捷方式，Windows 需要它来显示通知。")];
     case "channel-disabled": return [t("消息通知类别已关闭"), t("请在 Android 的 TaroBird 通知设置中开启消息通知类别，返回后重新检查。")];
     case "channel-missing": return [t("等待首次消息提醒"), t("权限与推送已连接，Android 会在首次提醒时创建通知类别；当前还无法检查该类别。")];
     case "unconfigured": return [t("主机推送尚未配置"), t("请让主机管理员恢复当前推送方式的配置，再重新检查。消息仍会正常同步。")];
@@ -36,11 +39,13 @@ export function NotificationReadiness({ connection, state, online, working, refr
   const [result, setResult] = useState<{ connection: HubConnection; state: NotificationState; check: number; value: Readiness }>();
   const action = useRef<AbortController | undefined>(undefined);
   const [repairFailed, setRepairFailed] = useState(false);
-  useEffect(() => { setRepairFailed(false); const foreground = () => { setCheck(n => n + 1); void refresh(); }; window.addEventListener(PUSH_FOREGROUND_EVENT, foreground); return () => { window.removeEventListener(PUSH_FOREGROUND_EVENT, foreground); action.current?.abort(); action.current = undefined; }; }, [connection, refresh]);
+  // Windows re-registration reports its own reason instead of the push-recovery text.
+  const [repairError, setRepairError] = useState<string>();
+  useEffect(() => { setRepairFailed(false); setRepairError(undefined); const foreground = () => { setCheck(n => n + 1); void refresh(); }; window.addEventListener(PUSH_FOREGROUND_EVENT, foreground); return () => { window.removeEventListener(PUSH_FOREGROUND_EVENT, foreground); action.current?.abort(); action.current = undefined; }; }, [connection, refresh]);
   useEffect(() => {
     if (!online || working) return;
     const controller = new AbortController(); let active = true;
-    const finish = (value: Readiness) => { if (active) { setResult({ connection, state, check, value }); if (value.reason === "ready") setRepairFailed(false); } };
+    const finish = (value: Readiness) => { if (active) { setResult({ connection, state, check, value }); if (value.reason === "ready") { setRepairFailed(false); setRepairError(undefined); } } };
     const timer = setTimeout(() => { controller.abort(); finish({ reason: "unknown" }); active = false; }, 10_000);
     void checkNotificationReadiness(connection, state, controller.signal).then(finish, () => finish({ reason: "unknown" })).finally(() => clearTimeout(timer));
     return () => { active = false; clearTimeout(timer); controller.abort(); };
@@ -49,6 +54,20 @@ export function NotificationReadiness({ connection, state, online, working, refr
   const [title, detail] = !online ? [t("连接主机后检查接收状态"), t("提醒开关已保留，当前无法确认接收条件。")]
     : value ? copy(value) : [t("正在检查接收状态…"), t("只读取权限与连接状态，不发送测试通知。")];
   const provider = value?.provider, canRepair = value?.reason === "subscription" && (provider === "apns" || provider === "fcm");
+  const windows = nativePlatform() === "windows", reRegister = windows && (value?.reason === "prompt" || value?.reason === "shortcut");
+  // Explicit user action only: the request shows one confirmation toast; a
+  // missing shortcut is created first (tier 3). Hub preferences stay unchanged.
+  const register = () => {
+    if (action.current || working) return;
+    const controller = new AbortController(); action.current = controller; setRepairError(undefined);
+    const shortcut = value?.reason === "shortcut";
+    void repair(async () => {
+      try {
+        if (shortcut) await createDesktopNotificationShortcut();
+        if (await desktopNotificationPermission(true) !== "granted") throw await desktopNotificationDenied();
+      } catch (error) { if (action.current === controller) setRepairError(error instanceof Error ? error.message : t("设置失败")); }
+    }).finally(() => { if (action.current === controller) { action.current = undefined; setCheck(n => n + 1); } });
+  };
   const open = expanded ?? value?.reason !== "ready";
   return <details className="notification-readiness" data-state={value?.reason} aria-label={t("接收状态")} open={open} onToggle={event => {
     // Native toggle also fires when React changes the default open state. Only
@@ -74,8 +93,10 @@ export function NotificationReadiness({ connection, state, online, working, refr
           catch { if (action.current === controller) setRepairFailed(true); }
         }).finally(() => { clearTimeout(timeout); if (action.current === controller) { action.current = undefined; if (!controller.signal.aborted) setCheck(n => n + 1); } });
       }}>{t("重新连接推送")}</button>}
+      {reRegister && <button className="primary" disabled={working || !online} onClick={register}>{value?.reason === "shortcut" ? t("创建快捷方式并开启") : t("重新启用通知")}</button>}
       <button className="secondary" disabled={!online || working} aria-disabled={!value || working || !online} onClick={() => { if (!value || working || !online) return; setCheck(n => n + 1); setRepairFailed(false); void refresh(); }}>{t("检查接收状态")}</button>
     </div>
     {repairFailed && <p role="alert" className="error-text">{t("恢复未完成，请重新检查后重试。不会更改你选择的推送方式。")}</p>}
+    {repairError && <p role="alert" className="error-text">{repairError}</p>}
   </details>;
 }
