@@ -2,12 +2,13 @@ import { createHash } from "node:crypto";
 import { blocksText, type Block, type HubEvent, type Message } from "../client-protocol/index.js";
 import { PROMPT_QUEUE_ENGINES, promptQueueMutationSchema, type PromptQueueMutation, type PromptQueueSnapshot } from "../client-protocol/prompt-queue.js";
 import { deletedMessage } from "../client-protocol/message-deletion.js";
+import { isCommandShapedInput } from "../client-protocol/history.js";
 import { HubError, type HubStore, type TransactionGuard } from "./store.js";
 
 type Delivery = { message_id: string; bot_id: string; conversation_id: string; queue_position: number; dispatched: number; queue_paused: number; targets: number };
 // Match the worker's slash-token grammar, not Unix paths such as /tmp/log.
 // Unknown slash tokens stay barriers too: an engine may add its own commands.
-const commandText = (text: string) => /^\/[a-z][\w.-]*(?:@[a-z0-9_][\w.-]*)?(?=\s|$)/i.test(text.trim());
+const commandText = isCommandShapedInput;
 const command = (message: Message) => !message.botSource && !message.forwardedFrom && commandText(blocksText(message.blocks));
 /** A slash control input; it never starts an engine run (#53 anchors). */
 export const isQueueCommand = command;

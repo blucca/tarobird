@@ -122,6 +122,12 @@ export const historyForkSchema = z.object({
 }).strict();
 export type HistoryForkRequest = z.infer<typeof historyForkSchema>;
 
+/** A slash-command-shaped input: a queue barrier on the Hub and never an
+ * anchor (unknown tokens count too: an engine may add its own commands). A
+ * path such as "/Users/a/b …" is not one. One rule for the Hub's anchors and
+ * the Bot's history ledger, so the two cannot disagree. */
+export const isCommandShapedInput = (text: string): boolean => /^\/[a-z][\w.-]*(?:@[a-z0-9_][\w.-]*)?(?=\s|$)/i.test(text.trim());
+
 // ---------------------------------------------------------------- Hub ⇄ Gateway
 
 /** Hub-side facts for matching an older run (no ledger line) to engine turns. */

@@ -20,6 +20,7 @@ import type { BridgeTurnLockWaitEvent } from "../runtime/turn-lock.js";
 import type { TurnPoolWaitEvent } from "../runtime/turn-pool.js";
 import { engineEventTimelineMetadata, shouldPersistEngineTimelineEvent } from "../runtime/timeline-events.js";
 import { HistoryLedgerRun, type HistoryLedgerOutcome } from "../runtime/history-ledger.js";
+import { isCommandShapedInput } from "../client-protocol/history.js";
 import { classifyFailure } from "../runtime/error-classification.js";
 import { FileWorkflowStore } from "../state/file-workflow-store.js";
 import {
@@ -2104,11 +2105,13 @@ async function runNormalizedCoreMessage(
     }
 
     let runCard: CoreRunCardController | undefined;
-    // #53 history ledger: only an ordinary App user message starts a run that
-    // can anchor a rewind or fork. Steering, slash commands, delegated Bot
-    // input and group discussion write nothing.
-    historyLedger = channelProfile() === "gateway" && !normalized.botSource && !normalized.agentBus && !normalized.groupDiscussion
-      && !normalized.reviewAdmission && !normalized.goalObjective && !commandText.trimStart().startsWith("/") && /^[A-Za-z0-9_-]{1,128}$/.test(normalized.messageId)
+    // #53 history ledger: exactly the runs the Hub accepts as anchors — an
+    // input whose text is not command-shaped (a path such as "/Users/a/b …"
+    // is ordinary text), including one delegated by another Bot (the Hub
+    // refuses command-shaped Bot messages). Steering does not reach here as
+    // a run; group discussion and Agent Bus input are outside history scope.
+    historyLedger = channelProfile() === "gateway" && !normalized.agentBus && !normalized.groupDiscussion
+      && !normalized.reviewAdmission && !normalized.goalObjective && !isCommandShapedInput(commandText) && /^[A-Za-z0-9_-]{1,128}$/.test(normalized.messageId)
       ? new HistoryLedgerRun({ stateDir: input.stateDir, conversationKey: normalized.conversationKey, sourceMessageId: normalized.messageId, engine: cfg.engine })
       : undefined;
     let nativeGoalReceipt: ClaudeNativeGoalReceipt | undefined;

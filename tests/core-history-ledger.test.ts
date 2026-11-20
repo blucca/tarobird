@@ -51,13 +51,24 @@ describe("Core history ledger (#53)", () => {
     expect(run!.last).toMatchObject({ sourceMessageId: "msg_b", anchor: { firstTurnId: "t9", lastTurnId: "t9" }, outcome: "failed:engine-quota" });
   });
 
-  it("writes nothing for slash commands, delegated Bot input or the Feishu profile", async () => {
+  it("writes nothing for slash commands, command-shaped input or the Feishu profile", async () => {
     const bridge = { handleAuthorizedMessage: vi.fn(async (input: TurnInput) => { await input.onTurnAnchor?.({ sessionId: "thr-1", turnId: "t1" }); return { text: "ok" }; }) };
     await gateway(bridge, "msg_c", "/help");
-    await withChannelProfile("gateway", () => handleCoreMessage({ channel: { ...fakeChannel(), profile: "gateway" as const }, bridge, runtime: createCoreServiceRuntime(), stateDir,
-      message: { ...fakeLarkMessage({ messageId: "msg_d" }), botSource: { hostId: "host_1", botId: "bot_2", requestId: "req_1", hops: 1 } } as never }));
+    // Unknown to Core, so the engine gets it, but the Hub never takes it for an anchor.
+    await gateway(bridge, "msg_u", "/unknowncmd do it");
     await handleCoreMessage({ channel: fakeChannel(), bridge, runtime: createCoreServiceRuntime(), stateDir, message: fakeLarkMessage({ messageId: "om_feishu" }) });
     expect(await readHistoryLedger(stateDir, KEY)).toEqual([]);
     for (const call of bridge.handleAuthorizedMessage.mock.calls) expect(call[0]).not.toHaveProperty("sourceMessageId");
+  });
+
+  it("records what the Hub accepts as an anchor: delegated Bot input and slash text that is not a command", async () => {
+    const bridge = { handleAuthorizedMessage: vi.fn(async (input: TurnInput) => { await input.onTurnAnchor?.({ sessionId: "thr-1", turnId: `t-${input.sourceMessageId}` }); return { text: "ok" }; }) };
+    const botSource = { hostId: "host_1", botId: "bot_2", requestId: "req_1", hops: 1 };
+    await withChannelProfile("gateway", () => handleCoreMessage({ channel: { ...fakeChannel(), profile: "gateway" as const }, bridge, runtime: createCoreServiceRuntime(), stateDir,
+      message: { ...fakeLarkMessage({ messageId: "msg_d", content: "summarize the report" }), botSource } as never }));
+    await gateway(bridge, "msg_p", "/Users/a/b 是什么");
+    const runs = await readHistoryLedger(stateDir, KEY);
+    expect(runs.map(run => [run.last.sourceMessageId, run.last.anchor?.firstTurnId])).toEqual([["msg_d", "t-msg_d"], ["msg_p", "t-msg_p"]]);
+    expect(bridge.handleAuthorizedMessage.mock.calls.map(call => call[0].sourceMessageId)).toEqual(["msg_d", "msg_p"]);
   });
 });

@@ -191,6 +191,22 @@ describe("rewind", () => {
     expect((await json(api(headers, route, { ...base, requestId: "stale", expectedLastMessageId: seeded[1]!.reply.id }))).body).toMatchObject({ state: "failed", error: "history_changed", replayed: true });
     expect((await rows()).every(row => row.state === "failed")).toBe(true);
   });
+  it("takes the same inputs for anchors as the Bot's ledger records", async () => {
+    const { headers, chat } = await fixture(["first"]);
+    const [path, unknown] = await turns(chat.id, ["/Users/a/b 是什么", "/unknowncmd do it"]);
+    const { message: delegated } = await hub.store.sendMessage("owner", { conversationId: chat.id, clientMsgId: "bm_1", text: "summarize the report", attachments: [], botSource: { hostId: "host_1", hostName: "Host", botId: "beta", botName: "Beta", requestId: "req_1", hops: 1 } });
+    await hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=?", [delegated.id]);
+    const bot = await gateway();
+    const route = `/api/conversations/${chat.id}/history/rewind`, lastNow = delegated.id;
+    expect((await json(api(headers, route, { botId: "alpha", requestId: "a_cmd", beforeMessageId: unknown!.input.id, expectedLastMessageId: lastNow }))).body).toMatchObject({ state: "failed", error: "not_an_anchor" });
+    for (const [requestId, message] of [["a_path", path!.input], ["a_bot", delegated]] as const) {
+      const pending = json(api(headers, route, { botId: "alpha", requestId, beforeMessageId: message.id, expectedLastMessageId: lastNow }));
+      const call = await bot.next("instance.call", f => f.method === "history.rewind");
+      expect(call.params.beforeMessageId).toBe(message.id);
+      bot.reply(call, { ok: false, error: "engine_busy" });
+      expect((await pending).body).toMatchObject({ state: "failed", error: "engine_busy" });
+    }
+  });
   it("allows one started operation per conversation; a second device gets busy", async () => {
     const { headers, chat, seeded, last } = await fixture();
     const bot = await gateway(), second = await login(testDevice("second_dev"));
