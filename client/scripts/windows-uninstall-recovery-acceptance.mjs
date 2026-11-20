@@ -129,6 +129,8 @@ export function makeContext(sys, options) {
     const directory = unquote(location.values?.['(Default)']) ?? unquote(key.values?.InstallLocation);
     const ok = result.code === 0 && !!directory && existsSync(W.join(directory, EXE));
     receipt.expect(phase, `install ${args.join(' ')}`, ok, `${outcome(result)}; ${directory ?? 'no location'}; version ${key.values?.DisplayVersion}`);
+    // What the installer left running (e.g. a child that keeps inherited handles).
+    receipt.info(phase, `after install ${args.join(' ')}: processes/windows`, (await sys.powershell(PROCESS_SNAPSHOT)).stdout.trim() || 'none');
     return ok ? directory : undefined;
   };
   /** Which owned files and keys are left: locates the step a failed run stopped at. */
