@@ -25,10 +25,26 @@ Discovery uses the configured executable, environment, workspace and web
 profile, copied into a disposable private DSH home. Credentials are copied for
 this read, rather than linked. Only the public catalog is requested: no Session
 is created and no prompt, selection or native settings write is sent. Native
-startup itself may write in the disposable home. A seven-second deadline leaves
-time within the existing ten-second Bot RPC. Concurrent reads coalesce; writes
-request a fresh catalog, including when an earlier reader is still cleaning up.
-Temporary children and homes are cleaned on success, failure and timeout.
+startup itself may write in the disposable home. Temporary children and homes
+are cleaned on success, failure and timeout.
+
+Reads of one configuration never overlap: a read that has not answered is
+joined, including by a refresh. A passive read may reuse a ready answer for 30
+seconds; an explicit refresh (saving, creating a Bot) never reuses one, and a
+failed answer is never reused, so the user's "reload" after a timeout is a new
+read. A replacing read first waits up to three seconds for the previous child to
+exit and its private home to be removed; if that does not happen, it answers
+unavailable without starting another child. Passive reads keep a seven-second
+startup budget. Explicit refreshes and reads after a failure get twelve seconds,
+counted from the request and including that wait; the Hub gives model and
+effort RPCs fifteen seconds so such a refresh is not reported as an unconfirmed
+save.
+
+The twelve-second budget comes from cold reads of DSH 0.2.2-rc.5 with synthetic
+providers on a 10-core Apple Silicon Mac (2026-11-21), all under other load:
+1.7–2.6 s (8 reads, 1-minute load 6–7), 1.8–5.6 s (12 reads, load 10–12), and an
+independent sample of 4.1–7.0 s plus one read over 7.04 s (load 8–19). An idle
+Mac and Windows were not measured.
 
 `ready`, `no-models`, and `unavailable` distinguish a healthy catalog, no configured
 models and failed discovery. Partial provider failures are unavailable even if

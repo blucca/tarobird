@@ -13,9 +13,25 @@ import { spawnEngine } from "./engine-process.js";
 import { resolveDeepSeekExecutable } from "./deepseek-executable.js";
 import { modelDiscoveryEnabled } from "./cli-model-discovery.js";
 
-const DEADLINE_MS = 7000;
+// Each read copies a private home and cold-starts `dsh web`. A passive read keeps the original budget,
+// inside the 10 s Bot RPC. An explicit refresh, or any read after a failed one, gets a longer budget
+// (REFRESH_DEADLINE_MS, chosen from measured cold starts; see docs/client/deepseek-model-settings.md).
+const PASSIVE_DEADLINE_MS = 7000;
+export const DEEPSEEK_CATALOG_REFRESH_DEADLINE_MS = 12_000;
+const REFRESH_DEADLINE_MS = DEEPSEEK_CATALOG_REFRESH_DEADLINE_MS;
+// A replacing read first waits this long for the previous child to exit and its private home to go.
+const RECLAIM_WAIT_MS = 3000;
 const unavailable = (): DeepSeekModelCatalog => ({ status: "unavailable", models: [] });
-const cache = new Map<string, { expires: number; promise: Promise<DeepSeekModelCatalog> }>();
+type Entry = {
+  promise: Promise<DeepSeekModelCatalog>; answered: boolean; status?: DeepSeekModelCatalog["status"]; expires: number;
+  reclaimed: boolean; whenReclaimed: Promise<void>;
+};
+const cache = new Map<string, Entry>();
+export type DeepSeekDiscoveryTiming = { deadlineMs?: number; refreshDeadlineMs?: number; reclaimWaitMs?: number };
+const settledWithin = (promise: Promise<void>, ms: number) => new Promise<boolean>(resolve => {
+  const timer = setTimeout(() => resolve(false), Math.max(0, ms)); timer.unref?.();
+  void promise.then(() => { clearTimeout(timer); resolve(true); });
+});
 
 /** A file can grow after stat; cap the actual read and reject a changing copy. */
 export async function readDeepSeekCatalogConfig(file: string): Promise<Buffer> {
@@ -40,7 +56,7 @@ export async function readDeepSeekCatalogConfig(file: string): Promise<Buffer> {
  * native turns, but a disposable private home. No session/create, prompt,
  * model selection or settings write is sent. Shared credentials are copied,
  * never linked, because even CLI boot/migration must not write through them. */
-export async function discoverDeepSeekModels(env: NodeJS.ProcessEnv = process.env, cwd?: string, fresh = false): Promise<DeepSeekModelCatalog> {
+export async function discoverDeepSeekModels(env: NodeJS.ProcessEnv = process.env, cwd?: string, fresh = false, timing: DeepSeekDiscoveryTiming = {}): Promise<DeepSeekModelCatalog> {
   if (!modelDiscoveryEnabled(env)) return unavailable();
   try {
     const home = resolveDeepSeekHome(env), executable = resolveDeepSeekExecutable(env);
@@ -50,26 +66,40 @@ export async function discoverDeepSeekModels(env: NodeJS.ProcessEnv = process.en
     }));
     const key = createHash("sha256").update(JSON.stringify([executable, home, env, cwd, signatures])).digest("hex");
     const current = cache.get(key);
-    // A normal result is published after cleanup. A timed-out preparation
-    // stays coalesced until cleanup finishes, so retries cannot pile up copies.
-    if (current && (current.expires === Infinity || !fresh && current.expires > Date.now())) return current.promise;
-    if (cache.size >= 16 && !cache.has(key)) {
-      const completed = [...cache].find(([, entry]) => entry.expires !== Infinity);
-      if (completed) cache.delete(completed[0]); else return unavailable();
+    // One read per configuration at a time: a read that has not answered yet is joined, refreshes included.
+    if (current && !current.answered) return current.promise;
+    // A passive read may reuse a recent answer. An explicit refresh never does, and a failure is never
+    // reused: the next read (typically the user's "reload") is a real, new read.
+    const failed = current?.status === "unavailable";
+    if (current && !fresh && !failed && current.expires > Date.now()) return current.promise;
+    if (!current && cache.size >= 16) {
+      const reclaimed = [...cache].find(([, entry]) => entry.answered && entry.reclaimed);
+      if (reclaimed) cache.delete(reclaimed[0]); else return unavailable();
     }
-    const entry = { expires: Infinity, promise: Promise.resolve(unavailable()) };
-    let status: DeepSeekModelCatalog["status"] = "unavailable";
-    entry.promise = readCatalog(executable, home, env, cwd, () => { entry.expires = Date.now() + (status === "ready" ? 30_000 : 1000); })
-      .then(result => { status = result.status; if (entry.expires !== Infinity) entry.expires = Date.now() + (status === "ready" ? 30_000 : 1000); return result; }, () => { entry.expires = Date.now() + 1000; return unavailable(); });
+    const deadline = Date.now() + (fresh || failed ? timing.refreshDeadlineMs ?? REFRESH_DEADLINE_MS : timing.deadlineMs ?? PASSIVE_DEADLINE_MS);
+    let reclaim!: () => void;
+    const entry: Entry = { promise: Promise.resolve(unavailable()), answered: false, expires: 0, reclaimed: false,
+      whenReclaimed: new Promise<void>(resolve => { reclaim = () => { entry.reclaimed = true; resolve(); }; }) };
+    entry.promise = (async () => {
+      // Never overlap a replaced read's child or private home. If it does not finish exiting within the
+      // bounded wait, answer unavailable without starting another; this entry is reclaimed with it.
+      if (current && !current.reclaimed && !await settledWithin(current.whenReclaimed, Math.min(timing.reclaimWaitMs ?? RECLAIM_WAIT_MS, deadline - Date.now()))) {
+        void current.whenReclaimed.then(reclaim); return unavailable();
+      }
+      return await readCatalog(executable, home, env, cwd, deadline, reclaim);
+    })().catch(() => { reclaim(); return unavailable(); }).then(result => {
+      entry.answered = true; entry.status = result.status; entry.expires = Date.now() + (result.status === "ready" ? 30_000 : 1000);
+      return result;
+    });
     cache.set(key, entry);
     return await entry.promise;
   } catch { return unavailable(); }
 }
 
-async function readCatalog(executable: string, sharedHome: string, env: NodeJS.ProcessEnv, cwd: string | undefined, closed: () => void): Promise<DeepSeekModelCatalog> {
+async function readCatalog(executable: string, sharedHome: string, env: NodeJS.ProcessEnv, cwd: string | undefined, deadline: number, closed: () => void): Promise<DeepSeekModelCatalog> {
   const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-dsh-catalog-"));
   const home = path.join(root, "home"), workspace = cwd ?? path.join(root, "workspace");
-  const abort = new AbortController(), deadline = Date.now() + DEADLINE_MS;
+  const abort = new AbortController();
   let child: DeepSeekHarnessChildProcess | undefined, protocol: DeepSeekHarnessProtocolClient | undefined;
   let finished: Promise<void> | undefined;
   const stop = () => finished ??= (async () => { await protocol?.close().catch(() => {}); if (child) await stopChild(child, 300); })();
@@ -98,7 +128,7 @@ async function readCatalog(executable: string, sharedHome: string, env: NodeJS.P
     return parseDeepSeekModelCatalog(await protocol.request("session/modelCatalog", {}, abort.signal));
   })();
   let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<DeepSeekModelCatalog>(resolve => { timer = setTimeout(() => { abort.abort(); if (child) void stop(); resolve(unavailable()); }, DEADLINE_MS); });
+  const timeout = new Promise<DeepSeekModelCatalog>(resolve => { timer = setTimeout(() => { abort.abort(); if (child) void stop(); resolve(unavailable()); }, Math.max(1, deadline - Date.now())); });
   // Cleanup waits for preparation too; a timed-out profile copy must never
   // recreate files after its temporary directory has already been removed.
   const settled = work.finally(async () => {

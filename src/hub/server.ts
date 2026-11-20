@@ -133,6 +133,11 @@ import { exportGoogleDocument } from "./google-export.js";
 import { ShutdownErrors } from "./shutdown.js";
 
 const SNAPSHOT_WINDOW_MESSAGES = 32, SNAPSHOT_WINDOW_BYTES = 1024 * 1024;
+const BOT_RPC_TIMEOUT_MS = 10_000;
+/** Model/effort reads and saves may run an explicit DeepSeek catalog refresh (its own 12 s startup
+ * budget, including the bounded wait for a previous reader). The RPC outlives it, so a slow but
+ * successful refresh is not reported as an unconfirmed save. */
+export const BOT_MODEL_SETTINGS_RPC_TIMEOUT_MS = 15_000;
 type SnapshotTransfer = { id: string; sent: number; received: number; bytes: number; pending: { count: number; bytes: number }[]; changed?: () => void };
 type Client = { foreground: boolean; ws: WebSocket; session?: AuthSession; rejected?: "device_revoked" | "session_expired"; capabilities: string[]; cursors: Record<string, number>; syncLineages: Record<string, string>; conversationIds: Set<string>; readySent: boolean; pendingPublications: unknown[]; syncing: boolean; pendingSync: Set<string>; syncingConversations: Set<string>; syncFailures: Set<string>; streams: Map<string, Message>; snapshot?: SnapshotTransfer };
 /** Older gateways parse turn metadata strictly and predate design.open: give
@@ -1224,7 +1229,7 @@ export class HubServer {
       }
     } finally { this.actionDispatch.delete(botId); }
   }
-  private callBot(botId: string, method: string, params: unknown, timeoutMs = 10_000): Promise<Json> {
+  private callBot(botId: string, method: string, params: unknown, timeoutMs = BOT_RPC_TIMEOUT_MS): Promise<Json> {
     const connection = this.bots.get(botId);
     if (!connection?.ready) return Promise.reject(new HubError("bot_offline", 503));
     const id = newId("rpc");
@@ -2275,7 +2280,7 @@ export class HubServer {
         // Share the queue with effort: model changes may also change effort.
         const operation = (this.effortOperations.get(botId) ?? Promise.resolve()).catch(() => undefined).then(async () => {
           await this.auth.validateSession(session); await requireOwner();
-          const result = modelResultSchema.parse(await this.callBot(botId, req.method === "PUT" ? "model.set" : "model.get", input));
+          const result = modelResultSchema.parse(await this.callBot(botId, req.method === "PUT" ? "model.set" : "model.get", input, BOT_MODEL_SETTINGS_RPC_TIMEOUT_MS));
           if (!result.ok) throw new HubError(result.error, 409);
           const { engine, model: value, effort } = result.settings;
           await this.store.botStatus(botId, { engine, model: value, effort }); await this.broadcastBotStatus(botId);
@@ -2295,7 +2300,7 @@ export class HubServer {
         const operation = (this.effortOperations.get(botId) ?? Promise.resolve()).catch(() => undefined).then(async () => {
           await this.auth.validateSession(session);
           await requireOwner();
-          const result = effortResultSchema.parse(await this.callBot(botId, req.method === "PUT" ? "effort.set" : "effort.get", input));
+          const result = effortResultSchema.parse(await this.callBot(botId, req.method === "PUT" ? "effort.set" : "effort.get", input, BOT_MODEL_SETTINGS_RPC_TIMEOUT_MS));
           if (!result.ok) throw new HubError(result.error, 409);
           const { engine, model, effort: value } = result.settings;
           await this.store.botStatus(botId, { engine, model, effort: value });

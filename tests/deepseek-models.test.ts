@@ -61,3 +61,69 @@ it('bounds native startup and closes the temporary child/home without a fallback
   await expect.poll(() => { try { process.kill(events[0].pid, 0); return true; } catch { return false; } }, { timeout: 1500 }).toBe(false);
   await expect.poll(async () => await readFile(path.join(events[0].home, '.credentials.yaml')).then(() => true, () => false), { timeout: 1500 }).toBe(false);
 }, 12_000);
+
+// Explicit reloads after a failed read: wait (bounded) for the old child and private home, then read again.
+async function rereadFixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dsh-catalog-reread-")); dirs.push(root);
+  const shared = path.join(root, "shared"), workspace = path.join(root, "workspace"), source = path.join(root, "catalog.json"), trace = path.join(root, "trace.jsonl"), mode = path.join(root, "mode");
+  await mkdir(path.join(shared, "profiles", "web"), { recursive: true }); await mkdir(workspace);
+  await writeFile(source, JSON.stringify(catalog)); await writeFile(mode, "");
+  const env = { ...process.env, TAROBOT_MODEL_DISCOVERY: "1", DSH_EXECUTABLE: path.resolve("tests/fixtures/deepseek-models.mjs"), DSH_HOME: shared, DSH_FIXTURE_CATALOG: source, DSH_FIXTURE_TRACE: trace, DSH_FIXTURE_MODE_FILE: mode };
+  const starts = async () => (await readFile(trace, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event => event.kind === "start");
+  return { env, workspace, setMode: (value: string) => writeFile(mode, value), starts, read: (fresh = false, timing = {}) => discoverDeepSeekModels(env, workspace, fresh, timing) };
+}
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+it.each([false, true])("a reload right after a timed-out read really reads again once the old child is reclaimed (refresh=%s)", async fresh => {
+  const f = await rereadFixture();
+  await f.setMode("hang");
+  expect(await f.read(false, { deadlineMs: 300 })).toEqual({ status: "unavailable", models: [] });
+  await f.setMode("");
+  // Immediately, while the timed-out child may still be stopping: no reuse of the failure, no overlap.
+  expect((await f.read(fresh)).status).toBe("ready");
+  const [first, second] = await f.starts();
+  expect(second).toBeDefined(); expect(second.earlierHomesPresent).toBe(0); expect(alive(first.pid)).toBe(false);
+}, 15_000);
+
+it("concurrent reloads after a failure join one new read", async () => {
+  const f = await rereadFixture();
+  await f.setMode("hang"); await f.read(false, { deadlineMs: 300 }); await f.setMode("delay-200");
+  const results = await Promise.all([f.read(), f.read(true), f.read()]);
+  expect(results.map(result => result.status)).toEqual(["ready", "ready", "ready"]);
+  expect(await f.starts()).toHaveLength(2);
+}, 15_000);
+
+it("an explicit refresh joins an unanswered read instead of starting a second child", async () => {
+  const f = await rereadFixture(); await f.setMode("delay-300");
+  const [passive, refresh] = await Promise.all([f.read(), new Promise(resolve => setTimeout(resolve, 50)).then(() => f.read(true))]);
+  expect(passive.status).toBe("ready"); expect(refresh).toEqual(passive); expect(await f.starts()).toHaveLength(1);
+  // A ready answer is reused by passive reads, never by an explicit refresh.
+  await f.read(); expect(await f.starts()).toHaveLength(1);
+  await f.read(true); expect(await f.starts()).toHaveLength(2);
+}, 15_000);
+
+it("does not start another child while the old one is still exiting past the bounded wait", async () => {
+  const f = await rereadFixture();
+  await f.setMode("hang slow-exit"); await f.read(false, { deadlineMs: 300 }); await f.setMode("");
+  // The old child ignores SIGTERM until the kill grace ends; a 20 ms wait cannot see it reclaimed.
+  expect(await f.read(true, { reclaimWaitMs: 20 })).toEqual({ status: "unavailable", models: [] });
+  expect(await f.starts()).toHaveLength(1);
+  await expect.poll(async () => (await f.read(true)).status, { timeout: 8000 }).toBe("ready");
+  const starts = await f.starts();
+  expect(starts).toHaveLength(2); expect(starts[1].earlierHomesPresent).toBe(0);
+}, 20_000);
+
+it("gives an explicit refresh, and a reload after a failure, the longer startup budget", async () => {
+  const f = await rereadFixture(); await f.setMode("delay-700");
+  const timing = { deadlineMs: 300, refreshDeadlineMs: 4000 };
+  expect((await f.read(false, timing)).status).toBe("unavailable");
+  expect((await f.read(false, timing)).status).toBe("ready");
+  resetDeepSeekModelDiscoveryForTest();
+  expect((await f.read(true, timing)).status).toBe("ready");
+}, 20_000);
+
+it("keeps the Hub's model/effort RPC budget above the explicit DeepSeek refresh budget", async () => {
+  const { DEEPSEEK_CATALOG_REFRESH_DEADLINE_MS } = await import("../src/runtime/deepseek-model-discovery.js");
+  const { BOT_MODEL_SETTINGS_RPC_TIMEOUT_MS } = await import("../src/hub/server.js");
+  expect(BOT_MODEL_SETTINGS_RPC_TIMEOUT_MS - DEEPSEEK_CATALOG_REFRESH_DEADLINE_MS).toBeGreaterThanOrEqual(2000);
+});
