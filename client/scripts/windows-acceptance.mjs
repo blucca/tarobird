@@ -14,7 +14,7 @@
 //     [--scope install,upgrade,...]                        judge only these scopes (default: all)
 //
 // Every check is recorded as pass, fail or skip (with the reason); a skipped
-// check is NOT a pass. The outcome is `pass` only when every required check of
+// check is NOT a pass. `info` records evidence that is never judged. The outcome is `pass` only when every required check of
 // the judged scopes ran and passed; otherwise `fail` or `incomplete`.
 import { execFile, spawn } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
@@ -86,8 +86,9 @@ export class Report {
   }
   // A failure counts in any scope: a scope narrows what must run, never what may fail.
   get outcome() { return this.checks.some(check => check.status === 'fail') ? 'fail' : this.missing.length ? 'incomplete' : 'pass'; }
+  info(phase, id, detail) { this.add(phase, id, 'info', detail); }
   markdown(meta) {
-    const rows = this.checks.map(c => `| ${c.phase} | ${c.id} | ${c.status === 'pass' ? '✅ pass' : c.status === 'fail' ? '❌ fail' : '⏭ skip'} | ${c.detail.replaceAll('|', '\\|').replaceAll('\n', ' ')} |`);
+    const rows = this.checks.map(c => `| ${c.phase} | ${c.id} | ${c.status === 'pass' ? '✅ pass' : c.status === 'fail' ? '❌ fail' : c.status === 'info' ? 'ℹ info (not judged)' : '⏭ skip'} | ${c.detail.replaceAll('|', '\\|').replaceAll('\n', ' ')} |`);
     const missing = this.missing.length ? `\nNot executed (required by the judged scopes): ${this.missing.join(', ')}.\n` : '';
     return `# Windows acceptance (${meta.startedAt})\n\nOutcome: **${this.outcome}** for scopes ${this.scopes.join(', ')}. Skips are not passes.\n${missing}\n| phase | check | status | detail |\n|---|---|---|---|\n${rows.join('\n')}\n`;
   }
@@ -195,6 +196,36 @@ async function verifyElectron(sys, report, phase, directory, version) {
   report.expect(phase, 'notification-receipt', !!shortcut && typeof receiptPath === 'string' && same(receiptPath, shortcut), `${receipt} → ${receiptPath ?? 'missing'}`);
   const apps = (await sys.powershell(`Get-StartApps | Where-Object { $_.AppID -eq '${AUMID}' } | ForEach-Object { $_.AppID }`)).stdout.trim();
   report.expect(phase, 'notification-aumid', apps.split(/\r?\n/).includes(AUMID), apps || `no Start app with AppID ${AUMID}`);
+}
+
+/** Record-only toast status probe for the installed AUMID (Windows PowerShell
+ * 5.1 WinRT projection): Setting and the Notifications\Settings key before and
+ * after one Show. Never judged: a Server runner without an interactive desktop
+ * proves neither banner delivery nor Windows 10/11 behaviour. */
+export const TOAST_PROBE = `$ErrorActionPreference = 'Stop'
+[void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+[void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+$id = '${AUMID}'
+$key = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings\\$id"
+function Code($e) { while ($e.InnerException) { $e = $e.InnerException }; '0x{0:X8}' -f $e.HResult }
+function Setting { try { [string][Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Setting } catch { Code $_.Exception } }
+$before = Setting; $keyBefore = Test-Path $key
+try {
+  $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+  $xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>TaroBird acceptance probe</text></binding></visual></toast>')
+  $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+  $toast.Tag = 'probe'; $toast.Group = 'acceptance'
+  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Show($toast); $show = '0x00000000'
+} catch { $show = Code $_.Exception }
+Start-Sleep -Milliseconds 500
+$after = Setting; $keyAfter = Test-Path $key
+try { [Windows.UI.Notifications.ToastNotificationManager]::History.Remove('probe', 'acceptance', $id) } catch {}
+"setting-before=$before key-before=$keyBefore show=$show setting-after=$after key-after=$keyAfter"`;
+async function probeToastStatus(sys, report, phase) {
+  try {
+    const result = await sys.powershell(TOAST_PROBE);
+    report.info(phase, 'notification-status-probe', result.code === 0 ? result.stdout.trim() : `probe exit ${result.code}: ${(result.stderr || result.stdout).trim().slice(-500)}`);
+  } catch (error) { report.info(phase, 'notification-status-probe', `probe error: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
 /** Credential Manager target names only (cmdkey never prints secrets);
@@ -323,6 +354,8 @@ async function phases(options, sys, report) {
   directory = await install(sys, report, 'install', options.installer, options.legacyInstaller ? ['/P', '/UPDATE'] : ['/S']) ?? directory;
   if (!directory) return;
   await verifyElectron(sys, report, 'install', directory, options.version);
+  // Before the App's first launch: the state a fresh install hands to the user.
+  await probeToastStatus(sys, report, 'install');
   if (options.legacyInstaller) {
     // The Electron runtime lives in resources\host; the whole Tauri folder must be gone.
     const old = path.win32.join(directory, 'host'), left = sys.probe(old);

@@ -122,6 +122,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Desktop native regressions failed" }
           cargo test --manifest-path client/src-desktop-updater/Cargo.toml --locked --lib --bins --test real_archive
           if ($LASTEXITCODE -ne 0) { throw "Desktop updater regressions failed" }
+      # Record only, never a gate: the real WinRT Setting of a never-registered
+      # AUMID and how windows_status classifies it. A Server runner proves
+      # neither banner delivery nor Windows 10/11 behaviour.
+      - name: Record-only Windows toast status probe (non-blocking)
+        if: inputs.arch == 'x64'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
+          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $output = cargo test --manifest-path client/src-desktop-native/Cargo.toml --locked --no-default-features windows_toast_status_probe -- --ignored --nocapture 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Output $output
+          $fence = '```'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Windows toast status probe (record only)', $fence, $output.Trim(), $fence)
+          if ($code -ne 0) { throw "Toast status probe did not classify as prompt/granted; recorded only" }
       - name: Real Windows install, first launch and uninstall
         shell: pwsh
         env:

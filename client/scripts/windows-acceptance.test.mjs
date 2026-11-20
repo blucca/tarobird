@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
-import { AUMID, EXE, hostState, LOCATION_KEY, PROTOCOL_KEY, registryScript, RUN_KEY, runAcceptance, UNINSTALL_KEY, windowsSystem } from './windows-acceptance.mjs';
+import { AUMID, EXE, hostState, LOCATION_KEY, PROTOCOL_KEY, registryScript, RUN_KEY, runAcceptance, TOAST_PROBE, UNINSTALL_KEY, windowsSystem } from './windows-acceptance.mjs';
 
 const W = path.win32;
 const APPDATA = 'C:\\Users\\lab\\AppData\\Roaming', LOCAL = 'C:\\Users\\lab\\AppData\\Local', INSTALL = `${LOCAL}\\TaroBot`;
@@ -83,6 +83,11 @@ function windows({ faults = new Set(), existing = false, host = false, displayNa
       }
       if (script.includes('CreateShortcut')) return { code: 0, stdout: `${exe}\r\n` };
       if (script.includes('Get-StartApps')) return { code: 0, stdout: faults.has('aumid') ? '' : `${AUMID}\r\n` };
+      if (script.includes('ToastNotificationManager')) {
+        calls.push(['toast-probe']);
+        return faults.has('toast-probe') ? { code: 1, stdout: '', stderr: 'Unable to find type [Windows.UI.Notifications.ToastNotificationManager]' }
+          : { code: 0, stdout: 'setting-before=0x80070490 key-before=False show=0x00000000 setting-after=Enabled key-after=True\r\n' };
+      }
       return { code: 1, stdout: '', stderr: 'unexpected script' };
     },
     run: async (file, args, { env } = {}) => {
@@ -279,4 +284,20 @@ test('TaroBird display name is verified independently from retained TaroBot inst
     assert.equal(statuses(report)['install/uninstall-key'], expected, displayName);
     assert.equal(statuses(report)['install/deep-link'], 'pass');
   }
+});
+
+test('the installed toast status probe is recorded once and never judged', async () => {
+  for (const fault of [undefined, 'toast-probe']) {
+    const sys = windows({ faults: new Set(fault ? [fault] : []) });
+    const { report, meta } = await runAcceptance({ installer: SETUP, version: '1.2.3', confirmed: true, scopes: ['install'] }, sys);
+    assert.equal(report.outcome, 'pass', JSON.stringify(report.checks.filter(c => c.status === 'fail')));
+    assert.equal(statuses(report)['install/notification-status-probe'], 'info');
+    assert.equal(sys.calls.filter(call => call[0] === 'toast-probe').length, 1);
+    assert.match(detail(report, 'install/notification-status-probe'), fault ? /^probe exit 1: Unable to find type/ : /^setting-before=0x80070490 key-before=False show=0x00000000 setting-after=Enabled/);
+    assert.match(report.markdown(meta), /\| install \| notification-status-probe \| ℹ info \(not judged\) \|/);
+    assert.ok(!report.missing.includes('install/notification-status-probe'));
+  }
+  // The probe reads one fixed AUMID and writes only the probe toast it removes again.
+  assert.match(TOAST_PROBE, /\$id = 'com\.tarobot\.client'/);
+  assert.match(TOAST_PROBE, /History\.Remove\('probe', 'acceptance', \$id\)/);
 });
