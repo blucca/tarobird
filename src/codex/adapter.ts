@@ -29,6 +29,13 @@ export class EngineContextCompactionPendingError extends Error {
   }
 }
 
+/** #53: the engine neither confirmed nor refused a rewind (its call timed
+ * out and the target turn is still listed, or the outcome cannot be read). It
+ * may still land: never a terminal failure; ask again with the same request. */
+export class EngineHistoryUnconfirmedError extends Error {
+  constructor() { super("rewind_unconfirmed"); this.name = "EngineHistoryUnconfirmedError"; }
+}
+
 export class EngineStopTooLateError extends Error {
   constructor() { super("Engine turn finished before the stop request arrived"); this.name = "EngineStopTooLateError"; }
 }
@@ -444,8 +451,12 @@ export interface CodexAdapter {
     reason?: "legacy_history" | "external_session" | "unsupported";
   }>;
   /** Drop the anchor turn and everything after it. Re-entrant: succeeds when the
-   * target turn is already gone from this session. */
-  rewindSession?(sessionId: string, input: { anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
+   * target turn is already gone from this session, with `reverted: false` (the
+   * caller decides where that earlier rewind ended). `beforeRevert` runs once
+   * the turn is known present, right before the engine call; if it throws,
+   * nothing is reverted. Throws EngineHistoryUnconfirmedError when the
+   * outcome is unknown. */
+  rewindSession?(sessionId: string, input: { anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal; beforeRevert?: () => Promise<void> }): Promise<{ sessionId: string; reverted: boolean }>;
   /** Copy history through `through` (inclusive; omitted = whole) into an independent,
    * persistent session. The source session is unchanged. `appPlatformTools`
    * lets an engine that records App tools per session carry the source's. */

@@ -22,7 +22,7 @@ import type {
   EngineStreamEvent,
   SideCapability,
 } from "./adapter.js";
-import { EngineContextCompactionPendingError } from "./adapter.js";
+import { EngineContextCompactionPendingError, EngineHistoryUnconfirmedError } from "./adapter.js";
 import type { EngineHistoryAnchor } from "../client-protocol/history.js";
 import { appendUniqueSendImageTag, extractGeneratedImagePath, sendImageTag } from "./generated-files.js";
 import { killProcessTree } from "./process-tree.js";
@@ -201,6 +201,8 @@ type AppServerDependencies = {
   findThreadWriterLockHolder: typeof findThreadWriterLockHolder;
   /** Host-managed Brave/Tavily MCP, added per thread when credentials are effective. */
   nativeSearchMcp: NativeSearchMcpPlanner;
+  /** #53: further looks after a timed-out `thread/revert` (default CODEX_HISTORY_REVERT_RECHECK_DELAYS_MS). */
+  historyRevertRecheckDelaysMs: readonly number[];
 };
 
 /** Collab calls that only observe or stop child agents; any other collab tool
@@ -814,6 +816,9 @@ const CODEX_HISTORY_PRESENCE_MAX_PAGES = 400;
 /** A run's first turn starts after its run card (downloads, transcription). */
 const CODEX_HISTORY_MATCH_BEFORE_MS = 60_000;
 const CODEX_HISTORY_MATCH_AFTER_MS = 30 * 60_000;
+/** After a timed-out `thread/revert`: look again after these waits before
+ * reporting the outcome as unconfirmed. Not measured on a real long thread. */
+const CODEX_HISTORY_REVERT_RECHECK_DELAYS_MS: readonly number[] = [5_000, 15_000];
 
 export function readCodexHistoryTurn(raw: unknown): CodexHistoryTurn | undefined {
   if (!raw || typeof raw !== "object") return undefined;
@@ -936,6 +941,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
   private readonly threadHistoryInfo = new Map<string, { historyMode: string | null; originator: string | null }>();
   /** #53: history RPCs this CLI answered with "method not found"; for the process lifetime. */
   private readonly missingHistoryMethods = new Set<string>();
+  private readonly historyRevertRecheckDelaysMs: readonly number[];
   // Codex publishes the active context size separately from per-turn billing.
   // Keep it thread-scoped so a long-lived topic can compact before its next turn
   // instead of crossing the model limit and leaking an unrelated old answer.
@@ -1010,6 +1016,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
         : spawnCodexArg ?? (spawnEngine as unknown as AppServerSpawnCodex);
     this.findWriterLockHolder = dependencies.findThreadWriterLockHolder ?? findThreadWriterLockHolder;
     this.nativeSearchMcp = dependencies.nativeSearchMcp;
+    this.historyRevertRecheckDelaysMs = dependencies.historyRevertRecheckDelaysMs ?? CODEX_HISTORY_REVERT_RECHECK_DELAYS_MS;
     this.instructionsPath = instructionsPath;
     this.configPath = configPath;
   }
@@ -4082,8 +4089,10 @@ export class CodexAppServerAdapter implements CodexAdapter {
 
   /** Remove the anchor turn and everything after it. Re-entrant: a turn id is
    * unique, so a target already gone was rewound before (a lost reply, a
-   * retried request) and is success, even after later turns. */
-  async rewindSession(sessionId: string, input: { anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }> {
+   * retried request) and is success with `reverted: false`; the caller knows
+   * where that rewind ended, this method does not. A revert whose outcome
+   * cannot be confirmed is EngineHistoryUnconfirmedError, never a failure. */
+  async rewindSession(sessionId: string, input: { anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal; beforeRevert?: () => Promise<void> }): Promise<{ sessionId: string; reverted: boolean }> {
     const turnId = input.anchor.firstTurnId;
     if (!turnId) throw new Error("turn_unresolved");
     if (isLogicalTelegramSessionId(sessionId)) throw new Error("no_main_session");
@@ -4096,9 +4105,12 @@ export class CodexAppServerAdapter implements CodexAdapter {
       try { threadId = await this.ensureThreadLoaded(sessionId, input.workspaceOverride ?? this.cwd); }
       catch (error) { throw error instanceof CodexActiveWriterConflictError ? new Error("engine_busy") : codexHistoryError(error); }
       if (this.historyCapabilityOf(await this.readThreadHistoryInfo(threadId)).rewind !== "turn") throw new Error("unsupported");
-      const done = () => { this.threadContextUsage.delete(threadId); return { sessionId: threadId }; };
-      if (!await this.historyTurnPresent(threadId, turnId)) return done();
+      // Cached context usage described the dropped turns.
+      const done = (reverted: boolean) => { this.threadContextUsage.delete(threadId); return { sessionId: threadId, reverted }; };
+      if (!await this.historyTurnPresent(threadId, turnId)) return done(false);
       input.abortSignal?.throwIfAborted();
+      // The caller's record of this rewind precedes the engine change.
+      await input.beforeRevert?.();
       try {
         await this.request("thread/revert", { threadId, beforeTurnId: turnId }, {
           timeoutMs: this.threadReadTimeoutMs,
@@ -4106,13 +4118,20 @@ export class CodexAppServerAdapter implements CodexAdapter {
         });
       } catch (error) {
         if (isMissingCodexMethod(error, "thread/revert")) { this.missingHistoryMethods.add("thread/revert"); throw new Error("unsupported"); }
-        // The outcome decides, not the reply: a timeout may still have landed.
-        if (await this.historyTurnPresent(threadId, turnId).catch(() => true)) throw codexHistoryError(error);
-        return done();
+        // The outcome decides, not the reply. A timed-out revert may still
+        // land: look again a few times before leaving it unconfirmed.
+        const timedOut = error instanceof CodexAppServerRequestTimeoutError;
+        let present: boolean | undefined;
+        for (const delayMs of [0, ...(timedOut ? this.historyRevertRecheckDelaysMs : [])]) {
+          if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+          present = await this.historyTurnPresent(threadId, turnId).catch(() => undefined);
+          if (present === false) return done(true);
+        }
+        if (timedOut || present === undefined) throw new EngineHistoryUnconfirmedError();
+        throw codexHistoryError(error);
       }
       if (await this.historyTurnPresent(threadId, turnId)) throw new Error("engine_failed");
-      // Cached context usage described the dropped turns.
-      return done();
+      return done(true);
     });
   }
 

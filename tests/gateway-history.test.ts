@@ -4,13 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { historyBotForkReplySchema, historyBotRewindReplySchema, historyBotStatusSchema } from "../src/client-protocol/history.js";
-import type { CodexAdapter, CodexThreadGoal } from "../src/codex/adapter.js";
+import { EngineHistoryUnconfirmedError, type CodexAdapter, type CodexThreadGoal } from "../src/codex/adapter.js";
 import { CoreGoalRunController } from "../src/core/bus.js";
 import { buildCoreConversationKey, stableCoreNumericId } from "../src/core/message-normalizer.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import { gatewayHistory } from "../src/gateway/history.js";
 import { Bridge, type AccessStoreLike } from "../src/runtime/bridge.js";
-import { appendHistoryLedgerLine, findHistoryLedgerRun, readHistoryLedger } from "../src/runtime/history-ledger.js";
+import { appendHistoryLedgerLine, findHistoryLedgerRun, readHistoryLedger, readHistoryLedgerEntries } from "../src/runtime/history-ledger.js";
 import { SessionManager } from "../src/runtime/session-manager.js";
 import { bridgeConversationLockId, sessionLockNamespace, withBridgeTurnLock } from "../src/runtime/turn-lock.js";
 import { SessionStore } from "../src/state/session-store.js";
@@ -40,7 +40,8 @@ describe("Gateway history handlers (#53)", () => {
       createSession: vi.fn(), sendUserMessage: vi.fn(),
       ...(options.history === false ? {} : {
         historyCapability: vi.fn(async () => ({ rewind: "turn", fork: "turn" })),
-        rewindSession: vi.fn(async (sessionId: string) => ({ sessionId })),
+        // Like the adapter: the caller's record, then the engine change.
+        rewindSession: vi.fn(async (sessionId: string, input: { beforeRevert?: () => Promise<void> }) => { await input.beforeRevert?.(); return { sessionId, reverted: true }; }),
         forkSession: vi.fn(async () => ({ sessionId: "thr-fork" })),
         resolveHistoryAnchor: vi.fn(async () => undefined),
         getThreadGoal: vi.fn(async () => ({ goal: null })),
@@ -133,12 +134,12 @@ describe("Gateway history handlers (#53)", () => {
     await bind(f.store, sid);
     await ledger("msg_a", sid, { firstTurnId: "t1", lastTurnId: "t2" });
     let finish!: () => void;
-    f.adapter.rewindSession.mockImplementation(() => new Promise((resolve) => { finish = () => resolve({ sessionId: sid }); }));
+    f.adapter.rewindSession.mockImplementation(() => new Promise((resolve) => { finish = () => resolve({ sessionId: sid, reverted: true }); }));
     const both = Promise.all([rewind(f.history), rewind(f.history)]);
     await vi.waitFor(() => expect(f.adapter.rewindSession).toHaveBeenCalledTimes(1));
     finish();
     expect(await both).toEqual([{ ok: true }, { ok: true }]);
-    expect(f.adapter.rewindSession).toHaveBeenCalledWith(sid, { anchor: { firstTurnId: "t1", lastTurnId: "t2" }, workspaceOverride: "/tmp/history-ws", abortSignal: undefined });
+    expect(f.adapter.rewindSession).toHaveBeenCalledWith(sid, { anchor: { firstTurnId: "t1", lastTurnId: "t2" }, workspaceOverride: "/tmp/history-ws", abortSignal: undefined, beforeRevert: expect.any(Function) });
     expect(f.closeSideSessions).toHaveBeenCalledWith(conversationId);
     // A restarted Gateway answers from the receipt.
     expect(historyBotRewindReplySchema.parse(await rewind(f.create()))).toEqual({ ok: true });
@@ -162,7 +163,7 @@ describe("Gateway history handlers (#53)", () => {
     expect(f.adapter.rewindSession).toHaveBeenCalledTimes(2);
     // An execution still in flight in this process is joined, not repeated.
     let finish!: () => void;
-    f.adapter.rewindSession.mockImplementationOnce((sessionId: string) => new Promise((resolve) => { finish = () => resolve({ sessionId }); }));
+    f.adapter.rewindSession.mockImplementationOnce((sessionId: string) => new Promise((resolve) => { finish = () => resolve({ sessionId, reverted: true }); }));
     const running = rewind(f.history, { requestId: "ro_live" });
     await vi.waitFor(() => expect(f.adapter.rewindSession).toHaveBeenCalledTimes(3));
     const joined = rewind(f.history, { requestId: "ro_live", replayOnly: true });
@@ -171,6 +172,47 @@ describe("Gateway history handlers (#53)", () => {
     // Asking again still executes nothing.
     expect(await rewind(f.history, { requestId: "ro_none", replayOnly: true })).toEqual({ ok: false, error: "history_changed" });
     expect(f.adapter.rewindSession).toHaveBeenCalledTimes(3);
+  });
+
+  it("records each rewind before the engine call; an anchor already gone answers the earlier rewind's edge", async () => {
+    const f = fixture();
+    await bind(f.store, sid);
+    await ledger("msg_a", sid, { firstTurnId: "t1", lastTurnId: "t1" });
+    await ledger("msg_b", sid, { firstTurnId: "t2", lastTurnId: "t2" });
+    expect(await rewind(f.history, { requestId: "r1", throughMessageId: "msg_z1" })).toEqual({ ok: true });
+    const { rewinds } = await readHistoryLedgerEntries(stateDir, key);
+    expect(rewinds).toEqual([{ v: 1, kind: "rewind", requestId: "r1", sessionId: sid, fromMessageId: "msg_a", throughMessageId: "msg_z1", at: expect.any(Number) }]);
+    // Run readers skip the rewind line.
+    expect((await readHistoryLedger(stateDir, key)).map(run => run.runId)).toEqual(["run-msg_a", "run-msg_b"]);
+    // Later the Hub still thinks msg_a is live (that request ended failed there):
+    // the turn is gone, so the range ends where the rewind that removed it ended.
+    f.adapter.rewindSession.mockResolvedValue({ sessionId: sid, reverted: false });
+    expect(await rewind(f.history, { requestId: "r2", throughMessageId: "msg_z2" })).toEqual({ ok: true, throughMessageId: "msg_z1" });
+    // Gone without any record of how: nothing is marked.
+    expect(await rewind(f.history, { requestId: "r3", beforeMessageId: "msg_b", throughMessageId: "msg_z3" })).toEqual({ ok: false, error: "already_rewound" });
+    // A record from another session, or one without an edge, proves nothing.
+    await appendHistoryLedgerLine(stateDir, key, { v: 1, kind: "rewind", requestId: "x1", sessionId: "thr-other", fromMessageId: "msg_b", throughMessageId: "msg_z4", at: 1 });
+    expect(await rewind(f.history, { requestId: "r4", beforeMessageId: "msg_b" })).toEqual({ ok: false, error: "already_rewound" });
+    await appendHistoryLedgerLine(stateDir, key, { v: 1, kind: "rewind", requestId: "x2", sessionId: sid, fromMessageId: "msg_b", at: 2 });
+    expect(await rewind(f.history, { requestId: "r5", beforeMessageId: "msg_b" })).toEqual({ ok: false, error: "already_rewound" });
+  });
+
+  it("an unconfirmed engine call is no answer: the same request asks again and resolves through its record", async () => {
+    const f = fixture();
+    await bind(f.store, sid);
+    await ledger("msg_a", sid, { firstTurnId: "t1", lastTurnId: "t1" });
+    f.adapter.rewindSession.mockImplementationOnce(async (_sessionId: string, input: { beforeRevert?: () => Promise<void> }) => { await input.beforeRevert?.(); throw new EngineHistoryUnconfirmedError(); });
+    expect(await rewind(f.history, { requestId: "p1", throughMessageId: "msg_z" })).toEqual({ ok: false, error: "operation_pending" });
+    expect(f.closeSideSessions).not.toHaveBeenCalled();
+    // Not a stored success.
+    expect(await rewind(f.history, { requestId: "p1", throughMessageId: "msg_z", replayOnly: true })).toEqual({ ok: false, error: "history_changed" });
+    // The engine applied it late; the retry finds the turn gone and this request's own record.
+    f.adapter.rewindSession.mockResolvedValueOnce({ sessionId: sid, reverted: false });
+    expect(await rewind(f.create(), { requestId: "p1", throughMessageId: "msg_z" })).toEqual({ ok: true, throughMessageId: "msg_z" });
+    expect(f.adapter.rewindSession).toHaveBeenCalledTimes(2);
+    // Now a stored success.
+    expect(await rewind(f.history, { requestId: "p1", throughMessageId: "msg_z" })).toEqual({ ok: true, throughMessageId: "msg_z" });
+    expect(f.adapter.rewindSession).toHaveBeenCalledTimes(2);
   });
 
   it("refuses an earlier session's message, a run without an engine turn, and an unmatched older run", async () => {

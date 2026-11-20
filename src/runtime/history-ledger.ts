@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
-import { historyLedgerLineSchema, type HistoryLedgerLine } from "../client-protocol/history.js";
+import { historyLedgerLineSchema, historyLedgerRewindLineSchema, type HistoryLedgerLine, type HistoryLedgerRewindLine } from "../client-protocol/history.js";
 import { STATE_DIR_MODE, STATE_FILE_MODE } from "../state/state-permissions.js";
 
 /**
@@ -34,8 +34,8 @@ export function historyLedgerPath(stateDir: string, conversationKey: string): st
 /** Validates and appends one line; false instead of throwing. Each record is
  * written with a leading newline, so a torn final write (crash, full disk)
  * can only spoil its own line, never the next append. */
-export async function appendHistoryLedgerLine(stateDir: string, conversationKey: string, line: HistoryLedgerLine): Promise<boolean> {
-  const parsed = historyLedgerLineSchema.safeParse(line);
+export async function appendHistoryLedgerLine(stateDir: string, conversationKey: string, line: HistoryLedgerLine | HistoryLedgerRewindLine): Promise<boolean> {
+  const parsed = "kind" in line ? historyLedgerRewindLineSchema.safeParse(line) : historyLedgerLineSchema.safeParse(line);
   if (!parsed.success) return false;
   try {
     const file = historyLedgerPath(stateDir, conversationKey);
@@ -51,25 +51,52 @@ export async function appendHistoryLedgerLine(stateDir: string, conversationKey:
  * tail after a crash) are skipped. A missing file is an empty ledger; any other
  * read error is thrown, so a caller never mistakes it for "no record". */
 export async function readHistoryLedger(stateDir: string, conversationKey: string): Promise<HistoryLedgerRunRecord[]> {
+  return (await readHistoryLedgerEntries(stateDir, conversationKey)).runs;
+}
+
+/** Runs as readHistoryLedger, plus rewind lines in append order. */
+export async function readHistoryLedgerEntries(stateDir: string, conversationKey: string): Promise<{ runs: HistoryLedgerRunRecord[]; rewinds: HistoryLedgerRewindLine[] }> {
   let text: string;
   try { text = await readFile(historyLedgerPath(stateDir, conversationKey), "utf8"); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { runs: [], rewinds: [] };
     throw error;
   }
-  const runs = new Map<string, HistoryLedgerRunRecord>();
+  const runs = new Map<string, HistoryLedgerRunRecord>(), rewinds: HistoryLedgerRewindLine[] = [];
   for (const raw of text.split("\n")) {
     const trimmed = raw.trim();
     if (!trimmed) continue;
     let value: unknown;
     try { value = JSON.parse(trimmed); } catch { continue; }
+    if (value && typeof value === "object" && (value as { kind?: unknown }).kind === "rewind") {
+      const rewind = historyLedgerRewindLineSchema.safeParse(value);
+      if (rewind.success) rewinds.push(rewind.data);
+      continue;
+    }
     const parsed = historyLedgerLineSchema.safeParse(value);
     if (!parsed.success) continue;
     const existing = runs.get(parsed.data.runId);
     if (existing) existing.last = parsed.data;
     else runs.set(parsed.data.runId, { runId: parsed.data.runId, first: parsed.data, last: parsed.data });
   }
-  return [...runs.values()];
+  return { runs: [...runs.values()], rewinds };
+}
+
+/**
+ * The rewind that removed `fromMessageId`'s run from `sessionId`, when its
+ * turn is found gone: the last rewind line for exactly that anchor in that
+ * session. A line is written only while the anchor's turn is still present,
+ * so after an effective rewind no later line for it can exist; and if the
+ * last line's engine call did not land, a rewind from an earlier anchor
+ * removed the turn later, and with it everything up to that line's edge.
+ * Either way the edge never covers a turn that is still live.
+ */
+export function lastHistoryLedgerRewind(rewinds: readonly HistoryLedgerRewindLine[], fromMessageId: string, sessionId: string): HistoryLedgerRewindLine | undefined {
+  for (let index = rewinds.length - 1; index >= 0; index--) {
+    const rewind = rewinds[index]!;
+    if (rewind.fromMessageId === fromMessageId && rewind.sessionId === sessionId) return rewind;
+  }
+  return undefined;
 }
 
 /** The latest run started by this Hub message. */

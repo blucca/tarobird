@@ -182,7 +182,7 @@ export interface CoreBridgeLike {
   /** Throws a busy error instead of waiting when either lock is held. */
   withHistoryLocks?<T>(input: CoreHistoryScope, task: (session: { sessionId: string } | null) => Promise<T>): Promise<T>;
   historyCapability?(input: CoreHistoryScope & { sessionId?: string; workspaceOverride?: string }): Promise<{ rewind: "turn" | "none"; fork: "turn" | "head" | "none"; reason?: "legacy_history" | "external_session" | "unsupported" }>;
-  rewindHistory?(input: CoreHistoryScope & { sessionId: string; anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
+  rewindHistory?(input: CoreHistoryScope & { sessionId: string; anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal; beforeRevert?: () => Promise<void> }): Promise<{ sessionId: string; reverted: boolean }>;
   forkHistory?(input: CoreHistoryScope & { sessionId: string; through?: EngineHistoryAnchor; workspaceOverride?: string; appPlatformTools?: AppPlatformTools; abortSignal?: AbortSignal }): Promise<{ sessionId: string }>;
   resolveHistoryAnchor?(input: CoreHistoryScope & { sessionId: string; target: CoreHistoryRunHint; next?: CoreHistoryRunHint }): Promise<EngineHistoryAnchor | undefined>;
   bindForkedHistorySession?(input: CoreHistoryScope, sessionId: string, carry?: { resume: SessionRecord["resume"] }): Promise<void>;

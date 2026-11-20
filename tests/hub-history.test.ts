@@ -135,7 +135,7 @@ describe("rewind", () => {
     const pending = json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body));
     const call = await bot.next("instance.call", f => f.method === "history.rewind");
     // A rewind carries the next run too: an older run is never taken for the latest.
-    expect(call.params).toEqual({ conversationId: chat.id, userId: "owner", requestId: "r_1", beforeMessageId: seeded[1]!.input.id,
+    expect(call.params).toEqual({ conversationId: chat.id, userId: "owner", requestId: "r_1", beforeMessageId: seeded[1]!.input.id, throughMessageId: last,
       hints: { target: { sourceMessageId: seeded[1]!.input.id, text: "second", createdAt: seeded[1]!.input.createdAt, startedAt: seeded[1]!.input.createdAt + 10 },
         next: { sourceMessageId: seeded[2]!.input.id, text: "third", createdAt: seeded[2]!.input.createdAt, startedAt: seeded[2]!.input.createdAt + 10 } } });
     bot.reply(call, { ok: true });
@@ -215,6 +215,59 @@ describe("rewind", () => {
     expect((await interrupted).body).toMatchObject({ kind: "fork", state: "failed", error: "uncertain" });
     expect((await hub.store.conversations("owner")).map(c => c.id)).toEqual([chat.id]);
     expect((await hub.store.conversations("owner"))[0]!.history).toBeUndefined();
+  });
+});
+
+describe("rewind of an anchor the engine already dropped", () => {
+  it("bounds the range by the earlier rewind's edge, so turns chatted since stay live", async () => {
+    const { headers, chat, seeded, last } = await fixture();
+    const bot = await gateway();
+    const route = `/api/conversations/${chat.id}/history/rewind`;
+    // Recorded failed, although the engine did rewind (e.g. its check failed).
+    const one = json(api(headers, route, { botId: "alpha", requestId: "g_1", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last }));
+    bot.reply(await bot.next("instance.call", f => f.method === "history.rewind"), { ok: false, error: "engine_failed" });
+    expect((await one).body).toMatchObject({ state: "failed", error: "engine_failed" });
+    const [after] = await turns(chat.id, ["one more turn"]);
+    const two = json(api(headers, route, { botId: "alpha", requestId: "g_2", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: after!.reply.id }));
+    const call = await bot.next("instance.call", f => f.method === "history.rewind");
+    expect(call.params).toMatchObject({ requestId: "g_2", throughMessageId: after!.reply.id });
+    // The Gateway found the turn gone and its record of g_1 ending at `last`.
+    bot.reply(call, { ok: true, throughMessageId: last });
+    const done = (await two).body;
+    expect(done).toMatchObject({ state: "completed", rewind: { fromMessageId: seeded[1]!.input.id, throughMessageId: last } });
+    expect(after!.input.createdAt).toBeGreaterThan(done.rewind.throughCreatedAt);
+    expect((await hub.store.conversations("owner")).find(c => c.id === chat.id)?.history?.rewinds).toEqual([done.rewind]);
+    // The turn chatted afterwards can still be rewound.
+    const three = json(api(headers, route, { botId: "alpha", requestId: "g_3", beforeMessageId: after!.input.id, expectedLastMessageId: after!.reply.id }));
+    bot.reply(await bot.next("instance.call", f => f.method === "history.rewind"), { ok: true });
+    expect((await three).body).toMatchObject({ state: "completed", rewind: { fromMessageId: after!.input.id } });
+  });
+  it("marks nothing when the reported edge lies outside the operation's own range", async () => {
+    const { headers, chat, seeded, last } = await fixture();
+    const bot = await gateway();
+    const route = `/api/conversations/${chat.id}/history/rewind`;
+    const before = json(api(headers, route, { botId: "alpha", requestId: "e_1", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last }));
+    bot.reply(await bot.next("instance.call", f => f.method === "history.rewind"), { ok: true, throughMessageId: seeded[0]!.reply.id });
+    expect((await before).body).toMatchObject({ state: "failed", error: "already_rewound" });
+    const unknown = json(api(headers, route, { botId: "alpha", requestId: "e_2", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last }));
+    bot.reply(await bot.next("instance.call", f => f.method === "history.rewind"), { ok: true, throughMessageId: "msg_elsewhere" });
+    expect((await unknown).body).toMatchObject({ state: "failed", error: "already_rewound" });
+    expect((await hub.store.conversations("owner")).find(c => c.id === chat.id)?.history).toBeUndefined();
+  });
+  it("keeps an unconfirmed rewind started, holding dispatch, and asks again with the same request", async () => {
+    await hub.close(); await start({ ...fast, pendingResendMs: 100 });
+    const { headers, chat, seeded, last } = await fixture();
+    const bot = await gateway();
+    const pending = json(api(headers, `/api/conversations/${chat.id}/history/rewind`, { botId: "alpha", requestId: "p_1", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last }));
+    bot.reply(await bot.next("instance.call", f => f.method === "history.rewind"), { ok: false, error: "operation_pending" });
+    expect((await pending).body).toMatchObject({ requestId: "p_1", state: "started" });
+    const { message: held } = await hub.store.sendMessage("owner", { conversationId: chat.id, clientMsgId: "held_p", text: "meanwhile", attachments: [] });
+    const again = await bot.next("instance.call", f => f.method === "history.rewind");
+    expect(again.params).toMatchObject({ requestId: "p_1" });
+    expect(bot.frames.some(f => f.type === "instance.message" && f.message.id === held.id)).toBe(false);
+    bot.reply(again, { ok: true });
+    await until(async () => (await json(api(headers, `/api/conversations/${chat.id}/history/operations/p_1`))).body.state === "completed");
+    await bot.next("instance.message", f => f.message.id === held.id);
   });
 });
 

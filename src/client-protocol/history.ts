@@ -136,6 +136,10 @@ export const historyBotStatusSchema = historyStatusSchema.omit({ operation: true
 export const historyBotRewindCallSchema = z.object({
   conversationId: id, userId: id, requestId: id,
   beforeMessageId: id,
+  /** The range's right edge, fixed when the operation started. The Gateway
+   * records it with the rewind, so a later request that finds the anchor
+   * already gone can still say where that earlier rewind ended. */
+  throughMessageId: id.optional(),
   hints: historyHintsSchema.optional(),
   /** Retry of an expired rewind after later input already ran: answer this
    * request's stored success only, never execute. Executing now would also
@@ -151,10 +155,16 @@ export const historyBotForkCallSchema = z.object({
   hints: historyHintsSchema.optional(),
 }).strict();
 
-/** Gateway-only: a fork receipt left `running` by a crash. The Hub records it as `uncertain`. */
-export const historyBotErrorSchema = z.union([historyErrorSchema, z.literal("operation_interrupted")]);
+/** Gateway-only. `operation_interrupted`: a fork receipt left `running` by a
+ * crash; the Hub records it as `uncertain`. `operation_pending`: the engine
+ * has not confirmed a rewind either way (e.g. `thread/revert` timed out with
+ * the turn still listed); the Hub keeps the operation `started` and asks
+ * again with the same requestId. */
+export const historyBotErrorSchema = z.union([historyErrorSchema, z.literal("operation_interrupted"), z.literal("operation_pending")]);
 export const historyBotRewindReplySchema = z.discriminatedUnion("ok", [
-  z.object({ ok: z.literal(true), restarted: z.literal(true).optional() }).strict(),
+  /** `throughMessageId`: the anchor's turn was already gone (an earlier
+   * rewind of it landed); its range ends there, not at this request's edge. */
+  z.object({ ok: z.literal(true), restarted: z.literal(true).optional(), throughMessageId: id.optional() }).strict(),
   z.object({ ok: z.literal(false), error: historyBotErrorSchema }).strict(),
 ]);
 export const historyBotForkReplySchema = z.discriminatedUnion("ok", [
@@ -188,6 +198,22 @@ export const historyLedgerLineSchema = z.object({
   outcome: z.string().max(80).regex(/^(?:ok|failed:[a-z-]{1,60})$/).optional(),
 }).strict();
 export type HistoryLedgerLine = z.infer<typeof historyLedgerLineSchema>;
+
+/** A rewind about to be sent to the engine, appended to the same ledger file
+ * right before the engine call (and only when the anchor's turn is still
+ * there). Readers of run lines skip it. */
+export const historyLedgerRewindLineSchema = z.object({
+  v: z.literal(1),
+  kind: z.literal("rewind"),
+  requestId: id,
+  sessionId: z.string().min(1).max(200),
+  /** The anchor: its run and everything after it leave the session. */
+  fromMessageId: id,
+  /** The Hub's right edge for this rewind (`historyBotRewindCallSchema`). */
+  throughMessageId: id.optional(),
+  at,
+}).strict();
+export type HistoryLedgerRewindLine = z.infer<typeof historyLedgerRewindLineSchema>;
 
 /** On a failed run card's `extra` (outside strict `nativeRun`): the chat keeps
  * failing as an invalid request. `firstMessageId` is the suggested rewind point. */

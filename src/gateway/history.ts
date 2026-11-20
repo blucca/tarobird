@@ -5,14 +5,14 @@ import {
   historyBotStatusSchema, historyErrorSchema, type EngineHistoryAnchor, type HistoryError, type HistoryHints, type HistoryLedgerLine,
 } from "../client-protocol/history.js";
 import { idSchema, type Json } from "../client-protocol/index.js";
-import type { AppPlatformTools } from "../codex/adapter.js";
+import { EngineHistoryUnconfirmedError, type AppPlatformTools } from "../codex/adapter.js";
 import { buildCoreConversationKey, stableCoreNumericId } from "../core/message-normalizer.js";
 import type { CoreServiceRuntime } from "../core/runtime.js";
 import type { CoreBridgeLike, CoreHistoryRunHint, CoreHistoryScope } from "../core/types.js";
 import { HistoryOperationBusyError } from "../runtime/bridge.js";
 import { getConversationKey } from "../runtime/conversation-key.js";
 import { resolveConversationResume } from "../runtime/conversation-resume.js";
-import { appendHistoryLedgerLine, findHistoryLedgerRun, historyLedgerSinceMessageId, readHistoryLedger } from "../runtime/history-ledger.js";
+import { appendHistoryLedgerLine, findHistoryLedgerRun, historyLedgerSinceMessageId, lastHistoryLedgerRewind, readHistoryLedger, readHistoryLedgerEntries } from "../runtime/history-ledger.js";
 import { loadInstanceConfig, resolveInstanceWorkspacePath } from "../state/instance-config.js";
 import { SessionStore } from "../state/session-store.js";
 import type { SessionRecord } from "../types.js";
@@ -182,12 +182,31 @@ export function gatewayHistory(options: GatewayHistoryOptions) {
         if (capability.rewind !== "turn" || ctx.shared(session.sessionId)) refuse("unsupported");
         if (await goalActive(ctx.scope, ctx.workspaceOverride)) refuse("goal_active");
         const anchor = await resolveAnchor({ scope: ctx.scope, sessionId: session.sessionId, messageId: call.beforeMessageId, hints: call.hints, engine: ctx.cfg.engine, rewind: true });
-        await bridge.rewindHistory!({ ...ctx.scope, sessionId: session.sessionId, anchor, workspaceOverride: ctx.workspaceOverride });
+        // Recorded while the anchor's turn is known present, before the engine
+        // changes: a later request that finds it gone learns where it ended.
+        const record = { v: 1 as const, kind: "rewind" as const, requestId: call.requestId, sessionId: session.sessionId, fromMessageId: call.beforeMessageId,
+          ...(call.throughMessageId ? { throughMessageId: call.throughMessageId } : {}) };
+        const beforeRevert = async () => {
+          if (!await appendHistoryLedgerLine(stateDir, ctx.scope.conversationKey, { ...record, at: Date.now() })) refuse("engine_failed");
+        };
+        const result = await bridge.rewindHistory!({ ...ctx.scope, sessionId: session.sessionId, anchor, workspaceOverride: ctx.workspaceOverride, beforeRevert });
         // Side handles were forked from the history that is gone.
         await options.closeSideSessions?.(call.conversationId).catch(() => undefined);
-        return { ok: true as const };
+        if (result.reverted) return { ok: true as const };
+        // Gone before this call. Turns chatted since that earlier rewind are
+        // live: its own edge bounds the range, never this request's. Without a
+        // record nothing proves where it ended, so nothing is marked.
+        let rewinds: Awaited<ReturnType<typeof readHistoryLedgerEntries>>["rewinds"];
+        try { ({ rewinds } = await readHistoryLedgerEntries(stateDir, ctx.scope.conversationKey)); }
+        catch { return refuse("engine_failed"); }
+        const earlier = lastHistoryLedgerRewind(rewinds, call.beforeMessageId, session.sessionId);
+        return earlier?.throughMessageId ? { ok: true as const, throughMessageId: earlier.throughMessageId } : refuse("already_rewound");
       });
-    } catch (error) { return { ok: false, error: historyErrorCode(error) }; }
+    } catch (error) {
+      // Not an answer: the receipt stays retryable and the Hub asks again.
+      if (error instanceof EngineHistoryUnconfirmedError) throw error;
+      return { ok: false, error: historyErrorCode(error) };
+    }
   };
 
   const executeFork = async (call: z.infer<typeof historyBotForkCallSchema>): Promise<z.infer<typeof historyBotForkReplySchema>> => {
@@ -236,7 +255,9 @@ export function gatewayHistory(options: GatewayHistoryOptions) {
         return reply?.ok ? reply : { ok: false, error: "history_changed" };
       }
       const receipt = await receipts.run(key, async () => ({ ...identity, reply: await executeRewind(call) }), REWIND_RECEIPT_RETRY_MS);
-      if (!receipt.ok) return { ok: false, error: receipt.error === "operation_interrupted" ? "operation_interrupted" : "engine_failed" };
+      // executeRewind answers every outcome; only an unconfirmed engine call
+      // throws, leaving the receipt open for the same request's next call.
+      if (!receipt.ok) return { ok: false, error: receipt.error === "operation_interrupted" ? "operation_interrupted" : "operation_pending" };
       return storedReply(receipt.result) ?? { ok: false, error: "engine_failed" };
     }
     if (method === "history.fork") {

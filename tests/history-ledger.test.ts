@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  HISTORY_LEDGER_UNBOUND_SESSION, HistoryLedgerRun, appendHistoryLedgerLine, findHistoryLedgerRun, historyLedgerPath, historyLedgerSinceMessageId, readHistoryLedger,
+  HISTORY_LEDGER_UNBOUND_SESSION, HistoryLedgerRun, appendHistoryLedgerLine, findHistoryLedgerRun, historyLedgerPath, historyLedgerSinceMessageId, lastHistoryLedgerRewind,
+  readHistoryLedger, readHistoryLedgerEntries,
 } from "../src/runtime/history-ledger.js";
 
 // Synthetic ids only.
@@ -92,6 +93,27 @@ describe("history ledger (#53)", () => {
     expect(historyLedgerSinceMessageId(runs, "thr-1")).toBe("msg_1");
     expect(historyLedgerSinceMessageId(runs, "thr-2")).toBe("msg_3");
     expect(historyLedgerSinceMessageId(runs, "thr-bound-from-elsewhere")).toBeUndefined();
+  });
+
+  it("keeps rewind lines apart from runs; the last one for an anchor in a session wins", async () => {
+    const run = new HistoryLedgerRun({ stateDir, conversationKey: KEY, sourceMessageId: "msg_a", engine: "codex", runId: "run-a" });
+    await run.start("thr-1"); await run.anchor({ sessionId: "thr-1", turnId: "t1" }); await run.finish("ok");
+    const rewind = (requestId: string, sessionId: string, fromMessageId: string, throughMessageId?: string) =>
+      appendHistoryLedgerLine(stateDir, KEY, { v: 1, kind: "rewind", requestId, sessionId, fromMessageId, ...(throughMessageId ? { throughMessageId } : {}), at: 5 });
+    expect(await rewind("r1", "thr-1", "msg_a", "msg_z1")).toBe(true);
+    expect(await rewind("r2", "thr-1", "msg_a", "msg_z2")).toBe(true);
+    expect(await rewind("r3", "thr-2", "msg_a", "msg_z3")).toBe(true);
+    expect(await rewind("r4", "thr-1", "msg_b")).toBe(true);
+    expect(await appendHistoryLedgerLine(stateDir, KEY, { v: 1, kind: "rewind", requestId: "bad id", sessionId: "thr-1", fromMessageId: "msg_a", at: 1 })).toBe(false);
+    // Older readers see runs only.
+    expect((await readHistoryLedger(stateDir, KEY)).map(entry => entry.runId)).toEqual(["run-a"]);
+    const { runs, rewinds } = await readHistoryLedgerEntries(stateDir, KEY);
+    expect(runs.map(entry => entry.runId)).toEqual(["run-a"]);
+    expect(rewinds.map(entry => entry.requestId)).toEqual(["r1", "r2", "r3", "r4"]);
+    expect(lastHistoryLedgerRewind(rewinds, "msg_a", "thr-1")?.throughMessageId).toBe("msg_z2");
+    expect(lastHistoryLedgerRewind(rewinds, "msg_a", "thr-2")?.throughMessageId).toBe("msg_z3");
+    expect(lastHistoryLedgerRewind(rewinds, "msg_b", "thr-1")?.throughMessageId).toBeUndefined();
+    expect(lastHistoryLedgerRewind(rewinds, "msg_c", "thr-1")).toBeUndefined();
   });
 
   it("writes nothing for a run that never started", async () => {

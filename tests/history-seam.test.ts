@@ -11,13 +11,13 @@ import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HISTORY_CAPABILITY, type EngineHistoryAnchor } from "../src/client-protocol/history.js";
 import type { Block, Message } from "../src/client-protocol/index.js";
-import type { CodexAdapter } from "../src/codex/adapter.js";
+import { EngineHistoryUnconfirmedError, type CodexAdapter } from "../src/codex/adapter.js";
 import { resolveCodexHistoryAnchor, type CodexHistoryTurn } from "../src/codex/app-server-adapter.js";
 import { buildCoreConversationKey, stableCoreNumericId } from "../src/core/message-normalizer.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import { gatewayHistory } from "../src/gateway/history.js";
 import { hashSecret } from "../src/hub/auth.js";
-import { HubServer } from "../src/hub/server.js";
+import { HubServer, type HubServerOptions } from "../src/hub/server.js";
 import { Bridge, type AccessStoreLike } from "../src/runtime/bridge.js";
 import { findHistoryLedgerRun, readHistoryLedger } from "../src/runtime/history-ledger.js";
 import { SessionManager } from "../src/runtime/session-manager.js";
@@ -33,12 +33,15 @@ const SID = "thr-seam";
 class FakeThread {
   turns: CodexHistoryTurn[] = [];
   rewindError: string | undefined;
+  /** Thrown after the change was applied: an answer that does not tell. */
+  afterRevert: Error[] = [];
+  created = 0;
   add(id: string, startedAtMs: number, text: string) { this.turns.push({ id, startedAt: Math.floor(startedAtMs / 1000), userMessage: true, clientId: null, text: `[host guidance]\n${text}` }); }
   has(id: string) { return this.turns.some(turn => turn.id === id); }
 }
 
 let hubDir: string, gwDir: string, hub: HubServer, secret: string, socket: WebSocket | undefined;
-async function start(timings = { rewindMs: 2000, forkMs: 2000, statusMs: 2000, unknownAfterMs: 60_000 }) { hub = await HubServer.start({ stateDir: hubDir, historyTimings: timings }); }
+async function start(timings: HubServerOptions["historyTimings"] = { rewindMs: 2000, forkMs: 2000, statusMs: 2000, unknownAfterMs: 60_000 }) { hub = await HubServer.start({ stateDir: hubDir, historyTimings: timings }); }
 beforeEach(async () => {
   hubDir = await mkdtemp(path.join(os.tmpdir(), "history-seam-hub-"));
   gwDir = await mkdtemp(path.join(os.tmpdir(), "history-seam-gw-"));
@@ -56,11 +59,17 @@ async function gateway(conversationId: string, thread: FakeThread) {
     historyCapability: vi.fn(async () => ({ rewind: "turn", fork: "turn" })),
     getThreadGoal: vi.fn(async () => ({ goal: null })),
     resolveHistoryAnchor: vi.fn(async (_sid: string, input: Parameters<typeof resolveCodexHistoryAnchor>[1]) => resolveCodexHistoryAnchor(thread.turns, input)),
-    rewindSession: vi.fn(async (sessionId: string, input: { anchor: EngineHistoryAnchor }) => {
-      if (thread.rewindError) throw new Error(thread.rewindError);
+    // The adapter's contract: gone already → reverted: false, no record;
+    // otherwise the caller's record, then the engine change.
+    rewindSession: vi.fn(async (sessionId: string, input: { anchor: EngineHistoryAnchor; beforeRevert?: () => Promise<void> }) => {
       const index = thread.turns.findIndex(turn => turn.id === input.anchor.firstTurnId);
-      if (index >= 0) thread.turns.splice(index);
-      return { sessionId };
+      if (index < 0) return { sessionId, reverted: false };
+      await input.beforeRevert?.();
+      if (thread.rewindError) throw new Error(thread.rewindError);
+      thread.turns.splice(index);
+      const after = thread.afterRevert.shift();
+      if (after) throw after;
+      return { sessionId, reverted: true };
     }),
     forkSession: vi.fn(async () => ({ sessionId: "thr-forked" })),
   } as unknown as CodexAdapter & Record<"resolveHistoryAnchor" | "rewindSession" | "forkSession", ReturnType<typeof vi.fn>>;
@@ -103,7 +112,8 @@ async function turns(conversationId: string, thread: FakeThread, texts: string[]
     const at = clock += 60_000; await hub.store.db.run("UPDATE messages SET created_at=? WHERE id=?", [at, input.id]);
     const reply = await hub.store.publishBotMessage("alpha", { conversationId, blocks: [runCard(at + 1000)], replyTo: input.id });
     await hub.store.db.run("UPDATE messages SET created_at=? WHERE id=?", [clock += 5000, reply.id]);
-    const turnId = `t${thread.turns.length + 1}`;
+    // Turn ids are never reused, also after a rewind.
+    const turnId = `t${++thread.created}`;
     thread.add(turnId, at + 2000, text);
     result.push({ input: { ...input, createdAt: at }, reply: { ...reply, createdAt: clock }, turnId });
   }
@@ -162,5 +172,36 @@ describe("Hub calls answered by the real Gateway handler (#53)", () => {
     expect(later!.input.createdAt).toBeGreaterThan(retried.body.rewind.throughCreatedAt);
     expect(gw.adapter.rewindSession).toHaveBeenCalledTimes(1);
     expect(thread.has(later!.turnId)).toBe(true);
+  });
+
+  it("a rewind recorded failed although the engine applied it: a new request marks only what it removed", async () => {
+    const { headers, chat, thread, seeded } = await fixture(["first question", "second question", "third question"]);
+    const gw = await gateway(chat.id, thread);
+    const first = await lastId(chat.id);
+    // The engine reverted; the check after it failed.
+    thread.afterRevert.push(new Error("socket closed"));
+    const one = await post(headers, `/api/conversations/${chat.id}/history/rewind`, { botId: "alpha", requestId: "s_b1", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: first });
+    expect(one.body).toMatchObject({ state: "failed", error: "engine_failed" });
+    expect(thread.turns.map(turn => turn.id)).toEqual(["t1"]);
+    const [later] = await turns(chat.id, thread, ["kept chatting"]);
+    const two = await post(headers, `/api/conversations/${chat.id}/history/rewind`, { botId: "alpha", requestId: "s_b2", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: await lastId(chat.id) });
+    expect(two.body).toMatchObject({ state: "completed", rewind: { fromMessageId: seeded[1]!.input.id, throughMessageId: first } });
+    expect(later!.input.createdAt).toBeGreaterThan(two.body.rewind.throughCreatedAt);
+    expect(thread.has(later!.turnId)).toBe(true);
+    expect(gw.calls.map(call => call.result)).toEqual([{ ok: false, error: "engine_failed" }, { ok: true, throughMessageId: first }]);
+  });
+  it("a rewind the engine left unconfirmed stays started and resolves on the next ask", async () => {
+    await hub.close(); await start({ rewindMs: 2000, forkMs: 2000, statusMs: 2000, unknownAfterMs: 60_000, pendingResendMs: 50 });
+    const { headers, chat, thread, seeded } = await fixture(["first question", "second question", "third question"]);
+    const gw = await gateway(chat.id, thread);
+    const last = await lastId(chat.id);
+    // The engine call timed out; the change landed afterwards.
+    thread.afterRevert.push(new EngineHistoryUnconfirmedError());
+    const body = { botId: "alpha", requestId: "s_p", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last };
+    const first = await post(headers, `/api/conversations/${chat.id}/history/rewind`, body);
+    expect(first.body.state === "started" || first.body.state === "completed").toBe(true);
+    await vi.waitFor(async () => expect((await (await fetch(`${hub.url}/api/conversations/${chat.id}/history/operations/s_p`, { headers })).json() as any)).toMatchObject({ state: "completed", rewind: { throughMessageId: last } }));
+    expect(gw.calls.map(call => call.result)).toEqual([{ ok: false, error: "operation_pending" }, { ok: true, throughMessageId: last }]);
+    expect(gw.adapter.rewindSession).toHaveBeenCalledTimes(2);
   });
 });

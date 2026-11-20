@@ -940,9 +940,10 @@ export class Bridge {
   }
 
   /** Call inside withHistoryLocks with the session it supplied. */
-  async rewindHistory(input: HistoryScopeInput & { sessionId: string; anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal }): Promise<{ sessionId: string }> {
+  async rewindHistory(input: HistoryScopeInput & { sessionId: string; anchor: EngineHistoryAnchor; workspaceOverride?: string; abortSignal?: AbortSignal; beforeRevert?: () => Promise<void> }): Promise<{ sessionId: string; reverted: boolean }> {
     if (!this.adapter.rewindSession || (await this.checkAccess(input)).kind !== "allow") throw new Error("unsupported");
-    return await this.adapter.rewindSession(input.sessionId, { anchor: input.anchor, workspaceOverride: input.workspaceOverride, abortSignal: input.abortSignal });
+    return await this.adapter.rewindSession(input.sessionId, { anchor: input.anchor, workspaceOverride: input.workspaceOverride, abortSignal: input.abortSignal,
+      ...(input.beforeRevert ? { beforeRevert: input.beforeRevert } : {}) });
   }
 
   /** Call inside withHistoryLocks with the session it supplied. */

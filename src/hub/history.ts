@@ -3,7 +3,7 @@ import { z } from "zod";
 import { blocksText, type Conversation, type Json, type Message } from "../client-protocol/index.js";
 import {
   HISTORY_FORK_CALL_MS, HISTORY_FORK_EXCERPT_MAX, HISTORY_REWIND_CALL_MS, HISTORY_UNKNOWN_AFTER_MS,
-  historyBotForkCallSchema, historyBotForkReplySchema, historyBotRewindCallSchema, historyBotRewindReplySchema,
+  historyBotErrorSchema, historyBotForkCallSchema, historyBotForkReplySchema, historyBotRewindCallSchema, historyBotRewindReplySchema,
   historyBotStatusCallSchema, historyBotStatusSchema, historyForkSchema, historyRewindSchema, historyStatusSchema,
   type ForkOrigin, type HistoryError, type HistoryForkRequest, type HistoryHints, type HistoryOperation, type HistoryRewindRequest, type HistoryStatus,
 } from "../client-protocol/history.js";
@@ -32,7 +32,12 @@ export type HistoryHooks = {
   warn(code: string): void;
 };
 /** Internal overrides for isolated tests. */
-export type HistoryTimings = { rewindMs?: number; forkMs?: number; statusMs?: number; unknownAfterMs?: number };
+export type HistoryTimings = { rewindMs?: number; forkMs?: number; statusMs?: number; unknownAfterMs?: number; pendingResendMs?: number };
+/** Wait before asking again about a rewind the engine had not confirmed. */
+const PENDING_RESEND_MS = 5_000;
+/** Gateway-only codes as the Hub records them. */
+const hubError = (error: z.infer<typeof historyBotErrorSchema>): HistoryError =>
+  error === "operation_interrupted" ? "uncertain" : error === "operation_pending" ? "engine_failed" : error;
 
 /** At most `max` UTF-16 units without splitting a surrogate pair. */
 function clip(text: string, max: number): string {
@@ -56,9 +61,11 @@ export class HubHistory {
   private readonly inflight = new Map<string, Promise<void>>();
   /** Started operations of this process and when they become `unknown`. */
   private readonly deadlines = new Map<string, number>();
+  /** Started operations whose engine call was unconfirmed: when to ask again. */
+  private readonly resendAt = new Map<string, number>();
   private readonly timings: Required<HistoryTimings>;
   constructor(private readonly store: HubStore, private readonly auth: HubAuth, private readonly hooks: HistoryHooks, timings: HistoryTimings = {}) {
-    this.timings = { rewindMs: HISTORY_REWIND_CALL_MS, forkMs: HISTORY_FORK_CALL_MS, statusMs: STATUS_CALL_MS, unknownAfterMs: HISTORY_UNKNOWN_AFTER_MS, ...timings };
+    this.timings = { rewindMs: HISTORY_REWIND_CALL_MS, forkMs: HISTORY_FORK_CALL_MS, statusMs: STATUS_CALL_MS, unknownAfterMs: HISTORY_UNKNOWN_AFTER_MS, pendingResendMs: PENDING_RESEND_MS, ...timings };
   }
   private get db() { return this.store.db; }
 
@@ -75,8 +82,13 @@ export class HubHistory {
     const rows = await this.db.serial(() => this.db.all<{ id: string }>("SELECT id FROM conversation_history_ops WHERE state='started' AND bot_id=?", [botId]));
     await Promise.all(rows.map(row => this.send(row.id)));
   }
-  /** Releases operations that never got an answer. */
+  /** Asks again where the engine had not decided; releases operations that never got an answer. */
   async sweep(now = Date.now()): Promise<void> {
+    for (const [id, at] of [...this.resendAt]) {
+      if (now < at) continue;
+      this.resendAt.delete(id);
+      if (!this.hooks.stopping()) this.hooks.track(this.send(id));
+    }
     for (const [id, deadline] of [...this.deadlines]) {
       if (now < deadline) continue;
       const row = await this.row(id);
@@ -236,12 +248,14 @@ export class HubHistory {
       // No stored success: the user confirms again against today's history.
       if (replayOnly && !(reply.success && reply.data.ok)) await this.finish(row, "failed", "history_changed");
       else if (!reply.success) await this.finish(row, "failed", "engine_failed");
-      else if (!reply.data.ok) await this.finish(row, "failed", reply.data.error === "operation_interrupted" ? "uncertain" : reply.data.error);
-      else await this.completeRewind(row, reply.data.restarted === true);
+      // The engine has not decided yet: no outcome, the row stays `started`.
+      else if (!reply.data.ok && reply.data.error === "operation_pending") this.resendAt.set(row.id, Date.now() + this.timings.pendingResendMs);
+      else if (!reply.data.ok) await this.finish(row, "failed", hubError(reply.data.error));
+      else await this.completeRewind(row, { restarted: reply.data.restarted === true, ...(reply.data.throughMessageId ? { throughMessageId: reply.data.throughMessageId } : {}) });
     } else {
       const reply = historyBotForkReplySchema.safeParse(raw);
       if (!reply.success) await this.finish(row, "failed", "engine_failed");
-      else if (!reply.data.ok) await this.finish(row, "failed", reply.data.error === "operation_interrupted" ? "uncertain" : reply.data.error);
+      else if (!reply.data.ok) await this.finish(row, "failed", hubError(reply.data.error));
       else await this.completeFork(row, reply.data.mode);
     }
     return false;
@@ -256,7 +270,8 @@ export class HubHistory {
       const hints = target ? await this.hints(target, row.bot_id) : undefined;
       if (row.kind === "rewind") {
         const replayOnly = await this.ranSinceThroughInTransaction(row);
-        return { replayOnly, params: historyBotRewindCallSchema.parse({ ...base, beforeMessageId: row.anchor_message_id, ...(hints ? { hints } : {}), ...(replayOnly ? { replayOnly: true } : {}) }) };
+        return { replayOnly, params: historyBotRewindCallSchema.parse({ ...base, beforeMessageId: row.anchor_message_id, ...(row.through_message_id ? { throughMessageId: row.through_message_id } : {}),
+          ...(hints ? { hints } : {}), ...(replayOnly ? { replayOnly: true } : {}) }) };
       }
       return { replayOnly: false, params: historyBotForkCallSchema.parse({ ...base, targetConversationId: row.target_conversation_id, ...(target ? { throughMessageId: target.id, hints } : {}) }) };
     });
@@ -307,14 +322,28 @@ export class HubHistory {
     }
     return undefined;
   }
-  private async completeRewind(row: HistoryOpRow, restarted: boolean): Promise<void> {
-    const conversation = await this.db.transaction(async () => {
-      const changed = await this.db.run("UPDATE conversation_history_ops SET state='completed',error=NULL,result_json=?,updated_at=? WHERE id=? AND state IN ('started','unknown')", [restarted ? JSON.stringify({ restarted: true }) : null, Date.now(), row.id]);
-      return changed.changes ? this.store.conversationInTransaction(row.conversation_id) : undefined;
+  /** `throughMessageId`: the anchor was already gone and an earlier rewind
+   * of it ended there (Gateway ledger); it bounds the range instead of this
+   * operation's own edge, so turns chatted since stay unmarked. */
+  private async completeRewind(row: HistoryOpRow, reply: { restarted: boolean; throughMessageId?: string }): Promise<void> {
+    const done = await this.db.transaction(async () => {
+      const current = await this.db.get<HistoryOpRow>("SELECT * FROM conversation_history_ops WHERE id=?", [row.id]);
+      if (!current || (current.state !== "started" && current.state !== "unknown")) return undefined;
+      let through = { id: current.through_message_id, at: current.through_created_at };
+      if (reply.throughMessageId && reply.throughMessageId !== current.through_message_id) {
+        const edge = await this.db.get<{ id: string; created_at: number }>("SELECT id,created_at FROM messages WHERE id=? AND conversation_id=?", [reply.throughMessageId, current.conversation_id]);
+        // An edge outside [anchor, this operation's edge] proves nothing; mark nothing.
+        if (!edge || current.anchor_created_at === null || current.through_created_at === null || edge.created_at < current.anchor_created_at || edge.created_at > current.through_created_at) return "refused" as const;
+        through = { id: edge.id, at: edge.created_at };
+      }
+      await this.db.run("UPDATE conversation_history_ops SET state='completed',error=NULL,result_json=?,through_message_id=?,through_created_at=?,updated_at=? WHERE id=?",
+        [reply.restarted ? JSON.stringify({ restarted: true }) : null, through.id, through.at, Date.now(), current.id]);
+      return { conversation: await this.store.conversationInTransaction(row.conversation_id) };
     });
-    if (!conversation) return;
+    if (!done) return;
+    if (done === "refused") { await this.finish(row, "failed", "already_rewound"); return; }
     this.ended(row, "completed");
-    this.hooks.conversationChanged(conversation);
+    this.hooks.conversationChanged(done.conversation);
   }
   private async completeFork(row: HistoryOpRow, mode: ForkOrigin["mode"]): Promise<void> {
     let created: { userId: string; conversation: Conversation } | undefined;
@@ -345,7 +374,7 @@ export class HubHistory {
     if (changed.changes) this.ended(row, state, error);
   }
   private ended(row: HistoryOpRow, state: HistoryOpRow["state"], error?: HistoryError): void {
-    this.deadlines.delete(row.id);
+    this.deadlines.delete(row.id); this.resendAt.delete(row.id);
     // Identifiers and outcome only; never message content.
     void this.store.audit("history.operation", row.user_id, { opId: row.id, kind: row.kind, conversationId: row.conversation_id, botId: row.bot_id, state, ...(error ? { error } : {}) }).catch(() => undefined);
     this.hooks.released(row.bot_id);

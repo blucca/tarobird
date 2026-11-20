@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import type { AppPlatformTools, EngineStreamEvent } from "../src/codex/adapter.js";
+import { EngineHistoryUnconfirmedError } from "../src/codex/adapter.js";
 import { CodexAppServerAdapter, readCodexHistoryTurn, resolveCodexHistoryAnchor, type CodexHistoryTurn } from "../src/codex/app-server-adapter.js";
 
 // Scripted app-server peer; no Codex process, synthetic ids and text only.
@@ -16,6 +17,12 @@ class FakeChild extends EventEmitter {
 async function waitFor(condition: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt++) { if (condition()) return; await new Promise((resolve) => setTimeout(resolve, 0)); }
   throw new Error("Condition was not met in time");
+}
+/** For requests that come only after a real timer (a call timeout). */
+async function respondSlow(respond: () => Promise<void>): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await respond(); } catch (error) { if (attempt >= 100) throw error; await new Promise((resolve) => setTimeout(resolve, 20)); }
+  }
 }
 type Frame = { id?: number | string; method?: string; params?: Record<string, unknown> };
 function harness() {
@@ -131,7 +138,7 @@ describe("Codex history: rewind", () => {
       await h.respond("thread/turns/list", page(turn("t3", 30), turn("t2", 20), turn("t1", 10)));
       await h.respond("thread/revert", { thread: { id: "thr-1", ...OURS, turns: [] }, turnsBackwardsCursor: null, itemsBackwardsCursor: null });
       await h.respond("thread/turns/list", page(turn("t1", 10)), 2);
-      await expect(rewind).resolves.toEqual({ sessionId: "thr-1" });
+      await expect(rewind).resolves.toEqual({ sessionId: "thr-1", reverted: true });
       expect(h.frames().filter(frame => frame.method).map(frame => frame.method)).toEqual(["initialize", "thread/resume", "thread/turns/list", "thread/revert", "thread/turns/list"]);
       expect(h.requests("thread/turns/list")[0]!.params).toEqual({ threadId: "thr-1", sortDirection: "desc", limit: 50 });
       expect(h.requests("thread/revert")[0]!.params).toEqual({ threadId: "thr-1", beforeTurnId: "t2" });
@@ -142,7 +149,8 @@ describe("Codex history: rewind", () => {
     try {
       const { rewind } = await loaded(h, "t2");
       await h.respond("thread/turns/list", page(turn("t5", 50), turn("t4", 40), turn("t1", 10)));
-      await expect(rewind).resolves.toEqual({ sessionId: "thr-1" });
+      // Reported as not reverted now: where that earlier rewind ended is the caller's record.
+      await expect(rewind).resolves.toEqual({ sessionId: "thr-1", reverted: false });
       expect(h.requests("thread/revert")).toHaveLength(0);
     } finally { h.adapter.destroy(); }
   });
@@ -154,7 +162,7 @@ describe("Codex history: rewind", () => {
       await h.respond("thread/turns/list", page(turn("t1", 10)), 2);
       await h.respond("thread/revert", { thread: { id: "thr-1", ...OURS } });
       await h.respond("thread/turns/list", page(), 3);
-      await expect(rewind).resolves.toEqual({ sessionId: "thr-1" });
+      await expect(rewind).resolves.toEqual({ sessionId: "thr-1", reverted: true });
       expect(h.requests("thread/turns/list")[1]!.params).toMatchObject({ cursor: "c1" });
       expect(h.requests("thread/revert")[0]!.params).toEqual({ threadId: "thr-1", beforeTurnId: "t1" });
     } finally { h.adapter.destroy(); }
@@ -172,8 +180,64 @@ describe("Codex history: rewind", () => {
       await h.respond("thread/turns/list", page(turn("t2", 20), turn("t1", 10)), 3);
       await h.fail("thread/revert", "connection reset", -32000, 2);
       await h.respond("thread/turns/list", page(turn("t1", 10)), 4);
-      await expect(lost).resolves.toEqual({ sessionId: "thr-1" });
+      await expect(lost).resolves.toEqual({ sessionId: "thr-1", reverted: true });
     } finally { h.adapter.destroy(); }
+  });
+  it("runs the caller's record only once the turn is known present, and before the revert", async () => {
+    const h = harness();
+    try {
+      const order: string[] = [];
+      const rewind = h.adapter.rewindSession("thr-1", { anchor: { firstTurnId: "t2" }, beforeRevert: async () => { order.push(`record:${h.requests("thread/revert").length}`); } });
+      await h.respond("initialize", {});
+      await h.respond("thread/resume", { thread: { id: "thr-1", ...OURS } });
+      await h.respond("thread/turns/list", page(turn("t2", 20), turn("t1", 10)));
+      await h.respond("thread/revert", { thread: { id: "thr-1", ...OURS } });
+      await h.respond("thread/turns/list", page(turn("t1", 10)), 2);
+      await expect(rewind).resolves.toEqual({ sessionId: "thr-1", reverted: true });
+      expect(order).toEqual(["record:0"]);
+      // Already gone: no record, no revert.
+      const gone = h.adapter.rewindSession("thr-1", { anchor: { firstTurnId: "t2" }, beforeRevert: async () => { order.push("again"); } });
+      await h.respond("thread/turns/list", page(turn("t1", 10)), 3);
+      await expect(gone).resolves.toEqual({ sessionId: "thr-1", reverted: false });
+      // A record that cannot be written stops the revert.
+      const refused = h.adapter.rewindSession("thr-1", { anchor: { firstTurnId: "t1" }, beforeRevert: async () => { throw new Error("engine_failed"); } });
+      await h.respond("thread/turns/list", page(turn("t1", 10)), 4);
+      await expect(refused).rejects.toThrow("engine_failed");
+      expect(order).toEqual(["record:0"]);
+      expect(h.requests("thread/revert")).toHaveLength(1);
+    } finally { h.adapter.destroy(); }
+  });
+  it("leaves a timed-out revert unconfirmed after looking again, and accepts one that landed late", async () => {
+    const children: FakeChild[] = [];
+    // A short engine call limit and immediate second looks; synthetic only.
+    const adapter = new CodexAppServerAdapter("codex", "/tmp/history-fixture", (() => { const child = new FakeChild(); children.push(child); return child; }) as never,
+      undefined, undefined, undefined, undefined, undefined, undefined, 400, { historyRevertRecheckDelaysMs: [1, 1] });
+    const frames = () => (children.at(-1)?.stdin.lines ?? []).map((line) => JSON.parse(line) as Frame);
+    const requests = (method: string) => frames().filter((frame) => frame.method === method);
+    const respond = async (method: string, result: unknown, nth = 1) => {
+      await waitFor(() => requests(method).length >= nth);
+      children.at(-1)!.stdout.emitData(JSON.stringify({ id: requests(method)[nth - 1]!.id, result }) + "\n");
+    };
+    try {
+      const stuck = adapter.rewindSession("thr-1", { anchor: { firstTurnId: "t2" } });
+      stuck.catch(() => undefined);
+      await respond("initialize", {});
+      await respond("thread/resume", { thread: { id: "thr-1", ...OURS } });
+      await respond("thread/turns/list", page(turn("t2", 20), turn("t1", 10)));
+      await waitFor(() => requests("thread/revert").length === 1);
+      // No answer to thread/revert; every later look still lists the turn.
+      for (let nth = 2; nth <= 4; nth++) await respondSlow(() => respond("thread/turns/list", page(turn("t2", 20), turn("t1", 10)), nth));
+      await expect(stuck).rejects.toBeInstanceOf(EngineHistoryUnconfirmedError);
+      expect(requests("thread/turns/list")).toHaveLength(4);
+
+      const late = adapter.rewindSession("thr-1", { anchor: { firstTurnId: "t2" } });
+      await respond("thread/turns/list", page(turn("t2", 20), turn("t1", 10)), 5);
+      await waitFor(() => requests("thread/revert").length === 2);
+      await respondSlow(() => respond("thread/turns/list", page(turn("t2", 20), turn("t1", 10)), 6));
+      // The second look finds it gone: the revert landed after its timeout.
+      await respondSlow(() => respond("thread/turns/list", page(turn("t1", 10)), 7));
+      await expect(late).resolves.toEqual({ sessionId: "thr-1", reverted: true });
+    } finally { adapter.destroy(); }
   });
   it("refuses a thread created by another client without listing or reverting", async () => {
     const h = harness();
