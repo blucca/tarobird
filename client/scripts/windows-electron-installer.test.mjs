@@ -134,7 +134,7 @@ test('makensis compiles the installer; the payload holds the App, helper and rec
   const result = await buildWindowsInstaller({ appDir, helper, version: '1.2.3', outFile, pluginsDir }, { makensis, workDir: path.join(root, 'nsis-work') });
   assert.equal(result.host, 'host');
   assert.equal((await readFile(outFile)).subarray(0, 2).toString(), 'MZ');
-  for (const forbidden of [/installer-diagnostics\.nsh/i, /installer-notes\.nsh/i, /installer-hooks\.nsh/i, /utils\.nsh/i, /English\.nsh/i, /SimpChinese\.nsh/i, /LangString/i, /function .* not referenced/i]) {
+  for (const forbidden of [/installer-diagnostics\.nsh/i, /installer-notes\.nsh/i, /installer-language\.nsh/i, /installer-hooks\.nsh/i, /utils\.nsh/i, /English\.nsh/i, /SimpChinese\.nsh/i, /LangString/i, /function .* not referenced/i]) {
     assert.doesNotMatch(result.log, forbidden, `makensis emitted unexpected warning matching ${forbidden}:\n${result.log}`);
   }
   if (!sevenZip) return;
@@ -513,5 +513,57 @@ test('local setup notes hold only allowlisted stage text, stay bounded and never
     for (const key of ['birdNoteKept', 'birdNoteDone']) assert.doesNotMatch(strings.get(key), /\$|[\\/]|[A-Za-z]:/, key);
     assert.match(strings.get('birdNoteKept'), keyword);
     assert.ok(strings.get('birdNoteKept').includes('%LOCALAPPDATA%') && strings.get('birdNoteKept').includes(define('BIRDNOTESDIR')));
+  }
+});
+
+// Windows run 44827642188: a /S install saves no language (MUI saves it only
+// when a shown files page closes), and the next same-version `setup /P` stopped
+// at "Installer Language" for 301 s. The updater's `/P /UPDATE /R` and the
+// uninstaller a passive reinstall starts with /P take the same path. The
+// Windows behaviour itself is checked by a small real-Windows probe.
+const nsisCode = source => source.split('\n').filter(line => !line.trim().startsWith(';')).join('\n');
+function checkPassiveLanguage(nsi, language) {
+  const lang = nsisCode(language), code = nsisCode(nsi);
+  // Only an interactive run reaches MUI's dialog macros; a /P run picks without them.
+  const choose = between(lang, '!macro BirdChooseLanguage', '!macroend');
+  ordered(choose, '${If} $PassiveMode = 1', '!insertmacro BirdPassiveLanguage', '${Else}', '!ifdef __UNINSTALL__', '!insertmacro MUI_UNGETLANGUAGE', '!else', '!insertmacro MUI_LANGDLL_DISPLAY', '!endif', '${EndIf}');
+  const passive = between(lang, '!macro BirdPassiveLanguage', '!macroend');
+  assert.doesNotMatch(passive, /LangDLL|LANGDLL_DISPLAY|UNGETLANGUAGE|MessageBox|nsDialogs|Abort|Quit/, 'a /P run never shows a dialog or stops');
+  // It reads the value MUI saves, uses it only if it is one of this setup's languages, and keeps $0.
+  ordered(passive, 'Push $0', 'ReadRegStr $0 ${MUI_LANGDLL_REGISTRY_ROOT} "${MUI_LANGDLL_REGISTRY_KEY}" "${MUI_LANGDLL_REGISTRY_VALUENAME}"', 'StrCpy $LANGUAGE $0', '${EndIf}', 'Pop $0');
+  assert.equal(passive.match(/StrCpy \$LANGUAGE/g).length, 1);
+  const accepted = [...passive.matchAll(/\$\{(?:If|OrIf)\} \$0 == \$\{LANG_(\w+)\}/g)].map(match => match[1]).sort();
+  const compiled = [...code.matchAll(/^!insertmacro MUI_LANGUAGE "(\w+)"$/gm)].map(match => match[1].toUpperCase()).sort();
+  assert.deepEqual(accepted, compiled, 'a saved language is used only when this setup has it');
+  assert.match(code, /^!define MUI_LANGDLL_REGISTRY_VALUENAME "Installer Language"$/m);
+  ordered(code, '!insertmacro MUI_LANGUAGE "English"', '!include "installer-language.nsh"', 'Function .onInit');
+  // Each program reads /P (and /UPDATE) before choosing, and has no other language dialog.
+  for (const name of ['Function .onInit\n', 'Function un.onInit\n']) {
+    const body = between(code, name, 'FunctionEnd');
+    ordered(body, '${GetOptions} $CMDLINE "/P" $PassiveMode', 'StrCpy $PassiveMode 1', '${GetOptions} $CMDLINE "/UPDATE" $UpdateMode', '!insertmacro BirdChooseLanguage');
+    assert.equal(body.match(/!insertmacro BirdChooseLanguage/g).length, 1, name);
+    assert.doesNotMatch(body, /MUI_LANGDLL_DISPLAY|MUI_UNGETLANGUAGE|LangDLL/, `${name.trim()} has no language dialog outside BirdChooseLanguage`);
+  }
+  assert.equal(code.match(/MUI_LANGDLL_DISPLAY|MUI_UNGETLANGUAGE|LangDLL::/g), null, 'no other language dialog in installer.nsi');
+}
+
+test('a /P run never stops at the language dialog; interactive runs keep it and reuse a saved language', async () => {
+  const [nsi, language] = await templates('installer.nsi', 'installer-language.nsh');
+  checkPassiveLanguage(nsi, language);
+  // Negative: the cfbf8f0 shapes that blocked, and nearby regressions, are rejected.
+  const onInit = between(nsi, 'Function .onInit\n', 'FunctionEnd'), unInit = between(nsi, 'Function un.onInit\n', 'FunctionEnd');
+  const swap = (body, edit) => nsi.replace(body, edit(body));
+  const baselineUnInit = body => body.replace('  !insertmacro BirdChooseLanguage\n', '').replace('  ${GetOptions} $CMDLINE "/P"', '  !insertmacro MUI_UNGETLANGUAGE\n\n  ${GetOptions} $CMDLINE "/P"');
+  const broken = {
+    'installer always shows the dialog (cfbf8f0)': [swap(onInit, body => body.replace('!insertmacro BirdChooseLanguage', '!insertmacro MUI_LANGDLL_DISPLAY')), language],
+    'uninstaller reads the language before /P (cfbf8f0)': [swap(unInit, baselineUnInit), language],
+    'uninstaller chooses before /P': [swap(unInit, body => body.replace('  !insertmacro BirdChooseLanguage\n', '').replace('  ${GetOptions} $CMDLINE "/P"', '  !insertmacro BirdChooseLanguage\n  ${GetOptions} $CMDLINE "/P"')), language],
+    'passive branch shows the dialog': [nsi, language.replace('    !insertmacro BirdPassiveLanguage\n', '    !insertmacro MUI_LANGDLL_DISPLAY\n')],
+    'any saved value is trusted': [nsi, language.replace(/  \$\{If\} \$0 == \$\{LANG_SIMPCHINESE\}\n  \$\{OrIf\} \$0 == \$\{LANG_ENGLISH\}\n    StrCpy \$LANGUAGE \$0\n  \$\{EndIf\}\n/, '  StrCpy $LANGUAGE $0\n')],
+    'a compiled language is not accepted': [nsi, language.replace('  ${OrIf} $0 == ${LANG_ENGLISH}\n', '')],
+  };
+  for (const [label, [candidate, candidateLanguage]] of Object.entries(broken)) {
+    assert.notEqual(candidate + candidateLanguage, nsi + language, `${label}: mutation applied`);
+    assert.throws(() => checkPassiveLanguage(candidate, candidateLanguage), assert.AssertionError, label);
   }
 });
