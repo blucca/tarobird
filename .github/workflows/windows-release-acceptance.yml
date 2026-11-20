@@ -1,23 +1,25 @@
-# ACCEPTANCE-ONLY BRANCH COPY (#48). Never merge this file into main as is:
-# it runs only #48 Windows remote-screen verification on a disposable
-# GitHub-hosted Windows runner with synthetic capture and an isolated test
-# window, drops signing/publishing/uploads/cache-writes, and writes redacted
-# results only to the job log and summary.
+# ACCEPTANCE-ONLY BRANCH COPY (#48 E4 real capture). Never merge this file
+# into main: on a disposable GitHub-hosted Windows runner it covers the runner
+# desktop with an owned full-screen colour test window, runs the product
+# remote-screen capture path (ScreenService -> ScreenCaptureHost ->
+# desktopCapturer) against a real Hub with a view-only viewer, and writes
+# redacted statistics to the job log and summary only. No signing, no
+# publishing, no artifact upload, no cache writes, no input injection.
 name: Windows release upgrade acceptance
 on:
   workflow_dispatch:
     inputs:
       scope:
-        description: Acceptance scope (default runs native tests, screen regressions, stage3 and isolated E2E)
+        description: Acceptance scope
         type: choice
-        options: [full, w1-only]
-        default: full
+        options: [capture]
+        default: capture
 permissions:
   contents: read
 jobs:
-  windows-screen-acceptance:
+  windows-capture-acceptance:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 35
     steps:
       - name: Acceptance-only guard (disposable GitHub-hosted runner, no uploads)
         shell: pwsh
@@ -50,7 +52,7 @@ jobs:
           # Acceptance branch: restore only, never save build outputs.
           save-if: false
 
-      - name: Install dependencies (with Electron 45.3.0 runtime)
+      - name: Install dependencies
         shell: pwsh
         run: |
           npm ci
@@ -67,13 +69,13 @@ jobs:
       - name: Build native Windows addon (tarobot-desktop-native.node)
         shell: pwsh
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/winviewer-native-target.noindex
+          CARGO_TARGET_DIR: ${{ runner.temp }}/wincapture-native-target.noindex
           CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
         run: |
           cargo build --manifest-path client/src-desktop-native/Cargo.toml --release --locked --target x86_64-pc-windows-msvc --lib
           if ($LASTEXITCODE -ne 0) { throw "native addon build failed" }
-          $outDir = Join-Path $env:RUNNER_TEMP "winviewer-native.noindex"
+          $outDir = Join-Path $env:RUNNER_TEMP "wincapture-native.noindex"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
           $dll = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\tarobot_desktop_native.dll"
           $addon = Join-Path $outDir "tarobot-desktop-native.node"
@@ -82,36 +84,7 @@ jobs:
           "addon_sha256=$hash"
           "TAROBOT_WIN_ADDON=$addon" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: W1 - Native Rust MSVC unit tests (src-desktop-native)
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/winviewer-native-test.noindex
-          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
-        run: |
-          cargo test --manifest-path client/src-desktop-native/Cargo.toml --locked --no-default-features
-          if ($LASTEXITCODE -ne 0) { throw "src-desktop-native cargo test failed" }
-
-      - name: W1 - Root Windows remote-screen vitest (real Windows named pipe)
-        shell: pwsh
-        run: |
-          npx vitest run tests/remote-screen-keys-windows.test.ts tests/screen-service-hub-windows.test.ts
-          if ($LASTEXITCODE -ne 0) { throw "Windows screen vitest failed" }
-
-      - name: W1 - Electron remote-screen tests on Windows Node (record result)
-        id: electron_screen_tests
-        continue-on-error: true
-        working-directory: client
-        shell: pwsh
-        run: |
-          node --import tsx --test electron/tests/screen-windows.test.mjs electron/tests/screen-service.test.mjs
-          $code = $LASTEXITCODE
-          "electron_screen_exit=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          if ($code -ne 0) { throw "Electron screen tests failed (exit $code)" }
-
-      - name: Stage 3 + Isolated App E2E acceptance (synthetic capture & test window)
-        if: ${{ inputs.scope != 'w1-only' }}
-        id: e2e
+      - name: E4 real capture acceptance (owned colour window, view-only viewer)
         shell: pwsh
         env:
           TAROBOT_WINDOWS_ACCEPTANCE: disposable
@@ -120,30 +93,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Electron binary install failed" }
           $electron = (node -p "require('./client/node_modules/electron')").Trim()
           if (-not (Test-Path -LiteralPath $electron)) { throw "Resolved Electron binary missing" }
-          $report = Join-Path $env:RUNNER_TEMP "winviewer-report.noindex"
-          node client/scripts/windows-screen-acceptance.mjs `
+          $report = Join-Path $env:RUNNER_TEMP "wincapture-report.noindex"
+          node client/scripts/windows-capture-acceptance.mjs `
             --confirm-disposable-windows `
             --electron $electron `
             --addon $env:TAROBOT_WIN_ADDON `
             --report $report `
             --source-commit ${{ github.sha }}
-          if ($LASTEXITCODE -ne 0) { throw "Windows screen acceptance reported failure; see summary" }
+          if ($LASTEXITCODE -ne 0) { throw "Windows capture acceptance reported failure; see summary" }
 
-      - name: Publish redacted evidence to job log and summary only (no uploads)
+      - name: Publish redacted statistics to job log and summary only (no uploads)
         if: always()
         shell: pwsh
         run: |
-          $report = Join-Path $env:RUNNER_TEMP "winviewer-report.noindex"
-          $md = Join-Path $report "windows-screen-acceptance.md"
-          $json = Join-Path $report "windows-screen-acceptance.json"
-          if (Test-Path -LiteralPath $md) {
-            Get-Content -LiteralPath $md -Raw | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          }
+          $report = Join-Path $env:RUNNER_TEMP "wincapture-report.noindex"
+          $md = Join-Path $report "windows-capture-acceptance.md"
+          $json = Join-Path $report "windows-capture-acceptance.json"
+          if (Test-Path -LiteralPath $md) { Get-Content -LiteralPath $md -Raw | Add-Content -Path $env:GITHUB_STEP_SUMMARY }
           if (Test-Path -LiteralPath $json) {
-            "===== windows-screen-acceptance.json ====="
+            "===== windows-capture-acceptance.json ====="
             Get-Content -LiteralPath $json -Raw
-          }
-          "electron_screen_tests_outcome=${{ steps.electron_screen_tests.outcome }}"
-          if ("${{ steps.electron_screen_tests.outcome }}" -ne "success") {
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "`n> Note: W1 Electron screen tests outcome = ${{ steps.electron_screen_tests.outcome }} (check step log for path/Windows test assertions such as E2)."
           }
