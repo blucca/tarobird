@@ -73,7 +73,7 @@ async function adapterWith(pi: FakePiOptions) {
   return { adapter, spawner };
 }
 
-const message = (text: string, extra: Partial<CodexUserMessageInput> = {}): CodexUserMessageInput => ({ text, files: [], locale: "en", ...extra } as CodexUserMessageInput);
+const message = (text: string, extra: Partial<CodexUserMessageInput> = {}): CodexUserMessageInput => ({ text, authoredText: text, files: [], locale: "en", ...extra } as CodexUserMessageInput);
 
 /** One extension dialog answered through the card; returns what the extension received. */
 async function answerDialog(request: Record<string, unknown>, form: Record<string, unknown>, locale: "en" | "zh" = "en") {

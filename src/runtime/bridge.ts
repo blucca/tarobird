@@ -109,6 +109,8 @@ export interface BridgeAuthorizedMessageInput {
   chatType: string;
   locale?: Locale;
   text: string;
+  /** The owner's own typed text for this turn; see `CodexUserMessageInput.authoredText`. Never set for other sources. */
+  authoredText?: string;
   replyContext?: {
     messageId: number | string;
     text: string;
@@ -546,6 +548,8 @@ export class Bridge {
             inputOwnerKey: scopeLockId,
             ...(input.reviewAdmission && !receipt && !continuation ? { reviewAdmission: input.reviewAdmission, nativeInput: input.nativeInput } : {}),
             text,
+            // A recovery continuation is the Host's own prompt, not something the owner typed.
+            ...(input.authoredText !== undefined && !continuation ? { authoredText: input.authoredText } : {}),
             files,
             locale: input.locale,
             instructions: [this.options.runtimeInstructions?.(), input.instructions]

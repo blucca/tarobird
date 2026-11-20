@@ -14,6 +14,8 @@ const fsCalls = vi.hoisted(() => ({
   symlinkEpermForFiles: false,
   copyFailFor: new Set<string>(),
   copyFailOnceFor: new Set<string>(),
+  beforeCopyFailure: undefined as (() => Promise<void>) | undefined,
+  afterCopy: undefined as ((source: string) => void) | undefined,
   unlinkEpermFor: new Set<string>(),
   rmdir: [] as string[],
 }));
@@ -33,10 +35,12 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     // A copy that dies halfway: part of the destination is written, then it fails.
     copyFile: async (source: string, destination: string, mode?: number) => {
       if (fsCalls.copyFailOnceFor.delete(source) || fsCalls.copyFailFor.has(source)) {
+        await fsCalls.beforeCopyFailure?.();
         await actual.writeFile(destination, "partial");
         throw Object.assign(new Error(`EIO: i/o error, copyfile '${source}' -> '${destination}'`), { code: "EIO" });
       }
-      return await actual.copyFile(source, destination, mode);
+      await actual.copyFile(source, destination, mode);
+      fsCalls.afterCopy?.(source);
     },
     // Synthetic Windows: a directory junction refuses unlink and is removed by rmdir.
     unlink: async (file: string) => {
@@ -65,6 +69,8 @@ afterEach(async () => {
   fsCalls.symlinkEpermForFiles = false;
   fsCalls.copyFailFor.clear();
   fsCalls.copyFailOnceFor.clear();
+  fsCalls.beforeCopyFailure = undefined;
+  fsCalls.afterCopy = undefined;
   fsCalls.unlinkEpermFor.clear();
   fsCalls.rmdir.length = 0;
   await Promise.all(roots.splice(0).map((root) => removeTempRoot(root)));
@@ -726,5 +732,76 @@ describe("DeepSeek Harness private profile", () => {
     expect(await readFile(privateIndex, "utf8")).toBe("export const changed = true;\n");
     expect(await tree(f.sharedHome)).toEqual(before);
     expect((await stat(path.join(f.sharedProfile, "package.json"))).mode & 0o777).toBe(0o644);
+  });
+
+  it("keeps a copied file link whole when its refresh fails (synthetic platform)", async () => {
+    const f = await fixture();
+    const privateHome = path.join(f.stateDir, "dsh-home");
+    await mkdir(privateHome, { recursive: true });
+    const tool = path.join(f.privateProfile, "node_modules", ".bin", "tool");
+    fsCalls.symlinkEpermForFiles = true;
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      await prepareDeepSeekHarnessPrivateProfile({ sharedHome: f.sharedHome, privateHome });
+      expect(await readFile(tool, "utf8")).toBe("#!/usr/bin/env node\n");
+      fsCalls.copyFailOnceFor.add(path.join(f.sharedProfile, "node_modules", ".bin", "tool"));
+      await expect(prepareDeepSeekHarnessPrivateProfile({ sharedHome: f.sharedHome, privateHome })).rejects.toThrow(/EIO/);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+
+    // The copy that stood in for the link is still whole.
+    expect(await readFile(tool, "utf8")).toBe("#!/usr/bin/env node\n");
+    // A later start with file links available can atomically replace that copy.
+    fsCalls.symlinkEpermForFiles = false;
+    expect(await prepare(f)).toEqual([]);
+    expect((await lstat(tool)).isSymbolicLink()).toBe(true);
+    expect(await readFile(tool, "utf8")).toBe("#!/usr/bin/env node\n");
+  });
+
+  it("does not copy again what arrived before a start failed", async () => {
+    const f = await fixture();
+    const retainedSource = path.join(f.sharedProfile, "node_modules", "@scope", "plugin-b", "index.js");
+    let arrived!: () => void;
+    const copied = new Promise<void>(resolve => { arrived = resolve; });
+    fsCalls.beforeCopyFailure = () => copied;
+    fsCalls.afterCopy = source => { if (source === retainedSource) arrived(); };
+    fsCalls.copyFailOnceFor.add(path.join(f.sharedProfile, "node_modules", "plugin-a", "index.js"));
+    await expect(prepareDeepSeekHarnessHome({ sharedHome: f.sharedHome, stateDir: f.stateDir })).rejects.toThrow(/EIO/);
+    const retained = path.join(f.privateProfile, "node_modules", "@scope", "plugin-b", "index.js");
+    const before = await lstat(retained);
+    expect(before.isFile()).toBe(true);
+
+    expect(await prepare(f)).toEqual([]);
+
+    const after = await lstat(retained);
+    expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+    expect(await readFile(path.join(f.privateProfile, "node_modules", "plugin-a", "index.js"), "utf8")).toBe("export {};\n");
+  });
+
+  it.each(["file", "link"])("mirrors a %s path it had to keep as a directory once that directory is empty", async kind => {
+    const f = await fixture();
+    await prepare(f);
+    const sharedDist = path.join(f.sharedProfile, "node_modules", "plugin-a", "dist");
+    const privateDist = path.join(f.privateProfile, "node_modules", "plugin-a", "dist");
+    await writeFile(path.join(privateDist, "runtime-cache.bin"), "private\n");
+    await rm(path.join(f.sharedProfile, "node_modules", ".bin", "tool"));
+    await rm(sharedDist, { recursive: true });
+    if (kind === "file") await writeFile(sharedDist, "export const bundled = true;\n");
+    else {
+      const linked = path.join(f.root, "replacement.js");
+      await writeFile(linked, "export const bundled = true;\n");
+      await symlink(linked, sharedDist, "file");
+    }
+
+    const kept = await prepare(f);
+    expect(kept.filter((line) => line.endsWith(`: ${privateDist}`))).toHaveLength(1);
+    expect(await readFile(path.join(privateDist, "runtime-cache.bin"), "utf8")).toBe("private\n");
+
+    // Once the private file is gone, the shared file takes the path.
+    await rm(path.join(privateDist, "runtime-cache.bin"));
+    expect(await prepare(f)).toEqual([]);
+    expect(await readFile(privateDist, "utf8")).toBe("export const bundled = true;\n");
   });
 });

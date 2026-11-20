@@ -49,6 +49,10 @@ it("factory uses the native Pi adapter and never falls through to Codex", async 
     expect(adapter).toBeInstanceOf(PiRpcAdapter);
     expect(adapter.turnRuntimeLimitMs).toBeNull();
     expect(adapter.supportsTurnScopedEnv).toBe(false);
+    // The Host's own test for text it would act on is what keeps a command reply from being executed.
+    const wired = (adapter as unknown as { options: { carriesHostDirectives?: (text: string) => boolean } }).options.carriesHostDirectives;
+    expect(wired?.("[send-file:/synthetic/x.txt]")).toBe(true);
+    expect(wired?.("nothing to act on")).toBe(false);
     await adapter.destroy();
   } finally { await rm(root, { recursive: true, force: true }); }
 });

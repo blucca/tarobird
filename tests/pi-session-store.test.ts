@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -629,6 +629,111 @@ describe("piBotDefaultFingerprint", () => {
     expect(piBotDefaultFingerprint(undefined, undefined)).toBe(piBotDefaultFingerprint("", ""));
     expect(piBotDefaultFingerprint(undefined, "off")).toBe(piBotDefaultFingerprint("", "off"));
     expect(piBotDefaultFingerprint(undefined, "off")).not.toBe(piBotDefaultFingerprint(undefined, undefined));
+  });
+});
+
+describe("PiSessionStore import destination", () => {
+  it("names an imported copy so the store finds it by id again, whatever the source was called", async () => {
+    const { root, cwd, store } = await scratch();
+    await store.ensureDirs();
+    const sources = [["backup.jsonl", "abc-1"], ["notes.txt", "abc-2"], ["2026-01-02T03-04-05-000Z_abc-3.jsonl", "abc-3"], ["under_score.and.dots.jsonl", "abc-4"]] as const;
+    for (const [source, id] of sources) {
+      const from = path.join(root, source);
+      await writeFile(from, `${header(id, cwd)}\n`);
+      const destination = await store.importDestination(from, id);
+      expect(path.dirname(destination)).toBe(store.sessionDir);
+      // The id is in the name, as in Pi's own files: no header has to be read to find it again.
+      expect(path.basename(destination).endsWith(`_${id}.jsonl`)).toBe(true);
+      await copyFile(from, destination);
+      expect(await store.find(id)).toMatchObject({ sessionId: id, path: destination, origin: "bot" });
+    }
+    // A source that already carries Pi's own name keeps it.
+    expect((await readdir(store.sessionDir)).sort()).toContain("2026-01-02T03-04-05-000Z_abc-3.jsonl");
+    expect((await store.list({ cwd })).map(session => session.sessionId).sort()).toEqual(["abc-1", "abc-2", "abc-3", "abc-4"]);
+  });
+
+  it("keeps the id at the end when the name is taken, and keeps the name within one path component", async () => {
+    const { root, cwd, store } = await scratch();
+    await store.ensureDirs();
+    const from = path.join(root, "backup.jsonl");
+    await writeFile(from, `${header("abc-1", cwd)}\n`);
+    const first = await store.importDestination(from, "abc-1");
+    // Something else already sits under that name (a leftover with another header).
+    await writeFile(first, `${header("someone-else", cwd)}\n`);
+    const second = await store.importDestination(from, "abc-1");
+    expect(second).not.toBe(first);
+    expect(path.basename(second)).toBe("backup-1_abc-1.jsonl");
+    await copyFile(from, second);
+    expect(await store.find("abc-1")).toMatchObject({ sessionId: "abc-1", path: second });
+
+    const long = await store.importDestination(path.join(root, `${"长".repeat(120)}.jsonl`), "a".repeat(128));
+    expect(Buffer.byteLength(path.basename(long))).toBeLessThanOrEqual(255);
+    expect(path.basename(long).endsWith(`_${"a".repeat(128)}.jsonl`)).toBe(true);
+    await expect(store.importDestination(from, "../escape")).rejects.toThrow(/session id/i);
+  });
+});
+
+describe("PiSessionStore sessions imported before copies were named by id", () => {
+  it("finds a copy that kept the owner's file name by its header, and only opens files Pi did not name itself", async () => {
+    const { cwd, store } = await scratch();
+    await store.ensureDirs();
+    await writeFile(path.join(store.sessionDir, "backup.jsonl"), `${header("legacy-1", cwd)}\n${nameEntry("Old import")}\n`);
+    await writeFile(path.join(store.sessionDir, "notes.txt"), `${header("legacy-2", cwd)}\n`);
+    await writeFile(path.join(store.sessionDir, "2026-01-02T03-04-05-000Z_5f0c3a52-8b0e-4c59-9f43-0d6f1a2b3c4d-1.jsonl"), `${header("legacy-3", cwd)}\n`);
+    expect(await store.find("legacy-1")).toMatchObject({ sessionId: "legacy-1", path: path.join(store.sessionDir, "backup.jsonl"), origin: "bot", name: "Old import", cwd });
+    // Other extensions are still not session files, here as in a listing.
+    expect(await store.find("legacy-2")).toBeUndefined();
+    expect(await store.find("legacy-3")).toMatchObject({ sessionId: "legacy-3" });
+    expect(await store.find("legacy-9")).toBeUndefined();
+
+    // A file Pi named itself carries its id in the name: it is never opened to look for another id,
+    // so a Bot with thousands of ordinary sessions pays nothing for this.
+    const own = path.join(store.sessionDir, "2026-01-02T03-04-05-000Z_5f0c3a52-8b0e-4c59-9f43-0d6f1a2b3c4d.jsonl");
+    await writeFile(own, `${header("renamed-by-hand", cwd)}\n`);
+    expect(await store.find("renamed-by-hand")).toBeUndefined();
+    expect(await store.find("5f0c3a52-8b0e-4c59-9f43-0d6f1a2b3c4d")).toBeUndefined();
+  });
+
+  it("prefers the copy that was written last when an old double import left two files with one id", async () => {
+    const { cwd, store } = await scratch();
+    await store.ensureDirs();
+    const first = path.join(store.sessionDir, "backup.jsonl"), second = path.join(store.sessionDir, "backup-1.jsonl");
+    await writeFile(first, `${header("legacy-1", cwd)}\n`); await writeFile(second, `${header("legacy-1", cwd)}\n`);
+    await utimes(first, new Date(2_000_000_000_000), new Date(2_000_000_000_000));
+    await utimes(second, new Date(1_900_000_000_000), new Date(1_900_000_000_000));
+    expect((await store.find("legacy-1"))?.path).toBe(first);
+    await utimes(second, new Date(2_100_000_000_000), new Date(2_100_000_000_000));
+    expect((await store.find("legacy-1"))?.path).toBe(second);
+    // A copy under the current naming is the one an import made on purpose; it wins over leftovers.
+    const named = path.join(store.sessionDir, "backup_legacy-1.jsonl");
+    await writeFile(named, `${header("legacy-1", cwd)}\n`);
+    await utimes(named, new Date(1_800_000_000_000), new Date(1_800_000_000_000));
+    expect((await store.find("legacy-1"))?.path).toBe(named);
+  });
+
+  it("does not hand out a file that was replaced by another session between its two reads", async () => {
+    const { cwd, store } = await scratch();
+    await store.ensureDirs();
+    const kept = path.join(store.sessionDir, "backup.jsonl");
+    await writeFile(kept, `${header("legacy-1", cwd)}\n`);
+    // The lookup reads a match once for its id and once more for its name. Swap the file in between.
+    const target = store as unknown as { describe(file: string, origin: string, withName: boolean): Promise<unknown> };
+    const describe = target.describe.bind(store);
+    target.describe = async (file, origin, withName) => {
+      if (withName && file === kept) await writeFile(kept, `${header("someone-else", cwd)}\n${nameEntry("Not yours")}\n`);
+      return describe(file, origin, withName);
+    };
+    expect(await store.find("legacy-1")).toBeUndefined();
+    expect(await store.find("someone-else")).toMatchObject({ sessionId: "someone-else", name: "Not yours" });
+  });
+
+  it("looks at a bounded number of such files", async () => {
+    const { cwd, store } = await scratch();
+    await store.ensureDirs();
+    await Promise.all(Array.from({ length: 260 }, (_, index) => writeFile(path.join(store.sessionDir, `copy-${String(index).padStart(3, "0")}.jsonl`), `${header(`bulk-${index}`, cwd)}\n`)));
+    expect(await store.find("bulk-0")).toMatchObject({ sessionId: "bulk-0" });
+    expect(await store.find("bulk-199")).toMatchObject({ sessionId: "bulk-199" });
+    expect(await store.find("bulk-259")).toBeUndefined();
   });
 });
 

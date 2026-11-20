@@ -183,13 +183,19 @@ async function mirrorSharedProfile(
     tree.hold(target);
     next.entries[item.rel] = { kind: "dir" };
   }
-  await forEachLimited(plan.filter((item) => item.kind !== "dir"), MIRROR_CONCURRENCY, async (item) => {
-    const target = await tree.pathInHeldDirectory(item.rel);
-    const record = item.kind === "file"
-      ? await mirrorFile(tree, item, target, previous.entries[item.rel], diagnose)
-      : item.kind === "link" ? await mirrorLink(tree, item, target, previous.entries[item.rel], diagnose) : undefined;
-    if (record) next.entries[item.rel] = record;
-  });
+  try {
+    await forEachLimited(plan.filter((item) => item.kind !== "dir"), MIRROR_CONCURRENCY, async (item) => {
+      const target = await tree.pathInHeldDirectory(item.rel);
+      const record = item.kind === "file"
+        ? await mirrorFile(tree, item, target, previous.entries[item.rel], diagnose)
+        : item.kind === "link" ? await mirrorLink(tree, item, target, previous.entries[item.rel], diagnose) : undefined;
+      if (record) next.entries[item.rel] = record;
+    });
+  } catch (error) {
+    // Record the files that did arrive, so the next start does not copy them again.
+    await writeMirrorManifest(manifestPath, { version: 1, entries: { ...intent.entries, ...next.entries } }).catch(() => {});
+    throw error;
+  }
 
   // Entries no start recorded: a link is removed (it holds no data and may be
   // left from the earlier link layout); anything else is kept and reported.
@@ -415,7 +421,8 @@ async function mirrorFile(
   const info = await lstatWithoutOwnedDirectory(target, previous);
   if (info?.isDirectory()) {
     diagnose("DeepSeek Harness kept an unexpected private directory instead of copying a shared file", target);
-    return undefined;
+    // Still the directory an earlier start created: keep its record, so it goes once it is empty.
+    return previous?.kind === "dir" ? previous : undefined;
   }
   if (info?.isFile()) {
     if (item.top) {
@@ -454,12 +461,16 @@ async function mirrorLink(
     await removeLink(target);
   } else if (info?.isDirectory()) {
     diagnose("DeepSeek Harness kept an unexpected private directory instead of linking the shared one", target);
-    return undefined;
-  } else if (info) {
+    return previous?.kind === "dir" ? previous : undefined;
+  }
+  // A whole file where a file link belongs stays until its replacement is complete.
+  const replacesFile = info?.isFile() === true && !item.directory;
+  if (info && !info.isSymbolicLink() && !replacesFile) {
     await unlink(target);
   }
   try {
-    await symlink(item.target, target, item.directory ? (process.platform === "win32" ? "junction" : "dir") : "file");
+    if (replacesFile) await replaceWithLink(tree, item.target, target);
+    else await symlink(item.target, target, item.directory ? (process.platform === "win32" ? "junction" : "dir") : "file");
     return { kind: "link" };
   } catch (error) {
     // Windows needs a privilege for file links; a private copy loads the same.
@@ -488,6 +499,17 @@ async function replaceWithCopy(tree: PrivateProfileTree, source: string, target:
       await chmod(target, 0o600);
       await rename(staged, target);
     }
+  } finally {
+    await rm(staged, { force: true }).catch(() => {});
+  }
+}
+
+/** Create a file link in staging, then rename it over the file at `target`. */
+async function replaceWithLink(tree: PrivateProfileTree, linkTarget: string, target: string): Promise<void> {
+  const staged = await tree.stage();
+  try {
+    await symlink(linkTarget, staged, "file");
+    await rename(staged, target);
   } finally {
     await rm(staged, { force: true }).catch(() => {});
   }

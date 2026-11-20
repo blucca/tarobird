@@ -60,6 +60,10 @@ const MAX_HEADER_BYTES = 64 * 1024;
 const MAX_NAME_SCAN_BYTES = 8 * 1024 * 1024;
 const MAX_SESSION_RECORDS = 1000;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/** `<timestamp>_<uuid>.jsonl`: a file Pi named itself. Its name says which session it holds. */
+const PI_OWN_SESSION_FILE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
+/** How many files that Pi did not name are opened to look for a session by its header. */
+const MAX_HEADER_LOOKUP_FILES = 200;
 
 /** Ids become file-name suffixes and CLI arguments; accept only what Pi itself generates or a UUID we chose. */
 export function isSafePiSessionId(value: string): boolean {
@@ -267,9 +271,10 @@ export class PiSessionStore {
   }
 
   /**
-   * Locate a session by id: the Bot's directory, a remembered external path,
-   * then Pi's own directory for `cwd`. The header id must match exactly; a
-   * file name alone is never trusted.
+   * Locate a session by id: the Bot's directory (by file name, then the few
+   * files whose name does not carry an id), a remembered external path, then
+   * Pi's own directory for `cwd`. The header id must match exactly; a file
+   * name alone is never trusted.
    */
   async find(sessionId: string, cwd?: string): Promise<PiSessionFile | undefined> {
     if (!isSafePiSessionId(sessionId)) return;
@@ -282,6 +287,8 @@ export class PiSessionStore {
       const found = await check(file, "bot");
       if (found) return found;
     }
+    const kept = await this.findByHeader(sessionId);
+    if (kept) return kept;
     const remembered = (await this.record(sessionId)).externalPath;
     if (remembered) {
       const found = await check(remembered, "native");
@@ -296,6 +303,29 @@ export class PiSessionStore {
       }
     }
     return;
+  }
+
+  /**
+   * A session in the Bot's directory whose file name does not carry its id.
+   * Imports used to keep the owner's file name (`backup.jsonl`, `backup-1.jsonl`),
+   * and such a copy says who it is only in its header. Files Pi named itself
+   * are never opened here, so this costs nothing for a Bot without such copies,
+   * and at most `MAX_HEADER_LOOKUP_FILES` files are read. When an old double
+   * import left several copies of one id, the one written last is the one the
+   * conversation was using.
+   */
+  private async findByHeader(sessionId: string): Promise<PiSessionFile | undefined> {
+    const files = (await this.sessionFilesIn(this.sessionDir))
+      .filter(file => !PI_OWN_SESSION_FILE.test(path.basename(file)) && !file.endsWith(`_${sessionId}.jsonl`)).sort();
+    let latest: PiSessionFile | undefined;
+    for (const file of files.slice(0, MAX_HEADER_LOOKUP_FILES)) {
+      const found = await this.describe(file, "bot", false);
+      if (found?.sessionId === sessionId && (!latest || found.updatedAt > latest.updatedAt)) latest = found;
+    }
+    if (!latest) return;
+    // Read once more for the name; the file may have been replaced meanwhile, so the id is checked again.
+    const named = await this.describe(latest.path, "bot", true);
+    return named?.sessionId === sessionId ? named : undefined;
   }
 
   /** Sessions that belong to `cwd`, newest first: the Bot's own and those started in Pi's terminal UI. */
@@ -435,16 +465,26 @@ export class PiSessionStore {
   }
 
   /**
-   * Where an imported session file goes: the Bot's session directory, under
-   * its own base name, with `-N` appended while that name is taken (as Pi's
-   * own import does).
+   * Where an imported session file goes: the Bot's session directory, named
+   * `<source name>_<session id>.jsonl` as Pi names its own files. `find` looks
+   * for that ending, so the copy is still found by id once the process that
+   * imported it has gone; under the owner's own name (`backup.jsonl`) it was
+   * listed but could not be bound again, and could be imported a second time
+   * beside itself. `-N` goes before the id while the name is taken.
    */
-  async importDestination(source: string): Promise<string> {
-    const { name, ext } = path.parse(path.basename(source));
-    let destination = path.join(this.sessionDir, `${name}${ext}`);
-    for (let suffix = 1; suffix < 1000; suffix++) {
+  async importDestination(source: string, sessionId: string): Promise<string> {
+    if (!isSafePiSessionId(sessionId)) throw new Error("Invalid Pi session id");
+    const ending = `_${sessionId}.jsonl`;
+    let stem = path.parse(path.basename(source)).name;
+    if (stem.endsWith(`_${sessionId}`)) stem = stem.slice(0, -(sessionId.length + 1));
+    // One path component holds 255 bytes; leave room for the ending and a counter.
+    const budget = 255 - Buffer.byteLength(ending) - 4;
+    const characters = [...stem];
+    while (characters.length && Buffer.byteLength(characters.join("")) > budget) characters.pop();
+    stem = characters.join("") || "imported";
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      const destination = path.join(this.sessionDir, `${stem}${attempt ? `-${attempt}` : ""}${ending}`);
       try { await stat(destination); } catch { return destination; }
-      destination = path.join(this.sessionDir, `${name}-${suffix}${ext}`);
     }
     throw new Error("No free file name for the imported session");
   }

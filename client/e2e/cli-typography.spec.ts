@@ -33,6 +33,7 @@ for (const width of [390, 1360]) test(`CLI bilingual reading size, fonts and con
   const root = await mkdtemp(path.join(os.tmpdir(), "cli-type-"));
   const hub = await HubServer.start({ stateDir: root, clientDir: path.resolve("dist") });
   try {
+    await hub.profile.update({ name: "Demo Host", revision: (await hub.profile.read()).revision });
     await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('type','终端助手','fixture')");
     const chat = await hub.store.createConversation("owner", ["type"], "账单核对 / Review", "type");
     const card = await hub.store.publishBotMessage("type", { conversationId: chat.id, blocks: [{ type: "card", title: "核对完成", elements: [{ type: "markdown", text }] }] });

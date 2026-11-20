@@ -139,7 +139,8 @@ async function rig(input: {
 
 function message(text: string, extra: Partial<CodexUserMessageInput> = {}): CodexUserMessageInput & { events: EngineStreamEvent[] } {
   const events: EngineStreamEvent[] = [];
-  return { text, files: [], locale: "en", onEngineEvent: event => { events.push(event); }, events, ...extra } as CodexUserMessageInput & { events: EngineStreamEvent[] };
+  // `authoredText`: these are the owner's own messages, typed as given. Tests of other sources override it.
+  return { text, authoredText: text, files: [], locale: "en", onEngineEvent: event => { events.push(event); }, events, ...extra } as CodexUserMessageInput & { events: EngineStreamEvent[] };
 }
 const commands = (process: FakePiProcess, type?: string) => process.received.filter(command => !type || command.type === type);
 const kinds = (events: EngineStreamEvent[]) => events.map(event => event.type);
@@ -744,7 +745,8 @@ describe("PiRpcAdapter approvals and bridge", () => {
     // The first turn could not know yet: the bridge reports trust after startup.
     await startUntrusted();
     await r.adapter.sendUserMessage(sessionId, message("ask", { onApprovalRequest: answer(/Trust/) }));
-    expect(questions).toEqual(["Load this project's own Pi files?"]);
+    // Asked once, and the card text itself carries the warning about what loading means.
+    expect(questions).toEqual([expect.stringMatching(/^Load this project's own Pi files\?\n\n[\s\S]*run code on your computer\.$/)]);
     expect(r.spawner.processes).toHaveLength(2);
     expect(await r.bridge().handler.trust({ cwd: r.workspace })).toBe("yes");
     r.bridge().handler.onEvent({ type: "session_start", reason: "startup", trusted: false });
@@ -858,7 +860,7 @@ describe("PiRpcAdapter turns", () => {
     const { sessionId } = await r.adapter.createSession(1);
     const native: PiNativeEvent[] = [];
     r.adapter.piNative.subscribe(sessionId, event => { native.push(event); });
-    const answers: Record<string, string> = { Pick: "B", "Sure?": "No", Name: "typed", Edit: "" };
+    const answers: Record<string, string> = { Pick: "B", "Sure?\n\ndetail": "No", Name: "typed", Edit: "" };
     await r.adapter.sendUserMessage(sessionId, message("go", { onApprovalRequest: async request => {
       requests.push(request);
       const question = (request.toolInput as { questions: Array<{ question: string }> }).questions[0]!;
@@ -868,7 +870,7 @@ describe("PiRpcAdapter turns", () => {
     const forms = requests.map(request => (request.toolInput as { questions: unknown[] }).questions[0]);
     // A choice must say it takes no free text: the shared card shows a text box by default, and typing there would cancel the dialog.
     expect(forms[0]).toMatchObject({ question: "Pick", options: [{ label: "A" }, { label: "B" }], multiSelect: false, allowFreeText: false });
-    expect(forms[1]).toMatchObject({ question: "Sure?", detail: "detail", options: [{ label: "Yes" }, { label: "No" }], allowFreeText: false });
+    expect(forms[1]).toMatchObject({ question: "Sure?\n\ndetail", options: [{ label: "Yes" }, { label: "No" }], allowFreeText: false });
     expect(forms[2]).toMatchObject({ question: "Name", options: [], allowFreeText: true, required: false, input: { kind: "text", placeholder: "type" } });
     expect(forms[3]).toMatchObject({ question: "Edit", options: [], allowFreeText: true, required: false, input: { kind: "multiline", prefill: "old" } });
     expect(r.spawner.last().uiResponses.sort((a, b) => String(a.id).localeCompare(String(b.id)))).toEqual([
@@ -1105,7 +1107,7 @@ describe("PiRpcAdapter lifecycle regressions", () => {
     const seen: string[] = [];
     await r.adapter.sendUserMessage(sessionId, message("first", { onApprovalRequest: trustAnswer(/Do not/, seen) }));
     // Pi reports session_start before it reads its first command; losing it would skip the question forever.
-    expect(seen).toEqual(["Load this project's own Pi files?"]);
+    expect(seen).toEqual([expect.stringMatching(/^Load this project's own Pi files\?\n\n[\s\S]*run code on your computer\.$/)]);
     expect(r.startupApprovals).toEqual([{ allow: false, reason: expect.stringMatching(/still starting/) }]);
     expect(r.spawner.processes).toHaveLength(1);
   });
@@ -1638,6 +1640,81 @@ describe("PiRpcAdapter trust, session files and model scope", () => {
     expect((await r.adapter.sendUserMessage("imported-one", message("continue"))).sessionId).toBe("imported-one");
     expect(await r.adapter.piNative.inspectImport("imported-one", { path: mine })).toMatchObject({ alreadyPresent: true });
     await expect(r.adapter.piNative.importSession("imported-one", { path: mine })).rejects.toThrow(/already among/);
+  });
+
+  it("still finds an imported session once its process is gone, whatever its source file was called", async () => {
+    const r = await rig();
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("hi"));
+    // What `/export backup.jsonl` hands over: a name the owner chose, with the session id only in the header.
+    const exported = path.join(r.root, "backup.jsonl");
+    await writeFile(exported, `${JSON.stringify({ type: "session", version: 3, id: "exported-one", timestamp: "2026-01-01T00:00:00.000Z", cwd: r.workspace })}\n`);
+    expect(await r.adapter.piNative.importSession(sessionId, { path: exported })).toEqual({ sessionId: "exported-one", cancelled: false });
+    const copy = String(commands(r.spawner.last(), "switch_session")[0]!.sessionPath);
+    expect(copy).toBe(path.join(r.stateDir, "pi", "sessions", "backup_exported-one.jsonl"));
+    expect(await readFile(copy, "utf8")).toBe(await readFile(exported, "utf8"));
+
+    // The Pi process ends (idle sweep, Host restart). The Host has to find the file by itself from here on.
+    r.spawner.last().exit(0);
+    await waitFor(() => !r.adapter.supportsSessionSteering("exported-one"));
+    // `/resume` lists the session, so choosing it there must work.
+    expect((await r.adapter.listExternalSessions({ cwd: r.workspace })).map(session => session.sessionId)).toContain("exported-one");
+    expect(await r.adapter.validateExternalSession("exported-one")).toMatchObject({ sessionId: "exported-one", cwd: r.workspace });
+    // It is reopened from its own file, which is also what the other-workspace check reads.
+    expect((await r.adapter.sendUserMessage("exported-one", message("continue"))).sessionId).toBe("exported-one");
+    const args = r.spawner.last().args;
+    expect(args[args.indexOf("--session") + 1]).toBe(copy);
+    expect(args).not.toContain("--session-id");
+  });
+
+  it("refuses to import the same owner-named file a second time next to its first copy", async () => {
+    const r = await rig();
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("hi"));
+    const exported = path.join(r.root, "backup.jsonl");
+    await writeFile(exported, `${JSON.stringify({ type: "session", version: 3, id: "exported-one", timestamp: "2026-01-01T00:00:00.000Z", cwd: r.workspace })}\n`);
+    await r.adapter.piNative.importSession(sessionId, { path: exported });
+    r.spawner.last().exit(0);
+    await waitFor(() => !r.adapter.supportsSessionSteering("exported-one"));
+
+    const other = (await r.adapter.createSession(2)).sessionId;
+    await r.adapter.sendUserMessage(other, message("hi"));
+    expect(await r.adapter.piNative.inspectImport(other, { path: exported })).toEqual({ sessionId: "exported-one", sameWorkspace: true, alreadyPresent: true });
+    await expect(r.adapter.piNative.importSession(other, { path: exported })).rejects.toThrow(/already among/);
+    // One session id, one file: a second copy would leave two transcripts under the same id.
+    const sessions = path.join(r.stateDir, "pi", "sessions");
+    const holders = [];
+    for (const name of await readdir(sessions)) if ((await readFile(path.join(sessions, name), "utf8")).includes('"id":"exported-one"')) holders.push(name);
+    expect(holders).toHaveLength(1);
+  });
+
+  it("serves a session an earlier build imported under the owner's file name", async () => {
+    const r = await rig();
+    const sessions = path.join(r.stateDir, "pi", "sessions"), kept = path.join(sessions, "backup.jsonl");
+    const header = `${JSON.stringify({ type: "session", version: 3, id: "kept-one", timestamp: "2026-01-01T00:00:00.000Z", cwd: r.workspace })}\n`;
+    await mkdir(sessions, { recursive: true }); await writeFile(kept, header);
+    const elsewhere = path.join(r.root, "elsewhere"); await mkdir(elsewhere);
+
+    expect(await r.adapter.validateExternalSession("kept-one")).toMatchObject({ sessionId: "kept-one", cwd: r.workspace });
+    // The check that keeps Pi from asking [y/N] on a terminal nobody sees needs the file's own header.
+    await expect(r.adapter.validateExternalSession("kept-one", { workspaceOverride: elsewhere })).rejects.toThrow(/another workspace/);
+    await expect(r.adapter.sendUserMessage("kept-one", message("hi", { workspaceOverride: elsewhere }))).rejects.toThrow(/another workspace/);
+    expect(r.spawner.processes).toHaveLength(0);
+
+    expect((await r.adapter.sendUserMessage("kept-one", message("continue"))).sessionId).toBe("kept-one");
+    const args = r.spawner.last().args;
+    expect(args[args.indexOf("--session") + 1]).toBe(kept);
+    expect(args).not.toContain("--session-id");
+
+    // The same export offered again, from another conversation while this one has no live process.
+    r.spawner.last().exit(0);
+    await waitFor(() => !r.adapter.supportsSessionSteering("kept-one"));
+    const exported = path.join(r.root, "backup.jsonl"); await writeFile(exported, header);
+    const other = (await r.adapter.createSession(2)).sessionId;
+    await r.adapter.sendUserMessage(other, message("hi"));
+    expect(await r.adapter.piNative.inspectImport(other, { path: exported })).toMatchObject({ alreadyPresent: true });
+    await expect(r.adapter.piNative.importSession(other, { path: exported })).rejects.toThrow(/already among/);
+    expect((await readdir(sessions)).filter(name => name.startsWith("backup"))).toEqual(["backup.jsonl"]);
   });
 
   it("leaves nothing behind when an extension vetoes the import", async () => {

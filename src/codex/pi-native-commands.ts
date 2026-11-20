@@ -5,7 +5,7 @@ import {
   type PiNativeControls, type PiNativeGlobalSetting, type PiNativeModelScope, type PiNativeProjectTrust, type PiNativeState,
   type PiNativeTree, type PiNativeTreeNode,
 } from "./pi-native-types.js";
-import { PI_TUI_BUILTIN_COMMANDS, parsePiSlashCommand, sanitizePiErrorText, type PiModelRef, type PiThinkingLevel } from "./pi-rpc-protocol.js";
+import { PI_TUI_BUILTIN_COMMANDS, parsePiSlashCommand, piClip, sanitizePiErrorText, type PiModelRef, type PiThinkingLevel } from "./pi-rpc-protocol.js";
 
 /**
  * Pi's terminal built-ins, typed as conversation text.
@@ -213,6 +213,7 @@ const EN = {
   scopeSave: (count: number) => `Save the ${number(count)} selected models`,
   scopeInScope: "in scope",
   scopeNothing: "Nothing was selected, so the scope is unchanged. `/scoped-models clear` removes it.",
+  scopeNotSaved: "Nothing was saved: the selection was never confirmed with Save, so this Bot's scope is unchanged. Send `/scoped-models` again, or name the models directly: `/scoped-models provider/id, provider/id`.",
   scopeSet: (list: string) => `This Bot's scope is now ${list}.`,
   scopeCleared: (native: boolean) => `This Bot's scope is cleared.${native ? " Your global Pi list applies again." : " Every available model is offered as before."}`,
   scopeAlreadyClear: "This Bot has no model scope to clear. Nothing was changed.",
@@ -414,6 +415,7 @@ const ZH: Copy = {
   scopeSave: count => `保存已选的 ${number(count)} 个模型`,
   scopeInScope: "范围内",
   scopeNothing: "没有选中任何模型，范围保持不变。要清除范围请发送 `/scoped-models clear`。",
+  scopeNotSaved: "没有保存：这次选择一直没有用“保存”确认，此 Bot 的范围保持不变。可以重新发送 `/scoped-models`，或直接写出模型：`/scoped-models provider/id, provider/id`。",
   scopeSet: list => `这个 Bot 的模型范围已设为 ${list}。`,
   scopeCleared: native => `这个 Bot 的模型范围已清除。${native ? "你的 Pi 全局列表重新生效。" : "所有可用模型照常提供。"}`,
   scopeAlreadyClear: "这个 Bot 没有模型范围可以清除，没有任何改动。",
@@ -798,7 +800,8 @@ async function scopedModelsCommand(run: Run, args: string): Promise<Reply> {
     if (chosen.kind === "reply") return { text: chosen.text };
     for (const row of chosen.items) if (!selected.includes(row)) selected.push(row);
   }
-  return selected.length ? apply(selected) : { text: t.tooManyRounds };
+  // The rounds ran out without Save. A selection the owner never confirmed is not a change.
+  return { text: selected.length ? t.scopeNotSaved : t.tooManyRounds };
 }
 
 // ---------------------------------------------------------------------------
@@ -901,7 +904,8 @@ function pathArgument(args: string): string | undefined {
 }
 
 function safeExportName(candidate: string | undefined, sessionId: string, extension: ".html" | ".jsonl"): string {
-  const clean = (value: string) => value.normalize("NFC").replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^[.-]+/, "").replace(/[.\s-]+$/, "").slice(0, 80);
+  // The same 80 units as before, but never half of a surrogate pair: that is not a file name.
+  const clean = (value: string) => piClip(value.normalize("NFC").replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^[.-]+/, "").replace(/[.\s-]+$/, ""), 80);
   const stem = clean((candidate ?? "").replace(extension === ".jsonl" ? /\.jsonl$/i : /\.html?$/i, ""));
   return `${stem || `pi-session-${clean(sessionId).slice(0, 12) || "export"}`}${extension}`;
 }
@@ -1102,34 +1106,71 @@ function treeVisible(tree: PiNativeTree, filter: TreeFilter): PiNativeTreeNode[]
   return visible;
 }
 
-function treePoint(run: Run, tree: PiNativeTree, node: PiNativeTreeNode): TreePoint {
+/**
+ * What every listed point needs from the whole tree, worked out once. The
+ * listing used to rebuild the id index and walk to the root again for every
+ * entry, which made `/tree` quadratic in the length of the session.
+ */
+interface TreeShape { onPath: Set<string>; depth(node: PiNativeTreeNode): number }
+
+function treeShape(tree: PiNativeTree): TreeShape {
   const byId = new Map(tree.nodes.map(entry => [entry.id, entry]));
+  const limit = tree.nodes.length;
+  const parent = (node: PiNativeTreeNode) => (node.parentId ? byId.get(node.parentId) : undefined);
   const onPath = new Set<string>();
-  for (let cursor = tree.leafId ? byId.get(tree.leafId) : undefined, guard = 0; cursor && guard <= tree.nodes.length; guard++) {
+  for (let cursor = tree.leafId ? byId.get(tree.leafId) : undefined, guard = 0; cursor && guard <= limit; guard++) {
     onPath.add(cursor.id);
-    cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+    cursor = parent(cursor);
   }
-  let depth = 0;
-  for (let cursor = node.parentId ? byId.get(node.parentId) : undefined, guard = 0; cursor && guard <= tree.nodes.length; guard++) {
-    if (cursor.childIds.length > 1) depth++;
-    cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
-  }
+  /** Ancestors that branch, by the bounded walk to the root: right for any data, a parent cycle included. */
+  const walk = (node: PiNativeTreeNode): number => {
+    let depth = 0;
+    for (let cursor = parent(node), guard = 0; cursor && guard <= limit; guard++) {
+      if (cursor.childIds.length > 1) depth++;
+      cursor = parent(cursor);
+    }
+    return depth;
+  };
+  const known = new Map<PiNativeTreeNode, number>();
+  const depth = (node: PiNativeTreeNode): number => {
+    // Climb to the nearest ancestor already counted (or to a root), then count back down that chain.
+    const chain: PiNativeTreeNode[] = [], climbed = new Set<PiNativeTreeNode>();
+    let cursor: PiNativeTreeNode | undefined = node, above = 0;
+    while (cursor) {
+      const counted = known.get(cursor);
+      if (counted !== undefined) { above = counted + (cursor.childIds.length > 1 ? 1 : 0); break; }
+      // A parent cycle is not a tree. Count such an entry the long way, exactly as before, and remember nothing.
+      if (climbed.has(cursor)) return walk(node);
+      climbed.add(cursor);
+      chain.push(cursor);
+      cursor = parent(cursor);
+    }
+    for (let index = chain.length - 1; index >= 0; index--) {
+      known.set(chain[index]!, above);
+      above += chain[index]!.childIds.length > 1 ? 1 : 0;
+    }
+    return known.get(node)!;
+  };
+  return { onPath, depth };
+}
+
+function treePoint(run: Run, tree: PiNativeTree, shape: TreeShape, node: PiNativeTreeNode): TreePoint {
   return {
-    id: node.id, node, depth: Math.min(depth, 6),
-    mark: node.id === tree.leafId ? run.t.treeLeaf : onPath.has(node.id) ? run.t.treeOnBranch : run.t.treeOtherBranch,
+    id: node.id, node, depth: Math.min(shape.depth(node), 6),
+    mark: node.id === tree.leafId ? run.t.treeLeaf : shape.onPath.has(node.id) ? run.t.treeOnBranch : run.t.treeOtherBranch,
   };
 }
 
-function treePoints(run: Run, tree: PiNativeTree, filter: TreeFilter): TreePoint[] {
-  return treeVisible(tree, filter).map(node => treePoint(run, tree, node)).reverse();
+function treePoints(run: Run, tree: PiNativeTree, shape: TreeShape, filter: TreeFilter): TreePoint[] {
+  return treeVisible(tree, filter).map(node => treePoint(run, tree, shape, node)).reverse();
 }
 
 /** A position in the list shown, or the exact id of any entry Pi can navigate to, listed or not. */
-function treeTarget(run: Run, tree: PiNativeTree, points: TreePoint[], token: string): TreePoint | undefined {
+function treeTarget(run: Run, tree: PiNativeTree, shape: TreeShape, points: TreePoint[], token: string): TreePoint | undefined {
   const listed = selectByArgument(points, token);
   if (listed) return listed;
   const node = tree.nodes.find(entry => entry.id === token && entry.type !== "usage");
-  return node ? treePoint(run, tree, node) : undefined;
+  return node ? treePoint(run, tree, shape, node) : undefined;
 }
 
 const treeLabel = (point: TreePoint): string => `${"· ".repeat(point.depth)}${oneLine(point.node.preview) || point.node.type}`;
@@ -1160,13 +1201,14 @@ async function summaryChoice(run: Run): Promise<{ summarize: boolean; customInst
 async function treeCommand(run: Run, args: string): Promise<Reply> {
   const { context, t } = run;
   const [tree, settings] = await call(run, Promise.all([context.controls.getTree(context.sessionId), treeSettings(run)]));
-  const points = treePoints(run, tree, settings.filter);
+  const shape = treeShape(tree);
+  const points = treePoints(run, tree, shape, settings.filter);
   if (!tree.nodes.some(node => node.type !== "usage")) return { text: t.treeNone };
   const words = args ? args.split(/\s+/) : [];
   if (!points.length && !words.length) return { text: t.treeNoneFiltered(settings.filter) };
 
   if (words[0] === "label") {
-    const target = words[1] ? treeTarget(run, tree, points, words[1]) : undefined;
+    const target = words[1] ? treeTarget(run, tree, shape, points, words[1]) : undefined;
     if (!target) return { text: t.rejectedNotFound };
     const label = words.slice(2).join(" ").trim();
     await call(run, context.controls.setLabel(context.sessionId, { entryId: target.id, label: label || null }));
@@ -1176,7 +1218,7 @@ async function treeCommand(run: Run, args: string): Promise<Reply> {
   let target: TreePoint | undefined;
   let summary: { summarize: boolean; customInstructions?: string } | undefined;
   if (words.length) {
-    target = treeTarget(run, tree, points, words[0]);
+    target = treeTarget(run, tree, shape, points, words[0]);
     if (!target) return { text: t.rejectedNotFound };
     if (words[1]?.toLowerCase() === "summarize") {
       const instructions = words.slice(2).join(" ").trim();
@@ -1313,8 +1355,11 @@ async function bashCommand(run: Run, command: string, excludeFromContext: boolea
   }));
   const output = result.output.replace(/\s+$/, "");
   const tail = output.length > BASH_REPLY_TAIL_CHARS ? output.slice(-BASH_REPLY_TAIL_CHARS) : output;
-  // The fence must be longer than any backtick run in the output.
-  const fence = "`".repeat(Math.max(3, ...(tail.match(/`+/g) ?? []).map(ticks => ticks.length + 1)));
+  // The fence must be longer than any backtick run in the output. Counted in a loop: output can hold
+  // more runs than a call can take as arguments.
+  let longest = 2;
+  for (const ticks of tail.match(/`+/g) ?? []) if (ticks.length > longest) longest = ticks.length;
+  const fence = "`".repeat(longest + 1);
   const status = result.cancelled ? t.bashCancelled : typeof result.exitCode === "number" ? t.bashExit(result.exitCode) : t.bashNoExit;
   return {
     text: [

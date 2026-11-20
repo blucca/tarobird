@@ -386,6 +386,15 @@ export interface CodexUserMessageInput {
   reviewAdmission?: "native";
   nativeInput?: NativeInputObserver;
   text: string;
+  /**
+   * Exactly what the conversation's owner typed for this turn, set only when the turn is their own
+   * direct message. Absent for everything else the Host sends through here: another Bot's message,
+   * agent-bus, delegated and group-discussion prompts, scheduled jobs, Host repair prompts and
+   * recovery continuations. `text` is what a model should read and may carry context the Host
+   * appended (a quoted message, a media transcript). An engine whose input is also a command
+   * language (Pi's `/name` and `!shell`) takes commands from this alone and reads the rest as prose.
+   */
+  authoredText?: string;
   files: string[];
   locale?: "en" | "zh";
   /** Stable channel/runtime contract. Changes may reconfigure persistent workers. */

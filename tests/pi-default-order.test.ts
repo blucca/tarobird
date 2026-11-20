@@ -20,7 +20,7 @@ async function fixture() {
     bridgeExtensionPath: null, spawnFn: spawner.spawn, idleSweepIntervalMs: 0 });
   cleanups.push(async () => { await adapter.destroy(); await rm(root, { recursive: true, force: true }); });
   const { sessionId } = await adapter.createSession(1);
-  const send = (text = "next") => adapter.sendUserMessage(sessionId, { text, files: [], locale: "en" });
+  const send = (text = "next") => adapter.sendUserMessage(sessionId, { text, authoredText: text, files: [], locale: "en" });
   await send("initial");
   const live = adapter.piNative.getLiveSession!(sessionId)!;
   return { config, configPath, send, live, spawner, adapter, sessionId };

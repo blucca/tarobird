@@ -29,6 +29,12 @@ Pi RPC drops cancelled commands before a queued stdin write, assembles large
 records without rescanning accumulated fragments, and reports unfinished turns
 as interrupted when their adapter is retired. See the
 [scoped verification](client/pi-efficiency-stability-2026-11-20.md).
+The [post-release review](audits/2026-11-20-post-release-review.md) covers imported
+session rediscovery, bounded catalog cleanup and process-exit settlement,
+typed command provenance, literal native-command replies, complete question
+cards and the `pi-state-v1` managed-runtime compatibility fence. The owner-authored
+command field crosses Core and Bridge; other engines ignore it. DeepSeek profile
+refresh and selected-text clipboard ownership are also covered by that review.
 
 [1.5.1 preflight](client/release-1.5.1-preflight.md) records shared Android
 channel versions, cross-host permissions, date refresh, mobile cleanup and the
@@ -2665,8 +2671,10 @@ and the existing network/run/delete suites listed in that audit.
   delayed conversion uses a promised text item. Failures retain the complete
   original with explicit feedback, and stale requests cannot update a different
   conversation's feedback. New copies supersede pending conversion; cancelled
-  clipboard writes are not retried over a newer copy. Regressions:
-  `client-message-plain-text`, `message-copy-plain-review`, `message-plain-copy`,
+  clipboard writes are not retried over a newer copy. Rich selected-text writes
+  retain the same ownership through their plain-text fallback; a later App
+  copy or native Copy/Cut cancels that fallback. Regressions:
+  `client-message-selection-clipboard`, `client-message-plain-text`, `message-copy-plain-review`, `message-plain-copy`,
   `message-plain-clipboard`, `message-actions`,
   `message-selection`, `message-context-menu`, `message-hold` and Markdown parsing.
   Pure App behavior; CLI not applicable.

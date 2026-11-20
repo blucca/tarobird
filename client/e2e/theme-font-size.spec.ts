@@ -16,6 +16,7 @@ test("scrolling past font size to choose a theme never changes the saved reading
   const root = await mkdtemp(path.join(os.tmpdir(), "theme-font-size-"));
   const hub = await HubServer.start({ stateDir: root, clientDir: path.resolve("dist") });
   try {
+    await hub.profile.update({ name: "Demo Host", revision: (await hub.profile.read()).revision });
     await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('alpha','字号助手','fixture')");
     const chat = await hub.store.createConversation("owner", ["alpha"], "字号回归", "font");
     await hub.store.publishBotMessage("alpha", { conversationId: chat.id, blocks: [{ type: "text", text: "切换主题后，聊天正文应保持自己设置的字号。" }], status: "complete" });
@@ -85,6 +86,7 @@ for (const width of [390, 1360]) test(`chosen font size survives themes, chat na
   const root = await mkdtemp(path.join(os.tmpdir(), "font-choice-"));
   const hub = await HubServer.start({ stateDir: root, clientDir: path.resolve("dist") });
   try {
+    await hub.profile.update({ name: "Demo Host", revision: (await hub.profile.read()).revision });
     await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('alpha','字号助手','fixture')");
     const chat = await hub.store.createConversation("owner", ["alpha"], "字号选择", "choice");
     const body = "正文大小应一致，切换主题后也保持。Same reading size: 123.";
@@ -146,6 +148,7 @@ for (const width of [390, 1360]) test(`bold text inside Markdown headings keeps 
   const root = await mkdtemp(path.join(os.tmpdir(), "heading-emphasis-"));
   const hub = await HubServer.start({ stateDir: root, clientDir: path.resolve("dist") });
   try {
+    await hub.profile.update({ name: "Demo Host", revision: (await hub.profile.read()).revision });
     await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('alpha','层级助手','fixture')");
     const chat = await hub.store.createConversation("owner", ["alpha"], "标题层级", "heading");
     const text = "**有台风，而且是周末最明显。** 路径图已发给你。\n\n## 二、对上海的判断：**不会正面登陆，但周末受外围影响明显**\n\n位置：台湾以东近海，**距上海约 710 公里**。";

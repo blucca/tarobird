@@ -10,6 +10,7 @@ import { controlPath, inspectHubService, stopDrainedHub, type DrainedStopGuard, 
 import { withFileMutex as withStateFileMutex } from "../state/file-mutex.js";
 import { buildHostEnvironment, HOST_CONFIG_DIRECTORY_KEYS, HOST_ENGINE_EXECUTABLE_KEYS, HOST_PROXY_KEYS, HOST_PRESERVED_ENVIRONMENT_KEYS, validateHostEnvironmentExecutables } from "./environment.js";
 import { acquireInstanceLock, isInstanceLockOwnerAlive, type InstanceLockHandle } from "../state/instance-lock.js";
+import { readHostEngineSettings } from "../runtime/host-engine-settings.js";
 const withFileMutex = <T>(file: string, operation: () => Promise<T>) => withStateFileMutex(file, operation, { waitTimeoutMs: 45_000 });
 
 type Platform = "darwin" | "linux" | "win32";
@@ -70,6 +71,7 @@ const manifestSchema = z.object({
 type Manifest = z.infer<typeof manifestSchema>;
 const serviceEnvironment = (manifest: Manifest) => ({ ...manifest.environment, ...manifest.extraEnvironment });
 export const SERVICE_EXTRA_ENVIRONMENT_CAPABILITY = "service-extra-environment-v1";
+export const PI_STATE_CAPABILITY = "pi-state-v1";
 const refreshSchema = z.object({ before: manifestSchema, after: manifestSchema });
 const manifestFile = (directory: string) => path.join(directory, "host-service.json");
 const refreshFile = (directory: string) => path.join(directory, "host-service-refresh.json");
@@ -268,9 +270,12 @@ export async function managedServiceEnvironmentDifferences(directory: string, en
   const expected = buildHostEnvironment({ platform: manifest.platform, home: manifest.home, executable: manifest.executable, env });
   return HOST_PRESERVED_ENVIRONMENT_KEYS.filter(key => expected[key] !== (serviceEnvironment(manifest) as Record<string, string | undefined>)[key]);
 }
-async function assertEnvironmentRuntime(entrypoint: string, extraEnvironment?: Record<string, string | undefined>): Promise<void> {
+async function assertEnvironmentRuntime(entrypoint: string, extraEnvironment?: Record<string, string | undefined>, state?: { directory: string; environment?: Record<string, string | undefined> }): Promise<void> {
   const names = Object.keys(extraEnvironment ?? {}).filter(key => extraEnvironment?.[key] !== undefined);
-  if (!names.length) return;
+  // The original extra-environment capability predates Pi. Its presence does
+  // not prove that a runtime's strict service/settings readers accept Pi keys.
+  const piEnvironment = ["PI_EXECUTABLE", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"]
+    .some(key => state?.environment?.[key] !== undefined || extraEnvironment?.[key] !== undefined);
   const packageFile = path.resolve(path.dirname(entrypoint), "../../package.json");
   type RuntimeMetadata = { tarobotHostCapabilities?: unknown };
   let metadata: RuntimeMetadata | null = null;
@@ -279,13 +284,24 @@ async function assertEnvironmentRuntime(entrypoint: string, extraEnvironment?: R
     metadata = JSON.parse(await readFile(packageFile, "utf8")) as RuntimeMetadata;
   } catch { /* Missing/unknown capability is incompatible, never guessed by version. */ }
   const capabilities = metadata?.tarobotHostCapabilities;
-  if (!Array.isArray(capabilities) || !capabilities.includes(SERVICE_EXTRA_ENVIRONMENT_CAPABILITY)) throw new Error(`host_service_runtime_environment_incompatible: selected runtime cannot preserve ${names.sort().join(", ")}`);
+  if (!Array.isArray(capabilities) || !capabilities.includes(PI_STATE_CAPABILITY)) {
+    // A capable Host may start so its owner can repair a damaged settings file.
+    // Only an older reader needs proof that no incompatible Pi path is present.
+    let piPath = false;
+    try { piPath = state ? readHostEngineSettings(state.directory).paths.pi !== undefined : false; }
+    catch { throw new Error("host_service_runtime_pi_state_unverified: engine settings could not be inspected; repair their contents or private file permissions before selecting an older runtime"); }
+    if (piEnvironment || piPath) {
+      const recovery = [piPath ? "reset the Pi program path in engine settings" : "", piEnvironment ? "reinstall the service without Pi environment overrides" : ""].filter(Boolean).join(" and ");
+      throw new Error(`host_service_runtime_pi_state_incompatible: selected runtime cannot read persisted Pi settings; ${recovery} before selecting an older runtime`);
+    }
+  }
+  if (names.length && (!Array.isArray(capabilities) || !capabilities.includes(SERVICE_EXTRA_ENVIRONMENT_CAPABILITY))) throw new Error(`host_service_runtime_environment_incompatible: selected runtime cannot preserve ${names.sort().join(", ")}`);
 }
 /** Read-only capability fence; callers may already hold the service mutex. */
 export async function assertManagedServiceRuntimeCompatible(directory: string, runtime: { entrypoint: string }, options: ManagedServiceOptions = {}): Promise<void> {
   directory = await canonicalDirectory(directory);
   const manifest = await readManifest(directory, options);
-  if (manifest) await assertEnvironmentRuntime(runtime.entrypoint, manifest.extraEnvironment);
+  await assertEnvironmentRuntime(runtime.entrypoint, manifest?.extraEnvironment, { directory, environment: manifest?.environment });
   if (manifest?.platform === "win32") await assertWindowsHostLauncher(runtime.entrypoint);
 }
 export const HOST_SUPERVISOR_EXIT_CODE = 78;
@@ -461,7 +477,7 @@ export async function installManagedService(directory: string, entrypoint: strin
     const extraKeys = new Set<string>([...HOST_CONFIG_DIRECTORY_KEYS, ...HOST_PROXY_KEYS]);
     const environment = Object.fromEntries(Object.entries(inherited).filter(([key]) => !extraKeys.has(key)));
     const extraEnvironment = Object.fromEntries(Object.entries(inherited).filter(([key]) => extraKeys.has(key)));
-    await assertEnvironmentRuntime(selected.entrypoint, extraEnvironment);
+    await assertEnvironmentRuntime(selected.entrypoint, extraEnvironment, { directory, environment });
     let windowsUserSid = options.windowsUserSid;
     if (platform === "win32" && !windowsUserSid) {
       const who = await (options.runner ?? defaultRunner)("whoami.exe", ["/user", "/fo", "csv", "/nh"]);
@@ -639,7 +655,7 @@ async function stop(manifest: Manifest, options: ManagedServiceOptions): Promise
 }
 async function start(manifest: Manifest, options: ManagedServiceOptions): Promise<void> {
   const selected = await selectedRuntime(manifest.directory, manifest.entrypoint, options);
-  await assertEnvironmentRuntime(selected.entrypoint, manifest.extraEnvironment);
+  await assertEnvironmentRuntime(selected.entrypoint, manifest.extraEnvironment, { directory: manifest.directory, environment: manifest.environment });
   if (selected.entrypoint !== manifest.entrypoint || selected.executable !== manifest.executable) manifest = await refreshStoppedRuntime(manifest, selected, options);
   await verifyArtifacts(manifest);
   const state = await osStatus(manifest, options);
@@ -666,7 +682,7 @@ async function start(manifest: Manifest, options: ManagedServiceOptions): Promis
   if (!ready.running || !ownsHub(manifest, owner, ready)) throw new Error("host_service_start_unconfirmed: Hub is reachable but its OS supervision is not confirmed");
 }
 async function refreshStoppedRuntime(manifest: Manifest, selected: { entrypoint: string; executable: string; revisionId: string }, options: ManagedServiceOptions): Promise<Manifest> {
-  await assertEnvironmentRuntime(selected.entrypoint, manifest.extraEnvironment);
+  await assertEnvironmentRuntime(selected.entrypoint, manifest.extraEnvironment, { directory: manifest.directory, environment: manifest.environment });
   const state = await osStatus(manifest, options);
   if (state.error) throw new Error(state.error);
   if (manifest.enabled || state.enabled || state.supervisorRunning || (await (options.inspect ?? inspectHubService)(manifest.directory)).running) throw new Error("host_service_stop_before_runtime_change");
@@ -735,7 +751,7 @@ export async function refreshManagedServiceRuntime(directory: string, runtime: {
     const manifest = await readManifest(directory, options);
     if (!manifest) return managedServiceStatus(directory, options);
     const selected = await selectedRuntime(directory, manifest.entrypoint, options);
-    await assertEnvironmentRuntime(selected.entrypoint, manifest.extraEnvironment);
+    await assertEnvironmentRuntime(selected.entrypoint, manifest.extraEnvironment, { directory, environment: manifest.environment });
     if (runtime.entrypoint !== selected.entrypoint || runtime.executable !== selected.executable) throw new Error("host_service_runtime_pair_mismatch");
     await refreshStoppedRuntime(manifest, selected, options);
     return managedServiceStatus(directory, options);
@@ -775,7 +791,7 @@ export async function enableManagedServiceOnLogin(directory: string, options: Ma
     if (state.error) throw new Error(state.error);
     if (state.supervisorRunning || (await (options.inspect ?? inspectHubService)(directory)).running) throw new Error("host_service_enable_requires_stopped");
     const selected = await selectedRuntime(directory, manifest.entrypoint, options);
-    await assertEnvironmentRuntime(selected.entrypoint, manifest.extraEnvironment);
+    await assertEnvironmentRuntime(selected.entrypoint, manifest.extraEnvironment, { directory, environment: manifest.environment });
     if (selected.entrypoint !== manifest.entrypoint || selected.executable !== manifest.executable) manifest = await refreshStoppedRuntime(manifest, selected, options);
     await verifyArtifacts(manifest);
     await saveIntent(manifest, true);

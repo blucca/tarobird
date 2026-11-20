@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { closeSync, openSync, readSync } from "node:fs";
 import { PassThrough, Writable } from "node:stream";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import type { PiSpawn } from "../../src/codex/pi-rpc-client.js";
@@ -39,6 +40,19 @@ export interface FakePiRun {
   finish(options?: { aborted?: boolean }): void;
   readonly command: Command;
   readonly process: FakePiProcess;
+}
+
+/** Observed: Pi takes a session's id from the header line of the file it opens, whatever the file is called. */
+function sessionHeaderId(file: string | undefined): string | undefined {
+  if (!file) return;
+  let handle: number | undefined;
+  try {
+    handle = openSync(file, "r");
+    const buffer = Buffer.alloc(64 * 1024);
+    const text = buffer.subarray(0, readSync(handle, buffer, 0, buffer.length, 0)).toString("utf8");
+    const header = JSON.parse(text.split("\n", 1)[0]!) as { type?: unknown; id?: unknown };
+    return header.type === "session" && typeof header.id === "string" && header.id ? header.id : undefined;
+  } catch { return; } finally { if (handle !== undefined) closeSync(handle); }
 }
 
 export interface FakePiOptions {
@@ -90,8 +104,8 @@ export class FakePiProcess extends EventEmitter {
     this.models = options.models ?? [fakePiModel("fakeprov", "dup-model"), fakePiModel("fakeprov", "plain-model", { reasoning: false, input: ["text"] }), fakePiModel("fakeprov2", "dup-model")];
     const sessionIdArg = spawnArgs.args[spawnArgs.args.indexOf("--session-id") + 1];
     const sessionPath = spawnArgs.args.includes("--session") ? spawnArgs.args[spawnArgs.args.indexOf("--session") + 1] : undefined;
-    // Pi names session files `<timestamp>_<id>.jsonl`.
-    const resumedId = sessionPath?.match(/_([^_/\\]+)\.jsonl$/)?.[1];
+    // Pi names session files `<timestamp>_<id>.jsonl`; a file that exists is identified by its header.
+    const resumedId = sessionHeaderId(sessionPath) ?? sessionPath?.match(/_([^_/\\]+)\.jsonl$/)?.[1];
     const sessionId = options.sessionId ?? resumedId ?? (spawnArgs.args.includes("--session-id") ? sessionIdArg : "fake-session-1");
     const model = options.model ?? this.models[0];
     this.state = {
@@ -328,9 +342,9 @@ export class FakePiProcess extends EventEmitter {
       case "set_auto_compaction": this.state.autoCompactionEnabled = command.enabled; this.respond(command); return;
       case "set_auto_retry": case "abort_retry": case "abort_bash": this.respond(command); return;
       case "switch_session": {
-        // Observed: Pi switches even to a path that does not exist. The id comes from the file name here.
+        // Observed: Pi switches even to a path that does not exist. Only then does the id come from the file name here.
         const target = String(command.sessionPath ?? "");
-        const id = target.match(/_([^_/\\]+?)(?:-\d+)?\.jsonl$/)?.[1];
+        const id = sessionHeaderId(target) ?? target.match(/_([^_/\\]+?)(?:-\d+)?\.jsonl$/)?.[1];
         if (this.options.cancelSwitch) { this.respond(command, { cancelled: true }); return; }
         if (id) { this.state.sessionId = id; this.state.sessionFile = target; this.entries = []; this.messages = []; }
         this.respond(command, { cancelled: false }); return;

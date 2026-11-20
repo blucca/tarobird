@@ -123,9 +123,16 @@ Bot's selection never changes another Bot's or the user's own `dsh web` default.
 Changes made in the user's DSH, including installed or updated plugins, reach a
 Bot at its next Host start; an unchanged package file is not copied again. Each
 Bot therefore holds its own copy of the installed plugins on disk.
+If a refresh fails partway through, completed file records are retained so a
+retry does not copy unchanged package files again. Replacing a file with a link
+is staged before rename; if Windows cannot create that link, the copy fallback
+also leaves the old file intact until its replacement is ready.
 `.tarobird-profile-mirror.json` in the private profile lists what TaroBird
 created there. Later starts remove only those entries and bare links, never
-recursively, and keep and report anything else. An existing Bot's `profiles`
+recursively, and keep and report anything else. A previously mirrored
+directory that cannot yet be replaced because it contains an unowned file
+keeps its ownership record; after the owner removes that file, a later refresh
+can replace the now-empty directory. An existing Bot's `profiles`
 link or junction is replaced by removing the link only. Before Search MCP
 registration,
 it validates the installed plugin marker, declared entrypoint, and the bounded

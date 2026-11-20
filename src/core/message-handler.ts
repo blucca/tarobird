@@ -2590,7 +2590,11 @@ async function runNormalizedCoreMessage(
         let result: Awaited<ReturnType<CoreBridgeLike["handleAuthorizedMessage"]>>;
         try {
           workflowOutcome = "failed";
-          result = await runBridgeTurn(bridgeTurnInput);
+          // Only this first turn is the owner's message as typed. `requestText` may already carry transcripts and
+          // the Bridge adds a quoted message; the repair prompts below are the Host's own. A Bot's message, an
+          // agent-bus prompt and a group-discussion turn were not typed by the owner of this conversation.
+          result = await runBridgeTurn(normalized.botSource || normalized.agentBus || normalized.groupDiscussion
+            ? bridgeTurnInput : { ...bridgeTurnInput, authoredText: normalized.text });
         } catch (error) {
           if (error instanceof EngineNativeInputUnsentError) throw error;
           if (classifyCoreTurnTermination(error, runController.signal).kind !== "error") {

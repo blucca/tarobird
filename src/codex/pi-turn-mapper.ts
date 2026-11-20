@@ -249,9 +249,9 @@ export async function buildPiPrompt(input: { text: string; files: string[]; mode
 }
 
 export interface PiDialogQuestion {
+  /** Title and, below it, the explanation: the shared card shows this text and nothing else about the question. */
   question: string;
   header?: string;
-  detail?: string;
   options: Array<{ label: string; description?: string }>;
   multiSelect: false;
   /** Free-text dialogs: the card shows an input instead of choices. */
@@ -268,6 +268,16 @@ const DIALOG_COPY = {
 } as const;
 
 /**
+ * A question's title with its explanation under it. The shared question card
+ * renders the question text and the options; an explanation sent in a field
+ * of its own never reached the owner, who then confirmed a title alone.
+ */
+export function piQuestionWithDetail(title: string, detail: string | undefined): string {
+  const body = detail?.trim();
+  return body ? `${title}\n\n${body}` : title;
+}
+
+/**
  * Map an extension dialog to the shared question form. Blank titles and
  * options get visible text: the card drops blank ones, and answers are matched
  * back to the dialog by position (`piQuestionSelection`).
@@ -277,7 +287,7 @@ export function piDialogQuestion(request: PiExtensionUiRequest, locale: "en" | "
   const title = (value: string) => piQuestionText(value, copy.untitled);
   switch (request.method) {
     case "select": return { question: title(request.title), header, options: request.options.map(label => ({ label: piQuestionText(label, copy.empty) })), multiSelect: false, allowFreeText: false };
-    case "confirm": return { question: title(request.title), header, ...(request.message ? { detail: request.message } : {}), options: [{ label: copy.yes }, { label: copy.no }], multiSelect: false, allowFreeText: false };
+    case "confirm": return { question: piQuestionWithDetail(title(request.title), request.message), header, options: [{ label: copy.yes }, { label: copy.no }], multiSelect: false, allowFreeText: false };
     case "input": return { question: title(request.title), header, options: [], multiSelect: false, allowFreeText: true, required: false, input: { kind: "text", ...(request.placeholder ? { placeholder: request.placeholder } : {}) } };
     case "editor": return { question: title(request.title), header, options: [], multiSelect: false, allowFreeText: true, required: false, input: { kind: "multiline", ...(request.prefill ? { prefill: request.prefill } : {}) } };
     default: return;

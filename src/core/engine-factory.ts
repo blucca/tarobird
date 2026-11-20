@@ -10,6 +10,7 @@ import { prepareBotInstructions } from "../runtime/bot-instructions.js";
 import { ProcessCodexAdapter } from "../codex/process-adapter.js";
 import { ClaudeStreamAdapter } from "../codex/claude-stream-adapter.js";
 import { PiRpcAdapter } from "../codex/pi-rpc-adapter.js";
+import { hasCorePostTurnDelivery } from "./delivery.js";
 import { KimiAcpAdapter } from "../codex/kimi-acp-adapter.js";
 import { ProcessAntigravityAdapter } from "../codex/antigravity-adapter.js";
 import { CodexAppServerAdapter } from "../codex/app-server-adapter.js";
@@ -532,6 +533,8 @@ async function createAdapter(
       launch: { command: config.piExecutable, args: [] },
       workspacePath, stateDir: config.stateDir, childEnv, configPath,
       nativeSearchMcp,
+      // Replies the adapter writes for Pi's own commands are shown, never executed as delivery.
+      carriesHostDirectives: hasCorePostTurnDelivery,
       // Pi has no native turn deadline; retain an inactivity watchdog only.
       turnTimeoutMs: null,
     });

@@ -59,7 +59,12 @@ it("reuses the topic recording transcript across all discussion turns", async ()
   await until(async () => channels.every(c => !c.isBusy()));
   const run = (await hub.groupDiscussions.view("owner", chat.id)).run!;
   const cards = (await hub.store.listMessages("owner", chat.id)).messages.filter(m => m.authorType === "bot" && /Audio transcription complete/.test(blocksText(m.blocks))).length;
+  expect(run.status).toBe("completed");
   expect(run.steps.length).toBe(6);
+  for (const step of run.steps) expect(step).toMatchObject({ status: "completed", result: "answered" });
   expect(uploads.length).toBe(1);
   expect(new Set(uploads).size).toBe(1);
-});
+// Six real Hub/Gateway/SQLite turns exceed the default 5 s under parallel load
+// on both the baseline and current source. Keep the existing wait budget here;
+// this bounds completion, while the assertions above still prove every turn.
+}, 30_000);

@@ -505,7 +505,8 @@ describe("extension dialogs as question cards", () => {
   it("maps the recorded select, confirm, input and editor dialogs", () => {
     const [select, confirm, input, editor] = recorded();
     expect(piDialogQuestion(select!)).toEqual({ question: "Pick one", header: "Extension", options: [{ label: "A" }, { label: "B" }], multiSelect: false, allowFreeText: false });
-    expect(piDialogQuestion(confirm!)).toEqual({ question: "Sure?", header: "Extension", detail: "Really?", options: [{ label: "Yes" }, { label: "No" }], multiSelect: false, allowFreeText: false });
+    // The message is part of the text the card shows; a separate field never reached the owner.
+    expect(piDialogQuestion(confirm!)).toEqual({ question: "Sure?\n\nReally?", header: "Extension", options: [{ label: "Yes" }, { label: "No" }], multiSelect: false, allowFreeText: false });
     expect(piDialogQuestion(input!)).toEqual({ question: "Type", header: "Extension", options: [], multiSelect: false, allowFreeText: true, required: false, input: { kind: "text", placeholder: "placeholder" } });
     expect(piDialogQuestion(editor!)).toEqual({ question: "Edit", header: "Extension", options: [], multiSelect: false, allowFreeText: true, required: false, input: { kind: "multiline", prefill: "prefill" } });
   });

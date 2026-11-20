@@ -43,7 +43,30 @@ async function readPiCatalog(env: NodeJS.ProcessEnv, cwd?: string): Promise<PiMo
     const defaultModel = result.current ? encodePiModel(result.current.provider, result.current.modelId) : undefined;
     return { status: models.length ? "ready" : "no-models", models,
       ...(defaultModel && models.some(model => model.id === defaultModel) ? { defaultModel } : {}) };
-  } finally { if (temporary) await rm(temporary, { recursive: true, force: true }); }
+  } finally { if (temporary) await removeCatalogDirectory(temporary); }
+}
+
+const REMOVE_RETRY_MS = 250;
+/** Longer than the catalog process can take to end: its close escalates to a kill within about eight seconds. */
+const REMOVE_RETRIES = 48;
+
+/**
+ * Remove the private directory a workspace-free read ran in. The catalog
+ * process is closed in the background and may still be exiting; Windows does
+ * not remove a directory that is some process's working directory (EBUSY,
+ * EPERM). A removal that fails must not replace the catalog that was read, and
+ * must not make its caller wait: it is tried again, for a bounded time, until
+ * the process has gone.
+ */
+async function removeCatalogDirectory(directory: string): Promise<void> {
+  const remove = () => rm(directory, { recursive: true, force: true }).then(() => true, () => false);
+  if (await remove()) return;
+  void (async () => {
+    for (let attempt = 0; attempt < REMOVE_RETRIES; attempt++) {
+      await new Promise<void>(resolve => { const timer = setTimeout(resolve, REMOVE_RETRY_MS); timer.unref?.(); });
+      if (await remove()) return;
+    }
+  })();
 }
 
 export function resetPiModelDiscoveryForTest(): void { cache.clear(); }

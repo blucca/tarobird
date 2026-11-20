@@ -355,6 +355,18 @@ export class PiJsonlDecoder {
   }
 }
 
+/**
+ * Cut to at most `units` UTF-16 code units without ending inside a surrogate
+ * pair. Lengths here are budgets in code units (file names, RPC fields);
+ * counting characters instead would let a name of astral characters grow to
+ * twice the units and four bytes each.
+ */
+export function piClip(value: string, units: number): string {
+  if (value.length <= units) return value;
+  const cut = value.slice(0, units), last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
 export function encodePiRecord(record: object): string {
   return `${JSON.stringify(record)}\n`;
 }

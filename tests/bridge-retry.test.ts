@@ -142,6 +142,25 @@ it("resends the unadmitted input, but never reverts to the original task after a
   expect(f.send.mock.calls.map(c => c[1].engineRecoveryContinuation)).toEqual([undefined, undefined, true, true]);
 });
 
+it("hands the owner's typed text over with the input itself, never with the Host's own continuation", async () => {
+  const f = fixture();
+  f.send.mockRejectedValueOnce(f.fail("input")).mockRejectedValueOnce(f.fail("continue")).mockResolvedValueOnce({ text: "done" });
+  const result = f.bridge.handleAuthorizedMessage({ ...f.input, text: "!make deploy", authoredText: "!make deploy", files: [] }); await f.waiting.promise;
+  await vi.advanceTimersByTimeAsync(17_000); await result;
+  expect(f.send.mock.calls.map(c => c[1].text)).toEqual(["!make deploy", "!make deploy", ENGINE_RECOVERY_CONTINUATION]);
+  // An input that was never admitted is repeated as typed. A continuation is the Host's prompt: an engine
+  // that reads commands from the typed text (Pi) must not run the command a second time because of it.
+  expect(f.send.mock.calls.map(c => c[1].authoredText)).toEqual(["!make deploy", "!make deploy", undefined]);
+});
+
+it("does not invent typed text for input that has none", async () => {
+  const f = fixture();
+  f.send.mockResolvedValueOnce({ text: "done" });
+  await f.bridge.handleAuthorizedMessage({ ...f.input, text: "!make deploy", files: [], replyContext: { messageId: "m1", text: "quoted" } });
+  expect(f.send.mock.calls[0]![1]).not.toHaveProperty("authoredText");
+  expect(f.send.mock.calls[0]![1].text).toBe("!make deploy\n\n[Quoted message #m1]\nquoted");
+});
+
 it("Stop wins during recovery and retains the native context for a later manual continuation", async () => {
   const f = fixture(), abort = new AbortController(); f.send.mockRejectedValue(f.fail());
   const result = f.bridge.handleAuthorizedMessage({ ...f.input, abortSignal: abort.signal });

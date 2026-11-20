@@ -39,7 +39,10 @@ export function parsePiModels(rows: unknown): PiModelChoice[] {
     const model = row as PiModel;
     if (typeof model.provider !== "string" || !model.provider || typeof model.id !== "string" || !model.id
       || /\p{Cc}/u.test(model.provider + model.id)) continue;
-    const id = encodePiModel(model.provider, model.id);
+    let id: string;
+    // An identity that is not well-formed text (half a surrogate pair) cannot be encoded. One such row
+    // from a custom provider must not take the whole catalog with it.
+    try { id = encodePiModel(model.provider, model.id); } catch { continue; }
     if (id.length > 512 || seen.has(id)) continue;
     const name = typeof model.name === "string" && model.name.trim() && !/\p{Cc}/u.test(model.name)
       ? model.name.trim().slice(0, 160) : model.id;

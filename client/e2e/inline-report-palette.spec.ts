@@ -253,7 +253,12 @@ test('production-minified data tokens remain usable by existing widget scripts',
   const outDir = await mkdtemp(path.join(tmpdir(), 'mono-chart-production-'));
   let server: Awaited<ReturnType<typeof preview>> | undefined;
   try {
-    await build({ logLevel: 'error', build: { outDir, emptyOutDir: true, rollupOptions: { input: path.resolve('e2e/fixtures/report-palette.html') } } });
+    // Keep the real App entry in this production build. Its asset guards verify
+    // the bundled canvas transforms; a report-only graph cannot satisfy them.
+    // The extra report entry exercises the same minifier without bypassing guards.
+    await build({ logLevel: 'error', build: { outDir, emptyOutDir: true, rollupOptions: { input: {
+      app: path.resolve('index.html'), report: path.resolve('e2e/fixtures/report-palette.html'),
+    } } } });
     server = await preview({ build: { outDir }, preview: { host: '127.0.0.1', port: 0, strictPort: false } });
     await page.goto(server.resolvedUrls.local[0]! + 'e2e/fixtures/report-palette.html');
     await expect(page.locator('.inline-report')).toBeVisible();

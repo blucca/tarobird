@@ -58,6 +58,10 @@ export class PiRpcTimeoutError extends Error {
 }
 
 const STDERR_TAIL_CHARS = 8 * 1024;
+/** After Pi has exited: how long both output pipes must stay quiet before the client stops waiting for them to close. */
+const EXIT_STDIO_GRACE_MS = 1_000;
+/** After Pi has exited: the longest the client keeps reading, however much another holder of the pipes still writes. */
+const EXIT_STDIO_LIMIT_MS = 3_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const QUICK_COMMAND_TIMEOUT_MS = 30_000;
 /** These run extension code, a shell command, a model call or a human dialog, so they have no default deadline. */
@@ -84,8 +88,12 @@ export class PiRpcClient {
 
   private constructor(private readonly child: ChildProcess, private readonly killTree: (pid: number | undefined) => void | Promise<void>) {
     this.exited = new Promise(resolve => {
+      let quiet: ReturnType<typeof setTimeout> | undefined;
+      let settle: ReturnType<typeof setImmediate> | undefined;
       const finish = (code: number | null, signal: NodeJS.Signals | null) => {
         if (this.exit) return;
+        clearTimeout(quiet);
+        if (settle) clearImmediate(settle);
         try { for (const line of this.decoder.end()) this.receive(line); } catch { /* an oversized trailing record is dropped */ }
         this.exit = { code, signal, expected: this.closing, stderrTail: sanitizePiErrorText(this.stderrTail, 1200) };
         for (const [id, request] of this.pending) { this.pending.delete(id); request.cleanup(); request.reject(new PiRpcClosedError(request.command, this.exit)); }
@@ -94,6 +102,39 @@ export class PiRpcClient {
       // `close` fires after stdio drained; `error` covers a failed spawn, where `close` may never come.
       child.once("close", finish);
       child.once("error", (error: NodeJS.ErrnoException) => { this.spawnError ??= error; finish(null, null); });
+      // `close` also waits for every other process that holds these pipes. A process that inherited Pi's
+      // stdout or stderr and outlives it (an extension's own helper, a launcher chain) would leave this
+      // client "alive" with no peer: requests never answered, the session unusable until that process
+      // ends. So once Pi has exited, wait only until both pipes have fallen quiet (output still arriving
+      // is still read), and never longer than a fixed limit however much such a process writes; then
+      // close our ends. Closing stdin is also Pi's own signal to shut down, should a Pi somehow remain
+      // behind them.
+      child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+        const deadline = Date.now() + EXIT_STDIO_LIMIT_MS;
+        const end = () => {
+          if (this.exit) return;
+          try { child.stdin?.destroy(); } catch { /* already closed */ }
+          finish(code, signal);
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        };
+        const arm = () => {
+          if (this.exit) return;
+          clearTimeout(quiet);
+          if (settle) { clearImmediate(settle); settle = undefined; }
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) { end(); return; }
+          quiet = setTimeout(() => {
+            // A stalled event loop runs this timer before it delivers output that was already waiting
+            // in the pipe. One more turn lets that output arrive, and re-arm, first.
+            settle = setImmediate(() => { settle = undefined; end(); });
+          }, Math.min(EXIT_STDIO_GRACE_MS, remaining));
+          quiet.unref?.();
+        };
+        child.stdout?.on("data", arm);
+        child.stderr?.on("data", arm);
+        arm();
+      });
     });
     child.stdout?.on("data", (chunk: Buffer) => {
       let lines: string[];

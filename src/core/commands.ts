@@ -2652,6 +2652,15 @@ async function applyCoreGoalCommand(
     return true;
   }
 
+  if (cfg.engine === "pi") {
+    // Pi has no goal mode and its adapter has no structured goal API. Without this the command either
+    // threw or opened a run card that failed with a generic error.
+    await sendCoreCommandMarkdown(input, normalized, "/goal", locale === "en"
+      ? "Pi has no /goal mode, so nothing was started and no goal was changed. Send the task as an ordinary message, or switch to Codex, Claude or DeepSeek for a goal."
+      : "Pi 没有 /goal 目标模式，本次没有启动任何任务，也没有改动目标。请直接发送任务；需要目标模式时请切换到 Codex、Claude 或 DeepSeek。");
+    return true;
+  }
+
   const goalInput = {
     chatId: normalized.bridgeChatId,
     userId: normalized.bridgeUserId,

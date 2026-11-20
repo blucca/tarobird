@@ -120,3 +120,44 @@ for (const nextCopy of ["message", "App", "native"] as const) test(`a delayed fi
     await expect(page.locator("#paste")).toHaveValue("Latest copy");
   } finally { await page.close(); await server.close(); }
 });
+
+for (const nextCopy of ["App", "native"] as const) test(`a rejected rich selection cannot replace a newer ${nextCopy} clipboard value`, async ({ page, context, browserName }) => {
+  if (browserName === "chromium") await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const server = await openProbe(page);
+  try {
+    await page.evaluate(async () => {
+      const selectionUrl = "/src/message-selection-clipboard.ts";
+      const { writeMessageSelection } = await import(selectionUrl);
+      const clipboardUrl = "/src/clipboard-write.ts";
+      const { writeClipboardText } = await import(clipboardUrl);
+      // Only the earlier rich write is delayed. The newer write and the final
+      // paste use the browser's actual clipboard.
+      navigator.clipboard.write = () => new Promise<void>((_, reject) => { (window as any).rejectRich = reject; });
+      for (const id of ["rich", "latest"]) {
+        const button = document.createElement("button"); button.id = id; button.textContent = id;
+        button.onclick = () => (id === "rich"
+          ? writeMessageSelection("Earlier selection", "<p>Earlier selection</p>")
+          : writeClipboardText("Latest copy")).then(
+          () => { (window as any)[`${id}Done`] = true; },
+          () => { (window as any)[`${id}Done`] = true; },
+        );
+        document.body.append(button);
+      }
+    });
+    await page.locator("#rich").click();
+    await expect.poll(() => page.evaluate(() => !!(window as any).rejectRich)).toBe(true);
+    if (nextCopy === "App") {
+      await page.locator("#latest").click();
+      await expect.poll(() => page.evaluate(() => (window as any).latestDone)).toBe(true);
+    } else {
+      await page.locator("#paste").fill("Latest copy");
+      await page.locator("#paste").selectText();
+      await page.keyboard.press("ControlOrMeta+C");
+      await page.locator("#paste").fill("");
+    }
+    await page.evaluate(() => (window as any).rejectRich(new Error("HTML clipboard unavailable")));
+    await expect.poll(() => page.evaluate(() => (window as any).richDone)).toBe(true);
+    await page.locator("#paste").click(); await page.keyboard.press("ControlOrMeta+V");
+    await expect(page.locator("#paste")).toHaveValue("Latest copy");
+  } finally { await page.close(); await server.close(); }
+});

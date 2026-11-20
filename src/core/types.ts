@@ -136,6 +136,8 @@ export interface CoreBridgeLike {
     messageThreadId?: number;
     locale?: "en" | "zh";
     text: string;
+    /** The owner's own typed text for this turn; see `CodexUserMessageInput.authoredText`. */
+    authoredText?: string;
     replyContext?: {
       messageId: string;
       text: string;

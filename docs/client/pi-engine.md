@@ -139,6 +139,10 @@ native session and binds its actual workspace; a forged path in a stale card
 cannot replace the validated path. `/detach` leaves the native history intact.
 Forking or creating a session updates the conversation binding only after Pi
 confirms the new identity.
+Imported copies receive a session-id suffix so they can be rediscovered after
+the worker exits. Existing imports with a custom filename are matched by a
+bounded header scan in this Bot's session directory; the header identity and
+workspace must still match. The original file is not overwritten.
 
 Native session discovery follows Pi's `PI_CODING_AGENT_SESSION_DIR`, project and
 user `sessionDir` settings, and default workspace directory. Tilde, relative and
@@ -166,6 +170,15 @@ native usage and a per-model cost breakdown. Commands that
 require Pi's terminal surface explain where to run them; they are not submitted
 to a language model as ordinary text. `!` and `!!` retain Pi shell-command
 semantics and respect Normal-mode approval.
+Commands are parsed from the owner's typed text, separately from quoted replies
+or media context. A quote is never appended to a shell or extension command's
+arguments. Templates and skills may receive that context as model input.
+Bot messages, scheduled work, delegation and recovery prompts are model input,
+not native Pi commands. Confirmations show both the title and explanation,
+including the scope of user-wide settings. Replies produced by native commands
+display tag-shaped text literally, so `/copy` cannot resend an earlier file or
+recreate an earlier schedule. Explicit exports still use the request's output
+directory and ordinary model deliveries are unchanged.
 
 In a direct chat, plain text supplements the current Pi task by default. Choose
 **Next turn** to use TaroBird's visible Host queue. This queue is separate from
@@ -210,6 +223,17 @@ It also lists the managed Search MCP when launch policy would enable it. This is
 still a partial metadata catalog, not proof of loaded or working tools. Background
 Host environments preserve Pi's native agent/session-directory settings, including
 relative and tilde forms; native Pi resolves them in its workspace.
+
+Pi program-path settings and service environment overrides require a Host
+runtime declaring `pi-state-v1`. The managed-service and CLI update preflight
+reject an older runtime that cannot read those keys, before changing the
+service or settings. To return to such a runtime, first reset the Pi program
+path and reinstall the service without Pi environment overrides, as indicated
+by the error. Other engine settings are preserved. This preflight cannot
+protect an old executable launched manually outside the managed update flow.
+A Pi-capable runtime can still start its service when engine settings need
+repair; each engine retains its own strict settings reader. An older runtime
+is refused when unreadable settings prevent verifying compatibility.
 
 ## Implementation and verification boundaries
 

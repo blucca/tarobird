@@ -1,4 +1,4 @@
-import { writeClipboardText, writeClipboard } from "./clipboard-write.js";
+import { claimClipboardWrite } from "./clipboard-write.js";
 /** A clipboard-only projection. Never insert marker text into the live message
  * DOM or change the selection; streaming, double-click and native editing keep
  * their existing owners. Ordinary/partial selections keep native copying. */
@@ -148,11 +148,26 @@ export function installMessageSelectionCopy(): () => void {
 }
 
 export async function writeMessageSelection(text: string, html?: string): Promise<void> {
-  if (html && typeof ClipboardItem !== "undefined" && typeof navigator.clipboard?.write === "function") {
-    try {
-      await writeClipboard([new ClipboardItem({ "text/plain": new Blob([text], { type: "text/plain" }), "text/html": new Blob([html], { type: "text/html" }) })]);
-      return;
-    } catch { /* Text-only platforms may still support the existing copy API. */ }
+  const current = claimClipboardWrite();
+  // A rejected rich write may arrive after another App or system copy. Only
+  // the original owner may fall back; that fallback must not claim a new turn.
+  const nativeCopy = () => { claimClipboardWrite(); };
+  const document = globalThis.document;
+  document?.addEventListener("copy", nativeCopy, true);
+  document?.addEventListener("cut", nativeCopy, true);
+  try {
+    if (html && typeof ClipboardItem !== "undefined" && typeof navigator.clipboard?.write === "function") {
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ "text/plain": new Blob([text], { type: "text/plain" }), "text/html": new Blob([html], { type: "text/html" }) })]);
+        return;
+      } catch (error) {
+        if (!current()) throw error;
+        // Text-only platforms may still support the existing copy API.
+      }
+    }
+    await navigator.clipboard.writeText(text);
+  } finally {
+    document?.removeEventListener("copy", nativeCopy, true);
+    document?.removeEventListener("cut", nativeCopy, true);
   }
-  await writeClipboardText(text);
 }

@@ -389,11 +389,11 @@ it("rejects runtime rebinding until the OS owner is explicitly stopped", async (
   await expect(refreshManagedServiceRuntime(f.directory, { entrypoint: f.entrypoint, executable: process.execPath }, f.options)).rejects.toThrow("host_service_stop_before_runtime_change");
 });
 it("matches desktop engine PATH vectors and preserves only validated engine path overrides", () => {
-  expect(buildHostEnvironment({ platform: "darwin", home: "/Users/Case", executable: "/runtime/node", env: { PATH: "/usr/bin", CLAUDE_EXECUTABLE: "/custom/claude", API_KEY: "secret" } })).toEqual({
-    HOME: "/Users/Case", PATH: "/runtime:/Users/Case/.local/bin:/Users/Case/.npm-global/bin:/Users/Case/.kimi-code/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin", CLAUDE_EXECUTABLE: "/custom/claude",
+  expect(buildHostEnvironment({ platform: "darwin", home: "/Users/Tester", executable: "/runtime/node", env: { PATH: "/usr/bin", CLAUDE_EXECUTABLE: "/custom/claude", API_KEY: "secret" } })).toEqual({
+    HOME: "/Users/Tester", PATH: "/runtime:/Users/Tester/.local/bin:/Users/Tester/.npm-global/bin:/Users/Tester/.kimi-code/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin", CLAUDE_EXECUTABLE: "/custom/claude",
   });
-  const win = buildHostEnvironment({ platform: "win32", home: "C:\\Users\\Case", executable: "C:\\runtime\\node.exe", env: { Path: "C:\\Windows", APPDATA: "C:\\Users\\Case\\AppData\\Roaming" } });
-  expect(win.PATH).toBe("C:\\runtime;C:\\Users\\Case\\.local\\bin;C:\\Users\\Case\\.npm-global\\bin;C:\\Users\\Case\\.kimi-code\\bin;C:\\Users\\Case\\AppData\\Roaming\\npm;C:\\Users\\Case\\.cargo\\bin;C:\\Users\\Case\\scoop\\shims;C:\\Windows");
+  const win = buildHostEnvironment({ platform: "win32", home: "C:\\Users\\Tester", executable: "C:\\runtime\\node.exe", env: { Path: "C:\\Windows", APPDATA: "C:\\Users\\Tester\\AppData\\Roaming" } });
+  expect(win.PATH).toBe("C:\\runtime;C:\\Users\\Tester\\.local\\bin;C:\\Users\\Tester\\.npm-global\\bin;C:\\Users\\Tester\\.kimi-code\\bin;C:\\Users\\Tester\\AppData\\Roaming\\npm;C:\\Users\\Tester\\.cargo\\bin;C:\\Users\\Tester\\scoop\\shims;C:\\Windows");
   expect(() => buildHostEnvironment({ env: { CODEX_EXECUTABLE: "codex --unsafe-flag" } })).toThrow("absolute_path_required");
 });
 it("recovers an interrupted runtime refresh without starting either revision implicitly", async () => {
@@ -775,6 +775,70 @@ it("rejects an old runtime before rollback can strip persisted extra environment
   await expect(managedServiceCommand("start", f.directory, undefined, f.options)).rejects.toThrow("host_service_runtime_environment_incompatible");
   await expect(refreshManagedServiceRuntime(f.directory, { entrypoint: old, executable: process.execPath }, f.options)).rejects.toThrow("host_service_runtime_environment_incompatible");
   expect(f.calls).toHaveLength(count); expect(await readFile(path.join(f.directory, "host-service.json"))).toEqual(before);
+});
+
+const piEnvironmentKeys = ["PI_EXECUTABLE", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"] as const;
+const piStateCapabilities = ["service-extra-environment-v1", "pi-state-v1"];
+
+it.each(process.platform === "win32" ? ["json", "directory"] : ["json", "directory", "permissions"])("keeps a Pi-capable service available for repairing unreadable engine settings: %s", async problem => {
+  const f = await fixture("linux");
+  await writeFile(path.join(f.root, "package/package.json"), JSON.stringify({ tarobotHostCapabilities: piStateCapabilities }));
+  const settings = path.join(f.directory, "engine-settings.json");
+  if (problem === "directory") await mkdir(settings);
+  else await writeFile(settings, problem === "json" ? "not JSON" : JSON.stringify({ format: 1, revision: "fixture", paths: {}, receipts: [] }), { mode: problem === "permissions" ? 0o644 : 0o600 });
+  // A compatible Host must still start so its owner can repair settings; engines keep their own fail-closed reader.
+  await expect(assertManagedServiceRuntimeCompatible(f.directory, { entrypoint: f.entrypoint }, f.options)).resolves.toBeUndefined();
+  await installManagedService(f.directory, f.entrypoint, f.options);
+  await expect(managedServiceCommand("start", f.directory, undefined, f.options)).resolves.toMatchObject({ running: true });
+  const old = await packageFixture(path.join(f.root, "old-package"));
+  const count = f.calls.length, manifest = await readFile(path.join(f.directory, "host-service.json"));
+  // An old reader cannot be declared safe when the settings cannot be inspected.
+  await expect(assertManagedServiceRuntimeCompatible(f.directory, { entrypoint: old }, f.options)).rejects.toThrow("host_service_runtime_pi_state_unverified");
+  expect(f.calls).toHaveLength(count);
+  expect(await readFile(path.join(f.directory, "host-service.json"))).toEqual(manifest);
+  expect((await stat(settings)).isDirectory()).toBe(problem === "directory");
+  if (problem === "json") expect(await readFile(settings, "utf8")).toBe("not JSON");
+});
+
+it.each(piEnvironmentKeys)("refuses service installation when the runtime cannot read %s", async key => {
+  const f = await fixture("linux");
+  f.options.env = { PATH: "/usr/bin", [key]: key === "PI_EXECUTABLE" ? process.execPath : path.join(f.root, "pi") };
+  await expect(installManagedService(f.directory, f.entrypoint, f.options)).rejects.toThrow("host_service_runtime_pi_state_incompatible");
+  expect(f.calls).toEqual([]);
+  await expect(readFile(path.join(f.directory, "host-service.json"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it.each(piEnvironmentKeys)("rejects rollback with persisted %s before changing service state", async key => {
+  const f = await fixture("linux");
+  await writeFile(path.join(f.root, "package/package.json"), JSON.stringify({ tarobotHostCapabilities: piStateCapabilities }));
+  f.options.env = { PATH: "/usr/bin", [key]: key === "PI_EXECUTABLE" ? process.execPath : path.join(f.root, "pi") };
+  await installManagedService(f.directory, f.entrypoint, f.options);
+  await managedServiceCommand("stop", f.directory, undefined, f.options);
+  const old = await packageFixture(path.join(f.root, "old-package"));
+  const before = await readFile(path.join(f.directory, "host-service.json")), count = f.calls.length;
+  await expect(assertManagedServiceRuntimeCompatible(f.directory, { entrypoint: f.entrypoint }, f.options)).resolves.toBeUndefined();
+  await expect(assertManagedServiceRuntimeCompatible(f.directory, { entrypoint: old }, f.options)).rejects.toThrow("host_service_runtime_pi_state_incompatible");
+  f.options.resolveRuntime = async () => ({ entrypoint: old, executable: process.execPath, revisionId: "old" });
+  await expect(managedServiceCommand("start", f.directory, undefined, f.options)).rejects.toThrow("host_service_runtime_pi_state_incompatible");
+  await expect(refreshManagedServiceRuntime(f.directory, { entrypoint: old, executable: process.execPath }, f.options)).rejects.toThrow("host_service_runtime_pi_state_incompatible");
+  expect(f.calls).toHaveLength(count);
+  expect(await readFile(path.join(f.directory, "host-service.json"))).toEqual(before);
+});
+
+it("fences a saved Pi program path even without an installed service, and permits an explicit reset", async () => {
+  const f = await fixture("linux");
+  const settings = path.join(f.directory, "engine-settings.json");
+  const data = { format: 1, revision: "fixture", paths: { pi: process.execPath }, receipts: [] };
+  await writeFile(settings, JSON.stringify(data), { mode: 0o600 });
+  const before = await readFile(settings);
+  await expect(assertManagedServiceRuntimeCompatible(f.directory, { entrypoint: f.entrypoint }, f.options)).rejects.toThrow("host_service_runtime_pi_state_incompatible");
+  expect(await readFile(settings)).toEqual(before);
+  await writeFile(path.join(f.root, "package/package.json"), JSON.stringify({ tarobotHostCapabilities: piStateCapabilities }));
+  await expect(assertManagedServiceRuntimeCompatible(f.directory, { entrypoint: f.entrypoint }, f.options)).resolves.toBeUndefined();
+  const old = await packageFixture(path.join(f.root, "old-package"));
+  await writeFile(settings, JSON.stringify({ ...data, paths: { codex: process.execPath } }));
+  await expect(assertManagedServiceRuntimeCompatible(f.directory, { entrypoint: old }, f.options)).resolves.toBeUndefined();
+  expect(f.calls).toEqual([]);
 });
 
 it.each(["missing", "invalid"])("rejects a Windows update/rollback target with a %s launcher before stopping the current service", async problem => {
