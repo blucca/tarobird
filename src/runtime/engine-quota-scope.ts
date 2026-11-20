@@ -20,10 +20,15 @@ export function createQuotaScopeStamp(key: Uint8Array, parts: QuotaScopeGenerati
   return digest(key, ["quota-scope-v1", parts.engine, parts.configurationGeneration, parts.credentialGeneration, parts.workerGeneration]);
 }
 
+// Native identifiers carry no length/format contract (Codex 0.170.0 marks both optional). Only a
+// bounded, whitespace-free token is accepted as identity; anything else is "not identified".
+const NATIVE_ACCOUNT_IDENTIFIER = /^[\x21-\x7e]{1,512}$/;
+
 /** Valid only while the caller can still prove scopeStamp is current. A user alone does not identify the billed workspace. */
 export function proveQuotaAccount(key: Uint8Array, parts: {
   engine: QuotaEngine; scopeStamp: string; accountId: string | null | undefined; userId: string | null | undefined;
 }): QuotaAccountProof | undefined {
   if (!parts.accountId || !parts.userId || !parts.scopeStamp) return undefined;
+  if (!NATIVE_ACCOUNT_IDENTIFIER.test(parts.accountId) || !NATIVE_ACCOUNT_IDENTIFIER.test(parts.userId)) return undefined;
   return { engine: parts.engine, scopeStamp: parts.scopeStamp, accountKey: digest(key, ["quota-account-v1", parts.engine, parts.accountId, parts.userId]) };
 }

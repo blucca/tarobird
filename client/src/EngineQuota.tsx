@@ -20,7 +20,7 @@ function reasonText(reason: QuotaReason | undefined, engine: QuotaEngine): strin
     case "auth_changed": return t("授权信息已变化，旧额度已清除。请核对后再次刷新。");
     case "scope_unverifiable": return engine === "claude"
       ? t("Claude Code 的凭据来源无法由公开接口核实（例如 macOS 钥匙串登录），为避免显示其他账号的额度，不展示被动收到的读数。")
-      : t("无法从运行主机的凭据文件确认当前账号（例如登录保存在系统钥匙串），读数不会保留；刷新时由引擎原生接口当场核对一次。");
+      : t("无法从运行主机的凭据文件确认当前账号（例如登录保存在系统钥匙串），读数不会保留；刷新时由引擎原生接口当场核对一次，原生未返回可辨识的用户和计费账号时不展示读数。");
     case "offline": return t("Bot 当前离线，连接恢复后重新读取列表。");
     case "timeout": return t("读取原生额度超时，可稍后再刷新。");
     case "cancelled": return t("本次读取已取消，可重新刷新。");

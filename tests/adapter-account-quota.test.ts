@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexAppServerAdapter, type AppServerSpawnCodex } from "../src/codex/app-server-adapter.js";
 import { ProcessCodexAdapter } from "../src/codex/process-adapter.js";
 import { ClaudeStreamAdapter } from "../src/codex/claude-stream-adapter.js";
@@ -15,11 +15,11 @@ afterEach(async () => { for (const dispose of disposals.splice(0)) await dispose
 const account = { account: { type: "chatgpt", email: "fixture@example.invalid", planType: "pro" }, requiresOpenaiAuth: true, userId: "fixture-user" };
 class Child extends EventEmitter {
   stdout = new EventEmitter(); stderr = new EventEmitter(); methods: string[] = []; killCount = 0; closed = false;
-  hold = new Set<string>(); closeDelayMs = 20; accounts: unknown[] = [];
+  hold = new Set<string>(); closeDelayMs = 20; accounts: unknown[] = []; limits?: unknown;
   stdin = { write: (line: string, callback?: (error?: Error | null) => void) => {
     const request = JSON.parse(line); this.methods.push(request.method);
     if (request.id != null && !this.hold.has(request.method)) queueMicrotask(() => this.reply(request.id,
-      request.method === "account/read" ? this.accounts.length ? this.accounts.shift() : account : request.method === "account/rateLimits/read" ? { accountId: "fixture-account", rateLimits: { primary: { usedPercent: 25 } } } : {}));
+      request.method === "account/read" ? this.accounts.length ? this.accounts.shift() : account : request.method === "account/rateLimits/read" ? this.limits ?? { accountId: "fixture-account", rateLimits: { primary: { usedPercent: 25 } } } : {}));
     callback?.(null); return true;
   }, end: () => undefined, on: () => undefined };
   reply(id: unknown, result: unknown) { this.stdout.emit("data", JSON.stringify({ id, result }) + "\n"); }
@@ -145,10 +145,11 @@ async function opaqueFixture(kind: "missing" | "keyring") {
   if (kind === "missing") await rm(path.join(f.codexHome, "auth.json"));
   else { await rm(path.join(f.codexHome, "auth.json")); await writeFile(path.join(f.codexHome, "config.toml"), 'cli_auth_credentials_store = "keyring"\n'); }
   const children: Child[] = [], accounts: unknown[][] = [];
-  const spawn = vi.fn(() => { const child = new Child(); child.accounts = accounts.shift() ?? []; children.push(child); return child; });
+  const limits: unknown[] = [];
+  const spawn = vi.fn(() => { const child = new Child(); child.accounts = accounts.shift() ?? []; child.limits = limits.shift(); children.push(child); return child; });
   const adapter = new ProcessCodexAdapter("codex", f.env, spawn, undefined, undefined, undefined, f.root);
   disposals.push(() => adapter.destroy());
-  return { adapter, spawn, children, accounts };
+  return { adapter, spawn, children, accounts, limits };
 }
 const methodsOf = (child: Child) => child.methods.filter(method => !["initialize", "initialized"].includes(method));
 it("an explicit refresh lets native Codex report that no account is signed in", async () => {
@@ -224,3 +225,65 @@ it.skipIf(!process.env.TAROBIRD_QUOTA_REAL_CODEX)("real Codex CLI reports no sig
   expect(await readdir(codexHome)).not.toContain("sessions");
   expect(await readdir(codexHome)).not.toContain("auth.json");
 }, 30_000);
+
+// Codex 0.170.0 schema: GetAccountResponse.userId is "when available", ChatgptAccount.email may be null and
+// GetAccountRateLimitsResponse.accountId is "when supplied by the backend". Upstream guarantees no identity, so a
+// one-shot read of an opaque credential source must carry a stable user and billed account itself.
+describe("one-shot opaque Codex reads require a distinguishable native account", () => {
+  const limitsB = { rateLimits: { primary: { usedPercent: 30, windowDurationMins: 60 } }, accountId: "workspace-B" };
+  const chatgpt = (extra: Record<string, unknown> = {}, accountExtra: Record<string, unknown> = {}) => ({ requiresOpenaiAuth: true, account: { type: "chatgpt", ...accountExtra }, ...extra });
+  const rejected = async (account: unknown, limits: unknown = limitsB) => {
+    const f = await opaqueFixture("keyring");
+    f.accounts.push([account, account]); f.limits.push(limits);
+    const result = await f.adapter.getAccountQuota({ refresh: true });
+    expect(result.snapshot).toMatchObject({ pools: [], constraints: [], availability: "unknown" });
+    expect(result.snapshot.state).not.toBe("ready"); expect(result).not.toHaveProperty("proof");
+    return result.snapshot.reason;
+  };
+  it("rejects the reported counterexample: type only, no user, no billed-account link", async () => {
+    expect(await rejected(chatgpt())).toBe("scope_unverifiable");
+  });
+  it.each([
+    ["plan only", chatgpt({}, { planType: "pro" })],
+    ["email and plan without a user id", chatgpt({}, { email: "fixture@example.invalid", planType: "pro" })],
+    ["empty user id", chatgpt({ userId: "" }, { planType: "pro" })],
+    ["whitespace user id", chatgpt({ userId: "   " }, { planType: "pro" })],
+    ["user id with inner space", chatgpt({ userId: "user one" }, { planType: "pro" })],
+    ["over-long user id", chatgpt({ userId: "u".repeat(513) }, { planType: "pro" })],
+  ])("rejects an unidentifiable account (%s)", async (_label, account) => {
+    expect(await rejected(account)).toBe("scope_unverifiable");
+  });
+  it("rejects a native user id beyond the native identity bound as an invalid response", async () => {
+    expect(await rejected(chatgpt({ userId: "u".repeat(4097) }))).toBe("invalid_response");
+  });
+  it.each([
+    ["missing", { rateLimits: { primary: { usedPercent: 30 } } }],
+    ["empty", { rateLimits: { primary: { usedPercent: 30 } }, accountId: "" }],
+    ["over-long", { rateLimits: { primary: { usedPercent: 30 } }, accountId: "a".repeat(513) }],
+  ])("rejects a user without a %s billed account id", async (_label, limits) => {
+    expect(await rejected(chatgpt({ userId: "fixture-user" }, { planType: "pro" }), limits)).toBe("scope_unverifiable");
+  });
+  it("still shows a one-shot reading when the native user and billed account are both identified", async () => {
+    const f = await opaqueFixture("keyring");
+    const account = chatgpt({ userId: "fixture-user" }, { planType: "pro", email: null });
+    f.accounts.push([account, account]); f.limits.push(limitsB);
+    const result = await f.adapter.getAccountQuota({ refresh: true });
+    expect(result.snapshot).toMatchObject({ state: "ready" }); expect(result.snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 30 });
+    expect((await f.adapter.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+  });
+  it("keeps native not-signed-in and API-key answers without requiring an account id", async () => {
+    const missing = await opaqueFixture("keyring"); missing.accounts.push([{ account: null, requiresOpenaiAuth: true }]);
+    expect((await missing.adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ state: "login_required", pools: [] });
+    const key = await opaqueFixture("keyring"); key.accounts.push([{ account: { type: "apiKey" }, requiresOpenaiAuth: false }]);
+    expect((await key.adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "mode_not_supported", authMode: "api_key", pools: [] });
+  });
+  it("keeps a file-verified login readable even when native identity fields are absent", async () => {
+    const f = await fixture(), child = new Child();
+    child.accounts = [chatgpt({}, { planType: "pro" }), chatgpt({}, { planType: "pro" })]; child.limits = limitsB;
+    const adapter = new ProcessCodexAdapter("codex", f.env, () => child, undefined, undefined, undefined, f.root);
+    disposals.push(() => adapter.destroy());
+    const result = await adapter.getAccountQuota({ refresh: true });
+    expect(result.snapshot).toMatchObject({ state: "ready" });
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 30 });
+  });
+});

@@ -107,7 +107,16 @@ export class AdapterQuotaCache {
   }
   store(scope: AdapterQuotaScope, value: { snapshot: QuotaSnapshot; proof?: QuotaAccountProof }): EngineQuotaReadResult {
     // One-shot only: no cache and no account proof for a credential source this Host cannot verify.
-    if (!scope.verifiable) { this.cached = undefined; return { revision: scope.revision, snapshot: structuredClone(value.snapshot) }; }
+    // The native reply must then identify the account itself: a stable user id and the billed account id
+    // (both optional upstream). Type, plan or email alone cannot separate two accounts. Native
+    // "not signed in", API-key and error answers carry no account values and pass unchanged.
+    if (!scope.verifiable) {
+      this.cached = undefined;
+      const snapshot = value.snapshot;
+      const carriesValues = snapshot.observedAt !== undefined || snapshot.pools.length > 0 || snapshot.constraints.length > 0 || snapshot.availability !== "unknown";
+      if (carriesValues && !value.proof) return this.failure(scope, "scope_unverifiable");
+      return { revision: scope.revision, snapshot: structuredClone(snapshot) };
+    }
     const same = this.cached?.revision === scope.revision ? this.cached : undefined;
     if (same && same.snapshot.observedAt && ["unavailable", "offline"].includes(value.snapshot.state)) {
       this.cached = { ...same, snapshot: { ...same.snapshot, state: "stale", reason: value.snapshot.reason, lastAttemptAt: value.snapshot.lastAttemptAt } };
