@@ -19,6 +19,7 @@ import { killProcessTree } from "./process-tree.js";
 import { deepseekParentGuardEnvironment } from "./deepseek-parent-guard.js";
 import { createDeepSeekOfficeFontPatch, deepSeekOfficeToolTimeout, DEEPSEEK_OFFICE_TOOL_TIMEOUT_MS, macOfficeFontDirectories, readDeepSeekOfficeConfig } from "./deepseek-office-fonts.js";
 import { DeepSeekAppTools, type DeepSeekAppToolBinding } from "./deepseek-app-tools.js";
+import { prepareDeepSeekHarnessPrivateProfile } from "./deepseek-harness-profile.js";
 
 import {
   DeepSeekHarnessProtocolClient,
@@ -521,7 +522,9 @@ export async function prepareDeepSeekHarnessHome(
 
   await mkdir(home, { recursive: true, mode: 0o700 });
   await chmod(home, 0o700).catch(() => {});
-  await linkRequired(path.join(sharedHome, "profiles"), path.join(home, "profiles"), "dir");
+  // dsh saves model/effort choices into the profile patch; keep this Bot's
+  // writes in a private copy that each start refreshes from the shared profile.
+  await prepareDeepSeekHarnessPrivateProfile({ sharedHome, privateHome: home, onDiagnostic: options.onDiagnostic });
   // Current dsh no longer writes settings.yaml: it imports a leftover one at
   // startup and renames it to settings.yaml.imported. A fresh install, or a
   // shared home the desktop dsh has migrated, has none; credentials still link.
@@ -742,8 +745,8 @@ async function copyRequiredFile(source: string, target: string): Promise<void> {
     throw error;
   }
 
-  // Harness persists model selection in settings.yaml. Keep that write inside
-  // the instance home instead of allowing it through to the desktop dsh home.
+  // Remove the private target first so an old link is never written through
+  // to the shared original.
   await removeIfExists(target);
   await writeFileAtomically(target, contents, 0o600);
 }
