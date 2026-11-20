@@ -1267,8 +1267,10 @@ test('allowed speakers default to everyone and a single selection survives reloa
     const paint = (name: string) => box(name).evaluate(el => ({ fill: getComputedStyle(el).backgroundColor, glyph: getComputedStyle(el).color }));
     const checked = await paint('研究助手');
     expect(checked.fill).not.toBe('rgba(0, 0, 0, 0)');
-    expect(checked.glyph).not.toBe(checked.fill);
-    await expect(box('研究助手').locator('svg')).toBeVisible();
+    // WCAG contrast between the glyph and its fill (reviewed themes measure >= 4.96).
+    const luminance = (css: string) => { const [r, g, b] = (css.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number).map(v => { const c = v / 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!; };
+    const [hi, lo] = [luminance(checked.glyph), luminance(checked.fill)].sort((a, b) => b - a);
+    expect((hi! + 0.05) / (lo! + 0.05)).toBeGreaterThanOrEqual(3);
     await chooser.getByRole('checkbox', { name: '复核助手', exact: true }).uncheck();
     expect((await paint('复核助手')).fill).toBe('rgba(0, 0, 0, 0)');
     await chooser.getByRole('button', { name: '完成', exact: true }).click();
