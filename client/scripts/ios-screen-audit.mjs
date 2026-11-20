@@ -10,9 +10,9 @@ const repo=fileURLToPath(new URL('../../',import.meta.url));
 if(!process.argv[2])throw Error('private output directory required');
 const output=path.resolve(process.argv[2]);await mkdir(output,{recursive:true});
 const scratch=await mkdtemp(path.join(output,'screen-audit-'));
-async function run(args,name,timeout){
+async function run(args,name,timeout,extra={}){
  const log=createWriteStream(path.join(output,name));
- const child=spawn('/usr/bin/xcrun',args,{cwd:repo,env:{...process.env,TMPDIR:scratch},detached:true,stdio:['ignore','pipe','pipe']});
+ const child=spawn('/usr/bin/xcrun',args,{cwd:repo,env:{...process.env,TMPDIR:scratch,...extra},detached:true,stdio:['ignore','pipe','pipe']});
  child.stdout.pipe(log,{end:false});child.stderr.pipe(log,{end:false});
  const stop=()=>{try{if(child.pid)process.kill(-child.pid,'SIGTERM')}catch(error){if(error.code!=='ESRCH')throw error}};
  let expired=false;const timer=setTimeout(()=>{expired=true;stop()},timeout);
@@ -30,4 +30,9 @@ try{
  await run([...common,'-parse-as-library',...sources,'client/ios/tests/HubScreenChecks.swift','-o',binary],'compile.log',90000);
  await run([binary,repo,scratch,path.join(output,'ios-screen-foundation-result.json')],'run.log',90000);
  console.log(await readFile(path.join(output,'ios-screen-foundation-result.json'),'utf8'));
+ // Same native source against this checkout's real HubServer message order.
+ if(!process.env.SCREEN_AUDIT_FOCUS){
+  await run([binary,repo,scratch,path.join(output,'ios-screen-real-hub-result.json')],'real-hub.log',90000,{SCREEN_AUDIT_FOCUS:'real-hub'});
+  console.log(await readFile(path.join(output,'ios-screen-real-hub-result.json'),'utf8'));
+ }
 }finally{await rm(scratch,{recursive:true,force:true})}

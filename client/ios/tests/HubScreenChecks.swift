@@ -11,8 +11,8 @@ final class ScreenEvents: @unchecked Sendable {
 final class ScreenFixture {
     let process = Process(), input = Pipe(), output = Pipe()
     var network: [String: Any] = [:]
-    init(_ repo: String, _ scratch: String) throws {
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env"); process.arguments = ["node", "client/android/audit/screen-fixture.mjs", scratch]
+    init(_ repo: String, _ scratch: String, _ script: [String] = ["client/android/audit/screen-fixture.mjs"]) throws {
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env"); process.arguments = ["node"] + script + [scratch]
         process.currentDirectoryURL = URL(fileURLWithPath: repo); process.standardInput = input; process.standardOutput = output
         try process.run(); network = try read()
     }
@@ -316,8 +316,70 @@ final class ScreenClock: @unchecked Sendable {
         FileHandle.standardError.write(report); FileHandle.standardError.write(Data("\n".utf8))
         for (name, value) in expected.sorted(by: { $0.key < $1.key }) { try check(observed[name] == value, "order_" + name) }
     }
+    /// The native session against this checkout's real HubServer: the Hub's
+    /// own control order (state before attached on released Hubs), real tickets,
+    /// auth and RemoteScreenSockets; only the target service is synthetic.
+    static func realHub(_ fixture: ScreenFixture) async throws {
+        let log = ScreenEvents()
+        let manager = HubTransport { log.append($0) }; defer { manager.reset(destroy: true) }
+        manager.setScreenActive(true)
+        let document = try await call(manager, "document")["value"] as! String
+        var observed: [String: String] = [:], expected: [String: String] = [:]
+        for round in 1...3 {
+            let opened = try fixture.request(["action": "open"])
+            guard let join = opened["join"] as? [String: Any] else { throw HubNetworkError("real_hub_open_" + (opened["error"] as? String ?? "failed")) }
+            let id = try await call(manager, "allocate", ["document": document, "kind": "screen"])["value"] as! String
+            _ = try await call(manager, "screenOpen", ["id": id, "network": fixture.network, "join": join])
+            var control: [String] = [], stream = false, packet = false, reason: String?
+            // JSON is drained (and acknowledged) before each packet check, so a
+            // queued stream/state is never mistaken for a missing one.
+            func drain() async throws {
+                while let event = log.pop(id, "screen") {
+                    guard manager.acceptScreenEvent(event) else { continue }
+                    _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": event["deliverySequence"]!])
+                    let type = (event["value"] as! [String: Any])["type"] as! String
+                    if type == "stream" { stream = true } else { control.append(type) }
+                }
+            }
+            let until = ProcessInfo.processInfo.systemUptime + 8
+            while ProcessInfo.processInfo.systemUptime < until, !packet {
+                if let terminal = log.pop(id, "close") { reason = terminal["reason"] as? String ?? "?"; break }
+                try await drain()
+                if let event = log.pop(id, "binary"), manager.acceptScreenEvent(event) {
+                    let bytes = Data(base64Encoded: try await call(manager, "screenRead", ["id": id, "deliverySequence": event["deliverySequence"]!, "offset": 0, "maxBytes": 262144])["data"] as! String)!
+                    _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": event["deliverySequence"]!])
+                    packet = bytes.count == event["byteLength"] as? Int
+                }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            if reason == nil { try await Task.sleep(nanoseconds: 300_000_000); try await drain() }
+            observed["round\(round)"] = reason.map { "closed:" + $0 }
+                ?? "firstControl=\(control.first ?? "-") state=\(control.contains("state")) stream=\(stream) frame=\(packet)"
+            expected["round\(round)"] = "firstControl=attached state=true stream=true frame=true"
+            if reason == nil {
+                observed["round\(round)Healthy"] = log.count(id) == 0 ? "open" : "closed"; expected["round\(round)Healthy"] = "open"
+                _ = try await call(manager, "screenClose", ["id": id]); _ = try await event(manager, log, id, "close")
+            }
+            var stop: String?
+            for _ in 0..<200 {
+                stop = (try fixture.request(["action": "stats"])["stops"] as? [String: String])?[sid(join)]
+                if stop != nil { break }; try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            observed["round\(round)HubStop"] = stop ?? "none"
+        }
+        let report = try JSONSerialization.data(withJSONObject: ["observed": observed, "expected": expected], options: [.prettyPrinted, .sortedKeys])
+        FileHandle.standardError.write(report); FileHandle.standardError.write(Data("\n".utf8))
+        for (name, value) in expected.sorted(by: { $0.key < $1.key }) { try check(observed[name] == value, "realHub_" + name) }
+    }
     static func main() async throws {
         let args = CommandLine.arguments
+        if ProcessInfo.processInfo.environment["SCREEN_AUDIT_FOCUS"] == "real-hub" {
+            let hub = try ScreenFixture(args[1], args[2], ["--import", "tsx", "tests/helpers/ios-screen-real-hub.ts"]); defer { hub.stop() }
+            try await realHub(hub)
+            let receipt: [String: Any] = ["surface": "Apple Foundation production source; this checkout's HubServer over pinned TLS; synthetic target frames only", "checks": checks]
+            let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys]); try bytes.write(to: URL(fileURLWithPath: args[3]))
+            print(String(data: bytes, encoding: .utf8)!); return
+        }
         let fixture = try ScreenFixture(args[1], args[2]); defer { fixture.stop() }
         if let focus = ProcessInfo.processInfo.environment["SCREEN_AUDIT_FOCUS"] {
             if focus == "close" { try await closeReasons(fixture) }
