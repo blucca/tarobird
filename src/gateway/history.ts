@@ -194,12 +194,13 @@ export function gatewayHistory(options: GatewayHistoryOptions) {
         if (!result.reverted) {
           // Gone before this call. Turns chatted since that earlier rewind are
           // live: its own edge bounds the range, never this request's. Without
-          // a record nothing proves where it ended, so nothing is marked.
+          // a record nothing proves where it ended, so nothing is marked; no
+          // range is displayed either, so the user is told it cannot be placed.
           let rewinds: Awaited<ReturnType<typeof readHistoryLedgerEntries>>["rewinds"];
           try { ({ rewinds } = await readHistoryLedgerEntries(stateDir, ctx.scope.conversationKey)); }
           catch { return refuse("engine_failed"); }
           const earlier = lastHistoryLedgerRewind(rewinds, call.beforeMessageId, session.sessionId);
-          if (!earlier?.throughMessageId) return refuse("already_rewound");
+          if (!earlier?.throughMessageId) return refuse("turn_unresolved");
           reply = { ok: true, throughMessageId: earlier.throughMessageId };
         }
         // Side handles were forked from the history that is gone (an earlier

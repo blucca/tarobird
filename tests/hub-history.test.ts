@@ -266,10 +266,19 @@ describe("rewind of an anchor the engine already dropped", () => {
     const route = `/api/conversations/${chat.id}/history/rewind`;
     const before = json(api(headers, route, { botId: "alpha", requestId: "e_1", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last }));
     bot.reply(await bot.next("instance.call", f => f.method === "history.rewind"), { ok: true, throughMessageId: seeded[0]!.reply.id });
-    expect((await before).body).toMatchObject({ state: "failed", error: "already_rewound" });
+    // No displayed range holds the target: readable, not the silent `already_rewound`.
+    expect((await before).body).toMatchObject({ state: "failed", error: "turn_unresolved" });
     const unknown = json(api(headers, route, { botId: "alpha", requestId: "e_2", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last }));
     bot.reply(await bot.next("instance.call", f => f.method === "history.rewind"), { ok: true, throughMessageId: "msg_elsewhere" });
-    expect((await unknown).body).toMatchObject({ state: "failed", error: "already_rewound" });
+    expect((await unknown).body).toMatchObject({ state: "failed", error: "turn_unresolved" });
+    // Later than this operation's own edge: a message sent while it ran.
+    const beyond = json(api(headers, route, { botId: "alpha", requestId: "e_3", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last }));
+    const call = await bot.next("instance.call", f => f.method === "history.rewind");
+    const { message: later } = await hub.store.sendMessage("owner", { conversationId: chat.id, clientMsgId: "beyond_e3", text: "sent meanwhile", attachments: [] });
+    const own = await hub.store.db.get<{ through_created_at: number }>("SELECT through_created_at FROM conversation_history_ops WHERE request_id='e_3'");
+    expect(later.createdAt).toBeGreaterThan(own!.through_created_at);
+    bot.reply(call, { ok: true, throughMessageId: later.id });
+    expect((await beyond).body).toMatchObject({ state: "failed", error: "turn_unresolved" });
     expect((await hub.store.conversations("owner")).find(c => c.id === chat.id)?.history).toBeUndefined();
   });
   it("keeps an unconfirmed rewind started, holding dispatch, and asks again with the same request", async () => {

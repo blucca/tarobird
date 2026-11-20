@@ -334,7 +334,8 @@ export class HubHistory {
       let through = { id: current.through_message_id, at: current.through_created_at };
       if (throughMessageId && throughMessageId !== current.through_message_id) {
         const edge = await this.db.get<{ id: string; created_at: number }>("SELECT id,created_at FROM messages WHERE id=? AND conversation_id=?", [throughMessageId, current.conversation_id]);
-        // An edge outside [anchor, this operation's edge] proves nothing; mark nothing.
+        // An edge outside [anchor, this operation's edge] proves nothing; mark
+        // nothing. Not `already_rewound`: no displayed range holds the target.
         if (!edge || current.anchor_created_at === null || current.through_created_at === null || edge.created_at < current.anchor_created_at || edge.created_at > current.through_created_at) return "refused" as const;
         through = { id: edge.id, at: edge.created_at };
       }
@@ -343,7 +344,7 @@ export class HubHistory {
       return { conversation: await this.store.conversationInTransaction(row.conversation_id) };
     });
     if (!done) return;
-    if (done === "refused") { await this.finish(row, "failed", "already_rewound"); return; }
+    if (done === "refused") { await this.finish(row, "failed", "turn_unresolved"); return; }
     this.ended(row, "completed");
     this.hooks.conversationChanged(done.conversation);
   }

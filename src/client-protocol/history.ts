@@ -38,9 +38,9 @@ export const historyErrorSchema = z.enum([
   "no_main_session",  // no real engine session yet
   "history_changed",  // expectedLastMessageId no longer matches
   "not_an_anchor",    // the message did not start a run (steering, command, cancelled queue)
-  "already_rewound",  // the target is inside an existing rewind range
+  "already_rewound",  // the target is inside an existing (displayed) rewind range
   "session_changed",  // the message belongs to an earlier engine session
-  "turn_unresolved",  // an older message could not be matched to an engine turn
+  "turn_unresolved",  // an older message could not be matched to an engine turn, or its turn is gone with no known edge
   "engine_busy",      // the engine refused: the thread is held by another client
   "engine_failed",    // the engine explicitly failed
   "uncertain",        // fork interrupted mid-way; no conversation was created
