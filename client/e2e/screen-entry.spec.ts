@@ -39,8 +39,8 @@ test("unready shortcut stays discoverable, explains readiness and opens settings
  expect(await page.evaluate(()=>(window as any).screenEntryFixture.calls.filter((v:string)=>/^(open|configure):/.test(v)))).toEqual([]);
  await page.getByRole("button",{name:"关闭连接状态与线路",exact:true}).click();
  await page.evaluate(()=>{const f=(window as any).screenEntryFixture;f.statuses.a.permission="view";f.statuses.a.desktop=null;window.dispatchEvent(new Event("focus"));});
- // Without desktop metadata the target platform is unknown (it may be Windows), so the sentence names no Mac.
- await expect(panel(page).getByText("主机在线，但桌面服务未运行。请在目标电脑打开 TaroBird。",{exact:true})).toBeVisible();
+ // The desktop service is gone, but this Host was read as a Mac a moment ago, so the sentence still names it.
+ await expect(panel(page).getByText("主机在线，但桌面服务未运行。请在目标 Mac 打开 TaroBird。",{exact:true})).toBeVisible();
  await expect(panel(page).getByRole("button",{name:"连接屏幕",exact:true})).toBeDisabled();
 });
 

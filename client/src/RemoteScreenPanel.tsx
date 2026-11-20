@@ -30,6 +30,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   lifecycles.current.set(connection,lifecycle);
   const retire=()=>{const task=lifecycle.retiring.catch(()=>undefined).then(async()=>{for(const id of lifecycle.sessions){await connection.screenStop(id);lifecycle.sessions.delete(id);}});lifecycle.retiring=task;return task;};
   const [modifierMode, setModifierMode] = useState<ScreenModifierMode>("command"), lastClick = useRef<{button:number;x:number;y:number;at:number;count:1|2|3}|undefined>(undefined);
+  const knownTarget = useRef<{connection:HubConnection;platform:"macos"|"windows"}|undefined>(undefined);
   const visibleNow=useRef(visible);visibleNow.current=visible;
   const panel=useRef<HTMLElement>(null),canvas=useRef<HTMLCanvasElement>(null),viewer=useRef<RemoteScreenViewer>(undefined),attempt=useRef(0);
   const [status,setStatus]=useState<ScreenStatus>(),[display,setDisplay]=useState(""),[error,setError]=useState(""),[statusError,setStatusError]=useState(""),[state,setState]=useState<ViewerState>({state:"closed",controlling:false,pending:false,fresh:false});
@@ -117,7 +118,10 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   // Keys and shortcuts follow the controlled computer; mobile hardware keys
   // use the controller platform instead of the browser user-agent brand.
   const target = status?.desktop?.platform ?? "macos", remap = screenModifierModeApplies(controller, target);
-  const errorTarget = status?.desktop?.platform ?? "unknown";
+  // Reasons name the computer last read for this Host: once a session ends its
+  // desktop service may be gone (sleep, App quit), leaving no platform to read.
+  if(status?.desktop?.platform)knownTarget.current={connection,platform:status.desktop.platform};
+  const errorTarget = status?.desktop?.platform ?? (knownTarget.current?.connection===connection?knownTarget.current.platform:undefined) ?? "unknown";
   const blocked = status ? !status.enabled ? "screen_disabled" : status.permission === "none" ? "screen_not_authorized"
     : !status.desktop ? "screen_service_offline" : status.desktop.locked ? "screen_locked"
     : status.desktop.capture !== "granted" ? "screen_capture_denied" : !status.desktop.displays.length ? "screen_display_unavailable" : "" : "";
