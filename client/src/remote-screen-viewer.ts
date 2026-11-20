@@ -1,13 +1,24 @@
 import { SCREEN_QUALITY_PROFILES, screenQualityProfile, type ScreenQuality } from "../../src/client-protocol/screen-quality.js";
 import { screenStreamSchema, screenViewerEventSchema, type ScreenInputEvent, type ScreenJoin, type ScreenStream } from "../../src/client-protocol/remote-screen.js";
 import { readScreenFrame, SCREEN_HEADER_BYTES } from "../../src/client-protocol/screen-wire.js";
-import { invoke } from "./desktop-bridge.js";
+import { electronScreenViewerTransport, type ScreenViewerChannel, type ScreenViewerPort, type ScreenViewerTransport } from "./screen-viewer-transport.js";
 
 export type ViewerState = { state: string; reason?: string; controlAllowed?: boolean; controlling: boolean; pending: boolean; fresh: boolean; width?: number; height?: number };
+/** Desktop input validity: this window is focused and visible and the canvas
+ * holds focus, so clicking the chat input stops remote control at once. */
+export function screenCanvasFocused(canvas: HTMLCanvasElement) { return document.hasFocus() && document.activeElement === canvas && document.visibilityState === "visible"; }
+export type RemoteScreenViewerOptions = {
+  /** Carries this session's messages; the Electron main process by default. */
+  transport?: ScreenViewerTransport;
+  /** Whether local input may drive the target right now. Gates every input,
+   * lease renewal and the `input-focus` report; `screenCanvasFocused` by default.
+   * A replacement must only add the viewer's own controls, never loosen the rest. */
+  inputActive?: (canvas: HTMLCanvasElement) => boolean;
+};
 /** One controller object per explicit viewing session; never reconnects/replays. */
 export class RemoteScreenViewer {
   state: ViewerState = { state: "connecting", controlling: false, pending: false, fresh: false };
-  private port?: MessagePort; private decoder?: VideoDecoder; private stream?: ScreenStream;
+  private port?: ScreenViewerPort; private decoder?: VideoDecoder; private stream?: ScreenStream;
   private frames = new Map<number, { generation: number; at: number }>();
   private picture?: { sequence: number; expiresAt: number; at: number };
   private lease?: { id: string; challenge: string }; private usedChallenge = ""; private sequence = 0;
@@ -16,9 +27,12 @@ export class RemoteScreenViewer {
   private lastMoveAt = -Infinity;
   private moveTimer?: ReturnType<typeof setTimeout>; private pendingMove?: { event: Extract<ScreenInputEvent, { kind: "move" }> | { clientX: number; clientY: number }; leaseId: string; epoch: number };
   private inputFocused = false;
-  private controlRequested = false; private controlGeneration = 0; private receivePort?: (event: MessageEvent) => void;
-  private minimumGeneration = 1; private streamEpoch = 0; private openTimer?: ReturnType<typeof setTimeout>;
-  constructor(readonly join: ScreenJoin, private canvas: HTMLCanvasElement, private change: (state: ViewerState) => void) {
+  private controlRequested = false; private controlGeneration = 0;
+  private minimumGeneration = 1; private streamEpoch = 0;
+  private readonly channel: ScreenViewerChannel; private readonly inputActive: (canvas: HTMLCanvasElement) => boolean;
+  constructor(readonly join: ScreenJoin, private canvas: HTMLCanvasElement, private change: (state: ViewerState) => void, options: RemoteScreenViewerOptions = {}) {
+    this.channel = (options.transport ?? electronScreenViewerTransport)(join);
+    this.inputActive = options.inputActive ?? screenCanvasFocused;
     this.state.controlAllowed = join.session.controlAllowed;
     this.timer = setInterval(() => {
       const fresh = !!this.picture && performance.now() - this.picture.at < 1500;
@@ -36,7 +50,7 @@ export class RemoteScreenViewer {
     if (focused !== this.inputFocused) { this.inputFocused = focused; this.send({ type: "input-focus", enabled: focused }); }
     if (changed) this.change(this.state);
   }
-  private focused() { return document.hasFocus() && document.activeElement === this.canvas && document.visibilityState === "visible"; }
+  private focused() { return this.inputActive(this.canvas); }
   private send(value: Record<string, unknown>) {
     if (this.disposed || !this.port) return false;
     this.port.postMessage({ ...value, sessionId: this.join.session.id, generation: this.join.session.generation }); return true;
@@ -47,18 +61,13 @@ export class RemoteScreenViewer {
     if (this.send({ type: "visibility", visible: this.visible }) && !this.visible) this.minimumGeneration++;
   }
   async open(network: unknown) {
-    const channelId = crypto.randomUUID();
-    const receive = (event: MessageEvent) => {
-      if (event.source !== window || event.origin !== location.origin || event.data?.type !== "tarobot:screen-port:v1" || event.data.channelId !== channelId || event.data.sessionId !== this.join.session.id || event.ports.length !== 1) return;
-      window.removeEventListener("message", receive); clearTimeout(this.openTimer);
-      if (this.disposed) { event.ports[0]!.close(); return; }
-      this.port = event.ports[0]; this.port.onmessage = e => { void this.message(e.data).catch(error => this.fail(error instanceof Error ? error.message : "screen_decode_failed")); }; this.port.start();
-      if (!this.visible) this.sendVisibility();
-    };
-    this.receivePort = receive; window.addEventListener("message", receive);
-    this.openTimer = setTimeout(() => { window.removeEventListener("message", receive); this.fail("screen_connect_timeout"); }, 10_000);
-    try { await invoke("screen_viewer_open", { channelId, join: this.join, network }); }
-    catch (error) { window.removeEventListener("message", receive); clearTimeout(this.openTimer); this.fail(error instanceof Error ? error.message : "screen_open_failed"); throw error; }
+    try { await this.channel.open(network, { attach: port => this.attach(port), fail: reason => this.fail(reason) }); }
+    catch (error) { this.fail(error instanceof Error ? error.message : "screen_open_failed"); throw error; }
+  }
+  private attach(port: ScreenViewerPort) {
+    if (this.disposed) { port.close(); return; }
+    this.port = port; port.start(data => { void this.message(data).catch(error => this.fail(error instanceof Error ? error.message : "screen_decode_failed")); });
+    if (!this.visible) this.sendVisibility();
   }
   private checkQuality(value: {width:number;height:number;codec:string}) {
     const limit=screenQualityProfile(this.join.quality);
@@ -192,9 +201,8 @@ export class RemoteScreenViewer {
   private fail(reason: string) { if (this.disposed) return; this.update({ state: "closed", reason, controlling: false, pending: false, fresh: false }); this.dispose(); }
   dispose() {
     if (this.disposed) return; this.send({ type: "disconnect" }); this.disposed = true;
-    if (this.receivePort) window.removeEventListener("message", this.receivePort); this.receivePort = undefined;
-    this.clearMove(); this.clearWheel(); clearInterval(this.timer); clearTimeout(this.openTimer); this.closeDecoder(); this.frames.clear(); this.port?.close();
-    void invoke("screen_viewer_close", { sessionId: this.join.session.id }).catch(() => undefined);
+    this.clearMove(); this.clearWheel(); clearInterval(this.timer); this.closeDecoder(); this.frames.clear(); this.port?.close();
+    this.channel.close();
   }
 }
 export async function supportedScreenCodecs(quality: ScreenQuality = "balanced"): Promise<("h264" | "vp8")[]> {

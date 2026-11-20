@@ -187,6 +187,15 @@ the final pointer position within the existing 32 ms movement budget, with
 lease/stream-scoped cancellation and measurements only on sent movements.
 Isolated Electron copy/decoder verification is `electron/tests/screen-viewer.smoke.mjs`;
 it captures no desktop and posts no native input.
+Seams for a phone viewer and other target platforms (#48/#49) change no desktop
+behavior: `RemoteScreenViewer` takes an optional `ScreenViewerTransport`
+(`client/src/screen-viewer-transport.ts`; the Electron main-process port is the
+default) and an optional `inputActive` check (default `screenCanvasFocused`).
+`screenError` and its reason table live in `client/src/screen-errors.ts`.
+`screenControllerCode` and `screenShortcuts` take the target platform (macOS by
+default). Regressions: root `remote-screen-viewer-seams`, `remote-screen-keys-target`,
+`client-screen-errors`; Electron `screen-service-hello` pins the macOS target's
+hello text byte for byte.
 
 `npm --prefix client run test:electron` runs the main/preload contract tests.
 `electron/tests/packaged.smoke.mjs`, `packaged-migration.smoke.mjs` and the real
