@@ -18,7 +18,7 @@ import { UsageStore } from "../src/state/usage-store.js";
 
 it("requires an explicit client disposition for every canonical TaroCub command", () => {
   expect(Object.keys(GATEWAY_COMMAND_POLICIES).sort()).toEqual(CORE_SLASH_COMMANDS.map((c) => c.command).sort());
-  for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity"]) {
+  for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"]) {
     const menu = gatewayCommands(engine).map((c) => c.command);
     expect(menu.includes("fast")).toBe(engine === "codex");
     expect(menu.includes("ultrareview")).toBe(engine === "claude");

@@ -168,7 +168,7 @@ export interface EngineApprovalScopes {
 }
 
 export interface EngineApprovalRequest {
-  engine: "claude" | "codex" | "antigravity" | "kimi" | "deepseek";
+  engine: "claude" | "codex" | "antigravity" | "kimi" | "deepseek" | "pi";
   toolName: string;
   toolInput: unknown;
   cwd?: string;

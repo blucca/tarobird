@@ -13,6 +13,9 @@ import { hashSecret } from "../src/hub/auth.js";
 import { attachGateway } from "../src/gateway/service.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import { kimiModelConfig } from "./fixtures/kimi-model-config.js";
+import { discoverPiModels } from "../src/runtime/pi-model-discovery.js";
+import { parsePiModels } from "../src/codex/pi-models.js";
+vi.mock("../src/runtime/pi-model-discovery.js", () => ({ discoverPiModels: vi.fn() }));
 
 it("CLI lists native Kimi models and resets effort without replacing sessions", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "tarobot-kimi-cli-"));
@@ -78,5 +81,42 @@ it("CLI and App share authenticated model updates, scope, conflicts and permissi
     await expect(management.botModel("bot")).rejects.toThrow();
     await expect(management.botModel("bot", { revision: current.revision, model: "gpt-6.1-sol" })).rejects.toThrow();
     expect(engineCalls).toBe(0); expect(await hub.store.db.get("SELECT COUNT(*) AS count FROM messages")).toEqual({ count: 0 });
+  } finally { log.mockRestore(); local.close(); await gateway.disconnect(); await control(); await hub.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+
+it.each(["pi", "codex"] as const)("CLI keeps %s effort off semantics and caller revisions", async engine => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-off-cli-"));
+  const model = engine === "pi" ? "fixture/reasoning" : "gpt-6.1-sol";
+  vi.mocked(discoverPiModels).mockResolvedValue({ status: "ready", models: parsePiModels([{ provider: "fixture", id: "reasoning", reasoning: true }]), defaultModel: "fixture/reasoning" });
+  await initializeHost(root, "Off fixture");
+  const hub = await HubServer.start({ stateDir: root }), stateDir = path.join(root, "bot"); await mkdir(stateDir);
+  await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine, model, effort: "high" }));
+  await writeFile(path.join(stateDir, "session.json"), "preserved-session");
+  const secret = randomBytes(32).toString("base64url");
+  await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES(?,?,?)", ["bot", "Fixture", hashSecret(secret)]);
+  const bridge = { handleAuthorizedMessage: vi.fn(async () => ({ text: "unused" })) };
+  const gateway = await attachGateway({ stateDir, url: hub.instanceUrl.replace("http", "ws") + "/instance", secret, botId: "bot", engine, model, effort: "high", runtime: createCoreServiceRuntime(), bridge });
+  const control = await startHubControl(root, { running: true, pid: process.pid, url: hub.url, instanceUrl: hub.instanceUrl, publicKey: hub.auth.publicKey }, () => {}, { enrollController: value => hub.enrollLocalController(value) });
+  const local = await LocalHostClient.connect(root, { enroll: true }), management = new HostManagement(local);
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const cli = (args: string[]) => runHostCli(["bots", "model", "bot", ...args, "--state-dir", root, "--json"]);
+  try {
+    const before = await management.botModel("bot");
+    await cli(["--model", model, "--effort", "off", "--revision", before.revision]);
+    let current = await management.botModel("bot");
+    expect(current).toMatchObject({ engine, model, effort: engine === "pi" ? "off" : "" });
+    // Looking up the engine must not silently replace the caller's old revision.
+    await expect(cli(["--model", model, "--effort", "off", "--revision", before.revision])).rejects.toThrow("model_conflict");
+    if (engine === "pi") {
+      await cli(["--model", model, "--effort", "minimal", "--revision", current.revision]);
+      current = await management.botModel("bot");
+      expect(current.effort).toBe("minimal");
+    }
+    await cli(["--model", model, "--effort", "default", "--revision", current.revision]);
+    expect(await management.botModel("bot")).toMatchObject({ model, effort: "" });
+    expect(JSON.parse(await readFile(path.join(stateDir, "config.json"), "utf8"))).not.toHaveProperty("effort");
+    expect(await readFile(path.join(stateDir, "session.json"), "utf8")).toBe("preserved-session");
+    expect(bridge.handleAuthorizedMessage).not.toHaveBeenCalled();
   } finally { log.mockRestore(); local.close(); await gateway.disconnect(); await control(); await hub.close(); await rm(root, { recursive: true, force: true }); }
 });

@@ -8,7 +8,7 @@ import { timeoutSignal } from "./abort-signals.js";
 import { t, useLocale } from "./i18n.js";
 import "./engine-settings.css";
 
-const labels: Record<HostEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek" };
+const labels: Record<HostEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
 export function EngineSettings({ connection, active, onBusy, onDirty, onSaved, onDetected }: { connection: HubConnection; active: boolean; onBusy?: (busy: boolean) => void; onDirty?: (dirty: boolean) => void; onSaved?: () => void; /** Engines the host reported as present in a completed read (not a save). */ onDetected?: (available: HostEngine[]) => void }) {
   useLocale(); const host = useContext(RuntimeHostContext);
   const state = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);
@@ -35,7 +35,7 @@ export function EngineSettings({ connection, active, onBusy, onDirty, onSaved, o
   useEffect(() => { onBusy?.(busy); return () => onBusy?.(false); }, [busy, onBusy]);
   useEffect(() => { onDirty?.(dirty); return () => onDirty?.(false); }, [dirty, onDirty]);
   useEffect(() => { generation.current++; flight.current = undefined; setBusy(false); setView(undefined); setEditing(undefined); setDraft(""); returnFocus.current = undefined; setError(""); setNeedsRead(false); setSaved(false); setFeedbackEngine(undefined); return () => { generation.current++; flight.current = undefined; }; }, [connection, owner, supported]);
-  const read = (requestId?: string) => connection.http(`/api/settings/engines${requestId ? `?requestId=${encodeURIComponent(requestId)}` : ""}`, { signal: timeoutSignal(15_000) }).then(engineSettingsSchema.parse);
+  const read = (requestId?: string) => connection.http(`/api/settings/engines?includePi=1${requestId ? `&requestId=${encodeURIComponent(requestId)}` : ""}`, { signal: timeoutSignal(15_000) }).then(engineSettingsSchema.parse);
   async function refresh(focusAfter?: HostEngine | "refresh") {
     if (flight.current || !owner || !online || !supported) return;
     const current = generation.current, token = Symbol(); flight.current = token; setBusy(true); setSaved(false); setFeedbackEngine(focusAfter === "refresh" ? undefined : focusAfter);
@@ -49,7 +49,7 @@ export function EngineSettings({ connection, active, onBusy, onDirty, onSaved, o
     const current = generation.current, token = Symbol(), command = { engine, path: value, revision: view.revision, requestId: crypto.randomUUID() };
     flight.current = token; setBusy(true); setSaved(false); setError(""); setFeedbackEngine(engine);
     try {
-      await connection.http("/api/settings/engines", { method: "PUT", signal: timeoutSignal(15_000), body: JSON.stringify(command) });
+      await connection.http("/api/settings/engines?includePi=1", { method: "PUT", signal: timeoutSignal(15_000), body: JSON.stringify(command) });
       const next = await read(command.requestId);
       if (current !== generation.current) return;
       if (next.receipt?.requestId !== command.requestId || next.receipt.revision !== next.revision || next.engines.find(item => item.id === engine)?.override !== value) throw new Error("unconfirmed");

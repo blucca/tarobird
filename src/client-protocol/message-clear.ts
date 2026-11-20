@@ -22,6 +22,7 @@ export const MESSAGE_CLEAR_ACTIVE = "message_clear_active";
 // questions and approvals an App still offers as actionable.
 const questionSchema = z.object({
   question: z.string(), header: z.string(), multiSelect: z.boolean(), required: z.boolean(), allowFreeText: z.boolean(),
+  input: z.object({ kind: z.enum(["text", "multiline"]), placeholder: z.string().max(1000).optional(), prefill: z.string().max(16000).optional() }).optional(),
   minSelections: z.number().int().nonnegative().optional(), maxSelections: z.number().int().nonnegative().optional(),
   options: z.array(z.object({ label: z.string(), description: z.string().optional(), preview: z.string().optional() })).max(100),
 });

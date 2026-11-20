@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type EffortLevel = typeof EFFORT_LEVELS[number];
 
 export const ResumeStateFileSchema = z.object({
@@ -37,7 +37,7 @@ export const MeetingConfigFileSchema = z.object({
 }).passthrough();
 
 export const ConfigFileSchema = z.object({
-  engine: z.enum(["codex", "claude", "antigravity", "kimi", "deepseek"]).optional(),
+  engine: z.enum(["codex", "claude", "antigravity", "kimi", "deepseek", "pi"]).optional(),
   /** Set once by the Hub when a dispatcher Bot is created. */
   role: z.enum(["dispatcher"]).optional(),
   approvalMode: z.enum(["normal", "full-auto", "bypass"]).optional(),

@@ -10,10 +10,10 @@ import { HubHttpError } from "./http-error.js";
 import { t, useLocale } from "./i18n.js";
 import "./dispatch.css";
 
-export const ENGINE_NAMES: Record<string, string> = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity" };
+export const ENGINE_NAMES: Record<string, string> = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi" };
 type Engine = NonNullable<DispatcherSettings["allowedEngines"]>[number];
 /** Engine CLIs installed on the Host, from its Bot catalog. */
-export const installedEngines = (catalog?: BotCatalog): Engine[] => (catalog?.engines ?? []).filter(engine => engine.available).map(engine => engine.id);
+export const installedEngines = (catalog?: BotCatalog): Engine[] => (catalog?.engines ?? []).filter(engine => engine.available).map(engine => engine.id).filter((id): id is Engine => (DISPATCH_ENGINES as readonly string[]).includes(id));
 /** An omitted allowlist means every CLI, including ones installed later. An
  * explicit one never depends on what is installed now: a missing CLI stays
  * listed, and naming every installed CLI does not allow later installs. */

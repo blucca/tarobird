@@ -18,6 +18,7 @@ import type {
 } from "../codex/adapter.js";
 import type { BridgeAccessDecision } from "../runtime/bridge.js";
 import type { EngineTaskSnapshot, EngineTaskControlResult } from "../client-protocol/engine-tasks.js";
+import type { PiSessionSnapshot, PiSessionResult, PiSessionChange } from "../client-protocol/pi-session.js";
 import type { BridgeTurnLockWaitEvent } from "../runtime/turn-lock.js";
 import type { TurnPoolWaitEvent } from "../runtime/turn-pool.js";
 import type { CoreChatMode } from "./message-normalizer.js";
@@ -194,6 +195,8 @@ export interface CoreBridgeLike {
   backgroundInputTarget?(input: { chatId: number; conversationKey: string }): Promise<string | undefined>;
   controlNativeInput?(input: { chatId: number; conversationKey: string; inputId: string; action: NativeInputAction; isCurrentSession?: () => Promise<boolean> }): Promise<NativeInputControlResult>;
   listTasks?(input: { chatId: number; conversationKey: string }): Promise<EngineTaskSnapshot>;
+  getPiSession?(input: { chatId: number; conversationKey: string; isCurrentSession?: () => Promise<boolean> }): Promise<PiSessionSnapshot>;
+  changePiSession?(input: { chatId: number; conversationKey: string; isCurrentSession?: () => Promise<boolean> } & Pick<PiSessionChange, "expectedSession" | "action" | "value">): Promise<PiSessionResult>;
   stopTask?(input: { chatId: number; conversationKey: string; taskId: string; isCurrentSession?: () => Promise<boolean> }): Promise<EngineTaskControlResult>;
   recoverSession?(input: { chatId: number; conversationKey: string; token: string; isCurrentSession?: () => Promise<boolean> }): Promise<EngineTaskControlResult>;
   steerActiveTurn?(input: {

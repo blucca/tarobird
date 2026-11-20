@@ -1,3 +1,4 @@
+import { resolvePiExecutable } from "../runtime/pi-executable.js";
 import { EngineSettingsReadError, hostEngineEnvironment } from "../runtime/host-engine-settings.js";
 import { assignNewBotAvatar } from "./bot-avatar-default.js";
 import { publishExclusive } from "../state/publish-exclusive.js";
@@ -18,7 +19,8 @@ import { createBotSchema, type CreateBotInput, type BotCatalog } from "../client
 import { defaultDispatcherSettings } from "../client-protocol/dispatch.js";
 import { saveDispatcherSettingsInTransaction } from "./dispatch.js";
 import { CODEX_MODEL_CHOICES } from "../codex/model-capabilities.js";
-import { modelCatalog } from "../runtime/model-catalog.js";
+import { readModelCatalog } from "../runtime/model-catalog.js";
+import { decodePiModel } from "../codex/pi-models.js";
 import { readEngineCapabilities } from "../runtime/bot-capabilities.js";
 import { applyEngineSelection, getEngineEffortValidationError, loadInstanceConfig, readValidatedConfigFile, resolveInstanceWorkspacePath, updateInstanceConfig, type InstanceEngine } from "../state/instance-config.js";
 import { hashSecret } from "./auth.js";
@@ -66,17 +68,20 @@ export class BotManager {
   }
   capabilities(engine: InstanceEngine) { return readEngineCapabilities(engine, { env: this.env }); }
   private engineBinaries(env = this.env): Record<InstanceEngine, string> {
-    return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: resolveDeepSeekExecutable(env), antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy" };
+    return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: resolveDeepSeekExecutable(env), antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy", pi: resolvePiExecutable(env) };
   }
   engineAvailable(engine: InstanceEngine): boolean { const env = this.env; return !!resolveEngineExecutable(this.engineBinaries(env)[engine], env); }
-  async catalog(): Promise<BotCatalog> {
+  async catalog(workspace?: string): Promise<BotCatalog> {
+    const workspaceAvailable = !workspace || path.isAbsolute(workspace) && await stat(workspace).then(s => s.isDirectory(), () => false);
     const env = this.env, bins = this.engineBinaries(env);
     return { engines: await Promise.all((Object.keys(bins) as InstanceEngine[]).map(async (id) => {
       const available = !!resolveEngineExecutable(bins[id], env);
-      const models = id === "antigravity" && !available ? [{ id: "", efforts: [""] }] : await modelCatalog(id, env);
+      const catalog: Awaited<ReturnType<typeof readModelCatalog>> = id === "pi" && !workspaceAvailable ? { choices: [{ id: "", efforts: [""] }], status: "unavailable" }
+        : (id === "antigravity" || id === "pi") && !available ? { choices: [{ id: "", efforts: [""] }] } : await readModelCatalog(id, env, workspace);
+      const models = catalog.choices;
       const defaults: Record<string, unknown> = {}; applyEngineSelection(defaults, id);
       if (id === "antigravity") defaults.model = preferredAntigravityModel(models);
-      return { id, available, models, permissions: { defaultChoice: defaultPermission(id), choices: permissionOptions(id) }, defaultModel: String(defaults.model ?? (id === "codex" ? CODEX_MODEL_CHOICES[0] : "")), defaultEffort: String(defaults.effort ?? "") };
+      return { id, available, models, ...(catalog.status ? { catalogStatus: catalog.status } : {}), permissions: { defaultChoice: defaultPermission(id), choices: permissionOptions(id) }, defaultModel: String(defaults.model ?? (id === "codex" ? CODEX_MODEL_CHOICES[0] : "")), defaultEffort: String(defaults.effort ?? "") };
     })) };
   }
   async restore(): Promise<void> {
@@ -93,17 +98,19 @@ export class BotManager {
       if (spec.permission && !permissionOptions(spec.engine).some(option => option.id === spec.permission)) throw new HubError("permissions_incompatible");
       const incompatible = getEngineEffortValidationError(spec.engine, spec.effort || undefined, spec.model || undefined);
       if (incompatible) throw new HubError("bot_effort_incompatible");
+      if (spec.engine === "pi" && spec.model && !decodePiModel(spec.model)) throw new HubError("model_id_invalid");
       const botId = `client_${createHash("sha256").update(`${userId}:${spec.requestId}`).digest("hex").slice(0, 24)}`;
       if (await this.store.db.serial(() => this.store.db.get("SELECT 1 FROM bots WHERE id=? AND deleted_at IS NOT NULL", [botId]))) throw new HubError("bot_deleted", 410);
       let row = await this.store.db.serial(() => this.store.db.get<Managed>("SELECT * FROM managed_bots WHERE bot_id=?", [botId]));
       if (row && row.specification_json !== JSON.stringify(spec)) throw new HubError("idempotency_conflict", 409);
       const creating = !row;
       if (!row) {
-        const engine = (await this.catalog()).engines.find((e) => e.id === spec.engine);
+        if (spec.workspace && (!path.isAbsolute(spec.workspace) || !await stat(spec.workspace).then((s) => s.isDirectory(), () => false))) throw new HubError("bot_workspace_unavailable");
+        const engine = (await this.catalog(spec.engine === "pi" ? spec.workspace : undefined)).engines.find((e) => e.id === spec.engine);
         if (!engine?.available) throw new HubError("bot_engine_unavailable", 409);
         if (spec.engine === "kimi" && spec.effort && engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort) === false) throw new HubError("bot_effort_incompatible");
+        if (spec.engine === "pi" && spec.effort && !engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
         if (spec.engine === "antigravity" && spec.effort && !antigravityEffortChoices(await discoverAntigravityModels(this.env), spec.model).includes(spec.effort)) throw new HubError("bot_effort_incompatible");
-        if (spec.workspace && (!path.isAbsolute(spec.workspace) || !await stat(spec.workspace).then((s) => s.isDirectory(), () => false))) throw new HubError("bot_workspace_unavailable");
         await this.store.db.serial(authorize);
         row = { bot_id: botId, owner_id: userId, request_id: spec.requestId, specification_json: JSON.stringify(spec) };
         const secret = await this.prepare(row);
@@ -147,7 +154,7 @@ export class BotManager {
     // explicit bypass/manual; otherwise fall back to manual rather than widen.
     const permission = config.engine === engine || selected === "bypass" || selected === "normal" ? selected : "normal";
     const workspace = resolveInstanceWorkspacePath({ workspacePath: config.workspacePath, resume: config.resume }) ?? "";
-    const label = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity" }[engine];
+    const label = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi" }[engine];
     const guard = async () => {
       await validate?.();
       if (!await this.store.db.get("SELECT 1 FROM bots WHERE id=? AND role='dispatcher' AND deleted_at IS NULL", [dispatcherId])) throw new HubError("dispatcher_required", 409);

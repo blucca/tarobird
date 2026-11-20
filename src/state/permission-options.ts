@@ -4,11 +4,15 @@ import { resolveApprovalModeForEngine } from "./approval-mode.js";
 // universal CLI flag: notably Claude Auto and Kimi Auto have opposite meanings.
 export const PERMISSION_CHOICES = ["bypass", "full-auto", "normal", "claude-auto", "claude-accept-edits"] as const;
 export type PermissionChoice = typeof PERMISSION_CHOICES[number];
-export type PermissionEngine = "codex" | "claude" | "kimi" | "deepseek" | "antigravity";
+export type PermissionEngine = "codex" | "claude" | "kimi" | "deepseek" | "antigravity" | "pi";
 export type PermissionOption = { id: PermissionChoice; label: string; description: string };
 export function defaultPermission(engine: PermissionEngine): PermissionChoice { return engine === "kimi" ? "full-auto" : "bypass"; }
 export function permissionOptions(engine: PermissionEngine, codexRuntime?: unknown): PermissionOption[] {
   switch (engine) {
+    case "pi": return [
+      { id: "bypass", label: "原生访问 · Pi", description: "按 Pi 原生方式运行工具；没有系统沙箱。扩展请求确认时仍会询问。" },
+      { id: "normal", label: "工具审批 · Pi", description: "由 TaroBird 在写入、执行命令和扩展工具前询问；Pi 本身没有系统沙箱。" },
+    ];
     case "claude": return [
       { id: "bypass", label: "完全访问 · Bypass", description: "跳过工具权限确认；不提供系统沙箱。" },
       { id: "claude-auto", label: "自动审批 · Claude Auto", description: "由 Claude CLI 自动评估操作；仍需人工确认的请求显示在对话中。不等于沙箱。" },

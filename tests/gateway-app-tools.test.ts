@@ -19,7 +19,7 @@ const APP_INSTRUCTION_BUDGET = 1700;
 
 describe("App platform contract", () => {
   it("routes routine Bot follow-ups through durable messages and forbids ambiguous steering fallback", () => {
-    for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity"] as const) {
+    for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const) {
       expect(appAgentInstructions({ engine })).toContain("messages send/wait (--help), not steer");
     }
     const guide = botCollaborationInstructions();
@@ -36,7 +36,7 @@ describe("App platform contract", () => {
     expect(guide).toContain("Never impersonate the owner or bypass native permission approval");
     expect(appAgentInstructions({ context: "discussion" })).toContain("do not delegate");
   });
-  it.each(["codex", "claude", "kimi", "deepseek", "antigravity"] as const)("keeps %s question guidance consistent for ordinary Bot delegation", engine => {
+  it.each(["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const)("keeps %s question guidance consistent for ordinary Bot delegation", engine => {
     const human = appCapabilityInstructions("questions", { engine });
     const delegated = appCapabilityInstructions("questions", { engine, botMessageTask: true });
     expect(delegated).toContain("do not use AskUserQuestion, request_user_input, request_user_input_async, send.choice");
@@ -54,7 +54,7 @@ describe("App platform contract", () => {
     expect(appTurnInstructions("你好", { engine: "claude" })).toBeUndefined();
   });
   it("identifies the current TaroBot surface for every engine and context", () => {
-    for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity"] as const) {
+    for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const) {
       for (const context of ["chat", "card", "comment", "cron", "bus", "meeting"] as const) {
         for (const nativeDelivery of [false, true]) {
           const app = appAgentInstructions({ engine, context, nativeDelivery, nativeBatchDelivery: nativeDelivery });
@@ -72,7 +72,7 @@ describe("App platform contract", () => {
     }
   });
   it("provides a captioned fallback example accepted by the real directive parser while ordinary JSON stays inert", () => {
-    for (const engine of ["claude", "kimi", "deepseek", "antigravity"] as const) {
+    for (const engine of ["claude", "kimi", "deepseek", "antigravity", "pi"] as const) {
       const guide = appTurnInstructions("发送带说明的文件", { engine })!;
       const matches = extractCoreToolTagMatches(guide);
       expect(matches).toHaveLength(1);
@@ -81,7 +81,7 @@ describe("App platform contract", () => {
     }
   });
   it("keeps ordinary turns short and independent of Feishu, while retaining a working fallback", () => {
-    for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity"] as const) {
+    for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const) {
       const app = appAgentInstructions({ engine });
       expect(app.length).toBeLessThan(APP_INSTRUCTION_BUDGET);
       expect(app).toContain("[send-file:/absolute/path]");

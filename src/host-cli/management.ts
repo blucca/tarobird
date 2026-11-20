@@ -7,13 +7,14 @@ import { createBotSchema, deleteBotSchema, renameBotSchema, type BotCatalog, typ
 import { hostProfileSchema } from "../client-protocol/host-profile.js";
 import { modelSettingsSchema, modelPatchSchema, type ModelPatch } from "../client-protocol/model.js";
 import { personaSettingsSchema, personaPatchSchema } from "../client-protocol/persona.js";
+import { piSessionChangeSchema, piSessionResultSchema, piSessionSnapshotSchema, type PiSessionChange } from "../client-protocol/pi-session.js";
 import type { Bot, DeviceSummary } from "../hub/store.js";
 import { HostCliError, LocalHostClient } from "./client.js";
 
 export class HostManagement {
   constructor(readonly client: LocalHostClient) {}
   bots(): Bot[] { return this.client.bots; }
-  catalog(): Promise<BotCatalog> { return this.client.request("/api/bots/catalog"); }
+  catalog(workspace?: string): Promise<BotCatalog> { return this.client.request(`/api/bots/catalog?includePi=1${workspace ? `&workspace=${encodeURIComponent(workspace)}` : ""}`); }
   createBot(input: CreateBotInput): Promise<Bot> { return this.client.request("/api/bots", "POST", createBotSchema.parse(input)); }
   deleteBot(id: string, input: DeleteBotInput) { return this.client.request(`/api/bots/${idSchema.parse(id)}`, "DELETE", deleteBotSchema.parse(input)); }
   renameBot(id: string, input: RenameBotInput) { return this.client.request(`/api/bots/${idSchema.parse(id)}/name`, "PUT", renameBotSchema.parse(input)); }
@@ -29,6 +30,14 @@ export class HostManagement {
   }
   async botModel(id: string, patch?: ModelPatch) {
     return modelSettingsSchema.parse(await this.client.request(`/api/bots/${idSchema.parse(id)}/model`, patch ? "PUT" : "GET", patch ? modelPatchSchema.parse(patch) : undefined));
+  }
+  async piSession(conversationId: string, botId: string, change?: Omit<PiSessionChange, "botId">) {
+    const route = `/api/conversations/${idSchema.parse(conversationId)}/pi-session`;
+    if (change !== undefined) {
+      const input = piSessionChangeSchema.parse({ ...change, botId });
+      return piSessionResultSchema.parse(await this.client.request(route, "POST", input));
+    }
+    return piSessionSnapshotSchema.parse(await this.client.request(`${route}?botId=${idSchema.parse(botId)}`));
   }
   async botPersona(id: string, patch?: unknown) {
     return personaSettingsSchema.parse(await this.client.request(`/api/bots/${idSchema.parse(id)}/persona`, patch === undefined ? "GET" : "PUT", patch === undefined ? undefined : personaPatchSchema.parse(patch)));

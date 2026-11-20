@@ -9,6 +9,7 @@ import { Bridge } from "../runtime/bridge.js";
 import { prepareBotInstructions } from "../runtime/bot-instructions.js";
 import { ProcessCodexAdapter } from "../codex/process-adapter.js";
 import { ClaudeStreamAdapter } from "../codex/claude-stream-adapter.js";
+import { PiRpcAdapter } from "../codex/pi-rpc-adapter.js";
 import { KimiAcpAdapter } from "../codex/kimi-acp-adapter.js";
 import { ProcessAntigravityAdapter } from "../codex/antigravity-adapter.js";
 import { CodexAppServerAdapter } from "../codex/app-server-adapter.js";
@@ -256,7 +257,7 @@ async function seedIsolatedClaudeConfig(
   ]);
 }
 
-export type EngineType = "codex" | "claude" | "antigravity" | "kimi" | "deepseek";
+export type EngineType = "codex" | "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
 type CodexRuntime = "app-server" | "process";
 
 export async function readInstanceRuntimeConfig(configPath: string): Promise<{
@@ -266,7 +267,7 @@ export async function readInstanceRuntimeConfig(configPath: string): Promise<{
   claudeChrome: boolean;
 }> {
   const parsed = await readValidatedConfigFile(configPath);
-  const engine = parsed.engine === "claude" || parsed.engine === "antigravity" || parsed.engine === "kimi" || parsed.engine === "deepseek"
+  const engine = parsed.engine === "claude" || parsed.engine === "antigravity" || parsed.engine === "kimi" || parsed.engine === "deepseek" || parsed.engine === "pi"
     ? parsed.engine
     : "codex";
   const approvalMode = resolveApprovalModeForEngine(
@@ -297,7 +298,8 @@ export function resolveEngineRuntime(
   engine: EngineType,
   _approvalMode: ApprovalMode,
   codexRuntime?: CodexRuntime,
-): "app-server" | "process" | "stream" | "acp" | "web" {
+): "app-server" | "process" | "stream" | "acp" | "web" | "rpc" {
+  if (engine === "pi") return "rpc";
   if (engine === "claude") {
     return "stream";
   }
@@ -474,6 +476,7 @@ export function buildEngineEnvironment(env: EnvSource, transport: BridgeDependen
     ["CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"],
     ["KIMI_CODE_HOME", "KIMI_CODE_HOME"],
     ["DSH_HOME", "DSH_HOME"],
+    ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"],
     ["TAROBOT_STATE_DIR", "TAROBOT_STATE_DIR"],
     ["TAROBOT_INSTANCE", "TAROBOT_INSTANCE"],
     ["TAROCUB_INSTANCE", "TAROCUB_INSTANCE"],
@@ -522,6 +525,17 @@ async function createAdapter(
   const childEnv = buildEngineEnvironment(env, options.transport);
   const searchRouting = await resolveSearchRouting(childEnv);
   const nativeSearchMcp = createNativeSearchMcpPlanner(childEnv);
+
+  if (engine === "pi") {
+    await mkdir(workspacePath, { recursive: true });
+    return new PiRpcAdapter({
+      launch: { command: config.piExecutable, args: [] },
+      workspacePath, stateDir: config.stateDir, childEnv, configPath,
+      nativeSearchMcp,
+      // Pi has no native turn deadline; retain an inactivity watchdog only.
+      turnTimeoutMs: null,
+    });
+  }
 
   if (engine === "claude") {
     // Bots no longer get a per-instance CLAUDE_CONFIG_DIR. Instead they

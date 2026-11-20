@@ -12,7 +12,7 @@ describe("Bot permissions", () => {
   afterEach(async () => { await rm(root, { recursive: true, force: true }); });
   const config = (value: object) => writeFile(path.join(root, "config.json"), JSON.stringify(value));
   async function settings(engine: PermissionEngine) { const result = await permissionSettings(root, engine, 0); if (!result.ok) throw new Error(result.error); return result.settings; }
-  it.each(["codex", "claude", "kimi", "deepseek", "antigravity"] as const)("persists every %s native choice without changing unrelated config or sessions", async engine => {
+  it.each(["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const)("persists every %s native choice without changing unrelated config or sessions", async engine => {
     const preserved = { engine, model: "my-model", effort: "high", workspacePath: "/private/workspace", bus: { secret: "test-secret-value" }, userExtension: { retained: true } };
     await config(preserved); await writeFile(path.join(root, "session.json"), "unchanged");
     let before = await settings(engine); expect(before.choice).toBe(defaultPermission(engine));

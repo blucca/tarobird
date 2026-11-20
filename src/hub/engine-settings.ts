@@ -1,3 +1,4 @@
+import { resolvePiExecutable } from "../runtime/pi-executable.js";
 import { createHash, randomUUID } from "node:crypto";
 import { open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -20,7 +21,7 @@ export class HubEngineSettings {
     return { revision: settings.revision, platform: process.platform, searchPaths: (env.PATH ?? "").split(path.delimiter).filter(Boolean),
       receipt: receipt ? { requestId: receipt.requestId, revision: receipt.revision } : null,
       engines: hostEngineSchema.options.map(id => {
-        const command = id === "deepseek" ? resolveDeepSeekExecutable(env) : env[ENGINE_ENV_KEYS[id]] || ENGINE_COMMANDS[id];
+        const command = id === "pi" ? resolvePiExecutable(env) : id === "deepseek" ? resolveDeepSeekExecutable(env) : env[ENGINE_ENV_KEYS[id]] || ENGINE_COMMANDS[id];
         const executable = resolveEngineExecutable(command, env) ?? null;
         const explicit = id === "deepseek" ? deepseekExecutableOverride(base) !== undefined : !!base[ENGINE_ENV_KEYS[id]];
         return { id, override: settings.paths[id] ?? null, source: settings.paths[id] ? "setting" : explicit ? "environment" : "auto", command, executable, available: !!executable };

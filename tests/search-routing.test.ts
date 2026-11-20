@@ -46,7 +46,7 @@ it("passes Kimi search credentials through ACP env only and degrades on missing 
   expect(warn.mock.calls.flat().join(" ")).not.toContain("fixture-secret");
 });
 it("prefers available configured MCP and explicitly preserves native fallback in App guidance", () => {
-  for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity"] as const) {
+  for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const) {
     const standing = appAgentInstructions({ engine });
     expect(standing).toContain("Prefer configured Search MCP.");
     expect(appCapabilityInstructions("browser", { engine })).toContain("If MCP fails, use native tools");

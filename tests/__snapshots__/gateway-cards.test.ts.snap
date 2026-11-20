@@ -2578,6 +2578,42 @@ exports[`Gateway card translation > translates actual config, board, status, res
                 "value": "antigravity",
               },
             },
+            {
+              "actionId": "action:2.0.6",
+              "extra": {
+                "behaviors": [
+                  {
+                    "type": "callback",
+                    "value": {
+                      "action": "engine",
+                      "bridgeChatId": 42,
+                      "bridgeChatType": "private",
+                      "cctb_lark": "config",
+                      "conversationKey": "lark:fixture",
+                      "larkChatId": "fixture",
+                      "revision": "render_revision_fixture",
+                      "value": "pi",
+                    },
+                  },
+                ],
+              },
+              "layout": {
+                "width": "fill",
+              },
+              "style": "default",
+              "text": "Pi",
+              "type": "button",
+              "value": {
+                "action": "engine",
+                "bridgeChatId": 42,
+                "bridgeChatType": "private",
+                "cctb_lark": "config",
+                "conversationKey": "lark:fixture",
+                "larkChatId": "fixture",
+                "revision": "render_revision_fixture",
+                "value": "pi",
+              },
+            },
           ],
           "layout": {
             "weight": 1,

@@ -36,21 +36,21 @@ it.each(["darwin", "linux", "win32"] as const)("keeps %s host PATH consistent wi
   else { expect(result.PATH?.split(":")).toContain("/opt/homebrew/bin"); expect(result.PATH?.split(":")).toContain("/home/example/.kimi-code/bin"); }
 });
 
-it.each(["codex", "claude", "kimi", "agy", "dsh"])("explains a missing %s startup path without leaking the executable path or promising restart will fix it", engine => {
+it.each(["codex", "claude", "kimi", "agy", "dsh", "pi"])("explains a missing %s startup path without leaking the executable path or promising restart will fix it", engine => {
   const error = new Error(`spawn /private/owner/${engine} ENOENT`);
   expect(renderCoreUserFacingError(error, "engine", "zh")).toContain("CLI 安装、启动路径（PATH）和 Bot 工作目录");
   expect(renderCoreUserFacingError(error, "engine", "en")).toContain("executable or working directory");
   expect(renderCoreUserFacingError(error, "engine", "zh")).not.toMatch(/重启|private/);
 });
 
-it.runIf(process.platform !== "win32").each([ ["detached", "local"], ["foreground", "local"], ["detached", "managers"], ["foreground", "managers"] ] as const)("finds all five installed CLIs from a minimal system PATH in a real %s host (%s)", async (mode, layout) => {
+it.runIf(process.platform !== "win32").each([ ["detached", "local"], ["foreground", "local"], ["detached", "managers"], ["foreground", "managers"] ] as const)("finds all six installed CLIs from a minimal system PATH in a real %s host (%s)", async (mode, layout) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "tb-path-")); roots.push(root);
   const home = path.join(root, "user"), directory = path.join(root, "host"); directories.push(directory);
   await mkdir(path.join(home, ".local/bin"), { recursive: true });
   const expectedDirectories = new Set<string>();
   // Presence checks never invoke a real engine installed elsewhere on the host.
-  for (const command of ["codex", "claude", "kimi", "dsh", "agy"]) {
-    const dirs: Record<string, string> = { codex: ".nvm/versions/node/v22.12.0/bin", claude: ".volta/bin", kimi: ".asdf/shims", dsh: ".local/share/mise/shims", agy: ".bun/bin" };
+  for (const command of ["codex", "claude", "kimi", "dsh", "agy", "pi"]) {
+    const dirs: Record<string, string> = { codex: ".nvm/versions/node/v22.12.0/bin", claude: ".volta/bin", kimi: ".asdf/shims", dsh: ".local/share/mise/shims", agy: ".bun/bin", pi: ".nvm/versions/node/v22.12.0/bin" };
     const cli = path.join(home, layout === "local" ? ".local/bin" : dirs[command]!, command);
     expectedDirectories.add(path.dirname(cli));
     await mkdir(path.dirname(cli), { recursive: true });
@@ -60,7 +60,7 @@ it.runIf(process.platform !== "win32").each([ ["detached", "local"], ["foregroun
   await initializeHost(directory, "PATH regression host");
   const identity = await readFile(path.join(directory, "identity.json"), "utf8");
   // CI images and developer shells can export manager roots outside this fixture.
-  const overrides = { HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin", NVM_DIR: "", VOLTA_HOME: "", BUN_INSTALL: "", ASDF_DATA_DIR: "", MISE_DATA_DIR: "", FNM_DIR: "", XDG_DATA_HOME: "", CODEX_EXECUTABLE: "", CLAUDE_EXECUTABLE: "", KIMI_EXECUTABLE: "", DSH_EXECUTABLE: "", ANTIGRAVITY_EXECUTABLE: "" };
+  const overrides = { HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin", NVM_DIR: "", VOLTA_HOME: "", BUN_INSTALL: "", ASDF_DATA_DIR: "", MISE_DATA_DIR: "", FNM_DIR: "", XDG_DATA_HOME: "", CODEX_EXECUTABLE: "", CLAUDE_EXECUTABLE: "", KIMI_EXECUTABLE: "", DSH_EXECUTABLE: "", ANTIGRAVITY_EXECUTABLE: "", PI_EXECUTABLE: "", PI_CODING_AGENT_DIR: "" };
   const env = { ...process.env, ...overrides };
   if (mode === "detached") {
     for (const [key, value] of Object.entries(overrides)) vi.stubEnv(key, value);
@@ -73,11 +73,11 @@ it.runIf(process.platform !== "win32").each([ ["detached", "local"], ["foregroun
   }
   const client = await LocalHostClient.connect(directory, { enroll: true });
   try {
-    const settings = engineSettingsSchema.parse(await client.request("/api/settings/engines"));
+    const settings = engineSettingsSchema.parse(await client.request("/api/settings/engines?includePi=1"));
     // A globally installed CLI must not hide a missing fixture search directory.
     for (const directory of expectedDirectories) expect(settings.searchPaths).toContain(directory);
     expect(settings.engines.map(engine => [engine.id, engine.available]).sort()).toEqual([
-      ["antigravity", true], ["claude", true], ["codex", true], ["deepseek", true], ["kimi", true],
+      ["antigravity", true], ["claude", true], ["codex", true], ["deepseek", true], ["kimi", true], ["pi", true],
     ]);
   } finally { client.close(); }
   expect(await readFile(path.join(directory, "identity.json"), "utf8")).toBe(identity);

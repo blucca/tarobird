@@ -10,8 +10,8 @@ import { botRoleSchema, dispatcherSettingsSchema } from "./dispatch.js";
 export const createBotSchema = z.object({
   requestId: idSchema,
   name: z.string().trim().min(1).max(100),
-  engine: z.enum(["codex", "claude", "kimi", "deepseek", "antigravity"]),
-  model: z.string().trim().max(128),
+  engine: z.enum(["codex", "claude", "kimi", "deepseek", "antigravity", "pi"]),
+  model: z.string().trim().max(512),
   effort: z.enum(["", ...EFFORT_LEVELS]),
   permission: permissionChoiceSchema.optional(),
   workspace: z.string().trim().max(4096).default(""),
@@ -19,7 +19,9 @@ export const createBotSchema = z.object({
   // existing Bot must stay byte-identical for idempotent retries.
   role: botRoleSchema.optional(),
   dispatcher: dispatcherSettingsSchema.optional(),
-}).strict().refine(input => !input.dispatcher || input.role === "dispatcher", { message: "dispatcher_settings_require_role", path: ["dispatcher"] });
+}).strict().refine(input => input.engine === "pi" || input.model.length <= 128, { message: "model_id_too_long", path: ["model"] })
+  .refine(input => input.engine !== "pi" || input.role !== "dispatcher", { message: "pi_dispatcher_unsupported", path: ["role"] })
+  .refine(input => !input.dispatcher || input.role === "dispatcher", { message: "dispatcher_settings_require_role", path: ["dispatcher"] });
 
 export type CreateBotInput = z.infer<typeof createBotSchema>;
 // Read legacy CLI-registered names verbatim so the compare-and-set baseline is
@@ -31,9 +33,10 @@ export type BotCatalog = {
   engines: {
     id: CreateBotInput["engine"];
     available: boolean;
-    models: { id: string; label?: string; efforts: string[] }[];
+    models: { id: string; label?: string; provider?: string; modelId?: string; efforts: string[] }[];
     defaultModel: string;
     defaultEffort: string;
+    catalogStatus?: "ready" | "no-models" | "unavailable";
     permissions?: { defaultChoice: PermissionChoice; choices: PermissionOption[] };
   }[];
 };

@@ -13,7 +13,7 @@ import { redactSecrets } from "./secret-redaction.js";
 
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const clean = (value: unknown, max = 500) => typeof value === "string" ? redactSecrets(value).replace(/https?:\/\/\S+/g, "[URL]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, max) : "";
-const engineNames = ["codex", "claude", "kimi", "deepseek", "antigravity"] as const;
+const engineNames = ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const;
 export type CapabilityEngine = typeof engineNames[number];
 type Options = { env?: NodeJS.ProcessEnv; offline?: boolean };
 /** A registered Bot: its own state, workspace and project-scoped settings. */
@@ -185,6 +185,20 @@ async function scanEngine(scan: Scanner, engine: CapabilityEngine, env: NodeJS.P
     if (user) { await jsonMcp(path.join(home, ".gemini/config/mcp_config.json"), "~/.gemini/config/mcp_config.json", "user"); await skills(path.join(home, ".gemini/antigravity-cli/skills"), "~/.gemini/antigravity-cli/skills", "user"); }
     if (workspace) {
       await jsonMcp(path.join(workspace, ".agents/mcp_config.json"), "workspace/.agents/mcp_config.json", "workspace");
+      await skills(path.join(workspace, ".agents/skills"), "workspace/.agents/skills", "workspace");
+    }
+  } else if (engine === "pi") {
+    const agentDir = env.PI_CODING_AGENT_DIR || path.join(home, ".pi", "agent");
+    if (user) {
+      await jsonMcp(path.join(agentDir, "mcp.json"), "$PI_CODING_AGENT_DIR/mcp.json", "user");
+      await skills(path.join(agentDir, "skills"), "$PI_CODING_AGENT_DIR/skills", "user");
+      await skills(path.join(home, ".agents/skills"), "~/.agents/skills", "user");
+    }
+    if (workspace) {
+      // Declared metadata only. Pi's native trust gate decides whether project
+      // resources actually load; this scanner never grants that trust.
+      await jsonMcp(path.join(workspace, ".pi/mcp.json"), "workspace/.pi/mcp.json", "workspace");
+      await skills(path.join(workspace, ".pi/skills"), "workspace/.pi/skills", "workspace");
       await skills(path.join(workspace, ".agents/skills"), "workspace/.agents/skills", "workspace");
     }
   } else {

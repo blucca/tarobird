@@ -33,6 +33,7 @@ export interface AppConfig {
   deepseekExecutable: string;
   deepseekHome: string;
   kimiExecutable: string;
+  piExecutable: string;
   antigravityExecutable: string;
 }
 

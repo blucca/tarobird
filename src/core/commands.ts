@@ -1,4 +1,6 @@
 import { getEngineEffortValidationError } from "../state/instance-config.js";
+import { PI_THINKING_LEVELS } from "../codex/pi-models.js";
+import { modelCatalog, modelEffortChoices } from "../runtime/model-catalog.js";
 import { antigravityPresetEffort } from "../codex/antigravity-models.js";
 import path from "node:path";
 import { channelProfile } from "./channel-profile.js";
@@ -90,7 +92,7 @@ const goalPursuitCompletions = new WeakMap<CoreServiceRuntime, Map<string, Promi
 const goalCommandLocks = new WeakMap<CoreServiceRuntime, Map<string, Promise<unknown>>>();
 
 const VALID_LARK_EFFORT_LEVELS: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
-const LARK_ENGINE_CHOICES: InstanceEngine[] = ["claude", "codex", "kimi", "deepseek", "antigravity"];
+const LARK_ENGINE_CHOICES: InstanceEngine[] = ["claude", "codex", "kimi", "deepseek", "antigravity", "pi"];
 
 type RequestCoreApproval = (input: {
   channel: CoreChannelLike;
@@ -297,6 +299,9 @@ export async function handleCoreSimpleCommand(
   const modelCommand = parseCoreModelCommand(commandText);
   if (modelCommand) {
     const cfg = await loadInstanceConfig(input.stateDir);
+    // Pi /model is a native per-session picker; the App's model settings remain
+    // the explicit Bot-wide default. Do not silently rewrite that scope here.
+    if (cfg.engine === "pi") return false;
     const message = await handleCoreModelCommand(input.stateDir, cfg, modelCommand.model, commandLocale);
     await sendCoreCommandMarkdown(input, normalized, "/model", message);
     return true;
@@ -471,6 +476,7 @@ async function handleCoreLocalEngineCommand(
     locale,
     cfg: {
       engine: cfg.engine,
+      role: cfg.role,
       model: cfg.model,
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
       resume: cfg.resume,
@@ -555,6 +561,18 @@ async function handleCoreSessionCommand(
           };
         })
       : undefined,
+    scanRecentPiSessions: input.bridge.listExternalSessions
+      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+          const modifiedAt = new Date(session.updatedAt ?? 0);
+          return {
+            sessionId: session.sessionId,
+            dirName: session.sessionId,
+            workspacePath: session.cwd,
+            modifiedAt: Number.isNaN(modifiedAt.getTime()) ? new Date(0) : modifiedAt,
+            displayName: session.title || session.sessionId,
+          };
+        })
+      : undefined,
     sendResumeScanResult: async ({ kind, visibleSessions }) => {
       await sendCoreCardWithFallback({
         channel: input.channel,
@@ -576,7 +594,7 @@ async function handleCoreSessionCommand(
 }
 
 function renderCoreResumeFallback(
-  kind: "claude" | "antigravity" | "kimi" | "deepseek",
+  kind: "claude" | "antigravity" | "kimi" | "deepseek" | "pi",
   sessions: ScannedSession[],
   locale: Locale,
 ): string {
@@ -1076,14 +1094,14 @@ function renderCoreHelpMessage(locale: Locale = "zh"): string {
       "",
       "**Session**",
       "- `/status` current conversation · `/stop` stop the current task (cancel a queued task from its queue card) · `/reset` reset the session",
-      "- `/resume [n]` pick a Claude/Kimi/DeepSeek Harness/Antigravity session · Claude `/resume <full ID>` · Codex `/resume thread <id>` · Kimi/DeepSeek also support `/resume session <id>` · `/detach` unbind",
+      "- `/resume [n]` pick a Claude/Kimi/DeepSeek Harness/Antigravity/Pi session · Claude `/resume <full ID>` · Codex `/resume thread <id>` · Kimi/DeepSeek also support `/resume session <id>` · `/detach` unbind",
       "- `/goal […]` set a conversation goal · `/btw <q>` ask aside without touching the session · `/continue` resume a waiting archive analysis",
       "- `/q <message>` force a queued turn — while a Codex/DeepSeek turn is running, plain text steers INTO it; `/q` runs it afterwards instead",
       "- `/bg` list this instance's engine/background processes · `/bg kill <pid>` · `/bg killall` sweep orphans",
       "",
       "**Settings**",
       "- `/config` interactive panel (recommended) · `/usage` usage · `/account` bound Feishu app",
-      "- `/model` · `/effort` · `/engine [claude|codex|kimi|deepseek|antigravity]` · `/fast` Codex Fast Mode · `/yolo` approval mode",
+      "- `/model` · `/effort` · `/engine [claude|codex|kimi|deepseek|antigravity|pi]` · `/fast` Codex Fast Mode · `/yolo` approval mode",
       "- `/stream [on|off]` typewriter streaming on run cards (off = full-card refresh)",
       "- `/timeout [on|off]` engine runtime safeguards (hard cap and/or inactivity watchdog; off disables both)",
       "- `/steer [on|off|<seconds>|unlimited]` mid-turn steering window (default 30s; later messages queue)",
@@ -1111,14 +1129,14 @@ function renderCoreHelpMessage(locale: Locale = "zh"): string {
     "",
     "**会话**",
     "- `/status` 当前会话 · `/stop` 停当前任务（排队任务在各自排队卡片上取消）· `/reset` 重置会话",
-    "- `/resume [编号]` 选 Claude/Kimi/DeepSeek Harness/Antigravity 会话 · Claude `/resume <完整 ID>` · Codex `/resume thread <id>` · Kimi/DeepSeek 也支持 `/resume session <id>` · `/detach` 解绑",
+    "- `/resume [编号]` 选 Claude/Kimi/DeepSeek Harness/Antigravity/Pi 会话 · Claude `/resume <完整 ID>` · Codex `/resume thread <id>` · Kimi/DeepSeek 也支持 `/resume session <id>` · `/detach` 解绑",
     "- `/goal […]` 设会话目标 · `/btw <问题>` 旁问不影响会话 · `/continue` 继续等待中的压缩包分析",
     "- `/q <消息>` 强制排队 — Codex/DeepSeek 任务运行中纯文本会注入当前任务，`/q` 则排在后面单独执行",
     "- `/bg` 列出本实例引擎/后台进程 · `/bg kill <pid>` 停指定进程树 · `/bg killall` 清理孤儿后台进程",
     "",
     "**设置**",
     "- `/config` 交互配置面板（推荐）· `/usage` 用量 · `/account` 当前绑定的飞书应用",
-    "- `/model` · `/effort` · `/engine [claude|codex|kimi|deepseek|antigravity]` · `/fast` Codex 快速模式 · `/yolo` 审批模式",
+    "- `/model` · `/effort` · `/engine [claude|codex|kimi|deepseek|antigravity|pi]` · `/fast` Codex 快速模式 · `/yolo` 审批模式",
     "- `/stream [on|off]` 回答卡片打字机流式开关（off = 整卡刷新）",
     "- `/timeout [on|off]` 引擎运行时保护（硬上限和/或静默看门狗；off 会全部关闭）",
     "- `/steer [on|off|<秒数>|unlimited]` 任务中途引导的资格窗口（默认 30 秒，超窗排队）",
@@ -1859,6 +1877,9 @@ async function renderCoreStatusMessage(
  * trip there — pretending otherwise would be a false safety net.
  */
 function renderCoreEngineUsageNote(engine: InstanceConfig["engine"], locale: Locale, budgetConfigured: boolean): string {
+  if (engine === "pi") return locale === "en"
+    ? "Pi reports usage and cost when supplied by the provider. Cost may be estimated; a Host budget check does not impose a native per-turn spending limit."
+    : "Pi 会记录提供商返回的用量和费用，费用可能为估算值；主机预算检查不等于原生单轮费用上限。";
   if (engine === "kimi") {
     return locale === "en"
       ? `Note: Kimi ACP does not currently report structured per-turn tokens or cost; Kimi turns are excluded from these totals${budgetConfigured ? " and the configured budget cap cannot track them" : ""}.`
@@ -2113,11 +2134,20 @@ async function handleCoreEffortCommand(
   if (!level) {
     return locale === "en" ? `Current effort: ${cfg.effort ?? "default"}` : `当前 effort: ${cfg.effort ?? "default"}`;
   }
-  if (level === "off" || level === "default") {
+  if (level === "default" || level === "off" && cfg.engine !== "pi") {
     await updateInstanceConfig(stateDir, (config) => {
       delete config.effort;
     });
     return locale === "en" ? "Effort reset to default." : "Effort 已恢复默认。";
+  }
+  if (cfg.engine === "pi") {
+    const models = await modelCatalog("pi", process.env, cfg.workspacePath ?? cfg.resume?.workspacePath ?? path.join(stateDir, "workspace"));
+    const levels = modelEffortChoices("pi", cfg.model ?? "", models);
+    if (!PI_THINKING_LEVELS.includes(level as typeof PI_THINKING_LEVELS[number]) || !levels.includes(level as EffortLevel)) {
+      return locale === "en" ? "Pi has not confirmed this thinking level for the selected model. Refresh the model list or use /effort default." : "Pi 尚未确认当前模型支持这个思考档位。请重新读取模型列表，或使用 /effort default。";
+    }
+    await updateInstanceConfig(stateDir, config => { config.effort = level; });
+    return locale === "en" ? `Pi thinking override set to ${level}.` : `Pi 思考强度已设为 ${level}。`;
   }
   if (cfg.engine === "claude" && level === "ultra") {
     return locale === "en"
@@ -2363,36 +2393,38 @@ async function handleCoreEngineCommand(
       return [
         `Current engine: ${cfg.engine}`,
         "Choose an engine with /engine <name>:",
-        ...LARK_ENGINE_CHOICES.map((choice) => `/engine ${choice}`),
+        ...LARK_ENGINE_CHOICES.filter(choice => choice !== "pi" || cfg.role !== "dispatcher").map((choice) => `/engine ${choice}`),
         restartNote,
       ].join("\n");
     }
     return [
       `当前引擎：${cfg.engine}`,
       "用 /engine <名称> 选择引擎：",
-      ...LARK_ENGINE_CHOICES.map((choice) => `/engine ${choice}`),
+      ...LARK_ENGINE_CHOICES.filter(choice => choice !== "pi" || cfg.role !== "dispatcher").map((choice) => `/engine ${choice}`),
       restartNote,
     ].join("\n");
   }
   if (invalid || !LARK_ENGINE_CHOICES.includes(engine as InstanceEngine)) {
-    return locale === "en" ? "Usage: /engine [claude|codex|kimi|deepseek|antigravity]" : "用法: /engine [claude|codex|kimi|deepseek|antigravity]";
+    return locale === "en" ? "Usage: /engine [claude|codex|kimi|deepseek|antigravity|pi]" : "用法: /engine [claude|codex|kimi|deepseek|antigravity|pi]";
   }
 
   const selectedEngine = engine as InstanceEngine;
+  if (selectedEngine === "pi" && cfg.role === "dispatcher") {
+    return locale === "en" ? "Pi is available for ordinary Bots, not Chief of Staff Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
+  }
   const engineChanged = cfg.engine !== selectedEngine;
   let resetSessionBindings = false;
-  if (engineChanged) {
-    const sessionStore = new SessionStore(path.join(stateDir, "session.json"));
-    resetSessionBindings = (await sessionStore.clearAll()) > 0;
-  }
-
   let clearedModel = false;
   let enabledFullAuto = false;
-  await updateInstanceConfig(stateDir, (config) => {
+  const persist = () => updateInstanceConfig(stateDir, (config) => {
     const result = applyEngineSelection(config, selectedEngine);
     clearedModel = result.clearedModel;
     enabledFullAuto = result.enabledFullAuto;
   });
+  if (engineChanged) {
+    const result = await new SessionStore(path.join(stateDir, "session.json")).clearAllThen(persist);
+    resetSessionBindings = result.removedCount > 0;
+  } else await persist();
 
   const details: string[] = [];
   if (clearedModel) {

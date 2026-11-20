@@ -4,6 +4,11 @@ import type { SteeringApplication } from "../client-protocol/steering-outcome.js
 import { EngineSteeringRejectedError } from "../codex/adapter.js";
 import { botInstructionsGuidance } from "./bot-instructions.js";
 import type { EngineTaskSnapshot, EngineTaskControlResult } from "../client-protocol/engine-tasks.js";
+import { createHash } from "node:crypto";
+import { getPiNativeControls } from "../codex/pi-rpc-adapter.js";
+import { decodePiModel, encodePiModel, parsePiModels } from "../codex/pi-models.js";
+import { PiNativeRejectedError, type PiNativeState, type PiNativeLiveSession } from "../codex/pi-native-types.js";
+import { piSessionSnapshotSchema, piSessionThinkingSchema, type PiSessionSnapshot, type PiSessionResult, type PiSessionChange } from "../client-protocol/pi-session.js";
 import type {
   CodexAdapter,
   AppPlatformTools,
@@ -15,6 +20,18 @@ import type {
   ExternalSessionInfo,
 } from "../codex/adapter.js";
 import { findConflictingLockedChatId } from "../state/access-store.js";
+
+type PiSessionScope = { chatId: number; conversationKey: string; isCurrentSession?: () => Promise<boolean> };
+const piSessionToken = (scope: PiSessionScope, sessionId: string, live: PiNativeLiveSession): string => createHash("sha256").update(JSON.stringify([scope.conversationKey, sessionId, live.token])).digest("hex");
+const piUiText = (value: string, max: number): string => value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").slice(0, max);
+function piUi(state: PiNativeState): PiNativeState["ui"] {
+  const safeKey = (key: string) => key.length > 0 && key.length <= 80 && !["__proto__", "prototype", "constructor"].includes(key);
+  return {
+    status: Object.fromEntries(Object.entries(state.ui?.status ?? {}).filter(([key, value]) => safeKey(key) && typeof value === "string").slice(0, 20).map(([key, value]) => [key, piUiText(value, 1000)])),
+    widgets: Object.fromEntries(Object.entries(state.ui?.widgets ?? {}).filter(([key, value]) => safeKey(key) && Array.isArray(value?.lines) && ["aboveEditor", "belowEditor"].includes(value.placement)).slice(0, 10).map(([key, value]) => [key, { placement: value.placement, lines: value.lines.filter(line => typeof line === "string").slice(0, 20).map(line => piUiText(line, 1000)) }])),
+    ...(typeof state.ui?.title === "string" ? { title: piUiText(state.ui.title, 200) } : {}),
+  };
+}
 
 /** Native tool adapters may select a previous thread's tool schema. Keep the
  * Bot file reference in that turn too, without changing stable worker settings. */
@@ -812,6 +829,67 @@ export class Bridge {
     if (current?.sessionId !== session.sessionId) return { outcome: "rejected", reason: "binding_changed" };
     if (!mayUse(session.sessionId)) return { outcome: "rejected", reason: "stale" };
     return this.adapter.controlNativeInput(session.sessionId, { inputId: input.inputId, action: input.action });
+  }
+
+  async getPiSession(input: PiSessionScope): Promise<PiSessionSnapshot> {
+    const controls = getPiNativeControls(this.adapter);
+    if (!controls?.getLiveSession || !this.sessionManager.getExistingSession) return { supported: false };
+    const scope = this.conversationScope(input), mayUse = await this.sessionTurnAccess(scope);
+    const session = await this.sessionManager.getExistingSession(scope);
+    if (!session || !mayUse(session.sessionId)) return { supported: true };
+    const live = controls.getLiveSession(session.sessionId);
+    if (!live) return { supported: true };
+    const isCurrent = async () => {
+      if (input.isCurrentSession && !await input.isCurrentSession()) return false;
+      const current = await this.sessionManager.getExistingSession!(scope);
+      return current?.sessionId === session.sessionId && mayUse(session.sessionId) && live.isCurrent();
+    };
+    if (!await isCurrent()) return { supported: true };
+    try {
+      const [state, models] = await Promise.all([live.getState(), live.listModels()]);
+      if (!await isCurrent() || state.sessionId !== session.sessionId) return { supported: true };
+      const model = state.model ? encodePiModel(state.model.provider, state.model.modelId) : undefined;
+      const snapshot = piSessionSnapshotSchema.safeParse({ supported: true, session: {
+        token: piSessionToken(input, session.sessionId, live),
+        ...(model && decodePiModel(model) ? { model } : {}),
+        modelSource: state.modelSource, thinking: state.thinkingLevel, thinkingLevels: state.availableThinkingLevels,
+        choices: parsePiModels(models).slice(0, 5000), busy: state.isStreaming || state.isCompacting,
+        bridge: state.bridge, ui: piUi(state),
+      } });
+      return snapshot.success ? snapshot.data : { supported: true };
+    } catch { return { supported: true }; }
+  }
+
+  async changePiSession(input: PiSessionScope & Pick<PiSessionChange, "expectedSession" | "action" | "value">): Promise<PiSessionResult> {
+    const controls = getPiNativeControls(this.adapter);
+    if (!controls?.getLiveSession || !this.sessionManager.getExistingSession) return { outcome: "rejected", reason: "unsupported" };
+    const scope = this.conversationScope(input), mayUse = await this.sessionTurnAccess(scope);
+    const session = await this.sessionManager.getExistingSession(scope);
+    if (!session || !mayUse(session.sessionId)) return { outcome: "rejected", reason: "stale" };
+    const live = controls.getLiveSession(session.sessionId);
+    if (!live || piSessionToken(input, session.sessionId, live) !== input.expectedSession) return { outcome: "rejected", reason: "stale" };
+    const isCurrent = async () => {
+      if (input.isCurrentSession && !await input.isCurrentSession()) return false;
+      const current = await this.sessionManager.getExistingSession!(scope);
+      return current?.sessionId === session.sessionId && mayUse(session.sessionId) && live.isCurrent();
+    };
+    if (!await isCurrent()) return { outcome: "rejected", reason: "stale" };
+    const model = input.action === "model" && input.value !== null ? decodePiModel(input.value) : null;
+    const thinking = input.action === "thinking" && input.value !== null ? piSessionThinkingSchema.safeParse(input.value) : undefined;
+    if (input.action === "model" && input.value !== null && !model || thinking && !thinking.success) return { outcome: "rejected", reason: "invalid" };
+    try {
+      // The handle repeats isCurrent immediately before its actual native write,
+      // after any asynchronous lookup of defaults or supported thinking levels.
+      const result = input.action === "model"
+        ? await live.setModel(model ?? null, { isCurrent })
+        : await live.setThinkingLevel(thinking?.success ? thinking.data : null, { isCurrent });
+      return await isCurrent() && result.sessionId === session.sessionId ? { outcome: "accepted" } : { outcome: "unknown", reason: "uncertain" };
+    } catch (error) {
+      // A live-handle guard can fail after a native write. Clearing defaults
+      // may also involve more than one write, so neither is a safe rejection.
+      if (input.value !== null && error instanceof PiNativeRejectedError && ["model-unavailable", "thinking-unsupported"].includes(error.reason)) return { outcome: "rejected", reason: "invalid" };
+      return { outcome: "unknown", reason: "uncertain" };
+    }
   }
 
   async listTasks(input: { chatId: number; conversationKey: string }): Promise<EngineTaskSnapshot> {

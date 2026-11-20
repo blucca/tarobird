@@ -49,6 +49,23 @@ it("keeps saved DeepSeek paths ahead of environment defaults and fails closed af
   expect(inspectEngines(env).find(row => row.engine === "deepseek")?.installed).toBe(false);
   expect(resolveBridgeConfig(env).deepseekExecutable).toBe(f.executable);
 });
+it("uses the same Pi executable for Host, Doctor and settings, without running a discovery candidate", async () => {
+  const f = await fixture();
+  const env = { ...f.env, PI_EXECUTABLE: process.execPath };
+  const settings = new HubEngineSettings(f.root, () => env);
+  const set = await settings.update({ engine: "pi", path: f.executable, requestId: "pi-set", revision: "default" }, apply => apply());
+  const effective = hostEngineEnvironment(f.root, env);
+  expect(resolveBridgeConfig(effective).piExecutable).toBe(f.executable);
+  expect(inspectEngines(effective).find(row => row.engine === "pi")).toMatchObject({ executable: f.executable, installed: true, authentication: "unverified" });
+  expect(settings.status().engines.find(row => row.id === "pi")).toMatchObject({ source: "setting", executable: f.executable, available: true });
+  // The candidate is a non-program text file: discovery must never execute it.
+  await rm(f.executable);
+  expect(resolveBridgeConfig(effective).piExecutable).toBe(f.executable);
+  expect(inspectEngines(effective).find(row => row.engine === "pi")?.installed).toBe(false);
+  expect(settings.status().engines.find(row => row.id === "pi")).toMatchObject({ source: "setting", executable: null, available: false });
+  await settings.update({ engine: "pi", path: null, requestId: "pi-clear", revision: set.revision }, apply => apply());
+  expect(resolveBridgeConfig(hostEngineEnvironment(f.root, env)).piExecutable).toBe(process.execPath);
+});
 it.skipIf(process.platform === "win32")("does not apply Windows DeepSeek environment normalization on Unix", async () => {
   const f = await fixture(), env = { HOME: f.home, PATH: "", dsh_executable: f.executable };
   expect(hostEngineEnvironment(f.root, env)).toMatchObject({ dsh_executable: f.executable });
@@ -100,17 +117,22 @@ it("uses the owner API from CLI, checks read-back, and keeps paths out of audit 
     expect(client.ready.serverCapabilities).toContain("engines.settings.v1");
     const set = await engineSettingsCommand(client, "set", { engine: "codex", path: f.executable, revision: "default", requestId: "api-set" }, () => undefined);
     expect(set.engines.find(e => e.id === "codex")?.override).toBe(f.executable);
+    expect(set.engines.some(e => e.id === "pi")).toBe(true);
+    const legacy = await client.request<{ engines: { id: string }[] }>("/api/settings/engines");
+    expect(legacy.engines.map(e => e.id).sort()).toEqual(["antigravity", "claude", "codex", "deepseek", "kimi"]);
+    const legacyWrite = await client.request<{ revision: string; engines: { id: string }[] }>("/api/settings/engines", "PUT", { engine: "codex", path: f.executable, revision: set.revision, requestId: "legacy-noop" });
+    expect(legacyWrite.engines.map(e => e.id).sort()).toEqual(["antigravity", "claude", "codex", "deepseek", "kimi"]);
     expect((await client.request<{ engines: { id: string; available: boolean }[] }>("/api/bots/catalog")).engines.find(e => e.id === "codex")?.available).toBe(true);
     const audit = await hub.store.db.all("SELECT detail_json FROM audit_log WHERE kind='engines.settings-updated'");
     expect(JSON.stringify(audit)).not.toContain(f.executable);
     const out = vi.spyOn(console, "log").mockImplementation(() => undefined);
     await runHostCli(["engines", "status", "--state-dir", f.root, "--json"]);
-    expect(JSON.parse(String(out.mock.calls.at(-1)?.[0])).revision).toBe(set.revision);
+    expect(JSON.parse(String(out.mock.calls.at(-1)?.[0])).revision).toBe(legacyWrite.revision);
     expect((await fetch(hub.url + "/api/settings/engines")).ok).toBe(false);
     await hub.store.db.run("UPDATE users SET role='member' WHERE id='owner'");
     await expect(client.request("/api/settings/engines")).rejects.toThrow();
     await expect(client.request("/api/settings/engines", "PUT", { engine: "codex", path: null, revision: set.revision, requestId: "member" })).rejects.toThrow();
-    expect(f.settings.status().revision).toBe(set.revision);
+    expect(f.settings.status().revision).toBe(legacyWrite.revision);
   } finally { client.close(); await close(); await hub.close(); }
 });
 it("never repeats an unconfirmed CLI write or pretends an old Host supports settings", async () => {

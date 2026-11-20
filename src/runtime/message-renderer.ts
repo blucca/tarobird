@@ -3,7 +3,7 @@ import { extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError
 
 import type { Locale } from "./locale.js";
 export type { Locale } from "./locale.js";
-export type EngineName = "codex" | "claude" | "antigravity" | "kimi" | "deepseek";
+export type EngineName = "codex" | "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
 
 // Bounded reply chunks preserve the existing shared command contract.
 export function chunkReplyMessage(text: string, limit = 4000): string[] {
@@ -123,7 +123,8 @@ function extractDiagnosticHttpTarget(detail: string): string | undefined {
   }
 }
 
-function renderEngineName(engine: EngineName | undefined): "Codex" | "Claude" | "Kimi" | "DeepSeek" | "Antigravity" | undefined {
+function renderEngineName(engine: EngineName | undefined): "Codex" | "Claude" | "Kimi" | "DeepSeek" | "Antigravity" | "Pi" | undefined {
+  if (engine === "pi") return "Pi";
   if (engine === "codex") {
     return "Codex";
   }
@@ -142,7 +143,7 @@ function renderEngineName(engine: EngineName | undefined): "Codex" | "Claude" | 
   return undefined;
 }
 
-function inferEngineName(detail: string, target: string | undefined, engine?: EngineName): "Codex" | "Claude" | "Kimi" | "DeepSeek" | "Antigravity" | "Engine" {
+function inferEngineName(detail: string, target: string | undefined, engine?: EngineName): "Codex" | "Claude" | "Kimi" | "DeepSeek" | "Antigravity" | "Pi" | "Engine" {
   const explicitEngineName = renderEngineName(engine);
   if (explicitEngineName) {
     return explicitEngineName;

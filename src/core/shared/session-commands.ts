@@ -77,7 +77,7 @@ const RESUME_SCAN_TTL_MS = 10 * 60 * 1000;
 const ANTIGRAVITY_CONVERSATION_ID_PATTERN =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-type PendingResumeScanKind = "claude" | "antigravity" | "kimi" | "deepseek";
+type PendingResumeScanKind = "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
 
 const pendingResumeScans = new Map<string, {
   kind: PendingResumeScanKind;
@@ -226,10 +226,11 @@ interface LocalSessionCommandInput {
   scanRecentAntigravitySessions?: (hours: number) => Promise<ScannedSession[]>;
   scanRecentKimiSessions?: () => Promise<ScannedSession[]>;
   scanRecentDeepSeekSessions?: () => Promise<ScannedSession[]>;
+  scanRecentPiSessions?: () => Promise<ScannedSession[]>;
   formatSessionListMessage?: (sessions: ScannedSession[], locale: Locale) => string;
   formatAntigravityConversationListMessage?: (sessions: ScannedSession[], locale: Locale) => string;
   sendResumeScanResult?: (input: {
-    kind: "claude" | "antigravity" | "kimi" | "deepseek";
+    kind: "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
     sessions: ScannedSession[];
     visibleSessions: ScannedSession[];
     locale: Locale;
@@ -258,6 +259,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
     scanRecentAntigravitySessions = scanRecentAntigravityConversations,
     scanRecentKimiSessions,
     scanRecentDeepSeekSessions,
+    scanRecentPiSessions,
     formatSessionListMessage = formatSessionList,
     formatAntigravityConversationListMessage = formatAntigravityConversationList,
     sendResumeScanResult,
@@ -304,11 +306,11 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
 
   const resumeCmd = parseResumeCommand(normalized.text);
   if (resumeCmd) {
-    if (cfg.engine === "kimi" || cfg.engine === "deepseek") {
+    if (cfg.engine === "kimi" || cfg.engine === "deepseek" || cfg.engine === "pi") {
       const isDeepSeek = cfg.engine === "deepseek";
-      const scanKind: "kimi" | "deepseek" = isDeepSeek ? "deepseek" : "kimi";
-      const engineName = isDeepSeek ? "DeepSeek Harness" : "Kimi";
-      const scanRecentHarnessSessions = isDeepSeek ? scanRecentDeepSeekSessions : scanRecentKimiSessions;
+      const scanKind = cfg.engine;
+      const engineName = cfg.engine === "pi" ? "Pi" : isDeepSeek ? "DeepSeek Harness" : "Kimi";
+      const scanRecentHarnessSessions = cfg.engine === "pi" ? scanRecentPiSessions : isDeepSeek ? scanRecentDeepSeekSessions : scanRecentKimiSessions;
       if (resumeCmd.kind === "scan") {
         if (!scanRecentHarnessSessions) {
           const msg = locale === "zh"
@@ -828,7 +830,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         ? "已断开恢复的 session，回到 bot 默认工作区。"
         : "Detached from resumed session. Back to default workspace.";
       await context.api.sendMessage(normalized.chatId, detachMessage);
-    } else if (cfg.engine === "codex" || cfg.engine === "antigravity" || cfg.engine === "kimi" || cfg.engine === "deepseek") {
+    } else if (cfg.engine === "codex" || cfg.engine === "antigravity" || cfg.engine === "kimi" || cfg.engine === "deepseek" || cfg.engine === "pi") {
       const removed = await removeSessionForConversation(sessionStore, normalized);
       if (cfg.engine === "codex") {
         detachMessage = removed
@@ -854,6 +856,8 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
           : (locale === "zh"
             ? "当前没有绑定的 Kimi session。"
             : "No active Kimi session.");
+      } else if (cfg.engine === "pi") {
+        detachMessage = removed ? (locale === "zh" ? "已断开当前 Pi 会话。下一条消息会新建会话。" : "Detached from the current Pi session. The next message starts a fresh session.") : (locale === "zh" ? "当前没有绑定的 Pi 会话。" : "No active Pi session.");
       } else {
         detachMessage = removed
           ? (locale === "zh"

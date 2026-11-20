@@ -213,4 +213,11 @@ describe("client-created TaroCub instances", () => {
     expect(catalog.engines.find((e) => e.id === "codex")?.models.find((m) => m.id === "gpt-5.5")?.efforts).not.toContain("ultra");
     expect(await hub.store.bots("owner")).toHaveLength(0);
   });
+  it("keeps other engine catalogs usable when a Pi workspace cannot be read", async () => {
+    const catalog = await manager.catalog("../missing-workspace");
+    expect(catalog.engines.find(engine => engine.id === "codex")).toMatchObject({ available: true });
+    expect(catalog.engines.find(engine => engine.id === "pi")).toMatchObject({ catalogStatus: "unavailable", models: [{ id: "", efforts: [""] }] });
+    await expect(manager.create("owner", { ...spec, engine: "pi", model: "provider/model", workspace: "../missing-workspace" })).rejects.toThrow("bot_workspace_unavailable");
+    expect(await hub.store.bots("owner")).toHaveLength(0);
+  });
 });

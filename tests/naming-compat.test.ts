@@ -79,7 +79,7 @@ it("keeps legacy environment inputs usable without overriding canonical settings
   expect(resolveBridgeConfig({ HOME: "/home", TAROBOT_STATE_DIR: "/new", TAROBOT_INSTANCE: "new", CODEX_TELEGRAM_STATE_DIR: "/old", TAROCUB_INSTANCE: "old" })).toMatchObject({ stateDir: "/new", instanceName: "new" });
 });
 
-it.each(["codex", "claude", "antigravity", "kimi", "deepseek"] as const)("advertises neutral App question directives for %s", engine => {
+it.each(["codex", "claude", "antigravity", "kimi", "deepseek", "pi"] as const)("advertises neutral App question directives for %s", engine => {
   expect(appAgentInstructions({ engine })).toContain("send.choice");
   expect(appCapabilityInstructions("questions", { engine })).not.toContain("lark.choice");
 });

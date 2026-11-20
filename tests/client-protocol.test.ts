@@ -1,8 +1,16 @@
 import { notificationLink, pushPayloadSchema } from "../src/client-protocol/push.js";
 import { describe, expect, it } from "vitest";
-import { blocksText, MAX_FRAME_BYTES, parseClientFrame, textSchema, uploadSchema } from "../src/client-protocol/index.js";
+import { blocksText, CAPABILITIES, SERVER_CAPABILITIES, MAX_FRAME_BYTES, parseClientFrame, textSchema, uploadSchema } from "../src/client-protocol/index.js";
+import { SNAPSHOT_ACTIVITY_CAPABILITY } from "../src/client-protocol/snapshot.js";
 
 describe("client protocol v1 boundaries", () => {
+  it("advertises Pi controls from the host without overflowing legacy client hello limits", () => {
+    const capabilities = [...CAPABILITIES, SNAPSHOT_ACTIVITY_CAPABILITY];
+    expect(capabilities.length).toBeLessThanOrEqual(64);
+    expect(SERVER_CAPABILITIES).toContain("pi.session.v1");
+    expect(CAPABILITIES).not.toContain("pi.session.v1");
+    expect(parseClientFrame(JSON.stringify({ v: 1, type: "hello", deviceId: "device", protocolVersions: [1], capabilities, cursors: {}, nonce: "a".repeat(32) }))).toHaveProperty("frame.type", "hello");
+  });
   it("keeps queue cancellation status out of copied and indexed prompt text", () => {
     expect(blocksText([
       { type: "text", text: "Original prompt\nSecond line" },

@@ -9,9 +9,9 @@ import { applyEngineSelection } from "../../state/instance-config.js";
 import type { CommandMessage } from "../../runtime/command-message.js";
 import type { InstanceEngine } from "../../state/instance-config.js";
 
-const ENGINE_CHOICES: InstanceEngine[] = ["claude", "codex", "kimi", "deepseek", "antigravity"];
-const ENGINE_USAGE_EN = "Usage: /engine [claude|codex|kimi|deepseek|antigravity]";
-const ENGINE_USAGE_ZH = "用法: /engine [claude|codex|kimi|deepseek|antigravity]";
+const ENGINE_CHOICES: InstanceEngine[] = ["claude", "codex", "kimi", "deepseek", "antigravity", "pi"];
+const ENGINE_USAGE_EN = "Usage: /engine [claude|codex|kimi|deepseek|antigravity|pi]";
+const ENGINE_USAGE_ZH = "用法: /engine [claude|codex|kimi|deepseek|antigravity|pi]";
 
 function isCompactCommand(text: string): boolean {
   return /^\/compact(?:@\w+)?(?:\s|$)/i.test(text.trim());
@@ -25,13 +25,13 @@ function isContextCommand(text: string): boolean {
   return /^\/context(?:@\w+)?(?:\s|$)/i.test(text.trim());
 }
 
-function renderContextUsage(usage: EngineContextUsage | null, locale: Locale): string {
+function renderContextUsage(usage: EngineContextUsage | null, locale: Locale, engineName = "DeepSeek Harness"): string {
   const used = usage?.projectedTokens ?? usage?.pressureTokens;
   const window = usage?.contextWindow;
   if (used === undefined || window === undefined || window <= 0) {
     return locale === "zh"
-      ? "当前还没有可用的上下文统计。先发送一条消息，让 DeepSeek Harness 获得 provider 用量样本后再试。"
-      : "Context usage is not available yet. Send a message first so DeepSeek Harness can collect a provider usage sample, then try again.";
+      ? `当前还没有可用的上下文统计。先发送一条消息，让 ${engineName} 获得 provider 用量样本后再试。`
+      : `Context usage is not available yet. Send a message first so ${engineName} can collect a provider usage sample, then try again.`;
   }
   const format = (value: number) => Math.round(value).toLocaleString("en-US");
   const percent = Math.min(100, Math.max(0, used / window * 100)).toFixed(1);
@@ -122,6 +122,7 @@ function renderEngineSwitchMessage(input: {
 
 export interface EngineCommandConfig {
   engine: InstanceEngine;
+  role?: "dispatcher";
   disableRuntimeTimeout?: boolean;
   model?: string;
   resume?: {
@@ -183,18 +184,21 @@ export async function handleLocalEngineCoreCommand(input: {
         ? [
             `当前引擎：${cfg.engine}`,
             "用 /engine <名称> 选择引擎：",
-            ...ENGINE_CHOICES.map((engine) => `/engine ${engine}`),
+            ...ENGINE_CHOICES.filter(engine => engine !== "pi" || cfg.role !== "dispatcher").map((engine) => `/engine ${engine}`),
             "切换后重启此实例以生效。",
           ].join("\n")
         : [
             `Current engine: ${cfg.engine}`,
             "Choose an engine with /engine <name>:",
-            ...ENGINE_CHOICES.map((engine) => `/engine ${engine}`),
+            ...ENGINE_CHOICES.filter(engine => engine !== "pi" || cfg.role !== "dispatcher").map((engine) => `/engine ${engine}`),
             "Restart this instance after switching to apply the change.",
           ].join("\n");
       await context.api.sendMessage(normalized.chatId, engineMessage);
     } else if (engineCmd.invalid || !ENGINE_CHOICES.includes(engineCmd.engine as InstanceEngine)) {
       engineMessage = locale === "zh" ? ENGINE_USAGE_ZH : ENGINE_USAGE_EN;
+      await context.api.sendMessage(normalized.chatId, engineMessage);
+    } else if (engineCmd.engine === "pi" && cfg.role === "dispatcher") {
+      engineMessage = locale === "zh" ? "Pi 仅用于普通 Bot，不支持幕僚长。" : "Pi is available for ordinary Bots, not Chief of Staff Bots.";
       await context.api.sendMessage(normalized.chatId, engineMessage);
     } else {
       const selectedEngine = engineCmd.engine as InstanceEngine;
@@ -240,6 +244,8 @@ export async function handleLocalEngineCoreCommand(input: {
   }
 
   if (isCompactCommand(normalized.text)) {
+    // Keep Pi's native command suffix, extension callbacks and turn scope.
+    if (cfg.engine === "pi") return false;
     if (cfg.engine !== "claude" && cfg.engine !== "kimi" && cfg.engine !== "deepseek") {
       const msg = locale === "zh"
         ? "/compact 仅支持 Claude、Kimi 与 DeepSeek 引擎。当前引擎不会执行本地上下文压缩；如需清空当前会话，请使用 /reset。"
@@ -357,14 +363,14 @@ export async function handleLocalEngineCoreCommand(input: {
   }
 
   if (isContextCommand(normalized.text)) {
-    if (cfg.engine === "deepseek") {
+    if (cfg.engine === "deepseek" || cfg.engine === "pi") {
       const usage = await bridge.getContextUsage?.({
         chatId: normalized.chatId,
         messageThreadId: normalized.messageThreadId,
         conversationKey: normalized.conversationKey,
         workspaceOverride: cfg.resume?.workspacePath,
       }) ?? null;
-      const msg = renderContextUsage(usage, locale);
+      const msg = renderContextUsage(usage, locale, cfg.engine === "pi" ? "Pi" : "DeepSeek Harness");
       await context.api.sendMessage(normalized.chatId, msg);
       await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
         startedAt,

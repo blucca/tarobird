@@ -16,6 +16,9 @@ export function resolveApprovalModeForEngine(
   kimiAutoNeverAskAcknowledged: unknown = false,
 ): ApprovalMode {
   const mode = normalizeApprovalMode(value);
+  // Pi has no workspace sandbox. A legacy "full-auto" selection must not
+  // silently turn into unattended unrestricted execution.
+  if (engine === "pi") return mode === "full-auto" ? "normal" : mode ?? DEFAULT_APPROVAL_MODE;
   if (engine === "kimi") {
     if (mode === "bypass" && kimiAutoNeverAskAcknowledged !== true) {
       return "full-auto";
@@ -32,6 +35,9 @@ export function renderApprovalModeStatus(
   kimiAutoNeverAskAcknowledged: unknown = false,
 ): string {
   const mode = resolveApprovalModeForEngine(engine, value, kimiAutoNeverAskAcknowledged);
+  if (engine === "pi") return mode === "normal"
+    ? locale === "en" ? "Pi: Host tool approvals; no OS sandbox" : "Pi：主机工具审批；无 OS 沙箱"
+    : locale === "en" ? "Pi native access; no OS sandbox" : "Pi 原生访问；无 OS 沙箱";
   if (engine === "kimi") {
     if (mode === "full-auto") {
       return locale === "en"

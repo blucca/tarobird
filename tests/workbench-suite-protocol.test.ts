@@ -59,7 +59,7 @@ describe('Baoyu suite authenticated protocol boundary', () => {
     peer.send({ type: 'workbench.receipt', dispatchId: frame.dispatchId, receipt: { requestId: frame.request.requestId, target: frame.target, status: applied ? 'applied' : 'success', revision, ...(applied ? { saved: true } : { result: {} }) } });
   }
 
-  it.each(['deepseek', 'codex', 'claude', 'kimi', 'antigravity'])('%s negotiates canvas/PPT/comments/history and stamps the authenticated Bot actor', async engine => {
+  it.each(['deepseek', 'codex', 'claude', 'kimi', 'antigravity', 'pi'])('%s negotiates canvas/PPT/comments/history and stamps the authenticated Bot actor', async engine => {
     await register();
     const app = await client('cap-check');
     expect(app.capabilities).toEqual(expect.arrayContaining([WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY]));

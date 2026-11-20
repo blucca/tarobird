@@ -105,7 +105,7 @@ export function renderCoreStatusCard(input: {
 }
 
 export function renderCoreResumeScanCard(input: {
-  kind: "claude" | "antigravity" | "kimi" | "deepseek";
+  kind: "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
   sessions: ScannedSession[];
   locale: Locale;
   conversationKey: string;
@@ -197,7 +197,7 @@ function statusLabels(locale: Locale): { title: string; config: string; resume: 
     : { title: "飞书会话状态", config: "打开配置", resume: "恢复会话" };
 }
 
-function resumeLabels(locale: Locale, kind: "claude" | "antigravity" | "kimi" | "deepseek"): {
+function resumeLabels(locale: Locale, kind: "claude" | "antigravity" | "kimi" | "deepseek" | "pi"): {
   title: string;
   hint: string;
   empty: string;
@@ -206,7 +206,7 @@ function resumeLabels(locale: Locale, kind: "claude" | "antigravity" | "kimi" | 
 } {
   if (locale === "en") {
     return {
-      title: kind === "antigravity"
+      title: kind === "pi" ? "Pi sessions" : kind === "antigravity"
         ? "Recent Antigravity conversations"
         : kind === "deepseek"
           ? "Resume DeepSeek Harness sessions"
@@ -214,7 +214,7 @@ function resumeLabels(locale: Locale, kind: "claude" | "antigravity" | "kimi" | 
           ? "Resume Kimi sessions"
           : "Resume local sessions",
       hint: "Pick one session below. The current conversation will bind to that history.",
-      empty: kind === "antigravity"
+      empty: kind === "pi" ? "No Pi sessions found." : kind === "antigravity"
         ? "No Antigravity conversations found in the last 24 hours."
         : kind === "deepseek"
           ? "No DeepSeek Harness sessions found."
@@ -226,7 +226,7 @@ function resumeLabels(locale: Locale, kind: "claude" | "antigravity" | "kimi" | 
     };
   }
   return {
-    title: kind === "antigravity"
+    title: kind === "pi" ? "恢复 Pi 会话" : kind === "antigravity"
       ? "最近的 Antigravity conversation"
       : kind === "deepseek"
         ? "恢复 DeepSeek Harness session"
@@ -234,7 +234,7 @@ function resumeLabels(locale: Locale, kind: "claude" | "antigravity" | "kimi" | 
         ? "恢复 Kimi session"
         : "恢复历史会话",
     hint: "选择一个历史会话，当前飞书会话会绑定到这段上下文。",
-    empty: kind === "antigravity"
+    empty: kind === "pi" ? "没有找到 Pi 会话。" : kind === "antigravity"
       ? "最近 24 小时内没有找到 Antigravity conversation。"
       : kind === "deepseek"
         ? "没有找到 DeepSeek Harness session。"

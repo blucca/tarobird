@@ -63,7 +63,7 @@ describe("core engine switch (App config card)", () => {
 
   it("keeps the old engine when session bindings cannot be reset first", async () => {
     const stateDir = await botState({ engine: "claude", model: "opus" });
-    vi.spyOn(SessionStore.prototype, "clearAll").mockRejectedValue(new Error("session store unavailable"));
+    vi.spyOn(SessionStore.prototype, "clearAllThen").mockRejectedValue(new Error("session store unavailable"));
 
     await expect(switchEngine(stateDir, "codex")).rejects.toThrow("session store unavailable");
 

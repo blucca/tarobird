@@ -59,6 +59,7 @@ import { permissionPatchSchema, permissionResultSchema } from "../client-protoco
 import { personaPatchSchema, personaResultSchema } from "../client-protocol/persona.js";
 import { steerRequestSchema, steerResultSchema, steerStatusSchema } from "../client-protocol/steering.js";
 import { ENGINE_TASKS_CAPABILITY, engineSessionRecoverySchema, engineTaskSnapshotSchema, engineTaskStopSchema, engineTaskControlResultSchema } from "../client-protocol/engine-tasks.js";
+import { PI_SESSION_CAPABILITY, piSessionChangeSchema, piSessionSnapshotSchema, piSessionResultSchema } from "../client-protocol/pi-session.js";
 import { deviceActionProofSchema } from "../client-protocol/device-actions.js";
 import { effortPatchSchema, effortResultSchema } from "../client-protocol/effort.js";
 import { modelPatchSchema, modelResultSchema } from "../client-protocol/model.js";
@@ -101,7 +102,7 @@ import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
-import { CAPABILITIES, CHUNK_BYTES, MAX_FRAME_BYTES, blocksText, idSchema, messageSchema, pairingSchema, parseClientFrame, type Block, type CardElement, type ClientFrame, type Conversation, type HubEvent, type Json, type Message } from "../client-protocol/index.js";
+import { SERVER_CAPABILITIES, CHUNK_BYTES, MAX_FRAME_BYTES, blocksText, idSchema, messageSchema, pairingSchema, parseClientFrame, type Block, type CardElement, type ClientFrame, type Conversation, type HubEvent, type Json, type Message } from "../client-protocol/index.js";
 import { DISPATCH_CAPABILITY } from "../client-protocol/dispatch.js";
 import { HubDispatch } from "./dispatch.js";
 import type { Bot } from "./store.js";
@@ -137,7 +138,7 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
   const { workbench, ...rest } = metadata, { openTarget: _opener, ...context } = workbench;
   return (workbenchOpenerOnly(workbench) ? rest : { ...rest, workbench: context }) as T;
 }
-type BotConnection = { designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
+type BotConnection = { designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
 export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
@@ -955,7 +956,7 @@ export class HubServer {
           // copy of every conversation/avatar/history merely to list Bots.
           // Authentication and all subsequent HTTP authorization are unchanged.
           if (client.capabilities.includes("management.v1")) {
-            await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: CAPABILITIES,
+            await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES,
               uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations: [], avatars: [] });
             client.readySent = true; client.syncing = false;
             client.pendingPublications.length = 0; client.pendingSync.clear();
@@ -969,7 +970,7 @@ export class HubServer {
             this.options.onWarning?.("conversation_folders_unavailable");
             return undefined;
           });
-          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations, ...(conversationFolders ? { conversationFolders } : {}), avatars: await this.avatars.list(session.userId, session) });
+          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations, ...(conversationFolders ? { conversationFolders } : {}), avatars: await this.avatars.list(session.userId, session) });
           while (client.pendingPublications.length) await this.sendClient(client, client.pendingPublications.shift());
           client.readySent = true;
           if (client.capabilities.includes(CONVERSATION_SYNC_CAPABILITY)) {
@@ -1251,14 +1252,14 @@ export class HubServer {
           botId = frame.botId; if (frame.capabilities?.includes(FRAGMENT_CAPABILITY)) this.fragmentSockets.add(ws); clearTimeout(timeout); this.bots.get(botId)?.ws.close(4000, "replaced");
           const queueAdvertised = frame.capabilities?.includes(PROMPT_QUEUE_CAPABILITY) ?? false;
           const queueCapable = queueAdvertised && supportsPromptQueueEngine(frame.engine);
-          const connection: BotConnection = { designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
+          const connection: BotConnection = { designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
           // Reserve socket ownership before awaiting SQLite. Concurrent hellos
           // must replace this exact socket, not both replace its predecessor.
           this.bots.set(botId, connection);
           const ownsConnection = () => active() && this.bots.get(botId!) === connection;
           if (!await new HubPromptQueue(this.store).registerWorker(botId, queueCapable, ownsConnection, frame) || !ownsConnection()) return;
           connection.ready = true;
-          this.send(ws, { v: 1, type: "instance.ready", capabilities: [WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY] });
+          this.send(ws, { v: 1, type: "instance.ready", capabilities: [PI_SESSION_CAPABILITY, WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY] });
           // Never await RPC results in this socket's frame chain: its result
           // frames are handled by that same chain after hello completes.
           if (connection.agentBus) this.trackTask(this.replayAbandonedBusStops(connection).catch(() => this.options.onWarning?.("agent_bus_stop_replay_failed")));
@@ -1361,7 +1362,23 @@ export class HubServer {
     if (truncated) throw new HubError("workbench_input_pending", 409);
     return actor.context;
   }
+  /** Called in the database queue on both the HTTP and authenticated worker paths. */
+  private async authorizePiSession(botId: string, conversationId: string, userId: string): Promise<boolean> {
+    await this.store.requireOwner(userId);
+    await this.store.requireMember(userId, conversationId);
+    await this.store.requireBot(botId, conversationId);
+    const bot = await this.store.db.get<{ engine: string; role: string; owner_id: string | null }>("SELECT b.engine,b.role,m.owner_id FROM bots b LEFT JOIN managed_bots m ON m.bot_id=b.id WHERE b.id=? AND b.deleted_at IS NULL", [botId]);
+    const conversation = await this.store.db.get<{ type: string; owner_id: string; hidden: number }>("SELECT type,owner_id,hidden FROM conversations WHERE id=?", [conversationId]);
+    if (bot?.owner_id && bot.owner_id !== userId || conversation?.owner_id !== userId) throw new HubError("bot_forbidden", 403);
+    return bot?.engine === "pi" && !bot.role && conversation.type === "direct" && !conversation.hidden;
+  }
+
   private async instanceRequest(botId: string, method: string, params: unknown): Promise<unknown> {
+    if (method === "pi.session.authorize") {
+      const input = z.object({ conversationId: idSchema, userId: idSchema }).strict().parse(params);
+      if (!this.bots.get(botId)?.piSession) return { allowed: false };
+      return { allowed: await this.store.db.serial(() => this.authorizePiSession(botId, input.conversationId, input.userId)) };
+    }
     if (method === "workbench.turn.begin" || method === "workbench.turn.end") {
       const input = z.object({ conversationId: idSchema, messageId: idSchema }).strict().parse(params), connection = this.bots.get(botId);
       if (!connection?.designOpen) throw new HubError("unsupported", 409);
@@ -1569,7 +1586,9 @@ export class HubServer {
             await this.store.db.run("INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)", [Date.now(), session.deviceId, "engines.settings-updated", JSON.stringify({ engine: command.engine, manual: command.path !== null, requestId: command.requestId })]);
           }));
         } else view = this.engineSettings.status(idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined));
-        await reply(200, view); return;
+        // Existing clients validate a closed five-engine enum. Keep their
+        // complete settings page usable until they opt into Pi support.
+        await reply(200, url.searchParams.get("includePi") === "1" ? view : { ...view, engines: view.engines.filter(engine => engine.id !== "pi") }); return;
       }
       if (route === "/api/settings/widgets" && ["GET", "PUT"].includes(req.method ?? "")) {
         await requireOwner();
@@ -1810,6 +1829,29 @@ export class HubServer {
         await reply(200, result); return;
       }
       const steerRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/steer$/);
+      const piSessionRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/pi-session$/);
+      if (piSessionRoute && (req.method === "GET" || req.method === "POST")) {
+        const conversationId = piSessionRoute[1]!;
+        const input = req.method === "POST" ? piSessionChangeSchema.parse(await this.jsonBody(req, 4096)) : undefined;
+        const botId = input?.botId ?? idSchema.parse(url.searchParams.get("botId"));
+        const authorize = async () => {
+          await this.auth.validateSession(session);
+          return serial(() => this.authorizePiSession(botId, conversationId, userId));
+        };
+        const allowed = await authorize(), worker = this.bots.get(botId);
+        if (!allowed || worker && !worker.piSession) {
+          await reply(200, input ? { outcome: "rejected", reason: "unsupported" } : { supported: false }); return;
+        }
+        if (!worker) { await reply(200, input ? { outcome: "rejected", reason: "not_ready" } : { supported: true }); return; }
+        let result: unknown;
+        try {
+          result = input
+            ? piSessionResultSchema.parse(await this.callBot(botId, "pi.session.set", { ...input, conversationId, userId }))
+            : piSessionSnapshotSchema.parse(await this.callBot(botId, "pi.session.get", { botId, conversationId, userId }));
+        } catch { result = input ? { outcome: "unknown", reason: "uncertain" } : { supported: true }; }
+        if (!await authorize()) result = input ? { outcome: "unknown", reason: "uncertain" } : { supported: false };
+        await reply(200, result); return;
+      }
       const tasksRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/tasks(\/recover)?$/);
       if (tasksRoute && (req.method === "GET" || req.method === "POST")) {
         const conversationId = tasksRoute[1]!;
@@ -1932,7 +1974,12 @@ export class HubServer {
       if (route === "/api/bots/catalog" && req.method === "GET" || route === "/api/bots" && req.method === "POST") {
         await requireOwner();
         if (!this.botManager) throw new HubError("bot_creation_unavailable", 503);
-        if (req.method === "GET") await reply(200, await this.botManager.catalog());
+        if (req.method === "GET") {
+          const catalog = await this.botManager.catalog(z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined));
+          // Existing clients do not understand Pi's provider/effort settings.
+          // New App and CLI catalog readers opt in, just as engine settings do.
+          await reply(200, url.searchParams.get("includePi") === "1" ? catalog : { ...catalog, engines: catalog.engines.filter(engine => engine.id !== "pi") });
+        }
         else await reply(201, await this.botManager.create(userId, createBotSchema.parse(await this.jsonBody(req)), validateInQueue));
         return;
       }

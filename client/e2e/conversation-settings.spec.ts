@@ -208,7 +208,7 @@ for(const engine of ['codex','antigravity','unknown']) {
  await page.evaluate(engine=>{const f=(window as any).settingsFixture;f.connection.update({bots:[{id:'bot',engine}]});},engine);
  await expect(page.getByRole('button',{name:'整理上下文',exact:true})).toHaveCount(0);
 }
-for(const engine of ['claude','kimi','deepseek']) {
+for(const engine of ['claude','kimi','deepseek','pi']) {
  await page.evaluate(engine=>{const f=(window as any).settingsFixture;f.connection.update({bots:[{id:'bot',engine}]});},engine);
  await expect(page.getByRole('button',{name:'整理上下文',exact:true})).toBeVisible();
 }

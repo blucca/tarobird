@@ -32,7 +32,7 @@ import { EngineConfigError } from "../state/engine-config-error.js";
 import { isExtendedCodexEffort, knownCodexModelSupportsEffort } from "../codex/model-capabilities.js";
 
 export type { EffortLevel };
-export type InstanceEngine = "codex" | "claude" | "antigravity" | "kimi" | "deepseek";
+export type InstanceEngine = "codex" | "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
 
 export const CLAUDE_MODEL_CHOICES = [
   "claude-opus-5-5[1m]",
@@ -60,6 +60,8 @@ export function getEngineEffortValidationError(
   model?: string,
 ): string | undefined {
   if (effort === undefined) return undefined;
+  if (engine === "pi") return effort === "ultra" ? "Pi thinking supports off, minimal, low, medium, high, xhigh, or max" : undefined;
+  if (effort === "off" || effort === "minimal") return "This engine does not support Pi thinking levels";
   if (engine === "codex" && isExtendedCodexEffort(effort) && knownCodexModelSupportsEffort(model, effort) !== true) {
     return "The selected Codex model does not support this effort";
   }
@@ -213,7 +215,7 @@ function sanitizeConfigCompatibility(config: ConfigFile, configPath: string): Co
       ? "DeepSeek Harness supports only low, high, and max"
       : engine === "kimi"
         ? "Kimi ACP supports only low, high, and max"
-        : engine === "claude"
+        : engine === "claude" || engine === "pi"
           ? reason
           : "the selected Codex model does not advertise that effort";
   console.error(
@@ -415,13 +417,20 @@ export function applyEngineSelection(
   config: Record<string, unknown>,
   engine: InstanceEngine,
 ): { clearedModel: boolean; enabledFullAuto: boolean } {
+  if (engine === "pi" && config.role === "dispatcher") throw new Error("Pi is available for ordinary Bots, not Chief of Staff Bots.");
   const previousEngine =
-    config.engine === "claude" || config.engine === "codex" || config.engine === "antigravity" || config.engine === "kimi" || config.engine === "deepseek"
+    config.engine === "claude" || config.engine === "codex" || config.engine === "antigravity" || config.engine === "kimi" || config.engine === "deepseek" || config.engine === "pi"
       ? config.engine
       : undefined;
   const hadModelOverride = typeof config.model === "string" && config.model.trim().length > 0;
 
   config.engine = engine;
+
+  if (engine === "pi" && previousEngine !== "pi") {
+    // Follow Pi's own default, not another engine's reasoning override.
+    delete config.effort;
+    if (config.approvalMode === "full-auto") config.approvalMode = "normal";
+  }
 
   const clearedModel = previousEngine !== undefined && previousEngine !== engine && hadModelOverride;
   if (clearedModel) {
@@ -497,6 +506,7 @@ export async function readValidatedConfigFile(configPath: string, options: { for
     // Legacy defaults apply only to a readable, valid config. Never salvage an
     // invalid approval value by dropping it and thereby selecting Bypass/YOLO.
     const record = parsed as Record<string, unknown>;
+    if (record.engine === "pi" && record.role === "dispatcher") throw new EngineConfigError();
     for (const key of ["engine", "approvalMode", "claudePermissionMode", "kimiAutoNeverAskAcknowledged", "codexRuntime"] as const) {
       if (!ConfigFileSchema.shape[key].safeParse(record[key]).success) throw new EngineConfigError();
     }
@@ -546,7 +556,7 @@ export async function loadInstanceConfig(stateDir: string): Promise<InstanceConf
 
   const effort = VALID_EFFORT_LEVELS.includes(config.effort as EffortLevel) ? config.effort as EffortLevel : undefined;
   return {
-    engine: config.engine === "claude" || config.engine === "antigravity" || config.engine === "kimi" || config.engine === "deepseek" ? config.engine : "codex",
+    engine: config.engine === "claude" || config.engine === "antigravity" || config.engine === "kimi" || config.engine === "deepseek" || config.engine === "pi" ? config.engine : "codex",
     ...(config.role === "dispatcher" ? { role: "dispatcher" as const } : {}),
     claudeChrome: config.claudeChrome === true,
     locale: config.locale === "zh" ? "zh" : "en",
@@ -655,7 +665,7 @@ export async function updateInstanceApprovalMode(
     const engine: InstanceEngine = config.engine === "claude"
       || config.engine === "antigravity"
       || config.engine === "kimi"
-      || config.engine === "deepseek"
+      || config.engine === "deepseek" || config.engine === "pi"
       ? config.engine
       : "codex";
     config.approvalMode = approvalMode;

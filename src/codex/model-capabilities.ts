@@ -29,7 +29,7 @@ const CODEX_MODEL_MAX_EFFORT: Readonly<Record<string, EffortLevel>> = {
   "gpt-5.3-codex-spark": "xhigh",
 };
 
-const EFFORT_RANK: Readonly<Record<EffortLevel, number>> = {
+const EFFORT_RANK: Readonly<Partial<Record<EffortLevel, number>>> = {
   low: 0,
   medium: 1,
   high: 2,
@@ -39,10 +39,11 @@ const EFFORT_RANK: Readonly<Record<EffortLevel, number>> = {
 };
 
 export function knownCodexModelSupportsEffort(model: string | undefined, effort: EffortLevel): boolean | undefined {
+  if (effort === "off" || effort === "minimal") return false;
   if (!model) return undefined;
   const maxEffort = CODEX_MODEL_MAX_EFFORT[model.trim().toLowerCase()];
   if (!maxEffort) return undefined;
-  return EFFORT_RANK[effort] <= EFFORT_RANK[maxEffort];
+  return EFFORT_RANK[effort]! <= EFFORT_RANK[maxEffort]!;
 }
 
 export function knownCodexModelMaxEffort(model: string | undefined): EffortLevel | undefined {

@@ -57,7 +57,7 @@ describe('workbench signed socket and API boundary',()=>{
   });
   // Use the actual Gateway transport/channel/tool. Calling the instance API
   // directly bypasses capability negotiation and missed the 1.0.123 regression.
-  it.each(['deepseek', 'codex', 'claude', 'kimi', 'antigravity'])('%s Design and PPT tools pass the real handshake and wait for the exact App receipt', async engine => {
+  it.each(['deepseek', 'codex', 'claude', 'kimi', 'antigravity', 'pi'])('%s Design and PPT tools pass the real handshake and wait for the exact App receipt', async engine => {
     const app = await client('design-capability-check');
     expect(app.serverCapabilities).toContain(WORKBENCH_DESIGN_CAPABILITY);
     expect(app.serverCapabilities).toContain(WORKBENCH_SLIDES_CAPABILITY);

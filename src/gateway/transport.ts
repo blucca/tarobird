@@ -1,6 +1,7 @@
 import { workbenchContextSchema, workbenchContextOmittedSchema, type WorkbenchContext, type WorkbenchContextOmitted } from "../client-protocol/workbench.js";
 import { WORKBENCH_DESIGN_OPEN_CAPABILITY } from "../client-protocol/workbench-design.js";
 import { NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY } from "../client-protocol/native-input.js";
+import { PI_SESSION_CAPABILITY } from "../client-protocol/pi-session.js";
 import { STEERING_OUTCOME_CAPABILITY } from "../client-protocol/steering-outcome.js";
 import { WIDGET_POLICY_CAPABILITY } from "../client-protocol/widget-settings.js";
 import { VOICE_POLICY_CAPABILITY } from "../client-protocol/voice-settings.js";
@@ -100,7 +101,7 @@ export class GatewayTransport {
         await this.readStatus();
         // Standalone/manual workers without a Host binding still use their own
         // environment; do not claim that the Host's voice settings apply.
-        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
+        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [...(this.status.engine === "pi" ? [PI_SESSION_CAPABILITY] : []), ...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
       }).catch(() => undefined);
     });
     ws.on("message", (data) => {
@@ -137,7 +138,7 @@ export class GatewayTransport {
       const file = path.join(this.options.stateDir, "config.json");
       const reading = (async () => {
         if ((await stat(file)).size > 256 * 1024) return;
-        const config = z.object({ engine: z.string().max(64).optional(), model: z.string().max(128).optional(), effort: z.string().max(32).optional() }).parse(JSON.parse(await readFile(file, { encoding: "utf8", signal: controller.signal })));
+        const config = z.object({ engine: z.string().max(64).optional(), model: z.string().max(512).optional(), effort: z.string().max(32).optional() }).refine(value => value.engine === "pi" || !value.model || value.model.length <= 128).parse(JSON.parse(await readFile(file, { encoding: "utf8", signal: controller.signal })));
         return botRuntimeStatusSchema.parse({ engine: config.engine ?? this.options.engine ?? "", model: config.model ?? "", effort: config.effort ?? "" });
       })();
       const timeout = new Promise<undefined>(resolve => { timer = setTimeout(() => { controller.abort(); this.options.onWarning?.("gateway_metadata_read_timeout"); resolve(undefined); }, 2000); timer.unref(); });

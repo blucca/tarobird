@@ -5,16 +5,32 @@ import { EFFORT_LEVELS } from "../state/config-file-schema.js";
 import { CLAUDE_MODEL_CHOICES, getEngineEffortValidationError, type InstanceEngine } from "../state/instance-config.js";
 import type { ModelSettings } from "../client-protocol/model.js";
 import { discoverCliModels } from "./cli-model-discovery.js";
+import { discoverPiModels } from "./pi-model-discovery.js";
 
 export function modelEffortChoices(engine: InstanceEngine, model: string, discovered: ModelSettings["choices"] = []): ModelSettings["customEfforts"] {
-  if (engine === "kimi" || engine === "claude" || engine === "codex") {
+  if (engine === "kimi" || engine === "claude" || engine === "codex" || engine === "pi") {
     const known = discovered.find(choice => choice.id === model);
     if (known) return known.efforts;
   }
+  // Native Pi model metadata is authoritative. Unknown models can follow their
+  // native default, but must not advertise invented reasoning capabilities.
+  if (engine === "pi") return [""];
   return engine === "antigravity" ? antigravityEffortChoices(discovered, model) : ["", ...EFFORT_LEVELS.filter(effort => !getEngineEffortValidationError(engine, effort, model || undefined))];
 }
 /** Creation and existing-Bot settings use the same host-owned catalog. */
-export async function modelCatalog(engine: InstanceEngine, env = process.env): Promise<ModelSettings["choices"]> {
+export async function readModelCatalog(engine: InstanceEngine, env = process.env, cwd?: string): Promise<{ choices: ModelSettings["choices"]; status?: "ready" | "no-models" | "unavailable" }> {
+  if (engine === "pi") {
+    const result = await discoverPiModels(env, cwd), selected = result.models.find(model => model.id === result.defaultModel);
+    return { choices: [{ id: "", ...(selected ? { label: selected.label } : {}), efforts: selected?.efforts ?? [""] }, ...result.models], status: result.status };
+  }
+  return { choices: await legacyModelCatalog(engine, env) };
+}
+
+export async function modelCatalog(engine: InstanceEngine, env = process.env, cwd?: string): Promise<ModelSettings["choices"]> {
+  return (await readModelCatalog(engine, env, cwd)).choices;
+}
+
+async function legacyModelCatalog(engine: InstanceEngine, env: NodeJS.ProcessEnv): Promise<ModelSettings["choices"]> {
   if (engine === "antigravity") return [{ id: "", efforts: [""] }, ...await discoverAntigravityModels(env)];
   if (engine === "kimi") {
     const config = await readKimiModelConfig(env);

@@ -5,6 +5,7 @@ import { permissionSettings } from "../runtime/permissions-settings.js";
 import { personaSettings } from "../runtime/persona-settings.js";
 import { gatewaySteering } from "./steering.js";
 import { gatewayEngineTasks } from "./engine-tasks.js";
+import { gatewayPiSession } from "./pi-session.js";
 import { gatewaySideSessions, instanceAttachmentDownload } from "./side.js";
 import { readBotDiagnostics } from "../runtime/diagnostics.js";
 import { routeAlertSchema, type RouteAlert } from "../hub/route-monitor.js";
@@ -245,11 +246,13 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   channel.on("error", () => options.onWarning?.("gateway_dispatch_failed"));
   const steering = gatewaySteering(bridge, runtime, channel, options.stateDir);
   const engineTasks = gatewayEngineTasks(bridge, channel, options.stateDir);
+  const piSession = gatewayPiSession(bridge, channel, options.stateDir, options.botId);
   // Side audio uses the main transcriber and cloud policy, without its chat progress cards.
   sideSessions = gatewaySideSessions(surface, options.stateDir, options.botId, conversationId => channel.canSteerConversation!(conversationId), instanceAttachmentDownload(channel.transport), runtime.transcribeMedia ?? createDefaultTranscribeVoice(), channel);
   const schedules = gatewaySchedules(options, channel);
   channel.onCall = async (method, raw): Promise<Json> => withChannelProfile("gateway", async () => {
     if (method === "tasks.list" || method === "tasks.stop" || method === "tasks.recover") return z.json().parse(await engineTasks(method, raw));
+    if (method === "pi.session.get" || method === "pi.session.set") return z.json().parse(await piSession(method, raw));
     if (["side.status", "side.open", "side.read", "side.ask", "side.stop", "side.close"].includes(method)) return z.json().parse(await sideSessions!.call(method, raw));
     if (method === "persona.get" || method === "persona.set") {
       if (method === "persona.get") z.object({}).strict().parse(raw);

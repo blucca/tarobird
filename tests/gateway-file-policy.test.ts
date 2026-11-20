@@ -16,11 +16,11 @@ afterEach(async () => { vi.unstubAllEnvs(); await rm(root, { recursive: true, fo
 const config = (value: unknown) => writeFile(path.join(stateDir, "config.json"), JSON.stringify(value));
 const check = (file = outside) => withChannelProfile("gateway", async () => preflightCoreDeliveryPath(file, await resolveCoreDeliveryRoots({ stateDir })));
 
-it.each(["codex", "claude", "antigravity", "kimi", "deepseek"])("defaults full-access %s to any readable file path", async engine => {
+it.each(["codex", "claude", "antigravity", "kimi", "deepseek", "pi"])("defaults full-access %s to any readable file path", async engine => {
   await config({ engine, approvalMode: "bypass", ...(engine === "kimi" ? { kimiAutoNeverAskAcknowledged: true } : {}) });
   expect(await check()).toMatchObject({ ok: true });
 });
-it.each(["codex", "claude", "antigravity", "kimi", "deepseek"])("keeps %s normal mode scoped even with an explicit opt-in", async engine => {
+it.each(["codex", "claude", "antigravity", "kimi", "deepseek", "pi"])("keeps %s normal mode scoped even with an explicit opt-in", async engine => {
   await config({ engine, approvalMode: "normal" });
   await writeFile(path.join(stateDir, "bot.env"), "TAROBOT_ALLOW_ANY_FILE_PATH=1\n");
   expect(await check()).toMatchObject({ ok: false, reason: "outside-workspace" });

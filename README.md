@@ -222,6 +222,8 @@ Right-click a folder name or an empty area of the desktop list to group by host,
 
 Install and sign in to any one engine on the computer that runs your Bots to get started; TaroBird does not include AI engines, model accounts or credits. See the [engine comparison](docs/details.md#engine-comparison) for adapter differences.
 
+**Development branch:** [Pi native integration](docs/client/pi-engine.md) adds provider-aware model selection and native conversation controls for ordinary Bots. It is not part of the current stable release and is excluded from Chancellor dispatch.
+
 <a id="engines"></a>
 
 > [!IMPORTANT]

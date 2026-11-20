@@ -18,7 +18,7 @@ try { requirePackage.resolve('@larksuiteoapi/node-sdk'); throw new Error('SDK in
 for (const relative of ['src/lark', 'adapters', 'dist/src/lark', 'dist/src/legacy-index.js', 'dist/src/telegram', 'dist/src/commands', 'dist/src/service.js', 'dist/src/runtime/telegram-out.js', 'dist/src/runtime/cron-executor.js', 'dist/src/runtime/cron-runtime.js', 'dist/src/tools/telegram-tool-executor.js', 'dist/src/tools/telegram-tool-registry.js', 'dist/src/tools/telegram-tool-types.js']) {
  if (await access(path.join(root, relative)).then(() => true, () => false)) throw new Error('Legacy transport packaged: '+relative);
 }
-const helpers = ['dist/src/codex/claude-permission-mcp-server.js', 'dist/src/codex/deepseek-app-plugin.js', 'dist/deepseek-harness-plugin/src/search-mcp-server.js', 'dist/relay-runtime.mjs', 'client/dist/index.html', 'client/dist/widget-sandbox.html'];
+const helpers = ['dist/src/codex/claude-permission-mcp-server.js', 'dist/src/codex/deepseek-app-plugin.js', 'dist/src/codex/pi-bridge-extension.js', 'dist/deepseek-harness-plugin/src/search-mcp-server.js', 'dist/relay-runtime.mjs', 'client/dist/index.html', 'client/dist/widget-sandbox.html'];
 for (const relative of helpers) await access(path.join(root, relative));
 for (const relative of integrationAssets) await access(path.join(root, relative));
 const state = await mkdtemp(path.join(os.tmpdir(), 'tarobot-package-start-'));

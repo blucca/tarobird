@@ -29,7 +29,7 @@ export function QuestionForm({ data, element, connection, messageId, values: ini
   useLocale();
   const cache = connection.cache;
   const [step, setStep] = useState(0), [error, setError] = useState(""), [pending, setPending] = useState(false), [deliveryError, setDeliveryError] = useState(false);
-  const [values, setValues] = useState<QuestionDraft["values"]>(() => { const defaults = questionDraftSchema.shape.values.safeParse(initialValues); return defaults.success ? defaults.data : {}; });
+  const [values, setValues] = useState<QuestionDraft["values"]>(() => { const defaults = questionDraftSchema.shape.values.safeParse(initialValues); return { ...Object.fromEntries(data.questions.flatMap((q, i) => q.allowFreeText && q.input?.prefill !== undefined ? [[`q${i}_other`, q.input.prefill]] : [])), ...(defaults.success ? defaults.data : {}) }; });
   const [loaded, setLoaded] = useState(false), [loadAttempt, setLoadAttempt] = useState(0), [draftError, setDraftError] = useState(false);
   const draft = useRef<QuestionDraft>({ values, step: 0 }), saveRevision = useRef(0);
   const draftKey = questionDraftKey(messageId, data);
@@ -150,7 +150,7 @@ export function QuestionForm({ data, element, connection, messageId, values: ini
           <span><strong>{option.label}</strong>{option.description && <span className="question-description" id={`${prefix}-option-${i}`}>{option.description}</span>}</span>
         </label>{option.preview && <details className="question-preview"><summary>{t("查看选项预览")}</summary><pre>{option.preview}</pre></details>}</div>;
       })}
-      {q.allowFreeText && <label className="question-custom">{q.options.length ? q.multiSelect ? t("补充其他选项") : t("其他答案") : t("填写你的回答")}<textarea name={otherName} rows={3} maxLength={16000} value={other} placeholder={q.options.length ? t("选项不合适？写下你的答案") : t("填写你的回答")} onChange={(event) => { change(otherName, event.target.value); if (!q.multiSelect && event.target.value.trim()) change(name, ""); setError(""); }}/></label>}
+      {q.allowFreeText && <label className="question-custom">{q.options.length ? q.multiSelect ? t("补充其他选项") : t("其他答案") : t("填写你的回答")}<textarea name={otherName} rows={q.input?.kind === "multiline" ? 6 : q.input?.kind === "text" ? 1 : 3} maxLength={16000} value={other} placeholder={q.input?.placeholder ?? (q.options.length ? t("选项不合适？写下你的答案") : t("填写你的回答"))} onChange={(event) => { change(otherName, event.target.value); if (!q.multiSelect && event.target.value.trim()) change(name, ""); setError(""); }}/></label>}
     </fieldset>
     {error && <p className="error-text" role="alert">{error}</p>}
     {!loaded && error && <button type="button" onClick={() => setLoadAttempt((n) => n + 1)}>{t("重新读取")}</button>}

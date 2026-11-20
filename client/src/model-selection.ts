@@ -8,7 +8,7 @@ export type ModelOption = Choice & { variants?: { id: string; effort: Effort }[]
 export function modelOptionLabel(choice: Pick<Choice, "id" | "label">, defaultLabel: string): string {
   return choice.id ? choice.label || choice.id : choice.label ? `${defaultLabel} · ${choice.label}` : defaultLabel;
 }
-const order: Effort[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+const order: Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const suffix = /^(.*)-(low|medium|high|xhigh|max|ultra)$/;
 
 /** Group only host-advertised variants with matching IDs AND display labels.

@@ -46,6 +46,7 @@ import { isTailscaleAddress } from "../hub/network.js";
 import { networkCanonical, sharedRoutesSchema, type NetworkCommand } from "../client-protocol/private-network.js";
 import { routesSchema, type Route } from "../client-protocol/routes.js";
 import { createBotSchema } from "../client-protocol/bots.js";
+import { piSessionThinkingSchema, type PiSessionChange } from "../client-protocol/pi-session.js";
 import { hashSecret } from "../hub/auth.js";
 import { waitForHostIdle, keepHostDrainLease, captureDrainedStopGuard } from "./lifecycle.js";
 import { captureUpdateRecovery, recoverUnchangedAutostart, recoverUnchangedRuntime } from "./update-recovery.js";
@@ -80,7 +81,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   bots chrome ID --enabled on|off --revision REV
   bots model ID                         读取当前模型、可选模型和 revision
   bots model ID --model M --revision REV [--effort E]
-    --model default 恢复默认；--effort default 恢复默认思考强度
+    --model default 恢复默认；--effort default 恢复默认思考强度；Pi 的 --effort off 关闭思考
   bots persona ID                       读取 Bot 人设小节和 revision
   bots persona ID --from PATCH.json     保存 {revision,text}；text 为空字符串时清空人设
   bots delete ID --expected-name N --yes（保留历史与工作区）
@@ -96,6 +97,10 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     取消置顶恢复普通分组位置；旧置顶未保存原位置时回到普通分组末尾
   conversations list --host HOST --bot BOT [--source-bot LOCAL_BOT_ID]
   conversations local                 当前本地主机的全部可见对话（含已归档）
+  conversations pi-session CONVERSATION --bot BOT
+    [--model FULL_ID|default | --thinking LEVEL|default] --session TOKEN --request-id ID
+    不带修改参数时只读取当前 Pi 会话，不启动会话；修改必须指定 session 和 request-id。
+    default 跟随 Bot 默认；结果未知时保留原参数和编号核对，不会自动重放；不会修改 Bot 默认值。
   conversations archive --ids ID,ID --yes [--request-id ID]
   conversations restore --ids ID,ID --yes [--request-id ID]
   conversations move --ids ID,ID (--folder ID|--unfiled|--new-folder NAME) --revision N [--request-id ID]
@@ -247,7 +252,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
 Google 文档工具：tarobot gdocs --help（导入 OAuth 配置、授权、查看状态及创建/更新文档）
 通用选项：--state-dir PATH（显式选择独立主机） --json --help
 默认与桌面版共用数据目录；不会自动合并旧 ~/.cctb/hub。
-引擎：codex、claude、antigravity、kimi、deepseek；须在此主机同一用户下安装并登录。
+引擎：codex、claude、antigravity、kimi、deepseek、pi；须在此主机同一用户下安装并登录。
 跨网络使用现有 VPS 中转或 Tailscale；pair --routes 只分享已配置线路，不部署中转。
 手机配对不等于主机加入组网；network 命令保留签名审批与独立手机归属。
 多网卡配对需用 --address 选择地址；Tailscale 双栈默认使用唯一 IPv4，可显式选择 IPv6。
@@ -291,7 +296,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     role: { type: "string" }, "dispatch-mode": { type: "string" }, "max-concurrent": { type: "string" }, allow: { type: "string" }, assist: { type: "string" }, status: { type: "string" }, note: { type: "string" }, open: { type: "boolean" }, match: { type: "string" }, offset: { type: "string" },
     folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
     "html-file": { type: "string" }, "report-file": { type: "string" }, title: { type: "string" }, summary: { type: "string" },
-    token: { type: "string" }, target: { type: "string" }, task: { type: "string" }, bot: { type: "string" }, message: { type: "string" }, before: { type: "string" }, through: { type: "string" }, last: { type: "boolean" },
+    token: { type: "string" }, session: { type: "string" }, thinking: { type: "string" }, target: { type: "string" }, task: { type: "string" }, bot: { type: "string" }, message: { type: "string" }, before: { type: "string" }, through: { type: "string" }, last: { type: "boolean" },
     path: { type: "string" }, operation: { type: "string" }, preview: { type: "boolean" },
     host: { type: "string" }, to: { type: "string" }, "source-bot": { type: "string" }, "cross-host": { type: "boolean" }, "context-message": { type: "string" }, file: { type: "string", multiple: true }, "new-conversation": { type: "string" }, timeout: { type: "string" },
     "reply-to": { type: "string" }, ids: { type: "string" }, conversation: { type: "string" }, sort: { type: "string" }, text: { type: "string" }, "text-file": { type: "string" }, run: { type: "string" },
@@ -320,7 +325,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     tickets: ["bot", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
     devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
     folders: ["enabled", "revision", "unfiled"],
-    conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id"],
+    conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session"],
     widgets: ["html-file", "report-file", "title", "summary", "request-id", "enabled", "revision"],
     messages: ["ids", "before", "through", "yes", "to", "source-bot", "text-file", "file", "new-conversation", "message", "timeout", "out", "request-id", "from", "bot", "context-message", "cross-host"],
     queue: ["bot", "message", "before", "last", "text", "text-file", "revision", "request-id"],
@@ -333,7 +338,21 @@ export async function runHostCli(argv: string[]): Promise<void> {
     groups: ["from", "revision", "text-file", "file", "run", "request-id", "reply-to", "participants", "supersedes", "then", "if-running"],
   };
   for (const key of Object.keys(v)) if (!["state-dir", "json", "help", ...(allowed[command] ?? [])].includes(key)) throw new Error(`此命令不支持 --${key}。请执行 tarobot --help。`);
+  let piSessionUpdate: Omit<PiSessionChange, "botId"> | undefined;
+  if (command === "conversations") {
+    if (sub === "pi-session") {
+      required(argument, "缺少 CONVERSATION。"); required(v.bot, "缺少 --bot BOT。");
+      if ([v.host, v["source-bot"], v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v.revision].some(value => value !== undefined)) throw new Error("pi-session 仅支持当前主机的对话与 Pi 会话参数。");
+      if (v.model !== undefined && v.thinking !== undefined) throw new Error("--model 与 --thinking 不能同时使用。");
+      if (v.model !== undefined || v.thinking !== undefined) {
+        const expectedSession = required(v.session, "修改 Pi 会话必须填写 --session TOKEN。"), requestId = required(v["request-id"], "修改 Pi 会话必须填写 --request-id ID；结果未知时保留同一编号核对。");
+        const action = v.model !== undefined ? "model" : "thinking", selected = v.model ?? v.thinking!;
+        piSessionUpdate = { expectedSession, requestId, action, value: selected === "default" ? null : action === "thinking" ? piSessionThinkingSchema.parse(selected) : selected };
+      } else if (v.session !== undefined || v["request-id"] !== undefined) throw new Error("只读 Pi 会话不接受 --session 或 --request-id；修改时需填写 --model 或 --thinking。");
+    } else if ([v.model, v.thinking, v.session].some(value => value !== undefined)) throw new Error("--model、--thinking、--session 仅支持 conversations pi-session。");
+  }
   const positionalLimit: Record<string, number> = { screens: 3, workbench: 3, engines: 2, backups: 2, integrations: 3, directory: 2, name: 2, bots: 3, queue: 3, tasks: 3, steer: 3, side: 3, changes: 3, bus: 3, groups: 3, messages: 3, tickets: 3, widgets: 3, folders: 3, conversations: 2, devices: 3, service: 2, network: 3, update: 3, backup: 2, restore: 2 };
+  if (command === "conversations" && sub === "pi-session") positionalLimit.conversations = 3;
   if (command === "bus" && ["list", "create", "prepare"].includes(sub ?? "")) positionalLimit.bus = 2;
   if (command === "bots" && ["list", "catalog", "create"].includes(sub ?? "") || command === "devices" && ["list", "pending", "invites"].includes(sub ?? "") || command === "network" && sub !== "remove" || command === "update" && sub !== "apply") positionalLimit[command] = 2;
   if (p.length > (positionalLimit[command] ?? 1)) throw new Error("此命令不接受额外的位置参数。请执行 tarobot --help。");
@@ -706,6 +725,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     }
     if (command === "widgets") { if (v.enabled !== undefined || v.revision !== undefined) throw new Error("widgets publish 不接受设置参数。"); await output(await runWidgetsCommand(management.client, sub, argument, { htmlFile: v["html-file"], reportFile: v["report-file"], title: v.title, summary: v.summary, requestId: v["request-id"] })); return; }
     if (command === "conversations") {
+      if (sub === "pi-session") { await output(await management.piSession(argument!, v.bot!, piSessionUpdate)); return; }
       if (argument || [v.host, v.bot, v["source-bot"]].some(value => value !== undefined)) throw new Error("批量整理使用当前本地主机；不接受跨 Bot 路由参数。");
       await output(await runConversationsCommand(management.client, sub, { ids: v.ids, yes: v.yes, folder: v.folder, unfiled: v.unfiled, newFolder: v["new-folder"], revision: v.revision, requestId: v["request-id"] }, id => console.error(`批量操作编号：${id}。结果不确定时保留原编号和参数核对，勿换编号重复提交。`))); return;
     }
@@ -737,7 +757,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     if (command === "bots") {
       if (v.from !== undefined && sub !== "persona") throw new Error("bots --from 仅支持 persona。");
       if (sub === "list") await output(management.bots());
-      else if (sub === "catalog") await output(await management.catalog());
+      else if (sub === "catalog") await output(await management.catalog(v.workspace ? path.resolve(v.workspace) : undefined));
       else if (sub === "create") {
         const input = createBotSchema.parse({ requestId: v["request-id"] ?? randomUUID(), name: required(v.name, "缺少 --name。"), engine: required(v.engine, "缺少 --engine。"), model: v.model ?? "", effort: v.effort ?? "", workspace: v.workspace ? path.resolve(v.workspace) : "", ...(v.permission ? { permission: v.permission } : {}),
           ...(v.role ? { role: v.role } : {}), ...(v.role && (v["dispatch-mode"] !== undefined || v["max-concurrent"] !== undefined || v.allow !== undefined) ? { dispatcher: {
@@ -770,10 +790,16 @@ export async function runHostCli(argv: string[]): Promise<void> {
           if (v.effort !== undefined || v.revision !== undefined) throw new Error("修改模型需填写 --model 和 --revision。");
           await output(await management.botModel(id));
         } else {
+          const revision = required(v.revision, "先用 bots model ID 读取 revision，再用 --revision 提交，避免覆盖其他设备的修改。");
+          // Pi's off is an actual thinking level. Resolve the engine from the
+          // same authenticated settings API, but keep the caller's revision so
+          // an intervening engine/settings change still fails as a conflict.
+          const clearEffort = v.effort === "default"
+            || v.effort === "off" && (await management.botModel(id)).engine !== "pi";
           await output(await management.botModel(id, {
-            revision: required(v.revision, "先用 bots model ID 读取 revision，再用 --revision 提交，避免覆盖其他设备的修改。"),
+            revision,
             model: ["default", "off"].includes(v.model) ? "" : v.model,
-            ...(v.effort === undefined ? {} : { effort: (["default", "off"].includes(v.effort) ? "" : v.effort) as import("../client-protocol/model.js").ModelPatch["effort"] }),
+            ...(v.effort === undefined ? {} : { effort: (clearEffort ? "" : v.effort) as import("../client-protocol/model.js").ModelPatch["effort"] }),
           }));
         }
       }

@@ -79,17 +79,19 @@ type AskUserQuestionCardQuestion = {
   multiSelect: boolean;
   required: boolean;
   allowFreeText: boolean;
+  input?: { kind: "text" | "multiline"; placeholder?: string; prefill?: string };
   minSelections?: number;
   maxSelections?: number;
   options: AskUserQuestionOption[];
 };
 
 function isAskUserQuestionRequest(request: EngineApprovalRequest): boolean {
-  return (request.engine === "claude" || request.engine === "kimi" || request.engine === "deepseek" || request.engine === "codex")
+  return (request.engine === "claude" || request.engine === "kimi" || request.engine === "deepseek" || request.engine === "codex" || request.engine === "pi")
     && request.toolName === "AskUserQuestion";
 }
 
 function renderApprovalEngineLabel(engine: EngineApprovalRequest["engine"] | undefined): string {
+  if (engine === "pi") return "Pi";
   if (engine === "deepseek") {
     return "DeepSeek Harness";
   }
@@ -441,15 +443,16 @@ function renderCoreAskUserQuestionCard(input: {
     // Kimi ACP only returns advertised option IDs. Claude and DeepSeek
     // Harness both support a free-text custom answer, so preserve that UX.
     if (input.engine !== "kimi" && question.allowFreeText) {
-      const otherValue = stringValue(input.selections?.[askFormOtherFieldName(index)]) ?? "";
+      const rawOther = input.selections?.[askFormOtherFieldName(index)];
+      const otherValue = typeof rawOther === "string" ? rawOther : question.input?.prefill ?? "";
       formElements.push({
         tag: "input",
         name: askFormOtherFieldName(index),
         placeholder: {
           tag: "plain_text",
-          content: question.options.length
+          content: question.input?.placeholder ?? (question.options.length
             ? (locale === "en" ? "Other — type your own (optional)" : "其他 —— 不合适就自己填（选填）")
-            : (locale === "en" ? "Type your answer" : "填写你的回答"),
+            : (locale === "en" ? "Type your answer" : "填写你的回答")),
         },
         ...(otherValue ? { default_value: otherValue } : {}),
       });
@@ -703,6 +706,13 @@ function normalizeAskUserQuestions(toolInput: unknown): AskUserQuestionCardQuest
         // elicitation marks optional schema properties explicitly false.
         required: question.required !== false,
         allowFreeText: question.allowFreeText !== false,
+        ...(objectValue(question.input)?.kind === "text" || objectValue(question.input)?.kind === "multiline" ? {
+          input: {
+            kind: objectValue(question.input)!.kind as "text" | "multiline",
+            ...(typeof objectValue(question.input)!.placeholder === "string" ? { placeholder: String(objectValue(question.input)!.placeholder).slice(0, 1000) } : {}),
+            ...(typeof objectValue(question.input)!.prefill === "string" ? { prefill: String(objectValue(question.input)!.prefill).slice(0, 16000) } : {}),
+          },
+        } : {}),
         ...(question.multiSelect === true || question.multi_select === true
           ? normalizeAskSelectionBounds(question)
           : {}),
@@ -1232,7 +1242,7 @@ export async function handleCoreCardAction(input: {
       );
       return true;
     }
-    const kind = cfg.engine === "antigravity"
+    const kind = cfg.engine === "pi" ? "pi" : cfg.engine === "antigravity"
       ? "antigravity"
       : cfg.engine === "kimi"
         ? "kimi"
@@ -1241,7 +1251,7 @@ export async function handleCoreCardAction(input: {
           : "claude";
     const sessions = kind === "antigravity"
       ? await scanRecentAntigravityConversations(24)
-      : (kind === "kimi" || kind === "deepseek") && input.bridge?.listExternalSessions
+      : (kind === "kimi" || kind === "deepseek" || kind === "pi") && input.bridge?.listExternalSessions
         ? (await input.bridge.listExternalSessions({ limit: 20 })).map((session) => {
             const modifiedAt = new Date(session.updatedAt ?? 0);
             return {
@@ -1278,7 +1288,7 @@ export async function handleCoreCardAction(input: {
     value.cctb_lark === "resume" &&
     typeof value.conversationKey === "string" &&
     typeof value.sessionId === "string" &&
-    (value.engine === "claude" || value.engine === "antigravity" || value.engine === "kimi" || value.engine === "deepseek")
+    (value.engine === "claude" || value.engine === "antigravity" || value.engine === "kimi" || value.engine === "deepseek" || value.engine === "pi")
   ) {
     if (!input.stateDir) {
       return false;
@@ -1303,8 +1313,8 @@ export async function handleCoreCardAction(input: {
       return true;
     }
     let resumeValue = value;
-    if (value.engine === "kimi" || value.engine === "deepseek") {
-      const engineName = value.engine === "deepseek" ? "DeepSeek Harness" : "Kimi";
+    if (value.engine === "kimi" || value.engine === "deepseek" || value.engine === "pi") {
+      const engineName = value.engine === "pi" ? "Pi" : value.engine === "deepseek" ? "DeepSeek Harness" : "Kimi";
       const validateHarnessSession = input.bridge?.validateCodexThread?.bind(input.bridge);
       if (!validateHarnessSession) {
         await input.channel.send(
@@ -1535,7 +1545,8 @@ export async function handleCoreCardAction(input: {
       // Merge the free-text "Other": for single-select it stands in when nothing
       // was picked; for multi-select it is appended to the chosen labels.
       const other = pending.approvalEngine === "kimi" || !question.allowFreeText
-        ? "" : stringValue(formValue[askFormOtherFieldName(index)]) ?? "";
+        ? "" : question.input && typeof formValue[askFormOtherFieldName(index)] === "string"
+          ? formValue[askFormOtherFieldName(index)] as string : stringValue(formValue[askFormOtherFieldName(index)]) ?? "";
       if (other) {
         // answer is already resolved labels and other is free text — neither is an
         // index, so join directly rather than re-running the index→label mapping.
@@ -3288,7 +3299,7 @@ async function applyCoreResumeCardAction(
       ? "kimi"
       : value.engine === "deepseek"
         ? "deepseek"
-        : "claude";
+        : value.engine === "pi" ? "pi" : "claude";
   const sessionId = String(value.sessionId);
   const sessionStore = new SessionStore(path.join(stateDir, "session.json"));
   const cfg = await loadInstanceConfig(stateDir);
@@ -3296,7 +3307,7 @@ async function applyCoreResumeCardAction(
     return renderCoreResumeEngineChanged(locale);
   }
   let workspacePath: string | null = null;
-  if (engine === "claude" || engine === "kimi" || engine === "deepseek") {
+  if (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi") {
     const candidate = typeof value.workspacePath === "string" && value.workspacePath.trim()
       ? value.workspacePath
       : null;
@@ -3320,7 +3331,7 @@ async function applyCoreResumeCardAction(
 
   const existing = await sessionStore.findByConversationKeySafe(conversationKey);
   const currentResume = resolveConversationResume(existing.record, cfg.resume);
-  const nextResume: ResumeState | null = (engine === "claude" || engine === "kimi" || engine === "deepseek") && workspacePath
+  const nextResume: ResumeState | null = (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi") && workspacePath
     ? {
       sessionId,
       dirName: typeof value.dirName === "string" ? value.dirName : sessionId,
@@ -3340,7 +3351,7 @@ async function applyCoreResumeCardAction(
     }),
   });
 
-  if ((engine === "claude" || engine === "kimi" || engine === "deepseek") && workspacePath) {
+  if ((engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi") && workspacePath) {
     await updateInstanceConfig(stateDir, (config) => {
       delete config.resume;
     });
@@ -3349,6 +3360,11 @@ async function applyCoreResumeCardAction(
       return locale === "en"
         ? `Attached Kimi session: ${sessionId}\nWorkspace: ${workspacePath}\n\nSend a message to continue. Use /detach when done.`
         : `已绑定 Kimi session：${sessionId}\n工作区：${workspacePath}\n\n发送消息继续对话，完成后发 /detach 断开。`;
+    }
+    if (engine === "pi") {
+      return locale === "en"
+        ? `Attached Pi session: ${sessionId}\nWorkspace: ${workspacePath}\n\nSend a message to continue. Use /detach when done.`
+        : `已绑定 Pi session：${sessionId}\n工作区：${workspacePath}\n\n发送消息继续对话，完成后发 /detach 断开。`;
     }
     if (engine === "deepseek") {
       return locale === "en"

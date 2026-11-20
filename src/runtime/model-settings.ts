@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { modelErrorSchema, modelPatchSchema, type ModelSettings } from "../client-protocol/model.js";
+import { modelErrorSchema, modelPatchSchema, modelValueSchema, type ModelSettings } from "../client-protocol/model.js";
 import { ConfigFileSchema, type ConfigFile } from "../state/config-file-schema.js";
 import { withFileMutex } from "../state/file-mutex.js";
 import { normalizeModelCommandInput, type InstanceEngine } from "../state/instance-config.js";
-import { modelCatalog, modelEffortChoices } from "./model-catalog.js";
+import { readModelCatalog, modelEffortChoices } from "./model-catalog.js";
+import { decodePiModel } from "../codex/pi-models.js";
 
 async function readConfig(file: string): Promise<ConfigFile> {
   try { return ConfigFileSchema.parse(JSON.parse(await readFile(file, "utf8"))); }
@@ -23,13 +24,20 @@ function snapshot(config: ConfigFile, engine: InstanceEngine, activeTurns: numbe
 export async function modelSettings(stateDir: string, engine: InstanceEngine, activeTurns: number | (() => number), patch?: unknown) {
   const activeCount = () => typeof activeTurns === "function" ? activeTurns() : activeTurns;
   try {
-    const choices = await modelCatalog(engine), file = path.join(stateDir, "config.json");
+    const file = path.join(stateDir, "config.json");
+    const initial = engine === "pi" ? await readConfig(file) : undefined;
+    const workspace = initial?.workspacePath ?? initial?.resume?.workspacePath ?? path.join(stateDir, "workspace");
+    const catalog = await readModelCatalog(engine, process.env, workspace), choices = catalog.choices;
     const settings = await withFileMutex(file, async () => {
       const config = await readConfig(file), before = snapshot(config, engine, activeCount(), choices);
+      if (engine === "pi" && (config.workspacePath ?? config.resume?.workspacePath ?? path.join(stateDir, "workspace")) !== workspace) throw new Error("model_conflict");
+      if (catalog.status) before.catalogStatus = catalog.status;
       if (patch === undefined) return before;
       const update = modelPatchSchema.parse(patch);
+      if (engine !== "pi") modelValueSchema.max(128).parse(update.model);
       if (update.revision !== before.revision) throw new Error("model_conflict");
       const model = normalizeModelCommandInput(engine, update.model), effort = update.effort ?? before.effort;
+      if (engine === "pi" && model && !decodePiModel(model)) throw new Error("model_id_invalid");
       const efforts = choices.find(choice => choice.id === model)?.efforts ?? modelEffortChoices(engine, model, choices);
       if (!efforts.includes(effort)) throw new Error("model_effort_incompatible");
       if (model === before.model && effort === before.effort) return before;
@@ -43,7 +51,7 @@ export async function modelSettings(stateDir: string, engine: InstanceEngine, ac
         const handle = await open(temporary, "r+"); try { await handle.sync(); } finally { await handle.close(); }
         await rename(temporary, file);
       } finally { await unlink(temporary).catch(() => undefined); }
-      return snapshot(await readConfig(file), engine, activeCount(), choices);
+      return { ...snapshot(await readConfig(file), engine, activeCount(), choices), ...(catalog.status ? { catalogStatus: catalog.status } : {}) };
     });
     return { ok: true as const, settings };
   } catch (error) {

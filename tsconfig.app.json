@@ -8,7 +8,8 @@
   "include": [
     "src/index.ts",
     "src/codex/claude-permission-mcp-server.ts",
-    "src/codex/deepseek-app-plugin.ts"
+    "src/codex/deepseek-app-plugin.ts",
+    "src/codex/pi-bridge-extension.ts"
   ],
   "exclude": [
     "node_modules",

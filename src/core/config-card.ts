@@ -25,7 +25,7 @@ import { CoreKnownChatStore } from "./known-chats.js";
 import { readRawCoreConfig } from "./locale.js";
 import { coreAccessChatIdFromConversationKey, stableCoreNumericId } from "./message-normalizer.js";
 
-const CORE_CONFIG_ENGINES: InstanceEngine[] = ["codex", "claude", "kimi", "deepseek", "antigravity"];
+const CORE_CONFIG_ENGINES: InstanceEngine[] = ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"];
 
 export type CoreConfigActionName = "engine" | "fast" | "yolo" | "locale" | "group" | "refresh" | "submit";
 
@@ -120,6 +120,7 @@ export async function renderCoreConfigCard(input: CoreConfigCardContext): Promis
       button(optionLabel(labels.kimi, cfg.engine === "kimi", labels), "engine", "kimi", input, cfg.engine === "kimi" ? "primary" : "default"),
       button(optionLabel(labels.deepseek, cfg.engine === "deepseek", labels), "engine", "deepseek", input, cfg.engine === "deepseek" ? "primary" : "default"),
       button(optionLabel(labels.antigravity, cfg.engine === "antigravity", labels), "engine", "antigravity", input, cfg.engine === "antigravity" ? "primary" : "default"),
+      ...(cfg.role === "dispatcher" ? [] : [button(optionLabel(labels.pi, cfg.engine === "pi", labels), "engine", "pi", input, cfg.engine === "pi" ? "primary" : "default")]),
     ]),
     section(labels.speedSection, [
       button(optionLabel(labels.fastOn, fastOn, labels), "fast", "on", input, fastOn ? "primary" : "default"),
@@ -281,18 +282,22 @@ async function applyEngineAction(stateDir: string, value: string | undefined, lo
   }
   const selected = value as InstanceEngine;
   const cfg = await loadInstanceConfig(stateDir);
+  if (selected === "pi" && cfg.role === "dispatcher") {
+    return locale === "en" ? "Pi is available for ordinary Bots, not Chief of Staff Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
+  }
   const engineChanged = cfg.engine !== selected;
   let resetSessionBindings = false;
-  if (engineChanged) {
-    resetSessionBindings = (await new SessionStore(path.join(stateDir, "session.json")).clearAll()) > 0;
-  }
   let clearedModel = false;
   let enabledFullAuto = false;
-  await updateInstanceConfig(stateDir, (config) => {
+  const persist = () => updateInstanceConfig(stateDir, (config) => {
     const result = applyEngineSelection(config, selected);
     clearedModel = result.clearedModel;
     enabledFullAuto = result.enabledFullAuto;
   });
+  if (engineChanged) {
+    const result = await new SessionStore(path.join(stateDir, "session.json")).clearAllThen(persist);
+    resetSessionBindings = result.removedCount > 0;
+  } else await persist();
   const details = [
     clearedModel ? (locale === "en" ? "cleared model override" : "已清除模型覆盖") : undefined,
     resetSessionBindings ? (locale === "en" ? "reset session bindings" : "已重置会话绑定") : undefined,
@@ -654,6 +659,7 @@ function coreConfigLabels(locale: Locale): {
   claude: string;
   kimi: string;
   deepseek: string;
+  pi: string;
   antigravity: string;
   speedSection: string;
   fastOn: string;
@@ -702,6 +708,7 @@ function coreConfigLabels(locale: Locale): {
       claude: "Claude",
       kimi: "Kimi",
       deepseek: "DeepSeek Harness",
+    pi: "Pi",
       antigravity: "Antigravity",
       speedSection: "Speed",
       fastOn: "Fast On",
@@ -750,6 +757,7 @@ function coreConfigLabels(locale: Locale): {
     claude: "Claude",
     kimi: "Kimi",
     deepseek: "DeepSeek Harness",
+    pi: "Pi",
     antigravity: "Antigravity",
     speedSection: "速度",
     fastOn: "Fast 开",

@@ -25,10 +25,13 @@ function snapshot(config: ConfigFile, runtimeEngine: InstanceEngine, activeTurns
 export async function effortSettings(stateDir: string, engine: InstanceEngine, activeTurns: number | (() => number), patch?: unknown) {
   const activeCount = () => typeof activeTurns === "function" ? activeTurns() : activeTurns;
   try {
-    const models = await modelCatalog(engine);
     const file = path.join(stateDir, "config.json");
+    const initial = engine === "pi" ? await readConfig(file) : undefined;
+    const workspace = initial?.workspacePath ?? initial?.resume?.workspacePath ?? path.join(stateDir, "workspace");
+    const models = await modelCatalog(engine, process.env, workspace);
     const settings = await withFileMutex(file, async () => {
       const config = await readConfig(file), before = snapshot(config, engine, activeCount(), models);
+      if (engine === "pi" && (config.workspacePath ?? config.resume?.workspacePath ?? path.join(stateDir, "workspace")) !== workspace) throw new Error("effort_conflict");
       if (patch === undefined) return before;
       const update = effortPatchSchema.parse(patch);
       if (update.revision !== before.revision) throw new Error("effort_conflict");

@@ -71,9 +71,11 @@ export function extractModelEffortMismatch(error: unknown): { model: string; eff
   // model identifier and known levels; never surface the surrounding stderr.
   const conflict = text.match(/--model ([a-zA-Z0-9][a-zA-Z0-9._/-]{0,120}-(low|medium|high|xhigh|max|ultra)) conflicts with --effort=(low|medium|high|xhigh|max|ultra)\b/i);
   if (conflict) return { model: conflict[1]!, effort: conflict[3]!.toLowerCase(), available: [conflict[2]!.toLowerCase()] };
-  const match = text.match(/([a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}) has no "(low|medium|high|xhigh|max|ultra)" effort \(available: ([a-z, ]{1,80})\)/i);
+  // Pi provider/model IDs may include escaped providers, tags and context
+  // suffixes. Require the whole bounded identifier, never a partial path/tail.
+  const match = text.match(/invalid model selection(?: \([^\r\n]{1,512}\))?: ([a-zA-Z0-9][a-zA-Z0-9._/%:\[\]-]{0,511}|the current model) has no "(off|minimal|low|medium|high|xhigh|max|ultra)" effort \(available: ([a-z, ]{1,80})\)/i);
   if (!match) return undefined;
-  const available = match[3]!.split(",").map((v) => v.trim().toLowerCase()).filter((v) => /^(low|medium|high|xhigh|max|ultra)$/.test(v));
+  const available = match[3]!.split(",").map((v) => v.trim().toLowerCase()).filter((v) => /^(off|minimal|low|medium|high|xhigh|max|ultra)$/.test(v));
   return available.length ? { model: match[1]!, effort: match[2]!, available } : undefined;
 }
 export function renderEngineSettingsError(error: unknown, locale: "zh" | "en"): string {
@@ -83,6 +85,9 @@ export function renderEngineSettingsError(error: unknown, locale: "zh" | "en"): 
   if (error instanceof EngineConfigError || normalizeErrorText(error).includes(`${ENGINE_CONFIG_ERROR_CODE}:`)) return locale === "zh"
     ? "无法确认 Bot 的权限配置，本次执行已停止。请修复主机上此 Bot 的 config.json 后重试；不会自动切换为完全访问。"
     : "The Bot permission configuration could not be verified, so this turn was blocked. Repair this Bot’s config.json on the host and retry; full access was not enabled.";
+  if (isPiModelUnavailable(normalizeErrorText(error))) return locale === "zh"
+    ? "所选模型在 Pi 中不可用。请检查模型名称和供应商登录状态，或选择可用模型后重试。"
+    : "The selected model is not available in Pi. Check the model name and provider sign-in, or select an available model and retry.";
   const mismatch = extractModelEffortMismatch(error);
   if (!mismatch) return locale === "zh" ? "模型与思考强度不兼容，请调整 Bot 的模型或 effort 后重试。" : "The model and effort are incompatible. Change the Bot model or effort and retry.";
   return locale === "zh"
@@ -111,6 +116,16 @@ export function extractQuotaResetHint(error: unknown): string | undefined {
 }
 
 const NAMED_ENGINE_RE = /(?:^|[^a-z0-9_./-])(?:codex|claude|kimi|deepseek|dsh|antigravity|agy)(?=$|[^a-z0-9_./-])/;
+// A bare "pi" also means a number or a Raspberry Pi. Require a runtime label
+// or one of our typed adapter error names before treating it as this engine.
+const PI_RUNTIME_LABEL_RE = /(?:^|[^a-z0-9_./-])pi (?:cli|rpc|adapter|bridge)(?=$|[^a-z0-9_./-])/;
+const PI_RUNTIME_ERROR_RE = /(?:^|[\r\n])pi(?:startup|rpc(?:command|closed|timeout)|bridge(?:control|handshake)|nativebridgeunavailable)error(?:$|[\r\n:])/;
+function hasNamedEngineSignal(text: string): boolean {
+  return NAMED_ENGINE_RE.test(text) || PI_RUNTIME_LABEL_RE.test(text) || PI_RUNTIME_ERROR_RE.test(text);
+}
+function isPiModelUnavailable(text: string): boolean {
+  return /invalid model selection: [^\r\n]{1,512} is not available in pi\./i.test(text);
+}
 const ENGINE_RUNTIME_RE =
   /\b(?:runtime|process|spawn|adapter|binary|cli|app-server|startup|start|starting|transport|stream|session|turn|exited|exit code)\b/;
 const ENGINE_FAILURE_RE = /\b(?:failed|failure|error|crash|crashed|timeout|timed out|disconnected)\b/;
@@ -124,7 +139,7 @@ function hasEngineCliSignal(text: string): boolean {
     return true;
   }
 
-  return NAMED_ENGINE_RE.test(text) && (ENGINE_RUNTIME_RE.test(text) || ENGINE_FAILURE_RE.test(text));
+  return PI_RUNTIME_ERROR_RE.test(text) || hasNamedEngineSignal(text) && (ENGINE_RUNTIME_RE.test(text) || ENGINE_FAILURE_RE.test(text));
 }
 
 export function classifyFailure(error: unknown): FailureCategory {
@@ -153,7 +168,9 @@ export function classifyFailure(error: unknown): FailureCategory {
   const mcpWarningIndex = rawText.search(/⚠️ MCP startup warnings?:/u);
   const text = (mcpWarningIndex >= 0 ? rawText.slice(0, mcpWarningIndex) : rawText).toLowerCase();
 
-  if (extractModelEffortMismatch(text) || /invalid model selection: \S{1,128} does not support effort/.test(text)) return "engine-settings";
+  // Native Pi labels can contain Unicode or spaces. Recognize that bounded
+  // diagnostic as settings, while rendering only the safe identifier above.
+  if (extractModelEffortMismatch(text) || /invalid model selection: [^\r\n]{1,512} has no "(?:off|minimal|low|medium|high|xhigh|max|ultra)" effort \(available: [a-z, ]{1,80}\)/.test(text) || isPiModelUnavailable(text) || /invalid model selection: \S{1,512} does not support effort/.test(text)) return "engine-settings";
 
   // A Codex thread whose writer lock is held elsewhere. The adapter appends an
   // actionable diagnosis naming the holder; keep it as its own category so the
@@ -192,7 +209,7 @@ export function classifyFailure(error: unknown): FailureCategory {
     /\binsufficient[\s_-]+(?:quota|balance|credits?)\b/.test(text) ||
     /\b(?:balance|credits?)[\s_-]+(?:exhausted|depleted)\b/.test(text) ||
     /\bout[\s_-]+of[\s_-]+(?:credits?|budget)\b/.test(text) ||
-    (NAMED_ENGINE_RE.test(text) && (text.includes("payment required") || /\b402\b/.test(text)))
+    (hasNamedEngineSignal(text) && (text.includes("payment required") || /\b402\b/.test(text)))
   ) {
     return "engine-quota";
   }
@@ -205,7 +222,7 @@ export function classifyFailure(error: unknown): FailureCategory {
       || /\bapi error\s*:\s*429\b/.test(text)
       || /\brate[\s_-]*limit[\s_-]*(?:exceeded|reached)\b/.test(text)
       || (/\b429\b/.test(text) && /\b(?:rate limit(?:ed|ing)?|too many requests|resource[_ ]exhausted)\b/.test(text))
-      || (NAMED_ENGINE_RE.test(text) && /\b(?:http\s*)?(?:status(?: code)?\s*[:=]?\s*)?429\b/.test(text))
+      || (hasNamedEngineSignal(text) && /\b(?:http\s*)?(?:status(?: code)?\s*[:=]?\s*)?429\b/.test(text))
     )
   ) {
     return "engine-rate-limit";
@@ -220,7 +237,7 @@ export function classifyFailure(error: unknown): FailureCategory {
     || text.includes("responsibleai policy violation")
     || /\b(?:content|safety)[\s_-]*(?:filter|policy)[\s_-]*(?:blocked|violation|rejected|triggered)\b/.test(text)
     || /\b(?:blocked|rejected)\b.{0,48}\b(?:content|safety)[\s_-]*(?:filter|policy)\b/.test(text)
-    || (NAMED_ENGINE_RE.test(text) && /\b(?:content_filter|policy_violation)\b/.test(text))
+    || (hasNamedEngineSignal(text) && /\b(?:content_filter|policy_violation)\b/.test(text))
   ) {
     return "engine-content-policy";
   }

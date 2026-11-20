@@ -58,7 +58,7 @@ describe("execution configuration safety", () => {
     expect(await readValidatedConfigFile(file, { forExecution: true })).toMatchObject({ approvalMode: "bypass" });
   });
 
-  it.each(["codex", "claude", "kimi", "deepseek", "antigravity"] as const)("does not replace invalid %s permissions with its permissive default during engine selection", async engine => {
+  it.each(["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const)("does not replace invalid %s permissions with its permissive default during engine selection", async engine => {
     for (const previousEngine of [engine, undefined, engine === "kimi" ? "codex" : "kimi"]) for (const approvalMode of [null, "typo", "normal"]) {
       await writeFile(file, JSON.stringify({ engine: previousEngine, approvalMode }));
       await updateInstanceConfig(root, config => applyEngineSelection(config, engine));

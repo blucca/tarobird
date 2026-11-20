@@ -1,4 +1,4 @@
-export type RuntimeTimeoutEngine = "codex" | "claude" | "antigravity" | "kimi" | "deepseek";
+export type RuntimeTimeoutEngine = "codex" | "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
 export type RuntimeTimeoutAction = "status" | "on" | "off";
 
 export function renderRuntimeTimeoutMessage(
@@ -20,7 +20,7 @@ function renderEngineTimeoutMessage(
   action: RuntimeTimeoutAction,
   locale: "en" | "zh",
 ): string {
-  const name = engine === "deepseek"
+  const name = engine === "pi" ? "Pi" : engine === "deepseek"
     ? "DeepSeek Harness"
     : engine === "claude"
       ? "Claude"
@@ -29,7 +29,7 @@ function renderEngineTimeoutMessage(
         : engine === "antigravity"
           ? "Antigravity"
           : "Codex";
-  const safeguards = engine === "claude"
+  const safeguards = engine === "claude" || engine === "pi"
     ? (locale === "zh" ? "30 分钟静默看门狗（本身无硬上限）" : "30-minute inactivity watchdog (no hard cap)")
     : engine === "deepseek" || engine === "antigravity"
       ? (locale === "zh" ? "6 小时硬上限和 30 分钟静默看门狗" : "6-hour hard cap and 30-minute inactivity watchdog")

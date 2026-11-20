@@ -1,3 +1,4 @@
+import { PiModelSelect, PiModelCatalogNotice } from "./PiModelSelect.js";
 import { ENGINE_SETTINGS_REPAIR_HINT } from "../../src/client-protocol/engine-settings.js";
 import { EngineSettings } from "./EngineSettings.js";
 import { PermissionSelect } from "./PermissionSelect.js";
@@ -32,6 +33,7 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
   // Chosen only here; the Host fixes the role at creation.
   const [dispatcher, setDispatcher] = useState(false), [dispatch, setDispatch] = useState<DispatcherSettings>(defaultDispatcherSettings);
   const targets = installedEngines(catalog);
+  const dispatcherAvailable = !!state.dispatchAvailable && engine !== "pi";
   const [busy, setBusy] = useState(false), [error, setError] = useState(""); const [created, setCreated] = useState<Bot>();
   const pending = useRef<CreateBotInput>(undefined);
   const selectionOnRefresh = useRef<{ connection: HubConnection; engine: CreateBotInput["engine"] }>(undefined);
@@ -40,7 +42,7 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
   const models = modelOptions(engine, options?.models ?? []), selectedModel = selectedModelOption(models, model);
   const displayedEffort = selectedModelEffort(selectedModel, { model, effort }), levels = selectedModel?.efforts ?? [""];
   const validSelection = !!selectedModel && levels.includes(displayedEffort);
-  const changeEngine = (id: CreateBotInput["engine"], source = catalog) => { const next = source?.engines.find((e) => e.id === id); setEngine(id); setModel(next?.defaultModel ?? ""); setEffort(effortValueSchema.safeParse(next?.defaultEffort ?? "").data ?? ""); setEffortAdjusted(false); setPermission(next?.permissions?.defaultChoice ?? "bypass"); };
+  const changeEngine = (id: CreateBotInput["engine"], source = catalog) => { const next = source?.engines.find((e) => e.id === id); setEngine(id); if (id === "pi") setDispatcher(false); setModel(next?.defaultModel ?? ""); setEffort(effortValueSchema.safeParse(next?.defaultEffort ?? "").data ?? ""); setEffortAdjusted(false); setPermission(next?.permissions?.defaultChoice ?? "bypass"); };
   // A failed catalog read says why: only a missing endpoint means "update the
   // Hub". A dropped connection retries by itself once online; other failures
   // offer an explicit retry instead of requiring the dialog to be reopened.
@@ -49,7 +51,7 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
   useEffect(() => {
     if (catalog) return;
     let alive = true; setCatalogError(undefined);
-    void connection.http<BotCatalog>("/api/bots/catalog").then((value) => { if (alive) {
+    void connection.http<BotCatalog>(`/api/bots/catalog?includePi=1${workspace.trim() ? `&workspace=${encodeURIComponent(workspace.trim())}` : ""}`).then((value) => { if (alive) {
       setCatalog(value);
       const keep = selectionOnRefresh.current;
       if (keep?.connection !== connection || !value.engines.some(e => e.id === keep.engine && e.available)) changeEngine(value.engines.find((e) => e.available)?.id ?? "codex", value);
@@ -83,7 +85,7 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
   const submit = async () => {
     if (creationBlocked) return; setBusy(true); setError("");
     const selection = selectModelEffort(selectedModel, model, displayedEffort)!;
-    pending.current ??= { requestId: `bot_${crypto.randomUUID()}`, name: name.trim(), engine, ...selection, workspace, ...(options?.permissions ? { permission } : {}), ...(dispatcher && state.dispatchAvailable ? { role: "dispatcher" as const, dispatcher: normalizedDispatcherSettings(dispatch, targets) } : {}) };
+    pending.current ??= { requestId: `bot_${crypto.randomUUID()}`, name: name.trim(), engine, ...selection, workspace, ...(options?.permissions ? { permission } : {}), ...(dispatcher && dispatcherAvailable ? { role: "dispatcher" as const, dispatcher: normalizedDispatcherSettings(dispatch, targets) } : {}) };
     try { setCreated(await connection.createBot(pending.current)); }
     catch (e) {
       if (e instanceof HubHttpError && e.status >= 400 && e.status < 500) pending.current = undefined;
@@ -110,23 +112,24 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
       {/* Detection only proves the executable exists; sign-in is still the owner's step. */}
       <p id={cliHelp} className="new-bot-hint new-bot-cli"><SquareTerminal size={14} aria-hidden="true"/><span>{hostName ? t("需先在「{0}」安装此引擎的 CLI，并完成登录或 API 密钥配置。", hostName) : t("需先在运行主机上安装此引擎的 CLI，并完成登录或 API 密钥配置。")}</span></p>
       <div className="new-bot-pair">
-        <label>{t("模型")}<select aria-label={t("模型")} value={selectedModel?.id ?? model} onChange={(e) => { const next = selectModel(models, e.target.value, { model, effort }); setModel(next.model); setEffort(next.effort); setEffortAdjusted(!!displayedEffort && next.effort !== displayedEffort); }}>{options?.available && !selectedModel && <option value={model} disabled>{model || t("引擎默认")}</option>}{models.map((m) => <option key={m.id} value={m.id}>{modelOptionLabel(m, t("跟随引擎默认模型"))}</option>)}</select></label>
+        {engine === "pi" ? <PiModelSelect models={models} value={model} disabled={busy} change={value => { const next = selectModel(models, value, { model, effort }); setModel(next.model); setEffort(next.effort); setEffortAdjusted(!!displayedEffort && next.effort !== displayedEffort); }}/> : <label>{t("模型")}<select aria-label={t("模型")} value={selectedModel?.id ?? model} onChange={(e) => { const next = selectModel(models, e.target.value, { model, effort }); setModel(next.model); setEffort(next.effort); setEffortAdjusted(!!displayedEffort && next.effort !== displayedEffort); }}>{options?.available && !selectedModel && <option value={model} disabled>{model || t("引擎默认")}</option>}{models.map((m) => <option key={m.id} value={m.id}>{modelOptionLabel(m, t("跟随引擎默认模型"))}</option>)}</select></label>}
         <label>{t("推理强度（effort）")}<select aria-label={t("推理强度（effort）")} value={displayedEffort} onChange={(e) => { const next = selectModelEffort(selectedModel, model, e.target.value as CreateBotInput["effort"]); if (next) { setModel(next.model); setEffort(next.effort); setEffortAdjusted(false); } }}>{!levels.includes(displayedEffort) && <option value={displayedEffort} disabled>{displayedEffort} · {t("当前模型不支持")}</option>}{levels.map((value) => <option key={value} value={value}>{value || t("跟随引擎默认强度")}</option>)}</select></label>
       </div>
+      {engine === "pi" && options?.available && <><PiModelCatalogNotice status={options.catalogStatus}/><button type="button" disabled={busy || !online || !!pending.current} onClick={reloadCatalog}>{t("重新读取模型")}</button></>}
       {options?.available && !validSelection && <p role="alert" className="dashboard-notice">{t("此前选择的模型或推理强度已不可用，请重新选择。")}</p>}
       {effortAdjusted && <p className="dashboard-notice">{t("已调整为此模型支持的思考强度，请确认。")}</p>}
       {engine === "antigravity" && !model && <p className="new-bot-hint">{t("跟随默认模型时也跟随默认强度；选择具体模型后可调整其支持的档位。")}</p>}
     </div>
-    {(state.dispatchAvailable || options?.permissions) && <div className="new-bot-block" role="group" aria-labelledby={`${cliHelp}-role`}>
-      <h3 id={`${cliHelp}-role`} className="new-bot-heading">{state.dispatchAvailable && options?.permissions ? t("角色与权限") : state.dispatchAvailable ? t("角色") : t("权限")}</h3>
-      {state.dispatchAvailable && <div className="new-bot-role" data-checked={dispatcher || undefined}>
+    {(dispatcherAvailable || options?.permissions) && <div className="new-bot-block" role="group" aria-labelledby={`${cliHelp}-role`}>
+      <h3 id={`${cliHelp}-role`} className="new-bot-heading">{dispatcherAvailable && options?.permissions ? t("角色与权限") : dispatcherAvailable ? t("角色") : t("权限")}</h3>
+      {dispatcherAvailable && <div className="new-bot-role" data-checked={dispatcher || undefined}>
         <div className="dispatcher-role-row"><label className="collaboration-check"><input type="checkbox" aria-describedby={`${cliHelp}-dispatcher`} checked={dispatcher} onChange={(e) => setDispatcher(e.target.checked)}/>{t("作为幕僚长")}</label><DispatcherRoutingHelp/></div>
         <p id={`${cliHelp}-dispatcher`} className="new-bot-hint">{t("你只说目标，它会拆分任务，并调用这台主机上已安装的 CLI 去做。只能在创建时选择。")}<strong className="new-bot-role-advice">{t("刚开始建议先建普通 Bot，这里不勾选。")}</strong></p>
         {dispatcher && <div className="new-bot-role-details"><p className="new-bot-hint">{t("不需要另外建 Bot；过程不占对话列表，只在需要你决定或验收时提醒你。")}</p><p className="new-bot-hint">{t("上面的引擎、模型和推理强度是它自己思考用的；派出去的每张工单可以各自选择。")}</p><details><summary>{t("幕僚长设置")}</summary><DispatcherSettingsFields value={dispatch} change={setDispatch} engines={targets} loading={!catalog}/></details></div>}
       </div>}
       {options?.permissions && <PermissionSelect value={permission} choices={options.permissions.choices} defaultChoice={options.permissions.defaultChoice} change={setPermission}/>}
     </div>}
-    <details><summary>{t("高级设置")}</summary><label>{t("工作区（可选）")}<input value={workspace} placeholder={t("留空，自动创建独立工作区")} onChange={(e) => setWorkspace(e.target.value)}/></label><p className="new-bot-hint">{t("填写运行 Bot 的主机上的文件夹路径；主机在 VPS 时，请填写 VPS 路径。")}</p></details></fieldset>
+    <details><summary>{t("高级设置")}</summary><label>{t("工作区（可选）")}<input value={workspace} placeholder={t("留空，自动创建独立工作区")} onChange={(e) => setWorkspace(e.target.value)} onBlur={() => { if (engine === "pi" && !pending.current) reloadCatalog(); }}/></label><p className="new-bot-hint">{t("填写运行 Bot 的主机上的文件夹路径；主机在 VPS 时，请填写 VPS 路径。")}</p></details></fieldset>
     <div className="new-bot-footer">
       {!catalog && !catalogError && <p role="status" className="new-bot-status"><LoaderCircle className="spin" size={14} aria-hidden="true"/>{t("正在读取可用引擎…")}</p>}
       {error && <p role="alert" className="error-text new-bot-alert">{error}</p>}
