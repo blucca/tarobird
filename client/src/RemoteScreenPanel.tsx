@@ -5,7 +5,7 @@ import type { HubConnection } from "./connection.js";
 import type { ScreenStatus } from "../../src/client-protocol/remote-screen.js";
 import { screenKeyCodeSchema } from "../../src/client-protocol/remote-screen.js";
 import { RemoteScreenViewer, supportedScreenCodecs, type ViewerState } from "./remote-screen-viewer.js";
-import { screenError } from "./RemoteScreenSettings.js";
+import { screenError } from "./screen-errors.js";
 import { t, useLocale } from "./i18n.js";
 import "./remote-screen.css";
 import { SCREEN_DEFAULT_QUALITY, type ScreenQuality } from "../../src/client-protocol/screen-quality.js";
