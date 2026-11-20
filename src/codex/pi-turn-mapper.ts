@@ -7,6 +7,7 @@ import type {
   PiSessionEntry, PiSessionEvent, PiSessionTreeNode, PiUsage,
 } from "./pi-rpc-protocol.js";
 import type { PiNativeTree, PiNativeTreeNode } from "./pi-native-types.js";
+import { piLabelAnswer, piLabelValue, piQuestionSelection, piQuestionText } from "./pi-question-identity.js";
 
 /** Pure translation between Pi's wire records and TaroBird's engine stream. No process or socket state. */
 
@@ -262,33 +263,56 @@ export interface PiDialogQuestion {
 }
 
 const DIALOG_COPY = {
-  en: { yes: "Yes", no: "No", extension: "Extension" },
-  zh: { yes: "是", no: "否", extension: "扩展" },
+  en: { yes: "Yes", no: "No", extension: "Extension", untitled: "Pi extension question", empty: "(empty)" },
+  zh: { yes: "是", no: "否", extension: "扩展", untitled: "Pi 扩展问题", empty: "（空）" },
 } as const;
 
-/** Map an extension dialog to the shared question form. */
+/**
+ * Map an extension dialog to the shared question form. Blank titles and
+ * options get visible text: the card drops blank ones, and answers are matched
+ * back to the dialog by position (`piQuestionSelection`).
+ */
 export function piDialogQuestion(request: PiExtensionUiRequest, locale: "en" | "zh" = "en"): PiDialogQuestion | undefined {
   const copy = DIALOG_COPY[locale], header = copy.extension;
+  const title = (value: string) => piQuestionText(value, copy.untitled);
   switch (request.method) {
-    case "select": return { question: request.title, header, options: request.options.map(label => ({ label })), multiSelect: false, allowFreeText: false };
-    case "confirm": return { question: request.title, header, ...(request.message ? { detail: request.message } : {}), options: [{ label: copy.yes }, { label: copy.no }], multiSelect: false, allowFreeText: false };
-    case "input": return { question: request.title, header, options: [], multiSelect: false, allowFreeText: true, required: false, input: { kind: "text", ...(request.placeholder ? { placeholder: request.placeholder } : {}) } };
-    case "editor": return { question: request.title, header, options: [], multiSelect: false, allowFreeText: true, required: false, input: { kind: "multiline", ...(request.prefill ? { prefill: request.prefill } : {}) } };
+    case "select": return { question: title(request.title), header, options: request.options.map(label => ({ label: piQuestionText(label, copy.empty) })), multiSelect: false, allowFreeText: false };
+    case "confirm": return { question: title(request.title), header, ...(request.message ? { detail: request.message } : {}), options: [{ label: copy.yes }, { label: copy.no }], multiSelect: false, allowFreeText: false };
+    case "input": return { question: title(request.title), header, options: [], multiSelect: false, allowFreeText: true, required: false, input: { kind: "text", ...(request.placeholder ? { placeholder: request.placeholder } : {}) } };
+    case "editor": return { question: title(request.title), header, options: [], multiSelect: false, allowFreeText: true, required: false, input: { kind: "multiline", ...(request.prefill ? { prefill: request.prefill } : {}) } };
     default: return;
   }
 }
 
-/** Translate the form's answer back. A missing or foreign answer cancels the dialog. */
+/**
+ * Translate the form's answer back. A choice is taken by position, so the
+ * extension receives exactly the option string it offered; a missing or
+ * foreign answer cancels the dialog.
+ */
 export function piDialogResponse(
   request: PiExtensionUiRequest, question: PiDialogQuestion, updatedInput: unknown, locale: "en" | "zh" = "en",
 ): PiExtensionUiResponse {
   const cancelled: PiExtensionUiResponse = { type: "extension_ui_response", id: request.id, cancelled: true };
-  const answers = (updatedInput as { answers?: Record<string, unknown> } | undefined)?.answers;
-  const raw = answers && typeof answers === "object" ? answers[question.question] : undefined;
-  const answer = Array.isArray(raw) ? raw.find((value): value is string => typeof value === "string") : typeof raw === "string" ? raw : undefined;
+  const raw = piLabelAnswer(updatedInput, question.question);
+  const labelAnswer = Array.isArray(raw) ? raw.find((value): value is string => typeof value === "string") : typeof raw === "string" ? raw : undefined;
+  const selection = piQuestionSelection(updatedInput);
+  if (selection && (request.method === "select" || request.method === "confirm")) {
+    const position = selection.options.length === 1 ? selection.options[0]! : undefined;
+    if (request.method === "select") {
+      const value = position === undefined ? undefined : request.options[position];
+      return value === undefined ? cancelled : { type: "extension_ui_response", id: request.id, value };
+    }
+    return position === 0 ? { type: "extension_ui_response", id: request.id, confirmed: true }
+      : position === 1 ? { type: "extension_ui_response", id: request.id, confirmed: false } : cancelled;
+  }
+  const answer = (request.method === "input" || request.method === "editor") && selection?.text !== undefined ? selection.text : labelAnswer;
   if (answer === undefined) return cancelled;
   switch (request.method) {
-    case "select": return request.options.includes(answer) ? { type: "extension_ui_response", id: request.id, value: answer } : cancelled;
+    case "select": {
+      // A label-only answer: the card shows labels trimmed, so options that look alike there are never guessed between.
+      const match = piLabelValue(request.options.map(option => ({ label: option, value: option })), answer);
+      return typeof match === "object" ? { type: "extension_ui_response", id: request.id, value: match.value } : cancelled;
+    }
     case "confirm": {
       const copy = DIALOG_COPY[locale];
       if (answer === copy.yes) return { type: "extension_ui_response", id: request.id, confirmed: true };

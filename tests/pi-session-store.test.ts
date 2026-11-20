@@ -10,8 +10,21 @@ import {
   piNativeSessionDir, piNativeSessionDirFor,
 } from "../src/codex/pi-session-store.js";
 
+const readFault = vi.hoisted(() => ({ file: "", code: "", reads: 0 }));
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, readFile: (...args: Parameters<typeof actual.readFile>) => {
+    if (args[0] === readFault.file && readFault.code) {
+      readFault.reads++;
+      return Promise.reject(Object.assign(new Error("Synthetic read failure"), { code: readFault.code }));
+    }
+    return actual.readFile(...args);
+  } };
+});
+
 const roots: string[] = [];
 afterEach(async () => {
+  readFault.file = ""; readFault.code = ""; readFault.reads = 0;
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
 
@@ -477,6 +490,47 @@ describe("PiSessionStore state", () => {
     expect((await reloaded.record("a")).appliedBotDefault).toBe("1");
     expect((await reloaded.record("b")).appliedBotDefault).toBe("2");
     expect(await reloaded.trustDecision("/synthetic/ws")).toBe("yes");
+  });
+
+  it.each(["EACCES", "EIO"])("preserves existing settings when the first state read fails with %s, and retries after recovery", async code => {
+    const { store, make, stateDir } = await scratch();
+    await store.updateRecord("kept", { appliedBotDefault: "original", modelSource: "session" });
+    await store.setTrustDecision("/synthetic/kept", "no");
+    await store.setScopedModels(["provider/model"]);
+    const file = path.join(stateDir, "pi", "state.json");
+    const before = await readFile(file, "utf8");
+    readFault.file = file; readFault.code = code;
+    const fresh = make();
+    const attempts = await Promise.allSettled([
+      fresh.updateRecord("new", { appliedBotDefault: "must-not-write" }),
+      fresh.setTrustDecision("/synthetic/new", "yes"),
+      fresh.setScopedModels(["other/model"]),
+    ]);
+    readFault.code = "";
+    expect(attempts.map(result => result.status)).toEqual(["rejected", "rejected", "rejected"]);
+    expect(readFault.reads).toBe(1);
+    expect(await readFile(file, "utf8")).toBe(before);
+    // The failed load must not remain cached, and failed mutations must not be replayed.
+    await fresh.updateRecord("recovered", { appliedBotDefault: "new" });
+    const reloaded = make();
+    expect(await reloaded.record("kept")).toMatchObject({ appliedBotDefault: "original", modelSource: "session" });
+    expect(await reloaded.record("new")).toEqual({});
+    expect(await reloaded.trustDecision("/synthetic/kept")).toBe("no");
+    expect(await reloaded.trustDecision("/synthetic/new")).toBeUndefined();
+    expect(await reloaded.scopedModels()).toEqual(["provider/model"]);
+    expect(await reloaded.record("recovered")).toMatchObject({ appliedBotDefault: "new" });
+  });
+
+  it("does not cache empty state after a real read error, and can read a repaired state path", async () => {
+    const { store, stateDir } = await scratch();
+    const file = path.join(stateDir, "pi", "state.json");
+    // A directory at a file path deterministically fails readFile on macOS/Linux/Windows.
+    await mkdir(file, { recursive: true });
+    await expect(store.record("kept")).rejects.toBeInstanceOf(Error);
+    expect((await stat(file)).isDirectory()).toBe(true);
+    await rm(file, { recursive: true });
+    await writeFile(file, JSON.stringify({ version: 1, sessions: { kept: { appliedBotDefault: "original" } }, trust: {} }));
+    expect(await store.record("kept")).toMatchObject({ appliedBotDefault: "original" });
   });
 
   it.each([

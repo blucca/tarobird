@@ -51,7 +51,14 @@ landed. Incompatible Bot defaults are explicitly rejected. A conversation's own
 unsupported level uses Pi's native clamping with a notice. Direct native `/model`
 changes retain Pi's own per-model/default-thinking behavior.
 A native `/model` or `/thinking` selection belongs to its conversation and persists
-across subsequent turns while that individual Bot default remains unchanged. Restored native sessions retain their recorded
+across subsequent turns while that individual Bot default remains unchanged.
+A conversation choice made after a Bot default was saved takes precedence over
+that pending default in the same field; the other field is still independent.
+When an unavailable model or incompatible thinking default is rejected, `/model`,
+`/thinking`, and bare `/session` remain available with a notice so the owner can
+recover. Ordinary prompts still fail, and these commands do not bypass unreadable
+configuration, stale ownership or uncertain native writes.
+Restored native sessions retain their recorded
 selection unless that Bot default has changed. Clear a Bot override to return
 to the native default; **off** explicitly disables thinking and is different
 from an empty override. Clearing a conversation thinking override when the Bot
@@ -103,6 +110,9 @@ and `/yolo unsafe` select normal approval and bypass respectively.
 Approval decisions belong to the current Bot and session; another conversation
 does not inherit a tool approval accidentally. A disconnected approval bridge
 cannot authorize an operation.
+Oversized approval inputs are shown as a partial preview, with omitted items,
+fields and text identified. The tool still executes with its full original
+arguments; shortening the preview does not shorten the operation.
 
 The bundled extension connects to a private authenticated local endpoint. It
 provides App tools and per-turn instructions without modifying the owner's
@@ -115,7 +125,11 @@ the run details; a fixed final notice cannot execute embedded delivery directive
 replayed on every later turn, and their text cannot become a final file-send
 directive. Native
 select, confirm, input and editor requests use App question cards, including
-multi-line text and explicit empty answers. Native terminal-only rendering is
+multi-line text and explicit empty answers. Pi selections retain their option
+positions, so equal labels, surrounding whitespace and commas do not change the
+selected native value. Blank titles and options have visible placeholders.
+Ambiguous label-only answers are rejected rather than guessed.
+Native terminal-only rendering is
 not reproduced as an embedded terminal.
 
 ## Sessions and commands
@@ -264,6 +278,10 @@ live under its state directory. Per-field default fingerprints are additive:
 unchanged legacy pairs migrate without native writes; changed legacy pairs apply
 both once because the old individual values are unknown. Forks inherit these
 records and malformed new fingerprints fall back to legacy comparison.
+An initial state-file read failure, other than a missing file, rejects the
+operation without treating saved settings as empty or overwriting them. The
+same store can retry once the read failure is resolved. Existing recovery of
+readable malformed state files is unchanged.
 TaroBird does not rewrite project instruction
 files. A turn ends on native `agent_settled`, and confirmed cancellation requires
 native settlement or process termination, not just a sent abort request.

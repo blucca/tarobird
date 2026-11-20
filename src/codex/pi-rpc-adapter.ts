@@ -32,6 +32,7 @@ import {
   PI_TUI_BUILTIN_COMMANDS, classifyPiError, isPiPlaceholderModel, parsePiSlashCommand, piDisplayText, samePiModel, sanitizePiErrorText, toPiModelRef,
   type PiAssistantMessage, type PiExtensionUiRequest, type PiModel, type PiModelRef, type PiPromptDisposition, type PiSessionEvent, type PiSessionState,
 } from "./pi-rpc-protocol.js";
+import { piLabelAnswer, piLabelValue, piQuestionSelection, piQuestionText } from "./pi-question-identity.js";
 import { piManagedSearchServer, type PiManagedSearchServer } from "./pi-search-mcp.js";
 import { PiSessionStore, piWorkspaceCwd, samePiWorkspace, hasPiTrustGatedFiles, isSafePiSessionId, piBotDefaultFingerprint, type PiSessionRecord } from "./pi-session-store.js";
 import {
@@ -450,26 +451,44 @@ export class PiRpcAdapter implements CodexAdapter {
       const runtime = await this.loadRuntime(input.engineOverride);
       await this.resolveProjectTrust(turn, cwd);
       await this.applyGate(turn.worker, runtime.gate);
+      // Pi's editor trims before it looks for `/` or `!` (interactive-mode.ts:3327).
+      const text = input.text.trim();
+      const command = input.files.length === 0 ? parsePiSlashCommand(text) : undefined;
+      const canRepairDefaults = !runtime.ticket && command
+        && (command.name === "model" || command.name === "thinking" || command.name === "session" && !command.args);
+      let defaultsNotice = "";
+      let rejectedDefault: PiNativeRejectedError | undefined;
       // Same queue as the conversation's own model controls: a default being applied and a choice being made never interleave.
-      await this.unlessStopped(turn, this.settingsTask(turn.worker, turn.worker.sessionId, false, undefined, scope => this.applyModelSettings(turn.worker, runtime, scope)));
+      try {
+        await this.unlessStopped(turn, this.settingsTask(turn.worker, turn.worker.sessionId, false, undefined, scope => this.applyModelSettings(turn.worker, runtime, scope)));
+      } catch (error) {
+        // A confirmed incompatible/unavailable default must not block its own
+        // recovery controls. I/O failures, stale ownership and uncertain native
+        // writes still fail the turn; normal prompts and extensions do as well.
+        if (!canRepairDefaults || !(error instanceof PiNativeRejectedError)
+          || (error.reason !== "thinking-unsupported" && error.reason !== "model-unavailable")) throw error;
+        rejectedDefault = error;
+        defaultsNotice = input.locale === "zh"
+          ? "Bot 默认设置暂时无法应用。可以用 /model 或 /thinking 调整当前对话。"
+          : "Bot defaults could not be applied. Use /model or /thinking to adjust this conversation.";
+      }
       this.throwIfStopped(turn);
       await this.emit(turn, { type: "session", sessionId: turn.worker.sessionId });
       this.flushBacklog(turn);
 
-      // Pi's editor trims before it looks for `/` or `!` (interactive-mode.ts:3327).
-      const text = input.text.trim();
       if (input.files.length === 0 && (text.startsWith("/") || text.startsWith("!"))) {
         const handled = await this.unlessStopped(turn, this.runNativeCommand(turn, text, runtime.gate));
         if (handled.handled) {
           this.throwIfStopped(turn);
           const current = handled.sessionId ?? turn.worker.sessionId;
           if (current !== sessionId) await this.emit(turn, { type: "session", sessionId: current });
-          const text = this.withExtensionErrorNotice(turn, handled.text);
+          const text = this.withExtensionErrorNotice(turn, [defaultsNotice, handled.text].filter(Boolean).join("\n\n"));
           await this.emit(turn, { type: "result", text, sessionId: current });
           await turn.emitChain;
           return { text, sessionId: current };
         }
       }
+      if (rejectedDefault) throw rejectedDefault; // Recovery may never fall through to a model prompt.
       return await this.runPrompt(turn);
     } catch (error) {
       // The turn is over for the Host only once the stop is confirmed: Pi settled, or its process was ended.
@@ -911,8 +930,9 @@ export class PiRpcAdapter implements CodexAdapter {
     const ask = turn.input.onApprovalRequest, worker = turn.worker;
     if (!ask || turn.stopRequested) return { cancelled: true };
     const form = {
-      question: question.title, ...(question.message ? { detail: question.message } : {}),
-      options: question.options.map(option => ({ label: option.label, ...(option.description ? { description: option.description } : {}) })),
+      // Non-blank, so the card keeps every option and its answer positions line up with `question.options`.
+      question: piQuestionText(question.title, "Pi"), ...(question.message ? { detail: question.message } : {}),
+      options: question.options.map(option => ({ label: piQuestionText(option.label, option.value), ...(option.description ? { description: option.description } : {}) })),
       multiSelect: Boolean(question.multiple),
       // Stated either way: the shared card offers a free-text box by default, and a typed answer to a pure choice would only cancel it.
       allowFreeText: Boolean(question.text),
@@ -923,20 +943,35 @@ export class PiRpcAdapter implements CodexAdapter {
       await this.emit(turn, { type: "permission_request", toolName: "AskUserQuestion", toolInput: { questions: [form] }, sessionId: worker.sessionId });
       const decision = await ask({ engine: "pi", toolName: "AskUserQuestion", toolInput: { questions: [form] }, cwd: worker.cwd, sessionId: worker.sessionId, abortSignal: turn.scope.signal });
       if (decision.behavior !== "allow" || turn.stopRequested) return { cancelled: true };
-      const raw = (decision.updatedInput as { answers?: Record<string, unknown> } | undefined)?.answers?.[form.question];
+      // Picked options by position: two fork points or tree entries may share their text.
+      const selection = piQuestionSelection(decision.updatedInput);
+      if (selection) {
+        const picked = selection.options.map(position => question.options[position]);
+        if (picked.some(option => !option)) return { cancelled: true };
+        if (picked.length) {
+          if (question.multiple) return { values: picked.map(option => option!.value) };
+          return picked.length === 1 ? { value: picked[0]!.value } : { cancelled: true };
+        }
+        return question.text ? { text: selection.text ?? "" } : { cancelled: true };
+      }
+      // A label-only answer (a surface without positions): labels that look alike on the card are never guessed between.
+      const raw = piLabelAnswer(decision.updatedInput, form.question);
+      const shown = form.options.map((option, index) => ({ label: option.label, value: question.options[index]!.value }));
       if (question.multiple) {
         // The shared form returns several choices as an array, or as one comma-separated string.
         const labels = Array.isArray(raw) ? raw.filter((value): value is string => typeof value === "string")
           : typeof raw === "string" ? raw.split(/\s*[,，]\s*/).filter(Boolean) : undefined;
         if (!labels) return { cancelled: true };
-        const byLabel = new Map(question.options.map(option => [option.label, option.value]));
-        if (labels.every(label => byLabel.has(label))) return { values: labels.map(label => byLabel.get(label)!) };
+        const matches = labels.map(label => piLabelValue(shown, label));
+        if (matches.includes("ambiguous")) return { cancelled: true };
+        if (matches.every(match => typeof match === "object")) return { values: matches.map(match => (match as { value: string }).value) };
         return question.text && typeof raw === "string" ? { text: raw } : { cancelled: true };
       }
       const answer = Array.isArray(raw) ? raw.find((value): value is string => typeof value === "string") : typeof raw === "string" ? raw : undefined;
       if (answer === undefined) return { cancelled: true };
-      const option = question.options.find(candidate => candidate.label === answer);
-      if (option) return { value: option.value };
+      const match = piLabelValue(shown, answer);
+      if (typeof match === "object") return { value: match.value };
+      if (match === "ambiguous") return { cancelled: true };
       return question.text ? { text: answer } : { cancelled: true };
     } catch { return { cancelled: true }; } finally {
       turn.humanWaits = Math.max(0, turn.humanWaits - 1);
@@ -1334,41 +1369,46 @@ export class PiRpcAdapter implements CodexAdapter {
 
   private async applyChoice(worker: Worker, choice: { model: PiModelRef | null } | { thinking: PiThinkingLevel | null }, scope: SettingsScope): Promise<void> {
     const beforeWrite = scope.check;
+    // This explicit choice supersedes the Bot default already saved when it
+    // starts. A later Bot change must still apply, and the other field remains
+    // independent. Capture before any native write; only record after success.
+    const runtime = await this.loadRuntime(undefined);
+    const modelDefault = { appliedBotModelDefault: piBotDefaultFingerprint(runtime.botModel, undefined) };
+    const thinkingDefault = { appliedBotThinkingDefault: piBotDefaultFingerprint(undefined, runtime.botEffort) };
     if ("model" in choice && choice.model) {
       await this.setModelExact(worker, choice.model, beforeWrite);
-      await scope.record({ modelSource: "session", botDefaultModel: undefined });
+      await scope.record({ ...modelDefault, modelSource: "session", botDefaultModel: undefined });
       return;
     }
     if ("thinking" in choice && choice.thinking) {
       await this.setThinkingExact(worker, choice.thinking, beforeWrite);
       // The conversation chose this level itself; clearing the Bot effort later must not undo it.
-      await scope.record({ botDefaultThinking: undefined, thinkingBeforeBotDefault: undefined });
+      await scope.record({ ...thinkingDefault, botDefaultThinking: undefined, thinkingBeforeBotDefault: undefined });
       return;
     }
     // Dropping a choice. Model and thinking level are independent: resetting one never moves the other,
     // beyond what Pi itself does to the thinking level when the model changes.
-    const runtime = await this.loadRuntime(undefined);
     if ("model" in choice) {
       if (runtime.botModel) {
         const ref = this.decodeModel(runtime.botModel);
         await this.setModelExact(worker, ref, beforeWrite);
-        await scope.record({ modelSource: "bot-default", botDefaultModel: ref });
+        await scope.record({ ...modelDefault, modelSource: "bot-default", botDefaultModel: ref });
         return;
       }
       await beforeWrite();
       const restored = await this.restoreNativeDefault(worker, beforeWrite, { thinking: false });
       if (!restored) throw new PiNativeRejectedError("Pi's default model is not available right now; the conversation keeps its current model", "model-unavailable");
-      await scope.record({ modelSource: "native", botDefaultModel: undefined });
+      await scope.record({ ...modelDefault, modelSource: "native", botDefaultModel: undefined });
       return;
     }
     if (runtime.botEffort) {
       // Checked against the model the session runs now; an unsupported Bot effort is refused, never worked around by switching models.
       await this.setThinkingExact(worker, runtime.botEffort, beforeWrite);
-      await scope.record({ botDefaultThinking: runtime.botEffort, thinkingBeforeBotDefault: undefined });
+      await scope.record({ ...thinkingDefault, botDefaultThinking: runtime.botEffort, thinkingBeforeBotDefault: undefined });
       return;
     }
     // No Bot effort to fall back to: the level stays; only the record of who chose it is cleared.
-    await scope.record({ botDefaultThinking: undefined, thinkingBeforeBotDefault: undefined });
+    await scope.record({ ...thinkingDefault, botDefaultThinking: undefined, thinkingBeforeBotDefault: undefined });
   }
 
   /** Pi's own `get_commands` for this process. Names are Pi's invocation names (a duplicate gets `name:2`, runner.ts:839-849). */

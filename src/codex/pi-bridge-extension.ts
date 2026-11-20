@@ -104,20 +104,44 @@ function parseDefinitions(value: unknown): { definitions: ToolDefinition[]; reje
   return { definitions, rejected };
 }
 
-/** Keep an approval request under the frame cap: a 2 MB `write` must still be askable. */
+/**
+ * Keep an approval request under the frame cap: a 2 MB `write` must still be askable.
+ * This is only what the owner is shown; the tool still runs with its full input. Every
+ * shortening is marked where it happened, so an approval never covers items the card
+ * silently left out (Pi's own `edit` takes an `edits` array).
+ */
 function boundedInput(input: unknown): { input: unknown; inputTruncated?: true } {
   let json: string;
-  try { json = JSON.stringify(input) ?? "null"; } catch { return { input: null, inputTruncated: true }; }
+  try { json = JSON.stringify(input) ?? "null"; } catch { return { input: { notice: "The tool input cannot be shown." }, inputTruncated: true }; }
   if (Buffer.byteLength(json) <= APPROVAL_INPUT_BUDGET_BYTES) return { input };
   const clip = (value: unknown, depth: number): unknown => {
     if (typeof value === "string") return value.length > 4000 ? `${value.slice(0, 4000)}… [${value.length - 4000} more characters]` : value;
     if (depth >= 4 || typeof value !== "object" || value === null) return typeof value === "object" && value !== null ? "[omitted]" : value;
-    if (Array.isArray(value)) return value.slice(0, 50).map(item => clip(item, depth + 1));
-    return Object.fromEntries(Object.entries(value).slice(0, 50).map(([key, item]) => [key, clip(item, depth + 1)]));
+    if (Array.isArray(value)) {
+      const kept = value.slice(0, 50).map(item => clip(item, depth + 1));
+      return value.length > 50 ? [...kept, `… [${value.length - 50} more items not shown]`] : kept;
+    }
+    const entries = Object.entries(value);
+    const kept: Json = Object.fromEntries(entries.slice(0, 50).map(([key, item]) => [key, clip(item, depth + 1)]));
+    if (entries.length > 50) {
+      let key = "…";
+      while (Object.hasOwn(kept, key)) key += "…";
+      kept[key] = `[${entries.length - 50} more fields not shown]`;
+    }
+    return kept;
   };
+  // Said first, ahead of the bulk it shortens; the marks below say where and how much.
+  const notice = "This preview is shortened; marked parts are not shown. The tool runs with its full input.";
   const clipped = clip(input, 0);
-  if (Buffer.byteLength(JSON.stringify(clipped) ?? "null") <= APPROVAL_INPUT_BUDGET_BYTES) return { input: clipped, inputTruncated: true };
-  return { input: { preview: json.slice(0, 8000) }, inputTruncated: true };
+  let shown: unknown = clipped;
+  if (Array.isArray(clipped)) shown = [notice, ...clipped];
+  else if (isRecord(clipped)) {
+    let key = "⚠";
+    while (Object.hasOwn(clipped, key)) key += "⚠";
+    shown = { [key]: notice, ...clipped };
+  } else if (typeof clipped === "string") shown = `[${notice}] ${clipped}`;
+  if (Buffer.byteLength(JSON.stringify(shown) ?? "null") <= APPROVAL_INPUT_BUDGET_BYTES) return { input: shown, inputTruncated: true };
+  return { input: { notice: `This preview is shortened: the tool input is too large to show in full (${Buffer.byteLength(json)} bytes); only its beginning is shown. The tool runs with its full input.`, preview: json.slice(0, 8000) }, inputTruncated: true };
 }
 
 /**

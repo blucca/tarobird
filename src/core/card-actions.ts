@@ -348,6 +348,25 @@ function askFormSelectedValues(raw: unknown): string[] {
   return [trimmed];
 }
 
+/**
+ * Pi only: the picked options of each question by position, plus free text.
+ * `answers` carries trimmed labels, so equal labels, labels the card trimmed
+ * and labels containing commas cannot be told apart there. Other engines keep
+ * their existing `answers` contract and never receive this field.
+ */
+function askFormPiSelections(questions: AskUserQuestionCardQuestion[], formValue: Record<string, unknown>): Array<{ options: number[]; text?: string }> {
+  return questions.map((question, index) => {
+    const positions = askFormSelectedValues(formValue[askFormFieldName(index)])
+      .map((value) => value.trim())
+      .filter((value) => /^\d+$/.test(value))
+      .map(Number)
+      .filter((position) => position < question.options.length);
+    const raw = formValue[askFormOtherFieldName(index)];
+    const text = !question.allowFreeText ? undefined : question.input && typeof raw === "string" ? raw : stringValue(raw);
+    return { options: [...new Set(positions)], ...(text !== undefined ? { text } : {}) };
+  });
+}
+
 function renderCoreAskUserQuestionCard(input: {
   requestId: string;
   toolInput: unknown;
@@ -1688,6 +1707,7 @@ export async function handleCoreCardAction(input: {
         ...root,
         questions: Array.isArray(root.questions) ? root.questions : questions,
         answers,
+        ...(pending.approvalEngine === "pi" ? { selections: askFormPiSelections(questions, formValue) } : {}),
       },
       ...(onAnswerProgress ? { onAnswerProgress } : {}),
     };

@@ -121,6 +121,15 @@ function rawClient(endpoint: PiBridgeEndpoint): Promise<net.Socket> {
     cleanups.push(() => socket.destroy());
   });
 }
+/** The real listeners `openPiBridgeEndpoint` starts, in order: observed, not replaced. */
+function observeListeners(): () => net.Server[] {
+  const listen = vi.spyOn(net.Server.prototype, "listen");
+  cleanups.push(() => listen.mockRestore());
+  return () => listen.mock.contexts as net.Server[];
+}
+/** A later client's outcome. POSIX refuses at once; a Windows pipe client waits while the accepted instance is open. */
+const laterClient = (endpoint: PiBridgeEndpoint) => rawClient(endpoint).then(() => "connected", (error: NodeJS.ErrnoException) => error.code ?? "error");
+const isWindows = process.platform === "win32";
 const hello = (token: string) => `${JSON.stringify({ v: 1, type: "request", id: randomUUID(), method: "hello", payload: { token, protocol: 1 } })}\n`;
 const rejection = (promise: Promise<unknown>) => promise.then(() => { throw new Error("expected a rejection"); }, error => error);
 const toolCall = (pi: ReturnType<typeof fakePi>, toolName: string, input: unknown = {}, signal?: AbortSignal) =>
@@ -138,15 +147,23 @@ afterEach(async () => {
 
 describe("Pi bridge handshake", () => {
   it("accepts the extension, then closes the listener and removes the socket", async () => {
+    const listeners = observeListeners();
     const { endpoint, connection, pi } = await connected();
     expect(connection.isOpen).toBe(true);
     expect(process.env[PI_BRIDGE_ENDPOINT_ENV]).toBeUndefined();
     expect(process.env[PI_BRIDGE_TOKEN_ENV]).toBeUndefined();
+    const [listener] = listeners();
+    expect(listeners()).toHaveLength(1);
+    expect(listener!.listening).toBe(false);
     expect(existsSync(endpointPath(endpoint))).toBe(false);
-    expect(existsSync(path.dirname(endpointPath(endpoint)))).toBe(false);
-    await expect(rawClient(endpoint)).rejects.toThrow();
+    // POSIX: the private socket directory is removed as well. A Windows named pipe has no directory.
+    if (!isWindows) expect(existsSync(path.dirname(endpointPath(endpoint)))).toBe(false);
     expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "model_select", "project_trust", "session_shutdown", "session_start", "tool_call", "user_bash"]);
     expect(pi.commands.has(PI_BRIDGE_COMMAND)).toBe(true);
+    // Nobody can connect afterwards. A Windows pipe client waits for the accepted instance, so end it first there.
+    const later = laterClient(endpoint);
+    if (isWindows) connection.close();
+    expect(await later).not.toBe("connected");
   });
 
   it("rejects a wrong token", async () => {
@@ -182,14 +199,24 @@ describe("Pi bridge handshake", () => {
   });
 
   it("serves only the first connection", async () => {
+    const listeners = observeListeners();
     const endpoint = await openEndpoint(recordingHandler().handler);
+    const [listener] = listeners();
+    let accepted = 0;
+    listener!.on("connection", () => { accepted++; });
     const token = endpoint.env[PI_BRIDGE_TOKEN_ENV]!;
     const first = await rawClient(endpoint);
-    await vi.waitFor(() => expect(existsSync(endpointPath(endpoint))).toBe(false));
-    await expect(rawClient(endpoint)).rejects.toThrow();
+    // The listener closes as soon as it accepts, before any handshake.
+    await vi.waitFor(() => expect(listener!.listening).toBe(false));
+    if (!isWindows) expect(existsSync(endpointPath(endpoint))).toBe(false); // POSIX: the socket file is gone too
+    const second = laterClient(endpoint);
     first.write(hello(token));
     const connection = await endpoint.connection;
     expect(connection.isOpen).toBe(true);
+    // Windows: the second client is still waiting for the pipe; once the only instance ends it fails instead of connecting.
+    connection.close();
+    expect(await second).not.toBe("connected");
+    expect(accepted).toBe(1);
   });
 
   it("fails when the peer disconnects before authenticating", async () => {
@@ -228,7 +255,32 @@ describe("Pi bridge handshake", () => {
 });
 
 describe("Pi bridge endpoint placement", () => {
-  it("uses a private directory under the state directory when the path fits", async () => {
+  // The socket directory, its sun_path fallback and its private-directory check exist only in the POSIX branch.
+  // Windows listens on a named pipe and creates no directory; the Windows test below covers that branch.
+  it.runIf(isWindows)("uses a private named pipe on Windows and creates nothing under the state directory", async () => {
+    const directory = await stateDir();
+    const deep = path.join(directory, "a".repeat(60), "b".repeat(60));
+    await mkdir(deep, { recursive: true });
+    const listeners = observeListeners();
+    const host = recordingHandler();
+    const endpoint = await openEndpoint(host.handler, { stateDir: deep });
+    expect(endpointPath(endpoint)).toMatch(/^\\\\\.\\pipe\\tarobird-pi-[0-9a-f]{32}$/);
+    expect(endpoint.env[PI_BRIDGE_TOKEN_ENV]).toMatch(/^[0-9a-f]{64}$/);
+    expect(existsSync(path.join(deep, "pi"))).toBe(false);
+    const pi = await loadExtension(endpoint);
+    const connection = await endpoint.connection;
+    expect(connection.isOpen).toBe(true);
+    expect(listeners()[0]!.listening).toBe(false);
+    expect(await toolCall(pi, "bash")).toBeUndefined(); // an approval round trip over the pipe
+    expect(host.approvals.map(approval => approval.toolName)).toEqual(["bash"]);
+    endpoint.dispose();
+    await connection.closed;
+    expect(existsSync(endpointPath(endpoint))).toBe(false);
+    expect(existsSync(path.join(deep, "pi"))).toBe(false);
+    expect(existsSync(path.join(directory, "pi"))).toBe(false);
+  });
+
+  it.skipIf(isWindows)("uses a private directory under the state directory when the path fits", async () => {
     const directory = await stateDir();
     const endpoint = await openEndpoint(recordingHandler().handler, { stateDir: directory });
     const socketPath = endpointPath(endpoint);
@@ -237,7 +289,7 @@ describe("Pi bridge endpoint placement", () => {
     expect(endpoint.env[PI_BRIDGE_TOKEN_ENV]).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("falls back to a short temporary directory for a long state path", async () => {
+  it.skipIf(isWindows)("falls back to a short temporary directory for a long state path", async () => {
     const deep = path.join(await stateDir(), "a".repeat(60), "b".repeat(60));
     await mkdir(deep, { recursive: true });
     const endpoint = await openEndpoint(recordingHandler().handler, { stateDir: deep });
@@ -249,7 +301,7 @@ describe("Pi bridge endpoint placement", () => {
     expect(existsSync(path.dirname(socketPath))).toBe(false);
   });
 
-  it("refuses a bridge directory that is not a real private directory", async () => {
+  it.skipIf(isWindows)("refuses a bridge directory that is not a real private directory", async () => {
     const directory = await stateDir();
     const elsewhere = await stateDir();
     await mkdir(path.join(directory, "pi"));
@@ -328,6 +380,42 @@ describe("Pi bridge approval gate", () => {
     expect(approvals[0]!.inputTruncated).toBe(true);
     expect(JSON.stringify(approvals[0]!.input).length).toBeLessThan(300_000);
     expect((approvals[0]!.input as { path: string }).path).toBe("big.txt");
+  });
+
+  it("marks every item, field and preview it leaves out of an oversized approval, and runs the tool with its full input", async () => {
+    const { pi, approvals } = await connected();
+    const edits = Array.from({ length: 80 }, (_, index) => ({ oldText: `OLD-${index}-${"a".repeat(1990)}`, newText: `NEW-${index}-${"b".repeat(1990)}` }));
+    const input = { path: "src/app.ts", edits };
+    expect(await toolCall(pi, "edit", input)).toBeUndefined();
+    const shown = approvals[0]!.input as { path: string; edits: unknown[] };
+    expect(approvals[0]!.inputTruncated).toBe(true);
+    expect(shown.edits).toHaveLength(51);
+    expect(shown.edits.at(-1)).toBe("… [30 more items not shown]");
+    expect(JSON.stringify(shown)).not.toContain("OLD-50-");
+    expect(input.edits).toHaveLength(80); // the approval shows a copy; the tool's own arguments are untouched
+
+    const fields = Object.fromEntries(Array.from({ length: 60 }, (_, index) => [`field${index}`, "x".repeat(5000)]));
+    await toolCall(pi, "custom", { ...fields, "…": "own value" });
+    const keys = approvals[1]!.input as Record<string, unknown>;
+    expect(Object.keys(keys)).toHaveLength(52); // the leading notice, 50 fields and the omitted-fields mark
+    expect(Object.keys(keys)[0]).toBe("⚠");
+    expect(Object.values(keys).at(-1)).toBe("[11 more fields not shown]");
+
+    await toolCall(pi, "custom", { rows: Array.from({ length: 50 }, () => Array.from({ length: 50 }, () => "y".repeat(400))) });
+    const preview = approvals[2]!.input as { preview: string; notice: string };
+    expect(preview.preview.length).toBe(8000);
+    expect(preview.notice).toMatch(/too large to show in full \(\d+ bytes\); only its beginning is shown/);
+
+    // The incomplete-preview notice leads every shortened preview, ahead of the bulk it shortens.
+    for (const approval of approvals.slice(0, 3)) {
+      const head = JSON.stringify(approval.input).slice(0, 200);
+      expect(head).toContain("preview is shortened");
+    }
+    expect(Object.keys(preview)[0]).toBe("notice");
+
+    const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
+    await toolCall(pi, "custom", cyclic);
+    expect(approvals[3]).toMatchObject({ input: { notice: "The tool input cannot be shown." }, inputTruncated: true });
   });
 });
 

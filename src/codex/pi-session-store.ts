@@ -324,9 +324,17 @@ export class PiSessionStore {
   /** Single flight: concurrent first uses must share one in-memory state, or the later load would drop the earlier update. */
   private load(): Promise<PiStateFile> {
     if (this.state) return Promise.resolve(this.state);
-    this.loading ??= (async () => {
+    if (this.loading) return this.loading;
+    const loading = (async () => {
+      let text: string | undefined;
+      try { text = await readFile(this.statePath, "utf8"); }
+      catch (error) {
+        // A first run has no state file. A read failure is not an empty state:
+        // allowing a subsequent save would erase settings we could not read.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
       let parsed: Partial<PiStateFile> | undefined;
-      try { parsed = JSON.parse(await readFile(this.statePath, "utf8")) as Partial<PiStateFile>; } catch { /* missing or unreadable: start empty */ }
+      try { parsed = text === undefined ? undefined : JSON.parse(text) as Partial<PiStateFile>; } catch { /* retain recovery of readable, malformed JSON */ }
       const object = (value: unknown) => (value && typeof value === "object" && !Array.isArray(value) ? value : {}) as Record<string, never>;
       const scope = Array.isArray(parsed?.scopedModels) ? parsed.scopedModels.filter((item): item is string => typeof item === "string" && item.length > 0 && item.length <= 512).slice(0, 200) : [];
       // The additive per-field fingerprints are optional. Malformed values revert to the legacy
@@ -342,7 +350,10 @@ export class PiSessionStore {
       this.state = { version: 1, sessions, trust: { ...object(parsed?.trust) }, ...(scope.length ? { scopedModels: scope } : {}) };
       return this.state;
     })();
-    return this.loading;
+    this.loading = loading;
+    // A temporary I/O error must not poison this store for its entire lifetime.
+    void loading.catch(() => { if (this.loading === loading) this.loading = undefined; });
+    return loading;
   }
 
   private save(): Promise<void> {
