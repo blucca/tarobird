@@ -57,10 +57,12 @@ for await(const line of createInterface({input:process.stdin})){
  const input=JSON.parse(line),group=clients.get(input.id);
  if(input.action==='register'){joins.set(input.join.session.id,input.join);console.log('{}');}
  else if(input.action==='frame'){
-  const b=Buffer.alloc(input.size??300032,97);b[0]=1;b[1]=1;b.writeUInt16LE(1,2);b.writeUInt32LE(input.sequence??1,4);b.writeUInt32LE(1,8);b.writeUInt32LE(1,12);b.writeDoubleLE(Date.now(),16);b.writeUInt16LE(64,24);b.writeUInt16LE(64,26);b.writeUInt32LE(b.length-32,28);if(input.malformed)b[0]=2;group.media.send(b);console.log('{}');
+  const b=Buffer.alloc(input.size??300032,97);b[0]=1;b[1]=1;b.writeUInt16LE(1,2);b.writeUInt32LE(input.sequence??1,4);b.writeUInt32LE(1,8);b.writeUInt32LE(input.generation??1,12);b.writeDoubleLE(Date.now(),16);b.writeUInt16LE(64,24);b.writeUInt16LE(64,26);b.writeUInt32LE(b.length-32,28);if(input.malformed)b[0]=2;group.media.send(b);console.log('{}');
  } else if(input.action==='json-burst'){for(let n=0;n<input.count;n++)group.control.send(JSON.stringify({type:'frame-ready',sessionId:input.id,generation:joins.get(input.id).session.generation,streamGeneration:1,frameSequence:n+1,expiresAt:Date.now()+1000}));console.log('{}');}
  else if(input.action==='control-state'){const session={...joins.get(input.id).session,state:input.active?'controlling':'viewing'};group.control.send(JSON.stringify({type:'state',session,serverTime:Date.now(),...(input.active?{lease:{id:'L'.repeat(43),challenge:'C'.repeat(43),expiresAt:Date.now()+6000,challengeExpiresAt:Date.now()+6000}}:{})}));console.log('{}');}
  else if(input.action==='message'){group[input.role??'control'].send(JSON.stringify(input.value));console.log('{}');}
+ // A stream restart (start control, keyframe, resume): the next generation's config on media.
+ else if(input.action==='stream'){group.media.send(JSON.stringify({...stream,streamGeneration:input.generation}));console.log('{}');}
  else if(input.action==='ping'){for(const role of input.roles)group[role].ping();console.log('{}');}
  else if(input.action==='close-media'){group.media.terminate();console.log('{}');}
  else if(input.action==='close-host'){if(!input.role){group.control.send(JSON.stringify({type:'state',session:{...joins.get(input.id).session,state:'closed',reason:input.reason},serverTime:Date.now()}));for(const ws of Object.values(group))ws.close(input.code,input.reason);}else group[input.role].close(input.code,input.reason);console.log('{}');}

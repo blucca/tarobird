@@ -42,6 +42,33 @@ public final class NativeScreenAudit {
         long end=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);while(true){JSONArray open=request(new JSONObject().put("action","stats")).getJSONArray("open");boolean found=false;for(int i=0;i<open.length();i++)if(sid.equals(open.getJSONObject(i).getString("id")))found=true;if(!found)return;if(System.nanoTime()>end)throw new Exception("peer remained open");Thread.sleep(10);}
     }
     static JSONObject command(JSONObject join,String type) throws Exception {return new JSONObject().put("type",type).put("sessionId",join.getJSONObject("session").getString("id")).put("generation",join.getJSONObject("session").getString("generation"));}
+    static void frame(JSONObject join,long generation,int sequence) throws Exception {request(new JSONObject().put("action","frame").put("id",join.getJSONObject("session").getString("id")).put("sequence",sequence).put("generation",generation).put("size",4096));}
+    /** The next `binaries` binary deliveries of `id` in order, or stops at its close (then the last entry is that close). Bounded. */
+    static List<JSONObject> deliveries(String id,int binaries) throws Exception {
+        List<JSONObject> found=new ArrayList<>();long end=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);int count=0;
+        synchronized(events){while(count<binaries){JSONObject next=null;for(int i=0;i<events.size();i++){JSONObject e=events.get(i);if(id.equals(e.optString("id"))&&("binary".equals(e.optString("kind"))||"close".equals(e.optString("kind")))){next=events.remove(i);break;}}
+            if(next!=null){found.add(next);if("close".equals(next.getString("kind")))return found;count++;continue;}long left=end-System.nanoTime();if(left<=0)throw new Exception("binary timeout");TimeUnit.NANOSECONDS.timedWait(events,left);}}
+        return found;
+    }
+    static void consume(String id,JSONObject binary) throws Exception {long n=binary.getLong("deliverySequence");int total=0;while(total<binary.getInt("byteLength"))total+=transport.screenRead(id,n,total,262144).length;transport.screenAck(id,n);}
+    static JSONObject restart(JSONObject join,String id,long generation) throws Exception {request(new JSONObject().put("action","stream").put("id",join.getJSONObject("session").getString("id")).put("generation",generation));JSONObject config=event(id,"screen");transport.screenAck(id,config.getLong("deliverySequence"));return config;}
+    /** A-5. The target's three-frame credit window belongs to one stream generation: a restart
+     * (start control, keyframe request, resume) retires it and the next generation may send three
+     * at once, while the page may still be reading packets of the old one. Packets of the current
+     * generation stay bounded at three and all retained packets at six. */
+    static void streamRestart() throws Exception {
+        JSONObject join=join(true);String id=open(join),sid=join.getJSONObject("session").getString("id");
+        frame(join,1,1);List<JSONObject> old=deliveries(id,1);
+        JSONObject config=restart(join,id,2);check(config.getJSONObject("value").getLong("streamGeneration")==2,"restartConfigDelivered");
+        for(int i=1;i<=3;i++)frame(join,2,i);List<JSONObject> fresh=deliveries(id,3);
+        check(fresh.size()==3&&!"close".equals(fresh.get(2).getString("kind")),"restartWindowAdmittedBehindUnreadPacket");
+        consume(id,old.get(0));for(JSONObject binary:fresh)consume(id,binary);check(transport.screenCurrent(id),"restartedSessionStaysOpen");
+        for(int i=4;i<=6;i++)frame(join,2,i);List<JSONObject> window=deliveries(id,3);check(window.size()==3,"generationWindowRefills");
+        frame(join,2,7);check("screen_viewer_congested".equals(deliveries(id,1).get(0).optString("reason")),"generationWindowStillBounded");closedOnPeer(sid);
+        JSONObject chain=join(true);String chainId=open(chain),chainSid=chain.getJSONObject("session").getString("id");
+        for(int i=1;i<=3;i++)frame(chain,1,i);deliveries(chainId,3);restart(chain,chainId,2);for(int i=1;i<=3;i++)frame(chain,2,i);deliveries(chainId,3);
+        restart(chain,chainId,3);frame(chain,3,1);check("screen_viewer_congested".equals(deliveries(chainId,1).get(0).optString("reason")),"retainedPacketsStillBounded");closedOnPeer(chainSid);
+    }
     static void frame(JSONObject join,int sequence,boolean malformed) throws Exception {request(new JSONObject().put("action","frame").put("id",join.getJSONObject("session").getString("id")).put("sequence",sequence).put("malformed",malformed));}
     /** Readers parked on the transport monitor inside HubSocket.onWebsocketPing (its activity report). */
     static List<ThreadInfo> parkedPings() {
@@ -148,6 +175,7 @@ public final class NativeScreenAudit {
             reject(()->transport.screenSend(controlId,renew),"renewRequiresFocus");transport.screenSend(controlId,command(controlling,"input-focus").put("enabled",true));transport.screenSend(controlId,renew);
             transport.screenSend(controlId,command(controlling,"input-focus").put("enabled",false));reject(()->transport.screenSend(controlId,renew),"blurRejectsQueuedRenew");transport.screenClose(controlId);event(controlId,"close");closedOnPeer(controlling.getJSONObject("session").getString("id"));
             pingDuringSend();
+            streamRestart();
             JSONObject bound=join(false);String bounded=open(bound);for(int i=1;i<=4;i++)frame(bound,i,false);event(bounded,"close");closedOnPeer(bound.getJSONObject("session").getString("id"));check(true,"fourthPacketClosesBoth");
             JSONObject expiry=join(false);String expired=open(expiry);frame(expiry,1,false);event(expired,"binary");event(expired,"close");closedOnPeer(expiry.getJSONObject("session").getString("id"));check(true,"unackedPacketExpiresAndClosesBoth");
             JSONObject json=join(false);String jsonId=open(json);request(new JSONObject().put("action","json-burst").put("id",json.getJSONObject("session").getString("id")).put("count",9));event(jsonId,"close");closedOnPeer(json.getJSONObject("session").getString("id"));check(true,"jsonQueueBounded");

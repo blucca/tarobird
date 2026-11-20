@@ -16,15 +16,21 @@ import org.json.JSONObject;
 
 /** One document-owned, viewer-only pair of pinned sockets. All mutable state
  * uses the owning transport monitor, including callbacks and lifecycle gates.
- * No binary data enters the Capacitor event queue: at most three native packets
- * are retained until strict sequential pulls and an explicit consumption ACK. */
+ * No binary data enters the Capacitor event queue: native packets are retained
+ * only until strict sequential pulls and an explicit consumption ACK, at most
+ * BINARY_WINDOW of the current stream generation and BINARY_RETAINED in all. */
 final class HubScreenSession {
     static final int PACKET_LIMIT=1024*1024, READ_LIMIT=256*1024, CONTROL_LIMIT=16384;
     static final long ACK_NANOS=TimeUnit.SECONDS.toNanos(2);
+    /** The target's encoder credits: three frames per stream generation. A restart
+     * (start control, keyframe, resume) retires them and the next generation may send
+     * three at once while the page still reads the old one's, so superseded packets
+     * count only against the total: one current window plus one superseded window. */
+    static final int BINARY_WINDOW=3, BINARY_RETAINED=2*BINARY_WINDOW;
     interface Events { void send(JSONObject event) throws Exception; void closed(); }
     private static final class Delivery {
-        final byte[] bytes; final int size; final long sent=System.nanoTime(); int offset;
-        Delivery(byte[] bytes,int size) { this.bytes=bytes; this.size=size; }
+        final byte[] bytes; final int size; final long generation, sent=System.nanoTime(); int offset;
+        Delivery(byte[] bytes,int size,long generation) { this.bytes=bytes; this.size=size; this.generation=generation; }
     }
     private final Object owner;
     private final BooleanSupplier active;
@@ -179,7 +185,7 @@ final class HubScreenSession {
     /** Queues one JSON delivery for the page; false when the bound closed the session. */
     private boolean deliver(JSONObject value,int size) throws Exception {
         if(jsonCount>=8 || jsonBytes+size>65536) { close("screen_viewer_congested"); return false; }
-        Delivery delivery=new Delivery(null,size); long receipt=++sequence; deliveries.put(receipt,delivery); jsonCount++; jsonBytes+=size;
+        Delivery delivery=new Delivery(null,size,0); long receipt=++sequence; deliveries.put(receipt,delivery); jsonCount++; jsonBytes+=size;
         emit(new JSONObject().put("kind","screen").put("deliverySequence",receipt).put("value",value));
         return true;
     }
@@ -188,9 +194,10 @@ final class HubScreenSession {
         ByteBuffer data=raw.slice().order(ByteOrder.LITTLE_ENDIAN);
         int key=data.get(1)&255; long frame=(data.getInt(4)&0xffffffffL); double capture=data.getDouble(16);
         if(data.get(0)!=1||key>1||(data.getShort(2)&65535)!=codec||(data.getInt(8)&0xffffffffL)!=geometryRevision||(data.getInt(12)&0xffffffffL)!=streamGeneration||data.getInt(28)!=length-32||!Double.isFinite(capture)||capture<0||capture>9007199254740991d||capture!=Math.floor(capture)||(data.getShort(24)&65535)!=width||(data.getShort(26)&65535)!=height||frame<=lastFrame||lastFrame==0&&key!=1) throw invalid();
-        if(binaryCount>=3) { close("screen_viewer_congested"); return; }
+        int current=0; for(Delivery value:deliveries.values()) if(value.bytes!=null&&value.generation==streamGeneration) current++;
+        if(current>=BINARY_WINDOW||binaryCount>=BINARY_RETAINED) { close("screen_viewer_congested"); return; }
         byte[] bytes=new byte[length]; data.get(bytes); lastFrame=frame;
-        long receipt=++sequence; deliveries.put(receipt,new Delivery(bytes,length)); binaryCount++;
+        long receipt=++sequence; deliveries.put(receipt,new Delivery(bytes,length,streamGeneration)); binaryCount++;
         emit(new JSONObject().put("kind","binary").put("deliverySequence",receipt).put("byteLength",length));
     }
     byte[] read(long receipt,int offset,int maxBytes) throws Exception { synchronized(owner) {

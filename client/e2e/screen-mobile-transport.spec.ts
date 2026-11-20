@@ -168,3 +168,27 @@ test("an open rejected after native already ended the session reports that sessi
   await expect(opened).rejects.toThrow("screen_permission_revoked");
   expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_permission_revoked" }]);
 });
+
+// A-5. The target's three-frame credit window belongs to one stream generation. A restart
+// (start control, keyframe, resume) retires it and the next generation may send three packets
+// at once while the page is still reading the old generation's.
+const streamConfig = (streamGeneration: number) => ({ type: "stream", streamGeneration, geometryRevision: 1, codec: "h264", codecString: "avc1.42c01e", width: 1280, height: 720, contentRect: { x: 0, y: 0, width: 1280, height: 720 } });
+function restarts(f: ReturnType<typeof fixture>) {
+  let delivery = 0;
+  return { binary: () => f.event({ kind: "binary", deliverySequence: ++delivery, byteLength: f.options.bytes.byteLength }),
+    stream: (generation: number) => f.event({ kind: "screen", deliverySequence: ++delivery, value: streamConfig(generation) }) };
+}
+test("a stream restart admits the new generation's window behind a packet the page is still reading", async () => {
+  const f = fixture(); f.options.read = new Promise(() => {}); await f.open(); const s = restarts(f);
+  s.binary(); s.stream(2); for (let i = 0; i < 3; i++) s.binary(); await tick();
+  expect(closes(f.values)).toEqual([]); expect(f.calls.filter(value => value.name === "net_screen_close")).toHaveLength(0);
+  // The new generation's own window is still three.
+  s.binary(); expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_congested" }]);
+});
+
+test("packets of superseded generations still count against a bounded total", async () => {
+  const f = fixture(); f.options.read = new Promise(() => {}); await f.open(); const s = restarts(f);
+  for (let i = 0; i < 3; i++) s.binary(); s.stream(2); for (let i = 0; i < 3; i++) s.binary(); await tick();
+  expect(closes(f.values)).toEqual([]);
+  s.stream(3); s.binary(); expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_congested" }]);
+});

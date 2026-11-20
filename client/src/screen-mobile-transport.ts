@@ -18,6 +18,9 @@ const NATIVE_SESSION_ENDED: ReadonlyMap<string, string> = new Map([
 ]);
 export const SCREEN_NATIVE_CLOSE_GRACE_MS = 1000;
 const CONTROL_BYTES = 16 * 1024, JSON_BYTES = 64 * 1024;
+/** Native's packet bound: the target's three encoder credits per stream generation;
+ * packets of a superseded generation still being read count only in the total. */
+const BINARY_WINDOW = 3, BINARY_RETAINED = 2 * BINARY_WINDOW;
 const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
 /** Bounded, document-owned adapter. It never opens a WebView socket, obtains a
@@ -27,8 +30,10 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
     let allocation: ScreenAllocation | undefined, closed = false, opening = false, focused = false, focusGeneration = 0;
     let receive: ((value: unknown) => void) | undefined, terminal: string | undefined, ending: ReturnType<typeof setTimeout> | undefined;
     let sequence = 0, jsonCount = 0, jsonBytes = 0, binaryCount = 0, binaryBytes = 0, commands = 0, commandBytes = 0;
+    // Stream configs counted as they arrive: native delivers each before its generation's packets.
+    let streams = 0, streamBinaries = 0;
     let incoming = Promise.resolve(), outgoing = Promise.resolve();
-    const receipts = new Map<number, { deliverySequence: number; bytes: number }>();
+    const receipts = new Map<number, { deliverySequence: number; bytes: number; stream: number }>();
     const close = (reason?: string) => {
       if (closed) return;
       closed = true; focused = false; receipts.clear(); clearTimeout(ending);
@@ -58,7 +63,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
             const receipt = receipts.get(message.sequence as number);
             if (!receipt) throw new Error("screen_protocol_invalid");
             receipts.delete(message.sequence as number);
-            void ack(receipt.deliverySequence).then(() => { binaryCount--; binaryBytes -= receipt.bytes; }, fail);
+            void ack(receipt.deliverySequence).then(() => { binaryCount--; binaryBytes -= receipt.bytes; if (receipt.stream === streams) streamBinaries--; }, fail);
             return;
           }
           if (message.sessionId !== join.session.id || message.generation !== join.session.generation) throw new Error("screen_session_changed");
@@ -91,6 +96,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
           if (bytes > CONTROL_BYTES || ++jsonCount > 8 || (jsonBytes += bytes) > JSON_BYTES) throw new Error("screen_congested");
           const data = (value.value as { type?: unknown })?.type === "stream" ? screenStreamSchema.parse(value.value) : screenViewerEventSchema.parse(value.value);
           if ("sessionId" in data && data.sessionId !== join.session.id || "session" in data && (data.session.id !== join.session.id || data.session.generation !== join.session.generation) || "generation" in data && data.generation !== join.session.generation) throw new Error("screen_session_changed");
+          if (data.type === "stream") { streams++; streamBinaries = 0; }
           incoming = incoming.then(async () => {
             if (closed) return;
             if (!receive) throw new Error("screen_protocol_invalid");
@@ -98,7 +104,9 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
           }).catch(fail).finally(() => { jsonCount--; jsonBytes -= bytes; });
         } else if (value.kind === "binary") {
           const bytes = value.byteLength as number;
-          if (!Number.isSafeInteger(bytes) || bytes <= 32 || bytes > SCREEN_PACKET_LIMIT || ++binaryCount > 3 || (binaryBytes += bytes) > 3 * SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
+          if (!Number.isSafeInteger(bytes) || bytes <= 32 || bytes > SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
+          if (++streamBinaries > BINARY_WINDOW || ++binaryCount > BINARY_RETAINED || (binaryBytes += bytes) > BINARY_RETAINED * SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
+          const stream = streams;
           incoming = incoming.then(async () => {
             if (!live()) return;
             const buffer = new Uint8Array(bytes);
@@ -111,7 +119,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
             }
             const header = readScreenFrame(buffer);
             if (!receive || receipts.has(header.sequence)) throw new Error("screen_protocol_invalid");
-            receipts.set(header.sequence, { deliverySequence, bytes });
+            receipts.set(header.sequence, { deliverySequence, bytes, stream });
             receive(buffer.buffer);
           }).catch(fail);
         } else throw new Error("screen_protocol_invalid");

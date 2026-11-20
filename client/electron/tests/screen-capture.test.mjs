@@ -76,6 +76,18 @@ test('credits bound outstanding frames at 3; the newest frame waits (older ones 
   assert.equal(b.encoders[0].encodes.length, 4, 'cross-generation credit is ignored');
 });
 
+// The viewer's native packet bound (HubScreenSession BINARY_WINDOW/BINARY_RETAINED, page
+// transport) relies on this: the window is per generation, and a reset starts a fresh one
+// without any credit for packets of the old generation still on their way to the viewer.
+test('a reset grants the next generation a full credit window while the old one is unacknowledged', async () => {
+  const b = browser(); await start(b); await tick();
+  for (let i = 0; i < CAPTURE_CREDITS; i++) { b.advance(100); b.push(b.frame()); await tick(); b.encoders[0].emit(i ? 'delta' : 'key'); }
+  await b.core.handle({ type: 'reset', sessionId: 's1', streamGeneration: 2, geometryRevision: 1 });
+  for (let i = 0; i < CAPTURE_CREDITS + 1; i++) { b.advance(100); b.push(b.frame()); await tick(); if (b.encoders[1].encodes.length > i) b.encoders[1].emit(i ? 'delta' : 'key'); }
+  assert.deepEqual(frames(b).map(f => readScreenFrame(f.bytes).streamGeneration), [1, 1, 1, 2, 2, 2], 'no credit returned between any of the six');
+  assert.equal(b.encoders[1].encodes.length, CAPTURE_CREDITS, 'the new generation is still bounded at its own window');
+});
+
 test('pause drops the held raw frame; resume never encodes a frame captured before the pause', async () => {
   const b = browser(); await start(b); await tick();
   for (let i = 0; i < 4; i++) { b.advance(100); b.push(b.frame()); await tick(); }
