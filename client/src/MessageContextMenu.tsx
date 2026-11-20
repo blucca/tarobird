@@ -1,18 +1,28 @@
 import { useEffect, useLayoutEffect, useId, useRef, useState, type RefObject } from "react";
-import { Copy, Forward, MessageSquare, TextSelect, ListChecks, Trash2 } from "lucide-react";
+import { Copy, Forward, GitBranch, MessageSquare, TextSelect, ListChecks, Trash2, Undo2 } from "lucide-react";
 import { blocksText, type Message } from "../../src/client-protocol/index.js";
 import { DesktopMenu } from "./DesktopMenu.js";
 import { t, useLocale } from "./i18n.js";
 import { messageSelectionCopy, type MessageSelectionCopy } from "./message-selection-clipboard.js";
 
+export type MessageContextHistoryActions = {
+  showForkTurn: boolean;
+  showRewind: boolean;
+  disabled: boolean;
+  blockedReason?: string;
+  fork: (message: Message, trigger: HTMLElement | null) => void;
+  rewind: (message: Message, trigger: HTMLElement | null) => void;
+};
+
 type Target = { scope: string; id: string; point: { x: number; y: number }; selection?: MessageSelectionCopy };
 /** Delegated desktop actions, keyed to the live message rather than a recycled
  * virtual row. Phone long-press and editable-field menus retain their owners. */
-export function MessageContextMenu({ root, scope, enabled, messages, quoteBlocked, quote, forward, copy, opened, select, remove, deletionAvailable }: {
+export function MessageContextMenu({ root, scope, enabled, messages, quoteBlocked, quote, forward, copy, opened, select, remove, deletionAvailable, history }: {
   root: RefObject<HTMLElement | null>; scope: string; enabled: boolean; messages: Message[]; quoteBlocked: boolean;
   quote: (message: Message) => void; forward: (message: Message, trigger: HTMLElement | null) => void;
   copy: (text: string, html?: string) => void; opened: () => void;
   select: (message: Message, trigger: HTMLElement | null) => void; remove: (message: Message, trigger: HTMLElement | null) => void; deletionAvailable: boolean;
+  history?: (message: Message) => MessageContextHistoryActions;
 }) {
   useLocale();
   const id = useId(), trigger = useRef<HTMLElement | null>(null);
@@ -62,12 +72,21 @@ export function MessageContextMenu({ root, scope, enabled, messages, quoteBlocke
   if (!target || !message) return null;
   const forwardReady = ["complete", "error"].includes(message.status);
   const copyText = (text: string, html?: string) => { trigger.current?.focus({ preventScroll: true }); copy(text, html); };
+  const historyMenu = history?.(message);
+  const showHistoryGroup = !!historyMenu && (historyMenu.showForkTurn || historyMenu.showRewind);
+  const historyNoteId = showHistoryGroup && historyMenu.disabled && historyMenu.blockedReason ? `${id}-history-blocked` : undefined;
   return <DesktopMenu id={id} label={t("消息操作")} open point={target.point} placement="down-start" trigger={trigger} close={() => setTarget(undefined)} restoreFocusOnSelect={false}>
     <button type="button" role="menuitem" disabled={quoteBlocked} title={quoteBlocked ? t("对话已归档，恢复后可引用") : undefined} onClick={() => quote(message)}><MessageSquare size={16}/>{t("回复")}</button>
     <button type="button" role="menuitem" disabled={!forwardReady} title={!forwardReady ? t("生成完成后可转发") : undefined} onClick={() => { trigger.current?.focus({ preventScroll: true }); forward(message, trigger.current); }}><Forward size={16}/>{t("转发")}</button>
     <hr/>
     <button type="button" role="menuitem" onClick={() => copyText(blocksText(message.blocks))}><Copy size={16}/>{t("复制消息")}</button>
     {target.selection && <button type="button" role="menuitem" onClick={() => copyText(target.selection!.text, target.selection!.html)}><TextSelect size={16}/>{t("复制所选文本")}</button>}
+    {showHistoryGroup && <>
+      <hr/>
+      {historyMenu.showForkTurn && <button type="button" role="menuitem" disabled={historyMenu.disabled} title={historyMenu.disabled ? historyMenu.blockedReason : undefined} aria-describedby={historyNoteId} onClick={() => historyMenu.fork(message, trigger.current)}><GitBranch size={16}/>{t("从这一轮分叉")}</button>}
+      {historyMenu.showRewind && <button type="button" role="menuitem" className="text-danger" disabled={historyMenu.disabled} title={historyMenu.disabled ? historyMenu.blockedReason : undefined} aria-describedby={historyNoteId} onClick={() => historyMenu.rewind(message, trigger.current)}><Undo2 size={16}/>{t("回退到这条之前")}</button>}
+      {historyNoteId && <p id={historyNoteId} className="desktop-menu-note">{historyMenu.blockedReason}</p>}
+    </>}
     <hr/>
     <button type="button" role="menuitem" disabled={!deletionAvailable} aria-describedby={!deletionAvailable ? `${id}-deletion-unavailable` : undefined} title={!deletionAvailable ? t("请更新主机后使用消息删除。") : undefined} onClick={() => select(message, trigger.current)}><ListChecks size={16}/>{t("多选消息")}</button>
     <button type="button" role="menuitem" className="message-delete-action text-danger" disabled={!deletionAvailable} aria-describedby={!deletionAvailable ? `${id}-deletion-unavailable` : undefined} title={!deletionAvailable ? t("请更新主机后使用消息删除。") : undefined} onClick={() => remove(message, trigger.current)}><Trash2 size={16}/>{t("删除消息")}</button>

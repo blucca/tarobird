@@ -35,7 +35,7 @@ const views = new Map<string, View>(); // UI position only; never retain raw log
 function position(key: string): View { let value = views.get(key); if (!value) { value = { after: 0, history: [], query: "", expanded: new Set(), scroll: 0 }; views.set(key, value); } while (views.size > 64) views.delete(views.keys().next().value!); return value; }
 const activePhase = (phase: RunSummary["phase"]) => !["done", "partial", "error", "stopped", "interrupted"].includes(phase);
 
-export function RunPresentation({ run, block, message, connection, backgroundSource, compact = false, compactReturnFocus }: { compactReturnFocus?: React.RefObject<HTMLButtonElement | null>; compact?: boolean; run: RunSummary; block: Extract<Block, { type: "card" }>; message: Message; connection: HubConnection; backgroundSource?: BackgroundSource }) {
+export function RunPresentation({ run, block, message, connection, backgroundSource, compact = false, compactReturnFocus, rewound = false }: { compactReturnFocus?: React.RefObject<HTMLButtonElement | null>; compact?: boolean; run: RunSummary; block: Extract<Block, { type: "card" }>; message: Message; connection: HubConnection; backgroundSource?: BackgroundSource; rewound?: boolean }) {
   const requestStop = useContext(TurnStopContext);
   useLocale(); const hostActive = useContext(RuntimeHostActiveContext);
   const state = useConnectionSelection(connection, value => ({
@@ -92,7 +92,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
   const waiting = active && stopState === "waiting";
   const phase = interrupted ? "interrupted" : waiting ? "stopping" : run.phase;
   const [now, setNow] = useState(Date.now);
-  const ticking = active && !disconnected && !interrupted && !scopeUnsupported && hostActive;
+  const ticking = !rewound && active && !disconnected && !interrupted && !scopeUnsupported && hostActive;
   useEffect(() => {
     setNow(Date.now());
     if (!ticking) return;
@@ -141,7 +141,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
   const phaseLabel = notice?.delivery === "unconfirmed" ? t("交付未确认") : scopeUnsupported && active ? t("最后状态待确认") : disconnected ? t("连接中断，当前状态待确认") : active && run.current && phase === "working" ? runEntryTitle(run.current) : phase === "done" && backgroundNote ? t("本轮已回复") : scoped && phase === "partial" ? t("最终状态未确认") : goalTurnEnded ? t("本轮已结束") : runPhaseLabel(phase);
   const readers = <>
     {opened?.key === key && opened.kind === "report" && hostActive && createPortal(<RunReport key={key} status={phaseLabel} block={block} message={message} source={backgroundSource} returnFocus={reportFocus} close={() => open(undefined)} process={scopeUnsupported ? undefined : () => open({ key, kind: "process" })}/>, document.body)}
-    {opened?.key === key && opened.kind === "process" && hostActive && !scopeUnsupported && createPortal(<RunDetails key={key} goalTurnEnded={goalTurnEnded} scoped={scoped} run={run} phase={phase} observedNow={observedNow} sync={sync} connection={connection} message={message} view={position(key)} returnFocus={detailFocus} close={() => open(undefined)} report={compact ? () => open({ key, kind: "report" }) : undefined}/>, document.body)}
+    {opened?.key === key && opened.kind === "process" && hostActive && !scopeUnsupported && createPortal(<RunDetails key={key} goalTurnEnded={goalTurnEnded} scoped={scoped} rewound={rewound} run={run} phase={phase} observedNow={observedNow} sync={sync} connection={connection} message={message} view={position(key)} returnFocus={detailFocus} close={() => open(undefined)} report={compact ? () => open({ key, kind: "report" }) : undefined}/>, document.body)}
   </>;
   if (compact && scoped) return <>
     <button type="button" ref={trigger} className="background-task-row" data-phase={phase}
@@ -180,14 +180,14 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
     {backgroundNote && <p className="run-notice">{backgroundNote}</p>}
     <div className="native-run-actions">{scoped && !inlineScopedReply && reportPreview.needsReader && <button type="button" ref={reportTrigger} className="run-report-trigger" onClick={() => open({ key, kind: "report" })}>{t("查看完整回复")}</button>}{!scopeUnsupported && <button ref={trigger} className="run-process-trigger" onClick={() => open({ key, kind: "process" })} aria-label={t("查看运行过程")}><ChevronRight size={14}/><span>{run.count ? t("过程 · {0} 个动作", run.count) : t("查看运行过程")}</span></button>}
       {!scoped && <DiffViewerTrigger connection={connection} message={message}/>}
-      {!scoped && active && !interrupted && <button className="run-stop" disabled={disconnected || waiting} onClick={() => void stop()}><CircleStop size={14}/>{waiting ? t("等待停止确认") : waitingForBackground || waitingForNativeInput ? t("取消等待") : t("停止")}</button>}
+      {!scoped && !rewound && active && !interrupted && <button className="run-stop" disabled={disconnected || waiting} onClick={() => void stop()}><CircleStop size={14}/>{waiting ? t("等待停止确认") : waitingForBackground || waitingForNativeInput ? t("取消等待") : t("停止")}</button>}
     </div>{error && <p role="alert">{error}</p>}
-    {!scoped && active && !interrupted && !disconnected && stopState === "unconfirmed" && <p className="run-notice" role="status">{t("尚未收到停止确认。请核对运行状态，需要时可再次停止。")}</p>}
+    {!scoped && !rewound && active && !interrupted && !disconnected && stopState === "unconfirmed" && <p className="run-notice" role="status">{t("尚未收到停止确认。请核对运行状态，需要时可再次停止。")}</p>}
     {readers}
   </section>;
 }
 
-function RunDetails({ goalTurnEnded, scoped, run, phase, observedNow, sync, message, connection, view, close, returnFocus, report }: { goalTurnEnded?: boolean; report?: () => void; scoped: boolean; run: RunSummary; phase: RunSummary["phase"]; observedNow: number; sync?: ScopedJournal; message: Message; connection: HubConnection; view: View; close: () => void; returnFocus: React.RefObject<HTMLButtonElement | null> }) {
+function RunDetails({ goalTurnEnded, scoped, rewound = false, run, phase, observedNow, sync, message, connection, view, close, returnFocus, report }: { goalTurnEnded?: boolean; report?: () => void; scoped: boolean; rewound?: boolean; run: RunSummary; phase: RunSummary["phase"]; observedNow: number; sync?: ScopedJournal; message: Message; connection: HubConnection; view: View; close: () => void; returnFocus: React.RefObject<HTMLButtonElement | null> }) {
   const locale = useLocale(); const [after, setAfter] = useState(view.after), [query, setQuery] = useState(view.query), [search, setSearch] = useState(view.query);
   const [before, setBefore] = useState(view.before), [tail, setTail] = useState(!!view.tail);
   const [page, setPage] = useState<RunPage>(), [error, setError] = useState(""), [busy, setBusy] = useState(false), [exporting, setExporting] = useState(false), [notice, setNotice] = useState("");
@@ -207,7 +207,7 @@ function RunDetails({ goalTurnEnded, scoped, run, phase, observedNow, sync, mess
   const latestRun = useRef(run); latestRun.current = run;
   const trailingAttempt = useRef({ runId: run.id, revision: -1 });
   if (trailingAttempt.current.runId !== run.id) trailingAttempt.current = { runId: run.id, revision: -1 };
-  const liveDetails = useRef(activePhase(run.phase)); liveDetails.current = activePhase(run.phase) && message.status !== "error";
+  const liveDetails = useRef(!rewound && activePhase(run.phase)); liveDetails.current = !rewound && activePhase(run.phase) && message.status !== "error";
   const terminalPollUntil = useRef(0);
   const refreshDetails = useRef<(() => void) | undefined>(undefined);
   const connectionState = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);

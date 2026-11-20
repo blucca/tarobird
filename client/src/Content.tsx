@@ -13,6 +13,7 @@ import { RunPresentation } from "./RunPresentation.js";
 import { QueueNotice } from "./QueueNotice.js";
 import { queueNotice } from "../../src/client-protocol/queue-notice.js";
 import { anyRun } from "../../src/client-protocol/run.js";
+import { upstreamRejectionSchema } from "../../src/client-protocol/history.js";
 import { AttachmentPreviewHeader } from "./AttachmentPreviewHeader.js";
 import { AttachmentImage } from "./AttachmentImage.js";
 import { remembersSavedAttachments, restoreSavedAttachment, savedAttachmentKey } from "./android-saved-attachment.js";
@@ -262,22 +263,22 @@ export function AttachmentFile({ connection, block, list = false }: { connection
     {saveButton}{!preview && status()}
   </>}</section>{preview && active && (preview.kind === "image" ? <LocalImagePreview blob={preview.blob} name={block.name} close={close} saving={busy} save={action => { void run(action); }} feedbackKey={phase.kind === "idle" ? saved?.path : fileStatusText(phase)} feedback={phase.kind !== "idle" || saved ? status("file-preview-status") : undefined}/> : createPortal(<dialog ref={panel} className="lightbox file-preview-lightbox" aria-label={t("文件预览")} onCancel={(event) => { event.preventDefault(); event.stopPropagation(); close(); }} onPointerDown={(event) => { backdropPress.current = event.isPrimary && event.target === event.currentTarget; }} onPointerUp={(event) => { if (event.target !== event.currentTarget) backdropPress.current = false; }} onPointerCancel={() => { backdropPress.current = false; }} onClick={(event) => { if (backdropPress.current && event.target === event.currentTarget) close(); backdropPress.current = false; }}><section ref={previewBody} className={`file-preview${preview.kind === "video" ? " is-movable" : ""}`} onClick={(event) => event.stopPropagation()}><AttachmentPreviewHeader headerRef={previewHeader} name={block.name} mime={block.mime} busy={busy} save={() => { void run("save"); }} share={() => { void run("share"); }} external={() => { void run("external"); }} close={close}/>{status("file-preview-status")}{preview.kind === "audio" || preview.kind === "video" ? <MediaReader blob={preview.blob} kind={preview.kind} name={block.name} connection={connection} attachmentId={block.attachmentId}/> : preview.kind === "spreadsheet" ? <SpreadsheetReader blob={preview.blob}/> : preview.kind === "docx" ? <DocumentReader blob={preview.blob}/> : preview.kind === "markdown" ? <MarkdownReader text={preview.text} truncated={preview.truncated}/> : preview.kind === "text" ? <><pre>{preview.text}</pre>{preview.truncated && <p>{t("预览显示前 1 MB，另存为可查看完整文件。")}</p>}</> : preview.kind === "pdf" ? <PdfReader blob={preview.blob} name={block.name}/> : <p>{t("此文件不支持内置预览，请另存为后使用对应应用打开。")}</p>}</section></dialog>, document.body))}</>;
 }
-type ElementProps = { replyProse?: boolean; element: CardElement; connection: HubConnection; messageId: string; values: Record<string, Json>; change: (name: string, value: Json) => void; act: (element: CardElement, overrides?: Record<string, Json>) => Promise<boolean> };
-function Element({ element: e, connection, messageId, values, change, act, replyProse = false }: ElementProps) {
+type ElementProps = { replyProse?: boolean; rewound?: boolean; element: CardElement; connection: HubConnection; messageId: string; values: Record<string, Json>; change: (name: string, value: Json) => void; act: (element: CardElement, overrides?: Record<string, Json>) => Promise<boolean> };
+function Element({ element: e, connection, messageId, values, change, act, replyProse = false, rewound = false }: ElementProps) {
   useLocale();
   // Nested form/process content retains its own typography.
-  const children = e.children?.map((child, i) => <Element key={child.id ?? i} element={child} connection={connection} messageId={messageId} values={values} change={change} act={act}/>);
+  const children = e.children?.map((child, i) => <Element key={child.id ?? i} element={child} connection={connection} messageId={messageId} values={values} change={change} act={act} rewound={rewound}/>);
   const style = cardLayoutStyle(e);
   switch (e.type) {
     case "markdown": return <div className="card-text" style={style}><MarkdownText text={e.text ?? ""} reply={replyProse}/></div>;
     case "divider": return <hr style={style}/>;
     case "columns": return <div className="card-columns" style={style}>{children}</div>;
     case "column": return <div className="card-column" style={style}>{children}</div>;
-    case "buttonGroup": return <div className="button-group" style={style}>{children}</div>;
+    case "buttonGroup": return rewound ? null : <div className="button-group" style={style}>{children}</div>;
     case "collapsible": return <details className="card-collapse" open={e.open || undefined} style={style}><summary data-disclosure-icon><ChevronDown size={14} aria-hidden="true"/><MarkdownText text={e.text ?? t("详情")}/></summary><div className="collapse-body" style={{ rowGap: style.rowGap }}>{children}</div></details>;
     case "icon": return <span className="standard-icon" aria-hidden="true">{e.text?.includes("loading") ? <LoaderCircle size={16} className="spin"/> : <ChevronDown size={16}/>}</span>;
     case "image": return e.attachmentId ? <AttachmentImage connection={connection} id={e.attachmentId} title={e.text}/> : null;
-    case "button": return <button className={`card-button ${e.style ?? "default"}`} disabled={e.disabled} style={style} onClick={() => { if (e.confirm && !window.confirm(`${e.confirm.title}\n${e.confirm.text}`)) return; if (e.url && /^https?:\/\//i.test(e.url)) { window.open(e.url, "_blank", "noopener,noreferrer"); return; } act(e); }}>{e.text ?? t("确认")}</button>;
+    case "button": return rewound ? null : <button className={`card-button ${e.style ?? "default"}`} disabled={e.disabled} style={style} onClick={() => { if (e.confirm && !window.confirm(`${e.confirm.title}\n${e.confirm.text}`)) return; if (e.url && /^https?:\/\//i.test(e.url)) { window.open(e.url, "_blank", "noopener,noreferrer"); return; } act(e); }}>{e.text ?? t("确认")}</button>;
     case "form": { const data = nativeQuestionData(e); return data ? <QuestionForm key={questionDraftKey(messageId, data)} data={data} element={e} connection={connection} messageId={messageId} values={values} act={act}/> : <div className="card-form" style={style}>{children}</div>; }
     case "input": {
       // Unnamed inputs are keyed by actionId, as in defaults, validation and submit.
@@ -291,7 +292,7 @@ function Element({ element: e, connection, messageId, values, change, act, reply
     }
   }
 }
-function Card({ block, connection, message, backgroundSource, caption }: { caption?: string; backgroundSource?: BackgroundSource; block: Extract<Block, { type: "card" }>; connection: HubConnection; message: Message }) {
+function Card({ block, connection, message, backgroundSource, caption, rewound = false }: { caption?: string; backgroundSource?: BackgroundSource; block: Extract<Block, { type: "card" }>; connection: HubConnection; message: Message; rewound?: boolean }) {
   useLocale();
   const elements = voiceCardElements(block.elements);
   const transcript = voiceTranscriptElement(elements);
@@ -307,7 +308,7 @@ function Card({ block, connection, message, backgroundSource, caption }: { capti
     await connection.send({ v: 1, type: "interaction.submit", conversationId: message.conversationId, messageId: message.id, actionId: element.actionId ?? "", values: submitted, clientActionId: `action_${crypto.randomUUID()}` }); setError(""); return true;
   } catch (e: unknown) { setError(e instanceof Error ? e.message : t("提交失败")); return false; } };
   const queued = queueNotice(block, message);
-  if (queued) return <QueueNotice notice={queued} message={message} connection={connection} act={act} error={error} detail={block.elements[0]?.text}/>;
+  if (queued) return <QueueNotice notice={queued} message={message} connection={connection} act={act} error={error} detail={block.elements[0]?.text} rewound={rewound}/>;
   // The existing image batch constructor alternates caption markdown and images.
   // Recognize only that complete shape, so prose in ordinary cards keeps its layout.
   const images = galleryImages(elements);
@@ -324,10 +325,10 @@ function Card({ block, connection, message, backgroundSource, caption }: { capti
   const submittedAnswer = (block.summary === "已提交" || block.summary === "Submitted") && block.title === `✅ ${block.summary}`;
   return <section className={`rich-card template-${block.template ?? "default"}${reply || background ? " reply-card" : ""}`}>
     {block.title && !repeatedQuestionTitle && !(elements.length === 1 && elements[0]?.type === "markdown" && elements[0].text?.trim() === block.title.trim()) && <header className="card-header" style={submittedAnswer ? { fontSize: 12 } : undefined}>{block.title}</header>}
-    <div className="card-body" style={cardLayoutStyle({ type: "column", layout: block.layout })}>{caption?.trim() && <div className="card-text"><MarkdownText text={caption} reply={message.authorType === "bot"}/></div>}{images && images.length > 1 ? <div className="image-grid" aria-label={t("图片批次")}>{images.map((image, i) => <AttachmentImage key={`${image.id}:${i}`} connection={connection} id={image.id} title={image.title}/>)}</div> : elements.map((element, i) => background && element.id === "background_context" ? <BackgroundTaskReference key={element.id} notice={background} message={message} source={backgroundSource}/> : element === transcript ? <VoiceTranscript key={element.id ?? i} text={element.text ?? ""} style={cardLayoutStyle(element)}/> : <Element key={element.id ?? i} replyProse={message.authorType === "bot" && (!reply || i > 0)} element={element} connection={connection} messageId={message.id} values={values} change={(key, value) => setValues((old) => ({ ...old, [key]: value }))} act={act}/>)}{error && <p role="alert" className="error-text">{error}</p>}</div>
+    <div className="card-body" style={cardLayoutStyle({ type: "column", layout: block.layout })}>{caption?.trim() && <div className="card-text"><MarkdownText text={caption} reply={message.authorType === "bot"}/></div>}{images && images.length > 1 ? <div className="image-grid" aria-label={t("图片批次")}>{images.map((image, i) => <AttachmentImage key={`${image.id}:${i}`} connection={connection} id={image.id} title={image.title}/>)}</div> : elements.map((element, i) => background && element.id === "background_context" ? <BackgroundTaskReference key={element.id} notice={background} message={message} source={backgroundSource}/> : element === transcript ? <VoiceTranscript key={element.id ?? i} text={element.text ?? ""} style={cardLayoutStyle(element)}/> : <Element key={element.id ?? i} replyProse={message.authorType === "bot" && (!reply || i > 0)} rewound={rewound} element={element} connection={connection} messageId={message.id} values={values} change={(key, value) => setValues((old) => ({ ...old, [key]: value }))} act={act}/>)}{error && <p role="alert" className="error-text">{error}</p>}</div>
   </section>;
 }
-export const MessageContent = memo(function MessageContent({ message, connection, reference, backgroundSource }: { backgroundSource?: BackgroundSource; message: Message; connection: HubConnection; reference?: ReactNode }) {
+export const MessageContent = memo(function MessageContent({ message, connection, reference, backgroundSource, rewound = false, upstreamRejectionFooter }: { backgroundSource?: BackgroundSource; message: Message; connection: HubConnection; reference?: ReactNode; rewound?: boolean; upstreamRejectionFooter?: ReactNode }) {
   useLocale();
   const groupedBlocks = new Set<number>();
   const rejectedInput = message.authorType === "user" && message.blocks.some(block => block.type === "steering" && block.outcome === "rejected");
@@ -366,12 +367,12 @@ export const MessageContent = memo(function MessageContent({ message, connection
       </div>;
     }
     switch (block.type) {
-      case "steering": return <SteeringReceipt key={i} block={block} message={message} connection={connection}/>;
+      case "steering": return <SteeringReceipt key={i} block={block} message={message} connection={connection} rewound={rewound}/>;
       // Older command receipts and simple Bot responses are stored as text.
       // Reuse card typography (including authored line breaks) without rewriting
       // history or treating a slash-prefixed quote as an executable command.
       case "text": return message.authorType === "bot"
-        ? <Card key={i} block={{ type: "card", elements: [{ type: "markdown", text: block.text }] }} connection={connection} message={message}/>
+        ? <Card key={i} block={{ type: "card", elements: [{ type: "markdown", text: block.text }] }} connection={connection} message={message} rewound={rewound}/>
         : rejectedInput ? <details className="steering-rejected-input" key={i}><summary>{message.blocks.some(b => b.type === "steering" && b.mode === "message") ? t("未发送的消息") : t("未投递的补充")}</summary><MarkdownText text={block.text}/></details> : <MarkdownText key={i} text={block.text}/>;
       case "card": {
         const widget = readWidget(block);
@@ -383,7 +384,10 @@ export const MessageContent = memo(function MessageContent({ message, connection
         if (message.authorType === "user" && queue && typeof queue === "object" && !Array.isArray(queue) && queue.state === "cancelled") {
           return <small key={i} className="prompt-queue-cancelled">{t("已取消排队，未发送给 Bot。")}</small>;
         }
-        const run = anyRun(block); return run ? <RunPresentation key={i} run={run} block={block} connection={connection} message={message} backgroundSource={backgroundSource}/> : message.authorType === "bot" && isBackgroundReport(block) ? <BackgroundReport key={i} block={block} connection={connection} message={message} source={backgroundSource}/> : <Card key={i} block={block} connection={connection} message={message} backgroundSource={backgroundSource}/>;
+        const rejectionFooter = !rewound && upstreamRejectionFooter && upstreamRejectionSchema.safeParse(block.extra?.upstreamRejection).success ? upstreamRejectionFooter : undefined;
+        const run = anyRun(block);
+        const rendered = run ? <RunPresentation key={i} run={run} block={block} connection={connection} message={message} backgroundSource={backgroundSource} rewound={rewound}/> : message.authorType === "bot" && isBackgroundReport(block) ? <BackgroundReport key={i} block={block} connection={connection} message={message} source={backgroundSource}/> : <Card key={i} block={block} connection={connection} message={message} backgroundSource={backgroundSource} rewound={rewound}/>;
+        return rejectionFooter ? <div key={i} className="upstream-rejection-card-wrap">{rendered}{rejectionFooter}</div> : rendered;
       }
       case "image": {
         // Group only consecutive images, preserving caption/file order and the

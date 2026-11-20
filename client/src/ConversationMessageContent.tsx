@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, type ReactNode } from "react";
 import type { Message } from "../../src/client-protocol/index.js";
 import { backgroundTaskNotice } from "../../src/client-protocol/background-task.js";
 import type { HubConnection } from "./connection.js";
@@ -12,10 +12,10 @@ import { useLocale } from "./i18n.js";
 /** Construct references inside the memo boundary. An inline React element or
  * backgroundSource object from Workspace otherwise defeats MessageContent's
  * memo on every unrelated stream event and every virtual-scroll render. */
-export const ConversationMessageContent = memo(function ConversationMessageContent({ message, original, referenceAuthor, referenceAvailable, scheduledName, connection, locate, focusRequest }: {
+export const ConversationMessageContent = memo(function ConversationMessageContent({ message, original, referenceAuthor, referenceAvailable, scheduledName, connection, locate, focusRequest, rewound = false, upstreamRejectionFooter }: {
   message: Message; original?: Message; referenceAuthor?: string; referenceAvailable: boolean; scheduledName: string;
   connection: HubConnection; locate: (conversationId: string, messageId: string) => void;
-  focusRequest?: { messageId?: string };
+  focusRequest?: { messageId?: string }; rewound?: boolean; upstreamRejectionFooter?: ReactNode;
 }) {
   useLocale();
   const scheduled = message.groupDiscussion?.role === "input";
@@ -32,7 +32,8 @@ export const ConversationMessageContent = memo(function ConversationMessageConte
       && <BotReplySource message={message} original={original} open={openReply}/>}
     {scheduled ? <GroupDiscussionInput message={message} name={scheduledName}/>
       : <MessageContent message={message} connection={connection} reference={inline ? reference : undefined}
-        backgroundSource={bound && message.replyTo ? { original, open: openReply } : undefined}/>}
+        backgroundSource={bound && message.replyTo ? { original, open: openReply } : undefined}
+        rewound={rewound} upstreamRejectionFooter={upstreamRejectionFooter}/>}
   </>;
   // Queue cancellation and unsupported-worker errors are appended to the input
   // itself. They must remain visible even when its original report is long.

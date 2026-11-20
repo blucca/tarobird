@@ -29,13 +29,13 @@ export function WelcomeHome({ hasBots, newChat, newBot, newGroup, pairDevice }: 
 }
 
 /** Empty direct conversation: compact and unboxed, so it never competes with the first reply. */
-export function DirectEmpty({ botId, name, archived, online, draftEmpty, commands, attach, dispatcher }: { botId: string; name: string; archived: boolean; online: boolean; draftEmpty: boolean; commands: () => void; attach: () => void; dispatcher?: boolean }) {
+export function DirectEmpty({ botId, name, archived, online, draftEmpty, commands, attach, dispatcher, forked }: { botId: string; name: string; archived: boolean; online: boolean; draftEmpty: boolean; commands: () => void; attach: () => void; dispatcher?: boolean; forked?: boolean }) {
   useLocale(); const id = useId();
   return <section className="direct-empty" aria-labelledby={id}>
     <Avatar kind="bot" id={botId} name={name} size={40}/>
     <div className="direct-empty-copy">
       <h2 id={id}>{t("和 {0} 开始这段对话", name)}</h2>
-      <p>{dispatcher ? t("跟它说要做什么，它会拆成工单交给本机的 CLI 去做，并在这里汇报结果。") : t("这是一个独立对话，不带入其他对话的上下文；仍使用这个 Bot 的工作区、人设和记忆。")}</p>
+      <p>{dispatcher ? t("跟它说要做什么，它会拆成工单交给本机的 CLI 去做，并在这里汇报结果。") : forked ? t("已带入原对话的上下文，可以直接接着聊。原对话不受影响。") : t("这是一个独立对话，不带入其他对话的上下文；仍使用这个 Bot 的工作区、人设和记忆。")}</p>
       {/* The command shortcut writes "/", so it exists only while there is no draft to overwrite, like the composer hint. */}
       {!archived && <div className="direct-empty-actions">{draftEmpty && <button type="button" disabled={!online} onClick={commands}><kbd aria-hidden="true">/</kbd>{t("查看命令")}</button>}<button type="button" onClick={attach}><FilePlus2 size={15} aria-hidden="true"/>{t("附加文件")}</button></div>}
     </div>

@@ -1,0 +1,330 @@
+/* Conversation history: rewind ranges, fork marks & upstream rejection recovery (#53).
+   Uses only existing design tokens and the shared 760px phone breakpoint. */
+
+/* ---------- 5.3 Rewound message notice & expanded state ---------- */
+.message.rewind-notice-row {
+  display: flex;
+  justify-content: center;
+  padding: 4px 12px;
+}
+
+.rewind-notice {
+  max-width: min(640px, 100%);
+  min-width: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.rewind-notice > summary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 100%;
+  min-width: 0;
+  padding: 2px 6px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  list-style: none;
+  color: var(--muted);
+  user-select: none;
+}
+
+.rewind-notice > summary::-webkit-details-marker {
+  display: none;
+}
+
+.rewind-notice > summary:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.rewind-notice > summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Keep the count intact on 320px screens; truncate only the trailing note. */
+.rewind-notice-count {
+  flex: none;
+  white-space: nowrap;
+}
+
+.rewind-notice-sep {
+  flex: none;
+  white-space: pre;
+}
+
+.rewind-notice-detail {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message.is-rewound {
+  box-sizing: border-box;
+  opacity: 0.55;
+  border-left: 2px solid var(--border-strong);
+  padding-left: 10px;
+}
+
+.message.is-rewound.is-selecting {
+  padding-left: 34px;
+}
+
+/* ---------- 5.4 Forked conversation marks ---------- */
+.fork-row-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  margin-right: 4px;
+  color: var(--muted);
+  vertical-align: -1px;
+}
+
+.mh-row-top > .fork-row-mark,
+.inbox-row-title > .fork-row-mark {
+  margin-right: 0;
+}
+
+/* Match desktop danger color inside mobile action sheets (`.mobile-chat-action-list`). */
+.mobile-chat-action-list > button.text-danger,
+.mobile-chat-action-list > button.text-danger > svg {
+  color: var(--red);
+}
+
+.conversation-row.selected .fork-row-mark {
+  color: var(--text);
+}
+
+:root[data-palette="cli"] .conversation-row.selected .fork-row-mark {
+  color: var(--cli-rev-fg);
+}
+
+.fork-origin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(26%, 16em);
+  min-height: 24px;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 400;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.fork-origin-badge > svg {
+  flex: none;
+}
+
+.fork-origin-badge-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fork-origin-badge:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.fork-origin-badge:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.fork-origin-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 4px 8px;
+  max-width: min(680px, 100%);
+  margin: 0 auto 10px;
+  padding: 4px 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.fork-origin-banner-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fork-origin-open {
+  flex: none;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.fork-origin-open:hover {
+  background: var(--hover);
+  text-decoration: underline;
+}
+
+.fork-origin-open:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* ---------- 5.6 Upstream rejection recovery strip ---------- */
+.upstream-rejection-card-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  width: fit-content;
+  max-width: 100%;
+}
+
+.upstream-rejection-actions {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--raised, var(--bg));
+}
+
+.upstream-rejection-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.upstream-rejection-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: 30px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.upstream-rejection-btn > svg {
+  flex: none;
+}
+
+.upstream-rejection-btn.is-primary {
+  border-color: var(--primary-bg);
+  background: var(--primary-bg);
+  color: var(--on-primary);
+}
+
+.upstream-rejection-btn:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.upstream-rejection-btn.is-primary:hover:not(:disabled) {
+  border-color: var(--primary-hover);
+  background: var(--primary-hover);
+  color: var(--on-primary);
+}
+
+.upstream-rejection-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.upstream-rejection-btn:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.upstream-rejection-note {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+html[data-palette="cli"] .upstream-rejection-actions {
+  border-radius: 2px;
+}
+
+@media (max-width: 760px) {
+  /* Phone header has tight room: keep the icon clickable; full text sits in the top banner. */
+  .fork-origin-badge {
+    max-width: none;
+    padding: 4px 6px;
+    min-height: 32px;
+    min-width: 32px;
+    justify-content: center;
+  }
+
+  .fork-origin-badge-text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .fork-origin-banner {
+    padding: 4px 6px;
+  }
+
+  .upstream-rejection-actions {
+    padding: 8px;
+  }
+
+  .upstream-rejection-buttons {
+    gap: 6px;
+  }
+
+  .upstream-rejection-btn {
+    min-height: 36px;
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 360px) {
+  .upstream-rejection-btn {
+    gap: 4px;
+    padding: 4px 7px;
+    font-size: 11.5px;
+  }
+
+  .upstream-rejection-btn > svg {
+    width: 12px;
+    height: 12px;
+  }
+}

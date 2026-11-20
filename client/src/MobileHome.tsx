@@ -11,6 +11,7 @@ import { botAgentSignal, buildConversationRows as buildMobileRows, folderSection
 export { buildConversationRows as buildMobileRows, unreadFor, formatRowTime, type InboxHost as MobileHost, type InboxRow as MobileConversationRow } from './conversation-inbox.js';
 import { MobileListOptions } from "./MobileListOptions.js";
 import { HostSourceBadge } from "./HostSourceBadge.js";
+import { ForkRowMark } from "./HistoryMarks.js";
 import { BotName } from "./BotName.js";
 import {
   createContext,
@@ -464,6 +465,7 @@ function ConversationRow({ row, connection, conversations, dispatcher, multiHost
       </AgentAvatar>
       <span className="mh-row-main">
         <span className="mh-row-top">
+          {conversation.history?.forkedFrom && <ForkRowMark origin={conversation.history.forkedFrom}/>}
           <span className="mh-row-title">{title}</span>
           {tag && <span className="mh-row-tag">{isGroup || conversation.parentId ? tag : <BotName id={botId ?? ""} name={tag} compact/>}</span>}
           {(row.pinned || row.globallyPinned) && (

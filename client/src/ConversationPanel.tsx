@@ -7,7 +7,7 @@ import { t, useLocale } from "./i18n.js";
 import { useEffect, useId, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import type { Conversation } from "../../src/client-protocol/index.js";
 import type { HubConnection } from "./connection.js";
-import { ChevronDown, ChevronRight, History, MessageSquarePlus, RotateCcw, SlidersHorizontal, Sparkles, Unplug, type LucideIcon } from "lucide-react";
+import { ChevronDown, ChevronRight, GitBranch, History, MessageSquarePlus, RotateCcw, SlidersHorizontal, Sparkles, Unplug, type LucideIcon } from "lucide-react";
 import "./conversation-settings.css";
 import { useBotLabels } from "./BotReferences.js";
 import { ClearHistoryControl } from "./ClearHistoryControl.js";
@@ -19,7 +19,15 @@ function SessionAction({ icon: Icon, title, description, disabled, onClick, dang
   </button>;
 }
 
-export function ConversationPanel({ connection, conversation, group, pinned, globallyPinned = false, globalPin, pin, close, newChat, externalError, chooseRecipient, returnFocus, initialBot }: { initialBot?: string; returnFocus?: RefObject<HTMLElement | null>; connection: HubConnection; conversation: Conversation; group?: Conversation; pinned: boolean; globallyPinned?: boolean; globalPin?: (value: boolean) => Promise<void>; pin: (value: boolean) => Promise<void>; close: () => void; newChat: (botId: string) => void; externalError?: string; chooseRecipient: (botId: string) => void }) {
+export type ConversationPanelHistoryFork = {
+  visible: boolean;
+  disabled: boolean;
+  blockedReason?: string;
+  fork: () => void;
+  refresh?: () => void;
+};
+
+export function ConversationPanel({ connection, conversation, group, pinned, globallyPinned = false, globalPin, pin, close, newChat, externalError, chooseRecipient, returnFocus, initialBot, historyFork }: { initialBot?: string; returnFocus?: RefObject<HTMLElement | null>; connection: HubConnection; conversation: Conversation; group?: Conversation; pinned: boolean; globallyPinned?: boolean; globalPin?: (value: boolean) => Promise<void>; pin: (value: boolean) => Promise<void>; close: () => void; newChat: (botId: string) => void; externalError?: string; chooseRecipient: (botId: string) => void; historyFork?: ConversationPanelHistoryFork }) {
   useLocale(); const labels = useBotLabels();
   const state = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);
   const [targetBot, setTargetBot] = useState(initialBot && conversation.botIds.includes(initialBot) ? initialBot : conversation.botIds[0] ?? "");
@@ -33,7 +41,7 @@ export function ConversationPanel({ connection, conversation, group, pinned, glo
   const compactSupported = ["claude", "kimi", "deepseek"].includes(state.bots.find(bot => bot.id === targetBot)?.engine ?? "");
   const [refreshFailed, setRefreshFailed] = useState(false), [queuedCommands, setQueuedCommands] = useState<string[]>([]);
   const [busy, setBusy] = useState(false), busyRef = useRef(false);
-  const [confirmation, setConfirmation] = useState<"discard" | "reset" | "unbind" | "new" | "detach">();
+  const [confirmation, setConfirmation] = useState<"discard" | "reset" | "unbind" | "new" | "fork" | "detach">();
   const previous = useRef(conversation), editing = useRef(false), editRevision = useRef(0);
   const refreshRequest = useRef(0);
   const alive = useRef(true), commandIds = useRef(new Map<string, string>());
@@ -64,7 +72,7 @@ export function ConversationPanel({ connection, conversation, group, pinned, glo
     try { await connection.refreshNotificationPreferences(timeoutSignal(20_000)); if (alive.current && request === refreshRequest.current) setRefreshFailed(false); }
     catch { if (alive.current && request === refreshRequest.current) { setRefreshFailed(true); setNotice(saved ? t("通知设置暂时无法刷新，已保存的修改仍然有效。") : t("通知设置暂时无法刷新，请稍后重试。")); } }
   };
-  useEffect(() => { void refresh(); }, [connection, conversation.id]);
+  useEffect(() => { void refresh(); historyFork?.refresh?.(); }, [connection, conversation.id]);
   const act = async (work: () => Promise<unknown>) => {
     if (busyRef.current) return;
     busyRef.current = true; setBusy(true); setError(""); setNotice("");
@@ -138,6 +146,7 @@ export function ConversationPanel({ connection, conversation, group, pinned, glo
       <p className="session-scope">{t("当前操作对象：此对话中的 {0}", labels.get(targetBot) ?? state.bots.find(bot => bot.id === targetBot)?.name ?? targetBot)}</p>
       <div className="session-action-list">
         {!isDispatcher(state.bots.find(bot => bot.id === targetBot)) && !engineWorker && <SessionAction icon={MessageSquarePlus} title={t("新建独立对话")} description={t("开启另一段聊天，不带入这里的上下文。Bot 人设和配置继续沿用。")} disabled={busy || !targetBot} onClick={() => { if (dirty) setConfirmation("new"); else newChat(targetBot); }}/>}
+        {historyFork?.visible && <SessionAction icon={GitBranch} title={t("分叉当前对话")} description={historyFork.disabled && historyFork.blockedReason ? historyFork.blockedReason : t("复制当前上下文到一个新对话，两边各自继续。")} disabled={busy || historyFork.disabled} onClick={() => { if (dirty) setConfirmation("fork"); else historyFork.fork(); }}/>}
         {compactSupported && <SessionAction icon={Sparkles} title={t("整理上下文")} description={t("聊天太长时，总结前文再继续。聊天记录保留，部分细节可能省略。")} disabled={commandDisabled("/compact")} onClick={() => command("/compact")}/>}
       </div>
       <button type="button" className="session-advanced-toggle" aria-label={t("高级对话管理")} aria-expanded={advanced} aria-controls={advancedId} onClick={() => setAdvanced(value => !value)}><SlidersHorizontal size={18} aria-hidden="true"/><span><strong>{t("高级对话管理")}</strong><small>{t("继续旧会话、退出接入或重新开始")}</small></span><ChevronDown size={16} aria-hidden="true"/></button>
@@ -160,7 +169,7 @@ export function ConversationPanel({ connection, conversation, group, pinned, glo
     <ClearHistoryControl connection={connection} conversationId={conversation.id} disabled={busy}/>
     {refreshFailed && <button disabled={busy} onClick={() => void act(() => refresh())}>{t("重新检查")}</button>}
     {busy && <p role="status">{t("正在处理…")}</p>}{notice && <p role="status">{notice}</p>}{(error || externalError) && <p className="error-text" role="alert">{error || externalError}</p>}
-  {confirmation && <CreationDialog className="confirmation-dialog" initialFocus={cancelConfirmation} title={(confirmation === "discard" || confirmation === "new") ? t("放弃尚未保存的对话名称？") : confirmation === "detach" ? t("退出接入的会话") : confirmation === "reset" ? t("重新开始上下文") : t("清除会话选择")} closeLabel={t("关闭确认")} close={() => setConfirmation(undefined)} busy={busy} returnFocus={confirmation === "discard" ? titleInput : undefined}>
+  {confirmation && <CreationDialog className="confirmation-dialog" initialFocus={cancelConfirmation} title={(confirmation === "discard" || confirmation === "new" || confirmation === "fork") ? t("放弃尚未保存的对话名称？") : confirmation === "detach" ? t("退出接入的会话") : confirmation === "reset" ? t("重新开始上下文") : t("清除会话选择")} closeLabel={t("关闭确认")} close={() => setConfirmation(undefined)} busy={busy} returnFocus={confirmation === "discard" ? titleInput : undefined}>
     <p className="confirmation-lead">{confirmation === "detach" ? t("回到接入前的会话。") : confirmation === "reset" ? t("Bot 将从新的上下文开始，不再带入之前的聊天内容。") : confirmation === "unbind" ? t("只清除已选会话，不撤销已经发生的切换。") : t("对话名称的修改尚未保存。")}</p>
     {(confirmation === "reset" || confirmation === "detach" || confirmation === "unbind") && <ExplanationList items={confirmation === "unbind" ? [
       { label: t("恢复中断时"), description: t("先退出接入的会话或重新开始上下文，再发送消息。") },
@@ -168,6 +177,6 @@ export function ConversationPanel({ connection, conversation, group, pinned, glo
       ...(confirmation === "detach" ? [{ label: t("无法恢复时"), description: t("下一条消息从新的上下文开始。") }] : []),
       { label: t("仍保留"), description: t("聊天记录和 Bot 人设。") },
     ]}/>}
-    <div className="confirmation-actions"><button ref={cancelConfirmation} disabled={busy} onClick={() => setConfirmation(undefined)}>{t("取消")}</button><button className="primary" disabled={busy} onClick={() => { const action = confirmation; setConfirmation(undefined); if (action === "discard") close(); else if (action === "new") newChat(targetBot); else if (action === "reset") command("/reset"); else if (action === "detach") command("/detach"); else bind(null); }}>{t("确认")}</button></div>
+    <div className="confirmation-actions"><button ref={cancelConfirmation} disabled={busy} onClick={() => setConfirmation(undefined)}>{t("取消")}</button><button className="primary" disabled={busy} onClick={() => { const action = confirmation; setConfirmation(undefined); if (action === "discard") close(); else if (action === "new") newChat(targetBot); else if (action === "fork") historyFork?.fork(); else if (action === "reset") command("/reset"); else if (action === "detach") command("/detach"); else bind(null); }}>{t("确认")}</button></div>
   </CreationDialog>}</CreationDialog>;
 }

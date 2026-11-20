@@ -22,7 +22,7 @@ function rejectedLabel(reason?: string) {
 }
 
 export const NativeInputContext = createContext<{ capability?: NativeInputCapability; editable?: boolean; draftText?: (conversationId: string) => string | undefined; restore?: (message: Message) => void }>({});
-export function NativeInputReceipt({ block, message, connection }: { block: Extract<Block, { type: "steering" }>; message: Message; connection: HubConnection }) {
+export function NativeInputReceipt({ block, message, connection, rewound = false }: { block: Extract<Block, { type: "steering" }>; message: Message; connection: HubConnection; rewound?: boolean }) {
   useLocale();
   const context = useContext(NativeInputContext), [busy, setBusy] = useState(false), busyRef = useRef(false), [notice, setNotice] = useState("");
   const restored = useRef(false);
@@ -68,10 +68,10 @@ export function NativeInputReceipt({ block, message, connection }: { block: Extr
   };
   return <div className={`steering-receipt native-input-receipt ${block.outcome}`} role="status" data-input-state={state ?? block.outcome}>
     {busy ? <LoaderCircle size={13} className="spin"/> : state === "received" ? <Check size={13}/> : <Clock3 size={13}/>}<span>{label}</span>
-    {pending && (block.outcome === "pending" || block.outcome === "unknown") && <button disabled={busy} onClick={() => void check()}>{t("核对消息回执")}</button>}
-    {pending && canControl && context.capability?.sendNow && <button disabled={busy} onClick={() => void control("send-now")}>{t("立即发送")}</button>}
-    {pending && canControl && context.capability?.cancel && context.editable && <button disabled={busy} onClick={() => void control("cancel")}>{t("撤回编辑")}</button>}
-    {state === "cancelled" && ownsMessage && context.editable && <button disabled={busy} onClick={() => context.restore?.(message)}>{t("编辑已撤回内容")}</button>}
+    {!rewound && pending && (block.outcome === "pending" || block.outcome === "unknown") && <button disabled={busy} onClick={() => void check()}>{t("核对消息回执")}</button>}
+    {!rewound && pending && canControl && context.capability?.sendNow && <button disabled={busy} onClick={() => void control("send-now")}>{t("立即发送")}</button>}
+    {!rewound && pending && canControl && context.capability?.cancel && context.editable && <button disabled={busy} onClick={() => void control("cancel")}>{t("撤回编辑")}</button>}
+    {!rewound && state === "cancelled" && ownsMessage && context.editable && <button disabled={busy} onClick={() => context.restore?.(message)}>{t("编辑已撤回内容")}</button>}
     {sendNowRequested && state === "queued" && <span>{t("已请求立即发送。")}</span>}
     {notice && (!noticePendingOnly || pending) && notice !== label && <span>{notice}</span>}
   </div>;

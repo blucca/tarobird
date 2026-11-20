@@ -7,7 +7,7 @@ import { RuntimeHostActiveContext } from "./RuntimeHost.js";
 import { t, useLocale } from "./i18n.js";
 import "./queue-notice.css";
 
-export function QueueNotice({ notice, message, connection, act, error, detail }: { notice: QueueNoticeData; message: Message; connection: HubConnection; act: (element: CardElement) => Promise<boolean>; error: string; detail?: string }) {
+export function QueueNotice({ notice, message, connection, act, error, detail, rewound = false }: { notice: QueueNoticeData; message: Message; connection: HubConnection; act: (element: CardElement) => Promise<boolean>; error: string; detail?: string; rewound?: boolean }) {
   useLocale(); const hostActive = useContext(RuntimeHostActiveContext);
   const labelId = useId();
   const state = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);
@@ -35,7 +35,7 @@ export function QueueNotice({ notice, message, connection, act, error, detail }:
   const Icon = queued || started ? Clock3 : cancelled || skipped ? Check : CircleAlert;
   return <section className="queue-notice" role="status" aria-labelledby={labelId}>
     <div className="queue-notice-header"><span id={labelId} className="queue-notice-label"><Icon size={14}/>{label}</span>
-      {queued && notice.cancel && <button type="button" className="queue-notice-cancel" aria-disabled={pending || notice.cancel.disabled || offline || !hostActive} onClick={() => { void cancel(); }}>{pending ? t("正在取消…") : t("取消排队")}</button>}
+      {!rewound && queued && notice.cancel && <button type="button" className="queue-notice-cancel" aria-disabled={pending || notice.cancel.disabled || offline || !hostActive} onClick={() => { void cancel(); }}>{pending ? t("正在取消…") : t("取消排队")}</button>}
     </div>
     <div className="queue-notice-detail">{description}</div>
     {(error || expired) && <div className="queue-notice-error" role="alert">{error || t("尚未收到取消确认，请核对任务状态。")}</div>}

@@ -10,10 +10,10 @@ export { steerReason } from "./steering-reason.js";
 import { t, useLocale } from "./i18n.js";
 
 
-export function SteeringReceipt(props: { block: Extract<Block, { type: "steering" }>; message: Message; connection: HubConnection }) {
+export function SteeringReceipt(props: { block: Extract<Block, { type: "steering" }>; message: Message; connection: HubConnection; rewound?: boolean }) {
   return props.block.mode === "message" ? <NativeInputReceipt {...props}/> : <LegacySteeringReceipt {...props}/>;
 }
-function LegacySteeringReceipt({ block, message, connection }: { block: Extract<Block, { type: "steering" }>; message: Message; connection: HubConnection }) {
+function LegacySteeringReceipt({ block, message, connection, rewound = false }: { block: Extract<Block, { type: "steering" }>; message: Message; connection: HubConnection; rewound?: boolean }) {
   useLocale(); const [busy, setBusy] = useState(false), [error, setError] = useState("");
   const context = useContext(NativeInputContext);
   useEffect(() => {
@@ -34,7 +34,7 @@ function LegacySteeringReceipt({ block, message, connection }: { block: Extract<
   return <div className={`steering-receipt ${application?.status === "dropped" ? "rejected" : block.outcome}`} role="status">
     {block.outcome === "accepted" && application?.status !== "dropped" ? <Check size={13}/> : block.outcome === "pending" ? <LoaderCircle size={13} className="spin"/> : <Compass size={13}/>}
     <span>{label}</span>
-    {!application && (block.outcome === "unknown" || block.outcome === "pending") && <button disabled={busy} onClick={() => void check()}>{t("核对引导回执")}</button>}
+    {!rewound && !application && (block.outcome === "unknown" || block.outcome === "pending") && <button disabled={busy} onClick={() => void check()}>{t("核对引导回执")}</button>}
     {error && <span>{error}</span>}
   </div>;
 }

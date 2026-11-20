@@ -105,14 +105,19 @@ import { NewConversation, type ConversationCreation } from "./NewConversation.js
 import { ShareInbox } from "./ShareInbox.js";
 import { maintainUnifiedPush } from "./unifiedpush.js";
 import { t, useLocale, setLocale } from "./i18n.js";
-import { lazy, Suspense, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type SetStateAction } from "react";
+import { lazy, Suspense, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactNode, type SetStateAction } from "react";
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import { createReadingScroll } from "./reading-scroll.js";
 import { useConnectionSelection } from "./connection-selection.js";
-import { CalendarClock, Activity, Archive, ArrowLeft, AtSign, FolderInput, FolderOpen, ArrowUp, CornerDownLeft, Compass, Bot as BotIcon, Check, ChevronDown, ChevronLeft, ChevronRight, CircleStop, Copy, Forward, Hash, LoaderCircle, MoreHorizontal, MessageSquare, MessageSquarePlus, Monitor, MonitorPlay, PanelRight, Pencil, Plug, Plus, RotateCcw, Search, Settings, ShieldCheck, Trash2, Users, Wifi, WifiOff, X } from "lucide-react";
+import { CalendarClock, Activity, Archive, ArrowLeft, AtSign, FolderInput, FolderOpen, ArrowUp, CornerDownLeft, Compass, Bot as BotIcon, Check, ChevronDown, ChevronLeft, ChevronRight, CircleStop, Copy, Forward, GitBranch, Hash, LoaderCircle, MoreHorizontal, MessageSquare, MessageSquarePlus, Monitor, MonitorPlay, PanelRight, Pencil, Plug, Plus, RotateCcw, Search, Settings, ShieldCheck, Trash2, Users, Wifi, WifiOff, X } from "lucide-react";
 import { BrandName } from "./BrandScenes.js";
 import { DirectEmpty, WelcomeHome } from "./ChatEmpty.js";
 import { blocksText, messageSchema, type Conversation, type Message } from "../../src/client-protocol/index.js";
+import type { ForkOrigin } from "../../src/client-protocol/history.js";
+import { buildTimelineRows, conversationHistoryEntries, findLastUpstreamRejectionMessageId, messageHistoryEntries, messageUpstreamRejection, resolveUpstreamRejectionActions } from "./conversation-history.js";
+import { useConversationHistory } from "./use-conversation-history.js";
+import { HistoryConfirmationDialog, type HistoryConfirmationRequest } from "./HistoryConfirmationDialog.js";
+import { ForkOriginBanner, ForkOriginHeaderBadge, RewindGroupNotice, UpstreamRejectionActionsBar } from "./HistoryMarks.js";
 import { isRunActive, runSummarySchema } from "../../src/client-protocol/run.js";
 import { HubConnection, type Bot } from "./connection.js";
 import { MessageOverlayContext, useMessageOverlayRows } from "./message-overlay.js";
@@ -397,6 +402,45 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   }, [finishTouch]);
   const readHistory = (force = false) => { scrollingTowardLatest.current = false; releaseFocus(); const node = scroll.current; if (node && (force || node.scrollHeight > node.clientHeight + 2)) { followLatest.current = false; setShowLatest(true); } };
   const current = conversations.find((c) => c.id === selected); const activeBot = state.bots.find((b) => b.id === current?.botIds[0]);
+  const dispatchWorker = !!current && current.botIds.length === 1 && !!state.dispatchWorkers?.some(bot => bot.id === current.botIds[0]);
+  const history = useConversationHistory({
+    connection,
+    conversation: current,
+    bot: activeBot,
+    dispatchWorker,
+    historyAvailable: !!state.historyAvailable,
+    online: state.status === "online" && !connection.isReadOnly,
+    active: visible && chatVisible,
+  });
+  const [historyConfirm, setHistoryConfirm] = useState<HistoryConfirmationRequest>();
+  const historyTrigger = useRef<HTMLElement | null>(null);
+  const historyOrigin = useRef<{ conversationId: string; messageId?: string } | undefined>(undefined);
+  const [expandedRewindGroups, setExpandedRewindGroups] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => { setExpandedRewindGroups(new Set()); setHistoryConfirm(undefined); }, [selected, connection]);
+  const toggleRewindGroup = useCallback((groupKey: string) => {
+    setExpandedRewindGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(groupKey)) next.delete(groupKey); else next.add(groupKey);
+      return next;
+    });
+  }, []);
+  const timeline = useMemo(
+    () => buildTimelineRows(displayedMessages, current?.history?.rewinds, expandedRewindGroups, backgroundGroups.byAnchor),
+    [displayedMessages, current?.history?.rewinds, expandedRewindGroups, backgroundGroups.byAnchor],
+  );
+  const timelineRows = timeline.rows;
+  const lastUpstreamRejectionId = useMemo(
+    () => findLastUpstreamRejectionMessageId(messages, current?.history?.rewinds),
+    [messages, current?.history?.rewinds],
+  );
+  useLayoutEffect(() => {
+    if (focusTarget?.conversationId !== selected || !focusTarget.messageId) return;
+    const resolved = backgroundGroups.anchors.get(focusTarget.messageId) ?? focusTarget.messageId;
+    const groupKey = timeline.groupByMessageId.get(resolved);
+    if (groupKey && !expandedRewindGroups.has(groupKey)) {
+      setExpandedRewindGroups(prev => new Set(prev).add(groupKey));
+    }
+  }, [focusTarget, selected, backgroundGroups.anchors, timeline.groupByMessageId, expandedRewindGroups]);
   // A dispatcher keeps one conversation and joins no group: never preselect it for creation.
   const choosableBot = isDispatcher(activeBot) ? undefined : activeBot;
   // The panel choice belongs to this conversation, just like its workbench
@@ -576,7 +620,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   // Disconnect observers while the chat is hidden instead of caching zero
   // heights and clearing every measurement when it becomes visible again.
   const messageOverlays = useMessageOverlayRows();
-  const messageKey = useMemo(() => (index: number) => displayedMessages[index]!.id, [displayedMessages]);
+  const messageKey = useMemo(() => (index: number) => timelineRows[index]!.key, [timelineRows]);
   const retainMessageOverlay = messageOverlays.retain;
   const retainedMessageRows = new Set([...messageOverlays.rows.keys()].map(id => backgroundGroups.anchors.get(id) ?? id));
   const followingTail = chatVisible && followLatest.current && !focusTarget && !searchResults;
@@ -586,7 +630,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   // the phone layout or on a touch platform, whatever the window width.
   const replyWidthDesktop = !pane && desktopReplyWidth(nativePlatform());
   const virtualizer = useVirtualizer({
-    count: displayedMessages.length, getItemKey: messageKey,
+    count: timelineRows.length, getItemKey: messageKey,
     ...(replyWidthDesktop ? { observeElementRect: observeReplyWidthRoom } : {}),
     getScrollElement: () => chatVisible ? scroll.current : null,
     estimateSize: () => 160, overscan: 4, anchorTo: followingTail && !readingScroll.ios ? "end" : "start",
@@ -603,7 +647,13 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       // immediately removes its trigger and sends keyboard focus to <body>.
       const focused = historyRows.current?.contains(document.activeElement)
         ? document.activeElement?.closest<HTMLElement>("[data-message-id]")?.dataset.messageId : undefined;
-      displayedMessages.forEach((message, index) => { if ((retainedMessageRows.has(message.id) || message.id === focused) && !indexes.includes(index)) indexes.push(index); });
+      const focusedRewind = historyRows.current?.contains(document.activeElement)
+        ? document.activeElement?.closest<HTMLElement>("[data-rewind-group-id]")?.dataset.rewindGroupId : undefined;
+      timelineRows.forEach((row, index) => {
+        if (row.kind === "message" ? (retainedMessageRows.has(row.message.id) || row.message.id === focused) : row.key === focusedRewind) {
+          if (!indexes.includes(index)) indexes.push(index);
+        }
+      });
       return indexes.sort((a, b) => a - b);
     },
     // Keep React measurement updates out of WebKit's ResizeObserver delivery.
@@ -631,7 +681,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     if (index >= 0) virtualizer.resizeItem(index, row.offsetHeight);
   } } : undefined, [replyWidthDesktop, phone, virtualizer]);
   const messageHeight = virtualizer.getTotalSize();
-  const tailMessageId = displayedMessages.at(-1)?.id;
+  const tailRowKey = timelineRows.at(-1)?.key;
   const [tailElement, setTailElement] = useState<HTMLElement | null>(null);
   const measureTail = useCallback((node: HTMLElement | null) => {
     virtualizer.measureElement(node);
@@ -756,7 +806,8 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   // scrolled. New replies never pull the reader back; the highlight remains.
   useEffect(() => {
     if (!chatVisible || searchResults !== undefined || focusTarget?.conversationId !== selected || !focusTarget.messageId) return;
-    const index = displayedMessages.findIndex((m) => m.id === (backgroundGroups.anchors.get(focusTarget.messageId!) ?? focusTarget.messageId)), previous = focusPosition.current;
+    const targetId = backgroundGroups.anchors.get(focusTarget.messageId!) ?? focusTarget.messageId;
+    const index = timelineRows.findIndex(row => row.kind === "message" && row.message.id === targetId), previous = focusPosition.current;
     if (index < 0 || previous?.target === focusTarget && (previous.released || previous.index === index)) return;
     const frame = requestAnimationFrame(() => {
       if (!scroll.current) return;
@@ -766,7 +817,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       virtualizer.scrollToIndex(index, { align: "center" });
     });
     return () => cancelAnimationFrame(frame);
-  }, [focusTarget, selected, displayedMessages, backgroundGroups.anchors, virtualizer, chatVisible, searchResults]);
+  }, [focusTarget, selected, timelineRows, backgroundGroups.anchors, virtualizer, chatVisible, searchResults]);
   useSearchMessageHighlight(scroll, pane && chatVisible && searchResults === undefined && focusTarget?.conversationId === selected ? focusTarget.messageId : undefined, focusTarget?.searchQuery, range => {
     const node = scroll.current, positioned = focusPosition.current;
     if (!node || !positioned || positioned.target !== focusTarget || positioned.released) return;
@@ -1021,7 +1072,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   );
   useEffect(() => {
     if (visible) return;
-    setDetails(false); setChatActions(false); setRenameId(undefined); setRemoveTopicId(undefined); setSettingsBotIds(undefined); setArchives(false); setSettings(false); setManage(false); setNewBot(false); setNewChat(undefined); setDelegation(undefined); setFileCenter(false); setConversationFiles(undefined); setOperations(false); setCapabilities(false); setCapabilityHelp(undefined); setForwarding(undefined); setMessageSheet(undefined);
+    setDetails(false); setChatActions(false); setRenameId(undefined); setRemoveTopicId(undefined); setSettingsBotIds(undefined); setArchives(false); setSettings(false); setManage(false); setNewBot(false); setNewChat(undefined); setDelegation(undefined); setFileCenter(false); setConversationFiles(undefined); setOperations(false); setCapabilities(false); setCapabilityHelp(undefined); setForwarding(undefined); setMessageSheet(undefined); setHistoryConfirm(undefined);
     if (voice.phase === "requesting") voice.cancel(); else if (voice.phase === "recording") voice.finish();
   }, [visible, voice.phase, voice.cancel, voice.finish]);
   // A popover never outlives the target it was opened for: another chat or host,
@@ -1048,6 +1099,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const sheetReturn = useMemo(() => ({ get current() { const origin = sheetOrigin.current; return !origin ? null : origin.next?.isConnected ? origin.next : messageFocus(origin.conversationId, origin.messageId, origin.trigger); } }), []);
   const conversationReturn = useMemo(() => ({ get current() { return conversationFocus(); } }), []);
   const forwardReturn = useMemo(() => ({ get current() { const origin = forwardOrigin.current; return origin ? messageFocus(origin.conversationId, origin.messageId, forwardTrigger.current) : forwardTrigger.current; } }), []);
+  const historyReturn = useMemo(() => ({ get current() { const origin = historyOrigin.current; return origin?.messageId ? messageFocus(origin.conversationId, origin.messageId, historyTrigger.current) : historyTrigger.current?.isConnected ? historyTrigger.current : conversationFocus(); } }), []);
   const composerContent = useRef({ files, reply }); composerContent.current = { files, reply };
   const steer = async (ordinarySend = false, immediately = false, origin?: { context?: WorkbenchContext }, expectedTargetId?: string) => {
     if (!current || !richDraftReady || sendBusy.current) return;
@@ -1181,7 +1233,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
         if (showLatest && !fitFrame) fitFrame = requestAnimationFrame(() => {
           fitFrame = 0;
           const history = historyRows.current;
-          if (followLatest.current || !messagesReady || !tail?.isConnected || tail.dataset.messageId !== tailMessageId || !history || history.childElementCount !== displayedMessages.length || history.querySelector(".markdown-pending") || touchY.current !== undefined || node.dataset.touchHold || node.dataset.contextMenu || scrollbarOrigin.current !== undefined || node.clientHeight <= 0 || node.scrollTop > 2 || node.scrollHeight > node.clientHeight + 2) return;
+          if (followLatest.current || !messagesReady || !tail?.isConnected || tail.dataset.rowKey !== tailRowKey || !history || history.childElementCount !== timelineRows.length || history.querySelector(".markdown-pending") || touchY.current !== undefined || node.dataset.touchHold || node.dataset.contextMenu || scrollbarOrigin.current !== undefined || node.clientHeight <= 0 || node.scrollTop > 2 || node.scrollHeight > node.clientHeight + 2) return;
           const bottom = node.getBoundingClientRect().top + node.clientTop + node.clientHeight;
           // A virtual spacer may still underestimate freshly wrapped rows.
           // Require the real tail and all loaded rows to fit before following.
@@ -1208,7 +1260,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     // change after sends, errors, localization or width/font changes.
     if (queuedRows.current) observer.observe(queuedRows.current);
     return () => { observer.disconnect(); cancelAnimationFrame(fitFrame); };
-  }, [chatVisible, selected, focusTarget, searchResults, tailElement, tailMessageId, followingTail, showLatest, messagesReady, displayedMessages.length]);
+  }, [chatVisible, selected, focusTarget, searchResults, tailElement, tailRowKey, followingTail, showLatest, messagesReady, timelineRows.length]);
   const send = async (nextTurn = false, literalUnknown = false) => {
     if (!selected || !richDraftReady || recording || (!draft.trim() && !files.length) || sendBusy.current) return;
     const workbenchSendOrigin = selected, workbenchSendRevision = draftRevision.current;
@@ -1493,6 +1545,54 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       followLatest.current = false; setShowLatest(true); setFocusTarget({ conversationId, messageId });
     }).catch(error => setError(error instanceof Error ? error.message : String(error)));
   }, [cache]);
+  const openHistoryRewind = (message: Message, trigger: HTMLElement | null) => {
+    readHistory(true);
+    historyTrigger.current = trigger;
+    historyOrigin.current = { conversationId: message.conversationId, messageId: message.id };
+    setHistoryConfirm({ kind: "rewind", message });
+  };
+  const openHistoryForkTurn = (message: Message, trigger: HTMLElement | null) => {
+    historyTrigger.current = trigger;
+    historyOrigin.current = { conversationId: message.conversationId, messageId: message.id };
+    setHistoryConfirm({ kind: "fork", mode: "turn", message });
+  };
+  const openHistoryForkHead = (trigger: HTMLElement | null) => {
+    if (!current) return;
+    historyTrigger.current = trigger;
+    historyOrigin.current = { conversationId: current.id };
+    setHistoryConfirm({ kind: "fork", mode: "head" });
+  };
+  const openForkOrigin = (origin: ForkOrigin) => {
+    if (!conversations.some(c => c.id === origin.conversationId)) { setError(t("原对话当前不可访问")); return; }
+    if (origin.mode === "turn" && origin.throughMessageId) {
+      void cache.messages(origin.conversationId).then(items => {
+        if (items.some(item => item.id === origin.throughMessageId && item.status !== "deleted")) {
+          followLatest.current = false; setShowLatest(true);
+          setFocusTarget({ conversationId: origin.conversationId, messageId: origin.throughMessageId });
+        } else selectChat(origin.conversationId);
+      }).catch(() => selectChat(origin.conversationId));
+    } else selectChat(origin.conversationId);
+  };
+  const conversationHistory = conversationHistoryEntries({
+    historyAvailable: !!state.historyAvailable,
+    status: history.status,
+    conversation: current,
+    online: state.status === "online",
+    readOnly: connection.isReadOnly,
+  });
+  const conversationForkBlockedReason = conversationHistory.blockedReasonKey ? t(conversationHistory.blockedReasonKey) : undefined;
+  const messageHistoryFor = (message: Message) => {
+    const entries = messageHistoryEntries({
+      historyAvailable: !!state.historyAvailable,
+      status: history.status,
+      conversation: current,
+      message,
+      messages,
+      online: state.status === "online",
+      readOnly: connection.isReadOnly,
+    });
+    return { ...entries, blockedReason: entries.blockedReasonKey ? t(entries.blockedReasonKey) : undefined };
+  };
   const authorName = (message: Message) => labels.get(message.authorId) ?? botDirectory.find((b) => b.id === message.authorId)?.name ?? (message.authorType === "user" ? t("我") : "TaroBird");
   const retryBlocked = !!current?.archived || !!group?.archived;
   // A human resend cannot preserve a signed Bot's origin or its reply receipt.
@@ -1509,6 +1609,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const closeSheet = () => setMessageSheet(undefined);
   const openMessageSheet = (message: Message, trigger: HTMLElement) => {
     if (message.groupDiscussion?.role === "input") return;
+    history.refreshIfStale();
     sheetOrigin.current = { conversationId: message.conversationId, messageId: message.id, trigger, next: null };
     setMessageSheet({ conversationId: message.conversationId, messageId: message.id });
   };
@@ -1561,6 +1662,14 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       forwardTrigger.current = sheetOrigin.current?.trigger ?? null; closeSheet(); setForwarding(message);
     },
     retry: () => { const message = sheetMessage; if (!message || retryBlocked || !canRetry(message)) return; closeSheet(); report(retryMessage(message)); },
+    history: sheetMessage ? (() => {
+      const h = messageHistoryFor(sheetMessage);
+      return {
+        ...h,
+        fork: () => { const target = sheetMessage; const trigger = sheetOrigin.current?.trigger ?? null; closeSheet(); openHistoryForkTurn(target, trigger); },
+        rewind: () => { const target = sheetMessage; const trigger = sheetOrigin.current?.trigger ?? null; closeSheet(); openHistoryRewind(target, trigger); },
+      };
+    })() : undefined,
   };
   const paneBusy = sending || steeringBusy || uploadProgress !== undefined || recording || voice.phase === "requesting";
   const pendingSave = draftSaving || richDraftPendingAny;
@@ -1623,11 +1732,12 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     {pane?.headerLeading}<div className="header-title"><h1>{searchConversation ? t("搜索当前对话") : t("搜索历史消息")}</h1><span title={searchScope}>{searchScope}</span></div>{side.shown && sideButton}{pane?.headerTrailing}
   </header> : <header className="conversation-header"><button className="icon-button mobile-menu" aria-label={t("打开会话列表")} onClick={openMobileHome}><ChevronLeft size={24}/></button>{!phone && group && current?.parentId && <button className="icon-button header-group-back" aria-label={t("返回群组「{0}」", group.title)} title={t("返回群组「{0}」", group.title)} onClick={() => selectChat(group.id)}><ArrowLeft size={18}/></button>}{pane?.headerLeading}<div className="header-title">
     <div className="header-heading-row"><h1 aria-label={current?.title}>{current ? <button ref={detailTrigger} className="chat-identity" aria-label={t("查看对话详情")} aria-expanded={details} onClick={() => setDetails(value => !value)}><ConversationAvatar conversation={current} size={30}/><span title={current.title}>{current.title}</span><ChevronDown size={14}/></button> : t("欢迎回来")}</h1>
+      {current?.history?.forkedFrom && <ForkOriginHeaderBadge origin={current.history.forkedFrom} onOpen={() => openForkOrigin(current.history!.forkedFrom!)}/>}
       {pane?.headerMeta}
       {!phone && directBotName && <span className="header-bot-name" title={directBotName}><BotName id={directBotId!} name={directBotName} compact/></span>}
       {current && <ReplyActivity group={!!group} names={streamingBots} offline={live && !!directBotId && state.bots.some(bot => bot.id === directBotId && !bot.online)}/>}
     </div>
-  </div>{shell?.multiHost && <HostSourceBadge name={shell.host.name} header/>}{!phone && visible && searchResults === undefined && group && current && <TopicSwitcher compact={!!pane} connection={connection} key={`topic:${current.id}`} group={group} current={current} conversations={conversations} activity={activity} select={selectChat} create={() => setNewChat({ kind: "topic", group })}/>}{sideButton}{workbenchButton}{screenButton}{!phone && current && <button ref={conversationSearchTrigger} className="icon-button conversation-search-trigger" aria-label={t("搜索当前对话")} title={t("搜索当前对话") + " (⌘F / Ctrl+F)"} aria-keyshortcuts="Meta+F Control+F" onClick={searchCurrentConversation}><Search size={18}/></button>}<button className={`connection-pill ${state.status}`} title={state.route?.url} aria-label={t("打开连接设置")} onClick={(event) => { event.currentTarget.focus(); setSettingsFromMenu(false); setSettingsSection("connection"); setSettings(true); }}>{state.status === "online" ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{connectionSummary}</span></button>{(phone || current) && <button ref={chatMoreTrigger} className="icon-button mobile-chat-more" aria-label={t("更多聊天操作")} aria-expanded={phone ? undefined : menu === "chat"} aria-controls={!phone && menu === "chat" ? `${menuId}-chat` : undefined} onClick={(event) => { event.currentTarget.focus(); if (phone) setChatActions(true); else toggleMenu("chat"); }}><MoreHorizontal size={phone ? 24 : 18}/></button>}
+  </div>{shell?.multiHost && <HostSourceBadge name={shell.host.name} header/>}{!phone && visible && searchResults === undefined && group && current && <TopicSwitcher compact={!!pane} connection={connection} key={`topic:${current.id}`} group={group} current={current} conversations={conversations} activity={activity} select={selectChat} create={() => setNewChat({ kind: "topic", group })}/>}{sideButton}{workbenchButton}{screenButton}{!phone && current && <button ref={conversationSearchTrigger} className="icon-button conversation-search-trigger" aria-label={t("搜索当前对话")} title={t("搜索当前对话") + " (⌘F / Ctrl+F)"} aria-keyshortcuts="Meta+F Control+F" onClick={searchCurrentConversation}><Search size={18}/></button>}<button className={`connection-pill ${state.status}`} title={state.route?.url} aria-label={t("打开连接设置")} onClick={(event) => { event.currentTarget.focus(); setSettingsFromMenu(false); setSettingsSection("connection"); setSettings(true); }}>{state.status === "online" ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{connectionSummary}</span></button>{(phone || current) && <button ref={chatMoreTrigger} className="icon-button mobile-chat-more" aria-label={t("更多聊天操作")} aria-expanded={phone ? undefined : menu === "chat"} aria-controls={!phone && menu === "chat" ? `${menuId}-chat` : undefined} onClick={(event) => { event.currentTarget.focus(); history.refreshIfStale(); if (phone) setChatActions(true); else toggleMenu("chat"); }}><MoreHorizontal size={phone ? 24 : 18}/></button>}
       {pane?.headerTrailing}{!phone && current && <DesktopMenu id={`${menuId}-chat`} label={t("聊天操作")} open={menu === "chat"} close={closeMenu} trigger={chatMoreTrigger} placement="down-end" className="chat-menu">
         {current.botIds.length === 1 && !current.archived && !group?.archived && searchResults === undefined && state.engineTasksAvailable && <button onClick={() => { closeMenu(); setTaskListRequest({ conversationId: selected, id: Date.now() }); }}><ListOrdered size={16}/><span className="desktop-menu-label">{t("子代理与后台任务")}</span></button>}
         {immediateAvailable && <button aria-label={t("立即发送")} disabled={!draft.trim() || steeringBusy || sending} onClick={() => report(sendImmediately())}><ArrowUp size={16}/><span className="desktop-menu-text"><span>{t("立即发送")}</span><small>{t("由 CLI 后台继续工具或中断当前输出，再读入消息")}</small></span></button>}
@@ -1637,6 +1747,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
         {!current.parentId && !current.archived && <button disabled={state.status !== "online" || !state.foldersAvailable} title={state.status !== "online" || !state.foldersAvailable ? t("连接恢复或主机升级后可编辑分组") : undefined} onClick={() => setMovingConversation(current.id)}><FolderInput size={16}/><span className="desktop-menu-label">{t("移至分组")}</span></button>}
         {current.parentId && !current.archived && <><button disabled={!canRename || group?.archived} onClick={() => setRenameId(current.id)}><Pencil size={16}/><span className="desktop-menu-label">{t("重命名话题")}</span></button><button className="text-danger" disabled={!canRename || group?.archived} onClick={() => setRemoveTopicId(current.id)}><Trash2 size={16}/><span className="desktop-menu-label">{t("删除话题")}</span></button></>}
         {!isDispatcher(activeBot) && <button title={t("为当前 Bot 开一个独立对话")} onClick={() => setNewChat({ kind: "direct", ...(activeBot ? { botId: activeBot.id } : {}) })}><MessageSquarePlus size={16}/><span className="desktop-menu-label">{t("新对话")}</span></button>}
+        {conversationHistory.showForkHead && <><button disabled={conversationHistory.disabled} title={conversationHistory.disabled ? conversationForkBlockedReason : undefined} aria-describedby={conversationHistory.disabled && conversationForkBlockedReason ? `${chatActionNote}-menu-fork` : undefined} onClick={() => { closeMenu(); openHistoryForkHead(chatMoreTrigger.current); }}><GitBranch size={16}/><span className="desktop-menu-label">{t("分叉当前对话")}</span></button>{conversationHistory.disabled && conversationForkBlockedReason && <p id={`${chatActionNote}-menu-fork`} className="desktop-menu-note">{conversationForkBlockedReason}</p>}</>}
         {group && <button disabled={!!group.archived} onClick={() => setNewChat({ kind: "topic", group })}><Hash size={16}/><span className="desktop-menu-label">{t("新建话题")}</span></button>}
         {/* Keep explicit steering reachable when the selector replaces its
             desktop button. The extra stop entry is only for unobserved runs. */}
@@ -1683,7 +1794,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
         // Being near the bottom is not consent to follow: the first few pixels
         // of a pull are still near it. Rejoin only on an intentional return.
         if ((scrollingTowardLatest.current || scrollbarOrigin.current !== undefined && node.scrollTop > scrollbarOrigin.current) && node.scrollHeight - node.scrollTop - node.clientHeight <= 2) { followLatest.current = true; setShowLatest(false); setFocusTarget(undefined); }
-      }}>{phone && <div className="conversation-intro"><ShieldCheck size={14}/>{t("仅已授权设备可访问")}</div>}{messagesReady && group && current && !messages.length && <div className="conversation-empty"><MessageSquare size={28}/><h2>{current.parentId ? t("从这个话题开始") : t("默认讨论")}</h2><p>{current.parentId ? t("这里的消息只属于「{0}」。", current.title) : t("日常交流留在这里，不同事项可以新建话题。")}</p>{!group.archived && !current.parentId && !conversations.some((c) => c.parentId === group.id) && <button onClick={() => setNewChat({ kind: "topic", group })}><Plus size={16}/>{t("创建第一个话题")}</button>}</div>}{messagesReady && !group && current && !messages.length && !queued.length && <DirectEmpty botId={current.botIds[0] ?? "unknown"} name={labels.get(current.botIds[0] ?? "") ?? activeBot?.name ?? current.title} archived={!!current.archived} online={state.status === "online"} draftEmpty={!draft} commands={() => { if (draft) return; changeDraft("/"); composer.current?.focus(); }} attach={attachments.show} dispatcher={isDispatcher(activeBot)}/>}<div ref={historyRows} className="virtual-messages" style={{ height: Math.max(0, virtualizer.getTotalSize() - readingScroll.shift), transform: readingScroll.shift ? `translateY(${-readingScroll.shift}px)` : undefined }}><ReplyWidthContext.Provider value={replyWidth}>{virtualizer.getVirtualItems().map((item) => { const message = displayedMessages[item.index]!; const bot = botDirectory.find((b) => b.id === message.authorId); const scheduled = message.groupDiscussion?.role === "input"; const original = message.replyTo ? messagesById.get(message.replyTo) : undefined; if (isTicketNotice(message, isDispatcher(activeBot))) return <article ref={message.id === tailMessageId ? measureTail : virtualizer.measureElement} data-index={item.index} data-message-id={message.id} key={message.id} className="message dispatch-notice-row" style={{ transform: `translateY(${item.start}px)` }}><DispatchNotice message={message}/></article>; return <article ref={message.id === tailMessageId ? measureTail : virtualizer.measureElement} data-index={item.index} data-message-id={message.id} tabIndex={0} role={deletion.active ? "checkbox" : undefined} aria-checked={deletion.active ? deletion.selected.has(message.id) : undefined} aria-label={deletion.active ? t("选择消息：{0}", messageExcerpt(message).slice(0, 80) || authorName(message)) : undefined} aria-haspopup={phone && !deletion.active && !scheduled && !backgroundGroups.byAnchor.has(message.id) ? "dialog" : undefined} aria-expanded={phone && !deletion.active && !backgroundGroups.byAnchor.has(message.id) ? sheetTarget?.messageId === message.id : undefined} onKeyDown={event => { if (deletion.active) { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); deletion.toggle(message.id); } else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); deletion.close(); } return; } if (phone && !backgroundGroups.byAnchor.has(message.id) && event.target === event.currentTarget && (event.key === "Enter" || event.key === " " || event.key === "ContextMenu" || event.key === "F10" && event.shiftKey)) { event.preventDefault(); event.stopPropagation(); openMessageSheet(message, event.currentTarget); } }} onClick={event => { if (deletion.active) { event.preventDefault(); event.stopPropagation(); deletion.toggle(message.id); return; } if (phone && !backgroundGroups.byAnchor.has(message.id) && event.detail === 0 && event.target === event.currentTarget) openMessageSheet(message, event.currentTarget); }} key={backgroundGroups.byAnchor.get(message.id)?.key ?? message.id} className={`message ${message.authorType} ${scheduled ? "is-discussion-input" : ""} ${deletion.active ? `is-selecting ${deletion.selected.has(message.id) ? "is-selected" : ""}` : ""} ${(backgroundGroups.anchors.get(focusTarget?.messageId ?? "") ?? focusTarget?.messageId) === message.id ? "focused-message" : ""}`} style={{ transform: `translateY(${item.start}px)` }}>{deletion.active && deletion.check(message.id)}<div className="message-selection-content" inert={deletion.active || undefined}><div className={`message-avatar ${message.authorType}${live ? presence(message) : ""}`}><Avatar kind={message.authorType === "bot" ? "bot" : "user"} id={message.authorId} name={labels.get(message.authorId) ?? (message.authorType === "user" ? t("我") : "TaroBird")} size={32}/></div><div className="message-body"><div className="message-meta"><strong>{message.botSource?.botName ?? labels.get(message.authorId) ?? bot?.name ?? (message.authorType === "user" ? t("我") : "TaroBird")}</strong><time>{formatMessageTime(message.createdAt, locale, compactTime)}</time>{message.authorType === "user" && <UserReplyStatus replies={replyStatuses.get(message.id)} group={!!group} labels={labels}/>}{phone && <span className="message-action-status" aria-live="polite">{copied === message.id ? t("已复制") : ""}</span>}{!phone && !scheduled && !backgroundGroups.byAnchor.has(message.id) && <div className="message-actions"><button aria-label={t("复制消息")} onClick={() => report(navigator.clipboard.writeText(blocksText(message.blocks)))}><Copy size={13}/></button><button aria-label={t("引用回复")} title={t("引用回复")} disabled={groupSending || !!current?.archived || !!group?.archived} onClick={() => { setReply(message); composer.current?.focus(); }}><MessageSquare size={13}/><span>{t("引用")}</span></button><button aria-label={t("转发消息")} title={message.status === "streaming" ? t("生成完成后可转发") : t("转发消息")} disabled={!["complete", "error"].includes(message.status)} onClick={(event) => { forwardTrigger.current = event.currentTarget; setForwarding(message); }}><Forward size={13}/><span>{t("转发")}</span></button><GoogleExport connection={connection} messageId={message.id}/>{canRetry(message) && <button aria-label={t("重新发送消息")} disabled={retryBlocked} title={retryBlocked ? t("对话已归档，恢复后可重新发送。") : t("重新发送消息")} onClick={() => report(retryMessage(message))}><RotateCcw size={13}/></button>}</div>}</div>{message.botSource && <div className="bot-message-source" title={`${message.botSource.hostId}/${message.botSource.botId}`}><span>{t("来自 {0} · {1}", message.botSource.hostName, message.botSource.botName)}</span><small>{t("转发 {0} 层", message.botSource.hops)}</small></div>}<TurnStopContext.Provider value={turnStop.request}><MessageOverlayContext.Provider value={retainMessageOverlay}><WidgetComposeProvider owner={widgetOwner} active={widgetAllowed(selected)} scope={`${connection.identity.hubPublicKey}:${state.user?.id ?? ""}:${message.conversationId}:${message.id}`} message={message} compose={dispatchWidgetCompose}>{backgroundGroups.byAnchor.has(message.id) ? <BackgroundTaskGroup group={backgroundGroups.byAnchor.get(message.id)!} connection={connection} original={original} locate={locateMessage} focusRequest={focusTarget}/> : <ConversationMessageContent focusRequest={focusTarget} message={message} original={original} referenceAuthor={original ? messageAuthor(original, botDirectory) : undefined} referenceAvailable={!message.forwardedFrom || conversations.some(c => c.id === message.forwardedFrom!.conversationId)} scheduledName={labels.get(message.groupDiscussion?.botId ?? "") ?? botDirectory.find(b => b.id === message.groupDiscussion?.botId)?.name ?? t("Bot")} connection={connection} locate={locateMessage}/>}</WidgetComposeProvider></MessageOverlayContext.Provider></TurnStopContext.Provider></div></div></article>; })}</ReplyWidthContext.Provider></div><div ref={queuedRows} style={{ display: "flow-root" }}>{queued.filter((q) => q.error || !messages.some((m) => m.clientMsgId === q.id)).map((q) => <div className="queued-message" key={q.id}><span><ReferencePreview text={q.text}/></span><small>{q.error ? q.expired ? q.error : t("发送失败：{0}", q.error) : q.sent ? t("已发送") : q.syncing ? t("正在同步发送状态…") : q.blocked ? t("等待前一条消息处理") : t("等待发送")}</small>{q.error && <>{current?.type === "group" && q.copyable && <button onClick={() => { clearTimeout(copiedTimer.current); setCopied(undefined); let write: Promise<void>; try { write = navigator.clipboard.writeText(q.text); } catch (error) { write = Promise.reject(error); } write.then(() => { setCopied(q.id); copiedTimer.current = setTimeout(() => setCopied(undefined), 3000); }, () => setError(t("无法写入剪贴板，请检查权限后重试。"))); }}>{copied === q.id ? t("已复制") : t("复制文字")}</button>}{!q.expired && <button disabled={retryBlocked} title={retryBlocked ? t("对话已归档，恢复后可重新发送。") : undefined} onClick={() => { if (retryBlocked) return; report(connection.retryFailed(q.id)); }}>{t("重试")}</button>}<button onClick={() => report(connection.discardFailed(q.id))}>{t("移除待发送项")}</button></>}</div>)}</div>{pane && <span ref={readTail} aria-hidden="true" style={{ display: "block", height: 1 }}/>}</div>
+      }}>{phone && <div className="conversation-intro"><ShieldCheck size={14}/>{t("仅已授权设备可访问")}</div>}{current?.history?.forkedFrom && <ForkOriginBanner origin={current.history.forkedFrom} compactTime={compactTime} onOpen={() => openForkOrigin(current.history!.forkedFrom!)}/>}{messagesReady && group && current && !messages.length && <div className="conversation-empty"><MessageSquare size={28}/><h2>{current.parentId ? t("从这个话题开始") : t("默认讨论")}</h2><p>{current.parentId ? t("这里的消息只属于「{0}」。", current.title) : t("日常交流留在这里，不同事项可以新建话题。")}</p>{!group.archived && !current.parentId && !conversations.some((c) => c.parentId === group.id) && <button onClick={() => setNewChat({ kind: "topic", group })}><Plus size={16}/>{t("创建第一个话题")}</button>}</div>}{messagesReady && !group && current && !messages.length && !queued.length && <DirectEmpty botId={current.botIds[0] ?? "unknown"} name={labels.get(current.botIds[0] ?? "") ?? activeBot?.name ?? current.title} archived={!!current.archived} online={state.status === "online"} draftEmpty={!draft} commands={() => { if (draft) return; changeDraft("/"); composer.current?.focus(); }} attach={attachments.show} dispatcher={isDispatcher(activeBot)} forked={!!current.history?.forkedFrom}/>}<div ref={historyRows} className="virtual-messages" style={{ height: Math.max(0, virtualizer.getTotalSize() - readingScroll.shift), transform: readingScroll.shift ? `translateY(${-readingScroll.shift}px)` : undefined }}><ReplyWidthContext.Provider value={replyWidth}>{virtualizer.getVirtualItems().map((item) => { const row = timelineRows[item.index]!; if (row.kind === "rewind-group") return <div ref={row.key === tailRowKey ? measureTail : virtualizer.measureElement} data-index={item.index} data-row-key={row.key} data-rewind-group-id={row.key} key={row.key} className="message dispatch-notice-row rewind-notice-row" style={{ transform: `translateY(${item.start}px)` }}><RewindGroupNotice count={row.count} expanded={row.expanded} onToggle={() => toggleRewindGroup(row.key)}/></div>; const message = row.message; const bot = botDirectory.find((b) => b.id === message.authorId); const scheduled = message.groupDiscussion?.role === "input"; const original = message.replyTo ? messagesById.get(message.replyTo) : undefined; if (isTicketNotice(message, isDispatcher(activeBot))) return <article ref={row.key === tailRowKey ? measureTail : virtualizer.measureElement} data-index={item.index} data-row-key={row.key} data-message-id={message.id} key={message.id} className={`message dispatch-notice-row ${row.rewound ? "is-rewound" : ""}`} style={{ transform: `translateY(${item.start}px)` }}><DispatchNotice message={message}/></article>; let upstreamRejectionFooter: ReactNode; if (!row.rewound && message.id === lastUpstreamRejectionId) { const rejection = messageUpstreamRejection(message); if (rejection) { const resolved = resolveUpstreamRejectionActions({ messages, rejection, historyAvailable: !!state.historyAvailable, status: history.status, rewinds: current?.history?.rewinds, online: state.status === "online", readOnly: connection.isReadOnly, canCreateChat: !!activeBot && !isDispatcher(activeBot) && !dispatchWorker && !current?.archived && !group?.archived }); if (resolved.primary || resolved.secondary) upstreamRejectionFooter = <UpstreamRejectionActionsBar primary={resolved.primary} secondary={resolved.secondary} onRewind={(targetId, trigger) => { const target = messagesById.get(targetId); if (target) openHistoryRewind(target, trigger); }} onFork={(targetId, trigger) => { const target = messagesById.get(targetId); if (target) openHistoryForkTurn(target, trigger); }} onNewChat={() => setNewChat({ kind: "direct", ...(activeBot ? { botId: activeBot.id } : {}) })}/>; } } return <article ref={row.key === tailRowKey ? measureTail : virtualizer.measureElement} data-index={item.index} data-row-key={row.key} data-message-id={message.id} tabIndex={0} role={deletion.active ? "checkbox" : undefined} aria-checked={deletion.active ? deletion.selected.has(message.id) : undefined} aria-label={deletion.active ? t("选择消息：{0}", messageExcerpt(message).slice(0, 80) || authorName(message)) : undefined} aria-haspopup={phone && !deletion.active && !scheduled && !backgroundGroups.byAnchor.has(message.id) ? "dialog" : undefined} aria-expanded={phone && !deletion.active && !backgroundGroups.byAnchor.has(message.id) ? sheetTarget?.messageId === message.id : undefined} onKeyDown={event => { if (deletion.active) { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); deletion.toggle(message.id); } else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); deletion.close(); } return; } if (phone && !backgroundGroups.byAnchor.has(message.id) && event.target === event.currentTarget && (event.key === "Enter" || event.key === " " || event.key === "ContextMenu" || event.key === "F10" && event.shiftKey)) { event.preventDefault(); event.stopPropagation(); openMessageSheet(message, event.currentTarget); } }} onClick={event => { if (deletion.active) { event.preventDefault(); event.stopPropagation(); deletion.toggle(message.id); return; } if (phone && !backgroundGroups.byAnchor.has(message.id) && event.detail === 0 && event.target === event.currentTarget) openMessageSheet(message, event.currentTarget); }} key={row.key} className={`message ${message.authorType} ${scheduled ? "is-discussion-input" : ""} ${row.rewound ? "is-rewound" : ""} ${deletion.active ? `is-selecting ${deletion.selected.has(message.id) ? "is-selected" : ""}` : ""} ${(backgroundGroups.anchors.get(focusTarget?.messageId ?? "") ?? focusTarget?.messageId) === message.id ? "focused-message" : ""}`} style={{ transform: `translateY(${item.start}px)` }}>{deletion.active && deletion.check(message.id)}<div className="message-selection-content" inert={deletion.active || undefined}><div className={`message-avatar ${message.authorType}${live && !row.rewound ? presence(message) : ""}`}><Avatar kind={message.authorType === "bot" ? "bot" : "user"} id={message.authorId} name={labels.get(message.authorId) ?? (message.authorType === "user" ? t("我") : "TaroBird")} size={32}/></div><div className="message-body"><div className="message-meta"><strong>{message.botSource?.botName ?? labels.get(message.authorId) ?? bot?.name ?? (message.authorType === "user" ? t("我") : "TaroBird")}</strong><time>{formatMessageTime(message.createdAt, locale, compactTime)}</time>{message.authorType === "user" && <UserReplyStatus replies={replyStatuses.get(message.id)} group={!!group} labels={labels}/>}{phone && <span className="message-action-status" aria-live="polite">{copied === message.id ? t("已复制") : ""}</span>}{!phone && !scheduled && !backgroundGroups.byAnchor.has(message.id) && <div className="message-actions"><button aria-label={t("复制消息")} onClick={() => report(navigator.clipboard.writeText(blocksText(message.blocks)))}><Copy size={13}/></button><button aria-label={t("引用回复")} title={t("引用回复")} disabled={groupSending || !!current?.archived || !!group?.archived} onClick={() => { setReply(message); composer.current?.focus(); }}><MessageSquare size={13}/><span>{t("引用")}</span></button><button aria-label={t("转发消息")} title={message.status === "streaming" ? t("生成完成后可转发") : t("转发消息")} disabled={!["complete", "error"].includes(message.status)} onClick={(event) => { forwardTrigger.current = event.currentTarget; setForwarding(message); }}><Forward size={13}/><span>{t("转发")}</span></button><GoogleExport connection={connection} messageId={message.id}/>{canRetry(message) && <button aria-label={t("重新发送消息")} disabled={retryBlocked} title={retryBlocked ? t("对话已归档，恢复后可重新发送。") : t("重新发送消息")} onClick={() => report(retryMessage(message))}><RotateCcw size={13}/></button>}</div>}</div>{message.botSource && <div className="bot-message-source" title={`${message.botSource.hostId}/${message.botSource.botId}`}><span>{t("来自 {0} · {1}", message.botSource.hostName, message.botSource.botName)}</span><small>{t("转发 {0} 层", message.botSource.hops)}</small></div>}<TurnStopContext.Provider value={turnStop.request}><MessageOverlayContext.Provider value={retainMessageOverlay}><WidgetComposeProvider owner={widgetOwner} active={widgetAllowed(selected)} scope={`${connection.identity.hubPublicKey}:${state.user?.id ?? ""}:${message.conversationId}:${message.id}`} message={message} compose={dispatchWidgetCompose}>{backgroundGroups.byAnchor.has(message.id) ? <BackgroundTaskGroup group={backgroundGroups.byAnchor.get(message.id)!} connection={connection} original={original} locate={locateMessage} focusRequest={focusTarget}/> : <ConversationMessageContent focusRequest={focusTarget} message={message} original={original} referenceAuthor={original ? messageAuthor(original, botDirectory) : undefined} referenceAvailable={!message.forwardedFrom || conversations.some(c => c.id === message.forwardedFrom!.conversationId)} scheduledName={labels.get(message.groupDiscussion?.botId ?? "") ?? botDirectory.find(b => b.id === message.groupDiscussion?.botId)?.name ?? t("Bot")} connection={connection} locate={locateMessage} rewound={row.rewound} upstreamRejectionFooter={upstreamRejectionFooter}/>}</WidgetComposeProvider></MessageOverlayContext.Provider></TurnStopContext.Provider></div></div></article>; })}</ReplyWidthContext.Provider></div><div ref={queuedRows} style={{ display: "flow-root" }}>{queued.filter((q) => q.error || !messages.some((m) => m.clientMsgId === q.id)).map((q) => <div className="queued-message" key={q.id}><span><ReferencePreview text={q.text}/></span><small>{q.error ? q.expired ? q.error : t("发送失败：{0}", q.error) : q.sent ? t("已发送") : q.syncing ? t("正在同步发送状态…") : q.blocked ? t("等待前一条消息处理") : t("等待发送")}</small>{q.error && <>{current?.type === "group" && q.copyable && <button onClick={() => { clearTimeout(copiedTimer.current); setCopied(undefined); let write: Promise<void>; try { write = navigator.clipboard.writeText(q.text); } catch (error) { write = Promise.reject(error); } write.then(() => { setCopied(q.id); copiedTimer.current = setTimeout(() => setCopied(undefined), 3000); }, () => setError(t("无法写入剪贴板，请检查权限后重试。"))); }}>{copied === q.id ? t("已复制") : t("复制文字")}</button>}{!q.expired && <button disabled={retryBlocked} title={retryBlocked ? t("对话已归档，恢复后可重新发送。") : undefined} onClick={() => { if (retryBlocked) return; report(connection.retryFailed(q.id)); }}>{t("重试")}</button>}<button onClick={() => report(connection.discardFailed(q.id))}>{t("移除待发送项")}</button></>}</div>)}</div>{pane && <span ref={readTail} aria-hidden="true" style={{ display: "block", height: 1 }}/>}</div>
     : <WelcomeHome pairDevice={["macos", "windows"].includes(nativePlatform()) && state.status === "online" && state.user?.role === "owner" ? () => { setSettingsSection("pairing"); setSettings(true); } : undefined} hasBots={state.status !== "online" || state.bots.length > 0} newChat={() => setNewChat({ kind: "direct", ...(choosableBot ? { botId: choosableBot.id } : {}) })} newBot={() => shell ? shell.create("bot") : setNewBot(true)} newGroup={() => setNewChat({ kind: "group", ...(choosableBot ? { botId: choosableBot.id } : {}) })}/>}
     {deletion.toolbar}
     {!searchResults && selected && (current?.archived || group?.archived) && <div className="archived-notice"><span>{!current?.botIds.length || current.botIds.some(id => state.deletedBots?.some(bot => bot.id === id)) ? t("Bot 已删除，此对话仅保留历史记录。") : t("已归档，历史记录仍可查看。恢复后可继续讨论。")}</span><button onClick={() => { if (group?.archived) setSelected(group.id); setManage(true); }}>{current?.parentId && !group?.archived ? t("管理话题") : t("管理对话")}</button></div>}
@@ -1730,7 +1841,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   {renameTarget && visible && <RenameConversation key={renameTarget.id} connection={connection} conversation={renameTarget} returnFocus={conversationReturn} close={() => setRenameId(undefined)}/>}
   {removeTopicTarget && visible && <RemoveConversation key={removeTopicTarget.id} connection={connection} conversation={removeTopicTarget} returnFocus={conversationReturn} close={() => setRemoveTopicId(undefined)} removed={() => { setRemoveTopicId(undefined); if (currentSelection.current === removeTopicTarget.id) { setDetails(false); setManage(false); if (pane) pane.replace(removeTopicTarget.parentId!); else selectChat(removeTopicTarget.parentId!); } }}/>}
   {settingsTargets[0] && visible && <BotSettings key={settingsBotIds?.join("\0")} connection={connection} bot={settingsTargets[0]} name={settingsTargets[0].name} choices={settingsTargets} returnFocus={botSettingsReturn} close={() => setSettingsBotIds(undefined)}/>}
-  {manage && current && <ConversationPanel initialBot={detailBot} key={current.id} returnFocus={conversationReturn} group={group} chooseRecipient={(botId) => setRecipients([botId])} externalError={state.error} newChat={(botId) => { setDetails(false); setManage(false); setNewChat({ kind: "direct", botId }); }} connection={connection} conversation={current} pinned={pins.includes(current.id)} globallyPinned={globalPins.includes(current.id)} globalPin={value => connection.pinConversation(current.id, value, "global")} pin={value => connection.pinConversation(current.id, value)} close={() => setManage(false)}/>}
+  {manage && current && <ConversationPanel initialBot={detailBot} key={current.id} returnFocus={conversationReturn} group={group} chooseRecipient={(botId) => setRecipients([botId])} externalError={state.error} newChat={(botId) => { setDetails(false); setManage(false); setNewChat({ kind: "direct", botId }); }} historyFork={{ visible: conversationHistory.showForkHead, disabled: conversationHistory.disabled, blockedReason: conversationForkBlockedReason, refresh: history.refreshIfStale, fork: () => { setDetails(false); setManage(false); openHistoryForkHead(conversationReturn.current); } }} connection={connection} conversation={current} pinned={pins.includes(current.id)} globallyPinned={globalPins.includes(current.id)} globalPin={value => connection.pinConversation(current.id, value, "global")} pin={value => connection.pinConversation(current.id, value)} close={() => setManage(false)}/>}
   {conversationFiles && <ConversationFiles connection={connection} conversation={conversationFiles} bots={state.bots} close={() => setConversationFiles(undefined)} locate={(conversationId, messageId) => { setConversationFiles(undefined); setDetails(false); setSelected(conversationId); setSidebar(false); closeSearch(); setFocusTarget({ conversationId, messageId }); }}/> }
   {fileCenter && <FileCenter connection={connection} bots={state.bots} close={() => setFileCenter(false)} locate={(conversationId, messageId) => { setDetails(false); setSelected(conversationId); setSidebar(false); closeSearch(); setFocusTarget({ conversationId, messageId }); }}/>}
   {capabilities && <CapabilitiesPanel connection={connection} bots={state.bots} initialBot={detailBot ?? activeBot?.id} close={() => setCapabilities(false)} help={(request) => { const bot = state.bots.find(value => value.id === request.botId); if (bot) setCapabilityHelp({ request, bot }); }}/> }
@@ -1749,9 +1860,10 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   {operations && <OperationsPanel connection={connection} initialBot={operationBot} initialView={operationBot?.view} close={() => { setOperations(false); setOperationBot(undefined); }}/> }
   <MessageContextMenu opened={() => {
     readHistory(true);
+    history.refreshIfStale();
     // Retire a pending follow-to-end target at the reader's current position.
     if (scroll.current) virtualizer.scrollToOffset(scroll.current.scrollTop);
-  }} root={scroll} scope={selected} enabled={visible && !phone && !!selected && searchResults === undefined && !deletion.active} deletionAvailable={!!state.messageDeletionAvailable} select={deletion.start} remove={(message, trigger) => deletion.ask([message.id], trigger)} messages={messages} quoteBlocked={groupSending || !!current?.archived || !!group?.archived} quote={(message) => { setReply(message); composer.current?.focus(); }} forward={(message, trigger) => { forwardTrigger.current = trigger; setForwarding(message); }} copy={(text, html) => report(writeMessageSelection(text, html))}/>
+  }} root={scroll} scope={selected} enabled={visible && !phone && !!selected && searchResults === undefined && !deletion.active} deletionAvailable={!!state.messageDeletionAvailable} select={deletion.start} remove={(message, trigger) => deletion.ask([message.id], trigger)} history={message => { const h = messageHistoryFor(message); return { ...h, fork: openHistoryForkTurn, rewind: openHistoryRewind }; }} messages={messages} quoteBlocked={groupSending || !!current?.archived || !!group?.archived} quote={(message) => { setReply(message); composer.current?.focus(); }} forward={(message, trigger) => { forwardTrigger.current = trigger; setForwarding(message); }} copy={(text, html) => report(writeMessageSelection(text, html))}/>
   {forwarding && <ForwardMessage message={forwarding} conversations={listedChats} connection={connection} returnFocus={forwardReturn} close={() => setForwarding(undefined)} sent={(id) => { setForwarding(undefined); setSelected(id); setFocusTarget(undefined); closeSearch(); setSidebar(false); followLatest.current = true; }}/>}
     {settings && settingsSection === "connection" && <ConnectionPanel connection={connection} openScreen={openScreen} close={() => setSettings(false)} returnFocus={settingsFromMenu ? chatMoreTrigger : undefined}/>}
     {settings && settingsSection !== "connection" && <PreferencesPanel returnFocus={settingsFromMenu ? chatMoreTrigger : undefined} openWorkbenchFile={openLocalLibraryFile} initialSection={settingsSection === "pairing" ? "devices" : settingsSection} initialPairingStep={settingsSection === "pairing" ? 0 : undefined} connection={connection} manageNetwork={shell ? (beforeLeave, hostKey, options) => shell.manageHosts(beforeLeave, hostKey ?? connection.identity.hubPublicKey, options) : undefined} manageConnections={shell?.manageConnections} forget={async () => { if (shell) setSettings(false); await forget(); }} preferences={preferences} update={setPreferences} close={() => setSettings(false)}/>}
@@ -1769,6 +1881,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       <button onClick={() => { setChatActions(false); setConversationFiles(current); }} disabled={!current}><FolderOpen size={20}/>{t("文件")}</button>
       <button onClick={() => { setChatActions(false); setDetails(true); }}><Settings size={20}/>{t("对话详情")}</button>
       {!isDispatcher(activeBot) && <button onClick={() => { setChatActions(false); setNewChat({ kind: "direct", ...(activeBot ? { botId: activeBot.id } : {}) }); }}><Plus size={20}/>{t("新对话")}</button>}
+      {conversationHistory.showForkHead && <button className={conversationHistory.disabled && conversationForkBlockedReason ? "action-with-note" : undefined} aria-label={t("分叉当前对话")} aria-describedby={conversationHistory.disabled && conversationForkBlockedReason ? `${chatActionNote}-fork` : undefined} disabled={conversationHistory.disabled} onClick={() => { setChatActions(false); openHistoryForkHead(chatMoreTrigger.current); }}><GitBranch size={20}/>{conversationHistory.disabled && conversationForkBlockedReason ? <span className="action-text"><span>{t("分叉当前对话")}</span><small id={`${chatActionNote}-fork`}>{conversationForkBlockedReason}</small></span> : t("分叉当前对话")}</button>}
     </div>
     <div className="mobile-chat-action-list">
       <button aria-label={t("打开连接设置")} aria-describedby={`${chatActionNote}-connection`} onClick={() => { setChatActions(false); setSettingsFromMenu(true); setSettingsSection("connection"); setSettings(true); }}>{state.status === "online" ? <Wifi size={20}/> : <WifiOff size={20}/>}<span className="action-label">{t("连接状态与线路")}</span><span id={`${chatActionNote}-connection`} className="action-value">{connectionSummary}</span><ChevronRight className="action-chevron" size={18}/></button>
@@ -1777,6 +1890,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     {!replying && phoneTurnActions}
   </CreationDialog>}
   {deletion.dialog}
+  {historyConfirm && current && history.botId && <HistoryConfirmationDialog key={`${current.id}:${historyConfirm.kind}:${historyConfirm.kind === "rewind" ? historyConfirm.message.id : historyConfirm.mode === "turn" ? historyConfirm.message.id : "head"}`} connection={connection} conversation={current} botId={history.botId} messages={messages} status={history.status} request={historyConfirm} returnFocus={historyReturn} close={() => setHistoryConfirm(undefined)} onRewound={() => { setHistoryConfirm(undefined); history.invalidate(true); }} onForked={conversationId => { setHistoryConfirm(undefined); history.invalidate(true); if (pane) pane.navigate(conversationId); else selectChat(conversationId); if (!phone) pendingComposerFocus.current = conversationId; }}/>}
   {sheetTarget && <MessageActionSheet connection={connection} message={sheetMessage} meta={sheetMessage ? `${authorName(sheetMessage)} · ${formatMessageTime(sheetMessage.createdAt, locale)}` : ""} quoteBlocked={groupSending || !!current?.archived || !!group?.archived} canRetry={!!sheetMessage && canRetry(sheetMessage)} retryBlocked={retryBlocked} returnFocus={sheetReturn} close={closeSheet} actions={sheetActions}/>}
   {archives && <ArchivedConversations connection={connection} conversations={listedChats} close={() => setArchives(false)} open={id => { setSelected(id); setSidebar(false); setArchives(false); }}/>}
   {newBot && <NewBot hostName={shell?.host.name} localHost={(shell?.localHost ?? pane?.localHost)} setup={(bot, features) => { setNewBot(false); setCapabilityHelp({ bot, request: { botId: bot.id, kind: "integrations", features } }); }} connection={connection} close={() => setNewBot(false)} chat={(bot) => { setNewBot(false); report(connection.createConversation({ v: 1, type: "conversation.create", conversationType: "direct", botIds: [bot.id], title: t("与 {0} 的新对话", bot.name), clientActionId: `first_${bot.id}` }).then((conversation) => { if (pane) pane.navigate(conversation.id, undefined, conversation.title); else setSelected(conversation.id); setSidebar(false); closeSearch(); if (!phone) pendingComposerFocus.current = conversation.id; })); }}/>}
