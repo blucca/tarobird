@@ -4142,7 +4142,12 @@ export class CodexAppServerAdapter implements CodexAdapter {
         if (timedOut || present === undefined) throw new EngineHistoryUnconfirmedError();
         throw codexHistoryError(error);
       }
-      if (await this.historyTurnPresent(threadId, turnId)) throw new Error("engine_failed");
+      // The engine confirmed the revert; a look that cannot tell (read error,
+      // no end in sight) leaves it unconfirmed, not failed.
+      let present: boolean;
+      try { present = await this.historyTurnPresent(threadId, turnId); }
+      catch { throw new EngineHistoryUnconfirmedError(); }
+      if (present) throw new Error("engine_failed");
       return done(true);
     });
   }

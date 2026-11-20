@@ -239,6 +239,31 @@ describe("Codex history: rewind", () => {
       await expect(late).resolves.toEqual({ sessionId: "thr-1", reverted: true });
     } finally { adapter.destroy(); }
   });
+  it("leaves a confirmed revert unconfirmed when the look afterwards cannot tell, and failed only when it shows the turn", async () => {
+    const reverted = { thread: { id: "thr-1", ...OURS, turns: [] }, turnsBackwardsCursor: null, itemsBackwardsCursor: null };
+    const listed = page(turn("t3", 30), turn("t2", 20), turn("t1", 10));
+    for (const look of ["fails", "unreadable", "still listed"] as const) {
+      const h = harness();
+      try {
+        let recorded = 0;
+        const rewind = h.adapter.rewindSession("thr-1", { anchor: { firstTurnId: "t2" }, beforeRevert: async () => { recorded++; } });
+        rewind.catch(() => undefined);
+        await h.respond("initialize", {});
+        await h.respond("thread/resume", { thread: { id: "thr-1", ...OURS } });
+        await h.respond("thread/turns/list", listed);
+        await h.respond("thread/revert", reverted);
+        if (look === "fails") await h.fail("thread/turns/list", "internal error while listing turns", -32603, 2);
+        else await h.respond("thread/turns/list", look === "unreadable" ? { data: "not a list" } : listed, 2);
+        // The record was written before the engine change either way.
+        expect(recorded).toBe(1);
+        if (look === "still listed") {
+          await expect(rewind).rejects.toThrow("engine_failed");
+          await expect(rewind).rejects.not.toBeInstanceOf(EngineHistoryUnconfirmedError);
+        } else await expect(rewind).rejects.toBeInstanceOf(EngineHistoryUnconfirmedError);
+        expect(h.requests("thread/revert")).toHaveLength(1);
+      } finally { h.adapter.destroy(); }
+    }
+  });
   it("refuses a thread created by another client without listing or reverting", async () => {
     const h = harness();
     try {
