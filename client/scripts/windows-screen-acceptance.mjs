@@ -14,11 +14,10 @@ import { existsSync } from 'node:fs';
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { build as esbuild } from 'esbuild';
-import { WebSocket } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 import { HubServer } from '../../dist/src/hub/server.js';
 import { startHubControl } from '../../dist/src/hub/service.js';
 import { deviceProof, hashSecret } from '../../dist/src/hub/auth.js';
@@ -27,7 +26,6 @@ import { screenConfigureText, screenJoinSchema, screenStatusSchema } from '../..
 
 const execFileAsync = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PREFIX = 'TAROBIRD_ACC_MSG:';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const wait = async (check, ms = 8000) => {
   const end = Date.now() + ms;
@@ -160,40 +158,54 @@ function connectWs(url, cleanups) {
   return { ws, values, ready, send: v => ws.send(JSON.stringify(v)) };
 }
 
-function spawnTarget(electronBin, entryFile, { addon, hostDir, appState, profile }) {
+async function spawnTarget(electronBin, entryFile, { addon, hostDir, appState, profile }) {
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise((resolve, reject) => {
+    wss.once('listening', resolve);
+    wss.once('error', reject);
+  });
+  const addr = wss.address();
+  const rpcUrl = `ws://127.0.0.1:${addr.port}`;
+
+  let nextId = 1;
+  let clientWs = null;
+  const pending = new Map();
+  let readyResolve;
+  let readyReject;
+  const ready = new Promise((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+
+  wss.on('connection', ws => {
+    clientWs = ws;
+    ws.on('message', raw => {
+      let msg;
+      try { msg = JSON.parse(String(raw)); } catch { return; }
+      if (msg.event === 'ready') { readyResolve(); return; }
+      if (msg.id && pending.has(msg.id)) {
+        const entry = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (msg.ok) entry.resolve(msg.result);
+        else entry.reject(new Error(msg.error || 'target_rpc_failed'));
+      }
+    });
+  });
+
   const child = spawn(electronBin, [
     entryFile,
     '--addon', addon,
     '--host-dir', hostDir,
     '--app-state', appState,
     '--profile', profile,
-  ], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: false });
+    '--rpc-url', rpcUrl,
+  ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: false });
 
-  let nextId = 1;
-  const pending = new Map();
-  let readyResolve;
-  const ready = new Promise((resolve, reject) => {
-    readyResolve = resolve;
-    child.once('error', reject);
-    child.once('exit', code => {
-      for (const [, entry] of pending) entry.reject(new Error(`target_exited_${code}`));
-      pending.clear();
-      reject(new Error(`target_exited_before_ready_${code}`));
-    });
-  });
-
-  const rl = readline.createInterface({ input: child.stdout });
-  rl.on('line', line => {
-    if (!line.startsWith(PREFIX)) return;
-    let msg;
-    try { msg = JSON.parse(line.slice(PREFIX.length)); } catch { return; }
-    if (msg.event === 'ready') { readyResolve(); return; }
-    if (msg.id && pending.has(msg.id)) {
-      const entry = pending.get(msg.id);
-      pending.delete(msg.id);
-      if (msg.ok) entry.resolve(msg.result);
-      else entry.reject(new Error(msg.error || 'target_rpc_failed'));
-    }
+  child.once('error', err => readyReject(err));
+  child.once('exit', code => {
+    for (const [, entry] of pending) entry.reject(new Error(`target_exited_${code}`));
+    pending.clear();
+    readyReject(new Error(`target_exited_before_ready_${code}`));
   });
 
   const stderrChunks = [];
@@ -201,7 +213,11 @@ function spawnTarget(electronBin, entryFile, { addon, hostDir, appState, profile
     if (stderrChunks.length < 40) stderrChunks.push(String(chunk).slice(0, 400));
   });
 
-  const call = (op, payload = {}, timeoutMs = 20000) => new Promise((resolve, reject) => {
+  const call = (op, payload = {}, timeoutMs = 35000) => new Promise((resolve, reject) => {
+    if (!clientWs || clientWs.readyState !== WebSocket.OPEN) {
+      reject(new Error(`target_rpc_not_connected:${op}`));
+      return;
+    }
     const id = nextId++;
     const timer = setTimeout(() => {
       pending.delete(id);
@@ -211,11 +227,13 @@ function spawnTarget(electronBin, entryFile, { addon, hostDir, appState, profile
       resolve: value => { clearTimeout(timer); resolve(value); },
       reject: error => { clearTimeout(timer); reject(error); },
     });
-    child.stdin.write(`${JSON.stringify({ id, op, ...payload })}\n`);
+    clientWs.send(JSON.stringify({ id, op, ...payload }));
   });
 
   const close = async () => {
     try { await call('shutdown', {}, 5000); } catch { /* ignore */ }
+    try { clientWs?.terminate(); } catch { /* ignore */ }
+    try { wss.close(); } catch { /* ignore */ }
     try { child.kill(); } catch { /* ignore */ }
   };
 
@@ -372,11 +390,11 @@ async function main() {
     cleanups.push(stopControl);
 
     // 5. Launch isolated Electron target with real native addon + real ScreenService + synthetic capture.
-    const target = spawnTarget(electronBin, bundleFile, { addon: addonPath, hostDir, appState, profile: profileDir });
+    const target = await spawnTarget(electronBin, bundleFile, { addon: addonPath, hostDir, appState, profile: profileDir });
     cleanups.push(() => target.close());
     await target.ready;
 
-    const started = await target.call('start-service', {}, 20000);
+    const started = await target.call('start-service', {}, 35000);
     evidence.e2ePreflight = { preflight: started.preflight, serviceStatus: started.status };
 
     receipt.expect('service', 'native-addon-windows-platform', started.preflight.targetPlatform === 'windows' && started.preflight.monitorCount > 0,
@@ -573,17 +591,18 @@ async function main() {
         }
       }
     }
+  } catch (error) {
+    receipt.expect('harness', 'unexpected-error', false, String(error?.message ?? error).slice(0, 400));
   } finally {
     for (const fn of cleanups.reverse()) {
       try { await fn(); } catch { /* ignore */ }
     }
+    const reportJson = path.join(reportDir, 'windows-screen-acceptance.json');
+    const reportMd = path.join(reportDir, 'windows-screen-acceptance.md');
+    await writeFile(reportJson, JSON.stringify({ outcome: receipt.outcome, checks: receipt.checks, evidence }, null, 2));
+    await writeFile(reportMd, receipt.markdown(meta));
+    process.stdout.write(receipt.markdown(meta));
   }
-
-  const reportJson = path.join(reportDir, 'windows-screen-acceptance.json');
-  const reportMd = path.join(reportDir, 'windows-screen-acceptance.md');
-  await writeFile(reportJson, JSON.stringify({ outcome: receipt.outcome, checks: receipt.checks, evidence }, null, 2));
-  await writeFile(reportMd, receipt.markdown(meta));
-  process.stdout.write(receipt.markdown(meta));
   if (receipt.outcome === 'fail') process.exitCode = 1;
 }
 

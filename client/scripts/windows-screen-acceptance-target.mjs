@@ -9,15 +9,13 @@ import fs from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { app, BrowserWindow, ipcMain, powerMonitor, screen, shell, systemPreferences } from 'electron';
+import { WebSocket } from 'ws';
 import { ScreenService } from '../electron/screen-service.mjs';
 import { screenServiceTicket } from '../electron/screen-host-control.mjs';
 import { readHeldJournal } from '../electron/screen-held-journal.mjs';
 import { writeScreenFrame } from '../../src/client-protocol/screen-wire.ts';
-
-const PREFIX = 'TAROBIRD_ACC_MSG:';
 
 function parseCli(argv) {
   const out = {};
@@ -35,12 +33,16 @@ const addonFile = path.resolve(args.addon || '');
 const hostDir = path.resolve(args['host-dir'] || '');
 const appState = path.resolve(args['app-state'] || '');
 const profileDir = path.resolve(args.profile || path.join(appState, 'electron-profile'));
+const rpcUrl = args['rpc-url'] || '';
 
 app.setPath('userData', profileDir);
 app.setPath('sessionData', profileDir);
 
+let rpcWs = null;
 const emitMsg = payload => {
-  process.stdout.write(`${PREFIX}${JSON.stringify(payload)}\n`);
+  if (rpcWs && rpcWs.readyState === WebSocket.OPEN) {
+    rpcWs.send(JSON.stringify(payload));
+  }
 };
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -442,12 +444,17 @@ app.whenReady().then(() => {
   }, 90000);
   hardLimit.unref?.();
 
-  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-  rl.on('line', async line => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
+  if (!rpcUrl) {
+    app.exit(2);
+    return;
+  }
+  rpcWs = new WebSocket(rpcUrl);
+  rpcWs.on('open', () => {
+    emitMsg({ event: 'ready' });
+  });
+  rpcWs.on('message', async raw => {
     let cmd;
-    try { cmd = JSON.parse(trimmed); } catch { return; }
+    try { cmd = JSON.parse(String(raw)); } catch { return; }
     try {
       const result = await handle(cmd);
       emitMsg({ id: cmd.id, ok: true, result });
@@ -455,7 +462,16 @@ app.whenReady().then(() => {
       emitMsg({ id: cmd.id, ok: false, error: String(error?.message ?? error).slice(0, 300) });
     }
   });
-  emitMsg({ event: 'ready' });
+  rpcWs.on('error', async () => {
+    await shutdown();
+    app.exit(1);
+  });
+  rpcWs.on('close', async () => {
+    if (!shuttingDown) {
+      await shutdown();
+      app.exit(0);
+    }
+  });
 });
 
 app.on('window-all-closed', () => { /* controlled by shutdown command */ });
