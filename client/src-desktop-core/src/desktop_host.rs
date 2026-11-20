@@ -218,11 +218,17 @@ mod tests {
             let resources = root.join("resources/host");
             std::fs::create_dir_all(resources.join("dist/src")).unwrap();
             let node = std::env::var_os("TAROBOT_TEST_NODE").map(PathBuf::from).unwrap_or_else(|| {
+                #[cfg(unix)]
                 let out = std::process::Command::new("/bin/sh").args(["-c", "command -v node"]).output().unwrap();
-                PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
+                #[cfg(windows)]
+                let out = std::process::Command::new("where.exe").arg("node.exe").output().unwrap();
+                PathBuf::from(String::from_utf8(out.stdout).unwrap().lines().next().unwrap_or_default().trim())
             });
             assert!(node.is_file(), "a Node executable is required for the desktop_host lab (set TAROBOT_TEST_NODE)");
             #[cfg(unix)] std::os::unix::fs::symlink(&node, resources.join("node")).unwrap();
+            // The bundled runtime is `resources/host/node.exe` on Windows. A symlink
+            // there needs Developer Mode, so the lab places a copy, as the bundle does.
+            #[cfg(windows)] std::fs::copy(&node, resources.join("node.exe")).unwrap();
             std::fs::write(resources.join("dist/src/index.js"), fake_host).unwrap();
             let app_data = root.join("data/com.tarobot.client");
             let state = root.join("state");
@@ -282,7 +288,17 @@ process.stdin.on('end', () => {
         assert_eq!(std::fs::canonicalize(result["cwd"].as_str().unwrap()).unwrap(), std::fs::canonicalize(&lab.resources).unwrap());
         let path = result["path"].as_str().unwrap();
         assert!(path.starts_with(lab.resources.to_str().unwrap()), "bundled runtime must lead PATH: {path}");
+        #[cfg(not(windows))]
         assert!(path.contains("/.local/bin") && path.contains("/opt/homebrew/bin"));
+        #[cfg(windows)]
+        {
+            let entries: Vec<PathBuf> = std::env::split_paths(path).collect();
+            let home = std::env::home_dir().unwrap();
+            for expected in [home.join(".local/bin"), home.join(".cargo/bin"), home.join("scoop/shims")] {
+                assert!(entries.contains(&expected), "{} missing from PATH: {path}", expected.display());
+            }
+            assert!(!entries.contains(&PathBuf::from("/opt/homebrew/bin")), "macOS locations must not be searched on Windows: {path}");
+        }
         assert_eq!(result["device"], Value::Null);
         assert_eq!((result["nodeOptions"].clone(), result["nodePath"].clone()), (Value::Null, Value::Null));
         assert_eq!(host.run("shell", None).await.unwrap_err(), "invalid_desktop_host_action");
