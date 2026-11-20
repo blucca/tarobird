@@ -10,6 +10,19 @@ export type CodexQuotaRequest = (
 ) => Promise<unknown>;
 export type CodexQuotaReadResult = { snapshot: QuotaSnapshot; proof?: QuotaAccountProof };
 
+// codex-cli 0.170.0 reports a revoked or expired login on these two RPCs as JSON-RPC -32603 with a
+// fixed message (recorded against a loopback backend answering 401). Only that code, the RPC that
+// failed and the exact bounded prefix mean "sign in again"; other -32603 failures, rate limits,
+// transport errors or a 401 mentioned elsewhere in a body stay ordinary native errors.
+const NATIVE_UNAUTHORIZED: Record<Parameters<CodexQuotaRequest>[0], RegExp> = {
+  "account/read": /^workspace routing discovery unauthorized \(401\)$/,
+  "account/rateLimits/read": /^failed to fetch codex rate limits: GET [^\s;]{1,2048} failed: 401 Unauthorized(?:;|$)/,
+};
+function nativeUnauthorized(method: Parameters<CodexQuotaRequest>[0], error: unknown): boolean {
+  if (!(error instanceof Error) || (error as Error & { jsonRpcCode?: unknown }).jsonRpcCode !== -32603) return false;
+  return error.message.length <= 8192 && NATIVE_UNAUTHORIZED[method].test(error.message);
+}
+
 /** Does not start/stop the worker. Cancelling this read must never destroy a shared chatting worker. */
 export async function readCodexAccountQuota(options: {
   request: CodexQuotaRequest;
@@ -49,7 +62,9 @@ export async function readCodexAccountQuota(options: {
     };
     const read = async (method: Parameters<CodexQuotaRequest>[0], params: Parameters<CodexQuotaRequest>[1]) => {
       await checkScope();
-      const response = await wait(() => options.request(method, params, { signal: abort.signal, timeoutMs: Math.max(1, Math.ceil(deadline - performance.now())) }));
+      let response: unknown;
+      try { response = await wait(() => options.request(method, params, { signal: abort.signal, timeoutMs: Math.max(1, Math.ceil(deadline - performance.now())) })); }
+      catch (error) { if (nativeUnauthorized(method, error)) throw new QuotaReadError("login_required"); throw error; }
       await checkScope();
       // A native transport must bound its input too; this caps data handed to the pure parser.
       if (Buffer.byteLength(JSON.stringify(response) ?? "", "utf8") > 256 * 1024) throw new QuotaReadError("invalid_response");

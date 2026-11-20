@@ -15,10 +15,11 @@ afterEach(async () => { for (const dispose of disposals.splice(0)) await dispose
 const account = { account: { type: "chatgpt", email: "fixture@example.invalid", planType: "pro" }, requiresOpenaiAuth: true, userId: "fixture-user" };
 class Child extends EventEmitter {
   stdout = new EventEmitter(); stderr = new EventEmitter(); methods: string[] = []; killCount = 0; closed = false;
-  hold = new Set<string>(); closeDelayMs = 20; accounts: unknown[] = []; limits?: unknown;
+  hold = new Set<string>(); closeDelayMs = 20; accounts: unknown[] = []; limits?: unknown; errors: Record<string, { code: number; message: string }> = {};
   stdin = { write: (line: string, callback?: (error?: Error | null) => void) => {
     const request = JSON.parse(line); this.methods.push(request.method);
-    if (request.id != null && !this.hold.has(request.method)) queueMicrotask(() => this.reply(request.id,
+    if (request.id != null && this.errors[request.method]) { const error = this.errors[request.method]; queueMicrotask(() => this.stdout.emit("data", JSON.stringify({ id: request.id, error }) + "\n")); }
+    else if (request.id != null && !this.hold.has(request.method)) queueMicrotask(() => this.reply(request.id,
       request.method === "account/read" ? this.accounts.length ? this.accounts.shift() : account : request.method === "account/rateLimits/read" ? this.limits ?? { accountId: "fixture-account", rateLimits: { primary: { usedPercent: 25 } } } : {}));
     callback?.(null); return true;
   }, end: () => undefined, on: () => undefined };
@@ -285,5 +286,38 @@ describe("one-shot opaque Codex reads require a distinguishable native account",
     const result = await adapter.getAccountQuota({ refresh: true });
     expect(result.snapshot).toMatchObject({ state: "ready" });
     expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 30 });
+  });
+});
+
+// Recorded from real codex-cli 0.170.0 against a loopback backend answering 401 (FABLE quota-fable-lab).
+const real401 = {
+  account: { code: -32603, message: "workspace routing discovery unauthorized (401)" },
+  limits: { code: -32603, message: "failed to fetch codex rate limits: GET http://127.0.0.1:60045/backend-api/wham/usage failed: 401 Unauthorized; content-type=application/json; body={\"detail\":\"synthetic unauthorized\"}" },
+};
+describe("native Codex login revocation is reported as login required", () => {
+  const read = async (errors: Child["errors"], opaque = false) => {
+    const f = await fixture(), child = new Child(); child.errors = errors;
+    if (opaque) { await rm(path.join(f.codexHome, "auth.json")); await writeFile(path.join(f.codexHome, "config.toml"), 'cli_auth_credentials_store = "keyring"\n'); }
+    const adapter = new ProcessCodexAdapter("codex", f.env, () => child, undefined, undefined, undefined, f.root);
+    disposals.push(() => adapter.destroy());
+    return (await adapter.getAccountQuota({ refresh: true })).snapshot;
+  };
+  it.each([false, true])("account/read 401 means sign in again (opaque=%s)", async opaque => {
+    expect(await read({ "account/read": real401.account }, opaque)).toMatchObject({ state: "login_required", reason: "login_required", pools: [] });
+  });
+  it("rate-limit 401 after a readable account means sign in again", async () => {
+    expect(await read({ "account/rateLimits/read": real401.limits })).toMatchObject({ state: "login_required", reason: "login_required", pools: [] });
+  });
+  it.each([
+    ["other -32603 discovery failure", { "account/read": { code: -32603, message: "workspace routing discovery failed" } }],
+    ["missing backend origin", { "account/read": { code: -32603, message: "workspace routing discovery missing backend origin" } }],
+    ["rate limited", { "account/rateLimits/read": { code: -32603, message: "failed to fetch codex rate limits: GET http://127.0.0.1:1/backend-api/wham/usage failed: 429 Too Many Requests; body={}" } }],
+    ["server error whose body mentions 401", { "account/rateLimits/read": { code: -32603, message: "failed to fetch codex rate limits: GET http://127.0.0.1:1/backend-api/wham/usage failed: 500 Internal Server Error; body={\"detail\":\"401 Unauthorized\"}" } }],
+    ["offline transport text", { "account/read": { code: -32603, message: "error sending request: connection refused (401)" } }],
+    ["same text with a different JSON-RPC code", { "account/read": { code: -32600, message: "workspace routing discovery unauthorized (401)" } }],
+    ["unauthorized text with a suffix", { "account/read": { code: -32603, message: "workspace routing discovery unauthorized (401); retry later" } }],
+  ])("does not report %s as login required", async (_label, errors) => {
+    const snapshot = await read(errors);
+    expect(snapshot.state).not.toBe("login_required"); expect(snapshot).toMatchObject({ pools: [] });
   });
 });

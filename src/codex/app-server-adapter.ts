@@ -162,7 +162,10 @@ export class CodexThreadMissingError extends Error {
 const NO_CODEX_THREAD = "This chat has no Codex thread yet, so it has no goal";
 
 /** The app-server answered a request, and the answer was an error. Anything else that fails a request is not an answer. */
-class CodexAppServerReplyError extends Error {}
+class CodexAppServerReplyError extends Error {
+  /** The native JSON-RPC error code, when the reply carried a numeric one. */
+  constructor(message: string, readonly jsonRpcCode?: number) { super(message); }
+}
 
 /** Head of a thread that exists and has no turns. */
 const EMPTY_HISTORY_HEAD = "empty";
@@ -2038,7 +2041,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
         status: parsed.error ? "error" : "ok",
       };
       if (parsed.error) {
-        pending.reject(new CodexAppServerReplyError(parsed.error.message ?? "Unknown app-server error"));
+        pending.reject(new CodexAppServerReplyError(parsed.error.message ?? "Unknown app-server error", typeof parsed.error.code === "number" ? parsed.error.code : undefined));
       } else {
         pending.resolve(parsed.result);
       }
