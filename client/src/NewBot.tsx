@@ -1,6 +1,7 @@
 import { PiModelSelect, PiModelCatalogNotice } from "./PiModelSelect.js";
 import { DeepSeekModelCatalogNotice, deepSeekCatalogBlocked, deepSeekSettingsErrorText } from "./DeepSeekModelCatalog.js";
 import { ENGINE_SETTINGS_REPAIR_HINT } from "../../src/client-protocol/engine-settings.js";
+import { deepSeekDefaultUnavailable } from "../../src/client-protocol/model.js";
 import { EngineSettings } from "./EngineSettings.js";
 import { PermissionSelect } from "./PermissionSelect.js";
 import type { PermissionChoice } from "../../src/state/permission-options.js";
@@ -43,7 +44,9 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
   const options = catalog?.engines.find((e) => e.id === engine);
   const models = modelOptions(engine, options?.models ?? []), selectedModel = selectedModelOption(models, model);
   const displayedEffort = selectedModelEffort(selectedModel, { model, effort }), levels = selectedModel?.efforts ?? [""];
-  const validSelection = !!selectedModel && levels.includes(displayedEffort);
+  // Following a DSH default that does not exist is known to be refused; keep the choice, ask for a model.
+  const defaultUnavailable = deepSeekDefaultUnavailable(engine, options?.catalogStatus, options?.models), followsUnavailableDefault = defaultUnavailable && selectedModel?.id === "";
+  const validSelection = !!selectedModel && levels.includes(displayedEffort) && !followsUnavailableDefault;
   const changeEngine = (id: CreateBotInput["engine"], source = catalog) => { const next = source?.engines.find((e) => e.id === id); setEngine(id); if (id === "pi") setDispatcher(false); setModel(next?.defaultModel ?? ""); setEffort(effortValueSchema.safeParse(next?.defaultEffort ?? "").data ?? ""); setEffortAdjusted(false); setPermission(next?.permissions?.defaultChoice ?? "bypass"); };
   // A failed catalog read says why: only a missing endpoint means "update the
   // Hub". A dropped connection retries by itself once online; other failures
@@ -115,11 +118,11 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
       {/* Detection only proves the executable exists; sign-in is still the owner's step. */}
       <p id={cliHelp} className="new-bot-hint new-bot-cli"><SquareTerminal size={14} aria-hidden="true"/><span>{hostName ? t("需先在「{0}」安装此引擎的 CLI，并完成登录或 API 密钥配置。", hostName) : t("需先在运行主机上安装此引擎的 CLI，并完成登录或 API 密钥配置。")}</span></p>
       <div className="new-bot-pair">
-        {engine === "pi" ? <PiModelSelect models={models} value={model} disabled={busy || catalogLoading} change={value => { const next = selectModel(models, value, { model, effort }); setModel(next.model); setEffort(next.effort); setEffortAdjusted(!!displayedEffort && next.effort !== displayedEffort); }}/> : <label>{t("模型")}<select aria-label={t("模型")} disabled={catalogLoading} value={selectedModel?.id ?? model} onChange={(e) => { const next = selectModel(models, e.target.value, { model, effort }); setModel(next.model); setEffort(next.effort); setEffortAdjusted(!!displayedEffort && next.effort !== displayedEffort); }}>{options?.available && !selectedModel && <option value={model} disabled>{model || t("引擎默认")}</option>}{models.map((m) => <option key={m.id} value={m.id}>{modelOptionLabel(m, t("跟随引擎默认模型"))}</option>)}</select></label>}
+        {engine === "pi" ? <PiModelSelect models={models} value={model} disabled={busy || catalogLoading} change={value => { const next = selectModel(models, value, { model, effort }); setModel(next.model); setEffort(next.effort); setEffortAdjusted(!!displayedEffort && next.effort !== displayedEffort); }}/> : <label>{t("模型")}<select aria-label={t("模型")} disabled={catalogLoading} value={selectedModel?.id ?? model} onChange={(e) => { const next = selectModel(models, e.target.value, { model, effort }); setModel(next.model); setEffort(next.effort); setEffortAdjusted(!!displayedEffort && next.effort !== displayedEffort); }}>{options?.available && !selectedModel && <option value={model} disabled>{model || t("引擎默认")}</option>}{models.map((m) => <option key={m.id} value={m.id} disabled={defaultUnavailable && !m.id}>{defaultUnavailable && !m.id ? t("跟随引擎默认模型（未设置）") : modelOptionLabel(m, t("跟随引擎默认模型"))}</option>)}</select></label>}
         <label>{t("推理强度（effort）")}<select aria-label={t("推理强度（effort）")} disabled={catalogLoading} value={displayedEffort} onChange={(e) => { const next = selectModelEffort(selectedModel, model, e.target.value as CreateBotInput["effort"]); if (next) { setModel(next.model); setEffort(next.effort); setEffortAdjusted(false); } }}>{!levels.includes(displayedEffort) && <option value={displayedEffort} disabled>{displayedEffort} · {t("当前模型不支持")}</option>}{levels.map((value) => <option key={value} value={value}>{engine === "deepseek" && value === "off" ? t("关闭推理（off）") : value || t("跟随引擎默认强度")}</option>)}</select></label>
       </div>
-      {(engine === "pi" || engine === "deepseek") && options?.available && <>{engine === "pi" ? <PiModelCatalogNotice status={options.catalogStatus}/> : <DeepSeekModelCatalogNotice status={options.catalogStatus}/>}<button type="button" disabled={busy || catalogLoading || !online || !!pending.current} onClick={reloadCatalog}>{t("重新读取模型")}</button></>}
-      {options?.available && !validSelection && !deepSeekCatalogBlocked(engine, options.catalogStatus) && <p role="alert" className="dashboard-notice">{t("此前选择的模型或推理强度已不可用，请重新选择。")}</p>}
+      {(engine === "pi" || engine === "deepseek") && options?.available && <>{engine === "pi" ? <PiModelCatalogNotice status={options.catalogStatus}/> : <DeepSeekModelCatalogNotice status={options.catalogStatus} defaultUnavailable={defaultUnavailable}/>}<button type="button" disabled={busy || catalogLoading || !online || !!pending.current} onClick={reloadCatalog}>{t("重新读取模型")}</button></>}
+      {options?.available && !validSelection && !followsUnavailableDefault && !deepSeekCatalogBlocked(engine, options.catalogStatus) && <p role="alert" className="dashboard-notice">{t("此前选择的模型或推理强度已不可用，请重新选择。")}</p>}
       {effortAdjusted && <p className="dashboard-notice">{t("已调整为此模型支持的思考强度，请确认。")}</p>}
       {engine === "antigravity" && !model && <p className="new-bot-hint">{t("跟随默认模型时也跟随默认强度；选择具体模型后可调整其支持的档位。")}</p>}
     </div>

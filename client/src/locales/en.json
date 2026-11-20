@@ -5463,5 +5463,8 @@
   "未能读取额度列表，请重新读取。保留的读数不代表当前余额。": "The quota list could not be read. Reload it. Previous readings may not reflect current balances.",
   "上次读数，需重新读取": "Previous reading; refresh required",
   "暂时无法确认当前授权，未展示历史额度。": "Current authorization could not be verified. Previous quota values are hidden.",
-  "原生服务报告使用受限；窗口剩余量不代表可以继续请求。": "The native service reports a restriction. Remaining window quota does not mean requests are allowed."
+  "原生服务报告使用受限；窗口剩余量不代表可以继续请求。": "The native service reports a restriction. Remaining window quota does not mean requests are allowed.",
+  "主机上的 DeepSeek Harness 未设置可用的默认模型，无法跟随默认。请选择具体模型；不会自动替你选择。": "DeepSeek Harness on the Host has no usable default model, so following the default is unavailable. Choose a specific model; none is chosen for you.",
+  "跟随引擎默认模型（未设置）": "Follow engine default model (not set)",
+  "引擎默认模型（未设置）": "Engine default model (not set)"
 }

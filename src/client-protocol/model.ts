@@ -19,4 +19,15 @@ export const modelResultSchema = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(false), error: modelErrorSchema }),
 ]);
 export type ModelSettings = z.infer<typeof modelSettingsSchema>;
+
+/** A ready DeepSeek catalog marks a usable DSH default by giving its "" (follow default) choice a
+ * provider/modelId, the same condition the Host checks before accepting that choice. Without them
+ * the Host rejects following the default, so entries present it as unavailable and ask for a
+ * concrete model. Older Hosts (no catalog status) and other engines are never affected. */
+export function deepSeekDefaultUnavailable(engine: string | undefined, status: string | undefined,
+  choices: readonly { id: string; provider?: string; modelId?: string }[] | undefined): boolean {
+  if (engine !== "deepseek" || status !== "ready" || !choices) return false;
+  const fallback = choices.find(choice => choice.id === "");
+  return !!fallback && !(fallback.provider && fallback.modelId) && choices.some(choice => !!choice.id && !!choice.provider && !!choice.modelId);
+}
 export type ModelPatch = z.infer<typeof modelPatchSchema>;

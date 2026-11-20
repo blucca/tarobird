@@ -39,6 +39,18 @@ existing shared revision and file mutex, so a stale device or concurrent edit
 cannot overwrite another change. An exact no-op remains safe when discovery is
 unavailable. Older Hosts without catalog status retain their existing API behavior.
 
+A ready catalog gives the follow-default choice the resolved DSH default's
+provider/model identity. When DSH has concrete models but no usable default
+(never set, or pointing to a removed route), that choice has no identity and the
+Host refuses it. Creation, Bot settings and the composer quick menus share
+`deepSeekDefaultUnavailable` to recognize this case: they disable follow-default,
+say that no usable default model is set and ask for a specific model. They
+neither rewrite the saved value nor pick a model for the user, and an existing
+Bot can be corrected by choosing one. Once DSH reports a default again,
+follow-default becomes selectable on the next catalog read. Older Hosts, other
+engines and unavailable catalogs are unaffected. Effort-only settings do not
+receive the model catalog and still report the Host's refusal after submission.
+
 At each native task boundary, the adapter revalidates the exact route and effort
 against native metadata and checks the native selection acknowledgement. Changed
 settings are explicitly applied even if the remote follow projection is still

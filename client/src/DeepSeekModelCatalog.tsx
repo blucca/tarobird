@@ -6,8 +6,8 @@ type Status = "ready" | "no-models" | "unavailable" | undefined;
 export function deepSeekCatalogBlocked(engine: string, status: Status) {
   return engine === "deepseek" && status !== undefined && status !== "ready";
 }
-export function DeepSeekModelCatalogNotice({ status }: { status: Status }) {
-  if (status === "ready") return null;
+export function DeepSeekModelCatalogNotice({ status, defaultUnavailable = false }: { status: Status; defaultUnavailable?: boolean }) {
+  if (status === "ready") return defaultUnavailable ? <p className="dashboard-notice" role="status">{t("主机上的 DeepSeek Harness 未设置可用的默认模型，无法跟随默认。请选择具体模型；不会自动替你选择。")}</p> : null;
   return <p className="dashboard-notice" role="status">{status === "no-models"
     ? t("DeepSeek 未提供可用模型。请检查主机上的提供商配置与授权，然后重新读取；已保存的选择和当前填写内容会保留。")
     : status === "unavailable"

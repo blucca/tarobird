@@ -15,7 +15,8 @@ import en from "../src/locales/en.json" with { type: "json" };
 // Synthetic catalog responses exercise the built App and signed Hub connection.
 // Native discovery/acceptance are covered by Host tests, never a model call here.
 const choices: ModelSettings["choices"] = [
-  { id: "", label: "alpha / Shared model", efforts: ["", "off", "medium", "high"] },
+  // A ready Host attaches the resolved DSH default's identity to follow-default (real DSH 0.2.2-rc.5 shape).
+  { id: "", label: "alpha / Shared model", provider: "alpha", modelId: "org/shared", efforts: ["", "off", "medium", "high"] },
   { id: "alpha/org/shared", provider: "alpha", modelId: "org/shared", label: "Shared model", efforts: ["", "off", "medium", "high"] },
   { id: "beta/org/shared", provider: "beta", modelId: "org/shared", label: "Shared model", efforts: [""] },
   // The encoding is deliberately opaque to the App, including slash/percent.
@@ -193,6 +194,73 @@ test("DeepSeek quick menus block incomplete catalogs and preserve opaque IDs", a
     await page.screenshot({ path: info.outputPath("deepseek-quick-effort.png") });
     await levels.getByRole("button", { name: "关闭推理（off）", exact: true }).click();
     await expect.poll(() => f.writes.length).toBe(2); expect(f.writes[1]).toMatchObject({ model: choices[3]!.id, effort: "off" });
+  } finally { await f.close(); }
+});
+
+// DSH has concrete models but no usable default (removed or never set): "follow default" is refused by the Host.
+const withoutDefault: ModelSettings["choices"] = [{ id: "", efforts: [""] }, ...choices.slice(1)];
+for (const english of [false, true]) test(`DeepSeek without a usable default asks for a concrete model in creation and recovers · ${english ? "en" : "zh"}`, async ({ browser }, info) => {
+  const context = await browser.newContext({ viewport: { width: 390, height: 900 }, locale: english ? "en-US" : "zh-CN", serviceWorkers: "block" });
+  const page = await context.newPage(), f = await fixture(page, english);
+  try {
+    f.settings = { ...f.settings, choices: withoutDefault };
+    await newBot(page, f); await page.getByLabel(f.text("Bot 名称"), { exact: true }).fill("Synthetic draft");
+    const model = page.getByLabel(f.text("模型"), { exact: true }), create = page.getByRole("button", { name: f.text("创建 Bot"), exact: true });
+    const notice = page.getByRole("status").filter({ hasText: f.text("主机上的 DeepSeek Harness 未设置可用的默认模型，无法跟随默认。请选择具体模型；不会自动替你选择。") });
+    // The draft stays on follow-default; nothing is chosen for the user, and the refused request cannot be sent.
+    await expect(notice).toBeVisible(); await expect(model).toHaveValue("");
+    await expect(model.locator('option[value=""]')).toBeDisabled(); await expect(model.locator('option[value=""]')).toHaveText(f.text("跟随引擎默认模型（未设置）"));
+    await expect(create).toBeDisabled(); await expect(page.getByText(f.text("此前选择的模型或推理强度已不可用，请重新选择。"))).toHaveCount(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.screenshot({ path: info.outputPath("deepseek-default-missing.png"), fullPage: true });
+    await model.selectOption(choices[1]!.id); await expect(create).toBeEnabled(); await expect(notice).toBeVisible();
+    // The default returns: the explicit choice is kept and follow-default is offered again.
+    f.settings = { ...f.settings, choices };
+    await page.getByRole("button", { name: f.text("重新读取模型"), exact: true }).click();
+    await expect(notice).toHaveCount(0); await expect(model).toHaveValue(choices[1]!.id); await expect(create).toBeEnabled();
+    await model.selectOption(""); await expect(model).toHaveValue(""); await expect(create).toBeEnabled();
+    expect(f.creates).toEqual([]);
+  } finally { await f.close(); await context.close(); }
+});
+
+test("DeepSeek without a usable default lets an existing Bot be corrected in quick menus and settings", async ({ page }) => {
+  const f = await fixture(page, false);
+  try {
+    f.settings = { ...f.settings, model: "", effort: "high", choices: withoutDefault };
+    // Quick menus offer only the concrete models while the Bot still follows the missing default.
+    await page.locator(".conversation-row").filter({ has: page.getByText("DeepSeek model fixture", { exact: true }) }).click();
+    const controls = page.locator(".host-workspace:not([hidden]) .composer-model-controls");
+    await controls.getByRole("button", { name: /^思考强度：/ }).click();
+    const levels = page.getByRole("group", { name: "快捷选择思考强度", exact: true });
+    await expect(levels.getByRole("status")).toContainText("未设置可用的默认模型");
+    await expect(levels.getByRole("button", { name: "跟随默认", exact: true })).toBeDisabled();
+    await page.keyboard.press("Escape"); await levels.waitFor({ state: "hidden" });
+    await controls.getByRole("button", { name: /^模型设置：/ }).click();
+    const menu = page.getByRole("group", { name: "快捷选择模型", exact: true });
+    await expect(menu.getByRole("status")).toContainText("未设置可用的默认模型");
+    await expect(menu.getByRole("button", { name: /^引擎默认模型（未设置）/ })).toBeDisabled();
+    await menu.getByRole("button", { name: /beta \/ Shared model/ }).click();
+    await expect.poll(() => f.writes.length).toBe(1); expect(f.writes[0]).toMatchObject({ model: choices[2]!.id, effort: "" });
+    // Settings: the follow-default draft is shown but cannot be saved; a concrete model corrects it.
+    f.settings = { ...f.settings, model: "", effort: "high", revision: "c".repeat(64) };
+    await openModel(page, f);
+    const existing = page.getByLabel("选择模型", { exact: true }), save = page.getByRole("button", { name: "保存到此 Bot", exact: true });
+    await expect(page.getByRole("status").filter({ hasText: "未设置可用的默认模型" })).toBeVisible();
+    await expect(existing).toHaveValue(""); await expect(existing.locator('option[value=""]')).toBeDisabled(); await expect(save).toBeDisabled();
+    await existing.selectOption(choices[3]!.id); await expect(save).toBeEnabled(); await save.click();
+    await expect.poll(() => f.writes.length).toBe(2); expect(f.writes[1]).toEqual({ revision: "c".repeat(64), model: choices[3]!.id, effort: "" });
+  } finally { await f.close(); }
+});
+
+test("DeepSeek older Hosts keep follow-default selectable without a catalog status", async ({ page }) => {
+  const f = await fixture(page, false);
+  try {
+    f.settings = { ...f.settings, catalogStatus: undefined, choices: [{ id: "", efforts: ["", "low", "high", "max"] }, { id: "legacy/model", efforts: ["", "low", "high", "max"] }] };
+    await newBot(page, f); await page.getByLabel("Bot 名称", { exact: true }).fill("Legacy draft");
+    const model = page.getByLabel("模型", { exact: true });
+    await expect(model).toHaveValue(""); await expect(model.locator('option[value=""]')).toBeEnabled();
+    await expect(page.getByText("未设置可用的默认模型")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "创建 Bot", exact: true })).toBeEnabled();
   } finally { await f.close(); }
 });
 

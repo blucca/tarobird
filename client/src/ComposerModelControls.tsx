@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { Check, ChevronDown, Cpu, LoaderCircle, Zap } from "lucide-react";
-import { modelSettingsSchema, type ModelSettings } from "../../src/client-protocol/model.js";
+import { deepSeekDefaultUnavailable, modelSettingsSchema, type ModelSettings } from "../../src/client-protocol/model.js";
 import type { Bot, HubConnection } from "./connection.js";
 import { DesktopMenu, DesktopMenuPortalContext } from "./DesktopMenu.js";
 import { useBotSettingsRequest } from "./bot-settings-request.js";
@@ -64,6 +64,8 @@ function ComposerModelMenu({ id, picker, connection, bot, online, trigger, close
   const levels = selected?.efforts ?? data?.customEfforts ?? [];
   // An uncertain write must be read back before another choice can be submitted.
   const disabled = busy || !online || error !== undefined || deepSeekCatalogBlocked(data?.engine ?? bot.engine, data?.catalogStatus);
+  // The Host refuses "follow default" (and effort changes while following it) when DSH has no usable default.
+  const defaultUnavailable = deepSeekDefaultUnavailable(data?.engine, data?.catalogStatus, data?.choices);
   function choose(next: { model: string; effort: ModelSettings["effort"] } | undefined) {
     if (!data || disabled || !next) return;
     if (next.model === data.model && next.effort === data.effort) { trigger.current?.focus({ preventScroll: true }); close(); return; }
@@ -73,13 +75,13 @@ function ComposerModelMenu({ id, picker, connection, bot, online, trigger, close
     <DesktopMenu id={id} label={picker === "model" ? t("快捷选择模型") : t("快捷选择思考强度")} open close={() => { if (!saving) close(); }} trigger={trigger} placement="up-end" className="composer-settings-menu">
       <p className="desktop-menu-heading"><span>{picker === "model" ? t("选择模型") : (selected ? modelOptionLabel(selected, t("引擎默认模型")) : data?.model || bot.model || t("引擎默认模型"))}</span><span className="desktop-menu-value">{data?.engine ?? bot.engine}</span></p>
       {data?.engine === "pi" && picker === "model" && <><input className="pi-model-search" type="search" aria-label={t("搜索提供商或模型")} placeholder={t("搜索提供商或模型")} value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key !== "Escape" && event.key !== "Tab") event.stopPropagation(); }}/><PiModelCatalogNotice status={data.catalogStatus}/></>}
-      {data?.engine === "deepseek" && <DeepSeekModelCatalogNotice status={data.catalogStatus}/>}
+      {data?.engine === "deepseek" && <DeepSeekModelCatalogNotice status={data.catalogStatus} defaultUnavailable={defaultUnavailable}/>}
       {data && picker === "model" && shownOptions.map(option => {
         const next = selectModel(options, option.id, data, data.customEfforts);
-        return <button key={option.id} type="button" data-menu-keep="" aria-pressed={selected?.id === option.id} disabled={disabled} onClick={() => choose(selected?.id === option.id ? { model: data.model, effort: data.effort } : next)}><span className="quick-setting-check">{selected?.id === option.id && <Check size={14}/>}</span><span className="desktop-menu-label">{modelOptionLabel(option, t("引擎默认模型"))}</span><span className="desktop-menu-value">{data.engine === "deepseek" && next.effort === "off" ? t("关闭推理（off）") : next.effort || t("跟随默认")}</span></button>;
+        return <button key={option.id} type="button" data-menu-keep="" aria-pressed={selected?.id === option.id} disabled={disabled || defaultUnavailable && !option.id} onClick={() => choose(selected?.id === option.id ? { model: data.model, effort: data.effort } : next)}><span className="quick-setting-check">{selected?.id === option.id && <Check size={14}/>}</span><span className="desktop-menu-label">{defaultUnavailable && !option.id ? t("引擎默认模型（未设置）") : modelOptionLabel(option, t("引擎默认模型"))}</span><span className="desktop-menu-value">{data.engine === "deepseek" && next.effort === "off" ? t("关闭推理（off）") : next.effort || t("跟随默认")}</span></button>;
       })}
       {data && picker === "model" && !shownOptions.length && <p className="desktop-menu-note" role="status">{t("没有匹配的模型")}</p>}
-      {data && picker === "effort" && levels.map(level => <button key={level} type="button" data-menu-keep="" aria-pressed={effort === level} disabled={disabled} onClick={() => choose(level === effort ? { model: data.model, effort: data.effort } : selectModelEffort(selected, data.model, level))}><span className="quick-setting-check">{effort === level && <Check size={14}/>}</span><span className="desktop-menu-label">{data.engine === "deepseek" && level === "off" ? t("关闭推理（off）") : level || t("跟随默认")}</span></button>)}
+      {data && picker === "effort" && levels.map(level => <button key={level} type="button" data-menu-keep="" aria-pressed={effort === level} disabled={disabled || defaultUnavailable && selected?.id === ""} onClick={() => choose(level === effort ? { model: data.model, effort: data.effort } : selectModelEffort(selected, data.model, level))}><span className="quick-setting-check">{effort === level && <Check size={14}/>}</span><span className="desktop-menu-label">{data.engine === "deepseek" && level === "off" ? t("关闭推理（off）") : level || t("跟随默认")}</span></button>)}
       {busy && <p className="desktop-menu-note" role="status"><LoaderCircle size={14} className="spin"/>{saving ? t("保存中…") : t("正在读取…")}</p>}
       {error !== undefined && <><p className="quick-setting-error" role="alert">{modelSettingsErrorText(error)}</p><button type="button" data-menu-keep="" disabled={busy || !online} onClick={() => void load()}>{t("重新读取")}</button></>}
       {error === undefined && (data?.engine === "pi" || data?.engine === "deepseek") && data.catalogStatus !== "ready" && <button type="button" data-menu-keep="" disabled={busy || !online} onClick={() => void load()}>{t("重新读取")}</button>}

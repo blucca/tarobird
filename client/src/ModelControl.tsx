@@ -3,7 +3,7 @@ import { DeepSeekModelCatalogNotice, deepSeekCatalogBlocked, deepSeekSettingsErr
 import { decodePiModel } from "../../src/codex/pi-models.js";
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown, Cpu } from "lucide-react";
-import { modelSettingsSchema, modelValueSchema, type ModelSettings } from "../../src/client-protocol/model.js";
+import { deepSeekDefaultUnavailable, modelSettingsSchema, modelValueSchema, type ModelSettings } from "../../src/client-protocol/model.js";
 import type { Bot, HubConnection } from "./connection.js";
 import { CreationDialog } from "./CreationDialog.js";
 import { useBotSettingsRequest } from "./bot-settings-request.js";
@@ -53,8 +53,9 @@ function ModelDialog({ connection, bot, online, close, returnFocus }: { connecti
     setDraft(next.model); setEffort(next.effort); setAdjusted(next.effort !== displayedEffort);
   }
   const catalogBlocked = deepSeekCatalogBlocked(data?.engine ?? bot.engine, data?.catalogStatus);
+  const defaultUnavailable = deepSeekDefaultUnavailable(data?.engine, data?.catalogStatus, data?.choices);
   const writeBlocked = busy || !online || catalogBlocked || (data?.engine === "deepseek" && error !== undefined);
-  const valid = modelValueSchema.safeParse(draft).success && (data?.engine === "pi" ? !draft || !!decodePiModel(draft) : draft.length <= (data?.engine === "deepseek" ? 512 : 128))
+  const valid = !(defaultUnavailable && !custom && !draft) && modelValueSchema.safeParse(draft).success && (data?.engine === "pi" ? !draft || !!decodePiModel(draft) : draft.length <= (data?.engine === "deepseek" ? 512 : 128))
     && (!custom || !!draft.trim()) && levels.includes(displayedEffort);
   return <CreationDialog mobilePage title={t("模型设置")} closeLabel={t("关闭模型设置")} close={close} busy={saving} returnFocus={returnFocus}>
     <div className="effort-settings" data-engine={data?.engine}>
@@ -65,11 +66,11 @@ function ModelDialog({ connection, bot, online, close, returnFocus }: { connecti
           const value = event.target.value; setCustom(value === "__custom__"); changeModel(value === "__custom__" ? "" : value);
         }}>
           {!custom && !selectedModel && <option value={draft} disabled>{draft || t("引擎默认模型")}</option>}
-          {models.map(choice => <option key={choice.id} value={choice.id}>{modelOptionLabel(choice, t("引擎默认模型"))}</option>)}
+          {models.map(choice => <option key={choice.id} value={choice.id} disabled={defaultUnavailable && !choice.id}>{defaultUnavailable && !choice.id ? t("引擎默认模型（未设置）") : modelOptionLabel(choice, t("引擎默认模型"))}</option>)}
           <option value="__custom__">{t("自定义模型…")}</option>
         </select></label>}
         {data.engine === "pi" && <><PiModelCatalogNotice status={data.catalogStatus}/><button type="button" disabled={busy || !online} onClick={() => { setCustom(!custom); }}>{custom ? t("从列表选择模型") : t("自定义模型…")}</button></>}
-        {data.engine === "deepseek" && <DeepSeekModelCatalogNotice status={data.catalogStatus}/>}
+        {data.engine === "deepseek" && <DeepSeekModelCatalogNotice status={data.catalogStatus} defaultUnavailable={defaultUnavailable}/>}
         {custom && <label>{t("模型 ID")}<input aria-label={t("模型 ID")} value={draft} maxLength={data.engine === "pi" || data.engine === "deepseek" ? 512 : 128} disabled={busy || !online} autoCapitalize="none" autoCorrect="off" spellCheck={false} onChange={event => {
           const value = event.target.value; setDraft(value);
           const choices = data.choices.find(choice => choice.id === value)?.efforts ?? data.customEfforts;
