@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import {
   PI_TUI_BUILTIN_COMMANDS, PiFrameTooLargeError, PiJsonlDecoder,
   classifyPiError, encodePiRecord, isPiPlaceholderModel, parsePiFrame, parsePiSlashCommand,
-  samePiModel, sanitizePiErrorText, toPiModelRef,
+  piDisplayText, samePiModel, sanitizePiErrorText, toPiModelRef,
 } from "../src/codex/pi-rpc-protocol.js";
 
 const FIXTURE_DIR = fileURLToPath(new URL("./fixtures/pi-rpc/", import.meta.url));
@@ -265,7 +265,24 @@ describe("PiJsonlDecoder", () => {
   });
 });
 
+it("keeps extension content and multiline/emoji text while removing terminal presentation", () => {
+  const content = "C:\\Projects\\notes.txt\n\t中文 👩‍💻 api_key=synthetic_display_value";
+  expect(piDisplayText(`\x1b[31m${content}\x1b[0m`)).toBe(content);
+});
+
 describe("sanitizePiErrorText", () => {
+  it("removes residual control and directional formatting characters", () => {
+    expect(sanitizePiErrorText("ready\x00\x07\x7f\u202e\u2066 end\u2069")).toBe("ready end");
+  });
+  it("removes terminal escapes and masks common credentials before showing diagnostics", () => {
+    const input = '\x1b[31mResource failed\x1b[0m api_key=synthetic-private-value Authorization: Bearer synthetic-bearer-value\nHint: Start without extensions using "pi -ne".';
+    const result = sanitizePiErrorText(input);
+    expect(result).toContain("Resource failed");
+    expect(result).toContain("[redacted]");
+    expect(result).not.toMatch(/\x1b|synthetic-private-value|synthetic-bearer-value|pi -ne/);
+    expect(sanitizePiErrorText('\x1b]8;;https://example.com\x07visible\x1b]8;;\x07')).toBe("visible");
+  });
+
   it("keeps the meaning of Pi's no-model error and drops its docs references and terminal advice", () => {
     const record = fixtureRecords("noauth-responses.jsonl").find(item => item.command === "prompt" && item.success === false) as { error: string };
     expect(record.error).toContain("/synthetic/lab/node_modules/");

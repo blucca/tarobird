@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, realpathSync } from "node:fs";
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -32,6 +32,9 @@ export interface PiSessionFile {
 export interface PiSessionRecord {
   /** Fingerprint of the Bot-wide model/effort this session last had applied. */
   appliedBotDefault?: string;
+  /** Independent defaults; the combined fingerprint is retained for older state readers. */
+  appliedBotModelDefault?: string;
+  appliedBotThinkingDefault?: string;
   modelSource?: PiModelSource;
   /** Model put in place by the Bot default, so clearing the default can undo exactly that. */
   botDefaultModel?: PiModelRef;
@@ -63,6 +66,23 @@ export function isSafePiSessionId(value: string): boolean {
   return SESSION_ID_PATTERN.test(value) && !value.includes("..");
 }
 
+/** Physical identity for comparisons; never substitute this for a Windows process cwd. */
+export function canonicalPiWorkspacePath(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  try { return realpathSync(resolved); } catch { return resolved; }
+}
+
+/** Node's cwd resolves links on POSIX, but retains the logical junction path on Windows. */
+export function piWorkspaceCwd(cwd: string): string {
+  return process.platform === "win32" ? path.resolve(cwd) : canonicalPiWorkspacePath(cwd);
+}
+
+/** Pi compares Windows workspace identities without case; retain case on other platforms. */
+export function samePiWorkspace(left: string, right: string): boolean {
+  const a = canonicalPiWorkspacePath(left), b = canonicalPiWorkspacePath(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
 /** Mirrors Pi 1.5.2 `getDefaultSessionDirPath` (session-manager.ts:590-595). */
 export function piNativeSessionDir(cwd: string, agentDir: string): string {
   const safe = `--${path.resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
@@ -74,6 +94,11 @@ export function piNativeSessionDir(cwd: string, agentDir: string): string {
  * Windows) and `file://` URLs. Anything else, relative paths included, is left as written.
  */
 export function expandPiPath(value: string, homeDir = os.homedir()): string {
+  // Native Pi also accepts Git Bash, Cygwin and WSL drive paths on Windows.
+  if (process.platform === "win32" && value.startsWith("/") && !value.startsWith("//") && !value.includes("\\")) {
+    const drive = value.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+    if (drive) return `${drive[1]!.toUpperCase()}:\\${drive[2]?.replaceAll("/", "\\") ?? ""}`;
+  }
   if (value === "~") return homeDir;
   if (value.startsWith("~/") || (process.platform === "win32" && value.startsWith("~\\"))) return path.join(homeDir, value.slice(2));
   if (/^file:\/\//.test(value)) { try { return fileURLToPath(value); } catch { return value; } }
@@ -112,7 +137,7 @@ async function readPiSettingsFile(file: string): Promise<Record<string, unknown>
  * workspace; `~` is expanded and a relative path is taken from `cwd`, where Pi runs. No credential file is read.
  */
 export async function piNativeSessionDirFor(cwd: string, env: NodeJS.ProcessEnv, homeDir = os.homedir()): Promise<string> {
-  const resolvedCwd = path.resolve(cwd);
+  const resolvedCwd = piWorkspaceCwd(cwd);
   const fromEnv = env.PI_CODING_AGENT_SESSION_DIR?.trim();
   if (fromEnv) return path.resolve(resolvedCwd, expandPiPath(fromEnv, homeDir));
   const agentDir = piAgentDir(env, homeDir, resolvedCwd);
@@ -196,6 +221,14 @@ export class PiSessionStore {
     return piNativeSessionDirFor(cwd, this.options.childEnv, this.options.homeDir);
   }
 
+  /** A Windows junction and its target can each have native sessions. Do not scan unrelated workspaces. */
+  private async nativeSessionDirs(cwd: string): Promise<string[]> {
+    const logical = path.resolve(cwd), physical = canonicalPiWorkspacePath(cwd);
+    const dirs = await Promise.all([logical, physical].map(workspace => this.nativeSessionDir(workspace)));
+    return dirs.filter((dir, index) => dirs.findIndex(candidate =>
+      process.platform === "win32" ? candidate.toLowerCase() === dir.toLowerCase() : candidate === dir) === index);
+  }
+
   /** Read and validate a session header. Undefined when the file is not a Pi session. */
   async readHeader(file: string): Promise<{ id: string; cwd: string; version?: number; timestamp?: string; parentSession?: string } | undefined> {
     const line = await readFirstLine(file);
@@ -255,9 +288,11 @@ export class PiSessionStore {
       if (found) return found;
     }
     if (cwd) {
-      for (const file of (await this.sessionFilesIn(await this.nativeSessionDir(cwd))).filter(name => name.endsWith(suffix))) {
-        const found = await check(file, "native");
-        if (found) return found;
+      for (const dir of await this.nativeSessionDirs(cwd)) {
+        for (const file of (await this.sessionFilesIn(dir)).filter(name => name.endsWith(suffix))) {
+          const found = await check(file, "native");
+          if (found) return found;
+        }
       }
     }
     return;
@@ -265,9 +300,11 @@ export class PiSessionStore {
 
   /** Sessions that belong to `cwd`, newest first: the Bot's own and those started in Pi's terminal UI. */
   async list(input: { cwd: string; limit?: number }): Promise<PiSessionFile[]> {
-    const cwd = path.resolve(input.cwd), limit = Math.max(1, Math.min(input.limit ?? 50, 500));
+    const cwd = piWorkspaceCwd(input.cwd), limit = Math.max(1, Math.min(input.limit ?? 50, 500));
     const candidates: Array<{ file: string; origin: PiSessionFile["origin"]; mtime: number }> = [];
-    for (const [dir, origin] of [[this.sessionDir, "bot"], [await this.nativeSessionDir(cwd), "native"]] as const) {
+    const directories: Array<[string, PiSessionFile["origin"]]> = [[this.sessionDir, "bot"],
+      ...(await this.nativeSessionDirs(cwd)).map(dir => [dir, "native"] as [string, "native"])];
+    for (const [dir, origin] of directories) {
       for (const file of await this.sessionFilesIn(dir)) {
         try { candidates.push({ file, origin, mtime: (await stat(file)).mtimeMs }); } catch { /* removed meanwhile */ }
       }
@@ -277,7 +314,7 @@ export class PiSessionStore {
     for (const candidate of candidates) {
       if (sessions.length >= limit) break;
       const session = await this.describe(candidate.file, candidate.origin, true);
-      if (!session || seen.has(session.sessionId) || path.resolve(session.cwd) !== cwd) continue;
+      if (!session || seen.has(session.sessionId) || !samePiWorkspace(session.cwd, cwd)) continue;
       seen.add(session.sessionId);
       sessions.push(session);
     }
@@ -292,7 +329,17 @@ export class PiSessionStore {
       try { parsed = JSON.parse(await readFile(this.statePath, "utf8")) as Partial<PiStateFile>; } catch { /* missing or unreadable: start empty */ }
       const object = (value: unknown) => (value && typeof value === "object" && !Array.isArray(value) ? value : {}) as Record<string, never>;
       const scope = Array.isArray(parsed?.scopedModels) ? parsed.scopedModels.filter((item): item is string => typeof item === "string" && item.length > 0 && item.length <= 512).slice(0, 200) : [];
-      this.state = { version: 1, sessions: { ...object(parsed?.sessions) }, trust: { ...object(parsed?.trust) }, ...(scope.length ? { scopedModels: scope } : {}) };
+      // The additive per-field fingerprints are optional. Malformed values revert to the legacy
+      // pair migration; never let arbitrary JSON suppress application of a new Bot default.
+      const sessions: Record<string, PiSessionRecord> = Object.create(null);
+      for (const [id, value] of Object.entries(object(parsed?.sessions))) {
+        const record = { ...object(value) } as PiSessionRecord;
+        for (const key of ["appliedBotModelDefault", "appliedBotThinkingDefault"] as const) {
+          if (typeof record[key] !== "string" || !/^[a-f0-9]{32}$/.test(record[key])) delete record[key];
+        }
+        sessions[id] = record;
+      }
+      this.state = { version: 1, sessions, trust: { ...object(parsed?.trust) }, ...(scope.length ? { scopedModels: scope } : {}) };
       return this.state;
     })();
     return this.loading;

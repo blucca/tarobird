@@ -1,3 +1,4 @@
+import { PiRpcCommandError, PiStartupError } from "../codex/pi-rpc-client.js";
 import { archiveReadErrorMessage } from "../runtime/zip-archive.js";
 import { classifyFailure, extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError, renderMalformedToolInputError, renderDeepSeekOfficeTimeout } from "../runtime/error-classification.js";
 import { EngineCancellationUnconfirmedError, EngineContextCompactionPendingError, EngineIncompleteResponseError, EngineStopTooLateError } from "../codex/adapter.js";
@@ -135,9 +136,12 @@ export function renderCoreUserFacingError(
   const errorText = error instanceof Error ? `${error.name}\n${error.message}` : String(error);
   // ENOENT from spawn can mean either the executable/interpreter or cwd is missing.
   const missingLaunchPath = /^spawn [^\r\n]+ ENOENT(?:\r?\n|$)/.test(error instanceof Error ? error.message : String(error));
-  if (phase === "engine" && missingLaunchPath) return locale === "en"
+  if (phase === "engine" && (missingLaunchPath || error instanceof PiStartupError && error.reason === "spawn" && error.message === "Pi executable was not found")) return locale === "en"
     ? "Error: the engine could not start because its executable or working directory was not found. Check the CLI installation, host PATH and Bot workspace, then retry. In Settings > Engine programs, the host owner can check detection and set the executable path."
     : "错误：无法启动引擎，找不到启动程序或工作目录。请检查主机的 CLI 安装、启动路径（PATH）和 Bot 工作目录后重试。主机所有者可到「设置 → 引擎程序」检查检测结果或指定程序路径。";
+  if (category === "auth" && error instanceof PiRpcCommandError) return locale === "zh"
+    ? "Pi 提供商凭据缺失或已失效。请在运行 Bot 的主机上执行 `pi auth login` 或更新提供商凭据后重试；原会话已保留。"
+    : "Pi provider credentials are missing or expired. Run `pi auth login` or update the provider credentials on the host running this Bot, then retry. Chat history is preserved.";
   const isAntigravityAuth = category === "auth" && /(?:antigravity|\bagy\b)/i.test(errorText);
   const isClaudeAuth = category === "auth" && error instanceof Error && error.name === "ClaudeError";
   const isKimiAuth = category === "auth" && error instanceof Error && /^Kimi Code authentication required(?:$|\n)/.test(error.message);

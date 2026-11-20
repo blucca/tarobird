@@ -1747,3 +1747,17 @@ for them, and the App keeps them out of lists and unread counts. The bump to
 those conversations. The tables are otherwise additive; downgrade uses the
 existing pre-upgrade backup path. See
 [dispatcher Bots](client/dispatcher-bot-2026-11-01.md).
+
+## Pi native session defaults
+
+The Pi adapter owns its Bot-local `pi/state.json` bookkeeping; native transcripts
+remain Pi JSONL. Version 1 records retain `appliedBotDefault` for compatibility
+and add optional `appliedBotModelDefault` and `appliedBotThinkingDefault` hashes.
+Each new hash is validated as 32 lowercase hexadecimal characters on read;
+invalid values are ignored in favor of the legacy pair comparison. Unknown
+record fields are retained. An unchanged legacy pair migrates without a native
+write; a changed legacy pair applies both fields once because its previous
+individual values are unavailable. Subsequent changes apply only the changed
+field, preserving independent conversation choices and Pi's native clamping.
+Forks inherit the fingerprints, and native writes plus record updates retain
+the existing session-generation guard. See [Pi integration](client/pi-engine.md).

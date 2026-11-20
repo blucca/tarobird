@@ -1,4 +1,6 @@
 import { StringDecoder } from "node:string_decoder";
+import { stripVTControlCharacters } from "node:util";
+import { redactSecrets } from "../runtime/secret-redaction.js";
 import type { PiThinkingLevel } from "./pi-models.js";
 
 /**
@@ -352,6 +354,12 @@ export function classifyPiError(message: string): PiErrorKind {
   return "other";
 }
 
+/** Plain App presentation of terminal-styled extension output. Keep ordinary
+ * text, paths, tabs/newlines and emoji joiners; remove terminal and bidi controls. */
+export function piDisplayText(message: string): string {
+  return stripVTControlCharacters(String(message ?? "")).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "");
+}
+
 /**
  * Native error text can embed absolute local paths (Pi's bundled docs, the
  * owner's home directory) and terminal-only advice ("Use /login"). Paths are
@@ -394,8 +402,8 @@ export function sanitizePiErrorText(message: string, limit = 600): string {
     for (const pattern of patterns) result = result.replace(pattern, lastSegment);
     return result;
   };
-  const lines = String(message ?? "").replace(/\r\n?/g, "\n").replace(/[ \t]*Run '\/login[^'\n]*' to re-authenticate\.?/gi, "").split("\n").map(line => line.trim())
-    .filter(line => line && !/^See:?$/i.test(line) && !/^Use \/login\b/i.test(line) && !/^Run '\/login/i.test(line))
+  const lines = redactSecrets(piDisplayText(message)).replace(/\r\n?/g, "\n").replace(/[ \t]*Run '\/login[^'\n]*' to re-authenticate\.?/gi, "").split("\n").map(line => line.trim())
+    .filter(line => line && !/^See:?$/i.test(line) && !/^Use \/login\b/i.test(line) && !/^Run '\/login/i.test(line) && !/^Hint: Start without extensions using ["']pi -ne["']\.?$/i.test(line))
     .map(reduce)
     // A line that was nothing but a path (a docs reference) carries no meaning once reduced.
     .filter(line => !/^…(?:\/[^\s]*)?$/.test(line));

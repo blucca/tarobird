@@ -1,5 +1,6 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { spawnEngine } from "../runtime/engine-process.js";
+import { resolvePiLaunchCommand } from "../runtime/pi-executable.js";
 import { killProcessTree } from "./process-tree.js";
 import {
   PiJsonlDecoder, classifyPiError, encodePiRecord, isPiPlaceholderModel, parsePiFrame, sanitizePiErrorText,
@@ -111,9 +112,12 @@ export class PiRpcClient {
   /** Spawn Pi in RPC mode and wait until it answers `get_state`. */
   static async start(options: PiRpcClientOptions): Promise<PiRpcClient> {
     const spawnFn = options.spawnFn ?? spawnEngine;
+    // An injected spawn function receives the command as given; the real launch runs only a resolved file.
+    const command = options.spawnFn ? options.launch.command : resolvePiLaunchCommand(options.launch.command, options.env);
+    if (command === undefined) throw new PiStartupError("Pi executable was not found", "spawn");
     let child: ChildProcess;
     try {
-      child = spawnFn(options.launch.command, [...options.launch.args, "--mode", "rpc", ...(options.args ?? [])], {
+      child = spawnFn(command, [...options.launch.args, "--mode", "rpc", ...(options.args ?? [])], {
         cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
       });
     } catch (error) {
@@ -195,7 +199,15 @@ export class PiRpcClient {
     void this.write(response).catch(() => {});
   }
 
-  /** Orderly stop: stdin EOF, then SIGTERM, then the process tree. Idempotent. */
+  /**
+   * Orderly stop: stdin EOF (Pi's own shutdown), then the process tree while its root still names
+   * it, then SIGKILL on this child's own handle. Idempotent.
+   *
+   * The tree comes before any signal to the root. On Windows `kill()` is TerminateProcess of the
+   * root alone, Pi's SIGTERM handler never runs, and `taskkill /T` cannot find the children of a
+   * root that has gone; the official managed launcher makes that root cmd.exe, above
+   * pi-launcher.js and Pi. On POSIX the tree killer still sends SIGTERM first.
+   */
   close(options: { graceMs?: number } = {}): Promise<PiExit> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
@@ -205,9 +217,11 @@ export class PiRpcClient {
       await Promise.race([this.writeChain, new Promise<void>(resolve => { const timer = setTimeout(resolve, Math.min(graceMs, 1_000)); timer.unref?.(); })]);
       try { this.child.stdin?.end(); } catch { /* already closed */ }
       if (await this.exitedWithin(graceMs)) return this.exit!;
-      try { this.child.kill("SIGTERM"); } catch { /* already gone */ }
+      await Promise.resolve().then(() => this.killTree(this.child.pid)).catch(() => {});
       if (await this.exitedWithin(2_000)) return this.exit!;
-      await this.killTree(this.child.pid);
+      // The tree killer signals only what it can enumerate (no pgrep/ps, a failed taskkill). This
+      // handle names our own child, so it cannot reach a reused PID.
+      try { this.child.kill("SIGKILL"); } catch { /* already gone */ }
       if (await this.exitedWithin(5_000)) return this.exit!;
       return { code: null, signal: null, expected: true, stderrTail: sanitizePiErrorText(this.stderrTail, 1200) };
     })();

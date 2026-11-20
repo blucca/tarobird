@@ -1,3 +1,4 @@
+import { PiRpcCommandError } from "../codex/pi-rpc-client.js";
 import { ENGINE_CONFIG_ERROR_CODE, EngineConfigError } from "../state/engine-config-error.js";
 import { FileWorkflowPreparationError } from "./file-workflow.js";
 import { EngineIncompleteResponseError } from "../codex/adapter.js";
@@ -79,6 +80,9 @@ export function extractModelEffortMismatch(error: unknown): { model: string; eff
   return available.length ? { model: match[1]!, effort: match[2]!, available } : undefined;
 }
 export function renderEngineSettingsError(error: unknown, locale: "zh" | "en"): string {
+  if (error instanceof PiRpcCommandError && error.kind === "no-model") return locale === "zh"
+    ? "Pi 尚无可用模型。请在运行 Bot 的主机上执行 `pi auth login` 或配置提供商凭据，然后重新读取模型列表并重试。"
+    : "Pi has no available model. Run `pi auth login` or configure provider credentials on the host running this Bot, then refresh the model list and retry.";
   if (error instanceof EngineConfigError && error.setting === "budget" || normalizeErrorText(error).includes(`${ENGINE_CONFIG_ERROR_CODE}: Bot budget configuration is invalid`)) return locale === "zh"
     ? "无法确认 Bot 的预算配置，自动恢复已停止。请修复主机上此 Bot 的 config.json 后继续；原会话已保留。"
     : "The Bot budget configuration could not be verified, so automatic recovery stopped. Repair this Bot’s config.json on the host before continuing; the conversation is preserved.";
@@ -143,6 +147,11 @@ function hasEngineCliSignal(text: string): boolean {
 }
 
 export function classifyFailure(error: unknown): FailureCategory {
+  if (error instanceof PiRpcCommandError) {
+    if (error.kind === "no-model" || error.kind === "model-unavailable") return "engine-settings";
+    if (error.kind === "auth") return "auth";
+    if (error.kind === "busy" || error.kind === "compacting") return "engine-busy";
+  }
   if (error instanceof Error && ["EngineRecoveryUnconfirmedError", "EngineRecoveryExhaustedError"].includes(error.name)) return "engine-incomplete";
   if (error instanceof Error && error.name === "EngineRecoveryBudgetError") return "engine-quota";
   if (error instanceof EngineIncompleteResponseError) return "engine-incomplete";

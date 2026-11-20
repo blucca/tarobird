@@ -876,3 +876,18 @@ appended; files, quotation and queue/steering choice are not replaced. Requests
 from synthetic events, automatic scripts, hidden frames or expired lifetimes
 must not authorize an insertion. A returned true is only an insertion receipt.
 See [the contract and verification](client/interactive-widgets-2026-10-25.md).
+
+## Pi extension diagnostics and selection outcomes
+
+Pi extension notifications and errors are external text. Show their sanitized
+details in the owning run; when no assistant answer exists, use a fixed final
+notice instead of promoting notification text into executable delivery tags.
+The common credential scrubber covers known formats and is not a guarantee that
+arbitrary extension text contains no private data. Do not parse stderr as RPC.
+
+A Pi control value rejected before a native write, or explicitly refused by Pi,
+is safe to report as rejected, including a reset to the Bot default. A successful
+model write followed by a failed state read, a timed-out write, or a lost session
+guard remains uncertain; do not automatically replay it. Workspace equivalence
+uses physical identity and Windows case comparison, while Windows launch cwd
+keeps its logical junction path and its native ancestor-resource semantics.

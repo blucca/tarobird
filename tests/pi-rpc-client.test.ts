@@ -1,4 +1,7 @@
 import type { ChildProcess } from "node:child_process";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -71,6 +74,21 @@ describe("PiRpcClient startup", () => {
     expect(client.pid).toBe(4242);
     expect(client.isAlive).toBe(true);
     expect(client.receivedFrames).toBe(1);
+  });
+
+  // On Windows the platform search for a bare name looks in the child's working directory (the
+  // workspace) first; a relative PATH entry does the same on every platform. Pi is launched only
+  // from a resolved absolute file, and a bare name that resolves to none fails without a spawn.
+  it.skipIf(process.platform === "win32")("never runs a same-named file from the workspace for a bare command", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-pi-shadow-"));
+    try {
+      const workspace = path.join(root, "workspace"), marker = path.join(root, "ran");
+      await mkdir(workspace);
+      await writeFile(path.join(workspace, "pi-lab-shadow"), `#!/bin/sh\necho ran > "${marker}"\n`, { mode: 0o755 });
+      const error = await caught(PiRpcClient.start({ launch: { command: "pi-lab-shadow", args: [] }, cwd: workspace, env: { PATH: "." }, startupTimeoutMs: 2_000 }));
+      expect(error).toMatchObject({ name: "PiStartupError", reason: "spawn", message: "Pi executable was not found" });
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("reports a spawn function that throws", async () => {
@@ -517,12 +535,12 @@ describe("PiRpcClient.close and terminate", () => {
     expect(await client.close()).toMatchObject({ code: 7, expected: false });
   });
 
-  it("escalates in order: stdin EOF, then SIGTERM, then the process tree", async () => {
-    const { spawner, start, treeKills } = harness();
-    const client = await start();
+  it("escalates in order: stdin EOF, then the process tree, then SIGKILL on its own handle", async () => {
+    const { spawner, base } = harness();
+    const order: string[] = [];
+    const client = await PiRpcClient.start({ ...base, killProcessTreeFn: pid => { order.push(`tree:${pid}`); } }); // reaches nothing
     const process = spawner.last();
     process.stubborn = true; // ignores EOF and SIGTERM
-    const order: string[] = [];
     process.stdin.once("finish", () => { order.push("stdin-eof"); });
     const originalKill = process.kill.bind(process);
     process.kill = signal => { order.push(String(signal)); return originalKill(signal); };
@@ -532,42 +550,41 @@ describe("PiRpcClient.close and terminate", () => {
     await vi.advanceTimersByTimeAsync(99);
     expect(order).toEqual(["stdin-eof"]);
     await vi.advanceTimersByTimeAsync(1);
-    expect(order).toEqual(["stdin-eof", "SIGTERM"]);
-    expect(treeKills).toEqual([]);
+    expect(order).toEqual(["stdin-eof", "tree:4242"]);
     await vi.advanceTimersByTimeAsync(1_999);
-    expect(treeKills).toEqual([]);
+    expect(order).toEqual(["stdin-eof", "tree:4242"]);
     await vi.advanceTimersByTimeAsync(1);
-    expect(treeKills).toEqual([4242]);
     vi.useRealTimers();
     expect(await closing).toMatchObject({ code: null, signal: "SIGKILL", expected: true });
     expect(done).toBe(true);
-    expect(order).toEqual(["stdin-eof", "SIGTERM", "SIGKILL"]);
+    expect(order).toEqual(["stdin-eof", "tree:4242", "SIGKILL"]); // never a bare SIGTERM to the root
   });
 
-  it("stops at SIGTERM when that is enough", async () => {
-    const { spawner, start, treeKills } = harness();
+  it("needs no signal to the root when the tree kill ends the process", async () => {
+    const { spawner, start, treeKills } = harness(); // its tree killer ends every process
     const client = await start();
     const process = spawner.last();
     process.stubborn = true;
-    const originalKill = process.kill.bind(process);
-    process.kill = signal => { process.stubborn = false; return originalKill(signal); };
     const exit = await client.close({ graceMs: 20 });
-    expect(exit).toMatchObject({ code: 143, signal: null, expected: true });
-    expect(process.killSignals).toEqual(["SIGTERM"]);
-    expect(treeKills).toEqual([]);
+    expect(treeKills).toEqual([4242]);
+    expect(process.killSignals).toEqual(["SIGKILL"]); // the stand-in tree killer's own signal only
+    expect(exit).toMatchObject({ signal: "SIGKILL", expected: true });
   });
 
-  it("returns instead of hanging when even the tree kill does not end the process", async () => {
+  it("returns instead of hanging when nothing ends the process", async () => {
     const { spawner, base } = harness();
     let treeKillCalls = 0;
     const client = await PiRpcClient.start({ ...base, killProcessTreeFn: () => { treeKillCalls++; } });
-    spawner.last().stubborn = true;
+    const process = spawner.last();
+    process.stubborn = true;
+    process.kill = signal => { process.killSignals.push(signal); return true; }; // not even SIGKILL lands
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const closing = client.close({ graceMs: 50 });
     await vi.advanceTimersByTimeAsync(50 + 2_000 + 5_000);
     vi.useRealTimers();
     expect(await closing).toEqual({ code: null, signal: null, expected: true, stderrTail: "" });
     expect(treeKillCalls).toBe(1);
+    expect(process.killSignals).toEqual(["SIGKILL"]);
     expect(client.isAlive).toBe(true); // it says what it knows: the process never confirmed its end
   });
 
@@ -597,6 +614,42 @@ describe("PiRpcClient.close and terminate", () => {
     expect(await caught(client.request({ type: "get_state" }))).toBeInstanceOf(PiRpcClosedError);
     client.terminate(); // harmless on a dead process
     expect(treeKills).toEqual([4242]);
+  });
+
+  // Windows: kill() is TerminateProcess of the root alone, Pi's SIGTERM handler never runs, and
+  // `taskkill /T` cannot find the children of a root that has already gone. The official managed
+  // launcher makes the root cmd.exe (pi.cmd -> pi-launcher.js -> Pi), so killing it first leaves Pi running.
+  it("stops the process tree while its root is still alive, before any signal to the root", async () => {
+    const { spawner, base } = harness();
+    let process!: FakePiProcess;
+    const seen: Array<{ pid: number | undefined; rootAlive: boolean; directKills: number }> = [];
+    const client = await PiRpcClient.start({ ...base, killProcessTreeFn: pid => {
+      seen.push({ pid, rootAlive: process.exitCode === null && process.signalCode === null, directKills: process.killSignals.length });
+      process.kill("SIGKILL");
+    } });
+    process = spawner.last();
+    process.stubborn = true; // a Pi whose shutdown hangs after stdin EOF
+    const originalKill = process.kill.bind(process);
+    process.kill = () => originalKill("SIGKILL"); // any direct kill ends the root at once, as on Windows
+    const exit = await client.close({ graceMs: 20 });
+    expect(seen).toEqual([{ pid: 4242, rootAlive: true, directKills: 0 }]);
+    expect(exit).toMatchObject({ signal: "SIGKILL", expected: true });
+  });
+
+  it("falls back to SIGKILL on its own handle when the tree kill leaves the root running", async () => {
+    // For example a container without pgrep/ps: the tree killer can only signal what it can enumerate.
+    const { spawner, base } = harness();
+    let treeKillCalls = 0;
+    const client = await PiRpcClient.start({ ...base, killProcessTreeFn: () => { treeKillCalls++; } });
+    const process = spawner.last();
+    process.stubborn = true; // ignores EOF and SIGTERM, honours SIGKILL
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const closing = client.close({ graceMs: 50 });
+    await vi.advanceTimersByTimeAsync(50 + 2_000 + 1);
+    vi.useRealTimers();
+    expect(await closing).toMatchObject({ code: null, signal: "SIGKILL", expected: true });
+    expect(treeKillCalls).toBe(1);
+    expect(process.killSignals).toEqual(["SIGKILL"]);
   });
 
   it("survives a tree killer that throws", async () => {

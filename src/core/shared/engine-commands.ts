@@ -125,6 +125,7 @@ export interface EngineCommandConfig {
   role?: "dispatcher";
   disableRuntimeTimeout?: boolean;
   model?: string;
+  workspacePath?: string;
   resume?: {
     workspacePath: string;
   };
@@ -368,7 +369,7 @@ export async function handleLocalEngineCoreCommand(input: {
         chatId: normalized.chatId,
         messageThreadId: normalized.messageThreadId,
         conversationKey: normalized.conversationKey,
-        workspaceOverride: cfg.resume?.workspacePath,
+        workspaceOverride: cfg.engine === "pi" ? cfg.workspacePath ?? cfg.resume?.workspacePath : cfg.resume?.workspacePath,
       }) ?? null;
       const msg = renderContextUsage(usage, locale, cfg.engine === "pi" ? "Pi" : "DeepSeek Harness");
       await context.api.sendMessage(normalized.chatId, msg);

@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { open, opendir, realpath } from "node:fs/promises";
+import { open, opendir, realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -9,6 +9,8 @@ import { botCapabilitiesSchema, type BotCapabilities, type BotCapability } from 
 import { loadGatewayEnvironment } from "../gateway/environment.js";
 import { resolveSearchRouting } from "./search-routing.js";
 import { collectClaudeSearchMcpEntries, collectCodexSearchMcpEntries, createNativeSearchMcpPlanner, searchMcpBlocksManaged } from "./native-search-mcp.js";
+import { piAgentDir } from "../codex/pi-session-store.js";
+import { collectPiSearchMcpEntries } from "../codex/pi-search-mcp.js";
 import { redactSecrets } from "./secret-redaction.js";
 
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -63,6 +65,47 @@ function scanner(result: BotCapabilities) {
   }
   const seenSkills = new Set<string>();
   const disabledSkills = new Set<string>();
+  async function skillFile(file: string, label: string, scope: BotCapability["scope"], disabled: boolean): Promise<boolean> {
+    const text = await raw(file, label, "skill", false);
+    if (text === null) return false;
+    const canonical = await realpath(file).catch(() => file);
+    if (seenSkills.has(canonical)) return true;
+    const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
+    if (!frontmatter) return true;
+    const doc = parseDocument(frontmatter, { schema: "core", uniqueKeys: true });
+    if (doc.errors.length || doc.warnings.length) return true;
+    let fields: Record<string, unknown>; try { fields = object(doc.toJS({ maxAliasCount: 20 })); } catch { return true; }
+    if (typeof fields.name !== "string" || !fields.name.trim()) return true;
+    seenSkills.add(canonical);
+    add({ kind: "skill", name: fields.name, description: clean(fields.description), source: label, scope,
+      status: disabled || disabledSkills.has(canonical) || disabledSkills.has(path.resolve(file)) ? "disabled" : "discovered" }, canonical);
+    return true;
+  }
+  const seenPiDirectories = new Set<string>();
+  /** Pi root Markdown files and nested SKILL.md, bounded like the existing metadata reader. */
+  async function piSkills(root: string, source: string, scope: BotCapability["scope"], depth = 0): Promise<void> {
+    if (depth > 3 || reads > 1600 || result.entries.length >= 1000) { warn("scan_limited"); return; }
+    try {
+      const canonical = await realpath(root);
+      if (seenPiDirectories.has(canonical)) return;
+      seenPiDirectories.add(canonical);
+      // A SKILL.md makes this directory a skill root; Pi does not descend below it.
+      if (await skillFile(path.join(root, "SKILL.md"), `${source}/SKILL.md`, scope, false)) return;
+      const directory = await opendir(root);
+      if (result.sources.length < 200) result.sources.push({ source: clean(source), kind: "skill", status: "read" });
+      let count = 0;
+      for await (const entry of directory) {
+        if (++count > 1000 || reads > 1600 || result.entries.length >= 1000) { warn("scan_limited"); break; }
+        if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+        const file = path.join(root, entry.name), label = `${source}/${entry.name}`;
+        const info = entry.isSymbolicLink() ? await stat(file).catch(() => undefined) : entry;
+        if (info?.isDirectory()) await piSkills(file, label, scope, depth + 1);
+        else if (depth === 0 && info?.isFile() && entry.name.endsWith(".md")) await skillFile(file, label, scope, false);
+      }
+    } catch (error) {
+      if (result.sources.length < 200) result.sources.push({ source: clean(source), kind: "skill", status: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable" });
+    }
+  }
   async function skills(root: string, source: string, scope: BotCapability["scope"], disabled = false, depth = 0) {
     if (depth > 3 || result.entries.length >= 1000 || reads > 1600) { warn("scan_limited"); return; }
     let directory; let count = 0;
@@ -73,22 +116,9 @@ function scanner(result: BotCapabilities) {
         if (++count > 1000 || reads > 1600 || result.entries.length >= 1000) { warn("scan_limited"); break; }
         if (!(entry.isDirectory() || entry.isSymbolicLink())) continue;
         const file = path.join(root, entry.name, "SKILL.md"), label = `${source}/${entry.name}/SKILL.md`;
-        const text = await raw(file, label, "skill", false);
-        if (text === null) {
-          if (entry.name === ".system") await skills(path.join(root, entry.name), `${source}/${entry.name}`, "system", disabled, depth + 1);
-          continue;
+        if (!await skillFile(file, label, scope, disabled) && entry.name === ".system") {
+          await skills(path.join(root, entry.name), `${source}/${entry.name}`, "system", disabled, depth + 1);
         }
-        const canonical = await realpath(file).catch(() => file);
-        if (seenSkills.has(canonical)) continue;
-        const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
-        if (!frontmatter) continue;
-        const doc = parseDocument(frontmatter, { schema: "core", uniqueKeys: true });
-        if (doc.errors.length || doc.warnings.length) continue;
-        let fields: Record<string, unknown>; try { fields = object(doc.toJS({ maxAliasCount: 20 })); } catch { continue; }
-        if (typeof fields.name !== "string" || !fields.name.trim()) continue;
-        seenSkills.add(canonical);
-        add({ kind: "skill", name: fields.name, description: clean(fields.description), source: label, scope,
-          status: disabled || disabledSkills.has(canonical) || disabledSkills.has(path.resolve(file)) ? "disabled" : "discovered" }, canonical);
       }
     } catch (error) { if (result.sources.length < 200) result.sources.push({ source: clean(source), kind: "skill", status: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable" }); }
   }
@@ -102,14 +132,14 @@ function scanner(result: BotCapabilities) {
     }
   }
   async function jsonMcp(file: string, source: string, scope: BotCapability["scope"], disabled: string[] = []) { const data = await document(file, source); mcp(data.mcpServers, source, scope, disabled); }
-  return { warn, document, add, skills, mcp, jsonMcp, disabledSkills };
+  return { warn, document, add, skills, piSkills, mcp, jsonMcp, disabledSkills };
 }
 type Scanner = ReturnType<typeof scanner>;
 
 /** Native skill/MCP declarations of one engine. Without `bot`, only the Host
  * user's own scope is read: no workspace, Bot state or project-scoped entry. */
 async function scanEngine(scan: Scanner, engine: CapabilityEngine, env: NodeJS.ProcessEnv, home: string, bot?: BotScope) {
-  const { document, mcp, jsonMcp, skills } = scan;
+  const { document, mcp, jsonMcp, skills, piSkills } = scan;
   const user = !bot?.offline, workspace = bot?.workspace;
   if (engine === "codex") {
     const codexHome = env.CODEX_HOME || path.join(home, ".codex");
@@ -188,18 +218,18 @@ async function scanEngine(scan: Scanner, engine: CapabilityEngine, env: NodeJS.P
       await skills(path.join(workspace, ".agents/skills"), "workspace/.agents/skills", "workspace");
     }
   } else if (engine === "pi") {
-    const agentDir = env.PI_CODING_AGENT_DIR || path.join(home, ".pi", "agent");
+    const agentDir = piAgentDir(env, home, workspace ?? home);
     if (user) {
       await jsonMcp(path.join(agentDir, "mcp.json"), "$PI_CODING_AGENT_DIR/mcp.json", "user");
-      await skills(path.join(agentDir, "skills"), "$PI_CODING_AGENT_DIR/skills", "user");
-      await skills(path.join(home, ".agents/skills"), "~/.agents/skills", "user");
+      await piSkills(path.join(agentDir, "skills"), "$PI_CODING_AGENT_DIR/skills", "user");
+      await piSkills(path.join(home, ".agents/skills"), "~/.agents/skills", "user");
     }
     if (workspace) {
       // Declared metadata only. Pi's native trust gate decides whether project
       // resources actually load; this scanner never grants that trust.
       await jsonMcp(path.join(workspace, ".pi/mcp.json"), "workspace/.pi/mcp.json", "workspace");
-      await skills(path.join(workspace, ".pi/skills"), "workspace/.pi/skills", "workspace");
-      await skills(path.join(workspace, ".agents/skills"), "workspace/.agents/skills", "workspace");
+      await piSkills(path.join(workspace, ".pi/skills"), "workspace/.pi/skills", "workspace");
+      await piSkills(path.join(workspace, ".agents/skills"), "workspace/.agents/skills", "workspace");
     }
   } else {
     // Harness patches can contain executable !!js and profile/plugin indirection.
@@ -224,20 +254,22 @@ export async function readBotCapabilities(stateDir: string, options: Options = {
   const workspace = typeof override === "string" ? override : path.join(stateDir, "workspace");
   result.workspace = clean(workspace, 1000);
   let managedSearch;
-  if (!options.offline && (engine === "kimi" || engine === "deepseek" || engine === "claude" || engine === "codex")) {
+  if (!options.offline && (engine === "kimi" || engine === "deepseek" || engine === "claude" || engine === "codex" || engine === "pi")) {
     try { managedSearch = await resolveSearchRouting(await loadGatewayEnvironment(stateDir, "capabilities", env)); }
     catch { scan.warn("config_unreadable"); }
   }
   if (options.offline) scan.warn("offline_workspace_only");
   await scanEngine(scan, engine, env, home, { stateDir, workspace, offline: !!options.offline });
   if (managedSearch?.enabled && (engine === "kimi" || engine === "deepseek")) scan.add({ kind: "mcp", name: "cctb_search", description: "", scope: "bridge", source: engine === "kimi" ? "TaroBird / Kimi ACP" : "TaroBird / DeepSeek Harness", status: "configured", transport: "stdio" });
-  if (managedSearch?.enabled && (engine === "claude" || engine === "codex")) {
+  if (managedSearch?.enabled && (engine === "claude" || engine === "codex" || engine === "pi")) {
     try {
-      const entries = await (engine === "claude" ? collectClaudeSearchMcpEntries : collectCodexSearchMcpEntries)(managedSearch.env, workspace);
+      const entries = engine === "pi"
+        ? await collectPiSearchMcpEntries(managedSearch.env, workspace, home)
+        : await (engine === "claude" ? collectClaudeSearchMcpEntries : collectCodexSearchMcpEntries)(managedSearch.env, workspace);
       const plan = createNativeSearchMcpPlanner(managedSearch.env)();
       // Match launch-time suppression for existing/disabled registrations.
       // This remains a partial config catalog, never a live health claim.
-      if (plan && !searchMcpBlocksManaged(entries)) scan.add({ kind: "mcp", name: plan.name, description: "", scope: "bridge", source: engine === "claude" ? "TaroBird / Claude Code" : "TaroBird / Codex", status: "configured", transport: "stdio" });
+      if (plan && !searchMcpBlocksManaged(entries)) scan.add({ kind: "mcp", name: plan.name, description: "", scope: "bridge", source: engine === "pi" ? "TaroBird / Pi" : engine === "claude" ? "TaroBird / Claude Code" : "TaroBird / Codex", status: "configured", transport: "stdio" });
     } catch { scan.warn("config_unreadable"); }
   }
   return finish(result);

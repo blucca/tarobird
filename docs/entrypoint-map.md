@@ -16,7 +16,15 @@ Pi command discovery is scoped to an existing live session and never starts a
 worker. Native extension commands wait for an owned turn while busy; templates
 and skills retain native steering. Stop/settlement drains in-flight input before
 the last queue clear and returns the actual unconsumed text. See the Pi guide
-for terminal-only and independent-extension-run boundaries.
+for terminal-only and independent-extension-run boundaries. Startup extension
+errors are buffered for the next owned turn; final notices contain counts only.
+Extension-only notifications stay in run details instead of becoming delivery
+instructions. Known model/default rejections unlock controls; uncertain writes
+remain fenced. Model and thinking defaults have separate, legacy-compatible
+fingerprints in the Pi session store.
+Pi workspace comparison follows physical directory links and Windows casing,
+while still rejecting cross-workspace session reuse. Settings and runtime errors
+share the App/CLI recovery guidance and retain the native inactivity meaning.
 
 [1.5.1 preflight](client/release-1.5.1-preflight.md) records shared Android
 channel versions, cross-host permissions, date refresh, mobile cleanup and the

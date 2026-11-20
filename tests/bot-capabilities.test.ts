@@ -23,7 +23,7 @@ it("reads real TOML including quoted names, disables skills, deduplicates symlin
   const f = await fixture(), codex = path.join(f.home, ".codex"), skillPath = path.join(codex, "skills", "first", "SKILL.md");
   const config = `[[skills.config]]\npath = ${JSON.stringify(skillPath)}\nenabled = false\n[mcp_servers."server.with.dot"]\ncommand = "sh"\nargs = ["secret-argument"]\nenabled = false\n[mcp_servers.remote]\nurl = "https://user:password@example.test/secret?token=secret-query"\nhttp_headers = { Authorization = "Bearer fixture-secret" }`;
   await save(path.join(codex, "config.toml"), config); await save(skillPath, skill("analysis"));
-  await mkdir(path.join(f.workspace, ".agents"), { recursive: true }); await symlink(path.join(codex, "skills"), path.join(f.workspace, ".agents/skills"));
+  await mkdir(path.join(f.workspace, ".agents"), { recursive: true }); await symlink(path.join(codex, "skills"), path.join(f.workspace, ".agents/skills"), process.platform === "win32" ? "junction" : "dir");
   const result = await readBotCapabilities(f.stateDir, { env: f.env });
   expect(result.entries).toHaveLength(3); expect(result.entries.find((r) => r.kind === "skill")).toMatchObject({ name: "analysis", status: "disabled" });
   expect(result.entries.find((r) => r.name === "server.with.dot")).toMatchObject({ status: "disabled", transport: "stdio" });
@@ -101,7 +101,7 @@ it("serves only paired owners, rejects client paths and revocation, and reads ma
 }, 20000);
 it("matches physical Claude project keys and deduplicates shared plugin registrations", async () => {
   const f = await fixture("claude"), physical = path.join(f.root, "physical"), linked = path.join(f.root, "linked"), plugin = path.join(f.root, "plugin");
-  await mkdir(physical); await symlink(physical, linked); await save(path.join(f.stateDir, "config.json"), JSON.stringify({ engine: "claude", workspacePath: linked }));
+  await mkdir(physical); await symlink(physical, linked, process.platform === "win32" ? "junction" : "dir"); await save(path.join(f.stateDir, "config.json"), JSON.stringify({ engine: "claude", workspacePath: linked }));
   await save(path.join(f.home, ".claude.json"), JSON.stringify({ mcpServers: { shared: { command: "node" } }, projects: { [physical]: { disabledMcpServers: ["shared"], mcpServers: { local: { command: "node" } } } } }));
   await save(path.join(f.home, ".claude/plugins/installed_plugins.json"), JSON.stringify({ plugins: { "fixture@local": [{ installPath: plugin, scope: "user" }, { installPath: plugin, scope: "project", projectPath: physical }] } }));
   await save(path.join(plugin, ".mcp.json"), JSON.stringify({ mcpServers: { pluginServer: { command: "node" } } }));
@@ -116,10 +116,10 @@ it("reads large Claude metadata without disclosing unrelated contents, and label
   expect((await readBotCapabilities(f.stateDir, { env: f.env, offline: true })).entries[0]).toMatchObject({ name: "private", scope: "bot" });
 });
 
-it.each(["kimi", "deepseek", "claude", "codex"])("shows %s managed search only with configured private credentials", async (engine) => {
+it.each(["kimi", "deepseek", "claude", "codex", "pi"])("shows %s managed search only with configured private credentials", async (engine) => {
   const f = await fixture(engine);
   await save(path.join(f.home, ".tarobot/integrations.env"), "BRAVE_API_KEY=PRIVATE_SEARCH_FIXTURE\n");
-  const name = engine === "claude" || engine === "codex" ? "tarobot_search" : "cctb_search";
+  const name = engine === "claude" || engine === "codex" || engine === "pi" ? "tarobot_search" : "cctb_search";
   const enabled = await readBotCapabilities(f.stateDir, { env: f.env });
   expect(enabled.entries.find(row => row.name === name)).toMatchObject({ status: "configured" });
   expect(JSON.stringify(enabled)).not.toContain("PRIVATE_SEARCH_FIXTURE");
@@ -140,4 +140,33 @@ it.each(["claude", "codex"])("does not advertise %s managed search over a workin
     expect(result.entries.some(row => row.name === "tarobot_search")).toBe(false);
     expect(JSON.stringify(result)).not.toContain("PRIVATE_CATALOG_FIXTURE");
   }
+});
+
+it.each(["~/custom-pi", ".native-pi"])("reads Pi root and nested skills using native agent path expansion: %s", async override => {
+  const f = await fixture("pi");
+  const agent = override.startsWith("~/") ? path.join(f.home, "custom-pi") : path.join(f.workspace, override);
+  await save(path.join(agent, "skills/direct.md"), skill("direct"));
+  await save(path.join(agent, "skills/group/nested/SKILL.md"), skill("nested"));
+  await save(path.join(agent, "skills/group/not-a-root-file.md"), skill("ignored-file"));
+  await save(path.join(agent, "skills/root/SKILL.md"), skill("root"));
+  await save(path.join(agent, "skills/root/child/SKILL.md"), skill("hidden-by-root"));
+  await save(path.join(agent, "skills/.hidden/SKILL.md"), skill("hidden-directory"));
+  await save(path.join(agent, "skills/node_modules/package/SKILL.md"), skill("dependency-skill"));
+  await symlink(path.join(agent, "skills"), path.join(agent, "skills/cycle"), process.platform === "win32" ? "junction" : "dir");
+  const result = await readBotCapabilities(f.stateDir, { env: { ...f.env, PI_CODING_AGENT_DIR: override } });
+  expect(result.entries.filter(row => row.kind === "skill").map(row => row.name)).toEqual(["direct", "nested", "root"]);
+  expect(JSON.stringify(result)).not.toContain("PRIVATE BODY");
+  const offline = await readBotCapabilities(f.stateDir, { env: { ...f.env, PI_CODING_AGENT_DIR: override }, offline: true });
+  expect(offline.entries).toEqual([]);
+});
+
+it("does not advertise managed Pi search over a disabled global registration or malformed project config", async () => {
+  const f = await fixture("pi"), agent = path.join(f.home, "custom-pi");
+  await save(path.join(f.stateDir, "bot.env"), "BRAVE_API_KEY=PRIVATE_CATALOG_FIXTURE\n");
+  await save(path.join(agent, "mcp.json"), JSON.stringify({ mcpServers: { web_search: { command: "search-cli", enabled: false } } }));
+  const env = { ...f.env, PI_CODING_AGENT_DIR: "~/custom-pi" };
+  expect((await readBotCapabilities(f.stateDir, { env })).entries.some(row => row.name === "tarobot_search")).toBe(false);
+  await save(path.join(agent, "mcp.json"), "{}");
+  await save(path.join(f.workspace, ".pi/mcp.json"), "{broken");
+  expect((await readBotCapabilities(f.stateDir, { env })).entries.some(row => row.name === "tarobot_search")).toBe(false);
 });

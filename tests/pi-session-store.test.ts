@@ -1,8 +1,9 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   PI_TRUST_GATED_PATHS, PiSessionStore, expandPiPath, hasPiTrustGatedFiles, isSafePiSessionId, piAgentDir, piBotDefaultFingerprint,
@@ -40,10 +41,12 @@ describe("Pi session locations", () => {
     // session-manager.ts:590-595: strip one leading separator, then turn every / \ : into "-".
     const reference = (cwd: string) => `--${path.resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
     for (const cwd of ["/synthetic/work/my project", "/synthetic/C:\\repo\\x", "/synthetic/a:b/c", "/", "/synthetic/trailing/"]) {
-      expect(piNativeSessionDir(cwd, "/synthetic/agent")).toBe(path.join("/synthetic/agent", "sessions", reference(cwd)));
+      expect(piNativeSessionDir(cwd, "/synthetic/agent")).toBe(path.join(path.resolve("/synthetic/agent"), "sessions", reference(cwd)));
     }
-    expect(piNativeSessionDir("/synthetic/work/my project", "/synthetic/agent")).toBe("/synthetic/agent/sessions/--synthetic-work-my project--");
-    expect(piNativeSessionDir("/synthetic/C:\\repo\\x", "/synthetic/agent")).toBe("/synthetic/agent/sessions/--synthetic-C--repo-x--");
+    if (process.platform !== "win32") {
+      expect(piNativeSessionDir("/synthetic/work/my project", "/synthetic/agent")).toBe("/synthetic/agent/sessions/--synthetic-work-my project--");
+      expect(piNativeSessionDir("/synthetic/C:\\repo\\x", "/synthetic/agent")).toBe("/synthetic/agent/sessions/--synthetic-C--repo-x--");
+    }
   });
 
   it("resolves a relative workspace and agent directory before encoding", () => {
@@ -53,7 +56,7 @@ describe("Pi session locations", () => {
   });
 
   it("uses the native agent directory override, else the account's .pi/agent", () => {
-    expect(piAgentDir({ PI_CODING_AGENT_DIR: "  /synthetic/custom-agent  " }, "/synthetic/account")).toBe("/synthetic/custom-agent");
+    expect(piAgentDir({ PI_CODING_AGENT_DIR: "  /synthetic/custom-agent  " }, "/synthetic/account")).toBe(path.resolve("/synthetic/custom-agent"));
     expect(piAgentDir({}, "/synthetic/account")).toBe(path.join("/synthetic/account", ".pi", "agent"));
     expect(piAgentDir({ PI_CODING_AGENT_DIR: "   " }, "/synthetic/account")).toBe(path.join("/synthetic/account", ".pi", "agent"));
     expect(piAgentDir({})).toBe(path.join(os.homedir(), ".pi", "agent"));
@@ -78,16 +81,17 @@ describe("Pi session locations", () => {
   });
 
   it("expands `~` and file URLs as Pi's normalizePath does, and leaves relative paths for the caller's cwd", async () => {
-    const home = "/synthetic/account";
+    const home = path.resolve("/synthetic/account");
     expect(expandPiPath("~", home)).toBe(home);
     expect(expandPiPath("~/pi/sessions", home)).toBe(path.join(home, "pi/sessions"));
     expect(expandPiPath("~other/x", home)).toBe("~other/x");
-    expect(expandPiPath("file:///synthetic/x", home)).toBe("/synthetic/x");
+    const target = path.resolve("/synthetic/x");
+    expect(expandPiPath(pathToFileURL(target).href, home)).toBe(target);
     expect(expandPiPath("rel/dir", home)).toBe("rel/dir");
     expect(piAgentDir({ PI_CODING_AGENT_DIR: "~/custom-agent" }, home)).toBe(path.join(home, "custom-agent"));
     // Pi runs in the workspace, so a relative variable is read from there, not from the Host's own directory.
     expect(await piNativeSessionDirFor("/synthetic/ws", { PI_CODING_AGENT_DIR: "/synthetic/agent", PI_CODING_AGENT_SESSION_DIR: "~/flat" }, home)).toBe(path.join(home, "flat"));
-    expect(await piNativeSessionDirFor("/synthetic/ws", { PI_CODING_AGENT_DIR: "/synthetic/agent", PI_CODING_AGENT_SESSION_DIR: "rel/flat" }, home)).toBe("/synthetic/ws/rel/flat");
+    expect(await piNativeSessionDirFor("/synthetic/ws", { PI_CODING_AGENT_DIR: "/synthetic/agent", PI_CODING_AGENT_SESSION_DIR: "rel/flat" }, home)).toBe(path.resolve("/synthetic/ws/rel/flat"));
   });
 
   it("reads a relative PI_CODING_AGENT_DIR from the workspace Pi runs in, never from the Host's own directory", async () => {
@@ -120,11 +124,67 @@ describe("Pi session locations", () => {
     await settings(projectFile, "{ not json");
     expect(await make().nativeSessionDir(cwd)).toBe(path.join(home, "global-sessions"));
     await settings(projectFile, `\uFEFF${JSON.stringify({ sessionDir: "/synthetic/abs-sessions" })}`);
-    expect(await make().nativeSessionDir(cwd)).toBe("/synthetic/abs-sessions");
+    expect(await make().nativeSessionDir(cwd)).toBe(path.resolve("/synthetic/abs-sessions"));
     await settings(projectFile, { sessionDir: 42 });
     expect(await make().nativeSessionDir(cwd)).toBe(piNativeSessionDir(cwd, agentDir));
     // The variable still wins over both files.
-    expect(await make({ PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: "/synthetic/env" }).nativeSessionDir(cwd)).toBe("/synthetic/env");
+    expect(await make({ PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: "/synthetic/env" }).nativeSessionDir(cwd)).toBe(path.resolve("/synthetic/env"));
+  });
+
+  it("validates new default fingerprints while retaining legacy and future record fields", async () => {
+    const { stateDir, make } = await scratch();
+    await mkdir(path.join(stateDir, "pi"), { recursive: true });
+    const good = piBotDefaultFingerprint("provider/model", undefined);
+    await writeFile(path.join(stateDir, "pi", "state.json"), JSON.stringify({ version: 1, trust: {}, sessions: {
+      legacy: { appliedBotDefault: "legacy", appliedBotModelDefault: 17, appliedBotThinkingDefault: { invalid: true }, futureField: "retained" },
+      valid: { appliedBotModelDefault: good, appliedBotThinkingDefault: good },
+    } }));
+    const store = make();
+    expect(await store.record("legacy")).toEqual({ appliedBotDefault: "legacy", futureField: "retained" });
+    expect(await store.record("valid")).toEqual({ appliedBotModelDefault: good, appliedBotThinkingDefault: good });
+  });
+
+  it("finds Bot and terminal sessions through a linked workspace without admitting another workspace", async () => {
+    const { root, cwd, store, agentDir } = await scratch();
+    const link = path.join(root, "linked-workspace");
+    await symlink(cwd, link, process.platform === "win32" ? "junction" : "dir");
+    const nativeDir = piNativeSessionDir(cwd, agentDir);
+    await writeSession(nativeDir, "native-real", cwd);
+    await writeSession(store.sessionDir, "bot-real", cwd);
+    await writeSession(store.sessionDir, "other-project", path.join(root, "other"));
+    expect(await store.nativeSessionDir(link)).toBe(process.platform === "win32" ? piNativeSessionDir(link, agentDir) : nativeDir);
+    expect((await store.list({ cwd: link })).map(item => item.sessionId).sort()).toEqual(["bot-real", "native-real"]);
+    expect((await store.find("native-real", link))?.cwd).toBe(cwd);
+  });
+
+  it("discovers Windows terminal sessions from both junction and physical directories, deduplicated", async () => {
+    const { root, cwd, store, agentDir } = await scratch();
+    const link = path.join(root, "junction-workspace");
+    await symlink(cwd, link, process.platform === "win32" ? "junction" : "dir");
+    // Only the cwd policy is simulated on POSIX; actual Windows also runs this test with a real junction.
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    try {
+      const logical = piNativeSessionDir(link, agentDir), physical = piNativeSessionDir(cwd, agentDir);
+      await writeSession(logical, "native-junction", link);
+      await writeSession(physical, "native-physical", cwd);
+      await writeSession(logical, "native-physical", link);
+      await writeSession(logical, "another-workspace", path.join(root, "elsewhere"));
+      expect(await store.nativeSessionDir(link)).toBe(logical);
+      expect((await store.list({ cwd: link })).map(item => item.sessionId).sort()).toEqual(["native-junction", "native-physical"]);
+      expect((await store.find("native-junction", link))?.cwd).toBe(link);
+      expect((await store.find("native-physical", link))?.sessionId).toBe("native-physical");
+    } finally { platform.mockRestore(); }
+  });
+
+  it("normalizes Windows shell drive paths only on Windows", () => {
+    const paths = [["/c/pi-sessions", "C:\\pi-sessions"], ["/mnt/d/项目 A", "D:\\项目 A"], ["/cygdrive/e/agent/x", "E:\\agent\\x"], ["/F", "F:\\"]];
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    try {
+      for (const [input, expected] of paths) expect(expandPiPath(input!)).toBe(expected);
+      for (const input of ["//server/share", "/ordinary/path", "relative/path", "/c/mixed\\path"]) expect(expandPiPath(input)).toBe(input);
+      platform.mockReturnValue("linux");
+      for (const [input] of paths) expect(expandPiPath(input!)).toBe(input);
+    } finally { platform.mockRestore(); }
   });
 
   it("lists and finds terminal sessions in a settings-configured directory, only for this workspace", async () => {

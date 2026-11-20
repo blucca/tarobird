@@ -61,6 +61,15 @@ async function withCommandInstance(
 }
 
 describe("shared engine command rules", () => {
+  it("does not claim Pi enabled sandboxed YOLO or silently change its existing permissions", async () => {
+    await withCommandInstance({ engine: "pi", approvalMode: "bypass" }, async (send, stateDir) => {
+      expect((await send("/yolo on")).join("\n")).toContain("Pi does not provide sandboxed full-auto");
+      expect((await readConfig(stateDir)).approvalMode).toBe("bypass");
+      await send("/yolo off");
+      expect((await readConfig(stateDir)).approvalMode).toBe("normal");
+    });
+  });
+
   it("preserves the complete ordered Codex model choices after adapter retirement", async () => {
     await withCommandInstance({ engine: "codex" }, async (send) => {
       expect((await send("/model")).join("\n")).toBe([
@@ -223,6 +232,10 @@ describe("shared engine command rules", () => {
       "fdfc8ab1-7936-4599-98b0-d8ba2593c250",
       "Current conversation: fdfc8ab1-7936-4599-98b0-d8ba2593c250",
     );
+  });
+
+  it("includes the current Pi session id in /status when available", async () => {
+    await expectStatusSessionLine("pi", "pi-session-123", "Current Pi session: pi-session-123");
   });
 
   it("includes the current Kimi session id in /status when available", async () => {

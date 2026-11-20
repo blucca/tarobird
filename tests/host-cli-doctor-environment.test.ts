@@ -1,3 +1,4 @@
+import { buildHostEnvironment } from "../src/host-cli/environment.js";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -47,7 +48,7 @@ it("explains settings repair without falling back or changing a damaged file", a
 it("keeps a manual engine path and damaged settings visible when the terminal environment is invalid", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "doctor-fallback-")); roots.push(root);
   const home = path.join(root, "home"); await mkdir(home);
-  const executable = path.join(root, "manual-codex"); await writeFile(executable, "a fixture, never executed"); await chmod(executable, 0o700);
+  const executable = path.join(root, process.platform === "win32" ? "manual-codex.cmd" : "manual-codex"); await writeFile(executable, "a fixture, never executed"); await chmod(executable, 0o700);
   await new HubEngineSettings(root, () => ({ HOME: home, PATH: "/usr/bin" })).update({ engine: "codex", path: executable, requestId: "set", revision: "default" }, apply => apply());
   const invalid = { HOME: home, PATH: "/usr/bin", CODEX_HOME: "relative-private-location" };
   const report = await inspectHost(root, invalid);
@@ -59,4 +60,13 @@ it("keeps a manual engine path and damaged settings visible when the terminal en
   expect(damaged.engines).toEqual([]);
   expect(damaged.environmentCheck).toEqual({ error: "host_environment_invalid", variables: ["CODEX_HOME"], hint: expect.stringContaining("engine-settings.json") });
   expect(JSON.stringify(damaged)).not.toContain("relative-private-location");
+});
+
+it.each(["darwin", "win32"] as const)("preserves Pi native directory forms in the %s Host environment", platform => {
+  const home = platform === "win32" ? "C:\\Synthetic\\Account" : "/synthetic/account";
+  const environment = buildHostEnvironment({ platform, home, env: {
+    PATH: "", PI_CODING_AGENT_DIR: "~/custom-pi", PI_CODING_AGENT_SESSION_DIR: "relative/sessions",
+  } });
+  expect(environment).toMatchObject({ PI_CODING_AGENT_DIR: "~/custom-pi", PI_CODING_AGENT_SESSION_DIR: "relative/sessions" });
+  expect(() => buildHostEnvironment({ platform, home, env: { PI_CODING_AGENT_SESSION_DIR: "bad\nvalue" } })).toThrow(/invalid_environment/);
 });

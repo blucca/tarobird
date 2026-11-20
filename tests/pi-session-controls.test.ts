@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { gatewayPiSession } from "../src/gateway/pi-session.js";
 import type { GatewayChannel } from "../src/gateway/channel.js";
 import { Bridge, type AccessStoreLike } from "../src/runtime/bridge.js";
-import { PiNativeRejectedError, type PiNativeState } from "../src/codex/pi-native-types.js";
+import { PiNativeRejectedError, PiNativeUncertainError, type PiNativeState } from "../src/codex/pi-native-types.js";
 import { piSessionChangeSchema, piSessionSnapshotSchema } from "../src/client-protocol/pi-session.js";
 import { PiRpcAdapter } from "../src/codex/pi-rpc-adapter.js";
 import { fakePiSpawner } from "./helpers/pi-fake-rpc.js";
@@ -158,9 +158,13 @@ describe("Pi live session snapshots and mutation boundaries", () => {
   });
   it("keeps uncertain clear-default failures separate from rejected explicit choices", async () => {
     const f = bridgeFixture(), snapshot = await f.bridge.getPiSession(scope);
-    f.live.setModel.mockRejectedValue(new PiNativeRejectedError("native default unavailable after partial reset", "model-unavailable"));
+    f.live.setModel.mockRejectedValue(new PiNativeUncertainError("set_model"));
     expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: null })).toEqual({ outcome: "unknown", reason: "uncertain" });
+    f.live.setModel.mockRejectedValue(new PiNativeRejectedError("model unavailable before reset", "model-unavailable"));
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: null })).toEqual({ outcome: "rejected", reason: "invalid" });
     expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: "provider/model" })).toEqual({ outcome: "rejected", reason: "invalid" });
+    f.live.setThinkingLevel.mockRejectedValue(new PiNativeRejectedError("Bot default is unsupported by this model", "thinking-unsupported"));
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "thinking", value: null })).toEqual({ outcome: "rejected", reason: "invalid" });
   });
   it("rejects malformed model or thinking choices before any native write", async () => {
     const f = bridgeFixture(), snapshot = await f.bridge.getPiSession(scope);

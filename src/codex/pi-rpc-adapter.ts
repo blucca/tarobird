@@ -14,7 +14,7 @@ import type { NativeSearchMcpPlanner } from "../runtime/native-search-mcp.js";
 import { DEFAULT_APPROVAL_MODE, normalizeApprovalMode } from "../state/approval-mode.js";
 import { readValidatedConfigFile, resolveEngineOverride, type EngineOverride } from "../state/instance-config.js";
 import { prependPrivateTurnInstructions } from "./turn-instructions.js";
-import { PI_THINKING_LEVELS, decodePiModel, encodePiModel, parsePiModels, type PiThinkingLevel } from "./pi-models.js";
+import { PI_THINKING_LEVELS, decodePiModel, encodePiModel, parsePiModels, piThinkingLevels, type PiThinkingLevel } from "./pi-models.js";
 import { PI_LIVE_COMMANDS } from "../client-protocol/pi-commands.js";
 import {
   PI_BRIDGE_COMMAND, openPiBridgeEndpoint, resolvePiBridgeExtensionPath,
@@ -29,11 +29,11 @@ import {
 } from "./pi-native-types.js";
 import { PiRpcClient, PiRpcCommandError, PiStartupError, queryPiCatalog, type PiLaunchSpec, type PiSpawn } from "./pi-rpc-client.js";
 import {
-  PI_TUI_BUILTIN_COMMANDS, classifyPiError, isPiPlaceholderModel, parsePiSlashCommand, samePiModel, sanitizePiErrorText, toPiModelRef,
+  PI_TUI_BUILTIN_COMMANDS, classifyPiError, isPiPlaceholderModel, parsePiSlashCommand, piDisplayText, samePiModel, sanitizePiErrorText, toPiModelRef,
   type PiAssistantMessage, type PiExtensionUiRequest, type PiModel, type PiModelRef, type PiPromptDisposition, type PiSessionEvent, type PiSessionState,
 } from "./pi-rpc-protocol.js";
 import { piManagedSearchServer, type PiManagedSearchServer } from "./pi-search-mcp.js";
-import { PiSessionStore, hasPiTrustGatedFiles, isSafePiSessionId, piBotDefaultFingerprint, type PiSessionRecord } from "./pi-session-store.js";
+import { PiSessionStore, piWorkspaceCwd, samePiWorkspace, hasPiTrustGatedFiles, isSafePiSessionId, piBotDefaultFingerprint, type PiSessionRecord } from "./pi-session-store.js";
 import {
   PiTurnMapper, buildPiPrompt, isPiDialog, piDialogQuestion, piDialogResponse, piNativeTree, piUsageCostBreakdown, piUserEntryText,
 } from "./pi-turn-mapper.js";
@@ -94,6 +94,7 @@ interface Turn {
   instructions?: string;
   appTools?: AppPlatformTools;
   notices: string[];
+  extensionErrors: number;
   emitChain: Promise<void>;
   /** Open human waits; the inactivity timer does not run while the owner is deciding. */
   humanWaits: number;
@@ -150,6 +151,7 @@ interface Worker {
   readonly ui: PiNativeState["ui"];
   /** Extension notices that arrived while no turn was running. */
   readonly backlog: string[];
+  readonly extensionErrors: Array<Extract<PiNativeEvent, { type: "extension_error" }>>;
   lastUsedAt: number;
   closed: boolean;
 }
@@ -399,19 +401,22 @@ export class PiRpcAdapter implements CodexAdapter {
 
   async validateExternalSession(sessionId: string, input: { workspaceOverride?: string } = {}): Promise<ExternalSessionInfo> {
     this.assertUsable();
-    const cwd = this.resolveWorkspace(input.workspaceOverride);
+    const cwd = await this.resolveWorkspace(input.workspaceOverride);
     const live = this.workers.get(sessionId);
-    if (live && !live.closed) return { sessionId, cwd: live.cwd, ...(live.state.sessionName ? { title: live.state.sessionName } : {}) };
+    if (live && !live.closed) {
+      if (!samePiWorkspace(live.cwd, cwd)) throw new Error(`Pi session ${sessionId} belongs to another workspace`);
+      return { sessionId, cwd: live.cwd, ...(live.state.sessionName ? { title: live.state.sessionName } : {}) };
+    }
     const file = await this.store.find(sessionId, cwd);
     if (!file) throw new Error(`Pi session ${sessionId} was not found for this workspace`);
-    if (path.resolve(file.cwd) !== cwd) throw new Error(`Pi session ${sessionId} belongs to another workspace`);
+    if (!samePiWorkspace(file.cwd, cwd)) throw new Error(`Pi session ${sessionId} belongs to another workspace`);
     if (file.origin === "native") await this.store.updateRecord(sessionId, { externalPath: file.path });
     return { sessionId, cwd: file.cwd, ...(file.name ? { title: file.name } : {}), updatedAt: file.updatedAt };
   }
 
   async listExternalSessions(input: { cwd?: string; limit?: number } = {}): Promise<ExternalSessionInfo[]> {
     this.assertUsable();
-    const sessions = await this.store.list({ cwd: this.resolveWorkspace(input.cwd), ...(input.limit ? { limit: input.limit } : {}) });
+    const sessions = await this.store.list({ cwd: await this.resolveWorkspace(input.cwd), ...(input.limit ? { limit: input.limit } : {}) });
     return sessions.map(session => ({
       sessionId: session.sessionId, cwd: session.cwd, updatedAt: session.updatedAt, ...(session.name ? { title: session.name } : {}),
     }));
@@ -419,7 +424,7 @@ export class PiRpcAdapter implements CodexAdapter {
 
   async getContextUsage(sessionId: string, input: { workspaceOverride?: string } = {}): Promise<EngineContextUsage | null> {
     this.assertUsable();
-    const worker = await this.ensureWorker(sessionId, this.resolveWorkspace(input.workspaceOverride));
+    const worker = await this.ensureWorker(sessionId, await this.resolveWorkspace(input.workspaceOverride));
     const context = (await worker.client.request({ type: "get_session_stats" })).contextUsage;
     if (!context) return null;
     return { ...(typeof context.tokens === "number" ? { pressureTokens: context.tokens } : {}), contextWindow: context.contextWindow };
@@ -428,7 +433,7 @@ export class PiRpcAdapter implements CodexAdapter {
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     this.assertUsable();
     if (input.abortSignal?.aborted) throw abortError();
-    const cwd = this.resolveWorkspace(input.workspaceOverride);
+    const cwd = await this.resolveWorkspace(input.workspaceOverride);
     const first = await this.ensureWorker(sessionId, cwd, input.abortSignal);
     if (first.turn) throw new Error("Pi session already has a turn in progress");
     if (first.exclusive) throw new PiNativeBusyError(first.exclusive);
@@ -453,9 +458,10 @@ export class PiRpcAdapter implements CodexAdapter {
           this.throwIfStopped(turn);
           const current = handled.sessionId ?? turn.worker.sessionId;
           if (current !== sessionId) await this.emit(turn, { type: "session", sessionId: current });
-          await this.emit(turn, { type: "result", text: handled.text, sessionId: current });
+          const text = this.withExtensionErrorNotice(turn, handled.text);
+          await this.emit(turn, { type: "result", text, sessionId: current });
           await turn.emitChain;
-          return { text: handled.text, sessionId: current };
+          return { text, sessionId: current };
         }
       }
       return await this.runPrompt(turn);
@@ -486,7 +492,7 @@ export class PiRpcAdapter implements CodexAdapter {
   private beginTurn(worker: Worker, input: CodexUserMessageInput): Turn {
     const turn: Turn = {
       worker, input, mapper: new PiTurnMapper(worker.sessionId), scope: new AbortController(), done: deferred<void>(), stopped: deferred<void>(),
-      notices: [], emitChain: Promise.resolve(), humanWaits: 0, stopRequested: false,
+      notices: [], extensionErrors: 0, emitChain: Promise.resolve(), humanWaits: 0, stopRequested: false,
       liveWork: new Set(), liveChain: Promise.resolve(), liveQueued: 0, wrappingUp: false, handedBack: 0,
     };
     worker.turn = turn;
@@ -528,7 +534,7 @@ export class PiRpcAdapter implements CodexAdapter {
     if (!limit || turn.input.disableRuntimeTimeout || turn.done.settled || turn.stopRequested) return;
     turn.inactivityTimer = setTimeout(() => {
       if (turn.humanWaits > 0) { this.noteActivity(turn); return; }
-      turn.timedOut = `Pi turn timed out after ${minutes(limit)} without activity`;
+      turn.timedOut = `Pi turn became inactive after ${minutes(limit)}`;
       void this.stopTurn(turn);
     }, limit);
     turn.inactivityTimer.unref?.();
@@ -677,7 +683,10 @@ export class PiRpcAdapter implements CodexAdapter {
     }
     const current = await this.reconcileSession(worker).catch(() => worker.sessionId);
     if (current !== sessionId) await this.emit(turn, { type: "session", sessionId: current });
-    let finalText = turn.mapper.finalText || turn.notices.join("\n");
+    // Extension notices are external/tool text, not an assistant instruction to send files or run Host commands.
+    let finalText = turn.mapper.finalText || (turn.notices.length
+      ? locale === "en" ? "Pi extension notices are available in this turn's run details." : "Pi 扩展发出了提示，详情见本轮运行过程。"
+      : "");
     // An extension command that printed nothing still gets a visible answer; an empty reply reads as a failure.
     if (!finalText && response.disposition === "handled" && !turn.mapper.runStarted) {
       finalText = locale === "en" ? "The command ran and produced no output." : "命令已执行，没有输出。";
@@ -686,6 +695,7 @@ export class PiRpcAdapter implements CodexAdapter {
     // the taken-back text stays in this turn's run details, so nothing the owner typed is replayed as the reply.
     const note = this.handBackNote(turn, locale);
     if (note) finalText = finalText.trim() ? `${finalText}\n\n${note}` : note;
+    finalText = this.withExtensionErrorNotice(turn, finalText);
     await this.emit(turn, { type: "result", text: finalText, sessionId: current });
     await turn.emitChain;
     return { text: finalText, sessionId: current, ...(turn.mapper.usage ? { usage: turn.mapper.usage } : {}) };
@@ -761,7 +771,19 @@ export class PiRpcAdapter implements CodexAdapter {
       case "session_info_changed": worker.state = { ...worker.state, sessionName: event.name }; this.publishState(worker); break;
       case "compaction_start": worker.state = { ...worker.state, isCompacting: true }; this.publishState(worker); break;
       case "compaction_end": worker.state = { ...worker.state, isCompacting: false }; this.publishState(worker); break;
-      case "extension_error": this.publish(worker.sessionId, { type: "extension_error", extensionPath: path.basename(event.extensionPath), event: event.event, error: sanitizePiErrorText(event.error) }); break;
+      case "extension_error": {
+        const diagnostic: Extract<PiNativeEvent, { type: "extension_error" }> = {
+          type: "extension_error", extensionPath: path.basename(event.extensionPath),
+          event: sanitizePiErrorText(event.event, 100), error: sanitizePiErrorText(event.error),
+        };
+        this.publish(worker.sessionId, diagnostic);
+        if (turn && !turn.done.settled) this.emitExtensionError(turn, diagnostic);
+        else {
+          worker.extensionErrors.push(diagnostic);
+          while (worker.extensionErrors.length > NOTICE_BACKLOG_LIMIT) worker.extensionErrors.shift();
+        }
+        break;
+      }
       default: break;
     }
     if (!turn) return;
@@ -802,6 +824,24 @@ export class PiRpcAdapter implements CodexAdapter {
 
   private flushBacklog(turn: Turn): void {
     for (const line of turn.worker.backlog.splice(0)) void this.emit(turn, { type: "assistant_text", text: line, sessionId: turn.worker.sessionId });
+    for (const error of turn.worker.extensionErrors.splice(0)) this.emitExtensionError(turn, error);
+  }
+
+  private emitExtensionError(turn: Turn, error: Extract<PiNativeEvent, { type: "extension_error" }>): void {
+    turn.extensionErrors++;
+    if (turn.extensionErrors > NOTICE_BACKLOG_LIMIT) return;
+    const label = turn.input.locale === "zh" ? "[Pi 扩展错误]" : "[Pi extension error]";
+    void this.emit(turn, { type: "assistant_text", text: `${label} ${error.extensionPath} (${error.event}): ${error.error}`, sessionId: turn.worker.sessionId });
+  }
+
+  private withExtensionErrorNotice(turn: Turn, text: string): string {
+    if (!turn.extensionErrors) return text;
+    // Extension diagnostics can contain text that resembles a delivery directive.
+    // Keep their details in the process; only a fixed count belongs in the final answer.
+    const warning = turn.input.locale === "zh"
+      ? `[Pi] 本轮出现 ${turn.extensionErrors} 个扩展错误；详情见本轮运行过程。`
+      : `[Pi] ${turn.extensionErrors} extension ${turn.extensionErrors === 1 ? "error" : "errors"} occurred. See this turn's run details.`;
+    return text.trim() ? `${text}\n\n${warning}` : warning;
   }
 
   private handleExtensionUi(worker: Worker, request: PiExtensionUiRequest): void {
@@ -812,10 +852,10 @@ export class PiRpcAdapter implements CodexAdapter {
         if (text) this.publishUi(worker, { type: "notify", level: request.notifyType ?? "info", text });
         return;
       }
-      case "setStatus": this.publishUi(worker, { type: "status", key: request.statusKey, ...(request.statusText ? { text: request.statusText } : {}) }); return;
-      case "setWidget": this.publishUi(worker, { type: "widget", key: request.widgetKey, ...(request.widgetLines ? { lines: request.widgetLines } : {}), placement: request.widgetPlacement ?? "aboveEditor" }); return;
-      case "setTitle": this.publishUi(worker, { type: "title", title: request.title }); return;
-      case "set_editor_text": this.publishUi(worker, { type: "editor_text", text: request.text }); return;
+      case "setStatus": this.publishUi(worker, { type: "status", key: request.statusKey, ...(request.statusText ? { text: piDisplayText(request.statusText) } : {}) }); return;
+      case "setWidget": this.publishUi(worker, { type: "widget", key: request.widgetKey, ...(request.widgetLines ? { lines: request.widgetLines.map(piDisplayText) } : {}), placement: request.widgetPlacement ?? "aboveEditor" }); return;
+      case "setTitle": this.publishUi(worker, { type: "title", title: piDisplayText(request.title) }); return;
+      case "set_editor_text": this.publishUi(worker, { type: "editor_text", text: piDisplayText(request.text) }); return;
       default: break;
     }
     if (!isPiDialog(request)) return;
@@ -1013,8 +1053,8 @@ export class PiRpcAdapter implements CodexAdapter {
 
   /**
    * The Bot-wide model and effort are a default, not a per-turn force: they are
-   * applied when a session first runs and again only when the Bot setting
-   * changes. A choice made inside the conversation therefore survives.
+   * applied when a session first runs and again only when that individual Bot
+   * field changes. A choice in the other field made in the conversation survives.
    * Clearing the Bot setting undoes exactly what it had imposed and nothing
    * the conversation chose itself. A dispatcher ticket override is applied on
    * every turn of its session.
@@ -1029,30 +1069,60 @@ export class PiRpcAdapter implements CodexAdapter {
     }
     const fingerprint = piBotDefaultFingerprint(runtime.botModel, runtime.botEffort);
     const record = await this.store.record(scope.sessionId);
-    if (record.appliedBotDefault === fingerprint) return;
-    const patch: Partial<PiSessionRecord> = { appliedBotDefault: fingerprint };
+    const modelFingerprint = piBotDefaultFingerprint(runtime.botModel, undefined);
+    const thinkingFingerprint = piBotDefaultFingerprint(undefined, runtime.botEffort);
+    // Older records know only the pair. If unchanged, migrate without writing to Pi;
+    // otherwise retain the old apply-both behavior once, since neither previous value is known.
+    const legacyUnchanged = record.appliedBotDefault === fingerprint;
+    const modelChanged = record.appliedBotModelDefault !== undefined
+      ? record.appliedBotModelDefault !== modelFingerprint : !legacyUnchanged;
+    const thinkingChanged = record.appliedBotThinkingDefault !== undefined
+      ? record.appliedBotThinkingDefault !== thinkingFingerprint : !legacyUnchanged;
+    const patch: Partial<PiSessionRecord> = {
+      appliedBotDefault: fingerprint, appliedBotModelDefault: modelFingerprint, appliedBotThinkingDefault: thinkingFingerprint,
+    };
+    if (!modelChanged && !thinkingChanged) {
+      if (record.appliedBotModelDefault === undefined || record.appliedBotThinkingDefault === undefined) await scope.record(patch);
+      return;
+    }
     const stillImposedModel = Boolean(record.modelSource === "bot-default" && record.botDefaultModel && samePiModel(toPiModelRef(worker.state.model), record.botDefaultModel));
     const stillImposedThinking = Boolean(record.botDefaultThinking && worker.state.thinkingLevel === record.botDefaultThinking);
+    // Ownership must survive Pi resetting thinking during an uncertain model
+    // write. A conversation's explicit thinking choice clears this record.
+    const retainBotThinking = modelChanged && !thinkingChanged && Boolean(runtime.botEffort && record.botDefaultThinking === runtime.botEffort)
+      && (Boolean(runtime.botModel) || record.modelSource === "bot-default");
     const thinkingBefore = stillImposedThinking ? record.thinkingBeforeBotDefault : worker.state.thinkingLevel;
+    const modelBefore = toPiModelRef(worker.state.model), levelBefore = worker.state.thinkingLevel;
     let modelRestored = false;
 
-    if (runtime.botModel) {
+    if (modelChanged && runtime.botModel) {
       const ref = this.decodeModel(runtime.botModel);
+      if (retainBotThinking) await this.validateThinkingForModel(worker, ref, runtime.botEffort!);
       await this.setModelExact(worker, ref, beforeWrite);
       patch.modelSource = "bot-default"; patch.botDefaultModel = ref;
-    } else if (stillImposedModel) {
+    } else if (modelChanged && stillImposedModel) {
       // The Bot default was cleared and this session still runs the model it had imposed: return to Pi's own default.
-      modelRestored = await this.restoreNativeDefault(worker, beforeWrite);
+      modelRestored = await this.restoreNativeDefault(worker, beforeWrite, { thinking: thinkingChanged && stillImposedThinking, ...(retainBotThinking ? { requiredThinking: runtime.botEffort } : {}) });
       patch.modelSource = "native"; patch.botDefaultModel = undefined;
       if (!modelRestored) this.publishUi(worker, { type: "notify", level: "warning", text: "Pi's default model is not available right now; the conversation keeps its current model." }, "host");
-    } else if (record.modelSource === "bot-default") {
+    } else if (modelChanged && record.modelSource === "bot-default") {
       patch.modelSource = "session"; patch.botDefaultModel = undefined;
     }
 
-    if (runtime.botEffort) {
+    // Pi's set_model applies its per-model/default thinking setting. Reapply an
+    // unchanged Bot-owned effort even if an earlier uncertain write already
+    // selected the target model. No intermediate checkpoint or retry flag needed.
+    if (retainBotThinking) await this.setThinkingExact(worker, runtime.botEffort!, beforeWrite);
+    else if (modelChanged && !thinkingChanged && !samePiModel(modelBefore, toPiModelRef(worker.state.model)) && levelBefore !== worker.state.thinkingLevel && levelBefore && isThinkingLevel(levelBefore)) {
+      const { levels } = await worker.client.request({ type: "get_available_thinking_levels" });
+      if (levels.includes(levelBefore)) await this.setThinkingExact(worker, levelBefore, beforeWrite);
+      else this.publishUi(worker, { type: "notify", level: "warning", text: `The new Pi model does not support the conversation's ${levelBefore} thinking level; Pi selected ${worker.state.thinkingLevel ?? "its default"}.` }, "host");
+    }
+
+    if (thinkingChanged && runtime.botEffort) {
       await this.setThinkingExact(worker, runtime.botEffort, beforeWrite);
       patch.botDefaultThinking = runtime.botEffort; patch.thinkingBeforeBotDefault = thinkingBefore;
-    } else {
+    } else if (thinkingChanged) {
       // The Bot effort was cleared. If the session still runs the level it had imposed, put back what was there before;
       // a model that was just returned to Pi's default already carries Pi's own level.
       if (stillImposedThinking && !modelRestored && thinkingBefore && thinkingBefore !== worker.state.thinkingLevel) {
@@ -1077,18 +1147,35 @@ export class PiRpcAdapter implements CodexAdapter {
   /** `beforeWrite` runs immediately before each native write; throwing there leaves Pi untouched. */
   private async setModelExact(worker: Worker, ref: PiModelRef, beforeWrite?: () => Promise<void>): Promise<void> {
     if (samePiModel(toPiModelRef(worker.state.model), ref)) return;
+    let written = false;
     try {
       const model = await this.settingsWrite(worker, { type: "set_model", provider: ref.provider, modelId: ref.modelId }, beforeWrite);
+      written = true;
       worker.state = { ...worker.state, model };
       await this.refreshState(worker);
       this.publishState(worker);
     } catch (error) {
+      if (written) {
+        worker.settingsUncertain = "set_model";
+        throw new PiNativeUncertainError("set_model", { cause: error });
+      }
       if (error instanceof PiRpcCommandError && error.kind === "model-unavailable") {
         // Pi words an unknown model and a provider without credentials identically.
         throw new PiNativeRejectedError(`Invalid model selection: ${modelLabel(ref)} is not available in Pi. Either the model does not exist or its provider is not signed in.`, "model-unavailable");
       }
       throw error;
     }
+  }
+
+  /** Reject an incompatible retained Bot effort before changing the model. */
+  private async validateThinkingForModel(worker: Worker, ref: PiModelRef, level: string): Promise<void> {
+    const { models } = await worker.client.request({ type: "get_available_models" });
+    const model = models.find(model => model.provider === ref.provider && model.id === ref.modelId);
+    if (!model) return; // Keep Pi's own unavailable-model error and credential check.
+    const levels = piThinkingLevels(model);
+    if (!isThinkingLevel(level) || !levels.includes(level)) throw new PiNativeRejectedError(
+      `Invalid model selection: ${modelLabel(ref)} has no "${level}" effort (available: ${levels.join(", ")})`, "thinking-unsupported", levels,
+    );
   }
 
   private async setThinkingExact(worker: Worker, level: string, beforeWrite?: () => Promise<void>): Promise<void> {
@@ -1186,7 +1273,7 @@ export class PiRpcAdapter implements CodexAdapter {
     return task;
   }
 
-  private async restoreNativeDefault(worker: Worker, beforeWrite?: () => Promise<void>, options: { thinking: boolean } = { thinking: true }): Promise<boolean> {
+  private async restoreNativeDefault(worker: Worker, beforeWrite?: () => Promise<void>, options: { thinking: boolean; requiredThinking?: string } = { thinking: true }): Promise<boolean> {
     try {
       const catalog = await (this.options.queryCatalogFn ?? queryPiCatalog)({
         launch: this.options.launch, cwd: worker.cwd, env: this.options.childEnv,
@@ -1196,7 +1283,9 @@ export class PiRpcAdapter implements CodexAdapter {
         ...(this.options.killProcessTreeFn ? { killProcessTreeFn: this.options.killProcessTreeFn } : {}),
       });
       if (!catalog.current) return false;
-      await this.setModelExact(worker, { provider: catalog.current.provider, modelId: catalog.current.modelId }, beforeWrite);
+      const ref = { provider: catalog.current.provider, modelId: catalog.current.modelId };
+      if (options.requiredThinking) await this.validateThinkingForModel(worker, ref, options.requiredThinking);
+      await this.setModelExact(worker, ref, beforeWrite);
       const level = catalog.current.thinkingLevel;
       if (options.thinking && isThinkingLevel(level) && worker.state.thinkingLevel !== level) {
         const { levels } = await worker.client.request({ type: "get_available_thinking_levels" });
@@ -1209,7 +1298,7 @@ export class PiRpcAdapter implements CodexAdapter {
     } catch (error) {
       // A failed precondition and an unconfirmed write must reach the caller as what they are;
       // anything else means the default could not be restored.
-      if (error instanceof PiNativeUncertainError || (error instanceof PiNativeRejectedError && error.reason === "not-found")) throw error;
+      if (error instanceof PiNativeUncertainError || (error instanceof PiNativeRejectedError && (error.reason === "not-found" || error.reason === "thinking-unsupported"))) throw error;
       return false;
     }
   }
@@ -1359,8 +1448,20 @@ export class PiRpcAdapter implements CodexAdapter {
     if (this.destroyed) throw new Error("Pi adapter has been destroyed");
   }
 
-  private resolveWorkspace(override: string | undefined): string {
-    return path.resolve(override ?? this.options.workspacePath);
+  private async resolveWorkspace(override: string | undefined): Promise<string> {
+    if (override !== undefined) return piWorkspaceCwd(override);
+    // Control calls such as /resume and /context have no turn-supplied override.
+    // Read the current Bot configuration, just as ordinary messages do, rather
+    // than using the factory's fallback directory after the workspace changes.
+    if (this.options.configPath) {
+      const config = await readValidatedConfigFile(this.options.configPath, { forExecution: true });
+      const resume = config.resume && typeof config.resume === "object" ? config.resume as { workspacePath?: unknown } : undefined;
+      const workspace = typeof config.workspacePath === "string" && config.workspacePath.trim()
+        ? config.workspacePath.trim()
+        : typeof resume?.workspacePath === "string" && resume.workspacePath ? resume.workspacePath : undefined;
+      if (workspace) return piWorkspaceCwd(workspace);
+    }
+    return piWorkspaceCwd(this.options.workspacePath);
   }
 
   private ensureWorker(sessionId: string, cwd: string, signal?: AbortSignal): Promise<Worker> {
@@ -1368,12 +1469,15 @@ export class PiRpcAdapter implements CodexAdapter {
     if (!isSafePiSessionId(sessionId)) return Promise.reject(new Error("Invalid Pi session id"));
     const live = this.workers.get(sessionId);
     if (live && !live.closed && live.client.isAlive) {
-      if (live.cwd !== cwd) return Promise.reject(new Error(`Pi session ${sessionId} is open in another workspace`));
+      if (!samePiWorkspace(live.cwd, cwd)) return Promise.reject(new Error(`Pi session ${sessionId} is open in another workspace`));
       live.lastUsedAt = Date.now();
       return Promise.resolve(live);
     }
     const pending = this.starting.get(sessionId);
-    if (pending) return pending;
+    if (pending) return pending.then(worker => {
+      if (!samePiWorkspace(worker.cwd, cwd)) throw new Error(`Pi session ${sessionId} is open in another workspace`);
+      return worker;
+    });
     const starting = this.startWorker(sessionId, cwd, signal).finally(() => { this.starting.delete(sessionId); });
     this.starting.set(sessionId, starting);
     return starting;
@@ -1382,9 +1486,10 @@ export class PiRpcAdapter implements CodexAdapter {
   private async startWorker(sessionId: string, cwd: string, signal?: AbortSignal): Promise<Worker> {
     await this.store.ensureDirs();
     await mkdir(cwd, { recursive: true });
+    cwd = piWorkspaceCwd(cwd);
     const file = await this.store.find(sessionId, cwd);
     // Resuming by id from another directory makes Pi ask [y/N] on the terminal and read our first command as the answer.
-    if (file && path.resolve(file.cwd) !== cwd) throw new Error(`Pi session ${sessionId} belongs to another workspace`);
+    if (file && !samePiWorkspace(file.cwd, cwd)) throw new Error(`Pi session ${sessionId} belongs to another workspace`);
     const args = ["--session-dir", this.store.sessionDir, ...(file ? ["--session", file.path] : ["--session-id", sessionId])];
     // The Bot's model scope. `--models` takes a comma-separated list, so a reference containing a comma cannot be passed.
     const scope = (await this.store.scopedModels()).map(decodePiModel).filter((model): model is PiModelRef => Boolean(model))
@@ -1404,6 +1509,7 @@ export class PiRpcAdapter implements CodexAdapter {
       try { managedSearch = await piManagedSearchServer(this.options.nativeSearchMcp(), this.options.childEnv, cwd); } catch { managedSearch = null; }
     }
     const uiAtStartup: PiExtensionUiRequest[] = [];
+    const errorsAtStartup: Array<Extract<PiSessionEvent, { type: "extension_error" }>> = [];
     let client: PiRpcClient | undefined;
     let bridge: PiBridgeConnection | undefined;
     const discard = async () => { client?.terminate(); bridge?.close(); await endpoint?.dispose(); };
@@ -1418,6 +1524,13 @@ export class PiRpcAdapter implements CodexAdapter {
           if (worker) return;
           if (isPiDialog(request)) peer.respondExtensionUi({ type: "extension_ui_response", id: request.id, cancelled: true });
           else uiAtStartup.push(request);
+        },
+        onEvent: event => {
+          if (worker) this.handleEvent(worker, event);
+          else if (event.type === "extension_error") {
+            errorsAtStartup.push(event);
+            while (errorsAtStartup.length > NOTICE_BACKLOG_LIMIT) errorsAtStartup.shift();
+          }
         },
         ...(this.options.startupTimeoutMs ? { startupTimeoutMs: this.options.startupTimeoutMs } : {}),
         ...(this.options.spawnFn ? { spawnFn: this.options.spawnFn } : {}),
@@ -1439,7 +1552,7 @@ export class PiRpcAdapter implements CodexAdapter {
       if (signal?.aborted) throw abortError();
       worker = {
         sessionId, generation: 1, token: randomUUID(), editorRevision: 0, settingsQueue: Promise.resolve(), cwd, client, ...(endpoint ? { endpoint } : {}), ...(bridge ? { bridge } : {}),
-        state, queue: { steering: [], followUp: [] }, dialogs: new Map(), ui: { status: {}, widgets: {} }, backlog: [], lastUsedAt: Date.now(), closed: false,
+        state, queue: { steering: [], followUp: [] }, dialogs: new Map(), ui: { status: {}, widgets: {} }, backlog: [], extensionErrors: [], lastUsedAt: Date.now(), closed: false,
       };
     } catch (error) {
       await discard();
@@ -1447,7 +1560,7 @@ export class PiRpcAdapter implements CodexAdapter {
     }
     const current = worker;
     for (const event of startup.events.splice(0)) if (event.type === "session_start" && typeof event.trusted === "boolean") current.trusted = event.trusted;
-    client.onEvent(event => this.handleEvent(current, event));
+    for (const event of errorsAtStartup.splice(0)) this.handleEvent(current, event);
     client.onExtensionUi(request => this.handleExtensionUi(current, request));
     for (const request of uiAtStartup.splice(0)) this.handleExtensionUi(current, request);
     void client.exited.then(() => this.handleExit(current));
@@ -1596,7 +1709,7 @@ export class PiRpcAdapter implements CodexAdapter {
     if (!header || !isSafePiSessionId(header.id)) return;
     const existing = await this.store.find(header.id, worker.cwd);
     return {
-      path: resolved, header, sameWorkspace: path.resolve(header.cwd) === worker.cwd,
+      path: resolved, header, sameWorkspace: samePiWorkspace(header.cwd, worker.cwd),
       alreadyPresent: Boolean(existing) || this.workers.has(header.id),
     };
   }
@@ -1605,7 +1718,7 @@ export class PiRpcAdapter implements CodexAdapter {
     this.assertUsable();
     const worker = this.workers.get(sessionId);
     if (worker && !worker.closed && worker.client.isAlive) { worker.lastUsedAt = Date.now(); return worker; }
-    return this.ensureWorker(sessionId, this.resolveWorkspace(undefined));
+    return this.ensureWorker(sessionId, await this.resolveWorkspace(undefined));
   }
 
   private requireBridge(worker: Worker, operation: string): PiBridgeConnection {

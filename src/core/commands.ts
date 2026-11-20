@@ -479,6 +479,7 @@ async function handleCoreLocalEngineCommand(
       role: cfg.role,
       model: cfg.model,
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
+      workspacePath: cfg.workspacePath,
       resume: cfg.resume,
     },
     normalized: toSessionCommandMessage(normalized, commandText),
@@ -1825,6 +1826,7 @@ async function renderCoreStatusMessage(
       ...(cfg.engine === "antigravity" && currentSession ? [`Current conversation: ${currentSession.codexSessionId}`] : []),
       ...(cfg.engine === "kimi" && currentSession ? [`Current Kimi session: ${currentSession.codexSessionId}`] : []),
       ...(cfg.engine === "deepseek" && currentSession ? [`Current DeepSeek Harness session: ${currentSession.codexSessionId}`] : []),
+      ...(cfg.engine === "pi" && currentSession ? [`Current Pi session: ${currentSession.codexSessionId}`] : []),
       ...workflowLines,
       `Active run: ${activeRun ? "yes" : "no"}`,
       `Pending approvals: ${runtime.pendingApprovals.size}`,
@@ -1865,6 +1867,7 @@ async function renderCoreStatusMessage(
     ...(cfg.engine === "antigravity" && currentSession ? [`当前 conversation：${currentSession.codexSessionId}`] : []),
     ...(cfg.engine === "kimi" && currentSession ? [`当前 Kimi session：${currentSession.codexSessionId}`] : []),
     ...(cfg.engine === "deepseek" && currentSession ? [`当前 DeepSeek Harness session：${currentSession.codexSessionId}`] : []),
+    ...(cfg.engine === "pi" && currentSession ? [`当前 Pi session：${currentSession.codexSessionId}`] : []),
     ...workflowLines,
     `当前运行：${activeRun ? "是" : "否"}`,
     `待处理审批：${runtime.pendingApprovals.size}`,
@@ -2472,6 +2475,9 @@ async function handleCoreYoloCommand(stateDir: string, action: string, locale: L
     return `当前 YOLO: ${label}`;
   }
   if (action === "on") {
+    if (cfg.engine === "pi") return locale === "en"
+      ? "Pi does not provide sandboxed full-auto. Permissions were not changed. Use /yolo off for normal approval or /yolo unsafe to skip approval without an OS sandbox."
+      : "Pi 不提供带沙箱的 full-auto，权限未更改。普通审批请用 /yolo off；跳过审批请用 /yolo unsafe，这不会提供 OS 沙箱。";
     const engine = await updateInstanceApprovalMode(stateDir, "full-auto");
     if (engine === "kimi") {
       return locale === "en"

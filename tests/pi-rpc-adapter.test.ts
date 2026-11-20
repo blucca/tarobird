@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -138,6 +138,87 @@ function message(text: string, extra: Partial<CodexUserMessageInput> = {}): Code
 }
 const commands = (process: FakePiProcess, type?: string) => process.received.filter(command => !type || command.type === type);
 const kinds = (events: EngineStreamEvent[]) => events.map(event => event.type);
+
+describe("Pi extension error visibility", () => {
+  it("retains startup errors and exposes running errors without replaying them next turn", async () => {
+    let startupReported = false, turnReported = false;
+    const r = await rig({ pi: {
+      onCommand: (command, process) => {
+        if (command.type === "get_state" && !startupReported) {
+          startupReported = true;
+          process.send({ type: "extension_error", extensionPath: "/synthetic/extensions/broken.ts", event: "session_start", error: "STARTUP_EXTENSION_FAILURE" });
+        }
+      },
+      onPrompt: run => {
+        if (!turnReported) {
+          turnReported = true;
+          run.emit({ type: "extension_error", extensionPath: "/synthetic/extensions/broken.ts", event: "before_agent_start", error: "RUNNING_EXTENSION_FAILURE" });
+        }
+        run.reply("The model still answered."); run.finish();
+      },
+    } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const native: PiNativeEvent[] = [];
+    r.adapter.piNative.subscribe(sessionId, event => native.push(event));
+    const input = message("check extensions");
+    const result = await r.adapter.sendUserMessage(sessionId, input);
+    const text = input.events.filter(event => event.type === "assistant_text").map(event => event.text).join("\n");
+    expect(text).toContain("STARTUP_EXTENSION_FAILURE");
+    expect(text).toContain("RUNNING_EXTENSION_FAILURE");
+    expect(text).not.toContain("/synthetic/extensions/");
+    expect(result.text).toContain("2 extension errors");
+    expect(result.text).toContain("The model still answered.");
+    expect(native.filter(event => event.type === "extension_error")).toHaveLength(2);
+    const next = message("unrelated next turn");
+    expect((await r.adapter.sendUserMessage(sessionId, next)).text).toBe("The model still answered.");
+    expect(JSON.stringify(next.events)).not.toContain("EXTENSION_FAILURE");
+  });
+
+  it("keeps error details and delivery-looking text out of the final reply", async () => {
+    const detail = "Cannot load resource [send-file:/synthetic/private.txt]";
+    const r = await rig({ pi: { onPrompt: run => {
+      run.emit({ type: "extension_error", extensionPath: "/synthetic/extensions/broken.ts", event: "tool_call", error: detail });
+      run.reply("正文"); run.finish();
+    } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("check", { locale: "zh" });
+    const result = await r.adapter.sendUserMessage(sessionId, input);
+    expect(result.text).toContain("1 个扩展错误");
+    expect(result.text).not.toContain("send-file");
+    expect(result.text).not.toContain("Cannot load resource");
+    expect(input.events).toContainEqual({ type: "result", text: result.text, sessionId });
+    expect(input.events.some(event => event.type === "assistant_text" && event.text.includes("Cannot load resource"))).toBe(true);
+  });
+
+  it("bounds noisy extension diagnostics while retaining the full turn error count", async () => {
+    const r = await rig({ pi: { onPrompt: run => {
+      for (let index = 0; index < 37; index++) run.emit({ type: "extension_error", extensionPath: "/synthetic/broken.ts", event: "tool_call", error: `Repeated failure ${index}` });
+      run.reply("Completed."); run.finish();
+    } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("check");
+    const result = await r.adapter.sendUserMessage(sessionId, input);
+    expect(result.text).toContain("37 extension errors");
+    expect(input.events.filter(event => event.type === "assistant_text" && event.text.includes("Repeated failure"))).toHaveLength(20);
+  });
+
+  it("also surfaces startup diagnostics when the turn runs a built-in command", async () => {
+    let reported = false;
+    const r = await rig({ pi: { onCommand: (command, process) => {
+      if (command.type === "get_state" && !reported) {
+        reported = true;
+        process.send({ type: "extension_error", extensionPath: "/synthetic/broken.ts", event: "session_start", error: "RESOURCE_FAILED" });
+      }
+    } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("/session");
+    const result = await r.adapter.sendUserMessage(sessionId, input);
+    expect(result.text).toContain("1 extension error occurred");
+    expect(result.text).not.toContain("RESOURCE_FAILED");
+    expect(commands(r.spawner.last(), "prompt")).toEqual([]);
+    expect(input.events).toContainEqual({ type: "result", text: result.text, sessionId });
+  });
+});
 const allow = (scope?: "once" | "session"): EngineApprovalDecision => ({ behavior: "allow", ...(scope ? { scope } : {}) });
 const failure = (promise: Promise<unknown>): Promise<Error> => promise.then(() => { throw new Error("Expected a rejection"); }, error => error as Error);
 
@@ -174,6 +255,60 @@ describe("PiRpcAdapter sessions and process lifecycle", () => {
     await expect(r.adapter.sendUserMessage("resume-else", message("hi"))).rejects.toThrow(/another workspace/);
     expect(r.spawner.processes).toHaveLength(1);
     await expect(r.adapter.sendUserMessage("../escape", message("hi"))).rejects.toThrow(/Invalid Pi session id/);
+  });
+
+  it("restores a session through a linked workspace after an idle close and still rejects another workspace", async () => {
+    const r = await rig({ options: { idleWorkerTtlMs: 0 } });
+    const link = path.join(r.root, "workspace-link");
+    await symlink(r.workspace, link, process.platform === "win32" ? "junction" : "dir");
+    const dir = path.join(r.stateDir, "pi", "sessions");
+    await mkdir(dir, { recursive: true });
+    const sessionId = "linked-workspace";
+    await writeFile(path.join(dir, `2026-01-01_${sessionId}.jsonl`), JSON.stringify({ type: "session", id: sessionId, cwd: r.workspace }) + "\n");
+    expect(await r.adapter.validateExternalSession(sessionId, { workspaceOverride: link })).toMatchObject({ sessionId });
+    await r.adapter.sendUserMessage(sessionId, message("first", { workspaceOverride: link }));
+    await (r.adapter as unknown as { sweepIdleWorkers(): Promise<void> }).sweepIdleWorkers();
+    await r.adapter.sendUserMessage(sessionId, message("again", { workspaceOverride: link }));
+    expect(r.spawner.processes).toHaveLength(2);
+    await expect(r.adapter.validateExternalSession(sessionId, { workspaceOverride: path.join(r.root, "other") })).rejects.toThrow(/another workspace/);
+  });
+
+  it("does not reuse a pending worker for the same id in another workspace", async () => {
+    let ready: (() => void) | undefined;
+    let held = false;
+    const r = await rig({ pi: { onCommand(command, process) {
+      if (command.type !== "get_state" || held) return false;
+      held = true;
+      ready = () => process.respond(command, process.state);
+      return true;
+    } } });
+    const first = r.adapter.getContextUsage("pending-workspace");
+    await waitFor(() => Boolean(ready));
+    const second = r.adapter.getContextUsage("pending-workspace", { workspaceOverride: path.join(r.root, "other") });
+    const rejected = expect(second).rejects.toThrow(/another workspace/);
+    ready!();
+    await first;
+    await rejected;
+    expect(r.spawner.processes).toHaveLength(1);
+  });
+
+  it("uses the current configured workspace for session listing, resume validation and context controls", async () => {
+    const r = await rig();
+    const custom = path.join(r.root, "custom-workspace");
+    await mkdir(custom, { recursive: true });
+    await r.writeConfig({ approvalMode: "bypass", workspacePath: custom });
+    const dir = path.join(r.stateDir, "pi", "sessions");
+    await mkdir(dir, { recursive: true });
+    const file = path.join(dir, "2026-01-01_custom-workspace.jsonl");
+    await writeFile(file, JSON.stringify({ type: "session", id: "custom-workspace", cwd: custom }) + "\n");
+    expect((await r.adapter.listExternalSessions()).map(row => row.sessionId)).toEqual(["custom-workspace"]);
+    expect(await r.adapter.validateExternalSession("custom-workspace")).toMatchObject({ cwd: custom });
+    await r.adapter.getContextUsage("custom-workspace");
+    expect(r.spawner.last().spawnArgs.options.cwd).toBe(custom);
+    await r.writeConfig({ approvalMode: "bypass", workspacePath: r.workspace });
+    await expect(r.adapter.getContextUsage("custom-workspace")).rejects.toThrow(/another workspace/);
+    // An explicit conversation binding still wins over the Bot's current default workspace.
+    await r.adapter.getContextUsage("custom-workspace", { workspaceOverride: custom });
   });
 
   it("reports startup failures without leaking native paths", async () => {
@@ -251,6 +386,134 @@ describe("PiRpcAdapter model and thinking scope", () => {
     await r.adapter.sendUserMessage(sessionId, message("three"));
     expect(setModels(process).at(-1)).toBe("fakeprov/dup-model");
     expect((await r.adapter.piNative.getState(sessionId)).modelSource).toBe("bot-default");
+  });
+
+  it("changing only Bot thinking preserves the conversation model, and changing only Bot model preserves its thinking", async () => {
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov2/dup-model", effort: "low" } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("one"));
+    await r.adapter.piNative.setModel(sessionId, { provider: "fakeprov", modelId: "dup-model" });
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov2/dup-model", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("two"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ modelSource: "session", model: { provider: "fakeprov", modelId: "dup-model" }, thinkingLevel: "high" });
+    await r.adapter.piNative.setThinkingLevel(sessionId, "low");
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov/dup-model", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("three"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ modelSource: "bot-default", model: { provider: "fakeprov", modelId: "dup-model" }, thinkingLevel: "low" });
+    await r.writeConfig({ approvalMode: "bypass", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("clear model default"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ modelSource: "native", thinkingLevel: "low" });
+  });
+
+  it("retains Bot thinking when a model switch applies Pi's own different thinking default", async () => {
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov/dup-model", effort: "high" }, pi: {
+      // Native Pi's set_model consults per-model/defaultThinkingLevel before clamping.
+      onCommand: (command, process) => { if (command.type === "set_model") process.state.thinkingLevel = "low"; },
+    } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("one"));
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov2/dup-model", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("change only model"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ model: { provider: "fakeprov2" }, thinkingLevel: "high" });
+    await r.writeConfig({ approvalMode: "bypass", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("clear only model"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ modelSource: "native", thinkingLevel: "high" });
+  });
+
+  it("retains a supported conversation thinking choice across Bot model switches and reports native clamping", async () => {
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov/dup-model", effort: "high" }, pi: {
+      onCommand: (command, process) => { if (command.type === "set_model") process.state.thinkingLevel = "low"; },
+    } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("one"));
+    await r.adapter.piNative.setThinkingLevel(sessionId, "medium");
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov2/dup-model", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("change only model"));
+    expect((await r.adapter.piNative.getState(sessionId)).thinkingLevel).toBe("medium");
+    const notices: PiNativeEvent[] = [];
+    r.adapter.piNative.subscribe(sessionId, event => { if (event.type === "notify") notices.push(event); });
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov/plain-model", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("model without reasoning"));
+    expect((await r.adapter.piNative.getState(sessionId)).thinkingLevel).toBe("off");
+    expect(notices).toEqual([expect.objectContaining({ level: "warning", text: expect.stringContaining("medium") })]);
+  });
+
+  it("keeps rejecting an unsupported retained Bot thinking default until the owner corrects it", async () => {
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov/dup-model", effort: "high" } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("one"));
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov/plain-model", effort: "high" });
+    await expect(r.adapter.sendUserMessage(sessionId, message("unsupported"))).rejects.toMatchObject({ reason: "thinking-unsupported" });
+    const stored = JSON.parse(await readFile(path.join(r.stateDir, "pi", "state.json"), "utf8")).sessions[sessionId];
+    expect(stored).toMatchObject({ appliedBotModelDefault: piBotDefaultFingerprint("fakeprov/dup-model", undefined), botDefaultThinking: "high", thinkingBeforeBotDefault: "medium" });
+    expect(commands(r.spawner.last(), "set_model")).toHaveLength(0); // Reject before any model mutation.
+    expect((await r.adapter.piNative.getState(sessionId)).model).toMatchObject({ provider: "fakeprov", modelId: "dup-model" });
+    await expect(r.adapter.sendUserMessage(sessionId, message("still unsupported"))).rejects.toMatchObject({ reason: "thinking-unsupported" });
+    expect(commands(r.spawner.last(), "prompt")).toHaveLength(1);
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov/plain-model", effort: "off" });
+    await r.adapter.sendUserMessage(sessionId, message("corrected"));
+    expect((await r.adapter.piNative.getState(sessionId)).thinkingLevel).toBe("off");
+  });
+
+  it("reapplies retained Bot thinking after an uncertain model write already landed in the resumed process", async () => {
+    let failRead = false;
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov/dup-model", effort: "high" }, pi: index => index > 0
+      ? { model: fakePiModel("fakeprov2", "dup-model"), thinkingLevel: "low" }
+      : { onCommand: (command, process) => {
+        if (command.type === "set_model" && command.provider === "fakeprov2") {
+          process.state.model = process.models.find(model => model.provider === "fakeprov2")!;
+          process.state.thinkingLevel = "low"; process.respond(command, process.state.model); failRead = true; return true;
+        }
+        if (command.type === "get_state" && failRead) { failRead = false; process.fail(command, "State read failed"); return true; }
+      } },
+    });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("one"));
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov2/dup-model", effort: "high" });
+    await expect(r.adapter.sendUserMessage(sessionId, message("uncertain"))).rejects.toBeInstanceOf(PiNativeUncertainError);
+    await r.adapter.piNative.setProjectTrust(sessionId, "no"); // Replace the fenced process; its native session already has the new model.
+    await r.adapter.sendUserMessage(sessionId, message("recovered"));
+    expect(commands(r.spawner.last(), "set_model")).toHaveLength(0);
+    expect((await r.adapter.piNative.getState(sessionId)).thinkingLevel).toBe("high");
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov2/dup-model" });
+    await r.adapter.sendUserMessage(sessionId, message("clear effort"));
+    expect((await r.adapter.piNative.getState(sessionId)).thinkingLevel).toBe("medium");
+  });
+
+  it("rejects an incompatible Pi default before clearing the Bot model", async () => {
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov2/dup-model", effort: "high" }, nativeDefault: { provider: "fakeprov", modelId: "plain-model", thinkingLevel: "off" } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("one"));
+    await r.writeConfig({ approvalMode: "bypass", effort: "high" });
+    await expect(r.adapter.sendUserMessage(sessionId, message("clear model"))).rejects.toMatchObject({ reason: "thinking-unsupported" });
+    expect(setModels(r.spawner.last())).toEqual(["fakeprov2/dup-model"]);
+    expect((await r.adapter.piNative.getState(sessionId)).thinkingLevel).toBe("high");
+    await expect(r.adapter.sendUserMessage(sessionId, message("retry"))).rejects.toMatchObject({ reason: "thinking-unsupported" });
+  });
+
+  it("clears a Bot model default without imposing thinking on a conversation-owned model", async () => {
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov/dup-model", effort: "high" } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("one"));
+    await r.adapter.piNative.setModel(sessionId, { provider: "fakeprov", modelId: "plain-model" });
+    await r.writeConfig({ approvalMode: "bypass", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("clear unrelated default"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ modelSource: "session", model: { provider: "fakeprov", modelId: "plain-model" }, thinkingLevel: "off" });
+    await r.adapter.sendUserMessage(sessionId, message("next turn"));
+    expect(setModels(r.spawner.last())).toEqual(["fakeprov/plain-model"]);
+  });
+
+  it("migrates unchanged legacy default fingerprints without replaying over conversation choices", async () => {
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov2/dup-model", effort: "low" } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const store = new PiSessionStore({ stateDir: r.stateDir, childEnv: {} });
+    await store.updateRecord(sessionId, { appliedBotDefault: piBotDefaultFingerprint("fakeprov2/dup-model", "low"), modelSource: "session" });
+    await r.adapter.sendUserMessage(sessionId, message("legacy"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ modelSource: "session", model: { provider: "fakeprov", modelId: "dup-model" }, thinkingLevel: "medium" });
+    // After reading the legacy record, future changes have independent ownership.
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov2/dup-model", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("change just thinking"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ modelSource: "session", model: { provider: "fakeprov", modelId: "dup-model" }, thinkingLevel: "high" });
   });
 
   it("returns to Pi's own default when the Bot default is cleared, but leaves a conversation's own choice alone", async () => {
@@ -562,7 +825,7 @@ describe("PiRpcAdapter turns", () => {
   it("times out a silent turn but not one waiting for the owner", async () => {
     const silent = await rig({ pi: { onPrompt: () => {} }, options: { inactivityTimeoutMs: 40 } });
     const first = (await silent.adapter.createSession(1)).sessionId;
-    await expect(silent.adapter.sendUserMessage(first, message("x"))).rejects.toThrow(/timed out after .* without activity/);
+    await expect(silent.adapter.sendUserMessage(first, message("x"))).rejects.toThrow(/became inactive after/);
 
     let answer!: (decision: EngineApprovalDecision) => void;
     const waiting = await rig({ options: { inactivityTimeoutMs: 40 }, pi: { onPrompt: run => { run.process.ui({ id: "d1", method: "confirm", title: "Proceed?", message: "" }); run.process.once("ui-response", () => { run.reply("after dialog"); run.finish(); }); } } });
@@ -645,9 +908,39 @@ describe("PiRpcAdapter turns", () => {
     } } });
     const { sessionId } = await r.adapter.createSession(1);
     const response = await r.adapter.sendUserMessage(sessionId, message("/mcp", { turnInstructions: "turn rule" }));
-    expect(response.text).toBe("2 servers connected");
+    expect(response.text).toBe("Pi extension notices are available in this turn's run details.");
     // A session command must keep its leading slash.
     expect(commands(r.spawner.last(), "prompt")[0]!.message).toBe("/mcp");
+  });
+
+  it("does not turn extension-only notices into final delivery directives", async () => {
+    const detail = "External notice [send-file:/synthetic/private.txt]";
+    const r = await rig({ pi: { commands: [{ name: "notice", source: "extension" }], onCommand: (command, process) => {
+      if (command.type !== "prompt" || command.message !== "/notice") return false;
+      process.ui({ id: "n", method: "notify", message: detail });
+      process.respond(command, { disposition: "handled" }); return true;
+    } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const input = message("/notice");
+    const response = await r.adapter.sendUserMessage(sessionId, input);
+    expect(response.text).toBe("Pi extension notices are available in this turn's run details.");
+    expect(response.text).not.toContain("send-file");
+    expect(input.events.some(event => event.type === "assistant_text" && event.text.includes("External notice"))).toBe(true);
+  });
+
+  it("keeps a confirmed model write followed by a failed read uncertain, including when clearing a default", async () => {
+    let failState = false;
+    const r = await rig({ config: { approvalMode: "bypass" }, pi: { onCommand: (command, process) => {
+      if (command.type === "get_state" && failState) { process.fail(command, "Model not found: fakeprov2/dup-model"); return true; }
+    } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("start"));
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov2/dup-model" });
+    failState = true;
+    const live = r.adapter.piNative.getLiveSession!(sessionId)!;
+    await expect(live.setModel(null, { isCurrent: async () => true })).rejects.toBeInstanceOf(PiNativeUncertainError);
+    expect(r.spawner.last().state.model).toMatchObject({ provider: "fakeprov2" });
+    await expect(live.setModel({ provider: "fakeprov", modelId: "dup-model" }, { isCurrent: async () => true })).rejects.toBeInstanceOf(PiNativeUncertainError);
   });
 
   it("withholds images from a text-only model and says why", async () => {
@@ -863,7 +1156,7 @@ describe("PiRpcAdapter lifecycle regressions", () => {
   });
 
   it("follows a session replacement an extension command made on its own", async () => {
-    const outside = "/synthetic/elsewhere/2026-01-01T00-00-02-000Z_ext-made.jsonl";
+    const outside = path.resolve("/synthetic/elsewhere/2026-01-01T00-00-02-000Z_ext-made.jsonl");
     const r = await rig({ pi: { commands: [{ name: "handoff", source: "extension" }], onCommand: (command, process) => {
       if (command.type !== "prompt" || command.message !== "/handoff") return false;
       process.state.sessionId = "ext-made"; process.state.sessionFile = outside;
@@ -952,10 +1245,10 @@ describe("PiRpcAdapter lifecycle regressions", () => {
   it("shows extension notices to the owner and keeps status, widgets and title as state", async () => {
     const r = await rig({ pi: { onPrompt: run => {
       run.process.ui({ id: "n", method: "notify", message: "indexing done", notifyType: "info" });
-      run.process.ui({ id: "s", method: "setStatus", statusKey: "git", statusText: "main ✓" });
-      run.process.ui({ id: "w", method: "setWidget", widgetKey: "todo", widgetLines: ["one", "two"], widgetPlacement: "belowEditor" });
-      run.process.ui({ id: "t", method: "setTitle", title: "pi - project" });
-      run.process.ui({ id: "e", method: "set_editor_text", text: "try this next" });
+      run.process.ui({ id: "s", method: "setStatus", statusKey: "git", statusText: "\x1b[38;5;5mmain ✓\x1b[0m\x07" });
+      run.process.ui({ id: "w", method: "setWidget", widgetKey: "todo", widgetLines: ["\x1b[31mone\x1b[0m", "two\u202e"], widgetPlacement: "belowEditor" });
+      run.process.ui({ id: "t", method: "setTitle", title: "pi - project\x00" });
+      run.process.ui({ id: "e", method: "set_editor_text", text: "\x1b[36mtry this next\x1b[0m" });
       run.reply("answer"); run.finish();
     } } });
     const { sessionId } = await r.adapter.createSession(1);

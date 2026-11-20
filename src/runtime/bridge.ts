@@ -886,9 +886,9 @@ export class Bridge {
         : await live.setThinkingLevel(thinking?.success ? thinking.data : null, { isCurrent });
       return await isCurrent() && result.sessionId === session.sessionId ? { outcome: "accepted" } : { outcome: "unknown", reason: "uncertain" };
     } catch (error) {
-      // A live-handle guard can fail after a native write. Clearing defaults
-      // may also involve more than one write, so neither is a safe rejection.
-      if (input.value !== null && error instanceof PiNativeRejectedError && ["model-unavailable", "thinking-unsupported"].includes(error.reason)) return { outcome: "rejected", reason: "invalid" };
+      // These typed value rejections occur before a write or after an explicit native refusal,
+      // including a single-field reset to the Bot default. Post-write reads/guards stay uncertain.
+      if (error instanceof PiNativeRejectedError && ["model-unavailable", "thinking-unsupported"].includes(error.reason)) return { outcome: "rejected", reason: "invalid" };
       return { outcome: "unknown", reason: "uncertain" };
     }
   }

@@ -8,9 +8,34 @@ import {
 } from "../src/runtime/error-classification.js";
 import { renderCoreUserFacingError, renderedEngineFailure } from "../src/core/errors.js";
 import { engineRetryReason } from "../src/codex/turn-retry.js";
+import { PiRpcCommandError, PiStartupError } from "../src/codex/pi-rpc-client.js";
 import { claudeError } from "../src/codex/claude-errors.js";
 import { renderCategorizedErrorMessage } from "../src/runtime/message-renderer.js";
 import { EngineCancellationUnconfirmedError, EngineContextCompactionPendingError, EngineIncompleteResponseError, EngineStopTooLateError } from "../src/codex/adapter.js";
+
+describe("Pi native error guidance", () => {
+  it("keeps missing models non-retryable and directs users to Pi provider setup", () => {
+    const error = new PiRpcCommandError("prompt", "No models available", "no-model");
+    expect(classifyFailure(error)).toBe("engine-settings");
+    expect(getBusErrorSemantics(classifyFailure(error)).retryable).toBe(false);
+    for (const locale of ["en", "zh"] as const) {
+      const text = renderCoreUserFacingError(error, "engine", locale);
+      expect(text).toContain("pi auth login");
+      expect(text).not.toMatch(/Restart the instance|重启实例/);
+    }
+  });
+  it("recognizes Pi authentication and busy kinds without guessing from native prose", () => {
+    const auth = new PiRpcCommandError("prompt", "No API key for synthetic-provider", "auth");
+    expect(classifyFailure(auth)).toBe("auth");
+    for (const locale of ["en", "zh"] as const) expect(renderCoreUserFacingError(auth, "engine", locale)).toContain("pi auth login");
+    for (const kind of ["busy", "compacting"] as const) expect(classifyFailure(new PiRpcCommandError("prompt", "Native operation is occupied", kind))).toBe("engine-busy");
+  });
+  it("gives missing Pi launchers the existing engine-path recovery guidance", () => {
+    const error = new PiStartupError("Pi executable was not found", "spawn");
+    expect(renderCoreUserFacingError(error, "engine", "en")).toContain("Engine programs");
+    expect(renderCoreUserFacingError(error, "engine", "zh")).toContain("引擎程序");
+  });
+});
 
 describe("classifyFailure auth detection", () => {
   it.each([["Authentication required", "sign-in", "登录"], ["Quota exceeded", "quota", "额度"]])("explains an incomplete turn's actionable cause without replaying or exposing diagnostics: %s", (reason, en, zh) => {

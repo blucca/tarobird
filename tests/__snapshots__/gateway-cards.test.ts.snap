@@ -2287,6 +2287,10 @@ exports[`Gateway card translation > translates actual config, board, status, res
               "label": "Antigravity",
               "value": "antigravity",
             },
+            {
+              "label": "Pi",
+              "value": "pi",
+            },
           ],
           "type": "select",
         },

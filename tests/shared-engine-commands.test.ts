@@ -447,6 +447,22 @@ describe("handleLocalEngineTelegramCommand", () => {
     }
   });
 
+  it("uses Pi's configured workspace before a fallback resume workspace for /context", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "pi-context-"));
+    const api = { sendMessage: vi.fn().mockResolvedValue({ message_id: 1 }) };
+    const bridge = { handleAuthorizedMessage: vi.fn(), getContextUsage: vi.fn().mockResolvedValue(null) };
+    try {
+      await handleLocalEngineCoreCommand({
+        stateDir: root, startedAt: Date.now(), locale: "en",
+        cfg: { engine: "pi", workspacePath: "/synthetic/current", resume: { workspacePath: "/synthetic/previous" } },
+        normalized: createNormalizedMessage("/context"), context: { api: api as never }, bridge,
+        sessionStore: { removeByChatId: vi.fn(), clearAll: vi.fn() }, updateInstanceConfig: vi.fn(),
+      });
+      expect(bridge.getContextUsage).toHaveBeenCalledWith(expect.objectContaining({ workspaceOverride: "/synthetic/current" }));
+      expect(bridge.handleAuthorizedMessage).not.toHaveBeenCalled();
+    } finally { await removeTempRoot(root); }
+  });
+
   it("renders DeepSeek Harness context pressure without sending a model prompt", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "telegram-engine-commands-"));
     const api = { sendMessage: vi.fn().mockResolvedValue({ message_id: 11 }) };

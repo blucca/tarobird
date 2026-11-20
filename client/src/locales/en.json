@@ -5336,5 +5336,7 @@
   "上次修改仍可能生效。若核对后仍无结果，请在任务结束后重启 Bot，再重新读取；不会自动重复修改。": "The previous change may still apply. If checking remains inconclusive, restart the Bot after its task finishes, then reload. The change will not be repeated automatically.",
   "核对修改结果": "Check change result",
   "搜索模型": "Search models",
-  "Bot 未设置默认思考强度；清除对话覆盖后，当前档位保持不变。": "No Bot default is set. Clearing this conversation override keeps the current thinking level."
+  "Bot 未设置默认思考强度；清除对话覆盖后，当前档位保持不变。": "No Bot default is set. Clearing this conversation override keeps the current thinking level.",
+  "Bot 默认思考强度不适用于当前对话模型。请选择可用档位，或调整 Bot 默认设置后重试。": "The Bot default thinking level is not supported by the current model. Choose an available level, or update the Bot default and retry.",
+  "Bot 默认模型或 Pi 默认模型当前不可用。请选择可用模型，或检查提供商登录与 Bot 默认设置后重试。": "The Bot or Pi default model is unavailable right now. Choose an available model, or check provider sign-in and Bot defaults and retry."
 }

@@ -33,6 +33,11 @@ export function PiSessionControls({ connection, conversationId, bot, owner, onli
   const [model, setModel] = useState(""), [thinking, setThinking] = useState("");
   const [search, setSearch] = useState("");
   const trigger = useRef<HTMLButtonElement>(null), alive = useRef(true), writeFlight = useRef(false);
+  const observed = useRef<{ token?: string; model?: string; thinking?: string }>({});
+  const draftRev = useRef({ model: 0, thinking: 0 }), syncedRev = useRef({ model: 0, thinking: 0 });
+  const acceptedSync = useRef<{ model?: number; thinking?: number }>({});
+  const editModel = (next: string) => { draftRev.current.model++; setModel(next); };
+  const editThinking = (next: string) => { draftRev.current.thinking++; setThinking(next); };
   const scope = `${conversationId}:${bot.id}`, route = `/api/conversations/${conversationId}/pi-session`;
   const uncertain = pendingFor(connection).has(scope);
   const session = snapshot?.session;
@@ -57,6 +62,19 @@ export function PiSessionControls({ connection, conversationId, bot, owner, onli
           if (waiting && value.session && waiting.expectedSession !== value.session.token && pendingFor(connection).get(scope) === waiting) {
             pendingFor(connection).delete(scope); setError(""); setNotice("");
           }
+          // Do not erase an unsaved selection on every metadata poll. Rebase a
+          // field on a new worker generation, an observed change while clean, or
+          // after its own accepted save when no newer local edit occurred.
+          const prev = observed.current, next = value.session, tokenChanged = next?.token !== prev.token;
+          const acceptModel = acceptedSync.current.model, acceptThinking = acceptedSync.current.thinking;
+          acceptedSync.current.model = undefined; acceptedSync.current.thinking = undefined;
+          if (tokenChanged || (acceptModel !== undefined && draftRev.current.model === acceptModel) || (next?.model !== prev.model && draftRev.current.model === syncedRev.current.model)) {
+            setModel(next?.model ?? ""); syncedRev.current.model = draftRev.current.model;
+          }
+          if (tokenChanged || (acceptThinking !== undefined && draftRev.current.thinking === acceptThinking) || (next?.thinking !== prev.thinking && draftRev.current.thinking === syncedRev.current.thinking)) {
+            setThinking(next?.thinking ?? ""); syncedRev.current.thinking = draftRev.current.thinking;
+          }
+          observed.current = { token: next?.token, model: next?.model, thinking: next?.thinking };
           setSnapshot(value); setStale(false);
         }
       } catch { if (!controller.signal.aborted) setStale(true); }
@@ -70,13 +88,11 @@ export function PiSessionControls({ connection, conversationId, bot, owner, onli
     };
     void read(); return () => { controller.abort(); clearTimeout(timer); };
   }, [connection, route, bot.id, owner, active, online, open, activity, refresh, saving]);
-  // Do not erase an unsaved selection on every metadata poll. Rebase only on
-  // an observed native selection or a different exact worker generation.
-  useEffect(() => { setModel(session?.model ?? ""); setThinking(session?.thinking ?? ""); }, [session?.token, session?.model, session?.thinking]);
 
   async function submit(command: PiSessionChange) {
     if (writeFlight.current || !owner || !online || !active) return;
     const checkingExisting = pendingFor(connection).get(scope)?.requestId === command.requestId;
+    const editRev = draftRev.current[command.action];
     writeFlight.current = true; pendingFor(connection).set(scope, command);
     setSaving(true); setError(""); setNotice("");
     const request = queueRequest([], 15_000);
@@ -89,8 +105,15 @@ export function PiSessionControls({ connection, conversationId, bot, owner, onli
       const settled = result.outcome === "accepted" || !checkingExisting && result.outcome === "rejected";
       if (settled && pendingFor(connection).get(scope)?.requestId === command.requestId) pendingFor(connection).delete(scope);
       if (alive.current) {
-        if (result.outcome === "accepted") setNotice(t("已应用到当前 Pi 对话。"));
-        else setError(!settled ? t("结果尚未确认，请核对后再修改。") : result.reason === "invalid" ? t("当前模型不支持这个选择，请重新读取。") : t("Pi 会话已变化或暂不可用，请重新读取。"));
+        if (result.outcome === "accepted") { acceptedSync.current[command.action] = editRev; setNotice(t("已应用到当前 Pi 对话。")); }
+        else setError(!settled ? t("结果尚未确认，请核对后再修改。")
+          : result.reason === "invalid"
+            ? (command.value === null
+              ? (command.action === "thinking"
+                ? t("Bot 默认思考强度不适用于当前对话模型。请选择可用档位，或调整 Bot 默认设置后重试。")
+                : t("Bot 默认模型或 Pi 默认模型当前不可用。请选择可用模型，或检查提供商登录与 Bot 默认设置后重试。"))
+              : t("当前模型不支持这个选择，请重新读取。"))
+            : t("Pi 会话已变化或暂不可用，请重新读取。"));
       }
     } catch { if (alive.current) setError(t("结果尚未确认，请核对后再修改。")); }
     finally {
@@ -103,7 +126,8 @@ export function PiSessionControls({ connection, conversationId, bot, owner, onli
     void submit({ botId: bot.id, requestId: randomNonce(), expectedSession: session.token, action, value });
   }
   const choices = modelOptions("pi", session?.choices ?? []);
-  const filtered = search.trim() ? choices.filter(option => `${option.label} ${option.id}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()) || option.id === model) : choices;
+  const query = search.trim().toLocaleLowerCase();
+  const filtered = query ? choices.filter(option => `${option.label} ${option.id} ${option.provider ?? ""}`.toLocaleLowerCase().includes(query)) : choices;
   const blocked = !online || stale || reading || saving || uncertain;
   const displayModel = choices.find(option => option.id === session?.model)?.label || session?.model || t("当前对话");
   return <div className="composer-model-controls pi-session-controls">
@@ -114,9 +138,9 @@ export function PiSessionControls({ connection, conversationId, bot, owner, onli
         {!session && <p role="status">{stale ? t("暂未读取到 Pi 会话，请重新读取。") : reading ? t("正在读取…") : snapshot?.supported === false ? t("请更新主机以使用此设置。") : t("当前没有正在运行的 Pi 会话。发送一条消息后即可在这里调整。")}</p>}
         {session && <>
           <label>{t("搜索模型")}<input type="search" value={search} onChange={event => setSearch(event.target.value)} disabled={saving} autoCapitalize="none" autoCorrect="off"/></label>
-          <PiModelSelect models={filtered} value={model} change={setModel} disabled={blocked} defaultLabel={t("跟随 Bot 默认")}/>
+          <PiModelSelect models={filtered} value={model} change={editModel} disabled={blocked} defaultLabel={t("跟随 Bot 默认")} searching={!!query}/>
           <button className="primary" type="button" disabled={blocked || !!model && !choices.some(option => option.id === model) || model === session.model} onClick={() => change("model", model || null)}>{t("应用模型")}</button>
-          <label>{t("思考强度")}<select aria-label={t("Pi 对话思考强度")} disabled={blocked} value={thinking} onChange={event => setThinking(event.target.value)}><option value="">{t("跟随 Bot 默认")}</option>{session.thinkingLevels.map(level => <option key={level} value={level}>{level}</option>)}</select></label>
+          <label>{t("思考强度")}<select aria-label={t("Pi 对话思考强度")} disabled={blocked} value={thinking} onChange={event => editThinking(event.target.value)}><option value="">{t("跟随 Bot 默认")}</option>{session.thinkingLevels.map(level => <option key={level} value={level}>{level}</option>)}</select></label>
           {!thinking && !bot.effort && <p className="muted">{t("Bot 未设置默认思考强度；清除对话覆盖后，当前档位保持不变。")}</p>}
           <button className="primary" type="button" disabled={blocked || thinking === session.thinking || !!thinking && !session.thinkingLevels.includes(thinking as typeof session.thinking)} onClick={() => change("thinking", thinking || null)}>{t("应用思考强度")}</button>
           {session.bridge === "unavailable" && <p className="settings-warning" role="status">{t("Pi 扩展连接暂不可用，App 工具需要恢复连接后使用。")}</p>}

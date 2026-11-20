@@ -127,7 +127,7 @@ export async function renderCoreConfigCard(input: CoreConfigCardContext): Promis
       button(optionLabel(labels.fastOff, !fastOn, labels), "fast", "off", input, !fastOn ? "primary" : "default"),
     ]),
     section(labels.approvalSection, [
-      button(optionLabel(labels.yoloOn, resolvedApprovalMode === "full-auto", labels), "yolo", "on", input, resolvedApprovalMode === "full-auto" ? "primary" : "default"),
+      ...(cfg.engine === "pi" ? [] : [button(optionLabel(labels.yoloOn, resolvedApprovalMode === "full-auto", labels), "yolo", "on", input, resolvedApprovalMode === "full-auto" ? "primary" : "default")]),
       button(optionLabel(labels.yoloOff, resolvedApprovalMode === "normal", labels), "yolo", "off", input, resolvedApprovalMode === "normal" ? "primary" : "default"),
       button(optionLabel(labels.yoloUnsafe, resolvedApprovalMode === "bypass", labels), "yolo", "unsafe", input, resolvedApprovalMode === "bypass" ? "danger" : "default"),
     ]),
@@ -331,6 +331,9 @@ async function applyFastAction(stateDir: string, value: string | undefined, loca
 
 async function applyYoloAction(stateDir: string, value: string | undefined, locale: Locale): Promise<string> {
   if (value === "on") {
+    if ((await loadInstanceConfig(stateDir)).engine === "pi") return locale === "en"
+      ? "Pi does not provide sandboxed full-auto. Permissions were not changed; select normal approval or unsafe bypass."
+      : "Pi 不提供带沙箱的 full-auto，权限未更改；请选择普通审批或 unsafe bypass。";
     await updateInstanceApprovalMode(stateDir, "full-auto");
     return locale === "en" ? "YOLO/full-auto enabled." : "YOLO/full-auto 已开启。";
   }
@@ -494,13 +497,14 @@ function configFormSection(
       ["kimi", "Kimi"],
       ["deepseek", "DeepSeek Harness"],
       ["antigravity", "Antigravity"],
+      ...(cfg.role === "dispatcher" ? [] : [["pi", "Pi"] as [string, string]]),
     ]),
     selectStatic("fast", cfg.codexServiceTier === "fast" ? "on" : "off", [
       ["on", isEn ? "Fast on" : "Fast 开"],
       ["off", isEn ? "Fast off" : "Fast 关"],
     ]),
     selectStatic("yolo", yoloValue, [
-      ["on", isEn ? "YOLO on" : "YOLO 开"],
+      ...(cfg.engine === "pi" ? [] : [["on", isEn ? "YOLO on" : "YOLO 开"] as [string, string]]),
       ["off", isEn ? "YOLO off" : "YOLO 关"],
       ["unsafe", isEn ? "Unsafe bypass" : "Unsafe bypass"],
     ]),
