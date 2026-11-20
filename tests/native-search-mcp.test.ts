@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CodexAppServerAdapter } from "../src/codex/app-server-adapter.js";
 import { ClaudeStreamAdapter } from "../src/codex/claude-stream-adapter.js";
@@ -38,6 +38,12 @@ async function tempHome(): Promise<{ home: string; workspace: string; env: NodeJ
   await mkdir(workspace, { recursive: true });
   return { home, workspace, env: { HOME: home, CODEX_HOME: path.join(home, ".codex") } };
 }
+
+// FakeChild PIDs are synthetic: every adapter cleanup must stay inside the
+// fixture. Otherwise a fake PID can coincide with a real process in CI.
+beforeEach(() => {
+  vi.spyOn(processTree, "killProcessTree").mockResolvedValue(undefined);
+});
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -326,7 +332,6 @@ describe("Codex exec managed search", () => {
 
 describe("Claude managed search", () => {
   it("merges the server into the existing --mcp-config without credential values", async () => {
-    vi.spyOn(processTree, "killProcessTree").mockImplementation(() => Promise.resolve());
     const { workspace, env } = await tempHome();
     const children: FakeChild[] = [];
     const configs: string[] = [];

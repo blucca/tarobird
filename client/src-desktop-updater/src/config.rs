@@ -200,7 +200,16 @@ mod tests {
     use serde_json::json;
 
     fn args(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsString::from).collect()
+        values.iter().map(|value| {
+            // The synthetic fixtures use Unix-style absolute paths. Give them
+            // a drive on Windows so negative cases reach the intended guard,
+            // instead of all failing the earlier absolute-path check.
+            if cfg!(windows) && value.starts_with('/') {
+                OsString::from(format!("C:{value}"))
+            } else {
+                OsString::from(value)
+            }
+        }).collect()
     }
     const VALID: &[&str] = &[
         "--config", "/b/TaroBot.app/Contents/Resources/update-config.json",
@@ -247,6 +256,12 @@ mod tests {
 
     #[test]
     fn rejects_relative_traversing_unstable_or_resolved_inputs() {
+        #[cfg(windows)]
+        {
+            let mut rooted_without_drive = args(VALID);
+            rooted_without_drive[1] = OsString::from("/b/update-config.json");
+            assert_eq!(Args::parse(rooted_without_drive), Err("invalid_arguments"));
+        }
         for (index, value) in [
             (1, "relative.json"),
             (5, "/b/../etc"),

@@ -52,6 +52,8 @@ function connection(key:string) {
 const a=connection("host-a"),b=connection("host-b");
 (window as any).tarobotDesktop={version:1,engine:"electron",platform:params.get("platform")??"darwin",on:()=>()=>{},openSocket:async()=>{},invoke:async(command:string,args:any)=>{
  state.native.push({command,args});
+ // Closing the embedded viewer reads native fullscreen state even outside fullscreen.
+ if(command==="desktop_window_read")return{fullscreen:!!document.fullscreenElement,fullscreenTransitioning:false};
  if(command==="desktop_host")return{running:true,publicKey:"host-a"};
  if(command==="screen_service_status")return structuredClone(state.local);
  if(command==="screen_service_permission"){
