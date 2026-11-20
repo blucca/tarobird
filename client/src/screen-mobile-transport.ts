@@ -17,6 +17,10 @@ const NATIVE_SESSION_ENDED: ReadonlyMap<string, string> = new Map([
   ["native_request_cancelled", "screen_disconnected"], ["native_document_retired", "screen_disconnected"], ["screen_inactive", "screen_inactive"],
 ]);
 export const SCREEN_NATIVE_CLOSE_GRACE_MS = 1000;
+/** Native refuses a renew or input that reaches it after it has seen control end:
+ * the state that ended control is already queued for this page. Nothing was sent
+ * and the viewing session goes on. */
+const CONTROL_ENDED = "screen_control_ended";
 const CONTROL_BYTES = 16 * 1024, JSON_BYTES = 64 * 1024;
 /** Native's packet bound: the target's three encoder credits per stream generation;
  * packets of a superseded generation still being read count only in the total. */
@@ -76,7 +80,10 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
           if (++commands > 8 || (commandBytes += bytes) > CONTROL_BYTES) throw new Error("screen_congested");
           outgoing = outgoing.then(async () => {
             if ((command.type === "input" || command.type === "renew") && (!focused || admittedFocus !== focusGeneration)) return;
-            if (live()) await bridge.invoke("net_screen_send", { id: allocation!.id, command });
+            if (live()) await bridge.invoke("net_screen_send", { id: allocation!.id, command }).catch(error => {
+              if ((command.type === "input" || command.type === "renew") && error instanceof Error && error.message === CONTROL_ENDED) return;
+              throw error;
+            });
           }).catch(fail).finally(() => { commands--; commandBytes -= bytes; });
         } catch (error) { fail(error); }
       },

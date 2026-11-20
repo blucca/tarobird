@@ -12,12 +12,13 @@ function fixture() {
   const life = new AbortController(), calls: { name: string; args: Record<string, unknown> }[] = [], values: unknown[] = [];
   let deliver: (value: unknown) => void = () => {}, port: ScreenViewerPort;
   const allocation: ScreenAllocation = { id: "native-group", document: "native-document", signal: life.signal };
-  const options: { allocate?: Promise<ScreenAllocation>; read?: Promise<void>; send?: Promise<void>; opening?: Promise<void>; reject: Record<string, string>; bytes: Uint8Array } = { bytes: frame(), reject: {} };
+  const options: { allocate?: Promise<ScreenAllocation>; read?: Promise<void>; send?: Promise<void>; opening?: Promise<void>; reject: Record<string, string>; refuse: Record<string, string>; bytes: Uint8Array } = { bytes: frame(), reject: {}, refuse: {} };
   const bridge: ScreenNativeBridge = { allocate: async () => options.allocate ?? allocation, invoke: async <T>(name: string, args: Record<string, unknown>) => {
     calls.push({ name, args });
     if (name === "net_screen_open") { deliver = (args.events as { onmessage(value: unknown): void }).onmessage; await options.opening; }
     // A native rejection, as the plugin returns it: an Error whose message is the code.
     if (options.reject[name]) throw new Error(options.reject[name]);
+    if (name === "net_screen_send" && options.refuse[(args.command as { type: string }).type]) throw new Error(options.refuse[(args.command as { type: string }).type]);
     if (name === "net_screen_send") await options.send;
     if (name === "net_screen_read") { await options.read; return options.bytes.slice(args.offset as number, (args.offset as number) + (args.maxBytes as number)).buffer as T; }
     return {} as T;
@@ -191,4 +192,31 @@ test("packets of superseded generations still count against a bounded total", as
   for (let i = 0; i < 3; i++) s.binary(); s.stream(2); for (let i = 0; i < 3; i++) s.binary(); await tick();
   expect(closes(f.values)).toEqual([]);
   s.stream(3); s.binary(); expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_congested" }]);
+});
+
+// F-AND-3. The Hub withdrew control while this page, not yet through the state that says so,
+// sent a renew or input. Native refuses it as control having ended; the viewing session stays.
+const lateRenew = { type: "renew", ...stamp, leaseId: "l".repeat(43), frameSequence: 1, challenge: "c".repeat(43) };
+const lateInput = { type: "input", ...stamp, desktopId: "desktop", displayId: "display", displayRevision: 1, leaseId: "l".repeat(43), sequence: 1, frameSequence: 1, expiresAt: Date.now() + 60_000, event: { kind: "move", x: .5, y: .5 } };
+for (const late of [lateRenew, lateInput]) test(`a ${late.type} refused because control already ended leaves the viewing session open`, async () => {
+  const f = fixture(); f.options.refuse[late.type] = "screen_control_ended"; await f.open();
+  f.post({ type: "input-focus", ...stamp, enabled: true }); f.post(late);
+  await expect.poll(() => f.calls.filter(value => value.name === "net_screen_send" && (value.args.command as { type: string }).type === late.type).length).toBe(1); await tick();
+  expect(closes(f.values)).toEqual([]); expect(f.calls.filter(value => value.name === "net_screen_close")).toHaveLength(0);
+  // The session goes on: the state that ended control arrives, frames and commands still flow.
+  attached(f); await expect.poll(() => f.values).toEqual([{ type: "attached", sessionId: "session" }]);
+  f.post({ type: "keyframe", ...stamp }); await expect.poll(() => f.calls.some(value => value.name === "net_screen_send" && (value.args.command as { type: string }).type === "keyframe")).toBe(true);
+  f.channel.close(); expect(f.calls.filter(value => value.name === "net_screen_close")).toHaveLength(1);
+});
+
+test("a renew native rejects as a protocol violation still ends the session", async () => {
+  const f = fixture(); f.options.refuse.renew = "screen_protocol_invalid"; await f.open();
+  f.post({ type: "input-focus", ...stamp, enabled: true }); f.post(lateRenew);
+  await expect.poll(() => closes(f.values)).toEqual([{ type: "closed", reason: "screen_protocol_invalid" }]);
+});
+
+test("control having ended is only accepted for a renew or input", async () => {
+  const f = fixture(); f.options.refuse.keyframe = "screen_control_ended"; await f.open();
+  f.post({ type: "keyframe", ...stamp });
+  await expect.poll(() => closes(f.values)).toEqual([{ type: "closed", reason: "screen_control_ended" }]);
 });

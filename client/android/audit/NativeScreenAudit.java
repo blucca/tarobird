@@ -114,6 +114,31 @@ public final class NativeScreenAudit {
         frame(join,1,false);JSONObject binary=event(id,"binary");long n=binary.getLong("deliverySequence");int total=0;while(total<binary.getInt("byteLength"))total+=transport.screenRead(id,n,total,262144).length;transport.screenAck(id,n);check(true,"framesFlowAfterPingDuringSend");
         check(transport.screenClose(id),"pingDuringSendClosesNormally");event(id,"close");closedOnPeer(sid);
     }
+    static String refusal(Work work) { try { work.run(); return null; } catch(Exception error) { return error.getMessage(); } }
+    /** F-AND-3. The Hub withdraws control (lease expiry, Host stop, permission change) while the
+     * page, which has not processed that state yet, still sends a renew or an input. Native has
+     * applied the state: those are refused and never forwarded, as control having ended, not as a
+     * protocol error that ends the session. A malformed one still is a protocol error. */
+    static void controlWithdrawn() throws Exception {
+        JSONObject join=join(true);String id=open(join),sid=join.getJSONObject("session").getString("id");
+        request(new JSONObject().put("action","control-state").put("id",sid).put("active",true));JSONObject lease=event(id,"screen");transport.screenAck(id,lease.getLong("deliverySequence"));
+        JSONObject renew=command(join,"renew").put("leaseId",String.join("",Collections.nCopies(43,"L"))).put("challenge",String.join("",Collections.nCopies(43,"C"))).put("frameSequence",1);
+        JSONObject input=command(join,"input").put("desktopId","synthetic-desktop").put("displayId","synthetic").put("displayRevision",1).put("leaseId",String.join("",Collections.nCopies(43,"L"))).put("sequence",1).put("frameSequence",1).put("expiresAt",System.currentTimeMillis()+1000).put("event",new JSONObject().put("kind","move").put("x",0.5).put("y",0.5));
+        transport.screenSend(id,command(join,"input-focus").put("enabled",true));transport.screenSend(id,renew);
+        // Withdrawn: native applies the state on arrival; the page has not consumed it yet.
+        request(new JSONObject().put("action","control-state").put("id",sid).put("active",false));JSONObject viewing=event(id,"screen");
+        check("screen_control_ended".equals(refusal(()->transport.screenSend(id,renew))),"lateRenewRefusedAsControlEnded");
+        check("screen_control_ended".equals(refusal(()->transport.screenSend(id,input))),"lateInputRefusedAsControlEnded");
+        JSONObject malformed=new JSONObject(renew.toString()).put("challenge","short");
+        check("screen_protocol_invalid".equals(refusal(()->transport.screenSend(id,malformed))),"malformedRenewStillProtocolInvalid");
+        check("screen_protocol_invalid".equals(refusal(()->transport.screenSend(id,new JSONObject(input.toString()).put("desktopId","other")))),"foreignInputStillProtocolInvalid");
+        transport.screenAck(id,viewing.getLong("deliverySequence"));check(transport.screenCurrent(id),"viewingSurvivesWithdrawnControl");
+        JSONArray commands=request(new JSONObject().put("action","stats")).getJSONArray("commands");int renews=0,inputs=0;
+        for(int i=0;i<commands.length();i++){JSONObject c=commands.getJSONObject(i);if(!sid.equals(c.getString("id")))continue;String type=c.getJSONObject("value").getString("type");if(type.equals("renew"))renews++;if(type.equals("input"))inputs++;}
+        check(renews==1&&inputs==0,"withdrawnControlForwardsNothing");
+        frame(join,1,false);consume(id,event(id,"binary"));check(transport.screenCurrent(id),"framesFlowAfterWithdrawnControl");
+        transport.screenClose(id);event(id,"close");closedOnPeer(sid);
+    }
     public static void main(String[] args) throws Exception {
         Process fixture=null; AtomicBoolean active=new AtomicBoolean(true);
         try{
@@ -176,6 +201,7 @@ public final class NativeScreenAudit {
             transport.screenSend(controlId,command(controlling,"input-focus").put("enabled",false));reject(()->transport.screenSend(controlId,renew),"blurRejectsQueuedRenew");transport.screenClose(controlId);event(controlId,"close");closedOnPeer(controlling.getJSONObject("session").getString("id"));
             pingDuringSend();
             streamRestart();
+            controlWithdrawn();
             JSONObject bound=join(false);String bounded=open(bound);for(int i=1;i<=4;i++)frame(bound,i,false);event(bounded,"close");closedOnPeer(bound.getJSONObject("session").getString("id"));check(true,"fourthPacketClosesBoth");
             JSONObject expiry=join(false);String expired=open(expiry);frame(expiry,1,false);event(expired,"binary");event(expired,"close");closedOnPeer(expiry.getJSONObject("session").getString("id"));check(true,"unackedPacketExpiresAndClosesBoth");
             JSONObject json=join(false);String jsonId=open(json);request(new JSONObject().put("action","json-burst").put("id",json.getJSONObject("session").getString("id")).put("count",9));event(jsonId,"close");closedOnPeer(json.getJSONObject("session").getString("id"));check(true,"jsonQueueBounded");

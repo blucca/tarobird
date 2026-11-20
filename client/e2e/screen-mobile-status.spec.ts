@@ -17,6 +17,8 @@ const GENERIC="屏幕连接已结束，请检查主机状态后重试。";
 const CONGESTED="连接拥塞，屏幕已断开。请检查线路后重新连接。";
 const REVOKED="远程屏幕已关闭，或此设备的授权已撤销。请检查目标电脑的授权后重新连接。";
 const CLOSED="屏幕连接已关闭。请重新连接，再单独开始控制。";
+const LEASE_EXPIRED="控制授权已过期，请重新点击开始控制。";
+const PROTOCOL="屏幕服务协议不兼容，请检查 App 与主机版本后重试。";
 const ready=(page:Page)=>page.waitForFunction(()=>!!(window as any).screenMobileFixture);
 const refresh=(page:Page)=>page.evaluate(()=>window.dispatchEvent(new Event("focus")));
 
@@ -110,4 +112,17 @@ test("a page call rejected as an Android session ends never hides why it ended",
   // An ordinary reconnect follows, and the next session's state replaces the old reason.
   await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
   await expect(status(page)).not.toHaveText(CLOSED);
+});
+
+// F-AND-3: control withdrawn by the Hub while a renew is on its way ends control, not the session.
+test("a renew refused because the Hub already withdrew control returns to viewing",async({page})=>{
+  await page.goto(url("android"));await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
+  await page.getByRole("button",{name:"开始控制",exact:true}).click();await expect(page.getByRole("button",{name:"停止控制",exact:true})).toBeVisible();
+  const opens=(await log(page)).opens;await page.evaluate(()=>{(window as any).screenMobileFixture.withdrawOnRenew=true;});
+  await expect.poll(async()=>(await log(page)).withdrawOnRenew,{timeout:5000}).toBe(false);
+  await expect(status(page)).toHaveText(LEASE_EXPIRED);await expect(page.getByText(PROTOCOL)).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeVisible();await expect(page.getByRole("button",{name:"停止控制",exact:true})).toHaveCount(0);
+  // Still the same viewing session: nothing closed it and no reconnect was needed.
+  expect((await log(page)).calls.filter((call:any)=>call.method==="screenClose")).toHaveLength(0);expect((await log(page)).opens).toBe(opens);
+  await expect(page.getByRole("button",{name:"断开",exact:true})).toBeVisible();await expect(page.getByRole("button",{name:"连接屏幕",exact:true})).toHaveCount(0);
 });

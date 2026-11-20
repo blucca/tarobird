@@ -70,6 +70,10 @@ final class HubScreenSession {
         h264Only=quality.equals("sharp");
     }
     private static IOException invalid() { return new IOException("screen_protocol_invalid"); }
+    /** A well-formed renew or input after native has seen control end (the Hub withdrew the
+     * lease, or focus was lost): refused and never forwarded. The page may simply not have
+     * processed that state yet, so this ends control, not the session. */
+    private static IOException controlEnded() { return new IOException("screen_control_ended"); }
     static String text(JSONObject object,String key) throws IOException { Object value=object.opt(key); if(!(value instanceof String)) throw invalid(); return (String)value; }
     static JSONObject object(JSONObject object,String key) throws IOException { Object value=object.opt(key); if(!(value instanceof JSONObject)) throw invalid(); return (JSONObject)value; }
     private static String identifier(JSONObject object,String key) throws IOException { String value=text(object,key); if(!value.matches("[A-Za-z0-9_-]{1,128}")) throw invalid(); return value; }
@@ -216,8 +220,8 @@ final class HubScreenSession {
         if(type.equals("input-focus")) { keys(command,"type sessionId generation enabled",""); inputFocused=bool(command,"enabled")&&visible&&canControl; return; }
         if(type.equals("visibility")) { keys(command,"type sessionId generation visible",""); visible=bool(command,"visible"); if(!visible) { close("screen_inactive"); return; } }
         else if(type.equals("control")) { keys(command,"type sessionId generation frameSequence",""); integer(command,"frameSequence",1,0xffffffffL); if(!controlAllowed||!visible) throw invalid(); }
-        else if(type.equals("renew")) { keys(command,"type sessionId generation leaseId frameSequence challenge",""); token(command,"leaseId"); token(command,"challenge"); integer(command,"frameSequence",1,0xffffffffL); if(!canControl||!inputFocused||!visible) throw invalid(); }
-        else if(type.equals("input")) { validateInput(command); if(!canControl||!inputFocused||!visible) throw invalid(); }
+        else if(type.equals("renew")) { keys(command,"type sessionId generation leaseId frameSequence challenge",""); token(command,"leaseId"); token(command,"challenge"); integer(command,"frameSequence",1,0xffffffffL); if(!canControl||!inputFocused||!visible) throw controlEnded(); }
+        else if(type.equals("input")) { validateInput(command); if(!canControl||!inputFocused||!visible) throw controlEnded(); }
         else if(type.equals("ack")) { keys(command,"type sessionId generation frameSequence",""); integer(command,"frameSequence",1,0xffffffffL); }
         else if(Arrays.asList("release","disconnect","keyframe").contains(type)) { keys(command,"type sessionId generation",""); if(!type.equals("keyframe")) { inputFocused=false; canControl=false; } }
         else throw invalid();

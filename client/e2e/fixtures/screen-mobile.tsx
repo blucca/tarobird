@@ -3,7 +3,7 @@
 import type { HubConnection } from "../../src/connection.js";
 const platform = new URL(location.href).searchParams.get("platform") === "ios" ? "ios" : "android";
 const blocked = new URL(location.href).searchParams.get("blocked");
-const fixture = { calls: [] as { plugin: string; method: string; args: any }[], commands: [] as any[], opens: 0, stops: 0, documents: 0, active: true, locked: false, delayOpen: false, resumeOpen: undefined as (()=>void)|undefined, statusFailure: "" as ""|"abort"|"offline", renewals: false, viewOnly: false, endBehind: undefined as undefined|{ method: string; code: string; reason: string } };
+const fixture = { calls: [] as { plugin: string; method: string; args: any }[], commands: [] as any[], opens: 0, stops: 0, documents: 0, active: true, locked: false, delayOpen: false, resumeOpen: undefined as (()=>void)|undefined, statusFailure: "" as ""|"abort"|"offline", renewals: false, viewOnly: false, endBehind: undefined as undefined|{ method: string; code: string; reason: string }, withdrawOnRenew: false };
 let challenge = 0;
 let socketListener = (_value: any) => {}, appListener = (_value: any) => {};
 const groups = new Map<string, { join: any; delivery: number; frame: number; generation: number; timer: number; packets: Map<number, Uint8Array>; pending: boolean }>();
@@ -37,6 +37,10 @@ Object.assign(window, { ...(platform === "ios" ? { webkit: { messageHandlers: { 
       if(value.type==="ack"){event(args.id,{type:"frame-ready",sessionId:group.join.session.id,generation:group.join.session.generation,streamGeneration:group.generation,frameSequence:value.frameSequence,expiresAt:Date.now()+2000});if(group.pending){group.pending=false;status(args.id,true);}}
       if(value.type==="control"){group.pending=true;group.generation++;stream(args.id);}
       if(value.type==="release")status(args.id);
+      // The Hub withdrew control (here: the lease expired) just before this renew reached
+      // native: native has applied that state and refuses the renew; the page sees the refusal first.
+      if(value.type==="renew"&&fixture.withdrawOnRenew){fixture.withdrawOnRenew=false;fixture.commands.pop();
+        setTimeout(()=>event(args.id,{type:"state",session:{...group.join.session,state:"viewing",reason:"screen_lease_expired"},streamGeneration:group.generation,serverTime:Date.now()}),0);throw Error("screen_control_ended");}
       // Opt-in Host behaviour: each accepted renew issues the next challenge.
       if(value.type==="renew"&&fixture.renewals)status(args.id,true);
       return {};
