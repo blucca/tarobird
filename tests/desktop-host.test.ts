@@ -21,7 +21,9 @@ afterEach(async () => { for (const dir of directories.splice(0)) { await desktop
 describe("desktop first installation", () => {
   it("does not create a host merely by opening a client", async () => {
     const dir = path.join(await directory(), "untouched");
-    expect(await desktopHost("resume", dir, entry)).toMatchObject({ available: true, running: false });
+    // scripts/verify-desktop-host.mjs (the packaged-host smoke on Windows and
+    // macOS) and the App's local controller rely on these first-launch fields.
+    expect(await desktopHost("resume", dir, entry)).toEqual({ available: true, running: false, directoryState: "missing", hostEnabled: false, hostName: os.hostname() });
     await expect(stat(dir)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await desktopHost("status", dir, entry)).toMatchObject({ running: false, hostName: os.hostname() });
     await expect(stat(dir)).rejects.toMatchObject({ code: "ENOENT" });
