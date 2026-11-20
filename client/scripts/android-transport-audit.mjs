@@ -34,9 +34,15 @@ try {
   }
   const classes=path.join(scratch,"classes");await mkdir(classes);
   const classpath=jars.join(path.delimiter),source=path.join(repo,"client/android/app/src/main/java/com/tarobot/client");
-  await run(java("javac"),["--release","8","-cp",classpath,"-d",classes,path.join(source,"HubTls.java"),path.join(source,"HubTransport.java"),path.join(source,"HubSocket.java"),path.join(source,"HubScreenSession.java"),path.join(repo,"client/android/audit/NativeTlsAudit.java"),path.join(repo,"client/android/audit/NativeScreenAudit.java")],"compile.log",60_000);
+  await run(java("javac"),["--release","8","-cp",classpath,"-d",classes,path.join(source,"HubTls.java"),path.join(source,"HubTransport.java"),path.join(source,"HubSocket.java"),path.join(source,"HubScreenSession.java"),path.join(repo,"client/android/audit/NativeTlsAudit.java"),path.join(repo,"client/android/audit/NativeScreenAudit.java"),path.join(repo,"client/android/audit/RealHubScreenAudit.java")],"compile.log",60_000);
   await run(java("java"),["-Xmx512m","-cp",classes+path.delimiter+classpath,"com.tarobot.client.NativeTlsAudit",repo,scratch,path.join(output,"android-jvm-result.json")],"run.log",180_000);
   await run(java("java"),["-Xmx128m","-cp",classes+path.delimiter+classpath,"com.tarobot.client.NativeScreenAudit",repo,scratch,path.join(output,"android-screen-jvm-result.json")],"screen-run.log",60_000);
+  // The same production transport against a real HubServer (needs the root npm install for tsx).
+  await run(java("java"),["-Xmx128m","-cp",classes+path.delimiter+classpath,"com.tarobot.client.RealHubScreenAudit",repo,path.join(scratch,"real-hub"),path.join(output,"android-real-hub-screen-result.json")],"real-hub-run.log",120_000);
+  // Bind the receipts to the exact production and audit bytes that ran.
+  const audited=["client/android/app/src/main/java/com/tarobot/client/HubTls.java","client/android/app/src/main/java/com/tarobot/client/HubTransport.java","client/android/app/src/main/java/com/tarobot/client/HubSocket.java","client/android/app/src/main/java/com/tarobot/client/HubScreenSession.java","client/android/audit/NativeTlsAudit.java","client/android/audit/NativeScreenAudit.java","client/android/audit/RealHubScreenAudit.java","client/android/audit/screen-fixture.mjs","client/android/audit/real-hub-peer.mjs"];
+  await writeFile(path.join(output,"android-audit-sources.json"),JSON.stringify(Object.fromEntries(await Promise.all(audited.map(async file=>[file,createHash("sha256").update(await readFile(path.join(repo,file))).digest("hex")]))),null,2));
   console.log(await readFile(path.join(output,"android-jvm-result.json"),"utf8"));
   console.log(await readFile(path.join(output,"android-screen-jvm-result.json"),"utf8"));
+  console.log(await readFile(path.join(output,"android-real-hub-screen-result.json"),"utf8"));
 } finally { await rm(scratch,{recursive:true,force:true}); }

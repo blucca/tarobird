@@ -71,7 +71,9 @@ generic network closure. Every terminal reason the Host, a native session or
 the viewer can end a connection with has its own explanation;
 `tests/client-screen-errors.test.ts` scans those sources to keep it so.
 The iOS attach deadline starts when both sockets resume, after route
-preparation, so a slow identity check does not consume it.
+preparation, so a slow identity check does not consume it. A Hub sends the
+session's state on the control socket as it attaches, before `attached`; both
+platforms accept exactly that validated state first and nothing else.
 
 ## Maintenance and validation
 
@@ -82,8 +84,13 @@ preparation, so a slow identity check does not consume it.
   `screen-mobile`, `screen-mobile-transport` and `screen-touch` browser specs.
 - Native loopback: `node client/scripts/ios-screen-audit.mjs <private-output>`
   on Apple Foundation; `node client/scripts/android-transport-audit.mjs
-  <private-output>` on a JVM. Both use synthetic TLS peers. The client workflow's
-  native jobs run these checks in addition to platform compilation.
+  <private-output>` on a JVM. Both use a synthetic TLS peer and then a real
+  HubServer (`client/android/audit/real-hub-peer.mjs`, run with the root `tsx`):
+  its TLS listener and identity proof, screen sockets and heartbeat, a paired
+  and granted viewer, and the Host's own stop, sign-in expiry and revocation.
+  Only the target's capture is synthetic. The client workflow's native jobs run
+  these checks in addition to platform compilation; the Android runner records
+  the hashes of the production and audit sources it ran.
 - Native mobile checks have separately exercised real WKWebView/Capacitor and
   Android WebView decoding, document retirement and background handling in
   isolated simulator/emulator Apps. Browser fixtures and native-plugin fixtures

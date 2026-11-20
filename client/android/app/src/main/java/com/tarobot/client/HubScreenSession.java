@@ -137,7 +137,9 @@ final class HubScreenSession {
             if(integer(rect,"x",0,0)!=0||integer(rect,"y",0,0)!=0||integer(rect,"width",1,edgeLimit)!=w||integer(rect,"height",1,edgeLimit)!=h) throw invalid();
             streamGeneration=stream; geometryRevision=geometry; width=w; height=h; codec=c.equals("h264")?1:2; lastFrame=0;
         } else {
-            if(!controlReady) throw invalid();
+            // A Hub announces the session's state as it attaches the control
+            // socket, before "attached" itself. Only a valid state may precede it.
+            if(!controlReady && !type.equals("state")) throw invalid();
             if(type.equals("state")) {
                 keys(value,"type session serverTime","controlPending streamGeneration lease"); JSONObject session=object(value,"session");
                 if(!sessionId.equals(text(session,"id"))||!generation.equals(text(session,"generation"))) throw invalid();
