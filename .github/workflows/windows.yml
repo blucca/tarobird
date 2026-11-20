@@ -17,7 +17,7 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       TAROBOT_SOURCE_COMMIT: ${{ github.sha }}
     outputs:
@@ -75,6 +75,7 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix client
       - name: Build full Windows host installer
+        id: build
         run: npm run desktop:windows --prefix client -- --arch ${{ inputs.arch }}
       - name: Packaged host end-to-end smoke
         run: client/src-tauri/host/node.exe scripts/verify-desktop-host.mjs client/src-tauri/host
@@ -136,6 +137,17 @@ jobs:
             --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-acceptance.noindex" `
             --native-tests client/src-desktop-updater --scope install,native
           if ($LASTEXITCODE -ne 0) { throw "Windows installation or native acceptance failed; see the receipt" }
+      - name: "#50 uninstall recovery, in-place uninstall, helper backup and dialogs (acceptance only)"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: pwsh
+        env:
+          TAROBOT_WINDOWS_ACCEPTANCE: disposable
+        run: |
+          $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
+          if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
+          node client/scripts/windows-uninstall-recovery-acceptance.mjs --confirm-disposable-windows --installer $installers[0].FullName `
+            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex"
+          if ($LASTEXITCODE -ne 0) { throw "#50 uninstall recovery acceptance did not pass; see the receipt in the job summary" }
       - name: Build isolated Windows migration acceptance package
         shell: pwsh
         run: |
