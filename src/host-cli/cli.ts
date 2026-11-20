@@ -1,5 +1,5 @@
 import { runHistoryCommand } from "./history.js";
-import { engineQuotaCommand } from "./engine-quota.js";
+import { engineQuotaCommand, engineQuotaGuidance } from "./engine-quota.js";
 import { screenCommand } from "./screens.js";
 import { runWorkbenchCommand } from "./workbench.js";
 import { runConversationsCommand } from './conversations.js';
@@ -159,6 +159,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     通过同一主机授权接口控制在线 App；返回真实回执。unknown 不代表成功，勿换编号自动重试。
     Markdown 笔记是 App 工作台对象，不是本机文件；导入导出只由用户在 App 中进行。
   engines quota [--bot BOT] [--refresh --revision REV] [--json]
+    无当前读数的 Bot 会在标准错误输出该引擎经核实的官方查看方式。
   engines status [--request-id ID] [--json]
   engines set --engine ENGINE --path ABSOLUTE_PATH --revision REV [--request-id ID]
   engines reset --engine ENGINE --revision REV [--request-id ID]
@@ -431,7 +432,11 @@ export async function runHostCli(argv: string[]): Promise<void> {
   if (command === "engines" && sub === "quota") {
     if (argument || v.engine !== undefined || v.path !== undefined || v["request-id"] !== undefined) throw new Error("请使用 engines quota --help。");
     const client = await LocalHostClient.connect(directory);
-    try { await output(await engineQuotaCommand(client, { bot: v.bot, refresh: v.refresh, revision: v.revision })); }
+    try {
+      const value = await engineQuotaCommand(client, { bot: v.bot, refresh: v.refresh, revision: v.revision });
+      await output(value);
+      for (const line of engineQuotaGuidance(value)) console.error(line);
+    }
     finally { client.close(); }
     return;
   }

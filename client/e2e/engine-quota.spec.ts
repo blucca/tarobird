@@ -86,6 +86,9 @@ test("quota page reads actual Host cache and explicit refresh never sends a mode
     expect(f.records.writer!.refreshes).toBe(0);
     await expect(panel.getByRole("region", { name: "Review Bot · Codex", exact: true })).toContainText("超出 25%");
     await expect(panel.getByRole("region", { name: "Research Bot · Kimi", exact: true })).toContainText("尚未接入");
+    await expect(panel.getByRole("region", { name: "Research Bot · Kimi", exact: true }).locator(".quota-help")).toHaveText("官方查看：在 Kimi Code CLI 交互界面输入 /usage 查看套餐额度；ACP 会话里的 /usage 只显示本会话 token。");
+    await expect(writer.locator(".quota-help")).toContainText("claude.ai/settings/usage");
+    await expect(coder.locator(".quota-help")).toHaveCount(0);
     await page.screenshot({ path: info.outputPath("quota-desktop.png"), fullPage: true });
   } finally { await f.close(); }
 });
@@ -101,10 +104,13 @@ for (const width of [1360, 390, 320]) for (const english of [false, true]) test(
     await expect(coder).toContainText(english ? "62% remaining" : "剩余 62%"); await expect(coder.getByRole("meter")).toHaveCount(1);
     await expect(reviewer).toContainText(f.text("已触发原生消费限制")); await expect(reviewer).toContainText(english ? "25% over limit" : "超出 25%");
     await expect(reviewer.locator(".quota-balance")).toContainText(f.text("尚无数据")); await expect(reviewer.locator(".quota-balance")).not.toContainText("0 credits");
+    const research = panel.getByRole("region", { name: "Research Bot · Kimi", exact: true });
+    await expect(research.locator(".quota-help")).toHaveText(f.text("官方查看：在 Kimi Code CLI 交互界面输入 /usage 查看套餐额度；ACP 会话里的 /usage 只显示本会话 token。"));
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     expect(await panel.locator(".quota-card").evaluateAll(cards => cards.every(card => card.scrollWidth <= card.clientWidth + 1))).toBe(true);
     await coder.scrollIntoViewIfNeeded(); await page.screenshot({ path: info.outputPath("quota-values.png") });
     await reviewer.scrollIntoViewIfNeeded(); await page.screenshot({ path: info.outputPath("quota-restrictions.png") });
+    await research.scrollIntoViewIfNeeded(); await page.screenshot({ path: info.outputPath("quota-guidance.png") });
     for (const record of Object.values(f.records)) expect(record.refreshes).toBe(0);
     expect(errors).toEqual([]);
   } finally { await f.close(); await context.close(); }
@@ -143,15 +149,17 @@ test("constraint reset times expire the reading like the Gateway, without a refi
   const f = await fixture(page);
   try {
     const snapshot = f.records.coder!.snapshot;
-    snapshot.pools = []; snapshot.availability = "blocked"; snapshot.observedAt = new Date().toISOString();
+    // Mirrors parseCodexQuota: native Codex readings carry their official viewing guidance.
+    snapshot.pools = []; snapshot.availability = "blocked"; snapshot.observedAt = new Date().toISOString(); snapshot.help = "codex_usage";
     snapshot.constraints = [{ code: "ordinary_usage_blocked", availability: "blocked", resetsAt: new Date(Date.now() + 4_000).toISOString() }];
     await f.open(); const coder = page.getByRole("region", { name: "Coding Bot · Codex", exact: true }), constraints = coder.locator(".quota-constraints");
-    await expect(coder.locator(".quota-state")).toHaveText("已读取"); await expect(constraints).toContainText("重置：");
+    await expect(coder.locator(".quota-state")).toHaveText("已读取"); await expect(constraints).toContainText("重置："); await expect(coder.locator(".quota-help")).toHaveCount(0);
     await expect(coder.locator(".quota-notice")).toHaveText("原生服务报告使用受限；窗口剩余量不代表可以继续请求。");
     const requests = f.requests();
     await expect(coder.locator(".quota-state")).toHaveText("待更新", { timeout: 8_000 });
     await expect(constraints).toContainText("常规使用受限 · 已到重置时间，等待更新"); await expect(constraints).not.toContainText("重置：");
     await expect(coder.locator(".quota-notice")).toHaveText("上次读数：原生服务报告使用受限；窗口剩余量不代表可以继续请求。");
+    await expect(coder.locator(".quota-help")).toContainText("/usage");
     await expect(coder).not.toContainText("剩余 100%");
     expect(f.requests()).toBe(requests); expect(f.records.coder!.refreshes).toBe(0);
   } finally { await f.close(); }

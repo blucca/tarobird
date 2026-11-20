@@ -20,6 +20,28 @@ Native windows and credits retain their own units and reset times. An unknown
 value is not zero or unlimited. Independent native restrictions can block use
 even when a percentage is low.
 
+## Official viewing guidance
+
+When a card has no current reading (unsupported, unknown, login required,
+unverifiable, stale or offline), Settings shows the engine's official viewing
+method from the snapshot's `help` code. `tarobird engines quota` prints the
+same guidance to standard error; its JSON output is unchanged. The sources were
+checked against the local CLIs' own help/changelog text and official docs:
+
+| `help` | Guidance | Evidence |
+| --- | --- | --- |
+| `codex_usage` | Codex CLI `/usage` after a ChatGPT sign-in | Codex CLI 0.170.0 built-in help text |
+| `claude_usage` | Claude Code `/usage`, or `claude.ai/settings/usage` | Claude Code 2.1.329 command list and limit message |
+| `antigravity_usage` | Antigravity CLI `/usage`, `/quota`, `/credits`; a `GEMINI_API_KEY` has no account quota (Google AI Studio) | `agy changelog` (1.5.13) |
+| `gemini_api_usage` | Google AI Studio for a `GEMINI_API_KEY` | `agy changelog` (1.5.13) |
+| `kimi_usage` | Interactive Kimi Code CLI `/usage`; ACP `/usage` only reports session tokens | Kimi Code 2.7.0 command definitions |
+| `deepseek_balance` | DeepSeek Platform balance for the official API; other providers' own consoles | DeepSeek API balance docs; DSH 0.2.2-rc.5 account plugin default origin |
+
+The guidance never triggers a read, a login or a model request. Claude's
+passive source stays hidden when its credential source cannot be verified
+(for example, a macOS Keychain login); the card states that limit instead of
+showing values that could belong to another account.
+
 ## Read and refresh behavior
 
 Opening the page and refreshing the directory reads worker caches only. Codex's

@@ -12,6 +12,7 @@
 .quota-state{flex-shrink:0;max-width:40%;font-size:12px;color:var(--muted);text-align:right}
 .quota-notice{padding:9px 11px;border-radius:var(--radius-sm);background:var(--orange-soft);color:var(--orange)}
 .quota-constraints{padding-left:20px;overflow-wrap:anywhere}
+.quota-help{color:var(--muted);font-size:12px}
 .quota-pool{border-top:1px solid var(--border);margin-top:14px;padding-top:12px}
 .quota-pool h5{margin:0 0 8px;font-size:13px;font-weight:600;overflow-wrap:anywhere}
 .quota-window{margin:12px 0}

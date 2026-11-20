@@ -2,8 +2,8 @@ import { expect, it, vi } from "vitest";
 import { hubEngineQuotas } from "../src/hub/engine-quota.js";
 import { HubError } from "../src/hub/errors.js";
 import { unavailableQuota } from "../src/codex/account-quota.js";
-import { engineQuotaCommand } from "../src/host-cli/engine-quota.js";
-import { ENGINE_QUOTA_CAPABILITY } from "../src/client-protocol/engine-quota.js";
+import { engineQuotaCommand, engineQuotaGuidance } from "../src/host-cli/engine-quota.js";
+import { ENGINE_QUOTA_CAPABILITY, quotaHelpSchema } from "../src/client-protocol/engine-quota.js";
 
 function fixture() {
   let key = {}, visible = true, authorized = true;
@@ -68,4 +68,22 @@ it("CLI refresh uses exactly the same versioned scope and never creates a turn",
   expect(client.request).toHaveBeenCalledExactlyOnceWith("/api/engine-quotas/bot?refresh=1&revision=rev");
   await expect(engineQuotaCommand(client as never, { refresh: true })).rejects.toThrow();
   expect(client.request).toHaveBeenCalledOnce();
+});
+
+// #47-C: the verified official viewing guidance reaches CLI users without changing the JSON contract.
+it("CLI guidance names verified official views only for Bots without a current reading", () => {
+  const scope = (id: string, engine: "codex" | "kimi" | "pi" | "claude", snapshot: ReturnType<typeof unavailableQuota>) =>
+    ({ ...snapshot, id, revision: `${id}_rev`, engine, label: `${id} Bot`, botIds: [id], sharing: "unverified" as const });
+  const ready = { ...unavailableQuota("codex", "not_loaded", 1000), state: "ready" as const, reason: undefined, observedAt: new Date(1000).toISOString(), constraints: [{ code: "ordinary_usage_blocked" as const, availability: "blocked" as const, resetsAt: new Date(20_000).toISOString() }] };
+  const directory = { generatedAt: new Date(1000).toISOString(), scopes: [
+    scope("current", "codex", ready), scope("kimi_a", "kimi", unavailableQuota("kimi", "not_adapted")),
+    scope("kimi_b", "kimi", unavailableQuota("kimi", "not_adapted")), scope("pi", "pi", unavailableQuota("pi", "not_adapted")),
+    scope("writer", "claude", unavailableQuota("claude", "scope_unverifiable")),
+  ] };
+  const lines = engineQuotaGuidance(directory, 2000);
+  expect(lines).toEqual([expect.stringMatching(/^kimi_a Bot, kimi_b Bot: .*\/usage.*ACP/), expect.stringMatching(/^writer Bot: .*claude\.ai\/settings\/usage/)]);
+  expect(lines.join("\n")).not.toMatch(/_rev|current/);
+  // The same reading becomes guidance-worthy once its constraint reset passes.
+  expect(engineQuotaGuidance(directory.scopes[0]!, 20_000)).toEqual([expect.stringContaining("Codex CLI")]);
+  for (const help of quotaHelpSchema.options) expect(engineQuotaGuidance({ ...directory.scopes[1]!, help }, 2000)[0]).toMatch(/官方查看.+ \/ Official view/);
 });

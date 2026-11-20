@@ -1,6 +1,6 @@
 import { useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { LoaderCircle, RefreshCw } from "lucide-react";
-import { quotaReadingExpired, type QuotaConstraint, type QuotaReason, type QuotaWindow } from "../../src/client-protocol/engine-quota.js";
+import { quotaReadingExpired, type QuotaConstraint, type QuotaEngine, type QuotaReason, type QuotaSnapshot, type QuotaWindow } from "../../src/client-protocol/engine-quota.js";
 import type { HubConnection } from "./connection.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
 import { SettingsGroupHeading } from "./SettingsParts.js";
@@ -9,7 +9,7 @@ import { t, useLocale } from "./i18n.js";
 import "./engine-quota.css";
 
 const engines = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
-function reasonText(reason?: QuotaReason): string {
+function reasonText(reason: QuotaReason | undefined, engine: QuotaEngine): string {
   switch (reason) {
     case "not_adapted": return t("此引擎尚未接入原生额度。");
     case "not_loaded": return t("尚未读取原生额度，可点击刷新。");
@@ -18,7 +18,9 @@ function reasonText(reason?: QuotaReason): string {
     case "no_passive_event": return t("尚未收到原生额度状态，仅在正常使用中被动更新。");
     case "login_required": return t("请先在运行主机上完成引擎登录，再刷新。");
     case "auth_changed": return t("授权信息已变化，旧额度已清除。请核对后再次刷新。");
-    case "scope_unverifiable": return t("暂时无法确认当前授权，未展示历史额度。");
+    case "scope_unverifiable": return engine === "claude"
+      ? t("Claude Code 的凭据来源无法由公开接口核实（例如 macOS 钥匙串登录），为避免显示其他账号的额度，不展示被动收到的读数。")
+      : t("无法从运行主机的凭据文件确认当前账号（例如登录保存在系统钥匙串），读数不会保留。");
     case "offline": return t("Bot 当前离线，连接恢复后重新读取列表。");
     case "timeout": return t("读取原生额度超时，可稍后再刷新。");
     case "cancelled": return t("本次读取已取消，可重新刷新。");
@@ -27,6 +29,18 @@ function reasonText(reason?: QuotaReason): string {
     case "cli_unavailable": return t("主机上的引擎程序不可用，请检查后再刷新。");
     case "native_error": return t("暂时无法读取原生额度，可稍后再刷新。");
     case "host_upgrade_required": return t("请更新主机与 Bot 运行程序以读取额度。");
+    default: return "";
+  }
+}
+// Verified against each engine's own CLI help/changelog and official docs; shown when no current reading exists.
+function helpText(help: QuotaSnapshot["help"]): string {
+  switch (help) {
+    case "codex_usage": return t("官方查看：在运行主机的 Codex CLI 中以 ChatGPT 登录后输入 /usage，可查看账号额度和重置时间。");
+    case "claude_usage": return t("官方查看：订阅登录时，在 Claude Code 中输入 /usage，或打开 claude.ai/settings/usage。");
+    case "antigravity_usage": return t("官方查看：在 Antigravity CLI 中输入 /usage 或 /quota，AI credits 用 /credits；GEMINI_API_KEY 没有账号额度，请在 Google AI Studio 查看该 Key 的用量。");
+    case "gemini_api_usage": return t("官方查看：GEMINI_API_KEY 没有账号额度，请在 Google AI Studio 查看该 Key 的用量。");
+    case "kimi_usage": return t("官方查看：在 Kimi Code CLI 交互界面输入 /usage 查看套餐额度；ACP 会话里的 /usage 只显示本会话 token。");
+    case "deepseek_balance": return t("官方查看：使用 DeepSeek 官方 API 时，登录 DeepSeek 开放平台（platform.deepseek.com）查看账户余额；其他供应商请在其控制台查看。");
     default: return "";
   }
 }
@@ -79,13 +93,15 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
         const passive = scope.capability.mode === "passive";
         const canRead = scope.capability.mode !== "unsupported" && scope.state !== "offline" && scope.state !== "unsupported" && scope.reason !== "host_upgrade_required";
         const cooling = !!scope.nextRefreshAt && Date.parse(scope.nextRefreshAt) > now;
-        const busy = quota.busy.includes(scope.id), reason = reasonText(scope.reason ?? scope.capability.reason);
+        const busy = quota.busy.includes(scope.id), reason = reasonText(scope.reason ?? scope.capability.reason, scope.engine);
+        const help = scope.state === "ready" && !stale ? "" : helpText(scope.help);
         const auth = ({ subscription: t("订阅授权"), api_key: "API Key", adc: t("应用默认凭据"), other: t("其他授权"), unknown: t("授权方式未确认") })[scope.authMode];
         const constraints = [...scope.constraints, ...scope.pools.flatMap(pool => pool.constraints)];
         const availabilityNotice = scope.availability === "blocked" ? t("原生服务报告使用受限；窗口剩余量不代表可以继续请求。") : scope.availability === "warning" ? t("原生服务报告额度预警。") : "";
         return <section className="quota-card" key={scope.id} aria-label={`${scope.label} · ${engines[scope.engine]}`} aria-busy={busy || undefined}>
           <header className="quota-card-heading"><div><h4>{scope.label}</h4><p>{engines[scope.engine]} · {auth}</p></div><span className="quota-state">{status}</span></header>
           {reason && <p className="quota-reason">{reason}</p>}
+          {help && <p className="quota-help">{help}</p>}
           {passive && <p className="muted">{t("仅显示正常使用中收到的状态；读取不会触发新对话。")}</p>}
           {availabilityNotice && <p className="quota-notice">{stale ? t("上次读数：{0}", availabilityNotice) : availabilityNotice}</p>}
           {constraints.length > 0 && <ul className="quota-constraints">{constraints.map((value, index) => <li key={`${value.code}:${index}`}>{constraintText(value)}{value.resetsAt && <span> · {Date.parse(value.resetsAt) <= now ? t("已到重置时间，等待更新") : t("重置：{0}", formatTime(value.resetsAt))}</span>}</li>)}</ul>}
