@@ -84,9 +84,9 @@ function windows({ faults = new Set(), existing = false, host = false, displayNa
       if (script.includes('CreateShortcut')) return { code: 0, stdout: `${exe}\r\n` };
       if (script.includes('Get-StartApps')) return { code: 0, stdout: faults.has('aumid') ? '' : `${AUMID}\r\n` };
       if (script.includes('ToastNotificationManager')) {
-        calls.push(['toast-probe']);
+        calls.push(['toast-probe', script]);
         return faults.has('toast-probe') ? { code: 1, stdout: '', stderr: 'Unable to find type [Windows.UI.Notifications.ToastNotificationManager]' }
-          : { code: 0, stdout: 'setting-before=0x80070490 key-before=False show=0x00000000 setting-after=Enabled key-after=True\r\n' };
+          : { code: 0, stdout: script.includes('.Show(') ? 'setting-before=0x80070490 key-before=False show=0x00000000 setting-after=Enabled key-after=True\r\n' : 'setting-before=0x80070490 key-before=False show=not-requested setting-after=0x80070490 key-after=False\r\n' };
       }
       return { code: 1, stdout: '', stderr: 'unexpected script' };
     },
@@ -156,10 +156,11 @@ test('refuses anything but a confirmed, empty, readable disposable profile — a
   for (const [sys, confirmed, reason] of [[{ ...windows(), platform: 'darwin' }, true, /Windows is required/], [windows(), false, /TAROBOT_WINDOWS_ACCEPTANCE/],
     [windows({ existing: true }), true, /an installation exists/], [windows({ faults: new Set(['registry']) }), true, /cannot read HKCU.*Uninstall/],
     [windows({ faults: new Set(['processes']) }), true, /cannot list tarocub-client\.exe/], [windows({ faults: new Set(['unreadable']) }), true, /cannot inspect/]]) {
-    const { report } = await runAcceptance({ installer: SETUP, confirmed }, sys);
+    const { report } = await runAcceptance({ installer: SETUP, confirmed, showToastProbe: true }, sys);
     assert.equal(report.outcome, 'fail');
     assert.match(report.checks.filter(check => check.status === 'fail').map(check => check.detail).join('\n'), reason);
     assert.ok(!sys.calls.some(call => String(call[0]).endsWith('setup.exe')), 'no installer may run');
+    assert.ok(!sys.calls.some(call => call[0] === 'toast-probe'), 'an explicit toast option cannot bypass disposable guards');
   }
 });
 
@@ -286,18 +287,34 @@ test('TaroBird display name is verified independently from retained TaroBot inst
   }
 });
 
-test('the installed toast status probe is recorded once and never judged', async () => {
+test('the default installed toast status probe is read-only, recorded once and never judged', async () => {
   for (const fault of [undefined, 'toast-probe']) {
     const sys = windows({ faults: new Set(fault ? [fault] : []) });
     const { report, meta } = await runAcceptance({ installer: SETUP, version: '1.2.3', confirmed: true, scopes: ['install'] }, sys);
     assert.equal(report.outcome, 'pass', JSON.stringify(report.checks.filter(c => c.status === 'fail')));
     assert.equal(statuses(report)['install/notification-status-probe'], 'info');
     assert.equal(sys.calls.filter(call => call[0] === 'toast-probe').length, 1);
-    assert.match(detail(report, 'install/notification-status-probe'), fault ? /^probe exit 1: Unable to find type/ : /^setting-before=0x80070490 key-before=False show=0x00000000 setting-after=Enabled/);
+    assert.ok(sys.calls.filter(call => call[0] === 'toast-probe').every(call => !call[1].includes('.Show(')));
+    assert.match(detail(report, 'install/notification-status-probe'), fault ? /^probe exit 1: Unable to find type/ : /^setting-before=0x80070490 key-before=False show=not-requested setting-after=0x80070490/);
     assert.match(report.markdown(meta), /\| install \| notification-status-probe \| ℹ info \(not judged\) \|/);
     assert.ok(!report.missing.includes('install/notification-status-probe'));
   }
-  // The probe reads one fixed AUMID and writes only the probe toast it removes again.
+  // Reading the production identity must not register it before first launch.
   assert.match(TOAST_PROBE, /\$id = 'com\.tarobot\.client'/);
-  assert.match(TOAST_PROBE, /History\.Remove\('probe', 'acceptance', \$id\)/);
+  assert.doesNotMatch(TOAST_PROBE, /\.Show\(|History\.Remove|LoadXml/);
+});
+
+test('an explicit toast probe runs only after first-launch checks in the guarded disposable run', async () => {
+  const sys = windows();
+  const { report } = await runAcceptance({ installer: SETUP, confirmed: true, scopes: ['install'], showToastProbe: true }, sys);
+  assert.equal(report.outcome, 'pass');
+  const probes = sys.calls.filter(call => call[0] === 'toast-probe');
+  assert.equal(probes.length, 2);
+  assert.ok(!probes[0][1].includes('.Show('));
+  assert.match(probes[1][1], /\.Show\(\$toast\)/);
+  assert.match(probes[1][1], /History\.Remove\('probe', 'acceptance', \$id\)/);
+  assert.ok(sys.calls.indexOf(probes[1]) > sys.calls.findIndex(call => call[0] === 'launch'));
+  assert.equal(statuses(report)['notification-show/notification-status-probe'], 'info');
+  const index = report.checks.findIndex(check => check.phase === 'notification-show');
+  assert.ok(index > report.checks.findIndex(check => check.phase === 'first-launch' && check.id === 'stop-own-processes'));
 });

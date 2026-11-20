@@ -2148,6 +2148,15 @@ and the existing network/run/delete suites listed in that audit.
   Rust `windows_status::`, `electron/tests/notifications.test.mjs`, Windows cases in
   `notification-design`; record-only CI probe `windows_toast_status_probe`.
   [First-toast registration and real-device gaps](client/windows-notification-first-toast-2026-11-20.md).
+  A successful confirmation toast preserves the explicit enable choice; it does
+  not prove Windows can read an Enabled setting. `notification-readiness.ts`
+  reports `windows-unverified` when valid Windows diagnostics cannot confirm
+  that setting, with system settings and diagnostic actions. Older shells
+  without diagnostics retain the existing permission fallback. The confirmation
+  copy describes a test notification rather than a completed preference save.
+  `windows-acceptance.mjs` observes notification state without Show by default;
+  `--show-toast-probe` runs only after first-launch checks in a confirmed
+  disposable profile. Neither probe alone verifies banner delivery.
   [Ordinary r38 macOS acceptance](client/native-r38-2026-10-11.md) records actual
   background notification banner delivery. Native clicks, Windows delivery/installer
   and physical-phone acceptance remain gates.
@@ -3119,7 +3128,8 @@ and the existing network/run/delete suites listed in that audit.
   folder-name context menus, Bot menus and section/Host heading menus. No search
   or Host-heading ellipsis remains. `FolderListOptions` owns one stable manager
   per directory and resolves the clicked connection, including same-ID folders
-  on different Hosts. Empty directory space and Shift+F10 retain access without
+  on different Hosts. Combined multi-Host conversation lists use
+  `CrossHostFolderManager`; single-Host and Bot-filtered views keep `FolderManager`. Empty directory space and Shift+F10 retain access without
   adding a toolbar row; phone controls and mixed recency ordering are unchanged.
   The existing device preferences, Host APIs and CLI rules are unchanged.
   See [desktop list options](client/desktop-list-options-2026-10-28.md); browser
@@ -3127,7 +3137,7 @@ and the existing network/run/delete suites listed in that audit.
   `porcelain-details` and `adhd-board`.
   `MobileListOptions.tsx` puts phone Messages list preferences and host-scoped
   folder management behind the filter-row overflow button. It reuses existing
-  preferences and `FolderManager`; desktop controls remain unchanged. See the
+  preferences and the same scoped folder manager as desktop. See the
   October 26 follow-up in [phone host grouping](client/mobile-host-grouping-2026-10-16.md).
   `MobileHome.tsx` shares the optional `sidebarGroupByHost` preference (default
   false), retaining host-scoped custom folders and labeling each branch once.
@@ -3136,6 +3146,18 @@ and the existing network/run/delete suites listed in that audit.
   an implicit Unfiled heading rather than source labels on individual rows.
   Regressions: `sidebar-layout`, `mobile-im`, `conversation-folders`,
   `host-source-badges`. [Phone host grouping](client/mobile-host-grouping-2026-10-16.md).
+  `cross-host-folder-order.ts` and `use-cross-host-folder-order.ts` keep the
+  combined folder order on this device (`tarobird-cross-host-folder-order-v1`).
+  Keys pair the Host public key with its folder ID; names and repeated IDs cannot
+  change ownership. Pinned folders form a global tier before ordinary folders.
+  After a local reorder, the saved combined order takes precedence over each
+  Host's order; it is not synchronized to other devices or written to the Hub.
+  Offline/filtered Hosts retain their positions; permanent Host removal prunes
+  only that Host. Rename, delete, pin and conversation moves still target the
+  owning Host. CLI folder commands continue to control the Host-scoped order.
+  Regressions: `client-cross-host-folder-order`; browser
+  `cross-host-folder-order`, `conversation-folders`, `mobile-conversation-actions`
+  and `host-source-badges`.
   `showDisconnectedBots` defaults false on both clients. The device-local
   checkbox uses `conversation-inbox.ts:navigationItems` to filter Bot rows and
   direct chats by both host connectivity and Bot presence, preserving groups,

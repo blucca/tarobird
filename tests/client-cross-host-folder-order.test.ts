@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ConversationFoldersState } from '../src/client-protocol/conversation-folders.js';
 import type { HubConnection } from '../client/src/connection.js';
 import {
@@ -19,6 +19,7 @@ import {
   resetCrossHostFolderOrderCache,
   resolveCrossHostFolderOrder,
   saveCrossHostFolderOrder,
+  subscribeCrossHostFolderOrder,
   visibleCrossHostFolders,
   writeCrossHostFolderOrder,
   type CrossHostFolderSource,
@@ -72,6 +73,7 @@ function installMemoryStorage() {
 afterEach(() => {
   resetCrossHostFolderOrderCache();
   delete (globalThis as { localStorage?: unknown }).localStorage;
+  vi.unstubAllGlobals();
 });
 
 describe('cross-host folder order keying and parsing', () => {
@@ -373,6 +375,90 @@ describe('cross-host folder order resolution and merging', () => {
 });
 
 describe('App-local persistence store', () => {
+  function storageWindow() {
+    const target = new EventTarget();
+    vi.stubGlobal('window', target);
+    return (key: string | null = CROSS_HOST_FOLDER_ORDER_KEY) => {
+      const event = new Event('storage');
+      Object.defineProperty(event, 'key', { value: key });
+      target.dispatchEvent(event);
+    };
+  }
+
+  it('keeps a remote reorder made while the combined view is unmounted before the next local move', () => {
+    const { storage } = installMemoryStorage();
+    const remoteChanged = storageWindow();
+    const sources = [
+      makeSource('a', 'keyA', 'Host Alpha', [{ id: 'a1', name: 'A1' }, { id: 'a2', name: 'A2' }]),
+      makeSource('b', 'keyB', 'Host Beta', [{ id: 'b1', name: 'B1' }]),
+    ];
+    const unmount = subscribeCrossHostFolderOrder(() => {});
+    readCrossHostFolderOrder();
+    unmount();
+
+    const remote = moveCrossHostFolderOrder(emptyCrossHostFolderOrder(), sources, k('keyB', 'b1'), 'top');
+    storage.setItem(CROSS_HOST_FOLDER_ORDER_KEY, JSON.stringify(remote));
+    remoteChanged();
+    const remount = subscribeCrossHostFolderOrder(() => {});
+    try {
+      expect(describeOrder(sources, readCrossHostFolderOrder())[0]).toBe('keyB/b1');
+      applyCrossHostFolderMove(sources, k('keyA', 'a2'), 'up');
+      expect(describeOrder(sources, readCrossHostFolderOrder())).toEqual([
+        'keyB/b1', 'keyA/a2', 'keyA/a1', 'keyA/unfiled', 'keyB/unfiled',
+      ]);
+      expect(JSON.parse(storage.getItem(CROSS_HOST_FOLDER_ORDER_KEY)!)).toEqual(readCrossHostFolderOrder());
+    } finally { remount(); }
+  });
+
+  it('preserves another window\'s order when removing a host with no mounted subscribers', () => {
+    const { storage } = installMemoryStorage();
+    const remoteChanged = storageWindow();
+    writeCrossHostFolderOrder({ version: 1, pinned: [], ordinary: [k('A', 'a1'), k('A', 'a2'), k('B', 'b1')] });
+    const unmount = subscribeCrossHostFolderOrder(() => {});
+    unmount();
+    storage.setItem(CROSS_HOST_FOLDER_ORDER_KEY, JSON.stringify({
+      version: 1, pinned: [], ordinary: [k('B', 'b1'), k('A', 'a2'), k('A', 'a1')],
+    }));
+    remoteChanged();
+    removeCrossHostFolderOrderHost('B');
+    expect(readCrossHostFolderOrder().ordinary).toEqual([k('A', 'a2'), k('A', 'a1')]);
+    expect(JSON.parse(storage.getItem(CROSS_HOST_FOLDER_ORDER_KEY)!).ordinary).toEqual([k('A', 'a2'), k('A', 'a1')]);
+  });
+
+  it('observes relevant storage changes and clear, ignoring unrelated keys', () => {
+    const { storage } = installMemoryStorage();
+    const remoteChanged = storageWindow();
+    const listener = vi.fn();
+    const unmount = subscribeCrossHostFolderOrder(listener);
+    try {
+      readCrossHostFolderOrder();
+      const remote = { version: 1, pinned: [], ordinary: [k('A', 'a1')] };
+      storage.setItem(CROSS_HOST_FOLDER_ORDER_KEY, JSON.stringify(remote));
+      remoteChanged('unrelated-preference');
+      expect(listener).not.toHaveBeenCalled();
+      remoteChanged();
+      expect(readCrossHostFolderOrder()).toEqual(remote);
+      expect(listener).toHaveBeenCalledTimes(1);
+      storage.clear();
+      remoteChanged(null);
+      expect(readCrossHostFolderOrder()).toEqual(emptyCrossHostFolderOrder());
+      expect(listener).toHaveBeenCalledTimes(2);
+    } finally { unmount(); }
+  });
+
+  it('retains the in-memory choice across unmount/remount when storage rejects writes', () => {
+    const { storage } = installMemoryStorage();
+    storageWindow();
+    storage.setItem = () => { throw new Error('quota_exceeded'); };
+    const unmount = subscribeCrossHostFolderOrder(() => {});
+    const choice = { version: 1 as const, pinned: [], ordinary: [k('A', 'a2'), k('A', 'a1')] };
+    writeCrossHostFolderOrder(choice);
+    unmount();
+    const remount = subscribeCrossHostFolderOrder(() => {});
+    try { expect(readCrossHostFolderOrder()).toEqual(choice); }
+    finally { remount(); }
+  });
+
   it('persists, reloads, applies moves/pins, and cleans up removed hosts via localStorage', () => {
     const { map } = installMemoryStorage();
     const hostA = makeSource('a', 'keyA', 'Host Alpha', [{ id: 'a1', name: 'A1' }]);

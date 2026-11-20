@@ -9,6 +9,7 @@ test.beforeAll(async () => {
   server = await createServer({ resolve: { alias: [
     { find: /^@capacitor\/core$/, replacement: fileURLToPath(new URL("./fixtures/notification-readiness-core.ts", import.meta.url)) },
     { find: /^@capacitor\/push-notifications$/, replacement: fileURLToPath(new URL("./fixtures/notification-readiness-push.ts", import.meta.url)) },
+    { find: /^@capacitor\/app$/, replacement: fileURLToPath(new URL("./fixtures/notification-readiness-app.ts", import.meta.url)) },
   ] }, server: { host: "127.0.0.1", port: 0, strictPort: false } });
   await server.listen();
 });
@@ -194,7 +195,7 @@ for (const locale of ["zh", "en"] as const) test(`Windows registers an unregiste
   await page.evaluate(() => { const n = window.readinessFixture.nativeState; n.permission = "prompt"; n.afterRequest = "granted"; });
   await toggle(page, zh ? "消息提醒" : "Message alerts").click();
   await expect(toggle(page, zh ? "消息提醒" : "Message alerts")).toHaveAttribute("aria-checked", "true");
-  expect(await permissionCalls(page)).toEqual([{ request: false }, { request: true, confirmation: { body: zh ? "通知已开启。新消息会在这里提醒你。" : "Notifications are on. New messages will show up here." } }, { request: false }]);
+  expect(await permissionCalls(page)).toEqual([{ request: false }, { request: true, confirmation: { body: zh ? "这是一条 TaroBird 测试通知，用于检查通知显示。" : "This is a TaroBird test notification to check notification display." } }, { request: false }]);
   expect((await page.evaluate(() => window.readinessFixture.fixture.writes)).map((w: any) => w.body.enabled)).toEqual([true]);
   await expect(page.getByText(zh ? "接收条件已就绪" : "Receiving requirements are ready", { exact: true })).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
@@ -212,6 +213,58 @@ test("macOS permission requests are unchanged: no confirmation text and no Windo
   await expect(page.getByRole("alert")).toHaveText("无法读取系统通知权限，请检查系统设置后重试。");
   expect(await desktopCommands(page)).not.toContain("desktop_notification_diagnostics");
   await expect(page.getByRole("button", { name: "复制诊断信息", exact: true })).toHaveCount(0);
+});
+
+for (const locale of ["zh", "en"] as const) test(`Windows unverified registration preserves consent without claiming readiness (${locale})`, async ({ page }) => {
+  const zh = locale === "zh";
+  await open(page, `platform=windows&enabled=false&lang=${locale}`);
+  await page.evaluate(value => {
+    const n = window.readinessFixture.nativeState;
+    n.permission = "prompt"; n.afterRequest = "granted"; n.diagnostics = value;
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text: string) => { (window as any).copiedDiagnostics = text; } } });
+  }, diagnostics({ setting: "unregistered", registration: "unverified", steps: { setting: "0x80070490", confirm: "0x00000000" } }));
+  await toggle(page, zh ? "消息提醒" : "Message alerts").click();
+  await expect(toggle(page, zh ? "消息提醒" : "Message alerts")).toHaveAttribute("aria-checked", "true");
+  const readiness = page.locator(".notification-readiness");
+  await expect(readiness).toHaveAttribute("data-state", "windows-unverified");
+  await expect(readiness).toContainText(zh ? "Windows 通知状态尚未确认" : "Windows notification status is unverified");
+  await expect(page.getByText(zh ? "接收条件已就绪" : "Receiving requirements are ready", { exact: true })).toHaveCount(0);
+  await expect(readiness).not.toContainText(zh ? "权限与接收设置检查通过" : "Permissions and receiving settings passed");
+  await readiness.getByRole("button", { name: zh ? "复制诊断信息" : "Copy diagnostics", exact: true }).click();
+  expect(JSON.parse(await page.evaluate(() => (window as any).copiedDiagnostics))).toMatchObject({ setting: "unregistered", registration: "unverified" });
+  await page.getByRole("button", { name: zh ? "声音与横幅设置" : "Sounds and banners", exact: true }).click();
+  await recheck(page, zh ? "检查接收状态" : "Check receiving status");
+  await expect(readiness).toHaveAttribute("data-state", "windows-unverified");
+  expect((await permissionCalls(page)).filter((args: any) => args.request)).toHaveLength(1);
+  expect((await page.evaluate(() => window.readinessFixture.fixture.writes)).map((w: any) => w.body.enabled)).toEqual([true]);
+
+  // A newly readable Enabled setting wins over the previous registration result.
+  await page.evaluate(() => { window.readinessFixture.nativeState.diagnostics.setting = "enabled"; });
+  await recheck(page, zh ? "检查接收状态" : "Check receiving status");
+  await expect(readiness).toHaveAttribute("data-state", "ready");
+  await expect(page.getByText(zh ? "接收条件已就绪" : "Receiving requirements are ready", { exact: true })).toBeVisible();
+});
+
+test("Windows unknown or missing setting stays unverified while older shells without diagnostics remain compatible", async ({ page }) => {
+  await open(page, "platform=windows");
+  for (const setting of ["unknown", "unreadable", undefined]) {
+    await page.evaluate(value => { window.readinessFixture.nativeState.diagnostics = value; }, diagnostics({ setting }));
+    await recheck(page);
+    await expect(page.locator(".notification-readiness")).toHaveAttribute("data-state", "windows-unverified");
+  }
+  await page.evaluate(() => { window.readinessFixture.nativeState.diagnostics = undefined; });
+  await recheck(page);
+  await expect(page.locator(".notification-readiness")).toHaveAttribute("data-state", "ready");
+  expect((await permissionCalls(page)).filter((args: any) => args.request)).toEqual([]);
+  expect(await page.evaluate(() => window.readinessFixture.fixture.writes)).toEqual([]);
+});
+
+for (const platform of ["macos", "ios", "android"]) test(`${platform} readiness never reads Windows diagnostics`, async ({ page }) => {
+  await open(page, `platform=${platform}`);
+  await expect(page.locator(".notification-readiness")).toHaveAttribute("data-state", "ready");
+  await recheck(page);
+  await expect(page.locator(".notification-readiness")).toHaveAttribute("data-state", "ready");
+  expect(await desktopCommands(page)).not.toContain("desktop_notification_diagnostics");
 });
 
 for (const [setting, text, settings] of [
@@ -292,7 +345,7 @@ for (const locale of ["zh", "en"] as const) test(`Windows readiness re-registers
   expect((await permissionCalls(page)).every((args: any) => !args.request)).toBe(true);
   await page.getByRole("button", { name: zh ? "重新启用通知" : "Re-enable notifications", exact: true }).click();
   await expect(page.getByText(zh ? "接收条件已就绪" : "Receiving requirements are ready", { exact: true })).toBeVisible();
-  expect((await permissionCalls(page)).filter((args: any) => args.request)).toEqual([{ request: true, confirmation: { body: zh ? "通知已开启。新消息会在这里提醒你。" : "Notifications are on. New messages will show up here." } }]);
+  expect((await permissionCalls(page)).filter((args: any) => args.request)).toEqual([{ request: true, confirmation: { body: zh ? "这是一条 TaroBird 测试通知，用于检查通知显示。" : "This is a TaroBird test notification to check notification display." } }]);
   expect(await page.evaluate(() => window.readinessFixture.fixture.writes)).toEqual([]);
 });
 

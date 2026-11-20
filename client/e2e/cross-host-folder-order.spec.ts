@@ -96,6 +96,71 @@ async function dragCrossHostRow(page: Page, sourceLabel: string, destLabel: stri
   await expect(list).not.toHaveAttribute('data-dragging', 'true');
 }
 
+test('combined sidebar and manager share local order when only one registered host is ready', async ({ page }) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'cross-host-folder-one-ready-'));
+  const a = await HubServer.start({ stateDir: path.join(root, 'a'), clientDir: path.resolve('dist') });
+  const b = await HubServer.start({ stateDir: path.join(root, 'b'), origins: [a.url] });
+  try {
+    await a.store.db.run("INSERT INTO bots(id,name,secret_hash,online) VALUES('bot','助手','fixture',1)");
+    const chat = await a.store.createConversation('owner', ['bot'], '分组对话', 'chat');
+    const folders = new ConversationFolders(a.store.db);
+    await folders.change('owner', { type: 'create', id: 'f1', name: '分组 1', conversationId: chat.id, revision: 0 });
+    await folders.change('owner', { type: 'create', id: 'f2', name: '分组 2', revision: 1 });
+    const original = await folders.read('owner');
+    await pair(page, a, '主机 A');
+    await pair(page, b, '主机 B', true);
+    await sidebar(page).getByRole('button', { name: '按对话', exact: true }).click();
+    await sidebar(page).locator(`[data-host-id="${hostId(a)}"] [data-conversation-id="${chat.id}"]`).click();
+
+    // An interrupted removal is registered but has no connection/directory.
+    // Ordinary offline hosts retain their directory and do not exercise this case.
+    await page.evaluate(async id => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('tarocub-hosts-v1');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction('hosts', 'readwrite'), store = tx.objectStore('hosts'), request = store.get(id);
+          request.onsuccess = () => store.put({ ...request.result, state: 'removing' });
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+      } finally { db.close(); }
+    }, hostId(b));
+    await page.reload();
+    await waitForClientOnline(page);
+    await expect(sidebar(page).getByRole('button', { name: '主机 B · 等待完成移除', exact: true })).toBeVisible();
+
+    await sidebar(page).locator('[data-folder-id="f2"] .folder-heading').click({ button: 'right' });
+    await page.getByRole('menu', { name: '分组操作', exact: true }).getByRole('button', { name: '移到最上面', exact: true }).click();
+    await expect.poll(() => folderSequence(sidebar(page))).toEqual(['主机 A/分组 2', '主机 A/分组 1', '主机 A/未分组']);
+    await openFolderManager(page);
+    const manager = dialog(page, '管理分组');
+    await expect.poll(() => managerSequence(manager)).toEqual(['主机 A/分组 2', '主机 A/分组 1', '主机 A/未分组']);
+    await manager.getByRole('button', { name: '拖动排序：分组 1（主机 A）', exact: true }).press('Home');
+    await manager.getByRole('button', { name: '保存', exact: true }).click();
+    await expect(manager).toHaveCount(0);
+    await expect.poll(() => folderSequence(sidebar(page))).toEqual(['主机 A/分组 1', '主机 A/分组 2', '主机 A/未分组']);
+    expect(await folders.read('owner')).toEqual(original);
+
+    // An explicit single-host filter still edits that host's canonical order.
+    await sidebar(page).getByRole('combobox', { name: '筛选运行主机' }).selectOption(hostId(a));
+    await openFolderManager(page);
+    await manager.getByRole('button', { name: '拖动排序：分组 2', exact: true }).press('Home');
+    await manager.getByRole('button', { name: '保存', exact: true }).click();
+    await expect(manager).toHaveCount(0);
+    await expect.poll(async () => (await folders.read('owner')).revision).toBe(original.revision + 1);
+    await expect.poll(() => folderSequence(sidebar(page))).toEqual(['分组 2', '分组 1', '未分组']);
+  } finally {
+    await page.close();
+    await a.close();
+    await b.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('desktop and phone interleave cross-host folders via actions and manager, persist across reload, and keep host ownership intact', async ({ page, browser }, info) => {
   test.setTimeout(150_000);
   const root = await mkdtemp(path.join(os.tmpdir(), 'cross-host-folder-order-'));

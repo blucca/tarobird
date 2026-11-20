@@ -1254,7 +1254,8 @@ test('discussion composer offers Bot names when typing at-sign', async ({ page }
   } finally { await f.close(); }
 });
 
-test('allowed speakers default to everyone and a single selection survives reload', async ({ page }, info) => {
+for (const width of [390, 1360]) test(`allowed speakers default to everyone and a single selection survives reload at ${width}px`, async ({ page }, info) => {
+  await page.setViewportSize({ width, height: 900 });
   const f = await setup(page);
   try {
     await configure(page, '轮流讨论', '1');

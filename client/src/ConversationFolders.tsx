@@ -60,7 +60,7 @@ export function FolderListOptions({ children, options, hosts, defaultConnection,
   const current = manager?.mode === 'single' ? hosts.find(host => host.connection === manager.host.connection) : undefined;
   useEffect(() => { setManager(undefined); }, [visible, scope, bulk?.active, combined]);
   useEffect(() => { if (manager?.mode === 'single' && !current) setManager(undefined); }, [manager, current]);
-  useEffect(() => { if (manager?.mode === 'cross' && hosts.length < 2) setManager(undefined); }, [manager, hosts.length]);
+  useEffect(() => { if (manager?.mode === 'cross' && !hosts.length) setManager(undefined); }, [manager, hosts.length]);
   useEffect(() => {
     const layout = matchMedia('(max-width:760px)'), close = () => setManager(undefined);
     layout.addEventListener('change', close);
@@ -71,7 +71,9 @@ export function FolderListOptions({ children, options, hosts, defaultConnection,
     const host = connection ? hosts.find(item => item.connection === connection) : hostId ? hosts.find(item => item.id === hostId) : hosts.find(item => item.connection === defaultConnection) ?? hosts[0];
     if (!visible || bulk?.active) return;
     trigger.current = element;
-    if (combined && hosts.length > 1) {
+    // The combined view can have only one ready host while another is opening
+    // or being removed. Its manager must still edit the same local order.
+    if (combined) {
       setManager({ mode: 'cross', defaultHostId: host?.id });
       return;
     }
@@ -80,7 +82,7 @@ export function FolderListOptions({ children, options, hosts, defaultConnection,
   } : undefined;
   return <><SidebarListOptions options={options} visible={visible} disabled={bulk?.active} scope={scope} manageFolders={manageFolders}>{children}</SidebarListOptions>
     {visible && !bulk?.active && manager?.mode === 'single' && current && createPortal(<RuntimeHostContext.Provider value={current.name}><FolderManager connection={current.connection} initialView="manage" returnFocus={trigger} close={() => setManager(undefined)}/></RuntimeHostContext.Provider>, document.body)}
-    {visible && !bulk?.active && manager?.mode === 'cross' && hosts.length > 1 && createPortal(<CrossHostFolderManager hosts={hosts} defaultHostId={manager.defaultHostId} returnFocus={trigger} close={() => setManager(undefined)}/>, document.body)}
+    {visible && !bulk?.active && manager?.mode === 'cross' && hosts.length > 0 && createPortal(<CrossHostFolderManager hosts={hosts} defaultHostId={manager.defaultHostId} returnFocus={trigger} close={() => setManager(undefined)}/>, document.body)}
   </>;
 }
 

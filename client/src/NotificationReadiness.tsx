@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, Info, RefreshCw, ChevronRight } from "lucide-react";
 import { nativePlatform } from "./native.js";
 import { t } from "./i18n.js";
 import { checkNotificationReadiness, reconnectSystemNotifications, type NotificationReadiness as Readiness } from "./notification-readiness.js";
-import { createDesktopNotificationShortcut, desktopNotificationDenied, desktopNotificationPermission } from "./desktop-notifications.js";
+import { createDesktopNotificationShortcut, desktopNotificationDenied, desktopNotificationPermission, type DesktopNotificationDiagnostics } from "./desktop-notifications.js";
 import { PUSH_FOREGROUND_EVENT } from "./push-maintenance.js";
 import type { HubConnection } from "./connection.js";
 import type { NotificationState } from "./notifications.js";
@@ -16,6 +16,7 @@ function copy(result: Readiness): [string, string] {
     // Windows "prompt": the unpackaged App has no notification profile yet.
     case "prompt": return windows ? [t("Windows 尚未登记通知"), t("TaroBird 还没有在 Windows 中登记通知。点「重新启用通知」会发出一条确认通知完成登记。")] : [t("尚未允许通知"), t("关闭后重新开启消息提醒，即可申请通知权限。")];
     case "shortcut": return [t("未找到开始菜单快捷方式"), t("未找到 TaroBird 的开始菜单快捷方式，Windows 需要它来显示通知。")];
+    case "windows-unverified": return [t("Windows 通知状态尚未确认"), t("提醒开关已保留，但 Windows 尚未确认当前通知设置。请检查系统通知设置后重新检查。")];
     case "channel-disabled": return [t("消息通知类别已关闭"), t("请在 Android 的 TaroBird 通知设置中开启消息通知类别，返回后重新检查。")];
     case "channel-missing": return [t("等待首次消息提醒"), t("权限与推送已连接，Android 会在首次提醒时创建通知类别；当前还无法检查该类别。")];
     case "unconfigured": return [t("主机推送尚未配置"), t("请让主机管理员恢复当前推送方式的配置，再重新检查。消息仍会正常同步。")];
@@ -29,9 +30,10 @@ function copy(result: Readiness): [string, string] {
   }
 }
 
-export function NotificationReadiness({ connection, state, online, working, refresh, repair }: {
+export function NotificationReadiness({ connection, state, online, working, refresh, repair, renderDiagnostics }: {
   connection: HubConnection; state: NotificationState; online: boolean; working: boolean;
   refresh: () => Promise<unknown>; repair: (work: () => Promise<void>) => Promise<void>;
+  renderDiagnostics: (value: DesktopNotificationDiagnostics) => ReactNode;
 }) {
   const [check, setCheck] = useState(0);
   const [expanded, setExpanded] = useState<boolean>();
@@ -96,6 +98,7 @@ export function NotificationReadiness({ connection, state, online, working, refr
       {reRegister && <button className="primary" disabled={working || !online} onClick={register}>{value?.reason === "shortcut" ? t("创建快捷方式并开启") : t("重新启用通知")}</button>}
       <button className="secondary" disabled={!online || working} aria-disabled={!value || working || !online} onClick={() => { if (!value || working || !online) return; setCheck(n => n + 1); setRepairFailed(false); void refresh(); }}>{t("检查接收状态")}</button>
     </div>
+    {value?.reason === "windows-unverified" && value.diagnostics && renderDiagnostics(value.diagnostics)}
     {repairFailed && <p role="alert" className="error-text">{t("恢复未完成，请重新检查后重试。不会更改你选择的推送方式。")}</p>}
     {repairError && <p role="alert" className="error-text">{repairError}</p>}
   </details>;

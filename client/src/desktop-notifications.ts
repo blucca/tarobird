@@ -60,7 +60,7 @@ const shortcutMissing = (diagnostics?: DesktopNotificationDiagnostics) => new De
 export async function desktopNotificationPermission(request: boolean): Promise<"granted" | "prompt" | "denied"> {
   // Windows registers an unpackaged App with its first toast. Only an explicit
   // request shows one visible confirmation; a read never shows or writes.
-  const args = request && nativePlatform() === "windows" ? { request, confirmation: { body: t("通知已开启。新消息会在这里提醒你。") } } : { request };
+  const args = request && nativePlatform() === "windows" ? { request, confirmation: { body: t("这是一条 TaroBird 测试通知，用于检查通知显示。") } } : { request };
   try { return await invoke("desktop_notification_permission", args); }
   catch (error) {
     const code = error instanceof Error ? error.message : String(error);

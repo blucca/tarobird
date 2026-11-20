@@ -401,13 +401,21 @@ function handleStorageEvent(event: StorageEvent): void {
   for (const listener of listeners) listener();
 }
 
+function listenForStorageChanges(): void {
+  if (storageListenerAttached || typeof window === 'undefined') return;
+  window.addEventListener('storage', handleStorageEvent);
+  storageListenerAttached = true;
+}
+
 export function readCrossHostFolderOrder(): StoredCrossHostFolderOrder {
+  listenForStorageChanges();
   if (cachedOrder) return cachedOrder;
   cachedOrder = readFromStorage();
   return cachedOrder;
 }
 
 export function writeCrossHostFolderOrder(next: StoredCrossHostFolderOrder): void {
+  listenForStorageChanges();
   const sanitized = parseStoredCrossHostFolderOrder(next);
   cachedOrder = sanitized;
   if (typeof localStorage !== 'undefined') {
@@ -426,17 +434,11 @@ export function writeCrossHostFolderOrder(next: StoredCrossHostFolderOrder): voi
 
 export function subscribeCrossHostFolderOrder(listener: () => void): () => void {
   listeners.add(listener);
-  if (!storageListenerAttached && typeof window !== 'undefined') {
-    window.addEventListener('storage', handleStorageEvent);
-    storageListenerAttached = true;
-  }
-  return () => {
-    listeners.delete(listener);
-    if (!listeners.size && storageListenerAttached && typeof window !== 'undefined') {
-      window.removeEventListener('storage', handleStorageEvent);
-      storageListenerAttached = false;
-    }
-  };
+  listenForStorageChanges();
+  // The cached store outlives its views, including host removal without a view.
+  // Keep one document-lifetime listener so hidden views cannot miss remote
+  // changes; reloading storage on remount would discard failed-write fallback.
+  return () => { listeners.delete(listener); };
 }
 
 export function removeCrossHostFolderOrderHost(hostKey: string): void {
@@ -474,4 +476,8 @@ export function applyCrossHostFolderPin(
 
 export function resetCrossHostFolderOrderCache(): void {
   cachedOrder = undefined;
+  if (storageListenerAttached && typeof window !== 'undefined') {
+    window.removeEventListener('storage', handleStorageEvent);
+    storageListenerAttached = false;
+  }
 }

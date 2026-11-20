@@ -481,11 +481,11 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
       const data = entry.host.id === currentId && !board ? current : directories[entry.host.id];
       return entry.connection && data ? [{ id: entry.host.id, name: entry.host.name, connection: entry.connection, conversations: data.conversations }] : [];
     });
-    const combinedFolders = !preferences.sidebarGroupByHost && bulkHosts.length > 1;
+    const combinedFolders = !preferences.sidebarGroupByHost && entries.length > 1;
     const bulkScope = (children: ReactNode) => <ConversationBulkProvider hosts={bulkHosts} showGroupHint={layout !== "conversations"} visible={board ? board.visible : !pairingVisible && currentId === activeId && !adhd} scopeKey={`${layout}:${filter}:${!!board}`} archived={(host, ids) => { if (!board) conversationsArchived(host.id, ids); }}><div className="host-directory"><ConversationBulkToolbar/><FolderListOptions hosts={bulkHosts} combined={combinedFolders} defaultConnection={toolbarHost?.connection} visible={board ? board.visible : !pairingVisible && currentId === activeId && !adhd} scope={`${layout}:${filter}:${!!board}:${preferences.sidebarGroupByHost}`} options={grouping}>{children}</FolderListOptions></div></ConversationBulkProvider>;
     if (board?.query && !entries.some(entry => dataFor(entry.host.id)?.conversations.some(c => !c.archived))) return bulkScope(<><p className="empty-sidebar">{t("没有找到对话，换个关键词试试。")}</p></>);
     const unavailable = (entry: ConnectedHost) => <button className="host-unavailable" onClick={() => setManaging(true)}>{entry.host.name} · {entry.host.state === "removing" ? t("等待完成移除") : entry.error ? t("无法打开主机，请重试") : t("正在连接主机…")}</button>;
-    if (!preferences.sidebarGroupByHost && entries.length > 1) {
+    if (combinedFolders) {
       const ready = entries.flatMap(entry => {
         const data = dataFor(entry.host.id);
         return entry.connection && data ? [{ id: entry.host.id, name: entry.host.name, connection: entry.connection, ...data, viewingHistory: viewingHistory(entry) }] : [];

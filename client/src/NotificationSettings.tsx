@@ -154,7 +154,7 @@ export function NotificationSettings({ connection, dirtyChange, busyChange }: { 
       {blocker && <div className="settings-callout" role="note"><Info size={16} aria-hidden="true"/><div><strong>{blocker.title}</strong><details className="settings-help"><summary>{t("如何开启提醒")}</summary><p>{blocker.detail}</p></details>{blocker.recheck && !loadFailed && retry}</div></div>}
     </div>
     <p className="settings-note muted">{desktop ? t("使用其他应用时接收系统通知；点按通知回到对应对话。完全退出 TaroBird 后不再提醒。") : t("离开 TaroBird 或锁屏后接收系统通知；点按通知回到对应对话。")}</p>
-    {enabled && <NotificationReadiness connection={connection} state={state} online={online} working={working} refresh={load} repair={(work) => act("repair", work)}/>}
+    {enabled && <NotificationReadiness connection={connection} state={state} online={online} working={working} refresh={load} repair={(work) => act("repair", work)} renderDiagnostics={value => <NotificationDiagnostics value={value}/>}/>}
     {loadNotice}
     {error?.area === "status" && <>
       <p role="alert" className="error-text">{error.text}</p>

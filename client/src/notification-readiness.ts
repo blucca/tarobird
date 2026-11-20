@@ -1,7 +1,7 @@
 import { PushNotifications } from "@capacitor/push-notifications";
 import { pushBindingSchema } from "../../src/client-protocol/push.js";
 import { nativePlatform } from "./native.js";
-import { DesktopNotificationShortcutError, desktopNotificationPermission, desktopNotificationsSupported } from "./desktop-notifications.js";
+import { DesktopNotificationShortcutError, desktopNotificationDiagnostics, desktopNotificationPermission, desktopNotificationsSupported, type DesktopNotificationDiagnostics } from "./desktop-notifications.js";
 import { UnifiedPush, unifiedState, pushScopeFor, withUnifiedChange } from "./unifiedpush.js";
 import { unifiedSubscription } from "./unifiedpush-controller.js";
 import { currentSystemPushToken, systemPushResetRevision } from "./native-push-token.js";
@@ -11,8 +11,8 @@ import type { NotificationState } from "./notifications.js";
 import { apnsTopicFor, ApnsTopicError, nativeApnsTopic, systemPushSubscription, type ApnsTopicIssue } from "./apns-topic.js";
 
 /** `shortcut`: Windows only, no Start Menu shortcut carries TaroBird's identity. */
-export type ReadinessReason = "ready" | "denied" | "prompt" | "shortcut" | "channel-disabled" | "channel-missing" | "unconfigured" | "unbound" | "subscription" | "unifiedpush" | "browser-subscription" | "unsupported" | "unknown" | "apns-topic";
-export type NotificationReadiness = { reason: ReadinessReason; provider?: "apns" | "fcm" | "webpush" | "unifiedpush"; channelAlerts?: { sound: boolean; vibration: boolean }; apnsTopic?: ApnsTopicIssue };
+export type ReadinessReason = "ready" | "denied" | "prompt" | "shortcut" | "windows-unverified" | "channel-disabled" | "channel-missing" | "unconfigured" | "unbound" | "subscription" | "unifiedpush" | "browser-subscription" | "unsupported" | "unknown" | "apns-topic";
+export type NotificationReadiness = { reason: ReadinessReason; provider?: "apns" | "fcm" | "webpush" | "unifiedpush"; channelAlerts?: { sound: boolean; vibration: boolean }; apnsTopic?: ApnsTopicIssue; diagnostics?: DesktopNotificationDiagnostics };
 /** Read only. In particular, do not obtain a token, register a worker, call
  * UnifiedPush.refresh, migrate a legacy registration, or request permission. */
 export async function checkNotificationReadiness(connection: HubConnection, _savedState: NotificationState, signal: AbortSignal): Promise<NotificationReadiness> {
@@ -24,6 +24,13 @@ export async function checkNotificationReadiness(connection: HubConnection, _sav
     let permission: Awaited<ReturnType<typeof desktopNotificationPermission>>;
     try { permission = await desktopNotificationPermission(false); }
     catch (error) { if (platform === "windows" && error instanceof DesktopNotificationShortcutError) return issue("shortcut"); throw error; }
+    if (platform === "windows" && permission === "granted") {
+      const diagnostics = await desktopNotificationDiagnostics();
+      signal.throwIfAborted();
+      // A successful Show allows the user's enable action but does not prove
+      // Windows can read an Enabled setting. Older shells omit diagnostics.
+      if (diagnostics && diagnostics.setting !== "enabled") return { ...issue("windows-unverified"), diagnostics };
+    }
     return issue(permission === "granted" ? "ready" : permission === "denied" ? "denied" : "prompt");
   }
   let missingChannel = false;

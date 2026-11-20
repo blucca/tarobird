@@ -12,6 +12,7 @@
 //     [--next-installer <newer Electron setup.exe>]        Electron -> Electron update
 //     [--native-tests <client/src-desktop-updater>]        ControlJob/guard/helper/handoff (needs cargo)
 //     [--scope install,upgrade,...]                        judge only these scopes (default: all)
+//     [--show-toast-probe]                                 after first-launch checks; changes Windows notification registration
 //
 // Every check is recorded as pass, fail or skip (with the reason); a skipped
 // check is NOT a pass. `info` records evidence that is never judged. The outcome is `pass` only when every required check of
@@ -198,18 +199,18 @@ async function verifyElectron(sys, report, phase, directory, version) {
   report.expect(phase, 'notification-aumid', apps.split(/\r?\n/).includes(AUMID), apps || `no Start app with AppID ${AUMID}`);
 }
 
-/** Record-only toast status probe for the installed AUMID (Windows PowerShell
- * 5.1 WinRT projection): Setting and the Notifications\Settings key before and
- * after one Show. Never judged: a Server runner without an interactive desktop
- * proves neither banner delivery nor Windows 10/11 behaviour. */
-export const TOAST_PROBE = `$ErrorActionPreference = 'Stop'
+/** Read-only by default: never register the production AUMID before App first
+ * launch. An explicit disposable-run option can request one Show afterwards.
+ * Neither probe proves banner delivery or Windows 10/11 behaviour. */
+function toastStatusProbe(show) {
+  return `$ErrorActionPreference = 'Stop'
 [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-[void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
 $id = '${AUMID}'
 $key = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings\\$id"
 function Code($e) { while ($e.InnerException) { $e = $e.InnerException }; '0x{0:X8}' -f $e.HResult }
 function Setting { try { [string][Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Setting } catch { Code $_.Exception } }
 $before = Setting; $keyBefore = Test-Path $key
+${show ? `[void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
 try {
   $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
   $xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>TaroBird acceptance probe</text></binding></visual></toast>')
@@ -217,13 +218,15 @@ try {
   $toast.Tag = 'probe'; $toast.Group = 'acceptance'
   [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Show($toast); $show = '0x00000000'
 } catch { $show = Code $_.Exception }
-Start-Sleep -Milliseconds 500
+Start-Sleep -Milliseconds 500` : "$show = 'not-requested'"}
 $after = Setting; $keyAfter = Test-Path $key
-try { [Windows.UI.Notifications.ToastNotificationManager]::History.Remove('probe', 'acceptance', $id) } catch {}
+${show ? "try { [Windows.UI.Notifications.ToastNotificationManager]::History.Remove('probe', 'acceptance', $id) } catch {}" : ''}
 "setting-before=$before key-before=$keyBefore show=$show setting-after=$after key-after=$keyAfter"`;
-async function probeToastStatus(sys, report, phase) {
+}
+export const TOAST_PROBE = toastStatusProbe(false);
+async function probeToastStatus(sys, report, phase, show = false) {
   try {
-    const result = await sys.powershell(TOAST_PROBE);
+    const result = await sys.powershell(show ? toastStatusProbe(true) : TOAST_PROBE);
     report.info(phase, 'notification-status-probe', result.code === 0 ? result.stdout.trim() : `probe exit ${result.code}: ${(result.stderr || result.stdout).trim().slice(-500)}`);
   } catch (error) { report.info(phase, 'notification-status-probe', `probe error: ${error instanceof Error ? error.message : String(error)}`); }
 }
@@ -354,7 +357,7 @@ async function phases(options, sys, report) {
   directory = await install(sys, report, 'install', options.installer, options.legacyInstaller ? ['/P', '/UPDATE'] : ['/S']) ?? directory;
   if (!directory) return;
   await verifyElectron(sys, report, 'install', directory, options.version);
-  // Before the App's first launch: the state a fresh install hands to the user.
+  // Before the App's first launch: observe without registering its AUMID.
   await probeToastStatus(sys, report, 'install');
   if (options.legacyInstaller) {
     // The Electron runtime lives in resources\host; the whole Tauri folder must be gone.
@@ -383,6 +386,11 @@ async function phases(options, sys, report) {
   else if (!credentialsBefore.length) report.add('first-launch', 'credentials-retained', 'skip', 'the old App stored no TaroBot credential (device keys appear only after pairing)');
   else report.expect('first-launch', 'credentials-retained', credentialsBefore.every(target => credentialsAfter.includes(target)), `${credentialsBefore.length} before, ${credentialsAfter.length} after`);
   await stopApp(sys, report, 'first-launch', first.session);
+
+  if (options.showToastProbe === true) {
+    report.info('notification-show', 'registration-side-effect', 'explicit --show-toast-probe after first-launch checks; may create the production AUMID notification profile');
+    await probeToastStatus(sys, report, 'notification-show', true);
+  }
 
   if (options.nextInstaller) {
     await install(sys, report, 'update', options.nextInstaller, ['/P', '/UPDATE']);
@@ -424,6 +432,7 @@ async function main() {
     installer: { type: 'string' }, 'legacy-installer': { type: 'string' }, 'next-installer': { type: 'string' },
     version: { type: 'string' }, 'next-version': { type: 'string' }, 'native-tests': { type: 'string' },
     report: { type: 'string' }, 'confirm-disposable-windows': { type: 'boolean', default: false }, scope: { type: 'string' },
+    'show-toast-probe': { type: 'boolean', default: false },
   } });
   const resolve = value => value && path.resolve(value);
   if (!values.installer || !values.report) throw new Error('--installer and --report are required');
@@ -435,7 +444,7 @@ async function main() {
   const nextVersion = values['next-version'] ?? (values['next-installer'] && /_(\d+\.\d+\.\d+)_/.exec(path.basename(values['next-installer']))?.[1]);
   const { report, meta } = await runAcceptance({
     installer: resolve(values.installer), legacyInstaller: resolve(values['legacy-installer']), nextInstaller: resolve(values['next-installer']),
-    version, nextVersion, nativeTests: resolve(values['native-tests']), confirmed: values['confirm-disposable-windows'], scopes,
+    version, nextVersion, nativeTests: resolve(values['native-tests']), confirmed: values['confirm-disposable-windows'], scopes, showToastProbe: values['show-toast-probe'],
   });
   await mkdir(reportDir, { recursive: true });
   const body = { outcome: report.outcome, missing: report.missing, ...meta, finishedAt: new Date().toISOString(), checks: report.checks };
