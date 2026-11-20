@@ -19,6 +19,10 @@ export const HISTORY_REWIND_CALL_MS = 60_000;
 export const HISTORY_FORK_CALL_MS = 120_000;
 /** A `started` operation with no answer this long becomes `unknown` and stops blocking dispatch. */
 export const HISTORY_UNKNOWN_AFTER_MS = 10 * 60_000;
+/** An `unknown` operation is asked again with its requestId only this long
+ * after it started; later the stored receipt stands (also the Gateway's
+ * retry window for a rewind receipt). */
+export const HISTORY_UNKNOWN_RETRY_MS = 24 * 60 * 60_000;
 export const HISTORY_REWIND_RANGES_MAX = 64;
 export const HISTORY_FORK_EXCERPT_MAX = 200;
 
@@ -170,7 +174,7 @@ export const historyBotErrorSchema = z.union([historyErrorSchema, z.literal("ope
 export const historyBotRewindReplySchema = z.discriminatedUnion("ok", [
   /** `throughMessageId`: the anchor's turn was already gone (an earlier
    * rewind of it landed); its range ends there, not at this request's edge. */
-  z.object({ ok: z.literal(true), restarted: z.literal(true).optional(), throughMessageId: id.optional() }).strict(),
+  z.object({ ok: z.literal(true), throughMessageId: id.optional() }).strict(),
   z.object({ ok: z.literal(false), error: historyBotErrorSchema }).strict(),
 ]);
 export const historyBotForkReplySchema = z.discriminatedUnion("ok", [

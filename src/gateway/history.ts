@@ -1,7 +1,7 @@
 import path from "node:path";
 import { z } from "zod";
 import {
-  historyBotForkCallSchema, historyBotForkReplySchema, historyBotRewindCallSchema, historyBotRewindReplySchema, historyBotStatusCallSchema,
+  HISTORY_UNKNOWN_RETRY_MS, historyBotForkCallSchema, historyBotForkReplySchema, historyBotRewindCallSchema, historyBotRewindReplySchema, historyBotStatusCallSchema,
   historyBotStatusSchema, historyErrorSchema, type EngineHistoryAnchor, type HistoryError, type HistoryHints, type HistoryLedgerLine,
 } from "../client-protocol/history.js";
 import { idSchema, type Json } from "../client-protocol/index.js";
@@ -19,7 +19,7 @@ import type { SessionRecord } from "../types.js";
 import { GatewayReceipts } from "./receipts.js";
 
 /** A rewind is re-entrant: an interrupted or failed receipt may run again. */
-const REWIND_RECEIPT_RETRY_MS = 24 * 60 * 60_000;
+const REWIND_RECEIPT_RETRY_MS = HISTORY_UNKNOWN_RETRY_MS;
 /** Ledger run id of an older run matched in the engine (no line of its own). */
 const RESOLVED_RUN_PREFIX = "resolved-";
 

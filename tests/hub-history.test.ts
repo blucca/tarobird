@@ -160,7 +160,7 @@ describe("rewind", () => {
 
     // A later rewind covering the first leaves one range.
     const wider = json(api(headers, `/api/conversations/${chat.id}/history/rewind`, { ...body, requestId: "r_3", beforeMessageId: seeded[0]!.input.id }));
-    bot.reply(await bot.next("instance.call", f => f.method === "history.rewind"), { ok: true, restarted: true });
+    bot.reply(await bot.next("instance.call", f => f.method === "history.rewind"), { ok: true });
     const widened = await wider;
     expect(widened.body).toMatchObject({ state: "completed", rewind: { fromMessageId: seeded[0]!.input.id, throughMessageId: last } });
     expect((await hub.store.conversations("owner")).find(c => c.id === chat.id)?.history).toEqual({ rewinds: [widened.body.rewind] });
@@ -229,6 +229,8 @@ describe("rewind", () => {
     const interrupted = json(api(headers, `/api/conversations/${chat.id}/history/fork`, { botId: "alpha", requestId: "x_2", throughMessageId: seeded[0]!.input.id, expectedLastMessageId: last }));
     bot.reply(await bot.next("instance.call", f => f.method === "history.fork"), { ok: false, error: "operation_interrupted" });
     expect((await interrupted).body).toMatchObject({ kind: "fork", state: "failed", error: "uncertain" });
+    // The failed fork keeps no snapshot of the source title or message.
+    expect(await hub.store.db.get("SELECT result_json FROM conversation_history_ops WHERE request_id='x_2'")).toEqual({ result_json: null });
     expect((await hub.store.conversations("owner")).map(c => c.id)).toEqual([chat.id]);
     expect((await hub.store.conversations("owner"))[0]!.history).toBeUndefined();
   });
@@ -458,6 +460,19 @@ describe("no answer", () => {
     expect(call.params).not.toHaveProperty("replayOnly");
     bot.reply(call, { ok: true });
     expect((await retried).body).toMatchObject({ state: "completed", replayed: true, rewind: { throughMessageId: last } });
+  });
+  it("stops asking an unknown operation again a day after it started; its receipt stands", async () => {
+    await hub.close(); await start({ ...fast, unknownAfterMs: 600, unknownRetryMs: 1500 });
+    const { headers, chat, seeded, last } = await fixture();
+    const bot = await gateway();
+    const body = { botId: "alpha", requestId: "d_1", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last };
+    expect((await json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body))).body).toMatchObject({ state: "started" });
+    await until(async () => (await json(api(headers, `/api/conversations/${chat.id}/history/operations/d_1`))).body.state === "unknown", 5000);
+    await wait(1600);
+    bot.frames.length = 0;
+    expect((await json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body))).body).toMatchObject({ state: "unknown", replayed: true });
+    await wait(100);
+    expect(bot.calls("history.rewind")).toEqual([]);
   });
   it("re-drives started operations after a Hub restart", async () => {
     const { headers, chat, seeded, last } = await fixture();

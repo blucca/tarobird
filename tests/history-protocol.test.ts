@@ -31,6 +31,11 @@ describe("history protocol (#53)", () => {
   it("lets the Gateway report an interrupted fork, which the App never sees", () => {
     expect(historyBotForkReplySchema.parse({ ok: false, error: "operation_interrupted" })).toBeTruthy();
     expect(historyBotRewindReplySchema.parse({ ok: true })).toBeTruthy();
+    expect(historyBotRewindReplySchema.parse({ ok: true, throughMessageId: "msg_z" })).toBeTruthy();
+    expect(historyBotRewindReplySchema.parse({ ok: false, error: "operation_pending" })).toBeTruthy();
+    // No Gateway produces a restarted context any more.
+    expect(() => historyBotRewindReplySchema.parse({ ok: true, restarted: true })).toThrow();
+    expect(() => historyOperationSchema.parse({ id: "hop_1", requestId: "r1", kind: "rewind", state: "started", error: "operation_pending" })).toThrow();
     expect(() => historyOperationSchema.parse({ id: "hop_1", requestId: "r1", kind: "fork", state: "failed", error: "operation_interrupted" })).toThrow();
   });
   it("shapes ledger lines and the upstream-rejection mark", () => {
