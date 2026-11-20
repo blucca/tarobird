@@ -106,7 +106,7 @@ for (const platform of ["macos", "windows"]) test(`blocked desktop permission gi
   expect(await page.evaluate(() => window.readinessFixture.nativeState.calls)).not.toContain("permission-request");
   await expect(page.getByRole("alert")).toContainText("系统通知已关闭");
   const recovery = page.locator(".notification-permission-help");
-  await expect(recovery).toContainText(platform === "macos" ? "系统设置 → 通知 → TaroBird" : "Windows 设置 → 系统 → 通知 → TaroBird");
+  await expect(recovery).toContainText(platform === "macos" ? "系统设置 → 通知 → TaroBird" : "Windows 设置 → 系统 → 通知（Windows 10 为「通知和操作」），在列表中找到 TaroBird");
   await expect(recovery).toContainText("返回此页重新开启消息提醒");
   await expect(toggle(page, "消息提醒")).toHaveAttribute("aria-checked", "false");
   await page.screenshot({ path: info.outputPath(`${platform}-permission-recovery.png`), fullPage: true });
@@ -175,4 +175,139 @@ test("reception diagnostics respect manual collapse on both a warning and a read
   await page.getByRole("button", { name: "检查接收状态", exact: true }).click();
   await expect(page.getByText("接收条件已就绪", { exact: true })).toBeVisible();
   await expect(details).toHaveAttribute("open");
+});
+
+// Windows: an unpackaged App has no notification profile until its first toast.
+const permissionCalls = (page: any) => page.evaluate(() => window.readinessFixture.nativeState.desktopCalls.filter((c: any) => c.command === "desktop_notification_permission").map((c: any) => c.args));
+const desktopCommands = (page: any) => page.evaluate(() => window.readinessFixture.nativeState.desktopCalls.map((c: any) => c.command));
+const recheck = async (page: any, name = "检查接收状态") => {
+  const details = page.locator("details.notification-readiness");
+  await expect(details.locator("summary strong")).not.toHaveText(/正在检查|Checking/);
+  if (!await details.evaluate((e: HTMLDetailsElement) => e.open)) await details.locator("summary").click();
+  await page.getByRole("button", { name, exact: true }).click();
+};
+const diagnostics = (extra: Record<string, unknown>) => ({ schema: 1, appId: "com.tarobot.client", identity: "verified", receipt: "valid", shortcut: "programs", steps: {}, os: "10.0.22631", ...extra });
+
+for (const locale of ["zh", "en"] as const) test(`Windows registers an unregistered App with one localized confirmation toast (${locale})`, async ({ page }) => {
+  const zh = locale === "zh";
+  await open(page, `platform=windows&enabled=false&lang=${locale}`);
+  await page.evaluate(() => { const n = window.readinessFixture.nativeState; n.permission = "prompt"; n.afterRequest = "granted"; });
+  await toggle(page, zh ? "消息提醒" : "Message alerts").click();
+  await expect(toggle(page, zh ? "消息提醒" : "Message alerts")).toHaveAttribute("aria-checked", "true");
+  expect(await permissionCalls(page)).toEqual([{ request: false }, { request: true, confirmation: { body: zh ? "通知已开启。新消息会在这里提醒你。" : "Notifications are on. New messages will show up here." } }, { request: false }]);
+  expect((await page.evaluate(() => window.readinessFixture.fixture.writes)).map((w: any) => w.body.enabled)).toEqual([true]);
+  await expect(page.getByText(zh ? "接收条件已就绪" : "Receiving requirements are ready", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page.getByText(zh ? "打开 Windows 通知设置后，在列表中选择 TaroBird。TaroBird 发出第一条通知后才会出现在该列表中。" : "Open Windows notification settings, then select TaroBird in the list. TaroBird appears there only after its first notification.", { exact: true })).toBeVisible();
+});
+
+test("macOS permission requests are unchanged: no confirmation text and no Windows diagnostics", async ({ page }) => {
+  await open(page, "platform=macos&enabled=false");
+  await page.evaluate(() => { const n = window.readinessFixture.nativeState; n.permission = "prompt"; n.afterRequest = "granted"; });
+  await toggle(page, "消息提醒").click();
+  await expect(toggle(page, "消息提醒")).toHaveAttribute("aria-checked", "true");
+  expect((await permissionCalls(page)).slice(0, 2)).toEqual([{ request: false }, { request: true }]);
+  await open(page, "platform=macos&enabled=false&permissionError=native_notification_permission_failed");
+  await toggle(page, "消息提醒").click();
+  await expect(page.getByRole("alert")).toHaveText("无法读取系统通知权限，请检查系统设置后重试。");
+  expect(await desktopCommands(page)).not.toContain("desktop_notification_diagnostics");
+  await expect(page.getByRole("button", { name: "复制诊断信息", exact: true })).toHaveCount(0);
+});
+
+for (const [setting, text, settings] of [
+  ["disabled_for_application", "Windows 已关闭 TaroBird 的通知。请在「设置 → 系统 → 通知」的列表中打开 TaroBird。", true],
+  ["disabled_for_user", "Windows 的通知总开关已关闭。请先在「设置 → 系统 → 通知」中打开。", true],
+  ["disabled_by_group_policy", "此电脑的管理策略禁用了通知，无法开启。", false],
+] as const) test(`Windows ${setting} is explained without a second request or a confirmation toast`, async ({ page }) => {
+  await open(page, "platform=windows&enabled=false");
+  await page.evaluate(setting => { const n = window.readinessFixture.nativeState; n.permission = "denied"; n.diagnostics = { schema: 1, appId: "com.tarobot.client", setting, steps: { setting: "0x00000000" } }; }, setting);
+  await toggle(page, "消息提醒").click();
+  await expect(page.getByRole("alert")).toHaveText(text);
+  expect(await permissionCalls(page)).toEqual([{ request: false }]);
+  await expect(page.locator(".notification-permission-help")).toHaveCount(settings ? 1 : 0);
+  await expect(page.getByRole("button", { name: "复制诊断信息", exact: true })).toBeVisible();
+  await expect(toggle(page, "消息提醒")).toHaveAttribute("aria-checked", "false");
+  expect(await page.evaluate(() => window.readinessFixture.fixture.writes)).toEqual([]);
+});
+
+for (const locale of ["zh", "en"] as const) test(`a missing Windows shortcut is created only after the user asks, then registered (${locale})`, async ({ page }, info) => {
+  const zh = locale === "zh";
+  await page.setViewportSize({ width: 1000, height: 900 });
+  await open(page, `platform=windows&enabled=false&lang=${locale}`);
+  await page.evaluate(() => { const n = window.readinessFixture.nativeState; n.permission = "prompt"; n.afterRequest = "granted"; n.readError = "native_notification_install_required"; n.diagnostics = { schema: 1, appId: "com.tarobot.client", identity: "missing", receipt: "missing", steps: {} }; });
+  await toggle(page, zh ? "消息提醒" : "Message alerts").click();
+  await expect(page.getByRole("alert")).toHaveText(zh ? "未找到 TaroBird 的开始菜单快捷方式，Windows 需要它来显示通知。" : "TaroBird's Start Menu shortcut is missing. Windows needs it to show notifications.");
+  expect(await desktopCommands(page)).not.toContain("desktop_notification_shortcut");
+  expect(await page.evaluate(() => window.readinessFixture.fixture.writes)).toEqual([]);
+  await page.screenshot({ path: info.outputPath(`windows-shortcut-${locale}.png`), fullPage: true });
+  await page.getByRole("button", { name: zh ? "创建快捷方式并开启" : "Create shortcut and turn on", exact: true }).click();
+  await expect(toggle(page, zh ? "消息提醒" : "Message alerts")).toHaveAttribute("aria-checked", "true");
+  const commands = await desktopCommands(page);
+  expect(commands.indexOf("desktop_notification_shortcut")).toBeGreaterThan(-1);
+  expect(commands.indexOf("desktop_notification_shortcut")).toBeLessThan(commands.lastIndexOf("desktop_notification_permission"));
+  expect((await permissionCalls(page)).filter((args: any) => args.request)).toHaveLength(1);
+  expect(await page.evaluate(() => window.readinessFixture.fixture.writes)).toHaveLength(1);
+});
+
+for (const width of [1000, 360]) test(`a Windows notification failure shows its HRESULT and copies path-free diagnostics at ${width}px`, async ({ page }, info) => {
+  await page.setViewportSize({ width, height: 900 });
+  await open(page, "platform=windows&enabled=false");
+  await page.evaluate(value => { const n = window.readinessFixture.nativeState; n.readError = "native_notification_platform_unavailable"; n.diagnostics = value;
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text: string) => { (window as any).copiedDiagnostics = text; } } }); },
+    diagnostics({ setting: "platform_unavailable", error: "native_notification_platform_unavailable", failure: { stage: "setting", code: "0x803E0105" }, steps: { setting: "0x803E0105", notifier: "0x00000000" } }));
+  await toggle(page, "消息提醒").click();
+  await expect(page.getByRole("alert")).toHaveText("Windows 通知服务不可用（代码 0x803E0105），暂时无法发送系统通知。");
+  await expect(page.getByText("代码 0x803E0105 · setting", { exact: true })).toBeVisible();
+  await expect(page.locator(".notification-permission-help")).toHaveCount(0);
+  await page.getByRole("button", { name: "复制诊断信息", exact: true }).click();
+  await expect(page.locator(".notification-diagnostics [role=status]")).toHaveText("诊断信息已复制");
+  const copied = await page.evaluate(() => (window as any).copiedDiagnostics);
+  expect(JSON.parse(copied)).toMatchObject({ app: "TaroBird", version: expect.stringMatching(/^\d+\.\d+\.\d+$/), appId: "com.tarobot.client", failure: { stage: "setting", code: "0x803E0105" }, os: "10.0.22631" });
+  expect(copied).not.toMatch(/[A-Za-z]:\\|\/Users\/|\.lnk/);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath(`windows-diagnostics-${width}.png`), fullPage: true });
+});
+
+test("Windows failure messages keep the HRESULT in both languages", async ({ page }) => {
+  for (const [error, failure, zh, en] of [
+    ["native_notification_identity_unresolved", "0x80070490", "Windows 无法把通知关联到 TaroBird（代码 0x80070490）。请重新安装 TaroBird，并保留开始菜单快捷方式。", "Windows couldn't link notifications to TaroBird (code 0x80070490). Reinstall TaroBird and keep the Start Menu shortcut."],
+    ["native_notification_permission_failed", "0x80004005", "无法完成 Windows 通知登记（代码 0x80004005）。", "Couldn't register TaroBird for Windows notifications (code 0x80004005)."],
+  ] as const) for (const locale of ["zh", "en"] as const) {
+    await open(page, `platform=windows&enabled=false&lang=${locale}&requestError=${error}`);
+    await page.evaluate(code => { const n = window.readinessFixture.nativeState; n.permission = "prompt"; n.diagnostics = { schema: 1, appId: "com.tarobot.client", setting: "unregistered", registration: "failed", failure: { stage: "confirm", code }, steps: { setting: "0x80070490", confirm: code } }; }, failure);
+    await toggle(page, locale === "zh" ? "消息提醒" : "Message alerts").click();
+    await expect(page.getByRole("alert")).toHaveText(locale === "zh" ? zh : en);
+    await expect(page.getByText(locale === "zh" ? `代码 ${failure} · confirm` : `Code ${failure} · confirm`, { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => window.readinessFixture.fixture.writes)).toEqual([]);
+  }
+});
+
+for (const locale of ["zh", "en"] as const) test(`Windows readiness re-registers an unregistered App without changing Hub preferences (${locale})`, async ({ page }) => {
+  const zh = locale === "zh";
+  await open(page, `platform=windows&lang=${locale}`);
+  await page.evaluate(() => { const n = window.readinessFixture.nativeState; n.permission = "prompt"; n.afterRequest = "granted"; });
+  await recheck(page, zh ? "检查接收状态" : "Check receiving status");
+  await expect(page.getByText(zh ? "Windows 尚未登记通知" : "Not yet registered with Windows", { exact: true })).toBeVisible();
+  await expect(page.getByText(zh ? "关闭后重新开启消息提醒，即可申请通知权限。" : "Turn reminders off and on again to request notification permission.", { exact: true })).toHaveCount(0);
+  expect((await permissionCalls(page)).every((args: any) => !args.request)).toBe(true);
+  await page.getByRole("button", { name: zh ? "重新启用通知" : "Re-enable notifications", exact: true }).click();
+  await expect(page.getByText(zh ? "接收条件已就绪" : "Receiving requirements are ready", { exact: true })).toBeVisible();
+  expect((await permissionCalls(page)).filter((args: any) => args.request)).toEqual([{ request: true, confirmation: { body: zh ? "通知已开启。新消息会在这里提醒你。" : "Notifications are on. New messages will show up here." } }]);
+  expect(await page.evaluate(() => window.readinessFixture.fixture.writes)).toEqual([]);
+});
+
+test("Windows readiness offers the shortcut repair and reports a refused creation", async ({ page }) => {
+  await open(page, "platform=windows");
+  await page.evaluate(() => { const n = window.readinessFixture.nativeState; n.permission = "prompt"; n.afterRequest = "granted"; n.readError = "native_notification_install_required"; n.shortcutFail = true; });
+  await recheck(page);
+  await expect(page.getByText("未找到开始菜单快捷方式", { exact: true })).toBeVisible();
+  expect(await desktopCommands(page)).not.toContain("desktop_notification_shortcut");
+  await page.getByRole("button", { name: "创建快捷方式并开启", exact: true }).click();
+  await expect(page.locator(".notification-readiness").getByRole("alert")).toHaveText("无法创建开始菜单快捷方式。请重新安装 TaroBird，并保留开始菜单快捷方式。");
+  expect((await permissionCalls(page)).filter((args: any) => args.request)).toEqual([]);
+  await page.evaluate(() => { window.readinessFixture.nativeState.shortcutFail = false; });
+  await page.getByRole("button", { name: "创建快捷方式并开启", exact: true }).click();
+  await expect(page.getByText("接收条件已就绪", { exact: true })).toBeVisible();
+  expect((await permissionCalls(page)).filter((args: any) => args.request)).toHaveLength(1);
+  expect(await page.evaluate(() => window.readinessFixture.fixture.writes)).toEqual([]);
 });

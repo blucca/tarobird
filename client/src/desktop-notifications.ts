@@ -5,29 +5,81 @@ import { idSchema } from "../../src/client-protocol/index.js";
 import type { PushPayload } from "../../src/client-protocol/push.js";
 import type { ListenerScope } from "./listener-scope.js";
 import { t } from "./i18n.js";
+import { nativePlatform } from "./native.js";
 
 const targetSchema = z.object({ hostId: z.string().regex(/^hub_[0-9a-f]{64}$/), conversationId: idSchema, messageId: idSchema }).strict();
 const actionSchema = z.object({ id: z.uuid(), ageMs: z.number().finite().nonnegative(), target: targetSchema }).strict();
 export type DesktopNotificationTarget = z.infer<typeof targetSchema>;
 export type DesktopNotificationIntent = { supersededAt: number; routing: boolean; changed?: () => void };
-/** Permission recovery is distinct from installation and Host write failures. */
-export class DesktopNotificationPermissionError extends Error {}
+const hresult = z.string().regex(/^0x[0-9A-F]{8}$/);
+const label = z.string().regex(/^[a-z0-9_]{1,48}$/);
+/** Windows-only native status for support: category labels and HRESULTs, no paths. */
+const diagnosticsSchema = z.object({
+  schema: z.number().int().optional(), appId: z.string().max(64).optional(), os: z.string().max(32).optional(),
+  identity: label.optional(), receipt: label.optional(), shortcut: label.optional(), repaired: label.optional(), setting: label.optional(),
+  settingsKey: z.boolean().optional(), registration: label.optional(), error: label.optional(),
+  failure: z.object({ stage: label, code: hresult }).strict().optional(),
+  steps: z.record(label, hresult).optional(),
+}).strict();
+export type DesktopNotificationDiagnostics = z.infer<typeof diagnosticsSchema>;
+type ErrorDetails = { diagnostics?: DesktopNotificationDiagnostics; systemSettings?: boolean };
+/** Permission recovery is distinct from installation and Host write failures.
+ * `systemSettings: false`: the system settings page cannot fix this cause. */
+export class DesktopNotificationPermissionError extends Error {
+  readonly diagnostics?: DesktopNotificationDiagnostics; readonly systemSettings: boolean;
+  constructor(message: string, { diagnostics, systemSettings = true }: ErrorDetails = {}) { super(message); this.diagnostics = diagnostics; this.systemSettings = systemSettings; }
+}
+/** Windows: no Start Menu shortcut carries TaroBird's notification identity.
+ * Only an explicit user action may create one (`createDesktopNotificationShortcut`). */
+export class DesktopNotificationShortcutError extends Error {
+  readonly diagnostics?: DesktopNotificationDiagnostics;
+  constructor(message: string, diagnostics?: DesktopNotificationDiagnostics) { super(message); this.diagnostics = diagnostics; }
+}
 let supported: Promise<boolean> | undefined;
 let lastHandled: string | undefined;
 export function desktopNotificationsSupported(): Promise<boolean> {
   return supported ??= invoke<boolean>("desktop_notifications_supported").catch((error) => { supported = undefined; throw error; });
 }
+/** Never throws; `undefined` off Windows or from an older native shell. */
+export async function desktopNotificationDiagnostics(): Promise<DesktopNotificationDiagnostics | undefined> {
+  if (nativePlatform() !== "windows") return undefined;
+  try { const parsed = diagnosticsSchema.safeParse(await invoke("desktop_notification_diagnostics")); return parsed.success ? parsed.data : undefined; }
+  catch { return undefined; }
+}
+/** Windows reports why it disables notifications; other systems keep one message. */
+export async function desktopNotificationDenied(): Promise<DesktopNotificationPermissionError> {
+  const diagnostics = await desktopNotificationDiagnostics();
+  switch (diagnostics?.setting) {
+    case "disabled_for_application": return new DesktopNotificationPermissionError(t("Windows 已关闭 TaroBird 的通知。请在「设置 → 系统 → 通知」的列表中打开 TaroBird。"), { diagnostics });
+    case "disabled_for_user": return new DesktopNotificationPermissionError(t("Windows 的通知总开关已关闭。请先在「设置 → 系统 → 通知」中打开。"), { diagnostics });
+    case "disabled_by_group_policy": return new DesktopNotificationPermissionError(t("此电脑的管理策略禁用了通知，无法开启。"), { diagnostics, systemSettings: false });
+  }
+  return new DesktopNotificationPermissionError(t("系统通知已关闭。请在系统设置中允许 TaroBird 通知。"), { diagnostics });
+}
+const shortcutMissing = (diagnostics?: DesktopNotificationDiagnostics) => new DesktopNotificationShortcutError(t("未找到 TaroBird 的开始菜单快捷方式，Windows 需要它来显示通知。"), diagnostics);
 export async function desktopNotificationPermission(request: boolean): Promise<"granted" | "prompt" | "denied"> {
-  try { return await invoke("desktop_notification_permission", { request }); }
+  // Windows registers an unpackaged App with its first toast. Only an explicit
+  // request shows one visible confirmation; a read never shows or writes.
+  const args = request && nativePlatform() === "windows" ? { request, confirmation: { body: t("通知已开启。新消息会在这里提醒你。") } } : { request };
+  try { return await invoke("desktop_notification_permission", args); }
   catch (error) {
     const code = error instanceof Error ? error.message : String(error);
-    if (code === "native_notification_install_required") throw new Error(t("请重新安装 TaroBird，并保留开始菜单快捷方式，才能使用 Windows 通知。"));
+    const diagnostics = await desktopNotificationDiagnostics(), failure = diagnostics?.failure?.code;
+    if (code === "native_notification_install_required") throw shortcutMissing(diagnostics);
     if (code === "native_notification_windows_version") throw new Error(t("桌面通知需要 Windows 10 1703 或更新版本。"));
     if (code === "native_notification_bundle_required") throw new Error(t("请从安装后的 TaroBird 应用中开启系统通知。"));
+    if (code === "native_notification_platform_unavailable") throw new DesktopNotificationPermissionError(failure ? t("Windows 通知服务不可用（代码 {0}），暂时无法发送系统通知。", failure) : t("Windows 通知服务不可用，暂时无法发送系统通知。"), { diagnostics, systemSettings: false });
+    if (code === "native_notification_identity_unresolved") throw new DesktopNotificationPermissionError(t("Windows 无法把通知关联到 TaroBird（代码 {0}）。请重新安装 TaroBird，并保留开始菜单快捷方式。", failure ?? "0x80070490"), { diagnostics, systemSettings: false });
     if (request && code === "native_notification_timeout") throw new DesktopNotificationPermissionError(t("系统通知授权尚未完成，请检查系统通知设置。"));
-    if (request) throw new DesktopNotificationPermissionError(t("无法完成系统通知授权，请检查系统通知设置。"));
-    throw new DesktopNotificationPermissionError(t("无法读取系统通知权限，请检查系统设置后重试。"));
+    if (request) throw new DesktopNotificationPermissionError(failure ? t("无法完成 Windows 通知登记（代码 {0}）。", failure) : t("无法完成系统通知授权，请检查系统通知设置。"), { diagnostics });
+    throw new DesktopNotificationPermissionError(failure ? t("无法读取 Windows 通知状态（代码 {0}）。", failure) : t("无法读取系统通知权限，请检查系统设置后重试。"), { diagnostics });
   }
+}
+/** Windows tier-3 identity repair, only from the user's explicit click (for
+ * example after a `/NS` install): create `Programs\TaroBird.lnk` with our AUMID. */
+export async function createDesktopNotificationShortcut(): Promise<void> {
+  try { await invoke<void>("desktop_notification_shortcut"); }
+  catch { throw new DesktopNotificationShortcutError(t("无法创建开始菜单快捷方式。请重新安装 TaroBird，并保留开始菜单快捷方式。"), await desktopNotificationDiagnostics()); }
 }
 // Tauri schedules async commands independently. Enforce ordering before IPC:
 // a clear must run after earlier show RPCs settle, including a not-yet-polled

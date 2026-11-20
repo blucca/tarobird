@@ -55,13 +55,17 @@ plugins.TaroCubUnifiedPush = {
 };
 if (["macos", "windows"].includes(nativeState.platform)) {
   Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: async (command: string, args?: { request?: boolean }) => {
-    nativeState.calls.push(command);
+    nativeState.calls.push(command); nativeState.desktopCalls.push({ command, args: args && JSON.parse(JSON.stringify(args)) });
     if (command === "desktop_notifications_supported") return true;
     if (command === "desktop_notification_permission") {
       nativeState.calls.push(args?.request ? "permission-request" : "permission-read");
-      if (params.get(args?.request ? "requestError" : "permissionError")) throw params.get(args?.request ? "requestError" : "permissionError");
+      const error = args?.request ? params.get("requestError") : nativeState.readError ?? params.get("permissionError");
+      if (error) throw error;
+      if (args?.request && nativeState.afterRequest) { nativeState.permission = nativeState.afterRequest; nativeState.afterRequest = undefined; }
       return nativeState.permission;
     }
+    if (command === "desktop_notification_diagnostics") { if (nativeState.diagnostics === undefined) throw new Error("unknown_desktop_command"); return nativeState.diagnostics; }
+    if (command === "desktop_notification_shortcut") { if (nativeState.shortcutFail) throw new Error("native_notification_registration_failed"); nativeState.readError = ""; return null; }
     if (command === "desktop_notification_settings") return openSystemSettings();
     if (nativeState.settingsFail) throw new Error("settings_unavailable");
   } } });

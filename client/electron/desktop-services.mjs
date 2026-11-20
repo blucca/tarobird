@@ -48,7 +48,7 @@ export class DesktopServices {
       afterInstall: installed => this.finishInstall(installed),
       version: electron.app.getVersion(), quit: () => electron.app.quit(), relaunch: () => { if (!restart) throw new Error('restart_unavailable'); restart(); },
     });
-    this.notifications = new DesktopNotifications(window, addon, (name, payload) => this.emit(name, payload));
+    this.notifications = new DesktopNotifications(window, addon, (name, payload) => this.emit(name, payload), { platform, shell: electron.shell });
     // Workbench web partitions: registry of partition→Host for Host removal, and
     // Chromium's Partitions directory to confirm a partition exists before clearing.
     const appPath = name => { try { return electron.app.getPath(name); } catch { return undefined; } }, userData = appPath('userData'), sessionData = appPath('sessionData');

@@ -19,7 +19,8 @@ export const DESKTOP_COMMANDS = Object.freeze([
   'desktop_launch_links', 'desktop_autostart_get', 'desktop_autostart_set', 'unread_count', 'desktop_notification_settings',
   'desktop_save_begin', 'desktop_save_write', 'desktop_save_commit', 'desktop_save_cancel', 'open_saved_file', 'reveal_saved_file',
   'desktop_notifications_supported', 'desktop_notification_permission', 'desktop_notification_context', 'desktop_notification_show',
-  'desktop_notification_clear', 'desktop_notification_peek', 'desktop_notification_ack', 'capture_screenshot',
+  'desktop_notification_clear', 'desktop_notification_peek', 'desktop_notification_ack', 'desktop_notification_diagnostics',
+  'desktop_notification_shortcut', 'capture_screenshot',
   // Main-owned workbench pages (WebContentsView). Distinct from desktop_open_url,
   // which keeps opening the system browser.
   'workbench_browser', 'workbench_browser_layout',

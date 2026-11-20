@@ -2139,6 +2139,15 @@ and the existing network/run/delete suites listed in that audit.
   fence late sends/clears across reload; Mac query cleanup callbacks retire on exit.
   Cross-target module checker: `src-tauri/audit/windows-notifications/`.
   [Implementation, reviews and Windows build limits](client/windows-notifications-2026-10-11.md).
+  `windows_status.rs` holds the platform-free policy: an unreadable Setting
+  (ERROR_NOT_FOUND before the first toast) is `prompt`, never denied; only an
+  explicit Disabled* setting blocks a send. `permission(true)` (user action only)
+  shows one localized confirmation toast, then re-reads; identity self-heal tiers
+  1-3 (tier 3 = `desktop_notification_shortcut` after a click), tier 4 registry
+  AUMID not implemented. `desktop_notification_diagnostics` is path-free. Tests:
+  Rust `windows_status::`, `electron/tests/notifications.test.mjs`, Windows cases in
+  `notification-design`; record-only CI probe `windows_toast_status_probe`.
+  [First-toast registration and real-device gaps](client/windows-notification-first-toast-2026-11-20.md).
   [Ordinary r38 macOS acceptance](client/native-r38-2026-10-11.md) records actual
   background notification banner delivery. Native clicks, Windows delivery/installer
   and physical-phone acceptance remain gates.

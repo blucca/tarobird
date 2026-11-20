@@ -28,6 +28,15 @@ pub fn activation_args(args: &[String]) -> Option<Target> {
     if args.len() != 2 { return None; }
     activation_target(&args[1])
 }
+/// The registration confirmation only focuses the window: it names no Host,
+/// conversation or message and never enters the native Inbox.
+pub const READY_URL: &str = "tarocub://notification/ready";
+pub const CONFIRMATION_TAG: &str = "ready";
+/// Host groups are 64 hex characters, so this group cannot collide with one.
+pub const CONFIRMATION_GROUP: &str = "app";
+/// Used only if an older renderer sends no localized confirmation text.
+pub const DEFAULT_CONFIRMATION: &str = "通知已开启。Notifications are on.";
+pub fn ready_activation(args: &[String]) -> bool { args.len() == 2 && args[1] == READY_URL }
 
 fn xml_text(value: &str) -> String {
     let mut escaped = String::new();
@@ -49,6 +58,12 @@ pub fn toast_xml(notice: &Notice) -> Result<String, String> {
     let (title, body) = notice.display();
     Ok(format!("<toast activationType=\"protocol\" launch=\"{}\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
         xml_text(&activation_url(&notice.target())?), xml_text(&title), xml_text(&body)))
+}
+/// Visible registration toast. The renderer supplies the localized body.
+pub fn confirmation_xml(body: &str) -> Result<String, String> {
+    let length = body.encode_utf16().count();
+    if length == 0 || length > 200 || body.trim().is_empty() { return Err("invalid_notification".into()); }
+    Ok(format!("<toast activationType=\"protocol\" launch=\"{READY_URL}\"><visual><binding template=\"ToastGeneric\"><text>TaroBird</text><text>{}</text></binding></visual></toast>", xml_text(body)))
 }
 pub fn host_group(host: &str) -> Result<&str, String> {
     if !super::state::valid_host(host) { return Err("invalid_notification_host".into()); }
@@ -87,6 +102,25 @@ mod tests {
         let xml = toast_xml(&notice).unwrap();
         assert!(xml.contains("<text>「A &amp; &lt;B&gt;」 · CC1</text><text>回复完成：已修复。</text>"));
         assert!(!xml.contains("<text>TaroBird</text>"));
+    }
+    #[test]
+    fn confirmation_toast_is_escaped_bounded_and_only_focuses() {
+        let xml = confirmation_xml("通知已开启 <b>&</b>").unwrap();
+        assert!(xml.contains("launch=\"tarocub://notification/ready\""));
+        assert!(xml.contains("<text>TaroBird</text><text>通知已开启 &lt;b&gt;&amp;&lt;/b&gt;</text>"));
+        assert!(!xml.contains("<action") && !xml.contains("<b>"));
+        assert!(confirmation_xml(&"字".repeat(200)).is_ok());
+        for bad in [String::new(), "  ".into(), "a".repeat(201), "😀".repeat(101)] { assert!(confirmation_xml(&bad).is_err(), "{bad}"); }
+        assert!(confirmation_xml(DEFAULT_CONFIRMATION).is_ok());
+        // Strict: the confirmation URL is never a routable notification target.
+        assert!(activation_target(READY_URL).is_none());
+        assert!(ready_activation(&["app.exe".into(), READY_URL.into()]));
+        for bad in [format!("{READY_URL}?x=1"), format!("{READY_URL}/"), format!("{READY_URL}#a"), "tarocub://notification/Ready".into(), "tarocub://conversation/ready".into()] {
+            assert!(!ready_activation(&["app.exe".into(), bad.clone()]), "{bad}");
+        }
+        assert!(!ready_activation(&[READY_URL.into()]));
+        assert!(!ready_activation(&["app.exe".into(), READY_URL.into(), "extra".into()]));
+        assert_ne!(CONFIRMATION_GROUP.len(), 64);
     }
     #[test]
     fn host_cleanup_groups_keep_full_identity_and_reject_invalid_values() {
