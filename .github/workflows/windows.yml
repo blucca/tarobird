@@ -56,3 +56,56 @@ jobs:
         shell: pwsh
         timeout-minutes: 4
         run: node client/scripts/acceptance-probe/lang-watch-probe.mjs "$env:RUNNER_TEMP\ui-probe.noindex\ui-probe.exe" "$env:RUNNER_TEMP\ui-probe.noindex\work"
+  host-contract:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Acceptance-only guard (disposable GitHub-hosted runner, no uploads)
+        shell: pwsh
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Probe runs only on a disposable GitHub-hosted runner" }
+          if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "This probe runs only from an accept/* branch" }
+          foreach ($d in @("$env:APPDATA\com.tarobot.client", "$env:LOCALAPPDATA\com.tarobot.client", "$env:APPDATA\com.tarocub.client", "$env:LOCALAPPDATA\com.tarocub.client")) { if (Test-Path -LiteralPath $d) { throw "unexpected existing $d on a fresh runner" } }
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build only the installer helper
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/helper-probe.noindex
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --manifest-path client/src-desktop-updater/Cargo.toml --locked --bin tarobot-installer-helper --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "helper did not build" }
+      - name: Host contract of --confirm-host-stopped-v2 and --prepare-fresh-install-v2
+        shell: pwsh
+        run: |
+          $helper = "$env:RUNNER_TEMP\helper-probe.noindex\x86_64-pc-windows-msvc\debug\tarobot-installer-helper.exe"
+          $roam = "$env:APPDATA\com.tarobot.client\host"; $local = "$env:LOCALAPPDATA\com.tarobot.client\host"
+          $lock = '{"pid":' + $PID + '}'
+          function Run([string]$flag) { & $helper $flag 2>$null | Out-Null; return $LASTEXITCODE }
+          function Roots { @("$env:APPDATA\com.tarobot.client", "$env:LOCALAPPDATA\com.tarobot.client") | Where-Object { Test-Path -LiteralPath $_ } }
+          $results = [ordered]@{}; $fail = @()
+          function Check([string]$id, [int]$got, [int]$want) { $script:results[$id] = $got; if ($got -ne $want) { $script:fail += "$id=$got (want $want)" } }
+          New-Item -ItemType Directory -Force $roam | Out-Null; Set-Content -LiteralPath "$roam\instance.lock.json" -Value $lock -NoNewline
+          Check 'roaming-lock confirm' (Run '--confirm-host-stopped-v2') 41
+          $before = @(Roots); Check 'roaming-lock prepare' (Run '--prepare-fresh-install-v2') 41
+          if ((@(Roots) -join '|') -ne ($before -join '|')) { $fail += 'roaming-lock prepare moved data' }
+          Remove-Item -LiteralPath "$roam\instance.lock.json"
+          New-Item -ItemType Directory -Force $local | Out-Null; Set-Content -LiteralPath "$local\instance.lock.json" -Value $lock -NoNewline
+          $results['local-lock confirm (contract: Host directory is Roaming only)'] = (Run '--confirm-host-stopped-v2')
+          $before = @(Roots); Check 'local-lock prepare' (Run '--prepare-fresh-install-v2') 41
+          if ((@(Roots) -join '|') -ne ($before -join '|')) { $fail += 'local-lock prepare moved data' }
+          Remove-Item -LiteralPath "$local\instance.lock.json"
+          Set-Content -LiteralPath "$roam\host-service.json" -Value '{}' -NoNewline
+          Check 'roaming-service confirm' (Run '--confirm-host-stopped-v2') 40
+          $before = @(Roots); Check 'roaming-service prepare' (Run '--prepare-fresh-install-v2') 40
+          if ((@(Roots) -join '|') -ne ($before -join '|')) { $fail += 'roaming-service prepare moved data' }
+          Remove-Item -LiteralPath "$roam\host-service.json"
+          Check 'no-owner confirm' (Run '--confirm-host-stopped-v2') 0
+          $results | ConvertTo-Json -Compress
+          if ($fail.Count) { throw "PROBE FAIL: $($fail -join '; ')" }
+          'PROBE PASS: a live lock or shared service in the Roaming Host directory blocks both; a LocalAppData lock blocks the backup'
