@@ -1,5 +1,6 @@
 // The shared remote screen reason table (#48/#49 P1). `check-translations`
 // only sees literal t("…") calls, so this keeps every table entry translated.
+import { readFileSync } from "node:fs";
 import { afterEach, expect, it, vi } from "vitest";
 import english from "../client/src/locales/en.json" with { type: "json" };
 import { setLocale } from "../client/src/i18n.js";
@@ -54,4 +55,40 @@ it("the target decides the sentence; an unknown reason is the same bounded code 
   vi.stubGlobal("document", { documentElement: { lang: "zh-CN" } });
   setLocale("en");
   expect(screenError("screen_input_denied", "windows")).toBe((english as Record<string, string>)[SCREEN_ERROR_MESSAGES_WINDOWS.screen_input_denied!]);
+});
+
+it("every terminal reason a Host, mobile native session or viewer can end a connection with has its own sentence", () => {
+  // Mobile sessions keep the Host's validated close reason (#49), so a reason
+  // without an entry would show the generic sentence with a raw code.
+  const read = (file: string) => readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+  const sources: Array<[string, RegExp]> = [
+    ["src/hub/remote-screen.ts", /(?:closeSession|serviceLost)\([^,()]+,\s*"([a-z_]+)"/g],
+    // A lease release shows its reason in the viewer state, except the two the Host hides.
+    ["src/hub/remote-screen.ts", /release\(live,\s*"((?!screen_control_stopped"|screen_stream_changed")screen_[a-z_]+)"/g],
+    ["src/hub/remote-screen-sockets.ts", /stop\((?:reason = )?"(screen_[a-z_]+)"/g],
+    ["client/android/app/src/main/java/com/tarobot/client/HubScreenSession.java", /close\("(screen_[a-z_]+)"\)/g],
+    ["client/ios/App/App/HubScreenSession.swift", /(?:fail|HubNetworkError)\("(screen_[a-z_]+)"\)/g],
+    ["client/src/remote-screen-viewer.ts", /(?:new Error|this\.fail)\("(screen_[a-z_]+)"\)/g],
+  ];
+  // The target service's stop and lease-denied events are enumerated, not literal calls.
+  const protocol = read("src/client-protocol/remote-screen.ts");
+  for (const type of ["stop", "lease-denied"]) {
+    const line = protocol.split("\n").find(value => value.includes(`type: z.literal("${type}")`) && value.includes("reason: z.enum("));
+    expect(line, type).toBeTruthy();
+    const listed = [...line!.matchAll(/"(screen_[a-z_]+)"/g)].map(match => match[1]!);
+    expect(listed.length, type).toBeGreaterThan(0);
+    for (const reason of listed) expect(SCREEN_ERROR_MESSAGES[reason], `${type}: ${reason}`).toBeTruthy();
+  }
+  const missing: string[] = [];
+  for (const [file, pattern] of sources) {
+    const reasons = [...read(file).matchAll(pattern)].map(match => match[1]!);
+    expect(reasons.length, file).toBeGreaterThan(0);
+    for (const reason of reasons) if (!SCREEN_ERROR_MESSAGES[reason]) missing.push(`${file}: ${reason}`);
+  }
+  expect([...new Set(missing)]).toEqual([]);
+  // The Android close path accepts only the bounded Host form; its fallback is covered too.
+  expect(SCREEN_ERROR_MESSAGES.screen_network_closed).toBeTruthy();
+  expect(screenError("screen_permission_revoked", "windows")).toBe(screenError("screen_permission_revoked"));
+  expect(screenError("screen_attach_timeout", "windows")).toBe(screenError("screen_connect_timeout", "windows"));
+  expect(screenError("screen_socket_timeout")).toBe(screenError("screen_network_timeout"));
 });

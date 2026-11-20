@@ -64,8 +64,12 @@ the ordinary request's absolute resource duration, and is cancelled when the
 screen group closes; other groups and chat retain their own lifetime.
 
 A Host close frame with code 4000 and a bounded `screen_[a-z_]` reason remains
-the session's terminal reason on both platforms; any other close reports a
-generic network closure.
+the session's terminal reason on both platforms, as do the exact sign-in codes
+`session_expired`, `device_revoked` and `device_revoked_or_expired` (a screen
+session ends with its sign-in, within 15 minutes); any other close reports a
+generic network closure. Every terminal reason the Host, a native session or
+the viewer can end a connection with has its own explanation;
+`tests/client-screen-errors.test.ts` scans those sources to keep it so.
 The iOS attach deadline starts when both sockets resume, after route
 preparation, so a slow identity check does not consume it.
 

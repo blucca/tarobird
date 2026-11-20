@@ -106,9 +106,16 @@ final class HubScreenSession {
             public void activity() { synchronized(owner) { if(isMedia) mediaActivity=System.nanoTime(); else controlActivity=System.nanoTime(); } }
             public void message(String text) { synchronized(owner) { try { requireLive(); receive(isMedia,text); } catch(Exception error) { close("screen_protocol_invalid"); } } }
             public void binary(ByteBuffer bytes) { synchronized(owner) { try { requireLive(); if(!isMedia) throw invalid(); receiveBinary(bytes); } catch(Exception error) { close("screen_protocol_invalid"); } } }
-            public void closed(int code,String reason,boolean clean) { synchronized(owner) { close(clean && code==4000 && reason!=null && reason.matches("screen_[a-z_]{1,57}") ? reason : "screen_network_closed"); } }
+            public void closed(int code,String reason,boolean clean) { synchronized(owner) { close(hostCloseReason(code,reason,clean)); } }
             public void failed(Exception error) { synchronized(owner) { close("screen_network_closed"); } if(HubTls.trustFailure(error)) trustFailed.run(); }
         };
+    }
+    /** A clean Host close keeps its bounded screen_ reason, or one of the exact
+     * sign-in codes the Host also ends a session with; anything else is generic. */
+    static String hostCloseReason(int code,String reason,boolean clean) {
+        if(!clean || code!=4000 || reason==null) return "screen_network_closed";
+        if(reason.equals("session_expired") || reason.equals("device_revoked") || reason.equals("device_revoked_or_expired")) return reason;
+        return reason.matches("screen_[a-z_]{1,57}") ? reason : "screen_network_closed";
     }
     private void receive(boolean isMedia,String text) throws Exception {
         int size=text.getBytes(StandardCharsets.UTF_8).length; if(size>CONTROL_LIMIT) throw invalid();

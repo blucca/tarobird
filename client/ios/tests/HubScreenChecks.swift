@@ -100,7 +100,13 @@ final class ScreenClock: @unchecked Sendable {
             (4000, "screen_Locked", nil, "uppercaseReasonIsGeneric"),
             (4000, "screen_locked🔒", nil, "unicodeReasonIsGeneric"),
             (4000, "screen_" + String(repeating: "a", count: 58), nil, "oversizedReasonIsGeneric"),
-            (4000, "screen_" + String(repeating: "a", count: 57), nil, "maximumBoundedReasonIsPreserved")
+            (4000, "screen_" + String(repeating: "a", count: 57), nil, "maximumBoundedReasonIsPreserved"),
+            (4000, "session_expired", nil, "sessionExpiredIsPreserved"),
+            (4000, "device_revoked", "media", "deviceRevokedIsPreserved"),
+            (4000, "device_revoked_or_expired", "control", "deviceRevokedOrExpiredIsPreserved"),
+            (4000, "session_expired\n", nil, "authReasonNewlineIsGeneric"),
+            (4000, "session_expire", nil, "authReasonPrefixIsGeneric"),
+            (4001, "session_expired", nil, "authReasonOtherCodeIsGeneric")
         ]
         for (code, reason, role, name) in cases {
             let value = join(), id = try await open(manager, log, fixture, document, value)

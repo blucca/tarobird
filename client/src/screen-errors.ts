@@ -83,6 +83,41 @@ export const SCREEN_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.fr
   screen_control_timeout: "目标 Mac 未确认控制，请检查权限后重试。",
   screen_frame_or_lease_expired: "控制已暂停，请等待新画面后重新开始控制。",
   screen_frame_stale: "画面暂未更新，控制已停止，请等待新画面。",
+  // Terminal reasons the Host, a native mobile session or the viewer can end a
+  // connection with. Mobile now keeps the Host's validated close reason, so
+  // each needs its own sentence instead of the generic text with a code.
+  screen_permission_revoked: "远程屏幕已关闭，或此设备的授权已撤销。请检查目标电脑的授权后重新连接。",
+  screen_stopped: "主机已停止这次屏幕连接，需要时可重新连接。",
+  screen_host_stopped: "主机已停止运行，屏幕连接已断开。请在主机恢复后重新连接。",
+  device_revoked: "此设备与主机的配对已被撤销，请重新配对后再连接。",
+  screen_disconnected: "屏幕连接已断开。",
+  screen_stream_invalid: "屏幕画面数据异常，连接已断开，请重新连接。",
+  screen_frame_invalid_or_stale: "屏幕画面数据异常，连接已断开，请重新连接。",
+  screen_generation_exhausted: "屏幕画面数据异常，连接已断开，请重新连接。",
+  screen_input_rate_limited: "输入过于频繁，屏幕连接已断开，请重新连接。",
+  screen_desktop_changed: "目标电脑的桌面服务已变更，请重新连接。",
+  screen_clock_or_sleep_changed: "主机时钟发生变化或刚从睡眠中唤醒，屏幕连接已断开，请重新连接。",
+  screen_service_timeout: "目标电脑的桌面服务没有响应，屏幕连接已断开，请重新连接。",
+  screen_attach_timeout: "屏幕连接超时，请检查目标 Mac 和当前线路。",
+  screen_socket_timeout: "屏幕连接超时，请检查目标 Mac 和当前线路。",
+  screen_open_failed: "无法建立屏幕连接，请检查线路后重新连接。",
+  screen_session_changed: "屏幕连接已变更，请重新连接。",
+  screen_decoder_congested: "画面解码跟不上，屏幕已断开。请重新连接，或改用流畅画质。",
+  screen_canvas_unavailable: "无法显示屏幕画面，请重新连接。",
+  screen_service_stopped: "目标电脑已停止屏幕共享，需要时可重新连接。",
+  screen_capture_failed: "目标电脑的屏幕采集失败，请重新连接。",
+  screen_input_failed: "目标电脑的远程输入失败，控制已停止。请重新连接。",
+  screen_channel_closed: "屏幕连接已关闭。请重新连接，再单独开始控制。",
+  screen_input_stale: "控制已暂停，请等待新画面后重新开始控制。",
+  screen_renew_expired: "控制授权已过期，请重新点击开始控制。",
+  screen_packet_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
+  screen_attach_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
+  screen_receipt_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
+  screen_read_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
+  screen_join_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
+  screen_quality_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
+  screen_scope_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
+  screen_command_invalid: "屏幕服务协议不兼容，请检查 App 与主机版本后重试。",
 });
 /** The reasons whose sentence names a Mac or a Mac permission, for a
  * controlled computer that runs Windows. Windows has no screen-recording or
@@ -106,6 +141,8 @@ export const SCREEN_ERROR_MESSAGES_WINDOWS: Readonly<Record<string, string>> = O
   screen_takeover_unavailable: "目标电脑无法确认是否有人在本机操作，控制已停止。请重新点击开始控制。",
   screen_input_denied: "目标电脑没有接受远程输入，控制已停止。以管理员身份运行的窗口和安全提示不能被远程控制。",
   screen_control_timeout: "目标电脑未确认控制，请稍后重试。",
+  screen_attach_timeout: "屏幕连接超时，请检查目标电脑和当前线路。",
+  screen_socket_timeout: "屏幕连接超时，请检查目标电脑和当前线路。",
 });
 /** Unknown platform is a display-only state when the Host keeps desktop metadata
  * private. Only these three general states reuse neutral computer wording;

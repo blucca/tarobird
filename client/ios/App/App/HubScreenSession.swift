@@ -107,7 +107,11 @@ final class HubScreenSession: @unchecked Sendable {
             ?? channels.lazy.compactMap { Self.hostCloseReason($0.task?.closeCode.rawValue ?? 0, $0.task?.closeReason) }.first
         fail(peerReason ?? "screen_socket_closed")
     }
+    /// The Host also ends a screen session when the device's sign-in expires or
+    /// is revoked; these exact codes are allowed besides the bounded screen_ form.
+    private static let hostAuthReasons: Set<Data> = Set(["session_expired", "device_revoked", "device_revoked_or_expired"].map { Data($0.utf8) })
     private static func hostCloseReason(_ code: Int, _ bytes: Data?) -> String? {
+        if code == 4000, let bytes = bytes, hostAuthReasons.contains(bytes) { return String(data: bytes, encoding: .utf8) }
         guard code == 4000, let bytes = bytes, (8...64).contains(bytes.count),
               bytes.starts(with: Data("screen_".utf8)), bytes.dropFirst(7).allSatisfy({ (97...122).contains($0) || $0 == 95 }) else { return nil }
         return String(data: bytes, encoding: .utf8)
