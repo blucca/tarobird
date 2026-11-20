@@ -739,6 +739,8 @@ Section Install
 SectionEnd
 
 Function .onInstSuccess
+  ; TaroBot: local setup note of the finished run (installer-notes.nsh).
+  !insertmacro BirdNoteDone
   ; Check for `/R` flag only in silent and passive installers because
   ; GUI installer has a toggle for the user to (re)start the app
   ${If} $PassiveMode = 1
@@ -769,6 +771,11 @@ Function un.onInit
   ${IfNot} ${Errors}
     StrCpy $UpdateMode 1
   ${EndIf}
+FunctionEnd
+
+Function un.onUninstSuccess
+  ; TaroBot: local setup note of the finished run (installer-notes.nsh).
+  !insertmacro BirdNoteDone
 FunctionEnd
 
 Section Uninstall

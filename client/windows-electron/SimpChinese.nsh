@@ -96,3 +96,5 @@ LangString birdNoticeMissing ${LANG_SIMPCHINESE} "TaroBird 主程序已缺失，
 LangString birdNoStopper ${LANG_SIMPCHINESE} "用于确认本地 Host 已停止的安装助手已缺失。"
 LangString birdRepairThenUninstall ${LANG_SIMPCHINESE} "请保留数据和备份，重新安装此版本修复后再卸载。"
 LangString birdSelfKept ${LANG_SIMPCHINESE} "正在运行的卸载程序留给安装程序替换。"
+LangString birdNoteDone ${LANG_SIMPCHINESE} "已完成"
+LangString birdNoteKept ${LANG_SIMPCHINESE} "此步骤也已保存在本机当前 Windows 用户的本地目录中，不会上传。安装程序关闭后如需查看本次及之前的步骤，请按 Win+R 输入 %LOCALAPPDATA%，再打开其中的 TaroBird Setup Notes 文件夹。"

@@ -134,7 +134,7 @@ test('makensis compiles the installer; the payload holds the App, helper and rec
   const result = await buildWindowsInstaller({ appDir, helper, version: '1.2.3', outFile, pluginsDir }, { makensis, workDir: path.join(root, 'nsis-work') });
   assert.equal(result.host, 'host');
   assert.equal((await readFile(outFile)).subarray(0, 2).toString(), 'MZ');
-  for (const forbidden of [/installer-diagnostics\.nsh/i, /installer-hooks\.nsh/i, /utils\.nsh/i, /English\.nsh/i, /SimpChinese\.nsh/i, /LangString/i, /function .* not referenced/i]) {
+  for (const forbidden of [/installer-diagnostics\.nsh/i, /installer-notes\.nsh/i, /installer-hooks\.nsh/i, /utils\.nsh/i, /English\.nsh/i, /SimpChinese\.nsh/i, /LangString/i, /function .* not referenced/i]) {
     assert.doesNotMatch(result.log, forbidden, `makensis emitted unexpected warning matching ${forbidden}:\n${result.log}`);
   }
   if (!sevenZip) return;
@@ -318,10 +318,11 @@ test('running-app shutdown targets only this exe via Restart Manager, guides Tas
   // Worst-case assembled BirdMessage stays comfortably below NSIS_MAX_STRLEN (1024) in both languages.
   for (const [label, map] of [['EN', enMap], ['ZH', zhMap]]) {
     const maxLen = keys => Math.max(...keys.map(k => map.get(k).length));
-    const dialogKeys = [...map.keys()].filter(k => k.startsWith('bird') && !k.endsWith('Consent'));
+    const dialogKeys = [...map.keys()].filter(k => k.startsWith('bird') && !k.endsWith('Consent') && !k.startsWith('birdNote'));
     const worst = maxLen(['birdInstall', 'birdUninstall']) + 3
       + maxLen(['birdHostStage', 'birdAppStage', 'birdInstallBackup', 'birdUninstallBackup', 'birdNoticeStage', 'birdNoticeRegStage', 'birdFilesStage']) + 2
-      + maxLen(dialogKeys) * 3 + map.get('birdNoticeCleared').length + 14 + 'TaroBird 99.99.99 · TB-HOST-UNCONFIRMED · '.length + map.get('birdCopy').length;
+      + maxLen(dialogKeys) * 3 + map.get('birdNoticeCleared').length + 14 + 'TaroBird 99.99.99 · TB-HOST-UNCONFIRMED · '.length + map.get('birdCopy').length
+      + 2 + map.get('birdNoteKept').length;
     assert.ok(worst < 900, `${label} worst-case BirdMessage length (${worst}) must stay below NSIS_MAX_STRLEN (1024)`);
   }
 });
@@ -449,5 +450,68 @@ test('new #50 diagnostics are localized and path-free in both languages', async 
   for (const language of [en, zh]) {
     const strings = new Map([...language.matchAll(/^LangString (bird\w+) \S+ "(.+)"$/gm)].map(match => [match[1], match[2]]));
     for (const key of keys) { assert.ok(strings.has(key), key); assert.doesNotMatch(strings.get(key), /\$|[\\/]/, key); }
+  }
+});
+
+// #50: the only record left after setup closes. Real writes, the limit and
+// concurrent writers need Windows (acceptance probe); these pin the script.
+test('local setup notes hold only allowlisted stage text, stay bounded and never block setup', async () => {
+  const [notes, diagnostics, nsi, hooks, en, zh] = await templates('installer-notes.nsh', 'installer-diagnostics.nsh', 'installer.nsi', 'installer-hooks.nsh', 'English.nsh', 'SimpChinese.nsh');
+  const code = notes.split('\n').filter(line => !line.trim().startsWith(';')).join('\n');
+  const define = name => code.match(new RegExp(`^!define ${name} "?([^"\\n]*)"?$`, 'm'))?.[1];
+  // Where: this Windows user's Local AppData, apart from the install and the data the backup moves.
+  assert.equal(define('BIRDNOTESDIR'), 'TaroBird Setup Notes');
+  assert.match(code, /StrCpy \$8 "\$LOCALAPPDATA\\\$\{BIRDNOTESDIR\}"/);
+  assert.equal(code.match(/\$LOCALAPPDATA|\$APPDATA|\$PROFILE|\$TEMP|\$DESKTOP|\$DOCUMENTS|\$EXEDIR|\$PLUGINSDIR/g).filter(token => token !== '$LOCALAPPDATA').length, 0);
+  assert.doesNotMatch(code, /com\.taro(?:bot|cub)\.client|TaroBot-backup/);
+  assert.notEqual(define('BIRDNOTESDIR'), nsi.match(/^!define DISPLAYNAME "([^"]*)"/m)[1], 'never the default install folder');
+  assert.match(code, /\$\{OrIf\} \$8 == \$INSTDIR\n\s+Goto bird_note_end/);
+  assert.equal(code.match(/\$INSTDIR/g).length, 1, 'the install folder is only compared, never written');
+  // The next installer's fresh-start offer only looks at the data folders, never at the notes.
+  const residual = between(hooks, '!macro NSIS_HOOK_PREINSTALL', '!macroend');
+  for (const folder of residual.matchAll(/\$\{(?:If|OrIf)\} \$\{FileExists\} "([^"]+)"/g)) assert.match(folder[1], /^\$(?:LOCAL)?APPDATA\\com\.taro(?:bot|cub)\.client$/);
+  // What: one line built only from the time, fixed localized strings, the allowlisted code and the version.
+  assert.equal(code.match(/FileWriteUTF16LE/g).length, 1);
+  assert.match(code, /FileWriteUTF16LE \/BOM \$4 "\$3"/);
+  const line = between(code, '${GetTime} "" "L" $0 $1 $2 $3 $4 $5 $6', 'ClearErrors\n  FileOpen $4');
+  const pieces = new Set([...line.matchAll(/\$\{\w+\}|\$\([\w]+\)|\$\w+/g)].map(match => match[0]).filter(token => !/^\$\{(?:If|Else|EndIf|GetTime)\}$/.test(token)));
+  const allowed = new Set(['$0', '$1', '$2', '$3', '$4', '$5', '$6', '$BirdOperation', '$BirdNotePhase', '$BirdNoteCode', '$BirdBackupState', '$BirdNoticeState', '$(birdNoteDone)', '${VERSION}']);
+  for (const piece of pieces) assert.ok(allowed.has(piece), `note line uses ${piece}`);
+  assert.doesNotMatch(code, /ReadReg|EnumReg|ExecWait|Exec |ExecShell|\$CMDLINE|nsExec|FindFirst|GetFullPathName|UserName|ComputerName/i);
+  // Bounded: count to the limit, rotate into one previous file, and skip rather than grow.
+  assert.equal(Number(define('BIRDNOTESMAX')), 20);
+  ordered(code, 'FileReadUTF16LE $4 $3', '${LoopUntil} $5 >= ${BIRDNOTESMAX}', '${If} $5 >= ${BIRDNOTESMAX}', 'Delete "$8\\${BIRDNOTESPREVIOUS}"',
+    'Rename "$8\\${BIRDNOTESFILE}" "$8\\${BIRDNOTESPREVIOUS}"', '${If} ${FileExists} "$8\\${BIRDNOTESFILE}"', 'Goto bird_note_release');
+  assert.equal(code.match(/^\s*(?:Delete|Rename|CreateDirectory|RMDir)\b/gm).length, 3, 'only the notes folder and its previous file are changed');
+  // One writer at a time: a named per-session mutex, waited on briefly, always released and closed.
+  ordered(code, 'kernel32::CreateMutexW(p 0, i 0, w "Local\\TaroBirdSetupNotes") p .r7', 'kernel32::WaitForSingleObject(p r7, i ${BIRDNOTESWAIT}) i .r6',
+    '${If} $6 <> 0', '${AndIf} $6 <> 0x80', 'Goto bird_note_close', 'bird_note_release:', 'kernel32::ReleaseMutex(p r7)', 'bird_note_close:', 'kernel32::CloseHandle(p r7)', 'bird_note_end:');
+  assert.ok(Number(define('BIRDNOTESWAIT')) <= 5000);
+  // Never through a link or junction.
+  assert.equal(code.match(/GetFileAttributesW/g).length, 3);
+  assert.equal(code.match(/IntOp \$5 \$6 & 0x410/g).length, 3);
+  // Never blocks: no prompt, abort or exit code; Details stay silent; registers and the error flag are restored.
+  assert.doesNotMatch(code, /MessageBox|Abort|Quit|SetErrorLevel|DetailPrint|BirdProblem/);
+  ordered(code, 'SetDetailsPrint none', 'CreateDirectory', 'Delete', 'Rename', 'SetDetailsPrint lastused');
+  const pushes = [...code.matchAll(/^\s*Push (\$\d)$/gm)].map(match => match[1]), pops = [...code.matchAll(/^\s*Pop (\$\d)$/gm)].map(match => match[1]);
+  assert.deepEqual(pops, [...pushes].reverse());
+  ordered(code, '${If} ${Errors}\n    StrCpy $9 1', 'bird_note_end:', 'ClearErrors\n  ${If} $9 = 1\n    SetErrors');
+  // Installer and uninstaller each get their own copy; both programs call it.
+  assert.match(code, /!insertmacro BirdNoteFunction ""\n!insertmacro BirdNoteFunction "un\."/);
+  assert.match(code, /!ifdef __UNINSTALL__\n\s+Call un\.BirdNote\n\s+!else\n\s+Call BirdNote/);
+  // Every diagnosed stop records its stage and code before the dialog; the hint appears only for a written line.
+  const problem = between(diagnostics, '!macro BirdProblem', '!macroend');
+  ordered(problem, 'StrCpy $BirdNotePhase "${PHASE}"', 'StrCpy $BirdNoteCode "${CODE}"', '!insertmacro BirdNoteCall', 'StrCpy $BirdMessage',
+    '${If} $BirdNoteKept = 1', '$(birdNoteKept)', 'DetailPrint "$BirdMessage"', 'Abort');
+  assert.match(diagnostics, /^!include "installer-notes\.nsh"$/m);
+  // A finished install or uninstall records that it finished.
+  assert.match(between(nsi, 'Function .onInstSuccess', 'FunctionEnd'), /!insertmacro BirdNoteDone/);
+  assert.match(between(nsi, 'Function un.onUninstSuccess', 'FunctionEnd'), /!insertmacro BirdNoteDone/);
+  // Copy: how to find the notes, in both languages, without a literal path.
+  for (const [language, keyword] of [[en, /Win\+R/], [zh, /Win\+R/]]) {
+    const strings = new Map([...language.matchAll(/^LangString (bird\w+) \S+ "(.+)"$/gm)].map(match => [match[1], match[2]]));
+    for (const key of ['birdNoteKept', 'birdNoteDone']) assert.doesNotMatch(strings.get(key), /\$|[\\/]|[A-Za-z]:/, key);
+    assert.match(strings.get('birdNoteKept'), keyword);
+    assert.ok(strings.get('birdNoteKept').includes('%LOCALAPPDATA%') && strings.get('birdNoteKept').includes(define('BIRDNOTESDIR')));
   }
 });
