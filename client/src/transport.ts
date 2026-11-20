@@ -27,7 +27,7 @@ let documentLease = nativeDocument ? invoke<string>("net_document") : undefined;
 void documentLease?.catch(() => undefined);
 window.addEventListener("pagehide", () => { if (usesPinnedTransport()) { documentRetired = true; documentLife.abort(new Error("native_document_retired")); } });
 window.addEventListener("pageshow", (event) => { if (nativeDocument && event.persisted) location.reload(); });
-async function allocate(kind: "http" | "socket", life = documentLife) {
+async function allocation(kind: "http" | "socket" | "screen", life = documentLife) {
   if (life.signal.aborted) throw life.signal.reason;
   // One lease per document, including reconnects. Never obtain a new lease to
   // retry a retired page: that would let queued old-page POSTs escape reset.
@@ -35,9 +35,12 @@ async function allocate(kind: "http" | "socket", life = documentLife) {
   const document = await documentLease;
   if (life.signal.aborted) throw life.signal.reason;
   const id = await invoke<string>("net_allocate", { kind, document });
-  if (life.signal.aborted) { await cancel(id); throw life.signal.reason; }
-  return id;
+  if (life.signal.aborted) { if (kind === "screen") await invoke("net_screen_close", { id }); else await cancel(id); throw life.signal.reason; }
+  return { id, document, signal: life.signal };
 }
+const allocate = async (kind: "http" | "socket", life = documentLife) => (await allocation(kind, life)).id;
+/** Reuses the entry module's document claim; a screen must never retire chat. */
+export const allocateNativeScreen = () => allocation("screen");
 
 /** Explicit same-document recovery. Abort queued old operations first, including
  * uploads waiting for a slot. Never replay them after rotating the native lease.

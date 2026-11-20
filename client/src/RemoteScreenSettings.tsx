@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState, useSyncExternalStore } from "react"
 import type { ScreenStatus, ScreenPolicy } from "../../src/client-protocol/remote-screen.js";
 import type { HubConnection } from "./connection.js";
 import { isElectron, invoke } from "./desktop-bridge.js";
+import { hasScreenViewer } from "./mobile-screen-viewer-transport.js";
 import { t, useLocale } from "./i18n.js";
 import { screenError } from "./screen-errors.js";
 import "./remote-screen.css";
@@ -24,7 +25,7 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
 }) {
   useLocale();
   const state = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);
-  const desktopApp = isElectron();
+  const desktopApp = isElectron(), viewerApp = hasScreenViewer();
   const localDesktop = local && desktopApp, localMac = localDesktop && window.tarobotDesktop?.platform === "darwin", localWindows = localDesktop && window.tarobotDesktop?.platform === "win32";
   const [snapshot, setSnapshot] = useState<{ connection: HubConnection; status?: ScreenStatus; native?: LocalScreenStatus; error?: string; nativeError?: string }>();
   const [busy, setBusy] = useState(false), [actionError, setActionError] = useState("");
@@ -40,9 +41,9 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
   const targetUnsupported = native?.supported === false && native.reason === "screen_platform_unsupported";
   // What the sentences call the controlled computer: a Windows one has no Mac
   // permissions to point at. A remote Host without a desktop does not say.
-  const target = status?.desktop?.platform ?? (localWindows ? "windows" : "macos");
+  const target = status?.desktop?.platform ?? (localWindows ? "windows" : localMac ? "macos" : "unknown");
   useEffect(() => {
-    if (!desktopApp) return;
+    if (!viewerApp) return;
     const scope = {}; lifetime.current = scope;
     let reading = false, queued = false;
     setSnapshot(undefined); setActionError(""); setPermissionRequest(undefined); setBusy(false); operation.current = false;
@@ -69,7 +70,7 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
     const focus = () => { if (document.visibilityState === "visible") void read(); };
     window.addEventListener("focus", focus); document.addEventListener("visibilitychange", focus);
     return () => { lifetime.current = null; clearInterval(timer); window.removeEventListener("focus", focus); document.removeEventListener("visibilitychange", focus); refresh.current = () => {}; busyChange?.(false); };
-  }, [connection, desktopApp, localDesktop, state.status, state.screenAvailable, busyChange]);
+  }, [connection, viewerApp, localDesktop, state.status, state.screenAvailable, busyChange]);
   const run = async (work: () => Promise<unknown>) => {
     if (operation.current) return;
     const scope = lifetime.current;
@@ -88,7 +89,7 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
       if (result.requestError) setActionError(result.requestError);
     }
   });
-  if (!desktopApp) return null;
+  if (!viewerApp) return null;
   const permissions = native?.permissions ?? (native?.desktop ? { capture: native.desktop.capture, accessibility: native.desktop.accessibility, inputMonitoring: !!native.inputMonitoring } : undefined);
   const requestedPermissionGranted = permissionRequest?.kind === "capture" ? permissions?.capture === "granted"
     : permissionRequest?.kind === "accessibility" ? permissions?.accessibility : permissionRequest?.kind === "input-monitoring" ? permissions?.inputMonitoring : false;
@@ -141,7 +142,7 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
       {blocked && <div className="screen-entry-help"><p id={entryDescription}>{blocked}</p>
         {!targetUnsupported && status?.permission === "none" && (status.canManage && status.policy
           ? <button className="screen-text-action" disabled={busy} onClick={manageDevices}>{t("管理设备授权")}</button>
-          : <p>{target === "windows" ? t("请在目标电脑的已配对设备列表中，明确允许此设备“仅查看”或“查看并控制”。") : t("请在目标 Mac 的已配对设备列表中，明确允许此设备“仅查看”或“查看并控制”。")}</p>)}
+          : <p>{status.desktop?.platform === "macos" || localMac ? t("请在目标 Mac 的已配对设备列表中，明确允许此设备“仅查看”或“查看并控制”。") : t("请在目标电脑的已配对设备列表中，明确允许此设备“仅查看”或“查看并控制”。")}</p>)}
       </div>}
     </div>
     {error && <p className="screen-notice" role="alert">{screenError(error, target)}</p>}

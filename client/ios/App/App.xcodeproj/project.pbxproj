@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A49C012534B140A7809A0001 /* HubScreenSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A49C012534B140A7809A0002 /* HubScreenSession.swift */; };
 		AA1200000000000000000004 /* AttachmentSaverPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1100000000000000000004 /* AttachmentSaverPlugin.swift */; };
 		2FAD9763203C412B000D30F8 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 2FAD9762203C412B000D30F8 /* config.xml */; };
 		4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */ = {isa = PBXBuildFile; productRef = 4D22ABE82AF431CB00220026 /* CapApp-SPM */; };
@@ -38,6 +39,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		A49C012534B140A7809A0002 /* HubScreenSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HubScreenSession.swift; sourceTree = "<group>"; };
 		AA1100000000000000000004 /* AttachmentSaverPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentSaverPlugin.swift; sourceTree = "<group>"; };
 		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
 		50379B222058CBB4000EE86E /* capacitor.config.json */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.json; path = capacitor.config.json; sourceTree = "<group>"; };
@@ -128,6 +130,7 @@
 				AA1100000000000000000006 /* KeyboardInsets.swift */,
 				AA1100000000000000000002 /* DeviceKeyStore.swift */,
 				AA1100000000000000000001 /* DeviceIdentity.swift */,
+				A49C012534B140A7809A0002 /* HubScreenSession.swift */,
 				F39F2D0B868B4287BFCEE28E /* HubTransport.swift */,
 				707B9AF116164C79966A5299 /* HubTLS.swift */,
 				504EC30B1FED79650016851F /* Main.storyboard */,
@@ -262,6 +265,7 @@
 				AA1200000000000000000006 /* KeyboardInsets.swift in Sources */,
 				AA1200000000000000000002 /* DeviceKeyStore.swift in Sources */,
 				AA1200000000000000000001 /* DeviceIdentity.swift in Sources */,
+				A49C012534B140A7809A0001 /* HubScreenSession.swift in Sources */,
 				157C95E297384BA4BF115178 /* HubTransport.swift in Sources */,
 				247DC14CF2544D91850053C1 /* HubTLS.swift in Sources */,
 				9582B6832FE993A70072D4E8 /* SceneDelegate.swift in Sources */,

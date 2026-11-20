@@ -1,0 +1,118 @@
+import { screenStreamSchema, screenViewerCommandSchema, screenViewerEventSchema, type ScreenJoin } from "../../src/client-protocol/remote-screen.js";
+import { readScreenFrame, SCREEN_PACKET_LIMIT } from "../../src/client-protocol/screen-wire.js";
+import type { ScreenViewerPort, ScreenViewerTransport } from "./screen-viewer-transport.js";
+
+export type ScreenAllocation = { id: string; document: string; signal: AbortSignal };
+export type ScreenNativeBridge = {
+  allocate(): Promise<ScreenAllocation>;
+  invoke<T = unknown>(command: string, args: Record<string, unknown>): Promise<T>;
+};
+export const SCREEN_BRIDGE_CHUNK_BYTES = 256 * 1024;
+const CONTROL_BYTES = 16 * 1024, JSON_BYTES = 64 * 1024;
+const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+/** Bounded, document-owned adapter. It never opens a WebView socket, obtains a
+ * new document claim, reconnects, or retains input for a replacement session. */
+export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): ScreenViewerTransport {
+  return (join: ScreenJoin) => {
+    let allocation: ScreenAllocation | undefined, closed = false, opening = false, focused = false, focusGeneration = 0;
+    let receive: ((value: unknown) => void) | undefined, terminal: string | undefined;
+    let sequence = 0, jsonCount = 0, jsonBytes = 0, binaryCount = 0, binaryBytes = 0, commands = 0, commandBytes = 0;
+    let incoming = Promise.resolve(), outgoing = Promise.resolve();
+    const receipts = new Map<number, { deliverySequence: number; bytes: number }>();
+    const close = (reason?: string) => {
+      if (closed) return;
+      closed = true; focused = false; receipts.clear();
+      allocation?.signal.removeEventListener("abort", retired);
+      if (allocation) void bridge.invoke("net_screen_close", { id: allocation.id }).catch(() => undefined);
+      if (reason) { terminal = reason; receive?.({ type: "closed", reason }); }
+    };
+    const retired = () => close("screen_connection_changed");
+    const fail = (error: unknown) => close(error instanceof Error && error.name !== "ZodError" ? error.message : "screen_protocol_invalid");
+    const ack = async (deliverySequence: number) => {
+      if (!closed && allocation) await bridge.invoke("net_screen_ack", { id: allocation.id, deliverySequence });
+    };
+    const port: ScreenViewerPort = {
+      start(deliver) { if (receive) return; receive = deliver; if (terminal) deliver({ type: "closed", reason: terminal }); },
+      close: () => close(),
+      postMessage(message) {
+        if (closed || !allocation) return;
+        try {
+          if (message.type === "received") {
+            const receipt = receipts.get(message.sequence as number);
+            if (!receipt) throw new Error("screen_protocol_invalid");
+            receipts.delete(message.sequence as number);
+            void ack(receipt.deliverySequence).then(() => { binaryCount--; binaryBytes -= receipt.bytes; }, fail);
+            return;
+          }
+          if (message.sessionId !== join.session.id || message.generation !== join.session.generation) throw new Error("screen_session_changed");
+          if (message.type === "input-focus") { if (typeof message.enabled !== "boolean") throw new Error("screen_protocol_invalid"); focused = message.enabled; focusGeneration++; }
+          // Native consumes focus locally; it never forwards it to either Hub socket.
+          const command = message.type === "input-focus" ? { type: "input-focus" as const, sessionId: join.session.id, generation: join.session.generation, enabled: focused } : screenViewerCommandSchema.parse(message);
+          if ((command.type === "input" || command.type === "renew") && !focused) return;
+          const bytes = size(command);
+          const admittedFocus = focusGeneration;
+          if (++commands > 8 || (commandBytes += bytes) > CONTROL_BYTES) throw new Error("screen_congested");
+          outgoing = outgoing.then(async () => {
+            if ((command.type === "input" || command.type === "renew") && (!focused || admittedFocus !== focusGeneration)) return;
+            if (!closed && allocation) await bridge.invoke("net_screen_send", { id: allocation.id, command });
+          }).catch(fail).finally(() => { commands--; commandBytes -= bytes; });
+        } catch (error) { fail(error); }
+      },
+    };
+    const event = (raw: unknown) => {
+      if (closed || !allocation || !raw || typeof raw !== "object") return;
+      const value = raw as Record<string, unknown>;
+      if (value.id !== allocation.id || value.document !== allocation.document) return;
+      if (value.kind === "close") { close(typeof value.reason === "string" ? value.reason : "screen_disconnected"); return; }
+      try {
+        const deliverySequence = value.deliverySequence as number;
+        if (!Number.isSafeInteger(deliverySequence) || deliverySequence <= sequence) throw new Error("screen_protocol_invalid");
+        sequence = deliverySequence;
+        if (value.kind === "screen") {
+          const bytes = size(value.value);
+          if (bytes > CONTROL_BYTES || ++jsonCount > 8 || (jsonBytes += bytes) > JSON_BYTES) throw new Error("screen_congested");
+          const data = (value.value as { type?: unknown })?.type === "stream" ? screenStreamSchema.parse(value.value) : screenViewerEventSchema.parse(value.value);
+          if ("sessionId" in data && data.sessionId !== join.session.id || "session" in data && (data.session.id !== join.session.id || data.session.generation !== join.session.generation) || "generation" in data && data.generation !== join.session.generation) throw new Error("screen_session_changed");
+          incoming = incoming.then(async () => {
+            if (closed) return;
+            if (!receive) throw new Error("screen_protocol_invalid");
+            receive(data); await ack(deliverySequence);
+          }).catch(fail).finally(() => { jsonCount--; jsonBytes -= bytes; });
+        } else if (value.kind === "binary") {
+          const bytes = value.byteLength as number;
+          if (!Number.isSafeInteger(bytes) || bytes <= 32 || bytes > SCREEN_PACKET_LIMIT || ++binaryCount > 3 || (binaryBytes += bytes) > 3 * SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
+          incoming = incoming.then(async () => {
+            if (closed || !allocation) return;
+            const buffer = new Uint8Array(bytes);
+            for (let offset = 0; offset < bytes;) {
+              const maxBytes = Math.min(SCREEN_BRIDGE_CHUNK_BYTES, bytes - offset);
+              const chunk = await bridge.invoke<ArrayBuffer>("net_screen_read", { id: allocation.id, deliverySequence, offset, maxBytes });
+              if (closed) return;
+              if (!(chunk instanceof ArrayBuffer) || !chunk.byteLength || chunk.byteLength > maxBytes) throw new Error("screen_protocol_invalid");
+              buffer.set(new Uint8Array(chunk), offset); offset += chunk.byteLength;
+            }
+            const header = readScreenFrame(buffer);
+            if (!receive || receipts.has(header.sequence)) throw new Error("screen_protocol_invalid");
+            receipts.set(header.sequence, { deliverySequence, bytes });
+            receive(buffer.buffer);
+          }).catch(fail);
+        } else throw new Error("screen_protocol_invalid");
+      } catch (error) { fail(error); }
+    };
+    return {
+      async open(network, events) {
+        if (opening || closed) throw new Error("screen_connection_changed"); opening = true;
+        try {
+          const lease = await bridge.allocate(); allocation = lease;
+          if (closed) { void bridge.invoke("net_screen_close", { id: lease.id }).catch(() => undefined); return; }
+          if (lease.signal.aborted) { close(); throw new Error("screen_connection_changed"); }
+          lease.signal.addEventListener("abort", retired, { once: true });
+          events.attach(port);
+          if (!closed) await bridge.invoke("net_screen_open", { id: lease.id, network, join, events: { onmessage: event } });
+        } catch (error) { close(); throw error; }
+      },
+      close: () => close(),
+    };
+  };
+}

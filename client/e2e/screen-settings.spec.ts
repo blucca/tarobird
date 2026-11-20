@@ -283,3 +283,23 @@ for(const english of [false,true])test(`a remote Host without a registered deskt
  // A remote Host is never probed through this computer's native service.
  expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.native)).toEqual([]);
 });
+
+for(const english of [false,true])test(`an unauthorized remote device gets platform-neutral guidance when its desktop is private (${english?"en":"zh"})`,async({page})=>{
+ await page.goto(url(`?remote${english?"&en":""}`));
+ await expect(page.getByRole("button",{name:english?"Refresh status":"刷新状态",exact:true})).toBeVisible();
+ await page.evaluate(()=>{const state=(window as any).screenSettingsFixture.state.status;state.canManage=false;state.permission="none";state.desktop=null;delete state.policy;window.dispatchEvent(new Event("focus"));});
+ const sentence=english?"On the target computer, explicitly allow View only or View and control for this device in the paired device list.":"请在目标电脑的已配对设备列表中，明确允许此设备“仅查看”或“查看并控制”。";
+ await expect(page.getByText(sentence,{exact:true})).toBeVisible();
+ await expect(page.locator(".screen-entry-help")).not.toContainText("Mac");
+ await expect(page.getByRole("button",{name:english?"View screen":"查看屏幕",exact:true})).toBeDisabled();
+ expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.native)).toEqual([]);
+});
+
+for(const english of [false,true])test(`a remote disabled screen with a private desktop uses neutral guidance (${english?"en":"zh"})`,async({page})=>{
+ await page.goto(url(`?remote${english?"&en":""}`));
+ await expect(page.getByRole("button",{name:english?"Refresh status":"刷新状态",exact:true})).toBeVisible();
+ await page.evaluate(()=>{const state=(window as any).screenSettingsFixture.state.status;state.canManage=false;state.enabled=false;state.desktop=null;delete state.policy;window.dispatchEvent(new Event("focus"));});
+ await expect(page.getByText(english?"Turn on Allow remote screen on the target computer first.":"请先在目标电脑开启允许远程屏幕。",{exact:true})).toBeVisible();
+ await expect(page.locator(".screen-entry-help")).not.toContainText("Mac");
+ expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.native)).toEqual([]);
+});

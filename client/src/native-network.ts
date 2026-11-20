@@ -13,6 +13,11 @@ interface MobileTransport {
   socketSend(args: Record<string, unknown>): Promise<void>;
   socketAck(args: Record<string, unknown>): Promise<void>;
   socketClose(args: Record<string, unknown>): Promise<{ value: boolean }>;
+  screenOpen?(args: Record<string, unknown>): Promise<unknown>;
+  screenSend?(args: Record<string, unknown>): Promise<unknown>;
+  screenRead?(args: Record<string, unknown>): Promise<{ data: string }>;
+  screenAck?(args: Record<string, unknown>): Promise<unknown>;
+  screenClose?(args: Record<string, unknown>): Promise<{ value: boolean }>;
   addListener(name: string, callback: (event: { id: string; kind: string }) => void): Promise<PluginListenerHandle>;
 }
 
@@ -29,6 +34,11 @@ if (pageToken) Object.defineProperty(window, "__TAROCUB_NATIVE_PAGE_TOKEN__", { 
 export function mobileNetwork(plugin: MobileTransport, pageToken?: string) {
   const channels = new Map<string, NativeEventChannel<unknown>>();
   let listener: Promise<PluginListenerHandle> | undefined;
+  const screenCall = async <T>(method: ((args: Record<string, unknown>) => Promise<T>) | undefined, args: Record<string, unknown>): Promise<T> => {
+    if (!method) throw new Error("screen_mobile_update_required");
+    try { return await method.call(plugin, args); }
+    catch (error) { if ((error as { code?: string })?.code === "UNIMPLEMENTED") throw new Error("screen_mobile_update_required"); throw error; }
+  };
   const listen = () => {
     if (!listener) {
       let live = true;
@@ -58,8 +68,9 @@ export function mobileNetwork(plugin: MobileTransport, pageToken?: string) {
       case "net_allocate": return (await plugin.allocate(args)).value;
       case "net_cancel": channels.delete(String(args.id)); return plugin.cancel(args);
       case "net_http_open": return plugin.httpOpen(args);
-      case "net_http_read": {
-        const { data } = await plugin.httpRead(args);
+      case "net_http_read":
+      case "net_screen_read": {
+        const { data } = command === "net_http_read" ? await plugin.httpRead(args) : await screenCall(plugin.screenRead, args);
         if (typeof data !== "string" || data.length > 349528) throw new Error("invalid_native_chunk");
         const decoded = atob(data);
         if (decoded.length > 256 * 1024) throw new Error("invalid_native_chunk");
@@ -81,6 +92,16 @@ export function mobileNetwork(plugin: MobileTransport, pageToken?: string) {
       case "net_socket_send": return plugin.socketSend(args);
       case "net_socket_ack": return plugin.socketAck(args);
       case "net_socket_close": return (await plugin.socketClose(args)).value;
+      case "net_screen_open": {
+        await listen();
+        const id = String(args.id), channel = args.events as NativeEventChannel<unknown>;
+        channels.set(id, channel);
+        try { return await screenCall(plugin.screenOpen, { id, network: args.network, join: args.join, ...(pageToken ? { pageToken } : {}) }); }
+        catch (error) { if (channels.get(id) === channel) channels.delete(id); throw error; }
+      }
+      case "net_screen_send": return screenCall(plugin.screenSend, args);
+      case "net_screen_ack": return screenCall(plugin.screenAck, args);
+      case "net_screen_close": channels.delete(String(args.id)); return (await screenCall(plugin.screenClose, args)).value;
       default: throw new Error("unknown_native_transport_command");
     }
   };

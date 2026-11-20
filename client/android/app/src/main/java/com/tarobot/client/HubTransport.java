@@ -27,6 +27,7 @@ final class HubTransport implements AutoCloseable {
     private static final int BODY_LIMIT = 8 * 1024 * 1024, READ_BYTES = 256 * 1024, CREDITS = 8;
     private final HubTls network;
     private final Events events;
+    private final java.util.function.BooleanSupplier screenActive;
     private final Map<String, Slot> slots = new HashMap<>();
     private int retiringHttp;
     private final java.util.concurrent.ThreadPoolExecutor cleanup = new java.util.concurrent.ThreadPoolExecutor(1,1,30,TimeUnit.SECONDS,new java.util.concurrent.ArrayBlockingQueue<>(32));
@@ -46,10 +47,12 @@ final class HubTransport implements AutoCloseable {
         Response response;
         byte[] readBuffer;
         HubSocket socket;
+        HubScreenSession screen;
         ScheduledFuture<?> deadline;
         Slot(String id, String document, String kind) { this.id=id; this.document=document; this.kind=kind; }
     }
-    HubTransport(HubTls network, Events events) { this.network=network; this.events=events; deadlines.setRemoveOnCancelPolicy(true); cleanup.allowCoreThreadTimeOut(true); }
+    HubTransport(HubTls network, Events events) { this(network,events,()->true); }
+    HubTransport(HubTls network, Events events, java.util.function.BooleanSupplier screenActive) { this.network=network; this.events=events; this.screenActive=screenActive; deadlines.setRemoveOnCancelPolicy(true); cleanup.allowCoreThreadTimeOut(true); }
     synchronized String document() throws IOException {
         if (destroyed) throw new IOException("native_transport_destroyed");
         reset();
@@ -58,11 +61,12 @@ final class HubTransport implements AutoCloseable {
     synchronized void reset() { document=null; for(Slot slot:new ArrayList<>(slots.values())) cancel(slot); }
     synchronized String allocate(String kind, String document) throws IOException {
         if (destroyed || this.document == null || !this.document.equals(document)) throw new IOException("native_document_retired");
-        if (!kind.equals("http") && !kind.equals("socket")) throw new IOException("invalid_native_kind");
+        if (!kind.equals("http") && !kind.equals("socket") && !kind.equals("screen")) throw new IOException("invalid_native_kind");
+        if(kind.equals("screen")&&!screenActive.getAsBoolean()) throw new IOException("screen_inactive");
         int count=0; for (Slot slot : slots.values()) if (slot.kind.equals(kind)) count++;
-        if (count + (kind.equals("http") ? retiringHttp : 0) >= (kind.equals("http") ? 32 : 8)) throw new IOException("native_transport_busy");
+        if (count + (kind.equals("http") ? retiringHttp : 0) >= (kind.equals("http") ? 32 : kind.equals("screen") ? 2 : 8)) throw new IOException("native_transport_busy");
         Slot slot = new Slot(UUID.randomUUID().toString(), document, kind); slots.put(slot.id, slot);
-        slot.deadline=deadlines.schedule(() -> { synchronized (HubTransport.this) { if (slots.get(slot.id)==slot) cancel(slot); } },kind.equals("http")?300:1200,TimeUnit.SECONDS);
+        slot.deadline=deadlines.schedule(() -> { synchronized (HubTransport.this) { if (slots.get(slot.id)==slot) cancel(slot); } },kind.equals("http")?300:kind.equals("screen")?30:1200,TimeUnit.SECONDS);
         return slot.id;
     }
     private synchronized Slot get(String id, String kind) throws IOException {
@@ -80,6 +84,8 @@ final class HubTransport implements AutoCloseable {
         if(slot.deadline!=null) slot.deadline.cancel(false);
         if(slot.call!=null) try { slot.call.cancel(); } catch(RuntimeException ignored) { }
         if(slot.socket!=null) try { slot.socket.cancel(); } catch(RuntimeException ignored) { }
+        if(slot.screen!=null) slot.screen.close("screen_disconnected");
+        else if(slot.kind.equals("screen")) screenTerminal(slot,"screen_disconnected");
         if(slot.response!=null) {
             // Cross-thread cancellation only aborts the Call. Body.close() may
             // mutate Okio's read buffer; serialize disposal with the reader on
@@ -167,6 +173,58 @@ final class HubTransport implements AutoCloseable {
             if(used==0) { cancel(id); return new byte[0]; }
             return Arrays.copyOf(slot.readBuffer,used);
         } } catch(Exception error) { cancel(id); throw error; }
+    }
+    private void screenTerminal(Slot slot,String reason) {
+        if(slot.terminal) return; slot.terminal=true;
+        emit(slot,"close","document",slot.document,"reason",reason);
+    }
+    synchronized void closeScreens(String reason) {
+        for(Slot slot:new ArrayList<>(slots.values())) if(slot.kind.equals("screen")) {
+            if(slot.screen!=null) slot.screen.close(reason); else screenTerminal(slot,reason);
+            cancel(slot);
+        }
+    }
+    // Rechecked on the ordered bridge thread, not only when an event was queued.
+    synchronized boolean screenEventCurrent(JSONObject event) {
+        if(destroyed||document==null||!document.equals(event.optString("document"))) return false;
+        if("close".equals(event.optString("kind"))) return true;
+        Slot slot=slots.get(event.optString("id"));
+        return slot!=null&&!slot.cancelled&&slot.screen!=null&&slot.screen.isOpen()&&screenActive.getAsBoolean();
+    }
+    void screenOpen(String id,JSONObject input,JSONObject join) throws Exception {
+        Slot slot=get(id,"screen"); start(slot);
+        String origin=null,key=null; HubTls.Route route=null;
+        try {
+            synchronized(this) {
+                alive(slot); if(!screenActive.getAsBoolean()) throw new IOException("screen_inactive");
+                slot.screen=new HubScreenSession(this,slot.id,slot.document,join,()->screenActive.getAsBoolean()&&!slot.cancelled&&slots.get(slot.id)==slot&&slot.document.equals(document),new HubScreenSession.Events() {
+                    public void send(JSONObject event) throws Exception { if("close".equals(event.optString("kind"))) { if(slot.terminal) return; slot.terminal=true; } events.send(event); }
+                    public void closed() { cancel(slot); }
+                },deadlines);
+            }
+            if(input==null||input.length()<2||input.length()>3) throw new IOException("screen_route_invalid");
+            java.util.Iterator<String> fields=input.keys(); while(fields.hasNext()) if(!Arrays.asList("url","publicKey","certificateAuthority").contains(fields.next())) throw new IOException("screen_route_invalid");
+            origin=string(input,"url"); key=string(input,"publicKey");
+            route=network.prepare(origin,key,input.has("certificateAuthority")?string(input,"certificateAuthority"):null,call->track(slot,call));
+            synchronized(this) { alive(slot); if(!screenActive.getAsBoolean()) throw new IOException("screen_inactive"); }
+            final String trustedOrigin=origin,trustedKey=key; final HubTls.Route trustedRoute=route;
+            slot.screen.start(route,()->network.forget(trustedOrigin,trustedKey,trustedRoute));
+            // Allocation expiry bounds an abandoned claim, not a healthy screen.
+            // Once started, its attach/network/ACK watchdogs own the lifetime.
+            synchronized(this) { alive(slot); if(slot.deadline!=null) slot.deadline.cancel(false); }
+        } catch(Exception error) { if(HubTls.trustFailure(error)) network.forget(origin,key,route); cancel(id); throw error; }
+    }
+    private synchronized HubScreenSession screen(String id) throws IOException {
+        Slot slot=get(id,"screen"); if(slot.screen==null) throw new IOException("screen_not_open"); return slot.screen;
+    }
+    synchronized boolean screenCurrent(String id) { Slot slot=slots.get(id); return !destroyed&&slot!=null&&!slot.cancelled&&slot.kind.equals("screen")&&slot.document.equals(document)&&slot.screen!=null&&slot.screen.isOpen()&&screenActive.getAsBoolean(); }
+    void screenSend(String id,JSONObject command) throws Exception { screen(id).send(command); }
+    byte[] screenRead(String id,long sequence,int offset,int maxBytes) throws Exception { return screen(id).read(sequence,offset,maxBytes); }
+    void screenAck(String id,long sequence) throws Exception { screen(id).ack(sequence); }
+    synchronized boolean screenClose(String id) throws IOException {
+        Slot slot=slots.get(id); if(slot==null) return true;
+        if(!slot.kind.equals("screen")||!slot.document.equals(document)) throw new IOException("invalid_screen_id");
+        cancel(slot); return true;
     }
     void socketOpen(String id, String origin, String key) throws Exception { socketOpen(id,origin,key,null); }
     void socketOpen(String id, String origin, String key, String authority) throws Exception {

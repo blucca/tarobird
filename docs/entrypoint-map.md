@@ -207,7 +207,9 @@ The Electron desktop conversation header has a separate “View screen” shortc
 beside Workbench, with a selected-accent open state. It opens the current
 Workspace's Host viewer without granting access or starting capture; the viewer
 explains missing grants/service/capture permission and links to that Host's
-Connection settings. Phone/web headers do not offer this desktop-only viewer.
+Connection settings. Native mobile conversations use their actions menu and
+connection settings instead of adding a header button; mobile ADHD panes do not
+gain screen controls. Browser-only clients do not expose the native viewer.
 This is an App entry/presentation change; the existing `tarobot screens` CLI
 and Host authorization contracts are unchanged. See [shortcut verification](client/remote-screen-entry-2026-11-03.md).
 The viewer toolbar distinguishes in-App expansion from full screen and preserves
@@ -237,8 +239,12 @@ default). Regressions: root `remote-screen-viewer-seams`, `remote-screen-keys-ta
 `client-screen-errors`; Electron `screen-service-hello` pins the macOS target's
 hello text byte for byte.
 
-The [Windows target extension](client/remote-screen-platforms-2026-11-21.md)
-maps Windows physical input, held-input recovery and legacy-client negotiation.
+The [Windows target and mobile viewer extension](client/remote-screen-platforms-2026-11-21.md)
+maps Windows physical input and legacy-client negotiation, iOS/Android pinned
+screen allocations, explicit mobile control and native lifecycle retirement.
+`screen-mobile-transport.ts` shares the document lease from `transport.ts`;
+`HubScreenSession` on each mobile platform bounds its own media/control queues.
+Returning foreground requires a new connection and never replays old input.
 
 `npm --prefix client run test:electron` runs the main/preload contract tests.
 `electron/tests/packaged.smoke.mjs`, `packaged-migration.smoke.mjs` and the real
