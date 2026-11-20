@@ -46,6 +46,8 @@ import { installPushActions } from "./notifications.js";
 import { ListenerScope } from "./listener-scope.js";
 import { clearHostPush } from "./notifications.js";
 import { clearHostShares } from "./share-inbox.js";
+import { hostCleanupError, pairingState, pairingStateLabel } from "./pairing-state.js";
+import type { ResetStep } from "./local-reset.js";
 import { setLocale, t, useLocale } from "./i18n.js";
 import "./hosts.css";
 import type { MobileHost, MobileInboxState, MobileScrollPositions } from "./MobileHome.js";
@@ -208,7 +210,11 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
     setManaging(false); setInitialJoin(undefined); setNetworkInitialHostKey(undefined); setNetworkInitialHostDetails(false);
     if (guard) guard(navigate); else navigate();
   };
-  const pendingEntry = state.hosts.find((entry) => entry.host.id === activeId && entry.connection?.identity.pendingPairing) ?? state.hosts.find((entry) => entry.connection?.identity.pendingPairing);
+  // The pairing page follows the request it last created; another host's
+  // unanswered request stays saved and is offered again afterwards.
+  const [pairingFocus, setPairingFocus] = useState<string>();
+  const pendingEntry = state.hosts.find((entry) => !!pairingFocus && entry.connection?.identity.pendingPairing && entry.connection.identity.deviceId === pairingFocus)
+    ?? state.hosts.find((entry) => entry.host.id === activeId && entry.connection?.identity.pendingPairing) ?? state.hosts.find((entry) => entry.connection?.identity.pendingPairing);
   const pendingConnection = pendingEntry?.connection;
   const pairingVisible = pairing || !!pendingConnection && activeId === pendingEntry?.host.id;
   const pairingRef = useRef(pairingVisible); pairingRef.current = pairingVisible;
@@ -501,7 +507,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   };
   const savePairing = async (identity: Identity, name: string) => {
     localControllerEpoch.current++;
-    setPairing(true);
+    setPairing(true); setPairingFocus(identity.deviceId);
     if (isDesktop() && !identity.pendingPairing && identity.deployment === "computer") {
       pool.localHostKey = identity.hubPublicKey ?? ""; pool.localControllerPending = false;
       setLocalHostKey(pool.localHostKey); showLocalIssue();
@@ -556,7 +562,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
       })().catch(() => setError(t("本机已准备好，网络尚未创建。请在「设备与网络」中重试。")));
     }
   };
-  const beforePair = async (publicKey: string) => { const existing = (await registry.list()).find(host => host.publicKey === publicKey); if (existing) throw new Error(existing.networkBlocked ? t("请先在「此设备的连接」移除此旧连接，再重新配对。历史和草稿会在移除前提示。") : t("此主机已经添加。请在「设置 → 网络与连接 → 此设备的连接」中选择对应主机，打开连接设置并更新线路。")); };
+  const beforePair = async (publicKey: string) => { const existing = (await registry.list()).find(host => host.publicKey === publicKey); if (existing) throw new Error(state.hosts.some(entry => entry.host.id === existing.id && entry.connection?.identity.pendingPairing) ? t("这台主机已有未完成的配对申请。请返回该申请，扫描或粘贴新的连接码。") : existing.networkBlocked ? t("请先在「此设备的连接」移除此旧连接，再重新配对。历史和草稿会在移除前提示。") : t("此主机已经添加。请在「设置 → 网络与连接 → 此设备的连接」中选择对应主机，打开连接设置并更新线路。")); };
   const joinSource = state.hosts.find(entry => entry.host.publicKey === joinIntent?.sourceKey && entry.host.publicKey === localHostKey);
   const joinTarget = state.hosts.find(entry => entry.host.publicKey === joinIntent?.targetKey && !entry.host.networkBlocked);
   const destination = joinTarget?.connection?.state.network?.membership?.manifest;
@@ -632,7 +638,7 @@ function HostManager({ registry, entries, pool, close, add, settings, history }:
     try { const handle = await registry.open(entry.host.id); try { setRemoval({ entry, drafts: await handle.cache.draftCount(), queued: (await handle.cache.outbox()).length }); } finally { handle.cache.close(); } } catch { setRemoval({ entry }); }
   }
   async function remove(entry: ConnectedHost) {
-    setBusy(true); setError("");
+    setBusy(true); setError(""); let step: ResetStep | undefined;
     try {
       const current = (await registry.list()).find((host) => host.id === entry.host.id); if (!current) { setRemoval(undefined); return; }
       if (current.state !== "removing") {
@@ -644,15 +650,15 @@ function HostManager({ registry, entries, pool, close, add, settings, history }:
         await registry.beginRemoval(entry.host.id); setRemoval(undefined);
       }
       await pool.refresh();
-      await registry.finishRemoval(entry.host.id, entry.host.registrationId, { shared: clearHostShares, push: clearHostPush, browser: (host, scopes) => clearWorkbenchBrowserData(host.publicKey, scopes), key: deleteNativeIdentity });
+      await registry.finishRemoval(entry.host.id, entry.host.registrationId, { shared: clearHostShares, push: clearHostPush, browser: (host, scopes) => clearWorkbenchBrowserData(host.publicKey, scopes), key: deleteNativeIdentity }, value => { step = value; });
       setRemoval(undefined);
-    } catch (e) { setError(e instanceof Error ? e.message : t("操作失败")); } finally { setBusy(false); }
+    } catch (e) { setError(step ? hostCleanupError(step) : e instanceof Error ? e.message : t("操作失败")); } finally { setBusy(false); }
   }
   return <CreationDialog mobilePage title={t("此设备的连接")} close={close} closeLabel={t("关闭连接管理")} busy={busy} showHost={false} className="saved-host-manager">
     <p className="muted">{t("这些连接保存在此设备。移除连接不会让主机退出网络，也不会删除主机上的 Bot。")}</p>
     {!entries.length && <p className="settings-note">{t("还没有保存的主机连接。")}</p>}
     {entries.map(entry => <section className="host-manager-row" aria-label={entry.host.name} key={entry.host.registrationId}>
-      <div className="saved-host-heading"><Monitor size={20} aria-hidden="true"/><div><strong>{entry.host.name}</strong><small>{t("公钥尾号 {0}", entry.host.publicKey.slice(-8))}</small></div><span className="saved-host-state">{networkHostBlocked(entry, pool.localHostKey) ? t("网络授权已失效") : entry.connection?.state.status === "online" ? t("已连接") : t("离线")}</span></div>
+      <div className="saved-host-heading"><Monitor size={20} aria-hidden="true"/><div><strong>{entry.host.name}</strong><small>{t("公钥尾号 {0}", entry.host.publicKey.slice(-8))}</small></div><span className="saved-host-state">{networkHostBlocked(entry, pool.localHostKey) ? t("网络授权已失效") : pairingState(entry.connection?.identity) ? pairingStateLabel(pairingState(entry.connection?.identity)!) : entry.connection?.state.status === "online" ? t("已连接") : t("离线")}</span></div>
       {networkHostBlocked(entry, pool.localHostKey) && <p className="muted">{t("历史和草稿仍保留。再次连接需先移除此旧连接，再扫描新的配对二维码。")}</p>}
       <div className="quick-actions">
         {networkHostBlocked(entry, pool.localHostKey) && <button disabled={busy || !entry.connection} onClick={() => history(entry.host.id)}>{t("查看历史记录")}</button>}

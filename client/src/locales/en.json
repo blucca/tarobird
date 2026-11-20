@@ -5530,5 +5530,10 @@
   "本机状态": "This computer",
   "这台电脑已锁定、会话已断开或正在显示安全提示，暂时不能被查看或控制。": "This computer is locked, disconnected or showing a security prompt, so it can't be viewed or controlled right now.",
   "目标电脑无法确认是否有人在本机操作，控制已停止。请重新点击开始控制。": "The target computer could not watch for local input, so control stopped. Start control again.",
-  "上次远程控制的按键记录无法读取，控制已暂停。请在受控电脑注销并重新登录；若仍未恢复，需检查本机记录。": "The last remote input record cannot be read, so control is paused. Sign out and back in on the target computer. If control remains unavailable, its local record needs inspection."
+  "上次远程控制的按键记录无法读取，控制已暂停。请在受控电脑注销并重新登录；若仍未恢复，需检查本机记录。": "The last remote input record cannot be read, so control is paused. Sign out and back in on the target computer. If control remains unavailable, its local record needs inspection.",
+  "配对已过期": "Pairing expired",
+  "连接其他主机": "Connect a different host",
+  "返回配对申请": "Back to the pairing request",
+  "未能清理{0}。旧连接已停止，请重试清理。": "Could not clear {0}. The old connection has stopped; retry cleanup.",
+  "这台主机已有未完成的配对申请。请返回该申请，扫描或粘贴新的连接码。": "This host already has an unfinished pairing request. Go back to that request and scan or paste a new connection code."
 }

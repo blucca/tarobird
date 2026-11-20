@@ -1,3 +1,4 @@
+import { pairingState, pairingStateLabel } from './pairing-state.js';
 import { AgentAvatar } from "./AgentAvatar.js";
 import { isDispatcher, useTicketConversationsVisible } from "./dispatcher.js";
 import { restorePinFocus } from "./conversation-pin-focus.js";
@@ -627,6 +628,8 @@ function MePane({ hosts, activeHost, selectHost, open }: PaneProps) {
     // name; strip only the registry's own disambiguation suffix.
     const suffix = ` · ${host.id.slice(4, 12)}`;
     const savedName = host.name.endsWith(suffix) ? host.name.slice(0, -suffix.length) : host.name;
+    // A host that has not approved this device is identified by its key, never as a paired computer.
+    if (pairingState(host.connection.identity) && ['我的主机', 'My host'].includes(savedName)) return t('公钥尾号 {0}', (host.connection.identity.hubPublicKey ?? '').slice(-8));
     return ['我的主机', 'My host'].includes(savedName)
       ? state.hostProfile?.name ?? state.network?.host.name ?? t('已配对电脑') : savedName;
   });
@@ -661,7 +664,8 @@ function MePane({ hosts, activeHost, selectHost, open }: PaneProps) {
           <ul className="mh-group">
             {hosts.map((host, index) => {
               const current = host.id === activeHost?.id;
-              const status = hostStatus(host.connection.state.status);
+              const pairing = pairingState(host.connection.identity);
+              const status = pairing ? { label: pairingStateLabel(pairing), tone: pairing === 'waiting' ? 'pending' as const : 'unknown' as const } : hostStatus(host.connection.state.status);
               const label = computerLabels[index]!;
               return (
                 <li key={host.id}>

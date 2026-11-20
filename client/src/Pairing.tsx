@@ -56,7 +56,11 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   // below it would look like nothing happened. Reveal it; focus stays put.
   const revealFailure = () => { if (phone) failure.current?.scrollIntoView({ block: "nearest", behavior: "instant" }); };
   useEffect(() => { if (error) revealFailure(); }, [phone, error]);
-  const identity = createdIdentity ?? pendingConnection?.identity;
+  // "Connect a different host" sets the unanswered request aside without
+  // touching it; the page only uses a pending connection of the shown identity.
+  const [another, setAnother] = useState(false);
+  const identity = createdIdentity ?? (another ? undefined : pendingConnection?.identity);
+  const connection = pendingConnection && identity && pendingConnection.identity.deviceId === identity.deviceId ? pendingConnection : undefined;
   const joiningDesktop = desktop && (localHostReady || !!preparedLocal);
   const pending = identity?.pendingPairing;
   // Native phones: connection details were read, nothing is connected yet.
@@ -65,7 +69,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   const directHost = (() => { try { return address ? new URL(address).hostname : ""; } catch { return ""; } })();
   const tailscaleRoute = legacyDirect?.name === "Tailscale" || directHost.endsWith(".ts.net") || /^100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./.test(directHost);
   const lanRoute = /^(?:192\.168\.|10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)/.test(directHost);
-  const status = useSyncExternalStore(pendingConnection ? (notify) => pendingConnection.subscribe(notify) : noopSubscribe, () => pendingConnection?.state ?? idle);
+  const status = useSyncExternalStore(connection ? (notify) => connection.subscribe(notify) : noopSubscribe, () => connection?.state ?? idle);
   const [now, setNow] = useState(Date.now), completing = useRef(false), admission = useRef(false);
   const remaining = pending ? pairingRemaining(pending.expiresAt, now, pending.serverTimeOffset) : 0;
   useEffect(() => { if (!pending) return; const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, [pending]);
@@ -127,6 +131,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     } finally { admission.current = false; setBusy(false); }
   };
   const submitPending = async () => {
+    const pendingConnection = connection;
     if (!identity?.hubPublicKey || !pendingConnection || admission.current || pendingConnection.identity.deviceId !== identity.deviceId || pendingConnection.identity.hubPublicKey !== identity.hubPublicKey) return;
     const request = identity.pendingPairing?.request; if (!request) return;
     const expected = { requestId: request.requestId, code: identity.pendingPairing!.code };
@@ -162,15 +167,23 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   const attempted = useRef(new Set<string>()), submitRef = useRef(submitPending); submitRef.current = submitPending;
   useEffect(() => {
     const requestId = pending?.request?.requestId;
-    if (!busy && !admission.current && !(desktop && !remote) && pendingConnection?.identity.deviceId === identity?.deviceId && pendingConnection?.identity.hubPublicKey === identity?.hubPublicKey && !pending?.code && requestId && !attempted.current.has(requestId)) {
+    if (!busy && !admission.current && !(desktop && !remote) && connection?.identity.deviceId === identity?.deviceId && connection?.identity.hubPublicKey === identity?.hubPublicKey && !pending?.code && requestId && !attempted.current.has(requestId)) {
       attempted.current.add(requestId); void submitRef.current();
     }
-  }, [pendingConnection, pending?.code, pending?.request?.requestId, busy, desktop, remote]);
+  }, [connection, pending?.code, pending?.request?.requestId, busy, desktop, remote]);
+  // A different host starts from an empty form: details read for this request
+  // (its invite, address and key) must not be submitted for another host.
+  const startAnother = () => {
+    setAnother(true); setIdentity(undefined); setError(""); setRequestError(undefined);
+    setInvite(undefined); setExpectedKey(undefined); setManualKey(""); setDeployment(undefined); setLegacyDirect(undefined); setRelays([]);
+    setAddress(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""); setManual(platform === "web"); setOptionsOpen(false); setHostName(t("我的主机"));
+  };
   const routeHint = expectedKey && (tailscaleRoute || lanRoute) && <p className="pairing-route-hint">{tailscaleRoute ? t("此连接使用 Tailscale。这台设备也需连接同一 Tailscale 网络，并允许访问目标主机；仅复制地址不会自动建立连接。") : t("此连接包含局域网地址。人在外面时需有可用的 Tailscale 或 VPS 线路；家里的 Wi-Fi 地址通常无法从外部直接访问。")}</p>;
   if (desktop && !remote) return <Suspense fallback={<div className="loading-screen"><BrandMark/><LoaderCircle className="spin" size={16}/></div>}><DesktopWelcome localHostReady={localHostReady || !!preparedLocal} connected={connected} save={saveLocal} beforePair={beforePair} discard={discard} cancel={cancel ?? (preparedLocal ? () => { void Promise.resolve(connected(preparedLocal)).catch(e => setError(String(e))); } : undefined)} pending={!!pending} remote={() => setRemote(true)}/></Suspense>;
   return <main className="pairing-page"><div className="pairing-layout"><div className={`pairing-card${!pending && phone ? " pairing-phone-welcome" : ""}`}>
-    {(desktop || cancel) && <nav className="pairing-navigation">
+    {(desktop || cancel || another && !createdIdentity && !!pendingConnection?.identity.pendingPairing) && <nav className="pairing-navigation">
       {desktop && <button type="button" className="pairing-host-cancel" disabled={busy} onClick={() => { setRemote(false); setError(""); }}><ChevronLeft size={16}/>{t("返回开始")}</button>}
+      {another && !createdIdentity && pendingConnection?.identity.pendingPairing && <button type="button" className="pairing-host-cancel" disabled={busy} onClick={() => { setAnother(false); setError(""); }}><ChevronLeft size={16}/>{t("返回配对申请")}</button>}
       {cancel && <button type="button" className="pairing-host-cancel pairing-return-conversations" disabled={busy} onClick={cancel}><ArrowLeft size={16} aria-hidden="true"/>{t("返回会话")}</button>}
     </nav>}
     <BrandMark/>{joiningDesktop && <ol className="pairing-journey" aria-label={t("加入步骤")}><li>{t("准备电脑")}</li><li aria-current="step">{t("手机确认连接")}</li><li>{t("确认加入网络")}</li></ol>}<h1>{pending ? t("用已配对设备确认") : t("连接你的 TaroBird")}</h1>
@@ -182,16 +195,22 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       <p className="pairing-countdown">{remaining ? t("有效时间 {0}:{1}", Math.floor(remaining / 60), String(remaining % 60).padStart(2, "0")) : t("配对码已过期，请扫描新的限时连接码。")}</p></>}
       <div role="status" className="pairing-connection-status">{remaining > 0 && <LoaderCircle className="spin" size={18}/>}<span>{status.status === "online" ? joiningDesktop ? t("已连接，正在继续加入网络…") : t("已连接，正在打开聊天…") : !pending.code ? busy ? t("正在核对申请…") : t("配对申请结果待确认，请核对上次申请。") : !remaining ? t("配对码已过期，请扫描新的限时连接码。") : status.awaitingApproval ? t("等待已配对设备确认…") : t("正在连接主机…")}</span></div>
       {status.error && <p className="error-text" role="alert">{status.error}</p>}
-      <button className="secondary full" disabled={busy || status.status === "connecting"} onClick={() => { setError(""); completing.current = false; pendingConnection?.resume(true); }}>{t("重新检查连接")}</button>
+      <button className="secondary full" disabled={busy || status.status === "connecting"} onClick={() => { setError(""); completing.current = false; connection?.resume(true); }}>{t("重新检查连接")}</button>
       {!pending.code && pending.request && <button className="primary full" disabled={busy} onClick={() => void submitPending()}>{busy ? t("正在核对申请…") : t("核对上次申请")}</button>}
-      {((!!pending.code && !remaining) || ["pairing_invite_invalid", "pairing_invite_expired", "pairing_invite_used", "pairing_invite_required"].includes(requestError ?? "")) && <button className="secondary full" disabled={busy} onClick={() => { setInputMode("scan"); setScan(true); }}>{t("扫描新的连接码")}</button>}
+      {((!!pending.code && !remaining) || ["pairing_invite_invalid", "pairing_invite_expired", "pairing_invite_used", "pairing_invite_required"].includes(requestError ?? "")) && <>
+        <button className="secondary full" disabled={busy} onClick={() => { setInputMode("scan"); setScan(true); }}>{t("扫描新的连接码")}</button>
+        <button className="secondary full" disabled={busy} onClick={() => { setInputMode("text"); setScan(true); }}>{t("粘贴连接信息")}</button>
+      </>}
+      {/* Pairing another host never cancels or renews this request. The desktop
+          network-join journey keeps its own guided steps. */}
+      {!joiningDesktop && <button className="secondary full" disabled={busy} onClick={startAnother}>{t("连接其他主机")}</button>}
       {!pending.code && requestError && <p className="settings-note">{t("若主机地址也已改变，请先在下方「无法连接？更新主机地址」更新线路。")}</p>}
       {pending.code && <details className="pairing-options"><summary>{t("其他确认方式")}</summary>
         {remaining > 0 && identity?.hubPublicKey && <Suspense fallback={null}><PairingCode payload={{ v: 1, kind: "approve", code: pending.code, hubPublicKey: identity.hubPublicKey }}/></Suspense>}
         <p className="muted">{t("也可以用已配对手机扫描此码，核对后点「确认配对」。")}</p>
         <p className="muted">{t("CLI 主机也支持手机确认；没有已配对设备时，可在主机终端运行 tarobot devices approve 加上上方的配对码。")}</p>
       </details>}
-      {pendingConnection && <details className="pairing-options"><summary>{t("无法连接？更新主机地址")}</summary><Suspense fallback={null}><RepairHostRoute connection={pendingConnection} online={status.status === "online"} busyChange={setBusy}/></Suspense>{manage && <button type="button" disabled={busy} onClick={manage}>{t("设备与网络")}</button>}</details>}
+      {connection && <details className="pairing-options"><summary>{t("无法连接？更新主机地址")}</summary><Suspense fallback={null}><RepairHostRoute connection={connection} online={status.status === "online"} busyChange={setBusy}/></Suspense>{manage && <button type="button" disabled={busy} onClick={manage}>{t("设备与网络")}</button>}</details>}
     </section> : <>
       {/* New users look for the QR code here; say where it comes from in the eye line, not only in the side guide. */}
       {!reviewing && <div className="pairing-qr-source" role="note"><Smartphone size={20} aria-hidden="true"/><div>
@@ -231,6 +250,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   {scan && <Suspense fallback={null}><PairingScanner initialMode={inputMode} close={() => setScan(false)} receive={(payload) => {
     if (payload.kind !== "connect") throw new Error(t("请扫描已信任设备显示的 Hub 二维码"));
     if (!payload.invite) throw new Error(pairingInviteError("invite_required"));
+    const pendingConnection = connection;
     if (pending && identity && pendingConnection) {
       if (payload.hubPublicKey !== identity.hubPublicKey) throw new Error(t("这不是当前主机的二维码。请扫描此主机显示的连接二维码。"));
       if (admission.current) throw new Error(t("正在核对上一份申请，请稍候。"));

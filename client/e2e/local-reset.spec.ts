@@ -133,7 +133,9 @@ test("failed local purge survives restart, stays disconnected and can retry with
     await page.getByRole("navigation", { name: "设置分类" }).getByRole("button", { name: /^网络与连接/ }).click();
     await page.evaluate(() => localStorage.setItem("fail-test-reset", "true"));
     await page.getByRole("dialog", { name: "设置", exact: true }).getByRole("button", { name: /^此设备的连接(?: |$)/ }).click(); await page.getByRole("button", { name: "从此设备移除", exact: true }).click(); await expect(page.getByRole("dialog", { name: `从此设备移除「${(await hub.profile.read()).name}」？`, exact: true })).toContainText("1 份草稿"); await page.getByRole("button", { name: "确认移除", exact: true }).click();
-    await expect(page.getByRole("dialog", { name: "此设备的连接", exact: true }).getByRole("alert")).toContainText("injected_purge_failure");
+    // The failed step is named in the UI language; the raw cause is not shown.
+    const failure = page.getByRole("dialog", { name: "此设备的连接", exact: true }).getByRole("alert");
+    await expect(failure).toHaveText("未能清理本地缓存。旧连接已停止，请重试清理。"); await expect(failure).not.toContainText("injected_purge_failure");
     await expect(page.getByRole("textbox", { name: "消息", exact: true })).toHaveCount(0);
     const initialSockets = sockets;
     const readSettings = () => page.evaluate(async () => {
