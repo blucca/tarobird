@@ -9,6 +9,9 @@ mod macos;
 #[cfg(any(target_os = "windows", test))]
 #[path = "../../src-tauri/src/notifications/windows_payload.rs"]
 mod windows_payload;
+#[cfg(any(target_os = "windows", test))]
+#[path = "../../src-tauri/src/notifications/windows_status.rs"]
+mod windows_status;
 #[cfg(target_os = "windows")]
 #[path = "../../src-tauri/src/notifications/windows.rs"]
 mod windows;
@@ -58,13 +61,15 @@ fn initialize() {
     #[cfg(target_os = "macos")]
     macos::initialize(state.clone());
 }
-async fn permission(request: bool) -> Result<String, String> {
+/// `confirmation`: the localized body of the Windows registration toast. Only
+/// an explicit request (`request == true`) may show it; macOS ignores it.
+async fn permission(request: bool, confirmation: Option<String>) -> Result<String, String> {
     #[cfg(target_os = "macos")]
-    { macos::permission(request).await }
+    { let _ = confirmation; macos::permission(request).await }
     #[cfg(target_os = "windows")]
-    { let _ = request; tokio::task::spawn_blocking(windows::permission).await.map_err(|_| "native_notification_unavailable")? }
+    { tokio::task::spawn_blocking(move || windows::permission(request, confirmation)).await.map_err(|_| "native_notification_unavailable")? }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    { let _ = request; Err("native_notification_unavailable".into()) }
+    { let _ = (request, confirmation); Err("native_notification_unavailable".into()) }
 }
 async fn send(raw: String, document: String) -> Result<(), String> {
     if raw.len() > 8192 { return Err("invalid_notification".into()); }
@@ -123,7 +128,31 @@ mod bindings {
         notifications().map_err(error)?.submissions.lock().map_err(|_| error("notification_state_unavailable".into()))?.new_document(); Ok(())
     }
     #[napi]
-    pub async fn notification_permission(request: bool) -> napi::Result<String> { permission(request).await.map_err(error) }
+    pub async fn notification_permission(request: bool, confirmation: Option<String>) -> napi::Result<String> { permission(request, confirmation).await.map_err(error) }
+    /// Windows only: bounded, path-free status JSON for support.
+    #[napi]
+    pub fn notification_diagnostics() -> napi::Result<String> {
+        #[cfg(target_os = "windows")]
+        { Ok(windows::diagnostics()) }
+        #[cfg(not(target_os = "windows"))]
+        { Err(error("native_notification_unavailable".into())) }
+    }
+    /// Windows only: where an explicit "create shortcut" click may create the link.
+    #[napi]
+    pub fn notification_shortcut_path() -> napi::Result<String> {
+        #[cfg(target_os = "windows")]
+        { windows_identity::shortcut_path().map(|path| path.to_string_lossy().into_owned()).map_err(error) }
+        #[cfg(not(target_os = "windows"))]
+        { Err(error("native_notification_unavailable".into())) }
+    }
+    /// Windows only: verify and register the link created at that path.
+    #[napi]
+    pub async fn notification_adopt_shortcut() -> napi::Result<()> {
+        #[cfg(target_os = "windows")]
+        { tokio::task::spawn_blocking(windows_identity::adopt_created_shortcut).await.map_err(|_| error("native_notification_unavailable".into()))?.map_err(error) }
+        #[cfg(not(target_os = "windows"))]
+        { Err(error("native_notification_unavailable".into())) }
+    }
     #[napi]
     pub async fn notification_show(raw: String, document: String) -> napi::Result<()> { send(raw, document).await.map_err(error) }
     #[napi]
@@ -145,6 +174,8 @@ mod bindings {
     pub fn notification_activation_args(args: Vec<String>) -> napi::Result<()> {
         #[cfg(target_os = "windows")]
         if let Some(target) = windows_payload::activation_args(&args) { notifications().map_err(error)?.activate(target); }
+        // The registration confirmation only brings the window forward.
+        else if windows_payload::ready_activation(&args) { notifications().map_err(error)?.focus(); }
         let _ = args; Ok(())
     }
     #[napi]

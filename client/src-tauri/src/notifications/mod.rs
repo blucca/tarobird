@@ -3,6 +3,8 @@ mod state;
 mod macos;
 #[cfg(any(target_os = "windows", test))]
 mod windows_payload;
+#[cfg(any(target_os = "windows", test))]
+mod windows_status;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
@@ -50,6 +52,7 @@ pub fn initialize() -> Arc<Notifications> {
 impl Notifications {
     pub fn activation_args(&self, args: &[String]) {
         if let Some(target) = windows_payload::activation_args(args) { self.activate(target); }
+        else if windows_payload::ready_activation(args) { self.focus(); }
     }
 }
 pub fn attach(app: &tauri::AppHandle) {
@@ -68,15 +71,19 @@ pub fn desktop_notification_context(window: tauri::WebviewWindow, state: tauri::
     Ok(state.submissions.lock().map_err(|_| "notification_state_unavailable")?.document_id())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Confirmation { body: String }
 #[tauri::command]
-pub async fn desktop_notification_permission(window: tauri::WebviewWindow, request: bool) -> Result<String, String> {
+pub async fn desktop_notification_permission(window: tauri::WebviewWindow, request: bool, confirmation: Option<Confirmation>) -> Result<String, String> {
     main_window(&window)?;
+    let confirmation = confirmation.map(|value| value.body);
     #[cfg(target_os = "macos")]
-    return macos::permission(request).await;
+    { let _ = confirmation; return macos::permission(request).await; }
     #[cfg(target_os = "windows")]
-    { let _ = request; return tauri::async_runtime::spawn_blocking(windows::permission).await.map_err(|_| "native_notification_unavailable")?; }
+    { return tauri::async_runtime::spawn_blocking(move || windows::permission(request, confirmation)).await.map_err(|_| "native_notification_unavailable")?; }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    { let _ = request; Err("native_notification_unavailable".into()) }
+    { let _ = (request, confirmation); Err("native_notification_unavailable".into()) }
 }
 #[tauri::command]
 pub async fn desktop_notification_show(window: tauri::WebviewWindow, state: tauri::State<'_, Arc<Notifications>>, notice: Notice, document_id: String) -> Result<(), String> {
