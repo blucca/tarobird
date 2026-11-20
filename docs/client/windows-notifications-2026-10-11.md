@@ -5,10 +5,12 @@
 
 ## 行为
 
-Windows 使用本应用 AUMID `com.tarocub.client` 的 WinRT `ToastNotifier.Setting`，
+Windows 使用本应用 AUMID `com.tarobot.client` 的 WinRT `ToastNotifier.Setting`，
 不使用桌面插件恒定返回 granted 的权限结果。系统禁用时保持禁用；只有明确开启
 操作才更新 Hub 偏好。缺少有效安装快捷方式、系统版本过低或权限读取失败时，
 设置显示中英文操作指引。支持 Windows 10 1703（15063）及以后版本。
+（2026-11-20 起：读不到设置不再等于被关闭，见
+[首条通知登记](windows-notification-first-toast-2026-11-20.md)。）
 
 通知使用 protocol-only ToastGeneric；专用 `tarocub://notification/…` 严格验证
 主机、对话和消息标识，拒绝重复／未知参数、路径注入及 fragment。正文和 launch
