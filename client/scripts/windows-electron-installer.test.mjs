@@ -382,3 +382,72 @@ test('a backup refusal after notification cleanup reports the completed cleanup 
   assert.match(install, /StrCpy \$BirdOperation "\$\(birdInstall\)"/);
   assert.match(install, /BirdBackup/); assert.doesNotMatch(install, /clear-notification-history/);
 });
+
+// #50 follow-up. Installer-run, partial and helper-less uninstalls on Windows
+// need real acceptance; these checks pin the decisions the scripts encode.
+const templates = async (...files) => Promise.all(files.map(file => readFile(path.join(TEMPLATE_DIR, file), 'utf8')));
+const between = (source, start, end) => { const from = source.indexOf(start); assert.ok(from >= 0, 'missing ' + start); const to = source.indexOf(end, from + start.length); assert.ok(to > from, 'missing ' + end); return source.slice(from, to); };
+const ordered = (source, ...fragments) => {
+  let start = 0;
+  for (const fragment of fragments) {
+    const index = source.indexOf(fragment, start);
+    assert.ok(index >= start, 'missing or out of order: ' + fragment);
+    start = index + fragment.length;
+  }
+};
+
+test('an uninstaller the installer runs in place keeps only its own running image', async () => {
+  const [nsi] = await templates('installer.nsi');
+  // The reinstall page runs the installed uninstaller with `_?=` (no temporary copy, NSIS 3.2.2).
+  assert.match(between(nsi, 'reinst_uninstall:', 'reinst_done:'), /StrCpy \$R1 "\$R1 _\?=\$4"[\s\S]*ExecWait '\$R1' \$0/);
+  const section = nsi.split('Section Uninstall')[1];
+  ordered(section, '!include "${TB_RESOURCES_UNINSTALL}"', '${If} $EXEPATH != "$INSTDIR\\uninstall.exe"',
+    '!insertmacro BirdDeleteOwnedFile "$INSTDIR\\uninstall.exe"', '${Else}', '$(birdSelfKept)', '${EndIf}', 'DeleteRegKey SHCTX "Software\\Classes\\tarocub"');
+  // Only the running image is exempt; every other owned file keeps its guarded removal.
+  assert.equal(section.split('$EXEPATH').length - 1, 1);
+  assert.match(between(section, 'CheckIfAppIsRunning', '!include "${TB_RESOURCES_UNINSTALL}"'), /^(?![\s\S]*\$EXEPATH)/);
+});
+
+test('a rerun after a partial uninstall skips only notification cleanup an earlier attempt completed', async () => {
+  const [hooks, nsi] = await templates('installer-hooks.nsh', 'installer.nsi');
+  const uninstall = hooks.split('!macro NSIS_HOOK_PREUNINSTALL')[1].split('!macroend')[0];
+  ordered(uninstall, 'StrCpy $TaroBotNoticesCleared 0', 'bird_notice_retry:');
+  const notice = between(uninstall, 'bird_notice_retry:', '; Back up only after');
+  ordered(notice, 'ReadRegStr $R0 SHCTX "Software\\Classes\\tarocub\\shell\\open\\command"',
+    '${AndIf} ${FileExists} "$INSTDIR\\${MAINBINARYNAME}.exe"', '--clear-notification-history', '"NOTICE-CLEAR" bird_notice_retry',
+    'StrCpy $TaroBotNoticesCleared 1', '${ElseIf} $R0 ==', 'ReadRegStr $R0 SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}"',
+    '${If} $R0 == "1"', '$(birdNoticeClearedEarlier)', 'StrCpy $TaroBotNoticesCleared 1', '${Else}', '"NOTICE-MISSING" ""');
+  // A missing program is never executed, and an unproven state stops without a futile retry.
+  assert.doesNotMatch(notice.slice(notice.indexOf('${ElseIf} $R0 ==')), /ExecWait|bird_notice_retry/);
+  const section = nsi.split('Section Uninstall')[1];
+  ordered(section, '!insertmacro NSIS_HOOK_PREUNINSTALL', 'CheckIfAppIsRunning', '${If} $TaroBotNoticesCleared = 1',
+    'WriteRegStr SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}" "1"', '!insertmacro BirdDeleteOwnedFile');
+  // The program is the first file removed, so the marker only ever describes an App that can no longer run.
+  assert.ok(section.indexOf('!insertmacro BirdDeleteOwnedFile "$INSTDIR\\${MAINBINARYNAME}.exe"') === section.indexOf('!insertmacro BirdDeleteOwnedFile'));
+  // Any install or repair makes the App runnable again and drops the marker.
+  const install = nsi.split('Section Uninstall')[0];
+  ordered(install, 'WriteRegStr SHCTX "${UNINSTKEY}" "UninstallString"', 'DeleteRegValue SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}"');
+  assert.match(hooks, /!define TAROBOTNOTICESCLEARED "TaroBirdNoticesCleared"/);
+});
+
+test('a Host runtime without its stopper is never treated as stopped', async () => {
+  const [hooks] = await templates('installer-hooks.nsh');
+  const stop = hooks.split('!macro TaroBotStopLocalHost')[1].split('!macroend')[0];
+  ordered(stop, 'StrCpy $TaroBotHostStopper ""', 'StrCpy $R0 0', '${If} $TaroBotHostStopper == ""', '${AndIf} ${FileExists} "$INSTDIR\\resources\\host\\node.exe"', 'StrCpy $R0 1',
+    '${ElseIf} $TaroBotHostStopper == ""', '${AndIf} ${FileExists} "$INSTDIR\\host\\node.exe"', 'StrCpy $R0 1');
+  // The uninstaller has no helper of its own: it stops before any change, without a futile retry.
+  ordered(stop, '${If} $R0 = 1', '!if "${INSTALLER}" != "1"', '"HOST-NO-STOPPER" ""', '!endif');
+  // The installer reaches its read-only recovery confirmation even without an installed stopper.
+  ordered(stop, '${If} $TaroBotHostStopper != ""', '${OrIf} $R0 = 1', '!if "${INSTALLER}" == "1"', '--confirm-host-stopped-v2', '${If} $R0 != 0', 'BirdProblem');
+  assert.doesNotMatch(stop, /taskkill|KillProcess|nsProcess/i);
+});
+
+test('new #50 diagnostics are localized and path-free in both languages', async () => {
+  const [nsi, hooks, en, zh] = await templates('installer.nsi', 'installer-hooks.nsh', 'English.nsh', 'SimpChinese.nsh');
+  const keys = ['birdNoticeClearedEarlier', 'birdNoticeMissing', 'birdNoStopper', 'birdRepairThenUninstall', 'birdSelfKept'];
+  for (const key of keys) assert.ok((nsi + hooks).includes(`$(${key})`), key + ' is used');
+  for (const language of [en, zh]) {
+    const strings = new Map([...language.matchAll(/^LangString (bird\w+) \S+ "(.+)"$/gm)].map(match => [match[1], match[2]]));
+    for (const key of keys) { assert.ok(strings.has(key), key); assert.doesNotMatch(strings.get(key), /\$|[\\/]/, key); }
+  }
+});

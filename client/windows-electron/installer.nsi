@@ -700,6 +700,8 @@ Section Install
   WriteRegStr SHCTX "${UNINSTKEY}" "Publisher" "${MANUFACTURER}"
   WriteRegStr SHCTX "${UNINSTKEY}" "InstallLocation" "$\"$INSTDIR$\""
   WriteRegStr SHCTX "${UNINSTKEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
+  ; This install (or repair) can run again and clears its own notifications.
+  DeleteRegValue SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}"
   WriteRegDWORD SHCTX "${UNINSTKEY}" "NoModify" "1"
   WriteRegDWORD SHCTX "${UNINSTKEY}" "NoRepair" "1"
 
@@ -777,15 +779,29 @@ Section Uninstall
 
   !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"
 
+  ; From here on the program cannot run again, so a later attempt cannot clear
+  ; notifications itself. Record that this attempt already cleared them.
+  ${If} $TaroBotNoticesCleared = 1
+    WriteRegStr SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}" "1"
+  ${EndIf}
+
   ; Delete the app directory and its content from disk
-  ; Copy main executable
+  ; The main executable goes first: until it is gone nothing else is removed,
+  ; so a failed attempt either leaves a runnable App or no App at all.
   !insertmacro BirdDeleteOwnedFile "$INSTDIR\${MAINBINARYNAME}.exe"
 
   ; Delete resources (generated: exactly the files this version installed)
   !include "${TB_RESOURCES_UNINSTALL}"
 
-  ; Delete uninstaller
-  !insertmacro BirdDeleteOwnedFile "$INSTDIR\uninstall.exe"
+  ; Delete uninstaller. Started with `_?=` (the installer's reinstall path) it
+  ; runs in place instead of from a temporary copy (NSIS 3.2.2), and Windows
+  ; cannot delete a running program; NSIS leaves that file to the caller,
+  ; whose install writes a new uninstaller. Any other failure is reported.
+  ${If} $EXEPATH != "$INSTDIR\uninstall.exe"
+    !insertmacro BirdDeleteOwnedFile "$INSTDIR\uninstall.exe"
+  ${Else}
+    DetailPrint "$BirdOperation — $(birdFilesStage) — $(birdSelfKept)"
+  ${EndIf}
 
   ; Delete deep links
   ReadRegStr $R7 SHCTX "Software\Classes\tarocub\shell\open\command" ""
