@@ -182,6 +182,8 @@ async function viewOnlyPhase({ receipt, evidence, target, electronBin, addonPath
   child.stderr.on('data', () => {});
   const statusNow = async token => screenStatusSchema.parse(await (await api('/api/screens/status?includeWindows=1', token)).json());
   const up = await wait(async () => (await statusNow(remote.token)).desktop !== null, 20000);
+  // The entry prints `started` only after its own registration completed.
+  await wait(() => lines.some(l => l.startsWith('started ')), 20000);
   const status = await statusNow(remote.token);
   receipt.expect(phase, 'registers-with-existing-hub', up && lines.some(l => l.startsWith('started registered=true')) && status.desktop?.platform === 'windows',
     `up=${up}, lines=${JSON.stringify(lines.slice(0, 4))}, displays=${status.desktop?.displays?.length ?? 0}`);
