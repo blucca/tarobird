@@ -1663,12 +1663,14 @@ export class HubServer {
           await reply(200, view); return;
         } catch (error) { if (error instanceof VoiceSettingsError) throw new HubError(error.code, error.status); throw error; }
       }
-      if (route === "/api/screens/status" && req.method === "GET") { await reply(200, await this.remoteScreen.status(session)); return; }
+      // `includeWindows=1`: this client can read a Windows desktop. Older ones parse the reply strictly as a Mac's.
+      const screenViewer = { windows: url.searchParams.get("includeWindows") === "1" };
+      if (route === "/api/screens/status" && req.method === "GET") { await reply(200, await this.remoteScreen.status(session, screenViewer)); return; }
       if (route === "/api/screens/configure" && req.method === "POST") {
         const { command, proof } = signedScreenConfigureSchema.parse(await this.jsonBody(req, SCREEN_MAX_CONTROL_BYTES));
         await reply(200, await this.remoteScreen.configure(session, command, proof)); return;
       }
-      if (route === "/api/screens/sessions" && req.method === "POST") { await reply(201, await this.remoteScreen.open(session, await this.jsonBody(req, SCREEN_MAX_CONTROL_BYTES))); return; }
+      if (route === "/api/screens/sessions" && req.method === "POST") { await reply(201, await this.remoteScreen.open(session, await this.jsonBody(req, SCREEN_MAX_CONTROL_BYTES), screenViewer)); return; }
       if (route === "/api/screens/stop" && req.method === "POST") { const input = screenStopSchema.parse(await this.jsonBody(req, 4096)); await this.remoteScreen.stop(session, input.sessionId); await reply(200, { ok: true }); return; }
       if (route === "/api/integrations/asr" && req.method === "GET") {
         await requireOwner(); await reply(200, await this.asrSetup.status()); return;

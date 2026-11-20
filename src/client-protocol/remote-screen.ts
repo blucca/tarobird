@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { SCREEN_MAC_KEYCODES } from "./screen-keys.js";
+import { SCREEN_MAC_KEYCODES, SCREEN_TARGET_PLATFORMS } from "./screen-keys.js";
 import { idSchema } from "./index.js";
 import { deviceActionProofSchema } from "./device-actions.js";
 import { SCREEN_QUALITIES, SCREEN_STREAM_MAX_AREA, SCREEN_STREAM_MAX_EDGE } from "./screen-quality.js";
@@ -11,6 +11,11 @@ export const REMOTE_SCREEN_CAPABILITY = "desktop.screen.v1";
 export const REMOTE_SCREEN_QUALITY_CAPABILITY = "desktop.screen.quality.v1";
 /** Host control socket → target (`controlCapabilities`): the hello may carry `features`. */
 export const SCREEN_CONTROL_QUALITY_CAPABILITY = "screen-quality-v1";
+/** Host control socket → target (`controlCapabilities`): this Host accepts a
+ * Windows desktop in the hello and in `status`. A Windows target never
+ * registers with a Host that does not say so: an older Host parses the hello
+ * strictly, would refuse it, and the target would reconnect for ever. */
+export const SCREEN_CONTROL_WINDOWS_CAPABILITY = "screen-windows-v1";
 /** Target → Hub (hello `features`): `start` may carry `quality`. */
 export const SCREEN_SERVICE_QUALITY_FEATURE = "screen.quality.v1";
 export const screenQualitySchema = z.enum(SCREEN_QUALITIES);
@@ -47,8 +52,10 @@ export const screenDisplaySchema = z.object({
 }).strict();
 export type ScreenDisplay = z.infer<typeof screenDisplaySchema>;
 export const screenDesktopSchema = z.object({
-  desktopId: idSchema, instanceId: idSchema, loginSession: idSchema, platform: z.literal("macos"),
+  desktopId: idSchema, instanceId: idSchema, loginSession: idSchema, platform: z.enum(SCREEN_TARGET_PLATFORMS),
   capture: z.enum(["granted", "denied", "not-determined", "unavailable"]),
+  // The wire name is the Mac permission's. It means "this target can post
+  // input now" on every platform; Windows has no such permission.
   accessibility: z.boolean(), locked: z.boolean(),
   displays: z.array(screenDisplaySchema).max(16),
 }).strict().refine(v => new Set(v.displays.map(d => d.id)).size === v.displays.length, "duplicate_screen_display");

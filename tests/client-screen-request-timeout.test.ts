@@ -46,8 +46,8 @@ describe("remote-screen HTTP calls have their own short bound", () => {
   it("is 15 s, far below the general 5-minute HTTP bound", () => { expect(SCREEN_REQUEST_TIMEOUT_MS).toBe(15_000); });
 
   for (const [name, call, route] of [
-    ["screenStatus", (c: InstanceType<typeof HubConnection>) => c.screenStatus(), "/api/screens/status"],
-    ["screenOpen", (c: InstanceType<typeof HubConnection>) => c.screenOpen(open), "/api/screens/sessions"],
+    ["screenStatus", (c: InstanceType<typeof HubConnection>) => c.screenStatus(), "/api/screens/status?includeWindows=1"],
+    ["screenOpen", (c: InstanceType<typeof HubConnection>) => c.screenOpen(open), "/api/screens/sessions?includeWindows=1"],
     ["screenStop", (c: InstanceType<typeof HubConnection>) => c.screenStop("screen_1"), "/api/screens/stop"],
   ] as const) {
     it(`${name}: a stalled Host fails with screen_request_timeout after 15 s, once, and a later call works`, async () => {

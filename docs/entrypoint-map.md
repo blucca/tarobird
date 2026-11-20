@@ -176,7 +176,7 @@ is retained. `src-tauri/` remains for this compatibility reader and historical
 regressions, not the shipping desktop shell. A source migration is not an
 installed release: see [acceptance and remaining native gates](client/electron-migration-2026-10-30.md).
 
-Remote Mac screen/control (#99) uses `client/electron/screen-service.mjs` for
+Remote screen/control uses `client/electron/screen-service.mjs` for
 App-level target lifetime and `screen-viewer.mjs` for document-scoped viewing.
 `src/hub/remote-screen.ts` owns grants/leases, and `remote-screen-sockets.ts`
 provides independent bounded media/control channels. Shared contracts live in
@@ -192,9 +192,10 @@ viewer. `ConnectionPanel` provides a selected-Host viewer fallback for network,
 preferences and ADHD entry points. `RemoteScreenSettings` reads the GUI device's
 Hub status, and reads native status only after `useDesktopLocalHost` confirms
 the selected Host is this computer. A native `supported: false` with reason
-`screen_platform_unsupported` (Windows today) shows "Not supported" without the
-switch, device grants or reinstall advice; `screen_native_unavailable` keeps the
-Mac reinstall notice. Regressions: Electron `screen-host-control`,
+`screen_platform_unsupported` shows "Not supported" without the switch, device
+grants or reinstall advice; `screen_native_unavailable` keeps the platform's
+reinstall notice. Windows targets require the native Windows backend and the
+Host's `screen-windows-v1` capability. Regressions: Electron `screen-host-control`,
 `screen-service`, `desktop-services`; root `screen-service-hub`; browser
 `screen-settings`, `remote-screen`, `local-relay`. See
 [readiness and permission repair](client/remote-screen-readiness-2026-10-31.md).
@@ -235,6 +236,9 @@ default) and an optional `inputActive` check (default `screenCanvasFocused`).
 default). Regressions: root `remote-screen-viewer-seams`, `remote-screen-keys-target`,
 `client-screen-errors`; Electron `screen-service-hello` pins the macOS target's
 hello text byte for byte.
+
+The [Windows target extension](client/remote-screen-platforms-2026-11-21.md)
+maps Windows physical input, held-input recovery and legacy-client negotiation.
 
 `npm --prefix client run test:electron` runs the main/preload contract tests.
 `electron/tests/packaged.smoke.mjs`, `packaged-migration.smoke.mjs` and the real

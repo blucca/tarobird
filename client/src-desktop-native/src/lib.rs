@@ -34,6 +34,10 @@ mod saved_file_quarantine;
 #[cfg(target_os = "macos")]
 #[cfg_attr(not(feature = "addon"), allow(dead_code))]
 mod screen_macos;
+// Built for tests on every host: everything except its `os` half is plain logic.
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(any(not(target_os = "windows"), not(feature = "addon")), allow(dead_code))]
+mod screen_windows;
 use state::{Inbox, Notice, Operations, Submissions, Target};
 use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
 
@@ -209,12 +213,43 @@ mod bindings {
         { let _ = enabled; Err(error("autostart_unavailable".into())) }
     }
 
-    // Remote screen (#99). macOS only; every other platform reports unavailable.
+    // Remote screen (#99, #48). macOS and Windows; every other platform reports unavailable.
     #[napi(object)]
     pub struct ScreenPoint { pub x: f64, pub y: f64 }
     #[napi(object)]
+    pub struct ScreenRect { pub x: i32, pub y: i32, pub width: i32, pub height: i32 }
+    /// The platform this addon controls as a remote-screen target. Windows is
+    /// named only by the real backend: an older addon whose screen functions
+    /// are stubs has no such function, and must not be taken for a target.
+    #[napi]
+    pub fn screen_target_platform() -> Option<String> {
+        #[cfg(target_os = "macos")] { Some("macos".into()) }
+        #[cfg(target_os = "windows")] { Some("windows".into()) }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { None }
+    }
+    /// Windows: the physical bounds of every monitor, as Windows lists them.
+    #[napi]
+    pub fn screen_monitors() -> napi::Result<Vec<ScreenRect>> {
+        #[cfg(target_os = "windows")] { Ok(screen_windows::monitors().map_err(error)?.into_iter().map(|r| ScreenRect { x: r.x, y: r.y, width: r.width, height: r.height }).collect()) }
+        #[cfg(not(target_os = "windows"))] { Ok(Vec::new()) }
+    }
+    /// Windows: the physical button ("left" | "right" | "other") that Windows
+    /// takes for `button` by meaning, as the left/right swap setting is now.
+    /// The caller records the answer before pressing it with `screenMouse`.
+    #[napi]
+    pub fn screen_physical_button(button: String) -> napi::Result<String> {
+        #[cfg(target_os = "windows")] { Ok(screen_windows::physical_button_now(screen_windows::Button::parse(&button).map_err(error)?).name().into()) }
+        #[cfg(not(target_os = "windows"))] { let _ = button; Err(error("screen_unavailable".into())) }
+    }
+    /// Windows: how many keys and buttons this process pressed and could not release yet.
+    #[napi]
+    pub fn screen_release_pending() -> u32 {
+        #[cfg(target_os = "windows")] { screen_windows::held() }
+        #[cfg(not(target_os = "windows"))] { 0 }
+    }
+    #[napi(object)]
     pub struct ScreenSession { pub available: bool, pub on_console: bool, pub locked: bool, pub user: Option<i64>, pub audit: Option<i64>, pub unique: Option<String>, pub login_done: bool }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn screen_unavailable<T>() -> napi::Result<T> { Err(error("screen_unavailable".into())) }
     fn flags(value: f64) -> napi::Result<u64> {
         if value.is_finite() && value >= 0.0 && value <= u32::MAX as f64 && value.fract() == 0.0 { Ok(value as u64) } else { Err(error("screen_input_invalid".into())) }
@@ -227,39 +262,51 @@ mod bindings {
     #[napi]
     pub fn screen_session() -> ScreenSession {
         #[cfg(target_os = "macos")] { let s = screen_macos::session_state(); ScreenSession { available: s.available, on_console: s.on_console, locked: s.locked, user: s.user, audit: s.audit, unique: s.unique, login_done: s.login_done } }
-        #[cfg(not(target_os = "macos"))] { ScreenSession { available: false, on_console: false, locked: false, user: None, audit: None, unique: None, login_done: false } }
+        #[cfg(target_os = "windows")] { let s = screen_windows::session_state(); ScreenSession { available: s.available, on_console: s.on_console, locked: s.locked, user: None, audit: None, unique: s.unique, login_done: s.available } }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { ScreenSession { available: false, on_console: false, locked: false, user: None, audit: None, unique: None, login_done: false } }
     }
     #[napi]
     pub fn screen_mouse(action: String, button: String, x: f64, y: f64, clicks: i64, modifiers: f64) -> napi::Result<()> {
         #[cfg(target_os = "macos")] { let modifiers = flags(modifiers)?;
           screen_macos::post_mouse(screen_macos::Mouse::parse(&action).map_err(error)?, screen_macos::Button::parse(&button).map_err(error)?, screen_macos::CGPoint { x, y }, clicks, modifiers).map_err(error) }
-        #[cfg(not(target_os = "macos"))] { let _ = (action, button, x, y, clicks, flags(modifiers)); screen_unavailable() }
+        // Windows: `x`/`y` are physical pixels and `button` is a physical button (see `screen_physical_button`).
+        // Modifier state is the system's own; `modifiers` is only validated.
+        #[cfg(target_os = "windows")] { flags(modifiers)?;
+          screen_windows::post_mouse(screen_windows::Mouse::parse(&action).map_err(error)?, screen_windows::Button::parse(&button).map_err(error)?, x, y, clicks).map_err(error) }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { let _ = (action, button, x, y, clicks, flags(modifiers)); screen_unavailable() }
     }
     #[napi]
     pub fn screen_scroll(x: f64, y: f64, wheel1: i32, wheel2: i32, modifiers: f64) -> napi::Result<()> {
         #[cfg(target_os = "macos")] { screen_macos::post_scroll(screen_macos::CGPoint { x, y }, wheel1, wheel2, flags(modifiers)?).map_err(error) }
-        #[cfg(not(target_os = "macos"))] { let _ = (x, y, wheel1, wheel2, flags(modifiers)); screen_unavailable() }
+        // Windows: `wheel1` is the vertical and `wheel2` the horizontal amount in WHEEL_DELTA units.
+        #[cfg(target_os = "windows")] { flags(modifiers)?; screen_windows::post_scroll(x, y, wheel1, wheel2).map_err(error) }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { let _ = (x, y, wheel1, wheel2, flags(modifiers)); screen_unavailable() }
     }
     #[napi]
     pub fn screen_key(keycode: u32, down: bool, modifiers: f64, modifier: bool, repeat: bool) -> napi::Result<()> {
         let keycode = u16::try_from(keycode).map_err(|_| error("screen_input_invalid".into()))?;
         #[cfg(target_os = "macos")] { screen_macos::post_key(keycode, down, flags(modifiers)?, modifier, repeat).map_err(error) }
-        #[cfg(not(target_os = "macos"))] { let _ = (keycode, down, flags(modifiers), modifier, repeat); screen_unavailable() }
+        // Windows: `keycode` is a scan code, `| 0x100` for an extended key. A repeat is another down.
+        #[cfg(target_os = "windows")] { flags(modifiers)?; let _ = repeat; screen_windows::post_key(keycode, down, modifier).map_err(error) }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { let _ = (keycode, down, flags(modifiers), modifier, repeat); screen_unavailable() }
     }
     #[napi]
     pub fn screen_text(text: String) -> napi::Result<()> {
         #[cfg(target_os = "macos")] { screen_macos::post_text(&text).map_err(error) }
-        #[cfg(not(target_os = "macos"))] { let _ = text; screen_unavailable() }
+        #[cfg(target_os = "windows")] { screen_windows::post_text(&text).map_err(error) }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { let _ = text; screen_unavailable() }
     }
     #[napi]
     pub fn screen_cursor() -> napi::Result<ScreenPoint> {
         #[cfg(target_os = "macos")] { let p = screen_macos::cursor(); Ok(ScreenPoint { x: p.x, y: p.y }) }
-        #[cfg(not(target_os = "macos"))] { screen_unavailable() }
+        #[cfg(target_os = "windows")] { let (x, y) = screen_windows::cursor().map_err(error)?; Ok(ScreenPoint { x: x as f64, y: y as f64 }) }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { screen_unavailable() }
     }
     #[napi]
     pub fn screen_release_all() -> napi::Result<u32> {
         #[cfg(target_os = "macos")] { screen_macos::release_all().map_err(error) }
-        #[cfg(not(target_os = "macos"))] { screen_unavailable() }
+        #[cfg(target_os = "windows")] { screen_windows::release_all().map_err(error) }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { screen_unavailable() }
     }
     #[napi(object)]
     pub struct ScreenMonitor { pub alive: bool, pub failed: bool, pub foreign: u32, pub interrupted: u32 }
@@ -268,27 +315,47 @@ mod bindings {
     #[napi]
     pub fn screen_monitor_start() -> napi::Result<()> {
         #[cfg(target_os = "macos")] { screen_macos::monitor_start().map_err(error) }
-        #[cfg(not(target_os = "macos"))] { screen_unavailable() }
+        #[cfg(target_os = "windows")] { screen_windows::monitor_start().map_err(error) }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { screen_unavailable() }
     }
     /// Input Monitoring access for the takeover monitor; `request` only on an explicit user gesture.
+    /// Windows asks no permission for its hooks, so there is nothing to grant or request.
     #[napi]
     pub fn screen_monitor_access(request: bool) -> bool {
         #[cfg(target_os = "macos")] { screen_macos::listen_access(request) }
-        #[cfg(not(target_os = "macos"))] { let _ = request; false }
+        #[cfg(target_os = "windows")] { let _ = request; true }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { let _ = request; false }
     }
     #[napi]
     pub fn screen_monitor_poll() -> ScreenMonitor {
         #[cfg(target_os = "macos")] { let p = screen_macos::monitor_poll(); ScreenMonitor { alive: p.alive, failed: p.failed, foreign: p.foreign.min(u32::MAX as u64) as u32, interrupted: p.interrupted.min(u32::MAX as u64) as u32 } }
-        #[cfg(not(target_os = "macos"))] { ScreenMonitor { alive: false, failed: false, foreign: 0, interrupted: 0 } }
+        #[cfg(target_os = "windows")] { let p = screen_windows::monitor_poll(); ScreenMonitor { alive: p.alive, failed: p.failed, foreign: p.foreign.min(u32::MAX as u64) as u32, interrupted: p.interrupted.min(u32::MAX as u64) as u32 } }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))] { ScreenMonitor { alive: false, failed: false, foreign: 0, interrupted: 0 } }
     }
     #[napi]
     pub fn screen_monitor_stop() {
         #[cfg(target_os = "macos")] { screen_macos::monitor_stop() }
+        #[cfg(target_os = "windows")] { screen_windows::monitor_stop() }
     }
     #[napi]
     pub fn screen_release_stale() -> napi::Result<()> {
         #[cfg(target_os = "macos")] { screen_macos::release_stale().map_err(error) }
-        #[cfg(not(target_os = "macos"))] { screen_unavailable() }
+        // Windows never lifts input it has no record of; see `screen_release_candidates`.
+        #[cfg(not(target_os = "macos"))] { Err(error("screen_unavailable".into())) }
+    }
+    /// Windows, after the App died during control: lifts those of `keys` (scan
+    /// code descriptors) and `buttons` (physical) that are still down. Both come from the
+    /// record the dead process wrote before pressing; nothing else is examined.
+    /// Returns how many releases Windows took; fails if it did not take them all.
+    #[napi]
+    pub fn screen_release_candidates(keys: Vec<u32>, buttons: Vec<String>) -> napi::Result<u32> {
+        #[cfg(target_os = "windows")]
+        {
+            let keys = keys.into_iter().map(u16::try_from).collect::<Result<Vec<u16>, _>>().map_err(|_| error("screen_input_invalid".into()))?;
+            let buttons = buttons.iter().map(|button| screen_windows::Button::parse(button)).collect::<Result<Vec<_>, _>>().map_err(error)?;
+            screen_windows::release_candidates(&keys, &buttons).map_err(error)
+        }
+        #[cfg(not(target_os = "windows"))] { let _ = (keys, buttons); Err(error("screen_unavailable".into())) }
     }
     #[napi]
     pub fn screen_capture_access(request: bool) -> bool {

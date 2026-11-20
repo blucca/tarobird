@@ -1,13 +1,15 @@
 /** Remote screen keyboard model. Pure and browser-safe (no imports), shared by
- * the viewer UI and the macOS target service. Codes are W3C `KeyboardEvent.code`
- * values; for a macOS target they are Mac keys: Meta = Command, Alt = Option,
- * Control = Control. A controller maps its codes for the target platform with
+ * the viewer UI and the target services. Codes are W3C `KeyboardEvent.code`
+ * values, i.e. key positions: the target's own keyboard layout decides which
+ * character a position types. For a macOS target they are Mac keys (Meta =
+ * Command, Alt = Option); for a Windows target Meta is the Windows key. A
+ * controller maps its codes for the target platform with
  * `screenControllerCode` BEFORE sending. */
 
 /** Target (controlled computer) platforms, as `status.desktop.platform` reports
- * them. The protocol accepts only macOS today. A new target platform joins this
- * list together with its negotiated protocol value, key mapping and shortcuts. */
-export const SCREEN_TARGET_PLATFORMS = Object.freeze(['macos'] as const);
+ * them. A new target platform joins this list together with its negotiated
+ * protocol value, key mapping and shortcuts. */
+export const SCREEN_TARGET_PLATFORMS = Object.freeze(['macos', 'windows'] as const);
 export type ScreenTargetPlatform = typeof SCREEN_TARGET_PLATFORMS[number];
 /** The controller's own keyboard, which produced the `KeyboardEvent.code`. */
 export type ScreenControllerPlatform = 'mac' | 'windows';
@@ -36,6 +38,35 @@ export const SCREEN_MAC_KEYCODES: Readonly<Record<string, number>> = Object.free
   NumpadEnter: 0x4c, NumpadSubtract: 0x4e, NumpadEqual: 0x51, NumLock: 0x47,
 });
 
+/** Set in a Windows key descriptor for an extended (E0-prefixed) key. */
+export const SCREEN_WINDOWS_EXTENDED = 0x100;
+const E0 = SCREEN_WINDOWS_EXTENDED;
+/** Windows keys as Set 1 scan codes, for `SendInput` with `KEYEVENTF_SCANCODE`
+ * (`| SCREEN_WINDOWS_EXTENDED` adds `KEYEVENTF_EXTENDEDKEY`). A scan code is a
+ * position, like the Mac codes above, so the two tables name the same keys and
+ * every code the protocol accepts has an entry in both. The values are the
+ * `win` column of Chromium's `dom_code_data.inc`, the public table from which
+ * Chrome Remote Desktop injects keys the same way (high byte E0 = extended).
+ * Num Lock is extended there (0xE045); plain 0x45 is Pause. */
+export const SCREEN_WINDOWS_SCANCODES: Readonly<Record<string, number>> = Object.freeze({
+  KeyA: 0x1e, KeyS: 0x1f, KeyD: 0x20, KeyF: 0x21, KeyH: 0x23, KeyG: 0x22, KeyZ: 0x2c, KeyX: 0x2d, KeyC: 0x2e, KeyV: 0x2f,
+  KeyB: 0x30, KeyQ: 0x10, KeyW: 0x11, KeyE: 0x12, KeyR: 0x13, KeyY: 0x15, KeyT: 0x14, KeyO: 0x18, KeyU: 0x16, KeyI: 0x17,
+  KeyP: 0x19, KeyL: 0x26, KeyJ: 0x24, KeyK: 0x25, KeyN: 0x31, KeyM: 0x32,
+  Digit1: 0x02, Digit2: 0x03, Digit3: 0x04, Digit4: 0x05, Digit6: 0x07, Digit5: 0x06, Digit9: 0x0a, Digit7: 0x08, Digit8: 0x09, Digit0: 0x0b,
+  Equal: 0x0d, Minus: 0x0c, BracketRight: 0x1b, BracketLeft: 0x1a, Quote: 0x28, Semicolon: 0x27, Backslash: 0x2b,
+  Comma: 0x33, Slash: 0x35, Period: 0x34, Backquote: 0x29, IntlBackslash: 0x56,
+  Enter: 0x1c, Tab: 0x0f, Space: 0x39, Backspace: 0x0e, Escape: 0x01, Delete: E0 | 0x53, Insert: E0 | 0x52,
+  Home: E0 | 0x47, End: E0 | 0x4f, PageUp: E0 | 0x49, PageDown: E0 | 0x51,
+  ArrowLeft: E0 | 0x4b, ArrowRight: E0 | 0x4d, ArrowDown: E0 | 0x50, ArrowUp: E0 | 0x48,
+  MetaRight: E0 | 0x5c, MetaLeft: E0 | 0x5b, ShiftLeft: 0x2a, CapsLock: 0x3a, AltLeft: 0x38, ControlLeft: 0x1d,
+  ShiftRight: 0x36, AltRight: E0 | 0x38, ControlRight: E0 | 0x1d,
+  F1: 0x3b, F2: 0x3c, F3: 0x3d, F4: 0x3e, F5: 0x3f, F6: 0x40, F7: 0x41, F8: 0x42, F9: 0x43, F10: 0x44, F11: 0x57, F12: 0x58,
+  F13: 0x64, F14: 0x65, F15: 0x66, F16: 0x67, F17: 0x68, F18: 0x69, F19: 0x6a,
+  Numpad0: 0x52, Numpad1: 0x4f, Numpad2: 0x50, Numpad3: 0x51, Numpad4: 0x4b, Numpad5: 0x4c, Numpad6: 0x4d, Numpad7: 0x47,
+  Numpad8: 0x48, Numpad9: 0x49, NumpadDecimal: 0x53, NumpadMultiply: 0x37, NumpadAdd: 0x4e, NumpadDivide: E0 | 0x35,
+  NumpadEnter: E0 | 0x1c, NumpadSubtract: 0x4a, NumpadEqual: 0x59, NumLock: E0 | 0x45,
+});
+
 /** CGEventFlags. Device bits (low word) let apps tell left from right modifiers. */
 export const SCREEN_FLAG = Object.freeze({
   capsLock: 0x00010000, shift: 0x00020000, control: 0x00040000, option: 0x00080000, command: 0x00100000,
@@ -57,9 +88,12 @@ export function screenKeyExtraFlags(code: string): number {
 }
 export function screenIsModifier(code: string): boolean { return Object.hasOwn(SCREEN_MODIFIERS, code); }
 
-/** How a non-Mac controller's physical modifiers reach the Mac.
- * `command`: Ctrl→⌘ and Win→⌃ (Windows shortcuts like Ctrl+C keep working).
- * `physical`: no remapping (Ctrl→⌃, Win→⌘). Alt is Option in both. */
+/** How the modifiers of a controller keyboard of the other kind reach the target.
+ * `command`: the main shortcut modifier stays the main one. Windows keyboard →
+ * Mac: Ctrl→⌘ and Win→⌃ (Ctrl+C keeps copying). Mac keyboard → Windows: ⌘→Ctrl
+ * and ⌃→Win (⌘C keeps copying).
+ * `physical`: no remapping (Ctrl stays Control, Win/⌘ stays Meta). Alt is
+ * Option in both. A keyboard of the target's own kind is never remapped. */
 export type ScreenModifierMode = 'command' | 'physical';
 const COMMAND_MODE: Readonly<Record<string, string>> = Object.freeze({
   ControlLeft: 'MetaLeft', ControlRight: 'MetaRight', MetaLeft: 'ControlLeft', MetaRight: 'ControlRight',
@@ -68,7 +102,15 @@ type ControllerCode = (code: string, controller: ScreenControllerPlatform, mode:
 const TARGET_CODES: Readonly<Record<ScreenTargetPlatform, ControllerCode>> = Object.freeze({
   // A macOS target receives Mac keys; only a Windows keyboard in `command` mode swaps Ctrl and Win.
   macos: (code, controller, mode) => controller === 'windows' && mode === 'command' ? COMMAND_MODE[code] ?? code : code,
+  // A Windows target receives Windows keys; only a Mac keyboard in `command` mode swaps ⌘ and ⌃.
+  windows: (code, controller, mode) => controller === 'mac' && mode === 'command' ? COMMAND_MODE[code] ?? code : code,
 });
+/** Whether `ScreenModifierMode` changes anything: only when the controller's
+ * keyboard is not of the target's kind. */
+export function screenModifierModeApplies(controller: ScreenControllerPlatform, target: ScreenTargetPlatform = 'macos'): boolean {
+  if (!Object.hasOwn(TARGET_CODES, target)) throw new Error('screen_target_platform_unknown');
+  return (controller === 'windows') !== (target === 'windows');
+}
 /** The code to send for `code` pressed on the controller's keyboard, for the
  * target platform being controlled (macOS unless stated). */
 export function screenControllerCode(code: string, controller: ScreenControllerPlatform, mode: ScreenModifierMode = 'command', target: ScreenTargetPlatform = 'macos'): string {
@@ -90,7 +132,24 @@ export const SCREEN_SHORTCUTS: ReadonlyArray<ScreenShortcut> = Object.freeze([
   { id: 'mission-control', codes: ['ControlLeft', 'ArrowUp'], label: { zh: '调度中心 ⌃↑', en: 'Mission Control ⌃↑' } },
   { id: 'show-desktop', codes: ['MetaLeft', 'F3'], label: { zh: '显示桌面 ⌘F3', en: 'Show desktop ⌘F3' } },
 ]);
-const TARGET_SHORTCUTS: Readonly<Record<ScreenTargetPlatform, ReadonlyArray<ScreenShortcut>>> = Object.freeze({ macos: SCREEN_SHORTCUTS });
+/** Windows shortcuts the controller's own OS would intercept. A button sends
+ * key positions, and the target's layout decides what a letter, digit or
+ * punctuation position means: on an AZERTY target the W position is Z. So this
+ * list holds only keys every layout keeps in place (Esc, Tab, Space, function
+ * keys, modifiers), and each button does what its label says on any layout.
+ * Letter shortcuts such as Win+D or Ctrl+W are deliberately not offered here.
+ * Nothing that opens an elevated window (which then refuses remote input), and
+ * never the secure attention sequence. */
+export const SCREEN_WINDOWS_SHORTCUTS: ReadonlyArray<ScreenShortcut> = Object.freeze([
+  { id: 'escape', codes: ['Escape'], label: { zh: 'Esc', en: 'Esc' } },
+  { id: 'app-switcher', codes: ['AltLeft', 'Tab'], label: { zh: '切换窗口 Alt+Tab', en: 'Switch window Alt+Tab' } },
+  { id: 'start-menu', codes: ['MetaLeft'], label: { zh: '开始菜单 Win', en: 'Start menu Win' } },
+  { id: 'task-view', codes: ['MetaLeft', 'Tab'], label: { zh: '任务视图 Win+Tab', en: 'Task view Win+Tab' } },
+  { id: 'input-source', codes: ['MetaLeft', 'Space'], label: { zh: '切换输入法 Win+空格', en: 'Input language Win+Space' } },
+  { id: 'close-window', codes: ['AltLeft', 'F4'], label: { zh: '关闭窗口 Alt+F4', en: 'Close window Alt+F4' } },
+  { id: 'close-tab', codes: ['ControlLeft', 'F4'], label: { zh: '关闭标签页 Ctrl+F4', en: 'Close tab Ctrl+F4' } },
+]);
+const TARGET_SHORTCUTS: Readonly<Record<ScreenTargetPlatform, ReadonlyArray<ScreenShortcut>>> = Object.freeze({ macos: SCREEN_SHORTCUTS, windows: SCREEN_WINDOWS_SHORTCUTS });
 /** The explicit shortcut list offered when controlling a `target` computer. */
 export function screenShortcuts(target: ScreenTargetPlatform = 'macos'): ReadonlyArray<ScreenShortcut> {
   return forTarget(TARGET_SHORTCUTS, target);
@@ -106,4 +165,27 @@ export function screenShortcutEvents(codes: readonly string[]): { code: string; 
 export function screenWheelToMac(dx: number, dy: number): { wheel1: number; wheel2: number } {
   const clamp = (v: number) => Math.max(-2000, Math.min(2000, Math.round(v)));
   return { wheel1: clamp(-dy), wheel2: clamp(-dx) };
+}
+
+/** `WHEEL_DELTA` units per W3C pixel on a Windows target: one wheel notch (120)
+ * for the 100 px a Chromium page reports for one notch. */
+export const SCREEN_WINDOWS_WHEEL_PER_PIXEL = 1.2;
+export const SCREEN_WINDOWS_WHEEL_MAX = 2400;
+/** W3C wheel deltas (pixels) to `MOUSEEVENTF_WHEEL` / `MOUSEEVENTF_HWHEEL`
+ * amounts. Windows counts the other way vertically (positive = away from the
+ * user = content up) and the same way horizontally (positive = right). Amounts
+ * are whole numbers; `carry` is the fraction not yet sent, to be passed back
+ * with the next delta so slow scrolling is not rounded away. */
+export function screenWheelToWindows(dx: number, dy: number, carry: { vertical: number; horizontal: number } = { vertical: 0, horizontal: 0 }):
+  { vertical: number; horizontal: number; carry: { vertical: number; horizontal: number } } {
+  // Millionths of a unit: sums of decimal fractions must not drift below a whole unit.
+  const exactly = (value: number) => Math.round(value * 1e6) / 1e6;
+  const step = (pixels: number, rest: number) => {
+    if (!pixels) return { whole: 0, rest };  // this axis did not move: what it is owed stays owed
+    const exact = exactly(pixels * SCREEN_WINDOWS_WHEEL_PER_PIXEL + (Math.sign(rest) === Math.sign(pixels) ? rest : 0));
+    const whole = Math.max(-SCREEN_WINDOWS_WHEEL_MAX, Math.min(SCREEN_WINDOWS_WHEEL_MAX, Math.trunc(exact)));
+    return { whole: whole || 0, rest: Math.abs(exact) > SCREEN_WINDOWS_WHEEL_MAX ? 0 : exactly(exact - whole) };
+  };
+  const vertical = step(-dy, carry.vertical), horizontal = step(dx, carry.horizontal);
+  return { vertical: vertical.whole, horizontal: horizontal.whole, carry: { vertical: vertical.rest, horizontal: horizontal.rest } };
 }

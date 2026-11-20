@@ -9,7 +9,8 @@ export async function screenCommand(client: LocalHostClient, sub: string, device
     if (!options.yes) throw new Error("停止指定屏幕会话（未填 ID 则停止全部），确认后加 --yes。");
     return client.request("/api/screens/stop", "POST", { ...(deviceId ? { sessionId: deviceId } : {}) });
   }
-  const status = screenStatusSchema.parse(await client.request("/api/screens/status"));
+  // This CLI reads a Windows desktop as well as a Mac's; see `HubRemoteScreen.status`.
+  const status = screenStatusSchema.parse(await client.request("/api/screens/status?includeWindows=1"));
   if (sub === "status") return status;
   if (!["configure", "enable", "disable", "allow", "revoke"].includes(sub)) throw new Error("未知 screens 命令。");
   if (!options.yes) throw new Error("先用 screens status 核对目标设备与权限，确认后加 --yes。");

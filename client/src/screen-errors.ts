@@ -35,6 +35,7 @@ export const SCREEN_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.fr
   host_directory_redirected: "主机目录被重定向，请检查主机数据目录。",
   host_directory_probe_failed: "无法读取主机目录，请检查文件访问权限后重试屏幕服务。",
   screen_service_updating: "App 正在安装更新，完成后将重试屏幕服务。",
+  screen_stale_record_invalid: "上次远程控制的按键记录无法读取，控制已暂停。请在受控电脑注销并重新登录；若仍未恢复，需检查本机记录。",
   screen_service_unavailable: "屏幕服务不可用，请检查本机桌面版是否完整安装。",
   screen_quality_unsupported: "目标 Mac 的 App 暂不支持画质选择，请更新后重试，或以默认画质连接。",
   screen_quality_decoder_unavailable: "此设备不支持清晰画质解码，请改用均衡或流畅。",
@@ -71,6 +72,31 @@ export const SCREEN_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.fr
   screen_frame_or_lease_expired: "控制已暂停，请等待新画面后重新开始控制。",
   screen_frame_stale: "画面暂未更新，控制已停止，请等待新画面。",
 });
-export function screenError(reason: string) {
-  return SCREEN_ERROR_MESSAGES[reason] ? t(SCREEN_ERROR_MESSAGES[reason]!) : `${t("屏幕连接已结束，请检查主机状态后重试。")} (${reason.slice(0,120)})`;
+/** The reasons whose sentence names a Mac or a Mac permission, for a
+ * controlled computer that runs Windows. Windows has no screen-recording or
+ * accessibility grant: what stops viewing there is the lock screen or a
+ * security prompt, and what stops input is that or a window run as
+ * administrator. The sentences say what can be done, not which of these it was;
+ * Windows does not tell. Every other reason reads the same for both. */
+export const SCREEN_ERROR_MESSAGES_WINDOWS: Readonly<Record<string, string>> = Object.freeze({
+  screen_quality_unsupported: "目标电脑的 App 暂不支持画质选择，请更新后重试，或以默认画质连接。",
+  screen_display_unavailable: "目标电脑没有可用显示器。",
+  screen_disabled: "请先在目标电脑开启允许远程屏幕。",
+  screen_not_authorized: "请在目标电脑的远程屏幕设置中授权此设备。",
+  screen_capture_denied: "目标电脑已锁定或正在显示安全提示，请在那台电脑上处理后重新连接。",
+  screen_service_offline: "主机在线，但桌面服务未运行。请在目标电脑打开 TaroBird。",
+  screen_locked: "目标电脑已锁定或正在显示安全提示，请在那台电脑上处理后重新连接。",
+  screen_connect_timeout: "屏幕连接超时，请检查目标电脑和当前线路。",
+  screen_network_timeout: "屏幕连接超时，请检查目标电脑和当前线路。",
+  screen_accessibility_denied: "目标电脑暂时不接受远程输入，请稍后再点击开始控制。",
+  screen_control_not_authorized: "请在目标电脑的远程屏幕设置中允许此设备查看并控制。",
+  screen_control_revoked: "请在目标电脑的远程屏幕设置中允许此设备查看并控制。",
+  screen_takeover_unavailable: "目标电脑无法确认是否有人在本机操作，控制已停止。请重新点击开始控制。",
+  screen_input_denied: "目标电脑没有接受远程输入，控制已停止。以管理员身份运行的窗口和安全提示不能被远程控制。",
+  screen_control_timeout: "目标电脑未确认控制，请稍后重试。",
+});
+/** `target`: the controlled computer's platform, when it is known. */
+export function screenError(reason: string, target: "macos" | "windows" = "macos") {
+  const message = target === "windows" && SCREEN_ERROR_MESSAGES_WINDOWS[reason] || SCREEN_ERROR_MESSAGES[reason];
+  return message ? t(message) : `${t("屏幕连接已结束，请检查主机状态后重试。")} (${reason.slice(0,120)})`;
 }
