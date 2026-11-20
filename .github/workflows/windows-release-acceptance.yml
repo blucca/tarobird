@@ -2,8 +2,9 @@
 # into main: on a disposable GitHub-hosted Windows runner it covers the runner
 # desktop with an owned full-screen colour test window, runs the product
 # remote-screen capture path (ScreenService -> ScreenCaptureHost ->
-# desktopCapturer) against a real Hub with a view-only viewer, and writes
-# redacted statistics to the job log and summary only. No signing, no
+# desktopCapturer) against a real Hub with a view-only viewer, then checks
+# the standby view-only entry (own synthetic window as the only source) on
+# the same Hub, and writes redacted statistics to the job log and summary only. No signing, no
 # publishing, no artifact upload, no cache writes, no input injection.
 name: Windows release upgrade acceptance
 on:
@@ -12,8 +13,8 @@ on:
       scope:
         description: Acceptance scope
         type: choice
-        options: [capture]
-        default: capture
+        options: [capture-viewonly]
+        default: capture-viewonly
 permissions:
   contents: read
 jobs:
@@ -29,6 +30,10 @@ jobs:
           if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Acceptance runs only on a disposable GitHub-hosted runner" }
           if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "This acceptance-only workflow copy runs only from an accept/* branch" }
           "runner=$env:RUNNER_ENVIRONMENT os=$env:ImageOS image=$env:ImageVersion ref=$env:REF sha=${{ github.sha }}"
+
+      - name: Check out LF sources (bundle hashes comparable across hosts)
+        shell: pwsh
+        run: git config --global core.autocrlf false
 
       - uses: actions/checkout@v4
         with:
@@ -99,7 +104,8 @@ jobs:
             --electron $electron `
             --addon $env:TAROBOT_WIN_ADDON `
             --report $report `
-            --source-commit ${{ github.sha }}
+            --source-commit ${{ github.sha }} `
+            --with-viewonly
           if ($LASTEXITCODE -ne 0) { throw "Windows capture acceptance reported failure; see summary" }
 
       - name: Publish redacted statistics to job log and summary only (no uploads)

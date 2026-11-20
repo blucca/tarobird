@@ -159,10 +159,84 @@ function judgeFrames(decoded, layout, index) {
     size: frames[0] ? `${frames[0].w}x${frames[0].h}` : null, firstRegions: frames[0]?.r ?? null, lastRegions: frames.at(-1)?.r ?? null };
 }
 
+// Standby view-only entry (windows-viewonly-entry.mjs), bundled exactly as it
+// would be handed over, checked against the same Hub: registration, frames
+// that decode to ITS OWN window's colours (not the desktop), and a control
+// request from a device granted control that must be refused with no input.
+async function viewOnlyPhase({ receipt, evidence, target, electronBin, addonPath, app, workDir, hub, api, remote, ctl, layout, cleanups, hostDir }) {
+  const phase = 'viewonly';
+  await target.call('stop-service');
+  await wait(async () => (await (await api('/api/screens/status?includeWindows=1', remote.token)).json()).desktop === null, 8000);
+  const bundle = path.join(app, 'viewonly-entry.cjs');
+  await esbuild({ entryPoints: [path.join(HERE, 'windows-viewonly-entry.mjs')], outfile: bundle, bundle: true, format: 'cjs', platform: 'node', target: 'node24', external: ['electron', '*.node'] });
+  const sha = async file => createHash('sha256').update(await readFile(file)).digest('hex');
+  const manifest = { 'viewonly-entry.cjs': await sha(bundle), 'screen-capture/capture.js': await sha(path.join(app, 'screen-capture/capture.js')),
+    'screen-capture/capture.html': await sha(path.join(app, 'screen-capture/capture.html')), 'screen-capture-preload.cjs': await sha(path.join(app, 'screen-capture-preload.cjs')) };
+  evidence.viewonly = { manifest };
+  receipt.info(phase, 'bundle-manifest-sha256', JSON.stringify(manifest));
+  const lines = [];
+  const child = spawn(electronBin, [bundle, '--addon', addonPath, '--host-dir', hostDir, '--app-state', path.join(workDir, 'viewonly-state'), '--minutes', '3'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const exited = new Promise(resolve => child.once('exit', code => resolve(code)));
+  cleanups.push(async () => { try { child.kill(); } catch { /* ignore */ } });
+  child.stdout.on('data', chunk => { for (const line of String(chunk).split(/\r?\n/)) if (line.startsWith('viewonly: ') && lines.length < 200) lines.push(line.slice(10, 170)); });
+  child.stderr.on('data', () => {});
+  const statusNow = async token => screenStatusSchema.parse(await (await api('/api/screens/status?includeWindows=1', token)).json());
+  const up = await wait(async () => (await statusNow(remote.token)).desktop !== null, 20000);
+  const status = await statusNow(remote.token);
+  receipt.expect(phase, 'registers-with-existing-hub', up && lines.some(l => l.startsWith('started registered=true')) && status.desktop?.platform === 'windows',
+    `up=${up}, lines=${JSON.stringify(lines.slice(0, 4))}, displays=${status.desktop?.displays?.length ?? 0}`);
+  if (!up || !status.desktop?.displays?.length) return;
+  const display = status.desktop.displays[0];
+  const wsBase = hub.instanceUrl.replace('http:', 'ws:');
+  const watch = async (login, label, onReady) => {
+    const opened = await api('/api/screens/sessions?includeWindows=1', login.token, { desktopId: status.desktop.desktopId, displayId: display.id, displayRevision: display.revision, requestId: randomUUID(), codecs: ['h264', 'vp8'] });
+    const join = opened.status === 201 ? screenJoinSchema.parse(await opened.json()) : null;
+    if (!join) return { label, http: opened.status };
+    const frames = [];
+    let control;
+    control = connectWs(`${wsBase}/screen/v1/control`, cleanups);
+    const media = connectWs(`${wsBase}/screen/v1/media`, cleanups, bytes => {
+      let header; try { header = readScreenFrame(bytes); } catch { return; }
+      frames.push({ header, bytes, at: Date.now() });
+      try { control.send({ type: 'ack', sessionId: join.session.id, generation: join.session.generation, frameSequence: header.sequence }); } catch { /* closed */ }
+    });
+    await Promise.all([control.ready, media.ready]);
+    control.send({ type: 'hello', ticket: join.controlTicket }); media.send({ type: 'hello', ticket: join.mediaTicket });
+    await wait(() => frames.length >= 20, 12000);
+    const extra = onReady ? await onReady({ join, control, frames }) : undefined;
+    control.send({ type: 'disconnect', sessionId: join.session.id, generation: join.session.generation });
+    await wait(() => control.values.some(v => v.type === 'state' && v.session.state === 'closed'), 4000);
+    const streams = media.values.filter(v => !(v instanceof Uint8Array) && v.type === 'stream');
+    return { label, http: opened.status, controlAllowed: join.session.controlAllowed, frames, streams, states: control.values.filter(v => v.type === 'state').map(v => `${v.session.state}${v.session.reason ? `:${v.session.reason}` : ''}${v.lease ? '+lease' : ''}`), extra };
+  };
+  const view = await watch(remote, 'view');
+  const gen = view.frames?.[0]?.header.streamGeneration;
+  const chunk = (view.frames ?? []).filter(f => f.header.streamGeneration === gen).slice(0, 30);
+  const codecString = view.streams?.find(s => s.streamGeneration === gen)?.codecString;
+  const judged = chunk.length && codecString ? judgeFrames(await target.call('decode', { codec: codecString, frames: chunk.map(f => Buffer.from(f.bytes).toString('base64')), points: POINTS }, 60000), layout, 0) : null;
+  evidence.viewonly.view = { http: view.http, controlAllowed: view.controlAllowed, frames: view.frames?.length ?? 0, states: view.states, judged: judged && { ...judged, firstRegions: judged.firstRegions } };
+  receipt.expect(phase, 'phone-view-gets-frames-of-own-window', view.http === 201 && view.controlAllowed === false && !!judged && judged.decoded >= 10 && judged.quadOk >= Math.ceil(judged.decoded * 0.9) && judged.toggleA > 0 && judged.toggleB > 0,
+    `http=${view.http}, controlAllowed=${view.controlAllowed}, frames=${view.frames?.length ?? 0}, codec=${codecString}, decoded=${judged?.decoded}, quadOk=${judged?.quadOk}, toggle=${judged?.toggleA}/${judged?.toggleB}, first=${JSON.stringify(judged?.firstRegions)}`);
+  const ctlRun = await watch(ctl, 'control', async ({ join, control, frames }) => {
+    const last = frames.at(-1)?.header.sequence ?? 1;
+    control.send({ type: 'control', sessionId: join.session.id, generation: join.session.generation, frameSequence: last });
+    await sleep(4000);
+    return { lease: control.values.some(v => v.type === 'state' && v.lease && v.session.state === 'controlling') };
+  });
+  const refused = lines.filter(l => l.startsWith('input_refused'));
+  evidence.viewonly.control = { http: ctlRun.http, controlAllowed: ctlRun.controlAllowed, states: ctlRun.states, lease: ctlRun.extra?.lease ?? null, refused };
+  receipt.expect(phase, 'control-request-refused-without-input', ctlRun.http === 201 && ctlRun.controlAllowed === true && ctlRun.extra?.lease === false
+    && refused.length >= 1 && refused.every(l => l === 'input_refused screenMonitorStart'),
+    `controlAllowed=${ctlRun.controlAllowed}, leaseObserved=${ctlRun.extra?.lease}, states=${JSON.stringify(ctlRun.states)}, refused=${JSON.stringify(refused)}`);
+  try { child.kill(); } catch { /* ignore */ }
+  const code = await Promise.race([exited, sleep(5000).then(() => 'timeout')]);
+  receipt.info(phase, 'entry-log', JSON.stringify({ exit: code, lines: lines.filter(l => !l.startsWith('sharing')).slice(0, 20) }));
+}
+
 async function main() {
   const { values } = parseArgs({ args: process.argv.slice(2), options: {
     'confirm-disposable-windows': { type: 'boolean', default: false }, electron: { type: 'string' }, addon: { type: 'string' },
-    report: { type: 'string' }, 'source-commit': { type: 'string', default: 'unknown' } } });
+    report: { type: 'string' }, 'source-commit': { type: 'string', default: 'unknown' }, 'with-viewonly': { type: 'boolean', default: false } } });
   if (process.platform !== 'win32' || process.env.RUNNER_ENVIRONMENT !== 'github-hosted' || process.env.TAROBOT_WINDOWS_ACCEPTANCE !== 'disposable' || !values['confirm-disposable-windows']) {
     throw new Error('Refusing to run: requires a disposable GitHub-hosted Windows runner with TAROBOT_WINDOWS_ACCEPTANCE=disposable and --confirm-disposable-windows');
   }
@@ -200,12 +274,17 @@ async function main() {
     await mkdir(hostDir, { recursive: true }); await mkdir(appState, { recursive: true });
     const hub = await HubServer.start({ stateDir: hostDir });
     cleanups.push(() => hub.close());
-    const owner = makeDevice('acc-local'), viewer = makeDevice('acc-viewer');
+    const owner = makeDevice('acc-local'), viewer = makeDevice('acc-viewer'), controller = makeDevice('acc-controller');
     await hub.enrollLocalController({ deviceId: owner.deviceId, name: owner.name, platform: owner.platform, publicKey: owner.publicKey });
     const { code } = await hub.auth.pair({ deviceId: viewer.deviceId, name: viewer.name, platform: viewer.platform, publicKey: viewer.publicKey }, '127.0.0.1');
     await hub.auth.approve(code, 'local-owner', 'owner');
-    const local = await loginFor(hub.auth, owner), remote = await loginFor(hub.auth, viewer);
-    const cfg = { operation: 'screen.configure', expectedRevision: 0, enabled: true, requestId: randomUUID(), grants: [{ deviceId: viewer.deviceId, publicKey: viewer.publicKey, permission: 'view' }] };
+    const paired = await hub.auth.pair({ deviceId: controller.deviceId, name: controller.name, platform: controller.platform, publicKey: controller.publicKey }, '127.0.0.1');
+    await hub.auth.approve(paired.code, 'local-owner', 'owner');
+    const local = await loginFor(hub.auth, owner), remote = await loginFor(hub.auth, viewer), ctl = await loginFor(hub.auth, controller);
+    // The capture phases use the VIEW device only. The control grant exists solely
+    // for the view-only entry's refusal check (a misconfigured grant must not inject).
+    const cfg = { operation: 'screen.configure', expectedRevision: 0, enabled: true, requestId: randomUUID(), grants: [
+      { deviceId: viewer.deviceId, publicKey: viewer.publicKey, permission: 'view' }, { deviceId: controller.deviceId, publicKey: controller.publicKey, permission: 'control' }] };
     const statement = await hub.auth.prepareDeviceAction({ operation: 'screen-grant', target: hashSecret(screenConfigureText(cfg)) }, local.token, local.session);
     await hub.remoteScreen.configure(local.session, cfg, { nonce: statement.nonce, signature: sign(null, Buffer.from(deviceActionProofText(statement)), owner.privateKey).toString('base64') });
     const stopControl = await startHubControl(hostDir, () => ({ running: true, pid: process.pid, url: hub.url, instanceUrl: hub.instanceUrl, publicKey: hub.auth.publicKey }), () => {},
@@ -324,6 +403,34 @@ async function main() {
       const again = await runSession(displays[0], 'reconnect');
       evidence.sessions.push(again);
       checkSession(again, 'reconnect');
+      // 6b. H.264-only viewer (as a sharp/h264Only session or a decoder without VP8 would ask):
+      // observed only, since a GPU-less runner may have no H.264 encoder.
+      {
+        const opened = await api('/api/screens/sessions?includeWindows=1', remote.token, { desktopId: status.desktop.desktopId, displayId: displays[0].id,
+          displayRevision: displays[0].revision, requestId: randomUUID(), codecs: ['h264'] });
+        const join = opened.status === 201 ? screenJoinSchema.parse(await opened.json()) : null;
+        let result = { http: opened.status };
+        if (join) {
+          const wsBase = hub.instanceUrl.replace('http:', 'ws:');
+          const frames = [];
+          let control;
+          control = connectWs(`${wsBase}/screen/v1/control`, cleanups);
+          const media = connectWs(`${wsBase}/screen/v1/media`, cleanups, bytes => {
+            try { const h = readScreenFrame(bytes); frames.push(h); control.send({ type: 'ack', sessionId: join.session.id, generation: join.session.generation, frameSequence: h.sequence }); } catch { /* ignore */ }
+          });
+          await Promise.all([control.ready, media.ready]);
+          control.send({ type: 'hello', ticket: join.controlTicket }); media.send({ type: 'hello', ticket: join.mediaTicket });
+          await wait(() => frames.length >= 5 || control.values.some(v => v.type === 'state' && v.session.state === 'closed'), 12000);
+          const closed = control.values.findLast(v => v.type === 'state' && v.session.state === 'closed');
+          if (!closed) control.send({ type: 'disconnect', sessionId: join.session.id, generation: join.session.generation });
+          await wait(async () => !(await target.call('host-active')).active, 5000);
+          const streams = media.values.filter(v => !(v instanceof Uint8Array) && v.type === 'stream').map(v => v.codecString);
+          const events = (await target.call('diag')).captureEvents.filter(e => e.type === 'ended').slice(-2);
+          result = { http: opened.status, frames: frames.length, streams, closedReason: closed?.session.reason ?? null, captureEnded: events };
+        }
+        evidence.h264Only = result;
+        receipt.info('codec', 'h264-only-viewer-on-this-runner', JSON.stringify(result));
+      }
       // 7. Display switching only where the runner really has more than one display.
       if (displays.length > 1) {
         for (const display of displays.slice(1, 4)) {
@@ -339,6 +446,7 @@ async function main() {
       }
     }
     const diag1 = await target.call('diag');
+    if (values['with-viewonly']) await viewOnlyPhase({ receipt, evidence, target, electronBin, addonPath, app, workDir, hub, api, remote, ctl, layout: started.layout, cleanups, hostDir });
     evidence.e4.resolveCalls = diag1.resolveCalls;
     evidence.e4.captureEvents = diag1.captureEvents;
     receipt.expect('e4', 'product-desktopSource-matched-on-every-start', diag1.resolveCalls.length > 0 && diag1.resolveCalls.every(c => c.matched),

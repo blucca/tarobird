@@ -204,6 +204,12 @@ async function handle(cmd) {
     case 'start-service': return startService();
     case 'diag': return diag();
     case 'host-active': return { active: !!captureRef?.active };
+    case 'stop-service': {
+      // Leaves only the decoder: the next phase registers a different target.
+      try { service?.dispose(); } catch { /* best effort */ }
+      for (const { win } of testWindows) { try { if (!win.isDestroyed()) win.destroy(); } catch { /* ignore */ } }
+      return { ok: true, hostActive: !!captureRef?.active };
+    }
     case 'decode': return decode(cmd);
     case 'shutdown': { const res = await shutdown(); setTimeout(() => app.exit(0), 50); return res; }
     default: throw new Error(`unknown_op:${cmd.op}`);
