@@ -2,13 +2,14 @@
 ; The standard Windows MessageBox copies its caption and text with Ctrl+C.
 Var BirdOperation
 Var BirdBackupState
+Var BirdNoticeState
 Var BirdCode
 Var BirdReason
 Var BirdNext
 Var BirdMessage
 
 !macro BirdProblem PHASE REASON ACTION CODE RETRY
-  StrCpy $BirdMessage "$BirdOperation — ${PHASE}$\r$\n${REASON}$\r$\n$BirdBackupState$\r$\n$\r$\n${ACTION}$\r$\n$\r$\nTaroBird ${VERSION} · TB-${CODE} · $(birdCopy)"
+  StrCpy $BirdMessage "$BirdOperation — ${PHASE}$\r$\n${REASON}$\r$\n$BirdBackupState$\r$\n$BirdNoticeState$\r$\n$\r$\n${ACTION}$\r$\n$\r$\nTaroBird ${VERSION} · TB-${CODE} · $(birdCopy)"
   DetailPrint "$BirdMessage"
   ${IfNot} ${Silent}
   ${AndIf} $PassiveMode != 1
@@ -19,6 +20,22 @@ Var BirdMessage
     !endif
   ${EndIf}
   Abort "$BirdOperation — ${PHASE} (TB-${CODE})"
+!macroend
+
+; Only fixed files in this version's install manifest use this macro. NSIS
+; Delete succeeds for an already-absent file, so a partial uninstall can retry.
+; Never postpone deletion to reboot and remove the recovery entry prematurely.
+!macro BirdDeleteOwnedFile FILE
+  !define _TB_FILE_ID ${__COUNTER__}
+  bird_file_retry_${_TB_FILE_ID}:
+  ClearErrors
+  SetDetailsPrint none
+  Delete "${FILE}"
+  SetDetailsPrint lastused
+  ${If} ${Errors}
+    !insertmacro BirdProblem "$(birdFilesStage)" "$(birdFilesFailed)" "$(birdFilesStep)" "FILES-REMOVE" bird_file_retry_${_TB_FILE_ID}
+  ${EndIf}
+  !undef _TB_FILE_ID
 !macroend
 
 ; Installer and uninstaller are separate NSIS programs. Both decode the same

@@ -91,35 +91,71 @@ fn remove_legacy_host(install: &std::path::Path, host_stopped: impl FnOnce() -> 
     if std::fs::remove_dir_all(&old).is_ok() { LegacyHost::Removed } else { LegacyHost::RemoveFailed }
 }
 
+#[cfg(any(windows, test))]
+fn stop_installed_host(
+    install: &std::path::Path,
+    confirm: impl Fn() -> Result<(), fresh_install::Reason>,
+    run: impl FnOnce(&std::path::Path) -> Result<(), fresh_install::Reason>,
+) -> Result<(), fresh_install::Reason> {
+    // Missing files do not prove the previously launched Host has exited.
+    let Some(resources) = host_runtime(install) else { return confirm() };
+    run(&resources)
+}
+
+/// Run only this installation's stop command. Kept portable for isolated
+/// launch/timeout and ownership-refusal regression tests.
+#[cfg(any(windows, test))]
+fn run_host_stop(
+    mut command: std::process::Command,
+    confirm: impl Fn() -> Result<(), fresh_install::Reason>,
+    timeout: std::time::Duration,
+) -> Result<(), fresh_install::Reason> {
+    use fresh_install::Reason;
+    // A broken bundled Node must not trap an already stopped installation.
+    // The native check is read-only and still rejects shared/unknown owners.
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return confirm(),
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|_| Reason::StopFailed)? {
+            return if status.success() { Ok(()) } else { confirm() };
+        }
+        if std::time::Instant::now() >= deadline {
+            // Confirm the stop-command child has exited before allowing any
+            // file removal; never replace a failed kill with an owner guess.
+            if child.kill().is_err() {
+                if child.try_wait().ok().flatten().is_none() { return Err(Reason::StopTimedOut); }
+            } else if child.wait().is_err() { return Err(Reason::StopTimedOut); }
+            return confirm();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Port of `desktop_host::installer_command` (Tauri): ask the bundled CLI to
 /// stop the canonical Host; a damaged runtime may still pass when native
 /// ownership checks confirm nothing of ours is running.
 #[cfg(windows)]
 fn stop_desktop_host() -> i32 {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use fresh_install::Reason;
     (|| -> Result<(), Reason> {
         let executable = std::env::current_exe().map_err(|_| Reason::StopFailed)?;
-        let Some(resources) = host_runtime(executable.parent().ok_or(Reason::StopFailed)?) else { return Ok(()) };
+        stop_installed_host(executable.parent().ok_or(Reason::StopFailed)?, fresh_install::check_stopped, |resources| {
         let directory = native_identity::host_directory(&dirs::data_dir().ok_or(Reason::DirectoryUnavailable)?)
             .map_err(|reason| match reason.as_str() {
                 "host_directory_conflict" => Reason::HostConflict,
                 "host_directory_redirected" => Reason::Redirected,
                 _ => Reason::StateUnreadable,
             })?;
-        let mut child = node_runtime::command(&resources.join("node.exe"), &resources.join("dist/src/index.js"))
-            .args(["hub", "service", "installer-stop", "--state-dir"]).arg(directory)
+        let mut command = node_runtime::command(&resources.join("node.exe"), &resources.join("dist/src/index.js"));
+        command.args(["hub", "service", "installer-stop", "--state-dir"]).arg(directory)
             .current_dir(&resources)
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .spawn().map_err(|_| Reason::StopFailed)?;
-        let deadline = Instant::now() + Duration::from_secs(25);
-        loop {
-            if let Some(status) = child.try_wait().map_err(|_| Reason::StopFailed)? {
-                return if status.success() { Ok(()) } else { fresh_install::check_stopped() };
-            }
-            if Instant::now() >= deadline { let _ = child.kill(); let _ = child.wait(); return Err(Reason::StopTimedOut); }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        run_host_stop(command, fresh_install::check_stopped, Duration::from_secs(25))
+        })
     })().map_or_else(|reason| reason as i32, |()| 0)
 }
 
@@ -161,6 +197,42 @@ mod tests {
         install
     }
     fn never() -> bool { panic!("the Host check runs only after every file check passed") }
+
+    #[test]
+    fn missing_or_incomplete_runtime_does_not_bypass_native_owner_checks() {
+        use fresh_install::Reason;
+        let install = scratch();
+        for runtime_state in ["absent", "missing-entry", "missing-node"] {
+            if runtime_state != "absent" {
+                runtime(&install.join("resources/host"), Some("tarobot"));
+                let missing = if runtime_state == "missing-entry" { "dist/src/index.js" } else { "node.exe" };
+                std::fs::remove_file(install.join("resources/host").join(missing)).unwrap();
+            }
+            let never_run = |_: &std::path::Path| -> Result<(), Reason> { panic!("no complete owned runtime to execute") };
+            assert_eq!(stop_installed_host(&install, || Err(Reason::HostRunning), never_run), Err(Reason::HostRunning));
+            for reason in [Reason::SharedService, Reason::OwnerUnknown, Reason::ProcessUnconfirmed] {
+                assert_eq!(stop_installed_host(&install, || Err(reason), never_run), Err(reason));
+            }
+            assert_eq!(stop_installed_host(&install, || Ok(()), never_run), Ok(()));
+        }
+        runtime(&install.join("resources/host"), Some("tarobot"));
+        assert_eq!(stop_installed_host(&install, || panic!("successful installer-stop may retain a managed CLI"), |_| Ok(())), Ok(()));
+        std::fs::remove_dir_all(install).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_host_command_can_uninstall_only_after_native_owner_confirmation() {
+        use fresh_install::Reason;
+        let missing = || std::process::Command::new("/nonexistent-tarobird-fixture/node");
+        assert_eq!(run_host_stop(missing(), || Ok(()), std::time::Duration::from_millis(20)), Ok(()));
+        for reason in [Reason::SharedService, Reason::HostRunning, Reason::OwnerUnknown, Reason::ProcessUnconfirmed] {
+            assert_eq!(run_host_stop(missing(), || Err(reason), std::time::Duration::from_millis(20)), Err(reason));
+        }
+        let sleep = || { let mut command = std::process::Command::new("/bin/sleep"); command.arg("10"); command };
+        assert_eq!(run_host_stop(sleep(), || Ok(()), std::time::Duration::from_millis(20)), Ok(()));
+        assert_eq!(run_host_stop(sleep(), || Err(Reason::HostRunning), std::time::Duration::from_millis(20)), Err(Reason::HostRunning));
+    }
 
     #[test]
     fn legacy_host_removed_only_when_identified_beside_the_new_runtime_and_stopped() {

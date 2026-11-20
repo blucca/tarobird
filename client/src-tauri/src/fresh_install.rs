@@ -93,6 +93,11 @@ fn plain_directory(path: &Path) -> Result<(), Reason> {
     Ok(())
 }
 
+fn plain_backup_directory(path: &Path) -> Result<(), Reason> {
+    plain_directory(path.parent().ok_or(Reason::InvalidRequest)?)?;
+    plain_directory(path)
+}
+
 /// An installed CLI can restart itself even while its PID is absent. Refuse to
 /// reset that shared state until its service is uninstalled. Unknown/live PIDs
 /// and malformed ownership records also block; never terminate an arbitrary PID.
@@ -159,7 +164,7 @@ fn reset_with(
     for (source, destination, _) in &plan {
         // Recheck immediately before moving in case an App/CLI was started
         // while the installer was asking the user to close applications.
-        let result = host_stopped(source, alive).and_then(|()| {
+        let result = plain_directory(source).and_then(|()| host_stopped(source, alive)).and_then(|()| {
             rename(source, destination).map_err(|error| match error.kind() {
                 io::ErrorKind::PermissionDenied => Reason::MoveDenied,
                 _ => Reason::MoveFailed,
@@ -168,7 +173,8 @@ fn reset_with(
         if let Err(reason) = result {
             let mut rolled_back = true;
             for (original, backup) in moved.iter().rev() {
-                if exists(original) != Ok(false) || rename(backup, original).is_err() { rolled_back = false; }
+                if exists(original) != Ok(false) || plain_backup_directory(backup).is_err()
+                    || rename(backup, original).is_err() { rolled_back = false; }
             }
             for folder in &folders { let _ = fs::remove_dir(folder); }
             return Err(if moved.is_empty() {
@@ -185,6 +191,9 @@ fn reset_with(
     // Otherwise restoring a fresh-start backup could resurrect remote pairing.
     // Do this only after every move commits so ordinary rollback keeps access.
     for (_, backup) in moved {
+        // A directory replaced between phases must never redirect this key
+        // removal to another installation. Retain all data on uncertainty.
+        if plain_backup_directory(backup).is_err() { return Err(BackupFailure::FinalizationIncomplete); }
         match fs::remove_file(backup.join("tarobot-client-installation-v1")) {
             Ok(()) => {},
             Err(error) if error.kind() == io::ErrorKind::NotFound => {},
@@ -499,4 +508,69 @@ mod tests {
         assert!(paths[1].join("identity").is_file());
         fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(unix)]
+    #[test]
+    fn a_root_redirected_after_preflight_does_not_remove_another_installation_key() {
+        let (root, paths) = setup();
+        let outside = root.join("unrelated"); fs::create_dir(&outside).unwrap();
+        let key = outside.join("tarobot-client-installation-v1"); fs::write(&key, b"unrelated-key").unwrap();
+        let result = reset_with(&paths, "test", &|_, _| Ok(false), &|from, to| {
+            rename(from, to)?;
+            if from == paths[0] {
+                rename(&paths[1], &root.join("original-second"))?;
+                std::os::unix::fs::symlink(&outside, &paths[1])?;
+            }
+            Ok(())
+        });
+        assert_eq!(fs::read(&key).ok(), Some(b"unrelated-key".to_vec()), "must not follow a replaced root during backup finalization");
+        assert_eq!(result, Err(BackupFailure::RolledBack(Reason::Redirected)));
+        assert!(paths[0].join("identity").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_redirected_after_move_is_not_followed_during_key_finalization() {
+        for replace_container in [false, true] {
+            let (root, paths) = setup();
+            let outside = root.join("unrelated");
+            let target = if replace_container { outside.join(APP_ID) } else { outside.clone() };
+            fs::create_dir_all(&target).unwrap();
+            let key = target.join("tarobot-client-installation-v1"); fs::write(&key, b"unrelated-key").unwrap();
+            let result = reset_with(&paths, "test", &|_, _| Ok(false), &|from, to| {
+                rename(from, to)?;
+                if from == paths[1] {
+                    let redirected = if replace_container { to.parent().unwrap() } else { to };
+                    rename(redirected, &root.join("original-backup"))?;
+                    std::os::unix::fs::symlink(&outside, redirected)?;
+                }
+                Ok(())
+            });
+            assert_eq!(fs::read(&key).ok(), Some(b"unrelated-key".to_vec()));
+            assert_eq!(result, Err(BackupFailure::FinalizationIncomplete));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirected_backup_cannot_be_claimed_as_a_complete_rollback() {
+        let (root, paths) = setup();
+        let outside = root.join("unrelated"); fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"unrelated").unwrap();
+        let result = reset_with(&paths, "test", &|_, _| Ok(false), &|from, to| {
+            if from == paths[1] { return Err(io::Error::from(io::ErrorKind::PermissionDenied)); }
+            rename(from, to)?;
+            if from == paths[0] {
+                rename(to, &root.join("original-backup"))?;
+                std::os::unix::fs::symlink(&outside, to)?;
+            }
+            Ok(())
+        });
+        assert_eq!(result, Err(BackupFailure::RollbackIncomplete(Reason::MoveDenied)));
+        assert!(!paths[0].exists());
+        assert!(root.join("original-backup/identity").is_file());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"unrelated");
+        fs::remove_dir_all(root).unwrap();
+    }
+
 }

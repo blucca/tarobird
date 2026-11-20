@@ -262,7 +262,7 @@ test('reset requires consent and safe backup states; later retries stay in their
   }
   const template = await readFile(path.join(TEMPLATE_DIR, 'installer.nsi'), 'utf8');
   assert.doesNotMatch(template, /RMDir\s+\/r\s+"\$(?:LOCAL)?APPDATA/i);
-  const notificationRetry = uninstall.split('bird_notice_retry:')[1];
+  const notificationRetry = uninstall.split('bird_notice_retry:')[1].split('; Back up only after')[0];
   inOrder(notificationRetry, 'ReadRegStr', 'CheckIfAppIsRunning', '--clear-notification-history', '"NOTICE-CLEAR" bird_notice_retry');
   assert.doesNotMatch(notificationRetry, /BirdBackup|prepare-fresh-install|RmDir/);
   assert.ok(registerShortcut.includes('!insertmacro BirdProblem') && registerShortcut.includes('"NOTICE-REGISTER"'), 'notification registration uses passive/silent-safe BirdProblem with retry');
@@ -320,8 +320,65 @@ test('running-app shutdown targets only this exe via Restart Manager, guides Tas
     const maxLen = keys => Math.max(...keys.map(k => map.get(k).length));
     const dialogKeys = [...map.keys()].filter(k => k.startsWith('bird') && !k.endsWith('Consent'));
     const worst = maxLen(['birdInstall', 'birdUninstall']) + 3
-      + maxLen(['birdHostStage', 'birdAppStage', 'birdInstallBackup', 'birdUninstallBackup', 'birdNoticeStage', 'birdNoticeRegStage']) + 2
-      + maxLen(dialogKeys) * 3 + 12 + 'TaroBird 99.99.99 · TB-HOST-UNCONFIRMED · '.length + map.get('birdCopy').length;
+      + maxLen(['birdHostStage', 'birdAppStage', 'birdInstallBackup', 'birdUninstallBackup', 'birdNoticeStage', 'birdNoticeRegStage', 'birdFilesStage']) + 2
+      + maxLen(dialogKeys) * 3 + map.get('birdNoticeCleared').length + 14 + 'TaroBird 99.99.99 · TB-HOST-UNCONFIRMED · '.length + map.get('birdCopy').length;
     assert.ok(worst < 900, `${label} worst-case BirdMessage length (${worst}) must stay below NSIS_MAX_STRLEN (1024)`);
   }
+});
+
+
+test('unconfirmed Restart Manager start, registration or query cannot authorize data moves', async () => {
+  const utils = await readFile(path.join(TEMPLATE_DIR, 'utils.nsh'), 'utf8');
+  const check = utils.split('!macro CheckIfAppIsRunning')[1].split('!macroend')[0];
+  // Only a successful empty list or completed owned shutdown may exit the check.
+  assert.match(check, /RestartManager_StartSession \$R0[\s\S]*?\$\{If\} \$R0 == ""[\s\S]*?Goto app_check_failed_\$\{UniqueID\}/);
+  assert.match(check, /RestartManager_RegisterFile[\s\S]*?\$\{If\} \$0 != 0[\s\S]*?Goto app_check_failed_\$\{UniqueID\}/);
+  assert.match(check, /\$\{If\} \$0 != 0[\s\S]*?\$\{AndIf\} \$0 != \$\{ERROR_MORE_DATA\}[\s\S]*?Goto app_check_failed_\$\{UniqueID\}/);
+  assert.match(check, /app_check_failed_\$\{UniqueID\}:[\s\S]*?BirdProblem/);
+});
+
+
+test('uninstall file failures keep the uninstaller and registration available', async () => {
+  const appDir = await packaged('delete-errors');
+  const plan = await planWindowsInstaller({ appDir, helper, version: '1.2.3', outFile: path.join(root, 'delete-errors.exe'), pluginsDir });
+  for (const resource of plan.resources) assert.ok(plan.includes.uninstall.includes(`!insertmacro BirdDeleteOwnedFile "$INSTDIR\\${resource.target}"`), resource.target);
+  const [nsi, diagnostics] = await Promise.all(['installer.nsi', 'installer-diagnostics.nsh'].map(file => readFile(path.join(TEMPLATE_DIR, file), 'utf8')));
+  const section = nsi.split('Section Uninstall')[1];
+  assert.match(section, /!insertmacro BirdDeleteOwnedFile "\$INSTDIR\\\$\{MAINBINARYNAME\}\.exe"/);
+  assert.match(section, /!insertmacro BirdDeleteOwnedFile "\$INSTDIR\\uninstall\.exe"/);
+  assert.ok(section.indexOf('TB_RESOURCES_UNINSTALL') < section.indexOf('uninstall.exe'));
+  assert.ok(section.indexOf('uninstall.exe') < section.indexOf('DeleteRegKey'), 'all owned file removal must finish before any registry removal');
+  assert.ok(section.indexOf('uninstall.exe') < section.indexOf('DeleteRegKey SHCTX "${UNINSTKEY}"'));
+  const remove = diagnostics.split('!macro BirdDeleteOwnedFile')[1]?.split('!macroend')[0] ?? '';
+  assert.match(remove, /ClearErrors[\s\S]*?Delete "\$\{FILE\}"[\s\S]*?\$\{If\} \$\{Errors\}[\s\S]*?BirdProblem/);
+  assert.doesNotMatch(remove, /REBOOTOK|DeleteReg|RMDir/);
+});
+
+test('notification cleanup failure cannot follow an irreversible backup finalization', async () => {
+  const hooks = await readFile(path.join(TEMPLATE_DIR, 'installer-hooks.nsh'), 'utf8');
+  const uninstall = hooks.split('!macro NSIS_HOOK_PREUNINSTALL')[1].split('!macroend')[0];
+  assert.ok(uninstall.indexOf('birdUninstallConsent') < uninstall.indexOf('--clear-notification-history'));
+  assert.ok(uninstall.indexOf('--clear-notification-history') < uninstall.indexOf('!insertmacro BirdBackup'), 'NOTICE-CLEAR rejection must occur before data moves or installation-key cleanup');
+});
+
+
+test('a backup refusal after notification cleanup reports the completed cleanup without clearing settings', async () => {
+  const [hooks, diagnostics, en, zh] = await Promise.all(['installer-hooks.nsh', 'installer-diagnostics.nsh', 'English.nsh', 'SimpChinese.nsh'].map(file => readFile(path.join(TEMPLATE_DIR, file), 'utf8')));
+  const uninstall = hooks.split('!macro NSIS_HOOK_PREUNINSTALL')[1].split('!macroend')[0];
+  const notice = uninstall.indexOf('--clear-notification-history');
+  const noticeReceipt = uninstall.indexOf('StrCpy $BirdNoticeState "$(birdNoticeCleared)"');
+  const backup = uninstall.indexOf('!insertmacro BirdBackup');
+  const clearSettings = uninstall.indexOf('StrCpy $TaroBotClearSettings 1');
+  assert.ok(notice < noticeReceipt && noticeReceipt < backup && backup < clearSettings);
+  assert.match(uninstall.slice(notice, noticeReceipt), /BirdProblem .*"NOTICE-CLEAR" bird_notice_retry/);
+  const backupMacro = hooks.split('!macro BirdBackup')[1].split('!macroend')[0];
+  assert.match(backupMacro, /BirdProblem/);
+  assert.match(diagnostics, /StrCpy \$BirdMessage .*\$BirdNoticeState/);
+  assert.match(diagnostics, /Abort "\$BirdOperation/);
+  assert.match(en, /Notification history was cleared/); assert.match(zh, /通知历史已清理/);
+  assert.match(en, /Keep any earlier TaroBot-backup folders/); assert.match(zh, /保留此前已有的 TaroBot-backup/);
+  // Install still requests backup before POSTINSTALL notification registration.
+  const install = hooks.split('!macro NSIS_HOOK_PREINSTALL')[1].split('!macroend')[0];
+  assert.match(install, /StrCpy \$BirdOperation "\$\(birdInstall\)"/);
+  assert.match(install, /BirdBackup/); assert.doesNotMatch(install, /clear-notification-history/);
 });

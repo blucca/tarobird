@@ -184,7 +184,7 @@ export async function planWindowsInstaller({ appDir, helper, version, outFile, p
     ...directories.map(parts => `  CreateDirectory "$INSTDIR\\${parts.join('\\')}"`),
     ...resources.map(item => `  File /a "/oname=${item.target}" "${item.source}"`),
   ].join('\n') + '\n';
-  const uninstall = bom + resources.map(item => `  Delete "$INSTDIR\\${item.target}"`).join('\n') + '\n';
+  const uninstall = bom + resources.map(item => `  !insertmacro BirdDeleteOwnedFile "$INSTDIR\\${item.target}"`).join('\n') + '\n';
   // Deepest first; `RMDir` without /r only removes directories left empty.
   const ancestors = bom + [...directories].sort((a, b) => b.length - a.length || b.join('\\').localeCompare(a.join('\\')))
     .map(parts => `  RMDir /REBOOTOK "$INSTDIR\\${parts.join('\\')}"`).join('\n') + '\n';

@@ -16,6 +16,7 @@ Var TaroBotHostStopper
 Var TaroBotHadInstallation
 Var TaroBotFreshPrepared
 Var TaroBotClearSettings
+Var TaroBotBackupRequested
 !define MUI_CUSTOMFUNCTION_GUIINIT TaroBotRememberInstallation
 Function TaroBotRememberInstallation
   ReadRegStr $TaroBotHadInstallation HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TaroBot" "UninstallString"
@@ -171,6 +172,7 @@ FunctionEnd
 !macro NSIS_HOOK_PREINSTALL
   StrCpy $BirdOperation "$(birdInstall)"
   StrCpy $BirdBackupState "$(birdNotRequested)"
+  StrCpy $BirdNoticeState ""
   StrCpy $TaroBotFreshPrepared 0
   ; Silent/passive installs and every upgrade keep state. Only an interactive
   ; reinstall with residual data offers a fresh start, and only after consent.
@@ -250,7 +252,9 @@ FunctionEnd
 !macro NSIS_HOOK_PREUNINSTALL
   StrCpy $BirdOperation "$(birdUninstall)"
   StrCpy $BirdBackupState "$(birdNotRequested)"
+  StrCpy $BirdNoticeState ""
   StrCpy $TaroBotClearSettings 0
+  StrCpy $TaroBotBackupRequested 0
   ${IfNot} ${Silent}
   ${AndIf} $PassiveMode <> 1
   ${AndIf} $UpdateMode <> 1
@@ -265,10 +269,7 @@ FunctionEnd
     MessageBox MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2 "$(birdUninstallConsent)" /SD IDNO IDYES tarobot_uninstall_fresh
     Abort
     tarobot_uninstall_fresh:
-    !insertmacro BirdBackup "$INSTDIR\${TAROBOTHELPER}" "$(birdUninstallBackup)" "un."
-    ; Clear installer settings only after the backup returned a known success.
-    StrCpy $DeleteAppDataCheckboxState 0
-    StrCpy $TaroBotClearSettings 1
+    StrCpy $TaroBotBackupRequested 1
   ${EndIf}
   ; Updates retain history. An old install must not clear a newer owner's notices.
   ${If} $UpdateMode <> 1
@@ -286,7 +287,16 @@ FunctionEnd
       ${OrIf} $R0 <> 0
         !insertmacro BirdProblem "$(birdNoticeStage)" "$(birdNotice)" "$(birdNoticeStep)" "NOTICE-CLEAR" bird_notice_retry
       ${EndIf}
+      StrCpy $BirdNoticeState "$(birdNoticeCleared)"
     ${EndIf}
     Pop $R0
+  ${EndIf}
+  ; Back up only after notification cleanup has succeeded. A later backup
+  ; refusal reports the cleared-notification state but leaves program files.
+  ${If} $TaroBotBackupRequested = 1
+    !insertmacro BirdBackup "$INSTDIR\${TAROBOTHELPER}" "$(birdUninstallBackup)" "un."
+    ; Clear installer settings only after the backup returned a known success.
+    StrCpy $DeleteAppDataCheckboxState 0
+    StrCpy $TaroBotClearSettings 1
   ${EndIf}
 !macroend

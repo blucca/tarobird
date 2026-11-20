@@ -33,10 +33,20 @@
 
 
   !insertmacro RestartManager_StartSession $R0
+  ${If} $R0 == ""
+    Goto app_check_failed_${UniqueID}
+  ${EndIf}
   ${If} $R0 != ""
     !insertmacro RestartManager_RegisterFile $R0 "${executablePath}"
+    ${If} $0 != 0
+      Goto app_check_failed_${UniqueID}
+    ${EndIf}
     ${If} $0 = 0
       System::Call 'RSTRTMGR::RmGetList(p R0, *i .r1, *i .r2, p 0, *i .r3) i .r0'
+      ${If} $0 != 0
+      ${AndIf} $0 != ${ERROR_MORE_DATA}
+        Goto app_check_failed_${UniqueID}
+      ${EndIf}
       ; ERROR_SUCCESS means no running processes, ERROR_MORE_DATA means there're some
       ${If} $0 = ${ERROR_MORE_DATA}
         IfSilent kill_${UniqueID} 0
@@ -66,6 +76,13 @@
     ${EndIf}
     !insertmacro RestartManager_EndSession $R0
   ${EndIf}
+  Goto app_check_finished_${UniqueID}
+  app_check_failed_${UniqueID}:
+    ${If} $R0 != ""
+      !insertmacro RestartManager_EndSession $R0
+    ${EndIf}
+    !insertmacro BirdProblem "$(birdAppStage)" "$(birdAppUnconfirmed)" "$(birdCloseApp)" "APP-CHECK" app_check_retry_${UniqueID}
+  app_check_finished_${UniqueID}:
 
   !undef UniqueID
 !macroend

@@ -779,19 +779,19 @@ Section Uninstall
 
   ; Delete the app directory and its content from disk
   ; Copy main executable
-  Delete "$INSTDIR\${MAINBINARYNAME}.exe"
+  !insertmacro BirdDeleteOwnedFile "$INSTDIR\${MAINBINARYNAME}.exe"
 
   ; Delete resources (generated: exactly the files this version installed)
   !include "${TB_RESOURCES_UNINSTALL}"
+
+  ; Delete uninstaller
+  !insertmacro BirdDeleteOwnedFile "$INSTDIR\uninstall.exe"
 
   ; Delete deep links
   ReadRegStr $R7 SHCTX "Software\Classes\tarocub\shell\open\command" ""
   ${If} $R7 == "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
     DeleteRegKey SHCTX "Software\Classes\tarocub"
   ${EndIf}
-
-  ; Delete uninstaller
-  Delete "$INSTDIR\uninstall.exe"
 
   !include "${TB_RESOURCES_ANCESTORS}"
   RMDir "$INSTDIR"
