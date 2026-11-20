@@ -106,9 +106,20 @@ TaroCub instance
 `DSH_EXECUTABLE` overrides the executable; otherwise TaroCub uses `dsh` from
 `PATH`. `DSH_HOME` points at the user's authenticated Harness home (default
 `~/.dsh`). TaroCub creates `<stateDir>/dsh-home` with mode `0700`, links the
-shared credentials and profiles, copies mutable `settings.yaml` when the shared
+shared credentials, copies mutable `settings.yaml` when the shared
 home has one (current dsh no longer writes it), and installs
-the bridge `AGENTS.md` plus permission presets. Before Search MCP registration,
+the bridge `AGENTS.md` plus permission presets. dsh saves every model and
+reasoning selection (and other settings edits) as the default in
+`profiles/web/cordis.patch.yml`, so each Bot gets a private `profiles/web`:
+regular files there, including that patch, are private copies, each package
+under `node_modules` links to the shared package, and other directories link to
+the shared ones. Every Host start refreshes the private profile one-way from the
+shared profile; nothing is written back, so a Bot's selection never changes
+another Bot's or the user's own `dsh web` default. Changes made in the user's
+DSH reach a Bot at its next Host start. Shared plugins load as dsh linked roots,
+which supply runtime packages only to plugins that declare them as peers. An
+existing Bot's `profiles` link or junction is replaced by removing the link
+only. Before Search MCP registration,
 it validates the installed plugin marker, declared entrypoint, and the bounded
 package-local Harness patch that registers `mcp-cctb-search` through
 `@deepseek-ai/dsh-mcp-client`. A valid plugin owns the client; otherwise the

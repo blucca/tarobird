@@ -151,7 +151,7 @@ describe("prepareDeepSeekHarnessHome", () => {
     } finally { Object.defineProperty(process, "platform", platform); }
   });
 
-  it("isolates mutable settings while linking shared profiles and credentials", async () => {
+  it("isolates mutable settings and the profile while linking shared credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "deepseek-harness-home-"));
     roots.push(root);
     const sharedHome = path.join(root, "shared");
@@ -173,12 +173,13 @@ describe("prepareDeepSeekHarnessHome", () => {
     expect(prepared.home).toBe(path.join(stateDir, "dsh-home"));
     expect(await readFile(prepared.patchPath, "utf8")).toContain('name: "/Applications/Taro Cub/deepseek-app-plugin.js"');
     await expect(lstat(path.join(sharedHome, "cordis.patch.yml"))).rejects.toMatchObject({ code: "ENOENT" });
-    for (const name of ["profiles", ".credentials.yaml", "AGENTS.md"]) {
+    for (const name of [".credentials.yaml", "AGENTS.md"]) {
       expect((await lstat(path.join(prepared.home, name))).isSymbolicLink()).toBe(true);
     }
     expect((await lstat(path.join(prepared.home, "settings.yaml"))).isSymbolicLink()).toBe(false);
     expect(await readFile(path.join(prepared.home, "settings.yaml"), "utf8")).toBe("theme: dark\n");
-    expect(await readlink(path.join(prepared.home, "profiles"))).toBe(path.join(sharedHome, "profiles"));
+    expect((await lstat(path.join(prepared.home, "profiles", "web"))).isDirectory()).toBe(true);
+    expect((await lstat(path.join(prepared.home, "profiles", "web", "package.json"))).isFile()).toBe(true);
     expect(await readlink(path.join(prepared.home, ".credentials.yaml"))).toBe(
       path.join(sharedHome, ".credentials.yaml"),
     );
@@ -206,7 +207,7 @@ describe("prepareDeepSeekHarnessHome", () => {
 
     const prepared = await prepareDeepSeekHarnessHome({ sharedHome, stateDir });
 
-    expect(await readlink(path.join(prepared.home, "profiles"))).toBe(path.join(sharedHome, "profiles"));
+    expect((await lstat(path.join(prepared.home, "profiles", "web"))).isDirectory()).toBe(true);
     expect(await readlink(path.join(prepared.home, ".credentials.yaml"))).toBe(path.join(sharedHome, ".credentials.yaml"));
     await expect(lstat(path.join(prepared.home, "settings.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(lstat(path.join(sharedHome, "settings.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
