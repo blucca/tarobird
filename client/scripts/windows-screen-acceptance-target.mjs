@@ -286,7 +286,7 @@ async function triggerForegroundLoss() {
   await stealerWin.loadFile(file);
   stealerWin.show();
   stealerWin.focus();
-  await waitUntil(() => !inFront(), 2500);
+  await waitUntil(() => !inFront() && lostFocus, 2500);
   return {
     inFront: inFront(),
     lostFocus,
@@ -386,11 +386,90 @@ async function runObservations() {
       const totalMs = Math.round((performance.now() - t0) * 100) / 100;
       obs.move1000 = { count, totalMs, avgMs: count ? Math.round((totalMs / count) * 1000) / 1000 : null };
     }
+
+    // 5. Direct native addon input diagnostic (mouse vs key vs text under monitor, plus direct click/dblclick/text delivery).
+    if (inFront()) {
+      const dispId = service.geometry.displays()[0].id;
+      const p1 = windowPoint({ fx: 0.35, fy: 0.25, displayId: dispId });
+      const p2 = windowPoint({ fx: 0.45, fy: 0.25, displayId: dispId });
+      const pBox = windowPoint({ fx: 0.5, fy: 0.7, displayId: dispId });
+      const btn = addon.screenPhysicalButton('left');
+
+      // Per-input-kind monitor poll breakdown (separating mouse move, mouse click, scan key, Unicode text).
+      addon.screenMonitorPoll();
+      await sleep(50);
+      addon.screenMonitorPoll();
+
+      addon.screenMouse('move', btn, p1.physical.x, p1.physical.y, 1, 0);
+      await sleep(160);
+      const pollMove = addon.screenMonitorPoll();
+
+      addon.screenMouse('down', btn, p2.physical.x, p2.physical.y, 1, 0);
+      await sleep(30);
+      addon.screenMouse('up', btn, p2.physical.x, p2.physical.y, 1, 0);
+      await sleep(160);
+      const pollClick = addon.screenMonitorPoll();
+
+      addon.screenKey(0x2a, true, 0, true, false);
+      await sleep(30);
+      addon.screenKey(0x2a, false, 0, true, false);
+      await sleep(160);
+      const pollKey = addon.screenMonitorPoll();
+
+      // Click textarea, clear, test Unicode + Enter text delivery directly via addon.
+      addon.screenMouse('down', btn, pBox.physical.x, pBox.physical.y, 1, 0);
+      await sleep(30);
+      addon.screenMouse('up', btn, pBox.physical.x, pBox.physical.y, 1, 0);
+      await sleep(180);
+      await pageEval('document.getElementById("text").value = ""; undefined');
+      addon.screenMonitorPoll();
+      const sampleText = 'hello 中文😀\nline2';
+      addon.screenText(sampleText);
+      await sleep(220);
+      const pollText = addon.screenMonitorPoll();
+      const activeEl = await pageEval('document.activeElement && document.activeElement.id');
+      const gotText = await pageEval('document.getElementById("text").value');
+
+      // Direct double-click delivery via addon.
+      await sleep(700);
+      const fromDbl = seen.length;
+      for (let press = 1; press <= 2; press++) {
+        addon.screenMouse('down', btn, p1.physical.x, p1.physical.y, press, 0);
+        await sleep(30);
+        addon.screenMouse('up', btn, p1.physical.x, p1.physical.y, press, 0);
+        if (press === 1) await sleep(60);
+      }
+      await sleep(220);
+      const dblTypes = seen.slice(fromDbl).filter(e => ['mousedown', 'mouseup', 'click', 'dblclick'].includes(e.type)).map(e => `${e.type}:${e.detail}`);
+
+      obs.hookBreakdown = {
+        mouseMove1: pollMove,
+        mouseClick4: pollClick,
+        keyShift2: pollKey,
+        textUnicode: pollText,
+        directText: { activeEl, expectedLen: sampleText.length, gotLen: gotText?.length ?? 0, match: gotText === sampleText },
+        directDblClick: dblTypes,
+      };
+    }
   } finally {
     try { if (addon.screenReleasePending() > 0) addon.screenReleaseAll(); } catch { /* ignore */ }
     try { addon.screenMonitorStop(); } catch { /* ignore */ }
   }
   return obs;
+}
+
+/** Fires one mouse move + one ShiftLeft tap while an external read-only hook probe observes flags & dwExtraInfo. */
+async function probeAddonInputs() {
+  if (!inFront()) return { skipped: true };
+  const dispId = service.geometry.displays()[0].id;
+  const p = windowPoint({ fx: 0.4, fy: 0.3, displayId: dispId });
+  addon.screenMouse('move', 'left', p.physical.x, p.physical.y, 1, 0);
+  await sleep(60);
+  addon.screenKey(0x2a, true, 0, true, false);
+  await sleep(30);
+  addon.screenKey(0x2a, false, 0, true, false);
+  await sleep(60);
+  return { skipped: false };
 }
 
 async function shutdown() {
@@ -427,6 +506,7 @@ async function handle(cmd) {
     case 'trigger-foreground-loss': return triggerForegroundLoss();
     case 'close-focus-window': return closeFocusWindow();
     case 'run-observations': return runObservations();
+    case 'probe-addon-inputs': return probeAddonInputs();
     case 'shutdown': {
       const res = await shutdown();
       setTimeout(() => app.exit(0), 50);

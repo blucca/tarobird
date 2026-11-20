@@ -122,6 +122,190 @@ $out | ConvertTo-Json -Compress
   }
 }
 
+async function runHookWireProbe(workDir, triggerAddon) {
+  const readyFile = path.join(workDir, 'hook-probe.ready');
+  const stopFile = path.join(workDir, 'hook-probe.stop');
+  const psScript = `
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public static class HookWireProbe {
+  private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+  private static HookProc _mouseProc;
+  private static HookProc _keyProc;
+  private static List<string> _events = new List<string>();
+  private static string _phase = "addon";
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct POINT { public int x; public int y; }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct MSLLHOOKSTRUCT {
+    public POINT pt;
+    public uint mouseData;
+    public uint flags;
+    public uint time;
+    public UIntPtr dwExtraInfo;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct KBDLLHOOKSTRUCT {
+    public uint vkCode;
+    public uint scanCode;
+    public uint flags;
+    public uint time;
+    public UIntPtr dwExtraInfo;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct MOUSEINPUT {
+    public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public UIntPtr dwExtraInfo;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct KEYBDINPUT {
+    public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public UIntPtr dwExtraInfo;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct HARDWAREINPUT {
+    public uint uMsg; public ushort wParamL; public ushort wParamH;
+  }
+  [StructLayout(LayoutKind.Explicit)]
+  private struct INPUTUNION {
+    [FieldOffset(0)] public MOUSEINPUT mi;
+    [FieldOffset(0)] public KEYBDINPUT ki;
+    [FieldOffset(0)] public HARDWAREINPUT hi;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct INPUT {
+    public uint type;
+    public INPUTUNION u;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct MSG {
+    public IntPtr hwnd; public uint message; public UIntPtr wParam; public IntPtr lParam; public uint time; public POINT pt;
+  }
+
+  [DllImport("user32.dll", SetLastError=true)] private static extern IntPtr SetWindowsHookExW(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+  [DllImport("user32.dll", SetLastError=true)] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+  [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr GetModuleHandleW(string lpModuleName);
+  [DllImport("user32.dll")] private static extern bool PeekMessageW(out MSG msg, IntPtr hWnd, uint min, uint max, uint remove);
+  [DllImport("user32.dll", SetLastError=true)] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+  private static IntPtr MouseCb(int code, IntPtr wParam, IntPtr lParam) {
+    if (code >= 0 && lParam != IntPtr.Zero && _events.Count < 40) {
+      MSLLHOOKSTRUCT s = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+      _events.Add(string.Format("{{\\"p\\":\\"{0}\\",\\"k\\":\\"m\\",\\"wp\\":\\"{1:x}\\",\\"fl\\":\\"{2:x}\\",\\"ex\\":\\"{3:x16}\\"}}",
+        _phase, wParam.ToInt64(), s.flags, s.dwExtraInfo.ToUInt64()));
+    }
+    return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+  }
+  private static IntPtr KeyCb(int code, IntPtr wParam, IntPtr lParam) {
+    if (code >= 0 && lParam != IntPtr.Zero && _events.Count < 40) {
+      KBDLLHOOKSTRUCT s = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+      _events.Add(string.Format("{{\\"p\\":\\"{0}\\",\\"k\\":\\"k\\",\\"wp\\":\\"{1:x}\\",\\"fl\\":\\"{2:x}\\",\\"ex\\":\\"{3:x16}\\"}}",
+        _phase, wParam.ToInt64(), s.flags, s.dwExtraInfo.ToUInt64()));
+    }
+    return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+  }
+  private static void Pump(int ms) {
+    int end = Environment.TickCount + ms;
+    MSG m;
+    while (Environment.TickCount < end) {
+      while (PeekMessageW(out m, IntPtr.Zero, 0, 0, 1)) {}
+      Thread.Sleep(5);
+    }
+  }
+  public static string Run(string readyPath, string stopPath) {
+    _mouseProc = new HookProc(MouseCb);
+    _keyProc = new HookProc(KeyCb);
+    IntPtr mod = GetModuleHandleW(null);
+    IntPtr hm = SetWindowsHookExW(14, _mouseProc, mod, 0);
+    IntPtr hk = SetWindowsHookExW(13, _keyProc, mod, 0);
+    if (hm == IntPtr.Zero || hk == IntPtr.Zero) {
+      if (hm != IntPtr.Zero) UnhookWindowsHookEx(hm);
+      if (hk != IntPtr.Zero) UnhookWindowsHookEx(hk);
+      return "{\\"error\\":\\"hook_install_failed\\"}";
+    }
+    try {
+      File.WriteAllText(readyPath, "ok");
+      int deadline = Environment.TickCount + 8000;
+      MSG m;
+      while (!File.Exists(stopPath) && Environment.TickCount < deadline) {
+        while (PeekMessageW(out m, IntPtr.Zero, 0, 0, 1)) {}
+        Thread.Sleep(5);
+      }
+      Pump(120);
+      int sz = Marshal.SizeOf(typeof(INPUT));
+      // Self-control test: 64-bit tag vs 32-bit tag via SendInput (mouse move + ShiftLeft down/up).
+      _phase = "self64";
+      INPUT[] m64 = new INPUT[1];
+      m64[0].type = 0;
+      m64[0].u.mi.dx = 32768; m64[0].u.mi.dy = 20000;
+      m64[0].u.mi.dwFlags = 0x0001 | 0x8000 | 0x4000;
+      m64[0].u.mi.dwExtraInfo = new UIntPtr(0x1122334455667789UL);
+      uint sm64 = SendInput(1, m64, sz);
+      INPUT[] k64 = new INPUT[2];
+      k64[0].type = 1; k64[0].u.ki.wScan = 0x2a; k64[0].u.ki.dwFlags = 0x0008; k64[0].u.ki.dwExtraInfo = new UIntPtr(0x1122334455667789UL);
+      k64[1].type = 1; k64[1].u.ki.wScan = 0x2a; k64[1].u.ki.dwFlags = 0x0008 | 0x0002; k64[1].u.ki.dwExtraInfo = new UIntPtr(0x1122334455667789UL);
+      uint sk64 = SendInput(2, k64, sz);
+      Pump(120);
+
+      _phase = "self32";
+      INPUT[] m32 = new INPUT[1];
+      m32[0].type = 0;
+      m32[0].u.mi.dx = 32800; m32[0].u.mi.dy = 20000;
+      m32[0].u.mi.dwFlags = 0x0001 | 0x8000 | 0x4000;
+      m32[0].u.mi.dwExtraInfo = new UIntPtr(0x0000000055667789UL);
+      uint sm32 = SendInput(1, m32, sz);
+      INPUT[] k32 = new INPUT[2];
+      k32[0].type = 1; k32[0].u.ki.wScan = 0x2a; k32[0].u.ki.dwFlags = 0x0008; k32[0].u.ki.dwExtraInfo = new UIntPtr(0x0000000055667789UL);
+      k32[1].type = 1; k32[1].u.ki.wScan = 0x2a; k32[1].u.ki.dwFlags = 0x0008 | 0x0002; k32[1].u.ki.dwExtraInfo = new UIntPtr(0x0000000055667789UL);
+      uint sk32 = SendInput(2, k32, sz);
+      Pump(120);
+
+      return string.Format("{{\\"inputSize\\":{0},\\"sent\\":{{\\"m64\\":{1},\\"k64\\":{2},\\"m32\\":{3},\\"k32\\":{4}}},\\"events\\":[{5}]}}",
+        sz, sm64, sk64, sm32, sk32, string.Join(",", _events.ToArray()));
+    } finally {
+      UnhookWindowsHookEx(hm);
+      UnhookWindowsHookEx(hk);
+    }
+  }
+}
+"@
+[HookWireProbe]::Run($args[0], $args[1])
+`;
+  const scriptFile = path.join(workDir, 'hook-wire-probe.ps1');
+  await writeFile(scriptFile, psScript);
+  return new Promise(resolve => {
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', scriptFile, readyFile, stopFile], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', d => { stdout += String(d); });
+    child.stderr.on('data', d => { if (stderr.length < 1000) stderr += String(d); });
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* ignore */ } }, 20000);
+    (async () => {
+      const ready = await wait(() => existsSync(readyFile), 8000);
+      if (ready) {
+        try { await triggerAddon(); } catch { /* ignore */ }
+      }
+      await writeFile(stopFile, 'stop').catch(() => {});
+    })();
+    child.once('exit', code => {
+      clearTimeout(timer);
+      const start = stdout.indexOf('{');
+      const end = stdout.lastIndexOf('}');
+      if (start >= 0 && end > start) {
+        try { resolve(JSON.parse(stdout.slice(start, end + 1))); return; } catch { /* ignore */ }
+      }
+      resolve({ error: `exit_${code}`, stderr: stderr.slice(0, 400) });
+    });
+  });
+}
+
 function makeDevice(deviceId) {
   const keys = generateKeyPairSync('ed25519');
   return {
@@ -297,15 +481,18 @@ async function main() {
   const cleanups = [() => rm(workDir, { recursive: true, force: true })];
 
   const addonSha256 = createHash('sha256').update(await readFile(addonPath)).digest('hex');
-  const stage3Sha256 = createHash('sha256').update(await readFile(stage3Script)).digest('hex');
+  const stage3Raw = await readFile(stage3Script);
+  const stage3Sha256 = createHash('sha256').update(stage3Raw).digest('hex');
+  const stage3LfSha256 = createHash('sha256').update(Buffer.from(stage3Raw.toString('utf8').replaceAll('\r\n', '\n'), 'utf8')).digest('hex');
   const receipt = new Receipt();
   const meta = {
     startedAt: new Date().toISOString(),
     sourceCommit: values['source-commit'],
     addonSha256,
     stage3Sha256,
+    stage3LfSha256,
   };
-  const evidence = { meta, osPreflight: null, stage3: null, e2ePreflight: null, observations: null };
+  const evidence = { meta, osPreflight: null, stage3: null, e2ePreflight: null, e2eControlEvents: null, observations: null, hookWireProbe: null };
 
   try {
     // 1. OS interactive desktop preflight (no guesses).
@@ -497,8 +684,8 @@ async function main() {
         };
 
         if (leaseGranted) {
-          // 8a. Pointer move inside synthetic test window.
-          const pMove = await target.call('window-point', { fx: 0.5, fy: 0.25, displayId: display.id });
+          // 8a. Pointer move inside synthetic test window (distinct pixel from Stage 3's 0.5, 0.25).
+          const pMove = await target.call('window-point', { fx: 0.35, fy: 0.25, displayId: display.id });
           const fromMove = (await target.call('window-state')).seenCount;
           await sendInput({ kind: 'move', x: pMove.norm.x, y: pMove.norm.y });
           await sleep(220);
@@ -583,11 +770,26 @@ async function main() {
             !loss.inFront && loss.lostFocus && abortedNextInput && noKeyAAfterLoss && releasedClean && afterRelease.pending === 0 && !afterRelease.activeMarkerExists && afterRelease.heldJournal.state === 'missing',
             `loss=${JSON.stringify(loss)}, abortedNextInput=${abortedNextInput}, noKeyA=${noKeyAAfterLoss}, pendingAfter=${afterRelease.pending}, activeMarker=${afterRelease.activeMarkerExists}, journal=${afterRelease.heldJournal.state}, keyEvents=${holdKeyEvents.map(e => `${e.type}:${e.code}`).join(',')}`);
 
-          // 9. Record-only non-gating observations from Fable's Section 5 checklist.
+          // Record redacted control channel state transitions for root-cause clarity.
+          evidence.e2eControlEvents = control.values
+            .filter(v => v && typeof v === 'object' && v.type !== 'frame-ready')
+            .map(v => ({
+              type: v.type,
+              reason: v.reason ?? v.error ?? v.session?.endedReason ?? null,
+              state: v.session?.state ?? null,
+              hasLease: Boolean(v.lease),
+            }));
+          receipt.info('e2e-input', 'control-channel-transitions', JSON.stringify(evidence.e2eControlEvents));
+
+          // 9. Record-only non-gating observations from Fable's Section 5 checklist + Win32 hook wire probe.
           await target.call('close-focus-window');
           const obs = await target.call('run-observations', {}, 30000);
           evidence.observations = obs;
           receipt.info('observations', 'fable-section5-checklist', JSON.stringify(obs));
+
+          const wireProbe = await runHookWireProbe(workDir, () => target.call('probe-addon-inputs'));
+          evidence.hookWireProbe = wireProbe;
+          receipt.info('observations', 'win32-hook-wire-probe', JSON.stringify(wireProbe));
         }
       }
     }
