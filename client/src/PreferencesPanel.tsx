@@ -3,6 +3,7 @@ import type { WorkbenchFileTarget } from "./workbench-library-context.js";
 import { useDialogDrag } from "./dialog-drag.js";
 import { useSceneMotion } from "./use-scene-motion.js";
 import { BackupSettings } from "./BackupSettings.js";
+import { EngineQuota } from "./EngineQuota.js";
 import { EngineSettings } from "./EngineSettings.js";
 import { WidgetSettings } from "./WidgetSettings.js";
 import { GoogleDocsSettings } from "./GoogleDocsSettings.js";
@@ -18,7 +19,7 @@ import { FontSizeSlider } from "./FontSizeSlider.js";
 import { LayoutDensityPicker } from "./LayoutDensityPicker.js";
 import { useBackAction } from "./back-navigation.js";
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject } from "react";
-import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Link, Monitor, Plus, QrCode, ScanLine, Settings2, ShieldCheck, X } from "lucide-react";
+import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Link, Monitor, Plus, QrCode, ScanLine, Settings2, ShieldCheck, Gauge, X } from "lucide-react";
 import { ConnectionPanel } from "./ConnectionPanel.js";
 import type { OpenNetwork } from "./network-navigation.js";
 import "./network-settings.css";
@@ -42,7 +43,7 @@ import { ambiguousDeviceName, deviceDisplayName, deviceRevokeScope } from "./dev
 import "./device-settings.css";
 import { BotMessageGrants } from "./BotMessageGrants.js";
 
-type Section = "workbench" | "backups" | "general" | "network" | "notifications" | "devices" | "botMessages" | "voice" | "engines";
+type Section = "workbench" | "backups" | "general" | "network" | "notifications" | "devices" | "botMessages" | "voice" | "engines" | "quota";
 /** `created_at`/`last_seen` come from the host; 0 or missing means never recorded. */
 type Device = { id: string; name: string; nameSource?: "host"; platform: string; revoked: number; created_at?: number | string | null; last_seen?: number | string | null };
 /** Messages appear beside the control that produced them, not at the page end. */
@@ -152,6 +153,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   const sections = [
     { id: "general" as const, title: t("通用"), detail: t("语言、外观与个人头像"), icon: Settings2 },
     { id: "engines" as const, title: t("引擎程序"), detail: t("检测 CLI 与手动指定程序路径"), icon: Monitor },
+    ...(state.user?.role === "owner" ? [{ id: "quota" as const, title: t("模型额度"), detail: t("原生剩余额度与重置时间"), icon: Gauge }] : []),
     { id: "network" as const, title: t("网络与连接"), detail: t("连接线路、VPS 与主机组网"), icon: Globe },
     { id: "workbench" as const, title: t("工作台文件"), detail: t("集中管理白板、笔记与设计"), icon: FolderOpen },
     { id: "backups" as const, title: t("数据与备份"), detail: t("自动备份、保留天数与空间占用"), icon: Database },
@@ -160,6 +162,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
     { id: "devices" as const, title: t("设备与安全"), detail: t("查看设备、修改名称与撤销授权"), icon: ShieldCheck },
     { id: "botMessages" as const, title: t("Bot 消息授权"), detail: t("管理本机与跨主机 Bot 的直接消息权限"), icon: Link },
   ];
+  useEffect(() => { if (section === "quota" && state.user?.role !== "owner") { setSection("general"); setOverview(true); } }, [section, state.user?.role]);
   const requestClose = () => {
     if (settingsBusy || busy) return;
     if (dirty) { setConfirmation({ kind: "discard" }); return; }
@@ -425,6 +428,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
           <details className="network-settings-help"><summary>{t("第一次连接，应该从哪里开始？")}</summary><p>{t("新手机或电脑：点击「添加设备」展示二维码，让新设备扫码，再输入新设备上的 8 位配对码确认。")}</p><p>{t("外出时需要访问主机：到「连接状态与线路」配置可用的 VPS 中转或 Tailscale。填写地址不会自动部署服务器和隧道。")}</p></details>
         </section>
         <section hidden={section !== "engines"} aria-label={t("引擎程序")}><h3>{t("引擎程序")}</h3><EngineSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "engines" && (!phone || !overview)} onDirty={setEngineDirty} onBusy={setEngineBusy}/></section>
+        {state.user?.role === "owner" && <section hidden={section !== "quota"} aria-label={t("模型额度")}><h3>{t("模型额度")}</h3><EngineQuota key={connection.identity.hubPublicKey} connection={connection} active={section === "quota" && (!phone || !overview)}/></section>}
         <section hidden={section !== "workbench"} aria-label={t("工作台文件")}><h3>{t("工作台文件")}</h3><WorkbenchLibrary connection={connection} active={section === "workbench" && (!phone || !overview)} onBusy={setLibraryBusy} onOpened={close} openLocalFile={openWorkbenchFile}/></section>
         <section hidden={section !== "backups"} aria-label={t("数据与备份")}><h3>{t("数据与备份")}</h3><BackupSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "backups" && (!phone || !overview)} onDirty={setBackupDirty} onBusy={setBackupBusy}/></section>
         <section hidden={section !== "voice"} aria-label={t("语音转写")}><h3>{t("语音转写")}</h3><VoiceSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "voice" && (!phone || !overview)} onDirty={setVoiceDirty} onBusy={setVoiceBusy}/></section>

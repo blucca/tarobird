@@ -1,5 +1,7 @@
 import { HubConversationHistory } from "./conversation-history.js";
 import { CONVERSATION_HISTORY_CAPABILITY, historyChangeSchema } from "../client-protocol/conversation-history.js";
+import { hubEngineQuotas } from "./engine-quota.js";
+import { ENGINE_QUOTA_CAPABILITY } from "../client-protocol/engine-quota.js";
 import { DesignShareBroker, metaDesignShareRepository, type DesignSharePeer } from "./workbench-design-sharing.js";
 import { DESIGN_SHARE_CLIENT_CAPABILITY } from "../client-protocol/workbench-design-sharing.js";
 import { HubRemoteScreen } from "./remote-screen.js";
@@ -140,7 +142,7 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
   const { workbench, ...rest } = metadata, { openTarget: _opener, ...context } = workbench;
   return (workbenchOpenerOnly(workbench) ? rest : { ...rest, workbench: context }) as T;
 }
-type BotConnection = { history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
+type BotConnection = { engineQuota: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
 export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
@@ -1261,7 +1263,7 @@ export class HubServer {
           botId = frame.botId; if (frame.capabilities?.includes(FRAGMENT_CAPABILITY)) this.fragmentSockets.add(ws); clearTimeout(timeout); this.bots.get(botId)?.ws.close(4000, "replaced");
           const queueAdvertised = frame.capabilities?.includes(PROMPT_QUEUE_CAPABILITY) ?? false;
           const queueCapable = queueAdvertised && supportsPromptQueueEngine(frame.engine);
-          const connection: BotConnection = { history: frame.capabilities?.includes(CONVERSATION_HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
+          const connection: BotConnection = { engineQuota: frame.capabilities?.includes(ENGINE_QUOTA_CAPABILITY) ?? false, history: frame.capabilities?.includes(CONVERSATION_HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
           // Reserve socket ownership before awaiting SQLite. Concurrent hellos
           // must replace this exact socket, not both replace its predecessor.
           this.bots.set(botId, connection);
@@ -1567,6 +1569,17 @@ export class HubServer {
     const reply = async (status: number, value: unknown) => { await validate(); this.json(res, status, value); };
     this.requestGuards.set(req, validate);
     try {
+      const quotaRoute = route.match(/^\/api\/engine-quotas(?:\/([A-Za-z0-9_-]+))?$/);
+      if (quotaRoute && req.method === "GET") {
+        await requireOwner();
+        const url = new URL(req.url ?? "/", "http://hub"), refresh = url.searchParams.get("refresh") === "1", revision = url.searchParams.get("revision") ?? undefined;
+        if (revision && (revision.length > 128 || !/^[a-zA-Z0-9_.:-]+$/.test(revision)) || refresh && !quotaRoute[1]) throw new HubError("quota_request_invalid", 400);
+        const quotas = hubEngineQuotas({ bots: () => this.store.bots(userId), validate,
+          connection: id => { const connection = this.bots.get(id); return connection ? { key: connection, supported: connection.engineQuota, ready: connection.ready } : undefined; },
+          call: (id, request) => this.callBot(id, "quota.get", request, request.refresh ? 9_000 : 2_500),
+        });
+        await reply(200, quotaRoute[1] ? await quotas.scope(quotaRoute[1], refresh, revision) : await quotas.directory()); return;
+      }
       if (route === "/api/workbench/admit" && req.method === "POST") {
         const input = z.object({ dispatchId: idSchema }).strict().parse(await this.jsonBody(req, 2048));
         await reply(200, await this.workbench.admit(session, input.dispatchId)); return;

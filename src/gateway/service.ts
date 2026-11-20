@@ -1,5 +1,7 @@
 import { gatewayConversationHistory } from "./conversation-history.js";
 import { CONVERSATION_HISTORY_CAPABILITY, historyAnchorEvidenceSchema } from "../client-protocol/conversation-history.js";
+import { gatewayEngineQuota } from "./engine-quota.js";
+import { quotaEngineSchema } from "../client-protocol/engine-quota.js";
 import { workbenchInstructions } from "./agent-instructions.js";
 import { chromeSettings } from "../runtime/chrome-settings.js";
 import { RUN_RECOVERY_CAPABILITY } from "../client-protocol/run.js";
@@ -261,8 +263,11 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   // Side audio uses the main transcriber and cloud policy, without its chat progress cards.
   sideSessions = gatewaySideSessions(surface, options.stateDir, options.botId, conversationId => channel.canSteerConversation!(conversationId), instanceAttachmentDownload(channel.transport), runtime.transcribeMedia ?? createDefaultTranscribeVoice(), channel);
   const schedules = gatewaySchedules(options, channel);
+  const quotaEngine = quotaEngineSchema.safeParse(options.engine);
+  const quotas = quotaEngine.success ? gatewayEngineQuota({ botId: options.botId, engine: quotaEngine.data, read: bridge.readAccountQuota?.bind(bridge) }) : undefined;
   channel.onCall = async (method, raw): Promise<Json> => withChannelProfile("gateway", async () => {
     if (method.startsWith("history.")) return history(method, raw);
+    if (method === "quota.get") { if (!quotas) throw new Error("quota_engine_unavailable"); return z.json().parse(await quotas(raw)); }
     if (method === "tasks.list" || method === "tasks.stop" || method === "tasks.recover") return z.json().parse(await engineTasks(method, raw));
     if (method === "pi.session.get" || method === "pi.session.set") return z.json().parse(await piSession(method, raw));
     if (["side.status", "side.open", "side.read", "side.ask", "side.stop", "side.close"].includes(method)) return z.json().parse(await sideSessions!.call(method, raw));

@@ -1,5 +1,8 @@
 import { addCodexWebSources, renderCodexWebCitations, type CodexWebSource, type CodexWebSources } from "../runtime/codex-web-citations.js";
 import { SIDE_TOOL_INSTRUCTIONS } from "./side-instructions.js";
+import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
+import { readCodexAccountQuota } from "./codex-account-quota.js";
+import { cancelOwnedQuotaReads, readOwnedCodexQuota } from "./codex-quota-process.js";
 import { isLogicalSessionId } from "../runtime/logical-session.js";
 import { wholeFilePatch } from "../core/recorded-diff.js";
 import { spawnEngine } from "../runtime/engine-process.js";
@@ -839,6 +842,9 @@ function decodeProcessChunk(
 }
 
 export class CodexAppServerAdapter implements CodexAdapter {
+  private readonly quotaCache: AdapterQuotaCache;
+  private quotaCredentialAtSpawn?: string;
+  private quotaAccountGeneration = 0;
   get turnRuntimeLimitMs(): number { return this.turnTimeoutMs; }
   readonly bridgeInstructionMode = "output-directory" as const;
   readonly supportsTurnScopedEnv = false;
@@ -965,6 +971,53 @@ export class CodexAppServerAdapter implements CodexAdapter {
     this.nativeSearchMcp = dependencies.nativeSearchMcp;
     this.instructionsPath = instructionsPath;
     this.configPath = configPath;
+    this.quotaCache = new AdapterQuotaCache("codex", codexExecutable, this.childEnv, cwd, configPath);
+  }
+
+  private quotaScope() { return this.quotaCache.capture(`${this.childGeneration}:${Math.max(0, this.quotaAccountGeneration - 1)}:${this.child ? "live" : "none"}`); }
+
+  async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
+    const scope = this.quotaScope();
+    const cached = this.quotaCache.response(scope, options);
+    if (cached) return cached;
+    if (!this.child) return readOwnedCodexQuota({ executable: this.codexExecutable, cwd: this.cwd, env: this.childEnv, spawn: this.spawnCodex, cache: this.quotaCache, scope, options, captureScope: () => this.quotaScope() });
+    if (this.quotaCredentialAtSpawn !== scope.credentialRevision) { this.quotaCache.invalidate(); return this.quotaCache.failure(scope, "auth_changed"); }
+    const initial = this.initializePromise;
+    const result = await readCodexAccountQuota({
+      request: async (method, params, requestOptions) => {
+        await initial;
+        if (requestOptions.signal.aborted) throw new Error("quota_cancelled");
+        return this.request(method, params, { ...requestOptions, idleBlocking: false, destroyOnTimeout: false });
+      },
+      captureScope: () => this.quotaScope().revision, proofKey: this.quotaCache.proofKey,
+      signal: options.signal, timeoutMs: Math.min(options.timeoutMs ?? 7000, 7000),
+    });
+    const after = this.quotaScope();
+    if (after.revision !== scope.revision) return this.quotaCache.failure(after, "auth_changed");
+    return this.quotaCache.store(after, result);
+  }
+
+  /** Only the quota-owned helper calls this. Its caller owns termination and waits for actual close. */
+  async readAccountQuotaFromOwnedProcess(options: {
+    signal: AbortSignal; timeoutMs: number; proofKey: Uint8Array; captureScope: () => string; remainingMs: () => number;
+  }) {
+    if (options.signal.aborted) throw new Error("quota_cancelled");
+    await this.startChildAndInitialize(["app-server"]);
+    if (options.signal.aborted) throw new Error("quota_cancelled");
+    return readCodexAccountQuota({ request: (method, params, requestOptions) => this.request(method, params, { ...requestOptions, idleBlocking: false, destroyOnTimeout: false }),
+      // The first account/updated is startup discovery, later events fence a login/workspace switch.
+      captureScope: () => `${options.captureScope()}:${this.childGeneration}:${Math.max(0, this.quotaAccountGeneration - 1)}`,
+      proofKey: options.proofKey, signal: options.signal, timeoutMs: options.remainingMs() });
+  }
+
+  /** Exclusive quota helper only: there are no model turns or tools to drain. */
+  stopOwnedAccountQuotaProcess(): Promise<void> {
+    const child = this.child;
+    const stopped = child?.pid ? killProcessTree(child.pid, { graceMs: 100 }) : Promise.resolve();
+    if (child && !child.pid) child.kill?.();
+    this.failAllPending(new Error("Quota reader closed"));
+    this.resetChildState();
+    return stopped;
   }
 
   async createSession(chatId: number): Promise<CodexSessionHandle> {
@@ -1800,6 +1853,8 @@ export class CodexAppServerAdapter implements CodexAdapter {
   }
 
   private async startChildAndInitialize(appServerArgs: string[]): Promise<void> {
+    this.quotaAccountGeneration = 0;
+    this.quotaCredentialAtSpawn = this.quotaScope().credentialRevision;
     const invocation = buildCommandInvocation(this.codexExecutable, appServerArgs);
     let searchPlan: NativeSearchMcpPlan | null = null;
     try { searchPlan = this.nativeSearchMcp?.() ?? null; } catch { searchPlan = null; }
@@ -1993,6 +2048,14 @@ export class CodexAppServerAdapter implements CodexAdapter {
           this.settleGoalAfterFinalTurn(notificationThreadId, watcher);
         }
       }
+    }
+
+    if (parsed.method === "account/updated") {
+      this.quotaAccountGeneration++;
+      this.quotaCache.invalidate();
+    } else if (parsed.method === "account/rateLimits/updated") {
+      // Sparse native updates cannot clear fields from a full quota snapshot.
+      this.quotaCache.invalidate();
     }
 
     if (parsed.method === "serverRequest/resolved") {
@@ -4476,6 +4539,8 @@ export class CodexAppServerAdapter implements CodexAdapter {
     if (expectedChildGeneration !== undefined && expectedChildGeneration !== this.childGeneration) {
       return;
     }
+    void cancelOwnedQuotaReads(this.quotaCache).catch(() => undefined);
+    this.quotaCache.invalidate();
     this.terminateChild();
     // `reason` preserves a diagnosable cause (e.g. the thread/read timeout that
     // triggered the respawn); without it every pending turn was rejected with a

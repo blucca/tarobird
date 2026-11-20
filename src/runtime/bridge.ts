@@ -248,6 +248,10 @@ export class Bridge {
         this.historyMutations.add(sessionId); return () => { this.historyMutations.delete(sessionId); }; });
   }
 
+  async readAccountQuota(options: import("../codex/adapter.js").EngineQuotaReadOptions): Promise<import("../codex/adapter.js").EngineQuotaReadResult | undefined> {
+    return this.adapter.getAccountQuota?.(options);
+  }
+
   async destroy(): Promise<void> {
     await this.adapter.destroy?.();
   }

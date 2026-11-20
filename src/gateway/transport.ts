@@ -1,4 +1,5 @@
 import { CONVERSATION_HISTORY_CAPABILITY } from "../client-protocol/conversation-history.js";
+import { ENGINE_QUOTA_CAPABILITY } from "../client-protocol/engine-quota.js";
 import { workbenchContextSchema, workbenchContextOmittedSchema, type WorkbenchContext, type WorkbenchContextOmitted } from "../client-protocol/workbench.js";
 import { WORKBENCH_DESIGN_OPEN_CAPABILITY } from "../client-protocol/workbench-design.js";
 import { NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY } from "../client-protocol/native-input.js";
@@ -102,7 +103,7 @@ export class GatewayTransport {
         await this.readStatus();
         // Standalone/manual workers without a Host binding still use their own
         // environment; do not claim that the Host's voice settings apply.
-        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [CONVERSATION_HISTORY_CAPABILITY, ...(this.status.engine === "pi" ? [PI_SESSION_CAPABILITY] : []), ...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
+        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [ENGINE_QUOTA_CAPABILITY,CONVERSATION_HISTORY_CAPABILITY, ...(this.status.engine === "pi" ? [PI_SESSION_CAPABILITY] : []), ...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
       }).catch(() => undefined);
     });
     ws.on("message", (data) => {

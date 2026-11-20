@@ -108,6 +108,7 @@ export interface CoreBridgeLike {
   getConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryScope): Promise<import("../client-protocol/conversation-history.js").HistoryInternalSnapshot>;
   applyConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryApply): Promise<import("../client-protocol/conversation-history.js").HistoryNativeResult>;
   finalizeConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryFinalize): Promise<{ revision: string }>;
+  readAccountQuota?(options: import("../codex/adapter.js").EngineQuotaReadOptions): Promise<import("../codex/adapter.js").EngineQuotaReadResult | undefined>;
   sideCapability?(input?: { workspaceOverride?: string; tools?: "inherited" }): import("../codex/adapter.js").SideCapability;
   openSideSession?(input: { chatId: number; userId: number; chatType: string; conversationKey: string; workspaceOverride?: string; tools?: "inherited"; locale?: "en" | "zh"; abortSignal?: AbortSignal }): Promise<import("../codex/adapter.js").EngineSideSession>;
   /** Shares the underlying engine/session state for an independently authenticated transport. */

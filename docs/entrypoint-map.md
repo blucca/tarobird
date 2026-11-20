@@ -3703,6 +3703,22 @@ retired; see [scope and regression mapping](adapter-retirement-2026-10-21.md).
 
 See `docs/state-model.md` before changing on-disk semantics.
 
+## Native model quota reads
+
+- `client-protocol/engine-quota.ts` owns the strict `engines.quota.v1` public DTO.
+  Owner-only `hub/engine-quota.ts` and `gateway/engine-quota.ts` compose cached
+  directory reads and explicit per-Bot refresh; credential proofs never leave
+  the worker. `host-cli/engine-quota.ts` exposes the same API to the CLI.
+- `codex/account-quota.ts`, `codex/codex-account-quota.ts` and
+  `codex/adapter-account-quota.ts` parse native limits and fence credential,
+  worker and cache generations. Codex uses account-only RPCs; Claude observes
+  normal stream events. No prompt, login or automatic allowance estimate is
+  used to query quota. See [the supported sources and limits](client/engine-quota.md).
+- Focused coverage: `tests/{account-quota,engine-quota-scope,adapter-account-quota,
+  gateway-engine-quota,hub-engine-quota,hub-engine-quota-http}.test.ts` and the
+  client quota UI/browser cases. Include existing adapter cancellation and
+  process-lifecycle tests when changing readers.
+
 ## Engine / Provider Layer
 
 Claude input/task parity: `client-protocol/engine-tasks.ts`,

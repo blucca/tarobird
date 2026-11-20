@@ -1,4 +1,5 @@
 import { runHistoryCommand } from "./history.js";
+import { engineQuotaCommand } from "./engine-quota.js";
 import { screenCommand } from "./screens.js";
 import { runWorkbenchCommand } from "./workbench.js";
 import { runConversationsCommand } from './conversations.js';
@@ -157,6 +158,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   workbench run CONVERSATION --from REQUEST.json --request-id ID [--context-message ID] [--file IMAGE] [--json]
     通过同一主机授权接口控制在线 App；返回真实回执。unknown 不代表成功，勿换编号自动重试。
     Markdown 笔记是 App 工作台对象，不是本机文件；导入导出只由用户在 App 中进行。
+  engines quota [--bot BOT] [--refresh --revision REV] [--json]
   engines status [--request-id ID] [--json]
   engines set --engine ENGINE --path ABSOLUTE_PATH --revision REV [--request-id ID]
   engines reset --engine ENGINE --revision REV [--request-id ID]
@@ -302,7 +304,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
     "html-file": { type: "string" }, "report-file": { type: "string" }, title: { type: "string" }, summary: { type: "string" },
     token: { type: "string" }, session: { type: "string" }, thinking: { type: "string" }, target: { type: "string" }, task: { type: "string" }, bot: { type: "string" }, message: { type: "string" }, before: { type: "string" }, through: { type: "string" }, last: { type: "boolean" },
-    path: { type: "string" }, operation: { type: "string" }, preview: { type: "boolean" },
+    refresh: { type: "boolean" }, path: { type: "string" }, operation: { type: "string" }, preview: { type: "boolean" },
     host: { type: "string" }, to: { type: "string" }, "source-bot": { type: "string" }, "cross-host": { type: "boolean" }, "context-message": { type: "string" }, file: { type: "string", multiple: true }, "new-conversation": { type: "string" }, timeout: { type: "string" },
     "reply-to": { type: "string" }, ids: { type: "string" }, conversation: { type: "string" }, sort: { type: "string" }, text: { type: "string" }, "text-file": { type: "string" }, run: { type: "string" },
     coordinator: { type: "string" }, members: { type: "string" },
@@ -324,7 +326,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     history: ["bot", "anchor", "message", "cursor", "revision", "request-id", "title", "action"],
     screens: ["from", "yes", "permission", "request-id"],
     workbench: ["from", "request-id", "context-message", "file"],
-    engines: ["engine", "path", "revision", "request-id"],
+    engines: ["engine", "path", "revision", "request-id", "bot", "refresh"],
     backups: ["days", "revision", "request-id"],
     integrations: ["yes", "request-id", "mode", "enabled", "adapter", "threshold-seconds", "revision"], directory: ["from"], init: ["name"], stop: ["wait", "force"], restart: ["wait", "force"], enroll: ["reset", "yes"], name: ["name"], drain: ["wait"],
     service: ["yes"], bots: ["name", "engine", "model", "effort", "workspace", "permission", "request-id", "expected-name", "yes", "revision", "enabled", "role", "dispatch-mode", "max-concurrent", "allow", "from"],
@@ -426,8 +428,15 @@ export async function runHostCli(argv: string[]): Promise<void> {
     finally { client.close(); }
     return;
   }
+  if (command === "engines" && sub === "quota") {
+    if (argument || v.engine !== undefined || v.path !== undefined || v["request-id"] !== undefined) throw new Error("请使用 engines quota --help。");
+    const client = await LocalHostClient.connect(directory);
+    try { await output(await engineQuotaCommand(client, { bot: v.bot, refresh: v.refresh, revision: v.revision })); }
+    finally { client.close(); }
+    return;
+  }
   if (command === "engines") {
-    if (argument) throw new Error("请使用 engines status|set|reset --help。");
+    if (argument || v.bot !== undefined || v.refresh !== undefined) throw new Error("请使用 engines status|set|reset --help。");
     const client = await LocalHostClient.connect(directory);
     try { await output(await engineSettingsCommand(client, sub ?? "", { engine: v.engine, path: v.path, revision: v.revision, requestId: v["request-id"] }, id => console.error(`引擎路径操作编号：${id}。结果未确认时用 engines status --request-id 核对。`))); }
     finally { client.close(); }

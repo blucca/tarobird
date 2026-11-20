@@ -1,4 +1,7 @@
 import { isLogicalSessionId } from "../runtime/logical-session.js";
+import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
+import { applyClaudeQuotaEvent } from "./account-quota.js";
+import type { QuotaSnapshot } from "../client-protocol/engine-quota.js";
 import { claudeAssistantError, claudeError, claudeResultRepeatsError } from "./claude-errors.js";
 import { wholeFilePatch } from "../core/recorded-diff.js";
 import { ClaudeScopedEvents, type ClaudeScope } from "./claude-scoped-events.js";
@@ -1150,6 +1153,10 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   /** History helper calls in flight. They belong to no worker, so nothing else would wait for or end them. */
   private readonly historyRuns = new Set<Promise<unknown>>();
   private readonly historyAbort = new AbortController();
+  private readonly quotaCache: AdapterQuotaCache;
+  private readonly quotaWorkers = new WeakMap<ClaudeWorker, { id: number; credentialRevision: string; snapshot?: QuotaSnapshot }>();
+  private quotaWorkerSequence = 0;
+  private quotaSource?: ClaudeWorker;
   private readonly sessionUsage: ClaudeSessionUsage;
   private destroyPromise: Promise<void> | undefined;
   private readonly appMcpUnavailable = new WeakSet<ClaudeWorker>();
@@ -1207,6 +1214,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     this.turnRecovery = new ClaudeTurnRecovery(options?.recoveryStatePath);
     this.sessionUsage = new ClaudeSessionUsage(options?.usageStatePath);
     this.workspacePath = options?.workspacePath;
+    this.quotaCache = new AdapterQuotaCache("claude", claudeExecutable, this.childEnv, this.workspacePath, this.configPath);
     this.idleWorkerTtlMs = options?.idleWorkerTtlMs ?? DEFAULT_IDLE_WORKER_TTL_MS;
     this.turnInactivityTimeoutMs = options?.turnInactivityTimeoutMs === undefined
       ? CLAUDE_STREAM_INACTIVITY_TIMEOUT_MS
@@ -1232,6 +1240,38 @@ export class ClaudeStreamAdapter implements CodexAdapter {
 
   async createSession(chatId: number): Promise<CodexSessionHandle> {
     return { sessionId: `tarobot-${chatId}` };
+  }
+
+  private quotaScope() {
+    const source = this.quotaSource;
+    const active = source && !source.retired && [...this.workers.values()].includes(source);
+    return this.quotaCache.capture(this.destroyPromise ? "destroyed" : active ? String(this.quotaWorkers.get(source)?.id ?? "none") : "none");
+  }
+
+  async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
+    const scope = this.quotaScope();
+    return this.quotaCache.response(scope, options) ?? this.quotaCache.failure(scope, "no_passive_event");
+  }
+
+  private observeAccountQuota(worker: ClaudeWorker, message: unknown): void {
+    if (!message || typeof message !== "object") return;
+    const value = message as Record<string, unknown>;
+    if (value.type !== "rate_limit_event" && !(value.type === "assistant" && value.usage_report != null)) return;
+    const entry = this.quotaWorkers.get(worker);
+    if (!entry || worker.retired || this.destroyPromise || ![...this.workers.values()].includes(worker)) return;
+    const scope = this.quotaCache.capture(String(entry.id));
+    if (!scope.verifiable || scope.authMode !== "subscription" || scope.credentialRevision !== entry.credentialRevision) {
+      entry.snapshot = undefined;
+      if (this.quotaSource === worker) this.quotaCache.invalidate();
+      return;
+    }
+    try {
+      const snapshot = applyClaudeQuotaEvent(entry.snapshot, value);
+      if (!snapshot) return;
+      entry.snapshot = snapshot;
+      this.quotaSource = worker;
+      this.quotaCache.store(scope, { snapshot });
+    } catch { /* Invalid native quota data must never interrupt the user's conversation. */ }
   }
 
   private async loadInstructions(): Promise<string | null> {
@@ -1770,6 +1810,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     }
 
     const invocation = buildCommandInvocation(this.claudeExecutable, args);
+    const quotaCredentialAtSpawn = this.quotaCache.capture("spawn").credentialRevision;
     let child: ClaudeChildProcess;
     try {
       child = this.spawnClaude(invocation.command, invocation.args, {
@@ -1871,6 +1912,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       this.removeWorker(worker);
     });
 
+    this.quotaWorkers.set(worker, { id: ++this.quotaWorkerSequence, credentialRevision: quotaCredentialAtSpawn });
     this.workers.set(sessionId, worker);
     if (appTools) {
       worker.appMcp = new ClaudeAppMcp(appTools.definitions, (value) => this.writeJson(worker, value), () => this.markWorkerActivity(worker));
@@ -1924,6 +1966,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     } catch {
       return;
     }
+    this.observeAccountQuota(worker, parsed);
     // Side-question responses belong to the side channel only; they never
     // reach the foreground turn, task reviews or session bookkeeping.
     if (worker.side?.handle(parsed as Record<string, unknown>)) return;

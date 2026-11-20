@@ -1,4 +1,6 @@
 import { isLogicalSessionId } from "../runtime/logical-session.js";
+import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
+import { cancelOwnedQuotaReads, readOwnedCodexQuota } from "./codex-quota-process.js";
 import { spawnEngine } from "../runtime/engine-process.js";
 import { spawn } from "node:child_process";
 import { readdir, readFile, realpath } from "node:fs/promises";
@@ -332,6 +334,7 @@ function combineInstructions(primary: string | null, secondary: string | null): 
 }
 
 export class ProcessCodexAdapter implements CodexAdapter {
+  private readonly quotaCache: AdapterQuotaCache;
   readonly bridgeInstructionMode = "output-directory" as const;
   readonly supportsTurnScopedEnv = true;
   private readonly childEnv: NodeJS.ProcessEnv;
@@ -392,6 +395,16 @@ export class ProcessCodexAdapter implements CodexAdapter {
     this.nativeSearchMcp = options.nativeSearchMcp;
     this.turnTimeoutMs = turnTimeoutMs;
     this.inactivityTimeoutMs = inactivityTimeoutMs;
+    this.quotaCache = new AdapterQuotaCache("codex", codexExecutable, this.childEnv, workspacePath, configPath);
+  }
+
+  async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
+    const captureScope = () => this.quotaCache.capture("process");
+    const scope = captureScope();
+    const cached = this.quotaCache.response(scope, options);
+    if (cached) return cached;
+    return readOwnedCodexQuota({ executable: this.codexExecutable, cwd: this.workspacePath ?? process.cwd(), env: this.childEnv,
+      spawn: this.spawnCodex as unknown as AppServerSpawnCodex, cache: this.quotaCache, scope, options, captureScope });
   }
 
   async createSession(chatId: number): Promise<CodexSessionHandle> {
@@ -701,14 +714,16 @@ export class ProcessCodexAdapter implements CodexAdapter {
     return result.value;
   }
 
-  /** Stop only the currently owned history helpers. Ordinary process turns and
+  /** Stop the currently owned history/quota helpers. Ordinary process turns and
    * future operations keep their existing restartable lifecycle. */
   async destroy(): Promise<void> {
     this.historyEpoch++;
     const active = [...this.historyOperations];
     for (const control of active) control.stop();
-    const results = await Promise.allSettled(active.map(control => control.finished));
-    if (results.some(result => result.status === "rejected")) throw new Error("Codex history helper did not exit");
+    this.quotaCache.invalidate();
+    const results = await Promise.allSettled([cancelOwnedQuotaReads(this.quotaCache), ...active.map(control => control.finished)]);
+    if (results[0]?.status === "rejected") throw results[0].reason;
+    if (results.slice(1).some(result => result.status === "rejected")) throw new Error("Codex history helper did not exit");
   }
 
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {

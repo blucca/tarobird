@@ -5,6 +5,8 @@ import type { Locale } from "../runtime/locale.js";
 import type { EngineTaskSnapshot, EngineTaskControlResult } from "../client-protocol/engine-tasks.js";
 import type { EngineOverride } from "../state/instance-config.js";
 import type { ClaudeNativeGoalReceipt, ClaudeNativeGoalUpdate } from "./claude-native-goal.js";
+import type { EngineQuotaReadOptions, EngineQuotaReadResult } from "./adapter-account-quota.js";
+export type { EngineQuotaReadOptions, EngineQuotaReadResult } from "./adapter-account-quota.js";
 export type { EngineTask, EngineTaskSnapshot, EngineTaskControlResult } from "../client-protocol/engine-tasks.js";
 
 /** A terminal frame arrived without a complete answer. Never blindly replay tools. */
@@ -501,6 +503,8 @@ export interface CodexUserMessageInput {
 }
 
 export interface CodexAdapter {
+  /** Account quota only: never starts a model turn. Private proof must not enter public replies. */
+  getAccountQuota?(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult>;
   /** Existing native total turn cap, carried across automatic continuations.
    * Undefined/null means this adapter has no total cap (inactivity is separate). */
   readonly turnRuntimeLimitMs?: number | null;
