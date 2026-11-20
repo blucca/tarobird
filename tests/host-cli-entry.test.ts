@@ -95,8 +95,8 @@ it("refuses implicit migration during offline maintenance and profile repair bef
   await store.db.exec("ALTER TABLE bots DROP COLUMN deleted_at");
   await store.db.run("UPDATE meta SET value='13' WHERE key='schema_version'"); await store.db.close();
   const before = await readFile(path.join(directory, "hub.sqlite")), identity = await readFile(path.join(directory, "identity.json")), files = (await readdir(directory)).sort();
-  await expect(runHubCli(["devices", "list", "--state-dir", directory])).rejects.toThrow("host_schema_migration_requires_update:13:25");
-  await expect(initializeHost(directory, "Changed")).rejects.toThrow("host_schema_migration_requires_update:13:25");
+  await expect(runHubCli(["devices", "list", "--state-dir", directory])).rejects.toThrow("host_schema_migration_requires_update:13:26");
+  await expect(initializeHost(directory, "Changed")).rejects.toThrow("host_schema_migration_requires_update:13:26");
   expect(await readFile(path.join(directory, "hub.sqlite"))).toEqual(before);
   expect(await readFile(path.join(directory, "identity.json"))).toEqual(identity);
   expect((await readdir(directory)).filter(file => !["hub.sqlite-shm", "hub.sqlite-wal"].includes(file)).sort()).toEqual(files.filter(file => !["hub.sqlite-shm", "hub.sqlite-wal"].includes(file)));
@@ -107,29 +107,29 @@ it("uses target runtime compatibility and preserves a frozen older selection whe
   await initializeHost(directory, "Original"); await mkdir(pkg);
   const entrypoint = path.join(pkg, "index.js"); await writeFile(entrypoint, "// fixture runtime");
   await writeFile(path.join(pkg, "package.json"), JSON.stringify({ tarobotHostUpdate: { format: 1, minHubSchema: 1, maxHubSchema: 13 } }));
-  await expect(assertHostRuntimeCompatible(directory, entrypoint, { allowMigration: true })).rejects.toThrow("host_schema_incompatible:25:runtime_1-13");
+  await expect(assertHostRuntimeCompatible(directory, entrypoint, { allowMigration: true })).rejects.toThrow("host_schema_incompatible:26:runtime_1-13");
   await mkdir(`${directory}.runtime`);
   const current = { entrypoint, executable: process.execPath, minHubSchema: 1, maxHubSchema: 13 };
   const selection = JSON.stringify({ format: 1, transactionId: randomUUID(), current, previous: current });
   await writeFile(`${directory}.runtime/current.json`, selection);
   const before = await readFile(path.join(directory, "hub.sqlite"));
-  await expect(runHubCli(["devices", "list", "--state-dir", directory])).rejects.toThrow("host_schema_incompatible:25:runtime_1-13");
+  await expect(runHubCli(["devices", "list", "--state-dir", directory])).rejects.toThrow("host_schema_incompatible:26:runtime_1-13");
   expect(await readFile(path.join(directory, "hub.sqlite"))).toEqual(before);
   expect(await readFile(`${directory}.runtime/current.json`, "utf8")).toBe(selection);
-  const modernPackage = { tarobotHostUpdate: { format: 1, minHubSchema: 1, maxHubSchema: 25 }, tarobotHubSchema: 25 };
+  const modernPackage = { tarobotHostUpdate: { format: 1, minHubSchema: 1, maxHubSchema: 26 }, tarobotHubSchema: 26 };
   await writeFile(path.join(pkg, "package.json"), JSON.stringify(modernPackage));
-  expect(await assertHostRuntimeCompatible(directory, entrypoint)).toMatchObject({ schema: 25, maxHubSchema: 25, writeHubSchema: 25 });
+  expect(await assertHostRuntimeCompatible(directory, entrypoint)).toMatchObject({ schema: 26, maxHubSchema: 26, writeHubSchema: 26 });
   // Source tests and built packages use different depths; discovery must not
   // require the source tree's synthetic index.js path to exist.
-  expect(await assertHostRuntimeCompatible(directory, path.join(pkg, "dist", "src", "index.js"))).toMatchObject({ schema: 25, writeHubSchema: 25 });
+  expect(await assertHostRuntimeCompatible(directory, path.join(pkg, "dist", "src", "index.js"))).toMatchObject({ schema: 26, writeHubSchema: 26 });
 });
 
 it("rejects an incompatible Hub run before startup can migrate state or change supervisor intent", async () => {
   const directory = path.join(await root(), "host"); await initializeHost(directory, "Original");
   const store = await HubStore.open(directory);
-  await store.db.run("UPDATE meta SET value='26' WHERE key='schema_version'"); await store.db.close();
+  await store.db.run("UPDATE meta SET value='27' WHERE key='schema_version'"); await store.db.close();
   const before = await readFile(path.join(directory, "hub.sqlite")), enabled = await readFile(path.join(directory, "desktop-enabled.json"));
-  await expect(runHubCli(["run", "--state-dir", directory])).rejects.toThrow("host_schema_incompatible:26:runtime_1-25");
+  await expect(runHubCli(["run", "--state-dir", directory])).rejects.toThrow("host_schema_incompatible:27:runtime_1-26");
   expect(await readFile(path.join(directory, "hub.sqlite"))).toEqual(before);
   expect(await readFile(path.join(directory, "desktop-enabled.json"))).toEqual(enabled);
 });
@@ -171,7 +171,7 @@ it("repairs a legacy configuration without migrating an unnamed old database", a
 });
 it("never repairs configuration for an unsupported future database", async () => {
   const directory = path.join(await root(), "host"); await initializeHost(directory, "Future");
-  const store = await HubStore.open(directory); await store.db.run("UPDATE meta SET value='26' WHERE key='schema_version'"); await store.db.close(); await rm(path.join(directory, "config.json"));
+  const store = await HubStore.open(directory); await store.db.run("UPDATE meta SET value='27' WHERE key='schema_version'"); await store.db.close(); await rm(path.join(directory, "config.json"));
   await expect(initializeHost(directory, "Future")).rejects.toThrow("host_schema_incompatible");
   await expect(stat(path.join(directory, "config.json"))).rejects.toMatchObject({ code: "ENOENT" });
 });

@@ -1,8 +1,16 @@
+import { SessionHistoryPendingError } from "./session-history-error.js";
 import { SessionStateSchema } from "./session-state-schema.js";
 import { withFileMutex } from "./file-mutex.js";
 import { JsonStore } from "./json-store.js";
 import type { SessionRecord, SessionState } from "../types.js";
 import { getConversationKey } from "../runtime/conversation-key.js";
+import { createHash, randomUUID } from "node:crypto";
+
+export interface SessionHistoryBinding { record: SessionRecord; shared: boolean }
+export interface SessionHistoryFinalization { operationId: string; rewind?: boolean; destination?: SessionRecord }
+function requireNoHistoryFence(records: SessionRecord[]): void {
+  if (records.some(record => record.historyFence)) throw new SessionHistoryPendingError();
+}
 
 export const SESSION_STATE_UNREADABLE_WARNING = "session state unreadable";
 
@@ -68,9 +76,20 @@ export class SessionStore {
   async upsert(record: SessionRecord): Promise<void> {
     await this.enqueueWrite(async () => {
       const state = await this.loadUnlocked();
-      const normalized = normalizeRecord(record);
+      const normalized = normalizeRecord({ ...record });
       const key = recordConversationKey(normalized);
       const index = state.chats.findIndex((entry) => recordConversationKey(entry) === key);
+      const old = state.chats[index];
+      requireNoHistoryFence(state.chats.filter(entry => entry === old || entry.codexSessionId === normalized.codexSessionId));
+      // Old callers pass whole records or rebuild them. Neither may clear a
+      // history fence or restore a stale revision. Only the dedicated transaction
+      // below can finish a pending native mutation.
+      delete normalized.historyFence;
+      delete normalized.historyLastOperation;
+      if (old?.historyGeneration || normalized.historyGeneration) {
+        normalized.historyGeneration = old?.codexSessionId === normalized.codexSessionId ? old.historyGeneration ?? randomUUID() : randomUUID();
+        normalized.historyRevision = randomUUID();
+      }
 
       if (index === -1) {
         state.chats.push(normalized);
@@ -128,6 +147,7 @@ export class SessionStore {
 
   private async removeMatchingUnlocked(predicate: (record: SessionRecord) => boolean): Promise<boolean> {
     const state = await this.loadUnlocked();
+    requireNoHistoryFence(state.chats.filter(predicate));
     let removed = false;
     const nextChats = state.chats.filter((record) => {
       if (predicate(record)) {
@@ -149,6 +169,7 @@ export class SessionStore {
   async clearAll(): Promise<number> {
     return this.enqueueWrite(async () => {
       const state = await this.loadUnlocked();
+      requireNoHistoryFence(state.chats);
       const removedCount = state.chats.length;
       if (removedCount === 0) {
         return 0;
@@ -168,6 +189,7 @@ export class SessionStore {
   async clearAllThen<T>(operation: () => Promise<T>): Promise<{ removedCount: number; result: T }> {
     return this.enqueueWrite(async () => {
       const original = await this.loadUnlocked();
+      requireNoHistoryFence(original.chats);
       const removedCount = original.chats.length;
       if (removedCount > 0) {
         await this.store.write(createDefaultSessionState());
@@ -222,7 +244,86 @@ export class SessionStore {
 
   async reset(): Promise<void> {
     await this.enqueueWrite(async () => {
+      try {
+        requireNoHistoryFence((await this.loadUnlocked()).chats);
+      } catch (error) {
+        if (!isRepairableSessionStateError(error)) throw error;
+        // Explicit reset has always been a repair entry point. Preserve the
+        // damaged file, but never erase a readable pending history operation.
+        await this.store.quarantineCurrentFile("corrupt");
+      }
       await this.store.write(createDefaultSessionState());
+    });
+  }
+
+  async inspectHistory(conversationKey: string): Promise<SessionHistoryBinding | null> {
+    return this.enqueueWrite(async () => {
+      const state = await this.loadUnlocked();
+      const record = state.chats.find(entry => recordConversationKey(entry) === conversationKey);
+      if (!record) return null;
+      if (!record.historyGeneration || !record.historyRevision) {
+        record.historyGeneration ??= randomUUID(); record.historyRevision ??= randomUUID();
+        await this.store.write(state);
+      }
+      return { record, shared: state.chats.some(other => other !== record && other.codexSessionId === record.codexSessionId) };
+    });
+  }
+
+  async reserveHistory(conversationKey: string, expectedRevision: string, operationId: string): Promise<SessionHistoryBinding> {
+    return this.enqueueWrite(async () => {
+      const state = await this.loadUnlocked();
+      const record = state.chats.find(entry => recordConversationKey(entry) === conversationKey);
+      if (!record || record.historyRevision !== expectedRevision) throw new Error("history_source_changed");
+      requireNoHistoryFence([record]);
+      if (state.chats.some(other => other !== record && other.codexSessionId === record.codexSessionId)) throw new Error("history_shared_session");
+      record.historyFence = { operationId, sourceRevision: expectedRevision };
+      await this.store.write(state);
+      return { record, shared: false };
+    });
+  }
+
+  /** Only a definitely unadmitted/refused native operation may release its
+   * reservation. An RPC timeout or missing result is never such evidence. */
+  async releaseHistory(conversationKey: string, operationId: string): Promise<void> {
+    await this.enqueueWrite(async () => {
+      const state = await this.loadUnlocked();
+      const record = state.chats.find(entry => recordConversationKey(entry) === conversationKey);
+      const signature = createHash("sha256").update("rejected").digest("hex");
+      if (record?.historyLastOperation?.operationId === operationId && record.historyLastOperation.signature === signature) return;
+      if (!record || record.historyFence?.operationId !== operationId) throw new Error("history_source_changed");
+      delete record.historyFence;
+      record.historyLastOperation = { operationId, signature, revision: record.historyRevision! };
+      await this.store.write(state);
+    });
+  }
+
+  /** Native receipt must already be durable. Commits local binding only; it
+   * never invokes a native operation. A repeated identical finalization is safe. */
+  async finalizeHistory(conversationKey: string, input: SessionHistoryFinalization): Promise<{ revision: string }> {
+    return this.enqueueWrite(async () => {
+      const state = await this.loadUnlocked();
+      const record = state.chats.find(entry => recordConversationKey(entry) === conversationKey);
+      if (!record) throw new Error("history_source_changed");
+      const signature = createHash("sha256").update(JSON.stringify([input.operationId, input.rewind === true,
+        input.destination ? [recordConversationKey(input.destination), input.destination.codexSessionId, input.destination.resume ?? null] : null])).digest("hex");
+      if (record.historyLastOperation?.operationId === input.operationId) {
+        if (record.historyLastOperation.signature !== signature) throw new Error("history_request_conflict");
+        return { revision: record.historyLastOperation.revision };
+      }
+      if (record.historyFence?.operationId !== input.operationId || record.historyFence.sourceRevision !== record.historyRevision) throw new Error("history_source_changed");
+      if (input.destination) {
+        const destinationKey = recordConversationKey(input.destination);
+        if (input.rewind || state.chats.some(entry => recordConversationKey(entry) === destinationKey || entry.codexSessionId === input.destination!.codexSessionId)) throw new Error("history_destination_exists");
+        const destination = normalizeRecord({ ...input.destination, historyGeneration: randomUUID(), historyRevision: randomUUID() });
+        delete destination.historyFence; delete destination.historyLastOperation; delete destination.suspendedPrevious;
+        state.chats.push(destination);
+      }
+      if (input.rewind) record.historyRevision = randomUUID();
+      const revision = record.historyRevision!;
+      delete record.historyFence;
+      record.historyLastOperation = { operationId: input.operationId, signature, revision };
+      await this.store.write(state);
+      return { revision };
     });
   }
 

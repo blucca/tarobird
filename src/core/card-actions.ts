@@ -21,6 +21,7 @@ import type {
 } from "../codex/adapter.js";
 import { checkBudgetAvailability, recordBridgeTurnUsage } from "../runtime/bridge-turn.js";
 import { resolveConversationResume } from "../runtime/conversation-resume.js";
+import { bridgeConversationLockId, sessionLockNamespace, withBridgeTurnLock } from "../runtime/turn-lock.js";
 import { prepareArchiveContinueWorkflow } from "../runtime/file-workflow.js";
 import { scanRecentAntigravityConversations, scanRecentClaudeSessions } from "../runtime/session-scanner.js";
 import {
@@ -3308,6 +3309,30 @@ function renderCoreResumeEngineChanged(locale: Locale): string {
 
 
 async function applyCoreResumeCardAction(
+  stateDir: string,
+  value: Record<string, unknown>,
+  locale: Locale,
+): Promise<string> {
+  const conversationKey = String(value.conversationKey);
+  const namespace = await sessionLockNamespace(path.join(stateDir, "session.json"));
+  // Cards bypass the ordinary message queue. Use the Bridge's lock, but refuse
+  // contention instead of switching later after the card request has timed out.
+  // This signal cancels only this lock wait, never the running engine turn.
+  const controller = new AbortController(), busy = new Error("resume_card_conversation_busy");
+  try {
+    return await withBridgeTurnLock(bridgeConversationLockId({ chatId: stableCoreNumericId(conversationKey), conversationKey }, namespace),
+      async () => await applyCoreResumeCardActionUnlocked(stateDir, value, locale), {
+        signal: controller.signal, waitNotifyAfterMs: 0, onWait: () => controller.abort(busy),
+      });
+  } catch (error) {
+    if (error !== busy) throw error;
+    return locale === "en"
+      ? "Another operation is in progress in this conversation. Try resuming again when it finishes."
+      : "当前对话有其他操作正在进行，请结束后再恢复会话。";
+  }
+}
+
+async function applyCoreResumeCardActionUnlocked(
   stateDir: string,
   value: Record<string, unknown>,
   locale: Locale,

@@ -1,3 +1,5 @@
+import { CONVERSATION_HISTORY_CAPABILITY, historySnapshotSchema, historyAnchorPageSchema, historyChangeSchema, historyOperationSchema, type HistoryChange, type HistoryOperation } from "../../src/client-protocol/conversation-history.js";
+import { historyPendingSchema, historyRecordKey } from "./conversation-history-state.js";
 import { WORKBENCH_DESIGN_SHARE_CAPABILITY, designShareRequestFrameSchema, designShareResultFrameSchema, designShareEventFrameSchema, designShareDispatchFrameSchema, designShareCancelFrameSchema, type DesignShareRequest, type DesignShareServerFrame } from "../../src/client-protocol/workbench-design-sharing.js";
 import { DesignShareClient, type DesignShareTransport } from "./workbench-design-collaboration.js";
 import type { WorkbenchDraft } from "./workbench-draft.js";
@@ -69,7 +71,7 @@ const readySchema = z.object({ serverCapabilities: z.array(z.string()).default([
 const frameConversation = (frame: ClientFrame): string | undefined => "conversationId" in frame ? frame.conversationId : "groupId" in frame ? frame.groupId : undefined;
 export type RouteSyncSource = "host" | "network";
 export type RouteSyncResult = { limited: boolean };
-export type ConnectionState = ProfileCache & { dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
+export type ConnectionState = ProfileCache & { dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; historyAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
 export type OutboxSettlement = { entry: OutboxEntry; revision: number; messageAccepted: boolean };
 export class HubConnection {
   state: ConnectionState = { cacheRevision: 0, status: "offline", bots: [], outbox: 0, avatars: [] };
@@ -530,7 +532,7 @@ export class HubConnection {
           const ready = readySchema.parse(frame);
           this.independentSync = ready.serverCapabilities.includes(CONVERSATION_SYNC_CAPABILITY);
           lineageCapable = ready.serverCapabilities.includes(SYNC_LINEAGE_CAPABILITY);
-          this.update({ workbenchDesignShareAvailable:ready.serverCapabilities.includes(WORKBENCH_DESIGN_SHARE_CAPABILITY), workbenchDesignCommentsAvailable: ready.serverCapabilities.includes(WORKBENCH_DESIGN_COMMENTS_CAPABILITY), workbenchDesignHistoryAvailable: ready.serverCapabilities.includes(WORKBENCH_DESIGN_HISTORY_CAPABILITY), workbenchSlidesAvailable: ready.serverCapabilities.includes(WORKBENCH_SLIDES_CAPABILITY), screenQualityAvailable: ready.serverCapabilities.includes(REMOTE_SCREEN_QUALITY_CAPABILITY), workbenchDesignOpenAvailable: ready.serverCapabilities.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY), workbenchDesignAvailable: ready.serverCapabilities.includes(WORKBENCH_DESIGN_CAPABILITY), workbenchAvailable: ready.serverCapabilities.includes(WORKBENCH_CAPABILITY), workbenchMarkdownAvailable: ready.serverCapabilities.includes(WORKBENCH_MARKDOWN_CAPABILITY), sideAvailable: ready.serverCapabilities.includes("conversations.side.v1"), engineTasksAvailable: ready.serverCapabilities.includes("conversations.tasks.v1"), piSessionAvailable: ready.serverCapabilities.includes("pi.session.v1") });
+          this.update({ workbenchDesignShareAvailable:ready.serverCapabilities.includes(WORKBENCH_DESIGN_SHARE_CAPABILITY), workbenchDesignCommentsAvailable: ready.serverCapabilities.includes(WORKBENCH_DESIGN_COMMENTS_CAPABILITY), workbenchDesignHistoryAvailable: ready.serverCapabilities.includes(WORKBENCH_DESIGN_HISTORY_CAPABILITY), workbenchSlidesAvailable: ready.serverCapabilities.includes(WORKBENCH_SLIDES_CAPABILITY), screenQualityAvailable: ready.serverCapabilities.includes(REMOTE_SCREEN_QUALITY_CAPABILITY), workbenchDesignOpenAvailable: ready.serverCapabilities.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY), workbenchDesignAvailable: ready.serverCapabilities.includes(WORKBENCH_DESIGN_CAPABILITY), workbenchAvailable: ready.serverCapabilities.includes(WORKBENCH_CAPABILITY), workbenchMarkdownAvailable: ready.serverCapabilities.includes(WORKBENCH_MARKDOWN_CAPABILITY), historyAvailable: ready.serverCapabilities.includes(CONVERSATION_HISTORY_CAPABILITY), sideAvailable: ready.serverCapabilities.includes("conversations.side.v1"), engineTasksAvailable: ready.serverCapabilities.includes("conversations.tasks.v1"), piSessionAvailable: ready.serverCapabilities.includes("pi.session.v1") });
           this.pendingSync = new Set(ready.conversations.map(c => c.id));
           this.update({ syncProgress: { completed: 0, total: ready.conversations.length, indeterminate: !this.independentSync } }); handshakeState = "ready";
           // Identity metadata is also needed while draining received read events
@@ -885,6 +887,57 @@ export class HubConnection {
     if (!this.state.deletedBots?.some(b => b.id === bot.id) && !this.state.bots.some((b) => b.id === bot.id)) this.update({ bots: [...this.state.bots, bot] });
     return this.state.bots.find((b) => b.id === bot.id) ?? bot;
   }
+  async historySnapshot(conversationId: string, botId: string, signal?: AbortSignal) {
+    if (!this.state.historyAvailable) throw new Error("history_unavailable");
+    return historySnapshotSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history?botId=${encodeURIComponent(botId)}`, { signal: signal ?? timeoutSignal(15_000) }));
+  }
+  async historyAnchors(conversationId: string, botId: string, messageId: string, signal?: AbortSignal) {
+    if (!this.state.historyAvailable) throw new Error("history_unavailable");
+    return historyAnchorPageSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/anchors?${new URLSearchParams({ botId, messageId })}`, { signal: signal ?? timeoutSignal(15_000) }));
+  }
+  async changeHistory(conversationId: string, change: HistoryChange) {
+    if (!this.state.historyAvailable || this.isReadOnly || this.state.status !== "online") throw new Error("history_unavailable");
+    const body = historyChangeSchema.parse(change);
+    return historyOperationSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/operations`, { method: "POST", body: JSON.stringify(body), signal: timeoutSignal(20_000) }));
+  }
+  /** Receipt lookup only: recovery must never repeat a native history operation. */
+  async historyOperation(conversationId: string, botId: string, requestId: string) {
+    if (!this.state.historyAvailable) throw new Error("history_unavailable");
+    return historyOperationSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/operations/${encodeURIComponent(requestId)}?botId=${encodeURIComponent(botId)}`, { signal: timeoutSignal(15_000) }));
+  }
+  /** Explicit recovery may tombstone a never-admitted request. The Host only
+   * reconciles this exact receipt and never reapplies a native history action. */
+  async reconcileHistory(conversationId: string, change: HistoryChange) {
+    if (!this.state.historyAvailable || this.isReadOnly || this.state.status !== "online") throw new Error("history_unavailable");
+    const body = historyChangeSchema.parse(change);
+    return historyOperationSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/operations/${encodeURIComponent(body.requestId)}/reconcile`, { method: "POST", body: JSON.stringify(body), signal: timeoutSignal(20_000) }));
+  }
+  async acceptHistoryOperation(conversationId: string, result: HistoryOperation): Promise<Conversation | undefined> {
+    if (result.state !== "applied") return;
+    const scope = historyRecordKey(this, conversationId);
+    const assertScope = () => { if (historyRecordKey(this, conversationId) !== scope) throw new Error("history_owner_changed"); };
+    if (result.sourceEventSeq !== undefined) await this.confirmHistoryClear(conversationId, result.sourceEventSeq);
+    assertScope();
+    if (!result.destinationConversationId) { this.refreshConversation(conversationId); return; }
+    // Read the durable directory, not a locally invented fork. Events/snapshots
+    // remain the source of message context exclusions.
+    const values = z.array(conversationSchema).parse(await this.http("/api/conversations", { signal: timeoutSignal(15_000) }));
+    assertScope();
+    const destination = result.destinationConversationId ? values.find(value => value.id === result.destinationConversationId) : undefined;
+    if (result.destinationConversationId && !destination) throw new Error("history_destination_not_synced");
+    const saved = destination ? await this.cache.seedConversation(destination) : undefined;
+    assertScope();
+    this.refreshConversation(conversationId);
+    return saved;
+  }
+  async assertHistorySettled(conversationId: string): Promise<void> {
+    if (this.cache.isClosed) { this.cacheUnavailable(); throw new Error(connectionErrorMessage("local_cache_unavailable")); }
+    const raw = await this.cache.operationRecord(historyRecordKey(this, conversationId));
+    if (!raw) return;
+    let record;
+    try { record = historyPendingSchema.parse(JSON.parse(raw)); } catch { throw new Error(t("操作记录无法读取，请先核对会话状态。")); }
+    if (!record.result || record.result.state === "pending" || record.result.state === "unknown") throw new Error(t("操作结果尚未确认，请先核对。"));
+  }
   async createConversation(frame: Extract<ClientFrame, { type: "conversation.create" | "topic.create" }>): Promise<Conversation> {
     const conversation = conversationSchema.parse(await this.http("/api/conversations", { method: "POST", body: JSON.stringify(frame), signal: timeoutSignal(20_000) }));
     const current = await this.cache.seedConversation(conversation); this.update({}, true); return current;
@@ -893,6 +946,11 @@ export class HubConnection {
     if (this.pairingRequired) throw new Error(connectionErrorMessage("device_pairing_required"));
     if (this.deviceRevoked) throw new Error(t("此设备已被吊销，请重新配对"));
     if (this.networkBlocked) throw new Error(t("网络授权已失效"));
+    if ("conversationId" in frame && ["message.send", "message.forward", "interaction.submit", "conversation.bind"].includes(frame.type)) {
+      const owner = this.state.user?.id;
+      await this.assertHistorySettled(frame.conversationId);
+      if (this.isReadOnly || this.state.user?.id !== owner) throw new Error(t("连接状态已变化，请核对后重试。"));
+    }
     if (frame.type === "message.send") assertMessageTextSize(frame.text);
     frame = clientFrameSchema.parse(frame);
     if (new TextEncoder().encode(JSON.stringify(frame)).byteLength > MAX_FRAME_BYTES) throw new Error(t("消息过大，请作为文件发送"));

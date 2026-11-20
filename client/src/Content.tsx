@@ -293,12 +293,14 @@ function Element({ element: e, connection, messageId, values, change, act, reply
 }
 function Card({ block, connection, message, backgroundSource, caption }: { caption?: string; backgroundSource?: BackgroundSource; block: Extract<Block, { type: "card" }>; connection: HubConnection; message: Message }) {
   useLocale();
-  const elements = voiceCardElements(block.elements);
+  const disable = (element: CardElement): CardElement => ({ ...element, disabled: true, children: element.children?.map(disable) });
+  const elements = voiceCardElements(message.historyContext ? block.elements.map(disable) : block.elements);
   const transcript = voiceTranscriptElement(elements);
   const [edits, setValues] = useState<Record<string, Json>>({}); const [error, setError] = useState("");
   const values: Record<string, Json> = {};
   const defaults = (elements: CardElement[]) => { for (const e of elements) { const key = e.name ?? e.actionId; const value = e.extra?.default_value ?? e.extra?.initial_options ?? e.extra?.initial_option; if (key && value !== undefined) values[key] = value; defaults(e.children ?? []); } }; defaults(block.elements); Object.assign(values, edits);
   const act = async (element: CardElement, overrides: Record<string, Json> = {}): Promise<boolean> => { try {
+    if (message.historyContext) throw new Error(t("这条记录已排除出上下文，不能再操作原任务。"));
     const submitted = { ...values, ...overrides };
     const validate = (elements: CardElement[]) => { for (const e of elements) { const value = submitted[e.name ?? e.actionId ?? ""];
       if (e.required && (!value || Array.isArray(value) && !value.length)) throw new Error(t("请填写所有必填项"));

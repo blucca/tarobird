@@ -25,6 +25,7 @@ The project license does not replace those component notices.
 | `assets/product/fonts/` | Bricolage Grotesque and Instrument Sans; their included OFL notices |
 | `client/vendor/baoyu-{design,slides}/`, `skills/baoyu-{design,ppt}/` | baoyu-design: mixed licensing. Maintainer original work is MIT; reconstructed Anthropic editor, references and Anthropicons are excluded from that grant. See upstream LICENSE, NOTICE.md and editor/third-party-licenses.txt. Pinned source and file hashes: UPSTREAM.json. Build retains notices in client/dist/licenses/baoyu-*/ for both editors. Skill references retain the same upstream notices; they are not represented as MIT. |
 | `client/public/licenses/` | Runtime notices for bundled libraries, fonts and icons |
+| Bundled Claude history helper | Official `@anthropic-ai/claude-agent-sdk` JavaScript; Anthropic terms, not the project AGPL grant. Exact build dependency is pinned in `package-lock.json`; the unmodified upstream README and LICENSE are shipped in `dist/licenses/claude-agent-sdk/`. No additional Claude CLI binary is bundled. |
 | `skills/scrapling/SKILL.md` | Retains its attribution to the MIT-licensed upstream fetching reference |
 | Gradle wrapper and other dependencies | Their own file headers, package licenses and notices |
 

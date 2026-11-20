@@ -5420,3 +5420,14 @@ See [release verification](releases/1.0.126-verification.md) and [source-bound r
 ### 1.0.127 publication readback
 
 See [release verification](releases/1.0.127-verification.md) and [source-bound receipts](releases/1.0.127-verification.json) for Mac/Android/canonical CLI publication from `f22db812b0f6c76074d791b78a3bf63f276e4250`, TestFlight 1.0.127 (1) internal availability, source/native/browser/real CLI/packaged-model checks, final CI and the separately committed scanner policy. Local Mac 1.0.127 / Host and CLI 0.1.472 now passed installed runtime, real model and CUA native window/version/GUI Host-connection checks; schema migrated from 23 to 24 with identity and baseline IDs preserved. Full functional acceptance remains incomplete: the first real local screen-view session stayed paused without frames; disconnect/reconnect recovered sustained viewing and closing removed the session. Its original trigger is unresolved, and no native input was posted. Newer main UI/extension fixes are not part of this frozen release. Windows runtime remains owner-deferred. Scoped cleanup retired five old release Apps; the unfiltered Spotlight query returned only the installed App. The defective DeepSeek-generated protocol answer was rejected and not imported.
+### Native conversation history
+
+[Native conversation history](client/native-conversation-history.md) maps owner-only
+rewind and permanent fork, exact native input anchors, durable operation receipts,
+Hub/SessionStore admission fences and source attribution. Shared protocol is
+`client-protocol/conversation-history.ts`; Hub/Gateway coordinators share the
+`host-cli/history.ts` entry. Rewind preserves App messages; fork creates a new App
+conversation. Unknown native results stay fenced and receipt reads never replay
+the mutation. Schema 26 requires the corresponding runtime; capability and native
+support are negotiated separately. Focused tests include `hub-conversation-history`,
+`gateway-conversation-history`, `history-gateway-roundtrip` and `host-cli-history`.

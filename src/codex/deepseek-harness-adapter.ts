@@ -4,7 +4,7 @@ import { EngineCancellationUnconfirmedError, EngineStopTooLateError, EngineSteer
 import { EngineRetryableError, type EngineRetryReason } from "./turn-retry.js";
 import { deepseekGoalUsageSchema } from "./deepseek-goal-usage.js";
 import { deepseekAssistantPrefixSchema } from "./deepseek-assistant-stream.js";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type {
@@ -14,11 +14,15 @@ import type {
   CodexThreadGoal,
   CodexThreadGoalResponse,
   CodexUserMessageInput,
-  EngineContextUsage,
   EngineApprovalDecision,
   EngineApprovalRequest,
+  EngineContextUsage,
   EngineStreamEvent,
   ExternalSessionInfo,
+  NativeHistoryAnchor,
+  NativeHistoryRejection,
+  NativeHistoryResult,
+  NativeHistoryState,
 } from "./adapter.js";
 import {
   DeepSeekHarnessRpcError,
@@ -137,6 +141,10 @@ type AssistantPresentation = { attemptId: string; text: string; reasoning: strin
 
 type PendingTurn = {
   claimId: string;
+  /** Sequence number of the `user/message` event that carries this prompt's own request id. */
+  historyInputSeq?: number;
+  /** Sequence number of the last `turn/end` of a turn this prompt owned. */
+  historyTurnEndSeq?: number;
   sessionId: string;
   input: CodexUserMessageInput;
   workspace: string;
@@ -224,6 +232,16 @@ type GoalWatcher = {
   assistantPrefixes: Map<string, AssistantPresentation>;
   toolCalls: Map<string, ToolCall>;
 };
+
+/** How many entries Harness may add to a fork after the copied prefix (one was observed on 0.2.2-rc.5). */
+const DEEPSEEK_FORK_CLOSER_ALLOWANCE = 8;
+
+/** Whether two paths are the same directory on disk; a path that cannot be resolved is compared as written. */
+async function sameDirectory(left: string, right: string): Promise<boolean> {
+  const physical = (value: string) => realpath(path.resolve(value)).catch(() => path.resolve(value));
+  const [a, b] = await Promise.all([physical(left), physical(right)]);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
 
 type HistoryResponse = {
   events?: unknown[];
@@ -412,6 +430,154 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     const receipt = await this.gateway.steerPrompt({ sessionId, sourceRpcId: pending.claimId,
       expectedTurn, requestId: randomUUID(), text: input.text, clientTimeZone: this.clientTimeZone });
     return receipt.outcome === "accepted" ? true : reject(receipt.outcome);
+  }
+
+  // ---- Native history: fork ---------------------------------------------------
+  // Observed on dsh 0.2.2-rc.5: the remote `session/fork { sessionId, atSeq? }`
+  // makes an independent session from an event prefix and calls no model. The
+  // event log is append-only, so there is nothing to rewind and a sequence
+  // number, once given, always names the same event.
+
+  /** The place a finished turn offers: forkable through its last `turn/end`. */
+  private async offerHistoryAnchor(pending: PendingTurn): Promise<void> {
+    const input = pending.historyInputSeq, end = pending.historyTurnEndSeq;
+    if (input === undefined || end === undefined || end <= input) return;
+    const anchor: NativeHistoryAnchor = {
+      sessionId: pending.sessionId, inputId: pending.claimId, rewind: false, fork: true, forkBoundary: "after-turn",
+      data: { inputSeq: input, turnEndSeq: end },
+    };
+    await this.emit(pending, { type: "history_anchor", anchor });
+  }
+
+  /** What this adapter itself has running on the session. Synchronous: asked again right before the fork is sent. */
+  private historyBlock(sessionId: string): "busy" | "goal_active" | "not_ready" | undefined {
+    if (this.destroyed) return "not_ready";
+    if (this.goalWatchers.has(sessionId)) return "goal_active";
+    return this.pendingTurns.has(sessionId) ? "busy" : undefined;
+  }
+
+  /**
+   * What Harness itself says about a session: where it ends, which directory it
+   * belongs to, and whether anything of its own is going on in it. Only what
+   * Harness reported counts: a read that fails, or a snapshot without the parts
+   * this depends on, is an error, never "nothing is going on". Never creates
+   * the session.
+   */
+  private async readHistorySource(sessionId: string, workspace: string, signal?: AbortSignal): Promise<
+    { head: number; blank: boolean; blocked?: "busy" | "goal_active" | "background_work" } | "source_missing" | "other_workspace"
+  > {
+    await this.ensureOperational(signal);
+    const row = (await this.listSessionRows(signal)).find(item => item.sessionId === sessionId);
+    signal?.throwIfAborted();
+    if (!row) return "source_missing";
+    // A session is forked into the directory it lives in. One that belongs elsewhere is not this conversation's to fork.
+    if (!row.cwd || !await sameDirectory(row.cwd, workspace)) return "other_workspace";
+    const response = asRecord(await this.gateway.request("session.history", { sessionId, maxMessages: 1 }, signal)) as HistoryResponse | undefined;
+    const seqs = (response?.events ?? [])
+      .map(entry => numberValue(asRecord(asRecord(entry)?.event)?.seq))
+      .filter((seq): seq is number => seq !== undefined);
+    const asOf = numberValue(response?.projections?.asOfSeq);
+    if (asOf !== undefined) seqs.push(asOf);
+    if (seqs.length === 0) throw new Error("DeepSeek Harness returned no events for the session");
+    const values = response?.projections?.values;
+    const inbox = asRecord(values?.inbox);
+    if (!values || !inbox || !Array.isArray(inbox["next-turn"]) || !Array.isArray(inbox["next-step"])) {
+      throw new Error("DeepSeek Harness did not report the session's queued input");
+    }
+    // No goal is reported as null. A goal entry that is absent, or there but unreadable, is not "no goal".
+    const goal = values.goal === null ? null : parseGoalProjection(values.goal);
+    if (values.goal !== null && !goal) throw new Error("DeepSeek Harness did not report a goal state this adapter can read");
+    const questions = asRecord(values.userQuestions), team = asRecord(values.agentTeam);
+    const jobs = [...(this.jobsBySession.get(sessionId)?.values() ?? [])];
+    // Team tasks are durable: finished and deleted ones stay listed for good, and a pending one is not being worked on.
+    // Only one in progress is work going on; a status this adapter does not know is not assumed to be finished.
+    const teamAtWork = Array.isArray(team?.tasks) && team.tasks.some(task => {
+      const status = stringValue(asRecord(task)?.status);
+      return status !== "pending" && status !== "completed" && status !== "deleted";
+    });
+    const blocked = goal?.goal.phase === "active" ? "goal_active" as const
+      // `running` is Harness's word for "this session's Agent is running", whoever started it.
+      : row.running || inbox["next-turn"].length > 0 || inbox["next-step"].length > 0 || (Array.isArray(questions?.active) && questions.active.length > 0) ? "busy" as const
+        : teamAtWork || jobs.some(job => job.status === "running" || job.status === "stopping") ? "background_work" as const
+          : undefined;
+    return { head: Math.max(...seqs), blank: row.blank, ...(blocked ? { blocked } : {}) };
+  }
+
+  async getHistoryState(sessionId: string, input: { workspaceOverride?: string; signal?: AbortSignal } = {}): Promise<NativeHistoryState> {
+    if (this.destroyed) return { head: null, blocked: "not_ready" };
+    try {
+      const read = await this.readHistorySource(sessionId, input.workspaceOverride ?? this.workspacePath, input.signal);
+      if (read === "source_missing") return { head: null, blocked: "source_missing" };
+      // Not this conversation's session: nothing is offered for it.
+      if (read === "other_workspace") return { head: null, blocked: "not_ready" };
+      const blocked = this.historyBlock(sessionId) ?? read.blocked;
+      return { fork: { whole: !read.blank, anchored: true }, head: String(read.head), ...(blocked ? { blocked } : {}) };
+    } catch {
+      return { head: null, blocked: "not_ready" };
+    }
+  }
+
+  async forkHistory(sessionId: string, input: {
+    anchor?: NativeHistoryAnchor; expectedHead?: string | null; workspaceOverride?: string; signal?: AbortSignal;
+  } = {}): Promise<NativeHistoryResult> {
+    const rejected = (reason: NativeHistoryRejection, detail?: string): NativeHistoryResult => ({ outcome: "rejected", reason, ...(detail ? { detail } : {}) });
+    const text = (error: unknown) => error instanceof Error ? error.message : String(error);
+    const anchor = input.anchor, workspace = input.workspaceOverride ?? this.workspacePath;
+    if (input.signal?.aborted) return rejected("cancelled");
+    const turnEnd = anchor ? numberValue(anchor.data?.turnEndSeq) : undefined;
+    if (anchor && !(anchor.fork && anchor.forkBoundary === "after-turn" && turnEnd !== undefined && Number.isSafeInteger(turnEnd) && turnEnd >= 0)) {
+      return rejected("anchor_unavailable", "The anchor does not allow this operation");
+    }
+    if (anchor && anchor.sessionId !== sessionId) return rejected("anchor_unavailable", "The anchor belongs to another session");
+    const busy = this.historyBlock(sessionId);
+    if (busy) return rejected(busy);
+    let head: number;
+    try {
+      const read = await this.readHistorySource(sessionId, workspace, input.signal);
+      if (read === "source_missing") return rejected("source_missing");
+      if (read === "other_workspace") return rejected("source_changed", "The session belongs to another workspace");
+      if (read.blocked) return rejected(read.blocked);
+      if (!anchor && read.blank) return rejected("not_ready", "There is no history to fork yet");
+      head = read.head;
+    } catch (error) {
+      return rejected(input.signal?.aborted ? "cancelled" : "not_ready", text(error));
+    }
+    if (input.expectedHead !== undefined && input.expectedHead !== String(head)) return rejected("source_changed");
+    // The log only grows: an event that existed still exists, and one beyond the head never did in this session.
+    if (turnEnd !== undefined && turnEnd > head) return rejected("anchor_unavailable", "The anchor is not in this session's history");
+    if (input.signal?.aborted) return rejected("cancelled");
+    const stillBusy = this.historyBlock(sessionId);
+    if (stillBusy) return rejected(stillBusy);
+
+    // A whole fork is tied to the head that was just read. Left open, Harness would take whatever another client
+    // had appended in the meantime, and the fork would hold more than was looked at.
+    const cut = turnEnd ?? head;
+    let forked: string | undefined;
+    try {
+      // Sent once. A refusal is an answer from Harness; anything else that fails leaves the outcome unknown.
+      const response = asRecord(await this.gateway.request("session.fork", { sessionId, atSeq: cut }));
+      forked = stringValue(response?.sessionId);
+    } catch (error) {
+      if (!(error instanceof DeepSeekHarnessRpcError)) return { outcome: "unknown", detail: text(error) };
+      const message = text(error);
+      return rejected(/not found/i.test(message) ? "source_missing"
+        : /does not exist in session/i.test(message) ? "anchor_unavailable"
+          : "not_ready", message);
+    }
+    if (!forked || forked === sessionId) return { outcome: "unknown", detail: "DeepSeek Harness did not return a distinct session for the fork" };
+    // The fork exists. It is read back from Harness; a failure from here on never means "nothing happened".
+    try {
+      const copy = await this.readHistorySource(forked, workspace);
+      if (copy === "source_missing") return { outcome: "unknown", detail: "DeepSeek Harness does not list the forked session", candidateSessionId: forked };
+      if (copy === "other_workspace") return { outcome: "unknown", detail: "The forked session is not in this workspace", candidateSessionId: forked };
+      // Harness appends its own closing entries after the copied prefix. The fork must end just past the cut, not somewhere else.
+      if (copy.head <= cut || copy.head > cut + DEEPSEEK_FORK_CLOSER_ALLOWANCE) {
+        return { outcome: "unknown", detail: `The fork ends at event ${copy.head}, not just after ${cut}`, candidateSessionId: forked };
+      }
+      return { outcome: "applied", sessionId: forked, head: String(copy.head), boundary: anchor ? "after-turn" : "whole" };
+    } catch (error) {
+      return { outcome: "unknown", detail: text(error), candidateSessionId: forked };
+    }
   }
 
   async validateExternalSession(
@@ -896,7 +1062,11 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
         }
         routing.owners.set(turn, owner);
         if (matches) {
-          if (owner === "foreground" && pending) pending.inputSeen = true;
+          if (owner === "foreground" && pending) {
+            pending.inputSeen = true;
+            // This event names the prompt by the request id this adapter gave it: the entry is this input's, by Harness's own record.
+            if (seq !== undefined) pending.historyInputSeq ??= seq;
+          }
           this.handleRoutedTurnStart(sessionId, turn, owner);
         } else {
           // A late stopped request is known foreground work, but does not
@@ -925,6 +1095,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     if (pending) {
       if (seq !== undefined) {
         pending.lastSeq = Math.max(pending.lastSeq, seq);
+        if (type === "turn/end") pending.historyTurnEndSeq = seq;
       }
       this.noteTurnActivity(pending);
     }
@@ -1976,7 +2147,8 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       sessionId: pending.sessionId,
       ...(usage ? { usage } : {}),
     };
-    void this.emit(pending, { type: "result", text, sessionId: pending.sessionId })
+    void this.offerHistoryAnchor(pending)
+      .then(() => this.emit(pending, { type: "result", text, sessionId: pending.sessionId }))
       .then(() => {
         this.cleanupPending(pending);
         pending.resolve(response);
@@ -3014,8 +3186,8 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     return [{ type: "text", text: sections.join("\n\n") }, ...images];
   }
 
-  private async listSessionRows(): Promise<SessionListItem[]> {
-    const response = asRecord(await this.gateway.request("session.list", {}));
+  private async listSessionRows(signal?: AbortSignal): Promise<SessionListItem[]> {
+    const response = asRecord(await this.gateway.request("session.list", {}, signal));
     if (!Array.isArray(response?.items)) {
       return [];
     }

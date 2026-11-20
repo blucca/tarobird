@@ -1,4 +1,7 @@
+import { SessionHistoryPendingError } from "../state/session-history-error.js";
+import { EngineHistoryBusyError } from "../codex/adapter.js";
 import { PiRpcCommandError, PiStartupError } from "../codex/pi-rpc-client.js";
+import { CodexThreadMissingError } from "../codex/app-server-adapter.js";
 import { archiveReadErrorMessage } from "../runtime/zip-archive.js";
 import { classifyFailure, extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError, renderMalformedToolInputError, renderDeepSeekOfficeTimeout } from "../runtime/error-classification.js";
 import { EngineCancellationUnconfirmedError, EngineContextCompactionPendingError, EngineIncompleteResponseError, EngineStopTooLateError } from "../codex/adapter.js";
@@ -57,6 +60,15 @@ export function renderCoreUserFacingError(
   phase: "prepare" | "engine" | "tool",
   locale: Locale = "zh",
 ): string {
+  if (error instanceof SessionHistoryPendingError) return locale === "en"
+    ? "The previous history operation is not yet confirmed. Check its result in the conversation history controls before continuing. Your conversation and files are preserved."
+    : "上一次历史操作的结果尚未确认，请先在会话历史操作中核对结果，再继续。对话和文件已保留。";
+  if (error instanceof EngineHistoryBusyError) return locale === "en"
+    ? "A conversation history operation is still in progress. Wait for its result before sending another message."
+    : "会话历史操作仍在处理中，请等待结果确认后再发送消息。";
+  if (error instanceof CodexThreadMissingError) return locale === "en"
+    ? "The Codex session could not be found on the host, so this goal operation was not performed. App messages remain available. Check Codex history on the host and restore the original session or select another session."
+    : "主机上找不到对应的 Codex 原生会话，本次目标操作未执行。App 消息记录仍可查看，请检查主机上的 Codex 历史，恢复原会话或选择其他会话。";
   const archiveError = archiveReadErrorMessage(error, locale);
   if (archiveError) return archiveError;
   if (error instanceof EngineRecoveryBudgetError) return error.message;
@@ -83,8 +95,11 @@ export function renderCoreUserFacingError(
     ? "The model service is still unavailable and automatic recovery has ended. The conversation and completed work are preserved. Once the service recovers, send ‘continue’ to resume the unfinished task."
     : "模型服务仍未恢复，本轮自动恢复已结束。原会话和已完成的工作已保留；服务恢复后发送“继续”，即可接着处理未完成的任务。";
   if (error instanceof EngineIncompleteResponseError && error.reason === "interrupted") {
-    // Keep the incomplete type non-retryable. Only a bounded explanation of
-    // authentication/quota is exposed; never print the engine's raw diagnostics.
+    if (error.requestRejection === "invalid-argument") return locale === "en"
+      ? "The model service rejected the request as invalid. Check the selected model, settings and attachments. This does not establish that the conversation is damaged. Prior operations may already have taken effect; the conversation is preserved and the request was not automatically replayed. If valid requests continue to fail, start a new conversation."
+      : "模型服务判定本次请求无效，请检查所选模型、设置和附件。这并不能证明对话已损坏。之前的操作可能已执行；原对话已保留，未自动重发请求。若确认输入有效后仍持续失败，可新开对话。";
+    // Keep the incomplete type non-retryable. Only bounded known causes are
+    // exposed; never print the engine's raw diagnostics.
     const category = classifyFailure(new Error(error.message));
     const cause = category === "auth" ? locale === "en" ? "Engine sign-in is missing or expired. Sign in on the host. " : "引擎尚未登录或登录已过期，请先在主机上完成登录。"
       : category === "engine-quota" ? locale === "en" ? "The engine usage quota is exhausted. Wait for its reset or increase the account quota. " : "引擎额度已用尽，请等待额度恢复或增加账户额度。" : "";

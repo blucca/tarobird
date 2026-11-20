@@ -951,9 +951,9 @@
     },
     {
       "path": "tests/host-cli-entry.test.ts",
-      "sha256": "365ec2ed6736401144e68460d4c5f40d3d89defb5857c377175635917585dbd1",
+      "sha256": "f9ab7ca07cf5baf3377dc57365e691766f209e72b7ccf3e848a03225ecd5acaa",
       "reviewer": "codex",
-      "note": "Reviewed synthetic test identities, addresses and negative-case data; no owner deployment or contact information.",
+      "note": "Rechecked unchanged synthetic CLI platform paths against the previous approved fixture; only history command coverage changed.",
       "findings": [
         {
           "kind": "personal-home-path",
@@ -1055,9 +1055,9 @@
     },
     {
       "path": "tests/hub-link-preview.test.ts",
-      "sha256": "72d8cc6eb6d1faf8795c67fd1247f1db6d36ab165c5142fcacb2222536134bb1",
+      "sha256": "ff12aed7ef811eb4667e18de08a44349a347df43db77acb8f727b3941eef136c",
       "reviewer": "codex",
-      "note": "Reviewed synthetic test identities, addresses and negative-case data; no owner deployment or contact information.",
+      "note": "Rechecked unchanged reserved-address SSRF negative fixtures against the previous approval; only schema-version fixture changed.",
       "findings": [
         {
           "kind": "non-example-public-ip",

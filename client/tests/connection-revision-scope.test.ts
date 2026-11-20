@@ -33,7 +33,7 @@ async function connected({ independent = true, complete = true } = {}) {
   const outbox: OutboxEntry[] = []; let order = 0;
   const frameId = (frame: ClientFrame) => "clientMsgId" in frame ? frame.clientMsgId : "clientActionId" in frame ? frame.clientActionId : "";
   const cache = {
-    discardSnapshot: async () => {}, syncResume: async () => ({ cursors: {}, syncLineages: {} }), selectedConversation: async () => "live",
+    operationRecord: async () => "", discardSnapshot: async () => {}, syncResume: async () => ({ cursors: {}, syncLineages: {} }), selectedConversation: async () => "live",
     saveConversations: vi.fn(async () => {}), saveProfiles: async () => {},
     outbox: vi.fn(async () => outbox.map(entry => ({ ...entry }))),
     enqueue: vi.fn(async (frame: ClientFrame) => { outbox.push({ id: frameId(frame), order: ++order, frame } as OutboxEntry); }),

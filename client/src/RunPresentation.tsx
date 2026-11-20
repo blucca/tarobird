@@ -82,7 +82,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
   const taskLabel = scopedTaskLabelSchema.safeParse(block.extra?.scopedTask);
   const scopeUnsupported = scoped && state.runScopesAvailable === false;
   const sync = scopedJournal(block, run);
-  const active = activePhase(run.phase);
+  const active = !message.historyContext && activePhase(run.phase);
   const thinking = runThinkingPreview(block, run);
   const disconnected = active && (state.status !== "online" || !state.bots.find(bot => bot.id === message.authorId)?.online);
   const interrupted = active && message.status === "error";
@@ -110,7 +110,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
   }, [stopWait]);
   // A retry is a new explicit click on this card, for this run's Bot only.
   const stop = async () => {
-    if (scoped || waiting || disconnected) return;
+    if (message.historyContext || scoped || waiting || disconnected) return;
     const previous = stopWait;
     let request: StopWait | undefined;
     const beforeSend = () => { request = { receipt: connection.stopReceipt() }; setStopWait(request); setError(""); };

@@ -1,3 +1,4 @@
+import { runHistoryCommand } from "./history.js";
 import { screenCommand } from "./screens.js";
 import { runWorkbenchCommand } from "./workbench.js";
 import { runConversationsCommand } from './conversations.js';
@@ -97,6 +98,10 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     取消置顶恢复普通分组位置；旧置顶未保存原位置时回到普通分组末尾
   conversations list --host HOST --bot BOT [--source-bot LOCAL_BOT_ID]
   conversations local                 当前本地主机的全部可见对话（含已归档）
+  history snapshot|anchors CONVERSATION --bot BOT [--message MESSAGE] [--cursor CURSOR]
+  history rewind|fork CONVERSATION --bot BOT --revision REV --request-id ID [--anchor ANCHOR] [--title TITLE]
+  history status CONVERSATION --bot BOT --request-id ID
+  history reconcile CONVERSATION --bot BOT --action rewind|fork --revision REV --request-id ID [--anchor ANCHOR] [--title TITLE]
   conversations pi-session CONVERSATION --bot BOT
     [--model FULL_ID|default | --thinking LEVEL|default] --session TOKEN --request-id ID
     不带修改参数时只读取当前 Pi 会话，不启动会话；修改必须指定 session 和 request-id。
@@ -290,7 +295,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
   const { values: v, positionals: p, tokens } = parseArgs({ args: argv, allowPositionals: true, strict: true, tokens: true, options: {
     "state-dir": { type: "string" }, name: { type: "string" }, json: { type: "boolean" }, help: { type: "boolean", short: "h" },
     days: { type: "string" }, mode: { type: "string" }, adapter: { type: "string" }, "threshold-seconds": { type: "string" }, enabled: { type: "string" }, engine: { type: "string" }, model: { type: "string" }, effort: { type: "string" }, workspace: { type: "string" }, permission: { type: "string" },
-    "request-id": { type: "string" }, "expected-name": { type: "string" }, yes: { type: "boolean" }, force: { type: "boolean" }, abandon: { type: "boolean" },
+    action: { type: "string" }, anchor: { type: "string" }, cursor: { type: "string" }, "request-id": { type: "string" }, "expected-name": { type: "string" }, yes: { type: "boolean" }, force: { type: "boolean" }, abandon: { type: "boolean" },
     wait: { type: "string" }, from: { type: "string" }, out: { type: "string" }, routes: { type: "string" },
     lan: { type: "boolean" }, tailscale: { type: "boolean" }, address: { type: "string" }, reset: { type: "boolean" },
     role: { type: "string" }, "dispatch-mode": { type: "string" }, "max-concurrent": { type: "string" }, allow: { type: "string" }, assist: { type: "string" }, status: { type: "string" }, note: { type: "string" }, open: { type: "boolean" }, match: { type: "string" }, offset: { type: "string" },
@@ -313,9 +318,10 @@ export async function runHostCli(argv: string[]): Promise<void> {
   if (command === "network" && !v.help && !["local", "select-lan", "status", "inspect", "recover", "create", "offer", "routes", "propose", "admit", "join", "leave", "remove"].includes(sub ?? "")) throw new Error("未知 network 命令。请执行 tarobot network --help。");
   if (v.help || !command || command === "help") { console.log(HOST_CLI_HELP); return; }
   if (extra.length) throw new Error("多余的位置参数。请执行 tarobot --help。");
-  const commands = ["attachments", "screens", "workbench", "init", "run", "start", "stop", "restart", "status", "logs", "doctor", "enroll", "name", "drain", "drain-cancel", "service", "bots", "queue", "side", "tasks", "steer", "changes", "bus", "groups", "messages", "tickets", "widgets", "engines", "folders", "conversations", "devices", "pair", "network", "update", "backups", "backup", "restore", "directory", "integrations"];
+  const commands = ["history", "attachments", "screens", "workbench", "init", "run", "start", "stop", "restart", "status", "logs", "doctor", "enroll", "name", "drain", "drain-cancel", "service", "bots", "queue", "side", "tasks", "steer", "changes", "bus", "groups", "messages", "tickets", "widgets", "engines", "folders", "conversations", "devices", "pair", "network", "update", "backups", "backup", "restore", "directory", "integrations"];
   if (!commands.includes(command)) throw new Error(`未知命令：${command}。请执行 tarobot --help。`);
   const allowed: Record<string, string[]> = {
+    history: ["bot", "anchor", "message", "cursor", "revision", "request-id", "title", "action"],
     screens: ["from", "yes", "permission", "request-id"],
     workbench: ["from", "request-id", "context-message", "file"],
     engines: ["engine", "path", "revision", "request-id"],
@@ -351,7 +357,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
       } else if (v.session !== undefined || v["request-id"] !== undefined) throw new Error("只读 Pi 会话不接受 --session 或 --request-id；修改时需填写 --model 或 --thinking。");
     } else if ([v.model, v.thinking, v.session].some(value => value !== undefined)) throw new Error("--model、--thinking、--session 仅支持 conversations pi-session。");
   }
-  const positionalLimit: Record<string, number> = { screens: 3, workbench: 3, engines: 2, backups: 2, integrations: 3, directory: 2, name: 2, bots: 3, queue: 3, tasks: 3, steer: 3, side: 3, changes: 3, bus: 3, groups: 3, messages: 3, tickets: 3, widgets: 3, folders: 3, conversations: 2, devices: 3, service: 2, network: 3, update: 3, backup: 2, restore: 2 };
+  const positionalLimit: Record<string, number> = { history: 3, screens: 3, workbench: 3, engines: 2, backups: 2, integrations: 3, directory: 2, name: 2, bots: 3, queue: 3, tasks: 3, steer: 3, side: 3, changes: 3, bus: 3, groups: 3, messages: 3, tickets: 3, widgets: 3, folders: 3, conversations: 2, devices: 3, service: 2, network: 3, update: 3, backup: 2, restore: 2 };
   if (command === "conversations" && sub === "pi-session") positionalLimit.conversations = 3;
   if (command === "bus" && ["list", "create", "prepare"].includes(sub ?? "")) positionalLimit.bus = 2;
   if (command === "bots" && ["list", "catalog", "create"].includes(sub ?? "") || command === "devices" && ["list", "pending", "invites"].includes(sub ?? "") || command === "network" && sub !== "remove" || command === "update" && sub !== "apply") positionalLimit[command] = 2;
@@ -724,6 +730,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
       return;
     }
     if (command === "widgets") { if (v.enabled !== undefined || v.revision !== undefined) throw new Error("widgets publish 不接受设置参数。"); await output(await runWidgetsCommand(management.client, sub, argument, { htmlFile: v["html-file"], reportFile: v["report-file"], title: v.title, summary: v.summary, requestId: v["request-id"] })); return; }
+    if (command === "history") { await output(await runHistoryCommand(management.client, sub, argument, { bot: v.bot, anchor: v.anchor, message: v.message, cursor: v.cursor, revision: v.revision, requestId: v["request-id"], title: v.title, action: v.action })); return; }
     if (command === "conversations") {
       if (sub === "pi-session") { await output(await management.piSession(argument!, v.bot!, piSessionUpdate)); return; }
       if (argument || [v.host, v.bot, v["source-bot"]].some(value => value !== undefined)) throw new Error("批量整理使用当前本地主机；不接受跨 Bot 路由参数。");

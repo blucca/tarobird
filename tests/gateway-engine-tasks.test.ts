@@ -53,6 +53,21 @@ describe("native task scope and stop receipts", () => {
     changed = true; expect(await bridge.canStartQueuedTurn(scope)).toBe(false);
     expect(sessions.getOrCreateSession).not.toHaveBeenCalled();
   });
+  it.each(["queue", "input", "recover", "steer"] as const)("does not retarget %s across the asynchronous history guard", async action => {
+    let sessionId = "source";
+    const sessions = { getOrCreateSession: vi.fn(), bindSession: vi.fn(), getExistingSession: vi.fn(async () => ({ sessionId })),
+      assertHistoryAvailable: vi.fn(async () => { sessionId = "replacement"; }) };
+    const adapter = { createSession: vi.fn(), sendUserMessage: vi.fn(), isSessionInputBlocked: vi.fn(() => false),
+      steerActiveTurn: vi.fn(async () => true), controlNativeInput: vi.fn(async () => ({ outcome: "accepted" as const })), recoverSession: vi.fn(async () => ({ outcome: "accepted" as const })) };
+    const bridge = new Bridge({ load: vi.fn(), issuePairingCode: vi.fn() } as AccessStoreLike, sessions, adapter);
+    const scope = { chatId: 1, conversationKey: "lark:chat" };
+    if (action === "queue") expect(await bridge.canStartQueuedTurn(scope)).toBe(false);
+    else if (action === "input") expect(await bridge.controlNativeInput({ ...scope, inputId: "native-input", action: "send-now" })).toMatchObject({ outcome: "rejected" });
+    else if (action === "recover") expect(await bridge.recoverSession({ ...scope, token: "recovery-fence" })).toMatchObject({ outcome: "rejected" });
+    else expect(await bridge.steerActiveTurn({ ...scope, text: "follow-up" })).toBe(false);
+    expect(adapter.controlNativeInput).not.toHaveBeenCalled(); expect(adapter.recoverSession).not.toHaveBeenCalled();
+    expect(adapter.isSessionInputBlocked).not.toHaveBeenCalled(); expect(adapter.steerActiveTurn).not.toHaveBeenCalled(); expect(sessions.getOrCreateSession).not.toHaveBeenCalled();
+  });
   it("deduplicates stop across devices, concurrent callers and Gateway recreation", async () => {
     const f = fixture();
     expect(await Promise.all([f.run("tasks.stop", input), f.run("tasks.stop", input)])).toEqual([{ outcome: "accepted" }, { outcome: "accepted" }]);

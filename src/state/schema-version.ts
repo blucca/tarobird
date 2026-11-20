@@ -5,7 +5,10 @@
  * Migration is handled per-store. When bumping, add a migration path in the
  * affected store's load() method that detects the old version and upgrades.
  */
-export const CURRENT_SCHEMA_VERSION = 1;
+// v2 adds native-history transaction fences to session.json. A v1 writer
+// strips those fields, so accepting a downgrade could resume uncertain work.
+// The payload change is additive; v1 and unversioned inputs remain readable.
+export const CURRENT_SCHEMA_VERSION = 2;
 
 export interface VersionedState {
   schemaVersion?: number;

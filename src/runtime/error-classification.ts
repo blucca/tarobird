@@ -1,7 +1,8 @@
+import { SessionHistoryPendingError } from "../state/session-history-error.js";
 import { PiRpcCommandError } from "../codex/pi-rpc-client.js";
 import { ENGINE_CONFIG_ERROR_CODE, EngineConfigError } from "../state/engine-config-error.js";
 import { FileWorkflowPreparationError } from "./file-workflow.js";
-import { EngineIncompleteResponseError } from "../codex/adapter.js";
+import { EngineHistoryBusyError, EngineIncompleteResponseError } from "../codex/adapter.js";
 
 export type FailureCategory =
   | "auth"
@@ -147,6 +148,8 @@ function hasEngineCliSignal(text: string): boolean {
 }
 
 export function classifyFailure(error: unknown): FailureCategory {
+  if (error instanceof SessionHistoryPendingError) return "workflow-state";
+  if (error instanceof EngineHistoryBusyError) return "engine-busy";
   if (error instanceof PiRpcCommandError) {
     if (error.kind === "no-model" || error.kind === "model-unavailable") return "engine-settings";
     if (error.kind === "auth") return "auth";

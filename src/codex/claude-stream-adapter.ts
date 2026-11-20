@@ -23,6 +23,7 @@ import {
   type ClaudeGoalCommand, type ClaudeGoalStdout, type ClaudeNativeGoalReceipt, type ClaudeNativeGoalTurnInput, type ClaudeNativeGoalUpdate,
 } from "./claude-native-goal.js";
 import { ClaudeTurnRecovery, claudeNoResponseError, isClaudeNoResponsePlaceholder } from "./claude-turn-recovery.js";
+import { claudeForkHistory, claudeHistoryState, resolveClaudeHistoryHelperPath, spawnClaudeHistoryHelper, type ClaudeHistoryHelper } from "./claude-history.js";
 import { ClaudeSessionUsage } from "./claude-session-usage.js";
 import { EngineRetryableError, type EngineRetryReason } from "./turn-retry.js";
 import { classifyFailure } from "../runtime/error-classification.js";
@@ -51,6 +52,9 @@ import type {
   EngineApprovalRequest,
   EngineAnswerProgress,
   EngineStreamEvent,
+  NativeHistoryAnchor,
+  NativeHistoryResult,
+  NativeHistoryState,
   EngineSideSession,
   CodexUserMessageInput,
   AppPlatformTools,
@@ -232,6 +236,8 @@ type PendingTurn = {
   /** The command whose native turn currently carries this host turn: the
    * prompt, or a missed steer that continued it. */
   nativeCommand: string;
+  /** uuid of the last message Claude wrote in the main conversation during this turn. */
+  lastAssistantUuid?: string;
   /** Real user text written into this running turn (native steering). */
   steers?: Set<string>;
   /** Own inputs for which `interrupt{send_now}` was requested on this turn: if
@@ -1140,6 +1146,10 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   private readonly nativeSearchMcp?: NativeSearchMcpPlanner;
   private readonly idleSweepTimer: ReturnType<typeof setInterval> | undefined;
   private readonly workers = new Map<string, ClaudeWorker>();
+  private readonly historyHelper: ClaudeHistoryHelper | undefined;
+  /** History helper calls in flight. They belong to no worker, so nothing else would wait for or end them. */
+  private readonly historyRuns = new Set<Promise<unknown>>();
+  private readonly historyAbort = new AbortController();
   private readonly sessionUsage: ClaudeSessionUsage;
   private destroyPromise: Promise<void> | undefined;
   private readonly appMcpUnavailable = new WeakSet<ClaudeWorker>();
@@ -1173,8 +1183,15 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       enableChromeIntegration?: boolean;
       /** Adds the host-managed Brave/Tavily MCP when credentials are effective. */
       nativeSearchMcp?: NativeSearchMcpPlanner;
+      /**
+       * Runs the session helper for native history. Absent: the helper the
+       * build put next to this module, if there is one. Null: no native history.
+       */
+      historyHelper?: ClaudeHistoryHelper | null;
     },
   ) {
+    const builtHistoryHelper = options?.historyHelper === undefined ? resolveClaudeHistoryHelperPath() : undefined;
+    this.historyHelper = options?.historyHelper ?? (builtHistoryHelper ? spawnClaudeHistoryHelper(builtHistoryHelper) : undefined);
     this.childEnv = options?.childEnv ?? (() => {
       const env = { ...process.env };
       delete env.TELEGRAM_BOT_TOKEN;
@@ -2336,6 +2353,8 @@ export class ClaudeStreamAdapter implements CodexAdapter {
         return;
       }
       worker.pendingTurn.assistantError = undefined;
+      // The main conversation's own messages only; a subagent's are not on this session's chain.
+      if (parsed.uuid && !parsed.parent_tool_use_id) worker.pendingTurn.lastAssistantUuid = parsed.uuid;
       // CLI resume placeholders are transcript padding, not model answers.
       // Keep the real foreground slot waiting for its own terminal result.
       if (parsed.message?.model === "<synthetic>" && parsed.message.content?.length === 1
@@ -3672,8 +3691,55 @@ export class ClaudeStreamAdapter implements CodexAdapter {
 
   /** Read the same native lifecycle that protects idle workers. Do not query
    * CLI state, start a turn, expire tasks or publish cards during a drain read. */
+  // ---- Native history: fork ---------------------------------------------------
+  // Through Anthropic's own session functions, in a helper process that gets
+  // this Bot's Claude environment. See claude-history.ts for what is and is
+  // not offered, and why there is no rewind.
+
+  /** What this adapter itself has going on in the session, its own end included. Synchronous: asked again right before a fork starts. */
+  private historyBlock(sessionId: string): "busy" | "goal_active" | "background_work" | "not_ready" | undefined {
+    // A retired adapter starts nothing, whatever its sessions look like.
+    if (this.destroyPromise) return "not_ready";
+    const worker = this.workers.get(sessionId);
+    if (!worker || worker.retired) return undefined;
+    if (worker.goal.armed) return "goal_active";
+    if (worker.pendingTurn || worker.continuationTurn || worker.stopFence || worker.nativeTurnOpen) return "busy";
+    return this.workerHasPendingWork(worker) ? "background_work" : undefined;
+  }
+
+  private async trackHistoryRun<T>(run: Promise<T>): Promise<T> {
+    this.historyRuns.add(run);
+    try { return await run; } finally { this.historyRuns.delete(run); }
+  }
+
+  async getHistoryState(sessionId: string, input: { workspaceOverride?: string; signal?: AbortSignal } = {}): Promise<NativeHistoryState> {
+    if (isLogicalTelegramSessionId(sessionId) || this.destroyPromise) return { head: null, blocked: "not_ready" };
+    const workspace = input.workspaceOverride ?? this.workspacePath;
+    // Without the helper, or without a project directory to look in, nothing is offered.
+    if (!this.historyHelper || !workspace) return { head: null };
+    return await this.trackHistoryRun(claudeHistoryState({
+      helper: this.historyHelper, env: this.childEnv, sessionId, workspace, blocked: () => this.historyBlock(sessionId),
+      ...(input.signal ? { signal: input.signal } : {}), lifetime: this.historyAbort.signal,
+    }));
+  }
+
+  async forkHistory(sessionId: string, input: {
+    anchor?: NativeHistoryAnchor; expectedHead?: string | null; workspaceOverride?: string; signal?: AbortSignal;
+  } = {}): Promise<NativeHistoryResult> {
+    if (input.signal?.aborted) return { outcome: "rejected", reason: "cancelled" };
+    if (isLogicalTelegramSessionId(sessionId)) return { outcome: "rejected", reason: "not_ready" };
+    const workspace = input.workspaceOverride ?? this.workspacePath;
+    if (!this.historyHelper || !workspace) return { outcome: "rejected", reason: "unsupported" };
+    // A retired adapter is refused by historyBlock(), which is asked before anything else and again before the fork.
+    return await this.trackHistoryRun(claudeForkHistory({
+      helper: this.historyHelper, env: this.childEnv, sessionId, workspace, blocked: () => this.historyBlock(sessionId),
+      ...(input.anchor ? { anchor: input.anchor } : {}), ...(input.expectedHead !== undefined ? { expectedHead: input.expectedHead } : {}),
+      ...(input.signal ? { signal: input.signal } : {}), lifetime: this.historyAbort.signal,
+    }));
+  }
+
   hasPendingNativeWork(): boolean {
-    if (this.pendingEventDeliveries) return true;
+    if (this.pendingEventDeliveries || this.historyRuns.size > 0) return true;
     for (const worker of new Set(this.workers.values())) {
       if (!worker.retired && this.workerHasPendingWork(worker)) return true;
     }
@@ -4361,6 +4427,15 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     const eventText = withDroppedSteerNotice(text, dropped, pending.locale);
     if (!pending.internal) {
       if (worker.currentSessionId) this.turnRecovery.clear(worker.currentSessionId, worker.workspacePath);
+      // The prompt's uuid is the one this adapter wrote on it, and the last answer's is Claude's own:
+      // both name transcript messages, so a fork through this turn needs no guess about which they are.
+      if (this.historyHelper && worker.currentSessionId && pending.nativeCommand && pending.lastAssistantUuid) {
+        const anchor: NativeHistoryAnchor = {
+          sessionId: worker.currentSessionId, inputId: pending.nativeCommand, rewind: false, fork: true, forkBoundary: "after-turn",
+          data: { lastMessageId: pending.lastAssistantUuid },
+        };
+        this.emitEngineEvent(worker, { type: "history_anchor", anchor }, pending.onEngineEvent);
+      }
       this.emitEngineEvent(worker, { type: "result", text: eventText, sessionId: worker.currentSessionId ?? undefined }, pending.onEngineEvent);
     }
     const finalText = eventText.trim() || (pending.locale === "zh" ? "Claude 本轮已结束，未返回文字回复。" : "Claude ended this turn without a text reply.");
@@ -4417,6 +4492,9 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     if (this.idleSweepTimer) {
       clearInterval(this.idleSweepTimer);
     }
+    // A history helper still running is ended; its caller reports what it knows, which may be nothing.
+    this.historyAbort.abort();
+    await Promise.allSettled([...this.historyRuns]);
     const deliveries: Array<Promise<void>> = [];
     const workers = [...new Set(this.workers.values())];
     this.workers.clear();

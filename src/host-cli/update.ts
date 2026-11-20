@@ -184,7 +184,7 @@ async function inventory(source: string, destination?: string): Promise<FileEntr
   }
   // Only runtime members are copied; never copy .env, a repository worktree,
   // another embedded release, or the developer's local credentials.
-  for (const member of ["package.json", "npm-shrinkwrap.json", "standalone-graph.json", "dist/src", "dist/relay-runtime.mjs", "client/dist", "node_modules", "dist/deepseek-harness-plugin", "integrations", "scripts", "docs", "bin"]) {
+  for (const member of ["package.json", "npm-shrinkwrap.json", "standalone-graph.json", "dist/src", "dist/relay-runtime.mjs", "dist/licenses", "client/dist", "node_modules", "dist/deepseek-harness-plugin", "integrations", "scripts", "docs", "bin"]) {
     if (await exists(path.join(source, member))) await walk(member);
   }
   return entries.sort((a, b) => a.path.localeCompare(b.path, "en"));

@@ -87,7 +87,7 @@ it("checks Electron resources/host and all native helpers in the extracted insta
 
 it.skipIf(process.platform === "win32")("fails standalone packaging on macOS/Linux when no Windows cross-builder is available", async () => {
   const folder = await fixture();
-  for (const directory of ["scripts", "client/dist", "dist"]) await mkdir(path.join(folder, directory), { recursive: true });
+  for (const directory of ["scripts", "client/dist", "dist/licenses/claude-agent-sdk"]) await mkdir(path.join(folder, directory), { recursive: true });
   for (const script of ["build-host-launcher.mjs", "macos-artifact-paths.mjs"]) await cp(path.join(root, "scripts", script), path.join(folder, "scripts", script));
   await writeFile(path.join(folder, "dist/standalone-graph.json"), '{"inputs":{}}');
   await writeFile(path.join(folder, "dist/relay-runtime.mjs"), "export {};");

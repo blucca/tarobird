@@ -1416,6 +1416,7 @@ function scheduleBatchedCoreTurn(
     }
     existing.normalized = {
       ...existing.normalized,
+      historyInputMerged: true,
       messageId: normalized.messageId,
       // Merge on the raw MEMBERS (envelope + body + attachments each), not on the
       // already-merged text — see mergeBatchedTexts.
@@ -2594,7 +2595,11 @@ async function runNormalizedCoreMessage(
           // the Bridge adds a quoted message; the repair prompts below are the Host's own. A Bot's message, an
           // agent-bus prompt and a group-discussion turn were not typed by the owner of this conversation.
           result = await runBridgeTurn(normalized.botSource || normalized.agentBus || normalized.groupDiscussion
-            ? bridgeTurnInput : { ...bridgeTurnInput, authoredText: normalized.text });
+            ? bridgeTurnInput : { ...bridgeTurnInput, authoredText: normalized.text,
+              ...(channelProfile() === "gateway" && normalized.bridgeChatType === "private" && !normalized.historyInputMerged
+                && !normalized.text.trimStart().startsWith("/") && !normalized.goalObjective
+                ? { historyInputMessageId: normalized.messageId } : {}),
+            });
         } catch (error) {
           if (error instanceof EngineNativeInputUnsentError) throw error;
           if (classifyCoreTurnTermination(error, runController.signal).kind !== "error") {

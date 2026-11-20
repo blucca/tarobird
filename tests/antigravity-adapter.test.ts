@@ -17,6 +17,26 @@ import { removeTempRoot } from "./helpers/temp-files.js";
 const CONVERSATION_ID = "11111111-2222-4333-8444-555555555555";
 
 describe("ProcessAntigravityAdapter", () => {
+  it.each([false, true].flatMap(goal => [false, true].flatMap(tools => ["text", "nested"].map(shape => ({ goal, tools, shape })))))("keeps native invalid-argument provenance without replay ($goal/$tools/$shape)", async ({ goal, tools, shape }) => {
+    const { spawnAntigravity, child, calls } = createSpawnHarness();
+    const adapter = new ProcessAntigravityAdapter("agy", { HOME: "/tmp/home" }, spawnAntigravity);
+    try {
+      const failure = adapter.sendUserMessage("tarobot-invalid-request", { text: goal ? "/goal inspect" : "inspect", files: [] }).then(() => undefined, error => error);
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      child.stdout.emitData(jsonLine({ event: "init", conversation_id: CONVERSATION_ID, init: {} }));
+      if (tools) child.stdout.emitData(jsonLine({ event: "step_update", step_update: { conversation_id: CONVERSATION_ID, step_index: 1, step_type: "tool", state: "DONE", tool_name: "write_file", tool_info: { output: "saved" } } }));
+      child.stderr.emitData("private diagnostics");
+      child.stdout.emitData(jsonLine({ event: "result", result: { conversation_id: CONVERSATION_ID, status: "ERROR", response: "", finished_reason: "error",
+        error: shape === "text" ? "400 INVALID_ARGUMENT: request rejected" : { error: { status: "INVALID_ARGUMENT", message: "request rejected" } } } }));
+      child.close(1);
+      const error = await failure;
+      expect(error).toBeInstanceOf(EngineIncompleteResponseError);
+      expect(error.requestRejection).toBe("invalid-argument");
+      expect(getBusErrorSemantics(classifyFailure(error))).toMatchObject({ retryable: false });
+      expect(calls).toHaveLength(1);
+    } finally { await adapter.destroy(); }
+  });
+
   it.each([false, true].flatMap(goal => ["legacy-error", "exit-zero", "exit-error", "protocol-error"].map(end => ({ goal, end }))))("does not replay work when the terminal receipt is missing or legacy ($goal/$end)", async ({ goal, end }) => {
     const { spawnAntigravity, child, calls } = createSpawnHarness();
     const adapter = new ProcessAntigravityAdapter("agy", { HOME: "/tmp/home" }, spawnAntigravity);

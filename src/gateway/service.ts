@@ -1,3 +1,5 @@
+import { gatewayConversationHistory } from "./conversation-history.js";
+import { CONVERSATION_HISTORY_CAPABILITY, historyAnchorEvidenceSchema } from "../client-protocol/conversation-history.js";
 import { workbenchInstructions } from "./agent-instructions.js";
 import { chromeSettings } from "../runtime/chrome-settings.js";
 import { RUN_RECOVERY_CAPABILITY } from "../client-protocol/run.js";
@@ -187,6 +189,14 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
         // async context, even after this request returns. Bind App formatting
         // explicitly so late reports never fall back to Feishu card limits.
         let response = await target.handleAuthorizedMessage({ ...input, text: engineText, appPlatformTools,
+          onHistoryAnchor: input.historyInputMessageId && conversationId && channel.transport.capabilities.includes(CONVERSATION_HISTORY_CAPABILITY)
+            ? async evidence => {
+              const record = historyAnchorEvidenceSchema.parse({ ...evidence, conversationId });
+              const publication = channel.transport.enqueue("history.anchor", record);
+              void publication.response.catch(() => options.onWarning?.("history_anchor_rejected"));
+              await publication.persisted;
+              await input.onHistoryAnchor?.(evidence);
+            } : input.onHistoryAnchor,
           extraEnv: { ...input.extraEnv, TAROBOT_MESSAGE_ID: discussionTurn ? "" : channel.currentMessageId() ?? "", TAROBOT_HOST_DIR: process.env.TAROBOT_HOST_DIR ?? "", TAROBOT_CLI_ENTRYPOINT: process.env.TAROBOT_CLI_ENTRYPOINT ?? "", TAROBOT_NODE_EXECUTABLE: process.env.TAROBOT_NODE_EXECUTABLE ?? "" },
           onEngineEvent: onEngineEvent ? event => withChannelProfile("gateway", () => onEngineEvent(event)) : undefined,
           onNativeGoal: input.onNativeGoal ? update => withChannelProfile("gateway", () => input.onNativeGoal!(update)) : undefined,
@@ -247,10 +257,12 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   const steering = gatewaySteering(bridge, runtime, channel, options.stateDir);
   const engineTasks = gatewayEngineTasks(bridge, channel, options.stateDir);
   const piSession = gatewayPiSession(bridge, channel, options.stateDir, options.botId);
+  const history = gatewayConversationHistory(bridge, channel, runtime, options.stateDir, options.botId, () => (sideSessions?.activeCount() ?? 0) > 0);
   // Side audio uses the main transcriber and cloud policy, without its chat progress cards.
   sideSessions = gatewaySideSessions(surface, options.stateDir, options.botId, conversationId => channel.canSteerConversation!(conversationId), instanceAttachmentDownload(channel.transport), runtime.transcribeMedia ?? createDefaultTranscribeVoice(), channel);
   const schedules = gatewaySchedules(options, channel);
   channel.onCall = async (method, raw): Promise<Json> => withChannelProfile("gateway", async () => {
+    if (method.startsWith("history.")) return history(method, raw);
     if (method === "tasks.list" || method === "tasks.stop" || method === "tasks.recover") return z.json().parse(await engineTasks(method, raw));
     if (method === "pi.session.get" || method === "pi.session.set") return z.json().parse(await piSession(method, raw));
     if (["side.status", "side.open", "side.read", "side.ask", "side.stop", "side.close"].includes(method)) return z.json().parse(await sideSessions!.call(method, raw));

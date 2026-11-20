@@ -35,8 +35,8 @@ export type User = { id: string; name: string; role: "owner" | "member" };
 export type Device = { id: string; user_id: string; name: string; platform: string; public_key: string; revoked: number; created_at: number; last_seen: number };
 export type DeviceSummary = Omit<Device, "public_key"> & { nameSource?: "host" };
 export type Bot = { id: string; name: string; engine: string; model: string; effort: string; online: number; managed?: number; deletedAt?: number; defaultAvatar?: string; role?: BotRole };
-type ConversationRow = { id: string; type: "direct" | "group"; title: string; owner_id: string; parent_id: string | null; session_id: string | null; binding_id: string | null; archived: number; created_at: number; hidden: number; ticket_json: string | null };
-type MessageRow = { workbench_receipt_json?: string | null; discussion_json?: string | null; bot_source_json?: string | null; preview_style: string | null; preview_url: string | null; link_preview_json: string | null; forwarded_json: string | null; mentions_json: string; id: string; conversation_id: string; author_id: string; author_type: "user" | "bot" | "system"; blocks_json: string; status: Message["status"]; version: number; client_msg_id: string | null; reply_to: string | null; created_at: number };
+type ConversationRow = { history_origin_json?: string | null; id: string; type: "direct" | "group"; title: string; owner_id: string; parent_id: string | null; session_id: string | null; binding_id: string | null; archived: number; created_at: number; hidden: number; ticket_json: string | null };
+type MessageRow = { history_json?: string | null; workbench_receipt_json?: string | null; discussion_json?: string | null; bot_source_json?: string | null; preview_style: string | null; preview_url: string | null; link_preview_json: string | null; forwarded_json: string | null; mentions_json: string; id: string; conversation_id: string; author_id: string; author_type: "user" | "bot" | "system"; blocks_json: string; status: Message["status"]; version: number; client_msg_id: string | null; reply_to: string | null; created_at: number };
 type MessageHeader = Pick<MessageRow, "id" | "conversation_id" | "author_id" | "author_type" | "created_at" | "version" | "client_msg_id">;
 function deletedMessageRow(row: MessageHeader): Message {
   return deletedMessage({ id: row.id, conversationId: row.conversation_id, authorId: row.author_id, authorType: row.author_type,
@@ -202,14 +202,14 @@ export class HubStore {
     const row = await this.db.get<ConversationRow>("SELECT * FROM conversations WHERE id=?", [id]);
     if (!row) throw new HubError("conversation_not_found", 404);
     const bots = await this.db.all<{ member_id: string }>("SELECT member_id FROM conversation_members WHERE conversation_id=? AND member_type='bot' ORDER BY member_id", [id]);
-    return conversationSchema.parse({ id: row.id, type: row.type, title: row.title, ownerId: row.owner_id, ...(row.parent_id ? { parentId: row.parent_id } : {}), botIds: bots.map((b) => b.member_id), archived: !!row.archived, ...(row.session_id ? { sessionId: row.session_id } : {}), ...(row.binding_id ? { bindingId: row.binding_id } : {}), createdAt: row.created_at,
+    return conversationSchema.parse({ ...(row.history_origin_json ? { historyOrigin: JSON.parse(row.history_origin_json) } : {}), id: row.id, type: row.type, title: row.title, ownerId: row.owner_id, ...(row.parent_id ? { parentId: row.parent_id } : {}), botIds: bots.map((b) => b.member_id), archived: !!row.archived, ...(row.session_id ? { sessionId: row.session_id } : {}), ...(row.binding_id ? { bindingId: row.binding_id } : {}), createdAt: row.created_at,
       ...(row.hidden ? { hidden: true } : {}), ...(row.ticket_json ? { ticket: conversationTicketSchema.parse(JSON.parse(row.ticket_json)) } : {}) });
   }
   /** Pass `hidden: false` where a listing reaches a client without dispatch.v1:
    * it would show dispatcher worker conversations as ordinary chats. */
   conversations(userId: string, options: { hidden?: boolean } = {}): Promise<Conversation[]> {
     return this.db.serial(async () => {
-      const rows = await this.db.all<{ id: string }>(`SELECT c.id FROM conversations c JOIN conversation_members m ON c.id=m.conversation_id WHERE m.member_type='user' AND m.member_id=?${options.hidden === false ? " AND c.hidden=0" : ""} ORDER BY c.created_at`, [userId]);
+      const rows = await this.db.all<{ id: string }>(`SELECT c.id FROM conversations c JOIN conversation_members m ON c.id=m.conversation_id WHERE m.member_type='user' AND m.member_id=? AND NOT EXISTS(SELECT 1 FROM history_operations h WHERE h.destination_conversation_id=c.id AND h.state!='applied')${options.hidden === false ? " AND c.hidden=0" : ""} ORDER BY c.created_at`, [userId]);
       return Promise.all(rows.map((r) => this.conversationRow(r.id)));
     });
   }
@@ -268,6 +268,7 @@ export class HubStore {
       const current = await this.conversationRow(id);
       if (current.ownerId !== userId) throw new HubError("conversation_owner_required", 403);
       if (changes.archived === false && (!current.botIds.length || await this.db.get("SELECT 1 FROM bots WHERE id IN (SELECT value FROM json_each(?)) AND deleted_at IS NOT NULL", [JSON.stringify(current.botIds)]))) throw new HubError("bot_deleted", 410);
+      if (changes.sessionId !== undefined || changes.archived !== undefined) await this.requireHistoryUnfencedInTransaction(id);
       if (changes.sessionId !== undefined) await this.requireOwner(userId);
       if (changes.sessionId === null && changes.expectedBindingId === undefined) throw new HubError("binding_revision_required", 409);
       if (changes.expectedBindingId !== undefined && changes.expectedBindingId !== (current.bindingId ?? null)) throw new HubError("binding_conflict", 409);
@@ -419,7 +420,7 @@ export class HubStore {
     for (const { attachment_id: id } of recalled) await this.db.run("INSERT OR IGNORE INTO retired_attachments SELECT ? WHERE NOT EXISTS(SELECT 1 FROM message_attachments WHERE attachment_id=?)", [id, id]);
   }
   private decodeMessage(row: MessageRow): Message {
-    return messageSchema.parse({ ...(row.discussion_json ? { groupDiscussion: JSON.parse(row.discussion_json) } : {}), ...(row.bot_source_json ? { botSource: JSON.parse(row.bot_source_json) } : {}), ...(row.preview_style != null ? { previewStyle: row.preview_style } : {}), ...(row.preview_url !== null && row.preview_url !== undefined ? { previewUrl: row.preview_url || null } : {}), ...(row.link_preview_json ? { linkPreview: JSON.parse(row.link_preview_json) } : {}), id: row.id, conversationId: row.conversation_id, authorId: row.author_id, authorType: row.author_type, blocks: JSON.parse(row.blocks_json), status: row.status, version: row.version, ...(row.client_msg_id ? { clientMsgId: row.client_msg_id } : {}), ...(row.reply_to ? { replyTo: row.reply_to } : {}), createdAt: row.created_at, ...(row.forwarded_json ? { forwardedFrom: JSON.parse(row.forwarded_json) } : {}), ...(JSON.parse(row.mentions_json ?? "[]").length ? { mentions: JSON.parse(row.mentions_json) } : {}) });
+    return messageSchema.parse({ ...(row.history_json ? { historyContext: JSON.parse(row.history_json) } : {}), ...(row.discussion_json ? { groupDiscussion: JSON.parse(row.discussion_json) } : {}), ...(row.bot_source_json ? { botSource: JSON.parse(row.bot_source_json) } : {}), ...(row.preview_style != null ? { previewStyle: row.preview_style } : {}), ...(row.preview_url !== null && row.preview_url !== undefined ? { previewUrl: row.preview_url || null } : {}), ...(row.link_preview_json ? { linkPreview: JSON.parse(row.link_preview_json) } : {}), id: row.id, conversationId: row.conversation_id, authorId: row.author_id, authorType: row.author_type, blocks: JSON.parse(row.blocks_json), status: row.status, version: row.version, ...(row.client_msg_id ? { clientMsgId: row.client_msg_id } : {}), ...(row.reply_to ? { replyTo: row.reply_to } : {}), createdAt: row.created_at, ...(row.forwarded_json ? { forwardedFrom: JSON.parse(row.forwarded_json) } : {}), ...(JSON.parse(row.mentions_json ?? "[]").length ? { mentions: JSON.parse(row.mentions_json) } : {}) });
   }
   async sendMessage(userId: string, input: SendMessageInput, validate?: TransactionGuard): Promise<{ message: Message; duplicate: boolean; workbenchContextOmitted?: "history_limit" }> {
     const result = await this.db.transaction(async () => {
@@ -445,6 +446,7 @@ export class HubStore {
       if (old.conversation_id !== input.conversationId || old.forwarded_json || this.decodeMessage(old).blocks.some((b) => b.type === "steering")) throw new HubError("idempotency_conflict", 409);
       return { message: this.decodeMessage(old), duplicate: true, ...(receipt?.omitted ? { workbenchContextOmitted: receipt.omitted } : {}) };
     }
+    await this.requireHistoryUnfencedInTransaction(input.conversationId);
     const conv = await this.conversationRow(input.conversationId);
     if (conv.archived || conv.parentId && (await this.conversationRow(conv.parentId)).archived) throw new HubError("conversation_archived", 409);
     if (input.groupReplyGuard) {
@@ -520,6 +522,53 @@ export class HubStore {
   }
   /** Emit events whose transaction has committed. */
   emitCommitted(events: HubEvent[]): void { for (const event of events) this.emit(event); }
+  async historyFencedInTransaction(conversationId: string): Promise<boolean> {
+    return !!await this.db.get("SELECT 1 FROM history_operations WHERE (source_conversation_id=? OR destination_conversation_id=?) AND state NOT IN ('applied','rejected') LIMIT 1", [conversationId, conversationId]);
+  }
+  async requireHistoryUnfencedInTransaction(conversationId: string): Promise<void> {
+    if (await this.historyFencedInTransaction(conversationId)) throw new HubError("history_operation_pending", 409);
+  }
+  /** Only the history coordinator may project a confirmed native context change. */
+  async excludeHistoryMessagesInTransaction(conversationId: string, inputIds: string[], operationId: string, botId: string): Promise<HubEvent[]> {
+    const excluded = new Set(inputIds);
+    // The source run's receipt is an exact relation, but only says a linked
+    // input may have entered it. Require native admission/adoption evidence as
+    // well; never infer context membership from message order or a lost result.
+    const linked = await this.db.all<MessageRow>(`SELECT linked.* FROM messages source
+      JOIN json_each(source.workbench_receipt_json,'$.inputs') relation JOIN messages linked ON linked.id=relation.value
+      WHERE source.conversation_id=? AND source.author_type='user' AND source.id IN (SELECT value FROM json_each(?))
+        AND linked.conversation_id=source.conversation_id AND linked.author_id=source.author_id AND linked.author_type='user'`, [conversationId, JSON.stringify(inputIds)]);
+    for (const row of linked) {
+      const control = this.decodeMessage(row).blocks.find(block => block.type === "steering");
+      if (!control || control.botId !== botId || control.outcome === "rejected" || control.application?.status === "dropped"
+        || control.nativeInput?.state === "cancelled" || control.nativeInput?.state === "dropped") continue;
+      const adopted = control.application?.status === "applied" || control.application?.status === "absorbed";
+      const admitted = control.mode === "message" ? control.nativeInput?.state === "received" : control.outcome === "accepted";
+      if (adopted || admitted) excluded.add(row.id);
+    }
+    // Truncated receipt entries are unknown, not permission to mark an App
+    // time range. All retained exact links above remain independently valid.
+    const projectedIds = [...excluded];
+    const events: HubEvent[] = [];
+    for (let offset = 0; offset < projectedIds.length; offset += 100) {
+      const ids = JSON.stringify(projectedIds.slice(offset, offset + 100));
+      const rows = await this.db.all<MessageRow>("SELECT * FROM messages WHERE conversation_id=? AND status!='deleted' AND history_json IS NULL AND (id IN (SELECT value FROM json_each(?)) OR (author_type='bot' AND reply_to IN (SELECT value FROM json_each(?))))", [conversationId, ids, ids]);
+      for (const row of rows) {
+        const message = { ...this.decodeMessage(row), historyContext: { excludedBy: operationId }, version: row.version + 1 };
+        await this.db.run("UPDATE messages SET history_json=?,version=? WHERE id=?", [JSON.stringify(message.historyContext), message.version, row.id]);
+        events.push(await this.append(conversationId, "message.updated", message, false));
+      }
+    }
+    return events;
+  }
+  async historyNoticeInTransaction(conversationId: string, operationId: string, text: string): Promise<HubEvent | undefined> {
+    const id = `history_${operationId}`;
+    if (await this.db.get("SELECT 1 FROM messages WHERE id=?", [id])) return;
+    const message: Message = { id, conversationId, authorId: "system", authorType: "system", blocks: [{ type: "text", text }], status: "complete", version: 1, createdAt: Date.now() };
+    await this.saveMessage(message);
+    return this.append(conversationId, "message.created", message, false);
+  }
+
   /** Durable transcript only: explicit controls must never enter deliveries. */
   async beginSteering(userId: string, input: { conversationId: string; botId: string; requestId: string; targetId: string; text: string; mode?: "message" }, validate?: TransactionGuard): Promise<Message> {
     return (await this.beginSteeringRecord(userId, input, validate)).message;
@@ -536,12 +585,14 @@ export class HubStore {
       await validate?.(!old);
       if (old) {
         const message = this.decodeMessage(old), control = message.blocks.find((block) => block.type === "steering");
+        if (message.historyContext) throw new HubError("history_message_excluded", 409);
         if (message.conversationId !== input.conversationId || !control || control.botId !== input.botId || control.targetId !== input.targetId || (input.mode !== undefined && control.mode !== input.mode) || blocksText(message.blocks) !== input.text) throw new HubError("idempotency_conflict", 409);
         const receipt = old.workbench_receipt_json ? JSON.parse(old.workbench_receipt_json) as SteeringInputReceipt : undefined;
         if (receipt?.digest !== (context ? workbenchContextDigest(JSON.stringify(context)) : undefined)) throw new HubError("idempotency_conflict", 409);
         return { message, created: false };
       }
-      const conv = await this.conversationRow(input.conversationId);
+      await this.requireHistoryUnfencedInTransaction(input.conversationId);
+    const conv = await this.conversationRow(input.conversationId);
       if (conv.archived || conv.parentId && (await this.conversationRow(conv.parentId)).archived) throw new HubError("conversation_archived", 409);
       const message: Message = { id: newId("msg"), conversationId: conv.id, authorId: userId, authorType: "user", clientMsgId: input.requestId, mentions: [input.botId],
         status: "complete", version: 1, createdAt: Date.now(), blocks: [{ type: "text", text: input.text }, { type: "steering", botId: input.botId, targetId: input.targetId, outcome: "pending", ...(input.mode ? { mode: input.mode } : {}) }] };
@@ -667,9 +718,11 @@ export class HubStore {
   }
   async nativeInputForControl(userId: string, conversationId: string, messageId: string): Promise<{ botId: string; inputId: string; targetId: string }> {
     await this.requireMember(userId, conversationId);
+    await this.requireHistoryUnfencedInTransaction(conversationId);
     const row = await this.db.get<MessageRow>("SELECT * FROM messages WHERE id=? AND conversation_id=? AND author_id=? AND author_type='user'", [messageId, conversationId, userId]);
     if (!row) throw new HubError("message_not_found", 404);
     const message = this.decodeMessage(row), control = message.blocks.find(block => block.type === "steering");
+    if (message.historyContext) throw new HubError("history_message_excluded", 409);
     if (control?.mode !== "message" || !message.clientMsgId) throw new HubError("not_native_input", 409);
     await this.requireBot(control.botId, conversationId);
     return { botId: control.botId, inputId: message.clientMsgId, targetId: control.targetId };
@@ -718,6 +771,7 @@ export class HubStore {
       await this.requireMember(userId, row.conversation_id);
       const original = this.decodeMessage(row);
       if (!["complete", "error"].includes(original.status)) throw new HubError("message_not_ready", 409);
+      await this.requireHistoryUnfencedInTransaction(input.conversationId);
       const conv = await this.conversationRow(input.conversationId), source = await this.conversationRow(original.conversationId);
       if (conv.archived || conv.parentId && (await this.conversationRow(conv.parentId)).archived) throw new HubError("conversation_archived", 409);
       const mentions = [...new Set(input.mentions ?? [])];
@@ -1253,6 +1307,9 @@ export class HubStore {
       await this.requireBot(botId, conversationId);
       const old = await this.db.get<{ payload_json: string }>("SELECT payload_json FROM actions WHERE user_id=? AND client_action_id=?", [userId, clientActionId]);
       if (old) { if (old.payload_json !== value) throw new HubError("idempotency_conflict", 409); return; }
+      await this.requireHistoryUnfencedInTransaction(conversationId);
+      const target = z.object({ messageId: idSchema }).passthrough().safeParse(params);
+      if (target.success && await this.db.get("SELECT 1 FROM messages WHERE id=? AND conversation_id=? AND history_json IS NOT NULL", [target.data.messageId, conversationId])) throw new HubError("history_message_excluded", 409);
       await this.db.run("INSERT INTO actions VALUES(?,?,?)", [userId, clientActionId, value]);
       await this.db.run("INSERT INTO action_deliveries(id,user_id,client_action_id,bot_id,conversation_id,params_json,created_at) VALUES(?,?,?,?,?,?,?)", [newId("action"), userId, clientActionId, botId, conversationId, JSON.stringify(z.json().parse(params)), Date.now()]);
     });

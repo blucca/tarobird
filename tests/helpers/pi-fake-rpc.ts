@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
-import { closeSync, openSync, readSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import type { PiSpawn } from "../../src/codex/pi-rpc-client.js";
@@ -55,7 +56,20 @@ function sessionHeaderId(file: string | undefined): string | undefined {
   } catch { return; } finally { if (handle !== undefined) closeSync(handle); }
 }
 
+/**
+ * Session files that outlive one fake process, for tests where a second
+ * process opens a session the first one wrote. Entries are shared by file, as
+ * they are on disk. Observed in Pi 1.6.0's source: a session file is written
+ * only once the session holds an assistant message; `fork` ends the new
+ * session before the chosen user message, `clone` copies up to the leaf, and
+ * both move the process that ran them to the new session.
+ */
+export interface FakePiDisk { dir: string; byFile: Map<string, Array<Record<string, unknown>>> }
+export function fakePiDisk(dir: string): FakePiDisk { return { dir, byFile: new Map() }; }
+
 export interface FakePiOptions {
+  /** Opt in to sessions shared between processes through real files in `disk.dir`. */
+  disk?: FakePiDisk;
   models?: FakePiModel[];
   /** Initial model; undefined with no models means "no usable model". */
   model?: FakePiModel;
@@ -95,6 +109,8 @@ export class FakePiProcess extends EventEmitter {
   entries: Array<Record<string, unknown>> = [];
   messages: Array<Record<string, unknown>> = [];
   activeRun: FakePiRun | undefined;
+  /** Set to move the current position without writing anything, as a move in Pi's tree does. Undefined: the last entry. */
+  leafOverride: string | null | undefined;
   private buffer = "";
   private entrySequence = 0;
   private ended = false;
@@ -118,6 +134,12 @@ export class FakePiProcess extends EventEmitter {
       write: (chunk, _encoding, callback) => { this.receive(chunk.toString("utf8")); callback(); },
       final: callback => { callback(); if (!this.stubborn) this.exit(0); },
     });
+    if (options.disk && !spawnArgs.args.includes("--no-session")) {
+      const file = sessionPath ?? path.join(this.sessionDir(), `2026-01-01T00-00-00-000Z_${sessionId}.jsonl`);
+      this.state.sessionFile = file;
+      const shared = options.disk.byFile.get(file);
+      if (shared) { this.entries = shared; this.entrySequence = shared.length; } else options.disk.byFile.set(file, this.entries);
+    }
     if (options.exitAtStart) {
       const { code, stderr } = options.exitAtStart;
       queueMicrotask(() => { if (stderr) this.stderr.write(stderr); this.exit(code); });
@@ -125,6 +147,8 @@ export class FakePiProcess extends EventEmitter {
   }
 
   get sessionId(): string { return this.state.sessionId as string; }
+  /** Whether this process has ended, however it ended. */
+  get exited(): boolean { return this.ended; }
   get args(): string[] { return this.spawnArgs.args; }
 
   kill(signal?: NodeJS.Signals | number): boolean {
@@ -166,7 +190,23 @@ export class FakePiProcess extends EventEmitter {
     const previous = this.entries[this.entries.length - 1];
     const full = { id: `e${++this.entrySequence}`, parentId: previous ? previous.id : null, timestamp: "2026-01-01T00:00:00.000Z", ...entry };
     this.entries.push(full);
+    this.writeSessionFile();
     return full;
+  }
+
+  /** Where Pi was told to keep sessions, else the disk's own directory. */
+  private sessionDir(): string {
+    const at = this.spawnArgs.args.indexOf("--session-dir");
+    return at >= 0 && this.spawnArgs.args[at + 1] ? this.spawnArgs.args[at + 1]! : this.options.disk!.dir;
+  }
+
+  /** Disk mode: the file appears with the first assistant message, as Pi's does. */
+  private writeSessionFile(): void {
+    const file = this.state.sessionFile as string | undefined;
+    if (!this.options.disk || !file || existsSync(file)) return;
+    if (!this.entries.some(entry => (entry.message as { role?: string } | undefined)?.role === "assistant")) return;
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `${JSON.stringify({ type: "session", version: 3, id: this.sessionId, timestamp: "2026-01-01T00:00:00.000Z", cwd: this.spawnArgs.options.cwd ?? process.cwd() })}\n`);
   }
 
   private receive(text: string): void {
@@ -304,7 +344,7 @@ export class FakePiProcess extends EventEmitter {
         contextUsage: { tokens: 266, contextWindow: 32000, percent: 0.83 },
       }); return;
       case "get_commands": this.respond(command, { commands: (this.options.commands ?? []).map(item => ({ ...item, sourceInfo: { path: "/synthetic/ext", source: "local", scope: "user", origin: "top-level" } })) }); return;
-      case "get_entries": this.respond(command, { entries: this.entries, leafId: this.entries[this.entries.length - 1]?.id ?? null }); return;
+      case "get_entries": this.respond(command, { entries: this.entries, leafId: this.leafOverride !== undefined ? this.leafOverride : this.entries[this.entries.length - 1]?.id ?? null }); return;
       case "get_tree": {
         const nodes = new Map<string, { entry: Record<string, unknown>; children: unknown[] }>();
         const roots: unknown[] = [];
@@ -329,6 +369,17 @@ export class FakePiProcess extends EventEmitter {
         if (command.type === "fork" && !this.entries.some(entry => entry.id === command.entryId)) { this.fail(command, "Invalid entry ID for forking"); return; }
         const next = `${command.type}-${this.entrySequence}-${Math.floor(Math.random() * 1e6)}`;
         const forkText = command.type === "fork" ? (this.entries.find(entry => entry.id === command.entryId)?.message as { content?: string } | undefined)?.content : undefined;
+        const disk = this.options.disk;
+        if (disk) {
+          // The source's entries stay with the source's file; this process leaves with a copy of the kept part.
+          const end = command.type === "fork" ? this.entries.findIndex(entry => entry.id === command.entryId) : command.type === "clone" ? this.entries.length : 0;
+          this.entries = this.entries.slice(0, end).map(entry => ({ ...entry }));
+          this.state.sessionId = next;
+          this.state.sessionFile = path.join(this.sessionDir(), `2026-01-01T00-00-01-000Z_${next}.jsonl`);
+          disk.byFile.set(this.state.sessionFile as string, this.entries);
+          this.writeSessionFile();
+          this.respond(command, command.type === "fork" ? { text: forkText ?? "", cancelled: false } : { cancelled: false }); return;
+        }
         this.state.sessionId = next;
         this.state.sessionFile = `/synthetic/sessions/2026-01-01T00-00-01-000Z_${next}.jsonl`;
         if (command.type === "new_session") { this.entries = []; this.messages = []; }

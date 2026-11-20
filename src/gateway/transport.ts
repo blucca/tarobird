@@ -1,3 +1,4 @@
+import { CONVERSATION_HISTORY_CAPABILITY } from "../client-protocol/conversation-history.js";
 import { workbenchContextSchema, workbenchContextOmittedSchema, type WorkbenchContext, type WorkbenchContextOmitted } from "../client-protocol/workbench.js";
 import { WORKBENCH_DESIGN_OPEN_CAPABILITY } from "../client-protocol/workbench-design.js";
 import { NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY } from "../client-protocol/native-input.js";
@@ -101,7 +102,7 @@ export class GatewayTransport {
         await this.readStatus();
         // Standalone/manual workers without a Host binding still use their own
         // environment; do not claim that the Host's voice settings apply.
-        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [...(this.status.engine === "pi" ? [PI_SESSION_CAPABILITY] : []), ...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
+        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [CONVERSATION_HISTORY_CAPABILITY, ...(this.status.engine === "pi" ? [PI_SESSION_CAPABILITY] : []), ...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
       }).catch(() => undefined);
     });
     ws.on("message", (data) => {
@@ -267,6 +268,8 @@ export class GatewayTransport {
    * earlier responses are slow or the Hub is disconnected. */
   enqueue(method: string, params: unknown): { persisted: Promise<void>; response: Promise<Json> } {
     this.throwIfStopped();
+    if (method.startsWith("history.") && !["history.anchor", "history.result"].includes(method)) throw new Error("history_requires_live_request");
+    if (method.startsWith("history.") && !this.capabilities.includes(CONVERSATION_HISTORY_CAPABILITY)) throw new Error("history_unsupported");
     if (method.startsWith("workbench.")) throw new Error("workbench_requires_live_request");
     if (method === "queue.take") throw new Error("queue_pull_requires_live_slot");
     if (method === "run.scope.write" && !this.capabilities.includes(RUN_SCOPES_CAPABILITY)) throw new Error("run_scopes_unsupported");

@@ -110,6 +110,14 @@ function assertAntigravityTurnFinished(result: AntigravityResult, streamedText: 
   }
   // Preserve actionable failures only before any answer or tool work. A
   // tool-only turn can already have side effects despite returning no text.
+  if (result.finished_reason === "error") {
+    const detail = stringifyToolValue(result.error);
+    // The native payload can be a string or structured error. Do not assume a
+    // provider-specific JSON shape or infer that the conversation is corrupt.
+    if (typeof detail === "string" && detail.length <= 16_384 && /\bINVALID_ARGUMENT\b/.test(detail)) {
+      throw new EngineIncompleteResponseError("Antigravity rejected the request", "interrupted", "invalid-argument");
+    }
+  }
   if (result.finished_reason === "error" && !toolStepSeen && !hasAnswer) {
     const error = stringifyToolValue(result.error);
     if (error) throw new Error(error);
@@ -1208,7 +1216,7 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
     const stderr = worker.stderrTail.trim();
     const diagnosed = stderr && !error.message.includes(stderr)
       ? error instanceof EngineIncompleteResponseError
-        ? new EngineIncompleteResponseError(`${error.message}\n\nAntigravity stderr:\n${stderr}`, error.reason)
+        ? new EngineIncompleteResponseError(`${error.message}\n\nAntigravity stderr:\n${stderr}`, error.reason, error.requestRejection)
         : new Error(`${error.message}\n\nAntigravity stderr:\n${stderr}`)
       : error;
     this.rejectPersistentTurn(worker, diagnosed);

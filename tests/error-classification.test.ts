@@ -7,6 +7,15 @@ import {
   isStaleSessionError,
 } from "../src/runtime/error-classification.js";
 import { renderCoreUserFacingError, renderedEngineFailure } from "../src/core/errors.js";
+import { CodexThreadMissingError } from "../src/codex/app-server-adapter.js";
+
+it.each(["en", "zh"] as const)("explains a missing native Codex history without exposing its diagnostics (%s)", locale => {
+  const error = new CodexThreadMissingError("private-native-id", "no rollout found: private-debug-path");
+  const message = renderCoreUserFacingError(error, "engine", locale);
+  expect(message).toContain(locale === "en" ? "Codex session could not be found" : "找不到对应的 Codex 原生会话");
+  expect(message).not.toMatch(/private-native-id|private-debug-path/);
+  expect(message).toContain(locale === "en" ? "App messages" : "App 消息记录");
+});
 import { engineRetryReason } from "../src/codex/turn-retry.js";
 import { PiRpcCommandError, PiStartupError } from "../src/codex/pi-rpc-client.js";
 import { claudeError } from "../src/codex/claude-errors.js";

@@ -174,7 +174,7 @@ it("migrates schema 7 previews without rewriting messages/events and rejects cor
   const before = await store.snapshot("owner", conversation.id), events = await store.sync("owner", conversation.id, 0);
   await store.db.exec("ALTER TABLE messages DROP COLUMN preview_style; UPDATE meta SET value='7' WHERE key='schema_version'");
   await store.db.close(); store = await HubStore.open(root);
-  expect((await store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value).toBe("25");
+  expect((await store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value).toBe("26");
   expect(await store.snapshot("owner", conversation.id)).toEqual(before);
   expect(await store.sync("owner", conversation.id, 0)).toEqual(events);
   expect((await store.messageForUser("owner", message.id)).previewStyle).toBeUndefined();

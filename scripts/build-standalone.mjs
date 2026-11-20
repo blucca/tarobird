@@ -4,4 +4,5 @@ import { execFileSync } from 'node:child_process';
 for (const directory of ['dist/src', 'dist/deepseek-harness-plugin']) await rm(directory, { recursive: true, force: true });
 execFileSync(process.execPath, ['node_modules/typescript/bin/tsc', '-p', 'tsconfig.app.json'], { stdio: 'inherit' });
 await import('./build-relay.mjs');
+await (await import('./build-claude-history-helper.mjs')).buildClaudeHistoryHelper();
 await import('./check-standalone-graph.mjs');

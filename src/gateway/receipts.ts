@@ -13,6 +13,11 @@ export type ReceiptResult = z.infer<typeof resultSchema>;
 export class GatewayReceipts {
   private active = new Map<string, Promise<ReceiptResult>>();
   constructor(private readonly directory: string) {}
+  /** Readback must never turn an interrupted mutation into another invocation. */
+  async inspect(key: string): Promise<z.infer<typeof receiptSchema> | null> {
+    const id = createHash("sha256").update(key).digest("hex");
+    return new JsonStore(path.join(this.directory, "gateway-receipts", `${id}.json`), value => receiptSchema.nullable().parse(value)).read(null);
+  }
   run(key: string, operation: () => Promise<Json>, idempotentRetryMs = 0, authorize?: () => Promise<void>): Promise<ReceiptResult> {
     // Each caller must still be authorized before joining someone else's work.
     if (authorize) return authorize().then(() => this.runAuthorized(key, operation, idempotentRetryMs, authorize));

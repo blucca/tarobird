@@ -122,7 +122,7 @@ async function inspectState(directory: string): Promise<{ bots: ManagedBot[]; un
     else if (value && typeof value === "object") Object.values(value).forEach(collectPaths);
   };
   try {
-    if (!["8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25"].includes((await db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value ?? "")) throw new Error("unsupported_hub_schema_version");
+    if (!["8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26"].includes((await db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value ?? "")) throw new Error("unsupported_hub_schema_version");
     if ((await db.get<{ quick_check: string }>("PRAGMA quick_check"))?.quick_check !== "ok" || (await db.all("PRAGMA foreign_key_check")).length) throw new Error("hub_backup_database_invalid");
     await readSmallJson(path.join(directory, "identity.json"));
     await requireExistingHostState(directory);

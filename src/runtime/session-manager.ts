@@ -1,5 +1,6 @@
+import { SessionHistoryPendingError } from "../state/session-history-error.js";
 import { randomUUID } from "node:crypto";
-import { SessionStore } from "../state/session-store.js";
+import { SessionStore, type SessionHistoryBinding, type SessionHistoryFinalization } from "../state/session-store.js";
 import type { CodexAdapter } from "../codex/adapter.js";
 import { getConversationKey } from "./conversation-key.js";
 import { sessionLockNamespace } from "./turn-lock.js";
@@ -45,6 +46,7 @@ export class SessionManager {
     }
 
     if (existing.record) {
+      if (existing.record.historyFence) throw new SessionHistoryPendingError();
       return { sessionId: existing.record.codexSessionId };
     }
 
@@ -96,5 +98,30 @@ export class SessionManager {
       ? getConversationKey(scope)
       : scope.conversationKey ?? getConversationKey(scope.chatId, scope.messageThreadId);
     return await this.sessionStore.removeByConversationKey(conversationKey);
+  }
+
+  async assertHistoryAvailable(scope: number | { chatId: number; messageThreadId?: number; conversationKey?: string }): Promise<void> {
+    const record = await this.sessionStore.findByConversationKey(this.historyKey(scope));
+    if (record?.historyFence) throw new SessionHistoryPendingError();
+  }
+
+  getHistoryBinding(scope: number | { chatId: number; messageThreadId?: number; conversationKey?: string }): Promise<SessionHistoryBinding | null> {
+    return this.sessionStore.inspectHistory(this.historyKey(scope));
+  }
+
+  reserveHistory(scope: number | { chatId: number; messageThreadId?: number; conversationKey?: string }, revision: string, operationId: string): Promise<SessionHistoryBinding> {
+    return this.sessionStore.reserveHistory(this.historyKey(scope), revision, operationId);
+  }
+
+  releaseHistory(scope: number | { chatId: number; messageThreadId?: number; conversationKey?: string }, operationId: string): Promise<void> {
+    return this.sessionStore.releaseHistory(this.historyKey(scope), operationId);
+  }
+
+  finalizeHistory(scope: number | { chatId: number; messageThreadId?: number; conversationKey?: string }, input: SessionHistoryFinalization): Promise<{ revision: string }> {
+    return this.sessionStore.finalizeHistory(this.historyKey(scope), input);
+  }
+
+  private historyKey(scope: number | { chatId: number; messageThreadId?: number; conversationKey?: string }): string {
+    return typeof scope === "number" ? getConversationKey(scope) : scope.conversationKey ?? getConversationKey(scope.chatId, scope.messageThreadId);
   }
 }

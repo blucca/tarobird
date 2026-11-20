@@ -49,6 +49,8 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
   private cachedMessageBytes = 0;
   private readonly conversations = new Map<string, Conversation>();
   private readonly processing = new Set<string>();
+  private readonly processingConversations = new Map<string, string>();
+  isConversationProcessing(conversationId: string): boolean { return [...this.processingConversations.values()].includes(conversationId); }
   private readonly processingAgentBus = new Map<string, string>();
   private readonly admissions = new Map<string, Promise<void>>();
   private readonly receipts: GatewayReceipts;
@@ -73,7 +75,7 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
     this.scopedRunWriter = new GatewayRunWriter(input => transport.request("run.scope.write", input));
     this.receiveMessage = async (message, conversation, agentBus, groupDiscussion, queueSlot = false, workbench, workbenchContextOmitted) => {
       if (this.processing.has(message.id)) { if (agentBus?.stopRequested) this.onAgentBusStopRequested?.(agentBus.runId); return; }
-      this.processing.add(message.id); if (agentBus) this.processingAgentBus.set(message.id, agentBus.runId); this.rememberMessage(message); this.conversations.set(conversation.id, conversation);
+      this.processing.add(message.id); this.processingConversations.set(message.id, conversation.id); if (agentBus) this.processingAgentBus.set(message.id, agentBus.runId); this.rememberMessage(message); this.conversations.set(conversation.id, conversation);
       const previous = this.admissions.get(conversation.id);
       let release!: () => void;
       const admitted = new Promise<void>((resolve) => { release = resolve; });
@@ -124,7 +126,7 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
           transport.reconnectAfterDeliveryFailure();
           this.events.emit("error", error instanceof Error ? error : new Error("gateway_message_failed"));
         }
-        finally { admit(); this.processing.delete(message.id); this.processingAgentBus.delete(message.id); await transport.refreshStatus(); }
+        finally { admit(); this.processing.delete(message.id); this.processingConversations.delete(message.id); this.processingAgentBus.delete(message.id); await transport.refreshStatus(); }
       }));
       this.tasks.add(task);
       void task.finally(() => this.tasks.delete(task)).catch(() => undefined);

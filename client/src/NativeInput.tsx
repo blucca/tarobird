@@ -29,7 +29,7 @@ export function NativeInputReceipt({ block, message, connection }: { block: Extr
   const [noticePendingOnly, setNoticePendingOnly] = useState(false);
   const [sendNowRequested, setSendNowRequested] = useState(false);
   useEffect(() => {
-    if (connection.state.user?.id === message.authorId) settleSteeringRequest(connection, message, () => context.draftText?.(message.conversationId));
+    if (!message.historyContext && connection.state.user?.id === message.authorId) settleSteeringRequest(connection, message, () => context.draftText?.(message.conversationId));
   }, [connection, message, block.outcome, context]);
   const state = block.nativeInput?.state;
   const endedWithoutReceipt = state === "unknown" && block.nativeInput?.reason === "ended_without_model_receipt";
@@ -43,7 +43,7 @@ export function NativeInputReceipt({ block, message, connection }: { block: Extr
   const canControl = state === "queued" || !state && block.outcome === "accepted";
   const pending = ownsMessage && !endedWithoutReceipt && block.outcome !== "rejected" && !["received", "cancelled", "dropped"].includes(state ?? "");
   const control = async (action: NativeInputAction) => {
-    if (busyRef.current) return;
+    if (message.historyContext || busyRef.current) return;
     busyRef.current = true; setBusy(true); setNotice(""); setNoticePendingOnly(false); setSendNowRequested(false);
     try {
       const result = await controlNativeInput(connection, message.conversationId, message.id, action);
@@ -57,7 +57,7 @@ export function NativeInputReceipt({ block, message, connection }: { block: Extr
     finally { busyRef.current = false; setBusy(false); }
   };
   const check = async () => {
-    if (busyRef.current || !message.clientMsgId) return;
+    if (message.historyContext || busyRef.current || !message.clientMsgId) return;
     busyRef.current = true; setBusy(true); setNotice(""); setNoticePendingOnly(false); setSendNowRequested(false);
     try {
       const updated = messageSchema.parse(await connection.http(`/api/conversations/${message.conversationId}/steer`, { method: "POST", body: JSON.stringify({ botId: block.botId, requestId: message.clientMsgId, targetId: block.targetId, text: blocksText(message.blocks), mode: "message" }), signal: timeoutSignal(15_000) }));
@@ -68,10 +68,10 @@ export function NativeInputReceipt({ block, message, connection }: { block: Extr
   };
   return <div className={`steering-receipt native-input-receipt ${block.outcome}`} role="status" data-input-state={state ?? block.outcome}>
     {busy ? <LoaderCircle size={13} className="spin"/> : state === "received" ? <Check size={13}/> : <Clock3 size={13}/>}<span>{label}</span>
-    {pending && (block.outcome === "pending" || block.outcome === "unknown") && <button disabled={busy} onClick={() => void check()}>{t("核对消息回执")}</button>}
-    {pending && canControl && context.capability?.sendNow && <button disabled={busy} onClick={() => void control("send-now")}>{t("立即发送")}</button>}
-    {pending && canControl && context.capability?.cancel && context.editable && <button disabled={busy} onClick={() => void control("cancel")}>{t("撤回编辑")}</button>}
-    {state === "cancelled" && ownsMessage && context.editable && <button disabled={busy} onClick={() => context.restore?.(message)}>{t("编辑已撤回内容")}</button>}
+    {pending && (block.outcome === "pending" || block.outcome === "unknown") && <button disabled={busy || !!message.historyContext} onClick={() => void check()}>{t("核对消息回执")}</button>}
+    {pending && canControl && context.capability?.sendNow && <button disabled={busy || !!message.historyContext} onClick={() => void control("send-now")}>{t("立即发送")}</button>}
+    {pending && canControl && context.capability?.cancel && context.editable && <button disabled={busy || !!message.historyContext} onClick={() => void control("cancel")}>{t("撤回编辑")}</button>}
+    {state === "cancelled" && ownsMessage && context.editable && <button disabled={busy || !!message.historyContext} onClick={() => context.restore?.(message)}>{t("编辑已撤回内容")}</button>}
     {sendNowRequested && state === "queued" && <span>{t("已请求立即发送。")}</span>}
     {notice && (!noticePendingOnly || pending) && notice !== label && <span>{notice}</span>}
   </div>;

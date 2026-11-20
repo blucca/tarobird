@@ -1,4 +1,5 @@
 import { wholeFilePatch } from "../core/recorded-diff.js";
+import { KimiHistoryError, KimiHistoryReplay, kimiHistoryRejection } from "./kimi-history.js";
 import { isLogicalSessionId as isHostLogicalSessionId } from "../runtime/logical-session.js";
 import { withFileMutex } from "../state/file-mutex.js";
 import { raceAbort } from "../runtime/abort-race.js";
@@ -58,6 +59,9 @@ import type {
   EngineStreamEvent,
   ExternalSessionInfo,
   SideCapability,
+  NativeHistoryAnchor,
+  NativeHistoryResult,
+  NativeHistoryState,
 } from "./adapter.js";
 import {
   ENGINE_DEFAULT_INACTIVITY_TIMEOUT_MS,
@@ -307,6 +311,9 @@ type KimiBackgroundContinuationWaiter = {
 };
 
 type KimiWorker = {
+  initialized?: InitializeResponse;
+  configOptions?: SessionConfigOption[];
+  historySettingsUncertain?: boolean;
   child: KimiChildProcess;
   connection: ClientConnection;
   requestedSessionId: string;
@@ -347,6 +354,12 @@ type KimiWorker = {
 };
 
 type KimiSessionResult = NewSessionResponse | LoadSessionResponse;
+type KimiHistoryContext = {
+  connection: ClientConnection; workspace: string; assertCurrent: () => void;
+  worker?: KimiWorker;
+  call: <T>(request: () => Promise<T>) => Promise<T>;
+  pending: Set<Promise<unknown>>; drain: () => Promise<void>;
+};
 
 type KimiRuntimeOptions = {
   model?: string;
@@ -1859,6 +1872,12 @@ export class KimiAcpAdapter implements CodexAdapter {
   private destroyed = false;
   // Dispose callbacks of open side forks; destroy() deletes them too.
   private readonly sideSessions = new Set<() => Promise<void>>();
+  private readonly historySessions = new Set<string>();
+  private readonly historyReadDrains = new Map<string, Promise<void>>();
+  private readonly historyLifetime = new AbortController();
+  private readonly historyWorkers = new Set<KimiWorker>();
+  private readonly historyReaders = new Map<ClientConnection, KimiHistoryReplay>();
+  private readonly historyControls = new Map<() => void, Promise<void>>();
 
   constructor(
     private readonly kimiExecutable: string,
@@ -1939,6 +1958,174 @@ export class KimiAcpAdapter implements CodexAdapter {
 
   async createSession(chatId: number): Promise<CodexSessionHandle> {
     return { sessionId: `tarobot-${chatId}` };
+  }
+
+  hasPendingNativeWork(): boolean { return this.historySessions.size > 0 || this.historyControls.size > 0; }
+
+  async getHistoryState(sessionId: string, input: { workspaceOverride?: string; signal?: AbortSignal } = {}): Promise<NativeHistoryState> {
+    if (isLogicalSessionId(sessionId)) return { head: null, blocked: "not_ready" };
+    try {
+      return await this.withHistorySession(sessionId, input, async context => ({
+        head: await this.readHistoryReplay(context, sessionId), fork: { whole: true, anchored: false },
+      }), true);
+    } catch (error) {
+      const reason = kimiHistoryRejection(error);
+      return reason === "unsupported" ? { head: null } : { head: null, blocked: reason === "busy" || reason === "background_work" || reason === "source_missing" ? reason : "not_ready" };
+    }
+  }
+
+  async forkHistory(sessionId: string, input: { anchor?: NativeHistoryAnchor; expectedHead?: string | null; workspaceOverride?: string; signal?: AbortSignal } = {}): Promise<NativeHistoryResult> {
+    if (input.anchor) return { outcome: "rejected", reason: "unsupported" };
+    if (isLogicalSessionId(sessionId)) return { outcome: "rejected", reason: "not_ready" };
+    let submitted = false, candidateSessionId: string | undefined;
+    try {
+      return await this.withHistorySession(sessionId, input, async context => {
+        const head = await this.readHistoryReplay(context, sessionId);
+        if (input.expectedHead !== undefined && input.expectedHead !== head) throw new KimiHistoryError("source_changed");
+        context.assertCurrent(); input.signal?.throwIfAborted();
+        // There is no await between the last ownership check and this write.
+        submitted = true;
+        const fork = await context.call(() => context.connection.agent.request(acpMethods.agent.session.fork, { sessionId, cwd: context.workspace, mcpServers: [] }));
+        if (typeof fork.sessionId !== "string" || !fork.sessionId || fork.sessionId === sessionId) throw new Error("Kimi returned no distinct fork");
+        candidateSessionId = fork.sessionId;
+        // A list entry and a replayable identical context prove persistence;
+        // no prompt is sent, and the source worker is never rekeyed or killed.
+        await this.findHistorySession(context, candidateSessionId);
+        const forkHead = await this.readHistoryReplay(context, candidateSessionId);
+        await context.call(() => context.connection.agent.request(acpMethods.agent.session.close, { sessionId: candidateSessionId! }));
+        if (forkHead !== head) throw new Error("Kimi fork context did not match the source");
+        return { outcome: "applied", sessionId: candidateSessionId, head: forkHead, boundary: "whole" };
+      });
+    } catch (error) {
+      if (submitted) return { outcome: "unknown", ...(candidateSessionId ? { candidateSessionId } : {}) };
+      return { outcome: "rejected", reason: input.signal?.aborted ? "cancelled" : kimiHistoryRejection(error) };
+    }
+  }
+
+  private historyBusy(worker: KimiWorker): "busy" | "background_work" | undefined {
+    if (worker.historySettingsUncertain) return "busy";
+    if (worker.pendingTurn || worker.turnReservations > (this.historyWorkers.has(worker) ? 1 : 0)) return "busy";
+    if (worker.backgroundTasks.size || worker.backgroundContinuations.size || worker.detachedQuestions.size
+      || worker.detachedApprovalControllers.size || worker.activeHookTurn?.originKind === "task" || worker.terminals.size) return "background_work";
+    return undefined;
+  }
+
+  private async withHistorySession<T>(sessionId: string, input: { workspaceOverride?: string; signal?: AbortSignal }, operation: (context: KimiHistoryContext) => Promise<T>, readOnly = false): Promise<T> {
+    if (this.destroyed) throw new KimiHistoryError("not_ready");
+    if (input.signal?.aborted) throw new KimiHistoryError("cancelled");
+    if (this.historySessions.has(sessionId) || this.pendingWorkers.has(sessionId)) throw new KimiHistoryError("busy");
+    const worker = this.findWorkerForHook(sessionId);
+    if (worker) { const busy = this.historyBusy(worker); if (busy) throw new KimiHistoryError(busy); }
+    this.historySessions.add(sessionId);
+    let finishRead: (() => void) | undefined;
+    const readDrained = readOnly ? new Promise<void>(resolve => { finishRead = resolve; }) : undefined;
+    if (readDrained) this.historyReadDrains.set(sessionId, readDrained);
+    if (worker) { this.historyWorkers.add(worker); worker.turnReservations++; }
+    const pending = new Set<Promise<unknown>>();
+    let helperExit: Promise<void> | undefined;
+    const release = () => {
+      this.historySessions.delete(sessionId);
+      if (worker && this.historyWorkers.delete(worker)) worker.turnReservations--;
+      if (readDrained && this.historyReadDrains.get(sessionId) === readDrained) this.historyReadDrains.delete(sessionId);
+      finishRead?.();
+    };
+    const run = async (connection: ClientConnection, initialized: InitializeResponse, active: () => boolean): Promise<T> => {
+      const caps = initialized.agentCapabilities;
+      if (!caps?.loadSession || !caps.sessionCapabilities?.list || !caps.sessionCapabilities.fork || !caps.sessionCapabilities.close) throw new KimiHistoryError("unsupported");
+      const assertCurrent = () => {
+        if (this.destroyed || !active() || worker?.removed) throw new KimiHistoryError("not_ready");
+        if (worker) { const busy = this.historyBusy(worker); if (busy) throw new KimiHistoryError(busy); }
+      };
+      const call = async <R>(request: () => Promise<R>): Promise<R> => {
+        assertCurrent();
+        const native = worker ? Promise.race([request(), worker.failurePromise]) : request();
+        pending.add(native); void native.finally(() => pending.delete(native)).catch(() => undefined);
+        return withTimeout(native, this.initializeTimeoutMs, "Kimi history request timed out");
+      };
+      const context: KimiHistoryContext = { connection, worker, workspace: path.resolve(input.workspaceOverride ?? worker?.workspacePath ?? this.workspacePath), call, assertCurrent, pending,
+        drain: worker ? () => this.drainKimiSessionUpdates(worker) : async () => undefined };
+      if (worker && input.workspaceOverride && !await this.sameHistoryWorkspace(context.workspace, worker.workspacePath)) throw new KimiHistoryError("source_changed");
+      if (worker?.hookRelayActive && this.hookRelayRuntime) await withTimeout(this.hookRelayRuntime.drainAcceptedEvents(), HOOK_RELAY_DRAIN_TIMEOUT_MS, "Kimi history hook relay busy");
+      assertCurrent();
+      await this.findHistorySession(context, sessionId);
+      return operation(context);
+    };
+    try {
+      if (worker) {
+        if (!worker.initialized) throw new KimiHistoryError("not_ready");
+        return await run(worker.connection, worker.initialized, () => this.findWorkerForHook(sessionId) === worker);
+      }
+      return await this.withControlConnection((connection, initialized, active) => run(connection, initialized, active!), { history: true, workspacePath: input.workspaceOverride, onHistoryExit: exited => { helperExit = exited; } });
+    } finally {
+      // A timed-out live load can still replay later. Keep both its capture and
+      // reservation until native settles; never leak that replay into a turn.
+      if (worker && pending.size) void Promise.allSettled([...pending]).then(release);
+      else if (helperExit) void helperExit.then(release);
+      else release();
+    }
+  }
+
+  private async findHistorySession(context: KimiHistoryContext, sessionId: string): Promise<void> {
+    let cursor: string | null = null; const cursors = new Set<string>();
+    for (let page = 0; page < 100; page++) {
+      const list: ListSessionsResponse = await context.call(() => context.connection.agent.request(acpMethods.agent.session.list, { cwd: null, cursor }));
+      const source = list.sessions.find(session => session.sessionId === sessionId);
+      if (source) {
+        if (!await this.sameHistoryWorkspace(source.cwd, context.workspace)) throw new KimiHistoryError("source_changed");
+        return;
+      }
+      cursor = list.nextCursor ?? null; if (!cursor) throw new KimiHistoryError("source_missing");
+      if (cursors.has(cursor)) break; cursors.add(cursor);
+    }
+    throw new KimiHistoryError("not_ready");
+  }
+
+  private async readHistoryReplay(context: KimiHistoryContext, sessionId: string): Promise<string> {
+    const reader = new KimiHistoryReplay(sessionId); this.historyReaders.set(context.connection, reader);
+    const clear = () => { if (this.historyReaders.get(context.connection) === reader) this.historyReaders.delete(context.connection); };
+    try {
+      const source = context.worker?.currentSessionId === sessionId ? context.worker : undefined;
+      const saved = source?.configOptions;
+      if (source && !saved) throw new KimiHistoryError("not_ready");
+      // Kimi 2.7 reconstructs runtime preferences on load. Keep the complete
+      // acknowledged settings and MCP list, and restore before releasing the
+      // claim. The tracked promise includes late restoration after a timeout.
+      await context.call(async () => {
+        if (source) source.historySettingsUncertain = true;
+        const loaded = await context.connection.agent.request(acpMethods.agent.session.load, {
+          sessionId, cwd: context.workspace, mcpServers: source ? [...this.mcpServers] : [],
+        });
+        if (source && saved) {
+          let current = loaded.configOptions ?? [];
+          for (const wanted of saved) {
+            if (this.destroyed || source.removed) throw new KimiHistoryError("not_ready");
+            const option = current.find(option => option.id === wanted.id);
+            if (!option || option.type !== "select" || wanted.type !== "select"
+              || !configOptionValues(option).includes(wanted.currentValue)) throw new KimiHistoryError("not_ready");
+            if (option.currentValue !== wanted.currentValue) {
+              const result = await context.connection.agent.request(acpMethods.agent.session.setConfigOption, {
+                sessionId, configId: wanted.id, value: wanted.currentValue,
+              });
+              current = result.configOptions;
+            }
+          }
+          if (saved.some(wanted => !current.some(option => option.id === wanted.id && option.currentValue === wanted.currentValue))) throw new KimiHistoryError("not_ready");
+          source.configOptions = current;
+          source.historySettingsUncertain = false;
+        }
+      });
+      await context.drain(); context.assertCurrent();
+      return reader.digest();
+    } finally {
+      if (context.pending.size) void Promise.allSettled([...context.pending]).then(clear);
+      else clear();
+    }
+  }
+
+  private async sameHistoryWorkspace(left: string, right: string): Promise<boolean> {
+    const physical = (value: string) => realpath(path.resolve(value)).catch(() => path.resolve(value));
+    const [a, b] = await Promise.all([physical(left), physical(right)]);
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
   }
 
   async syncDefaultWorkspaceInstructions(bridgeInstructions: string | null): Promise<void> {
@@ -2034,10 +2221,30 @@ export class KimiAcpAdapter implements CodexAdapter {
     });
   }
 
+  private async waitForHistoryRead(sessionId: string, signal?: AbortSignal): Promise<void> {
+    // A timed-out read still owns its native replay and preference restoration.
+    // Preserve ordinary queued input until that exact read drains; mutations
+    // have no such gate and continue to fail closed through historySessions.
+    const lifetime = signal ? AbortSignal.any([signal, this.historyLifetime.signal]) : this.historyLifetime.signal;
+    lifetime.throwIfAborted();
+    let drained: Promise<void> | undefined;
+    while ((drained = this.historyReadDrains.get(sessionId))) {
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => { lifetime.removeEventListener("abort", abort); reject(lifetime.reason); };
+        lifetime.addEventListener("abort", abort, { once: true });
+        void drained!.then(() => { lifetime.removeEventListener("abort", abort); resolve(); });
+        if (lifetime.aborted) abort();
+      });
+      lifetime.throwIfAborted();
+    }
+  }
+
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     if (this.destroyed) {
       throw new Error("Adapter destroyed");
     }
+    await this.waitForHistoryRead(sessionId, input.abortSignal);
+    if (this.historySessions.has(sessionId)) throw new KimiHistoryError("busy");
     const workspacePath = path.resolve(input.workspaceOverride ?? this.workspacePath);
     const agentInstructions = await this.loadInstructions();
     const instructions = combineInstructions(agentInstructions, input.instructions ?? null);
@@ -2056,7 +2263,7 @@ export class KimiAcpAdapter implements CodexAdapter {
         startupLock, async () => {
           input.abortSignal?.throwIfAborted();
           const preparedInstructions = await this.prepareInstructions(workspacePath, instructions);
-          const worker = await this.getOrCreateWorker(sessionId, workspacePath, runtimeOptions, preparedInstructions.settingsKey);
+          const worker = await this.getOrCreateWorker(sessionId, workspacePath, runtimeOptions, preparedInstructions.settingsKey, input.abortSignal);
           reservation.worker = worker;
           return { preparedInstructions, worker };
         }, { signal: input.abortSignal });
@@ -2222,11 +2429,15 @@ export class KimiAcpAdapter implements CodexAdapter {
     workspacePath: string,
     runtimeOptions: KimiRuntimeOptions,
     instructionSettingsKey = "",
+    signal?: AbortSignal,
   ): Promise<KimiWorker> {
+    await this.waitForHistoryRead(sessionId, signal);
+    if (this.historySessions.has(sessionId)) throw new KimiHistoryError("busy");
     const claim = (worker: KimiWorker): KimiWorker => { worker.turnReservations += 1; return worker; };
     const settingsKey = JSON.stringify({ runtimeOptions, instructionSettingsKey });
     const existing = this.workers.get(sessionId);
     if (existing) {
+      if (existing.historySettingsUncertain) throw new KimiHistoryError("not_ready");
       if (existing.workspacePath === workspacePath && existing.settingsKey === settingsKey) {
         existing.deferredSettingsKey = undefined;
         existing.deferredSettingsNotice = undefined;
@@ -2253,6 +2464,7 @@ export class KimiAcpAdapter implements CodexAdapter {
             workspacePath,
             runtimeOptions,
             instructionSettingsKey,
+            signal,
           );
         }
       }
@@ -2440,6 +2652,7 @@ export class KimiAcpAdapter implements CodexAdapter {
         `Kimi ACP initialize timed out after ${this.initializeTimeoutMs}ms`,
       );
       this.validateInitializeResponse(initialized);
+      worker.initialized = initialized;
 
       let sessionResult: KimiSessionResult;
       if (isLogicalSessionId(sessionId)) {
@@ -2473,7 +2686,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       if (!worker.currentSessionId) {
         throw new Error("Kimi ACP session/new returned no session id");
       }
-      await this.applySessionConfigOptions(worker, sessionResult.configOptions ?? [], runtimeOptions);
+      worker.configOptions = await this.applySessionConfigOptions(worker, sessionResult.configOptions ?? [], runtimeOptions);
       this.rekeyWorker(worker, worker.currentSessionId);
       return worker;
     } catch (error) {
@@ -2495,6 +2708,7 @@ export class KimiAcpAdapter implements CodexAdapter {
    * side conversation; an idle parent worker is released exactly as the idle
    * reaper would release it, and its next turn reloads the same session. */
   private async releaseIdleKimiParent(sessionId: string): Promise<void> {
+    if (this.historySessions.has(sessionId)) throw new Error("busy");
     if (this.pendingWorkers.has(sessionId)) throw new Error("busy");
     let worker = this.findWorkerForHook(sessionId);
     if (!worker) return;
@@ -2715,14 +2929,16 @@ export class KimiAcpAdapter implements CodexAdapter {
   }
 
   private async withControlConnection<T>(
-    operation: (connection: ClientConnection, initialized: InitializeResponse) => Promise<T>,
+    operation: (connection: ClientConnection, initialized: InitializeResponse, active?: () => boolean) => Promise<T>,
+    options: { history?: boolean; workspacePath?: string; onHistoryExit?: (exited: Promise<void>) => void } = {},
   ): Promise<T> {
+    if (options.history && this.destroyed) throw new KimiHistoryError("not_ready");
     const invocation = buildCommandInvocation(this.kimiExecutable, ["acp"]);
     const child = this.spawnKimi(invocation.command, invocation.args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: invocation.shell,
       env: this.childEnv,
-      cwd: this.workspacePath,
+      cwd: options.workspacePath ?? this.workspacePath,
       windowsHide: true,
     });
     if (!child.stdin || !child.stdout || !child.stderr) {
@@ -2736,11 +2952,25 @@ export class KimiAcpAdapter implements CodexAdapter {
       rejectFailure = reject;
     });
     void failurePromise.catch(() => undefined);
+    let active = true;
+    let finishControl!: () => void, failControl!: (error: Error) => void;
+    const controlFinished = new Promise<void>((resolve, reject) => { finishControl = resolve; failControl = reject; });
+    void controlFinished.catch(() => undefined);
+    let markExited!: () => void;
+    const exited = new Promise<void>(resolve => { markExited = resolve; });
+    let termination: Promise<void> | undefined;
+    const terminate = () => termination ??= Promise.resolve().then(() => this.killProcessTreeFn(child.pid));
+    const stop = () => { active = false; rejectFailure(new Error("Kimi history control stopped")); void terminate().catch(() => undefined); };
+    // The caller keeps this source reserved if cleanup reaches its bound while
+    // the actual process is still alive. Requesting termination is not exit.
+    if (options.history) options.onHistoryExit?.(exited);
+    if (options.history) this.historyControls.set(stop, controlFinished);
     child.stderr.on("data", (chunk) => {
       stderrTail = `${stderrTail}${chunk.toString()}`.slice(-MAX_STDERR_TAIL_CHARS);
     });
     child.once("error", (error) => rejectFailure(error));
     child.once("close", (code, signal) => {
+      markExited();
       const suffix = signal ? ` (signal ${signal})` : "";
       rejectFailure(new Error(`Kimi ACP exited with code ${code}${suffix}`));
     });
@@ -2748,7 +2978,10 @@ export class KimiAcpAdapter implements CodexAdapter {
     const stream = createBoundedAcpStream(child.stdout, child.stdin, () => undefined);
     const connection = acpClient()
       .onRequest(acpMethods.client.session.requestPermission, async () => ({ outcome: { outcome: "cancelled" } }))
-      .onNotification(acpMethods.client.session.update, async () => undefined)
+      .onNotification(acpMethods.client.session.update, async ({ params }) => {
+        const reader = this.historyReaders.get(connection);
+        if (reader?.sessionId === params.sessionId) reader.add(params.update);
+      })
       .connect(stream);
     try {
       const initialized = await withTimeout(
@@ -2765,7 +2998,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       );
       this.validateInitializeResponse(initialized);
       return await withTimeout(
-        Promise.race([operation(connection, initialized), failurePromise]),
+        Promise.race([operation(connection, initialized, () => active), failurePromise]),
         this.initializeTimeoutMs,
         `Kimi ACP control request timed out after ${this.initializeTimeoutMs}ms`,
       );
@@ -2777,7 +3010,25 @@ export class KimiAcpAdapter implements CodexAdapter {
       }
       throw new Error(`${normalized.message}\n\nKimi stderr:\n${stderr}`);
     } finally {
-      this.killProcessTreeFn(child.pid);
+      active = false; this.historyReaders.delete(connection);
+      if (options.history) {
+        const stopped = Promise.all([exited, terminate()]);
+        // Keep the control visible until real exit, including after a bounded
+        // cleanup failure. A submitted fork then remains unknown to its caller.
+        void stopped.then(() => this.historyControls.delete(stop), () => { void exited.then(() => this.historyControls.delete(stop)); });
+        try {
+          await withTimeout(stopped, 10_000, "Kimi history helper did not exit");
+          finishControl();
+        } catch {
+          const error = new KimiHistoryError("not_ready");
+          failControl(error);
+          throw error;
+        }
+        if (this.destroyed) throw new KimiHistoryError("not_ready");
+      } else {
+        this.killProcessTreeFn(child.pid);
+        finishControl();
+      }
     }
   }
 
@@ -3007,7 +3258,7 @@ export class KimiAcpAdapter implements CodexAdapter {
     worker: Pick<KimiWorker, "connection" | "currentSessionId" | "failurePromise">,
     initialOptions: SessionConfigOption[],
     requested: KimiRuntimeOptions,
-  ): Promise<void> {
+  ): Promise<SessionConfigOption[]> {
     const sessionId = worker.currentSessionId;
     if (!sessionId) {
       throw new Error("Kimi ACP did not provide a session id before configuration");
@@ -3058,6 +3309,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       );
       options = response.configOptions;
     }
+    return options;
   }
 
   private validateInitializeResponse(response: InitializeResponse): void {
@@ -3202,6 +3454,11 @@ export class KimiAcpAdapter implements CodexAdapter {
   }
 
   private queueKimiSessionUpdate(worker: KimiWorker, notification: SessionNotification): Promise<void> {
+    const reader = this.historyReaders.get(worker.connection);
+    if (reader?.sessionId === notification.sessionId) { reader.add(notification.update); return Promise.resolve(); }
+    if (notification.sessionId === worker.currentSessionId && notification.update.sessionUpdate === "config_option_update") {
+      worker.configOptions = notification.update.configOptions;
+    }
     const delivery = worker.sessionUpdateChain.then(async () => {
       await this.handleSessionUpdate(worker, notification);
     });
@@ -5613,12 +5870,16 @@ export class KimiAcpAdapter implements CodexAdapter {
   destroy(): Promise<void> {
     if (!this.destroyPromise) {
       this.destroyed = true;
+      this.historyLifetime.abort(new Error("Adapter destroyed"));
       this.destroyPromise = this.destroyInternal();
     }
     return this.destroyPromise;
   }
 
   private async destroyInternal(): Promise<void> {
+    const controls = [...this.historyControls];
+    for (const [stop] of controls) stop();
+    const controlResults = await Promise.allSettled(controls.map(([, finished]) => finished));
     if (this.idleSweepTimer) {
       clearInterval(this.idleSweepTimer);
     }
@@ -5654,5 +5915,6 @@ export class KimiAcpAdapter implements CodexAdapter {
     }
     this.workers.clear();
     this.pendingWorkers.clear();
+    if (controlResults.some(result => result.status === "rejected")) throw new KimiHistoryError("not_ready");
   }
 }

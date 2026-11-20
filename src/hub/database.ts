@@ -50,7 +50,7 @@ export class HubDatabase {
       await result.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=8388608;");
       await result.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
       const version = await result.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'");
-      if (version && !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25"].includes(version.value)) throw new Error("unsupported_hub_schema_version");
+      if (version && !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26"].includes(version.value)) throw new Error("unsupported_hub_schema_version");
       await result.transaction(async () => {
         await result.exec(SCHEMA);
         if (version && Number(version.value) < 21) {
@@ -71,6 +71,7 @@ export class HubDatabase {
         if (!botColumns.some(c => c.name === "deleted_at")) await result.exec("ALTER TABLE bots ADD COLUMN deleted_at INTEGER");
         if (!botColumns.some(c => c.name === "role")) await result.exec("ALTER TABLE bots ADD COLUMN role TEXT NOT NULL DEFAULT ''");
         const messageColumns = await result.all<{ name: string }>("PRAGMA table_info(messages)");
+        if (!messageColumns.some(c => c.name === "history_json")) await result.exec("ALTER TABLE messages ADD COLUMN history_json TEXT");
         if (!messageColumns.some(c => c.name === "bot_source_json")) await result.exec("ALTER TABLE messages ADD COLUMN bot_source_json TEXT");
         if (!messageColumns.some(c => c.name === "discussion_json")) await result.exec("ALTER TABLE messages ADD COLUMN discussion_json TEXT");
         // Additive receipt survives context retirement and old writers, which
@@ -92,6 +93,7 @@ export class HubDatabase {
           WHERE author_type='user' AND status IN ('complete','error')
           AND preview_url IS NOT NULL AND preview_url!='' AND link_preview_json IS NULL`);
         const conversationColumns = await result.all<{ name: string }>("PRAGMA table_info(conversations)");
+        if (!conversationColumns.some(c => c.name === "history_origin_json")) await result.exec("ALTER TABLE conversations ADD COLUMN history_origin_json TEXT");
         if (!conversationColumns.some((c) => c.name === "parent_id")) await result.exec("ALTER TABLE conversations ADD COLUMN parent_id TEXT REFERENCES conversations(id)");
         if (!conversationColumns.some((c) => c.name === "binding_id")) await result.exec("ALTER TABLE conversations ADD COLUMN binding_id TEXT");
         if (!conversationColumns.some((c) => c.name === "hidden")) await result.exec("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0");
@@ -170,7 +172,8 @@ export class HubDatabase {
         // the ticket result and drop the parent's continuation.
         // 25: per-message pause must survive restarts. Older Hosts would ignore
         // this bit and dispatch held inputs, so downgrades need a state backup.
-        await result.run("INSERT OR REPLACE INTO meta VALUES('schema_version','25')");
+        // 26: native history operations keep durable admission fences that old Hosts must not ignore.
+        await result.run("INSERT OR REPLACE INTO meta VALUES('schema_version','26')");
       });
       return result;
     } catch (error) { await result.close().catch(() => undefined); throw error; }
@@ -263,6 +266,11 @@ CREATE TABLE IF NOT EXISTS pairing_requests (code_hash TEXT PRIMARY KEY, device_
 CREATE TABLE IF NOT EXISTS bots (id TEXT PRIMARY KEY, name TEXT NOT NULL, secret_hash TEXT NOT NULL, engine TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', effort TEXT NOT NULL DEFAULT '', online INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS managed_bots (bot_id TEXT PRIMARY KEY REFERENCES bots(id), owner_id TEXT NOT NULL REFERENCES users(id), request_id TEXT NOT NULL, specification_json TEXT NOT NULL, UNIQUE(owner_id,request_id));
 CREATE TABLE IF NOT EXISTS bot_grants (user_id TEXT NOT NULL REFERENCES users(id), bot_id TEXT NOT NULL REFERENCES bots(id), PRIMARY KEY(user_id,bot_id));
+CREATE TABLE IF NOT EXISTS history_operations (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, request_id TEXT NOT NULL, payload_hash TEXT NOT NULL, bot_id TEXT NOT NULL, source_conversation_id TEXT NOT NULL, expected_revision TEXT NOT NULL, action_json TEXT NOT NULL, anchor_json TEXT, destination_conversation_id TEXT, state TEXT NOT NULL, native_result_json TEXT, result_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(owner_id,request_id));
+CREATE INDEX IF NOT EXISTS history_operations_source ON history_operations(source_conversation_id,state);
+CREATE INDEX IF NOT EXISTS history_operations_destination ON history_operations(destination_conversation_id,state);
+CREATE TABLE IF NOT EXISTS history_anchors (id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, conversation_id TEXT NOT NULL, message_id TEXT NOT NULL, generation TEXT NOT NULL, revision TEXT NOT NULL, session_id TEXT NOT NULL, evidence_json TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE(bot_id,message_id,generation));
+CREATE INDEX IF NOT EXISTS history_anchors_page ON history_anchors(bot_id,conversation_id,id);
 CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, type TEXT NOT NULL CHECK(type IN ('direct','group')), title TEXT NOT NULL, owner_id TEXT NOT NULL REFERENCES users(id), session_id TEXT, archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, client_action_id TEXT, UNIQUE(owner_id,client_action_id));
 CREATE TABLE IF NOT EXISTS conversation_members (conversation_id TEXT NOT NULL REFERENCES conversations(id), member_type TEXT NOT NULL CHECK(member_type IN ('user','bot')), member_id TEXT NOT NULL, muted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(conversation_id,member_type,member_id));
 CREATE TABLE IF NOT EXISTS events (conversation_id TEXT NOT NULL REFERENCES conversations(id), seq INTEGER NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(conversation_id,seq));

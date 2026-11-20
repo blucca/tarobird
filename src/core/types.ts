@@ -105,6 +105,9 @@ export interface CoreRuntimeChannelLike extends CoreChannelLike {
 }
 
 export interface CoreBridgeLike {
+  getConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryScope): Promise<import("../client-protocol/conversation-history.js").HistoryInternalSnapshot>;
+  applyConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryApply): Promise<import("../client-protocol/conversation-history.js").HistoryNativeResult>;
+  finalizeConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryFinalize): Promise<{ revision: string }>;
   sideCapability?(input?: { workspaceOverride?: string; tools?: "inherited" }): import("../codex/adapter.js").SideCapability;
   openSideSession?(input: { chatId: number; userId: number; chatType: string; conversationKey: string; workspaceOverride?: string; tools?: "inherited"; locale?: "en" | "zh"; abortSignal?: AbortSignal }): Promise<import("../codex/adapter.js").EngineSideSession>;
   /** Shares the underlying engine/session state for an independently authenticated transport. */
@@ -138,6 +141,8 @@ export interface CoreBridgeLike {
     text: string;
     /** The owner's own typed text for this turn; see `CodexUserMessageInput.authoredText`. */
     authoredText?: string;
+    historyInputMessageId?: string;
+    onHistoryAnchor?: (evidence: Omit<import("../client-protocol/conversation-history.js").HistoryAnchorEvidence, "conversationId">) => Promise<void>;
     replyContext?: {
       messageId: string;
       text: string;

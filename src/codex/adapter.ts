@@ -9,7 +9,15 @@ export type { EngineTask, EngineTaskSnapshot, EngineTaskControlResult } from "..
 
 /** A terminal frame arrived without a complete answer. Never blindly replay tools. */
 export class EngineIncompleteResponseError extends Error {
-  constructor(message: string, readonly reason: "placeholder" | "interrupted" = "placeholder") { super(message); this.name = "EngineIncompleteResponseError"; }
+  constructor(message: string, readonly reason: "placeholder" | "interrupted" = "placeholder",
+    /** Set only from an engine's terminal request error, never tools or stderr. */
+    readonly requestRejection?: "invalid-argument",
+  ) { super(message); this.name = "EngineIncompleteResponseError"; }
+}
+
+/** A local native history mutation excludes ordinary input until it settles. */
+export class EngineHistoryBusyError extends Error {
+  constructor() { super("Native conversation history operation is still in progress"); this.name = "EngineHistoryBusyError"; }
 }
 
 /** A stop request was sent, but the engine did not confirm that work stopped. */
@@ -160,6 +168,74 @@ export interface CodexThreadGoalResponse {
   sessionId?: string;
 }
 
+/** Where a fork taken at an anchor ends: before that input, or after the turn it started. */
+export type NativeHistoryBoundary = "before-input" | "after-turn";
+
+/**
+ * A place in one native session's history, made by the adapter when the engine
+ * accepted a user input. It is never derived from text, time or position. The
+ * holder stores it whole and hands it back; only the adapter reads `data`.
+ */
+export interface NativeHistoryAnchor {
+  /** The native session this anchor belongs to. It is valid nowhere else. */
+  sessionId: string;
+  /** The engine's own id of that user input. A rewind names what it removed by these. */
+  inputId: string;
+  rewind: boolean;
+  fork: boolean;
+  /** Present when `fork` is true. */
+  forkBoundary?: NativeHistoryBoundary;
+  /** Engine-private location data. */
+  data?: Record<string, string | number | null>;
+}
+
+/** What one native session can do now, from the engine's own handshake and state. */
+export interface NativeHistoryState {
+  /** Absent: this session cannot be forked. */
+  fork?: { whole: boolean; anchored: boolean };
+  rewind?: boolean;
+  /** Changes whenever the native history changes. Null: there is no native session, or it cannot be read. */
+  head: string | null;
+  /** Why nothing can be done at the moment; a call made now is rejected with the same reason. */
+  blocked?: "busy" | "goal_active" | "background_work" | "not_ready" | "source_missing";
+}
+
+export type NativeHistoryRejection =
+  | "unsupported" | "busy" | "goal_active" | "background_work"
+  /** The chat has no native session yet, or the engine cannot be asked right now. Nothing was changed. */
+  | "not_ready"
+  /** The native session no longer exists. No replacement is created. */
+  | "source_missing"
+  /** `expectedHead` is not the native head. */
+  | "source_changed"
+  /** The anchor is not on this session's active history, or its turn has not ended. */
+  | "anchor_unavailable"
+  /** Cancelled before anything was sent to the engine. */
+  | "cancelled";
+
+/**
+ * `rejected`: the engine was not asked, or refused; native state is unchanged.
+ * `unknown`: the request reached the engine and no confirmed answer came back.
+ * An adapter never repeats a fork or a rewind by itself.
+ */
+export type NativeHistoryResult =
+  | {
+      outcome: "applied";
+      /** Fork: the new durable session. Rewind: the same session. */
+      sessionId: string;
+      head: string | null;
+      boundary: NativeHistoryBoundary | "whole";
+      /** Rewind only: the inputs no longer in context, oldest first. */
+      excludedInputIds?: string[];
+    }
+  | { outcome: "rejected"; reason: NativeHistoryRejection; detail?: string }
+  | {
+      outcome: "unknown";
+      detail?: string;
+      /** A fork id the engine returned without confirming it durable. Never bind it. */
+      candidateSessionId?: string;
+    };
+
 /** Actual lifetime of the adapter's two legacy allow decisions. Missing keys
  * mean the native request does not offer that decision. */
 export interface EngineApprovalScopes {
@@ -234,6 +310,11 @@ type UnscopedEngineStreamEvent =
   | {
       type: "session";
       sessionId?: string;
+    }
+  | {
+      /** The engine has accepted one foreground user input; its history can be cut here. */
+      type: "history_anchor";
+      anchor: NativeHistoryAnchor;
     }
   | {
       type: "assistant_text";
@@ -487,6 +568,26 @@ export interface CodexAdapter {
     abortSignal?: AbortSignal;
   }): Promise<CodexThreadGoalResponse>;
   clearThreadGoal?(sessionId: string, input?: { workspaceOverride?: string; origin?: "user" | "automatic"; isCurrentSession?: () => boolean | Promise<boolean> }): Promise<{ cleared: boolean; sessionId?: string }>;
+  /**
+   * Native history operations; an absent method means the engine has none.
+   * None of them starts a turn, a model call or a replacement session, and the
+   * source session's binding and live process are left as they were.
+   */
+  getHistoryState?(sessionId: string, input?: { workspaceOverride?: string; signal?: AbortSignal }): Promise<NativeHistoryState>;
+  /** Without an anchor the whole history is forked. */
+  forkHistory?(sessionId: string, input?: {
+    anchor?: NativeHistoryAnchor;
+    expectedHead?: string | null;
+    workspaceOverride?: string;
+    signal?: AbortSignal;
+  }): Promise<NativeHistoryResult>;
+  /** Removes the anchor's input and everything after it from context. Files are not restored. */
+  rewindHistory?(sessionId: string, input: {
+    anchor: NativeHistoryAnchor;
+    expectedHead?: string | null;
+    workspaceOverride?: string;
+    signal?: AbortSignal;
+  }): Promise<NativeHistoryResult>;
   /** Optional native side conversations; absent means unsupported. */
   sideCapability?(input?: { workspaceOverride?: string; tools?: "inherited" }): SideCapability;
   /** sourceSessionId must be the parent's real native ID (never a logical

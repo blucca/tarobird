@@ -8,6 +8,8 @@ import { ReferencePreview } from "./BotReferences.js";
 import { messageExcerpt } from "./MessageReference.js";
 import { prepareMessagePlainText } from "./message-plain-text.js";
 import { t, useLocale } from "./i18n.js";
+import { HistoryMessageMenu } from "./ConversationHistoryActions.js";
+import type { HistoryMessageActions } from "./conversation-history-state.js";
 
 // Phone messages open this sheet by holding the bubble or activating its row.
 // Desktop keeps its inline hover/focus bar (App.tsx).
@@ -22,6 +24,7 @@ export type MessageSheetActions = {
   select: () => void;
   delete: () => void;
   deletionAvailable: boolean;
+  history?: HistoryMessageActions;
 };
 
 /** `message` is the live copy looked up by ID; undefined once it has left this conversation. */
@@ -67,6 +70,7 @@ export function MessageActionSheet({ connection, message, meta, quoteBlocked, ca
         <button type="button" className={quoteBlocked ? "action-with-note" : undefined} aria-label={t("引用回复")} aria-describedby={quoteBlocked ? `${note}-quote` : undefined} disabled={quoteBlocked} onClick={(event) => actions.quote(event.currentTarget.closest("dialog"))}><MessageSquare size={20}/><span className="action-text"><span>{t("引用回复")}</span>{quoteBlocked && <small id={`${note}-quote`}>{t("对话已归档，恢复后可引用")}</small>}</span></button>
         <button type="button" className={forwardReady ? undefined : "action-with-note"} aria-label={t("转发消息")} aria-describedby={forwardReady ? undefined : `${note}-forward`} disabled={!forwardReady} onClick={actions.forward}><Forward size={20}/><span className="action-text"><span>{t("转发消息")}</span>{!forwardReady && <small id={`${note}-forward`}>{t("生成完成后可转发")}</small>}</span></button>
       </div>
+      <HistoryMessageMenu phone actions={actions.history} trigger={() => returnFocus.current}/>
       <div className="mobile-chat-action-list message-sheet-list">
         <button type="button" disabled={!actions.deletionAvailable} onClick={actions.select}><ListChecks size={20}/><span className="action-label">{t("多选消息")}</span></button>
         <button type="button" className="message-delete-action" disabled={!actions.deletionAvailable} onClick={actions.delete}><Trash2 size={20}/><span className="action-label">{t("删除消息")}</span></button>

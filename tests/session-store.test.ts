@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { removeTempRoot } from "./helpers/temp-files.js";
 
 import { JsonStore } from "../src/state/json-store.js";
+import { CURRENT_SCHEMA_VERSION } from "../src/state/schema-version.js";
 import { stableCoreNumericId } from "../src/core/message-normalizer.js";
 import { SESSION_STATE_UNREADABLE_WARNING, SessionStore } from "../src/state/session-store.js";
 import type { SessionRecord, SessionState } from "../src/types.js";
@@ -42,7 +43,7 @@ describe("JsonStore", () => {
 
       const onDisk = JSON.parse(await readFile(filePath, "utf8")) as typeof value & { schemaVersion?: number };
       expect(onDisk.chats).toEqual(value.chats);
-      expect(onDisk.schemaVersion).toBe(1);
+      expect(onDisk.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
       expect(await readFile(`${filePath}.tmp`, "utf8")).toBe("stale-temp-file");
 
       const readBack = await store.read({ chats: [] });
@@ -89,7 +90,7 @@ describe("JsonStore", () => {
       await store.write(readBack);
 
       const onDisk = JSON.parse(await readFile(filePath, "utf8")) as { schemaVersion?: number };
-      expect(onDisk.schemaVersion).toBe(1);
+      expect(onDisk.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     } finally {
       await removeTempRoot(tempDir);
     }

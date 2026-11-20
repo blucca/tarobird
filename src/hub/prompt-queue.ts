@@ -224,6 +224,7 @@ export class HubPromptQueue {
       }
       const messages: Message[] = [], events: HubEvent[] = busEvents;
       for (const [conversationId, all] of byConversation) {
+        if (await this.store.historyFencedInTransaction(conversationId)) continue;
         const entries = all.filter(row => !busInputs.has(row.message_id));
         if (!entries.length) continue;
         const conversation = await this.store.db.get<{ type: string; parent_id: string | null }>("SELECT type,parent_id FROM conversations WHERE id=?", [conversationId]);
@@ -254,7 +255,7 @@ export class HubPromptQueue {
    * A lost response stays fenced and is recovered by ordinary delivery replay. */
   async take(botId: string, conversationId: string, active: () => boolean, botMessages = true): Promise<Message | undefined> {
     const result = await this.store.db.transaction(async () => {
-      if (!active()) return;
+      if (!active() || await this.store.historyFencedInTransaction(conversationId)) return;
       await this.store.requireBot(botId, conversationId);
       const conversation = await this.store.db.get<{ type: string; parent_id: string | null }>("SELECT type,parent_id FROM conversations WHERE id=?", [conversationId]);
       const members = await this.store.db.get<{ count: number }>("SELECT COUNT(*) AS count FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [conversationId]);

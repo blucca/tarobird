@@ -62,6 +62,8 @@ export interface CoreNormalizedAttachment {
 }
 
 export interface CoreNormalizedBridgeMessage {
+  /** Internal merge marker: no one-to-one native/App message boundary remains. */
+  historyInputMerged?: boolean;
   reviewAdmission?: "native";
   nativeInput?: import("../client-protocol/native-input.js").NativeInputObserver;
   botSource?: import("../client-protocol/bot-messages.js").BotSource;

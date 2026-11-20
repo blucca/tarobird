@@ -28,6 +28,10 @@ export const SessionRecordSchema = z.object({
   updatedAt: IsoTimestampSchema,
   resume: ResumeStateSchema.nullable().optional(),
   suspendedPrevious: SuspendedConversationStateSchema.optional(),
+  historyGeneration: z.string().uuid().optional(),
+  historyRevision: z.string().uuid().optional(),
+  historyFence: z.object({ operationId: z.string().min(1).max(128), sourceRevision: z.string().uuid() }).strict().optional(),
+  historyLastOperation: z.object({ operationId: z.string().min(1).max(128), signature: z.string().length(64), revision: z.string().uuid() }).strict().optional(),
 });
 
 export const SessionStateSchema = z.object({

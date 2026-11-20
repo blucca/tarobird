@@ -6,11 +6,15 @@ import os from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
+import { EngineHistoryBusyError } from "./adapter.js";
 import type {
   CodexAdapter,
   CodexAdapterResponse,
   CodexSessionHandle,
   CodexThreadGoalResponse,
+  NativeHistoryAnchor,
+  NativeHistoryResult,
+  NativeHistoryState,
   CodexUserMessageInput,
   EngineStreamEvent,
 } from "./adapter.js";
@@ -394,10 +398,10 @@ export class ProcessCodexAdapter implements CodexAdapter {
     return { sessionId: `tarobot-${chatId}` };
   }
 
-  private createGoalAppServerAdapter(workspaceOverride?: string): CodexAppServerAdapter {
-    const spawnForAppServer: AppServerSpawnCodex = (command, args, options) => (
+  private createGoalAppServerAdapter(workspaceOverride?: string, spawnOverride?: AppServerSpawnCodex): CodexAppServerAdapter {
+    const spawnForAppServer: AppServerSpawnCodex = spawnOverride ?? ((command, args, options) => (
       this.spawnCodex(command, args, options) as unknown as ReturnType<AppServerSpawnCodex>
-    );
+    ));
     return new CodexAppServerAdapter(
       this.codexExecutable,
       workspaceOverride ?? this.workspacePath ?? process.cwd(),
@@ -590,7 +594,146 @@ export class ProcessCodexAdapter implements CodexAdapter {
     }
   }
 
+  // ---- Native history -------------------------------------------------------
+  // `codex exec` has no history interface; the app-server has. A temporary
+  // app-server on the same Codex home reads and forks the thread, as it does
+  // for goals. This adapter never learns which turn an input became (exec does
+  // not say), so it emits no anchors and offers only a fork of the whole thread.
+
+  /** Turns this adapter has running in `codex exec`. The temporary app-server cannot see them. */
+  private runningTurns = 0;
+  private historyEpoch = 0;
+  private readonly historyOperations = new Set<{ kind: "read" | "fork"; stop: () => void; finished: Promise<void> }>();
+
+  hasPendingNativeWork(): boolean { return this.historyOperations.size > 0; }
+
+  /** Each temporary app-server belongs to one operation, not to future turns.
+   * Guard both spawn and writes: cancelling during asynchronous startup must
+   * not let an app-server start later and submit a history change. */
+  private async withHistoryAppServer<T>(kind: "read" | "fork", input: { workspaceOverride?: string; signal?: AbortSignal }, operation: (server: CodexAppServerAdapter, signal: AbortSignal) => Promise<T>): Promise<{
+    value?: T; failed: boolean; cancelled: boolean; submitted: boolean; cleanupFailed: boolean;
+  }> {
+    const lifetime = new AbortController();
+    const children: Promise<void>[] = [];
+    let server: CodexAppServerAdapter | undefined, active = true, submitted = false;
+    let finish!: () => void, fail!: (error: Error) => void;
+    const finished = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject; });
+    void finished.catch(() => undefined);
+    const stop = () => { lifetime.abort(new Error("Codex history operation cancelled")); server?.destroy(); };
+    const control = { kind, stop, finished };
+    this.historyOperations.add(control);
+    // Caller cancellation after a submitted mutation must not discard its
+    // answer. Owner shutdown still stops the helper and reports uncertainty.
+    const callerAbort = () => { if (!submitted) stop(); };
+    input.signal?.addEventListener("abort", callerAbort, { once: true });
+    if (input.signal?.aborted) callerAbort();
+    const guard = () => {
+      if (!active || lifetime.signal.aborted) throw new Error("Codex history operation cancelled");
+    };
+    const spawnHistory: AppServerSpawnCodex = (command, args, options) => {
+      guard();
+      const child = this.spawnCodex(command, args, options) as unknown as ReturnType<AppServerSpawnCodex>;
+      children.push(new Promise<void>(resolve => { child.once("close", () => resolve()); }));
+      const stdin = child.stdin;
+      return {
+        pid: child.pid, stdout: child.stdout, stderr: child.stderr,
+        kill: child.kill?.bind(child), once: child.once.bind(child),
+        ...(stdin ? { stdin: {
+          on: stdin.on?.bind(stdin), end: stdin.end?.bind(stdin),
+          write: (chunk: string, callback?: (error?: Error | null) => void) => {
+            guard();
+            for (const line of chunk.split("\n")) {
+              try { if (JSON.parse(line).method === "thread/fork") submitted = true; } catch { /* not a request */ }
+            }
+            return stdin.write(chunk, callback);
+          },
+        } } : {}),
+      };
+    };
+    let value: T | undefined, failed = false, cleanupFailed = false;
+    try {
+      guard();
+      server = this.createGoalAppServerAdapter(input.workspaceOverride, spawnHistory);
+      value = await operation(server, lifetime.signal);
+    } catch {
+      failed = true;
+    } finally {
+      active = false;
+      server?.destroy();
+      const closed = Promise.all(children);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([closed, new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("Codex history helper did not exit")), 10_000);
+          timer.unref?.();
+        })]);
+        this.historyOperations.delete(control); finish();
+      } catch {
+        cleanupFailed = true; fail(new Error("Codex history helper did not exit"));
+        // Keep native work visible until actual exit, even after a bounded
+        // cleanup error. No replacement helper or write is attempted.
+        void closed.then(() => this.historyOperations.delete(control));
+      } finally { if (timer) clearTimeout(timer); input.signal?.removeEventListener("abort", callerAbort); }
+    }
+    return { ...(value === undefined ? {} : { value }), failed, cancelled: lifetime.signal.aborted, submitted, cleanupFailed };
+  }
+
+  async getHistoryState(sessionId: string, input: { workspaceOverride?: string; signal?: AbortSignal } = {}): Promise<NativeHistoryState> {
+    if (this.runningTurns > 0 || this.historyOperations.size > 0) return { head: null, blocked: "busy" };
+    const result = await this.withHistoryAppServer("read", input, (server, signal) => server.getHistoryState(sessionId, { ...input, signal }));
+    if (result.failed || result.cancelled || result.cleanupFailed || !result.value) return { head: null, blocked: "not_ready" };
+    const state = result.value;
+    return { head: state.head, ...(state.fork ? { fork: { whole: state.fork.whole, anchored: false } } : {}), ...(state.blocked ? { blocked: state.blocked } : {}) };
+  }
+
+  async forkHistory(sessionId: string, input: {
+    anchor?: NativeHistoryAnchor; expectedHead?: string | null; workspaceOverride?: string; signal?: AbortSignal;
+  } = {}): Promise<NativeHistoryResult> {
+    if (input.anchor) return { outcome: "rejected", reason: "unsupported" };
+    if (input.signal?.aborted) return { outcome: "rejected", reason: "cancelled" };
+    if (this.runningTurns > 0 || this.historyOperations.size > 0) return { outcome: "rejected", reason: "busy" };
+    const result = await this.withHistoryAppServer("fork", input, (server, signal) => server.forkHistory(sessionId, { ...input, signal }));
+    if (result.failed || result.cancelled || result.cleanupFailed || !result.value) {
+      const candidate = result.value?.outcome === "applied" ? result.value.sessionId : result.value?.outcome === "unknown" ? result.value.candidateSessionId : undefined;
+      return result.submitted ? { outcome: "unknown", ...(candidate ? { candidateSessionId: candidate } : {}) }
+        : { outcome: "rejected", reason: input.signal?.aborted ? "cancelled" : "not_ready" };
+    }
+    return result.value;
+  }
+
+  /** Stop only the currently owned history helpers. Ordinary process turns and
+   * future operations keep their existing restartable lifecycle. */
+  async destroy(): Promise<void> {
+    this.historyEpoch++;
+    const active = [...this.historyOperations];
+    for (const control of active) control.stop();
+    const results = await Promise.allSettled(active.map(control => control.finished));
+    if (results.some(result => result.status === "rejected")) throw new Error("Codex history helper did not exit");
+  }
+
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
+    const epoch = this.historyEpoch;
+    while (this.historyOperations.size > 0) {
+      const active = [...this.historyOperations];
+      if (active.some(control => control.kind === "fork")) throw new EngineHistoryBusyError();
+      input.abortSignal?.throwIfAborted();
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => { input.abortSignal?.removeEventListener("abort", abort); reject(input.abortSignal?.reason); };
+        input.abortSignal?.addEventListener("abort", abort, { once: true });
+        void Promise.all(active.map(control => control.finished)).then(() => { input.abortSignal?.removeEventListener("abort", abort); resolve(); }, error => { input.abortSignal?.removeEventListener("abort", abort); reject(new EngineHistoryBusyError()); });
+        if (input.abortSignal?.aborted) abort();
+      });
+      if (epoch !== this.historyEpoch) throw new Error("Codex history operation cancelled");
+    }
+    this.runningTurns++;
+    try {
+      return await this.runUserMessage(sessionId, input);
+    } finally {
+      this.runningTurns--;
+    }
+  }
+
+  private async runUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     const instructions = combineInstructions(
       this.instructionsPath ? await this.loadInstructions() : null,
       input.instructions ?? null,

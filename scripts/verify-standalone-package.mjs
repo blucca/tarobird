@@ -14,11 +14,15 @@ await verifyHostLauncher(root);
 const requirePackage = createRequire(path.join(root, 'package.json'));
 const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 if (manifest.dependencies?.['@larksuiteoapi/node-sdk'] || manifest.scripts?.postinstall) throw new Error('Unexpected platform install dependency');
+if (manifest.dependencies?.['@anthropic-ai/claude-agent-sdk']) throw new Error('Claude history SDK must remain build-only');
+for (const name of ['@anthropic-ai/claude-agent-sdk', ...['darwin-arm64', 'darwin-x64', 'win32-arm64', 'win32-x64', 'linux-arm64', 'linux-x64', 'linux-arm64-musl', 'linux-x64-musl'].map(target => `@anthropic-ai/claude-agent-sdk-${target}`)]) {
+ if (await access(path.join(root, 'node_modules', name)).then(() => true, () => false)) throw new Error('Unexpected Claude SDK runtime dependency');
+}
 try { requirePackage.resolve('@larksuiteoapi/node-sdk'); throw new Error('SDK installed'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; }
 for (const relative of ['src/lark', 'adapters', 'dist/src/lark', 'dist/src/legacy-index.js', 'dist/src/telegram', 'dist/src/commands', 'dist/src/service.js', 'dist/src/runtime/telegram-out.js', 'dist/src/runtime/cron-executor.js', 'dist/src/runtime/cron-runtime.js', 'dist/src/tools/telegram-tool-executor.js', 'dist/src/tools/telegram-tool-registry.js', 'dist/src/tools/telegram-tool-types.js']) {
  if (await access(path.join(root, relative)).then(() => true, () => false)) throw new Error('Legacy transport packaged: '+relative);
 }
-const helpers = ['dist/src/codex/claude-permission-mcp-server.js', 'dist/src/codex/deepseek-app-plugin.js', 'dist/src/codex/pi-bridge-extension.js', 'dist/deepseek-harness-plugin/src/search-mcp-server.js', 'dist/relay-runtime.mjs', 'client/dist/index.html', 'client/dist/widget-sandbox.html'];
+const helpers = ['dist/src/codex/claude-permission-mcp-server.js', 'dist/src/codex/claude-history-native-helper.js', 'dist/src/codex/deepseek-app-plugin.js', 'dist/src/codex/pi-bridge-extension.js', 'dist/deepseek-harness-plugin/src/search-mcp-server.js', 'dist/relay-runtime.mjs', 'client/dist/index.html', 'client/dist/widget-sandbox.html', 'dist/licenses/claude-agent-sdk/LICENSE.md', 'dist/licenses/claude-agent-sdk/README.md', 'dist/licenses/claude-agent-sdk/component.json'];
 for (const relative of helpers) await access(path.join(root, relative));
 for (const relative of integrationAssets) await access(path.join(root, relative));
 const state = await mkdtemp(path.join(os.tmpdir(), 'tarobot-package-start-'));

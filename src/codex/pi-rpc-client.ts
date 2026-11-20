@@ -25,6 +25,12 @@ export interface PiRpcClientOptions {
   /** Attached before the first command, so dialogs an extension opens while Pi starts are seen too. */
   onExtensionUi?: (request: PiExtensionUiRequest, client: PiRpcClient) => void;
   onEvent?: (event: PiSessionEvent, client: PiRpcClient) => void;
+  /**
+   * Called as soon as the process exists, before it has answered anything. A
+   * caller that must wait for the process to be gone needs the handle even
+   * when startup then fails or is cancelled, in which case start() rejects.
+   */
+  onSpawned?: (client: PiRpcClient) => void;
   spawnFn?: PiSpawn;
   killProcessTreeFn?: (pid: number | undefined) => void | Promise<void>;
 }
@@ -166,6 +172,7 @@ export class PiRpcClient {
       throw new PiStartupError(`Pi could not be started: ${error instanceof Error ? error.message : String(error)}`, "spawn");
     }
     const client = new PiRpcClient(child, options.killProcessTreeFn ?? (pid => killProcessTree(pid)));
+    options.onSpawned?.(client);
     const { onExtensionUi, onEvent } = options;
     if (onExtensionUi) client.onExtensionUi(request => onExtensionUi(request, client));
     if (onEvent) client.onEvent(event => onEvent(event, client));

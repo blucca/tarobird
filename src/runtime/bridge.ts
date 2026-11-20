@@ -1,3 +1,4 @@
+import { EngineHistoryBusyError } from "../codex/adapter.js";
 import { piSessionCommands } from "../client-protocol/pi-commands.js";
 import type { NativeInputAction, NativeInputCapability, NativeInputControlResult, NativeInputObserver } from "../client-protocol/native-input.js";
 import type { ClaudeNativeGoalUpdate } from "../codex/claude-native-goal.js";
@@ -59,6 +60,8 @@ import type { TurnPoolLike, TurnPoolWaitEvent } from "./turn-pool.js";
 import type { EngineRetryReceipt } from "../codex/turn-retry.js";
 import { ENGINE_RECOVERY_CONTINUATION, EngineRecoveryUnconfirmedError, recoverEngineTurn } from "./engine-recovery.js";
 import { runToolAction } from "../client-protocol/run-tools.js";
+import { ConversationHistoryController, nativeHistoryAnchor, type ConversationHistoryScope, type ConversationHistoryApply, type ConversationHistoryFinalize, type HistorySessionManager, type NativeConversationHistoryAdapter } from "./conversation-history.js";
+import type { HistoryAnchorEvidence } from "../client-protocol/conversation-history.js";
 
 export interface AccessStoreLike {
   load(): Promise<{
@@ -80,11 +83,12 @@ export interface AccessStoreLike {
   }>;
 }
 
-export interface SessionManagerLike {
+export interface SessionManagerLike extends HistorySessionManager {
   getLockNamespace?(): Promise<string>;
   getOrCreateSession(scope: number | BridgeConversationScope): Promise<{ sessionId: string }>;
   getExistingSession?(scope: number | BridgeConversationScope): Promise<{ sessionId: string } | null>;
   bindSession(scope: number | BridgeConversationScope, sessionId: string): Promise<void>;
+  assertHistoryAvailable?(scope: number | BridgeConversationScope): Promise<void>;
 }
 
 export interface BridgeConversationScope {
@@ -111,6 +115,9 @@ export interface BridgeAuthorizedMessageInput {
   text: string;
   /** The owner's own typed text for this turn; see `CodexUserMessageInput.authoredText`. Never set for other sources. */
   authoredText?: string;
+  /** Only the first, unbatched direct owner input may acquire a native anchor. */
+  historyInputMessageId?: string;
+  onHistoryAnchor?: (evidence: Omit<HistoryAnchorEvidence, "conversationId">) => Promise<void>;
   replyContext?: {
     messageId: number | string;
     text: string;
@@ -211,6 +218,9 @@ export class Bridge {
   /** Native session -> the turn driving it in this process. Conversations bound
    * to one session share it. */
   private sessionTurnOwners = new Map<string, SessionTurnHold>();
+  private sideSessionReaders = new Map<string, number>();
+  private historyMutations = new Set<string>();
+  private readonly history: ConversationHistoryController;
 
   constructor(
     private readonly accessStore: AccessStoreLike,
@@ -232,6 +242,10 @@ export class Bridge {
     } = {},
   ) {
     this.supportsTurnScopedEnv = adapter.supportsTurnScopedEnv !== false;
+    this.history = new ConversationHistoryController(sessionManager, adapter as CodexAdapter & NativeConversationHistoryAdapter,
+      sessionId => (this.sideSessionReaders.get(sessionId) ?? 0) > 0 || !!this.sessionTurnOwner(sessionId),
+      sessionId => { if (this.historyMutations.has(sessionId) || (this.sideSessionReaders.get(sessionId) ?? 0) > 0) return undefined;
+        this.historyMutations.add(sessionId); return () => { this.historyMutations.delete(sessionId); }; });
   }
 
   async destroy(): Promise<void> {
@@ -250,8 +264,14 @@ export class Bridge {
     const surface = new Bridge(this.accessStore, this.sessionManager, this.adapter, this.options);
     surface.authenticatedSurface = true;
     surface.sessionTurnOwners = this.sessionTurnOwners;
+    surface.sideSessionReaders = this.sideSessionReaders;
+    surface.historyMutations = this.historyMutations;
     return surface;
   }
+
+  getConversationHistory(input: ConversationHistoryScope) { return this.history.get(input); }
+  applyConversationHistory(input: ConversationHistoryApply) { return this.history.apply(input); }
+  finalizeConversationHistory(input: ConversationHistoryFinalize) { return this.history.finalize(input); }
 
   async validateCodexThread(
     threadId: string,
@@ -467,6 +487,8 @@ export class Bridge {
     let nativeStartedAt: number | undefined;
     let boundSessionIdFromEvent: string | undefined;
     const pendingSessionBinds = new Map<string, Promise<void>>();
+    let historyObserverOpen = false, historyAttempt = 0;
+    const historyPublications = new Map<string, Promise<void>>();
     const ownership = this.sessionTurnOwnership(scopeLockId);
     const bindEngineSession = async (sessionId: string): Promise<void> => {
       if (sessionId === boundSessionIdFromEvent) {
@@ -492,7 +514,24 @@ export class Bridge {
     // A native engine can accept the provisional ID as its durable ID (Harness
     // does). Persist that confirmation too, otherwise the conversation stays
     // absent from session state, backups and runtime controls despite real turns.
-    const handleEngineEvent = async (event: EngineStreamEvent): Promise<void> => {
+    const handleEngineEvent = async (event: EngineStreamEvent, anchorAttempt?: number): Promise<void> => {
+      const anchor = historyObserverOpen && anchorAttempt === historyAttempt && !continuation && input.historyInputMessageId && input.onHistoryAnchor && !input.sessionIdOverride
+        ? nativeHistoryAnchor(event) : undefined;
+      if (anchor && this.sessionManager.getHistoryBinding && input.conversationKey) {
+        const key = JSON.stringify([anchor.sessionId, anchor.inputId]);
+        if (!historyPublications.has(key)) {
+          const publication = (async () => {
+            await bindEngineSession(anchor.sessionId);
+            const binding = await this.sessionManager.getHistoryBinding!({ chatId: input.chatId, conversationKey: input.conversationKey! });
+            if (binding?.record.codexSessionId !== anchor.sessionId || !binding.record.historyGeneration || !binding.record.historyRevision) return;
+            await input.onHistoryAnchor!({ messageId: input.historyInputMessageId!, sessionId: anchor.sessionId,
+              bindingGeneration: binding.record.historyGeneration, revision: binding.record.historyRevision, nativeAnchor: { ...anchor } });
+          })().catch(async () => { await this.recordError(new Error("history_anchor_not_recorded"), {}); });
+          historyPublications.set(key, publication);
+        }
+        await historyPublications.get(key);
+        return;
+      }
       if (event.type === "subagent_activity") {
         if (event.kind === "completed") unfinishedAgents.delete(event.agentId);
         else unfinishedAgents.add(event.agentId); // An interrupt request alone is not a terminal receipt.
@@ -544,6 +583,7 @@ export class Bridge {
           signal?.throwIfAborted();
           nativeStartedAt ??= performance.now();
           const botGuidance = this.options.botInstructionsPath ? botInstructionsGuidance(this.options.botInstructionsPath) : undefined;
+          const anchorAttempt = ++historyAttempt; historyObserverOpen = true;
           const adapterResponse = await this.adapter.sendUserMessage(nativeSessionId, {
             inputOwnerKey: scopeLockId,
             ...(input.reviewAdmission && !receipt && !continuation ? { reviewAdmission: input.reviewAdmission, nativeInput: input.nativeInput } : {}),
@@ -560,7 +600,7 @@ export class Bridge {
             ...(input.appPlatformTools ? { appPlatformTools: botGuidance ? withBotFileGuidance(input.appPlatformTools, botGuidance) : input.appPlatformTools } : {}),
             onProgress: input.onProgress,
             onApprovalRequest: input.onApprovalRequest,
-            onEngineEvent: handleEngineEvent,
+            onEngineEvent: event => handleEngineEvent(event, anchorAttempt),
             onNativeGoal: input.onNativeGoal,
             requestOutputDir: input.requestOutputDir,
             workspaceOverride: input.workspaceOverride,
@@ -569,6 +609,9 @@ export class Bridge {
             disableRuntimeTimeout: disableRuntimeTimeout || undefined,
             ...(continuation ? { engineRecoveryContinuation: true } : {}),
             ...(input.engineOverride ? { engineOverride: input.engineOverride } : {}),
+          }).finally(async () => {
+            if (anchorAttempt === historyAttempt) historyObserverOpen = false;
+            await Promise.all(historyPublications.values());
           });
 
           if (
@@ -786,6 +829,14 @@ export class Bridge {
     };
   }
 
+  private async historyAvailable(scope: BridgeConversationScope): Promise<boolean> {
+    try {
+      await this.sessionManager.assertHistoryAvailable?.(scope);
+      const session = await this.sessionManager.getExistingSession?.(scope);
+      return !session || !this.historyMutations.has(session.sessionId);
+    } catch { return false; }
+  }
+
   /**
    * Inject a follow-up message into the chat's currently running engine turn
    * (Codex app-server turn/steer or DeepSeek Harness session steer). Returns
@@ -796,11 +847,11 @@ export class Bridge {
    */
   supportsSteering(): boolean { return typeof this.adapter.steerActiveTurn === "function"; }
   async canStartQueuedTurn(input: { chatId: number; conversationKey: string }): Promise<boolean> {
-    if (!this.adapter.isSessionInputBlocked || !this.sessionManager.getExistingSession) return true;
-    const scope = this.conversationScope(input), session = await this.sessionManager.getExistingSession(scope);
-    if (!session) return true;
-    const current = await this.sessionManager.getExistingSession(scope);
-    return current?.sessionId === session.sessionId && !this.adapter.isSessionInputBlocked(session.sessionId);
+    const scope = this.conversationScope(input), session = await this.sessionManager.getExistingSession?.(scope);
+    if (!await this.historyAvailable(scope)) return false;
+    const current = await this.sessionManager.getExistingSession?.(scope);
+    if (current?.sessionId !== session?.sessionId) return false;
+    return !current || !this.historyMutations.has(current.sessionId) && !this.adapter.isSessionInputBlocked?.(current.sessionId);
   }
 
   async inFlightSendBehavior(input: { chatId: number; conversationKey: string }): Promise<"steer" | undefined> {
@@ -829,10 +880,11 @@ export class Bridge {
     if (!this.adapter.controlNativeInput || !this.sessionManager.getExistingSession) return { outcome: "rejected", reason: "unsupported" };
     const scope = this.conversationScope(input), mayUse = await this.sessionTurnAccess(scope);
     const session = await this.sessionManager.getExistingSession(scope);
-    if (!session || input.isCurrentSession && !await input.isCurrentSession()) return { outcome: "rejected", reason: "stale" };
+    if (!session || !await this.historyAvailable(scope)) return { outcome: "rejected", reason: "stale" };
+    if (input.isCurrentSession && !await input.isCurrentSession()) return { outcome: "rejected", reason: "stale" };
     const current = await this.sessionManager.getExistingSession(scope);
     if (current?.sessionId !== session.sessionId) return { outcome: "rejected", reason: "binding_changed" };
-    if (!mayUse(session.sessionId)) return { outcome: "rejected", reason: "stale" };
+    if (!mayUse(session.sessionId) || this.historyMutations.has(session.sessionId)) return { outcome: "rejected", reason: "stale" };
     return this.adapter.controlNativeInput(session.sessionId, { inputId: input.inputId, action: input.action });
   }
 
@@ -847,7 +899,7 @@ export class Bridge {
     const isCurrent = async () => {
       if (input.isCurrentSession && !await input.isCurrentSession()) return false;
       const current = await this.sessionManager.getExistingSession!(scope);
-      return current?.sessionId === session.sessionId && mayUse(session.sessionId) && live.isCurrent();
+      return current?.sessionId === session.sessionId && mayUse(session.sessionId) && !this.historyMutations.has(session.sessionId) && live.isCurrent();
     };
     if (!await isCurrent()) return { supported: true };
     try {
@@ -874,9 +926,10 @@ export class Bridge {
     const live = controls.getLiveSession(session.sessionId);
     if (!live || piSessionToken(input, session.sessionId, live) !== input.expectedSession) return { outcome: "rejected", reason: "stale" };
     const isCurrent = async () => {
+      if (!await this.historyAvailable(scope)) return false;
       if (input.isCurrentSession && !await input.isCurrentSession()) return false;
       const current = await this.sessionManager.getExistingSession!(scope);
-      return current?.sessionId === session.sessionId && mayUse(session.sessionId) && live.isCurrent();
+      return current?.sessionId === session.sessionId && mayUse(session.sessionId) && !this.historyMutations.has(session.sessionId) && live.isCurrent();
     };
     if (!await isCurrent()) return { outcome: "rejected", reason: "stale" };
     const model = input.action === "model" && input.value !== null ? decodePiModel(input.value) : null;
@@ -925,14 +978,26 @@ export class Bridge {
   async openSideSession(input: { chatId: number; userId: number; chatType: string; conversationKey: string; workspaceOverride?: string; tools?: "inherited"; locale?: "en" | "zh"; abortSignal?: AbortSignal }): Promise<import("../codex/adapter.js").EngineSideSession> {
     if (!this.adapter.openSideSession || !this.sessionManager.getExistingSession) throw new Error("unsupported");
     if ((await this.checkAccess(input)).kind !== "allow") throw new Error("unsupported");
-    const session = await this.sessionManager.getExistingSession(this.conversationScope(input));
+    const scope = this.conversationScope(input);
+    const session = await this.sessionManager.getExistingSession(scope);
     if (!session || /^(tarobot|telegram)-/.test(session.sessionId)) throw new Error("no_main_session");
     input.abortSignal?.throwIfAborted();
-    const side = await this.adapter.openSideSession({ sourceSessionId: session.sessionId, workspaceOverride: input.workspaceOverride, ...(input.tools ? { tools: input.tools } : {}), locale: input.locale, abortSignal: input.abortSignal });
-    if (input.abortSignal?.aborted) { await side.dispose(); input.abortSignal.throwIfAborted(); }
+    if (this.historyMutations.has(session.sessionId)) throw new Error("history_outcome_pending");
+    this.sideSessionReaders.set(session.sessionId, (this.sideSessionReaders.get(session.sessionId) ?? 0) + 1);
+    let released = false;
+    const release = () => { if (released) return; released = true;
+      const left = (this.sideSessionReaders.get(session.sessionId) ?? 1) - 1;
+      if (left > 0) this.sideSessionReaders.set(session.sessionId, left); else this.sideSessionReaders.delete(session.sessionId); };
+    let side: import("../codex/adapter.js").EngineSideSession;
+    try {
+      await this.sessionManager.assertHistoryAvailable?.(scope);
+      if ((await this.sessionManager.getExistingSession(scope))?.sessionId !== session.sessionId) throw new Error("history_source_changed");
+      side = await this.adapter.openSideSession({ sourceSessionId: session.sessionId, workspaceOverride: input.workspaceOverride, ...(input.tools ? { tools: input.tools } : {}), locale: input.locale, abortSignal: input.abortSignal });
+      if (input.abortSignal?.aborted) { await side.dispose(); input.abortSignal.throwIfAborted(); }
+    } catch (error) { release(); throw error; }
     return {
       nativeId: side.nativeId,
-      dispose: () => side.dispose(),
+      dispose: async () => { try { await side.dispose(); } finally { release(); } },
       send: turn => {
         const guidance = this.options.botInstructionsPath ? botInstructionsGuidance(this.options.botInstructionsPath) : undefined;
         const current = guidance ? { ...turn,
@@ -949,9 +1014,10 @@ export class Bridge {
   async recoverSession(input: { chatId: number; conversationKey: string; token: string; isCurrentSession?: () => Promise<boolean> }): Promise<EngineTaskControlResult> {
     if (!this.adapter.recoverSession || !this.sessionManager.getExistingSession) return { outcome: "rejected", reason: "unsupported" };
     const scope = this.conversationScope(input), session = await this.sessionManager.getExistingSession(scope);
-    if (!session || input.isCurrentSession && !await input.isCurrentSession()) return { outcome: "rejected", reason: "stale" };
+    if (!session || !await this.historyAvailable(scope)) return { outcome: "rejected", reason: "stale" };
+    if (input.isCurrentSession && !await input.isCurrentSession()) return { outcome: "rejected", reason: "stale" };
     const current = await this.sessionManager.getExistingSession(scope);
-    if (current?.sessionId !== session.sessionId) return { outcome: "rejected", reason: "stale" };
+    if (current?.sessionId !== session.sessionId || this.historyMutations.has(session.sessionId)) return { outcome: "rejected", reason: "stale" };
     return this.adapter.recoverSession(session.sessionId, { token: input.token });
   }
 
@@ -968,12 +1034,15 @@ export class Bridge {
       if (input.throwOnError) throw new EngineSteeringRejectedError("unsupported");
       return false;
     }
-    const useConversationScope = input.conversationKey !== undefined || input.messageThreadId !== undefined;
-    const mayUse = await this.sessionTurnAccess(this.conversationScope(input));
-    const session = await this.sessionManager.getExistingSession(
-      useConversationScope ? this.conversationScope(input) : input.chatId,
-    );
-    if (!session || input.isCurrentTurn && !input.isCurrentTurn()) {
+    const scope = this.conversationScope(input), useConversationScope = input.conversationKey !== undefined || input.messageThreadId !== undefined;
+    const session = await this.sessionManager.getExistingSession(useConversationScope ? scope : input.chatId);
+    if (!session || !await this.historyAvailable(scope)) {
+      if (input.throwOnError) throw new EngineSteeringRejectedError("stale");
+      return false;
+    }
+    const mayUse = await this.sessionTurnAccess(scope);
+    const current = await this.sessionManager.getExistingSession(useConversationScope ? scope : input.chatId);
+    if (current?.sessionId !== session.sessionId || this.historyMutations.has(session.sessionId) || input.isCurrentTurn && !input.isCurrentTurn()) {
       if (input.throwOnError) throw new EngineSteeringRejectedError("stale");
       return false;
     }
@@ -1040,8 +1109,10 @@ export class Bridge {
 
   private goalSessionIsCurrent(scope: BridgeConversationScope, sessionId: string, external?: () => boolean | Promise<boolean>): () => Promise<boolean> {
     return async () => {
+      if (!await this.historyAvailable(scope)) return false;
       if (external && !await external()) return false;
-      return !this.sessionManager.getExistingSession || (await this.sessionManager.getExistingSession(scope))?.sessionId === sessionId;
+      const current = await this.sessionManager.getExistingSession?.(scope);
+      return (!this.sessionManager.getExistingSession || current?.sessionId === sessionId) && !this.historyMutations.has(sessionId);
     };
   }
 
@@ -1101,6 +1172,7 @@ export class Bridge {
     const scope = this.conversationScope(input);
     let pursuit!: Promise<{ goal: CodexThreadGoal | null; sessionId?: string }>;
     const start = async () => {
+      await this.sessionManager.assertHistoryAvailable?.(scope);
       input.abortSignal?.throwIfAborted();
       const session = input.mode && input.mode !== "replace"
         ? await this.sessionManager.getExistingSession?.(scope)
@@ -1120,6 +1192,7 @@ export class Bridge {
       const isCurrentSession = input.mode && input.mode !== "replace"
         ? this.goalSessionIsCurrent(scope, session.sessionId, input.isCurrentSession) : input.isCurrentSession;
       if (isCurrentSession && !await isCurrentSession()) throw new Error("Goal session binding changed");
+      if (this.historyMutations.has(session.sessionId)) throw new EngineHistoryBusyError();
       pursuit = this.adapter.watchThreadGoal!(session.sessionId, {
         ...(isCurrentSession ? { isCurrentSession } : {}),
         ...(input.mode ? { mode: input.mode } : {}),

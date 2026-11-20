@@ -227,6 +227,7 @@ export function applyCoreEngineEvent(
     case "native_input_wait":
     case "subagent_activity":
     case "session":
+    case "history_anchor":
       return state;
   }
 }

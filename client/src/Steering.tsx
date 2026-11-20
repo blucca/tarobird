@@ -17,10 +17,10 @@ function LegacySteeringReceipt({ block, message, connection }: { block: Extract<
   useLocale(); const [busy, setBusy] = useState(false), [error, setError] = useState("");
   const context = useContext(NativeInputContext);
   useEffect(() => {
-    if (connection.state.user?.id === message.authorId) settleSteeringRequest(connection, message, () => context.draftText?.(message.conversationId));
+    if (!message.historyContext && connection.state.user?.id === message.authorId) settleSteeringRequest(connection, message, () => context.draftText?.(message.conversationId));
   }, [connection, message, context]);
   const check = async () => {
-    if (busy || !message.clientMsgId) return;
+    if (message.historyContext || busy || !message.clientMsgId) return;
     setBusy(true); setError("");
     try {
       const updated = messageSchema.parse(await connection.http(`/api/conversations/${message.conversationId}/steer`, { method: "POST", body: JSON.stringify({ botId: block.botId, requestId: message.clientMsgId, targetId: block.targetId, text: blocksText(message.blocks) }), signal: timeoutSignal(15_000) }));
@@ -34,7 +34,7 @@ function LegacySteeringReceipt({ block, message, connection }: { block: Extract<
   return <div className={`steering-receipt ${application?.status === "dropped" ? "rejected" : block.outcome}`} role="status">
     {block.outcome === "accepted" && application?.status !== "dropped" ? <Check size={13}/> : block.outcome === "pending" ? <LoaderCircle size={13} className="spin"/> : <Compass size={13}/>}
     <span>{label}</span>
-    {!application && (block.outcome === "unknown" || block.outcome === "pending") && <button disabled={busy} onClick={() => void check()}>{t("核对引导回执")}</button>}
+    {!application && (block.outcome === "unknown" || block.outcome === "pending") && <button disabled={busy || !!message.historyContext} onClick={() => void check()}>{t("核对引导回执")}</button>}
     {error && <span>{error}</span>}
   </div>;
 }

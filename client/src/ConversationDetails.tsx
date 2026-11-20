@@ -11,14 +11,16 @@ import { ConversationAvatarDialog } from "./ConversationAvatarDialog.js";
 import { useBotLabels } from "./BotReferences.js";
 import { ConversationDetailsFrame } from "./ConversationDetailsFrame.js";
 import { t, useLocale } from "./i18n.js";
+import { ConversationHistoryOrigin } from "./ConversationHistoryDialog.js";
 
 type Destination = "manage" | "conversation-files" | "files" | "capabilities" | "operations" | "connection";
 /** Keep conversation, shared Bot settings and host tools in distinct scopes. */
-export function ConversationDetails({ connection, conversation, group, bots, phone, hostName, connectionSummary, close, open, newChat, browseBot, returnFocus, suspended = false }: {
+export function ConversationDetails({ connection, conversation, group, bots, phone, hostName, connectionSummary, close, open, newChat, browseBot, returnFocus, suspended = false, historySource, openHistorySource }: {
   connection: HubConnection; conversation: Conversation; group?: Conversation; bots: Bot[]; phone: boolean;
   hostName: string; connectionSummary: string; close: () => void; open: (destination: Destination, botId?: string) => void;
   newChat: (botId: string) => void; returnFocus: RefObject<HTMLElement | null>; suspended?: boolean;
   browseBot?: (botId: string) => void;
+  historySource?: Conversation; openHistorySource?: (id: string) => void;
 }) {
   const scopeId = useId();
   useLocale(); const labels = useBotLabels();
@@ -42,6 +44,7 @@ export function ConversationDetails({ connection, conversation, group, bots, pho
       <ConversationAvatar conversation={conversation} size={44}/>
       <div><h3 title={conversation.title}>{conversation.title}</h3><p>{conversation.parentId ? (group ? t("{0} · 独立话题", group.title) : t("独立话题")) : group ? t("{0} 个 Bot", conversation.botIds.length) : t("{0} · 独立对话", labels.get(conversation.botIds[0]!) ?? bot?.name ?? "Bot")}</p></div>
     </div>
+    {conversation.historyOrigin && <ConversationHistoryOrigin details conversation={conversation} source={historySource} open={id => openHistorySource?.(id)}/>}
     <section className="details-section" aria-label={t("当前对话")}>
       <h4>{t("当前对话")}</h4>
       {conversation.type === "direct" && !conversation.parentId && <button ref={avatarTrigger} className="details-link" aria-label={t("设置{0}", t("对话头像"))} aria-describedby={`${scopeId}-avatar`} disabled={!canEditConversationAvatar(state, conversation)} onClick={() => setAvatarOpen(true)}><Camera size={20}/><span><strong>{t("设置{0}", t("对话头像"))}</strong><small id={`${scopeId}-avatar`}>{avatarHint}</small></span><ChevronRight size={16}/></button>}

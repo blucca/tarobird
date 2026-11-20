@@ -1,3 +1,5 @@
+import { HubConversationHistory } from "./conversation-history.js";
+import { CONVERSATION_HISTORY_CAPABILITY, historyChangeSchema } from "../client-protocol/conversation-history.js";
 import { DesignShareBroker, metaDesignShareRepository, type DesignSharePeer } from "./workbench-design-sharing.js";
 import { DESIGN_SHARE_CLIENT_CAPABILITY } from "../client-protocol/workbench-design-sharing.js";
 import { HubRemoteScreen } from "./remote-screen.js";
@@ -138,7 +140,7 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
   const { workbench, ...rest } = metadata, { openTarget: _opener, ...context } = workbench;
   return (workbenchOpenerOnly(workbench) ? rest : { ...rest, workbench: context }) as T;
 }
-type BotConnection = { designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
+type BotConnection = { history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
 export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
@@ -164,6 +166,7 @@ export class HubServer {
   readonly agentBuses: HubAgentBuses;
   readonly dispatch: HubDispatch;
   readonly groupDiscussions: HubGroupDiscussions;
+  readonly conversationHistory: HubConversationHistory;
   private readonly networkAbort = new AbortController();
   private networkTick?: Promise<void>;
   private readonly networkSources = new Map<string, { remaining: number; updatedAt: number; until: number }>();
@@ -315,6 +318,12 @@ export class HubServer {
   private readonly conversationFolders: ConversationFolders;
   private readonly avatars: HubAvatars;
   private constructor(readonly store: HubStore, readonly auth: HubAuth, readonly attachments: HubAttachments, readonly options: HubServerOptions) {
+    this.conversationHistory = new HubConversationHistory(store, {
+      available: botId => { const worker = this.bots.get(botId); return !worker?.ready ? "offline" : worker.history ? "ready" : "unsupported"; },
+      busy: (botId, conversationId) => [...this.nativeTurns.values(), ...this.steersInFlight.values()].some(value => value.botId === botId && value.conversationId === conversationId),
+      call: (botId, method, input) => this.callBot(botId, method, input),
+      changed: async conversation => { for (const client of this.clients) if (client.session?.userId === conversation.ownerId) { client.conversationIds.add(conversation.id); this.publishClient(client, { v: 1, type: "conversation.updated", conversation }); } },
+    });
     this.remoteScreen = new HubRemoteScreen(store, auth);
     this.screenSockets = new RemoteScreenSockets(this.remoteScreen);
     this.disposers.push(() => { this.remoteScreen.dispose(); this.screenSockets.dispose(); });
@@ -1252,16 +1261,17 @@ export class HubServer {
           botId = frame.botId; if (frame.capabilities?.includes(FRAGMENT_CAPABILITY)) this.fragmentSockets.add(ws); clearTimeout(timeout); this.bots.get(botId)?.ws.close(4000, "replaced");
           const queueAdvertised = frame.capabilities?.includes(PROMPT_QUEUE_CAPABILITY) ?? false;
           const queueCapable = queueAdvertised && supportsPromptQueueEngine(frame.engine);
-          const connection: BotConnection = { designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
+          const connection: BotConnection = { history: frame.capabilities?.includes(CONVERSATION_HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
           // Reserve socket ownership before awaiting SQLite. Concurrent hellos
           // must replace this exact socket, not both replace its predecessor.
           this.bots.set(botId, connection);
           const ownsConnection = () => active() && this.bots.get(botId!) === connection;
           if (!await new HubPromptQueue(this.store).registerWorker(botId, queueCapable, ownsConnection, frame) || !ownsConnection()) return;
           connection.ready = true;
-          this.send(ws, { v: 1, type: "instance.ready", capabilities: [PI_SESSION_CAPABILITY, WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY] });
+          this.send(ws, { v: 1, type: "instance.ready", capabilities: [CONVERSATION_HISTORY_CAPABILITY, PI_SESSION_CAPABILITY, WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY] });
           // Never await RPC results in this socket's frame chain: its result
           // frames are handled by that same chain after hello completes.
+          if (connection.history) this.trackTask(this.conversationHistory.recoverBot(botId).catch(() => this.options.onWarning?.("history_recovery_failed")));
           if (connection.agentBus) this.trackTask(this.replayAbandonedBusStops(connection).catch(() => this.options.onWarning?.("agent_bus_stop_replay_failed")));
           this.trackTask(this.groupDiscussions.settleBot(botId, true).catch(() => this.options.onWarning?.("group_discussion_settle_failed")));
           this.scheduleDispatch(botId); await this.broadcastBotStatus(botId); return;
@@ -1374,6 +1384,15 @@ export class HubServer {
   }
 
   private async instanceRequest(botId: string, method: string, params: unknown): Promise<unknown> {
+    if (method.startsWith("history.")) {
+      if (!this.bots.get(botId)?.history) throw new HubError("history_unsupported", 409);
+      if (method === "history.authorize") return this.conversationHistory.authorizeWorker(botId, params);
+      if (method === "history.anchor") { await this.conversationHistory.recordAnchor(botId, params); return null; }
+      if (method === "history.result") {
+        const operationId = await this.conversationHistory.acceptResult(botId, params);
+        this.trackTask(this.conversationHistory.finish(operationId)); return null;
+      }
+    }
     if (method === "pi.session.authorize") {
       const input = z.object({ conversationId: idSchema, userId: idSchema }).strict().parse(params);
       if (!this.bots.get(botId)?.piSession) return { allowed: false };
@@ -1829,6 +1848,29 @@ export class HubServer {
         await reply(200, result); return;
       }
       const steerRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/steer$/);
+      const historyRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/history(?:\/(anchors|operations)(?:\/([A-Za-z0-9_-]+)(\/reconcile)?)?)?$/);
+      if (historyRoute) {
+        const conversationId = historyRoute[1]!, part = historyRoute[2], requestId = historyRoute[3];
+        if (req.method === "POST" && part === "operations" && requestId && historyRoute[4]) {
+          const input = historyChangeSchema.parse(await this.jsonBody(req, 16384));
+          if (input.requestId !== requestId) throw new HubError("history_request_conflict", 409);
+          await reply(200, await this.conversationHistory.reconcile(userId, conversationId, input, validateInQueue)); return;
+        }
+        if (historyRoute[4]) throw new HubError("method_not_allowed", 405);
+        if (req.method === "POST" && part === "operations" && !requestId) {
+          const input = historyChangeSchema.parse(await this.jsonBody(req, 16384));
+          await reply(200, await this.conversationHistory.start(userId, conversationId, input, validateInQueue)); return;
+        }
+        if (req.method !== "GET") throw new HubError("method_not_allowed", 405);
+        const botId = idSchema.parse(url.searchParams.get("botId"));
+        if (!part) { await reply(200, await this.conversationHistory.snapshot(userId, botId, conversationId, validateInQueue)); return; }
+        if (part === "anchors" && !requestId) {
+          const query = { messageId: idSchema.optional().parse(url.searchParams.get("messageId") ?? undefined), cursor: idSchema.optional().parse(url.searchParams.get("cursor") ?? undefined) };
+          await reply(200, await this.conversationHistory.anchors(userId, botId, conversationId, query, validateInQueue)); return;
+        }
+        if (part === "operations" && requestId) { await reply(200, await this.conversationHistory.status(userId, botId, conversationId, requestId, validateInQueue)); return; }
+        throw new HubError("not_found", 404);
+      }
       const piSessionRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/pi-session$/);
       if (piSessionRoute && (req.method === "GET" || req.method === "POST")) {
         const conversationId = piSessionRoute[1]!;

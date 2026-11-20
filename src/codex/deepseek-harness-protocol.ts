@@ -368,6 +368,8 @@ export class DeepSeekHarnessProtocolClient {
     switch (method) {
       case "session.selectModel":
       case "session.cancel":
+      // `{ sessionId, atSeq? }` -> `{ sessionId }` of a new, independent session. Nothing here repeats it.
+      case "session.fork":
         args = { request: input };
         break;
       case "session.prompt": {

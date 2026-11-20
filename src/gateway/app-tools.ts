@@ -13,7 +13,7 @@ import { attachmentMime as artifactMime } from "../client-protocol/attachment-mi
 import { localAsrAgentInstruction, cloudAsrAgentInstruction } from "../core/agent-instructions.js";
 import { withChannelProfile } from "./platform-profile.js";
 import { preflightCoreDeliveryPath, resolveCoreDeliveryRoots } from "../core/delivery-preflight.js";
-import { JsonStore } from "../state/json-store.js";
+import { appToolRegistration } from "./app-tool-registration.js";
 import { APP_CAPABILITIES, appAgentInstructions, appCapabilityInstructions, appTurnInstructions, type AppInstructionOptions } from "./agent-instructions.js";
 import { GatewayArtifactUploadError, type GatewayChannel } from "./channel.js";
 import { GatewayReceipts } from "./receipts.js";
@@ -123,8 +123,7 @@ export function createAppPlatformTools(input: {
   const inTurn = AsyncLocalStorage.snapshot();
   const enabled = input.options?.widgetsEnabled ?? widgetsEnabled();
   const publications = input.deliveryCache ?? new Map<string, Promise<Json>>();
-  const registration = (id: string) => new JsonStore(path.join(input.stateDir, "app-tool-threads", `${hash(id)}.json`),
-    (value) => z.object({ toolVersion: z.string() }).nullable().parse(value));
+  const registration = (id: string) => appToolRegistration(input.stateDir, id);
   const versionFor = async (id: string) => (await registration(id).read(null).catch(() => null))?.toolVersion;
   const makeTools = (version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13, minimal = false): AppPlatformTools => {
     const batch = version !== 1;

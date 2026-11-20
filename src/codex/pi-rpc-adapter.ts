@@ -8,6 +8,7 @@ import {
   EngineIncompleteResponseError, EngineSteeringRejectedError,
   type AppPlatformTools, type CodexAdapter, type CodexAdapterResponse, type CodexSessionHandle, type CodexUserMessageInput,
   type EngineApprovalDecision, type EngineContextUsage, type EngineStreamEvent, type ExternalSessionInfo,
+  type NativeHistoryAnchor, type NativeHistoryRejection, type NativeHistoryResult, type NativeHistoryState,
 } from "./adapter.js";
 import { ENGINE_DEFAULT_INACTIVITY_TIMEOUT_MS, ENGINE_DEFAULT_TURN_TIMEOUT_MS } from "./engine-timeouts.js";
 import type { NativeSearchMcpPlanner } from "../runtime/native-search-mcp.js";
@@ -30,7 +31,7 @@ import {
 import { PiRpcClient, PiRpcCommandError, PiStartupError, queryPiCatalog, type PiLaunchSpec, type PiSpawn } from "./pi-rpc-client.js";
 import {
   PI_TUI_BUILTIN_COMMANDS, classifyPiError, isPiPlaceholderModel, parsePiSlashCommand, piClip, piDisplayText, samePiModel, sanitizePiErrorText, toPiModelRef,
-  type PiAssistantMessage, type PiExtensionUiRequest, type PiModel, type PiModelRef, type PiPromptDisposition, type PiSessionEvent, type PiSessionState,
+  type PiAssistantMessage, type PiExtensionUiRequest, type PiModel, type PiModelRef, type PiPromptDisposition, type PiSessionEntry, type PiSessionEvent, type PiSessionState,
 } from "./pi-rpc-protocol.js";
 import { piLabelAnswer, piLabelValue, piQuestionSelection, piQuestionText } from "./pi-question-identity.js";
 import { piManagedSearchServer, type PiManagedSearchServer } from "./pi-search-mcp.js";
@@ -199,6 +200,28 @@ const modelLabel = (ref: PiModelRef) => encodePiModel(ref.provider, ref.modelId)
  * expose (tool approvals, App tools, host instructions, project trust, tree
  * navigation, reload). Sessions are ordinary Pi session files.
  */
+/** Head of a Pi session that exists and has no entries on its current branch. */
+const PI_EMPTY_HISTORY_HEAD = "empty";
+
+function isPiUserEntry(entry: PiSessionEntry): boolean {
+  return entry.type === "message" && entry.message?.role === "user";
+}
+
+/** The entries from the root to `leafId`, oldest first. */
+function piActiveBranch(entries: PiSessionEntry[], leafId: string | null): PiSessionEntry[] {
+  const byId = new Map(entries.map(entry => [entry.id, entry]));
+  const branch: PiSessionEntry[] = [];
+  for (let cursor = leafId ? byId.get(leafId) : undefined, guard = 0; cursor && guard <= entries.length; guard++) {
+    branch.push(cursor);
+    cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+  }
+  return branch.reverse();
+}
+
+async function isExistingFile(file: string): Promise<boolean> {
+  try { return (await lstat(file)).isFile(); } catch { return false; }
+}
+
 export class PiRpcAdapter implements CodexAdapter {
   readonly bridgeInstructionMode = "generic-file-blocks" as const;
   readonly supportsTurnScopedEnv = false;
@@ -209,6 +232,13 @@ export class PiRpcAdapter implements CodexAdapter {
   private readonly store: PiSessionStore;
   private readonly workers = new Map<string, Worker>();
   private readonly starting = new Map<string, Promise<Worker>>();
+  /**
+   * Second processes making a fork, from before they are spawned until they
+   * have exited. They belong to no session of this adapter, so nothing else
+   * would wait for or end them. The key cancels one that is still starting.
+   */
+  private readonly historyHelpers = new Map<AbortController, Promise<unknown>>();
+  private readonly historyHelperClients = new Set<PiRpcClient>();
   private readonly subscribers = new Map<string, Set<(event: PiNativeEvent) => void>>();
   /** Session-scoped tool approvals. Memory only: a Host restart asks again. */
   private readonly grants = new Map<string, Set<string>>();
@@ -245,7 +275,7 @@ export class PiRpcAdapter implements CodexAdapter {
   }
 
   hasPendingNativeWork(): boolean {
-    if (this.starting.size) return true;
+    if (this.starting.size || this.historyHelpers.size) return true;
     for (const worker of this.workers.values()) if (!worker.closed && (worker.turn || worker.state.isStreaming || worker.state.isCompacting)) return true;
     return false;
   }
@@ -423,6 +453,179 @@ export class PiRpcAdapter implements CodexAdapter {
     return { sessionId, cwd: file.cwd, ...(file.name ? { title: file.name } : {}), updatedAt: file.updatedAt };
   }
 
+  // ---- Native history: fork ---------------------------------------------------
+  // Pi's `fork` and `clone` move the process that runs them to the new session.
+  // A fork that must leave its source alone is therefore made by a second,
+  // short-lived Pi on the same session file. Rewinding is not offered: Pi keeps
+  // a move in its tree in memory until the next entry is written, so it would
+  // be lost whenever this process is replaced.
+  //
+  // No `history_anchor` is emitted. Pi's answer to `prompt` is a disposition
+  // only, and an input hook or an extension's own `sendUserMessage` can add a
+  // user entry before the prompt's: nothing Pi reports says which entry a
+  // given prompt became. Forking from a message stays with Pi's own `/fork`,
+  // where the owner picks from Pi's list.
+
+  /** The process to ask about a session's history. Never starts Pi for an id it has no file for: that would create the session. */
+  private async historySource(sessionId: string, workspaceOverride?: string): Promise<{ worker: Worker; cwd: string } | { blocked: "source_missing" | "not_ready"; detail?: string }> {
+    try {
+      this.assertUsable();
+      const cwd = await this.resolveWorkspace(workspaceOverride);
+      const live = this.workers.get(sessionId);
+      if (!live || live.closed) {
+        const file = await this.store.find(sessionId, cwd);
+        if (!file || !samePiWorkspace(file.cwd, cwd)) return { blocked: "source_missing" };
+      }
+      return { worker: await this.ensureWorker(sessionId, cwd), cwd };
+    } catch (error) {
+      return { blocked: "not_ready", detail: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  async getHistoryState(sessionId: string, input: { workspaceOverride?: string; signal?: AbortSignal } = {}): Promise<NativeHistoryState> {
+    const source = await this.historySource(sessionId, input.workspaceOverride);
+    if ("blocked" in source) return { head: null, blocked: source.blocked };
+    const { worker } = source;
+    if (worker.turn || worker.exclusive) return { head: null, blocked: "busy" };
+    try {
+      const state = await this.refreshState(worker);
+      const { entries, leafId } = await worker.client.request({ type: "get_entries" }, { timeoutMs: 30_000 });
+      const blocked = state.isStreaming || state.isCompacting || state.pendingMessageCount > 0 || worker.dialogs.size > 0 || worker.turn || worker.exclusive;
+      return {
+        fork: { whole: leafId !== null && entries.at(-1)?.id === leafId, anchored: false },
+        head: leafId ?? PI_EMPTY_HISTORY_HEAD, ...(blocked ? { blocked: "busy" as const } : {}),
+      };
+    } catch {
+      return { head: null, blocked: "not_ready" };
+    }
+  }
+
+  async forkHistory(sessionId: string, input: {
+    anchor?: NativeHistoryAnchor; expectedHead?: string | null; workspaceOverride?: string; signal?: AbortSignal;
+  } = {}): Promise<NativeHistoryResult> {
+    const rejected = (reason: NativeHistoryRejection, detail?: string): NativeHistoryResult => ({ outcome: "rejected", reason, ...(detail ? { detail } : {}) });
+    const anchor = input.anchor;
+    if (input.signal?.aborted) return rejected("cancelled");
+    if (anchor && !(anchor.fork && anchor.forkBoundary === "before-input")) return rejected("anchor_unavailable", "The anchor does not allow this operation");
+    if (anchor && anchor.sessionId !== sessionId) return rejected("anchor_unavailable", "The anchor belongs to another session");
+    const source = await this.historySource(sessionId, input.workspaceOverride);
+    if ("blocked" in source) return rejected(source.blocked, source.detail);
+    const { worker, cwd } = source;
+    // A turn that has not prompted yet does not make Pi busy, but it is about to.
+    if (worker.turn) return rejected("busy");
+    try {
+      // While this holds, no turn starts on the source: its file does not change under the second process.
+      return await this.exclusive(worker, "fork", async () => {
+        if (worker.dialogs.size > 0 || worker.state.pendingMessageCount > 0) return rejected("busy");
+        const { entries, leafId } = await worker.client.request({ type: "get_entries" }, { timeoutMs: 30_000 });
+        if (input.expectedHead !== undefined && input.expectedHead !== (leafId ?? PI_EMPTY_HISTORY_HEAD)) return rejected("source_changed");
+        if (anchor) {
+          // On the branch the owner is on now, not merely somewhere in the file.
+          const branch = piActiveBranch(entries, leafId), at = branch.findIndex(entry => entry.id === anchor.inputId && isPiUserEntry(entry));
+          if (at < 0) return rejected("anchor_unavailable", "The anchor is no longer on this session's current branch");
+          // Pi writes a session to disk only once it holds an assistant message: a fork from before the first answer would have no file.
+          if (!branch.slice(0, at).some(entry => entry.type === "message" && entry.message?.role === "assistant")) {
+            return rejected("anchor_unavailable", "There is nothing before this message to fork");
+          }
+        } else {
+          if (leafId === null) return rejected("not_ready", "There is no history to fork yet");
+          // The second process sees the position Pi has written, which is the file's last entry.
+          if (entries.at(-1)?.id !== leafId) return rejected("not_ready", "Pi has not saved this session's current position yet. Send a message first.");
+        }
+        const file = worker.state.sessionFile;
+        if (!file || !await isExistingFile(file)) return rejected("not_ready", "Pi has not saved this session yet");
+        if (input.signal?.aborted) return rejected("cancelled");
+        return await this.forkInSecondProcess(sessionId, file, cwd, anchor ? { type: "fork", entryId: anchor.inputId } : { type: "clone" }, leafId);
+      });
+    } catch (error) {
+      // Everything after the second process starts is returned, not thrown: nothing was asked of Pi here.
+      if (error instanceof PiNativeBusyError) return rejected("busy");
+      return rejected("not_ready", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private forkInSecondProcess(
+    sourceId: string, file: string, cwd: string, command: { type: "fork"; entryId: string } | { type: "clone" }, sourceLeaf: string | null,
+  ): Promise<NativeHistoryResult> {
+    const rejected = (reason: NativeHistoryRejection, detail?: string): NativeHistoryResult => ({ outcome: "rejected", reason, ...(detail ? { detail } : {}) });
+    const text = (error: unknown) => error instanceof Error ? error.message : String(error);
+    let helper: PiRpcClient | undefined;
+    const starting = new AbortController();
+    const run = async (): Promise<NativeHistoryResult> => {
+      try {
+        if (this.destroyed) return rejected("not_ready", "Pi adapter has been destroyed");
+        helper = await PiRpcClient.start({
+          launch: this.options.launch, cwd, signal: starting.signal,
+          // The handle from the moment the process exists: a startup that fails or is cancelled still leaves a process to wait for.
+          onSpawned: client => { helper = client; this.historyHelperClients.add(client); },
+          // No extensions: nothing of the owner's runs here, and nothing can open a dialog nobody would answer.
+          args: ["--session-dir", this.store.sessionDir, "--session", file, "--no-extensions"],
+          env: { ...this.options.childEnv },
+          onExtensionUi: (request, peer) => { if (isPiDialog(request)) peer.respondExtensionUi({ type: "extension_ui_response", id: request.id, cancelled: true }); },
+          ...(this.options.startupTimeoutMs ? { startupTimeoutMs: this.options.startupTimeoutMs } : {}),
+          ...(this.options.spawnFn ? { spawnFn: this.options.spawnFn } : {}),
+          ...(this.options.killProcessTreeFn ? { killProcessTreeFn: this.options.killProcessTreeFn } : {}),
+        });
+      } catch (error) {
+        return rejected("not_ready", text(error));
+      }
+      // Before the fork is asked for: any failure leaves Pi's sessions as they were.
+      try {
+        if (this.destroyed) return rejected("not_ready", "Pi adapter has been destroyed");
+        const opened = await helper.request({ type: "get_state" }, { timeoutMs: 15_000 });
+        if (opened.sessionId !== sourceId) return rejected("not_ready", "Pi opened a different session than the one to fork");
+        const seen = await helper.request({ type: "get_entries" }, { timeoutMs: 30_000 });
+        if (command.type === "clone" && seen.leafId !== sourceLeaf) return rejected("not_ready", "Pi has not saved this session's current position yet. Send a message first.");
+        if (command.type === "fork" && !seen.entries.some(entry => entry.id === command.entryId)) return rejected("anchor_unavailable", "Pi has not saved that message yet");
+        if (this.destroyed) return rejected("not_ready", "Pi adapter has been destroyed");
+      } catch (error) {
+        return rejected("not_ready", text(error));
+      }
+      // The fork itself. Only Pi's own answer to this one command is a refusal.
+      try {
+        const result = await helper.request(command, { timeoutMs: 60_000 });
+        if (result.cancelled) return rejected("not_ready", "Pi cancelled the fork");
+      } catch (error) {
+        if (error instanceof PiRpcCommandError) return rejected(/invalid entry id/i.test(error.message) ? "anchor_unavailable" : "not_ready", error.message);
+        return { outcome: "unknown", detail: text(error) };
+      }
+      // Pi has forked. From here a failure never means "nothing happened".
+      let forked: string | undefined;
+      try {
+        const state = await helper.request({ type: "get_state" }, { timeoutMs: 15_000 });
+        forked = state.sessionId;
+        if (!forked || forked === sourceId || !isSafePiSessionId(forked)) return { outcome: "unknown", detail: "Pi did not report a distinct, addressable session for the fork" };
+        // Pi writes a session file only once it holds an assistant message. An id without a file cannot be opened again.
+        if (!state.sessionFile || !await isExistingFile(state.sessionFile)) {
+          return { outcome: "unknown", detail: "Pi has not written the forked session to disk", candidateSessionId: forked };
+        }
+        let head: string | null = null;
+        try { head = (await helper.request({ type: "get_entries" }, { timeoutMs: 30_000 })).leafId ?? PI_EMPTY_HISTORY_HEAD; } catch { /* The fork is confirmed; only its head could not be read. */ }
+        // A retired adapter records nothing more. The new session exists in Pi; the caller is told so, not that it is theirs.
+        if (this.destroyed) return { outcome: "unknown", detail: "Pi adapter was destroyed while the fork was being recorded", candidateSessionId: forked };
+        await this.store.inheritRecord(sourceId, forked);
+        const forkedFile = path.resolve(state.sessionFile);
+        if (path.dirname(forkedFile) !== this.store.sessionDir) await this.store.updateRecord(forked, { externalPath: forkedFile });
+        return { outcome: "applied", sessionId: forked, head, boundary: command.type === "fork" ? "before-input" : "whole" };
+      } catch (error) {
+        return { outcome: "unknown", detail: text(error), ...(forked ? { candidateSessionId: forked } : {}) };
+      }
+    };
+    // run() has spawned the process by the time it first waits, and this line follows without a turn of the
+    // event loop: there is no moment at which the process exists and the adapter does not know of it.
+    const work: Promise<NativeHistoryResult> = run().finally(async () => {
+      if (helper) {
+        // Gone before this returns: the new session's file must not have a writer when it is next opened.
+        await helper.close({ graceMs: 2_000 }).catch(() => undefined);
+        await Promise.race([helper.exited, sleep(8_000)]);
+        this.historyHelperClients.delete(helper);
+      }
+      this.historyHelpers.delete(starting);
+    });
+    this.historyHelpers.set(starting, work);
+    return work;
+  }
+
   async listExternalSessions(input: { cwd?: string; limit?: number } = {}): Promise<ExternalSessionInfo[]> {
     this.assertUsable();
     const sessions = await this.store.list({ cwd: await this.resolveWorkspace(input.cwd), ...(input.limit ? { limit: input.limit } : {}) });
@@ -515,6 +718,11 @@ export class PiRpcAdapter implements CodexAdapter {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     // A start in flight sees `destroyed` and closes what it created; wait so no process outlives the adapter.
     await Promise.allSettled([...this.starting.values()]);
+    // A fork in a second process is cut short: its caller reports an unknown outcome and writes nothing more.
+    // One still starting is cancelled; one that started is ended the way a worker is.
+    for (const starting of this.historyHelpers.keys()) starting.abort(new Error("Pi adapter has been destroyed"));
+    await Promise.allSettled([...this.historyHelperClients].map(helper => helper.close({ graceMs: 3_000 })));
+    await Promise.allSettled([...this.historyHelpers.values()]);
     const workers = [...this.workers.values()];
     this.workers.clear();
     // Ending a process under a running turn is not that turn finishing: what it streamed so far is not an answer.

@@ -21,6 +21,10 @@ import type {
   EngineApprovalRequest,
   EngineSideSession,
   EngineStreamEvent,
+  NativeHistoryAnchor,
+  NativeHistoryRejection,
+  NativeHistoryResult,
+  NativeHistoryState,
   SideCapability,
 } from "./adapter.js";
 import { EngineContextCompactionPendingError } from "./adapter.js";
@@ -139,6 +143,39 @@ class ThreadReadTimeoutError extends CodexAppServerRequestTimeoutError {
     super(message, childGeneration);
     this.name = "ThreadReadTimeoutError";
   }
+}
+
+/** How the app-server says that it has neither this thread loaded nor a rollout for it. */
+const THREAD_GONE_PATTERN = /thread not found|no rollout found/i;
+
+/** The native thread an operation was addressed to no longer exists. */
+export class CodexThreadMissingError extends Error {
+  constructor(readonly threadId: string, detail: string) {
+    super(`Codex thread ${threadId} no longer exists: ${detail}`);
+    this.name = "CodexThreadMissingError";
+  }
+}
+
+const NO_CODEX_THREAD = "This chat has no Codex thread yet, so it has no goal";
+
+/** The app-server answered a request, and the answer was an error. Anything else that fails a request is not an answer. */
+class CodexAppServerReplyError extends Error {}
+
+/** Head of a thread that exists and has no turns. */
+const EMPTY_HISTORY_HEAD = "empty";
+const HISTORY_TURN_PAGE_SIZE = 100;
+const HISTORY_TURN_MAX_PAGES = 500;
+
+/** How an app-server says that it does not have a method at all. */
+const METHOD_MISSING_PATTERN = /unknown variant|method not found|unknown method/i;
+
+/** Why the app-server refused a fork or a revert, from its own words (codex-cli 0.170.0). */
+function historyRefusalReason(message: string): NativeHistoryRejection {
+  if (THREAD_GONE_PATTERN.test(message) || /thread not loaded/i.test(message)) return "source_missing";
+  if (/turn not found/i.test(message)) return "anchor_unavailable";
+  if (/in-progress turn/i.test(message)) return "busy";
+  if (METHOD_MISSING_PATTERN.test(message)) return "unsupported";
+  return "not_ready";
 }
 
 const CODEX_TRANSIENT_HTTP_ERROR_KINDS = new Set([
@@ -1048,9 +1085,11 @@ export class CodexAppServerAdapter implements CodexAdapter {
   }
 
   async getThreadGoal(sessionId: string, input: { workspaceOverride?: string } = {}): Promise<CodexThreadGoalResponse> {
+    // No native thread, no goal. A status query starts neither Codex nor a thread.
+    if (isLogicalTelegramSessionId(sessionId)) return { goal: null };
     const runtimeOptions = await this.loadRuntimeOptions();
     await this.ensureInitialized(runtimeOptions);
-    const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, input.workspaceOverride ?? this.cwd);
+    const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, input.workspaceOverride ?? this.cwd, undefined, "fail");
     await this.waitForGoalSetup(threadId);
     const watcher = this.goalWatchers.get(threadId);
     const revision = watcher?.revision;
@@ -1098,9 +1137,10 @@ export class CodexAppServerAdapter implements CodexAdapter {
     origin?: "user" | "automatic";
     isCurrentSession?: () => boolean | Promise<boolean>;
   }): Promise<CodexThreadGoalResponse> {
+    if (isLogicalTelegramSessionId(sessionId)) throw new Error(NO_CODEX_THREAD);
     const runtimeOptions = await this.loadRuntimeOptions();
     await this.ensureInitialized(runtimeOptions);
-    const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, input.workspaceOverride ?? this.cwd);
+    const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, input.workspaceOverride ?? this.cwd, undefined, "fail");
     this.assertNoCompaction(threadId);
     await this.waitForGoalSetup(threadId);
     await this.assertCurrentGoalSession(sessionId, threadId, input.isCurrentSession);
@@ -1146,10 +1186,13 @@ export class CodexAppServerAdapter implements CodexAdapter {
     abortSignal?: AbortSignal;
   }): Promise<CodexThreadGoalResponse> {
     input.abortSignal?.throwIfAborted();
+    // Only setting a new goal is setup and may start the thread it will live on.
+    const existingGoal = input.mode === "resume" || input.mode === "observe";
+    if (existingGoal && isLogicalTelegramSessionId(sessionId)) throw new Error(NO_CODEX_THREAD);
     const runtimeOptions = await this.loadRuntimeOptions();
     await this.ensureInitialized(runtimeOptions);
     input.abortSignal?.throwIfAborted();
-    const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, input.workspaceOverride ?? this.cwd);
+    const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, input.workspaceOverride ?? this.cwd, undefined, existingGoal ? "fail" : "start");
     await this.assertCurrentGoalSession(sessionId, threadId, input.isCurrentSession);
     input.abortSignal?.throwIfAborted();
     this.assertNoCompaction(threadId);
@@ -1329,9 +1372,10 @@ export class CodexAppServerAdapter implements CodexAdapter {
   }
 
   async clearThreadGoal(sessionId: string, input: { workspaceOverride?: string; origin?: "user" | "automatic"; isCurrentSession?: () => boolean | Promise<boolean> } = {}): Promise<{ cleared: boolean; sessionId?: string }> {
+    if (isLogicalTelegramSessionId(sessionId)) return { cleared: false };
     const runtimeOptions = await this.loadRuntimeOptions();
     await this.ensureInitialized(runtimeOptions);
-    const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, input.workspaceOverride ?? this.cwd);
+    const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, input.workspaceOverride ?? this.cwd, undefined, "fail");
     await this.waitForGoalSetup(threadId);
     await this.assertCurrentGoalSession(sessionId, threadId, input.isCurrentSession);
     const cleared = await this.clearResolvedThreadGoal(threadId, input.origin ?? "user");
@@ -1361,6 +1405,234 @@ export class CodexAppServerAdapter implements CodexAdapter {
       watcher.resolve(null);
     }
     return readClearedResponse(result);
+  }
+
+  // ---- Native history: fork and rewind --------------------------------------
+  // Observed on codex-cli 0.170.0: a persistent `thread/fork` keeps the source's
+  // turn ids, and `thread/revert` does not refuse a running turn, it interrupts
+  // it. Whether the source is idle is therefore decided here, next to the
+  // request, and never left to the app-server.
+
+  private emitHistoryAnchor(threadId: string, turnId: string, onEngineEvent?: (event: EngineStreamEvent) => void | Promise<void>): void {
+    if (!onEngineEvent) return;
+    const anchor: NativeHistoryAnchor = { sessionId: threadId, inputId: turnId, rewind: true, fork: true, forkBoundary: "after-turn" };
+    // An anchor is an offer. Losing one never fails the turn.
+    void Promise.resolve().then(() => onEngineEvent({ type: "history_anchor", anchor })).catch(() => undefined);
+  }
+
+  /** What this process itself has running on the thread. Synchronous: call it right before writing a request. */
+  private historyBlock(threadId: string): "busy" | "goal_active" | undefined {
+    if (this.goalWatchers.has(threadId)) return "goal_active";
+    return this.pendingTurns.has(threadId) || this.activeTurnEntries.has(threadId) || this.pendingCompactions.has(threadId)
+      || (this.unresolvedTurnStarts.get(threadId)?.size ?? 0) > 0 ? "busy" : undefined;
+  }
+
+  private async listHistoryTurns(threadId: string, signal?: AbortSignal): Promise<Array<{ id: string; status: string }>> {
+    const turns: Array<{ id: string; status: string }> = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < HISTORY_TURN_MAX_PAGES; page++) {
+      const result = await this.request("thread/turns/list", {
+        threadId, sortDirection: "asc", limit: HISTORY_TURN_PAGE_SIZE, ...(cursor ? { cursor } : {}),
+      }, { timeoutMs: this.threadReadTimeoutMs, ...(signal ? { signal } : {}) }) as { data?: unknown; nextCursor?: unknown } | null;
+      if (!Array.isArray(result?.data)) throw new Error("Invalid Codex thread/turns/list response");
+      for (const turn of result.data as Array<{ id?: unknown; status?: unknown } | null>) {
+        if (typeof turn?.id !== "string" || !turn.id || typeof turn.status !== "string") throw new Error("Invalid Codex thread/turns/list response");
+        turns.push({ id: turn.id, status: turn.status });
+      }
+      if (typeof result.nextCursor !== "string" || !result.nextCursor) return turns;
+      cursor = result.nextCursor;
+    }
+    throw new Error("Codex thread history is longer than can be listed");
+  }
+
+  /**
+   * A goal Codex would keep pursuing by itself. Only an app-server without a
+   * goal interface at all is known to have none. Any other failed read proves
+   * nothing about the goal, and the caller must not go on to change history.
+   */
+  private async hasActiveNativeGoal(threadId: string, signal?: AbortSignal): Promise<boolean> {
+    try {
+      return readGoalResponse(await this.request("thread/goal/get", { threadId }, signal ? { ...GOAL_RPC_REQUEST_OPTIONS, signal } : GOAL_RPC_REQUEST_OPTIONS)).goal?.status === "active";
+    } catch (error) {
+      if (error instanceof CodexAppServerReplyError && METHOD_MISSING_PATTERN.test(error.message)) return false;
+      throw error;
+    }
+  }
+
+  /** A failure before anything was changed: the thread is gone, the app-server is too old, or it could not be read. */
+  private historyUnreadable(error: unknown): { reason: "source_missing" | "unsupported" | "not_ready"; detail: string } {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (error instanceof CodexThreadMissingError) return { reason: "source_missing", detail };
+    const reason = error instanceof CodexAppServerReplyError ? historyRefusalReason(detail) : "not_ready";
+    return { reason: reason === "source_missing" || reason === "unsupported" ? reason : "not_ready", detail };
+  }
+
+  /** What a failed fork or revert request means. Only an answer from the app-server is a refusal. */
+  private historyRequestFailure(error: unknown): NativeHistoryResult {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (error instanceof CodexAppServerReplyError) return { outcome: "rejected", reason: historyRefusalReason(detail), detail };
+    // request() refuses with this before it writes anything.
+    if (detail === "codex app-server is not running") return { outcome: "rejected", reason: "not_ready", detail };
+    return { outcome: "unknown", detail };
+  }
+
+  /**
+   * The caller's `signal` gives up this read only: the two read requests stop
+   * waiting and nothing further is asked. The app-server is shared with turns
+   * and other reads, so it is never stopped for it, and a thread that is being
+   * loaded finishes loading.
+   */
+  async getHistoryState(sessionId: string, input: { workspaceOverride?: string; signal?: AbortSignal } = {}): Promise<NativeHistoryState> {
+    if (isLogicalTelegramSessionId(sessionId)) return { head: null, blocked: "not_ready" };
+    const { signal } = input;
+    if (signal?.aborted) return { head: null, blocked: "not_ready" };
+    try {
+      const runtimeOptions = await this.loadRuntimeOptions();
+      signal?.throwIfAborted();
+      await this.ensureInitialized(runtimeOptions);
+      signal?.throwIfAborted();
+      const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, input.workspaceOverride ?? this.cwd, undefined, "fail");
+      signal?.throwIfAborted();
+      const turns = await this.listHistoryTurns(threadId, signal);
+      const blocked = this.historyBlock(threadId)
+        ?? (turns.some(turn => turn.status === "inProgress") ? "busy" : await this.hasActiveNativeGoal(threadId, signal) ? "goal_active" : undefined);
+      return {
+        fork: { whole: turns.length > 0, anchored: true }, rewind: true,
+        head: turns.at(-1)?.id ?? EMPTY_HISTORY_HEAD, ...(blocked ? { blocked } : {}),
+      };
+    } catch (error) {
+      // What the read found is not reported to a caller that gave it up, whatever the abort reason was.
+      if (signal?.aborted) return { head: null, blocked: "not_ready" };
+      const { reason } = this.historyUnreadable(error);
+      // An app-server without `thread/turns/list` offers nothing; that is not a fault to report.
+      return reason === "unsupported" ? { head: null } : { head: null, blocked: reason };
+    }
+  }
+
+  async forkHistory(sessionId: string, input: {
+    anchor?: NativeHistoryAnchor; expectedHead?: string | null; workspaceOverride?: string; signal?: AbortSignal;
+  } = {}): Promise<NativeHistoryResult> {
+    return await this.changeHistory("fork", sessionId, input);
+  }
+
+  async rewindHistory(sessionId: string, input: {
+    anchor: NativeHistoryAnchor; expectedHead?: string | null; workspaceOverride?: string; signal?: AbortSignal;
+  }): Promise<NativeHistoryResult> {
+    return await this.changeHistory("rewind", sessionId, input);
+  }
+
+  private async changeHistory(kind: "fork" | "rewind", sessionId: string, input: {
+    anchor?: NativeHistoryAnchor; expectedHead?: string | null; workspaceOverride?: string; signal?: AbortSignal;
+  }): Promise<NativeHistoryResult> {
+    const rejected = (reason: NativeHistoryRejection, detail?: string): NativeHistoryResult => ({ outcome: "rejected", reason, ...(detail ? { detail } : {}) });
+    const anchor = input.anchor;
+    if (input.signal?.aborted) return rejected("cancelled");
+    if (isLogicalTelegramSessionId(sessionId)) return rejected("not_ready");
+    if (kind === "rewind" ? !anchor?.rewind : anchor && !(anchor.fork && anchor.forkBoundary === "after-turn")) {
+      return rejected("anchor_unavailable", "The anchor does not allow this operation");
+    }
+    if (anchor && anchor.sessionId !== sessionId) return rejected("anchor_unavailable", "The anchor belongs to another session");
+
+    const cwd = input.workspaceOverride ?? this.cwd;
+    let turns: Array<{ id: string; status: string }>;
+    let searchConfig: Record<string, unknown>;
+    try {
+      const runtimeOptions = await this.loadRuntimeOptions();
+      await this.ensureInitialized(runtimeOptions);
+      // Loads the thread and never replaces a missing one.
+      const threadId = await this.resolveThreadForMessageWithRetry(sessionId, runtimeOptions, cwd, undefined, "fail");
+      if (threadId !== sessionId) return rejected("source_changed", `Codex resumed ${threadId} instead of ${sessionId}`);
+      turns = await this.listHistoryTurns(sessionId);
+      if (await this.hasActiveNativeGoal(sessionId)) return rejected("goal_active");
+      searchConfig = kind === "fork" ? await this.managedSearchConfig(cwd) : {};
+    } catch (error) {
+      const { reason, detail } = this.historyUnreadable(error);
+      return rejected(reason, detail);
+    }
+    const head = turns.at(-1)?.id ?? EMPTY_HISTORY_HEAD;
+    if (input.expectedHead !== undefined && input.expectedHead !== head) return rejected("source_changed");
+    // The anchor must still be on the thread's own history: a revert or another client may have removed it.
+    const index = anchor ? turns.findIndex(turn => turn.id === anchor.inputId) : -1;
+    if (anchor && index < 0) return rejected("anchor_unavailable", "The anchor is no longer in this thread's history");
+    if (!anchor && turns.length === 0) return rejected("not_ready", "There is no history to fork yet");
+    if (turns.some(turn => turn.status === "inProgress")) return rejected("busy");
+    if (input.signal?.aborted) return rejected("cancelled");
+    // Nothing is awaited between this check and request(), which writes at once.
+    const blocked = this.historyBlock(sessionId);
+    if (blocked) return rejected(blocked);
+
+    if (kind === "fork") {
+      let result: { thread?: { id?: unknown; ephemeral?: unknown } } | null;
+      try {
+        // Never repeated and never cancelled once written: a fork that was asked for may exist.
+        result = (await this.request("thread/fork", {
+          threadId: sessionId,
+          ...(anchor ? { lastTurnId: anchor.inputId } : {}),
+          excludeTurns: true,
+          cwd,
+          ...(this.configPath ? { sandbox: this.currentApprovalMode === "bypass" ? "danger-full-access" : "workspace-write" } : {}),
+          ...(Object.keys(searchConfig).length > 0 ? { config: searchConfig } : {}),
+          approvalPolicy: "never",
+        }, {
+          timeoutMs: this.threadReadTimeoutMs,
+          timeoutMessage: `Codex app-server thread/fork timed out after ${Math.max(1, Math.round(this.threadReadTimeoutMs / 1000))} seconds`,
+        })) as typeof result;
+      } catch (error) {
+        return this.historyRequestFailure(error);
+      }
+      const forkId = typeof result?.thread?.id === "string" ? result.thread.id : "";
+      if (!forkId || forkId === sessionId) return { outcome: "unknown", detail: "Codex did not return a distinct thread id for the fork" };
+      if (result?.thread?.ephemeral !== false) {
+        return { outcome: "unknown", detail: "Codex did not confirm that the fork is persistent", candidateSessionId: forkId };
+      }
+      const expected = anchor ? anchor.inputId : head;
+      let forkHead: string | null = null;
+      try {
+        forkHead = (await this.listHistoryTurns(forkId)).at(-1)?.id ?? EMPTY_HISTORY_HEAD;
+      } catch {
+        // The fork itself is confirmed; only where it ends could not be read back.
+      }
+      if (forkHead !== null && forkHead !== expected) {
+        return { outcome: "unknown", detail: `The fork ends at ${forkHead}, not at ${expected}`, candidateSessionId: forkId };
+      }
+      // thread/fork returns the new thread loaded, with the settings a resume would apply.
+      this.loadedThreads.add(forkId);
+      return { outcome: "applied", sessionId: forkId, head: forkHead, boundary: anchor ? "after-turn" : "whole" };
+    }
+
+    const cut = anchor!.inputId;
+    let refusal: unknown;
+    try {
+      await this.request("thread/revert", { threadId: sessionId, beforeTurnId: cut }, {
+        timeoutMs: this.threadReadTimeoutMs,
+        timeoutMessage: `Codex app-server thread/revert timed out after ${Math.max(1, Math.round(this.threadReadTimeoutMs / 1000))} seconds`,
+      });
+    } catch (error) {
+      if (!(error instanceof CodexAppServerReplyError)) return this.historyRequestFailure(error);
+      refusal = error;
+    }
+    // The app-server answered. Report what the history is now, not what the answer implies.
+    let after: Array<{ id: string; status: string }>;
+    try {
+      after = await this.listHistoryTurns(sessionId);
+    } catch {
+      if (refusal) return this.historyRequestFailure(refusal);
+      this.threadContextUsage.delete(sessionId);
+      return {
+        outcome: "applied", sessionId, head: turns[index - 1]?.id ?? EMPTY_HISTORY_HEAD, boundary: "before-input",
+        excludedInputIds: turns.slice(index).map(turn => turn.id),
+      };
+    }
+    const remaining = new Set(after.map(turn => turn.id));
+    if (remaining.has(cut)) {
+      return refusal ? this.historyRequestFailure(refusal)
+        : { outcome: "unknown", detail: "Codex acknowledged the rewind, but the turn is still in the thread's history" };
+    }
+    this.threadContextUsage.delete(sessionId);
+    return {
+      outcome: "applied", sessionId, head: after.at(-1)?.id ?? EMPTY_HISTORY_HEAD, boundary: "before-input",
+      excludedInputIds: turns.filter(turn => !remaining.has(turn.id)).map(turn => turn.id),
+    };
   }
 
   async validateExternalSession(sessionId: string): Promise<void> {
@@ -1695,7 +1967,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
         status: parsed.error ? "error" : "ok",
       };
       if (parsed.error) {
-        pending.reject(new Error(parsed.error.message ?? "Unknown app-server error"));
+        pending.reject(new CodexAppServerReplyError(parsed.error.message ?? "Unknown app-server error"));
       } else {
         pending.resolve(parsed.result);
       }
@@ -3261,12 +3533,13 @@ export class CodexAppServerAdapter implements CodexAdapter {
     return resumedThreadId;
   }
 
-  private async resolveThreadForMessage(threadId: string, cwd: string = this.cwd, appTools?: AppPlatformTools): Promise<string> {
+  private async resolveThreadForMessage(threadId: string, cwd: string = this.cwd, appTools?: AppPlatformTools, whenGone: "start" | "fail" = "start"): Promise<string> {
     try {
       return await this.ensureThreadLoaded(threadId, cwd);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (/thread not found|no rollout found/i.test(message)) {
+      if (THREAD_GONE_PATTERN.test(message)) {
+        if (whenGone === "fail") throw new CodexThreadMissingError(threadId, message);
         return await this.startThread(cwd, appTools);
       }
 
@@ -3274,16 +3547,26 @@ export class CodexAppServerAdapter implements CodexAdapter {
     }
   }
 
+  /**
+   * `whenGone: "start"` is for a turn or for setting up a new goal: a missing
+   * thread is replaced and the caller publishes the new id. `"fail"` is for
+   * anything that reads or changes what already exists on the thread: it never
+   * starts one, because a thread started for a query is bound to nothing, stays
+   * in Codex's history, and answers as if the chat had no goal.
+   */
   private async resolveThreadForMessageWithRetry(
     sessionId: string,
     runtimeOptions: Awaited<ReturnType<CodexAppServerAdapter["loadRuntimeOptions"]>>,
     cwd: string = this.cwd,
     appTools?: AppPlatformTools,
+    whenGone: "start" | "fail" = "start",
   ): Promise<string> {
     return this.retryThreadReadAfterTimeout(
-      () => isLogicalTelegramSessionId(sessionId)
-        ? this.startThread(cwd, appTools)
-        : this.resolveThreadForMessage(sessionId, cwd, appTools),
+      async () => {
+        if (!isLogicalTelegramSessionId(sessionId)) return await this.resolveThreadForMessage(sessionId, cwd, appTools, whenGone);
+        if (whenGone === "fail") throw new Error(NO_CODEX_THREAD);
+        return await this.startThread(cwd, appTools);
+      },
       runtimeOptions,
     );
   }
@@ -3717,6 +4000,11 @@ export class CodexAppServerAdapter implements CodexAdapter {
           }
           this.interruptTurn(threadId, startedTurnId);
           this.flushUnidentifiedTurnLines(pendingTurn);
+        }
+        // Only this id-correlated answer proves which turn the input started.
+        // A side turn lives on an ephemeral thread and is no place in history.
+        if (startedTurnId && !side && this.isPendingTurnTracked(threadId, pendingTurn)) {
+          this.emitHistoryAnchor(threadId, startedTurnId, onEngineEvent);
         }
       }, (error) => {
         forgetStart();

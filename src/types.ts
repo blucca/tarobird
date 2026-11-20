@@ -56,6 +56,11 @@ export interface SessionRecord {
   updatedAt: string;
   resume?: SuspendedConversationState["resume"];
   suspendedPrevious?: SuspendedConversationState;
+  /** Initialized only when native history controls first inspect this binding. */
+  historyGeneration?: string;
+  historyRevision?: string;
+  historyFence?: { operationId: string; sourceRevision: string };
+  historyLastOperation?: { operationId: string; signature: string; revision: string };
 }
 
 export interface SessionState {

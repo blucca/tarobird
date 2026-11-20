@@ -44,6 +44,15 @@ function bridgeFixture() {
 }
 
 describe("Pi live session snapshots and mutation boundaries", () => {
+  it("rechecks native history ownership after the asynchronous external guard", async () => {
+    const f = bridgeFixture(), snapshot = await f.bridge.getPiSession(scope);
+    const mutations: Set<string> = Reflect.get(f.bridge, "historyMutations");
+    const result = await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: null,
+      isCurrentSession: async () => { mutations.add("native"); return true; } });
+    expect(result).toEqual({ outcome: "rejected", reason: "stale" });
+    expect(f.live.setModel).not.toHaveBeenCalled();
+  });
+
   it("exposes only current native command metadata without source paths or starting a worker", async () => {
     const f = bridgeFixture();
     const snapshot = await f.bridge.getPiSession(scope);

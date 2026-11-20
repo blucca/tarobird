@@ -170,3 +170,17 @@ describe("goal session establishment", () => {
     } finally { await removeTempRoot(f.root); }
   });
 });
+
+it("does not start or update a goal while a history mutation won the asynchronous guard", async () => {
+  const updateThreadGoal = vi.fn(), watchThreadGoal = vi.fn();
+  const f = await fixture({ updateThreadGoal, watchThreadGoal });
+  try {
+    await f.manager.bindSession(f.scope, "native");
+    const mutations: Set<string> = Reflect.get(f.bridge, "historyMutations");
+    const isCurrentSession = async () => { mutations.add("native"); return true; };
+    await expect(f.bridge.updateThreadGoal({ ...f.scope, status: "paused", isCurrentSession })).rejects.toThrow("Goal session binding changed");
+    expect(updateThreadGoal).not.toHaveBeenCalled(); mutations.clear();
+    await expect(f.bridge.watchThreadGoal({ ...f.goal, isCurrentSession })).rejects.toThrow("history operation");
+    expect(watchThreadGoal).not.toHaveBeenCalled();
+  } finally { await removeTempRoot(f.root); }
+});
