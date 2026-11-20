@@ -79,8 +79,10 @@
 
 .screen-resolution{white-space:nowrap;font-variant-numeric:tabular-nums}
 
-/* Native mobile viewing owns the available window, independently of chat width. */
-.remote-screen-panel.screen-mobile{position:fixed!important;z-index:1000;inset:0!important;width:100%!important;max-width:none!important;min-width:0!important;height:var(--shell-height,100dvh)!important;display:flex;flex-direction:column;margin:0;border:0;background:var(--bg);padding:var(--safe-area-inset-top,0px) var(--safe-area-inset-right,0px) var(--safe-area-inset-bottom,0px) var(--safe-area-inset-left,0px);box-sizing:border-box;transform:none}
+/* Native mobile viewing owns the available window, independently of chat width.
+   Safe insets use the shared tokens: env() on iOS (Capacitor injects no
+   --safe-area-inset-* there), zero on Android whose native view is already inset. */
+.remote-screen-panel.screen-mobile{position:fixed!important;z-index:1000;inset:0!important;width:100%!important;max-width:none!important;min-width:0!important;height:var(--shell-height,100dvh)!important;display:flex;flex-direction:column;margin:0;border:0;background:var(--bg);padding:var(--app-safe-top) var(--app-safe-right) var(--app-safe-bottom) var(--app-safe-left);box-sizing:border-box;transform:none}
 .screen-mobile-dialog{position:fixed!important;inset:0!important;width:100%!important;max-width:none!important;height:var(--shell-height,100dvh)!important;max-height:none!important;margin:0!important;padding:0!important;transform:none!important;border:0!important;border-radius:0!important}
 .chat-menu .screen-mobile-entry{min-height:44px}
 .screen-mobile .screen-heading{flex-wrap:wrap;gap:4px 8px;padding:4px 8px}
@@ -91,7 +93,7 @@
 .screen-mobile .screen-state{font-size:12px;padding:0 10px 7px}
 .screen-mobile .screen-viewport{min-height:0;overflow:hidden;touch-action:none;contain:layout paint}
 .screen-mobile .screen-viewport canvas{position:absolute;left:50%;top:50%;max-width:none;max-height:none;transform-origin:center}
-.screen-mobile .screen-tools-popover{max-height:calc(var(--shell-height,100dvh) - 170px);overscroll-behavior:contain}
+.screen-mobile .screen-tools-popover{max-height:calc(var(--shell-height,100dvh) - 170px - var(--app-safe-top) - var(--app-safe-bottom));overscroll-behavior:contain}
 .screen-mobile .screen-display{gap:8px;flex-wrap:wrap}.screen-mobile .screen-display select{max-width:100%}
 .screen-touch-help{font-size:12px;line-height:1.6;overflow-wrap:anywhere}
 .screen-mobile-keyboard{flex:none;max-height:45%;overflow:auto;overscroll-behavior:contain;padding:6px 8px;background:var(--bg);border-bottom:1px solid var(--border)}
