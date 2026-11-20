@@ -306,6 +306,44 @@ public static class HookWireProbe {
   });
 }
 
+async function injectForeignMouseInsideWindow(workDir, absDx, absDy) {
+  const psScript = `
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class ForeignMouseSender {
+  [StructLayout(LayoutKind.Sequential)] private struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public UIntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Sequential)] private struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public UIntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Sequential)] private struct HARDWAREINPUT { public uint uMsg; public ushort wParamL; public ushort wParamH; }
+  [StructLayout(LayoutKind.Explicit)] private struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public HARDWAREINPUT hi; }
+  [StructLayout(LayoutKind.Sequential)] private struct INPUT { public uint type; public INPUTUNION u; }
+  [DllImport("user32.dll", SetLastError=true)] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+  public static string Send(int dx, int dy) {
+    int sz = Marshal.SizeOf(typeof(INPUT));
+    INPUT[] arr = new INPUT[1];
+    arr[0].type = 0;
+    arr[0].u.mi.dx = dx;
+    arr[0].u.mi.dy = dy;
+    arr[0].u.mi.dwFlags = 0x0001 | 0x8000 | 0x4000;
+    arr[0].u.mi.dwExtraInfo = UIntPtr.Zero;
+    uint sent = SendInput(1, arr, sz);
+    return string.Format("{{\\"sent\\":{0},\\"inputSize\\":{1}}}", sent, sz);
+  }
+}
+"@
+[ForeignMouseSender]::Send([int]$args[0], [int]$args[1])
+`;
+  const scriptFile = path.join(workDir, 'foreign-mouse-sender.ps1');
+  await writeFile(scriptFile, psScript);
+  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', scriptFile, String(absDx), String(absDy)], { timeout: 15000 });
+  const start = stdout.indexOf('{');
+  const end = stdout.lastIndexOf('}');
+  return start >= 0 && end > start ? JSON.parse(stdout.slice(start, end + 1)) : { sent: 0 };
+}
+
 function makeDevice(deviceId) {
   const keys = generateKeyPairSync('ed25519');
   return {
@@ -683,6 +721,8 @@ async function main() {
           });
         };
 
+        let expectedStarts = 1;
+        let expectedResets = 1;
         if (leaseGranted) {
           // 8a. Pointer move inside synthetic test window (distinct pixel from Stage 3's 0.5, 0.25).
           const pMove = await target.call('window-point', { fx: 0.35, fy: 0.25, displayId: display.id });
@@ -693,7 +733,8 @@ async function main() {
           const afterMove = await target.call('window-state');
           const lastMove = moveEvents.at(-1);
           const moveOk = Boolean(lastMove) && Math.abs(lastMove.x - pMove.page.x) <= 2 && Math.abs(lastMove.y - pMove.page.y) <= 2
-            && afterMove.cursor?.x === pMove.physical.x && afterMove.cursor?.y === pMove.physical.y;
+            && afterMove.cursor?.x === pMove.physical.x && afterMove.cursor?.y === pMove.physical.y
+            && afterMove.activeMarkerExists;
           receipt.expect('e2e-input', 'pointer-move', moveOk,
             `askedPage=${JSON.stringify(pMove.page)}, saw=${JSON.stringify(lastMove ?? null)}, askedPhys=${JSON.stringify(pMove.physical)}, cursor=${JSON.stringify(afterMove.cursor)}, activeMarkerAfter320ms=${afterMove.activeMarkerExists}`);
 
@@ -735,7 +776,7 @@ async function main() {
             receipt.expect('e2e-input', 'double-click', false, `blocked: session ended right after pointer-move with reason=${closeWhy}`);
           }
 
-          // Record redacted control channel transitions for Session 1 (mouse path).
+          // Record redacted control channel transitions for Session 1.
           evidence.e2eControlEvents = control.values
             .filter(v => v && typeof v === 'object' && v.type !== 'frame-ready')
             .map(v => ({
@@ -746,71 +787,110 @@ async function main() {
             }));
           receipt.info('e2e-input', 'control-channel-transitions', JSON.stringify(evidence.e2eControlEvents));
 
-          // 8d-8e. Keyboard + text + held-key + foreground-loss E2E on a clean session (no mouse input so
-          // the mouse-only 32-bit dwExtraInfo hook bug does not prematurely close the session).
-          let kbJoin = join, kbControl = control, kbLease = stateMsg, kbGen = currentGen, kbSeq = inputSeq;
-          if (!leaseAliveAfterMove) {
-            const opened2 = await api('/api/screens/sessions?includeWindows=1', remote.token, {
+          // Helper to open a clean controlled session.
+          const openControlledSession = async () => {
+            const openedN = await api('/api/screens/sessions?includeWindows=1', remote.token, {
               desktopId: currentStatusRes.desktop.desktopId,
               displayId: display.id,
               displayRevision: display.revision,
               requestId: randomUUID(),
               codecs: ['h264'],
             });
-            kbJoin = opened2.status === 201 ? screenJoinSchema.parse(await opened2.json()) : null;
-            if (kbJoin) {
-              kbControl = connectWs(`${wsBase}/screen/v1/control`, cleanups);
-              const kbMedia = connectWs(`${wsBase}/screen/v1/media`, cleanups);
-              await Promise.all([kbControl.ready, kbMedia.ready]);
-              kbControl.send({ type: 'hello', ticket: kbJoin.controlTicket });
-              kbMedia.send({ type: 'hello', ticket: kbJoin.mediaTicket });
-              await target.call('wait-capture-start', { count: 2 });
-              const f1 = await target.call('emit-frame', { sessionId: kbJoin.session.id, generation: 1, size: encodeSize });
-              await wait(() => kbMedia.values.some(v => v instanceof Uint8Array && v.byteLength > 32), 6000);
-              kbControl.send({ type: 'ack', sessionId: kbJoin.session.id, generation: kbJoin.session.generation, frameSequence: f1.sequence });
-              await wait(() => kbControl.values.some(v => v.type === 'frame-ready' && v.frameSequence === f1.sequence), 6000);
-              kbControl.send({ type: 'control', sessionId: kbJoin.session.id, generation: kbJoin.session.generation, frameSequence: f1.sequence });
-              const r2 = await target.call('wait-capture-reset', { count: 2 });
-              kbGen = r2.last?.[1] ?? 2;
-              const f2 = await target.call('emit-frame', { sessionId: kbJoin.session.id, generation: kbGen, size: encodeSize });
-              kbControl.send({ type: 'ack', sessionId: kbJoin.session.id, generation: kbJoin.session.generation, frameSequence: f2.sequence });
-              await wait(() => kbControl.values.some(v => v.type === 'state' && v.lease && v.session.state === 'controlling'), 6000);
-              kbLease = kbControl.values.findLast(v => v.type === 'state' && v.lease);
-              kbSeq = 0;
-            }
-          }
-          const sendKbInput = async event => {
-            const emitted = await target.call('emit-frame', { sessionId: kbJoin.session.id, generation: kbGen, size: encodeSize });
-            kbControl.send({ type: 'ack', sessionId: kbJoin.session.id, generation: kbJoin.session.generation, frameSequence: emitted.sequence });
-            await wait(() => kbControl.values.some(v => v.type === 'frame-ready' && v.frameSequence === emitted.sequence), 4000);
-            const ready = kbControl.values.findLast(v => v.type === 'frame-ready');
-            const st = await target.call('window-state');
-            if (!st.inFront) throw new Error('aborted_window_lost_foreground');
-            kbControl.send({
-              type: 'input',
-              sessionId: kbJoin.session.id,
-              desktopId: currentStatusRes.desktop.desktopId,
-              generation: kbJoin.session.generation,
-              displayId: display.id,
-              displayRevision: display.revision,
-              leaseId: kbLease.lease.id,
-              sequence: ++kbSeq,
-              frameSequence: ready.frameSequence,
-              expiresAt: ready.expiresAt,
-              event,
-            });
+            const j = openedN.status === 201 ? screenJoinSchema.parse(await openedN.json()) : null;
+            if (!j) return null;
+            const c = connectWs(`${wsBase}/screen/v1/control`, cleanups);
+            const m = connectWs(`${wsBase}/screen/v1/media`, cleanups);
+            await Promise.all([c.ready, m.ready]);
+            c.send({ type: 'hello', ticket: j.controlTicket });
+            m.send({ type: 'hello', ticket: j.mediaTicket });
+            await target.call('wait-capture-start', { count: ++expectedStarts });
+            const f1 = await target.call('emit-frame', { sessionId: j.session.id, generation: 1, size: encodeSize });
+            await wait(() => m.values.some(v => v instanceof Uint8Array && v.byteLength > 32), 6000);
+            c.send({ type: 'ack', sessionId: j.session.id, generation: j.session.generation, frameSequence: f1.sequence });
+            await wait(() => c.values.some(v => v.type === 'frame-ready' && v.frameSequence === f1.sequence), 6000);
+            c.send({ type: 'control', sessionId: j.session.id, generation: j.session.generation, frameSequence: f1.sequence });
+            const r = await target.call('wait-capture-reset', { count: ++expectedResets });
+            const gen = r.last?.[1] ?? 2;
+            const f2 = await target.call('emit-frame', { sessionId: j.session.id, generation: gen, size: encodeSize });
+            c.send({ type: 'ack', sessionId: j.session.id, generation: j.session.generation, frameSequence: f2.sequence });
+            const ok = await wait(() => c.values.some(v => v.type === 'state' && v.lease && v.session.state === 'controlling'), 6000);
+            const leaseState = c.values.findLast(v => v.type === 'state' && v.lease);
+            let seq = 0;
+            const sendOn = async (event, cachedReady) => {
+              let ready = cachedReady;
+              if (!ready) {
+                const emitted = await target.call('emit-frame', { sessionId: j.session.id, generation: gen, size: encodeSize });
+                c.send({ type: 'ack', sessionId: j.session.id, generation: j.session.generation, frameSequence: emitted.sequence });
+                await wait(() => c.values.some(v => v.type === 'frame-ready' && v.frameSequence === emitted.sequence), 4000);
+                ready = c.values.findLast(v => v.type === 'frame-ready');
+              }
+              const st = await target.call('window-state');
+              if (!st.inFront) throw new Error('aborted_window_lost_foreground');
+              c.send({
+                type: 'input',
+                sessionId: j.session.id,
+                desktopId: currentStatusRes.desktop.desktopId,
+                generation: j.session.generation,
+                displayId: display.id,
+                displayRevision: display.revision,
+                leaseId: leaseState.lease.id,
+                sequence: ++seq,
+                frameSequence: ready.frameSequence,
+                expiresAt: ready.expiresAt,
+                event,
+              });
+              return ready;
+            };
+            return { join: j, control: c, media: m, lease: leaseState, gen, ok, sendOn };
           };
 
+          // 8d-8e. Focus textarea (real remote mouse click when lease alive), Unicode + Enter text,
+          // NumLock toggle via real protocol, held key journal, and foreground-loss abort + release.
+          let kbJoin = join, kbControl = control, kbLease = stateMsg;
+          let sendKbInput = sendInput;
+          if (!leaseAliveAfterMove) {
+            const s2 = await openControlledSession();
+            if (s2?.ok) {
+              kbJoin = s2.join; kbControl = s2.control; kbLease = s2.lease; sendKbInput = s2.sendOn;
+            } else {
+              kbJoin = null; kbLease = null;
+            }
+          }
+
           if (kbJoin && kbLease?.lease) {
-            // 8d. Focus textarea & send Unicode + Enter text through real Hub + ScreenService.
-            await target.call('focus-textarea');
+            if (leaseAliveAfterMove) {
+              const pBox = await target.call('window-point', { fx: 0.5, fy: 0.7, displayId: display.id });
+              const boxReady = await freshReady();
+              await sendKbInput({ kind: 'button', x: pBox.norm.x, y: pBox.norm.y, button: 0, down: true, clicks: 1 }, boxReady);
+              await sleep(40);
+              await sendKbInput({ kind: 'button', x: pBox.norm.x, y: pBox.norm.y, button: 0, down: false, clicks: 1 }, boxReady);
+              await sleep(200);
+              await target.call('clear-textarea');
+            } else {
+              await target.call('focus-textarea');
+            }
             const expectedText = 'hello 中文😀\nline2';
             await sendKbInput({ kind: 'text', text: expectedText });
-            await sleep(350);
+            await sleep(320);
             const afterText = await target.call('window-state');
             receipt.expect('e2e-input', 'unicode-and-enter-text',
               afterText.activeElement === 'text' && afterText.textareaValue === expectedText,
               `activeElement=${afterText.activeElement}, expectedLen=${expectedText.length}, gotMatch=${afterText.textareaValue === expectedText}`);
+
+            // 8d-2. Verify NumLock through real protocol (2cfba74: plain 0x45 toggles NumLock).
+            const fromNum = (await target.call('window-state')).seenCount;
+            const numReady = leaseAliveAfterMove ? await freshReady() : undefined;
+            for (let t = 0; t < 2; t++) {
+              await sendKbInput({ kind: 'key', code: 'NumLock', down: true }, numReady);
+              await sleep(35);
+              await sendKbInput({ kind: 'key', code: 'NumLock', down: false }, numReady);
+              await sleep(85);
+            }
+            const numEvents = (await target.call('get-seen', { from: fromNum })).events.filter(e => e.type === 'keydown' || e.type === 'keyup');
+            const numKeydowns = numEvents.filter(e => e.type === 'keydown');
+            const numToggled = numKeydowns.length === 2 && numKeydowns[0].numLock !== numKeydowns[1].numLock && numKeydowns.every(e => e.key === 'NumLock');
+            receipt.expect('e2e-input', 'numlock-toggle-via-protocol', numToggled,
+              `keydowns=${JSON.stringify(numKeydowns.map(e => ({ code: e.code, key: e.key, numLock: e.numLock })))}`);
 
             // 8e. Hold ShiftLeft -> verify held journal + pending -> trigger foreground loss -> abort further input & release!
             const fromHold = (await target.call('window-state')).seenCount;
@@ -840,14 +920,74 @@ async function main() {
             receipt.expect('e2e-input', 'foreground-loss-abort-and-release',
               !loss.inFront && loss.lostFocus && abortedNextInput && noKeyAAfterLoss && releasedClean && afterRelease.pending === 0 && !afterRelease.activeMarkerExists && afterRelease.heldJournal.state === 'missing',
               `loss=${JSON.stringify(loss)}, abortedNextInput=${abortedNextInput}, noKeyA=${noKeyAAfterLoss}, pendingAfter=${afterRelease.pending}, activeMarker=${afterRelease.activeMarkerExists}, journal=${afterRelease.heldJournal.state}, keyEvents=${holdKeyEvents.map(e => `${e.type}:${e.code}`).join(',')}`);
+
+            kbControl.send({ type: 'disconnect', sessionId: kbJoin.session.id, generation: kbJoin.session.generation });
+            await sleep(150);
           } else {
             receipt.expect('e2e-input', 'unicode-and-enter-text', false, 'failed to open keyboard E2E session');
+            receipt.expect('e2e-input', 'numlock-toggle-via-protocol', false, 'failed to open keyboard E2E session');
             receipt.expect('e2e-input', 'held-key-recorded-before-loss', false, 'failed to open keyboard E2E session');
             receipt.expect('e2e-input', 'foreground-loss-abort-and-release', false, 'failed to open keyboard E2E session');
           }
 
-          // 9. Record-only non-gating observations from Fable's Section 5 checklist + Win32 hook wire probe.
+          // 8f. Positive takeover test: restore focus to our synthetic test window, open fresh controlled session,
+          // verify own mouse + held key stay alive, then inject ONE foreign untagged mouse event strictly inside
+          // our synthetic window -> verify immediate `screen_local_takeover`, session close, marker removal, and held-key release!
           await target.call('close-focus-window');
+          const takeoverSession = await openControlledSession();
+          if (takeoverSession?.ok) {
+            const pOwn = await target.call('window-point', { fx: 0.4, fy: 0.3, displayId: display.id });
+            await takeoverSession.sendOn({ kind: 'move', x: pOwn.norm.x, y: pOwn.norm.y });
+            await takeoverSession.sendOn({ kind: 'key', code: 'ShiftLeft', down: true });
+            await sleep(350);
+            const beforeForeign = await target.call('window-state');
+            const aliveBefore = beforeForeign.activeMarkerExists && beforeForeign.pending === 1 && beforeForeign.heldJournal.state === 'valid';
+
+            // Foreign untagged SendInput (dwExtraInfo = 0) shifted +2px strictly inside our synthetic test window.
+            // Keep synthetic frames fresh while powershell.exe compiles Add-Type so the lease cannot expire from frame staleness.
+            const fx = pOwn.physical.x + 2;
+            const fy = pOwn.physical.y;
+            const absDx = Math.floor((2 * (fx - pOwn.rect.x) + 1) * 32768 / pOwn.rect.width);
+            const absDy = Math.floor((2 * (fy - pOwn.rect.y) + 1) * 32768 / pOwn.rect.height);
+            let keepAlive = true;
+            const pulse = (async () => {
+              while (keepAlive) {
+                try {
+                  const f = await target.call('emit-frame', { sessionId: takeoverSession.join.session.id, generation: takeoverSession.gen, size: encodeSize });
+                  if (takeoverSession.control.ws.readyState === WebSocket.OPEN) {
+                    takeoverSession.control.send({ type: 'ack', sessionId: takeoverSession.join.session.id, generation: takeoverSession.join.session.generation, frameSequence: f.sequence });
+                  }
+                } catch { break; }
+                await sleep(500);
+              }
+            })();
+            let foreignSend;
+            try {
+              foreignSend = await injectForeignMouseInsideWindow(workDir, absDx, absDy);
+            } finally {
+              keepAlive = false;
+              await pulse.catch(() => {});
+            }
+
+            const gotTakeoverClose = await wait(() => takeoverSession.control.values.some(
+              v => v.type === 'state' && v.session?.state === 'closed' && v.session?.reason === 'screen_local_takeover',
+            ), 2500);
+            const cleanedAfterForeign = await wait(async () => {
+              const st = await target.call('window-state');
+              return st.pending === 0 && !st.activeMarkerExists && st.heldJournal.state === 'missing';
+            }, 2500);
+            const afterForeign = await target.call('window-state');
+            const takeoverTransitions = takeoverSession.control.values
+              .filter(v => v && typeof v === 'object' && v.type !== 'frame-ready')
+              .map(v => ({ type: v.type, state: v.session?.state ?? null, reason: v.session?.reason ?? v.reason ?? null, hasLease: Boolean(v.lease) }));
+            receipt.expect('e2e-input', 'foreign-input-immediate-takeover',
+              aliveBefore && foreignSend.sent === 1 && gotTakeoverClose && cleanedAfterForeign,
+              `aliveBefore=${aliveBefore} (pending=${beforeForeign.pending}, marker=${beforeForeign.activeMarkerExists}), foreignSend=${JSON.stringify(foreignSend)}, gotTakeoverClose=${gotTakeoverClose}, afterForeign={pending:${afterForeign.pending},marker:${afterForeign.activeMarkerExists},journal:${afterForeign.heldJournal.state}}, transitions=${JSON.stringify(takeoverTransitions.slice(-4))}`);
+          } else {
+            receipt.expect('e2e-input', 'foreign-input-immediate-takeover', false, 'failed to open fresh controlled session for foreign-input takeover test');
+          }
+
+          // 9. Record-only non-gating observations from Fable's Section 5 checklist + Win32 hook wire probe.
           const obs = await target.call('run-observations', {}, 30000);
           evidence.observations = obs;
           receipt.info('observations', 'fable-section5-checklist', JSON.stringify(obs));
