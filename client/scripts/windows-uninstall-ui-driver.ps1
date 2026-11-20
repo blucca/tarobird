@@ -28,7 +28,7 @@ $start = Get-Date
 $events = New-Object System.Collections.ArrayList
 Add-Type -Namespace BirdProbe -Name Win32 -MemberDefinition @'
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
-[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int max);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, System.Text.StringBuilder text);
 [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 '@
 function Win32Button([int]$hwnd, [string]$name) {
@@ -36,7 +36,7 @@ function Win32Button([int]$hwnd, [string]$name) {
   do {
     $child = [BirdProbe.Win32]::FindWindowEx([IntPtr]$hwnd, $child, 'Button', $null)
     if ($child -ne [IntPtr]::Zero) {
-      $sb = New-Object System.Text.StringBuilder 64; [void][BirdProbe.Win32]::GetWindowText($child, $sb, 64)
+      $sb = New-Object System.Text.StringBuilder 64; [void][BirdProbe.Win32]::SendMessage($child, 0x000D, [IntPtr]64, $sb)
       if ($sb.ToString().Replace('&', '').Trim() -eq $name) { return $child }
     }
   } while ($child -ne [IntPtr]::Zero)
@@ -49,11 +49,22 @@ function Note([string]$kind, [string]$detail) {
 }
 function Clean([string]$s) { $s.Replace('&', '').Trim() }
 function Kids($el) { @($el.FindAll($TS::Descendants, $Any)) }
+# NSIS buttons and check boxes are Win32 "Button" controls; UI Automation on a
+# runner exposed them as Pane (probe run 44837580710), so match the class too
+# and fall back to the control's own BM_CLICK / BM_GETCHECK.
+function IsButton($c) { $c.Current.ControlType -eq $CT::Button -or $c.Current.ClassName -eq 'Button' }
 function Btn($el, [string]$name) {
-  foreach ($c in (Kids $el)) { if ($c.Current.ControlType -eq $CT::Button -and (Clean $c.Current.Name) -eq $name) { return $c } }
+  foreach ($c in (Kids $el)) { if ((IsButton $c) -and (Clean $c.Current.Name) -eq $name) { return $c } }
   return $null
 }
-function Press($el) { $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
+function Press($el) {
+  try { $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
+  catch { [void][BirdProbe.Win32]::SendMessage([IntPtr]$el.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) }
+}
+function Checked($box) {
+  try { return [string]$box.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'On' }
+  catch { return [int][BirdProbe.Win32]::SendMessage([IntPtr]$box.Current.NativeWindowHandle, 0x00F0, [IntPtr]::Zero, [IntPtr]::Zero) -eq 1 }
+}
 function Text($el) { ((Kids $el | ForEach-Object { $_.Current.Name } | Where-Object { $_ }) -join ' | ') }
 # The uninstaller and its message boxes carry the product name; NSIS's own
 # language picker (if Windows shows it) is "Installer/Uninstaller Language".
@@ -78,9 +89,9 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
         # MUI's LangDLL: keep its preselected language (the Windows display
         # language when one matches) and press OK.
         $choice = ''
-        foreach ($c in (Kids $w)) { if ($c.Current.ControlType -eq $CT::ComboBox) { try { $choice = $c.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { $choice = $c.Current.Name } } }
+        foreach ($c in (Kids $w)) { if ($c.Current.ControlType -eq $CT::ComboBox -or $c.Current.ClassName -eq 'ComboBox') { try { $choice = $c.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { $choice = $c.Current.Name } } }
         $okLang = Btn $w 'OK'
-        if ($okLang) { Press $okLang; Note 'language' "$($w.Current.Name): $choice (UI Automation OK)"; $acted[$key] = $true; continue }
+        if ($okLang) { Press $okLang; Note 'language' "$($w.Current.Name): $choice (OK, $($okLang.Current.ControlType.ProgrammaticName))"; $acted[$key] = $true; continue }
         $native = Win32Button $w.Current.NativeWindowHandle 'OK'
         if ($native -ne [IntPtr]::Zero) { [void][BirdProbe.Win32]::SendMessage($native, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero); Note 'language' "$($w.Current.Name): $choice (Win32 OK)"; $acted[$key] = $true; continue }
         if (-not $acted.ContainsKey("$key|tree")) { Note 'language-unanswerable' "no OK button found; tree: $(Tree $w)"; $acted["$key|tree"] = $true }
@@ -109,12 +120,12 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
         $answered++; $acted[$key] = $true
       } elseif ($uninstall -and $uninstall.Current.IsEnabled) {
         $box = $null
-        foreach ($c in (Kids $w)) { if ($c.Current.ControlType -eq $CT::CheckBox -and $c.Current.Name -like '*Back up and reset local data*') { $box = $c } }
+        foreach ($c in (Kids $w)) { if (($c.Current.ControlType -eq $CT::CheckBox -or $c.Current.ClassName -eq 'Button') -and $c.Current.Name -like '*Back up and reset local data*') { $box = $c } }
         if ($box) {
-          $toggle = $box.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
-          $want = $(if ($Mode -eq 'consent') { 'On' } else { 'Off' })
-          if ([string]$toggle.Current.ToggleState -ne $want) { $toggle.Toggle() }
-          Note 'confirm-page' "checkbox=$([string]$toggle.Current.ToggleState) mode=$Mode"
+          $want = $Mode -eq 'consent'
+          if ((Checked $box) -ne $want) { Press $box }
+          Start-Sleep -Milliseconds 300
+          Note 'confirm-page' "checkbox=$(if (Checked $box) { 'On' } else { 'Off' }) mode=$Mode"
         } else { Note 'confirm-page' "checkbox not found; text: $(Text $w)" }
         Press $uninstall; Note 'answer' 'Uninstall'; $acted[$key] = $true
       } elseif ($close -and $close.Current.IsEnabled) {
