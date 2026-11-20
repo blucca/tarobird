@@ -24,7 +24,20 @@ test("parallel two-finger movement scrolls and cannot turn into pinch or click",
   const f = fixture(); f.touch.down(1, { x: 100, y: 200 }, 0); f.touch.down(2, { x: 300, y: 200 }, 0);
   f.touch.move(1, { x: 100, y: 220 }); f.touch.move(2, { x: 300, y: 220 }); f.touch.flush();
   f.touch.move(1, { x: 20, y: 220 }); f.touch.move(2, { x: 380, y: 220 }); f.touch.flush(); f.touch.up(1); f.touch.up(2);
-  expect(f.events.every(value => value.kind === "wheel")).toBe(true); expect(f.events[0]).toMatchObject({ kind: "wheel", dx: 0, dy: -20 }); expect(f.touch.transform.zoom).toBe(1);
+  // One pointer move to where the fingers landed, then every wheel stays there.
+  expect(f.events[0]).toEqual({ kind: "move", x: .5, y: .5 });
+  expect(f.events.slice(1).every(value => value.kind === "wheel" && value.x === .5 && value.y === .5)).toBe(true);
+  expect(f.events[1]).toMatchObject({ kind: "wheel", dx: 0, dy: -20 }); expect(f.touch.transform.zoom).toBe(1);
+});
+test("a scroll keeps its start while the fingers travel, and a margin start scrolls nothing", () => {
+  const f = fixture(); f.touch.down(1, { x: 180, y: 260 }, 0); f.touch.down(2, { x: 220, y: 260 }, 0);
+  for (let y = 250; y >= 110; y -= 10) { f.touch.move(1, { x: 180, y }); f.touch.move(2, { x: 220, y }); f.touch.flush(); }
+  f.touch.up(1); f.touch.up(2);
+  expect(f.events.filter(value => value.kind === "move")).toEqual([{ kind: "move", x: .5, y: .8 }]);
+  expect(f.events.filter(value => value.kind === "wheel").every(value => value.kind === "wheel" && value.x === .5 && value.y === .8)).toBe(true);
+  f.events.length = 0; f.touch.down(1, { x: 180, y: 40 }, 0); f.touch.down(2, { x: 220, y: 40 }, 0);
+  for (let y = 50; y <= 200; y += 10) { f.touch.move(1, { x: 180, y }); f.touch.move(2, { x: 220, y }); f.touch.flush(); }
+  f.touch.up(1); f.touch.up(2); expect(f.events).toEqual([]);
 });
 test("pinch stays local, bounds zoom and pan, and transforms target coordinates", () => {
   const f = fixture(); f.touch.down(1, { x: 100, y: 200 }, 0); f.touch.down(2, { x: 300, y: 200 }, 0);

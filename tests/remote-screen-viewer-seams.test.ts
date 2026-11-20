@@ -6,6 +6,7 @@ import type { ScreenJoin } from "../src/client-protocol/remote-screen.js";
 import { writeScreenFrame } from "../src/client-protocol/screen-wire.js";
 import { RemoteScreenViewer, screenCanvasFocused, type ViewerState } from "../client/src/remote-screen-viewer.js";
 import type { ScreenViewerPort, ScreenViewerTransport } from "../client/src/screen-viewer-transport.js";
+import { ScreenTouch } from "../client/src/screen-touch.js";
 
 class FakeDecoder { state = "unconfigured"; configure() { this.state = "configured"; } decode() {} close() { this.state = "closed"; } }
 class FakeChunk { constructor(readonly init: unknown) {} }
@@ -175,4 +176,31 @@ it("the default input check is canvas focus in a focused, visible window", () =>
   documentWith({ active: other }); expect(screenCanvasFocused(target)).toBe(false);
   documentWith({ focused: false }); expect(screenCanvasFocused(target)).toBe(false);
   documentWith({ visibility: "hidden" }); expect(screenCanvasFocused(target)).toBe(false);
+});
+
+it("a phone two-finger scroll reaches the Host as one move, then wheels fixed at the gesture start", async () => {
+  let active = true;
+  const { f, viewer } = await controllingViewer(() => active);
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  // Wired exactly as RemoteScreenPanel: wheels coalesce in the viewer, the rest go through input().
+  const touch = new ScreenTouch({ width: 400, height: 225, imageWidth: 1280, imageHeight: 720 },
+    event => { if (event.kind === "wheel") viewer.wheel(event); else viewer.input(event); }, () => {});
+  touch.setControl(viewer.state.controlling && viewer.state.fresh);
+  const sent = () => f.posted.filter(message => message.type === "input").map(message => message.event as { kind: string; x: number; y: number; dy?: number });
+  const before = sent().length;
+  touch.down(1, { x: 180, y: 160 }, 0); touch.down(2, { x: 220, y: 160 }, 0);
+  // Fingers travel 150 CSS px up; the old wheel position would have followed them to y≈0.
+  for (let n = 1; n <= 15; n++) { touch.move(1, { x: 180, y: 160 - 10 * n }); touch.move(2, { x: 220, y: 160 - 10 * n }); touch.flush(); if (n % 5 === 0) await sleep(45); }
+  touch.up(1); touch.up(2); await sleep(60);
+  const events = sent().slice(before), origin = { x: .5, y: 160 / 225 };
+  expect(events[0]).toEqual({ kind: "move", ...origin });
+  expect(events.length).toBeGreaterThan(1);
+  expect(events.slice(1).every(event => event.kind === "wheel" && event.x === origin.x && event.y === origin.y)).toBe(true);
+  expect(events.slice(1).reduce((sum, event) => sum + (event.dy ?? 0), 0)).toBe(150);
+  // Losing effective input mid-gesture sends nothing more, exactly as before.
+  active = false; const stopped = sent().length;
+  touch.down(1, { x: 180, y: 160 }, 0); touch.down(2, { x: 220, y: 160 }, 0);
+  for (let n = 1; n <= 5; n++) { touch.move(1, { x: 180, y: 160 - 10 * n }); touch.move(2, { x: 220, y: 160 - 10 * n }); touch.flush(); }
+  touch.up(1); touch.up(2); await sleep(60);
+  expect(sent().length).toBe(stopped);
 });

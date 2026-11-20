@@ -17,7 +17,7 @@ export class ScreenTouch {
   private fingers = new Map<number, Finger>();
   private mode: "idle" | "candidate" | "drag" | "pan" | "pair" | "pinch" | "scroll" | "consumed" = "idle";
   private control = false;
-  private pair?: { center: ScreenPoint; distance: number; previous: ScreenPoint; transform: ScreenTransform };
+  private pair?: { center: ScreenPoint; distance: number; previous: ScreenPoint; transform: ScreenTransform; origin?: ScreenPoint };
   private dragPoint?: ScreenPoint;
   private lastTap?: { point: ScreenPoint; at: number; clicks: 1 | 2 | 3 };
   private initial: ScreenTransform = this.transform;
@@ -70,15 +70,21 @@ export class ScreenTouch {
     const [a, b] = [...this.fingers.values()].map(value => value.point), center = middle(a!, b!), span = distance(a!, b!), pair = this.pair;
     if (this.mode === "pair") {
       if (!this.control || Math.abs(span - pair.distance) > SCREEN_TOUCH_SLOP && Math.abs(span / pair.distance - 1) > .04) this.mode = "pinch";
-      else if (distance(center, pair.center) > SCREEN_TOUCH_SLOP) this.mode = "scroll";
-      else return;
+      else if (distance(center, pair.center) > SCREEN_TOUCH_SLOP) {
+        // Like a trackpad under a resting pointer: the remote pointer moves once
+        // to where the two fingers landed and every wheel stays there, so the
+        // content under the gesture's start scrolls and the pointer agrees with
+        // the wheel. A start in the letterbox scrolls nothing, like a drag.
+        const origin = this.point(pair.center); if (!origin) { this.mode = "consumed"; return; }
+        pair.origin = origin; this.mode = "scroll"; this.emit({ kind: "move", ...origin });
+      } else return;
     }
     if (this.mode === "pinch") {
       const zoom = clamp(pair.transform.zoom * span / pair.distance, 1, SCREEN_TOUCH_MAX_ZOOM), ratio = zoom / pair.transform.zoom;
       this.update({ zoom, x: center.x - this.viewport.width / 2 - (pair.center.x - this.viewport.width / 2 - pair.transform.x) * ratio,
         y: center.y - this.viewport.height / 2 - (pair.center.y - this.viewport.height / 2 - pair.transform.y) * ratio });
     } else {
-      const point = this.point(center); if (point) this.emit({ kind: "wheel", ...point, dx: clamp(pair.previous.x - center.x, -2000, 2000), dy: clamp(pair.previous.y - center.y, -2000, 2000) });
+      this.emit({ kind: "wheel", ...pair.origin!, dx: clamp(pair.previous.x - center.x, -2000, 2000), dy: clamp(pair.previous.y - center.y, -2000, 2000) });
     }
     pair.previous = center;
   }
