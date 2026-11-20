@@ -488,6 +488,7 @@ FunctionEnd
 !insertmacro MUI_RESERVEFILE_LANGDLL
   !include "SimpChinese.nsh"
   !include "English.nsh"
+!include "installer-language.nsh"
 
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
@@ -505,8 +506,9 @@ Function .onInit
     StrCpy $UpdateMode 1
   ${EndIf}
 
+  ; TaroBot: /P never shows the language dialog (installer-language.nsh).
   !if "${DISPLAYLANGUAGESELECTOR}" == "true"
-    !insertmacro MUI_LANGDLL_DISPLAY
+    !insertmacro BirdChooseLanguage
   !endif
 
   !insertmacro SetContext
@@ -760,8 +762,6 @@ Function un.onInit
     !insertmacro MULTIUSER_UNINIT
   !endif
 
-  !insertmacro MUI_UNGETLANGUAGE
-
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
@@ -771,6 +771,10 @@ Function un.onInit
   ${IfNot} ${Errors}
     StrCpy $UpdateMode 1
   ${EndIf}
+
+  ; TaroBot: after /P is read, so a passive uninstall never shows the
+  ; language dialog (installer-language.nsh).
+  !insertmacro BirdChooseLanguage
 FunctionEnd
 
 Function un.onUninstSuccess
