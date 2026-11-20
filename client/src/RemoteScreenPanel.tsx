@@ -12,6 +12,7 @@ import "./remote-screen.css";
 import { SCREEN_DEFAULT_QUALITY, type ScreenQuality } from "../../src/client-protocol/screen-quality.js";
 import { useScreenFullscreen } from "./use-screen-fullscreen.js";
 import { isMobileScreenApp, mobileScreenViewerTransport } from "./mobile-screen-viewer-transport.js";
+import { isScreenReasonCode } from "./screen-errors.js";
 import { useScreenMobileLifecycle } from "./use-screen-mobile-lifecycle.js";
 import { ScreenTouch, SCREEN_TOUCH_HOLD_MS, type ScreenTransform } from "./screen-touch.js";
 
@@ -33,14 +34,17 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   const knownTarget = useRef<{connection:HubConnection;platform:"macos"|"windows"}|undefined>(undefined);
   const visibleNow=useRef(visible);visibleNow.current=visible;
   const panel=useRef<HTMLElement>(null),canvas=useRef<HTMLCanvasElement>(null),viewer=useRef<RemoteScreenViewer>(undefined),attempt=useRef(0);
-  const [status,setStatus]=useState<ScreenStatus>(),[display,setDisplay]=useState(""),[error,setError]=useState(""),[statusError,setStatusError]=useState(""),[state,setState]=useState<ViewerState>({state:"closed",controlling:false,pending:false,fresh:false});
+  const [status,setStatus]=useState<ScreenStatus>(),[display,setDisplay]=useState(""),[error,setError]=useState(""),[statusError,setStatusError]=useState(""),[notice,setNotice]=useState(""),[state,setState]=useState<ViewerState>({state:"closed",controlling:false,pending:false,fresh:false});
   const [wide,setWide]=useState(false),[scale,setScale]=useState("fit"),[text,setText]=useState(""),[showText,setShowText]=useState(false),[bounds,setBounds]=useState<{left:number;top:number;width:number;height:number}>();
   const viewport=useRef<HTMLDivElement>(null),touch=useRef<ScreenTouch>(undefined),touchFrame=useRef(0),holdTimer=useRef<ReturnType<typeof setTimeout>>(undefined),composing=useRef(false);
   const [imeComposing,setImeComposing]=useState(false);
   const [transform,setTransform]=useState<ScreenTransform>({zoom:1,x:0,y:0}),[fitSize,setFitSize]=useState({width:640,height:360});
   const clearTouch=()=>{clearTimeout(holdTimer.current);cancelAnimationFrame(touchFrame.current);touchFrame.current=0;touch.current?.cancel();};
   const clearPicture=()=>{clearTouch();if(canvas.current){canvas.current.width=1;canvas.current.height=1;}setText("");composing.current=false;setImeComposing(false);};
-  const mobileForeground=useScreenMobileLifecycle(mobile,visible,()=>{disconnect();clearPicture();});
+  // Background/lock ends a session exactly as before; on return the status line
+  // says why (screen_background) until the next connect. Repeated lifecycle
+  // events while away keep it; hiding the viewer starts fresh.
+  const mobileForeground=useScreenMobileLifecycle(mobile,visible,reason=>{if(!reason)setNotice("");else if(viewer.current||state.state!=="closed")setNotice(reason);disconnect();clearPicture();});
   const activeNow=useRef(true);activeNow.current=!mobile||mobileForeground&&visible&&document.documentElement.dataset.mobileLocked!=="true";
   const chrome=useRef<HTMLDivElement>(null), hideTimer=useRef<ReturnType<typeof setTimeout>>(undefined);
   const [tools,setTools]=useState(false),[chromeVisible,setChromeVisible]=useState(true);
@@ -54,7 +58,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   const reveal=()=>{clearTimeout(hideTimer.current);setChromeVisible(true);};
   const hideLater=()=>{clearTimeout(hideTimer.current);if(fullscreen.active&&state.fresh&&!tools&&!chrome.current?.contains(document.activeElement))hideTimer.current=setTimeout(()=>setChromeVisible(false),2400);};
   useEffect(()=>{reveal();hideLater();return()=>clearTimeout(hideTimer.current);},[fullscreen.active,state.fresh,tools]);
-  useEffect(()=>{if(mobile)clearPicture();setStatus(undefined);setDisplay("");setError("");setStatusError("");setQuality(mobile?"smooth":SCREEN_DEFAULT_QUALITY);setLegacyQuality(false);setText("");setShowText(false);setTools(false);lastClick.current=undefined;setState({state:"closed",controlling:false,pending:false,fresh:false});return()=>{++attempt.current;clearTouch();viewer.current?.dispose();viewer.current=undefined;void retire().catch(()=>undefined);};},[connection]);
+  useEffect(()=>{if(mobile)clearPicture();setStatus(undefined);setDisplay("");setError("");setStatusError("");setNotice("");setQuality(mobile?"smooth":SCREEN_DEFAULT_QUALITY);setLegacyQuality(false);setText("");setShowText(false);setTools(false);lastClick.current=undefined;setState({state:"closed",controlling:false,pending:false,fresh:false});return()=>{++attempt.current;clearTouch();viewer.current?.dispose();viewer.current=undefined;void retire().catch(()=>undefined);};},[connection]);
   // While disconnected, refresh permissions and displays after the target
   // recovers or the user returns from Settings. Never reuse another Host's data.
   useEffect(()=>{
@@ -80,7 +84,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   const connect=(requested:ScreenQuality=quality,legacy=legacyQuality)=>{
     if(mobile&&!activeNow.current)return;
     const n=++attempt.current,previous=lifecycle.opening;
-    viewer.current?.dispose();viewer.current=undefined;setError("");setState({state:"connecting",controlling:false,pending:false,fresh:false});
+    viewer.current?.dispose();viewer.current=undefined;setError("");setNotice("");setState({state:"connecting",controlling:false,pending:false,fresh:false});
     const run=async()=>{let cleanupOnError=false;try{
       // An earlier open may still return a session after cancellation. It owns
       // its cleanup; do not let a replacement race ahead of that response.
@@ -125,7 +129,10 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   const blocked = status ? !status.enabled ? "screen_disabled" : status.permission === "none" ? "screen_not_authorized"
     : !status.desktop ? "screen_service_offline" : status.desktop.locked ? "screen_locked"
     : status.desktop.capture !== "granted" ? "screen_capture_denied" : !status.desktop.displays.length ? "screen_display_unavailable" : "" : "";
-  const stateText=error?screenError(error,errorTarget):statusError?screenError(statusError,errorTarget):state.reason?screenError(state.reason,errorTarget):state.controlling?mobile?t("正在控制 · 可随时停止控制"):t("正在控制 · Ctrl+Alt+Shift+Esc 退出控制"):state.state==="connecting"?t("正在连接屏幕…"):state.state==="closed"?(blocked?screenError(blocked,errorTarget):t("尚未连接")):!state.fresh?t("画面暂未更新，控制已停止，请等待新画面。"):t("查看中 · 点击开始控制后操作");
+  // A status read that failed in transport (no reason code) must not hide the
+  // localized reason that ended the session.
+  const endedBy=state.reason||(state.state==="closed"&&!blocked?notice:""),statusShown=statusError&&!(endedBy&&!isScreenReasonCode(statusError));
+  const stateText=error?screenError(error,errorTarget):statusShown?screenError(statusError,errorTarget):state.reason?screenError(state.reason,errorTarget):state.controlling?mobile?t("正在控制 · 可随时停止控制"):t("正在控制 · Ctrl+Alt+Shift+Esc 退出控制"):state.state==="connecting"?t("正在连接屏幕…"):state.state==="closed"?(blocked?screenError(blocked,errorTarget):notice?screenError(notice,errorTarget):t("尚未连接")):!state.fresh?t("画面暂未更新，控制已停止，请等待新画面。"):t("查看中 · 点击开始控制后操作");
   const qualitySelect=<select aria-label={t("画面清晰度")} title={!connection.state.screenQualityAvailable?t("更新主机后可选择清晰度"):legacyQuality?t("目标电脑的 App 暂不支持画质选择，请更新后重试，或以默认画质连接。"):sharpSupported?t("流畅节省带宽，清晰保留更多文字细节"):t("此设备不支持清晰画质解码，请改用均衡或流畅。")} value={quality} disabled={!connection.state.screenQualityAvailable||legacyQuality||state.state==="connecting"} onChange={e=>changeQuality(e.target.value as ScreenQuality)}><option value="smooth">{t("流畅")}</option><option value="balanced">{t("均衡")}</option><option value="sharp" disabled={!sharpSupported}>{t("清晰")}</option></select>;
   return <aside ref={panel} hidden={!visible||mobile&&!mobileForeground} style={!mobile&&bounds?{position:"absolute",...bounds}:undefined} className={`conversation-side-panel remote-screen-panel${mobile?" screen-mobile":""}${wide?" screen-wide":""}${fullscreen.active?" screen-fullscreen":""}`} aria-label={t("远程屏幕")} onBlurCapture={e=>{if(!mobile)return;if(e.relatedTarget instanceof Node&&panel.current?.contains(e.relatedTarget))return;queueMicrotask(()=>{if(!panel.current?.contains(document.activeElement))viewer.current?.release();});}} onPointerMove={e=>{if(fullscreen.active&&e.clientY<28){reveal();hideLater();}}}>
     {fullscreen.active&&!chromeVisible&&<button className="screen-reveal" aria-label={t("显示屏幕工具栏")} title={t("显示屏幕工具栏")} onClick={reveal}><ChevronDown size={16}/></button>}

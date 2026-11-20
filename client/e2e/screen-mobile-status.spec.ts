@@ -1,0 +1,74 @@
+import { test, expect, type Page } from "@playwright/test";
+import type { ViteDevServer } from "vite";
+import { createServer } from "./fixtures/vite.js";
+import en from "../src/locales/en.json" with { type: "json" };
+// Real RemoteScreenPanel, Capacitor JS dispatch and screen transport over the
+// native plugin double (fixtures/screen-mobile.tsx); synthetic Hub responses.
+let server: ViteDevServer;
+test.beforeAll(async()=>{server=await createServer({server:{host:"127.0.0.1",port:0}});await server.listen();});
+test.afterAll(async()=>{await server?.close();});
+test.use({hasTouch:true,viewport:{width:390,height:844}});
+const url=(platform="ios")=>server.resolvedUrls!.local[0]+`e2e/fixtures/screen-mobile.html?platform=${platform}`;
+const log=(page:Page)=>page.evaluate(()=>(window as any).screenMobileFixture);
+const status=(page:Page)=>page.locator(".screen-mobile .screen-state[role=status]");
+const BACKGROUND="App 已进入后台或设备已锁定。返回后请重新连接，再单独开始控制。";
+const HOST_STOPPED="主机已停止运行，屏幕连接已断开。请在主机恢复后重新连接。";
+const GENERIC="屏幕连接已结束，请检查主机状态后重试。";
+const ready=(page:Page)=>page.waitForFunction(()=>!!(window as any).screenMobileFixture);
+const refresh=(page:Page)=>page.evaluate(()=>window.dispatchEvent(new Event("focus")));
+
+test("returning from background or lock explains why the session ended, until the next connect",async({page})=>{
+  await page.goto(url());await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
+  await page.getByRole("button",{name:"开始控制",exact:true}).click();await expect(page.getByRole("button",{name:"停止控制",exact:true})).toBeVisible();
+  await page.evaluate(()=>(window as any).screenMobileActive(false));await expect(page.locator(".screen-mobile")).toBeHidden();
+  // Further lifecycle events while away must not erase the explanation.
+  await page.evaluate(()=>{document.documentElement.dataset.mobileLocked="true";});await page.evaluate(()=>{document.documentElement.dataset.mobileLocked="false";});
+  const before=(await log(page)).opens;await page.evaluate(()=>(window as any).screenMobileActive(true));
+  await expect(status(page)).toHaveText(BACKGROUND);
+  // Unchanged design: no automatic reconnect, control is not restored.
+  await expect(page.getByRole("button",{name:"连接屏幕",exact:true})).toBeEnabled();expect((await log(page)).opens).toBe(before);
+  await expect(page.getByRole("button",{name:"连接设置",exact:true})).toHaveCount(0);
+  await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
+  await expect(status(page)).not.toHaveText(BACKGROUND);await expect(page.getByRole("button",{name:"停止控制",exact:true})).toHaveCount(0);
+  // A lock during a session explains itself the same way.
+  await page.evaluate(()=>{document.documentElement.dataset.mobileLocked="true";});await expect(page.locator(".screen-mobile")).toBeHidden();
+  await page.evaluate(()=>{document.documentElement.dataset.mobileLocked="false";});await expect(status(page)).toHaveText(BACKGROUND);
+  expect((await log(page)).opens).toBe(before+1);
+  // Without a session there is nothing to explain.
+  await page.evaluate(()=>(window as any).screenMobileFixture.hide());await page.evaluate(()=>(window as any).screenMobileFixture.show());
+  await expect(status(page)).toHaveText("尚未连接");
+  await page.evaluate(()=>(window as any).screenMobileActive(false));await page.evaluate(()=>(window as any).screenMobileActive(true));
+  await expect(status(page)).toHaveText("尚未连接");
+});
+
+test("a dropped Host keeps its localized reason and never shows the client's raw error",async({page})=>{
+  await page.goto(url());await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
+  // The Host stops; its status endpoint then fails the way the client reports a dropped route.
+  await page.evaluate(()=>{(window as any).screenMobileFixture.statusFailure="abort";(window as any).screenMobileHostClose("screen_host_stopped");});
+  for(const failure of ["abort","offline"]){
+    await page.evaluate(value=>{(window as any).screenMobileFixture.statusFailure=value;},failure);await refresh(page);await page.waitForTimeout(200);
+    await expect(status(page),failure).toHaveText(HOST_STOPPED);
+  }
+  await expect(page.getByText("The request was aborted.")).toHaveCount(0);
+  // Without a Host reason the failure is an ordinary, localized disconnect.
+  await page.reload();await ready(page);await page.evaluate(()=>{(window as any).screenMobileFixture.statusFailure="abort";});await refresh(page);
+  await expect(status(page)).toHaveText(GENERIC);
+  await page.evaluate(()=>{(window as any).screenMobileFixture.statusFailure="offline";});await refresh(page);
+  await expect(status(page)).toHaveText(GENERIC);
+  // Host recovers: the ordinary state returns.
+  await page.evaluate(()=>{(window as any).screenMobileFixture.statusFailure="";});await refresh(page);
+  await expect(status(page)).toHaveText("尚未连接");
+});
+
+test("English UI shows the same reasons in English, without raw client text",async({browser})=>{
+  const context=await browser.newContext({viewport:{width:390,height:844},locale:"en-US",hasTouch:true,isMobile:true});const page=await context.newPage();
+  const text=(key:string)=>(en as Record<string,string>)[key]??key;
+  try{
+    await page.goto(url("android"));await ready(page);await page.evaluate(()=>{(window as any).screenMobileFixture.statusFailure="abort";});await refresh(page);
+    await expect(status(page)).toHaveText(text(GENERIC));
+    await page.evaluate(()=>{(window as any).screenMobileFixture.statusFailure="";});await refresh(page);
+    await page.getByRole("button",{name:text("连接屏幕"),exact:true}).click();await expect(page.getByRole("button",{name:text("开始控制"),exact:true})).toBeEnabled();
+    await page.evaluate(()=>(window as any).screenMobileActive(false));await page.evaluate(()=>(window as any).screenMobileActive(true));
+    await expect(status(page)).toHaveText(text(BACKGROUND));
+  }finally{await context.close();}
+});

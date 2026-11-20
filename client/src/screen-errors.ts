@@ -155,9 +155,14 @@ export const SCREEN_ERROR_MESSAGES_UNKNOWN_TARGET: Readonly<Record<string, strin
   screen_accessibility_denied: "目标电脑暂时不接受远程输入，请在那台电脑上检查后再开始控制。",
   screen_input_denied: "目标电脑没有接受远程输入，控制已停止。请在那台电脑上检查后重试。",
 });
+/** Host/native reasons are snake_case codes. Anything else is client or
+ * platform text (e.g. "The request was aborted.") and is never displayed. */
+export const isScreenReasonCode = (reason: string) => /^[a-z][a-z0-9_]*$/.test(reason);
 export function screenError(reason: string, target: "macos" | "windows" | "unknown" = "macos") {
   const specific = target === "windows" ? SCREEN_ERROR_MESSAGES_WINDOWS[reason]
     : target === "unknown" ? SCREEN_ERROR_MESSAGES_UNKNOWN_TARGET[reason] ?? SCREEN_ERROR_MESSAGES_WINDOWS[reason] : undefined;
   const message = specific || SCREEN_ERROR_MESSAGES[reason];
-  return message ? t(message) : `${t("屏幕连接已结束，请检查主机状态后重试。")} (${reason.slice(0,120)})`;
+  if (message) return t(message);
+  // An unknown code stays visible for support; an ordinary disconnect is only the localized sentence.
+  return isScreenReasonCode(reason) ? `${t("屏幕连接已结束，请检查主机状态后重试。")} (${reason.slice(0,120)})` : t("屏幕连接已结束，请检查主机状态后重试。");
 }

@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 
 /** Native gates remain authoritative while JavaScript is suspended. This hook
- * retires the renderer too; foreground never reconnects or regains control. */
-export function useScreenMobileLifecycle(mobile: boolean, visible: boolean, retire: () => void) {
+ * retires the renderer too; foreground never reconnects or regains control.
+ * `retire` receives "screen_background" when the App left the foreground or
+ * the device locked, and nothing when the viewer itself was hidden. */
+export function useScreenMobileLifecycle(mobile: boolean, visible: boolean, retire: (reason?: "screen_background") => void) {
   const latest = useRef(retire); latest.current = retire;
   const [foreground, setForeground] = useState(!mobile);
   useEffect(() => {
@@ -11,7 +13,7 @@ export function useScreenMobileLifecycle(mobile: boolean, visible: boolean, reti
     const update = () => {
       if (disposed) return;
       const active = nativeActive && document.visibilityState !== "hidden" && document.documentElement.dataset.mobileLocked !== "true";
-      setForeground(active); if (!active) latest.current();
+      setForeground(active); if (!active) latest.current("screen_background");
     };
     const observer = new MutationObserver(update); observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-mobile-locked"] });
     document.addEventListener("visibilitychange", update);

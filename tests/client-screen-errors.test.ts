@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { afterEach, expect, it, vi } from "vitest";
 import english from "../client/src/locales/en.json" with { type: "json" };
 import { setLocale } from "../client/src/i18n.js";
-import { SCREEN_ERROR_MESSAGES, SCREEN_ERROR_MESSAGES_UNKNOWN_TARGET, SCREEN_ERROR_MESSAGES_WINDOWS, screenError } from "../client/src/screen-errors.js";
+import { SCREEN_ERROR_MESSAGES, SCREEN_ERROR_MESSAGES_UNKNOWN_TARGET, SCREEN_ERROR_MESSAGES_WINDOWS, isScreenReasonCode, screenError } from "../client/src/screen-errors.js";
 
 afterEach(() => { setLocale("zh"); vi.unstubAllGlobals(); });
 const placeholders = (value: string) => [...value.matchAll(/\{\d+\}/g)].map(match => match[0]).sort().join();
@@ -26,6 +26,18 @@ it("known reasons show their sentence in the UI locale; unknown ones keep the ge
   setLocale("en");
   expect(screenError("screen_locked")).toBe((english as Record<string, string>)["目标 Mac 已锁定，请在本机解锁后重新连接。"]);
   expect(screenError("screen_new_reason")).toBe(`${(english as Record<string, string>)["屏幕连接已结束，请检查主机状态后重试。"]} (screen_new_reason)`);
+});
+
+it("client or platform error text is never shown; an ordinary disconnect is only the localized sentence", () => {
+  // The iPhone showed "… (The request was aborted.)" when the Host dropped (F-49-4).
+  for (const raw of ["The request was aborted.", "连接恢复后即可操作", "Failed to fetch", "Load failed", "请求失败", "screen locked", "Screen_locked", ""]) {
+    expect(isScreenReasonCode(raw), raw).toBe(false);
+    expect(screenError(raw), raw).toBe("屏幕连接已结束，请检查主机状态后重试。");
+  }
+  for (const code of ["screen_new_reason", "session_expired", "x".repeat(200)]) expect(isScreenReasonCode(code), code).toBe(true);
+  vi.stubGlobal("document", { documentElement: { lang: "zh-CN" } });
+  setLocale("en");
+  expect(screenError("The request was aborted.")).toBe((english as Record<string, string>)["屏幕连接已结束，请检查主机状态后重试。"]);
 });
 
 it("a Windows target has its own sentence wherever the usual one names a Mac or a Mac permission", () => {
