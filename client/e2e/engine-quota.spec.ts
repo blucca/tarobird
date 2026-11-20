@@ -139,6 +139,24 @@ test("constraints-only quota readings expire locally without any network refresh
   } finally { await f.close(); }
 });
 
+test("constraint reset times expire the reading like the Gateway, without a refill or refresh", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    const snapshot = f.records.coder!.snapshot;
+    snapshot.pools = []; snapshot.availability = "blocked"; snapshot.observedAt = new Date().toISOString();
+    snapshot.constraints = [{ code: "ordinary_usage_blocked", availability: "blocked", resetsAt: new Date(Date.now() + 4_000).toISOString() }];
+    await f.open(); const coder = page.getByRole("region", { name: "Coding Bot · Codex", exact: true }), constraints = coder.locator(".quota-constraints");
+    await expect(coder.locator(".quota-state")).toHaveText("已读取"); await expect(constraints).toContainText("重置：");
+    await expect(coder.locator(".quota-notice")).toHaveText("原生服务报告使用受限；窗口剩余量不代表可以继续请求。");
+    const requests = f.requests();
+    await expect(coder.locator(".quota-state")).toHaveText("待更新", { timeout: 8_000 });
+    await expect(constraints).toContainText("常规使用受限 · 已到重置时间，等待更新"); await expect(constraints).not.toContainText("重置：");
+    await expect(coder.locator(".quota-notice")).toHaveText("上次读数：原生服务报告使用受限；窗口剩余量不代表可以继续请求。");
+    await expect(coder).not.toContainText("剩余 100%");
+    expect(f.requests()).toBe(requests); expect(f.records.coder!.refreshes).toBe(0);
+  } finally { await f.close(); }
+});
+
 test("quota authentication changes clear old values and require another explicit refresh", async ({ page }) => {
   const f = await fixture(page);
   try {

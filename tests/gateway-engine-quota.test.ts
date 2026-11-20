@@ -1,5 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { gatewayEngineQuota } from "../src/gateway/engine-quota.js";
+import { quotaReadingExpired } from "../src/client-protocol/engine-quota.js";
 import { unavailableQuota } from "../src/codex/account-quota.js";
 import type { EngineQuotaReadResult } from "../src/codex/adapter.js";
 
@@ -75,4 +76,39 @@ it("rejects cross-Bot and unversioned refresh requests before reading", async ()
   await expect(run({ scopeId: "other", refresh: false })).rejects.toThrow();
   await expect(run({ scopeId: "bot", refresh: true })).rejects.toThrow();
   expect(read).not.toHaveBeenCalled();
+});
+
+// #47-D: constraint resets and the snapshot TTL use the same expiry rule as the App.
+const constrained = (place: "snapshot" | "pool", resetsAt?: number) => {
+  const value = { ...unavailableQuota("codex", "not_loaded", 1000), state: "ready" as const, availability: "blocked" as const, observedAt: new Date(1000).toISOString(), pools: [] as ReturnType<typeof snapshot>["pools"] };
+  const constraint = { code: "ordinary_usage_blocked" as const, availability: "blocked" as const, ...(resetsAt ? { resetsAt: new Date(resetsAt).toISOString() } : {}) };
+  if (place === "snapshot") return { ...value, constraints: [constraint] };
+  return { ...value, pools: [{ id: "pool", label: "Codex", sharing: "shared" as const, availability: "blocked" as const, windows: [], balances: [], constraints: [constraint] }] };
+};
+const readAt = (value: ReturnType<typeof constrained>, now: number) => gatewayEngineQuota({ botId: "bot", engine: "codex", read: async () => ({ revision: "one", snapshot: value }), now: () => now })({ scopeId: "bot", refresh: false });
+
+it.each(["snapshot", "pool"] as const)("marks a %s constraint stale once its reset time passes, keeping the last restriction", async place => {
+  const result = await readAt(constrained(place, 11_000), 31_000);
+  expect(result.value.state).toBe("stale");
+  expect(result.value.availability).toBe("blocked");
+  expect([...result.value.constraints, ...result.value.pools.flatMap(pool => pool.constraints)]).toEqual([expect.objectContaining({ code: "ordinary_usage_blocked" })]);
+});
+
+it("marks a constraint-only reading stale when its own TTL elapses", async () => {
+  expect((await readAt(constrained("snapshot"), 61_000)).value.state).toBe("stale");
+});
+
+it("keeps a constraint reading current before its reset and TTL", async () => {
+  expect((await readAt(constrained("snapshot", 40_000), 31_000)).value.state).toBe("ready");
+  expect((await readAt(constrained("pool"), 60_999)).value.state).toBe("ready");
+});
+
+it("shares one expiry predicate between Gateway and App", () => {
+  const value = constrained("pool", 11_000);
+  expect(quotaReadingExpired(value, 10_999)).toBe(false);
+  expect(quotaReadingExpired(value, 11_000)).toBe(true);
+  expect(quotaReadingExpired({ ...value, pools: [] }, 60_999)).toBe(false);
+  expect(quotaReadingExpired({ ...value, pools: [] }, 61_000)).toBe(true);
+  expect(quotaReadingExpired(snapshot(), 49_999)).toBe(false);
+  expect(quotaReadingExpired(snapshot(), 50_000)).toBe(true);
 });

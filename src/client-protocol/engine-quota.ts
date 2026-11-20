@@ -67,3 +67,13 @@ export type QuotaScope = z.infer<typeof quotaScopeSchema>;
 export type QuotaDirectory = z.infer<typeof quotaDirectorySchema>;
 export type NativeQuotaRequest = z.infer<typeof nativeQuotaRequestSchema>;
 export type NativeQuotaReply = z.infer<typeof nativeQuotaReplySchema>;
+
+/** The single "no longer current" rule shared by Gateway, CLI output and the App.
+ * A reading expires with its own TTL, any window/balance expiry, or any reported
+ * reset time, including independent constraints. Expiry never manufactures a refill. */
+export function quotaReadingExpired(snapshot: Pick<QuotaSnapshot, "observedAt" | "pools" | "constraints">, now: number): boolean {
+  const past = (value: string | undefined) => !!value && Date.parse(value) <= now;
+  if (snapshot.observedAt && Date.parse(snapshot.observedAt) + ENGINE_QUOTA_TTL_MS <= now) return true;
+  if ([...snapshot.constraints, ...snapshot.pools.flatMap(pool => pool.constraints)].some(value => past(value.resetsAt))) return true;
+  return snapshot.pools.some(pool => [...pool.windows, ...pool.balances].some(value => past(value.expiresAt) || "resetsAt" in value && past(value.resetsAt)));
+}

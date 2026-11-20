@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { nativeQuotaRequestSchema, nativeQuotaReplySchema, quotaSnapshotSchema, type QuotaEngine, type QuotaSnapshot } from "../client-protocol/engine-quota.js";
+import { nativeQuotaRequestSchema, nativeQuotaReplySchema, quotaReadingExpired, quotaSnapshotSchema, type QuotaEngine, type QuotaSnapshot } from "../client-protocol/engine-quota.js";
 import { unavailableQuota } from "../codex/account-quota.js";
 import type { EngineQuotaReadResult, EngineQuotaReadOptions } from "../codex/adapter.js";
 
@@ -43,8 +43,7 @@ export function gatewayEngineQuota(options: {
       if (active && activeRevision === result.revision) result = await active;
     }
     const snapshot: QuotaSnapshot = quotaSnapshotSchema.parse(result.snapshot);
-    if (snapshot.state === "ready" && snapshot.pools.some(pool => [...pool.windows, ...pool.balances].some(value =>
-      Date.parse(value.expiresAt) <= now() || "resetsAt" in value && value.resetsAt && Date.parse(value.resetsAt) <= now()))) snapshot.state = "stale";
+    if (snapshot.state === "ready" && quotaReadingExpired(snapshot, now())) snapshot.state = "stale";
     if (snapshot.capability.mode === "active" && nextRefreshAt > now()) snapshot.nextRefreshAt = new Date(nextRefreshAt).toISOString();
     return nativeQuotaReplySchema.parse({ scopeId: options.botId, revision: result.revision,
       value: { ...snapshot, id: options.botId, revision: result.revision, engine: options.engine, label: options.engine,

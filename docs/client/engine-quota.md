@@ -26,6 +26,10 @@ Opening the page and refreshing the directory reads worker caches only. Codex's
 per-card refresh is explicit, coalesced and limited to once per minute for the
 same identity revision. Claude reads passive observations only. Expired values
 are marked stale; reaching a reset time does not manufacture a full allowance.
+One shared rule (`quotaReadingExpired`) decides this for the Gateway, CLI output
+and the App: the reading's TTL, any window/credit expiry, or any reported reset
+time, including an independent constraint's reset, ends the current reading.
+The last restriction remains visible as a last reading until a new read.
 No background polling, automatic retry, login, or token refresh is added.
 
 The owner-only HTTP entry points are `GET /api/engine-quotas` and
