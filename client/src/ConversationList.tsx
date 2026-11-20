@@ -5,7 +5,7 @@ import { ConversationBulkCheck, useConversationBulk } from './ConversationBulkSe
 import { useBotConversationFolds, useGroupTopicFolds } from "./bot-conversation-folds.js";
 import "./bot-conversation-folds.css";
 import { DraftPreviewText, listDraftPreview, useDraftPreviews } from "./DraftPreview.js";
-import { FolderSections, MoveToFolder } from "./ConversationFolders.js";
+import { FolderSections, MoveToFolder, type CrossHostFolderActionsContext } from "./ConversationFolders.js";
 import { botAgentSignal, buildBotRows, buildConversationRows, navigationItems, formatRowTime, type InboxRow } from "./conversation-inbox.js";
 import { useLocalDay } from "./local-day.js";
 import { agentSignal } from "./agent-state.js";
@@ -31,7 +31,7 @@ import { RemoveConversation } from "./RemoveConversation.js";
 import { GroupSettings } from "./GroupSettings.js";
 import { BotSettings } from "./BotSettings.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
-export type SidebarSlice = { kind: "bot"; id: string } | { kind: "conversation"; id: string; inbox?: InboxRow } | { kind: "folders" };
+export type SidebarSlice = { kind: "bot"; id: string } | { kind: "conversation"; id: string; inbox?: InboxRow } | { kind: "folders" } | { kind: "folder"; folderId: string | null; crossHost: CrossHostFolderActionsContext };
 
 export type ConversationSelection = {
   selected: ReadonlySet<string>; ready: boolean; key: (id: string) => string;
@@ -39,7 +39,7 @@ export type ConversationSelection = {
   disabled: (id: string) => boolean; reason?: (id: string) => string | undefined; toggle: (id: string) => void;
 };
 
-export function ConversationList({ connection, hostName, slice, showHostBadge = false, showDisconnectedBots = false, visible = true, layout = "bots", selection, filtered = false, conversations, bots, selected, pins, globalPins = [], showGlobalPins = true, activity, select, newChat, openBot }: { connection: HubConnection; hostName?: string; slice?: SidebarSlice; showHostBadge?: boolean; showDisconnectedBots?: boolean; visible?: boolean; layout?: SidebarLayout; selection?: ConversationSelection; filtered?: boolean; conversations: Conversation[]; bots: Bot[]; selected: string; pins: string[]; globalPins?: string[]; showGlobalPins?: boolean; activity: Record<string, ConversationActivity>; select: (id: string) => void; newChat: (botId: string) => void; openBot: (botId: string, destination: "capabilities" | "operations") => void }) {
+export function ConversationList({ connection, hostId, hostName, slice, showHostBadge = false, showDisconnectedBots = false, visible = true, layout = "bots", selection, filtered = false, conversations, bots, selected, pins, globalPins = [], showGlobalPins = true, activity, select, newChat, openBot }: { connection: HubConnection; hostId?: string; hostName?: string; slice?: SidebarSlice; showHostBadge?: boolean; showDisconnectedBots?: boolean; visible?: boolean; layout?: SidebarLayout; selection?: ConversationSelection; filtered?: boolean; conversations: Conversation[]; bots: Bot[]; selected: string; pins: string[]; globalPins?: string[]; showGlobalPins?: boolean; activity: Record<string, ConversationActivity>; select: (id: string) => void; newChat: (botId: string) => void; openBot: (botId: string, destination: "capabilities" | "operations") => void }) {
   const drafts = useDraftPreviews(connection.cache);
   const sourceHost = showHostBadge && hostName ? <HostSourceBadge name={hostName}/> : null;
   const bulk = useConversationBulk();
@@ -174,7 +174,7 @@ export function ConversationList({ connection, hostName, slice, showHostBadge = 
   // them readable without inventing an undefined Bot or enabling its actions.
   const unassigned = ordinary.filter((c) => c.type === "direct" && !c.botIds.length);
   const groups = ordinary.filter((c) => c.type === "group" && !c.parentId);
-  const inbox = layout === "conversations" && (!slice || slice.kind === "folders") ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }]) : undefined;
+  const inbox = layout === "conversations" && (!slice || slice.kind === "folders" || slice.kind === "folder") ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }]) : undefined;
   const botRow = (id: string) => {
       const bot = bots.find((b) => b.id === id), name = labels.get(id) ?? bot?.name ?? id;
       const chats = ordinary.filter((c) => c.type === "direct" && c.botIds[0] === id);
@@ -206,8 +206,8 @@ export function ConversationList({ connection, hostName, slice, showHostBadge = 
   const globalSection = globalRows.length > 0 && <GlobalPinSection>{globalRows.map(item => layout === "conversations" ? inboxRow(item) : isGroup(item.conversation) ? groupRow(item.conversation) : row(item.conversation))}</GlobalPinSection>;
   const Container = slice ? "div" : "nav";
   return <Container data-pin-scope={foldScope} className={slice ? "conversation-list-slice" : `conversation-list${inbox ? " conversation-inbox" : ""}`}>
-    {slice ? slice.kind === "bot" ? botIds.includes(slice.id) ? botRow(slice.id) : null : slice.kind === "folders" ? <FolderSections connection={connection} rows={(inbox ?? []).filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} showHostBadge filtered={filtered} renderRow={inboxRow}/> : slicedConversation ? slice.inbox ? inboxRow(slice.inbox) : isGroup(slicedConversation) ? groupRow(slicedConversation) : row(slicedConversation) : null : <>
-    {inbox ? <>{globalSection}<FolderSections connection={connection} rows={inbox.filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} filtered={filtered} renderRow={inboxRow}/></> : <>
+    {slice ? slice.kind === "bot" ? botIds.includes(slice.id) ? botRow(slice.id) : null : slice.kind === "folders" ? <FolderSections connection={connection} hostId={hostId} rows={(inbox ?? []).filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} showHostBadge filtered={filtered} renderRow={inboxRow}/> : slice.kind === "folder" ? <FolderSections connection={connection} hostId={hostId} folderFilter={slice.folderId} crossHost={slice.crossHost} rows={(inbox ?? []).filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} showHostBadge filtered={filtered} renderRow={inboxRow}/> : slicedConversation ? slice.inbox ? inboxRow(slice.inbox) : isGroup(slicedConversation) ? groupRow(slicedConversation) : row(slicedConversation) : null : <>
+    {inbox ? <>{globalSection}<FolderSections connection={connection} hostId={hostId} rows={inbox.filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} filtered={filtered} renderRow={inboxRow}/></> : <>
     {globalSection}
 
     {!!botIds.length && <section aria-label={t("Bot")}><SidebarListHeading>{t("Bot")}</SidebarListHeading>{botIds.map(botRow)}</section>}

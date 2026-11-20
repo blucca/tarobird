@@ -965,7 +965,9 @@ test('folder moves with identical conversation IDs stay on their originating hos
     await expect(sidebar(page).locator('.folder-heading').filter({ hasText: 'A 分组' }).getByLabel('运行于 主机 A', { exact: true })).toBeVisible();
     await expect(sidebar(page).locator('.folder-heading').filter({ hasText: 'B 分组' }).getByLabel('运行于 主机 B', { exact: true })).toBeVisible();
     await page.setViewportSize({ width: 390, height: 844 });
-    await expect(mobileHome(page).locator('.mh-folder-host')).toHaveCount(2);
+    await openMobileHome(page);
+    await expect(mobileHome(page).locator('.folder-heading').filter({ hasText: 'A 分组' }).getByLabel('运行于 主机 A', { exact: true })).toBeVisible();
+    await expect(mobileHome(page).locator('.folder-heading').filter({ hasText: 'B 分组' }).getByLabel('运行于 主机 B', { exact: true })).toBeVisible();
     await expect(mobileHome(page).locator('.mh-row')).toHaveCount(2);
   } finally { await page.close(); await a.close(); await b.close(); await rm(root, { recursive: true, force: true }); }
 });
@@ -987,7 +989,7 @@ for (const width of [1360, 390]) test(`folder dialogs release modal state when n
     await page.setViewportSize({ width, height: 844 });
     for (const entry of ['新建分组', '管理分组']) {
       await navigate(page, a); await openMobileHome(page);
-      await openFolderManager(page, '主机 A');
+      await openFolderManager(page);
       if (entry === '新建分组') await dialog(page, '管理分组').getByRole('button', { name: '新建分组', exact: true }).click();
       await expect(dialog(page, entry)).toBeVisible();
       if (entry === '新建分组') await dialog(page, entry).getByLabel('分组名称').fill('尚未保存');
@@ -999,14 +1001,14 @@ for (const width of [1360, 390]) test(`folder dialogs release modal state when n
       await expect(page.locator('dialog:modal')).toHaveCount(0);
     }
     if (width > 760) {
-      await openFolderManager(page, '主机 A');
+      await openFolderManager(page);
       await dialog(page, '管理分组').getByRole('button', { name: '新建分组', exact: true }).click();
       await page.setViewportSize({ width: 390, height: 844 });
       await expect(page.locator('dialog:modal')).toHaveCount(0);
     } else {
       // A same-host notification also leaves the mounted phone inbox hidden.
       await openMobileHome(page);
-      await openFolderManager(page, '主机 A');
+      await openFolderManager(page);
       await dialog(page, '管理分组').getByRole('button', { name: '新建分组', exact: true }).click();
       await navigate(page, a);
       await expect(page.locator('dialog:modal')).toHaveCount(0);

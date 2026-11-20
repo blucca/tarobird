@@ -2,20 +2,25 @@ import { GlobalPinSection } from "./GlobalPinSection.js";
 import { Fragment, type ReactNode } from "react";
 import { SidebarListHeading } from "./SidebarListOptions.js";
 import { buildBotRows, buildConversationRows, navigationItems, folderSectionHosts, type InboxHost } from "./conversation-inbox.js";
+import { resolveCrossHostFolderOrder, visibleCrossHostFolders } from "./cross-host-folder-order.js";
+import { buildCrossHostFolderSources, buildHostFolderRowCounts, useCrossHostFolderOrder, useHostFolderUpdates } from "./use-cross-host-folder-order.js";
 import type { SidebarSlice } from "./ConversationList.js";
 import type { SidebarLayout } from "./storage.js";
 import { t } from "./i18n.js";
 
 /** Only presentation is combined. Every rendered item keeps its host's
  * connection, avatars and action handlers, including when IDs coincide. */
-export function CombinedSidebar({ hosts, layout, showDisconnectedBots = false, leadingSection, retained, render }: {
+export function CombinedSidebar({ hosts, layout, showDisconnectedBots = false, filtered = false, leadingSection, retained, render }: {
   hosts: InboxHost[];
   layout: SidebarLayout;
   showDisconnectedBots?: boolean;
+  filtered?: boolean;
   leadingSection?: ReactNode;
   retained?: (hostId: string) => ReadonlySet<string>;
   render: (hostId: string, slice: SidebarSlice, showHostBadge: boolean) => ReactNode;
 }) {
+  useHostFolderUpdates(hosts);
+  const crossHostOrder = useCrossHostFolderOrder();
   const listed = hosts.map(host => ({ ...host, ...navigationItems(host, showDisconnectedBots, retained?.(host.id)) }));
   const visibleHosts = hosts.map((host, i) => ({ ...host, conversations: listed[i]!.conversations }));
   const hiddenBots = listed.some((host, i) => host.bots.length < hosts[i]!.bots.length);
@@ -28,11 +33,19 @@ export function CombinedSidebar({ hosts, layout, showDisconnectedBots = false, l
   if (layout === "conversations") {
     const folderHosts = folderSectionHosts(hosts, rows);
     const folderHostIds = new Set(folderHosts.map(host => host.id));
+    const allSources = buildCrossHostFolderSources(hosts);
+    const folderSources = buildCrossHostFolderSources(folderHosts);
+    const orderedFolders = folderHosts.length ? resolveCrossHostFolderOrder(folderSources, crossHostOrder) : [];
+    const visibleFolders = orderedFolders.length
+      ? visibleCrossHostFolders(orderedFolders, buildHostFolderRowCounts(folderHosts, rows), filtered)
+      : [];
+    const visibleKeys = visibleFolders.map(item => item.key);
+    const hasAnyPinned = visibleFolders.some(item => item.pinned);
     return <nav className="conversation-list conversation-inbox combined-sidebar">
       {globalSection}{leadingSection}
-      {/* Custom folders belong to their host. Keep their saved order (including
-          Unfiled), identify the folder once, and omit badges on its children. */}
-      {folderHosts.map(host => <Fragment key={host.id}>{render(host.id, { kind: "folders" }, false)}</Fragment>)}
+      {/* Custom folders belong to their host. Interleave only their display
+          order across hosts; identify each folder once and omit child badges. */}
+      {visibleFolders.map(item => <Fragment key={item.key}>{render(item.hostId, { kind: "folder", folderId: item.folderId, crossHost: { sources: allSources, visibleKeys, itemKey: item.key, hasAnyPinned } }, false)}</Fragment>)}
       {rows.filter(row => !folderHostIds.has(row.hostId)).map(row => <Fragment key={row.key}>{render(row.hostId, { kind: "conversation", id: row.conversation.id, inbox: row }, true)}</Fragment>)}
       {!allRows.length && (!folderHosts.length || hiddenItems) && <p className="empty-sidebar">{emptyText}</p>}
     </nav>;

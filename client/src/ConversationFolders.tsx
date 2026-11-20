@@ -4,8 +4,19 @@ import { ArrowDown, ArrowUp, ArrowUpToLine, Check, ChevronDown, ChevronRight, Fo
 import { conversationFolderOrder, emptyConversationFolders, isFolderPinned, type FolderEdit } from '../../src/client-protocol/conversation-folders.js';
 import type { HubConnection } from './connection.js';
 import type { InboxRow } from './conversation-inbox.js';
+import {
+  applyCrossHostFolderMove,
+  applyCrossHostFolderPin,
+  commitCrossHostFolderOrder,
+  recordCrossHostFolderPin,
+  resolveCrossHostFolderOrder,
+  saveCrossHostFolderOrder,
+  type CrossHostFolderSource,
+  type StoredCrossHostFolderOrder,
+} from './cross-host-folder-order.js';
+import { buildCrossHostFolderSources, useCrossHostFolderOrder, useHostFolderUpdates } from './use-cross-host-folder-order.js';
 import { HostSourceBadge } from './HostSourceBadge.js';
-import { FolderOrderEditor, useFolderOrder } from './FolderOrderEditor.js';
+import { FolderOrderEditor, FolderOrderList, useFolderOrder, type FolderOrderRow } from './FolderOrderEditor.js';
 import { CreationDialog } from './CreationDialog.js';
 import { DesktopMenu } from './DesktopMenu.js';
 import { RuntimeHostContext } from './RuntimeHost.js';
@@ -14,6 +25,13 @@ import { createPortal } from 'react-dom';
 import { useConversationHold } from './useConversationHold.js';
 import { t, useLocale } from './i18n.js';
 import './conversation-folders.css';
+
+export type CrossHostFolderActionsContext = {
+  sources: CrossHostFolderSource[];
+  visibleKeys: string[];
+  itemKey: string;
+  hasAnyPinned: boolean;
+};
 
 function useFolders(connection: HubConnection) {
   return useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);
@@ -32,14 +50,17 @@ function useFolderSave(connection: HubConnection) {
   return { busy, error, setError, save };
 }
 
-type FolderHost = { id: string; name: string; connection: HubConnection };
-export function FolderListOptions({ children, options, hosts, defaultConnection, visible, scope }: { children: ReactNode; options: ReactNode; hosts: FolderHost[]; defaultConnection?: HubConnection; visible: boolean; scope: string }) {
+export type FolderHost = { id: string; name: string; connection: HubConnection };
+export function FolderListOptions({ children, options, hosts, defaultConnection, visible, scope, combined = false }: {
+  children: ReactNode; options: ReactNode; hosts: FolderHost[]; defaultConnection?: HubConnection; visible: boolean; scope: string; combined?: boolean;
+}) {
   const bulk = useConversationBulk();
   const trigger = useRef<HTMLElement | null>(null);
-  const [manager, setManager] = useState<FolderHost>();
-  const current = manager && hosts.find(host => host.connection === manager.connection);
-  useEffect(() => { setManager(undefined); }, [visible, scope, bulk?.active]);
-  useEffect(() => { if (manager && !current) setManager(undefined); }, [manager, current]);
+  const [manager, setManager] = useState<{ mode: 'single'; host: FolderHost } | { mode: 'cross'; defaultHostId?: string }>();
+  const current = manager?.mode === 'single' ? hosts.find(host => host.connection === manager.host.connection) : undefined;
+  useEffect(() => { setManager(undefined); }, [visible, scope, bulk?.active, combined]);
+  useEffect(() => { if (manager?.mode === 'single' && !current) setManager(undefined); }, [manager, current]);
+  useEffect(() => { if (manager?.mode === 'cross' && hosts.length < 2) setManager(undefined); }, [manager, hosts.length]);
   useEffect(() => {
     const layout = matchMedia('(max-width:760px)'), close = () => setManager(undefined);
     layout.addEventListener('change', close);
@@ -47,12 +68,19 @@ export function FolderListOptions({ children, options, hosts, defaultConnection,
   }, []);
   const manageFolders = hosts.length ? (element: HTMLElement | null, connection?: HubConnection) => {
     const hostId = element?.closest<HTMLElement>('[data-host-id]')?.dataset.hostId;
-    const host = connection ? hosts.find(host => host.connection === connection) : hostId ? hosts.find(host => host.id === hostId) : hosts.find(host => host.connection === defaultConnection) ?? hosts[0];
-    if (!visible || bulk?.active || !host) return;
-    trigger.current = element; setManager(host);
+    const host = connection ? hosts.find(item => item.connection === connection) : hostId ? hosts.find(item => item.id === hostId) : hosts.find(item => item.connection === defaultConnection) ?? hosts[0];
+    if (!visible || bulk?.active) return;
+    trigger.current = element;
+    if (combined && hosts.length > 1) {
+      setManager({ mode: 'cross', defaultHostId: host?.id });
+      return;
+    }
+    if (!host) return;
+    setManager({ mode: 'single', host });
   } : undefined;
   return <><SidebarListOptions options={options} visible={visible} disabled={bulk?.active} scope={scope} manageFolders={manageFolders}>{children}</SidebarListOptions>
-    {visible && !bulk?.active && current && createPortal(<RuntimeHostContext.Provider value={current.name}><FolderManager connection={current.connection} initialView="manage" returnFocus={trigger} close={() => setManager(undefined)}/></RuntimeHostContext.Provider>, document.body)}
+    {visible && !bulk?.active && manager?.mode === 'single' && current && createPortal(<RuntimeHostContext.Provider value={current.name}><FolderManager connection={current.connection} initialView="manage" returnFocus={trigger} close={() => setManager(undefined)}/></RuntimeHostContext.Provider>, document.body)}
+    {visible && !bulk?.active && manager?.mode === 'cross' && hosts.length > 1 && createPortal(<CrossHostFolderManager hosts={hosts} defaultHostId={manager.defaultHostId} returnFocus={trigger} close={() => setManager(undefined)}/>, document.body)}
   </>;
 }
 
@@ -83,7 +111,9 @@ function setFolderCollapsed(host: string, key: string, folded: boolean): void {
 const subscribeCollapsedFolders = (notify: () => void) => { collapseListeners.add(notify); return () => { collapseListeners.delete(notify); }; };
 /** Both layouts share membership/order. Collapsing affects presentation only;
  * active search and unread/attention filters always reveal matching rows. */
-export function FolderSections({ connection, rows, renderRow, filtered = false, holdActions = false, visible, hostName, showHostBadge = false }: { connection: HubConnection; rows: InboxRow[]; renderRow: (row: InboxRow) => ReactNode; filtered?: boolean; holdActions?: boolean; visible: boolean; hostName?: string; showHostBadge?: boolean }) {
+export function FolderSections({ connection, hostId, rows, renderRow, filtered = false, holdActions = false, visible, hostName, showHostBadge = false, folderFilter, crossHost }: {
+  connection: HubConnection; hostId?: string; rows: InboxRow[]; renderRow: (row: InboxRow) => ReactNode; filtered?: boolean; holdActions?: boolean; visible: boolean; hostName?: string; showHostBadge?: boolean; folderFilter?: string | null; crossHost?: CrossHostFolderActionsContext;
+}) {
   useLocale(); const bulk = useConversationBulk(); const state = useFolders(connection), prefix = useId();
   const collapseHost = connection.identity.hubPublicKey ?? "";
   const collapsed = useSyncExternalStore(subscribeCollapsedFolders, () => readCollapsedFolders()[collapseHost] ?? noCollapsedFolders);
@@ -91,7 +121,7 @@ export function FolderSections({ connection, rows, renderRow, filtered = false, 
   const [renaming, setRenaming] = useState<RenameFolder>();
   const [action, setAction] = useState<{ id: string | null; point?: { x: number; y: number } }>();
   const folders = state.conversationFolders?.folders ?? [];
-  useConversationHold(root, `${filtered}`, visible && !bulk?.active && holdActions && !!folders.length, heading => {
+  useConversationHold(root, `${filtered}`, visible && !bulk?.active && holdActions && (!!folders.length || !!crossHost), heading => {
     trigger.current = heading;
     setAction({ id: heading.dataset.renameFolderId || null });
   }, '.folder-heading[data-rename-folder-id]');
@@ -112,54 +142,114 @@ export function FolderSections({ connection, rows, renderRow, filtered = false, 
   // Combined lists that identify sources on folder headings also need the
   // system Unfiled heading for a host with no custom folders. This creates no
   // folder metadata and keeps every action bound to the original connection.
-  if (!folders.length && !showHostBadge) return <>{rows.map(row => <div key={row.key}>{renderRow(row)}</div>)}</>;
+  if (!folders.length && !showHostBadge && folderFilter === undefined) return <>{rows.map(row => <div key={row.key}>{renderRow(row)}</div>)}</>;
   const assignments = new Map(state.conversationFolders?.assignments.map(a => [a.conversationId, a.folderId]));
   const known = new Set(folders.map(f => f.id));
-  return <div className="folder-sections" ref={root}>{conversationFolderOrder(state.conversationFolders ?? emptyConversationFolders()).map(id => {
-    const folder = id === null ? { id: '', name: t('未分组') } : folders.find(folder => folder.id === id)!;
+  const ids = folderFilter !== undefined
+    ? (folderFilter === null || known.has(folderFilter) ? [folderFilter] : [])
+    : conversationFolderOrder(state.conversationFolders ?? emptyConversationFolders());
+  return <div className="folder-sections" ref={root}>{ids.map(id => {
+    const folder = id === null ? { id: '', name: t('未分组') } : folders.find(item => item.id === id);
+    if (!folder) return null;
     const children = rows.filter(row => (known.has(assignments.get(row.conversation.id) ?? '') ? assignments.get(row.conversation.id) : '') === folder.id);
-    if (filtered && !children.length) return null;
+    if ((filtered || !folders.length && folderFilter !== undefined) && !children.length) return null;
     const key = folder.id || 'unfiled', folded = !filtered && !!collapsed[key];
     const unread = children.reduce((sum, row) => sum + row.unread, 0);
     const attention = children.some(row => row.attention.length > 0);
     const pinned = isFolderPinned(state.conversationFolders ?? emptyConversationFolders(), id);
     return <section className="conversation-folder" data-folder-id={folder.id} data-pinned={pinned || undefined} key={key}>
-      <button type="button" className="folder-heading" data-rename-folder-id={folder.id} aria-expanded={!folded} aria-controls={`${prefix}_${key}`} onClick={() => setFolderCollapsed(collapseHost, key, !folded)}
+      <button type="button" className="folder-heading" data-host-id={hostId} data-rename-folder-id={folder.id} aria-expanded={!folded} aria-controls={`${prefix}_${key}`} onClick={() => setFolderCollapsed(collapseHost, key, !folded)}
         onContextMenu={event => { event.preventDefault(); event.stopPropagation(); const rect = event.currentTarget.getBoundingClientRect(); openActions(event.currentTarget, id, { x: event.clientX || rect.left, y: event.clientY || rect.bottom }); }}
         onKeyDown={event => { if (event.key === 'ContextMenu' || event.key === 'F10' && event.shiftKey) { event.preventDefault(); event.stopPropagation(); const rect = event.currentTarget.getBoundingClientRect(); openActions(event.currentTarget, id, { x: rect.left, y: rect.bottom }); } }}>
         {folded ? <ChevronRight size={14}/> : <ChevronDown size={14}/>}<span className="folder-label"><span className="folder-name">{folder.name}</span><span className="folder-count">{children.length}</span>{pinned && <Pin size={12} className="folder-pin" role="img" aria-label={t('已置顶')}/>}</span>{showHostBadge && hostName && <HostSourceBadge name={hostName}/>}{folded && unread > 0 && <b className="unread-badge" role="img" aria-label={t("{0} 条新消息", unread)} title={t("{0} 条新消息", unread)}>{unread}</b>}{folded && attention && <span className="folder-attention" role="img" aria-label={t('需要处理')}/>}
       </button>
       <div id={`${prefix}_${key}`} hidden={folded}>{children.length ? children.map(row => <div key={row.key}>{renderRow(row)}</div>) : <p className="folder-empty">{t('暂无对话')}</p>}</div>
     </section>;
-  })}{visible && action && <RuntimeHostContext.Provider value={hostName}><FolderActions key={action.id ?? "unfiled"} connection={connection} folderId={action.id} point={action.point} returnFocus={trigger} close={() => setAction(undefined)} rename={folder => { setAction(undefined); setRenaming(folder); }}/></RuntimeHostContext.Provider>}{visible && renaming && <RuntimeHostContext.Provider value={hostName}><FolderManager connection={connection} initialView="rename" initialFolder={renaming} returnFocus={trigger} close={() => setRenaming(undefined)}/></RuntimeHostContext.Provider>}</div>;
+  })}{visible && action && <RuntimeHostContext.Provider value={hostName}><FolderActions key={action.id ?? "unfiled"} connection={connection} folderId={action.id} hostName={hostName} showHostBadge={showHostBadge} crossHost={crossHost} point={action.point} returnFocus={trigger} close={() => setAction(undefined)} rename={folder => { setAction(undefined); setRenaming(folder); }}/></RuntimeHostContext.Provider>}{visible && renaming && <RuntimeHostContext.Provider value={hostName}><FolderManager connection={connection} initialView="rename" initialFolder={renaming} returnFocus={trigger} close={() => setRenaming(undefined)}/></RuntimeHostContext.Provider>}</div>;
 }
 
-function FolderActions({ connection, folderId, point, returnFocus, close, rename }: { connection: HubConnection; folderId: string | null; point?: { x: number; y: number }; returnFocus: RefObject<HTMLElement | null>; close: () => void; rename: (folder: RenameFolder) => void }) {
+function FolderActions({ connection, folderId, hostName, showHostBadge = false, crossHost, point, returnFocus, close, rename }: {
+  connection: HubConnection; folderId: string | null; hostName?: string; showHostBadge?: boolean; crossHost?: CrossHostFolderActionsContext; point?: { x: number; y: number }; returnFocus: RefObject<HTMLElement | null>; close: () => void; rename: (folder: RenameFolder) => void;
+}) {
   const state = useFolders(connection), { busy, error, save } = useFolderSave(connection);
+  const crossHostOrder = useCrossHostFolderOrder();
   const menuId = useId();
   const folders = state.conversationFolders ?? emptyConversationFolders();
-  const order = conversationFolderOrder(folders), index = order.indexOf(folderId);
-  const folder = folders.folders.find(folder => folder.id === folderId);
+  const folder = folders.folders.find(item => item.id === folderId);
   const name = folderId === null ? t('未分组') : folder?.name ?? '';
   const allowed = state.status === 'online' && !!state.foldersAvailable;
-  const canReorder = allowed && state.folderReorderAvailable && index >= 0;
   const pinned = isFolderPinned(folders, folderId);
-  const peers = order.filter(id => isFolderPinned(folders, id) === pinned);
-  const first = order.indexOf(peers[0]!), last = order.indexOf(peers.at(-1)!);
+
+  let index: number;
+  let first: number;
+  let last: number;
+  let canReorder: boolean;
+  let hasPinned: boolean;
+  let singleOrder: (string | null)[] = [];
+
+  if (crossHost) {
+    const resolved = resolveCrossHostFolderOrder(crossHost.sources, crossHostOrder);
+    const pinnedByKey = new Map(resolved.map(item => [item.key, item.pinned]));
+    const visibleKeys = crossHost.visibleKeys;
+    index = visibleKeys.indexOf(crossHost.itemKey);
+    const peers = visibleKeys.filter(key => pinnedByKey.get(key) === pinned);
+    first = peers.length ? visibleKeys.indexOf(peers[0]!) : -1;
+    last = peers.length ? visibleKeys.indexOf(peers.at(-1)!) : -1;
+    canReorder = index >= 0;
+    hasPinned = crossHost.hasAnyPinned;
+  } else {
+    singleOrder = conversationFolderOrder(folders);
+    index = singleOrder.indexOf(folderId);
+    canReorder = allowed && !!state.folderReorderAvailable && index >= 0;
+    const peers = singleOrder.filter(id => isFolderPinned(folders, id) === pinned);
+    first = peers.length ? singleOrder.indexOf(peers[0]!) : -1;
+    last = peers.length ? singleOrder.indexOf(peers.at(-1)!) : -1;
+    hasPinned = !!folders.pinnedFolderIds?.length;
+  }
+
   const done = () => { returnFocus.current?.focus({ preventScroll: true }); close(); };
-  const move = (target: number) => {
-    if (!canReorder || busy || target < first || target > last || target === index) return;
-    const next = [...order]; next.splice(target, 0, ...next.splice(index, 1));
+  const doneAfterReorder = () => {
+    close();
+    requestAnimationFrame(() => returnFocus.current?.focus({ preventScroll: true }));
+  };
+  const move = (destination: 'up' | 'down' | 'top') => {
+    if (!canReorder || busy) return;
+    if (crossHost) {
+      if ((destination === 'up' || destination === 'top') && index === first) return;
+      if (destination === 'down' && index === last) return;
+      applyCrossHostFolderMove(crossHost.sources, crossHost.itemKey, destination, crossHost.visibleKeys);
+      doneAfterReorder();
+      return;
+    }
+    const target = destination === 'top' ? first : destination === 'up' ? index - 1 : index + 1;
+    if (target < first || target > last || target === index) return;
+    const next = [...singleOrder]; next.splice(target, 0, ...next.splice(index, 1));
     void save({ type: 'reorder', folderIds: next }, done, folders.revision);
   };
+  const togglePin = () => {
+    const sourcesBefore = crossHost?.sources;
+    const targetKey = crossHost?.itemKey;
+    void save({ type: 'pin', id: folderId, pinned: !pinned }, () => {
+      if (sourcesBefore && targetKey) {
+        applyCrossHostFolderPin(sourcesBefore, targetKey, !pinned);
+        doneAfterReorder();
+      } else {
+        done();
+      }
+    }, folders.revision);
+  };
+
   const contents = <>
-    <p className="folder-action-name">{name}</p>
-    <button type="button" data-menu-keep disabled={!allowed || !state.folderPinAvailable || busy} onClick={() => { void save({ type: 'pin', id: folderId, pinned: !pinned }, done, folders.revision); }}>{pinned ? <PinOff size={18}/> : <Pin size={18}/>}<span>{pinned ? t('取消置顶') : t('置顶分组')}</span></button>
-    <button type="button" data-menu-keep disabled={!canReorder || busy || index === first} onClick={() => move(index - 1)}><ArrowUp size={18}/><span>{t('上移一位')}</span></button>
-    <button type="button" data-menu-keep disabled={!canReorder || busy || index === last} onClick={() => move(index + 1)}><ArrowDown size={18}/><span>{t('下移一位')}</span></button>
-    <button type="button" data-menu-keep disabled={!canReorder || busy || index === first} onClick={() => move(first)}><ArrowUpToLine size={18}/><span>{folders.pinnedFolderIds?.length ? t('移到同类分组最上面') : t('移到最上面')}</span></button>
+    {showHostBadge && hostName
+      ? <div className="folder-action-header"><p className="folder-action-name">{name}</p><HostSourceBadge name={hostName}/></div>
+      : <p className="folder-action-name">{name}</p>}
+    <button type="button" data-menu-keep disabled={!allowed || !state.folderPinAvailable || busy} onClick={togglePin}>{pinned ? <PinOff size={18}/> : <Pin size={18}/>}<span>{pinned ? t('取消置顶') : t('置顶分组')}</span></button>
+    <button type="button" data-menu-keep disabled={!canReorder || busy || index === first} onClick={() => move('up')}><ArrowUp size={18}/><span>{t('上移一位')}</span></button>
+    <button type="button" data-menu-keep disabled={!canReorder || busy || index === last} onClick={() => move('down')}><ArrowDown size={18}/><span>{t('下移一位')}</span></button>
+    <button type="button" data-menu-keep disabled={!canReorder || busy || index === first} onClick={() => move('top')}><ArrowUpToLine size={18}/><span>{hasPinned ? t('移到同类分组最上面') : t('移到最上面')}</span></button>
     {folder && <button type="button" disabled={!allowed || busy} onClick={() => rename({ ...folder, revision: folders.revision })}><Pencil size={18}/><span>{t('重命名分组')}</span></button>}
-    {!canReorder && <p className="folder-action-note">{state.status !== 'online' ? t('连接恢复后可调整分组顺序。') : t('此主机尚未支持调整分组顺序，请更新运行 Bot 的电脑上的 TaroBird。')}</p>}
+    {!crossHost && !canReorder && <p className="folder-action-note">{state.status !== 'online' ? t('连接恢复后可调整分组顺序。') : t('此主机尚未支持调整分组顺序，请更新运行 Bot 的电脑上的 TaroBird。')}</p>}
+    {crossHost && !allowed && <p className="folder-action-note">{t('连接恢复或主机升级后可编辑分组')}</p>}
     {allowed && !state.folderPinAvailable && <p className="folder-action-note">{t('此主机尚未支持置顶分组，请更新运行 Bot 的电脑上的 TaroBird。')}</p>}
     {error && <p className="error-text folder-action-note" role="alert">{error}</p>}
     {point && <SidebarListSettings trigger={returnFocus} connection={connection}/>}
@@ -226,4 +316,175 @@ export function FolderManager({ connection, initialView, initialFolder, returnFo
     {!allowed && <p className="muted" role="status">{t('连接恢复或主机升级后可编辑分组')}</p>}
     {error && <p className="error-text" role="alert">{error}</p>}
   </CreationDialog>;
+}
+
+type CrossHostEditTarget = { hostId: string; folderId: string; revision: number };
+/** Unified folder manager for the combined multi-host view. Reordering updates
+ * App-local cross-host display order without migrating folders or altering per-host
+ * Hub sync contracts; create/rename/delete/pin route strictly to the owning host. */
+export function CrossHostFolderManager({ hosts, defaultHostId, returnFocus, close }: {
+  hosts: FolderHost[]; defaultHostId?: string; returnFocus: RefObject<HTMLElement | null>; close: () => void;
+}) {
+  useLocale();
+  useHostFolderUpdates(hosts);
+  const stored = useCrossHostFolderOrder();
+  const [draft, setDraft] = useState<StoredCrossHostFolderOrder | undefined>();
+  const [view, setView] = useState<'manage' | 'create' | 'rename' | 'delete'>('manage');
+  const [busy, setBusy] = useState(false), [error, setError] = useState('');
+  const [target, setTarget] = useState<CrossHostEditTarget | undefined>();
+  const [name, setName] = useState('');
+  const [createHostId, setCreateHostId] = useState('');
+  const createHostSelectId = useId();
+  const alive = useRef(true), saving = useRef(false), input = useRef<HTMLInputElement>(null);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+  useEffect(() => { if (view === 'create' || view === 'rename') input.current?.select(); }, [view]);
+
+  const sources = buildCrossHostFolderSources(hosts);
+  const hostById = new Map(hosts.map(host => [host.id, host]));
+  const editableHosts = hosts.filter(host => host.connection.state.status === 'online' && !!host.connection.state.foldersAvailable);
+  const savedItems = resolveCrossHostFolderOrder(sources, stored);
+  const displayedItems = resolveCrossHostFolderOrder(sources, draft ?? stored);
+  const savedKeys = savedItems.map(item => item.key);
+  const displayedKeys = displayedItems.map(item => item.key);
+  const changed = draft !== undefined && JSON.stringify(displayedKeys) !== JSON.stringify(savedKeys);
+  const hasPinned = displayedItems.some(item => item.pinned);
+
+  const targetHost = target ? hostById.get(target.hostId) : undefined;
+  const targetState = targetHost?.connection.state;
+  const targetAllowed = targetState?.status === 'online' && !!targetState.foldersAvailable;
+  const targetFolder = target ? targetState?.conversationFolders?.folders.find(item => item.id === target.folderId) : undefined;
+  const createHost = hostById.get(createHostId) ?? editableHosts[0];
+  const createAllowed = createHost?.connection.state.status === 'online' && !!createHost.connection.state.foldersAvailable;
+
+  useEffect(() => {
+    if ((view === 'rename' || view === 'delete') && !targetHost) {
+      setView('manage'); setTarget(undefined); setError('');
+    }
+  }, [view, targetHost]);
+
+  const back = () => { setError(''); setView('manage'); setTarget(undefined); };
+  const runHostEdit = async (connection: HubConnection, edit: FolderEdit, revision: number | undefined, onSuccess: () => void) => {
+    if (saving.current) return;
+    saving.current = true; setBusy(true); setError('');
+    try {
+      await connection.changeConversationFolders(edit, revision);
+      if (alive.current) onSuccess();
+    } catch (e) {
+      if (alive.current) setError(e instanceof Error ? e.message : t('操作失败'));
+    } finally {
+      saving.current = false;
+      if (alive.current) setBusy(false);
+    }
+  };
+
+  const rows: FolderOrderRow[] = displayedItems.map(item => {
+    const host = hostById.get(item.hostId);
+    const state = host?.connection.state;
+    const allowed = state?.status === 'online' && !!state.foldersAvailable;
+    return {
+      key: item.key,
+      folderId: item.folderId,
+      name: item.folderId === null ? t('未分组') : item.name ?? '',
+      hostName: item.hostName,
+      pinned: item.pinned,
+      canEdit: allowed && !busy,
+      canPin: allowed && !!state?.folderPinAvailable && !busy,
+    };
+  });
+
+  const openCreate = () => {
+    const preferred = editableHosts.find(host => host.id === defaultHostId) ?? editableHosts[0];
+    setError('');
+    setName('');
+    setCreateHostId(preferred?.id ?? '');
+    setView('create');
+  };
+
+  const title = view === 'create' ? t('新建分组') : view === 'rename' ? t('重命名分组') : view === 'delete' ? t('删除分组') : t('管理分组');
+  const dialogHostName = view === 'rename' || view === 'delete' ? targetHost?.name : undefined;
+
+  return <RuntimeHostContext.Provider value={dialogHostName}>
+    <CreationDialog mobilePage showHost={!!dialogHostName} onBack={view === 'manage' ? undefined : back} title={title} closeLabel={t('关闭分组')} className="folder-dialog folder-manager-dialog" returnFocus={returnFocus} busy={busy} close={close}>
+      {view === 'manage' ? <>
+        <p className="folder-order-hint muted">{t('拖动手柄排序后保存；点“…”重命名或删除分组。')}</p>
+        <p className="folder-order-hint muted">{t('跨主机显示顺序仅保存在本设备；分组内容和置顶仍归属各自所属主机。')}</p>
+        {hasPinned && <p className="folder-order-hint muted">{t('置顶分组始终在前；可在置顶或普通分组内排序。')}</p>}
+        <FolderOrderList
+          rows={rows}
+          canReorder={!busy}
+          showMoveTop
+          reorder={nextKeys => setDraft(prev => commitCrossHostFolderOrder(prev ?? stored, sources, nextKeys))}
+          pin={(row, nextPinned) => {
+            const item = displayedItems.find(entry => entry.key === row.key);
+            const host = item ? hostById.get(item.hostId) : undefined;
+            if (!item || !host) return;
+            const sourcesBefore = sources;
+            const expected = host.connection.state.conversationFolders?.revision ?? 0;
+            void runHostEdit(host.connection, { type: 'pin', id: item.folderId, pinned: nextPinned }, expected, () => {
+              applyCrossHostFolderPin(sourcesBefore, item.key, nextPinned);
+              setDraft(prev => prev ? recordCrossHostFolderPin(prev, sourcesBefore, item.key, nextPinned) : undefined);
+            });
+          }}
+          rename={row => {
+            const item = displayedItems.find(entry => entry.key === row.key);
+            const host = item ? hostById.get(item.hostId) : undefined;
+            if (!item || !host || item.folderId === null) return;
+            setError('');
+            setName(row.name);
+            setTarget({ hostId: host.id, folderId: item.folderId, revision: host.connection.state.conversationFolders?.revision ?? 0 });
+            setView('rename');
+          }}
+          remove={row => {
+            const item = displayedItems.find(entry => entry.key === row.key);
+            const host = item ? hostById.get(item.hostId) : undefined;
+            if (!item || !host || item.folderId === null) return;
+            setError('');
+            setTarget({ hostId: host.id, folderId: item.folderId, revision: host.connection.state.conversationFolders?.revision ?? 0 });
+            setView('delete');
+          }}
+        />
+        <button type="button" className="folder-new-choice" disabled={busy || !editableHosts.length} onClick={openCreate}><Plus size={18}/>{t('新建分组')}</button>
+        {!editableHosts.length && <p className="muted" role="status">{t('连接恢复或主机升级后可编辑分组')}</p>}
+        <div className="folder-dialog-actions">
+          <button type="button" disabled={busy} onClick={close}>{t('取消')}</button>
+          <button type="button" className="primary" disabled={busy || !changed} onClick={() => { saveCrossHostFolderOrder(sources, displayedKeys); close(); }}>{t('保存')}</button>
+        </div>
+      </> : view === 'delete' ? <>
+        <p>{targetFolder ? t('删除「{0}」分组？', targetFolder.name) : t('此分组已删除，请重新选择')}</p>
+        <p className="muted">{t('对话将移回“未分组”，聊天记录保留。')}</p>
+        {!targetAllowed && <p className="muted" role="status">{t('连接恢复或主机升级后可编辑分组')}</p>}
+        <div className="folder-dialog-actions">
+          <button type="button" disabled={busy} onClick={back}>{t('取消')}</button>
+          <button type="button" className="danger" disabled={busy || !targetAllowed || !targetFolder || !targetHost || !target} onClick={() => {
+            if (!targetHost || !target) return;
+            void runHostEdit(targetHost.connection, { type: 'delete', id: target.folderId }, target.revision, back)
+              .then(() => { if (alive.current) setTarget(old => old ? { ...old, revision: targetHost.connection.state.conversationFolders?.revision ?? old.revision } : old); });
+          }}>{t('删除分组')}</button>
+        </div>
+      </> : <form onSubmit={event => {
+        event.preventDefault();
+        if (!name.trim()) return;
+        if (view === 'create') {
+          if (!createHost || !createAllowed) return;
+          void runHostEdit(createHost.connection, { type: 'create', id: crypto.randomUUID(), name: name.trim() }, undefined, back);
+          return;
+        }
+        if (!targetHost || !target || !targetAllowed || !targetFolder) return;
+        void runHostEdit(targetHost.connection, { type: 'rename', id: target.folderId, name: name.trim() }, target.revision, back)
+          .then(() => { if (alive.current) setTarget(old => old ? { ...old, revision: targetHost.connection.state.conversationFolders?.revision ?? old.revision } : old); });
+      }}>
+        {view === 'create' && <><label htmlFor={createHostSelectId}>{t('所属主机')}</label><select id={createHostSelectId} value={createHost?.id ?? ''} disabled={busy} onChange={e => setCreateHostId(e.target.value)}>{hosts.map(host => {
+          const ready = host.connection.state.status === 'online' && !!host.connection.state.foldersAvailable;
+          return <option key={host.id} value={host.id} disabled={!ready}>{ready ? host.name : t('{0}（不可用）', host.name)}</option>;
+        })}</select></>}
+        <label>{t('分组名称')}<input ref={input} value={name} maxLength={48} required disabled={busy} onChange={e => setName(e.target.value)} onKeyDown={imeEnter}/></label>
+        {(view === 'create' ? !createAllowed : !targetAllowed) && <p className="muted" role="status">{t('连接恢复或主机升级后可编辑分组')}</p>}
+        <div className="folder-dialog-actions">
+          <button type="button" disabled={busy} onClick={back}>{t('取消')}</button>
+          <button type="submit" className="primary" disabled={busy || !name.trim() || (view === 'create' ? !createAllowed : !targetAllowed || !targetFolder)}>{busy ? t('正在保存…') : t('保存')}</button>
+        </div>
+      </form>}
+      {error && <p className="error-text" role="alert">{error}</p>}
+    </CreationDialog>
+  </RuntimeHostContext.Provider>;
 }

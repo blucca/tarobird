@@ -11,6 +11,7 @@ import type { Route } from "./storage.js";
 import { DEFAULT_MONO_ACCENT, DEFAULT_PALETTE, isColorPalette, isMonoAccent } from "./palettes.js";
 import { normalizeLayoutDensity } from "./layout-density.js";
 import { hostProfileSchema, type HostProfileState } from "../../src/client-protocol/host-profile.js";
+import { removeCrossHostFolderOrderHost } from "./cross-host-folder-order.js";
 
 export type RuntimeHost = {
   id: string;
@@ -403,7 +404,9 @@ export class HostRegistry {
           const ids: string[] = JSON.parse(repair);
           await tx.objectStore("meta").put(JSON.stringify(ids.filter(value => value !== id)), "desktopMigrationRepair");
         }
-        await tx.objectStore("hosts").delete(id); await tx.done; this.changed();
+        await tx.objectStore("hosts").delete(id); await tx.done;
+        if (this.databaseName === "tarocub-hosts-v1") removeCrossHostFolderOrderHost(record.publicKey);
+        this.changed();
       } finally { cache?.close(); }
     });
     if (garbage) await this.collectGarbage(garbage);

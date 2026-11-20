@@ -51,7 +51,9 @@ for (const locale of ['zh', 'en']) test(`folder context menus own the correct ho
     await expect(menu().getByRole('button', { name: locale === 'en' ? 'Rename folder' : '重命名分组', exact: true })).toBeVisible();
     await menu().getByRole('button', { name: w.folders, exact: true }).click();
     await expect(manager().locator('.folder-order-name')).toContainText(['Folder 1']);
-    await expect(manager()).not.toContainText('Folder 2');
+    await expect(manager().locator('.folder-order-name')).toContainText(['Folder 2']);
+    await expect(manager().getByLabel(locale === 'en' ? 'Running on Studio 1' : '运行于 Studio 1', { exact: true }).first()).toBeVisible();
+    await expect(manager().getByLabel(locale === 'en' ? 'Running on Studio 2' : '运行于 Studio 2', { exact: true }).first()).toBeVisible();
     await manager().getByRole('button', { name: w.close, exact: true }).click();
     await expect(folder(1)).toBeFocused();
     await folder(2).focus(); await page.keyboard.press('Shift+F10');
