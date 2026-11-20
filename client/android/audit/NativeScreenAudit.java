@@ -60,6 +60,18 @@ public final class NativeScreenAudit {
                 check(item[3].equals(event(endingId,"close").getString("reason")),"hostCloseReasonCase"+i);
                 closedOnPeer(ending.getJSONObject("session").getString("id"));
             }
+            // A real Hub sends the session's state before "attached" on control: exactly that state may come first.
+            JSONObject first=join(false);JSONObject firstRegistered=new JSONObject(first.toString()).put("fixtureMode","state-first");
+            request(new JSONObject().put("action","register").put("join",firstRegistered));String firstId=transport.allocate("screen",document);transport.screenOpen(firstId,network,first);
+            List<String> order=new ArrayList<>();
+            for(int i=0;i<3;i++){JSONObject delivered=event(firstId,"screen");order.add(delivered.getJSONObject("value").getString("type"));transport.screenAck(firstId,delivered.getLong("deliverySequence"));}
+            check(order.contains("state")&&order.indexOf("state")<order.indexOf("attached"),"stateBeforeAttachedDelivered");
+            check(transport.screenClose(firstId),"earlyStateSessionStaysOpen");event(firstId,"close");closedOnPeer(first.getJSONObject("session").getString("id"));
+            // Nothing else may precede it: a state for another session, or a readiness message.
+            String[][] refused={{"foreign-state-first","foreignStateBeforeAttachedRefused"},{"ready-first","readyBeforeAttachedRefused"}};
+            for(String[] item:refused){JSONObject early2=join(false);request(new JSONObject().put("action","register").put("join",new JSONObject(early2.toString()).put("fixtureMode",item[0])));
+                String earlyId=transport.allocate("screen",document);try{transport.screenOpen(earlyId,network,early2);}catch(IOException closing){/* the refusal may already have retired it */}
+                check("screen_protocol_invalid".equals(event(earlyId,"close").getString("reason")),item[1]);closedOnPeer(early2.getJSONObject("session").getString("id"));}
             JSONObject controlling=join(true);String controlId=open(controlling);
             request(new JSONObject().put("action","control-state").put("id",controlling.getJSONObject("session").getString("id")).put("active",true));JSONObject leaseEvent=event(controlId,"screen");transport.screenAck(controlId,leaseEvent.getLong("deliverySequence"));
             JSONObject renew=command(controlling,"renew").put("leaseId",String.join("",Collections.nCopies(43,"L"))).put("challenge",String.join("",Collections.nCopies(43,"C"))).put("frameSequence",1);

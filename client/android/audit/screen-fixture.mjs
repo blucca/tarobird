@@ -34,6 +34,10 @@ wss.on('connection',(ws,req)=>{if(req.url==='/ws'){ws.on('message',data=>ws.send
   entry=[...joins.values()].find(j=>(role==='media'?j.mediaTicket:j.controlTicket)===value.ticket);if(value.type!=='hello'||!entry){ws.terminate();return;}helloCount++;
   const group=clients.get(entry.session.id)||{};group[role]=ws;clients.set(entry.session.id,group);
   if(entry.fixtureMode==='no-attach')return;
+  // A real Hub sends the session's state on control before 'attached'; these modes send one message first.
+  if(role==='control'&&entry.fixtureMode==='state-first')ws.send(JSON.stringify({type:'state',session:{...entry.session,state:'connecting'},serverTime:Date.now(),controlPending:false,streamGeneration:1}));
+  if(role==='control'&&entry.fixtureMode==='foreign-state-first')ws.send(JSON.stringify({type:'state',session:{...entry.session,id:'other-session',state:'connecting'},serverTime:Date.now()}));
+  if(role==='control'&&entry.fixtureMode==='ready-first')ws.send(JSON.stringify({type:'frame-ready',sessionId:entry.session.id,generation:entry.session.generation,streamGeneration:1,frameSequence:1,expiresAt:Date.now()+1000}));
   ws.send(JSON.stringify({type:'attached',sessionId:entry.session.id}));
   if(role==='media'){ws.send(JSON.stringify(stream));if(sample&&entry.fixtureMode==='frame'){const b=Buffer.alloc(32+sample.length);b[0]=1;b[1]=1;b.writeUInt16LE(1,2);b.writeUInt32LE(1,4);b.writeUInt32LE(1,8);b.writeUInt32LE(1,12);b.writeDoubleLE(Date.now(),16);b.writeUInt16LE(64,24);b.writeUInt16LE(64,26);b.writeUInt32LE(sample.length,28);sample.copy(b,32);ws.send(b);}}else ws.send(JSON.stringify({type:'state',session:entry.session,serverTime:Date.now()}));
  } else {commands.push({id:entry.session.id,role,value});if(entry.fixtureMode==='frame'&&entry.session.controlAllowed&&value.type==='control')ws.send(JSON.stringify({type:'state',session:{...entry.session,state:'controlling'},serverTime:Date.now(),lease:{id:'L'.repeat(43),challenge:'C'.repeat(43),expiresAt:Date.now()+6000,challengeExpiresAt:Date.now()+6000}}));}
