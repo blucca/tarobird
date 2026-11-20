@@ -66,6 +66,8 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
   onCall?: (method: string, params: Json) => Promise<Json>;
   runCron?: CronExecutor;
   beforeDisconnect?: () => void | Promise<void>;
+  /** Drain service-owned work after pending transport requests are cancelled. */
+  afterDisconnect?: () => void | Promise<void>;
   /** A successful durable receipt can outlive its final run-card publication. */
   onRecoveredDelivery?: () => Promise<void>;
   isBusy(): boolean { return this.processing.size > 0 || this.tasks.size > 0 || this.updates.size > 0 || this.runWriter.isBusy() || this.scopedRunWriter.isBusy() || this.transport.isBusy(); }
@@ -268,6 +270,7 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
     // Both writers register their pending durable batches before transport stop.
     const journalStop = this.runWriter.stop(), scopedStop = this.scopedRunWriter.stop();
     await this.transport.disconnect(); await Promise.allSettled([journalStop, scopedStop, ...this.tasks]);
+    await this.afterDisconnect?.();
     this.messageCache.clear(); this.cachedMessageBytes = 0; this.conversations.clear();
     this.runWriter = new GatewayRunWriter(input => this.transport.request("run.write", input));
     this.scopedRunWriter = new GatewayRunWriter(input => this.transport.request("run.scope.write", input));

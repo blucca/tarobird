@@ -60,6 +60,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   const channel = new GatewayChannel(new GatewayTransport(options));
   let disconnecting = false;
   const blockedPulls = new Map<string, ReturnType<typeof setTimeout>>();
+  const activePulls = new Set<Promise<void>>();
   let sideSessions: ReturnType<typeof gatewaySideSessions> | undefined;
   const activeWorkCount = () => Math.max(gatewayActiveWorkCount(options.runtime), options.getActiveWorkCount?.() ?? 0) + (sideSessions?.activeCount() ?? 0);
   channel.beforeDisconnect = async () => {
@@ -69,6 +70,10 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     for (const pending of options.runtime.pendingApprovals.values()) if (pending.asyncQuestion && pending.conversationKey?.startsWith("lark:gw_")) pending.abortHandler?.();
     await sideSessions?.close();
   };
+  // A post-delivery admission read can outlive the channel's message task.
+  // Stop the transport first so an active queue.take RPC rejects, then drain
+  // only our already-started pulls, never unrelated work in the shared queue.
+  channel.afterDisconnect = async () => { await Promise.allSettled([...activePulls]); };
   const unavailable = async (): Promise<never> => { throw new Error("gateway_native_operation_required"); };
   const runtime = Object.assign(Object.create(options.runtime) as CoreServiceRuntime, { queuePolicy: { ...options.runtime.queuePolicy, preempt: false }, appInfo: undefined, commentClient: undefined, meetingSupport: undefined, detectLarkCli: async () => ({ available: false, error: "Gateway uses native operations" }), createChat: unavailable, createDocument: unavailable });
   const pulls = new Map<string, { dirty: boolean }>();
@@ -81,15 +86,19 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     let again = false, blocked = false;
     const execute = async () => {
       if (disconnecting) return;
-      channel.transport.throwIfStopped();
-      const conversationKey = buildCoreConversationKey(conversationId);
-      // Check before claiming: every queued message stays editable/cancellable
-      // while native stop confirmation is unresolved. Do not consume failures.
-      const inputBlocked = await options.bridge.canStartQueuedTurn?.({ chatId: stableCoreNumericId(conversationKey), conversationKey }) === false;
-      // A newly selected session must reach normal binding preparation instead
-      // of waiting indefinitely on the superseded session's fence.
-      blocked = inputBlocked && await channel.canSteerConversation?.(conversationId) !== false;
-      if (!blocked && !disconnecting) again = await channel.takeQueued(conversationId);
+      const work = (async () => {
+        channel.transport.throwIfStopped();
+        const conversationKey = buildCoreConversationKey(conversationId);
+        // Check before claiming: every queued message stays editable/cancellable
+        // while native stop confirmation is unresolved. Do not consume failures.
+        const inputBlocked = await options.bridge.canStartQueuedTurn?.({ chatId: stableCoreNumericId(conversationKey), conversationKey }) === false;
+        // A newly selected session must reach normal binding preparation instead
+        // of waiting indefinitely on the superseded session's fence.
+        blocked = inputBlocked && await channel.canSteerConversation?.(conversationId) !== false;
+        if (!blocked && !disconnecting) again = await channel.takeQueued(conversationId);
+      })();
+      activePulls.add(work);
+      try { await work; } finally { activePulls.delete(work); }
     };
     // Reserve execution order, not a particular prompt. Edits and moves remain
     // authoritative in the Hub until this slot actually reaches the front.

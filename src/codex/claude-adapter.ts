@@ -374,7 +374,7 @@ export class ProcessClaudeAdapter implements CodexAdapter {
     }
 
     let permissionHookServer: ClaudePermissionHookServer | undefined;
-    let permissionConfigFile: Awaited<ReturnType<typeof createClaudeInstructionsFile>>;
+    let permissionConfigFile: Awaited<ReturnType<typeof createClaudeInstructionsFile>> = null;
     let result: Awaited<ReturnType<ProcessClaudeAdapter["runClaudeCommand"]>>;
     try {
       if (approvalMode === "normal" && input.onApprovalRequest) {

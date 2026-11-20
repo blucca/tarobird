@@ -65,6 +65,115 @@ describe("Gateway shared-runtime contracts", () => {
     } finally { releaseRpc?.(); await call; channel!.onCall = previous; }
     await until(async () => !channel!.isBusy());
   });
+  it("drains its final queued admission read before disconnect resolves", async () => {
+    const sendUserMessage = vi.fn<CodexAdapter["sendUserMessage"]>(async sessionId => ({ text: "Done", sessionId }));
+    const adapter: CodexAdapter = { createSession: vi.fn(), sendUserMessage };
+    const sessions = new SessionStore(path.join(stateDir, "session.json"));
+    const access: AccessStoreLike = { load: async () => ({ multiChat: true, policy: "allowlist", allowlist: [], pairedUsers: [], pendingPairs: [] }), issuePairingCode: async () => { throw new Error("unused"); } };
+    const bridge = new Bridge(access, new SessionManager(sessions, adapter), adapter), runtime = createCoreServiceRuntime();
+    let holdNextRead = false, releaseRead!: () => void, enteredRead!: () => void, transportStopped!: () => void;
+    const held = new Promise<void>(resolve => { releaseRead = resolve; }), entered = new Promise<void>(resolve => { enteredRead = resolve; });
+    const transportDone = new Promise<void>(resolve => { transportStopped = resolve; });
+    // Hold the real SessionStore transaction after its mutex ticket exists, on
+    // the post-delivery pull that checks whether there is another queued turn.
+    const disk = sessions as unknown as { loadUnlocked: SessionStore["load"] }, read = disk.loadUnlocked.bind(sessions);
+    const readSpy = vi.spyOn(disk, "loadUnlocked").mockImplementation(async () => {
+      if (holdNextRead) { holdNextRead = false; enteredRead(); await held; }
+      return read();
+    });
+    const canStart = bridge.canStartQueuedTurn.bind(bridge);
+    const admission = vi.spyOn(bridge, "canStartQueuedTurn").mockImplementation(async input => {
+      if (sendUserMessage.mock.calls.length && (await hub.store.pendingForBot("alpha")).length === 0) holdNextRead = true;
+      return canStart(input);
+    });
+    let closing: Promise<void> | undefined, closed = false;
+    let stopSpy: ReturnType<typeof vi.spyOn> | undefined;
+    const c = await hub.store.createConversation("owner", ["alpha"], "Admission drain", "admission-drain");
+    const key = buildCoreConversationKey(c.id);
+    try {
+      await attach(bridge, runtime);
+      await hub.store.sendMessage("owner", { conversationId: c.id, clientMsgId: "drain-final-read", text: "One request", attachments: [] });
+      await entered;
+      await until(async () => !channel!.isBusy());
+      expect(sendUserMessage).toHaveBeenCalledTimes(1);
+      expect(runtime.activeRuns.size).toBe(0);
+      expect(runtime.chatQueue.isBusy(key)).toBe(true);
+      const disconnect = channel!.transport.disconnect.bind(channel!.transport);
+      stopSpy = vi.spyOn(channel!.transport, "disconnect").mockImplementation(async () => { await disconnect(); transportStopped(); });
+      closing = channel!.disconnect().then(() => { closed = true; });
+      await transportDone;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(closed, "Gateway still owns a SessionStore transaction after its message and transport drained").toBe(false);
+      releaseRead();
+      await closing;
+      expect(runtime.chatQueue.isBusy(key)).toBe(false);
+      const readsAfterClose = readSpy.mock.calls.length;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(readSpy).toHaveBeenCalledTimes(readsAfterClose);
+      expect((await sessions.findByConversationKey(key))?.codexSessionId).toBe(sendUserMessage.mock.calls[0]![0]);
+    } finally {
+      releaseRead();
+      await closing;
+      await until(async () => !runtime.chatQueue.isBusy(key));
+      stopSpy?.mockRestore(); admission.mockRestore(); readSpy.mockRestore();
+    }
+  });
+  it("cancels an active pull RPC before draining the Gateway-owned queue job", async () => {
+    const runtime = createCoreServiceRuntime(), engine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>();
+    const gateway = await attach({ handleAuthorizedMessage: engine }, runtime);
+    const c = await hub.store.createConversation("owner", ["alpha"], "Held queue RPC", "held-queue-rpc");
+    const key = buildCoreConversationKey(c.id);
+    let entered!: () => void, closed = false;
+    const enteredRpc = new Promise<void>(resolve => { entered = resolve; });
+    const transport = gateway.transport as unknown as { send(value: any): void }, send = transport.send;
+    const dropped = vi.spyOn(transport, "send").mockImplementation(function (this: GatewayTransport, value: any) {
+      // Keep the real transport's pending request but withhold the wire reply.
+      if (value.type === "instance.request" && value.method === "queue.take") { entered(); return; }
+      send.call(this, value);
+    });
+    let closing: Promise<void> | undefined;
+    try {
+      gateway.transport.onQueue?.(c.id);
+      await enteredRpc;
+      expect(runtime.chatQueue.isBusy(key)).toBe(true);
+      closing = gateway.disconnect().then(() => { closed = true; });
+      await until(async () => closed);
+      await closing;
+      expect(engine).not.toHaveBeenCalled();
+      await until(async () => !runtime.chatQueue.isBusy(key));
+      expect(dropped.mock.calls.filter(([value]) => value.method === "queue.take")).toHaveLength(1);
+    } finally {
+      // Also unblocks cleanup if the drain is accidentally moved before stop.
+      await gateway.transport.disconnect(); await closing; dropped.mockRestore();
+    }
+  });
+  it("does not drain unrelated shared work and skips its unstarted pull after disconnect", async () => {
+    const runtime = createCoreServiceRuntime(), engine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>();
+    const admission = vi.fn(async () => true);
+    const gateway = await attach({ handleAuthorizedMessage: engine, canStartQueuedTurn: admission }, runtime);
+    const c = await hub.store.createConversation("owner", ["alpha"], "External queue owner", "external-queue-owner");
+    const key = buildCoreConversationKey(c.id);
+    let release!: () => void, entered!: () => void, closed = false;
+    const held = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { entered = resolve; });
+    const foreign = runtime.chatQueue.enqueue(key, async () => { entered(); await held; });
+    await started;
+    gateway.transport.onQueue?.(c.id);
+    expect(runtime.chatQueue.pendingCount(key)).toBe(1);
+    let closing: Promise<void> | undefined;
+    try {
+      closing = gateway.disconnect().then(() => { closed = true; });
+      await until(async () => closed);
+      expect(runtime.chatQueue.isBusy(key)).toBe(true);
+      expect(admission).not.toHaveBeenCalled();
+      release(); await foreign;
+      await until(async () => !runtime.chatQueue.isBusy(key));
+      expect(admission).not.toHaveBeenCalled();
+      expect(engine).not.toHaveBeenCalled();
+      // A queue notification arriving after stop is also a no-op.
+      gateway.transport.onQueue?.(c.id);
+      expect(runtime.chatQueue.isBusy(key)).toBe(false);
+    } finally { release(); await foreign; await closing; }
+  });
   it("passes readable App requests, queued text and quoted replies to the engine without transport metadata", async () => {
     const sendUserMessage = vi.fn<CodexAdapter["sendUserMessage"]>(async (sessionId) => ({ text: "Done", sessionId }));
     const adapter: CodexAdapter = { createSession: vi.fn(), sendUserMessage };

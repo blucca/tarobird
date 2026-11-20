@@ -45,11 +45,15 @@ describe("Pi provider/model identity", () => {
     expect(choices[0]?.efforts).toContain("minimal");
     expect(selectModel(choices, "test/plain", { model: "test/reasoning", effort: "high" })).toEqual({ model: "test/plain", effort: "" });
   });
-  it("does not widen another engine's accepted effort levels", () => {
-    for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity"] as const) {
+  it("keeps fixed-vocabulary engines separate from Pi and DSH model-owned levels", () => {
+    for (const engine of ["codex", "claude", "kimi", "antigravity"] as const) {
       expect(getEngineEffortValidationError(engine, "off")).toBeTruthy();
       expect(getEngineEffortValidationError(engine, "minimal")).toBeTruthy();
     }
+    // DSH now admits this shared vocabulary, then validates the selected
+    // model's actual catalog. That capability does not widen other engines.
+    expect(getEngineEffortValidationError("deepseek", "off")).toBeUndefined();
+    expect(getEngineEffortValidationError("deepseek", "minimal")).toBeUndefined();
     expect(getEngineEffortValidationError("pi", "off")).toBeUndefined();
     expect(getEngineEffortValidationError("pi", "ultra")).toBeTruthy();
   });
