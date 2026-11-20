@@ -688,98 +688,163 @@ async function main() {
           const pMove = await target.call('window-point', { fx: 0.35, fy: 0.25, displayId: display.id });
           const fromMove = (await target.call('window-state')).seenCount;
           await sendInput({ kind: 'move', x: pMove.norm.x, y: pMove.norm.y });
-          await sleep(220);
+          await sleep(320);
           const moveEvents = (await target.call('get-seen', { from: fromMove })).events.filter(e => e.type === 'mousemove');
           const afterMove = await target.call('window-state');
           const lastMove = moveEvents.at(-1);
           const moveOk = Boolean(lastMove) && Math.abs(lastMove.x - pMove.page.x) <= 2 && Math.abs(lastMove.y - pMove.page.y) <= 2
             && afterMove.cursor?.x === pMove.physical.x && afterMove.cursor?.y === pMove.physical.y;
           receipt.expect('e2e-input', 'pointer-move', moveOk,
-            `askedPage=${JSON.stringify(pMove.page)}, saw=${JSON.stringify(lastMove ?? null)}, askedPhys=${JSON.stringify(pMove.physical)}, cursor=${JSON.stringify(afterMove.cursor)}`);
+            `askedPage=${JSON.stringify(pMove.page)}, saw=${JSON.stringify(lastMove ?? null)}, askedPhys=${JSON.stringify(pMove.physical)}, cursor=${JSON.stringify(afterMove.cursor)}, activeMarkerAfter320ms=${afterMove.activeMarkerExists}`);
 
-          // 8b. Primary click (share one fresh frame across down/up).
-          const fromClick = (await target.call('window-state')).seenCount;
-          const clickReady = await freshReady();
-          await sendInput({ kind: 'button', x: pMove.norm.x, y: pMove.norm.y, button: 0, down: true, clicks: 1 }, clickReady);
-          await sleep(40);
-          await sendInput({ kind: 'button', x: pMove.norm.x, y: pMove.norm.y, button: 0, down: false, clicks: 1 }, clickReady);
-          await sleep(220);
-          const clickEvents = (await target.call('get-seen', { from: fromClick })).events.filter(e => ['mousedown', 'mouseup', 'click'].includes(e.type));
-          receipt.expect('e2e-input', 'primary-click',
-            clickEvents.map(e => e.type).join(',') === 'mousedown,mouseup,click',
-            `events=${JSON.stringify(clickEvents.map(e => ({ type: e.type, button: e.button, x: e.x, y: e.y })))}`);
+          // Check whether #48 mouse hook self-takeover closed the session right after pointer-move.
+          const mouseClosed = control.values.findLast(v => v.type === 'state' && (v.session?.state === 'closed' || v.session?.reason));
+          const leaseAliveAfterMove = !mouseClosed || mouseClosed.session?.state === 'controlling';
 
-          // 8c. Double-click (share one fresh frame so both presses land well inside Windows double-click window).
-          await sleep(700);
-          const fromDbl = (await target.call('window-state')).seenCount;
-          const dblReady = await freshReady();
-          for (let press = 1; press <= 2; press++) {
-            await sendInput({ kind: 'button', x: pMove.norm.x, y: pMove.norm.y, button: 0, down: true, clicks: press }, dblReady);
-            await sleep(30);
-            await sendInput({ kind: 'button', x: pMove.norm.x, y: pMove.norm.y, button: 0, down: false, clicks: press }, dblReady);
-            if (press === 1) await sleep(60);
+          if (leaseAliveAfterMove) {
+            // 8b. Primary click (share one fresh frame across down/up).
+            const fromClick = (await target.call('window-state')).seenCount;
+            const clickReady = await freshReady();
+            await sendInput({ kind: 'button', x: pMove.norm.x, y: pMove.norm.y, button: 0, down: true, clicks: 1 }, clickReady);
+            await sleep(40);
+            await sendInput({ kind: 'button', x: pMove.norm.x, y: pMove.norm.y, button: 0, down: false, clicks: 1 }, clickReady);
+            await sleep(220);
+            const clickEvents = (await target.call('get-seen', { from: fromClick })).events.filter(e => ['mousedown', 'mouseup', 'click'].includes(e.type));
+            receipt.expect('e2e-input', 'primary-click',
+              clickEvents.map(e => e.type).join(',') === 'mousedown,mouseup,click',
+              `events=${JSON.stringify(clickEvents.map(e => ({ type: e.type, button: e.button, x: e.x, y: e.y })))}`);
+
+            // 8c. Double-click (share one fresh frame so both presses land well inside Windows double-click window).
+            await sleep(700);
+            const fromDbl = (await target.call('window-state')).seenCount;
+            const dblReady = await freshReady();
+            for (let press = 1; press <= 2; press++) {
+              await sendInput({ kind: 'button', x: pMove.norm.x, y: pMove.norm.y, button: 0, down: true, clicks: press }, dblReady);
+              await sleep(30);
+              await sendInput({ kind: 'button', x: pMove.norm.x, y: pMove.norm.y, button: 0, down: false, clicks: press }, dblReady);
+              if (press === 1) await sleep(60);
+            }
+            await sleep(250);
+            const dblEvents = (await target.call('get-seen', { from: fromDbl })).events.filter(e => ['click', 'dblclick'].includes(e.type));
+            receipt.expect('e2e-input', 'double-click',
+              dblEvents.filter(e => e.type === 'dblclick').length === 1,
+              `events=${JSON.stringify(dblEvents.map(e => ({ type: e.type, detail: e.detail })))}`);
+          } else {
+            const closeWhy = mouseClosed?.session?.reason ?? mouseClosed?.reason ?? 'closed';
+            receipt.expect('e2e-input', 'primary-click', false, `blocked: session ended right after pointer-move with reason=${closeWhy}`);
+            receipt.expect('e2e-input', 'double-click', false, `blocked: session ended right after pointer-move with reason=${closeWhy}`);
           }
-          await sleep(250);
-          const dblEvents = (await target.call('get-seen', { from: fromDbl })).events.filter(e => ['click', 'dblclick'].includes(e.type));
-          receipt.expect('e2e-input', 'double-click',
-            dblEvents.filter(e => e.type === 'dblclick').length === 1,
-            `events=${JSON.stringify(dblEvents.map(e => ({ type: e.type, detail: e.detail })))}`);
 
-          // 8d. Focus textarea & send Unicode + Enter text.
-          const pBox = await target.call('window-point', { fx: 0.5, fy: 0.7, displayId: display.id });
-          const boxReady = await freshReady();
-          await sendInput({ kind: 'button', x: pBox.norm.x, y: pBox.norm.y, button: 0, down: true, clicks: 1 }, boxReady);
-          await sleep(40);
-          await sendInput({ kind: 'button', x: pBox.norm.x, y: pBox.norm.y, button: 0, down: false, clicks: 1 }, boxReady);
-          await sleep(250);
-          await target.call('clear-textarea');
-          const expectedText = 'hello 中文😀\nline2';
-          await sendInput({ kind: 'text', text: expectedText });
-          await sleep(350);
-          const afterText = await target.call('window-state');
-          receipt.expect('e2e-input', 'unicode-and-enter-text',
-            afterText.activeElement === 'text' && afterText.textareaValue === expectedText,
-            `activeElement=${afterText.activeElement}, expectedLen=${expectedText.length}, gotMatch=${afterText.textareaValue === expectedText}`);
-
-          // 8e. Hold ShiftLeft -> verify held journal + pending -> trigger foreground loss -> abort further input & release!
-          const fromHold = (await target.call('window-state')).seenCount;
-          await sendInput({ kind: 'key', code: 'ShiftLeft', down: true });
-          await sleep(120);
-          const whileHeld = await target.call('window-state');
-          const heldRecorded = whileHeld.pending === 1 && whileHeld.heldJournal.state === 'valid' && whileHeld.heldJournal.keys.includes(0x2a);
-          receipt.expect('e2e-input', 'held-key-recorded-before-loss', heldRecorded,
-            `pending=${whileHeld.pending}, journal=${JSON.stringify(whileHeld.heldJournal)}`);
-
-          const loss = await target.call('trigger-foreground-loss');
-          let abortedNextInput = false;
-          try {
-            await sendInput({ kind: 'key', code: 'KeyA', down: true });
-          } catch (err) {
-            abortedNextInput = String(err?.message).includes('aborted_window_lost_foreground');
-          }
-          // Release control lease immediately on foreground loss.
-          control.send({ type: 'release', sessionId: join.session.id, generation: join.session.generation });
-          const releasedClean = await wait(async () => {
-            const st = await target.call('window-state');
-            return st.pending === 0 && !st.activeMarkerExists && st.heldJournal.state === 'missing';
-          }, 5000);
-          const afterRelease = await target.call('window-state');
-          const holdKeyEvents = (await target.call('get-seen', { from: fromHold })).events.filter(e => e.type === 'keydown' || e.type === 'keyup');
-          const noKeyAAfterLoss = !holdKeyEvents.some(e => e.code === 'KeyA');
-          receipt.expect('e2e-input', 'foreground-loss-abort-and-release',
-            !loss.inFront && loss.lostFocus && abortedNextInput && noKeyAAfterLoss && releasedClean && afterRelease.pending === 0 && !afterRelease.activeMarkerExists && afterRelease.heldJournal.state === 'missing',
-            `loss=${JSON.stringify(loss)}, abortedNextInput=${abortedNextInput}, noKeyA=${noKeyAAfterLoss}, pendingAfter=${afterRelease.pending}, activeMarker=${afterRelease.activeMarkerExists}, journal=${afterRelease.heldJournal.state}, keyEvents=${holdKeyEvents.map(e => `${e.type}:${e.code}`).join(',')}`);
-
-          // Record redacted control channel state transitions for root-cause clarity.
+          // Record redacted control channel transitions for Session 1 (mouse path).
           evidence.e2eControlEvents = control.values
             .filter(v => v && typeof v === 'object' && v.type !== 'frame-ready')
             .map(v => ({
               type: v.type,
-              reason: v.reason ?? v.error ?? v.session?.endedReason ?? null,
+              reason: v.session?.reason ?? v.reason ?? v.error ?? null,
               state: v.session?.state ?? null,
               hasLease: Boolean(v.lease),
             }));
           receipt.info('e2e-input', 'control-channel-transitions', JSON.stringify(evidence.e2eControlEvents));
+
+          // 8d-8e. Keyboard + text + held-key + foreground-loss E2E on a clean session (no mouse input so
+          // the mouse-only 32-bit dwExtraInfo hook bug does not prematurely close the session).
+          let kbJoin = join, kbControl = control, kbLease = stateMsg, kbGen = currentGen, kbSeq = inputSeq;
+          if (!leaseAliveAfterMove) {
+            const opened2 = await api('/api/screens/sessions?includeWindows=1', remote.token, {
+              desktopId: currentStatusRes.desktop.desktopId,
+              displayId: display.id,
+              displayRevision: display.revision,
+              requestId: randomUUID(),
+              codecs: ['h264'],
+            });
+            kbJoin = opened2.status === 201 ? screenJoinSchema.parse(await opened2.json()) : null;
+            if (kbJoin) {
+              kbControl = connectWs(`${wsBase}/screen/v1/control`, cleanups);
+              const kbMedia = connectWs(`${wsBase}/screen/v1/media`, cleanups);
+              await Promise.all([kbControl.ready, kbMedia.ready]);
+              kbControl.send({ type: 'hello', ticket: kbJoin.controlTicket });
+              kbMedia.send({ type: 'hello', ticket: kbJoin.mediaTicket });
+              await target.call('wait-capture-start', { count: 2 });
+              const f1 = await target.call('emit-frame', { sessionId: kbJoin.session.id, generation: 1, size: encodeSize });
+              await wait(() => kbMedia.values.some(v => v instanceof Uint8Array && v.byteLength > 32), 6000);
+              kbControl.send({ type: 'ack', sessionId: kbJoin.session.id, generation: kbJoin.session.generation, frameSequence: f1.sequence });
+              await wait(() => kbControl.values.some(v => v.type === 'frame-ready' && v.frameSequence === f1.sequence), 6000);
+              kbControl.send({ type: 'control', sessionId: kbJoin.session.id, generation: kbJoin.session.generation, frameSequence: f1.sequence });
+              const r2 = await target.call('wait-capture-reset', { count: 2 });
+              kbGen = r2.last?.[1] ?? 2;
+              const f2 = await target.call('emit-frame', { sessionId: kbJoin.session.id, generation: kbGen, size: encodeSize });
+              kbControl.send({ type: 'ack', sessionId: kbJoin.session.id, generation: kbJoin.session.generation, frameSequence: f2.sequence });
+              await wait(() => kbControl.values.some(v => v.type === 'state' && v.lease && v.session.state === 'controlling'), 6000);
+              kbLease = kbControl.values.findLast(v => v.type === 'state' && v.lease);
+              kbSeq = 0;
+            }
+          }
+          const sendKbInput = async event => {
+            const emitted = await target.call('emit-frame', { sessionId: kbJoin.session.id, generation: kbGen, size: encodeSize });
+            kbControl.send({ type: 'ack', sessionId: kbJoin.session.id, generation: kbJoin.session.generation, frameSequence: emitted.sequence });
+            await wait(() => kbControl.values.some(v => v.type === 'frame-ready' && v.frameSequence === emitted.sequence), 4000);
+            const ready = kbControl.values.findLast(v => v.type === 'frame-ready');
+            const st = await target.call('window-state');
+            if (!st.inFront) throw new Error('aborted_window_lost_foreground');
+            kbControl.send({
+              type: 'input',
+              sessionId: kbJoin.session.id,
+              desktopId: currentStatusRes.desktop.desktopId,
+              generation: kbJoin.session.generation,
+              displayId: display.id,
+              displayRevision: display.revision,
+              leaseId: kbLease.lease.id,
+              sequence: ++kbSeq,
+              frameSequence: ready.frameSequence,
+              expiresAt: ready.expiresAt,
+              event,
+            });
+          };
+
+          if (kbJoin && kbLease?.lease) {
+            // 8d. Focus textarea & send Unicode + Enter text through real Hub + ScreenService.
+            await target.call('focus-textarea');
+            const expectedText = 'hello 中文😀\nline2';
+            await sendKbInput({ kind: 'text', text: expectedText });
+            await sleep(350);
+            const afterText = await target.call('window-state');
+            receipt.expect('e2e-input', 'unicode-and-enter-text',
+              afterText.activeElement === 'text' && afterText.textareaValue === expectedText,
+              `activeElement=${afterText.activeElement}, expectedLen=${expectedText.length}, gotMatch=${afterText.textareaValue === expectedText}`);
+
+            // 8e. Hold ShiftLeft -> verify held journal + pending -> trigger foreground loss -> abort further input & release!
+            const fromHold = (await target.call('window-state')).seenCount;
+            await sendKbInput({ kind: 'key', code: 'ShiftLeft', down: true });
+            await sleep(120);
+            const whileHeld = await target.call('window-state');
+            const heldRecorded = whileHeld.pending === 1 && whileHeld.heldJournal.state === 'valid' && whileHeld.heldJournal.keys.includes(0x2a);
+            receipt.expect('e2e-input', 'held-key-recorded-before-loss', heldRecorded,
+              `pending=${whileHeld.pending}, journal=${JSON.stringify(whileHeld.heldJournal)}`);
+
+            const loss = await target.call('trigger-foreground-loss');
+            let abortedNextInput = false;
+            try {
+              await sendKbInput({ kind: 'key', code: 'KeyA', down: true });
+            } catch (err) {
+              abortedNextInput = String(err?.message).includes('aborted_window_lost_foreground');
+            }
+            // Release control lease immediately on foreground loss.
+            kbControl.send({ type: 'release', sessionId: kbJoin.session.id, generation: kbJoin.session.generation });
+            const releasedClean = await wait(async () => {
+              const st = await target.call('window-state');
+              return st.pending === 0 && !st.activeMarkerExists && st.heldJournal.state === 'missing';
+            }, 5000);
+            const afterRelease = await target.call('window-state');
+            const holdKeyEvents = (await target.call('get-seen', { from: fromHold })).events.filter(e => e.type === 'keydown' || e.type === 'keyup');
+            const noKeyAAfterLoss = !holdKeyEvents.some(e => e.code === 'KeyA');
+            receipt.expect('e2e-input', 'foreground-loss-abort-and-release',
+              !loss.inFront && loss.lostFocus && abortedNextInput && noKeyAAfterLoss && releasedClean && afterRelease.pending === 0 && !afterRelease.activeMarkerExists && afterRelease.heldJournal.state === 'missing',
+              `loss=${JSON.stringify(loss)}, abortedNextInput=${abortedNextInput}, noKeyA=${noKeyAAfterLoss}, pendingAfter=${afterRelease.pending}, activeMarker=${afterRelease.activeMarkerExists}, journal=${afterRelease.heldJournal.state}, keyEvents=${holdKeyEvents.map(e => `${e.type}:${e.code}`).join(',')}`);
+          } else {
+            receipt.expect('e2e-input', 'unicode-and-enter-text', false, 'failed to open keyboard E2E session');
+            receipt.expect('e2e-input', 'held-key-recorded-before-loss', false, 'failed to open keyboard E2E session');
+            receipt.expect('e2e-input', 'foreground-loss-abort-and-release', false, 'failed to open keyboard E2E session');
+          }
 
           // 9. Record-only non-gating observations from Fable's Section 5 checklist + Win32 hook wire probe.
           await target.call('close-focus-window');

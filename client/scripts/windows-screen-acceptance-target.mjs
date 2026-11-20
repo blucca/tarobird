@@ -82,6 +82,7 @@ let seen = [];
 let lostFocus = false;
 let shuttingDown = false;
 let sequence = 0;
+const sentStreams = new Set();
 
 const capture = {
   hooks: null,
@@ -206,20 +207,24 @@ async function startService() {
 
 async function emitSyntheticFrame({ sessionId, generation, size }) {
   const captureMs = Date.now();
-  capture.hooks.onMessage({
-    type: 'stream',
-    sessionId,
-    stream: {
+  const streamKey = `${sessionId}:${generation}`;
+  if (!sentStreams.has(streamKey)) {
+    sentStreams.add(streamKey);
+    capture.hooks.onMessage({
       type: 'stream',
-      streamGeneration: generation,
-      geometryRevision: 1,
-      codec: 'h264',
-      codecString: 'avc1.640028',
-      width: size.width,
-      height: size.height,
-      contentRect: { x: 0, y: 0, width: size.width, height: size.height },
-    },
-  });
+      sessionId,
+      stream: {
+        type: 'stream',
+        streamGeneration: generation,
+        geometryRevision: 1,
+        codec: 'h264',
+        codecString: 'avc1.640028',
+        width: size.width,
+        height: size.height,
+        contentRect: { x: 0, y: 0, width: size.width, height: size.height },
+      },
+    });
+  }
   capture.hooks.onMessage({ type: 'captured', sessionId, captureMs });
   const seq = ++sequence;
   // Synthetic H.264 IDR NAL header only; no pixels from any real desktop.
@@ -502,6 +507,10 @@ async function handle(cmd) {
     case 'clear-textarea': {
       await pageEval('document.getElementById("text").value = ""; undefined');
       return { ok: true };
+    }
+    case 'focus-textarea': {
+      await pageEval('const el = document.getElementById("text"); el.value = ""; el.focus(); undefined');
+      return { ok: true, activeElement: await pageEval('document.activeElement && document.activeElement.id') };
     }
     case 'trigger-foreground-loss': return triggerForegroundLoss();
     case 'close-focus-window': return closeFocusWindow();
