@@ -1429,7 +1429,9 @@ dialog:focus{outline:none}
   .recipient-menu{left:24px;min-width:220px}
   .recipient-menu>button[aria-checked=true]{font-weight:560}
   .recipient-check{display:grid;place-items:center;flex-shrink:0;width:16px;height:16px;border-radius:var(--radius-xs);box-shadow:inset 0 0 0 1px var(--border-strong);color:var(--on-primary)}
-  .recipient-menu>button[aria-checked=true] .recipient-check{background:var(--primary-bg);box-shadow:none}
+  /* Any checked row fills its box: the check glyph is --on-primary, so an unfilled
+     box hides it (the group speakers dialog is not inside .recipient-menu). */
+  .recipient-menu>button[aria-checked=true] .recipient-check,[aria-checked=true]>.recipient-check{background:var(--primary-bg);box-shadow:none}
 
 }
 

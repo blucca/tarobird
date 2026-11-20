@@ -1261,7 +1261,16 @@ test('allowed speakers default to everyone and a single selection survives reloa
     await page.getByRole('button', { name: '可发言：全员', exact: true }).click();
     const chooser = page.getByRole('dialog', { name: '可发言的 Bot', exact: true });
     for (const name of ['研究助手', '复核助手']) await expect(chooser.getByRole('checkbox', { name, exact: true })).toBeChecked();
+    // A checked box is filled: its check glyph uses --on-primary, so an unfilled
+    // box showed nothing on desktop (community report: "已选 5 位" looked empty).
+    const box = (name: string) => chooser.getByRole('checkbox', { name, exact: true }).locator('.recipient-check');
+    const paint = (name: string) => box(name).evaluate(el => ({ fill: getComputedStyle(el).backgroundColor, glyph: getComputedStyle(el).color }));
+    const checked = await paint('研究助手');
+    expect(checked.fill).not.toBe('rgba(0, 0, 0, 0)');
+    expect(checked.glyph).not.toBe(checked.fill);
+    await expect(box('研究助手').locator('svg')).toBeVisible();
     await chooser.getByRole('checkbox', { name: '复核助手', exact: true }).uncheck();
+    expect((await paint('复核助手')).fill).toBe('rgba(0, 0, 0, 0)');
     await chooser.getByRole('button', { name: '完成', exact: true }).click();
     await page.reload(); await waitForClientOnline(page); await selectConversation(page, '产品讨论组');
     await expect(page.getByRole('button', { name: '可发言：已选 1 位', exact: true })).toBeEnabled();
