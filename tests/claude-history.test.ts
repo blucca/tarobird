@@ -442,6 +442,60 @@ describe("the Claude adapter and native history", () => {
     });
   });
 
+  it("forks a turn that a missed steer continued through the continuation's answer, whichever of its inputs the anchor names", async () => {
+    // Frames, order and uuid roles as Claude Code 2.1.329 wrote them in an isolated loopback run: the steer was
+    // written while the prompt's request was in flight, missed the fold, and ran as its own native turn.
+    const h = harness();
+    let current: ClaudeHistoryHelper | undefined;
+    const adapter = new ClaudeStreamAdapter("claude", { spawnFn: h.spawnFn as never, workspacePath: WORKSPACE, historyHelper: (request, context) => current!(request, context) });
+    const A1 = "aaaaaaaa-0000-4000-8000-0000000000a1", A2 = "aaaaaaaa-0000-4000-8000-0000000000a2";
+    try {
+      const events: EngineStreamEvent[] = [];
+      const reply = adapter.sendUserMessage("tarobot-history-fixture", { text: "ALPHA", files: [], onEngineEvent: event => { events.push(event); } });
+      await waitFor(() => h.children[0]?.stdin.lines.length === 1);
+      const child = h.children[0]!;
+      const emit = (frame: object) => child.stdout.emitData(`${JSON.stringify({ session_id: SOURCE, ...frame })}\n`);
+      const lifecycle = (uuid: string, state: string) => emit({ type: "command_lifecycle", command_uuid: uuid, state });
+      const prompt = (JSON.parse(child.stdin.lines[0]!) as { uuid: string }).uuid;
+      emit({ type: "system", subtype: "init", capabilities: ["interrupt_receipt_v1", "interrupt_cancel_queued_v1", "interrupt_send_now_v1", "interrupt_requeue_taken_v1", "msg_lifecycle_v1", "request_marker_lists_v1"] });
+      lifecycle(prompt, "queued"); lifecycle(prompt, "started");
+      const outcomes: unknown[] = [];
+      const steering = adapter.steerActiveTurn(SOURCE, { text: "BETA", onOutcome: outcome => { outcomes.push(outcome); } });
+      await waitFor(() => child.stdin.lines.length === 2);
+      const steer = (JSON.parse(child.stdin.lines[1]!) as { uuid: string }).uuid;
+      lifecycle(steer, "queued");
+      expect(await steering).toBe(true);
+      emit(said(A1, "REPLY_ALPHA", { user_message_uuid: prompt, user_message_uuids: [prompt] }));
+      emit({ type: "result", subtype: "success", result: "REPLY_ALPHA", user_message_uuid: prompt, user_message_uuids: [prompt] });
+      lifecycle(prompt, "completed"); lifecycle(steer, "started");
+      emit(said(A2, "REPLY_BETA", { user_message_uuid: steer, user_message_uuids: [steer] }));
+      emit({ type: "result", subtype: "success", result: "REPLY_BETA", user_message_uuid: steer, user_message_uuids: [steer] });
+      lifecycle(steer, "completed");
+      await expect(reply).resolves.toMatchObject({ text: "REPLY_ALPHA\nREPLY_BETA" });
+      expect(outcomes).toEqual([{ status: "applied", via: "continuation" }]);
+
+      const anchors = events.filter(event => event.type === "history_anchor").map(event => (event as { anchor: NativeHistoryAnchor }).anchor);
+      expect(anchors).toHaveLength(1);
+      // The host turn's reply holds both segments; its fork boundary is the continuation's answer.
+      expect(anchors[0]!.data).toEqual({ lastMessageId: A2 });
+      expect([prompt, steer]).toContain(anchors[0]!.inputId);
+
+      // The session's chain afterwards, with one later ordinary turn.
+      const later = "aaaaaaaa-0000-4000-8000-0000000000b3", laterAnswer = "aaaaaaaa-0000-4000-8000-0000000000a3";
+      const h2 = scripted({ messages: [{ uuid: prompt, type: "user" }, { uuid: A1, type: "assistant" }, { uuid: steer, type: "user" }, { uuid: A2, type: "assistant" }, { uuid: later, type: "user" }, { uuid: laterAnswer, type: "assistant" }] });
+      current = h2.helper;
+      const asIs = await adapter.forkHistory(SOURCE, { anchor: anchors[0]! });
+      // Control: the same anchor naming the App message's own prompt instead.
+      const control = await adapter.forkHistory(SOURCE, { anchor: { ...anchors[0]!, inputId: prompt } });
+      expect(asIs).toMatchObject({ outcome: "applied", boundary: "after-turn" });
+      expect(control).toMatchObject({ outcome: "applied", boundary: "after-turn" });
+      expect(h2.asked("fork").map(request => request.upToMessageId)).toEqual([A2, A2]);
+      for (const result of [asIs, control]) {
+        expect(h2.sessions.get((result as { sessionId: string }).sessionId)!.map(message => message.type)).toEqual(["user", "assistant", "user", "assistant"]);
+      }
+    } finally { await adapter.destroy(); }
+  });
+
   it("has no native session to look at behind a chat that never started one", async () => {
     const h = harness(), helper = scripted();
     const adapter = new ClaudeStreamAdapter("claude", { spawnFn: h.spawnFn as never, workspacePath: WORKSPACE, historyHelper: helper.helper });
