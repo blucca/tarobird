@@ -24,8 +24,13 @@ even when a percentage is low.
 
 When a card has no current reading (unsupported, unknown, login required,
 unverifiable, stale or offline), Settings shows the engine's official viewing
-method from the snapshot's `help` code. `tarobird engines quota` prints the
-same guidance to standard error; its JSON output is unchanged. The sources were
+method from the snapshot's `help` code. `tarobird engines quota` keeps its JSON
+on standard output. In normal mode it also writes, on standard error, each such
+Bot's status and reason in the App's exact Chinese/English wording, the refresh
+command for an active reader (with its cooldown), and the official guidance.
+With `--json` nothing is added to standard error. These lines are built only
+from protocol codes, the Bot name and the scope/revision already in the JSON;
+no native text or account identity is printed. The sources were
 checked against the local CLIs' own help/changelog text and official docs:
 
 | `help` | Guidance | Evidence |

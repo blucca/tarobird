@@ -1,4 +1,4 @@
-import { ENGINE_QUOTA_CAPABILITY, quotaDirectorySchema, quotaReadingExpired, quotaScopeSchema, type QuotaDirectory, type QuotaScope, type QuotaSnapshot } from "../client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_CAPABILITY, quotaDirectorySchema, quotaReadingExpired, quotaScopeSchema, type QuotaDirectory, type QuotaEngine, type QuotaReason, type QuotaScope, type QuotaSnapshot, type QuotaState } from "../client-protocol/engine-quota.js";
 import type { LocalHostClient } from "./client.js";
 
 export async function engineQuotaCommand(client: Pick<LocalHostClient, "request" | "ready">, flags: { bot?: string; refresh?: boolean; revision?: string }) {
@@ -27,4 +27,59 @@ export function engineQuotaGuidance(value: QuotaDirectory | QuotaScope, now = Da
     groups.set(scope.help, [...groups.get(scope.help) ?? [], scope.label]);
   }
   return [...groups].map(([help, labels]) => `${labels.join(", ")}: ${guidance[help]}`);
+}
+
+type Text = readonly [zh: string, en: string];
+// Same wording as the App settings card: client/src/EngineQuota.tsx and its locales/en.json entries.
+// tests/hub-engine-quota.test.ts keeps every pair identical to the App.
+export const QUOTA_STATE_TEXT: Record<QuotaState, Text> = {
+  ready: ["已读取", "Read"],
+  stale: ["待更新", "Awaiting update"],
+  unknown: ["尚无数据", "No data yet"],
+  login_required: ["需要登录", "Sign-in required"],
+  offline: ["离线", "Offline"],
+  unavailable: ["暂不可用", "Unavailable"],
+  unsupported: ["暂不支持", "Not supported"],
+};
+export const QUOTA_REASON_TEXT: Record<QuotaReason, Text> = {
+  not_adapted: ["此引擎尚未接入原生额度。", "Native quota support is not yet implemented for this engine."],
+  not_loaded: ["尚未读取原生额度，可点击刷新。", "Native quotas have not been read yet. Select Refresh to read them."],
+  native_unverified: ["此引擎的原生额度接口尚未验证。", "This engine’s native quota interface has not been verified."],
+  mode_not_supported: ["此授权方式不提供可读取的原生额度。", "This authorization mode does not provide readable native quotas."],
+  no_passive_event: ["尚未收到原生额度状态，仅在正常使用中被动更新。", "No native quota status has been received. Updates arrive passively during normal use."],
+  login_required: ["请先在运行主机上完成引擎登录，再刷新。", "Sign in to the engine on the Host, then refresh."],
+  auth_changed: ["授权信息已变化，旧额度已清除。请核对后再次刷新。", "Authorization changed and previous quotas were cleared. Check the authorization, then refresh again."],
+  scope_unverifiable: ["无法从运行主机的凭据文件确认当前账号（例如登录保存在系统钥匙串），读数不会保留；刷新时由引擎原生接口当场核对一次，只有原生回包能把当前用户、前后两次的工作区和这次用量对应到同一账号时才展示读数。", "The current account cannot be confirmed from the running Host's credential files (for example, a login stored in the system keychain). Readings are not retained; a refresh checks once through the engine's native interface, and a reading is shown only when the native replies tie the current user, the workspace before and after, and this usage snapshot to the same account."],
+  offline: ["Bot 当前离线，连接恢复后重新读取列表。", "This Bot is offline. Reload the list after it reconnects."],
+  timeout: ["读取原生额度超时，可稍后再刷新。", "Reading native quotas timed out. Try refreshing later."],
+  cancelled: ["本次读取已取消，可重新刷新。", "This read was cancelled. You can refresh again."],
+  rate_limited: ["原生服务暂时限制读取，请等待后再刷新。", "The native service is limiting reads. Wait before refreshing again."],
+  invalid_response: ["原生额度数据无法确认，未将缺失数据当作零。", "Native quota data could not be verified. Missing values are not treated as zero."],
+  cli_unavailable: ["主机上的引擎程序不可用，请检查后再刷新。", "The engine program on the Host is unavailable. Check it, then refresh."],
+  native_error: ["暂时无法读取原生额度，可稍后再刷新。", "Native quotas could not be read. Try refreshing later."],
+  host_upgrade_required: ["请更新主机与 Bot 运行程序以读取额度。", "Update the Host and Bot runtime to read quotas."],
+};
+export const QUOTA_CLAUDE_UNVERIFIABLE_TEXT: Text = ["Claude Code 的凭据来源无法由公开接口核实（例如 macOS 钥匙串登录），为避免显示其他账号的额度，不展示被动收到的读数。", "Claude Code's credential source cannot be verified through a public interface (for example, a macOS Keychain login). Passive readings are hidden so another account's quota is never shown."];
+export const QUOTA_EXPIRED_TEXT: Text = ["已过期，需重新读取", "Expired; refresh required"];
+const ENGINE_NAMES: Record<QuotaEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
+
+/** Human explanation for standard error in normal mode: why each Bot has no current reading, how to
+ * refresh it, and where to check officially. Built only from protocol enums, the Bot label and the
+ * public scope/revision ids already in the JSON; no native text or account identity is printed. */
+export function engineQuotaNotes(value: QuotaDirectory | QuotaScope, now = Date.now()): string[] {
+  const lines: string[] = [];
+  for (const scope of "scopes" in value ? value.scopes : [value]) {
+    const expired = scope.state === "ready" && quotaReadingExpired(scope, now);
+    if (scope.state === "ready" && !expired) continue;
+    const state = QUOTA_STATE_TEXT[expired ? "stale" : scope.state], code = scope.reason ?? scope.capability.reason;
+    const reason = code === "scope_unverifiable" && scope.engine === "claude" ? QUOTA_CLAUDE_UNVERIFIABLE_TEXT
+      : code ? QUOTA_REASON_TEXT[code] : expired || scope.state === "stale" ? QUOTA_EXPIRED_TEXT : undefined;
+    lines.push(`${scope.label}（${ENGINE_NAMES[scope.engine]}）：${state[0]}${reason ? ` — ${reason[0]}` : ""} / ${state[1]}${reason ? ` — ${reason[1]}` : ""}`);
+    // Same condition as the App's refresh button for an active (native) reader.
+    if (scope.capability.mode === "active" && scope.state !== "offline" && scope.state !== "unsupported" && code !== "host_upgrade_required") {
+      const cooling = scope.nextRefreshAt && Date.parse(scope.nextRefreshAt) > now ? `（${scope.nextRefreshAt} 后 / after ${scope.nextRefreshAt}）` : "";
+      lines.push(`  刷新 / Refresh${cooling}: tarobird engines quota --bot ${scope.id} --refresh --revision ${scope.revision}`);
+    }
+  }
+  return [...lines, ...engineQuotaGuidance(value, now)];
 }

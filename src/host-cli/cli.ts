@@ -1,5 +1,5 @@
 import { runHistoryCommand } from "./history.js";
-import { engineQuotaCommand, engineQuotaGuidance } from "./engine-quota.js";
+import { engineQuotaCommand, engineQuotaNotes } from "./engine-quota.js";
 import { screenCommand } from "./screens.js";
 import { runWorkbenchCommand } from "./workbench.js";
 import { runConversationsCommand } from './conversations.js';
@@ -159,7 +159,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     通过同一主机授权接口控制在线 App；返回真实回执。unknown 不代表成功，勿换编号自动重试。
     Markdown 笔记是 App 工作台对象，不是本机文件；导入导出只由用户在 App 中进行。
   engines quota [--bot BOT] [--refresh --revision REV] [--json]
-    无当前读数的 Bot 会在标准错误输出该引擎经核实的官方查看方式。
+    标准输出为 JSON。无当前读数的 Bot 会在标准错误说明状态、原因、刷新命令和官方查看方式；--json 时不输出这些说明。
   engines status [--request-id ID] [--json]
   engines set --engine ENGINE --path ABSOLUTE_PATH --revision REV [--request-id ID]
   engines reset --engine ENGINE --revision REV [--request-id ID]
@@ -435,7 +435,8 @@ export async function runHostCli(argv: string[]): Promise<void> {
     try {
       const value = await engineQuotaCommand(client, { bot: v.bot, refresh: v.refresh, revision: v.revision });
       await output(value);
-      for (const line of engineQuotaGuidance(value)) console.error(line);
+      // Standard output stays the JSON contract; --json (automation) adds nothing on standard error.
+      if (!v.json) for (const line of engineQuotaNotes(value)) console.error(line);
     }
     finally { client.close(); }
     return;
