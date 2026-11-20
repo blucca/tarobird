@@ -134,8 +134,13 @@ fn invalid_startup_arguments_exit_without_protocol_output() {
     assert_eq!(output.status.code(), Some(64));
     assert!(output.stdout.is_empty());
     assert_eq!(String::from_utf8(output.stderr).unwrap(), "invalid_arguments\n");
+    // Absolute on this platform, so only the resolved `host` directory is wrong.
+    #[cfg(not(windows))]
+    let (state, resources, host) = ("/tmp/a", "/tmp/r", "/tmp/data/host");
+    #[cfg(windows)]
+    let (state, resources, host) = (r"C:\tmp\a", r"C:\tmp\r", r"C:\tmp\data\host");
     let output = Command::new(env!("CARGO_BIN_EXE_tarobot-desktop-core"))
-        .args(["--state-dir", "/tmp/a", "--keyring-service", "svc", "--resources-dir", "/tmp/r", "--host-state-dir", "/tmp/data/host"]).output().unwrap();
+        .args(["--state-dir", state, "--keyring-service", "svc", "--resources-dir", resources, "--host-state-dir", host]).output().unwrap();
     assert_eq!((output.status.code(), output.stdout.is_empty()), (Some(64), true));
     assert_eq!(String::from_utf8(output.stderr).unwrap(), "invalid_host_state_dir\n");
 }
