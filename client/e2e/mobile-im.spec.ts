@@ -77,13 +77,13 @@ test('phone chat keeps a compact header and Bot browsing in menu and details wit
     await hub.close();
     const notice = page.locator('.phone-connection-notice');
     await expect(notice).toBeVisible();
-    await expect(notice).toContainText('与「Mac mini」已断开');
+    await expect(notice.getByRole('status')).toHaveText('正在连接「Mac mini」');
     await expect(notice).toContainText('正在重连…');
     await expect(page.locator('.offline-banner,.error-banner')).toHaveCount(0);
     expect((await notice.boundingBox())!.height).toBeLessThanOrEqual(46);
     await page.screenshot({path:info.outputPath('phone-compact-offline.png')});
     await notice.locator('summary').click();
-    await expect(notice.locator('div')).toContainText('已缓存的消息仍可阅读');
+    await expect(notice.locator('div')).toContainText('与「Mac mini」的连接已断开，已缓存的消息仍可阅读。');
     await notice.locator('summary').click();
     await page.getByRole('button', {name:'更多聊天操作', exact:true}).click();
     await actions.getByRole('button', {name:'查看此 Bot 的全部对话', exact:true}).click();

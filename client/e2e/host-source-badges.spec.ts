@@ -21,11 +21,23 @@ async function pair(page: Page, hub: HubServer, name: string, origin: string, ad
   await expect(workspace(page).locator(".connection-pill.online")).toBeVisible();
 }
 async function bounded(row: Locator, badge: Locator) {
-  const box = await row.boundingBox(), tag = await badge.boundingBox();
-  expect(box).not.toBeNull(); expect(tag).not.toBeNull();
-  expect(tag!.x).toBeGreaterThan(box!.x + box!.width / 2);
-  expect(tag!.x + tag!.width).toBeLessThanOrEqual(box!.x + box!.width + 1);
-  const layout = await row.evaluate(el => ({ scroll: el.scrollWidth, width: el.clientWidth, children: Array.from(el.children).map(child => ({ class: child.className, width: child.getBoundingClientRect().width })) }));
+  await expect(badge).toBeVisible();
+  const source = await badge.elementHandle();
+  // Read all rectangles in one frame: phone navigation animates the header.
+  const layout = await row.evaluate((el, source) => {
+    const box = el.getBoundingClientRect(), tag = source!.getBoundingClientRect();
+    const title = el.matches('.conversation-header') ? el.querySelector('.header-title')!.getBoundingClientRect() : undefined;
+    return { left: box.left, right: box.right, midpoint: box.left + box.width / 2,
+      badgeLeft: tag.left, badgeRight: tag.right, titleRight: title?.right,
+      scroll: el.scrollWidth, width: el.clientWidth,
+      children: Array.from(el.children).map(child => ({ class: child.className, width: child.getBoundingClientRect().width })) };
+  }, source);
+  if (layout.titleRight !== undefined) {
+    // Header actions reserve the right edge. A long host name may cross the
+    // midpoint, but must stay after the title without overlapping it.
+    expect(layout.badgeLeft).toBeGreaterThanOrEqual(layout.titleRight);
+  } else expect(layout.badgeLeft).toBeGreaterThan(layout.midpoint);
+  expect(layout.badgeRight).toBeLessThanOrEqual(layout.right + 1);
   expect(layout.scroll, JSON.stringify(layout)).toBeLessThanOrEqual(layout.width + 1);
 }
 
