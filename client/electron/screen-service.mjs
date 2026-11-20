@@ -666,9 +666,13 @@ export class ScreenService {
   #heldSettled() {
     if (this.target !== 'windows') return true;
     if (this.input?.lease) return true;
+    // The file on disk is then the dead process's record: only #retireStale removes it.
+    if (this.#stale) return false;
     try {
       if (this.addon.screenReleasePending() > 0) { this.addon.screenReleaseAll(); if (this.addon.screenReleasePending() > 0) return false; }
-      if (this.#journal.open || this.#journal.size) this.#journal.clear();
+      // A removal that failed once (a sharing violation) is retried here, not
+      // left behind: a leftover file would refuse the next lease's first press.
+      if (this.#journal.pending) this.#journal.clear();
       return true;
     } catch { return false; }
   }
