@@ -5265,5 +5265,7 @@
   "请核对发送方 Bot ID；这里不会自动验证它的名称或创建新 Bot。": "Check the sending Bot ID carefully. Its name is not verified here, and no new Bot will be created.",
   "这个 Bot 不在发送方电脑当前列表中，只能撤销已有授权。": "This Bot isn't in the sending computer's current list; you can only revoke its existing permissions.",
   "发送方电脑当前不可用，仅可撤销": "Sending computer unavailable; revoke only",
-  "保存或放弃修改后，可以切换发送方。": "Save or discard your changes before switching the sender."
+  "保存或放弃修改后，可以切换发送方。": "Save or discard your changes before switching the sender.",
+  "暂不支持": "Not supported",
+  "这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。": "This Windows PC can't be viewed or controlled remotely yet. Viewing a Mac from here still works."
 }

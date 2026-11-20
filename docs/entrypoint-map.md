@@ -155,7 +155,10 @@ permission requests are separate IPC operations; none implicitly grants a
 viewer. `ConnectionPanel` provides a selected-Host viewer fallback for network,
 preferences and ADHD entry points. `RemoteScreenSettings` reads the GUI device's
 Hub status, and reads native status only after `useDesktopLocalHost` confirms
-the selected Host is this Mac. Regressions: Electron `screen-host-control`,
+the selected Host is this computer. A native `supported: false` with reason
+`screen_platform_unsupported` (Windows today) shows "Not supported" without the
+switch, device grants or reinstall advice; `screen_native_unavailable` keeps the
+Mac reinstall notice. Regressions: Electron `screen-host-control`,
 `screen-service`, `desktop-services`; root `screen-service-hub`; browser
 `screen-settings`, `remote-screen`, `local-relay`. See
 [readiness and permission repair](client/remote-screen-readiness-2026-10-31.md).

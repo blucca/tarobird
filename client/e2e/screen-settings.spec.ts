@@ -209,3 +209,56 @@ for(const english of [false,true])test(`compact settings distinguish system perm
  }
  expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.configured)).toEqual([]);
 });
+
+for(const english of [false,true])test(`a computer that cannot be a screen target says so and offers no switch, grants or reinstall advice (${english?"en":"zh"})`,async({page},info)=>{
+ const text=english?{state:"Not supported",help:"This Windows PC can't be viewed or controlled remotely yet. Viewing a Mac from here still works.",view:"View screen",region:"Remote screen"}
+  :{state:"暂不支持",help:"这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。",view:"查看屏幕",region:"远程屏幕"};
+ await page.goto(url(`?native=platform&platform=win32${english?"&en":""}`));
+ const section=page.getByRole("region",{name:text.region,exact:true});
+ await expect(section.locator(".screen-readiness").getByText(text.state,{exact:true})).toBeVisible();
+ await expect(section.getByText(text.help,{exact:true})).toBeVisible();
+ await expect(page.getByRole("button",{name:text.view,exact:true})).toBeDisabled();
+ // The Host still reports a manageable policy; none of it is offered here.
+ const absent=async()=>{
+  await expect(section.getByRole("checkbox")).toHaveCount(0);await expect(section.locator(".screen-settings-intro")).toHaveCount(0);
+  await expect(section.locator(".screen-device-permissions,.screen-system-permissions,.screen-service-recovery,.screen-permission-explanation")).toHaveCount(0);
+  await expect(section.getByRole("button")).toHaveCount(2);
+  for(const sentence of ["尚未注册","屏幕服务尚未注册，请在目标 Mac 检查或重试屏幕服务。","屏幕原生模块不可用，请重新安装完整的 TaroBird 桌面版。","Not registered","The native screen module is unavailable. Reinstall the complete TaroBird desktop app."])await expect(section.getByText(sentence,{exact:true})).toHaveCount(0);
+ };
+ await absent();
+ // The reported case: a granted device on a Host whose own desktop never registers.
+ await page.evaluate(()=>{const f=(window as any).screenSettingsFixture;f.state.status.permission="view";window.dispatchEvent(new Event("focus"));});
+ await expect(section.locator(".screen-readiness dd").filter({hasText:english?"View only":"仅查看"})).toBeVisible();
+ await expect(section.getByText(text.help,{exact:true})).toBeVisible();await absent();
+ expect(await page.evaluate(()=>[...new Set((window as any).screenSettingsFixture.state.native.map((c:any)=>c.command))])).toEqual(["screen_service_status"]);
+ expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.configured)).toEqual([]);
+ await page.mouse.move(0,0);await page.screenshot({path:info.outputPath(`screen-target-unsupported-${english?"en":"zh"}.png`)});
+});
+
+test("target support follows the native service's verdict, not the platform name",async({page})=>{
+ // A supported service on another platform shows the ordinary state and controls.
+ await page.goto(url("?platform=win32&configured"));
+ await expect(page.locator(".screen-readiness").getByText("已注册",{exact:true})).toBeVisible();
+ await expect(page.getByRole("checkbox",{name:"允许远程屏幕",exact:true})).toBeVisible();
+ await expect(page.getByRole("button",{name:"管理设备授权",exact:true})).toBeVisible();
+ await expect(page.getByText("暂不支持",{exact:true})).toHaveCount(0);
+ // macOS-only system permission controls stay macOS-only.
+ await expect(page.locator(".screen-system-permissions")).toHaveCount(0);
+ // The same "no target for this platform" verdict is honoured whatever the shell reports.
+ await page.goto(url("?native=platform"));
+ await expect(page.locator(".screen-readiness").getByText("暂不支持",{exact:true})).toBeVisible();
+ await expect(page.getByRole("checkbox",{name:"允许远程屏幕",exact:true})).toHaveCount(0);
+ await expect(page.locator(".screen-system-permissions,.screen-device-permissions")).toHaveCount(0);
+});
+
+test("a Mac without the native screen functions keeps its reinstall notice and controls",async({page})=>{
+ await page.goto(url("?native=addon"));
+ await expect(page.locator(".screen-readiness").getByText("不可用",{exact:true})).toBeVisible();
+ await expect(page.getByRole("alert")).toHaveText("屏幕原生模块不可用，请重新安装完整的 TaroBird 桌面版。");
+ await expect(page.getByRole("checkbox",{name:"允许远程屏幕",exact:true})).toBeVisible();
+ await expect(page.locator(".screen-system-permissions")).toBeVisible();
+ await expect(page.locator(".screen-device-permissions")).toHaveCount(1);
+ await expect(page.getByRole("button",{name:"重试屏幕服务",exact:true})).toHaveCount(0);
+ await expect(page.getByText("暂不支持",{exact:true})).toHaveCount(0);
+ await expect(page.getByText("这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。",{exact:true})).toHaveCount(0);
+});
