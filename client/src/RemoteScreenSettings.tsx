@@ -6,9 +6,10 @@ import { t, useLocale } from "./i18n.js";
 import { screenError } from "./screen-errors.js";
 import "./remote-screen.css";
 type LocalScreenStatus = {
-  /** With `supported: false`: `screen_platform_unsupported` when this computer
-   * has no target implementation yet, `screen_native_unavailable` when the
-   * native addon lacks the screen functions. */
+  /** With `supported: false`: `screen_platform_unsupported` when this computer's
+   * system has no target implementation, `screen_native_unavailable` when the
+   * native addon lacks the screen backend (a Mac without the screen functions,
+   * or a Windows addon that only has them as stubs). */
   supported: boolean; reason?: string; registered?: boolean; phase?: "starting" | "connecting" | "registered" | "retrying" | "failed"; retryAt?: number; error?: string;
   permissions?: { capture: string; accessibility: boolean; inputMonitoring: boolean };
   desktop?: ScreenStatus["desktop"]; inputMonitoring?: boolean;
@@ -24,7 +25,7 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
   useLocale();
   const state = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);
   const desktopApp = isElectron();
-  const localDesktop = local && desktopApp, localMac = localDesktop && window.tarobotDesktop?.platform === "darwin";
+  const localDesktop = local && desktopApp, localMac = localDesktop && window.tarobotDesktop?.platform === "darwin", localWindows = localDesktop && window.tarobotDesktop?.platform === "win32";
   const [snapshot, setSnapshot] = useState<{ connection: HubConnection; status?: ScreenStatus; native?: LocalScreenStatus; error?: string; nativeError?: string }>();
   const [busy, setBusy] = useState(false), [actionError, setActionError] = useState("");
   const [permissionRequest, setPermissionRequest] = useState<{ kind: "capture" | "accessibility" | "input-monitoring"; opened: boolean }>();
@@ -34,9 +35,12 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
   const devicePermissions = useRef<HTMLDetailsElement>(null);
   const current = snapshot?.connection === connection ? snapshot : undefined;
   const status = current?.status, native = localDesktop ? current?.native : undefined;
-  // This computer cannot be a target at all (e.g. Windows today). Reinstalling
-  // does not help, and the switch and grants would suggest that it does.
+  // This computer's system cannot be a target at all. Reinstalling does not
+  // help, and the switch and grants would suggest that it does.
   const targetUnsupported = native?.supported === false && native.reason === "screen_platform_unsupported";
+  // What the sentences call the controlled computer: a Windows one has no Mac
+  // permissions to point at. A remote Host without a desktop does not say.
+  const target = status?.desktop?.platform ?? (localWindows ? "windows" : "macos");
   useEffect(() => {
     if (!desktopApp) return;
     const scope = {}; lifetime.current = scope;
@@ -88,17 +92,17 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
   const permissions = native?.permissions ?? (native?.desktop ? { capture: native.desktop.capture, accessibility: native.desktop.accessibility, inputMonitoring: !!native.inputMonitoring } : undefined);
   const requestedPermissionGranted = permissionRequest?.kind === "capture" ? permissions?.capture === "granted"
     : permissionRequest?.kind === "accessibility" ? permissions?.accessibility : permissionRequest?.kind === "input-monitoring" ? permissions?.inputMonitoring : false;
-  const blocked = targetUnsupported ? t("这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。")
+  const blocked = targetUnsupported ? t("这台电脑的系统暂时不能被远程查看或控制。从这台电脑查看其他电脑不受影响。")
     : openBlocked || (state.status !== "online" ? t("主机暂时离线，请恢复连接后重试。")
     : !state.screenAvailable ? t("此主机需要更新后才能使用远程屏幕。")
     : !status ? current?.error ? t("无法读取屏幕状态，请刷新重试。") : t("正在读取屏幕状态，请稍候或刷新。")
-    : !status.enabled ? t("请先在目标 Mac 开启允许远程屏幕。")
+    : !status.enabled ? screenError("screen_disabled", target)
     : status.permission === "none" ? t("此设备尚未获得查看授权。")
-    // A remote Host does not say which system it runs; only Macs register today.
-    : !status.desktop ? local ? t("屏幕服务尚未注册，请在目标 Mac 检查或重试屏幕服务。") : t("屏幕服务尚未注册。请在目标电脑上打开 TaroBird 并检查；目前只有 Mac 可以被远程查看。")
-    : status.desktop.locked ? t("目标 Mac 已锁定，请在本机解锁后重新连接。")
-    : status.desktop.capture !== "granted" ? t("请在目标 Mac 允许 TaroBird 录制屏幕，再重新连接。")
-    : !status.desktop.displays.length ? t("目标 Mac 没有可用显示器。") : !open ? t("此入口暂时无法打开屏幕，请重新打开连接设置。") : "");
+    // A remote Host without a registered desktop does not say which system it runs.
+    : !status.desktop ? !local ? t("屏幕服务尚未注册。请在目标电脑上打开 TaroBird 并检查。") : localWindows ? t("屏幕服务尚未注册，请在这台电脑检查或重试屏幕服务。") : t("屏幕服务尚未注册，请在目标 Mac 检查或重试屏幕服务。")
+    : status.desktop.locked ? screenError("screen_locked", target)
+    : status.desktop.capture !== "granted" ? screenError("screen_capture_denied", target)
+    : !status.desktop.displays.length ? screenError("screen_display_unavailable", target) : !open ? t("此入口暂时无法打开屏幕，请重新打开连接设置。") : "");
   const error = actionError || current?.error || current?.nativeError;
   const nativePhase = native?.phase === "starting" ? t("正在启动") : native?.phase === "connecting" ? t("正在连接主机")
     : native?.phase === "registered" ? t("已注册") : native?.phase === "retrying" ? t("等待重试") : native?.phase === "failed" ? t("启动失败") : undefined;
@@ -137,13 +141,13 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
       {blocked && <div className="screen-entry-help"><p id={entryDescription}>{blocked}</p>
         {!targetUnsupported && status?.permission === "none" && (status.canManage && status.policy
           ? <button className="screen-text-action" disabled={busy} onClick={manageDevices}>{t("管理设备授权")}</button>
-          : <p>{t("请在目标 Mac 的已配对设备列表中，明确允许此设备“仅查看”或“查看并控制”。")}</p>)}
+          : <p>{target === "windows" ? t("请在目标电脑的已配对设备列表中，明确允许此设备“仅查看”或“查看并控制”。") : t("请在目标 Mac 的已配对设备列表中，明确允许此设备“仅查看”或“查看并控制”。")}</p>)}
       </div>}
     </div>
-    {error && <p className="screen-notice" role="alert">{screenError(error)}</p>}
+    {error && <p className="screen-notice" role="alert">{screenError(error, target)}</p>}
     {localDesktop && native && !targetUnsupported && <div className="screen-service-recovery">
       {native.phase === "retrying" && Number.isFinite(native.retryAt) && <p role="status">{t("自动重试时间：{0}", new Date(native.retryAt!).toLocaleTimeString())}</p>}
-      {native.error && native.error !== error && <p className="screen-notice" role="status">{screenError(native.error)}</p>}
+      {native.error && native.error !== error && <p className="screen-notice" role="status">{screenError(native.error, target)}</p>}
       {!native.supported && error !== "screen_native_unavailable" && native.error !== "screen_native_unavailable" && <p className="screen-notice" role="alert">{screenError("screen_native_unavailable")}</p>}
       {native.supported && !native.registered && <button disabled={busy || native.phase === "starting" || native.phase === "connecting" || native.error === "screen_service_updating"} onClick={() => void run(() => invoke("screen_service_retry", {}))}>{t("重试屏幕服务")}</button>}
     </div>}
@@ -170,13 +174,21 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
           </>}
         </div>}
       </div>}
+      {localWindows && native?.supported && permissions && <div className="screen-local-state">
+        <h4>{t("本机状态")}</h4>
+        <p className="screen-settings-intro" role="status">{permissions.capture !== "granted" ? t("这台电脑已锁定、会话已断开或正在显示安全提示，暂时不能被查看或控制。")
+          : !permissions.accessibility ? native.error === "screen_stale_record_invalid" ? screenError("screen_stale_record_invalid", "windows") : t("上一次远程控制按下的按键还没有全部松开，暂时不能被控制；回到桌面后会自动完成。")
+          : t("这台电脑可以被查看和控制。Windows 不需要另外授予系统权限。")}</p>
+      </div>}
       <details className="screen-device-permissions" ref={devicePermissions}>
         <summary>{t("设备授权")}</summary>
         <p>{t("配对和总开关不会自动授权设备。")}</p>
         {devices.map(device => <label className="screen-setting-row" data-current-device={device.id === connection.identity.deviceId} key={device.id}><span>{device.name}{device.id === connection.identity.deviceId && <small>{t("当前设备")}</small>}<small>{device.platform}</small></span><select aria-label={t("{0}的屏幕权限", device.name)} disabled={busy} value={status.policy!.grants.find(g => g.deviceId === device.id && g.publicKey === device.publicKey)?.permission ?? "none"} onChange={e => { const permission = e.target.value; void save({ ...status.policy!, grants: [...status.policy!.grants.filter(g => g.deviceId !== device.id), ...(permission === "none" ? [] : [{ deviceId: device.id, publicKey: device.publicKey, permission: permission as "view" | "control" }])] }); }}><option value="none">{t("不允许")}</option><option value="view">{t("仅查看")}</option><option value="control">{t("查看并控制")}</option></select></label>)}
       </details>
     </>}
-    {!targetUnsupported && <details className="screen-permission-explanation"><summary>{t("权限说明")}</summary><p>{t("查看只需屏幕录制权限；远程控制还需辅助功能与输入监控。配对和总开关不会自动授权设备。")}</p></details>}
+    {!targetUnsupported && <details className="screen-permission-explanation"><summary>{t("权限说明")}</summary><p>{localWindows
+      ? t("Windows 不需要另外授予系统权限。锁屏和安全提示出现时共享会停止；以管理员身份运行的窗口能看到，但不能被远程控制。配对和总开关不会自动授权设备。")
+      : t("查看只需屏幕录制权限；远程控制还需辅助功能与输入监控。配对和总开关不会自动授权设备。")}</p></details>}
 
   </section>;
 }

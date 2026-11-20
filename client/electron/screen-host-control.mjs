@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { lstat, readFile } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
@@ -30,19 +32,31 @@ export async function screenHostDirectory(appStateDir) {
   return hasLegacy ? legacy : current;
 }
 
-/** Same owner-only key file rules as the Host CLI (`src/hub/service.ts`). */
-async function controlToken(directory) {
+/** Where the Host in `directory` listens for local control, exactly as
+ * `controlPath` in `src/hub/service.ts`: a socket file, or on Windows a named
+ * pipe whose name is derived from the real (junction-free) directory. */
+export function screenControlAddress(directory, platform = process.platform) {
+  if (platform !== 'win32') return path.join(directory, 'hub-control.sock');
+  let resolved = directory;
+  if (process.platform === 'win32') { try { resolved = realpathSync.native(directory); } catch (error) { if (error?.code !== 'ENOENT') throw new Error('screen_host_directory_unavailable'); } }
+  return `\\\\.\\pipe\\tarobot-hub-${createHash('sha256').update(path.win32.resolve(resolved).toLowerCase()).digest('hex')}`;
+}
+/** Same key file rules as the Host CLI (`src/hub/service.ts`): owner-only by
+ * mode and uid, which Windows does not have; there the file is protected by
+ * the profile directory it lives in, as for the Host itself. */
+async function controlToken(directory, platform = process.platform) {
   const file = path.join(directory, 'hub-control.key');
   let info, token;
   try { info = await lstat(file); } catch (error) { throw new Error(error?.code === 'ENOENT' ? 'screen_host_unavailable' : 'unsafe_hub_control_key'); }
-  if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || info.uid !== process.getuid?.()) throw new Error('unsafe_hub_control_key');
+  if (!info.isFile() || info.isSymbolicLink() || platform !== 'win32' && ((info.mode & 0o077) !== 0 || info.uid !== process.getuid?.())) throw new Error('unsafe_hub_control_key');
   try { token = (await readFile(file, 'utf8')).trim(); } catch { throw new Error('unsafe_hub_control_key'); }
   if (!/^[0-9a-f]{64}$/.test(token)) throw new Error('unsafe_hub_control_key');
   return token;
 }
-function request(directory, body, { connect = net.createConnection, timeoutMs = 10000 } = {}) {
-  const socketPath = path.join(directory, 'hub-control.sock');
-  if (Buffer.byteLength(socketPath) > 100) return Promise.reject(new Error('screen_host_unavailable'));
+function request(directory, body, { connect = net.createConnection, timeoutMs = 10000, platform = process.platform } = {}) {
+  let socketPath;
+  try { socketPath = screenControlAddress(directory, platform); } catch (error) { return Promise.reject(coded(error, 'screen_host_unavailable')); }
+  if (platform !== 'win32' && Buffer.byteLength(socketPath) > 100) return Promise.reject(new Error('screen_host_unavailable'));
   return new Promise((resolve, reject) => {
     const socket = connect(socketPath); let data = ''; let settled = false;
     const done = (error, value) => { if (settled) return; settled = true; socket.destroy(); error ? reject(error) : resolve(value); };
@@ -64,9 +78,13 @@ function request(directory, body, { connect = net.createConnection, timeoutMs = 
  * in `hostDir`. Binds to the Host key observed on that same socket. Failures
  * are bounded `[a-z_]` codes. */
 export async function screenServiceTicket(hostDir, desktopId, options = {}) {
-  const status = await request(hostDir, { command: 'status' }, options);
+  const windows = (options.platform ?? process.platform) === 'win32';
+  // A Windows Host answers nothing without the key, `status` included. A
+  // missing key file there means no Host has started in this directory.
+  let token = windows ? await controlToken(hostDir, 'win32') : undefined;
+  const status = await request(hostDir, { command: 'status', ...(windows ? { token } : {}) }, options);
   if (status?.running !== true || typeof status.publicKey !== 'string') throw new Error('screen_host_unavailable');
-  const token = await controlToken(hostDir);
+  token ??= await controlToken(hostDir);
   const reply = await request(hostDir, { command: 'screen-service-ticket', token, desktopId, expectedPublicKey: status.publicKey }, options);
   const ticket = reply?.screenServiceTicket;
   if (reply?.running !== true || reply.controlError || reply.publicKey !== status.publicKey || typeof ticket?.ticket !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(ticket.ticket)) {

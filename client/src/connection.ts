@@ -1258,7 +1258,11 @@ export class HubConnection {
   private screenRequest<T>(route: string, init: RequestInit = {}): Promise<T> {
     return this.httpRequest<T>(route, init, { ms: SCREEN_REQUEST_TIMEOUT_MS, code: "screen_request_timeout" });
   }
-  async screenStatus() { return screenStatusSchema.parse(await this.screenRequest("/api/screens/status")); }
+  /** `includeWindows=1` tells the Host this App can read a Windows desktop. A
+   * Host shows one only to such a request (an App from before Windows targets
+   * parses the reply as a Mac's and would fail on all of it); a Host from
+   * before Windows targets ignores the query. */
+  async screenStatus() { return screenStatusSchema.parse(await this.screenRequest("/api/screens/status?includeWindows=1")); }
   async screenConfigure(raw: ScreenConfigure) {
     return this.duringMutation(async () => {
       const command = screenConfigureSchema.parse(raw), token = this.token, epoch = this.httpEpoch;
@@ -1276,7 +1280,7 @@ export class HubConnection {
   async screenOpen(input: { desktopId: string; displayId: string; displayRevision: number; requestId: string; codecs: ("h264" | "vp8")[]; quality?: ScreenQuality }) {
     const route = this.state.route, epoch = this.httpEpoch;
     if (!route || !this.identity.hubPublicKey) throw new Error("screen_host_offline");
-    const join = screenJoinSchema.parse(await this.screenRequest("/api/screens/sessions", { method: "POST", body: JSON.stringify(input) }));
+    const join = screenJoinSchema.parse(await this.screenRequest("/api/screens/sessions?includeWindows=1", { method: "POST", body: JSON.stringify(input) }));
     if (this.closed || epoch !== this.httpEpoch || this.state.route?.url !== route.url) { void this.screenStop(join.session.id).catch(() => undefined); throw new Error("screen_route_changed"); }
     return { join, network: { url: route.url, publicKey: this.identity.hubPublicKey, ...routeTrust(route.url, this.identity.hubPublicKey) } };
   }

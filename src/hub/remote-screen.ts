@@ -14,6 +14,8 @@ const POLICY_KEY = "remote-screen:policy:v1", LAST_COMMAND_KEY = "remote-screen:
 const secret = () => randomBytes(32).toString("base64url");
 const id = (prefix: string) => `${prefix}_${randomUUID().replaceAll("-", "")}`;
 export type ScreenControlSink = { send(value: unknown): boolean; close(reason: string): void };
+/** What the asking client can read; from the request, never from the signed policy. */
+export type ScreenViewerOptions = { windows?: boolean };
 export type ScreenMediaSink = { send(bytes: Uint8Array): boolean; configure(stream: ScreenStream): boolean; close(reason: string): void };
 type Lease = { id: string; expiresAt: number; ready: boolean; sequence: number; heldKeys: Set<string>; heldButtons: Set<number>; challenge: { nonce: string; validUntil: number; leaseUntil: number } };
 type Frame = { key: boolean; captureMs: number; confirmed: boolean; streamGeneration: number; pendingAck: boolean };
@@ -33,7 +35,7 @@ export class HubRemoteScreen {
   private serviceFeatures = new Set<string>();
   private sessions = new Map<string, Live>();
   private tickets = new Map<string, Ticket>();
-  private requests = new Map<string, { body: string; join: ScreenJoin }>();
+  private requests = new Map<string, { body: string; join: ScreenJoin; platform?: ScreenDesktop["platform"] }>();
   private unlisten: () => void;
   private disposed = false;
   private clockWall: number; private clockMono: number;
@@ -58,13 +60,18 @@ export class HubRemoteScreen {
       return { device, canManage };
     });
   }
-  async status(session: AuthSession): Promise<ScreenStatus> {
+  /** A client from before Windows targets parses `desktop` strictly as a Mac
+   * and would fail on the whole reply. So a Windows desktop is shown only to a
+   * request that says it can read one (`viewer.windows`, from the query); to
+   * any other it is the same as no desktop, which such a client can show. A
+   * Mac desktop is returned to both, byte for byte as before. */
+  async status(session: AuthSession, viewer: ScreenViewerOptions = {}): Promise<ScreenStatus> {
     await this.readPolicy(); const { device, canManage } = await this.principal(session), policy = this.policy!;
     const devices = canManage ? await this.store.db.serial(() => this.store.db.all<{ id: string; name: string; platform: string; publicKey: string }>("SELECT id,name,platform,public_key AS publicKey FROM devices WHERE revoked=0 ORDER BY created_at LIMIT 256")) : undefined;
     const permission = policy.grants.find(g => g.deviceId === device.id && g.publicKey === device.public_key)?.permission ?? "none";
     return { supported: true, enabled: policy.enabled, canManage, permission,
       ...(canManage ? { policy: structuredClone(policy), devices } : {}),
-      desktop: (canManage || policy.enabled && permission !== "none") && this.desktop ? structuredClone(this.desktop) : null,
+      desktop: (canManage || policy.enabled && permission !== "none") && this.desktop && this.readableBy(viewer) ? structuredClone(this.desktop) : null,
       sessions: [...this.sessions.values()].filter(s => canManage || s.auth.deviceId === device.id).map(s => structuredClone(s.value)), serverTime: this.now() };
   }
   async configure(session: AuthSession, raw: unknown, proof: DeviceActionProof): Promise<ScreenPolicy> {
@@ -161,7 +168,10 @@ export class HubRemoteScreen {
     const sink = this.service; this.service = undefined; this.desktop = undefined; this.serviceEpoch = ""; this.serviceFeatures = new Set();
     sink?.close(reason);
   }
-  async open(session: AuthSession, raw: unknown): Promise<ScreenJoin> {
+  private readableBy(viewer: ScreenViewerOptions, platform = this.desktop?.platform): boolean { return platform === "macos" || platform === "windows" && viewer.windows === true; }
+  /** `viewer` as for `status`: a client that cannot read a Windows desktop
+   * would drive it with Mac keys and shortcuts, so it is refused, not served. */
+  async open(session: AuthSession, raw: unknown, viewer: ScreenViewerOptions = {}): Promise<ScreenJoin> {
     const input = screenOpenSchema.parse(raw); await this.readPolicy(); const { device } = await this.principal(session);
     const grant = this.policy!.grants.find(g => g.deviceId === device.id && g.publicKey === device.public_key);
     if (!this.policy!.enabled || !grant) throw new HubError("screen_not_authorized", 403);
@@ -169,9 +179,13 @@ export class HubRemoteScreen {
     if (previous) {
       if (previous.body !== body) throw new HubError("screen_request_conflict", 409);
       if (!this.sessions.has(previous.join.session.id)) throw new HubError("screen_session_closed", 410);
+      // The same question is asked of a repeated request as of the first one:
+      // a receipt admitted with the opt-in is not handed to a request without it.
+      if (!this.readableBy(viewer, previous.platform ?? this.desktop?.platform)) throw new HubError("screen_client_update_required", 409);
       return structuredClone(previous.join);
     }
     if (!this.service || !this.desktop || this.desktop.desktopId !== input.desktopId) throw new HubError("screen_service_offline", 503);
+    if (!this.readableBy(viewer)) throw new HubError("screen_client_update_required", 409);
     if (this.desktop.locked) throw new HubError("screen_locked", 409);
     if (this.desktop.capture !== "granted") throw new HubError("screen_capture_denied", 409);
     const display = this.desktop.displays.find(d => d.id === input.displayId && d.revision === input.displayRevision);
@@ -187,7 +201,7 @@ export class HubRemoteScreen {
       ...(input.quality !== undefined ? { quality: input.quality } : {}) };
     this.sessions.set(value.id, { value, auth: session, publicKey: device.public_key, frames: new Map(), lastFrame: 0, lastKeyRequest: 0, visible: true, started: false, codecs: input.codecs, quality: input.quality, streamGeneration: 1, awaitingKey: true, lastCapture: 0, rateAt: this.now(), rateBudget: 180 });
     if (this.requests.size >= 128) this.requests.delete(this.requests.keys().next().value!);
-    this.requests.set(requestKey, { body, join: structuredClone(join) });
+    this.requests.set(requestKey, { body, join: structuredClone(join), platform: this.desktop.platform });
     void this.store.audit("screen.connected", session.deviceId, { sessionId: value.id, desktopId: value.desktopId, displayId: display.id, ...(input.quality !== undefined ? { quality: input.quality } : {}) });
     return structuredClone(join);
   }

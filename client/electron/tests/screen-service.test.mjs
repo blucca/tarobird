@@ -229,7 +229,7 @@ test('a startup failure is reported instead of swallowed, and an explicit retry 
 });
 
 test('a ticket failure keeps its bounded code, never a raw OS message or path', async t => {
-  const { service } = await bare(t, { ticket: async () => { throw new Error("EACCES: permission denied, connect '/Users/someone/Library/x.sock'"); } });
+  const { service } = await bare(t, { ticket: async () => { throw new Error("EACCES: permission denied, connect '/Users/example/Library/x.sock'"); } });
   await service.start();
   assert.ok(await waitFor(() => service.status().error));
   assert.equal(service.status().error, 'screen_host_unavailable');
@@ -244,13 +244,21 @@ test('a classified ticket failure is reported as is', async t => {
   assert.equal(service.status().error, 'screen_host_directory_conflict');
 });
 
-test('an unsupported target reports why: no target for this platform, or a Mac addon without screen functions', async t => {
-  const other = await bare(t, { platform: 'win32' });
+test('an unsupported target reports why: no target for this platform, or an addon without the screen backend', async t => {
+  const other = await bare(t, { platform: 'linux' });
   await other.service.start();
   assert.deepEqual(other.service.status(), { supported: false, reason: 'screen_platform_unsupported' });
   await assert.rejects(other.service.retry(), /screen_service_unavailable/);
   assert.equal(other.calls.tickets, 0);
   assert.equal(other.ws.all.length, 0);
+  // Windows is a target platform since #48. This addon has the screen functions
+  // only as an older build had them, as stubs, and does not name itself a
+  // Windows backend: a complete install repairs that, like on a Mac.
+  const stub = await bare(t, { platform: 'win32' });
+  await stub.service.start();
+  assert.deepEqual(stub.service.status(), { supported: false, reason: 'screen_native_unavailable' });
+  assert.equal(stub.calls.tickets, 0);
+  assert.equal(stub.ws.all.length, 0);
   const mac = await bare(t, { addon: { screenMouse: undefined } });
   await mac.service.start();
   assert.deepEqual(mac.service.status(), { supported: false, reason: 'screen_native_unavailable' });

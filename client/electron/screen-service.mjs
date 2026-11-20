@@ -3,9 +3,10 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { WebSocket } from 'ws';
 import { z } from 'zod';
-import { SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_MAX_CONTROL_BYTES, SCREEN_MAX_VIEWERS, SCREEN_SERVICE_QUALITY_FEATURE, screenDesktopSchema, screenServiceCommandSchema, screenServiceEventSchema } from '../../src/client-protocol/remote-screen.ts';
+import { SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_CONTROL_WINDOWS_CAPABILITY, SCREEN_MAX_CONTROL_BYTES, SCREEN_MAX_VIEWERS, SCREEN_SERVICE_QUALITY_FEATURE, screenDesktopSchema, screenServiceCommandSchema, screenServiceEventSchema } from '../../src/client-protocol/remote-screen.ts';
 import { screenQualityProfile } from '../../src/client-protocol/screen-quality.ts';
 import { ScreenGeometry, encodeSize } from './screen-geometry.mjs';
+import { HeldJournal, readHeldJournal } from './screen-held-journal.mjs';
 import { ScreenInput, SCREEN_FRAME_FRESH_MS } from './screen-input.mjs';
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -26,8 +27,8 @@ const captureState = status => status === 'granted' ? 'granted' : status === 'no
 const CODE = /^[a-z_]{1,64}$/, HOST_REASON = /^screen_[a-z_]{1,57}$/;
 const ticketError = error => CODE.test(error?.message ?? '') ? error.message : 'screen_host_unavailable';
 const PANES = { capture: 'Privacy_ScreenCapture', accessibility: 'Privacy_Accessibility', 'input-monitoring': 'Privacy_ListenEvent' };
-
-/** App-level target service for this Mac's desktop. Lives for the App's
+/** App-level target service for this computer's desktop (a Mac, or a Windows
+ * PC whose native addon has the Windows backend). Lives for the App's
  * lifetime, independent of the chat window and its document/NativeOwner: a
  * chat reload neither ends nor inherits screen sessions. Registers with the
  * canonical Host only through the private control-socket ticket and the
@@ -37,21 +38,30 @@ export class ScreenService {
   #ws; #registered = false; #epoch; #timer; #retry; #retryAt; #retryDelay; #disposed = false; #started = false; #startFailed = false;
   #connecting = false; #attempt = 0; #wsFailure;
   #sessions = new Map(); #instancePort; #lastError; #clock; #takeover; #hostRelease = false; #lockedEvent = false; #readyCache; #leaseReady;
-  constructor({ electron, addon, stateDir, hostControl, captureHost, platform = process.platform, WebSocketClass = WebSocket,
+  // Windows only. `#journal`: the on-disk record of what remote control holds (screen-held-journal.mjs).
+  // `#stale`: what a process that died during control left behind, until that is settled.
+  #journal; #markerOnDisk = false; #stale; #retiring; #settling;
+  constructor({ electron, addon, stateDir, hostControl, captureHost, platform = process.platform, WebSocketClass = WebSocket, heldFs,
     wall = Date.now, monotonic = () => performance.now(), onSharing = () => {}, isUpdating = () => false, log = () => {},
     registerTimeoutMs = 10000, attachTimeoutMs = 10000, retryBaseMs = 1000, retryMaxMs = 30000 }) {
     Object.assign(this, { electron, addon, stateDir, hostControl, platform, WebSocketClass, wall, monotonic, onSharing, isUpdating, log, registerTimeoutMs, attachTimeoutMs, retryBaseMs, retryMaxMs });
     this.#retryDelay = retryBaseMs;
-    this.supported = platform === 'darwin' && !!addon?.screenMouse;
+    // The controlled platform. A Windows addon is a target only if it says so
+    // itself: older Windows addons export the same screen functions as stubs.
+    this.target = platform === 'win32' ? 'windows' : 'macos';
+    let named; try { named = addon?.screenTargetPlatform?.(); } catch { named = undefined; }
+    this.supported = platform === 'darwin' ? !!addon?.screenMouse : platform === 'win32' && named === 'windows';
     // Why `status()` reports `supported: false`. A platform without a target
-    // implementation is not repaired by reinstalling; a Mac addon without the
+    // implementation is not repaired by reinstalling; an addon without the
     // screen functions is. Settings shows the two differently.
-    this.unsupportedReason = this.supported ? undefined : platform === 'darwin' ? 'screen_native_unavailable' : 'screen_platform_unsupported';
+    this.unsupportedReason = this.supported ? undefined : platform === 'darwin' || platform === 'win32' ? 'screen_native_unavailable' : 'screen_platform_unsupported';
     this.instanceId = `screen-${randomUUID()}`;
-    this.geometry = new ScreenGeometry({ screen: electron.screen, uuidOf: id => addon?.screenDisplayUuid?.(id) ?? null });
+    this.geometry = new ScreenGeometry({ screen: electron.screen, uuidOf: id => addon?.screenDisplayUuid?.(id) ?? null, platform: this.target, monitors: () => addon.screenMonitors() });
+    this.#journal = new HeldJournal({ file: path.join(stateDir, 'screen-control.held.log'), login: () => this.#login(), ...(heldFs ? { fs: heldFs } : {}) });
     this.capture = captureHost?.({ onMessage: message => this.#capture(message), onGone: (sessions, reason) => { for (const id of sessions) this.#end(id, reason, true); } });
     this.input = new ScreenInput({ native: this.#native(), geometry: this.geometry, frames: (id, sequence, generation) => this.#frame(id, sequence, generation),
-      ready: () => this.#ready(), wall, monotonic, onReleased: (lease, reason) => this.#released(lease, reason) });
+      ready: () => this.#ready(), wall, monotonic, onReleased: (lease, reason) => this.#released(lease, reason), target: this.target,
+      holding: (kind, value) => this.#journal.add(kind, value), settled: (kind, value) => this.#journal.remove(kind, value) });
   }
 
   // ---------------- lifecycle ----------------
@@ -73,7 +83,7 @@ export class ScreenService {
       await this.#recoverStaleInput();
       if (this.#disposed) return;
       const { powerMonitor, screen } = this.electron;
-      this.#watch(powerMonitor, 'lock-screen', () => { this.#lockedEvent = true; this.#readyCache = undefined; this.#invalidate('screen_locked'); });
+      this.#watch(powerMonitor, 'lock-screen', () => { this.#lockedEvent = true; this.#readyCache = undefined; this.#invalidate('screen_locked'); this.#lockedOut(); });
       this.#watch(powerMonitor, 'unlock-screen', () => { this.#lockedEvent = false; this.#readyCache = undefined; });
       this.#watch(powerMonitor, 'user-did-resign-active', () => { this.#lockedEvent = true; this.#readyCache = undefined; this.#invalidate('screen_locked'); });
       this.#watch(powerMonitor, 'user-did-become-active', () => { this.#lockedEvent = false; this.#readyCache = undefined; });
@@ -101,6 +111,9 @@ export class ScreenService {
     for (const stop of this.#listeners.splice(0)) stop();
     this.#ws?.close(1001, 'screen_service_stopped'); this.#ws = undefined;
     this.capture?.close();
+    // The record itself stays if a release is still outstanding: the next start reads it.
+    this.#journal.close();
+    clearInterval(this.#settling); this.#settling = undefined;
   }
 
   // ---------------- management (DesktopServices) ----------------
@@ -114,7 +127,8 @@ export class ScreenService {
       : this.#connecting ? 'connecting' : this.#retry ? 'retrying' : 'starting';
     const permissions = { capture: this.#permission('capture'), accessibility: this.#permission('accessibility'), inputMonitoring: this.#permission('input-monitoring') };
     let desktop = null; try { desktop = this.desktopId ? this.#desktop() : null; } catch { /* reported as no desktop */ }
-    return { supported: true, phase, registered: this.#registered, error: this.#lastError, ...(phase === 'retrying' ? { retryAt: this.#retryAt } : {}),
+    // A record of the last control that cannot be read is said here: it is why control stays off.
+    return { supported: true, phase, registered: this.#registered, error: this.#lastError ?? (this.#stale?.unreadable ? 'screen_stale_record_invalid' : undefined), ...(phase === 'retrying' ? { retryAt: this.#retryAt } : {}),
       permissions, inputMonitoring: permissions.inputMonitoring, desktop,
       sessions: [...this.#sessions.values()].map(r => ({ id: r.session.id, deviceName: r.session.deviceName, controlling: this.input.lease?.sessionId === r.session.id })) };
   }
@@ -130,8 +144,17 @@ export class ScreenService {
   }
   /** Preflight only (no prompt): capture via Electron's
    * CGPreflightScreenCaptureAccess, Accessibility via AXIsProcessTrusted,
-   * Input Monitoring via CGPreflightListenEventAccess. */
+   * Input Monitoring via CGPreflightListenEventAccess.
+   * Windows has none of these permissions. The same three names report what
+   * the session allows right now: capture unless it is locked or not this
+   * user's interactive desktop, input unless that or an unfinished release
+   * stands in the way; watching for the local person needs no grant. Electron's
+   * media status always says `granted` on Windows and is not used. */
   #permission(kind) {
+    if (this.target === 'windows') {
+      let blocked; try { blocked = this.#ready(); } catch { blocked = 'screen_locked'; }
+      return kind === 'capture' ? blocked === 'screen_locked' ? 'unavailable' : 'granted' : kind === 'accessibility' ? blocked === null : true;
+    }
     try {
       if (kind === 'capture') return captureState(this.electron.systemPreferences.getMediaAccessStatus('screen'));
       if (kind === 'accessibility') return this.electron.systemPreferences.isTrustedAccessibilityClient(false) === true;
@@ -147,7 +170,8 @@ export class ScreenService {
    * throws `screen_permission_settings_failed`. Grants nothing by itself. */
   async permission(kind) {
     if (!this.supported) throw new Error('screen_service_unavailable');
-    if (!Object.hasOwn(PANES, kind)) throw new Error('screen_permission_invalid');
+    // Windows has no permission to ask for and no pane to open.
+    if (this.target !== 'macos' || !Object.hasOwn(PANES, kind)) throw new Error('screen_permission_invalid');
     const granted = kind === 'capture' ? this.#permission(kind) === 'granted' : this.#permission(kind);
     let requested = false, requestError;
     if (!granted) {
@@ -196,6 +220,9 @@ export class ScreenService {
     if (this.#disposed || attempt !== this.#attempt) return;
     // An install may have begun while the ticket was pending.
     if (this.isUpdating()) { this.#attemptFailed(attempt, 'screen_service_updating'); return; }
+    // A Host that does not know Windows targets parses the hello strictly and
+    // would refuse it on every attempt: say what is needed instead of sending it.
+    if (this.target === 'windows' && !(Array.isArray(ticket.capabilities) && ticket.capabilities.includes(SCREEN_CONTROL_WINDOWS_CAPABILITY))) { this.#attemptFailed(attempt, 'screen_host_update_required'); return; }
     this.#instancePort = ticket.instancePort;
     const ws = new this.WebSocketClass(`ws://127.0.0.1:${ticket.instancePort}/screen/v1/target`, { perMessageDeflate: false, maxPayload: SCREEN_MAX_CONTROL_BYTES, handshakeTimeout: 5000 });
     this.#ws = ws; this.#wsFailure = undefined;
@@ -320,7 +347,8 @@ export class ScreenService {
     const fail = reason => this.#emit({ type: 'stop', sessionId: session.id, reason });
     // An App update replaces this process: no new sessions while it installs.
     if (session.desktopId !== this.desktopId || this.#sessions.size >= SCREEN_MAX_VIEWERS || this.isUpdating()) return fail('screen_service_stopped');
-    if (captureState(this.electron.systemPreferences.getMediaAccessStatus('screen')) !== 'granted') return fail('screen_capture_failed');
+    // Windows has no capture permission: what stops capture there is a session that cannot be seen.
+    if (this.target === 'windows' ? this.#permission('capture') !== 'granted' : captureState(this.electron.systemPreferences.getMediaAccessStatus('screen')) !== 'granted') return fail(this.target === 'windows' ? 'screen_locked' : 'screen_capture_failed');
     const display = this.geometry.find(session.display.id);
     if (!display || display.revision !== session.display.revision) return fail('screen_geometry_changed');
     const media = new this.WebSocketClass(`ws://127.0.0.1:${this.#instancePort}/screen/v1/target-media`, { perMessageDeflate: false, maxPayload: SCREEN_MAX_CONTROL_BYTES, handshakeTimeout: 5000 });
@@ -449,6 +477,8 @@ export class ScreenService {
     clearInterval(this.#takeover); this.#takeover = undefined;
     try { this.addon.screenMonitorStop(); } catch { /* already stopped */ }
     if (this.#leaseReady === lease.leaseId) this.#leaseReady = undefined;
+    // Whether input can be posted again depends on how this release went.
+    if (this.target === 'windows') { this.#readyCache = undefined; this.#heldSettled(); this.#settleLater(); }
     void this.#marker();
     this.#sharing();
     if (this.#hostRelease || !this.#sessions.has(lease.sessionId)) return;
@@ -477,6 +507,7 @@ export class ScreenService {
     if (this.isUpdating() && this.#sessions.size) { this.stop(undefined, 'screen_service_stopped'); }
     const blocked = this.#ready();
     if (blocked && this.input.lease) this.input.release(blocked);
+    if (this.target === 'windows' && blocked === 'screen_locked') this.#lockedOut();
     const lease = this.input.lease, record = lease && this.#sessions.get(lease.sessionId);
     if (record && mono - record.lastCaptureMono > SCREEN_FRAME_FRESH_MS + 500) this.input.release('screen_frame_stale');
     if (this.#registered) { try { this.#send(this.#ws, { type: 'status', desktop: this.#desktop() }); } catch (error) { this.log(`screen_status_failed:${error?.message?.slice(0, 64)}`); } }
@@ -494,14 +525,24 @@ export class ScreenService {
   #session() {
     try { return this.addon.screenSession(); } catch { return { available: false, onConsole: false, locked: false }; }
   }
+  /** On Windows the native layer checks the session again at every single
+   * post; this answer, up to 250 ms old, only decides leases and status. */
   #ready() {
     const now = this.monotonic();
     if (this.#readyCache && now - this.#readyCache.at < 250) return this.#readyCache.value;
     const session = this.#session();
     const value = !session.available || !session.onConsole || session.locked || this.#lockedEvent ? 'screen_locked'
+      : this.target === 'windows' ? this.#stale || !this.#heldSettled() ? 'screen_input_denied' : null
       : !this.electron.systemPreferences.isTrustedAccessibilityClient(false) ? 'screen_input_denied' : null;
     this.#readyCache = { at: now, value };
     return value;
+  }
+  /** Windows: the lock screen, a consent prompt, a disconnected session or
+   * another desktop has the input. Capture stops here and now, not at the
+   * Host's next status reading, and nothing resumes by itself afterwards. */
+  #lockedOut() {
+    if (this.target !== 'windows') return;
+    for (const id of [...this.#sessions.keys()]) this.#end(id, 'screen_locked', true);
   }
   /** The person at the Mac moved the pointer away from where remote input
    * left it: stop remote control immediately; regaining it needs a new request. */
@@ -538,7 +579,7 @@ export class ScreenService {
       const pointer = this.input.pointer;
       if (!pointer || this.monotonic() - pointer.at < 300) return;
       let cursor; try { cursor = this.addon.screenCursor(); } catch { return; }
-      if (Math.hypot(cursor.x - pointer.x, cursor.y - pointer.y) > TAKEOVER_POINTS) this.input.release('screen_local_takeover');
+      if (Math.hypot(cursor.x - pointer.x, cursor.y - pointer.y) > TAKEOVER_POINTS * pointer.scale) this.input.release('screen_local_takeover');
     }, 250);
     this.#takeover.unref?.();
   }
@@ -546,11 +587,17 @@ export class ScreenService {
   // ---------------- desktop description ----------------
   #desktop() {
     const session = this.#session();
+    const locked = !session.available || !session.onConsole || session.locked || this.#lockedEvent;
+    if (this.target === 'windows') {
+      // `accessibility` is the wire's name for "input can be posted now".
+      return screenDesktopSchema.parse({ desktopId: this.desktopId, instanceId: this.instanceId, loginSession: this.#login(session), platform: 'windows',
+        capture: locked ? 'unavailable' : 'granted', accessibility: this.#ready() === null, locked, displays: this.geometry.displays() });
+    }
     const login = session.unique ? `cgs-${session.unique}` : Number.isSafeInteger(session.audit) ? `asid-${session.audit}` : 'unknown';
     return screenDesktopSchema.parse({ desktopId: this.desktopId, instanceId: this.instanceId, loginSession: login, platform: 'macos',
       capture: captureState(this.electron.systemPreferences.getMediaAccessStatus('screen')),
       accessibility: this.electron.systemPreferences.isTrustedAccessibilityClient(false),
-      locked: !session.available || !session.onConsole || session.locked || this.#lockedEvent, displays: this.geometry.displays() });
+      locked, displays: this.geometry.displays() });
   }
   async #desktopId() {
     const file = path.join(this.stateDir, 'screen-desktop.json');
@@ -569,15 +616,20 @@ export class ScreenService {
    * App died mid-control: lift modifiers and buttons once. Writes and removals
    * are serialized and always converge on the current lease state, so a late
    * removal can never delete a newer lease's marker. Resolves true if the file
-   * now matches an active lease. */
+   * now matches an active lease.
+   * On Windows the marker is removed only once Windows has taken every
+   * release: while a dead process's record or a refused release is
+   * outstanding, the file stays. */
   #markers = Promise.resolve();
   #marker() {
     const file = path.join(this.stateDir, 'screen-control.active');
     const run = this.#markers.then(async () => {
       const active = !!this.input.lease;
       try {
-        if (active) { await mkdir(this.stateDir, { recursive: true }); await writeFile(file, String(this.wall()), { mode: 0o600 }); }
-        else await rm(file, { force: true });
+        // Windows also names the login session: a later start can tell that the session the keys were pressed in is gone.
+        if (active) { await mkdir(this.stateDir, { recursive: true }); await writeFile(file, this.target === 'windows' ? `${this.wall()} ${this.#login()}` : String(this.wall()), { mode: 0o600 }); this.#markerOnDisk = true; }
+        else if (this.target === 'windows' && (this.#stale || !this.#heldSettled())) return false;
+        else { await rm(file, { force: true }); this.#markerOnDisk = false; }
         return active;
       } catch { return false; }
     });
@@ -586,14 +638,96 @@ export class ScreenService {
   }
   async #recoverStaleInput() {
     const file = path.join(this.stateDir, 'screen-control.active');
+    if (this.target === 'windows') return this.#recoverStaleWindows(file);
     try { await readFile(file); } catch { return; }
     try { this.addon.screenReleaseStale(); } catch { /* reported by status */ }
     await rm(file, { force: true }).catch(() => {});
+  }
+
+  // ---------------- Windows: what remote control may have left down ----------------
+  // See screen-held-journal.mjs for the record itself. In short: a key or
+  // button is on disk before it is pressed and off it once Windows has taken
+  // its up, so after a crash exactly what remote control held is a candidate
+  // for lifting, and nothing else on the keyboard or mouse is ever examined.
+  //
+  // What is not covered. (1) Between Windows taking an up and its line being
+  // written, the record still names that input; a crash in that instant leaves
+  // one candidate too many. (2) Typed text presses Unicode keys (VK_PACKET)
+  // that are not recorded. The native layer lifts what a half-taken text call
+  // pressed before it reports the failure; a process that dies before that
+  // leaves at most such a key marked down, which recovery does not look for.
+  // (3) Whoever physically holds a recorded key at the moment of recovery has
+  // it lifted once: Windows does not say who is holding a key.
+  /** The login session's bounded name, or 'unknown' while it cannot be read. */
+  #login(session = this.#session()) { return session.unique ? `wts-${session.unique}` : 'unknown'; }
+  /** True when nothing this process pressed is still down. A release Windows
+   * refused (another desktop had the input) is tried again here; the record
+   * on disk is removed only after Windows took everything and no lease is live. */
+  #heldSettled() {
+    if (this.target !== 'windows') return true;
+    if (this.input?.lease) return true;
+    try {
+      if (this.addon.screenReleasePending() > 0) { this.addon.screenReleaseAll(); if (this.addon.screenReleasePending() > 0) return false; }
+      if (this.#journal.open || this.#journal.size) this.#journal.clear();
+      return true;
+    } catch { return false; }
+  }
+  /** Startup: what the last process left. No record under a marker means that
+   * lease never pressed anything. A record that cannot be read means nothing
+   * is known: nothing is lifted and nothing is cleared, and control stays off. */
+  async #recoverStaleWindows(marker) {
+    let markerLogin, markerFound = true;
+    try { markerLogin = /^\d{1,16} ([A-Za-z0-9_-]{1,128})$/.exec(await readFile(marker, 'utf8'))?.[1]; } catch (error) { if (error?.code !== 'ENOENT') throw error; markerFound = false; }
+    const record = readHeldJournal(this.#journal.file);
+    if (!markerFound && record.state === 'missing') return;
+    if (record.state === 'corrupt') this.log('screen_stale_record_invalid');
+    this.#stale = record.state === 'missing' ? { keys: [], buttons: [] }
+      : { keys: record.keys ?? [], buttons: record.buttons ?? [], login: record.login ?? markerLogin, unreadable: record.state === 'corrupt' };
+    if (!await this.#retireStale()) this.#settleLater();
+  }
+  /** Once a second, with or without a Host: finishes what is outstanding (a
+   * recovery Windows has not taken, a release it refused, the marker of
+   * either) and stops by itself when nothing is. A held key must not wait for
+   * a Host connection to come back. */
+  #settleLater() {
+    if (this.target !== 'windows' || this.#settling || this.#disposed) return;
+    this.#settling = setInterval(() => {
+      this.#readyCache = undefined;
+      if (this.#stale) { void this.#retireStale(); return; }
+      if (this.input.lease || !this.#heldSettled()) return;
+      if (this.#markerOnDisk) { void this.#marker(); return; }
+      clearInterval(this.#settling); this.#settling = undefined;
+    }, 1000);
+    this.#settling.unref?.();
+  }
+  /** Settles what the dead process left, then removes its record and marker;
+   * until then no lease is granted. Retried from the health tick, one attempt
+   * at a time. If this is a different login session than the one the inputs
+   * were pressed in, they cannot be down any more and nothing is lifted. An
+   * unreadable record from this same session (or from an unknown one) is
+   * never settled here: it stays, and so does the refusal to be controlled. */
+  #retireStale() {
+    if (!this.#stale) return Promise.resolve(true);
+    return this.#retiring ??= (async () => {
+      const { keys, buttons, login, unreadable } = this.#stale, now = this.#login();
+      const otherLogin = !!login && login !== 'unknown' && now !== 'unknown' && login !== now;
+      try {
+        if (!otherLogin) {
+          if (unreadable) return false;
+          if (keys.length || buttons.length) this.addon.screenReleaseCandidates(keys, buttons);
+        }
+        await rm(this.#journal.file, { force: true });
+        await rm(path.join(this.stateDir, 'screen-control.active'), { force: true });
+      } catch { return false; }
+      this.#stale = undefined; this.#readyCache = undefined;
+      return true;
+    })().finally(() => { this.#retiring = undefined; });
   }
   #native() {
     const addon = () => this.addon;
     return {
       mouse: (action, button, x, y, clicks, flags) => addon().screenMouse(action, button, x, y, clicks, flags),
+      physicalButton: button => addon().screenPhysicalButton(button),
       scroll: (x, y, wheel1, wheel2, flags) => addon().screenScroll(x, y, wheel1, wheel2, flags),
       key: (keycode, down, flags, { modifier, repeat }) => addon().screenKey(keycode, down, flags, modifier, repeat),
       text: text => addon().screenText(text),

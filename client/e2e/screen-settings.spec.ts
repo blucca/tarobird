@@ -211,8 +211,8 @@ for(const english of [false,true])test(`compact settings distinguish system perm
 });
 
 for(const english of [false,true])test(`a computer that cannot be a screen target says so and offers no switch, grants or reinstall advice (${english?"en":"zh"})`,async({page},info)=>{
- const text=english?{state:"Not supported",help:"This Windows PC can't be viewed or controlled remotely yet. Viewing a Mac from here still works.",view:"View screen",region:"Remote screen"}
-  :{state:"暂不支持",help:"这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。",view:"查看屏幕",region:"远程屏幕"};
+ const text=english?{state:"Not supported",help:"This computer's system can't be viewed or controlled remotely yet. Viewing other computers from here still works.",view:"View screen",region:"Remote screen"}
+  :{state:"暂不支持",help:"这台电脑的系统暂时不能被远程查看或控制。从这台电脑查看其他电脑不受影响。",view:"查看屏幕",region:"远程屏幕"};
  await page.goto(url(`?native=platform&platform=win32${english?"&en":""}`));
  const section=page.getByRole("region",{name:text.region,exact:true});
  await expect(section.locator(".screen-readiness").getByText(text.state,{exact:true})).toBeVisible();
@@ -244,6 +244,17 @@ test("target support follows the native service's verdict, not the platform name
  await expect(page.getByText("暂不支持",{exact:true})).toHaveCount(0);
  // macOS-only system permission controls stay macOS-only.
  await expect(page.locator(".screen-system-permissions")).toHaveCount(0);
+ // A Windows computer has no permission to set: it says what its session allows, and offers no button for it.
+ await expect(page.locator(".screen-local-state").getByText("这台电脑可以被查看和控制。Windows 不需要另外授予系统权限。",{exact:true})).toBeVisible();
+ await expect(page.locator(".screen-local-state").getByRole("button")).toHaveCount(0);
+ await page.getByText("权限说明",{exact:true}).click();
+ await expect(page.getByText("Windows 不需要另外授予系统权限。锁屏和安全提示出现时共享会停止；以管理员身份运行的窗口能看到，但不能被远程控制。配对和总开关不会自动授权设备。",{exact:true})).toBeVisible();
+ expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.native.filter((c:any)=>c.command==="screen_service_permission"))).toEqual([]);
+ // Locked, or a release Windows has not taken yet: the same line says which.
+ await page.evaluate(()=>{const f=(window as any).screenSettingsFixture;Object.assign(f.state.local.permissions,{capture:"unavailable",accessibility:false});window.dispatchEvent(new Event("focus"));});
+ await expect(page.locator(".screen-local-state").getByText("这台电脑已锁定、会话已断开或正在显示安全提示，暂时不能被查看或控制。",{exact:true})).toBeVisible();
+ await page.evaluate(()=>{const f=(window as any).screenSettingsFixture;Object.assign(f.state.local.permissions,{capture:"granted",accessibility:false});window.dispatchEvent(new Event("focus"));});
+ await expect(page.locator(".screen-local-state").getByText("上一次远程控制按下的按键还没有全部松开，暂时不能被控制；回到桌面后会自动完成。",{exact:true})).toBeVisible();
  // The same "no target for this platform" verdict is honoured whatever the shell reports.
  await page.goto(url("?native=platform"));
  await expect(page.locator(".screen-readiness").getByText("暂不支持",{exact:true})).toBeVisible();
@@ -260,11 +271,11 @@ test("a Mac without the native screen functions keeps its reinstall notice and c
  await expect(page.locator(".screen-device-permissions")).toHaveCount(1);
  await expect(page.getByRole("button",{name:"重试屏幕服务",exact:true})).toHaveCount(0);
  await expect(page.getByText("暂不支持",{exact:true})).toHaveCount(0);
- await expect(page.getByText("这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。",{exact:true})).toHaveCount(0);
+ await expect(page.getByText("这台电脑的系统暂时不能被远程查看或控制。从这台电脑查看其他电脑不受影响。",{exact:true})).toHaveCount(0);
 });
 
 for(const english of [false,true])test(`a remote Host without a registered desktop points at that computer, not at a Mac (${english?"en":"zh"})`,async({page})=>{
- const sentence=english?"Screen service isn't registered. Open TaroBird on that computer. Only Macs can be viewed for now.":"屏幕服务尚未注册。请在目标电脑上打开 TaroBird 并检查；目前只有 Mac 可以被远程查看。";
+ const sentence=english?"Screen service isn't registered. Open TaroBird on that computer.":"屏幕服务尚未注册。请在目标电脑上打开 TaroBird 并检查。";
  await page.goto(url(`?remote&ready${english?"&en":""}`));await expect(page.getByRole("button",{name:english?"View screen":"查看屏幕",exact:true})).toBeEnabled();
  await page.evaluate(()=>{const f=(window as any).screenSettingsFixture;f.state.status.desktop=null;window.dispatchEvent(new Event("focus"));});
  await expect(page.getByText(sentence,{exact:true})).toBeVisible();
