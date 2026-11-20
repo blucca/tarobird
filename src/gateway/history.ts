@@ -20,6 +20,8 @@ import { GatewayReceipts } from "./receipts.js";
 
 /** A rewind is re-entrant: an interrupted or failed receipt may run again. */
 const REWIND_RECEIPT_RETRY_MS = 24 * 60 * 60_000;
+/** Ledger run id of an older run matched in the engine (no line of its own). */
+const RESOLVED_RUN_PREFIX = "resolved-";
 
 export interface GatewayHistoryOptions {
   /** The authenticated surface sharing the engine, sessions and locks. */
@@ -110,18 +112,24 @@ export function gatewayHistory(options: GatewayHistoryOptions) {
     try { runs = await readHistoryLedger(stateDir, input.scope.conversationKey); }
     catch { return refuse("engine_failed"); }
     const run = findHistoryLedgerRun(runs, input.messageId);
+    const matched = run?.runId === `${RESOLVED_RUN_PREFIX}${input.messageId}`;
     if (run) {
       const anchor = run.last.anchor;
       if (!anchor?.firstTurnId && anchor?.endSeq === undefined) refuse("not_an_anchor");
       if (run.last.sessionId !== input.sessionId) refuse("session_changed");
-      return anchor!;
+      // A matched older run whose next run could not be matched then has no
+      // fork end yet: match again rather than refusing it forever.
+      if (input.rewind || !matched || anchor!.lastTurnId || anchor!.endSeq !== undefined) return anchor!;
     }
     const target = input.hints?.target, next = input.hints?.next;
     if (!target || target.sourceMessageId !== input.messageId || !bridge.resolveHistoryAnchor) return refuse("turn_unresolved");
     const resolved = await bridge.resolveHistoryAnchor({ ...input.scope, sessionId: input.sessionId, target: runHint(target), ...(next ? { next: runHint(next) } : {}) });
     if (!resolved?.firstTurnId) return refuse("turn_unresolved");
+    // The persisted start may already have been rewound from; never move it.
+    if (run && resolved.firstTurnId !== run.last.anchor?.firstTurnId) return refuse("turn_unresolved");
+    if (run && !resolved.lastTurnId) return resolved;
     const persisted = await appendHistoryLedgerLine(stateDir, input.scope.conversationKey, { v: 1, sourceMessageId: input.messageId,
-      runId: `resolved-${input.messageId}`, engine: input.engine, sessionId: input.sessionId, anchor: resolved, startedAt: target.startedAt ?? target.createdAt });
+      runId: `${RESOLVED_RUN_PREFIX}${input.messageId}`, engine: input.engine, sessionId: input.sessionId, anchor: resolved, startedAt: target.startedAt ?? target.createdAt });
     if (!persisted && input.rewind) refuse("engine_failed");
     return resolved;
   };

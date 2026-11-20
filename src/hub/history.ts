@@ -14,7 +14,7 @@ import { isQueueCommand } from "./prompt-queue.js";
 import { HubError, newId, type HubStore, type TransactionGuard } from "./store.js";
 
 const STATUS_CALL_MS = 10_000;
-const TITLE_MAX = 256, HINT_TEXT_MAX = 200_000;
+const TITLE_MAX = 256, HINT_TEXT_MAX = 200_000, NEXT_INPUT_PAGE = 64;
 const FORK_TITLE_SUFFIX = " · 分叉";
 /** Hub-private snapshot taken when a fork starts; the origin is written from it. */
 const forkStartSchema = z.object({ sourceTitle: z.string().max(TITLE_MAX), title: z.string().min(1).max(TITLE_MAX), excerpt: z.string().max(HISTORY_FORK_EXCERPT_MAX) }).strict();
@@ -252,11 +252,17 @@ export class HubHistory {
     return this.db.serial(async () => {
       const base = { conversationId: row.conversation_id, userId: row.user_id, requestId: row.request_id };
       const target = row.anchor_message_id ? await this.store.queuedMessageInTransaction(row.anchor_message_id) : undefined;
-      if (row.kind === "rewind") return historyBotRewindCallSchema.parse({ ...base, beforeMessageId: row.anchor_message_id, ...(target ? { hints: { target: await this.hint(target, row.bot_id) } } : {}) });
-      const next = target ? await this.nextInput(target, row.bot_id) : undefined;
-      return historyBotForkCallSchema.parse({ ...base, targetConversationId: row.target_conversation_id,
-        ...(target ? { throughMessageId: target.id, hints: { target: await this.hint(target, row.bot_id), ...(next ? { next: await this.hint(next, row.bot_id) } : {}) } } : {}) });
+      // Both operations carry the next run: without it an older run is taken
+      // to be the latest, and its matched anchor (persisted by the Gateway,
+      // reused by every later operation) would end at the thread's last turn.
+      const hints = target ? await this.hints(target, row.bot_id) : undefined;
+      if (row.kind === "rewind") return historyBotRewindCallSchema.parse({ ...base, beforeMessageId: row.anchor_message_id, ...(hints ? { hints } : {}) });
+      return historyBotForkCallSchema.parse({ ...base, targetConversationId: row.target_conversation_id, ...(target ? { throughMessageId: target.id, hints } : {}) });
     });
+  }
+  private async hints(target: Message, botId: string): Promise<HistoryHints> {
+    const next = await this.nextInput(target, botId);
+    return { target: await this.hint(target, botId), ...(next ? { next: await this.hint(next, botId) } : {}) };
   }
   /** Hub facts for matching an older run to engine turns (§4.2). */
   private async hint(message: Message, botId: string): Promise<HistoryHints["target"]> {
@@ -272,13 +278,20 @@ export class HubHistory {
     }
     return { sourceMessageId: message.id, text: clip(userText(message), HINT_TEXT_MAX), createdAt: message.createdAt, ...(startedAt !== undefined && Number.isSafeInteger(startedAt) ? { startedAt } : {}) };
   }
-  /** The next user input this Bot accepted after `message`; a fork ends before its run. */
+  /** The next input after `message` that started a run of this Bot, by the
+   * anchor rule (accepted or failed delivery: an interrupted run may have
+   * turns; not steering, not a command). A deleted one still ran, so it counts.
+   * Scanned to the end: "none found" must mean `message` is the latest run. */
   private async nextInput(message: Message, botId: string): Promise<Message | undefined> {
-    const rows = await this.db.all<{ id: string }>(`SELECT m.id FROM messages m JOIN deliveries d ON d.message_id=m.id AND d.bot_id=? AND d.status='accepted'
-      WHERE m.conversation_id=? AND m.author_type='user' AND m.status!='deleted' AND m.rowid>(SELECT rowid FROM messages WHERE id=?) ORDER BY m.rowid LIMIT 16`, [botId, message.conversationId, message.id]);
-    for (const row of rows) {
-      const next = await this.store.queuedMessageInTransaction(row.id);
-      if (!isQueueCommand(next) && !next.blocks.some(block => block.type === "steering")) return next;
+    let after = (await this.db.get<{ rowid: number }>("SELECT rowid FROM messages WHERE id=?", [message.id]))?.rowid;
+    while (after !== undefined) {
+      const rows = await this.db.all<{ id: string; position: number }>(`SELECT m.id,m.rowid AS position FROM messages m JOIN deliveries d ON d.message_id=m.id AND d.bot_id=? AND d.status IN ('accepted','failed')
+        WHERE m.conversation_id=? AND m.author_type='user' AND m.rowid>? ORDER BY m.rowid LIMIT ?`, [botId, message.conversationId, after, NEXT_INPUT_PAGE]);
+      for (const row of rows) {
+        const next = await this.store.queuedMessageInTransaction(row.id);
+        if (!isQueueCommand(next) && !next.blocks.some(block => block.type === "steering")) return next;
+      }
+      after = rows.length === NEXT_INPUT_PAGE ? rows.at(-1)!.position : undefined;
     }
     return undefined;
   }

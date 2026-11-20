@@ -134,8 +134,10 @@ describe("rewind", () => {
     const body = { botId: "alpha", requestId: "r_1", beforeMessageId: seeded[1]!.input.id, expectedLastMessageId: last };
     const pending = json(api(headers, `/api/conversations/${chat.id}/history/rewind`, body));
     const call = await bot.next("instance.call", f => f.method === "history.rewind");
+    // A rewind carries the next run too: an older run is never taken for the latest.
     expect(call.params).toEqual({ conversationId: chat.id, userId: "owner", requestId: "r_1", beforeMessageId: seeded[1]!.input.id,
-      hints: { target: { sourceMessageId: seeded[1]!.input.id, text: "second", createdAt: seeded[1]!.input.createdAt, startedAt: seeded[1]!.input.createdAt + 10 } } });
+      hints: { target: { sourceMessageId: seeded[1]!.input.id, text: "second", createdAt: seeded[1]!.input.createdAt, startedAt: seeded[1]!.input.createdAt + 10 },
+        next: { sourceMessageId: seeded[2]!.input.id, text: "third", createdAt: seeded[2]!.input.createdAt, startedAt: seeded[2]!.input.createdAt + 10 } } });
     bot.reply(call, { ok: true });
     const done = await pending;
     expect(done.status).toBe(200);
@@ -250,6 +252,21 @@ describe("fork", () => {
     const headDone = await head;
     expect((await hub.store.conversations("owner")).find(c => c.id === headDone.body.conversationId)).toMatchObject({ title: "Try another way", history: { forkedFrom: { mode: "head", excerpt: "", title: "Source chat" } } });
     expect((await hub.store.conversations("owner")).find(c => c.id === headDone.body.conversationId)?.history?.forkedFrom?.throughMessageId).toBeUndefined();
+  });
+  it("finds the next run past any number of commands and steering, and counts an interrupted input", async () => {
+    const { headers, chat, seeded } = await fixture(["first"]);
+    for (let i = 0; i < 70; i++) {
+      const { message } = await hub.store.sendMessage("owner", { conversationId: chat.id, clientMsgId: `cmd_${i}`, text: "/compact", attachments: [] });
+      await hub.store.db.run("UPDATE deliveries SET status='accepted',dispatched=1 WHERE message_id=?", [message.id]);
+    }
+    const { message: stopped } = await hub.store.sendMessage("owner", { conversationId: chat.id, clientMsgId: "stopped_1", text: "a run that was stopped", attachments: [] });
+    await hub.store.db.run("UPDATE deliveries SET status='failed',dispatched=1 WHERE message_id=?", [stopped.id]);
+    const bot = await gateway();
+    const pending = json(api(headers, `/api/conversations/${chat.id}/history/fork`, { botId: "alpha", requestId: "nx_1", throughMessageId: seeded[0]!.input.id, expectedLastMessageId: stopped.id }));
+    const call = await bot.next("instance.call", f => f.method === "history.fork");
+    expect(call.params.hints.next).toMatchObject({ sourceMessageId: stopped.id, text: "a run that was stopped" });
+    bot.reply(call, { ok: true, mode: "turn" });
+    expect((await pending).body).toMatchObject({ state: "completed" });
   });
   it("keeps the default title within 256 units", () => {
     expect(defaultForkTitle("A")).toBe("A · 分叉");

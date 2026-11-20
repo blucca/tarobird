@@ -231,6 +231,28 @@ describe("Gateway history handlers (#53)", () => {
     expect(await f.store.findByConversationKey(buildCoreConversationKey("gw_new"))).toBeNull();
   });
 
+  it("matches a recorded older run again when its fork end was missing, never moving its start", async () => {
+    const f = fixture();
+    await bind(f.store, sid);
+    const hints = { target: { sourceMessageId: "msg_a", text: "x", createdAt: 1 }, next: { sourceMessageId: "msg_b", text: "y", createdAt: 2 } };
+    f.adapter.resolveHistoryAnchor.mockResolvedValueOnce({ firstTurnId: "t5" });
+    expect(await fork(f.history, { requestId: "first", hints })).toEqual({ ok: false, error: "turn_unresolved" });
+    expect(findHistoryLedgerRun(await readHistoryLedger(stateDir, key), "msg_a")?.last.anchor).toEqual({ firstTurnId: "t5" });
+    // The next run can be matched now: the line is completed and used.
+    f.adapter.resolveHistoryAnchor.mockResolvedValueOnce({ firstTurnId: "t5", lastTurnId: "t6" });
+    expect(await fork(f.history, { requestId: "second", targetConversationId: "gw_n2", hints })).toEqual({ ok: true, mode: "turn" });
+    expect(f.adapter.forkSession).toHaveBeenLastCalledWith(sid, expect.objectContaining({ through: { lastTurnId: "t6" } }));
+    expect(findHistoryLedgerRun(await readHistoryLedger(stateDir, key), "msg_a")?.last.anchor).toEqual({ firstTurnId: "t5", lastTurnId: "t6" });
+    // A rewind needs only the start and never re-matches a recorded one.
+    await rewind(f.history, { requestId: "rw", hints });
+    expect(f.adapter.resolveHistoryAnchor).toHaveBeenCalledTimes(2);
+    // A different start is a different run: refused, the record is kept.
+    await appendHistoryLedgerLine(stateDir, key, { v: 1, sourceMessageId: "msg_c", runId: "resolved-msg_c", engine: "codex", sessionId: sid, anchor: { firstTurnId: "t8" }, startedAt: 1 });
+    f.adapter.resolveHistoryAnchor.mockResolvedValueOnce({ firstTurnId: "t9", lastTurnId: "t9" });
+    expect(await fork(f.history, { requestId: "moved", targetConversationId: "gw_n3", throughMessageId: "msg_c", hints: { target: { sourceMessageId: "msg_c", text: "z", createdAt: 3 } } })).toEqual({ ok: false, error: "turn_unresolved" });
+    expect(findHistoryLedgerRun(await readHistoryLedger(stateDir, key), "msg_c")?.last.anchor).toEqual({ firstTurnId: "t8" });
+  });
+
   it("needs a fork boundary for an older run and refuses an active goal", async () => {
     const f = fixture();
     await bind(f.store, sid);
