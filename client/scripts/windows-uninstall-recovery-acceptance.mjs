@@ -32,7 +32,13 @@ const SYNTHETIC = 'tarobird-acceptance-synthetic.txt';
 
 class Receipt {
   checks = [];
-  add(phase, id, status, detail = '') { this.checks.push({ phase, id, status, detail: String(detail).slice(0, 4000) }); return status === 'pass'; }
+  add(phase, id, status, detail = '') {
+    const check = { phase, id, status, detail: String(detail).slice(0, 4000) };
+    this.checks.push(check);
+    // Stream each check so a hung step still leaves evidence in the job log.
+    console.log(`[${new Date().toISOString()}] ${status.toUpperCase()} ${phase}/${id} — ${check.detail.replaceAll('\n', ' ').slice(0, 600)}`);
+    return status === 'pass';
+  }
   expect(phase, id, ok, detail) { return this.add(phase, id, ok ? 'pass' : 'fail', detail); }
   info(phase, id, detail) { this.add(phase, id, 'info', detail); }
   get outcome() { return this.checks.some(c => c.status === 'fail') ? 'fail' : this.checks.some(c => c.status === 'skip') ? 'incomplete' : 'pass'; }
@@ -46,8 +52,40 @@ class Receipt {
 const unquote = value => value?.trim().replace(/^"(.*)"$/, '$1');
 const ps = s => s.replaceAll("'", "''");
 
+const stamp = () => `[${new Date().toISOString()}]`;
+const PROCESS_SNAPSHOT = `Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(tarocub-client|Un|Un_A|Au_|tarobot-installer-helper|tarobot-desktop-updater|node|.*setup)\\.exe$' } | ForEach-Object { "$($_.ProcessId) <- $($_.ParentProcessId) $($_.Name) $($_.CommandLine)" }
+Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { "window $($_.Id) $($_.ProcessName): $($_.MainWindowTitle)" }`;
+
+/** Exit-code runner that never waits on inherited pipes (an NSIS child such as
+ * an Electron helper can keep them open) and, on timeout, records what was
+ * still running and which windows were open, then ends the whole tree. */
+export function timedRunner(sys) {
+  if (sys.runTimed) return sys.runTimed;
+  return (file, args, { timeout, capture = false } = {}) => new Promise(resolve => {
+    const started = Date.now();
+    let stdout = '', stderr = '', timedOut = false, settled = false;
+    const child = spawn(file, args, { windowsHide: true, stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'ignore' });
+    if (capture) { child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; }); }
+    const finish = code => {
+      if (settled) return; settled = true; clearTimeout(timer);
+      resolve({ code: timedOut ? -1 : code ?? 1, timedOut, seconds: Math.round((Date.now() - started) / 1000), stdout, stderr });
+    };
+    const timer = setTimeout(async () => {
+      timedOut = true;
+      const snapshot = (await sys.powershell(PROCESS_SNAPSHOT)).stdout.trim();
+      console.log(`${stamp()} TIMEOUT ${W.basename(file)} ${args.join(' ')} after ${Math.round(timeout / 1000)} s; still running / open windows:\n${snapshot}`);
+      spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }).once('error', () => {});
+      setTimeout(() => finish(-1), 10_000);
+    }, timeout);
+    child.once('error', error => { stderr += String(error); finish(1); });
+    child.once('exit', code => finish(code));
+  });
+}
+
 export function makeContext(sys, options) {
   const tmp = options.temp;
+  const exec = timedRunner(sys);
+  const outcome = result => `exit ${result.code}${result.timedOut ? ' (TIMED OUT, tree killed)' : ''} in ${result.seconds} s`;
   const env = sys.env;
   const bases = [env.APPDATA, env.LOCALAPPDATA];
   const roots = bases.flatMap(base => APP_IDS.map(id => W.join(base, id)));
@@ -86,12 +124,11 @@ export function makeContext(sys, options) {
     };
   };
   const install = async (receipt, phase, args = ['/S']) => {
-    const started = Date.now();
-    const result = await sys.run(options.installer, args, { timeout: 900_000 });
+    const result = await exec(options.installer, args, { timeout: 300_000 });
     const location = await reg(LOCATION_KEY), key = await reg(UNINSTALL_KEY);
     const directory = unquote(location.values?.['(Default)']) ?? unquote(key.values?.InstallLocation);
     const ok = result.code === 0 && !!directory && existsSync(W.join(directory, EXE));
-    receipt.expect(phase, `install ${args.join(' ')}`, ok, `exit ${result.code} in ${Math.round((Date.now() - started) / 1000)} s; ${directory ?? 'no location'}; version ${key.values?.DisplayVersion}`);
+    receipt.expect(phase, `install ${args.join(' ')}`, ok, `${outcome(result)}; ${directory ?? 'no location'}; version ${key.values?.DisplayVersion}`);
     return ok ? directory : undefined;
   };
   /** Which owned files and keys are left: locates the step a failed run stopped at. */
@@ -107,9 +144,10 @@ export function makeContext(sys, options) {
     await mkdir(folder, { recursive: true });
     const copy = W.join(folder, 'Un.exe');
     await copyFile(W.join(directory, 'uninstall.exe'), copy);
-    const result = await sys.run(copy, [...args, `_?=${directory}`], { timeout: 600_000 });
-    await rm(copy, { force: true });
-    return result.code;
+    const result = await exec(copy, [...args, `_?=${directory}`], { timeout: 300_000 });
+    console.log(`${stamp()} uninstaller copy ${args.join(' ')} _?=<dir>: ${outcome(result)}`);
+    await rm(copy, { force: true }).catch(() => {});
+    return result.timedOut ? -1 : result.code;
   };
   /** The registered entry, as Settings → Apps would run it, silently. */
   const uninstallRegistered = async (receipt, phase, id = 'registered-uninstall') => {
@@ -148,10 +186,10 @@ export function makeContext(sys, options) {
     return body;
   };
   const helper = async (directory, flag) => {
-    const result = await sys.run(W.join(directory, HELPER), [flag], { timeout: 120_000 });
-    return { code: result.code, stderr: result.stderr.trim().slice(0, 300) };
+    const result = await exec(W.join(directory, HELPER), [flag], { timeout: 120_000, capture: true });
+    return { code: result.code, stderr: `${result.timedOut ? 'TIMED OUT ' : ''}${result.stderr.trim().slice(0, 300)}` };
   };
-  return { sys, options, tmp, bases, roots, reg, state, backups, presentRoots, lock, install, snapshot, uninstallRegistered, uninstallSync, recover, ensureUninstalled, seed, helper };
+  return { sys, exec, outcome, options, tmp, bases, roots, reg, state, backups, presentRoots, lock, install, snapshot, uninstallRegistered, uninstallSync, recover, ensureUninstalled, seed, helper };
 }
 
 /** A failed silent uninstall must keep the recovery entry and data; a retry of
@@ -203,11 +241,12 @@ async function silentRepair(ctx, receipt, phase) {
 async function inPlace(ctx, receipt, phase) {
   let directory = await ctx.install(receipt, phase);
   if (!directory) return;
-  const code = await ctx.sys.run(W.join(directory, 'uninstall.exe'), ['/S', `_?=${directory}`], { timeout: 600_000 }).then(r => r.code);
+  const inplace = await ctx.exec(W.join(directory, 'uninstall.exe'), ['/S', `_?=${directory}`], { timeout: 300_000 });
+  const code = inplace.timedOut ? -1 : inplace.code;
   const after = await ctx.state();
   const left = [EXE, HELPER, W.join(...LOCK_TARGET), 'uninstall.exe'].filter(file => existsSync(W.join(directory, file)));
   receipt.expect(phase, 'inplace-uninstall-completes', code === 0 && after.uninstall.state === 'absent',
-    `uninstall.exe /S _?=<dir> exit ${code}; uninstall key ${after.uninstall.state}; left ${left.join(', ') || 'none'}`);
+    `uninstall.exe /S _?=<dir> ${ctx.outcome(inplace)}; uninstall key ${after.uninstall.state}; left ${left.join(', ') || 'none'}`);
   receipt.info(phase, 'inplace-state', await ctx.snapshot(directory));
   if (after.uninstall.state === 'present') await ctx.recover(receipt, phase);
   else if (existsSync(W.join(directory, 'uninstall.exe'))) receipt.info(phase, 'inplace-self-left', 'uninstall.exe left behind (expected: a running image cannot delete itself)');
@@ -215,12 +254,11 @@ async function inPlace(ctx, receipt, phase) {
   // Same-version passive reinstall: PageLeaveReinstall takes reinst_uninstall.
   directory = await ctx.install(receipt, phase);
   if (!directory) return;
-  const started = Date.now();
-  const passive = await ctx.sys.run(ctx.options.installer, ['/P'], { timeout: 900_000 });
+  const passive = await ctx.exec(ctx.options.installer, ['/P'], { timeout: 300_000 });
   const key = await ctx.reg(UNINSTALL_KEY);
   const missing = [EXE, 'uninstall.exe', HELPER, W.join(...LOCK_TARGET)].filter(file => !existsSync(W.join(directory, file)));
   receipt.expect(phase, 'passive-same-version-reinstall', passive.code === 0 && key.state === 'present' && !missing.length,
-    `setup /P exit ${passive.code} in ${Math.round((Date.now() - started) / 1000)} s; key ${key.state} ${key.values?.DisplayVersion ?? ''}; missing ${missing.join(', ') || 'none'}`);
+    `setup /P ${ctx.outcome(passive)}; key ${key.state} ${key.values?.DisplayVersion ?? ''}; missing ${missing.join(', ') || 'none'}`);
   if (passive.code !== 0 || missing.length) {
     const repair = await ctx.install(receipt, phase);
     if (repair) receipt.info(phase, 'repair-after-passive', 'silent reinstall restored the installation');
@@ -314,7 +352,7 @@ async function helperCase(ctx, receipt, phase) {
 
 async function driveUi(ctx, mode, { release } = {}) {
   const releaseFile = W.join(ctx.tmp, `ui-release-${Date.now()}.flag`), releasedFile = `${releaseFile}.done`;
-  const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, 'windows-uninstall-ui-driver.ps1'), '-Mode', mode, '-TimeoutSec', '300'];
+  const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, 'windows-uninstall-ui-driver.ps1'), '-Mode', mode, '-TimeoutSec', '180'];
   if (release) args.push('-ReleaseFile', releaseFile, '-ReleasedFile', releasedFile);
   const child = spawn('powershell.exe', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   let stdout = '', stderr = '';
@@ -322,8 +360,8 @@ async function driveUi(ctx, mode, { release } = {}) {
   let done = false;
   const exited = new Promise(resolve => { child.once('exit', () => { done = true; resolve(); }); child.once('error', error => { done = true; stderr += String(error); resolve(); }); });
   let released = false;
-  // The driver has its own 300 s budget; never wait for it longer than that.
-  const deadline = Date.now() + 360_000;
+  // The driver has its own 180 s budget; never wait for it much longer.
+  const deadline = Date.now() + 240_000;
   while (!done && Date.now() < deadline) {
     if (release && !released && existsSync(releaseFile)) { await release(); await writeFile(releasedFile, 'done'); released = true; }
     await Promise.race([exited, ctx.sys.sleep(500)]);
@@ -434,7 +472,10 @@ export async function run(options, sys = windowsSystem()) {
   const installed = await ctx.reg(UNINSTALL_KEY);
   if (installed.state !== 'absent') { receipt.add('preflight', 'no-installation', 'fail', `uninstall key ${installed.state}; an earlier step left an installation`); return { receipt, meta }; }
   receipt.info('preflight', 'retained-roots', ctx.presentRoots().join(', ') || 'none');
+  const deadline = Date.now() + (options.budgetMinutes ?? 50) * 60_000;
   for (const name of options.cases) {
+    if (Date.now() > deadline) { receipt.add(name, 'not-run', 'skip', `the ${options.budgetMinutes ?? 50}-minute budget was spent before this case`); continue; }
+    console.log(`${stamp()} case ${name} starts`);
     try { await CASES[name](ctx, receipt, name); }
     catch (error) { receipt.add(name, 'unexpected-error', 'fail', error instanceof Error ? error.stack ?? error.message : String(error)); }
     try { await ctx.ensureUninstalled(receipt, name); } catch (error) { receipt.add(name, 'cleanup', 'fail', String(error)); }
@@ -444,7 +485,7 @@ export async function run(options, sys = windowsSystem()) {
 
 async function main() {
   const { values } = parseArgs({ options: {
-    installer: { type: 'string' }, version: { type: 'string' }, report: { type: 'string' }, cases: { type: 'string' },
+    installer: { type: 'string' }, version: { type: 'string' }, report: { type: 'string' }, cases: { type: 'string' }, 'budget-minutes': { type: 'string' },
     'confirm-disposable-windows': { type: 'boolean', default: false },
   } });
   if (!values.installer || !values.report || !values.version) throw new Error('--installer, --version and --report are required');
@@ -452,7 +493,7 @@ async function main() {
   if (!report.split(/[\\/]/).some(part => part.endsWith('.noindex'))) throw new Error('--report must be inside a .noindex directory');
   const cases = values.cases ? values.cases.split(',').map(item => item.trim()) : ALL_CASES;
   for (const name of cases) if (!Object.hasOwn(CASES, name)) throw new Error(`unknown case ${name} (${ALL_CASES.join(', ')})`);
-  const { receipt, meta } = await run({ installer: path.resolve(values.installer), version: values.version, cases, confirmed: values['confirm-disposable-windows'], temp: path.join(report, 'work') });
+  const { receipt, meta } = await run({ installer: path.resolve(values.installer), version: values.version, cases, confirmed: values['confirm-disposable-windows'], temp: path.join(report, 'work'), budgetMinutes: Number(values['budget-minutes'] ?? 50) });
   await mkdir(report, { recursive: true });
   await writeFile(path.join(report, 'windows-uninstall-recovery.json'), `${JSON.stringify({ outcome: receipt.outcome, ...meta, finishedAt: new Date().toISOString(), checks: receipt.checks }, null, 2)}\n`);
   await writeFile(path.join(report, 'windows-uninstall-recovery.md'), receipt.markdown(meta));
