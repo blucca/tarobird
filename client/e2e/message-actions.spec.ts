@@ -59,7 +59,7 @@ test("phone message sheet preserves source, draft, focus and native Back across 
     expect(await back()).toBe(true); await expect(sheet).toBeHidden();
     await expect(trigger).toBeFocused(); await expect(composer).toHaveValue("保留这份草稿");
     await messageAction(page, article(page, message.id), "复制消息");
-    await expect.poll(() => page.evaluate(() => (window as any).copied)).toBe("准确复制这一条 **原始 Markdown**");
+    await expect.poll(() => page.evaluate(() => (window as any).copied)).toBe("准确复制这一条 原始 Markdown");
     await expect(article(page, message.id).getByText("已复制", { exact: true })).toBeVisible();
     if (await sheet.isVisible()) await page.keyboard.press("Escape");
     await messageAction(page, article(page, message.id), "引用回复");

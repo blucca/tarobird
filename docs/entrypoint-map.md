@@ -2616,11 +2616,28 @@ and the existing network/run/delete suites listed in that audit.
   semantic clipboard HTML. `main.tsx` installs a narrowly scoped copy-event
   handler; `MessageContextMenu.tsx` captures the same payload before menu focus
   changes. No selectionchange listener, live DOM marker mutation or new shortcut.
-  Partial-only selections, editors, portal readers and phone's raw-text selection
-  sheet retain native copying. Whole-message copying still reads original blocks.
+  Partial-only selections, editors and portal readers retain native copying.
+  Desktop whole-message copying still reads original blocks; mobile readable
+  copying and the phone selection sheet follow the separate policy below.
   Regression: `message-selection`, `message-context-menu`, `native-context-menu`.
   [Rules and validation](client/list-selection-copy-2026-10-27.md).
   Pure App clipboard behavior; headless CLI and stored message content unchanged.
+- Mobile readable message copying (2026-11-20): `message-plain-text.ts` maps only
+  Markdown-rendered fields, reusing `blocksText` for message structure. A separate
+  instance of `markdown.worker.ts` converts syntax trees with
+  `markdown-plain-text.ts`; the rendering queue and stored blocks are unchanged.
+  The phone action sheet and native iOS/Android wide message bars/context menus
+  copy readable text. Desktop source copying and rendered-selection/code/editor
+  copying retain their existing owners. Clipboard writes start inside the tap;
+  delayed conversion uses a promised text item. Failures retain the complete
+  original with explicit feedback, and stale requests cannot update a different
+  conversation's feedback. New copies supersede pending conversion; cancelled
+  clipboard writes are not retried over a newer copy. Regressions:
+  `client-message-plain-text`, `message-copy-plain-review`, `message-plain-copy`,
+  `message-plain-clipboard`, `message-actions`,
+  `message-selection`, `message-context-menu`, `message-hold` and Markdown parsing.
+  Pure App behavior; CLI not applicable.
+  [Rules and validation](client/mobile-message-copy-2026-11-20.md).
 - `tests/helpers/codex-acceptance.ts`
   Real Codex fixture teardown: native archive restricted to the run's exact
   temporary workspaces, after worker shutdown, with pagination and read-back

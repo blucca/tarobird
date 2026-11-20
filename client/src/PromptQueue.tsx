@@ -1,3 +1,4 @@
+import { writeClipboardText } from "./clipboard-write.js";
 import type { NativeInputCapability } from "../../src/client-protocol/native-input.js";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowDownToLine, ArrowUp, ArrowUpToLine, ChevronRight, ArrowRight, GripVertical, ListOrdered, Pause, Play, Pencil, RefreshCw, Trash2 } from "lucide-react";
@@ -291,7 +292,7 @@ export function PromptQueue({ connection, conversationId, botId, phone, active, 
         {!waiting.length && <p className="prompt-queue-empty">{t("没有待执行的消息")}</p>}
       </div>
       <PromptQueueContextMenu phone={phone} pauseState={pauseState} togglePause={id => void togglePause(id)} root={list} conversationId={conversationId} messages={waiting.map(item => item.message)} locate={message => locateSource(message.id)} copy={async text => {
-        try { await navigator.clipboard.writeText(text); setNotice({ text: t("已复制") }); }
+        try { await writeClipboardText(text); setNotice({ text: t("已复制") }); }
         catch { setError(t("复制失败，请选择文字后复制。")); }
       }}/>
       {edit && <form className="prompt-queue-editor" onSubmit={event => { event.preventDefault(); try { assertMessageTextSize(edit.text); if (editableItem?.canEdit) mutate({ type: "edit", messageId: edit.id, text: edit.text }); } catch (cause) { setError(cause instanceof Error ? cause.message : t("操作失败")); } }}>
@@ -309,7 +310,7 @@ export function PromptQueue({ connection, conversationId, botId, phone, active, 
           }
         }}/></label>
         <small>{editableItem?.canEdit ? t("仅修改文字，附件和引用保持不变。草稿会保留在本次 App 会话中。") : t("这条消息已下发或不再可编辑。你的文字仍保留在这里，可复制后关闭。")}</small>{editableItem?.canEdit && <small>{t("编辑期间队列仍会继续，保存前消息可能已下发。")}</small>}
-        <div><button type="submit" className="primary" disabled={!canAct || !editableItem?.canEdit || !edit.text.trim() && !editableItem?.message.blocks.some(block => ["file", "image", "audio"].includes(block.type))}>{edit.conflict && editableItem?.canEdit ? t("核对后保存我的修改") : t("保存修改")}</button><button type="button" onClick={async () => { try { await navigator.clipboard.writeText(edit.text); setNotice({ text: t("已复制编辑内容") }); } catch { setError(t("复制失败，请选择文字后复制。")); } }}>{t("复制文字")}</button><button type="button" disabled={busy || !!pending} onClick={() => setEdit(undefined)}>{t("放弃编辑")}</button></div>
+        <div><button type="submit" className="primary" disabled={!canAct || !editableItem?.canEdit || !edit.text.trim() && !editableItem?.message.blocks.some(block => ["file", "image", "audio"].includes(block.type))}>{edit.conflict && editableItem?.canEdit ? t("核对后保存我的修改") : t("保存修改")}</button><button type="button" onClick={async () => { try { await writeClipboardText(edit.text); setNotice({ text: t("已复制编辑内容") }); } catch { setError(t("复制失败，请选择文字后复制。")); } }}>{t("复制文字")}</button><button type="button" disabled={busy || !!pending} onClick={() => setEdit(undefined)}>{t("放弃编辑")}</button></div>
       </form>}
     </CreationDialog>}
   </div>;

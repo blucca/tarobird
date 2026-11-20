@@ -85,7 +85,9 @@ for (const width of [390, 1360]) test(`long transcription folds without losing c
     await expect(article.getByRole('link',{name:'尾部来源'})).toHaveCount(0);
     await page.evaluate(() => Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async (value: string) => { (window as any).copiedTranscript = value; }}}));
     await messageAction(page,article,'复制消息');
-    await expect.poll(() => page.evaluate(() => (window as any).copiedTranscript)).toBe(blocksText([complete]));
+    // The phone sheet copies readable text; the desktop bar keeps the Markdown source. Neither loses transcript text.
+    const readable = blocksText([complete]).replace('**音频转写完成**','音频转写完成').replace('[尾部来源](https://example.com/meeting)','尾部来源 (https://example.com/meeting)');
+    await expect.poll(() => page.evaluate(() => (window as any).copiedTranscript)).toBe(width === 390 ? readable : blocksText([complete]));
     await page.keyboard.press('Escape');
     const stored = (await hub.store.snapshot('owner',chat.id)).messages.find(item => item.id === message.id)!;
     expect(stored.blocks).toEqual([complete]);

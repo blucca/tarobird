@@ -1,3 +1,4 @@
+import { writeClipboardText } from "./clipboard-write.js";
 import { ExplanationList } from "./ExplanationList.js";
 import { NotificationReadiness } from "./NotificationReadiness.js";
 import { UnifiedPushSettings } from "./UnifiedPushSettings.js";
@@ -43,7 +44,7 @@ export function NotificationDiagnostics({ value }: { value: DesktopNotificationD
   return <div className="notification-diagnostics">
     {value.failure && <p className="muted">{t("代码 {0} · {1}", value.failure.code, value.failure.stage)}</p>}
     <button type="button" className="secondary" onClick={async () => {
-      try { await navigator.clipboard.writeText(text); setStatus(t("诊断信息已复制")); }
+      try { await writeClipboardText(text); setStatus(t("诊断信息已复制")); }
       catch { setStatus(t("复制失败，请选择文字后复制。")); }
     }}><Copy size={16} aria-hidden="true"/>{t("复制诊断信息")}</button>
     <span role="status">{status}</span>

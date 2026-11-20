@@ -78,7 +78,16 @@ test("friendly collaboration routes duplicate names by ID and preserves exact so
       await expect(article.locator(".message-reference")).toHaveCount(0);
       await expect(device.locator(`[data-message-id="${original.id}"] .bot-reference`)).toHaveText("研究助手 · bbbbbb");
       await messageAction(device, article, '复制消息');
-      expect(await device.evaluate(() => (window as unknown as { copied: string }).copied)).toBe(blocksText(answer.blocks));
+      const copied = () => device.evaluate(() => (window as unknown as { copied: string }).copied);
+      // Desktop keeps the Markdown source. The phone sheet copies readable
+      // text. Both keep the real Bot ID rather than its display label.
+      if (device === page) expect(await copied()).toBe(blocksText(answer.blocks));
+      else {
+        await expect.poll(copied).toContain(`link ${beta} (https://example.org/${beta})`);
+        const text = await copied();
+        expect(text).toContain(`ANSWER ${beta}\n\n${beta}\n\n`); expect(text).toContain(`Inline ${beta}\n\nPath /tmp/${beta}/a.json`);
+        expect(text).not.toMatch(/`|\[link/);
+      }
       const actions = device.getByRole('dialog', {name:'消息操作', exact:true});
       if (await actions.isVisible()) await device.keyboard.press('Escape');
     }
@@ -174,7 +183,9 @@ test("friendly collaboration routes duplicate names by ID and preserves exact so
     await expect(mobileHome(phone).locator(".mh-row").filter({has:phone.getByText(conversation.title,{exact:true})})).toContainText("草稿：UNSENT_DRAFT");
     await enterMobileChat(phone, conversation.title);
     await expect(phone.getByRole('textbox', { name: '消息', exact: true })).toHaveValue('UNSENT_DRAFT');
-    await expect(phone.locator(".offline-banner")).toBeVisible();
+    const connectionNotice = phone.locator(".phone-connection-notice");
+    await expect(connectionNotice).toBeVisible();
+    await expect(connectionNotice.getByRole("status")).toContainText(/正在连接|已断开/);
     await expect(phone.locator(".bot-reference").filter({ hasText: "研究助手 · bbbbbb" }).first()).toBeVisible();
     await phone.screenshot({ path: info.outputPath("delegation-phone-offline.png") });
     expect(await phone.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);

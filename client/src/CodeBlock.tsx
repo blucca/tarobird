@@ -1,3 +1,4 @@
+import { writeClipboardText } from "./clipboard-write.js";
 import { Children, isValidElement, useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, Copy } from "lucide-react";
 import { t, useLocale } from "./i18n.js";
@@ -17,7 +18,7 @@ export function CodeBlock({ children, text, language, className = "", copyLabel 
   const plainText = /^(?:text|txt|plaintext)$/i.test(label ?? "");
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(text ?? root.current?.querySelector("code")?.textContent ?? "");
+      await writeClipboardText(text ?? root.current?.querySelector("code")?.textContent ?? "");
       if (!alive.current) return;
       setCopied(true); setFailed(false); clearTimeout(timer.current);
       timer.current = setTimeout(() => setCopied(false), 2000);

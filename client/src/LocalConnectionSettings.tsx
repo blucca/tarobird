@@ -1,3 +1,4 @@
+import { writeClipboardText } from "./clipboard-write.js";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { Check, CheckCircle2, Copy, Globe, LoaderCircle, Wifi } from "lucide-react";
 import { HOST_ROUTES_PATH, hostRoutesViewSchema, type HostRoutesView } from "../../src/client-protocol/host-routes.js";
@@ -41,7 +42,7 @@ export function LocalConnectionSettings({ connection, busyChange }: { connection
   const selectionNeedsUpdate = needsSelection && !state.hostLanSelectionAvailable && !!view?.routes.some(entry => entry.source === "shared" && entry.route.name === "Tailscale");
   const addresses = view?.routes.filter(({ route }) => route.name === (mode === "tailscale" ? "Tailscale" : "Direct")) ?? [];
   const copyAddress = async (url: string) => {
-    try { await navigator.clipboard.writeText(url); setCopy({ key: hubKey, url }); }
+    try { await writeClipboardText(url); setCopy({ key: hubKey, url }); }
     catch { setCopy({ key: hubKey, url, failed: true }); }
   };
   const status = (value: "lan" | "tailscale") => !allowed ? t("暂时无法读取")

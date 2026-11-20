@@ -1,3 +1,4 @@
+import { writeClipboardText } from "./clipboard-write.js";
 import { useState } from "react";
 import { Copy, RotateCw } from "lucide-react";
 import { BrandMark } from "./BrandScenes.js";
@@ -20,7 +21,7 @@ export function StartupFailure({ message, attempts }: { message: string; attempt
     <div className="startup-failure-actions">
       <button type="button" className="primary" onClick={() => location.reload()}><RotateCw size={16}/>{t("重新尝试")}</button>
       <button type="button" onClick={async () => {
-        try { await navigator.clipboard.writeText(diagnostics); setCopyStatus(t("诊断信息已复制")); }
+        try { await writeClipboardText(diagnostics); setCopyStatus(t("诊断信息已复制")); }
         catch { setCopyStatus(t("复制失败，请选择文字后复制。")); }
       }}><Copy size={16}/>{t("复制诊断信息")}</button>
     </div>

@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import remarkRehype from "remark-rehype";
 import type { Nodes, Root } from "hast";
+import type { Root as MarkdownRoot } from "mdast";
 import { markdownImageUrl } from "./markdown-image.js";
 import { remarkMathBoundaries } from "./markdown-math-boundaries.js";
 import { remarkCjkStrong } from "./markdown-cjk-strong.js";
@@ -11,8 +12,17 @@ import { remarkLinkBoundaries } from "./markdown-link-boundaries.js";
 
 // Parse the entire document, preserving reference links, nested lists, fenced
 // blocks and footnotes across updates. Chunk only the resulting display tree.
-const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkMathBoundaries).use(remarkCjkStrong)
-  .use(remarkLinkBoundaries).use(remarkRehype);
+// Display and the readable copy share one syntax definition. Each use is a
+// separate processor, so extension patches are applied once per parser.
+const syntax = () => unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkMathBoundaries).use(remarkCjkStrong)
+  .use(remarkLinkBoundaries);
+const processor = syntax().use(remarkRehype);
+const markdownSyntax = syntax();
+/** The Markdown tree as the renderer reads it, before any display transform. */
+export function parseMarkdownSyntax(text: string): MarkdownRoot {
+  if (text.length > 1024 * 1024) throw new Error("markdown_too_large");
+  return markdownSyntax.runSync(markdownSyntax.parse(text)) as MarkdownRoot;
+}
 // Most chat messages use neither formula layout nor syntax highlighting. Load
 // those engines only after parsing proves they are needed, inside the Worker.
 // A failed module fetch can poison a WebKit module map. Report which optional

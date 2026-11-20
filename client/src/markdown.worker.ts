@@ -1,8 +1,14 @@
 import { MarkdownDependencyError, parseMarkdownChunks, type MarkdownDependency } from "./markdown-parser.js";
+import { markdownPlainText } from "./markdown-plain-text.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
 export type MarkdownWorkerRequest = { id: number; text: string; unavailable?: MarkdownDependency[] };
 export type MarkdownWorkerChunk = { fingerprint: string; serialized: string };
+/** Readable-copy conversion. A separate request shape and a separate Worker
+ * instance (message-plain-text.ts): rendering requests, replies and the shared
+ * rendering queue are unchanged. */
+export type MarkdownPlainRequest = { id: number; plain: string[] };
+export type MarkdownPlainResult = { id: number; plain: string[] } | { id: number; error: true };
 export type MarkdownWorkerResult = { id: number; chunks: MarkdownWorkerChunk[]; dependencies?: MarkdownDependency[] } | { id: number; error: true; dependency?: MarkdownDependency; skipped?: boolean; dependencies?: MarkdownDependency[] };
 async function fingerprint(serialized: string): Promise<string> {
   const bytes = utf8ToBytes(serialized);
@@ -32,7 +38,14 @@ async function render({ id, text, unavailable }: MarkdownWorkerRequest): Promise
   }
   self.postMessage(result);
 }
-self.onmessage = (event: MessageEvent<MarkdownWorkerRequest>) => {
+function plainText({ id, plain }: MarkdownPlainRequest): void {
+  let result: MarkdownPlainResult;
+  // All texts or none: a message is never copied half converted.
+  try { result = { id, plain: plain.map(markdownPlainText) }; } catch { result = { id, error: true }; }
+  self.postMessage(result);
+}
+self.onmessage = (event: MessageEvent<MarkdownWorkerRequest | MarkdownPlainRequest>) => {
+  if ("plain" in event.data) { plainText(event.data); return; }
   // postMessage can itself fail. Surface an ordinary worker error so the main
   // thread's existing recovery runs, without an unobserved async rejection.
   void render(event.data).catch(() => { setTimeout(() => { throw new Error("markdown_worker_reply_failed"); }, 0); });

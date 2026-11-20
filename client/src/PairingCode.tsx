@@ -1,3 +1,4 @@
+import { writeClipboardText } from "./clipboard-write.js";
 import { MAX_PAIRING_LINK_LENGTH, pairingLink, parsePairingLink, type PairingPayload } from "./pairing-link.js";
 export { pairingLink, parsePairingLink, type PairingPayload } from "./pairing-link.js";
 import { Camera, Copy, ImageDown, ImagePlus, LoaderCircle, ScanLine } from "lucide-react";
@@ -66,7 +67,7 @@ export function PairingCode({ payload, save }: { payload: PairingPayload; save?:
   }, [saveKey, !!url]);
   if (text.length > MAX_PAIRING_LINK_LENGTH) return <p role="alert">{t("配对信息过长，请减少备用线路后再试。")}</p>;
   const copy = async () => {
-    try { await navigator.clipboard.writeText(text); setCopyState({ text, status: "copied" }); }
+    try { await writeClipboardText(text); setCopyState({ text, status: "copied" }); }
     catch { setCopyState({ text, status: "manual" }); }
   };
   const busy = !!saving?.busy && saving.key === saveKey;

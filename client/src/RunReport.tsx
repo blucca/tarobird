@@ -1,3 +1,4 @@
+import { writeClipboardText } from "./clipboard-write.js";
 import { useState, type RefObject } from "react";
 import { Copy } from "lucide-react";
 import type { Block, Message } from "../../src/client-protocol/index.js";
@@ -16,7 +17,7 @@ export function RunReport({ block, message, source, close, returnFocus, process,
   const [copied, setCopied] = useState(false), [error, setError] = useState(false);
   const prose = runProse(block), notice = backgroundTaskNotice(block);
   const copy = async () => {
-    try { await navigator.clipboard.writeText(prose.map(entry => entry.text!).join("\n\n")); setCopied(true); setError(false); }
+    try { await writeClipboardText(prose.map(entry => entry.text!).join("\n\n")); setCopied(true); setError(false); }
     catch { setError(true); }
   };
   return <CreationDialog title={t(notice ? "后台任务结果" : "子代理回复")} closeLabel={t("关闭完整回复")} close={close} returnFocus={returnFocus} className="run-report-dialog" back>

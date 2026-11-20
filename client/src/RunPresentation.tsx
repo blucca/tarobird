@@ -1,3 +1,4 @@
+import { writeClipboardText } from "./clipboard-write.js";
 import { TurnStopContext } from "./use-turn-stop.js";
 import { DiffViewerTrigger } from "./DiffViewerTrigger.js";
 import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
@@ -360,7 +361,7 @@ function RunStep({ entry, initialOpen, change }: { entry: RunEntry; initialOpen:
   const plan = runPlan(entry), diff = runDiff(entry), sources = runKind(entry) === "search" ? runSources([entry.output, ...(entry.sources?.map(source => source.url) ?? [])].join("\n")) : [], exit = runExitCode(entry);
   const activity = entry.kind === "text" && entry.name?.startsWith("subagent_") ? runInput(entry) : undefined;
   const childReports = codexAgentReports(entry);
-  const copy = async () => { try { await navigator.clipboard.writeText(JSON.stringify(entry, null, 2)); setCopied(true); setCopyError(false); } catch { setCopyError(true); } };
+  const copy = async () => { try { await writeClipboardText(JSON.stringify(entry, null, 2)); setCopied(true); setCopyError(false); } catch { setCopyError(true); } };
   return <li className={`run-step is-${entry.status}`} data-seq={entry.seq}><details open={open} onToggle={e => { const next = e.currentTarget.open; setOpen(next); change(next); }}>
     <summary data-disclosure-icon><ChevronRight size={14} aria-hidden="true"/><span className="run-step-title">{entry.scope && <span className="run-step-scope"><span>{runScopeLabel(entry.scope)}</span></span>}{runEntryTitle(entry)}</span><span className="run-step-status">{entryStatus(entry)}</span>{(entry.durationMs !== undefined || entry.endedAt !== undefined) && <time>{formatRunDuration(entry.durationMs ?? (entry.endedAt! - entry.at), true)}</time>}</summary>
     {open && <div className="run-step-detail"><button className="run-copy" onClick={() => void copy()}><Copy size={14}/>{copied ? t("已复制") : t("复制此步骤")}</button>{copyError && <p role="alert">{t("复制失败，请手动选择内容。")}</p>}

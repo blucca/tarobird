@@ -1,3 +1,4 @@
+import { writeClipboard } from "./clipboard-write.js";
 /** Clipboard image interchange uses PNG; exports still preserve the original file. */
 export function canCopyImage(): boolean {
   return typeof ClipboardItem !== "undefined" && typeof navigator.clipboard?.write === "function";
@@ -34,5 +35,5 @@ export async function copyImage(blob: Blob): Promise<void> {
   const png = clipboardPng(blob);
   // A denied write may reject before the browser consumes the representation.
   void png.catch(() => undefined);
-  await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+  await writeClipboard([new ClipboardItem({ "image/png": png })]);
 }
