@@ -17,6 +17,11 @@ Var TaroBotHadInstallation
 Var TaroBotFreshPrepared
 Var TaroBotClearSettings
 Var TaroBotBackupRequested
+; Uninstall-key value: this uninstaller cleared notifications and then began
+; removing the program. A later attempt cannot run the program to clear them.
+; Removed with the key; any install or repair removes it as well.
+!define TAROBOTNOTICESCLEARED "TaroBirdNoticesCleared"
+Var TaroBotNoticesCleared
 !define MUI_CUSTOMFUNCTION_GUIINIT TaroBotRememberInstallation
 Function TaroBotRememberInstallation
   ReadRegStr $TaroBotHadInstallation HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TaroBot" "UninstallString"
@@ -117,14 +122,35 @@ FunctionEnd
     ${AndIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
     StrCpy $TaroBotHostStopper "$INSTDIR\${MAINBINARYNAME}.exe"
   ${EndIf}
-  ${If} $TaroBotHostStopper != ""
+  ; A Host runtime whose stopper is missing (removed or quarantined) may still
+  ; be running, so it is never treated as stopped. The installer confirms with
+  ; its own recovery helper below; the uninstaller has none and asks for repair.
+  ; Without a runtime there is no Host of this installation to stop.
+  StrCpy $R0 0
+  ${If} $TaroBotHostStopper == ""
+  ${AndIf} ${FileExists} "$INSTDIR\resources\host\node.exe"
+    StrCpy $R0 1
+  ${ElseIf} $TaroBotHostStopper == ""
+  ${AndIf} ${FileExists} "$INSTDIR\host\node.exe"
+    StrCpy $R0 1
+  ${EndIf}
+  ${If} $R0 = 1
     DetailPrint "$BirdOperation — $(birdHostStage)"
-    ClearErrors
-    SetDetailsPrint none
-    ExecWait '"$TaroBotHostStopper" --stop-desktop-host' $R0
-    SetDetailsPrint lastused
-    ${If} ${Errors}
-      StrCpy $R0 1
+    !if "${INSTALLER}" != "1"
+      !insertmacro BirdProblem "$(birdHostStage)" "$(birdNoStopper)" "$(birdRepairThenUninstall)" "HOST-NO-STOPPER" ""
+    !endif
+  ${EndIf}
+  ${If} $TaroBotHostStopper != ""
+  ${OrIf} $R0 = 1
+    ${If} $TaroBotHostStopper != ""
+      DetailPrint "$BirdOperation — $(birdHostStage)"
+      ClearErrors
+      SetDetailsPrint none
+      ExecWait '"$TaroBotHostStopper" --stop-desktop-host' $R0
+      SetDetailsPrint lastused
+      ${If} ${Errors}
+        StrCpy $R0 1
+      ${EndIf}
     ${EndIf}
     !if "${INSTALLER}" == "1"
       ; Preserve the read-only fallback for old/broken stoppers, including
@@ -255,6 +281,7 @@ FunctionEnd
   StrCpy $BirdNoticeState ""
   StrCpy $TaroBotClearSettings 0
   StrCpy $TaroBotBackupRequested 0
+  StrCpy $TaroBotNoticesCleared 0
   ${IfNot} ${Silent}
   ${AndIf} $PassiveMode <> 1
   ${AndIf} $UpdateMode <> 1
@@ -277,6 +304,7 @@ FunctionEnd
     bird_notice_retry:
     ReadRegStr $R0 SHCTX "Software\Classes\tarocub\shell\open\command" ""
     ${If} $R0 == '$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\"'
+    ${AndIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
       !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"
       DetailPrint "$BirdOperation — $(birdNoticeStage)"
       ClearErrors
@@ -288,6 +316,19 @@ FunctionEnd
         !insertmacro BirdProblem "$(birdNoticeStage)" "$(birdNotice)" "$(birdNoticeStep)" "NOTICE-CLEAR" bird_notice_retry
       ${EndIf}
       StrCpy $BirdNoticeState "$(birdNoticeCleared)"
+      StrCpy $TaroBotNoticesCleared 1
+    ${ElseIf} $R0 == '$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\"'
+      ; The program is gone, so it cannot clear notifications. Only an earlier
+      ; attempt of this uninstaller deletes it, after clearing them and
+      ; recording that (Section Uninstall). Anything else needs a repair.
+      ReadRegStr $R0 SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}"
+      ${If} $R0 == "1"
+        StrCpy $BirdNoticeState "$(birdNoticeClearedEarlier)"
+        StrCpy $TaroBotNoticesCleared 1
+        DetailPrint "$BirdOperation — $(birdNoticeStage) — $BirdNoticeState"
+      ${Else}
+        !insertmacro BirdProblem "$(birdNoticeStage)" "$(birdNoticeMissing)" "$(birdRepairThenUninstall)" "NOTICE-MISSING" ""
+      ${EndIf}
     ${EndIf}
     Pop $R0
   ${EndIf}
