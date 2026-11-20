@@ -93,6 +93,8 @@ app.whenReady().then(async () => {
       resolveSource: async () => (win && !win.isDestroyed() ? win.webContents.mainFrame : undefined), ...hooks }),
     onSharing: items => log('sharing', `sessions=${items.length} controlling=${items.filter(i => i.controlling).length}`) });
   await service.start();
+  // Registration completes asynchronously over the named pipe and the Hub socket.
+  for (let waited = 0; waited < 15000 && service.status().registered !== true; waited += 100) await new Promise(resolve => setTimeout(resolve, 100));
   const status = service.status();
   log('started', `registered=${status.registered} phase=${status.phase} error=${status.error ?? 'none'} minutes=${minutes}`);
   setTimeout(() => { void stop('time_limit'); }, minutes * 60000).unref?.();

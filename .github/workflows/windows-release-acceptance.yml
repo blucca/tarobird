@@ -33,7 +33,9 @@ jobs:
 
       - name: Check out LF sources (bundle hashes comparable across hosts)
         shell: pwsh
-        run: git config --global core.autocrlf false
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
 
       - uses: actions/checkout@v4
         with:
