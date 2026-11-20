@@ -554,3 +554,31 @@ describe("MCP startup warnings do not steer classification", () => {
     expect(classifyFailure(error)).toBe("auth");
   });
 });
+
+// #57: the DeepSeek Harness adapter's own bounded selection errors are settings problems,
+// not a crashed runtime. They must not suggest a restart or be marked for automatic retry.
+describe("DeepSeek Harness model selection failures", () => {
+  const cases = [
+    ["model_unavailable", "不在主机当前的 DeepSeek Harness 目录中", "not in the Host's current DeepSeek Harness catalog"],
+    ["model_id_invalid", "模型标识无效", "model identity is invalid"],
+    ["effort_incompatible", "思考强度", "effort"],
+    ["model_catalog_unavailable", "模型目录", "model catalog"],
+    ["selection_unconfirmed", "未确认", "did not confirm"],
+  ] as const;
+  it.each(cases)("%s is an explicit, non-retryable settings error", (code, zh, en) => {
+    const error = new Error(`DeepSeek Harness ${code}`);
+    expect(classifyFailure(error)).toBe("engine-settings");
+    expect(getBusErrorSemantics(classifyFailure(error))).toEqual({ code: "engine_settings", retryable: false });
+    const zhText = renderCoreUserFacingError(error, "engine", "zh"), enText = renderCoreUserFacingError(error, "engine", "en");
+    expect(zhText).toContain(zh); expect(enText).toContain(en);
+    expect(zhText).not.toContain("重启实例后重试"); expect(enText).not.toContain("Restart the instance and retry");
+    expect(zhText).toContain("不会自动"); expect(enText).toMatch(/not (?:substituted|switched|changed)|no other/i);
+  });
+  it.each([
+    "DeepSeek Harness agent failed: provider says model_unavailable",
+    "tool output: DeepSeek Harness model_unavailable",
+    "DeepSeek Harness model_unavailable\nextra native diagnostics",
+  ])("does not reclassify other text that merely mentions a selection code: %s", message => {
+    expect(classifyFailure(new Error(message))).not.toBe("engine-settings");
+  });
+});

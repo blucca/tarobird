@@ -1,4 +1,6 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { classifyFailure } from '../src/runtime/error-classification.js';
+import { renderCoreUserFacingError } from '../src/core/errors.js';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -69,4 +71,17 @@ it('applies a changed override even while the native read projection still shows
   await f.configure();
   expect(f.request.mock.calls.filter(([method]) => method === 'session.selectModel')).toHaveLength(2);
   expect(f.request.mock.calls.filter(([method]) => method === 'session.selectModel').at(-1)?.[1]).toEqual({ sessionId: 'source', provider: 'a', model: 'org/model' });
+});
+it('reports the adapter selection failures as explicit settings errors rather than a runtime crash', async () => {
+  const failures: unknown[] = [];
+  const removed = await fixture(); await removed.configure(); removed.state.groups = [];
+  failures.push(await removed.configure().catch(error => error));
+  const effort = await fixture({ model: 'a/org/model', effort: 'high' }); failures.push(await effort.configure().catch(error => error));
+  const catalog = await fixture(); catalog.state.failures = [{ message: 'private failure' }]; failures.push(await catalog.configure().catch(error => error));
+  const ack = await fixture(); ack.state.wrongAck = true; failures.push(await ack.configure().catch(error => error));
+  expect(failures.map(error => (error as Error).message)).toEqual(['model_unavailable', 'effort_incompatible', 'model_catalog_unavailable', 'selection_unconfirmed'].map(code => `DeepSeek Harness ${code}`));
+  for (const error of failures) {
+    expect(classifyFailure(error)).toBe('engine-settings');
+    expect(renderCoreUserFacingError(error, 'engine', 'zh')).not.toMatch(/重启实例后重试|private failure/);
+  }
 });

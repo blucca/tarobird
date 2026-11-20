@@ -90,6 +90,23 @@ export function renderEngineSettingsError(error: unknown, locale: "zh" | "en"): 
   if (error instanceof EngineConfigError || normalizeErrorText(error).includes(`${ENGINE_CONFIG_ERROR_CODE}:`)) return locale === "zh"
     ? "无法确认 Bot 的权限配置，本次执行已停止。请修复主机上此 Bot 的 config.json 后重试；不会自动切换为完全访问。"
     : "The Bot permission configuration could not be verified, so this turn was blocked. Repair this Bot’s config.json on the host and retry; full access was not enabled.";
+  switch (deepSeekSelectionFailure(error)) {
+    case "model_unavailable": return locale === "zh"
+      ? "此 Bot 使用的模型不在主机当前的 DeepSeek Harness 目录中（可能已删除，或其供应商不可用）。请在 Bot 的模型设置中重新读取并选择可用模型，或检查 DSH 默认模型；不会自动换成其他模型，无需重启实例。"
+      : "This Bot's model is not in the Host's current DeepSeek Harness catalog (it may have been removed, or its provider is unavailable). Reload the Bot's model settings and choose an available model, or check the DSH default model; no other model is substituted and no restart is needed.";
+    case "model_id_invalid": return locale === "zh"
+      ? "此 Bot 保存的 DeepSeek 模型标识无效。请在 Bot 的模型设置中重新选择模型；不会自动换成其他模型，无需重启实例。"
+      : "This Bot's saved DeepSeek model identity is invalid. Choose the model again in the Bot's model settings; no other model is substituted and no restart is needed.";
+    case "effort_incompatible": return locale === "zh"
+      ? "所选 DeepSeek 模型不支持此 Bot 的思考强度。请在 Bot 的思考强度设置中选择该模型提供的档位，或选择跟随默认；不会自动改用其他档位，无需重启实例。"
+      : "The selected DeepSeek model does not support this Bot's effort. Choose a level that model offers, or follow its default, in the Bot's effort settings; the effort is not switched automatically and no restart is needed.";
+    case "model_catalog_unavailable": return locale === "zh"
+      ? "DeepSeek Harness 暂未完整返回模型目录（有供应商读取失败），为避免用错模型，本轮未执行。请检查主机上的 DSH 供应商配置与授权后重试；不会自动换成其他模型，无需重启实例。"
+      : "DeepSeek Harness did not return a complete model catalog (a provider failed), so this turn did not run to avoid using the wrong model. Check the DSH provider configuration and sign-in on the Host, then retry; no other model is substituted and no restart is needed.";
+    case "selection_unconfirmed": return locale === "zh"
+      ? "DeepSeek Harness 未确认此 Bot 的模型选择，为避免用错模型，本轮未执行。请重试；若持续出现，请在 Bot 的模型设置中重新选择模型。不会自动换成其他模型。"
+      : "DeepSeek Harness did not confirm this Bot's model selection, so this turn did not run to avoid using the wrong model. Retry; if it persists, choose the model again in the Bot's model settings. No other model is substituted.";
+  }
   if (isPiModelUnavailable(normalizeErrorText(error))) return locale === "zh"
     ? "所选模型在 Pi 中不可用。请检查模型名称和供应商登录状态，或选择可用模型后重试。"
     : "The selected model is not available in Pi. Check the model name and provider sign-in, or select an available model and retry.";
@@ -127,6 +144,12 @@ const PI_RUNTIME_LABEL_RE = /(?:^|[^a-z0-9_./-])pi (?:cli|rpc|adapter|bridge)(?=
 const PI_RUNTIME_ERROR_RE = /(?:^|[\r\n])pi(?:startup|rpc(?:command|closed|timeout)|bridge(?:control|handshake)|nativebridgeunavailable)error(?:$|[\r\n:])/;
 function hasNamedEngineSignal(text: string): boolean {
   return NAMED_ENGINE_RE.test(text) || PI_RUNTIME_LABEL_RE.test(text) || PI_RUNTIME_ERROR_RE.test(text);
+}
+// Exact messages thrown by deepseek-harness-adapter.ts while selecting the Bot's model before a
+// prompt. Only the adapter's own bounded message matches; native or tool text is never scanned.
+const DEEPSEEK_SELECTION_RE = /^DeepSeek Harness (model_unavailable|model_id_invalid|effort_incompatible|model_catalog_unavailable|selection_unconfirmed)$/;
+function deepSeekSelectionFailure(error: unknown): string | undefined {
+  return DEEPSEEK_SELECTION_RE.exec(error instanceof Error ? error.message : typeof error === "string" ? error : "")?.[1];
 }
 function isPiModelUnavailable(text: string): boolean {
   return /invalid model selection: [^\r\n]{1,512} is not available in pi\./i.test(text);
@@ -182,6 +205,7 @@ export function classifyFailure(error: unknown): FailureCategory {
 
   // Native Pi labels can contain Unicode or spaces. Recognize that bounded
   // diagnostic as settings, while rendering only the safe identifier above.
+  if (deepSeekSelectionFailure(error)) return "engine-settings";
   if (extractModelEffortMismatch(text) || /invalid model selection: [^\r\n]{1,512} has no "(?:off|minimal|low|medium|high|xhigh|max|ultra)" effort \(available: [a-z, ]{1,80}\)/.test(text) || isPiModelUnavailable(text) || /invalid model selection: \S{1,512} does not support effort/.test(text)) return "engine-settings";
 
   // A Codex thread whose writer lock is held elsewhere. The adapter appends an
