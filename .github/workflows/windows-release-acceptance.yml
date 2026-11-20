@@ -116,7 +116,10 @@ jobs:
         env:
           TAROBOT_WINDOWS_ACCEPTANCE: disposable
         run: |
-          $electron = Join-Path (Get-Location) "client\node_modules\electron\dist\electron.exe"
+          node client/node_modules/electron/install.js
+          if ($LASTEXITCODE -ne 0) { throw "Electron binary install failed" }
+          $electron = (node -p "require('./client/node_modules/electron')").Trim()
+          if (-not (Test-Path -LiteralPath $electron)) { throw "Resolved Electron binary missing" }
           $report = Join-Path $env:RUNNER_TEMP "winviewer-report.noindex"
           node client/scripts/windows-screen-acceptance.mjs `
             --confirm-disposable-windows `
