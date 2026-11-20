@@ -376,9 +376,26 @@ describe("Codex history: older runs", () => {
     expect(resolveCodexHistoryAnchor(turns, { sourceMessageId: "msg_a", text: "never sent", startedAt: T * 1000 })).toBeUndefined();
     expect(resolveCodexHistoryAnchor(turns, { sourceMessageId: "msg_a", text: "fix the build please", startedAt: (T + 7200) * 1000 })).toBeUndefined();
     expect(resolveCodexHistoryAnchor(turns, { sourceMessageId: "msg_a", text: "fix the build please" })).toBeUndefined();
-    // Attachment-only input matches by time alone, and only when unique.
+    // Time alone never decides: attachment-only or very short input does not match.
     expect(resolveCodexHistoryAnchor(turns, { sourceMessageId: "msg_a", text: "", startedAt: T * 1000 })).toBeUndefined();
-    expect(resolveCodexHistoryAnchor(turns, { sourceMessageId: "msg_d", text: "", startedAt: (T + 290) * 1000 })).toEqual({ firstTurnId: "t4", lastTurnId: "t4" });
+    expect(resolveCodexHistoryAnchor(turns, { sourceMessageId: "msg_d", text: "", startedAt: (T + 290) * 1000 })).toBeUndefined();
+    expect(resolveCodexHistoryAnchor(turns, { sourceMessageId: "msg_d", text: "ok!", startedAt: (T + 290) * 1000 })).toBeUndefined();
+    // A message still found by its Hub id needs no text.
+    expect(resolveCodexHistoryAnchor(turns, { sourceMessageId: "msg_c", text: "", startedAt: (T + 120) * 1000 })).toEqual({ firstTurnId: "t3", lastTurnId: "t4" });
+  });
+  it("never takes a look-alike from a later run when the target's own turn is missing", () => {
+    const user = (id: string, at: number, text: string): CodexHistoryTurn => ({ id, startedAt: at, userMessage: true, clientId: null, text: `[guidance: reply in 1 message]\n${text}` });
+    // msg_1's own turn is absent (failed before a turn, or already removed); msg_2 ran at T+60.
+    const absent = [user("t_other", T + 60, "try another approach"), user("t_later", T + 300, "please continue the work")];
+    const next = { sourceMessageId: "msg_2", text: "try another approach", startedAt: (T + 60) * 1000 };
+    expect(resolveCodexHistoryAnchor(absent, { sourceMessageId: "msg_1", text: "please continue the work", startedAt: T * 1000, next })).toBeUndefined();
+    // With its own turn present it is found, and the later look-alike does not compete.
+    const present = [user("t_own", T + 1, "please continue the work"), ...absent];
+    expect(resolveCodexHistoryAnchor(present, { sourceMessageId: "msg_1", text: "please continue the work", startedAt: T * 1000, next })).toEqual({ firstTurnId: "t_own", lastTurnId: "t_own" });
+    // Short text and attachment-only input (the review's C1-C3 shapes).
+    expect(resolveCodexHistoryAnchor([user("t_later", T + 300, "继续")], { sourceMessageId: "msg_1", text: "继续", startedAt: T * 1000 })).toBeUndefined();
+    expect(resolveCodexHistoryAnchor([user("t_a", T, "帮我看一下这个报错")], { sourceMessageId: "msg_s", text: "1", startedAt: T * 1000 })).toBeUndefined();
+    expect(resolveCodexHistoryAnchor([user("t_next", T + 900, "这张图里是什么")], { sourceMessageId: "msg_img", text: "", startedAt: T * 1000 })).toBeUndefined();
   });
   it("lists the tail of the thread through the adapter", async () => {
     const h = harness();

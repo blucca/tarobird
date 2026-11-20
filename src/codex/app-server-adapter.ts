@@ -836,14 +836,25 @@ export function readCodexHistoryTurn(raw: unknown): CodexHistoryTurn | undefined
 
 const normalizeHistoryText = (text: string) => text.replace(/\s+/gu, " ").trim();
 
+/** Fewest letters or digits a message needs before its text can single out a
+ * turn. Shorter input ("1", "好", "继续") is contained in host guidance and in
+ * look-alike messages, so it would match on time alone. */
+const CODEX_HISTORY_MATCH_MIN_TEXT = 4;
+const singlesOutTurn = (text: string) => (text.match(/[\p{L}\p{N}]/gu)?.length ?? 0) >= CODEX_HISTORY_MATCH_MIN_TEXT;
+
 /** Index of the run's first turn at or after `from`: the turn carrying the Hub
  * id, else the only user turn near the run's start whose input contains the
  * message text (the host adds private guidance and attachment lines around
- * it). Ambiguous or absent: undefined, never a guess. */
-function locateCodexRunTurn(turns: readonly CodexHistoryTurn[], hint: CodexHistoryRunHint, from: number): number | undefined {
+ * it). The window ends where the next accepted input's run started, when
+ * known: a turn after that belongs to a later run even if it is the only
+ * look-alike left (the target's own turn may be missing). Time alone never
+ * decides: very short or attachment-only input does not match. Ambiguous or
+ * absent: undefined, never a guess. */
+function locateCodexRunTurn(turns: readonly CodexHistoryTurn[], hint: CodexHistoryRunHint, from: number, nextStartedAt?: number): number | undefined {
   for (let index = from; index < turns.length; index++) if (turns[index]!.clientId === hint.sourceMessageId) return index;
   if (hint.startedAt === undefined) return undefined;
   const text = normalizeHistoryText(hint.text);
+  if (!singlesOutTurn(text)) return undefined;
   const candidates: number[] = [];
   for (let index = from; index < turns.length; index++) {
     const turn = turns[index]!;
@@ -851,7 +862,8 @@ function locateCodexRunTurn(turns: readonly CodexHistoryTurn[], hint: CodexHisto
     if (!turn.userMessage || turn.clientId || turn.startedAt === null) continue;
     const at = turn.startedAt * 1000;
     if (at < hint.startedAt - CODEX_HISTORY_MATCH_BEFORE_MS || at > hint.startedAt + CODEX_HISTORY_MATCH_AFTER_MS) continue;
-    if (text && !normalizeHistoryText(turn.text).includes(text)) continue;
+    if (nextStartedAt !== undefined && at >= nextStartedAt) continue;
+    if (!normalizeHistoryText(turn.text).includes(text)) continue;
     candidates.push(index);
   }
   return candidates.length === 1 ? candidates[0] : undefined;
@@ -861,7 +873,7 @@ function locateCodexRunTurn(turns: readonly CodexHistoryTurn[], hint: CodexHisto
  * turn before the next run's first turn, or the thread's last turn when the
  * target is the latest run; absent when the next run cannot be matched. */
 export function resolveCodexHistoryAnchor(turns: readonly CodexHistoryTurn[], input: CodexHistoryRunHint & { next?: CodexHistoryRunHint }): EngineHistoryAnchor | undefined {
-  const first = locateCodexRunTurn(turns, input, 0);
+  const first = locateCodexRunTurn(turns, input, 0, input.next?.startedAt);
   if (first === undefined) return undefined;
   const firstTurnId = turns[first]!.id;
   if (!input.next) return { firstTurnId, lastTurnId: turns.at(-1)!.id };
