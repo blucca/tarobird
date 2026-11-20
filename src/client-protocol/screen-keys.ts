@@ -47,7 +47,9 @@ const E0 = SCREEN_WINDOWS_EXTENDED;
  * every code the protocol accepts has an entry in both. The values are the
  * `win` column of Chromium's `dom_code_data.inc`, the public table from which
  * Chrome Remote Desktop injects keys the same way (high byte E0 = extended).
- * Num Lock is extended there (0xE045); plain 0x45 is Pause. */
+ * Num Lock is the exception: that table lists it as E0 45, but injected that
+ * way it does not toggle (measured on Windows 11); plain 0x45 does, and maps to
+ * VK_NUMLOCK. Pause, plain 0x45 in that table, is not a key this protocol sends. */
 export const SCREEN_WINDOWS_SCANCODES: Readonly<Record<string, number>> = Object.freeze({
   KeyA: 0x1e, KeyS: 0x1f, KeyD: 0x20, KeyF: 0x21, KeyH: 0x23, KeyG: 0x22, KeyZ: 0x2c, KeyX: 0x2d, KeyC: 0x2e, KeyV: 0x2f,
   KeyB: 0x30, KeyQ: 0x10, KeyW: 0x11, KeyE: 0x12, KeyR: 0x13, KeyY: 0x15, KeyT: 0x14, KeyO: 0x18, KeyU: 0x16, KeyI: 0x17,
@@ -64,7 +66,7 @@ export const SCREEN_WINDOWS_SCANCODES: Readonly<Record<string, number>> = Object
   F13: 0x64, F14: 0x65, F15: 0x66, F16: 0x67, F17: 0x68, F18: 0x69, F19: 0x6a,
   Numpad0: 0x52, Numpad1: 0x4f, Numpad2: 0x50, Numpad3: 0x51, Numpad4: 0x4b, Numpad5: 0x4c, Numpad6: 0x4d, Numpad7: 0x47,
   Numpad8: 0x48, Numpad9: 0x49, NumpadDecimal: 0x53, NumpadMultiply: 0x37, NumpadAdd: 0x4e, NumpadDivide: E0 | 0x35,
-  NumpadEnter: E0 | 0x1c, NumpadSubtract: 0x4a, NumpadEqual: 0x59, NumLock: E0 | 0x45,
+  NumpadEnter: E0 | 0x1c, NumpadSubtract: 0x4a, NumpadEqual: 0x59, NumLock: 0x45,
 });
 
 /** CGEventFlags. Device bits (low word) let apps tell left from right modifiers. */

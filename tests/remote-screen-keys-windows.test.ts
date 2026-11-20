@@ -18,17 +18,18 @@ it("every key the protocol accepts has one Windows scan code, and no two keys sh
   }
 });
 
-it("keys that differ only by the E0 prefix are told apart, and Num Lock is the extended 0x45", () => {
+it("keys that differ only by the E0 prefix are told apart, and Num Lock is the plain 0x45 that toggles it", () => {
   const E0 = SCREEN_WINDOWS_EXTENDED;
   expect(SCREEN_WINDOWS_SCANCODES).toMatchObject({
     KeyA: 0x1e, KeyQ: 0x10, KeyW: 0x11, KeyZ: 0x2c, Digit1: 0x02, Digit0: 0x0b, Enter: 0x1c, Escape: 0x01, Tab: 0x0f, Space: 0x39, Backspace: 0x0e,
     ControlLeft: 0x1d, ControlRight: E0 | 0x1d, AltLeft: 0x38, AltRight: E0 | 0x38, ShiftLeft: 0x2a, ShiftRight: 0x36, MetaLeft: E0 | 0x5b, MetaRight: E0 | 0x5c,
     ArrowLeft: E0 | 0x4b, Numpad4: 0x4b, Home: E0 | 0x47, Numpad7: 0x47, Delete: E0 | 0x53, NumpadDecimal: 0x53, Insert: E0 | 0x52, Numpad0: 0x52,
     NumpadEnter: E0 | 0x1c, NumpadDivide: E0 | 0x35, Slash: 0x35, F4: 0x3e, F11: 0x57, F12: 0x58, F13: 0x64, F19: 0x6a, IntlBackslash: 0x56,
-    // Plain 0x45 is Pause; Chromium's public table and Chrome Remote Desktop inject Num Lock as E0 45.
-    NumLock: E0 | 0x45,
+    // Measured with SendInput on a Windows 11 runner: E0 45 reached the page as NumLock but did not
+    // toggle it; plain 0x45 toggled Num Lock (Windows maps it to VK_NUMLOCK). Pause has no entry.
+    NumLock: 0x45,
   });
-  expect(Object.values(SCREEN_WINDOWS_SCANCODES)).not.toContain(0x45);
+  expect(Object.values(SCREEN_WINDOWS_SCANCODES)).not.toContain(E0 | 0x45);
 });
 
 it("the same eight keys are modifiers on both targets", () => {
