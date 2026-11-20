@@ -22,15 +22,15 @@
 
 ; Checks whether app is running or not and prompts to kill it.
 !macro CheckIfAppIsRunning executablePath productName
-  !define UniqueID ${__LINE__}
+  !define UniqueID ${__COUNTER__}
 
+  app_check_retry_${UniqueID}:
   ; Replace {{product_name}} placeholder in the messages with the passed product name
   nsis_tauri_utils::StrReplace "$(appRunning)" "{{product_name}}" "${productName}"
   Pop $R1
   nsis_tauri_utils::StrReplace "$(appRunningOkKill)" "{{product_name}}" "${productName}"
   Pop $R2
-  nsis_tauri_utils::StrReplace "$(failedToKillApp)" "{{product_name}}" "${productName}"
-  Pop $R3
+
 
   !insertmacro RestartManager_StartSession $R0
   ${If} $R0 != ""
@@ -48,23 +48,19 @@
           ${If} $0 = 0
             Goto app_check_done_${UniqueID}
           ${Else}
-            IfSilent silent_${UniqueID} ui_${UniqueID}
-            silent_${UniqueID}:
+            IfSilent 0 ui_${UniqueID}
               System::Call 'kernel32::AttachConsole(i -1)i.r0'
               ${If} $0 != 0
                 System::Call 'kernel32::GetStdHandle(i -11)i.r0'
-                System::call 'kernel32::SetConsoleTextAttribute(i r0, i 0x0004)' ; set red color
-                FileWrite $0 "$R1$\n"
+                FileWrite $0 "$BirdOperation — $(birdAppStage) (TB-APP-CLOSE) $BirdBackupState$\n"
               ${EndIf}
-              !insertmacro RestartManager_EndSession $R0
-              Abort
             ui_${UniqueID}:
-              !insertmacro RestartManager_EndSession $R0
-              Abort $R3
+            !insertmacro RestartManager_EndSession $R0
+            !insertmacro BirdProblem "$(birdAppStage)" "$(birdAppCloseFailed)" "$(birdCloseApp)" "APP-CLOSE" app_check_retry_${UniqueID}
           ${EndIf}
         cancel_${UniqueID}:
           !insertmacro RestartManager_EndSession $R0
-          Abort $R1
+          Abort "$BirdOperation — $R1 $BirdBackupState"
         app_check_done_${UniqueID}:
       ${EndIf}
     ${EndIf}

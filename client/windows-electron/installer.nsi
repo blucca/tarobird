@@ -89,6 +89,8 @@ Var WixMode
 Var OldMainBinaryName
 
 Name "${DISPLAYNAME}"
+Caption "$(birdInstall)"
+UninstallCaption "$(birdUninstall)"
 BrandingText "${COPYRIGHT}"
 OutFile "${OUTFILE}"
 
@@ -390,7 +392,10 @@ Function PageLeaveReinstall
       ${EndIf}
 
       ; Other errors? show generic error message and return to select un/reinstall page
-      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)"
+      ${IfNot} ${Silent}
+      ${AndIf} $PassiveMode != 1
+        MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)" /SD IDOK
+      ${EndIf}
       Abort
     ${EndIf}
   reinst_done:
@@ -867,24 +872,8 @@ Section Uninstall
     Pop $R0
   ${EndIf}
 
-  ; Delete app data if the checkbox is selected
-  ; and if not updating
-  ${If} $DeleteAppDataCheckboxState = 1
-  ${AndIf} $UpdateMode <> 1
-    ; Clear the install location $INSTDIR from registry
-    DeleteRegKey SHCTX "${MANUPRODUCTKEY}"
-    DeleteRegKey /ifempty SHCTX "${MANUKEY}"
-
-    ; Clear the install language from registry
-    DeleteRegValue HKCU "${MANUPRODUCTKEY}" "Installer Language"
-    DeleteRegKey /ifempty HKCU "${MANUPRODUCTKEY}"
-    DeleteRegKey /ifempty HKCU "${MANUKEY}"
-
-    SetShellVarContext current
-    RmDir /r "$APPDATA\${BUNDLEID}"
-    RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
-  ${EndIf}
-
+  ; Only the confirmed pre-uninstall backup may move local data. There is
+  ; no recursive AppData deletion path, even if a future hook changes a flag.
   !ifmacrodef NSIS_HOOK_POSTUNINSTALL
     !insertmacro NSIS_HOOK_POSTUNINSTALL
   !endif

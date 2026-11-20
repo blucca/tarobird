@@ -134,6 +134,9 @@ test('makensis compiles the installer; the payload holds the App, helper and rec
   const result = await buildWindowsInstaller({ appDir, helper, version: '1.2.3', outFile, pluginsDir }, { makensis, workDir: path.join(root, 'nsis-work') });
   assert.equal(result.host, 'host');
   assert.equal((await readFile(outFile)).subarray(0, 2).toString(), 'MZ');
+  for (const forbidden of [/installer-diagnostics\.nsh/i, /installer-hooks\.nsh/i, /utils\.nsh/i, /English\.nsh/i, /SimpChinese\.nsh/i, /LangString/i, /function .* not referenced/i]) {
+    assert.doesNotMatch(result.log, forbidden, `makensis emitted unexpected warning matching ${forbidden}:\n${result.log}`);
+  }
   if (!sevenZip) return;
   const listing = execFileSync(sevenZip, ['l', '-ba', outFile]).toString();
   for (const entry of [MAIN_BINARY, HELPER_BINARY, 'resources\\app.asar', 'resources\\native\\tarobot-desktop-updater.exe', 'host\\node.exe', 'host\\dist\\src\\index.js', 'uninstall.exe']) {
@@ -204,4 +207,121 @@ test('after a Tauri upgrade the installer asks the helper, by fixed flag only, t
   assert.doesNotMatch(post.slice(call), /Abort|MessageBox/);
   // No other hook deletes inside the installation directory recursively.
   assert.doesNotMatch(hooks, /RMDir \/r|RmDir \/r/i);
+});
+
+test('backup exit codes have localized, path-free diagnostics in both NSIS programs', async () => {
+  const read = file => readFile(path.join(TEMPLATE_DIR, file), 'utf8');
+  const [rust, dialog, hooks, utils, en, zh] = await Promise.all([
+    readFile(path.join(client, 'src-tauri/src/fresh_install.rs'), 'utf8'),
+    ...['installer-diagnostics.nsh', 'installer-hooks.nsh', 'utils.nsh', 'English.nsh', 'SimpChinese.nsh'].map(read),
+  ]);
+  const reasons = rust.match(/pub enum Reason \{([^}]+)\}/)[1];
+  const exitCodes = [...reasons.matchAll(/= (\d+),/g)].map(match => Number(match[1]));
+  const handled = [...dialog.matchAll(/\$\{Case\} (\d+)/g)].map(match => Number(match[1]));
+  assert.deepEqual([...handled, 60], exitCodes, '60 is handled separately as incomplete finalization');
+  const required = new Set([...(dialog + hooks + utils).matchAll(/\$\((bird\w+)\)/g)].map(match => match[1]));
+  for (const language of [en, zh]) {
+    const strings = new Map([...language.matchAll(/^LangString (bird\w+) \S+ "(.+)"$/gm)].map(match => [match[1], match[2]]));
+    for (const key of required) {
+      assert.ok(strings.has(key), key);
+      assert.doesNotMatch(strings.get(key).replaceAll('$\\r$\\n', ''), /\$|[\\/]/, key);
+    }
+    assert.notEqual(strings.get('birdInstallBackup'), strings.get('birdUninstallBackup'));
+    assert.match(strings.get('birdCopy'), /Ctrl\+C/);
+  }
+  assert.doesNotMatch(dialog, /\$INSTDIR|\$APPDATA|\$PROFILE|\$TEMP|\$CMDLINE|ReadReg|FileRead|ExecWait/);
+});
+
+test('reset requires consent and safe backup states; later retries stay in their own stage', async () => {
+  const hooks = await readFile(path.join(TEMPLATE_DIR, 'installer-hooks.nsh'), 'utf8');
+  const macro = name => hooks.split('!macro ' + name)[1].split('!macroend')[0];
+  const inOrder = (source, ...fragments) => {
+    let start = 0;
+    for (const fragment of fragments) {
+      const index = source.indexOf(fragment, start);
+      assert.ok(index >= start, 'missing or out of order: ' + fragment);
+      start = index + fragment.length;
+    }
+  };
+  const install = macro('NSIS_HOOK_PREINSTALL');
+  const uninstall = macro('NSIS_HOOK_PREUNINSTALL');
+  const backup = macro('BirdBackup');
+  const stopHost = macro('TaroBotStopLocalHost');
+  const registerShortcut = macro('TaroBotRegisterNotificationShortcut');
+  inOrder(stopHost, 'bird_stop_retry_${_TB_STOP_ID}:', '!insertmacro CheckIfAppIsRunning "$INSTDIR\\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"',
+    'StrCpy $TaroBotHostStopper ""', '--stop-desktop-host');
+  inOrder(install, '${IfNot} ${Silent}', '$PassiveMode <> 1', '$UpdateMode <> 1',
+    '$TaroBotHadInstallation == ""', 'IDYES tarobot_fresh_install', 'tarobot_fresh_install:',
+    'StrCpy $BirdBackupState "$(birdNotStarted)"', '!insertmacro TaroBotStopLocalHost 1', '!insertmacro BirdBackup');
+  inOrder(uninstall, '!insertmacro TaroBotStopLocalHost 0', '${IfNot} ${Silent}', '$PassiveMode <> 1', '$UpdateMode <> 1',
+    '$DeleteAppDataCheckboxState = 1', 'IDYES tarobot_uninstall_fresh', 'Abort', 'tarobot_uninstall_fresh:', '!insertmacro BirdBackup', 'StrCpy $DeleteAppDataCheckboxState 0');
+  inOrder(backup, 'bird_backup_retry:', 'StrCpy $BirdBackupState "$(birdNotStarted)"', '!insertmacro CheckIfAppIsRunning', '--prepare-fresh-install-v2');
+  inOrder(backup, '$R0 = 0', 'StrCpy $BirdBackupState "$(birdCompleted)"', '$R0 = 10', 'StrCpy $BirdBackupState "$(birdNoData)"');
+  for (const code of ['B60', 'B-UNKNOWN', 'B$R0']) {
+    assert.ok(backup.includes('"$(birdPreserve)" "' + code + '" ""'), code + ' must stop without retry');
+  }
+  const template = await readFile(path.join(TEMPLATE_DIR, 'installer.nsi'), 'utf8');
+  assert.doesNotMatch(template, /RMDir\s+\/r\s+"\$(?:LOCAL)?APPDATA/i);
+  const notificationRetry = uninstall.split('bird_notice_retry:')[1];
+  inOrder(notificationRetry, 'ReadRegStr', 'CheckIfAppIsRunning', '--clear-notification-history', '"NOTICE-CLEAR" bird_notice_retry');
+  assert.doesNotMatch(notificationRetry, /BirdBackup|prepare-fresh-install|RmDir/);
+  assert.ok(registerShortcut.includes('!insertmacro BirdProblem') && registerShortcut.includes('"NOTICE-REGISTER"'), 'notification registration uses passive/silent-safe BirdProblem with retry');
+});
+
+test('running-app shutdown targets only this exe via Restart Manager, guides Task Manager recovery, and never blocks /S or /P', async () => {
+  const read = file => readFile(path.join(TEMPLATE_DIR, file), 'utf8');
+  const [nsi, hooks, diag, utils, en, zh] = await Promise.all(
+    ['installer.nsi', 'installer-hooks.nsh', 'installer-diagnostics.nsh', 'utils.nsh', 'English.nsh', 'SimpChinese.nsh'].map(read),
+  );
+
+  // Never kill processes by name anywhere in the installer templates.
+  for (const [name, src] of [['installer.nsi', nsi], ['installer-hooks.nsh', hooks], ['installer-diagnostics.nsh', diag], ['utils.nsh', utils]]) {
+    assert.doesNotMatch(src, /taskkill|Stop-Process|tskill/i, `${name} must not kill processes by name`);
+  }
+
+  // Community report (#50): a background App held data files open and could
+  // respawn the Host. Close this installation's App before stopping the Host,
+  // and before any backup move, on every path that stops the Host.
+  const stopMacro = hooks.slice(hooks.indexOf('!macro TaroBotStopLocalHost'), hooks.indexOf('!macroend', hooks.indexOf('!macro TaroBotStopLocalHost')));
+  assert.ok(stopMacro.includes('CheckIfAppIsRunning'), 'TaroBotStopLocalHost closes the App');
+  assert.ok(stopMacro.indexOf('CheckIfAppIsRunning') < stopMacro.indexOf('--stop-desktop-host'), 'the App closes before the Host stop request');
+  const backupMacro = hooks.slice(hooks.indexOf('!macro BirdBackup'), hooks.indexOf('!macroend', hooks.indexOf('!macro BirdBackup')));
+  assert.ok(backupMacro.indexOf('CheckIfAppIsRunning') >= 0 && backupMacro.indexOf('CheckIfAppIsRunning') < backupMacro.indexOf('--prepare-fresh-install'), 'the App closes before data moves');
+  const preUninstall = hooks.slice(hooks.indexOf('!macro NSIS_HOOK_PREUNINSTALL'));
+  assert.ok(preUninstall.indexOf('!insertmacro TaroBotStopLocalHost') >= 0 && preUninstall.indexOf('!insertmacro TaroBotStopLocalHost') < preUninstall.indexOf('!insertmacro BirdBackup'), 'uninstall stops the Host (after closing the App) before backing up');
+
+  // CheckIfAppIsRunning targets only executablePath via Restart Manager, skips prompts in /S and /P, uses monotonic labels, and retries on failure.
+  assert.match(utils, /!define UniqueID \$\{__COUNTER__\}/);
+  assert.match(utils, /!insertmacro RestartManager_RegisterFile \$R0 "\$\{executablePath\}"/);
+  assert.match(utils, /IfSilent kill_\$\{UniqueID\} 0\n\s+\$\{IfThen\} \$PassiveMode != 1 \$\{\|\} MessageBox MB_OKCANCEL \$R2 IDOK kill_\$\{UniqueID\} IDCANCEL cancel_\$\{UniqueID\} \$\{\|\}/);
+  assert.match(utils, /!insertmacro BirdProblem "\$\(birdAppStage\)" "\$\(birdAppCloseFailed\)" "\$\(birdCloseApp\)" "APP-CLOSE" app_check_retry_\$\{UniqueID\}/);
+
+  // App-close failure copy explains background execution and Task Manager recovery in both languages, with matching LangString key sets and safe length.
+  const parse = (src, lang) => new Map([...src.replace(/^\uFEFF/, '').matchAll(new RegExp(`^LangString (\\S+) \\$\\{${lang}\\} "([^"]*)"$`, 'gm'))].map(m => [m[1], m[2]]));
+  const enMap = parse(en, 'LANG_ENGLISH');
+  const zhMap = parse(zh, 'LANG_SIMPCHINESE');
+  assert.deepEqual([...enMap.keys()].sort(), [...zhMap.keys()].sort(), 'English.nsh and SimpChinese.nsh have identical LangString keys');
+  assert.match(enMap.get('birdAppCloseFailed'), /background/i);
+  assert.match(enMap.get('birdCloseApp'), /Task Manager/i);
+  assert.match(enMap.get('birdCloseApp'), /Retry/i);
+  assert.match(zhMap.get('birdAppCloseFailed'), /后台/);
+  assert.match(zhMap.get('birdCloseApp'), /任务管理器/);
+  assert.match(zhMap.get('birdCloseApp'), /重试/);
+
+  // Every BirdProblem and consent MessageBox carries /SD and is gated against Silent + Passive mode.
+  assert.match(diag, /MessageBox MB_ICONSTOP\|MB_OK "\$BirdMessage" \/SD IDOK/);
+  assert.match(diag, /MessageBox MB_ICONEXCLAMATION\|MB_RETRYCANCEL\|MB_DEFBUTTON2 "\$BirdMessage" \/SD IDCANCEL IDRETRY \$\{RETRY\}/);
+  assert.match(hooks, /MessageBox MB_ICONQUESTION\|MB_YESNOCANCEL\|MB_DEFBUTTON2 "\$\(birdInstallConsent\)" \/SD IDCANCEL/);
+  assert.match(hooks, /MessageBox MB_ICONQUESTION\|MB_YESNO\|MB_DEFBUTTON2 "\$\(birdUninstallConsent\)" \/SD IDNO/);
+  assert.match(nsi, /\$\{IfNot\} \$\{Silent\}\n\s+\$\{AndIf\} \$PassiveMode != 1\n\s+MessageBox MB_ICONEXCLAMATION "\$\(unableToUninstall\)" \/SD IDOK/);
+
+  // Worst-case assembled BirdMessage stays comfortably below NSIS_MAX_STRLEN (1024) in both languages.
+  for (const [label, map] of [['EN', enMap], ['ZH', zhMap]]) {
+    const maxLen = keys => Math.max(...keys.map(k => map.get(k).length));
+    const dialogKeys = [...map.keys()].filter(k => k.startsWith('bird') && !k.endsWith('Consent'));
+    const worst = maxLen(['birdInstall', 'birdUninstall']) + 3
+      + maxLen(['birdHostStage', 'birdAppStage', 'birdInstallBackup', 'birdUninstallBackup', 'birdNoticeStage', 'birdNoticeRegStage']) + 2
+      + maxLen(dialogKeys) * 3 + 12 + 'TaroBird 99.99.99 · TB-HOST-UNCONFIRMED · '.length + map.get('birdCopy').length;
+    assert.ok(worst < 900, `${label} worst-case BirdMessage length (${worst}) must stay below NSIS_MAX_STRLEN (1024)`);
+  }
 });

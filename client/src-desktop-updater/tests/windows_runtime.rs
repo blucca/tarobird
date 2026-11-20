@@ -24,6 +24,9 @@ fn staged_helper_without_a_runtime_stops_nothing_and_refuses_unknown_commands() 
     assert_eq!(Command::new(&helper).status().unwrap().code(), Some(2));
     // Fresh start validates its arguments before touching any directory.
     assert_eq!(Command::new(&helper).args(["--prepare-fresh-install", "C:\\elsewhere"]).status().unwrap().code(), Some(23));
+    for command in ["--prepare-fresh-install-v2", "--confirm-host-stopped-v2"] {
+        assert_eq!(Command::new(&helper).args([command, "unused"]).status().unwrap().code(), Some(48));
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 

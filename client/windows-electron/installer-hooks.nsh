@@ -24,28 +24,51 @@ Function TaroBotRememberInstallation
   ${EndIf}
 FunctionEnd
 
-!macro TaroBotFreshStart HELPER
-  Push $R0
+!include "installer-diagnostics.nsh"
+
+!macro BirdBackup HELPER PHASE PREFIX
+  bird_backup_retry:
+  StrCpy $BirdBackupState "$(birdNotStarted)"
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"
+  DetailPrint "$BirdOperation — ${PHASE}"
   ClearErrors
-  ExecWait '"${HELPER}" --prepare-fresh-install' $R0
+  SetDetailsPrint none
+  ExecWait '"${HELPER}" --prepare-fresh-install-v2' $R0
+  SetDetailsPrint lastused
   ${If} ${Errors}
-    MessageBox MB_ICONSTOP|MB_OK "无法准备全新安装，原数据未被删除。请关闭 TaroBird 后重试。$\r$\nUnable to prepare a fresh start. Close TaroBird and retry." /SD IDOK
-    Abort
+    !insertmacro BirdProblem "${PHASE}" "$(birdLaunch)" "$(birdRepair)" "BACKUP-LAUNCH" bird_backup_retry
   ${EndIf}
-  ${If} $R0 == 21
-    MessageBox MB_ICONSTOP|MB_OK "这台电脑安装了共享数据的 TaroBird CLI 服务，暂不能清空。请先运行 tarobot service uninstall，再重新安装。$\r$\nA CLI service owns this host. Uninstall that service before resetting." /SD IDOK
-    Abort
-  ${ElseIf} $R0 == 22
-    MessageBox MB_ICONSTOP|MB_OK "本机主机仍在运行，或无法确认它已退出。请退出 TaroBird、停止本机 CLI 后重试。原数据会保留。$\r$\nHost shutdown could not be confirmed. Stop TaroBird and its CLI, then retry." /SD IDOK
-    Abort
-  ${ElseIf} $R0 == 24
-    MessageBox MB_ICONSTOP|MB_OK "安装已停止：部分旧数据已备份，但恢复原位置失败。请保留 AppData 中的 TaroBot-backup 文件夹并联系支持，不要继续启动主机。$\r$\nReset rollback is incomplete. Preserve the TaroBot-backup folders and contact support." /SD IDOK
-    Abort
-  ${ElseIf} $R0 <> 0
-    MessageBox MB_ICONSTOP|MB_OK "无法完成全新安装，数据未被删除。请关闭 TaroBird 后重试；若仍失败，请联系支持。$\r$\nFresh start could not finish. Data has not been deleted. Close TaroBird and retry." /SD IDOK
-    Abort
+  ${If} $R0 = 0
+    StrCpy $BirdBackupState "$(birdCompleted)"
+  ${ElseIf} $R0 = 10
+    StrCpy $BirdBackupState "$(birdNoData)"
+  ${ElseIf} $R0 = 60
+    StrCpy $BirdBackupState "$(birdNotFinal)"
+    !insertmacro BirdProblem "${PHASE}" "$(birdFinalKey)" "$(birdPreserve)" "B60" ""
+  ${Else}
+    StrCpy $BirdCode $R0
+    ${If} $R0 >= 240
+    ${AndIf} $R0 <= 258
+      IntOp $BirdCode $R0 - 200
+      StrCpy $BirdBackupState "$(birdPartial)"
+    ${ElseIf} $R0 >= 140
+    ${AndIf} $R0 <= 158
+      IntOp $BirdCode $R0 - 100
+      StrCpy $BirdBackupState "$(birdRolledBack)"
+    ${Else}
+      StrCpy $BirdBackupState "$(birdNotStarted)"
+    ${EndIf}
+    Call ${PREFIX}BirdDescribeReason
+    ${If} $BirdNext == ""
+      StrCpy $BirdBackupState "$(birdUnknownState)"
+      !insertmacro BirdProblem "${PHASE}" "$(birdUnknown)" "$(birdPreserve)" "B-UNKNOWN" ""
+    ${ElseIf} $R0 >= 240
+      !insertmacro BirdProblem "${PHASE}" "$BirdReason" "$(birdPreserve)" "B$R0" ""
+    ${Else}
+      !insertmacro BirdProblem "${PHASE}" "$BirdReason" "$BirdNext" "B$R0" bird_backup_retry
+    ${EndIf}
   ${EndIf}
-  Pop $R0
+  DetailPrint "$BirdOperation — $BirdBackupState"
 !macroend
 
 !macro TaroBotStageRecovery
@@ -58,25 +81,34 @@ FunctionEnd
 ; Tauri CLI 2.12.1 invokes POSTINSTALL after its owned Start Menu shortcuts.
 ; Reuse those links, including upgrade locations; never create another shortcut.
 !macro TaroBotRegisterNotificationShortcut LINK
+  !define _TB_REG_ID ${__COUNTER__}
   !insertmacro IsShortcutTarget "${LINK}" "$INSTDIR\${MAINBINARYNAME}.exe"
   Pop $R0
   ${If} $R0 = 1
+    bird_reg_notice_retry_${_TB_REG_ID}:
+    DetailPrint "$BirdOperation — $(birdNoticeRegStage)"
     ClearErrors
+    SetDetailsPrint none
     ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --register-notification-shortcut "${LINK}"' $R0
+    SetDetailsPrint lastused
     ${If} ${Errors}
     ${OrIf} $R0 <> 0
-      DetailPrint "TaroBird notification shortcut registration failed."
-      MessageBox MB_ICONSTOP|MB_OK "TaroBird 通知注册失败，请保留开始菜单快捷方式后重试安装。$\r$\nNotification registration failed. Retry installation with a Start Menu shortcut." /SD IDOK
-      Abort
+      !insertmacro BirdProblem "$(birdNoticeRegStage)" "$(birdNoticeRegFailed)" "$(birdNoticeRegStep)" "NOTICE-REGISTER" bird_reg_notice_retry_${_TB_REG_ID}
     ${EndIf}
     StrCpy $R1 1
   ${EndIf}
+  !undef _TB_REG_ID
 !macroend
 
 !macro TaroBotStopLocalHost INSTALLER
-  ; The companion had no runtime. Never signal unrelated node.exe processes.
-  ; An Electron install answers through its helper; a Tauri install through
-  ; its own main executable, exactly as its hooks did.
+  !define _TB_STOP_ID ${__COUNTER__}
+  bird_stop_retry_${_TB_STOP_ID}:
+  ; Close this installation's running App via Restart Manager BEFORE stopping
+  ; the local Host or moving data, so a background tray/app process cannot hold
+  ; files open or respawn the Host. Never kill processes by name.
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"
+  ; Use only the stopper for this installation. Old Tauri installations use
+  ; their main executable. Companion installations have no runtime.
   StrCpy $TaroBotHostStopper ""
   ${If} ${FileExists} "$INSTDIR\${TAROBOTHELPER}"
     StrCpy $TaroBotHostStopper "$INSTDIR\${TAROBOTHELPER}"
@@ -85,34 +117,60 @@ FunctionEnd
     StrCpy $TaroBotHostStopper "$INSTDIR\${MAINBINARYNAME}.exe"
   ${EndIf}
   ${If} $TaroBotHostStopper != ""
-    Push $R0
+    DetailPrint "$BirdOperation — $(birdHostStage)"
     ClearErrors
+    SetDetailsPrint none
     ExecWait '"$TaroBotHostStopper" --stop-desktop-host' $R0
+    SetDetailsPrint lastused
     ${If} ${Errors}
-    ${OrIf} $R0 <> 0
-      !if "${INSTALLER}" == "1"
-        ; The installed binary may predate native recovery and have a broken
-        ; Node graph. Use the new helper only to VERIFY shutdown, never pretend
-        ; to stop through a staged executable with no adjacent host runtime.
-        !insertmacro TaroBotStageRecovery
-        ClearErrors
-        ExecWait '"$PLUGINSDIR\tarobot-recovery.exe" --confirm-host-stopped' $R0
-        ${If} ${Errors}
-          StrCpy $R0 1
+      StrCpy $R0 1
+    ${EndIf}
+    !if "${INSTALLER}" == "1"
+      ; Preserve the read-only fallback for old/broken stoppers, including
+      ; a launch failure or timeout. Never override explicit ownership refusals.
+      ${If} $R0 != 0
+        ${If} $R0 < 40
+        ${OrIf} $R0 > 58
+        ${OrIf} $R0 = 55
+        ${OrIf} $R0 = 56
+          Push $R1
+          StrCpy $R1 $R0
+          !insertmacro TaroBotStageRecovery
+          ClearErrors
+          SetDetailsPrint none
+          ExecWait '"$PLUGINSDIR\tarobot-recovery.exe" --confirm-host-stopped-v2' $R0
+          SetDetailsPrint lastused
+          ${If} ${Errors}
+            StrCpy $R0 $R1
+          ${EndIf}
+          Delete "$PLUGINSDIR\tarobot-recovery.exe"
+          Pop $R1
         ${EndIf}
-        Delete "$PLUGINSDIR\tarobot-recovery.exe"
+      ${EndIf}
+    !endif
+    ${If} $R0 != 0
+      StrCpy $BirdCode $R0
+      !if "${INSTALLER}" == "1"
+        Call BirdDescribeReason
+      !else
+        Call un.BirdDescribeReason
       !endif
+      ${If} $BirdCode = 40
+        StrCpy $BirdNext "$(birdCheckService)"
+      ${EndIf}
+      ${If} $BirdNext == ""
+        !insertmacro BirdProblem "$(birdHostStage)" "$(birdStop)" "$(birdCloseHost)" "HOST-UNCONFIRMED" bird_stop_retry_${_TB_STOP_ID}
+      ${Else}
+        !insertmacro BirdProblem "$(birdHostStage)" "$BirdReason" "$BirdNext" "H$BirdCode" bird_stop_retry_${_TB_STOP_ID}
+      ${EndIf}
     ${EndIf}
-    ${If} ${Errors}
-    ${OrIf} $R0 <> 0
-      MessageBox MB_ICONSTOP|MB_OK "无法停止本机主机，请退出 TaroBird 后重试。数据会保留。$\r$\nUnable to stop the local host. Please quit TaroBird and retry." /SD IDOK
-      Abort
-    ${EndIf}
-    Pop $R0
   ${EndIf}
+  !undef _TB_STOP_ID
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
+  StrCpy $BirdOperation "$(birdInstall)"
+  StrCpy $BirdBackupState "$(birdNotRequested)"
   StrCpy $TaroBotFreshPrepared 0
   ; Silent/passive installs and every upgrade keep state. Only an interactive
   ; reinstall with residual data offers a fresh start, and only after consent.
@@ -124,12 +182,13 @@ FunctionEnd
     ${OrIf} ${FileExists} "$LOCALAPPDATA\com.tarobot.client"
     ${OrIf} ${FileExists} "$APPDATA\com.tarocub.client"
     ${OrIf} ${FileExists} "$LOCALAPPDATA\com.tarocub.client"
-      MessageBox MB_ICONQUESTION|MB_YESNOCANCEL|MB_DEFBUTTON2 "发现上次安装留下的 TaroBird 数据。是否全新开始？$\r$\n$\r$\n是：备份这台电脑的旧配置、配对和本地数据，安装后像第一次使用一样重新配置。$\r$\n否：继续使用旧数据。$\r$\n取消：停止安装。$\r$\n$\r$\n不会修改 Mac mini 或其他主机。旧数据会保留在 AppData 的 TaroBot-backup 文件夹。$\r$\n$\r$\nPrevious data found. Start fresh?$\r$\nYes: back up local data and set up again. No: keep existing data." IDYES tarobot_fresh_install IDNO tarobot_keep_data
+      MessageBox MB_ICONQUESTION|MB_YESNOCANCEL|MB_DEFBUTTON2 "$(birdInstallConsent)" /SD IDCANCEL IDYES tarobot_fresh_install IDNO tarobot_keep_data
       Abort
       tarobot_fresh_install:
-      !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"
+      StrCpy $BirdBackupState "$(birdNotStarted)"
+      !insertmacro TaroBotStopLocalHost 1
       !insertmacro TaroBotStageRecovery
-      !insertmacro TaroBotFreshStart "$PLUGINSDIR\tarobot-recovery.exe"
+      !insertmacro BirdBackup "$PLUGINSDIR\tarobot-recovery.exe" "$(birdInstallBackup)" ""
       StrCpy $TaroBotFreshPrepared 1
       Delete "$PLUGINSDIR\tarobot-recovery.exe"
       tarobot_keep_data:
@@ -189,31 +248,43 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  !insertmacro TaroBotStopLocalHost 0
-  ${If} $UpdateMode <> 1
+  StrCpy $BirdOperation "$(birdUninstall)"
+  StrCpy $BirdBackupState "$(birdNotRequested)"
+  StrCpy $TaroBotClearSettings 0
+  ${IfNot} ${Silent}
+  ${AndIf} $PassiveMode <> 1
+  ${AndIf} $UpdateMode <> 1
   ${AndIf} $DeleteAppDataCheckboxState = 1
-    MessageBox MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2 "移除这台电脑的 TaroBird 配置并保留恢复备份？$\r$\n$\r$\n旧配置和本地数据会移入 AppData 的 TaroBot-backup 文件夹，重装后从首次配置开始。这不是安全擦除。不会更改其他主机。$\r$\n$\r$\nRemove local configuration and keep a recovery backup? This is not secure erasure." IDYES tarobot_uninstall_fresh
+    StrCpy $BirdBackupState "$(birdNotStarted)"
+  ${EndIf}
+  !insertmacro TaroBotStopLocalHost 0
+  ${IfNot} ${Silent}
+  ${AndIf} $PassiveMode <> 1
+  ${AndIf} $UpdateMode <> 1
+  ${AndIf} $DeleteAppDataCheckboxState = 1
+    MessageBox MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2 "$(birdUninstallConsent)" /SD IDNO IDYES tarobot_uninstall_fresh
     Abort
     tarobot_uninstall_fresh:
-    !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"
-    !insertmacro TaroBotFreshStart "$INSTDIR\${TAROBOTHELPER}"
-    ; The native helper has backed up the fixed Known Folders. Never let the
-    ; template recursively delete shared CLI data or an environment-derived path.
+    !insertmacro BirdBackup "$INSTDIR\${TAROBOTHELPER}" "$(birdUninstallBackup)" "un."
+    ; Clear installer settings only after the backup returned a known success.
     StrCpy $DeleteAppDataCheckboxState 0
     StrCpy $TaroBotClearSettings 1
   ${EndIf}
   ; Updates retain history. An old install must not clear a newer owner's notices.
   ${If} $UpdateMode <> 1
     Push $R0
+    bird_notice_retry:
     ReadRegStr $R0 SHCTX "Software\Classes\tarocub\shell\open\command" ""
     ${If} $R0 == '$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\"'
-      !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+      !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"
+      DetailPrint "$BirdOperation — $(birdNoticeStage)"
       ClearErrors
+      SetDetailsPrint none
       ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --clear-notification-history' $R0
+      SetDetailsPrint lastused
       ${If} ${Errors}
       ${OrIf} $R0 <> 0
-        MessageBox MB_ICONSTOP|MB_OK "无法清理 TaroBird 系统通知，请重试卸载。$\r$\nUnable to clear TaroBird notifications. Retry uninstalling." /SD IDOK
-        Abort
+        !insertmacro BirdProblem "$(birdNoticeStage)" "$(birdNotice)" "$(birdNoticeStep)" "NOTICE-CLEAR" bird_notice_retry
       ${EndIf}
     ${EndIf}
     Pop $R0

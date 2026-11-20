@@ -9,20 +9,86 @@ use std::{fs, io, path::{Path, PathBuf}};
 const APP_ID: &str = "com.tarobot.client";
 const LEGACY_APP_ID: &str = "com.tarocub.client";
 
-fn exists(path: &Path) -> Result<bool, &'static str> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err("fresh_install_state_unreadable"),
+// Numeric protocol for the Electron NSIS dialogs. Do not forward OS errors or paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Reason {
+    SharedService = 40,
+    HostRunning = 41,
+    OwnerUnknown = 42,
+    ProcessUnconfirmed = 43,
+    AccessDenied = 44,
+    StateUnreadable = 45,
+    Redirected = 46,
+    DirectoryUnavailable = 47,
+    InvalidRequest = 48,
+    BackupExists = 49,
+    CreateFailed = 50,
+    CreateDenied = 51,
+    MoveFailed = 52,
+    MoveDenied = 53,
+    HostConflict = 54,
+    StopFailed = 55,
+    StopTimedOut = 56,
+    UpdatePending = 57,
+    StorageUnconfirmed = 58,
+    FinalizeFailed = 60,
+}
+
+fn read_error(error: io::Error) -> Reason {
+    if error.kind() == io::ErrorKind::PermissionDenied { Reason::AccessDenied } else { Reason::StateUnreadable }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupFailure {
+    NotStarted(Reason),
+    RolledBack(Reason),
+    RollbackIncomplete(Reason),
+    FinalizationIncomplete,
+}
+
+impl From<Reason> for BackupFailure {
+    fn from(reason: Reason) -> Self { Self::NotStarted(reason) }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Backup { Completed, NoData }
+
+fn backup_exit(result: Result<Backup, BackupFailure>, detailed: bool) -> i32 {
+    use BackupFailure::*;
+    match result {
+        Ok(Backup::NoData) if detailed => 10,
+        Ok(_) => 0,
+        Err(failure) => match failure {
+            NotStarted(reason) if detailed => reason as i32,
+            RolledBack(reason) if detailed => 100 + reason as i32,
+            RollbackIncomplete(reason) if detailed => 200 + reason as i32,
+            FinalizationIncomplete if detailed => Reason::FinalizeFailed as i32,
+            // Older NSIS callers understand only 21–24 and use zero for all successes.
+            FinalizationIncomplete | RollbackIncomplete(_) => 24,
+            NotStarted(reason) | RolledBack(reason) => match reason {
+                Reason::SharedService | Reason::UpdatePending => 21,
+                Reason::OwnerUnknown | Reason::HostRunning | Reason::ProcessUnconfirmed => 22,
+                _ => 23,
+            },
+        },
     }
 }
 
-fn plain_directory(path: &Path) -> Result<(), &'static str> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| "fresh_install_state_unreadable")?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() { return Err("fresh_install_redirected_directory"); }
+fn exists(path: &Path) -> Result<bool, Reason> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(read_error(error)),
+    }
+}
+
+fn plain_directory(path: &Path) -> Result<(), Reason> {
+    let metadata = fs::symlink_metadata(path).map_err(read_error)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() { return Err(Reason::Redirected); }
     #[cfg(windows)] {
         use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 { return Err("fresh_install_redirected_directory"); }
+        if metadata.file_attributes() & 0x400 != 0 { return Err(Reason::Redirected); }
     }
     Ok(())
 }
@@ -30,25 +96,26 @@ fn plain_directory(path: &Path) -> Result<(), &'static str> {
 /// An installed CLI can restart itself even while its PID is absent. Refuse to
 /// reset that shared state until its service is uninstalled. Unknown/live PIDs
 /// and malformed ownership records also block; never terminate an arbitrary PID.
-fn host_stopped(root: &Path, alive: &impl Fn(u32, Option<u64>) -> Result<bool, &'static str>) -> Result<(), &'static str> {
+fn host_stopped(root: &Path, alive: &impl Fn(u32, Option<u64>) -> Result<bool, Reason>) -> Result<(), Reason> {
     let host = root.join("host");
     if !exists(&host)? { return Ok(()); }
     plain_directory(&host)?;
-    for name in ["host-service.json", "host-service-refresh.json", "update-in-progress.json"] {
-        if exists(&host.join(name))? { return Err("fresh_install_cli_service_present"); }
+    for name in ["host-service.json", "host-service-refresh.json"] {
+        if exists(&host.join(name))? { return Err(Reason::SharedService); }
     }
+    if exists(&host.join("update-in-progress.json"))? { return Err(Reason::UpdatePending); }
     let lock = host.join("instance.lock.json");
     if !exists(&lock)? { return Ok(()); }
-    let metadata = fs::symlink_metadata(&lock).map_err(|_| "fresh_install_state_unreadable")?;
+    let metadata = fs::symlink_metadata(&lock).map_err(read_error)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16_384 {
-        return Err("fresh_install_host_state_unknown");
+        return Err(Reason::OwnerUnknown);
     }
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(lock).map_err(|_| "fresh_install_state_unreadable")?)
-        .map_err(|_| "fresh_install_host_state_unknown")?;
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(lock).map_err(read_error)?)
+        .map_err(|_| Reason::OwnerUnknown)?;
     let pid = value.get("pid").and_then(|value| value.as_u64()).and_then(|pid| u32::try_from(pid).ok())
-        .filter(|pid| *pid > 0).ok_or("fresh_install_host_state_unknown")?;
+        .filter(|pid| *pid > 0).ok_or(Reason::OwnerUnknown)?;
     let birth = value.get("processBirth").and_then(|value| value.as_str()).and_then(|value| value.strip_prefix("win32:")).and_then(|value| value.parse::<u64>().ok());
-    if alive(pid, birth)? { return Err("fresh_install_host_running"); }
+    if alive(pid, birth)? { return Err(Reason::HostRunning); }
     Ok(())
 }
 
@@ -57,29 +124,34 @@ fn host_stopped(root: &Path, alive: &impl Fn(u32, Option<u64>) -> Result<bool, &
 /// newly created directory during rollback. No recursive deletion is used.
 fn reset_with(
     roots: &[PathBuf], suffix: &str,
-    alive: &impl Fn(u32, Option<u64>) -> Result<bool, &'static str>,
+    alive: &impl Fn(u32, Option<u64>) -> Result<bool, Reason>,
     rename: &impl Fn(&Path, &Path) -> io::Result<()>,
-) -> Result<(), &'static str> {
+) -> Result<Backup, BackupFailure> {
     if suffix.is_empty() || !suffix.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
-        return Err("fresh_install_invalid_backup_name");
+        return Err(Reason::InvalidRequest.into());
     }
     let mut plan = Vec::new();
     for root in roots {
-        if root.file_name().is_none_or(|name| name != APP_ID && name != LEGACY_APP_ID) { return Err("fresh_install_invalid_directory"); }
+        if root.file_name().is_none_or(|name| name != APP_ID && name != LEGACY_APP_ID) { return Err(Reason::InvalidRequest.into()); }
         if plan.iter().any(|(source, _, _): &(PathBuf, PathBuf, PathBuf)| source == root) { continue; }
         if !exists(root)? { continue; }
         plain_directory(root)?;
         host_stopped(root, alive)?;
-        let folder = root.parent().ok_or("fresh_install_invalid_directory")?.join(format!("TaroBot-backup-{suffix}"));
-        if exists(&folder)? { return Err("fresh_install_backup_exists"); }
-        plan.push((root.clone(), folder.join(root.file_name().ok_or("fresh_install_invalid_directory")?), folder));
+        let folder = root.parent().ok_or(Reason::InvalidRequest)?.join(format!("TaroBot-backup-{suffix}"));
+        if exists(&folder)? { return Err(Reason::BackupExists.into()); }
+        plan.push((root.clone(), folder.join(root.file_name().ok_or(Reason::InvalidRequest)?), folder));
     }
     let mut folders = Vec::new();
     for (_, _, folder) in &plan {
         if folders.contains(&folder) { continue; }
-        if fs::create_dir(folder).is_err() {
+        if let Err(error) = fs::create_dir(folder) {
             for previous in folders { let _ = fs::remove_dir(previous); }
-            return Err("fresh_install_backup_unavailable");
+            let reason = match error.kind() {
+                io::ErrorKind::PermissionDenied => Reason::CreateDenied,
+                io::ErrorKind::AlreadyExists => Reason::BackupExists,
+                _ => Reason::CreateFailed,
+            };
+            return Err(reason.into());
         }
         folders.push(folder);
     }
@@ -87,14 +159,25 @@ fn reset_with(
     for (source, destination, _) in &plan {
         // Recheck immediately before moving in case an App/CLI was started
         // while the installer was asking the user to close applications.
-        let failure = host_stopped(source, alive).err().or_else(|| rename(source, destination).err().map(|_| "fresh_install_move_failed"));
-        if let Some(error) = failure {
+        let result = host_stopped(source, alive).and_then(|()| {
+            rename(source, destination).map_err(|error| match error.kind() {
+                io::ErrorKind::PermissionDenied => Reason::MoveDenied,
+                _ => Reason::MoveFailed,
+            })
+        });
+        if let Err(reason) = result {
             let mut rolled_back = true;
             for (original, backup) in moved.iter().rev() {
                 if exists(original) != Ok(false) || rename(backup, original).is_err() { rolled_back = false; }
             }
             for folder in &folders { let _ = fs::remove_dir(folder); }
-            return Err(if rolled_back { error } else { "fresh_install_rollback_incomplete" });
+            return Err(if moved.is_empty() {
+                BackupFailure::NotStarted(reason)
+            } else if rolled_back {
+                BackupFailure::RolledBack(reason)
+            } else {
+                BackupFailure::RollbackIncomplete(reason)
+            });
         }
         moved.push((source, destination));
     }
@@ -105,20 +188,20 @@ fn reset_with(
         match fs::remove_file(backup.join("tarobot-client-installation-v1")) {
             Ok(()) => {},
             Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-            Err(_) => return Err("fresh_install_rollback_incomplete"),
+            Err(_) => return Err(BackupFailure::FinalizationIncomplete),
         }
     }
-    Ok(())
+    Ok(if plan.is_empty() { Backup::NoData } else { Backup::Completed })
 }
 
 #[cfg(windows)]
-fn process_alive(pid: u32, expected_birth: Option<u64>) -> Result<bool, &'static str> {
+fn process_alive(pid: u32, expected_birth: Option<u64>) -> Result<bool, Reason> {
     use windows::Win32::{Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME}, System::Threading::{OpenProcess, GetExitCodeProcess, GetProcessTimes, PROCESS_QUERY_LIMITED_INFORMATION}};
     unsafe {
         let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             Ok(handle) => handle,
             Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Ok(false),
-            Err(_) => return Err("fresh_install_process_unconfirmed"),
+            Err(_) => return Err(Reason::ProcessUnconfirmed),
         };
         let mut code = 0;
         let result = GetExitCodeProcess(handle, &mut code);
@@ -130,55 +213,64 @@ fn process_alive(pid: u32, expected_birth: Option<u64>) -> Result<bool, &'static
             }
         } else { Some(true) };
         let _ = CloseHandle(handle);
-        result.map_err(|_| "fresh_install_process_unconfirmed")?;
-        Ok(code == 259 && birth_matches.ok_or("fresh_install_process_unconfirmed")?) // STILL_ACTIVE
+        result.map_err(|_| Reason::ProcessUnconfirmed)?;
+        Ok(code == 259 && birth_matches.ok_or(Reason::ProcessUnconfirmed)?) // STILL_ACTIVE
     }
 }
 
 #[cfg(windows)]
-pub fn confirm_stopped() -> bool {
-    if storage_probe::package_family(std::process::id()) != Ok(None) { return false; }
-    dirs::data_dir().map(|base| {
-        [APP_ID, LEGACY_APP_ID].into_iter().all(|id| {
-            let root = base.join(id);
-            exists(&root) == Ok(false) || (plain_directory(&root).is_ok() && host_stopped(&root, &process_alive).is_ok())
-        })
-    }).unwrap_or(false)
+pub fn check_stopped() -> Result<(), Reason> {
+    if storage_probe::package_family(std::process::id()) != Ok(None) { return Err(Reason::StorageUnconfirmed); }
+    let base = dirs::data_dir().ok_or(Reason::DirectoryUnavailable)?;
+    for id in [APP_ID, LEGACY_APP_ID] {
+        let root = base.join(id);
+        if exists(&root)? {
+            plain_directory(&root)?;
+            host_stopped(&root, &process_alive)?;
+        }
+    }
+    Ok(())
 }
+
+#[cfg(windows)]
+pub fn confirm_stopped() -> bool { check_stopped().is_ok() }
 
 #[cfg(windows)]
 pub fn installer_command() -> Option<i32> {
     let args: Vec<_> = std::env::args_os().collect();
-    if args.get(1).is_some_and(|arg| arg == "--confirm-host-stopped") {
+    let command = args.get(1)?.to_str()?;
+    if command == "--confirm-host-stopped" {
         return Some(if args.len() == 2 && confirm_stopped() { 0 } else { 22 });
     }
-    if args.get(1).is_none_or(|arg| arg != "--prepare-fresh-install") { return None; }
-    Some((|| -> Result<(), &'static str> {
-        if args.len() != 2 { return Err("fresh_install_invalid_arguments"); }
-        if storage_probe::package_family(std::process::id()) != Ok(None) { return Err("fresh_install_redirected_directory"); }
+    if command == "--confirm-host-stopped-v2" {
+        return Some(if args.len() != 2 { Reason::InvalidRequest as i32 }
+            else { check_stopped().map_or_else(|reason| reason as i32, |()| 0) });
+    }
+    let detailed = match command {
+        "--prepare-fresh-install" => false,
+        "--prepare-fresh-install-v2" => true,
+        _ => return None,
+    };
+    let result = (|| {
+        if args.len() != 2 { return Err(Reason::InvalidRequest.into()); }
+        if storage_probe::package_family(std::process::id()) != Ok(None) { return Err(Reason::StorageUnconfirmed.into()); }
         // Identical Known Folder APIs to Tauri app_data_dir/app_local_data_dir;
         // never trust an installer-provided path or a redirected APPDATA env.
         let bases = [dirs::data_dir(), dirs::data_local_dir()].into_iter()
-            .map(|base| base.ok_or("fresh_install_directory_unavailable"))
+            .map(|base| base.ok_or(Reason::DirectoryUnavailable))
             .collect::<Result<Vec<_>, _>>()?;
         let roots = bases.iter().flat_map(|base| [base.join(APP_ID), base.join(LEGACY_APP_ID)]).collect::<Vec<_>>();
         reset_with(&roots, &uuid::Uuid::new_v4().to_string(), &process_alive, &|from, to| fs::rename(from, to))
-    })().map(|_| 0).unwrap_or_else(|code| {
-        eprintln!("{code}");
-        match code {
-            "fresh_install_cli_service_present" => 21,
-            "fresh_install_host_running" | "fresh_install_process_unconfirmed" | "fresh_install_host_state_unknown" => 22,
-            "fresh_install_rollback_incomplete" => 24,
-            _ => 23,
-        }
-    }))
+    })();
+    if let Err(failure) = &result { eprintln!("{failure:?}"); }
+    Some(backup_exit(result, detailed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn setup() -> (PathBuf, Vec<PathBuf>) {
-        let root = std::env::temp_dir().join(format!("tarobot-fresh-test-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("TaroBird 示例 {}", uuid::Uuid::new_v4()));
         let paths = vec![root.join("roaming").join(APP_ID), root.join("local").join(APP_ID)];
         for path in &paths { fs::create_dir_all(path).unwrap(); fs::write(path.join("identity"), b"preserve").unwrap(); }
         (root, paths)
@@ -213,11 +305,17 @@ mod tests {
     }
     #[test]
     fn cli_service_and_live_or_unknown_lock_block_before_any_move() {
-        for record in [Some("{}"), Some("{\"pid\":123}"), None] {
-            let (root, paths) = setup(); let host = paths[0].join("host"); fs::create_dir(&host).unwrap();
-            if let Some(value) = record { fs::write(host.join("instance.lock.json"), value).unwrap(); }
-            else { fs::write(host.join("host-service.json"), "{}").unwrap(); }
-            assert!(reset_with(&paths, "test", &|_, _| Ok(true), &rename).is_err());
+        for (name, record, reason) in [
+            ("instance.lock.json", "{}", Reason::OwnerUnknown),
+            ("instance.lock.json", r#"{"pid":123}"#, Reason::HostRunning),
+            ("host-service.json", "{}", Reason::SharedService),
+            ("update-in-progress.json", "{}", Reason::UpdatePending),
+        ] {
+            let (root, paths) = setup();
+            let host = paths[0].join("host");
+            fs::create_dir(&host).unwrap();
+            fs::write(host.join(name), record).unwrap();
+            assert_eq!(reset_with(&paths, "test", &|_, _| Ok(true), &rename), Err(BackupFailure::NotStarted(reason)));
             assert!(paths.iter().all(|p| p.join("identity").is_file()));
             fs::remove_dir_all(root).unwrap();
         }
@@ -228,7 +326,7 @@ mod tests {
         fs::write(host.join("instance.lock.json"), "{\"pid\":123}").unwrap();
         reset_with(&paths, "test", &|_, _| Ok(false), &rename).unwrap();
         fs::create_dir(&paths[0]).unwrap();
-        assert_eq!(reset_with(&paths, "test", &|_, _| Ok(false), &rename), Err("fresh_install_backup_exists"));
+        assert_eq!(reset_with(&paths, "test", &|_, _| Ok(false), &rename), Err(BackupFailure::NotStarted(Reason::BackupExists)));
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -238,11 +336,100 @@ mod tests {
         let result = reset_with(&paths, "test", &|_, _| Ok(false), &|from, to| {
             if from == paths[1] { Err(io::Error::from(io::ErrorKind::PermissionDenied)) } else { rename(from, to) }
         });
-        assert_eq!(result, Err("fresh_install_move_failed"));
+        assert_eq!(result, Err(BackupFailure::RolledBack(Reason::MoveDenied)));
+        assert_eq!(backup_exit(result, true), 153);
         assert!(paths.iter().all(|p| p.join("identity").is_file()));
         assert_eq!(fs::read(paths[0].join("tarobot-client-installation-v1")).unwrap(), [3; 32]);
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn denied_first_move_allows_a_fresh_retry_and_preserves_existing_backups() {
+        let (root, paths) = setup();
+        let old = paths[0].parent().unwrap().join("TaroBot-backup-earlier");
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join("keep"), b"earlier").unwrap();
+        let result = reset_with(&paths, "one", &|_, _| Ok(false), &|_, _| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(result, Err(BackupFailure::NotStarted(Reason::MoveDenied)));
+        assert_eq!(backup_exit(result, true), 53);
+        assert!(paths.iter().all(|path| path.join("identity").is_file()));
+        let retry = reset_with(&paths, "two", &|_, _| Ok(false), &rename);
+        assert_eq!(retry, Ok(Backup::Completed));
+        assert_eq!(backup_exit(retry, true), 0);
+        assert_eq!(fs::read(old.join("keep")).unwrap(), b"earlier");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_creation_race_keeps_the_existing_folder_and_moves_nothing() {
+        let (root, paths) = setup();
+        let existing = paths[0].parent().unwrap().join("TaroBot-backup-test");
+        let host = paths[1].join("host");
+        fs::create_dir(&host).unwrap();
+        fs::write(host.join("instance.lock.json"), r#"{"pid":123}"#).unwrap();
+        let result = reset_with(&paths, "test", &|_, _| {
+            // The first destination has passed preflight but is not reserved yet.
+            fs::create_dir(&existing).unwrap();
+            fs::write(existing.join("keep"), b"existing").unwrap();
+            Ok(false)
+        }, &rename);
+        assert_eq!(result, Err(BackupFailure::NotStarted(Reason::BackupExists)));
+        assert!(paths.iter().all(|path| path.join("identity").is_file()));
+        assert_eq!(fs::read(existing.join("keep")).unwrap(), b"existing");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn service_appearing_during_move_rechecks_preserves_the_reason_after_rollback() {
+        let (root, paths) = setup();
+        let result = reset_with(&paths, "test", &|_, _| Ok(false), &|from, to| {
+            rename(from, to)?;
+            if from == paths[0] {
+                let host = paths[1].join("host");
+                fs::create_dir(&host)?;
+                fs::write(host.join("host-service.json"), "{}")?;
+            }
+            Ok(())
+        });
+        assert_eq!(result, Err(BackupFailure::RolledBack(Reason::SharedService)));
+        assert_eq!(backup_exit(result, true), 140);
+        assert!(paths.iter().all(|path| path.join("identity").is_file()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finalization_failure_is_distinct_from_a_failed_rollback() {
+        let (root, paths) = setup();
+        fs::create_dir(paths[1].join("tarobot-client-installation-v1")).unwrap();
+        let result = reset_with(&paths, "test", &|_, _| Ok(false), &rename);
+        assert_eq!(result, Err(BackupFailure::FinalizationIncomplete));
+        assert_eq!(backup_exit(result, true), 60);
+        for path in &paths {
+            assert!(!path.exists());
+            assert!(path.parent().unwrap().join("TaroBot-backup-test").join(APP_ID).join("identity").is_file());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_and_detailed_exit_contracts_distinguish_no_data_and_safe_retries() {
+        use BackupFailure::*;
+        assert_eq!(backup_exit(Ok(Backup::NoData), false), 0);
+        assert_eq!(backup_exit(Ok(Backup::NoData), true), 10);
+        for (failure, legacy, detailed) in [
+            (NotStarted(Reason::InvalidRequest), 23, 48),
+            (NotStarted(Reason::OwnerUnknown), 22, 42),
+            (NotStarted(Reason::UpdatePending), 21, 57),
+            (RolledBack(Reason::MoveFailed), 23, 152),
+            (RollbackIncomplete(Reason::MoveDenied), 24, 253),
+            (FinalizationIncomplete, 24, 60),
+        ] {
+            assert_eq!(backup_exit(Err(failure), false), legacy);
+            assert_eq!(backup_exit(Err(failure), true), detailed);
+        }
+    }
+
     #[test]
     fn full_removal_backup_cannot_restore_client_authorization() {
         let (root, paths) = setup();
@@ -264,7 +451,8 @@ mod tests {
                 Err(io::Error::from(io::ErrorKind::PermissionDenied))
             } else { rename(from, to) }
         });
-        assert_eq!(result, Err("fresh_install_rollback_incomplete"));
+        assert_eq!(result, Err(BackupFailure::RollbackIncomplete(Reason::MoveDenied)));
+        assert_eq!(backup_exit(result, true), 253);
         assert!(paths[0].join("new").is_file());
         assert!(paths[0].parent().unwrap().join("TaroBot-backup-test").join(APP_ID).join("identity").is_file());
         fs::remove_dir_all(root).unwrap();
@@ -273,7 +461,7 @@ mod tests {
     fn second_root_is_checked_before_first_root_is_moved() {
         let (root, paths) = setup(); let host = paths[1].join("host"); fs::create_dir(&host).unwrap();
         fs::write(host.join("host-service-refresh.json"), "{}").unwrap();
-        assert_eq!(reset_with(&paths, "test", &|_, _| Ok(false), &rename), Err("fresh_install_cli_service_present"));
+        assert_eq!(reset_with(&paths, "test", &|_, _| Ok(false), &rename), Err(BackupFailure::NotStarted(Reason::SharedService)));
         assert!(paths.iter().all(|p| p.join("identity").is_file()));
         fs::remove_dir_all(root).unwrap();
     }
@@ -281,7 +469,7 @@ mod tests {
     fn unreadable_process_does_not_authorize_reset() {
         let (root, paths) = setup(); let host = paths[0].join("host"); fs::create_dir(&host).unwrap();
         fs::write(host.join("instance.lock.json"), "{\"pid\":123}").unwrap();
-        assert_eq!(reset_with(&paths, "test", &|_, _| Err("fresh_install_process_unconfirmed"), &rename), Err("fresh_install_process_unconfirmed"));
+        assert_eq!(reset_with(&paths, "test", &|_, _| Err(Reason::ProcessUnconfirmed), &rename), Err(BackupFailure::NotStarted(Reason::ProcessUnconfirmed)));
         assert!(paths.iter().all(|p| p.join("identity").is_file()));
         fs::remove_dir_all(root).unwrap();
     }
@@ -298,7 +486,7 @@ mod tests {
     fn empty_install_and_duplicate_known_folders_are_safe() {
         let (root, paths) = setup();
         reset_with(&[paths[0].clone(), paths[0].clone()], "test", &|_, _| Ok(false), &rename).unwrap();
-        reset_with(&[paths[0].clone()], "test", &|_, _| Ok(false), &rename).unwrap();
+        assert_eq!(reset_with(&[paths[0].clone()], "test", &|_, _| Ok(false), &rename), Ok(Backup::NoData));
         assert!(paths[1].join("identity").is_file());
         fs::remove_dir_all(root).unwrap();
     }
@@ -307,7 +495,7 @@ mod tests {
     fn a_link_to_another_directory_is_never_followed() {
         let (root, paths) = setup(); fs::remove_dir_all(&paths[0]).unwrap();
         std::os::unix::fs::symlink(&paths[1], &paths[0]).unwrap();
-        assert_eq!(reset_with(&paths, "test", &|_, _| Ok(false), &rename), Err("fresh_install_redirected_directory"));
+        assert_eq!(reset_with(&paths, "test", &|_, _| Ok(false), &rename), Err(BackupFailure::NotStarted(Reason::Redirected)));
         assert!(paths[1].join("identity").is_file());
         fs::remove_dir_all(root).unwrap();
     }

@@ -2,7 +2,7 @@
 //! installer hooks. The Tauri App answered these flags from its own exe; an
 //! Electron exe cannot run from the installer's plugin directory and must not
 //! start Chromium to stop a Host, so a standalone helper owns them:
-//!   --prepare-fresh-install / --confirm-host-stopped  (Tauri fresh_install.rs, unchanged)
+//!   --prepare-fresh-install[-v2] / --confirm-host-stopped (shared native backup and ownership checks)
 //!   --stop-desktop-host                               (Tauri desktop_host installer flow)
 //!   --remove-legacy-host-runtime                      (Tauri -> Electron: drop `<install>\host`)
 //! Notification shortcut registration stays with `tarocub-client.exe` itself:
@@ -97,24 +97,30 @@ fn remove_legacy_host(install: &std::path::Path, host_stopped: impl FnOnce() -> 
 #[cfg(windows)]
 fn stop_desktop_host() -> i32 {
     use std::time::{Duration, Instant};
-    (|| -> Result<i32, ()> {
-        let executable = std::env::current_exe().map_err(|_| ())?;
-        let Some(resources) = host_runtime(executable.parent().ok_or(())?) else { return Ok(0) };
-        let directory = native_identity::host_directory(&dirs::data_dir().ok_or(())?).map_err(|_| ())?;
+    use fresh_install::Reason;
+    (|| -> Result<(), Reason> {
+        let executable = std::env::current_exe().map_err(|_| Reason::StopFailed)?;
+        let Some(resources) = host_runtime(executable.parent().ok_or(Reason::StopFailed)?) else { return Ok(()) };
+        let directory = native_identity::host_directory(&dirs::data_dir().ok_or(Reason::DirectoryUnavailable)?)
+            .map_err(|reason| match reason.as_str() {
+                "host_directory_conflict" => Reason::HostConflict,
+                "host_directory_redirected" => Reason::Redirected,
+                _ => Reason::StateUnreadable,
+            })?;
         let mut child = node_runtime::command(&resources.join("node.exe"), &resources.join("dist/src/index.js"))
             .args(["hub", "service", "installer-stop", "--state-dir"]).arg(directory)
             .current_dir(&resources)
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .spawn().map_err(|_| ())?;
+            .spawn().map_err(|_| Reason::StopFailed)?;
         let deadline = Instant::now() + Duration::from_secs(25);
         loop {
-            if let Some(status) = child.try_wait().map_err(|_| ())? {
-                return Ok(if status.success() || fresh_install::confirm_stopped() { 0 } else { 1 });
+            if let Some(status) = child.try_wait().map_err(|_| Reason::StopFailed)? {
+                return if status.success() { Ok(()) } else { fresh_install::check_stopped() };
             }
-            if Instant::now() >= deadline { let _ = child.kill(); let _ = child.wait(); return Err(()); }
+            if Instant::now() >= deadline { let _ = child.kill(); let _ = child.wait(); return Err(Reason::StopTimedOut); }
             std::thread::sleep(Duration::from_millis(50));
         }
-    })().unwrap_or(1)
+    })().map_or_else(|reason| reason as i32, |()| 0)
 }
 
 fn main() {
