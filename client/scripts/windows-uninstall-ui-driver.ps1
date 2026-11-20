@@ -150,6 +150,11 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
       } elseif ($close -and (Enabled $close)) {
         Note 'finished' (Text $w)
         Press $close; $closed = $true; $acted[$key] = $true
+      } elseif ($text -match 'Aborted|not completed successfully') {
+        # NSIS's failed page disables Close and leaves only Cancel enabled
+        # (probe run 44838848838). The caller judges the outcome from state.
+        $cancel = Btn $w 'Cancel'
+        if ($cancel -and (Enabled $cancel)) { Note 'finished' "aborted: $text"; Press $cancel; $closed = $true; $acted[$key] = $true }
       }
     } catch { Note 'error' $_.Exception.Message }
   }
