@@ -32,6 +32,71 @@ release/update request. A completed audit, fix, commit or push is not that reque
 An instruction to wait for a new release request supersedes an earlier queued
 release/update: retain its artifacts and receipts, but do not publish or install.
 
+## Candidate and stable publication
+
+Effective 2026-11-20, use **owner trial → RC → stable** for all platforms.
+There is no mandatory Alpha/Beta/RC sequence or fixed waiting period. A general
+release request authorizes candidate preparation and RC publication; explicit
+approval after owner use is required to publish that identified candidate as
+stable. This supersedes older direct-stable Windows defaults. An explicitly
+deferred test stays recorded as deferred; it does not authorize stable promotion
+before owner acceptance.
+
+1. **Owner trial.** Freeze the scoped source with manifest status `rc`, build and
+   verify packages, then deliver them for owner use or retain a GitHub draft.
+   Do not activate a local installation without authorization. Record the tested
+   candidate, platform/build counters and artifact hashes. Use TestFlight for
+   iOS and a Google Play test track for the AAB; upload/processing is not a
+   production rollout or evidence of a successful device test.
+2. **Public RC, under the release request.** A preparation-only or owner-only
+   trial request does not authorize public downloads. Otherwise keep all platforms
+   on one canonical download page, with English RC notes and honest availability. Set
+   `prerelease: true` and `make_latest: false` on that page **and every platform
+   compatibility release**. Stable updater manifests must not be published
+   through a stable release for this candidate. Existing Mac/Windows/Android
+   GitHub readers filter draft/prerelease entries; verify the release metadata
+   and old stable download links. RCs in a public repository are public downloads,
+   not private tests. Leave the official homepage's main downloads on stable.
+3. **Stable promotion, after owner confirmation.** Record the owner's explicit
+   approval of the candidate and platforms. Prefer the same verified installer
+   bytes. Read back each exact numeric release ID, tag, frozen source commit,
+   complete asset inventory, signatures and downloaded hashes before changing
+   publication flags. If anything differs from the accepted candidate, stop and
+   investigate. Promote the platform entries and canonical page, then check
+   stable update discovery, downloads and actual platform availability again.
+   Only the canonical page becomes generic latest. Synchronize the homepage
+   and coordinate production store submission/rollout for platforms covered by
+   that approval; an upload or handoff does not itself authorize production.
+
+The desktop publication helpers and workflow `release_stage` default to `draft`.
+`--stage rc` publishes a prerelease; `--stage stable` publishes a stable release
+and may only be used after the above owner approval. Workflows still require
+their existing upload opt-in. These helpers create a **new** release and do not
+promote/overwrite an existing one. For an existing draft/RC, use the reviewed
+numeric-ID promotion procedure above; do not rerun creation or resolve a pending
+draft by tag alone. Android, the unified page and CLI publication must follow the
+same channel rules even when prepared using a separate release script.
+
+Keep candidate artifacts and the previous stable rollback copy during testing.
+The Mac publisher runs its existing guarded cleanup only for stable publication;
+manual promotion performs the same cleanup after successful stable read-back.
+If bytes change, advance applicable mobile counters, rerun affected checks and
+renew owner acceptance of the corrected candidate. Retain the actual package
+source binding when recording `status: stable` in a later bookkeeping commit.
+Do not alter dependencies, rename artifact identities or rebuild merely to drop
+the RC label. Apply the existing full/scoped validation rules to the actual diff;
+staging does not require an unrelated full audit, nor waive privacy/signatures.
+
+### Owner acceptance-policy source
+
+2026-11-20, current App conversation (recorded here for future attribution):
+
+> 现在项目以及这么多人star，肯定不能随便发版，我得自己用来才行，所以是不是后面发版就先pre-release，或者alpha或怎么样
+
+After discussing owner trial, RC publication and explicit stable promotion:
+
+> 好的，按照个先来
+
 ## Scoped patch releases
 
 Use this profile only when the owner explicitly authorizes a small patch release.
@@ -327,8 +392,8 @@ extraction. A held release keeps its `OWNER-HOLD.json` at the task root.
    inspect runtime dependencies before retiring any old copy. Check the running
    process, Dock/default application and loaded login job separately. See
    [installed-copy checks](client/artifact-branding-2026-11-05.md#installed-copy-and-login-item-check).
-8. Commit only source changes and sanitized evidence. Create an accurate GitHub Release only when explicitly releasing.
-9. After publication and asset read-back, run `python3 scripts/cleanup-macos-artifacts.py --apply --keep-version APP_VERSION --receipt CLEANUP.json` (the Mac publisher invokes it automatically). Keep the newest `macos-ready` backup, skip six-hour/active-task/build/owner-hold/activation guards, and use `/usr/bin/trash` only. Record skipped paths, then run the Spotlight query in the artifact guide. Never touch installed Apps under `/Applications` (TaroBird or legacy TaroBot).
+8. Commit only source changes and sanitized evidence. Create an accurate GitHub Release only when explicitly releasing, at the authorized draft/RC/stable stage described above.
+9. After **stable** publication and asset read-back, run `python3 scripts/cleanup-macos-artifacts.py --apply --keep-version APP_VERSION --receipt CLEANUP.json` (the Mac publisher invokes it automatically only for `--stage stable`). Keep candidate/rollback artifacts during trial. Keep the newest `macos-ready` backup, skip six-hour/active-task/build/owner-hold/activation guards, and use `/usr/bin/trash` only. Record skipped paths, then run the Spotlight query in the artifact guide. Never touch installed Apps under `/Applications` (TaroBird or legacy TaroBot).
 
 Native ID transition gate: the owner selected `com.tarobot.client` on every
 platform. Follow [the transition record](client/native-app-identity-2026-10-28.md).
@@ -383,7 +448,8 @@ Chinese READMEs link to the stable Releases page from the installation guide;
 do not restore a Downloads table or update the GitHub README solely for each
 version bump. Update README feature descriptions and product images when the
 product changes. The separate official website must be synchronized with every
-release, including actual per-platform availability and deployed download-link
+stable release; draft/RC work keeps its primary downloads on the current stable
+version. Include actual per-platform availability and deployed download-link
 verification; follow [official homepage and release updates](../AGENTS.md#official-homepage-and-release-updates).
 
 For iOS, follow [the iOS build and TestFlight guide](client/ios-build.md). Run the

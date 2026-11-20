@@ -3,9 +3,14 @@ on:
   workflow_dispatch:
     inputs:
       publish_update:
-        description: Publish the verified build to the private Mac update channel
+        description: Upload the verified build using the selected release stage
         type: boolean
         default: false
+      release_stage:
+        description: Keep draft by default; stable requires owner acceptance and explicit approval
+        type: choice
+        options: [draft, rc, stable]
+        default: draft
 permissions:
   contents: read
 env:
@@ -144,9 +149,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAROBOT_UPDATE_PUBLIC_KEY: ${{ vars.TAROBOT_UPDATE_PUBLIC_KEY }}
           APP_VERSION: ${{ needs.macos.outputs.version }}
+          RELEASE_STAGE: ${{ inputs.release_stage || 'draft' }}
         run: |
           files=(test-results/macos-extra/*)
           test "${#files[@]}" = 2
           args=()
           for file in "${files[@]}"; do args+=(--file "$file"); done
-          node client/scripts/publish-macos-update.mjs --installer test-results/macos-signed/TaroBird.app.tar.gz --repository "$GITHUB_REPOSITORY" --version "$APP_VERSION" --commit "$GITHUB_SHA" --output test-results/private-macos-update-bundle "${args[@]}"
+          node client/scripts/publish-macos-update.mjs --installer test-results/macos-signed/TaroBird.app.tar.gz --repository "$GITHUB_REPOSITORY" --version "$APP_VERSION" --commit "$GITHUB_SHA" --stage "$RELEASE_STAGE" --output test-results/private-macos-update-bundle "${args[@]}"

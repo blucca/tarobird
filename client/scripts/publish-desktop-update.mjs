@@ -19,9 +19,11 @@ async function digest(file) {
   return 'sha256:' + hash.digest('hex');
 }
 
-/** Publication is a separate explicit command. No existing release is overwritten. */
+/** Default to owner-review staging. Public RC/stable publication is explicit. */
 export async function publishDesktopUpdate(options, dependencies = {}) {
-  const { installer, publicKey, version, commit, outputDir, notes = '', platform = 'windows', extraArtifacts = [] } = options;
+  const { installer, publicKey, version, commit, outputDir, notes = '', platform = 'windows', extraArtifacts = [], stage = 'draft' } = options;
+  if (!['draft', 'rc', 'stable'].includes(stage)) throw new Error('Release stage must be draft, rc, or stable');
+  const prerelease = stage !== 'stable';
   const channel = desktopUpdatePlatform(platform);
   const repository = validateGithubRepository(options.repository);
   if (typeof commit !== 'string' || !/^[a-f0-9]{40}$/.test(commit)) throw new Error('A full verified source commit is required');
@@ -48,7 +50,7 @@ export async function publishDesktopUpdate(options, dependencies = {}) {
   let releaseId;
   const releaseInfo = async (draft = true) => {
     const release = await api(`repos/${repository}/releases/${releaseId}`);
-    if (release.id !== releaseId || release.tag_name !== tag || release.target_commitish !== commit || release.draft !== draft || release.prerelease !== false || !Array.isArray(release.assets)) throw new Error('Expected the desktop release for the built source commit and publication state');
+    if (release.id !== releaseId || release.tag_name !== tag || release.target_commitish !== commit || release.draft !== draft || release.prerelease !== prerelease || !Array.isArray(release.assets)) throw new Error('Expected the desktop release for the built source commit and publication state');
     return release;
   };
   const verifyExistingTag = async () => {
@@ -79,7 +81,7 @@ export async function publishDesktopUpdate(options, dependencies = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'tarobot-update-notes-'));
   try {
     const metadataFile = path.join(directory, 'release.json');
-    await writeFile(metadataFile, JSON.stringify({ tag_name: tag, target_commitish: commit, name: `TaroBird ${version} (${channel.name})`, body: notes, draft: true, prerelease: false, make_latest: 'false' }), { mode: 0o600 });
+    await writeFile(metadataFile, JSON.stringify({ tag_name: tag, target_commitish: commit, name: `TaroBird ${version}${prerelease ? ' RC' : ''} (${channel.name})`, body: notes, draft: true, prerelease, make_latest: 'false' }), { mode: 0o600 });
     const created = JSON.parse(await run(['api', `repos/${repository}/releases`, '--method', 'POST', '--input', metadataFile]));
     if (!Number.isSafeInteger(created.id) || created.id <= 0) throw new Error('Invalid draft release identity');
     releaseId = created.id;
@@ -103,14 +105,19 @@ export async function publishDesktopUpdate(options, dependencies = {}) {
     for (const file of files) await uploadedAsset(complete, file);
     await verifyExistingTag();
     if (!configuredRepository(await api(`repos/${repository}`))) throw new Error('Update repository changed or was archived before publication');
+    const result = { version, tag, repository, releaseId, stage, draft: stage === 'draft', prerelease,
+      releaseUrl: `https://github.com/${repository}/releases${stage === 'draft' ? '' : `/tag/${tag}`}` };
+    // A complete upload is not authorization to make a candidate public.
+    // Keep its numeric ID for reviewed promotion; pending draft tags are not unique.
+    if (stage === 'draft') return result;
     // Release creation/upload failures leave a draft. Only a complete verified
     // set becomes discoverable; other platform "latest" pointers are untouched.
     const publicationFile = path.join(directory, 'publish.json');
-    await writeFile(publicationFile, JSON.stringify({ draft: false, make_latest: 'false' }), { mode: 0o600 });
+    await writeFile(publicationFile, JSON.stringify({ draft: false, prerelease, make_latest: 'false' }), { mode: 0o600 });
     await run(['api', `repos/${repository}/releases/${releaseId}`, '--method', 'PATCH', '--input', publicationFile]);
     const published = await releaseInfo(false);
     for (const file of files) await uploadedAsset(published, file);
-    return { version, tag, repository, releaseUrl: `https://github.com/${repository}/releases/tag/${tag}` };
+    return result;
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

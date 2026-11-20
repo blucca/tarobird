@@ -27,13 +27,39 @@ downloads and verify a one-time upgrade path without changing App identities,
 signing keys, saved Host data or credentials. See
 [repository migration](docs/repository-migration.md).
 
+## Owner acceptance before stable publication
+
+From 2026-11-20, the default release path is **owner trial → RC → stable**.
+A general release request authorizes candidate preparation and RC publication,
+not stable publication; a preparation-only request remains preparation-only.
+First deliver verified packages for the owner's use or retain a GitHub draft.
+Install/activate on a device only when authorized. Public RC publication falls
+within that release request; use `prerelease: true` on both the canonical page
+and every platform compatibility release. RC downloads
+are public in a public repository and must not become the stable latest release
+or enter stable updater discovery. Keep iOS in TestFlight and Play in a test
+track until the owner's stable approval includes their production rollout.
+
+After the owner has used the candidate, obtain an explicit instruction to turn
+that identified build into a stable release. Prefer promoting the exact verified
+bytes; changed bytes need new checks, receipts and applicable build counters.
+Do not infer approval from passing tests, elapsed time or an older Windows
+direct-release exception. Scope validation to the change; this staging policy
+does not require an unrelated full audit for every patch, and does not waive
+privacy, signatures or affected-runtime checks. See the
+[candidate and promotion procedure](docs/release-checklist.md#candidate-and-stable-publication).
+
 ## Official homepage and release updates
 
 The official homepage is <https://cloveric.github.io/tarobird-site/>; its source
-repository is **cloveric/tarobird-site**. For every owner-authorized release,
+repository is **cloveric/tarobird-site**. For every owner-authorized stable release,
 update and deploy the homepage to reflect the published version, platform
 downloads, release link and affected feature descriptions or screenshots. Keep
 the existing page structure and keep its Chinese and English content aligned.
+
+During candidate testing, keep the homepage's primary version and download
+links on the current stable release. A separately requested preview link must
+be labelled as such; a draft or RC does not replace the stable homepage entry.
 
 Use each platform's actual availability: retain working downloads for platforms
 still pending, and do not describe an uploaded iOS build as available in

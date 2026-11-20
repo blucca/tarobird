@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { publishDesktopUpdate } from './publish-desktop-update.mjs';
 export async function publishMacosUpdate(options, dependencies = {}) {
   const published = await publishDesktopUpdate({ ...options, platform: 'macos' }, dependencies);
+  if (published.stage !== 'stable') return { ...published, cleanup: { status: 'retained', reason: 'Candidate and rollback artifacts are kept until stable acceptance.' } };
   const cleanup = await (dependencies.cleanupArtifacts ?? finalizeMacosArtifacts)(options);
   return { ...published, cleanup };
 }
@@ -14,6 +15,7 @@ async function main() {
   const { values } = parseArgs({ options: {
     installer: { type: 'string' }, repository: { type: 'string' }, version: { type: 'string' },
     commit: { type: 'string' }, output: { type: 'string' }, 'notes-file': { type: 'string' },
+    stage: { type: 'string', default: 'draft' },
     file: { type: 'string', multiple: true },
   } });
   for (const option of ['installer', 'repository', 'version', 'commit', 'output']) if (!values[option]) throw new Error(`--${option} is required`);

@@ -9,6 +9,7 @@ async function main() {
   const { values } = parseArgs({ options: {
     installer: { type: 'string' }, repository: { type: 'string' }, version: { type: 'string' },
     commit: { type: 'string' }, output: { type: 'string' }, 'notes-file': { type: 'string' },
+    stage: { type: 'string', default: 'draft' },
     file: { type: 'string', multiple: true },
   } });
   for (const option of ['installer', 'repository', 'version', 'commit', 'output']) if (!values[option]) throw new Error(`--${option} is required`);

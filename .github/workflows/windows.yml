@@ -12,9 +12,14 @@ on:
         type: boolean
         default: false
       publish_update:
-        description: Publish the verified signed build as a private Windows release
+        description: Upload the verified signed build using the selected release stage
         type: boolean
         default: false
+      release_stage:
+        description: Keep draft by default; stable requires owner acceptance and explicit approval
+        type: choice
+        options: [draft, rc, stable]
+        default: draft
 permissions:
   contents: read
 env:
@@ -210,13 +215,14 @@ jobs:
         with:
           name: TaroBird-windows-${{ inputs.arch }}-signed-update
           path: test-results/windows-signed
-      - name: Publish complete verified assets to the private repository
+      - name: Stage or publish complete verified assets
         env:
           GH_TOKEN: ${{ github.token }}
           TAROBOT_UPDATE_PUBLIC_KEY: ${{ vars.TAROBOT_UPDATE_PUBLIC_KEY }}
           APP_VERSION: ${{ needs.windows.outputs.version }}
+          RELEASE_STAGE: ${{ inputs.release_stage || 'draft' }}
         shell: bash
         run: |
           mapfile -t installers < <(find test-results/windows-signed -maxdepth 1 -type f -name '*-setup.exe')
           if [[ ${#installers[@]} -ne 1 ]]; then echo 'Expected one verified installer'; exit 1; fi
-          node client/scripts/publish-windows-update.mjs --installer "${installers[0]}" --repository "$GITHUB_REPOSITORY" --version "$APP_VERSION" --commit "$GITHUB_SHA" --output test-results/private-windows-update-bundle
+          node client/scripts/publish-windows-update.mjs --installer "${installers[0]}" --repository "$GITHUB_REPOSITORY" --version "$APP_VERSION" --commit "$GITHUB_SHA" --stage "$RELEASE_STAGE" --output test-results/private-windows-update-bundle

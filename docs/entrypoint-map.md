@@ -767,6 +767,12 @@ and the existing network/run/delete suites listed in that audit.
   updater builds; manifest/publication helpers bind signatures and private assets
   to one numeric draft-release ID. Tests: updater browser/controller,
   `windows-update-*`, native GitHub policy and lifecycle audits.
+  `publish-desktop-update.mjs` and the Mac/Windows wrapper/workflow entrypoints
+  default to retaining a verified draft. Explicit `rc` keeps the prerelease flag;
+  `stable` requires owner acceptance. Candidate publication retains local Mac
+  artifacts. Existing-release promotion is a reviewed numeric-ID operation in
+  the [release checklist](release-checklist.md#candidate-and-stable-publication),
+  not another create call. Regression: `windows-update-publish`.
   [Mac in-app updates](client/macos-github-updates.md) shares the private GitHub
   provider, with separate Mac release assets, native bundle recovery and a
   guarded `desktop-update` child that pauses/resumes only the App-owned Hub.

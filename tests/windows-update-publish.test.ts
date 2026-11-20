@@ -11,14 +11,15 @@ import { publishMacosUpdate } from '../client/scripts/publish-macos-update.mjs';
 const temporary: string[] = [];
 afterEach(async () => { for (const directory of temporary.splice(0)) await rm(directory, { recursive: true, force: true }); });
 type RepositoryState = { full_name?: unknown; private?: boolean; archived?: unknown };
-async function fixture(platform: string, change: { publicRepo?: boolean; repository?: RepositoryState; laterRepository?: RepositoryState; badDigest?: boolean; wrongTagCommit?: boolean; failCreate?: boolean; wrongAssetRepo?: boolean; publicationLost?: boolean; extraArtifact?: boolean } = {}) {
+async function fixture(platform: string, change: { publicRepo?: boolean; repository?: RepositoryState; laterRepository?: RepositoryState; badDigest?: boolean; wrongTagCommit?: boolean; failCreate?: boolean; wrongAssetRepo?: boolean; publicationLost?: boolean; extraArtifact?: boolean; wrongPrerelease?: boolean } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'tarobot-update-publish-')); temporary.push(directory);
   const installer = path.join(directory, platform === 'macos' ? 'TaroBot.app.tar.gz' : 'TaroBot_1.2.3_x64-setup.exe');
   await writeFile(installer, 'MZ disposable signed-payload fixture'); await writeFile(installer + '.sig', 'signature fixture');
   const extraArtifacts = change.extraArtifact ? [path.join(directory, 'tarobot-0.1.1.tgz')] : [];
   for (const file of extraArtifacts) await writeFile(file, 'matching CLI fixture');
   const calls: string[][] = [], commit = 'a'.repeat(40), repository = 'example/private-repo', version = '1.2.3', tag = `${platform}-tarobot-v1.2.3`;
-  let published = false, repositoryReads = 0;
+  let published = false, prerelease = false, repositoryReads = 0;
+  const payloads: Record<string, unknown>[] = [];
   let bundle: Record<string, string> | undefined;
   // The first read is the pre-write check; later reads are the final re-check.
   const repositoryState = () => ({ full_name: repository, private: !change.publicRepo, archived: false, ...change.repository, ...(repositoryReads++ > 0 ? change.laterRepository : {}) });
@@ -45,21 +46,27 @@ async function fixture(platform: string, change: { publicRepo?: boolean; reposit
       if (args[0] === 'api' && args[1] === `repos/${repository}/releases` && args.includes('POST')) {
         if (change.failCreate) throw new Error('existing release');
         const input = JSON.parse(await readFile(args[args.indexOf('--input') + 1]!, 'utf8'));
-        expect(input).toMatchObject({ tag_name: tag, target_commitish: commit, name: `TaroBird ${version} (${platform === 'macos' ? 'macOS' : 'Windows'})`, draft: true, make_latest: 'false' });
+        payloads.push(input);
+        prerelease = input.prerelease;
+        expect(input).toMatchObject({ tag_name: tag, target_commitish: commit, draft: true, make_latest: 'false' });
         return JSON.stringify({ id: 501 });
       }
       if (args[0] === 'api' && args[1] === `repos/${repository}/releases/501`) {
-        if (args.includes('PATCH') && !change.publicationLost) published = true;
+        if (args.includes('PATCH')) {
+          const input = JSON.parse(await readFile(args[args.indexOf('--input') + 1]!, 'utf8'));
+          payloads.push(input);
+          if (!change.publicationLost) { published = !input.draft; prerelease = input.prerelease ?? prerelease; }
+        }
         const assets = [await asset(installer, 101), await asset(installer + '.sig', 102)];
         if (bundle) assets.push(await asset(bundle.manifestFile!, 103), await asset(bundle.checksumFile!, 104));
         for (const file of extraArtifacts) assets.push(await asset(file, 105));
-        return JSON.stringify({ id: 501, tag_name: tag, target_commitish: commit, draft: !published, prerelease: false, assets });
+        return JSON.stringify({ id: 501, tag_name: tag, target_commitish: commit, draft: !published, prerelease: change.wrongPrerelease ? !prerelease : prerelease, assets });
       }
       if (args[0] === 'release' && args[1] === 'create' && change.failCreate) throw new Error('existing release');
       return '';
     },
   };
-  return { options: { installer, version, repository, commit, platform, extraArtifacts, outputDir: path.join(directory, 'bundle'), publicKey: 'public fixture key', notes: 'Desktop release notes' }, dependencies, calls, directory };
+  return { options: { installer, version, repository, commit, platform, stage: 'stable', extraArtifacts, outputDir: path.join(directory, 'bundle'), publicKey: 'public fixture key', notes: 'Desktop release notes' }, dependencies, calls, payloads, directory };
 }
 
 const visibilities = [{ visibility: 'public', publicRepo: true }, { visibility: 'private', publicRepo: false }];
@@ -71,6 +78,47 @@ const unusableRepositories: { problem: string; state: RepositoryState }[] = [
 const repositoryCases = visibilities.flatMap(visibility => unusableRepositories.map(repository => ({ ...visibility, ...repository })));
 
 describe.each(['windows', 'macos'])('%s update publication', platform => {
+  it('defaults to a verified prerelease draft without making it public', async () => {
+    const value = await fixture(platform);
+    const result = await publishDesktopUpdate({ ...value.options, stage: undefined }, value.dependencies);
+    expect(value.payloads[0]).toMatchObject({ draft: true, prerelease: true, make_latest: 'false' });
+    expect(value.calls.some(args => args.includes('PATCH'))).toBe(false);
+    expect(result).toMatchObject({ releaseId: 501, stage: 'draft', draft: true, prerelease: true });
+    expect(result.releaseUrl).toBe(`https://github.com/${value.options.repository}/releases`);
+    expect(value.calls.filter(args => args.includes('POST'))).toHaveLength(5);
+  });
+
+  it('publishes an explicit RC with prerelease retained on creation and publication', async () => {
+    const value = await fixture(platform);
+    const result = await publishDesktopUpdate({ ...value.options, stage: 'rc' }, value.dependencies);
+    expect(value.payloads).toHaveLength(2);
+    expect(value.payloads[0]).toMatchObject({ draft: true, prerelease: true, name: `TaroBird 1.2.3 RC (${platform === 'macos' ? 'macOS' : 'Windows'})` });
+    expect(value.payloads[1]).toEqual({ draft: false, prerelease: true, make_latest: 'false' });
+    expect(result).toMatchObject({ stage: 'rc', draft: false, prerelease: true });
+  });
+
+  it('publishes stable only when explicitly selected', async () => {
+    const value = await fixture(platform);
+    const result = await publishDesktopUpdate(value.options, value.dependencies);
+    expect(value.payloads[0]).toMatchObject({ prerelease: false, name: `TaroBird 1.2.3 (${platform === 'macos' ? 'macOS' : 'Windows'})` });
+    expect(value.payloads[1]).toEqual({ draft: false, prerelease: false, make_latest: 'false' });
+    expect(result).toMatchObject({ stage: 'stable', draft: false, prerelease: false });
+  });
+
+  it.each(['preview', '', null, false])('rejects an invalid stage before verification or network access: %s', async stage => {
+    const value = await fixture(platform);
+    let verified = false;
+    await expect(publishDesktopUpdate({ ...value.options, stage }, { ...value.dependencies, verifyArtifact: async () => { verified = true; } })).rejects.toThrow('stage');
+    expect(verified).toBe(false);
+    expect(value.calls).toEqual([]);
+  });
+
+  it.each(['draft', 'rc', 'stable'])('refuses a release whose prerelease flag differs from stage %s', async stage => {
+    const value = await fixture(platform, { wrongPrerelease: true });
+    await expect(publishDesktopUpdate({ ...value.options, stage }, value.dependencies)).rejects.toThrow('publication state');
+    expect(value.calls.some(args => args.includes('PATCH'))).toBe(false);
+  });
+
   it('stages and verifies all private assets before publishing without changing the generic latest release', async () => {
     const value = await fixture(platform);
     await publishDesktopUpdate(value.options, value.dependencies);
@@ -163,4 +211,12 @@ it('Mac publication cleans artifacts only after successful final asset read-back
   const failed = await fixture('macos', { publicationLost: true });
   await expect(publishMacosUpdate(failed.options, { ...failed.dependencies, cleanupArtifacts: () => { cleaned++; } })).rejects.toThrow();
   expect(cleaned).toBe(1);
+});
+
+it.each(['draft', 'rc'])('Mac %s keeps candidate and rollback artifacts for owner acceptance', async stage => {
+  const value = await fixture('macos');
+  let cleaned = false;
+  const result = await publishMacosUpdate({ ...value.options, stage }, { ...value.dependencies, cleanupArtifacts: () => { cleaned = true; } });
+  expect(cleaned).toBe(false);
+  expect(result.cleanup.status).toBe('retained');
 });

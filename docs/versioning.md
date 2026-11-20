@@ -99,8 +99,31 @@ releases. This is a migration plan, not implemented or packaged behavior.
 On 2026-11-12 the owner authorized removing Release pages/assets older than
 1.3.1 while preserving the 1.3.1 compatibility channels and source tags.
 
-The owner has accepted the running Windows version and requested formal releases
-from 1.2.0 onward. Publish Windows with `prerelease: false`, like macOS and Android.
+## Candidate first, stable after owner acceptance
+
+From 2026-11-20, all platforms follow owner trial, then an authorized public RC,
+then explicit owner approval for stable publication. This replaces the previous
+Windows default of direct formal publication. A routine release request covers
+preparing and publishing an RC; it is not approval to promote it to stable. See the
+[release procedure](release-checklist.md#candidate-and-stable-publication).
+
+Keep the numeric product version, such as `1.5.2`, inside native packages and
+updater manifests. Use `status: rc` before freezing the candidate, the GitHub
+prerelease flag and English titles/notes such as `TaroBird 1.5.2 RC1` to describe
+its maturity. A title suffix alone does not keep a build out of stable updates.
+The unified page and every platform compatibility release must remain draft or
+prerelease until the owner approves promotion. Retain the prior stable downloads.
+
+Record the candidate number, exact source and artifact digests, platform build
+counters and owner acceptance. Unchanged accepted packages can be promoted
+without rebuilding; changing the source manifest to `stable` afterward is a
+publication bookkeeping commit, not a claim that the binaries were built from
+that newer commit. Preserve the actual frozen source binding. A corrected
+candidate needs fresh validation and applicable counters under the existing
+same-version replacement rules. Candidate testers may need to install such a
+same-product-version correction manually; stable updaters ignore prereleases
+and do not promise equal-version updates.
+
 Do not turn a missing test into a passing receipt: record new-installer, upgrade,
 custom-path, uninstall and automatic-update validation separately. Historical
 manual previews keep their existing tags and prerelease flags. Existing old tags remain as

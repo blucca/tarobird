@@ -81,7 +81,15 @@ profile; ad-hoc signing is confined to explicit development builds. Signing and
 notarization do not replace an OS permission grant or Keychain authorization.
 
 `.github/workflows/macos-updates.yml` builds and verifies the Mac package.
-Publication is opt-in and verifies signature, signed version, source commit,
+Upload is opt-in and defaults to a retained prerelease draft. The workflow's
+`release_stage` and helper's `--stage` accept `draft` (default), `rc` or `stable`;
+stable requires explicit owner approval after candidate use. RC publication
+retains `prerelease: true`, so stable updaters do not offer it. Candidate artifacts
+and rollback copies are retained; guarded cleanup runs only for stable. Promote
+existing drafts/RCs by reviewed numeric ID without re-uploading accepted bytes,
+following the [release procedure](../release-checklist.md#candidate-and-stable-publication).
+The helper creates new releases, not promotions. It verifies signature, signed
+version, source commit,
 configured non-archived repository (public or private; rechecked immediately
 before publication), numeric release/asset IDs, SHA-256 and complete asset set
 before making the draft visible. It reads the published assets back and leaves

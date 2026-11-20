@@ -65,6 +65,15 @@ The Windows installer workflow has two explicit switches, both off by default:
   after the build passes. Configure environment protection/review rules before
   production use. Publication also requires `signed_updates=true`.
 
+The job's `release_stage` defaults to `draft`: it uploads and verifies the full
+asset set but keeps it unpublished, with `prerelease: true`. Choose `rc` only for
+an authorized public preview; choose `stable` only after explicit owner approval
+of the tested candidate. Local helpers accept the matching `--stage` option.
+The helper creates new releases, not promotions; use the reviewed numeric-ID
+[promotion procedure](../release-checklist.md#candidate-and-stable-publication)
+for an existing draft/RC, preserving the accepted assets. Stable updaters keep
+ignoring drafts and prereleases.
+
 Local build command after configuring the environment:
 
 ```powershell
