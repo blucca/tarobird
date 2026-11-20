@@ -408,6 +408,12 @@ pub enum HookVerdict { Own, Foreign }
 /// process's tag. Everything else counts as someone else, including input
 /// injected by another program.
 pub fn hook_verdict(injected: bool, extra: usize, tag: usize) -> HookVerdict { if injected && extra == tag { HookVerdict::Own } else { HookVerdict::Foreign } }
+/// The value stamped into every posted event's `dwExtraInfo`. 64-bit Windows
+/// keeps all of it for keyboard input, but hands low-level mouse hooks only the
+/// low 32 bits of a mouse event's value (measured on a Windows 11 runner: a
+/// 64-bit tag made every own pointer event look like someone else's). A nonzero
+/// 32-bit tag reads back the same on both paths.
+pub fn input_tag(random: u128) -> usize { ((random as u32) | 1) as usize }
 
 /// Starts a new generation without blocking; readiness or failure arrives
 /// through `monitor_poll_at`. Any previous generation is cancelled.
@@ -470,7 +476,7 @@ mod os {
     /// copy of the App is "someone else" too.
     pub fn tag() -> usize {
         static TAG: OnceLock<usize> = OnceLock::new();
-        *TAG.get_or_init(|| (uuid::Uuid::new_v4().as_u128() as usize) | 1)
+        *TAG.get_or_init(|| input_tag(uuid::Uuid::new_v4().as_u128()))
     }
     fn now_ms() -> u64 {
         static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -930,6 +936,19 @@ mod tests {
         // A record that is not a key this backend can press is refused whole.
         assert!(candidate_releases(&[0x1e, 0x00], &[], &|_| true, &|_| true).is_err() && candidate_releases(&[0x2ff], &[], &|_| true, &|_| true).is_err());
         assert!(candidate_releases(&[0x1e; 257], &[], &|_| true, &|_| true).is_err());
+    }
+    #[test]
+    fn own_mouse_events_are_recognised_after_the_mouse_hook_truncates_their_tag() {
+        // What a low-level mouse hook receives on 64-bit Windows: the low 32 bits of dwExtraInfo.
+        let mouse_hook = |extra: usize| (extra as u64 & 0xffff_ffff) as usize;
+        for random in [0u128, 1, u128::MAX, 0xaca1_b569_619b_9fd1, (0x1122_3344_5566_7788u128 << 64) | 0xdead_beef] {
+            let tag = input_tag(random);
+            assert!(tag != 0 && tag as u64 <= u32::MAX as u64, "nonzero and within 32 bits");
+            assert_eq!(hook_verdict(true, mouse_hook(tag), tag), HookVerdict::Own, "own pointer event");
+            assert_eq!(hook_verdict(true, tag, tag), HookVerdict::Own, "own key event keeps all bits");
+            assert_eq!(hook_verdict(false, tag, tag), HookVerdict::Foreign, "a physical event is never own");
+            assert_eq!(hook_verdict(true, tag ^ 2, tag), HookVerdict::Foreign, "another injector's value is foreign");
+        }
     }
     #[test]
     fn recovery_waits_while_an_elevated_or_unknown_foreground_hides_key_state() {
