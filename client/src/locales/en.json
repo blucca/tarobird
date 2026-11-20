@@ -5272,5 +5272,8 @@
   "跨主机显示顺序仅保存在本设备；分组内容和置顶仍归属各自所属主机。": "Cross-host display order is saved only on this device. Folder contents and pins stay on their owning hosts.",
   "所属主机": "Host",
   "{0}（不可用）": "{0} (Unavailable)",
-  "跨主机排序与管理": "Sort and manage across hosts"
+  "跨主机排序与管理": "Sort and manage across hosts",
+  "暂不支持": "Not supported",
+  "这台 Windows 电脑暂时不能被远程查看或控制，后续版本会支持。从这台电脑查看 Mac 不受影响。": "This Windows PC can't be viewed or controlled remotely yet. Viewing a Mac from here still works.",
+  "屏幕服务尚未注册。请在目标电脑上打开 TaroBird 并检查；目前只有 Mac 可以被远程查看。": "Screen service isn't registered. Open TaroBird on that computer. Only Macs can be viewed for now."
 }

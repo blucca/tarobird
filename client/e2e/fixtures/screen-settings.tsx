@@ -34,6 +34,10 @@ const state = { native:[] as {command:string;args:any}[], reads:[] as string[], 
   status:{supported:true,enabled:true,canManage:true,permission:"none",policy:{revision:7,enabled:true,grants:[] as any[]},devices:[{id:"gui-device",name:"GUI device",platform:"macos",publicKey:"device-key"}],desktop:null as typeof desktop|null,sessions:[],serverTime:Date.now()} };
 if(params.has("ready")){state.status.permission="view";state.status.desktop=desktop;state.local.registered=true;state.local.phase="registered";state.local.error="";}
 if(params.has("configured")){state.status.desktop=desktop;state.local.registered=true;state.local.phase="registered";state.local.error="";state.local.permissions.inputMonitoring=true;}
+// The native service's own verdict: no target for this computer's platform, or
+// a Mac addon without the screen functions. `platform` only changes the shell.
+if(params.get("native")==="platform")(state as any).local={supported:false,reason:"screen_platform_unsupported"};
+if(params.get("native")==="addon")(state as any).local={supported:false,reason:"screen_native_unavailable"};
 if(params.has("en"))setLocale("en");
 function connection(key:string) {
  const route={name:"Direct",url:"http://127.0.0.1:8788"};const listeners=new Set<()=>void>();
@@ -46,7 +50,7 @@ function connection(key:string) {
  } as unknown as HubConnection;
 }
 const a=connection("host-a"),b=connection("host-b");
-(window as any).tarobotDesktop={version:1,engine:"electron",platform:"darwin",on:()=>()=>{},openSocket:async()=>{},invoke:async(command:string,args:any)=>{
+(window as any).tarobotDesktop={version:1,engine:"electron",platform:params.get("platform")??"darwin",on:()=>()=>{},openSocket:async()=>{},invoke:async(command:string,args:any)=>{
  state.native.push({command,args});
  if(command==="desktop_host")return{running:true,publicKey:"host-a"};
  if(command==="screen_service_status")return structuredClone(state.local);

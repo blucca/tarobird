@@ -43,6 +43,10 @@ export class ScreenService {
     Object.assign(this, { electron, addon, stateDir, hostControl, platform, WebSocketClass, wall, monotonic, onSharing, isUpdating, log, registerTimeoutMs, attachTimeoutMs, retryBaseMs, retryMaxMs });
     this.#retryDelay = retryBaseMs;
     this.supported = platform === 'darwin' && !!addon?.screenMouse;
+    // Why `status()` reports `supported: false`. A platform without a target
+    // implementation is not repaired by reinstalling; a Mac addon without the
+    // screen functions is. Settings shows the two differently.
+    this.unsupportedReason = this.supported ? undefined : platform === 'darwin' ? 'screen_native_unavailable' : 'screen_platform_unsupported';
     this.instanceId = `screen-${randomUUID()}`;
     this.geometry = new ScreenGeometry({ screen: electron.screen, uuidOf: id => addon?.screenDisplayUuid?.(id) ?? null });
     this.capture = captureHost?.({ onMessage: message => this.#capture(message), onGone: (sessions, reason) => { for (const id of sessions) this.#end(id, reason, true); } });
@@ -102,9 +106,10 @@ export class ScreenService {
   // ---------------- management (DesktopServices) ----------------
   /** `phase`: starting | connecting | registered | retrying | failed. `error`
    * is the latest readiness failure, cleared on registration. Permission
-   * values are preflight checks only; reading them never prompts. */
+   * values are preflight checks only; reading them never prompts. An
+   * unsupported service reports only `supported: false` and its `reason`. */
   status() {
-    if (!this.supported) return { supported: false };
+    if (!this.supported) return { supported: false, reason: this.unsupportedReason };
     const phase = this.#registered ? 'registered' : this.#startFailed ? 'failed' : !this.#started ? 'starting'
       : this.#connecting ? 'connecting' : this.#retry ? 'retrying' : 'starting';
     const permissions = { capture: this.#permission('capture'), accessibility: this.#permission('accessibility'), inputMonitoring: this.#permission('input-monitoring') };

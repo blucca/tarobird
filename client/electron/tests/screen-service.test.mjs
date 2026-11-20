@@ -244,6 +244,19 @@ test('a classified ticket failure is reported as is', async t => {
   assert.equal(service.status().error, 'screen_host_directory_conflict');
 });
 
+test('an unsupported target reports why: no target for this platform, or a Mac addon without screen functions', async t => {
+  const other = await bare(t, { platform: 'win32' });
+  await other.service.start();
+  assert.deepEqual(other.service.status(), { supported: false, reason: 'screen_platform_unsupported' });
+  await assert.rejects(other.service.retry(), /screen_service_unavailable/);
+  assert.equal(other.calls.tickets, 0);
+  assert.equal(other.ws.all.length, 0);
+  const mac = await bare(t, { addon: { screenMouse: undefined } });
+  await mac.service.start();
+  assert.deepEqual(mac.service.status(), { supported: false, reason: 'screen_native_unavailable' });
+  assert.equal(mac.calls.tickets, 0);
+});
+
 test('a registration the Host refuses records the Host reason', async t => {
   const { service, ws } = await bare(t, { retryBaseMs: 10000 });
   await service.start();
