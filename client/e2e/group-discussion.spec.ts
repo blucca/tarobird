@@ -1261,7 +1261,31 @@ test('allowed speakers default to everyone and a single selection survives reloa
     await page.getByRole('button', { name: '可发言：全员', exact: true }).click();
     const chooser = page.getByRole('dialog', { name: '可发言的 Bot', exact: true });
     for (const name of ['研究助手', '复核助手']) await expect(chooser.getByRole('checkbox', { name, exact: true })).toBeChecked();
+    // A checked box is filled: its check glyph uses --on-primary, so an unfilled
+    // box showed nothing on desktop (community report: "已选 5 位" looked empty).
+    const box = (name: string) => chooser.getByRole('checkbox', { name, exact: true }).locator('.recipient-check');
+    const paint = (name: string) => box(name).evaluate(el => ({ fill: getComputedStyle(el).backgroundColor, glyph: getComputedStyle(el).color }));
+    const checked = await paint('研究助手');
+    expect(checked.fill).not.toBe('rgba(0, 0, 0, 0)');
+    // WCAG contrast between the glyph and its fill (reviewed themes measure >= 4.96).
+    const luminance = (css: string) => { const [r, g, b] = (css.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number).map(v => { const c = v / 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!; };
+    const [hi, lo] = [luminance(checked.glyph), luminance(checked.fill)].sort((a, b) => b - a);
+    expect((hi! + 0.05) / (lo! + 0.05)).toBeGreaterThanOrEqual(3);
     await chooser.getByRole('checkbox', { name: '复核助手', exact: true }).uncheck();
+    const unchecked = await box('复核助手').evaluate(el => {
+      const srgb = (value: string) => {
+        const c4 = value.match(/color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/i);
+        if (c4) return [Number(c4[1]), Number(c4[2]), Number(c4[3])];
+        const rgb = value.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+        return rgb ? [Number(rgb[1]) / 255, Number(rgb[2]) / 255, Number(rgb[3]) / 255] : [1, 1, 1];
+      };
+      const lum = (channels: number[]) => channels.map(s => s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4)).reduce((a, v, i) => a + v * [0.2126, 0.7152, 0.0722][i]!, 0);
+      const list = el.closest('.mobile-chat-action-list') ?? el;
+      const l1 = lum(srgb(getComputedStyle(el).boxShadow)), l2 = lum(srgb(getComputedStyle(list).backgroundColor));
+      return { fill: getComputedStyle(el).backgroundColor, contrast: (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05) };
+    });
+    expect(unchecked.fill).toBe('rgba(0, 0, 0, 0)');
+    expect(unchecked.contrast).toBeGreaterThanOrEqual(3);
     await chooser.getByRole('button', { name: '完成', exact: true }).click();
     await page.reload(); await waitForClientOnline(page); await selectConversation(page, '产品讨论组');
     await expect(page.getByRole('button', { name: '可发言：已选 1 位', exact: true })).toBeEnabled();
