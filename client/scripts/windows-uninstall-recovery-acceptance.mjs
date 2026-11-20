@@ -195,7 +195,16 @@ export function makeContext(sys, options) {
     const result = await exec(W.join(directory, HELPER), [flag], { timeout: 120_000, capture: true });
     return { code: result.code, stderr: `${result.timedOut ? 'TIMED OUT ' : ''}${result.stderr.trim().slice(0, 300)}` };
   };
-  return { sys, exec, outcome, options, tmp, bases, roots, reg, state, backups, presentRoots, lock, install, snapshot, uninstallRegistered, uninstallSync, recover, ensureUninstalled, seed, helper };
+  /** What an interactive install saves (MUI_LANGDLL_REGISTRY_*). The suite installs
+   * with /S, which saves none, and `.onInit` then shows the "Installer Language"
+   * chooser even for /P or a GUI uninstall. Only that value is written; the key is
+   * never recreated. */
+  const rememberLanguage = async () => {
+    const key = `HKCU:\\${LOCATION_KEY.slice('HKCU\\'.length)}`;
+    const result = await sys.powershell(`if (-not (Test-Path -LiteralPath '${ps(key)}')) { New-Item -Path '${ps(key)}' | Out-Null }; New-ItemProperty -LiteralPath '${ps(key)}' -Name 'Installer Language' -Value '1033' -PropertyType String -Force | Out-Null; (Get-ItemProperty -LiteralPath '${ps(key)}').'Installer Language'`);
+    return result.stdout.trim();
+  };
+  return { sys, exec, outcome, options, tmp, bases, roots, reg, state, backups, presentRoots, lock, install, snapshot, uninstallRegistered, uninstallSync, recover, ensureUninstalled, seed, helper, rememberLanguage };
 }
 
 /** A failed silent uninstall must keep the recovery entry and data; a retry of
@@ -266,9 +275,11 @@ async function inPlace(ctx, receipt, phase) {
   if (after.uninstall.state === 'present') await ctx.recover(receipt, phase);
   else receipt.expect(phase, 'inplace-leaves-only-running-uninstaller', left.length === 1 && left[0] === 'uninstall.exe', `left ${left.join(', ') || 'none'}`);
   await ctx.ensureUninstalled(receipt, phase);
-  // Same-version passive reinstall: PageLeaveReinstall takes reinst_uninstall.
+  // Same-version passive reinstall: PageLeaveReinstall takes reinst_uninstall,
+  // i.e. the installer runs the installed uninstaller in place (`/P _?=`).
   directory = await ctx.install(receipt, phase);
   if (!directory) return;
+  receipt.info(phase, 'installer-language-remembered', `Installer Language=${await ctx.rememberLanguage()} (as an interactive install saves; without it /P stops at the language chooser)`);
   const passive = await ctx.exec(ctx.options.installer, ['/P'], { timeout: 300_000 });
   const key = await ctx.reg(UNINSTALL_KEY);
   const missing = [EXE, 'uninstall.exe', HELPER, W.join(...LOCK_TARGET)].filter(file => !existsSync(W.join(directory, file)));
@@ -439,7 +450,9 @@ async function driveUi(ctx, mode, { release } = {}) {
 const describe = ui => ui.error ? `driver error: ${ui.error}` : `seen ${ui.seen}, closed ${ui.closed}, ${ui.seconds}s; events: ${(ui.events ?? []).map(e => `${e.kind}${e.kind === 'answer' || e.kind === 'confirm-page' ? `=${e.detail}` : ''}`).join(' → ')}; left ${JSON.stringify(ui.left ?? [])}`;
 
 async function launchGui(ctx, directory) {
-  // Like Settings → Apps: the registered uninstaller with its normal GUI.
+  // Like Settings → Apps: the registered uninstaller with its normal GUI, for a
+  // user whose interactive install saved the language (see rememberLanguage).
+  console.log(`${stamp()} Installer Language=${await ctx.rememberLanguage()} before the GUI uninstaller`);
   ctx.sys.launch(W.join(directory, 'uninstall.exe'));
 }
 
