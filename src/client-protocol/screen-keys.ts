@@ -1,7 +1,20 @@
 /** Remote screen keyboard model. Pure and browser-safe (no imports), shared by
  * the viewer UI and the macOS target service. Codes are W3C `KeyboardEvent.code`
- * values interpreted as Mac keys: Meta = Command, Alt = Option, Control = Control.
- * A Windows controller remaps its codes with `screenControllerCode` BEFORE sending. */
+ * values; for a macOS target they are Mac keys: Meta = Command, Alt = Option,
+ * Control = Control. A controller maps its codes for the target platform with
+ * `screenControllerCode` BEFORE sending. */
+
+/** Target (controlled computer) platforms, as `status.desktop.platform` reports
+ * them. The protocol accepts only macOS today. A new target platform joins this
+ * list together with its negotiated protocol value, key mapping and shortcuts. */
+export const SCREEN_TARGET_PLATFORMS = Object.freeze(['macos'] as const);
+export type ScreenTargetPlatform = typeof SCREEN_TARGET_PLATFORMS[number];
+/** The controller's own keyboard, which produced the `KeyboardEvent.code`. */
+export type ScreenControllerPlatform = 'mac' | 'windows';
+function forTarget<T>(table: Readonly<Record<ScreenTargetPlatform, T>>, target: ScreenTargetPlatform): T {
+  if (!Object.hasOwn(table, target)) throw new Error('screen_target_platform_unknown');
+  return table[target];
+}
 
 /** HIToolbox virtual key codes (ANSI positions). */
 export const SCREEN_MAC_KEYCODES: Readonly<Record<string, number>> = Object.freeze({
@@ -51,13 +64,21 @@ export type ScreenModifierMode = 'command' | 'physical';
 const COMMAND_MODE: Readonly<Record<string, string>> = Object.freeze({
   ControlLeft: 'MetaLeft', ControlRight: 'MetaRight', MetaLeft: 'ControlLeft', MetaRight: 'ControlRight',
 });
-export function screenControllerCode(code: string, platform: 'mac' | 'windows', mode: ScreenModifierMode = 'command'): string {
-  return platform === 'windows' && mode === 'command' ? COMMAND_MODE[code] ?? code : code;
+type ControllerCode = (code: string, controller: ScreenControllerPlatform, mode: ScreenModifierMode) => string;
+const TARGET_CODES: Readonly<Record<ScreenTargetPlatform, ControllerCode>> = Object.freeze({
+  // A macOS target receives Mac keys; only a Windows keyboard in `command` mode swaps Ctrl and Win.
+  macos: (code, controller, mode) => controller === 'windows' && mode === 'command' ? COMMAND_MODE[code] ?? code : code,
+});
+/** The code to send for `code` pressed on the controller's keyboard, for the
+ * target platform being controlled (macOS unless stated). */
+export function screenControllerCode(code: string, controller: ScreenControllerPlatform, mode: ScreenModifierMode = 'command', target: ScreenTargetPlatform = 'macos'): string {
+  return forTarget(TARGET_CODES, target)(code, controller, mode);
 }
 
+export type ScreenShortcut = { id: string; codes: readonly string[]; label: { zh: string; en: string } };
 /** Mac shortcuts the controller's own OS would intercept. The UI sends these as
  * explicit key sequences: modifiers down in order, key down/up, modifiers up reversed. */
-export const SCREEN_SHORTCUTS: ReadonlyArray<{ id: string; codes: readonly string[]; label: { zh: string; en: string } }> = Object.freeze([
+export const SCREEN_SHORTCUTS: ReadonlyArray<ScreenShortcut> = Object.freeze([
   { id: 'escape', codes: ['Escape'], label: { zh: 'Esc', en: 'Esc' } },
   { id: 'app-switcher', codes: ['MetaLeft', 'Tab'], label: { zh: '切换应用 ⌘Tab', en: 'Switch app ⌘Tab' } },
   { id: 'spotlight', codes: ['MetaLeft', 'Space'], label: { zh: '聚焦搜索 ⌘空格', en: 'Spotlight ⌘Space' } },
@@ -69,6 +90,11 @@ export const SCREEN_SHORTCUTS: ReadonlyArray<{ id: string; codes: readonly strin
   { id: 'mission-control', codes: ['ControlLeft', 'ArrowUp'], label: { zh: '调度中心 ⌃↑', en: 'Mission Control ⌃↑' } },
   { id: 'show-desktop', codes: ['MetaLeft', 'F3'], label: { zh: '显示桌面 ⌘F3', en: 'Show desktop ⌘F3' } },
 ]);
+const TARGET_SHORTCUTS: Readonly<Record<ScreenTargetPlatform, ReadonlyArray<ScreenShortcut>>> = Object.freeze({ macos: SCREEN_SHORTCUTS });
+/** The explicit shortcut list offered when controlling a `target` computer. */
+export function screenShortcuts(target: ScreenTargetPlatform = 'macos'): ReadonlyArray<ScreenShortcut> {
+  return forTarget(TARGET_SHORTCUTS, target);
+}
 /** Expands a shortcut into ordered key events (down…, up reversed). */
 export function screenShortcutEvents(codes: readonly string[]): { code: string; down: boolean }[] {
   if (!codes.length || codes.length > 4 || codes.some(code => !Object.hasOwn(SCREEN_MAC_KEYCODES, code))) throw new Error('screen_shortcut_invalid');
