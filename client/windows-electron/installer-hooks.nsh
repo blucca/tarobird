@@ -114,12 +114,17 @@ FunctionEnd
   ; files open or respawn the Host. Never kill processes by name.
   !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"
   ; Use only the stopper for this installation. Old Tauri installations use
-  ; their main executable. Companion installations have no runtime.
+  ; their main executable. Companion installations have no runtime. An
+  ; Electron program refuses --stop-desktop-host (exit 64), so an Electron
+  ; layout (resources\app.asar, resources\host) never uses it, even with a
+  ; Tauri host\ folder left over from the upgrade.
   StrCpy $TaroBotHostStopper ""
   ${If} ${FileExists} "$INSTDIR\${TAROBOTHELPER}"
     StrCpy $TaroBotHostStopper "$INSTDIR\${TAROBOTHELPER}"
   ${ElseIf} ${FileExists} "$INSTDIR\host\node.exe"
-    ${AndIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
+  ${AndIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
+  ${AndIfNot} ${FileExists} "$INSTDIR\resources\app.asar"
+  ${AndIfNot} ${FileExists} "$INSTDIR\resources\host\node.exe"
     StrCpy $TaroBotHostStopper "$INSTDIR\${MAINBINARYNAME}.exe"
   ${EndIf}
   ; A Host runtime whose stopper is missing (removed or quarantined) may still
