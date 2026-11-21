@@ -654,6 +654,23 @@ export class HubStore {
     if (update.event) this.emit(update.event);
     return update.message;
   }
+  /** A Bot steer that may not be queued after all (its source lost the right
+   * to deliver, review V3): final, never merged, never queued. Only a record
+   * without a definite outcome changes. */
+  async refuseBotSteer(messageId: string, botId: string, reason: string): Promise<{ message: Message; changed: boolean }> {
+    const update = await this.db.transaction(async () => {
+      const row = await this.db.get<MessageRow>("SELECT * FROM messages WHERE id=?", [messageId]);
+      if (!row) throw new HubError("message_not_found", 404);
+      const old = this.decodeMessage(row), control = old.blocks.find(block => block.type === "steering");
+      if (!old.botSource || control?.botId !== botId || control.outcome !== "pending" && control.outcome !== "unknown" || await this.db.get("SELECT 1 FROM deliveries WHERE message_id=?", [messageId])) return { message: old, changed: false };
+      const message: Message = { ...old, version: old.version + 1, blocks: old.blocks.map(block => block.type !== "steering" ? block
+        : { ...(({ reason: _reason, ...rest }) => rest)(block), outcome: "rejected" as const, reason }) };
+      await this.saveMessage(message);
+      return { message, changed: true, event: await this.append(message.conversationId, "message.updated", message) };
+    });
+    if (update.event) this.emit(update.event);
+    return { message: update.message, changed: update.changed };
+  }
   /** The engine refused a Bot steer before admission (also learned later by
    * reconciliation): in one transaction the same record loses its steering
    * block, gains the Host notice and becomes one ordinary queued Bot message.

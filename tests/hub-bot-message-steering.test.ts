@@ -731,6 +731,55 @@ describe("final verification round (V1–V4)", () => {
     expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
     expect(await openKeys()).toEqual([]);
   });
+
+  const unconfirmed = async (title: string) => {
+    const chat = await call(input("resolve", { newConversation: title })); await liveTurn(chat.conversationId);
+    fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    return { chat, receipt: await send(chat.conversationId, `Lost ${title}`, { delivery: "steer" }) };
+  };
+  const steerAudits = async () => (await b.store.db.all<{ detail_json: string }>("SELECT detail_json FROM audit_log WHERE kind='bot-message.steer' ORDER BY id")).map(row => JSON.parse(row.detail_json));
+
+  it("V4: one record that fails to settle does not stop the rest of the attach batch, and is audited", async () => {
+    const first = await unconfirmed("One"), second = await unconfirmed("Two");
+    fake.reconcile.mockResolvedValue({ outcome: "rejected", reason: "stale" });
+    const original = b.store.fallBackBotSteer.bind(b.store); let thrown = "";
+    vi.spyOn(b.store, "fallBackBotSteer").mockImplementation(async (messageId, ...rest) => {
+      if (!thrown) { thrown = messageId; throw new HubError("bot_forbidden", 403); }
+      return original(messageId, ...rest);
+    });
+    await b.botMessages.reconcileForBot("target");
+    const other = [first.receipt.messageId, second.receipt.messageId].find(id => id !== thrown)!;
+    expect(await deliveries(other)).toHaveLength(1);
+    expect(await deliveries(thrown)).toEqual([]);
+    expect(await steerAudits()).toContainEqual(expect.objectContaining({ messageId: thrown, outcome: "reconcile_failed", reason: "bot_forbidden" }));
+  });
+
+  it("V2: a worker without the steer capability ends this Bot's open steers as uncertain, never queued", async () => {
+    const { chat, receipt } = await unconfirmed("Downgraded");
+    await b.botMessages.closeOpenSteersForBot("target", "worker_without_steer");
+    expect(fake.reconcile).not.toHaveBeenCalled();
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+    expect(await wait(chat.conversationId, receipt.messageId)).toMatchObject({ status: "uncertain", delivery: { actual: "steer_uncertain" } });
+    expect(await steerAudits()).toContainEqual(expect.objectContaining({ messageId: receipt.messageId, outcome: "steer_uncertain", reason: "worker_without_steer" }));
+    expect(await openKeys()).toEqual([]);
+  });
+
+  it("V3: attach reconciliation rechecks the source's grant before queueing a recorded refusal", async () => {
+    const { receipt } = await unconfirmed("Revoked");
+    await b.botMessages.grant({ sourceHost: "Mac", sourceBot: "source", targetBot: "target", revoke: true }, guard);
+    fake.reconcile.mockResolvedValue({ outcome: "rejected", reason: "stale" });
+    await b.botMessages.reconcileForBot("target");
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+    expect(fake.dispatch).not.toHaveBeenCalled();
+    expect((await blocks(receipt.messageId)).find(block => block.type === "steering")).toMatchObject({ outcome: "rejected", reason: "grant_revoked" });
+    expect(await steerAudits()).toContainEqual(expect.objectContaining({ messageId: receipt.messageId, outcome: "not_delivered", reason: "grant_revoked" }));
+    expect(await openKeys()).toEqual([]);
+    // With the grant in place the same refusal is queued once (control).
+    await b.botMessages.grant({ sourceHost: "Mac", sourceBot: "source", targetBot: "target" }, guard);
+    const kept = await unconfirmed("Kept");
+    await b.botMessages.reconcileForBot("target");
+    expect(await deliveries(kept.receipt.messageId)).toHaveLength(1);
+  });
 });
 
 describe("M3: blank steer text", () => {

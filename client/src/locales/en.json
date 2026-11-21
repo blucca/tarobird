@@ -5568,5 +5568,10 @@
   "无法确认是否已并入；不会再次排队": "Can't confirm whether it was merged; it won't be queued again",
   "正在确认是否已并入…": "Checking whether it was merged…",
   "空白内容不能引导": "blank text can't be steered",
-  "Bot 不能引导自己": "a Bot can't steer itself"
+  "Bot 不能引导自己": "a Bot can't steer itself",
+  "未投递（{0}）": "Not delivered ({0})",
+  "未投递": "Not delivered",
+  "发送方的授权已撤销": "the sender's permission was revoked",
+  "发送方主机已不在网络中": "the sender's host left the network",
+  "目标 Bot 已删除": "the recipient Bot was deleted"
 }

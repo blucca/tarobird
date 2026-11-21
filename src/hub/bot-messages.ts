@@ -41,6 +41,8 @@ type CrossHostState = { snapshot: CrossHostMessageGrantsSnapshot; keys: Map<stri
 const resolutionCode = (error: TargetResolutionError): unknown => { try { return (JSON.parse(error.message) as { code?: unknown }).code; } catch { return undefined; } };
 /** A steer condition (limit, owner switch, engine, chat shape) that no longer holds inside the creating transaction: that write rolls back and the message is queued instead. */
 class SteerLimitReached extends Error { constructor(readonly reason: BotSteerFallbackReason) { super(reason); } }
+/** Attach-time reconciliation found the source may no longer deliver (review V3). */
+class NotDeliverable extends Error { constructor(readonly reason: string) { super(reason); } }
 type ReplyState = { status: string; activeReplies?: number; text: string; files: { id: string; name: string; size: number; mime: string; sha256: string }[]; truncated: boolean };
 type WaitResult = BotMessageTarget & { messageId: string } & ReplyState & { delivery?: BotMessageDeliveryReceipt; reply?: { kind: "merged_turn"; turnMessageId: string } };
 /** Everything receive() resolved for one send; the delivery paths share it. */
@@ -534,6 +536,7 @@ export class BotMessages {
   private deliveryOf(blocks: Block[], memo: IncomingMemo | undefined): BotMessageDeliveryReceipt {
     const control = blocks.find(block => block.type === "steering"), turn = memo?.steer?.turn ? { turn: { messageId: memo.steer.turn } } : {};
     if (!control) return memo?.steer?.reason ? { requested: "steer", actual: "fell_back_to_queue", reason: memo.steer.reason } : { requested: "steer", actual: "queued" };
+    if (control.outcome === "rejected") return { requested: "steer", actual: "not_delivered", ...(control.reason && /^[a-z_]{1,64}$/.test(control.reason) ? { reason: control.reason } : {}), ...turn };
     // Not final: the call is in flight, or this Host got no answer yet (reconcilable).
     if (control.outcome === "pending") return { requested: "steer", actual: "pending", reason: "steer_in_flight", ...turn };
     if (control.outcome === "unknown" && control.reason !== "gateway_uncertain") return { requested: "steer", actual: "pending", reason: "steer_unconfirmed", ...turn };
@@ -552,6 +555,7 @@ export class BotMessages {
     if (delivery.actual === "pending") return { ...target, messageId, status: "pending", ...empty, delivery };
     // Unknown whether it joined: report that, not the turn's reply. delivery.turn names the sender's own turn input.
     if (delivery.actual === "steer_uncertain") return { ...target, messageId, status: "uncertain", ...empty, delivery };
+    if (delivery.actual === "not_delivered") return { ...target, messageId, status: "failed", ...empty, delivery };
     // The joined turn, re-checked: only a turn this same sender started is readable.
     const turnRow = turn ? await this.store.db.get<{ bot_source_json: string | null; client_msg_id: string | null; status: string }>("SELECT m.bot_source_json,m.client_msg_id,d.status FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND m.conversation_id=? AND d.bot_id=?", [turn, target.conversationId, botId]) : undefined;
     if (!turn || !turnRow || !await this.sendersOwnInput(p, turnRow)) return { ...target, messageId, status: "uncertain", ...empty, delivery };
@@ -572,7 +576,7 @@ export class BotMessages {
   }
   private receipt(c: DeliveryContext, message: Message, duplicate: boolean, delivery: BotMessageDeliveryReceipt) {
     return { ...c.target, requestId: c.p.source.requestId, messageId: message.id, duplicate,
-      status: delivery.actual === "steered" ? "steered" : delivery.actual === "steer_uncertain" ? "uncertain" : delivery.actual === "pending" ? "pending" : "queued", delivery };
+      status: delivery.actual === "steered" ? "steered" : delivery.actual === "steer_uncertain" ? "uncertain" : delivery.actual === "pending" ? "pending" : delivery.actual === "not_delivered" ? "failed" : "queued", delivery };
   }
   /** One ordinary queued Bot message; with `reason` it records why a steer request was queued. */
   private async queueDelivery(c: DeliveryContext, reason?: BotSteerFallbackReason): Promise<unknown> {
@@ -742,7 +746,8 @@ export class BotMessages {
   /** Apply one Gateway answer (direct or reconciled; `answered` is false when
    * this Host got none). Every transition is idempotent: a definite refusal
    * queues the record once; acceptance and uncertainty never create a delivery. */
-  private async settleSteer(source: BotSource, botId: string, messageId: string, key: string, result: SteerResult, turn: string, answered: boolean): Promise<void> {
+  private async settleSteer(source: BotSource, botId: string, messageId: string, key: string, result: SteerResult, turn: string, answered: boolean,
+    /** Attach path only: may this source still deliver? A reason means no (review V3). */ recheck?: () => Promise<string | undefined>): Promise<void> {
     const audit = (outcome: string, extra: Record<string, string> = {}) => this.store.audit("bot-message.steer", source.botId, { messageId, requestId: source.requestId, sourceHost: source.hostId, sourceBot: source.botId, outcome, turn, ...extra });
     const close = () => this.store.db.transaction(() => this.store.db.run("DELETE FROM meta WHERE key=?", [openSteerKey(botId, messageId)]));
     if (result.outcome === "rejected" && result.reason === "control_forbidden") {
@@ -754,10 +759,21 @@ export class BotMessages {
     }
     if (result.outcome === "rejected") {
       const reason = botSteerRejectionReason(result.reason);
-      const changed = (await this.store.fallBackBotSteer(messageId, botId, steerFallbackNotice(botId, reason), async () => {
-        const memo = await this.memo<IncomingMemo>(key);
-        await this.put(key, { ...memo!, steer: { ...memo!.steer, reason } } satisfies IncomingMemo);
-      })).changed;
+      let changed: boolean;
+      try {
+        changed = (await this.store.fallBackBotSteer(messageId, botId, steerFallbackNotice(botId, reason), async () => {
+          // Rechecked inside the write that would queue it.
+          const refusal = await recheck?.();
+          if (refusal) throw new NotDeliverable(refusal);
+          const memo = await this.memo<IncomingMemo>(key);
+          await this.put(key, { ...memo!, steer: { ...memo!.steer, reason } } satisfies IncomingMemo);
+        })).changed;
+      } catch (error) {
+        if (!(error instanceof NotDeliverable)) throw error;
+        if ((await this.store.refuseBotSteer(messageId, botId, error.reason)).changed) await audit("not_delivered", { reason: error.reason });
+        await close();
+        return;
+      }
       if (changed) {
         // The delivery was inserted into an existing record: no message.created
         // event will wake the dispatch loop, so ask for it explicitly.
@@ -790,7 +806,7 @@ export class BotMessages {
       const control = (JSON.parse(row.blocks_json) as Block[]).find(block => block.type === "steering");
       if (control?.botId !== botId || !(control.outcome === "pending" || control.outcome === "unknown" && control.reason !== "gateway_uncertain")) return { stale: true as const };
       const steer = (await this.memo<IncomingMemo>(open.key))?.steer;
-      return steer?.turn && steer.targetId && steer.epoch ? { origin, key: open.key, conversationId: row.conversation_id, requestId: row.client_msg_id, turn: steer.turn, targetId: steer.targetId, epoch: steer.epoch } : undefined;
+      return steer?.turn && steer.targetId && steer.epoch ? { origin, key: open.key, sourceKey: open.sourceKey, conversationId: row.conversation_id, requestId: row.client_msg_id, turn: steer.turn, targetId: steer.targetId, epoch: steer.epoch } : undefined;
     });
     if (!found) return;
     if ("stale" in found) { await this.store.db.transaction(() => this.store.db.run("DELETE FROM meta WHERE key=?", [openSteerKey(botId, messageId)])); return; }
@@ -798,7 +814,16 @@ export class BotMessages {
     try { result = steerResultSchema.parse(await this.steering.reconcile(botId, { conversationId: found.conversationId, requestId: found.requestId, targetId: found.targetId, sourceMessageId: found.turn, receiptEpoch: found.epoch })); }
     catch { return; }
     if (this.steersInFlight.has(messageId)) return;
-    await this.settleSteer(found.origin, botId, messageId, found.key, result, found.turn, true);
+    // Without a sender request no passport was checked: before a recorded
+    // refusal becomes a queued task, the source must still be allowed now.
+    const recheck = sender ? undefined : async (): Promise<string | undefined> => {
+      if (!found.sourceKey) return "grant_revoked";
+      const grant = await this.memo<Grant>(memoKey("grant", found.sourceKey, found.origin.botId, botId));
+      if (!grant || grant.revoked) return "grant_revoked";
+      try { await this.network.requireMessagePeerInTransaction(found.sourceKey); } catch (error) { if (error instanceof HubError) return "source_not_peer"; throw error; }
+      if (!await this.store.db.get("SELECT 1 FROM bots WHERE id=? AND deleted_at IS NULL", [botId])) return "bot_deleted";
+    };
+    await this.settleSteer(found.origin, botId, messageId, found.key, result, found.turn, true, recheck);
   }
   /** wait / replay: only the sender's own record. */
   private reconcileSteer(p: BotPassport, botId: string, _target: BotMessageTarget, messageId: string): Promise<void> {
@@ -809,7 +834,32 @@ export class BotMessages {
   async reconcileForBot(botId: string): Promise<void> {
     const prefix = `${OPEN_STEER}${idSchema.parse(botId)}:`;
     const rows = await this.store.db.serial(() => this.store.db.all<{ key: string }>("SELECT key FROM meta WHERE key>=? AND key<? ORDER BY key LIMIT 100", [prefix, `${prefix}\uffff`]));
-    for (const { key } of rows) await this.reconcileRecord(botId, key.slice(prefix.length));
+    for (const { key } of rows) {
+      const messageId = key.slice(prefix.length);
+      // One bad record must not stop this batch, nor every later attach (review V4).
+      try { await this.reconcileRecord(botId, messageId); }
+      catch (error) { await this.store.audit("bot-message.steer", botId, { messageId, outcome: "reconcile_failed", reason: error instanceof HubError ? error.code : "internal_error" }).catch(() => undefined); }
+    }
+  }
+  /** A worker attached without the steer capability (engine changed, older
+   * Gateway): nothing can reconcile this Bot's open steers, so they end as
+   * uncertain — never queued (review V2). Bounded per attach. */
+  async closeOpenSteersForBot(botId: string, reason: string): Promise<void> {
+    const prefix = `${OPEN_STEER}${idSchema.parse(botId)}:`;
+    const rows = await this.store.db.serial(() => this.store.db.all<{ key: string }>("SELECT key FROM meta WHERE key>=? AND key<? ORDER BY key LIMIT 100", [prefix, `${prefix}\uffff`]));
+    for (const { key } of rows) {
+      const messageId = key.slice(prefix.length);
+      if (this.steersInFlight.has(messageId)) continue;
+      try {
+        const before = await this.store.db.serial(() => this.store.queuedMessageInTransaction(messageId));
+        const control = before.blocks.find(block => block.type === "steering");
+        if (before.botSource && control?.botId === botId && (control.outcome === "pending" || control.outcome === "unknown" && control.reason !== "gateway_uncertain")) {
+          await this.store.settleBotSteer(messageId, botId, { outcome: "unknown", reason: "gateway_uncertain" });
+          await this.store.audit("bot-message.steer", before.botSource.botId, { messageId, requestId: before.botSource.requestId, sourceHost: before.botSource.hostId, sourceBot: before.botSource.botId, outcome: "steer_uncertain", reason });
+        }
+        await this.store.db.transaction(() => this.store.db.run("DELETE FROM meta WHERE key=?", [key]));
+      } catch (error) { await this.store.audit("bot-message.steer", botId, { messageId, outcome: "reconcile_failed", reason: error instanceof HubError ? error.code : "internal_error" }).catch(() => undefined); }
+    }
   }
   /** Signed probe of a remote receiving Host. Only an explicit refusal of the
    * unknown route (an older Host) means queue; other failures stop the send. */

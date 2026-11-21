@@ -38,10 +38,12 @@ export function botSteerRejectionReason(reason: string | undefined): BotSteerFal
  * - steered: merged into `turn` (the input message of the recipient's live turn);
  * - queued / fell_back_to_queue: a normal queued Bot message, exactly once;
  * - steer_uncertain: the engine may have taken it; never queued again;
- * - pending: the merge call is still in flight (a duplicate request ID). */
+ * - pending: no final outcome yet (reason steer_in_flight or steer_unconfirmed);
+ * - not_delivered: never merged and never queued, e.g. the source's grant was
+ *   revoked before a recorded refusal could be queued on worker attach. */
 export const botMessageDeliveryReceiptSchema = z.object({
   requested: botMessageDeliverySchema,
-  actual: z.enum(["queued", "steered", "fell_back_to_queue", "steer_uncertain", "pending"]),
+  actual: z.enum(["queued", "steered", "fell_back_to_queue", "steer_uncertain", "pending", "not_delivered"]),
   reason: z.string().regex(/^[a-z_]{1,64}$/).optional(),
   turn: z.object({ messageId: idSchema }).strict().optional(),
   dropped: z.enum(["stopped", "turn_failed", "not_started", "engine_exit"]).optional(),

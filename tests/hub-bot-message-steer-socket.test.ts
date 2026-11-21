@@ -106,4 +106,22 @@ describe("Hub ↔ Gateway Bot steer wiring (#62)", () => {
     expect((await replacement.request("delivery.fail", { messageId: task.messageId, reason: "interrupted" })).error).toBeUndefined();
     expect(await local("wait", { messageId: receipt.messageId }, chat.conversationId)).toMatchObject({ status: "failed", delivery: { actual: "steered" }, reply: { kind: "merged_turn", turnMessageId: task.messageId } });
   });
+
+  it("V2: a worker that comes back without the steer capability ends an unconfirmed steer as uncertain", async () => {
+    const peer = await worker([BOT_MESSAGE_STEER_CAPABILITY]);
+    const chat = await local("resolve", {});
+    const task = await local("send", { text: "Long task", attachments: [] }, chat.conversationId);
+    await hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [task.messageId]);
+    const sending = local("send", { text: "Correction", attachments: [], delivery: "steer" }, chat.conversationId);
+    const status = await peer.next("instance.call", f => f.method === "botMessage.steer.status");
+    peer.send({ type: "instance.result", id: status.id, result: { supported: true, targetId: "run_live", sourceMessageId: task.messageId, receiptEpoch: "rs_fixture_store" } });
+    await peer.next("instance.call", f => f.method === "botMessage.steer");
+    peer.ws.terminate();
+    const receipt = await sending;
+    expect(receipt.delivery).toMatchObject({ actual: "pending", reason: "steer_unconfirmed" });
+    const older = await worker([]);
+    await expect.poll(async () => (await local("wait", { messageId: receipt.messageId }, chat.conversationId)).status, { timeout: 5000 }).toBe("uncertain");
+    expect(older.frames.some(f => f.type === "instance.call" && String(f.method).startsWith("botMessage."))).toBe(false);
+    expect(await hub.store.db.all("SELECT * FROM deliveries WHERE message_id=?", [receipt.messageId])).toEqual([]);
+  });
 });

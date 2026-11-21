@@ -13,6 +13,8 @@ const REASONS: Record<string, string> = {
   engine_not_ready: "对方引擎暂不接受引导", session_busy: "对方会话正忙于其他对话", session_changed: "对方会话已切换",
   blank_text: "空白内容不能引导", self_target: "Bot 不能引导自己",
 };
+/** Why a Bot's steer ended without being merged or queued. */
+const NOT_DELIVERED: Record<string, string> = { grant_revoked: "发送方的授权已撤销", source_not_peer: "发送方主机已不在网络中", bot_deleted: "目标 Bot 已删除" };
 export function steerFallbackText(reason: unknown): string {
   const known = typeof reason === "string" ? REASONS[reason] : undefined;
   return known ? t("未能并入正在进行的回复（{0}），已改为排队。", t(known)) : t("未能并入正在进行的回复，已改为排队。");
@@ -27,6 +29,7 @@ export function steerFallbackReason(block: Block): { reason?: string } | undefin
 export function botSteerLabel(block: Extract<Block, { type: "steering" }>): string {
   if (block.application?.status === "dropped") return t("已并入，但对方未处理这段补充");
   if (block.application?.status === "applied" || block.application?.status === "absorbed") return t("已并入正在进行的回复，已进入模型上下文");
+  if (block.outcome === "rejected") return block.reason && NOT_DELIVERED[block.reason] ? t("未投递（{0}）", t(NOT_DELIVERED[block.reason]!)) : t("未投递");
   if (block.outcome === "accepted") return t("已并入正在进行的回复");
   if (block.outcome === "pending") return t("正在并入正在进行的回复…");
   // Only the Gateway's own "cannot tell" is final; otherwise the Host is still checking.
