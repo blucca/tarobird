@@ -20,7 +20,12 @@ export const SCREEN_H264_L40_MACROBLOCKS = 8192, SCREEN_H264_L51_MACROBLOCKS = 3
 export type ScreenQualityProfile = {
   /** Encoded long-edge, area and macroblock caps; never upscaled. */
   longEdge: number; area: number; macroblocks: number;
-  /** Capture/encode frame-rate cap. */
+  /** Capture/encode frame-rate cap. `smooth` and `balanced` ask for the
+   * display's own 60; `sharp`, with several times the pixels, for 30. The
+   * H.264 level follows size and rate together (`screenH264Codec`), and the
+   * target falls back to 30 and then 15 when its encoder cannot take the
+   * rate. A slower viewer or a busy picture still lowers the real rate
+   * through the credit window and the byte budget. */
   fps: number;
   /** Per-frame quantizer at rest, and the ceiling congestion may raise it to. */
   qpBase: number; qpMax: number;
@@ -30,17 +35,23 @@ export type ScreenQualityProfile = {
   h264Only: boolean;
 };
 export const SCREEN_QUALITY_PROFILES: Readonly<Record<ScreenQuality, Readonly<ScreenQualityProfile>>> = Object.freeze({
-  smooth: Object.freeze({ longEdge: 1280, area: 1280 * 800, macroblocks: SCREEN_H264_L40_MACROBLOCKS, fps: 15, qpBase: 32, qpMax: 42, bitrate: 1_200_000, h264Only: false }),
-  balanced: Object.freeze({ longEdge: 1920, area: 1920 * 1080, macroblocks: SCREEN_H264_L40_MACROBLOCKS, fps: 15, qpBase: 28, qpMax: 40, bitrate: 2_500_000, h264Only: false }),
-  sharp: Object.freeze({ longEdge: 3072, area: 3072 * 1920, macroblocks: SCREEN_H264_L51_MACROBLOCKS, fps: 15, qpBase: 28, qpMax: 40, bitrate: 3_200_000, h264Only: true }),
+  smooth: Object.freeze({ longEdge: 1280, area: 1280 * 800, macroblocks: SCREEN_H264_L40_MACROBLOCKS, fps: 60, qpBase: 32, qpMax: 42, bitrate: 1_200_000, h264Only: false }),
+  balanced: Object.freeze({ longEdge: 1920, area: 1920 * 1080, macroblocks: SCREEN_H264_L40_MACROBLOCKS, fps: 60, qpBase: 28, qpMax: 40, bitrate: 2_500_000, h264Only: false }),
+  sharp: Object.freeze({ longEdge: 3072, area: 3072 * 1920, macroblocks: SCREEN_H264_L51_MACROBLOCKS, fps: 30, qpBase: 28, qpMax: 40, bitrate: 3_200_000, h264Only: true }),
 });
 /** Largest stream any profile may produce (the shared stream schema bound). */
 export const SCREEN_STREAM_MAX_EDGE = 3072, SCREEN_STREAM_MAX_AREA = 3072 * 1920;
-/** H.264 High profile codec string for an encoded size: level 4.0 when it
- * fits (the pre-quality string), otherwise level 5.1; undefined if neither. */
-export function screenH264Codec(width: number, height: number): string | undefined {
+/** The rate every stream ran at before profiles named their own. */
+export const SCREEN_LEGACY_FPS = 15;
+/** H.264 levels as [codec string, largest frame in macroblocks, macroblocks per second]: 4.0, 4.2, 5.1, 5.2. */
+const H264_LEVELS: readonly (readonly [string, number, number])[] = [["avc1.640028", 8192, 245_760], ["avc1.64002A", 8704, 522_240], ["avc1.640033", 36_864, 983_040], ["avc1.640034", 36_864, 2_073_600]];
+/** H.264 High profile codec string for an encoded size and rate: the lowest
+ * level that carries both. At the legacy rate this is level 4.0 whenever the
+ * size fits (the pre-quality string) and otherwise 5.1, exactly as before;
+ * 1080p at 60 is level 4.2. Undefined when no level fits. */
+export function screenH264Codec(width: number, height: number, fps: number = SCREEN_LEGACY_FPS): string | undefined {
   const blocks = Math.ceil(width / 16) * Math.ceil(height / 16);
-  return blocks <= SCREEN_H264_L40_MACROBLOCKS ? "avc1.640028" : blocks <= SCREEN_H264_L51_MACROBLOCKS ? "avc1.640033" : undefined;
+  return H264_LEVELS.find(([, frame, rate]) => blocks <= frame && blocks * fps <= rate)?.[0];
 }
 export function isScreenQuality(value: unknown): value is ScreenQuality {
   return typeof value === "string" && (SCREEN_QUALITIES as readonly string[]).includes(value);

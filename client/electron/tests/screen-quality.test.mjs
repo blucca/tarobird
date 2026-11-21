@@ -18,7 +18,7 @@ import { screenServiceCommandSchema, screenServiceHelloSchema, screenStreamSchem
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 // ---------------- capture core ----------------
-function browser({ supported = ['quantizer', 'variable'], codecs = ['avc1.640028', 'avc1.640033', 'vp8'], chunkBytes = 3 } = {}) {
+function browser({ supported = ['quantizer', 'variable'], codecs = ['avc1.640028', 'avc1.64002A', 'avc1.640033', 'vp8'], chunkBytes = 3 } = {}) {
   const sent = [], encoders = [], requests = [], probes = [], pending = [];
   let pushFrame, perf = 0, clock = 1_800_000_000_000;
   class Encoder {
@@ -55,11 +55,12 @@ const startMessage = (quality, extra = {}) => {
 
 test('core: each quality sets the real capture constraints, encoder size/rate and quantizer; omitted = legacy balanced', async () => {
   // 1440×900 points @2x: balanced/legacy = 1818×1136 (H.264 level 4.0), sharp = native 2880×1800 (level 5.1).
-  const expected = { smooth: [1280, 800, 32, 42, 'avc1.640028'], balanced: [1818, 1136, 28, 40, 'avc1.640028'], sharp: [2880, 1800, 28, 40, 'avc1.640033'], legacy: [1818, 1136, 28, 40, 'avc1.640028'] };
-  for (const [quality, [width, height, qpBase, qpMax, codecString]] of Object.entries(expected)) {
+  // Rate: smooth and balanced ask for 60 (1080p-class at 60 is H.264 level 4.2), sharp for 30; the legacy start stays at 15.
+  const expected = { smooth: [1280, 800, 32, 42, 'avc1.640028', 60], balanced: [1818, 1136, 28, 40, 'avc1.64002A', 60], sharp: [2880, 1800, 28, 40, 'avc1.640033', 30], legacy: [1818, 1136, 28, 40, 'avc1.640028', 15] };
+  for (const [quality, [width, height, qpBase, qpMax, codecString, fps]] of Object.entries(expected)) {
     const b = browser(); await b.core.handle(startMessage(quality === 'legacy' ? undefined : quality)); await tick();
-    assert.deepEqual(b.requests[0].video, { cursor: 'always', frameRate: { max: 15 }, width: { max: width }, height: { max: height } }, `${quality}: capture constraints`);
-    assert.deepEqual([b.encoders[0].config.width, b.encoders[0].config.height, b.encoders[0].config.framerate, b.encoders[0].config.bitrateMode], [width, height, 15, 'quantizer']);
+    assert.deepEqual(b.requests[0].video, { cursor: 'always', frameRate: { max: fps }, width: { max: width }, height: { max: height } }, `${quality}: capture constraints`);
+    assert.deepEqual([b.encoders[0].config.width, b.encoders[0].config.height, b.encoders[0].config.framerate, b.encoders[0].config.bitrateMode], [width, height, fps, 'quantizer']);
     const stream = b.sent.find(m => m.type === 'stream').stream;
     assert.deepEqual([stream.width, stream.height, stream.codecString, b.encoders[0].config.codec], [width, height, codecString, codecString]);
     assert.doesNotThrow(() => screenStreamSchema.parse(stream), `${quality}: stream fits the shared schema`);
@@ -75,6 +76,53 @@ test('core: each quality sets the real capture constraints, encoder size/rate an
   }
 });
 
+test('core: above the legacy rate a viewer that follows faster than it keeps its quantizer; below it, or at 15 fps, crowding still coarsens', async () => {
+  const b = browser(); await b.core.handle(startMessage('smooth')); await tick();
+  const session = b.core.sessions.get('s1'), base = session.qp;
+  // 40 of 60 frames could not be taken, 20 got through: slower than the source, not congested.
+  for (let i = 0; i < 5; i++) { session.crowded = 40; session.encoded = 20; b.adapt(); }
+  assert.equal(session.qp, base, 'a 20 fps viewer keeps the resting quantizer');
+  // Fewer got through than the legacy rate delivered: the old congestion response applies.
+  session.crowded = 52; session.encoded = 8; b.adapt();
+  assert.equal(session.qp, base + 3);
+  assert.deepEqual([session.crowded, session.encoded], [0, 0], 'both counters restart every second');
+  // Byte starvation coarsens at any rate.
+  session.starved = 1; session.encoded = 60; b.adapt();
+  assert.equal(session.qp, base + 6);
+  // A 15 fps session is judged exactly as before, whatever got through.
+  const c = browser(); await c.core.handle(startMessage(undefined)); await tick();
+  const legacy = c.core.sessions.get('s1'), legacyBase = legacy.qp;
+  legacy.crowded = 3; legacy.encoded = 13; c.adapt();
+  assert.equal(legacy.qp, legacyBase + 3);
+});
+
+test('codec: the H.264 level is the lowest that carries both the size and the rate; legacy sizes at the legacy rate keep their strings', () => {
+  assert.equal(screenH264Codec(1920, 1080), 'avc1.640028');
+  assert.equal(screenH264Codec(1920, 1080, 15), 'avc1.640028');
+  assert.equal(screenH264Codec(1920, 1080, 30), 'avc1.640028');
+  assert.equal(screenH264Codec(1280, 800, 60), 'avc1.640028', '720p-class at 60 still fits level 4.0');
+  assert.equal(screenH264Codec(1920, 1080, 60), 'avc1.64002A');
+  assert.equal(screenH264Codec(1818, 1136, 60), 'avc1.64002A');
+  assert.equal(screenH264Codec(2880, 1800), 'avc1.640033');
+  assert.equal(screenH264Codec(2880, 1800, 30), 'avc1.640033');
+  assert.equal(screenH264Codec(3072, 1920, 60), 'avc1.640034');
+  assert.equal(screenH264Codec(8192, 8192, 15), undefined);
+});
+
+test('core: an encoder that cannot take the profile rate gets H.264 at the next lower rate, before VP8 at any rate', async () => {
+  // No level 4.2: a 1080p-class picture cannot be encoded at 60.
+  const b = browser({ codecs: ['avc1.640028', 'avc1.640033', 'vp8'] }); await b.core.handle(startMessage('balanced')); await tick();
+  const session = b.core.sessions.get('s1'), stream = b.sent.find(m => m.type === 'stream').stream;
+  assert.deepEqual([b.encoders[0].config.codec, b.encoders[0].config.framerate, stream.codec, stream.codecString], ['avc1.640028', 30, 'h264', 'avc1.640028']);
+  assert.deepEqual([session.profile.fps, session.interval], [30, 1000 / 30], 'the whole session runs at the accepted rate');
+  // A reset keeps the choice.
+  await b.core.handle({ type: 'reset', sessionId: 's1', streamGeneration: 2, geometryRevision: 1 });
+  assert.equal(b.encoders[1].config.framerate, 30);
+  // VP8 only: the profile rate is still tried first.
+  const c = browser({ codecs: ['vp8'] }); await c.core.handle({ ...startMessage('balanced'), codecs: ['h264', 'vp8'] }); await tick();
+  assert.deepEqual([c.encoders[0].config.codec, c.encoders[0].config.framerate], ['vp8', 60]);
+});
+
 test('core: a variable-bitrate-only encoder gets the profile bitrate (legacy 2.5 Mbps unchanged)', async () => {
   for (const [quality, bitrate] of [['smooth', 1_200_000], ['balanced', 2_500_000], ['sharp', 3_200_000], [undefined, 2_500_000]]) {
     const b = browser({ supported: ['variable'] }); await b.core.handle(startMessage(quality)); await tick();
@@ -87,10 +135,11 @@ test('core: a variable-bitrate-only encoder gets the profile bitrate (legacy 2.5
 test('core: out-of-range profile values from main are clamped, never trusted as-is', async () => {
   const b = browser();
   await b.core.handle(startMessage('sharp', { fps: 120, profile: { qpBase: -5, qpMax: 99, bitrate: 1e12 } })); await tick();
-  assert.equal(b.requests[0].video.frameRate.max, 15);
-  assert.equal(b.encoders[0].config.framerate, 15);
+  assert.equal(b.requests[0].video.frameRate.max, 60, 'never above the renderer ceiling');
+  // 2880×1800 at 60 needs level 5.2, which this encoder lacks: it runs at the next lower rate.
+  assert.equal(b.encoders[0].config.framerate, 30);
   const session = b.core.sessions.get('s1');
-  assert.deepEqual([session.profile.qpBase, session.profile.qpMax, session.profile.bitrate, session.interval], [10, 51, 4_000_000, 1000 / 15]);
+  assert.deepEqual([session.profile.qpBase, session.profile.qpMax, session.profile.bitrate, session.interval], [10, 51, 4_000_000, 1000 / 30]);
   const c = browser(); await c.core.handle(startMessage('sharp', { profile: { qpBase: 40, qpMax: 20 } })); await tick();
   assert.deepEqual([c.core.sessions.get('s1').profile.qpBase, c.core.sessions.get('s1').profile.qpMax], [40, 40], 'ceiling never below base');
 });

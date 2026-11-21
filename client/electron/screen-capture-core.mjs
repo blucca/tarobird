@@ -23,12 +23,19 @@ export const PACE_BYTES_PER_MS = 425, PACE_BURST_BYTES = 768 * 1024;
 /** Latest send age for a packet: the Host refuses frames older than 2 s on arrival. */
 export const OUTPUT_MAX_AGE_MS = 1800;
 /** Legacy (balanced) encoder settings, used when main sends no profile. */
-const QP_BASE = 28, QP_MAX = 40, BITRATE = 2_500_000, FPS_MAX = 15;
+const QP_BASE = 28, QP_MAX = 40, BITRATE = 2_500_000;
+/** The most this renderer will capture and encode per second, and the rate
+ * used when main names none (the pre-quality behaviour). */
+export const FPS_MAX = 60, FPS_LEGACY = 15;
+/** A frame may be encoded this fraction of an interval before its slot: the
+ * source's own jitter around the same nominal rate must not hold every frame
+ * for a timer. The slots still advance by exactly one interval each. */
+const EARLY_FRACTION = 0.25;
 const bounded = (value, min, max, fallback) => Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
 /** Main's quality profile, clamped to what this renderer will ever encode. */
 function encoderProfile(fps, profile) {
   const qpBase = Math.round(bounded(profile?.qpBase, 10, 51, QP_BASE));
-  return { fps: bounded(fps, 1, FPS_MAX, FPS_MAX), qpBase, qpMax: Math.round(bounded(profile?.qpMax, qpBase, 51, Math.max(qpBase, QP_MAX))),
+  return { fps: bounded(fps, 1, FPS_MAX, FPS_LEGACY), qpBase, qpMax: Math.round(bounded(profile?.qpMax, qpBase, 51, Math.max(qpBase, QP_MAX))),
     bitrate: Math.round(bounded(profile?.bitrate, 250_000, 4_000_000, BITRATE)), h264Only: profile?.h264Only === true };
 }
 
@@ -82,7 +89,7 @@ export function createCaptureCore(env) {
     if (sessions.has(sessionId)) throw new Error('screen_capture_duplicate');
     const settings = encoderProfile(fps, profile);
     const session = { sessionId, codecs, encode, profile: settings, interval: 1000 / settings.fps, sequence: 0, outstanding: new Map(), pendingOutput: [],
-      geometryRevision, streamGeneration: 0, paused: false, needKey: true, qp: settings.qpBase, crowded: 0, calm: 0, held: undefined, lastEncodedAt: -Infinity, epoch: 0,
+      geometryRevision, streamGeneration: 0, paused: false, needKey: true, qp: settings.qpBase, crowded: 0, encoded: 0, calm: 0, held: undefined, dueAt: -Infinity, epoch: 0,
       // Session-wide, across generations: bytes sent count against the Hub budget whatever their chain.
       bucket: PACE_BURST_BYTES, bucketAt: perf(), lastKeyBytes: 0, lastDeltaBytes: 0, starved: 0, outbox: [], outputTimer: undefined };
     sessions.set(sessionId, session);
@@ -107,17 +114,24 @@ export function createCaptureCore(env) {
   }
 
   async function config(session) {
-    const { width, height } = session.encode, { fps, bitrate } = session.profile;
-    const candidates = [], h264 = screenH264Codec(width, height);
-    // The level follows the encoded size: 4.0 (the legacy string) whenever it fits.
-    if (session.codecs.includes('h264') && h264) candidates.push({ codec: 'h264', codecString: h264, config: { codec: h264, avc: { format: 'annexb' }, hardwareAcceleration: 'prefer-hardware' } });
+    const { width, height } = session.encode, { bitrate } = session.profile;
+    // The profile's rate first; an encoder that cannot take it at this size
+    // gets the next lower standard rate instead of no picture at all. Codec
+    // preference stays outermost: H.264 at a lower rate before VP8 at any.
+    const rates = [session.profile.fps, 30, FPS_LEGACY].filter((rate, index, all) => rate <= session.profile.fps && all.indexOf(rate) === index);
+    const candidates = [];
+    for (const fps of rates) {
+      // The level follows the encoded size and rate: 4.0 (the legacy string) whenever both fit.
+      const h264 = screenH264Codec(width, height, fps);
+      if (session.codecs.includes('h264') && h264) candidates.push({ codec: 'h264', codecString: h264, fps, config: { codec: h264, avc: { format: 'annexb' }, hardwareAcceleration: 'prefer-hardware' } });
+    }
     // A size only H.264 can carry is never silently re-encoded as something else.
-    if (session.codecs.includes('vp8') && !session.profile.h264Only) candidates.push({ codec: 'vp8', codecString: 'vp8', config: { codec: 'vp8' } });
+    if (session.codecs.includes('vp8') && !session.profile.h264Only) for (const fps of rates) candidates.push({ codec: 'vp8', codecString: 'vp8', fps, config: { codec: 'vp8' } });
     for (const candidate of candidates) {
       // Quantizer mode: VideoToolbox's bitrate modes held output for seconds at
       // low targets in the prototype; per-frame QP adapts without reconfiguring.
       for (const bitrateMode of ['quantizer', 'variable']) {
-        const full = { ...candidate.config, width, height, framerate: fps, latencyMode: 'realtime', bitrateMode, ...(bitrateMode === 'variable' ? { bitrate } : {}) };
+        const full = { ...candidate.config, width, height, framerate: candidate.fps, latencyMode: 'realtime', bitrateMode, ...(bitrateMode === 'variable' ? { bitrate } : {}) };
         try { if ((await VideoEncoder.isConfigSupported(full)).supported) return { ...candidate, config: full }; } catch { /* next */ }
       }
     }
@@ -145,6 +159,8 @@ export function createCaptureCore(env) {
     // A stop, pause or newer reset that ran while we awaited wins.
     if (!live(session, epoch) || session.paused) return;
     session.chosen = chosen;
+    // The rate the encoder accepted is the rate of the whole session.
+    if (chosen.fps !== session.profile.fps) { session.profile = { ...session.profile, fps: chosen.fps }; session.interval = 1000 / chosen.fps; }
     const encoder = new VideoEncoder({
       output: chunk => output(session, epoch, streamGeneration, chunk),
       error: error => { if (session.encoder === encoder) fail(session, 'screen_capture_failed', error); },
@@ -192,12 +208,18 @@ export function createCaptureCore(env) {
     const expect = key => key ? session.lastKeyBytes : session.lastDeltaBytes;
     const committed = session.outbox.reduce((n, entry) => n + entry.bytes.byteLength, 0) + session.pendingOutput.reduce((n, entry) => n + expect(entry.key), 0);
     const need = Math.min(PACE_BURST_BYTES, committed + Math.min(PACE_BURST_BYTES / 2, expect(session.needKey)));
-    const wait = Math.max(session.lastEncodedAt + session.interval - perf(), session.bucket < need ? (need - session.bucket) / PACE_BYTES_PER_MS : 0);
+    // Cadence follows a schedule of slots one interval apart, not the time of
+    // the previous encode: a late timer or a late frame delays that one frame
+    // only, instead of pushing every later frame back by the same amount.
+    const at = perf(), early = session.dueAt - at;
+    const wait = Math.max(early > session.interval * EARLY_FRACTION ? early : 0, session.bucket < need ? (need - session.bucket) / PACE_BYTES_PER_MS : 0);
     if (session.bucket < need) session.starved++;
     if (wait > 1) { timers.clearTimeout(session.pacing); session.pacing = timers.setTimeout(() => pump(session), wait); return; }
     const { frame, captureMs } = session.held; session.held = undefined;
     const sequence = ++session.sequence, key = session.needKey;
-    session.needKey = false; session.lastEncodedAt = perf();
+    // More than one interval behind (idle, slow viewer, byte wait): the schedule
+    // restarts here, so lost time is never made up with a burst.
+    session.needKey = false; session.dueAt = (at - session.dueAt > session.interval ? at : session.dueAt) + session.interval; session.encoded++;
     session.outstanding.set(sequence, { captureMs });
     session.pendingOutput.push({ sequence, captureMs, timestamp: frame.timestamp, key, generation: session.streamGeneration, geometryRevision: session.geometryRevision });
     let source = frame;
@@ -285,14 +307,18 @@ export function createCaptureCore(env) {
   }
   /** Once a second: credit starvation (slow viewer) or byte starvation (busy
    * picture) coarsens the quantizer up to the profile ceiling; three calm
-   * seconds with a comfortable byte budget refine it back towards the base. */
+   * seconds with a comfortable byte budget refine it back towards the base.
+   * Above the legacy rate, frames a viewer could not take only count as
+   * crowding once fewer got through than the legacy rate delivered: a viewer
+   * that follows at 20 of 30 frames a second keeps its picture quality. */
   function adapt(session) {
-    const { qpBase, qpMax } = session.profile;
+    const { qpBase, qpMax, fps } = session.profile;
     refill(session);
-    if (session.crowded > 2 || session.starved > 0) { session.qp = Math.min(qpMax, session.qp + 3); session.calm = 0; }
+    const crowded = session.crowded > 2 && (fps <= FPS_LEGACY || session.encoded < FPS_LEGACY - 2);
+    if (crowded || session.starved > 0) { session.qp = Math.min(qpMax, session.qp + 3); session.calm = 0; }
     else if (session.bucket < PACE_BURST_BYTES / 4) session.calm = 0;
     else if (++session.calm >= 3) session.qp = Math.max(qpBase, session.qp - 1);
-    session.crowded = 0; session.starved = 0;
+    session.crowded = 0; session.starved = 0; session.encoded = 0;
   }
   function close(session) {
     sessions.delete(session.sessionId);

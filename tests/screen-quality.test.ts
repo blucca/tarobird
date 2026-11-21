@@ -229,7 +229,7 @@ it("end to end: the requested quality reaches the real capture profile and is co
   const f = await fixture();
   const sharp = await f.view("sharp");
   expect(sharp.join.quality).toBe("sharp");
-  expect(f.capture.starts[0]).toMatchObject({ sessionId: sharp.join.session.id, encode: { width: 2880, height: 1800 }, fps: 15, profile: { qpBase: 28, qpMax: 40, h264Only: true } });
+  expect(f.capture.starts[0]).toMatchObject({ sessionId: sharp.join.session.id, encode: { width: 2880, height: 1800 }, fps: 30, profile: { qpBase: 28, qpMax: 40, h264Only: true } });
   // Switching = disconnect, then a new open: new session, generation and stream.
   sharp.control.send({ type: "disconnect", sessionId: sharp.join.session.id, generation: sharp.join.session.generation });
   await wait(() => f.capture.stops.includes(sharp.join.session.id) && f.service.status().sessions.length === 0);

@@ -19,7 +19,8 @@ const STOPS = new Set(['screen_local_takeover', 'screen_capture_failed', 'screen
 const stopReason = reason => STOPS.has(reason) ? reason : reason === 'screen_frame_stale' ? 'screen_capture_stale' : reason === 'screen_input_denied' ? 'screen_input_failed' : 'screen_service_stopped';
 const attachedSchema = z.object({ type: z.literal('attached'), sessionId: z.string().regex(ID) }).strict();
 const CONTROL_BACKLOG = 16 * 1024;
-const MEDIA_BACKLOG = 2 * 1024 * 1024, LEDGER = 64, TAKEOVER_POINTS = 12, CLOCK_JUMP_MS = 1000;
+// LEDGER: sent frames remembered for their receipts; 256 covers four seconds at 60 fps (frames are fresh for two).
+const MEDIA_BACKLOG = 2 * 1024 * 1024, LEDGER = 256, TAKEOVER_POINTS = 12, CLOCK_JUMP_MS = 1000;
 const captureState = status => status === 'granted' ? 'granted' : status === 'not-determined' ? 'not-determined' : ['denied', 'restricted'].includes(status) ? 'denied' : 'unavailable';
 /** Service readiness errors (`status().error`) are bounded `[a-z_]` codes; the
  * ticket step reports screen-host-control's codes, a Host refusal before

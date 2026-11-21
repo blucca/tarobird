@@ -30,7 +30,7 @@ function browser({ configGate } = {}) {
   }
   const core = createCaptureCore({ send: m => sent.push(m), getDisplayMedia: async () => ({ getVideoTracks: () => [track], getTracks: () => [track] }),
     VideoEncoder: Encoder, VideoFrame: class { constructor() { this.close = () => {}; } }, OffscreenCanvas: class { getContext() { return { drawImage() {} }; } },
-    MediaStreamTrackProcessor: Processor, writeScreenFrame, now: () => clock, perf: () => perf,
+    MediaStreamTrackProcessor: Processor, writeScreenFrame, now: () => Math.round(clock), perf: () => perf,
     timers: { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeout() {}, setInterval: () => 0, clearInterval() {} } });
   return { core, sent, encoders, frames, track, frame, push: value => { const p = pushFrame; pushFrame = undefined; p?.(value); },
     advance: ms => { perf += ms; clock += ms; }, timers };
@@ -253,6 +253,80 @@ test('core: a synchronous encode failure ends the whole session instead of escap
   assert.equal(b.core.sessions.size, 0);
   assert.equal(b.sent.at(-1).type, 'ended'); assert.equal(b.sent.at(-1).reason, 'screen_capture_failed');
   assert.equal(b.track.stopped, true);
+});
+
+/** Drives the fake clock and fires the pacing timers that fall due (the fake
+ * clearTimeout is a no-op; a stale timer only re-runs an idempotent pump). */
+function scheduler(b) {
+  let at = 0;
+  const stamp = () => { for (const timer of b.timers) if (timer.at === undefined) timer.at = at + timer.ms; };
+  const to = target => {
+    for (;;) {
+      stamp();
+      const next = b.timers.filter(timer => !timer.fired && timer.at <= target).sort((x, y) => x.at - y.at)[0];
+      if (!next) break;
+      if (next.at > at) { b.advance(next.at - at); at = next.at; }
+      next.fired = true; next.fn();
+    }
+    if (target > at) { b.advance(target - at); at = target; }
+    stamp();
+  };
+  /** Delivers one source frame at `time`, then answers every encode (output + viewer ACK). */
+  const deliver = async time => {
+    to(time); b.push(b.frame()); await tick();
+    const encoder = b.encoders[0];
+    while ((encoder.emitted ?? 0) < encoder.encodes.length) encoder.emit((encoder.emitted ?? 0) === 0 ? 'key' : 'delta');
+    const session = b.core.sessions.get('s1');
+    assert.ok(session, `session ended at ${time}: ${JSON.stringify(b.sent.filter(m => m.type === 'ended'))}`);
+    await b.core.handle({ type: 'credit', sessionId: 's1', frameSequence: session.sequence, streamGeneration: 1 });
+  };
+  return { to, deliver, encodes: () => b.encoders[0].encodes.length };
+}
+
+test('cadence: the named rate is used up to 60, an unnamed rate is the legacy 15 and nothing runs above 60', async () => {
+  for (const [fps, effective] of [[60, 60], [30, 30], [undefined, 15], [240, 60], [15, 15]]) {
+    const b = browser(); await start(b, { fps }); await tick();
+    assert.equal(b.core.sessions.get('s1').interval, 1000 / effective, `fps ${fps}`);
+    assert.equal(b.encoders[0].config.framerate, effective);
+  }
+});
+
+test('cadence: a source with jitter around 30 fps is encoded at 30, not held for a timer on every early frame', async () => {
+  const b = browser(); await start(b, { fps: 30 }); await tick();
+  const run = scheduler(b), interval = 1000 / 30;
+  // One second of frames, alternately 3 ms early and 3 ms late against the nominal grid.
+  for (let i = 0; i <= 30; i++) await run.deliver(Math.max(0, i * interval + (i % 2 ? -3 : 3)));
+  assert.equal(run.encodes(), 31, 'every frame of the 31 grid points within one second is encoded');
+  assert.equal(b.timers.length, 0, 'frames inside the tolerance are encoded on arrival, with no pacing timer at all');
+  assert.equal(b.frames.filter(frame => !frame.closed).length, 0, 'no source frame is left open');
+});
+
+test('cadence: a late pacing timer delays that frame only; the schedule does not slide', async () => {
+  const b = browser(); await start(b, { fps: 30 }); await tick();
+  const run = scheduler(b), interval = 1000 / 30;
+  await run.deliver(0);                                   // slot 0; next slot at 33.3
+  run.to(20); b.push(b.frame()); await tick();            // 13 ms early: held for its slot
+  assert.equal(run.encodes(), 1);
+  b.advance(20); b.timers.at(-1).fn();                    // the timer fires 6.7 ms late, at 40
+  assert.equal(run.encodes(), 2);
+  b.encoders[0].emit('delta'); await b.core.handle({ type: 'credit', sessionId: 's1', frameSequence: 2, streamGeneration: 1 });
+  // The following slot is still 66.7, not 40 + 33.3: a frame at 62 is inside the tolerance.
+  b.advance(22); b.push(b.frame()); await tick();
+  assert.equal(run.encodes(), 3, 'the late timer is not carried into the next frame');
+  assert.ok(Math.abs(b.core.sessions.get('s1').dueAt - 3 * interval) < 1e-6);
+});
+
+test('cadence: a source faster than the profile never exceeds it, and idle time is not made up with a burst', async () => {
+  const b = browser(); await start(b, { fps: 30 }); await tick();
+  const run = scheduler(b);
+  for (let time = 0; time <= 1000; time += 1000 / 120) await run.deliver(time);   // 120 fps source for one second
+  assert.ok(run.encodes() >= 30 && run.encodes() <= 31, `encoded ${run.encodes()} of 121 offered`);
+  const before = run.encodes();
+  // Two idle seconds, then three frames 5 ms apart: one goes at once, the others wait for their slots.
+  await run.deliver(3000); await run.deliver(3005); await run.deliver(3010);
+  assert.equal(run.encodes(), before + 1, 'no burst after idle');
+  await run.deliver(3000 + 1000 / 30);
+  assert.equal(run.encodes(), before + 2);
 });
 
 test('core: a raw frame that waited too long for a credit is dropped, never encoded stale', async () => {
