@@ -45,9 +45,11 @@ jobs:
         if: ${{ !cancelled() }}
         shell: powershell
         run: |
-          $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File client/scripts/acceptance-probe/aumid-start-apps-probe.ps1 -PollSeconds 30 -NsisFixture "$env:RUNNER_TEMP\aumid-fixture.exe" 2>&1 | Out-String
-          Write-Output $out
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Start Menu AppID probe', '```', $out.Trim(), '```')
+          $ErrorActionPreference = 'Continue'  # keep the probe's stderr as evidence instead of stopping on it
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File client/scripts/acceptance-probe/aumid-start-apps-probe.ps1 -PollSeconds 30 -NsisFixture "$env:RUNNER_TEMP\aumid-fixture.exe" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\probe.log"
+          $code = $LASTEXITCODE
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Start Menu AppID probe', '```', (Get-Content -Raw "$env:RUNNER_TEMP\probe.log").Trim(), '```')
+          exit $code
       - uses: actions/setup-node@v4
         if: ${{ !cancelled() }}
         with:

@@ -43,20 +43,22 @@ public static class LinkProps {
   }
   // bstr: VT_BSTR exactly as the product (windows 0.62 PROPVARIANT::from(&str))
   // and the NSIS SetLnkAppUserModelId macro write it; otherwise VT_LPWSTR.
-  public static void Stamp(string path, string id, bool clsid, bool bstr) {
+  // Returns the HRESULTs; any success code (S_FALSE included) is accepted and the read-back decides.
+  public static string Stamp(string path, string id, bool clsid, bool bstr) {
     IPropertyStore store = Open(path, true);
     PROPVARIANT v = bstr ? new PROPVARIANT { vt = 8, p = SysAllocString(id) } : new PROPVARIANT { vt = 31, p = Marshal.StringToCoTaskMemUni(id) };
     PROPERTYKEY k = Key(5);
-    int hr = store.SetValue(ref k, ref v); PropVariantClear(ref v);
-    if (hr != 0) throw new Exception("SetValue(ID) 0x" + hr.ToString("X8"));
+    int hr = store.SetValue(ref k, ref v); PropVariantClear(ref v); string trace = "id=0x" + hr.ToString("X8");
+    if (hr < 0) throw new Exception("SetValue(ID) 0x" + hr.ToString("X8"));
     if (clsid) {
       IntPtr g = Marshal.AllocCoTaskMem(16); Marshal.StructureToPtr(new Guid("5e8c5c51-d485-4c46-b76a-02547bcd6776"), g, false);
       PROPVARIANT c = new PROPVARIANT { vt = 72, p = g }; PROPERTYKEY kc = Key(26);
-      hr = store.SetValue(ref kc, ref c); PropVariantClear(ref c);
-      if (hr != 0) throw new Exception("SetValue(CLSID) 0x" + hr.ToString("X8"));
+      hr = store.SetValue(ref kc, ref c); PropVariantClear(ref c); trace += " clsid=0x" + hr.ToString("X8");
+      if (hr < 0) throw new Exception("SetValue(CLSID) 0x" + hr.ToString("X8"));
     }
-    hr = store.Commit(); Marshal.ReleaseComObject(store);
-    if (hr != 0) throw new Exception("Commit 0x" + hr.ToString("X8"));
+    hr = store.Commit(); Marshal.ReleaseComObject(store); trace += " commit=0x" + hr.ToString("X8");
+    if (hr < 0) throw new Exception("Commit 0x" + hr.ToString("X8"));
+    return trace;
   }
   public static string Read(string path) {
     IPropertyStore store = Open(path, false);
@@ -98,9 +100,9 @@ foreach ($c in $cases) {
   Copy-Item -LiteralPath "$env:SystemRoot\System32\whoami.exe" -Destination $exe -Force
   $lnk = Join-Path $programs "$($c.name).lnk"
   $s = $wsh.CreateShortcut($lnk); $s.TargetPath = $exe; $s.Save()
-  if ($c.id) { [LinkProps]::Stamp($lnk, $c.id, $c.clsid, $c.bstr) }
+  $hr = if ($c.id) { [LinkProps]::Stamp($lnk, $c.id, $c.clsid, $c.bstr) } else { '' }
   $c.lnk = $lnk; $c.exe = $exe
-  Out-Line 'shortcut' ([ordered]@{ case = $c.key; lnk = $lnk; readBack = [LinkProps]::Read($lnk); target = $wsh.CreateShortcut($lnk).TargetPath })
+  Out-Line 'shortcut' ([ordered]@{ case = $c.key; hr = $hr; lnk = $lnk; readBack = [LinkProps]::Read($lnk); target = $wsh.CreateShortcut($lnk).TargetPath })
 }
 
 $seen = @{}; $done = @{}
@@ -144,8 +146,8 @@ $m = @{ name = 'TaroBird AUMID Probe Modified'; id = 'com.tarobot.aumidprobe.mod
 $mExe = Join-Path $work 'modified.exe'; Copy-Item -LiteralPath "$env:SystemRoot\System32\whoami.exe" -Destination $mExe -Force
 $mLnk = Join-Path $programs "$($m.name).lnk"; $s = $wsh.CreateShortcut($mLnk); $s.TargetPath = $mExe; $s.Save()
 [void](Wait-Listed $m.name '' 60)
-[LinkProps]::Stamp($mLnk, $m.id, $true, $true)
-Out-Line 'seq-stamped' ([ordered]@{ name = $m.name; readBack = [LinkProps]::Read($mLnk) })
+$hr = [LinkProps]::Stamp($mLnk, $m.id, $true, $true)
+Out-Line 'seq-stamped' ([ordered]@{ name = $m.name; hr = $hr; readBack = [LinkProps]::Read($mLnk) })
 if (-not (Wait-Listed $m.name $m.id 90)) {
   [LinkProps]::SHChangeNotify(0x00002000, 0x0005, [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($mLnk), [IntPtr]::Zero)  # SHCNE_UPDATEITEM, SHCNF_PATHW
   Out-Line 'seq-refresh' 'SHChangeNotify(SHCNE_UPDATEITEM) on the link'
@@ -157,8 +159,8 @@ if ($NsisFixture -and (Test-Path -LiteralPath $NsisFixture)) {
   $p = Start-Process -FilePath $NsisFixture -Wait -PassThru
   Out-Line 'nsis-fixture' ([ordered]@{ exit = $p.ExitCode; exists = (Test-Path -LiteralPath $nLnk); readBack = $(if (Test-Path -LiteralPath $nLnk) { [LinkProps]::Read($nLnk) } else { '' }) })
   [void](Wait-Listed $nName 'com.tarobot.aumidprobe.nsis' 60)
-  [LinkProps]::Stamp($nLnk, 'com.tarobot.aumidprobe.nsis', $true, $true)
-  Out-Line 'nsis-restamped' ([ordered]@{ readBack = [LinkProps]::Read($nLnk) })
+  $hr = [LinkProps]::Stamp($nLnk, 'com.tarobot.aumidprobe.nsis', $true, $true)
+  Out-Line 'nsis-restamped' ([ordered]@{ hr = $hr; readBack = [LinkProps]::Read($nLnk) })
   [void](Wait-Listed $nName 'com.tarobot.aumidprobe.nsis' 20)
 } else { Out-Line 'nsis-fixture' "not available: $NsisFixture" }
 
