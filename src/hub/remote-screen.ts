@@ -318,7 +318,13 @@ export class HubRemoteScreen {
         return;
       }
     }
-    if (!live.visible || !this.fresh(live, input.frameSequence)) { this.release(live, "screen_frame_stale"); throw new HubError("screen_frame_stale", 409); }
+    if (!live.visible || !this.fresh(live, input.frameSequence)) {
+      this.release(live, "screen_frame_stale");
+      // A control request holds no lease yet, so release() says nothing. Say why
+      // it was refused, as below, or the viewer waits for a lease that never comes.
+      if (input.type === "control") { live.value.reason = "screen_frame_stale"; this.notify(live); }
+      throw new HubError("screen_frame_stale", 409);
+    }
     if (!live.value.controlAllowed || !this.desktop?.accessibility || this.desktop.locked) {
       const reason = !live.value.controlAllowed ? "screen_control_not_authorized" : this.desktop?.locked ? "screen_locked" : "screen_accessibility_denied";
       this.release(live, reason);

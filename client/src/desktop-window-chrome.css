@@ -37,6 +37,11 @@
    so its close button and text work while the remaining title bar still drags.
    A modal makes the notice inert; it must not cut into that modal's handles. */
 :root[data-desktop-engine="electron"]:not(:has(dialog:modal)) .host-error { -webkit-app-region: no-drag; app-region: no-drag; }
+/* The expanded or full-screen remote screen covers the conversation header,
+   a title-bar handle, without being its child. Exclude the visible viewer so
+   Start control and the rest of its toolbar take clicks instead of starting a
+   window drag. Side by side it covers no handle and changes nothing. */
+:root[data-desktop-engine="electron"]:not(:has(dialog:modal)) :is(.remote-screen-panel.screen-wide, .remote-screen-panel.screen-fullscreen):not([hidden]) { -webkit-app-region: no-drag; app-region: no-drag; }
 
 /* Electron native hit regions do not follow HTML modal stacking. A modal
    without window handles (settings, creation, reports, expanded widgets,

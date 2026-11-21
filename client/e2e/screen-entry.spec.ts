@@ -63,6 +63,35 @@ test("the workspace menu offers Screen control right after Connection status and
  expect(await page.evaluate(()=>(window as any).screenEntryFixture.calls.filter((v:string)=>/^(open|configure):/.test(v)))).toEqual([]);
 });
 
+test("on a Mac every viewer control takes clicks, also where the expanded viewer covers the title-bar handle",async({page},info)=>{
+ await page.goto(server.resolvedUrls!.local[0]+"e2e/fixtures/screen-entry.html?chrome");
+ await page.waitForFunction(()=>!!(window as any).screenEntryFixture);await page.evaluate(()=>{(window as any).screenEntryFixture.statuses.a.permission="control";});
+ // The real Mac window chrome marks the conversation header as a native drag handle.
+ await expect(page.locator(".conversation-header[data-tauri-drag-region]")).toHaveCount(1);
+ await entry(page).click();const p=panel(page);await expect(p.getByRole("button",{name:"开始控制",exact:true})).toBeVisible();
+ // Electron builds native hit regions from computed app-region in document
+ // order (drag adds, no-drag subtracts), whatever the z-index. A control whose
+ // centre ends inside a drag region starts a window drag instead of a click.
+ const swallowed=()=>page.evaluate(()=>{
+  const regions=[...document.querySelectorAll("*")].flatMap(node=>{const value=getComputedStyle(node).getPropertyValue("app-region"),r=node.getBoundingClientRect();return (value==="drag"||value==="no-drag")&&r.width>0&&r.height>0?[{drag:value==="drag",r}]:[];});
+  const panel=document.querySelector(".remote-screen-panel")!;
+  return [...panel.querySelectorAll<HTMLElement>("button,select")].filter(node=>node.getBoundingClientRect().width>0).filter(node=>{
+   const b=node.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2;let drag=false;
+   for(const {drag:value,r} of regions)if(x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom)drag=value;return drag;
+  }).map(node=>node.getAttribute("aria-label")??node.textContent?.trim());
+ });
+ expect(await swallowed()).toEqual([]);
+ await p.getByRole("button",{name:"展开屏幕",exact:true}).click();await expect(p).toHaveClass(/screen-wide/);
+ // The expanded viewer's toolbar lies over the conversation header.
+ const header=await page.locator(".conversation-header").boundingBox(),start=await p.getByRole("button",{name:"开始控制",exact:true}).boundingBox();
+ expect(start!.y+start!.height/2).toBeLessThan(header!.y+header!.height);
+ expect(await swallowed()).toEqual([]);
+ await page.screenshot({path:info.outputPath("expanded-viewer-over-title-handle.png")});
+ // Side by side again: the header handle still drags where nothing covers it.
+ await p.getByRole("button",{name:"返回并排",exact:true}).click();
+ expect(await page.locator(".conversation-header").evaluate(node=>getComputedStyle(node).getPropertyValue("app-region"))).toBe("drag");
+});
+
 test("phone and non-Electron headers do not offer an unsupported viewer",async({page})=>{
  await page.goto(server.resolvedUrls!.local[0]+"e2e/fixtures/screen-entry.html?web");
  await expect(page.locator(".conversation-header")).toBeVisible();await expect(entry(page)).toHaveCount(0);

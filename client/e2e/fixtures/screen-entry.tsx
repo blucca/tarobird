@@ -9,6 +9,7 @@ import { HubConnection } from "../../src/connection.js";
 import { ClientCache } from "../../src/storage.js";
 import { applyAppearance } from "../../src/appearance.js";
 import type { ScreenStatus } from "../../../src/client-protocol/remote-screen.js";
+import { installDesktopWindowChrome } from "../../src/desktop-window-chrome.js";
 
 // Real Workspace and cache. Only Host responses/native IPC are replaced.
 // No capture, protected operation, native input or real device grants.
@@ -40,7 +41,10 @@ async function main() {
     connection.screenConfigure = async()=>{calls.push(`configure:${key}`);throw Error("unexpected_grant");};
     return connection;
   }));
-  function Fixture() { const [index,setIndex] = useState(0); return <><button style={{position:"fixed",bottom:0,left:0,zIndex:999}} onClick={()=>setIndex(i=>1-i)}>Switch fixture host</button><Workspace key={index} connection={connections[index]} forget={async()=>{}}/></>; }
+  // ?chrome: the macOS window chrome of the real desktop shell (main.tsx), whose title rows are native drag handles.
+  const chrome = params.has("chrome");
+  if (chrome) { await import("../../src/desktop-window-chrome.css"); installDesktopWindowChrome(); }
+  function Fixture() { const [index,setIndex] = useState(0); const workspace = <Workspace key={index} connection={connections[index]} forget={async()=>{}}/>; return <><button style={{position:"fixed",bottom:0,left:0,zIndex:999}} onClick={()=>setIndex(i=>1-i)}>Switch fixture host</button>{chrome ? <div className="host-workspace">{workspace}</div> : workspace}</>; }
   Object.assign(window,{screenEntryFixture:{calls,statuses,connections}});
   createRoot(document.getElementById("root")!).render(<Fixture/>);
 }

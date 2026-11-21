@@ -354,3 +354,24 @@ it.each([1, 16])("retains the control budget for movement spaced %i ms apart", a
     expect((await screen.status(remote.session)).sessions[0]?.state).toBe("controlling");
   }
 });
+
+it("a control request refused for a picture past its freshness tells the viewer, so it never waits for a lease", async () => {
+  await configure(); const { epoch, sink } = service(); const { join: j, control: out } = await join();
+  liveFrame(epoch, j, 1);
+  expect(out.messages.at(-1)).toMatchObject({ type: "frame-ready", frameSequence: 1 });
+  // The viewer still shows frame 1 (its own window is 1.5 s from arrival), but
+  // the Hub measures 2 s from capture: a slow round trip lands between them.
+  clock += 2100;
+  const before = out.messages.length;
+  expect(() => screen.viewerCommand(j.session.id, { type: "control", sessionId: j.session.id, generation: j.session.generation, frameSequence: 1 })).toThrow("screen_frame_stale");
+  // Nothing was leased or reset, and the refusal reached the viewer with its reason.
+  expect(sink.messages.some(v => v.type === "reset" || v.type === "lease")).toBe(false);
+  expect(out.messages.slice(before)).toEqual([expect.objectContaining({ type: "state", controlPending: false, lease: undefined, session: expect.objectContaining({ state: "viewing", reason: "screen_frame_stale" }) })]);
+  // A fresh picture then lets the same viewer ask again and obtain control.
+  liveFrame(epoch, j, 2, 1, false);
+  screen.viewerCommand(j.session.id, { type: "control", sessionId: j.session.id, generation: j.session.generation, frameSequence: 2 });
+  expect(sink.messages.at(-1).type).toBe("reset");
+  liveFrame(epoch, j, 3, 2);
+  screen.serviceLeaseReady(epoch, j.session.id, sink.messages.findLast(v => v.type === "lease").leaseId);
+  expect(out.messages.findLast(v => v.type === "state")).toMatchObject({ session: { state: "controlling" }, lease: { id: expect.any(String) } });
+});
