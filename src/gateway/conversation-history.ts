@@ -115,6 +115,7 @@ export function gatewayConversationHistory(bridge: HistoryBridge, channel: Gatew
       if (sideBusy()) return { outcome: "rejected", reason: "background_work" };
       if (await channel.canSteerConversation?.(p.conversationId) !== true) return { outcome: "rejected", reason: "binding_pending" };
       const snapshot = historyInternalSnapshotSchema.parse(await bridge.getConversationHistory(scope));
+      if (snapshot.blocked === "busy") return { outcome: "rejected", reason: "busy" };
       if (command.anchorGeneration && (snapshot.bindingGeneration !== command.anchorGeneration || snapshot.sourceSessionId !== command.anchorSessionId)) return { outcome: "rejected", reason: "source_changed" };
       const permission = z.object({ allowed: z.boolean() }).strict().parse(await channel.transport.requestLive("history.authorize", { userId: command.userId, conversationId: command.conversationId, operationId: command.operationId, purpose: "apply" }));
       if (!permission.allowed) return unknown;

@@ -86,13 +86,16 @@ describe("conversation history native transaction", () => {
     const f = await setup(), entered = gate(), release = gate();
     f.adapter.getHistoryState.mockClear();
     const id = kind === "native" ? anchor.sessionId : bridgeConversationLockId(scope, await f.sessions.getLockNamespace());
+    const generation = (await f.store.inspectHistory(scope.conversationKey))!.record.historyGeneration;
     const held = withBridgeTurnLock(id, async () => { entered.resolve(); await release.promise; });
     try {
       await entered.promise;
       // What the session could do when last read, so the App shows the entry disabled
       // ("wait for the current reply") instead of hiding it; no revision, so nothing can be admitted.
+      // The binding lets the Hub still list this session's anchors, so message entries show disabled too.
       const busy = await f.controller.get(scope);
-      expect(busy).toEqual({ supported: true, blocked: "busy", capabilities: { rewind: true, fork: true, anchoredFork: true } });
+      expect(busy).toEqual({ supported: true, blocked: "busy", capabilities: { rewind: true, fork: true, anchoredFork: true },
+        sourceSessionId: anchor.sessionId, bindingGeneration: generation });
       expect(f.adapter.getHistoryState).not.toHaveBeenCalled();
     } finally { release.resolve(); await held; }
   });

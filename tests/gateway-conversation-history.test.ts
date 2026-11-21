@@ -57,6 +57,12 @@ it("rejects live queue work and stale anchor generation without invoking native"
   expect(await run("history.apply", { ...input, operationId: "other", anchorGeneration: "old", anchorSessionId: "source", nativeAnchor: { inputId: "anchor" } })).toEqual({ outcome: "rejected", reason: "source_changed" });
   expect(bridge.applyConversationHistory).not.toHaveBeenCalled();
 });
+it("rejects a busy answer that still names its session, before App tools or native", async () => {
+  // A reply in progress still names its binding so the Hub can list anchors; that is no admission.
+  bridge.getConversationHistory.mockImplementationOnce(async () => ({ supported: true, blocked: "busy", sourceSessionId: "source", bindingGeneration: "generation", capabilities: { rewind: true, fork: true, anchoredFork: true } }) as never);
+  expect(await run("history.apply", input)).toEqual({ outcome: "rejected", reason: "busy" });
+  expect(bridge.applyConversationHistory).not.toHaveBeenCalled();
+});
 it("reauthorizes receipt lookup and never reveals an old result after revocation", async () => {
   await run("history.apply", input); requestLive.mockResolvedValueOnce({ allowed: false });
   await expect(run("history.receipt", input)).rejects.toThrow("history_forbidden");

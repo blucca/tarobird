@@ -71,7 +71,11 @@ export class ConversationHistoryController {
     } catch (error) {
       if (error instanceof Error && error.message === "history_busy") {
         const capabilities = this.known.get(input.conversationKey);
-        return { supported: true, blocked: "busy", ...(capabilities ? { capabilities } : {}) };
+        // The binding is a store read, not a turn. With it the Hub still lists
+        // this session's anchors, so message entries show disabled as well.
+        const binding = await this.sessions.getHistoryBinding!(input).catch(() => null);
+        return { supported: true, blocked: "busy", ...(capabilities ? { capabilities } : {}),
+          ...(binding?.record.historyGeneration ? { sourceSessionId: binding.record.codexSessionId, bindingGeneration: binding.record.historyGeneration } : {}) };
       }
       throw error;
     }
