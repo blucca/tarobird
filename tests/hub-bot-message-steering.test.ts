@@ -520,6 +520,21 @@ describe("second code review (C1–C5)", () => {
   });
 });
 
+describe("M3: blank steer text", () => {
+  it("gets the queue path's own answer before any record or Gateway call", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const before = (await b.store.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM messages"))!.n;
+    await expect(send(chat.conversationId, "", {})).rejects.toThrow("empty_message");
+    await expect(send(chat.conversationId, "", { delivery: "steer" })).rejects.toThrow("empty_message");
+    expect((await b.store.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM messages"))!.n).toBe(before);
+    // Whitespace is accepted by the queue path, so it is queued, never steered.
+    const blank = await send(chat.conversationId, "   ", { delivery: "steer" });
+    expect(blank).toMatchObject({ status: "queued", delivery: { actual: "fell_back_to_queue", reason: "blank_text" } });
+    expect(await deliveries(blank.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
+    expect(fake.status).not.toHaveBeenCalled(); expect(fake.steer).not.toHaveBeenCalled();
+  });
+});
+
 describe("loop limits", () => {
   it("caps Bot steers per turn and per sender edge, then queues", async () => {
     const chat = await resolve(); await liveTurn(chat.conversationId);

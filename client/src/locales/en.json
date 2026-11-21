@@ -5566,5 +5566,6 @@
   "对方会话正忙于其他对话": "the recipient's session is busy with another chat",
   "对方会话已切换": "the recipient's session changed",
   "无法确认是否已并入；不会再次排队": "Can't confirm whether it was merged; it won't be queued again",
-  "正在确认是否已并入…": "Checking whether it was merged…"
+  "正在确认是否已并入…": "Checking whether it was merged…",
+  "空白内容不能引导": "blank text can't be steered"
 }

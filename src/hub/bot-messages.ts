@@ -13,7 +13,7 @@ import { exchangeBotMessage } from "./bot-message-transport.js";
 import { botMessageGrantsCommandSchema, crossHostMessageGrantsCommandSchema, messageHostIdSchema, type BotMessageGrantsSnapshot, type CrossHostMessageGrantsSnapshot } from "../client-protocol/bot-message-grants.js";
 import { botMessageCapabilitiesSchema, botMessageSendSchema, botMessageSteeringCommandSchema, botSteerRejectionReason, supportsBotMessageSteerEngine,
   type BotMessageDelivery, type BotMessageDeliveryReceipt, type BotMessageSteeringSnapshot, type BotSteerFallbackReason } from "../client-protocol/bot-message-delivery.js";
-import { botSteerStatusSchema, steerResultSchema, type SteerResult } from "../client-protocol/steering.js";
+import { botSteerCallSchema, botSteerStatusSchema, steerResultSchema, type SteerResult } from "../client-protocol/steering.js";
 import { hasPendingCardAction } from "../client-protocol/message-clear.js";
 import type { Message } from "../client-protocol/index.js";
 import { STEER_EDGE_LIMIT, STEER_EDGE_WINDOW_MS, STEER_TURN_LIMIT, offlineSteering, steerFallbackNotice, steeringDisabledKey, type BotMessageSteeringHooks, type IncomingMemo } from "./bot-message-steering.js";
@@ -660,8 +660,15 @@ export class BotMessages {
     }
     // An existing plain record replays through the ordinary queue path.
     if (c.delivery === "queue" || prior) return this.queueDelivery(c);
+    // The queue path's own rules first: empty text is its empty_message, before
+    // any record exists; blank text (which it accepts) is queued, never steered.
+    if (!c.input.text && !c.input.attachments.length) return this.queueDelivery(c);
+    if (!c.input.text.trim() && !c.input.attachments.length) return this.queueDelivery(c, "blank_text");
     const plan = await this.steerPlan(c);
     if ("reason" in plan) return this.queueDelivery(c, plan.reason);
+    const call = { conversationId: c.target.conversationId, userId: "owner", requestId: c.clientMsgId, targetId: plan.targetId, sourceMessageId: plan.turn, text: c.input.text, source: c.p.source };
+    // The exact Gateway call must be valid before a record is created for it.
+    if (!botSteerCallSchema.safeParse(call).success) throw new HubError("bot_message_invalid_request", 400);
     let created: { message: Message; created: boolean }, opened = false;
     try {
       created = await this.store.beginBotSteer("owner", { conversationId: c.target.conversationId, botId: c.bot.id, clientMsgId: c.clientMsgId, text: c.input.text, botSource: c.p.source, targetId: plan.targetId }, async () => {
@@ -686,7 +693,7 @@ export class BotMessages {
     let result: SteerResult, answered = true;
     this.steersInFlight.add(created.message.id);
     try {
-      try { result = steerResultSchema.parse(await this.steering.steer(c.bot.id, { conversationId: c.target.conversationId, userId: "owner", requestId: c.clientMsgId, targetId: plan.targetId, sourceMessageId: plan.turn, text: c.input.text, source: c.p.source })); }
+      try { result = steerResultSchema.parse(await this.steering.steer(c.bot.id, call)); }
       catch { result = { outcome: "unknown", reason: "uncertain" }; answered = false; }
       await this.settleSteer(c.p.source, c.bot.id, created.message.id, c.key, result, plan.turn, answered);
     } finally { this.steersInFlight.delete(created.message.id); }
