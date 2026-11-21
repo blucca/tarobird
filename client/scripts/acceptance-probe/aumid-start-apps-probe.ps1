@@ -31,6 +31,7 @@ public static class LinkProps {
   [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
   static extern int SHGetPropertyStoreFromParsingName(string path, IntPtr pbc, int flags, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
   [DllImport("ole32.dll")] static extern int PropVariantClear(ref PROPVARIANT v);
+  [DllImport("oleaut32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SysAllocString(string s);
   [DllImport("shell32.dll")] public static extern void SHChangeNotify(int eventId, uint flags, IntPtr a, IntPtr b);
   static readonly Guid AUM = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
   static PROPERTYKEY Key(uint pid) { return new PROPERTYKEY { fmtid = AUM, pid = pid }; }
@@ -40,9 +41,11 @@ public static class LinkProps {
     if (hr != 0) throw new Exception("SHGetPropertyStoreFromParsingName 0x" + hr.ToString("X8"));
     return store;
   }
-  public static void Stamp(string path, string id, bool clsid) {
+  // bstr: VT_BSTR exactly as the product (windows 0.62 PROPVARIANT::from(&str))
+  // and the NSIS SetLnkAppUserModelId macro write it; otherwise VT_LPWSTR.
+  public static void Stamp(string path, string id, bool clsid, bool bstr) {
     IPropertyStore store = Open(path, true);
-    PROPVARIANT v = new PROPVARIANT { vt = 31, p = Marshal.StringToCoTaskMemUni(id) };
+    PROPVARIANT v = bstr ? new PROPVARIANT { vt = 8, p = SysAllocString(id) } : new PROPVARIANT { vt = 31, p = Marshal.StringToCoTaskMemUni(id) };
     PROPERTYKEY k = Key(5);
     int hr = store.SetValue(ref k, ref v); PropVariantClear(ref v);
     if (hr != 0) throw new Exception("SetValue(ID) 0x" + hr.ToString("X8"));
@@ -58,7 +61,7 @@ public static class LinkProps {
   public static string Read(string path) {
     IPropertyStore store = Open(path, false);
     PROPERTYKEY k = Key(5), kc = Key(26); PROPVARIANT v, c; string id = "<none>", clsid = "<none>";
-    if (store.GetValue(ref k, out v) == 0) { if (v.vt == 31) id = Marshal.PtrToStringUni(v.p); else if (v.vt != 0) id = "<vt " + v.vt + ">"; PropVariantClear(ref v); }
+    if (store.GetValue(ref k, out v) == 0) { if (v.vt == 31 || v.vt == 8) id = "vt" + v.vt + ":" + Marshal.PtrToStringUni(v.p); else if (v.vt != 0) id = "<vt " + v.vt + ">"; PropVariantClear(ref v); }
     if (store.GetValue(ref kc, out c) == 0) { if (c.vt == 72) clsid = ((Guid)Marshal.PtrToStructure(c.p, typeof(Guid))).ToString(); else if (c.vt != 0) clsid = "<vt " + c.vt + ">"; PropVariantClear(ref c); }
     Marshal.ReleaseComObject(store);
     return id + " | " + clsid;
@@ -82,36 +85,40 @@ $work = Join-Path $env:LOCALAPPDATA 'TaroBirdAumidProbe'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $wsh = New-Object -ComObject WScript.Shell
 # name, AppID stamped (empty = none), stamp the toast CLSID too
+# bstr = the product's and NSIS's VT_BSTR; the LPWSTR cases are the controls.
 $cases = @(
-  @{ key = 'product-props'; name = 'TaroBird AUMID Probe'; id = 'com.tarobot.aumidprobe'; clsid = $true },
-  @{ key = 'id-only'; name = 'TaroBird AUMID Probe IdOnly'; id = 'com.tarobot.aumidprobe.idonly'; clsid = $false },
-  @{ key = 'no-id-control'; name = 'TaroBird AUMID Probe NoId'; id = ''; clsid = $false }
+  @{ key = 'bstr-id-clsid (product register)'; name = 'TaroBird AUMID Probe BstrProduct'; id = 'com.tarobot.aumidprobe.bstrproduct'; clsid = $true; bstr = $true },
+  @{ key = 'bstr-id (NSIS macro)'; name = 'TaroBird AUMID Probe BstrNsis'; id = 'com.tarobot.aumidprobe.bstrnsis'; clsid = $false; bstr = $true },
+  @{ key = 'lpwstr-id-clsid'; name = 'TaroBird AUMID Probe Lpwstr'; id = 'com.tarobot.aumidprobe.lpwstr'; clsid = $true; bstr = $false },
+  @{ key = 'lpwstr-id'; name = 'TaroBird AUMID Probe LpwstrIdOnly'; id = 'com.tarobot.aumidprobe.lpwstridonly'; clsid = $false; bstr = $false },
+  @{ key = 'no-id-control'; name = 'TaroBird AUMID Probe NoId'; id = ''; clsid = $false; bstr = $false }
 )
 foreach ($c in $cases) {
-  $exe = Join-Path $work "$($c.key).exe"
+  $exe = Join-Path $work "$(($c.key -replace '[^a-z]', '')).exe"
   Copy-Item -LiteralPath "$env:SystemRoot\System32\whoami.exe" -Destination $exe -Force
   $lnk = Join-Path $programs "$($c.name).lnk"
   $s = $wsh.CreateShortcut($lnk); $s.TargetPath = $exe; $s.Save()
-  if ($c.id) { [LinkProps]::Stamp($lnk, $c.id, $c.clsid) }
+  if ($c.id) { [LinkProps]::Stamp($lnk, $c.id, $c.clsid, $c.bstr) }
   $c.lnk = $lnk; $c.exe = $exe
   Out-Line 'shortcut' ([ordered]@{ case = $c.key; lnk = $lnk; readBack = [LinkProps]::Read($lnk); target = $wsh.CreateShortcut($lnk).TargetPath })
 }
 
-$seen = @{}
+$seen = @{}; $done = @{}
 $notified = $false
 $deadline = $started.AddSeconds($PollSeconds + 30)
 while ((Get-Date) -lt $deadline) {
   try { $apps = @(Get-StartApps) } catch { Out-Line 'poll-error' $_.Exception.Message; $apps = @() }
   foreach ($c in $cases) {
-    if ($seen.ContainsKey($c.key)) { continue }
+    if ($done.ContainsKey($c.key)) { continue }
     $hit = @($apps | Where-Object { $_.Name -eq $c.name })
     if ($hit.Count) {
-      $seen[$c.key] = $true
+      $ids = (@($hit | ForEach-Object { $_.AppID }) -join ' ; ')
       $exact = if ($c.id) { [bool]($hit | Where-Object { $_.AppID -eq $c.id }) } else { $null }
-      Out-Line 'listed' ([ordered]@{ case = $c.key; appIds = @($hit | ForEach-Object { $_.AppID }); exactIdMatch = $exact; totalApps = $apps.Count })
+      if ($seen[$c.key] -ne $ids) { $seen[$c.key] = $ids; Out-Line 'listed' ([ordered]@{ case = $c.key; appIds = $ids; exactIdMatch = $exact; totalApps = $apps.Count }) }
+      if (-not $c.id -or $exact) { $done[$c.key] = $true }
     }
   }
-  if ($seen.Count -eq $cases.Count) { break }
+  if ($done.Count -eq $cases.Count) { break }
   # Halfway with something still missing: ask the shell to refresh once, and record that.
   if (-not $notified -and ((Get-Date) - $started).TotalSeconds -gt ($PollSeconds / 2)) {
     [LinkProps]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)  # SHCNE_ASSOCCHANGED
@@ -119,6 +126,15 @@ while ((Get-Date) -lt $deadline) {
   }
   Start-Sleep -Seconds $IntervalSeconds
 }
+# Read-only: whether Windows associates each AppID with a notifier. Nothing is shown.
+try {
+  [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+  foreach ($c in $cases) {
+    if (-not $c.id) { continue }
+    $setting = try { [string][Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($c.id).Setting } catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; 'error 0x{0:X8}' -f $e.HResult }
+    Out-Line 'toast-setting' ([ordered]@{ case = $c.key; appId = $c.id; setting = $setting })
+  }
+} catch { Out-Line 'toast-setting-error' $_.Exception.Message }
 $apps = @(Get-StartApps)
-Out-Line 'summary' ([ordered]@{ listed = @($seen.Keys); notListed = @($cases | Where-Object { -not $seen.ContainsKey($_.key) } | ForEach-Object { $_.key }); totalApps = $apps.Count
+Out-Line 'summary' ([ordered]@{ exactOrControl = @($done.Keys); unresolved = @($cases | Where-Object { -not $done.ContainsKey($_.key) } | ForEach-Object { "$($_.key) => $($seen[$_.key])" }); totalApps = $apps.Count
   probeEntries = @($apps | Where-Object { $_.Name -like 'TaroBird AUMID Probe*' } | ForEach-Object { "$($_.Name) => $($_.AppID)" }); shell = (@('explorer', 'StartMenuExperienceHost') | ForEach-Object { "$_=$(@(Get-Process -Name $_ -ErrorAction SilentlyContinue).Count)" }) -join ' ' })
