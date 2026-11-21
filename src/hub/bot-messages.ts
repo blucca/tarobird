@@ -737,6 +737,9 @@ export class BotMessages {
       await close();
       return;
     }
+    // Like an owner steer: the joined (or possibly joined) run records this
+    // input, so a history rewind of that turn also marks an adopted Bot record.
+    await this.store.bindRunInput(turn, messageId);
     const outcome = (blocks: Block[]) => { const control = blocks.find(block => block.type === "steering"); return control ? `${control.outcome}:${control.reason ?? ""}` : "none"; };
     const before = outcome((await this.store.db.serial(() => this.store.queuedMessageInTransaction(messageId))).blocks);
     const settled = await this.store.settleBotSteer(messageId, botId, result.outcome === "accepted" ? { outcome: "accepted" } : { outcome: "unknown", reason: answered ? "gateway_uncertain" : "uncertain" });

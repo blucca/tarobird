@@ -479,7 +479,9 @@ describe("second code review (C1–C5)", () => {
     const results = await Promise.all([send(chat.conversationId, "Third", { delivery: "steer" }, requestId), send(chat.conversationId, "Third", { delivery: "steer" }, requestId)]);
     expect(new Set(results.map(result => result.messageId)).size).toBe(1);
     expect(results.map(result => result.duplicate).sort()).toEqual([false, true]);
-    for (const result of results) expect(result.delivery.actual).toBe("steered");
+    // The first is steered; the duplicate reports that same record, in flight or settled.
+    expect(results.find(result => !result.duplicate)!.delivery.actual).toBe("steered");
+    expect(["pending", "steered"]).toContain(results.find(result => result.duplicate)!.delivery.actual);
     expect(await deliveries(results[0]!.messageId)).toEqual([]);
   });
 
@@ -543,6 +545,20 @@ describe("M4: the owner's switch and the plan's Hub conditions hold in the creat
     });
     expect(await send(chat.conversationId, "Fix", { delivery: "steer" })).toMatchObject({ delivery: { actual: "fell_back_to_queue", reason: "unsupported_engine" } });
     expect(fake.steer).not.toHaveBeenCalled();
+  });
+});
+
+describe("R10: a merged Bot record follows its turn through a history rewind", () => {
+  it("binds an accepted steer to the run it joined, so a rewind of that turn marks it too", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    const merged = await send(chat.conversationId, "Merged fix", { delivery: "steer" });
+    fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    const unconfirmed = await send(chat.conversationId, "Unconfirmed fix", { delivery: "steer" });
+    expect((await b.store.runInputs(run.sourceMessageId)).inputs.map(input => input.id)).toEqual([merged.messageId, unconfirmed.messageId]);
+    await b.store.db.transaction(() => b.store.excludeHistoryMessagesInTransaction(chat.conversationId, [run.sourceMessageId], "op_rewind", "target"));
+    expect((await b.store.messageForUser("owner", merged.messageId)).historyContext?.excludedBy).toBe("op_rewind");
+    // Unknown membership is never inferred.
+    expect((await b.store.messageForUser("owner", unconfirmed.messageId)).historyContext).toBeUndefined();
   });
 });
 
