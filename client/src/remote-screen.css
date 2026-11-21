@@ -153,11 +153,11 @@ html[data-keyboard-open="true"] .screen-mobile.screen-landscape .screen-rail-gro
 .screen-mobile.screen-landscape .screen-mobile-keyboard .screen-text>button{min-width:60px}
 .screen-mobile.screen-landscape .screen-mobile-keyboard textarea{flex:1 1 auto;min-width:0;width:auto;height:44px;min-height:44px;box-sizing:border-box;margin:0;padding:0 8px;border:6px solid transparent;border-radius:12px;background:var(--bg) padding-box;box-shadow:inset 0 0 0 1px var(--border);font-size:16px;line-height:30px;white-space:pre;overflow:hidden;resize:none}
 .screen-mobile.screen-landscape .screen-mobile-keyboard small{display:none}
-/* With at least 700 pt beside the rail (panel content box ≥ 756) the eight
+/* With at least 640 pt beside the rail (panel content box ≥ 696) the eight
    keys sit whole and still, the drawn field takes the rest (≥ 160; its box adds the 6 pt
    transparent hit margins) and the
    combinations stay in More; narrower rows keep scrolling. */
-@container (min-width:756px){
+@container (min-width:696px){
  .screen-mobile.screen-landscape .screen-mobile-keys{flex:none;overflow:visible;padding-right:0;-webkit-mask-image:none;mask-image:none}
  .screen-mobile.screen-landscape .screen-mobile-keys>button:nth-child(n+9){display:none}
  .screen-mobile.screen-landscape .screen-mobile-keyboard .screen-text{flex:1 1 auto;min-width:0}

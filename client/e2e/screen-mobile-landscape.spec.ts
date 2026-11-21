@@ -107,13 +107,13 @@ for (const phone of phones) test(`landscape layout ${phone.name}`, async ({ brow
         return { rows: new Set(tops).size, keyInset: [drawn.top, drawn.bottom, drawn.borderRadius], field: getComputedStyle(tray.querySelector("textarea")!).fontSize, hint: getComputedStyle(tray.querySelector("small")!).display, send: tray.querySelector(".screen-text>button")!.getAttribute("aria-label") };
       });
       expect(row).toEqual({ rows: 1, keyInset: ["6px", "6px", "6px"], field: "16px", hint: "none", send: text("发送到远端") });
-      // ≥ 700 pt beside the rail: all eight keys whole and still, the field takes the rest.
+      // ≥ 640 pt beside the rail: all eight keys whole and still, the field takes the rest.
       // Narrower: the keys scroll. Enter is drawn as a return arrow but keeps its name.
       const keys = await page.locator(".screen-mobile-keyboard").evaluate(tray => {
         const panel = tray.closest<HTMLElement>(".remote-screen-panel")!, style = getComputedStyle(panel), available = panel.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) - 56;
         const strip = tray.querySelector<HTMLElement>(".screen-mobile-keys")!, s = strip.getBoundingClientRect(), buttons = [...strip.querySelectorAll("button")];
         const field = tray.querySelector("textarea")!.getBoundingClientRect(), send = tray.querySelector(".screen-text>button")!.getBoundingClientRect(), t = tray.getBoundingClientRect();
-        return { wide: available >= 700, whole: buttons.slice(0, 8).every(b => { const r = b.getBoundingClientRect(); return r.width >= 44 && r.left >= s.left - .5 && r.right <= s.right + .5; }),
+        return { wide: available >= 640, whole: buttons.slice(0, 8).every(b => { const r = b.getBoundingClientRect(); return r.width >= 44 && r.left >= s.left - .5 && r.right <= s.right + .5; }),
           scrolls: strip.scrollWidth > strip.clientWidth + .5, combos: buttons.slice(8).some(b => b.getBoundingClientRect().width > 0),
           field: field.width - 12 >= 159.5, fills: Math.abs(field.left - s.right) <= 8 && Math.abs(send.right - (t.right - 8)) <= .6, enter: [buttons[2]!.getAttribute("aria-label"), !!buttons[2]!.querySelector("svg"), buttons[2]!.textContent] };
       });
