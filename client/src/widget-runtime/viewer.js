@@ -38,7 +38,27 @@ let suppliedTheme=initialTheme,canvas='';
 const effectiveTheme=()=>{const theme=suppliedTheme??{};if(!canvas||canvas===theme.scheme)return theme;const next={...theme,scheme:canvas};for(const name of allowedTheme){const value=theme[name+'-'+canvas];if(typeof value==='string')next[name]=value}return next};
 const applyTheme=theme=>{suppliedTheme=theme;const effective=effectiveTheme();for(const name of allowedTheme){const value=effective[name];if(typeof value!=='string'||value.length>500)continue;if(name==='scheme'){suppliedScheme=value==='dark'?'dark':'light';htmlElement.style.colorScheme=suppliedScheme}else htmlElement.style.setProperty('--'+name,value)}mapSchemeMedia()};
 applyTheme(initialTheme);deviceDark.addEventListener('change',mapSchemeMedia);
-const declaredCanvas=()=>{const value=root.querySelector(':scope>[data-canvas-theme]')?.getAttribute('data-canvas-theme')?.trim().toLowerCase();return value==='light'||value==='dark'?value:''};
+// Without a declaration, source that paints its own colours yet uses none of
+// the scheme-following techniques (App colour variables, light-dark(),
+// prefers-color-scheme, the tarobot:theme event) was drawn for a light canvas.
+// SVG counts as painted because its default fill is black. Source without any
+// colour of its own inherits the App's and keeps following it. A painted design
+// whose outermost element has an opaque dark background was drawn for a dark
+// canvas; this reads the authored background once and rewrites nothing.
+const themeFollowing=/--(?:text|muted|surface|card|border|accent|accent-soft|primary-bg|on-primary|ok|warn|danger|cat-[1-8](?:-ink|-soft)?|chart-series-[1-4])(?![\w-])(?!\s*:)|light-dark\s*\(|prefers-color-scheme|tarobot:theme/i;
+const paintedColour=/(?:^|[^&\w])#[0-9a-f]{3,8}(?![\w-])|\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\s*\(|<svg\b/i,colourWords=['transparent','currentcolor','inherit','initial','unset','revert','none','auto'];
+const namedColour=source=>{for(const match of source.matchAll(/(?:color|background|fill|stroke)\s*[:=]\s*["']?\s*([a-z]+)\b/gi)){const word=match[1].toLowerCase();if(!colourWords.includes(word)&&CSS.supports('color',word))return true}return false};
+const ownDesign=typeof html==='string'&&!themeFollowing.test(html)&&(paintedColour.test(html)||namedColour(html));
+let defaultCanvas;
+const designCanvas=()=>{
+ if(defaultCanvas!==undefined)return defaultCanvas;
+ if(!ownDesign)return defaultCanvas='';
+ const outer=root.querySelector(':scope>:not(style,script,template)'),rgb=outer&&/^rgba?\(([^)]+)\)$/.exec(getComputedStyle(outer).backgroundColor);
+ const [r,g,b,a=1]=rgb?rgb[1].split(/[\s,/]+/).filter(Boolean).map(Number):[255,255,255,0];
+ const luminance=[r,g,b].map(v=>{v/=255;return v<=.04045?v/12.92:((v+.055)/1.055)**2.4}).reduce((sum,v,i)=>sum+v*[.2126,.7152,.0722][i],0);
+ return defaultCanvas=a>=.5&&luminance<.18?'dark':'light';
+};
+const declaredCanvas=()=>{const value=root.querySelector(':scope>[data-canvas-theme]')?.getAttribute('data-canvas-theme')?.trim().toLowerCase();return value==='light'||value==='dark'?value:designCanvas()};
 function refreshCanvas(){const next=declaredCanvas();if(next===canvas)return;canvas=next;applyTheme(suppliedTheme);worker?.postMessage({type:'theme',theme:effectiveTheme()})}
 // IDs remain local to this opaque viewer, whose authority is captured in lexical
 // bindings. Preserve ordinary IDs such as "title"/"method" for CSS and virtual

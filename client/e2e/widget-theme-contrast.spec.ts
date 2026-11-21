@@ -147,3 +147,29 @@ test('undeclared widgets keep the App scheme', async ({ page }) => {
     }
   } finally { await f.dispose(); }
 });
+
+// Without a declaration: own colours and no scheme-following technique mean a
+// light-canvas design; colourless or theme-aware source follows the App.
+const defaults = [
+  { name: 'fixed light design', canvas: 'light' as const, html: '<style>.fixed{color:#1f2937}.tint{background:rgba(59,130,246,.12);padding:8px}</style><section><p id="fixed" class="fixed">写死的深色字</p><div class="tint"><b id="tinted" class="fixed" style="font-size:1.4rem">53.8 万</b></div><svg viewBox="0 0 200 24" width="200" height="24"><text id="svg-default" x="2" y="18">SVG 默认填充</text></svg><span id="named" style="color:black">命名颜色</span></section>', targets: [{ id: 'fixed', kind: 'text' }, { id: 'tinted', kind: 'large' }, { id: 'svg-default', kind: 'text' }, { id: 'named', kind: 'text' }] as ContrastTarget[] },
+  { name: 'fixed dark design', canvas: 'dark' as const, html: '<section style="background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px"><p id="dark-fixed">写死的浅色字</p><p id="dark-muted" style="color:#94a3b8">写死的次要字</p></section>', targets: [{ id: 'dark-fixed', kind: 'text' }, { id: 'dark-muted', kind: 'text' }] as ContrastTarget[] },
+  { name: 'colourless', canvas: undefined, html: '<section><p id="plain">只用继承的文字颜色</p><div class="card"><span id="plain-muted" class="muted">内置类</span></div></section>', targets: [{ id: 'plain', kind: 'text' }, { id: 'plain-muted', kind: 'text' }] as ContrastTarget[] },
+  { name: 'theme-aware', canvas: undefined, html: '<section style="border:1px solid var(--border)"><p id="aware" style="color:var(--text)">用了主题变量</p><b id="aware-cat" style="color:var(--cat-3-ink)">分类</b></section>', targets: [{ id: 'aware', kind: 'text' }, { id: 'aware-cat', kind: 'text' }] as ContrastTarget[] },
+];
+for (const widget of defaults) test(`an undeclared ${widget.name} widget ${widget.canvas ? 'gets a light canvas' : 'follows the App'} and stays readable in every palette and mode`, async ({ page }) => {
+  test.setTimeout(300_000);
+  const f = await fixture(page, widget.html);
+  try {
+    await expect(guest(page).locator(`#${widget.targets[0]!.id}`)).toBeVisible();
+    const failures: string[] = [];
+    for (const { palette, theme, device } of combinations) {
+      await page.emulateMedia({ colorScheme: device });
+      await page.evaluate(({ palette, theme }) => Object.assign(document.documentElement.dataset, { palette, theme: palette === 'cli' ? 'dark' : theme }), { palette, theme });
+      const app = await page.evaluate(() => getComputedStyle(document.querySelector('.inline-widget')!).colorScheme === 'dark' ? 'dark' : 'light');
+      await expect.poll(() => guest(page).locator('html').evaluate(node => getComputedStyle(node).colorScheme), `${palette}/${theme}/${device}`).toBe(widget.canvas ?? app);
+      for (const result of await guest(page).locator('#report-root').evaluate(measureContrast, widget.targets))
+        if (result.ratio < minimum[result.kind]) failures.push(`${palette}/${theme}/device-${device} ${result.id} ${result.fg} on ${result.bg} = ${result.ratio}`);
+    }
+    expect(failures).toEqual([]);
+  } finally { await f.dispose(); }
+});
