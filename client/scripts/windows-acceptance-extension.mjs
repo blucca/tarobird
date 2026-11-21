@@ -10,6 +10,9 @@
 //      installed 1.5.1 uninstaller in place, review N6), GUI default upgrade
 //   C  Tauri 1.0.119 -> candidate through windows-acceptance.mjs's existing
 //      --legacy-installer path; needs read access to the private release
+//   D  the diagnostic dialog's text as UTF-16 code units (English and, with
+//      Installer Language=2052 for display only, Simplified Chinese): is the
+//      version/code separator really U+00B7 on screen?
 //
 //   set TAROBOT_WINDOWS_ACCEPTANCE=disposable
 //   node scripts/windows-acceptance-extension.mjs --confirm-disposable-windows \
@@ -26,7 +29,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { appProcesses, EXE, LOCATION_KEY, PROTOCOL_KEY, runAcceptance, UNINSTALL_KEY, windowsSystem } from './windows-acceptance.mjs';
+import { appProcesses, credentialTargets, EXE, LOCATION_KEY, PROTOCOL_KEY, RUN_KEY, runAcceptance, UNINSTALL_KEY, windowsSystem } from './windows-acceptance.mjs';
 import { makeContext } from './windows-uninstall-recovery-acceptance.mjs';
 
 const W = path.win32;
@@ -37,7 +40,7 @@ const LOCK_TARGET = W.join('resources', 'native', 'tarobot-migration-exporter.ex
 const FINGERPRINT = [EXE, HELPER, 'uninstall.exe', W.join('resources', 'app.asar')];
 const LAYOUT = [EXE, HELPER, 'uninstall.exe', W.join('resources', 'app.asar'), W.join('resources', 'host', 'node.exe'), W.join('resources', 'host', 'dist', 'src', 'index.js'),
   LOCK_TARGET, W.join('resources', 'native', 'tarobot-desktop-native.node'), 'tarocub-notification-shortcut.json'];
-export const GROUPS = ['C', 'A', 'B'];
+export const GROUPS = ['C', 'A', 'D', 'B'];
 /** Spaces and CJK, under the runner's temp disk (issue #50 checklist). */
 export const CUSTOM_PARENT = 'TB 验收 目录';
 /** Published installers, pinned from the release API digest and the release's
@@ -55,6 +58,8 @@ export const LEGACY = Object.freeze({ version: '1.0.119', repository: 'cloveric/
   url: 'https://api.github.com/repos/cloveric/tarobot/releases/assets/686391312', name: 'TaroBot-1.0.119-windows-x64-setup.exe', size: 105042980,
   sha256: '67dc626fbf9513d33b56662b5eeb3fe4bc6dd12913eae3c11025d54c184db821' });
 const SYNTHETIC = 'tarobird-acceptance-synthetic.txt';
+// Matches credentialTargets()'s /com\.taro(bot|cub)\.client/ filter; never a real key.
+const SYNTHETIC_CREDENTIAL = 'tarobird-acceptance-synthetic.com.tarobot.client.device';
 
 class Receipt {
   checks = [];
@@ -296,6 +301,7 @@ async function groupB(x, receipt) {
     receipt.expect(P, `B0-download-${version}-pinned`, got.ok, got.detail);
     if (got.ok) files[version] = file;
   }
+  await electronToElectron(x, receipt, files['1.5.1']);
   await x.cleanSlate(receipt, P);
   const fresh = await x.install(receipt, P, x.options.installer, { id: 'B0-candidate-fresh-install' });
   if (!fresh) return;
@@ -304,7 +310,7 @@ async function groupB(x, receipt) {
   await x.uninstallRegistered(receipt, P, 'B0-candidate-uninstall');
   await x.cleanSlate(receipt, P);
 
-  const scenario = async (name, version, upgrade, { language } = {}) => {
+  const scenario = async (name, version, upgrade, { language, after: afterUninstall } = {}) => {
     const S = `B-${name}`;
     if (!files[version]) { receipt.add(S, 'old-installer', 'skip', `${version} download failed or did not match its pin`); return; }
     await x.cleanSlate(receipt, S);
@@ -334,6 +340,7 @@ async function groupB(x, receipt) {
       if (repaired) receipt.expect(S, 'recovered-by-silent-install', x.sameFingerprint(await x.fingerprint(repaired), candidate), JSON.stringify(await x.fingerprint(repaired)));
     }
     await x.uninstallRegistered(receipt, S, 'uninstall-after-upgrade-completes');
+    if (afterUninstall) await afterUninstall(S);
     data = await x.kept(before, seeded);
     receipt.expect(S, 'data-retained-after-uninstall', data.ok, data.detail);
     const again = await x.install(receipt, S, x.options.installer, { id: 'reinstall-after-uninstall' });
@@ -357,12 +364,31 @@ async function groupB(x, receipt) {
   };
   // (1) The in-app updater hands the installer `/P /UPDATE /R` (windows_handoff.rs).
   await scenario('1-updater-handoff', '1.5.1', async (S, old) => {
+    // The login item exactly as auto-launch 0.6.0 writes it for this installation
+    // (`<exe> `), and a synthetic keyring entry under the App's service name: an
+    // update must keep both; the later uninstall removes only the login item.
+    const item = `${W.join(old, EXE)} `;
+    await x.sys.run('reg.exe', ['add', RUN_KEY, '/v', 'TaroBot', '/t', 'REG_SZ', '/d', item, '/f']);
+    await x.sys.run('cmdkey.exe', [`/generic:${SYNTHETIC_CREDENTIAL}`, '/user:tarobird-acceptance', '/pass:synthetic-not-a-secret']);
+    const credentialsBefore = await credentialTargets(x.sys);
     const result = await passive(S, ['/P', '/UPDATE', '/R'], old);
     await x.sys.sleep(8000);
     const running = (await appProcesses(x.sys, EXE) ?? []).filter(item => item.path && same(W.dirname(item.path), old));
     receipt.info(S, 'relaunched-by-R', running.length ? `${running.map(item => item.pid).join(', ')} from ${old}` : 'no App process after /R');
+    const kept = (await x.reg(RUN_KEY)).values?.TaroBot;
+    receipt.expect(S, 'login-item-kept-by-update', kept === item, `${RUN_KEY}\\TaroBot = ${JSON.stringify(kept ?? null)} (seeded ${JSON.stringify(item)})`);
+    const credentialsAfter = await credentialTargets(x.sys);
+    receipt.expect(S, 'synthetic-keyring-entry-kept-by-update', !!credentialsBefore?.some(t => t.includes(SYNTHETIC_CREDENTIAL)) && !!credentialsAfter?.some(t => t.includes(SYNTHETIC_CREDENTIAL)),
+      `proxy only (no paired device key exists on a runner): ${SYNTHETIC_CREDENTIAL} before ${credentialsBefore?.length ?? 'unreadable'}, after ${credentialsAfter?.length ?? 'unreadable'}`);
     return result;
-  });
+  }, { after: async S => {
+    const item = (await x.reg(RUN_KEY)).values?.TaroBot;
+    receipt.expect(S, 'login-item-removed-by-uninstall', item === undefined, `${RUN_KEY}\\TaroBot = ${JSON.stringify(item ?? null)} (it named this installation)`);
+    const credentials = await credentialTargets(x.sys);
+    receipt.expect(S, 'synthetic-keyring-entry-kept-by-uninstall', !!credentials?.some(t => t.includes(SYNTHETIC_CREDENTIAL)), `data-keeping uninstall leaves keyring entries; ${credentials?.length ?? 'unreadable'} TaroBird targets`);
+    await x.sys.run('cmdkey.exe', [`/delete:${SYNTHETIC_CREDENTIAL}`]);
+    await x.sys.run('reg.exe', ['delete', RUN_KEY, '/v', 'TaroBot', '/f']);
+  } });
   // (2) Same-version /P: reinst_uninstall runs the INSTALLED 1.5.1 uninstaller in place.
   await scenario('2a-passive-silent-1.5.1', '1.5.1', (S, old) => passive(S, ['/P'], old));
   await scenario('2b-passive-after-interactive-1.5.1', '1.5.1', (S, old) => passive(S, ['/P'], old), { language: '1033' });
@@ -396,6 +422,107 @@ async function driveInstaller(x) {
 }
 const describe = ui => ui.error ? `driver error: ${ui.error}` : `seen ${ui.seen}, stuck ${ui.stuck}, ${ui.seconds}s, setup exit ${ui.exit}; events: ${(ui.events ?? []).map(e => `${e.kind}${e.detail ? `=${String(e.detail).slice(0, 160)}` : ''}`).join(' → ')}`;
 
+/** windows-acceptance.mjs needs a pristine profile for its preflight: move any
+ * earlier data aside (renamed, never deleted) and clear the remembered location. */
+async function pristine(x, receipt, phase) {
+  await x.cleanSlate(receipt, phase);
+  let n = 0;
+  for (const root of x.presentRoots()) {
+    const aside = W.join(W.dirname(root), `TaroBird-acceptance-aside-${Date.now()}-${++n}`);
+    await x.sys.run('cmd.exe', ['/d', '/c', 'move', root, aside]);
+    receipt.info(phase, 'moved-aside', `${root} -> ${aside} (${existsSync(root) ? 'STILL PRESENT' : 'moved'})`);
+  }
+}
+
+/** B-E: Electron 1.5.1 → candidate through windows-acceptance.mjs's own
+ * --next-installer path (scope update). Its install/first-launch checks judge
+ * the published 1.5.1 build, so they are recorded as evidence only; update,
+ * update-launch and uninstall (the candidate's) are judged. */
+async function electronToElectron(x, receipt, oldInstaller) {
+  const P = 'B-E-electron-to-electron';
+  if (!oldInstaller) { receipt.add(P, 'old-installer', 'skip', '1.5.1 download failed or did not match its pin'); return; }
+  await pristine(x, receipt, P);
+  const { report } = await runAcceptance({ installer: oldInstaller, nextInstaller: x.options.installer, version: '1.5.1', nextVersion: x.options.version, confirmed: true, scopes: ['update'] }, x.sys);
+  const judged = new Set(['preflight', 'update', 'update-launch', 'uninstall']);
+  for (const check of report.checks) {
+    if (judged.has(check.phase) && check.status !== 'info') receipt.add(`${P}/${check.phase}`, check.id, check.status, check.detail);
+    else receipt.info(`${P}/${check.phase}`, check.id, `[${check.status}${judged.has(check.phase) ? '' : ', published 1.5.1 baseline, not judged here'}] ${check.detail}`);
+  }
+  receipt.expect(P, 'update-scope-complete', report.missing.length === 0, `windows-acceptance.mjs outcome ${report.outcome}; missing ${report.missing.join(', ') || 'none'}`);
+}
+
+const codeUnits = hex => (hex ?? '').trim().split(/\s+/).filter(Boolean).map(unit => parseInt(unit, 16));
+const unitsText = units => units.map(unit => `U+${unit.toString(16).toUpperCase().padStart(4, '0')}`).join(' ');
+/** The three code units before "TB-" (expected U+0020 U+00B7 U+0020). */
+const beforeCode = units => { for (let i = 3; i < units.length - 2; i++) if (units[i] === 0x54 && units[i + 1] === 0x42 && units[i + 2] === 0x2d) return units.slice(i - 3, i); return undefined; };
+const SEPARATOR = [0x20, 0xb7, 0x20];
+
+async function driveDialog(x, { release }) {
+  const releaseFile = W.join(x.tmp, `dlg-release-${Date.now()}.flag`), releasedFile = `${releaseFile}.done`, outFile = `${releaseFile}.json`;
+  const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, 'windows-dialog-text-driver.ps1'), '-TimeoutSec', '240',
+    '-ReleaseFile', releaseFile, '-ReleasedFile', releasedFile, '-OutFile', outFile], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+  let stderr = '', done = false; child.stderr.on('data', chunk => { stderr += chunk; });
+  const exited = new Promise(resolve => { child.once('exit', () => { done = true; resolve(); }); child.once('error', error => { done = true; stderr += String(error); resolve(); }); });
+  let released = false;
+  const deadline = Date.now() + 300_000;
+  while (!done && Date.now() < deadline) {
+    if (!released && existsSync(releaseFile)) { await release(); await writeFile(releasedFile, 'done'); released = true; }
+    await Promise.race([exited, x.sys.sleep(500)]);
+  }
+  if (!done) child.kill();
+  try { return { ...JSON.parse((await readFile(outFile, 'utf8')).replace(/^\uFEFF/, '')), released }; } catch { return { error: stderr.slice(-800) || 'no driver output', events: [], released }; }
+}
+
+/** D: is the diagnostic dialog's separator really U+00B7 on screen? */
+async function groupD(x, receipt) {
+  const P = 'D-dialog-text';
+  // What Windows PowerShell 5.1's default (redirected) console output makes of
+  // U+00B7 and U+2014: explains a U+FFFD read from a driver's stdout.
+  const probe = await new Promise(resolve => {
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write([string][char]0xB7 + [string][char]0x2014); [Console]::Out.Write("|" + [Console]::OutputEncoding.WebName)'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    const chunks = []; child.stdout.on('data', chunk => chunks.push(chunk));
+    child.once('exit', () => resolve(Buffer.concat(chunks))); child.once('error', () => resolve(Buffer.alloc(0)));
+  });
+  const bar = probe.indexOf(0x7c), payload = bar >= 0 ? probe.subarray(0, bar) : probe;
+  receipt.info(P, 'default-console-transport', `U+00B7 U+2014 written by powershell.exe to a pipe arrive as bytes ${payload.toString('hex') || '(none)'} (console encoding ${bar >= 0 ? probe.subarray(bar + 1).toString('latin1') : '?'}); read as UTF-8: ${JSON.stringify(payload.toString('utf8'))}`);
+  for (const [label, language] of [['en', undefined], ['zh', '2052']]) {
+    const S = `${P}-${label}`;
+    await x.cleanSlate(receipt, S);
+    const dir = await x.install(receipt, S, x.options.installer, { id: 'install' });
+    if (!dir) continue;
+    if (language) {
+      // Display language only, to read the Chinese dialog; never used for a /P judgement.
+      await x.sys.run('reg.exe', ['add', LOCATION_KEY, '/v', 'Installer Language', '/t', 'REG_SZ', '/d', language, '/f']);
+      receipt.info(S, 'display-language', `${LOCATION_KEY}\\Installer Language = ${language} (for reading the Chinese dialog only)`);
+    }
+    const held = await x.lock(W.join(dir, LOCK_TARGET));
+    if (!held.held) { receipt.add(S, 'induce-locked-file', 'skip', held.detail); await held.release(); continue; }
+    x.sys.launch(W.join(dir, 'uninstall.exe'));
+    const ui = await driveDialog(x, { release: held.release });
+    await held.release();
+    const ev = kind => (ui.events ?? []).find(e => e.kind === kind)?.detail;
+    receipt.info(S, 'ui-events', ui.error ? `driver error: ${ui.error}` : (ui.events ?? []).map(e => e.kind).join(' → '));
+    if (!ui.captured) { receipt.add(S, 'dialog-captured', 'skip', `no diagnostic dialog was read: ${ui.error ?? JSON.stringify(ui.left ?? [])}`); await x.cleanSlate(receipt, S); continue; }
+    receipt.info(S, 'dialog-text-uia', ev('problem-uia'));
+    receipt.info(S, 'dialog-text-win32', ev('problem-win32'));
+    for (const [source, hex] of [['uia', ev('problem-uia-hex')], ['win32', ev('problem-win32-hex')]]) {
+      const units = codeUnits(hex);
+      const sep = beforeCode(units);
+      receipt.expect(S, `separator-is-U+00B7-${source}`, !!sep && sep.every((unit, i) => unit === SEPARATOR[i]), `code units before "TB-": ${sep ? unitsText(sep) : 'TB- not found'}`);
+      receipt.expect(S, `no-replacement-char-${source}`, units.length > 0 && !units.includes(0xfffd), `${units.length} code units; U+FFFD ${units.includes(0xfffd) ? 'PRESENT' : 'absent'}; U+2014 ${units.includes(0x2014) ? 'present' : 'absent'}${label === 'zh' ? `; CJK units ${units.filter(u => u >= 0x4e00 && u <= 0x9fff).length}` : ''}`);
+      if (label === 'zh') receipt.expect(S, `chinese-text-${source}`, units.some(u => u >= 0x4e00 && u <= 0x9fff), `CJK units ${units.filter(u => u >= 0x4e00 && u <= 0x9fff).length}`);
+    }
+    const note = (await x.noteLines())?.findLast(line => line.includes('TB-FILES-REMOVE'));
+    if (note) {
+      const units = [...note].map(ch => ch.codePointAt(0));
+      receipt.info(S, 'setup-note-separator', `setup notes: code units before "TB-": ${unitsText(beforeCode(units) ?? [])}; U+FFFD ${units.includes(0xfffd) ? 'present' : 'absent'}`);
+    } else receipt.info(S, 'setup-note-separator', 'no TB-FILES-REMOVE line in setup notes');
+    for (let waited = 0; waited < 60_000 && (await x.reg(UNINSTALL_KEY)).state !== 'absent'; waited += 2000) await x.sys.sleep(2000);
+    receipt.expect(S, 'retry-completes-uninstall', ui.released && (await x.reg(UNINSTALL_KEY)).state === 'absent', `released ${ui.released}; uninstall key ${(await x.reg(UNINSTALL_KEY)).state}`);
+    await x.cleanSlate(receipt, S);
+  }
+}
+
 /** C: Tauri 1.0.119 → candidate via windows-acceptance.mjs (legacy scope). */
 async function groupC(x, receipt) {
   const P = 'C-tauri-to-electron';
@@ -408,7 +535,8 @@ async function groupC(x, receipt) {
   const got = await download(x.sys, LEGACY, file, { Authorization: `Bearer ${token}`, Accept: 'application/octet-stream' });
   receipt.expect(P, 'legacy-download-pinned', got.ok, got.detail.replace(token, '***'));
   if (!got.ok) return;
-  // The existing path (preflight needs a clean runner, so C runs first).
+  // The existing path; its preflight needs a pristine profile (C runs first).
+  await pristine(x, receipt, P);
   const { report } = await runAcceptance({ installer: x.options.installer, legacyInstaller: file, version: x.options.version, confirmed: true, scopes: ['install', 'upgrade'] }, x.sys);
   for (const check of report.checks) receipt.add(`${P}/${check.phase}`, check.id, check.status, check.detail);
   receipt.info(P, 'legacy-outcome', `windows-acceptance.mjs outcome ${report.outcome}; missing ${report.missing.join(', ') || 'none'}`);
@@ -427,7 +555,7 @@ async function groupC(x, receipt) {
   await x.cleanSlate(receipt, P);
 }
 
-const RUNNERS = { A: groupA, B: groupB, C: groupC };
+const RUNNERS = { A: groupA, B: groupB, C: groupC, D: groupD };
 
 export async function run(options, sys = windowsSystem()) {
   const receipt = new Receipt();

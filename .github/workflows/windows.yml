@@ -42,7 +42,63 @@ jobs:
       - name: "Extension pre-check: pinned downloads, CJK/space /D= and _?= (N2), driver syntax"
         shell: pwsh
         run: |
+<<<<<<< HEAD
           node client/scripts/acceptance-probe/extension-probe.mjs "$env:RUNNER_TEMP\n2-fixture.exe" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\probe.log"
           $code = $LASTEXITCODE
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Extension pre-check', '```', (Get-Content -Raw "$env:RUNNER_TEMP\probe.log").Trim(), '```')
           exit $code
+=======
+          choco install nsis --no-progress -y
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - run: npm ci
+      - run: npm ci --prefix client
+      - name: Build full Windows host installer
+        id: build
+        run: npm run desktop:windows --prefix client -- --arch ${{ inputs.arch }}
+      - name: Packaged host end-to-end smoke
+        run: client/src-tauri/host/node.exe scripts/verify-desktop-host.mjs client/src-tauri/host
+      - name: Windows host control and engine discovery
+        run: npx vitest run tests/windows-host.test.ts tests/deepseek-windows-discovery.test.ts tests/deepseek-windows-installation.test.ts tests/deepseek-desktop-launcher.test.ts tests/windows-state-sync.test.ts tests/host-cli-package.test.ts
+      - name: Final installer runtime dependencies
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "No Windows installer was produced" }
+          7z x $installer.FullName -owindows-installer-extracted -y
+          if ($LASTEXITCODE -ne 0) { throw "Installer extraction failed" }
+          node scripts/verify-windows-runtime.mjs windows-installer-extracted
+          if ($LASTEXITCODE -ne 0) { throw "Installer requires an unbundled runtime" }
+      - name: "#50 extension: custom directory, release upgrades, Tauri to Electron (acceptance only)"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 130
+        shell: pwsh
+        env:
+          TAROBOT_WINDOWS_ACCEPTANCE: disposable
+          # Optional, owner-provided read-only token for the private, archived
+          # cloveric/tarobot 1.0.119 release asset. Without it group C reports
+          # "blocked" (a skip, never a pass); nothing is uploaded either way.
+          TAROBOT_LEGACY_RELEASE_TOKEN: ${{ secrets.TAROBOT_LEGACY_RELEASE_READ }}
+        run: |
+          $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
+          if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
+          node client/scripts/windows-acceptance-extension.mjs --confirm-disposable-windows --installer $installers[0].FullName `
+            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-extension.noindex" --groups C,A,D,B --budget-minutes 120
+          if ($LASTEXITCODE -ne 0) { throw "#50 extension acceptance did not pass; see the receipt in the job summary" }
+      - name: Show acceptance evidence (log and summary only, no upload)
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/windows-acceptance.md", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.md", "$env:RUNNER_TEMP/windows-extension.noindex/*.md" -ErrorAction SilentlyContinue)) {
+            Get-Content -LiteralPath $file.FullName -Raw | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          }
+          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/*.json", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.json", "$env:RUNNER_TEMP/windows-persisted-migration.noindex/*.json", "$env:RUNNER_TEMP/windows-extension.noindex/*.json" -ErrorAction SilentlyContinue)) {
+            "===== $($file.Name) ====="; Get-Content -LiteralPath $file.FullName -Raw
+          }
+      - name: Installer checksum (log only, the installer is never uploaded)
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          }
+>>>>>>> accept/50-extension-20261121
