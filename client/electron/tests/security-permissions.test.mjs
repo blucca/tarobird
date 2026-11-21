@@ -5,7 +5,7 @@ import { APP_ENTRY } from '../contract.mjs';
 import { DESIGN_BOOTSTRAP_URL } from '../design-document.mjs';
 function setup(preferences) {
  const handlers={}; const contents={isDestroyed:()=>false,getURL:()=>APP_ENTRY};
- secureSession({setPermissionRequestHandler:fn=>handlers.request=fn,setPermissionCheckHandler:fn=>handlers.check=fn,setDevicePermissionHandler(){},on(){},webRequest:{onBeforeRequest(){}}},{owns:value=>value===contents,systemPreferences:preferences,platform:'darwin'});
+ secureSession({setPermissionRequestHandler:fn=>handlers.request=fn,setPermissionCheckHandler:fn=>handlers.check=fn,setDevicePermissionHandler(){},on(){},webRequest:{onBeforeRequest(){},onBeforeSendHeaders(){},onHeadersReceived(){}}},{owns:value=>value===contents,systemPreferences:preferences,platform:'darwin'});
  const details={isMainFrame:true,requestingUrl:APP_ENTRY,mediaTypes:['audio']};
  return {handlers,contents,details,request:(permission,extra={})=>new Promise(resolve=>handlers.request(contents,permission,resolve,{...details,...extra}))};
 }

@@ -840,9 +840,14 @@ responses. See the state model for retention and cancellation limits.
 
 The HTML viewer sits inside two opaque sandbox frames without host/native
 authority; authored scripts now execute in a dedicated Worker. The relay accepts only bounded, source/key-bound presentation messages.
-The guest CSP blocks ordinary fetch/WebSocket and external-resource requests;
-the trusted bootstrap separately removes WebRTC constructors because CSP does
-not prevent STUN/UDP. Chromium and WebKit tests use a loopback UDP listener to
+Network access follows the device setting "Allow widgets to use the network"
+(on by default since 2026-11-21, by the owner's decision). With it off, the
+guest CSP blocks fetch/WebSocket and every external resource, as before. With
+it on, the guest may load https images, media, fonts and stylesheets, and its
+Worker may use fetch, XMLHttpRequest, EventSource and WebSocket over https/wss
+and fetch `<script src="https://…">` text into the Worker; see "Widget network
+access" below. In both modes the trusted bootstrap removes WebRTC constructors
+because CSP does not prevent STUN/UDP. Chromium and WebKit tests use a loopback UDP listener to
 verify initial viewing/reload and reject constructor restoration. This is not
 an exhaustive guarantee against browser networking side channels (DNS prefetch
 is not verified). Repeated runtime errors retire execution and retain a text summary; incidental
@@ -856,13 +861,74 @@ following implementation replaces that execution path; see the historical
 Typed report cells are rendered as text by App-owned components, with no generated
 script execution. Custom HTML uses a dedicated Worker plus a trusted sanitized
 DOM renderer; it no longer executes authored JavaScript in the view thread.
-Blob Workers inherit the opaque sandbox CSP. Network/RTC/nested-worker/native
-capabilities are unavailable; the main App CSP is unchanged. Size, message-rate,
+Blob Workers inherit the opaque sandbox CSP. RTC/nested-worker/native
+capabilities are unavailable, and network capabilities exist only through the
+guarded wrappers described below; the main App CSP is unchanged. Size, message-rate,
 error and heartbeat guards bound the supported pipeline. This is not an OS
 process or memory quota; CSS/browser resource exhaustion remains outside the
 JavaScript-thread guarantee. Older clients retain their old reader. See the
 [precise protocol and acceptance boundaries](client/inline-widgets-cpu-containment-2026-10-22.md).
 
+
+### Widget network access (2026-11-21)
+
+**What a widget can now do.** With the setting on, any published widget can
+send data it contains (including anything the Bot put into it from the
+conversation or from tools) to any public https/wss endpoint, load tracking
+images or fonts, and run third-party scripts fetched at view time inside its
+Worker. A Bot misled by content it read can therefore build a widget that
+exfiltrates that widget's own data when it is viewed. Viewing an old message
+re-runs its requests and fetches; external resources may have changed or
+vanished, so a historical widget can render differently or lose its scripted
+parts. Network requests reveal the viewer's IP address and timing to the
+endpoints.
+
+**What stays closed.**
+
+- The guest remains two opaque sandbox frames (`allow-scripts` only): no App
+  origin, cookies, storage, parent access, navigation, popups, downloads,
+  forms, frames, objects or `<base>`. The relay protocol, Worker CPU/message
+  guards, size limits and WebRTC removal are unchanged; Hub routes reject the
+  opaque origin.
+- Only `https:` and `wss:` are permitted (CSP `connect-src https: wss:`, https
+  for images/media/fonts/styles; `script-src` stays nonce-only because external
+  scripts are fetched and evaluated in the Worker). `http:`, `file:`, `data:`
+  scripts and other schemes are refused, so plain-text local services are not
+  reachable.
+- Worker `fetch`/`XMLHttpRequest`/`EventSource` force `credentials: omit` and
+  no referrer; URLs with credentials and hosts written as loopback, private,
+  link-local, CGNAT, multicast or local names (`localhost`, `*.local`,
+  `*.internal`, `*.lan`, single labels) are refused; at most four WebSockets or
+  EventSources are open at once. External scripts must be served as JavaScript,
+  are limited to 16 files, 4 MiB each and 8 MiB in total, and time out after
+  15 s; a failure leaves the static markup and reports a widget warning.
+- The guest document and relay use `Referrer-Policy: no-referrer`; the sanitizer
+  keeps only `<link rel="stylesheet">` and https media, SVG image and stylesheet
+  URLs, never navigable links, and strips `autoplay`.
+- Electron allows https/wss in the App session only for requests from a widget
+  guest frame (or frameless Worker connections) and strips `Cookie`,
+  `Authorization`, `Proxy-Authorization` and `Set-Cookie` on them, so the
+  App session's cookie jar never gains widget cookies.
+
+**Residual exposure.**
+
+- Intranet services with valid https certificates under public-looking names,
+  and public names that resolve or redirect to private addresses, remain
+  reachable: name resolution and redirects are not inspected. Responses need
+  CORS to be readable, but requests with side effects still arrive. Browser
+  private-network protections vary by engine and were not relied on.
+- Document resource loads (images, stylesheets, fonts) and WebSocket handshakes
+  follow the engine's third-party cookie policy. In Chromium tests they carried
+  the target site's own `SameSite=None` cookie from earlier top-level browsing;
+  they never carried App cookies. Electron strips them; the Web build, Tauri
+  (WebKit) and mobile WebViews rely on their engine's policy and were not
+  measured on devices.
+- External scripts run with the widget's own authority in its Worker; there is
+  no integrity pinning.
+
+Older clients ignore external scripts and stylesheets and keep their offline
+policy; their static markup still renders. Hubs before this change reject such
+widgets at publication.
 
 ### Widget-to-composer handoff
 

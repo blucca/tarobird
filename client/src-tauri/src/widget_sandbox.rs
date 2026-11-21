@@ -8,7 +8,7 @@ pub fn response(path: &str) -> tauri::http::Response<Vec<u8>> {
         .header("Content-Type", "text/html; charset=utf-8")
         .header("X-Content-Type-Options", "nosniff")
         .header("Referrer-Policy", "no-referrer")
-        .header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; worker-src blob:; style-src 'unsafe-inline'; img-src data:; font-src data:; frame-src about:; base-uri 'none'; form-action 'none'; sandbox allow-scripts")
+        .header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; worker-src blob:; style-src 'unsafe-inline' https:; img-src data: https:; media-src https:; font-src data: https:; connect-src https: wss:; frame-src about:; base-uri 'none'; form-action 'none'; sandbox allow-scripts")
         .body(if found { include_bytes!("../../public/widget-sandbox.html").to_vec() } else { Vec::new() })
         .expect("static widget response")
 }

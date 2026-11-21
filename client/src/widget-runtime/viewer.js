@@ -1,6 +1,8 @@
 import DOMPurify from 'dompurify';
 // Trusted DOM renderer. Authored scripts exist only inside the dedicated Worker.
-const {html,theme:initialTheme,workerSource,key,restore}=window.widgetConfiguration;delete window.widgetConfiguration;
+const {html,theme:initialTheme,workerSource,key,restore,network:networkSetting}=window.widgetConfiguration;delete window.widgetConfiguration;
+// Widget network access (an App setting): https/wss only, enforced by this frame's CSP.
+const network=networkSetting===true;
 const root=document.getElementById('report-root');
 const createElement=document.createElement.bind(document),selectDocument=document.querySelector.bind(document),bodyElement=document.body,htmlElement=document.documentElement;
 // Authored names can shadow document properties (named access); security
@@ -41,12 +43,13 @@ applyTheme(initialTheme);deviceDark.addEventListener('change',mapSchemeMedia);
 // Without a declaration, source that paints its own colours yet uses none of
 // the scheme-following techniques (App colour variables, light-dark(),
 // prefers-color-scheme, the tarobot:theme event) was drawn for a light canvas.
-// SVG counts as painted because its default fill is black. Source without any
+// SVG counts as painted because its default fill is black, and so do external
+// stylesheets and scripts, which assume a light page unless they say otherwise. Source without any
 // colour of its own inherits the App's and keeps following it. A painted design
 // whose outermost element has an opaque dark background was drawn for a dark
 // canvas; this reads the authored background once and rewrites nothing.
 const themeFollowing=/--(?:text|muted|surface|card|border|accent|accent-soft|primary-bg|on-primary|ok|warn|danger|cat-[1-8](?:-ink|-soft)?|chart-series-[1-4])(?![\w-])(?!\s*:)|light-dark\s*\(|prefers-color-scheme|tarobot:theme/i;
-const paintedColour=/(?:^|[^&\w])#[0-9a-f]{3,8}(?![\w-])|\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\s*\(|<svg\b/i,colourWords=['transparent','currentcolor','inherit','initial','unset','revert','none','auto'];
+const paintedColour=/(?:^|[^&\w])#[0-9a-f]{3,8}(?![\w-])|\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\s*\(|<svg\b|<link\b|<script\b[^>]*\ssrc\s*=/i,colourWords=['transparent','currentcolor','inherit','initial','unset','revert','none','auto'];
 const namedColour=source=>{for(const match of source.matchAll(/(?:color|background|fill|stroke)\s*[:=]\s*["']?\s*([a-z]+)\b/gi)){const word=match[1].toLowerCase();if(!colourWords.includes(word)&&CSS.supports('color',word))return true}return false};
 const ownDesign=typeof html==='string'&&!themeFollowing.test(html)&&(paintedColour.test(html)||namedColour(html));
 let defaultCanvas;
@@ -64,7 +67,10 @@ function refreshCanvas(){const next=declaredCanvas();if(next===canvas)return;can
 // bindings. Preserve ordinary IDs such as "title"/"method" for CSS and virtual
 // DOM correspondence; frames/embedded plugins and executable attributes remain
 // forbidden. No authored script can use DOM-named globals here.
-const sanitize=value=>DOMPurify.sanitize(value,{FORCE_BODY:true,SANITIZE_DOM:false,FORBID_TAGS:['script','iframe','frame','object','embed','meta','base','link','audio','video','canvas','animate','animateTransform','set','foreignObject'],FORBID_ATTR:['autofocus','srcset','action','formaction','target','download'],ADD_ATTR:['data-tarobot-node'],ALLOW_UNKNOWN_PROTOCOLS:false});
+const sanitize=value=>DOMPurify.sanitize(value,{FORCE_BODY:true,SANITIZE_DOM:false,FORBID_TAGS:['script','iframe','frame','object','embed','meta','base',...network?[]:['link','audio','video'],'canvas','animate','animateTransform','set','foreignObject'],FORBID_ATTR:['autofocus','srcset','action','formaction','target','download',...network?['autoplay']:[]],ADD_TAGS:network?['link']:[],ADD_ATTR:['data-tarobot-node'],ALLOW_UNKNOWN_PROTOCOLS:false});
+// With network access, only these resource references may point at https:
+// media sources, an SVG <image> and a stylesheet <link>. Links never navigate.
+const httpsResource=(element,attr,value)=>network&&/^https:\/\//i.test(value.trim())&&(attr==='src'?['img','audio','video','source','track'].includes(element.localName):attr==='poster'?element.localName==='video':['image','link'].includes(element.localName));
 // A real form would add named-property clobbering and, in this sandbox, a
 // blocked submission without any submit event. Keep its box as a neutral
 // container: the Worker owns form semantics, submit and reset.
@@ -117,9 +123,10 @@ function render(value,overflow,ack=Infinity){
  const template=createElement('template');template.innerHTML=sanitize(value);
  if(overflow&&template.content.querySelectorAll('*').length>2048){overflow();return}
  neutralizeForms(template.content);
- for(const element of template.content.querySelectorAll('[href],[src],[xlink\\:href]')){
-  for(const attr of ['href','src','xlink:href']){const value=element.getAttribute(attr);if(value&&!value.startsWith('#')&&!/^data:image\/(?:png|gif|jpeg|webp);base64,/i.test(value))element.removeAttribute(attr)}
+ for(const element of template.content.querySelectorAll('[href],[src],[xlink\\:href],[poster]')){
+  for(const attr of ['href','src','xlink:href','poster']){const value=element.getAttribute(attr);if(value&&(attr==='poster'||!value.startsWith('#')&&!/^data:image\/(?:png|gif|jpeg|webp);base64,/i.test(value))&&!httpsResource(element,attr,value))element.removeAttribute(attr)}
  }
+ for(const link of template.content.querySelectorAll('link'))if(link.getAttribute('rel')?.trim().toLowerCase()!=='stylesheet'||!link.hasAttribute('href'))link.remove();
  const patch=(parent,source)=>{
   for(let i=0;i<source.childNodes.length;i++){
    const incoming=source.childNodes[i];let current=parent.childNodes[i];
@@ -286,7 +293,7 @@ if(worker){worker.onmessage=event=>{
   }
   else if((data.name==='setPointerCapture'||data.name==='releasePointerCapture')&&activePointers.has(data.pointerId))try{node[data.name](data.pointerId)}catch{/* The pointer is no longer active. */}
  }
-};worker.onerror=()=>{releaseWorkerUrl();unsupported(false)};worker.postMessage({type:'init',html,theme:effectiveTheme(),viewport:{width:root.clientWidth,height:320},reducedMotion:matchMedia('(prefers-reduced-motion: reduce)').matches,restore:typeof restore==='string'&&restore.length<=16384?restore:undefined})}
+};worker.onerror=()=>{releaseWorkerUrl();unsupported(false)};worker.postMessage({type:'init',html,network,theme:effectiveTheme(),viewport:{width:root.clientWidth,height:320},reducedMotion:matchMedia('(prefers-reduced-motion: reduce)').matches,restore:typeof restore==='string'&&restore.length<=16384?restore:undefined})}
 let lastWatch=performance.now();
 if(worker)watchdog=setInterval(()=>{
  if(failed)return;

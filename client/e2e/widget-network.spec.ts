@@ -1,0 +1,146 @@
+import { preparePairing } from "./fixtures/pairing-invite.js";
+import { test, expect, type Page, type FrameLocator } from '@playwright/test';
+import { randomBytes } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { createServer as createHttpsServer, type Server } from 'node:https';
+import { createServer as createHttpServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { WebSocketServer } from 'ws';
+import { HubServer } from '../../src/hub/server.js';
+import { hashSecret } from '../../src/hub/auth.js';
+import { attachGateway } from '../../src/gateway/service.js';
+import { createCoreServiceRuntime } from '../../src/core/runtime.js';
+import { selectConversation, waitForClientOnline } from './fixtures/mobile.js';
+import { openSettings, closeSettings } from './fixtures/settings.js';
+
+// A local https/wss origin under a public-looking name; no external site is contacted.
+const HOST = 'widget-net.test';
+test.use({ serviceWorkers: 'block', ignoreHTTPSErrors: true, launchOptions: { args: [`--host-resolver-rules=MAP ${HOST} 127.0.0.1`] } });
+
+type Seen = { path: string; cookie?: string; referer?: string; authorization?: string };
+let tls: { key: Buffer; cert: Buffer }, certDir: string;
+test.beforeAll(async () => {
+  certDir = await mkdtemp(path.join(os.tmpdir(), 'widget-net-cert-'));
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', path.join(certDir, 'key.pem'), '-out', path.join(certDir, 'cert.pem'), '-days', '2', '-subj', `/CN=${HOST}`, '-addext', `subjectAltName=DNS:${HOST},IP:127.0.0.1`], { stdio: 'ignore' });
+  tls = { key: await readFile(path.join(certDir, 'key.pem')), cert: await readFile(path.join(certDir, 'cert.pem')) };
+});
+test.afterAll(async () => { await rm(certDir, { recursive: true, force: true }); });
+
+async function origin() {
+  const seen: Seen[] = [], plain: string[] = [];
+  const pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+  const server: Server = createHttpsServer(tls, (req, res) => {
+    const url = new URL(req.url!, `https://${HOST}`);
+    seen.push({ path: url.pathname, cookie: req.headers.cookie, referer: req.headers.referer, authorization: req.headers.authorization });
+    const cors = { 'Access-Control-Allow-Origin': '*' };
+    if (url.pathname === '/set-cookie') { res.writeHead(200, { 'Set-Cookie': 'site_session=third-party; SameSite=None; Secure; Path=/', 'Content-Type': 'text/plain' }); res.end('ok'); return; }
+    if (url.pathname === '/data.json') { res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Set-Cookie': 'tracker=1; SameSite=None; Secure; Path=/' }); res.end('{"ok":1}'); return; }
+    if (url.pathname === '/events') { res.writeHead(200, { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' }); res.end('data: hello\n\n'); return; }
+    if (url.pathname === '/lib.js') { res.writeHead(200, { ...cors, 'Content-Type': 'text/javascript' }); res.end('(function(g){g.NetLib={double:function(x){return x*2},hasDocument:typeof document==="object"&&typeof document.createElement==="function"}})(typeof globalThis!=="undefined"?globalThis:this);'); return; }
+    if (url.pathname === '/not-js') { res.writeHead(200, { ...cors, 'Content-Type': 'text/html' }); res.end('<p>no</p>'); return; }
+    if (url.pathname === '/style.css') { res.writeHead(200, { ...cors, 'Content-Type': 'text/css' }); res.end(`.styled{color:rgb(1,2,3)}@font-face{font-family:NetFont;src:url(https://${HOST}:${(server.address() as AddressInfo).port}/font.woff2)}.font{font-family:NetFont,sans-serif}`); return; }
+    if (url.pathname === '/pixel.png') { res.writeHead(200, { ...cors, 'Content-Type': 'image/png' }); res.end(pixel); return; }
+    res.writeHead(404, cors); res.end();
+  });
+  const sockets = new WebSocketServer({ server });
+  sockets.on('connection', (socket, req) => { seen.push({ path: '/ws', cookie: req.headers.cookie, referer: req.headers.referer }); socket.on('message', data => socket.send('echo:' + data)); });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const insecure = createHttpServer((req, res) => { plain.push(req.url!); res.writeHead(200, { 'Access-Control-Allow-Origin': '*' }); res.end('plain'); });
+  await new Promise<void>(resolve => insecure.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port, httpPort = (insecure.address() as AddressInfo).port;
+  return { seen, plain, base: `https://${HOST}:${port}`, ws: `wss://${HOST}:${port}`, port, httpPort, close: async () => { for (const client of sockets.clients) client.terminate(); sockets.close(); server.closeAllConnections(); insecure.closeAllConnections(); await new Promise(r => server.close(r)); await new Promise(r => insecure.close(r)); } };
+}
+
+async function fixture(page: Page, html: string) {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'widget-net-')), stateDir = path.join(root, 'bot'); await mkdir(stateDir);
+  const hub = await HubServer.start({ stateDir: path.join(root, 'hub'), clientDir: path.resolve('dist') });
+  const secret = randomBytes(32).toString('base64url'); await hub.store.db.run('INSERT INTO bots(id,name,secret_hash) VALUES(?,?,?)', ['alpha', '可视化助手', hashSecret(secret)]);
+  await writeFile(path.join(stateDir, 'config.json'), JSON.stringify({ engine: 'codex', locale: 'zh' }));
+  const widget = { title: '联网组件', summary: '示例：外部资源与网络请求。', html };
+  const gateway = await attachGateway({ stateDir, url: hub.instanceUrl.replace('http', 'ws') + '/instance', secret, botId: 'alpha', engine: 'codex', model: 'fixture', effort: 'high', runtime: createCoreServiceRuntime(), bridge: { handleAuthorizedMessage: async input => {
+    await input.appPlatformTools!.call({ name: 'app_show_widget', arguments: widget, sessionId: 'fixture', callId: 'visual', abortSignal: input.abortSignal! }); return { text: '见组件。' };
+  } } });
+  const conv = await hub.store.createConversation('owner', ['alpha'], '联网', 'network_chat');
+  await page.goto(hub.url); await preparePairing(page, hub); await page.getByRole('button', { name: '配对此设备', exact: true }).click(); await hub.auth.approve(await page.getByLabel('配对码', { exact: true }).innerText(), 'local-owner'); await page.getByLabel('配对码', { exact: true }).waitFor({ state: 'hidden' }); await waitForClientOnline(page);
+  return { conv, publish: async () => { await selectConversation(page, conv.title); await page.getByLabel('消息', { exact: true }).fill('联网试试'); await page.getByRole('button', { name: '发送消息', exact: true }).click(); }, dispose: async () => { await page.close(); await gateway.disconnect(); await hub.close(); await rm(root, { recursive: true, force: true }); } };
+}
+const guest = (page: Page): FrameLocator => page.frameLocator('.widget-panel:visible > iframe').frameLocator('iframe');
+async function widgetNetwork(page: Page, on: boolean) {
+  await openSettings(page, 'general');
+  const toggle = page.getByRole('switch', { name: '允许小组件联网', exact: true });
+  await expect(toggle).toHaveAttribute('aria-checked', 'true'); // on by default
+  if (!on) { await toggle.click(); await expect(toggle).toHaveAttribute('aria-checked', 'false'); }
+  await closeSettings(page);
+}
+const probe = (o: Awaited<ReturnType<typeof origin>>) => `<link rel="stylesheet" href="${o.base}/style.css"><p id="styled" class="styled font">外部样式</p><img id="image" src="${o.base}/pixel.png" alt="外部图片" width="12" height="12"><img id="plain-image" src="http://${HOST}:${o.httpPort}/plain.png" alt="明文图片" width="12" height="12"><audio id="audio" src="${o.base}/tone.wav" preload="auto" controls autoplay></audio><p id="results">pending</p>
+<script src="${o.base}/lib.js"></script><script src="${o.base}/not-js"></script>
+<script>
+var out={};var B='${o.base}';
+function settle(name,promise){return Promise.resolve().then(function(){return promise()}).then(function(v){out[name]=v},function(e){out[name]='blocked'})}
+out.lib=typeof NetLib==='object'?[NetLib.double(21),NetLib.hasDocument]:'missing';
+Promise.all([
+ settle('fetch',function(){return fetch(B+'/data.json',{credentials:'include'}).then(function(r){return r.json()}).then(function(j){return j.ok})}),
+ settle('xhr',function(){return new Promise(function(res,rej){var x=new XMLHttpRequest();x.open('GET',B+'/data.json');x.withCredentials=true;x.onload=function(){res(JSON.parse(x.responseText).ok)};x.onerror=rej;x.send()})}),
+ settle('sse',function(){return new Promise(function(res,rej){var s=new EventSource(B+'/events');s.onmessage=function(e){s.close();res(e.data)};s.onerror=function(){s.close();rej()}})}),
+ settle('ws',function(){return new Promise(function(res,rej){var w=new WebSocket('${o.ws}/ws');w.onopen=function(){w.send('ping')};w.onmessage=function(e){w.close();res(e.data)};w.onerror=rej})}),
+ settle('http',function(){return fetch('http://${HOST}:${o.httpPort}/plain').then(function(){return 'reached'})}),
+ settle('loopback',function(){return fetch('https://127.0.0.1:${o.port}/data.json').then(function(){return 'reached'})}),
+ settle('private',function(){return fetch('https://192.168.1.1/').then(function(){return 'reached'})}),
+ settle('rtc',function(){return typeof RTCPeerConnection==='function'?'available':Promise.reject()}),
+]).then(function(){document.getElementById('results').textContent=JSON.stringify(out)});
+</script>`;
+
+test('with widget network on, https/wss resources and requests work while isolation holds', async ({ page, context }) => {
+  test.setTimeout(120_000);
+  const o = await origin();
+  // A top-level visit gives the test origin its own cookie; widget requests must not carry it.
+  const visit = await context.newPage(); await visit.goto(`${o.base}/set-cookie`); await visit.close();
+  const f = await fixture(page, probe(o));
+  try {
+    await page.evaluate(() => { document.cookie = 'app_session=secret; path=/'; });
+    await f.publish();
+    await expect(guest(page).locator('#results')).not.toHaveText('pending', { timeout: 20_000 });
+    const results = JSON.parse(await guest(page).locator('#results').innerText());
+    expect(results).toEqual({ lib: [42, true], fetch: 1, xhr: 1, sse: 'hello', ws: 'echo:ping', http: 'blocked', loopback: 'blocked', private: 'blocked', rtc: 'blocked' });
+    await expect(guest(page).locator('#styled')).toHaveCSS('color', 'rgb(1, 2, 3)');
+    await expect.poll(() => guest(page).locator('#image').evaluate(node => (node as HTMLImageElement).naturalWidth)).toBe(1);
+    expect(await guest(page).locator('#plain-image').getAttribute('src')).toBeNull();
+    // The guest is an opaque frame: no App document, cookie or storage.
+    expect(await guest(page).locator('html').evaluate(() => { const r: string[] = []; try { void window.parent.document; r.push('parent'); } catch { /* blocked */ } try { void document.cookie; r.push('cookie'); } catch { /* blocked */ } try { void localStorage; r.push('storage'); } catch { /* blocked */ } return r; })).toEqual([]);
+    const paths = o.seen.map(s => s.path);
+    await expect.poll(() => o.seen.some(s => s.path === '/tone.wav')).toBe(true);
+    expect(await guest(page).locator('#audio').getAttribute('autoplay')).toBeNull();
+    for (const expected of ['/style.css', '/pixel.png', '/lib.js', '/data.json', '/events', '/ws']) expect(paths, expected).toContain(expected);
+    await expect.poll(() => o.seen.some(s => s.path === '/font.woff2')).toBe(true);
+    expect(o.plain).toEqual([]);
+    const fromWidget = o.seen.filter(s => s.path !== '/set-cookie');
+    // No request names the App or the widget: the only referrer is an external stylesheet's own URL for its font.
+    expect(fromWidget.filter(s => s.referer && !s.referer.startsWith(o.base + '/style.css') || s.authorization || s.cookie?.includes('app_session'))).toEqual([]);
+    // Script-initiated requests never send cookies; record what document resource loads do.
+    expect(fromWidget.filter(s => ['/data.json', '/events', '/lib.js', '/not-js'].includes(s.path) && s.cookie)).toEqual([]);
+    test.info().annotations.push({ type: 'third-party cookie on document resources', description: JSON.stringify(fromWidget.filter(s => s.cookie).map(s => s.path)) });
+    await expect(page.getByText('组件未能完整运行', { exact: false }).first()).toBeVisible(); // the non-JavaScript script reports a warning, static content stays
+  } finally { await f.dispose(); await o.close(); }
+});
+
+test('with widget network off, the same widget requests nothing and keeps its static markup', async ({ page }) => {
+  test.setTimeout(120_000);
+  const o = await origin();
+  const f = await fixture(page, probe(o));
+  try {
+    await widgetNetwork(page, false);
+    await f.publish();
+    await expect(guest(page).locator('#styled')).toHaveText('外部样式');
+    await expect(guest(page).locator('#results')).not.toHaveText('pending', { timeout: 20_000 });
+    const results = JSON.parse(await guest(page).locator('#results').innerText());
+    expect(results).toMatchObject({ lib: 'missing', fetch: 'blocked', xhr: 'blocked', sse: 'blocked', ws: 'blocked', http: 'blocked', loopback: 'blocked', rtc: 'blocked' });
+    expect(await guest(page).locator('#image').getAttribute('src')).toBeNull();
+    expect(await guest(page).locator('link').count()).toBe(0);
+    expect(await guest(page).locator('audio').count()).toBe(0);
+    await page.waitForTimeout(500);
+    expect(o.seen).toEqual([]); expect(o.plain).toEqual([]);
+  } finally { await f.dispose(); await o.close(); }
+});

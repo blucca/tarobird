@@ -466,6 +466,8 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
           </div>
           <p id="link-preview-style-note" className="settings-note muted">{t("卡片显示标题、摘要和封面（网页提供时）；标题仅显示标题和域名。")}</p>
           <p id="link-preview-style-scope" className="settings-note muted">{t("用于此设备新发送的链接，已发送消息保持原样。")}</p>
+          <div className="settings-group"><div className="settings-row"><span id="widget-network-setting">{t("允许小组件联网")}</span><button type="button" className="model-brand-toggle" role="switch" aria-labelledby="widget-network-setting" aria-describedby="widget-network-note" aria-checked={preferences.widgetNetwork !== false} onClick={() => update({ ...preferences, widgetNetwork: preferences.widgetNetwork === false })}><span className="model-brand-toggle-track" aria-hidden="true"/></button></div></div>
+          <p id="widget-network-note" className="settings-note muted">{t("开启后，聊天里的小组件可通过 https 加载图片、字体、样式和脚本并访问网络，也能把它显示的数据发到外部；关闭后只显示组件自带的内容。仅对此设备有效。")}</p>
           {state.dispatchAvailable && <><div className="settings-group"><div className="settings-row"><span id="ticket-conversations-setting">{t("在列表里显示工单对话")}</span><button type="button" className="model-brand-toggle" role="switch" aria-labelledby="ticket-conversations-setting" aria-describedby="ticket-conversations-note" aria-checked={preferences.showTicketConversations === true} onClick={() => update({ ...preferences, showTicketConversations: preferences.showTicketConversations !== true })}><span className="model-brand-toggle-track" aria-hidden="true"/></button></div></div>
           <p id="ticket-conversations-note" className="settings-note muted">{t("调试用：显示幕僚长派活时开的内部对话。")}</p></>}
           <SettingsGroupHeading scope="device">{t("外观")}</SettingsGroupHeading>

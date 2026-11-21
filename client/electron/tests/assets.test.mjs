@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { assetPath, assetHandler, APP_CSP } from '../assets.mjs';
 import { developmentPaths, isolatedRoot } from '../isolation.mjs';
-import { internalResource, secureContents, secureSession, secureWebPreferences } from '../security.mjs';
+import { internalResource, secureContents, secureSession, secureWebPreferences, widgetNetworkRequest } from '../security.mjs';
 import { EventEmitter } from 'node:events';
 
 async function fixture(t) {
@@ -61,6 +61,16 @@ test('development state requires a physical .noindex ancestor and refuses redire
 test('default shell refuses arbitrary network, popup, webview and unsafe main-frame navigation', () => {
   for (const url of ['https://example.com', 'http://127.0.0.1:1', 'file:///etc/passwd', 'tarocub://conversation/x', 'tarobot://user@app/index.html']) assert.equal(internalResource(url), false);
   assert.equal(internalResource('tarobot://app/assets/index.js'), true);
+  // Widget network access: https/wss from a widget guest only, never local or private hosts.
+  const relay = { url: 'tarobot-widget://sandbox/widget-sandbox.html', parent: { url: 'tarobot://app/index.html', parent: null } };
+  const guest = { url: 'about:srcdoc', parent: relay }, app = relay.parent, design = { url: 'tarobot-widget://sandbox/design-loader.html', parent: app };
+  assert.equal(widgetNetworkRequest({ url: 'https://cdn.example.com/lib.js', resourceType: 'xhr', frame: guest }), true);
+  assert.equal(widgetNetworkRequest({ url: 'wss://echo.example.com/', resourceType: 'webSocket', frame: null }), true);
+  assert.equal(widgetNetworkRequest({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: app }), false);
+  assert.equal(widgetNetworkRequest({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: design }), false);
+  assert.equal(widgetNetworkRequest({ url: 'https://cdn.example.com/', resourceType: 'subFrame', frame: guest }), false);
+  for (const url of ['http://cdn.example.com/a.js', 'https://127.0.0.1/', 'https://192.168.1.2/', 'https://10.0.0.1/', 'https://[::1]/', 'https://nas.internal/', 'https://router/', 'https://user:pw@cdn.example.com/', 'file:///etc/passwd'])
+    assert.equal(widgetNetworkRequest({ url, resourceType: 'xhr', frame: guest }), false, url);
   const contents = new EventEmitter(); contents.setWindowOpenHandler = callback => { contents.popup = callback; };
   secureContents(contents); assert.deepEqual(contents.popup(), { action: 'deny' });
   let prevented = 0; const event = { preventDefault: () => prevented++ };
@@ -72,11 +82,17 @@ test('default shell refuses arbitrary network, popup, webview and unsafe main-fr
 test('both permission check and request paths deny unimplemented capabilities', () => {
   const session = new EventEmitter(); Object.assign(session, {
     setPermissionRequestHandler: fn => session.request = fn, setPermissionCheckHandler: fn => session.check = fn,
-    setDevicePermissionHandler: fn => session.device = fn, webRequest: { onBeforeRequest: fn => session.network = fn },
+    setDevicePermissionHandler: fn => session.device = fn, webRequest: { onBeforeRequest: fn => session.network = fn, onBeforeSendHeaders: fn => session.send = fn, onHeadersReceived: fn => session.receive = fn },
   });
   secureSession(session); assert.equal(session.check(), false); assert.equal(session.device(), false);
   session.request({}, 'media', accepted => assert.equal(accepted, false));
   session.network({ url: 'https://evil.example' }, result => assert.deepEqual(result, { cancel: true }));
+  session.network({ url: 'https://evil.example', resourceType: 'image', frame: { url: 'tarobot://app/index.html', parent: null } }, result => assert.deepEqual(result, { cancel: true }));
+  const guest = { url: 'about:srcdoc', parent: { url: 'tarobot-widget://sandbox/widget-sandbox.html', parent: { url: 'tarobot://app/index.html', parent: null } } };
+  session.network({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: guest }, result => assert.deepEqual(result, { cancel: false }));
+  session.send({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: guest, requestHeaders: { Cookie: 'a=1', Authorization: 'x', Accept: '*/*' } }, result => assert.deepEqual(result, { requestHeaders: { Accept: '*/*' } }));
+  session.receive({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: guest, responseHeaders: { 'Set-Cookie': ['a=1'], 'Content-Type': ['image/png'] } }, result => assert.deepEqual(result, { responseHeaders: { 'Content-Type': ['image/png'] } }));
+  session.send({ url: 'https://evil.example', resourceType: 'image', requestHeaders: { Cookie: 'a=1' } }, result => assert.deepEqual(result, {}));
 });
 
 test('design loader stays off the App origin and only its fixed path can load', async t => {

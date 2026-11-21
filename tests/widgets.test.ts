@@ -18,7 +18,10 @@ afterEach(async()=>{await Promise.all(roots.splice(0).map(root=>rm(root,{recursi
 it("validates bytes and scripts without executing them, keeps fallback/quotes/forwarding readable",()=>{
   expect(validateWidget({...input,html:'<script>throw new Error("must not execute")</script>'})).toBeTruthy();
   expect(()=>validateWidget({...input,html:'<script>const x = ;</script>'})).toThrow();
-  expect(()=>validateWidget({...input,html:'<script src="https://example.com/x.js"></script>'})).toThrow();
+  // External https scripts and stylesheets are accepted; clients decide whether to load them.
+  expect(validateWidget({...input,html:'<script src="https://example.com/x.js"></script><link rel="stylesheet" href="https://example.com/x.css"><script>use()</script>'}).html).toContain('x.js');
+  for (const html of ['<script src="http://example.com/x.js"></script>','<script src="/x.js"></script>','<script type="module" src="https://example.com/x.js"></script>','<link rel="stylesheet" href="http://example.com/x.css">','<link rel="icon" href="https://example.com/x.ico">','<link rel="preconnect" href="https://example.com">','<iframe src="https://example.com"></iframe>'])
+    expect(()=>validateWidget({...input,html}),html).toThrow();
   expect(()=>validateWidget({...input,html:'<meta http-equiv="refresh" content="0;url=https://example.com">'})).toThrow();
   expect(widgetInputSchema.safeParse({...input,html:'中'.repeat(MAX_WIDGET_BYTES/2)}).success).toBe(false);
   expect(widgetInputSchema.safeParse({...input,conversationId:'victim'}).success).toBe(false);
@@ -83,7 +86,7 @@ it("keeps the full widget recipe on demand for native tools and out of unrelated
 it("minimal widget facts are shared without changing frozen tool definitions", async () => {
   const recipe = appCapabilityInstructions('widgets');
   // Only facts needed for a widget that runs: publication, runtime limits, theme variables and contracts.
-  for (const fact of ['Only tool-call fences execute', '128 KiB', 'Scripts run in a Worker against a virtual DOM', '2,048 elements', 'tarobot.state.set', 'tarobot.prompt.compose', 'returns true only if inserted', "tarobot:theme", '--cat-1 to --cat-8', 'up to 720 px', 'SVG paints black unless given a fill', 'data-canvas-theme="light" or "dark" on that element', 'gets a light canvas, or a dark one', 'Report schema']) expect(recipe).toContain(fact);
+  for (const fact of ['Only tool-call fences execute', '128 KiB', 'run in a Worker against a virtual DOM', 'https/wss only, no cookies, no local or private hosts', 'unless the user turned widget networking off'.replace('unless','Unless'), '2,048 elements', 'tarobot.state.set', 'tarobot.prompt.compose', 'returns true only if inserted', "tarobot:theme", '--cat-1 to --cat-8', 'up to 720 px', 'SVG paints black unless given a fill', 'data-canvas-theme="light" or "dark" there fixes it', 'gets a light canvas (dark if', 'Report schema']) expect(recipe).toContain(fact);
   // Style, layout, colour, interaction and usage advice is left to the author.
   for (const retired of ['Use an interactive widget when', 'Start with at most one short factual conclusion', 'Use colour generously', 'Never put text on a solid', 'Interaction recipes', 'Round percentages', 'Honor reduced motion', 'Derive totals', 'Reserve saturated color', 'Avoid repeated titles']) expect(recipe).not.toContain(retired);
   const sum = widgetGuidance.length + reportCompatibilityGuidance.length;

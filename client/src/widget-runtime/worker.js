@@ -28,6 +28,10 @@ const send = (data, overflow='limit') => {
   transport(text);
 };
 const later = setTimeout.bind(self), cancel = clearTimeout.bind(self);
+// Network primitives are captured before the lockdown below. Guest code reaches
+// them only through the guarded wrappers in init, and only when the App setting
+// allows widget network access (the frame CSP enforces the same switch).
+const nativeFetch = self.fetch?.bind(self), NativeXMLHttpRequest = self.XMLHttpRequest, NativeWebSocket = self.WebSocket, NativeEventSource = self.EventSource, NativeURL = URL;
 const nativeNow = performance.now.bind(performance);
 // Capability boundary: authored code gets ECMAScript built-ins, timers,
 // microtasks, crypto random values and the virtual DOM below. Networking,
@@ -525,7 +529,48 @@ function render(initial=false) {
 }
 function identify(node){let id=ids.get(node);if(!id){id=String(++nextId);ids.set(node,id);node.setAttribute('data-tarobot-node',id)}return id}
 const rect=value=>value&&typeof value==='object'&&['x','y','width','height'].every(key=>Number.isFinite(value[key]))?{x:value.x,y:value.y,width:value.width,height:value.height,top:value.y,left:value.x,right:value.x+value.width,bottom:value.y+value.height}:undefined;
-function init(data) {
+// https/wss only, never credentials or a referrer, and no host written as a
+// loopback, private, link-local or local name. A public name that resolves to a
+// private address is not detectable here; browser private-network rules apply.
+const localHost=name=>{
+ const host=name.toLowerCase().replace(/^\[|\]$/g,'').replace(/\.$/,'');
+ if(host==='localhost'||/\.(?:localhost|local|internal|lan|home\.arpa)$/.test(host)||!host.includes('.')&&!host.includes(':'))return true;
+ const v4=/^(\d+)\.(\d+)\.\d+\.\d+$/.exec(host);
+ if(v4){const a=Number(v4[1]),b=Number(v4[2]);return a===0||a===10||a===127||a===169&&b===254||a===172&&b>=16&&b<=31||a===192&&b===168||a===100&&b>=64&&b<=127||a>=224}
+ return host.includes(':')&&(host==='::1'||host==='::'||/^f[cd]|^fe[89ab]|^::ffff:/.test(host));
+};
+const networkUrl=(value,protocol)=>{
+ let url;try{url=new NativeURL(String(value))}catch{throw new TypeError(`Widget network needs an absolute ${protocol}// URL`)}
+ if(url.protocol!==protocol)throw new TypeError(`Widget network uses ${protocol} only`);
+ if(url.username||url.password||localHost(url.hostname))throw new TypeError('Widget network cannot reach local or private hosts or send credentials');
+ return url.href;
+};
+const openStreams=new Set(),streamLimit=4,trackStream=stream=>{if(openStreams.size>=streamLimit)throw new Error('Too many open widget connections');openStreams.add(stream);stream.addEventListener('close',()=>openStreams.delete(stream));stream.addEventListener('error',()=>{if(stream.readyState===2)openStreams.delete(stream)});return stream};
+function networkApis(){
+ const fetch=(input,init)=>{try{const url=networkUrl(typeof input==='object'&&input!==null&&!(input instanceof NativeURL)?input.url:input,'https:');return nativeFetch(typeof input==='object'&&input!==null&&!(input instanceof NativeURL)?input:url,{...(init??{}),credentials:'omit',referrerPolicy:'no-referrer'})}catch(cause){return Promise.reject(cause)}};
+ class XMLHttpRequest extends NativeXMLHttpRequest{open(method,url,...rest){return super.open(method,networkUrl(url,'https:'),...rest)}get withCredentials(){return false}set withCredentials(value){/* Credentials are never sent. */}}
+ class WebSocket extends NativeWebSocket{constructor(url,protocols){super(networkUrl(url,'wss:'),protocols);trackStream(this)}close(...args){openStreams.delete(this);return super.close(...args)}}
+ class EventSource extends NativeEventSource{constructor(url){super(networkUrl(url,'https:'),{withCredentials:false});trackStream(this)}close(){openStreams.delete(this);return super.close()}}
+ return {fetch,XMLHttpRequest,WebSocket,EventSource};
+}
+// External <script src="https://..."> text is fetched under the same guard and
+// evaluated in the guest scope before inline scripts, in document order.
+async function externalScripts(sources){
+ const texts=[];let total=0;
+ for(const src of sources.slice(0,16)){
+  try{
+   const controller=new AbortController(),timer=later(()=>controller.abort(),15000);
+   const response=await nativeFetch(networkUrl(src,'https:'),{credentials:'omit',referrerPolicy:'no-referrer',signal:controller.signal}).finally(()=>cancel(timer));
+   if(!response.ok)throw new Error(`HTTP ${response.status}`);
+   if(!/javascript|ecmascript/i.test(response.headers.get('content-type')??''))throw new Error('response is not JavaScript');
+   const text=await response.text();total+=text.length;
+   if(text.length>4*1024*1024||total>8*1024*1024)throw new Error('script is too large');
+   texts.push(text);
+  }catch(cause){error(`External script ${String(src).slice(0,200)} did not load: ${cause?.message??cause}`)}
+ }
+ return texts;
+}
+async function init(data) {
   const parsed=parseHTML('<!doctype html><html><head></head><body>'+data.html+'</body></html>');
   doc=parsed.document;const globals=Object.create(null);win=new Proxy(globals,{get(target,name){return Object.hasOwn(target,name)?target[name]:parsed[name]}});Object.defineProperty(doc,'defaultView',{value:win});theme=data.theme??{};viewport=data.viewport??viewport;reducedMotion=data.reducedMotion===true;
   windowEvents=new parsed.EventTarget();
@@ -533,8 +578,9 @@ function init(data) {
   const tarobot=Object.freeze({prompt:Object.freeze({compose:text=>compose(text)}),state:Object.freeze({initial,set:value=>setState(value)})});
   const handler=installEvents(parsed),{FormData,Option}=installControls(parsed);
   Object.defineProperty(doc,'activeElement',{configurable:true,get:()=>activeElement&&doc.contains(activeElement)?activeElement:doc.body});
-  const scripts=[...doc.querySelectorAll('script')].map(node=>{const text=node.textContent;node.remove();return text});
-  for(const node of doc.querySelectorAll('iframe,object,embed,base,meta,link'))node.remove();
+  const network=data.network===true&&!!nativeFetch,sources=[];
+  const scripts=[...doc.querySelectorAll('script')].map(node=>{const src=node.getAttribute('src'),text=node.textContent;node.remove();if(src!==null){if(network)sources.push(src);return ''}return text});
+  for(const node of doc.querySelectorAll('iframe,object,embed,base,meta,link'))if(!(network&&node.localName==='link'&&node.getAttribute('rel')?.trim().toLowerCase()==='stylesheet'))node.remove();
   // Real border-box geometry arrives with pointer events and ResizeObserver;
   // until then an element reports the frame viewport.
   const dimensions=function(){const box=geometry.get(ids.get(this));return box?{...box}:{width:viewport.width,height:viewport.height,top:0,left:0,right:viewport.width,bottom:viewport.height,x:0,y:0}};
@@ -559,7 +605,8 @@ function init(data) {
     requestAnimationFrame:callback=>later(()=>callback(nativeNow()),16),cancelAnimationFrame:cancel,
     addEventListener:windowEvents.addEventListener.bind(windowEvents),removeEventListener:windowEvents.removeEventListener.bind(windowEvents),dispatchEvent:windowEvents.dispatchEvent.bind(windowEvents),
     Image:function(){return doc.createElement('img')},alert:deny,confirm:deny,prompt:deny,open:deny,fetch:()=>Promise.reject(new Error('Network unavailable')),
-    RTCPeerConnection:undefined,webkitRTCPeerConnection:undefined,Worker:undefined,SharedWorker:undefined,WebSocket:undefined,EventSource:undefined,postMessage:undefined,
+    RTCPeerConnection:undefined,webkitRTCPeerConnection:undefined,Worker:undefined,SharedWorker:undefined,WebSocket:undefined,EventSource:undefined,XMLHttpRequest:undefined,postMessage:undefined,
+    ...(network?networkApis():{}),
   };
   // LinkeDOM's defaultView is a proxy over its virtual globals. These definitions
   // do not install or expose any real DOM or native App bridge.
@@ -571,7 +618,15 @@ function init(data) {
   Object.defineProperties(win,{innerWidth:{get:()=>viewport.width},innerHeight:{get:()=>viewport.height}});
   Object.defineProperty(doc,'readyState',{value:'complete',configurable:true});
   const observer=new parsed.MutationObserver(()=>schedule());observer.observe(doc.documentElement,{subtree:true,childList:true,attributes:true,characterData:true});
-  const names=Object.keys(exposed),values=Object.values(exposed);
+  let names=Object.keys(exposed),values=Object.values(exposed);
+  if(sources.length){
+   // Libraries see the same virtual window; names they attach to it become
+   // bare identifiers for the inline scripts that follow.
+   const before=new Set(Object.keys(globals));
+   for(const text of await externalScripts(sources))try{new Function(...names,text).apply(win,values)}catch(cause){error(cause)}
+   const added=Object.keys(globals).filter(name=>!before.has(name)&&!names.includes(name)&&/^[A-Za-z_$][\w$]*$/.test(name));
+   names=[...names,...added];values=[...values,...added.map(name=>globals[name])];
+  }
   try{
     // A shared lexical scope preserves functions referenced by inline handlers.
     // No evaluated code is ever inserted into the real rendering document.
@@ -612,7 +667,7 @@ listen('message',event=>{
   }
   if(stateRetiring)return;
   if(data.type==='ping'){if(typeof data.nonce==='string'&&data.nonce.length<=64)send({type:'pong',nonce:data.nonce});return}
-  if(data.type==='init'&&!started&&typeof data.html==='string'&&data.html.length<=128*1024){started=true;try{init(data)}catch{unsupportedSnapshot()}return}
+  if(data.type==='init'&&!started&&typeof data.html==='string'&&data.html.length<=128*1024){started=true;init(data).catch(()=>unsupportedSnapshot());return}
   if(!doc)return;
   if(data.type==='event'){
     const node=nodes.get(data.id),name=typeof data.name==='string'?data.name:'';if(!node||!name)return;

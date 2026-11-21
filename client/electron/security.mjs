@@ -11,6 +11,33 @@ export function internalResource(raw) {
   } catch { return false; }
 }
 
+// Widget network access (an App setting enforced by the widget frame's CSP):
+// https/wss only, without URL credentials or hosts written as loopback,
+// private, link-local or local names. The App document itself stays offline.
+const WIDGET_RELAY = 'tarobot-widget://sandbox/widget-sandbox.html';
+export function localHost(name) {
+  const host = String(name).toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (host === 'localhost' || /\.(?:localhost|local|internal|lan|home\.arpa)$/.test(host) || !host.includes('.') && !host.includes(':')) return true;
+  const v4 = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(host);
+  if (v4) { const a = Number(v4[1]), b = Number(v4[2]); return a === 0 || a === 10 || a === 127 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 100 && b >= 64 && b <= 127 || a >= 224; }
+  return host.includes(':') && (host === '::1' || host === '::' || /^f[cd]|^fe[89ab]|^::ffff:/.test(host));
+}
+export function widgetNetworkURL(raw) {
+  try { const url = new URL(raw); return ['https:', 'wss:'].includes(url.protocol) && !url.username && !url.password && !localHost(url.hostname); } catch { return false; }
+}
+/** A widget guest is an about:srcdoc frame under the fixed widget relay. Dedicated
+ * Worker requests may carry no frame; those connections are governed by the CSP
+ * their creating document applies (the App document allows only 'self'). */
+export function widgetNetworkRequest(details) {
+  if (!widgetNetworkURL(details?.url)) return false;
+  if (['mainFrame', 'subFrame'].includes(details.resourceType)) return false;
+  let frame = details.frame;
+  if (!frame) return ['xhr', 'webSocket', 'other'].includes(details.resourceType);
+  try { for (; frame; frame = frame.parent) { if (frame.url === WIDGET_RELAY) return true; if (frame.url !== 'about:srcdoc') return false; } } catch { /* A detached frame is not trusted. */ }
+  return false;
+}
+const withoutHeaders = (headers, pattern) => Object.fromEntries(Object.entries(headers ?? {}).filter(([name]) => !pattern.test(name)));
+
 /** Only the owned App's main document can ask for microphone/camera access.
  * Widgets, browser content and workers never inherit those grants. The system
  * owns the final media permission; unknown native capabilities remain denied. */
@@ -50,7 +77,10 @@ export function secureSession(session, { owns = () => false, systemPreferences, 
   });
   session.setDevicePermissionHandler(() => false);
   session.on('will-download', event => event.preventDefault());
-  session.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !internalResource(details.url) }));
+  session.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !internalResource(details.url) && !widgetNetworkRequest(details) }));
+  // Widget requests never carry or receive cookies or HTTP credentials.
+  session.webRequest.onBeforeSendHeaders((details, callback) => callback(widgetNetworkRequest(details) ? { requestHeaders: withoutHeaders(details.requestHeaders, /^(?:cookie|authorization|proxy-authorization)$/i) } : {}));
+  session.webRequest.onHeadersReceived((details, callback) => callback(widgetNetworkRequest(details) ? { responseHeaders: withoutHeaders(details.responseHeaders, /^set-cookie2?$/i) } : {}));
 }
 
 export function secureContents(contents) {
