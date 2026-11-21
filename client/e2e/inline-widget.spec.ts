@@ -12,7 +12,6 @@ import { createCoreServiceRuntime } from '../../src/core/runtime.js';
 import { widgetBlock } from '../../src/client-protocol/widget.js';
 import { selectConversation, waitForClientOnline } from './fixtures/mobile.js';
 import { monoAccents } from '../src/palettes.js';
-import { openSettings, closeSettings } from './fixtures/settings.js';
 
 test.use({serviceWorkers:'block'});
 async function fixture(page:Page, html?:string, compatibility=false) {
@@ -71,15 +70,13 @@ test('native tool report: local filters, themes, expansion, reload, phone and AD
  }finally{await f.dispose()}
 });
 
-test('sandbox blocks parent, storage, network and self-navigation',async({page})=>{
+test('sandbox blocks parent, storage and self-navigation',async({page})=>{
  const target='https://widget-exfil.invalid';let requests=0;await page.route(target+'/**',route=>{requests++;return route.abort()});
  const html=`<p id="isolation">checking</p><button id="navigate">navigate</button><script>
  let parentBlocked=false,storageBlocked=false;try{parent.document.body.innerHTML='escaped'}catch{parentBlocked=true}try{localStorage.setItem('x','1')}catch{storageBlocked=true}
- document.getElementById('isolation').textContent=JSON.stringify({parentBlocked,storageBlocked});fetch('${target}/fetch').catch(()=>{});const image=new Image();image.src='${target}/image';document.getElementById('navigate').onclick=()=>location.href='${target}/navigate';
+ document.getElementById('isolation').textContent=JSON.stringify({parentBlocked,storageBlocked});document.getElementById('navigate').onclick=()=>location.href='${target}/navigate';
  </script>`;
  const f=await fixture(page,html);try{
-  // With the App's widget network switch off, widgets stay fully offline.
-  await openSettings(page,'general');await page.getByRole('switch',{name:'允许小组件联网',exact:true}).click();await expect(page.getByRole('switch',{name:'允许小组件联网',exact:true})).toHaveAttribute('aria-checked','false');await closeSettings(page);await selectConversation(page,f.conv.title);
   await requestWidget(page);await expect(guest(page).locator('#isolation')).toHaveText('{"parentBlocked":true,"storageBlocked":true}');
   await guest(page).getByRole('button',{name:'navigate'}).click();
   await page.locator('.widget-summary').evaluate(node=>{(node as HTMLDetailsElement).open=true});await expect(page.getByText(f.widget.summary,{exact:true})).toBeVisible();

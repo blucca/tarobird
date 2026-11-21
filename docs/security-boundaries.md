@@ -840,14 +840,11 @@ responses. See the state model for retention and cancellation limits.
 
 The HTML viewer sits inside two opaque sandbox frames without host/native
 authority; authored scripts now execute in a dedicated Worker. The relay accepts only bounded, source/key-bound presentation messages.
-Network access follows the device setting "Allow widgets to use the network"
-(on by default since 2026-11-21, by the owner's decision). With it off, the
-guest CSP blocks fetch/WebSocket and every external resource, as before. With
-it on, the guest may load https images, media, fonts and stylesheets, and its
-Worker may use fetch, XMLHttpRequest, EventSource and WebSocket over https/wss
-and fetch `<script src="https://…">` text into the Worker; see "Widget network
-access" below. In both modes the trusted bootstrap removes WebRTC constructors
-because CSP does not prevent STUN/UDP. Chromium and WebKit tests use a loopback UDP listener to
+Since 2026-11-21 (the owner's decision) the guest may load https images,
+media, fonts and stylesheets, and its Worker may use fetch, XMLHttpRequest,
+EventSource and WebSocket over https/wss and fetch `<script src="https://…">`
+text into the Worker; see "Widget network access" below. The trusted
+bootstrap removes WebRTC constructors because CSP does not prevent STUN/UDP. Chromium and WebKit tests use a loopback UDP listener to
 verify initial viewing/reload and reject constructor restoration. This is not
 an exhaustive guarantee against browser networking side channels (DNS prefetch
 is not verified). Repeated runtime errors retire execution and retain a text summary; incidental
@@ -872,7 +869,7 @@ JavaScript-thread guarantee. Older clients retain their old reader. See the
 
 ### Widget network access (2026-11-21)
 
-**What a widget can now do.** With the setting on, any published widget can
+**What a widget can now do.** Any published widget can
 send data it contains (including anything the Bot put into it from the
 conversation or from tools) to any public https/wss endpoint, load tracking
 images or fonts, and run third-party scripts fetched at view time inside its
@@ -898,15 +895,15 @@ endpoints.
 - Worker `fetch`/`XMLHttpRequest`/`EventSource` force `credentials: omit` and
   no referrer; URLs with credentials and hosts written as loopback, private,
   link-local, CGNAT, multicast or local names (`localhost`, `*.local`,
-  `*.internal`, `*.lan`, single labels) are refused; at most four WebSockets or
-  EventSources are open at once. External scripts must be served as JavaScript,
-  are limited to 16 files, 4 MiB each and 8 MiB in total, and time out after
-  15 s; a failure leaves the static markup and reports a widget warning.
+  `*.internal`, `*.lan`, single labels) are refused. External script fetches
+  time out after 15 s; a failure leaves the static markup and reports a
+  widget warning.
 - The guest document and relay use `Referrer-Policy: no-referrer`; the sanitizer
   keeps only `<link rel="stylesheet">` and https media, SVG image and stylesheet
   URLs, never navigable links, and strips `autoplay`.
-- Electron allows https/wss in the App session only for requests from a widget
-  guest frame (or frameless Worker connections) and strips `Cookie`,
+- Electron allows https/wss in the App session only for requests whose frame
+  chain is a widget guest under the widget relay (its Workers' requests carry
+  that frame); frameless requests are refused. It strips `Cookie`,
   `Authorization`, `Proxy-Authorization` and `Set-Cookie` on them, so the
   App session's cookie jar never gains widget cookies.
 

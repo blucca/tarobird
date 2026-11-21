@@ -41,7 +41,6 @@ import { CreationDialog } from "./CreationDialog.js";
 import { PageLoadBoundary } from "./PageLoadBoundary.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
 import { applyAppearance, syncThemeColor } from "./appearance.js";
-import { setWidgetNetworkAllowed } from "./widget-network.js";
 import { setTicketConversationsVisible, useTicketConversationsVisible } from "./dispatcher.js";
 import { deleteNativeIdentity, installNativeEvents, nativePlatform, updateBadge } from "./native.js";
 import { installPushActions } from "./notifications.js";
@@ -389,7 +388,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   }, [loading, pool, registry]);
   useEffect(() => {
     if (loading) return;
-    setLocale(preferences.locale); applyAppearance(preferences); setTicketConversationsVisible(preferences.showTicketConversations); setWidgetNetworkAllowed(preferences.widgetNetwork !== false); document.documentElement.style.setProperty("--font-size", `${preferences.fontSize}px`);
+    setLocale(preferences.locale); applyAppearance(preferences); setTicketConversationsVisible(preferences.showTicketConversations); document.documentElement.style.setProperty("--font-size", `${preferences.fontSize}px`);
     void registry.savePreferences(preferences).catch(() => setError(t("无法保存外观设置。")));
   }, [preferences, loading, registry]);
   useEffect(() => { const query = matchMedia("(prefers-color-scheme: dark)"); query.addEventListener("change", syncThemeColor); return () => query.removeEventListener("change", syncThemeColor); }, []);

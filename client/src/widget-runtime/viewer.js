@@ -1,8 +1,6 @@
 import DOMPurify from 'dompurify';
 // Trusted DOM renderer. Authored scripts exist only inside the dedicated Worker.
-const {html,theme:initialTheme,workerSource,key,restore,network:networkSetting}=window.widgetConfiguration;delete window.widgetConfiguration;
-// Widget network access (an App setting): https/wss only, enforced by this frame's CSP.
-const network=networkSetting===true;
+const {html,theme:initialTheme,workerSource,key,restore}=window.widgetConfiguration;delete window.widgetConfiguration;
 const root=document.getElementById('report-root');
 const createElement=document.createElement.bind(document),selectDocument=document.querySelector.bind(document),bodyElement=document.body,htmlElement=document.documentElement;
 // Authored names can shadow document properties (named access); security
@@ -65,10 +63,10 @@ function refreshCanvas(){const next=designCanvas();if(next===canvas)return;canva
 // bindings. Preserve ordinary IDs such as "title"/"method" for CSS and virtual
 // DOM correspondence; frames/embedded plugins and executable attributes remain
 // forbidden. No authored script can use DOM-named globals here.
-const sanitize=value=>DOMPurify.sanitize(value,{FORCE_BODY:true,SANITIZE_DOM:false,FORBID_TAGS:['script','iframe','frame','object','embed','meta','base',...network?[]:['link','audio','video'],'canvas','animate','animateTransform','set','foreignObject'],FORBID_ATTR:['autofocus','srcset','action','formaction','target','download',...network?['autoplay']:[]],ADD_TAGS:network?['link']:[],ADD_ATTR:['data-tarobot-node'],ALLOW_UNKNOWN_PROTOCOLS:false});
-// With network access, only these resource references may point at https:
+const sanitize=value=>DOMPurify.sanitize(value,{FORCE_BODY:true,SANITIZE_DOM:false,FORBID_TAGS:['script','iframe','frame','object','embed','meta','base','canvas','animate','animateTransform','set','foreignObject'],FORBID_ATTR:['autofocus','srcset','action','formaction','target','download','autoplay'],ADD_TAGS:['link'],ADD_ATTR:['data-tarobot-node'],ALLOW_UNKNOWN_PROTOCOLS:false});
+// Only these resource references may point at https (the frame CSP allows https/wss only):
 // media sources, an SVG <image> and a stylesheet <link>. Links never navigate.
-const httpsResource=(element,attr,value)=>network&&/^https:\/\//i.test(value.trim())&&(attr==='src'?['img','audio','video','source','track'].includes(element.localName):attr==='poster'?element.localName==='video':['image','link'].includes(element.localName));
+const httpsResource=(element,attr,value)=>/^https:\/\//i.test(value.trim())&&(attr==='src'?['img','audio','video','source','track'].includes(element.localName):attr==='poster'?element.localName==='video':['image','link'].includes(element.localName));
 // A real form would add named-property clobbering and, in this sandbox, a
 // blocked submission without any submit event. Keep its box as a neutral
 // container: the Worker owns form semantics, submit and reset.
@@ -291,7 +289,7 @@ if(worker){worker.onmessage=event=>{
   }
   else if((data.name==='setPointerCapture'||data.name==='releasePointerCapture')&&activePointers.has(data.pointerId))try{node[data.name](data.pointerId)}catch{/* The pointer is no longer active. */}
  }
-};worker.onerror=()=>{releaseWorkerUrl();unsupported(false)};worker.postMessage({type:'init',html,network,theme:effectiveTheme(),viewport:{width:root.clientWidth,height:320},reducedMotion:matchMedia('(prefers-reduced-motion: reduce)').matches,restore:typeof restore==='string'&&restore.length<=16384?restore:undefined})}
+};worker.onerror=()=>{releaseWorkerUrl();unsupported(false)};worker.postMessage({type:'init',html,theme:effectiveTheme(),viewport:{width:root.clientWidth,height:320},reducedMotion:matchMedia('(prefers-reduced-motion: reduce)').matches,restore:typeof restore==='string'&&restore.length<=16384?restore:undefined})}
 let lastWatch=performance.now();
 if(worker)watchdog=setInterval(()=>{
  if(failed)return;

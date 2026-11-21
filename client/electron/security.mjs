@@ -11,7 +11,7 @@ export function internalResource(raw) {
   } catch { return false; }
 }
 
-// Widget network access (an App setting enforced by the widget frame's CSP):
+// Widget network access (the widget frame's CSP allows https/wss only):
 // https/wss only, without URL credentials or hosts written as loopback,
 // private, link-local or local names. The App document itself stays offline.
 const WIDGET_RELAY = 'tarobot-widget://sandbox/widget-sandbox.html';
@@ -25,14 +25,14 @@ export function localHost(name) {
 export function widgetNetworkURL(raw) {
   try { const url = new URL(raw); return ['https:', 'wss:'].includes(url.protocol) && !url.username && !url.password && !localHost(url.hostname); } catch { return false; }
 }
-/** A widget guest is an about:srcdoc frame under the fixed widget relay. Dedicated
- * Worker requests may carry no frame; those connections are governed by the CSP
- * their creating document applies (the App document allows only 'self'). */
+/** A widget guest is an about:srcdoc frame under the fixed widget relay; its
+ * Workers' requests carry that frame too (Electron 45). Frameless requests, such
+ * as App SharedWorkers or main-process fetches, are never widget traffic. */
 export function widgetNetworkRequest(details) {
   if (!widgetNetworkURL(details?.url)) return false;
   if (['mainFrame', 'subFrame'].includes(details.resourceType)) return false;
   let frame = details.frame;
-  if (!frame) return ['xhr', 'webSocket', 'other'].includes(details.resourceType);
+  if (!frame) return false;
   try { for (; frame; frame = frame.parent) { if (frame.url === WIDGET_RELAY) return true; if (frame.url !== 'about:srcdoc') return false; } } catch { /* A detached frame is not trusted. */ }
   return false;
 }

@@ -85,7 +85,7 @@ it('keeps frozen v7/v8 sessions while new tools recommend HTML and add Design', 
   expect(fresh.description).toContain('Use HTML by default');
   expect(fresh.description).not.toContain('Prefer bounded report');
   expect(fresh.description).toContain('Use proactively when helpful; text when clearer');
-  expect(fresh.description).toContain('No network or host APIs');
+  expect(fresh.description).toContain('https/wss network; no host APIs');
   expect(JSON.stringify(fresh.inputSchema)).toContain('Only on explicit user request');
   expect(fresh.inputSchema.oneOf).toEqual([{ required: ['html'] }, { required: ['report'] }]);
   await current.register('v8');

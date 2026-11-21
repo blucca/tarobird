@@ -29,6 +29,7 @@ export const reportWidgetDefinition: AppPlatformTools["definitions"][number] = {
 };
 
 // Keep the report input for explicit requests and old-message interoperability.
+// htmlWidgetDefinition is frozen for persisted v8-v13 hashes; v14 states network access.
 export const htmlWidgetDefinition: AppPlatformTools["definitions"][number] = {
   ...reportWidgetDefinition,
   description: "Publish an interactive visual inline in this chat. Use HTML by default for charts, tables, timelines and custom controls; use report only when the user explicitly requests that format. Use proactively when helpful; text when clearer. No network or host APIs. Read app_capability topic=widgets for design and authoring guidance. Returns a durable messageId; do not duplicate delivery.",
@@ -37,6 +38,10 @@ export const htmlWidgetDefinition: AppPlatformTools["definitions"][number] = {
       report: { type: "object", description: "Only on explicit user request: version 1 structured report data. Read app_capability topic=widgets for its schema. Otherwise use html. Never supply both." },
     },
   },
+};
+export const networkWidgetDefinition: AppPlatformTools["definitions"][number] = {
+  ...htmlWidgetDefinition,
+  description: htmlWidgetDefinition.description.replace("No network or host APIs.", "https/wss network; no host APIs."),
 };
 
 export async function deliverAppWidget(input: {

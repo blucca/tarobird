@@ -65,7 +65,8 @@ test('default shell refuses arbitrary network, popup, webview and unsafe main-fr
   const relay = { url: 'tarobot-widget://sandbox/widget-sandbox.html', parent: { url: 'tarobot://app/index.html', parent: null } };
   const guest = { url: 'about:srcdoc', parent: relay }, app = relay.parent, design = { url: 'tarobot-widget://sandbox/design-loader.html', parent: app };
   assert.equal(widgetNetworkRequest({ url: 'https://cdn.example.com/lib.js', resourceType: 'xhr', frame: guest }), true);
-  assert.equal(widgetNetworkRequest({ url: 'wss://echo.example.com/', resourceType: 'webSocket', frame: null }), true);
+  assert.equal(widgetNetworkRequest({ url: 'wss://echo.example.com/', resourceType: 'webSocket', frame: guest }), true);
+  for (const resourceType of ['xhr', 'webSocket', 'other']) assert.equal(widgetNetworkRequest({ url: 'wss://echo.example.com/', resourceType, frame: null }), false, resourceType);
   assert.equal(widgetNetworkRequest({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: app }), false);
   assert.equal(widgetNetworkRequest({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: design }), false);
   assert.equal(widgetNetworkRequest({ url: 'https://cdn.example.com/', resourceType: 'subFrame', frame: guest }), false);

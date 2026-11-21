@@ -73,7 +73,6 @@ import { useBackAction } from "./back-navigation.js";
 import { steerReason } from "./Steering.js";
 import { sendSteering, SteeringNotDeliveredError } from "./steering-request.js";
 import { applyAppearance } from "./appearance.js";
-import { setWidgetNetworkAllowed } from "./widget-network.js";
 import { isDispatcher, isTicketNotice, listedConversations, setTicketConversationsVisible, useTicketConversationsVisible } from "./dispatcher.js";
 import { routeTitle } from "./RouteFields.js";
 import { Avatar, AvatarProvider, ConversationAvatar } from "./Avatar.js";
@@ -702,7 +701,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   useEffect(() => {
     // Do not apply or persist initial defaults before IndexedDB has hydrated.
     if (shell || pane || !preferencesReady) return;
-    setLocale(preferences.locale); applyAppearance(preferences); setTicketConversationsVisible(preferences.showTicketConversations); setWidgetNetworkAllowed(preferences.widgetNetwork !== false);
+    setLocale(preferences.locale); applyAppearance(preferences); setTicketConversationsVisible(preferences.showTicketConversations);
     document.documentElement.style.setProperty("--font-size", `${preferences.fontSize}px`);
     void cache.savePreferences(preferences).catch(() => undefined);
   }, [preferences, preferencesReady]);

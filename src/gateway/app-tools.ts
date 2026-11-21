@@ -18,7 +18,7 @@ import { APP_CAPABILITIES, appAgentInstructions, appCapabilityInstructions, appT
 import { GatewayArtifactUploadError, type GatewayChannel } from "./channel.js";
 import { GatewayReceipts } from "./receipts.js";
 import { appArtifactKey, type AppDeliveryReceipt, type AppDeliveryCache } from "./app-delivery.js";
-import { widgetDefinition, reportWidgetDefinition, htmlWidgetDefinition, deliverAppWidget } from "./app-widget.js";
+import { widgetDefinition, reportWidgetDefinition, htmlWidgetDefinition, networkWidgetDefinition, deliverAppWidget } from "./app-widget.js";
 import { batchDefinition, deliverAppBatch } from "./app-batch.js";
 import { appendTimelineEventBestEffort } from "../runtime/timeline-events.js";
 import { buildCoreConversationKey } from "../core/message-normalizer.js";
@@ -95,6 +95,10 @@ const workbenchDefinitionV13 = workbenchDefinitionFor("Operate the current user'
 const workbenchDefinitionsV13 = [...widgetDefinitions.slice(0, -1), htmlWidgetDefinition, workbenchDefinitionV13];
 const minimalWorkbenchDefinitionsV13 = [...permissionDefinitions, workbenchDefinitionV13];
 const toolVersionV13 = hash(JSON.stringify(workbenchDefinitionsV13)), minimalToolVersionV13 = hash(JSON.stringify(minimalWorkbenchDefinitionsV13));
+// v14 corrects the widget description for network access. Without widgets the
+// minimal contract is unchanged and stays v13; older contracts stay frozen.
+const workbenchDefinitionsV14 = [...widgetDefinitions.slice(0, -1), networkWidgetDefinition, workbenchDefinitionV13];
+const toolVersionV14 = hash(JSON.stringify(workbenchDefinitionsV14));
 const reportToolVersion = hash(JSON.stringify(definitions));
 const toolVersion = hash(JSON.stringify(workbenchDefinitions)), batchToolVersion = hash(JSON.stringify(batchDefinitions)), legacyToolVersion = hash(JSON.stringify(legacyDefinitions));
 const result = (value: unknown, isError = false) => ({ text: JSON.stringify(value), ...(isError ? { isError: true } : {}) });
@@ -125,22 +129,22 @@ export function createAppPlatformTools(input: {
   const publications = input.deliveryCache ?? new Map<string, Promise<Json>>();
   const registration = (id: string) => appToolRegistration(input.stateDir, id);
   const versionFor = async (id: string) => (await registration(id).read(null).catch(() => null))?.toolVersion;
-  const makeTools = (version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13, minimal = false): AppPlatformTools => {
+  const makeTools = (version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14, minimal = false): AppPlatformTools => {
     const batch = version !== 1;
     const options = { ...input.options, nativeDelivery: true, nativeBatchDelivery: batch, nativeWidgets: version >= 4 && !minimal, nativeReports: version >= 5 && !minimal, widgetsEnabled: enabled };
     return {
-      definitions: version === 13 ? minimal ? minimalWorkbenchDefinitionsV13 : workbenchDefinitionsV13 : version === 12 ? minimal ? minimalWorkbenchDefinitionsV12 : workbenchDefinitionsV12 : version === 11 ? minimal ? minimalWorkbenchDefinitionsV11 : workbenchDefinitionsV11 : version === 10 ? minimal ? minimalWorkbenchDefinitionsV10 : workbenchDefinitionsV10 : version === 9 ? minimal ? minimalWorkbenchDefinitionsV9 : workbenchDefinitionsV9 : version === 8 ? workbenchDefinitionsV8 : version === 7 ? minimal ? minimalWorkbenchDefinitionsV7 : workbenchDefinitionsV7 : version === 6 ? minimal ? minimalWorkbenchDefinitions : workbenchDefinitions : version === 5 ? definitions : version === 4 ? widgetDefinitions : version === 3 ? permissionDefinitions : batch ? batchDefinitions : legacyDefinitions,
+      definitions: version === 14 ? minimal ? minimalWorkbenchDefinitionsV13 : workbenchDefinitionsV14 : version === 13 ? minimal ? minimalWorkbenchDefinitionsV13 : workbenchDefinitionsV13 : version === 12 ? minimal ? minimalWorkbenchDefinitionsV12 : workbenchDefinitionsV12 : version === 11 ? minimal ? minimalWorkbenchDefinitionsV11 : workbenchDefinitionsV11 : version === 10 ? minimal ? minimalWorkbenchDefinitionsV10 : workbenchDefinitionsV10 : version === 9 ? minimal ? minimalWorkbenchDefinitionsV9 : workbenchDefinitionsV9 : version === 8 ? workbenchDefinitionsV8 : version === 7 ? minimal ? minimalWorkbenchDefinitionsV7 : workbenchDefinitionsV7 : version === 6 ? minimal ? minimalWorkbenchDefinitions : workbenchDefinitions : version === 5 ? definitions : version === 4 ? widgetDefinitions : version === 3 ? permissionDefinitions : batch ? batchDefinitions : legacyDefinitions,
       instructions: [appAgentInstructions(options), input.suppressDelivery ? "This scheduled run is muted: keep artifacts locally; do not publish attachments or emit delivery directives." : undefined].filter(Boolean).join("\n"),
       turnInstructions: [input.turnInstructions, input.turnText ? appTurnInstructions(input.turnText, options) : undefined].filter(Boolean).join("\n\n") || undefined,
       executionInstructions: input.executionInstructions,
       // Codex persists dynamic tools with NEW threads. /resume of an older thread
       // must keep the compatible contract; never reset history to install tools.
-      isRegistered: async (id) => [toolVersionV13, minimalToolVersionV13, toolVersionV12, minimalToolVersionV12, toolVersionV11, minimalToolVersionV11, toolVersionV10, minimalToolVersionV10, toolVersionV9, minimalToolVersionV9, toolVersionV8, toolVersionV7, minimalToolVersionV7, toolVersion, minimalWorkbenchToolVersion, reportToolVersion, widgetToolVersion, permissionToolVersion, batchToolVersion, legacyToolVersion].includes(await versionFor(id) ?? ""),
+      isRegistered: async (id) => [toolVersionV14, toolVersionV13, minimalToolVersionV13, toolVersionV12, minimalToolVersionV12, toolVersionV11, minimalToolVersionV11, toolVersionV10, minimalToolVersionV10, toolVersionV9, minimalToolVersionV9, toolVersionV8, toolVersionV7, minimalToolVersionV7, toolVersion, minimalWorkbenchToolVersion, reportToolVersion, widgetToolVersion, permissionToolVersion, batchToolVersion, legacyToolVersion].includes(await versionFor(id) ?? ""),
       forSession: async (id) => {
         const version = await versionFor(id);
-        return version === toolVersionV13 ? makeTools(13) : version === minimalToolVersionV13 ? makeTools(13, true) : version === toolVersionV12 ? makeTools(12) : version === minimalToolVersionV12 ? makeTools(12, true) : version === toolVersionV11 ? makeTools(11) : version === minimalToolVersionV11 ? makeTools(11, true) : version === toolVersionV10 ? makeTools(10) : version === minimalToolVersionV10 ? makeTools(10, true) : version === toolVersionV9 ? makeTools(9) : version === minimalToolVersionV9 ? makeTools(9, true) : version === toolVersionV8 ? makeTools(8) : version === minimalToolVersionV7 ? makeTools(7, true) : version === toolVersionV7 ? makeTools(7) : version === minimalWorkbenchToolVersion ? makeTools(6, true) : version === toolVersion ? makeTools(6) : version === reportToolVersion ? makeTools(5) : version === widgetToolVersion ? makeTools(4) : version === permissionToolVersion ? makeTools(3) : version === batchToolVersion ? makeTools(2) : version === legacyToolVersion ? makeTools(1) : undefined;
+        return version === toolVersionV14 ? makeTools(14) : version === toolVersionV13 ? makeTools(13) : version === minimalToolVersionV13 ? makeTools(13, true) : version === toolVersionV12 ? makeTools(12) : version === minimalToolVersionV12 ? makeTools(12, true) : version === toolVersionV11 ? makeTools(11) : version === minimalToolVersionV11 ? makeTools(11, true) : version === toolVersionV10 ? makeTools(10) : version === minimalToolVersionV10 ? makeTools(10, true) : version === toolVersionV9 ? makeTools(9) : version === minimalToolVersionV9 ? makeTools(9, true) : version === toolVersionV8 ? makeTools(8) : version === minimalToolVersionV7 ? makeTools(7, true) : version === toolVersionV7 ? makeTools(7) : version === minimalWorkbenchToolVersion ? makeTools(6, true) : version === toolVersion ? makeTools(6) : version === reportToolVersion ? makeTools(5) : version === widgetToolVersion ? makeTools(4) : version === permissionToolVersion ? makeTools(3) : version === batchToolVersion ? makeTools(2) : version === legacyToolVersion ? makeTools(1) : undefined;
       },
-      register: async (id) => registration(id).write({ toolVersion: version === 13 ? minimal ? minimalToolVersionV13 : toolVersionV13 : version === 12 ? minimal ? minimalToolVersionV12 : toolVersionV12 : version === 11 ? minimal ? minimalToolVersionV11 : toolVersionV11 : version === 10 ? minimal ? minimalToolVersionV10 : toolVersionV10 : version === 9 ? minimal ? minimalToolVersionV9 : toolVersionV9 : version === 8 ? toolVersionV8 : version === 7 ? minimal ? minimalToolVersionV7 : toolVersionV7 : version === 6 ? minimal ? minimalWorkbenchToolVersion : toolVersion : version === 5 ? reportToolVersion : version === 4 ? widgetToolVersion : version === 3 ? permissionToolVersion : batch ? batchToolVersion : legacyToolVersion }),
+      register: async (id) => registration(id).write({ toolVersion: version === 14 ? minimal ? minimalToolVersionV13 : toolVersionV14 : version === 13 ? minimal ? minimalToolVersionV13 : toolVersionV13 : version === 12 ? minimal ? minimalToolVersionV12 : toolVersionV12 : version === 11 ? minimal ? minimalToolVersionV11 : toolVersionV11 : version === 10 ? minimal ? minimalToolVersionV10 : toolVersionV10 : version === 9 ? minimal ? minimalToolVersionV9 : toolVersionV9 : version === 8 ? toolVersionV8 : version === 7 ? minimal ? minimalToolVersionV7 : toolVersionV7 : version === 6 ? minimal ? minimalWorkbenchToolVersion : toolVersion : version === 5 ? reportToolVersion : version === 4 ? widgetToolVersion : version === 3 ? permissionToolVersion : batch ? batchToolVersion : legacyToolVersion }),
       call: async (call) => inTurn(() => withChannelProfile("gateway", async () => {
         const signal = AbortSignal.any([input.signal, call.abortSignal]);
         if (signal.aborted) return result({ error: "turn_ended" }, true);
@@ -279,5 +283,5 @@ export function createAppPlatformTools(input: {
       })),
     };
   };
-  return makeTools(13, !enabled);
+  return makeTools(14, !enabled);
 }

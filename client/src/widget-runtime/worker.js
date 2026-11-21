@@ -29,8 +29,7 @@ const send = (data, overflow='limit') => {
 };
 const later = setTimeout.bind(self), cancel = clearTimeout.bind(self);
 // Network primitives are captured before the lockdown below. Guest code reaches
-// them only through the guarded wrappers in init, and only when the App setting
-// allows widget network access (the frame CSP enforces the same switch).
+// them only through the guarded wrappers in init; the frame CSP allows https/wss only.
 const nativeFetch = self.fetch?.bind(self), NativeXMLHttpRequest = self.XMLHttpRequest, NativeWebSocket = self.WebSocket, NativeEventSource = self.EventSource, NativeURL = URL;
 const nativeNow = performance.now.bind(performance);
 // Capability boundary: authored code gets ECMAScript built-ins, timers,
@@ -545,27 +544,23 @@ const networkUrl=(value,protocol)=>{
  if(url.username||url.password||localHost(url.hostname))throw new TypeError('Widget network cannot reach local or private hosts or send credentials');
  return url.href;
 };
-const openStreams=new Set(),streamLimit=4,trackStream=stream=>{if(openStreams.size>=streamLimit)throw new Error('Too many open widget connections');openStreams.add(stream);stream.addEventListener('close',()=>openStreams.delete(stream));stream.addEventListener('error',()=>{if(stream.readyState===2)openStreams.delete(stream)});return stream};
 function networkApis(){
  const fetch=(input,init)=>{try{const url=networkUrl(typeof input==='object'&&input!==null&&!(input instanceof NativeURL)?input.url:input,'https:');return nativeFetch(typeof input==='object'&&input!==null&&!(input instanceof NativeURL)?input:url,{...(init??{}),credentials:'omit',referrerPolicy:'no-referrer'})}catch(cause){return Promise.reject(cause)}};
  class XMLHttpRequest extends NativeXMLHttpRequest{open(method,url,...rest){return super.open(method,networkUrl(url,'https:'),...rest)}get withCredentials(){return false}set withCredentials(value){/* Credentials are never sent. */}}
- class WebSocket extends NativeWebSocket{constructor(url,protocols){super(networkUrl(url,'wss:'),protocols);trackStream(this)}close(...args){openStreams.delete(this);return super.close(...args)}}
- class EventSource extends NativeEventSource{constructor(url){super(networkUrl(url,'https:'),{withCredentials:false});trackStream(this)}close(){openStreams.delete(this);return super.close()}}
+ class WebSocket extends NativeWebSocket{constructor(url,protocols){super(networkUrl(url,'wss:'),protocols)}}
+ class EventSource extends NativeEventSource{constructor(url){super(networkUrl(url,'https:'),{withCredentials:false})}}
  return {fetch,XMLHttpRequest,WebSocket,EventSource};
 }
 // External <script src="https://..."> text is fetched under the same guard and
 // evaluated in the guest scope before inline scripts, in document order.
 async function externalScripts(sources){
- const texts=[];let total=0;
- for(const src of sources.slice(0,16)){
+ const texts=[];
+ for(const src of sources){
   try{
    const controller=new AbortController(),timer=later(()=>controller.abort(),15000);
    const response=await nativeFetch(networkUrl(src,'https:'),{credentials:'omit',referrerPolicy:'no-referrer',signal:controller.signal}).finally(()=>cancel(timer));
    if(!response.ok)throw new Error(`HTTP ${response.status}`);
-   if(!/javascript|ecmascript/i.test(response.headers.get('content-type')??''))throw new Error('response is not JavaScript');
-   const text=await response.text();total+=text.length;
-   if(text.length>4*1024*1024||total>8*1024*1024)throw new Error('script is too large');
-   texts.push(text);
+   texts.push(await response.text());
   }catch(cause){error(`External script ${String(src).slice(0,200)} did not load: ${cause?.message??cause}`)}
  }
  return texts;
@@ -578,7 +573,7 @@ async function init(data) {
   const tarobot=Object.freeze({prompt:Object.freeze({compose:text=>compose(text)}),state:Object.freeze({initial,set:value=>setState(value)})});
   const handler=installEvents(parsed),{FormData,Option}=installControls(parsed);
   Object.defineProperty(doc,'activeElement',{configurable:true,get:()=>activeElement&&doc.contains(activeElement)?activeElement:doc.body});
-  const network=data.network===true&&!!nativeFetch,sources=[];
+  const network=!!nativeFetch,sources=[];
   const scripts=[...doc.querySelectorAll('script')].map(node=>{const src=node.getAttribute('src'),text=node.textContent;node.remove();if(src!==null){if(network)sources.push(src);return ''}return text});
   for(const node of doc.querySelectorAll('iframe,object,embed,base,meta,link'))if(!(network&&node.localName==='link'&&node.getAttribute('rel')?.trim().toLowerCase()==='stylesheet'))node.remove();
   // Real border-box geometry arrives with pointer events and ResizeObserver;

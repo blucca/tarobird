@@ -12,7 +12,6 @@ import { t, useLocale } from "./i18n.js";
 import "./widget.css";
 import { WidgetComposeContext, widgetComposeText } from "./widget-compose.js";
 import { widgetDiagnostic, widgetRepairDraft } from "./widget-repair.js";
-import { useWidgetNetworkAllowed } from "./widget-network.js";
 import widgetRuntime from "virtual:widget-runtime";
 import { widgetFingerprint, widgetStopReason, stopWidget, retryWidget, type WidgetStopReason } from "./widget-quarantine.js";
 
@@ -41,9 +40,7 @@ function InteractiveWidget({ widget, instanceKey, showHeader, onReady, onRenderE
   const composeRef = useRef(compose); composeRef.current = compose;
   const [stateWarning, setStateWarning] = useState(false);
   const lease = useRef<WidgetStateSession | undefined>(undefined);
-  const [runtime, setRuntime] = useState<{ key: string; widget: WidgetData; scope?: string; fingerprint: string; attempt: number; owner: string; network: boolean }>();
-  // Changing the App's widget network setting restarts open widgets under the new policy.
-  const network = useWidgetNetworkAllowed();
+  const [runtime, setRuntime] = useState<{ key: string; widget: WidgetData; scope?: string; fingerprint: string; attempt: number; owner: string }>();
   const [composed, setComposed] = useState<boolean>();
   const [repairAccepted, setRepairAccepted] = useState(false);
   const repairPending = useRef(false);
@@ -109,13 +106,13 @@ function InteractiveWidget({ widget, instanceKey, showHeader, onReady, onRenderE
   useMessageReader(running || active && expanded);
   useLayoutEffect(() => {
     if (runtime) {
-      if (!shouldRun || runtime.widget.html !== widget.html || runtime.scope !== scope || runtime.attempt !== attempt || runtime.owner !== owner || runtime.network !== network) {
+      if (!shouldRun || runtime.widget.html !== widget.html || runtime.scope !== scope || runtime.attempt !== attempt || runtime.owner !== owner) {
         setRuntimeRetiring(true);
         if (!authorized || stopped || error === "runtime") lease.current?.discard();
         else void lease.current?.retire();
       }
-    } else if (shouldRun && fingerprint) setRuntime({ key: crypto.randomUUID(), widget, scope, fingerprint, attempt, owner, network });
-  }, [runtime, shouldRun, widget, scope, fingerprint, attempt, owner, stopped, error, authorized, network]);
+    } else if (shouldRun && fingerprint) setRuntime({ key: crypto.randomUUID(), widget, scope, fingerprint, attempt, owner });
+  }, [runtime, shouldRun, widget, scope, fingerprint, attempt, owner, stopped, error, authorized]);
   useEffect(() => { if (!active || !authorized) setExpanded(false); }, [active, authorized]);
   const close = () => setExpanded(false);
   useBackAction(panel, () => { if (!expanded) return false; close(); }, 210);
@@ -143,7 +140,7 @@ function InteractiveWidget({ widget, instanceKey, showHeader, onReady, onRenderE
       if (session.retiring || lease.current !== session || !frame.current) return;
       setStateWarning(widgetStateFailed(runtime.scope, runtime.fingerprint));
       session.markInitialized();
-      frame.current.contentWindow?.postMessage({ type: "tarobot-widget-init", key, title: runtime.widget.title, document: widgetDocument(runtime.widget, key, theme, widgetRuntime, state, runtime.network) }, "*");
+      frame.current.contentWindow?.postMessage({ type: "tarobot-widget-init", key, title: runtime.widget.title, document: widgetDocument(runtime.widget, key, theme, widgetRuntime, state) }, "*");
     });
   };
   useLayoutEffect(() => {

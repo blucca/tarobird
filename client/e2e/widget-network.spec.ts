@@ -14,7 +14,6 @@ import { hashSecret } from '../../src/hub/auth.js';
 import { attachGateway } from '../../src/gateway/service.js';
 import { createCoreServiceRuntime } from '../../src/core/runtime.js';
 import { selectConversation, waitForClientOnline } from './fixtures/mobile.js';
-import { openSettings, closeSettings } from './fixtures/settings.js';
 
 // A local https/wss origin under a public-looking name; no external site is contacted.
 const HOST = 'widget-net.test';
@@ -68,13 +67,6 @@ async function fixture(page: Page, html: string) {
   return { conv, publish: async () => { await selectConversation(page, conv.title); await page.getByLabel('消息', { exact: true }).fill('联网试试'); await page.getByRole('button', { name: '发送消息', exact: true }).click(); }, dispose: async () => { await page.close(); await gateway.disconnect(); await hub.close(); await rm(root, { recursive: true, force: true }); } };
 }
 const guest = (page: Page): FrameLocator => page.frameLocator('.widget-panel:visible > iframe').frameLocator('iframe');
-async function widgetNetwork(page: Page, on: boolean) {
-  await openSettings(page, 'general');
-  const toggle = page.getByRole('switch', { name: '允许小组件联网', exact: true });
-  await expect(toggle).toHaveAttribute('aria-checked', 'true'); // on by default
-  if (!on) { await toggle.click(); await expect(toggle).toHaveAttribute('aria-checked', 'false'); }
-  await closeSettings(page);
-}
 const probe = (o: Awaited<ReturnType<typeof origin>>) => `<link rel="stylesheet" href="${o.base}/style.css"><p id="styled" class="styled font">外部样式</p><img id="image" src="${o.base}/pixel.png" alt="外部图片" width="12" height="12"><img id="plain-image" src="http://${HOST}:${o.httpPort}/plain.png" alt="明文图片" width="12" height="12"><audio id="audio" src="${o.base}/tone.wav" preload="auto" controls autoplay></audio><p id="results">pending</p>
 <script src="${o.base}/lib.js"></script><script src="${o.base}/not-js"></script>
 <script>
@@ -93,7 +85,7 @@ Promise.all([
 ]).then(function(){document.getElementById('results').textContent=JSON.stringify(out)});
 </script>`;
 
-test('with widget network on, https/wss resources and requests work while isolation holds', async ({ page, context }) => {
+test('https/wss resources and requests work while isolation holds', async ({ page, context }) => {
   test.setTimeout(120_000);
   const o = await origin();
   // A top-level visit gives the test origin its own cookie; widget requests must not carry it.
@@ -122,25 +114,7 @@ test('with widget network on, https/wss resources and requests work while isolat
     // Script-initiated requests never send cookies; record what document resource loads do.
     expect(fromWidget.filter(s => ['/data.json', '/events', '/lib.js', '/not-js'].includes(s.path) && s.cookie)).toEqual([]);
     test.info().annotations.push({ type: 'third-party cookie on document resources', description: JSON.stringify(fromWidget.filter(s => s.cookie).map(s => s.path)) });
-    await expect(page.getByText('组件未能完整运行', { exact: false }).first()).toBeVisible(); // the non-JavaScript script reports a warning, static content stays
+    await expect(page.getByText('组件未能完整运行', { exact: false }).first()).toBeVisible(); // a script that fails to run reports a warning, static content stays
   } finally { await f.dispose(); await o.close(); }
 });
 
-test('with widget network off, the same widget requests nothing and keeps its static markup', async ({ page }) => {
-  test.setTimeout(120_000);
-  const o = await origin();
-  const f = await fixture(page, probe(o));
-  try {
-    await widgetNetwork(page, false);
-    await f.publish();
-    await expect(guest(page).locator('#styled')).toHaveText('外部样式');
-    await expect(guest(page).locator('#results')).not.toHaveText('pending', { timeout: 20_000 });
-    const results = JSON.parse(await guest(page).locator('#results').innerText());
-    expect(results).toMatchObject({ lib: 'missing', fetch: 'blocked', xhr: 'blocked', sse: 'blocked', ws: 'blocked', http: 'blocked', loopback: 'blocked', rtc: 'blocked' });
-    expect(await guest(page).locator('#image').getAttribute('src')).toBeNull();
-    expect(await guest(page).locator('link').count()).toBe(0);
-    expect(await guest(page).locator('audio').count()).toBe(0);
-    await page.waitForTimeout(500);
-    expect(o.seen).toEqual([]); expect(o.plain).toEqual([]);
-  } finally { await f.dispose(); await o.close(); }
-});
