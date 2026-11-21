@@ -1,7 +1,7 @@
 import { screenControllerCode, screenModifierModeApplies, screenShortcuts, type ScreenModifierMode } from "../../src/client-protocol/screen-keys.js";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Capacitor } from "@capacitor/core";
-import { Maximize, Maximize2, Minimize, Minimize2, X, Monitor, MoreHorizontal, ChevronDown, Unplug, Keyboard } from "lucide-react";
+import { Maximize, Maximize2, Minimize, Minimize2, X, Monitor, MoreHorizontal, ChevronDown, Unplug, Keyboard, Plug, MousePointer2 } from "lucide-react";
 import type { HubConnection } from "./connection.js";
 import type { ScreenStatus } from "../../src/client-protocol/remote-screen.js";
 import { screenInputEventSchema, screenKeyCodeSchema } from "../../src/client-protocol/remote-screen.js";
@@ -16,8 +16,22 @@ import { isScreenReasonCode } from "./screen-errors.js";
 import { useScreenMobileLifecycle } from "./use-screen-mobile-lifecycle.js";
 import { ScreenTouch, SCREEN_TOUCH_HOLD_MS, type ScreenTransform } from "./screen-touch.js";
 
+// A phone on its side keeps the picture at full height: the heading becomes a
+// right-hand rail and the status a small label over the picture. Tablets and
+// portrait phones keep the stacked layout.
+const LANDSCAPE_PHONE = "(orientation: landscape) and (max-height: 540px)";
+const landscapeMedia = () => typeof matchMedia === "function" ? matchMedia(LANDSCAPE_PHONE) : undefined;
+const watchLandscape = (listener: () => void) => { const media = landscapeMedia(); media?.addEventListener("change", listener); return () => media?.removeEventListener("change", listener); };
+const isLandscape = () => !!landscapeMedia()?.matches;
+function useLandscapePhone(enabled: boolean) { const matches = useSyncExternalStore(watchLandscape, isLandscape); return enabled && matches; }
+/** Visible rail captions. Each button keeps its full accessible name, which
+ * contains the caption; "连接" alone is already the noun "Connection". */
+const RAIL_LABELS = { zh: { connect: "连接", disconnect: "断开", control: "控制", stop: "停止", wait: "等待", send: "发送" }, en: { connect: "Connect", disconnect: "End", control: "Control", stop: "Stop", wait: "Wait", send: "Send" } } as const;
+const SCREEN_STATUS_LABEL_MS = 4000;
+
 export function RemoteScreenPanel({connection,hostName,visible,close,openSettings,standalone=false}:{connection:HubConnection;hostName:string;visible:boolean;close:()=>void;openSettings?:()=>void;standalone?:boolean}) {
-  const locale = useLocale(), windows = window.tarobotDesktop?.platform === "win32", mobile = isMobileScreenApp();
+  const locale = useLocale(), windows = window.tarobotDesktop?.platform === "win32", mobile = isMobileScreenApp(), landscape = useLandscapePhone(mobile);
+  const landscapeNow = useRef(landscape); landscapeNow.current = landscape;
   // Android hardware keyboards use Ctrl-based shortcuts; iOS keeps Mac keys.
   // Explicit on-screen shortcuts already contain the target's codes.
   const controller = windows || mobile && Capacitor.getPlatform() === "android" ? "windows" : "mac";
@@ -86,7 +100,11 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   useLayoutEffect(()=>{
     const element=viewport.current;if(!mobile||!element)return;
     const next=new ScreenTouch({width:1,height:1,imageWidth:state.width??640,imageHeight:state.height??360},event=>{if(event.kind==="wheel")viewer.current?.wheel(event);else viewer.current?.input(event);},setTransform);touch.current=next;next.setControl(state.controlling&&state.fresh);
-    const measure=()=>{clearTouch();next.resize({width:element.clientWidth,height:element.clientHeight,imageWidth:state.width??640,imageHeight:state.height??360});setFitSize(next.dimensions);};
+    // Rotation and new streams refit. On a landscape phone the system keyboard
+    // only shortens the picture area: keep the picture's scale and place.
+    let keyboardBefore=false;
+    const measure=()=>{clearTouch();const size={width:element.clientWidth,height:element.clientHeight,imageWidth:state.width??640,imageHeight:state.height??360},keyboard=document.documentElement.dataset.keyboardOpen==="true";
+      if(landscapeNow.current&&(keyboard||keyboardBefore))next.reframe(size);else next.resize(size);keyboardBefore=keyboard;setFitSize(next.dimensions);};
     const observer=new ResizeObserver(measure);observer.observe(element);measure();return()=>{observer.disconnect();clearTouch();if(touch.current===next)touch.current=undefined;};
   },[mobile,state.width,state.height]);
   useEffect(()=>{clearTouch();touch.current?.setControl(state.controlling&&state.fresh);},[state.controlling,state.fresh]);
@@ -145,10 +163,26 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   const endedBy=state.reason||(state.state==="closed"&&!blocked?notice:""),statusShown=statusError&&!(endedBy&&!isScreenReasonCode(statusError));
   const stateText=error?screenError(error,errorTarget):statusShown?screenError(statusError,errorTarget):state.reason?screenError(state.reason,errorTarget):state.controlling?mobile?t("正在控制 · 可随时停止控制"):t("正在控制 · Ctrl+Alt+Shift+Esc 退出控制"):state.state==="connecting"?t("正在连接屏幕…"):state.state==="closed"?(blocked?screenError(blocked,errorTarget):notice?screenError(notice,errorTarget):t("尚未连接")):!state.fresh?t("画面暂未更新，控制已停止，请等待新画面。"):state.controlAllowed?t("查看中 · 点击开始控制后操作"):t("查看中 · 仅查看");
   const qualitySelect=<select aria-label={t("画面清晰度")} title={!connection.state.screenQualityAvailable?t("更新主机后可选择清晰度"):legacyQuality?t("目标电脑的 App 暂不支持画质选择，请更新后重试，或以默认画质连接。"):sharpSupported?t("流畅节省带宽，清晰保留更多文字细节"):t("此设备不支持清晰画质解码，请改用均衡或流畅。")} value={quality} disabled={!connection.state.screenQualityAvailable||legacyQuality||state.state==="connecting"} onChange={e=>changeQuality(e.target.value as ScreenQuality)}><option value="smooth">{t("流畅")}</option><option value="balanced">{t("均衡")}</option><option value="sharp" disabled={!sharpSupported}>{t("清晰")}</option></select>;
-  return <aside ref={panel} hidden={!visible||mobile&&!mobileForeground} style={!mobile&&bounds?{position:"absolute",...bounds}:undefined} className={`conversation-side-panel remote-screen-panel${mobile?" screen-mobile":""}${wide?" screen-wide":""}${fullscreen.active?" screen-fullscreen":""}`} aria-label={t("远程屏幕")} onBlurCapture={e=>{if(!mobile)return;if(e.relatedTarget instanceof Node&&panel.current?.contains(e.relatedTarget))return;queueMicrotask(()=>{if(!panel.current?.contains(document.activeElement))viewer.current?.release();});}} onPointerMove={e=>{if(fullscreen.active&&e.clientY<28){reveal();hideLater();}}}>
+  // Landscape status label: a calm view fades after a few seconds, anything
+  // that needs attention stays. Only opacity changes; the live region remains.
+  const calm=state.state!=="closed"&&state.state!=="connecting"&&state.fresh&&!state.pending&&!error&&!statusShown&&!state.reason&&!imeComposing;
+  const attention=!!(error||statusShown||state.reason||state.state==="closed"&&(blocked||notice));
+  const resolution=!error&&!statusError&&!state.reason&&state.fresh&&state.width?` · ${state.width} × ${state.height}`:"";
+  const statusLabel=`${hostName} · ${imeComposing?t("请先在键盘上确认候选词，再发送。"):stateText}${resolution}`;
+  const [labelAwake,setLabelAwake]=useState(true),labelTimer=useRef<ReturnType<typeof setTimeout>>(undefined);
+  const wakeLabel=()=>{clearTimeout(labelTimer.current);setLabelAwake(true);labelTimer.current=setTimeout(()=>setLabelAwake(false),SCREEN_STATUS_LABEL_MS);};
+  useEffect(()=>{if(landscape)wakeLabel();return()=>clearTimeout(labelTimer.current);},[landscape,statusLabel]);
+  // Rotation swaps the heading for the rail. If that removed the focused
+  // control, keep focus in the viewer so its input gate stays open.
+  const lastFocus=useRef<Element|null>(null);
+  useLayoutEffect(()=>{const node=lastFocus.current;if(!mobile||!node||node.isConnected||document.activeElement&&document.activeElement!==document.body||!activeNow.current||!document.hasFocus())return;(state.state!=="closed"?canvas.current:keyboardButton.current)?.focus({preventScroll:true});},[landscape]);
+  const settingsShown=state.state==="closed"&&!!openSettings&&!!(blocked||statusError||error);
+  const legacyConnect=()=>{setLegacyQuality(true);setQuality(SCREEN_DEFAULT_QUALITY);void connect(SCREEN_DEFAULT_QUALITY,true);};
+  const rail=RAIL_LABELS[locale];
+  return <aside ref={panel} hidden={!visible||mobile&&!mobileForeground} style={!mobile&&bounds?{position:"absolute",...bounds}:undefined} className={`conversation-side-panel remote-screen-panel${mobile?" screen-mobile":""}${landscape?" screen-landscape":""}${wide?" screen-wide":""}${fullscreen.active?" screen-fullscreen":""}`} aria-label={t("远程屏幕")} onFocusCapture={e=>{lastFocus.current=e.target;}} onBlurCapture={e=>{if(!mobile)return;if(e.relatedTarget instanceof Node&&panel.current?.contains(e.relatedTarget))return;queueMicrotask(()=>{if(!panel.current?.contains(document.activeElement))viewer.current?.release();});}} onPointerMove={e=>{if(fullscreen.active&&e.clientY<28){reveal();hideLater();}}}>
     {fullscreen.active&&!chromeVisible&&<button className="screen-reveal" aria-label={t("显示屏幕工具栏")} title={t("显示屏幕工具栏")} onClick={reveal}><ChevronDown size={16}/></button>}
     <div ref={chrome} className={`screen-chrome${fullscreen.active&&!chromeVisible?" screen-chrome-hidden":""}`} onPointerEnter={reveal} onPointerLeave={hideLater} onFocusCapture={reveal} onBlurCapture={()=>queueMicrotask(hideLater)} inert={fullscreen.active&&!chromeVisible?true:undefined}>
-    <header className="screen-heading">
+    {!landscape&&<header className="screen-heading">
       <div className="screen-title"><strong><Monitor size={15}/>{t("远程屏幕")}</strong><small title={hostName}>{hostName}</small></div>
       <div className="screen-toolbar">
         {!mobile&&qualitySelect}
@@ -163,18 +197,33 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
         <button className="icon-button" aria-label={t("屏幕更多操作")} title={t("屏幕更多操作")} aria-expanded={tools} onMouseDown={e=>e.preventDefault()} onClick={()=>setTools(v=>!v)}><MoreHorizontal size={17}/></button>
         <button className="icon-button" aria-label={t("断开并关闭屏幕")} title={t("断开并关闭屏幕")} disabled={isClosing} onClick={()=>void closeViewer()}><X size={18}/></button>
       </div>
-    </header>
-    <p className="screen-state" role="status">{fullscreen.error??stateText}{!error&&!statusError&&!state.reason&&state.fresh&&state.width&&<span className="screen-resolution"> · {state.width} × {state.height}</span>}{error==="screen_quality_unsupported"&&<button onClick={()=>{setLegacyQuality(true);setQuality(SCREEN_DEFAULT_QUALITY);void connect(SCREEN_DEFAULT_QUALITY,true);}}>{t("以默认画质连接")}</button>}</p>
-    {state.state==="closed"&&openSettings&&!!(blocked||statusError||error)&&<p className="screen-state"><button onClick={openSettings}>{t("连接设置")}</button></p>}
+    </header>}
+    {landscape&&<div className="screen-rail">
+      <div className="screen-rail-group">
+        <button className="icon-button screen-rail-close" aria-label={t("断开并关闭屏幕")} title={t("断开并关闭屏幕")} disabled={isClosing} onClick={()=>void closeViewer()}><X size={20}/></button>
+        <button className="icon-button screen-rail-more" aria-label={t("屏幕更多操作")} title={t("屏幕更多操作")} aria-expanded={tools} onMouseDown={e=>e.preventDefault()} onClick={()=>{wakeLabel();setTools(v=>!v);}}><MoreHorizontal size={20}/></button>
+        <button ref={keyboardButton} className="icon-button" aria-label={t("键盘与快捷键")} aria-expanded={showText} onMouseDown={e=>e.preventDefault()} onClick={()=>{wakeLabel();toggleKeyboard();}}><Keyboard size={20}/></button>
+      </div>
+      <div className="screen-rail-group screen-rail-session">
+        {state.state==="closed"
+          ?<button className="screen-rail-labeled" aria-label={t("连接屏幕")} onClick={()=>{wakeLabel();void connect();}} disabled={isClosing||!display||!!blocked||mobile&&!mobileForeground}><span className="screen-rail-icon"><Plug size={19}/></span><span className="screen-rail-label" aria-hidden="true">{rail.connect}</span></button>
+          :<button className="screen-rail-labeled" aria-label={t("断开")} title={t("断开")} onClick={()=>{wakeLabel();disconnect();}}><span className="screen-rail-icon"><Unplug size={19}/></span><span className="screen-rail-label" aria-hidden="true">{rail.disconnect}</span></button>}
+        {(state.state==="closed"?status?.permission==="control":state.controlAllowed)&&<button className="screen-rail-labeled screen-rail-control" data-active={state.controlling?"":undefined} aria-label={state.pending?t("等待新画面…"):state.controlling?t("停止控制"):t("开始控制")} disabled={!state.fresh||state.pending} onMouseDown={e=>e.preventDefault()} onClick={()=>{wakeLabel();state.controlling?viewer.current?.release():viewer.current?.control();}}><span className="screen-rail-icon"><MousePointer2 size={19}/></span><span className="screen-rail-label" aria-hidden="true">{state.pending?rail.wait:state.controlling?rail.stop:rail.control}</span></button>}
+      </div>
+    </div>}
+    <p className={landscape?"screen-state screen-status-label":"screen-state"} role="status" data-faded={landscape&&calm&&!labelAwake?"":undefined} data-alert={landscape&&attention?"":undefined}>{landscape?statusLabel:<>{fullscreen.error??stateText}{!error&&!statusError&&!state.reason&&state.fresh&&state.width&&<span className="screen-resolution"> · {state.width} × {state.height}</span>}{error==="screen_quality_unsupported"&&<button onClick={legacyConnect}>{t("以默认画质连接")}</button>}</>}</p>
+    {!landscape&&settingsShown&&<p className="screen-state"><button onClick={openSettings}>{t("连接设置")}</button></p>}
+    {landscape&&(error==="screen_quality_unsupported"||settingsShown)&&<div className="screen-status-actions">{error==="screen_quality_unsupported"&&<button onClick={legacyConnect}>{t("以默认画质连接")}</button>}{settingsShown&&<button onClick={openSettings}>{t("连接设置")}</button>}</div>}
     {tools&&<div className="screen-tools-popover" role="region" aria-label={t("屏幕更多操作")}>
     {mobile&&<><label className="screen-display">{t("画面清晰度")}{qualitySelect}</label><button onClick={()=>{touch.current?.fit();setTools(false);}}>{t("适应窗口")}</button><p className="screen-touch-help">{t("查看时拖动画面、双指缩放。控制时点按左键、长按右键、单指拖动、双指滚动；捏合只缩放画面。")}</p></>}
+    {landscape&&<p className="screen-touch-help">{t("仅在开始控制后，点击发送才会提交文本。")}</p>}
     <label className="screen-display">{t("显示器")}<select aria-label={t("显示器")} value={display} onChange={e=>{disconnect();setDisplay(e.target.value);}}>{status?.desktop?.displays.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>
     <div className="screen-shortcuts"><details><summary onMouseDown={e=>e.preventDefault()}>{t("发送组合键")}</summary><div>{screenShortcuts(target).map(shortcut=><button key={shortcut.id} disabled={!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={e=>{canvas.current?.focus();for(const code of shortcut.codes)viewer.current?.input({kind:"key",code,down:true});for(const code of [...shortcut.codes].reverse())viewer.current?.input({kind:"key",code,down:false});e.currentTarget.closest("details")?.removeAttribute("open");}}>{shortcut.label[locale]}</button>)}</div></details>{remap&&<select aria-label={controller==="windows"?t("Windows 修饰键"):t("Mac 修饰键")} value={modifierMode} onChange={e=>{viewer.current?.release();setModifierMode(e.target.value as ScreenModifierMode);}}>{controller==="windows"?<><option value="command">Ctrl → ⌘ · Win → ⌃</option><option value="physical">Ctrl → ⌃ · Win → ⌘</option></>:<><option value="command">⌘ → Ctrl · ⌃ → Win</option><option value="physical">⌃ → Ctrl · ⌘ → Win</option></>}</select>}</div>
     {!mobile&&<div className="screen-bottom"><button onClick={()=>{viewer.current?.release();setShowText(v=>!v);}}>{t("发送文本")}</button><span>{target==="windows"?<>{remap&&<>{modifierMode==="command"?t("Command 对应 Ctrl，Control 对应 Win，Option 对应 Alt"):t("Control 对应 Ctrl，Command 对应 Win，Option 对应 Alt")}{" · "}</>}{t("按键按键位发送，字符由目标电脑的键盘布局决定。")}</>:windows?(modifierMode==="command"?t("Ctrl 对应 Command，Win 对应 Control，Alt 对应 Option"):t("Windows：Ctrl 对应 Control，Win 对应 Command，Alt 对应 Option")):t("点击聊天输入框会立即停止远端控制。")}</span></div>}
     {!mobile&&showText&&<div className="screen-text"><textarea aria-label={t("发送到远端的文本")} maxLength={2048} value={text} onChange={e=>setText(e.target.value)} placeholder={t("在这里输入或粘贴中文文本，不会同步剪贴板。")}/><button disabled={!text||!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={()=>{canvas.current?.focus();if(viewer.current?.input({kind:"text",text}))setText("");}}>{t("发送到远端")}</button><p>{t("编辑完成后点击开始控制，再发送文本。")}</p></div>}
     </div>}
     </div>
-    {mobile&&showText&&<div ref={tray} className="screen-mobile-keyboard"><div className="screen-mobile-keys" aria-label={t("快捷键")}>{["Escape","Tab","Enter","Backspace","ArrowLeft","ArrowUp","ArrowDown","ArrowRight"].map(code=><button key={code} disabled={!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={()=>shortcut([code])}>{({Escape:"Esc",Backspace:"⌫",ArrowLeft:"←",ArrowUp:"↑",ArrowDown:"↓",ArrowRight:"→"} as Record<string,string>)[code]??code}</button>)}{screenShortcuts(target).map(item=><button key={item.id} disabled={!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={()=>shortcut(item.codes)}>{item.label[locale]}</button>)}</div><div className="screen-text" onPointerDownCapture={e=>{if(e.target instanceof HTMLButtonElement&&e.target.disabled)e.preventDefault();}}><textarea aria-label={t("发送到远端的文本")} maxLength={2048} value={text} onCompositionStart={()=>{composing.current=true;setImeComposing(true);}} onCompositionEnd={()=>{composing.current=false;setImeComposing(false);}} onChange={e=>setText(e.target.value)} placeholder={t("在这里输入或粘贴中文文本，不会同步剪贴板。")}/><button disabled={imeComposing||!state.controlling||!screenInputEventSchema.safeParse({kind:"text",text}).success} onMouseDown={e=>e.preventDefault()} onClick={()=>{if(composing.current)return;if(viewer.current?.input({kind:"text",text}))setText("");}}>{t("发送到远端")}</button><small>{imeComposing?t("请先在键盘上确认候选词，再发送。"):t("仅在开始控制后，点击发送才会提交文本。")}</small></div></div>}
+    {mobile&&showText&&<div ref={tray} className="screen-mobile-keyboard"><div className="screen-mobile-keys" aria-label={t("快捷键")}>{["Escape","Tab","Enter","Backspace","ArrowLeft","ArrowUp","ArrowDown","ArrowRight"].map(code=><button key={code} disabled={!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={()=>shortcut([code])}>{({Escape:"Esc",Backspace:"⌫",ArrowLeft:"←",ArrowUp:"↑",ArrowDown:"↓",ArrowRight:"→"} as Record<string,string>)[code]??code}</button>)}{screenShortcuts(target).map(item=><button key={item.id} disabled={!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={()=>shortcut(item.codes)}>{item.label[locale]}</button>)}</div><div className="screen-text" onPointerDownCapture={e=>{if(e.target instanceof HTMLButtonElement&&e.target.disabled)e.preventDefault();}}><textarea aria-label={t("发送到远端的文本")} maxLength={2048} value={text} onCompositionStart={()=>{composing.current=true;setImeComposing(true);}} onCompositionEnd={()=>{composing.current=false;setImeComposing(false);}} onChange={e=>setText(e.target.value)} placeholder={t("在这里输入或粘贴中文文本，不会同步剪贴板。")}/><button disabled={imeComposing||!state.controlling||!screenInputEventSchema.safeParse({kind:"text",text}).success} onMouseDown={e=>e.preventDefault()} onClick={()=>{if(composing.current)return;if(viewer.current?.input({kind:"text",text}))setText("");}} aria-label={landscape?t("发送到远端"):undefined}>{landscape?rail.send:t("发送到远端")}</button><small>{imeComposing?t("请先在键盘上确认候选词，再发送。"):t("仅在开始控制后，点击发送才会提交文本。")}</small></div></div>}
     <div ref={viewport} className={`screen-viewport${!mobile&&scale==="fit"?" screen-fit":""}`} onPointerDown={e=>{if(!mobile||e.pointerType==="mouse")return;e.preventDefault();canvas.current?.focus({preventScroll:true});e.currentTarget.setPointerCapture(e.pointerId);touch.current?.down(e.pointerId,touchPoint(e),performance.now());clearTimeout(holdTimer.current);holdTimer.current=setTimeout(()=>touch.current?.hold(performance.now()),SCREEN_TOUCH_HOLD_MS);}} onPointerMove={e=>{if(!mobile||e.pointerType==="mouse")return;e.preventDefault();touch.current?.move(e.pointerId,touchPoint(e));if(!touchFrame.current)touchFrame.current=requestAnimationFrame(()=>{touchFrame.current=0;touch.current?.flush();});}} onPointerUp={e=>{if(!mobile||e.pointerType==="mouse")return;e.preventDefault();clearTimeout(holdTimer.current);touch.current?.up(e.pointerId);if(e.currentTarget.hasPointerCapture(e.pointerId))e.currentTarget.releasePointerCapture(e.pointerId);}} onPointerCancel={()=>{if(mobile)clearTouch();}} onLostPointerCapture={e=>{if(mobile&&touch.current?.hasPointer(e.pointerId))clearTouch();}}>
       <canvas ref={canvas} tabIndex={0} aria-label={t("{0}的远程屏幕",hostName)} className={state.fresh?"":"screen-stale"} style={mobile?{width:fitSize.width,height:fitSize.height,transform:`translate(-50%,-50%) translate(${transform.x}px,${transform.y}px) scale(${transform.zoom})`}:scale==="fit"?{aspectRatio:state.width&&state.height?`${state.width}/${state.height}`:undefined,width:`min(100cqw, calc(100cqh * ${state.width&&state.height?state.width/state.height:16/9}))`}:{width:(state.width??640)*Number(scale),height:(state.height??360)*Number(scale)}}
         onBlur={e=>{if(!mobile||!panel.current?.contains(e.relatedTarget as Node|null))viewer.current?.release();}} onContextMenu={e=>{if(state.controlling||mobile)e.preventDefault();}}

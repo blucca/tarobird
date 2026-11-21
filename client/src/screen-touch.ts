@@ -29,6 +29,19 @@ export class ScreenTouch {
   hasPointer(id: number) { return this.fingers.has(id); }
   setControl(value: boolean) { if (value !== this.control) this.cancel(); this.control = value; }
   resize(viewport: ScreenViewport) { this.cancel(); this.viewport = viewport; this.fit(); }
+  /** An area of the same width and picture that only gets shorter or taller
+   * (a system keyboard) keeps the picture's on-screen scale and top-left
+   * corner, within the zoom and pan limits; pinching out still fits the
+   * whole picture. Any other change refits exactly like resize(). */
+  reframe(viewport: ScreenViewport) {
+    const previous = this.viewport, before = this.dimensions, { zoom, x, y } = this.transform;
+    if (viewport.width !== previous.width || viewport.imageWidth !== previous.imageWidth || viewport.imageHeight !== previous.imageHeight) return this.resize(viewport);
+    this.cancel(); this.viewport = viewport;
+    const after = this.dimensions, next = clamp(before.width * zoom / after.width, 1, SCREEN_TOUCH_MAX_ZOOM);
+    if (!(after.width > 0 && before.width > 0) || !Number.isFinite(next + before.height)) return this.fit();
+    const left = (previous.width - before.width * zoom) / 2 + x, top = (previous.height - before.height * zoom) / 2 + y;
+    this.update({ zoom: next, x: left - (viewport.width - after.width * next) / 2, y: top - (viewport.height - after.height * next) / 2 });
+  }
   fit() { this.cancel(); this.update({ zoom: 1, x: 0, y: 0 }); }
   private update(transform: ScreenTransform) {
     const { width, height } = this.dimensions, zoom = clamp(transform.zoom, 1, SCREEN_TOUCH_MAX_ZOOM);

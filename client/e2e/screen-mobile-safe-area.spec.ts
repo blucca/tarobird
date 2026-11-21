@@ -25,12 +25,14 @@ async function layout(page: Page, insets: Insets) {
     const safe = { top: insets.top, left: insets.left, right: innerWidth - insets.right, bottom: innerHeight - insets.bottom };
     const inside = (r: DOMRect) => r.top >= safe.top - .5 && r.left >= safe.left - .5 && r.bottom <= safe.bottom + .5 && r.right <= safe.right + .5;
     const named = controls.map(name => [name, [...panel.querySelectorAll<HTMLElement>("button")].find(b => (b.getAttribute("aria-label") ?? b.textContent?.trim()) === name)] as const);
-    const parts = [...named, ["title", panel.querySelector<HTMLElement>(".screen-title")], ["picture", panel.querySelector<HTMLElement>(".screen-viewport")]] as const;
+    // A landscape phone names the Host in the status label over the picture,
+    // which deliberately lets touches through to the picture beneath it.
+    const parts = [...named, ["title", panel.querySelector<HTMLElement>(".screen-title") ?? panel.querySelector<HTMLElement>(".screen-status-label")], ["picture", panel.querySelector<HTMLElement>(".screen-viewport")]] as const;
     const result: Record<string, string> = {};
     for (const [name, node] of parts) {
       if (!node) { result[name] = "missing"; continue; }
       const r = node.getBoundingClientRect(), hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-      result[name] = `${inside(r) ? "inside" : `outside(${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.right)},${Math.round(r.bottom)})`}${name === "picture" || (hit && node.contains(hit)) ? "" : " covered"}`;
+      result[name] = `${inside(r) ? "inside" : `outside(${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.right)},${Math.round(r.bottom)})`}${name === "picture" || node.matches(".screen-status-label") || (hit && node.contains(hit)) ? "" : " covered"}`;
     }
     const style = getComputedStyle(panel);
     result.padding = `${style.paddingTop} ${style.paddingRight} ${style.paddingBottom} ${style.paddingLeft}`;

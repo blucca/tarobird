@@ -100,3 +100,53 @@
 .screen-mobile-keys{display:flex;gap:5px;overflow:auto;padding-bottom:6px}.screen-mobile-keys>button{flex:none;white-space:nowrap}
 .screen-mobile-keyboard .screen-text{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:0;border:0}
 .screen-mobile-keyboard textarea{min-height:44px;height:54px;font-size:16px;resize:none;margin:0}.screen-mobile-keyboard small{font-size:12px;color:var(--muted);flex:1;min-width:120px;line-height:1.5}
+
+/* Landscape phones (.screen-landscape: orientation landscape, height ≤ 540).
+   The picture keeps the full height; tools sit in a 56 px rail inside the
+   right safe inset, and the heading and status line become one label over the
+   picture. Portrait phones, tablets and desktop viewers are unaffected. */
+.screen-mobile.screen-landscape{display:grid;grid-template-columns:minmax(0,1fr) 56px;grid-template-rows:auto auto minmax(0,1fr) auto;--screen-active-bg:var(--primary-bg);--screen-active-ink:var(--on-primary)}
+:root[data-palette=mono] .screen-mobile.screen-landscape{--screen-active-bg:var(--mono-control-bg);--screen-active-ink:var(--mono-control-ink)}
+/* Monochrome without an accent: a deep grey instead of the black action fill. */
+:root[data-palette=mono]:is([data-mono-accent=none],:not([data-mono-accent])) .screen-mobile.screen-landscape{--screen-active-bg:color-mix(in srgb,var(--mono-control-bg) 72%,var(--bg))}
+.screen-landscape .screen-chrome{display:contents}
+.screen-mobile.screen-landscape .screen-viewport{grid-column:1;grid-row:1/4;min-width:0}
+.screen-rail{grid-column:2;grid-row:1/-1;display:flex;flex-direction:column;align-items:center;min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:none;padding:6px 0 10px;box-sizing:border-box;border-left:1px solid var(--border);background:var(--bg)}
+.screen-rail-group{display:flex;flex-direction:column;align-items:center;gap:4px;flex:none}
+.screen-rail-group.screen-rail-session{margin-top:auto;padding-top:16px;gap:14px}
+.screen-mobile.screen-landscape .screen-rail .icon-button{display:grid;place-items:center;width:44px;height:44px;padding:0;border:1px solid transparent;border-radius:10px;background:transparent;color:var(--text)}
+.screen-mobile.screen-landscape .screen-rail .icon-button[aria-expanded=true]{background:var(--surface);border-color:var(--border)}
+.screen-mobile.screen-landscape .screen-rail .screen-rail-labeled{display:flex;flex-direction:column;align-items:center;gap:3px;width:54px;min-width:44px;min-height:44px;padding:0;border:0;border-radius:10px;background:transparent;color:var(--text);font-size:10px}
+.screen-rail-icon{display:grid;place-items:center;width:44px;height:44px;box-sizing:border-box;border:1px solid transparent;border-radius:10px}
+.screen-rail-control .screen-rail-icon{background:var(--surface);border-color:var(--border)}
+.screen-rail-control[data-active] .screen-rail-icon{background:var(--screen-active-bg);border-color:var(--screen-active-bg);color:var(--screen-active-ink)}
+.screen-rail-label{font-size:10px;line-height:12px;color:var(--muted);white-space:nowrap}
+.screen-rail-control .screen-rail-label{color:var(--text)}.screen-rail-control[data-active] .screen-rail-label{font-weight:600}
+/* Above a system keyboard about 190 pt remain, too few for five 44 pt
+   targets: keep what typing needs (keyboard, disconnect, control) without
+   captions. Close and More return with the keyboard's dismissal; an open
+   More sheet keeps its toggle. The rail still scrolls if even that is short. */
+html[data-keyboard-open="true"] .screen-mobile.screen-landscape :is(.screen-rail-close,.screen-rail-more[aria-expanded=false],.screen-rail-label){display:none}
+html[data-keyboard-open="true"] .screen-mobile.screen-landscape .screen-rail{padding:4px 0}
+html[data-keyboard-open="true"] .screen-mobile.screen-landscape .screen-rail-group.screen-rail-session{padding-top:8px;gap:8px}
+/* Status label: one line, out of the way of touches on the picture. */
+.screen-mobile.screen-landscape .screen-status-label{grid-column:1;grid-row:1;justify-self:start;align-self:start;z-index:2;box-sizing:border-box;min-width:0;max-width:70%;height:26px;margin:10px 0 0 10px;padding:0 11px;border:1px solid var(--border);border-radius:13px;background:color-mix(in srgb,var(--bg) 94%,transparent);color:var(--text);font-size:12px;line-height:24px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;overflow-wrap:normal;pointer-events:none;transition:opacity .3s ease}
+/* A reason the person must read wraps (up to three lines) instead of losing its end. */
+.screen-mobile.screen-landscape .screen-status-label[data-alert]{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;height:auto;padding:4px 11px;line-height:16px;white-space:normal;overflow-wrap:anywhere}
+.screen-mobile.screen-landscape .screen-status-label[data-faded]{opacity:0}
+@media (prefers-reduced-motion:reduce){.screen-mobile.screen-landscape .screen-status-label{transition:none}}
+.screen-status-actions{grid-column:1;grid-row:2;justify-self:start;align-self:start;z-index:2;display:flex;flex-wrap:wrap;gap:8px;max-width:calc(100% - 20px);margin:6px 0 0 10px}
+.screen-mobile.screen-landscape .screen-status-actions button{box-shadow:0 2px 10px #0003}
+/* Keyboard tray: one 44 px row under the picture. Hit targets stay 44 px;
+   the drawn keys, field and Send are 32 px like the design. */
+.screen-mobile.screen-landscape .screen-mobile-keyboard{grid-column:1;grid-row:4;z-index:2;display:flex;align-items:center;gap:6px;height:44px;max-height:none;overflow:hidden;padding:0 8px;box-sizing:border-box;border:0;box-shadow:inset 0 1px 0 var(--border)}
+.screen-mobile.screen-landscape .screen-mobile-keys{flex:1 1 0;min-width:0;align-items:center;gap:4px;padding:0 16px 0 0;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 16px),transparent);mask-image:linear-gradient(to right,#000 calc(100% - 16px),transparent)}
+.screen-mobile.screen-landscape .screen-mobile-keyboard :is(.screen-mobile-keys>button,.screen-text>button){position:relative;isolation:isolate;flex:none;height:44px;min-width:44px;padding:0 10px;border:0;border-radius:0;background:transparent;font-size:12px;white-space:nowrap}
+.screen-mobile.screen-landscape .screen-mobile-keyboard :is(.screen-mobile-keys>button,.screen-text>button)::before{content:"";position:absolute;inset:6px 0;z-index:-1;border:1px solid var(--border);border-radius:6px;background:var(--surface)}
+.screen-mobile.screen-landscape .screen-mobile-keyboard .screen-text{flex:0 1 min(440px,54%);min-width:180px;display:flex;flex-wrap:nowrap;align-items:center;gap:2px;padding:0;border:0}
+.screen-mobile.screen-landscape .screen-mobile-keyboard .screen-text>button{min-width:60px}
+.screen-mobile.screen-landscape .screen-mobile-keyboard textarea{flex:1 1 auto;min-width:0;width:auto;height:44px;min-height:44px;box-sizing:border-box;margin:0;padding:0 8px;border:6px solid transparent;border-radius:12px;background:var(--bg) padding-box;box-shadow:inset 0 0 0 1px var(--border);font-size:16px;line-height:30px;white-space:pre;overflow:hidden;resize:none}
+.screen-mobile.screen-landscape .screen-mobile-keyboard small{display:none}
+/* "More" becomes a full-height side sheet against the rail. */
+.screen-mobile.screen-landscape .screen-tools-popover{position:absolute;z-index:4;top:var(--app-safe-top);bottom:var(--app-safe-bottom);right:calc(var(--app-safe-right) + 56px);left:auto;width:min(340px,60%);max-height:none;padding:8px 12px;border:0;border-left:1px solid var(--border);border-radius:0;box-shadow:-8px 0 24px #0002;overflow-y:auto}
+.screen-mobile.screen-landscape .screen-shortcuts summary{min-height:44px;box-sizing:border-box;line-height:34px}
