@@ -34,6 +34,7 @@ async function liveTurn() {
     status: async () => ({ supported: true, targetId: "run_live", sourceMessageId: task.messageId, receiptEpoch: "rs_fixture_store" }),
     steer: async (_bot, call) => { steered.push(call); return { outcome: "accepted", sourceMessageId: task.messageId }; },
     reconcile: async () => ({ outcome: "unknown", reason: "uncertain" }),
+    dispatch: () => undefined,
   } satisfies BotMessageSteeringHooks;
   return task;
 }

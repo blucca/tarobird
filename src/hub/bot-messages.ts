@@ -700,7 +700,12 @@ export class BotMessages {
         const memo = await this.memo<IncomingMemo>(key);
         await this.put(key, { ...memo!, steer: { ...memo!.steer, reason } } satisfies IncomingMemo);
       })).changed;
-      if (changed) await this.store.audit("bot-message.steer", p.source.botId, { messageId, requestId: p.source.requestId, sourceHost: p.source.hostId, sourceBot: p.source.botId, outcome: "fell_back_to_queue", reason, turn });
+      if (changed) {
+        // The delivery was inserted into an existing record: no message.created
+        // event will wake the dispatch loop, so ask for it explicitly.
+        this.steering.dispatch(botId);
+        await this.store.audit("bot-message.steer", p.source.botId, { messageId, requestId: p.source.requestId, sourceHost: p.source.hostId, sourceBot: p.source.botId, outcome: "fell_back_to_queue", reason, turn });
+      }
       return;
     }
     const before = (await this.store.db.serial(() => this.store.queuedMessageInTransaction(messageId))).blocks.find(block => block.type === "steering")?.outcome;

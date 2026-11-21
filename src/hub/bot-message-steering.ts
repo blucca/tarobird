@@ -12,6 +12,9 @@ export interface BotMessageSteeringHooks {
   steer(botId: string, call: BotSteerCall): Promise<unknown>;
   /** Never steers; see botSteerReconcileCallSchema. */
   reconcile(botId: string, call: BotSteerReconcileCall): Promise<unknown>;
+  /** A record that fell back to the queue after creation gained a delivery
+   * without any message.created event: hand it to the worker now. */
+  dispatch(botId: string): void;
 }
 /** Gateway RPC deadlines. A send that asks to steer waits for at most status
  * + steer (~13 s) beyond a queued send; within the sender's 15 s peer
@@ -22,6 +25,7 @@ export const offlineSteering: BotMessageSteeringHooks = {
   status: async () => { throw new Error("bot_offline"); },
   steer: async () => { throw new Error("bot_offline"); },
   reconcile: async () => { throw new Error("bot_offline"); },
+  dispatch: () => undefined,
 };
 
 /** At most this many Bot steers enter one live turn. A steer starts no new

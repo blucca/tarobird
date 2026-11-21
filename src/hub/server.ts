@@ -363,7 +363,8 @@ export class HubServer {
       { capable: botId => { const connection = this.bots.get(botId); return connection?.ready ? connection.botSteer : undefined; },
         status: (botId, conversationId) => this.callBot(botId, "botMessage.steer.status", { conversationId }, STEER_STATUS_TIMEOUT_MS),
         steer: (botId, call) => this.callBot(botId, "botMessage.steer", call, STEER_CALL_TIMEOUT_MS),
-        reconcile: (botId, call) => this.callBot(botId, "botMessage.steer.reconcile", call, STEER_RECONCILE_TIMEOUT_MS) });
+        reconcile: (botId, call) => this.callBot(botId, "botMessage.steer.reconcile", call, STEER_RECONCILE_TIMEOUT_MS),
+        dispatch: botId => { this.trackTask(this.dispatchPending(botId).catch(() => options.onWarning?.("queue_dispatch_failed"))); } });
     this.dispatch = new HubDispatch(store, {
       source: () => this.botMessages.ownSource(),
       conversationCreated: (userId, conversation) => conversationsCreated(userId, [conversation]),

@@ -16,7 +16,7 @@ import type { BotMessageSteeringHooks } from "../src/hub/bot-message-steering.js
 
 let root: string, a: HubServer, b: HubServer, source: BotMessages, bodies: Record<string, unknown>[];
 const guard = async () => undefined;
-type Fake = { capable: ReturnType<typeof vi.fn>; status: ReturnType<typeof vi.fn>; steer: ReturnType<typeof vi.fn>; reconcile: ReturnType<typeof vi.fn> };
+type Fake = { capable: ReturnType<typeof vi.fn>; status: ReturnType<typeof vi.fn>; steer: ReturnType<typeof vi.fn>; reconcile: ReturnType<typeof vi.fn>; dispatch: ReturnType<typeof vi.fn> };
 let fake: Fake;
 /** One live run per conversation, as a Gateway reports it. */
 let runs: Map<string, { targetId: string; sourceMessageId: string }>;
@@ -46,6 +46,7 @@ beforeEach(async () => {
       return run?.targetId === call.targetId ? { outcome: "accepted", sourceMessageId: run.sourceMessageId } : { outcome: "rejected", reason: "stale" };
     }),
     reconcile: vi.fn(async () => ({ outcome: "unknown", reason: "uncertain" })),
+    dispatch: vi.fn(),
   };
   b.botMessages.steering = fake as unknown as BotMessageSteeringHooks;
 });
@@ -229,11 +230,14 @@ describe("fallback to the queue", () => {
 
   it("turns a definite engine rejection (the turn just ended) into exactly one queued task", async () => {
     const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    expect(fake.dispatch).not.toHaveBeenCalled();
     // Status saw the run; by the time the steer arrives the run has ended.
     fake.steer.mockImplementationOnce(async () => { runs.delete(chat.conversationId); return { outcome: "rejected", reason: "stale" }; });
     const receipt = await send(chat.conversationId, "Late fix", { delivery: "steer" });
     await expectQueuedOnce(receipt, "turn_ended");
     expect(fake.steer).toHaveBeenCalledTimes(1);
+    // The new delivery asks the Hub to dispatch (socket-level proof in hub-bot-message-steer-dispatch).
+    expect(fake.dispatch).toHaveBeenCalledWith("target");
     await b.store.acknowledgeDelivery("target", run.sourceMessageId);
     const claimed = await new HubPromptQueue(b.store).claim("target", true, false);
     expect(claimed.map(message => message.id)).toEqual([receipt.messageId]);
