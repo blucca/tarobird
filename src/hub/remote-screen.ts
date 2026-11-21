@@ -268,7 +268,7 @@ export class HubRemoteScreen {
     live.awaitingKey = false; live.lastFrame = header.sequence; live.lastCapture = header.captureMs;
     if (!live.media?.send(bytes)) { this.closeSession(sessionId, "screen_congested"); return false; }
     live.frames.set(header.sequence, { key: header.key, captureMs: header.captureMs, streamGeneration: header.streamGeneration, confirmed: false, pendingAck: false });
-    for (const [seq, frame] of live.frames) if (this.now() - frame.captureMs > SCREEN_FRAME_FRESH_MS || live.frames.size > 90) live.frames.delete(seq);
+    for (const [seq, frame] of live.frames) if (this.now() - frame.captureMs > SCREEN_FRAME_FRESH_MS || live.frames.size > 240) live.frames.delete(seq); // 240: four seconds at 60 fps
     if (live.value.state === "connecting") { live.value.state = "viewing"; this.notify(live); }
     return true;
   }
@@ -277,6 +277,21 @@ export class HubRemoteScreen {
     if (!live || input.sessionId !== sessionId || input.generation !== live.value.generation) throw new HubError("screen_session_changed", 409);
     if (input.type === "disconnect") { this.closeSession(sessionId, "screen_disconnected"); return; }
     if (input.type === "release") { this.release(live, "screen_control_stopped"); return; }
+    if (input.type === "ack") {
+      // The first receipt of a frame this Hub forwarded is bounded by the stream
+      // itself (one per forwarded frame), so it does not draw on the input
+      // budget: a faster picture never eats into pointer and key allowance.
+      // Unknown, repeated or hidden receipts fall through and are charged.
+      const frame = live.frames.get(input.frameSequence);
+      if (live.visible && frame && !frame.pendingAck && frame.streamGeneration === live.streamGeneration) {
+        // Decoder receipt returns a bounded encoder credit even after a slow
+        // round trip. Input freshness is still checked by the target and below
+        // in serviceFrameConfirmed; a late ACK never makes old video controllable.
+        frame.pendingAck = true;
+        if (!this.toService({ type: "ack", sessionId, frameSequence: input.frameSequence, streamGeneration: frame.streamGeneration })) this.closeSession(sessionId, "screen_service_offline");
+        return;
+      }
+    }
     live.rateBudget = Math.min(180, live.rateBudget + Math.max(0, this.now() - live.rateAt) * .12); live.rateAt = this.now();
     if (live.rateBudget < 1) { this.closeSession(sessionId, "screen_input_rate_limited"); throw new HubError("screen_input_rate_limited", 429); } live.rateBudget--;
     if (input.type === "visibility") {
@@ -295,16 +310,8 @@ export class HubRemoteScreen {
         this.notify(live);
       } return;
     }
-    if (input.type === "ack") {
-      const frame = live.frames.get(input.frameSequence);
-      // Decoder receipt returns a bounded encoder credit even after a slow
-      // round trip. Input freshness is still checked by the target and below
-      // in serviceFrameConfirmed; a late ACK never makes old video controllable.
-      if (!live.visible || !frame || frame.pendingAck || frame.streamGeneration !== live.streamGeneration) return;
-      frame.pendingAck = true;
-      if (!this.toService({ type: "ack", sessionId, frameSequence: input.frameSequence, streamGeneration: frame.streamGeneration })) this.closeSession(sessionId, "screen_service_offline");
-      return;
-    }
+    // Only receipts that were not a first receipt of a forwarded frame reach here.
+    if (input.type === "ack") return;
     if (input.type === "input" && (input.event.kind === "key" || input.event.kind === "button") && !input.event.down) {
       // Release only something forwarded under this STILL VALID lease. A stale
       // picture/geometry must not trap a held input, but cannot revive a lease.

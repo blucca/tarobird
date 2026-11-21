@@ -355,6 +355,27 @@ it.each([1, 16])("retains the control budget for movement spaced %i ms apart", a
   }
 });
 
+it("a first receipt of a forwarded frame does not draw on the input budget; unknown or repeated receipts still do", async () => {
+  await configure(); const { epoch } = service(); const { join: j } = await join();
+  expect(screen.stream(epoch, j.session.id, j.session.generation, stream())).toBe(true);
+  const ack = (frameSequence: number) => screen.viewerCommand(j.session.id, { type: "ack", sessionId: j.session.id, generation: j.session.generation, frameSequence });
+  // Twelve seconds of a 30 fps picture, every frame acknowledged once, beside 111 charged commands a second
+  // (receipts for frames that never existed). Charged together, 141 a second would exhaust the 120/s budget
+  // and its burst of 180 in under nine seconds.
+  let sequence = 0;
+  for (let ms = 1; ms <= 12_000; ms++) {
+    clock += 1;
+    if (ms % 33 === 0) { expect(screen.frame(epoch, j.session.id, j.session.generation, header(++sequence), new Uint8Array([1]))).toBe(true); ack(sequence); }
+    if (ms % 9 === 0) ack(9_000_000 + ms);
+  }
+  expect((await screen.status(remote.session)).sessions).toHaveLength(1);
+  // A repeated receipt of a real frame is charged like an unknown one, and the budget itself is unchanged.
+  let rejected = "";
+  try { for (let i = 0; i < 400; i++) ack(i % 2 ? sequence : 8_000_000 + i); } catch (error) { rejected = (error as Error).message; }
+  expect(rejected).toBe("screen_input_rate_limited");
+  expect((await screen.status(remote.session)).sessions).toHaveLength(0);
+});
+
 it("a control request refused for a picture past its freshness tells the viewer, so it never waits for a lease", async () => {
   await configure(); const { epoch, sink } = service(); const { join: j, control: out } = await join();
   liveFrame(epoch, j, 1);
