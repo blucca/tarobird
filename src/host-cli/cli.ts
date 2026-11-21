@@ -121,11 +121,17 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   messages grants [--cross-host] [--json]
     查看本机 Bot 的直接消息授权，与 App 的「Bot 消息授权」使用同一份记录
     --cross-host 改为查看其他主机 Bot → 本机 Bot 的单向授权（含已离网来源的残留授权），与 App「跨主机」标签同一份快照
-  messages send --to HOST/BOT[/CONVERSATION] --text-file FILE [--file FILE]... [--new-conversation NAME] [--request-id ID] [--context-message ID] [--source-bot LOCAL_BOT_ID]
+  messages send --to HOST/BOT[/CONVERSATION] --text-file FILE [--file FILE]... [--new-conversation NAME] [--request-id ID] [--context-message ID] [--source-bot LOCAL_BOT_ID] [--delivery queue|steer]
+    --delivery 默认 queue（新任务，进入持久队列）。steer 只用于纠正方向、补充信息或回答对方刚问的问题：
+    仅当接收方是 Codex/Claude Code、同一对话里正在进行的回复由你这次之前的消息发起、且接收方主人允许时，并入那次回复；
+    否则自动排队一次，回执 delivery.actual 写明 steered / fell_back_to_queue（含原因）/ steer_uncertain（未确认时不重发，用 wait 或同一 --request-id 核对）。
+    steer 比排队最多多等约 13 秒；跨主机还要先探测一次对方主机，最坏约 30 秒。
   messages wait --to HOST_ID/BOT_ID/CONVERSATION_ID --message ID [--timeout SECONDS] [--out DIRECTORY] [--source-bot LOCAL_BOT_ID]
     默认等待 120 秒；timeout/pending 只结束本次查询，不会中断任务或自动恢复。用同一消息 ID 继续查询，勿重复发送。
     首次立即查询，后续间隔 1.5、3、6 秒，最长 6 秒；完成状态可能有最多一个轮询间隔的延迟。
   messages allow|revoke --from SOURCE_HOST/SOURCE_BOT_ID --bot TARGET_BOT
+  messages steering --bot BOT [--enabled on|off]
+    主人专用：查看或修改「允许其他 Bot 引导这个 Bot」（默认开启，仅 Codex/Claude Code 有效）；关闭后发给它的 Bot 消息一律排队
   attachments list [--conversation ID [--sort size|time] [--offset N]]
     主人专用：不带 --conversation 时按对话汇总附件占用；带上则列出该对话的附件，每页 100 项
   attachments delete (--ids ID,ID | --conversation ID) --yes
@@ -306,7 +312,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     "html-file": { type: "string" }, "report-file": { type: "string" }, title: { type: "string" }, summary: { type: "string" },
     token: { type: "string" }, session: { type: "string" }, thinking: { type: "string" }, target: { type: "string" }, task: { type: "string" }, bot: { type: "string" }, message: { type: "string" }, before: { type: "string" }, through: { type: "string" }, last: { type: "boolean" },
     refresh: { type: "boolean" }, path: { type: "string" }, operation: { type: "string" }, preview: { type: "boolean" },
-    host: { type: "string" }, to: { type: "string" }, "source-bot": { type: "string" }, "cross-host": { type: "boolean" }, "context-message": { type: "string" }, file: { type: "string", multiple: true }, "new-conversation": { type: "string" }, timeout: { type: "string" },
+    host: { type: "string" }, to: { type: "string" }, "source-bot": { type: "string" }, delivery: { type: "string" }, "cross-host": { type: "boolean" }, "context-message": { type: "string" }, file: { type: "string", multiple: true }, "new-conversation": { type: "string" }, timeout: { type: "string" },
     "reply-to": { type: "string" }, ids: { type: "string" }, conversation: { type: "string" }, sort: { type: "string" }, text: { type: "string" }, "text-file": { type: "string" }, run: { type: "string" },
     coordinator: { type: "string" }, members: { type: "string" },
     participants: { type: "string" }, supersedes: { type: "string" }, then: { type: "string" }, "if-running": { type: "boolean" },
@@ -336,7 +342,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     folders: ["enabled", "revision", "unfiled"],
     conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session"],
     widgets: ["html-file", "report-file", "title", "summary", "request-id", "enabled", "revision"],
-    messages: ["ids", "before", "through", "yes", "to", "source-bot", "text-file", "file", "new-conversation", "message", "timeout", "out", "request-id", "from", "bot", "context-message", "cross-host"],
+    messages: ["ids", "before", "through", "yes", "to", "source-bot", "text-file", "file", "new-conversation", "message", "timeout", "out", "request-id", "from", "bot", "context-message", "cross-host", "delivery", "enabled"],
     queue: ["bot", "message", "before", "last", "text", "text-file", "revision", "request-id"],
     tasks: ["bot", "task", "token", "yes", "request-id"],
     attachments: ["conversation", "ids", "sort", "offset", "yes"],
@@ -368,6 +374,8 @@ export async function runHostCli(argv: string[]): Promise<void> {
   if (v.force && !["stop", "restart", "tickets"].includes(command)) throw new Error("--force 仅支持 stop、restart 或 tickets dispatch。");
   if (v.reset && command !== "enroll") throw new Error("--reset 仅支持本机 CLI 控制器重新登记。");
   if (v["cross-host"] && !(command === "messages" && sub === "grants")) throw new Error("--cross-host 仅支持 messages grants。");
+  if (v.delivery !== undefined && !(command === "messages" && sub === "send")) throw new Error("--delivery 仅支持 messages send。");
+  if (command === "messages" && v.enabled !== undefined && sub !== "steering") throw new Error("messages 只有 steering 接受 --enabled。");
   if (command === "network" && v.tailscale && sub !== "local") throw new Error("--tailscale 仅支持 network local。");
   if (command === "network" && sub === "local" && (v.name || v.from || v.out || v.yes)) throw new Error("network local 只读，不接受 --name/--from/--out/--yes。");
   if (command === "update") {
@@ -712,12 +720,13 @@ export async function runHostCli(argv: string[]): Promise<void> {
     }
   }
 
-  if (command === "conversations" && sub === "list" || command === "messages" && ["send", "wait", "allow", "revoke", "grants"].includes(sub ?? "")) {
-    if (argument || command === "conversations" && sub !== "list") throw new Error("请使用 conversations list 或 messages send|wait|allow|revoke|grants。");
+  if (command === "conversations" && sub === "list" || command === "messages" && ["send", "wait", "allow", "revoke", "grants", "steering"].includes(sub ?? "")) {
+    if (argument || command === "conversations" && sub !== "list") throw new Error("请使用 conversations list 或 messages send|wait|allow|revoke|grants|steering。");
     if (command === "conversations" && [v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v.revision, v["request-id"]].some(value => value !== undefined)) throw new Error("conversations list 不接受批量修改参数。");
     await output(await runBotMessagesCommand(directory, sub!, {
       host: v.host, bot: v.bot, to: v.to, "source-bot": v["source-bot"], "context-message": v["context-message"], "text-file": v["text-file"], file: v.file,
       "new-conversation": v["new-conversation"], message: v.message, timeout: v.timeout, out: v.out, "request-id": v["request-id"], from: v.from, "cross-host": v["cross-host"],
+      delivery: v.delivery, enabled: v.enabled,
     }, abort.signal)); return;
   }
   if (command === "attachments") { await output(await runAttachmentsCommand(directory, sub, { conversation: v.conversation, ids: v.ids, sort: v.sort, offset: v.offset, yes: v.yes })); return; }

@@ -1760,7 +1760,7 @@ export class HubServer {
       // authorization has no route here.
       if (route === "/api/bot-messages/steering" && (req.method === "GET" || req.method === "POST")) {
         await requireOwner();
-        if (req.method === "GET") await reply(200, await this.botMessages.readSteering(userId, idSchema.parse(url.searchParams.get("botId")), validateInQueue));
+        if (req.method === "GET") await reply(200, await this.botMessages.readSteering(userId, z.string().min(1).max(256).parse(url.searchParams.get("botId")), validateInQueue));
         else {
           const input = z.object({ command: botMessageSteeringCommandSchema, proof: deviceActionProofSchema }).strict().parse(await this.jsonBody(req));
           await reply(200, await this.botMessages.setSteering(userId, input.command, validateInQueue,

@@ -720,8 +720,15 @@ export class BotMessages {
     return { botId, allowed: !await this.memo(steeringDisabledKey(botId)), supported: supportsBotMessageSteerEngine(bot.engine) };
   }
   /** Receiving owner's switch "allow other Bots to steer this Bot" (default on). */
-  async readSteering(userId: string, botId: string, guard: Guard): Promise<BotMessageSteeringSnapshot> {
-    return this.store.db.serial(async () => { await guard(); await this.store.requireOwner(userId); return this.steeringInTransaction(idSchema.parse(botId)); });
+  /** `bot` is an ID or an exact unique name (IDs first); the snapshot names the ID. */
+  async readSteering(userId: string, bot: string, guard: Guard): Promise<BotMessageSteeringSnapshot> {
+    return this.store.db.serial(async () => {
+      await guard(); await this.store.requireOwner(userId);
+      const bots = await this.store.db.all<{ id: string; name: string }>("SELECT id,name FROM bots WHERE deleted_at IS NULL AND role!='worker' ORDER BY id");
+      let id: string;
+      try { id = resolveBotTarget(bot, bots, "bot").id; } catch (error) { if (error instanceof TargetResolutionError && resolutionCode(error) === "target_not_found") throw new HubError("bot_not_found", 404); throw error; }
+      return this.steeringInTransaction(id);
+    });
   }
   /** Owner + one-use device proof (`admit`), like Bot-message grants. Bot
    * instance authorization never reaches this. */

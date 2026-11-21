@@ -7,6 +7,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { CHUNK_BYTES, MAX_FILE_BYTES, MAX_TEXT_BYTES, idSchema, uploadSchema } from "../client-protocol/index.js";
 import { BOT_LOCAL_REQUEST_TIMEOUT_MS, botMessageTargetSchema, parseBotDestination, type BotLocalRequest } from "../client-protocol/bot-messages.js";
+import { botMessageDeliverySchema, botMessageSteeringProofPayload, botMessageSteeringSnapshotSchema, type BotMessageDelivery } from "../client-protocol/bot-message-delivery.js";
 import { LocalHostClient, HostCliError } from "./client.js";
 import { inspectHubService } from "../hub/service.js";
 import { isLoopback } from "../hub/network.js";
@@ -15,7 +16,8 @@ import { withChannelProfile } from "../core/channel-profile.js";
 import { loadInstanceConfig, resolveInstanceWorkspacePath } from "../state/instance-config.js";
 
 export type BotMessageOptions = { host?: string; bot?: string; to?: string; "source-bot"?: string; "text-file"?: string; file?: string[];
-  "new-conversation"?: string; message?: string; timeout?: string; out?: string; "request-id"?: string; "context-message"?: string; from?: string; "cross-host"?: boolean };
+  "new-conversation"?: string; message?: string; timeout?: string; out?: string; "request-id"?: string; "context-message"?: string; from?: string; "cross-host"?: boolean;
+  delivery?: string; enabled?: string };
 type Call = (body: BotLocalRequest) => Promise<any>;
 const replyFileSchema = uploadSchema.omit({ conversationId: true }).extend({ id: idSchema, size: uploadSchema.shape.size.max(MAX_FILE_BYTES) });
 
@@ -99,8 +101,8 @@ function replyFilename(id: string, value: string): string {
 
 export async function runBotMessagesCommand(directory: string, command: string, options: BotMessageOptions, signal: AbortSignal = new AbortController().signal) {
   const allow: Record<string, string[]> = {
-    list: ["host", "bot", "source-bot"], send: ["to", "source-bot", "text-file", "file", "new-conversation", "request-id", "context-message"],
-    wait: ["to", "source-bot", "message", "timeout", "out"], allow: ["from", "bot"], revoke: ["from", "bot"], grants: ["cross-host"],
+    list: ["host", "bot", "source-bot"], send: ["to", "source-bot", "text-file", "file", "new-conversation", "request-id", "context-message", "delivery"],
+    wait: ["to", "source-bot", "message", "timeout", "out"], allow: ["from", "bot"], revoke: ["from", "bot"], grants: ["cross-host"], steering: ["bot", "enabled"],
   };
   if (!allow[command]) throw new Error("unknown_bot_message_command");
   for (const [key, value] of Object.entries(options)) if (value !== undefined && !allow[command]!.includes(key)) throw new Error(`unsupported_option_${key}`);
@@ -115,6 +117,30 @@ export async function runBotMessagesCommand(directory: string, command: string, 
       }
       throw error;
     } finally { owner.close(); }
+  }
+  if (command === "steering") {
+    // Receiving owner's switch: owner controller only, like grants.
+    if (process.env.TAROBOT_INSTANCE || process.env.TAROBOT_ACTIVE_INSTANCE) throw new Error("bot_message_steering_requires_owner_controller");
+    const bot = required(options.bot, "bot");
+    const allowed = options.enabled === undefined ? undefined : options.enabled === "on" ? true : options.enabled === "off" ? false : undefined;
+    if (options.enabled !== undefined && allowed === undefined) throw new Error("enabled_must_be_on_or_off");
+    const owner = await LocalHostClient.connect(directory);
+    try {
+      const current = botMessageSteeringSnapshotSchema.parse(await owner.request(`/api/bot-messages/steering?botId=${encodeURIComponent(bot)}`));
+      if (allowed === undefined || allowed === current.allowed) return current;
+      const change = { botId: current.botId, allowed };
+      const proof = await owner.deviceAction({ operation: "bot-message-grant", target: createHash("sha256").update(botMessageSteeringProofPayload(change)).digest("hex") });
+      return botMessageSteeringSnapshotSchema.parse(await owner.request("/api/bot-messages/steering", "POST", { command: change, proof }));
+    } catch (error) {
+      if (error instanceof HostCliError && error.status === 404 && error.code === "not_found") throw new Error("请先更新这台主机；当前运行的主机尚不支持「允许其他 Bot 引导」开关。 / Update this host before using the Bot steering switch.");
+      throw error;
+    } finally { owner.close(); }
+  }
+  let delivery: BotMessageDelivery | undefined;
+  if (options.delivery !== undefined) {
+    const parsed = botMessageDeliverySchema.safeParse(options.delivery);
+    if (!parsed.success) throw new Error("delivery_must_be_queue_or_steer");
+    delivery = parsed.data;
   }
   const sourceBot = options["source-bot"];
   if (!process.env.TAROBOT_INSTANCE && !process.env.TAROBOT_ACTIVE_INSTANCE && !sourceBot && !["allow", "revoke"].includes(command)) throw new Error("operator_requires_source_bot");
@@ -164,7 +190,9 @@ export async function runBotMessagesCommand(directory: string, command: string, 
           await source.unchanged(); await call("complete", { uploadId: upload.id }); attachments.push(upload.id);
         } finally { await source.handle.close(); }
       }
-      return await call("send", { text, attachments });
+      // Queue is the default and keeps the legacy request bytes on the wire.
+      const receipt = await call("send", { text, attachments, ...(delivery === "steer" ? { delivery } : {}) });
+      return delivery === "queue" && receipt && typeof receipt === "object" && !("delivery" in receipt) ? { ...receipt, delivery: { requested: "queue", actual: "queued" } } : receipt;
     }
     const messageId = idSchema.parse(required(options.message, "message")), timeout = Number(options.timeout ?? "120");
     if (!Number.isFinite(timeout) || timeout < 0 || timeout > 3600) throw new Error("timeout_must_be_0_to_3600_seconds");

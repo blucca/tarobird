@@ -544,6 +544,10 @@ App Bot 发送时使用本轮附加提示提供的 `--context-message CURRENT_IN
 
 Bot 间的新任务、审阅结果和后续补充都使用 `messages send`，收件方正在执行时也如此；这些消息进入持久队列。不要为了跟进正在运行的 Bot 而改用 `steer send`。后者只针对指定当前轮次，轮次结束就拒绝，且不进入下一轮。
 
+**逐条选择引导（issue #62）。** `messages send` 默认 `--delivery queue`，与以前完全相同（线上请求不带新字段）。`--delivery steer` 只用于纠正方向、补充关键信息或回答对方刚问的问题：接收主机在下列条件全部满足时，把文字并入收件 Bot 正在进行的回复，否则自动排队一次——收件 Bot 是 Codex 或 Claude Code；目标是直连单 Bot 对话；同一对话里有进行中的回复，且该回复由**同一个发送方 Bot** 之前的消息发起；没有待处理的审批或提问；接收方主人没有关闭开关；每次回复最多被引导 3 次、每条发送方 → 收件方方向 10 分钟最多 6 次；只有文字（带附件时排队）。回执的 `delivery.actual` 如实写明结果：`steered`（`delivery.turn.messageId` 为被并入回复的输入；`messages wait` 返回那次回复，`reply.kind` 为 `merged_turn`）、`fell_back_to_queue`（`delivery.reason` 说明原因，消息只排队一次）或 `steer_uncertain`（无法确认是否并入，**不会**再排队；用 `messages wait` 或同一 `--request-id` 重发核对，主机会向对方 Gateway 查询已落盘的结局）。旧主机不认识 steer 时，发送方主机自动排队并注明 `receiver_update_required`。steer 比排队最多多等约 13 秒，跨主机最坏约 30 秒。Bot 消息无论哪种方式都不能执行斜杠命令、`/stop`、审批或卡片回答。
+
+接收方主人可在普通终端用 `messages steering --bot BOT [--enabled on|off]` 查看或修改「允许其他 Bot 引导这个 Bot」（默认开启），或在 App 的 Bot 设置里修改；Bot 自己不能改。
+
 `steer send` 仍可用于有意限定某一轮的补充。`steer send` / `send-now` / `cancel` 返回的 JSON 格式不变；已知拒绝、未采纳、撤回或结果待确认时，CLI 在 stderr 解释原因并以退出码 1 结束。`status` 查询成功仍退出 0；`steer send` 退出 0 仅表示当前回执证明接收，不代表任务完成。之后核对原请求时，若已有“未进入模型”或“不确定”的原生回执，会以较新的证据为准。即使 HTTP 为 200，也必须检查回执；旧 CLI 的退出码不能证明投递成功。
 
 原生控制操作返回 `accepted / nothing_waiting` 时是幂等空操作，仍退出 0，但 stderr 明确说明“本次未改变任务”。它不能单独证明模型已接收原消息；JSON 回执保持不变，不会自动重发。
