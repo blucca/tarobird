@@ -1,4 +1,4 @@
-# ACCEPTANCE-ONLY PROBE (#50 shortcut AppID read and Start index timing).
+# ACCEPTANCE-ONLY PROBE (#50 extension A1: shortcut target under a CJK path).
 # Never merge into main. A tiny NSIS fixture, no TaroBird installer, no uploads.
 name: Windows desktop installer
 on:
@@ -29,30 +29,28 @@ jobs:
         run: |
           choco install nsis --no-progress -y
           "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
-      - name: Compile and run the AppID fixture (installer's own SetLnkAppUserModelId)
+      - name: CJK shortcut target probe (installer's own CreateShortcut + SetLnkAppUserModelId)
         shell: pwsh
         working-directory: client/scripts/acceptance-probe
         run: |
-          makensis /V2 "/DOUT=$env:RUNNER_TEMP\appid-probe.exe" appid-probe.nsi
+          $cjk = -join ([char]0x9A8C, [char]0x6536, ' ', [char]0x76EE, [char]0x5F55)
+          $dir = Join-Path $env:RUNNER_TEMP "TB $cjk\TaroBird"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item "$env:WINDIR\System32\whoami.exe" (Join-Path $dir 'tarocub-client.exe')
+          makensis /V2 "/DOUT=$env:RUNNER_TEMP\lnk-cjk-probe.exe" lnk-cjk-probe.nsi
           if ($LASTEXITCODE -ne 0) { throw "fixture did not compile" }
-          $p = Start-Process -FilePath "$env:RUNNER_TEMP\appid-probe.exe" -ArgumentList '/S' -Wait -PassThru
+          $p = Start-Process -FilePath "$env:RUNNER_TEMP\lnk-cjk-probe.exe" -ArgumentList "/S /D=$dir" -Wait -PassThru
           "fixture exit $($p.ExitCode)"
-      - name: Read the shortcut property and poll Start apps (judged read, recorded index timing)
-        shell: pwsh
-        run: |
-          $dir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\TaroBird AppID Probe'
-          function AppId([string]$name) { $i = (New-Object -ComObject Shell.Application).Namespace($dir).ParseName($name); [string]$i.ExtendedProperty('System.AppUserModel.ID') }
-          $withId = AppId 'TaroBird AppID Probe.lnk'; $plain = AppId 'TaroBird AppID Probe Plain.lnk'
-          "shortcut property: probe='$withId' plain='$plain'"
-          $polls = @(); $listed = $false; $start = Get-Date
-          for ($t = 0; $t -le 60; $t += 5) {
-            $hit = @(Get-StartApps | Where-Object { $_.AppID -eq 'com.tarobot.client.appidprobe' })
-            $named = @(Get-StartApps | Where-Object { $_.Name -like 'TaroBird AppID Probe*' } | ForEach-Object { "$($_.Name)=$($_.AppID)" })
-            $polls += "$([int]((Get-Date) - $start).TotalSeconds)s:$(if ($hit.Count) { 'listed' } else { 'absent' }) [$($named -join '; ')]"
-            if ($hit.Count) { $listed = $true; break }
-            Start-Sleep -Seconds 5
-          }
-          $polls | ForEach-Object { "poll $_" }
-          "| item | value |`n|---|---|`n| probe property | $withId |`n| plain property | $plain |`n| Start listed within 60 s | $listed |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          if ($withId -ne 'com.tarobot.client.appidprobe' -or $plain -ne '') { throw "PROBE FAIL: the property read does not tell the AppID shortcut from the plain one" }
-          "PROBE PASS: property read works (probe=$withId, plain=none); Start listed the AppID within 60 s: $listed"
+          $link = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\TaroBird CJK Probe.lnk'
+          if (-not (Test-Path -LiteralPath $link)) { throw "PROBE FAIL: no shortcut" }
+          $expected = Join-Path $dir 'tarocub-client.exe'
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File lnk-cjk-read.ps1 -Link $link -Expected $expected -Out "$env:RUNNER_TEMP\read-ps51.json"
+          pwsh -NoProfile -NonInteractive -File lnk-cjk-read.ps1 -Link $link -Expected $expected -Out "$env:RUNNER_TEMP\read-ps7.json"
+          $a = Get-Content -Raw "$env:RUNNER_TEMP\read-ps51.json" | ConvertFrom-Json; $b = Get-Content -Raw "$env:RUNNER_TEMP\read-ps7.json" | ConvertFrom-Json
+          "ps51 json: $(Get-Content -Raw "$env:RUNNER_TEMP\read-ps51.json")"
+          "ps7  json: $(Get-Content -Raw "$env:RUNNER_TEMP\read-ps7.json")"
+          Remove-Item -LiteralPath $link -Force
+          if (-not $a.bytesHaveUtf16Dir) { "VERDICT: the .lnk does not hold the CJK directory as UTF-16 (product side)"; exit 1 }
+          if ($a.shellEqual -and -not $a.wshEqual) { "VERDICT: the .lnk is correct; WScript.Shell TargetPath loses the CJK characters (acceptance read method)" }
+          elseif ($a.shellEqual -and $a.wshEqual) { "VERDICT: every read is correct here; the extension failure needs another cause" }
+          else { "VERDICT: unexpected combination, see the json" }
