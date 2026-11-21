@@ -197,6 +197,19 @@ async function verifyElectron(sys, report, phase, directory, version) {
   report.expect(phase, 'notification-receipt', !!shortcut && typeof receiptPath === 'string' && same(receiptPath, shortcut), `${receipt} → ${receiptPath ?? 'missing'}`);
   const apps = (await sys.powershell(`Get-StartApps | Where-Object { $_.AppID -eq '${AUMID}' } | ForEach-Object { $_.AppID }`)).stdout.trim();
   report.expect(phase, 'notification-aumid', apps.split(/\r?\n/).includes(AUMID), apps || `no Start app with AppID ${AUMID}`);
+  // Diagnostic only, never judged (the check above is unchanged): the AppID the
+  // shortcut itself carries, and what Start lists for TaroBird now and ~30 s
+  // later, tell a shortcut without the AppUserModelID (product) from a Start
+  // apps list that has not indexed it yet (runner). Read-only.
+  if (shortcut) {
+    const q = value => value.replaceAll("'", "''");
+    const property = (await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${q(path.win32.dirname(shortcut))}').ParseName('${q(path.win32.basename(shortcut))}'); [string]$i.ExtendedProperty('System.AppUserModel.ID')`)).stdout.trim();
+    report.info(phase, 'diag:shortcut-appusermodel-id', property || 'no System.AppUserModel.ID on the shortcut');
+    const listed = async () => (await sys.powershell(`Get-StartApps | Where-Object { $_.Name -like '*TaroBird*' -or $_.Name -like '*TaroBot*' -or $_.AppID -like '*tarobot*' -or $_.AppID -like '*tarocub*' } | ForEach-Object { "$($_.Name) = $($_.AppID)" }`)).stdout.trim() || 'none';
+    report.info(phase, 'diag:start-apps-now', await listed());
+    await sys.sleep(30_000);
+    report.info(phase, 'diag:start-apps-after-30s', await listed());
+  }
 }
 
 /** Read-only by default: never register the production AUMID before App first
