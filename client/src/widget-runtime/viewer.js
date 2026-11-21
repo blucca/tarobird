@@ -14,8 +14,24 @@ let watchdog,worker,failed=false,retiring=false,flushId,renderFrame=0,pendingHtm
 // yields cannot read it, so it cannot answer on the runtime's behalf.
 const randomValues=crypto.getRandomValues.bind(crypto),freshNonce=()=>[...randomValues(new Uint32Array(4))].map(value=>value.toString(36)).join('');
 const allowedTheme=Object.keys(initialTheme);
-const applyTheme=theme=>{for(const name of allowedTheme){const value=theme?.[name];if(typeof value!=='string'||value.length>500)continue;if(name==='scheme')htmlElement.style.colorScheme=value==='dark'?'dark':'light';else htmlElement.style.setProperty('--'+name,value)}};
-applyTheme(initialTheme);
+// Authored @media (prefers-color-scheme) follows the scheme supplied to this
+// widget, as light-dark() and the Worker's matchMedia already do. The frame
+// itself reports the device preference, which differs whenever the App
+// appearance overrides it (CLI is always dark). A mismatched frame swaps
+// light/dark inside each such feature, so any authored query stays valid.
+const deviceDark=matchMedia('(prefers-color-scheme: dark)'),schemeFeature=/(\(\s*prefers-color-scheme\s*:\s*)(light|dark)(\s*\))/gi,schemeMedia=new WeakMap(),schemeSheets=new WeakMap();
+let suppliedScheme='light';
+function mapSchemeMedia(){
+ const swap=(suppliedScheme==='dark')!==deviceDark.matches;
+ const visitList=(owner,list)=>{const original=schemeMedia.get(owner)??list.mediaText;if(!/prefers-color-scheme/i.test(original))return;schemeMedia.set(owner,original);const next=swap?original.replace(schemeFeature,(_,start,value,end)=>start+(value.toLowerCase()==='dark'?'light':'dark')+end):original;if(list.mediaText!==next)list.mediaText=next};
+ const visit=rules=>{for(const rule of rules){if(rule instanceof CSSMediaRule)visitList(rule,rule.media);if(rule.cssRules)visit(rule.cssRules)}};
+ for(const style of root.querySelectorAll('style')){
+  const sheet=style.sheet,mapped=schemeSheets.get(style);if(!sheet||mapped?.sheet===sheet&&mapped.swap===swap)continue;schemeSheets.set(style,{sheet,swap});
+  try{visitList(sheet,sheet.media);visit(sheet.cssRules)}catch{/* An unreadable sheet keeps its media. */}
+ }
+}
+const applyTheme=theme=>{for(const name of allowedTheme){const value=theme?.[name];if(typeof value!=='string'||value.length>500)continue;if(name==='scheme'){suppliedScheme=value==='dark'?'dark':'light';htmlElement.style.colorScheme=suppliedScheme}else htmlElement.style.setProperty('--'+name,value)}mapSchemeMedia()};
+applyTheme(initialTheme);deviceDark.addEventListener('change',mapSchemeMedia);
 // IDs remain local to this opaque viewer, whose authority is captured in lexical
 // bindings. Preserve ordinary IDs such as "title"/"method" for CSS and virtual
 // DOM correspondence; frames/embedded plugins and executable attributes remain
@@ -96,7 +112,7 @@ function render(value,overflow,ack=Infinity){
   }
   while(parent.childNodes.length>source.childNodes.length)parent.lastChild.remove();
  };
- patch(root,template.content);mapFormStyles();refreshObservers();
+ patch(root,template.content);mapFormStyles();mapSchemeMedia();refreshObservers();
 }
 // Live control properties from the Worker. Markup attributes only set default
 // values; once a control is dirty, script changes need these properties. Each
@@ -333,4 +349,4 @@ addEventListener('resize',revealEditor);
 send('tarobot-widget-started');
 if(!hasScripts)send('tarobot-widget-ready',{interactive:false});
 let height=0;const resize=new ResizeObserver(()=>{const next=Math.ceil(bodyElement.getBoundingClientRect().height);if(next!==height){height=next;send('tarobot-widget-height',{height})}worker?.postMessage({type:'viewport',viewport:{width:root.clientWidth,height:next}})});resize.observe(bodyElement);
-addEventListener('pagehide',()=>{removeEventListener('resize',revealEditor);if(focusScroll)cancelAnimationFrame(focusScroll);reducedMotion.removeEventListener('change',updateMotion);releaseWorkerUrl();worker?.terminate();clearInterval(watchdog);clearTimeout(wheelTimer);for(const timer of [...pendingEscapes.values(),...composeRequests.values()])clearTimeout(timer);resize.disconnect();guestResize.disconnect()});
+addEventListener('pagehide',()=>{removeEventListener('resize',revealEditor);deviceDark.removeEventListener('change',mapSchemeMedia);if(focusScroll)cancelAnimationFrame(focusScroll);reducedMotion.removeEventListener('change',updateMotion);releaseWorkerUrl();worker?.terminate();clearInterval(watchdog);clearTimeout(wheelTimer);for(const timer of [...pendingEscapes.values(),...composeRequests.values()])clearTimeout(timer);resize.disconnect();guestResize.disconnect()});
