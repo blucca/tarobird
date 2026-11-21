@@ -722,3 +722,61 @@ test('the setup notes folder is documented as setup writes it', async () => {
   // Kept by design: setup never removes the folder or its files.
   assert.doesNotMatch(nsisCode(notes), /RMDir|Delete "\$8\\\$\{BIRDNOTESFILE\}"/);
 });
+
+// Evaluates the stopper choice of installer-hooks.nsh (LogicLib If/ElseIf with
+// AndIf/AndIfNot/OrIf folded left to right, as LogicLib does) against a file
+// layout. Only the statements that block uses are understood; anything else
+// fails, so a changed block cannot be judged silently.
+function stopperFor(hooks, files) {
+  const stop = nsisCode(between(hooks, '!macro TaroBotStopLocalHost', '!macroend'));
+  const block = between(stop, 'StrCpy $TaroBotHostStopper ""', '${If} $R0 = 1').split('\n').map(line => line.trim()).filter(Boolean);
+  const defines = { TAROBOTHELPER: hooks.match(/^!define TAROBOTHELPER "([^"]+)"$/m)[1], MAINBINARYNAME: 'tarocub-client' };
+  const expand = text => text.replace(/\$\{(\w+)\}/g, (_, name) => { assert.ok(name in defines, `unknown define ${name}`); return defines[name]; });
+  const present = new Set(files.map(file => file.toLowerCase()));
+  const state = { stopper: '', r0: 0 };
+  const test = condition => {
+    let match;
+    if ((match = condition.match(/^\$\{FileExists\} "\$INSTDIR\\(.+)"$/))) return present.has(expand(match[1]).toLowerCase());
+    if (condition === '$TaroBotHostStopper == ""') return state.stopper === '';
+    if (condition === '$TaroBotHostStopper != ""') return state.stopper !== '';
+    assert.fail(`stopper evaluator does not know the condition: ${condition}`);
+  };
+  let open = false, taken = false, value = false;
+  for (const line of block) {
+    let match;
+    if ((match = line.match(/^\$\{(If|ElseIf)\} (.+)$/))) {
+      if (match[1] === 'If') { assert.ok(!open, 'nested If'); open = true; taken = false; } else assert.ok(open, 'ElseIf outside If');
+      value = !taken && test(match[2]);
+    } else if ((match = line.match(/^\$\{(AndIf|AndIfNot|OrIf)\} (.+)$/))) {
+      const result = test(match[2]);
+      value = match[1] === 'OrIf' ? value || (!taken && result) : value && (match[1] === 'AndIfNot' ? !result : result);
+    } else if (line === '${EndIf}') { assert.ok(open, 'EndIf outside If'); open = false; }
+    else if ((match = line.match(/^StrCpy \$TaroBotHostStopper "(.*)"$/))) { if (!open || value) { state.stopper = expand(match[1]).replace('$INSTDIR\\', ''); if (open) taken = true; } }
+    else if ((match = line.match(/^StrCpy \$R0 (\d+)$/))) { if (!open || value) { state.r0 = Number(match[1]); if (open) taken = true; } }
+    else assert.fail(`stopper evaluator does not know the statement: ${line}`);
+  }
+  assert.ok(!open, 'unterminated If');
+  // r0 = 1: a Host runtime without its stopper; the uninstaller refuses (TB-HOST-NO-STOPPER), the installer confirms read-only.
+  return state;
+}
+
+// Both shapes of a Tauri host\ left behind by the upgrade: with node.exe (the
+// review's case) and with only node-runtime.exe (read on a real Win11 machine
+// upgraded from Tauri to Electron 1.5.1, beside the helper and resources\).
+test('the Host stopper for each install layout, including both left-over Tauri host\\ shapes', async () => {
+  const [hooks] = await templates('installer-hooks.nsh');
+  const electron = ['tarocub-client.exe', 'resources\\app.asar', 'resources\\host\\node.exe', 'resources\\host\\dist\\src\\index.js'];
+  const helper = 'tarobot-installer-helper.exe';
+  const layouts = [
+    ['Tauri install', ['tarocub-client.exe', 'host\\node.exe', 'host\\dist\\src\\index.js'], { stopper: 'tarocub-client.exe', r0: 0 }],
+    ['Tauri runtime without its program', ['host\\node.exe'], { stopper: '', r0: 1 }],
+    ['Electron install', [...electron, helper], { stopper: helper, r0: 0 }],
+    ['Electron install, helper missing', electron, { stopper: '', r0: 1 }],
+    ['Electron, helper missing, Tauri host\\ with node.exe left (review S2)', [...electron, 'host\\node.exe', 'host\\dist\\src\\index.js'], { stopper: '', r0: 1 }],
+    ['Electron, helper missing, Tauri host\\ with only node-runtime.exe left', [...electron, 'host\\node-runtime.exe'], { stopper: '', r0: 1 }],
+    ['real upgraded machine: Electron with helper, host\\ with only node-runtime.exe', [...electron, helper, 'host\\node-runtime.exe'], { stopper: helper, r0: 0 }],
+    ['Electron with helper, Tauri host\\ with node.exe left', [...electron, helper, 'host\\node.exe'], { stopper: helper, r0: 0 }],
+    ['companion install without a runtime', ['tarocub-client.exe'], { stopper: '', r0: 0 }],
+  ];
+  for (const [label, files, expected] of layouts) assert.deepEqual(stopperFor(hooks, files), expected, label);
+});
