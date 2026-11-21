@@ -222,7 +222,9 @@ mod tests {
                 let out = std::process::Command::new("/bin/sh").args(["-c", "command -v node"]).output().unwrap();
                 #[cfg(windows)]
                 let out = std::process::Command::new("where.exe").arg("node.exe").output().unwrap();
-                PathBuf::from(String::from_utf8(out.stdout).unwrap().lines().next().unwrap_or_default().trim())
+                let found = String::from_utf8(out.stdout)
+                    .unwrap_or_else(|_| panic!("the Node lookup printed a non-UTF-8 path; set TAROBOT_TEST_NODE"));
+                PathBuf::from(found.lines().next().unwrap_or_default().trim())
             });
             assert!(node.is_file(), "a Node executable is required for the desktop_host lab (set TAROBOT_TEST_NODE)");
             #[cfg(unix)] std::os::unix::fs::symlink(&node, resources.join("node")).unwrap();
