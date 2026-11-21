@@ -25,6 +25,43 @@ blocks resetting shared data. Close the App and stop/uninstall the owning CLI
 service first; do not start another CLI while installing. Ordinary App upgrades
 continue to preserve independently installed CLI services.
 
+### Setup notes (`%LOCALAPPDATA%\TaroBird Setup Notes`)
+
+Dialogs and the Details list disappear when setup closes, and `/S` shows
+neither. So the installer and the uninstaller also keep a short local record:
+
+- **Where:** `%LOCALAPPDATA%\TaroBird Setup Notes\setup-notes.txt`, plus at most
+  one older `setup-notes.previous.txt` in the same folder. It is in this
+  Windows user's Local AppData (not roamed), outside the install folder and
+  outside the data folders that a reset backs up. Nothing uploads it.
+- **What:** one line for each stop that setup diagnoses with a `TB-` code (each
+  Retry adds another line) and one line for each finished install, update or
+  uninstall. A line holds only the local time, the operation, the stage, the
+  `TB-` code, the backup and notification state and `TaroBird <version>`, all
+  as fixed localized text. It never holds a path, account or computer name,
+  process name, registry value, helper output or log. A cancelled run, a
+  declined consent prompt or an NSIS error without a `TB-` code adds nothing,
+  so the last line can be an older run.
+- **How large:** at most 20 lines per file. When the current file is full, the
+  previous file is deleted and the current one becomes the previous one, so
+  there are never more than 40 lines in all (UTF-16LE text, a few hundred
+  characters per line).
+- **Never in the way:** one writer at a time; a writer that cannot get its
+  turn within 2 seconds skips its line. Setup never writes through a link or
+  junction, and any failure only skips the line: it never prompts, aborts or
+  changes what setup does. A dialog points to the folder only when its line
+  was written. In English it says:
+  "This step is also saved in this Windows user's local folder and is not uploaded. To see it and earlier steps after setup closes, press Win+R, enter %LOCALAPPDATA% and open the TaroBird Setup Notes folder."
+  In Chinese:
+  "此步骤也已保存在本机当前 Windows 用户的本地目录中，不会上传。安装程序关闭后如需查看本次及之前的步骤，请按 Win+R 输入 %LOCALAPPDATA%，再打开其中的 TaroBird Setup Notes 文件夹。"
+- **After uninstall:** the folder stays, both when data is kept and after
+  "back up and reset local data"; a successful uninstall writes its own
+  "finished" line, so it can create the folder. The next installer's fresh
+  start offer ignores it.
+- **Removing it:** you can delete the folder or its files at any time. Nothing
+  else reads them, and setup creates the folder again the next time it writes
+  a line.
+
 ## Implementation and review
 
 - `fresh_install.rs` runs before WebView/single-instance initialization and is
