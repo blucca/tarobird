@@ -38,7 +38,9 @@ jobs:
         shell: pwsh
         run: |
           $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $makensis) { choco install nsis --no-progress -y | Out-Null; $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
+          if (-not $makensis) { choco install nsis --no-progress -y | Out-Null }
+          if (-not $makensis) { $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe", "$env:ChocolateyInstall\bin\makensis.exe", (Get-Command makensis -ErrorAction SilentlyContinue).Source) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1 }
+          if (-not $makensis) { throw "makensis not found after choco install" }
           & $makensis -VERSION
           & $makensis -V2 -INPUTCHARSET UTF8 "-DSRC=$PWD\client\windows-electron" "-DOUT=$env:RUNNER_TEMP\dialog-fixture.exe" client/scripts/acceptance-probe/dialog-fixture.nsi
           if ($LASTEXITCODE -ne 0) { throw "fixture build failed" }
