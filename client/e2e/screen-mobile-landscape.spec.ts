@@ -107,6 +107,18 @@ for (const phone of phones) test(`landscape layout ${phone.name}`, async ({ brow
         return { rows: new Set(tops).size, keyInset: [drawn.top, drawn.bottom, drawn.borderRadius], field: getComputedStyle(tray.querySelector("textarea")!).fontSize, hint: getComputedStyle(tray.querySelector("small")!).display, send: tray.querySelector(".screen-text>button")!.getAttribute("aria-label") };
       });
       expect(row).toEqual({ rows: 1, keyInset: ["6px", "6px", "6px"], field: "16px", hint: "none", send: text("发送到远端") });
+      // ≥ 700 pt beside the rail: all eight keys whole and still, the field takes the rest.
+      // Narrower: the keys scroll. Enter is drawn as a return arrow but keeps its name.
+      const keys = await page.locator(".screen-mobile-keyboard").evaluate(tray => {
+        const panel = tray.closest<HTMLElement>(".remote-screen-panel")!, style = getComputedStyle(panel), available = panel.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) - 56;
+        const strip = tray.querySelector<HTMLElement>(".screen-mobile-keys")!, s = strip.getBoundingClientRect(), buttons = [...strip.querySelectorAll("button")];
+        const field = tray.querySelector("textarea")!.getBoundingClientRect(), send = tray.querySelector(".screen-text>button")!.getBoundingClientRect(), t = tray.getBoundingClientRect();
+        return { wide: available >= 700, whole: buttons.slice(0, 8).every(b => { const r = b.getBoundingClientRect(); return r.width >= 44 && r.left >= s.left - .5 && r.right <= s.right + .5; }),
+          scrolls: strip.scrollWidth > strip.clientWidth + .5, combos: buttons.slice(8).some(b => b.getBoundingClientRect().width > 0),
+          field: field.width - 12 >= 159.5, fills: Math.abs(field.left - s.right) <= 8 && Math.abs(send.right - (t.right - 8)) <= .6, enter: [buttons[2]!.getAttribute("aria-label"), !!buttons[2]!.querySelector("svg"), buttons[2]!.textContent] };
+      });
+      expect(keys).toEqual(keys.wide ? { wide: true, whole: true, scrolls: false, combos: false, field: true, fills: true, enter: ["Enter", true, ""] }
+        : { wide: false, whole: keys.whole, scrolls: true, combos: true, field: keys.field, fills: keys.fills, enter: ["Enter", true, ""] });
       // "More" is a full-height sheet against the rail and carries the keyboard note.
       await page.getByRole("button", { name: text("屏幕更多操作"), exact: true }).click();
       const sheet = page.getByRole("region", { name: text("屏幕更多操作") }); await expect(sheet).toBeVisible();
@@ -247,21 +259,42 @@ test("rotation keeps the session and control, refits, and the panel follows the 
   } finally { await context.close(); }
 });
 
-test("controlling fill follows the theme accent, and mono never uses plain black", async ({ browser }) => {
-  for (const [query, expected] of [["&palette=mono&accent=warm-gray", "rgb(231, 226, 220)"], ["&palette=mono&accent=mist", "mono-control"], ["&palette=ocean", "primary"], ["&palette=mono&accent=none", "not-black"]] as const) {
-    const { page, close } = await open(browser, phones[0]!, query);
-    try {
-      await connect(page, say(false)); await page.getByRole("button", { name: "开始控制", exact: true }).click();
-      const fill = await page.locator(".screen-rail-control[data-active] .screen-rail-icon").evaluate(node => {
-        const probe = (name: string) => { const el = document.createElement("i"); el.style.color = `var(${name})`; document.querySelector(".screen-rail")!.append(el); const value = getComputedStyle(el).color; el.remove(); return value; };
-        return { fill: getComputedStyle(node).backgroundColor, primary: probe("--primary-bg"), monoControl: probe("--mono-control-bg") };
+test("controlling fill is the theme accent with 4.5:1 ink and 3:1 against the rail in every palette and scheme", async ({ browser }, info) => {
+  const { page, close } = await open(browser, phones[0]!);
+  try {
+    await connect(page, say(false)); await page.getByRole("button", { name: "开始控制", exact: true }).click();
+    await expect(page.locator(".screen-rail-control[data-active]")).toBeVisible();
+    const accents = ["graphite", "warm-gray", "mist", "sage", "rose", "oat", "mauve", "none"];
+    const variants = [...accents.flatMap(accent => ["light", "dark", "system"].map(theme => ({ palette: "mono", accent, theme }))),
+      ...["white-blue", "white-green", "white-violet", "white-rose", "white-orange", "sage", "ocean"].flatMap(palette => ["light", "dark"].map(theme => ({ palette, accent: "warm-gray", theme }))),
+      { palette: "cli", accent: "warm-gray", theme: "dark" }];
+    await page.emulateMedia({ colorScheme: "dark" }); // "system" resolves to dark here
+    const rows = await page.evaluate(variants => {
+      const canvas = document.createElement("canvas").getContext("2d", { willReadFrequently: true })!;
+      const rgb = (color: string) => { canvas.clearRect(0, 0, 1, 1); canvas.fillStyle = "#000"; canvas.fillStyle = color; canvas.fillRect(0, 0, 1, 1); return [...canvas.getImageData(0, 0, 1, 1).data.slice(0, 3)]; };
+      const luminance = (c: number[]) => c.map(v => { v /= 255; return v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4; }).reduce((sum, v, i) => sum + v * [.2126, .7152, .0722][i]!, 0);
+      const ratio = (a: number[], b: number[]) => { const [x, y] = [luminance(a), luminance(b)].sort((m, n) => n - m); return Math.round((x! + .05) / (y! + .05) * 100) / 100; };
+      const hex = (c: number[]) => "#" + c.map(v => v.toString(16).padStart(2, "0")).join("");
+      const icon = document.querySelector(".screen-rail-control[data-active] .screen-rail-icon")!, rail = document.querySelector(".screen-rail")!, root = document.documentElement;
+      return variants.map(({ palette, accent, theme }) => {
+        Object.assign(root.dataset, { palette, monoAccent: accent, theme });
+        const fill = rgb(getComputedStyle(icon).backgroundColor), ink = rgb(getComputedStyle(icon).color), back = rgb(getComputedStyle(rail).backgroundColor);
+        const mark = getComputedStyle(root).getPropertyValue("--mono-mark").trim(), accentColor = rgb(getComputedStyle(root).getPropertyValue("--accent"));
+        return { palette, accent: palette === "mono" ? accent : "", theme, fill: hex(fill), ink: hex(ink), rail: hex(back), ink_fill: ratio(ink, fill), fill_rail: ratio(fill, back), source: palette === "mono" && mark ? (hex(fill) === hex(rgb(mark)) ? "mark" : "mark deepened") : hex(fill) === hex(accentColor) ? "accent" : "other" };
       });
-      if (expected === "primary") expect(fill.fill).toBe(fill.primary);
-      else if (expected === "mono-control") expect(fill.fill).toBe(fill.monoControl);
-      else if (expected === "not-black") expect(["rgb(17, 17, 17)", "rgb(0, 0, 0)"]).not.toContain(fill.fill);
-      else expect(fill.fill).toBe(expected);
-    } finally { await close(); }
-  }
+    }, variants);
+    await info.attach("controlling-fill-contrast", { body: JSON.stringify(rows, null, 1), contentType: "application/json" });
+    console.log(JSON.stringify(rows));
+    for (const row of rows) {
+      const name = `${row.palette} ${row.accent} ${row.theme}`;
+      expect.soft(row.ink_fill, `${name} ink on fill`).toBeGreaterThanOrEqual(4.5);
+      expect.soft(row.fill_rail, `${name} fill on rail`).toBeGreaterThanOrEqual(3);
+      expect.soft(["#000000", "#111111", "#171717"], `${name} is not black`).not.toContain(row.fill);
+      // The fill comes from the accent: the mark itself in dark mono, deepened in light mono, --accent elsewhere; "none" keeps its deep grey.
+      const expected = row.palette !== "mono" ? "accent" : row.accent === "none" ? "other" : row.theme === "light" ? "mark deepened" : "mark";
+      expect.soft(row.source, `${name} source`).toBe(expected);
+    }
+  } finally { await close(); }
 });
 
 test("portrait phones and tablets keep the stacked viewer", async ({ browser }) => {

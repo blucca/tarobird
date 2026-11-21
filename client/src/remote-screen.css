@@ -105,10 +105,16 @@
    The picture keeps the full height; tools sit in a 56 px rail inside the
    right safe inset, and the heading and status line become one label over the
    picture. Portrait phones, tablets and desktop viewers are unaffected. */
-.screen-mobile.screen-landscape{display:grid;grid-template-columns:minmax(0,1fr) 56px;grid-template-rows:auto auto minmax(0,1fr) auto;--screen-active-bg:var(--primary-bg);--screen-active-ink:var(--on-primary)}
-:root[data-palette=mono] .screen-mobile.screen-landscape{--screen-active-bg:var(--mono-control-bg);--screen-active-ink:var(--mono-control-ink)}
+.screen-mobile.screen-landscape{display:grid;grid-template-columns:minmax(0,1fr) 56px;grid-template-rows:auto auto minmax(0,1fr) auto}
+/* Controlling fill: the theme's accent (the mono accent mark, else --accent)
+   with --on-primary ink. Light monochrome deepens the pale mark, as the App's
+   mono controls do, so white ink keeps 4.5:1 and the fill 3:1 on the white
+   rail; dark themes use the mark as is under dark ink. */
+.screen-mobile.screen-landscape{--screen-active-bg:var(--mono-mark,var(--accent));--screen-active-ink:var(--on-primary)}
+:root[data-palette=mono]:not([data-theme=dark]) .screen-mobile.screen-landscape{--screen-active-bg:color-mix(in srgb,var(--mono-mark,var(--accent)) 70%,#171717)}
+@media(prefers-color-scheme:dark){:root[data-palette=mono][data-theme=system] .screen-mobile.screen-landscape{--screen-active-bg:var(--mono-mark,var(--accent))}}
 /* Monochrome without an accent: a deep grey instead of the black action fill. */
-:root[data-palette=mono]:is([data-mono-accent=none],:not([data-mono-accent])) .screen-mobile.screen-landscape{--screen-active-bg:color-mix(in srgb,var(--mono-control-bg) 72%,var(--bg))}
+:root[data-palette=mono]:is([data-mono-accent=none],:not([data-mono-accent])) .screen-mobile.screen-landscape{--screen-active-bg:color-mix(in srgb,var(--primary-bg) 72%,var(--bg))}
 .screen-landscape .screen-chrome{display:contents}
 .screen-mobile.screen-landscape .screen-viewport{grid-column:1;grid-row:1/4;min-width:0}
 .screen-rail{grid-column:2;grid-row:1/-1;display:flex;flex-direction:column;align-items:center;min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:none;padding:6px 0 10px;box-sizing:border-box;border-left:1px solid var(--border);background:var(--bg)}
@@ -147,6 +153,16 @@ html[data-keyboard-open="true"] .screen-mobile.screen-landscape .screen-rail-gro
 .screen-mobile.screen-landscape .screen-mobile-keyboard .screen-text>button{min-width:60px}
 .screen-mobile.screen-landscape .screen-mobile-keyboard textarea{flex:1 1 auto;min-width:0;width:auto;height:44px;min-height:44px;box-sizing:border-box;margin:0;padding:0 8px;border:6px solid transparent;border-radius:12px;background:var(--bg) padding-box;box-shadow:inset 0 0 0 1px var(--border);font-size:16px;line-height:30px;white-space:pre;overflow:hidden;resize:none}
 .screen-mobile.screen-landscape .screen-mobile-keyboard small{display:none}
+/* With at least 700 pt beside the rail (panel content box ≥ 756) the eight
+   keys sit whole and still, the drawn field takes the rest (≥ 160; its box adds the 6 pt
+   transparent hit margins) and the
+   combinations stay in More; narrower rows keep scrolling. */
+@container (min-width:756px){
+ .screen-mobile.screen-landscape .screen-mobile-keys{flex:none;overflow:visible;padding-right:0;-webkit-mask-image:none;mask-image:none}
+ .screen-mobile.screen-landscape .screen-mobile-keys>button:nth-child(n+9){display:none}
+ .screen-mobile.screen-landscape .screen-mobile-keyboard .screen-text{flex:1 1 auto;min-width:0}
+ .screen-mobile.screen-landscape .screen-mobile-keyboard textarea{min-width:172px}
+}
 /* "More" becomes a full-height side sheet against the rail. */
 .screen-mobile.screen-landscape .screen-tools-popover{position:absolute;z-index:4;top:var(--app-safe-top);bottom:var(--app-safe-bottom);right:calc(var(--app-safe-right) + 56px);left:auto;width:min(340px,60%);max-height:none;padding:8px 12px;border:0;border-left:1px solid var(--border);border-radius:0;box-shadow:-8px 0 24px #0002;overflow-y:auto}
 .screen-mobile.screen-landscape .screen-shortcuts summary{min-height:44px;box-sizing:border-box;line-height:34px}
