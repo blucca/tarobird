@@ -33,9 +33,9 @@ renderer accepts up to 120.
 - An encoder that cannot take a rate at the encoded size gets the next lower
   standard rate (`screenRateLadder`: the ceiling, then 60, 30, 15). H.264 at a
   lower rate is preferred to VP8 at any rate.
-- A viewer returns one receipt per decoded frame and the target keeps at most
-  three frames unacknowledged, so a slower viewer or a longer round trip
-  receives fewer frames without any setting: about three per round trip.
+- A viewer returns one receipt per decoded frame and the target keeps a bounded
+  number of frames unacknowledged (the flight window, below), so a slower
+  viewer receives fewer frames without any setting.
 - A busy picture that reaches the byte budget is paced, and its quantizer
   rises, as before.
 
@@ -63,6 +63,19 @@ short burst of motion over a long round trip.
 the input budget: it is bounded by the stream itself. Unknown or repeated
 receipts are still charged, and the budget is unchanged.
 
+**Flight window.** The target kept at most three frames unacknowledged, which
+over a long path means three frames per round trip (30 a second at 100 ms). A
+viewer may now name how many frames it can hold (`flight` on `screenOpen`, 16
+for the desktop viewer and the phone apps) and say on each receipt how long it
+held the frame (`heldMs`: decode, draw and the wait for a repaint). The target
+subtracts that from the time since the frame left and keeps the shortest
+result of the session as the network round trip: the shortest, so a queue at
+the viewer or in the network is never read as distance. The window is then
+the whole frames that fit in that round trip plus two, never below three and
+never above the viewer's capacity. A round trip under two frame intervals
+still gives three, so nothing changes on a local network, and a viewer that
+decodes slowly is not given more frames to wait behind.
+
 **Byte budget by route.** A viewer whose media socket reaches the Hub straight
 from a local-network address (RFC 1918, link-local, unique-local) gets
 5000 B/ms (40 Mbit/s) for that session. Every other viewer keeps 500 B/ms: a
@@ -83,8 +96,14 @@ not draw on it.
   are exactly what they were.
 - An older target is never sent `mediaBytesPerMs`: it goes only to a target
   that offered the feature, and such a target keeps its 15.
-- Viewers are unchanged. Their three-packet bound still matches the target's
-  three-frame window.
+- The flight window needs all three ends: the Hub advertises
+  `desktop.screen.flight.v1` (a Host-only capability, never in a client hello),
+  a viewer names `flight` and sends `heldMs` only to such a Hub, and the Hub
+  passes both only to a target that offered `screen.flight.v1`. With any older
+  end the window is three and every message is what it was.
+- The phone native layers now hold 16 packets of one stream generation (was 3)
+  and report that number to the page (`screenWindow`). A page on a native
+  layer that cannot report it names no capacity.
 
 The target remembers 512 sent frames (was 64) and the Hub up to 480 (was 90),
 four seconds at 120.
@@ -110,10 +129,22 @@ The 120 runs delivered 60 because the display is 60 Hz. At 2880×1800 the
 default budget was the limit (the quantizer rose and three frames in a hundred
 were paced out); with the local-network budget it was not.
 
+Flight window, same harness with a delay added on each leg (1920×1080,
+full-window text scroll, the viewer's receipt carrying its held time):
+
+| Round trip | Three frames | Capacity 16 |
+|---|---|---|
+| 10 ms | — | 59.6 |
+| 100 ms | 26.1 | 59.6 |
+| 200 ms | 13.9 | 59.6 |
+
 A decoder configured with `avc1.640028` decoded a level 4.2 stream of
 1920×1080 at 60 without an error (Chromium on this Mac).
 
-Simulated, not measured (the real capture core on a virtual clock): motion in
+Simulated, not measured (the real capture core on a virtual clock): over a
+100 ms round trip a viewer that names 16 and reports its held time receives
+about 60 a second with at most eight frames in flight, where three give about
+30; motion in
 spurts with receipts 100 ms after each frame keeps the resting quantizer; a
 viewer that takes 40 ms a frame receives about 25 a second at the resting
 quantizer; one that takes 100 ms a frame is coarsened to the ceiling.
@@ -125,10 +156,9 @@ quantizer; one that takes 100 ms a frame is coarsened to the ceiling.
   longer for each: in an independent model, a decoder at 25 ms a frame went
   from 15 frames a second with 35 ms from send to receipt to 40 with 71 ms; one
   at 60 ms a frame from 15 with 70 ms to 17 with 176 ms.
-- Through a relay the rate is about three frames per round trip (send, decode,
-  repaint, receipt): 60 needs a round trip of 50 ms or less, 100 ms gives 30.
-  Widening the window needs the viewers changed too: the phone apps end a
-  session that has more than three undelivered packets.
+- With an older viewer, Hub or target the window stays three: through a relay
+  that is about three frames per round trip (60 needs 50 ms or less, 100 ms
+  gives 30).
 
 ## Not verified
 
@@ -143,3 +173,6 @@ quantizer; one that takes 100 ms a frame is coarsened to the ceiling.
 - The local-network budget over a real network: the route test stands in for a
   local-network address, and the address rule is tested on its own.
 - The phone bridge at 60: each frame costs several bridge calls there.
+- The flight window on a real relay path and on real phones. The phone native
+  layers were exercised by the host-run audits (Android sources on a JVM, iOS
+  sources compiled for macOS) against this checkout's Hub, not on devices.
