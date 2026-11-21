@@ -18,7 +18,8 @@ const call = vi.fn(async (_bot: string, method: string, _input: unknown): Promis
   if (method === "history.finalize") return { revision: "next_revision" };
   throw new Error(method);
 });
-const host = { available: () => "ready" as const, busy: () => false, call, changed };
+const log = vi.fn();
+const host = { available: () => "ready" as const, busy: () => false, call, changed, log };
 beforeEach(async () => {
   vi.clearAllMocks(); directory = await mkdtemp(path.join(os.tmpdir(), "tarobird-history-")); store = await HubStore.open(directory);
   await store.db.run("INSERT INTO bots(id,name,secret_hash,engine) VALUES('bot','Fixture','unused','codex')");
@@ -47,6 +48,22 @@ it("creates one persistent fork and never copies messages or changes the source 
   expect(await store.db.get("SELECT 1 FROM messages WHERE conversation_id=?", [destination.id])).toBeUndefined();
   expect(await store.conversationForBot("bot", conversationId)).toEqual(before);
   expect(changed).toHaveBeenCalledOnce();
+});
+it("writes one Host log line for each operation that ends or becomes uncertain", async () => {
+  const applied = await history.start("owner", conversationId, change("logged"));
+  expect(log).toHaveBeenLastCalledWith(`history fork whole applied operation=${applied.operationId} bot=bot`);
+  call.mockImplementationOnce(async () => { throw new Error("gateway_gone"); });
+  const lost = await history.start("owner", conversationId, change("lost"));
+  expect(lost.state).toBe("unknown");
+  expect(log).toHaveBeenLastCalledWith(`history fork whole unknown (uncertain) operation=${lost.operationId} bot=bot`);
+  const busy = await history.start("owner", conversationId, change("busy"));
+  expect(log).toHaveBeenLastCalledWith(`history fork whole rejected (busy) operation=${busy.operationId} bot=bot`);
+  const cancelled = await history.reconcile("owner", conversationId, change("never-sent"));
+  expect(log).toHaveBeenLastCalledWith(`history fork whole rejected (cancelled) operation=${cancelled.operationId} bot=bot`);
+  // Retrying a settled request and reading a status add nothing.
+  await history.start("owner", conversationId, change("logged")); await history.status("owner", "bot", conversationId, "logged");
+  expect(log).toHaveBeenCalledTimes(4);
+  expect(log.mock.calls.flat().join("\n")).not.toContain("Source");
 });
 it("reserves complete request identity, including after a definite rejection", async () => {
   const queued = await store.sendMessage("owner", { conversationId, clientMsgId: "queue", text: "wait", attachments: [] });

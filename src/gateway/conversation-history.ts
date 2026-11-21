@@ -9,6 +9,7 @@ import type { GatewayChannel } from "./channel.js";
 import { GatewayReceipts } from "./receipts.js";
 import { readValidatedConfigFile } from "../state/instance-config.js";
 import { captureAppToolVersion, inheritAppToolVersion } from "./app-tool-registration.js";
+import { appendTimelineEventBestEffort } from "../runtime/timeline-events.js";
 
 type Scope = { chatId: number; conversationKey: string; workspaceOverride?: string; isCurrentSession: () => Promise<boolean> };
 type HistoryBridge = CoreBridgeLike & {
@@ -125,6 +126,10 @@ export function gatewayConversationHistory(bridge: HistoryBridge, channel: Gatew
       catch { return unknown; }
     }, 0, authorize);
     const result = receipt.ok ? historyNativeResultSchema.parse(receipt.result) : unknown;
+    await appendTimelineEventBestEffort(stateDir, { type: "command.handled", channel: "gateway", conversationKey, chatId: scope.chatId,
+      outcome: result.outcome, detail: `history.${command.action.kind}`, metadata: { source: "gateway.history", operationId: command.operationId,
+        ...(command.action.kind === "fork" ? { scope: command.action.scope } : {}), ...(result.reason ? { reason: result.reason } : {}),
+        ...(receipt.ok ? {} : { receipt: receipt.error ?? "operation_failed" }) } }, "history timeline event");
     // Publication is replayable evidence. Persist it before returning, but do
     // not await the Hub response in the RPC frame chain.
     const publication = channel.transport.enqueue("history.result", { operationId: command.operationId, result });

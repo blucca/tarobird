@@ -129,6 +129,12 @@ local finalization of a confirmed result. It never invokes native apply. A
 missing receipt for an admitted operation remains unknown and fenced. GET status
 is always a pure read; a 404 alone does not prove that a delayed POST cannot arrive.
 
+Each operation that ends, or whose outcome becomes unknown, writes one line to
+the Host log with its kind, state, reason and opaque operation and Bot ids. The
+Gateway records each apply and its outcome in the Bot timeline. A Claude helper
+that fails writes its phase and code to the Bot log; App receipts carry only
+the reason.
+
 Codex persists dynamic App tool definitions in native forks. Before requesting a
 fork, Gateway durably captures the source's exact local tool-version registration.
 Finalization inherits that version before exposing the new binding, without

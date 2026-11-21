@@ -332,6 +332,7 @@ export class HubServer {
       busy: (botId, conversationId) => [...this.nativeTurns.values(), ...this.steersInFlight.values()].some(value => value.botId === botId && value.conversationId === conversationId),
       call: (botId, method, input) => this.callBot(botId, method, input),
       changed: async conversation => { for (const client of this.clients) if (client.session?.userId === conversation.ownerId) { client.conversationIds.add(conversation.id); this.publishClient(client, { v: 1, type: "conversation.updated", conversation }); } },
+      log: line => options.onWarning?.(line),
     });
     this.remoteScreen = new HubRemoteScreen(store, auth);
     this.screenSockets = new RemoteScreenSockets(this.remoteScreen);

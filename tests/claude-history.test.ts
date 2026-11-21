@@ -72,6 +72,22 @@ describe("what a Claude session's history can do now", () => {
     const none = scripted({ override: () => ({ kind: "not-started", detail: "no helper" }) });
     expect(await claudeHistoryState(none.base)).toEqual({ head: null, blocked: "not_ready" });
   });
+  it("writes why the helper failed to the Bot log, and nothing when it answered", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const h = scripted();
+      await claudeHistoryState(h.base);
+      expect(warn).not.toHaveBeenCalled();
+      await claudeHistoryState({ ...h.base, sessionId: "33333333-3333-4333-8333-333333333333" });
+      expect(warn).toHaveBeenLastCalledWith(expect.stringMatching(/Claude history helper inspect of session 33333333 refused at inspect: session_unreadable$/));
+      await claudeHistoryState(scripted({ override: () => ({ kind: "lost", detail: "no answer" }) }).base);
+      expect(warn).toHaveBeenLastCalledWith(expect.stringMatching(/inspect of session 11111111 gave no answer \(no answer\)$/));
+      const lostFork = scripted({ override: request => request.operation === "fork" ? { kind: "lost", detail: "killed" } : undefined });
+      expect(await claudeForkHistory(lostFork.base)).toMatchObject({ outcome: "unknown" });
+      expect(warn).toHaveBeenLastCalledWith(expect.stringMatching(/fork of session 11111111 gave no answer \(killed\)$/));
+      expect(warn).toHaveBeenCalledTimes(3);
+    } finally { warn.mockRestore(); }
+  });
 });
 
 describe("forking a Claude session", () => {

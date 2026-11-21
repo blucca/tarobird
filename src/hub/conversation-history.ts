@@ -11,9 +11,17 @@ type HistoryHost = {
   busy(botId: string, conversationId: string): boolean;
   call(botId: string, method: string, input: unknown): Promise<Json>;
   changed(conversation: Conversation): Promise<void>;
+  /** The Host log. Opaque ids only: no titles, message text or paths. */
+  log?(line: string): void;
 };
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const publicResult = (row: OperationRow) => historyOperationSchema.parse(JSON.parse(row.result_json));
+/** One Host log line for an operation that ended, or whose outcome is not known. */
+const logLine = (row: Pick<OperationRow, "id" | "bot_id" | "action_json">, state: string, reason?: string) => {
+  const action = historyActionSchema.safeParse(JSON.parse(row.action_json));
+  const kind = !action.success ? "operation" : action.data.kind === "fork" ? `fork ${action.data.scope}` : "rewind";
+  return `history ${kind} ${state}${reason ? ` (${reason})` : ""} operation=${row.id} bot=${row.bot_id}`;
+};
 
 /** Native mutations are sent once. Reconnect recovery only reads receipts and
  * completes already-confirmed local bindings and Hub projections. */
@@ -105,7 +113,7 @@ export class HubConversationHistory {
     const reservation = await this.store.db.transaction(async () => {
       await validate?.(); await this.authorizeInTransaction(userId, input.botId, conversationId);
       const old = await this.store.db.get<OperationRow>("SELECT * FROM history_operations WHERE owner_id=? AND request_id=?", [userId, input.requestId]);
-      if (old) { if (old.payload_hash !== hash) throw new HubError("history_request_conflict", 409); return { row: old, fresh: false }; }
+      if (old) { if (old.payload_hash !== hash) throw new HubError("history_request_conflict", 409); return { row: old, fresh: false, refused: undefined }; }
       let reason: HistoryOperation["reason"];
       if (this.host.available(input.botId) !== "ready") reason = this.host.available(input.botId) === "unsupported" ? "unsupported" : "not_ready";
       else if (await this.pending(conversationId)) reason = "busy";
@@ -118,8 +126,9 @@ export class HubConversationHistory {
       }
       const id = newId("history"), result: HistoryOperation = { requestId: input.requestId, operationId: id, sourceRevision: input.expectedRevision, state: reason ? "rejected" : "pending", ...(reason ? { reason } : {}) };
       await this.store.db.run("INSERT INTO history_operations(id,owner_id,request_id,payload_hash,bot_id,source_conversation_id,expected_revision,action_json,anchor_json,state,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", [id, userId, input.requestId, hash, input.botId, conversationId, input.expectedRevision, JSON.stringify(input.action), anchor ? JSON.stringify(anchor) : null, reason ? "rejected" : "dispatched", JSON.stringify(result), Date.now(), Date.now()]);
-      return { row: (await this.row(id))!, fresh: !reason };
+      return { row: (await this.row(id))!, fresh: !reason, refused: reason };
     });
+    if (reservation.refused) this.host.log?.(logLine(reservation.row, "rejected", reservation.refused));
     if (reservation.fresh) {
       try {
         const nativeResult = historyNativeResultSchema.parse(await this.host.call(input.botId, "history.apply", this.workerInput(reservation.row)));
@@ -144,14 +153,18 @@ export class HubConversationHistory {
    * tombstoned atomically, so even an original POST still in transit cannot run. */
   async reconcile(userId: string, conversationId: string, raw: unknown, validate?: TransactionGuard): Promise<HistoryOperation> {
     const input = historyChangeSchema.parse(raw), hash = fingerprint([userId, conversationId, input]);
+    let tombstoned = false;
     const row = await this.store.db.transaction(async () => {
       await validate?.(); await this.authorizeInTransaction(userId, input.botId, conversationId);
       const old = await this.store.db.get<OperationRow>("SELECT * FROM history_operations WHERE owner_id=? AND request_id=?", [userId, input.requestId]);
+      tombstoned = false;
       if (old) { if (old.payload_hash !== hash) throw new HubError("history_request_conflict", 409); return old; }
       const id = newId("history"), result: HistoryOperation = { requestId: input.requestId, operationId: id, sourceRevision: input.expectedRevision, state: "rejected", reason: "cancelled" };
       await this.store.db.run("INSERT INTO history_operations(id,owner_id,request_id,payload_hash,bot_id,source_conversation_id,expected_revision,action_json,state,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", [id, userId, input.requestId, hash, input.botId, conversationId, input.expectedRevision, JSON.stringify(input.action), "rejected", JSON.stringify(result), Date.now(), Date.now()]);
+      tombstoned = true;
       return (await this.row(id))!;
     });
+    if (tombstoned) this.host.log?.(logLine(row, "rejected", "cancelled"));
     if (!["applied", "rejected"].includes(row.state) && this.host.available(row.bot_id) === "ready") await this.reconcileRow(row, true);
     return this.status(userId, input.botId, conversationId, input.requestId, validate);
   }
@@ -167,10 +180,14 @@ export class HubConversationHistory {
     return input.operationId;
   }
   private async markUnknown(id: string): Promise<void> {
+    let changed: OperationRow | undefined;
     await this.store.db.transaction(async () => {
+      changed = undefined;
       const row = await this.row(id); if (!row || ["applied", "rejected"].includes(row.state)) return;
       await this.store.db.run("UPDATE history_operations SET state='unknown',result_json=?,updated_at=? WHERE id=?", [JSON.stringify({ ...publicResult(row), state: "unknown", reason: "uncertain" }), Date.now(), id]);
+      if (row.state !== "unknown") changed = row;
     });
+    if (changed) this.host.log?.(logLine(changed, "unknown", "uncertain"));
   }
   finish(id: string): Promise<void> {
     const existing = this.finishing.get(id); if (existing) return existing;
@@ -207,7 +224,9 @@ export class HubConversationHistory {
     }
     const finalized = z.object({ revision: idSchema }).strict().parse(await this.host.call(row.bot_id, "history.finalize", { ...this.workerInput(row), result, ...(row.destination_conversation_id ? { destinationConversationId: row.destination_conversation_id } : {}) }));
     const events: HubEvent[] = [];
+    let settled: string | undefined;
     const changed = await this.store.db.transaction(async () => {
+      settled = undefined;
       const current = (await this.row(id))!; if (["applied", "rejected"].includes(current.state)) return;
       if (result.outcome === "applied" && action.kind === "rewind" && current.anchor_json) {
         const anchor = historyAnchorEvidenceSchema.parse(JSON.parse(current.anchor_json));
@@ -217,8 +236,10 @@ export class HubConversationHistory {
       }
       const operation: HistoryOperation = { ...publicResult(current), state: result.outcome === "applied" ? "applied" : "rejected", ...(result.reason ? { reason: result.reason } : { reason: undefined }), resultingRevision: finalized.revision, ...(events.length ? { sourceEventSeq: events[events.length - 1]!.seq } : {}), ...(result.outcome === "applied" && current.destination_conversation_id ? { destinationConversationId: current.destination_conversation_id } : {}) };
       await this.store.db.run("UPDATE history_operations SET state=?,result_json=?,updated_at=? WHERE id=?", [operation.state, JSON.stringify(operation), Date.now(), id]);
+      settled = logLine(current, operation.state, operation.reason);
       if (current.destination_conversation_id && result.outcome === "applied") return this.store.conversationInTransaction(current.destination_conversation_id);
     });
+    if (settled) this.host.log?.(settled);
     this.store.emitCommitted(events); if (changed) await this.host.changed(changed);
   }
   async recoverBot(botId: string): Promise<void> {

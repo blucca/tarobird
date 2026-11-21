@@ -167,11 +167,26 @@ function conversationLength(messages: ClaudeHistoryMessage[]): number {
   return messages.filter(message => message.type !== "system").length;
 }
 
+/**
+ * The Bot log (Gateway stderr) is the only place a helper failure is seen:
+ * the App and its receipts get a reason, never the helper's code. Opaque
+ * values only; no message text or titles.
+ */
+function logHelper(operation: "inspect" | "fork", sessionId: string, outcome: ClaudeHistoryHelperOutcome): void {
+  let what: string;
+  if (outcome.kind === "not-started") what = `could not start (${outcome.detail})`;
+  else if (outcome.kind === "lost") what = `gave no answer (${outcome.detail})`;
+  else if (!outcome.reply.ok) what = `refused at ${outcome.reply.phase}: ${outcome.reply.error.code}`;
+  else return;
+  console.warn(`[${new Date().toISOString()}] Claude history helper ${operation} of session ${sessionId.slice(0, 8)} ${what}`);
+}
+
 type Blocked = NonNullable<NativeHistoryState["blocked"]>;
 type Inspected = { messages: ClaudeHistoryMessage[]; head: string } | { rejected: NativeHistoryRejection; detail: string } | { lost: string };
 
 async function inspect(helper: ClaudeHistoryHelper, env: NodeJS.ProcessEnv, sessionId: string, workspace: string, signal?: AbortSignal): Promise<Inspected> {
   const outcome = await helper({ v: 1, operation: "inspect", sessionId, workspace }, { env, ...(signal ? { signal } : {}) });
+  logHelper("inspect", sessionId, outcome);
   if (outcome.kind === "not-started") return { rejected: "not_ready", detail: outcome.detail };
   if (outcome.kind === "lost") return { lost: outcome.detail };
   const reply = outcome.reply;
@@ -250,6 +265,7 @@ export async function claudeForkHistory(input: {
   // Never repeated and never cancelled once started: a fork that was asked for may exist.
   const outcome = await helper({ v: 1, operation: "fork", sessionId, workspace, expectedHead: seen.head, ...(end ? { upToMessageId: end } : {}) },
     { env, ...(input.lifetime ? { signal: input.lifetime } : {}) });
+  logHelper("fork", sessionId, outcome);
   if (outcome.kind === "not-started") return rejected("not_ready", outcome.detail);
   if (outcome.kind === "lost") return { outcome: "unknown", detail: outcome.detail };
   const reply = outcome.reply;

@@ -33,6 +33,16 @@ it("reads a completed receipt without changing files or invoking native/finalize
   expect(bridge.applyConversationHistory).toHaveBeenCalledOnce(); expect(bridge.finalizeConversationHistory).not.toHaveBeenCalled();
   expect(publish).toHaveBeenCalledOnce();
 });
+it("records each history change and its outcome in the Bot timeline", async () => {
+  await run("history.apply", input);
+  bridge.applyConversationHistory.mockRejectedValueOnce(new Error("native_reply_lost"));
+  await run("history.apply", { ...input, operationId: "lost" });
+  const events = (await readFile(path.join(directory, "timeline.log.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  expect(events.map(event => [event.type, event.detail, event.outcome, event.metadata])).toEqual([
+    ["command.handled", "history.fork", "applied", { source: "gateway.history", operationId: "operation", scope: "whole" }],
+    ["command.handled", "history.fork", "unknown", { source: "gateway.history", operationId: "lost", scope: "whole", reason: "uncertain" }],
+  ]);
+});
 it("keeps thrown native outcomes unknown and never replays them after restart", async () => {
   bridge.applyConversationHistory.mockRejectedValueOnce(new Error("native_reply_lost"));
   expect(await run("history.apply", input)).toEqual({ outcome: "unknown", reason: "uncertain" });
