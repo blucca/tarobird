@@ -371,6 +371,74 @@ final class ScreenClock: @unchecked Sendable {
         FileHandle.standardError.write(report); FileHandle.standardError.write(Data("\n".utf8))
         for (name, value) in expected.sorted(by: { $0.key < $1.key }) { try check(observed[name] == value, "realHub_" + name) }
     }
+    static func frame(_ fixture: ScreenFixture, _ join: [String: Any], _ generation: Int, _ sequence: Int) throws {
+        _ = try fixture.request(["action": "frame", "id": sid(join), "generation": generation, "sequence": sequence, "size": 4096])
+    }
+    /** Binary deliveries (accepted through the plugin gate, not read) until `count`, or the terminal close. */
+    static func packets(_ manager: HubTransport, _ log: ScreenEvents, _ id: String, _ count: Int) async throws -> (packets: [[String: Any]], closed: String?) {
+        var found: [[String: Any]] = []
+        let until = ProcessInfo.processInfo.systemUptime + 5
+        while found.count < count, ProcessInfo.processInfo.systemUptime < until {
+            if let terminal = log.pop(id, "close") { return (found, terminal["reason"] as? String ?? "?") }
+            if let packet = log.pop(id, "binary"), manager.acceptScreenEvent(packet) { found.append(packet); continue }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        if let terminal = log.pop(id, "close") { return (found, terminal["reason"] as? String ?? "?") }
+        return (found, nil)
+    }
+    static func consume(_ manager: HubTransport, _ id: String, _ packet: [String: Any]) async throws {
+        let size = packet["byteLength"] as! Int; var total = 0
+        while total < size { total += Data(base64Encoded: try await call(manager, "screenRead", ["id": id, "deliverySequence": packet["deliverySequence"]!, "offset": total, "maxBytes": 262144])["data"] as! String)!.count }
+        _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": packet["deliverySequence"]!])
+    }
+    /** A stream restart: the next generation's config on media, acknowledged as the page does. */
+    static func restart(_ manager: HubTransport, _ log: ScreenEvents, _ fixture: ScreenFixture, _ join: [String: Any], _ id: String, _ generation: Int) async throws -> Int? {
+        _ = try fixture.request(["action": "stream", "id": sid(join), "generation": generation])
+        let config = try await event(manager, log, id, "screen")
+        _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": config["deliverySequence"]!])
+        return (config["value"] as? [String: Any])?["streamGeneration"] as? Int
+    }
+    /** A-5 (as Android's NativeScreenAudit.streamRestart). The target's three-frame credit window
+     * belongs to one stream generation: a restart (start control, keyframe, resume) retires it and
+     * the next generation may send three at once while the page still reads the old one's. */
+    static func streamRestart(_ fixture: ScreenFixture) async throws {
+        let log = ScreenEvents()
+        let manager = HubTransport { log.append($0) }; defer { manager.reset(destroy: true) }
+        manager.setScreenActive(true)
+        let document = try await call(manager, "document")["value"] as! String
+        var observed: [String: String] = [:]
+        let value = join(true), id = try await open(manager, log, fixture, document, value)
+        try frame(fixture, value, 1, 1); let old = try await packets(manager, log, id, 1)
+        observed["restartConfigDelivered"] = String(describing: try await restart(manager, log, fixture, value, id, 2))
+        for sequence in 1...3 { try frame(fixture, value, 2, sequence) }
+        let fresh = try await packets(manager, log, id, 3)
+        observed["restartWindowAdmittedBehindUnreadPacket"] = fresh.closed.map { "closed:" + $0 } ?? "admitted:\(fresh.packets.count)"
+        if fresh.closed == nil {
+            for packet in old.packets + fresh.packets { try await consume(manager, id, packet) }
+            try await Task.sleep(nanoseconds: 300_000_000)
+            observed["restartedSessionStaysOpen"] = log.count(id) == 0 ? "open" : "closed"
+            for sequence in 4...6 { try frame(fixture, value, 2, sequence) }
+            let window = try await packets(manager, log, id, 3)
+            observed["generationWindowRefills"] = window.closed.map { "closed:" + $0 } ?? "admitted:\(window.packets.count)"
+            try frame(fixture, value, 2, 7)
+            observed["generationWindowStillBounded"] = try await packets(manager, log, id, 1).closed.map { "closed:" + $0 } ?? "admitted"
+        }
+        try await peerClosed(fixture, value)
+        // Two restarts without reading: the total stays bounded at one current plus one superseded window.
+        let chain = join(true), chainID = try await open(manager, log, fixture, document, chain)
+        for sequence in 1...3 { try frame(fixture, chain, 1, sequence) }
+        var stage = try await packets(manager, log, chainID, 3)
+        if stage.closed == nil { _ = try await restart(manager, log, fixture, chain, chainID, 2); for sequence in 1...3 { try frame(fixture, chain, 2, sequence) }; stage = try await packets(manager, log, chainID, 3) }
+        if stage.closed == nil { _ = try await restart(manager, log, fixture, chain, chainID, 3); try frame(fixture, chain, 3, 1); stage = try await packets(manager, log, chainID, 1) }
+        observed["retainedPacketsStillBounded"] = stage.closed.map { "closed:" + $0 } ?? "admitted"
+        try await peerClosed(fixture, chain)
+        let expected = ["restartConfigDelivered": "Optional(2)", "restartWindowAdmittedBehindUnreadPacket": "admitted:3", "restartedSessionStaysOpen": "open",
+                        "generationWindowRefills": "admitted:3", "generationWindowStillBounded": "closed:screen_viewer_congested",
+                        "retainedPacketsStillBounded": "closed:screen_viewer_congested"]
+        let report = try JSONSerialization.data(withJSONObject: ["observed": observed, "expected": expected], options: [.prettyPrinted, .sortedKeys])
+        FileHandle.standardError.write(report); FileHandle.standardError.write(Data("\n".utf8))
+        for (name, value) in expected.sorted(by: { $0.key < $1.key }) { try check(observed[name] == value, "restart_" + name) }
+    }
     static func main() async throws {
         let args = CommandLine.arguments
         if ProcessInfo.processInfo.environment["SCREEN_AUDIT_FOCUS"] == "real-hub" {
@@ -385,12 +453,13 @@ final class ScreenClock: @unchecked Sendable {
             if focus == "close" { try await closeReasons(fixture) }
             else if focus == "clock" { try await attachClock(fixture) }
             else if focus == "order" { try await attachOrder(fixture) }
+            else if focus == "restart" { try await streamRestart(fixture) }
             else { throw HubNetworkError("unknown_screen_audit_focus") }
             let receipt: [String: Any] = ["surface": "Apple Foundation production source; real pinned TLS dual sockets; injected monotonic clock only", "checks": checks]
             let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys]); try bytes.write(to: URL(fileURLWithPath: args[3]))
             print(String(data: bytes, encoding: .utf8)!); return
         }
-        try await closeReasons(fixture); try await attachClock(fixture); try await attachOrder(fixture)
+        try await closeReasons(fixture); try await attachClock(fixture); try await attachOrder(fixture); try await streamRestart(fixture)
         let log = ScreenEvents()
         // Event capture does not acknowledge automatically; the same delivery
         // gate used by the plugin is exercised explicitly for every event.

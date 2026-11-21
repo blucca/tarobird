@@ -34,10 +34,15 @@ final class HubScreenSession: @unchecked Sendable {
     private var early: [(value: [String: Any], size: Int)] = [], earlyBytes = 0
     private var timer: DispatchSourceTimer?
     private var started: TimeInterval = 0, nextPing: TimeInterval = 0
+    /// The target's encoder credits: three frames per stream generation. A restart (start
+    /// control, keyframe, resume) retires them and the next generation may send three at once
+    /// while the page still reads the old one's, so superseded packets count only against the
+    /// total: one current window plus one superseded window. Same names and values as Android.
+    static let BINARY_WINDOW = 3, BINARY_RETAINED = 2 * BINARY_WINDOW
     private final class Delivery {
-        let bytes: Data?, size: Int, created: TimeInterval
+        let bytes: Data?, size: Int, created: TimeInterval, generation: Int
         var offset = 0, notified = false
-        init(_ bytes: Data?, _ size: Int, _ created: TimeInterval) { self.bytes = bytes; self.size = size; self.created = created }
+        init(_ bytes: Data?, _ size: Int, _ created: TimeInterval, _ generation: Int = 0) { self.bytes = bytes; self.size = size; self.created = created; self.generation = generation }
     }
 
     init(queue: DispatchQueue, activity: HubScreenActivity, token: UInt64, join: [String: Any],
@@ -229,9 +234,11 @@ final class HubScreenSession: @unchecked Sendable {
         guard u32(4) > lastFrame, lastFrame != 0 || bytes[1] == 1, u32(8) == Self.integer(stream["geometryRevision"]), u32(12) == Self.integer(stream["streamGeneration"]),
               codec == stream["codec"] as? String, u16(24) == Self.integer(stream["width"]), u16(26) == Self.integer(stream["height"]),
               u32(28) == bytes.count - 32, stamp.isFinite, stamp >= 0, stamp <= 9007199254740991, stamp.rounded(.towardZero) == stamp else { throw HubNetworkError("screen_packet_invalid") }
-        guard deliveries.values.filter({ $0.bytes != nil }).count < 3 else { throw HubNetworkError("screen_viewer_congested") }
+        // The packet's generation equals the current stream's (checked above).
+        let held = deliveries.values.filter { $0.bytes != nil }, generation = u32(12)
+        guard held.filter({ $0.generation == generation }).count < Self.BINARY_WINDOW, held.count < Self.BINARY_RETAINED else { throw HubNetworkError("screen_viewer_congested") }
         lastFrame = u32(4)
-        nextDelivery += 1; deliveries[nextDelivery] = Delivery(bytes, bytes.count, now())
+        nextDelivery += 1; deliveries[nextDelivery] = Delivery(bytes, bytes.count, now(), generation)
         emit(["kind": "binary", "deliverySequence": nextDelivery, "byteLength": bytes.count])
     }
     private func deliver(value: [String: Any], size: Int) throws {
