@@ -5564,5 +5564,7 @@
   "对方的回复刚好结束": "the reply had just finished",
   "对方引擎暂不接受引导": "the recipient's engine isn't accepting steering right now",
   "对方会话正忙于其他对话": "the recipient's session is busy with another chat",
-  "对方会话已切换": "the recipient's session changed"
+  "对方会话已切换": "the recipient's session changed",
+  "无法确认是否已并入；不会再次排队": "Can't confirm whether it was merged; it won't be queued again",
+  "正在确认是否已并入…": "Checking whether it was merged…"
 }

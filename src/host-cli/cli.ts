@@ -124,7 +124,8 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   messages send --to HOST/BOT[/CONVERSATION] --text-file FILE [--file FILE]... [--new-conversation NAME] [--request-id ID] [--context-message ID] [--source-bot LOCAL_BOT_ID] [--delivery queue|steer]
     --delivery 默认 queue（新任务，进入持久队列）。steer 只用于纠正方向、补充信息或回答对方刚问的问题：
     仅当接收方是 Codex/Claude Code、同一对话里正在进行的回复由你这次之前的消息发起、且接收方主人允许时，并入那次回复；
-    否则自动排队一次，回执 delivery.actual 写明 steered / fell_back_to_queue（含原因）/ steer_uncertain（未确认时不重发，用 wait 或同一 --request-id 核对）。
+    否则自动排队一次，回执 delivery.actual 写明 steered / fell_back_to_queue（含原因）/ pending（steer_in_flight、steer_unconfirmed：继续 wait，不要重发）/
+    steer_uncertain（终态：无法确认是否并入，绝不会再排队；先看 delivery.turn 那条消息的回复再决定是否重发）。
     steer 比排队最多多等约 13 秒；跨主机还要先探测一次对方主机，最坏约 30 秒。
   messages wait --to HOST_ID/BOT_ID/CONVERSATION_ID --message ID [--timeout SECONDS] [--out DIRECTORY] [--source-bot LOCAL_BOT_ID]
     默认等待 120 秒；timeout/pending 只结束本次查询，不会中断任务或自动恢复。用同一消息 ID 继续查询，勿重复发送。

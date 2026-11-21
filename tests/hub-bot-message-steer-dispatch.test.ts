@@ -78,4 +78,21 @@ describe("a fallen-back steer reaches the worker (B1)", () => {
     expect((await peer.request("queue.take", { conversationId: chat.conversationId })).result?.message?.id).toBe(receipt.messageId);
   }, 20_000);
 
+  it("a refusal learned later by reconciliation is delivered as soon as it is queued", async () => {
+    const peer = await worker([]);
+    const chat = await local("resolve", {});
+    const task = await local("send", { text: "Long task", attachments: [] }, chat.conversationId);
+    await peer.next("instance.message", f => f.message?.id === task.messageId);
+    const sending = local("send", { text: "Reconciled", attachments: [], delivery: "steer" }, chat.conversationId);
+    await answerStatus(peer, task.messageId);
+    await peer.request("ack", { messageId: task.messageId });
+    // The Hub's call is lost with the socket; a new worker process attaches.
+    peer.ws.terminate();
+    const receipt = await sending;
+    expect(receipt.delivery).toMatchObject({ actual: "pending", reason: "steer_unconfirmed" });
+    const replacement = await worker([]);
+    const reconcile = await replacement.next("instance.call", f => f.method === "botMessage.steer.reconcile");
+    replacement.send({ type: "instance.result", id: reconcile.id, result: { outcome: "rejected", reason: "stale" } });
+    await replacement.next("instance.message", f => f.message?.id === receipt.messageId, 3000);
+  }, 20_000);
 });

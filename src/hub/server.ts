@@ -1290,6 +1290,8 @@ export class HubServer {
           if (connection.history) this.trackTask(this.conversationHistory.recoverBot(botId).catch(() => this.options.onWarning?.("history_recovery_failed")));
           if (connection.agentBus) this.trackTask(this.replayAbandonedBusStops(connection).catch(() => this.options.onWarning?.("agent_bus_stop_replay_failed")));
           this.trackTask(this.groupDiscussions.settleBot(botId, true).catch(() => this.options.onWarning?.("group_discussion_settle_failed")));
+          // Issue #62: open Bot steers learn their journaled outcome now, not on the sender's next wait.
+          if (connection.botSteer) this.trackTask(this.botMessages.reconcileForBot(botId).catch(() => this.options.onWarning?.("bot_steer_reconcile_failed")));
           this.scheduleDispatch(botId); await this.broadcastBotStatus(botId); return;
         }
         if (!botId) throw new HubError("instance_unauthorized", 401);

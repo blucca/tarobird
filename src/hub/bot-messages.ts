@@ -23,6 +23,11 @@ const digest = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 const activeRunPhases = runSummarySchema.shape.phase.options.filter(isRunActive);
 const activeRunPhaseParams = activeRunPhases.map(() => "?").join(",");
 const memoKey = (kind: string, ...parts: string[]) => `bot-messages:${kind}:${hashSecret(JSON.stringify(parts))}`;
+/** Steer records with no final outcome yet (pending call or unconfirmed),
+ * per recipient Bot; reconciled when its worker attaches. Bot IDs are idSchema. */
+const OPEN_STEER = "bot-messages:steer-open:";
+const openSteerKey = (botId: string, messageId: string) => `${OPEN_STEER}${botId}:${messageId}`;
+type OpenSteer = { key: string; conversationId: string };
 type Guard = () => Promise<unknown>;
 type Grant = { sourceKey: string; sourceBot: string; targetBot: string; revoked: boolean };
 const grantSchema = z.object({ sourceHost: z.string().min(1).max(256), sourceBot: idSchema, targetBot: z.string().min(1).max(256), revoke: z.boolean().default(false) }).strict();
@@ -525,7 +530,10 @@ export class BotMessages {
   private deliveryOf(blocks: Block[], memo: IncomingMemo | undefined): BotMessageDeliveryReceipt {
     const control = blocks.find(block => block.type === "steering"), turn = memo?.steer?.turn ? { turn: { messageId: memo.steer.turn } } : {};
     if (!control) return memo?.steer?.reason ? { requested: "steer", actual: "fell_back_to_queue", reason: memo.steer.reason } : { requested: "steer", actual: "queued" };
-    if (control.outcome === "pending") return { requested: "steer", actual: "pending", ...turn };
+    // Not final: the call is in flight, or this Host got no answer yet (reconcilable).
+    if (control.outcome === "pending") return { requested: "steer", actual: "pending", reason: "steer_in_flight", ...turn };
+    if (control.outcome === "unknown" && control.reason !== "gateway_uncertain") return { requested: "steer", actual: "pending", reason: "steer_unconfirmed", ...turn };
+    // Final: steered, or the Gateway itself cannot tell (never queued, never called merged).
     return { requested: "steer", actual: control.outcome === "accepted" ? "steered" : "steer_uncertain", ...turn, ...(control.application?.status === "dropped" ? { dropped: control.application.reason } : {}) };
   }
   /** Caller holds the DB queue. Undefined unless `messageId` is this sender's steer record for `botId`. */
@@ -538,6 +546,8 @@ export class BotMessages {
     const memo = await this.memo<IncomingMemo>(memoKey("incoming", p.sourceKey, p.source.botId, origin.requestId));
     const delivery = this.deliveryOf(blocks, memo), turn = memo?.steer?.turn, empty = { text: "", files: [], truncated: false };
     if (delivery.actual === "pending") return { ...target, messageId, status: "pending", ...empty, delivery };
+    // Unknown whether it joined: report that, not the turn's reply. delivery.turn names the sender's own turn input.
+    if (delivery.actual === "steer_uncertain") return { ...target, messageId, status: "uncertain", ...empty, delivery };
     // The joined turn, re-checked: only a turn this same sender started is readable.
     const turnRow = turn ? await this.store.db.get<{ bot_source_json: string | null; status: string }>("SELECT m.bot_source_json,d.status FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND m.conversation_id=? AND d.bot_id=?", [turn, target.conversationId, botId]) : undefined;
     const turnOrigin = turnRow?.bot_source_json ? botSourceSchema.parse(JSON.parse(turnRow.bot_source_json)) : undefined;
@@ -652,7 +662,7 @@ export class BotMessages {
     if (c.delivery === "queue" || prior) return this.queueDelivery(c);
     const plan = await this.steerPlan(c);
     if ("reason" in plan) return this.queueDelivery(c, plan.reason);
-    let created: { message: Message; created: boolean };
+    let created: { message: Message; created: boolean }, opened = false;
     try {
       created = await this.store.beginBotSteer("owner", { conversationId: c.target.conversationId, botId: c.bot.id, clientMsgId: c.clientMsgId, text: c.input.text, botSource: c.p.source, targetId: plan.targetId }, async () => {
         await c.scope();
@@ -664,39 +674,43 @@ export class BotMessages {
         if (times.length >= STEER_EDGE_LIMIT) throw new SteerLimitReached("steer_rate_limited");
         await this.put(edgeKey, [...times, Date.now()]);
         await this.put(c.key, { content: c.content, at: Date.now(), steer: { turn: plan.turn, targetId: plan.targetId, epoch: plan.epoch } } satisfies IncomingMemo);
+        opened = true;
         await this.auditSendInTransaction(c, false, {});
       });
     } catch (error) { if (error instanceof SteerLimitReached) return this.queueDelivery(c, error.reason); throw error; }
     if (!created.created) return this.deliver(c);
+    if (opened) await this.store.db.transaction(() => this.put(openSteerKey(c.bot.id, created.message.id), { key: c.key, conversationId: c.target.conversationId } satisfies OpenSteer));
     // The Gateway journals this call at most once. Only its explicit refusal
-    // proves nothing reached the engine; anything else stays uncertain.
-    let result: SteerResult;
+    // proves nothing reached the engine; its own "unknown" is final; a lost
+    // call leaves the record unconfirmed for reconciliation.
+    let result: SteerResult, answered = true;
     this.steersInFlight.add(created.message.id);
     try {
       try { result = steerResultSchema.parse(await this.steering.steer(c.bot.id, { conversationId: c.target.conversationId, userId: "owner", requestId: c.clientMsgId, targetId: plan.targetId, sourceMessageId: plan.turn, text: c.input.text, source: c.p.source })); }
-      catch { result = { outcome: "unknown", reason: "uncertain" }; }
-      await this.settleSteer(c.p, c.bot.id, created.message.id, c.key, result, plan.turn);
+      catch { result = { outcome: "unknown", reason: "uncertain" }; answered = false; }
+      await this.settleSteer(c.p.source, c.bot.id, created.message.id, c.key, result, plan.turn, answered);
     } finally { this.steersInFlight.delete(created.message.id); }
     const message = await this.store.db.serial(() => this.store.queuedMessageInTransaction(created.message.id));
     const delivery = this.deliveryOf(message.blocks, await this.store.db.serial(() => this.memo<IncomingMemo>(c.key)));
     await c.validate();
     return this.receipt(c, message, false, delivery);
   }
-  /** Apply one Gateway answer (direct or reconciled). Every transition is
-   * idempotent: a definite refusal queues the record once; acceptance and
-   * uncertainty never create a delivery. */
-  private async settleSteer(p: BotPassport, botId: string, messageId: string, key: string, result: SteerResult, turn: string): Promise<void> {
-    let changed: boolean;
+  /** Apply one Gateway answer (direct or reconciled; `answered` is false when
+   * this Host got none). Every transition is idempotent: a definite refusal
+   * queues the record once; acceptance and uncertainty never create a delivery. */
+  private async settleSteer(source: BotSource, botId: string, messageId: string, key: string, result: SteerResult, turn: string, answered: boolean): Promise<void> {
+    const audit = (outcome: string, extra: Record<string, string> = {}) => this.store.audit("bot-message.steer", source.botId, { messageId, requestId: source.requestId, sourceHost: source.hostId, sourceBot: source.botId, outcome, turn, ...extra });
+    const close = () => this.store.db.transaction(() => this.store.db.run("DELETE FROM meta WHERE key=?", [openSteerKey(botId, messageId)]));
     if (result.outcome === "rejected" && result.reason === "control_forbidden") {
       // Unreachable: control text is refused before any record exists. Never
-      // queue it and never call it an engine limitation; keep it unconfirmed.
-      await this.store.settleBotSteer(messageId, botId, { outcome: "unknown", reason: "uncertain" });
-      await this.store.audit("bot-message.steer", p.source.botId, { messageId, requestId: p.source.requestId, sourceHost: p.source.hostId, sourceBot: p.source.botId, outcome: "steer_uncertain", reason: "control_forbidden_unreachable", turn });
+      // queue it and never call it an engine limitation.
+      await this.store.settleBotSteer(messageId, botId, { outcome: "unknown", reason: "gateway_uncertain" });
+      await audit("steer_uncertain", { reason: "control_forbidden_unreachable" }); await close();
       return;
     }
     if (result.outcome === "rejected") {
       const reason = botSteerRejectionReason(result.reason);
-      changed = (await this.store.fallBackBotSteer(messageId, botId, steerFallbackNotice(botId, reason), async () => {
+      const changed = (await this.store.fallBackBotSteer(messageId, botId, steerFallbackNotice(botId, reason), async () => {
         const memo = await this.memo<IncomingMemo>(key);
         await this.put(key, { ...memo!, steer: { ...memo!.steer, reason } } satisfies IncomingMemo);
       })).changed;
@@ -704,34 +718,51 @@ export class BotMessages {
         // The delivery was inserted into an existing record: no message.created
         // event will wake the dispatch loop, so ask for it explicitly.
         this.steering.dispatch(botId);
-        await this.store.audit("bot-message.steer", p.source.botId, { messageId, requestId: p.source.requestId, sourceHost: p.source.hostId, sourceBot: p.source.botId, outcome: "fell_back_to_queue", reason, turn });
+        await audit("fell_back_to_queue", { reason });
       }
+      await close();
       return;
     }
-    const before = (await this.store.db.serial(() => this.store.queuedMessageInTransaction(messageId))).blocks.find(block => block.type === "steering")?.outcome;
-    const after = (await this.store.settleBotSteer(messageId, botId, result.outcome === "accepted" ? { outcome: "accepted" } : { outcome: "unknown", reason: "uncertain" })).blocks.find(block => block.type === "steering")?.outcome;
-    if (after !== before) await this.store.audit("bot-message.steer", p.source.botId, { messageId, requestId: p.source.requestId, sourceHost: p.source.hostId, sourceBot: p.source.botId, outcome: after === "accepted" ? "steered" : "steer_uncertain", turn });
+    const outcome = (blocks: Block[]) => { const control = blocks.find(block => block.type === "steering"); return control ? `${control.outcome}:${control.reason ?? ""}` : "none"; };
+    const before = outcome((await this.store.db.serial(() => this.store.queuedMessageInTransaction(messageId))).blocks);
+    const settled = await this.store.settleBotSteer(messageId, botId, result.outcome === "accepted" ? { outcome: "accepted" } : { outcome: "unknown", reason: answered ? "gateway_uncertain" : "uncertain" });
+    const after = outcome(settled.blocks), delivery = this.deliveryOf(settled.blocks, undefined);
+    if (after !== before) await audit(delivery.actual === "pending" ? "steer_unconfirmed" : delivery.actual);
+    if (delivery.actual !== "pending") await close();
   }
-  /** Learn the recorded outcome of a pending/uncertain steer from the Gateway
-   * (never steering again). Skipped while this process still awaits the
-   * original call, or while no capable worker is attached. */
-  private async reconcileSteer(p: BotPassport, botId: string, target: BotMessageTarget, messageId: string): Promise<void> {
+  /** Learn the recorded outcome of an open steer from the Gateway (never
+   * steering again). Skipped while this process still awaits the original
+   * call, or while no capable worker is attached: the record stays open. */
+  private async reconcileRecord(botId: string, messageId: string, sender?: { hostId: string; botId: string }): Promise<void> {
     if (this.steersInFlight.has(messageId) || this.steering.capable(botId) !== true) return;
     const found = await this.store.db.serial(async () => {
-      const row = await this.store.db.get<{ bot_source_json: string | null; blocks_json: string; client_msg_id: string | null }>("SELECT bot_source_json,blocks_json,client_msg_id FROM messages WHERE id=? AND conversation_id=? AND author_type='user'", [messageId, target.conversationId]);
+      const open = await this.memo<OpenSteer>(openSteerKey(botId, messageId));
+      const row = await this.store.db.get<{ bot_source_json: string | null; blocks_json: string; client_msg_id: string | null; conversation_id: string }>("SELECT bot_source_json,blocks_json,client_msg_id,conversation_id FROM messages WHERE id=? AND author_type='user'", [messageId]);
       const origin = row?.bot_source_json ? botSourceSchema.parse(JSON.parse(row.bot_source_json)) : undefined;
-      if (!row?.client_msg_id || !origin || origin.hostId !== p.source.hostId || origin.botId !== p.source.botId) return undefined;
+      if (!open || !row?.client_msg_id || !origin || open.conversationId !== row.conversation_id || sender && (origin.hostId !== sender.hostId || origin.botId !== sender.botId)) return undefined;
       const control = (JSON.parse(row.blocks_json) as Block[]).find(block => block.type === "steering");
-      if (control?.botId !== botId || control.outcome !== "pending" && control.outcome !== "unknown") return undefined;
-      const key = memoKey("incoming", p.sourceKey, p.source.botId, origin.requestId), steer = (await this.memo<IncomingMemo>(key))?.steer;
-      return steer?.turn && steer.targetId && steer.epoch ? { key, requestId: row.client_msg_id, turn: steer.turn, targetId: steer.targetId, epoch: steer.epoch } : undefined;
+      if (control?.botId !== botId || !(control.outcome === "pending" || control.outcome === "unknown" && control.reason !== "gateway_uncertain")) return { stale: true as const };
+      const steer = (await this.memo<IncomingMemo>(open.key))?.steer;
+      return steer?.turn && steer.targetId && steer.epoch ? { origin, key: open.key, conversationId: row.conversation_id, requestId: row.client_msg_id, turn: steer.turn, targetId: steer.targetId, epoch: steer.epoch } : undefined;
     });
     if (!found) return;
+    if ("stale" in found) { await this.store.db.transaction(() => this.store.db.run("DELETE FROM meta WHERE key=?", [openSteerKey(botId, messageId)])); return; }
     let result: SteerResult;
-    try { result = steerResultSchema.parse(await this.steering.reconcile(botId, { conversationId: target.conversationId, requestId: found.requestId, targetId: found.targetId, sourceMessageId: found.turn, receiptEpoch: found.epoch })); }
+    try { result = steerResultSchema.parse(await this.steering.reconcile(botId, { conversationId: found.conversationId, requestId: found.requestId, targetId: found.targetId, sourceMessageId: found.turn, receiptEpoch: found.epoch })); }
     catch { return; }
     if (this.steersInFlight.has(messageId)) return;
-    await this.settleSteer(p, botId, messageId, found.key, result, found.turn);
+    await this.settleSteer(found.origin, botId, messageId, found.key, result, found.turn, true);
+  }
+  /** wait / replay: only the sender's own record. */
+  private reconcileSteer(p: BotPassport, botId: string, _target: BotMessageTarget, messageId: string): Promise<void> {
+    return this.reconcileRecord(botId, messageId, { hostId: p.source.hostId, botId: p.source.botId });
+  }
+  /** A capable worker attached: reconcile this Bot's open steers, so a recorded
+   * refusal is queued without the sender having to ask. Bounded per attach. */
+  async reconcileForBot(botId: string): Promise<void> {
+    const prefix = `${OPEN_STEER}${idSchema.parse(botId)}:`;
+    const rows = await this.store.db.serial(() => this.store.db.all<{ key: string }>("SELECT key FROM meta WHERE key>=? AND key<? ORDER BY key LIMIT 100", [prefix, `${prefix}\uffff`]));
+    for (const { key } of rows) await this.reconcileRecord(botId, key.slice(prefix.length));
   }
   /** Signed probe of a remote receiving Host. Only an explicit refusal of the
    * unknown route (an older Host) means queue; other failures stop the send. */

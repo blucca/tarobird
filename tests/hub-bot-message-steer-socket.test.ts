@@ -72,17 +72,17 @@ describe("Hub ↔ Gateway Bot steer wiring (#62)", () => {
     await peer.next("instance.call", f => f.method === "botMessage.steer");
     peer.ws.terminate();
     const receipt = await sending;
-    expect(receipt).toMatchObject({ status: "uncertain", delivery: { actual: "steer_uncertain" } });
+    expect(receipt).toMatchObject({ status: "pending", delivery: { actual: "pending", reason: "steer_unconfirmed" } });
     expect(await hub.store.db.all("SELECT * FROM deliveries WHERE message_id=?", [receipt.messageId])).toEqual([]);
     // A replacement Gateway process reads its journal: this steer never started.
+    // It reconciles on attach, without anyone waiting.
     const replacement = await worker([BOT_MESSAGE_STEER_CAPABILITY]);
-    const waiting = local("wait", { messageId: receipt.messageId }, chat.conversationId);
     const reconcile = await replacement.next("instance.call", f => f.method === "botMessage.steer.reconcile");
     expect(reconcile.params).toEqual({ conversationId: chat.conversationId, requestId: expect.stringMatching(/^bm_/), targetId: "run_live", sourceMessageId: task.messageId, receiptEpoch: "rs_fixture_store" });
     replacement.send({ type: "instance.result", id: reconcile.id, result: { outcome: "rejected", reason: "stale" } });
-    expect(await waiting).toMatchObject({ status: "pending", delivery: { actual: "fell_back_to_queue", reason: "turn_ended" } });
-    // Queued once and handed to the replacement worker straight away (review B1).
     await replacement.next("instance.message", f => f.message?.id === receipt.messageId, 3000);
+    expect(await local("wait", { messageId: receipt.messageId }, chat.conversationId)).toMatchObject({ status: "pending", delivery: { actual: "fell_back_to_queue", reason: "turn_ended" } });
+    // Queued once and handed to the replacement worker straight away (review B1).
     expect(await hub.store.db.all("SELECT status,dispatched FROM deliveries WHERE message_id=?", [receipt.messageId])).toEqual([{ status: "pending", dispatched: 1 }]);
   });
 });

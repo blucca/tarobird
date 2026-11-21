@@ -26,5 +26,8 @@ export function steerFallbackReason(block: Block): { reason?: string } | undefin
 export function botSteerLabel(block: Extract<Block, { type: "steering" }>): string {
   if (block.application?.status === "dropped") return t("已并入，但对方未处理这段补充");
   if (block.application?.status === "applied" || block.application?.status === "absorbed") return t("已并入正在进行的回复，已进入模型上下文");
-  return block.outcome === "accepted" ? t("已并入正在进行的回复") : block.outcome === "pending" ? t("正在并入正在进行的回复…") : t("未确认是否已并入；不会再次排队");
+  if (block.outcome === "accepted") return t("已并入正在进行的回复");
+  if (block.outcome === "pending") return t("正在并入正在进行的回复…");
+  // Only the Gateway's own "cannot tell" is final; otherwise the Host is still checking.
+  return block.reason === "gateway_uncertain" ? t("无法确认是否已并入；不会再次排队") : t("正在确认是否已并入…");
 }

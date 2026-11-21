@@ -249,19 +249,40 @@ describe("fallback to the queue", () => {
     expect(fake.steer).toHaveBeenCalledTimes(1);
   });
 
-  it("never re-queues an uncertain steer and still ends the wait with a definite state", async () => {
+  it("M1: a lost Hub call is unconfirmed, not terminal; only the Gateway's own \"cannot tell\" is uncertain, and neither is a merged reply", async () => {
     const chat = await resolve(), run = await liveTurn(chat.conversationId);
     fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
     const receipt = await send(chat.conversationId, "Maybe", { delivery: "steer" });
-    expect(receipt).toMatchObject({ status: "uncertain", delivery: { requested: "steer", actual: "steer_uncertain", turn: { messageId: run.sourceMessageId } } });
+    // Same words in the send receipt and in wait for the same state.
+    expect(receipt).toMatchObject({ status: "pending", delivery: { requested: "steer", actual: "pending", reason: "steer_unconfirmed", turn: { messageId: run.sourceMessageId } } });
     expect(await deliveries(receipt.messageId)).toEqual([]);
-    const again = await send(chat.conversationId, "Maybe", { delivery: "steer" }, receipt.requestId);
-    expect(again).toMatchObject({ duplicate: true, delivery: { actual: "steer_uncertain" } });
-    expect(fake.steer).toHaveBeenCalledTimes(1);
-    expect((await wait(chat.conversationId, receipt.messageId)).status).toBe("pending");
-    await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: run.sourceMessageId, blocks: [{ type: "text", text: "Finished" }] });
+    // Reconciliation cannot run (no worker): still not terminal, with the reason.
+    fake.capable.mockReturnValue(undefined);
+    await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: run.sourceMessageId, blocks: [{ type: "text", text: "Finished without it" }] });
     await b.store.acknowledgeDelivery("target", run.sourceMessageId);
-    expect(await wait(chat.conversationId, receipt.messageId)).toMatchObject({ status: "completed", text: "Finished", delivery: { actual: "steer_uncertain" }, reply: { kind: "merged_turn" } });
+    const waiting = await wait(chat.conversationId, receipt.messageId);
+    expect(waiting).toMatchObject({ status: "pending", text: "", delivery: { actual: "pending", reason: "steer_unconfirmed" } });
+    expect(waiting).not.toHaveProperty("reply");
+    expect(JSON.stringify(waiting)).not.toContain("Finished without it");
+    expect(fake.reconcile).not.toHaveBeenCalled();
+    // The Gateway answers that it cannot tell: now terminal, still never merged_turn or completed.
+    fake.capable.mockReturnValue(true);
+    const ended = await wait(chat.conversationId, receipt.messageId);
+    expect(ended).toMatchObject({ status: "uncertain", text: "", files: [], delivery: { actual: "steer_uncertain", turn: { messageId: run.sourceMessageId } } });
+    expect(ended).not.toHaveProperty("reply");
+    const again = await send(chat.conversationId, "Maybe", { delivery: "steer" }, receipt.requestId);
+    expect(again).toMatchObject({ duplicate: true, status: "uncertain", delivery: { actual: "steer_uncertain" } });
+    expect(fake.steer).toHaveBeenCalledTimes(1); expect(fake.reconcile).toHaveBeenCalledTimes(1);
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+  });
+
+  it("M1: the Gateway's own unknown answer to the steer is terminal at once", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    fake.steer.mockResolvedValueOnce({ outcome: "unknown", reason: "uncertain", sourceMessageId: run.sourceMessageId });
+    const receipt = await send(chat.conversationId, "No ack", { delivery: "steer" });
+    expect(receipt).toMatchObject({ status: "uncertain", delivery: { actual: "steer_uncertain", turn: { messageId: run.sourceMessageId } } });
+    expect(await wait(chat.conversationId, receipt.messageId)).toMatchObject({ status: "uncertain", delivery: { actual: "steer_uncertain" } });
+    expect(fake.reconcile).not.toHaveBeenCalled();
   });
 
   it("reports a pending steer to a concurrent duplicate and recovers an interrupted Hub as uncertain", async () => {
@@ -272,11 +293,11 @@ describe("fallback to the queue", () => {
     const first = send(chat.conversationId, "Slow", { delivery: "steer" }, requestId);
     await vi.waitFor(() => expect(fake.steer).toHaveBeenCalledTimes(1));
     const duplicate = await send(chat.conversationId, "Slow", { delivery: "steer" }, requestId);
-    expect(duplicate).toMatchObject({ duplicate: true, status: "pending", delivery: { actual: "pending" } });
+    expect(duplicate).toMatchObject({ duplicate: true, status: "pending", delivery: { actual: "pending", reason: "steer_in_flight" } });
     expect((await wait(chat.conversationId, duplicate.messageId)).status).toBe("pending");
-    // A Hub restart marks the unresolved call uncertain; nothing is queued.
+    // A Hub restart leaves the unresolved call unconfirmed (reconcilable); nothing is queued.
     await b.store.recoverSteering();
-    expect(await wait(chat.conversationId, duplicate.messageId)).toMatchObject({ delivery: { actual: "steer_uncertain", turn: { messageId: run.sourceMessageId } } });
+    expect(await wait(chat.conversationId, duplicate.messageId)).toMatchObject({ status: "pending", delivery: { actual: "pending", reason: "steer_unconfirmed", turn: { messageId: run.sourceMessageId } } });
     release({ outcome: "accepted", sourceMessageId: run.sourceMessageId });
     await first;
     expect(await deliveries(duplicate.messageId)).toEqual([]);
@@ -337,7 +358,7 @@ describe("reconciling an unknown outcome (R1)", () => {
     const chat = await resolve(); await liveTurn(chat.conversationId);
     fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
     const receipt = await send(chat.conversationId, "Slow refusal", { delivery: "steer" });
-    expect(receipt.delivery.actual).toBe("steer_uncertain");
+    expect(receipt.delivery).toMatchObject({ actual: "pending", reason: "steer_unconfirmed" });
     fake.reconcile.mockResolvedValue({ outcome: "rejected", reason: "stale" });
     const after = await wait(chat.conversationId, receipt.messageId);
     expect(after).toMatchObject({ status: "pending", delivery: { actual: "fell_back_to_queue", reason: "turn_ended" } });
@@ -365,16 +386,19 @@ describe("reconciling an unknown outcome (R1)", () => {
     expect(fake.steer).toHaveBeenCalledTimes(1);
   });
 
-  it("stays uncertain while the Gateway cannot tell, is offline, or this Host still awaits the call", async () => {
+  it("stays unconfirmed while reconciliation cannot run, and terminal only when the Gateway cannot tell", async () => {
     const chat = await resolve(); await liveTurn(chat.conversationId);
     fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
     const receipt = await send(chat.conversationId, "Unknowable", { delivery: "steer" });
-    expect((await wait(chat.conversationId, receipt.messageId)).delivery.actual).toBe("steer_uncertain");
     fake.capable.mockReturnValue(undefined);
-    expect((await wait(chat.conversationId, receipt.messageId)).delivery.actual).toBe("steer_uncertain");
-    expect(fake.reconcile).toHaveBeenCalledTimes(1);
+    expect((await wait(chat.conversationId, receipt.messageId)).delivery).toMatchObject({ actual: "pending", reason: "steer_unconfirmed" });
+    fake.capable.mockReturnValue(false);
+    expect((await wait(chat.conversationId, receipt.messageId)).delivery).toMatchObject({ actual: "pending", reason: "steer_unconfirmed" });
+    expect(fake.reconcile).not.toHaveBeenCalled();
     fake.capable.mockReturnValue(true); fake.reconcile.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    expect((await wait(chat.conversationId, receipt.messageId)).delivery).toMatchObject({ actual: "pending", reason: "steer_unconfirmed" });
     expect((await wait(chat.conversationId, receipt.messageId)).delivery.actual).toBe("steer_uncertain");
+    expect(fake.reconcile).toHaveBeenCalledTimes(2);
     expect(await deliveries(receipt.messageId)).toEqual([]);
     let release!: (value: unknown) => void;
     fake.steer.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
@@ -382,10 +406,23 @@ describe("reconciling an unknown outcome (R1)", () => {
     await vi.waitFor(() => expect(fake.steer).toHaveBeenCalledTimes(2));
     const record = await b.store.db.get<{ id: string }>("SELECT id FROM messages WHERE blocks_json LIKE '%In flight%'");
     const calls = fake.reconcile.mock.calls.length;
-    expect((await wait(chat.conversationId, record!.id)).status).toBe("pending");
+    expect(await wait(chat.conversationId, record!.id)).toMatchObject({ status: "pending", delivery: { actual: "pending", reason: "steer_in_flight" } });
     expect(fake.reconcile.mock.calls.length).toBe(calls);
     release({ outcome: "accepted", sourceMessageId: runs.get(chat.conversationId)!.sourceMessageId });
     expect((await sending).status).toBe("steered");
+  });
+
+  it("reconciles every open steer of a Bot when its worker attaches, without the sender asking", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    const receipt = await send(chat.conversationId, "Lost", { delivery: "steer" });
+    fake.reconcile.mockResolvedValueOnce({ outcome: "rejected", reason: "stale" });
+    await b.botMessages.reconcileForBot("target");
+    expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
+    expect(fake.dispatch).toHaveBeenCalledWith("target");
+    // Settled records are not reconciled again.
+    await b.botMessages.reconcileForBot("target");
+    expect(fake.reconcile).toHaveBeenCalledTimes(1);
   });
 });
 

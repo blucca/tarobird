@@ -633,16 +633,19 @@ export class HubStore {
     return { message: result.message, created: result.created };
   }
   /** Record an accepted or uncertain Bot steer. Idempotent: a record that
-   * already fell back to the queue or has a definite outcome is unchanged,
-   * and uncertainty never overwrites anything but a pending call. */
-  async settleBotSteer(messageId: string, botId: string, result: { outcome: "accepted" } | { outcome: "unknown"; reason?: string }): Promise<Message> {
+   * already fell back to the queue or was accepted is unchanged. Unknown has
+   * two reasons: `uncertain` (this Host got no answer; reconcilable) only
+   * replaces a pending call, and `gateway_uncertain` (the Gateway itself
+   * cannot tell; terminal) replaces pending or `uncertain`, never the reverse. */
+  async settleBotSteer(messageId: string, botId: string, result: { outcome: "accepted" } | { outcome: "unknown"; reason: "uncertain" | "gateway_uncertain" }): Promise<Message> {
     const update = await this.db.transaction(async () => {
       const row = await this.db.get<MessageRow>("SELECT * FROM messages WHERE id=?", [messageId]);
       if (!row) throw new HubError("message_not_found", 404);
       const old = this.decodeMessage(row), control = old.blocks.find(block => block.type === "steering");
-      if (!old.botSource || control?.botId !== botId || control.outcome === "accepted" || control.outcome === "rejected" || result.outcome === "unknown" && control.outcome !== "pending") return { message: old };
+      if (!old.botSource || control?.botId !== botId || control.outcome === "accepted" || control.outcome === "rejected"
+        || result.outcome === "unknown" && control.outcome === "unknown" && (control.reason === "gateway_uncertain" || result.reason === "uncertain")) return { message: old };
       const message: Message = { ...old, version: old.version + 1, blocks: old.blocks.map(block => block.type !== "steering" ? block
-        : { ...(({ reason: _reason, ...rest }) => rest)(block), ...steerResultSchema.parse(result) }) };
+        : { ...(({ reason: _reason, ...rest }) => rest)(block), outcome: result.outcome, ...(result.outcome === "unknown" ? { reason: result.reason } : {}) }) };
       await this.saveMessage(message);
       return { message, event: await this.append(message.conversationId, "message.updated", message) };
     });
