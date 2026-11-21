@@ -292,7 +292,7 @@ flowchart TB
 | :--- | :--- | :--- |
 | **Local network (LAN)** | Phone and computer on the same Wi-Fi or reachable local network | No extra network service; devices must be able to reach each other |
 | **Remote access with Tailscale** | Away from home, with Tailscale on both devices | Both devices in the same Tailscale network; no VPS of your own required |
-| **VPS relay** | Away from home, with no VPN on the phone | A cloud server; we recommend letting an AI deploy it |
+| **VPS relay** | Away from home, with no VPN on the phone | A cloud server (several computers can share one); we recommend letting an AI deploy it |
 
 > [!TIP]
 > **Let your own agent set up the VPS relay.** Give Codex, Claude Code or another agent the [ready-to-use setup instructions](docs/client/remote-access.en.md#ask-an-agent-to-configure-it), and ask it to follow the project documentation to deploy and verify the relay. The agent needs terminal access on your host computer and authorized SSH access to your VPS.
@@ -313,6 +313,8 @@ Keep Tailscale connected on both devices, and make sure your Tailscale access ru
 2. On the computer, open **Settings → Network & connections → Connection status & routes**. Under **VPS relays for this host**, click **Add VPS relay**, enter the address and click **Verify and save relays**.
 3. If an already paired phone does not receive the new route automatically, open **Me → Connection status & routes → Edit routes → Add VPS relay address**, enter the same address and tap **Save routes**. A new phone can scan the computer's QR code with **VPS relay** selected.
 4. Turn off the phone's Wi-Fi and confirm that it connects over cellular data.
+
+**Several computers on one VPS:** all computers share one relay process and one tunnel port, and each computer takes only one more port for its phones. When you set up the next computer, tell the agent that the VPS already runs a relay and ask it to add the new computer; the existing computers keep their addresses and configuration. [Steps](docs/client/vps-relay-manual.md#8-add-another-computer-to-an-existing-relay)
 
 ### Add more computers
 

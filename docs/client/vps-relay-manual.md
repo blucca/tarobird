@@ -255,7 +255,7 @@ mode 0640. Replace the public IP and fingerprint (omit OpenSSL's `sha256 Fingerp
 computers. Every computer's tunnel connects to the same `tunnelPort` and the relay
 tells them apart by their tunnel client certificate; each computer still has its
 own public port for its devices. Add `additionalHosts` to the configuration above,
-one entry per further computer:
+one entry per further computer (the whole procedure is in step 8):
 
 ```json
   "additionalHosts": [
@@ -471,3 +471,41 @@ does not prove a physical phone completed authentication. The VPS must remain
 online, and the original computer must stay awake with its Hub and Bots running.
 Keep all deployment files and secrets outside Git. The public address does not
 grant access, but do not approve unfamiliar devices.
+
+## 8. Add another computer to an existing relay
+
+One relay process serves several computers (`additionalHosts` in step 4). Do not
+install a second relay or choose a second tunnel port: the new computer joins the
+tunnel port already in use and takes one public port of its own. The first
+computer's configuration, ports and routes stay as they are.
+
+1. **New computer:** run steps 1 and 2 there for its own tunnel CA and client
+   certificate. Skip the tunnel **server** certificate; the relay already has one.
+   The new CA key and client key never leave that computer.
+2. **New computer → VPS:** copy only the new `tunnel-ca.pem` (a certificate) and
+   note the client certificate's SHA-256 fingerprint.
+3. **VPS:** back up `relay.json` and the CA file. Append the new CA certificate to
+   the file `tls.ca` names, and add an `additionalHosts` entry with an unused public
+   port and that fingerprint. Open that public port in the firewall and in the
+   cloud provider's inbound rules.
+4. **VPS → new computer:** copy the CA certificate that issued the relay's tunnel
+   server certificate (the first computer's `tunnel-ca.pem`, already on the VPS).
+   It is the `tls.ca` of the new computer's `relays` entry, with the same
+   `servername` as the first computer uses.
+5. **New computer:** issue and renew its own public HTTPS certificate for the same
+   IP or domain (steps 3 and 6). Give its CSR, certificate and renewal job their
+   own file and unit names so that nothing of the first computer is overwritten.
+   Then merge step 5, with the shared tunnel port in `relays` and its own public
+   address in `origins`.
+6. **VPS:** restart the relay when the other computers are idle. Their tunnels
+   drop and reconnect on their own.
+
+Verify: `/health` on the relay's loopback health port lists every computer under
+`hosts` as connected; each public port answers `/health` with the public key of
+its own computer, and the keys differ; the first computer's phone route still
+works. Then run the step 7 checks through the new public port.
+
+Computers on one relay do not receive each other's connections: the relay hands a
+connection only to the computer whose certificate belongs to that public port, and
+a phone's TLS ends at its own Hub. What they share is the VPS's bandwidth and this
+one relay process.

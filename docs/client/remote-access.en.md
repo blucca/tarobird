@@ -22,11 +22,12 @@ assistant cannot deploy the service. Replace the placeholders and give it this:
 
 ```text
 Configure TaroBot remote phone access through my VPS to my existing computer.
-Repository: https://github.com/cloveric/tarobot
+Repository: https://github.com/cloveric/tarobird
 Bot host OS and app/source path: <fill in>
 Existing Hub state directory: <path, or inspect the running host to find it>
 VPS SSH alias and local private-key path: <paths only; never paste key contents>
 VPS OS/public IPv4 and existing services: <fill in, or inventory services first>
+This project's relay already on the VPS: <yes / no; inspect if unsure>
 Public entry: <existing domain, or IPv4 with a trusted IP certificate>
 
 Read AGENTS.md, docs/entrypoint-map.md, docs/client/remote-access.en.md,
@@ -35,8 +36,11 @@ The VPS is only a relay. Preserve the existing Hub identity, Bots, history and
 device enrollment. Do not create a replacement Hub or migrate the Bots.
 
 Inventory and back up the existing configuration. Verify SSH host identity.
-Use unused public HTTPS and mutual-TLS tunnel ports. On a shared VPS, preserve
-existing services and do not run the dedicated-VPS firewall installer.
+If the VPS already runs this project's relay, add this computer to it (manual
+step 8): reuse its tunnel port, add one public port, install no second relay and
+leave the existing computers' configuration, ports and routes unchanged.
+Otherwise use unused public HTTPS and mutual-TLS tunnel ports. On a shared VPS,
+preserve existing services and do not run the dedicated-VPS firewall installer.
 Keep the Hub identity/TLS private keys, API credentials and chat data on the
 original computer. Only the explicit relay server credentials belong on the VPS.
 Configure a trusted public certificate, renewal, safe delivery and loading on
@@ -44,6 +48,8 @@ the host, service startup and recovery. Certificate issuance alone is not renewa
 Verify public TLS, certificate-bound Hub identity, signed device authentication,
 history sync, unauthorized access rejection and relay restart recovery without
 sending test jobs to real Bots. A successful /health response is not completion.
+With several computers on one relay, confirm that each public port answers as its
+own host and that the other computers stay connected.
 Provide the actual phone HTTPS address and settings steps, required online
 machines, verified results and remaining physical-device checks.
 Keep secrets and real infrastructure configuration out of GitHub. Ask only for
@@ -55,6 +61,12 @@ manages its firewall. It is not a safe default for a VPS already running a websi
 or other service. The [manual guide](vps-relay-manual.md) covers a separate service
 without that dedicated-server firewall policy.
 
+**Several computers on one VPS.** One relay process serves several computers. They
+all connect to the same tunnel port and the relay tells them apart by their tunnel
+certificates; each computer still has its own public port for its phones. Use the
+same prompt for the next computer and state that the VPS already runs a relay; see
+[Add another computer to an existing relay](vps-relay-manual.md#8-add-another-computer-to-an-existing-relay).
+
 ## Set it up manually
 
 Follow [the command-by-command guide](vps-relay-manual.md): locate the existing
@@ -62,7 +74,8 @@ Hub, verify SSH, create separate tunnel and public TLS credentials, install the
 VPS relay, append the host listener/tunnel configuration, arrange renewal and
 verify the phone connection. Commands are labelled by the machine that runs them.
 The examples target macOS/Linux hosts and a Debian/Ubuntu VPS. Windows requires
-its native service/task setup instead of the Unix service commands.
+its native service/task setup instead of the Unix service commands. To add a
+computer to a relay that already exists, follow step 8 instead of reinstalling.
 
 ## Configure an already-paired phone
 
@@ -86,8 +99,9 @@ the trusted Hub identity from the original host's **Settings → Devices & secur
 address to the deployed public endpoint in the pairing form before connecting;
 never trust a new Hub key merely because an unverified `/health` returned it.
 
-Multiple hosts can share a cloud server, but each needs its own relay endpoint
-and tunnel. An endpoint forwarding to your Mac cannot also identify your Windows host.
+Multiple hosts can share a cloud server, one relay process and one tunnel port,
+but each still needs its own relay endpoint (its own public port). An endpoint
+forwarding to your Mac cannot also identify your Windows host.
 
 ## Common failures and security
 
@@ -100,7 +114,8 @@ and tunnel. An endpoint forwarding to your Mac cannot also identify your Windows
 - Computer off: a relay cannot run its Bots or serve an offline history/file copy.
 
 In the examples, 8443 is the phone HTTPS port, 7443 is the host's tunnel port and
-22 is SSH. The public address is not a password: unfamiliar devices still need
+22 is SSH. Several computers on one relay share the tunnel port and each has its
+own phone port. The public address is not a password: unfamiliar devices still need
 approval and device signatures. Do not approve unknown requests. Public services
 remain exposed to traffic attacks and software vulnerabilities despite limits.
 Separate process health, authenticated Internet access and physical-phone

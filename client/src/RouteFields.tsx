@@ -13,7 +13,7 @@ export function routeTitle(route: Route, routes: readonly Route[], deployment?: 
 export function RelaySetupNote() {
   return <aside className="relay-setup-note">
     <strong>{t("多台主机共用云服务器")}</strong>
-    <p>{t("可以共用一台腾讯云等云服务器，但每台主机都需要独立的中转入口（不同端口或域名）和通向自己的隧道。")}</p>
+    <p>{t("可以共用一台云服务器和同一个隧道端口，但每台主机仍需自己的中转入口（各用一个端口）。")}</p>
     <p>{t("请先完成部署，再填写当前主机的入口地址。这里只保存线路，不会自动部署中转。")}</p>
   </aside>;
 }

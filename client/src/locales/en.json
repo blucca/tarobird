@@ -3019,7 +3019,7 @@
   "备用中转 {0}": "Backup relay {0}",
   "中转线路（可选）": "Relay routes (optional)",
   "多台主机共用云服务器": "Sharing a cloud server across hosts",
-  "可以共用一台腾讯云等云服务器，但每台主机都需要独立的中转入口（不同端口或域名）和通向自己的隧道。": "Hosts can share one cloud server, such as Tencent Cloud, but each host needs its own relay endpoint (a different port or domain) and a tunnel leading to that host.",
+  "可以共用一台云服务器和同一个隧道端口，但每台主机仍需自己的中转入口（各用一个端口）。": "Hosts can share one cloud server and one tunnel port, but each host still needs its own relay endpoint (its own port).",
   "请先完成部署，再填写当前主机的入口地址。这里只保存线路，不会自动部署中转。": "Set up the relay first, then enter the endpoint for this host. Saving an address here does not deploy a relay.",
   "上移中转 {0}": "Move relay {0} up",
   "下移中转 {0}": "Move relay {0} down",
