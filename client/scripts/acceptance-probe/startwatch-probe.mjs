@@ -24,7 +24,8 @@ seen = await w.stop();
 results.direct = { proven: w.proven, detail: w.detail, exit: direct.code, starts: hit(seen) };
 // 3. Started by a child process with an argument, as an uninstaller's ExecWait would.
 w = await ctx.watchStarts(['tarocub-client.exe']);
-const nested = await sys.run('cmd.exe', ['/c', `"${fake}" /?`]);
+// (Run 44845710472: node's quoting of a `cmd /c` argument made cmd exit 1 before starting it.)
+const nested = await sys.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `$p = Start-Process -FilePath '${fake}' -ArgumentList '/?' -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode`]);
 seen = await w.stop();
 results.nested = { proven: w.proven, detail: w.detail, exit: nested.code, starts: hit(seen) };
 for (const [name, value] of Object.entries(results)) console.log(`${name}: ${JSON.stringify(value)}`);
