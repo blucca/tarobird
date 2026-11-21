@@ -608,6 +608,40 @@ describe("R13: every steer outcome leaves an audit entry", () => {
   });
 });
 
+describe("R15: scope decided by the lead", () => {
+  it("queues for a dispatcher (or worker) recipient", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    for (const role of ["dispatcher", "worker"]) {
+      await resetRate();
+      await b.store.db.run("UPDATE bots SET role=? WHERE id='target'", [role]);
+      expect(await send(chat.conversationId, `Fix ${role}`, { delivery: "steer" })).toMatchObject({ delivery: { actual: "fell_back_to_queue", reason: "unsupported_conversation" } });
+    }
+    expect(fake.status).not.toHaveBeenCalled();
+  });
+
+  it("does not count a Host-written notice that merely carries the sender's Bot source as the sender's turn", async () => {
+    const chat = await resolve();
+    const notice = await b.store.sendMessage("owner", { conversationId: chat.conversationId, clientMsgId: "dispatch_notice_fixture", text: "Ticket update", attachments: [], mentions: ["target"],
+      botSource: { hostId: (await source.ownSource()).hostId, hostName: "Mac", botId: "source", botName: "Source", requestId: "notice_request", hops: 1 } });
+    await b.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [notice.message.id]);
+    runs.set(chat.conversationId, { targetId: "run_notice", sourceMessageId: notice.message.id });
+    expect(await send(chat.conversationId, "Fix", { delivery: "steer" })).toMatchObject({ delivery: { actual: "fell_back_to_queue", reason: "turn_not_from_sender" } });
+    expect(fake.steer).not.toHaveBeenCalled();
+  });
+
+  it("never lets a Bot steer itself", async () => {
+    await b.botMessages.grant({ sourceHost: "Windows", sourceBot: "target", targetBot: "target" }, guard);
+    const self = (request: Omit<BotLocalRequest, "host" | "bot">) => b.botMessages.local({ ...request, host: "Windows", bot: "target" }, "target", guard, true) as Promise<any>;
+    const chat = await self({ operation: "resolve", requestId: randomUUID(), data: {} });
+    const task = await self({ operation: "send", conversation: chat.conversationId, requestId: randomUUID(), data: { text: "My own task", attachments: [] } });
+    await b.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [task.messageId]);
+    runs.set(chat.conversationId, { targetId: "run_self", sourceMessageId: task.messageId });
+    expect(await self({ operation: "send", conversation: chat.conversationId, requestId: randomUUID(), data: { text: "Note to self", attachments: [], delivery: "steer" } }))
+      .toMatchObject({ delivery: { actual: "fell_back_to_queue", reason: "self_target" } });
+    expect(fake.status).not.toHaveBeenCalled();
+  });
+});
+
 describe("M3: blank steer text", () => {
   it("gets the queue path's own answer before any record or Gateway call", async () => {
     const chat = await resolve(); await liveTurn(chat.conversationId);

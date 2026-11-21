@@ -552,9 +552,8 @@ export class BotMessages {
     // Unknown whether it joined: report that, not the turn's reply. delivery.turn names the sender's own turn input.
     if (delivery.actual === "steer_uncertain") return { ...target, messageId, status: "uncertain", ...empty, delivery };
     // The joined turn, re-checked: only a turn this same sender started is readable.
-    const turnRow = turn ? await this.store.db.get<{ bot_source_json: string | null; status: string }>("SELECT m.bot_source_json,d.status FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND m.conversation_id=? AND d.bot_id=?", [turn, target.conversationId, botId]) : undefined;
-    const turnOrigin = turnRow?.bot_source_json ? botSourceSchema.parse(JSON.parse(turnRow.bot_source_json)) : undefined;
-    if (!turn || !turnRow || turnOrigin?.hostId !== p.source.hostId || turnOrigin.botId !== p.source.botId) return { ...target, messageId, status: "uncertain", ...empty, delivery };
+    const turnRow = turn ? await this.store.db.get<{ bot_source_json: string | null; client_msg_id: string | null; status: string }>("SELECT m.bot_source_json,m.client_msg_id,d.status FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND m.conversation_id=? AND d.bot_id=?", [turn, target.conversationId, botId]) : undefined;
+    if (!turn || !turnRow || !await this.sendersOwnInput(p, turnRow)) return { ...target, messageId, status: "uncertain", ...empty, delivery };
     const state = await this.replyStateInTransaction(botId, target.conversationId, turn, turnRow.status);
     // Merged text the engine dropped will not be acted on: no need to wait for the turn.
     return { ...target, messageId, ...state, ...(delivery.dropped ? { status: "failed" } : {}), delivery, reply: { kind: "merged_turn" as const, turnMessageId: turn } };
@@ -608,15 +607,28 @@ export class BotMessages {
   private async priorSteerRequest(key: string): Promise<boolean> {
     return !!(await this.store.db.serial(() => this.memo<IncomingMemo>(key)))?.steer;
   }
+  /** Caller holds the DB queue. True only for a Bot message this sender's
+   * Host delivered through the Bot-message route (its signed request memo and
+   * derived client ID), not a Host-written notice that merely carries a Bot source. */
+  private async sendersOwnInput(p: BotPassport, row: { bot_source_json: string | null; client_msg_id: string | null }): Promise<boolean> {
+    const origin = row.bot_source_json ? botSourceSchema.parse(JSON.parse(row.bot_source_json)) : undefined;
+    if (!origin || origin.hostId !== p.source.hostId || origin.botId !== p.source.botId) return false;
+    const key = memoKey("incoming", p.sourceKey, origin.botId, origin.requestId);
+    return row.client_msg_id === `bm_${hashSecret(key)}` && !!await this.memo(key);
+  }
   /** Caller holds the DB queue. The Hub-side conditions of a steer: checked
    * when planning and again in the transaction that creates the record, so
    * an owner switch turned off (or an engine/chat change) during the Gateway
    * status call still queues the message. */
   private async hubSteerConditionsInTransaction(c: DeliveryContext): Promise<BotSteerFallbackReason | undefined> {
     const conversationId = c.target.conversationId;
+    // A Bot never steers itself (a self-target grant still queues).
+    if (c.p.sourceKey === this.auth.publicKey && c.p.source.botId === c.bot.id) return "self_target";
     if (await this.memo(steeringDisabledKey(c.bot.id))) return "steering_disabled";
-    const bot = await this.store.db.get<{ engine: string }>("SELECT engine FROM bots WHERE id=?", [c.bot.id]);
+    const bot = await this.store.db.get<{ engine: string; role: string | null }>("SELECT engine,role FROM bots WHERE id=?", [c.bot.id]);
     if (!bot || !supportsBotMessageSteerEngine(bot.engine)) return "unsupported_engine";
+    // First version: a dispatcher's chats (and its internal workers) only queue.
+    if (bot.role === "dispatcher" || bot.role === "worker") return "unsupported_conversation";
     const conversation = await this.store.db.get<{ type: string; parent_id: string | null; ticket_json: string | null }>("SELECT type,parent_id,ticket_json FROM conversations WHERE id=?", [conversationId]);
     const members = await this.store.db.get<{ count: number }>("SELECT COUNT(*) AS count FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [conversationId]);
     if (conversation?.type !== "direct" || conversation.parent_id || conversation.ticket_json || members?.count !== 1) return "unsupported_conversation";
@@ -640,9 +652,8 @@ export class BotMessages {
     const { targetId, sourceMessageId: turn, receiptEpoch: epoch } = status;
     const turnReason = await this.store.db.serial(async (): Promise<BotSteerFallbackReason | undefined> => {
       await c.guard();
-      const row = await this.store.db.get<{ bot_source_json: string | null; status: string; dispatched: number }>("SELECT m.bot_source_json,d.status,d.dispatched FROM messages m JOIN deliveries d ON d.message_id=m.id AND d.bot_id=? WHERE m.id=? AND m.conversation_id=?", [c.bot.id, turn, conversationId]);
-      const origin = row?.bot_source_json ? botSourceSchema.parse(JSON.parse(row.bot_source_json)) : undefined;
-      if (!row || origin?.hostId !== c.p.source.hostId || origin.botId !== c.p.source.botId) return "turn_not_from_sender";
+      const row = await this.store.db.get<{ bot_source_json: string | null; client_msg_id: string | null; status: string; dispatched: number }>("SELECT m.bot_source_json,m.client_msg_id,d.status,d.dispatched FROM messages m JOIN deliveries d ON d.message_id=m.id AND d.bot_id=? WHERE m.id=? AND m.conversation_id=?", [c.bot.id, turn, conversationId]);
+      if (!row || !await this.sendersOwnInput(c.p, row)) return "turn_not_from_sender";
       if (row.status !== "pending" || !row.dispatched) return "turn_ended";
       // An open approval or question owns this turn's next input; a Bot cannot answer it.
       for (const reply of await this.store.db.all<{ blocks_json: string }>("SELECT blocks_json FROM messages WHERE conversation_id=? AND reply_to=? AND author_type='bot' AND author_id=? AND status!='deleted' AND instr(blocks_json,'\"actionId\"')>0", [conversationId, turn, c.bot.id])) {

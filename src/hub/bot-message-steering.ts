@@ -50,7 +50,7 @@ const REASON_TEXT: Record<BotSteerFallbackReason, string> = {
   background_review: "对方正在后台复核", turn_not_from_sender: "进行中的回复不是由发送方发起", pending_card: "对方在等待审批或回答",
   turn_steer_limit: "这次回复已达引导次数上限", steer_rate_limited: "引导过于频繁", turn_ended: "对方的回复刚好结束",
   engine_not_ready: "对方引擎暂不接受引导", session_busy: "对方会话正忙于其他对话", session_changed: "对方会话已切换",
-  blank_text: "空白内容不能引导",
+  blank_text: "空白内容不能引导", self_target: "Bot 不能引导自己",
 };
 /** Host notice on a Bot message that asked to steer but was queued. Cards
  * carrying `extra.promptQueue` stay out of the engine prompt (blocksText). */

@@ -24,7 +24,7 @@ export const botMessageSendSchema = z.object({ text: textSchema, attachments: z.
 export const BOT_STEER_FALLBACK_REASONS = [
   "steering_disabled", "unsupported_engine", "unsupported_conversation", "attachments_unsupported", "bot_offline", "worker_update_required",
   "receiver_update_required", "status_unavailable", "no_active_turn", "background_review", "turn_not_from_sender", "pending_card",
-  "turn_steer_limit", "steer_rate_limited", "turn_ended", "engine_not_ready", "session_busy", "session_changed", "blank_text",
+  "turn_steer_limit", "steer_rate_limited", "turn_ended", "engine_not_ready", "session_busy", "session_changed", "blank_text", "self_target",
 ] as const;
 export type BotSteerFallbackReason = typeof BOT_STEER_FALLBACK_REASONS[number];
 /** Map a Gateway pre-admission rejection to the sender-visible reason. */
