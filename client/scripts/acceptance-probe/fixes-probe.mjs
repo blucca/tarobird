@@ -24,7 +24,10 @@ const fx = name => W.join(T, `${name}.exe`);
 const whoami = `${process.env.SystemRoot}\\System32\\whoami.exe`;
 const reg = async key => { try { return JSON.parse((await sys.powershell(registryScript(key))).stdout.trim()); } catch { return { state: 'error' }; } };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const wait = child => new Promise(resolve => { child.once('exit', code => resolve(code)); child.once('error', () => resolve(-1)); });
+// The exit promise is attached at spawn time: a child that exits before anyone
+// awaits it must still settle (the first probe run lost steps 2-4 to that).
+const start = (file, args, opts) => { const child = spawn(file, args, opts); child.done = new Promise(resolve => { child.once('exit', code => resolve(code)); child.once('error', () => resolve(-1)); }); return child; };
+const wait = child => child.done;
 
 // 1
 const lnkDir = W.join(T, CUSTOM_PARENT, 'LinkProbe');
@@ -41,13 +44,13 @@ out('1-shortcut', { fixtureExit: made.code, linkExists: existsSync(link), expect
 // 2
 {
   const releaseFile = W.join(x.tmp, 'f-release.flag'), releasedFile = `${releaseFile}.done`;
-  const drv = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, '..', 'windows-uninstall-ui-driver.ps1'), '-Mode', 'keep', '-TimeoutSec', '90', '-ReleaseFile', releaseFile, '-ReleasedFile', releasedFile], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  const drv = start('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, '..', 'windows-uninstall-ui-driver.ps1'), '-Mode', 'keep', '-TimeoutSec', '90', '-ReleaseFile', releaseFile, '-ReleasedFile', releasedFile], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   let stdout = ''; drv.stdout.on('data', chunk => { stdout += chunk; });
-  const done = wait(drv);
-  const setup = spawn(fx('dialog-fixture'), [], { stdio: 'ignore' });
+  const done = drv.done;
+  const setup = start(fx('dialog-fixture'), [], { stdio: 'ignore' });
   let finished = false; done.then(() => { finished = true; });
   for (let i = 0; i < 240 && !finished; i++) { if (existsSync(releaseFile) && !existsSync(releasedFile)) await (await import('node:fs/promises')).writeFile(releasedFile, 'done'); await sleep(500); }
-  await wait(setup).catch(() => {});
+  await Promise.race([wait(setup), sleep(30_000)]);
   let problem = ''; try { problem = (JSON.parse(stdout.trim().split(/\r?\n/).pop()).events ?? []).find(e => e.kind === 'problem')?.detail ?? ''; } catch (error) { problem = `unparsed: ${stdout.slice(-300)}`; }
   out('2-final-driver-utf8', { hasU00B7: problem.includes('·'), hasUFFFD: problem.includes('�'), hasU2014: problem.includes('—'), tail: problem.slice(-160) });
 }
@@ -57,8 +60,8 @@ out('1-shortcut', { fixtureExit: made.code, linkExists: existsSync(link), expect
   await copyFile(whoami, W.join(T, 'tarobot-installer-helper.exe'));
   const exits = await watchExits(x, ['tarobot-installer-helper.exe']);
   const outFile = W.join(x.tmp, 'd.json');
-  const drv = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, '..', 'windows-dialog-text-driver.ps1'), '-TimeoutSec', '90', '-OutFile', outFile], { stdio: 'ignore', windowsHide: true });
-  const setup = spawn(fx('dialog-fixture'), ['/HELPER'], { stdio: 'ignore' });
+  const drv = start('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, '..', 'windows-dialog-text-driver.ps1'), '-TimeoutSec', '90', '-OutFile', outFile], { stdio: 'ignore', windowsHide: true });
+  const setup = start(fx('dialog-fixture'), ['/HELPER'], { stdio: 'ignore' });
   await wait(drv); await wait(setup);
   const seen = await exits.stop();
   let ev = []; try { ev = JSON.parse((await readFile(outFile, 'utf8')).replace(/^﻿/, '')).events ?? []; } catch { /* none */ }
@@ -72,8 +75,8 @@ for (const [label, language] of [['no-stored-language', undefined], ['stored-lan
   if (language) await sys.run('reg.exe', ['add', 'HKCU\\Software\\TaroBirdAcceptanceB3Lang', '/v', 'Installer Language', '/t', 'REG_SZ', '/d', language, '/f']);
   await x.runLine(`"${fx('b3-old')}" /S`, { timeout: 60_000 });
   const outFile = W.join(x.tmp, `b3-${label}.json`);
-  const drv = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, '..', 'windows-install-ui-driver.ps1'), '-TimeoutSec', '150', '-SetupPath', fx('b3-new'), '-OutFile', outFile], { stdio: 'ignore', windowsHide: true });
-  const setup = spawn(fx('b3-new'), [], { stdio: 'ignore' });
+  const drv = start('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, '..', 'windows-install-ui-driver.ps1'), '-TimeoutSec', '150', '-SetupPath', fx('b3-new'), '-OutFile', outFile], { stdio: 'ignore', windowsHide: true });
+  const setup = start(fx('b3-new'), [], { stdio: 'ignore' });
   const exit = await Promise.race([wait(setup), sleep(170_000).then(() => 'timeout')]);
   if (exit === 'timeout') spawn('taskkill.exe', ['/PID', String(setup.pid), '/T', '/F'], { stdio: 'ignore' });
   await Promise.race([wait(drv), sleep(30_000)]);
