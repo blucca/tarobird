@@ -86,3 +86,19 @@ for (const [label, language] of [['no-stored-language', undefined], ['stored-lan
     events: (ui.events ?? []).map(e => `${e.kind}${e.detail ? `=${String(e.detail).slice(0, 140)}` : ''}`) });
   await sys.run('reg.exe', ['delete', 'HKCU\\Software\\TaroBirdAcceptanceB3Result', '/f']);
 }
+
+// 5: what Win32_ProcessStartTrace / StopTrace report as ProcessName for the two
+// long image names (a whoami.exe copy under each name). Decides whether a
+// WHERE ProcessName = '<full name>' watcher can ever match them.
+{
+  const names = ['tarocub-client.exe', 'tarobot-installer-helper.exe'];
+  for (const name of names) await copyFile(whoami, W.join(T, 'trace-names', name)).catch(async () => { await mkdir(W.join(T, 'trace-names'), { recursive: true }); await copyFile(whoami, W.join(T, 'trace-names', name)); });
+  const log = W.join(x.tmp, 'trace-names.log'), ready = `${log}.ready`;
+  const script = `$ErrorActionPreference = 'Stop'; Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStartTrace" -SourceIdentifier tbs | Out-Null; Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStopTrace" -SourceIdentifier tbe | Out-Null; Set-Content -LiteralPath '${ready.replaceAll("'", "''")}' -Value r; $end = (Get-Date).AddSeconds(25); while ((Get-Date) -lt $end) { foreach ($id in 'tbs', 'tbe') { $e = Wait-Event -SourceIdentifier $id -Timeout 1; if ($e) { $n = $e.SourceEventArgs.NewEvent; if ([string]$n.ProcessName -like 'taro*') { Add-Content -LiteralPath '${log.replaceAll("'", "''")}' -Value "$id $($n.ProcessName) len=$(([string]$n.ProcessName).Length)" }; Remove-Event -EventIdentifier $e.EventIdentifier } } }`;
+  const watcher = start('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: 'ignore', windowsHide: true });
+  for (let i = 0; i < 60 && !existsSync(ready); i++) await sleep(250);
+  for (const name of names) await wait(start(W.join(T, 'trace-names', name), ['/user'], { stdio: 'ignore', windowsHide: true }));
+  await Promise.race([wait(watcher), sleep(40_000)]);
+  let seen = ''; try { seen = (await readFile(log, 'utf8')).trim(); } catch { seen = '(nothing logged)'; }
+  out('5-trace-process-names', { ready: existsSync(ready), seen: seen.split(/\r?\n/) });
+}
