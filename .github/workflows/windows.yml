@@ -29,7 +29,7 @@ jobs:
           "runner=$env:RUNNER_ENVIRONMENT os=$env:ImageOS image=$env:ImageVersion ref=$env:REF"
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 10
+          fetch-depth: 20
       - uses: actions/setup-node@v4
         with:
           node-version: 24
