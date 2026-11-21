@@ -3,7 +3,8 @@ import { invoke } from "./desktop-bridge.js";
 
 /** One viewing session's message channel, with `MessagePort` semantics: ordered,
  * no replay after `close`. Inbound: frame `ArrayBuffer`s and JSON events
- * (`stream`, `state`, `frame-ready`, `attached`, `native-visibility`, `closed`).
+ * (`stream`, `state`, `frame-ready`, `attached`, `native-visibility`, `closed`,
+ * `control-refused`).
  * Outbound: viewer commands stamped with the session id and generation,
  * `received` and `input-focus`. */
 export type ScreenViewerPort = {

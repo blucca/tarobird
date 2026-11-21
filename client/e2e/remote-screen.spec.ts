@@ -33,6 +33,20 @@ test("a view-only session never invites the viewer to start control",async({page
  await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
  await expect(state).toHaveText(/^查看中 · 点击开始控制后操作 · /);
 });
+test("a control the App refused for an unfocused window returns to Start control instead of waiting",async({page})=>{
+ // Main's focus gate answered `control` with a Hub release; the Hub sends nothing for an unleased session.
+ const state=page.getByRole("complementary",{name:"远程屏幕"}).locator(".screen-state[role=status]");
+ await page.evaluate(()=>{(window as any).screenFixture.refuseControl=true;});
+ await page.getByRole("button",{name:"开始控制",exact:true}).click();
+ await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled({timeout:3000});
+ await expect(page.getByRole("button",{name:"等待新画面…",exact:true})).toHaveCount(0);
+ await expect(page.getByRole("button",{name:"停止控制",exact:true})).toHaveCount(0);
+ await expect(state).toHaveText(/^查看中 · 点击开始控制后操作 · /);
+ // Nothing was taken in the meantime; a later request from a focused window works as before.
+ await page.evaluate(()=>{(window as any).screenFixture.refuseControl=false;});
+ await page.getByRole("button",{name:"开始控制",exact:true}).click();
+ await expect(page.getByRole("button",{name:"停止控制",exact:true})).toBeVisible();
+});
 test("control waits for new keyframe; local typing releases control and never becomes remote text",async({page})=>{
  await page.getByRole("button",{name:"开始控制",exact:true}).click();await expect(page.getByRole("button",{name:"停止控制",exact:true})).toBeVisible();await page.keyboard.press("ArrowRight");
  await page.getByLabel("本地聊天草稿").fill("只在本地聊天中输入");await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeVisible();

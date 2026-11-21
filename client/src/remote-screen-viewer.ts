@@ -90,6 +90,12 @@ export class RemoteScreenViewer {
       this.nativeVisible = (value as { visible: boolean }).visible; this.applyVisibility(); return;
     }
     if ((value as { type: string }).type === "closed") { this.fail(String((value as { reason: string }).reason)); return; }
+    // The App refused this document's control request (its window had no focus) and
+    // released instead; no lease will come, so return to "Start control".
+    if ((value as { type: string }).type === "control-refused") {
+      if (this.state.pending) { this.controlRequested = false; this.lease = undefined; this.update({ controlling: false, pending: false }); }
+      return;
+    }
     if ((value as { type: string }).type === "stream") {
       const stream = screenStreamSchema.parse(value); this.checkQuality(stream); if (stream.streamGeneration < this.minimumGeneration) return; this.minimumGeneration = stream.streamGeneration; const epoch = ++this.streamEpoch;
       this.clearMove(); this.picture = undefined; this.frames.clear(); this.closeDecoder(); this.stream = stream;

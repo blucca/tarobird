@@ -55,7 +55,13 @@ export class ScreenViewers {
           }
           const command = screenViewerCommandSchema.parse(data);
           if (command.sessionId !== id || command.generation !== base.generation) throw new Error('screen_session_changed');
-          if (['input', 'control', 'renew'].includes(command.type) && (!viewer.visible || !this.window.isFocused() || !this.window.isVisible() || this.window.isMinimized())) { send({ type: 'release', ...base }); return; }
+          if (['input', 'control', 'renew'].includes(command.type) && (!viewer.visible || !this.window.isFocused() || !this.window.isVisible() || this.window.isMinimized())) {
+            send({ type: 'release', ...base });
+            // The Hub answers nothing for a session it never leased, so a refused
+            // `control` must be reported here or the document waits for a lease forever.
+            if (command.type === 'control') post({ type: 'control-refused' });
+            return;
+          }
           if (command.type === 'visibility') viewer.visible = command.visible;
           if (['release', 'disconnect'].includes(command.type) || command.type === 'visibility' && !command.visible) { viewer.inputFocused = false; viewer.canControl = false; this.syncMenuShortcuts(); }
           send(command);
