@@ -2,6 +2,7 @@
 // is a minimal adapter with the same three screen calls and parsing as
 // HubConnection (connection.ts screenStatus/screenOpen/screenStop); the
 // requests carry the viewer device's real token through the main process.
+import { useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import { RemoteScreenPanel } from "../../src/RemoteScreenPanel.js";
 import { setLocale } from "../../src/i18n.js";
@@ -24,9 +25,14 @@ const connection = { identity: { hubPublicKey }, state: { screenAvailable: true,
   screenStop: async (sessionId?: string) => call("/api/screens/stop", { method: "POST", body: JSON.stringify({ sessionId }) }),
 } as unknown as HubConnection;
 (window as any).accRefresh = () => window.dispatchEvent(new Event("focus"));
+// The product's standalone screen dialog (screen-connection-dialog): the side
+// layout needs sidebar + conversation + panel (≈760px), wider than B's half of
+// the runner's 1024px desktop next to A's test window.
 function App() {
-  return <div className="app-shell has-side-panel" style={{ height: "100vh", position: "relative", display: "flex" }}>
-    <RemoteScreenPanel connection={connection} hostName="Windows runner" visible={true} close={() => {}} />
-  </div>;
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => { dialog.current?.showModal(); }, []);
+  return <dialog className="screen-connection-dialog" ref={dialog} onCancel={e => e.preventDefault()}>
+    <RemoteScreenPanel connection={connection} hostName="Windows runner" visible={true} standalone close={() => {}} />
+  </dialog>;
 }
 createRoot(document.getElementById("root")!).render(<App />);
