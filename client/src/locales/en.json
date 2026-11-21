@@ -5573,5 +5573,10 @@
   "未投递": "Not delivered",
   "发送方的授权已撤销": "the sender's permission was revoked",
   "发送方主机已不在网络中": "the sender's host left the network",
-  "目标 Bot 已删除": "the recipient Bot was deleted"
+  "目标 Bot 已删除": "the recipient Bot was deleted",
+  "分享内容暂时读取不了": "Can't read shares",
+  "暂时读取不了收到的分享，请重试。": "Received shares can't be read right now. Try again.",
+  "错误代码：{0}": "Error code: {0}",
+  "仍然读取不了，请稍后再试。": "Still can't read them. Try again later.",
+  "正在重试…": "Retrying…"
 }
