@@ -163,6 +163,16 @@ This is covered on macOS by unit tests (old layout, unknown, symlink, missing
 new runtime, Host running) and by a Windows cross-compile check. It has not
 run on Windows.
 
+## Setup notes left by design
+
+Every install, update and uninstall, including a successful one, appends to
+`%LOCALAPPDATA%\TaroBird Setup Notes` for the user who ran it. Uninstall keeps
+that folder, whether it keeps data or resets it. On a machine you keep, expect
+the folder after a run. Delete it if you want; nothing else reads it. A
+disposable runner is discarded with it. What the record holds, its size limit
+and the dialog hint are described in
+[docs/client/windows-fresh-install-2026-10-16.md](../../docs/client/windows-fresh-install-2026-10-16.md#setup-notes-localappdatatarobird-setup-notes).
+
 ## Not covered (needs a person, or a paired environment)
 
 - A configured Host surviving the upgrade on a fresh machine. Pairing is

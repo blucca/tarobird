@@ -698,3 +698,27 @@ test('setup notes append, rotate, refuse links, close their files and record fin
     assert.throws(() => checkSetupNotes(source), error => error instanceof assert.AssertionError && error.message.includes(property), label);
   }
 });
+
+// Review F4: the notes folder stays after uninstall by design; the user doc
+// says where it is, what it holds, its limit, that it stays and may be deleted,
+// and quotes the dialog hint exactly.
+test('the setup notes folder is documented as setup writes it', async () => {
+  const [notes, en, zh, acceptance] = await templates('installer-notes.nsh', 'English.nsh', 'SimpChinese.nsh', 'ACCEPTANCE.md');
+  const doc = await readFile(path.join(client, '..', 'docs/client/windows-fresh-install-2026-10-16.md'), 'utf8');
+  const define = name => notes.match(new RegExp(`^!define ${name} "?([^"\\n]*)"?$`, 'm'))[1];
+  const section = between(doc, '### Setup notes (`%LOCALAPPDATA%\\', '\n## ');
+  assert.ok(section.includes(`\`%LOCALAPPDATA%\\${define('BIRDNOTESDIR')}\\${define('BIRDNOTESFILE')}\``), 'location');
+  assert.ok(section.includes(`\`${define('BIRDNOTESPREVIOUS')}\``), 'previous file');
+  assert.ok(section.includes(`at most ${define('BIRDNOTESMAX')} lines per file`) && section.includes(`never more than ${2 * Number(define('BIRDNOTESMAX'))} lines in all`), 'limit');
+  assert.ok(section.includes(`within ${Number(define('BIRDNOTESWAIT')) / 1000} seconds`), 'wait');
+  for (const words of ['**After uninstall:** the folder stays', '"back up and reset local data"', '**Removing it:** you can delete the folder', 'Nothing uploads it', 'never holds a path']) assert.ok(section.includes(words), words);
+  // The dialog hint, both languages, exactly as setup shows it.
+  for (const [language, lang] of [[en, 'LANG_ENGLISH'], [zh, 'LANG_SIMPCHINESE']]) {
+    const hint = language.match(new RegExp(`^LangString birdNoteKept \\$\\{${lang}\\} "(.+)"$`, 'm'))[1];
+    assert.ok(section.replace(/\n\s*/g, ' ').includes(`"${hint}"`), `the ${lang} dialog hint is quoted as shown`);
+  }
+  assert.match(acceptance, /^## Setup notes left by design$/m);
+  assert.ok(acceptance.includes('docs/client/windows-fresh-install-2026-10-16.md#setup-notes-localappdatatarobird-setup-notes'));
+  // Kept by design: setup never removes the folder or its files.
+  assert.doesNotMatch(nsisCode(notes), /RMDir|Delete "\$8\\\$\{BIRDNOTESFILE\}"/);
+});
