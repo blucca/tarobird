@@ -1,7 +1,7 @@
-# ACCEPTANCE-ONLY PROBE BRANCH (#50 extension pre-check). Never merge into main.
-# Builds and installs no TaroBird package: pinned release downloads (hash only,
-# nothing is run from them), an NSIS fixture for the CJK/space directory and
-# review N2, and driver syntax. No upload, signing or release.
+# ACCEPTANCE-ONLY PROBE BRANCH (#50 ext2 step watchdog). Never merge into main.
+# No TaroBird build or install: checks that acceptance-step-watchdog.ps1 ends a
+# hung node tree whose grandchild holds inherited stdio, lets later steps run and
+# the job finish with logs. No upload, signing or release.
 name: Windows desktop installer
 on:
   workflow_dispatch:
@@ -14,9 +14,9 @@ on:
 permissions:
   contents: read
 jobs:
-  extension-probe:
+  watchdog-probe:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Acceptance-only guard (disposable GitHub-hosted runner, no uploads)
         shell: pwsh
@@ -25,32 +25,27 @@ jobs:
         run: |
           if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Probe runs only on a disposable GitHub-hosted runner" }
           if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "Probe runs only from an accept/* branch" }
-          "runner=$env:RUNNER_ENVIRONMENT image=$env:ImageOS $env:ImageVersion ref=$env:REF"
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: |
-            client/scripts
-            client/windows-electron
+          sparse-checkout: client/scripts
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: "Build the fixtures (dialog from the product's .nsh files, link, B-3 pair; -INPUTCHARSET UTF8 as the product)"
+      - name: "Hung node with a stdio-inheriting grandchild, under a 1-minute watchdog (expected to fail with 124)"
+        continue-on-error: true
+        timeout-minutes: 5
         shell: pwsh
         run: |
-          $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $makensis) { choco install nsis --no-progress -y | Out-Null }
-          if (-not $makensis) { $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe", "$env:ChocolateyInstall\bin\makensis.exe", (Get-Command makensis -ErrorAction SilentlyContinue).Source) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1 }
-          if (-not $makensis) { throw "makensis not found after choco install" }
-          & $makensis -VERSION
-          foreach ($name in 'dialog-fixture', 'lnk-fixture', 'b3-old', 'b3-new') {
-            & $makensis -V2 -INPUTCHARSET UTF8 "-DSRC=$PWD\client\windows-electron" "-DOUT=$env:RUNNER_TEMP\$name.exe" "client/scripts/acceptance-probe/$name.nsi"
-            if ($LASTEXITCODE -ne 0) { throw "fixture $name failed" }
-          }
-      - name: "Round-2 pre-check: shortcut read, UTF-8 driver output, NSIS-only buttons and helper exits, B-3 driver"
+          & client/scripts/acceptance-step-watchdog.ps1 -Name hung -Minutes 1 -ArgumentLine "client/scripts/acceptance-probe/pipe-holder.mjs"
+          if ($LASTEXITCODE -ne 0) { throw "watchdog ended the hung step with $LASTEXITCODE (expected 124)" }
+      - name: Next step still runs; nothing of the hung tree is left
         shell: pwsh
         run: |
-          node client/scripts/acceptance-probe/fixes-probe.mjs 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\probe.log"
-          $code = $LASTEXITCODE
-          foreach ($f in 'windows-install-ui-driver.ps1', 'windows-dialog-text-driver.ps1', 'windows-uninstall-ui-driver.ps1') { $e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\client\scripts\$f", [ref]$null, [ref]$e); "parse ${f}: $(if ($e) { $e } else { 'OK' })" }
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Round-2 pre-check', '```', (Get-Content -Raw "$env:RUNNER_TEMP\probe.log").Trim(), '```')
-          exit $code
+          "after the hung step: $(Get-Date -Format o)"
+          $left = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'Start-Sleep -Seconds 900|pipe-holder' })
+          "left: $($left.Count) $($left | ForEach-Object { $_.ProcessId })"
+      - name: A normal step under the watchdog
+        shell: pwsh
+        run: |
+          & client/scripts/acceptance-step-watchdog.ps1 -Name quick -Minutes 1 -ArgumentLine "client/scripts/acceptance-probe/quick.mjs"
+          if ($LASTEXITCODE -ne 0) { throw "quick failed $LASTEXITCODE" }
