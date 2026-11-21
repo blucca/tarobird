@@ -80,6 +80,9 @@ function BtnRx($el, [string]$rx) {
   return $null
 }
 function Hex([string]$s) { (($s.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ') }
+Add-Type -Namespace BirdProbe -Name Win32Parent -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);'
+# The message box's own window: the parent of its Retry button's window.
+function DialogHandle($btn) { [int][BirdProbe.Win32Parent]::GetParent([IntPtr]$btn.Current.NativeWindowHandle) }
 function StaticTexts([int]$hwnd) {
   $parts = @(); $child = [IntPtr]::Zero
   do {
@@ -111,7 +114,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
       if ($retry) {
         $dialog = Scope $retry
         if (-not $captured) {
-          $uia = Text $dialog; $raw = StaticTexts $dialog.Current.NativeWindowHandle
+          $uia = Text $dialog; $raw = StaticTexts (DialogHandle $retry)
           Note 'problem-uia' $uia; Note 'problem-uia-hex' (Hex $uia); Note 'problem-win32' $raw; Note 'problem-win32-hex' (Hex $raw)
           $captured = $true
         }
