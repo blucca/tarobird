@@ -85,7 +85,25 @@ function Desc($el) { "'$($el.Current.Name)' class=$($el.Current.ClassName) hwnd=
 Add-Type -Namespace BirdProbe -Name Win32Alive -MemberDefinition @"
 [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
 [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+[DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 "@
+# Press = post the dialog's own WM_COMMAND/BN_CLICKED and return at once. A
+# synchronous UIA Invoke (SendMessage BM_CLICK) does not return while the
+# click handler runs, and setup's page-leave handler ExecWaits the old
+# uninstaller that this driver must answer: a deadlock (probe 44861697805).
+function Press($el) {
+  $h = [IntPtr]$el.Current.NativeWindowHandle
+  if ($h -ne [IntPtr]::Zero) {
+    $parent = [BirdProbe.Win32Alive]::GetParent($h); $id = [BirdProbe.Win32Alive]::GetDlgCtrlID($h)
+    if ($parent -ne [IntPtr]::Zero -and $id -ne 0) { [void][BirdProbe.Win32Alive]::PostMessage($parent, 0x0111, [IntPtr]$id, $h); return }
+    [void][BirdProbe.Win32Alive]::PostMessage($h, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero); return
+  }
+  try { $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch { }
+}
+# A check box changes only its own state (no ExecWait behind it): click it in place.
+function Untick($box) { [void][BirdProbe.Win32Alive]::SendMessage([IntPtr]$box.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) }
 # A window whose UI thread is blocked (setup's page-leave ExecWait) would hang
 # every UI Automation call on it; ask it a WM_NULL with a 400 ms limit first.
 function Responsive($w) {

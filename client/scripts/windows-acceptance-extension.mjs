@@ -473,11 +473,12 @@ const SEPARATOR = [0x20, 0xb7, 0x20];
  * whoami.exe first so an idle watcher cannot pass as "nothing exited". */
 export async function watchExits(x, names) {
   const log = W.join(x.tmp, `exits-${Date.now()}.log`), ready = `${log}.ready`;
-  // Trace ProcessName is the kernel's image name, at most 15 characters
-  // ("tarobot-installer-helper.exe" arrives as "tarobot-install"), so match
-  // on that prefix and log the raw name.
-  const wanted = [...names, 'whoami.exe'].map(name => `'${name.slice(0, 15).toLowerCase()}'`).join(',');
-  const script = `$ErrorActionPreference = 'Stop'; $wanted = @(${wanted}); Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStopTrace" -SourceIdentifier tbexits | Out-Null; Set-Content -LiteralPath '${ps(ready)}' -Value 'ready'; while ($true) { $e = Wait-Event -SourceIdentifier tbexits -Timeout 1; if ($e) { $n = $e.SourceEventArgs.NewEvent; $raw = [string]$n.ProcessName; if ($wanted -contains $raw.ToLower().Substring(0, [Math]::Min(15, $raw.Length))) { Add-Content -LiteralPath '${ps(log)}' -Value "$raw pid=$($n.ProcessID) parent=$($n.ParentProcessID) exit=$($n.ExitStatus)" }; Remove-Event -EventIdentifier $e.EventIdentifier } }`;
+  // Win32_ProcessStopTrace reports the image name cut to 14 characters
+  // ("tarobot-installer-helper.exe" -> "tarobot-instal"; StartTrace keeps the
+  // full name; probe 44861697805), so a stop matches when its raw name is a
+  // prefix of a wanted name at least min(14, length) long. The raw name is logged.
+  const wanted = [...names, 'whoami.exe'].map(name => `'${name.toLowerCase()}'`).join(',');
+  const script = `$ErrorActionPreference = 'Stop'; $wanted = @(${wanted}); Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStopTrace" -SourceIdentifier tbexits | Out-Null; Set-Content -LiteralPath '${ps(ready)}' -Value 'ready'; while ($true) { $e = Wait-Event -SourceIdentifier tbexits -Timeout 1; if ($e) { $n = $e.SourceEventArgs.NewEvent; $raw = ([string]$n.ProcessName).ToLower(); if ($raw -and @($wanted | Where-Object { $_.StartsWith($raw) -and $raw.Length -ge [Math]::Min(14, $_.Length) }).Count) { Add-Content -LiteralPath '${ps(log)}' -Value "$($n.ProcessName) pid=$($n.ProcessID) parent=$($n.ParentProcessID) exit=$($n.ExitStatus)" }; Remove-Event -EventIdentifier $e.EventIdentifier } }`;
   const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
   let stderr = '', done = false; child.stderr.on('data', chunk => { stderr += chunk; });
   const exited = new Promise(resolve => { child.once('exit', () => { done = true; resolve(); }); child.once('error', error => { done = true; stderr += String(error); resolve(); }); });
