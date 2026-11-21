@@ -28,10 +28,22 @@ jobs:
           "runner=$env:RUNNER_ENVIRONMENT image=$env:ImageOS $env:ImageVersion ref=$env:REF"
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: client/scripts/acceptance-probe
+          sparse-checkout: |
+            client/scripts/acceptance-probe
+            client/windows-electron
+      - name: Build the NSIS fixture with the product's utils.nsh (no TaroBird build)
+        shell: pwsh
+        run: |
+          $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis) { choco install nsis --no-progress -y | Out-Null; $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
+          $work = Join-Path $env:LOCALAPPDATA 'TaroBirdAumidProbe'; New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Copy-Item "$env:SystemRoot\System32\whoami.exe" (Join-Path $work 'nsis.exe') -Force
+          & $makensis /V2 "/DUTILS=$PWD\client\windows-electron\utils.nsh" "/DTARGET=$work\nsis.exe" "/DOUT=$env:RUNNER_TEMP\aumid-fixture.exe" client/scripts/acceptance-probe/aumid-fixture.nsi
+          if ($LASTEXITCODE -ne 0) { throw "fixture build failed" }
       - name: "Start Menu AppID probe (Windows PowerShell 5.1, like windows-acceptance.mjs)"
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
-          $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File client/scripts/acceptance-probe/aumid-start-apps-probe.ps1 -PollSeconds 180 2>&1 | Out-String
+          $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File client/scripts/acceptance-probe/aumid-start-apps-probe.ps1 -PollSeconds 30 -NsisFixture "$env:RUNNER_TEMP\aumid-fixture.exe" 2>&1 | Out-String
           Write-Output $out
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Start Menu AppID probe', '```', $out.Trim(), '```')

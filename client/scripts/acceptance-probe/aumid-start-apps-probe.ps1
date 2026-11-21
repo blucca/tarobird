@@ -5,7 +5,7 @@
 # ToastActivatorCLSID) or not at all, reads the properties back, then polls
 # Get-StartApps (Windows PowerShell 5.1, like windows-acceptance.mjs) to see
 # whether and when each AppID is listed.
-param([int]$PollSeconds = 180, [int]$IntervalSeconds = 3)
+param([int]$PollSeconds = 180, [int]$IntervalSeconds = 3, [string]$NsisFixture = '')
 $ErrorActionPreference = 'Stop'
 if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Only a disposable GitHub-hosted runner may run this probe' }
 $started = Get-Date
@@ -126,6 +126,42 @@ while ((Get-Date) -lt $deadline) {
   }
   Start-Sleep -Seconds $IntervalSeconds
 }
+# Sequences that mirror the installer: a link the shell has already indexed is
+# modified later (POSTINSTALL register() runs seconds after CreateShortcut).
+function Wait-Listed([string]$name, [string]$want, [int]$seconds) {
+  $t0 = Get-Date; $last = $null
+  while (((Get-Date) - $t0).TotalSeconds -lt $seconds) {
+    $hit = @(Get-StartApps | Where-Object { $_.Name -eq $name })
+    $ids = (@($hit | ForEach-Object { $_.AppID }) -join ' ; ')
+    if ($ids -ne $last) { $last = $ids; Out-Line 'seq-listed' ([ordered]@{ name = $name; after = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1); appIds = $ids }) }
+    if ($hit.Count -and (-not $want -or ($hit | Where-Object { $_.AppID -eq $want }))) { return $true }
+    Start-Sleep -Seconds 2
+  }
+  Out-Line 'seq-timeout' ([ordered]@{ name = $name; want = $want; seconds = $seconds; last = $last }); return $false
+}
+# M: no AppID first (as if the NSIS stamp did not take), indexed, then register-style stamp.
+$m = @{ name = 'TaroBird AUMID Probe Modified'; id = 'com.tarobot.aumidprobe.modified' }
+$mExe = Join-Path $work 'modified.exe'; Copy-Item -LiteralPath "$env:SystemRoot\System32\whoami.exe" -Destination $mExe -Force
+$mLnk = Join-Path $programs "$($m.name).lnk"; $s = $wsh.CreateShortcut($mLnk); $s.TargetPath = $mExe; $s.Save()
+[void](Wait-Listed $m.name '' 60)
+[LinkProps]::Stamp($mLnk, $m.id, $true, $true)
+Out-Line 'seq-stamped' ([ordered]@{ name = $m.name; readBack = [LinkProps]::Read($mLnk) })
+if (-not (Wait-Listed $m.name $m.id 90)) {
+  [LinkProps]::SHChangeNotify(0x00002000, 0x0005, [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($mLnk), [IntPtr]::Zero)  # SHCNE_UPDATEITEM, SHCNF_PATHW
+  Out-Line 'seq-refresh' 'SHChangeNotify(SHCNE_UPDATEITEM) on the link'
+  [void](Wait-Listed $m.name $m.id 60)
+}
+# N: the product's NSIS macro (utils.nsh) right after CreateShortcut, then the register()-style re-stamp.
+if ($NsisFixture -and (Test-Path -LiteralPath $NsisFixture)) {
+  $nName = 'TaroBird AUMID Probe Nsis'; $nLnk = Join-Path $programs "$nName.lnk"
+  $p = Start-Process -FilePath $NsisFixture -Wait -PassThru
+  Out-Line 'nsis-fixture' ([ordered]@{ exit = $p.ExitCode; exists = (Test-Path -LiteralPath $nLnk); readBack = $(if (Test-Path -LiteralPath $nLnk) { [LinkProps]::Read($nLnk) } else { '' }) })
+  [void](Wait-Listed $nName 'com.tarobot.aumidprobe.nsis' 60)
+  [LinkProps]::Stamp($nLnk, 'com.tarobot.aumidprobe.nsis', $true, $true)
+  Out-Line 'nsis-restamped' ([ordered]@{ readBack = [LinkProps]::Read($nLnk) })
+  [void](Wait-Listed $nName 'com.tarobot.aumidprobe.nsis' 20)
+} else { Out-Line 'nsis-fixture' "not available: $NsisFixture" }
+
 # Read-only: whether Windows associates each AppID with a notifier. Nothing is shown.
 try {
   [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
