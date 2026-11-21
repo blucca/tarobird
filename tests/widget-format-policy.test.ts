@@ -34,7 +34,7 @@ it('uses one HTML-default policy for all engines, native tools, compatibility fe
       expect(guide).toContain(widgetFormatPolicy);
       expect(guide.indexOf('Publish with app_show_widget')).toBeLessThan(guide.indexOf('Report schema'));
       expect(guide).not.toMatch(/Prefer bounded report|Use report data for ordinary|Use HTML only when/);
-      expect(guide).toContain('Scripts run in a Worker');
+      expect(guide).toContain('run in a Worker against a virtual DOM');
       // Design is left to the author: no layout, colour or interaction rules.
       expect(guide).not.toMatch(/complete company\/category names|Use colour generously|Interaction recipes|Start with at most one short factual conclusion/);
       if (!nativeWidgets) expect(appTurnInstructions('比较本周趋势', options)).toContain(widgetFormatPolicy);

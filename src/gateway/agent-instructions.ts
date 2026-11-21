@@ -39,7 +39,7 @@ export function appAgentInstructions(options: AppInstructionOptions = {}): strin
       : undefined,
     canDeliver && (options.widgetsEnabled ?? widgetsEnabled()) ? options.nativeWidgets
       ? `${widgetFormatPolicy} Use app_show_widget({title,summary,html}) proactively; text when clearer. Read app_capability topic=widgets.`
-      : `${widgetFormatPolicy} Chart/diagram widget: publish once, exactly:\n${widgetCompatibilityFence}\nSelf-contained HTML; no network or host APIs.` : undefined,
+      : `${widgetFormatPolicy} Chart/diagram widget: publish once, exactly:\n${widgetCompatibilityFence}\nHTML fragment; https/wss network unless turned off; no App/host APIs.` : undefined,
     context === "cron" ? "This scheduled run must not create, remove, or modify schedules." : context === "discussion" ? "This discussion turn must not create, remove, or modify schedules." : "Create or change schedules only when the user asks.",
   ].filter(Boolean).join("\n");
 }
