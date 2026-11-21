@@ -165,11 +165,22 @@ try {
     expect('drag-only', 'held-record-created-and-cleared', !!heldMid && JSON.stringify(heldMid.journal).length > JSON.stringify(heldBefore.journal).length && heldAfter.journal?.state !== undefined,
       { before: heldBefore.journal, mid: heldMid?.journal, after: heldAfter.journal, activeMid: heldMid?.active, activeAfter: heldAfter.active });
     // Status line lines at narrow widths (zh now, en next).
-    const lines = async (pg, l) => { for (const width of [512, 360, 300]) {
-      await (pg === page ? bApp : enApp).evaluate(({ BrowserWindow }, w) => BrowserWindow.getAllWindows()[0].setSize(w, 720), width); await sleep(500);
-      const m = await pg.evaluate(() => { const s = document.querySelector('.screen-state[role=status]'); const r = document.createRange(); r.selectNodeContents(s); const tops = new Set([...r.getClientRects()].map(x => Math.round(x.top)));
-        const cs = getComputedStyle(s); return { panelWidth: Math.round(document.querySelector('.remote-screen-panel').getBoundingClientRect().width), text: s.innerText, lines: tops.size, height: Math.round(s.getBoundingClientRect().height), lineHeight: cs.lineHeight, whiteSpace: cs.whiteSpace, sw: s.scrollWidth, cw: s.clientWidth }; });
-      rec(`lines:${l}`, `status-line-at-window-${width}`, 'info', m); } };
+    const lines = async (pg, l) => { for (const width of [360, 382]) {
+      await (pg === page ? bApp : enApp).evaluate(({ BrowserWindow }, w) => BrowserWindow.getAllWindows()[0].setSize(w, 720), width); await sleep(600);
+      const m = await pg.evaluate(() => {
+        const box = el => { if (!el) return null; const r = el.getBoundingClientRect(); return { top: Math.round(r.top * 10) / 10, bottom: Math.round(r.bottom * 10) / 10, left: Math.round(r.left), right: Math.round(r.right), h: Math.round(r.height * 10) / 10 }; };
+        const overlap = (a, b) => !!a && !!b && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5 && Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5;
+        const panel = document.querySelector('.remote-screen-panel'), s = panel.querySelector('.screen-state[role=status]');
+        const heading = panel.querySelector('.screen-heading'), toolbar = panel.querySelector('.screen-toolbar'), viewport = panel.querySelector('.screen-viewport'), canvas = panel.querySelector('canvas');
+        const r = document.createRange(); r.selectNodeContents(s); const rects = [...r.getClientRects()]; const tops = new Set(rects.map(x => Math.round(x.top)));
+        const sb = box(s), textBottom = Math.max(...rects.map(x => x.bottom)), textTop = Math.min(...rects.map(x => x.top));
+        // Clipped: text extends beyond the status box, or the status box beyond an ancestor that hides overflow.
+        let clippedBy = null; for (let a = s.parentElement; a && a !== document.body; a = a.parentElement) { const cs = getComputedStyle(a); if (/(hidden|clip|auto|scroll)/.test(cs.overflow + cs.overflowY)) { const ab = a.getBoundingClientRect(); if (sb.top < ab.top - 0.5 || sb.bottom > ab.bottom + 0.5) { clippedBy = a.className; break; } } }
+        return { panelWidth: Math.round(panel.getBoundingClientRect().width), text: s.innerText, lines: tops.size, status: sb, heading: box(heading), toolbar: box(toolbar), viewport: box(viewport), canvas: box(canvas),
+          overlapsHeading: overlap(sb, box(heading)), overlapsToolbar: overlap(sb, box(toolbar)), overlapsViewport: overlap(sb, box(viewport)), overlapsCanvas: overlap(sb, box(canvas)),
+          textInsideStatus: textTop >= sb.top - 0.5 && textBottom <= sb.bottom + 0.5, statusScrollH: s.scrollHeight, statusClientH: s.clientHeight, clippedBy };
+      });
+      rec(`overlap:${l}`, `${pg === page ? 'controlling' : 'controlling'}-panel-at-window-${width}`, (m.overlapsHeading || m.overlapsToolbar || m.overlapsViewport || m.overlapsCanvas || !m.textInsideStatus || m.clippedBy || m.statusScrollH > m.statusClientH + 1) ? 'fail' : 'pass', m); } };
     let enApp; await lines(page, 'zh');
     await bApp.close().catch(() => {});
     const en = await runB('en'); enApp = en.bApp; const te = L('en'); const btnE = name => en.page.getByRole('button', { name: te(name), exact: true });
