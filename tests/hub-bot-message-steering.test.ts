@@ -1,0 +1,337 @@
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { HubServer } from "../src/hub/server.js";
+import { BotMessages } from "../src/hub/bot-messages.js";
+import { HubError } from "../src/hub/store.js";
+import { hashSecret } from "../src/hub/auth.js";
+import { networkId } from "../src/hub/private-network.js";
+import { networkManifestSchema } from "../src/client-protocol/private-network.js";
+import { blocksText, type Block } from "../src/client-protocol/index.js";
+import type { BotLocalRequest } from "../src/client-protocol/bot-messages.js";
+import { HubPromptQueue } from "../src/hub/prompt-queue.js";
+import type { BotMessageSteeringHooks } from "../src/hub/bot-message-steering.js";
+
+let root: string, a: HubServer, b: HubServer, source: BotMessages, bodies: Record<string, unknown>[];
+const guard = async () => undefined;
+type Fake = { capable: ReturnType<typeof vi.fn>; status: ReturnType<typeof vi.fn>; steer: ReturnType<typeof vi.fn> };
+let fake: Fake;
+/** One live run per conversation, as a Gateway reports it. */
+let runs: Map<string, { targetId: string; sourceMessageId: string }>;
+
+beforeEach(async () => {
+  root = await mkdtemp(path.join(os.tmpdir(), "bot-steer-"));
+  a = await HubServer.start({ stateDir: path.join(root, "a") }); b = await HubServer.start({ stateDir: path.join(root, "b") });
+  await a.profile.update({ name: "Mac", revision: 0 }); await b.profile.update({ name: "Windows", revision: 0 });
+  for (const hub of [a, b]) for (const [id, name] of [["source", "Source"], ["target", "Target"]]) await hub.store.db.run("INSERT INTO bots(id,name,secret_hash,engine) VALUES(?,?,?,'codex')", [id!, name!, hashSecret("test-".repeat(10))]);
+  const nonce = randomBytes(32).toString("base64url");
+  const manifest = networkManifestSchema.parse({ v: 2, id: networkId(a.auth.publicKey, nonce), name: "Test", authorityKey: a.auth.publicKey, genesisNonce: nonce, revision: 1,
+    hosts: [a, b].map((hub, index) => ({ publicKey: hub.auth.publicKey, name: index ? "Windows" : "Mac", routes: [], protocol: 2, state: "active", revoked: false })), devices: [], revokedMembers: [], blockedBindings: [] });
+  const membership = { manifest, signature: a.auth.signNetworkManifest(manifest) };
+  for (const hub of [a, b]) await hub.store.db.run("INSERT INTO meta(key,value) VALUES('private-network:v1',?)", [JSON.stringify({ v: 1, routes: [], membership, imported: {}, revokedMembers: [], revokedHosts: [], retiredNetworks: [], admissions: [], peers: [], proofs: [], intents: {}, lastSyncedAt: Date.now(), waiting: false })]);
+  bodies = [];
+  source = new BotMessages(a.store, a.auth, a.network, a.attachments, async (_host, signed, body) => {
+    if (signed.passport.path === "/api/bot-messages/send") bodies.push(JSON.parse(body.toString("utf8")));
+    return b.botMessages.receive(signed, signed.passport.method, signed.passport.path, body);
+  });
+  await b.botMessages.grant({ sourceHost: "Mac", sourceBot: "source", targetBot: "target" }, guard);
+  runs = new Map();
+  fake = {
+    capable: vi.fn(() => true),
+    status: vi.fn(async (_bot: string, conversationId: string) => { const run = runs.get(conversationId); return run ? { supported: true, ...run } : { supported: true, reason: "no_active_turn" }; }),
+    steer: vi.fn(async (_bot: string, call: { targetId: string; conversationId: string }) => {
+      const run = runs.get(call.conversationId);
+      return run?.targetId === call.targetId ? { outcome: "accepted", sourceMessageId: run.sourceMessageId } : { outcome: "rejected", reason: "stale" };
+    }),
+  };
+  b.botMessages.steering = fake as unknown as BotMessageSteeringHooks;
+});
+afterEach(async () => { vi.restoreAllMocks(); await a.close(); await b.close(); await rm(root, { recursive: true, force: true }); });
+
+const input = (operation: BotLocalRequest["operation"], data: Record<string, unknown> = {}, conversation?: string, requestId = randomUUID()): BotLocalRequest => ({ operation, host: "Windows", bot: "target", requestId, data, ...(conversation ? { conversation } : {}) });
+const call = (request: BotLocalRequest) => source.local(request, "source", guard, true) as Promise<any>;
+const resolve = async () => call(input("resolve"));
+const send = (conversation: string, text: string, data: Record<string, unknown> = {}, requestId = randomUUID()) => call(input("send", { text, attachments: [], ...data }, conversation, requestId));
+const wait = (conversation: string, messageId: string) => call(input("wait", { messageId }, conversation));
+const deliveries = (messageId: string) => b.store.db.all<{ status: string; dispatched: number }>("SELECT status,dispatched FROM deliveries WHERE message_id=?", [messageId]);
+/** A queued task from the source, claimed by the target's worker: a live run. */
+async function liveTurn(conversation: string, text = "Long task") {
+  const receipt = await send(conversation, text);
+  await b.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [receipt.messageId]);
+  const run = { targetId: `run_${randomUUID().slice(0, 8)}`, sourceMessageId: receipt.messageId as string };
+  runs.set(conversation, run); return run;
+}
+const blocks = async (messageId: string): Promise<Block[]> => (await b.store.messageForUser("owner", messageId)).blocks;
+/** The pre-existing 10 messages/minute source limit is covered elsewhere. */
+const resetRate = () => b.store.db.run("DELETE FROM meta WHERE key LIKE 'bot-messages:rate:%'");
+
+describe("legacy and explicit queue delivery", () => {
+  it("keeps a send without delivery byte-identical: same body, same receipt keys, no steering calls", async () => {
+    const chat = await resolve();
+    await liveTurn(chat.conversationId);
+    const receipt = await send(chat.conversationId, "Plain");
+    expect(Object.keys(receipt).sort()).toEqual(["botId", "botName", "conversationId", "conversationName", "duplicate", "hostId", "hostName", "messageId", "requestId", "status"]);
+    expect(receipt.status).toBe("queued");
+    expect(bodies.at(-1)).toEqual({ text: "Plain", attachments: [] });
+    expect(fake.status).not.toHaveBeenCalled(); expect(fake.steer).not.toHaveBeenCalled();
+    expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
+  });
+
+  it("omits delivery on the wire for an explicit queue and still reports what happened", async () => {
+    const chat = await resolve();
+    const receipt = await send(chat.conversationId, "Queued", { delivery: "queue" });
+    expect(receipt).toMatchObject({ status: "queued", delivery: { requested: "queue", actual: "queued" } });
+    expect(fake.steer).not.toHaveBeenCalled();
+    expect(await deliveries(receipt.messageId)).toHaveLength(1);
+  });
+});
+
+describe("steered delivery", () => {
+  it("merges into the live turn the sender started, reports it, and waits for that turn's final reply", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    const receipt = await send(chat.conversationId, "Use the staging database", { delivery: "steer" });
+    expect(receipt).toMatchObject({ status: "steered", duplicate: false, delivery: { requested: "steer", actual: "steered", turn: { messageId: run.sourceMessageId } } });
+    expect(fake.steer).toHaveBeenCalledTimes(1);
+    expect(fake.steer.mock.calls[0]![1]).toMatchObject({ conversationId: chat.conversationId, userId: "owner", targetId: run.targetId, sourceMessageId: run.sourceMessageId, text: "Use the staging database", source: { botId: "source", hostName: "Mac" } });
+    // Never a second queued task: the record has no delivery row.
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+    const record = await b.store.messageForUser("owner", receipt.messageId);
+    expect(record.botSource).toMatchObject({ botId: "source", hostName: "Mac" });
+    expect(record.blocks.find(block => block.type === "steering")).toMatchObject({ botId: "target", targetId: run.targetId, outcome: "accepted" });
+    expect(await new HubPromptQueue(b.store).claim("target", true, false)).toEqual([]);
+    // The turn is still answering.
+    await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: run.sourceMessageId, status: "streaming", blocks: [{ type: "text", text: "Working" }] });
+    const pending = await wait(chat.conversationId, receipt.messageId);
+    expect(pending).toMatchObject({ status: "pending", delivery: { actual: "steered", turn: { messageId: run.sourceMessageId } } });
+    const reply = await b.store.db.get<{ id: string }>("SELECT id FROM messages WHERE reply_to=? AND author_type='bot'", [run.sourceMessageId]);
+    await b.store.publishBotMessage("target", { id: reply!.id, conversationId: chat.conversationId, replyTo: run.sourceMessageId, status: "complete", blocks: [{ type: "text", text: "Done on staging" }] });
+    await b.store.acknowledgeDelivery("target", run.sourceMessageId);
+    const done = await wait(chat.conversationId, receipt.messageId);
+    expect(done).toMatchObject({ status: "completed", text: "Done on staging", reply: { kind: "merged_turn", turnMessageId: run.sourceMessageId }, delivery: { requested: "steer", actual: "steered" } });
+    const audit = await b.store.db.all<{ kind: string; detail_json: string }>("SELECT kind,detail_json FROM audit_log WHERE kind LIKE 'bot-message.%' ORDER BY id");
+    expect(audit.map(row => row.kind)).toContain("bot-message.steer");
+    expect(JSON.parse(audit.find(row => row.kind === "bot-message.steer")!.detail_json)).toMatchObject({ outcome: "steered", sourceBot: "source", turn: run.sourceMessageId });
+  });
+
+  it("still forbids control text for steer, before any steering call", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    for (const text of ["/stop", "/approve all", " /new"]) await expect(send(chat.conversationId, text, { delivery: "steer" })).rejects.toThrow("bot_message_control_forbidden");
+    expect(fake.status).not.toHaveBeenCalled(); expect(fake.steer).not.toHaveBeenCalled();
+  });
+
+  it("returns the existing outcome for a repeated request ID, whatever delivery it names, without steering again", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const requestId = randomUUID();
+    const first = await send(chat.conversationId, "Fix A", { delivery: "steer" }, requestId);
+    for (const data of [{ delivery: "steer" }, { delivery: "queue" }, {}]) {
+      const again = await send(chat.conversationId, "Fix A", data, requestId);
+      expect(again).toMatchObject({ messageId: first.messageId, duplicate: true, status: "steered", delivery: { actual: "steered" } });
+    }
+    expect(fake.steer).toHaveBeenCalledTimes(1);
+    await expect(send(chat.conversationId, "Fix B", { delivery: "steer" }, requestId)).rejects.toThrow("bot_message_request_conflict");
+  });
+});
+
+describe("fallback to the queue", () => {
+  const expectQueuedOnce = async (receipt: any, reason: string) => {
+    expect(receipt).toMatchObject({ status: "queued", delivery: { requested: "steer", actual: "fell_back_to_queue", reason } });
+    expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
+    const record = await blocks(receipt.messageId);
+    expect(record.some(block => block.type === "steering")).toBe(false);
+    expect(record.find(block => block.type === "card")).toMatchObject({ extra: { promptQueue: { state: "steer_fallback", botId: "target", reason } } });
+    // The engine prompt never includes the Host's notice.
+    expect(blocksText(record)).not.toContain("已改为排队");
+  };
+
+  it("queues when the recipient has no live turn in this conversation (idle, or busy in another conversation)", async () => {
+    const chat = await resolve();
+    await expectQueuedOnce(await send(chat.conversationId, "Idle", { delivery: "steer" }), "no_active_turn");
+    const other = await call(input("resolve", { newConversation: "Other task" }));
+    await liveTurn(other.conversationId);
+    await expectQueuedOnce(await send(chat.conversationId, "Busy elsewhere", { delivery: "steer" }), "no_active_turn");
+    expect(fake.steer).not.toHaveBeenCalled();
+  });
+
+  it("queues when the receiving owner turned steering off for this Bot", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    await b.botMessages.setSteering("owner", { botId: "target", allowed: false }, guard, guard, "owner");
+    await expectQueuedOnce(await send(chat.conversationId, "Fix", { delivery: "steer" }), "steering_disabled");
+    expect(fake.status).not.toHaveBeenCalled();
+    await b.botMessages.setSteering("owner", { botId: "target", allowed: true }, guard, guard, "owner");
+    expect((await send(chat.conversationId, "Fix again", { delivery: "steer" })).status).toBe("steered");
+  });
+
+  it("queues for engines other than Codex and Claude", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    for (const engine of ["pi", "kimi", "deepseek", "antigravity"]) {
+      await b.store.db.run("UPDATE bots SET engine=? WHERE id='target'", [engine]);
+      await expectQueuedOnce(await send(chat.conversationId, `Fix ${engine}`, { delivery: "steer" }), "unsupported_engine");
+    }
+    await b.store.db.run("UPDATE bots SET engine='claude' WHERE id='target'");
+    expect((await send(chat.conversationId, "Fix claude", { delivery: "steer" })).status).toBe("steered");
+    expect(fake.status).toHaveBeenCalledTimes(1);
+  });
+
+  it("queues when the worker is offline or predates the steer capability", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    fake.capable.mockReturnValue(undefined);
+    await expectQueuedOnce(await send(chat.conversationId, "Offline", { delivery: "steer" }), "bot_offline");
+    fake.capable.mockReturnValue(false);
+    await expectQueuedOnce(await send(chat.conversationId, "Old worker", { delivery: "steer" }), "worker_update_required");
+    fake.capable.mockReturnValue(true); fake.status.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    await expectQueuedOnce(await send(chat.conversationId, "Status lost", { delivery: "steer" }), "status_unavailable");
+    expect(fake.steer).not.toHaveBeenCalled();
+  });
+
+  it("never steers into a turn another sender started, a background review, or a turn waiting on a card", async () => {
+    const chat = await resolve();
+    const owner = await b.store.sendMessage("owner", { conversationId: chat.conversationId, clientMsgId: "owner-task", text: "Owner task", attachments: [] });
+    await b.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [owner.message.id]);
+    runs.set(chat.conversationId, { targetId: "run_owner", sourceMessageId: owner.message.id });
+    await expectQueuedOnce(await send(chat.conversationId, "Hijack", { delivery: "steer" }), "turn_not_from_sender");
+    fake.status.mockResolvedValueOnce({ supported: true, reason: "background_review" });
+    await expectQueuedOnce(await send(chat.conversationId, "Review", { delivery: "steer" }), "background_review");
+    await b.store.acknowledgeDelivery("target", owner.message.id);
+    const run = await liveTurn(chat.conversationId);
+    await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: run.sourceMessageId, blocks: [{ type: "card", elements: [{ type: "button", text: "Allow", actionId: "act_1", value: { cctb_lark: "approval", requestId: "req", decision: "allow_once" } }] }] });
+    await expectQueuedOnce(await send(chat.conversationId, "Approve it", { delivery: "steer" }), "pending_card");
+    expect(fake.steer).not.toHaveBeenCalled();
+  });
+
+  it("queues group chats and attachments", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const bytes = Buffer.from("file"), sha256 = (await import("node:crypto")).createHash("sha256").update(bytes).digest("hex");
+    const upload = await call(input("upload", { name: "a.txt", mime: "text/plain", size: bytes.length, sha256 }, chat.conversationId));
+    await call(input("chunk", { uploadId: upload.id, index: 0, bytes: bytes.toString("base64") }, chat.conversationId));
+    await call(input("complete", { uploadId: upload.id }, chat.conversationId));
+    const withFile = await send(chat.conversationId, "See file", { delivery: "steer", attachments: [upload.id] });
+    expect(withFile).toMatchObject({ status: "queued", delivery: { actual: "fell_back_to_queue", reason: "attachments_unsupported" } });
+    const group = await b.store.createConversation("owner", ["target", "source"], "Group", "group-1");
+    await b.store.db.run("UPDATE conversations SET type='group' WHERE id=?", [group.id]);
+    const grouped = await send(group.id, "Group fix", { delivery: "steer" });
+    expect(grouped).toMatchObject({ status: "queued", delivery: { actual: "fell_back_to_queue", reason: "unsupported_conversation" } });
+    expect(fake.steer).not.toHaveBeenCalled();
+  });
+
+  it("turns a definite engine rejection (the turn just ended) into exactly one queued task", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    // Status saw the run; by the time the steer arrives the run has ended.
+    fake.steer.mockImplementationOnce(async () => { runs.delete(chat.conversationId); return { outcome: "rejected", reason: "stale" }; });
+    const receipt = await send(chat.conversationId, "Late fix", { delivery: "steer" });
+    await expectQueuedOnce(receipt, "turn_ended");
+    expect(fake.steer).toHaveBeenCalledTimes(1);
+    await b.store.acknowledgeDelivery("target", run.sourceMessageId);
+    const claimed = await new HubPromptQueue(b.store).claim("target", true, false);
+    expect(claimed.map(message => message.id)).toEqual([receipt.messageId]);
+    expect(await new HubPromptQueue(b.store).claim("target", true, false)).toEqual([]);
+    // A retry with the same request ID neither steers nor queues again.
+    const again = await send(chat.conversationId, "Late fix", { delivery: "steer" }, receipt.requestId);
+    expect(again).toMatchObject({ duplicate: true, delivery: { actual: "fell_back_to_queue", reason: "turn_ended" } });
+    expect(await deliveries(receipt.messageId)).toHaveLength(1);
+    expect(fake.steer).toHaveBeenCalledTimes(1);
+  });
+
+  it("never re-queues an uncertain steer and still ends the wait with a definite state", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    const receipt = await send(chat.conversationId, "Maybe", { delivery: "steer" });
+    expect(receipt).toMatchObject({ status: "uncertain", delivery: { requested: "steer", actual: "steer_uncertain", turn: { messageId: run.sourceMessageId } } });
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+    const again = await send(chat.conversationId, "Maybe", { delivery: "steer" }, receipt.requestId);
+    expect(again).toMatchObject({ duplicate: true, delivery: { actual: "steer_uncertain" } });
+    expect(fake.steer).toHaveBeenCalledTimes(1);
+    expect((await wait(chat.conversationId, receipt.messageId)).status).toBe("pending");
+    await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: run.sourceMessageId, blocks: [{ type: "text", text: "Finished" }] });
+    await b.store.acknowledgeDelivery("target", run.sourceMessageId);
+    expect(await wait(chat.conversationId, receipt.messageId)).toMatchObject({ status: "completed", text: "Finished", delivery: { actual: "steer_uncertain" }, reply: { kind: "merged_turn" } });
+  });
+
+  it("reports a pending steer to a concurrent duplicate and recovers an interrupted Hub as uncertain", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    let release!: (value: unknown) => void;
+    fake.steer.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const requestId = randomUUID();
+    const first = send(chat.conversationId, "Slow", { delivery: "steer" }, requestId);
+    await vi.waitFor(() => expect(fake.steer).toHaveBeenCalledTimes(1));
+    const duplicate = await send(chat.conversationId, "Slow", { delivery: "steer" }, requestId);
+    expect(duplicate).toMatchObject({ duplicate: true, status: "pending", delivery: { actual: "pending" } });
+    expect((await wait(chat.conversationId, duplicate.messageId)).status).toBe("pending");
+    // A Hub restart marks the unresolved call uncertain; nothing is queued.
+    await b.store.recoverSteering();
+    expect(await wait(chat.conversationId, duplicate.messageId)).toMatchObject({ delivery: { actual: "steer_uncertain", turn: { messageId: run.sourceMessageId } } });
+    release({ outcome: "accepted", sourceMessageId: run.sourceMessageId });
+    await first;
+    expect(await deliveries(duplicate.messageId)).toEqual([]);
+  });
+
+  it("reports a turn that failed or dropped the merged text as a terminal failure", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    const receipt = await send(chat.conversationId, "Fix", { delivery: "steer" });
+    await b.store.applySteeringOutcome("target", { conversationId: chat.conversationId, userId: "owner", requestId: (await b.store.messageForUser("owner", receipt.messageId)).clientMsgId, targetId: run.targetId, application: { status: "dropped", reason: "stopped" } });
+    await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: run.sourceMessageId, status: "error", blocks: [{ type: "text", text: "Stopped" }] });
+    await b.store.acknowledgeDelivery("target", run.sourceMessageId);
+    expect(await wait(chat.conversationId, receipt.messageId)).toMatchObject({ status: "failed", delivery: { actual: "steered", dropped: "stopped" } });
+  });
+});
+
+describe("loop limits", () => {
+  it("caps Bot steers per turn and per sender edge, then queues", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const results = [];
+    for (let i = 0; i < 4; i++) results.push(await send(chat.conversationId, `Fix ${i}`, { delivery: "steer" }));
+    expect(results.map(r => r.delivery.actual)).toEqual(["steered", "steered", "steered", "fell_back_to_queue"]);
+    expect(results[3]!.delivery.reason).toBe("turn_steer_limit");
+    await resetRate();
+    // Fresh turns: the edge allows 6 steers per 10 minutes in total.
+    const edge = [];
+    for (let i = 0; i < 4; i++) { const other = await call(input("resolve", { newConversation: `Edge ${i}` })); await liveTurn(other.conversationId); edge.push(await send(other.conversationId, `Edge ${i}`, { delivery: "steer" })); }
+    expect(edge.map(r => r.delivery.actual)).toEqual(["steered", "steered", "steered", "fell_back_to_queue"]);
+    expect(edge[3]!.delivery.reason).toBe("steer_rate_limited");
+  });
+
+  it("bounds two Bots that keep steering each other's live turns", async () => {
+    // Both Bots live on Host B; each one's turn was started by the other.
+    await b.botMessages.grant({ sourceHost: "Windows", sourceBot: "source", targetBot: "target" }, guard);
+    await b.botMessages.grant({ sourceHost: "Windows", sourceBot: "target", targetBot: "source" }, guard);
+    const local = (from: string, to: string, request: Omit<BotLocalRequest, "host" | "bot">) => b.botMessages.local({ ...request, host: "Windows", bot: to }, from, guard, true) as Promise<any>;
+    const chats: Record<string, string> = {};
+    for (const [from, to] of [["source", "target"], ["target", "source"]] as const) {
+      chats[to] = (await local(from, to, { operation: "resolve", requestId: randomUUID(), data: {} })).conversationId;
+      const task = await local(from, to, { operation: "send", conversation: chats[to], requestId: randomUUID(), data: { text: `Task for ${to}`, attachments: [] } });
+      await b.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [task.messageId]);
+      runs.set(chats[to]!, { targetId: `run_${to}`, sourceMessageId: task.messageId });
+    }
+    const outcomes: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const [from, to] = i % 2 ? ["target", "source"] : ["source", "target"];
+      const receipt = await local(from!, to!, { operation: "send", conversation: chats[to!], requestId: randomUUID(), data: { text: `Ping ${i}`, attachments: [], delivery: "steer" } });
+      outcomes.push(receipt.delivery.actual);
+    }
+    expect(outcomes.filter(o => o === "steered")).toHaveLength(6);
+    expect(outcomes.slice(6).every(o => o === "fell_back_to_queue")).toBe(true);
+    expect(fake.steer).toHaveBeenCalledTimes(6);
+  });
+});
+
+describe("receiving-host capability", () => {
+  it("advertises steer support and lets a new sender downgrade against an older receiver", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const probes: string[] = [];
+    vi.spyOn(source, "exchange").mockImplementation(async (_host, signed, body) => {
+      probes.push(signed.passport.path);
+      if (signed.passport.path === "/api/bot-messages/capabilities") throw new HubError("bot_message_operation_forbidden", 403);
+      if (signed.passport.path === "/api/bot-messages/send") bodies.push(JSON.parse(body.toString("utf8")));
+      return b.botMessages.receive(signed, signed.passport.method, signed.passport.path, body);
+    });
+    const receipt = await send(chat.conversationId, "Old host", { delivery: "steer" });
+    expect(probes).toContain("/api/bot-messages/capabilities");
+    expect(bodies.at(-1)).toEqual({ text: "Old host", attachments: [] });
+    expect(receipt).toMatchObject({ status: "queued", delivery: { requested: "steer", actual: "fell_back_to_queue", reason: "receiver_update_required" } });
+    vi.mocked(source.exchange).mockRestore();
+    const fresh = await send(chat.conversationId, "New host", { delivery: "steer" });
+    expect(bodies.at(-1)).toEqual({ text: "New host", attachments: [], delivery: "steer" });
+    expect(fresh.status).toBe("steered");
+  });
+});

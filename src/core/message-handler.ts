@@ -450,6 +450,8 @@ async function runAcceptedCoreMessage(
   if (normalized.botSource) {
     // A signed Bot input is always a new queued task. Never run card-answer,
     // approval, steering, batching, /stop or other pre-queue control handlers.
+    // A sender's explicit live-turn steer (issue #62) is decided by the Hub and
+    // Gateway before any delivery exists and never reaches this handler.
     if (isBotControl(commandText)) throw new Error("bot_message_control_forbidden");
     queuePendingCoreBatchNow(input, normalized.conversationKey, messageLocale);
     return enqueueCoreTurn(input, normalized, messageLocale, async () => undefined);

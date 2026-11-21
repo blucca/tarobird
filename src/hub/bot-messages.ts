@@ -11,6 +11,12 @@ import type { HubAttachments } from "./attachments.js";
 import type { PrivateNetwork } from "./private-network.js";
 import { exchangeBotMessage } from "./bot-message-transport.js";
 import { botMessageGrantsCommandSchema, crossHostMessageGrantsCommandSchema, messageHostIdSchema, type BotMessageGrantsSnapshot, type CrossHostMessageGrantsSnapshot } from "../client-protocol/bot-message-grants.js";
+import { botMessageCapabilitiesSchema, botMessageSendSchema, botMessageSteeringCommandSchema, botSteerRejectionReason, supportsBotMessageSteerEngine,
+  type BotMessageDelivery, type BotMessageDeliveryReceipt, type BotMessageSteeringSnapshot, type BotSteerFallbackReason } from "../client-protocol/bot-message-delivery.js";
+import { botSteerStatusSchema, steerResultSchema, type SteerResult } from "../client-protocol/steering.js";
+import { hasPendingCardAction } from "../client-protocol/message-clear.js";
+import type { Message } from "../client-protocol/index.js";
+import { STEER_EDGE_LIMIT, STEER_EDGE_WINDOW_MS, STEER_TURN_LIMIT, offlineSteering, steerFallbackNotice, steeringDisabledKey, type BotMessageSteeringHooks, type IncomingMemo } from "./bot-message-steering.js";
 
 export const messageHostId = (key: string) => `hub_${createHash("sha256").update(Buffer.from(key, "base64")).digest("hex")}`;
 const digest = (b: Buffer) => createHash("sha256").update(b).digest("hex");
@@ -27,6 +33,13 @@ const storedMembershipHostsSchema = z.object({ membership: z.object({ manifest: 
   hosts: z.array(z.object({ publicKey: z.string(), name: z.string(), state: z.string(), revoked: z.boolean() }).passthrough()) }).passthrough() }).passthrough().optional() }).passthrough();
 type CrossHostState = { snapshot: CrossHostMessageGrantsSnapshot; keys: Map<string, string>; live: Set<string>; listed: Set<string> };
 const resolutionCode = (error: TargetResolutionError): unknown => { try { return (JSON.parse(error.message) as { code?: unknown }).code; } catch { return undefined; } };
+/** A steer limit reached inside the creating transaction: that write rolls back and the message is queued instead. */
+class SteerLimitReached extends Error { constructor(readonly reason: BotSteerFallbackReason) { super(reason); } }
+type ReplyState = { status: string; activeReplies?: number; text: string; files: { id: string; name: string; size: number; mime: string; sha256: string }[]; truncated: boolean };
+type WaitResult = BotMessageTarget & { messageId: string } & ReplyState & { delivery?: BotMessageDeliveryReceipt; reply?: { kind: "merged_turn"; turnMessageId: string } };
+/** Everything receive() resolved for one send; the delivery paths share it. */
+type DeliveryContext = { p: BotPassport; bot: { id: string; name: string }; target: BotMessageTarget; input: { text: string; attachments: string[] }; delivery: BotMessageDelivery;
+  key: string; content: string; clientMsgId: string; scope: (admitting?: boolean) => Promise<void>; attachmentGuard: (id: string) => Promise<void>; guard: Guard; validate: Guard };
 
 /** A narrow peer protocol, independent of Agent Bus. All authority is checked
  * by the receiving Hub; the CLI never receives either Hub's signing key. */
@@ -36,7 +49,9 @@ export class BotMessages {
     readonly workerCapable: (botId: string) => boolean | undefined = () => undefined,
     // Live App sockets learn about conversations only when told, as for every
     // other creation path; otherwise a delegated chat stays hidden until reconnect.
-    readonly conversationCreated: (userId: string, conversation: Conversation) => void = () => undefined) {}
+    readonly conversationCreated: (userId: string, conversation: Conversation) => void = () => undefined,
+    /** Hub → Gateway calls for steered delivery (issue #62); HubServer owns them. */
+    public steering: BotMessageSteeringHooks = offlineSteering) {}
   private async memo<T>(key: string): Promise<T | undefined> {
     const row = await this.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [key]);
     return row ? JSON.parse(row.value) as T : undefined;
@@ -262,7 +277,12 @@ export class BotMessages {
         if (hops > 3 && (input.operation !== "resolve" || !input.conversation)) throw new HubError("bot_message_hop_limit", 429);
         return { hostId: own.id, hostName: own.name, botId: sourceBot, botName: bot.name, requestId: input.requestId, hops: Math.min(hops, 3) };
       });
-      const data = input.data;
+      let data = input.data, downgraded = false;
+      // An older receiving Host refuses `delivery` (strict body). Ask it first;
+      // a Host that does not know the probe route queues the plain message.
+      if (input.operation === "send" && data.delivery === "steer" && host.publicKey !== this.auth.publicKey && !await this.peerSteers(host as NetworkHost, source, input.bot, admit)) {
+        const { delivery: _delivery, ...plain } = data; data = plain; downgraded = true;
+      }
       const routes = {
         list: "/api/bot-messages/conversations", resolve: "/api/bot-messages/resolve", send: "/api/bot-messages/send", wait: "/api/bot-messages/wait",
         upload: "/api/uploads", chunk: `/api/uploads/${idSchema.optional().parse(data.uploadId) ?? "invalid"}/${z.number().int().nonnegative().optional().parse(data.index) ?? 0}`,
@@ -277,7 +297,9 @@ export class BotMessages {
       if (input.operation === "send") await this.store.db.transaction(async () => {
         await admit(); await this.network.requireMessagePeerInTransaction(host.publicKey);
         const key = memoKey("outgoing", sourceBot, input.requestId);
-        const content = hashSecret(networkCanonical({ target: host.publicKey, bot: input.bot, conversation: input.conversation, data }));
+        // Delivery is a preference, not content: a retry may name another one.
+        const { delivery: _delivery, ...sent } = data;
+        const content = hashSecret(networkCanonical({ target: host.publicKey, bot: input.bot, conversation: input.conversation, data: sent }));
         const old = await this.memo<{ content: string }>(key);
         if (old && old.content !== content) throw new HubError("bot_message_request_conflict", 409);
         await this.put(key, { content, state: "unconfirmed", at: Date.now() });
@@ -295,7 +317,8 @@ export class BotMessages {
         result = parsed.data;
       }
       await this.store.db.serial(async () => { await guard(); await this.network.requireMessagePeerInTransaction(host.publicKey); });
-      if (input.operation === "send" || input.operation === "wait") await this.store.audit(`bot-message.outgoing-${input.operation}`, sourceBot, { requestId: input.requestId, hostId: host.id });
+      if (input.operation === "send" || input.operation === "wait") await this.store.audit(`bot-message.outgoing-${input.operation}`, sourceBot, { requestId: input.requestId, hostId: host.id, ...(downgraded ? { delivery: "receiver_update_required" } : {}) });
+      if (downgraded && result && typeof result === "object") result = { ...result, delivery: { requested: "steer", actual: "fell_back_to_queue", reason: "receiver_update_required" } satisfies BotMessageDeliveryReceipt };
       return result;
     } catch (error) {
       await this.store.audit("bot-message.rejected", sourceBot, { stage: "source", requestId, reason: error instanceof HubError ? error.code : "invalid_request" }); throw error instanceof TargetResolutionError ? new HubError(error.message, 409) : error;
@@ -313,7 +336,7 @@ export class BotMessages {
           || p.source.hostId !== messageHostId(p.sourceKey) || !verify(null, Buffer.from(botPassportProof(p)), parsePublicKey(p.sourceKey), Buffer.from(signed.signature, "base64"))) throw new Error("signature");
       } catch { throw new HubError("bot_message_signature_invalid", 403); }
       const passport = signed.passport;
-      const allowedRoute = method === "POST" && (/^\/api\/bot-messages\/(conversations|resolve|send|wait|download)$/.test(path) || path === "/api/uploads" || /^\/api\/uploads\/[\w-]+\/complete$/.test(path))
+      const allowedRoute = method === "POST" && (/^\/api\/bot-messages\/(conversations|resolve|send|wait|download|capabilities)$/.test(path) || path === "/api/uploads" || /^\/api\/uploads\/[\w-]+\/complete$/.test(path))
         || method === "PUT" && /^\/api\/uploads\/[\w-]+\/\d+$/.test(path);
       if (!allowedRoute) throw new HubError("bot_message_operation_forbidden", 403);
       const bots = await this.store.db.serial(async () => {
@@ -355,6 +378,7 @@ export class BotMessages {
       const profile = await this.network.view(guard);
       const base = { hostId: messageHostId(this.auth.publicKey), hostName: profile.host.name, botId: bot.id, botName: bot.name };
       if (path === "/api/bot-messages/conversations" && method === "POST") { const result = { ...base, conversations: await conversations() }; await validate(); return result; }
+      if (path === "/api/bot-messages/capabilities" && method === "POST") { const result = botMessageCapabilitiesSchema.parse({ hostId: base.hostId, deliveries: ["queue", "steer"] }); await validate(); return result; }
       let conversation;
       if (p.conversation) {
         const requested = p.conversation;
@@ -418,10 +442,15 @@ export class BotMessages {
         if (method === "PUT" && upload[2] !== "complete") { await this.attachments.putChunk("owner", upload[1]!, Number(upload[2]), body, check); await receipt(); return { ok: true }; }
       }
       if (path === "/api/bot-messages/send" && method === "POST") {
-        const input = z.object({ text: textSchema, attachments: z.array(idSchema).max(50).default([]) }).strict().parse(data);
+        const { delivery, ...input } = botMessageSendSchema.parse(data);
         if (isBotControl(input.text)) throw new HubError("bot_message_control_forbidden", 400);
         const key = memoKey("incoming", p.sourceKey, p.source.botId, p.source.requestId);
         const content = hashSecret(networkCanonical({ bot: bot.id, conversation: target.conversationId, ...input }));
+        // Without `delivery` this stays the legacy path below, unless this
+        // request ID already asked to steer: its replay reports that outcome.
+        if (delivery || (await this.store.db.serial(() => this.memo<IncomingMemo>(key)))?.steer) {
+          return await this.deliver({ p, bot, target, input, delivery: delivery ?? "queue", key, content, clientMsgId: `bm_${hashSecret(key)}`, scope, attachmentGuard: id => attachmentGuard(id), guard, validate });
+        }
         const result = await this.store.sendMessage("owner", { ...input, conversationId: target.conversationId, clientMsgId: `bm_${hashSecret(key)}`, mentions: [bot.id], botSource: p.source, previewUrl: null }, async () => {
           await scope();
           const old = await this.memo<{ content: string }>(key);
@@ -440,23 +469,16 @@ export class BotMessages {
       }
       if (["/api/bot-messages/wait", "/api/bot-messages/download"].includes(path) && method === "POST") {
         const messageId = idSchema.parse(data.messageId);
-        const result = await this.store.db.serial(async () => {
+        const result = await this.store.db.serial(async (): Promise<WaitResult> => {
           await scope();
           const row = await this.store.db.get<{ bot_source_json: string; status: string }>("SELECT m.bot_source_json,d.status FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND m.conversation_id=? AND d.bot_id=?", [messageId, target.conversationId, bot.id]);
+          // A steered message has no delivery of its own: it reports the turn it joined.
+          if (!row) { const steered = await this.steeredWaitInTransaction(passport, bot.id, target, messageId); if (steered) return steered; }
           const origin = row?.bot_source_json ? botSourceSchema.parse(JSON.parse(row.bot_source_json)) : undefined;
           if (!row || !origin || origin.hostId !== passport.source.hostId || origin.botId !== passport.source.botId) throw new HubError("bot_message_reply_forbidden", 403);
-          const messages = await this.store.db.all<{ id: string; blocks_json: string; status: string }>("SELECT id,blocks_json,status FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND reply_to=? AND status!='deleted' ORDER BY created_at,id LIMIT 201", [target.conversationId, bot.id, messageId]);
-          const files = await this.store.db.all<{ id: string; name: string; size: number; mime: string; sha256: string }>(`SELECT DISTINCT a.id,a.name,a.size,a.mime,a.sha256 FROM attachments a JOIN message_attachments ma ON ma.attachment_id=a.id JOIN messages m ON m.id=ma.message_id WHERE m.reply_to=? AND m.author_type='bot' AND m.author_id=? AND m.conversation_id=? AND m.status!='deleted' AND a.complete=1`, [messageId, bot.id, target.conversationId]);
-          // An accepted delivery only ends the foreground turn. Bound background
-          // work keeps replying to the same input; its process cards always carry
-          // a complete envelope, so their run phase decides whether more may come.
-          const { active } = (await this.store.db.get<{ active: number }>(`SELECT COUNT(*) AS active FROM messages m WHERE m.reply_to=? AND m.author_type='bot' AND m.author_id=? AND m.conversation_id=? AND m.status!='deleted'
-            AND (m.status IN ('pending','streaming') OR EXISTS (SELECT 1 FROM json_each(m.blocks_json) b WHERE json_extract(b.value,'$.type')='card'
-              AND (json_extract(b.value,'$.extra.nativeRun.phase') IN (${activeRunPhaseParams}) OR json_extract(b.value,'$.extra.scopedRun.phase') IN (${activeRunPhaseParams}))))`,
-          [messageId, bot.id, target.conversationId, ...activeRunPhases, ...activeRunPhases]))!;
-          const replying = row.status === "accepted" && active > 0;
-          return { ...target, messageId, status: replying ? "pending" : row.status === "accepted" ? messages.some(m => m.status === "error") ? "failed" : "completed" : row.status === "failed" ? "failed" : row.status === "cancelled" ? "cancelled" : "pending",
-            ...(replying ? { activeReplies: active } : {}), text: messages.slice(0, 200).map(m => blocksText(JSON.parse(m.blocks_json) as Block[])).filter(Boolean).join("\n\n"), files, truncated: messages.length > 200 };
+          const reason = (await this.memo<IncomingMemo>(memoKey("incoming", passport.sourceKey, passport.source.botId, origin.requestId)))?.steer?.reason;
+          return { ...target, messageId, ...await this.replyStateInTransaction(bot.id, target.conversationId, messageId, row.status),
+            ...(reason ? { delivery: { requested: "steer" as const, actual: "fell_back_to_queue" as const, reason } } : {}) };
         });
         if (path.endsWith("/wait")) { await this.store.audit("bot-message.wait", p.source.botId, { messageId, sourceHost: p.source.hostId, status: result.status }); await validate(); return result; }
         const id = idSchema.parse(data.attachmentId), file = result.files.find(f => f.id === id);
@@ -471,5 +493,209 @@ export class BotMessages {
     } catch (error) {
       await this.store.audit("bot-message.rejected", p?.source.botId ?? null, { stage: "target", reason: error instanceof HubError ? error.code : "invalid_request" }); throw error instanceof TargetResolutionError ? new HubError(error.message, 409) : error;
     }
+  }
+
+  /** The replies to one input message, as `messages wait` reports them. */
+  private async replyStateInTransaction(botId: string, conversationId: string, inputId: string, deliveryStatus: string): Promise<ReplyState> {
+    const messages = await this.store.db.all<{ id: string; blocks_json: string; status: string }>("SELECT id,blocks_json,status FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND reply_to=? AND status!='deleted' ORDER BY created_at,id LIMIT 201", [conversationId, botId, inputId]);
+    const files = await this.store.db.all<{ id: string; name: string; size: number; mime: string; sha256: string }>(`SELECT DISTINCT a.id,a.name,a.size,a.mime,a.sha256 FROM attachments a JOIN message_attachments ma ON ma.attachment_id=a.id JOIN messages m ON m.id=ma.message_id WHERE m.reply_to=? AND m.author_type='bot' AND m.author_id=? AND m.conversation_id=? AND m.status!='deleted' AND a.complete=1`, [inputId, botId, conversationId]);
+    // An accepted delivery only ends the foreground turn. Bound background
+    // work keeps replying to the same input; its process cards always carry
+    // a complete envelope, so their run phase decides whether more may come.
+    const { active } = (await this.store.db.get<{ active: number }>(`SELECT COUNT(*) AS active FROM messages m WHERE m.reply_to=? AND m.author_type='bot' AND m.author_id=? AND m.conversation_id=? AND m.status!='deleted'
+      AND (m.status IN ('pending','streaming') OR EXISTS (SELECT 1 FROM json_each(m.blocks_json) b WHERE json_extract(b.value,'$.type')='card'
+        AND (json_extract(b.value,'$.extra.nativeRun.phase') IN (${activeRunPhaseParams}) OR json_extract(b.value,'$.extra.scopedRun.phase') IN (${activeRunPhaseParams}))))`,
+    [inputId, botId, conversationId, ...activeRunPhases, ...activeRunPhases]))!;
+    const replying = deliveryStatus === "accepted" && active > 0;
+    return { status: replying ? "pending" : deliveryStatus === "accepted" ? messages.some(m => m.status === "error") ? "failed" : "completed" : deliveryStatus === "failed" ? "failed" : deliveryStatus === "cancelled" ? "cancelled" : "pending",
+      ...(replying ? { activeReplies: active } : {}), text: messages.slice(0, 200).map(m => blocksText(JSON.parse(m.blocks_json) as Block[])).filter(Boolean).join("\n\n"), files, truncated: messages.length > 200 };
+  }
+  /** What actually happened to a request that asked to steer. The record's
+   * steering block is authoritative; the memo carries the turn and reason. */
+  private deliveryOf(blocks: Block[], memo: IncomingMemo | undefined): BotMessageDeliveryReceipt {
+    const control = blocks.find(block => block.type === "steering"), turn = memo?.steer?.turn ? { turn: { messageId: memo.steer.turn } } : {};
+    if (!control) return memo?.steer?.reason ? { requested: "steer", actual: "fell_back_to_queue", reason: memo.steer.reason } : { requested: "steer", actual: "queued" };
+    if (control.outcome === "pending") return { requested: "steer", actual: "pending", ...turn };
+    return { requested: "steer", actual: control.outcome === "accepted" ? "steered" : "steer_uncertain", ...turn, ...(control.application?.status === "dropped" ? { dropped: control.application.reason } : {}) };
+  }
+  /** Caller holds the DB queue. Undefined unless `messageId` is this sender's steer record for `botId`. */
+  private async steeredWaitInTransaction(p: BotPassport, botId: string, target: BotMessageTarget, messageId: string): Promise<WaitResult | undefined> {
+    const row = await this.store.db.get<{ bot_source_json: string | null; blocks_json: string }>("SELECT bot_source_json,blocks_json FROM messages WHERE id=? AND conversation_id=? AND author_type='user' AND status!='deleted'", [messageId, target.conversationId]);
+    const origin = row?.bot_source_json ? botSourceSchema.parse(JSON.parse(row.bot_source_json)) : undefined;
+    if (!row || !origin || origin.hostId !== p.source.hostId || origin.botId !== p.source.botId) return undefined;
+    const blocks = JSON.parse(row.blocks_json) as Block[];
+    if (!blocks.some(block => block.type === "steering" && block.botId === botId)) return undefined;
+    const memo = await this.memo<IncomingMemo>(memoKey("incoming", p.sourceKey, p.source.botId, origin.requestId));
+    const delivery = this.deliveryOf(blocks, memo), turn = memo?.steer?.turn, empty = { text: "", files: [], truncated: false };
+    if (delivery.actual === "pending") return { ...target, messageId, status: "pending", ...empty, delivery };
+    // The joined turn, re-checked: only a turn this same sender started is readable.
+    const turnRow = turn ? await this.store.db.get<{ bot_source_json: string | null; status: string }>("SELECT m.bot_source_json,d.status FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND m.conversation_id=? AND d.bot_id=?", [turn, target.conversationId, botId]) : undefined;
+    const turnOrigin = turnRow?.bot_source_json ? botSourceSchema.parse(JSON.parse(turnRow.bot_source_json)) : undefined;
+    if (!turn || !turnRow || turnOrigin?.hostId !== p.source.hostId || turnOrigin.botId !== p.source.botId) return { ...target, messageId, status: "uncertain", ...empty, delivery };
+    const state = await this.replyStateInTransaction(botId, target.conversationId, turn, turnRow.status);
+    // Merged text the engine dropped will not be acted on: no need to wait for the turn.
+    return { ...target, messageId, ...state, ...(delivery.dropped ? { status: "failed" } : {}), delivery, reply: { kind: "merged_turn" as const, turnMessageId: turn } };
+  }
+  /** New input admission shared by queued and steered deliveries (the legacy path keeps its own copy). */
+  private async admitNewInTransaction(c: DeliveryContext): Promise<void> {
+    if (this.workerCapable(c.bot.id) === false) throw new HubError("bot_message_worker_update_required", 409);
+    const rateKey = memoKey("rate", c.p.sourceKey, c.p.source.botId);
+    const times = (await this.memo<number[]>(rateKey) ?? []).filter(t => t > Date.now() - 60_000);
+    if (times.length >= 10) throw new HubError("bot_message_rate_limit", 429);
+    await this.put(rateKey, [...times, Date.now()]);
+  }
+  private auditSendInTransaction(c: DeliveryContext, duplicate: boolean, extra: Record<string, string>) {
+    return this.store.db.run("INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)", [Date.now(), c.p.source.botId, "bot-message.send", JSON.stringify({ ...c.target, requestId: c.p.source.requestId, duplicate, sourceHost: c.p.source.hostId, hops: c.p.source.hops, delivery: c.delivery, ...extra })]);
+  }
+  private receipt(c: DeliveryContext, message: Message, duplicate: boolean, delivery: BotMessageDeliveryReceipt) {
+    return { ...c.target, requestId: c.p.source.requestId, messageId: message.id, duplicate,
+      status: delivery.actual === "steered" ? "steered" : delivery.actual === "steer_uncertain" ? "uncertain" : delivery.actual === "pending" ? "pending" : "queued", delivery };
+  }
+  /** One ordinary queued Bot message; with `reason` it records why a steer request was queued. */
+  private async queueDelivery(c: DeliveryContext, reason?: BotSteerFallbackReason): Promise<unknown> {
+    const input = { ...c.input, conversationId: c.target.conversationId, clientMsgId: c.clientMsgId, mentions: [c.bot.id], botSource: c.p.source, previewUrl: null };
+    const admit = async () => {
+      await c.scope();
+      const old = await this.memo<IncomingMemo>(c.key);
+      if (old && old.content !== c.content) throw new HubError("bot_message_request_conflict", 409);
+      for (const id of c.input.attachments) await c.attachmentGuard(id);
+      if (!old) { await this.admitNewInTransaction(c); await this.put(c.key, { content: c.content, at: Date.now(), ...(reason ? { steer: { reason } } : {}) } satisfies IncomingMemo); }
+      await this.auditSendInTransaction(c, !!old, reason ? { fallback: reason } : {});
+    };
+    const result = reason ? await this.store.sendMessageWithNotice("owner", input, steerFallbackNotice(c.bot.id, reason), admit) : await this.store.sendMessage("owner", input, admit);
+    const stored = (await this.store.db.serial(() => this.memo<IncomingMemo>(c.key)))?.steer?.reason;
+    await c.validate();
+    return this.receipt(c, result.message, result.duplicate, stored ? { requested: c.delivery, actual: "fell_back_to_queue", reason: stored } : { requested: c.delivery, actual: "queued" });
+  }
+  /** Every Host-side condition for merging into a live turn; any miss queues. */
+  private async steerPlan(c: DeliveryContext): Promise<{ reason: BotSteerFallbackReason } | { targetId: string; turn: string }> {
+    if (c.input.attachments.length) return { reason: "attachments_unsupported" };
+    const conversationId = c.target.conversationId;
+    const hub = await this.store.db.serial(async (): Promise<BotSteerFallbackReason | undefined> => {
+      await c.guard();
+      if (await this.memo(steeringDisabledKey(c.bot.id))) return "steering_disabled";
+      const bot = await this.store.db.get<{ engine: string }>("SELECT engine FROM bots WHERE id=?", [c.bot.id]);
+      if (!bot || !supportsBotMessageSteerEngine(bot.engine)) return "unsupported_engine";
+      const conversation = await this.store.db.get<{ type: string; parent_id: string | null; ticket_json: string | null }>("SELECT type,parent_id,ticket_json FROM conversations WHERE id=?", [conversationId]);
+      const members = await this.store.db.get<{ count: number }>("SELECT COUNT(*) AS count FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [conversationId]);
+      if (conversation?.type !== "direct" || conversation.parent_id || conversation.ticket_json || members?.count !== 1) return "unsupported_conversation";
+      const times = (await this.memo<number[]>(memoKey("steer-rate", c.p.sourceKey, c.p.source.botId, c.bot.id)) ?? []).filter(t => t > Date.now() - STEER_EDGE_WINDOW_MS);
+      if (times.length >= STEER_EDGE_LIMIT) return "steer_rate_limited";
+    });
+    if (hub) return { reason: hub };
+    const capable = this.steering.capable(c.bot.id);
+    if (capable === undefined) return { reason: "bot_offline" };
+    if (!capable) return { reason: "worker_update_required" };
+    // Read-only: a failed status lookup cannot have injected anything.
+    let status;
+    try { status = botSteerStatusSchema.parse(await this.steering.status(c.bot.id, conversationId)); } catch { return { reason: "status_unavailable" }; }
+    if (!status.supported) return { reason: status.reason === "no_active_turn" ? "no_active_turn" : "unsupported_engine" };
+    if (status.reason === "background_review") return { reason: "background_review" };
+    if (!status.targetId || !status.sourceMessageId) return { reason: "no_active_turn" };
+    const { targetId, sourceMessageId: turn } = status;
+    const turnReason = await this.store.db.serial(async (): Promise<BotSteerFallbackReason | undefined> => {
+      await c.guard();
+      const row = await this.store.db.get<{ bot_source_json: string | null; status: string; dispatched: number }>("SELECT m.bot_source_json,d.status,d.dispatched FROM messages m JOIN deliveries d ON d.message_id=m.id AND d.bot_id=? WHERE m.id=? AND m.conversation_id=?", [c.bot.id, turn, conversationId]);
+      const origin = row?.bot_source_json ? botSourceSchema.parse(JSON.parse(row.bot_source_json)) : undefined;
+      if (!row || origin?.hostId !== c.p.source.hostId || origin.botId !== c.p.source.botId) return "turn_not_from_sender";
+      if (row.status !== "pending" || !row.dispatched) return "turn_ended";
+      // An open approval or question owns this turn's next input; a Bot cannot answer it.
+      for (const reply of await this.store.db.all<{ blocks_json: string }>("SELECT blocks_json FROM messages WHERE conversation_id=? AND reply_to=? AND author_type='bot' AND author_id=? AND status!='deleted' AND instr(blocks_json,'\"actionId\"')>0", [conversationId, turn, c.bot.id])) {
+        let blocks: unknown; try { blocks = JSON.parse(reply.blocks_json); } catch { continue; }
+        if (hasPendingCardAction(blocks)) return "pending_card";
+      }
+      if ((await this.memo<number>(memoKey("steer-turn", c.bot.id, targetId)) ?? 0) >= STEER_TURN_LIMIT) return "turn_steer_limit";
+    });
+    return turnReason ? { reason: turnReason } : { targetId, turn };
+  }
+  /** A request that named a delivery (or replays one that asked to steer). */
+  private async deliver(c: DeliveryContext): Promise<unknown> {
+    const prior = await this.store.db.serial(async () => { await c.scope(); return this.memo<IncomingMemo>(c.key); });
+    if (prior && prior.content !== c.content) throw new HubError("bot_message_request_conflict", 409);
+    if (prior?.steer) {
+      const row = await this.store.db.serial(() => this.store.db.get<{ id: string; blocks_json: string }>("SELECT id,blocks_json FROM messages WHERE author_id='owner' AND client_msg_id=?", [c.clientMsgId]));
+      if (row) { await c.validate(); return this.receipt(c, { id: row.id } as Message, true, this.deliveryOf(JSON.parse(row.blocks_json) as Block[], prior)); }
+    }
+    // An existing plain record replays through the ordinary queue path.
+    if (c.delivery === "queue" || prior) return this.queueDelivery(c);
+    const plan = await this.steerPlan(c);
+    if ("reason" in plan) return this.queueDelivery(c, plan.reason);
+    let created: { message: Message; created: boolean };
+    try {
+      created = await this.store.beginBotSteer("owner", { conversationId: c.target.conversationId, botId: c.bot.id, clientMsgId: c.clientMsgId, text: c.input.text, botSource: c.p.source, targetId: plan.targetId }, async () => {
+        await c.scope();
+        if (await this.memo(c.key)) throw new HubError("bot_message_request_conflict", 409);
+        await this.admitNewInTransaction(c);
+        const turnKey = memoKey("steer-turn", c.bot.id, plan.targetId), edgeKey = memoKey("steer-rate", c.p.sourceKey, c.p.source.botId, c.bot.id);
+        const count = await this.memo<number>(turnKey) ?? 0, times = (await this.memo<number[]>(edgeKey) ?? []).filter(t => t > Date.now() - STEER_EDGE_WINDOW_MS);
+        if (count >= STEER_TURN_LIMIT) throw new SteerLimitReached("turn_steer_limit");
+        if (times.length >= STEER_EDGE_LIMIT) throw new SteerLimitReached("steer_rate_limited");
+        await this.put(turnKey, count + 1); await this.put(edgeKey, [...times, Date.now()]);
+        await this.put(c.key, { content: c.content, at: Date.now(), steer: { turn: plan.turn, targetId: plan.targetId } } satisfies IncomingMemo);
+        await this.auditSendInTransaction(c, false, {});
+      });
+    } catch (error) { if (error instanceof SteerLimitReached) return this.queueDelivery(c, error.reason); throw error; }
+    if (!created.created) return this.deliver(c);
+    // The Gateway journals this call at most once. Only its explicit refusal
+    // proves nothing reached the engine; anything else stays uncertain.
+    let result: SteerResult;
+    try { result = steerResultSchema.parse(await this.steering.steer(c.bot.id, { conversationId: c.target.conversationId, userId: "owner", requestId: c.clientMsgId, targetId: plan.targetId, sourceMessageId: plan.turn, text: c.input.text, source: c.p.source })); }
+    catch { result = { outcome: "unknown", reason: "uncertain" }; }
+    let message: Message;
+    if (result.outcome === "rejected") {
+      const reason = botSteerRejectionReason(result.reason);
+      message = (await this.store.fallBackBotSteer(created.message.id, c.bot.id, steerFallbackNotice(c.bot.id, reason), async () => {
+        const memo = await this.memo<IncomingMemo>(c.key);
+        await this.put(c.key, { ...memo!, steer: { ...memo!.steer, reason } } satisfies IncomingMemo);
+      })).message;
+    } else {
+      const { sourceMessageId: _run, ...outcome } = result;
+      message = await this.store.finishSteering(created.message.id, outcome);
+    }
+    const memo = await this.store.db.serial(() => this.memo<IncomingMemo>(c.key));
+    const delivery = this.deliveryOf(message.blocks, memo);
+    await this.store.audit("bot-message.steer", c.p.source.botId, { conversationId: c.target.conversationId, messageId: message.id, requestId: c.p.source.requestId, sourceHost: c.p.source.hostId, sourceBot: c.p.source.botId,
+      outcome: delivery.actual, turn: plan.turn, ...(delivery.reason ? { reason: delivery.reason } : {}) });
+    await c.validate();
+    return this.receipt(c, message, false, delivery);
+  }
+  /** Signed probe of a remote receiving Host. Only an explicit refusal of the
+   * unknown route (an older Host) means queue; other failures stop the send. */
+  private async peerSteers(host: NetworkHost, source: BotSource, targetBot: string, admit: Guard): Promise<boolean> {
+    const body = Buffer.from("{}");
+    const passport: BotPassport = { v: 1, sourceKey: this.auth.publicKey, targetKey: host.publicKey, source, targetBot, method: "POST", path: "/api/bot-messages/capabilities", digest: digest(body), expiresAt: Date.now() + BOT_PASSPORT_TTL_MS, nonce: randomUUID() };
+    await this.store.db.serial(admit);
+    try {
+      const reply = botMessageCapabilitiesSchema.parse(await this.exchange(host, { passport, signature: this.auth.signBotPassport(passport) }, body));
+      if (reply.hostId !== messageHostId(host.publicKey)) throw new HubError("bot_message_reply_target_mismatch", 502);
+      return reply.deliveries.includes("steer");
+    } catch (error) {
+      if (error instanceof HubError && error.code === "bot_message_operation_forbidden") return false;
+      throw error;
+    }
+  }
+  /** Caller holds the DB queue. Internal dispatch workers are not listed. */
+  private async steeringInTransaction(botId: string): Promise<BotMessageSteeringSnapshot> {
+    const bot = await this.store.db.get<{ engine: string }>("SELECT engine FROM bots WHERE id=? AND deleted_at IS NULL AND role!='worker'", [botId]);
+    if (!bot) throw new HubError("bot_not_found", 404);
+    return { botId, allowed: !await this.memo(steeringDisabledKey(botId)), supported: supportsBotMessageSteerEngine(bot.engine) };
+  }
+  /** Receiving owner's switch "allow other Bots to steer this Bot" (default on). */
+  async readSteering(userId: string, botId: string, guard: Guard): Promise<BotMessageSteeringSnapshot> {
+    return this.store.db.serial(async () => { await guard(); await this.store.requireOwner(userId); return this.steeringInTransaction(idSchema.parse(botId)); });
+  }
+  /** Owner + one-use device proof (`admit`), like Bot-message grants. Bot
+   * instance authorization never reaches this. */
+  async setSteering(userId: string, raw: unknown, guard: Guard, admit: Guard, actor: string): Promise<BotMessageSteeringSnapshot> {
+    const command = botMessageSteeringCommandSchema.parse(raw);
+    return this.store.db.transaction(async () => {
+      await guard(); await this.store.requireOwner(userId);
+      const before = await this.steeringInTransaction(command.botId);
+      await admit();
+      if (command.allowed) await this.store.db.run("DELETE FROM meta WHERE key=?", [steeringDisabledKey(command.botId)]);
+      else await this.put(steeringDisabledKey(command.botId), true);
+      await this.store.db.run("INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)", [Date.now(), actor, "bot-message.steering-updated", JSON.stringify({ botId: command.botId, allowed: command.allowed, previous: before.allowed })]);
+      return this.steeringInTransaction(command.botId);
+    });
   }
 }

@@ -607,6 +607,61 @@ export class HubStore {
     if (result.event) this.emit(result.event);
     return { message: result.message, created: result.created };
   }
+  /** A signed Bot message about to be merged into a live turn (issue #62).
+   * Transcript-only like an owner steering record: it never gets a delivery
+   * unless the engine refuses it before admission (fallBackBotSteer). A replay
+   * returns the existing record; `validate` runs only when creating one. */
+  async beginBotSteer(userId: string, input: { conversationId: string; botId: string; clientMsgId: string; text: string; botSource: NonNullable<Message["botSource"]>; targetId: string }, validate: () => Promise<unknown>): Promise<{ message: Message; created: boolean }> {
+    const result = await this.db.transaction(async () => {
+      const old = await this.db.get<MessageRow>("SELECT * FROM messages WHERE author_id=? AND client_msg_id=?", [userId, input.clientMsgId]);
+      if (old) return { message: this.decodeMessage(old), created: false };
+      await validate();
+      await this.requireMember(userId, input.conversationId);
+      await this.requireBot(input.botId, input.conversationId);
+      await this.requireHistoryUnfencedInTransaction(input.conversationId);
+      const conv = await this.conversationRow(input.conversationId);
+      if (conv.archived || conv.parentId && (await this.conversationRow(conv.parentId)).archived) throw new HubError("conversation_archived", 409);
+      const message: Message = { botSource: input.botSource, id: newId("msg"), conversationId: conv.id, authorId: userId, authorType: "user", clientMsgId: input.clientMsgId, mentions: [input.botId],
+        status: "complete", version: 1, createdAt: Date.now(), blocks: [{ type: "text", text: input.text }, { type: "steering", botId: input.botId, targetId: input.targetId, outcome: "pending" }] };
+      await this.saveMessage(message);
+      return { message, created: true, event: await this.append(conv.id, "message.created", message) };
+    });
+    if (result.event) this.emit(result.event);
+    return { message: result.message, created: result.created };
+  }
+  /** The engine refused a Bot steer before admission: in one transaction the
+   * same record loses its steering block, gains the Host notice and becomes one
+   * ordinary queued Bot message. Any other outcome (accepted, or uncertain
+   * after a Hub restart) is left untouched, so nothing is ever queued twice.
+   * Archiving does not stop an input the Host had already accepted; a history
+   * fence holds it like any pending delivery (claim skips fenced chats). */
+  async fallBackBotSteer(messageId: string, botId: string, notice: Block, validate?: () => Promise<unknown>): Promise<{ message: Message; changed: boolean }> {
+    const result = await this.db.transaction(async () => {
+      const row = await this.db.get<MessageRow>("SELECT * FROM messages WHERE id=?", [messageId]);
+      if (!row) throw new HubError("message_not_found", 404);
+      const old = this.decodeMessage(row), control = old.blocks.find(block => block.type === "steering");
+      if (!old.botSource || control?.botId !== botId || control.outcome !== "pending" || await this.db.get("SELECT 1 FROM deliveries WHERE message_id=?", [messageId])) return { message: old, changed: false, events: [] as HubEvent[] };
+      await validate?.();
+      await this.requireBot(botId, old.conversationId);
+      const message: Message = { ...old, version: old.version + 1, blocks: [...old.blocks.filter(block => block.type !== "steering"), notice] };
+      await this.db.run("INSERT INTO deliveries(message_id,bot_id,queue_position) SELECT ?,?,COALESCE(MAX(queue_position),0)+1 FROM deliveries WHERE bot_id=?", [message.id, botId, botId]);
+      return { message, changed: true, events: [await this.updateQueuedMessageInTransaction(message), await this.queueEventInTransaction(message.conversationId, botId)] };
+    });
+    this.emitCommitted(result.events);
+    return { message: result.message, changed: result.changed };
+  }
+  /** sendMessage plus a Host-authored notice block on a newly created record. */
+  async sendMessageWithNotice(userId: string, input: SendMessageInput, notice: Block, validate?: TransactionGuard): Promise<{ message: Message; duplicate: boolean }> {
+    const result = await this.db.transaction(async () => {
+      await validate?.();
+      const sent = await this.sendMessageInTransaction(userId, input);
+      if (sent.duplicate) return { message: sent.message, duplicate: true, events: [] as HubEvent[] };
+      const message: Message = { ...sent.message, version: sent.message.version + 1, blocks: [...sent.message.blocks, notice] };
+      return { message, duplicate: false, events: [sent.event!, await this.updateQueuedMessageInTransaction(message)] };
+    });
+    this.emitCommitted(result.events);
+    return { message: result.message, duplicate: result.duplicate };
+  }
   /** A Bot reported that a user input may have reached the live run of
    * `sourceMessageId`. Kept on that source row: a keyed, bounded lookup that
    * survives reconnects. Overflow is remembered so lookups fail closed. */

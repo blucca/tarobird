@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { idSchema, textSchema } from "./index.js";
+import { networkCanonical } from "./private-network.js";
 
 /** Gateway capability (issue #62): this worker can merge a signed Bot message
  * into the live turn of the same conversation. Advertised only by Codex and
@@ -51,3 +52,15 @@ export type BotMessageDeliveryReceipt = z.infer<typeof botMessageDeliveryReceipt
  * older Host refuses the unknown route before any write; the sender then
  * queues and reports `receiver_update_required`. */
 export const botMessageCapabilitiesSchema = z.object({ hostId: idSchema, deliveries: z.array(botMessageDeliverySchema).min(1).max(8) }).strict();
+
+/** Receiving owner's switch "allow other Bots to steer this Bot" (default on).
+ * Changed only with the owner's one-use device proof (operation
+ * `bot-message-grant`, the same control right as message grants). */
+export const botMessageSteeringCommandSchema = z.object({ botId: idSchema, allowed: z.boolean() }).strict();
+export type BotMessageSteeringCommand = z.infer<typeof botMessageSteeringCommandSchema>;
+/** `supported` is false for engines that never steer; Apps hide the switch then. */
+export const botMessageSteeringSnapshotSchema = z.object({ botId: idSchema, allowed: z.boolean(), supported: z.boolean() }).strict();
+export type BotMessageSteeringSnapshot = z.infer<typeof botMessageSteeringSnapshotSchema>;
+/** Signed device-action target bytes (SHA-256 hex on both sides). The scope
+ * keeps a grant-edit proof from ever matching a steering change. */
+export const botMessageSteeringProofPayload = (command: BotMessageSteeringCommand): string => networkCanonical({ scope: "bot-message-steering", botId: command.botId, allowed: command.allowed });

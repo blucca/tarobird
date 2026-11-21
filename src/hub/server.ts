@@ -35,6 +35,8 @@ import { acquireHostIdentityAdmission, acquireExistingHostIdentityAdmission, Hos
 import { chromePatchSchema, chromeResultSchema } from "../client-protocol/chrome.js";
 import { networkCanonical } from "../client-protocol/private-network.js";
 import { BotMessages } from "./bot-messages.js";
+import { botMessageSteeringProofTarget } from "./bot-message-steering.js";
+import { BOT_MESSAGE_STEER_CAPABILITY, botMessageSteeringCommandSchema } from "../client-protocol/bot-message-delivery.js";
 import { HubAgentBuses } from "./agent-bus.js";
 import { HubGroupDiscussions } from "./group-discussions.js";
 import { GROUP_DISCUSSION_WORKER_CAPABILITY, GROUP_PARALLEL_CAPABILITY } from "../client-protocol/group-discussion.js";
@@ -147,7 +149,7 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
   const { workbench, ...rest } = metadata, { openTarget: _opener, ...context } = workbench;
   return (workbenchOpenerOnly(workbench) ? rest : { ...rest, workbench: context }) as T;
 }
-type BotConnection = { engineQuota: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
+type BotConnection = { botSteer: boolean; engineQuota: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
 export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
@@ -355,7 +357,12 @@ export class HubServer {
     };
     this.botMessages = new BotMessages(store, auth, this.network, attachments, undefined,
       botId => { const connection = this.bots.get(botId); return connection?.ready ? connection.botMessages : undefined; },
-      (userId, conversation) => conversationsCreated(userId, [conversation]));
+      (userId, conversation) => conversationsCreated(userId, [conversation]),
+      // Issue #62: read the live run and merge into it. Both are Gateway RPCs;
+      // a lost reply is uncertain and is never retried here.
+      { capable: botId => { const connection = this.bots.get(botId); return connection?.ready ? connection.botSteer : undefined; },
+        status: (botId, conversationId) => this.callBot(botId, "botMessage.steer.status", { conversationId }),
+        steer: (botId, call) => this.callBot(botId, "botMessage.steer", call) });
     this.dispatch = new HubDispatch(store, {
       source: () => this.botMessages.ownSource(),
       conversationCreated: (userId, conversation) => conversationsCreated(userId, [conversation]),
@@ -1268,7 +1275,7 @@ export class HubServer {
           botId = frame.botId; if (frame.capabilities?.includes(FRAGMENT_CAPABILITY)) this.fragmentSockets.add(ws); clearTimeout(timeout); this.bots.get(botId)?.ws.close(4000, "replaced");
           const queueAdvertised = frame.capabilities?.includes(PROMPT_QUEUE_CAPABILITY) ?? false;
           const queueCapable = queueAdvertised && supportsPromptQueueEngine(frame.engine);
-          const connection: BotConnection = { engineQuota: frame.capabilities?.includes(ENGINE_QUOTA_CAPABILITY) ?? false, history: frame.capabilities?.includes(CONVERSATION_HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
+          const connection: BotConnection = { botSteer: frame.capabilities?.includes(BOT_MESSAGE_STEER_CAPABILITY) ?? false, engineQuota: frame.capabilities?.includes(ENGINE_QUOTA_CAPABILITY) ?? false, history: frame.capabilities?.includes(CONVERSATION_HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
           // Reserve socket ownership before awaiting SQLite. Concurrent hellos
           // must replace this exact socket, not both replace its predecessor.
           this.bots.set(botId, connection);
@@ -1744,6 +1751,19 @@ export class HubServer {
           const input = z.object({ command: z.record(z.string(), z.unknown()), proof: deviceActionProofSchema }).strict().parse(await this.jsonBody(req));
           await reply(200, await this.botMessages.updateCrossHostGrants(userId, session.deviceId, input.command, validateInQueue,
             () => this.auth.consumeBotMessageGrant(session, hashSecret(networkCanonical(input.command)), input.proof)));
+        }
+        return;
+      }
+      // Receiving owner's switch: may other Bots steer this Bot (issue #62).
+      // Owner session + one-use device proof, like grants; Bot instance
+      // authorization has no route here.
+      if (route === "/api/bot-messages/steering" && (req.method === "GET" || req.method === "POST")) {
+        await requireOwner();
+        if (req.method === "GET") await reply(200, await this.botMessages.readSteering(userId, idSchema.parse(url.searchParams.get("botId")), validateInQueue));
+        else {
+          const input = z.object({ command: botMessageSteeringCommandSchema, proof: deviceActionProofSchema }).strict().parse(await this.jsonBody(req));
+          await reply(200, await this.botMessages.setSteering(userId, input.command, validateInQueue,
+            () => this.auth.consumeBotMessageGrant(session, botMessageSteeringProofTarget(input.command), input.proof), session.deviceId));
         }
         return;
       }

@@ -265,7 +265,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   });
   channel.on("cardAction", async (event) => { await handleCoreCardAction({ channel, bridge, runtime, stateDir: options.stateDir, instanceName: options.botId, event, createRunCard: createCoreRunCardController }); });
   channel.on("error", () => options.onWarning?.("gateway_dispatch_failed"));
-  const steering = gatewaySteering(bridge, runtime, channel, options.stateDir);
+  const steering = gatewaySteering(bridge, runtime, channel, options.stateDir, options.engine);
   const engineTasks = gatewayEngineTasks(bridge, channel, options.stateDir);
   const piSession = gatewayPiSession(bridge, channel, options.stateDir, options.botId);
   const history = gatewayConversationHistory(bridge, channel, runtime, options.stateDir, options.botId, () => (sideSessions?.activeCount() ?? 0) > 0);
@@ -301,7 +301,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       if (method === "model.get") z.object({}).strict().parse(raw);
       return z.json().parse(await modelSettings(options.stateDir, options.engine as InstanceEngine, activeWorkCount, method === "model.set" ? raw : undefined));
     }
-    if (method === "steer" || method === "steer.status" || method === "input.control") return z.json().parse(await steering(method, raw));
+    if (method === "steer" || method === "steer.status" || method === "input.control" || method === "botMessage.steer" || method === "botMessage.steer.status") return z.json().parse(await steering(method, raw));
     if (method === "agentBus.stop") {
       const { runId, messageId, onlyIfProcessing } = z.object({ runId: idSchema, messageId: idSchema, onlyIfProcessing: z.boolean().optional() }).strict().parse(raw);
       if (onlyIfProcessing && !channel.isProcessingAgentBus(runId, messageId)) return { ok: true, live: false };
