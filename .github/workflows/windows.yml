@@ -30,6 +30,7 @@ jobs:
         with:
           sparse-checkout: |
             client/scripts/acceptance-probe
+            client/scripts/windows-acceptance.mjs
             client/windows-electron
       - name: Build the NSIS fixture with the product's utils.nsh (no TaroBird build)
         shell: pwsh
@@ -47,3 +48,14 @@ jobs:
           $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File client/scripts/acceptance-probe/aumid-start-apps-probe.ps1 -PollSeconds 30 -NsisFixture "$env:RUNNER_TEMP\aumid-fixture.exe" 2>&1 | Out-String
           Write-Output $out
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Start Menu AppID probe', '```', $out.Trim(), '```')
+      - uses: actions/setup-node@v4
+        if: ${{ !cancelled() }}
+        with:
+          node-version: 24
+      - name: "Same chain as the acceptance step: pwsh -> node -> windowsSystem().powershell"
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $out = node client/scripts/acceptance-probe/aumid-acceptance-context.mjs com.tarobot.aumidprobe.lpwstr com.tarobot.aumidprobe.bstrproduct com.tarobot.aumidprobe.nsis 2>&1 | Out-String
+          Write-Output $out
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Acceptance-chain query', '```', $out.Trim(), '```')
