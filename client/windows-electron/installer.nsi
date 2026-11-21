@@ -743,6 +743,8 @@ Section Install
 SectionEnd
 
 Function .onInstSuccess
+  ; TaroBot: a /P run leaves the saved language as it found it (installer-language.nsh).
+  !insertmacro BirdKeepSavedLanguage
   ; TaroBot: local setup note of the finished run (installer-notes.nsh).
   !insertmacro BirdNoteDone
   ; Check for `/R` flag only in silent and passive installers because
