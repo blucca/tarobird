@@ -642,6 +642,70 @@ describe("R15: scope decided by the lead", () => {
   });
 });
 
+describe("R17: requirements pinned so that breaking them fails", () => {
+  /** Hold every status call until `count` have arrived, so concurrent requests all pass planning first. */
+  const barrier = (count: number) => {
+    const original = fake.status.getMockImplementation()!;
+    let arrived = 0, open!: () => void; const gate = new Promise<void>(resolve => { open = resolve; });
+    fake.status.mockImplementation(async (bot: string, conversationId: string) => { if (++arrived >= count) open(); await gate; return original(bot, conversationId); });
+  };
+  it("holds the per-turn limit inside the creating transaction under concurrency", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    for (let i = 0; i < 2; i++) await send(chat.conversationId, `Earlier ${i}`, { delivery: "steer" });
+    barrier(2);
+    const results = await Promise.all([send(chat.conversationId, "Race A", { delivery: "steer" }), send(chat.conversationId, "Race B", { delivery: "steer" })]);
+    expect(results.map(result => result.delivery.actual).sort()).toEqual(["fell_back_to_queue", "steered"]);
+    expect(results.find(result => result.delivery.actual === "fell_back_to_queue")!.delivery.reason).toBe("turn_steer_limit");
+  });
+  it("holds the per-edge limit inside the creating transaction under concurrency", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const edge = `bot-messages:steer-rate:${hashSecret(JSON.stringify([a.auth.publicKey, "source", "target"]))}`, now = Date.now();
+    await b.store.db.run("INSERT INTO meta(key,value) VALUES(?,?)", [edge, JSON.stringify([now, now, now, now, now])]);
+    barrier(2);
+    const results = await Promise.all([send(chat.conversationId, "Edge A", { delivery: "steer" }), send(chat.conversationId, "Edge B", { delivery: "steer" })]);
+    expect(results.map(result => result.delivery.actual).sort()).toEqual(["fell_back_to_queue", "steered"]);
+    expect(results.find(result => result.delivery.actual === "fell_back_to_queue")!.delivery.reason).toBe("steer_rate_limited");
+  });
+  it("reports failed when the engine dropped the merged text, even if the turn itself completed", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    const receipt = await send(chat.conversationId, "Fix", { delivery: "steer" });
+    await b.store.applySteeringOutcome("target", { conversationId: chat.conversationId, userId: "owner", requestId: (await b.store.messageForUser("owner", receipt.messageId)).clientMsgId, targetId: run.targetId, application: { status: "dropped", reason: "turn_failed" } });
+    await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: run.sourceMessageId, blocks: [{ type: "text", text: "All good" }] });
+    await b.store.acknowledgeDelivery("target", run.sourceMessageId);
+    expect(await wait(chat.conversationId, receipt.messageId)).toMatchObject({ status: "failed", delivery: { actual: "steered", dropped: "turn_failed" } });
+  });
+  it("never turns an accepted record into a queued one", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const receipt = await send(chat.conversationId, "Accepted", { delivery: "steer" });
+    const { changed } = await b.store.fallBackBotSteer(receipt.messageId, "target", { type: "card", elements: [] });
+    expect(changed).toBe(false);
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+    expect((await blocks(receipt.messageId)).find(block => block.type === "steering")).toMatchObject({ outcome: "accepted" });
+  });
+  it("plans a steer only into a turn whose input is still pending and already dispatched", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    await b.store.db.run("UPDATE deliveries SET dispatched=0 WHERE message_id=?", [run.sourceMessageId]);
+    expect((await send(chat.conversationId, "Not started", { delivery: "steer" })).delivery).toMatchObject({ actual: "fell_back_to_queue", reason: "turn_ended" });
+    await b.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [run.sourceMessageId]);
+    await b.store.acknowledgeDelivery("target", run.sourceMessageId);
+    expect((await send(chat.conversationId, "Finished", { delivery: "steer" })).delivery).toMatchObject({ actual: "fell_back_to_queue", reason: "turn_ended" });
+    expect(fake.steer).not.toHaveBeenCalled();
+  });
+  it("downgrades only on the receiving Host's explicit refusal of the probe; any other probe failure stops the send", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    for (const failure of [new HubError("bot_message_peer_unavailable_or_upgrade_required", 503), new HubError("bot_message_transport_timeout", 504), new HubError("bot_message_not_authorized_or_revoked", 403)]) {
+      const sends: string[] = [];
+      vi.spyOn(source, "exchange").mockImplementation(async (_host, signed, body) => {
+        if (signed.passport.path === "/api/bot-messages/capabilities") throw failure;
+        sends.push(signed.passport.path); return b.botMessages.receive(signed, signed.passport.method, signed.passport.path, body);
+      });
+      await expect(send(chat.conversationId, "Probe failed", { delivery: "steer" })).rejects.toThrow(failure.code);
+      expect(sends).toEqual([]);
+      vi.mocked(source.exchange).mockRestore();
+    }
+  });
+});
+
 describe("M3: blank steer text", () => {
   it("gets the queue path's own answer before any record or Gateway call", async () => {
     const chat = await resolve(); await liveTurn(chat.conversationId);

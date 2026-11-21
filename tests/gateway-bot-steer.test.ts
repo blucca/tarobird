@@ -193,6 +193,39 @@ describe("Gateway Bot-message steering (#62)", () => {
     expect(f.bridge.steerActiveTurn).toHaveBeenCalledTimes(1);
   });
 
+  it("R17: refuses while an owner input to a background review holds this conversation", async () => {
+    const { NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY } = await import("../src/client-protocol/native-input.js");
+    const runtime = createCoreServiceRuntime(), key = buildCoreConversationKey("gw_chat");
+    const bridge = {
+      supportsSteering: vi.fn(() => true), steerActiveTurn: vi.fn(async () => true), handleAuthorizedMessage: vi.fn(async () => ({ text: "" })),
+      inFlightSendBehavior: vi.fn(async () => "steer" as const), nativeInputCapability: vi.fn(async () => ({ sendNow: true, withdraw: true })),
+      backgroundInputTarget: vi.fn(async () => "review_target"),
+    };
+    const reviewInput = { id: "msg_review_input", conversationId: "gw_chat", authorId: "owner", authorType: "user", clientMsgId: "owner_req", status: "complete", version: 1, createdAt: 1,
+      blocks: [{ type: "text", text: "Also check the logs" }, { type: "steering", botId: "worker", targetId: "review_target", outcome: "pending", mode: "message" }] };
+    let reviewing!: () => void;
+    const channel = {
+      canSteerConversation: vi.fn(async () => true), getChatMode: vi.fn(async () => "p2p"), hasPendingAdmission: vi.fn(() => false),
+      dispatchNativeTurn: vi.fn((_message: unknown, _conversation: unknown, admission: { nativeInput: { onProgress: (p: { state: string }) => void } }) => {
+        admission.nativeInput.onProgress({ state: "queued" });
+        return new Promise<void>(resolve => { reviewing = resolve; });
+      }),
+      transport: { capabilities: [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY], options: { botId: "worker" },
+        request: vi.fn(async (method: string) => method === "fetch" ? reviewInput : method === "conversation" ? { id: "gw_chat", type: "direct", title: "Chat", ownerId: "owner", botIds: ["worker"], archived: false, createdAt: 1 } : null) },
+    };
+    const run = gatewaySteering(bridge, runtime, channel as unknown as GatewayChannel, root, "claude");
+    // The owner's input to the background review starts a foreground turn admitted natively by Claude.
+    expect(await run("steer", { conversationId: "gw_chat", userId: "owner", requestId: "owner_req", targetId: "review_target", text: "Also check the logs", mode: "message", messageId: "msg_review_input" })).toEqual({ outcome: "accepted" });
+    // That turn now runs; its run token is what any steer would have to name.
+    runtime.activeRuns.set(key, { abortController: new AbortController(), startedAt: Date.now(), sourceMessageId: "msg_bot_task" });
+    expect(await run("botMessage.steer.status", { conversationId: "gw_chat" })).toEqual({ supported: true, reason: "background_review" });
+    const targetId = (await run("steer.status", { conversationId: "gw_chat" }) as { targetId: string }).targetId;
+    expect(targetId).toBeDefined();
+    expect(await run("botMessage.steer", { conversationId: "gw_chat", userId: "owner", requestId: "bm_review", targetId, sourceMessageId: "msg_bot_task", text: "Bot correction", source })).toEqual({ outcome: "rejected", reason: "stale" });
+    expect(bridge.steerActiveTurn).not.toHaveBeenCalled();
+    reviewing();
+  });
+
   it("keeps Bot steer receipts apart from owner steer receipts", async () => {
     const f = fixture(), request = await f.call();
     expect(await f.run("botMessage.steer", request)).toEqual({ outcome: "accepted", sourceMessageId: "msg_turn" });

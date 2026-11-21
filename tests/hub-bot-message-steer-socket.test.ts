@@ -15,6 +15,7 @@ class Peer {
   constructor(readonly ws: WebSocket) { ws.on("message", raw => this.frames.push(JSON.parse(raw.toString()))); }
   static async connect(url: string) { const p = new Peer(new WebSocket(url)); await new Promise<void>((r, j) => { p.ws.once("open", r); p.ws.once("error", j); }); return p; }
   send(frame: object) { this.ws.send(JSON.stringify({ v: 1, ...frame })); }
+  async request(method: string, params: unknown) { const id = `rq_${randomBytes(6).toString("hex")}`; this.send({ type: "instance.request", id, method, params }); return this.next("instance.result", f => f.id === id); }
   async next(type: string, pred: (f: Frame) => boolean = () => true) { const until = Date.now() + 5000; for (;;) { const i = this.frames.findIndex(f => f.type === type && pred(f)); if (i >= 0) return this.frames.splice(i, 1)[0]!; if (Date.now() > until) throw new Error("Missing " + type); await new Promise(r => setTimeout(r, 5)); } }
 }
 
@@ -84,5 +85,25 @@ describe("Hub ↔ Gateway Bot steer wiring (#62)", () => {
     expect(await local("wait", { messageId: receipt.messageId }, chat.conversationId)).toMatchObject({ status: "pending", delivery: { actual: "fell_back_to_queue", reason: "turn_ended" } });
     // Queued once and handed to the replacement worker straight away (review B1).
     expect(await hub.store.db.all("SELECT status,dispatched FROM deliveries WHERE message_id=?", [receipt.messageId])).toEqual([{ status: "pending", dispatched: 1 }]);
+  });
+
+  it("R17: a wait on a merged message ends when the worker process is replaced mid-turn", async () => {
+    const peer = await worker([BOT_MESSAGE_STEER_CAPABILITY]);
+    const chat = await local("resolve", {});
+    const task = await local("send", { text: "Long task", attachments: [] }, chat.conversationId);
+    await peer.next("instance.message", f => f.message?.id === task.messageId);
+    const sending = local("send", { text: "Correction", attachments: [], delivery: "steer" }, chat.conversationId);
+    const status = await peer.next("instance.call", f => f.method === "botMessage.steer.status");
+    peer.send({ type: "instance.result", id: status.id, result: { supported: true, targetId: "run_live", sourceMessageId: task.messageId, receiptEpoch: "rs_fixture_store" } });
+    const steer = await peer.next("instance.call", f => f.method === "botMessage.steer");
+    peer.send({ type: "instance.result", id: steer.id, result: { outcome: "accepted", sourceMessageId: task.messageId } });
+    const receipt = await sending;
+    expect(receipt.delivery.actual).toBe("steered");
+    expect((await local("wait", { messageId: receipt.messageId }, chat.conversationId)).status).toBe("pending");
+    // The process dies mid-turn; its replacement reports the interrupted input, as a real Gateway does.
+    peer.ws.terminate();
+    const replacement = await worker([BOT_MESSAGE_STEER_CAPABILITY]);
+    expect((await replacement.request("delivery.fail", { messageId: task.messageId, reason: "interrupted" })).error).toBeUndefined();
+    expect(await local("wait", { messageId: receipt.messageId }, chat.conversationId)).toMatchObject({ status: "failed", delivery: { actual: "steered" }, reply: { kind: "merged_turn", turnMessageId: task.messageId } });
   });
 });

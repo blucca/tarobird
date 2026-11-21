@@ -703,12 +703,12 @@ export class BotMessages {
         await c.scope();
         if (await this.memo(c.key)) throw new HubError("bot_message_request_conflict", 409);
         await this.admitNewInTransaction(c);
+        // Owner switch, engine, chat shape and the per-edge limit, again inside this write.
         const refused = await this.hubSteerConditionsInTransaction(c);
         if (refused) throw new SteerLimitReached(refused);
         const edgeKey = memoKey("steer-rate", c.p.sourceKey, c.p.source.botId, c.bot.id);
         const times = (await this.memo<number[]>(edgeKey) ?? []).filter(t => t > Date.now() - STEER_EDGE_WINDOW_MS);
         if (await this.turnSteersInTransaction(c.target.conversationId, c.bot.id, plan.targetId) >= STEER_TURN_LIMIT) throw new SteerLimitReached("turn_steer_limit");
-        if (times.length >= STEER_EDGE_LIMIT) throw new SteerLimitReached("steer_rate_limited");
         await this.put(edgeKey, [...times, Date.now()]);
         await this.put(c.key, { content: c.content, at: Date.now(), steer: { turn: plan.turn, targetId: plan.targetId, epoch: plan.epoch } } satisfies IncomingMemo);
         opened = true;
