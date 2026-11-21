@@ -616,3 +616,30 @@ test('every define a setup function uses exists where makensis compiles that fun
   // The product identity is defined before any TaroBot include.
   ordered(nsisCode(nsi), '!define VERSION "${TB_VERSION}"', '!define STARTMENUFOLDER ""', '!include "installer-hooks.nsh"', 'Var PassiveMode');
 });
+
+// Review S2: with the helper missing, a leftover Tauri host\ folder made the
+// uninstaller use the Electron program as stopper. It refuses
+// --stop-desktop-host (exit 64), so the user got TB-HOST-UNCONFIRMED and a
+// Retry that could never succeed, instead of TB-HOST-NO-STOPPER.
+test('only a Tauri layout uses the main program as Host stopper', async () => {
+  const [hooks] = await templates('installer-hooks.nsh');
+  const stop = nsisCode(between(hooks, '!macro TaroBotStopLocalHost', '!macroend'));
+  const choice = between(stop, 'StrCpy $TaroBotHostStopper ""', '${EndIf}');
+  ordered(choice, '${If} ${FileExists} "$INSTDIR\\${TAROBOTHELPER}"', 'StrCpy $TaroBotHostStopper "$INSTDIR\\${TAROBOTHELPER}"',
+    '${ElseIf} ${FileExists} "$INSTDIR\\host\\node.exe"', '${AndIf} ${FileExists} "$INSTDIR\\${MAINBINARYNAME}.exe"',
+    '${AndIfNot} ${FileExists} "$INSTDIR\\resources\\app.asar"', '${AndIfNot} ${FileExists} "$INSTDIR\\resources\\host\\node.exe"',
+    'StrCpy $TaroBotHostStopper "$INSTDIR\\${MAINBINARYNAME}.exe"');
+  assert.equal(choice.match(/StrCpy \$TaroBotHostStopper "\$INSTDIR/g).length, 2, 'helper or Tauri program, nothing else');
+  // Without a stopper, either runtime is never treated as stopped: the uninstaller asks for
+  // repair before any change; the installer confirms with its own helper, read-only.
+  const after = stop.slice(stop.indexOf(choice) + choice.length);
+  ordered(after, '${If} $TaroBotHostStopper == ""', '${AndIf} ${FileExists} "$INSTDIR\\resources\\host\\node.exe"', 'StrCpy $R0 1',
+    '${ElseIf} $TaroBotHostStopper == ""', '${AndIf} ${FileExists} "$INSTDIR\\host\\node.exe"', 'StrCpy $R0 1',
+    '!if "${INSTALLER}" != "1"', '"HOST-NO-STOPPER" ""', '!if "${INSTALLER}" == "1"', '--confirm-host-stopped-v2');
+  // The Electron package really has both markers, and a Tauri package neither.
+  const tauri = JSON.parse(await readFile(path.join(client, 'src-tauri/tauri.conf.json'), 'utf8'));
+  assert.deepEqual(Object.values(tauri.bundle.resources), ['host/'], 'Tauri resources land in $INSTDIR\\host');
+  const plan = await planWindowsInstaller({ appDir: await packaged('stopper-layout'), helper, version: '1.2.3', outFile: path.join(root, 'out', 'stopper.exe'), pluginsDir });
+  const targets = plan.resources.map(item => item.target);
+  for (const marker of ['resources\\app.asar', 'resources\\host\\node.exe']) assert.ok(targets.includes(marker), `Electron installs ${marker}`);
+});
