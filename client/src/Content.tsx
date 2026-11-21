@@ -27,7 +27,7 @@ import { questionDraftKey } from "./question-draft.js";
 import { MessageLinkPreview } from "./LinkPreview.js";
 import { cardLayoutStyle } from "./card-layout.js";
 import { MarkdownText } from "./MarkdownText.js";
-import { selectMessageBubble } from "./message-text-selection.js";
+import { noteMessagePress, selectMessageBubble } from "./message-text-selection.js";
 import "./message-text-selection.css";
 import { t, useLocale } from "./i18n.js";
 import { createPortal } from "react-dom";
@@ -334,7 +334,7 @@ export const MessageContent = memo(function MessageContent({ message, connection
   useLocale();
   const groupedBlocks = new Set<number>();
   const rejectedInput = message.authorType === "user" && message.blocks.some(block => block.type === "steering" && block.outcome === "rejected");
-  return <MessageOverlayOwnerContext.Provider value={message.id}><div className={`message-blocks${reference ? " has-reference" : ""}`} onDoubleClick={selectMessageBubble}>{reference}<ImageGalleryContext.Provider value={messageImages(message.blocks)}>{message.blocks.map((block, i) => {
+  return <MessageOverlayOwnerContext.Provider value={message.id}><div className={`message-blocks${reference ? " has-reference" : ""}`} onMouseDown={noteMessagePress} onClick={selectMessageBubble}>{reference}<ImageGalleryContext.Provider value={messageImages(message.blocks)}>{message.blocks.map((block, i) => {
     if (groupedBlocks.has(i)) return null;
     // Caption and images are already one persisted message. Give them one
     // visual surface too, including existing batch deliveries in history.

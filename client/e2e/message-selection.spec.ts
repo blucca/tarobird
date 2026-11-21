@@ -25,6 +25,20 @@ async function fixture(page: Page) {
   return { hub, chat, user: page.locator(`[data-message-id="${user.id}"]`), reply: page.locator(`[data-message-id="${reply.id}"]`), run: page.locator(`[data-message-id="${run.id}"]`), close: async () => { await hub.close(); await rm(root, { recursive: true, force: true }); } };
 }
 
+/** The centre of a word's first character inside `surface`, for a real pointer click. */
+async function wordPoint(surface: Locator, word: string) {
+  return surface.evaluate((element, word) => {
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const index = node.textContent!.indexOf(word); if (index < 0) continue;
+      const range = document.createRange(); range.setStart(node, index); range.setEnd(node, index + 1);
+      const rect = range.getBoundingClientRect(); return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    }
+    throw new Error(`word not found: ${word}`);
+  }, word);
+}
+const tripleClick = (target: Locator) => target.click({ clickCount: 3 });
+
 async function selectedWithin(surface: Locator) {
   return surface.evaluate(element => {
     const selection = document.getSelection();
@@ -32,14 +46,14 @@ async function selectedWithin(surface: Locator) {
   });
 }
 
-test("double-click selects the entire user bubble, without the next reply or composer", async ({ page }, info) => {
+test("triple-click selects the entire user bubble, without the next reply or composer", async ({ page }, info) => {
   const f = await fixture(page);
   try {
     const bubble = f.user.locator(".message-blocks");
     await expect(bubble.locator("p")).toHaveCount(2);
     const expected = (await bubble.innerText()).trim();
     await page.getByRole("textbox", { name: "消息", exact: true }).fill("输入框里的草稿不能被选中");
-    await bubble.locator("p").first().dblclick();
+    await tripleClick(bubble.locator("p").first());
     await expect.poll(() => selectedWithin(bubble)).toEqual({ text: expected, inside: true });
     await page.screenshot({ path: info.outputPath("user-bubble-selected.png") });
     // A background update must not move selection to the newly rendered reply.
@@ -54,15 +68,70 @@ test("double-click selects the entire user bubble, without the next reply or com
   } finally { await f.close(); }
 });
 
+test("double-click selects one word in user and Bot prose, like the composer; triple-click then owns the message", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    const { message: english } = await f.hub.store.sendMessage("owner", { conversationId: f.chat.id, clientMsgId: "english", text: "Select only the word delta here.", attachments: [] });
+    const reply = await f.hub.store.publishBotMessage("alpha", { conversationId: f.chat.id, blocks: [{ type: "text", text: "Pick the word gamma from this reply.\n\n机器人回复里的气泡文字。" }] });
+    const userBubble = f.user.locator(".message-blocks"), englishBubble = page.locator(`[data-message-id="${english.id}"] .message-blocks`);
+    const botCard = page.locator(`[data-message-id="${reply.id}"] .rich-card`);
+    await expect(englishBubble).toContainText("delta"); await expect(botCard).toContainText("gamma");
+    for (const [surface, word] of [[userBubble, "气泡"], [englishBubble, "delta"], [botCard, "gamma"], [botCard, "回复"]] as const) {
+      const point = await wordPoint(surface, word);
+      await page.mouse.dblclick(point.x, point.y);
+      await expect.poll(() => selectedWithin(surface), { message: word }).toEqual({ text: word, inside: true });
+    }
+    // The third click of the same run selects the whole message surface.
+    const point = await wordPoint(botCard, "gamma");
+    await page.mouse.click(point.x, point.y, { clickCount: 3 });
+    await expect.poll(async () => { const selected = await selectedWithin(botCard); return { ...selected, text: selected.text?.replace(/\s+/g, " ") }; })
+      .toEqual({ text: (await botCard.innerText()).trim().replace(/\s+/g, " "), inside: true });
+  } finally { await f.close(); }
+});
+
+test("after a triple-click, Shift+click extends the selection and a triple-click drag stays native", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    const bubble = f.user.locator(".message-blocks"), card = f.reply.locator(".rich-card").first();
+    await expect(card.locator("p").first()).toHaveText("回复第一段。");
+    await tripleClick(bubble.locator("p").first());
+    await expect.poll(() => selectedWithin(bubble)).toEqual({ text: (await bubble.innerText()).trim(), inside: true });
+    const end = await wordPoint(card, "第一段");
+    await page.keyboard.down("Shift"); await page.mouse.click(end.x, end.y); await page.keyboard.up("Shift");
+    const extended = await page.evaluate(() => { const s = getSelection()!; return { text: s.toString(), anchor: s.anchorNode?.parentElement?.closest(".message-blocks") ? "bubble" : "", focusInCard: !!s.focusNode?.parentElement?.closest(".rich-card") }; });
+    expect(extended.text).toContain("只选择这条气泡里的全部文字。"); expect(extended.text).toContain("本条回复");
+    expect(extended.text).not.toContain("回复第二段。"); expect(extended.focusInCard).toBe(true);
+    // Third press, then drag into the reply: the browser extends by paragraph and
+    // the App does not replace that with the starting bubble.
+    const start = await wordPoint(bubble.locator("p").first(), "气泡"), target = await wordPoint(card.locator("p").first(), "第一段");
+    await page.mouse.click(start.x, start.y, { clickCount: 2 });
+    await page.mouse.down({ clickCount: 3 });
+    await page.mouse.move(target.x, target.y, { steps: 12 }); await page.mouse.up({ clickCount: 3 });
+    const dragged = await page.evaluate(() => getSelection()!.toString());
+    expect(dragged).toContain("只选择这条气泡里的全部文字。"); expect(dragged).toContain("回复第一段。");
+    // Inside one card the click still lands on the message: a drag from the first
+    // to the second paragraph keeps exactly those paragraphs, not the card title.
+    const first = await wordPoint(card.locator("p").first(), "第一段"), second = await wordPoint(card.locator("p").nth(1), "第二段");
+    await page.mouse.click(first.x, first.y, { clickCount: 2 });
+    await page.mouse.down({ clickCount: 3 });
+    await page.mouse.move(second.x, second.y, { steps: 12 }); await page.mouse.up({ clickCount: 3 });
+    // (Paragraph granularity ends at offset 0 of the next card, so compare text.)
+    const inCard = await page.evaluate(() => getSelection()!.toString().replace(/\s+/g, " ").trim());
+    expect(inCard).toBe("回复第一段。 回复第二段。");
+  } finally { await f.close(); }
+});
+
 test("reply cards and native answers each own their text selection", async ({ page }) => {
   const f = await fixture(page);
   try {
     const card = f.reply.locator(".rich-card").first();
-    await card.locator("p").first().dblclick();
+    await tripleClick(card.locator("p").first());
     // innerText and Selection serialize block-boundary newlines differently.
     await expect.poll(async () => { const selected = await selectedWithin(card); return { ...selected, text: selected.text?.replace(/\s+/g, " ") }; }).toEqual({ text: (await card.innerText()).trim().replace(/\s+/g, " "), inside: true });
+    // A multi-card message selects only the clicked card.
+    expect((await selectedWithin(card)).text).not.toContain("不要连带选择这张卡片。");
     const answer = f.run.locator(".native-run-prose");
-    await answer.locator("p").first().dblclick();
+    await tripleClick(answer.locator("p").first());
     await expect.poll(() => selectedWithin(answer)).toEqual({ text: (await answer.innerText()).trim(), inside: true });
     expect((await selectedWithin(answer)).text).not.toMatch(/已完成|查看运行过程|本轮改动/);
   } finally { await f.close(); }
@@ -72,13 +141,16 @@ test("code, editable cards and ordinary drag selection keep their native behavio
   const f = await fixture(page);
   try {
     const message = await f.hub.store.publishBotMessage("alpha", { conversationId: f.chat.id, blocks: [{ type: "card", elements: [
-      { type: "markdown", text: "Outside prose stays outside.\n\n```text\nalpha beta gamma\n```" },
+      { type: "markdown", text: "Outside prose stays outside.\n\n```text\nalpha beta gamma\ndelta epsilon line two\n```" },
       { type: "input", actionId: "note", text: "备注" },
     ] }] });
     const card = page.locator(`[data-message-id="${message.id}"] .rich-card`);
-    await expect(card.locator("code")).toHaveText("alpha beta gamma\n");
+    await expect(card.locator("code")).toHaveText("alpha beta gamma\ndelta epsilon line two\n");
     await card.locator("code").dblclick({ position: { x: 8, y: 8 } });
     const code = await selectedWithin(card.locator("code")); expect(code.inside).toBe(true); expect(code.text).toBe("alpha");
+    // A triple-click in code keeps the browser's line selection, not the whole card.
+    await card.locator("code").click({ clickCount: 3, position: { x: 8, y: 8 } });
+    const line = await selectedWithin(card.locator("code")); expect(line.inside).toBe(true); expect(line.text).toBe("alpha beta gamma");
     const field = card.getByRole("textbox", { name: "备注", exact: true });
     await field.fill("delta epsilon zeta"); await field.dblclick({ position: { x: 16, y: 16 } });
     await expect(field).toBeFocused();
@@ -90,7 +162,7 @@ test("code, editable cards and ordinary drag selection keep their native behavio
   } finally { await f.close(); }
 });
 
-test("double-clicking an expanded table cannot select its parent chat bubble through the portal", async ({ page }) => {
+test("clicks in an expanded table cannot select its parent chat bubble through the portal", async ({ page }) => {
   const f = await fixture(page);
   try {
     const table = "| Column | Value |\n|---|---|\n" + Array.from({ length: 20 }, (_, index) => `| row${index} | alpha beta gamma |`).join("\n");
@@ -106,8 +178,11 @@ test("double-clicking an expanded table cannot select its parent chat bubble thr
     await page.mouse.dblclick(point.x, point.y);
     const selected = await selectedWithin(dialog);
     expect(selected.inside).toBe(true); expect(selected.text).toMatch(/^(alpha|beta|gamma)$/);
+    await page.mouse.click(point.x, point.y, { clickCount: 3 });
+    const tripled = await selectedWithin(dialog);
+    expect(tripled.inside).toBe(true); expect(tripled.text).toContain("alpha beta gamma"); expect(tripled.text).not.toContain("Outside the table.");
     await page.keyboard.press("Escape"); await expect(dialog).toHaveCount(0);
-    await row.locator(".card-text p").first().dblclick();
+    await tripleClick(row.locator(".card-text p").first());
     const selection = await selectedWithin(row.locator(".rich-card"));
     expect(selection.inside).toBe(true); expect(selection.text).toContain("row19");
   } finally { await f.close(); }
@@ -149,7 +224,7 @@ test("selected-text copy omits code and table controls while retaining rich mess
     const message = await f.hub.store.publishBotMessage("alpha", { conversationId: f.chat.id, blocks: [{ type: "text", text: `正文开头。正文中的“复制”和“停止”也要保留。\n\n\`\`\`js\nconst answer = 42;\n  keepIndent();\n\`\`\`\n\n${table}\n\n[来源链接](https://example.com)\n\n正文结尾。` }] });
     const row = page.locator(`[data-message-id="${message.id}"]`), card = row.locator(".rich-card");
     await expect(card.getByRole("button", { name: "展开表格", exact: true })).toBeVisible();
-    await card.locator("p").first().dblclick();
+    await tripleClick(card.locator("p").first());
     const selected = (await selectedWithin(card)).text!;
     expect(selected).not.toMatch(/^(复制|已复制|展开表格|左右滑动查看|js)$/m);
     for (const text of ["正文中的“复制”和“停止”也要保留。", "const answer = 42;\n  keepIndent();", "条目13", "value13", "来源链接", "正文结尾。"]) expect(selected).toContain(text);
@@ -275,7 +350,7 @@ test("nested lists retain paragraphs, code indentation and numbering without UI 
   const f = await fixture(page);
   try {
     const card = await listReply(page, f, "前言\n\n7. 外层第一段\n\n   第二段\n\n   - 子项甲\n   - 子项乙\n\n8. 后一项\n\n   ```text\n   first\n     indented\n   ```\n\n结尾");
-    await card.locator("p").first().dblclick();
+    await tripleClick(card.locator("p").first());
     const value = await copySelection(page);
     expect(value.text).toContain("7. 外层第一段\n   \n   第二段\n   • 子项甲\n   • 子项乙");
     expect(value.text).toContain("8. 后一项\n   \n   first\n     indented");
@@ -311,7 +386,7 @@ test("list copies preserve table rows, formula text once, task state and cross-m
   try {
     const card = await listReply(page, f, "3. 表格项\n\n   | 名称 | 值 |\n   |---|---|\n   | 甲 | 10 |\n\n4. 公式 $x = 1$\n\n- [x] 已处理\n- [ ] 未处理");
     await expect(card.locator(".katex")).toHaveCount(1);
-    await card.locator("li").first().dblclick();
+    await tripleClick(card.locator("li").first());
     const value = await copySelection(page);
     expect(value.text).toContain("名称\t值\n   甲\t10");
     expect(value.text.match(/x = 1/g)).toHaveLength(1); expect(value.text).toContain("4. 公式 x = 1");
