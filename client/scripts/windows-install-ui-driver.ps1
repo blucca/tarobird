@@ -96,6 +96,37 @@ function Responsive($w) {
   return [BirdProbe.Win32Alive]::SendMessageTimeout($h, 0, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 400, [ref]$r) -ne [IntPtr]::Zero
 }
 function OwnerPath($w) { try { [string](Get-CimInstance Win32_Process -Filter "ProcessId=$($w.Current.ProcessId)").ExecutablePath } catch { '' } }
+
+# Top-level windows WITHOUT UI Automation: EnumWindows + InternalGetWindowText
+# never send a message, so a window whose UI thread is blocked (setup's
+# page-leave ExecWait, probe run 44860748632) cannot hang the enumeration.
+# Only visible windows that answer WM_NULL within 400 ms get a UIA element.
+Add-Type -Namespace BirdProbe -Name TopWindows -UsingNamespace System.Text, System.Collections.Generic -MemberDefinition @"
+public delegate bool EnumProc(IntPtr h, IntPtr l);
+[DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+[DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int InternalGetWindowText(IntPtr h, StringBuilder s, int n);
+[DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);
+public static string[] List() {
+  var found = new List<string>();
+  EnumWindows((h, l) => {
+    if (!IsWindowVisible(h)) return true;
+    var sb = new StringBuilder(512); InternalGetWindowText(h, sb, 512); var t = sb.ToString();
+    if (t.Contains("TaroBird") || t.Contains("Language")) { IntPtr r; bool alive = SendMessageTimeout(h, 0, IntPtr.Zero, IntPtr.Zero, 2, 400, out r) != IntPtr.Zero; found.Add(h.ToInt64() + "|" + (alive ? "1" : "0") + "|" + t); }
+    return true;
+  }, IntPtr.Zero);
+  return found.ToArray();
+}
+"@
+function Windows {
+  $list = @()
+  foreach ($entry in [BirdProbe.TopWindows]::List()) {
+    $part = $entry.Split('|', 3)
+    if ($part[1] -ne '1') { if (Get-Command Once -ErrorAction SilentlyContinue) { Once 'unresponsive' $part[0] "$($part[2]) hwnd=$($part[0]) (UI thread busy; skipped while it is)" }; continue }
+    try { $list += $AE::FromHandle([IntPtr][long]$part[0]) } catch { }
+  }
+  return $list
+}
 $seen = $false; $guard = 0; $empty = 0; $stuck = $false; $noted = @{}
 function Once([string]$kind, [string]$key, [string]$detail) { if (-not $noted.ContainsKey("$kind|$key")) { $noted["$kind|$key"] = $true; Note $kind $detail } }
 while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
@@ -118,7 +149,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
         $owner = OwnerPath $w
         $kind = $(if ($SetupPath -and $owner -and $owner -ieq $SetupPath) { 'language' } else { 'old-uninstaller-language' })
         $okLang = Btn $w 'OK'
-        if ($okLang) { Press $okLang; Note $kind "$($w.Current.Name) pid=$($w.Current.ProcessId) owner=$owner (OK $(Desc $okLang))"; $acted[$key] = $true; continue }
+        if ($okLang) { $d = Desc $okLang; $wn = "$($w.Current.Name) pid=$($w.Current.ProcessId)"; Press $okLang; Note $kind "$wn owner=$owner (OK $d)"; $acted[$key] = $true; continue }
         $native = Win32Button $w.Current.NativeWindowHandle 'OK'
         if ($native -ne [IntPtr]::Zero) { [void][BirdProbe.Win32]::SendMessage($native, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero); Note $kind "$($w.Current.Name) owner=$owner (Win32 OK)"; $acted[$key] = $true }
         continue
@@ -135,8 +166,8 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
       if ($isUninstaller) {
         Once 'old-uninstaller' "$($w.Current.ProcessId)" "$($w.Current.Name) pid=$($w.Current.ProcessId) path=$((Get-CimInstance Win32_Process -Filter "ProcessId=$($w.Current.ProcessId)").ExecutablePath): $now"
         $un = Btn $w 'Uninstall'; $close = Btn $w 'Close'
-        if ($un -and (Enabled $un)) { Press $un; Note 'pressed' "Uninstall on old uninstaller $(Desc $un), data boxes untouched"; $acted[$key] = $true }
-        elseif ($close -and (Enabled $close)) { Press $close; Note 'pressed' "Close on old uninstaller $(Desc $close)"; $acted[$key] = $true }
+        if ($un -and (Enabled $un)) { $d = Desc $un; Press $un; Note 'pressed' "Uninstall on old uninstaller $d, data boxes untouched"; $acted[$key] = $true }
+        elseif ($close -and (Enabled $close)) { $d = Desc $close; Press $close; Note 'pressed' "Close on old uninstaller $d"; $acted[$key] = $true }
         continue
       }
       $finish = Btn $w 'Finish'
@@ -150,7 +181,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
       }
       foreach ($name in @('I Agree', 'Next >', 'Install')) {
         $b = Btn $w $name
-        if ($b -and (Enabled $b)) { Press $b; Note 'pressed' "$name $(Desc $b)"; $acted[$key] = $true; break }
+        if ($b -and (Enabled $b)) { $d = Desc $b; Press $b; Note 'pressed' "$name $d"; $acted[$key] = $true; break }
       }
     } catch { Note 'error' $_.Exception.Message }
   }
