@@ -1,3 +1,4 @@
+import { EngineSteeringRejectedError } from "../src/codex/adapter.js";
 import { EventEmitter } from "node:events";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -641,6 +642,43 @@ describe("app-server mid-turn steering (turn/steer)", () => {
 
     controller.abort();
     await expect(promise).rejects.toThrow("Codex app-server turn aborted");
+  });
+
+  // Issue #62 D4. Exact replies of real codex-cli 0.170.0 (loopback probe,
+  // 2026-11-21): the provider never received the text in either case.
+  const steerReply = async (reply: string) => {
+    const { child, spawnFn } = createSpawnHarness();
+    const adapter = new CodexAppServerAdapter("codex", process.cwd(), spawnFn);
+    const controller = new AbortController();
+    const promise = adapter.sendUserMessage("telegram-12345", { text: "Rewrite the README", files: [], abortSignal: controller.signal });
+    await driveTurnStart(child);
+    child.stdout.emitData('{"id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress","error":null}}}\n');
+    await waitFor(() => Boolean((adapter as unknown as { pendingTurns: Map<string, { turnId?: string }> }).pendingTurns.get("thread-123")?.turnId));
+    const steerPromise = adapter.steerActiveTurn("thread-123", { text: "late follow-up", throwOnError: true });
+    steerPromise.catch(() => undefined);
+    await waitFor(() => parsedStdinLines(child).some((line) => line.method === "turn/steer"));
+    const steer = parsedStdinLines(child).find((line) => line.method === "turn/steer") as { id: number };
+    if (reply) child.stdout.emitData(`{"id":${steer.id},"error":${reply}}\n`);
+    const settled = await steerPromise.then(value => ({ value }), (error: unknown) => ({ error }));
+    controller.abort(); await promise.catch(() => undefined);
+    return settled as { value?: boolean; error?: unknown };
+  };
+  it.each([
+    '{"code":-32600,"message":"no active turn to steer"}',
+    '{"code":-32600,"message":"expected active turn id `turn-1` but found `turn-2`"}',
+  ])("turns a definite no-active/mismatched-turn reply into a pre-admission rejection: %s", async (reply) => {
+    const { error } = await steerReply(reply);
+    expect(error).toBeInstanceOf(EngineSteeringRejectedError);
+    expect((error as EngineSteeringRejectedError).reason).toBe("stale");
+  });
+  it.each([
+    '{"code":-32603,"message":"no active turn to steer"}',
+    '{"code":-32600,"message":"input exceeds limit"}',
+    '{"code":-32600,"message":"no active turn to steer; retry later"}',
+  ])("keeps any other error reply uncertain: %s", async (reply) => {
+    const { error } = await steerReply(reply);
+    expect(error).toBeDefined();
+    expect(error).not.toBeInstanceOf(EngineSteeringRejectedError);
   });
 });
 

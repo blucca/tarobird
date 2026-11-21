@@ -30,7 +30,7 @@ import type {
   NativeHistoryState,
   SideCapability,
 } from "./adapter.js";
-import { EngineContextCompactionPendingError, EngineIncompleteResponseError } from "./adapter.js";
+import { EngineContextCompactionPendingError, EngineIncompleteResponseError, EngineSteeringRejectedError } from "./adapter.js";
 import { appendUniqueSendImageTag, extractGeneratedImagePath, sendImageTag } from "./generated-files.js";
 import { killProcessTree } from "./process-tree.js";
 import { normalizeCodexUserInput } from "./codex-user-input.js";
@@ -171,6 +171,16 @@ class CodexAppServerReplyError extends Error {
 const EMPTY_HISTORY_HEAD = "empty";
 const HISTORY_TURN_PAGE_SIZE = 100;
 const HISTORY_TURN_MAX_PAGES = 500;
+
+/** turn/steer refusals of codex-cli 0.170.0, verified against a loopback
+ * provider (issue #62): the provider never received the text. Exact match
+ * only; every other reply remains an uncertain outcome. */
+const CODEX_STEER_NO_ACTIVE_TURN = /^no active turn to steer$/;
+const CODEX_STEER_TURN_MISMATCH = /^expected active turn id `[^`]*` but found `[^`]*`$/;
+function isCodexSteerTurnRefusal(error: unknown): boolean {
+  return error instanceof CodexAppServerReplyError && error.jsonRpcCode === -32600
+    && (CODEX_STEER_NO_ACTIVE_TURN.test(error.message) || CODEX_STEER_TURN_MISMATCH.test(error.message));
+}
 
 /** How an app-server says that it does not have a method at all. */
 const METHOD_MISSING_PATTERN = /unknown variant|method not found|unknown method/i;
@@ -4266,7 +4276,10 @@ export class CodexAppServerAdapter implements CodexAdapter {
       });
       return true;
     } catch (error) {
-      if (input.throwOnError) throw error;
+      // Only the app-server's own answer that this turn is not (or no longer)
+      // the active one proves the input was never appended. Timeouts, lost
+      // children and any other reply stay uncertain for the caller.
+      if (input.throwOnError) throw isCodexSteerTurnRefusal(error) ? new EngineSteeringRejectedError("stale") : error;
       return false;
     }
   }
