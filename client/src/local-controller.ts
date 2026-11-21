@@ -2,14 +2,16 @@ import { invoke } from "./desktop-bridge.js";
 import type { HostRegistry } from "./host-registry.js";
 import type { HostConnections } from "./host-connections.js";
 import { LocalControllerStartupError, startupAttempt, type StartupAttempt } from "./startup-diagnostics.js";
-import { desktopControllerSupported, type DesktopRuntimeIssue } from "../../src/client-protocol/desktop-runtime.js";
+import { desktopControllerSupported, type DesktopRuntimeIssue, type DesktopStartIssue } from "../../src/client-protocol/desktop-runtime.js";
+import { localControllerMessage, localHostStartFailureMessage, localHostStartIssueMessage } from "./local-controller-message.js";
 
 export type LocalControllerIssue = DesktopRuntimeIssue | "directory_missing" | "redirected" | "shadow_only" | "conflict" | "incomplete" | "probe_failed" | "foreign_runtime" | "identity_changed" | "credentials" | "keychain" | "controller_failed" | "background" | "stopped";
-type NativeHostStatus = { available?: boolean; publicKey?: string; running?: boolean; directoryState?: string; hostEnabled?: boolean; runtimeIssue?: DesktopRuntimeIssue; controlCapabilities?: string[] };
+type NativeHostStatus = { available?: boolean; publicKey?: string; running?: boolean; directoryState?: string; hostEnabled?: boolean; runtimeIssue?: DesktopRuntimeIssue; startIssue?: DesktopStartIssue; controlCapabilities?: string[] };
 export type LocalControllerResult = { publicKey?: string; pending: boolean; issue?: LocalControllerIssue };
 const directoryIssues = new Set(["redirected", "shadow_only", "conflict", "incomplete", "probe_failed", "foreign_runtime", "runtime_update_required"]);
 const runtimeIssues = new Set<DesktopRuntimeIssue>(["runtime_update_required", "runtime_restart_required", "runtime_waiting", "runtime_recovery_failed"]);
 type NativeRequest = (args: { action: "resume" | "status" | "pair"; device?: Record<string, unknown> }) => Promise<NativeHostStatus>;
+type NativeStartRequest = (args: { action: "start" }) => Promise<NativeHostStatus>;
 
 function pairingIssue(error: unknown): LocalControllerIssue {
   const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
@@ -35,6 +37,26 @@ export function watchLocalHostRecovery(request: NativeRequest = args => invoke("
   for (const target of targets) for (const event of events) target.addEventListener(event, check);
   const timer = setInterval(check, 60_000);
   return () => { stopped = true; clearInterval(timer); for (const target of targets) for (const event of events) target.removeEventListener(event, check); };
+}
+
+/** The explicit "Start local host" action for a stopped local host: the same
+ * native `desktop_host` start as the welcome page, which re-enables the host;
+ * an older database is upgraded by the Hub as on any App upgrade. Only a user
+ * action calls this; resume and the recovery watcher never do. Reconnecting
+ * afterwards is the ordinary local-controller recovery. */
+export async function startLocalHost(request: NativeStartRequest = args => invoke("desktop_host", args)): Promise<{ ok: true; publicKey?: string } | { ok: false; message: string }> {
+  let host: NativeHostStatus;
+  try { host = await request({ action: "start" }); }
+  catch (error) {
+    const diagnostic = startupAttempt("start", error), directoryIssue = diagnostic.reason?.startsWith("state_") ? diagnostic.reason.slice(6) : undefined;
+    if (directoryIssue && directoryIssues.has(directoryIssue)) return { ok: false, message: localControllerMessage(directoryIssue as LocalControllerIssue) };
+    return { ok: false, message: localHostStartFailureMessage(diagnostic.code === "desktop_host_runtime_missing") };
+  }
+  if (host.startIssue) return { ok: false, message: localHostStartIssueMessage(host.startIssue) };
+  if (host.runtimeIssue && runtimeIssues.has(host.runtimeIssue)) return { ok: false, message: localControllerMessage(host.runtimeIssue) };
+  if (host.directoryState && directoryIssues.has(host.directoryState)) return { ok: false, message: localControllerMessage(host.directoryState as LocalControllerIssue) };
+  if (!host.running) return { ok: false, message: localHostStartFailureMessage() };
+  return { ok: true, publicKey: host.publicKey };
 }
 
 /** Mark the native controller before any local authentication can classify a

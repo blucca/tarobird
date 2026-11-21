@@ -1,5 +1,6 @@
 import { t } from "./i18n.js";
 import type { LocalControllerIssue } from "./local-controller.js";
+import type { DesktopStartIssue } from "../../src/client-protocol/desktop-runtime.js";
 export function localControllerMessage(issue?: LocalControllerIssue): string {
   switch (issue) {
     case "redirected": return t("当前启动环境会重定向主机数据。请从开始菜单打开 TaroBird，或使用普通终端运行 CLI；原数据未修改。");
@@ -17,7 +18,15 @@ export function localControllerMessage(issue?: LocalControllerIssue): string {
     case "credentials": return t("本机主机已找到，但设备安全凭据验证失败。正在自动重试，原授权和草稿保留。");
     case "keychain": return t("暂时无法读取系统保存的设备凭据。请检查系统钥匙串或凭据存储访问权限；原授权保留。");
     case "controller_failed": return t("本机控制连接尚未完成验证，正在重试。原授权和数据保留，暂时不要重新配对。");
-    case "stopped": return t("本机主机已停止，自动恢复不会替你重新启用。其他主机仍可使用。");
+    case "stopped": return t("本机主机已停用，App 不会自动重新启用。点「启动本机主机」即可恢复，其他主机仍可使用。");
     default: return t("本机后台尚未恢复，正在自动重试。其他主机仍可使用。");
   }
+}
+
+/** Explicit "Start local host" refusals; the database was not opened. */
+export function localHostStartIssueMessage(issue: DesktopStartIssue): string {
+  return t("未启动：主机数据来自更新版本的 TaroBird。请先更新 App，再启动本机主机。数据未改动。");
+}
+export function localHostStartFailureMessage(runtimeMissing = false): string {
+  return runtimeMissing ? t("此安装包缺少主机组件，请下载包含主机的桌面版本。") : t("本机主机未能启动，原数据已保留。请重试；仍失败时在终端运行 tarobot start 查看原因。");
 }

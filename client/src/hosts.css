@@ -22,6 +22,9 @@
 .host-unavailable { margin: 12px; font-size: 12px; }
 .runtime-host-label { display: block; color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .host-error { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 250; padding: 12px; max-width: 92vw; background: var(--surface); border: 1px solid var(--border); box-shadow: 0 4px 16px #0002; border-radius: 10px; }
+.host-error .local-host-start { margin-left: 8px; }
+.local-host-start[aria-disabled="true"] { opacity: .6; cursor: progress; }
+.host-error .local-host-start-error { margin: 8px 0 0; }
 .host-choices { display: grid; gap: 8px; }
 .host-choices button { display: flex; align-items: center; gap: 12px; padding: 14px; text-align: left; }
 .host-choices span, .host-manager-row label { display: grid; gap: 4px; }

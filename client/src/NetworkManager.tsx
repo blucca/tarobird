@@ -7,7 +7,8 @@ import { ConnectionPanel } from "./ConnectionPanel.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
 import { mergeNetworkInviteRoute } from "./network-routes.js";
 import { canOfferDesktopJoin } from "./desktop-join-intent.js";
-import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import { Fragment, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import { LocalHostStartButton, LocalHostStartError, type LocalHostStartControl } from "./LocalHostStart.js";
 import { ArrowRight, Check, ChevronRight, Globe, Link, Monitor, MonitorSmartphone, Pencil, Plus, QrCode, RefreshCw, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import type { NetworkHost, NetworkManifest, NetworkView } from "../../src/client-protocol/private-network.js";
 import { sharedRoutesSchema } from "../../src/client-protocol/private-network.js";
@@ -84,7 +85,7 @@ const errorText = (error: unknown) => {
   return error instanceof Error && !/^[a-z_]+$/.test(error.message) ? error.message : t("操作未完成，请重试。");
 };
 
-export function NetworkManager({ entries, close, addHost, manageConnections, confirmDevice, joined, onChanged, initialJoin, initialHostKey, initialHostDetails = false, localHostKey = "" }: {
+export function NetworkManager({ entries, close, addHost, manageConnections, confirmDevice, joined, onChanged, initialJoin, initialHostKey, initialHostDetails = false, localHostKey = "", localHostStart }: {
   entries: ConnectedHost[];
   close: () => void;
   /** This device pairs with another host (the existing pairing screen). */
@@ -103,6 +104,8 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
   initialHostDetails?: boolean;
   /** Set only after the desktop shell confirms its native local controller. */
   localHostKey?: string;
+  /** Present only while this desktop's own host is explicitly stopped. */
+  localHostStart?: LocalHostStartControl;
 }) {
   useLocale();
   const snapshot = useSyncExternalStore(notify => { const cleanups = entries.map(entry => entry.connection?.subscribe(notify)); return () => cleanups.forEach(cleanup => cleanup?.()); }, () => JSON.stringify(entries.map(entry => { const state = connectionOf(entry)?.state; return [state?.status, state?.network, state?.hostProfile, state?.networkAvailable, state?.user?.role, state?.networkChange]; })));
@@ -168,7 +171,9 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
   };
   const candidates = network ? entries.filter(entry => eligible(entry, network)) : [];
   // Standalone hosts that cannot join right now stay visible with a reason.
-  const unjoined = network ? standalone.filter(entry => !candidates.includes(entry)) : [];
+  // Exception: this desktop's own stopped host has no network view, yet it is a
+  // listed member shown above with its start action; it has not "not joined".
+  const unjoined = network ? standalone.filter(entry => !candidates.includes(entry) && !(localHostStart && entry.host.publicKey === localHostKey && network.hosts.some(host => host.publicKey === entry.host.publicKey && !host.revoked))) : [];
   const authorityNoticeId = useId();
   const ready = standalone.filter(entry => canManage(entry) && connectionOf(entry)?.state.network?.sync === "standalone");
   const source = joining && entries.find(entry => entry.host.publicKey === joining.sourceKey);
@@ -361,13 +366,17 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
     const name = entry ? hostName(entry) : host.name;
     const online = isOnline(host, entry);
     const blocked = !!entry?.host.networkBlocked;
-    const status = host.state === "pending" ? t("待完成加入") : blocked ? t("授权已失效") : online ? t("已连接") : entry?.connection?.state.status === "connecting" ? t("连接中…") : entry?.connection ? t("离线") : t("未连接");
+    const localStopped = !!localHostStart && !!localHostKey && host.publicKey === localHostKey && !online;
+    const status = host.state === "pending" ? t("待完成加入") : blocked ? t("授权已失效") : online ? t("已连接") : localStopped ? t("已停止") : entry?.connection?.state.status === "connecting" ? t("连接中…") : entry?.connection ? t("离线") : t("未连接");
     const tone: Tone = host.state === "pending" ? "warn" : blocked ? "bad" : online ? "ok" : "muted";
-    return <button type="button" className="network-member" key={host.publicKey} disabled={busy} onClick={() => openDetails(host.publicKey)}>
+    if (localStopped) note = t("本机主机已停用，App 不会自动重新启用。");
+    const member = <button type="button" className="network-member" key={host.publicKey} disabled={busy} onClick={() => openDetails(host.publicKey)}>
       <span className="network-member-icon"><Monitor size={18} aria-hidden="true"/></span>
       <span className="network-member-name"><span className="network-member-title"><strong>{name}</strong>{tags(host.publicKey)}</span>{duplicateName(name) && <small>{fingerprint(host.publicKey)}</small>}{note && <small className="network-member-note">{note}</small>}</span>
       <span className={`network-member-status${online ? " is-online" : ""}`} data-tone={tone}><i aria-hidden="true"/>{status}</span><ChevronRight size={15} aria-hidden="true"/>
     </button>;
+    // A sibling, not nested in the row button: the same explicit start as the banner.
+    return localStopped ? <Fragment key={host.publicKey}>{member}<div className="network-local-start"><LocalHostStartButton control={localHostStart!} className="network-secondary"/><LocalHostStartError control={localHostStart!} live/></div></Fragment> : member;
   };
   const refreshButton = <button type="button" className="icon-button network-refresh" aria-disabled={busy || refreshing} aria-busy={refreshing} aria-label={t("刷新网络")} title={t("刷新网络")} onClick={() => void refreshOverview()}><RefreshCw size={16} className={refreshing ? "spin" : undefined} aria-hidden="true"/></button>;
   // The desktop that owns its local host can join it into another network; a
@@ -452,7 +461,9 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
           <span>{t("{0} 台在线", onlineCount)}</span>
           {!!pendingCount && <span>{t("{0} 台待加入", pendingCount)}</span>}
         </p>
-        {authorityNotice && <p className="network-availability" id={authorityNoticeId} role="status">{authorityNotice}</p>}
+        {localHostStart && network.authorityKey === localHostKey && !canManage(authority)
+          ? <div className="network-local-start"><p className="network-availability" id={authorityNoticeId} role="status">{t("协调主机「{0}」就是这台电脑上的主机，目前已停用，所以暂时无法管理网络。启动后会自动重新连接。", authorityName)}</p><LocalHostStartButton control={localHostStart} className="network-secondary"/><LocalHostStartError control={localHostStart}/></div>
+          : authorityNotice && <p className="network-availability" id={authorityNoticeId} role="status">{authorityNotice}</p>}
         <div className="network-sync-shortcut">
           <button ref={routesOverviewTrigger} type="button" disabled={busy || preparingLocal} onClick={event => {
             event.currentTarget.focus({ preventScroll: true });

@@ -6,7 +6,8 @@ import { buildConversationRows, navigationItems } from "./conversation-inbox.js"
 import { conversationUnreadTotal } from './conversation-unread.js';
 import { flushWidgetStateWithin } from "./widget-state-lifecycle.js";
 import { ConversationBulkProvider, ConversationBulkToolbar } from './ConversationBulkSelection.js';
-import { localControllerMessage } from "./local-controller-message.js";
+import { localControllerMessage, localHostStartFailureMessage } from "./local-controller-message.js";
+import { LocalHostStartButton, LocalHostStartError, type LocalHostStartControl } from "./LocalHostStart.js";
 import { coalescedReader } from "./coalesced-reader.js";
 import { shareDirectory } from "./share-directory.js";
 import type { OpenNetwork, NetworkNavigationGuard } from "./network-navigation.js";
@@ -26,7 +27,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, useSyncExtern
 import { LoaderCircle, Monitor, Plus } from "lucide-react";
 import { HostRegistry, type RuntimeHost } from "./host-registry.js";
 import { HostConnections, networkHostBlocked, type ConnectedHost } from "./host-connections.js";
-import { prepareLocalController, recoverLocalController, watchLocalHostRecovery } from "./local-controller.js";
+import { prepareLocalController, recoverLocalController, startLocalHost, watchLocalHostRecovery, type LocalControllerIssue } from "./local-controller.js";
 import { LocalControllerStartupError, type StartupAttempt } from "./startup-diagnostics.js";
 import { StartupFailure } from "./StartupFailure.js";
 import { cache, ClientCache, defaultPreferences, type Identity, type Preferences, type SidebarLayout, type ConversationActivity } from "./storage.js";
@@ -173,10 +174,39 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   const nativeBootAttempted = useRef(false);
   const localControllerEpoch = useRef(0);
   const lastLocalNotice = useRef("");
+  // The issue itself, not just its text: a stopped local host offers the
+  // explicit start action (issue #63). Automatic recovery never starts it.
+  const [localIssue, setLocalIssue] = useState<LocalControllerIssue>();
   const showLocalIssue = (issue?: Parameters<typeof localControllerMessage>[0]) => {
+    setLocalIssue(issue);
     const message = issue ? localControllerMessage(issue) : "";
     if (message !== lastLocalNotice.current) { lastLocalNotice.current = message; setLocalStartupError(message); }
   };
+  const [localStart, setLocalStart] = useState({ busy: false, error: "" });
+  const localStartBusy = useRef(false);
+  const localRecovery = useRef<(() => Promise<unknown>) | undefined>(undefined);
+  const startLocal = async () => {
+    if (localStartBusy.current) return;
+    localStartBusy.current = true; setLocalStart({ busy: true, error: "" });
+    const failed = (error: string) => {
+      setLocalStart({ busy: false, error });
+      // A banner closed while starting must not hide why the start failed.
+      lastLocalNotice.current = localControllerMessage("stopped"); setLocalStartupError(lastLocalNotice.current);
+    };
+    try {
+      const result = await startLocalHost();
+      if (!result.ok) { failed(result.message); return; }
+      // Reconnect through the ordinary local-controller recovery right away
+      // instead of waiting for the next focus/60-second check.
+      await localRecovery.current?.();
+      setLocalStart({ busy: false, error: "" });
+    } catch { failed(localHostStartFailureMessage()); }
+    finally { localStartBusy.current = false; }
+  };
+  const localStartControl: LocalHostStartControl = { ...localStart, start: () => { void startLocal(); } };
+  const localStopped = localIssue === "stopped";
+  // A new stopped episode starts without an earlier attempt's failure text.
+  useEffect(() => { if (!localStartBusy.current) setLocalStart(old => old.error ? { busy: false, error: "" } : old); }, [localIssue]);
   const [startupAttempts, setStartupAttempts] = useState<StartupAttempt[]>();
   const [preferences, setPreferences] = useState<Preferences>(defaultPreferences);
   const [activeId, setActiveId] = useState(""), [filter, setFilter] = useState("");
@@ -330,7 +360,8 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   useEffect(() => {
     if (loading || !nativeBootAttempted.current || !isDesktop()) return;
     let alive = true;
-    const stop = watchLocalHostRecovery(async () => {
+    let inFlight: Promise<{}> | undefined;
+    const recover = () => inFlight ??= (async () => {
       const expectedKey = pool.localHostKey, epoch = localControllerEpoch.current;
       const current = () => alive && pool.localHostKey === expectedKey && localControllerEpoch.current === epoch;
       try {
@@ -347,8 +378,13 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
         }
       }
       return {};
-    });
-    return () => { alive = false; stop(); };
+    })().finally(() => { inFlight = undefined; });
+    // An explicit start waits for any check already in flight (it may have read
+    // the stopped state), then runs a fresh one.
+    const recoverNow = async () => { await inFlight?.catch(() => undefined); await recover(); };
+    localRecovery.current = recoverNow;
+    const stop = watchLocalHostRecovery(recover);
+    return () => { alive = false; stop(); if (localRecovery.current === recoverNow) localRecovery.current = undefined; };
   }, [loading, pool, registry]);
   useEffect(() => {
     if (loading) return;
@@ -490,7 +526,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
     const combinedFolders = !preferences.sidebarGroupByHost && entries.length > 1;
     const bulkScope = (children: ReactNode) => <ConversationBulkProvider hosts={bulkHosts} showGroupHint={layout !== "conversations"} visible={board ? board.visible : !pairingVisible && currentId === activeId && !adhd} scopeKey={`${layout}:${filter}:${!!board}`} archived={(host, ids) => { if (!board) conversationsArchived(host.id, ids); }}><div className="host-directory"><ConversationBulkToolbar/><FolderListOptions hosts={bulkHosts} combined={combinedFolders} defaultConnection={toolbarHost?.connection} visible={board ? board.visible : !pairingVisible && currentId === activeId && !adhd} scope={`${layout}:${filter}:${!!board}:${preferences.sidebarGroupByHost}`} options={grouping}>{children}</FolderListOptions></div></ConversationBulkProvider>;
     if (board?.query && !entries.some(entry => dataFor(entry.host.id)?.conversations.some(c => !c.archived))) return bulkScope(<><p className="empty-sidebar">{t("没有找到对话，换个关键词试试。")}</p></>);
-    const unavailable = (entry: ConnectedHost) => <button className="host-unavailable" onClick={() => setManaging(true)}>{entry.host.name} · {entry.host.state === "removing" ? t("等待完成移除") : entry.error ? t("无法打开主机，请重试") : t("正在连接主机…")}</button>;
+    const unavailable = (entry: ConnectedHost) => <button className="host-unavailable" onClick={() => setManaging(true)}>{entry.host.name} · {entry.host.state === "removing" ? t("等待完成移除") : entry.error ? t("无法打开主机，请重试") : localStopped && entry.host.publicKey === localHostKey ? t("本机主机已停用") : t("正在连接主机…")}</button>;
     if (combinedFolders) {
       const ready = entries.flatMap(entry => {
         const data = dataFor(entry.host.id);
@@ -578,7 +614,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   if (legacyReset) return <Suspense fallback={<div className="loading-screen" role="status"><LoaderCircle className="spin"/></div>}><LocalReset complete={() => location.reload()}/></Suspense>;
   if ((error || localStartupError) && !initialized.current) return <StartupFailure message={localStartupError || error} attempts={startupAttempts}/>;
   return <BotMessageHostsContext.Provider value={state.hosts}><WorkbenchLibraryContext.Provider value={{ hosts: libraryHosts, open: openLibraryFile, request: workbenchFileRequest, consumed: serial => setWorkbenchFileRequest(old => old?.serial === serial ? undefined : old) }}>{state.hosts.filter((entry) => entry.connection).map((entry) => <DirectoryObserver key={entry.host.registrationId} entry={entry} changed={changed}/>)}
-    {!!localStartupError && <div className="host-error" role="alert">{localStartupError}<button onClick={() => setLocalStartupError("")}>{t("关闭")}</button></div>}
+    {!!localStartupError && <div className="host-error" role="alert">{localStartupError}{localStopped && <LocalHostStartButton control={localStartControl}/>}<button onClick={() => setLocalStartupError("")}>{t("关闭")}</button>{localStopped && <LocalHostStartError control={localStartControl}/>}</div>}
     {!!error && <div className="host-error" role="alert">{error}<button onClick={() => setError("")}>{t("关闭")}</button></div>}
     {adhd && !pairingVisible && <Suspense fallback={<div className="loading-screen">{t("正在读取面板…")}</div>}><AdhdBoard navigationRejected={serial => setWorkbenchFileRequest(old => old?.serial === serial ? undefined : old)} busNavigation={busNavigation} compact={!adhdBoard} agentBus={desktopBoard} activeHostId={activeId} navigation={boardNavigation} registry={registry} preferences={preferences} updatePreferences={setPreferences} Workspace={Workspace} sidebarControls={controls} tools={{ manageHosts: openNetwork, manageConnections: openConnections, addHost: () => { setAdhd(false); setPairing(true); }, createBot: hostId => { setAdhd(false); command(hostId, { kind: "bot" }); } }} renderConversations={options => navigation(activeId, { ...(directories[activeId] ?? { conversations: [], bots: [], pins: [], activity: {} }), selected: selected[activeId] ?? "" }, options)}
       hosts={allHosts.map(entry => ({ ...entry, directory: directories[entry.host.id]?.registration === entry.host.registrationId ? directories[entry.host.id] : undefined, blocked: networkHostBlocked(entry, localHostKey), local: isDesktop() && entry.host.publicKey === localHostKey }))}
@@ -592,7 +628,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
     {boardEntryPending && <div className="adhd-entry-notice" role="status"><span>{t("正在保存草稿…")}</span><button onClick={() => setBoardEntryPending(false)}>{t("取消")}</button></div>}
     {boardEntryConfirm && <CreationDialog title={t("有草稿尚未保存")} close={cancelBoardEntry} showHost={false} className="adhd-leave-dialog"><p>{state.hosts.filter(entry => workspaceLocks[entry.host.registrationId]?.dirty).map(entry => entry.host.name).join(" · ")}</p><p>{t("关闭后，未保存的文字或附件修改将丢失。已保存的内容和正在运行的任务会保留。")}</p><footer><button className="primary" onClick={cancelBoardEntry}>{t("继续编辑")}</button><button className="text-danger" disabled={workspaceLocked || state.hosts.some(entry => workspaceLocks[entry.host.registrationId]?.saving)} onClick={() => { setBoardEntryConfirm(false); continueBoardEntry(true); }}>{t("放弃未保存的修改")}</button></footer></CreationDialog>}
     {chooseCreation && <CreationDialog title={t("选择运行主机")} close={() => setChooseCreation(undefined)}><p>{t("Bot、工作区和会话将保存在所选主机上。群组只能加入这台主机的 Bot。")}</p><div className="host-choices">{hosts.map((entry) => <button key={entry.host.id} disabled={!entry.connection || entry.connection.state.status !== "online" || (chooseCreation === "bot" || chooseCreation === "schedule") && entry.connection.state.user?.role !== "owner"} onClick={() => { command(entry.host.id, { kind: chooseCreation }); setChooseCreation(undefined); }}><Monitor size={20}/><span><strong>{entry.host.name}</strong><small>{(chooseCreation === "bot" || chooseCreation === "schedule") && entry.connection?.state.user?.role !== "owner" ? t("需要管理员权限") : entry.connection?.state.status === "online" ? t("已连接") : t("离线")}</small></span></button>)}</div></CreationDialog>}
-    {managing && <PageLoadBoundary close={() => { setManaging(false); setInitialJoin(undefined); setNetworkInitialHostKey(undefined); setNetworkInitialHostDetails(false); networkNavigationGuard.current = undefined; }}><Suspense fallback={null}><NetworkManager entries={state.hosts} localHostKey={localHostKey} initialJoin={initialJoin} initialHostKey={networkInitialHostKey} initialHostDetails={networkInitialHostDetails} close={() => { setManaging(false); setInitialJoin(undefined); setNetworkInitialHostKey(undefined); setNetworkInitialHostDetails(false); networkNavigationGuard.current = undefined; }} addHost={() => leaveNetworkPage(() => setPairing(true))} manageConnections={() => openConnections(navigate => leaveNetworkPage(navigate))} confirmDevice={(hostKey, mode = "invite") => { setNetworkDeviceMode(mode); setNetworkDeviceHostKey(hostKey); }} onChanged={() => { void pool.refreshNetwork(); }}/></Suspense></PageLoadBoundary>}
+    {managing && <PageLoadBoundary close={() => { setManaging(false); setInitialJoin(undefined); setNetworkInitialHostKey(undefined); setNetworkInitialHostDetails(false); networkNavigationGuard.current = undefined; }}><Suspense fallback={null}><NetworkManager entries={state.hosts} localHostKey={localHostKey} localHostStart={localStopped ? localStartControl : undefined} initialJoin={initialJoin} initialHostKey={networkInitialHostKey} initialHostDetails={networkInitialHostDetails} close={() => { setManaging(false); setInitialJoin(undefined); setNetworkInitialHostKey(undefined); setNetworkInitialHostDetails(false); networkNavigationGuard.current = undefined; }} addHost={() => leaveNetworkPage(() => setPairing(true))} manageConnections={() => openConnections(navigate => leaveNetworkPage(navigate))} confirmDevice={(hostKey, mode = "invite") => { setNetworkDeviceMode(mode); setNetworkDeviceHostKey(hostKey); }} onChanged={() => { void pool.refreshNetwork(); }}/></Suspense></PageLoadBoundary>}
     {networkDeviceHost && <RuntimeHostContext.Provider value={networkDeviceHost.host.name}><Suspense fallback={null}><PreferencesPanel key={`${networkDeviceHost.host.registrationId}:${networkDeviceMode}`} connection={networkDeviceHost.connection!} preferences={preferences} update={setPreferences} initialSection="devices" initialPairingStep={networkDeviceMode === "manage" ? undefined : networkDeviceMode === "approve" ? 1 : 0} singleSection backLabel={t("返回设备与网络")} close={() => setNetworkDeviceHostKey(undefined)} forget={async () => { setNetworkDeviceHostKey(undefined); openConnections(navigate => leaveNetworkPage(navigate)); }} manageNetwork={(beforeLeave, hostKey) => {
       const navigate = () => { setNetworkDeviceHostKey(undefined); setNetworkInitialHostKey(hostKey ?? networkDeviceHost.host.publicKey); };
       if (beforeLeave) beforeLeave(navigate); else navigate();
