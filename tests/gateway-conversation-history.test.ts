@@ -62,3 +62,20 @@ it("reauthorizes receipt lookup and never reveals an old result after revocation
   await expect(run("history.receipt", input)).rejects.toThrow("history_forbidden");
   expect(bridge.applyConversationHistory).toHaveBeenCalledOnce();
 });
+
+it("finalizes a release of an operation left unconfirmed, but not while this process runs it and never as a success", async () => {
+  const cancelled = { outcome: "rejected" as const, reason: "cancelled" as const };
+  bridge.applyConversationHistory.mockImplementationOnce(() => new Promise(() => undefined));
+  void run("history.apply", input);
+  await vi.waitFor(() => expect(bridge.applyConversationHistory).toHaveBeenCalledOnce(), { timeout: 15_000 });
+  await expect(run("history.finalize", { ...input, result: cancelled })).rejects.toThrow("history_operation_running");
+  const restarted = gatewayConversationHistory(bridge, channel, runtime, directory, "bot");
+  await expect(restarted("history.finalize", { ...input, result: native, destinationConversationId: "fork" })).rejects.toThrow("history_receipt_unconfirmed");
+  expect(await restarted("history.finalize", { ...input, result: cancelled })).toEqual({ revision: "next_revision" });
+  expect(bridge.finalizeConversationHistory).toHaveBeenLastCalledWith(expect.objectContaining({ operationId: input.operationId, result: cancelled }));
+  // Never admitted by this Gateway at all: nothing to clear, still finalized.
+  expect(await restarted("history.finalize", { ...input, operationId: "never", result: cancelled })).toEqual({ revision: "next_revision" });
+  // A recorded success is not released.
+  await restarted("history.apply", { ...input, operationId: "done" });
+  await expect(restarted("history.finalize", { ...input, operationId: "done", result: cancelled })).rejects.toThrow("history_receipt_unconfirmed");
+}, 30_000);

@@ -68,10 +68,15 @@ export function gatewayConversationHistory(bridge: HistoryBridge, channel: Gatew
     }
     if (method === "history.finalize") {
       const final = finalizeSchema.parse(p), reservation = await receipts.inspect(`${key}:identity`), receipt = await receipts.inspect(`${key}:native`);
-      if (!reservation?.result?.ok || reservationSchema.parse(reservation.result.result).identity !== identity) throw new Error("history_request_conflict");
-      const reservedScope = reservationSchema.parse(reservation.result.result);
-      if (reservedScope.workspaceOverride) scope.workspaceOverride = reservedScope.workspaceOverride;
-      if (!receipt?.result?.ok || receipt.state !== "complete" || JSON.stringify(historyNativeResultSchema.parse(receipt.result.result)) !== JSON.stringify(final.result)) throw new Error("history_receipt_unconfirmed");
+      const reservedScope = reservation?.state === "complete" && reservation.result?.ok ? reservationSchema.parse(reservation.result.result) : undefined;
+      const confirmed = receipt?.state === "complete" && receipt.result?.ok ? historyNativeResultSchema.parse(receipt.result.result) : undefined;
+      // The Hub releases an operation left unconfirmed past its time as a
+      // rejection, without a matching receipt; never one still running here.
+      const releasing = final.result.outcome === "rejected" && (!confirmed || confirmed.outcome === "unknown");
+      if (releasing && receipts.isRunning(`${key}:native`)) throw new Error("history_operation_running");
+      if (reservedScope ? reservedScope.identity !== identity : !releasing) throw new Error("history_request_conflict");
+      if (reservedScope?.workspaceOverride) scope.workspaceOverride = reservedScope.workspaceOverride;
+      if (!releasing && (!confirmed || JSON.stringify(confirmed) !== JSON.stringify(final.result))) throw new Error("history_receipt_unconfirmed");
       if (!bridge.finalizeConversationHistory) throw new Error("history_unsupported");
       const destinationKey = final.destinationConversationId ? buildCoreConversationKey(final.destinationConversationId) : undefined;
       if (final.action.kind === "fork" && final.result.outcome === "applied") {

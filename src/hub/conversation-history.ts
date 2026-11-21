@@ -15,6 +15,16 @@ type HistoryHost = {
   log?(line: string): void;
 };
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+/**
+ * An operation still unconfirmed this long after it was admitted is released:
+ * its conversation can be used again and a new operation can be asked for.
+ * Longer than a live Gateway can spend on one operation (Codex allows 180 s
+ * for thread/fork and as long again to read the fork back; Claude's helper
+ * runs are 70 s at most each), so in practice only an operation whose Gateway
+ * ended is released.
+ */
+export const HISTORY_RELEASE_AFTER_MS = 10 * 60_000;
+const released: HistoryNativeResult = { outcome: "rejected", reason: "cancelled" };
 const publicResult = (row: OperationRow) => historyOperationSchema.parse(JSON.parse(row.result_json));
 /** One Host log line for an operation that ended, or whose outcome is not known. */
 const logLine = (row: Pick<OperationRow, "id" | "bot_id" | "action_json">, state: string, reason?: string) => {
@@ -27,6 +37,7 @@ const logLine = (row: Pick<OperationRow, "id" | "bot_id" | "action_json">, state
  * completes already-confirmed local bindings and Hub projections. */
 export class HubConversationHistory {
   private finishing = new Map<string, Promise<void>>();
+  private releasing?: Promise<void>;
   constructor(private readonly store: HubStore, private readonly host: HistoryHost) {}
 
   async authorizeInTransaction(userId: string, botId: string, conversationId: string): Promise<Conversation> {
@@ -241,6 +252,29 @@ export class HubConversationHistory {
     });
     if (settled) this.host.log?.(settled);
     this.store.emitCommitted(events); if (changed) await this.host.changed(changed);
+  }
+  /** Releases operations left unconfirmed for HISTORY_RELEASE_AFTER_MS. A result the Gateway recorded meanwhile still wins. */
+  releaseExpired(now = Date.now()): Promise<void> {
+    return this.releasing ??= (async () => {
+      const rows = await this.store.db.serial(() => this.store.db.all<OperationRow>("SELECT * FROM history_operations WHERE state NOT IN ('applied','rejected') AND created_at<? ORDER BY created_at LIMIT 20", [now - HISTORY_RELEASE_AFTER_MS]));
+      for (const row of rows) if (this.host.available(row.bot_id) === "ready") await this.release(row).catch(() => undefined);
+    })().finally(() => { this.releasing = undefined; });
+  }
+  private async release(row: OperationRow): Promise<void> {
+    await this.reconcileRow(row);
+    const current = await this.store.db.serial(() => this.row(row.id));
+    if (!current || ["applied", "rejected"].includes(current.state)) return;
+    // A confirmed result is finalized by its own path, never replaced here.
+    if (current.native_result_json && historyNativeResultSchema.parse(JSON.parse(current.native_result_json)).outcome !== "unknown") return;
+    // The Gateway refuses while the operation is still running there.
+    const finalized = z.object({ revision: idSchema }).strict().parse(await this.host.call(row.bot_id, "history.finalize", { ...this.workerInput(current), result: released }));
+    const done = await this.store.db.transaction(async () => {
+      const latest = (await this.row(row.id))!; if (["applied", "rejected"].includes(latest.state)) return false;
+      const operation: HistoryOperation = { ...publicResult(latest), state: "rejected", reason: "cancelled", resultingRevision: finalized.revision };
+      await this.store.db.run("UPDATE history_operations SET state='rejected',native_result_json=?,result_json=?,updated_at=? WHERE id=?", [JSON.stringify(released), JSON.stringify(operation), Date.now(), row.id]);
+      return true;
+    });
+    if (done) this.host.log?.(logLine(current, `released after ${HISTORY_RELEASE_AFTER_MS / 60_000} min unconfirmed`, "cancelled"));
   }
   async recoverBot(botId: string): Promise<void> {
     const rows = await this.store.db.serial(() => this.store.db.all<OperationRow>("SELECT * FROM history_operations WHERE bot_id=? AND state NOT IN ('applied','rejected') ORDER BY created_at LIMIT 100", [botId]));

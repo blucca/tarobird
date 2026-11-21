@@ -118,7 +118,15 @@ replayed. Reconnect recovery reads existing receipts and can complete local
 binding or Hub projection for a confirmed native result.
 
 A disconnect, timeout, interrupted receipt or unconfirmed native result remains
-unknown. The source remains fenced. Status lookup does not invoke the mutation
+unknown. The source remains fenced, for at most 10 minutes from admission:
+longer than a live Gateway can spend on one operation (Codex allows 180 s for
+`thread/fork` and as long again to read the fork back). The Hub then reads the
+Gateway receipt once more; a recorded result is finalized as usual. Otherwise
+the operation is released as rejected (`cancelled`): the Gateway clears its
+fence unless it is still running the operation itself, and the conversation can
+be used and forked again. A fork or rewind the engine did complete but never
+recorded stays outside TaroBird: a fork remains an unbound native session, a
+rewind remains in effect natively while App messages keep no exclusion mark. Status lookup does not invoke the mutation
 again. Do not change the request ID to retry an uncertain mutation. No generic
 reset/rebind bypass is provided by this feature.
 

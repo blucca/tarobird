@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { HubStore } from "../src/hub/store.js";
-import { HubConversationHistory } from "../src/hub/conversation-history.js";
+import { HISTORY_RELEASE_AFTER_MS, HubConversationHistory } from "../src/hub/conversation-history.js";
 import { HubPromptQueue } from "../src/hub/prompt-queue.js";
 import type { HistoryNativeResult } from "../src/client-protocol/conversation-history.js";
 import type { SteeringApplication } from "../src/client-protocol/steering-outcome.js";
@@ -227,4 +227,33 @@ it("keeps the Gateway's running block and capabilities while the reply's own del
   expect(await history.snapshot("owner", "bot", conversationId)).toEqual({ supported: true, blocked: "busy", capabilities: { rewind: false, fork: true, anchoredFork: true } });
   // Idle on the Gateway with input still waiting: that is the queue.
   expect(await history.snapshot("owner", "bot", conversationId)).toMatchObject({ blocked: "queued", revision: "revision" });
+});
+
+it("releases an operation still unconfirmed after its time, unless the Gateway recorded a result meanwhile", async () => {
+  const later = () => Date.now() + HISTORY_RELEASE_AFTER_MS + 1;
+  call.mockImplementationOnce(async () => { throw new Error("gateway_gone"); });
+  const lost = await history.start("owner", conversationId, change("lost"));
+  expect(lost.state).toBe("unknown");
+  await history.releaseExpired();
+  expect((await history.status("owner", "bot", conversationId, "lost")).state).toBe("unknown");
+  await expect(store.sendMessage("owner", { conversationId, clientMsgId: "blocked", text: "x", attachments: [] })).rejects.toThrow("history_operation_pending");
+  call.mockImplementationOnce(async () => ({}));
+  await history.releaseExpired(later());
+  expect(call).toHaveBeenLastCalledWith("bot", "history.finalize", expect.objectContaining({ operationId: lost.operationId, result: { outcome: "rejected", reason: "cancelled" } }));
+  expect(await history.status("owner", "bot", conversationId, "lost")).toMatchObject({ state: "rejected", reason: "cancelled", resultingRevision: "next_revision" });
+  expect(log).toHaveBeenLastCalledWith(`history fork whole released after 10 min unconfirmed (cancelled) operation=${lost.operationId} bot=bot`);
+  await store.sendMessage("owner", { conversationId, clientMsgId: "free", text: "x", attachments: [] });
+  await store.db.run("UPDATE deliveries SET status='cancelled'");
+  // A result the Gateway recorded before the time ran out is finalized as usual.
+  call.mockImplementationOnce(async () => { throw new Error("gateway_gone"); });
+  const recorded = await history.start("owner", conversationId, change("recorded"));
+  expect(recorded.state).toBe("unknown");
+  await history.releaseExpired(later());
+  expect(await history.status("owner", "bot", conversationId, "recorded")).toMatchObject({ state: "applied", destinationConversationId: expect.any(String) });
+  // Refused by the Gateway (still running there): left as it was, to be tried again.
+  call.mockImplementationOnce(async () => { throw new Error("gateway_gone"); });
+  const running = await history.start("owner", conversationId, change("running"));
+  call.mockImplementationOnce(async () => ({})).mockImplementationOnce(async () => { throw new Error("history_operation_running"); });
+  await history.releaseExpired(later());
+  expect((await history.status("owner", "bot", conversationId, "running")).state).toBe("unknown");
 });

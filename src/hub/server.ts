@@ -645,7 +645,12 @@ export class HubServer {
       catch (error) { controller.abort(error); }
     }
     for (const botId of this.bots.keys()) void this.dispatchActions(botId).catch(() => this.options.onWarning?.("action_dispatch_failed"));
+    if (Date.now() >= this.historyReleaseCheckAt) {
+      this.historyReleaseCheckAt = Date.now() + 10_000;
+      this.trackTask(this.conversationHistory.releaseExpired().catch(() => this.options.onWarning?.("history_release_failed")));
+    }
   }
+  private historyReleaseCheckAt = 0;
   private originAllowed(req: IncomingMessage): boolean {
     const origin = req.headers.origin;
     if (!origin) return true;

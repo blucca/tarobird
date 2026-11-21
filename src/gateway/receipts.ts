@@ -28,6 +28,8 @@ export class GatewayReceipts {
     const id = createHash("sha256").update(key).digest("hex");
     return new JsonStore(path.join(this.directory, "gateway-receipts", `${id}.json`), value => receiptSchema.nullable().parse(value)).read(null);
   }
+  /** Whether this process is running the operation now. */
+  isRunning(key: string): boolean { return this.active.has(key); }
   run(key: string, operation: () => Promise<Json>, idempotentRetryMs = 0, authorize?: () => Promise<void>): Promise<ReceiptResult> {
     // Each caller must still be authorized before joining someone else's work.
     if (authorize) return authorize().then(() => this.runAuthorized(key, operation, idempotentRetryMs, authorize));
