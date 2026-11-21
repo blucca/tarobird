@@ -81,7 +81,7 @@ function windows({ faults = new Set(), existing = false, host = false, displayNa
         if (faults.has('processes')) return { code: 0, stdout: 'ERROR\r\n' };
         return { code: 0, stdout: `${JSON.stringify([...procs.values()].filter(item => item.image === image).map(({ image: _, ...rest }) => rest))}\r\n` };
       }
-      if (script.includes('CreateShortcut')) return { code: 0, stdout: `${exe}\r\n` };
+      if (script.includes('GetLink.Path')) return { code: 0, stdout: `${exe}\r\n` };
       // The shortcut's own System.AppUserModel.ID (written by the installer) and Start's list.
       if (script.includes('System.AppUserModel.ID')) return { code: 0, stdout: faults.has('shortcut-aumid') ? '\r\n' : `${AUMID}\r\n` };
       if (script.includes('Get-StartApps') && faults.has('startapps-error')) return { code: 1, stdout: '', stderr: "Get-StartApps : The term 'Get-StartApps' is not recognized as the name of a cmdlet\r\n" };

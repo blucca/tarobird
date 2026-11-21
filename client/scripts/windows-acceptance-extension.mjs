@@ -132,7 +132,8 @@ export function makeExtension(sys, options) {
   const sameFingerprint = (a, b, files = FINGERPRINT) => files.every(file => a[file] !== 'absent' && a[file] === b[file]);
   const values = async key => (await ctx.reg(key));
   const shortcutOf = () => W.join(sys.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'TaroBird.lnk');
-  const shortcutTarget = async link => existsSync(link) ? (await sys.powershell(`(New-Object -ComObject WScript.Shell).CreateShortcut('${ps(link)}').TargetPath`)).stdout.trim() : '';
+  // Unicode shell link read (WScript.Shell's TargetPath gave "TB ?? ??" in run 44853329237).
+  const shortcutTarget = async link => existsSync(link) ? (await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${ps(W.dirname(link))}').ParseName('${ps(W.basename(link))}'); [string]$i.GetLink.Path`)).stdout.trim() : '';
   const shortcutAppId = async link => existsSync(link) ? (await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${ps(W.dirname(link))}').ParseName('${ps(W.basename(link))}'); [string]$i.ExtendedProperty('System.AppUserModel.ID')`)).stdout.trim() : '';
   /** Installs with the given switches and, last, an unquoted /D=. */
   const install = async (receipt, phase, installer, { dir, args = ['/S'], id } = {}) => {
@@ -398,17 +399,25 @@ async function groupB(x, receipt) {
     const ui = await driveInstaller(x);
     receipt.info(S, 'ui-events', describe(ui));
     if (ui.error || !ui.seen) { receipt.add(S, 'gui-driven', 'skip', `the installer UI could not be driven: ${describe(ui)}`); return { ok: false, skipped: true, detail: 'GUI not driven' }; }
-    const pages = (ui.events ?? []).map(e => e.kind);
-    receipt.expect(S, 'gui-took-uninstall-before-install', pages.includes('reinstall-page') && (ui.events ?? []).some(e => e.kind === 'old-uninstaller'), describe(ui));
-    if (ui.stuck) receipt.add(S, 'gui-driven', 'skip', `stuck: ${(ui.events ?? []).find(e => e.kind === 'stuck')?.detail ?? ''}`);
-    return { ok: ui.exit === 0 && !ui.stuck, skipped: ui.stuck, detail: `GUI setup exit ${ui.exit}${ui.stuck ? ' (stuck)' : ''} in ${ui.seconds} s` };
+    const events = ui.events ?? [];
+    // Review N6: after the fix the INSTALLED old uninstaller must not ask for a language.
+    const asked = events.filter(e => e.kind === 'old-uninstaller-language');
+    receipt.expect(S, 'old-uninstaller-never-asks-language', !asked.length, asked.length ? `asked: ${asked.map(e => e.detail).join(' ; ')}` : 'no language chooser from the old uninstaller');
+    const oldSeen = events.some(e => e.kind === 'old-uninstaller');
+    // A driver that could not get through (stuck, or setup still waiting when it
+    // was ended) proves nothing about the product: skip, never fail.
+    const notThrough = ui.stuck || (ui.exit === -1 && !oldSeen);
+    if (notThrough) receipt.add(S, 'gui-driven', 'skip', ui.stuck ? `stuck: ${events.find(e => e.kind === 'stuck')?.detail ?? ''}` : `setup ended at the time limit before the old uninstaller was seen; ${describe(ui)}`);
+    else receipt.expect(S, 'gui-took-uninstall-before-install', events.some(e => e.kind === 'reinstall-page') && oldSeen, describe(ui));
+    return { ok: ui.exit === 0 && !notThrough, skipped: notThrough, detail: `GUI setup exit ${ui.exit}${notThrough ? ' (driver did not get through)' : ''} in ${ui.seconds} s` };
   });
 }
 
 /** Runs the candidate installer interactively while the install driver presses
  * through it; returns the driver's events and the installer's exit code. */
 async function driveInstaller(x) {
-  const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, 'windows-install-ui-driver.ps1'), '-TimeoutSec', '300'];
+  const outFile = W.join(x.tmp, `install-ui-${Date.now()}.json`);
+  const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, 'windows-install-ui-driver.ps1'), '-TimeoutSec', '300', '-SetupPath', x.options.installer, '-OutFile', outFile];
   const driver = spawn('powershell.exe', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   let stdout = '', stderr = '', driverDone = false;
   driver.stdout.on('data', chunk => { stdout += chunk; }); driver.stderr.on('data', chunk => { stderr += chunk; });
@@ -418,7 +427,9 @@ async function driveInstaller(x) {
   if (exit === 'timeout') spawn('taskkill.exe', ['/PID', String(setup.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }).once('error', () => {});
   await Promise.race([driverExit, x.sys.sleep(30_000)]);
   if (!driverDone) driver.kill();
-  try { return { ...JSON.parse(stdout.trim().split(/\r?\n/).pop()), exit: exit === 'timeout' ? -1 : exit }; } catch { return { error: `${stdout.slice(-800)} ${stderr.slice(-800)}`, events: [], exit }; }
+  let parsed;
+  try { parsed = JSON.parse((await readFile(outFile, 'utf8')).replace(/^\uFEFF/, '')); } catch { try { parsed = JSON.parse(stdout.trim().split(/\r?\n/).pop()); } catch { /* below */ } }
+  return parsed ? { ...parsed, exit: exit === 'timeout' ? -1 : exit } : { error: `${stdout.slice(-800)} ${stderr.slice(-800)}`, events: [], exit: exit === 'timeout' ? -1 : exit };
 }
 const describe = ui => ui.error ? `driver error: ${ui.error}` : `seen ${ui.seen}, stuck ${ui.stuck}, ${ui.seconds}s, setup exit ${ui.exit}; events: ${(ui.events ?? []).map(e => `${e.kind}${e.detail ? `=${String(e.detail).slice(0, 160)}` : ''}`).join(' → ')}`;
 
@@ -456,6 +467,43 @@ const unitsText = units => units.map(unit => `U+${unit.toString(16).toUpperCase(
 /** The three code units before "TB-" (expected U+0020 U+00B7 U+0020). */
 const beforeCode = units => { for (let i = 3; i < units.length - 2; i++) if (units[i] === 0x54 && units[i + 1] === 0x42 && units[i + 2] === 0x2d) return units.slice(i - 3, i); return undefined; };
 const SEPARATOR = [0x20, 0xb7, 0x20];
+
+/** Records ProcessName, PID, parent and ExitStatus of every exit of `names`
+ * (Win32_ProcessStopTrace; the runner is elevated), proving itself on a
+ * whoami.exe first so an idle watcher cannot pass as "nothing exited". */
+export async function watchExits(x, names) {
+  const log = W.join(x.tmp, `exits-${Date.now()}.log`), ready = `${log}.ready`;
+  const where = [...names, 'whoami.exe'].map(name => `ProcessName = '${name}'`).join(' OR ');
+  const script = `$ErrorActionPreference = 'Stop'; Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStopTrace WHERE ${where}" -SourceIdentifier tbexits | Out-Null; Set-Content -LiteralPath '${ps(ready)}' -Value 'ready'; while ($true) { $e = Wait-Event -SourceIdentifier tbexits -Timeout 1; if ($e) { $n = $e.SourceEventArgs.NewEvent; Add-Content -LiteralPath '${ps(log)}' -Value "$($n.ProcessName) pid=$($n.ProcessID) parent=$($n.ParentProcessID) exit=$($n.ExitStatus)"; Remove-Event -EventIdentifier $e.EventIdentifier } }`;
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+  let stderr = '', done = false; child.stderr.on('data', chunk => { stderr += chunk; });
+  const exited = new Promise(resolve => { child.once('exit', () => { done = true; resolve(); }); child.once('error', error => { done = true; stderr += String(error); resolve(); }); });
+  const lines = async () => { try { return (await readFile(log, 'utf8')).split(/\r?\n/).filter(Boolean); } catch { return []; } };
+  for (let waited = 0; waited < 30_000 && !existsSync(ready) && !done; waited += 250) await x.sys.sleep(250);
+  let proven = false;
+  if (existsSync(ready) && !done) {
+    await x.exec('whoami.exe', [], { timeout: 30_000 });
+    for (let waited = 0; waited < 10_000 && !proven; waited += 250) { proven = (await lines()).some(line => /^whoami\.exe /i.test(line)); if (!proven) await x.sys.sleep(250); }
+  }
+  const skip = (await lines()).length;
+  return {
+    detail: proven ? `exit watcher pid ${child.pid} saw its whoami.exe check` : `exit watcher not proven: ${stderr.trim().slice(0, 300) || 'no answer'}`,
+    stop: async () => { await x.sys.sleep(3000); const seen = (await lines()).slice(skip).filter(line => !/^whoami\.exe /i.test(line)); if (!done) { child.kill(); await Promise.race([exited, x.sys.sleep(15_000)]); } return proven ? seen : ['(watcher not proven)', ...seen]; },
+  };
+}
+
+/** Processes and Host lock state at a moment (Host directory: %APPDATA%\com.tarobot.client\host). */
+async function hostState(x) {
+  const host = W.join(x.sys.env.APPDATA, 'com.tarobot.client', 'host');
+  const files = [];
+  for (const name of ['instance.lock.json', 'host-service.json', 'host-service-refresh.json', 'update-in-progress.json']) {
+    try { files.push(`${name}=${(await readFile(W.join(host, name), 'utf8')).replace(/\s+/g, ' ').slice(0, 240)}`); } catch { files.push(`${name}=absent`); }
+  }
+  const lock = /"pid"\s*:\s*(\d+)/.exec(files[0])?.[1];
+  const alive = lock ? (await x.sys.powershell(`if (Get-Process -Id ${lock} -ErrorAction SilentlyContinue) { 'alive' } else { 'gone' }`)).stdout.trim() : 'no lock pid';
+  const processes = (await x.sys.powershell(`Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(tarocub-client|tarobot-installer-helper|tarobot-desktop-core|node|Un_A|Au_|uninstall)\\.exe$' } | ForEach-Object { "$($_.ProcessId)<-$($_.ParentProcessId) $($_.Name) $($_.CommandLine)" }`)).stdout.trim().replace(/\r?\n/g, ' | ');
+  return `host dir ${existsSync(host) ? 'present' : 'absent'}; ${files.join('; ')}; lock pid ${lock ?? '-'} ${alive}; processes: ${processes || 'none'}`;
+}
 
 async function driveDialog(x, { release }) {
   const releaseFile = W.join(x.tmp, `dlg-release-${Date.now()}.flag`), releasedFile = `${releaseFile}.done`, outFile = `${releaseFile}.json`;
@@ -497,13 +545,25 @@ async function groupD(x, receipt) {
     }
     const held = await x.lock(W.join(dir, LOCK_TARGET));
     if (!held.held) { receipt.add(S, 'induce-locked-file', 'skip', held.detail); await held.release(); continue; }
+    // Exit status of every installer-helper run (the Host stop is
+    // `tarobot-installer-helper.exe --stop-desktop-host`), from WMI stop traces.
+    const exits = await watchExits(x, ['tarobot-installer-helper.exe', 'node.exe']);
+    receipt.info(S, 'exit-watcher', exits.detail);
+    let atDialog;
     x.sys.launch(W.join(dir, 'uninstall.exe'));
-    const ui = await driveDialog(x, { release: held.release });
+    const ui = await driveDialog(x, { release: async () => { atDialog = await hostState(x); await held.release(); } });
     await held.release();
+    const helperExits = await exits.stop();
+    receipt.info(S, 'helper-exits', helperExits.join(' ; ') || 'none recorded');
     const ev = kind => (ui.events ?? []).find(e => e.kind === kind)?.detail;
     receipt.info(S, 'ui-events', ui.error ? `driver error: ${ui.error}` : (ui.events ?? []).map(e => e.kind).join(' → '));
     if (!ui.captured) { receipt.add(S, 'dialog-captured', 'skip', `no diagnostic dialog was read: ${ui.error ?? JSON.stringify(ui.left ?? [])}`); await x.cleanSlate(receipt, S); continue; }
     receipt.info(S, 'dialog-text-uia', ev('problem-uia'));
+    const code = /TB-([A-Z0-9-]+)/.exec(ev('problem-uia') ?? '')?.[1];
+    receipt.info(S, 'state-at-first-dialog', atDialog ?? 'not captured');
+    // The locked program file must be the first stop; a Host-stop diagnostic
+    // with NSIS-only buttons is reported as a product problem with its evidence.
+    receipt.expect(S, 'first-dialog-is-files-remove', code === 'FILES-REMOVE', `first dialog TB-${code ?? '?'}; helper exits: ${helperExits.join(' ; ') || 'none'}; ${code && code !== 'FILES-REMOVE' ? `state then: ${atDialog ?? 'not captured'}` : ''}`);
     receipt.info(S, 'dialog-text-win32', ev('problem-win32'));
     for (const [source, hex] of [['uia', ev('problem-uia-hex')], ['win32', ev('problem-win32-hex')]]) {
       const units = codeUnits(hex);
