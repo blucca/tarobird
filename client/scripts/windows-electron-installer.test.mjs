@@ -552,7 +552,8 @@ function checkPassiveLanguage(nsi, language) {
   assert.match(between(code, 'Function .onInstSuccess', 'FunctionEnd'), /^\s*!insertmacro BirdKeepSavedLanguage$/m, 'after MUI saved the language');
   assert.equal(code.match(/BirdKeepSavedLanguage/g).length, 1);
   assert.match(code, /^!define MUI_LANGDLL_REGISTRY_VALUENAME "Installer Language"$/m);
-  ordered(code, '!insertmacro MUI_LANGUAGE "English"', '!include "installer-language.nsh"', 'Function .onInit');
+  // Macros are defined before their first use (the reinstall page); they expand after MUI_LANGUAGE.
+  ordered(code, '!define MUI_LANGDLL_REGISTRY_VALUENAME "Installer Language"', '!include "installer-language.nsh"', 'Function PageLeaveReinstall', '!insertmacro MUI_LANGUAGE "English"', 'Function .onInit');
   // Each program reads /P (and /UPDATE) before choosing, and has no other language dialog.
   for (const name of ['Function .onInit\n', 'Function un.onInit\n']) {
     const body = between(code, name, 'FunctionEnd');
@@ -779,4 +780,63 @@ test('the Host stopper for each install layout, including both left-over Tauri h
     ['companion install without a runtime', ['tarocub-client.exe'], { stopper: '', r0: 0 }],
   ];
   for (const [label, files, expected] of layouts) assert.deepEqual(stopperFor(hooks, files), expected, label);
+});
+
+// Extension run 44853329237 (B-2a, B-3): the reinstall page runs the installed
+// uninstaller in place. Released 1.5.0 and 1.5.1 uninstallers read the saved
+// language before /P and asked when there was none: a /P upgrade stopped, and
+// an interactive one asked a second time. The installer now lends the language
+// it uses for exactly the time that uninstaller runs.
+const KEY = '${MUI_LANGDLL_REGISTRY_ROOT} "${MUI_LANGDLL_REGISTRY_KEY}" "${MUI_LANGDLL_REGISTRY_VALUENAME}"';
+function checkLentLanguage(nsi, language) {
+  const lang = nsisCode(language), code = nsisCode(nsi);
+  // Trailing `; comment` text is not code (none of these lines holds a quoted semicolon).
+  const lines = text => text.split('\n').map(line => line.replace(/\s+;\s.*$/, '').trim()).filter(Boolean);
+  const consecutive = (text, property, ...expected) => {
+    const all = lines(text);
+    assert.ok(all.some((line, index) => expected.every((want, offset) => all[index + offset] === want)), `${property}: expected consecutive lines\n  ${expected.join('\n  ')}`);
+  };
+  const keepsErrors = ['StrCpy $BirdLentErrors 0', '${If} ${Errors}', 'StrCpy $BirdLentErrors 1', '${EndIf}'];
+  const restoresErrors = ['ClearErrors', '${If} $BirdLentErrors = 1', 'SetErrors', '${EndIf}'];
+  // Lend: only when the saved value is not already this run's language; remember what was there.
+  const lend = between(lang, '!macro BirdLendLanguage', '!macroend');
+  consecutive(lend, 'lend keeps the error flag', '!macro BirdLendLanguage', ...keepsErrors, 'Push $1', 'StrCpy $BirdLanguageLent 0', 'ClearErrors', `ReadRegStr $1 ${KEY}`,
+    '${If} ${Errors}', 'StrCpy $BirdLentFound 0', '${Else}', 'StrCpy $BirdLentFound 1', '${EndIf}',
+    '${If} $1 != $LANGUAGE', 'StrCpy $BirdLentValue $1', 'ClearErrors', `WriteRegStr ${KEY} $LANGUAGE`, '${IfNot} ${Errors}', 'StrCpy $BirdLanguageLent 1', '${EndIf}', '${EndIf}',
+    'Pop $1', ...restoresErrors);
+  // Return: only a value still the lent one is put back as found; a value the uninstaller changed or removed stays.
+  const back = between(lang, '!macro BirdReturnLanguage', '!macroend');
+  consecutive(back, 'return puts back only its own write', '!macro BirdReturnLanguage', ...keepsErrors, '${If} $BirdLanguageLent = 1', 'Push $1', 'ClearErrors', `ReadRegStr $1 ${KEY}`,
+    '${IfNot} ${Errors}', '${AndIf} $1 == $LANGUAGE', '${If} $BirdLentFound = 1', `WriteRegStr ${KEY} $BirdLentValue`, '${Else}', `DeleteRegValue ${KEY}`, '${EndIf}', '${EndIf}',
+    'Pop $1', 'StrCpy $BirdLanguageLent 0', '${EndIf}', ...restoresErrors);
+  // The installer lends right before it runs the installed uninstaller and takes it back right after,
+  // before it judges the exit code, so every outcome (success, failure, cancel, launch error) is covered.
+  const leave = between(code, 'Function PageLeaveReinstall', 'FunctionEnd');
+  consecutive(leave, 'lent around the in-place uninstaller', 'StrCpy $R1 "$R1 _?=$4"', '!insertmacro BirdLendLanguage', "ExecWait '$R1' $0", '!insertmacro BirdReturnLanguage', '${EndIf}', 'BringToFront', '${IfThen} ${Errors} ${|} StrCpy $0 2 ${|}');
+  ordered(leave, 'reinst_uninstall:', '${If} $WixMode = 1', 'ReadRegStr $R1 HKLM "$R6" "UninstallString"', "ExecWait '$R1' $0", '${Else}', '!insertmacro BirdLendLanguage', 'reinst_done:');
+  assert.equal(code.match(/!insertmacro BirdLendLanguage/g)?.length, 1, 'one lend (not for an MSI uninstaller)');
+  assert.equal(code.match(/!insertmacro BirdReturnLanguage/g)?.length, 1, 'one return');
+  ordered(code, '!define MUI_LANGDLL_REGISTRY_VALUENAME "Installer Language"', '!include "installer-language.nsh"', 'Function PageLeaveReinstall');
+}
+
+test('an installed uninstaller the installer runs in place finds the language already saved, only while it runs', async () => {
+  const [nsi, language] = await templates('installer.nsi', 'installer-language.nsh');
+  checkLentLanguage(nsi, language);
+  const lend = between(language, '!macro BirdLendLanguage', '!macroend'), back = between(language, '!macro BirdReturnLanguage', '!macroend');
+  const swap = (source, from, to) => { assert.ok(source.includes(from), `mutation source missing: ${from}`); return source.replace(from, to); };
+  const broken = [
+    ['lent only after the uninstaller ran', swap(nsi, "      !insertmacro BirdLendLanguage\n      ExecWait '$R1' $0\n", "      ExecWait '$R1' $0\n      !insertmacro BirdLendLanguage\n"), language, 'lent around'],
+    ['never given back', swap(nsi, "      !insertmacro BirdReturnLanguage\n", ''), language, 'lent around'],
+    ['given back only after the exit code was judged', swap(swap(nsi, "      !insertmacro BirdReturnLanguage\n", ''), '  reinst_done:', '    !insertmacro BirdReturnLanguage\n  reinst_done:'), language, 'lent around'],
+    ['lent to the MSI uninstaller too', swap(nsi, "      ReadRegStr $R1 HKLM \"$R6\" \"UninstallString\"\n", "      ReadRegStr $R1 HKLM \"$R6\" \"UninstallString\"\n      !insertmacro BirdLendLanguage\n"), language, 'one lend'],
+    ['lend leaks the error flag (a missing value would read as a failed uninstall)', nsi, swap(language, lend, lend.replace('  ClearErrors\n  ${If} $BirdLentErrors = 1\n    SetErrors\n  ${EndIf}\n', '')), 'lend keeps the error flag'],
+    ['lend rewrites a saved language that already matches', nsi, swap(language, lend, lend.replace('  ${If} $1 != $LANGUAGE\n', '  ${If} 1 = 1\n')), 'lend keeps the error flag'],
+    ['return overrides what the uninstaller changed', nsi, swap(language, back, back.replace('    ${AndIf} $1 == $LANGUAGE\n', '')), 'return puts back only its own write'],
+    ['return keeps the lent value', nsi, swap(language, back, back.replace(/      \$\{If\} \$BirdLentFound = 1\n[\s\S]*?      \$\{EndIf\}\n/, '')), 'return puts back only its own write'],
+    ['return leaks the error flag (a successful uninstall would read as failed)', nsi, swap(language, back, back.replace('  ClearErrors\n  ${If} $BirdLentErrors = 1\n    SetErrors\n  ${EndIf}\n', '')), 'return puts back only its own write'],
+  ];
+  for (const [label, candidate, candidateLanguage, property] of broken) {
+    assert.notEqual(candidate + candidateLanguage, nsi + language, `${label}: mutation applied`);
+    assert.throws(() => checkLentLanguage(candidate, candidateLanguage), error => error instanceof assert.AssertionError && error.message.includes(property), label);
+  }
 });
