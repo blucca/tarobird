@@ -38,7 +38,7 @@ const storedMembershipHostsSchema = z.object({ membership: z.object({ manifest: 
   hosts: z.array(z.object({ publicKey: z.string(), name: z.string(), state: z.string(), revoked: z.boolean() }).passthrough()) }).passthrough() }).passthrough().optional() }).passthrough();
 type CrossHostState = { snapshot: CrossHostMessageGrantsSnapshot; keys: Map<string, string>; live: Set<string>; listed: Set<string> };
 const resolutionCode = (error: TargetResolutionError): unknown => { try { return (JSON.parse(error.message) as { code?: unknown }).code; } catch { return undefined; } };
-/** A steer limit reached inside the creating transaction: that write rolls back and the message is queued instead. */
+/** A steer condition (limit, owner switch, engine, chat shape) that no longer holds inside the creating transaction: that write rolls back and the message is queued instead. */
 class SteerLimitReached extends Error { constructor(readonly reason: BotSteerFallbackReason) { super(reason); } }
 type ReplyState = { status: string; activeReplies?: number; text: string; files: { id: string; name: string; size: number; mime: string; sha256: string }[]; truncated: boolean };
 type WaitResult = BotMessageTarget & { messageId: string } & ReplyState & { delivery?: BotMessageDeliveryReceipt; reply?: { kind: "merged_turn"; turnMessageId: string } };
@@ -605,20 +605,25 @@ export class BotMessages {
   private async priorSteerRequest(key: string): Promise<boolean> {
     return !!(await this.store.db.serial(() => this.memo<IncomingMemo>(key)))?.steer;
   }
+  /** Caller holds the DB queue. The Hub-side conditions of a steer: checked
+   * when planning and again in the transaction that creates the record, so
+   * an owner switch turned off (or an engine/chat change) during the Gateway
+   * status call still queues the message. */
+  private async hubSteerConditionsInTransaction(c: DeliveryContext): Promise<BotSteerFallbackReason | undefined> {
+    const conversationId = c.target.conversationId;
+    if (await this.memo(steeringDisabledKey(c.bot.id))) return "steering_disabled";
+    const bot = await this.store.db.get<{ engine: string }>("SELECT engine FROM bots WHERE id=?", [c.bot.id]);
+    if (!bot || !supportsBotMessageSteerEngine(bot.engine)) return "unsupported_engine";
+    const conversation = await this.store.db.get<{ type: string; parent_id: string | null; ticket_json: string | null }>("SELECT type,parent_id,ticket_json FROM conversations WHERE id=?", [conversationId]);
+    const members = await this.store.db.get<{ count: number }>("SELECT COUNT(*) AS count FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [conversationId]);
+    if (conversation?.type !== "direct" || conversation.parent_id || conversation.ticket_json || members?.count !== 1) return "unsupported_conversation";
+    const times = (await this.memo<number[]>(memoKey("steer-rate", c.p.sourceKey, c.p.source.botId, c.bot.id)) ?? []).filter(t => t > Date.now() - STEER_EDGE_WINDOW_MS);
+    if (times.length >= STEER_EDGE_LIMIT) return "steer_rate_limited";
+  }
   private async steerPlan(c: DeliveryContext): Promise<{ reason: BotSteerFallbackReason } | { targetId: string; turn: string; epoch: string }> {
     if (c.input.attachments.length) return { reason: "attachments_unsupported" };
     const conversationId = c.target.conversationId;
-    const hub = await this.store.db.serial(async (): Promise<BotSteerFallbackReason | undefined> => {
-      await c.guard();
-      if (await this.memo(steeringDisabledKey(c.bot.id))) return "steering_disabled";
-      const bot = await this.store.db.get<{ engine: string }>("SELECT engine FROM bots WHERE id=?", [c.bot.id]);
-      if (!bot || !supportsBotMessageSteerEngine(bot.engine)) return "unsupported_engine";
-      const conversation = await this.store.db.get<{ type: string; parent_id: string | null; ticket_json: string | null }>("SELECT type,parent_id,ticket_json FROM conversations WHERE id=?", [conversationId]);
-      const members = await this.store.db.get<{ count: number }>("SELECT COUNT(*) AS count FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [conversationId]);
-      if (conversation?.type !== "direct" || conversation.parent_id || conversation.ticket_json || members?.count !== 1) return "unsupported_conversation";
-      const times = (await this.memo<number[]>(memoKey("steer-rate", c.p.sourceKey, c.p.source.botId, c.bot.id)) ?? []).filter(t => t > Date.now() - STEER_EDGE_WINDOW_MS);
-      if (times.length >= STEER_EDGE_LIMIT) return "steer_rate_limited";
-    });
+    const hub = await this.store.db.serial(async () => { await c.guard(); return this.hubSteerConditionsInTransaction(c); });
     if (hub) return { reason: hub };
     const capable = this.steering.capable(c.bot.id);
     if (capable === undefined) return { reason: "bot_offline" };
@@ -675,6 +680,8 @@ export class BotMessages {
         await c.scope();
         if (await this.memo(c.key)) throw new HubError("bot_message_request_conflict", 409);
         await this.admitNewInTransaction(c);
+        const refused = await this.hubSteerConditionsInTransaction(c);
+        if (refused) throw new SteerLimitReached(refused);
         const edgeKey = memoKey("steer-rate", c.p.sourceKey, c.p.source.botId, c.bot.id);
         const times = (await this.memo<number[]>(edgeKey) ?? []).filter(t => t > Date.now() - STEER_EDGE_WINDOW_MS);
         if (await this.turnSteersInTransaction(c.target.conversationId, c.bot.id, plan.targetId) >= STEER_TURN_LIMIT) throw new SteerLimitReached("turn_steer_limit");

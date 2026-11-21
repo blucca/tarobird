@@ -520,6 +520,32 @@ describe("second code review (C1–C5)", () => {
   });
 });
 
+describe("M4: the owner's switch and the plan's Hub conditions hold in the creating transaction", () => {
+  it("queues when the owner turns steering off while the Gateway status call is in flight", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const original = fake.status.getMockImplementation()!;
+    fake.status.mockImplementationOnce(async (bot: string, conversationId: string) => {
+      await b.botMessages.setSteering("owner", { botId: "target", allowed: false }, guard, guard, "owner");
+      return original(bot, conversationId);
+    });
+    const receipt = await send(chat.conversationId, "Fix", { delivery: "steer" });
+    expect(receipt).toMatchObject({ status: "queued", delivery: { actual: "fell_back_to_queue", reason: "steering_disabled" } });
+    expect(fake.steer).not.toHaveBeenCalled();
+    expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
+  });
+
+  it("queues when the engine changes away from Codex/Claude during the status call", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const original = fake.status.getMockImplementation()!;
+    fake.status.mockImplementationOnce(async (bot: string, conversationId: string) => {
+      await b.store.db.run("UPDATE bots SET engine='pi' WHERE id='target'");
+      return original(bot, conversationId);
+    });
+    expect(await send(chat.conversationId, "Fix", { delivery: "steer" })).toMatchObject({ delivery: { actual: "fell_back_to_queue", reason: "unsupported_engine" } });
+    expect(fake.steer).not.toHaveBeenCalled();
+  });
+});
+
 describe("M3: blank steer text", () => {
   it("gets the queue path's own answer before any record or Gateway call", async () => {
     const chat = await resolve(); await liveTurn(chat.conversationId);
