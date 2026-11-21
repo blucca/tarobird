@@ -41,6 +41,8 @@ jobs:
           Copy-Item "$env:SystemRoot\System32\whoami.exe" (Join-Path $work 'nsis.exe') -Force
           & $makensis /V2 "/DUTILS=$PWD\client\windows-electron\utils.nsh" "/DTARGET=$work\nsis.exe" "/DOUT=$env:RUNNER_TEMP\aumid-fixture.exe" client/scripts/acceptance-probe/aumid-fixture.nsi
           if ($LASTEXITCODE -ne 0) { throw "fixture build failed" }
+          & $makensis /V2 "/DUTILS=$PWD\client\windows-electron\utils.nsh" "/DTARGET=$work\nsis.exe" "/DLINK=TaroBird AUMID Probe Race" "/DOUT=$env:RUNNER_TEMP\aumid-fixture-race.exe" client/scripts/acceptance-probe/aumid-fixture.nsi
+          if ($LASTEXITCODE -ne 0) { throw "race fixture build failed" }
       - name: "Start Menu AppID probe (Windows PowerShell 5.1, like windows-acceptance.mjs)"
         if: ${{ !cancelled() }}
         shell: powershell

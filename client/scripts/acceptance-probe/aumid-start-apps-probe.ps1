@@ -11,7 +11,7 @@ if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Only a disposable GitH
 $started = Get-Date
 function Out-Line([string]$kind, $data) {
   $line = [ordered]@{ s = [math]::Round(((Get-Date) - $started).TotalSeconds, 1); kind = $kind; data = $data }
-  Write-Output (ConvertTo-Json -InputObject $line -Compress -Depth 5)
+  [Console]::Out.WriteLine((ConvertTo-Json -InputObject $line -Compress -Depth 5))
 }
 
 Add-Type -TypeDefinition @'
@@ -130,49 +130,52 @@ while ((Get-Date) -lt $deadline) {
 }
 # Sequences that mirror the installer: a link the shell has already indexed is
 # modified later (POSTINSTALL register() runs seconds after CreateShortcut).
-function Wait-Listed([string]$name, [string]$want, [int]$seconds) {
-  $t0 = Get-Date; $last = $null
+# Back-to-back Get-StartApps calls (no sleep): each line is a state change with
+# the time the call STARTED, relative to $t0 (the moment the link was written).
+function Wait-Listed([string]$name, [string]$want, [int]$seconds, [datetime]$t0 = (Get-Date)) {
+  $last = '<not polled>'; $polls = 0
   while (((Get-Date) - $t0).TotalSeconds -lt $seconds) {
-    $hit = @(Get-StartApps | Where-Object { $_.Name -eq $name })
-    $ids = (@($hit | ForEach-Object { $_.AppID }) -join ' ; ')
-    if ($ids -ne $last) { $last = $ids; Out-Line 'seq-listed' ([ordered]@{ name = $name; after = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1); appIds = $ids }) }
+    $at = ((Get-Date) - $t0).TotalSeconds
+    $hit = @(Get-StartApps | Where-Object { $_.Name -eq $name }); $polls++
+    $ids = $(if ($hit.Count) { (@($hit | ForEach-Object { $_.AppID }) -join ' ; ') } else { '<not listed>' })
+    if ($ids -ne $last) { $last = $ids; Out-Line 'seq-listed' ([ordered]@{ name = $name; callStartedAfter = [math]::Round($at, 2); poll = $polls; appIds = $ids }) }
     if ($hit.Count -and (-not $want -or ($hit | Where-Object { $_.AppID -eq $want }))) { return $true }
-    Start-Sleep -Seconds 2
   }
-  Out-Line 'seq-timeout' ([ordered]@{ name = $name; want = $want; seconds = $seconds; last = $last }); return $false
+  Out-Line 'seq-timeout' ([ordered]@{ name = $name; want = $want; seconds = $seconds; polls = $polls; last = $last }); return $false
 }
 # M: no AppID first (as if the NSIS stamp did not take), indexed, then register-style stamp.
 $m = @{ name = 'TaroBird AUMID Probe Modified'; id = 'com.tarobot.aumidprobe.modified' }
 $mExe = Join-Path $work 'modified.exe'; Copy-Item -LiteralPath "$env:SystemRoot\System32\whoami.exe" -Destination $mExe -Force
-$mLnk = Join-Path $programs "$($m.name).lnk"; $s = $wsh.CreateShortcut($mLnk); $s.TargetPath = $mExe; $s.Save()
-[void](Wait-Listed $m.name '' 60)
-$hr = [LinkProps]::Stamp($mLnk, $m.id, $true, $true)
+$mLnk = Join-Path $programs "$($m.name).lnk"; $s = $wsh.CreateShortcut($mLnk); $s.TargetPath = $mExe; $t0 = Get-Date; $s.Save()
+$ok = Wait-Listed $m.name '' 60 $t0
+$t0 = Get-Date; $hr = [LinkProps]::Stamp($mLnk, $m.id, $true, $true)
 Out-Line 'seq-stamped' ([ordered]@{ name = $m.name; hr = $hr; readBack = [LinkProps]::Read($mLnk) })
-if (-not (Wait-Listed $m.name $m.id 90)) {
+if (-not (Wait-Listed $m.name $m.id 90 $t0)) {
   [LinkProps]::SHChangeNotify(0x00002000, 0x0005, [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($mLnk), [IntPtr]::Zero)  # SHCNE_UPDATEITEM, SHCNF_PATHW
   Out-Line 'seq-refresh' 'SHChangeNotify(SHCNE_UPDATEITEM) on the link'
-  [void](Wait-Listed $m.name $m.id 60)
+  $ok = Wait-Listed $m.name $m.id 60
 }
 # N: the product's NSIS macro (utils.nsh) right after CreateShortcut, then the register()-style re-stamp.
 if ($NsisFixture -and (Test-Path -LiteralPath $NsisFixture)) {
   $nName = 'TaroBird AUMID Probe Nsis'; $nLnk = Join-Path $programs "$nName.lnk"
-  $p = Start-Process -FilePath $NsisFixture -Wait -PassThru
-  Out-Line 'nsis-fixture' ([ordered]@{ exit = $p.ExitCode; exists = (Test-Path -LiteralPath $nLnk); readBack = $(if (Test-Path -LiteralPath $nLnk) { [LinkProps]::Read($nLnk) } else { '' }) })
-  [void](Wait-Listed $nName 'com.tarobot.aumidprobe.nsis' 60)
-  $hr = [LinkProps]::Stamp($nLnk, 'com.tarobot.aumidprobe.nsis', $true, $true)
+  $t0 = Get-Date; $p = Start-Process -FilePath $NsisFixture -Wait -PassThru
+  Out-Line 'nsis-fixture' ([ordered]@{ exit = $p.ExitCode; seconds = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2); exists = (Test-Path -LiteralPath $nLnk); readBack = $(if (Test-Path -LiteralPath $nLnk) { [LinkProps]::Read($nLnk) } else { '' }) })
+  $ok = Wait-Listed $nName 'com.tarobot.aumidprobe.nsis' 60 $t0
+  $t0 = Get-Date; $hr = [LinkProps]::Stamp($nLnk, 'com.tarobot.aumidprobe.nsis', $true, $true)
   Out-Line 'nsis-restamped' ([ordered]@{ hr = $hr; readBack = [LinkProps]::Read($nLnk) })
-  [void](Wait-Listed $nName 'com.tarobot.aumidprobe.nsis' 20)
+  $ok = Wait-Listed $nName 'com.tarobot.aumidprobe.nsis' 20 $t0
+  # The installer's real order: NSIS creates and stamps, the App re-stamps ~1 s later, the check queries once.
+  $rName = 'TaroBird AUMID Probe Race'; $rLnk = Join-Path $programs "$rName.lnk"
+  $race = Join-Path (Split-Path -Parent $NsisFixture) 'aumid-fixture-race.exe'
+  if (Test-Path -LiteralPath $race) {
+    $t0 = Get-Date; $p = Start-Process -FilePath $race -Wait -PassThru
+    Start-Sleep -Milliseconds 800
+    $hr = [LinkProps]::Stamp($rLnk, 'com.tarobot.aumidprobe.nsis', $true, $true)
+    Out-Line 'race-restamped' ([ordered]@{ exit = $p.ExitCode; hr = $hr; afterCreate = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2); readBack = [LinkProps]::Read($rLnk) })
+    $ok = Wait-Listed $rName 'com.tarobot.aumidprobe.nsis' 30 $t0
+  } else { Out-Line 'race' "no fixture $race" }
 } else { Out-Line 'nsis-fixture' "not available: $NsisFixture" }
 
-# Read-only: whether Windows associates each AppID with a notifier. Nothing is shown.
-try {
-  [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-  foreach ($c in $cases) {
-    if (-not $c.id) { continue }
-    $setting = try { [string][Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($c.id).Setting } catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; 'error 0x{0:X8}' -f $e.HResult }
-    Out-Line 'toast-setting' ([ordered]@{ case = $c.key; appId = $c.id; setting = $setting })
-  }
-} catch { Out-Line 'toast-setting-error' $_.Exception.Message }
 $apps = @(Get-StartApps)
 Out-Line 'summary' ([ordered]@{ exactOrControl = @($done.Keys); unresolved = @($cases | Where-Object { -not $done.ContainsKey($_.key) } | ForEach-Object { "$($_.key) => $($seen[$_.key])" }); totalApps = $apps.Count
   probeEntries = @($apps | Where-Object { $_.Name -like 'TaroBird AUMID Probe*' } | ForEach-Object { "$($_.Name) => $($_.AppID)" }); shell = (@('explorer', 'StartMenuExperienceHost') | ForEach-Object { "$_=$(@(Get-Process -Name $_ -ErrorAction SilentlyContinue).Count)" }) -join ' ' })

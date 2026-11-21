@@ -6,6 +6,7 @@ Unicode true
 RequestExecutionLevel user
 SilentInstall silent
 !define BUNDLEID "com.tarobot.aumidprobe.nsis"
+!define /ifndef LINK "TaroBird AUMID Probe Nsis"
 !include LogicLib.nsh
 !include "Win\COM.nsh"
 !include "Win\Propkey.nsh"
@@ -13,6 +14,6 @@ SilentInstall silent
 OutFile "${OUT}"
 Section
   SetShellVarContext current
-  CreateShortcut "$SMPROGRAMS\TaroBird AUMID Probe Nsis.lnk" "${TARGET}"
-  !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\TaroBird AUMID Probe Nsis.lnk"
+  CreateShortcut "$SMPROGRAMS\${LINK}.lnk" "${TARGET}"
+  !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\${LINK}.lnk"
 SectionEnd
