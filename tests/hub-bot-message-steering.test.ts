@@ -706,6 +706,33 @@ describe("R17: requirements pinned so that breaking them fails", () => {
   });
 });
 
+describe("final verification round (V1–V4)", () => {
+  const openKeys = () => b.store.db.all<{ key: string; value: string }>("SELECT key,value FROM meta WHERE key LIKE 'bot-messages:steer-open:%'");
+  it("V1: the open index commits with the record — a failed index write leaves nothing behind, and a restart still reconciles", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const bm = b.botMessages as unknown as { put(key: string, value: unknown): Promise<unknown> };
+    const put = bm.put.bind(b.botMessages); let failed = 0;
+    bm.put = (key: string, value: unknown) => { if (key.startsWith("bot-messages:steer-open:") && !failed) { failed++; return Promise.reject(new Error("simulated lost index write")); } return put(key, value); };
+    const requestId = randomUUID();
+    await expect(send(chat.conversationId, "IndexedOrNothing", { delivery: "steer" }, requestId)).rejects.toThrow("simulated lost index write");
+    bm.put = put;
+    expect(failed).toBe(1);
+    expect(await b.store.db.get("SELECT 1 FROM messages WHERE blocks_json LIKE '%IndexedOrNothing%'")).toBeUndefined();
+    expect(fake.steer).not.toHaveBeenCalled();
+    // The Hub dies after the record (and its index) committed, before any answer.
+    fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    const receipt = await send(chat.conversationId, "IndexedOrNothing", { delivery: "steer" }, requestId);
+    expect(receipt.delivery).toMatchObject({ actual: "pending", reason: "steer_unconfirmed" });
+    expect((await openKeys()).map(row => row.key)).toEqual([`bot-messages:steer-open:target:${receipt.messageId}`]);
+    await b.close(); b = await HubServer.start({ stateDir: path.join(root, "b") }); b.botMessages.steering = fake as unknown as BotMessageSteeringHooks;
+    fake.reconcile.mockResolvedValueOnce({ outcome: "rejected", reason: "stale" });
+    await b.botMessages.reconcileForBot("target");
+    expect(fake.reconcile).toHaveBeenCalledTimes(1);
+    expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
+    expect(await openKeys()).toEqual([]);
+  });
+});
+
 describe("M3: blank steer text", () => {
   it("gets the queue path's own answer before any record or Gateway call", async () => {
     const chat = await resolve(); await liveTurn(chat.conversationId);

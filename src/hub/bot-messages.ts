@@ -27,7 +27,8 @@ const memoKey = (kind: string, ...parts: string[]) => `bot-messages:${kind}:${ha
  * per recipient Bot; reconciled when its worker attaches. Bot IDs are idSchema. */
 const OPEN_STEER = "bot-messages:steer-open:";
 const openSteerKey = (botId: string, messageId: string) => `${OPEN_STEER}${botId}:${messageId}`;
-type OpenSteer = { key: string; conversationId: string };
+/** `sourceKey` lets attach-time reconciliation recheck the source's current grant (review V3). */
+type OpenSteer = { key: string; conversationId: string; sourceKey?: string };
 type Guard = () => Promise<unknown>;
 type Grant = { sourceKey: string; sourceBot: string; targetBot: string; revoked: boolean };
 const grantSchema = z.object({ sourceHost: z.string().min(1).max(256), sourceBot: idSchema, targetBot: z.string().min(1).max(256), revoke: z.boolean().default(false) }).strict();
@@ -697,7 +698,7 @@ export class BotMessages {
     const call = { conversationId: c.target.conversationId, userId: "owner", requestId: c.clientMsgId, targetId: plan.targetId, sourceMessageId: plan.turn, text: c.input.text, source: c.p.source };
     // The exact Gateway call must be valid before a record is created for it.
     if (!botSteerCallSchema.safeParse(call).success) throw new HubError("bot_message_invalid_request", 400);
-    let created: { message: Message; created: boolean }, opened = false;
+    let created: { message: Message; created: boolean };
     try {
       created = await this.store.beginBotSteer("owner", { conversationId: c.target.conversationId, botId: c.bot.id, clientMsgId: c.clientMsgId, text: c.input.text, botSource: c.p.source, targetId: plan.targetId }, async () => {
         await c.scope();
@@ -711,8 +712,11 @@ export class BotMessages {
         if (await this.turnSteersInTransaction(c.target.conversationId, c.bot.id, plan.targetId) >= STEER_TURN_LIMIT) throw new SteerLimitReached("turn_steer_limit");
         await this.put(edgeKey, [...times, Date.now()]);
         await this.put(c.key, { content: c.content, at: Date.now(), steer: { turn: plan.turn, targetId: plan.targetId, epoch: plan.epoch } } satisfies IncomingMemo);
-        opened = true;
         await this.auditSendInTransaction(c, false, {});
+      }, async message => {
+        // The open index commits with the record (review V1): every later
+        // reconciliation starts from it, so it can never be missing.
+        await this.put(openSteerKey(c.bot.id, message.id), { key: c.key, conversationId: c.target.conversationId, sourceKey: c.p.sourceKey } satisfies OpenSteer);
       });
     } catch (error) { if (error instanceof SteerLimitReached) return this.queueDelivery(c, error.reason); throw error; }
     // Another call with this request created the record first: report that one, once.
@@ -720,7 +724,6 @@ export class BotMessages {
       if (replays > 0 || !this.ownsRecord(c, created.message)) throw new HubError("bot_message_request_conflict", 409);
       return this.deliver(c, replays + 1);
     }
-    if (opened) await this.store.db.transaction(() => this.put(openSteerKey(c.bot.id, created.message.id), { key: c.key, conversationId: c.target.conversationId } satisfies OpenSteer));
     // The Gateway journals this call at most once. Only its explicit refusal
     // proves nothing reached the engine; its own "unknown" is final; a lost
     // call leaves the record unconfirmed for reconciliation.

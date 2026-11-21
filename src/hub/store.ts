@@ -614,7 +614,8 @@ export class HubStore {
    * Transcript-only like an owner steering record: it never gets a delivery
    * unless the engine refuses it before admission (fallBackBotSteer). A replay
    * returns the existing record; `validate` runs only when creating one. */
-  async beginBotSteer(userId: string, input: { conversationId: string; botId: string; clientMsgId: string; text: string; botSource: NonNullable<Message["botSource"]>; targetId: string }, validate: () => Promise<unknown>): Promise<{ message: Message; created: boolean }> {
+  async beginBotSteer(userId: string, input: { conversationId: string; botId: string; clientMsgId: string; text: string; botSource: NonNullable<Message["botSource"]>; targetId: string }, validate: () => Promise<unknown>,
+    /** Runs in the same transaction after the insert: state that must commit with the record. */ created?: (message: Message) => Promise<unknown>): Promise<{ message: Message; created: boolean }> {
     const result = await this.db.transaction(async () => {
       const old = await this.db.get<MessageRow>("SELECT * FROM messages WHERE author_id=? AND client_msg_id=?", [userId, input.clientMsgId]);
       if (old) return { message: this.decodeMessage(old), created: false };
@@ -627,6 +628,7 @@ export class HubStore {
       const message: Message = { botSource: input.botSource, id: newId("msg"), conversationId: conv.id, authorId: userId, authorType: "user", clientMsgId: input.clientMsgId, mentions: [input.botId],
         status: "complete", version: 1, createdAt: Date.now(), blocks: [{ type: "text", text: input.text }, { type: "steering", botId: input.botId, targetId: input.targetId, outcome: "pending" }] };
       await this.saveMessage(message);
+      await created?.(message);
       return { message, created: true, event: await this.append(conv.id, "message.created", message) };
     });
     if (result.event) this.emit(result.event);
