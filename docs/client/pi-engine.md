@@ -62,9 +62,18 @@ Restored native sessions retain their recorded
 selection unless that Bot default has changed. Clear a Bot override to return
 to the native default; **off** explicitly disables thinking and is different
 from an empty override. Clearing a conversation thinking override when the Bot
-has no thinking default leaves the current native level unchanged. Only thinking
+has no thinking default leaves the current native level unchanged.
+Resetting the conversation's model to the default also returns a thinking
+level that still follows the Bot to the Bot effort: Pi's `set_model` picks its
+own per-model or default level, which the conversation never chose. A level
+the restored model does not offer is left to Pi with a notice. Only thinking
 levels reported by that model are offered; provider-specific aliases and disabled
 levels remain native metadata rather than a hard-coded list.
+
+In chat, `/model` and `/thinking` change the current conversation, while
+`/effort` changes the Bot default thinking level for the whole Bot (like
+`/effort` for every other engine, the Bot settings and `bots model --effort`);
+its replies say so and point to `/thinking` for the conversation.
 
 The Pi control in a direct conversation adjusts that **current conversation**,
 including while a turn is running; model changes apply to subsequent native
@@ -99,6 +108,41 @@ serve another caller. Retiring the adapter interrupts unfinished model and
 native-command turns; a partial reply or command failure is not reported as a
 completed result. A process that exits or is retired during final startup
 registration is never published as live.
+
+A model request that Pi reports as failed keeps the provider's status and short
+code. When the error body parses as one JSON document and has a `message`, the
+reply shows that message as the provider wrote it, in a code span, at most 200
+characters cut on whole characters. Control characters are removed and
+whitespace runs become one space; the only change to its words is that a key-shaped
+string is replaced with `[redacted]` (a word of letters, digits and `+ / = _ -`
+with a stretch of at least 24 characters between `-` and `.` that mixes upper
+case, lower case and digits, or is at least 32 hex digits). A body that does not
+parse (cut at Pi's 4000-character limit, HTML, plain text) shows only the status
+and the category. The status comes from Pi's own label (`… (400): `, `400: `,
+`503 Service Unavailable`) or a status field of the body, never from numbers
+later in the text. A 4xx refusal is reported as the provider refusing that request,
+with the next step it implies (choose another model for a model or account
+refusal, shorten the input for an over-long request); a 5xx or lost connection
+is reported as a service problem. Neither suggests restarting the instance.
+Quota, rate-limit, content-policy and sign-in failures keep their own wording.
+
+A turn that fails, is stopped, times out or loses its Pi process still reports
+the usage of the model calls Pi completed before that point; the message, card
+action and scheduled-task paths record it in the Bot's usage ledger.
+
+An idle Pi process is closed 15 minutes after its last use (checked every
+minute, one check at a time; closes run side by side). Before closing, Pi's own
+run, compaction and queue state is asked afresh rather than read from the
+Host's cached copy. The Bot log (`tarobot logs`) gets one line when a worker is
+closed, when an expired worker is kept (and why: a running turn, a dialog,
+pending messages, no state reply), and when a worker stays fresh only because
+something outside a turn keeps using it (a history read, a native control);
+each reason is written again only when it changes.
+
+Known behaviour, as with Pi run on its own: when the Pi process exits
+unexpectedly (a crash or SIGKILL), a command its shell tool was running may
+carry on until it finishes. The turn is reported as failed and the conversation
+can continue on the same session.
 
 ## Attachments and images
 
@@ -292,7 +336,20 @@ tarobot conversations pi-session CONVERSATION --bot BOT \
 ```
 
 Read the current `session.token` before writing. `default` means clear this
-conversation's override. A read cannot start a process. Keep the exact write
+conversation's override. A refused change keeps `reason: "invalid"` and, for a
+client that asks with `?detail=1` (the App's conversation panel and the CLI do), adds `detail.kind`:
+`model_invalid`, `model_not_found` (the provider is signed in but has no such
+model), `provider_unavailable` (no usable sign-in, or no such provider),
+`model_unavailable`, `default_unavailable`, `thinking_invalid` or
+`thinking_unsupported` with the model's `allowed` levels. Older Apps, which read
+the result strictly, get the previous shape; against an older Host the App keeps
+its previous wording. The App's Bot model and thinking dialogs explain a refused
+Pi default from the catalog they read: a provider that is signed in but lacks the
+model, a provider without sign-in, or the levels the model offers. `bots model` reports a Pi model
+missing from a complete catalog as `model_unavailable` rather than an effort
+mismatch, and the CLI explains both codes from the catalog it read. An invalid
+`--effort` or `--thinking` is answered with the accepted levels instead of a
+schema dump. A read cannot start a process. Keep the exact write
 parameters and request ID when checking an unknown outcome; a retry reads the
 stored receipt and does not repeat the operation. Use a new request ID only for
 a new intended change. Both App and CLI refuse stale sessions or lost access.

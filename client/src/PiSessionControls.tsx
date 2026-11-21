@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { PiSessionCommand } from "../../src/client-protocol/pi-commands.js";
 import { ChevronDown, Cpu } from "lucide-react";
 import { piSessionResultSchema, piSessionSnapshotSchema, type PiSessionChange, type PiSessionSnapshot } from "../../src/client-protocol/pi-session.js";
+import { piSessionRejectionText } from "./pi-rejection-text.js";
 import type { Bot, HubConnection } from "./connection.js";
 import { CreationDialog } from "./CreationDialog.js";
 import { PiModelSelect } from "./PiModelSelect.js";
@@ -97,7 +98,8 @@ export function PiSessionControls({ connection, conversationId, bot, owner, onli
     setSaving(true); setError(""); setNotice("");
     const request = queueRequest([], 15_000);
     try {
-      const result = piSessionResultSchema.parse(await request.wait(connection.http(route, { method: "POST", body: JSON.stringify(command), signal: request.signal })));
+      // `detail=1`: a current Host says why a change was refused; an older one ignores the parameter.
+      const result = piSessionResultSchema.parse(await request.wait(connection.http(`${route}?detail=1`, { method: "POST", body: JSON.stringify(command), signal: request.signal })));
       // An older component can finish after reopening and submitting a newer
       // operation. Its receipt must never erase that newer pending operation.
       // A rejected status on a CHECK can describe this check's lost permission
@@ -107,13 +109,13 @@ export function PiSessionControls({ connection, conversationId, bot, owner, onli
       if (alive.current) {
         if (result.outcome === "accepted") { acceptedSync.current[command.action] = editRev; setNotice(t("已应用到当前 Pi 对话。")); }
         else setError(!settled ? t("结果尚未确认，请核对后再修改。")
-          : result.reason === "invalid"
+          : piSessionRejectionText(result, command) ?? (result.reason === "invalid"
             ? (command.value === null
               ? (command.action === "thinking"
                 ? t("Bot 默认思考强度不适用于当前对话模型。请选择可用档位，或调整 Bot 默认设置后重试。")
                 : t("Bot 默认模型或 Pi 默认模型当前不可用。请选择可用模型，或检查提供商登录与 Bot 默认设置后重试。"))
               : t("当前模型不支持这个选择，请重新读取。"))
-            : t("Pi 会话已变化或暂不可用，请重新读取。"));
+            : t("Pi 会话已变化或暂不可用，请重新读取。")));
       }
     } catch { if (alive.current) setError(t("结果尚未确认，请核对后再修改。")); }
     finally {

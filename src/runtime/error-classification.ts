@@ -20,6 +20,7 @@ export type FailureCategory =
   | "engine-thread-locked"
   | "engine-incomplete"
   | "engine-tool-input"
+  | "engine-request-rejected"
   | "file-workflow"
   | "workflow-state"
   | "session-state"
@@ -117,6 +118,56 @@ export function renderEngineSettingsError(error: unknown, locale: "zh" | "en"): 
     : `Model ${mismatch.model} does not support ${mismatch.effort}. Available levels: ${mismatch.available.join(", ")}. Change the Bot effort or follow its default; no restart is needed.`;
 }
 
+const PROVIDER_MODEL_REFUSAL_RE = /\bmodel\b[^.]{0,80}\b(?:not (?:found|supported|available|allowed|enabled)|does not exist|unsupported|no access)|\b(?:unsupported|unknown|invalid) model\b|do(?:es)? not have access to (?:the )?model|model_not_found/i;
+const PROVIDER_SIZE_RE = /too (?:long|large)|context(?:[ _-](?:length|window))|maximum context|token limit|payload/i;
+
+/** A CommonMark code span around one line of text: a fence longer than any backtick run inside it. */
+function codeSpan(text: string): string {
+  const fence = "`".repeat(Math.max(0, ...Array.from(text.matchAll(/`+/g), run => run[0].length)) + 1);
+  const pad = text.startsWith("`") || text.endsWith("`") ? " " : "";
+  return `${fence}${pad}${text}${pad}${fence}`;
+}
+
+/**
+ * The reply for a model request Pi reported as failed: what the provider said
+ * (as read by piProviderFailure) and the step that can help. Quota,
+ * rate-limit, content-policy and sign-in failures keep their own wording.
+ */
+export function renderPiProviderFailure(error: unknown, category: FailureCategory, locale: "zh" | "en"): string | undefined {
+  if (!(error instanceof PiRpcCommandError) || !error.provider) return undefined;
+  if (!["engine-request-rejected", "engine-backend", "engine-cli", "unknown"].includes(category)) return undefined;
+  const { status, code, reason } = error.provider;
+  const zh = locale === "zh";
+  const label = [status !== undefined ? `HTTP ${status}` : "", code ?? ""].filter(Boolean).join(" · ");
+  // The provider's own words in a code span, so no Markdown renderer reads them as markup.
+  const said = reason ? (zh ? `\n提供商说明：${codeSpan(reason)}` : `\nThe provider said: ${codeSpan(reason)}`) : "";
+  const kept = zh ? "原会话已保留，未自动重发请求。" : "The conversation is preserved and the request was not resent.";
+  if (category === "engine-request-rejected") {
+    const head = zh ? `错误：模型服务拒绝了本轮请求${label ? `（${label}）` : ""}。` : `Error: the model service refused this request${label ? ` (${label})` : ""}.`;
+    const subject = `${code ?? ""} ${reason ?? ""}`;
+    const step = status === 403 || status === 404 || PROVIDER_MODEL_REFUSAL_RE.test(subject)
+      ? zh
+        ? "所选模型可能不适用于当前提供商账号或登录方式。请换一个模型（/model 或「Pi 对话设置」）后重试，或检查该提供商的账号权限；重启实例无效。"
+        : "The selected model may not be available to this provider account or sign-in method. Choose another model (/model or the Pi conversation settings) and retry, or check the provider account's access; restarting the instance will not help."
+      : status === 413 || PROVIDER_SIZE_RE.test(subject)
+        ? zh
+          ? "请求内容超出了模型或服务的限制。请缩短输入、减少附件，或先用 /compact 压缩上下文后重试；重启实例无效。"
+          : "The request exceeds what the model or service accepts. Shorten the input, send fewer attachments, or run /compact first, then retry; restarting the instance will not help."
+        : zh
+          ? "请检查所选模型、思考强度和附件后重试；重启实例无效。"
+          : "Check the selected model, thinking level and attachments, then retry; restarting the instance will not help.";
+    return `${head}${said}\n${step}${zh ? "" : " "}${kept}`;
+  }
+  if (category === "engine-backend") {
+    const head = zh ? `错误：模型服务暂时出错或连接中断${label ? `（${label}）` : ""}。` : `Error: the model service failed or the connection to it was lost${label ? ` (${label})` : ""}.`;
+    const step = zh ? "请稍后重试，或临时换一个模型；无需重启实例。" : "Retry shortly or switch models for now; restarting the instance is not required.";
+    return `${head}${said}\n${step}${zh ? "" : " "}${kept}`;
+  }
+  const head = zh ? `错误：Pi 的模型请求失败${label ? `（${label}）` : ""}。` : `Error: Pi's model request failed${label ? ` (${label})` : ""}.`;
+  const step = zh ? "可以稍后重试；若反复出现，请换一个模型或检查提供商设置。" : "You can retry shortly; if it keeps happening, choose another model or check the provider settings.";
+  return `${head}${said}\n${step}${zh ? "" : " "}${kept}`;
+}
+
 function isDeepSeekWriterHeld(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "session/writer-held";
 }
@@ -168,6 +219,16 @@ function hasEngineCliSignal(text: string): boolean {
   }
 
   return PI_RUNTIME_ERROR_RE.test(text) || hasNamedEngineSignal(text) && (ENGINE_RUNTIME_RE.test(text) || ENGINE_FAILURE_RE.test(text));
+}
+
+
+/** Category of a failed Pi model request by the provider's status; undefined when nothing says which. */
+export function piProviderFailureCategory(error: unknown): "engine-request-rejected" | "engine-backend" | undefined {
+  if (!(error instanceof PiRpcCommandError) || !error.provider) return undefined;
+  const { status, connection } = error.provider;
+  // 408: the provider gave up waiting for this request, which is not a refusal of its content.
+  if (status !== undefined) return status >= 500 || status === 408 ? "engine-backend" : "engine-request-rejected";
+  return connection ? "engine-backend" : undefined;
 }
 
 export function classifyFailure(error: unknown): FailureCategory {
@@ -297,6 +358,14 @@ export function classifyFailure(error: unknown): FailureCategory {
   ) {
     return "auth";
   }
+
+  // A model request Pi reported as failed, with the provider's own status. Quota, rate
+  // limits, content policy and sign-in are recognised above from the same text; what is
+  // left is the provider refusing this request (4xx) or failing to serve it (5xx, a lost
+  // connection). Neither is the engine process failing, and a "permission denied" from a
+  // provider is not the disk refusing a write.
+  const providerCategory = piProviderFailureCategory(error);
+  if (providerCategory) return providerCategory;
 
   if (
     text.includes("read-only") ||
@@ -434,6 +503,9 @@ export function getBusErrorSemantics(failureCategory: FailureCategory): BusError
       return { code: "engine_incomplete", retryable: false };
     case "engine-tool-input":
       return { code: "engine_tool_input", retryable: false };
+    case "engine-request-rejected":
+      // The provider refused this request as it is; repeating it unchanged gets the same answer.
+      return { code: "engine_request_rejected", retryable: false };
     case "engine-backend":
       return { code: "engine_backend", retryable: true };
     case "engine-rate-limit":

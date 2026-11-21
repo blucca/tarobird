@@ -11,8 +11,8 @@ import { botMessageDeliverySchema, botMessageSteeringProofPayload, botMessageSte
 import { LocalHostClient, HostCliError } from "./client.js";
 import { inspectHubService } from "../hub/service.js";
 import { isLoopback } from "../hub/network.js";
-import { preflightCoreDeliveryPath, resolveCoreDeliveryRoots } from "../core/delivery-preflight.js";
-import { withChannelProfile } from "../core/channel-profile.js";
+import { CORE_FILE_UPLOAD_MAX_BYTES, preflightCoreDeliveryPath, resolveCoreDeliveryRoots } from "../core/delivery-preflight.js";
+import { channelProfile, withChannelProfile } from "../core/channel-profile.js";
 import { loadInstanceConfig, resolveInstanceWorkspacePath } from "../state/instance-config.js";
 
 export type BotMessageOptions = { host?: string; bot?: string; to?: string; "source-bot"?: string; "text-file"?: string; file?: string[];
@@ -69,13 +69,45 @@ export async function instanceEndpoint(directory: string, botId: string): Promis
     });
   } };
 }
+const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(bytes % (1024 * 1024) ? 1 : 0)} MiB`;
+/**
+ * A refusal's code, then what it means. The code stays first and unchanged:
+ * callers and scripts match on it.
+ */
+const explained = (code: string, zh: string, en: string) => new Error(`${code}: ${zh} / ${en}`);
+const FILE_REFUSALS: Record<string, [string, string]> = {
+  "outside-workspace": ["附件不在这个 Bot 的工作区或允许的输出目录里，请先复制到工作区再发送。", "The attachment is outside this Bot's workspace and allowed output folders; copy it into the workspace first."],
+  "credentials-file": ["附件看起来是凭据文件（如 auth.json、.env、私钥），不会发送。", "The attachment looks like a credentials file (auth.json, .env, a private key) and is not sent."],
+  "not-found": ["找不到这个附件文件。", "The attachment file was not found."],
+  "permission-denied": ["没有读取这个附件的权限。", "The attachment cannot be read (permission denied)."],
+  "read-error": ["附件不是可读取的普通文件。", "The attachment is not a readable regular file."],
+};
+function fileRefusal(reason: string, fileBytes: number | undefined): Error {
+  const code = `bot_message_file_${reason}`;
+  if (reason === "too-large") {
+    // The same boundary the preflight just applied.
+    const limit = channelProfile() === "gateway" ? MAX_FILE_BYTES : CORE_FILE_UPLOAD_MAX_BYTES, size = fileBytes === undefined ? "" : ` ${mib(fileBytes)}，`;
+    return explained(code, `附件${size}超过 Bot 消息单个附件的上限 ${mib(limit)}，请压缩或拆分后再发送。`,
+      `The attachment${fileBytes === undefined ? "" : ` is ${mib(fileBytes)},`} over the ${mib(limit)} limit for one Bot-message attachment; compress or split it and send again.`);
+  }
+  const text = FILE_REFUSALS[reason];
+  return text ? explained(code, text[0], text[1]) : new Error(code);
+}
+/** Refusals that arrive from the Hub as a code only. */
+function explainBotMessageError(error: unknown): unknown {
+  if (error instanceof HostCliError && error.code === "bot_message_control_forbidden") {
+    error.message = `${error.code}: Bot 之间的消息不能是斜杠命令（以 /model、/thinking、/compact、/new 这类 /名称 开头）：这些命令只有主人本人能在 App 里发送。要发送普通文字，请不要让消息以“/名称”开头。 / A Bot message cannot be a slash command (text starting with a /name such as /model, /thinking, /compact or /new); only the owner can send those, in the App. To send ordinary text, do not start the message with a /name.`;
+  }
+  return error;
+}
+
 async function fileHandle(file: string, maximum: number) {
   const stateDir = process.env.TAROBOT_ACTIVE_STATE_DIR ?? process.env.TAROBOT_STATE_DIR;
   const config = stateDir ? await loadInstanceConfig(stateDir) : undefined;
   const roots = await withChannelProfile("gateway", () => resolveCoreDeliveryRoots({ stateDir, workspaceOverride: config ? resolveInstanceWorkspacePath(config) : undefined }));
   if (!stateDir) roots.allowAnyAbsolutePath = true; // Explicit local operator; credentials are still forbidden.
   const checked = await preflightCoreDeliveryPath(path.resolve(file), roots);
-  if (!checked.ok) throw new Error(`bot_message_file_${checked.reason}`);
+  if (!checked.ok) throw fileRefusal(checked.reason, "fileBytes" in checked ? checked.fileBytes : undefined);
   const handle = await open(checked.realPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   const before = await handle.stat();
   if (!before.isFile() || before.size <= 0 || before.size > maximum) { await handle.close(); throw new Error("bot_message_file_size"); }
@@ -170,6 +202,10 @@ export async function runBotMessagesCommand(directory: string, command: string, 
       const attachments: string[] = [];
       if ((options.file?.length ?? 0) > 50) throw new Error("too_many_files");
       for (const file of options.file ?? []) {
+        // Checked before anything is uploaded: the Hub refuses such a name only after the bytes went up, with a bare code.
+        if (!uploadSchema.shape.name.safeParse(path.basename(file)).success) {
+          throw explained("invalid_request", "附件的文件名不能含换行、斜杠或其他控制字符，请改名后再发送。", "An attachment's file name cannot contain line breaks, slashes or other control characters; rename it and send again.");
+        }
         const source = await fileHandle(file, MAX_FILE_BYTES);
         try {
           const sha = createHash("sha256");
@@ -239,5 +275,5 @@ export async function runBotMessagesCommand(directory: string, command: string, 
       } finally { await handle.close(); if (!verified) await unlink(out); }
     }
     return { ...result, files };
-  } finally { client.close(); }
+  } catch (error) { throw explainBotMessageError(error); } finally { client.close(); }
 }

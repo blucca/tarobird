@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  EngineIncompleteResponseError, EngineSteeringRejectedError,
+  EngineIncompleteResponseError, EngineSteeringRejectedError, failedTurnUsage,
   type AppPlatformTools, type CodexUserMessageInput, type EngineApprovalDecision, type EngineApprovalRequest, type EngineStreamEvent,
 } from "../src/codex/adapter.js";
 import type { PiBridgeConnection, PiBridgeControl, PiBridgeEndpoint, PiBridgeEvent, PiBridgeHandler } from "../src/codex/pi-bridge-host.js";
@@ -334,6 +334,74 @@ describe("PiRpcAdapter sessions and process lifecycle", () => {
     expect((error as EngineIncompleteResponseError).reason).toBe("interrupted");
     expect((await r.adapter.sendUserMessage(sessionId, message("again"))).text).toBe("back");
     expect(r.spawner.processes).toHaveLength(2);
+  });
+
+  it("asks Pi instead of trusting a cached run flag before keeping an expired idle worker", async () => {
+    // A cached isStreaming left at true made the sweep skip the worker before ever asking Pi again.
+    const lines: string[] = [];
+    const r = await rig({ options: { idleWorkerTtlMs: 0, log: line => { lines.push(line); } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("hi"));
+    const process = r.spawner.last();
+    const worker = (r.adapter as unknown as { workers: Map<string, { state: { isStreaming: boolean } }> }).workers.get(sessionId)!;
+    worker.state = { ...worker.state, isStreaming: true };
+    await (r.adapter as unknown as { sweepIdleWorkers(): Promise<void> }).sweepIdleWorkers();
+    await waitFor(() => process.exitCode === 0);
+    expect(lines.some(line => line.includes(sessionId.slice(0, 8)) && /closed/.test(line))).toBe(true);
+  });
+
+  it("says once why an expired idle worker is kept, and again only when the reason changes", async () => {
+    const lines: string[] = [];
+    const r = await rig({ options: { idleWorkerTtlMs: 0, log: line => { lines.push(line); } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("hi"));
+    const process = r.spawner.last();
+    const sweep = () => (r.adapter as unknown as { sweepIdleWorkers(): Promise<void> }).sweepIdleWorkers();
+    process.queue.followUp.push("parked");
+    await sweep(); await sweep();
+    expect(lines.filter(line => /kept/.test(line))).toHaveLength(1);
+    expect(lines[0]).toMatch(/pending messages: 1/);
+    expect(lines[0]).not.toContain("parked");
+    process.queue.followUp.length = 0;
+    await sweep();
+    await waitFor(() => process.exitCode === 0);
+    expect(lines.at(-1)).toMatch(/closed/);
+  });
+
+  it("names what keeps an idle worker fresh after its last turn", async () => {
+    const lines: string[] = [];
+    const r = await rig({ options: { idleWorkerTtlMs: 40, log: line => { lines.push(line); } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("hi"));
+    const sweep = () => (r.adapter as unknown as { sweepIdleWorkers(): Promise<void> }).sweepIdleWorkers();
+    await new Promise(resolve => setTimeout(resolve, 60));
+    await r.adapter.getHistoryState(sessionId);
+    await sweep();
+    expect(lines.at(-1)).toMatch(/kept fresh by a conversation history read; last turn \d+ s ago/);
+    await new Promise(resolve => setTimeout(resolve, 1_100));
+    await r.adapter.getHistoryState(sessionId); await sweep();
+    expect(lines.filter(line => /kept fresh/.test(line))).toHaveLength(1);
+    expect(r.spawner.last().exitCode).toBeNull();
+  });
+
+  it("does not let a state reply read before a run settled overwrite the settle that followed it", async () => {
+    // 尼奥's hypothesis, checked here: Pi writes a get_state reply (still streaming) and then agent_settled
+    // into one stdout chunk; the reply's await resumes after the event and wrote isStreaming back to true.
+    let racing = false;
+    const r = await rig({ pi: { onCommand: (command, process) => {
+      if (command.type !== "get_state" || !racing) return;
+      racing = false;
+      const state = { ...process.state, isStreaming: true, messageCount: 0, pendingMessageCount: 0 };
+      process.sendRaw(`${JSON.stringify({ id: command.id, type: "response", command: "get_state", success: true, data: state })}\n${JSON.stringify({ type: "agent_settled", aborted: false })}\n`);
+      return true;
+    } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("hi"));
+    expect(r.adapter.hasPendingNativeWork()).toBe(false);
+    racing = true;
+    await r.adapter.piNative.getState(sessionId);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(r.adapter.hasPendingNativeWork()).toBe(false);
   });
 
   it("closes idle workers only after Pi itself reports nothing pending", async () => {
@@ -776,6 +844,22 @@ describe("PiRpcAdapter turns", () => {
     expect(input.events[2]).toMatchObject({ toolUseId: "t1", output: "a\n", isError: false, exitCode: 0, durationMs: 5 });
     expect(input.events[3]).toMatchObject({ toolUseId: "t1" });
     expect(progress.at(-1)).toBe("final answer");
+  });
+
+  it("carries the usage already billed in a turn whose process dies, and in a stopped turn", async () => {
+    const r = await rig({ pi: { onPrompt: run => { run.reply("", { stopReason: "toolUse" }); run.tool({ id: "t1", name: "bash", args: { command: "sleep 70" } }); queueMicrotask(() => run.process.exit(null, "SIGKILL")); } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const died = await failure(r.adapter.sendUserMessage(sessionId, message("x")));
+    expect(died).toBeInstanceOf(EngineIncompleteResponseError);
+    expect(failedTurnUsage(died)).toEqual({ inputTokens: 80, outputTokens: 20, cachedTokens: 40, costUsd: 0.001 });
+
+    let started!: () => void;
+    const running = new Promise<void>(resolve => { started = resolve; });
+    const s = await rig({ pi: { onPrompt: run => { run.reply("", { stopReason: "toolUse" }); started(); } } });
+    const stop = new AbortController();
+    const turn = failure(s.adapter.sendUserMessage((await s.adapter.createSession(1)).sessionId, message("y", { abortSignal: stop.signal })));
+    await running; stop.abort();
+    expect(failedTurnUsage(await turn)).toMatchObject({ inputTokens: 80, outputTokens: 20 });
   });
 
   it("surfaces a provider failure as the turn's error, not as an answer", async () => {
@@ -1824,6 +1908,46 @@ describe("PiRpcAdapter independent model and thinking resets", () => {
     expect(commands(r.spawner.last(), "set_thinking_level").map(command => command.level)).toEqual(["high", "low"]);
   });
 
+  it("returns a Bot-owned thinking level together with the model when the model is reset", async () => {
+    // P-test 2026-11-21: a conversation model Pi clamped to "off", then "default" restored only the model.
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov/dup-model", effort: "medium" } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("a"));
+    expect(await r.adapter.piNative.setModel(sessionId, { provider: "fakeprov", modelId: "plain-model" })).toMatchObject({ thinkingLevel: "off" });
+    expect(await r.adapter.piNative.setModel(sessionId, null)).toMatchObject({ model: { provider: "fakeprov", modelId: "dup-model" }, modelSource: "bot-default", thinkingLevel: "medium" });
+    // The next turn finds nothing to correct, and the level is still the Bot's to change.
+    await r.adapter.sendUserMessage(sessionId, message("b"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ thinkingLevel: "medium" });
+    await r.writeConfig({ approvalMode: "bypass", model: "fakeprov/dup-model", effort: "high" });
+    await r.adapter.sendUserMessage(sessionId, message("c"));
+    expect(await r.adapter.piNative.getState(sessionId)).toMatchObject({ thinkingLevel: "high", modelSource: "bot-default" });
+  });
+
+  it("records a completed model reset even when putting the Bot's level back then fails", async () => {
+    // Independent review 9: a throw after set_model left the reset unrecorded and the caller saw "uncertain".
+    let dropThinking = false;
+    const r = await rig({ config: { approvalMode: "bypass", model: "fakeprov/dup-model", effort: "medium" }, options: { settingsWriteTimeoutMs: 50 },
+      pi: { onCommand: command => command.type === "set_thinking_level" && dropThinking ? true : undefined } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("a"));
+    await r.adapter.piNative.setModel(sessionId, { provider: "fakeprov", modelId: "plain-model" });
+    dropThinking = true;
+    const notices: PiNativeEvent[] = [];
+    r.adapter.piNative.subscribe(sessionId, event => notices.push(event));
+    expect(await r.adapter.piNative.setModel(sessionId, null)).toMatchObject({ model: { provider: "fakeprov", modelId: "dup-model" }, modelSource: "bot-default" });
+    const record = JSON.parse(await readFile(path.join(r.stateDir, "pi", "state.json"), "utf8")).sessions[sessionId];
+    expect(record).toMatchObject({ modelSource: "bot-default", botDefaultModel: { provider: "fakeprov", modelId: "dup-model" } });
+    expect(notices.some(event => event.type === "notify" && /thinking level/i.test(event.text))).toBe(true);
+  });
+
+  it("returns a Bot-owned level when the model falls back to Pi's default", async () => {
+    const r = await rig({ config: { approvalMode: "bypass", effort: "medium" }, nativeDefault: { provider: "fakeprov", modelId: "dup-model", thinkingLevel: "low" } });
+    const { sessionId } = await r.adapter.createSession(1);
+    await r.adapter.sendUserMessage(sessionId, message("a"));
+    await r.adapter.piNative.setModel(sessionId, { provider: "fakeprov", modelId: "plain-model" });
+    expect(await r.adapter.piNative.setModel(sessionId, null)).toMatchObject({ model: { provider: "fakeprov", modelId: "dup-model" }, modelSource: "native", thinkingLevel: "medium" });
+  });
+
   it("keeps the level when there is no Bot effort, and says so by not writing", async () => {
     const r = await rig({ config: { approvalMode: "bypass" } });
     const { sessionId } = await r.adapter.createSession(1);
@@ -2172,6 +2296,19 @@ describe("PiRpcAdapter error identity", () => {
     expect(error).toBeInstanceOf(PiRpcCommandError);
     expect(error.message).toBe("429: {\"message\":\"rate limit\"}");
     expect(classifyFailure(error)).toBe("engine-rate-limit");
+  });
+
+  it("carries the provider's status and explanation of a failed model request, sanitized", async () => {
+    const raw = "OpenAI API error (400): {\"type\":\"invalid_request_error\",\"code\":\"model_not_found\",\"message\":\"The 'gpt-4' model is not supported when using Codex with a ChatGPT account.\"}";
+    const r = await rig({ pi: { onPrompt: run => { run.reply("", { stopReason: "error", errorMessage: raw }); run.finish(); } } });
+    const error = await failure(r.adapter.sendUserMessage((await r.adapter.createSession(1)).sessionId, message("x")));
+    expect(error).toBeInstanceOf(PiRpcCommandError);
+    expect((error as PiRpcCommandError).provider).toEqual({ status: 400, code: "model_not_found", reason: "The 'gpt-4' model is not supported when using Codex with a ChatGPT account." });
+    expect(classifyFailure(error)).toBe("engine-request-rejected");
+    // A command Pi refused is not a model request: it carries no provider explanation.
+    const none = await rig({ pi: { models: [], model: undefined } });
+    const refused = await failure(none.adapter.sendUserMessage((await none.adapter.createSession(1)).sessionId, message("hi")));
+    expect((refused as PiRpcCommandError).provider).toBeUndefined();
   });
 
   it("keeps the type on a rejected prompt and on a failed start, with owner-facing wording", async () => {

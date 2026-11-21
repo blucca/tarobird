@@ -44,6 +44,8 @@ function ComposerModelMenu({ id, picker, connection, bot, online, trigger, close
 }) {
   const { data, busy, saving, error, saved, load, save } = useBotSettingsRequest(connection, bot.id, "model", modelSettingsSchema);
   const [search, setSearch] = useState("");
+  // The last choice submitted, so a refusal can name what was refused.
+  const attempt = useRef<{ model: string; effort: ModelSettings["effort"] }>(undefined);
   useEffect(() => { onSaving(saving); return () => onSaving(false); }, [saving, onSaving]);
   // Keep callbacks fresh without making a successful response run twice.
   const callbacks = useRef({ close, announce }); callbacks.current = { close, announce };
@@ -69,6 +71,7 @@ function ComposerModelMenu({ id, picker, connection, bot, online, trigger, close
   function choose(next: { model: string; effort: ModelSettings["effort"] } | undefined) {
     if (!data || disabled || !next) return;
     if (next.model === data.model && next.effort === data.effort) { trigger.current?.focus({ preventScroll: true }); close(); return; }
+    attempt.current = next;
     void save({ revision: data.revision, ...next });
   }
   return <DesktopMenuPortalContext.Provider value={true}>
@@ -83,7 +86,7 @@ function ComposerModelMenu({ id, picker, connection, bot, online, trigger, close
       {data && picker === "model" && !shownOptions.length && <p className="desktop-menu-note" role="status">{t("没有匹配的模型")}</p>}
       {data && picker === "effort" && levels.map(level => <button key={level} type="button" data-menu-keep="" aria-pressed={effort === level} disabled={disabled || defaultUnavailable && selected?.id === ""} onClick={() => choose(level === effort ? { model: data.model, effort: data.effort } : selectModelEffort(selected, data.model, level))}><span className="quick-setting-check">{effort === level && <Check size={14}/>}</span><span className="desktop-menu-label">{data.engine === "deepseek" && level === "off" ? t("关闭推理（off）") : level || t("跟随默认")}</span></button>)}
       {busy && <p className="desktop-menu-note" role="status"><LoaderCircle size={14} className="spin"/>{saving ? t("保存中…") : t("正在读取…")}</p>}
-      {error !== undefined && <><p className="quick-setting-error" role="alert">{modelSettingsErrorText(error)}</p><button type="button" data-menu-keep="" disabled={busy || !online} onClick={() => void load()}>{t("重新读取")}</button></>}
+      {error !== undefined && <><p className="quick-setting-error" role="alert">{modelSettingsErrorText(error, data && attempt.current ? { engine: data.engine, ...attempt.current, choices: data.choices } : undefined)}</p><button type="button" data-menu-keep="" disabled={busy || !online} onClick={() => void load()}>{t("重新读取")}</button></>}
       {error === undefined && (data?.engine === "pi" || data?.engine === "deepseek") && data.catalogStatus !== "ready" && <button type="button" data-menu-keep="" disabled={busy || !online} onClick={() => void load()}>{t("重新读取")}</button>}
       {!online && <p className="desktop-menu-note" role="status">{t("连接恢复后即可操作")}</p>}
       <p className="quick-setting-scope">{bot.engine === "pi" ? t("修改 Bot 默认会用于后续任务；/model 只调整当前对话") : t("{0} · 所有对话共用，下次任务生效", bot.name)}</p>

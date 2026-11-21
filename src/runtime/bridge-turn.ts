@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import type { AdapterUsage } from "../codex/adapter.js";
+import { failedTurnUsage, type AdapterUsage } from "../codex/adapter.js";
 import type { Locale } from "./locale.js";
 import { loadInstanceConfig } from "../state/instance-config.js";
 import { UsageStore, type UsageRecord } from "../state/usage-store.js";
@@ -48,6 +48,20 @@ export async function checkBudgetAvailability(
     : `Budget exhausted: $${usage.totalCostUsd.toFixed(4)} used of $${budgetUsd.toFixed(2)}. Adjust this Bot's budget configuration on the host, then retry.`;
 
   return { budgetUsd, usage, message };
+}
+
+/**
+ * Record the usage an engine attached to a failed turn (`withFailedTurnUsage`). Best effort: a ledger
+ * write that fails must not replace the turn's own error. Returns whether anything was recorded.
+ */
+export async function recordFailedTurnUsage(stateDir: string, error: unknown, budgetUsd?: number): Promise<boolean> {
+  const usage = failedTurnUsage(error);
+  if (!usage) return false;
+  try { await recordBridgeTurnUsage(stateDir, usage, budgetUsd); return true; }
+  catch (recordError) {
+    console.error("Failed to record the usage of a failed turn:", recordError instanceof Error ? recordError.message : recordError);
+    return false;
+  }
 }
 
 export async function recordBridgeTurnUsage(

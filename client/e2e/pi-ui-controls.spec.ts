@@ -10,6 +10,7 @@ import { createCoreServiceRuntime } from "../../src/core/runtime.js";
 import { preparePairing, fixtureInvitation } from "./fixtures/pairing-invite.js";
 import { pairingLink } from "../src/pairing-link.js";
 import { selectConversation, waitForClientOnline } from "./fixtures/mobile.js";
+import { openBotSettings } from "./fixtures/bot-settings.js";
 import type { PiSessionSnapshot, PiSessionChange } from "../../src/client-protocol/pi-session.js";
 import type { ModelSettings } from "../../src/client-protocol/model.js";
 
@@ -465,3 +466,148 @@ for (const width of [390, 1360]) for (const en of [false, true]) {
     }
   });
 }
+
+for (const en of [false, true]) {
+  test(`Pi session controls: a refusal says why when the Host names the reason, and keeps the old copy when it does not · ${en ? "en" : "zh"}`, async ({ browser }, info) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-pi-reject-reason-"));
+    const stateDir = path.join(root, "bot");
+    await mkdir(stateDir);
+    await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "pi", effort: "high", locale: en ? "en" : "zh" }));
+    const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: path.resolve("dist") });
+    await hub.profile.update({ name: "Demo Host", revision: (await hub.profile.read()).revision });
+    const secret = randomBytes(32).toString("base64url");
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('pi_reason','Pi',?)", [hashSecret(secret)]);
+    const gateway = await attachGateway({
+      stateDir, url: hub.instanceUrl.replace("http", "ws") + "/instance", botId: "pi_reason", secret, engine: "pi", effort: "high",
+      runtime: createCoreServiceRuntime(), bridge: { handleAuthorizedMessage: async () => ({ text: "Pi" }) },
+    });
+    const context = await browser.newContext({ viewport: { width: 1360, height: 900 }, locale: en ? "en-US" : "zh-CN", serviceWorkers: "block" });
+    const page = await context.newPage();
+    const errors: string[] = [], posts: string[] = [];
+    page.on("pageerror", error => errors.push(error.message));
+    const snapshot: PiSessionSnapshot = { supported: true, session: {
+      token: "worker_reason", model: "deepseek/deepseek-v4-pro", modelSource: "session", thinking: "high", thinkingLevels: ["off", "high", "max"],
+      choices: [
+        { id: "deepseek/deepseek-v4-pro", provider: "deepseek", modelId: "deepseek-v4-pro", label: "DeepSeek V4 Pro · deepseek", efforts: ["", "off", "high", "max"] },
+        { id: "deepseek/deepseek-v4-flash", provider: "deepseek", modelId: "deepseek-v4-flash", label: "DeepSeek V4 Flash · deepseek", efforts: ["", "off", "high", "max"] },
+      ],
+      busy: false, bridge: "connected", ui: { status: {}, widgets: {} },
+    } };
+    // What the Host answers next: the reason a current Host gives, then the bare answer of an older one.
+    const answers = [
+      { outcome: "rejected", reason: "invalid", detail: { kind: "thinking_unsupported", allowed: ["off", "high", "max"] } },
+      { outcome: "rejected", reason: "invalid", detail: { kind: "model_not_found" } },
+      { outcome: "rejected", reason: "invalid" },
+    ];
+    try {
+      await hub.store.createConversation("owner", ["pi_reason"], "Pi reason fixture", "pi_reason_fixture");
+      await page.route("**/api/conversations/*/pi-session*", async route => {
+        if (route.request().method() === "GET") return route.fulfill({ json: snapshot });
+        posts.push(route.request().url());
+        return route.fulfill({ json: answers.shift() ?? { outcome: "accepted" } });
+      });
+      await pairClient(page, hub, en);
+      await openChat(page, "Pi reason fixture", 1360, en);
+      await page.getByRole("button", { name: en ? "Pi conversation settings" : "Pi 对话设置", exact: true }).click();
+      const thinkingSelect = page.getByLabel(en ? "Pi conversation thinking level" : "Pi 对话思考强度", { exact: true });
+      const applyThinking = page.getByRole("button", { name: en ? "Apply thinking level" : "应用思考强度", exact: true });
+      const modelSelect = page.getByLabel(en ? "Model" : "模型", { exact: true });
+      const applyModel = page.getByRole("button", { name: en ? "Apply model" : "应用模型", exact: true });
+      const alert = page.locator(".pi-session-panel [role=alert]");
+
+      await thinkingSelect.selectOption("off");
+      await applyThinking.click();
+      await expect(alert).toHaveText(en ? "The current model does not offer this thinking level. Available: off, high, max." : "当前模型不支持这个思考强度。可选：off、high、max。");
+      expect(posts.at(-1)).toContain("detail=1");
+
+      await modelSelect.selectOption("deepseek/deepseek-v4-flash");
+      await applyModel.click();
+      await expect(alert).toHaveText(en
+        ? "Provider deepseek is signed in but has no model deepseek/deepseek-v4-flash. Reload and choose again."
+        : "提供商 deepseek 已登录，但没有 deepseek/deepseek-v4-flash 这个模型。请重新读取后选择。");
+
+      await thinkingSelect.selectOption("max");
+      await applyThinking.click();
+      await expect(alert).toHaveText(en ? "This choice is unavailable for the current model. Refresh to check." : "当前模型不支持这个选择，请重新读取。");
+      expect(errors).toEqual([]);
+      await page.screenshot({ path: info.outputPath(`pi-reject-reason-${en ? "en" : "zh"}.png`), fullPage: true });
+    } finally {
+      await context.close();
+      await gateway.disconnect();
+      await hub.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("Pi Bot default dialogs: a refusal keeps naming what was refused after the form changes · zh", async ({ browser }, info) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-pi-default-refusal-"));
+  const stateDir = path.join(root, "bot");
+  await mkdir(stateDir);
+  await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "pi", locale: "zh" }));
+  const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: path.resolve("dist") });
+  await hub.profile.update({ name: "Demo Host", revision: (await hub.profile.read()).revision });
+  const secret = randomBytes(32).toString("base64url");
+  await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('pi_default','Pi',?)", [hashSecret(secret)]);
+  const gateway = await attachGateway({
+    stateDir, url: hub.instanceUrl.replace("http", "ws") + "/instance", botId: "pi_default", secret, engine: "pi",
+    runtime: createCoreServiceRuntime(), bridge: { handleAuthorizedMessage: async () => ({ text: "Pi" }) },
+  });
+  const context = await browser.newContext({ viewport: { width: 1360, height: 900 }, locale: "zh-CN", serviceWorkers: "block" });
+  const page = await context.newPage();
+  const errors: string[] = [];
+  page.on("pageerror", error => errors.push(error.message));
+  const revision = "1".repeat(64);
+  const model: ModelSettings = {
+    scope: "bot", revision, engine: "pi", model: "", effort: "", customEfforts: [""], activeTurns: 0, catalogStatus: "ready",
+    choices: [
+      { id: "", efforts: [""] },
+      { id: "anthropic/claude-sonnet", provider: "anthropic", modelId: "claude-sonnet", label: "Claude Sonnet · anthropic", efforts: ["", "low", "high"] },
+      { id: "deepseek/deepseek-v4-pro", provider: "deepseek", modelId: "deepseek-v4-pro", label: "DeepSeek V4 Pro · deepseek", efforts: ["", "off", "high"] },
+    ],
+  };
+  const effort = { scope: "bot", revision, engine: "pi", model: "anthropic/claude-sonnet", effort: "", choices: ["", "low", "high"], activeTurns: 0, catalogStatus: "ready" };
+  try {
+    await hub.store.createConversation("owner", ["pi_default"], "Pi default refusal", "pi_default_refusal");
+    await page.route("**/api/bots/pi_default/model", route => route.request().method() === "GET"
+      ? route.fulfill({ json: model })
+      : route.fulfill({ status: 409, json: { error: "model_unavailable" } }));
+    await page.route("**/api/bots/pi_default/effort", route => route.request().method() === "GET"
+      ? route.fulfill({ json: effort })
+      : route.fulfill({ status: 409, json: { error: "effort_incompatible" } }));
+    await pairClient(page, hub, false);
+    await openChat(page, "Pi default refusal", 1360, false);
+    await openBotSettings(page);
+
+    await page.getByRole("button", { name: "调整 Bot 模型", exact: true }).click();
+    await page.getByRole("button", { name: "自定义模型…", exact: true }).click();
+    await page.getByLabel("模型 ID", { exact: true }).fill("deepseek/deepseek-v9");
+    await page.getByRole("button", { name: "保存到此 Bot", exact: true }).click();
+    const refusedModel = "提供商 deepseek 已登录，但 Pi 的模型目录里没有 deepseek/deepseek-v9。请从列表选择，或检查模型 ID。";
+    const alert = page.locator(".effort-settings [role=alert]");
+    await expect(alert).toHaveText(refusedModel);
+    // The owner picks a listed model without saving: the alert still names the refused one.
+    await page.getByRole("button", { name: "从列表选择模型", exact: true }).click();
+    await page.getByLabel("模型提供商", { exact: true }).selectOption("anthropic");
+    await expect(page.getByLabel("模型", { exact: true })).toHaveValue("anthropic/claude-sonnet");
+    await expect(alert).toHaveText(refusedModel);
+    await page.getByRole("button", { name: "关闭模型设置", exact: true }).click();
+
+    await page.getByRole("button", { name: "调整 Bot 思考强度", exact: true }).click();
+    const level = page.getByLabel("Effort 档位", { exact: true });
+    await level.selectOption("high");
+    await page.getByRole("button", { name: "保存到此 Bot", exact: true }).click();
+    // The refused level is not offered back as available.
+    const refusedLevel = "当前模型不支持思考强度 high。可选：low，或跟随默认。";
+    await expect(alert).toHaveText(refusedLevel);
+    await level.selectOption("low");
+    await expect(alert).toHaveText(refusedLevel);
+    expect(errors).toEqual([]);
+    await page.screenshot({ path: info.outputPath("pi-default-refusal-zh.png"), fullPage: true });
+  } finally {
+    await context.close();
+    await gateway.disconnect();
+    await hub.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

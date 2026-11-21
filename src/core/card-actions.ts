@@ -19,7 +19,7 @@ import type {
   EngineAnswerProgress,
   EngineStreamEvent,
 } from "../codex/adapter.js";
-import { checkBudgetAvailability, recordBridgeTurnUsage } from "../runtime/bridge-turn.js";
+import { checkBudgetAvailability, recordBridgeTurnUsage, recordFailedTurnUsage } from "../runtime/bridge-turn.js";
 import { resolveConversationResume } from "../runtime/conversation-resume.js";
 import { bridgeConversationLockId, sessionLockNamespace, withBridgeTurnLock } from "../runtime/turn-lock.js";
 import { prepareArchiveContinueWorkflow } from "../runtime/file-workflow.js";
@@ -2726,6 +2726,8 @@ async function runCoreCardChoice(input: {
       },
     });
   } catch (error) {
+    // Only an engine failure carries usage; it happens before the completed turn's usage is recorded.
+    await recordFailedTurnUsage(input.stateDir, error);
     const errorText = renderCoreUserFacingError(error, "engine", input.locale);
     if (runCard) {
       if (abortController.signal.aborted) await runCard.interrupt().catch(() => undefined);

@@ -131,3 +131,25 @@ it.each([-1, 90_000])("refreshes an owner session with %i ms left before an oper
   expect(sent.duplicate).toBe(false);
   expect(await hub.store.db.all("SELECT * FROM deliveries")).toHaveLength(1);
 });
+
+it("explains the Bot-message refusals that used to be bare codes, keeping each code first", async () => {
+  // P-test 2026-11-21: these came back as `bot_message_control_forbidden`, `bot_message_file_too-large` and `invalid_request`.
+  const reason = (promise: Promise<unknown>) => promise.then(() => "", (error: Error) => error.message);
+  await writeFile(path.join(root, "command.txt"), "/model fakeprov/plain-model");
+  const control = await reason(runBotMessagesCommand(root, "send", { ...options(), "text-file": path.join(root, "command.txt") }));
+  expect(control).toMatch(/^bot_message_control_forbidden[:：]/);
+  expect(control).toContain("/model");
+  expect(control).toMatch(/斜杠命令|slash command/);
+
+  const big = path.join(root, "big.bin"); await writeFile(big, Buffer.alloc(27 * 1024 * 1024, 1));
+  const tooLarge = await reason(runBotMessagesCommand(root, "send", { ...options(), file: [big] }));
+  expect(tooLarge).toMatch(/^bot_message_file_too-large[:：]/);
+  expect(tooLarge).toContain("26 MiB");
+  expect(tooLarge).toContain("27 MiB");
+
+  const odd = path.join(root, "two\nlines.txt"); await writeFile(odd, "x");
+  const name = await reason(runBotMessagesCommand(root, "send", { ...options(), file: [odd] }));
+  expect(name).toMatch(/^invalid_request[:：]/);
+  expect(name).toMatch(/文件名|file name/);
+  expect(await hub.store.pendingForBot("receiver")).toHaveLength(0);
+}, 30_000);

@@ -49,6 +49,9 @@ import { networkCanonical, sharedRoutesSchema, type NetworkCommand } from "../cl
 import { routesSchema, type Route } from "../client-protocol/routes.js";
 import { createBotSchema } from "../client-protocol/bots.js";
 import { piSessionThinkingSchema, type PiSessionChange } from "../client-protocol/pi-session.js";
+import { effortArgumentError, explainPiModelRejection, piLevelArgumentError, piSessionRejectionNote } from "./pi-rejections.js";
+import { effortValueSchema } from "../client-protocol/effort.js";
+import { PI_THINKING_LEVELS } from "../codex/pi-models.js";
 import { hashSecret } from "../hub/auth.js";
 import { waitForHostIdle, keepHostDrainLease, captureDrainedStopGuard } from "./lifecycle.js";
 import { captureUpdateRecovery, recoverUnchangedAutostart, recoverUnchangedRuntime } from "./update-recovery.js";
@@ -364,6 +367,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
       if (v.model !== undefined || v.thinking !== undefined) {
         const expectedSession = required(v.session, "修改 Pi 会话必须填写 --session TOKEN。"), requestId = required(v["request-id"], "修改 Pi 会话必须填写 --request-id ID；结果未知时保留同一编号核对。");
         const action = v.model !== undefined ? "model" : "thinking", selected = v.model ?? v.thinking!;
+        if (action === "thinking" && selected !== "default" && !piSessionThinkingSchema.safeParse(selected).success) throw piLevelArgumentError("--thinking", selected);
         piSessionUpdate = { expectedSession, requestId, action, value: selected === "default" ? null : action === "thinking" ? piSessionThinkingSchema.parse(selected) : selected };
       } else if (v.session !== undefined || v["request-id"] !== undefined) throw new Error("只读 Pi 会话不接受 --session 或 --request-id；修改时需填写 --model 或 --thinking。");
     } else if ([v.model, v.thinking, v.session].some(value => value !== undefined)) throw new Error("--model、--thinking、--session 仅支持 conversations pi-session。");
@@ -774,7 +778,12 @@ export async function runHostCli(argv: string[]): Promise<void> {
     if (command === "widgets") { if (v.enabled !== undefined || v.revision !== undefined) throw new Error("widgets publish 不接受设置参数。"); await output(await runWidgetsCommand(management.client, sub, argument, { htmlFile: v["html-file"], reportFile: v["report-file"], title: v.title, summary: v.summary, requestId: v["request-id"] })); return; }
     if (command === "history") { await output(await runHistoryCommand(management.client, sub, argument, { bot: v.bot, anchor: v.anchor, message: v.message, cursor: v.cursor, revision: v.revision, requestId: v["request-id"], title: v.title, action: v.action })); return; }
     if (command === "conversations") {
-      if (sub === "pi-session") { await output(await management.piSession(argument!, v.bot!, piSessionUpdate)); return; }
+      if (sub === "pi-session") {
+        const result = await management.piSession(argument!, v.bot!, piSessionUpdate);
+        const note = piSessionUpdate && "outcome" in result ? piSessionRejectionNote(result, piSessionUpdate.value) : undefined;
+        if (note && !v.json) console.error(note);
+        await output(result); return;
+      }
       if (argument || [v.host, v.bot, v["source-bot"]].some(value => value !== undefined)) throw new Error("批量整理使用当前本地主机；不接受跨 Bot 路由参数。");
       await output(await runConversationsCommand(management.client, sub, { ids: v.ids, yes: v.yes, folder: v.folder, unfiled: v.unfiled, newFolder: v["new-folder"], revision: v.revision, requestId: v["request-id"] }, id => console.error(`批量操作编号：${id}。结果不确定时保留原编号和参数核对，勿换编号重复提交。`))); return;
     }
@@ -843,13 +852,20 @@ export async function runHostCli(argv: string[]): Promise<void> {
           // Pi/DeepSeek off is an explicit native thinking level. Resolve the engine from the
           // same authenticated settings API, but keep the caller's revision so
           // an intervening engine/settings change still fails as a conflict.
-          const clearEffort = v.effort === "default"
-            || v.effort === "off" && !["pi", "deepseek"].includes((await management.botModel(id)).engine);
-          await output(await management.botModel(id, {
-            revision,
-            model: ["default", "off"].includes(v.model) ? "" : v.model,
-            ...(v.effort === undefined ? {} : { effort: (clearEffort ? "" : v.effort) as import("../client-protocol/model.js").ModelPatch["effort"] }),
-          }));
+          // The same read names what a refusal was about.
+          const current = await management.botModel(id);
+          if (v.effort !== undefined && v.effort !== "default") {
+            if (current.engine === "pi" && !(PI_THINKING_LEVELS as readonly string[]).includes(v.effort)) throw piLevelArgumentError("--effort", v.effort);
+            if (!effortValueSchema.safeParse(v.effort).success) throw effortArgumentError(v.effort);
+          }
+          const clearEffort = v.effort === "default" || v.effort === "off" && !["pi", "deepseek"].includes(current.engine);
+          const model = ["default", "off"].includes(v.model) ? "" : v.model;
+          try {
+            await output(await management.botModel(id, {
+              revision, model,
+              ...(v.effort === undefined ? {} : { effort: (clearEffort ? "" : v.effort) as import("../client-protocol/model.js").ModelPatch["effort"] }),
+            }));
+          } catch (error) { throw explainPiModelRejection(error, current, model, clearEffort ? "" : v.effort); }
         }
       }
       else throw new Error("未知 bots 命令。请执行 tarobot --help。");

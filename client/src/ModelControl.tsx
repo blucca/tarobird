@@ -9,9 +9,12 @@ import { CreationDialog } from "./CreationDialog.js";
 import { useBotSettingsRequest } from "./bot-settings-request.js";
 import { HubHttpError } from "./http-error.js";
 import { t, useLocale } from "./i18n.js";
+import { piModelSettingsRejectionText } from "./pi-rejection-text.js";
 import { modelOptionLabel, modelOptions, selectedModelOption, selectedModelEffort, selectModel, selectModelEffort } from "./model-selection.js";
 
-export function modelSettingsErrorText(error: unknown) {
+/** `attempt`: the model and effort that were saved, with the catalog read for them, so a Pi refusal can say which part failed. */
+export function modelSettingsErrorText(error: unknown, attempt?: { engine?: string; model: string; effort: string; choices: readonly { id: string; provider?: string; efforts: readonly string[] }[] }) {
+  const piError = attempt && error instanceof Error ? piModelSettingsRejectionText(error.message, attempt) : undefined; if (piError) return piError;
   const deepSeekError = deepSeekSettingsErrorText(error); if (deepSeekError) return deepSeekError;
   if (error instanceof HubHttpError && error.status === 404) return t("此主机尚不支持在设置中切换模型，请更新主机版本。");
   switch (error instanceof Error ? error.message : "") {
@@ -36,6 +39,8 @@ function ModelDialog({ connection, bot, online, close, returnFocus }: { connecti
   const { data, busy, saving, error, saved, load, save } = useBotSettingsRequest(connection, bot.id, "model", modelSettingsSchema, bot.engine === "deepseek");
   const [draft, setDraft] = useState(""), [custom, setCustom] = useState(false), [effort, setEffort] = useState<ModelSettings["effort"]>(""), [adjusted, setAdjusted] = useState(false);
   const previousRead = useRef<{ connection: HubConnection; botId: string; data: ModelSettings }>(undefined);
+  // What the last save sent: a refusal is explained for that, not for what the form shows now.
+  const attempt = useRef<{ model: string; effort: ModelSettings["effort"] }>(undefined);
   useEffect(() => {
     if (!data) return;
     const previous = previousRead.current; previousRead.current = { connection, botId: bot.id, data };
@@ -60,7 +65,7 @@ function ModelDialog({ connection, bot, online, close, returnFocus }: { connecti
   return <CreationDialog mobilePage title={t("模型设置")} closeLabel={t("关闭模型设置")} close={close} busy={saving} returnFocus={returnFocus}>
     <div className="effort-settings" data-engine={data?.engine}>
       <p className="effort-scope"><strong>{bot.name}</strong><span>{bot.engine === "pi" ? t("修改 Bot 默认会用于后续任务；/model 只调整当前对话") : t("此 Bot 的所有对话、群聊和话题共用")}</span></p>
-      {data && <form onSubmit={event => { event.preventDefault(); if (!writeBlocked && valid) void save({ revision: data.revision, model: draft, effort }); }}>
+      {data && <form onSubmit={event => { event.preventDefault(); if (!writeBlocked && valid) { attempt.current = { model: draft, effort }; void save({ revision: data.revision, model: draft, effort }); } }}>
         <p className="muted">{t("引擎")} · {data.engine}</p>
         {data.engine === "pi" && !custom ? <PiModelSelect models={models} value={draft} disabled={busy || !online} change={changeModel}/> : <label>{t("选择模型")}<select aria-label={t("选择模型")} disabled={busy || !online} value={custom ? "__custom__" : selectedModel?.id ?? draft} onChange={event => {
           const value = event.target.value; setCustom(value === "__custom__"); changeModel(value === "__custom__" ? "" : value);
@@ -90,7 +95,7 @@ function ModelDialog({ connection, bot, online, close, returnFocus }: { connecti
       </form>}
       {!data && <button disabled={busy || !online} onClick={() => void load()}>{busy ? t("正在读取…") : t("重新读取")}</button>}
       {!online && <p role="status">{t("连接恢复后即可操作")}</p>}
-      {error !== undefined && <p role="alert" className="error-text">{modelSettingsErrorText(error)}</p>}
+      {error !== undefined && <p role="alert" className="error-text">{modelSettingsErrorText(error, data && attempt.current ? { engine: data.engine, ...attempt.current, choices: data.choices } : undefined)}</p>}
     </div>
   </CreationDialog>;
 }

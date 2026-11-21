@@ -5,7 +5,7 @@ import { killProcessTree } from "./process-tree.js";
 import {
   PiJsonlDecoder, classifyPiError, encodePiRecord, isPiPlaceholderModel, parsePiFrame, sanitizePiErrorText,
   type PiCommand, type PiCommandType, type PiErrorKind, type PiExtensionUiRequest, type PiExtensionUiResponse,
-  type PiResponseData, type PiResponseFrame, type PiSessionEvent,
+  type PiProviderFailure, type PiResponseData, type PiResponseFrame, type PiSessionEvent,
 } from "./pi-rpc-protocol.js";
 
 export interface PiLaunchSpec { command: string; args: string[] }
@@ -52,7 +52,11 @@ export class PiStartupError extends Error {
 }
 /** Pi answered `success: false`. `message` is sanitized; `kind` classifies the native text. */
 export class PiRpcCommandError extends Error {
-  constructor(readonly command: string, message: string, readonly kind: PiErrorKind) { super(message); this.name = "PiRpcCommandError"; }
+  constructor(
+    readonly command: string, message: string, readonly kind: PiErrorKind,
+    /** Set only for a model request that Pi reported as failed (`stopReason: "error"`); the Host words its reply from it. */
+    readonly provider?: PiProviderFailure,
+  ) { super(message); this.name = "PiRpcCommandError"; }
 }
 /** The process ended (or was never writable) before the command was answered. */
 export class PiRpcClosedError extends Error {
@@ -81,6 +85,7 @@ export class PiRpcClient {
   private readonly pending = new Map<string, Pending>();
   private readonly eventListeners = new Set<(event: PiSessionEvent) => void>();
   private readonly uiListeners = new Set<(request: PiExtensionUiRequest) => void>();
+  private readonly responseListeners = new Set<(command: string, data: unknown) => void>();
   private readonly decoder = new PiJsonlDecoder();
   private stderrTail = "";
   private sequence = 0;
@@ -240,6 +245,16 @@ export class PiRpcClient {
     return () => { this.eventListeners.delete(listener); };
   }
 
+  /**
+   * Successful replies, delivered synchronously and in stream order with events. An awaited reply
+   * resumes only after every later record of the same stdout chunk has been handled, so state read
+   * from it there can be older than an event that followed it.
+   */
+  onResponse(listener: (command: string, data: unknown) => void): () => void {
+    this.responseListeners.add(listener);
+    return () => { this.responseListeners.delete(listener); };
+  }
+
   /** Dialog requests block the extension until answered; a caller that listens must answer or cancel each one. */
   onExtensionUi(listener: (request: PiExtensionUiRequest) => void): () => void {
     this.uiListeners.add(listener);
@@ -327,7 +342,10 @@ export class PiRpcClient {
     if (!request) return;
     this.pending.delete(response.id);
     request.cleanup();
-    if (response.success) { request.resolve(response.data); return; }
+    if (response.success) {
+      for (const listener of [...this.responseListeners]) { try { listener(request.command, response.data); } catch { /* listener errors never break the stream */ } }
+      request.resolve(response.data); return;
+    }
     const raw = response.error ?? "Pi rejected the command";
     request.reject(new PiRpcCommandError(request.command, sanitizePiErrorText(raw) || "Pi rejected the command", classifyPiError(raw)));
   }

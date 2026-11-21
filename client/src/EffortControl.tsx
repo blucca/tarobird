@@ -7,8 +7,10 @@ import { useBotSettingsRequest } from "./bot-settings-request.js";
 import { t, useLocale } from "./i18n.js";
 import { modelEffortPreset } from "./model-selection.js";
 import { DeepSeekModelCatalogNotice, deepSeekCatalogBlocked, deepSeekSettingsErrorText } from "./DeepSeekModelCatalog.js";
+import { piEffortSettingsRejectionText } from "./pi-rejection-text.js";
 
-function errorText(error: unknown): string {
+function errorText(error: unknown, attempt?: { engine?: string; effort: string; choices: readonly string[] }): string {
+  const piError = attempt && error instanceof Error ? piEffortSettingsRejectionText(error.message, attempt) : undefined; if (piError) return piError;
   const deepSeekError = deepSeekSettingsErrorText(error); if (deepSeekError) return deepSeekError;
   switch (error instanceof Error ? error.message : "") {
     case "effort_conflict": return t("其他设备或本机已修改设置。请重新读取后再选择，避免覆盖对方的修改。");
@@ -34,6 +36,8 @@ function EffortDialog({ connection, bots, online, close, returnFocus }: { connec
   const { data, busy, saving, error, saved, load, save } = useBotSettingsRequest(connection, botId, "effort", effortSettingsSchema, bot.engine === "deepseek");
   const preset = data && modelEffortPreset(data.engine, data.model, data.choices);
   const previousRead = useRef<{ connection: HubConnection; botId: string; effort: EffortSettings["effort"] }>(undefined);
+  // What the last save sent: a refusal is explained for that, not for what the form shows now.
+  const attempt = useRef<EffortSettings["effort"]>(undefined);
   useEffect(() => {
     if (!data) return;
     const previous = previousRead.current; previousRead.current = { connection, botId, effort: data.effort };
@@ -48,7 +52,7 @@ function EffortDialog({ connection, bots, online, close, returnFocus }: { connec
       <p className="effort-scope"><strong>{bot?.name}</strong><span>{t("此 Bot 的所有对话、群聊和话题共用")}</span></p>
       {data && <form onSubmit={(event) => {
         event.preventDefault(); if (writeBlocked) return;
-        void save({ revision: data.revision, effort: draft });
+        attempt.current = draft; void save({ revision: data.revision, effort: draft });
       }}>
         <p className="muted">{data.engine}{data.model ? ` · ${preset?.model ?? data.model}` : ` · ${t("引擎默认模型")}`}</p>
         <label>{t("Effort 档位")}<select aria-label={t("Effort 档位")} disabled={busy || !online} value={draft} onChange={(event) => setDraft(event.target.value as EffortSettings["effort"])}>
@@ -66,7 +70,7 @@ function EffortDialog({ connection, bots, online, close, returnFocus }: { connec
       </form>}
       {!data && <button disabled={busy || !online} onClick={() => void load()}>{busy ? t("正在读取…") : t("重新读取")}</button>}
       {!online && <p role="status">{t("连接恢复后即可操作")}</p>}
-      {error !== undefined && <p role="alert" className="error-text">{errorText(error)}</p>}
+      {error !== undefined && <p role="alert" className="error-text">{errorText(error, data && attempt.current !== undefined ? { engine: data.engine, effort: attempt.current, choices: data.choices } : undefined)}</p>}
     </div>
   </CreationDialog>;
 }

@@ -1937,6 +1937,10 @@ export class HubServer {
             : piSessionSnapshotSchema.parse(await this.callBot(botId, "pi.session.get", { botId, conversationId, userId }));
         } catch { result = input ? { outcome: "unknown", reason: "uncertain" } : { supported: true }; }
         if (!await authorize()) result = input ? { outcome: "unknown", reason: "uncertain" } : { supported: false };
+        // The rejection detail goes only to a client that asks for it: older Apps read the result strictly.
+        if (input && url.searchParams.get("detail") !== "1" && result && typeof result === "object" && "detail" in result) {
+          const { detail: _detail, ...plain } = result as Record<string, unknown>; result = plain;
+        }
         await reply(200, result); return;
       }
       const tasksRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/tasks(\/recover)?$/);

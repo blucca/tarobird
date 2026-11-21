@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  EngineIncompleteResponseError, EngineSteeringRejectedError,
+  EngineIncompleteResponseError, EngineSteeringRejectedError, withFailedTurnUsage,
   type AppPlatformTools, type CodexAdapter, type CodexAdapterResponse, type CodexSessionHandle, type CodexUserMessageInput,
   type EngineApprovalDecision, type EngineContextUsage, type EngineStreamEvent, type ExternalSessionInfo,
   type NativeHistoryAnchor, type NativeHistoryRejection, type NativeHistoryResult, type NativeHistoryState,
@@ -30,7 +30,7 @@ import {
 } from "./pi-native-types.js";
 import { PiRpcClient, PiRpcCommandError, PiStartupError, queryPiCatalog, type PiLaunchSpec, type PiSpawn } from "./pi-rpc-client.js";
 import {
-  PI_TUI_BUILTIN_COMMANDS, classifyPiError, isPiPlaceholderModel, parsePiSlashCommand, piClip, piDisplayText, samePiModel, sanitizePiErrorText, toPiModelRef,
+  PI_TUI_BUILTIN_COMMANDS, classifyPiError, isPiPlaceholderModel, parsePiSlashCommand, piClip, piDisplayText, piProviderFailure, samePiModel, sanitizePiErrorText, toPiModelRef,
   type PiAssistantMessage, type PiExtensionUiRequest, type PiModel, type PiModelRef, type PiPromptDisposition, type PiSessionEntry, type PiSessionEvent, type PiSessionState,
 } from "./pi-rpc-protocol.js";
 import { piLabelAnswer, piLabelValue, piQuestionSelection, piQuestionText } from "./pi-question-identity.js";
@@ -73,6 +73,8 @@ export interface PiRpcAdapterOptions {
   settingsWriteTimeoutMs?: number;
   idleWorkerTtlMs?: number;
   idleSweepIntervalMs?: number;
+  /** One-line diagnostics (idle-worker decisions). Default: stderr, which the Hub keeps as the Bot's log tail. */
+  log?: (line: string) => void;
 }
 
 type Deferred<T> = { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void; settled: boolean };
@@ -161,6 +163,10 @@ interface Worker {
   /** Extension notices that arrived while no turn was running. */
   readonly backlog: string[];
   readonly extensionErrors: Array<Extract<PiNativeEvent, { type: "extension_error" }>>;
+  /** When the last turn ended (or the process started); with `touchedBy`, says what keeps an idle worker fresh. */
+  lastTurnAt: number;
+  /** The last call outside a turn that refreshed `lastUsedAt` (a history read, a native control). */
+  touchedBy?: string;
   lastUsedAt: number;
   closed: boolean;
 }
@@ -247,6 +253,10 @@ export class PiRpcAdapter implements CodexAdapter {
   private readonly cancelGraceMs: number;
   private readonly idleWorkerTtlMs: number;
   private readonly sweepTimer: ReturnType<typeof setInterval> | undefined;
+  /** The sweep in progress: one at a time, however long its closes take. */
+  private sweeping: Promise<void> | undefined;
+  /** Why each expired idle worker was last kept, so a reason is logged once and again only when it changes. */
+  private readonly sweepReasons = new WeakMap<Worker, string>();
   private readonly bridgeExtensionPath: string | null;
   private destroyed = false;
 
@@ -477,7 +487,9 @@ export class PiRpcAdapter implements CodexAdapter {
         const file = await this.store.find(sessionId, cwd);
         if (!file || !samePiWorkspace(file.cwd, cwd)) return { blocked: "source_missing" };
       }
-      return { worker: await this.ensureWorker(sessionId, cwd), cwd };
+      const worker = await this.ensureWorker(sessionId, cwd);
+      if (!worker.turn) worker.touchedBy = "a conversation history read";
+      return { worker, cwd };
     } catch (error) {
       return { blocked: "not_ready", detail: error instanceof Error ? error.message : String(error) };
     }
@@ -638,6 +650,7 @@ export class PiRpcAdapter implements CodexAdapter {
   async getContextUsage(sessionId: string, input: { workspaceOverride?: string } = {}): Promise<EngineContextUsage | null> {
     this.assertUsable();
     const worker = await this.ensureWorker(sessionId, await this.resolveWorkspace(input.workspaceOverride));
+    if (!worker.turn) worker.touchedBy = "a context usage read";
     const context = (await worker.client.request({ type: "get_session_stats" })).contextUsage;
     if (!context) return null;
     return { ...(typeof context.tokens === "number" ? { pressureTokens: context.tokens } : {}), contextWindow: context.contextWindow };
@@ -705,9 +718,11 @@ export class PiRpcAdapter implements CodexAdapter {
     } catch (error) {
       // The turn is over for the Host only once the stop is confirmed: Pi settled, or its process was ended.
       if (turn.stopping) await turn.stopping;
-      if (turn.timedOut) throw new Error(turn.timedOut);
-      if (turn.stopRequested) throw abortError();
-      throw this.publicError(error);
+      // Model calls that completed before the failure were billed; the Host's ledger records them too.
+      const usage = turn.mapper.usage;
+      if (turn.timedOut) throw withFailedTurnUsage(new Error(turn.timedOut), usage);
+      if (turn.stopRequested) throw withFailedTurnUsage(abortError(), usage);
+      throw withFailedTurnUsage(this.publicError(error), usage);
     } finally {
       this.endTurn(turn);
     }
@@ -741,6 +756,7 @@ export class PiRpcAdapter implements CodexAdapter {
     };
     worker.turn = turn;
     worker.lastUsedAt = Date.now();
+    worker.touchedBy = undefined;
     // Everything below addresses `turn.worker`, never the process this turn happened to start on.
     const stop = () => { void this.stopTurn(turn); };
     input.abortSignal?.addEventListener("abort", stop, { once: true });
@@ -763,7 +779,8 @@ export class PiRpcAdapter implements CodexAdapter {
     turn.done.resolve();
     turn.scope.abort();
     if (worker.turn === turn) worker.turn = undefined;
-    worker.lastUsedAt = Date.now();
+    worker.lastUsedAt = worker.lastTurnAt = Date.now();
+    worker.touchedBy = undefined;
     // A dialog nobody will answer must not leave an extension waiting forever.
     this.cancelDialogs(worker);
   }
@@ -932,7 +949,8 @@ export class PiRpcAdapter implements CodexAdapter {
     if (last?.stopReason === "error") {
       // Typed, so the Host can tell a provider status reported by Pi (a bare "429") from unrelated text. Only sanitized text is carried.
       const raw = last.errorMessage ?? "";
-      throw new PiRpcCommandError("prompt", sanitizePiErrorText(raw) || "Pi model request failed", classifyPiError(raw));
+      // The provider's own status and explanation travel with it, so the owner is told what the provider said.
+      throw new PiRpcCommandError("prompt", sanitizePiErrorText(raw) || "Pi model request failed", classifyPiError(raw), piProviderFailure(raw));
     }
     const current = await this.reconcileSession(worker).catch(() => worker.sessionId);
     if (current !== sessionId) await this.emit(turn, { type: "session", sessionId: current });
@@ -1658,19 +1676,34 @@ export class PiRpcAdapter implements CodexAdapter {
       await scope.record({ ...thinkingDefault, botDefaultThinking: undefined, thinkingBeforeBotDefault: undefined });
       return;
     }
-    // Dropping a choice. Model and thinking level are independent: resetting one never moves the other,
-    // beyond what Pi itself does to the thinking level when the model changes.
+    // Dropping a choice. Model and thinking level are independent: resetting one never moves the other.
+    // Pi's `set_model` picks a level of its own (its per-model or default setting, then a clamp), so a
+    // level that still follows the Bot is put back afterwards: the conversation never chose another one.
     if ("model" in choice) {
+      const record = await this.store.record(scope.sessionId);
+      const botThinking = runtime.botEffort && record.botDefaultThinking !== undefined ? runtime.botEffort : undefined;
+      // The model reset is complete and recorded first; putting the level back is a second step whose
+      // failure is reported as such, never as an unknown outcome of the reset.
+      const thinkingAfterReset = async () => {
+        if (!botThinking) return;
+        try {
+          if (await this.reapplyThinking(worker, botThinking, beforeWrite)) await scope.record({ ...thinkingDefault, botDefaultThinking: botThinking });
+        } catch (error) {
+          this.publishUi(worker, { type: "notify", level: "warning", text: `The model was reset, but the Bot's ${botThinking} thinking level could not be applied${error instanceof PiNativeUncertainError ? " (Pi did not confirm the change; check the level before changing it again)" : ""}.` }, "host");
+        }
+      };
       if (runtime.botModel) {
         const ref = this.decodeModel(runtime.botModel);
         await this.setModelExact(worker, ref, beforeWrite);
         await scope.record({ ...modelDefault, modelSource: "bot-default", botDefaultModel: ref });
+        await thinkingAfterReset();
         return;
       }
       await beforeWrite();
       const restored = await this.restoreNativeDefault(worker, beforeWrite, { thinking: false });
       if (!restored) throw new PiNativeRejectedError("Pi's default model is not available right now; the conversation keeps its current model", "model-unavailable");
       await scope.record({ ...modelDefault, modelSource: "native", botDefaultModel: undefined });
+      await thinkingAfterReset();
       return;
     }
     if (runtime.botEffort) {
@@ -1681,6 +1714,24 @@ export class PiRpcAdapter implements CodexAdapter {
     }
     // No Bot effort to fall back to: the level stays; only the record of who chose it is cleared.
     await scope.record({ ...thinkingDefault, botDefaultThinking: undefined, thinkingBeforeBotDefault: undefined });
+  }
+
+  /**
+   * After a model change, put back the level that owns the thinking field. Pi chose one of its own on
+   * `set_model`. A level the new model does not offer is left to Pi, with a notice. True when the level is in place.
+   */
+  private async reapplyThinking(worker: Worker, level: string, beforeWrite: () => Promise<void>): Promise<boolean> {
+    if (!isThinkingLevel(level)) return false;
+    if (worker.state.thinkingLevel === level) return true;
+    const { levels } = await worker.client.request({ type: "get_available_thinking_levels" });
+    if (!levels.includes(level)) {
+      this.publishUi(worker, { type: "notify", level: "warning", text: `The model does not support the ${level} thinking level; Pi selected ${worker.state.thinkingLevel ?? "its default"}.` }, "host");
+      return false;
+    }
+    await this.settingsWrite(worker, { type: "set_thinking_level", level }, beforeWrite);
+    await this.refreshState(worker);
+    this.publishState(worker);
+    return true;
   }
 
   /** Pi's own `get_commands` for this process. Names are Pi's invocation names (a duplicate gets `name:2`, runner.ts:839-849). */
@@ -1876,7 +1927,7 @@ export class PiRpcAdapter implements CodexAdapter {
       if (signal?.aborted) throw abortError();
       worker = {
         sessionId, generation: 1, token: randomUUID(), editorRevision: 0, settingsQueue: Promise.resolve(), cwd, client, ...(endpoint ? { endpoint } : {}), ...(bridge ? { bridge } : {}),
-        state, queue: { steering: [], followUp: [] }, dialogs: new Map(), ui: { status: {}, widgets: {} }, backlog: [], extensionErrors: [], lastUsedAt: Date.now(), closed: false,
+        state, queue: { steering: [], followUp: [] }, dialogs: new Map(), ui: { status: {}, widgets: {} }, backlog: [], extensionErrors: [], lastUsedAt: Date.now(), lastTurnAt: Date.now(), closed: false,
       };
     } catch (error) {
       await discard();
@@ -1886,6 +1937,9 @@ export class PiRpcAdapter implements CodexAdapter {
     for (const event of startup.events.splice(0)) if (event.type === "session_start" && typeof event.trusted === "boolean") current.trusted = event.trusted;
     for (const event of errorsAtStartup.splice(0)) this.handleEvent(current, event);
     client.onExtensionUi(request => this.handleExtensionUi(current, request));
+    // Pi's own state, applied where it sits in the stream: a reply read while a run was going must not
+    // overwrite the agent_settled that followed it in the same chunk (the awaited reply resumes after it).
+    client.onResponse((command, data) => { if (command === "get_state" && !current.closed) current.state = data as PiSessionState; });
     for (const request of uiAtStartup.splice(0)) this.handleExtensionUi(current, request);
     void client.exited.then(() => this.handleExit(current));
     void bridge?.closed.then(() => { if (!current.closed) { current.bridge = undefined; current.managedSearchPrefix = undefined; this.publishState(current); } });
@@ -1937,21 +1991,58 @@ export class PiRpcAdapter implements CodexAdapter {
     await worker.endpoint?.dispose();
   }
 
-  private async sweepIdleWorkers(): Promise<void> {
-    const now = Date.now();
-    for (const worker of [...this.workers.values()]) {
-      if (worker.turn || worker.exclusive || worker.state.isStreaming || worker.state.isCompacting || worker.dialogs.size) continue;
-      if (now - worker.lastUsedAt < this.idleWorkerTtlMs) continue;
-      // Ask Pi itself before closing: an extension may have started work the Host did not see.
-      const state = await this.refreshState(worker).catch(() => undefined);
-      if (!state || state.isStreaming || state.isCompacting || state.pendingMessageCount > 0 || worker.turn) continue;
-      await this.closeWorker(worker);
-    }
+  private sweepIdleWorkers(): Promise<void> {
+    this.sweeping ??= this.sweepOnce().finally(() => { this.sweeping = undefined; });
+    return this.sweeping;
   }
 
+  /**
+   * Close the workers idle past their TTL. What the Host owns (a turn, an
+   * exclusive control, an open dialog) keeps a worker as it is. Pi's own run
+   * and compaction flags are asked afresh: a cached flag that went stale would
+   * otherwise keep the worker for good. Closes run side by side, so one slow
+   * Pi exit does not hold back the rest.
+   */
+  private async sweepOnce(): Promise<void> {
+    const closing: Promise<void>[] = [];
+    for (const worker of [...this.workers.values()]) {
+      const idle = Date.now() - worker.lastUsedAt;
+      if (worker.closed) continue;
+      if (idle < this.idleWorkerTtlMs) {
+        // Fresh only because something outside a turn keeps using it: say what, so a worker that never expires can be explained.
+        const sinceTurn = Date.now() - worker.lastTurnAt;
+        if (!worker.turn && worker.touchedBy && sinceTurn >= this.idleWorkerTtlMs) this.keepIdle(worker, `kept fresh by ${worker.touchedBy}; last turn ${Math.round(sinceTurn / 1000)} s ago`, idle);
+        continue;
+      }
+      const held = worker.turn ? "a turn is running" : worker.exclusive ? `${worker.exclusive} is in progress` : worker.dialogs.size ? `${worker.dialogs.size} extension dialog(s) open` : undefined;
+      if (held) { this.keepIdle(worker, held, idle); continue; }
+      // Ask Pi itself before closing: an extension may have started work the Host did not see.
+      let state: PiSessionState;
+      try { state = await this.refreshState(worker); } catch (error) { this.keepIdle(worker, `Pi did not report its state (${error instanceof Error ? error.name : "error"})`, idle); continue; }
+      const busy = worker.turn ? "a turn started" : state.isStreaming ? "Pi reports a run in progress" : state.isCompacting ? "Pi reports a compaction"
+        : state.pendingMessageCount > 0 ? `pending messages: ${state.pendingMessageCount}` : undefined;
+      if (busy) { this.keepIdle(worker, busy, idle); continue; }
+      this.log(`[pi] closed idle worker ${worker.sessionId.slice(0, 8)} after ${Math.round(idle / 1000)} s idle`);
+      closing.push(this.closeWorker(worker));
+    }
+    await Promise.all(closing);
+  }
+
+  private keepIdle(worker: Worker, reason: string, idle: number): void {
+    // The same reason with only its durations changed is not news.
+    const key = reason.replace(/\d+ s\b/g, "");
+    if (this.sweepReasons.get(worker) === key) return;
+    this.sweepReasons.set(worker, key);
+    this.log(`[pi] kept idle worker ${worker.sessionId.slice(0, 8)} past its TTL (${Math.round(idle / 1000)} s idle): ${reason}`);
+  }
+
+  private log(line: string): void {
+    try { (this.options.log ?? (text => console.error(text)))(line); } catch { /* diagnostics never affect a worker */ }
+  }
+
+  /** Pi's state as it answered. `worker.state` took it in stream order (`onResponse`), and later events may have moved it on. */
   private async refreshState(worker: Worker): Promise<PiSessionState> {
-    worker.state = await worker.client.request({ type: "get_state" });
-    return worker.state;
+    return worker.client.request({ type: "get_state" });
   }
 
   /**
@@ -1969,8 +2060,8 @@ export class PiRpcAdapter implements CodexAdapter {
   /** Reword what the owner can act on. The error keeps its Pi type: the Host classifies by it, and its text is already sanitized. */
   private publicError(error: unknown): unknown {
     if (error instanceof PiRpcCommandError) {
-      if (error.kind === "no-model") return new PiRpcCommandError(error.command, "Pi has no usable model. Sign in to a provider in a terminal with `pi auth login <provider>`, or choose a model whose provider is signed in.", error.kind);
-      if (error.kind === "auth") return new PiRpcCommandError(error.command, `Pi could not authenticate with the model provider. Sign in again in a terminal with \`pi auth login <provider>\`. (${error.message})`, error.kind);
+      if (error.kind === "no-model") return new PiRpcCommandError(error.command, "Pi has no usable model. Sign in to a provider in a terminal with `pi auth login <provider>`, or choose a model whose provider is signed in.", error.kind, error.provider);
+      if (error.kind === "auth") return new PiRpcCommandError(error.command, `Pi could not authenticate with the model provider. Sign in again in a terminal with \`pi auth login <provider>\`. (${error.message})`, error.kind, error.provider);
     }
     return error;
   }
@@ -2048,7 +2139,7 @@ export class PiRpcAdapter implements CodexAdapter {
   private async live(sessionId: string): Promise<Worker> {
     this.assertUsable();
     const worker = this.workers.get(sessionId);
-    if (worker && !worker.closed && worker.client.isAlive) { worker.lastUsedAt = Date.now(); return worker; }
+    if (worker && !worker.closed && worker.client.isAlive) { worker.lastUsedAt = Date.now(); if (!worker.turn) worker.touchedBy = "a native Pi control"; return worker; }
     return this.ensureWorker(sessionId, await this.resolveWorkspace(undefined));
   }
 

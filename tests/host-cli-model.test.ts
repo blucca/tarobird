@@ -123,3 +123,40 @@ it.each(["pi", "codex", "deepseek"] as const)("CLI keeps %s effort off semantics
     expect(bridge.handleAuthorizedMessage).not.toHaveBeenCalled();
   } finally { log.mockRestore(); local.close(); await gateway.disconnect(); await control(); await hub.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+it("CLI explains Pi model rejections: unknown model, provider without sign-in, levels the model offers, invalid level", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-pi-reasons-cli-"));
+  vi.mocked(discoverPiModels).mockResolvedValue({ status: "ready", defaultModel: "fixture/reasoning", models: parsePiModels([
+    { provider: "fixture", id: "reasoning", reasoning: true },
+    { provider: "fixture", id: "limited", reasoning: true, thinkingLevelMap: { minimal: null, low: null, medium: null } },
+  ]) });
+  await initializeHost(root, "Pi reasons fixture");
+  const hub = await HubServer.start({ stateDir: root }), stateDir = path.join(root, "bot"); await mkdir(stateDir);
+  await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "pi", model: "fixture/reasoning", effort: "high" }));
+  const secret = randomBytes(32).toString("base64url");
+  await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES(?,?,?)", ["bot", "Fixture", hashSecret(secret)]);
+  const gateway = await attachGateway({ stateDir, url: hub.instanceUrl.replace("http", "ws") + "/instance", secret, botId: "bot", engine: "pi", model: "fixture/reasoning", effort: "high", runtime: createCoreServiceRuntime(), bridge: { handleAuthorizedMessage: vi.fn(async () => ({ text: "unused" })) } });
+  const control = await startHubControl(root, { running: true, pid: process.pid, url: hub.url, instanceUrl: hub.instanceUrl, publicKey: hub.auth.publicKey }, () => {}, { enrollController: value => hub.enrollLocalController(value) });
+  const local = await LocalHostClient.connect(root, { enroll: true }), management = new HostManagement(local);
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const cli = (args: string[]) => runHostCli(["bots", "model", "bot", ...args, "--state-dir", root, "--json"]);
+  const reason = (args: string[]) => cli(args).then(() => "", (error: Error) => error.message);
+  try {
+    const { revision } = await management.botModel("bot");
+    const bytes = await readFile(path.join(stateDir, "config.json"), "utf8");
+    const missing = await reason(["--model", "fixture/missing", "--effort", "high", "--revision", revision]);
+    expect(missing).toContain("model_unavailable");
+    expect(missing).toMatch(/fixture.*(?:已登录|signed in)/);
+    const unsigned = await reason(["--model", "google/gemini-3-pro", "--effort", "high", "--revision", revision]);
+    expect(unsigned).toContain("model_unavailable");
+    expect(unsigned).toMatch(/pi auth login google/);
+    const level = await reason(["--model", "fixture/limited", "--effort", "medium", "--revision", revision]);
+    expect(level).toContain("model_effort_incompatible");
+    expect(level).toMatch(/off.*high/);
+    expect(level).not.toMatch(/medium、|medium,/);
+    const bogus = await reason(["--model", "fixture/reasoning", "--effort", "bogus", "--revision", revision]);
+    expect(bogus).toMatch(/off.*minimal.*low.*medium.*high.*xhigh.*max/);
+    expect(bogus).not.toMatch(/ultra|"code"|invalid_enum_value/);
+    expect(await readFile(path.join(stateDir, "config.json"), "utf8")).toBe(bytes);
+  } finally { log.mockRestore(); local.close(); await gateway.disconnect(); await control(); await hub.close(); await rm(root, { recursive: true, force: true }); }
+});

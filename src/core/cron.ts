@@ -8,7 +8,7 @@ import { deliverBackgroundTaskResponse } from "./background-task-delivery.js";
 import { backgroundTaskBody, backgroundTaskContext, backgroundTaskReplyTo } from "./background-task-notice.js";
 import { renderBackgroundTaskHeader } from "../runtime/background-task-header.js";
 
-import { checkBudgetAvailability, recordBridgeTurnUsage } from "../runtime/bridge-turn.js";
+import { checkBudgetAvailability, recordBridgeTurnUsage, recordFailedTurnUsage } from "../runtime/bridge-turn.js";
 import { applyConversationResumeScope } from "../runtime/conversation-resume.js";
 import { CronAccessDeniedError } from "../runtime/cron-errors.js";
 import { createFreshCronSessionId } from "../runtime/cron-session.js";
@@ -243,6 +243,8 @@ export function buildCoreCronExecutor(input: {
               : undefined,
           });
         } catch (error) {
+          // Model calls made before the failure were billed.
+          await recordFailedTurnUsage(input.stateDir, error, cfg.budgetUsd);
           if (runCard) {
             if (controller.signal.aborted) {
               await runCard.interrupt().catch(() => {});

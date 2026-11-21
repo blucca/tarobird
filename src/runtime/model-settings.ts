@@ -48,7 +48,11 @@ export async function modelSettings(stateDir: string, engine: InstanceEngine, ac
       }
       if (engine === "pi" && model && !decodePiModel(model)) throw new Error("model_id_invalid");
       const efforts = choices.find(choice => choice.id === model)?.efforts ?? modelEffortChoices(engine, model, choices);
-      if (!efforts.includes(effort)) throw new Error("model_effort_incompatible");
+      if (!efforts.includes(effort)) {
+        // A Pi model a complete catalog does not list is the problem, not the effort it was asked with.
+        if (engine === "pi" && model && catalog.status === "ready" && !choices.some(choice => choice.id === model)) throw new Error("model_unavailable");
+        throw new Error("model_effort_incompatible");
+      }
       if (model === before.model && effort === before.effort) return before;
       if (model) config.model = model; else delete config.model;
       if (effort) config.effort = effort; else delete config.effort;

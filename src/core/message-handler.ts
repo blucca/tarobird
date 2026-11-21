@@ -14,8 +14,8 @@ import path from "node:path";
 import type { EngineStreamEvent } from "../codex/adapter.js";
 import { renderCodexWebCitations } from "../runtime/codex-web-citations.js";
 import type { ClaudeNativeGoalReceipt, ClaudeNativeGoalUpdate } from "../codex/claude-native-goal.js";
-import { EngineCancellationUnconfirmedError, EngineSteeringRejectedError, EngineStopTooLateError, EngineNativeInputUnsentError } from "../codex/adapter.js";
-import { checkBudgetAvailability, recordBridgeTurnUsage } from "../runtime/bridge-turn.js";
+import { EngineCancellationUnconfirmedError, EngineSteeringRejectedError, EngineStopTooLateError, EngineNativeInputUnsentError, failedTurnUsage } from "../codex/adapter.js";
+import { checkBudgetAvailability, recordBridgeTurnUsage, recordFailedTurnUsage } from "../runtime/bridge-turn.js";
 import type { ChatQueueWaitEvent } from "../runtime/chat-queue.js";
 import type { BridgeTurnLockWaitEvent } from "../runtime/turn-lock.js";
 import type { TurnPoolWaitEvent } from "../runtime/turn-pool.js";
@@ -2623,7 +2623,9 @@ async function runNormalizedCoreMessage(
             throw error;
           }
           recoveredEngineError = error;
-          result = { text: candidate };
+          // Recorded below with the recovered answer, like a completed turn's usage.
+          const usage = failedTurnUsage(error);
+          result = { text: candidate, ...(usage ? { usage } : {}) };
           await appendCoreTimelineEvent(input.stateDir, normalized, {
             type: "engine.event",
             outcome: "recovered",
@@ -3078,6 +3080,8 @@ async function runNormalizedCoreMessage(
         });
         return true;
       }
+      // The engine did not complete, but model calls it made before failing were billed.
+      await recordFailedTurnUsage(input.stateDir, error, cfg.budgetUsd);
       const terminal = classifyCoreTurnTermination(error, runController.signal);
       const goalStopNote = cfg.engine === "claude" && (claudeGoalSetTurn || nativeGoalObserved)
         ? locale === "en"

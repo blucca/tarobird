@@ -10,7 +10,8 @@ import { createHash } from "node:crypto";
 import { getPiNativeControls } from "../codex/pi-rpc-adapter.js";
 import { decodePiModel, encodePiModel, parsePiModels } from "../codex/pi-models.js";
 import { PiNativeRejectedError, type PiNativeState, type PiNativeLiveSession } from "../codex/pi-native-types.js";
-import { piSessionSnapshotSchema, piSessionThinkingSchema, type PiSessionSnapshot, type PiSessionResult, type PiSessionChange } from "../client-protocol/pi-session.js";
+import { piSessionSnapshotSchema, piSessionThinkingSchema, type PiSessionSnapshot, type PiSessionResult, type PiSessionChange, type PiSessionThinking } from "../client-protocol/pi-session.js";
+import type { PiModelRef } from "../codex/pi-rpc-protocol.js";
 import type {
   CodexAdapter,
   AppPlatformTools,
@@ -211,6 +212,23 @@ function hasPairedPrivateUser(
  * the turn ended and its claims are removed, before its turn lock is released. */
 type SessionTurnHold = { scopeLockId: string; lockedSessionId: string; released: Promise<void>; ended?: true };
 type SessionTurnWaitOptions = NonNullable<Parameters<typeof withBridgeTurnLock>[2]>;
+
+/**
+ * Why Pi refused a value. Pi words an unknown model and a provider without
+ * credentials alike ("Model not found"); its catalog lists only signed-in
+ * providers, so a provider absent from it is the sign-in case.
+ */
+async function piRejectionDetail(error: PiNativeRejectedError, model: PiModelRef | null, listModels: () => Promise<unknown[]>): Promise<NonNullable<PiSessionResult["detail"]>> {
+  if (error.reason === "thinking-unsupported") {
+    const allowed = (error.allowed ?? []).filter((level): level is PiSessionThinking => piSessionThinkingSchema.safeParse(level).success);
+    return { kind: "thinking_unsupported", ...(allowed.length ? { allowed } : {}) };
+  }
+  if (!model) return { kind: "default_unavailable" };
+  let catalog: unknown[];
+  try { catalog = await listModels(); } catch { return { kind: "model_unavailable" }; }
+  const signedIn = catalog.some(entry => Boolean(entry) && typeof entry === "object" && (entry as { provider?: unknown }).provider === model.provider);
+  return { kind: signedIn ? "model_not_found" : "provider_unavailable" };
+}
 
 export class Bridge {
   readonly supportsTurnScopedEnv: boolean;
@@ -938,7 +956,8 @@ export class Bridge {
     if (!await isCurrent()) return { outcome: "rejected", reason: "stale" };
     const model = input.action === "model" && input.value !== null ? decodePiModel(input.value) : null;
     const thinking = input.action === "thinking" && input.value !== null ? piSessionThinkingSchema.safeParse(input.value) : undefined;
-    if (input.action === "model" && input.value !== null && !model || thinking && !thinking.success) return { outcome: "rejected", reason: "invalid" };
+    if (input.action === "model" && input.value !== null && !model) return { outcome: "rejected", reason: "invalid", detail: { kind: "model_invalid" } };
+    if (thinking && !thinking.success) return { outcome: "rejected", reason: "invalid", detail: { kind: "thinking_invalid", allowed: [...piSessionThinkingSchema.options] } };
     try {
       // The handle repeats isCurrent immediately before its actual native write,
       // after any asynchronous lookup of defaults or supported thinking levels.
@@ -949,7 +968,9 @@ export class Bridge {
     } catch (error) {
       // These typed value rejections occur before a write or after an explicit native refusal,
       // including a single-field reset to the Bot default. Post-write reads/guards stay uncertain.
-      if (error instanceof PiNativeRejectedError && ["model-unavailable", "thinking-unsupported"].includes(error.reason)) return { outcome: "rejected", reason: "invalid" };
+      if (error instanceof PiNativeRejectedError && ["model-unavailable", "thinking-unsupported"].includes(error.reason)) {
+        return { outcome: "rejected", reason: "invalid", detail: await piRejectionDetail(error, model ?? null, () => live.listModels()) };
+      }
       return { outcome: "unknown", reason: "uncertain" };
     }
   }

@@ -49,3 +49,13 @@ it("rejects a catalog read for a workspace that changed before save", async () =
   });
   expect(await modelSettings(root, "pi", 0, { revision: before.revision, model: models[1]!.id, effort: "" })).toEqual({ ok: false, error: "model_conflict" });
 });
+
+it("names an unknown Pi model as unavailable rather than as an effort mismatch", async () => {
+  // P-test 2026-11-21: `bots model … --model deepseek/deepseek-v9-nonexistent` answered model_effort_incompatible.
+  const before = await read(), bytes = await readFile(path.join(root, "config.json"), "utf8");
+  expect(await modelSettings(root, "pi", 0, { revision: before.revision, model: "one/no-such-model", effort: "high" })).toEqual({ ok: false, error: "model_unavailable" });
+  expect(await modelSettings(root, "pi", 0, { revision: before.revision, model: "nobody/no-such-model" })).toEqual({ ok: false, error: "model_unavailable" });
+  expect(await readFile(path.join(root, "config.json"), "utf8")).toBe(bytes);
+  // A model the catalog lists keeps the precise effort error.
+  expect(await modelSettings(root, "pi", 0, { revision: before.revision, model: models[1]!.id, effort: "high" })).toEqual({ ok: false, error: "model_effort_incompatible" });
+});

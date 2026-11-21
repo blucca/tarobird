@@ -35,7 +35,8 @@ export class HostManagement {
     const route = `/api/conversations/${idSchema.parse(conversationId)}/pi-session`;
     if (change !== undefined) {
       const input = piSessionChangeSchema.parse({ ...change, botId });
-      return piSessionResultSchema.parse(await this.client.request(route, "POST", input));
+      // `detail=1`: say why a change was refused. A Host that predates it ignores the parameter.
+      return piSessionResultSchema.parse(await this.client.request(`${route}?detail=1`, "POST", input));
     }
     return piSessionSnapshotSchema.parse(await this.client.request(`${route}?botId=${idSchema.parse(botId)}`));
   }

@@ -78,6 +78,30 @@ export interface AdapterUsage {
   costUsd?: number;
 }
 
+const FAILED_TURN_USAGE = Symbol.for("tarobird.failedTurnUsage");
+/**
+ * Attach what the engine already reported for model calls of a turn that then
+ * failed, was stopped or lost its process. The Host records it as it records a
+ * completed turn's usage; it says nothing about the outcome and replays nothing.
+ */
+export function withFailedTurnUsage<T>(error: T, usage: AdapterUsage | undefined): T {
+  // All zero is a request that was refused or aborted before anything was billed (Pi zeroes a provider error's
+  // usage): it is not a metered request and is not counted as one.
+  const billed = usage && (usage.inputTokens > 0 || usage.outputTokens > 0 || (usage.cachedTokens ?? 0) > 0 || (usage.costUsd ?? 0) > 0);
+  if (billed && error && typeof error === "object") Object.defineProperty(error, FAILED_TURN_USAGE, { value: { ...usage }, enumerable: false, configurable: true });
+  return error;
+}
+/** The usage attached by `withFailedTurnUsage`, also when a wrapper keeps the engine error as its cause. */
+export function failedTurnUsage(error: unknown): AdapterUsage | undefined {
+  let current = error;
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth++) {
+    const usage = (current as { [FAILED_TURN_USAGE]?: AdapterUsage })[FAILED_TURN_USAGE];
+    if (usage) return usage;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
 export interface EngineContextUsage {
   /** Provider-reported prompt size for the most recent request. */
   pressureTokens?: number;

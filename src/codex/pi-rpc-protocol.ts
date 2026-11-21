@@ -453,7 +453,93 @@ export function sanitizePiErrorText(message: string, limit = 600): string {
     // A line that was nothing but a path (a docs reference) carries no meaning once reduced.
     .filter(line => !/^…(?:\/[^\s]*)?$/.test(line));
   const text = lines.join(" ").replace(/\s+/g, " ").trim();
-  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+  return text.length > limit ? `${piClip(text, limit - 1)}…` : text;
+}
+
+/**
+ * A model request that Pi reports as failed: an assistant message with
+ * `stopReason: "error"`. Pi's providers word it as `<Label> API error (<status>): <body>`,
+ * `<status>: <body>` or an SDK's `<status> <message>`; the body is usually the
+ * provider's JSON error (pi-ai `utils/error-body.js`), cut at 4000 characters.
+ */
+export interface PiProviderFailure {
+  /** HTTP status, from Pi's own label or a status field of the parsed body; never from numbers in prose. */
+  status?: number;
+  /** The provider's own short code or error type (`model_not_found`), from the parsed body. */
+  code?: string;
+  /**
+   * The provider's `message`, only when the body parsed as JSON: its own words, with
+   * long key-shaped strings masked, at most 200 characters.
+   */
+  reason?: string;
+  /** The text reads as a lost connection (for classification only; it is not shown). */
+  connection?: true;
+}
+
+const PROVIDER_STATUS = /^\s*(?:[^\n(]{1,80}\((\d{3})\)\s*:\s*|(\d{3})(?::\s*|\s+))/;
+const PROVIDER_CODE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const PROVIDER_CONNECTION = /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ENOTFOUND)\b|connection (?:error|reset|refused|closed)|fetch failed|socket hang up|network (?:error|unavailable)|stream disconnected/i;
+const REASON_LIMIT = 200;
+/** A word of key characters; dots only between them, so a sentence's full stop stays. */
+const KEY_WORD = /[A-Za-z0-9+/=_-]+(?:\.[A-Za-z0-9+/=_-]+)*/g;
+
+const httpStatus = (value: unknown): number | undefined => {
+  const number = typeof value === "number" ? value : typeof value === "string" && /^\d{3}$/.test(value) ? Number(value) : NaN;
+  return Number.isInteger(number) && number >= 400 && number <= 599 ? number : undefined;
+};
+
+/** `message`, code and status of `{error: {...}}` or a flat error object (OpenAI, Anthropic, Google). */
+function providerErrorFields(value: unknown): { message?: string; code?: string; status?: number } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const record = value as Record<string, unknown>;
+  const code = (field: unknown) => typeof field === "string" && PROVIDER_CODE.test(field) && field !== "error" ? field : undefined;
+  const status = httpStatus(record.status) ?? httpStatus(record.statusCode) ?? httpStatus(record.code);
+  if (record.error && typeof record.error === "object") {
+    const inner = providerErrorFields(record.error);
+    if (inner.message) {
+      const found = inner.code ?? code(record.code) ?? code(record.type);
+      const innerStatus = inner.status ?? status;
+      return { message: inner.message, ...(found ? { code: found } : {}), ...(innerStatus ? { status: innerStatus } : {}) };
+    }
+  }
+  const message = typeof record.message === "string" && record.message.trim() ? record.message : undefined;
+  const found = code(record.code) ?? code(record.type) ?? code(record.status);
+  return { ...(message ? { message } : {}), ...(found ? { code: found } : {}), ...(status ? { status } : {}) };
+}
+
+/**
+ * A key-shaped string: a word of key characters (letters, digits, `+ / = _ -`, dots between)
+ * with a stretch of at least 24 characters between `-` and `.` that mixes upper case, lower
+ * case and digits, or is at least 32 hex digits. Model names (`deepseek-ai/DeepSeek-V3`)
+ * have no stretch that long.
+ */
+const isKeyShaped = (word: string) => word.split(/[-.]/).some(part =>
+  part.length >= 24 && ((/[a-z]/.test(part) && /[A-Z]/.test(part) && /\d/.test(part)) || (part.length >= 32 && /^[0-9a-f]+$/i.test(part))));
+
+/** The provider's message as shown: control characters removed, key-shaped strings masked, at most 200 characters. */
+function providerReason(message: string): string {
+  const text = piDisplayText(message).replace(/\s+/g, " ").trim().replace(KEY_WORD, word => isKeyShaped(word) ? "[redacted]" : word);
+  const characters = Array.from(text);
+  return characters.length > REASON_LIMIT ? `${characters.slice(0, REASON_LIMIT - 1).join("")}…` : text;
+}
+
+/** The provider's status, code and message, read from what Pi reported. */
+export function piProviderFailure(raw: string): PiProviderFailure {
+  const text = String(raw ?? "");
+  const head = PROVIDER_STATUS.exec(text);
+  let status = httpStatus(head?.[1] ?? head?.[2]);
+  const rest = head && status !== undefined ? text.slice(head[0].length) : text;
+  // Only a body that is one JSON document is read; anything else is not shown at all.
+  let fields: ReturnType<typeof providerErrorFields> = {};
+  if (rest.trimStart().startsWith("{")) {
+    try { fields = providerErrorFields(JSON.parse(rest)); } catch { fields = {}; }
+  }
+  status ??= fields.status;
+  const reason = fields.message ? providerReason(fields.message) : "";
+  return {
+    ...(status !== undefined ? { status } : {}), ...(fields.code ? { code: fields.code } : {}), ...(reason ? { reason } : {}),
+    ...(status === undefined && PROVIDER_CONNECTION.test(text) ? { connection: true as const } : {}),
+  };
 }
 
 /**

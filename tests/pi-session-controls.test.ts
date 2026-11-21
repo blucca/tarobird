@@ -170,16 +170,25 @@ describe("Pi live session snapshots and mutation boundaries", () => {
     f.live.setModel.mockRejectedValue(new PiNativeUncertainError("set_model"));
     expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: null })).toEqual({ outcome: "unknown", reason: "uncertain" });
     f.live.setModel.mockRejectedValue(new PiNativeRejectedError("model unavailable before reset", "model-unavailable"));
-    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: null })).toEqual({ outcome: "rejected", reason: "invalid" });
-    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: "provider/model" })).toEqual({ outcome: "rejected", reason: "invalid" });
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: null })).toEqual({ outcome: "rejected", reason: "invalid", detail: { kind: "default_unavailable" } });
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: "provider/model" })).toMatchObject({ outcome: "rejected", reason: "invalid" });
     f.live.setThinkingLevel.mockRejectedValue(new PiNativeRejectedError("Bot default is unsupported by this model", "thinking-unsupported"));
-    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "thinking", value: null })).toEqual({ outcome: "rejected", reason: "invalid" });
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "thinking", value: null })).toEqual({ outcome: "rejected", reason: "invalid", detail: { kind: "thinking_unsupported" } });
+  });
+  it("says why a value was refused: unknown model, provider without sign-in, or the levels the model offers", async () => {
+    // P-test 2026-11-21: every one of these came back as a bare "invalid".
+    const f = bridgeFixture(), snapshot = await f.bridge.getPiSession(scope), token = snapshot.session!.token;
+    f.live.setModel.mockRejectedValue(new PiNativeRejectedError("Invalid model selection: not available in Pi", "model-unavailable"));
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: token, action: "model", value: "provider/nonexistent-9" })).toEqual({ outcome: "rejected", reason: "invalid", detail: { kind: "model_not_found" } });
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: token, action: "model", value: "google/gemini-3-pro" })).toEqual({ outcome: "rejected", reason: "invalid", detail: { kind: "provider_unavailable" } });
+    f.live.setThinkingLevel.mockRejectedValue(new PiNativeRejectedError("Invalid model selection: provider/model has no \"minimal\" effort (available: off, high)", "thinking-unsupported", ["off", "high"]));
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: token, action: "thinking", value: "minimal" })).toEqual({ outcome: "rejected", reason: "invalid", detail: { kind: "thinking_unsupported", allowed: ["off", "high"] } });
   });
   it("rejects malformed model or thinking choices before any native write", async () => {
     const f = bridgeFixture(), snapshot = await f.bridge.getPiSession(scope);
-    for (const change of [{ action: "model" as const, value: "unqualified" }, { action: "thinking" as const, value: "unsupported" }]) {
-      expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, ...change })).toEqual({ outcome: "rejected", reason: "invalid" });
-    }
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "model", value: "unqualified" })).toEqual({ outcome: "rejected", reason: "invalid", detail: { kind: "model_invalid" } });
+    expect(await f.bridge.changePiSession({ ...scope, expectedSession: snapshot.session!.token, action: "thinking", value: "unsupported" }))
+      .toEqual({ outcome: "rejected", reason: "invalid", detail: { kind: "thinking_invalid", allowed: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] } });
     expect(f.live.setModel).not.toHaveBeenCalled(); expect(f.live.setThinkingLevel).not.toHaveBeenCalled();
   });
 });

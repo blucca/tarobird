@@ -204,6 +204,10 @@ export function renderCategorizedErrorMessage(
   if (category === "engine-settings") return renderEngineSettingsError(detail, locale);
   if (category === "engine-busy") return renderEngineBusyError(locale, detail);
   if (category === "engine-tool-input") return renderMalformedToolInputError(locale);
+  // Only a category and a recorded detail are known here; the provider's explanation is in the run's own reply.
+  if (category === "engine-request-rejected") return locale === "en"
+    ? "The model service refused the previous request. Check the selected model, thinking level and attachments, then retry; restarting the instance will not help."
+    : "模型服务拒绝了上一轮请求。请检查所选模型、思考强度和附件后重试；重启实例无效。";
   if (category === "engine-incomplete") return locale === "en"
     ? "The engine returned a placeholder instead of an answer; this turn is not confirmed complete. Review any tool effects before deciding whether to continue."
     : "引擎返回了占位内容，本轮未确认完成。请先检查已执行操作的结果，再决定是否继续。";

@@ -2157,7 +2157,11 @@ async function handleCoreEffortCommand(
   level: string,
   locale: Locale,
 ): Promise<string> {
+  // Pi has a per-conversation level (/thinking) besides this Bot-wide default, so its replies name the scope.
   if (!level) {
+    if (cfg.engine === "pi") return locale === "en"
+      ? `Bot default thinking level: ${cfg.effort ?? "default"}. It is set for the whole Bot: a change replaces the level in all of this Bot's conversations from their next turn. Use /thinking to see or change this conversation's level.`
+      : `Bot 默认思考强度：${cfg.effort ?? "default"}。它作用于整个 Bot：改动后，这个 Bot 的所有对话从下一轮起都改用新档位。查看或调整当前对话请用 /thinking。`;
     return locale === "en" ? `Current effort: ${cfg.effort ?? "default"}` : `当前 effort: ${cfg.effort ?? "default"}`;
   }
   if (cfg.engine === "deepseek") {
@@ -2173,6 +2177,9 @@ async function handleCoreEffortCommand(
     await updateInstanceConfig(stateDir, (config) => {
       delete config.effort;
     });
+    if (cfg.engine === "pi") return locale === "en"
+      ? "Cleared the Bot default thinking level for the whole Bot: conversations still on the level the Bot set go back to the level they had before; a level chosen with /thinking stays. To change only this conversation, use /thinking."
+      : "已清除 Bot 默认思考强度，作用于整个 Bot：仍在用 Bot 所设档位的对话恢复到之前的档位；用 /thinking 自己选的保持不变。只改当前对话请用 /thinking。";
     return locale === "en" ? "Effort reset to default." : "Effort 已恢复默认。";
   }
   if (cfg.engine === "pi") {
@@ -2182,7 +2189,9 @@ async function handleCoreEffortCommand(
       return locale === "en" ? "Pi has not confirmed this thinking level for the selected model. Refresh the model list or use /effort default." : "Pi 尚未确认当前模型支持这个思考档位。请重新读取模型列表，或使用 /effort default。";
     }
     await updateInstanceConfig(stateDir, config => { config.effort = level; });
-    return locale === "en" ? `Pi thinking override set to ${level}.` : `Pi 思考强度已设为 ${level}。`;
+    return locale === "en"
+      ? `Bot default thinking level set to ${level} for the whole Bot: all of this Bot's conversations use it from their next turn, including ones that chose a level with /thinking. To change only this conversation, use /thinking ${level}.`
+      : `已把 Bot 默认思考强度设为 ${level}，作用于整个 Bot：这个 Bot 的所有对话从下一轮起都改用这一档，包括在对话里用 /thinking 选过档位的。只改当前对话请用 /thinking ${level}。`;
   }
   if (cfg.engine === "claude" && level === "ultra") {
     return locale === "en"

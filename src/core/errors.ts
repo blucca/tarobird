@@ -3,7 +3,7 @@ import { EngineHistoryBusyError } from "../codex/adapter.js";
 import { PiRpcCommandError, PiStartupError } from "../codex/pi-rpc-client.js";
 import { CodexThreadMissingError } from "../codex/app-server-adapter.js";
 import { archiveReadErrorMessage } from "../runtime/zip-archive.js";
-import { classifyFailure, extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError, renderMalformedToolInputError, renderDeepSeekOfficeTimeout } from "../runtime/error-classification.js";
+import { classifyFailure, extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError, renderMalformedToolInputError, renderDeepSeekOfficeTimeout, renderPiProviderFailure } from "../runtime/error-classification.js";
 import { EngineCancellationUnconfirmedError, EngineContextCompactionPendingError, EngineIncompleteResponseError, EngineStopTooLateError } from "../codex/adapter.js";
 import { formatCoreFileSize, isCoreAttachmentTooLargeError } from "./files.js";
 import type { Locale } from "../runtime/locale.js";
@@ -153,6 +153,8 @@ export function renderCoreUserFacingError(
   if (category === "engine-tool-input") return renderMalformedToolInputError(locale);
   if (category === "engine-settings") return renderEngineSettingsError(error, locale);
   if (category === "engine-busy") return renderEngineBusyError(locale, error);
+  const piProvider = renderPiProviderFailure(error, category, locale);
+  if (piProvider) return piProvider;
   const errorText = error instanceof Error ? `${error.name}\n${error.message}` : String(error);
   // ENOENT from spawn can mean either the executable/interpreter or cwd is missing.
   const missingLaunchPath = /^spawn [^\r\n]+ ENOENT(?:\r?\n|$)/.test(error instanceof Error ? error.message : String(error));

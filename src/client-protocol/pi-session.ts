@@ -28,11 +28,29 @@ export const piSessionChangeSchema = z.object({
   botId: id, requestId: id, expectedSession: id,
   action: z.enum(["model", "thinking"]), value: z.string().min(1).max(512).nullable(),
 }).strict();
+/**
+ * Why an `invalid` change was refused. Sent only to a client that asks for it (`?detail=1`):
+ * the result schema is strict, so an older App would otherwise fail to read the answer.
+ */
+export const piSessionRejectionSchema = z.object({
+  kind: z.enum([
+    /** Not a `provider/model` reference. */ "model_invalid",
+    /** The provider is signed in, but has no such model. */ "model_not_found",
+    /** No usable model of that provider: not signed in, or no such provider. */ "provider_unavailable",
+    /** Pi refused the model and the catalog could not be read to say why. */ "model_unavailable",
+    /** Returning to the default: the Bot's or Pi's default model is not available. */ "default_unavailable",
+    /** Not a Pi thinking level. */ "thinking_invalid",
+    /** The model does not offer this level; `allowed` lists what it offers, when known. */ "thinking_unsupported",
+  ]),
+  allowed: z.array(piSessionThinkingSchema).max(7).optional(),
+}).strict();
 export const piSessionResultSchema = z.object({
   outcome: z.enum(["accepted", "rejected", "unknown"]),
   reason: z.enum(["unsupported", "stale", "not_ready", "invalid", "uncertain"]).optional(),
+  detail: piSessionRejectionSchema.optional(),
 }).strict();
 export type PiSessionState = z.infer<typeof piSessionStateSchema>;
 export type PiSessionSnapshot = z.infer<typeof piSessionSnapshotSchema>;
 export type PiSessionChange = z.infer<typeof piSessionChangeSchema>;
 export type PiSessionResult = z.infer<typeof piSessionResultSchema>;
+export type PiSessionThinking = z.infer<typeof piSessionThinkingSchema>;

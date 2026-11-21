@@ -56,6 +56,7 @@ const failureCategories = new Set<FailureCategory>([
   "engine-thread-locked",
   "engine-incomplete",
   "engine-tool-input",
+  "engine-request-rejected",
   "file-workflow",
   "workflow-state",
   "session-state",

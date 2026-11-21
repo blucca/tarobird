@@ -124,3 +124,17 @@ it("preserves the existing owner and conversation membership checks", async () =
   expect(bridge.changePiSession).not.toHaveBeenCalled();
   expect(bridge.getPiSession).not.toHaveBeenCalled();
 });
+
+it("shows the CLI why a change was refused, keeps old clients' answers unchanged and explains a bad level", async () => {
+  bridge.changePiSession.mockResolvedValueOnce({ outcome: "rejected", reason: "invalid", detail: { kind: "thinking_unsupported", allowed: ["off", "high", "max"] } } as never);
+  await cli(["--bot", "bot", "--thinking", "medium", "--session", "opaque", "--request-id", "why_rejected"]);
+  expect(result()).toEqual({ outcome: "rejected", reason: "invalid", detail: { kind: "thinking_unsupported", allowed: ["off", "high", "max"] } });
+  // A client that does not ask for the detail (an App built before it existed) gets exactly the old shape.
+  bridge.changePiSession.mockResolvedValueOnce({ outcome: "rejected", reason: "invalid", detail: { kind: "model_not_found" } } as never);
+  const old = await local.request(`/api/conversations/${conversation}/pi-session`, "POST", { botId: "bot", requestId: "old_client", expectedSession: "opaque", action: "model", value: "fixture/missing" });
+  expect(old).toEqual({ outcome: "rejected", reason: "invalid" });
+  const error = await cli(["--bot", "bot", "--thinking", "bogus", "--session", "opaque", "--request-id", "bad_level"]).then(() => undefined, (failure: Error) => failure);
+  expect(error?.message).toMatch(/off.*minimal.*low.*medium.*high.*xhigh.*max/);
+  expect(error?.message).toContain("default");
+  expect(error?.message).not.toMatch(/"code"|invalid_enum_value|"path"/);
+});
