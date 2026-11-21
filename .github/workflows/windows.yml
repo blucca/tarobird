@@ -1,5 +1,5 @@
-# ACCEPTANCE-ONLY PROBE (#50 extension A1: shortcut target under a CJK path).
-# Never merge into main. A tiny NSIS fixture, no TaroBird installer, no uploads.
+# ACCEPTANCE-ONLY PROBE (#50 extension B-3: what the published 1.5.0 uninstaller shows).
+# Never merge into main. Downloads only the pinned published 1.5.0; no build, no candidate, no uploads.
 name: Windows desktop installer
 on:
   workflow_dispatch:
@@ -29,28 +29,31 @@ jobs:
         run: |
           choco install nsis --no-progress -y
           "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
-      - name: CJK shortcut target probe (installer's own CreateShortcut + SetLnkAppUserModelId)
+      - name: What the published 1.5.0 uninstaller shows when the installer runs it interactively in place
         shell: pwsh
         working-directory: client/scripts/acceptance-probe
         run: |
-          $cjk = -join ([char]0x9A8C, [char]0x6536, ' ', [char]0x76EE, [char]0x5F55)
-          $dir = Join-Path $env:RUNNER_TEMP "TB $cjk\TaroBird"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Copy-Item "$env:WINDIR\System32\whoami.exe" (Join-Path $dir 'tarocub-client.exe')
-          makensis /V2 "/DOUT=$env:RUNNER_TEMP\lnk-cjk-probe.exe" lnk-cjk-probe.nsi
-          if ($LASTEXITCODE -ne 0) { throw "fixture did not compile" }
-          $p = Start-Process -FilePath "$env:RUNNER_TEMP\lnk-cjk-probe.exe" -ArgumentList "/S /D=$dir" -Wait -PassThru
-          "fixture exit $($p.ExitCode)"
-          $link = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\TaroBird CJK Probe.lnk'
-          if (-not (Test-Path -LiteralPath $link)) { throw "PROBE FAIL: no shortcut" }
-          $expected = Join-Path $dir 'tarocub-client.exe'
-          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File lnk-cjk-read.ps1 -Link $link -Expected $expected -Out "$env:RUNNER_TEMP\read-ps51.json"
-          pwsh -NoProfile -NonInteractive -File lnk-cjk-read.ps1 -Link $link -Expected $expected -Out "$env:RUNNER_TEMP\read-ps7.json"
-          $a = Get-Content -Raw "$env:RUNNER_TEMP\read-ps51.json" | ConvertFrom-Json; $b = Get-Content -Raw "$env:RUNNER_TEMP\read-ps7.json" | ConvertFrom-Json
-          "ps51 json: $(Get-Content -Raw "$env:RUNNER_TEMP\read-ps51.json")"
-          "ps7  json: $(Get-Content -Raw "$env:RUNNER_TEMP\read-ps7.json")"
-          Remove-Item -LiteralPath $link -Force
-          if (-not $a.bytesHaveUtf16Dir) { "VERDICT: the .lnk does not hold the CJK directory as UTF-16 (product side)"; exit 1 }
-          if ($a.shellEqual -and -not $a.wshEqual) { "VERDICT: the .lnk is correct; WScript.Shell TargetPath loses the CJK characters (acceptance read method)" }
-          elseif ($a.shellEqual -and $a.wshEqual) { "VERDICT: every read is correct here; the extension failure needs another cause" }
-          else { "VERDICT: unexpected combination, see the json" }
+          $url = 'https://github.com/cloveric/tarobird/releases/download/windows-tarobot-v1.5.0/TaroBird_1.5.0_x64-setup.exe'
+          $file = Join-Path $env:RUNNER_TEMP 'TaroBird_1.5.0_x64-setup.exe'
+          Invoke-WebRequest -Uri $url -OutFile $file -UseBasicParsing
+          $len = (Get-Item $file).Length; $sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+          "1.5.0 download: $len bytes, sha256 $sha"
+          if ($len -ne 262755192 -or $sha -ne 'deb9382a818647fbe34b9faa62ceb310e42505b60b0cc22edd2cb03813c4a419') { throw "PROBE FAIL: 1.5.0 does not match the pinned size and hash" }
+          $p = Start-Process -FilePath $file -ArgumentList '/S' -Wait -PassThru; "1.5.0 /S exit $($p.ExitCode)"
+          $dir = (Get-ItemProperty 'HKCU:\Software\tarocub\TaroBot').'(default)'
+          $lang = (Get-ItemProperty 'HKCU:\Software\tarocub\TaroBot' -ErrorAction SilentlyContinue).'Installer Language'
+          "install dir $dir; Installer Language = $(if ($null -eq $lang) { 'absent' } else { $lang })"
+          $us = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\TaroBot').UninstallString
+          "UninstallString $us"
+          # The installer's interactive reinst_uninstall: ExecWait '<UninstallString> _?=<dir>' (installer.nsi).
+          $out = Join-Path $env:RUNNER_TEMP 'old-uninstaller-windows.jsonl'
+          $exe = $us.Trim('"')
+          $u = Start-Process -FilePath $exe -ArgumentList "_?=$dir" -PassThru
+          "started $exe _?=$dir as pid $($u.Id)"
+          foreach ($t in 0, 2, 4, 6, 10, 15, 20, 30, 45, 60) {
+            while (((Get-Date) - $u.StartTime).TotalSeconds -lt $t) { Start-Sleep -Milliseconds 200 }
+            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File old-uninstaller-windows.ps1 -Out $out -At $t
+            if ($u.HasExited) { "uninstaller exited with $($u.ExitCode) by ${t}s"; break }
+          }
+          Get-Content -LiteralPath $out -Encoding utf8 | ForEach-Object { "snapshot $_" }
+          if (-not $u.HasExited) { "uninstaller still running after 60 s; ending its tree"; taskkill /PID $u.Id /T /F | Out-Null }
