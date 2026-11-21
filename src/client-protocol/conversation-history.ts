@@ -26,6 +26,13 @@ export const historyAnchorPageSchema = z.object({
   anchors: z.array(historyAnchorSchema).max(100), next: id.optional(),
 }).strict();
 const forkTitle = z.string().trim().min(1).max(256).optional();
+/** A default fork title, numbered when the same title is already taken
+ * (" 2", " 3", …). Shared by the App and the Host so both number alike. */
+export function numberedForkTitle(base: string, taken: Iterable<string>): string {
+  const used = new Set(taken), fit = (suffix: string) => `${base.slice(0, 256 - suffix.length)}${suffix}`;
+  if (!used.has(fit(""))) return fit("");
+  for (let n = 2; ; n++) if (!used.has(fit(` ${n}`))) return fit(` ${n}`);
+}
 export const historyActionSchema = z.union([
   z.object({ kind: z.literal("rewind"), anchorId: id }).strict(),
   z.object({ kind: z.literal("fork"), scope: z.literal("whole"), title: forkTitle }).strict(),

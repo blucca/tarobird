@@ -191,3 +191,15 @@ it("reconciles a durable result after temporary local finalization failure witho
   expect(call.mock.calls.filter(([, method]) => method === "history.apply")).toHaveLength(1);
   expect(call.mock.calls.filter(([, method]) => method === "history.finalize")).toHaveLength(2);
 });
+it("numbers default fork titles per source and keeps an explicit title as given", async () => {
+  const title = async (requestId: string, action: Record<string, unknown> = { kind: "fork", scope: "whole" }) => {
+    result = { outcome: "applied", sourceSessionId: "native_source", destinationSessionId: `native_${requestId}` };
+    const operation = await history.start("owner", conversationId, { ...change(requestId), action: action as any });
+    expect(operation.state).toBe("applied");
+    return (await store.conversationForBot("bot", operation.destinationConversationId!)).title;
+  };
+  expect(await title("first")).toBe("Source · 分叉");
+  expect(await title("second")).toBe("Source · 分叉 2");
+  expect(await title("named", { kind: "fork", scope: "whole", title: "My branch" })).toBe("My branch");
+  expect(await title("third")).toBe("Source · 分叉 3");
+});

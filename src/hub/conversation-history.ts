@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { idSchema, type Conversation, type HubEvent, type Json } from "../client-protocol/index.js";
-import { historyActionSchema, historyAnchorEvidenceSchema, historyAnchorPageSchema, historyChangeSchema, historyInternalSnapshotSchema, historyNativeResultSchema, historyOperationSchema, historySnapshotSchema, type HistoryAnchorEvidence, type HistoryChange, type HistoryInternalSnapshot, type HistoryNativeResult, type HistoryOperation } from "../client-protocol/conversation-history.js";
+import { historyActionSchema, historyAnchorEvidenceSchema, numberedForkTitle, historyAnchorPageSchema, historyChangeSchema, historyInternalSnapshotSchema, historyNativeResultSchema, historyOperationSchema, historySnapshotSchema, type HistoryAnchorEvidence, type HistoryChange, type HistoryInternalSnapshot, type HistoryNativeResult, type HistoryOperation } from "../client-protocol/conversation-history.js";
 import { HubError, HubStore, newId, type TransactionGuard } from "./store.js";
 
 type OperationRow = { id: string; owner_id: string; request_id: string; payload_hash: string; bot_id: string; source_conversation_id: string; expected_revision: string; action_json: string; anchor_json: string | null; destination_conversation_id: string | null; state: string; native_result_json: string | null; result_json: string };
@@ -190,7 +190,12 @@ export class HubConversationHistory {
         row = (await this.row(id))!;
         if (row.destination_conversation_id) return;
         const source = await this.store.conversationInTransaction(row.source_conversation_id);
-        const destination = await this.store.createConversationInTransaction(row.owner_id, [row.bot_id], action.title ?? `${source.title.slice(0, 230)} · Fork`, `fork_${id}`, { type: "direct" });
+        // The App names its forks itself. A default here (CLI) matches the
+        // App's Chinese default: Host-side text defaults to Chinese and
+        // managed Bots are created with locale zh.
+        const forks = action.title ? [] : await this.store.db.all<{ title: string }>("SELECT title FROM conversations WHERE json_extract(history_origin_json,'$.sourceConversationId')=?", [row.source_conversation_id]);
+        const title = action.title ?? numberedForkTitle(`${source.title.slice(0, 230)} · 分叉`, forks.map(fork => fork.title));
+        const destination = await this.store.createConversationInTransaction(row.owner_id, [row.bot_id], title, `fork_${id}`, { type: "direct" });
         const anchor = row.anchor_json ? historyAnchorEvidenceSchema.parse(JSON.parse(row.anchor_json)) : undefined;
         const origin = { operationId: id, sourceConversationId: row.source_conversation_id, sourceRevision: row.expected_revision, ...(anchor ? { sourceMessageId: anchor.messageId } : {}), boundary: action.scope === "whole" ? "whole" : result.forkBoundary ?? "before-input" };
         await this.store.db.run("UPDATE conversations SET history_origin_json=? WHERE id=?", [JSON.stringify(origin), destination.id]);

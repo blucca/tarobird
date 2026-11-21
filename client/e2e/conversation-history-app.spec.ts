@@ -72,6 +72,6 @@ test("App desktop, phone and ADHD menus open the fork while preserving source an
     await expect(sourcePane.getByRole("textbox")).toHaveValue("源对话里未发送的草稿");
     await expect(otherPane.getByRole("textbox")).toHaveValue("另一个面板的草稿"); await expect(otherPane.getByText("另一个面板保持原状", { exact: true })).toBeVisible();
     await page.screenshot({ path: info.outputPath("history-app-adhd-fork.png") });
-    expect(requests).toHaveLength(2); expect(errors).toEqual([]);
+    expect(requests).toHaveLength(2); expect(requests.map(input => input.action.title)).toEqual(["历史操作源对话 · 分叉", "历史操作源对话 · 分叉 2"]); expect(errors).toEqual([]);
   } finally { await context.close(); await hub.close(); await rm(root, { recursive: true, force: true }); }
 });

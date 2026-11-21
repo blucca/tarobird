@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import type { Conversation, Message } from "../../src/client-protocol/index.js";
-import type { HistoryAction, HistoryAnchor, HistoryBoundary, HistoryOperation, HistorySnapshot } from "../../src/client-protocol/conversation-history.js";
+import { numberedForkTitle, type HistoryAction, type HistoryAnchor, type HistoryBoundary, type HistoryOperation, type HistorySnapshot } from "../../src/client-protocol/conversation-history.js";
 import { historyPendingSchema, historyReason, historyRecordKey, type HistoryMessageActions, type HistoryPending } from "./conversation-history-state.js";
 import type { HubConnection } from "./connection.js";
 import { useConnectionSelection } from "./connection-selection.js";
@@ -14,8 +14,10 @@ const initial = (key: string): View => ({ key, anchors: {}, ready: false, stale:
 
 /** One durable operation per Host/user/conversation. Only submit() applies a
  * native action. Explicit recovery reconciles this receipt without replay. */
-export function useConversationHistory({ connection, conversation, enabled, activity, pendingMessages, localBusy, fallback, opened }: {
+export function useConversationHistory({ connection, conversation, enabled, activity, pendingMessages, localBusy, fallback, opened, forkTitles = [] }: {
   connection: HubConnection; conversation?: Conversation; enabled: boolean; activity: string;
+  /** Titles of conversations already forked from this one; a default title is numbered past them. */
+  forkTitles?: string[];
   pendingMessages: boolean; localBusy: boolean; fallback: RefObject<HTMLElement | null>; opened: (conversation: Conversation) => void;
 }) {
   const id = conversation?.id ?? "", botId = conversation?.botIds[0] ?? "";
@@ -83,7 +85,7 @@ export function useConversationHistory({ connection, conversation, enabled, acti
     trigger.current = origin;
     patch(key, { open: true, intent: { action, revision: view.snapshot.revision, excerpt: message ? messageExcerpt(message).slice(0, 500) : undefined, boundary }, error: "", notice: "", result: undefined, destination: undefined });
   }
-  const title = t("{0} · 分叉", (conversation?.title ?? "").slice(0, 240));
+  const title = numberedForkTitle(t("{0} · 分叉", (conversation?.title ?? "").slice(0, 240)), forkTitles);
   const fork = available && view.snapshot?.supported && view.snapshot.capabilities?.fork ? {
     reason, run: (origin: HTMLElement | null) => ask({ kind: "fork", scope: "whole", title }, origin),
   } : undefined;
