@@ -1,6 +1,7 @@
 import { nativeInputCapabilitySchema, nativeInputActionSchema } from "./native-input.js";
 import { z } from "zod";
 import { idSchema, textSchema } from "./index.js";
+import { botSourceSchema } from "./bot-messages.js";
 import { workbenchContextSchema } from "./workbench.js";
 
 export const steerReasonSchema = z.enum(["unsupported", "idle", "stale", "binding_changed", "queued", "not_ready", "uncertain"]);
@@ -23,3 +24,16 @@ export const steerResultSchema = z.object({ outcome: z.enum(["accepted", "reject
 export type SteerResult = z.infer<typeof steerResultSchema>;
 
 export const nativeInputControlRequestSchema = z.object({ requestId: idSchema, action: nativeInputActionSchema }).strict();
+
+/** Hub → Gateway, `bot-messages.steer.v1` workers only (issue #62). Read-only:
+ * the live run of exactly this conversation, never a background-review target. */
+export const botSteerStatusCallSchema = z.object({ conversationId: idSchema }).strict();
+/** `sourceMessageId` is the Hub input message that started the live run; the
+ * Hub accepts a Bot steer only into a run its own sender started. */
+export const botSteerStatusSchema = z.object({ supported: z.boolean(), targetId: idSchema.optional(), sourceMessageId: idSchema.optional(),
+  reason: z.enum(["unsupported", "unsupported_engine", "no_active_turn", "background_review"]).optional() }).strict();
+/** Hub → Gateway. Plain text append only: no native-input mode, attachments,
+ * stop, card answer or approval. `requestId` is the Hub record's client ID. */
+export const botSteerCallSchema = z.object({ conversationId: idSchema, userId: idSchema, requestId: idSchema, targetId: idSchema, sourceMessageId: idSchema,
+  text: textSchema.refine((text) => !!text.trim(), "empty_message"), source: botSourceSchema }).strict();
+export type BotSteerCall = z.infer<typeof botSteerCallSchema>;
