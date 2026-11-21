@@ -86,14 +86,15 @@ FunctionEnd
 
 Section Probe
   SetOutPath $INSTDIR
+  ; As NSIS_HOOK_PREINSTALL does first in every product install.
+  StrCpy $BirdOperation "$(birdInstall)"
+  StrCpy $BirdBackupState "$(birdNotRequested)"
+  StrCpy $BirdNoticeState ""
   !insertmacro ProbeWrite "install-language.txt" "$LANGUAGE $(probeLanguage)"
   ${GetOptions} $CMDLINE "/CASE=" $ProbeCase
   ${If} $ProbeCase == "makeun"
     WriteUninstaller "$INSTDIR\probe-uninstall.exe"
   ${ElseIf} $ProbeCase == "stop"
-    StrCpy $BirdOperation "$(birdInstall)"
-    StrCpy $BirdBackupState "$(birdNotRequested)"
-    StrCpy $BirdNoticeState ""
     !insertmacro TaroBotStopLocalHost 1
     !insertmacro ProbeWrite "stop-confirmed.txt" "installer"
   ${EndIf}
@@ -119,12 +120,13 @@ Function un.onInit
 FunctionEnd
 
 Section Uninstall
+  ; As NSIS_HOOK_PREUNINSTALL does first in every product uninstall.
+  StrCpy $BirdOperation "$(birdUninstall)"
+  StrCpy $BirdBackupState "$(birdNotRequested)"
+  StrCpy $BirdNoticeState ""
   !insertmacro ProbeWrite "uninstall-language.txt" "$LANGUAGE $(probeLanguage)"
   ${GetOptions} $CMDLINE "/CASE=" $ProbeCase
   ${If} $ProbeCase == "stop"
-    StrCpy $BirdOperation "$(birdUninstall)"
-    StrCpy $BirdBackupState "$(birdNotRequested)"
-    StrCpy $BirdNoticeState ""
     !insertmacro TaroBotStopLocalHost 0
     !insertmacro ProbeWrite "stop-confirmed.txt" "uninstaller"
   ${EndIf}
