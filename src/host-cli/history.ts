@@ -1,5 +1,5 @@
 import { idSchema } from "../client-protocol/index.js";
-import { CONVERSATION_HISTORY_CAPABILITY, historyAnchorPageSchema, historyChangeSchema, historyOperationSchema, historySnapshotSchema } from "../client-protocol/conversation-history.js";
+import { CONVERSATION_HISTORY_CAPABILITY, historyAnchorPageSchema, historyChangeSchema, historyOperationSchema, historySnapshotSchema, type HistoryOperation } from "../client-protocol/conversation-history.js";
 import type { LocalHostClient } from "./client.js";
 
 export async function runHistoryCommand(client: Pick<LocalHostClient, "request" | "supports">, command: string | undefined, conversationId: string | undefined,
@@ -18,4 +18,15 @@ export async function runHistoryCommand(client: Pick<LocalHostClient, "request" 
       : { kind: "fork", scope: "whole", title: options.title };
   const input = historyChangeSchema.parse({ botId, requestId: options.requestId, expectedRevision: options.revision, action });
   return historyOperationSchema.parse(await client.request(command === "reconcile" ? `${base}/operations/${input.requestId}/reconcile` : `${base}/operations`, "POST", input));
+}
+
+/** A change that did not apply exits non-zero, as `steer send` does. The
+ * receipt is still printed first; reads (snapshot, anchors, status) report
+ * what they found and never fail on its content. */
+export function historyCommandFailure(command: string | undefined, result: unknown): string | undefined {
+  if (command !== "rewind" && command !== "fork" && command !== "reconcile") return;
+  const operation = result as HistoryOperation;
+  if (operation.state === "applied") return;
+  if (operation.state === "rejected") return `历史操作未执行（${operation.reason ?? "rejected"}）。原生会话没有改动，也没有自动重试。`;
+  return "历史操作结果待确认。请保留原编号和原参数，用 history status 查询或 history reconcile 核对，不要换编号重试。";
 }

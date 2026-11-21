@@ -1,5 +1,5 @@
 import { expect, it, vi } from "vitest";
-import { runHistoryCommand } from "../src/host-cli/history.js";
+import { historyCommandFailure, runHistoryCommand } from "../src/host-cli/history.js";
 import { HOST_CLI_HELP } from "../src/host-cli/cli.js";
 const operation = { requestId: "request", operationId: "operation", state: "unknown", sourceRevision: "revision", reason: "uncertain" };
 it("uses the shared owner API and keeps unknown status a GET", async () => {
@@ -17,4 +17,17 @@ it("rejects missing explicit operation identity and old Hosts before sending", a
   await expect(runHistoryCommand(client as any, "rewind", "chat", { bot: "bot", anchor: "anchor" })).rejects.toThrow("--request-id");
   await expect(runHistoryCommand({ ...client, supports: () => false } as any, "snapshot", "chat", { bot: "bot" })).rejects.toThrow("更新主机");
   expect(request).not.toHaveBeenCalled();
+});
+it("gives rejected and unconfirmed changes a failure message, so the CLI exits non-zero like steer send", () => {
+  const result = (state: string, reason?: string) => ({ requestId: "request", operationId: "operation", sourceRevision: "revision", state, ...(reason ? { reason } : {}) }) as any;
+  for (const command of ["fork", "rewind", "reconcile"]) {
+    expect(historyCommandFailure(command, result("applied"))).toBeUndefined();
+    expect(historyCommandFailure(command, result("rejected", "source_changed"))).toContain("未执行");
+    expect(historyCommandFailure(command, result("rejected", "source_changed"))).toContain("source_changed");
+    expect(historyCommandFailure(command, result("unknown", "uncertain"))).toContain("不要换编号");
+    expect(historyCommandFailure(command, result("pending"))).toContain("不要换编号");
+  }
+  // Reads only report: their result is the answer, not a failed change.
+  for (const command of ["status", "snapshot", "anchors"]) expect(historyCommandFailure(command, result("rejected", "busy"))).toBeUndefined();
+  expect(HOST_CLI_HELP).toMatch(/history[^\n]*\n[^\n]*退出码/);
 });

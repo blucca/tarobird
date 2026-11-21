@@ -1,4 +1,4 @@
-import { runHistoryCommand } from "./history.js";
+import { historyCommandFailure, runHistoryCommand } from "./history.js";
 import { engineQuotaCommand, engineQuotaNotes } from "./engine-quota.js";
 import { screenCommand } from "./screens.js";
 import { runWorkbenchCommand } from "./workbench.js";
@@ -106,6 +106,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   history rewind|fork CONVERSATION --bot BOT --revision REV --request-id ID [--anchor ANCHOR] [--title TITLE]
   history status CONVERSATION --bot BOT --request-id ID
   history reconcile CONVERSATION --bot BOT --action rewind|fork --revision REV --request-id ID [--anchor ANCHOR] [--title TITLE]
+    rewind、fork、reconcile 未执行或结果待确认时退出码为 1（回执仍照常输出）；snapshot、anchors、status 只读，退出码 0
   conversations pi-session CONVERSATION --bot BOT
     [--model FULL_ID|default | --thinking LEVEL|default] --session TOKEN --request-id ID
     不带修改参数时只读取当前 Pi 会话，不启动会话；修改必须指定 session 和 request-id。
@@ -776,7 +777,13 @@ export async function runHostCli(argv: string[]): Promise<void> {
       return;
     }
     if (command === "widgets") { if (v.enabled !== undefined || v.revision !== undefined) throw new Error("widgets publish 不接受设置参数。"); await output(await runWidgetsCommand(management.client, sub, argument, { htmlFile: v["html-file"], reportFile: v["report-file"], title: v.title, summary: v.summary, requestId: v["request-id"] })); return; }
-    if (command === "history") { await output(await runHistoryCommand(management.client, sub, argument, { bot: v.bot, anchor: v.anchor, message: v.message, cursor: v.cursor, revision: v.revision, requestId: v["request-id"], title: v.title, action: v.action })); return; }
+    if (command === "history") {
+      const result = await runHistoryCommand(management.client, sub, argument, { bot: v.bot, anchor: v.anchor, message: v.message, cursor: v.cursor, revision: v.revision, requestId: v["request-id"], title: v.title, action: v.action });
+      await output(result);
+      const failure = historyCommandFailure(sub, result);
+      if (failure) { console.error(failure); process.exitCode = 1; }
+      return;
+    }
     if (command === "conversations") {
       if (sub === "pi-session") {
         const result = await management.piSession(argument!, v.bot!, piSessionUpdate);

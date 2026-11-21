@@ -88,6 +88,11 @@ tarobot history status CHAT --bot BOT --request-id REQUEST
 tarobot history reconcile CHAT --bot BOT --action fork --revision REV --request-id REQUEST --title "New branch"
 ```
 
+`rewind`, `fork` and `reconcile` print the receipt and exit with status 1 when
+the operation was rejected or its outcome is not yet confirmed (`unknown` or
+`pending`), as `steer send` does. Earlier versions exited 0 in those cases.
+`snapshot`, `anchors` and `status` are reads and exit 0 whatever they report.
+
 Use a fresh snapshot for each new operation. An operation's `resultingRevision`
 records local persistence; it is not a replacement for the next snapshot's
 `expectedRevision`. `sourceEventSeq` on a committed rewind identifies the App
