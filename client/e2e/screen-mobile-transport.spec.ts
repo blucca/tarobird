@@ -8,12 +8,12 @@ const display = { id: "display", nativeId: "1", name: "Fixture display", revisio
 const join: ScreenJoin = { session: { id: "session", desktopId: "desktop", deviceId: "device", deviceName: "Fixture", generation: "generation", display, controlAllowed: true, state: "viewing", createdAt: 1 }, controlTicket: "c".repeat(43), mediaTicket: "m".repeat(43), expiresAt: 2, serverTime: 1 };
 const stamp = { sessionId: "session", generation: "generation" };
 const frame = () => writeScreenFrame({ key: true, codec: "h264", sequence: 7, geometryRevision: 1, streamGeneration: 1, captureMs: 1, width: 1280, height: 720 }, new Uint8Array(300_000));
-function fixture() {
+function fixture(window?: number) {
   const life = new AbortController(), calls: { name: string; args: Record<string, unknown> }[] = [], values: unknown[] = [];
   let deliver: (value: unknown) => void = () => {}, port: ScreenViewerPort;
   const allocation: ScreenAllocation = { id: "native-group", document: "native-document", signal: life.signal };
   const options: { allocate?: Promise<ScreenAllocation>; read?: Promise<void>; send?: Promise<void>; opening?: Promise<void>; reject: Record<string, string>; refuse: Record<string, string>; bytes: Uint8Array } = { bytes: frame(), reject: {}, refuse: {} };
-  const bridge: ScreenNativeBridge = { allocate: async () => options.allocate ?? allocation, invoke: async <T>(name: string, args: Record<string, unknown>) => {
+  const bridge: ScreenNativeBridge = { ...(window ? { window: async () => window } : {}), allocate: async () => options.allocate ?? allocation, invoke: async <T>(name: string, args: Record<string, unknown>) => {
     calls.push({ name, args });
     if (name === "net_screen_open") { deliver = (args.events as { onmessage(value: unknown): void }).onmessage; await options.opening; }
     // A native rejection, as the plugin returns it: an Error whose message is the code.
@@ -27,6 +27,19 @@ function fixture() {
   const open = () => channel.open({ url: "https://fixture.invalid", publicKey: "fixture" }, { attach: value => { port = value; value.start(data => values.push(data)); }, fail: reason => { throw new Error(reason); } });
   return { life, allocation, calls, values, options, channel, open, post: (value: Record<string, unknown>) => port.postMessage(value), event: (value: Record<string, unknown>) => deliver({ id: allocation.id, document: allocation.document, ...value }) };
 }
+
+test("the packet window is three unless native reports a wider one; one packet beyond it ends the session", async () => {
+  const run = async (window: number | undefined, packets: number) => {
+    const f = fixture(window); f.options.read = new Promise(() => {}); await f.open();   // the page never finishes reading: every packet stays held
+    for (let index = 0; index < packets; index++) f.event({ kind: "binary", deliverySequence: index + 1, byteLength: f.options.bytes.byteLength });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    return f.values.filter(value => (value as { type?: string }).type === "closed").map(value => (value as { reason: string }).reason);
+  };
+  expect([await run(undefined, 3), await run(undefined, 4)]).toEqual([[], ["screen_congested"]]);
+  expect([await run(16, 16), await run(16, 17)]).toEqual([[], ["screen_congested"]]);
+  // A native answer below three, or nonsense, never narrows the window.
+  expect([await run(1, 3), await run(Number.NaN, 3)]).toEqual([[], []]);
+});
 
 test("mobile screen bridge orders JSON and bounded chunks, separating delivery and decoded receipts", async () => {
   const f = fixture(); await f.open();

@@ -5,6 +5,8 @@ import type { ScreenViewerPort, ScreenViewerTransport } from "./screen-viewer-tr
 export type ScreenAllocation = { id: string; document: string; signal: AbortSignal };
 export type ScreenNativeBridge = {
   allocate(): Promise<ScreenAllocation>;
+  /** The most packets of one stream generation native holds for the page. Absent or undefined: three. */
+  window?(): Promise<number | undefined>;
   invoke<T = unknown>(command: string, args: Record<string, unknown>): Promise<T>;
 };
 export const SCREEN_BRIDGE_CHUNK_BYTES = 256 * 1024;
@@ -22,9 +24,12 @@ export const SCREEN_NATIVE_CLOSE_GRACE_MS = 1000;
  * and the viewing session goes on. */
 const CONTROL_ENDED = "screen_control_ended";
 const CONTROL_BYTES = 16 * 1024, JSON_BYTES = 64 * 1024;
-/** Native's packet bound: the target's three encoder credits per stream generation;
- * packets of a superseded generation still being read count only in the total. */
-const BINARY_WINDOW = 3, BINARY_RETAINED = 2 * BINARY_WINDOW;
+/** Native's packet bound: the target's flight window per stream generation (three,
+ * or what native reports); packets of a superseded generation still being read
+ * count only in the total, twice the window. Pending commands and JSON deliveries
+ * are bounded five beyond the window: a receipt and a frame-ready per frame, plus
+ * input and state (eight, as always, at three). */
+const BINARY_WINDOW = 3, PENDING_SLACK = 5;
 const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
 /** Bounded, document-owned adapter. It never opens a WebView socket, obtains a
@@ -35,7 +40,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
     let receive: ((value: unknown) => void) | undefined, terminal: string | undefined, ending: ReturnType<typeof setTimeout> | undefined;
     let sequence = 0, jsonCount = 0, jsonBytes = 0, binaryCount = 0, binaryBytes = 0, commands = 0, commandBytes = 0;
     // Stream configs counted as they arrive: native delivers each before its generation's packets.
-    let streams = 0, streamBinaries = 0;
+    let streams = 0, streamBinaries = 0, window = BINARY_WINDOW;
     let incoming = Promise.resolve(), outgoing = Promise.resolve();
     const receipts = new Map<number, { deliverySequence: number; bytes: number; stream: number }>();
     const close = (reason?: string) => {
@@ -77,7 +82,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
           if ((command.type === "input" || command.type === "renew") && !focused) return;
           const bytes = size(command);
           const admittedFocus = focusGeneration;
-          if (++commands > 8 || (commandBytes += bytes) > CONTROL_BYTES) throw new Error("screen_congested");
+          if (++commands > window + PENDING_SLACK || (commandBytes += bytes) > CONTROL_BYTES) throw new Error("screen_congested");
           outgoing = outgoing.then(async () => {
             if ((command.type === "input" || command.type === "renew") && (!focused || admittedFocus !== focusGeneration)) return;
             if (live()) await bridge.invoke("net_screen_send", { id: allocation!.id, command }).catch(error => {
@@ -100,7 +105,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
         sequence = deliverySequence;
         if (value.kind === "screen") {
           const bytes = size(value.value);
-          if (bytes > CONTROL_BYTES || ++jsonCount > 8 || (jsonBytes += bytes) > JSON_BYTES) throw new Error("screen_congested");
+          if (bytes > CONTROL_BYTES || ++jsonCount > window + PENDING_SLACK || (jsonBytes += bytes) > JSON_BYTES) throw new Error("screen_congested");
           const data = (value.value as { type?: unknown })?.type === "stream" ? screenStreamSchema.parse(value.value) : screenViewerEventSchema.parse(value.value);
           if ("sessionId" in data && data.sessionId !== join.session.id || "session" in data && (data.session.id !== join.session.id || data.session.generation !== join.session.generation) || "generation" in data && data.generation !== join.session.generation) throw new Error("screen_session_changed");
           if (data.type === "stream") { streams++; streamBinaries = 0; }
@@ -112,7 +117,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
         } else if (value.kind === "binary") {
           const bytes = value.byteLength as number;
           if (!Number.isSafeInteger(bytes) || bytes <= 32 || bytes > SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
-          if (++streamBinaries > BINARY_WINDOW || ++binaryCount > BINARY_RETAINED || (binaryBytes += bytes) > BINARY_RETAINED * SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
+          if (++streamBinaries > window || ++binaryCount > 2 * window || (binaryBytes += bytes) > 2 * window * SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
           const stream = streams;
           incoming = incoming.then(async () => {
             if (!live()) return;
@@ -136,6 +141,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
       async open(network, events) {
         if (opening || closed) throw new Error("screen_connection_changed"); opening = true;
         try {
+          if (bridge.window) window = Math.max(BINARY_WINDOW, Math.floor(await bridge.window() ?? BINARY_WINDOW) || BINARY_WINDOW);
           const lease = await bridge.allocate(); allocation = lease;
           if (closed) { void bridge.invoke("net_screen_close", { id: lease.id }).catch(() => undefined); return; }
           if (lease.signal.aborted) { close(); throw new Error("screen_connection_changed"); }

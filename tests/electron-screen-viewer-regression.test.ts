@@ -107,8 +107,9 @@ it("accepts a fourth frame after a receipt frees one of three IPC credits", asyn
 
 it("terminates the entire viewer when the IPC window fills instead of dropping a delta and continuing", async () => {
   const { viewers, mainPort, media } = await fixture();
-  for (let sequence = 1; sequence <= 4; sequence++) media.receive(packet(sequence));
-  expect(binaryMessages(mainPort)).toHaveLength(3);
+  // The hop holds the largest flight window (16) awaiting receipt; one more ends the viewer.
+  for (let sequence = 1; sequence <= 17; sequence++) media.receive(packet(sequence));
+  expect(binaryMessages(mainPort)).toHaveLength(16);
   expect(mainPort.messages.at(-1)?.[0]).toEqual({ type: "closed", reason: "screen_viewer_congested" });
   expect(mainPort.closed).toBe(true);
   expect(viewers.viewers.size).toBe(0);

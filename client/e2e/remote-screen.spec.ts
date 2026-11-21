@@ -182,6 +182,15 @@ test("old target quality refusal requires explicit default fallback; old Hosts n
  expect(await page.evaluate(()=>Object.hasOwn((window as any).screenFixture.requests.at(-1),"quality"))).toBe(false);
 });
 
+test("the capacity is named only to a Host that knows the field, and receipts then say how long each frame was held",async({page})=>{
+ // The fixture Host advertises nothing about it: the open and every receipt are what they always were.
+ expect(await page.evaluate(()=>Object.hasOwn((window as any).screenFixture.requests.at(-1),"flight"))).toBe(false);
+ await page.getByRole("button",{name:"断开",exact:true}).click();
+ await page.evaluate(()=>{(window as any).screenConnection.state.screenFlightAvailable=true;});
+ await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
+ expect(await page.evaluate(()=>(window as any).screenFixture.requests.at(-1).flight)).toBe(16);
+});
+
 test("missing quality confirmation retires the returned session instead of silently displaying another profile",async({page})=>{
  await page.getByRole("button",{name:"断开",exact:true}).click();await page.evaluate(()=>{(window as any).screenFixture.unconfirmedQuality=true;});
  await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("status")).toContainText("主机未确认所选画质");

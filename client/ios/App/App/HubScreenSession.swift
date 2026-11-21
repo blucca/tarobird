@@ -34,11 +34,15 @@ final class HubScreenSession: @unchecked Sendable {
     private var early: [(value: [String: Any], size: Int)] = [], earlyBytes = 0
     private var timer: DispatchSourceTimer?
     private var started: TimeInterval = 0, nextPing: TimeInterval = 0
-    /// The target's encoder credits: three frames per stream generation. A restart (start
-    /// control, keyframe, resume) retires them and the next generation may send three at once
-    /// while the page still reads the old one's, so superseded packets count only against the
-    /// total: one current window plus one superseded window. Same names and values as Android.
-    static let BINARY_WINDOW = 3, BINARY_RETAINED = 2 * BINARY_WINDOW
+    /// The target's flight window: the most frames of one stream generation it keeps
+    /// unacknowledged (three by default, up to this many for a viewer that names its
+    /// capacity; the page asks for this value through `screenWindow`). A restart (start
+    /// control, keyframe, resume) retires them and the next generation may send a full
+    /// window while the page still reads the old one's, so superseded packets count only
+    /// against the total: one current window plus one superseded window. JSON deliveries
+    /// and commands being sent are bounded five beyond the window: a frame-ready and a
+    /// receipt per frame, plus state and input. Same names and values as Android.
+    static let BINARY_WINDOW = 16, BINARY_RETAINED = 2 * BINARY_WINDOW, PENDING = BINARY_WINDOW + 5
     /// A well-formed renew or input after native has seen control end (the Hub withdrew the
     /// lease, or focus was lost): refused and never forwarded. The page may simply not have
     /// processed that state yet, so this ends control, not the session (as on Android).
@@ -248,7 +252,7 @@ final class HubScreenSession: @unchecked Sendable {
     }
     private func deliver(value: [String: Any], size: Int) throws {
         let json = deliveries.values.filter { $0.bytes == nil }
-        guard json.count < 8, json.reduce(0, { $0 + $1.size }) + size <= 65536 else { throw HubNetworkError("screen_viewer_congested") }
+        guard json.count < Self.PENDING, json.reduce(0, { $0 + $1.size }) + size <= 65536 else { throw HubNetworkError("screen_viewer_congested") }
         nextDelivery += 1; deliveries[nextDelivery] = Delivery(nil, size, now())
         emit(["kind": "screen", "deliverySequence": nextDelivery, "value": value])
     }
@@ -295,15 +299,17 @@ final class HubScreenSession: @unchecked Sendable {
             try validateInput(command)
             guard canControl, inputFocused, visible else { throw HubNetworkError(Self.controlEnded) }
         case "ack":
-            try Self.keys(command, "type sessionId generation frameSequence")
+            // `heldMs`: how long the page held the frame, from a viewer that named its capacity.
+            try Self.keys(command, "type sessionId generation frameSequence", "heldMs")
             guard Self.revision(command["frameSequence"]) else { throw HubNetworkError("screen_command_invalid") }
+            if command["heldMs"] != nil { guard let held = Self.integer(command["heldMs"]), held <= 2000 else { throw HubNetworkError("screen_command_invalid") } }
         case "release", "disconnect", "keyframe":
             try Self.keys(command, "type sessionId generation")
             if type != "keyframe" { inputFocused = false; canControl = false }
         default: throw HubNetworkError("screen_command_invalid")
         }
         let bytes = try JSONSerialization.data(withJSONObject: command)
-        guard bytes.count <= 16384, sendingBytes + bytes.count <= 16384, sendingCount < 8,
+        guard bytes.count <= 16384, sendingBytes + bytes.count <= 16384, sendingCount < Self.PENDING,
               let text = String(data: bytes, encoding: .utf8) else { fail("screen_viewer_congested"); throw HubNetworkError("screen_viewer_congested") }
         commands.append(text); sendingBytes += bytes.count; sendingCount += 1; flush()
     }

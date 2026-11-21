@@ -1,4 +1,4 @@
-import { SCREEN_QUALITY_PROFILES, screenQualityProfile, type ScreenQuality } from "../../src/client-protocol/screen-quality.js";
+import { SCREEN_FLIGHT_MAX, SCREEN_FLIGHT_MIN, SCREEN_QUALITY_PROFILES, screenQualityProfile, type ScreenQuality } from "../../src/client-protocol/screen-quality.js";
 import { screenStreamSchema, screenViewerEventSchema, type ScreenInputEvent, type ScreenJoin, type ScreenStream } from "../../src/client-protocol/remote-screen.js";
 import { readScreenFrame, SCREEN_HEADER_BYTES } from "../../src/client-protocol/screen-wire.js";
 import { electronScreenViewerTransport, type ScreenViewerChannel, type ScreenViewerPort, type ScreenViewerTransport } from "./screen-viewer-transport.js";
@@ -10,6 +10,10 @@ export function screenCanvasFocused(canvas: HTMLCanvasElement) { return document
 export type RemoteScreenViewerOptions = {
   /** Carries this session's messages; the Electron main process by default. */
   transport?: ScreenViewerTransport;
+  /** The capacity this session was opened with (`screenOpen({ flight })`): frames
+   * accepted before their receipts, and every receipt then says how long this
+   * viewer held the frame. Omitted: three, and receipts as they always were. */
+  flight?: number;
   /** Whether local input may drive the target right now. Gates every input,
    * lease renewal and the `input-focus` report; `screenCanvasFocused` by default.
    * A replacement must only add the viewer's own controls, never loosen the rest. */
@@ -30,9 +34,12 @@ export class RemoteScreenViewer {
   private controlRequested = false; private controlGeneration = 0;
   private minimumGeneration = 1; private streamEpoch = 0;
   private readonly channel: ScreenViewerChannel; private readonly inputActive: (canvas: HTMLCanvasElement) => boolean;
+  private readonly flight: number; private readonly reportHeld: boolean;
   constructor(readonly join: ScreenJoin, private canvas: HTMLCanvasElement, private change: (state: ViewerState) => void, options: RemoteScreenViewerOptions = {}) {
     this.channel = (options.transport ?? electronScreenViewerTransport)(join);
     this.inputActive = options.inputActive ?? screenCanvasFocused;
+    this.reportHeld = options.flight !== undefined;
+    this.flight = Math.min(SCREEN_FLIGHT_MAX, Math.max(SCREEN_FLIGHT_MIN, Math.floor(options.flight ?? SCREEN_FLIGHT_MIN)));
     this.state.controlAllowed = join.session.controlAllowed;
     this.timer = setInterval(() => {
       const fresh = !!this.picture && performance.now() - this.picture.at < 1500;
@@ -80,7 +87,7 @@ export class RemoteScreenViewer {
       this.checkQuality(header);
       this.port?.postMessage({ type: "received", sequence: header.sequence });
       if (!this.visible || !this.stream || header.streamGeneration !== this.stream.streamGeneration) return;
-      if (this.decoder?.state !== "configured" || this.frames.size >= 3) throw new Error("screen_decoder_congested");
+      if (this.decoder?.state !== "configured" || this.frames.size >= this.flight) throw new Error("screen_decoder_congested");
       this.frames.set(header.sequence, { generation: header.streamGeneration, at: performance.now() });
       this.decoder.decode(new EncodedVideoChunk({ type: header.key ? "key" : "delta", timestamp: header.sequence, data: bytes.subarray(SCREEN_HEADER_BYTES) })); return;
     }
@@ -112,7 +119,8 @@ export class RemoteScreenViewer {
           const context = this.canvas.getContext("2d", { alpha: false }); if (!context) throw new Error("screen_canvas_unavailable"); context.drawImage(frame, 0, 0);
           const sequence = frame.timestamp;
           requestAnimationFrame(() => {
-            if (this.visible && !this.disposed && epoch === this.streamEpoch) { this.frames.delete(sequence); this.send({ type: "ack", frameSequence: sequence }); }
+            // The receipt says how long the frame was here (decode, draw, this repaint), so the target can tell the network's share of the round trip.
+          if (this.visible && !this.disposed && epoch === this.streamEpoch) { this.frames.delete(sequence); this.send({ type: "ack", frameSequence: sequence, ...(this.reportHeld ? { heldMs: Math.min(2000, Math.max(0, Math.round(performance.now() - record.at))) } : {}) }); }
           });
         } catch (error) { this.fail(error instanceof Error ? error.message : "screen_decode_failed"); } finally { frame.close(); }
       } });

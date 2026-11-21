@@ -14,7 +14,7 @@ import { isLocalNetworkAddress } from "../src/hub/network.js";
 import { inspectHubService, startHubControl } from "../src/hub/service.js";
 import { hashSecret } from "../src/hub/auth.js";
 import { deviceActionProofText } from "../src/client-protocol/device-actions.js";
-import { CAPABILITIES } from "../src/client-protocol/index.js";
+import { CAPABILITIES, SERVER_CAPABILITIES } from "../src/client-protocol/index.js";
 import {
   REMOTE_SCREEN_FLIGHT_CAPABILITY, REMOTE_SCREEN_QUALITY_CAPABILITY, SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_SERVICE_FLIGHT_FEATURE, SCREEN_CONTROL_RATE_CAPABILITY, SCREEN_MEDIA_BYTES_PER_MS, SCREEN_MEDIA_DIRECT_BYTES_PER_MS, SCREEN_SERVICE_PACE_FEATURE, SCREEN_SERVICE_QUALITY_FEATURE,
   screenConfigureText, screenJoinSchema, screenOpenSchema, screenServiceCommandSchema, screenServiceHelloSchema,
@@ -116,7 +116,8 @@ describe("Hub authority", () => {
   });
 
   it("a viewer's capacity and its reported delay reach only a target that understands them", async () => {
-    expect(CAPABILITIES).toContain(REMOTE_SCREEN_FLIGHT_CAPABILITY);
+    // A Host-only feature: advertised by the Hub, never in a client hello (older Hubs cap that list at 64).
+    expect(SERVER_CAPABILITIES).toContain(REMOTE_SCREEN_FLIGHT_CAPABILITY); expect(CAPABILITIES).not.toContain(REMOTE_SCREEN_FLIGHT_CAPABILITY);
     const stream = { type: "stream", streamGeneration: 1, geometryRevision: 1, codec: "h264", codecString: "avc1.640028", width: 1920, height: 1080, contentRect: { x: 0, y: 0, width: 1920, height: 1080 } };
     const header = (sequence: number) => ({ key: sequence === 1, codec: "h264" as const, sequence, geometryRevision: 1, streamGeneration: 1, captureMs: clock, width: 1920, height: 1080 });
     const round = async (features: string[], extra: Record<string, unknown>, heldMs?: number) => {

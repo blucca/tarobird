@@ -18,6 +18,8 @@ interface MobileTransport {
   screenRead?(args: Record<string, unknown>): Promise<{ data: string }>;
   screenAck?(args: Record<string, unknown>): Promise<unknown>;
   screenClose?(args: Record<string, unknown>): Promise<{ value: boolean }>;
+  /** The most packets of one stream generation native holds for the page; missing in older App builds. */
+  screenWindow?(args: Record<string, unknown>): Promise<{ value: number }>;
   addListener(name: string, callback: (event: { id: string; kind: string }) => void): Promise<PluginListenerHandle>;
 }
 
@@ -102,6 +104,7 @@ export function mobileNetwork(plugin: MobileTransport, pageToken?: string) {
       case "net_screen_send": return screenCall(plugin.screenSend, args);
       case "net_screen_ack": return screenCall(plugin.screenAck, args);
       case "net_screen_close": channels.delete(String(args.id)); return (await screenCall(plugin.screenClose, args)).value;
+      case "net_screen_window": return (await screenCall(plugin.screenWindow, args)).value;
       default: throw new Error("unknown_native_transport_command");
     }
   };

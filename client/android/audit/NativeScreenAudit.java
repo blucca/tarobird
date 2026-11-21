@@ -60,13 +60,14 @@ public final class NativeScreenAudit {
         JSONObject join=join(true);String id=open(join),sid=join.getJSONObject("session").getString("id");
         frame(join,1,1);List<JSONObject> old=deliveries(id,1);
         JSONObject config=restart(join,id,2);check(config.getJSONObject("value").getLong("streamGeneration")==2,"restartConfigDelivered");
-        for(int i=1;i<=3;i++)frame(join,2,i);List<JSONObject> fresh=deliveries(id,3);
-        check(fresh.size()==3&&!"close".equals(fresh.get(2).getString("kind")),"restartWindowAdmittedBehindUnreadPacket");
+        final int w=HubScreenSession.BINARY_WINDOW; // the flight window; the bounds below are one window per generation and two in all
+        for(int i=1;i<=w;i++)frame(join,2,i);List<JSONObject> fresh=deliveries(id,w);
+        check(fresh.size()==w&&!"close".equals(fresh.get(w-1).getString("kind")),"restartWindowAdmittedBehindUnreadPacket");
         consume(id,old.get(0));for(JSONObject binary:fresh)consume(id,binary);check(transport.screenCurrent(id),"restartedSessionStaysOpen");
-        for(int i=4;i<=6;i++)frame(join,2,i);List<JSONObject> window=deliveries(id,3);check(window.size()==3,"generationWindowRefills");
-        frame(join,2,7);check("screen_viewer_congested".equals(deliveries(id,1).get(0).optString("reason")),"generationWindowStillBounded");closedOnPeer(sid);
+        for(int i=w+1;i<=2*w;i++)frame(join,2,i);List<JSONObject> window=deliveries(id,w);check(window.size()==w,"generationWindowRefills");
+        frame(join,2,2*w+1);check("screen_viewer_congested".equals(deliveries(id,1).get(0).optString("reason")),"generationWindowStillBounded");closedOnPeer(sid);
         JSONObject chain=join(true);String chainId=open(chain),chainSid=chain.getJSONObject("session").getString("id");
-        for(int i=1;i<=3;i++)frame(chain,1,i);deliveries(chainId,3);restart(chain,chainId,2);for(int i=1;i<=3;i++)frame(chain,2,i);deliveries(chainId,3);
+        for(int i=1;i<=w;i++)frame(chain,1,i);deliveries(chainId,w);restart(chain,chainId,2);for(int i=1;i<=w;i++)frame(chain,2,i);deliveries(chainId,w);
         restart(chain,chainId,3);frame(chain,3,1);check("screen_viewer_congested".equals(deliveries(chainId,1).get(0).optString("reason")),"retainedPacketsStillBounded");closedOnPeer(chainSid);
     }
     static void frame(JSONObject join,int sequence,boolean malformed) throws Exception {request(new JSONObject().put("action","frame").put("id",join.getJSONObject("session").getString("id")).put("sequence",sequence).put("malformed",malformed));}
