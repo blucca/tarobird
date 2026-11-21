@@ -59,7 +59,9 @@ try {
   const hostDir = path.join(work, 'hub'); await mkdir(hostDir, { recursive: true });
   const hub = await HubServer.start({ stateDir: hostDir }); cleanups.push(() => hub.close());
   // Read-only tap on what the Hub receives from the controller (input shape only).
-  const hubInputs = []; { const rs = hub.remoteScreen, orig = rs.viewerCommand.bind(rs); rs.viewerCommand = (id, raw) => { try { if (raw?.type === 'input' && hubInputs.length < 4000) hubInputs.push({ at: Date.now(), kind: raw.event?.kind, button: raw.event?.button, down: raw.event?.down, x: raw.event?.x, y: raw.event?.y }); } catch { /* shape only */ } return orig(id, raw); }; }
+  const hubInputs = [], hubEvents = []; { const rs = hub.remoteScreen, orig = rs.viewerCommand.bind(rs); rs.viewerCommand = (id, raw) => { try { if (raw?.type === 'input' && hubInputs.length < 4000) hubInputs.push({ at: Date.now(), kind: raw.event?.kind, button: raw.event?.button, down: raw.event?.down, x: raw.event?.x, y: raw.event?.y });
+      else if (raw?.type && !['ack', 'renew'].includes(raw.type) && hubEvents.length < 400) hubEvents.push({ at: Date.now(), from: 'viewer', type: raw.type }); } catch { /* shape only */ } return orig(id, raw); };
+    for (const name of ['serviceStop', 'serviceLeaseDenied', 'serviceLeaseReady', 'closeSession', 'release']) { const f = rs[name]?.bind(rs); if (f) rs[name] = (...args) => { try { if (hubEvents.length < 400) hubEvents.push({ at: Date.now(), from: 'hub', type: name, reason: args.find(v => typeof v === 'string' && /^screen_/.test(v)) ?? null }); } catch {} return f(...args); }; } }
   const owner = device('acc-owner'), ctl = device('acc-controller-b');
   await hub.enrollLocalController({ deviceId: owner.deviceId, name: owner.name, platform: owner.platform, publicKey: owner.publicKey });
   const { code } = await hub.auth.pair({ deviceId: ctl.deviceId, name: 'Controller B', platform: ctl.platform, publicKey: ctl.publicKey }, '127.0.0.1');
@@ -252,6 +254,7 @@ try {
     let aSide = null; try { aSide = (await a('mouse-calls', { since: t0 }, 8000)).calls.map(c => `${c.action}:${c.button}@${c.x},${c.y}`); } catch { aSide = 'a_unresponsive'; }
     const bDom = await page.evaluate(() => (window).__dr);
     rec('input', 'drag-b-dom', 'info', bDom);
+    rec('input', 'drag-hub-events', 'info', hubEvents.filter(e => e.at >= t0 - 200).map(e => ({ dt: e.at - t0, from: e.from, type: e.type, reason: e.reason })));
     rec('input', 'drag-path', 'info', { hubReceived: hubSide.slice(0, 30), hubCount: hubSide.length, aNativeMouseCalls: Array.isArray(aSide) ? aSide.slice(0, 30) : aSide });
     let evs = null; try { evs = (await a('seen', { from }, 8000)).events; } catch (e) { evs = null; }
     await snap(page, lang, 'after-drag');
