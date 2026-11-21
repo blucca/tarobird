@@ -16,19 +16,21 @@ const unavailable = (): PiModelCatalog => ({ status: "unavailable", models: [] }
 const cache = new Map<string, { expires: number; promise: Promise<PiModelCatalog> }>();
 
 /** Native metadata only: no prompt, model switch, credentials readback, or
- * session file. Workspace participates in both discovery and the cache key. */
-export function discoverPiModels(env: NodeJS.ProcessEnv = process.env, cwd?: string): Promise<PiModelCatalog> {
+ * session file. Workspace participates in both discovery and the cache key.
+ * `reread` skips a settled answer but still joins a read in progress. */
+export function discoverPiModels(env: NodeJS.ProcessEnv = process.env, cwd?: string, reread = false): Promise<PiModelCatalog> {
   if (!modelDiscoveryEnabled(env)) return Promise.resolve(unavailable());
   const key = createHash("sha256").update(JSON.stringify([resolvePiExecutable(env), env, cwd])).digest("hex");
   const current = cache.get(key);
-  if (current && current.expires > Date.now()) return current.promise;
+  // A read in progress has an infinite expiry until it answers.
+  if (current && (reread ? current.expires === Number.POSITIVE_INFINITY : current.expires > Date.now())) return current.promise;
   const entry = { expires: Number.POSITIVE_INFINITY, promise: Promise.resolve(unavailable()) };
   entry.promise = readPiCatalog(env, cwd).catch(unavailable).then(result => {
     // Share overlapping reads, but let an explicit reread see recent native login/config changes.
     entry.expires = Date.now() + 1000;
     return result;
   });
-  if (cache.size >= 16) cache.delete(cache.keys().next().value!);
+  if (cache.size >= 16 && !current) cache.delete(cache.keys().next().value!);
   cache.set(key, entry);
   return entry.promise;
 }

@@ -7,7 +7,13 @@ const trace = process.env.DSH_FIXTURE_TRACE;
 const mode = process.env.DSH_FIXTURE_MODE_FILE && existsSync(process.env.DSH_FIXTURE_MODE_FILE) ? readFileSync(process.env.DSH_FIXTURE_MODE_FILE, 'utf8').trim() : process.env.DSH_FIXTURE_STARTUP ?? '';
 // Records whether any earlier instance's private home still existed when this one started.
 const earlier = trace && existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(event => event.kind === 'start') : [];
-if (trace) appendFileSync(trace, JSON.stringify({ kind: 'start', args: process.argv.slice(2), home: process.env.DSH_HOME, cwd: process.cwd(), pid: process.pid, mode, earlierHomesPresent: earlier.filter(event => existsSync(event.home)).length }) + '\n');
+// What the private profile patch held at boot, and whether another fixture still ran against this home.
+const patchFile = path.join(process.env.DSH_HOME, 'profiles', 'web', 'cordis.patch.yml'), pidFile = path.join(process.env.DSH_HOME, 'fixture.pid');
+const running = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const overlapped = existsSync(pidFile) && running(Number(readFileSync(pidFile, 'utf8')));
+const patchSeen = existsSync(patchFile) ? readFileSync(patchFile, 'utf8') : null;
+writeFileSync(pidFile, String(process.pid));
+if (trace) appendFileSync(trace, JSON.stringify({ kind: 'start', args: process.argv.slice(2), home: process.env.DSH_HOME, cwd: process.cwd(), pid: process.pid, mode, earlierHomesPresent: earlier.filter(event => existsSync(event.home)).length, overlapped, patchSeen, credentialsSeen: existsSync(path.join(process.env.DSH_HOME, '.credentials.yaml')) }) + '\n');
 if (mode.includes('slow-exit')) process.on('SIGTERM', () => {});
 // Deliberately emulate a native boot/model-default write. The real shared
 // profile and credential file must remain byte-identical through discovery.

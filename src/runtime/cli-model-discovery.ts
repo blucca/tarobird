@@ -155,20 +155,21 @@ function executable(engine: DiscoveryEngine, env: NodeJS.ProcessEnv): string {
   return (configured || engine).trim().replace(/^"(.*)"$/, "$1");
 }
 
-const cache = new Map<string, { expires: number; result: Promise<DiscoveredModels | undefined> }>();
+const cache = new Map<string, { expires: number; settled: boolean; result: Promise<DiscoveredModels | undefined> }>();
 
 /** The models the installed Claude Code or Codex CLI offers right now, or
- * undefined when it cannot say (missing, too old, signed out, timed out). */
-export function discoverCliModels(engine: DiscoveryEngine, env: NodeJS.ProcessEnv = process.env): Promise<DiscoveredModels | undefined> {
+ * undefined when it cannot say (missing, too old, signed out, timed out).
+ * `reread` skips a settled answer but still joins a read in progress. */
+export function discoverCliModels(engine: DiscoveryEngine, env: NodeJS.ProcessEnv = process.env, reread = false): Promise<DiscoveredModels | undefined> {
   if (!modelDiscoveryEnabled(env)) return Promise.resolve(undefined);
   const key = createHash("sha256").update(JSON.stringify([engine, env])).digest("hex");
   const current = cache.get(key);
-  if (current && current.expires > Date.now()) return current.result;
-  const entry = { expires: Date.now() + SUCCESS_TTL_MS, result: Promise.resolve<DiscoveredModels | undefined>(undefined) };
+  if (current && (reread ? !current.settled : current.expires > Date.now())) return current.result;
+  const entry = { expires: Date.now() + SUCCESS_TTL_MS, settled: false, result: Promise.resolve<DiscoveredModels | undefined>(undefined) };
   entry.result = (engine === "claude" ? discoverClaude(env) : discoverCodex(env))
     .then(found => found.models.length ? found : undefined, () => undefined)
-    .then(found => { if (!found) entry.expires = Date.now() + FAILURE_TTL_MS; return found; });
-  if (cache.size >= 16) cache.delete(cache.keys().next().value!);
+    .then(found => { entry.settled = true; if (!found) entry.expires = Date.now() + FAILURE_TTL_MS; return found; });
+  if (cache.size >= 16 && !current) cache.delete(cache.keys().next().value!);
   cache.set(key, entry);
   return entry.result;
 }
