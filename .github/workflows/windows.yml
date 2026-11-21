@@ -1,129 +1,48 @@
-# ACCEPTANCE-ONLY BRANCH COPY (#50 extension: custom directory, release
-# upgrades, Tauri -> Electron). Never merge this file into main as is: it removes
-# signing, publishing and every artifact upload so a disposable GitHub-hosted
-# runner can install/uninstall without releasing unreviewed bytes. The main #50
-# suite (native regressions, baseline, #50 cases, migration) stays on
-# accept/50-final-20261121; it needs the same pristine runner as group C, so the
-# two never share a job.
+# ACCEPTANCE-ONLY PROBE BRANCH (#50 extension pre-check). Never merge into main.
+# Builds and installs no TaroBird package: pinned release downloads (hash only,
+# nothing is run from them), an NSIS fixture for the CJK/space directory and
+# review N2, and driver syntax. No upload, signing or release.
 name: Windows desktop installer
 on:
   workflow_dispatch:
     inputs:
       arch:
-        description: Windows CPU architecture
+        description: Unused by this probe
         type: choice
         options: [x64]
         default: x64
 permissions:
   contents: read
-env:
-  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
 jobs:
-  windows:
+  extension-probe:
     runs-on: windows-latest
-    timeout-minutes: 180
-    env:
-      TAROBOT_SOURCE_COMMIT: ${{ github.sha }}
-    outputs:
-      version: ${{ steps.version.outputs.version }}
+    timeout-minutes: 20
     steps:
       - name: Acceptance-only guard (disposable GitHub-hosted runner, no uploads)
         shell: pwsh
         env:
           REF: ${{ github.ref }}
         run: |
-          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Install/uninstall acceptance runs only on a disposable GitHub-hosted runner" }
-          if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "This acceptance-only workflow copy runs only from an accept/* branch" }
-          "runner=$env:RUNNER_ENVIRONMENT os=$env:ImageOS image=$env:ImageVersion ref=$env:REF"
-      - name: Configure desktop build directories
-        shell: bash
-        run: |
-          printf '%s\n' \
-            "TAROBOT_DESKTOP_OUTPUT=$RUNNER_TEMP/tarobot-electron-output.noindex" \
-            "TAROBOT_ELECTRON_CACHE=$RUNNER_TEMP/tarobot-electron-cache.noindex" \
-            "TAROBOT_DESKTOP_TARGET=$RUNNER_TEMP/tarobot-electron-target.noindex" >> "$GITHUB_ENV"
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Probe runs only on a disposable GitHub-hosted runner" }
+          if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "Probe runs only from an accept/* branch" }
+          "runner=$env:RUNNER_ENVIRONMENT image=$env:ImageOS $env:ImageVersion ref=$env:REF"
       - uses: actions/checkout@v4
-      - name: Read application version
-        id: version
-        shell: pwsh
-        run: |
-          $client = Get-Content client/package.json -Raw | ConvertFrom-Json
-          $app = Get-Content client/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          if ($client.version -ne $app.version) { throw "Client and native application versions differ" }
-          "version=$($app.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        with:
+          sparse-checkout: client/scripts
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            client/package-lock.json
-      - name: Validate unsigned build settings
+      - name: Build the N2 fixture
         shell: pwsh
         run: |
-          node --input-type=module -e "import { windowsBuildPlan } from './client/scripts/windows-build-plan.mjs'; windowsBuildPlan({ signedUpdates: false });"
-          if ($LASTEXITCODE -ne 0) { throw "Build configuration is incomplete" }
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: client/src-tauri -> target
-          # Acceptance branch: restore only, never store build outputs.
-          save-if: false
-      - name: Install NSIS
+          $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis) { choco install nsis --no-progress -y | Out-Null; $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
+          & $makensis /V2 "/DOUT=$env:RUNNER_TEMP\n2-fixture.exe" client/scripts/acceptance-probe/n2-fixture.nsi
+          if ($LASTEXITCODE -ne 0) { throw "fixture build failed" }
+      - name: "Extension pre-check: pinned downloads, CJK/space /D= and _?= (N2), driver syntax"
         shell: pwsh
         run: |
-          choco install nsis --no-progress -y
-          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
-      - run: npm ci
-      - run: npm ci --prefix client
-      - name: Build full Windows host installer
-        id: build
-        run: npm run desktop:windows --prefix client -- --arch ${{ inputs.arch }}
-      - name: Packaged host end-to-end smoke
-        run: client/src-tauri/host/node.exe scripts/verify-desktop-host.mjs client/src-tauri/host
-      - name: Windows host control and engine discovery
-        run: npx vitest run tests/windows-host.test.ts tests/deepseek-windows-discovery.test.ts tests/deepseek-windows-installation.test.ts tests/deepseek-desktop-launcher.test.ts tests/windows-state-sync.test.ts tests/host-cli-package.test.ts
-      - name: Final installer runtime dependencies
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe" | Select-Object -First 1
-          if (-not $installer) { throw "No Windows installer was produced" }
-          7z x $installer.FullName -owindows-installer-extracted -y
-          if ($LASTEXITCODE -ne 0) { throw "Installer extraction failed" }
-          node scripts/verify-windows-runtime.mjs windows-installer-extracted
-          if ($LASTEXITCODE -ne 0) { throw "Installer requires an unbundled runtime" }
-      - name: "#50 extension: custom directory, release upgrades, Tauri to Electron (acceptance only)"
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 110
-        shell: pwsh
-        env:
-          TAROBOT_WINDOWS_ACCEPTANCE: disposable
-          # Optional, owner-provided read-only token for the private, archived
-          # cloveric/tarobot 1.0.119 release asset. Without it group C reports
-          # "blocked" (a skip, never a pass); nothing is uploaded either way.
-          TAROBOT_LEGACY_RELEASE_TOKEN: ${{ secrets.TAROBOT_LEGACY_RELEASE_READ }}
-        run: |
-          $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
-          if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
-          node client/scripts/windows-acceptance-extension.mjs --confirm-disposable-windows --installer $installers[0].FullName `
-            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-extension.noindex" --groups C,A,B --budget-minutes 100
-          if ($LASTEXITCODE -ne 0) { throw "#50 extension acceptance did not pass; see the receipt in the job summary" }
-      - name: Show acceptance evidence (log and summary only, no upload)
-        if: always()
-        shell: pwsh
-        run: |
-          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/windows-acceptance.md", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.md", "$env:RUNNER_TEMP/windows-extension.noindex/*.md" -ErrorAction SilentlyContinue)) {
-            Get-Content -LiteralPath $file.FullName -Raw | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-          }
-          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/*.json", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.json", "$env:RUNNER_TEMP/windows-persisted-migration.noindex/*.json", "$env:RUNNER_TEMP/windows-extension.noindex/*.json" -ErrorAction SilentlyContinue)) {
-            "===== $($file.Name) ====="; Get-Content -LiteralPath $file.FullName -Raw
-          }
-      - name: Installer checksum (log only, the installer is never uploaded)
-        if: always()
-        shell: pwsh
-        run: |
-          Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
-          }
+          node client/scripts/acceptance-probe/extension-probe.mjs "$env:RUNNER_TEMP\n2-fixture.exe" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\probe.log"
+          $code = $LASTEXITCODE
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Extension pre-check', '```', (Get-Content -Raw "$env:RUNNER_TEMP\probe.log").Trim(), '```')
+          exit $code
