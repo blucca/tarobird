@@ -16,7 +16,7 @@ import { hashSecret } from "../src/hub/auth.js";
 import { deviceActionProofText } from "../src/client-protocol/device-actions.js";
 import { CAPABILITIES } from "../src/client-protocol/index.js";
 import {
-  REMOTE_SCREEN_QUALITY_CAPABILITY, SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_CONTROL_RATE_CAPABILITY, SCREEN_MEDIA_BYTES_PER_MS, SCREEN_MEDIA_DIRECT_BYTES_PER_MS, SCREEN_SERVICE_PACE_FEATURE, SCREEN_SERVICE_QUALITY_FEATURE,
+  REMOTE_SCREEN_FLIGHT_CAPABILITY, REMOTE_SCREEN_QUALITY_CAPABILITY, SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_SERVICE_FLIGHT_FEATURE, SCREEN_CONTROL_RATE_CAPABILITY, SCREEN_MEDIA_BYTES_PER_MS, SCREEN_MEDIA_DIRECT_BYTES_PER_MS, SCREEN_SERVICE_PACE_FEATURE, SCREEN_SERVICE_QUALITY_FEATURE,
   screenConfigureText, screenJoinSchema, screenOpenSchema, screenServiceCommandSchema, screenServiceHelloSchema,
   type ScreenConfigure, type ScreenDesktop, type ScreenJoin,
 } from "../src/client-protocol/remote-screen.js";
@@ -31,8 +31,8 @@ type Any = any;
 // Shapes an older peer parses strictly: what the new side emits by default
 // must still be accepted by them.
 const legacyJoin = screenJoinSchema.omit({ quality: true }).strict();
-const legacyStart = (screenServiceCommandSchema.options.find(o => o.shape.type.value === "start") as Any).omit({ quality: true, mediaBytesPerMs: true }).strict();
-const legacyOpen = screenOpenSchema.omit({ quality: true }).strict();
+const legacyStart = (screenServiceCommandSchema.options.find(o => o.shape.type.value === "start") as Any).omit({ quality: true, mediaBytesPerMs: true, flight: true }).strict();
+const legacyOpen = screenOpenSchema.omit({ quality: true, flight: true }).strict();
 
 describe("Hub authority", () => {
   let root: string, hub: HubServer, screen: HubRemoteScreen, clock: number;
@@ -113,6 +113,36 @@ describe("Hub authority", () => {
     expect([direct.start.mediaBytesPerMs, direct.rate]).toEqual([SCREEN_MEDIA_DIRECT_BYTES_PER_MS, SCREEN_MEDIA_DIRECT_BYTES_PER_MS]);
     expect(() => screenServiceCommandSchema.parse(direct.start)).not.toThrow();
     expect(screen.mediaBytesPerMs("no-such-session")).toBe(SCREEN_MEDIA_BYTES_PER_MS);
+  });
+
+  it("a viewer's capacity and its reported delay reach only a target that understands them", async () => {
+    expect(CAPABILITIES).toContain(REMOTE_SCREEN_FLIGHT_CAPABILITY);
+    const stream = { type: "stream", streamGeneration: 1, geometryRevision: 1, codec: "h264", codecString: "avc1.640028", width: 1920, height: 1080, contentRect: { x: 0, y: 0, width: 1920, height: 1080 } };
+    const header = (sequence: number) => ({ key: sequence === 1, codec: "h264" as const, sequence, geometryRevision: 1, streamGeneration: 1, captureMs: clock, width: 1920, height: 1080 });
+    const round = async (features: string[], extra: Record<string, unknown>, heldMs?: number) => {
+      const { sink, epoch } = register(features), join = await open(extra);
+      await attach(join);
+      const { id, generation } = join.session;
+      expect(screen.stream(epoch, id, generation, stream)).toBe(true);
+      expect(screen.frame(epoch, id, generation, header(1), new Uint8Array([1]))).toBe(true);
+      screen.viewerCommand(id, { type: "ack", sessionId: id, generation, frameSequence: 1, ...(heldMs !== undefined ? { heldMs } : {}) });
+      const result = { start: sink.messages.find(m => m.type === "start"), ack: sink.messages.find(m => m.type === "ack") };
+      screen.viewerCommand(id, { type: "disconnect", sessionId: id, generation });
+      screen.serviceLost(epoch, "screen_service_stopped"); // the next round registers another target
+      return result;
+    };
+    const both = await round([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE], { flight: 12 }, 14);
+    expect([both.start.flight, both.ack.heldMs]).toEqual([12, 14]);
+    expect(() => screenServiceCommandSchema.parse(both.start)).not.toThrow(); expect(() => screenServiceCommandSchema.parse(both.ack)).not.toThrow();
+    // An older target: the same viewer, the start and the receipt it always got.
+    const oldTarget = await round([SCREEN_SERVICE_QUALITY_FEATURE], { flight: 12 }, 14);
+    expect("flight" in oldTarget.start || "heldMs" in oldTarget.ack).toBe(false);
+    expect(() => legacyStart.parse(oldTarget.start)).not.toThrow();
+    // A viewer that named no capacity: its delay is not passed on either.
+    const plain = await round([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE], {}, 14);
+    expect("flight" in plain.start || "heldMs" in plain.ack).toBe(false);
+    register([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE]);
+    for (const flight of [2, 17, 3.5]) await expect(open({ flight })).rejects.toThrow();
   });
 
   it("a target that never advertised the pace feature is never sent a budget, wherever the viewer is", async () => {

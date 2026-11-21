@@ -2,13 +2,15 @@ import { z } from "zod";
 import { SCREEN_MAC_KEYCODES, SCREEN_TARGET_PLATFORMS } from "./screen-keys.js";
 import { idSchema } from "./index.js";
 import { deviceActionProofSchema } from "./device-actions.js";
-import { SCREEN_QUALITIES, SCREEN_STREAM_MAX_AREA, SCREEN_STREAM_MAX_EDGE } from "./screen-quality.js";
+import { SCREEN_FLIGHT_MAX, SCREEN_FLIGHT_MIN, SCREEN_QUALITIES, SCREEN_STREAM_MAX_AREA, SCREEN_STREAM_MAX_EDGE } from "./screen-quality.js";
 
 export const REMOTE_SCREEN_CAPABILITY = "desktop.screen.v1";
 /** Hub → App (`serverCapabilities`): `screenOpen` accepts `quality`. Whether the
  * registered target can honour it is decided per open: an explicit refusal
  * (`screen_quality_unsupported`), or `join.quality` confirming it. */
 export const REMOTE_SCREEN_QUALITY_CAPABILITY = "desktop.screen.quality.v1";
+/** Hub → App (`serverCapabilities`): `screenOpen` accepts `flight` and a viewer's `ack` may carry `heldMs`. */
+export const REMOTE_SCREEN_FLIGHT_CAPABILITY = "desktop.screen.flight.v1";
 /** Host control socket → target (`controlCapabilities`): the hello may carry `features`. */
 export const SCREEN_CONTROL_QUALITY_CAPABILITY = "screen-quality-v1";
 /** Host control socket → target (`controlCapabilities`): this Host accepts a
@@ -24,6 +26,11 @@ export const SCREEN_CONTROL_WINDOWS_CAPABILITY = "screen-windows-v1";
 export const SCREEN_CONTROL_RATE_CAPABILITY = "screen-rate-v1";
 /** Target → Hub (hello `features`): `start` may carry `quality`. */
 export const SCREEN_SERVICE_QUALITY_FEATURE = "screen.quality.v1";
+/** Target → Hub (hello `features`, only to a Host with SCREEN_CONTROL_RATE_CAPABILITY): `start` may carry `flight` and `ack` may carry `heldMs`. */
+export const SCREEN_SERVICE_FLIGHT_FEATURE = "screen.flight.v1";
+const flightSchema = z.number().int().min(SCREEN_FLIGHT_MIN).max(SCREEN_FLIGHT_MAX);
+/** Milliseconds a viewer held a frame between receiving it and sending its receipt (decode, draw, repaint). */
+const heldSchema = z.number().int().min(0).max(2000);
 /** Target → Hub (hello `features`, only to a Host with SCREEN_CONTROL_RATE_CAPABILITY): `start` may carry `mediaBytesPerMs`. */
 export const SCREEN_SERVICE_PACE_FEATURE = "screen.pace.v1";
 /** Encoded bytes a target may send for one session per millisecond (4 and
@@ -76,7 +83,9 @@ export const screenDesktopSchema = z.object({
 export type ScreenDesktop = z.infer<typeof screenDesktopSchema>;
 export const screenOpenSchema = z.object({ desktopId: idSchema, displayId, displayRevision: revision, requestId: idSchema, codecs: z.array(z.enum(["h264", "vp8"])).min(1).max(2).default(["vp8"]),
   // Omitted: the legacy default (balanced), exactly as before quality existed.
-  quality: screenQualitySchema.optional() }).strict();
+  quality: screenQualitySchema.optional(),
+  // The most frames this viewer can hold unacknowledged. Sent only to a Hub with REMOTE_SCREEN_FLIGHT_CAPABILITY; omitted = three.
+  flight: flightSchema.optional() }).strict();
 export const screenSessionSchema = z.object({
   id: idSchema, desktopId: idSchema, deviceId: idSchema, deviceName: z.string().max(128),
   generation: idSchema, display: screenDisplaySchema, controlAllowed: z.boolean(),
@@ -119,7 +128,8 @@ export const screenViewerCommandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("release"), sessionId: idSchema, generation: idSchema }).strict(),
   z.object({ type: z.literal("visibility"), sessionId: idSchema, generation: idSchema, visible: z.boolean() }).strict(),
   z.object({ type: z.literal("keyframe"), sessionId: idSchema, generation: idSchema }).strict(),
-  z.object({ type: z.literal("ack"), sessionId: idSchema, generation: idSchema, frameSequence: revision }).strict(),
+  // `heldMs` only from a viewer that opened with `flight`.
+  z.object({ type: z.literal("ack"), sessionId: idSchema, generation: idSchema, frameSequence: revision, heldMs: heldSchema.optional() }).strict(),
   z.object({ type: z.literal("disconnect"), sessionId: idSchema, generation: idSchema }).strict(),
 ]);
 export type ScreenViewerCommand = z.infer<typeof screenViewerCommandSchema>;
@@ -129,11 +139,13 @@ export const screenServiceCommandSchema = z.discriminatedUnion("type", [
   // `quality` is sent only to a target whose hello advertised SCREEN_SERVICE_QUALITY_FEATURE,
   // `mediaBytesPerMs` (a budget other than the default) only to one that advertised SCREEN_SERVICE_PACE_FEATURE.
   z.object({ type: z.literal("start"), session: screenSessionSchema, mediaTicket: token, streamGeneration: revision, codecs: z.array(z.enum(["h264", "vp8"])).min(1).max(2), quality: screenQualitySchema.optional(),
-    mediaBytesPerMs: z.number().int().min(SCREEN_MEDIA_BYTES_PER_MS).max(SCREEN_MEDIA_DIRECT_BYTES_PER_MS).optional() }).strict(),
+    mediaBytesPerMs: z.number().int().min(SCREEN_MEDIA_BYTES_PER_MS).max(SCREEN_MEDIA_DIRECT_BYTES_PER_MS).optional(),
+    // `flight` (the viewer's capacity) and `heldMs` on `ack` only to a target that advertised SCREEN_SERVICE_FLIGHT_FEATURE.
+    flight: flightSchema.optional() }).strict(),
   z.object({ type: z.literal("stop"), sessionId: idSchema, reason: z.string().max(128) }).strict(),
   z.object({ type: z.literal("pause"), sessionId: idSchema, paused: z.boolean(), streamGeneration: revision }).strict(),
   z.object({ type: z.literal("reset"), sessionId: idSchema, streamGeneration: revision }).strict(),
-  z.object({ type: z.literal("ack"), sessionId: idSchema, frameSequence: revision, streamGeneration: revision }).strict(),
+  z.object({ type: z.literal("ack"), sessionId: idSchema, frameSequence: revision, streamGeneration: revision, heldMs: heldSchema.optional() }).strict(),
   z.object({ type: z.literal("lease"), sessionId: idSchema, generation: idSchema, leaseId: token, expiresAt: integer, frameSequence: revision, streamGeneration: revision }).strict(),
   z.object({ type: z.literal("release"), sessionId: idSchema, reason: z.string().max(128) }).strict(),
   screenInputSchema,

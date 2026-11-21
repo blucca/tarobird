@@ -101,24 +101,66 @@ test('core: above the legacy rate a viewer that follows faster than it keeps its
 
 /** Drives real frames through the core on the fake clock: a source that repaints
  * at `source` Hz while `moving(ms)`, an encoder that outputs at once, and a
- * viewer whose receipt for a frame comes `loop` ms after it was sent, or, with
- * `decode`, that many ms after the previous receipt if that is later (a viewer
- * that takes frames one at a time). Returns the quantizer after every second. */
-async function drive(b, { seconds, loop, decode = 0, moving = () => true, source = 60, width = 1280, height = 800 }) {
+ * viewer. A frame reaches the viewer half of `loop` ms after it was sent; the
+ * viewer takes frames one at a time, `decode` ms each; its receipt travels the
+ * other half back. With `held`, each receipt says how long the viewer kept the
+ * frame. Returns the quantizer after every second, the frames sent and the
+ * most frames ever unacknowledged at once. */
+async function drive(b, { seconds, loop, decode = 0, held = false, moving = () => true, source = 60, width = 1280, height = 800 }) {
   const session = b.core.sessions.get('s1'), step = 1000 / source, receipts = [], qp = [];
-  let at = 0, seen = 0, last = 0, second = 1000;
+  let at = 0, seen = 0, last = 0, second = 1000, most = 0;
   for (let ms = 0; ms < seconds * 1000; ms += step) {
     b.advance(step); at += step; b.run();
-    while (receipts.length && receipts[0].at <= at) await b.core.handle({ type: 'credit', sessionId: 's1', frameSequence: receipts.shift().sequence, streamGeneration: 1 });
+    while (receipts.length && receipts[0].at <= at) { const receipt = receipts.shift(); await b.core.handle({ type: 'credit', sessionId: 's1', frameSequence: receipt.sequence, streamGeneration: 1, ...(held ? { heldMs: receipt.heldMs } : {}) }); }
     if (moving(ms)) { b.push(b.frame(width, height)); await tick(); }
     const encoder = b.encoders.at(-1);
     while (encoder.encodes.length > encoder.emitted) encoder.emit(encoder.emitted ? 'delta' : 'key');
     const frames = b.sent.filter(m => m.type === 'frame');
-    for (; seen < frames.length; seen++) { last = Math.max(at + loop, last) + decode; receipts.push({ at: last, sequence: frames[seen].sequence }); }
+    for (; seen < frames.length; seen++) { const arrived = at + loop / 2; last = Math.max(arrived, last) + decode; receipts.push({ at: last + loop / 2, sequence: frames[seen].sequence, heldMs: Math.round(last - arrived) }); }
+    most = Math.max(most, session.outstanding.size);
     if (at >= second) { b.adapt(); qp.push(session.qp); second += 1000; }
   }
-  return { qp, frames: b.sent.filter(m => m.type === 'frame').length };
+  return { qp, frames: b.sent.filter(m => m.type === 'frame').length, most };
 }
+
+test('flight window: a viewer that holds more and reports its own delay gets the frames that fit the round trip; without either it stays at three', async () => {
+  const run = async (flight, held, loop = 100) => { const b = browser(); await b.core.handle(startMessage('smooth', { fps: 60, ...(flight ? { flight } : {}) })); await tick(); return drive(b, { seconds: 6, loop, held }); };
+  // 100 ms there and back at 60 a second: six frames are in the network at any moment.
+  const wide = await run(16, true);
+  assert.ok(wide.frames >= 6 * 56, `about 60 a second got through (${wide.frames} in 6 s)`);
+  assert.ok(wide.most > 5 && wide.most <= 8, `six in the network, at most two more (${wide.most})`);
+  // The same link with three: three frames per round trip.
+  for (const [name, three] of [['no capacity named', await run(undefined, true)], ['no delay reported', await run(16, false)]]) {
+    assert.equal(three.most, 3, name);
+    assert.ok(three.frames > 6 * 25 && three.frames < 6 * 34, `${name}: about 30 a second (${three.frames})`);
+  }
+  // Never beyond what the viewer said it can hold.
+  assert.equal((await run(5, true, 240)).most, 5);
+  // A round trip under two frame intervals never goes beyond three, however slow the viewer.
+  const short = browser(); await short.core.handle(startMessage('smooth', { fps: 60, flight: 16 })); await tick();
+  assert.equal((await drive(short, { seconds: 4, loop: 20, decode: 60, held: true })).most, 3);
+});
+
+test('flight window: a slow decoder on a short path is not read as distance', async () => {
+  const b = browser(); await b.core.handle(startMessage('smooth', { fps: 60, flight: 16 })); await tick();
+  // 100 ms a frame, receipts honest about the wait: the network share stays 10 ms.
+  const run = await drive(b, { seconds: 6, loop: 10, decode: 100, held: true });
+  assert.equal(run.most, 3);
+  // (The driver hands receipts over on its 60 Hz tick, so up to one tick is added to the 10 ms.)
+  assert.ok(b.core.sessions.get('s1').rtt < 30, `network round trip ${b.core.sessions.get('s1').rtt}`);
+});
+
+test('flight window: a capacity outside the range is clamped, and a nonsense delay is ignored', async () => {
+  const b = browser(); await b.core.handle(startMessage('smooth', { fps: 60, flight: 400 })); await tick();
+  const session = b.core.sessions.get('s1');
+  assert.equal(session.flight, 16);
+  b.push(b.frame(1280, 800)); await tick(); b.encoders[0].emit('key');
+  b.advance(50);
+  await b.core.handle({ type: 'credit', sessionId: 's1', frameSequence: 1, streamGeneration: 1, heldMs: -5 });
+  assert.equal(session.rtt, Infinity);
+  const low = browser(); await low.core.handle(startMessage('smooth', { flight: 1 })); await tick();
+  assert.equal(low.core.sessions.get('s1').flight, 3);
+});
 
 test('crowding, driven: motion in spurts over a long round trip keeps the resting quantizer', async () => {
   // 60 fps, receipts 100 ms after each frame: three credits are used up within 50 ms of any motion.
@@ -352,7 +394,7 @@ function sockets() {
 async function target(t, { capabilities } = {}) {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'screen-quality-'));
   t.after(() => rm(stateDir, { recursive: true, force: true }));
-  const ws = sockets(), starts = [], stops = []; let hooks;
+  const ws = sockets(), starts = [], stops = []; let hooks, capture;
   const display = { id: 1, bounds: { x: 0, y: 0, width: 1440, height: 900 }, scaleFactor: 2, rotation: 0, label: 'Display' };
   const electron = { screen: Object.assign(new EventEmitter(), { getAllDisplays: () => [display] }), powerMonitor: new EventEmitter(),
     systemPreferences: { getMediaAccessStatus: () => 'granted', isTrustedAccessibilityClient: () => true }, shell: {} };
@@ -360,7 +402,7 @@ async function target(t, { capabilities } = {}) {
     screenMouse() {}, screenReleaseAll: () => 0, screenMonitorStop() {}, screenMonitorPoll: () => ({ alive: false, foreign: 0, interrupted: 0 }) };
   const service = new ScreenService({ electron, addon, stateDir, platform: 'darwin', WebSocketClass: ws.FakeSocket,
     hostControl: { ticket: async () => ({ ticket: 'T'.repeat(43), instancePort: 1234, ...(capabilities ? { capabilities } : {}) }) },
-    captureHost: callbacks => (hooks = callbacks, { start: async s => { starts.push(s); }, stop: id => stops.push(id), reset() { return true; }, pause() { return true; }, credit() {}, keyframe() {}, close() {} }) });
+    captureHost: callbacks => (hooks = callbacks, capture = { start: async s => { starts.push(s); }, stop: id => stops.push(id), reset() { return true; }, pause() { return true; }, credit() {}, keyframe() {}, close() {} }) });
   t.after(() => service.dispose());
   await service.start(); await tick();
   const [control] = ws.find('/screen/v1/target');
@@ -376,7 +418,7 @@ async function target(t, { capabilities } = {}) {
     return { session, media };
   };
   const attach = async ({ session, media }) => { media.open(); media.receive({ type: 'attached', sessionId: session.id }); await tick(); };
-  return { service, control, hello, open, attach, starts, stops, ws, hooks: () => hooks };
+  return { service, control, hello, open, attach, starts, stops, ws, hooks: () => hooks, capture: () => capture };
 }
 const legacyHello = screenServiceHelloSchema.omit({ features: true }).strict();
 
@@ -387,6 +429,20 @@ test('service: a Host without the rate capability keeps every profile at the leg
     assert.equal(f.starts.at(-1).fps, 15, String(quality));
     f.service.stop(opened.session.id);
   }
+});
+
+test('service: the viewer capacity on start and the delay on each receipt reach the capture; neither is invented when absent', async t => {
+  const f = await target(t, { capabilities: ['screen-quality-v1', 'screen-rate-v1'] });
+  const credits = []; f.capture().credit = (...args) => credits.push(args);
+  const wide = f.open('balanced', { flight: 12 }); await f.attach(wide);
+  assert.equal(f.starts.at(-1).flight, 12);
+  const frame = sequence => f.hooks().onMessage({ type: 'frame', sessionId: wide.session.id, sequence, streamGeneration: 1, captureMs: Date.now(), geometryRevision: wide.session.display.revision, key: sequence === 1, bytes: new Uint8Array(40) });
+  frame(1); f.control.receive({ type: 'ack', sessionId: wide.session.id, frameSequence: 1, streamGeneration: 1, heldMs: 14 });
+  frame(2); f.control.receive({ type: 'ack', sessionId: wide.session.id, frameSequence: 2, streamGeneration: 1 });
+  assert.deepEqual(credits, [[wide.session.id, 1, 1, 14], [wide.session.id, 2, 1, undefined]]);
+  f.service.stop(wide.session.id);
+  const plain = f.open('balanced'); await f.attach(plain);
+  assert.equal('flight' in f.starts.at(-1), false);
 });
 
 test('service: a byte budget named by the Host paces the capture 15% below it; none named leaves the start as it was', async t => {
@@ -423,7 +479,7 @@ test('service: the hello carries features only when the Host advertised quality;
   const quality = await target(t, { capabilities: ['target-stop', 'screen-service-ticket', 'screen-quality-v1'] });
   assert.deepEqual(quality.hello.features, ['screen.quality.v1'], 'a Host that only negotiates quality gets the hello it always got');
   const current = await target(t, { capabilities: ['target-stop', 'screen-service-ticket', 'screen-quality-v1', 'screen-rate-v1'] });
-  assert.deepEqual(current.hello.features, ['screen.quality.v1', 'screen.pace.v1']);
+  assert.deepEqual(current.hello.features, ['screen.quality.v1', 'screen.pace.v1', 'screen.flight.v1']);
   assert.throws(() => legacyHello.parse(current.hello), 'proves why it must be gated');
   assert.doesNotThrow(() => screenServiceHelloSchema.parse(current.hello));
 });

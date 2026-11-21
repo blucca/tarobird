@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import {
-  SCREEN_FRAME_FRESH_MS, SCREEN_LEASE_MS, SCREEN_MAX_VIEWERS, SCREEN_MEDIA_BYTES_PER_MS, SCREEN_MEDIA_DIRECT_BYTES_PER_MS, SCREEN_TICKET_MS, SCREEN_SERVICE_PACE_FEATURE, SCREEN_SERVICE_QUALITY_FEATURE,
+  SCREEN_FRAME_FRESH_MS, SCREEN_LEASE_MS, SCREEN_MAX_VIEWERS, SCREEN_MEDIA_BYTES_PER_MS, SCREEN_MEDIA_DIRECT_BYTES_PER_MS, SCREEN_TICKET_MS, SCREEN_SERVICE_FLIGHT_FEATURE, SCREEN_SERVICE_PACE_FEATURE, SCREEN_SERVICE_QUALITY_FEATURE,
   screenConfigureSchema, screenConfigureText, screenDesktopSchema, screenOpenSchema, screenPolicySchema, screenViewerCommandSchema, screenStreamSchema,
   type ScreenStream, type ScreenConfigure, type ScreenDesktop, type ScreenJoin, type ScreenPolicy, type ScreenServiceCommand, type ScreenSession, type ScreenStatus,
 } from "../client-protocol/remote-screen.js";
@@ -19,7 +19,7 @@ export type ScreenViewerOptions = { windows?: boolean };
 export type ScreenMediaSink = { send(bytes: Uint8Array): boolean; configure(stream: ScreenStream): boolean; close(reason: string): void };
 type Lease = { id: string; expiresAt: number; ready: boolean; sequence: number; heldKeys: Set<string>; heldButtons: Set<number>; challenge: { nonce: string; validUntil: number; leaseUntil: number } };
 type Frame = { key: boolean; captureMs: number; confirmed: boolean; streamGeneration: number; pendingAck: boolean };
-type Live = { value: ScreenSession; auth: AuthSession; publicKey: string; control?: ScreenControlSink; media?: ScreenMediaSink; frames: Map<number, Frame>; lastFrame: number; lastKeyRequest: number; visible: boolean; started: boolean; direct: boolean; mediaBytesPerMs: number; lease?: Lease; codecs: ("h264" | "vp8")[]; quality?: ScreenQuality; streamGeneration: number; stream?: ScreenStream; awaitingKey: boolean; pendingControl?: number; lastCapture: number; rateAt: number; rateBudget: number };
+type Live = { value: ScreenSession; auth: AuthSession; publicKey: string; control?: ScreenControlSink; media?: ScreenMediaSink; frames: Map<number, Frame>; lastFrame: number; lastKeyRequest: number; visible: boolean; started: boolean; direct: boolean; mediaBytesPerMs: number; lease?: Lease; codecs: ("h264" | "vp8")[]; quality?: ScreenQuality; flight?: number; streamGeneration: number; stream?: ScreenStream; awaitingKey: boolean; pendingControl?: number; lastCapture: number; rateAt: number; rateBudget: number };
 type Ticket = { kind: "service" | "target-media" | "control" | "media"; id: string; expiresAt: number; epoch?: string };
 
 /** Identity/policy stays in the Host. Frames and ephemeral input never enter
@@ -199,7 +199,7 @@ export class HubRemoteScreen {
       deviceId: device.id, deviceName: device.name, controlAllowed: grant.permission === "control", state: "connecting", createdAt: this.now() };
     const join: ScreenJoin = { session: value, controlTicket: this.issueTicket("control", value.id).ticket, mediaTicket: this.issueTicket("media", value.id).ticket, expiresAt: this.now() + SCREEN_TICKET_MS, serverTime: this.now(),
       ...(input.quality !== undefined ? { quality: input.quality } : {}) };
-    this.sessions.set(value.id, { value, auth: session, publicKey: device.public_key, frames: new Map(), lastFrame: 0, lastKeyRequest: 0, visible: true, started: false, direct: false, mediaBytesPerMs: SCREEN_MEDIA_BYTES_PER_MS, codecs: input.codecs, quality: input.quality, streamGeneration: 1, awaitingKey: true, lastCapture: 0, rateAt: this.now(), rateBudget: 180 });
+    this.sessions.set(value.id, { value, auth: session, publicKey: device.public_key, frames: new Map(), lastFrame: 0, lastKeyRequest: 0, visible: true, started: false, direct: false, mediaBytesPerMs: SCREEN_MEDIA_BYTES_PER_MS, codecs: input.codecs, quality: input.quality, flight: input.flight, streamGeneration: 1, awaitingKey: true, lastCapture: 0, rateAt: this.now(), rateBudget: 180 });
     if (this.requests.size >= 128) this.requests.delete(this.requests.keys().next().value!);
     this.requests.set(requestKey, { body, join: structuredClone(join), platform: this.desktop.platform });
     void this.store.audit("screen.connected", session.deviceId, { sessionId: value.id, desktopId: value.desktopId, displayId: display.id, ...(input.quality !== undefined ? { quality: input.quality } : {}) });
@@ -216,6 +216,8 @@ export class HubRemoteScreen {
     this.startVisible(live);
     this.notify(live); return claim.id;
   }
+  /** This session's viewer named a capacity and the registered target understands it. */
+  private flight(live: Live): boolean { return live.flight !== undefined && this.serviceFeatures.has(SCREEN_SERVICE_FLIGHT_FEATURE); }
   /** The byte budget this session's target is held to (fixed when the session started). */
   mediaBytesPerMs(sessionId: string): number { return this.sessions.get(sessionId)?.mediaBytesPerMs ?? SCREEN_MEDIA_BYTES_PER_MS; }
   private startVisible(live: Live): void {
@@ -227,7 +229,9 @@ export class HubRemoteScreen {
       // A viewer served straight to the local network gets the larger byte budget, when the target can be told.
       live.mediaBytesPerMs = live.direct && this.serviceFeatures.has(SCREEN_SERVICE_PACE_FEATURE) ? SCREEN_MEDIA_DIRECT_BYTES_PER_MS : SCREEN_MEDIA_BYTES_PER_MS;
       if (!this.toService({ type: "start", session: structuredClone(live.value), mediaTicket, streamGeneration: live.streamGeneration, codecs: live.codecs, ...(live.quality !== undefined ? { quality: live.quality } : {}),
-        ...(live.mediaBytesPerMs !== SCREEN_MEDIA_BYTES_PER_MS ? { mediaBytesPerMs: live.mediaBytesPerMs } : {}) })) { this.closeSession(live.value.id, "screen_service_offline"); throw new HubError("screen_service_offline", 503); }
+        ...(live.mediaBytesPerMs !== SCREEN_MEDIA_BYTES_PER_MS ? { mediaBytesPerMs: live.mediaBytesPerMs } : {}),
+        // The viewer's capacity, when it named one and the target can use it.
+        ...(this.flight(live) ? { flight: live.flight } : {}) })) { this.closeSession(live.value.id, "screen_service_offline"); throw new HubError("screen_service_offline", 503); }
     }
   }
   private toService(command: ScreenServiceCommand): boolean { return this.service?.send(command) ?? false; }
@@ -294,7 +298,8 @@ export class HubRemoteScreen {
         // round trip. Input freshness is still checked by the target and below
         // in serviceFrameConfirmed; a late ACK never makes old video controllable.
         frame.pendingAck = true;
-        if (!this.toService({ type: "ack", sessionId, frameSequence: input.frameSequence, streamGeneration: frame.streamGeneration })) this.closeSession(sessionId, "screen_service_offline");
+        if (!this.toService({ type: "ack", sessionId, frameSequence: input.frameSequence, streamGeneration: frame.streamGeneration,
+          ...(input.heldMs !== undefined && this.flight(live) ? { heldMs: input.heldMs } : {}) })) this.closeSession(sessionId, "screen_service_offline");
         return;
       }
     }

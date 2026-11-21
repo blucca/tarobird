@@ -149,7 +149,7 @@ export class ScreenCaptureHost {
    * or close at any point (queued, opening, resolving, awaiting the page)
    * cancels it at once: the promise rejects promptly, nothing is sent after it,
    * and the queue moves on. */
-  start({ sessionId, display, streamGeneration, codecs, encode, fps = 15, profile }) {
+  start({ sessionId, display, streamGeneration, codecs, encode, fps = 15, profile, flight }) {
     if (this.#requests.has(sessionId) || this.#sessions.has(sessionId)) return Promise.reject(new Error('screen_capture_duplicate'));
     let cancel, release;
     const cancelled = new Promise((_, reject) => { cancel = (reason = 'screen_capture_cancelled') => reject(new Error(reason)); });
@@ -190,7 +190,7 @@ export class ScreenCaptureHost {
       });
       this.#pending = source; request.source = source;
       try {
-        this.#send({ type: 'start', sessionId, streamGeneration, geometryRevision: display.revision, codecs, encode, fps, ...(profile ? { profile } : {}) });
+        this.#send({ type: 'start', sessionId, streamGeneration, geometryRevision: display.revision, codecs, encode, fps, ...(profile ? { profile } : {}), ...(flight ? { flight } : {}) });
         await settled; live();
       } catch (error) {
         // Own failure: clean up here. A cancellation was already cleaned up by
@@ -212,7 +212,7 @@ export class ScreenCaptureHost {
   /** True if the command reached the page (only once its start was sent). */
   reset(sessionId, streamGeneration, geometryRevision) { if (!this.#sessions.has(sessionId)) return false; this.#send({ type: 'reset', sessionId, streamGeneration, geometryRevision }); return true; }
   pause(sessionId, paused, streamGeneration) { if (!this.#sessions.has(sessionId)) return false; this.#send({ type: 'pause', sessionId, paused, streamGeneration }); return true; }
-  credit(sessionId, frameSequence, streamGeneration) { if (this.#sessions.has(sessionId)) this.#send({ type: 'credit', sessionId, frameSequence, streamGeneration }); }
+  credit(sessionId, frameSequence, streamGeneration, heldMs) { if (this.#sessions.has(sessionId)) this.#send({ type: 'credit', sessionId, frameSequence, streamGeneration, ...(heldMs !== undefined ? { heldMs } : {}) }); }
   keyframe(sessionId) { if (this.#sessions.has(sessionId)) this.#send({ type: 'keyframe', sessionId }); }
   stop(sessionId) {
     this.#requests.get(sessionId)?.cancel();

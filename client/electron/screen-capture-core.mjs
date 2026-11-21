@@ -1,8 +1,18 @@
 // Capture/encode logic of the isolated capture renderer. Browser APIs are
 // injected so the generation, credit and race rules are testable without a
 // real screen. The page entry (screen-capture-page.mjs) passes real globals.
-import { screenH264Codec, screenH264EncoderCodec, screenRateLadder } from '../../src/client-protocol/screen-quality.ts';
-export const CAPTURE_CREDITS = 3;
+import { SCREEN_FLIGHT_MAX, SCREEN_FLIGHT_MIN, screenH264Codec, screenH264EncoderCodec, screenRateLadder } from '../../src/client-protocol/screen-quality.ts';
+/** Frames kept unacknowledged at once. Three for any viewer. A viewer that
+ * says it can hold more (`flight`) and reports how long it held each frame
+ * lets the window follow the network: the whole frames that fit in the
+ * shortest round trip seen (the shortest, so queueing is never read as
+ * distance) plus two for the viewer's own decode and repaint, up to what the
+ * viewer holds. A round trip under two frame intervals still gives three;
+ * over a relay it is what keeps the rate from being three frames per round
+ * trip. */
+export const CAPTURE_CREDITS = SCREEN_FLIGHT_MIN;
+const flightWindow = session => Number.isFinite(session.rtt)
+  ? Math.min(session.flight, Math.max(CAPTURE_CREDITS, 2 + Math.floor(session.rtt / session.interval))) : CAPTURE_CREDITS;
 /** A raw frame that waited this long for a credit is dropped, never encoded:
  * the Host refuses frames older than 2 s, and a stale delta cannot be skipped. */
 export const CAPTURE_HELD_MAX_MS = 1500;
@@ -13,7 +23,7 @@ export const CAPTURE_HELD_MAX_MS = 1500;
  * (latest wins, as for credits) while the bucket cannot cover what is already
  * committed plus the expected frame, and the quantizer rises. After encode,
  * every packet waits in FIFO order until the bucket covers its ACTUAL size:
- * up to three encodes may be in flight and their outputs can arrive together.
+ * several encodes may be in flight and their outputs can arrive together.
  * With a smaller cap and slower refill than the Hub's, the Hub bucket stays at
  * least 256 KiB above this one when send and arrival coincide, so a packet
  * this gate sends always fits there. A legal packet above this cap (≤1 MiB)
@@ -87,12 +97,14 @@ export function createCaptureCore(env) {
   }
   const live = (session, epoch) => sessions.get(session.sessionId) === session && session.epoch === epoch;
 
-  async function start({ sessionId, streamGeneration, geometryRevision, codecs, encode, fps, profile }) {
+  async function start({ sessionId, streamGeneration, geometryRevision, codecs, encode, fps, profile, flight }) {
     if (cancelled.delete(sessionId)) return;
     if (sessions.has(sessionId)) throw new Error('screen_capture_duplicate');
     const settings = encoderProfile(fps, profile);
     const session = { sessionId, codecs, encode, profile: settings, interval: 1000 / settings.fps, sequence: 0, outstanding: new Map(), pendingOutput: [],
       geometryRevision, streamGeneration: 0, paused: false, needKey: true, qp: settings.qpBase, crowded: 0, encoded: 0, calm: 0, held: undefined, dueAt: -Infinity, epoch: 0,
+      // The viewer's capacity, and the shortest network round trip its receipts have shown (session-wide: the path does not change with a generation).
+      flight: Math.round(bounded(flight, CAPTURE_CREDITS, SCREEN_FLIGHT_MAX, CAPTURE_CREDITS)), rtt: Infinity,
       // Session-wide, across generations: bytes sent count against the Hub budget whatever their chain.
       bucket: PACE_BURST_BYTES, bucketAt: perf(), lastKeyBytes: 0, lastDeltaBytes: 0, starved: 0, outbox: [], outputTimer: undefined };
     sessions.set(sessionId, session);
@@ -208,7 +220,7 @@ export function createCaptureCore(env) {
     const encoder = session.encoder;
     if (!session.held || !encoder || session.paused || encoder.state !== 'configured') return;
     if (session.held.epoch !== session.epoch || now() - session.held.captureMs > CAPTURE_HELD_MAX_MS) { session.held.frame.close(); session.held = undefined; return; }
-    if (session.outstanding.size >= CAPTURE_CREDITS || encoder.encodeQueueSize > 0) { session.held.blocked = true; return; }
+    if (session.outstanding.size >= flightWindow(session) || encoder.encodeQueueSize > 0) { session.held.blocked = true; return; }
     // Bytes: packets waiting to leave, encodes still in flight and the next
     // frame are each expected to cost what the last one of their kind did.
     refill(session);
@@ -248,7 +260,7 @@ export function createCaptureCore(env) {
     if (!live(session, epoch) || generation !== session.streamGeneration) return; // retired generation
     // An output keeps its input's timestamp. A realtime encoder may drop an
     // input and never output it: forget those and return their credits, so
-    // neither the metadata nor the three-frame window can drift or leak.
+    // neither the metadata nor the flight window can drift or leak.
     const index = session.pendingOutput.findIndex(entry => entry.timestamp === chunk.timestamp);
     if (index < 0) return;
     const dropped = session.pendingOutput.splice(0, index), meta = session.pendingOutput.shift();
@@ -267,7 +279,7 @@ export function createCaptureCore(env) {
         streamGeneration: generation, captureMs: meta.captureMs, width: session.encode.width, height: session.encode.height }, payload);
     } catch (error) { fail(session, 'screen_congested', error); return; }
     if (chunk.type === 'key') session.lastKeyBytes = bytes.byteLength; else session.lastDeltaBytes = bytes.byteLength;
-    // Bounded by the credit window (≤3 entries); sent strictly in encode order.
+    // Bounded by the flight window; sent strictly in encode order.
     session.outbox.push({ bytes, meta, key: chunk.type === 'key', generation, epoch });
     flush(session);
   }
@@ -291,7 +303,7 @@ export function createCaptureCore(env) {
         return;
       }
       session.outbox.shift(); session.bucket -= size;
-      const credit = session.outstanding.get(head.meta.sequence); if (credit) credit.sent = true;
+      const credit = session.outstanding.get(head.meta.sequence); if (credit) { credit.sent = true; credit.sentAt = perf(); }
       // Copied, never transferred: Electron 45.1.0 main hangs on ArrayBuffer transfer.
       send({ type: 'frame', sessionId: session.sessionId, bytes: head.bytes, sequence: head.meta.sequence, streamGeneration: head.generation, captureMs: head.meta.captureMs,
         geometryRevision: head.meta.geometryRevision, key: head.key });
@@ -301,8 +313,11 @@ export function createCaptureCore(env) {
     try { flush(session); } catch (error) { if (sessions.get(session.sessionId) === session) fail(session, 'screen_capture_failed', error); }
   }
 
-  function credit(session, { frameSequence, streamGeneration }) {
-    if (streamGeneration !== session.streamGeneration || !session.outstanding.has(frameSequence)) return;
+  function credit(session, { frameSequence, streamGeneration, heldMs }) {
+    const entry = session.outstanding.get(frameSequence);
+    if (streamGeneration !== session.streamGeneration || !entry) return;
+    // The network's share of this frame's round trip: the time since it left, less what the viewer says it held it.
+    if (Number.isFinite(heldMs) && heldMs >= 0 && entry.sentAt !== undefined) session.rtt = Math.min(session.rtt, Math.max(0, perf() - entry.sentAt - heldMs));
     // In-order TCP: an ACK for N also covers every earlier frame of this generation.
     for (const sequence of [...session.outstanding.keys()]) if (sequence <= frameSequence) session.outstanding.delete(sequence);
     drain(session);
