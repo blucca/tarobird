@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Check } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { Check, ChevronRight, Inbox } from "lucide-react";
 import { useBackAction } from "./back-navigation.js";
 import type { Conversation } from "../../src/client-protocol/index.js";
 import type { HubConnection } from "./connection.js";
@@ -84,10 +84,14 @@ function ShareDraft({ item, connection, conversations, refresh, native }: { item
       <button className="primary" disabled={busy || foreign || !!item.error || !!blocked || unavailableBots || !target || (!pinned && (!saved.ready || saved.retired || !!saved.error || !!group && !chosen.length)) || (!shownText.trim() && !item.files.length) || (item.files.length > 0 && connection.state.status !== "online")} onClick={() => { void send(); }}>{busy ? recovering ? t("连接中断，等待恢复…") : t("上传 {0}%", Math.round(progress * 100)) : t("发送分享")}</button></div>
   </article>;
 }
-export function ShareInbox({ connection, conversations, active = true, hosts = [], native = supportsShareInbox() ? shareInbox : undefined }: { connection: HubConnection; conversations: Conversation[]; active?: boolean; hosts?: { hubKey: string; deviceId: string; name: string; open: (conversationId: string) => void }[]; native?: ShareBridge }) {
+type ShareInboxProps = { connection: HubConnection; conversations: Conversation[]; active?: boolean; enabled?: boolean; hosts?: { hubKey: string; deviceId: string; name: string; open: (conversationId: string) => void }[]; native?: ShareBridge };
+/** Polling and review stay here; the caller places `entry` in an in-flow notice
+ * slot (never a floating layer over headers, lists or the composer). */
+export function useShareInbox({ connection, conversations, active = true, enabled = true, hosts = [], native: bridge = supportsShareInbox() ? shareInbox : undefined }: ShareInboxProps): { entry: ReactNode; dialog: ReactNode } {
+  const native = enabled ? bridge : undefined;
   useLocale(); const [items, setItems] = useState<SharedItem[]>([]); const [open, setOpen] = useState(false); const [error, setError] = useState("");
   const panel = useRef<HTMLElement>(null), trigger = useRef<HTMLButtonElement>(null);
-  const visible = open && active && !!native && (!!items.length || !!error);
+  const visible = open && active && !!native && !!items.length;
   useLayoutEffect(() => {
     if (!visible) return;
     const node = panel.current; node?.focus({ preventScroll: true });
@@ -105,6 +109,8 @@ export function ShareInbox({ connection, conversations, active = true, hosts = [
     return () => { document.removeEventListener("keydown", key); if (node?.contains(document.activeElement) || document.activeElement === document.body) trigger.current?.focus({ preventScroll: true }); };
   }, [visible]);
   useEffect(() => { if (!active) setOpen(false); }, [active]);
+  // Nothing left to review: a later share must not reopen a stale dialog.
+  useEffect(() => { if (!items.length) setOpen(false); }, [items.length]);
   // Polls, focus and post-send refreshes overlap. Apply results in request order so a slow older
   // list cannot resurrect a removed share; never wait for "the latest" request, or slow polls starve.
   const requested = useRef(0), applied = useRef(0), mounted = useRef(true);
@@ -138,9 +144,14 @@ export function ShareInbox({ connection, conversations, active = true, hosts = [
     window.addEventListener("focus", focus); document.addEventListener("visibilitychange", focus);
     return () => { clearInterval(interval); window.removeEventListener("focus", focus); document.removeEventListener("visibilitychange", focus); };
   }, [connection, native, active]);
-  if (!native || (!items.length && !error)) return null;
-  return <><button ref={trigger} className="share-inbox-button" onClick={() => setOpen(true)}>{t("待发送分享 ({0})", items.length)}</button><div className="modal-scrim" hidden={!open} style={open ? undefined : { display: "none" }}><section ref={panel} tabIndex={-1} className="settings-panel" role="dialog" aria-modal="true" aria-label={t("收到的分享")}><header><h2>{t("收到的分享")}</h2><button onClick={() => setOpen(false)}>{t("关闭")}</button></header><HostLocation/><p className="muted">{t("确认会话和内容后发送。本机副本保留 24 小时。")}</p>{error && <p role="alert">{error}</p>}{items.map((item) => {
+  // A read failure with nothing pending offers no action (the Share extension
+  // reports its own storage failure while sharing): show no "(0)" entry. With
+  // pending items the dialog still shows the error.
+  if (!native || !items.length) return { entry: null, dialog: null };
+  const entry = <button ref={trigger} type="button" className="share-inbox-button" aria-haspopup="dialog" data-reviewing={open || undefined} onClick={() => setOpen(true)}><Inbox size={17} aria-hidden="true"/><span>{t("待发送分享 ({0})", items.length)}</span><ChevronRight size={16} aria-hidden="true"/></button>;
+  return { entry, dialog: <div className="modal-scrim" hidden={!open} style={open ? undefined : { display: "none" }}><section ref={panel} tabIndex={-1} className="settings-panel" role="dialog" aria-modal="true" aria-label={t("收到的分享")}><header><h2>{t("收到的分享")}</h2><button onClick={() => setOpen(false)}>{t("关闭")}</button></header><HostLocation/><p className="muted">{t("确认会话和内容后发送。本机副本保留 24 小时。")}</p>{error && <p role="alert">{error}</p>}{items.map((item) => {
     const owner = item.delivery && hosts.find((host) => host.hubKey === item.delivery!.hubKey && host.deviceId === item.delivery!.deviceId);
     return owner && (owner.hubKey !== connection.identity.hubPublicKey || owner.deviceId !== connection.identity.deviceId) ? <article className="share-draft" key={item.id}><p>{t("这条分享已指定发送到 {0}。内容和附件仍然保留。", owner.name)}</p><button onClick={() => { setOpen(false); owner.open(item.delivery!.conversationId); }}>{t("切换到 {0}", owner.name)}</button></article> : <ShareDraft key={JSON.stringify([connection.cache.databaseName, connection.identity.hubPublicKey, connection.identity.deviceId, connection.identity.publicKey, item.id])} item={item} connection={connection} conversations={conversations} refresh={refresh} native={native}/>;
-  })}</section></div></>;
+  })}</section></div> };
 }
+export function ShareInbox(props: ShareInboxProps) { const { entry, dialog } = useShareInbox(props); return <>{entry}{dialog}</>; }

@@ -50,7 +50,15 @@
 
 .mobile-lock-content{height:100%}.mobile-lock-content[hidden]{display:none!important}.app-lock-screen{height:100dvh;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:16px;padding:24px;text-align:center;background:var(--bg);color:var(--text)}.app-lock-screen h1,.app-lock-screen p{margin:0}[data-mobile-locked="true"] body>.lightbox{display:none!important}
 
-.share-inbox-button{position:fixed;right:18px;top:64px;background:var(--selected);border:1px solid var(--blue);color:var(--blue);z-index:5;box-shadow:var(--shadow)}.share-draft{padding:18px 0;border-bottom:1px solid var(--border)}.share-draft label{display:flex;flex-direction:column;gap:8px;margin:10px 0}.share-draft li{overflow-wrap:anywhere}.share-draft .quick-actions{margin-top:12px}
+/* In-flow notice row (home header slot, under the chat header): it pushes content
+   down instead of floating over controls, and honours the side safe areas. */
+.share-inbox-button{display:flex;align-items:center;gap:8px;flex:none;box-sizing:border-box;width:calc(100% - max(12px,var(--app-safe-left)) - max(12px,var(--app-safe-right)));min-height:44px;margin:6px max(12px,var(--app-safe-right)) 6px max(12px,var(--app-safe-left));padding:6px 12px;background:var(--selected);border:1px solid var(--blue);color:var(--blue);text-align:start;font-weight:500}.share-inbox-button>span{flex:1;min-width:0;overflow-wrap:anywhere}.share-inbox-button>svg{flex:none}
+/* `.mobile-home button` resets margins; beside a sidebar the column starts away from the screen edge. */
+.mobile-home .share-inbox-button{margin:6px max(12px,var(--app-safe-right)) 6px max(12px,var(--app-safe-left))}
+@media (min-width:761px){.app-shell:has(>.sidebar)>.conversation-main>.share-inbox-button{width:calc(100% - 16px - max(12px,var(--app-safe-right)));margin-left:16px}}
+/* While typing, the row would only shrink the visible chat; it returns with the keyboard. */
+html[data-keyboard-open="true"] .share-inbox-button:not([data-reviewing]){display:none}
+.share-draft{padding:18px 0;border-bottom:1px solid var(--border)}.share-draft label{display:flex;flex-direction:column;gap:8px;margin:10px 0}.share-draft li{overflow-wrap:anywhere}.share-draft .quick-actions{margin-top:12px}
 
 /* This is the escaped source shown before/after a parser failure. Avoid
    paragraph-wide typographic shaping on potentially megabyte-sized runs;

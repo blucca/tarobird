@@ -110,7 +110,7 @@ import { automaticComposer, groupReplyModeFromView, sendGroupComposerMessage, ty
 import { DesktopMenu, DesktopMenuPortalContext } from "./DesktopMenu.js";
 import { NewBot } from "./NewBot.js";
 import { NewConversation, type ConversationCreation } from "./NewConversation.js";
-import { ShareInbox } from "./ShareInbox.js";
+import { useShareInbox } from "./ShareInbox.js";
 import { maintainUnifiedPush } from "./unifiedpush.js";
 import { t, useLocale, setLocale } from "./i18n.js";
 import { lazy, Suspense, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type SetStateAction } from "react";
@@ -211,6 +211,8 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const [conversations, setConversations] = useState<Conversation[]>([]); const [normalSelected, setNormalSelected] = useState("");
   // Opening uses the full cache (a ticket panel may open a hidden worker chat); lists and pickers use listedChats.
   const showTickets = useTicketConversationsVisible(), listedChats = useMemo(() => listedConversations(conversations), [conversations, showTickets]);
+  // Panes never own the device share inbox; the entry sits in the notice slots below.
+  const share = useShareInbox({ connection, conversations: listedChats, active: visible, enabled: !pane, hosts: shell?.shareHosts });
   const requestedSelected = pane?.conversationId ?? normalSelected;
   // A hidden ADHD pane retains state through a bounded flush. A different Host
   // or revoked/deleted identity loses authority immediately, without a grace period.
@@ -1686,7 +1688,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       else if (tool === "operations") setOperations(true);
       else if (tool === "archives") setArchives(true);
     }}/></Sidebar>{sidebar && <button className="sidebar-backdrop" aria-label={t("关闭会话列表")} onClick={() => setSidebar(false)}/>}</>}
-  {phone && <Suspense fallback={<div className="mobile-home loading-screen" role="status">{t("正在打开 TaroBird…")}</div>}><MobileHome showDisconnectedBots={preferences.showDisconnectedBots} changeShowDisconnectedBots={showDisconnectedBots => setPreferences({ ...preferences, showDisconnectedBots })} density={preferences.layoutDensity} groupByHost={preferences.sidebarGroupByHost} changeGroupByHost={sidebarGroupByHost => setPreferences({ ...preferences, sidebarGroupByHost })} notice={visible && sidebar ? shell?.networkNotice : undefined} hosts={shell?.mobileHosts({ conversations, bots: navigationBots, activity, pins, globalPins }) ?? [{ id: "local", name: t("我的主机"), connection, conversations, bots: navigationBots, activity, pins, globalPins }]} activeHostId={shell?.host.id ?? "local"} visible={visible && sidebar} scrollPositions={mobileScroll} inbox={mobileInbox} updateInbox={updateMobileInbox} tab={mobileTab} setTab={setMobileTab}
+  {phone && <Suspense fallback={<div className="mobile-home loading-screen" role="status">{t("正在打开 TaroBird…")}</div>}><MobileHome showDisconnectedBots={preferences.showDisconnectedBots} changeShowDisconnectedBots={showDisconnectedBots => setPreferences({ ...preferences, showDisconnectedBots })} density={preferences.layoutDensity} groupByHost={preferences.sidebarGroupByHost} changeGroupByHost={sidebarGroupByHost => setPreferences({ ...preferences, sidebarGroupByHost })} notice={visible && sidebar && (shell?.networkNotice || share.entry) ? <>{shell?.networkNotice}{share.entry}</> : undefined} hosts={shell?.mobileHosts({ conversations, bots: navigationBots, activity, pins, globalPins }) ?? [{ id: "local", name: t("我的主机"), connection, conversations, bots: navigationBots, activity, pins, globalPins }]} activeHostId={shell?.host.id ?? "local"} visible={visible && sidebar} scrollPositions={mobileScroll} inbox={mobileInbox} updateInbox={updateMobileInbox} tab={mobileTab} setTab={setMobileTab}
     archived={(hostId, ids) => { if (shell) shell.conversationsArchived(hostId, ids); else { const next = selectionAfterArchive(selected, ids, conversations, navigationItems({ connection, bots: state.bots, conversations }, preferences.showDisconnectedBots).conversations, activity); if (next !== undefined) { setSelected(next); setFocusTarget(undefined); closeSearch(); } } }}
     select={(hostId, id, messageId) => { if (shell) shell.mobileSelect(hostId, { kind: "select", conversationId: id, messageId }); else { setFocusTarget(messageId ? { conversationId: id, messageId } : undefined); setSelected(id); closeSearch(); setSidebar(false); } }}
     newChat={(hostId, botId) => { if (shell) shell.mobileSelect(hostId, { kind: "direct", botId }); else setNewChat({ kind: "direct", botId }); }}
@@ -1725,6 +1727,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
         </>}
       </DesktopMenu>}</header>}
     {visible && (!phone || !sidebar) && shell?.networkNotice}
+    {visible && (!phone || !sidebar) && share.entry}
     {/* Phones keep the topic strip; desktop uses the header's TopicSwitcher. */}
     {phone && visible && searchResults === undefined && group && current && <GroupTopics connection={connection} key={group.id} group={group} current={current} conversations={conversations} activity={activity} select={selectChat} create={() => setNewChat({ kind: "topic", group })}/>}
     {searchResults === undefined && group && current && <GroupDiscussionBar key={`${connection.identity.hubPublicKey}:${current.id}`} connection={connection} conversation={current} group={group} active={visible && chatVisible} select={selectChat} modeChanged={setGroupReplyMode} participants={discussionParticipants} participantNames={labels}/>}
@@ -1804,7 +1807,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     if (draftRevision.current === revision) { setDraft(""); await clearSentDraft(current.id, sentDraft); }
     setRecipients([botId]);
   }}/>}
-  {!pane && <ShareInbox connection={connection} conversations={listedChats} active={visible} hosts={shell?.shareHosts}/>}
+  {share.dialog}
   {visible && !phone && current && movingConversation === current.id && !current.parentId && !archivedHere && <MoveToFolder key={current.id} connection={connection} conversationId={current.id} showLayoutHint={preferences.sidebarLayout === "bots"} returnFocus={chatMoreTrigger} close={() => setMovingConversation(undefined)}/>}
   {renameTarget && visible && <RenameConversation key={renameTarget.id} connection={connection} conversation={renameTarget} returnFocus={conversationReturn} close={() => setRenameId(undefined)}/>}
   {removeTopicTarget && visible && <RemoveConversation key={removeTopicTarget.id} connection={connection} conversation={removeTopicTarget} returnFocus={conversationReturn} close={() => setRemoveTopicId(undefined)} removed={() => { setRemoveTopicId(undefined); if (currentSelection.current === removeTopicTarget.id) { setDetails(false); setManage(false); if (pane) pane.replace(removeTopicTarget.parentId!); else selectChat(removeTopicTarget.parentId!); } }}/>}
