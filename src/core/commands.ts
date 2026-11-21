@@ -8,7 +8,6 @@ import { antigravityPresetEffort } from "../codex/antigravity-models.js";
 import path from "node:path";
 import { channelProfile } from "./channel-profile.js";
 import { applyGatewayGroupMode, renderGatewayHelp } from "./platform-policy.js";
-import { mkdir } from "node:fs/promises";
 
 import type {
   CodexThreadGoal,
@@ -54,7 +53,6 @@ import {
   type InstanceConfig,
   type InstanceEngine,
   type ResumeState,
-  type WorkspaceProfile,
   DEFAULT_STEER_WINDOW_SECONDS,
 } from "../state/instance-config.js";
 import {
@@ -161,16 +159,6 @@ export async function handleCoreSimpleCommand(
       outcome: "success",
       detail: "/config",
     });
-    return true;
-  }
-
-  if (isWorkspaceCommand(commandText)) {
-    await sendCoreCommandMarkdown(input, normalized, "/ws", await renderAndApplyCoreWorkspaceCommand(
-      input,
-      normalized,
-      commandText,
-      commandLocale,
-    ));
     return true;
   }
 
@@ -1109,8 +1097,7 @@ function renderCoreHelpMessage(locale: Locale = "zh"): string {
       "- `/timeout [on|off]` engine runtime safeguards (hard cap and/or inactivity watchdog; off disables both)",
       "- `/steer [on|off|<seconds>|unlimited]` mid-turn steering window (default 30s; later messages queue)",
       "",
-      "**Workspace & groups**",
-      "- `/ws list|save|use|remove` workspace directories",
+      "**Groups**",
       "- `/newgroup <name>` / `/newgroup topic <name>` / `/newtopic <name>` create and authorize a group / topic group (you become its owner)",
       "- `/group [status|allow|deny|all|at]` group access & reply mode (`all` = reply without `@`, `at` = `@`-only)",
       "- `/invite group|user @person` · `/remove …` group/user access · `/cron …` reminders & scheduled tasks",
@@ -1144,8 +1131,7 @@ function renderCoreHelpMessage(locale: Locale = "zh"): string {
     "- `/timeout [on|off]` 引擎运行时保护（硬上限和/或静默看门狗；off 会全部关闭）",
     "- `/steer [on|off|<秒数>|unlimited]` 任务中途引导的资格窗口（默认 30 秒，超窗排队）",
     "",
-    "**工作区与群**",
-    "- `/ws list|save|use|remove` 工作区目录",
+    "**群**",
     "- `/newgroup <名>` / `/newgroup topic <名>` / `/newtopic <名>` 新建并授权普通群 / 话题群（你是群主）",
     "- `/group [status|allow|deny|all|at]` 群授权与回复模式（`all`=不@也回，`at`=只@才回）",
     "- `/invite group|user @某人` · `/remove …` 群/用户授权 · `/cron …` 定时提醒与任务",
@@ -1164,186 +1150,12 @@ function isGroupCommand(text: string): boolean {
   return /^\/group(?:\s|$)/i.test(text.trim());
 }
 
-function isWorkspaceCommand(text: string): boolean {
-  return /^\/ws(?:\s|$)/i.test(text.trim());
-}
-
 function isCoreInviteRemoveCommand(text: string): boolean {
   return /^\/(?:invite|remove)(?:\s|$)/i.test(text.trim());
 }
 
 function extractCoreInviteRemoveCommandName(text: string): "/invite" | "/remove" {
   return /^\/remove(?:\s|$)/i.test(text.trim()) ? "/remove" : "/invite";
-}
-
-async function renderAndApplyCoreWorkspaceCommand(
-  input: CoreCommandInput,
-  normalized: CoreNormalizedBridgeMessage,
-  commandText: string,
-  locale: Locale,
-): Promise<string> {
-  const words = commandText.trim().split(/\s+/);
-  const action = (words[1] ?? "list").toLowerCase();
-  const name = words[2];
-  const cfg = await loadInstanceConfig(input.stateDir);
-  const currentWorkspace = resolveInstanceWorkspacePath(cfg) ?? path.join(input.stateDir, "workspace");
-
-  if (action === "list" || action === "status") {
-    return renderCoreWorkspaceList(cfg.workspaceProfiles, currentWorkspace, locale);
-  }
-
-  if (action === "save") {
-    const validation = validateWorkspaceProfileName(name, locale);
-    if (validation) {
-      return validation;
-    }
-    const rawProfilePath = words[3] ? words.slice(3).join(" ") : "";
-    if (rawProfilePath && !path.isAbsolute(rawProfilePath)) {
-      return locale === "en" ? "Workspace path must be absolute." : "工作区路径必须是绝对路径。";
-    }
-    const profilePath = rawProfilePath || currentWorkspace;
-    await mkdir(profilePath, { recursive: true });
-    await updateInstanceConfig(input.stateDir, (config) => {
-      const profiles = normalizeWorkspaceProfiles(config.workspaceProfiles);
-      upsertWorkspaceProfile(profiles, { name, path: profilePath, updatedAt: new Date().toISOString() });
-      config.workspaceProfiles = profiles;
-    });
-    await appendCoreTimelineEvent(input.stateDir, normalized, {
-      type: "command.handled",
-      outcome: "success",
-      detail: "/ws save",
-      metadata: { workspaceName: name },
-    });
-    return locale === "en"
-      ? `Saved workspace \`${name}\`:\n${profilePath}`
-      : `已保存工作区 \`${name}\`：\n${profilePath}`;
-  }
-
-  if (action === "use") {
-    const validation = validateWorkspaceProfileName(name, locale);
-    if (validation) {
-      return validation;
-    }
-    const profile = cfg.workspaceProfiles.find((item) => item.name === name);
-    if (!profile) {
-      return locale === "en" ? `Workspace \`${name}\` is not saved. Use \`/ws list\`.` : `工作区 \`${name}\` 尚未保存。可先用 \`/ws list\` 查看。`;
-    }
-    await mkdir(profile.path, { recursive: true });
-    const removedSession = await new SessionStore(path.join(input.stateDir, "session.json"))
-      .removeByConversationKeyRecovering(normalized.conversationKey)
-      .then((result) => result.removed || result.repaired)
-      .catch(() => false);
-    await updateInstanceConfig(input.stateDir, (config) => {
-      config.workspacePath = profile.path;
-    });
-    await appendCoreTimelineEvent(input.stateDir, normalized, {
-      type: "command.handled",
-      outcome: "success",
-      detail: "/ws use",
-      metadata: { workspaceName: name, removedSession },
-    });
-    const resetNote = removedSession
-      ? (locale === "en" ? "The current session binding was reset to avoid stale project context." : "已重置当前会话绑定，避免新工作区沿用旧上下文。")
-      : (locale === "en" ? "The next turn will use this workspace." : "下一轮会使用这个工作区。");
-    return locale === "en"
-      ? `Using workspace \`${name}\`:\n${profile.path}\n\n${resetNote}`
-      : `已切换到工作区 \`${name}\`：\n${profile.path}\n\n${resetNote}`;
-  }
-
-  if (action === "remove" || action === "rm") {
-    const validation = validateWorkspaceProfileName(name, locale);
-    if (validation) {
-      return validation;
-    }
-    let removed: WorkspaceProfile | undefined;
-    await updateInstanceConfig(input.stateDir, (config) => {
-      const profiles = normalizeWorkspaceProfiles(config.workspaceProfiles);
-      removed = profiles.find((item) => item.name === name);
-      config.workspaceProfiles = profiles.filter((item) => item.name !== name);
-      if (removed && config.workspacePath === removed.path) {
-        delete config.workspacePath;
-      }
-    });
-    await appendCoreTimelineEvent(input.stateDir, normalized, {
-      type: "command.handled",
-      outcome: removed ? "success" : "noop",
-      detail: "/ws remove",
-      metadata: { workspaceName: name },
-    });
-    if (!removed) {
-      return locale === "en" ? `Workspace \`${name}\` was not saved.` : `工作区 \`${name}\` 不存在。`;
-    }
-    return locale === "en" ? `Removed workspace \`${name}\`.` : `已移除工作区 \`${name}\`。`;
-  }
-
-  return locale === "en"
-    ? "Usage: `/ws list`, `/ws save <name> [absolute-path]`, `/ws use <name>`, or `/ws remove <name>`."
-    : "用法：`/ws list`、`/ws save <名称> [绝对路径]`、`/ws use <名称>`、`/ws remove <名称>`。";
-}
-
-function validateWorkspaceProfileName(name: string | undefined, locale: Locale): string | undefined {
-  if (!name || !/^[A-Za-z0-9_.-]{1,64}$/.test(name)) {
-    return locale === "en"
-      ? "Workspace names must use 1-64 letters, numbers, dots, underscores, or dashes, for example `/ws save demo /abs/path`."
-      : "工作区名称只能使用 1-64 位字母、数字、点、下划线或短横线，例如 `/ws save demo /abs/path`。";
-  }
-  return undefined;
-}
-
-function normalizeWorkspaceProfiles(raw: unknown): WorkspaceProfile[] {
-  if (!Array.isArray(raw)) {
-    return [];
-  }
-  return raw
-    .filter((item): item is WorkspaceProfile => {
-      if (typeof item !== "object" || item === null) {
-        return false;
-      }
-      const record = item as Record<string, unknown>;
-      return typeof record.name === "string" && typeof record.path === "string";
-    })
-    .map((item) => ({
-      name: item.name,
-      path: item.path,
-      updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : new Date(0).toISOString(),
-    }));
-}
-
-function upsertWorkspaceProfile(profiles: WorkspaceProfile[], next: WorkspaceProfile): void {
-  const index = profiles.findIndex((item) => item.name === next.name);
-  if (index === -1) {
-    profiles.push(next);
-  } else {
-    profiles[index] = next;
-  }
-  profiles.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function renderCoreWorkspaceList(profiles: WorkspaceProfile[], currentWorkspace: string, locale: Locale): string {
-  const lines = profiles.length > 0
-    ? profiles.map((profile) => {
-      const marker = profile.path === currentWorkspace ? " *" : "";
-      return `- ${profile.name}${marker}: ${profile.path}`;
-    })
-    : [locale === "en" ? "- No saved workspaces." : "- 暂无已保存工作区。"];
-  if (locale === "en") {
-    return [
-      `Current workspace: ${currentWorkspace}`,
-      "",
-      "Saved workspaces:",
-      ...lines,
-      "",
-      "Commands: `/ws save <name> [absolute-path]`, `/ws use <name>`, `/ws remove <name>`.",
-    ].join("\n");
-  }
-  return [
-    `当前工作区：${currentWorkspace}`,
-    "",
-    "已保存工作区：",
-    ...lines,
-    "",
-    "命令：`/ws save <名称> [绝对路径]`、`/ws use <名称>`、`/ws remove <名称>`。",
-  ].join("\n");
 }
 
 async function handleCoreInviteRemoveCommand(

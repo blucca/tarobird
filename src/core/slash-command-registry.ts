@@ -41,7 +41,6 @@ export const CORE_SLASH_COMMANDS: readonly CoreSlashCommandDefinition[] = [
   defineCommand("q", "Force a message into the task queue", "强制把消息作为新任务排队"),
   defineCommand("bg", "Inspect or stop engine background processes", "查看或停止引擎后台进程"),
   defineCommand("continue", "Continue the latest waiting archive analysis", "继续最近一个等待中的压缩包分析"),
-  defineCommand("ws", "List, save, use, or remove workspaces", "列出、保存、切换或删除工作区"),
   defineCommand("context", "Show engine context usage where supported", "查看支持引擎的上下文用量"),
   defineCommand("compact", "Compact the current native agent session", "压缩当前原生 Agent 会话"),
   defineCommand("ultrareview", "Run the Claude deep-review workflow", "运行 Claude 深度审查流程"),

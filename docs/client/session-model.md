@@ -41,6 +41,6 @@ Claude 的空白目标对话也保存明确的“此前未绑定”状态，因�
 
 Gateway 与无界面 Host 共用 `createBridgeDependencies` 和 adapter。人设是 `<Bot 状态目录>/workspace/AGENTS.md` 中的一段用户指令；各引擎接收明确的 Bot 文件路径，旧人设全文注入已移除。修改文件后可在对话中让 Bot 重新读取；保存不表示运行中的会话已经读取新版。原生引擎继续处理其项目和全局指令。App 的平台说明已独立成短提示词，按需补充能力说明；Codex、Claude 和 DeepSeek 已接入各自原生 App 文件工具，不支持的版本、会话或引擎保留必要兼容。详见 [App 平台提示词与结构化交付](app-platform-prompt.md)。
 
-创建 Bot 时可选择已有工作区，不填则建立该 Bot 的独立目录；`/ws list|save|use|remove` 沿用原管理逻辑。恢复会话的工作区只属于那条对话，不改其他对话的恢复绑定。App 的“人设”编辑器只修改 Bot 专用 AGENTS.md 的人设小节，保留其他规则。CLI 使用同一权限和 revision 校验：`tarobot bots persona ID`，写入用 `--from PATCH.json`。详见[人设文件与迁移](persona-agents-2026-11-04.md)。
+创建 Bot 时可选择已有工作区，不填则建立该 Bot 的独立目录。恢复会话的工作区只属于那条对话，不改其他对话的恢复绑定。App 的“人设”编辑器只修改 Bot 专用 AGENTS.md 的人设小节，保留其他规则。CLI 使用同一权限和 revision 校验：`tarobot bots persona ID`，写入用 `--from PATCH.json`。详见[人设文件与迁移](persona-agents-2026-11-04.md)。
 
 验证入口：`gateway-service` 的会话隔离、绑定／恢复／切断／重置与跨频道锁测试；`gateway-session-binding` 的旧版、崩溃和损坏收据保护；`telegram-session-commands` 原有引擎语法回归。运行证据以 [验收记录](implementation-status.md) 为准。

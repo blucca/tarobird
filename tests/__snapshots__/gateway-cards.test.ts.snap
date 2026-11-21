@@ -2951,10 +2951,9 @@ exports[`Gateway card translation > translates actual config, board, status, res
       "type": "columns",
     },
     {
-      "text": "**访问和工作区**
+      "text": "**访问**
 - \`/invite group\` / \`/remove group\`：允许或移除当前群。
-- \`/invite user @某人\` / \`/remove user @某人\`：管理群内可操作用户。
-- \`/ws list|save|use|remove\`：管理已保存工作区目录。",
+- \`/invite user @某人\` / \`/remove user @某人\`：管理群内可操作用户。",
       "type": "markdown",
     },
     {

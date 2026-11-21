@@ -137,20 +137,18 @@ export async function renderCoreConfigCard(input: CoreConfigCardContext): Promis
     ]),
     markdownElement(channelProfile() === "gateway"
       ? input.locale === "en"
-        ? "Device access: Settings → Device management. Use /ws list|save|use|remove to manage workspace directories."
-        : "设备权限在「设置 → 设备管理」中设置。使用 /ws list|save|use|remove 管理工作区目录。"
+        ? "Device access: Settings → Device management."
+        : "设备权限在「设置 → 设备管理」中设置。"
       : input.locale === "en"
       ? [
         `**${labels.accessSection}**`,
         "- `/invite group` / `/remove group`: allow or remove the current group.",
         "- `/invite user @person` / `/remove user @person`: manage who can operate the bot inside groups.",
-        "- `/ws list|save|use|remove`: manage saved workspace directories.",
       ].join("\n")
       : [
         `**${labels.accessSection}**`,
         "- `/invite group` / `/remove group`：允许或移除当前群。",
         "- `/invite user @某人` / `/remove user @某人`：管理群内可操作用户。",
-        "- `/ws list|save|use|remove`：管理已保存工作区目录。",
       ].join("\n")),
   ];
 
@@ -722,7 +720,7 @@ function coreConfigLabels(locale: Locale): {
       yoloOff: "YOLO Off",
       yoloUnsafe: "Unsafe",
       localeSection: "Language",
-      accessSection: "Access and workspace",
+      accessSection: "Access",
       groupSection: "Group Mode",
       groupAllow: "Allow Group",
       groupKeep: "Keep current group setting",
@@ -771,7 +769,7 @@ function coreConfigLabels(locale: Locale): {
     yoloOff: "YOLO 关",
     yoloUnsafe: "Unsafe",
     localeSection: "语言",
-    accessSection: "访问和工作区",
+    accessSection: "访问",
     groupSection: "群聊模式",
     groupAllow: "允许本群",
     groupKeep: "保持当前群聊设置",

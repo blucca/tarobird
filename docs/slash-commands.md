@@ -47,7 +47,6 @@ Use `/help` inside the bot for the live command list available to that chat. Thi
 | `/q <message>` (alias `/queue <message>`) | Force the message to run as its own queued turn. Without it, plain text sent while a Codex or DeepSeek turn is running is steered into that turn (within the `/steer` eligibility window, default 30s). | Lark |
 | `/bg` | List engine/background processes for this instance; `/bg kill <pid>` stops a process tree; `/bg killall` cleans orphans. | Lark |
 | `/continue` | Continue the latest waiting archive analysis. | Telegram, Lark |
-| `/ws list\|save\|use\|remove` | Manage saved Lark workspace directories; `/ws use` resets the current Lark session binding to avoid stale context. | Lark |
 
 ## Context Utilities
 

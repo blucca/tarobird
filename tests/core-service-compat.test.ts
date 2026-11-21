@@ -12772,52 +12772,6 @@ describe("core service compatibility profile", () => {
     }
   });
 
-  it("manages Lark workspace profiles with /ws commands", async () => {
-    const stateDir = await mkdtemp(path.join(os.tmpdir(), "cctb-lark-ws-"));
-    const workspacePath = path.join(stateDir, "workspaces", "demo");
-    const channel = fakeChannel();
-    const runtime = createCoreServiceRuntime();
-    const bridge = {
-      handleAuthorizedMessage: vi.fn(async () => ({ text: "should not run" })),
-    };
-
-    try {
-      await handleCoreMessage({
-        channel,
-        bridge,
-        runtime,
-        stateDir,
-        message: fakeLarkMessage({ messageId: "om_ws_save", content: `/ws save demo ${workspacePath}` }),
-      });
-      await handleCoreMessage({
-        channel,
-        bridge,
-        runtime,
-        stateDir,
-        message: fakeLarkMessage({ messageId: "om_ws_use", content: "/ws use demo" }),
-      });
-      await handleCoreMessage({
-        channel,
-        bridge,
-        runtime,
-        stateDir,
-        message: fakeLarkMessage({ messageId: "om_ws_list", content: "/ws list" }),
-      });
-
-      const cfg = await loadInstanceConfig(stateDir);
-      expect(cfg.workspacePath).toBe(workspacePath);
-      expect(cfg.workspaceProfiles).toEqual([
-        expect.objectContaining({ name: "demo", path: workspacePath }),
-      ]);
-      const replies = JSON.stringify(channel.send.mock.calls);
-      expect(replies).toContain("demo");
-      expect(replies).toContain(workspacePath);
-      expect(bridge.handleAuthorizedMessage).not.toHaveBeenCalled();
-    } finally {
-      await rm(stateDir, { recursive: true, force: true });
-    }
-  });
-
   it("renders skipped queued Lark messages in English when Lark locale is English", async () => {
     const stateDir = await mkdtemp(path.join(os.tmpdir(), "cctb-lark-message-skipped-en-"));
     const runtime = createCoreServiceRuntime();
