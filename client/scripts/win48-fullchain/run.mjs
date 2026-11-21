@@ -86,7 +86,7 @@ try {
   const aChild = spawn(electronBin, [path.join(work, 'a.cjs'), '--addon', addonPath, '--host-dir', hostDir, '--app-state', path.join(work, 'a-state'), '--assets', assets, '--rpc-url', `ws://127.0.0.1:${wss.address().port}`], { stdio: ['ignore', 'pipe', 'pipe'] });
   aChild.stdout.on('data', () => {}); aChild.stderr.on('data', () => {}); cleanups.push(async () => { try { await a('shutdown', {}, 3000); } catch {} try { aChild.kill(); } catch {} });
   await aUp;
-  const aStart = await a('start', {}, 40000);
+  const aStart = await a('start', {}, 40000); globalThis.accDiag = () => a('diag', {}, 5000);
   expect('a', 'product-screen-service-registered', aStart.registered && aStart.platform === 'windows', aStart);
   const aInfo0 = await a('info');
   rec('a', 'test-window', 'info', aInfo0);
@@ -132,41 +132,56 @@ try {
     await page.evaluate(() => document.querySelector('.remote-screen-panel canvas').focus());
     // move
     let from = await count(); let p = toB(ci, 125, 108); await page.mouse.move(p.x, p.y, { steps: 4 });
-    let ev = await until(async () => (await seenFrom(from)).filter(e => e.type === 'mousemove').at(-1), 4000);
-    expect('input', 'move', !!ev && near2(ev, 125, 108), { want: [125, 108], got: ev && [ev.x, ev.y] });
+    let ev = await until(async () => (await seenFrom(from)).filter(e => e.type === 'mousemove').find(e => near2(e, 125, 108)), 4000);
+    const lastMove = (await seenFrom(from)).filter(e => e.type === 'mousemove').at(-1);
+    expect('input', 'move', !!ev, { want: [125, 108], got: ev ? [ev.x, ev.y] : lastMove && [lastMove.x, lastMove.y] });
+    await snap(page, lang, 'after-move');
     // single click
     from = await count(); p = toB(ci, 375, 108); await page.mouse.click(p.x, p.y);
     let evs = await until(async () => { const l = await seenFrom(from); return l.some(e => e.type === 'click') && l; }, 4000) || await seenFrom(from);
     let c1 = evs.find(e => e.type === 'click'); expect('input', 'click', !!c1 && c1.button === 0 && near2(c1, 375, 108), { want: [375, 108], got: evs.filter(e => e.type !== 'mousemove').map(e => [e.type, e.button, e.x, e.y]) });
+    // Unmodified behaviour on ONE shared desktop: the click activated A's test window.
+    await sleep(1500); await snap(page, lang, 'after-click-unmodified');
+    const released = await btn('开始控制').isVisible().catch(() => false);
+    rec('same-desktop', 'controller-blur-releases-control', 'info', { controlReleased: released, windowBlurs: await page.evaluate(() => (window).accHarness.blurs()), state: texts[lang].at(-1).state });
+    await page.evaluate(() => (window).accHarness.suppressBlur(true));
+    await bApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].focus());
+    if (await btn('开始控制').isVisible().catch(() => false)) { await btn('开始控制').click(); await until(() => btn('停止控制').isVisible(), 8000); }
+    await page.evaluate(() => document.querySelector('.remote-screen-panel canvas').focus());
+    await snap(page, lang, 'control-again-with-blur-suppressed');
     // double click
     from = await count(); p = toB(ci, 125, 324); await page.mouse.dblclick(p.x, p.y);
     evs = await until(async () => { const l = await seenFrom(from); return l.some(e => e.type === 'dblclick') && l; }, 4000) || await seenFrom(from);
+    await snap(page, lang, 'after-dblclick');
     const dc = evs.find(e => e.type === 'dblclick'); expect('input', 'double-click', !!dc && near2(dc, 125, 324), { got: evs.filter(e => e.type !== 'mousemove').map(e => [e.type, e.detail, e.x, e.y]) });
     // right click
     from = await count(); p = toB(ci, 375, 324); await page.mouse.click(p.x, p.y, { button: 'right' });
     evs = await until(async () => { const l = await seenFrom(from); return l.some(e => e.type === 'contextmenu') && l; }, 4000) || await seenFrom(from);
+    await snap(page, lang, 'after-right-click');
     const cm = evs.find(e => e.type === 'contextmenu'); expect('input', 'right-click', !!cm && cm.button === 2 && near2(cm, 375, 324), { got: evs.filter(e => e.type !== 'mousemove').map(e => [e.type, e.button, e.x, e.y]) });
     // wheel
     from = await count(); p = toB(ci, 250, 200); await page.mouse.move(p.x, p.y); await page.mouse.wheel(0, 240);
     evs = await until(async () => { const l = await seenFrom(from); return l.some(e => e.type === 'wheel') && l; }, 4000) || await seenFrom(from);
+    await snap(page, lang, 'after-wheel');
     const wh = evs.filter(e => e.type === 'wheel'); expect('input', 'wheel', wh.length > 0 && wh.every(e => near2(e, 250, 200)), { wheel: wh.slice(0, 4).map(e => [e.dx, e.dy, e.x, e.y]) });
     // drag
     from = await count(); const s0 = toB(ci, 100, 300), s1 = toB(ci, 300, 350);
     await page.mouse.move(s0.x, s0.y); await page.mouse.down(); await page.mouse.move(s1.x, s1.y, { steps: 10 }); await page.mouse.up();
     evs = await until(async () => { const l = await seenFrom(from); return l.some(e => e.type === 'mouseup') && l; }, 4000) || await seenFrom(from);
+    await snap(page, lang, 'after-drag');
     const dn = evs.find(e => e.type === 'mousedown'), up = evs.find(e => e.type === 'mouseup'), dragMoves = evs.filter(e => e.type === 'mousemove' && e.buttons === 1);
     expect('input', 'drag', !!dn && !!up && near2(dn, 100, 300) && near2(up, 300, 350) && dragMoves.length > 0, { down: dn && [dn.x, dn.y], up: up && [up.x, up.y], movesWithButton: dragMoves.length });
     // focus the remote textarea with a real remote click, then text with Chinese and a newline
     const ti = (await a('info')).textarea; const tx = Math.round(ti.x + ti.w / 2), ty = Math.round(ti.y + ti.h / 2);
     p = toB(ci, tx, ty); await page.mouse.click(p.x, p.y);
     await until(async () => (await a('info')).textarea.focused === 't', 3000);
-    let opened = await page.getByLabel(t('发送到远端的文本'), { exact: true }).isVisible().catch(() => false);
-    if (!opened) { const k = btn('键盘与快捷键'); if (await k.isVisible().catch(() => false)) await k.click(); else { await btn('屏幕更多操作').click(); await page.getByRole('menuitem', { name: t('键盘与快捷键') }).click().catch(() => {}); } }
+    await snap(page, lang, 'remote-textarea-focused');
+    // Desktop text box: 屏幕更多操作 → 发送文本 (this releases control by design), type, start control, send.
+    if (!(await page.getByLabel(t('发送到远端的文本'), { exact: true }).isVisible().catch(() => false))) { await btn('屏幕更多操作').click(); await btn('发送文本').click(); }
     const box = page.getByLabel(t('发送到远端的文本'), { exact: true }); await box.fill('你好 TaroBird\n第二行');
     if (await btn('开始控制').isVisible().catch(() => false)) { await btn('开始控制').click(); await until(() => btn('停止控制').isVisible(), 8000); }
     await snap(page, lang, 'text-ready');
-    const sendName = (await btn('发送文本').isVisible().catch(() => false)) ? '发送文本' : '发送到远端';
-    await btn(sendName).click();
+    await page.locator('.screen-text button').first().click();
     const val = await until(async () => { const v = (await a('info')).value; return v.includes('第二行') && v; }, 6000);
     expect('input', 'text-chinese-and-newline', typeof val === 'string' && val.includes('你好 TaroBird\n第二行'), { value: (await a('info')).value });
     // platform shortcut: Ctrl+A on the Windows target selects the whole textarea
@@ -222,6 +237,7 @@ try {
   expect('a', 'desktopSource-matched', diag.resolveCalls.length > 0 && diag.resolveCalls.every(c => c.matched), diag.resolveCalls);
 } catch (error) {
   rec('harness', 'unexpected-error', 'fail', String(error?.stack ?? error).replace(/[A-Za-z]:\\[^\s"']+/g, '<path>'));
+  try { rec('a', 'diag-at-failure', 'info', await globalThis.accDiag?.()); } catch { /* A gone */ }
 } finally {
   const outcome = checks.some(c => c.status === 'fail') ? 'fail' : 'pass';
   await writeFile(path.join(reportDir, 'win48-fullchain.json'), JSON.stringify({ outcome, sourceCommit: values['source-commit'], checks, texts }, null, 1));
