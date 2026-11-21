@@ -97,9 +97,12 @@ export function useShareInbox({ connection, conversations, active = true, enable
   const native = enabled ? bridge : undefined;
   useLocale(); const [items, setItems] = useState<SharedItem[]>([]); const [open, setOpen] = useState(false); const [error, setError] = useState("");
   const [unsupported, setUnsupported] = useState(false); const [retry, setRetry] = useState<"idle" | "busy" | "failed">("idle");
+  // Consecutive failed reads. The row is in-flow, so one transient failure must
+  // not push the page down and back; a failed manual retry always counts as shown.
+  const [failures, setFailures] = useState(0);
   // Nothing known to be pending but the inbox cannot be read: say so in the same
   // row instead of hiding shares that may be waiting (e.g. one unreadable item).
-  const failed = !items.length && !!error && !unsupported;
+  const failed = !items.length && !!error && !unsupported && failures >= 2;
   const shown = !!native && (!!items.length || failed);
   const panel = useRef<HTMLElement>(null), trigger = useRef<HTMLButtonElement>(null);
   const visible = open && active && shown;
@@ -129,7 +132,8 @@ export function useShareInbox({ connection, conversations, active = true, enable
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useBackAction(panel, () => setOpen(false));
   /** Resolves whether this read succeeded, or undefined when a newer read already applied. */
-  async function refresh(): Promise<boolean | undefined> {
+  // `.then(refresh)` passes a resolved value: only an explicit `true` is a manual retry.
+  async function refresh(manual: unknown = false): Promise<boolean | undefined> {
     if (!native) return; const request = ++requested.current;
     let next: SharedItem[] | undefined, failure = "", cannotShare = false;
     try { next = (await native.list()).items.map((item) => sharedItemSchema.parse(item)); } catch (e) { failure = String(e); cannotShare = shareUnsupported(e); }
@@ -141,14 +145,14 @@ export function useShareInbox({ connection, conversations, active = true, enable
       if (removed.length || Date.now() - pruned.current > 60_000) { pruned.current = Date.now(); void connection.cache.pruneExpiredShareDrafts(connection.identity).catch(() => undefined); }
       const signature = JSON.stringify(next);
       if (signature !== listed.current) { listed.current = signature; setItems(next); }
-      setError(""); setUnsupported(false);
+      setError(""); setUnsupported(false); setFailures(0);
       // Another host/window can finish the shared native item. Retire this
       // pairing's old editor too; a delayed save cannot restore its content.
       for (const id of removed) void connection.cache.retireShareDraft(id, connection.identity).catch(() => undefined);
-    } else { setError(failure); setUnsupported(cannotShare); }
+    } else { setError(failure); setUnsupported(cannotShare); setFailures(count => Math.max(count + 1, manual === true ? 2 : 0)); }
     return !!next;
   }
-  async function retryRead() { setRetry("busy"); const ok = await refresh(); if (mounted.current) setRetry(ok === false ? "failed" : "idle"); }
+  async function retryRead() { setRetry("busy"); const ok = await refresh(true); if (mounted.current) setRetry(ok === false ? "failed" : "idle"); }
   useEffect(() => {
     // Only the visible host workspace polls; a hidden host reads again on activation.
     if (!native || !active) return;
