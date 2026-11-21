@@ -82,11 +82,18 @@ it("keeps the full widget recipe on demand for native tools and out of unrelated
 it("custom interaction guidance is shared without changing frozen tool definitions", async () => {
   const recipe = appCapabilityInstructions('widgets');
   expect(recipe).toContain('input[type=range]');
-  expect(recipe).toContain('--chart-series-1 through --chart-series-4');
-  expect(recipe).toContain('no accent means grayscale');
+  expect(recipe).toContain('Use --cat-* in new widgets; --chart-series-1 to --chart-series-4 remain available');
+  expect(recipe).toContain('--cat-1 to --cat-8 for graphics');
+  expect(recipe).toContain('--cat-1-ink to --cat-8-ink for coloured text');
+  expect(recipe).toContain('--cat-1-soft to --cat-8-soft for tinted');
+  expect(recipe).toContain('Never put text on a solid --cat-N fill');
+  expect(recipe).toContain('fill="currentColor"');
+  expect(recipe).toContain('light-dark(lightValue, darkValue)');
+  expect(recipe).toContain('data-canvas-theme="light" or "dark" on its outermost element');
   expect(recipe).toContain("window's tarobot:theme event");
-  expect(recipe).toContain('older clients provide distinct fallbacks');
-  expect(recipe).toContain('Keep series-to-colour assignments stable');
+  expect(recipe).toContain('Keep each entity on the same --cat-N');
+  // Colour is no longer limited to one accent plus greys.
+  for (const retired of ['Reserve saturated color', 'Emphasize one leading finding', 'decorative KPI grids', 'no accent means grayscale', 'mute the rest', 'distinct fallbacks']) expect(recipe).not.toContain(retired);
   expect(recipe).toContain('tarobot.prompt.compose');
   expect(recipe).toContain('NOT when sent');
   expect(recipe).toContain('Local forms');
