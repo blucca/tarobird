@@ -41,7 +41,7 @@ describe('workbench standalone CLI and engine tools',()=>{
     await runHostCli(['workbench','guide','widgets','--state-dir','/dev/null/not-a-directory','--json']);
     const guide=JSON.parse(String(log.mock.calls[0]![0]));expect(guide).toMatchObject({topic:'widgets',staticGuide:true});
     expect(guide.instructions).toContain(appCapabilityInstructions('widgets',{widgetsEnabled:true}));
-    expect(guide.instructions).toContain('send.widget');expect(guide.instructions).toContain('does not return a native source receipt');expect(guide.instructions).toContain('Never guess');expect(guide.instructions).toContain('borrow owner credentials');
+    expect(guide.instructions).toContain('send.widget');expect(guide.instructions).toContain('A send.widget fence returns no source');expect(guide.instructions).toContain('never guess it');expect(guide.instructions).toContain('borrow owner credentials');
     expect((await runWorkbenchCommand('', 'guide','browser',{})).instructions).toContain('image.insert payload');
     await expect(runWorkbenchCommand('', 'guide','unknown',{})).rejects.toThrow('workbench_guide_topic_required');
     await expect(runWorkbenchCommand('', 'guide','widgets',{contextMessageId:'source'})).rejects.toThrow('workbench_guide_does_not_accept_request');

@@ -37,12 +37,37 @@ differs from the App scheme, the viewer applies that scheme's tokens and
 `@media (prefers-color-scheme)` agree). Authored colours are never rewritten.
 Nested or unknown values are ignored.
 
-The authoring guidance now encourages colour per category, metric and series,
-lists the guaranteed pairings with a short example, forbids text on solid
-`--cat-N`, names SVG text's default black fill and black/white `rgba` tints,
-asks for `light-dark()` for any extra colour, and reserves `data-canvas-theme`
-for designs that depend on one canvas. `--ok/--warn/--danger` keep their
-meanings and colour must not be the only cue.
+Monochrome's `--chart-series-1..4` (used by App reports and older widgets) now
+point at its first four categorical hues in both modes; a Monochrome accent
+sets only the data emphasis (report headline metric, timeline nodes, data
+widget accent and primary action). Other palettes' series are unchanged.
+
+### Default canvas
+
+Without a declaration the viewer decides once from the widget source:
+
+1. Source that mentions an App colour variable (`--text` … `--cat-N-soft`,
+   `--chart-series-N`), `light-dark()`, `prefers-color-scheme` or the
+   `tarobot:theme` event follows the App.
+2. Otherwise, source that paints its own colours (hex, `rgb()`/`hsl()`/
+   `oklch()` and similar, a named colour on a colour property, or any `<svg>`,
+   whose default paint is black) gets a light canvas, or a dark one when its
+   outermost element has an opaque dark background.
+3. Source with no colour of its own inherits the App's text colour and follows
+   the App.
+
+Known limits: a design drawn for dark with a transparent background and light
+text gets a light canvas unless it declares `data-canvas-theme="dark"`; a
+design that mixes App variables with fixed dark text follows the App and can
+be hard to read in dark themes.
+
+### Guidance
+
+The on-demand widget guidance (`src/gateway/widget-guidance.ts`) now states
+only facts a model needs for a working widget: publication, runtime limits
+of the sanitized Worker DOM, frame size, optional state/composer APIs, the
+theme variables and default canvas, and the report and chart-tab contracts.
+Usage, layout, colour, interaction and data-presentation advice was removed.
 
 ## Compatibility
 

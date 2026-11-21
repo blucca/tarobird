@@ -7,6 +7,7 @@ import { widgetInputSchema, widgetBlock, readWidget, MAX_WIDGET_BYTES } from "..
 import { blocksText } from "../src/client-protocol/index.js";
 import { forwardedBlocks } from "../src/client-protocol/forwarding.js";
 import { validateWidget } from "../src/runtime/widget.js";
+import { widgetGuidance, reportCompatibilityGuidance } from "../src/gateway/widget-guidance.js";
 import { createAppPlatformTools } from "../src/gateway/app-tools.js";
 import { GatewayReceipts } from "../src/gateway/receipts.js";
 import { appAgentInstructions, appCapabilityInstructions, appTurnInstructions } from "../src/gateway/agent-instructions.js";
@@ -56,7 +57,7 @@ it("preserves the previous three-tool contract and provides compatibility guidan
   await mkdir(path.join(root,'app-tool-threads'));await writeFile(path.join(root,'app-tool-threads',hash('old')+'.json'),JSON.stringify({toolVersion:hash(JSON.stringify(old))}));
   const resumed=await tools.forSession!('old');expect(resumed?.definitions).toEqual(old);expect(resumed?.instructions).toContain('send.widget');expect(resumed?.instructions).not.toContain('Use app_show_widget');
   await tools.register('new');expect((await tools.forSession!('new'))?.definitions.map(x=>x.name)).toContain('app_show_widget');
-  for(const engine of ['codex','claude','deepseek','kimi','antigravity'] as const){expect(appAgentInstructions({engine})).toContain('send.widget');expect(appTurnInstructions('比较本周趋势',{engine})).toContain('proactively');}
+  for(const engine of ['codex','claude','deepseek','kimi','antigravity'] as const){expect(appAgentInstructions({engine})).toContain('send.widget');expect(appTurnInstructions('比较本周趋势',{engine})).toContain('128 KiB');}
 });
 it("headless CLI validates before the shared API and retains the caller request ID",async()=>{
   const root=await mkdtemp(path.join(os.tmpdir(),'widget-cli-'));roots.push(root);const file=path.join(root,'report.html');await writeFile(file,input.html);
@@ -79,25 +80,14 @@ it("keeps the full widget recipe on demand for native tools and out of unrelated
   expect(appCapabilityInstructions('widgets')).toContain('128 KiB');
 });
 
-it("custom interaction guidance is shared without changing frozen tool definitions", async () => {
+it("minimal widget facts are shared without changing frozen tool definitions", async () => {
   const recipe = appCapabilityInstructions('widgets');
-  expect(recipe).toContain('input[type=range]');
-  expect(recipe).toContain('Use --cat-* in new widgets; --chart-series-1 to --chart-series-4 remain available');
-  expect(recipe).toContain('--cat-1 to --cat-8 for graphics');
-  expect(recipe).toContain('--cat-1-ink to --cat-8-ink for coloured text');
-  expect(recipe).toContain('--cat-1-soft to --cat-8-soft for tinted');
-  expect(recipe).toContain('Never put text on a solid --cat-N fill');
-  expect(recipe).toContain('fill="currentColor"');
-  expect(recipe).toContain('light-dark(lightValue, darkValue)');
-  expect(recipe).toContain('data-canvas-theme="light" or "dark" on its outermost element');
-  expect(recipe).toContain("window's tarobot:theme event");
-  expect(recipe).toContain('Keep each entity on the same --cat-N');
-  // Colour is no longer limited to one accent plus greys.
-  for (const retired of ['Reserve saturated color', 'Emphasize one leading finding', 'decorative KPI grids', 'no accent means grayscale', 'mute the rest', 'distinct fallbacks']) expect(recipe).not.toContain(retired);
-  expect(recipe).toContain('tarobot.prompt.compose');
-  expect(recipe).toContain('NOT when sent');
-  expect(recipe).toContain('Local forms');
-  expect(recipe).toContain('terminable Worker');
+  // Only facts needed for a widget that runs: publication, runtime limits, theme variables and contracts.
+  for (const fact of ['Only tool-call fences execute', '128 KiB', 'Scripts run in a Worker against a virtual DOM', '2,048 elements', 'tarobot.state.set', 'tarobot.prompt.compose', 'returns true only if inserted', "tarobot:theme", '--cat-1 to --cat-8', 'up to 720 px', 'SVG paints black unless given a fill', 'data-canvas-theme="light" or "dark" on that element', 'gets a light canvas, or a dark one', 'Report schema']) expect(recipe).toContain(fact);
+  // Style, layout, colour, interaction and usage advice is left to the author.
+  for (const retired of ['Use an interactive widget when', 'Start with at most one short factual conclusion', 'Use colour generously', 'Never put text on a solid', 'Interaction recipes', 'Round percentages', 'Honor reduced motion', 'Derive totals', 'Reserve saturated color', 'Avoid repeated titles']) expect(recipe).not.toContain(retired);
+  const sum = widgetGuidance.length + reportCompatibilityGuidance.length;
+  expect(sum).toBeLessThan(4000);
   const html = await readFile('docs/examples/widget-scenario-explorer.html','utf8');
   expect(validateWidget({ ...input, html }).html).toBe(html.trim());
 });

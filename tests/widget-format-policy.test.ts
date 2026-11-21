@@ -34,7 +34,9 @@ it('uses one HTML-default policy for all engines, native tools, compatibility fe
       expect(guide).toContain(widgetFormatPolicy);
       expect(guide.indexOf('Publish with app_show_widget')).toBeLessThan(guide.indexOf('Report schema'));
       expect(guide).not.toMatch(/Prefer bounded report|Use report data for ordinary|Use HTML only when/);
-      expect(guide).toContain('complete company/category names');
+      expect(guide).toContain('Scripts run in a Worker');
+      // Design is left to the author: no layout, colour or interaction rules.
+      expect(guide).not.toMatch(/complete company\/category names|Use colour generously|Interaction recipes|Start with at most one short factual conclusion/);
       if (!nativeWidgets) expect(appTurnInstructions('比较本周趋势', options)).toContain(widgetFormatPolicy);
     }
   }
@@ -63,7 +65,7 @@ it('provides the explicit report recipe on compatibility engines without turning
   for (const text of ['写一份季度分析报告', 'write a weekly report', '修复 report 格式的解析代码', 'fix the structured report parser']) {
     expect(appTurnInstructions(text, { widgetsEnabled: true, nativeWidgets: false }) ?? '').not.toContain('Report schema');
   }
-  expect(appCapabilityInstructions('widgets')).toContain('Asking for a written report');
+  expect(appCapabilityInstructions('widgets')).toContain('asking for a written report, analysis report, 报告 or 周报 does not');
 });
 
 it('keeps frozen v7/v8 sessions while new tools recommend HTML and add Design', async () => {
