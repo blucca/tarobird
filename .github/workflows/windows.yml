@@ -96,7 +96,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installer requires an unbundled runtime" }
       - name: "#50 extension: custom directory, release upgrades, Tauri to Electron (acceptance only)"
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 110
+        timeout-minutes: 130
         shell: pwsh
         env:
           TAROBOT_WINDOWS_ACCEPTANCE: disposable
@@ -108,7 +108,7 @@ jobs:
           $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
           if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
           node client/scripts/windows-acceptance-extension.mjs --confirm-disposable-windows --installer $installers[0].FullName `
-            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-extension.noindex" --groups C,A,B --budget-minutes 100
+            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-extension.noindex" --groups C,A,D,B --budget-minutes 120
           if ($LASTEXITCODE -ne 0) { throw "#50 extension acceptance did not pass; see the receipt in the job summary" }
       - name: Show acceptance evidence (log and summary only, no upload)
         if: always()
