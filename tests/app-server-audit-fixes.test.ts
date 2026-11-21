@@ -675,6 +675,10 @@ describe("app-server mid-turn steering (turn/steer)", () => {
     '{"code":-32603,"message":"no active turn to steer"}',
     '{"code":-32600,"message":"input exceeds limit"}',
     '{"code":-32600,"message":"no active turn to steer; retry later"}',
+    // Whole-message anchors (review R16): a prefix or suffix keeps it uncertain.
+    '{"code":-32600,"message":"error: no active turn to steer"}',
+    '{"code":-32600,"message":"note: expected active turn id `turn-1` but found `turn-2`"}',
+    '{"code":-32600,"message":"expected active turn id `turn-1` but found `turn-2` (retry)"}',
   ])("keeps any other error reply uncertain: %s", async (reply) => {
     const { error } = await steerReply(reply);
     expect(error).toBeDefined();
