@@ -134,7 +134,8 @@ try {
     let ci = await canvasInfo(page);
     await page.evaluate(() => document.querySelector('.remote-screen-panel canvas').focus());
     // move
-    let from = await count(); let p = toB(ci, 125, 108); await page.mouse.move(p.x, p.y, { steps: 4 });
+    await sleep(500);
+    let from = await count(); let p = toB(ci, 125, 108); await page.mouse.move(p.x, p.y, { steps: 8 }); await sleep(100); await page.mouse.move(p.x + 0.2, p.y);
     let ev = await until(async () => (await seenFrom(from)).filter(e => e.type === 'mousemove').find(e => near2(e, 125, 108)), 4000);
     const lastMove = (await seenFrom(from)).filter(e => e.type === 'mousemove').at(-1);
     expect('input', 'move', !!ev, { want: [125, 108], got: ev ? [ev.x, ev.y] : lastMove && [lastMove.x, lastMove.y] });
@@ -238,6 +239,10 @@ try {
     await btn('连接屏幕').click(); await until(async () => await btn('开始控制').isEnabled(), 20000);
     await btn('开始控制').click(); await until(() => btn('停止控制').isVisible(), 8000);
     const ci = await canvasInfo(page); await page.evaluate(() => document.querySelector('.remote-screen-panel canvas').focus());
+    await sleep(500);
+    await page.evaluate(() => { const c = document.querySelector('.remote-screen-panel canvas'); const d = (window).__dr = { moves: 0, movesWithButton: 0, downs: 0, ups: 0, lost: 0, cancels: 0, samples: [] };
+      c.addEventListener('pointermove', e => { d.moves++; if (e.buttons) d.movesWithButton++; if (d.samples.length < 12) d.samples.push([document.hasFocus(), document.activeElement === c, e.buttons, c.hasPointerCapture(e.pointerId)]); });
+      c.addEventListener('pointerdown', () => d.downs++); c.addEventListener('pointerup', () => d.ups++); c.addEventListener('lostpointercapture', () => d.lost++); c.addEventListener('pointercancel', () => d.cancels++); });
     const from = await count(), t0 = Date.now(); const s0 = toB(ci, 100, 300), s1 = toB(ci, 300, 350);
     await page.mouse.move(s0.x, s0.y); await page.mouse.down(); await sleep(150);
     for (let i = 1; i <= 10; i++) { await page.mouse.move(s0.x + (s1.x - s0.x) * i / 10, s0.y + (s1.y - s0.y) * i / 10); await sleep(40); }
@@ -245,6 +250,8 @@ try {
     const health = hbGap(t0, Date.now());
     const hubSide = hubInputs.filter(e => e.at >= t0).map(e => `${e.kind}${e.down === undefined ? '' : e.down ? ':down' : ':up'}@${e.x?.toFixed?.(3)},${e.y?.toFixed?.(3)}`);
     let aSide = null; try { aSide = (await a('mouse-calls', { since: t0 }, 8000)).calls.map(c => `${c.action}:${c.button}@${c.x},${c.y}`); } catch { aSide = 'a_unresponsive'; }
+    const bDom = await page.evaluate(() => (window).__dr);
+    rec('input', 'drag-b-dom', 'info', bDom);
     rec('input', 'drag-path', 'info', { hubReceived: hubSide.slice(0, 30), hubCount: hubSide.length, aNativeMouseCalls: Array.isArray(aSide) ? aSide.slice(0, 30) : aSide });
     let evs = null; try { evs = (await a('seen', { from }, 8000)).events; } catch (e) { evs = null; }
     await snap(page, lang, 'after-drag');
