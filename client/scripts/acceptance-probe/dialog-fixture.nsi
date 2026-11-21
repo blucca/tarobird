@@ -32,11 +32,21 @@ Function .onInit
     StrCpy $LANGUAGE 2052
   ${EndIf}
 FunctionEnd
+Var RunHelper
 Section
   StrCpy $BirdOperation "$(birdUninstall)"
   StrCpy $BirdBackupState "$(birdNotRequested)"
   StrCpy $BirdNoticeState "$(birdNoticeCleared)"
   StrCpy $Tries 0
+  ; /HELPER: run a stand-in "tarobot-installer-helper.exe" (a whoami.exe copy,
+  ; which exits non-zero on an unknown switch) first, as the Host stop does.
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/HELPER" $RunHelper
+  ${IfNot} ${Errors}
+    ExecWait '"$EXEDIR\tarobot-installer-helper.exe" --stop-desktop-host' $R5
+    DetailPrint "stand-in helper exit $R5"
+  ${EndIf}
   bird_fixture_retry:
   IntOp $Tries $Tries + 1
   ${If} $Tries = 1

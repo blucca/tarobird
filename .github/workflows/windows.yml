@@ -34,7 +34,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: "Build the dialog fixture from the product's own .nsh files (as the product, -INPUTCHARSET UTF8)"
+      - name: "Build the fixtures (dialog from the product's .nsh files, link, B-3 pair; -INPUTCHARSET UTF8 as the product)"
         shell: pwsh
         run: |
           $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -42,13 +42,15 @@ jobs:
           if (-not $makensis) { $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe", "$env:ChocolateyInstall\bin\makensis.exe", (Get-Command makensis -ErrorAction SilentlyContinue).Source) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1 }
           if (-not $makensis) { throw "makensis not found after choco install" }
           & $makensis -VERSION
-          & $makensis -V2 -INPUTCHARSET UTF8 "-DSRC=$PWD\client\windows-electron" "-DOUT=$env:RUNNER_TEMP\dialog-fixture.exe" client/scripts/acceptance-probe/dialog-fixture.nsi
-          if ($LASTEXITCODE -ne 0) { throw "fixture build failed" }
-      - name: "Extension D pre-check: the dialog's separator as UTF-16 code units (en, zh) and the console transport"
+          foreach ($name in 'dialog-fixture', 'lnk-fixture', 'b3-old', 'b3-new') {
+            & $makensis -V2 -INPUTCHARSET UTF8 "-DSRC=$PWD\client\windows-electron" "-DOUT=$env:RUNNER_TEMP\$name.exe" "client/scripts/acceptance-probe/$name.nsi"
+            if ($LASTEXITCODE -ne 0) { throw "fixture $name failed" }
+          }
+      - name: "Round-2 pre-check: shortcut read, UTF-8 driver output, NSIS-only buttons and helper exits, B-3 driver"
         shell: pwsh
         run: |
-          node client/scripts/acceptance-probe/dialog-probe.mjs "$env:RUNNER_TEMP\dialog-fixture.exe" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\probe.log"
+          node client/scripts/acceptance-probe/fixes-probe.mjs 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\probe.log"
           $code = $LASTEXITCODE
-          $e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\client\scripts\windows-dialog-text-driver.ps1", [ref]$null, [ref]$e); "dialog driver parse (pwsh): $(if ($e) { $e } else { 'OK' })"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Extension D pre-check', '```', (Get-Content -Raw "$env:RUNNER_TEMP\probe.log").Trim(), '```')
+          foreach ($f in 'windows-install-ui-driver.ps1', 'windows-dialog-text-driver.ps1', 'windows-uninstall-ui-driver.ps1') { $e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\client\scripts\$f", [ref]$null, [ref]$e); "parse ${f}: $(if ($e) { $e } else { 'OK' })" }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Round-2 pre-check', '```', (Get-Content -Raw "$env:RUNNER_TEMP\probe.log").Trim(), '```')
           exit $code
