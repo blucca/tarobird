@@ -14,6 +14,7 @@ import { SCHEMES } from '../../electron/assets.mjs';
 import { ScreenService } from '../../electron/screen-service.mjs';
 import { ScreenCaptureHost, desktopSource } from '../../electron/screen-capture-host.mjs';
 import { screenServiceTicket } from '../../electron/screen-host-control.mjs';
+import { readHeldJournal } from '../../electron/screen-held-journal.mjs';
 
 const { app, BrowserWindow, ipcMain, protocol, screen } = electron;
 const arg = name => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : undefined; };
@@ -40,11 +41,13 @@ async function start() {
   // Read-only tap: every call is passed through unchanged; only the mouse call shape is recorded.
   addon = Object.create(real); addon.screenMouse = (...args) => { if (mouseCalls.length < 2000) mouseCalls.push({ at: Date.now(), action: args[0], button: args[1], x: args[2], y: args[3] }); return real.screenMouse(...args); };
   const display = screen.getPrimaryDisplay();
-  win = new BrowserWindow({ x: 0, y: 0, width: 500, height: 720, frame: false, resizable: false, show: false, alwaysOnTop: true, skipTaskbar: false,
+  // --no-activate: a window Windows never activates (WS_EX_NOACTIVATE via focusable:false); mouse input still arrives.
+  const noActivate = process.argv.includes('--no-activate');
+  win = new BrowserWindow({ x: 0, y: 0, width: 500, height: 720, frame: false, resizable: false, show: false, alwaysOnTop: true, skipTaskbar: noActivate, focusable: !noActivate,
     webPreferences: { nodeIntegration: true, contextIsolation: false, sandbox: false, spellcheck: false, backgroundThrottling: false } });
   ipcMain.on('seen', (_e, v) => { if (seen.length < 6000) seen.push({ at: Date.now(), ...v }); });
   const file = path.join(appState, 'test-window.html'); fs.writeFileSync(file, TEST);
-  await win.loadFile(file); win.setBounds({ x: 0, y: 0, width: 500, height: 720 }); win.show(); await sleep(800);
+  await win.loadFile(file); win.setBounds({ x: 0, y: 0, width: 500, height: 720 }); if (noActivate) win.showInactive(); else win.show(); await sleep(800);
   service = new ScreenService({ electron, addon, stateDir: appState, log: code => captureEvents.push({ log: String(code).slice(0, 80) }),
     hostControl: { ticket: id => screenServiceTicket(hostDir, id) },
     captureHost: hooks => new ScreenCaptureHost({ electron, root: path.join(assets, 'screen-capture'), preload: path.join(assets, 'screen-capture-preload.cjs'),
@@ -67,6 +70,7 @@ async function handle(cmd) {
     case 'start': return start();
     case 'info': return info();
     case 'seen': return { events: seen.slice(cmd.from ?? 0), count: seen.length };
+    case 'held': { const j = readHeldJournal(path.join(appState, 'screen-control.held.log')); return { journal: JSON.parse(JSON.stringify(j)), active: fs.existsSync(path.join(appState, 'screen-control.active')), focusedWindow: !!BrowserWindow.getFocusedWindow() }; }
     case 'mouse-calls': return { calls: mouseCalls.filter(c => c.at >= (cmd.since ?? 0)) };
     case 'diag': return { resolveCalls, captureEvents: captureEvents.slice(-40), status: { registered: service?.status().registered, phase: service?.status().phase } };
     case 'shutdown': { try { service?.dispose(); } catch {} setTimeout(() => app.exit(0), 50); return { ok: true }; }

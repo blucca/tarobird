@@ -12,7 +12,7 @@ on:
       scope:
         description: Acceptance scope
         type: choice
-        options: [fullchain]
+        options: [fullchain, drag]
         default: fullchain
 permissions:
   contents: read
@@ -85,5 +85,5 @@ jobs:
           node client/node_modules/electron/install.js
           if ($LASTEXITCODE -ne 0) { throw "Electron binary install failed" }
           $electron = (node -p "require('./client/node_modules/electron')").Trim()
-          node client/scripts/win48-fullchain/run.mjs --electron $electron --addon $env:TAROBOT_WIN_ADDON --report (Join-Path $env:RUNNER_TEMP "fc-report.noindex") --source-commit ${{ github.sha }}
+          node client/scripts/win48-fullchain/run.mjs --electron $electron --addon $env:TAROBOT_WIN_ADDON --report (Join-Path $env:RUNNER_TEMP "fc-report.noindex") --source-commit ${{ github.sha }} --only ${{ inputs.scope }}
           if ($LASTEXITCODE -ne 0) { throw "full chain reported failure; see log" }
