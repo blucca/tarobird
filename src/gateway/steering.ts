@@ -125,7 +125,10 @@ export function gatewaySteering(bridge: ReviewTargetBridge, runtime: CoreService
     if (isBotControl(p.text)) return { outcome: "rejected", reason: "control_forbidden" };
     const run = current(p.conversationId);
     if (!run || token(run) !== p.targetId || run.sourceMessageId !== p.sourceMessageId || reviewTurns.has(p.conversationId)) return { outcome: "rejected", reason: "stale" };
-    if (!await channel.canSteerConversation?.(p.conversationId)) return { outcome: "rejected", reason: "binding_changed" };
+    // A failure here happens before anything is written to the engine: a definite refusal.
+    let bound: boolean | undefined;
+    try { bound = await channel.canSteerConversation?.(p.conversationId); } catch { return { outcome: "rejected", reason: "not_ready" }; }
+    if (!bound) return { outcome: "rejected", reason: "binding_changed" };
     // A queued next turn must never inherit text meant for the run that just ended.
     const isCurrentTurn = () => current(p.conversationId) === run;
     if (!isCurrentTurn()) return { outcome: "rejected", reason: "stale" };
@@ -166,7 +169,8 @@ export function gatewaySteering(bridge: ReviewTargetBridge, runtime: CoreService
         result: reconcile ? { outcome: "rejected" as const, reason: "stale" as const } : await botSend(p as BotSteerCall) }));
       if (!receipt.ok) return { outcome: "unknown", reason: "uncertain", sourceMessageId: p.sourceMessageId };
       const stored = z.object({ conversationId: idSchema, targetId: idSchema, sourceMessageId: idSchema, result: steerResultSchema }).parse(receipt.result);
-      return stored.conversationId === p.conversationId && stored.targetId === p.targetId && stored.sourceMessageId === p.sourceMessageId ? stored.result : { outcome: "rejected", reason: "stale" };
+      // A journal entry for another conversation, run or source says nothing about this call: never a refusal.
+      return stored.conversationId === p.conversationId && stored.targetId === p.targetId && stored.sourceMessageId === p.sourceMessageId ? stored.result : { outcome: "unknown", reason: "uncertain", sourceMessageId: p.sourceMessageId };
     }
     if (method === "steer.status") {
       const { conversationId, backgroundReview } = steerStatusCallSchema.parse(raw);

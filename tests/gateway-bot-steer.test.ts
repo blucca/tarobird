@@ -172,6 +172,27 @@ describe("Gateway Bot-message steering (#62)", () => {
     expect(g.bridge.steerActiveTurn).toHaveBeenCalledTimes(1);
   });
 
+  it("R8: a Gateway failure before anything reaches the engine is a definite refusal", async () => {
+    const f = fixture(), request = await f.call({ requestId: "bm_prewrite" });
+    f.channel.canSteerConversation.mockRejectedValueOnce(new Error("hub_request_failed"));
+    expect(await f.run("botMessage.steer", request)).toEqual({ outcome: "rejected", reason: "not_ready" });
+    expect(f.bridge.steerActiveTurn).not.toHaveBeenCalled();
+    const epoch = (await f.status()).receiptEpoch!;
+    expect(await f.run("botMessage.steer.reconcile", { conversationId: request.conversationId, requestId: request.requestId, targetId: request.targetId, sourceMessageId: request.sourceMessageId, receiptEpoch: epoch })).toEqual({ outcome: "rejected", reason: "not_ready" });
+  });
+
+  it("R9: a journaled receipt for another conversation, run or source is unknown, never a refusal", async () => {
+    const f = fixture(), request = await f.call({ requestId: "bm_identity" });
+    expect(await f.run("botMessage.steer", request)).toEqual({ outcome: "accepted", sourceMessageId: "msg_turn" });
+    const epoch = (await f.status()).receiptEpoch!;
+    const base = { conversationId: request.conversationId, requestId: request.requestId, targetId: request.targetId, sourceMessageId: request.sourceMessageId, receiptEpoch: epoch };
+    for (const changed of [{ targetId: "run_other" }, { sourceMessageId: "msg_other" }, { conversationId: "gw_other" }]) {
+      expect(await f.run("botMessage.steer.reconcile", { ...base, ...changed })).toEqual({ outcome: "unknown", reason: "uncertain", sourceMessageId: (changed as { sourceMessageId?: string }).sourceMessageId ?? "msg_turn" });
+      expect(await f.run("botMessage.steer", { ...request, ...changed })).toEqual({ outcome: "unknown", reason: "uncertain", sourceMessageId: (changed as { sourceMessageId?: string }).sourceMessageId ?? "msg_turn" });
+    }
+    expect(f.bridge.steerActiveTurn).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps Bot steer receipts apart from owner steer receipts", async () => {
     const f = fixture(), request = await f.call();
     expect(await f.run("botMessage.steer", request)).toEqual({ outcome: "accepted", sourceMessageId: "msg_turn" });
