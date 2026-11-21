@@ -44,8 +44,6 @@ ManifestDPIAwareness PerMonitorV2
 ${StrCase}
 ${StrLoc}
 
-!include "installer-hooks.nsh"
-
 !define WEBVIEW2APPGUID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
 !define MANUFACTURER "tarocub"
@@ -81,6 +79,10 @@ ${StrLoc}
 !define UNINSTALLERSIGNCOMMAND "${TB_UNINSTALLER_SIGN}"
 !define ESTIMATEDSIZE "${TB_ESTIMATED_SIZE}"
 !define STARTMENUFOLDER ""
+
+; TaroBot: after the identity above. The hooks include the setup notes, whose
+; functions are compiled here and write ${VERSION} into every line.
+!include "installer-hooks.nsh"
 
 Var PassiveMode
 Var UpdateMode
