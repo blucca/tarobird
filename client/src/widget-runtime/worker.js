@@ -552,16 +552,27 @@ function networkApis(){
  return {fetch,XMLHttpRequest,WebSocket,EventSource};
 }
 // External <script src="https://..."> text is fetched under the same guard and
-// evaluated in the guest scope before inline scripts, in document order.
+// evaluated in the guest scope before inline scripts, in document order. Each
+// download, body included, must finish within 15 s, and all of them share a
+// 16 MiB budget counted while reading, so no server can grow this Worker's
+// memory without bound.
+const externalScriptBudget=16*1024*1024;
 async function externalScripts(sources){
- const texts=[];
+ const texts=[];let total=0;
  for(const src of sources){
+  const controller=new AbortController(),timer=later(()=>controller.abort(),15000);
   try{
-   const controller=new AbortController(),timer=later(()=>controller.abort(),15000);
-   const response=await nativeFetch(networkUrl(src,'https:'),{credentials:'omit',referrerPolicy:'no-referrer',signal:controller.signal}).finally(()=>cancel(timer));
+   const response=await nativeFetch(networkUrl(src,'https:'),{credentials:'omit',referrerPolicy:'no-referrer',signal:controller.signal});
    if(!response.ok)throw new Error(`HTTP ${response.status}`);
-   texts.push(await response.text());
+   const reader=response.body?.getReader(),decoder=new TextDecoder();let text='';
+   while(reader){
+    const {done,value}=await reader.read();if(done)break;
+    total+=value.byteLength;if(total>externalScriptBudget)throw new Error('external scripts exceed 16 MiB in total');
+    text+=decoder.decode(value,{stream:true});
+   }
+   texts.push(text+decoder.decode());
   }catch(cause){error(`External script ${String(src).slice(0,200)} did not load: ${cause?.message??cause}`)}
+  finally{cancel(timer);controller.abort()}
  }
  return texts;
 }

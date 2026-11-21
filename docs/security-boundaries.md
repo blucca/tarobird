@@ -895,9 +895,10 @@ endpoints.
 - Worker `fetch`/`XMLHttpRequest`/`EventSource` force `credentials: omit` and
   no referrer; URLs with credentials and hosts written as loopback, private,
   link-local, CGNAT, multicast or local names (`localhost`, `*.local`,
-  `*.internal`, `*.lan`, single labels) are refused. External script fetches
-  time out after 15 s; a failure leaves the static markup and reports a
-  widget warning.
+  `*.internal`, `*.lan`, single labels) are refused. Each external script
+  download, body included, must finish within 15 s, and all external scripts
+  of a widget share a 16 MiB total counted while reading; a failure aborts that
+  download, leaves the static markup and reports a widget warning.
 - The guest document and relay use `Referrer-Policy: no-referrer`; the sanitizer
   keeps only `<link rel="stylesheet">` and https media, SVG image and stylesheet
   URLs, never navigable links, and strips `autoplay`.

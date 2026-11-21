@@ -29,7 +29,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => { await rm(certDir, { recursive: true, force: true }); });
 
 async function origin() {
-  const seen: Seen[] = [], plain: string[] = [];
+  const seen: Seen[] = [], plain: string[] = [], streams: { path: string; started: number; closed?: number; bytes: number }[] = [];
   const pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
   const server: Server = createHttpsServer(tls, (req, res) => {
     const url = new URL(req.url!, `https://${HOST}`);
@@ -39,6 +39,15 @@ async function origin() {
     if (url.pathname === '/data.json') { res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Set-Cookie': 'tracker=1; SameSite=None; Secure; Path=/' }); res.end('{"ok":1}'); return; }
     if (url.pathname === '/events') { res.writeHead(200, { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' }); res.end('data: hello\n\n'); return; }
     if (url.pathname === '/lib.js') { res.writeHead(200, { ...cors, 'Content-Type': 'text/javascript' }); res.end('(function(g){g.NetLib={double:function(x){return x*2},hasDocument:typeof document==="object"&&typeof document.createElement==="function"}})(typeof globalThis!=="undefined"?globalThis:this);'); return; }
+    // A script body that never ends, streamed as fast as the client reads, and
+    // one that sends its headers and then nothing.
+    if (url.pathname === '/endless.js' || url.pathname === '/stalled.js') {
+      const stream = { path: url.pathname, started: Date.now(), bytes: 0 }; streams.push(stream);
+      res.writeHead(200, { ...cors, 'Content-Type': 'text/javascript' }); res.flushHeaders();
+      const chunk = Buffer.alloc(1 << 20, '/');
+      const pump = () => { while (url.pathname === '/endless.js' && !res.destroyed) { stream.bytes += chunk.length; if (!res.write(chunk)) { res.once('drain', pump); return; } } };
+      res.on('close', () => { stream.closed = Date.now(); }); pump(); return;
+    }
     if (url.pathname === '/not-js') { res.writeHead(200, { ...cors, 'Content-Type': 'text/html' }); res.end('<p>no</p>'); return; }
     if (url.pathname === '/style.css') { res.writeHead(200, { ...cors, 'Content-Type': 'text/css' }); res.end(`.styled{color:rgb(1,2,3)}@font-face{font-family:NetFont;src:url(https://${HOST}:${(server.address() as AddressInfo).port}/font.woff2)}.font{font-family:NetFont,sans-serif}`); return; }
     if (url.pathname === '/pixel.png') { res.writeHead(200, { ...cors, 'Content-Type': 'image/png' }); res.end(pixel); return; }
@@ -50,7 +59,7 @@ async function origin() {
   const insecure = createHttpServer((req, res) => { plain.push(req.url!); res.writeHead(200, { 'Access-Control-Allow-Origin': '*' }); res.end('plain'); });
   await new Promise<void>(resolve => insecure.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as AddressInfo).port, httpPort = (insecure.address() as AddressInfo).port;
-  return { seen, plain, base: `https://${HOST}:${port}`, ws: `wss://${HOST}:${port}`, port, httpPort, close: async () => { for (const client of sockets.clients) client.terminate(); sockets.close(); server.closeAllConnections(); insecure.closeAllConnections(); await new Promise(r => server.close(r)); await new Promise(r => insecure.close(r)); } };
+  return { seen, plain, streams, base: `https://${HOST}:${port}`, ws: `wss://${HOST}:${port}`, port, httpPort, close: async () => { for (const client of sockets.clients) client.terminate(); sockets.close(); server.closeAllConnections(); insecure.closeAllConnections(); await new Promise(r => server.close(r)); await new Promise(r => insecure.close(r)); } };
 }
 
 async function fixture(page: Page, html: string) {
@@ -118,3 +127,23 @@ test('https/wss resources and requests work while isolation holds', async ({ pag
   } finally { await f.dispose(); await o.close(); }
 });
 
+test('an external script that never ends or stalls after its headers is cut off while the widget keeps working', async ({ page }) => {
+  test.setTimeout(120_000);
+  const o = await origin();
+  const f = await fixture(page, `<p id="results">pending</p><script src="${o.base}/lib.js"></script><script src="${o.base}/endless.js"></script><script src="${o.base}/stalled.js"></script><script>document.getElementById('results').textContent=String(NetLib.double(21));</script>`);
+  try {
+    const started = Date.now();
+    await f.publish();
+    // Both downloads are abandoned (16 MiB shared budget, 15 s per download) and the inline script still runs.
+    await expect(guest(page).locator('#results')).toHaveText('42', { timeout: 40_000 });
+    await expect(page.getByText('组件未能完整运行', { exact: false }).first()).toBeVisible();
+    await expect.poll(() => o.streams.every(stream => stream.closed !== undefined), { timeout: 10_000 }).toBe(true);
+    const endless = o.streams.find(stream => stream.path === '/endless.js')!, stalled = o.streams.find(stream => stream.path === '/stalled.js')!;
+    expect(endless.bytes).toBeGreaterThan(16 << 20);
+    expect(endless.bytes).toBeLessThan(64 << 20);
+    expect(stalled.bytes).toBe(0);
+    expect(stalled.closed! - stalled.started).toBeGreaterThanOrEqual(14_000);
+    expect(stalled.closed! - stalled.started).toBeLessThan(30_000);
+    expect(Date.now() - started).toBeLessThan(60_000);
+  } finally { await f.dispose(); await o.close(); }
+});
