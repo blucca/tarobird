@@ -156,10 +156,10 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   // Desktop control: the picture carries the target's own pointer, so the local
   // one is hidden over the picture only (toolbar, menus and the letterbox keep
   // it). It returns the moment input stops: stale picture, control withdrawn,
-  // window blur (which releases control) or the end of the session. Verified
-  // for Mac targets (their captured frames show the pointer); a Windows target
-  // keeps the local pointer until that is confirmed for its capture.
-  const hideLocalPointer = !mobile && status?.desktop?.platform === "macos" && state.controlling && state.fresh;
+  // window blur (which releases control) or the end of the session. Both kinds
+  // of target capture their own pointer into the picture (Mac verified
+  // 2026-11-21; Windows 2026-11-22, the ordinary arrow in a captured frame).
+  const hideLocalPointer = !mobile && state.controlling && state.fresh;
   // Reasons name the computer last read for this Host: once a session ends its
   // desktop service may be gone (sleep, App quit), leaving no platform to read.
   if(status?.desktop?.platform)knownTarget.current={connection,platform:status.desktop.platform};

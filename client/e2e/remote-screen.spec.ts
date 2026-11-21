@@ -520,8 +520,12 @@ test("controlling a Mac hides the local pointer over the picture only and shows 
  await page.evaluate(()=>{(window as any).screenFixture.active=true;});await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled({timeout:4000});
  await start();await page.getByRole("button",{name:"断开",exact:true}).click();await expect(page.getByRole("button",{name:"连接屏幕",exact:true})).toBeVisible();expect(await cursor()).not.toBe("none");
 });
-test("a Windows target keeps the local pointer while controlling until its picture is known to show one",async({page})=>{
+test("controlling a Windows target hides the local pointer over the picture too, and only while controlling",async({page})=>{
  await page.goto(server.resolvedUrls!.local[0]+"e2e/fixtures/remote-screen.html?target=windows");await page.getByRole("button",{name:"连接屏幕",exact:true}).click();
+ const cursor=()=>page.locator(".screen-viewport canvas").evaluate(node=>getComputedStyle(node).cursor);
+ expect(await cursor()).not.toBe("none");   // viewing only
  await page.getByRole("button",{name:"开始控制",exact:true}).click();await expect(page.getByRole("button",{name:"停止控制",exact:true})).toBeVisible();
- expect(await page.locator(".screen-viewport canvas").evaluate(node=>getComputedStyle(node).cursor)).not.toBe("none");
+ await expect.poll(cursor).toBe("none");
+ await page.getByRole("button",{name:"停止控制",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeVisible();
+ expect(await cursor()).not.toBe("none");
 });
