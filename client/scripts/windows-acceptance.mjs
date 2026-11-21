@@ -41,7 +41,7 @@ const EXPORT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
  * before the upgrade, which a fresh disposable machine does not have. */
 export const SCOPES = Object.freeze({
   install: ['install/installer-exit', 'install/install-location', 'install/uninstall-key', 'install/host-runtime', 'install/deep-link',
-    'install/start-menu-shortcut', 'install/notification-receipt', 'install/notification-aumid', 'first-launch/app-running',
+    'install/start-menu-shortcut', 'install/notification-receipt', 'install/shortcut-appusermodel-id', 'install/notification-aumid', 'first-launch/app-running',
     'first-launch/profile-marker', 'first-launch/stop-own-processes', 'uninstall/uninstaller-exit', 'uninstall/program-removed',
     'uninstall/uninstall-key-removed', 'uninstall/deep-link-removed', 'uninstall/data-retained'],
   upgrade: ['legacy/installer-exit', 'legacy/tauri-layout', 'legacy/seed-login-item', 'legacy/legacy-webview2-profile', 'legacy/stop-own-processes',
@@ -188,15 +188,44 @@ async function verifyElectron(sys, report, phase, directory, version) {
   const startMenu = sys.env.APPDATA && path.win32.join(sys.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs');
   const shortcut = startMenu && [path.win32.join(startMenu, `${DISPLAY_NAME}.lnk`), path.win32.join(startMenu, PRODUCT, `${DISPLAY_NAME}.lnk`), path.win32.join(startMenu, `${PRODUCT}.lnk`), path.win32.join(startMenu, PRODUCT, `${PRODUCT}.lnk`)].find(sys.exists);
   let target = '';
-  if (shortcut) target = (await sys.powershell(`(New-Object -ComObject WScript.Shell).CreateShortcut('${shortcut.replaceAll("'", "''")}').TargetPath`)).stdout.trim();
+  // Shell.Application's ShellLinkObject reads the link through the Unicode
+  // shell; WScript.Shell's TargetPath turned CJK into "?" (run 44853329237).
+  if (shortcut) target = (await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${path.win32.dirname(shortcut).replaceAll("'", "''")}').ParseName('${path.win32.basename(shortcut).replaceAll("'", "''")}'); [string]$i.GetLink.Path`)).stdout.trim();
   report.expect(phase, 'start-menu-shortcut', !!shortcut && same(target, join(EXE)), `${shortcut ?? 'missing'} → ${target}`);
   // Written only after `tarocub-client.exe --register-notification-shortcut` succeeded.
   const receipt = join('tarocub-notification-shortcut.json');
   let receiptPath;
   try { receiptPath = JSON.parse(await sys.readFile(receipt)); } catch { /* reported below */ }
   report.expect(phase, 'notification-receipt', !!shortcut && typeof receiptPath === 'string' && same(receiptPath, shortcut), `${receipt} → ${receiptPath ?? 'missing'}`);
-  const apps = (await sys.powershell(`Get-StartApps | Where-Object { $_.AppID -eq '${AUMID}' } | ForEach-Object { $_.AppID }`)).stdout.trim();
-  report.expect(phase, 'notification-aumid', apps.split(/\r?\n/).includes(AUMID), apps || `no Start app with AppID ${AUMID}`);
+  // Two separate facts. The shortcut itself must carry the AppUserModelID the
+  // installer writes (utils.nsh SetLnkAppUserModelId): a wrong or missing value
+  // is a product defect. Start's app list is built asynchronously, so it is
+  // polled up to 60 s with every read recorded; a correct shortcut that Start
+  // still does not list is reported as environment pending (a skip), not a pass.
+  // Every call's exit code and stderr are kept, so a Get-StartApps that fails to
+  // load (for example from an inherited PSModulePath) is not read as "absent".
+  const q = value => value.replaceAll("'", "''");
+  const oneLine = text => String(text ?? '').trim().replaceAll(/\s+/g, ' ').slice(0, 300);
+  const property = shortcut ? await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${q(path.win32.dirname(shortcut))}').ParseName('${q(path.win32.basename(shortcut))}'); [string]$i.ExtendedProperty('System.AppUserModel.ID')`) : undefined;
+  const shortcutAppId = property ? property.stdout.trim() : '';
+  report.expect(phase, 'shortcut-appusermodel-id', !!shortcut && shortcutAppId === AUMID, shortcut ? `${shortcut}: System.AppUserModel.ID=${shortcutAppId || 'none'} (exit ${property.code}${oneLine(property.stderr) ? `; stderr: ${oneLine(property.stderr)}` : ''})` : 'no Start Menu shortcut');
+  const polls = [];
+  let listed = false, failedCalls = 0, lastError = '';
+  for (let waited = 0; ; waited += 5000) {
+    const call = await sys.powershell(`Get-StartApps | Where-Object { $_.AppID -eq '${AUMID}' -or $_.Name -like '*TaroBird*' } | ForEach-Object { "$($_.Name)=$($_.AppID)" }`);
+    const apps = call.stdout.trim(), error = oneLine(call.stderr);
+    listed = apps.split(/\r?\n/).some(line => line.endsWith(`=${AUMID}`));
+    if (call.code !== 0 || error) failedCalls += 1;
+    polls.push(`${waited / 1000}s:${listed ? 'listed' : 'absent'} exit ${call.code}${apps ? ` [${apps.replaceAll(/\r?\n/g, '; ')}]` : ''}${error && error !== lastError ? ` stderr: ${error}` : error ? ' stderr: (same)' : ''}`);
+    lastError = error || lastError;
+    if (listed || waited >= 60_000) break;
+    await sys.sleep(5000);
+  }
+  const trail = `polls ${polls.join(', ')}`;
+  if (listed) report.expect(phase, 'notification-aumid', true, trail);
+  else if (shortcutAppId === AUMID && failedCalls) report.add(phase, 'notification-aumid', 'skip', `Get-StartApps failed in ${failedCalls}/${polls.length} calls (exit code or stderr), so Start's list is unknown, not a pass; ${trail}`);
+  else if (shortcutAppId === AUMID) report.add(phase, 'notification-aumid', 'skip', `Start did not list ${AUMID} within 60 s although the shortcut carries it: index not shown (environment pending, not a pass); ${trail}`);
+  else report.expect(phase, 'notification-aumid', false, `no Start app with AppID ${AUMID}; the shortcut carries ${shortcutAppId || 'no AppID'}; ${trail}`);
 }
 
 /** Read-only by default: never register the production AUMID before App first
