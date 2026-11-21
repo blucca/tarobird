@@ -1,6 +1,13 @@
 # Native model quota visibility
 
-The owner can inspect model quotas in Settings or with `tarobird engines quota`.
+The owner can inspect model quotas with `tarobird engines quota`.
+
+The Settings › Model quotas page is not open yet: ordinary builds have no
+entry for it, never mount it and never read the Host's quota list. A client
+built with `VITE_TAROBIRD_ENGINE_QUOTA_UI=1` shows it again
+(`client/src/engine-quota-feature.ts`). Where this document describes that
+page, it describes such a build; the Host API and CLI are unchanged.
+
 This is separate from conversation token counts and estimated costs: those do
 not establish an account's remaining allowance.
 
@@ -23,9 +30,9 @@ even when a percentage is low.
 ## Official viewing guidance
 
 When a card has no current reading (unsupported, unknown, login required,
-unverifiable, stale or offline), Settings shows the engine's official viewing
-method from the snapshot's `help` code. `tarobird engines quota` keeps its JSON
-on standard output. In normal mode it also writes, on standard error, each such
+unverifiable, stale or offline), the Settings page (when enabled) shows the
+engine's official viewing method from the snapshot's `help` code.
+`tarobird engines quota` keeps its JSON on standard output. In normal mode it also writes, on standard error, each such
 Bot's status and reason in the App's exact Chinese/English wording, the refresh
 command for an active reader (with its cooldown), and the official guidance.
 With `--json` nothing is added to standard error. These lines are built only

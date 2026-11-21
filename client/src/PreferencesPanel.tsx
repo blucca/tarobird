@@ -4,6 +4,7 @@ import { useDialogDrag } from "./dialog-drag.js";
 import { useSceneMotion } from "./use-scene-motion.js";
 import { BackupSettings } from "./BackupSettings.js";
 import { EngineQuota } from "./EngineQuota.js";
+import { engineQuotaPageVisible, startingSettingsSection } from "./engine-quota-feature.js";
 import { EngineSettings } from "./EngineSettings.js";
 import { WidgetSettings } from "./WidgetSettings.js";
 import { GoogleDocsSettings } from "./GoogleDocsSettings.js";
@@ -113,12 +114,14 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   const dialog = useRef<HTMLDialogElement>(null), content = useRef<HTMLDivElement>(null), heading = useRef<HTMLHeadingElement>(null), header = useRef<HTMLElement>(null);
   useDialogDrag(dialog, header, true);
   const phone = useSyncExternalStore(subscribePhone, phoneLayout);
-  const [section, setSection] = useState<Section>(initialSection), [overview, setOverview] = useState(initialSection === "general");
+  // A request for a category this build hides (Model quotas) opens the default one.
+  const startSection: Section = startingSettingsSection(initialSection);
+  const [section, setSection] = useState<Section>(startSection), [overview, setOverview] = useState(startSection === "general");
   const [connectionOpen, setConnectionOpen] = useState(false);
   useSceneMotion(dialog, `${overview}:${section}`, phone, overview ? -1 : 1, overview ? ".settings-navigation" : ".settings-content");
   // A category opened directly (Devices from the phone home) is the first phone page:
   // its Back returns to where it was opened, not to categories never shown.
-  const [direct, setDirect] = useState(initialSection !== "general");
+  const [direct, setDirect] = useState(startSection !== "general");
   const [confirmationKey, setConfirmationKey] = useState(0);
   // `hosts`: the discard was requested by opening host management, which follows it.
   const [confirmation, setConfirmation] = useState<{ kind: "discard"; next?: "hosts" | "navigate" } | { kind: "forget" } | { kind: "revoke"; device: Device }>();
@@ -150,10 +153,12 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   const addButton = useRef<HTMLButtonElement>(null), stepHeading = useRef<HTMLHeadingElement>(null), deviceList = useRef<HTMLDivElement>(null), reveal = useRef(false);
   const locale = preferences.locale === "en" ? "en" : "zh-CN";
 
+  // Hidden by default (engine-quota-feature.ts): no entry, no page, no quota reads.
+  const quotaPage = engineQuotaPageVisible(state.user?.role);
   const sections = [
     { id: "general" as const, title: t("通用"), detail: t("语言、外观与个人头像"), icon: Settings2 },
     { id: "engines" as const, title: t("引擎程序"), detail: t("检测 CLI 与手动指定程序路径"), icon: Monitor },
-    ...(state.user?.role === "owner" ? [{ id: "quota" as const, title: t("模型额度"), detail: t("原生剩余额度与重置时间"), icon: Gauge }] : []),
+    ...(quotaPage ? [{ id: "quota" as const, title: t("模型额度"), detail: t("原生剩余额度与重置时间"), icon: Gauge }] : []),
     { id: "network" as const, title: t("网络与连接"), detail: t("连接线路、VPS 与主机组网"), icon: Globe },
     { id: "workbench" as const, title: t("工作台文件"), detail: t("集中管理白板、笔记与设计"), icon: FolderOpen },
     { id: "backups" as const, title: t("数据与备份"), detail: t("自动备份、保留天数与空间占用"), icon: Database },
@@ -162,7 +167,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
     { id: "devices" as const, title: t("设备与安全"), detail: t("查看设备、修改名称与撤销授权"), icon: ShieldCheck },
     { id: "botMessages" as const, title: t("Bot 消息授权"), detail: t("管理本机与跨主机 Bot 的直接消息权限"), icon: Link },
   ];
-  useEffect(() => { if (section === "quota" && state.user?.role !== "owner") { setSection("general"); setOverview(true); } }, [section, state.user?.role]);
+  useEffect(() => { if (section === "quota" && !quotaPage) { setSection("general"); setOverview(true); } }, [section, quotaPage]);
   const requestClose = () => {
     if (settingsBusy || busy) return;
     if (dirty) { setConfirmation({ kind: "discard" }); return; }
@@ -428,7 +433,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
           <details className="network-settings-help"><summary>{t("第一次连接，应该从哪里开始？")}</summary><p>{t("新手机或电脑：点击「添加设备」展示二维码，让新设备扫码，再输入新设备上的 8 位配对码确认。")}</p><p>{t("外出时需要访问主机：到「连接状态与线路」配置可用的 VPS 中转或 Tailscale。填写地址不会自动部署服务器和隧道。")}</p></details>
         </section>
         <section hidden={section !== "engines"} aria-label={t("引擎程序")}><h3>{t("引擎程序")}</h3><EngineSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "engines" && (!phone || !overview)} onDirty={setEngineDirty} onBusy={setEngineBusy}/></section>
-        {state.user?.role === "owner" && <section hidden={section !== "quota"} aria-label={t("模型额度")}><h3>{t("模型额度")}</h3><EngineQuota key={connection.identity.hubPublicKey} connection={connection} active={section === "quota" && (!phone || !overview)}/></section>}
+        {quotaPage && <section hidden={section !== "quota"} aria-label={t("模型额度")}><h3>{t("模型额度")}</h3><EngineQuota key={connection.identity.hubPublicKey} connection={connection} active={section === "quota" && (!phone || !overview)}/></section>}
         <section hidden={section !== "workbench"} aria-label={t("工作台文件")}><h3>{t("工作台文件")}</h3><WorkbenchLibrary connection={connection} active={section === "workbench" && (!phone || !overview)} onBusy={setLibraryBusy} onOpened={close} openLocalFile={openWorkbenchFile}/></section>
         <section hidden={section !== "backups"} aria-label={t("数据与备份")}><h3>{t("数据与备份")}</h3><BackupSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "backups" && (!phone || !overview)} onDirty={setBackupDirty} onBusy={setBackupBusy}/></section>
         <section hidden={section !== "voice"} aria-label={t("语音转写")}><h3>{t("语音转写")}</h3><VoiceSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "voice" && (!phone || !overview)} onDirty={setVoiceDirty} onBusy={setVoiceBusy}/></section>
