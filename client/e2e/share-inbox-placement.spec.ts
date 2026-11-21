@@ -35,13 +35,8 @@ async function bootstrap(page: Page) {
         w.__share.calls.push(`${plugin}.${method}`);
         if (plugin !== "TaroCubShareInbox") throw new Error(`unexpected_native:${plugin}.${method}`);
         if (method === "list") {
-          // unsupported: an iOS build without the App Group; unimplemented: no
-          // native plugin in the build; broken: any other read failure.
-          const mode = w.__share.mode;
-          if (mode === "unsupported") throw new Error("share_app_group_unavailable");
-          if (mode === "unimplemented") throw Object.assign(new Error('"TaroCubShareInbox" plugin is not implemented on ios'), { code: "UNIMPLEMENTED" });
-          if (mode === "broken") throw new Error("share_operation_failed");
-          return { items: mode === "one" ? [structuredClone(item)] : [] };
+          if (w.__share.mode === "error") throw new Error("share_app_group_unavailable");
+          return { items: w.__share.mode === "one" ? [structuredClone(item)] : [] };
         }
         if (method === "pushTokenSnapshot") return { revision: 0 };
         return {};
@@ -234,13 +229,10 @@ for (const [label, platform, width, height, insets, keyboardHeight] of [
   await context.close();
 });
 
-const listCalls = (page: Page) => page.evaluate(() => (window as any).__share.calls.filter((c: string) => c.endsWith(".list")).length);
-async function polls(page: Page, count: number) { const start = await listCalls(page); await expect.poll(() => listCalls(page), { timeout: 15_000 }).toBeGreaterThanOrEqual(start + count); }
-
-test("a package that cannot receive shares, or an empty inbox, shows no entry; pending shares still show the read error", async ({ browser }) => {
+test("an empty or unreadable inbox shows no entry; pending shares still show the read error", async ({ browser }) => {
   const context = await browser.newContext({ viewport: { width: 430, height: 932 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true, locale: "zh-CN" });
   await withHub(await context.newPage(), async page => {
-    await page.evaluate(() => { (window as any).__share.mode = "unsupported"; });
+    await page.evaluate(() => { (window as any).__share.mode = "error"; });
     await goNative(page, "ios", IPHONE_PORTRAIT);
     await nav(page).getByRole("button", { name: /^Bot/ }).click(); await nav(page).getByRole("button", { name: /^消息/ }).click();
     // Several 2.5 s polls fail; no "(0)" entry ever appears, at home or in the chat.
@@ -250,9 +242,6 @@ test("a package that cannot receive shares, or an empty inbox, shows no entry; p
     if (shots) { await settle(page); await page.screenshot({ path: path.join(shots, "iphone-portrait-error-empty.png") }); }
     await openChat(page, true);
     await expect(page.locator(".share-inbox-button")).toHaveCount(0);
-    // A build without the native plugin is equally unable to receive shares.
-    await page.evaluate(() => { (window as any).__share.mode = "unimplemented"; }); await polls(page, 2);
-    await expect(page.locator(".share-inbox-button")).toHaveCount(0);
     await page.evaluate(() => { (window as any).__share.mode = "none"; });
     const before = await page.evaluate(() => (window as any).__share.calls.length);
     await expect.poll(() => page.evaluate(() => (window as any).__share.calls.length), { timeout: 10_000 }).toBeGreaterThan(before);
@@ -261,61 +250,13 @@ test("a package that cannot receive shares, or an empty inbox, shows no entry; p
     await page.evaluate(() => { (window as any).__share.mode = "one"; });
     await expect(entry(page)).toBeVisible({ timeout: 10_000 });
     // A later read failure keeps the pending item and explains itself in the dialog.
-    await page.evaluate(() => { (window as any).__share.mode = "unsupported"; });
+    await page.evaluate(() => { (window as any).__share.mode = "error"; });
     await entry(page).click();
     const dialog = page.getByRole("dialog", { name: "收到的分享", exact: true });
     await expect(dialog.getByRole("alert").filter({ hasText: "share_app_group_unavailable" })).toBeVisible({ timeout: 10_000 });
     await expect(dialog).toContainText("来自系统分享的草稿");
     await dialog.getByRole("button", { name: "关闭", exact: true }).click();
     await expect(entry(page)).toBeVisible();
-  });
-  await context.close();
-});
-
-const readError = (page: Page) => page.getByRole("button", { name: "分享内容暂时读取不了", exact: true });
-for (const [label, platform, width, height, insets] of [
-  ["iphone-portrait", "ios", 430, 932, IPHONE_PORTRAIT],
-  ["android-portrait", "android", 412, 846, NONE],
-] as const) test(`an unreadable inbox with nothing pending explains itself in the same row and recovers: ${label}`, async ({ browser }) => {
-  const context = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: 3, isMobile: true, hasTouch: true, locale: "zh-CN" });
-  await withHub(await context.newPage(), async page => {
-    await page.evaluate(() => { (window as any).__share.mode = "broken"; });
-    await goNative(page, platform, insets);
-    await nav(page).getByRole("button", { name: /^Bot/ }).click();
-    await expect(readError(page)).toBeVisible();
-    await expect(page.getByText(/待发送分享/)).toHaveCount(0);
-    for (const tab of ["消息", "Bot", "我的"]) {
-      await nav(page).getByRole("button", { name: new RegExp(`^${tab}`) }).click();
-      expectClear(`${label} read error ${tab}`, await record(page, `${label}-read-error-${tab}`));
-    }
-    await openChat(page, true);
-    await expect(readError(page)).toBeVisible();
-    expectClear(`${label} read error chat`, await record(page, `${label}-read-error-chat`));
-    // The dialog explains in plain words; the raw code is secondary, with a retry.
-    await readError(page).click();
-    const dialog = page.getByRole("dialog", { name: "收到的分享", exact: true });
-    const alert = dialog.getByRole("alert");
-    await expect(alert).toHaveText("暂时读取不了收到的分享，请重试。");
-    await expect(dialog.locator(".share-inbox-error-code")).toHaveText("错误代码：share_operation_failed");
-    await expect(dialog.getByText("待发送分享")).toHaveCount(0);
-    if (shots) { await settle(page); await page.screenshot({ path: path.join(shots, `${label}-read-error-dialog.png`) }); }
-    await dialog.getByRole("button", { name: "重试", exact: true }).click();
-    await expect(dialog.getByRole("status")).toHaveText("仍然读取不了，请稍后再试。");
-    await expect(dialog.getByRole("button", { name: "重试", exact: true })).toBeEnabled();
-    // Recovery with nothing pending: the dialog and the row disappear.
-    await page.evaluate(() => { (window as any).__share.mode = "none"; });
-    await dialog.getByRole("button", { name: "重试", exact: true }).click();
-    await expect(dialog).toHaveCount(0); await expect(page.locator(".share-inbox-button")).toHaveCount(0);
-    // A new failure brings the row back on the next poll; a recovered read with a
-    // pending share turns it into the normal entry.
-    await page.evaluate(() => { (window as any).__share.mode = "broken"; });
-    await expect(readError(page)).toBeVisible({ timeout: 10_000 });
-    await page.evaluate(() => { (window as any).__share.mode = "one"; });
-    await expect(entry(page)).toBeVisible({ timeout: 10_000 }); await expect(readError(page)).toHaveCount(0);
-    expectClear(`${label} recovered chat`, await record(page, `${label}-read-error-recovered-chat`));
-    await entry(page).click();
-    await expect(dialog).toContainText("来自系统分享的草稿"); await expect(dialog.locator(".share-inbox-error-code")).toHaveCount(0);
-    await dialog.getByRole("button", { name: "关闭", exact: true }).click();
   });
   await context.close();
 });

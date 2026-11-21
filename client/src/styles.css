@@ -56,8 +56,6 @@
 /* `.mobile-home button` resets margins; beside a sidebar the column starts away from the screen edge. */
 .mobile-home .share-inbox-button{margin:6px max(12px,var(--app-safe-right)) 6px max(12px,var(--app-safe-left))}
 @media (min-width:761px){.app-shell:has(>.sidebar)>.conversation-main>.share-inbox-button{width:calc(100% - 16px - max(12px,var(--app-safe-right)));margin-left:16px}}
-/* The inbox could not be read and nothing is known to be pending. */
-.share-inbox-button.is-error{border-color:var(--orange);background:var(--orange-soft);color:var(--orange)}.share-inbox-error-code{font-size:12px;overflow-wrap:anywhere}
 /* While typing, the row would only shrink the visible chat; it returns with the keyboard. */
 html[data-keyboard-open="true"] .share-inbox-button:not([data-reviewing]){display:none}
 .share-draft{padding:18px 0;border-bottom:1px solid var(--border)}.share-draft label{display:flex;flex-direction:column;gap:8px;margin:10px 0}.share-draft li{overflow-wrap:anywhere}.share-draft .quick-actions{margin-top:12px}

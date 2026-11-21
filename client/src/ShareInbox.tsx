@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { Check, ChevronRight, CircleAlert, Inbox } from "lucide-react";
+import { Check, ChevronRight, Inbox } from "lucide-react";
 import { useBackAction } from "./back-navigation.js";
 import type { Conversation } from "../../src/client-protocol/index.js";
 import type { HubConnection } from "./connection.js";
@@ -20,7 +20,7 @@ function targetTitle(conversations: Conversation[], target: Conversation): strin
   const parent = target.parentId ? conversations.find((c) => c.id === target.parentId) : undefined;
   return `${parent ? `${parent.title} / ` : ""}${target.title}${archivedReason(conversations, target) ? ` · ${t("已归档")}` : ""}`;
 }
-function ShareDraft({ item, connection, conversations, refresh, native }: { item: SharedItem; connection: HubConnection; conversations: Conversation[]; refresh: () => Promise<unknown>; native: ShareBridge }) {
+function ShareDraft({ item, connection, conversations, refresh, native }: { item: SharedItem; connection: HubConnection; conversations: Conversation[]; refresh: () => Promise<void>; native: ShareBridge }) {
   const labels = useBotLabels();
   const saved = useShareDraft(item.id, item.text, connection.cache, connection.identity, item.createdAt);
   const { text, recipient, mentions } = saved.draft;
@@ -84,25 +84,14 @@ function ShareDraft({ item, connection, conversations, refresh, native }: { item
       <button className="primary" disabled={busy || foreign || !!item.error || !!blocked || unavailableBots || !target || (!pinned && (!saved.ready || saved.retired || !!saved.error || !!group && !chosen.length)) || (!shownText.trim() && !item.files.length) || (item.files.length > 0 && connection.state.status !== "online")} onClick={() => { void send(); }}>{busy ? recovering ? t("连接中断，等待恢复…") : t("上传 {0}%", Math.round(progress * 100)) : t("发送分享")}</button></div>
   </article>;
 }
-/** The installed package cannot receive system shares at all: an iOS build signed
- * without the App Group, or a build without the native plugin. Nothing can
- * arrive, so there is nothing to explain or retry. Android has no such state. */
-function shareUnsupported(e: unknown): boolean {
-  return (e as { code?: unknown } | null)?.code === "UNIMPLEMENTED" || /share_app_group_unavailable/.test(String(e));
-}
 type ShareInboxProps = { connection: HubConnection; conversations: Conversation[]; active?: boolean; enabled?: boolean; hosts?: { hubKey: string; deviceId: string; name: string; open: (conversationId: string) => void }[]; native?: ShareBridge };
 /** Polling and review stay here; the caller places `entry` in an in-flow notice
  * slot (never a floating layer over headers, lists or the composer). */
 export function useShareInbox({ connection, conversations, active = true, enabled = true, hosts = [], native: bridge = supportsShareInbox() ? shareInbox : undefined }: ShareInboxProps): { entry: ReactNode; dialog: ReactNode } {
   const native = enabled ? bridge : undefined;
   useLocale(); const [items, setItems] = useState<SharedItem[]>([]); const [open, setOpen] = useState(false); const [error, setError] = useState("");
-  const [unsupported, setUnsupported] = useState(false); const [retry, setRetry] = useState<"idle" | "busy" | "failed">("idle");
-  // Nothing known to be pending but the inbox cannot be read: say so in the same
-  // row instead of hiding shares that may be waiting (e.g. one unreadable item).
-  const failed = !items.length && !!error && !unsupported;
-  const shown = !!native && (!!items.length || failed);
   const panel = useRef<HTMLElement>(null), trigger = useRef<HTMLButtonElement>(null);
-  const visible = open && active && shown;
+  const visible = open && active && !!native && !!items.length;
   useLayoutEffect(() => {
     if (!visible) return;
     const node = panel.current; node?.focus({ preventScroll: true });
@@ -120,19 +109,18 @@ export function useShareInbox({ connection, conversations, active = true, enable
     return () => { document.removeEventListener("keydown", key); if (node?.contains(document.activeElement) || document.activeElement === document.body) trigger.current?.focus({ preventScroll: true }); };
   }, [visible]);
   useEffect(() => { if (!active) setOpen(false); }, [active]);
-  // Nothing left to review or explain: a later share must not reopen a stale dialog.
-  useEffect(() => { if (!shown) setOpen(false); }, [shown]);
+  // Nothing left to review: a later share must not reopen a stale dialog.
+  useEffect(() => { if (!items.length) setOpen(false); }, [items.length]);
   // Polls, focus and post-send refreshes overlap. Apply results in request order so a slow older
   // list cannot resurrect a removed share; never wait for "the latest" request, or slow polls starve.
   const requested = useRef(0), applied = useRef(0), mounted = useRef(true);
   const previousItems = useRef<string[]>([]), listed = useRef(""), pruned = useRef(0);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useBackAction(panel, () => setOpen(false));
-  /** Resolves whether this read succeeded, or undefined when a newer read already applied. */
-  async function refresh(): Promise<boolean | undefined> {
+  async function refresh() {
     if (!native) return; const request = ++requested.current;
-    let next: SharedItem[] | undefined, failure = "", cannotShare = false;
-    try { next = (await native.list()).items.map((item) => sharedItemSchema.parse(item)); } catch (e) { failure = String(e); cannotShare = shareUnsupported(e); }
+    let next: SharedItem[] | undefined, failure = "";
+    try { next = (await native.list()).items.map((item) => sharedItemSchema.parse(item)); } catch (e) { failure = String(e); }
     if (!mounted.current || request < applied.current) return; applied.current = request;
     if (next) {
       const removed = previousItems.current.filter(id => !next!.some(item => item.id === id)); previousItems.current = next.map(item => item.id);
@@ -141,14 +129,12 @@ export function useShareInbox({ connection, conversations, active = true, enable
       if (removed.length || Date.now() - pruned.current > 60_000) { pruned.current = Date.now(); void connection.cache.pruneExpiredShareDrafts(connection.identity).catch(() => undefined); }
       const signature = JSON.stringify(next);
       if (signature !== listed.current) { listed.current = signature; setItems(next); }
-      setError(""); setUnsupported(false);
+      setError("");
       // Another host/window can finish the shared native item. Retire this
       // pairing's old editor too; a delayed save cannot restore its content.
       for (const id of removed) void connection.cache.retireShareDraft(id, connection.identity).catch(() => undefined);
-    } else { setError(failure); setUnsupported(cannotShare); }
-    return !!next;
+    } else setError(failure);
   }
-  async function retryRead() { setRetry("busy"); const ok = await refresh(); if (mounted.current) setRetry(ok === false ? "failed" : "idle"); }
   useEffect(() => {
     // Only the visible host workspace polls; a hidden host reads again on activation.
     if (!native || !active) return;
@@ -158,13 +144,12 @@ export function useShareInbox({ connection, conversations, active = true, enable
     window.addEventListener("focus", focus); document.addEventListener("visibilitychange", focus);
     return () => { clearInterval(interval); window.removeEventListener("focus", focus); document.removeEventListener("visibilitychange", focus); };
   }, [connection, native, active]);
-  // Never a "(0)" entry: an empty inbox shows nothing, and so does a package
-  // that cannot receive shares. Other read failures show the error row; with
-  // pending items the review dialog still shows the error.
-  if (!shown) return { entry: null, dialog: null };
-  const entry = <button ref={trigger} type="button" className={`share-inbox-button${failed ? " is-error" : ""}`} aria-haspopup="dialog" data-reviewing={open || undefined} onClick={() => { setRetry("idle"); setOpen(true); }}>{failed ? <CircleAlert size={17} aria-hidden="true"/> : <Inbox size={17} aria-hidden="true"/>}<span>{failed ? t("分享内容暂时读取不了") : t("待发送分享 ({0})", items.length)}</span><ChevronRight size={16} aria-hidden="true"/></button>;
-  return { entry, dialog: <div className="modal-scrim" hidden={!open} style={open ? undefined : { display: "none" }}><section ref={panel} tabIndex={-1} className="settings-panel" role="dialog" aria-modal="true" aria-label={t("收到的分享")}><header><h2>{t("收到的分享")}</h2><button onClick={() => setOpen(false)}>{t("关闭")}</button></header><HostLocation/>{failed ? <div className="share-inbox-failure"><p role="alert">{t("暂时读取不了收到的分享，请重试。")}</p><p className="muted share-inbox-error-code">{t("错误代码：{0}", error.replace(/^Error:\s*/, ""))}</p>{retry === "failed" && <p role="status">{t("仍然读取不了，请稍后再试。")}</p>}<div className="quick-actions"><button className="primary" disabled={retry === "busy"} onClick={() => { void retryRead(); }}>{retry === "busy" ? t("正在重试…") : t("重试")}</button></div></div>
-    : <><p className="muted">{t("确认会话和内容后发送。本机副本保留 24 小时。")}</p>{error && <p role="alert">{error}</p>}</>}{items.map((item) => {
+  // A read failure with nothing pending offers no action (the Share extension
+  // reports its own storage failure while sharing): show no "(0)" entry. With
+  // pending items the dialog still shows the error.
+  if (!native || !items.length) return { entry: null, dialog: null };
+  const entry = <button ref={trigger} type="button" className="share-inbox-button" aria-haspopup="dialog" data-reviewing={open || undefined} onClick={() => setOpen(true)}><Inbox size={17} aria-hidden="true"/><span>{t("待发送分享 ({0})", items.length)}</span><ChevronRight size={16} aria-hidden="true"/></button>;
+  return { entry, dialog: <div className="modal-scrim" hidden={!open} style={open ? undefined : { display: "none" }}><section ref={panel} tabIndex={-1} className="settings-panel" role="dialog" aria-modal="true" aria-label={t("收到的分享")}><header><h2>{t("收到的分享")}</h2><button onClick={() => setOpen(false)}>{t("关闭")}</button></header><HostLocation/><p className="muted">{t("确认会话和内容后发送。本机副本保留 24 小时。")}</p>{error && <p role="alert">{error}</p>}{items.map((item) => {
     const owner = item.delivery && hosts.find((host) => host.hubKey === item.delivery!.hubKey && host.deviceId === item.delivery!.deviceId);
     return owner && (owner.hubKey !== connection.identity.hubPublicKey || owner.deviceId !== connection.identity.deviceId) ? <article className="share-draft" key={item.id}><p>{t("这条分享已指定发送到 {0}。内容和附件仍然保留。", owner.name)}</p><button onClick={() => { setOpen(false); owner.open(item.delivery!.conversationId); }}>{t("切换到 {0}", owner.name)}</button></article> : <ShareDraft key={JSON.stringify([connection.cache.databaseName, connection.identity.hubPublicKey, connection.identity.deviceId, connection.identity.publicKey, item.id])} item={item} connection={connection} conversations={conversations} refresh={refresh} native={native}/>;
   })}</section></div> };
