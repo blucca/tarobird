@@ -19,8 +19,8 @@
 .row-source-meta { display: flex; flex: 0 1 auto; align-items: center; justify-content: flex-end; gap: 5px; min-width: 0; max-width: 42%; margin-left: auto; }
 /* Nested chats inherit the host label from their Bot; no badge means no slot. */
 .row-source-meta:empty { display: none; }
-.conversation-row .inbox-row-meta:has(> .host-source-badge) { flex: 0 1 auto; min-width: 0; max-width: 38%; }
-.conversation-row .inbox-row-meta > .host-source-badge { max-width: min(7em, 100%); }
+/* Inbox rows end the preview line with the host; the preview keeps at least 60%. */
+.conversation-row .inbox-row-detail > .host-source-badge { flex: none; max-width: min(7em, 40%); }
 :root[data-palette=cli] .conversation-row.selected .host-source-badge { color: var(--cli-rev-fg); }
 .bot-tree-heading > .host-source-badge { flex-shrink: 1; max-width: 34%; }
 .conversation-header > .host-source-badge.header-host-source { display: inline-flex; flex: 0 1 auto; max-width: min(22%, 14em); margin: 0 2px 0 auto; font-size: 11px; }

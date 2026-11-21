@@ -8,6 +8,7 @@ import path from "node:path";
 import { HOST_PROFILE_KEY } from "../../src/hub/host-profile.js";
 import { ConversationFolders } from "../../src/hub/conversation-folders.js";
 import { HubServer } from "../../src/hub/server.js";
+import type { Block } from "../../src/client-protocol/index.js";
 import { clickAppAction } from "./fixtures/desktop-actions.js";
 import { openMobileHome, openMobileSearch } from "./fixtures/mobile.js";
 
@@ -636,5 +637,132 @@ test('host grouping defaults off, removes redundant badges and preserves same-ID
     await page.reload(); await expectListOption(page, '按主机分组', false);
     await expect(sidebar(page).locator('.host-heading')).toHaveCount(0);
     await expect(sidebar(page).locator('.conversation-row')).toHaveCount(2);
+  } finally { await page.close(); await a.close(); await b.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+// Reads every inbox row in one frame. "visible" counts the title characters a
+// reader sees before the ellipsis; "label" is the painted part of the Bot name.
+const inboxGeometry = (page: Page, scope = sidebar(page)) => scope.locator('.conversation-inbox .conversation-row').evaluateAll(rows => rows.map(row => {
+  const title = row.querySelector<HTMLElement>('.inbox-row-title>strong')!, line = row.querySelector('.inbox-row-title')!.getBoundingClientRect();
+  const box = title.getBoundingClientRect(), text = title.textContent ?? '', truncated = title.scrollWidth > title.clientWidth;
+  const style = getComputedStyle(title), probe = document.createElement('canvas').getContext('2d')!;
+  probe.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+  let visible = text.length;
+  if (truncated) {
+    const limit = box.right - probe.measureText('…').width + 0.5;
+    visible = [...text].findIndex((_, index) => { const range = document.createRange(); range.setStart(title.firstChild!, index); range.setEnd(title.firstChild!, index + 1); return range.getBoundingClientRect().right > limit; });
+  }
+  const bot = row.querySelector<HTMLElement>('.inbox-row-bot'), clip = bot?.getClientRects().length ? bot.getBoundingClientRect() : undefined;
+  const painted = (selector: string) => { const node = row.querySelector<HTMLElement>(selector); if (!clip || !node?.getClientRects().length) return 0; const rect = node.getBoundingClientRect(); return Math.max(0, Math.min(rect.right, clip.right) - Math.max(rect.left, clip.left)); };
+  const label = row.querySelector<HTMLElement>('.inbox-row-bot .bot-name-label'), badge = row.querySelector('.host-source-badge')?.getBoundingClientRect();
+  const pin = row.querySelector('.inbox-row-title>.lucide-pin')?.getBoundingClientRect();
+  return { title: text, visible, truncated, label: painted('.inbox-row-bot .bot-name-label'), labelFull: label?.scrollWidth ?? 0, icon: painted('.inbox-row-bot .bot-brand-icon'),
+    gap: clip && clip.width ? clip.left - box.right : undefined, line: { top: line.top, bottom: line.bottom, right: line.right },
+    badge: badge && { top: badge.top, right: badge.right }, pin: pin && { right: pin.right, width: pin.width },
+    overflow: row.scrollWidth > row.clientWidth + 1 || row.querySelector('.inbox-row-title')!.scrollWidth > row.querySelector('.inbox-row-title')!.clientWidth + 1 };
+}));
+type InboxGeometry = Awaited<ReturnType<typeof inboxGeometry>>[number];
+function expectTitleFirst(row: InboxGeometry, where: string) {
+  const at = `${where} ${JSON.stringify(row)}`;
+  // While the title is cut, no Bot-name text may hold space on its line.
+  if (row.truncated) expect(row.label, at).toBeLessThanOrEqual(0.5);
+  // An engine icon is either whole or absent, never a clipped sliver.
+  expect([0, 12], at).toContain(Math.round(row.icon));
+  // The host label sits on the preview line and leaves the title line whole.
+  if (row.badge) { expect(row.badge.top, at).toBeGreaterThanOrEqual(row.line.bottom - 1); expect(row.line.right, at).toBeGreaterThanOrEqual(row.badge.right - 1); }
+  if (row.pin) { expect(row.pin.width, at).toBeGreaterThan(0); expect(row.pin.right, at).toBeLessThanOrEqual(row.line.right + 0.5); }
+  expect(row.overflow, at).toBe(false);
+}
+
+test('inbox titles keep their width ahead of Bot names and host labels at every sidebar width', async ({ page }, info) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'sidebar-inbox-titles-'));
+  const a = await HubServer.start({ stateDir: path.join(root, 'a'), clientDir: path.resolve('dist') });
+  const b = await HubServer.start({ stateDir: path.join(root, 'b'), origins: [a.url] });
+  try {
+    await a.store.db.run("INSERT INTO bots(id,name,secret_hash,online,engine) VALUES('kimi','KIMI 研究助手','fixture',1,'kimi')");
+    await a.store.db.run("INSERT INTO bots(id,name,secret_hash,online) VALUES('plain','资料整理员','fixture',1)");
+    await b.store.db.run("INSERT INTO bots(id,name,secret_hash,online,engine) VALUES('gem','Gemini 助手','fixture',1,'antigravity')");
+    const group = await a.store.createConversation('owner', ['kimi', 'plain'], '产品与研发联合周会讨论组', 'group', { type: 'group' });
+    const pinned = await a.store.createConversation('owner', ['plain'], '供应链风险排查与周报汇总', 'pinned');
+    const english = await a.store.createConversation('owner', ['kimi'], 'Quarterly budget review and planning', 'english');
+    const short = await a.store.createConversation('owner', ['kimi'], '演讲', 'short');
+    const long = await a.store.createConversation('owner', ['kimi'], '季度经营复盘与预算调整会', 'long');
+    const other = await b.store.createConversation('owner', ['gem'], '跨主机同步的设计评审记录', 'other');
+    for (const [hub, bot, chat] of [[a, 'kimi', group], [a, 'plain', pinned], [a, 'kimi', english], [a, 'kimi', short], [b, 'gem', other], [a, 'kimi', long]] as const)
+      await hub.store.publishBotMessage(bot, { conversationId: chat.id, blocks: [{ type: 'text', text: `${chat.title} 的最新进展` }], status: 'complete' });
+    await pair(page, a, '项目工作室的 Mac mini'); await pair(page, b, '主机 B', true);
+    await mode(page, '按对话').click();
+    await sidebar(page).locator(`[data-conversation-id="${pinned.id}"]`).click({ button: 'right' });
+    await page.getByRole('menu', { name: '对话操作', exact: true }).getByRole('menuitem', { name: '分组置顶', exact: true }).click();
+    await sidebar(page).locator(`[data-conversation-id="${short.id}"]`).click();
+    await a.store.publishBotMessage('kimi', { conversationId: long.id, blocks: [{ type: 'text', text: '新的回复' }], status: 'complete' });
+    await expect(sidebar(page).locator(`[data-conversation-id="${long.id}"] .unread-badge`)).toBeVisible();
+    await expect(sidebar(page).locator('.conversation-inbox .host-source-badge')).toHaveCount(6);
+    const width = (value: number) => page.evaluate(value => document.documentElement.style.setProperty('--desktop-sidebar-width', `${value}px`), value);
+    const titled = (rows: InboxGeometry[], title: string) => rows.find(row => row.title === title)!;
+    for (const palette of ['default', 'cli', 'white-teal']) {
+      await page.evaluate(palette => { if (palette === 'default') delete document.documentElement.dataset.palette; else document.documentElement.dataset.palette = palette; }, palette);
+      for (const size of [480, 360, 288, 272, 240, 200]) {
+        await width(size);
+        await expect(sidebar(page)).toHaveCSS('width', `${size}px`);
+        const rows = await inboxGeometry(page);
+        for (const row of rows) expectTitleFirst(row, `${palette}@${size}`);
+        // The default width must keep enough of a 12-character title to tell chats apart.
+        if (size === 272) expect(titled(rows, long.title).visible, `${palette}@272`).toBeGreaterThanOrEqual(6);
+        if (size >= 360) {
+          // Wide sidebars keep the title → Bot order and the short-title spacing.
+          const brief = titled(rows, short.title);
+          expect(brief.truncated).toBe(false);
+          expect(brief.label).toBeGreaterThanOrEqual(brief.labelFull - 0.5);
+          expect(brief.gap).toBeGreaterThanOrEqual(7); expect(brief.gap).toBeLessThanOrEqual(9);
+        }
+      }
+    }
+    await page.evaluate(() => { delete document.documentElement.dataset.palette; });
+    await width(272);
+    await page.screenshot({ path: info.outputPath('inbox-titles-272.png'), animations: 'disabled' });
+    await width(240);
+    await page.screenshot({ path: info.outputPath('inbox-titles-240.png'), animations: 'disabled' });
+
+    // Selection checkboxes take room from the same line without reordering it.
+    await width(272);
+    await sidebar(page).locator(`[data-conversation-id="${long.id}"]`).click({ button: 'right' });
+    await page.getByRole('menuitem', { name: '多选', exact: true }).click();
+    await expect(sidebar(page).locator(`[data-conversation-id="${long.id}"]`)).toHaveAttribute('aria-checked', 'true');
+    for (const row of await inboxGeometry(page)) expectTitleFirst(row, 'bulk@272');
+    await sidebar(page).getByRole('button', { name: '取消多选', exact: true }).click();
+
+    // ADHD picker rows add a pending marker and a checkbox around the same row.
+    const question: Block[] = [{ type: 'card', title: '需要选择', elements: [{ type: 'button', text: '提交', actionId: 'askq_submit', value: { cctb_lark: 'ask_user_question', action: 'form_submit', requestId: 'question' } }] }];
+    await a.store.publishBotMessage('kimi', { conversationId: long.id, blocks: question });
+    await page.getByRole('button', { name: '打开 ADHD 模式', exact: true }).click();
+    const picker = page.locator('.adhd-shell > .sidebar');
+    await expect(picker.locator(`[data-conversation-id="${long.id}"] .adhd-picker-attention`)).toHaveText('待回答');
+    for (const size of [480, 272, 200]) {
+      await width(size);
+      await expect(picker).toHaveCSS('width', `${size}px`);
+      const rows = await inboxGeometry(page, picker);
+      expect(rows).toHaveLength(6);
+      for (const row of rows) expectTitleFirst(row, `adhd@${size}`);
+    }
+    await page.getByRole('button', { name: '返回聊天', exact: true }).click();
+
+    // English titles follow the same order.
+    await page.evaluate(() => new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open('tarocub-hosts-v1');
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => { const db = open.result, tx = db.transaction('meta', 'readwrite'), store = tx.objectStore('meta'), get = store.get('preferences');
+        get.onsuccess = () => store.put(JSON.stringify({ ...(get.result ? JSON.parse(get.result) : {}), locale: 'en' }), 'preferences');
+        tx.oncomplete = () => { db.close(); resolve(); }; tx.onerror = () => reject(tx.error); };
+    }));
+    await page.reload();
+    await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+    await expect(sidebar(page).locator('.conversation-inbox .conversation-row')).toHaveCount(6);
+    for (const size of [272, 200]) {
+      await width(size);
+      const rows = await inboxGeometry(page);
+      for (const row of rows) expectTitleFirst(row, `en@${size}`);
+      if (size === 272) expect(titled(rows, english.title).visible).toBeGreaterThanOrEqual(10);
+    }
   } finally { await page.close(); await a.close(); await b.close(); await rm(root, { recursive: true, force: true }); }
 });

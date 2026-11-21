@@ -10,18 +10,24 @@
 .conversation-inbox{padding-top:4px;container-type:inline-size}
 .conversation-inbox .conversation-row{min-height:64px;padding:9px 8px;gap:9px}
 .inbox-row-title{display:flex;align-items:center;gap:8px;min-width:0}
-/* Match the phone's title → Bot identity flow; only long titles shrink. */
+/* Match the phone's title → Bot identity flow. The title keeps its full width
+   first; the Bot takes only what is left, losing its name before its icon. */
 .inbox-row-title>strong{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.inbox-row-bot{flex:0 1 auto;max-width:50%;min-width:0;padding:1px 4px;border-radius:4px;background:var(--surface-alt);color:var(--muted);font-size:10px;line-height:1.4;overflow:hidden}
-.inbox-row-bot .bot-name{max-width:100%;gap:5px}
+.inbox-row-bot{--inbox-bot-pad:4px;display:flex;flex:1 1 0;min-width:0;max-width:max-content;color:var(--muted);font-size:10px;line-height:1.4;overflow:hidden}
+/* The chip is inside the clipping box so a fully yielded Bot leaves no sliver. */
+.inbox-row-bot .bot-name{max-width:100%;gap:5px;padding:1px var(--inbox-bot-pad);border-radius:4px;background:var(--inbox-bot-bg,var(--surface-alt))}
+/* Icon-only floor: empty label + 5px gap + 12px icon + chip padding. */
+:root:not([data-model-icons=hidden]) .inbox-row-bot:has(.bot-brand-icon){min-width:calc(17px + 2 * var(--inbox-bot-pad))}
 .inbox-row-title>.lucide-pin{flex:none;color:var(--muted)}
 .inbox-row-meta{display:grid;flex:none;align-self:center;align-items:center;justify-items:end;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:auto 18px;gap:4px 5px;max-width:45px}
-/* Every time stays on the title line. Host and unread share the second row. */
+/* Every time stays on the title line; unread sits on the preview line. */
 .inbox-row-meta>time{grid-column:1/-1}
-.inbox-row-meta>.host-source-badge{grid-column:1;grid-row:2}
 .inbox-row-meta>.unread-badge{grid-column:2;grid-row:2}
+/* Host labels share the preview line, so they never narrow the title line. */
+.inbox-row-detail{display:flex;align-items:center;gap:6px;min-width:0}
+.inbox-row-detail>small{flex:1 1 auto;min-width:0}
 .inbox-row-meta time{font-size:10px;line-height:1.5;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
-.conversation-inbox .row-text>small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.conversation-inbox :is(.row-text,.inbox-row-detail)>small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 :root[data-palette=cli] .conversation-inbox .conversation-row.selected :is(.inbox-row-meta time,.inbox-row-title>.lucide-pin){color:var(--cli-rev-fg)}
 /* Keep chat titles readable when the user narrows the desktop sidebar. */
 @container(max-width:220px){

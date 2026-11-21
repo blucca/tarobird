@@ -229,7 +229,7 @@
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .search-results>button>small{font-size:12px;color:var(--label,var(--muted));font-variant-numeric:tabular-nums}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .search-filters{border-radius:12px}
 /* ---------- 5. Lists ---------- */
-:root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .inbox-row-bot{flex-shrink:0;padding-inline:0;background:transparent}
+:root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .inbox-row-bot{--inbox-bot-pad:0px;--inbox-bot-bg:transparent}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) :is(.inbox-row-bot,.mobile-home .mh-row-tag) .bot-name-label{padding-inline:0;background:transparent;color:var(--muted)}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .mobile-home .mh-row-tag:not(:has(.bot-name)){padding-inline:0;background:transparent;color:var(--muted)}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .mobile-home .mh-row[data-unread] .mh-row-time{color:var(--muted)}
