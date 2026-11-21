@@ -183,3 +183,18 @@ test('without an SDK summary the session is still fenced to its own workspace an
   const sidechain = await session.run({ v: 1, operation: 'inspect', sessionId: appSessionId, workspace: session.directory });
   assert.equal(sidechain.ok, false); assert.equal(sidechain.error.code, 'session_unreadable');
 });
+test('bookkeeping records Claude appends on exit do not change the head; a new message does', async () => {
+  for (const name of ['head-untitled', 'head-titled']) {
+    const session = await appSession(name);
+    if (name === 'head-titled') await writeFile(session.file, (await readFile(session.file, 'utf8')) + JSON.stringify({ type: 'custom-title', customTitle: 'Fixture title', sessionId: appSessionId }) + '\n');
+    const ask = { v: 1, operation: 'inspect', sessionId: appSessionId, workspace: session.directory };
+    const first = await session.run(ask); assert.equal(first.ok, true, JSON.stringify(first));
+    // What a Claude process writes when it ends or resumes without a turn: no uuid, not on the message chain.
+    const bookkeeping = [{ type: 'cost-state', sessionId: appSessionId, hasUnknownModelCost: false, totalCostUSD: 0 }, { type: 'last-prompt', sessionId: appSessionId, leafUuid: first.messages.at(-1).uuid }, { type: 'mode', sessionId: appSessionId, mode: 'normal' }];
+    await writeFile(session.file, (await readFile(session.file, 'utf8')) + bookkeeping.map(value => JSON.stringify(value)).join('\n') + '\n');
+    const later = await session.run(ask); assert.equal(later.ok, true); assert.equal(later.head, first.head, name);
+    const parent = first.messages.at(-1).uuid, uuid = '7b4c1e2a-9d3f-4a6b-8c5d-0e1f2a3b4c5d';
+    await writeFile(session.file, (await readFile(session.file, 'utf8')) + JSON.stringify({ type: 'user', uuid, parentUuid: parent, isSidechain: false, sessionId: appSessionId, cwd: session.directory, timestamp: '2026-11-21T09:00:00.000Z', message: { role: 'user', content: 'One more fixture question' } }) + '\n');
+    const moved = await session.run(ask); assert.equal(moved.ok, true); assert.notEqual(moved.head, first.head, name);
+  }
+});

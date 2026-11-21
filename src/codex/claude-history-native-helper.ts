@@ -103,7 +103,12 @@ async function inspect(r: Pick<Request, "sessionId" | "workspace">, sdk: Session
   });
   const after = await sessionFacts(r, sdk);
   if (after.cwd !== before.cwd || after.stamp !== before.stamp) throw new HistoryFailure("source_changed");
-  const head = createHash("sha256").update(JSON.stringify({ sessionId: r.sessionId, messages, stamp: after.stamp })).digest("hex");
+  // The head is the session's message chain, nothing else. Everything that
+  // changes what the conversation holds (a turn, a compaction, resuming from
+  // an earlier message) changes this chain. Records outside it (cost-state,
+  // last-prompt, mode, titles, tags) do not, and Claude appends some of them
+  // when a process ends or resumes without a turn.
+  const head = createHash("sha256").update(JSON.stringify({ sessionId: r.sessionId, messages })).digest("hex");
   return { v: 1 as const, ok: true as const, sessionId: r.sessionId, head, messages };
 }
 
