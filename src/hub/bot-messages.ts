@@ -651,12 +651,18 @@ export class BotMessages {
     return turnReason ? { reason: turnReason } : { targetId, turn, epoch };
   }
   /** A request that named a delivery (or replays one that asked to steer). */
-  private async deliver(c: DeliveryContext): Promise<unknown> {
+  /** A record under this request's client ID must be this request's own. */
+  private ownsRecord(c: DeliveryContext, message: Pick<Message, "botSource" | "conversationId">): boolean {
+    const origin = message.botSource;
+    return !!origin && origin.hostId === c.p.source.hostId && origin.botId === c.p.source.botId && origin.requestId === c.p.source.requestId && message.conversationId === c.target.conversationId;
+  }
+  private async deliver(c: DeliveryContext, replays = 0): Promise<unknown> {
     const prior = await this.store.db.serial(async () => { await c.scope(); return this.memo<IncomingMemo>(c.key); });
     if (prior && prior.content !== c.content) throw new HubError("bot_message_request_conflict", 409);
     if (prior?.steer) {
-      const existing = await this.store.db.serial(() => this.store.db.get<{ id: string }>("SELECT id FROM messages WHERE author_id='owner' AND client_msg_id=?", [c.clientMsgId]));
+      const existing = await this.store.db.serial(() => this.store.db.get<{ id: string; bot_source_json: string | null; conversation_id: string }>("SELECT id,bot_source_json,conversation_id FROM messages WHERE author_id='owner' AND client_msg_id=?", [c.clientMsgId]));
       if (existing) {
+        if (!this.ownsRecord(c, { conversationId: existing.conversation_id, botSource: existing.bot_source_json ? botSourceSchema.parse(JSON.parse(existing.bot_source_json)) : undefined })) throw new HubError("bot_message_request_conflict", 409);
         await this.reconcileSteer(c.p, c.bot.id, c.target, existing.id);
         const row = (await this.store.db.serial(() => this.store.db.get<{ blocks_json: string }>("SELECT blocks_json FROM messages WHERE id=?", [existing.id])))!;
         const memo = await this.store.db.serial(() => this.memo<IncomingMemo>(c.key));
@@ -669,6 +675,8 @@ export class BotMessages {
     // any record exists; blank text (which it accepts) is queued, never steered.
     if (!c.input.text && !c.input.attachments.length) return this.queueDelivery(c);
     if (!c.input.text.trim() && !c.input.attachments.length) return this.queueDelivery(c, "blank_text");
+    // The source's own rate limit is the queue path's answer too, and costs no Gateway call.
+    if (await this.store.db.serial(async () => (await this.memo<number[]>(memoKey("rate", c.p.sourceKey, c.p.source.botId)) ?? []).filter(t => t > Date.now() - 60_000).length >= 10)) throw new HubError("bot_message_rate_limit", 429);
     const plan = await this.steerPlan(c);
     if ("reason" in plan) return this.queueDelivery(c, plan.reason);
     const call = { conversationId: c.target.conversationId, userId: "owner", requestId: c.clientMsgId, targetId: plan.targetId, sourceMessageId: plan.turn, text: c.input.text, source: c.p.source };
@@ -692,7 +700,11 @@ export class BotMessages {
         await this.auditSendInTransaction(c, false, {});
       });
     } catch (error) { if (error instanceof SteerLimitReached) return this.queueDelivery(c, error.reason); throw error; }
-    if (!created.created) return this.deliver(c);
+    // Another call with this request created the record first: report that one, once.
+    if (!created.created) {
+      if (replays > 0 || !this.ownsRecord(c, created.message)) throw new HubError("bot_message_request_conflict", 409);
+      return this.deliver(c, replays + 1);
+    }
     if (opened) await this.store.db.transaction(() => this.put(openSteerKey(c.bot.id, created.message.id), { key: c.key, conversationId: c.target.conversationId } satisfies OpenSteer));
     // The Gateway journals this call at most once. Only its explicit refusal
     // proves nothing reached the engine; its own "unknown" is final; a lost

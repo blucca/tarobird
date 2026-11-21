@@ -562,6 +562,27 @@ describe("R10: a merged Bot record follows its turn through a history rewind", (
   });
 });
 
+describe("R11/R12: bounded replay and the source rate limit before the Gateway", () => {
+  it("R11: refuses a record under this request's client ID that is not this request's, without re-planning forever", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const requestId = "collision_request";
+    const clientMsgId = `bm_${hashSecret(`bot-messages:incoming:${hashSecret(JSON.stringify([a.auth.publicKey, "source", requestId]))}`)}`;
+    // A hand-made collision: a record with that client ID but another origin and no request memo.
+    await b.store.sendMessage("owner", { conversationId: chat.conversationId, clientMsgId, text: "Someone else", attachments: [] });
+    await expect(send(chat.conversationId, "Mine", { delivery: "steer" }, requestId)).rejects.toThrow("bot_message_request_conflict");
+    expect(fake.status.mock.calls.length).toBeLessThanOrEqual(1);
+    expect(fake.steer).not.toHaveBeenCalled();
+  });
+
+  it("R12: a rate-limited source gets the queue path's 429 without any Gateway call", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    for (let i = 0; i < 9; i++) await send(chat.conversationId, `Filler ${i}`);
+    const statusCalls = fake.status.mock.calls.length;
+    for (let i = 0; i < 3; i++) await expect(send(chat.conversationId, `Steer ${i}`, { delivery: "steer" })).rejects.toThrow("bot_message_rate_limit");
+    expect(fake.status.mock.calls.length).toBe(statusCalls);
+  });
+});
+
 describe("M3: blank steer text", () => {
   it("gets the queue path's own answer before any record or Gateway call", async () => {
     const chat = await resolve(); await liveTurn(chat.conversationId);
