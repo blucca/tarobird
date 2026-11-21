@@ -41,7 +41,6 @@ async function bootstrap(page: Page) {
           if (mode === "unsupported") throw new Error("share_app_group_unavailable");
           if (mode === "unimplemented") throw Object.assign(new Error('"TaroCubShareInbox" plugin is not implemented on ios'), { code: "UNIMPLEMENTED" });
           if (mode === "broken") throw new Error("share_operation_failed");
-          if (mode === "broken-once") { w.__share.mode = "none"; throw new Error("share_operation_failed"); }
           return { items: mode === "one" ? [structuredClone(item)] : [] };
         }
         if (method === "pushTokenSnapshot") return { revision: 0 };
@@ -280,21 +279,10 @@ for (const [label, platform, width, height, insets] of [
 ] as const) test(`an unreadable inbox with nothing pending explains itself in the same row and recovers: ${label}`, async ({ browser }) => {
   const context = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: 3, isMobile: true, hasTouch: true, locale: "zh-CN" });
   await withHub(await context.newPage(), async page => {
-    // One transient failure never shows the in-flow row (it would push the page
-    // down and back); it appears only after two consecutive failed reads.
-    await page.evaluate(() => {
-      const w = window as any; w.__share.mode = "broken-once"; w.__sawErrorRow = false;
-      new MutationObserver(() => { if (document.querySelector(".share-inbox-button")) w.__sawErrorRow = true; }).observe(document.body, { subtree: true, childList: true, attributes: true });
-    });
+    await page.evaluate(() => { (window as any).__share.mode = "broken"; });
     await goNative(page, platform, insets);
     await nav(page).getByRole("button", { name: /^Bot/ }).click();
-    await expect.poll(() => page.evaluate(() => (window as any).__share.mode)).toBe("none");
-    await polls(page, 2);
-    expect(await page.evaluate(() => (window as any).__sawErrorRow)).toBe(false);
-    await page.evaluate(() => { (window as any).__share.mode = "broken"; });
-    await polls(page, 1);
-    await expect(page.locator(".share-inbox-button")).toHaveCount(0);
-    await expect(readError(page)).toBeVisible({ timeout: 10_000 });
+    await expect(readError(page)).toBeVisible();
     await expect(page.getByText(/待发送分享/)).toHaveCount(0);
     for (const tab of ["消息", "Bot", "我的"]) {
       await nav(page).getByRole("button", { name: new RegExp(`^${tab}`) }).click();
@@ -318,10 +306,10 @@ for (const [label, platform, width, height, insets] of [
     await page.evaluate(() => { (window as any).__share.mode = "none"; });
     await dialog.getByRole("button", { name: "重试", exact: true }).click();
     await expect(dialog).toHaveCount(0); await expect(page.locator(".share-inbox-button")).toHaveCount(0);
-    // Two new failures bring the row back; a recovered read with a
+    // A new failure brings the row back on the next poll; a recovered read with a
     // pending share turns it into the normal entry.
     await page.evaluate(() => { (window as any).__share.mode = "broken"; });
-    await expect(readError(page)).toBeVisible({ timeout: 15_000 });
+    await expect(readError(page)).toBeVisible({ timeout: 10_000 });
     await page.evaluate(() => { (window as any).__share.mode = "one"; });
     await expect(entry(page)).toBeVisible({ timeout: 10_000 }); await expect(readError(page)).toHaveCount(0);
     expectClear(`${label} recovered chat`, await record(page, `${label}-read-error-recovered-chat`));
