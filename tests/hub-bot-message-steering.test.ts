@@ -96,6 +96,8 @@ describe("legacy and explicit queue delivery", () => {
     const chat = await resolve();
     const receipt = await send(chat.conversationId, "Queued", { delivery: "queue" });
     expect(receipt).toMatchObject({ status: "queued", delivery: { requested: "queue", actual: "queued" } });
+    // R14: an older receiving Host's strict schema would refuse the field, so the sending Host never puts queue on the wire.
+    expect(bodies.at(-1)).toEqual({ text: "Queued", attachments: [] });
     expect(fake.steer).not.toHaveBeenCalled();
     expect(await deliveries(receipt.messageId)).toHaveLength(1);
   });

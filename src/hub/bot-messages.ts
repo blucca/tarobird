@@ -285,7 +285,9 @@ export class BotMessages {
         if (hops > 3 && (input.operation !== "resolve" || !input.conversation)) throw new HubError("bot_message_hop_limit", 429);
         return { hostId: own.id, hostName: own.name, botId: sourceBot, botName: bot.name, requestId: input.requestId, hops: Math.min(hops, 3) };
       });
-      let data = input.data, downgraded = false;
+      let data = input.data, downgraded = false, queueRequested = false;
+      // Queue is the default: never put it on the wire (an older receiving Host refuses the field).
+      if (input.operation === "send" && data.delivery === "queue") { const { delivery: _delivery, ...plain } = data; data = plain; queueRequested = true; }
       // An older receiving Host refuses `delivery` (strict body). Ask it first;
       // a Host that does not know the probe route queues the plain message.
       if (input.operation === "send" && data.delivery === "steer" && host.publicKey !== this.auth.publicKey && !await this.peerSteers(host as NetworkHost, source, input.bot, admit)) {
@@ -327,6 +329,7 @@ export class BotMessages {
       await this.store.db.serial(async () => { await guard(); await this.network.requireMessagePeerInTransaction(host.publicKey); });
       if (input.operation === "send" || input.operation === "wait") await this.store.audit(`bot-message.outgoing-${input.operation}`, sourceBot, { requestId: input.requestId, hostId: host.id, ...(downgraded ? { delivery: "receiver_update_required" } : {}) });
       if (downgraded && result && typeof result === "object") result = { ...result, delivery: { requested: "steer", actual: "fell_back_to_queue", reason: "receiver_update_required" } satisfies BotMessageDeliveryReceipt };
+      if (queueRequested && result && typeof result === "object" && !("delivery" in result)) result = { ...result, delivery: { requested: "queue", actual: "queued" } satisfies BotMessageDeliveryReceipt };
       return result;
     } catch (error) {
       await this.store.audit("bot-message.rejected", sourceBot, { stage: "source", requestId, reason: error instanceof HubError ? error.code : "invalid_request" }); throw error instanceof TargetResolutionError ? new HubError(error.message, 409) : error;
