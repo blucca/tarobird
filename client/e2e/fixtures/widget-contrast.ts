@@ -1,6 +1,6 @@
 // Contrast probes for sandboxed widget guests. Runs inside the guest document:
 // keep it self-contained (no imports, no closures over Node values).
-export type ContrastTarget = { id: string; kind: "text" | "large" | "graphic"; paint?: "color" | "fill" | "stroke" };
+export type ContrastTarget = { id: string; kind: "text" | "large" | "graphic"; paint?: "color" | "fill" | "stroke" | "background" };
 export type ContrastResult = { id: string; kind: ContrastTarget["kind"]; fg: string; bg: string; ratio: number };
 
 export function measureContrast(root: Element, targets: ContrastTarget[]): ContrastResult[] {
@@ -31,9 +31,9 @@ export function measureContrast(root: Element, targets: ContrastTarget[]): Contr
     if (!node) return { id: target.id, kind: target.kind, fg: "missing", bg: "missing", ratio: 0 };
     const style = getComputedStyle(node);
     const paint = target.paint ?? (node instanceof SVGElement ? "fill" : "color");
-    const raw = parse(paint === "color" ? style.color : paint === "fill" ? style.fill : style.stroke);
+    const painted = paint === "color" ? style.color : paint === "fill" ? style.fill : paint === "stroke" ? style.stroke : style.backgroundColor, raw = parse(painted);
     const background = backdrop(target.kind === "graphic" && node.parentElement ? node.parentElement : node);
-    if (!raw) return { id: target.id, kind: target.kind, fg: String(paint === "color" ? style.color : style.fill), bg: hex(background), ratio: 0 };
+    if (!raw) return { id: target.id, kind: target.kind, fg: String(painted), bg: hex(background), ratio: 0 };
     const foreground = over(raw, background);
     const a = luminance(foreground), b = luminance(background);
     return { id: target.id, kind: target.kind, fg: hex(foreground), bg: hex(background), ratio: Math.round((Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05) * 100) / 100 };

@@ -30,8 +30,16 @@ function mapSchemeMedia(){
   try{visitList(sheet,sheet.media);visit(sheet.cssRules)}catch{/* An unreadable sheet keeps its media. */}
  }
 }
-const applyTheme=theme=>{for(const name of allowedTheme){const value=theme?.[name];if(typeof value!=='string'||value.length>500)continue;if(name==='scheme'){suppliedScheme=value==='dark'?'dark':'light';htmlElement.style.colorScheme=suppliedScheme}else htmlElement.style.setProperty('--'+name,value)}mapSchemeMedia()};
+// A top-level element may declare data-canvas-theme="light|dark" for a design
+// drawn for one canvas. When it differs from the App scheme, the frame takes
+// that scheme's tokens (the "<name>-light|dark" entries) and color-scheme;
+// authored colours are never rewritten.
+let suppliedTheme=initialTheme,canvas='';
+const effectiveTheme=()=>{const theme=suppliedTheme??{};if(!canvas||canvas===theme.scheme)return theme;const next={...theme,scheme:canvas};for(const name of allowedTheme){const value=theme[name+'-'+canvas];if(typeof value==='string')next[name]=value}return next};
+const applyTheme=theme=>{suppliedTheme=theme;const effective=effectiveTheme();for(const name of allowedTheme){const value=effective[name];if(typeof value!=='string'||value.length>500)continue;if(name==='scheme'){suppliedScheme=value==='dark'?'dark':'light';htmlElement.style.colorScheme=suppliedScheme}else htmlElement.style.setProperty('--'+name,value)}mapSchemeMedia()};
 applyTheme(initialTheme);deviceDark.addEventListener('change',mapSchemeMedia);
+const declaredCanvas=()=>{const value=root.querySelector(':scope>[data-canvas-theme]')?.getAttribute('data-canvas-theme')?.trim().toLowerCase();return value==='light'||value==='dark'?value:''};
+function refreshCanvas(){const next=declaredCanvas();if(next===canvas)return;canvas=next;applyTheme(suppliedTheme);worker?.postMessage({type:'theme',theme:effectiveTheme()})}
 // IDs remain local to this opaque viewer, whose authority is captured in lexical
 // bindings. Preserve ordinary IDs such as "title"/"method" for CSS and virtual
 // DOM correspondence; frames/embedded plugins and executable attributes remain
@@ -112,7 +120,7 @@ function render(value,overflow,ack=Infinity){
   }
   while(parent.childNodes.length>source.childNodes.length)parent.lastChild.remove();
  };
- patch(root,template.content);mapFormStyles();mapSchemeMedia();refreshObservers();
+ patch(root,template.content);mapFormStyles();refreshCanvas();mapSchemeMedia();refreshObservers();
 }
 // Live control properties from the Worker. Markup attributes only set default
 // values; once a control is dirty, script changes need these properties. Each
@@ -258,7 +266,7 @@ if(worker){worker.onmessage=event=>{
   }
   else if((data.name==='setPointerCapture'||data.name==='releasePointerCapture')&&activePointers.has(data.pointerId))try{node[data.name](data.pointerId)}catch{/* The pointer is no longer active. */}
  }
-};worker.onerror=()=>{releaseWorkerUrl();unsupported(false)};worker.postMessage({type:'init',html,theme:initialTheme,viewport:{width:root.clientWidth,height:320},reducedMotion:matchMedia('(prefers-reduced-motion: reduce)').matches,restore:typeof restore==='string'&&restore.length<=16384?restore:undefined})}
+};worker.onerror=()=>{releaseWorkerUrl();unsupported(false)};worker.postMessage({type:'init',html,theme:effectiveTheme(),viewport:{width:root.clientWidth,height:320},reducedMotion:matchMedia('(prefers-reduced-motion: reduce)').matches,restore:typeof restore==='string'&&restore.length<=16384?restore:undefined})}
 let lastWatch=performance.now();
 if(worker)watchdog=setInterval(()=>{
  if(failed)return;
@@ -325,7 +333,7 @@ addEventListener('message',event=>{
   return;
  }
  if(retiring)return;
- if(data.type==='tarobot-widget-theme'){applyTheme(data.theme);worker?.postMessage({type:'theme',theme:data.theme})}
+ if(data.type==='tarobot-widget-theme'){applyTheme(data.theme);worker?.postMessage({type:'theme',theme:effectiveTheme()})}
  else if(data.type==='tarobot-widget-compose-result'&&typeof data.id==='string'){const timer=composeRequests.get(data.id);if(timer!==undefined){clearTimeout(timer);composeRequests.delete(data.id);worker?.postMessage({type:'compose-result',id:data.id,accepted:data.accepted===true})}}
 });
 addEventListener('keydown',event=>{if(event.key==='Escape'&&!event.defaultPrevented)send('tarobot-widget-close')});
