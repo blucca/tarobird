@@ -1,8 +1,10 @@
-# ACCEPTANCE-ONLY FIXTURE CHECK COPY (#50 native). Never merge this file into main:
-# it builds no installer, signs nothing, uploads nothing and publishes nothing.
-# It runs only the Windows cases affected by the test-fixture fix: the step 17
-# desktop-core command and the step 19 native integration tests, parsed the way
-# windows-acceptance.mjs judges them.
+# ACCEPTANCE-ONLY FIXTURE CHECK COPY (#50 native, follow-up). Never merge this file
+# into main: it builds no installer, signs nothing, uploads nothing and publishes
+# nothing. It runs only the Windows cases touched by the test-fixture commits:
+# step 17 desktop-core, the step 19 native tests (judged like windows-acceptance.mjs),
+# the source-guard binary serial and under the default parallel harness, main's
+# client.yml Windows updater command, the where.exe Node fallback, and one in-runner
+# mutation of the duplicate-argument check (never committed).
 name: Windows desktop installer
 on:
   workflow_dispatch:
@@ -14,8 +16,6 @@ on:
         default: x64
 permissions:
   contents: read
-env:
-  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
 jobs:
   windows:
     runs-on: windows-latest
@@ -28,9 +28,9 @@ jobs:
         env:
           REF: ${{ github.ref }}
         run: |
-          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Native triage runs only on a disposable GitHub-hosted runner" }
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Fixture checks run only on a disposable GitHub-hosted runner" }
           if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "This acceptance-only workflow copy runs only from an accept/* branch" }
-          "runner=$env:RUNNER_ENVIRONMENT os=$env:ImageOS image=$env:ImageVersion ref=$env:REF"
+          "runner=$env:RUNNER_ENVIRONMENT os=$env:ImageOS image=$env:ImageVersion ref=$env:REF cpus=$env:NUMBER_OF_PROCESSORS"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -56,21 +56,10 @@ jobs:
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($hash -ne 'e612af99f626ab415ea225af6bce5c971feb448cb5cae250bb1c3fa50c5f7d9f') { throw "Node archive integrity failed: $hash" }
           Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP/host-node" -Force
-          $node = "$env:RUNNER_TEMP/host-node/node-v24.22.3-win-x64/node.exe"
-          if (-not (Test-Path $node)) { throw "node.exe missing from the pinned archive" }
-          "TAROBOT_TEST_NODE=$node" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Toolchain and system state
-        shell: pwsh
-        run: |
-          rustc -Vv; cargo -V; node -v; & $env:TAROBOT_TEST_NODE -v
-          "user=$env:USERNAME temp=$env:TEMP image=$env:ImageVersion"
-          [System.Environment]::OSVersion.VersionString
-          "RUSTFLAGS=[$env:RUSTFLAGS] CARGO_INCREMENTAL=[$env:CARGO_INCREMENTAL]"
-      # Exactly the three commands of step 17, but every command runs so one
-      # failing crate cannot hide another. On failure the same command is run
-      # again with --no-fail-fast (already compiled) to list every failing binary.
-      - name: Native Rust regressions on the x64 runner (step 17 desktop-core command)
-        id: step17
+          "PINNED_NODE=$env:RUNNER_TEMP/host-node/node-v24.22.3-win-x64/node.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          rustc -Vv; cargo -V
+      - name: Step 17 desktop-core exact command
+        id: core
         continue-on-error: true
         shell: pwsh
         env:
@@ -78,36 +67,45 @@ jobs:
           CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
         run: |
-          $ErrorActionPreference = 'Continue'
-          $commands = @(
-            @{ name = 'desktop-core'; cargo = @('test', '--manifest-path', 'client/src-desktop-core/Cargo.toml', '--locked', '--', '--test-threads=1') }
-          )
-          $failed = @()
-          $summary = @('### Step 17 desktop-core')
-          foreach ($c in $commands) {
-            Write-Output "::group::cargo $($c.cargo -join ' ')"
-            & cargo @($c.cargo) 2>&1 | Tee-Object -Variable out | Write-Output
-            $code = $LASTEXITCODE
-            Write-Output "::endgroup::"
-            Write-Output "RESULT $($c.name) exit=$code"
-            $summary += "- $($c.name): exit $code"
-            if ($code -ne 0) {
-              $failed += $c.name
-              $retry = $c.cargo.Clone()
-              $sep = [Array]::IndexOf($retry, '--')
-              if ($sep -ge 0) { $retry = $retry[0..($sep - 1)] + @('--no-fail-fast') + $retry[$sep..($retry.Count - 1)] } else { $retry += '--no-fail-fast' }
-              Write-Output "::group::no-fail-fast cargo $($retry -join ' ')"
-              & cargo @retry 2>&1 | Tee-Object -Variable out2 | Write-Output
-              Write-Output "::endgroup::"
-              $lines = @(@($out) + @($out2) | ForEach-Object { "$_" } | Where-Object { $_ -match '^test result:|^test .* (FAILED|ok)$|panicked at|^error(\[E\d+\])?:|^     Running |^failures:|^    [a-z_:]+$|---- .* stdout ----|assertion|left:|right:' })
-              $summary += '```'; $summary += ($lines | Select-Object -First 200); $summary += '```'
-            }
-          }
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
-          if ($failed.Count) { throw "Step 17 command(s) failed: $($failed -join ', ')" }
-      # The --native-tests part of step 19 (windows-acceptance.mjs --scope native),
-      # same command and environment: RUSTFLAGS removed, static CRT target flags.
-      - name: windows-acceptance native integration tests (step 19 native part)
+          $env:TAROBOT_TEST_NODE = $env:PINNED_NODE
+          cargo test --manifest-path client/src-desktop-core/Cargo.toml --locked -- --test-threads=1
+          "RESULT core exit=$LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { throw "desktop-core failed" }
+      - name: desktop_host lab through the where.exe Node fallback (no TAROBOT_TEST_NODE)
+        id: fallback
+        continue-on-error: true
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
+          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          Remove-Item Env:TAROBOT_TEST_NODE -ErrorAction SilentlyContinue
+          "where.exe node.exe -> $((where.exe node.exe | Select-Object -First 1))"
+          cargo test --manifest-path client/src-desktop-core/Cargo.toml --locked --lib -- --test-threads=1 desktop_host::tests
+          "RESULT fallback exit=$LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { throw "desktop_host lab failed through the where.exe fallback" }
+      - name: Mutation (in runner only) - duplicate --state-dir detection removed must fail the config test
+        id: mutation
+        continue-on-error: true
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
+          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $file = 'client/src-desktop-core/src/config.rs'
+          $from = 'if slot.replace(value).is_some() { return Err("invalid_arguments"); }'
+          $text = Get-Content $file -Raw
+          if (-not $text.Contains($from)) { throw "mutation anchor not found" }
+          Set-Content $file -Value $text.Replace($from, 'let _ = slot.replace(value);') -NoNewline
+          cargo test --manifest-path client/src-desktop-core/Cargo.toml --locked --lib -- --test-threads=1 --exact config::tests::requires_every_fixed_path_once_and_rejects_ambiguity
+          $code = $LASTEXITCODE
+          git checkout -- $file
+          if ((git status --porcelain -- $file)) { throw "mutation not reverted" }
+          "RESULT mutation exit=$code (non-zero = the broken duplicate check is detected)"
+          if ($code -eq 0) { throw "duplicate-argument mutation survived on Windows" }
+      - name: Step 19 native exact command, judged like windows-acceptance.mjs
         id: native19
         continue-on-error: true
         shell: pwsh
@@ -117,36 +115,68 @@ jobs:
           CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
         run: |
+          $ErrorActionPreference = 'Continue'
           Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
           Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
-          # Step 19 never had the Host Node variable; keep its environment exact.
-          Remove-Item Env:TAROBOT_TEST_NODE -ErrorAction SilentlyContinue
-          $ErrorActionPreference = 'Continue'
-          $cargoArgs = @('test', '--manifest-path', 'client/src-desktop-updater/Cargo.toml', '--locked', '--target', 'x86_64-pc-windows-msvc',
-            '--test', 'windows_runtime', '--test', 'windows_control_job', '--test', 'windows_source_guard', '--', '--test-threads=1', '--nocapture')
-          & cargo @cargoArgs 2>&1 | Tee-Object -Variable out | Write-Output
+          & cargo test --manifest-path client/src-desktop-updater/Cargo.toml --locked --target x86_64-pc-windows-msvc `
+            --test windows_runtime --test windows_control_job --test windows_source_guard -- --test-threads=1 --nocapture 2>&1 | Tee-Object -Variable out | Write-Output
           $code = $LASTEXITCODE
-          $retry = $null
-          if ($code -ne 0) {
-            $sep = [Array]::IndexOf($cargoArgs, '--')
-            $nff = $cargoArgs[0..($sep - 1)] + @('--no-fail-fast') + $cargoArgs[$sep..($cargoArgs.Count - 1)]
-            Write-Output "::group::no-fail-fast cargo $($nff -join ' ')"
-            & cargo @nff 2>&1 | Tee-Object -Variable retry | Write-Output
-            Write-Output "::endgroup::"
-          }
-          $lines = @(@($out) + @($retry) | ForEach-Object { "$_" } | Where-Object { $_ -match '^test result:|^test .* (FAILED|ok|ignored)$|^skipped:|panicked at|^error(\[E\d+\])?:|^     Running |---- .* stdout ----|assertion|left:|right:' })
-          # Judged exactly like windows-acceptance.mjs: one `ok` result per binary
-          # on stdout, every count > 0, and no binary that skipped itself.
           $stdout = @(@($out) | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })
           $passed = @($stdout | Where-Object { $_ -match '^test result: ok\. (\d+) passed' } | ForEach-Object { [int]($_ -replace '^test result: ok\. (\d+) passed.*$', '$1') })
           $vacuous = @(@($out) | ForEach-Object { "$_" } | Where-Object { $_ -match '^skipped:' }).Count -gt 0
           $judged = ($code -eq 0) -and ($passed.Count -eq 3) -and (@($passed | Where-Object { $_ -le 0 }).Count -eq 0) -and (-not $vacuous)
-          Write-Output "JUDGED native/controljob-guard-helper-handoff=$judged code=$code passed=[$($passed -join ',')] vacuous=$vacuous"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value (@('### Step 19 native integration tests', "exit $code judged=$judged passed=[$($passed -join ',')]", '```') + ($lines | Select-Object -First 200) + @('```'))
-          if (-not $judged) { throw "Native integration tests failed (exit $code, judged $judged)" }
-      - name: Triage outcome
+          "JUDGED native/controljob-guard-helper-handoff=$judged code=$code passed=[$($passed -join ',')] vacuous=$vacuous"
+          if (-not $judged) { throw "step 19 native not judged pass" }
+      - name: Source guard - serial once, then 20 rounds of the default parallel harness
+        id: guard
+        continue-on-error: true
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
+          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Remove-Item Env:RUST_TEST_THREADS -ErrorAction SilentlyContinue
+          $base = @('test', '--manifest-path', 'client/src-desktop-updater/Cargo.toml', '--locked', '--target', 'x86_64-pc-windows-msvc', '--test', 'windows_source_guard')
+          & cargo @($base + @('--', '--test-threads=1')) 2>&1 | Tee-Object -Variable serial | Write-Output
+          $serialCode = $LASTEXITCODE
+          "RESULT guard-serial exit=$serialCode"
+          $failedRounds = 0; $failures = @{}
+          foreach ($round in 1..20) {
+            & cargo @base 2>&1 | Tee-Object -Variable out | Out-Null
+            $code = $LASTEXITCODE
+            $names = @(@($out) | ForEach-Object { "$_" } | Where-Object { $_ -match '^test (\S+) \.\.\. FAILED$' } | ForEach-Object { ($_ -replace '^test (\S+) \.\.\. FAILED$', '$1') })
+            $result = @(@($out) | ForEach-Object { "$_" } | Where-Object { $_ -match '^test result:' }) -join ' | '
+            "ROUND $round parallel exit=$code $result $(if ($names) { 'FAILED: ' + ($names -join ',') })"
+            if ($code -ne 0) { $failedRounds++; foreach ($n in $names) { $failures[$n] = 1 + [int]$failures[$n] } ; @(@($out) | ForEach-Object { "$_" } | Where-Object { $_ -match 'panicked at|left:|right:|failed in its own process' }) | Select-Object -First 12 | ForEach-Object { "    $_" } }
+          }
+          "RESULT guard-parallel failedRounds=$failedRounds/20 byTest=$(($failures.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';')"
+          if ($serialCode -ne 0 -or $failedRounds -gt 0) { throw "source guard failed (serial $serialCode, parallel rounds $failedRounds/20)" }
+      - name: main client.yml Windows updater command, 3 rounds (default env and parallel harness)
+        id: clientyml
+        continue-on-error: true
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-client-yml.noindex
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Remove-Item Env:RUST_TEST_THREADS -ErrorAction SilentlyContinue
+          $failedRounds = 0
+          foreach ($round in 1..3) {
+            & cargo test --manifest-path client/src-desktop-updater/Cargo.toml --locked 2>&1 | Tee-Object -Variable out | Out-Null
+            $code = $LASTEXITCODE
+            $names = @(@($out) | ForEach-Object { "$_" } | Where-Object { $_ -match '^test (\S+) \.\.\. FAILED$' } | ForEach-Object { ($_ -replace '^test (\S+) \.\.\. FAILED$', '$1') })
+            "ROUND $round client.yml exit=$code results: $(@(@($out) | ForEach-Object { "$_" } | Where-Object { $_ -match '^test result:' }) -join ' | ') $(if ($names) { 'FAILED: ' + ($names -join ',') })"
+            if ($code -ne 0) { $failedRounds++; @(@($out) | ForEach-Object { "$_" } | Where-Object { $_ -match 'panicked at|left:|right:|failed in its own process|^error' }) | Select-Object -First 12 | ForEach-Object { "    $_" } }
+          }
+          "RESULT clientyml failedRounds=$failedRounds/3"
+          if ($failedRounds -gt 0) { throw "client.yml updater command failed in $failedRounds/3 rounds" }
+      - name: Fixture check outcome
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
-          "step17=${{ steps.step17.outcome }} native19=${{ steps.native19.outcome }}"
-          if ('${{ steps.step17.outcome }}' -ne 'success' -or '${{ steps.native19.outcome }}' -ne 'success') { throw "native triage found failures; see the step logs and summary" }
+          $o = 'core=${{ steps.core.outcome }} fallback=${{ steps.fallback.outcome }} mutation=${{ steps.mutation.outcome }} native19=${{ steps.native19.outcome }} guard=${{ steps.guard.outcome }} clientyml=${{ steps.clientyml.outcome }}'
+          "OUTCOME $o"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "OUTCOME $o"
+          if ($o -match 'failure') { throw "fixture check found failures: $o" }
