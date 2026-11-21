@@ -134,7 +134,7 @@ test('makensis compiles the installer; the payload holds the App, helper and rec
   const result = await buildWindowsInstaller({ appDir, helper, version: '1.2.3', outFile, pluginsDir }, { makensis, workDir: path.join(root, 'nsis-work') });
   assert.equal(result.host, 'host');
   assert.equal((await readFile(outFile)).subarray(0, 2).toString(), 'MZ');
-  for (const forbidden of [/installer-diagnostics\.nsh/i, /installer-notes\.nsh/i, /installer-language\.nsh/i, /installer-hooks\.nsh/i, /utils\.nsh/i, /English\.nsh/i, /SimpChinese\.nsh/i, /LangString/i, /function .* not referenced/i]) {
+  for (const forbidden of [/installer-diagnostics\.nsh/i, /installer-notes\.nsh/i, /installer-language\.nsh/i, /installer-hooks\.nsh/i, /utils\.nsh/i, /English\.nsh/i, /SimpChinese\.nsh/i, /LangString/i, /function .* not referenced/i, /unknown variable\/constant/i, /warning 6000\b/i]) {
     assert.doesNotMatch(result.log, forbidden, `makensis emitted unexpected warning matching ${forbidden}:\n${result.log}`);
   }
   if (!sevenZip) return;
@@ -566,4 +566,33 @@ test('a /P run never stops at the language dialog; interactive runs keep it and 
     assert.notEqual(candidate + candidateLanguage, nsi + language, `${label}: mutation applied`);
     assert.throws(() => checkPassiveLanguage(candidate, candidateLanguage), assert.AssertionError, label);
   }
+});
+
+// 47450f7: installer.nsi included the hooks (and through them the setup
+// notes) before it defined VERSION, so every note line ended with the literal
+// "${VERSION}" (makensis warning 6000, reported for the macro, not the file).
+test('every define a setup function uses exists where makensis compiles that function', async () => {
+  const [nsi, hooks, diagnostics, notes] = await templates('installer.nsi', 'installer-hooks.nsh', 'installer-diagnostics.nsh', 'installer-notes.nsh');
+  const upTo = (source, line) => { const at = source.indexOf(line); assert.ok(at >= 0, 'missing ' + line); return source.slice(0, at); };
+  const intoHooks = upTo(nsi, '!include "installer-hooks.nsh"');
+  const intoNotes = intoHooks + upTo(hooks, '!include "installer-diagnostics.nsh"') + upTo(diagnostics, '!include "installer-notes.nsh"');
+  // Functions are compiled where they are instantiated; macros used inside Sections expand later.
+  const compiled = [
+    ['BirdNoteFunction', intoNotes + upTo(notes, '!insertmacro BirdNoteFunction ""'), between(notes, '!macro BirdNoteFunction', '!macroend')],
+    ['BirdReasonFunction', intoNotes + notes + upTo(diagnostics, '!insertmacro BirdReasonFunction ""'), between(diagnostics, '!macro BirdReasonFunction', '!macroend')],
+    ['TaroBotRememberInstallation', intoHooks + upTo(hooks, 'Function TaroBotRememberInstallation'), between(hooks, 'Function TaroBotRememberInstallation', 'FunctionEnd')],
+  ];
+  const defineLine = name => new RegExp(`^\\s*!define (?:/\\w+ )*${name}\\b`, 'm');
+  const ours = nsisCode([nsi, hooks, diagnostics, notes].join('\n'));
+  let checked = 0;
+  for (const [name, before, body] of compiled) {
+    for (const constant of new Set([...nsisCode(body).matchAll(/\$\{(\w+)\}/g)].map(match => match[1]))) {
+      if (!defineLine(constant).test(ours)) continue; // LogicLib words and macro parameters
+      checked++;
+      assert.match(nsisCode(before), defineLine(constant), `${name} uses \${${constant}} before installer.nsi defines it`);
+    }
+  }
+  assert.ok(nsisCode(between(notes, '!macro BirdNoteFunction', '!macroend')).includes('${VERSION}') && checked > 1, 'the note line still carries the version');
+  // The product identity is defined before any TaroBot include.
+  ordered(nsisCode(nsi), '!define VERSION "${TB_VERSION}"', '!define STARTMENUFOLDER ""', '!include "installer-hooks.nsh"', 'Var PassiveMode');
 });
