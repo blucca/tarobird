@@ -8,7 +8,8 @@
 #   old uninstaller   -> Uninstall (no data box touched), then Close
 #   finish page       -> untick "Run TaroBird", Finish
 #   anything else     -> I Agree / Next > / Install, else recorded as stuck
-param([int]$TimeoutSec = 300, [int]$SceneTimeoutSec = 40)
+param([int]$TimeoutSec = 300, [int]$SceneTimeoutSec = 40, [string]$SetupPath = '', [string]$OutFile = '')
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -75,6 +76,26 @@ function Text($el) { ((Kids $el | ForEach-Object { $_.Current.Name } | Where-Obj
 # language picker (if Windows shows it) is "Installer/Uninstaller Language".
 function Windows { @($AE::RootElement.FindAll($TS::Children, $Any) | Where-Object { $_.Current.Name -like '*TaroBird*' -or $_.Current.Name -like '*Language*' }) }
 
+
+# --- #50 extension overrides ---------------------------------------------
+# Only NSIS's own Win32 buttons: class "Button" with a window handle. A window's
+# title-bar Close is a UI Automation Button without either, and pressing it
+# mid-uninstall is what this excludes (run 44853329237, D).
+function IsButton($c) { $c.Current.ClassName -eq 'Button' -and $c.Current.NativeWindowHandle -ne 0 }
+function Desc($el) { "'$($el.Current.Name)' class=$($el.Current.ClassName) hwnd=$($el.Current.NativeWindowHandle)" }
+Add-Type -Namespace BirdProbe -Name Win32Alive -MemberDefinition @"
+[DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+[DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);
+"@
+# A window whose UI thread is blocked (setup's page-leave ExecWait) would hang
+# every UI Automation call on it; ask it a WM_NULL with a 400 ms limit first.
+function Responsive($w) {
+  $h = [IntPtr]$w.Current.NativeWindowHandle
+  if ($h -eq [IntPtr]::Zero) { return $true }
+  $r = [IntPtr]::Zero
+  return [BirdProbe.Win32Alive]::SendMessageTimeout($h, 0, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 400, [ref]$r) -ne [IntPtr]::Zero
+}
+function OwnerPath($w) { try { [string](Get-CimInstance Win32_Process -Filter "ProcessId=$($w.Current.ProcessId)").ExecutablePath } catch { '' } }
 $seen = $false; $guard = 0; $empty = 0; $stuck = $false; $noted = @{}
 function Once([string]$kind, [string]$key, [string]$detail) { if (-not $noted.ContainsKey("$kind|$key")) { $noted["$kind|$key"] = $true; Note $kind $detail } }
 while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
@@ -82,6 +103,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
   if ($wins.Count) { $seen = $true; $empty = 0 } else { $empty++ }
   if ($seen -and $empty -ge 12) { Note 'gone' 'no TaroBird window for ~8 s'; break }
   foreach ($w in $wins) {
+    if (-not (Responsive $w)) { Once 'unresponsive' "$($w.Current.NativeWindowHandle)" "$($w.Current.Name) pid=$($w.Current.ProcessId) (UI thread busy; skipped while it is)"; continue }
     $key = "$($w.Current.NativeWindowHandle)|$($w.Current.Name)"
     $now = Text $w
     if (-not $since.ContainsKey($key) -or $seenText[$key] -ne $now -or $acted.ContainsKey($key)) { $since[$key] = Get-Date; $seenText[$key] = $now; [void]$acted.Remove($key) }
@@ -91,10 +113,14 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
     }
     try {
       if ($w.Current.Name -match '^(Installer|Uninstaller) Language$') {
+        # Setup's own chooser is expected in a GUI run; the INSTALLED old
+        # uninstaller asking (review N6) is recorded with its process.
+        $owner = OwnerPath $w
+        $kind = $(if ($SetupPath -and $owner -and $owner -ieq $SetupPath) { 'language' } else { 'old-uninstaller-language' })
         $okLang = Btn $w 'OK'
-        if ($okLang) { Press $okLang; Note 'language' "$($w.Current.Name) pid=$($w.Current.ProcessId) (OK)"; $acted[$key] = $true; continue }
+        if ($okLang) { Press $okLang; Note $kind "$($w.Current.Name) pid=$($w.Current.ProcessId) owner=$owner (OK $(Desc $okLang))"; $acted[$key] = $true; continue }
         $native = Win32Button $w.Current.NativeWindowHandle 'OK'
-        if ($native -ne [IntPtr]::Zero) { [void][BirdProbe.Win32]::SendMessage($native, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero); Note 'language' "$($w.Current.Name) (Win32 OK)"; $acted[$key] = $true }
+        if ($native -ne [IntPtr]::Zero) { [void][BirdProbe.Win32]::SendMessage($native, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero); Note $kind "$($w.Current.Name) owner=$owner (Win32 OK)"; $acted[$key] = $true }
         continue
       }
       $yes = Btn $w 'Yes'
@@ -109,8 +135,8 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
       if ($isUninstaller) {
         Once 'old-uninstaller' "$($w.Current.ProcessId)" "$($w.Current.Name) pid=$($w.Current.ProcessId) path=$((Get-CimInstance Win32_Process -Filter "ProcessId=$($w.Current.ProcessId)").ExecutablePath): $now"
         $un = Btn $w 'Uninstall'; $close = Btn $w 'Close'
-        if ($un -and (Enabled $un)) { Press $un; Note 'pressed' 'Uninstall (old uninstaller, data boxes untouched)'; $acted[$key] = $true }
-        elseif ($close -and (Enabled $close)) { Press $close; Note 'pressed' 'Close (old uninstaller)'; $acted[$key] = $true }
+        if ($un -and (Enabled $un)) { Press $un; Note 'pressed' "Uninstall on old uninstaller $(Desc $un), data boxes untouched"; $acted[$key] = $true }
+        elseif ($close -and (Enabled $close)) { Press $close; Note 'pressed' "Close on old uninstaller $(Desc $close)"; $acted[$key] = $true }
         continue
       }
       $finish = Btn $w 'Finish'
@@ -124,7 +150,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
       }
       foreach ($name in @('I Agree', 'Next >', 'Install')) {
         $b = Btn $w $name
-        if ($b -and (Enabled $b)) { Press $b; Note 'pressed' $name; $acted[$key] = $true; break }
+        if ($b -and (Enabled $b)) { Press $b; Note 'pressed' "$name $(Desc $b)"; $acted[$key] = $true; break }
       }
     } catch { Note 'error' $_.Exception.Message }
   }
@@ -133,4 +159,6 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
   Start-Sleep -Milliseconds 700
 }
 $left = @(Windows | ForEach-Object { "$($_.Current.Name) [$($_.Current.ClassName)] pid=$($_.Current.ProcessId)" })
-ConvertTo-Json -InputObject ([ordered]@{ seen = $seen; stuck = $stuck; seconds = [int]((Get-Date) - $start).TotalSeconds; left = $left; events = $events }) -Depth 4 -Compress
+$json = ConvertTo-Json -InputObject ([ordered]@{ seen = $seen; stuck = $stuck; seconds = [int]((Get-Date) - $start).TotalSeconds; left = $left; events = $events }) -Depth 4 -Compress
+if ($OutFile) { [System.IO.File]::WriteAllText($OutFile, $json, (New-Object System.Text.UTF8Encoding $false)) }
+$json

@@ -18,6 +18,9 @@ param(
   [string]$ReleasedFile = ''
 )
 $ErrorActionPreference = 'Stop'
+# UTF-8 stdout: Windows PowerShell's default (IBM437 on the runner) turned U+00B7
+# into a byte the caller decoded as U+FFFD (run 44846271631, gui-locked).
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $AE = [System.Windows.Automation.AutomationElement]

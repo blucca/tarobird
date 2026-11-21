@@ -75,14 +75,33 @@ function Text($el) { ((Kids $el | ForEach-Object { $_.Current.Name } | Where-Obj
 # language picker (if Windows shows it) is "Installer/Uninstaller Language".
 function Windows { @($AE::RootElement.FindAll($TS::Children, $Any) | Where-Object { $_.Current.Name -like '*TaroBird*' -or $_.Current.Name -like '*Language*' }) }
 
+
+# --- #50 extension overrides ---------------------------------------------
+# Only NSIS's own Win32 buttons: class "Button" with a window handle. A window's
+# title-bar Close is a UI Automation Button without either, and pressing it
+# mid-uninstall is what this excludes (run 44853329237, D).
+function IsButton($c) { $c.Current.ClassName -eq 'Button' -and $c.Current.NativeWindowHandle -ne 0 }
+function Desc($el) { "'$($el.Current.Name)' class=$($el.Current.ClassName) hwnd=$($el.Current.NativeWindowHandle)" }
+Add-Type -Namespace BirdProbe -Name Win32Alive -MemberDefinition @"
+[DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+[DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);
+"@
+# A window whose UI thread is blocked (setup's page-leave ExecWait) would hang
+# every UI Automation call on it; ask it a WM_NULL with a 400 ms limit first.
+function Responsive($w) {
+  $h = [IntPtr]$w.Current.NativeWindowHandle
+  if ($h -eq [IntPtr]::Zero) { return $true }
+  $r = [IntPtr]::Zero
+  return [BirdProbe.Win32Alive]::SendMessageTimeout($h, 0, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 400, [ref]$r) -ne [IntPtr]::Zero
+}
+function OwnerPath($w) { try { [string](Get-CimInstance Win32_Process -Filter "ProcessId=$($w.Current.ProcessId)").ExecutablePath } catch { '' } }
 function BtnRx($el, [string]$rx) {
   foreach ($c in (Kids $el)) { if ((IsButton $c) -and (Clean $c.Current.Name) -match $rx) { return $c } }
   return $null
 }
 function Hex([string]$s) { (($s.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ') }
-Add-Type -Namespace BirdProbe -Name Win32Parent -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);'
 # The message box's own window: the parent of its Retry button's window.
-function DialogHandle($btn) { [int][BirdProbe.Win32Parent]::GetParent([IntPtr]$btn.Current.NativeWindowHandle) }
+function DialogHandle($btn) { [int][BirdProbe.Win32Alive]::GetParent([IntPtr]$btn.Current.NativeWindowHandle) }
 function StaticTexts([int]$hwnd) {
   $parts = @(); $child = [IntPtr]::Zero
   do {
@@ -98,6 +117,7 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
   if ($closed -and -not $wins.Count) { break }
   if ($seen -and $empty -ge 12) { Note 'gone' 'no TaroBird window for ~8 s'; break }
   foreach ($w in $wins) {
+    if (-not (Responsive $w)) { continue }
     $key = "$($w.Current.NativeWindowHandle)|$($w.Current.Name)"
     $now = Text $w
     if (-not $since.ContainsKey($key) -or $seenText[$key] -ne $now -or $acted.ContainsKey($key)) { $since[$key] = Get-Date; $seenText[$key] = $now; [void]$acted.Remove($key) }
@@ -123,13 +143,13 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
           $waited = 0; while (-not (Test-Path -LiteralPath $ReleasedFile) -and $waited -lt 120) { Start-Sleep -Seconds 1; $waited++ }
           Note 'released' "after ${waited}s"
         }
-        Press (BtnRx $dialog '^(Retry|重试)'); Note 'answer' 'Retry'; $acted[$key] = $true; continue
+        $r = BtnRx $dialog '^(Retry|重试)'; Press $r; Note 'answer' "Retry $(Desc $r)"; $acted[$key] = $true; continue
       }
       $yes = Btn $w 'Yes'
       if ($yes -and (Btn (Scope $yes) 'No')) { $q = Scope $yes; Note 'question' (Text $q); Press (Btn $q 'No'); Note 'answer' 'No'; $acted[$key] = $true; continue }
       $un = BtnRx $w '^(Uninstall|卸载)'; $close = BtnRx $w '^(Close|关闭)'
-      if ($un -and (Enabled $un)) { Note 'confirm-page' "$($w.Current.Name): $now"; Press $un; Note 'answer' 'Uninstall'; $acted[$key] = $true }
-      elseif ($close -and (Enabled $close)) { Note 'finished' $now; Press $close; $closed = $true; $acted[$key] = $true }
+      if ($un -and (Enabled $un)) { Note 'confirm-page' "$($w.Current.Name): $now"; Press $un; Note 'answer' "Uninstall $(Desc $un)"; $acted[$key] = $true }
+      elseif ($close -and (Enabled $close)) { Note 'finished' "Close $(Desc $close): $now"; Press $close; $closed = $true; $acted[$key] = $true }
       elseif ($now -match 'Aborted|not completed successfully|中止|未能') { $cancel = BtnRx $w '^(Cancel|取消)'; if ($cancel -and (Enabled $cancel)) { Note 'finished' "aborted: $now"; Press $cancel; $closed = $true; $acted[$key] = $true } }
     } catch { Note 'error' $_.Exception.Message }
   }

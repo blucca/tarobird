@@ -188,7 +188,9 @@ async function verifyElectron(sys, report, phase, directory, version) {
   const startMenu = sys.env.APPDATA && path.win32.join(sys.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs');
   const shortcut = startMenu && [path.win32.join(startMenu, `${DISPLAY_NAME}.lnk`), path.win32.join(startMenu, PRODUCT, `${DISPLAY_NAME}.lnk`), path.win32.join(startMenu, `${PRODUCT}.lnk`), path.win32.join(startMenu, PRODUCT, `${PRODUCT}.lnk`)].find(sys.exists);
   let target = '';
-  if (shortcut) target = (await sys.powershell(`(New-Object -ComObject WScript.Shell).CreateShortcut('${shortcut.replaceAll("'", "''")}').TargetPath`)).stdout.trim();
+  // Shell.Application's ShellLinkObject reads the link through the Unicode
+  // shell; WScript.Shell's TargetPath turned CJK into "?" (run 44853329237).
+  if (shortcut) target = (await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${path.win32.dirname(shortcut).replaceAll("'", "''")}').ParseName('${path.win32.basename(shortcut).replaceAll("'", "''")}'); [string]$i.GetLink.Path`)).stdout.trim();
   report.expect(phase, 'start-menu-shortcut', !!shortcut && same(target, join(EXE)), `${shortcut ?? 'missing'} → ${target}`);
   // Written only after `tarocub-client.exe --register-notification-shortcut` succeeded.
   const receipt = join('tarocub-notification-shortcut.json');
