@@ -134,7 +134,7 @@ for (const phone of phones) test(`landscape layout ${phone.name}`, async ({ brow
   // A reason stays readable and its action remains reachable.
   const blocked = await open(browser, phone, "&blocked=screen_service_offline&settings=1");
   try {
-    const action = blocked.page.getByRole("button", { name: text("连接设置"), exact: true }); await expect(action).toBeVisible();
+    const action = blocked.page.getByRole("button", { name: text("屏幕控制设置"), exact: true }); await expect(action).toBeVisible();
     await expect.poll(() => layout(blocked.page, phone.insets, undefined, false)).toEqual([]);
     await expect(blocked.page.locator(".screen-status-label")).toContainText(text("主机在线，但桌面服务未运行。请在目标电脑打开 TaroBird。"));
     await action.click(); expect((await log(blocked.page)).settingsOpened).toBe(1);

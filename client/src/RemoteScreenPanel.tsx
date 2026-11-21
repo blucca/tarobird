@@ -212,8 +212,8 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
       </div>
     </div>}
     <p className={landscape?"screen-state screen-status-label":"screen-state"} role="status" data-faded={landscape&&calm&&!labelAwake?"":undefined} data-alert={landscape&&attention?"":undefined}>{landscape?statusLabel:<>{fullscreen.error??stateText}{!error&&!statusError&&!state.reason&&state.fresh&&state.width&&<span className="screen-resolution"> · {state.width} × {state.height}</span>}{error==="screen_quality_unsupported"&&<button onClick={legacyConnect}>{t("以默认画质连接")}</button>}</>}</p>
-    {!landscape&&settingsShown&&<p className="screen-state"><button onClick={openSettings}>{t("连接设置")}</button></p>}
-    {landscape&&(error==="screen_quality_unsupported"||settingsShown)&&<div className="screen-status-actions">{error==="screen_quality_unsupported"&&<button onClick={legacyConnect}>{t("以默认画质连接")}</button>}{settingsShown&&<button onClick={openSettings}>{t("连接设置")}</button>}</div>}
+    {!landscape&&settingsShown&&<p className="screen-state"><button onClick={openSettings}>{t("屏幕控制设置")}</button></p>}
+    {landscape&&(error==="screen_quality_unsupported"||settingsShown)&&<div className="screen-status-actions">{error==="screen_quality_unsupported"&&<button onClick={legacyConnect}>{t("以默认画质连接")}</button>}{settingsShown&&<button onClick={openSettings}>{t("屏幕控制设置")}</button>}</div>}
     {tools&&<div className="screen-tools-popover" role="region" aria-label={t("屏幕更多操作")}>
     {mobile&&<><label className="screen-display">{t("画面清晰度")}{qualitySelect}</label><button onClick={()=>{touch.current?.fit();setTools(false);}}>{t("适应窗口")}</button><p className="screen-touch-help">{t("查看时拖动画面、双指缩放。控制时点按左键、长按右键、单指拖动、双指滚动；捏合只缩放画面。")}</p></>}
     {landscape&&<p className="screen-touch-help">{t("仅在开始控制后，点击发送才会提交文本。")}</p>}

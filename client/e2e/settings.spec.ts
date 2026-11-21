@@ -85,6 +85,8 @@ for (const phone of [false, true]) test(`connection shortcuts and settings categ
     await dragSettings(page, settings, phone);
     const networkPage = settings.getByRole("region", { name: "网络与连接", exact: true });
     await expect(networkPage.getByRole("button", { name: /^设备与网络/ })).toBeVisible();
+    // A web renderer cannot view screens, so it lists no Screen control page.
+    await expect(networkPage.getByRole("button", { name: /^屏幕控制设置/ })).toHaveCount(0);
     await expect(networkPage.locator(".network-settings-current")).toContainText("已连接");
     await networkPage.getByRole("button", { name: /^连接状态与线路/ }).click();
     const child = page.getByRole("dialog", { name: "连接状态与线路", exact: true });
@@ -147,6 +149,7 @@ for (const phone of [false, true]) test(`connection shortcuts and settings categ
     const container = phone ? mobileHome(page) : page.getByRole("group", { name: "工作台", exact: true });
     const connectionEntry = container.getByRole("button", { name: "连接状态与线路", exact: true });
     const networkEntry = container.getByRole("button", { name: "设备与网络", exact: true });
+    await expect(container.getByRole("button", { name: "屏幕控制设置", exact: true })).toHaveCount(0);
     await networkEntry.scrollIntoViewIfNeeded();
     if (phone) expect((await networkEntry.boundingBox())!.y).toBeLessThan((await connectionEntry.boundingBox())!.y);
     else expect((await connectionEntry.boundingBox())!.y).toBeLessThan((await networkEntry.boundingBox())!.y);

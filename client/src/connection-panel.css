@@ -27,3 +27,7 @@
 .host-route-status dl { display: grid; gap: 8px; margin: 12px 0; }
 .host-route-status dl > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; }
 .host-route-status dd { margin: 0; color: var(--muted); }
+/* Screen control moved to its own settings page; this row leads there. */
+.connection-dialog .connection-screen-entry{margin:0 0 18px}
+/* Its own page: the screen section starts the page instead of following routes. */
+.screen-control-dialog .settings-content>.screen-settings{margin-top:0;padding-top:0;border-top:0}

@@ -117,7 +117,7 @@ test("local startup recovery remains available when Host reads fail and is disab
  expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.configured)).toEqual([]);
  expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.native.filter((c:any)=>c.command!=="screen_service_status"))).toEqual([{command:"screen_service_retry",args:{}}]);
 });
-test("the connection dialog stays movable after its embedded screen viewer closes",async({page})=>{
+test("the screen control dialog stays movable after its embedded screen viewer closes",async({page})=>{
  await page.goto(url("?panel&remote&ready"));const dialog=page.locator("dialog.connection-dialog");
  // The fixture uses the real theme. Measure only after its entrance animation
  // settles, so a moving starting point cannot skew the pointer displacement.
@@ -135,7 +135,19 @@ test("the connection dialog stays movable after its embedded screen viewer close
  await drag(-60,20);
  const after=await translate();expect(after).not.toBe("");expect(after).not.toBe(before);expect([await left()-x1,await top()-y1]).toEqual([-60,20]);
  // Header controls keep their own clicks; pressing one does not start a drag.
- await dialog.getByRole("button",{name:"关闭连接状态与线路",exact:true}).click();await expect(dialog).toHaveCount(0);
+ await dialog.getByRole("button",{name:"关闭屏幕控制设置",exact:true}).click();await expect(dialog).toHaveCount(0);
+});
+
+test("the connection page keeps one row to Screen control and opens it as a sub-page with the same section",async({page})=>{
+ await page.goto(url("?connection&remote&ready"));const connection=page.getByRole("dialog",{name:"连接状态与线路",exact:true});await expect(connection).toBeVisible();
+ await expect(connection.locator(".screen-settings")).toHaveCount(0);await expect(connection.getByRole("region",{name:"远程屏幕",exact:true})).toHaveCount(0);
+ const row=connection.getByRole("button",{name:/^屏幕控制设置/});await expect(row).toHaveCount(1);await row.click();
+ const screen=page.getByRole("dialog",{name:"屏幕控制设置",exact:true});await expect(screen).toBeVisible();
+ await expect(screen.getByRole("region",{name:"远程屏幕",exact:true})).toBeVisible();await expect(screen.getByRole("button",{name:"查看屏幕",exact:true})).toBeEnabled();
+ await screen.getByRole("button",{name:"查看屏幕",exact:true}).click();await expect(page.getByRole("complementary",{name:"远程屏幕",exact:true})).toBeVisible();
+ await page.getByRole("button",{name:"断开并关闭屏幕",exact:true}).click();await expect(screen.getByRole("button",{name:"查看屏幕",exact:true})).toBeVisible();
+ await screen.getByRole("button",{name:"返回连接状态与线路",exact:true}).click();await expect(screen).toHaveCount(0);await expect(connection).toBeVisible();await expect(row).toBeFocused();
+ expect(await page.evaluate(()=>(window as any).screenSettingsFixture.state.native.filter((c:any)=>/^screen_(service_permission|viewer_open)/.test(c.command)))).toEqual([]);
 });
 
 test("device access shortcut only reveals the current GUI device; saving stays explicit and targets the selected host",async({page})=>{

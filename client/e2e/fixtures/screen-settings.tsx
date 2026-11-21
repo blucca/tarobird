@@ -18,6 +18,7 @@ import { restoreAppearance, applyAppearance } from "../../src/appearance.js";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ConnectionPanel } from "../../src/ConnectionPanel.js";
+import { ScreenControlPanel } from "../../src/ScreenControlPanel.js";
 import { RemoteScreenSettings } from "../../src/RemoteScreenSettings.js";
 import { RuntimeHostContext } from "../../src/RuntimeHost.js";
 import type { HubConnection } from "../../src/connection.js";
@@ -67,6 +68,6 @@ const a=connection("host-a"),b=connection("host-b");
 if(params.has("web"))delete (window as any).tarobotDesktop;
 function App(){const[host,setHost]=useState(params.has("remote")?b:a),[panel,setPanel]=useState(true),[busy,setBusy]=useState(false);
  return <><textarea aria-label="Local draft" defaultValue="keep draft"/><button onClick={()=>setHost(h=>h===a?b:a)}>Switch host</button><button onClick={()=>setBusy(v=>!v)}>Toggle busy</button>
- <RuntimeHostContext.Provider value={host===a?"macmini":"Other Mac"}>{params.has("panel")?panel&&<ConnectionPanel key={host.identity.hubPublicKey} connection={host} close={()=>setPanel(false)}/>:<RemoteScreenSettings connection={host} local={host===a} open={()=>state.opens.push(host.identity.hubPublicKey)} {...{openBlocked:busy?"请先保存或取消连接修改。":undefined}}/>}</RuntimeHostContext.Provider></>;
+ <RuntimeHostContext.Provider value={host===a?"macmini":"Other Mac"}>{params.has("panel")?panel&&<ScreenControlPanel key={host.identity.hubPublicKey} connection={host} close={()=>setPanel(false)}/>:params.has("connection")?panel&&<ConnectionPanel key={host.identity.hubPublicKey} connection={host} close={()=>setPanel(false)}/>:<RemoteScreenSettings connection={host} local={host===a} open={()=>state.opens.push(host.identity.hubPublicKey)} {...{openBlocked:busy?"请先保存或取消连接修改。":undefined}}/>}</RuntimeHostContext.Provider></>;
 }
 Object.assign(window,{screenSettingsFixture:{state,desktop,a,b,setLocale}});createRoot(document.getElementById("root")!).render(<App/>);

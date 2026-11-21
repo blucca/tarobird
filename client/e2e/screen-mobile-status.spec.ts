@@ -32,7 +32,7 @@ test("returning from background or lock explains why the session ended, until th
   await expect(status(page)).toHaveText(BACKGROUND);
   // Unchanged design: no automatic reconnect, control is not restored.
   await expect(page.getByRole("button",{name:"连接屏幕",exact:true})).toBeEnabled();expect((await log(page)).opens).toBe(before);
-  await expect(page.getByRole("button",{name:"连接设置",exact:true})).toHaveCount(0);
+  await expect(page.getByRole("button",{name:"屏幕控制设置",exact:true})).toHaveCount(0);
   await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
   await expect(status(page)).not.toHaveText(BACKGROUND);await expect(page.getByRole("button",{name:"停止控制",exact:true})).toHaveCount(0);
   // A lock during a session explains itself the same way.

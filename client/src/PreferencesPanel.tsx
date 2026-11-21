@@ -20,8 +20,10 @@ import { FontSizeSlider } from "./FontSizeSlider.js";
 import { LayoutDensityPicker } from "./LayoutDensityPicker.js";
 import { useBackAction } from "./back-navigation.js";
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject } from "react";
-import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Link, Monitor, Plus, QrCode, ScanLine, Settings2, ShieldCheck, Gauge, X } from "lucide-react";
+import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Link, Monitor, MonitorCog, Plus, QrCode, ScanLine, Settings2, ShieldCheck, Gauge, X } from "lucide-react";
 import { ConnectionPanel } from "./ConnectionPanel.js";
+import { ScreenControlPanel } from "./ScreenControlPanel.js";
+import { hasScreenViewer } from "./mobile-screen-viewer-transport.js";
 import type { OpenNetwork } from "./network-navigation.js";
 import "./network-settings.css";
 import { CreationDialog } from "./CreationDialog.js";
@@ -117,7 +119,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   // A request for a category this build hides (Model quotas) opens the default one.
   const startSection: Section = startingSettingsSection(initialSection);
   const [section, setSection] = useState<Section>(startSection), [overview, setOverview] = useState(startSection === "general");
-  const [connectionOpen, setConnectionOpen] = useState(false);
+  const [connectionOpen, setConnectionOpen] = useState(false), [screenOpen, setScreenOpen] = useState(false);
   useSceneMotion(dialog, `${overview}:${section}`, phone, overview ? -1 : 1, overview ? ".settings-navigation" : ".settings-content");
   // A category opened directly (Devices from the phone home) is the first phone page:
   // its Back returns to where it was opened, not to categories never shown.
@@ -423,6 +425,9 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
             <button type="button" className="network-settings-option" onClick={event => { event.currentTarget.focus({ preventScroll: true }); setConnectionOpen(true); }}>
               <Link size={20} aria-hidden="true"/><span><strong>{t("连接状态与线路")}</strong><small>{desktopLocalHost ? t("本机的局域网、Tailscale 和 VPS 中转") : t("此设备访问当前主机的直连和 VPS 中转")}</small></span><ChevronRight size={17} aria-hidden="true"/>
             </button>
+            {hasScreenViewer() && <button type="button" className="network-settings-option" data-settings-entry="screen" onClick={event => { event.currentTarget.focus({ preventScroll: true }); setScreenOpen(true); }}>
+              <MonitorCog size={20} aria-hidden="true"/><span><strong>{t("屏幕控制设置")}</strong><small>{t("允许远程屏幕、设备授权和查看屏幕")}</small></span><ChevronRight size={17} aria-hidden="true"/>
+            </button>}
             {manageNetwork && <button type="button" className="network-settings-option" onClick={event => { event.currentTarget.focus({ preventScroll: true }); openHosts(); }}>
               <Globe size={20} aria-hidden="true"/><span><strong>{t("设备与网络")}</strong><small>{t("添加手机或电脑、管理设备与主机组网")}</small></span><ChevronRight size={17} aria-hidden="true"/>
             </button>}
@@ -532,6 +537,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
         </section>
       </div>
     </div>
+    {screenOpen && <ScreenControlPanel connection={connection} close={() => setScreenOpen(false)} backLabel={t("返回网络与连接")}/>}
     {connectionOpen && <ConnectionPanel connection={connection} close={() => setConnectionOpen(false)} backLabel={t("返回网络与连接")}/>}
     {detailDevice && <CreationDialog mobilePage title={t("管理设备")} close={closeDevice} closeLabel={t("返回设备列表")} busy={busy} back={phone} showHost={false} className="device-detail">
       {!online && <p role="status" className="settings-offline">{t("连接恢复后即可操作")}</p>}

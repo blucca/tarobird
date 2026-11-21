@@ -1,3 +1,4 @@
+import { hasScreenViewer } from './mobile-screen-viewer-transport.js';
 import { pairingState, pairingStateLabel } from './pairing-state.js';
 import { AgentAvatar } from "./AgentAvatar.js";
 import { isDispatcher, useTicketConversationsVisible } from "./dispatcher.js";
@@ -28,7 +29,7 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import { CalendarClock, Archive as ArchiveIcon, ArrowLeft, Settings, Bell, ShieldCheck, Wifi, WifiOff, RefreshCw } from 'lucide-react';
+import { CalendarClock, Archive as ArchiveIcon, ArrowLeft, Settings, Bell, ShieldCheck, Wifi, WifiOff, RefreshCw, MonitorCog } from 'lucide-react';
 import type { Conversation } from '../../src/client-protocol/index.js';
 import { Avatar, AvatarProvider, ConversationAvatar } from './Avatar.js';
 import { BotReferences, ReferencePreview } from './BotReferences.js';
@@ -52,7 +53,7 @@ type BotScope = { hostId: string; botId: string };
 export type MobileInboxState = { query: string; filter: MobileFilter; botScope?: BotScope; botQuery?: string };
 export type MobileScrollPositions = Record<MobileTab, number>;
 export type MobileCreateKind = 'bot' | 'group' | 'direct' | 'schedule';
-export type MobileOpenTarget = 'settings' | 'connection' | 'devices' | 'notifications' | 'files' | 'capabilities' | 'operations' | 'schedules' | 'hosts' | 'archives';
+export type MobileOpenTarget = 'settings' | 'connection' | 'screen' | 'devices' | 'notifications' | 'files' | 'capabilities' | 'operations' | 'schedules' | 'hosts' | 'archives';
 type Locale = ReturnType<typeof useLocale>;
 
 export type MobileHomeProps = {
@@ -690,6 +691,7 @@ function MePane({ hosts, activeHost, selectHost, open }: PaneProps) {
       <section><ul className="mh-group">
           <Cell icon={<MonitorIcon />} labelOnly label={t('设备与网络')} description={t('添加手机或电脑 · 显示二维码')} onClick={() => open('hosts')} />
           <Cell settingsEntry="connection" icon={<Wifi size={20}/>} label={t('连接状态与线路')} description={computerLabels[hosts.findIndex(host => host.id === activeHost?.id)]} disabled={!activeHost} onClick={() => open('connection')} />
+          {hasScreenViewer() && <Cell settingsEntry="screen" icon={<MonitorCog size={20}/>} label={t('屏幕控制设置')} description={computerLabels[hosts.findIndex(host => host.id === activeHost?.id)]} disabled={!activeHost} onClick={() => open('screen')} />}
       </ul></section>
 
       <section>
@@ -719,7 +721,7 @@ function MePane({ hosts, activeHost, selectHost, open }: PaneProps) {
 function Cell({ icon, label, description, disabled, onClick, settingsEntry, labelOnly }: {
   description?: string;
   labelOnly?: boolean;
-  settingsEntry?: "settings" | "connection" | "capabilities" | "operations";
+  settingsEntry?: "settings" | "connection" | "screen" | "capabilities" | "operations";
   icon: ReactNode;
   label: string;
   disabled?: boolean;
@@ -727,7 +729,7 @@ function Cell({ icon, label, description, disabled, onClick, settingsEntry, labe
 }) {
   return (
     <li>
-      <button type="button" className="mh-cell" aria-label={settingsEntry === "connection" || labelOnly ? label : undefined} data-settings-entry={settingsEntry} disabled={disabled} onClick={(event) => { event.currentTarget.focus(); onClick(); }}>
+      <button type="button" className="mh-cell" aria-label={settingsEntry === "connection" || settingsEntry === "screen" || labelOnly ? label : undefined} data-settings-entry={settingsEntry} disabled={disabled} onClick={(event) => { event.currentTarget.focus(); onClick(); }}>
         <span className="mh-cell-icon" aria-hidden="true">{icon}</span>
         <span className="mh-cell-label">{label}{description && <small className="mh-cell-description">{description}</small>}</span>
         <span className="mh-cell-chevron" aria-hidden="true"><ChevronIcon size={18} /></span>

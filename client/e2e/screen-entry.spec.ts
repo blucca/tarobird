@@ -34,14 +34,33 @@ test("unready shortcut stays discoverable, explains readiness and opens settings
  await page.evaluate(()=>{(window as any).screenEntryFixture.statuses.a.permission="none";});await entry(page).click();
  await expect(panel(page).getByText("请在目标 Mac 的远程屏幕设置中授权此设备。",{exact:true})).toBeVisible();
  await expect(panel(page).getByRole("button",{name:"连接屏幕",exact:true})).toBeDisabled();
- await panel(page).getByRole("button",{name:"连接设置",exact:true}).click();
- await expect(page.getByRole("dialog",{name:"连接状态与线路",exact:true})).toBeVisible();
+ await panel(page).getByRole("button",{name:"屏幕控制设置",exact:true}).click();
+ await expect(page.getByRole("dialog",{name:"屏幕控制设置",exact:true})).toBeVisible();
+ await expect(page.getByRole("dialog",{name:"屏幕控制设置",exact:true}).getByRole("region",{name:"远程屏幕",exact:true})).toBeVisible();
  expect(await page.evaluate(()=>(window as any).screenEntryFixture.calls.filter((v:string)=>/^(open|configure):/.test(v)))).toEqual([]);
- await page.getByRole("button",{name:"关闭连接状态与线路",exact:true}).click();
+ await page.getByRole("button",{name:"关闭屏幕控制设置",exact:true}).click();
  await page.evaluate(()=>{const f=(window as any).screenEntryFixture;f.statuses.a.permission="view";f.statuses.a.desktop=null;window.dispatchEvent(new Event("focus"));});
  // The desktop service is gone, but this Host was read as a Mac a moment ago, so the sentence still names it.
  await expect(panel(page).getByText("主机在线，但桌面服务未运行。请在目标 Mac 打开 TaroBird。",{exact:true})).toBeVisible();
  await expect(panel(page).getByRole("button",{name:"连接屏幕",exact:true})).toBeDisabled();
+});
+
+test("the workspace menu offers Screen control right after Connection status and routes",async({page},info)=>{
+ await page.goto(server.resolvedUrls!.local[0]+"e2e/fixtures/screen-entry.html");
+ // The fixture's host switch is pinned over the footer: open the menu from the keyboard.
+ const trigger=page.getByRole("button",{name:/^工作台：/}).filter({visible:true}),openMenu=async()=>{await trigger.focus();await page.keyboard.press("Enter");};
+ await openMenu();
+ const menu=page.getByRole("group",{name:"工作台",exact:true}),entry=menu.getByRole("button",{name:"屏幕控制设置",exact:true});await expect(entry).toBeVisible();
+ expect(await entry.evaluate(node=>node.previousElementSibling?.textContent)).toBe("连接状态与线路");
+ await menu.screenshot({path:info.outputPath("workspace-menu-screen-control.png")});
+ await entry.click();const dialog=page.getByRole("dialog",{name:"屏幕控制设置",exact:true});
+ await expect(dialog.getByRole("region",{name:"远程屏幕",exact:true})).toBeVisible();await expect(dialog.getByRole("button",{name:"查看屏幕",exact:true})).toBeVisible();
+ await page.getByRole("button",{name:"关闭屏幕控制设置",exact:true}).click();await expect(dialog).toHaveCount(0);
+ // The connection page keeps a row that leads here instead of repeating the section.
+ await openMenu();await menu.getByRole("button",{name:"连接状态与线路",exact:true}).click();
+ const connection=page.getByRole("dialog",{name:"连接状态与线路",exact:true});await expect(connection.locator(".screen-settings")).toHaveCount(0);
+ await expect(connection.getByRole("button",{name:/^屏幕控制设置/})).toBeVisible();
+ expect(await page.evaluate(()=>(window as any).screenEntryFixture.calls.filter((v:string)=>/^(open|configure):/.test(v)))).toEqual([]);
 });
 
 test("phone and non-Electron headers do not offer an unsupported viewer",async({page})=>{
