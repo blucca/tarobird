@@ -288,6 +288,18 @@ describe("fallback to the queue", () => {
   });
 });
 
+describe("owner steering stays separate", () => {
+  it("never lets the owner's steer route re-send a Bot steer record", async () => {
+    const chat = await resolve(); const run = await liveTurn(chat.conversationId);
+    fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    const receipt = await send(chat.conversationId, "Bot text", { delivery: "steer" });
+    const record = await b.store.messageForUser("owner", receipt.messageId);
+    await expect(b.store.beginSteeringRecord("owner", { conversationId: chat.conversationId, botId: "target", requestId: record.clientMsgId!, targetId: run.targetId, text: "Bot text" })).rejects.toThrow("idempotency_conflict");
+    await expect(b.store.sendMessage("owner", { conversationId: chat.conversationId, clientMsgId: record.clientMsgId!, text: "Bot text", attachments: [] })).rejects.toThrow("idempotency_conflict");
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+  });
+});
+
 describe("only the sender's own turn (D1)", () => {
   it("queues instead of steering into a turn the owner or a third Bot started, and never reveals that turn's reply", async () => {
     for (const hub of [a, b]) await hub.store.db.run("INSERT INTO bots(id,name,secret_hash,engine) VALUES('third','Third',?,'codex')", [hashSecret("test-".repeat(10))]);

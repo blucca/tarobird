@@ -586,6 +586,9 @@ export class HubStore {
       if (old) {
         const message = this.decodeMessage(old), control = message.blocks.find((block) => block.type === "steering");
         if (message.historyContext) throw new HubError("history_message_excluded", 409);
+        // A Bot's steer record is owner-authored on this Host but is not the
+        // owner's input: its own receipt (and reconciliation) is the only path.
+        if (message.botSource) throw new HubError("idempotency_conflict", 409);
         if (message.conversationId !== input.conversationId || !control || control.botId !== input.botId || control.targetId !== input.targetId || (input.mode !== undefined && control.mode !== input.mode) || blocksText(message.blocks) !== input.text) throw new HubError("idempotency_conflict", 409);
         const receipt = old.workbench_receipt_json ? JSON.parse(old.workbench_receipt_json) as SteeringInputReceipt : undefined;
         if (receipt?.digest !== (context ? workbenchContextDigest(JSON.stringify(context)) : undefined)) throw new HubError("idempotency_conflict", 409);
