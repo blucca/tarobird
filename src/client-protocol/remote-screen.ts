@@ -2,7 +2,7 @@ import { z } from "zod";
 import { SCREEN_MAC_KEYCODES, SCREEN_TARGET_PLATFORMS } from "./screen-keys.js";
 import { idSchema } from "./index.js";
 import { deviceActionProofSchema } from "./device-actions.js";
-import { SCREEN_FLIGHT_MAX, SCREEN_FLIGHT_MIN, SCREEN_QUALITIES, SCREEN_STREAM_MAX_AREA, SCREEN_STREAM_MAX_EDGE } from "./screen-quality.js";
+import { SCREEN_FLIGHT_MAX, SCREEN_FLIGHT_MIN, SCREEN_HELD_MAX_MS, SCREEN_QUALITIES, SCREEN_STREAM_MAX_AREA, SCREEN_STREAM_MAX_EDGE } from "./screen-quality.js";
 
 export const REMOTE_SCREEN_CAPABILITY = "desktop.screen.v1";
 /** Hub → App (`serverCapabilities`): `screenOpen` accepts `quality`. Whether the
@@ -30,7 +30,7 @@ export const SCREEN_SERVICE_QUALITY_FEATURE = "screen.quality.v1";
 export const SCREEN_SERVICE_FLIGHT_FEATURE = "screen.flight.v1";
 const flightSchema = z.number().int().min(SCREEN_FLIGHT_MIN).max(SCREEN_FLIGHT_MAX);
 /** Milliseconds a viewer held a frame between receiving it and sending its receipt (decode, draw, repaint). */
-const heldSchema = z.number().int().min(0).max(2000);
+const heldSchema = z.number().int().min(0).max(SCREEN_HELD_MAX_MS);
 /** Target → Hub (hello `features`, only to a Host with SCREEN_CONTROL_RATE_CAPABILITY): `start` may carry `mediaBytesPerMs`. */
 export const SCREEN_SERVICE_PACE_FEATURE = "screen.pace.v1";
 /** Encoded bytes a target may send for one session per millisecond (4 and

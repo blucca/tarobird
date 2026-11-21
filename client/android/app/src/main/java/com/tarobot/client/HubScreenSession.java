@@ -27,9 +27,10 @@ final class HubScreenSession {
      * capacity; the page asks for this value through screenWindow). A restart (start
      * control, keyframe, resume) retires them and the next generation may send a full
      * window while the page still reads the old one's, so superseded packets count only
-     * against the total: one current window plus one superseded window. JSON deliveries
-     * and commands queued before the control socket is ready are bounded five beyond
-     * the window: a frame-ready and a receipt per frame, plus state and input. */
+     * against the total: one current window plus one superseded window. JSON deliveries,
+     * commands queued before the control socket is ready and frames waiting in a screen
+     * socket's write queue (HubSocket) are bounded five beyond the window: a frame-ready
+     * and a receipt per frame, plus state and input. */
     static final int BINARY_WINDOW=16, BINARY_RETAINED=2*BINARY_WINDOW, PENDING=BINARY_WINDOW+5;
     interface Events { void send(JSONObject event) throws Exception; void closed(); }
     private static final class Delivery {

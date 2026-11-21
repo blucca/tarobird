@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createCaptureCore, CAPTURE_CREDITS, OUTPUT_MAX_AGE_MS, PACE_BURST_BYTES, PACE_BYTES_PER_MS, PACE_BYTES_PER_MS_MAX } from '../screen-capture-core.mjs';
+import { createCaptureCore, CAPTURE_CREDITS, FLIGHT_BYTES, OUTPUT_MAX_AGE_MS, PACE_BURST_BYTES, PACE_BYTES_PER_MS, PACE_BYTES_PER_MS_MAX } from '../screen-capture-core.mjs';
 import { ScreenCaptureHost } from '../screen-capture-host.mjs';
 import { ScreenService } from '../screen-service.mjs';
 import { encodeSize, SCREEN_ENCODE_AREA, SCREEN_ENCODE_LONG_EDGE } from '../screen-geometry.mjs';
@@ -123,43 +123,112 @@ async function drive(b, { seconds, loop, decode = 0, held = false, moving = () =
   return { qp, frames: b.sent.filter(m => m.type === 'frame').length, most };
 }
 
-test('flight window: a viewer that holds more and reports its own delay gets the frames that fit the round trip; without either it stays at three', async () => {
-  const run = async (flight, held, loop = 100) => { const b = browser(); await b.core.handle(startMessage('smooth', { fps: 60, ...(flight ? { flight } : {}) })); await tick(); return drive(b, { seconds: 6, loop, held }); };
-  // 100 ms there and back at 60 a second: six frames are in the network at any moment.
-  const wide = await run(16, true);
-  assert.ok(wide.frames >= 6 * 56, `about 60 a second got through (${wide.frames} in 6 s)`);
-  assert.ok(wide.most > 5 && wide.most <= 8, `six in the network, at most two more (${wide.most})`);
-  // The same link with three: three frames per round trip.
-  for (const [name, three] of [['no capacity named', await run(undefined, true)], ['no delay reported', await run(16, false)]]) {
-    assert.equal(three.most, 3, name);
-    assert.ok(three.frames > 6 * 25 && three.frames < 6 * 34, `${name}: about 30 a second (${three.frames})`);
+/** One session on a modelled path, 1 ms resolution: a 60 Hz source, an encoder
+ * that outputs at once (`size(key, session)` bytes), then in order a forward
+ * link (`bw` bytes/ms, serial), `down` ms of delay, a phone bridge (`bridge`
+ * ms a frame, serial, BEFORE the page stamps the frame, so not in `heldMs`), a
+ * decoder (`decode` ms a frame, serial, in `heldMs`) and `up` ms back.
+ * Returns frames delivered a second and the median time from leaving the
+ * target to being decoded (both after `warm` seconds), the most frames and
+ * bytes ever unacknowledged, and the reason if the session ended. */
+async function link({ quality = 'smooth', fps, flight, held = true, source = 60, down = 50, up = 50, bw = Infinity, bridge = 0, decode = 0,
+  size = key => key ? 60_000 : 3_000, seconds = 8, warm = 3, lie } = {}) {
+  const b = browser(); await b.core.handle(startMessage(quality, { ...(fps ? { fps } : {}), ...(flight ? { flight } : {}) })); await tick();
+  const session = b.core.sessions.get('s1'), receipts = [], frames = new Map();
+  let seen = 0, linkFree = 0, bridgeFree = 0, decodeFree = 0, nextSource = 0, second = 1000, most = 0, mostBytes = 0, ended;
+  for (let at = 1; at <= seconds * 1000 && !ended; at++) {
+    b.advance(1); b.run();
+    while (receipts.length && receipts[0].at <= at) { const r = receipts.shift(); await b.core.handle({ type: 'credit', sessionId: 's1', frameSequence: r.sequence, streamGeneration: 1, ...(held ? { heldMs: r.heldMs } : {}) }); }
+    if (at >= nextSource) { nextSource += 1000 / source; b.push(b.frame(1280, 800)); await tick(); }
+    const encoder = b.encoders.at(-1);
+    while (encoder.encodes.length > encoder.emitted) { const key = encoder.encodes[encoder.emitted].keyFrame; encoder.emit(key ? 'key' : 'delta', Math.max(40, Math.round(size(key, session)))); }
+    const sent = b.sent.filter(m => m.type === 'frame');
+    for (; seen < sent.length; seen++) {
+      const bytes = sent[seen].bytes.byteLength;
+      const departed = Math.max(at, linkFree) + (Number.isFinite(bw) ? bytes / bw : 0); linkFree = departed;
+      const page = Math.max(departed + down, bridgeFree) + bridge; bridgeFree = page;
+      const done = Math.max(page, decodeFree) + decode; decodeFree = done;
+      const truly = Math.min(2000, Math.round(done - page));
+      frames.set(sent[seen].sequence, { sentAt: at, done, bytes });
+      receipts.push({ at: done + up, sequence: sent[seen].sequence, heldMs: lie ? lie(truly) : truly }); receipts.sort((x, y) => x.at - y.at);
+    }
+    most = Math.max(most, session.outstanding.size);
+    let bytes = 0; for (const entry of session.outstanding.values()) bytes += entry.bytes ?? 0; mostBytes = Math.max(mostBytes, bytes);
+    if (at >= second) { b.adapt(); second += 1000; }
+    ended = b.sent.find(m => m.type === 'ended')?.reason;
   }
-  // Never beyond what the viewer said it can hold.
-  assert.equal((await run(5, true, 240)).most, 5);
-  // A round trip under two frame intervals never goes beyond three, however slow the viewer.
-  const short = browser(); await short.core.handle(startMessage('smooth', { fps: 60, flight: 16 })); await tick();
-  assert.equal((await drive(short, { seconds: 4, loop: 20, decode: 60, held: true })).most, 3);
+  const settled = [...frames.values()].filter(f => f.sentAt >= warm * 1000 && f.done <= seconds * 1000), delays = settled.map(f => f.done - f.sentAt).sort((x, y) => x - y);
+  return { fps: settled.length / (seconds - warm), delay: delays[Math.floor(delays.length / 2)], most, mostBytes, ended, rtt: session.rtt, cadence: session.cadence };
+}
+
+test('flight window: on a long path a viewer that keeps up gets the frame rate, at the profile ceiling too; without a capacity or a held time it stays at three', async () => {
+  // 100 ms there and back, the source repainting at 60: six frames are in transit at any moment.
+  for (const [name, options] of [['asked for 60', { fps: 60 }], ['the profile ceiling of 120, source still 60', {}], ['200 ms', { down: 100, up: 100 }]]) {
+    const wide = await link({ flight: 16, ...options });
+    assert.ok(wide.fps > 56, `${name}: about 60 a second (${wide.fps})`);
+    assert.ok(wide.most <= 2 + Math.ceil((options.down ?? 50) * 2 / (1000 / 60)) && wide.most > 5, `${name}: the frames in transit plus two at most, not twice that (${wide.most})`);
+    assert.ok(wide.delay < (options.down ?? 50) + 12, `${name}: nothing queues (${wide.delay} ms to decoded)`);
+  }
+  for (const [name, three] of [['no capacity named', await link({ fps: 60 })], ['no held time reported', await link({ fps: 60, flight: 16, held: false })]]) {
+    assert.equal(three.most, 3, name);
+    assert.ok(three.fps > 24 && three.fps < 34, `${name}: three a round trip (${three.fps})`);
+  }
+  assert.equal((await link({ flight: 5, down: 120, up: 120 })).most, 5, 'never beyond what the viewer said it holds');
 });
 
-test('flight window: a slow decoder on a short path is not read as distance', async () => {
+test('flight window: a viewer or a link that returns frames slowly keeps a window near three however long the path', async () => {
+  // Each row: the same path with three, then with a capacity of 16. More frames a second when there are any to gain, and never a queue.
+  for (const [name, options, most, extra] of [
+    ['decodes in 25 ms, 100 ms path', { decode: 25 }, 6, 60],
+    ['decodes in 40 ms, 100 ms path', { decode: 40 }, 5, 90],
+    ['decodes in 60 ms, 100 ms path', { decode: 60 }, 4, 90],
+    ['decodes in 100 ms, 250 ms path', { decode: 100, down: 125, up: 125, seconds: 14, warm: 6 }, 5, 150],
+    ['a 1 Mbit/s link, text scrolling', { bw: 125, size: key => key ? 150_000 : 2_400, seconds: 14, warm: 6 }, 16, 60],
+    ['a 2 Mbit/s link, the whole picture repainting', { quality: 'balanced', bw: 250, size: (key, s) => (key ? 150_000 : 14_000) * 2 ** (-(s.qp - s.profile.qpBase) / 6), seconds: 16, warm: 8 }, 6, 120],
+    ['a phone bridge of 35 ms a frame, 4 ms path', { bridge: 35, down: 2, up: 2 }, 3, 5],
+    ['a short path, 60 ms decoder', { decode: 60, down: 2, up: 2 }, 3, 5],
+  ]) {
+    const three = await link(options), wide = await link({ ...options, flight: 16 });
+    assert.equal(wide.ended, undefined, name);
+    assert.ok(wide.most <= most, `${name}: at most ${most} in flight (${wide.most})`);
+    assert.ok(wide.fps >= three.fps - 1.5, `${name}: no slower than with three (${wide.fps} against ${three.fps})`);
+    assert.ok(wide.delay <= three.delay + extra, `${name}: at most ${extra} ms later than with three (${wide.delay} against ${three.delay})`);
+  }
+});
+
+test('flight window: beyond three frames the unacknowledged bytes are bounded; a held time that cannot be true is left out', async () => {
+  // 90 KB frames on a long, fast path: frames alone would allow sixteen (1.4 MB toward a viewer the Hub ends at 1 MiB).
+  const heavy = await link({ quality: 'sharp', flight: 16, down: 150, up: 150, size: key => key ? 200_000 : 90_000, seconds: 6, warm: 2 });
+  assert.equal(heavy.ended, undefined);
+  assert.ok(heavy.mostBytes <= FLIGHT_BYTES + 90_032, `unacknowledged bytes ${heavy.mostBytes}`);
+  assert.ok(heavy.most >= 3 && heavy.most < 9, `fewer frames than the path alone would take (${heavy.most})`);
+  // A viewer that claims to have held every frame for longer than the frame has existed: no round trip, so three.
+  const liar = await link({ flight: 16, lie: () => 2000 });
+  assert.deepEqual([liar.most, liar.rtt], [3, Infinity]);
+  // One such receipt among honest ones does not pin the session at three.
+  let n = 0; const once = await link({ flight: 16, lie: truly => ++n === 4 ? 2000 : truly });
+  assert.ok(once.most > 5 && once.fps > 56, `recovered: ${once.most} in flight, ${once.fps} a second`);
+});
+
+test('flight window: the round trip survives a new generation; the receipt pace is not read from a gap in which nothing was owed', async () => {
   const b = browser(); await b.core.handle(startMessage('smooth', { fps: 60, flight: 16 })); await tick();
-  // 100 ms a frame, receipts honest about the wait: the network share stays 10 ms.
-  const run = await drive(b, { seconds: 6, loop: 10, decode: 100, held: true });
-  assert.equal(run.most, 3);
-  // (The driver hands receipts over on its 60 Hz tick, so up to one tick is added to the 10 ms.)
-  assert.ok(b.core.sessions.get('s1').rtt < 30, `network round trip ${b.core.sessions.get('s1').rtt}`);
-});
-
-test('flight window: a capacity outside the range is clamped, and a nonsense delay is ignored', async () => {
-  const b = browser(); await b.core.handle(startMessage('smooth', { fps: 60, flight: 400 })); await tick();
   const session = b.core.sessions.get('s1');
-  assert.equal(session.flight, 16);
-  b.push(b.frame(1280, 800)); await tick(); b.encoders[0].emit('key');
-  b.advance(50);
-  await b.core.handle({ type: 'credit', sessionId: 's1', frameSequence: 1, streamGeneration: 1, heldMs: -5 });
-  assert.equal(session.rtt, Infinity);
-  const low = browser(); await low.core.handle(startMessage('smooth', { flight: 1 })); await tick();
-  assert.equal(low.core.sessions.get('s1').flight, 3);
+  const send = async (sequence, generation) => { b.push(b.frame(1280, 800)); await tick(); b.encoders.at(-1).emit(session.outstanding.size === 1 && !session.chainStarted ? 'key' : 'delta'); assert.ok(session.outstanding.has(sequence)); return generation; };
+  const receipt = (frameSequence, streamGeneration, heldMs) => b.core.handle({ type: 'credit', sessionId: 's1', frameSequence, streamGeneration, heldMs });
+  await send(1, 1); b.advance(80); await receipt(1, 1, 10);
+  assert.equal(session.rtt, 70);
+  assert.equal(session.cadence, undefined, 'one receipt is not a pace');
+  // Five seconds of an idle screen, then one frame: that gap says nothing about the viewer.
+  b.advance(5000); await send(2, 1); b.advance(80); await receipt(2, 1, 10);
+  assert.equal(session.cadence, undefined);
+  // Two frames owed at once: the gap between their receipts is the pace. A receipt for the later one covers both.
+  b.advance(100); await send(3, 1); b.advance(17); await send(4, 1); b.advance(17); await send(5, 1);
+  b.advance(60); await receipt(3, 1, 5); b.advance(40); await receipt(5, 1, 5);
+  assert.equal(session.cadence, 20, 'forty milliseconds for two frames');
+  assert.equal(session.outstanding.size, 0);
+  // A reset starts a new generation: the path is the same one.
+  await b.core.handle({ type: 'reset', sessionId: 's1', streamGeneration: 2, geometryRevision: 1 });
+  assert.deepEqual([session.rtt, session.cadence, session.owed], [70, 20, false]);
 });
 
 test('crowding, driven: motion in spurts over a long round trip keeps the resting quantizer', async () => {

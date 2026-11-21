@@ -217,7 +217,7 @@ export class HubRemoteScreen {
     this.notify(live); return claim.id;
   }
   /** This session's viewer named a capacity and the registered target understands it. */
-  private flight(live: Live): boolean { return live.flight !== undefined && this.serviceFeatures.has(SCREEN_SERVICE_FLIGHT_FEATURE); }
+  private wide(live: Live): boolean { return live.flight !== undefined && this.serviceFeatures.has(SCREEN_SERVICE_FLIGHT_FEATURE); }
   /** The byte budget this session's target is held to (fixed when the session started). */
   mediaBytesPerMs(sessionId: string): number { return this.sessions.get(sessionId)?.mediaBytesPerMs ?? SCREEN_MEDIA_BYTES_PER_MS; }
   private startVisible(live: Live): void {
@@ -231,7 +231,7 @@ export class HubRemoteScreen {
       if (!this.toService({ type: "start", session: structuredClone(live.value), mediaTicket, streamGeneration: live.streamGeneration, codecs: live.codecs, ...(live.quality !== undefined ? { quality: live.quality } : {}),
         ...(live.mediaBytesPerMs !== SCREEN_MEDIA_BYTES_PER_MS ? { mediaBytesPerMs: live.mediaBytesPerMs } : {}),
         // The viewer's capacity, when it named one and the target can use it.
-        ...(this.flight(live) ? { flight: live.flight } : {}) })) { this.closeSession(live.value.id, "screen_service_offline"); throw new HubError("screen_service_offline", 503); }
+        ...(this.wide(live) ? { flight: live.flight } : {}) })) { this.closeSession(live.value.id, "screen_service_offline"); throw new HubError("screen_service_offline", 503); }
     }
   }
   private toService(command: ScreenServiceCommand): boolean { return this.service?.send(command) ?? false; }
@@ -299,7 +299,7 @@ export class HubRemoteScreen {
         // in serviceFrameConfirmed; a late ACK never makes old video controllable.
         frame.pendingAck = true;
         if (!this.toService({ type: "ack", sessionId, frameSequence: input.frameSequence, streamGeneration: frame.streamGeneration,
-          ...(input.heldMs !== undefined && this.flight(live) ? { heldMs: input.heldMs } : {}) })) this.closeSession(sessionId, "screen_service_offline");
+          ...(input.heldMs !== undefined && this.wide(live) ? { heldMs: input.heldMs } : {}) })) this.closeSession(sessionId, "screen_service_offline");
         return;
       }
     }

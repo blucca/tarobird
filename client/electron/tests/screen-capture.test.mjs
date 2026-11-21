@@ -453,6 +453,28 @@ test('host: a start stopped while its source is still resolving releases the que
   host.close();
 });
 
+test('host: the viewer capacity on start and the held time on a receipt reach the page as given; neither is added when absent', async () => {
+  const fake = electronFake(), sent = [], pause = () => new Promise(r => setTimeout(r, 10));
+  let release;
+  const host = new ScreenCaptureHost({ electron: fake.electron, root: '/x', preload: '/p.cjs', onMessage() {}, onGone() {},
+    resolveSource: display => new Promise(resolve => { release = () => resolve({ id: `source-${display.id}` }); }) });
+  const begin = async (id, extra) => {
+    const started = host.start({ sessionId: id, display: { id, revision: 1 }, streamGeneration: 1, codecs: ['h264'], encode: { width: 2, height: 2 }, ...extra });
+    await pause(); fake.windows.at(-1).onPage = data => sent.push(data);   // the page window may be a new one after the last session ended
+    release(); await pause();
+    await new Promise(resolve => fake.handlers.display({ frame: { processId: 7, routingId: 9 }, audioRequested: false }, resolve));
+    fake.windows.at(-1).page.postMessage({ type: 'started', sessionId: id }); await started;
+  };
+  await begin('A', { flight: 12 }); host.credit('A', 5, 1, 14); host.credit('A', 6, 1, 0); host.credit('A', 7, 1);
+  host.stop('A'); await pause();
+  await begin('B', {}); await pause();
+  const starts = sent.filter(m => m.type === 'start'), credits = sent.filter(m => m.type === 'credit');
+  assert.deepEqual(starts.map(m => [m.sessionId, m.flight, 'flight' in m]), [['A', 12, true], ['B', undefined, false]]);
+  assert.deepEqual(credits, [{ type: 'credit', sessionId: 'A', frameSequence: 5, streamGeneration: 1, heldMs: 14 }, { type: 'credit', sessionId: 'A', frameSequence: 6, streamGeneration: 1, heldMs: 0 },
+    { type: 'credit', sessionId: 'A', frameSequence: 7, streamGeneration: 1 }]);
+  host.close?.();
+});
+
 test('host: cancelling a QUEUED start never lets a later start overtake the still-active earlier one', async () => {
   const fake = electronFake(), sent = [];
   let releaseA;

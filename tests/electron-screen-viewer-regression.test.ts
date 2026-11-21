@@ -95,21 +95,22 @@ it("copies the exact binary view without an ArrayBuffer transfer list or neighbo
   expect(handedOff[0]![2]).toEqual([rendererPort]);
 });
 
-it("accepts a fourth frame after a receipt frees one of three IPC credits", async () => {
+it("accepts another frame after a receipt frees one of the hop's slots", async () => {
   const { mainPort, media } = await fixture();
-  for (let sequence = 1; sequence <= 3; sequence++) media.receive(packet(sequence));
+  // The hop holds two flight windows (2 × 16): the current generation's and one a restart superseded.
+  for (let sequence = 1; sequence <= 32; sequence++) media.receive(packet(sequence));
   mainPort.emit("message", { data: { type: "received", sequence: 1 } });
-  media.receive(packet(4));
-  expect(binaryMessages(mainPort)).toHaveLength(4);
+  media.receive(packet(33));
+  expect(binaryMessages(mainPort)).toHaveLength(33);
   expect(mainPort.closed).toBe(false);
   expect(media.signal.aborted).toBe(false);
 });
 
 it("terminates the entire viewer when the IPC window fills instead of dropping a delta and continuing", async () => {
   const { viewers, mainPort, media } = await fixture();
-  // The hop holds the largest flight window (16) awaiting receipt; one more ends the viewer.
-  for (let sequence = 1; sequence <= 17; sequence++) media.receive(packet(sequence));
-  expect(binaryMessages(mainPort)).toHaveLength(16);
+  // The hop holds two flight windows (32) awaiting receipt; one more ends the viewer.
+  for (let sequence = 1; sequence <= 33; sequence++) media.receive(packet(sequence));
+  expect(binaryMessages(mainPort)).toHaveLength(32);
   expect(mainPort.messages.at(-1)?.[0]).toEqual({ type: "closed", reason: "screen_viewer_congested" });
   expect(mainPort.closed).toBe(true);
   expect(viewers.viewers.size).toBe(0);

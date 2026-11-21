@@ -83,10 +83,10 @@ export class ScreenViewers {
       viewer.media = openScreenSocket(route, pin, 'media', args.join.mediaTicket, { signal: abort.signal, close: fail, receive: value => {
         if (value instanceof Uint8Array) {
           const header = readScreenFrame(value);checkQuality(header);
-          if (viewer.pending.size >= SCREEN_FLIGHT_MAX) { fail('screen_viewer_congested'); return; }
+          if (viewer.pending.size >= 2 * SCREEN_FLIGHT_MAX) { fail('screen_viewer_congested'); return; }
           viewer.pending.set(header.sequence, Date.now());
           // Electron MessagePortMain structured clones ArrayBuffers (no video JSON).
-          // At most the largest flight window may be awaiting receipt in this hop.
+          // At most the largest flight window, and one more of a generation a restart superseded, may be awaiting receipt in this hop.
           post(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
         } else if (value.type === 'attached') { if (screenViewerEventSchema.parse(value).sessionId !== id) throw new Error('screen_session_changed'); }
         else {const stream=screenStreamSchema.parse(value);checkQuality(stream);post(stream);}

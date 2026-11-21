@@ -68,13 +68,23 @@ over a long path means three frames per round trip (30 a second at 100 ms). A
 viewer may now name how many frames it can hold (`flight` on `screenOpen`, 16
 for the desktop viewer and the phone apps) and say on each receipt how long it
 held the frame (`heldMs`: decode, draw and the wait for a repaint). The target
-subtracts that from the time since the frame left and keeps the shortest
-result of the session as the network round trip: the shortest, so a queue at
-the viewer or in the network is never read as distance. The window is then
-the whole frames that fit in that round trip plus two, never below three and
-never above the viewer's capacity. A round trip under two frame intervals
-still gives three, so nothing changes on a local network, and a viewer that
-decodes slowly is not given more frames to wait behind.
+then knows two things about the path:
+
+- the network round trip: the time since the frame left less `heldMs`, the
+  shortest value of the session (a figure that would be negative is left out);
+- the pace receipts really come back at while frames are still owed, per
+  frame, smoothed over the last few. An idle screen gives no sample.
+
+The window is the whole frames in the round trip at that pace (the pace never
+taken as faster than the session's interval, and a quarter of a frame allowed
+for noise in the two measurements), plus two, never below three and never
+above the viewer's capacity. It stays three until eight receipts have shown the pace. A
+path that is long and returns receipts at the frame rate widens the window to
+the frames really in transit. A viewer, a link or a phone bridge that returns
+frames slowly keeps it near three however long the path, because more frames
+in flight would only queue in front of it. Beyond three frames the
+unacknowledged bytes are bounded as well (512 KiB, half of what the Hub lets
+wait for a viewer before it ends the session).
 
 **Byte budget by route.** A viewer whose media socket reaches the Hub straight
 from a local-network address (RFC 1918, link-local, unique-local) gets
@@ -135,16 +145,30 @@ full-window text scroll, the viewer's receipt carrying its held time):
 | Round trip | Three frames | Capacity 16 |
 |---|---|---|
 | 10 ms | — | 59.6 |
-| 100 ms | 26.1 | 59.6 |
-| 200 ms | 13.9 | 59.6 |
+| 100 ms | 25.9 | 59.5 |
+| 150 ms | — | 59.1 |
+| 200 ms | 13.9 | 56.9 |
 
 A decoder configured with `avc1.640028` decoded a level 4.2 stream of
 1920×1080 at 60 without an error (Chromium on this Mac).
 
-Simulated, not measured (the real capture core on a virtual clock): over a
-100 ms round trip a viewer that names 16 and reports its held time receives
-about 60 a second with at most eight frames in flight, where three give about
-30; motion in
+Modelled, not measured (the real capture core on a virtual clock, with a
+link, a phone bridge and a decoder that take frames one at a time; frames a
+second, and the median time from leaving the target to being decoded):
+
+| Path and viewer | Three frames | Capacity 16 |
+|---|---|---|
+| keeps up, 100 ms round trip | 30.0, 50 ms | 59.4, 50 ms |
+| keeps up, 200 ms | 15.0, 100 ms | 58.8, 100 ms |
+| decodes in 25 ms, 100 ms | 23.8, 75 ms | 39.2, 100 ms |
+| decodes in 40 ms, 100 ms | 21.0, 90 ms | 24.6, 110 ms |
+| decodes in 60 ms, 100 ms | 16.2, 130 ms | 16.2, 130 ms |
+| decodes in 100 ms, 250 ms | 8.4, 225 ms | 9.8, 275 ms |
+| 1 Mbit/s link, text scrolling, 100 ms | 24.9, 69 ms | 50.8, 105 ms |
+| 2 Mbit/s link, whole picture repainting, 100 ms | 17.6, 118 ms | 17.5, 174 ms |
+| phone bridge of 35 ms a frame, 4 ms | 28.0, 103 ms | 28.0, 103 ms |
+
+Also modelled: motion in
 spurts with receipts 100 ms after each frame keeps the resting quantizer; a
 viewer that takes 40 ms a frame receives about 25 a second at the resting
 quantizer; one that takes 100 ms a frame is coarsened to the ceiling.
@@ -159,6 +183,9 @@ quantizer; one that takes 100 ms a frame is coarsened to the ceiling.
 - With an older viewer, Hub or target the window stays three: through a relay
   that is about three frames per round trip (60 needs 50 ms or less, 100 ms
   gives 30).
+- Where the path is long and the viewer or the link is the slower part, the
+  wider window can add delay for few or no extra frames (rows above: 20 to
+  56 ms). A viewer that decodes in 60 ms or more keeps a window of three.
 
 ## Not verified
 

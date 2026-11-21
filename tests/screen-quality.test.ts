@@ -17,7 +17,7 @@ import { deviceActionProofText } from "../src/client-protocol/device-actions.js"
 import { CAPABILITIES, SERVER_CAPABILITIES } from "../src/client-protocol/index.js";
 import {
   REMOTE_SCREEN_FLIGHT_CAPABILITY, REMOTE_SCREEN_QUALITY_CAPABILITY, SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_SERVICE_FLIGHT_FEATURE, SCREEN_CONTROL_RATE_CAPABILITY, SCREEN_MEDIA_BYTES_PER_MS, SCREEN_MEDIA_DIRECT_BYTES_PER_MS, SCREEN_SERVICE_PACE_FEATURE, SCREEN_SERVICE_QUALITY_FEATURE,
-  screenConfigureText, screenJoinSchema, screenOpenSchema, screenServiceCommandSchema, screenServiceHelloSchema,
+  screenConfigureText, screenJoinSchema, screenOpenSchema, screenServiceCommandSchema, screenServiceHelloSchema, screenViewerCommandSchema,
   type ScreenConfigure, type ScreenDesktop, type ScreenJoin,
 } from "../src/client-protocol/remote-screen.js";
 import { writeScreenFrame } from "../src/client-protocol/screen-wire.js";
@@ -135,6 +135,7 @@ describe("Hub authority", () => {
     const both = await round([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE], { flight: 12 }, 14);
     expect([both.start.flight, both.ack.heldMs]).toEqual([12, 14]);
     expect(() => screenServiceCommandSchema.parse(both.start)).not.toThrow(); expect(() => screenServiceCommandSchema.parse(both.ack)).not.toThrow();
+    expect((await round([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE], { flight: 3 }, 0)).ack.heldMs).toBe(0);
     // An older target: the same viewer, the start and the receipt it always got.
     const oldTarget = await round([SCREEN_SERVICE_QUALITY_FEATURE], { flight: 12 }, 14);
     expect("flight" in oldTarget.start || "heldMs" in oldTarget.ack).toBe(false);
@@ -144,6 +145,8 @@ describe("Hub authority", () => {
     expect("flight" in plain.start || "heldMs" in plain.ack).toBe(false);
     register([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE]);
     for (const flight of [2, 17, 3.5]) await expect(open({ flight })).rejects.toThrow();
+    const receipt = (heldMs: unknown) => screenViewerCommandSchema.safeParse({ type: "ack", sessionId: "s", generation: "g", frameSequence: 1, heldMs }).success;
+    expect([receipt(0), receipt(2000), receipt(2001), receipt(-1), receipt(1.5)]).toEqual([true, true, false, false, false]);
   });
 
   it("a target that never advertised the pace feature is never sent a budget, wherever the viewer is", async () => {

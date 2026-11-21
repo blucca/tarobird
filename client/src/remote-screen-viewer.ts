@@ -1,4 +1,4 @@
-import { SCREEN_FLIGHT_MAX, SCREEN_FLIGHT_MIN, SCREEN_QUALITY_PROFILES, screenQualityProfile, type ScreenQuality } from "../../src/client-protocol/screen-quality.js";
+import { SCREEN_FLIGHT_MAX, SCREEN_FLIGHT_MIN, SCREEN_HELD_MAX_MS, SCREEN_QUALITY_PROFILES, screenQualityProfile, type ScreenQuality } from "../../src/client-protocol/screen-quality.js";
 import { screenStreamSchema, screenViewerEventSchema, type ScreenInputEvent, type ScreenJoin, type ScreenStream } from "../../src/client-protocol/remote-screen.js";
 import { readScreenFrame, SCREEN_HEADER_BYTES } from "../../src/client-protocol/screen-wire.js";
 import { electronScreenViewerTransport, type ScreenViewerChannel, type ScreenViewerPort, type ScreenViewerTransport } from "./screen-viewer-transport.js";
@@ -120,7 +120,7 @@ export class RemoteScreenViewer {
           const sequence = frame.timestamp;
           requestAnimationFrame(() => {
             // The receipt says how long the frame was here (decode, draw, this repaint), so the target can tell the network's share of the round trip.
-          if (this.visible && !this.disposed && epoch === this.streamEpoch) { this.frames.delete(sequence); this.send({ type: "ack", frameSequence: sequence, ...(this.reportHeld ? { heldMs: Math.min(2000, Math.max(0, Math.round(performance.now() - record.at))) } : {}) }); }
+          if (this.visible && !this.disposed && epoch === this.streamEpoch) { this.frames.delete(sequence); this.send({ type: "ack", frameSequence: sequence, ...(this.reportHeld ? { heldMs: Math.min(SCREEN_HELD_MAX_MS, Math.max(0, Math.round(performance.now() - record.at))) } : {}) }); }
           });
         } catch (error) { this.fail(error instanceof Error ? error.message : "screen_decode_failed"); } finally { frame.close(); }
       } });

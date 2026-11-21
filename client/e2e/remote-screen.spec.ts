@@ -184,11 +184,18 @@ test("old target quality refusal requires explicit default fallback; old Hosts n
 
 test("the capacity is named only to a Host that knows the field, and receipts then say how long each frame was held",async({page})=>{
  // The fixture Host advertises nothing about it: the open and every receipt are what they always were.
+ const receipts=()=>page.evaluate(()=>(window as any).screenFixture.commands.filter((command:any)=>command.type==="ack"));
  expect(await page.evaluate(()=>Object.hasOwn((window as any).screenFixture.requests.at(-1),"flight"))).toBe(false);
+ await expect.poll(async()=>(await receipts()).length).toBeGreaterThan(0);
+ expect((await receipts()).every((command:any)=>!Object.hasOwn(command,"heldMs"))).toBe(true);
  await page.getByRole("button",{name:"断开",exact:true}).click();
  await page.evaluate(()=>{(window as any).screenConnection.state.screenFlightAvailable=true;});
  await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
  expect(await page.evaluate(()=>(window as any).screenFixture.requests.at(-1).flight)).toBe(16);
+ const before=(await receipts()).length;
+ await expect.poll(async()=>(await receipts()).length).toBeGreaterThan(before);
+ const held=(await receipts()).slice(before).map((command:any)=>command.heldMs);
+ expect(held.every((value:unknown)=>Number.isInteger(value)&&(value as number)>=0&&(value as number)<=2000)).toBe(true);
 });
 
 test("missing quality confirmation retires the returned session instead of silently displaying another profile",async({page})=>{

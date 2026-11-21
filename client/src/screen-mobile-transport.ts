@@ -40,7 +40,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
     let receive: ((value: unknown) => void) | undefined, terminal: string | undefined, ending: ReturnType<typeof setTimeout> | undefined;
     let sequence = 0, jsonCount = 0, jsonBytes = 0, binaryCount = 0, binaryBytes = 0, commands = 0, commandBytes = 0;
     // Stream configs counted as they arrive: native delivers each before its generation's packets.
-    let streams = 0, streamBinaries = 0, window = BINARY_WINDOW;
+    let streams = 0, streamBinaries = 0, capacity = BINARY_WINDOW;
     let incoming = Promise.resolve(), outgoing = Promise.resolve();
     const receipts = new Map<number, { deliverySequence: number; bytes: number; stream: number }>();
     const close = (reason?: string) => {
@@ -82,7 +82,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
           if ((command.type === "input" || command.type === "renew") && !focused) return;
           const bytes = size(command);
           const admittedFocus = focusGeneration;
-          if (++commands > window + PENDING_SLACK || (commandBytes += bytes) > CONTROL_BYTES) throw new Error("screen_congested");
+          if (++commands > capacity + PENDING_SLACK || (commandBytes += bytes) > CONTROL_BYTES) throw new Error("screen_congested");
           outgoing = outgoing.then(async () => {
             if ((command.type === "input" || command.type === "renew") && (!focused || admittedFocus !== focusGeneration)) return;
             if (live()) await bridge.invoke("net_screen_send", { id: allocation!.id, command }).catch(error => {
@@ -105,7 +105,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
         sequence = deliverySequence;
         if (value.kind === "screen") {
           const bytes = size(value.value);
-          if (bytes > CONTROL_BYTES || ++jsonCount > window + PENDING_SLACK || (jsonBytes += bytes) > JSON_BYTES) throw new Error("screen_congested");
+          if (bytes > CONTROL_BYTES || ++jsonCount > capacity + PENDING_SLACK || (jsonBytes += bytes) > JSON_BYTES) throw new Error("screen_congested");
           const data = (value.value as { type?: unknown })?.type === "stream" ? screenStreamSchema.parse(value.value) : screenViewerEventSchema.parse(value.value);
           if ("sessionId" in data && data.sessionId !== join.session.id || "session" in data && (data.session.id !== join.session.id || data.session.generation !== join.session.generation) || "generation" in data && data.generation !== join.session.generation) throw new Error("screen_session_changed");
           if (data.type === "stream") { streams++; streamBinaries = 0; }
@@ -117,7 +117,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
         } else if (value.kind === "binary") {
           const bytes = value.byteLength as number;
           if (!Number.isSafeInteger(bytes) || bytes <= 32 || bytes > SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
-          if (++streamBinaries > window || ++binaryCount > 2 * window || (binaryBytes += bytes) > 2 * window * SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
+          if (++streamBinaries > capacity || ++binaryCount > 2 * capacity || (binaryBytes += bytes) > 2 * capacity * SCREEN_PACKET_LIMIT) throw new Error("screen_congested");
           const stream = streams;
           incoming = incoming.then(async () => {
             if (!live()) return;
@@ -141,7 +141,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
       async open(network, events) {
         if (opening || closed) throw new Error("screen_connection_changed"); opening = true;
         try {
-          if (bridge.window) window = Math.max(BINARY_WINDOW, Math.floor(await bridge.window() ?? BINARY_WINDOW) || BINARY_WINDOW);
+          if (bridge.window) capacity = Math.max(BINARY_WINDOW, Math.floor(await bridge.window() ?? BINARY_WINDOW) || BINARY_WINDOW);
           const lease = await bridge.allocate(); allocation = lease;
           if (closed) { void bridge.invoke("net_screen_close", { id: lease.id }).catch(() => undefined); return; }
           if (lease.signal.aborted) { close(); throw new Error("screen_connection_changed"); }

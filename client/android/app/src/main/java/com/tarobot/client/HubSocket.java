@@ -150,7 +150,7 @@ final class HubSocket extends WebSocketClient {
     }
     private HubSocket(HubTls.Route route, Listener listener, ScheduledExecutorService deadlines, String path, boolean binaryAllowed, int writeLimit, BoundedDraft draft) {
         super(URI.create(route.base.newBuilder().encodedPath(path).build().toString().replaceFirst("^https:","wss:")),draft);
-        this.route=route; this.listener=listener; this.deadlines=deadlines; this.receipt=draft.receipt; this.binaryAllowed=binaryAllowed; this.writeLimit=writeLimit; this.writeFrames=writeLimit==WRITE_LIMIT?WRITE_FRAMES:8;
+        this.route=route; this.listener=listener; this.deadlines=deadlines; this.receipt=draft.receipt; this.binaryAllowed=binaryAllowed; this.writeLimit=writeLimit; this.writeFrames=writeLimit==WRITE_LIMIT?WRITE_FRAMES:HubScreenSession.PENDING; // a screen socket: a receipt per frame of the flight window, plus input
         setProxy(Proxy.NO_PROXY); setConnectionLostTimeout(0); setDaemon(true);
     }
     private void attach(Socket socket) throws IOException {

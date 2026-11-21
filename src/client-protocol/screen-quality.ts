@@ -43,9 +43,12 @@ export const SCREEN_QUALITY_PROFILES: Readonly<Record<ScreenQuality, Readonly<Sc
 /** Largest stream any profile may produce (the shared stream schema bound). */
 export const SCREEN_STREAM_MAX_EDGE = 3072, SCREEN_STREAM_MAX_AREA = 3072 * 1920;
 /** Frames a target keeps unacknowledged at once. Three always; more only for a
- * viewer that said how many it can hold (`flight` on open), and then only as
- * many as the measured network round trip needs, never above the maximum. */
+ * viewer that said how many it can hold (`flight` on open), and then only the
+ * frames really in transit on its path (see the capture core), never above
+ * the maximum. */
 export const SCREEN_FLIGHT_MIN = 3, SCREEN_FLIGHT_MAX = 16;
+/** The longest a viewer may say it held a frame (`heldMs`): frames are only fresh for this long. */
+export const SCREEN_HELD_MAX_MS = 2000;
 /** The rate every stream ran at before profiles named their own. */
 export const SCREEN_LEGACY_FPS = 15;
 /** The rates a target tries for a profile, highest first: its ceiling, then each lower standard rate. */

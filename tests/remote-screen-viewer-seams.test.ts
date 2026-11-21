@@ -223,15 +223,26 @@ it("a viewer opened with a capacity takes that many frames before their receipts
 
   // Eight named: six frames wait undecoded without a failure, and each receipt carries the time the frame spent here.
   const wide = await open(8);
+  const settle = () => new Promise(resolve => setTimeout(resolve, 5));   // a refusal lands asynchronously
   for (let sequence = 1; sequence <= 6; sequence++) wide.f.deliver(frame(1, sequence));
-  expect(wide.viewer.state.state).not.toBe("closed");
+  await settle(); expect(wide.viewer.state.state).not.toBe("closed");
   now = 1012; decoded(1); now = 1031.4; decoded(2);
   expect(acks(wide.f)).toEqual([{ type: "ack", frameSequence: 1, heldMs: 12, ...stamp }, { type: "ack", frameSequence: 2, heldMs: 31, ...stamp }]);
   for (let sequence = 7; sequence <= 10; sequence++) wide.f.deliver(frame(1, sequence));   // 3..10: eight held
-  expect(wide.viewer.state.state).not.toBe("closed");
+  await settle(); expect(wide.viewer.state.state).not.toBe("closed");
   wide.f.deliver(frame(1, 11));
   await vi.waitFor(() => expect(wide.viewer.state).toMatchObject({ state: "closed", reason: "screen_decoder_congested" }));
   wide.viewer.dispose();
+
+  // A capacity outside the range is brought inside it; a held time is never reported above two seconds.
+  const most = await open(400);
+  for (let sequence = 1; sequence <= 16; sequence++) most.f.deliver(frame(1, sequence));
+  await settle(); expect(most.viewer.state.state).not.toBe("closed");
+  now += 9000; decoded(1);
+  expect(acks(most.f)).toEqual([{ type: "ack", frameSequence: 1, heldMs: 2000, ...stamp }]);
+  most.f.deliver(frame(1, 17)); most.f.deliver(frame(1, 18));
+  await vi.waitFor(() => expect(most.viewer.state).toMatchObject({ state: "closed", reason: "screen_decoder_congested" }));
+  most.viewer.dispose();
 
   // None named: three, and the receipt it always sent.
   const plain = await open();

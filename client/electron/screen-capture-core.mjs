@@ -2,17 +2,28 @@
 // injected so the generation, credit and race rules are testable without a
 // real screen. The page entry (screen-capture-page.mjs) passes real globals.
 import { SCREEN_FLIGHT_MAX, SCREEN_FLIGHT_MIN, screenH264Codec, screenH264EncoderCodec, screenRateLadder } from '../../src/client-protocol/screen-quality.ts';
-/** Frames kept unacknowledged at once. Three for any viewer. A viewer that
- * says it can hold more (`flight`) and reports how long it held each frame
- * lets the window follow the network: the whole frames that fit in the
- * shortest round trip seen (the shortest, so queueing is never read as
- * distance) plus two for the viewer's own decode and repaint, up to what the
- * viewer holds. A round trip under two frame intervals still gives three;
- * over a relay it is what keeps the rate from being three frames per round
- * trip. */
+/** Frames kept unacknowledged at once (the flight window). Three for any
+ * viewer. A viewer that says it can hold more (`flight`) and reports how long
+ * it held each frame lets the window follow the path: the frames really in
+ * transit, which is the network round trip (the shortest seen this session)
+ * divided by the pace receipts actually come back at while frames are still
+ * owed (a quarter of a frame is allowed for noise in the two measurements),
+ * plus two for the viewer's own decode and repaint. That pace is never taken
+ * as faster than the session's interval. So a viewer, a link or a phone
+ * bridge that returns frames slowly keeps a window near three however long
+ * the path: more frames in flight would only queue in front of it. A path that
+ * is long and returns receipts at the frame rate widens it, up to what the
+ * viewer holds, and only once that pace has been seen over a few receipts:
+ * until then, as at the start of every session, it is three. Beyond three
+ * frames the unacknowledged bytes are bounded too. */
 export const CAPTURE_CREDITS = SCREEN_FLIGHT_MIN;
-const flightWindow = session => Number.isFinite(session.rtt)
-  ? Math.min(session.flight, Math.max(CAPTURE_CREDITS, 2 + Math.floor(session.rtt / session.interval))) : CAPTURE_CREDITS;
+/** Receipts whose spacing must have been seen before the window may widen. */
+const PACE_SAMPLES = 8;
+/** Unacknowledged bytes allowed beyond three frames: half of what the Hub lets
+ * wait unsent for a viewer (1 MiB) before it ends the session as congested. */
+export const FLIGHT_BYTES = 512 * 1024;
+const flightWindow = session => Number.isFinite(session.rtt) && session.paced >= PACE_SAMPLES
+  ? Math.min(session.flight, Math.max(CAPTURE_CREDITS, 2 + Math.floor(session.rtt / Math.max(session.interval, session.cadence) + 0.25))) : CAPTURE_CREDITS;
 /** A raw frame that waited this long for a credit is dropped, never encoded:
  * the Host refuses frames older than 2 s, and a stale delta cannot be skipped. */
 export const CAPTURE_HELD_MAX_MS = 1500;
@@ -103,8 +114,9 @@ export function createCaptureCore(env) {
     const settings = encoderProfile(fps, profile);
     const session = { sessionId, codecs, encode, profile: settings, interval: 1000 / settings.fps, sequence: 0, outstanding: new Map(), pendingOutput: [],
       geometryRevision, streamGeneration: 0, paused: false, needKey: true, qp: settings.qpBase, crowded: 0, encoded: 0, calm: 0, held: undefined, dueAt: -Infinity, epoch: 0,
-      // The viewer's capacity, and the shortest network round trip its receipts have shown (session-wide: the path does not change with a generation).
-      flight: Math.round(bounded(flight, CAPTURE_CREDITS, SCREEN_FLIGHT_MAX, CAPTURE_CREDITS)), rtt: Infinity,
+      // The viewer's capacity, the shortest network round trip its receipts have shown and the pace they come back at
+      // (session-wide: the path and the viewer do not change with a generation).
+      flight: Math.round(bounded(flight, CAPTURE_CREDITS, SCREEN_FLIGHT_MAX, CAPTURE_CREDITS)), rtt: Infinity, cadence: undefined, paced: 0, creditAt: undefined, owed: false,
       // Session-wide, across generations: bytes sent count against the Hub budget whatever their chain.
       bucket: PACE_BURST_BYTES, bucketAt: perf(), lastKeyBytes: 0, lastDeltaBytes: 0, starved: 0, outbox: [], outputTimer: undefined };
     sessions.set(sessionId, session);
@@ -161,7 +173,7 @@ export function createCaptureCore(env) {
   function retire(session) {
     session.epoch++;
     const encoder = session.encoder; session.encoder = undefined;
-    session.outstanding.clear(); session.pendingOutput = []; session.outbox = [];
+    session.outstanding.clear(); session.pendingOutput = []; session.outbox = []; session.owed = false;
     session.held?.frame.close(); session.held = undefined;
     timers.clearTimeout(session.pacing); session.pacing = undefined;
     timers.clearTimeout(session.outputTimer); session.outputTimer = undefined;
@@ -226,6 +238,12 @@ export function createCaptureCore(env) {
     refill(session);
     const expect = key => key ? session.lastKeyBytes : session.lastDeltaBytes;
     const committed = session.outbox.reduce((n, entry) => n + entry.bytes.byteLength, 0) + session.pendingOutput.reduce((n, entry) => n + expect(entry.key), 0);
+    // Beyond three frames everything not yet acknowledged counts: what has left, what waits to leave and the next frame.
+    if (session.outstanding.size >= CAPTURE_CREDITS) {
+      let unacknowledged = committed + expect(session.needKey);
+      for (const entry of session.outstanding.values()) unacknowledged += entry.bytes ?? 0;
+      if (unacknowledged > FLIGHT_BYTES) { session.held.blocked = true; return; }
+    }
     const need = Math.min(PACE_BURST_BYTES, committed + Math.min(PACE_BURST_BYTES / 2, expect(session.needKey)));
     // Cadence follows a schedule of slots one interval apart, not the time of
     // the previous encode: a late timer or a late frame delays that one frame
@@ -303,7 +321,7 @@ export function createCaptureCore(env) {
         return;
       }
       session.outbox.shift(); session.bucket -= size;
-      const credit = session.outstanding.get(head.meta.sequence); if (credit) { credit.sent = true; credit.sentAt = perf(); }
+      const credit = session.outstanding.get(head.meta.sequence); if (credit) { credit.sent = true; credit.sentAt = perf(); credit.bytes = size; }
       // Copied, never transferred: Electron 45.1.0 main hangs on ArrayBuffer transfer.
       send({ type: 'frame', sessionId: session.sessionId, bytes: head.bytes, sequence: head.meta.sequence, streamGeneration: head.generation, captureMs: head.meta.captureMs,
         geometryRevision: head.meta.geometryRevision, key: head.key });
@@ -316,10 +334,17 @@ export function createCaptureCore(env) {
   function credit(session, { frameSequence, streamGeneration, heldMs }) {
     const entry = session.outstanding.get(frameSequence);
     if (streamGeneration !== session.streamGeneration || !entry) return;
+    const at = perf();
     // The network's share of this frame's round trip: the time since it left, less what the viewer says it held it.
-    if (Number.isFinite(heldMs) && heldMs >= 0 && entry.sentAt !== undefined) session.rtt = Math.min(session.rtt, Math.max(0, perf() - entry.sentAt - heldMs));
+    // A figure that would make it negative is the viewer's mistake and is left out, not kept as a round trip of zero.
+    if (Number.isFinite(heldMs) && heldMs >= 0) { const sample = at - entry.sentAt - heldMs; if (sample >= 0) session.rtt = Math.min(session.rtt, sample); }
     // In-order TCP: an ACK for N also covers every earlier frame of this generation.
-    for (const sequence of [...session.outstanding.keys()]) if (sequence <= frameSequence) session.outstanding.delete(sequence);
+    let released = 0;
+    for (const sequence of [...session.outstanding.keys()]) if (sequence <= frameSequence) { session.outstanding.delete(sequence); released++; }
+    // The pace receipts come back at, per frame, smoothed over the last few. Counted only when
+    // frames were still owed after the previous receipt: an idle screen is not a slow viewer.
+    if (session.owed && session.creditAt !== undefined) { const gap = (at - session.creditAt) / released; session.cadence = session.cadence === undefined ? gap : session.cadence + (gap - session.cadence) / 8; session.paced++; }
+    session.creditAt = at; session.owed = session.outstanding.size > 0;
     drain(session);
     if (sessions.get(session.sessionId) === session) pump(session);
   }
