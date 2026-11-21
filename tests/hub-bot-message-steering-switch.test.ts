@@ -32,9 +32,15 @@ it("defaults on, persists an owner change with a one-use matching device proof, 
     const good = await client.deviceAction({ operation: "bot-message-grant", target: hashSecret(botMessageSteeringProofPayload(off)) });
     expect(await client.request("/api/bot-messages/steering", "POST", { command: off, proof: good })).toEqual({ botId: "codex", allowed: false, supported: true });
     await expect(client.request("/api/bot-messages/steering", "POST", { command: off, proof: good })).rejects.toThrow();
-    const bot = await fetch(hub.instanceUrl + "/api/bot-messages/steering", { method: "POST", headers: { Authorization: `Instance codex:${"secret-".repeat(8)}` }, body: JSON.stringify({ command: { botId: "codex", allowed: true }, proof: good }) });
-    expect(bot.ok).toBe(false);
-    expect((await fetch(hub.url + "/api/bot-messages/steering?botId=codex")).ok).toBe(false);
+    // A Bot's own instance credentials get exactly the refusal grants get, for reads and writes.
+    const asBot = async (route: string, method: "GET" | "POST") => { const response = await fetch(hub.instanceUrl + route, { method, headers: { Authorization: `Instance codex:${"secret-".repeat(8)}` }, ...(method === "POST" ? { body: JSON.stringify({ command: { botId: "codex", allowed: true }, proof: good }) } : {}) }); return { status: response.status, body: await response.text() }; };
+    for (const method of ["GET", "POST"] as const) {
+      const steering = await asBot(`/api/bot-messages/steering${method === "GET" ? "?botId=codex" : ""}`, method), grants = await asBot("/api/bot-messages/grants", method);
+      expect(steering.status).toBeGreaterThanOrEqual(400); expect(steering).toEqual(grants);
+    }
+    const anonymous = await fetch(hub.url + "/api/bot-messages/steering?botId=codex"), anonymousGrants = await fetch(hub.url + "/api/bot-messages/grants");
+    expect(anonymous.ok).toBe(false); expect([anonymous.status, await anonymous.text()]).toEqual([anonymousGrants.status, await anonymousGrants.text()]);
+    expect(await hub.botMessages.readSteering("owner", "codex", guard)).toMatchObject({ allowed: false });
     const audit = await hub.store.db.all<{ detail_json: string }>("SELECT detail_json FROM audit_log WHERE kind='bot-message.steering-updated'");
     expect(audit.map(row => JSON.parse(row.detail_json))).toEqual([{ botId: "codex", allowed: false, previous: true }]);
   } finally { client.close(); await closeControl(); }

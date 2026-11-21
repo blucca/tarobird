@@ -37,3 +37,9 @@ export const botSteerStatusSchema = z.object({ supported: z.boolean(), targetId:
 export const botSteerCallSchema = z.object({ conversationId: idSchema, userId: idSchema, requestId: idSchema, targetId: idSchema, sourceMessageId: idSchema,
   text: textSchema.refine((text) => !!text.trim(), "empty_message"), source: botSourceSchema }).strict();
 export type BotSteerCall = z.infer<typeof botSteerCallSchema>;
+/** Hub → Gateway reconciliation of an unknown Bot steer by its request ID.
+ * It never steers: a recorded outcome is returned; a request that never
+ * started is fenced with a recorded refusal, so a late original call cannot
+ * run either; one still running (or interrupted) stays unknown. */
+export const botSteerReconcileCallSchema = z.object({ conversationId: idSchema, requestId: idSchema, targetId: idSchema, sourceMessageId: idSchema }).strict();
+export type BotSteerReconcileCall = z.infer<typeof botSteerReconcileCallSchema>;

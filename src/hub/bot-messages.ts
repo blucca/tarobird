@@ -52,6 +52,9 @@ export class BotMessages {
     readonly conversationCreated: (userId: string, conversation: Conversation) => void = () => undefined,
     /** Hub → Gateway calls for steered delivery (issue #62); HubServer owns them. */
     public steering: BotMessageSteeringHooks = offlineSteering) {}
+  /** Steer records whose Gateway call this process is still awaiting: they are
+   * reconciled only after that call has returned or been lost. */
+  private readonly steersInFlight = new Set<string>();
   private async memo<T>(key: string): Promise<T | undefined> {
     const row = await this.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [key]);
     return row ? JSON.parse(row.value) as T : undefined;
@@ -469,6 +472,7 @@ export class BotMessages {
       }
       if (["/api/bot-messages/wait", "/api/bot-messages/download"].includes(path) && method === "POST") {
         const messageId = idSchema.parse(data.messageId);
+        if (path.endsWith("/wait")) await this.reconcileSteer(p, bot.id, target, messageId);
         const result = await this.store.db.serial(async (): Promise<WaitResult> => {
           await scope();
           const row = await this.store.db.get<{ bot_source_json: string; status: string }>("SELECT m.bot_source_json,d.status FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND m.conversation_id=? AND d.bot_id=?", [messageId, target.conversationId, bot.id]);
@@ -613,8 +617,13 @@ export class BotMessages {
     const prior = await this.store.db.serial(async () => { await c.scope(); return this.memo<IncomingMemo>(c.key); });
     if (prior && prior.content !== c.content) throw new HubError("bot_message_request_conflict", 409);
     if (prior?.steer) {
-      const row = await this.store.db.serial(() => this.store.db.get<{ id: string; blocks_json: string }>("SELECT id,blocks_json FROM messages WHERE author_id='owner' AND client_msg_id=?", [c.clientMsgId]));
-      if (row) { await c.validate(); return this.receipt(c, { id: row.id } as Message, true, this.deliveryOf(JSON.parse(row.blocks_json) as Block[], prior)); }
+      const existing = await this.store.db.serial(() => this.store.db.get<{ id: string }>("SELECT id FROM messages WHERE author_id='owner' AND client_msg_id=?", [c.clientMsgId]));
+      if (existing) {
+        await this.reconcileSteer(c.p, c.bot.id, c.target, existing.id);
+        const row = (await this.store.db.serial(() => this.store.db.get<{ blocks_json: string }>("SELECT blocks_json FROM messages WHERE id=?", [existing.id])))!;
+        const memo = await this.store.db.serial(() => this.memo<IncomingMemo>(c.key));
+        await c.validate(); return this.receipt(c, { id: existing.id } as Message, true, this.deliveryOf(JSON.parse(row.blocks_json) as Block[], memo));
+      }
     }
     // An existing plain record replays through the ordinary queue path.
     if (c.delivery === "queue" || prior) return this.queueDelivery(c);
@@ -639,25 +648,55 @@ export class BotMessages {
     // The Gateway journals this call at most once. Only its explicit refusal
     // proves nothing reached the engine; anything else stays uncertain.
     let result: SteerResult;
-    try { result = steerResultSchema.parse(await this.steering.steer(c.bot.id, { conversationId: c.target.conversationId, userId: "owner", requestId: c.clientMsgId, targetId: plan.targetId, sourceMessageId: plan.turn, text: c.input.text, source: c.p.source })); }
-    catch { result = { outcome: "unknown", reason: "uncertain" }; }
-    let message: Message;
-    if (result.outcome === "rejected") {
-      const reason = botSteerRejectionReason(result.reason);
-      message = (await this.store.fallBackBotSteer(created.message.id, c.bot.id, steerFallbackNotice(c.bot.id, reason), async () => {
-        const memo = await this.memo<IncomingMemo>(c.key);
-        await this.put(c.key, { ...memo!, steer: { ...memo!.steer, reason } } satisfies IncomingMemo);
-      })).message;
-    } else {
-      const { sourceMessageId: _run, ...outcome } = result;
-      message = await this.store.finishSteering(created.message.id, outcome);
-    }
-    const memo = await this.store.db.serial(() => this.memo<IncomingMemo>(c.key));
-    const delivery = this.deliveryOf(message.blocks, memo);
-    await this.store.audit("bot-message.steer", c.p.source.botId, { conversationId: c.target.conversationId, messageId: message.id, requestId: c.p.source.requestId, sourceHost: c.p.source.hostId, sourceBot: c.p.source.botId,
-      outcome: delivery.actual, turn: plan.turn, ...(delivery.reason ? { reason: delivery.reason } : {}) });
+    this.steersInFlight.add(created.message.id);
+    try {
+      try { result = steerResultSchema.parse(await this.steering.steer(c.bot.id, { conversationId: c.target.conversationId, userId: "owner", requestId: c.clientMsgId, targetId: plan.targetId, sourceMessageId: plan.turn, text: c.input.text, source: c.p.source })); }
+      catch { result = { outcome: "unknown", reason: "uncertain" }; }
+      await this.settleSteer(c.p, c.bot.id, created.message.id, c.key, result, plan.turn);
+    } finally { this.steersInFlight.delete(created.message.id); }
+    const message = await this.store.db.serial(() => this.store.queuedMessageInTransaction(created.message.id));
+    const delivery = this.deliveryOf(message.blocks, await this.store.db.serial(() => this.memo<IncomingMemo>(c.key)));
     await c.validate();
     return this.receipt(c, message, false, delivery);
+  }
+  /** Apply one Gateway answer (direct or reconciled). Every transition is
+   * idempotent: a definite refusal queues the record once; acceptance and
+   * uncertainty never create a delivery. */
+  private async settleSteer(p: BotPassport, botId: string, messageId: string, key: string, result: SteerResult, turn: string): Promise<void> {
+    let changed: boolean;
+    if (result.outcome === "rejected") {
+      const reason = botSteerRejectionReason(result.reason);
+      changed = (await this.store.fallBackBotSteer(messageId, botId, steerFallbackNotice(botId, reason), async () => {
+        const memo = await this.memo<IncomingMemo>(key);
+        await this.put(key, { ...memo!, steer: { ...memo!.steer, reason } } satisfies IncomingMemo);
+      })).changed;
+      if (changed) await this.store.audit("bot-message.steer", p.source.botId, { messageId, requestId: p.source.requestId, sourceHost: p.source.hostId, sourceBot: p.source.botId, outcome: "fell_back_to_queue", reason, turn });
+      return;
+    }
+    const before = (await this.store.db.serial(() => this.store.queuedMessageInTransaction(messageId))).blocks.find(block => block.type === "steering")?.outcome;
+    const after = (await this.store.settleBotSteer(messageId, botId, result.outcome === "accepted" ? { outcome: "accepted" } : { outcome: "unknown", reason: "uncertain" })).blocks.find(block => block.type === "steering")?.outcome;
+    if (after !== before) await this.store.audit("bot-message.steer", p.source.botId, { messageId, requestId: p.source.requestId, sourceHost: p.source.hostId, sourceBot: p.source.botId, outcome: after === "accepted" ? "steered" : "steer_uncertain", turn });
+  }
+  /** Learn the recorded outcome of a pending/uncertain steer from the Gateway
+   * (never steering again). Skipped while this process still awaits the
+   * original call, or while no capable worker is attached. */
+  private async reconcileSteer(p: BotPassport, botId: string, target: BotMessageTarget, messageId: string): Promise<void> {
+    if (this.steersInFlight.has(messageId) || this.steering.capable(botId) !== true) return;
+    const found = await this.store.db.serial(async () => {
+      const row = await this.store.db.get<{ bot_source_json: string | null; blocks_json: string; client_msg_id: string | null }>("SELECT bot_source_json,blocks_json,client_msg_id FROM messages WHERE id=? AND conversation_id=? AND author_type='user'", [messageId, target.conversationId]);
+      const origin = row?.bot_source_json ? botSourceSchema.parse(JSON.parse(row.bot_source_json)) : undefined;
+      if (!row?.client_msg_id || !origin || origin.hostId !== p.source.hostId || origin.botId !== p.source.botId) return undefined;
+      const control = (JSON.parse(row.blocks_json) as Block[]).find(block => block.type === "steering");
+      if (control?.botId !== botId || control.outcome !== "pending" && control.outcome !== "unknown") return undefined;
+      const key = memoKey("incoming", p.sourceKey, p.source.botId, origin.requestId), steer = (await this.memo<IncomingMemo>(key))?.steer;
+      return steer?.turn && steer.targetId ? { key, requestId: row.client_msg_id, turn: steer.turn, targetId: steer.targetId } : undefined;
+    });
+    if (!found) return;
+    let result: SteerResult;
+    try { result = steerResultSchema.parse(await this.steering.reconcile(botId, { conversationId: target.conversationId, requestId: found.requestId, targetId: found.targetId, sourceMessageId: found.turn })); }
+    catch { return; }
+    if (this.steersInFlight.has(messageId)) return;
+    await this.settleSteer(p, botId, messageId, found.key, result, found.turn);
   }
   /** Signed probe of a remote receiving Host. Only an explicit refusal of the
    * unknown route (an older Host) means queue; other failures stop the send. */

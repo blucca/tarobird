@@ -1,7 +1,7 @@
 import type { Block } from "../client-protocol/index.js";
 import { botMessageSteeringProofPayload, type BotMessageSteeringCommand, type BotSteerFallbackReason } from "../client-protocol/bot-message-delivery.js";
 import { hashSecret } from "./auth.js";
-import type { BotSteerCall } from "../client-protocol/steering.js";
+import type { BotSteerCall, BotSteerReconcileCall } from "../client-protocol/steering.js";
 
 /** Hub → Gateway calls used by a receiving Host to merge a signed Bot message
  * into the recipient's live turn (issue #62). Owned by HubServer. */
@@ -10,11 +10,18 @@ export interface BotMessageSteeringHooks {
   capable(botId: string): boolean | undefined;
   status(botId: string, conversationId: string): Promise<unknown>;
   steer(botId: string, call: BotSteerCall): Promise<unknown>;
+  /** Never steers; see botSteerReconcileCallSchema. */
+  reconcile(botId: string, call: BotSteerReconcileCall): Promise<unknown>;
 }
+/** Gateway RPC deadlines. A send that asks to steer waits for at most status
+ * + steer (~13 s) beyond a queued send; within the sender's 15 s peer
+ * exchange for a text request. Reconciliation runs during wait/replay. */
+export const STEER_STATUS_TIMEOUT_MS = 3_000, STEER_CALL_TIMEOUT_MS = 10_000, STEER_RECONCILE_TIMEOUT_MS = 5_000;
 export const offlineSteering: BotMessageSteeringHooks = {
   capable: () => undefined,
   status: async () => { throw new Error("bot_offline"); },
   steer: async () => { throw new Error("bot_offline"); },
+  reconcile: async () => { throw new Error("bot_offline"); },
 };
 
 /** At most this many Bot steers enter one live turn. A steer starts no new

@@ -629,10 +629,27 @@ export class HubStore {
     if (result.event) this.emit(result.event);
     return { message: result.message, created: result.created };
   }
-  /** The engine refused a Bot steer before admission: in one transaction the
-   * same record loses its steering block, gains the Host notice and becomes one
-   * ordinary queued Bot message. Any other outcome (accepted, or uncertain
-   * after a Hub restart) is left untouched, so nothing is ever queued twice.
+  /** Record an accepted or uncertain Bot steer. Idempotent: a record that
+   * already fell back to the queue or has a definite outcome is unchanged,
+   * and uncertainty never overwrites anything but a pending call. */
+  async settleBotSteer(messageId: string, botId: string, result: { outcome: "accepted" } | { outcome: "unknown"; reason?: string }): Promise<Message> {
+    const update = await this.db.transaction(async () => {
+      const row = await this.db.get<MessageRow>("SELECT * FROM messages WHERE id=?", [messageId]);
+      if (!row) throw new HubError("message_not_found", 404);
+      const old = this.decodeMessage(row), control = old.blocks.find(block => block.type === "steering");
+      if (!old.botSource || control?.botId !== botId || control.outcome === "accepted" || control.outcome === "rejected" || result.outcome === "unknown" && control.outcome !== "pending") return { message: old };
+      const message: Message = { ...old, version: old.version + 1, blocks: old.blocks.map(block => block.type !== "steering" ? block
+        : { ...(({ reason: _reason, ...rest }) => rest)(block), ...steerResultSchema.parse(result) }) };
+      await this.saveMessage(message);
+      return { message, event: await this.append(message.conversationId, "message.updated", message) };
+    });
+    if (update.event) this.emit(update.event);
+    return update.message;
+  }
+  /** The engine refused a Bot steer before admission (also learned later by
+   * reconciliation): in one transaction the same record loses its steering
+   * block, gains the Host notice and becomes one ordinary queued Bot message.
+   * An accepted record is left untouched, so nothing is ever queued twice.
    * Archiving does not stop an input the Host had already accepted; a history
    * fence holds it like any pending delivery (claim skips fenced chats). */
   async fallBackBotSteer(messageId: string, botId: string, notice: Block, validate?: () => Promise<unknown>): Promise<{ message: Message; changed: boolean }> {
@@ -640,7 +657,7 @@ export class HubStore {
       const row = await this.db.get<MessageRow>("SELECT * FROM messages WHERE id=?", [messageId]);
       if (!row) throw new HubError("message_not_found", 404);
       const old = this.decodeMessage(row), control = old.blocks.find(block => block.type === "steering");
-      if (!old.botSource || control?.botId !== botId || control.outcome !== "pending" || await this.db.get("SELECT 1 FROM deliveries WHERE message_id=?", [messageId])) return { message: old, changed: false, events: [] as HubEvent[] };
+      if (!old.botSource || control?.botId !== botId || control.outcome !== "pending" && control.outcome !== "unknown" || await this.db.get("SELECT 1 FROM deliveries WHERE message_id=?", [messageId])) return { message: old, changed: false, events: [] as HubEvent[] };
       await validate?.();
       await this.requireBot(botId, old.conversationId);
       const message: Message = { ...old, version: old.version + 1, blocks: [...old.blocks.filter(block => block.type !== "steering"), notice] };

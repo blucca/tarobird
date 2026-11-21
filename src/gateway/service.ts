@@ -301,7 +301,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       if (method === "model.get") z.object({}).strict().parse(raw);
       return z.json().parse(await modelSettings(options.stateDir, options.engine as InstanceEngine, activeWorkCount, method === "model.set" ? raw : undefined));
     }
-    if (method === "steer" || method === "steer.status" || method === "input.control" || method === "botMessage.steer" || method === "botMessage.steer.status") return z.json().parse(await steering(method, raw));
+    if (method === "steer" || method === "steer.status" || method === "input.control" || method === "botMessage.steer" || method === "botMessage.steer.status" || method === "botMessage.steer.reconcile") return z.json().parse(await steering(method, raw));
     if (method === "agentBus.stop") {
       const { runId, messageId, onlyIfProcessing } = z.object({ runId: idSchema, messageId: idSchema, onlyIfProcessing: z.boolean().optional() }).strict().parse(raw);
       if (onlyIfProcessing && !channel.isProcessingAgentBus(runId, messageId)) return { ok: true, live: false };

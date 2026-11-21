@@ -35,7 +35,7 @@ import { acquireHostIdentityAdmission, acquireExistingHostIdentityAdmission, Hos
 import { chromePatchSchema, chromeResultSchema } from "../client-protocol/chrome.js";
 import { networkCanonical } from "../client-protocol/private-network.js";
 import { BotMessages } from "./bot-messages.js";
-import { botMessageSteeringProofTarget } from "./bot-message-steering.js";
+import { STEER_CALL_TIMEOUT_MS, STEER_RECONCILE_TIMEOUT_MS, STEER_STATUS_TIMEOUT_MS, botMessageSteeringProofTarget } from "./bot-message-steering.js";
 import { BOT_MESSAGE_STEER_CAPABILITY, botMessageSteeringCommandSchema } from "../client-protocol/bot-message-delivery.js";
 import { HubAgentBuses } from "./agent-bus.js";
 import { HubGroupDiscussions } from "./group-discussions.js";
@@ -361,8 +361,9 @@ export class HubServer {
       // Issue #62: read the live run and merge into it. Both are Gateway RPCs;
       // a lost reply is uncertain and is never retried here.
       { capable: botId => { const connection = this.bots.get(botId); return connection?.ready ? connection.botSteer : undefined; },
-        status: (botId, conversationId) => this.callBot(botId, "botMessage.steer.status", { conversationId }),
-        steer: (botId, call) => this.callBot(botId, "botMessage.steer", call) });
+        status: (botId, conversationId) => this.callBot(botId, "botMessage.steer.status", { conversationId }, STEER_STATUS_TIMEOUT_MS),
+        steer: (botId, call) => this.callBot(botId, "botMessage.steer", call, STEER_CALL_TIMEOUT_MS),
+        reconcile: (botId, call) => this.callBot(botId, "botMessage.steer.reconcile", call, STEER_RECONCILE_TIMEOUT_MS) });
     this.dispatch = new HubDispatch(store, {
       source: () => this.botMessages.ownSource(),
       conversationCreated: (userId, conversation) => conversationsCreated(userId, [conversation]),

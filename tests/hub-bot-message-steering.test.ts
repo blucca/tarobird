@@ -16,7 +16,7 @@ import type { BotMessageSteeringHooks } from "../src/hub/bot-message-steering.js
 
 let root: string, a: HubServer, b: HubServer, source: BotMessages, bodies: Record<string, unknown>[];
 const guard = async () => undefined;
-type Fake = { capable: ReturnType<typeof vi.fn>; status: ReturnType<typeof vi.fn>; steer: ReturnType<typeof vi.fn> };
+type Fake = { capable: ReturnType<typeof vi.fn>; status: ReturnType<typeof vi.fn>; steer: ReturnType<typeof vi.fn>; reconcile: ReturnType<typeof vi.fn> };
 let fake: Fake;
 /** One live run per conversation, as a Gateway reports it. */
 let runs: Map<string, { targetId: string; sourceMessageId: string }>;
@@ -45,6 +45,7 @@ beforeEach(async () => {
       const run = runs.get(call.conversationId);
       return run?.targetId === call.targetId ? { outcome: "accepted", sourceMessageId: run.sourceMessageId } : { outcome: "rejected", reason: "stale" };
     }),
+    reconcile: vi.fn(async () => ({ outcome: "unknown", reason: "uncertain" })),
   };
   b.botMessages.steering = fake as unknown as BotMessageSteeringHooks;
 });
@@ -77,6 +78,17 @@ describe("legacy and explicit queue delivery", () => {
     expect(bodies.at(-1)).toEqual({ text: "Plain", attachments: [] });
     expect(fake.status).not.toHaveBeenCalled(); expect(fake.steer).not.toHaveBeenCalled();
     expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
+  });
+
+  it("pins the legacy receipt and wait result bytes across the cross-host path", async () => {
+    const chat = await resolve();
+    const receipt = await send(chat.conversationId, "Plain", {}, "legacy_request");
+    const target = { hostId: chat.hostId, hostName: "Windows", botId: "target", botName: "Target", conversationId: chat.conversationId, conversationName: chat.conversationName };
+    expect(JSON.stringify(receipt)).toBe(JSON.stringify({ ...target, requestId: "legacy_request", messageId: receipt.messageId, duplicate: false, status: "queued" }));
+    await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: receipt.messageId, blocks: [{ type: "text", text: "Answer" }] });
+    await b.store.acknowledgeDelivery("target", receipt.messageId);
+    expect(JSON.stringify(await wait(chat.conversationId, receipt.messageId))).toBe(JSON.stringify({ ...target, messageId: receipt.messageId, status: "completed", text: "Answer", files: [], truncated: false }));
+    expect(fake.status).not.toHaveBeenCalled(); expect(fake.reconcile).not.toHaveBeenCalled();
   });
 
   it("omits delivery on the wire for an explicit queue and still reports what happened", async () => {
@@ -273,6 +285,121 @@ describe("fallback to the queue", () => {
     await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: run.sourceMessageId, status: "error", blocks: [{ type: "text", text: "Stopped" }] });
     await b.store.acknowledgeDelivery("target", run.sourceMessageId);
     expect(await wait(chat.conversationId, receipt.messageId)).toMatchObject({ status: "failed", delivery: { actual: "steered", dropped: "stopped" } });
+  });
+});
+
+describe("only the sender's own turn (D1)", () => {
+  it("queues instead of steering into a turn the owner or a third Bot started, and never reveals that turn's reply", async () => {
+    for (const hub of [a, b]) await hub.store.db.run("INSERT INTO bots(id,name,secret_hash,engine) VALUES('third','Third',?,'codex')", [hashSecret("test-".repeat(10))]);
+    await b.botMessages.grant({ sourceHost: "Mac", sourceBot: "third", targetBot: "target" }, guard);
+    const chat = await resolve();
+    // A third Bot reaches the same conversation by exact ID and starts the turn.
+    const third: any = await source.local({ operation: "send", host: "Windows", bot: "target", conversation: chat.conversationId, requestId: randomUUID(), data: { text: "Third task", attachments: [] } }, "third", guard, true);
+    await b.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [third.messageId]);
+    runs.set(chat.conversationId, { targetId: "run_third", sourceMessageId: third.messageId });
+    await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: third.messageId, blocks: [{ type: "text", text: "Secret answer for Third" }] });
+    const receipt = await send(chat.conversationId, "Hijack", { delivery: "steer" });
+    expect(receipt).toMatchObject({ status: "queued", delivery: { actual: "fell_back_to_queue", reason: "turn_not_from_sender" } });
+    expect(fake.steer).not.toHaveBeenCalled();
+    const result = await wait(chat.conversationId, receipt.messageId);
+    expect(JSON.stringify(result)).not.toContain("Secret answer");
+    await expect(wait(chat.conversationId, third.messageId)).rejects.toThrow("bot_message_reply_forbidden");
+    // Even a forged record pointing at another sender's turn reveals nothing.
+    const own = await liveTurn(chat.conversationId), steered = await send(chat.conversationId, "Mine", { delivery: "steer" });
+    expect(steered.delivery.turn.messageId).toBe(own.sourceMessageId);
+    const key = (await b.store.db.all<{ key: string; value: string }>("SELECT key,value FROM meta WHERE key LIKE 'bot-messages:incoming:%'")).find(row => JSON.parse(row.value).steer?.turn === own.sourceMessageId)!.key;
+    const memo = JSON.parse((await b.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [key]))!.value);
+    await b.store.db.run("UPDATE meta SET value=? WHERE key=?", [JSON.stringify({ ...memo, steer: { ...memo.steer, turn: third.messageId } }), key]);
+    const forged = await wait(chat.conversationId, steered.messageId);
+    expect(forged).toMatchObject({ status: "uncertain", text: "", files: [] });
+    expect(JSON.stringify(forged)).not.toContain("Secret answer");
+  });
+});
+
+describe("reconciling an unknown outcome (R1)", () => {
+  it("queues exactly once when the Gateway had in fact refused before admission", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    const receipt = await send(chat.conversationId, "Slow refusal", { delivery: "steer" });
+    expect(receipt.delivery.actual).toBe("steer_uncertain");
+    fake.reconcile.mockResolvedValue({ outcome: "rejected", reason: "stale" });
+    const after = await wait(chat.conversationId, receipt.messageId);
+    expect(after).toMatchObject({ status: "pending", delivery: { actual: "fell_back_to_queue", reason: "turn_ended" } });
+    expect(fake.reconcile).toHaveBeenCalledTimes(1);
+    expect(fake.reconcile.mock.calls[0]![1]).toEqual({ conversationId: chat.conversationId, requestId: (await b.store.messageForUser("owner", receipt.messageId)).clientMsgId, targetId: runs.get(chat.conversationId)!.targetId, sourceMessageId: runs.get(chat.conversationId)!.sourceMessageId });
+    expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
+    // Later waits and a replay neither reconcile nor queue again.
+    await wait(chat.conversationId, receipt.messageId);
+    expect(await send(chat.conversationId, "Slow refusal", { delivery: "steer" }, receipt.requestId)).toMatchObject({ duplicate: true, status: "queued", delivery: { actual: "fell_back_to_queue" } });
+    expect(fake.reconcile).toHaveBeenCalledTimes(1);
+    expect(await deliveries(receipt.messageId)).toHaveLength(1);
+    expect(fake.steer).toHaveBeenCalledTimes(1);
+  });
+
+  it("becomes steered, never queued, when the Gateway had in fact accepted", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    const receipt = await send(chat.conversationId, "Slow accept", { delivery: "steer" });
+    fake.reconcile.mockResolvedValue({ outcome: "accepted", sourceMessageId: run.sourceMessageId });
+    const again = await send(chat.conversationId, "Slow accept", { delivery: "steer" }, receipt.requestId);
+    expect(again).toMatchObject({ duplicate: true, status: "steered", delivery: { actual: "steered", turn: { messageId: run.sourceMessageId } } });
+    expect((await blocks(receipt.messageId)).find(block => block.type === "steering")).toMatchObject({ outcome: "accepted" });
+    expect((await blocks(receipt.messageId)).find(block => block.type === "steering")).not.toHaveProperty("reason");
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+    expect(fake.steer).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays uncertain while the Gateway cannot tell, is offline, or this Host still awaits the call", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    fake.steer.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    const receipt = await send(chat.conversationId, "Unknowable", { delivery: "steer" });
+    expect((await wait(chat.conversationId, receipt.messageId)).delivery.actual).toBe("steer_uncertain");
+    fake.capable.mockReturnValue(undefined);
+    expect((await wait(chat.conversationId, receipt.messageId)).delivery.actual).toBe("steer_uncertain");
+    expect(fake.reconcile).toHaveBeenCalledTimes(1);
+    fake.capable.mockReturnValue(true); fake.reconcile.mockRejectedValueOnce(new HubError("bot_timeout", 504));
+    expect((await wait(chat.conversationId, receipt.messageId)).delivery.actual).toBe("steer_uncertain");
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+    let release!: (value: unknown) => void;
+    fake.steer.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const sending = send(chat.conversationId, "In flight", { delivery: "steer" });
+    await vi.waitFor(() => expect(fake.steer).toHaveBeenCalledTimes(2));
+    const record = await b.store.db.get<{ id: string }>("SELECT id FROM messages WHERE blocks_json LIKE '%In flight%'");
+    const calls = fake.reconcile.mock.calls.length;
+    expect((await wait(chat.conversationId, record!.id)).status).toBe("pending");
+    expect(fake.reconcile.mock.calls.length).toBe(calls);
+    release({ outcome: "accepted", sourceMessageId: runs.get(chat.conversationId)!.sourceMessageId });
+    expect((await sending).status).toBe("steered");
+  });
+});
+
+describe("waits always end (R5)", () => {
+  it("ends when the joined turn is cancelled, fails, loses its input or replies, or its chat is archived", async () => {
+    for (const ending of ["cancelled", "failed", "input_deleted", "replies_deleted", "archived"] as const) {
+      await resetRate();
+      const chat = await call(input("resolve", { newConversation: `End ${ending}` })), run = await liveTurn(chat.conversationId);
+      const receipt = await send(chat.conversationId, `Fix ${ending}`, { delivery: "steer" });
+      expect((await wait(chat.conversationId, receipt.messageId)).status).toBe("pending");
+      if (ending === "cancelled" || ending === "failed") await b.store.db.run("UPDATE deliveries SET status=? WHERE message_id=?", [ending, run.sourceMessageId]);
+      else {
+        const reply = await b.store.publishBotMessage("target", { conversationId: chat.conversationId, replyTo: run.sourceMessageId, blocks: [{ type: "text", text: "Partial" }] });
+        if (ending === "input_deleted") await b.store.db.run("UPDATE messages SET status='deleted' WHERE id=?", [run.sourceMessageId]);
+        if (ending === "replies_deleted") await b.store.db.run("UPDATE messages SET status='deleted' WHERE id=?", [reply.id]);
+        if (ending === "archived") await b.store.updateConversation("owner", chat.conversationId, { archived: true });
+        await b.store.acknowledgeDelivery("target", run.sourceMessageId);
+      }
+      const done = await wait(chat.conversationId, receipt.messageId);
+      expect(done.status).toBe(ending === "cancelled" ? "cancelled" : ending === "failed" ? "failed" : "completed");
+      expect(done.reply).toEqual({ kind: "merged_turn", turnMessageId: run.sourceMessageId });
+      if (ending === "replies_deleted") expect(done.text).toBe("");
+    }
+  });
+
+  it("returns an explicit error once the recipient Bot is deleted", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    const receipt = await send(chat.conversationId, "Fix", { delivery: "steer" });
+    await b.store.db.run("UPDATE bots SET deleted_at=? WHERE id='target'", [Date.now()]);
+    await expect(wait(chat.conversationId, receipt.messageId)).rejects.toThrow(/bot_deleted|not_authorized/);
   });
 });
 
