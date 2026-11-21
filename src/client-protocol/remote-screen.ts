@@ -16,8 +16,22 @@ export const SCREEN_CONTROL_QUALITY_CAPABILITY = "screen-quality-v1";
  * registers with a Host that does not say so: an older Host parses the hello
  * strictly, would refuse it, and the target would reconnect for ever. */
 export const SCREEN_CONTROL_WINDOWS_CAPABILITY = "screen-windows-v1";
+/** Host control socket → target (`controlCapabilities`): this Host does not
+ * charge a viewer's frame receipts against its input budget, and knows
+ * SCREEN_SERVICE_PACE_FEATURE. A target runs above the legacy 15 frames a
+ * second only for such a Host: an older one counts every receipt as input and
+ * would end a busy session as rate-limited. */
+export const SCREEN_CONTROL_RATE_CAPABILITY = "screen-rate-v1";
 /** Target → Hub (hello `features`): `start` may carry `quality`. */
 export const SCREEN_SERVICE_QUALITY_FEATURE = "screen.quality.v1";
+/** Target → Hub (hello `features`, only to a Host with SCREEN_CONTROL_RATE_CAPABILITY): `start` may carry `mediaBytesPerMs`. */
+export const SCREEN_SERVICE_PACE_FEATURE = "screen.pace.v1";
+/** Encoded bytes a target may send for one session per millisecond (4 and
+ * 40 Mbit/s). The first is every session's budget and guards traffic that
+ * leaves the local network (a relay, a metered link). The second is for a
+ * viewer whose media socket reached the Hub straight from a local-network
+ * address: there the picture is held back by the devices, not by a budget. */
+export const SCREEN_MEDIA_BYTES_PER_MS = 500, SCREEN_MEDIA_DIRECT_BYTES_PER_MS = 5000;
 export const screenQualitySchema = z.enum(SCREEN_QUALITIES);
 export const SCREEN_MAX_VIEWERS = 2;
 export const SCREEN_LEASE_MS = 6000;
@@ -112,8 +126,10 @@ export type ScreenViewerCommand = z.infer<typeof screenViewerCommandSchema>;
 
 /** Each input is authorized again at the target; a queued command is not a lease. */
 export const screenServiceCommandSchema = z.discriminatedUnion("type", [
-  // `quality` is sent only to a target whose hello advertised SCREEN_SERVICE_QUALITY_FEATURE.
-  z.object({ type: z.literal("start"), session: screenSessionSchema, mediaTicket: token, streamGeneration: revision, codecs: z.array(z.enum(["h264", "vp8"])).min(1).max(2), quality: screenQualitySchema.optional() }).strict(),
+  // `quality` is sent only to a target whose hello advertised SCREEN_SERVICE_QUALITY_FEATURE,
+  // `mediaBytesPerMs` (a budget other than the default) only to one that advertised SCREEN_SERVICE_PACE_FEATURE.
+  z.object({ type: z.literal("start"), session: screenSessionSchema, mediaTicket: token, streamGeneration: revision, codecs: z.array(z.enum(["h264", "vp8"])).min(1).max(2), quality: screenQualitySchema.optional(),
+    mediaBytesPerMs: z.number().int().min(SCREEN_MEDIA_BYTES_PER_MS).max(SCREEN_MEDIA_DIRECT_BYTES_PER_MS).optional() }).strict(),
   z.object({ type: z.literal("stop"), sessionId: idSchema, reason: z.string().max(128) }).strict(),
   z.object({ type: z.literal("pause"), sessionId: idSchema, paused: z.boolean(), streamGeneration: revision }).strict(),
   z.object({ type: z.literal("reset"), sessionId: idSchema, streamGeneration: revision }).strict(),

@@ -1,7 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
-import { SCREEN_MAX_CONTROL_BYTES, screenHelloSchema, screenServiceHelloSchema, screenServiceEventSchema } from "../client-protocol/remote-screen.js";
+import { SCREEN_MAX_CONTROL_BYTES, SCREEN_MEDIA_BYTES_PER_MS, screenHelloSchema, screenServiceHelloSchema, screenServiceEventSchema } from "../client-protocol/remote-screen.js";
 import { readScreenFrame, SCREEN_PACKET_LIMIT } from "../client-protocol/screen-wire.js";
 import { HubRemoteScreen, type ScreenControlSink, type ScreenMediaSink } from "./remote-screen.js";
 import { HubError } from "./store.js";
@@ -23,7 +23,8 @@ export class RemoteScreenSockets {
   private budgetAt = Date.now();
   constructor(private authority: HubRemoteScreen) {}
   handles(route: string): boolean { return routes.has(route); }
-  upgrade(req: IncomingMessage, socket: Duplex, head: Buffer, instance: boolean): void {
+  /** `direct`: the peer's own address is on the local network (not loopback, where a relay arrives). */
+  upgrade(req: IncomingMessage, socket: Duplex, head: Buffer, instance: boolean, direct = false): void {
     const route = req.url!;
     // Instance listener is separate plain loopback; TLS relay peers also arrive
     // on loopback and must never be able to register a target service.
@@ -33,13 +34,13 @@ export class RemoteScreenSockets {
     // require the instance listener and their one-use owner/service tickets.
     if (!routes.has(route) || target && (!instance || this.targetConnections.size >= 4)
       || !target && this.connections.size - this.targetConnections.size >= 16) { socket.destroy(); return; }
-    (route.endsWith("media") ? this.media : this.control).handleUpgrade(req, socket, head, ws => this.accept(ws, route));
+    (route.endsWith("media") ? this.media : this.control).handleUpgrade(req, socket, head, ws => this.accept(ws, route, direct));
   }
   private closeGroup(sessionId: string, reason: string): void {
     const group = this.sessionSockets.get(sessionId); this.sessionSockets.delete(sessionId);
     for (const ws of group ?? []) { if (ws.readyState === WebSocket.OPEN) ws.close(4000, reason.slice(0,100)); else ws.terminate(); }
   }
-  private accept(ws: WebSocket, route: string): void {
+  private accept(ws: WebSocket, route: string, direct: boolean): void {
     this.connections.add(ws);
     if (route.startsWith("/screen/v1/target")) this.targetConnections.add(ws);
     let ready = false, authenticating = false, epoch = "", sessionId = "", generation = "", localBudget = SCREEN_PACKET_LIMIT, localAt = Date.now();
@@ -69,7 +70,7 @@ export class RemoteScreenSockets {
           } else {
             const hello = screenHelloSchema.parse(data);
             if (route === "/screen/v1/target-media") ({ epoch, sessionId, generation } = this.authority.serviceMedia(hello.ticket));
-            else sessionId = await this.authority.attachViewer(hello.ticket, route.endsWith("media") ? "media" : "control", route.endsWith("media") ? mediaSink : controlSink);
+            else sessionId = await this.authority.attachViewer(hello.ticket, route.endsWith("media") ? "media" : "control", route.endsWith("media") ? mediaSink : controlSink, { direct });
             const group = this.sessionSockets.get(sessionId) ?? new Set<WebSocket>(); group.add(ws); this.sessionSockets.set(sessionId, group);
             if (ws.readyState !== WebSocket.OPEN) { stop(); return; }
             send({ type: "attached", sessionId });
@@ -79,9 +80,13 @@ export class RemoteScreenSockets {
         if (binary) {
           if (route !== "/screen/v1/target-media") throw new HubError("screen_binary_direction", 400);
           const now = Date.now();
-          localBudget = Math.min(SCREEN_PACKET_LIMIT, localBudget + Math.max(0, now - localAt) * 500); localAt = now;
-          this.totalBudget = Math.min(2 * SCREEN_PACKET_LIMIT, this.totalBudget + Math.max(0, now - this.budgetAt) * 1000); this.budgetAt = now;
-          localBudget -= bytes.byteLength; this.totalBudget -= bytes.byteLength;
+          // The session's own budget was fixed when it started. Sessions on the
+          // default budget also share one Hub-wide allowance (twice a session's);
+          // a session served straight to the local network does not draw on it.
+          const rate = this.authority.mediaBytesPerMs(sessionId), shared = rate === SCREEN_MEDIA_BYTES_PER_MS;
+          localBudget = Math.min(SCREEN_PACKET_LIMIT, localBudget + Math.max(0, now - localAt) * rate); localAt = now;
+          this.totalBudget = Math.min(2 * SCREEN_PACKET_LIMIT, this.totalBudget + Math.max(0, now - this.budgetAt) * 2 * SCREEN_MEDIA_BYTES_PER_MS); this.budgetAt = now;
+          localBudget -= bytes.byteLength; if (shared) this.totalBudget -= bytes.byteLength;
           if (localBudget < 0 || this.totalBudget < 0) throw new HubError("screen_bandwidth_exceeded", 429);
           if (!this.authority.frame(epoch, sessionId, generation, readScreenFrame(bytes), bytes)) throw new HubError("screen_frame_rejected", 409);
           return;

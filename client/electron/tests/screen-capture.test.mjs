@@ -283,8 +283,8 @@ function scheduler(b) {
   return { to, deliver, encodes: () => b.encoders[0].encodes.length };
 }
 
-test('cadence: the named rate is used up to 60, an unnamed rate is the legacy 15 and nothing runs above 60', async () => {
-  for (const [fps, effective] of [[60, 60], [30, 30], [undefined, 15], [240, 60], [15, 15]]) {
+test('cadence: the named rate is used up to 120, an unnamed rate is the legacy 15 and nothing runs above 120', async () => {
+  for (const [fps, effective] of [[120, 120], [60, 60], [30, 30], [undefined, 15], [240, 120], [15, 15]]) {
     const b = browser(); await start(b, { fps }); await tick();
     assert.equal(b.core.sessions.get('s1').interval, 1000 / effective, `fps ${fps}`);
     assert.equal(b.encoders[0].config.framerate, effective);

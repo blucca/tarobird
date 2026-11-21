@@ -7,22 +7,22 @@ import { EventEmitter } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createCaptureCore, CAPTURE_CREDITS, OUTPUT_MAX_AGE_MS, PACE_BURST_BYTES, PACE_BYTES_PER_MS } from '../screen-capture-core.mjs';
+import { createCaptureCore, CAPTURE_CREDITS, OUTPUT_MAX_AGE_MS, PACE_BURST_BYTES, PACE_BYTES_PER_MS, PACE_BYTES_PER_MS_MAX } from '../screen-capture-core.mjs';
 import { ScreenCaptureHost } from '../screen-capture-host.mjs';
 import { ScreenService } from '../screen-service.mjs';
 import { encodeSize, SCREEN_ENCODE_AREA, SCREEN_ENCODE_LONG_EDGE } from '../screen-geometry.mjs';
 import { writeScreenFrame } from '../../../src/client-protocol/screen-wire.ts';
-import { SCREEN_QUALITY_PROFILES, screenH264Codec, screenQualityProfile } from '../../../src/client-protocol/screen-quality.ts';
+import { SCREEN_QUALITY_PROFILES, screenH264Codec, screenH264EncoderCodec, screenQualityProfile, screenRateLadder } from '../../../src/client-protocol/screen-quality.ts';
 import { screenServiceCommandSchema, screenServiceHelloSchema, screenStreamSchema } from '../../../src/client-protocol/remote-screen.ts';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 // ---------------- capture core ----------------
-function browser({ supported = ['quantizer', 'variable'], codecs = ['avc1.640028', 'avc1.64002A', 'avc1.640033', 'vp8'], chunkBytes = 3 } = {}) {
+function browser({ supported = ['quantizer', 'variable'], codecs = ['avc1.640028', 'avc1.64002A', 'avc1.640033', 'avc1.640034', 'vp8'], chunkBytes = 3, maxRate = Infinity } = {}) {
   const sent = [], encoders = [], requests = [], probes = [], pending = [];
   let pushFrame, perf = 0, clock = 1_800_000_000_000;
   class Encoder {
-    static async isConfigSupported(config) { probes.push(config); return { supported: supported.includes(config.bitrateMode) && codecs.includes(config.codec) }; }
+    static async isConfigSupported(config) { probes.push(config); return { supported: supported.includes(config.bitrateMode) && codecs.includes(config.codec) && config.framerate <= maxRate }; }
     constructor({ output }) { this.output = output; this.state = 'unconfigured'; this.encodeQueueSize = 0; this.encodes = []; this.timestamps = []; this.emitted = 0; encoders.push(this); }
     configure(config) { this.config = config; this.state = 'configured'; }
     encode(frame, options) { this.encodes.push(options); this.timestamps.push(frame.timestamp); }
@@ -35,7 +35,7 @@ function browser({ supported = ['quantizer', 'variable'], codecs = ['avc1.640028
   let interval;
   const core = createCaptureCore({ send: m => sent.push(Object.assign(m, { at: perf })), getDisplayMedia: async constraints => { requests.push(constraints); return { getVideoTracks: () => [track], getTracks: () => [track] }; },
     VideoEncoder: Encoder, VideoFrame: class { constructor(_source, init) { this.timestamp = init?.timestamp; } close() {} }, OffscreenCanvas: class { constructor(w, h) { this.width = w; this.height = h; } getContext() { return { drawImage() {} }; } },
-    MediaStreamTrackProcessor: Processor, writeScreenFrame, now: () => clock, perf: () => perf,
+    MediaStreamTrackProcessor: Processor, writeScreenFrame, now: () => Math.round(clock), perf: () => perf,
     timers: { setTimeout: (fn, ms) => { const t = { fn, at: perf + ms }; pending.push(t); return t; }, clearTimeout: t => { const i = pending.indexOf(t); if (i >= 0) pending.splice(i, 1); },
       setInterval: fn => { interval = fn; return 1; }, clearInterval() {} } });
   /** Runs due pacing timers (fake clock). */
@@ -54,15 +54,18 @@ const startMessage = (quality, extra = {}) => {
 };
 
 test('core: each quality sets the real capture constraints, encoder size/rate and quantizer; omitted = legacy balanced', async () => {
-  // 1440×900 points @2x: balanced/legacy = 1818×1136 (H.264 level 4.0), sharp = native 2880×1800 (level 5.1).
-  // Rate: smooth and balanced ask for 60 (1080p-class at 60 is H.264 level 4.2), sharp for 30; the legacy start stays at 15.
-  const expected = { smooth: [1280, 800, 32, 42, 'avc1.640028', 60], balanced: [1818, 1136, 28, 40, 'avc1.64002A', 60], sharp: [2880, 1800, 28, 40, 'avc1.640033', 30], legacy: [1818, 1136, 28, 40, 'avc1.640028', 15] };
-  for (const [quality, [width, height, qpBase, qpMax, codecString, fps]] of Object.entries(expected)) {
+  // 1440×900 points @2x: balanced/legacy = 1818×1136, sharp = native 2880×1800.
+  // Rate: smooth and balanced ask for 120, sharp for 60; the legacy start stays at 15.
+  // The stream declares the size's own level (what viewers have always been sent: 4.0, or 5.1 above 1080p-class);
+  // the encoder is given the level the size needs AT THAT RATE (4.2, 5.1 and 5.2 here).
+  const expected = { smooth: [1280, 800, 32, 42, 'avc1.640028', 'avc1.64002A', 120], balanced: [1818, 1136, 28, 40, 'avc1.640028', 'avc1.640033', 120],
+    sharp: [2880, 1800, 28, 40, 'avc1.640033', 'avc1.640034', 60], legacy: [1818, 1136, 28, 40, 'avc1.640028', 'avc1.640028', 15] };
+  for (const [quality, [width, height, qpBase, qpMax, codecString, level, fps]] of Object.entries(expected)) {
     const b = browser(); await b.core.handle(startMessage(quality === 'legacy' ? undefined : quality)); await tick();
     assert.deepEqual(b.requests[0].video, { cursor: 'always', frameRate: { max: fps }, width: { max: width }, height: { max: height } }, `${quality}: capture constraints`);
     assert.deepEqual([b.encoders[0].config.width, b.encoders[0].config.height, b.encoders[0].config.framerate, b.encoders[0].config.bitrateMode], [width, height, fps, 'quantizer']);
     const stream = b.sent.find(m => m.type === 'stream').stream;
-    assert.deepEqual([stream.width, stream.height, stream.codecString, b.encoders[0].config.codec], [width, height, codecString, codecString]);
+    assert.deepEqual([stream.width, stream.height, stream.codecString, b.encoders[0].config.codec], [width, height, codecString, level]);
     assert.doesNotThrow(() => screenStreamSchema.parse(stream), `${quality}: stream fits the shared schema`);
     if (quality !== 'sharp') assert.ok(width <= 1920 && height <= 1920 && width * height <= 1920 * 1080, `${quality}: inside the pre-quality (old-viewer) contract`);
     b.push(b.frame(width, height)); await tick();
@@ -82,7 +85,7 @@ test('core: above the legacy rate a viewer that follows faster than it keeps its
   // 40 of 60 frames could not be taken, 20 got through: slower than the source, not congested.
   for (let i = 0; i < 5; i++) { session.crowded = 40; session.encoded = 20; b.adapt(); }
   assert.equal(session.qp, base, 'a 20 fps viewer keeps the resting quantizer');
-  // Fewer got through than the legacy rate delivered: the old congestion response applies.
+  // Fewer than a quarter got through: the congestion response applies.
   session.crowded = 52; session.encoded = 8; b.adapt();
   assert.equal(session.qp, base + 3);
   assert.deepEqual([session.crowded, session.encoded], [0, 0], 'both counters restart every second');
@@ -96,31 +99,90 @@ test('core: above the legacy rate a viewer that follows faster than it keeps its
   assert.equal(legacy.qp, legacyBase + 3);
 });
 
-test('codec: the H.264 level is the lowest that carries both the size and the rate; legacy sizes at the legacy rate keep their strings', () => {
+/** Drives real frames through the core on the fake clock: a source that repaints
+ * at `source` Hz while `moving(ms)`, an encoder that outputs at once, and a
+ * viewer whose receipt for a frame comes `loop` ms after it was sent, or, with
+ * `decode`, that many ms after the previous receipt if that is later (a viewer
+ * that takes frames one at a time). Returns the quantizer after every second. */
+async function drive(b, { seconds, loop, decode = 0, moving = () => true, source = 60, width = 1280, height = 800 }) {
+  const session = b.core.sessions.get('s1'), step = 1000 / source, receipts = [], qp = [];
+  let at = 0, seen = 0, last = 0, second = 1000;
+  for (let ms = 0; ms < seconds * 1000; ms += step) {
+    b.advance(step); at += step; b.run();
+    while (receipts.length && receipts[0].at <= at) await b.core.handle({ type: 'credit', sessionId: 's1', frameSequence: receipts.shift().sequence, streamGeneration: 1 });
+    if (moving(ms)) { b.push(b.frame(width, height)); await tick(); }
+    const encoder = b.encoders.at(-1);
+    while (encoder.encodes.length > encoder.emitted) encoder.emit(encoder.emitted ? 'delta' : 'key');
+    const frames = b.sent.filter(m => m.type === 'frame');
+    for (; seen < frames.length; seen++) { last = Math.max(at + loop, last) + decode; receipts.push({ at: last, sequence: frames[seen].sequence }); }
+    if (at >= second) { b.adapt(); qp.push(session.qp); second += 1000; }
+  }
+  return { qp, frames: b.sent.filter(m => m.type === 'frame').length };
+}
+
+test('crowding, driven: motion in spurts over a long round trip keeps the resting quantizer', async () => {
+  // 60 fps, receipts 100 ms after each frame: three credits are used up within 50 ms of any motion.
+  for (const [name, moving] of [['typing: 100 ms in every 500', ms => ms % 500 < 100], ['scroll: 250 ms every 3 s', ms => ms % 3000 < 250], ['300 ms every 2 s', ms => ms % 2000 < 300]]) {
+    const b = browser(); await b.core.handle(startMessage('smooth', { fps: 60 })); await tick();
+    const run = await drive(b, { seconds: 12, loop: 100, moving });
+    assert.deepEqual([...new Set(run.qp)], [32], name);
+    assert.ok(run.frames > 20, `${name}: frames flowed (${run.frames})`);
+  }
+});
+
+test('crowding, driven: a viewer that follows at 25 of 60 keeps its quantizer; one that follows at 10 is coarsened to the ceiling', async () => {
+  const follow = browser(); await follow.core.handle(startMessage('smooth', { fps: 60 })); await tick();
+  const quick = await drive(follow, { seconds: 8, loop: 10, decode: 40 });
+  assert.deepEqual([...new Set(quick.qp)], [32]);
+  assert.ok(quick.frames > 8 * 20 && quick.frames < 8 * 30, `about 25 a second got through (${quick.frames})`);
+  const slow = browser(); await slow.core.handle(startMessage('smooth', { fps: 60 })); await tick();
+  const run = await drive(slow, { seconds: 8, loop: 10, decode: 100 });
+  assert.equal(run.qp.at(-1), 42, `rose to the ceiling: ${run.qp}`);
+  assert.ok(run.qp[1] > 32, 'and started within two seconds');
+});
+
+test('crowding, driven: an encoder held to 15 by the fallback ladder is not crowded by the frames its schedule skips', async () => {
+  const b = browser({ maxRate: 15 }); await b.core.handle(startMessage('smooth')); await tick();
+  assert.deepEqual([b.encoders[0].config.framerate, b.requests[0].video.frameRate.max], [15, 120], 'the capture keeps the profile rate, the encoder runs at 15');
+  const run = await drive(b, { seconds: 8, loop: 5 });
+  assert.deepEqual([...new Set(run.qp)], [32]);
+  assert.ok(run.frames >= 8 * 14 && run.frames <= 8 * 16, `15 a second were encoded (${run.frames})`);
+});
+
+test('crowding, driven: at the legacy rate a viewer that drops more than two frames a second is coarsened, as before', async () => {
+  const b = browser(); await b.core.handle(startMessage(undefined)); await tick();
+  const run = await drive(b, { seconds: 6, loop: 10, decode: 100, source: 15, width: 1818, height: 1136 });
+  assert.equal(run.qp.at(-1), 40, `rose to the ceiling: ${run.qp}`);
+});
+
+test('codec: the declared string depends on size alone; the encoder level is the lowest that carries the size at the rate', () => {
+  // Declared to viewers: unchanged by the rate.
   assert.equal(screenH264Codec(1920, 1080), 'avc1.640028');
-  assert.equal(screenH264Codec(1920, 1080, 15), 'avc1.640028');
-  assert.equal(screenH264Codec(1920, 1080, 30), 'avc1.640028');
-  assert.equal(screenH264Codec(1280, 800, 60), 'avc1.640028', '720p-class at 60 still fits level 4.0');
-  assert.equal(screenH264Codec(1920, 1080, 60), 'avc1.64002A');
-  assert.equal(screenH264Codec(1818, 1136, 60), 'avc1.64002A');
+  assert.equal(screenH264Codec(1818, 1136), 'avc1.640028');
   assert.equal(screenH264Codec(2880, 1800), 'avc1.640033');
-  assert.equal(screenH264Codec(2880, 1800, 30), 'avc1.640033');
-  assert.equal(screenH264Codec(3072, 1920, 60), 'avc1.640034');
-  assert.equal(screenH264Codec(8192, 8192, 15), undefined);
+  assert.equal(screenH264Codec(8192, 8192), undefined);
+  // Given to the encoder.
+  for (const [width, height, fps, level] of [[1920, 1080, 15, 'avc1.640028'], [1920, 1080, 30, 'avc1.640028'], [1280, 800, 60, 'avc1.640028'], [1280, 800, 120, 'avc1.64002A'],
+    [1920, 1080, 60, 'avc1.64002A'], [1818, 1136, 60, 'avc1.64002A'], [1920, 1080, 120, 'avc1.640033'], [2880, 1800, 30, 'avc1.640033'], [2880, 1800, 60, 'avc1.640034'],
+    [2880, 1800, 120, undefined], [8192, 8192, 15, undefined]]) assert.equal(screenH264EncoderCodec(width, height, fps), level, `${width}x${height}@${fps}`);
+  assert.deepEqual([screenRateLadder(120), screenRateLadder(60), screenRateLadder(30), screenRateLadder(15), screenRateLadder(24)], [[120, 60, 30, 15], [60, 30, 15], [30, 15], [15], [24, 15]]);
 });
 
 test('core: an encoder that cannot take the profile rate gets H.264 at the next lower rate, before VP8 at any rate', async () => {
-  // No level 4.2: a 1080p-class picture cannot be encoded at 60.
-  const b = browser({ codecs: ['avc1.640028', 'avc1.640033', 'vp8'] }); await b.core.handle(startMessage('balanced')); await tick();
+  // No level 5.1: a 1080p-class picture cannot be encoded at 120, so it runs at 60 (level 4.2).
+  const b = browser({ codecs: ['avc1.640028', 'avc1.64002A', 'vp8'] }); await b.core.handle(startMessage('balanced')); await tick();
   const session = b.core.sessions.get('s1'), stream = b.sent.find(m => m.type === 'stream').stream;
-  assert.deepEqual([b.encoders[0].config.codec, b.encoders[0].config.framerate, stream.codec, stream.codecString], ['avc1.640028', 30, 'h264', 'avc1.640028']);
-  assert.deepEqual([session.profile.fps, session.interval], [30, 1000 / 30], 'the whole session runs at the accepted rate');
+  assert.deepEqual([b.encoders[0].config.codec, b.encoders[0].config.framerate, stream.codec, stream.codecString], ['avc1.64002A', 60, 'h264', 'avc1.640028']);
+  assert.deepEqual([session.profile.fps, session.interval], [60, 1000 / 60], 'the whole session runs at the accepted rate');
   // A reset keeps the choice.
   await b.core.handle({ type: 'reset', sessionId: 's1', streamGeneration: 2, geometryRevision: 1 });
-  assert.equal(b.encoders[1].config.framerate, 30);
+  assert.equal(b.encoders[1].config.framerate, 60);
+  // Level 4.0 only: two steps down, to 30.
+  const d = browser({ codecs: ['avc1.640028', 'vp8'] }); await d.core.handle({ ...startMessage('balanced'), codecs: ['h264', 'vp8'] }); await tick();
+  assert.deepEqual([d.encoders[0].config.codec, d.encoders[0].config.framerate], ['avc1.640028', 30]);
   // VP8 only: the profile rate is still tried first.
   const c = browser({ codecs: ['vp8'] }); await c.core.handle({ ...startMessage('balanced'), codecs: ['h264', 'vp8'] }); await tick();
-  assert.deepEqual([c.encoders[0].config.codec, c.encoders[0].config.framerate], ['vp8', 60]);
+  assert.deepEqual([c.encoders[0].config.codec, c.encoders[0].config.framerate], ['vp8', 120]);
 });
 
 test('core: a variable-bitrate-only encoder gets the profile bitrate (legacy 2.5 Mbps unchanged)', async () => {
@@ -134,12 +196,16 @@ test('core: a variable-bitrate-only encoder gets the profile bitrate (legacy 2.5
 
 test('core: out-of-range profile values from main are clamped, never trusted as-is', async () => {
   const b = browser();
-  await b.core.handle(startMessage('sharp', { fps: 120, profile: { qpBase: -5, qpMax: 99, bitrate: 1e12 } })); await tick();
-  assert.equal(b.requests[0].video.frameRate.max, 60, 'never above the renderer ceiling');
-  // 2880×1800 at 60 needs level 5.2, which this encoder lacks: it runs at the next lower rate.
-  assert.equal(b.encoders[0].config.framerate, 30);
+  await b.core.handle(startMessage('sharp', { fps: 240, profile: { qpBase: -5, qpMax: 99, bitrate: 1e12, bytesPerMs: 1e9 } })); await tick();
+  assert.equal(b.requests[0].video.frameRate.max, 120, 'never above the renderer ceiling');
+  // No H.264 level carries 2880×1800 at 120: it runs at the next lower rate.
+  assert.equal(b.encoders[0].config.framerate, 60);
   const session = b.core.sessions.get('s1');
-  assert.deepEqual([session.profile.qpBase, session.profile.qpMax, session.profile.bitrate, session.interval], [10, 51, 4_000_000, 1000 / 30]);
+  assert.deepEqual([session.profile.qpBase, session.profile.qpMax, session.profile.bitrate, session.interval, session.profile.pace], [10, 51, 4_000_000, 1000 / 60, PACE_BYTES_PER_MS_MAX]);
+  // The byte budget is never below the default, and is the default when main names none.
+  const low = browser(); await low.core.handle(startMessage('sharp', { profile: { bytesPerMs: 1 } })); await tick();
+  const none = browser(); await none.core.handle(startMessage('sharp')); await tick();
+  assert.deepEqual([low.core.sessions.get('s1').profile.pace, none.core.sessions.get('s1').profile.pace], [PACE_BYTES_PER_MS, PACE_BYTES_PER_MS]);
   const c = browser(); await c.core.handle(startMessage('sharp', { profile: { qpBase: 40, qpMax: 20 } })); await tick();
   assert.deepEqual([c.core.sessions.get('s1').profile.qpBase, c.core.sessions.get('s1').profile.qpMax], [40, 40], 'ceiling never below base');
 });
@@ -302,10 +368,10 @@ async function target(t, { capabilities } = {}) {
   const hello = control.sent[0];
   control.receive({ type: 'registered', epoch: 'desktop_epoch', serverTime: Date.now() });
   let n = 0;
-  const open = quality => {
+  const open = (quality, extra = {}) => {
     const session = { id: `screen_${++n}`, desktopId: service.desktopId, deviceId: 'viewer', deviceName: 'Viewer', generation: `generation_${n}`,
       display: service.status().desktop.displays[0], controlAllowed: true, state: 'connecting', createdAt: Date.now() };
-    control.receive({ type: 'start', session, mediaTicket: 'M'.repeat(43), streamGeneration: 1, codecs: ['h264'], ...(quality !== undefined ? { quality } : {}) });
+    control.receive({ type: 'start', session, mediaTicket: 'M'.repeat(43), streamGeneration: 1, codecs: ['h264'], ...(quality !== undefined ? { quality } : {}), ...extra });
     const media = ws.find('/screen/v1/target-media').at(-1);
     return { session, media };
   };
@@ -314,20 +380,56 @@ async function target(t, { capabilities } = {}) {
 }
 const legacyHello = screenServiceHelloSchema.omit({ features: true }).strict();
 
+test('service: a Host without the rate capability keeps every profile at the legacy 15 frames a second', async t => {
+  const f = await target(t, { capabilities: ['screen-quality-v1'] });
+  for (const quality of [undefined, 'smooth', 'balanced', 'sharp']) {
+    const opened = f.open(quality); await f.attach(opened);
+    assert.equal(f.starts.at(-1).fps, 15, String(quality));
+    f.service.stop(opened.session.id);
+  }
+});
+
+test('service: a byte budget named by the Host paces the capture 15% below it; none named leaves the start as it was', async t => {
+  const f = await target(t, { capabilities: ['screen-quality-v1', 'screen-rate-v1'] });
+  const direct = f.open('balanced', { mediaBytesPerMs: 5000 }); await f.attach(direct);
+  assert.equal(f.starts.at(-1).profile.bytesPerMs, 4250);
+  f.service.stop(direct.session.id);
+  const relayed = f.open('balanced'); await f.attach(relayed);
+  assert.equal('bytesPerMs' in f.starts.at(-1).profile, false);
+});
+
+test('core pacer: with a local-network budget the same busy picture keeps its rate and its quantizer, still inside that budget', async () => {
+  const b = browser({ chunkBytes: 200_000 }); await b.core.handle(startMessage('balanced', { fps: 15, profile: { qpBase: 28, qpMax: 40, bitrate: 2_500_000, h264Only: false, bytesPerMs: 4250 } })); await tick();
+  const session = b.core.sessions.get('s1');
+  let encodes = 0;
+  for (let i = 0; i < 150; i++) { // 10 s at 15 fps of 200 kB frames = 24 Mbps offered, 34 Mbps allowed
+    b.advance(67); b.push(b.frame(1818, 1136)); await tick(); b.run();
+    const encoder = b.encoders.at(-1);
+    while (encoder.encodes.length > encodes) { encodes++; encoder.emit(encodes === 1 ? 'key' : 'delta'); await b.core.handle({ type: 'credit', sessionId: 's1', frameSequence: encodes, streamGeneration: 1 }); }
+    if (i % 15 === 14) b.adapt();
+  }
+  const frames = b.sent.filter(m => m.type === 'frame'), bytes = frames.reduce((n, m) => n + m.bytes.byteLength, 0);
+  assert.equal(frames.length, 150, 'every captured frame was encoded and sent');
+  assert.equal(session.qp, 28, 'the quantizer stayed at rest');
+  assert.ok(bytes / (150 * 67) < 5000, 'average below the Hub local-network refill (5000 B/ms)');
+});
+
 test('service: the hello carries features only when the Host advertised quality; an old Host gets the exact legacy hello', async t => {
   const old = await target(t);
   assert.deepEqual(Object.keys(old.hello), ['type', 'ticket', 'desktop']);
   assert.doesNotThrow(() => legacyHello.parse(old.hello), 'an older Hub (strict hello) still accepts it');
   const unrelated = await target(t, { capabilities: ['target-stop', 'screen-service-ticket'] });
   assert.equal('features' in unrelated.hello, false);
-  const current = await target(t, { capabilities: ['target-stop', 'screen-service-ticket', 'screen-quality-v1'] });
-  assert.deepEqual(current.hello.features, ['screen.quality.v1']);
+  const quality = await target(t, { capabilities: ['target-stop', 'screen-service-ticket', 'screen-quality-v1'] });
+  assert.deepEqual(quality.hello.features, ['screen.quality.v1'], 'a Host that only negotiates quality gets the hello it always got');
+  const current = await target(t, { capabilities: ['target-stop', 'screen-service-ticket', 'screen-quality-v1', 'screen-rate-v1'] });
+  assert.deepEqual(current.hello.features, ['screen.quality.v1', 'screen.pace.v1']);
   assert.throws(() => legacyHello.parse(current.hello), 'proves why it must be gated');
   assert.doesNotThrow(() => screenServiceHelloSchema.parse(current.hello));
 });
 
 test('service: the start quality selects the real capture profile; omitted = legacy balanced', async t => {
-  const f = await target(t, { capabilities: ['screen-quality-v1'] });
+  const f = await target(t, { capabilities: ['screen-quality-v1', 'screen-rate-v1'] });
   for (const quality of [undefined, 'smooth', 'balanced', 'sharp']) {
     const opened = f.open(quality); await f.attach(opened);
     const start = f.starts.at(-1), profile = screenQualityProfile(quality);
@@ -343,7 +445,7 @@ test('service: the start quality selects the real capture profile; omitted = leg
 });
 
 test('service: an unknown quality is refused by the command schema and creates no media socket or capture', async t => {
-  const f = await target(t, { capabilities: ['screen-quality-v1'] });
+  const f = await target(t, { capabilities: ['screen-quality-v1', 'screen-rate-v1'] });
   const before = f.ws.find('/screen/v1/target-media').length;
   f.control.receive({ type: 'start', session: { id: 'screen_x', desktopId: f.service.desktopId, deviceId: 'viewer', deviceName: 'Viewer', generation: 'generation_x',
     display: f.service.status().desktop.displays[0], controlAllowed: true, state: 'connecting', createdAt: Date.now() }, mediaTicket: 'M'.repeat(43), streamGeneration: 1, codecs: ['h264'], quality: 'ultra' });
@@ -354,7 +456,7 @@ test('service: an unknown quality is refused by the command schema and creates n
 });
 
 test('service: a late `attached` after a quality session was stopped never starts capture', async t => {
-  const f = await target(t, { capabilities: ['screen-quality-v1'] });
+  const f = await target(t, { capabilities: ['screen-quality-v1', 'screen-rate-v1'] });
   const opened = f.open('sharp');
   opened.media.open();
   f.service.stop(opened.session.id);
@@ -438,7 +540,7 @@ test('reference chain: an encoded frame that cannot be framed ends the session; 
 });
 
 test('service: a frame the media socket cannot take ends the session (Host told), never skipped while the chain continues', async t => {
-  const f = await target(t, { capabilities: ['screen-quality-v1'] });
+  const f = await target(t, { capabilities: ['screen-quality-v1', 'screen-rate-v1'] });
   const opened = f.open('balanced'); await f.attach(opened);
   const hooks = f.hooks(), id = opened.session.id;
   const frame = (sequence, key = false) => hooks.onMessage({ type: 'frame', sessionId: id, sequence, streamGeneration: 1, captureMs: Date.now(), geometryRevision: 1, key,

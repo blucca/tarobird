@@ -369,6 +369,13 @@ it("a first receipt of a forwarded frame does not draw on the input budget; unkn
     if (ms % 9 === 0) ack(9_000_000 + ms);
   }
   expect((await screen.status(remote.session)).sessions).toHaveLength(1);
+  // Each kind on its own, at one instant (no refill): only the first receipt of a forwarded frame is free.
+  const budget = () => (screen as any).sessions.get(j.session.id).rateBudget as number;
+  expect(screen.frame(epoch, j.session.id, j.session.generation, header(++sequence), new Uint8Array([1]))).toBe(true);
+  const before = budget();
+  ack(sequence); expect(budget()).toBe(before);                              // first receipt: untouched
+  ack(sequence); const once = budget(); expect(once).toBeLessThan(before);   // repeated: charged (the refill since the last charge is under one)
+  ack(7_000_000); expect(budget()).toBe(once - 1);                           // never existed: charged
   // A repeated receipt of a real frame is charged like an unknown one, and the budget itself is unchanged.
   let rejected = "";
   try { for (let i = 0; i < 400; i++) ack(i % 2 ? sequence : 8_000_000 + i); } catch (error) { rejected = (error as Error).message; }

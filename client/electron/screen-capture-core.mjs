@@ -1,13 +1,14 @@
 // Capture/encode logic of the isolated capture renderer. Browser APIs are
 // injected so the generation, credit and race rules are testable without a
 // real screen. The page entry (screen-capture-page.mjs) passes real globals.
-import { screenH264Codec } from '../../src/client-protocol/screen-quality.ts';
+import { screenH264Codec, screenH264EncoderCodec, screenRateLadder } from '../../src/client-protocol/screen-quality.ts';
 export const CAPTURE_CREDITS = 3;
 /** A raw frame that waited this long for a credit is dropped, never encoded:
  * the Host refuses frames older than 2 s, and a stale delta cannot be skipped. */
 export const CAPTURE_HELD_MAX_MS = 1500;
-/** Encoded-byte pacing below the Hub's per-source media budget (500 B/ms with
- * a 1 MiB burst; exceeding it ends the session as `screen_bandwidth_exceeded`).
+/** Encoded-byte pacing below the Hub's per-source media budget (by default
+ * 500 B/ms with a 1 MiB burst, ten times that rate for a viewer on the local
+ * network; exceeding it ends the session as `screen_bandwidth_exceeded`).
  * Two gates share one bucket. Before encode, the newest raw frame waits
  * (latest wins, as for credits) while the bucket cannot cover what is already
  * committed plus the expected frame, and the quantizer rises. After encode,
@@ -19,14 +20,14 @@ export const CAPTURE_HELD_MAX_MS = 1500;
  * waits for a full bucket with nothing unacknowledged in flight. Nothing
  * encoded is dropped or reordered: a packet that cannot leave before it would
  * be too old for the Host ends the session (`screen_congested`). */
-export const PACE_BYTES_PER_MS = 425, PACE_BURST_BYTES = 768 * 1024;
+export const PACE_BYTES_PER_MS = 425, PACE_BYTES_PER_MS_MAX = 4250, PACE_BURST_BYTES = 768 * 1024;
 /** Latest send age for a packet: the Host refuses frames older than 2 s on arrival. */
 export const OUTPUT_MAX_AGE_MS = 1800;
 /** Legacy (balanced) encoder settings, used when main sends no profile. */
 const QP_BASE = 28, QP_MAX = 40, BITRATE = 2_500_000;
 /** The most this renderer will capture and encode per second, and the rate
  * used when main names none (the pre-quality behaviour). */
-export const FPS_MAX = 60, FPS_LEGACY = 15;
+export const FPS_MAX = 120, FPS_LEGACY = 15;
 /** A frame may be encoded this fraction of an interval before its slot: the
  * source's own jitter around the same nominal rate must not hold every frame
  * for a timer. The slots still advance by exactly one interval each. */
@@ -36,7 +37,9 @@ const bounded = (value, min, max, fallback) => Number.isFinite(value) ? Math.min
 function encoderProfile(fps, profile) {
   const qpBase = Math.round(bounded(profile?.qpBase, 10, 51, QP_BASE));
   return { fps: bounded(fps, 1, FPS_MAX, FPS_LEGACY), qpBase, qpMax: Math.round(bounded(profile?.qpMax, qpBase, 51, Math.max(qpBase, QP_MAX))),
-    bitrate: Math.round(bounded(profile?.bitrate, 250_000, 4_000_000, BITRATE)), h264Only: profile?.h264Only === true };
+    bitrate: Math.round(bounded(profile?.bitrate, 250_000, 4_000_000, BITRATE)), h264Only: profile?.h264Only === true,
+    // Bytes per millisecond this session may send: main names it when the Host granted more than the default budget.
+    pace: bounded(profile?.bytesPerMs, PACE_BYTES_PER_MS, PACE_BYTES_PER_MS_MAX, PACE_BYTES_PER_MS) };
 }
 
 export function createCaptureCore(env) {
@@ -118,12 +121,14 @@ export function createCaptureCore(env) {
     // The profile's rate first; an encoder that cannot take it at this size
     // gets the next lower standard rate instead of no picture at all. Codec
     // preference stays outermost: H.264 at a lower rate before VP8 at any.
-    const rates = [session.profile.fps, 30, FPS_LEGACY].filter((rate, index, all) => rate <= session.profile.fps && all.indexOf(rate) === index);
+    const rates = screenRateLadder(session.profile.fps), declared = screenH264Codec(width, height);
     const candidates = [];
     for (const fps of rates) {
-      // The level follows the encoded size and rate: 4.0 (the legacy string) whenever both fit.
-      const h264 = screenH264Codec(width, height, fps);
-      if (session.codecs.includes('h264') && h264) candidates.push({ codec: 'h264', codecString: h264, fps, config: { codec: h264, avc: { format: 'annexb' }, hardwareAcceleration: 'prefer-hardware' } });
+      // The encoder is told the level its size and rate need. The stream still
+      // declares the size's own level, the string viewers have always opened
+      // their decoder with; decoders follow the level in the bitstream.
+      const level = screenH264EncoderCodec(width, height, fps);
+      if (session.codecs.includes('h264') && declared && level) candidates.push({ codec: 'h264', codecString: declared, fps, config: { codec: level, avc: { format: 'annexb' }, hardwareAcceleration: 'prefer-hardware' } });
     }
     // A size only H.264 can carry is never silently re-encoded as something else.
     if (session.codecs.includes('vp8') && !session.profile.h264Only) for (const fps of rates) candidates.push({ codec: 'vp8', codecString: 'vp8', fps, config: { codec: 'vp8' } });
@@ -185,8 +190,10 @@ export function createCaptureCore(env) {
       const frame = result.value, captureMs = now();
       if (sessions.get(session.sessionId) !== session || session.paused || !session.encoder) { frame.close(); if (sessions.get(session.sessionId) !== session) return; continue; }
       send({ type: 'captured', sessionId: session.sessionId, captureMs });
-      // Latest wins: a frame that never got a credit is dropped before encode.
-      if (session.held) { session.held.frame.close(); session.crowded++; }
+      // Latest wins: a frame that never got its turn is dropped before encode.
+      // Only one the viewer or the encoder held up counts as crowding, not one
+      // the schedule or the byte budget skipped.
+      if (session.held) { session.held.frame.close(); if (session.held.blocked) session.crowded++; }
       session.held = { frame, captureMs, epoch: session.epoch };
       pump(session);
     }
@@ -201,7 +208,7 @@ export function createCaptureCore(env) {
     const encoder = session.encoder;
     if (!session.held || !encoder || session.paused || encoder.state !== 'configured') return;
     if (session.held.epoch !== session.epoch || now() - session.held.captureMs > CAPTURE_HELD_MAX_MS) { session.held.frame.close(); session.held = undefined; return; }
-    if (session.outstanding.size >= CAPTURE_CREDITS || encoder.encodeQueueSize > 0) return;
+    if (session.outstanding.size >= CAPTURE_CREDITS || encoder.encodeQueueSize > 0) { session.held.blocked = true; return; }
     // Bytes: packets waiting to leave, encodes still in flight and the next
     // frame are each expected to cost what the last one of their kind did.
     refill(session);
@@ -212,7 +219,7 @@ export function createCaptureCore(env) {
     // the previous encode: a late timer or a late frame delays that one frame
     // only, instead of pushing every later frame back by the same amount.
     const at = perf(), early = session.dueAt - at;
-    const wait = Math.max(early > session.interval * EARLY_FRACTION ? early : 0, session.bucket < need ? (need - session.bucket) / PACE_BYTES_PER_MS : 0);
+    const wait = Math.max(early > session.interval * EARLY_FRACTION ? early : 0, session.bucket < need ? (need - session.bucket) / session.profile.pace : 0);
     if (session.bucket < need) session.starved++;
     if (wait > 1) { timers.clearTimeout(session.pacing); session.pacing = timers.setTimeout(() => pump(session), wait); return; }
     const { frame, captureMs } = session.held; session.held = undefined;
@@ -279,7 +286,7 @@ export function createCaptureCore(env) {
         session.starved++;
         // Re-checked when bytes refill, when an ACK clears the flight, and at
         // the age limit at the latest: never an unbounded wait.
-        const refillMs = Math.max(0, (Math.min(size, PACE_BURST_BYTES) - session.bucket) / PACE_BYTES_PER_MS);
+        const refillMs = Math.max(0, (Math.min(size, PACE_BURST_BYTES) - session.bucket) / session.profile.pace);
         session.outputTimer = timers.setTimeout(() => drain(session), Math.max(1, Math.min(refillMs || OUTPUT_MAX_AGE_MS, OUTPUT_MAX_AGE_MS - age + 1)));
         return;
       }
@@ -303,18 +310,22 @@ export function createCaptureCore(env) {
   }
   function refill(session) {
     const at = perf();
-    session.bucket = Math.min(PACE_BURST_BYTES, session.bucket + Math.max(0, at - session.bucketAt) * PACE_BYTES_PER_MS); session.bucketAt = at;
+    session.bucket = Math.min(PACE_BURST_BYTES, session.bucket + Math.max(0, at - session.bucketAt) * session.profile.pace); session.bucketAt = at;
   }
   /** Once a second: credit starvation (slow viewer) or byte starvation (busy
    * picture) coarsens the quantizer up to the profile ceiling; three calm
    * seconds with a comfortable byte budget refine it back towards the base.
-   * Above the legacy rate, frames a viewer could not take only count as
-   * crowding once fewer got through than the legacy rate delivered: a viewer
-   * that follows at 20 of 30 frames a second keeps its picture quality. */
+   * `crowded` counts frames replaced while the viewer still owed receipts for
+   * a full window. At the legacy rate more than two of them in a second
+   * coarsen, as they always did. Above it the share decides, not the count:
+   * only when fewer than a quarter of the frames that wanted to go got through
+   * (a viewer below about 15 of 60). A viewer that follows at 20 or 40 keeps
+   * its picture quality, and so does a short burst of motion over a long
+   * round trip, which fills the window for a moment without anyone being slow. */
   function adapt(session) {
     const { qpBase, qpMax, fps } = session.profile;
     refill(session);
-    const crowded = session.crowded > 2 && (fps <= FPS_LEGACY || session.encoded < FPS_LEGACY - 2);
+    const crowded = session.crowded > 2 && (fps <= FPS_LEGACY || session.crowded > 3 * session.encoded);
     if (crowded || session.starved > 0) { session.qp = Math.min(qpMax, session.qp + 3); session.calm = 0; }
     else if (session.bucket < PACE_BURST_BYTES / 4) session.calm = 0;
     else if (++session.calm >= 3) session.qp = Math.max(qpBase, session.qp - 1);
