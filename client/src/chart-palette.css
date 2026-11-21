@@ -4,9 +4,11 @@
    with DEFAULT_PALETTE (mono), including initial widget token discovery.
    Dark/system resolve through CSS,
    so a theme change never recreates a report or resets its selection. */
+/* Monochrome's four series are its first four categorical hues (below), in
+   both modes and with every accent; the accent stays the data emphasis. */
 :root, :root[data-palette="mono"] {
-  --chart-series-1-light:#171717; --chart-series-2-light:#858585; --chart-series-3-light:#2f2f2f; --chart-series-4-light:#656565;
-  --chart-series-1-dark:#eeeeee; --chart-series-2-dark:#747474; --chart-series-3-dark:#cbcbcb; --chart-series-4-dark:#909090;
+  --chart-series-1-light:var(--cat-1-light); --chart-series-2-light:var(--cat-2-light); --chart-series-3-light:var(--cat-3-light); --chart-series-4-light:var(--cat-4-light);
+  --chart-series-1-dark:var(--cat-1-dark); --chart-series-2-dark:var(--cat-2-dark); --chart-series-3-dark:var(--cat-3-dark); --chart-series-4-dark:var(--cat-4-dark);
 }
 :root[data-palette="white-violet"] {
   --chart-series-1-light:#54488d; --chart-series-2-light:#9d5366; --chart-series-3-light:#7a87b3; --chart-series-4-light:#20766c;
@@ -212,45 +214,43 @@
   --cat-7-dark:#fbbf24; --cat-7-ink-dark:#fde047; --cat-7-soft-dark:#39362a;
   --cat-8-dark:#2dd4bf; --cat-8-ink-dark:#67e8d9; --cat-8-soft-dark:#22383b;
 }
-/* One accent-led main series, with three stable neutral references. Graphite
-   and no accent share the same grayscale data. Concrete hex values also work
-   with older token-aware guests and avoid colour-format surprises in scripts. */
+/* Monochrome accents set the data emphasis (headline, data-widget accent and
+   primary action), not the chart series. Concrete hex values also work with
+   older token-aware guests and avoid colour-format surprises in scripts. */
 :root[data-palette="mono"][data-mono-accent="graphite"] {
-  --chart-series-1-light:#171717; --chart-series-1-dark:#eeeeee;
+  --data-accent-light:#171717; --data-accent-dark:#eeeeee;
   --data-soft-light:#e8e8e8; --data-soft-dark:#313131;
 }
 :root[data-palette="mono"][data-mono-accent="warm-gray"] {
-  --chart-series-1-light:#554c42; --chart-series-1-dark:#b9ad9d;
+  --data-accent-light:#554c42; --data-accent-dark:#b9ad9d;
   --data-soft-light:#f0ede9; --data-soft-dark:#2d2a27;
 }
 :root[data-palette="mono"][data-mono-accent="mist"] {
-  --chart-series-1-light:#3b5779; --chart-series-1-dark:#8dacd2;
+  --data-accent-light:#3b5779; --data-accent-dark:#8dacd2;
   --data-soft-light:#ebeef2; --data-soft-dark:#272a2e;
 }
 :root[data-palette="mono"][data-mono-accent="sage"] {
-  --chart-series-1-light:#465d38; --chart-series-1-dark:#99b389;
+  --data-accent-light:#465d38; --data-accent-dark:#99b389;
   --data-soft-light:#ecefeb; --data-soft-dark:#282b27;
 }
 :root[data-palette="mono"][data-mono-accent="rose"] {
-  --chart-series-1-light:#75483e; --chart-series-1-dark:#cf9b8f;
+  --data-accent-light:#75483e; --data-accent-dark:#cf9b8f;
   --data-soft-light:#f1edec; --data-soft-dark:#2e2928;
 }
 :root[data-palette="mono"][data-mono-accent="oat"] {
-  --chart-series-1-light:#695129; --chart-series-1-dark:#bfa57b;
+  --data-accent-light:#695129; --data-accent-dark:#bfa57b;
   --data-soft-light:#f0eeea; --data-soft-dark:#2c2a26;
 }
 :root[data-palette="mono"][data-mono-accent="mauve"] {
-  --chart-series-1-light:#5c4c73; --chart-series-1-dark:#b1a0cc;
+  --data-accent-light:#5c4c73; --data-accent-dark:#b1a0cc;
   --data-soft-light:#efedf1; --data-soft-dark:#2b292e;
 }
 /* Data-only roles: never change global App chrome, chat or semantic status.
    One tone identifies the main series, headline and data-widget primary action
    in both modes; it meets text as well as graphical contrast requirements. */
 :root[data-palette="mono"]:is([data-mono-accent="graphite"],[data-mono-accent="warm-gray"],[data-mono-accent="mist"],[data-mono-accent="sage"],[data-mono-accent="rose"],[data-mono-accent="oat"],[data-mono-accent="mauve"]) {
-  --data-accent-light:var(--chart-series-1-light);
-  --data-accent-dark:var(--chart-series-1-dark);
-  --data-primary-light:var(--chart-series-1-light);
-  --data-primary-dark:var(--chart-series-1-dark);
+  --data-primary-light:var(--data-accent-light);
+  --data-primary-dark:var(--data-accent-dark);
 }
 :root {
   --data-accent:var(--data-accent-light,var(--accent));

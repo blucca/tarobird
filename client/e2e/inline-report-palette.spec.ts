@@ -152,7 +152,7 @@ for (const width of [390, 1360]) test(`all chart palettes retain distinct series
   } finally { await page.close(); await server.close(); }
 });
 
-for (const width of [390, 1360]) test(`monochrome data follows accents without recolouring surfaces or resetting interaction at ${width}px`, async ({ page }, info) => {
+for (const width of [390, 1360]) test(`monochrome series stay categorical while the accent sets only the data emphasis, without recolouring surfaces or resetting interaction at ${width}px`, async ({ page }, info) => {
   test.setTimeout(120_000);
   await page.setViewportSize({ width, height: 960 });
   const server = await createServer({ server: { port: 0, host: "127.0.0.1" } }); await server.listen();
@@ -171,10 +171,10 @@ for (const width of [390, 1360]) test(`monochrome data follows accents without r
     for (const theme of ['light', 'dark']) {
       await page.evaluate(theme => Object.assign(document.documentElement.dataset, { palette: 'mono', theme, monoAccent: 'none' }), theme);
       const neutral = await series(page), baseline = await surfaces(), seen = new Set<string>();
-      for (const entry of neutral) {
-        const rgb = entry.color.match(/[\d.]+/g)!.slice(0, 3).map(Number);
-        expect(new Set(rgb).size, 'no accent means neutral data, not a blue companion').toBe(1);
-      }
+      // Monochrome series are its first four categorical hues, not greys.
+      const categorical = await page.evaluate(() => { const probe = document.createElement('span'); document.body.append(probe); const colors = [1, 2, 3, 4].map(i => { probe.style.color = `var(--cat-${i})`; return getComputedStyle(probe).color; }); probe.remove(); return colors; });
+      expect(neutral.map(x => x.color)).toEqual(categorical);
+      for (const entry of neutral) expect(new Set(entry.color.match(/[\d.]+/g)!.slice(0, 3).map(Number)).size, 'monochrome data is coloured').toBeGreaterThan(1);
       for (const accent of monoAccents) {
         await page.evaluate(accent => document.documentElement.dataset.monoAccent = accent, accent.id);
         const actual = await series(page); seen.add(JSON.stringify(actual.map(x => x.color)));
@@ -191,8 +191,9 @@ for (const width of [390, 1360]) test(`monochrome data follows accents without r
         expect(legend).toEqual(actual.map(({ color, dash }) => ({ color, dash })));
         const emphasis = await panel.locator('.report-metrics dd').evaluateAll(nodes => nodes.map(node => getComputedStyle(node).color));
         expect(emphasis[1]).toBe(baseline.text);
-        if (!['none', 'graphite'].includes(accent.id)) { expect(actual).not.toEqual(neutral); expect(emphasis[0]).toBe(actual[0].color); }
-        expect(actual.slice(1)).toEqual(neutral.slice(1));
+        // The accent is the data emphasis; the series keep their categorical hues.
+        expect(actual).toEqual(neutral);
+        if (!['none', 'graphite'].includes(accent.id)) expect(emphasis[0]).not.toBe(baseline.text);
         const textContrast = await panel.evaluate(el => {
           const luminance = (s: string) => s.match(/[\d.]+/g)!.slice(0, 3).map(Number).map(v => v / 255).map(v => v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4).reduce((sum, v, i) => sum + v * [.2126, .7152, .0722][i], 0);
           const ratio = (a: string, b: string) => (Math.max(luminance(a), luminance(b)) + .05) / (Math.min(luminance(a), luminance(b)) + .05);
@@ -213,7 +214,7 @@ for (const width of [390, 1360]) test(`monochrome data follows accents without r
         await page.evaluate(() => (window as any).reportPalette.render('line'));
         await picker.selectOption('20');
       }
-      expect(seen.size).toBe(monoAccents.length - 1); // graphite and none intentionally share neutral data
+      expect(seen.size).toBe(1);
       await page.evaluate(() => document.documentElement.dataset.monoAccent = 'unknown'); expect(await series(page)).toEqual(neutral);
       await page.evaluate(() => { delete document.documentElement.dataset.monoAccent; }); expect(await series(page)).toEqual(neutral);
       await page.evaluate(() => { delete document.documentElement.dataset.palette; }); expect(await series(page)).toEqual(neutral);

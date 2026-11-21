@@ -326,7 +326,7 @@ test('open widgets follow monochrome accent-only changes without restarting stat
     sets.add(JSON.stringify(expected.slice(0,4)));
    }
   }
-  expect(sets.size).toBe((monoAccents.length-1)*2); // graphite shares the neutral series
+  expect(sets.size).toBe(2); // Monochrome series are categorical; an accent changes only the data emphasis
   await expect.poll(()=>guest(page).locator('#theme-events').innerText()).not.toBe('0');
   await page.evaluate(()=>Object.assign(document.documentElement.dataset,{palette:'white-blue',monoAccent:'mist'}));
   const blue=await page.evaluate(()=>getComputedStyle(document.documentElement).getPropertyValue('--accent').trim());
