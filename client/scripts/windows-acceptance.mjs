@@ -200,20 +200,28 @@ async function verifyElectron(sys, report, phase, directory, version) {
   // is a product defect. Start's app list is built asynchronously, so it is
   // polled up to 60 s with every read recorded; a correct shortcut that Start
   // still does not list is reported as environment pending (a skip), not a pass.
+  // Every call's exit code and stderr are kept, so a Get-StartApps that fails to
+  // load (for example from an inherited PSModulePath) is not read as "absent".
   const q = value => value.replaceAll("'", "''");
-  const shortcutAppId = shortcut ? (await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${q(path.win32.dirname(shortcut))}').ParseName('${q(path.win32.basename(shortcut))}'); [string]$i.ExtendedProperty('System.AppUserModel.ID')`)).stdout.trim() : '';
-  report.expect(phase, 'shortcut-appusermodel-id', !!shortcut && shortcutAppId === AUMID, shortcut ? `${shortcut}: System.AppUserModel.ID=${shortcutAppId || 'none'}` : 'no Start Menu shortcut');
+  const oneLine = text => String(text ?? '').trim().replaceAll(/\s+/g, ' ').slice(0, 300);
+  const property = shortcut ? await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${q(path.win32.dirname(shortcut))}').ParseName('${q(path.win32.basename(shortcut))}'); [string]$i.ExtendedProperty('System.AppUserModel.ID')`) : undefined;
+  const shortcutAppId = property ? property.stdout.trim() : '';
+  report.expect(phase, 'shortcut-appusermodel-id', !!shortcut && shortcutAppId === AUMID, shortcut ? `${shortcut}: System.AppUserModel.ID=${shortcutAppId || 'none'} (exit ${property.code}${oneLine(property.stderr) ? `; stderr: ${oneLine(property.stderr)}` : ''})` : 'no Start Menu shortcut');
   const polls = [];
-  let listed = false;
+  let listed = false, failedCalls = 0, lastError = '';
   for (let waited = 0; ; waited += 5000) {
-    const apps = (await sys.powershell(`Get-StartApps | Where-Object { $_.AppID -eq '${AUMID}' -or $_.Name -like '*TaroBird*' } | ForEach-Object { "$($_.Name)=$($_.AppID)" }`)).stdout.trim();
+    const call = await sys.powershell(`Get-StartApps | Where-Object { $_.AppID -eq '${AUMID}' -or $_.Name -like '*TaroBird*' } | ForEach-Object { "$($_.Name)=$($_.AppID)" }`);
+    const apps = call.stdout.trim(), error = oneLine(call.stderr);
     listed = apps.split(/\r?\n/).some(line => line.endsWith(`=${AUMID}`));
-    polls.push(`${waited / 1000}s:${listed ? 'listed' : 'absent'}${apps ? ` [${apps.replaceAll(/\r?\n/g, '; ')}]` : ''}`);
+    if (call.code !== 0 || error) failedCalls += 1;
+    polls.push(`${waited / 1000}s:${listed ? 'listed' : 'absent'} exit ${call.code}${apps ? ` [${apps.replaceAll(/\r?\n/g, '; ')}]` : ''}${error && error !== lastError ? ` stderr: ${error}` : error ? ' stderr: (same)' : ''}`);
+    lastError = error || lastError;
     if (listed || waited >= 60_000) break;
     await sys.sleep(5000);
   }
   const trail = `polls ${polls.join(', ')}`;
   if (listed) report.expect(phase, 'notification-aumid', true, trail);
+  else if (shortcutAppId === AUMID && failedCalls) report.add(phase, 'notification-aumid', 'skip', `Get-StartApps failed in ${failedCalls}/${polls.length} calls (exit code or stderr), so Start's list is unknown, not a pass; ${trail}`);
   else if (shortcutAppId === AUMID) report.add(phase, 'notification-aumid', 'skip', `Start did not list ${AUMID} within 60 s although the shortcut carries it: index not shown (environment pending, not a pass); ${trail}`);
   else report.expect(phase, 'notification-aumid', false, `no Start app with AppID ${AUMID}; the shortcut carries ${shortcutAppId || 'no AppID'}; ${trail}`);
 }
