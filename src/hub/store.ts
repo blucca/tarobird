@@ -710,7 +710,13 @@ export class HubStore {
   }
   async recoverSteering(): Promise<void> {
     const rows = await this.db.serial(() => this.db.all<MessageRow>("SELECT * FROM messages WHERE author_type='user' AND blocks_json LIKE '%\"type\":\"steering\"%'"));
-    for (const row of rows) if (this.decodeMessage(row).blocks.some((block) => block.type === "steering" && block.outcome === "pending")) await this.finishSteering(row.id, { outcome: "unknown", reason: "uncertain" });
+    for (const row of rows) {
+      const message = this.decodeMessage(row);
+      if (!message.blocks.some((block) => block.type === "steering" && block.outcome === "pending")) continue;
+      await this.finishSteering(row.id, { outcome: "unknown", reason: "uncertain" });
+      // A Bot's steer (issue #62) stays reconcilable; the log still states that its text may have reached a turn.
+      if (message.botSource) await this.audit("bot-message.steer", message.botSource.botId, { messageId: row.id, requestId: message.botSource.requestId, sourceHost: message.botSource.hostId, sourceBot: message.botSource.botId, outcome: "steer_unconfirmed", reason: "hub_restart" });
+    }
   }
   /** Only the Bot addressed by this user's original input may report adoption. */
   async applySteeringOutcome(botId: string, raw: unknown): Promise<void> {
@@ -726,9 +732,13 @@ export class HubStore {
       message.blocks = message.blocks.map(block => block.type === "steering" ? { ...block, application: input.application } : block);
       message.version++;
       await this.saveMessage(message);
-      return this.append(message.conversationId, "message.updated", message);
+      return { event: await this.append(message.conversationId, "message.updated", message), botSource: message.botSource, messageId: message.id };
     });
-    if (event) this.emit(event);
+    if (!event) return;
+    this.emit(event.event);
+    // Issue #62: whether a Bot's merged text was applied or dropped belongs in the audit log.
+    if (event.botSource) await this.audit("bot-message.steer", event.botSource.botId, { messageId: event.messageId, requestId: event.botSource.requestId, sourceHost: event.botSource.hostId, sourceBot: event.botSource.botId,
+      outcome: input.application.status, ...(input.application.status === "dropped" ? { reason: input.application.reason } : {}) });
   }
   /** A model receipt is distinct from native admission and turn completion. */
   async applyNativeInputProgress(botId: string, raw: unknown): Promise<void> {

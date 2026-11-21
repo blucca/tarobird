@@ -666,6 +666,7 @@ export class BotMessages {
         await this.reconcileSteer(c.p, c.bot.id, c.target, existing.id);
         const row = (await this.store.db.serial(() => this.store.db.get<{ blocks_json: string }>("SELECT blocks_json FROM messages WHERE id=?", [existing.id])))!;
         const memo = await this.store.db.serial(() => this.memo<IncomingMemo>(c.key));
+        await this.store.db.transaction(() => this.auditSendInTransaction(c, true, {}));
         await c.validate(); return this.receipt(c, { id: existing.id } as Message, true, this.deliveryOf(JSON.parse(row.blocks_json) as Block[], memo));
       }
     }

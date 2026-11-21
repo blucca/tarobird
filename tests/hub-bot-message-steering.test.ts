@@ -583,6 +583,29 @@ describe("R11/R12: bounded replay and the source rate limit before the Gateway",
   });
 });
 
+describe("R13: every steer outcome leaves an audit entry", () => {
+  const steerAudits = async () => (await b.store.db.all<{ kind: string; detail_json: string }>("SELECT kind,detail_json FROM audit_log WHERE kind IN ('bot-message.steer','bot-message.send') ORDER BY id")).map(row => ({ kind: row.kind, ...JSON.parse(row.detail_json) }));
+  it("records a Hub restart that left the call unconfirmed", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    let release!: (value: unknown) => void;
+    fake.steer.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const sending = send(chat.conversationId, "Interrupted", { delivery: "steer" });
+    await vi.waitFor(() => expect(fake.steer).toHaveBeenCalledTimes(1));
+    const record = (await b.store.db.get<{ id: string }>("SELECT id FROM messages WHERE blocks_json LIKE '%Interrupted%'"))!;
+    await b.store.recoverSteering();
+    expect(await steerAudits()).toContainEqual(expect.objectContaining({ kind: "bot-message.steer", messageId: record.id, outcome: "steer_unconfirmed", reason: "hub_restart", sourceBot: "source" }));
+    release({ outcome: "unknown", reason: "uncertain" }); await sending;
+  });
+  it("records the engine dropping merged text and every replay of a steer request", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    const receipt = await send(chat.conversationId, "Fix", { delivery: "steer" });
+    await b.store.applySteeringOutcome("target", { conversationId: chat.conversationId, userId: "owner", requestId: (await b.store.messageForUser("owner", receipt.messageId)).clientMsgId, targetId: run.targetId, application: { status: "dropped", reason: "stopped" } });
+    expect(await steerAudits()).toContainEqual(expect.objectContaining({ kind: "bot-message.steer", messageId: receipt.messageId, outcome: "dropped", reason: "stopped" }));
+    await send(chat.conversationId, "Fix", { delivery: "steer" }, receipt.requestId);
+    expect((await steerAudits()).filter(entry => entry.kind === "bot-message.send" && entry.requestId === receipt.requestId).map(entry => entry.duplicate)).toEqual([false, true]);
+  });
+});
+
 describe("M3: blank steer text", () => {
   it("gets the queue path's own answer before any record or Gateway call", async () => {
     const chat = await resolve(); await liveTurn(chat.conversationId);
