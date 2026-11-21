@@ -17,7 +17,24 @@ Var BirdMessage
   ${If} $BirdNoteKept = 1
     StrCpy $BirdMessage "$BirdMessage$\r$\n$(birdNoteKept)"
   ${EndIf}
-  DetailPrint "$BirdMessage"
+  ; The Details list shows each DetailPrint as one row and ignores line breaks,
+  ; and a /P run shows no dialog. Print the dialog's lines one row each, minus
+  ; the Ctrl+C hint, which only applies to the dialog.
+  DetailPrint "$BirdOperation — ${PHASE}"
+  DetailPrint "${REASON}"
+  ${If} $BirdBackupState != ""
+    DetailPrint "$BirdBackupState"
+  ${EndIf}
+  ${If} $BirdNoticeState != ""
+    DetailPrint "$BirdNoticeState"
+  ${EndIf}
+  ${If} "${ACTION}" != ""
+    DetailPrint "${ACTION}"
+  ${EndIf}
+  DetailPrint "TaroBird ${VERSION} · TB-${CODE}"
+  ${If} $BirdNoteKept = 1
+    DetailPrint "$(birdNoteKept)"
+  ${EndIf}
   ${IfNot} ${Silent}
   ${AndIf} $PassiveMode != 1
     !if "${RETRY}" == ""

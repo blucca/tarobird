@@ -455,6 +455,26 @@ test('new #50 diagnostics are localized and path-free in both languages', async 
   }
 });
 
+// #50: the Details list shows one row per DetailPrint and drops line breaks,
+// and a /P run has no dialog. How the rows look on Windows needs real acceptance.
+test('a stopped step lists stage, reason, next step and code in Details one row each; the dialog text is unchanged', async () => {
+  const [diagnostics] = await templates('installer-diagnostics.nsh');
+  const problem = between(diagnostics, '!macro BirdProblem', '!macroend');
+  // The dialog keeps the full multi-line text.
+  assert.ok(problem.includes('StrCpy $BirdMessage "$BirdOperation — ${PHASE}$\\r$\\n${REASON}$\\r$\\n$BirdBackupState$\\r$\\n$BirdNoticeState$\\r$\\n$\\r$\\n${ACTION}$\\r$\\n$\\r$\\nTaroBird ${VERSION} · TB-${CODE} · $(birdCopy)"'));
+  assert.ok(problem.includes('StrCpy $BirdMessage "$BirdMessage$\\r$\\n$(birdNoteKept)"'));
+  assert.equal(problem.match(/MessageBox [^\n]*"\$BirdMessage"/g).length, 2);
+  // Details: the dialog's lines in the dialog's order, one row each, without the joined text, a line break or the dialog-only Ctrl+C hint.
+  const rows = [...problem.matchAll(/^\s*DetailPrint "(.*)"$/gm)].map(match => match[1]);
+  assert.deepEqual(rows, ['$BirdOperation — ${PHASE}', '${REASON}', '$BirdBackupState', '$BirdNoticeState', '${ACTION}', 'TaroBird ${VERSION} · TB-${CODE}', '$(birdNoteKept)']);
+  for (const row of rows) assert.doesNotMatch(row, /\$BirdMessage|\$\\[rn]|birdCopy/, row);
+  assert.equal(problem.match(/^\s*DetailPrint\b/gm).length, rows.length);
+  // Empty lines get no row; every row is printed before the dialog and the abort.
+  ordered(problem, '${If} $BirdBackupState != ""\n    DetailPrint "$BirdBackupState"', '${If} $BirdNoticeState != ""\n    DetailPrint "$BirdNoticeState"',
+    '${If} "${ACTION}" != ""\n    DetailPrint "${ACTION}"', 'DetailPrint "TaroBird ${VERSION} · TB-${CODE}"', '${If} $BirdNoteKept = 1\n    DetailPrint "$(birdNoteKept)"',
+    '${IfNot} ${Silent}', 'MessageBox', 'Abort');
+});
+
 // #50: the only record left after setup closes. Real writes, the limit and
 // concurrent writers need Windows (acceptance probe); these pin the script.
 test('local setup notes hold only allowlisted stage text, stay bounded and never block setup', async () => {
@@ -504,7 +524,7 @@ test('local setup notes hold only allowlisted stage text, stay bounded and never
   // Every diagnosed stop records its stage and code before the dialog; the hint appears only for a written line.
   const problem = between(diagnostics, '!macro BirdProblem', '!macroend');
   ordered(problem, 'StrCpy $BirdNotePhase "${PHASE}"', 'StrCpy $BirdNoteCode "${CODE}"', '!insertmacro BirdNoteCall', 'StrCpy $BirdMessage',
-    '${If} $BirdNoteKept = 1', '$(birdNoteKept)', 'DetailPrint "$BirdMessage"', 'Abort');
+    '${If} $BirdNoteKept = 1', '$(birdNoteKept)', 'DetailPrint', 'Abort');
   assert.match(diagnostics, /^!include "installer-notes\.nsh"$/m);
   // A finished install or uninstall records that it finished.
   assert.match(between(nsi, 'Function .onInstSuccess', 'FunctionEnd'), /!insertmacro BirdNoteDone/);
