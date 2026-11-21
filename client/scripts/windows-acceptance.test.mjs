@@ -82,7 +82,9 @@ function windows({ faults = new Set(), existing = false, host = false, displayNa
         return { code: 0, stdout: `${JSON.stringify([...procs.values()].filter(item => item.image === image).map(({ image: _, ...rest }) => rest))}\r\n` };
       }
       if (script.includes('CreateShortcut')) return { code: 0, stdout: `${exe}\r\n` };
-      if (script.includes('Get-StartApps')) return { code: 0, stdout: faults.has('aumid') ? '' : `${AUMID}\r\n` };
+      // The shortcut's own System.AppUserModel.ID (written by the installer) and Start's list.
+      if (script.includes('System.AppUserModel.ID')) return { code: 0, stdout: faults.has('shortcut-aumid') ? '\r\n' : `${AUMID}\r\n` };
+      if (script.includes('Get-StartApps')) return { code: 0, stdout: faults.has('aumid') || faults.has('shortcut-aumid') ? '' : `TaroBird=${AUMID}\r\n` };
       if (script.includes('ToastNotificationManager')) {
         calls.push(['toast-probe', script]);
         return faults.has('toast-probe') ? { code: 1, stdout: '', stderr: 'Unable to find type [Windows.UI.Notifications.ToastNotificationManager]' }
@@ -169,7 +171,7 @@ test('a fresh install passes only its own scope; unexercised paths make the defa
   const { report } = await runAcceptance({ installer: SETUP, version: '1.2.3', confirmed: true, scopes: ['install'] }, scoped);
   assert.equal(report.outcome, 'pass', JSON.stringify(report.checks.filter(c => c.status === 'fail')));
   const status = statuses(report);
-  for (const id of ['install/uninstall-key', 'install/notification-receipt', 'install/notification-aumid', 'install/deep-link', 'install/host-runtime',
+  for (const id of ['install/uninstall-key', 'install/notification-receipt', 'install/shortcut-appusermodel-id', 'install/notification-aumid', 'install/deep-link', 'install/host-runtime',
     'first-launch/app-running', 'first-launch/profile-marker', 'first-launch/stop-own-processes', 'uninstall/program-removed', 'uninstall/uninstall-key-removed', 'uninstall/data-retained']) {
     assert.equal(status[id], 'pass', id);
   }
@@ -255,12 +257,25 @@ test('regressions: each former false positive now fails or is reported as not ve
 });
 
 test('a broken behaviour is a failure, not a skip', async () => {
-  for (const [fault, id, legacy] of [['credentials', 'first-launch/credentials-retained', true], ['receipt', 'install/notification-receipt'], ['aumid', 'install/notification-aumid'], ['uninstall', 'uninstall/uninstaller-exit']]) {
+  for (const [fault, id, legacy] of [['credentials', 'first-launch/credentials-retained', true], ['receipt', 'install/notification-receipt'], ['shortcut-aumid', 'install/shortcut-appusermodel-id'], ['uninstall', 'uninstall/uninstaller-exit']]) {
     const sys = windows({ faults: new Set([fault]), host: fault === 'credentials' });
     const { report } = await runAcceptance({ installer: SETUP, legacyInstaller: legacy ? LEGACY : undefined, confirmed: true }, sys);
     assert.equal(statuses(report)[id], 'fail', fault);
     assert.equal(report.outcome, 'fail');
   }
+});
+
+test('a shortcut without its AppUserModelID is a product failure; a correct one Start never lists is environment pending', async () => {
+  let { report } = await runAcceptance({ installer: SETUP, confirmed: true, scopes: ['install'] }, windows({ faults: new Set(['shortcut-aumid']) }));
+  assert.equal(statuses(report)['install/shortcut-appusermodel-id'], 'fail');
+  assert.equal(statuses(report)['install/notification-aumid'], 'fail');
+  assert.match(detail(report, 'install/notification-aumid'), /the shortcut carries no AppID/);
+  assert.equal(report.outcome, 'fail');
+  ({ report } = await runAcceptance({ installer: SETUP, confirmed: true, scopes: ['install'] }, windows({ faults: new Set(['aumid']) })));
+  assert.equal(statuses(report)['install/shortcut-appusermodel-id'], 'pass');
+  assert.equal(statuses(report)['install/notification-aumid'], 'skip', 'never a silent pass');
+  assert.match(detail(report, 'install/notification-aumid'), /environment pending, not a pass.*polls 0s:absent.*60s:absent/);
+  assert.notEqual(report.outcome, 'pass');
 });
 
 test('a failed launch or an unexpected error still produces a failing receipt', async () => {
