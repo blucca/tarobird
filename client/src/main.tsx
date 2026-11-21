@@ -1,6 +1,7 @@
 import { installMotion } from "./motion.js";
 import "./transport.js";
 import { restoreAppearance } from "./appearance.js";
+import { lockIosAppPageZoom } from "./ios-page-zoom.js";
 import { installDesktopWindowChrome } from "./desktop-window-chrome.js";
 import { installNativeContextMenu } from "./native-context-menu.js";
 import { installFocusIntent } from "./focus-intent.js";
@@ -44,6 +45,7 @@ import "./ios-adaptive.css";
 setLocale(systemLocale());
 const stopMotion = installMotion();
 restoreAppearance();
+lockIosAppPageZoom();
 const stopWindowChrome = installDesktopWindowChrome();
 // Android's native container owns system bars/cutouts; viewport.ts handles the
 // keyboard overlay. Zero safe tokens apply before React and survive navigation.

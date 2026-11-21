@@ -4144,6 +4144,14 @@ visible area. `safe-area-tokens.css` retains browser/iOS inset fallback values;
 iOS `contentInset: "never"` leaves safe-area ownership with these CSS surfaces;
 UIKit must not add another automatic WKWebView scroll inset. See the
 [iOS inset follow-up](client/mobile-safe-area-2026-10-12.md#ios-container-inset-follow-up-2026-10-23).
+`main.tsx` calls `ios-page-zoom.ts` at startup: only in the iOS App does the
+viewport gain `maximum-scale=1`. Capacitor leaves that WKWebView without page
+pinch or scrolling, so WebKit's automatic zoom into a field under 16px (or a
+contenteditable) could not be undone and kept the right and bottom edges off
+screen. Picture, PDF and image pinch zoom are page code and stay available;
+Android, desktop and browsers keep the shipped viewport. Unit and browser
+`ios-page-zoom` check the viewport per platform; see
+[iOS page zoom](client/ios-page-zoom-2026-11-21.md) for simulator evidence.
 Android `MainActivity` installs `NativeInsets.java`: native window padding owns
 system bars and cutouts. It reports IME overlap to `viewport.ts` instead of
 resizing the WebView ahead of the keyboard. SystemBars inset handling is disabled,
