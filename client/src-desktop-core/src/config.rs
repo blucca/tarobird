@@ -77,7 +77,9 @@ mod tests {
             let mut partial = VALID.to_vec(); partial.drain(skip..skip + 2);
             assert!(Config::parse(args(&partial)).is_err(), "missing {}", VALID[skip]);
         }
-        let mut duplicate = VALID.to_vec(); duplicate.extend(["--state-dir", "/tmp/b"]);
+        // A second, otherwise valid value: only the duplicate itself can be rejected.
+        let other = if cfg!(windows) { r"C:\tmp\b" } else { "/tmp/b" };
+        let mut duplicate = VALID.to_vec(); duplicate.extend(["--state-dir", other]);
         assert!(Config::parse(args(&duplicate)).is_err());
         let mut unknown = VALID.to_vec(); unknown.push("--dev");
         assert!(Config::parse(args(&unknown)).is_err());
