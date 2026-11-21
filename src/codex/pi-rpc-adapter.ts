@@ -39,6 +39,7 @@ import { PiSessionStore, piWorkspaceCwd, samePiWorkspace, hasPiTrustGatedFiles, 
 import {
   PiTurnMapper, buildPiPrompt, isPiDialog, piDialogQuestion, piDialogResponse, piNativeTree, piQuestionWithDetail, piUsageCostBreakdown, piUserEntryText,
 } from "./pi-turn-mapper.js";
+import { piSkippedImagesNotice } from "./pi-turn-mapper.js";
 
 export interface PiRpcAdapterOptions {
   launch: PiLaunchSpec;
@@ -900,11 +901,8 @@ export class PiRpcAdapter implements CodexAdapter {
     const acceptsImages = Boolean(worker.state.model?.input?.includes("image"));
     const prompt = await buildPiPrompt({ text, files: input.files, modelAcceptsImages: acceptsImages });
     this.throwIfStopped(turn);
-    if (prompt.skippedImages.some(item => item.reason === "model-has-no-vision")) {
-      this.publishUi(worker, { type: "notify", level: "warning", text: locale === "en"
-        ? "The current model does not accept images. The image was passed as a file path only."
-        : "当前模型不支持图片输入，图片只以文件路径形式提供。" }, "host");
-    }
+    const imageNotice = piSkippedImagesNotice(prompt.skippedImages, locale);
+    if (imageNotice) this.publishUi(worker, { type: "notify", level: "warning", text: imageNotice }, "host");
 
     // Pi answers `prompt` only after its extension and input preflight, which can take arbitrarily long.
     // The request is kept unbounded and raced against a stop, so a stop never waits on that preflight.
@@ -2151,6 +2149,8 @@ export class PiRpcAdapter implements CodexAdapter {
         const worker = await this.live(sessionId);
         const prompt = await buildPiPrompt({ text: input.text, files: input.files ?? [], modelAcceptsImages: Boolean(worker.state.model?.input?.includes("image")) });
         const result = await worker.client.request({ type: "follow_up", message: prompt.message, ...(prompt.images.length ? { images: prompt.images } : {}) });
+        const imageNotice = piSkippedImagesNotice(prompt.skippedImages, worker.turn?.input.locale ?? "en");
+        if (imageNotice) this.publishUi(worker, { type: "notify", level: "warning", text: imageNotice }, "host");
         return result.disposition;
       },
       clearQueue: async sessionId => {

@@ -100,6 +100,21 @@ native-command turns; a partial reply or command failure is not reported as a
 completed result. A process that exits or is retired during final startup
 registration is never published as live.
 
+## Attachments and images
+
+Every attachment is named by its path in the prompt. For a model that accepts
+images, image attachments also travel as pixels, recognised by Pi's own rules
+(PNG, JPEG, GIF, WebP and BMP; not APNG, JPEG-LS or HEIC). TaroBird sends the
+original bytes; Pi 1.5.2 and later converts BMP to PNG and resizes each image to
+the model's inline limits, as it does for `pi @file`. There is no per-image size
+or count limit. One message carries at most 64 MiB of original image bytes,
+which keeps its single RPC line well below the sizes measured to stall Pi or
+exceed the host's 256 MiB record limit. An image left out for that reason or
+because it cannot be read is named by path only, with a host notice listing the
+files and the reason; a text-only model receives every image by path, with its
+own notice. Pi 1.5.0 and earlier do not convert or resize images in messages
+queued while a run is in progress.
+
 ## Permissions and tools
 
 Normal mode asks for approval for shell commands, writes and other tools that

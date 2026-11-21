@@ -12,9 +12,9 @@ import {
   type PiExtensionUiRequest, type PiSessionEvent, type PiSessionTreeNode,
 } from "../src/codex/pi-rpc-protocol.js";
 import {
-  PI_INLINE_IMAGE_MAX_BYTES, PI_INLINE_IMAGE_MAX_COUNT, PiTurnMapper,
-  addPiUsage, buildPiPrompt, isPiAssistantMessage, isPiDialog, piDialogQuestion, piDialogResponse, piMessageText,
-  piNativeTree, piToolResultText, piUserEntryText,
+  PI_INLINE_IMAGE_TOTAL_BYTES, PiTurnMapper,
+  addPiUsage, buildPiPrompt, isPiAssistantMessage, isPiDialog, piDialogQuestion, piDialogResponse, piImageMimeType, piMessageText,
+  piNativeTree, piSkippedImagesNotice, piToolResultText, piUserEntryText,
 } from "../src/codex/pi-turn-mapper.js";
 
 const FIXTURE_DIR = fileURLToPath(new URL("./fixtures/pi-rpc/", import.meta.url));
@@ -411,6 +411,15 @@ describe("Pi usage and text helpers", () => {
 describe("buildPiPrompt", () => {
   const PNG_1X1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
   const PNG_SIGNATURE = PNG_1X1.subarray(0, 8);
+  /** Signature and IHDR chunk, which Pi requires before it calls a file a PNG. */
+  const PNG_HEADER = PNG_1X1.subarray(0, 33);
+  /** A 2×2 24-bit BMP with a 40-byte BITMAPINFOHEADER. */
+  const BMP_2X2 = (() => {
+    const pixels = 2 * 2 * 3 + 2 * 2, file = Buffer.alloc(54 + pixels);
+    file.write("BM", 0, "latin1"); file.writeUInt32LE(file.length, 2); file.writeUInt32LE(54, 10); file.writeUInt32LE(40, 14);
+    file.writeInt32LE(2, 18); file.writeInt32LE(2, 22); file.writeUInt16LE(1, 26); file.writeUInt16LE(24, 28); file.writeUInt32LE(pixels, 34);
+    return file;
+  })();
   const roots: string[] = [];
   afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
   const scratch = async () => { const root = await mkdtemp(path.join(os.tmpdir(), "pi-prompt-")); roots.push(root); return root; };
@@ -455,28 +464,70 @@ describe("buildPiPrompt", () => {
     expect(prompt.message).toBe(`look\nAttachment: ${image}\nAttachment: ${notes}`);
   });
 
-  it("leaves an image over the inline limit to the agent's own read tool", async () => {
+  it("sends an image larger than 3 MiB as pixels, as native Pi does: Pi resizes it", async () => {
     const root = await scratch();
-    const atLimit = path.join(root, "limit.png"), over = path.join(root, "over.png");
-    await writeFile(atLimit, Buffer.concat([PNG_SIGNATURE, Buffer.alloc(PI_INLINE_IMAGE_MAX_BYTES - PNG_SIGNATURE.length)]));
-    await writeFile(over, Buffer.concat([PNG_SIGNATURE, Buffer.alloc(PI_INLINE_IMAGE_MAX_BYTES - PNG_SIGNATURE.length + 1)]));
-    const prompt = await buildPiPrompt({ text: "big", files: [atLimit, over], modelAcceptsImages: true });
+    const big = path.join(root, "big.png");
+    await writeFile(big, Buffer.concat([PNG_HEADER, Buffer.alloc(5 * 1024 * 1024)]));
+    const prompt = await buildPiPrompt({ text: "big", files: [big], modelAcceptsImages: true });
     expect(prompt.images).toHaveLength(1);
-    expect(Buffer.from(prompt.images[0]!.data, "base64")).toHaveLength(PI_INLINE_IMAGE_MAX_BYTES);
-    expect(prompt.skippedImages).toEqual([{ file: over, reason: "too-large" }]);
-    expect(prompt.message).toContain(`Attachment: ${over}`);
-    expect(PI_INLINE_IMAGE_MAX_BYTES).toBe(3 * 1024 * 1024);
+    expect(Buffer.from(prompt.images[0]!.data, "base64")).toHaveLength(PNG_HEADER.length + 5 * 1024 * 1024);
+    expect(prompt.skippedImages).toEqual([]);
   });
 
-  it("inlines at most eight images per message", async () => {
+  it("sends every image of a message, with no count limit of its own", async () => {
     const root = await scratch();
     const files: string[] = [];
-    for (let index = 0; index < PI_INLINE_IMAGE_MAX_COUNT + 2; index++) { const file = path.join(root, `i${index}.png`); await writeFile(file, PNG_1X1); files.push(file); }
+    for (let index = 0; index < 20; index++) { const file = path.join(root, `i${index}.png`); await writeFile(file, PNG_1X1); files.push(file); }
     const prompt = await buildPiPrompt({ text: "many", files, modelAcceptsImages: true });
-    expect(PI_INLINE_IMAGE_MAX_COUNT).toBe(8);
-    expect(prompt.images).toHaveLength(8);
-    expect(prompt.skippedImages).toEqual([{ file: files[8], reason: "too-many" }, { file: files[9], reason: "too-many" }]);
-    expect(prompt.message.split("\n").filter(line => line.startsWith("Attachment: "))).toHaveLength(10);
+    expect(prompt.images).toHaveLength(20);
+    expect(prompt.skippedImages).toEqual([]);
+    expect(prompt.message.split("\n").filter(line => line.startsWith("Attachment: "))).toHaveLength(20);
+  });
+
+  it("keeps one message's original image bytes within the line budget and names the rest by path", async () => {
+    const root = await scratch();
+    const image = async (name: string, bytes: number) => { const file = path.join(root, name); await writeFile(file, Buffer.concat([PNG_HEADER, Buffer.alloc(bytes - PNG_HEADER.length)])); return file; };
+    const a = await image("a.png", 400), b = await image("b.png", 600), c = await image("c.png", 100), d = await image("d.png", 1001), e = await image("e.png", 1000);
+    const prompt = await buildPiPrompt({ text: "x", files: [a, b, c, d, e], modelAcceptsImages: true, totalBytes: 1000 });
+    // a + b fill the budget exactly; c no longer fits; d alone is over it; e would fit an empty message.
+    expect(prompt.images.map(item => Buffer.from(item.data, "base64").length)).toEqual([400, 600]);
+    expect(prompt.skippedImages).toEqual([{ file: c, reason: "over-total" }, { file: d, reason: "too-large" }, { file: e, reason: "over-total" }]);
+    expect(prompt.message).toBe(["x", ...[a, b, c, d, e].map(file => `Attachment: ${file}`)].join("\n"));
+    const later = await buildPiPrompt({ text: "x", files: [d, c, e], modelAcceptsImages: true, totalBytes: 1000 });
+    expect(later.images.map(item => Buffer.from(item.data, "base64").length)).toEqual([100]);
+    expect(later.skippedImages).toEqual([{ file: d, reason: "too-large" }, { file: e, reason: "over-total" }]);
+    expect(PI_INLINE_IMAGE_TOTAL_BYTES).toBe(64 * 1024 * 1024);
+  });
+
+  it("sends a BMP as it is, for Pi to convert to PNG as native Pi does", async () => {
+    const root = await scratch();
+    const bmp = path.join(root, "scan.bmp"), notBmp = path.join(root, "notes.txt");
+    await writeFile(bmp, BMP_2X2);
+    await writeFile(notBmp, "BMW service notes, not a bitmap at all");
+    const prompt = await buildPiPrompt({ text: "x", files: [bmp, notBmp], modelAcceptsImages: true });
+    expect(prompt.images).toEqual([{ type: "image", data: BMP_2X2.toString("base64"), mimeType: "image/bmp" }]);
+    expect(prompt.skippedImages).toEqual([]);
+  });
+
+  it("recognises images by Pi's own rules", () => {
+    expect(piImageMimeType(PNG_1X1)).toBe("image/png");
+    expect(piImageMimeType(BMP_2X2)).toBe("image/bmp");
+    expect(piImageMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0]))).toBe("image/jpeg");
+    expect(piImageMimeType(Buffer.from("GIF89a\x01\x00\x01\x00", "latin1"))).toBe("image/gif");
+    expect(piImageMimeType(Buffer.from("RIFF\x00\x00\x00\x00WEBPVP8 ", "latin1"))).toBe("image/webp");
+    // Native Pi does not send these as images either.
+    expect(piImageMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xf7, 0, 0]))).toBeNull(); // JPEG-LS
+    const actl = Buffer.concat([Buffer.from([0, 0, 0, 8]), Buffer.from("acTL", "latin1"), Buffer.alloc(12)]);
+    expect(piImageMimeType(Buffer.concat([PNG_HEADER, actl]))).toBeNull(); // APNG
+    expect(piImageMimeType(PNG_SIGNATURE)).toBeNull(); // a signature without its header
+    const os2 = Buffer.from(BMP_2X2); os2.writeUInt32LE(12, 14); os2.writeUInt16LE(1, 22); os2.writeUInt16LE(24, 24);
+    expect(piImageMimeType(os2)).toBe("image/bmp");
+    const planes = Buffer.from(BMP_2X2); planes.writeUInt16LE(2, 26);
+    expect(piImageMimeType(planes)).toBeNull();
+    const offset = Buffer.from(BMP_2X2); offset.writeUInt32LE(20, 10);
+    expect(piImageMimeType(offset)).toBeNull();
+    expect(piImageMimeType(BMP_2X2.subarray(0, 25))).toBeNull();
+    expect(piImageMimeType(Buffer.from("ftypheic", "latin1"))).toBeNull();
   });
 
   it("still names a path it cannot open, without failing the turn", async () => {
@@ -485,6 +536,32 @@ describe("buildPiPrompt", () => {
     await mkdir(folder);
     const prompt = await buildPiPrompt({ text: "x", files: [missing, folder], modelAcceptsImages: true });
     expect(prompt).toEqual({ message: `x\nAttachment: ${missing}\nAttachment: ${folder}`, images: [], skippedImages: [] });
+  });
+});
+
+describe("piSkippedImagesNotice", () => {
+  const skip = (reason: "model-has-no-vision" | "too-large" | "over-total" | "unreadable", ...names: string[]) => names.map(name => ({ file: path.join("/inbox", name), reason }));
+
+  it("says nothing when every image went as pixels", () => {
+    expect(piSkippedImagesNotice([], "zh")).toBeUndefined();
+    expect(piSkippedImagesNotice([], "en")).toBeUndefined();
+  });
+
+  it("keeps the text-only model notice", () => {
+    expect(piSkippedImagesNotice(skip("model-has-no-vision", "a.png"), "zh")).toBe("当前模型不支持图片输入，图片只以文件路径形式提供。");
+    expect(piSkippedImagesNotice(skip("model-has-no-vision", "a.png"), "en")).toBe("The current model does not accept images. The image was passed as a file path only.");
+  });
+
+  it("names each image that went by path only, and why", () => {
+    const skipped = [...skip("over-total", "c.png", "e.png"), ...skip("too-large", "huge.bmp"), ...skip("unreadable", "gone.jpg")];
+    expect(piSkippedImagesNotice(skipped, "zh")).toBe("以下图片没有直接发给模型，只以文件路径提供：huge.bmp（单张超过 64 MiB）；c.png、e.png（本条消息的图片合计超过 64 MiB）；gone.jpg（无法读取）。");
+    expect(piSkippedImagesNotice(skipped, "en")).toBe("Sent as file paths only, not as images: huge.bmp (over 64 MiB); c.png, e.png (64 MiB per-message total reached); gone.jpg (unreadable).");
+  });
+
+  it("shortens a long list", () => {
+    const skipped = skip("over-total", ...Array.from({ length: 8 }, (_, index) => `p${index}.jpg`));
+    expect(piSkippedImagesNotice(skipped, "zh")).toBe("以下图片没有直接发给模型，只以文件路径提供：p0.jpg、p1.jpg、p2.jpg、p3.jpg、p4.jpg 等 8 张（本条消息的图片合计超过 64 MiB）。");
+    expect(piSkippedImagesNotice(skipped, "en")).toBe("Sent as file paths only, not as images: p0.jpg, p1.jpg, p2.jpg, p3.jpg, p4.jpg and 3 more (64 MiB per-message total reached).");
   });
 });
 

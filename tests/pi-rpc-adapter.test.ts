@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -966,6 +966,32 @@ describe("PiRpcAdapter turns", () => {
     await r.adapter.piNative.setModel(sessionId, { provider: "fakeprov", modelId: "dup-model" });
     await r.adapter.sendUserMessage(sessionId, message("look again", { files: [file] }));
     expect(commands(r.spawner.last(), "prompt")[1]!.images).toEqual([{ type: "image", data: png.toString("base64"), mimeType: "image/png" }]);
+  });
+
+  it("sends a BMP for Pi to convert and says which images went by path only", async () => {
+    const r = await rig();
+    const bmp = Buffer.alloc(70);
+    bmp.write("BM", 0, "latin1"); bmp.writeUInt32LE(70, 2); bmp.writeUInt32LE(54, 10); bmp.writeUInt32LE(40, 14);
+    bmp.writeInt32LE(2, 18); bmp.writeInt32LE(2, 22); bmp.writeUInt16LE(1, 26); bmp.writeUInt16LE(24, 28);
+    const scan = path.join(r.root, "scan.bmp"); await writeFile(scan, bmp);
+    // Over the per-message budget by size alone, so it is never read: a sparse file is enough.
+    const huge = path.join(r.root, "huge.png");
+    await writeFile(huge, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ", "base64"));
+    await truncate(huge, 65 * 1024 * 1024);
+    const { sessionId } = await r.adapter.createSession(1);
+    const notes: PiNativeEvent[] = [];
+    r.adapter.piNative.subscribe(sessionId, event => { if (event.type === "notify") notes.push(event); });
+    const turn = message("look", { files: [scan, huge], locale: "zh" });
+    await r.adapter.sendUserMessage(sessionId, turn);
+    const prompt = commands(r.spawner.last(), "prompt")[0]!;
+    expect(prompt.images).toEqual([{ type: "image", data: bmp.toString("base64"), mimeType: "image/bmp" }]);
+    expect(String(prompt.message)).toContain(`Attachment: ${huge}`);
+    expect(notes).toEqual([{ type: "notify", level: "warning", text: "以下图片没有直接发给模型，只以文件路径提供：huge.png（单张超过 64 MiB）。" }]);
+    expect(turn.events.some(event => event.type === "assistant_text" && event.text === "[Pi] 以下图片没有直接发给模型，只以文件路径提供：huge.png（单张超过 64 MiB）。")).toBe(true);
+
+    expect(await r.adapter.piNative.followUp(sessionId, { text: "later", files: [huge] })).toBe("queued");
+    expect(commands(r.spawner.last(), "follow_up").at(-1)!.images).toBeUndefined();
+    expect(notes.at(-1)).toEqual({ type: "notify", level: "warning", text: "Sent as file paths only, not as images: huge.png (over 64 MiB)." });
   });
 });
 

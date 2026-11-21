@@ -1,7 +1,7 @@
-import { readFile, stat } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
+import path from "node:path";
 import type { AdapterUsage, EngineStreamEvent } from "./adapter.js";
 import { engineRetryReason } from "./turn-retry.js";
-import { detectImageMediaTypeFromFile } from "../runtime/image-media.js";
 import type {
   PiAssistantMessage, PiContentBlock, PiExtensionUiRequest, PiExtensionUiResponse, PiImageContent, PiMessage,
   PiSessionEntry, PiSessionEvent, PiSessionTreeNode, PiUsage,
@@ -213,39 +213,122 @@ function compactJson(value: unknown, limit = 300): string {
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
 }
 
-/** Inline images Pi accepts over RPC. Larger files are left for the agent's own `read` tool, which resizes. */
-export const PI_INLINE_IMAGE_MAX_BYTES = 3 * 1024 * 1024;
-export const PI_INLINE_IMAGE_MAX_COUNT = 8;
+/**
+ * Original image bytes one prompt may carry. Pi (1.5.2 and later) converts and resizes every prompt image
+ * itself, as it does for `pi @file`, so there is no per-image size or count limit of TaroBird's own. This
+ * bounds only the single RPC line: Pi reads a long line in time that grows faster than its length (lab,
+ * 12.6 MB images: 60 MiB of originals took 12 s and 1.1 GiB in Pi; 193 MiB took 122 s and 2.7 GiB), and
+ * with Pi's image resizing turned off it echoes the line unchanged, where a record over the 256 MiB read
+ * limit ends the Pi process.
+ */
+export const PI_INLINE_IMAGE_TOTAL_BYTES = 64 * 1024 * 1024;
+
+/** Why an image attachment was named by path only instead of being sent as pixels. */
+export type PiSkippedImageReason = "model-has-no-vision" | "too-large" | "over-total" | "unreadable";
 
 export interface PiPromptParts {
   message: string;
   images: PiImageContent[];
   /** Image attachments that were not sent as pixels, with the reason. */
-  skippedImages: Array<{ file: string; reason: "model-has-no-vision" | "too-large" | "too-many" | "unreadable" }>;
+  skippedImages: Array<{ file: string; reason: PiSkippedImageReason }>;
+}
+
+/** Bytes Pi reads to recognise an image (`detectSupportedImageMimeTypeFromFile`). */
+const PI_IMAGE_SNIFF_BYTES = 4100;
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+/**
+ * The image formats native Pi sends as pixels, recognised the way Pi does (`utils/mime.js` in 1.5.2 and
+ * 1.6.0): PNG other than APNG, JPEG other than JPEG-LS, GIF, WebP and BMP. Pi converts BMP to PNG itself.
+ */
+export function piImageMimeType(bytes: Uint8Array): "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | null {
+  const ascii = (offset: number, text: string) => bytes.length >= offset + text.length && [...text].every((char, index) => bytes[offset + index] === char.charCodeAt(0));
+  const u16le = (offset: number) => (bytes[offset] ?? 0) + ((bytes[offset + 1] ?? 0) << 8);
+  const u32le = (offset: number) => u16le(offset) + u16le(offset + 2) * 0x10000;
+  const u32be = (offset: number) => (bytes[offset] ?? 0) * 0x1000000 + ((bytes[offset + 1] ?? 0) << 16) + ((bytes[offset + 2] ?? 0) << 8) + (bytes[offset + 3] ?? 0);
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return bytes[3] === 0xf7 ? null : "image/jpeg";
+  if (bytes.length >= 8 && PNG_SIGNATURE.every((byte, index) => bytes[index] === byte)) {
+    if (bytes.length < 16 || u32be(8) !== 13 || !ascii(12, "IHDR")) return null;
+    for (let offset = 8; offset + 8 <= bytes.length;) {
+      if (ascii(offset + 4, "acTL")) return null;
+      if (ascii(offset + 4, "IDAT")) break;
+      const next = offset + 12 + u32be(offset);
+      if (next <= offset || next > bytes.length) break;
+      offset = next;
+    }
+    return "image/png";
+  }
+  if (ascii(0, "GIF87a") || ascii(0, "GIF89a")) return "image/gif";
+  if (ascii(0, "RIFF") && ascii(8, "WEBP")) return "image/webp";
+  if (ascii(0, "BM") && bytes.length >= 26) {
+    const fileSize = u32le(2), pixelOffset = u32le(10), dibSize = u32le(14);
+    if ((fileSize !== 0 && fileSize < 26) || pixelOffset < 14 + dibSize || (fileSize !== 0 && pixelOffset >= fileSize)) return null;
+    const fields = dibSize === 12 ? 22 : dibSize >= 40 && dibSize <= 124 && bytes.length >= 30 ? 26 : -1;
+    return fields > 0 && u16le(fields) === 1 && [1, 4, 8, 16, 24, 32].includes(u16le(fields + 2)) ? "image/bmp" : null;
+  }
+  return null;
+}
+
+async function piImageMimeTypeOfFile(file: string): Promise<ReturnType<typeof piImageMimeType>> {
+  const handle = await open(file, "r");
+  try {
+    const head = Buffer.alloc(PI_IMAGE_SNIFF_BYTES);
+    const { bytesRead } = await handle.read(head, 0, head.length, 0);
+    return piImageMimeType(head.subarray(0, bytesRead));
+  } finally { await handle.close(); }
 }
 
 /**
  * Build the RPC prompt. Every attachment is named by path so the agent can
  * open the original; images also travel as pixels when the model accepts
  * them. Pi silently drops images for a text-only model, so they are withheld
- * here and reported instead.
+ * here and reported instead. Images that do not fit the line are reported too.
  */
-export async function buildPiPrompt(input: { text: string; files: string[]; modelAcceptsImages: boolean }): Promise<PiPromptParts> {
+export async function buildPiPrompt(input: { text: string; files: string[]; modelAcceptsImages: boolean; totalBytes?: number }): Promise<PiPromptParts> {
   const images: PiImageContent[] = [], skippedImages: PiPromptParts["skippedImages"] = [];
+  const budget = input.totalBytes ?? PI_INLINE_IMAGE_TOTAL_BYTES;
+  let total = 0;
   for (const file of input.files) {
     let mimeType: string | null;
-    try { mimeType = await detectImageMediaTypeFromFile(file); } catch { mimeType = null; }
+    try { mimeType = await piImageMimeTypeOfFile(file); } catch { mimeType = null; }
     if (!mimeType) continue;
     if (!input.modelAcceptsImages) { skippedImages.push({ file, reason: "model-has-no-vision" }); continue; }
-    if (images.length >= PI_INLINE_IMAGE_MAX_COUNT) { skippedImages.push({ file, reason: "too-many" }); continue; }
     try {
-      if ((await stat(file)).size > PI_INLINE_IMAGE_MAX_BYTES) { skippedImages.push({ file, reason: "too-large" }); continue; }
-      images.push({ type: "image", data: (await readFile(file)).toString("base64"), mimeType });
+      const size = (await stat(file)).size;
+      if (size > budget) { skippedImages.push({ file, reason: "too-large" }); continue; }
+      if (total + size > budget) { skippedImages.push({ file, reason: "over-total" }); continue; }
+      const data = await readFile(file);
+      // The file may have grown since `stat`; what is sent is what counts.
+      if (total + data.length > budget) { skippedImages.push({ file, reason: data.length > budget ? "too-large" : "over-total" }); continue; }
+      total += data.length;
+      images.push({ type: "image", data: data.toString("base64"), mimeType });
     } catch { skippedImages.push({ file, reason: "unreadable" }); }
   }
   // Attachments alone are a valid message; do not start it with an empty line.
   const lines = [...(input.text ? [input.text] : []), ...input.files.map(file => `Attachment: ${file}`)];
   return { message: lines.join("\n"), images, skippedImages };
+}
+
+/** The host notice for images named by path only, or undefined when every image went as pixels. */
+export function piSkippedImagesNotice(skipped: PiPromptParts["skippedImages"], locale: string | undefined): string | undefined {
+  if (!skipped.length) return undefined;
+  const en = locale === "en";
+  if (skipped.some(item => item.reason === "model-has-no-vision")) {
+    return en ? "The current model does not accept images. The image was passed as a file path only." : "当前模型不支持图片输入，图片只以文件路径形式提供。";
+  }
+  const limit = `${PI_INLINE_IMAGE_TOTAL_BYTES / 1024 / 1024} MiB`;
+  const why: Record<Exclude<PiSkippedImageReason, "model-has-no-vision">, string> = en
+    ? { "too-large": `over ${limit}`, "over-total": `${limit} per-message total reached`, unreadable: "unreadable" }
+    : { "too-large": `单张超过 ${limit}`, "over-total": `本条消息的图片合计超过 ${limit}`, unreadable: "无法读取" };
+  const groups = (["too-large", "over-total", "unreadable"] as const).flatMap(reason => {
+    const names = skipped.filter(item => item.reason === reason).map(item => path.basename(item.file));
+    if (!names.length) return [];
+    const shown = names.slice(0, 5).join(en ? ", " : "、"), more = names.length - 5;
+    return [`${shown}${more > 0 ? (en ? ` and ${more} more` : ` 等 ${names.length} 张`) : ""}${en ? ` (${why[reason]})` : `（${why[reason]}）`}`];
+  });
+  return en
+    ? `Sent as file paths only, not as images: ${groups.join("; ")}.`
+    : `以下图片没有直接发给模型，只以文件路径提供：${groups.join("；")}。`;
 }
 
 export interface PiDialogQuestion {
