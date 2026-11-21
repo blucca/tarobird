@@ -58,6 +58,8 @@ try {
   // ---- real Hub, owner, controller device B ----
   const hostDir = path.join(work, 'hub'); await mkdir(hostDir, { recursive: true });
   const hub = await HubServer.start({ stateDir: hostDir }); cleanups.push(() => hub.close());
+  // Read-only tap on what the Hub receives from the controller (input shape only).
+  const hubInputs = []; { const rs = hub.remoteScreen, orig = rs.viewerCommand.bind(rs); rs.viewerCommand = (id, raw) => { try { if (raw?.type === 'input' && hubInputs.length < 4000) hubInputs.push({ at: Date.now(), kind: raw.event?.kind, button: raw.event?.button, down: raw.event?.down, x: raw.event?.x, y: raw.event?.y }); } catch { /* shape only */ } return orig(id, raw); }; }
   const owner = device('acc-owner'), ctl = device('acc-controller-b');
   await hub.enrollLocalController({ deviceId: owner.deviceId, name: owner.name, platform: owner.platform, publicKey: owner.publicKey });
   const { code } = await hub.auth.pair({ deviceId: ctl.deviceId, name: 'Controller B', platform: ctl.platform, publicKey: ctl.publicKey }, '127.0.0.1');
@@ -215,9 +217,11 @@ try {
       await bApp.evaluate(({ BrowserWindow }, w) => BrowserWindow.getAllWindows()[0].setSize(w, 720), width); await sleep(600);
       const m = await page.evaluate(() => { const panel = document.querySelector('.remote-screen-panel'); const pr = panel.getBoundingClientRect();
         const els = [...panel.querySelectorAll('.screen-state, button, select, .screen-heading *')].filter(e => e.offsetParent !== null);
-        const bad = els.filter(e => e.scrollWidth > e.clientWidth + 1 || e.getBoundingClientRect().right > pr.right + 1 || e.getBoundingClientRect().left < pr.left - 1)
-          .map(e => ({ tag: e.tagName, text: (e.getAttribute('aria-label') || e.innerText || '').trim().slice(0, 60), sw: e.scrollWidth, cw: e.clientWidth, right: Math.round(e.getBoundingClientRect().right), panelRight: Math.round(pr.right) }));
-        return { panelWidth: Math.round(pr.width), minWidth: getComputedStyle(panel).minWidth, docScroll: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1, checked: els.length, bad }; });
+        const over = els.filter(e => e.scrollWidth > e.clientWidth + 1 || e.getBoundingClientRect().right > pr.right + 1 || e.getBoundingClientRect().left < pr.left - 1)
+          .map(e => ({ tag: e.tagName, text: (e.getAttribute('aria-label') || e.innerText || '').trim().slice(0, 60), sw: e.scrollWidth, cw: e.clientWidth, right: Math.round(e.getBoundingClientRect().right), panelRight: Math.round(pr.right),
+            designedEllipsis: getComputedStyle(e).textOverflow === 'ellipsis' && !!e.title && e.title === e.textContent }));
+        return { panelWidth: Math.round(pr.width), docScroll: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1, checked: els.length,
+          bad: over.filter(o => !o.designedEllipsis), designedEllipsis: over.filter(o => o.designedEllipsis) }; });
       rec(`width:${lang}`, `controlling-at-window-${width}`, m.bad.length === 0 && !m.docScroll ? 'pass' : 'fail', m);
     }
     await bApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(512, 720));
@@ -239,6 +243,9 @@ try {
     for (let i = 1; i <= 10; i++) { await page.mouse.move(s0.x + (s1.x - s0.x) * i / 10, s0.y + (s1.y - s0.y) * i / 10); await sleep(40); }
     await page.mouse.up(); await sleep(2500);
     const health = hbGap(t0, Date.now());
+    const hubSide = hubInputs.filter(e => e.at >= t0).map(e => `${e.kind}${e.down === undefined ? '' : e.down ? ':down' : ':up'}@${e.x?.toFixed?.(3)},${e.y?.toFixed?.(3)}`);
+    let aSide = null; try { aSide = (await a('mouse-calls', { since: t0 }, 8000)).calls.map(c => `${c.action}:${c.button}@${c.x},${c.y}`); } catch { aSide = 'a_unresponsive'; }
+    rec('input', 'drag-path', 'info', { hubReceived: hubSide.slice(0, 30), hubCount: hubSide.length, aNativeMouseCalls: Array.isArray(aSide) ? aSide.slice(0, 30) : aSide });
     let evs = null; try { evs = (await a('seen', { from }, 8000)).events; } catch (e) { evs = null; }
     await snap(page, lang, 'after-drag');
     if (!evs) rec('input', 'drag', 'fail', { aResponsive: false, heartbeat: health, state: texts[lang].at(-1) });

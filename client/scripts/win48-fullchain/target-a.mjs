@@ -21,7 +21,7 @@ const addonFile = path.resolve(arg('addon')), hostDir = path.resolve(arg('host-d
 protocol.registerSchemesAsPrivileged(SCHEMES);
 app.setPath('userData', path.join(appState, 'profile')); app.setPath('sessionData', path.join(appState, 'profile'));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-let rpc, service, win, addon; const seen = []; const resolveCalls = []; const captureEvents = [];
+let rpc, service, win, addon; const seen = []; const mouseCalls = []; const resolveCalls = []; const captureEvents = [];
 const TEST = `<!doctype html><meta charset="utf-8"><title>TaroBird full-chain test window</title>
 <style>html,body{margin:0;height:100%;overflow:hidden;font:14px system-ui;background:#111}
 .q{position:absolute;width:50%;height:30%}#t{position:absolute;left:5%;top:66%;width:88%;height:28%;font:16px system-ui}</style>
@@ -36,7 +36,9 @@ for(const k of ['keydown','keyup']) addEventListener(k,e=>s({type:k,code:e.code,
 const t=document.getElementById('t');t.addEventListener('input',()=>s({type:'input',value:t.value}));
 document.addEventListener('selectionchange',()=>{if(document.activeElement===t)s({type:'selection',start:t.selectionStart,end:t.selectionEnd,len:t.value.length});});</script>`;
 async function start() {
-  addon = createRequire(pathToFileURL(addonFile).href)(addonFile);
+  const real = createRequire(pathToFileURL(addonFile).href)(addonFile);
+  // Read-only tap: every call is passed through unchanged; only the mouse call shape is recorded.
+  addon = Object.create(real); addon.screenMouse = (...args) => { if (mouseCalls.length < 2000) mouseCalls.push({ at: Date.now(), action: args[0], button: args[1], x: args[2], y: args[3] }); return real.screenMouse(...args); };
   const display = screen.getPrimaryDisplay();
   win = new BrowserWindow({ x: 0, y: 0, width: 500, height: 720, frame: false, resizable: false, show: false, alwaysOnTop: true, skipTaskbar: false,
     webPreferences: { nodeIntegration: true, contextIsolation: false, sandbox: false, spellcheck: false, backgroundThrottling: false } });
@@ -65,6 +67,7 @@ async function handle(cmd) {
     case 'start': return start();
     case 'info': return info();
     case 'seen': return { events: seen.slice(cmd.from ?? 0), count: seen.length };
+    case 'mouse-calls': return { calls: mouseCalls.filter(c => c.at >= (cmd.since ?? 0)) };
     case 'diag': return { resolveCalls, captureEvents: captureEvents.slice(-40), status: { registered: service?.status().registered, phase: service?.status().phase } };
     case 'shutdown': { try { service?.dispose(); } catch {} setTimeout(() => app.exit(0), 50); return { ok: true }; }
     default: throw new Error('unknown_op');
