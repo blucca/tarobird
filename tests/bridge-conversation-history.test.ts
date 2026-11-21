@@ -89,7 +89,10 @@ describe("conversation history native transaction", () => {
     const held = withBridgeTurnLock(id, async () => { entered.resolve(); await release.promise; });
     try {
       await entered.promise;
-      expect(await f.controller.get(scope)).toMatchObject({ supported: true, blocked: "busy" });
+      // What the session could do when last read, so the App shows the entry disabled
+      // ("wait for the current reply") instead of hiding it; no revision, so nothing can be admitted.
+      const busy = await f.controller.get(scope);
+      expect(busy).toEqual({ supported: true, blocked: "busy", capabilities: { rewind: true, fork: true, anchoredFork: true } });
       expect(f.adapter.getHistoryState).not.toHaveBeenCalled();
     } finally { release.resolve(); await held; }
   });

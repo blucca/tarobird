@@ -50,7 +50,10 @@ export function useConversationHistory({ connection, conversation, enabled, acti
       if (matches(scope) && serial === readSerial.current && latest.current.enabled) setView(old => {
         const current = old.key === scope ? old : initial(scope);
         const anchors = current.snapshot?.revision === snapshot.revision ? current.anchors : {};
-        return { ...current, snapshot, stale: false, anchors: messageId ? { ...anchors, [messageId]: anchor } : anchors };
+        // Older Hosts answer a running conversation without capabilities. Keep
+        // what it could do when last read, so the entry stays visible and disabled.
+        const known = snapshot.supported && snapshot.blocked && !snapshot.capabilities && current.snapshot?.supported ? current.snapshot.capabilities : undefined;
+        return { ...current, snapshot: known ? { ...snapshot, capabilities: known } : snapshot, stale: false, anchors: messageId ? { ...anchors, [messageId]: anchor } : anchors };
       });
     } catch { if (serial === readSerial.current) patch(scope, { stale: true }); }
   }

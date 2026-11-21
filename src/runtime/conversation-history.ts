@@ -42,7 +42,14 @@ const token = (binding: SessionHistoryBinding, head: string, workspace: string |
 /** Coordinates native history with the same locks used by ordinary turns.
  * Gateway receipts own at-most-once invocation. This class never retries a
  * native mutation or treats a missing result as proof that nothing changed. */
+/** Conversations whose last capabilities are remembered for busy answers. */
+const KNOWN_CAPABILITIES_MAX = 512;
+
 export class ConversationHistoryController {
+  /** What each conversation could do when last read. A busy answer carries it
+   * (without a revision, so nothing can be admitted) so the App can show the
+   * entry disabled with a reason instead of hiding it during a reply. */
+  private readonly known = new Map<string, HistoryCapabilities>();
   constructor(private readonly sessions: HistorySessionManager, private readonly adapter: NativeConversationHistoryAdapter,
     private readonly hasNativeReader: (sessionId: string) => boolean = () => false,
     private readonly claim?: (sessionId: string) => (() => void) | undefined) {}
@@ -53,9 +60,19 @@ export class ConversationHistoryController {
 
   async get(input: ConversationHistoryScope): Promise<HistoryInternalSnapshot> {
     if (!this.supported()) return { supported: false };
-    try { return await this.idleLock(input, () => this.inspect(input)); }
-    catch (error) {
-      if (error instanceof Error && error.message === "history_busy") return { supported: true, blocked: "busy" };
+    try {
+      const snapshot = await this.idleLock(input, () => this.inspect(input));
+      this.known.delete(input.conversationKey);
+      if (snapshot.supported && snapshot.capabilities) {
+        this.known.set(input.conversationKey, snapshot.capabilities);
+        if (this.known.size > KNOWN_CAPABILITIES_MAX) this.known.delete(this.known.keys().next().value!);
+      }
+      return snapshot;
+    } catch (error) {
+      if (error instanceof Error && error.message === "history_busy") {
+        const capabilities = this.known.get(input.conversationKey);
+        return { supported: true, blocked: "busy", ...(capabilities ? { capabilities } : {}) };
+      }
       throw error;
     }
   }

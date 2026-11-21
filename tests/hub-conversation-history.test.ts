@@ -203,3 +203,11 @@ it("numbers default fork titles per source and keeps an explicit title as given"
   expect(await title("named", { kind: "fork", scope: "whole", title: "My branch" })).toBe("My branch");
   expect(await title("third")).toBe("Source · 分叉 3");
 });
+it("keeps the Gateway's running block and capabilities while the reply's own delivery is still pending", async () => {
+  const sent = await store.sendMessage("owner", { conversationId, clientMsgId: "running", text: "running", attachments: [] });
+  expect(await store.db.get("SELECT 1 FROM deliveries WHERE message_id=? AND status='pending'", [sent.message.id])).toBeTruthy();
+  call.mockImplementationOnce(async () => ({ supported: true, blocked: "busy", capabilities: { rewind: false, fork: true, anchoredFork: true } }));
+  expect(await history.snapshot("owner", "bot", conversationId)).toEqual({ supported: true, blocked: "busy", capabilities: { rewind: false, fork: true, anchoredFork: true } });
+  // Idle on the Gateway with input still waiting: that is the queue.
+  expect(await history.snapshot("owner", "bot", conversationId)).toMatchObject({ blocked: "queued", revision: "revision" });
+});

@@ -59,7 +59,9 @@ export class HubConversationHistory {
       const operation = await this.pending(conversationId);
       const { sourceSessionId: _session, bindingGeneration: _generation, ...result } = snapshot as HistoryInternalSnapshot;
       if (operation) { result.pendingOperation = operation.request_id; result.blocked = operation.state === "unknown" ? "outcome_unknown" : "busy"; }
-      else if (await this.queued(conversationId)) result.blocked = "queued";
+      // A reply in progress keeps its own delivery pending; the Gateway's
+      // "busy" says that more precisely than "queued".
+      else if (!result.blocked && await this.queued(conversationId)) result.blocked = "queued";
       return historySnapshotSchema.parse(result);
     });
   }

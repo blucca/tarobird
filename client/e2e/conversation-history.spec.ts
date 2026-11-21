@@ -80,7 +80,10 @@ test("busy, queues, goals and stale revisions block admission with localized rea
     await page.evaluate(blocked => { const f = (window as any).historyFixture; f.snapshot.blocked = blocked; f.history.refresh(); }, blocked);
     await expect(page.getByRole("button", { name: "分叉当前对话", exact: true })).toBeDisabled(); await expect(page.getByText(text, { exact: true })).toBeVisible();
   }
-  await page.evaluate(() => { const f = (window as any).historyFixture; delete f.snapshot.blocked; f.history.refresh(); });
+  // An older Host answers a running conversation without capabilities or revision: keep the entry, disabled.
+  await page.evaluate(() => { const f = (window as any).historyFixture; f.saved = { ...f.snapshot }; f.snapshot = { supported: true, blocked: "busy" }; f.history.refresh(); });
+  await expect(page.getByRole("button", { name: "分叉当前对话", exact: true })).toBeDisabled(); await expect(page.getByText("请等待当前任务结束后再操作。", { exact: true })).toBeVisible();
+  await page.evaluate(() => { const f = (window as any).historyFixture; f.snapshot = f.saved; delete f.snapshot.blocked; f.history.refresh(); });
   await page.getByRole("button", { name: "分叉当前对话", exact: true }).click();
   await page.evaluate(() => { (window as any).historyFixture.snapshot.revision = "new_revision"; });
   await page.getByRole("button", { name: "创建分叉对话", exact: true }).click();
