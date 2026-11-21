@@ -20,6 +20,7 @@ import { installerHarness } from "./helpers/relay-installer-harness.js";
 import { loadHubTls } from "../src/hub/tls.js";
 import { enrollTrusted, issueInvite, pairingRequestId, testDevice } from "./helpers/pairing-invite.js";
 import { deployRelay, inspectRemoteRelay, prepareRelayDeployment, resolveRelayRuntime, validateSshHost } from "../src/relay/deploy.js";
+import { relayHosts, relayServerSchema } from "../src/relay/config.js";
 
 let root: string; let ca: Buffer; let hubPair: { cert: Buffer; key: Buffer }; let relayPair: typeof hubPair; let clientPair: typeof hubPair; let otherClientPair: typeof hubPair;
 beforeAll(async () => {
@@ -266,6 +267,90 @@ test("two warm TLS tunnels share one Hub and a failed primary cannot close the b
   } finally { fleet.stop(); await primary.close(); await backup.close(); await hub.close(); }
 }, 15_000);
 
+test("one relay serves two computers on one tunnel port, each through its own public port", async () => {
+  const computer = async (name: string) => { const server = createHttpsServer(hubPair, (_req, res) => res.end(name)); await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve)); return server; };
+  const first = await computer("first"), second = await computer("second");
+  const relay = await RelayServer.start({ publicHost: "127.0.0.1", publicPort: 0, tunnelHost: "127.0.0.1", tunnelPort: 0, serverName: "hub.test",
+    clientFingerprint256: new X509Certificate(clientPair.cert).fingerprint256, additionalHosts: [{ publicPort: 0, clientFingerprint256: new X509Certificate(otherClientPair.cert).fingerprint256 }], tls: { ...relayPair, ca } });
+  const tunnel = (pair: typeof clientPair, target: typeof first) => new RelayTunnel({ host: "127.0.0.1", port: relay.status.tunnelPort, servername: "relay.test", tls: { ...pair, ca }, targetHost: "127.0.0.1", targetPort: (target.address() as { port: number }).port });
+  const one = tunnel(clientPair, first); let two = tunnel(otherClientPair, second);
+  one.start(); two.start();
+  try {
+    await expect.poll(() => one.online && two.online).toBe(true);
+    const [portOne, portTwo] = relay.status.hosts!.map(host => host.publicPort);
+    expect(new Set([portOne, portTwo, relay.status.tunnelPort]).size).toBe(3);
+    expect(relay.status).toMatchObject({ connected: true, publicPort: portOne, hosts: [{ publicPort: portOne, connected: true }, { publicPort: portTwo, connected: true }] });
+    // Each public port reaches its own computer and never the other.
+    for (let round = 0; round < 3; round++) expect([(await get(portOne, "/")).body, (await get(portTwo, "/")).body]).toEqual(["first", "second"]);
+    // One computer going away closes nothing of the other's, and its own port answers nobody meanwhile.
+    two.stop();
+    await expect.poll(() => relay.status.hosts![1].connected).toBe(false);
+    expect(relay.status.connected).toBe(true);
+    expect((await get(portOne, "/")).body).toBe("first");
+    await expect(get(portTwo, "/")).rejects.toThrow();
+    // It comes back on the same tunnel port without the first one noticing.
+    two = tunnel(otherClientPair, second); two.start();
+    await expect.poll(() => relay.status.hosts![1].connected).toBe(true);
+    expect([(await get(portOne, "/")).body, (await get(portTwo, "/")).body]).toEqual(["first", "second"]);
+    expect(one.online).toBe(true);
+  } finally { one.stop(); two.stop(); await relay.close(); await Promise.all([first, second].map(server => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); }))); }
+}, 15_000);
+
+test("a computer's data stream cannot join a connection that arrived for another computer", async () => {
+  const relay = await RelayServer.start({ publicHost: "127.0.0.1", publicPort: 0, tunnelHost: "127.0.0.1", tunnelPort: 0, serverName: "hub.test",
+    clientFingerprint256: new X509Certificate(clientPair.cert).fingerprint256, additionalHosts: [{ publicPort: 0, clientFingerprint256: new X509Certificate(otherClientPair.cert).fingerprint256 }], tls: { ...relayPair, ca } });
+  const sockets: { destroy(): void }[] = [];
+  const dial = (pair: typeof clientPair, protocol: string) => { const socket = connect({ host: "127.0.0.1", port: relay.status.tunnelPort, servername: "relay.test", ca, ...pair, ALPNProtocols: [protocol] }); socket.on("error", () => undefined); sockets.push(socket); return socket; };
+  /** A control channel that reports when it is ready and hands over each `open` it is sent. */
+  const control = (pair: typeof clientPair) => {
+    const socket = dial(pair, CONTROL_ALPN), opens: { id: string; token: string }[] = []; let ready = false, input = "";
+    socket.on("data", chunk => { input += chunk.toString(); for (;;) { const end = input.indexOf("\n"); if (end < 0) break; const frame = JSON.parse(input.slice(0, end)); input = input.slice(end + 1); if (frame.type === "ready") ready = true; if (frame.type === "open") opens.push(frame); } });
+    return { opens, ready: () => ready };
+  };
+  /** Claims a pending connection as `pair`; resolves with what the relay then sends, or "closed". */
+  const claim = (pair: typeof clientPair, open: { id: string; token: string }) => new Promise<string>(resolve => {
+    const socket = dial(pair, DATA_ALPN);
+    socket.once("secureConnect", () => socket.write(JSON.stringify({ id: open.id, token: open.token }) + "\n"));
+    socket.once("data", chunk => resolve(`bytes:${chunk.length}`)); socket.once("close", () => resolve("closed"));
+  });
+  try {
+    const first = control(clientPair), second = control(otherClientPair);
+    await expect.poll(() => first.ready() && second.ready()).toBe(true);
+    const [portOne, portTwo] = relay.status.hosts!.map(host => host.publicPort);
+    // A device arrives for the first computer: only the first computer is told.
+    const device = connect({ host: "127.0.0.1", port: portOne, servername: "hub.test", ca }); device.on("error", () => undefined); sockets.push(device);
+    await expect.poll(() => first.opens.length).toBe(1);
+    expect(second.opens).toEqual([]);
+    // The second computer presents the first one's id and token: refused, and the connection is still there for its owner.
+    expect(await claim(otherClientPair, first.opens[0])).toBe("closed");
+    expect(await claim(clientPair, first.opens[0])).toMatch(/^bytes:\d+$/);   // the device's ClientHello, forwarded untouched
+    // And the other way round.
+    const other = connect({ host: "127.0.0.1", port: portTwo, servername: "hub.test", ca }); other.on("error", () => undefined); sockets.push(other);
+    await expect.poll(() => second.opens.length).toBe(1);
+    expect(first.opens).toHaveLength(1);
+    expect(await claim(clientPair, second.opens[0])).toBe("closed");
+    expect(await claim(otherClientPair, second.opens[0])).toMatch(/^bytes:\d+$/);
+  } finally { for (const socket of sockets) socket.destroy(); await relay.close(); }
+});
+
+test("a relay configuration lists further computers beside the first; the single-computer form is unchanged", () => {
+  const fingerprint = (seed: string) => Array.from({ length: 32 }, () => seed).join(":");
+  const base = { serverName: "192.0.2.10", publicPort: 8443, tunnelPort: 7443, healthPort: 19878, clientFingerprint256: fingerprint("aa"), tls: { ca: "ca.pem", cert: "server.pem", key: "server.key" } };
+  const parse = (extra: Record<string, unknown>) => relayServerSchema.safeParse({ ...base, ...extra });
+  // As written today: nothing new appears in what it parses to.
+  expect(parse({})).toMatchObject({ success: true });
+  expect("additionalHosts" in (parse({}).data as object)).toBe(false);
+  expect(relayHosts(parse({}).data!)).toEqual([{ publicPort: 8443, clientFingerprint256: fingerprint("aa") }]);
+  const two = parse({ additionalHosts: [{ publicPort: 8444, clientFingerprint256: fingerprint("bb") }] });
+  expect(two.success).toBe(true);
+  expect(relayHosts(two.data!).map(host => host.publicPort)).toEqual([8443, 8444]);
+  // Each computer needs its own public port and its own certificate, and no added port may be the tunnel or health port.
+  for (const added of [{ publicPort: 8443, clientFingerprint256: fingerprint("bb") }, { publicPort: 7443, clientFingerprint256: fingerprint("bb") }, { publicPort: 19878, clientFingerprint256: fingerprint("bb") },
+    { publicPort: 8444, clientFingerprint256: fingerprint("AA") }, { publicPort: 8444 }, { publicPort: 8444, clientFingerprint256: fingerprint("bb"), name: "x" }]) expect(parse({ additionalHosts: [added] }).success).toBe(false);
+  expect(parse({ additionalHosts: [] }).success).toBe(false);
+  expect(parse({ additionalHosts: [{ publicPort: 8444, clientFingerprint256: fingerprint("bb") }, { publicPort: 8444, clientFingerprint256: fingerprint("cc") }] }).success).toBe(false);
+});
+
 test("the tunnel rejects absent credentials and a different client certificate", async () => {
   const relay = await RelayServer.start({ publicHost: "127.0.0.1", publicPort: 0, tunnelHost: "127.0.0.1", tunnelPort: 0, serverName: "hub.test", clientFingerprint256: new X509Certificate(clientPair.cert).fingerprint256, tls: { ...relayPair, ca } });
   try {
@@ -365,6 +450,16 @@ test("relay deployment is deterministic, protects tunnel secrets and requires a 
   await writeFile(configFile, JSON.stringify(config)); await writeFile(bundleFile, "console.log('fixture');");
   const plan = await prepareRelayDeployment(configFile, bundleFile, () => { throw new Error("pinned runtime must not fetch"); });
   expect(await prepareRelayDeployment(configFile, bundleFile)).toEqual(plan);
+  // One computer: the firewall opens its public port and the tunnel port, as before. Further computers add their own public ports, and nothing else.
+  expect(plan.script).toContain("tcp dport { $ssh_port, 443, 7443 } accept");
+  expect("additionalPublic" in (plan.summary.ports as object)).toBe(false);
+  const shared = path.join(root, "deployment-shared.json");
+  await writeFile(shared, JSON.stringify({ ...config, relay: { ...config.relay, additionalHosts: [{ publicPort: 8444, clientFingerprint256: new X509Certificate(otherClientPair.cert).fingerprint256 }] } }));
+  const sharedPlan = await prepareRelayDeployment(shared, bundleFile);
+  expect(sharedPlan.script).toContain("tcp dport { $ssh_port, 443, 8444, 7443 } accept");
+  expect(sharedPlan.summary.ports).toMatchObject({ public: 443, additionalPublic: [8444], tunnel: 7443 });
+  await writeFile(shared, JSON.stringify({ ...config, relay: { ...config.relay, additionalHosts: [{ publicPort: 9877, clientFingerprint256: new X509Certificate(otherClientPair.cert).fingerprint256 }] } }));
+  await expect(prepareRelayDeployment(shared, bundleFile)).rejects.toThrow("Relay ports must be distinct");   // 9877 is the default health port
   expect(JSON.stringify(plan.summary)).not.toContain("PRIVATE KEY");
   expect(plan.script).not.toContain(hubPair.key.toString("base64"));
   expect(plan.script).not.toContain(clientPair.key.toString("base64"));

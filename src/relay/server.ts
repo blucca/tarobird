@@ -2,7 +2,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { connect as tcpConnect, createServer as createTcpServer, isIP, type Server as TcpServer, type Socket } from "node:net";
 import { createServer as createTlsServer, type Server as TlsServer, type TlsOptions, type TLSSocket } from "node:tls";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
-import { localTlsRouteSchema } from "./config.js";
+import { localTlsRouteSchema, relayHosts, RELAY_MAX_HOSTS } from "./config.js";
 import { coupleSockets } from "./socket-lifecycle.js";
 import { ClientHelloReader, CONTROL_ALPN, SOURCE_CONTROL_ALPN, DATA_ALPN, dataHelloSchema, readFrames, sendFrame } from "./protocol.js";
 import { sourceAddress } from "./sources.js";
@@ -21,29 +21,37 @@ function handshakeSource(address: string | undefined): string {
 export interface RelayServerOptions {
   publicHost?: string; publicPort?: number; tunnelHost?: string; tunnelPort?: number;
   serverName: string; clientFingerprint256: string; tls: TlsOptions;
+  /** More computers on this relay: each has its own public port, and its tunnel
+   * is recognised on the shared tunnel port by its certificate. */
+  additionalHosts?: { publicPort?: number; clientFingerprint256: string }[];
   maxConnections?: number; onWarning?: (code: string) => void;
   /** Absolute accept-to-ClientHello bound and per-source cap on such sockets. */
   helloTimeoutMs?: number; maxHandshakesPerSource?: number;
   healthPort?: number;
   localTls?: { serverName: string; targetPort: number };
 }
-type Pending = { socket: Socket; token: string; timer: ReturnType<typeof setTimeout>; hello: Buffer };
+/** One computer: where its devices arrive, the certificate its tunnel shows, and that tunnel's control channel. */
+type Host = { port: number; fingerprint: string; server: TcpServer; control?: TLSSocket; lastPong: number };
+type Pending = { host: Host; socket: Socket; token: string; timer: ReturnType<typeof setTimeout>; hello: Buffer };
 export class RelayServer {
-  private publicServer: TcpServer;
+  private hosts: Host[];
   private tunnelServer: TlsServer;
-  private control?: TLSSocket;
   private pending = new Map<string, Pending>();
   private sockets = new Set<Socket>();
   private handshakes = new Map<string, number>();
   private handshaking = 0;
   private timer?: ReturnType<typeof setInterval>;
-  private lastPong = 0;
   private healthServer?: HttpServer;
   private constructor(readonly options: RelayServerOptions) {
     if (!/^[a-z0-9.-]+$/i.test(options.serverName)) throw new Error("invalid_server_name");
-    if (!/^(?:[a-f0-9]{2}:){31}[a-f0-9]{2}$/i.test(options.clientFingerprint256)) throw new Error("client_certificate_fingerprint_required");
+    const hosts = relayHosts(options);
+    if (hosts.some(host => !/^(?:[a-f0-9]{2}:){31}[a-f0-9]{2}$/i.test(host.clientFingerprint256))) throw new Error("client_certificate_fingerprint_required");
+    if (hosts.length > RELAY_MAX_HOSTS || new Set(hosts.map(host => host.clientFingerprint256.toUpperCase())).size !== hosts.length) throw new Error("invalid_relay_hosts");
     if (options.localTls) { localTlsRouteSchema.parse(options.localTls); if (options.localTls.serverName.toLowerCase() === options.serverName.toLowerCase() || [options.publicPort, options.tunnelPort, options.healthPort].includes(options.localTls.targetPort)) throw new Error("invalid_local_tls_route"); }
-    this.publicServer = createTcpServer((socket) => this.acceptPublic(socket));
+    this.hosts = hosts.map(({ publicPort, clientFingerprint256 }, index) => {
+      const host: Host = { port: index === 0 ? options.publicPort ?? 443 : publicPort, fingerprint: clientFingerprint256.toUpperCase(), lastPong: 0, server: createTcpServer((socket) => this.acceptPublic(socket, host)) };
+      return host;
+    });
     // Bound unauthenticated handshakes at the TLS layer. A timeout on the raw
     // parent socket survives the handshake and kills otherwise healthy idle
     // streams even after their TLSSocket receives its longer data timeout.
@@ -55,7 +63,7 @@ export class RelayServer {
     const relay = new RelayServer(options);
     try {
       await relay.listen(relay.tunnelServer, options.tunnelPort ?? 7443, options.tunnelHost ?? "0.0.0.0");
-      await relay.listen(relay.publicServer, options.publicPort ?? 443, options.publicHost ?? "0.0.0.0");
+      for (const host of relay.hosts) await relay.listen(host.server, host.port, options.publicHost ?? "0.0.0.0");
       if (options.healthPort !== undefined) {
         relay.healthServer = createHttpServer((req, res) => {
           if (req.method !== "GET" || req.url !== "/health") { res.writeHead(404); res.end(); return; }
@@ -65,12 +73,12 @@ export class RelayServer {
         relay.healthServer.requestTimeout = 5000; relay.healthServer.headersTimeout = 5000;
         await relay.listen(relay.healthServer, options.healthPort, "127.0.0.1");
       }
-      relay.timer = setInterval(() => { if (!relay.control) return; if (Date.now() - relay.lastPong > 45_000) relay.control.destroy(); else sendFrame(relay.control, { type: "ping" }); }, 15_000); relay.timer.unref(); return relay;
+      relay.timer = setInterval(() => { for (const host of relay.hosts) { if (!host.control) continue; if (Date.now() - host.lastPong > 45_000) host.control.destroy(); else sendFrame(host.control, { type: "ping" }); } }, 15_000); relay.timer.unref(); return relay;
     } catch (error) { await relay.close(); throw error; }
   }
   private listen(server: TcpServer, port: number, host: string): Promise<void> { return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, host, () => { server.off("error", reject); resolve(); }); }); }
   private track(socket: Socket): void { this.sockets.add(socket); socket.on("error", () => undefined); socket.once("close", () => this.sockets.delete(socket)); }
-  private acceptPublic(socket: Socket): void {
+  private acceptPublic(socket: Socket, host: Host): void {
     const maximum = this.options.maxConnections ?? 256;
     if (this.sockets.size >= maximum) { socket.destroy(); return; }
     // Before a complete ClientHello a socket is unauthenticated. Bound it by an
@@ -97,13 +105,14 @@ export class RelayServer {
         handshakeDone();
         const hello = reader.bytes();
         if (name === this.options.localTls?.serverName.toLowerCase()) { socket.pause(); socket.off("data", receive); this.forwardLocal(socket, hello, this.options.localTls.targetPort); return; }
-        if (!(name === this.options.serverName.toLowerCase() || ipEndpoint && name === "") || !this.control) { socket.destroy(); return; }
+        const control = host.control;
+        if (!(name === this.options.serverName.toLowerCase() || ipEndpoint && name === "") || !control) { socket.destroy(); return; }
         socket.pause(); socket.off("data", receive);
         const id = randomUUID(); const token = randomBytes(32).toString("base64url");
         const timer = setTimeout(() => { this.pending.delete(id); socket.destroy(); }, 10_000); timer.unref();
-        this.pending.set(id, { socket, token, timer, hello });
+        this.pending.set(id, { host, socket, token, timer, hello });
         socket.once("close", () => { clearTimeout(timer); this.pending.delete(id); });
-        sendFrame(this.control, { type: "open", id, token, ...(this.control.alpnProtocol === SOURCE_CONTROL_ALPN ? { source: sourceAddress(socket.remoteAddress ?? "") } : {}) });
+        sendFrame(control, { type: "open", id, token, ...(control.alpnProtocol === SOURCE_CONTROL_ALPN ? { source: sourceAddress(socket.remoteAddress ?? "") } : {}) });
       } catch { socket.destroy(); }
     };
     socket.on("data", receive);
@@ -121,17 +130,19 @@ export class RelayServer {
   }
   private acceptTunnel(socket: TLSSocket): void {
     socket.on("error", () => undefined);
-    const fingerprint = socket.getPeerCertificate().fingerprint256;
-    if (!socket.authorized || fingerprint?.toUpperCase() !== this.options.clientFingerprint256.toUpperCase()) { socket.destroy(); return; }
+    // The certificate says which computer this is. Everything it may do from here on is that computer's alone.
+    const fingerprint = socket.getPeerCertificate().fingerprint256?.toUpperCase();
+    const host = socket.authorized && fingerprint ? this.hosts.find(candidate => candidate.fingerprint === fingerprint) : undefined;
+    if (!host) { socket.destroy(); return; }
     socket.setTimeout(0);
     if (socket.alpnProtocol === CONTROL_ALPN || socket.alpnProtocol === SOURCE_CONTROL_ALPN) {
-      if (this.control && !this.control.destroyed) { socket.destroy(); return; }
-      this.control = socket; this.lastPong = Date.now();
-      readFrames(socket, (frame) => { if (frame.type === "pong") this.lastPong = Date.now(); else if (frame.type === "ping") sendFrame(socket, { type: "pong" }); else socket.destroy(); });
-      socket.once("close", () => { if (this.control !== socket) return; this.control = undefined; for (const p of this.pending.values()) { clearTimeout(p.timer); p.socket.destroy(); } this.pending.clear(); });
+      if (host.control && !host.control.destroyed) { socket.destroy(); return; }
+      host.control = socket; host.lastPong = Date.now();
+      readFrames(socket, (frame) => { if (frame.type === "pong") host.lastPong = Date.now(); else if (frame.type === "ping") sendFrame(socket, { type: "pong" }); else socket.destroy(); });
+      socket.once("close", () => { if (host.control !== socket) return; host.control = undefined; for (const [id, p] of this.pending) if (p.host === host) { clearTimeout(p.timer); p.socket.destroy(); this.pending.delete(id); } });
       sendFrame(socket, { type: "ready" }); return;
     }
-    if (socket.alpnProtocol !== DATA_ALPN || !this.control) { socket.destroy(); return; }
+    if (socket.alpnProtocol !== DATA_ALPN || !host.control) { socket.destroy(); return; }
     socket.setTimeout(10_000, () => socket.destroy()); let buffer = Buffer.alloc(0);
     const receive = (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]); const end = buffer.indexOf(10);
@@ -139,7 +150,8 @@ export class RelayServer {
       if (end > 1024) { socket.destroy(); return; }
       try {
         const hello = dataHelloSchema.parse(JSON.parse(buffer.subarray(0, end).toString("utf8"))); const p = this.pending.get(hello.id);
-        if (!p || !timingSafeEqual(Buffer.from(hello.token), Buffer.from(p.token))) { socket.destroy(); return; }
+        // A data stream joins only a connection that arrived for its own computer.
+        if (!p || p.host !== host || hello.token.length !== p.token.length || !timingSafeEqual(Buffer.from(hello.token), Buffer.from(p.token))) { socket.destroy(); return; }
         clearTimeout(p.timer); this.pending.delete(hello.id); socket.off("data", receive);
         socket.setTimeout(600_000, () => socket.destroy()); p.socket.setTimeout(600_000, () => p.socket.destroy());
         coupleSockets(socket, p.socket);
@@ -149,9 +161,11 @@ export class RelayServer {
     };
     socket.on("data", receive);
   }
-  get status(): { connected: boolean; pending: number; connections: number; publicPort: number; tunnelPort: number; healthPort?: number } {
+  /** `connected` and `publicPort` describe the first computer, as they always did. `hosts` lists every computer when there is more than one. */
+  get status(): { connected: boolean; pending: number; connections: number; publicPort: number; tunnelPort: number; healthPort?: number; hosts?: { publicPort: number; connected: boolean }[] } {
     const port = (server: TcpServer) => { const addr = server.address(); return addr && typeof addr !== "string" ? addr.port : 0; };
-    return { connected: !!this.control && !this.control.destroyed, pending: this.pending.size, connections: this.sockets.size, publicPort: port(this.publicServer), tunnelPort: port(this.tunnelServer), ...(this.healthServer ? { healthPort: port(this.healthServer) } : {}) };
+    const hosts = this.hosts.map(host => ({ publicPort: port(host.server), connected: !!host.control && !host.control.destroyed }));
+    return { connected: hosts[0].connected, pending: this.pending.size, connections: this.sockets.size, publicPort: hosts[0].publicPort, tunnelPort: port(this.tunnelServer), ...(this.healthServer ? { healthPort: port(this.healthServer) } : {}), ...(hosts.length > 1 ? { hosts } : {}) };
   }
-  async close(): Promise<void> { if (this.timer) clearInterval(this.timer); for (const p of this.pending.values()) clearTimeout(p.timer); this.pending.clear(); for (const socket of this.sockets) socket.destroy(); this.control?.destroy(); this.healthServer?.closeAllConnections(); await Promise.all([this.publicServer, this.tunnelServer, this.healthServer].map((server) => new Promise<void>((resolve) => { if (!server?.listening) resolve(); else server.close(() => resolve()); }))); }
+  async close(): Promise<void> { if (this.timer) clearInterval(this.timer); for (const p of this.pending.values()) clearTimeout(p.timer); this.pending.clear(); for (const socket of this.sockets) socket.destroy(); for (const host of this.hosts) host.control?.destroy(); this.healthServer?.closeAllConnections(); await Promise.all([...this.hosts.map(host => host.server), this.tunnelServer, this.healthServer].map((server) => new Promise<void>((resolve) => { if (!server?.listening) resolve(); else server.close(() => resolve()); }))); }
 }

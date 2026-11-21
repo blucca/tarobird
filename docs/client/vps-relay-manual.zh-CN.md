@@ -243,6 +243,25 @@ rm ~/tarobot-stage/tunnel-server.key
 }
 ```
 
+**同一台 VPS 接多台电脑（可选）。**一个中转程序可以接多台电脑：所有电脑的隧道连同一个
+`tunnelPort`，中转按各自的隧道客户端证书认出是哪一台；每台电脑仍有自己的手机入口端口。
+在上面的配置里加 `additionalHosts`，每多一台电脑加一项：
+
+```json
+  "additionalHosts": [
+    { "publicPort": 8444, "clientFingerprint256": "第二台电脑隧道客户端证书的指纹" }
+  ]
+```
+
+- 第一台电脑仍然写在顶层的 `publicPort` 和 `clientFingerprint256`，原有配置不用改。
+- 各台电脑的 `publicPort` 不能相同，也不能和 `tunnelPort`、`healthPort` 相同；指纹不能相同。
+- 每台电脑的隧道客户端证书都要由 `tls.ca` 里的 CA 签发（`ca` 文件可以放多张 CA 证书），
+  每台电脑也要信任这台中转的隧道服务器证书。
+- 防火墙和云厂商入站规则里放行新增的 `publicPort`；`tunnelPort` 不用再加。
+- `/health` 会多出 `hosts`，逐台列出入口端口和隧道是否在线；`connected` 和 `publicPort`
+  仍然表示第一台。
+- 没有域名时手机按 IP 连接，握手里不带名字，所以每台电脑需要各自的入口端口。
+
 创建 `/etc/systemd/system/tarobot-relay.service`，root 所有、权限 0644。
 将 Node 路径替换为系统级 Node 24 可执行文件；`ProtectHome` 会阻止读取其他用户
 家目录内的 Node，因此不要直接指向那里的 nvm 路径。

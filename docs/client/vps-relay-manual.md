@@ -251,6 +251,32 @@ mode 0640. Replace the public IP and fingerprint (omit OpenSSL's `sha256 Fingerp
 }
 ```
 
+**Several computers on one VPS (optional).** One relay process can serve several
+computers. Every computer's tunnel connects to the same `tunnelPort` and the relay
+tells them apart by their tunnel client certificate; each computer still has its
+own public port for its devices. Add `additionalHosts` to the configuration above,
+one entry per further computer:
+
+```json
+  "additionalHosts": [
+    { "publicPort": 8444, "clientFingerprint256": "FINGERPRINT_OF_THE_SECOND_COMPUTER_TUNNEL_CLIENT_CERTIFICATE" }
+  ]
+```
+
+- The first computer stays in the top-level `publicPort` and `clientFingerprint256`;
+  an existing configuration needs no change.
+- Public ports must differ from each other and from `tunnelPort` and `healthPort`;
+  fingerprints must differ.
+- Every computer's tunnel client certificate must be issued by a CA in `tls.ca` (the
+  file may hold several CA certificates), and every computer must trust this relay's
+  tunnel server certificate.
+- Open the added public ports in the firewall and the cloud provider's inbound rules;
+  `tunnelPort` needs nothing more.
+- `/health` gains `hosts`, one entry per computer with its public port and whether its
+  tunnel is connected; `connected` and `publicPort` still describe the first computer.
+- Without a domain a device connects by IP address and its handshake carries no name,
+  which is why each computer needs a public port of its own.
+
 Save `/etc/systemd/system/tarobot-relay.service` (root-owned, mode 0644). Replace
 the Node path with a system-wide Node 24 executable readable by the service
 account; an executable under another user's home can be blocked by `ProtectHome`.

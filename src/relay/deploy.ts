@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { relayServerSchema } from "./config.js";
+import { relayHosts, relayServerSchema } from "./config.js";
 import { ntfyDeploymentSchema, peerRelayDeploymentSchema, prepareCompanions } from "./companions.js";
 import { companionStatusSchema } from "./health.js";
 import { relayUpdateConfigSchema } from "./update.js";
@@ -45,7 +45,9 @@ export async function prepareRelayDeployment(configFile: string, bundleFile: str
   const companions = await prepareCompanions(config, configFile);
   if (relay.localTls) throw new Error("Deployment owns localTls; configure ntfy instead");
   if (config.ntfy && (config.ntfy.serverName.toLowerCase() === relay.serverName.toLowerCase() || new Set([relay.publicPort, relay.tunnelPort, healthPort, config.ntfy.tlsPort, config.ntfy.healthPort]).size !== 5 || relay.publicPort !== 443)) throw new Error("ntfy requires a separate domain, distinct loopback ports and public TCP 443");
-  if (new Set([relay.publicPort, relay.tunnelPort, healthPort]).size !== 3) throw new Error("Relay ports must be distinct");
+  // The public port of every computer, the first included.
+  const publicPorts = relayHosts(relay).map(host => host.publicPort);
+  if (new Set([...publicPorts, relay.tunnelPort, healthPort]).size !== publicPorts.length + 2) throw new Error("Relay ports must be distinct");
   const file = (value: string) => readFile(path.resolve(path.dirname(configFile), value));
   const [bundle, ca, cert, key] = await Promise.all([readFile(bundleFile), file(relay.tls.ca), file(relay.tls.cert), file(relay.tls.key)]);
   if (!bundle.length || bundle.length > 10 * 1024 * 1024) throw new Error("Relay bundle missing or too large; run npm run build");
@@ -200,7 +202,7 @@ table inet tarocub_relay {
   iifname "tailscale0" accept
   ip protocol icmp accept
   meta l4proto ipv6-icmp accept
-  tcp dport { $ssh_port, ${relay.publicPort}, ${relay.tunnelPort} } accept
+  tcp dport { $ssh_port, ${publicPorts.join(", ")}, ${relay.tunnelPort} } accept
   ${config.peerRelay ? `udp dport ${config.peerRelay.port} accept` : ""}
  }
 }
@@ -228,7 +230,7 @@ printf '%s\n' 'APT::Periodic::Update-Package-Lists "1";' 'APT::Periodic::Unatten
 printf 'TAROCUB_DEPLOYED revision=%s changed=%s firewallChanged=%s\n' "$revision" "$changed" "$firewall_changed"
 cat "$stage/status.json"
 `;
-  return { script, summary: { service: "tarocub-relay", revision, serverName: relay.serverName, ports: { public: relay.publicPort, tunnel: relay.tunnelPort, health: `127.0.0.1:${healthPort}`, ssh: "preserve current SSH server port" }, runtime: runtime.version, files: Object.keys(files), firewall: "dedicated VPS: allow established traffic, loopback, Tailscale, ICMP, SSH, public and tunnel ports; drop other inbound traffic", updates: config.updates ? { relay: "daily signed release feed", url: config.updates.url, minRelease: config.updates.minRelease, os: "signed distribution security updates", node: "idempotent redeploy" } : "OS security updates; relay code and Node runtime updated by idempotent redeploy", companions: companions.summary, rollback: "restore previous release, managed unit/config files, service states and firewall on failure", secrets: "only explicit tunnel and optional companion credentials are transferred; no Hub identity or Hub TLS key is read; enrollment keys are removed with the private temporary staging directory" } };
+  return { script, summary: { service: "tarocub-relay", revision, serverName: relay.serverName, ports: { public: relay.publicPort, ...(publicPorts.length > 1 ? { additionalPublic: publicPorts.slice(1) } : {}), tunnel: relay.tunnelPort, health: `127.0.0.1:${healthPort}`, ssh: "preserve current SSH server port" }, runtime: runtime.version, files: Object.keys(files), firewall: "dedicated VPS: allow established traffic, loopback, Tailscale, ICMP, SSH, public and tunnel ports; drop other inbound traffic", updates: config.updates ? { relay: "daily signed release feed", url: config.updates.url, minRelease: config.updates.minRelease, os: "signed distribution security updates", node: "idempotent redeploy" } : "OS security updates; relay code and Node runtime updated by idempotent redeploy", companions: companions.summary, rollback: "restore previous release, managed unit/config files, service states and firewall on failure", secrets: "only explicit tunnel and optional companion credentials are transferred; no Hub identity or Hub TLS key is read; enrollment keys are removed with the private temporary staging directory" } };
 }
 export type SshRunner = (host: string, command: string, input?: string) => Promise<string>;
 export const runRelaySsh: SshRunner = (host, command, input) => new Promise((resolve, reject) => {
