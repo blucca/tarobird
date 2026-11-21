@@ -179,6 +179,9 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 !define MUI_LANGDLL_REGISTRY_ROOT "HKCU"
 !define MUI_LANGDLL_REGISTRY_KEY "${MANUPRODUCTKEY}"
 !define MUI_LANGDLL_REGISTRY_VALUENAME "Installer Language"
+; TaroBot: how setup chooses, lends and keeps that language. Its macros expand
+; where they are used (after MUI_LANGUAGE); the reinstall page below uses two.
+!include "installer-language.nsh"
 
 ; Installer pages, must be ordered as they appear
 ; 1. Welcome Page
@@ -373,7 +376,11 @@ Function PageLeaveReinstall
       ${IfThen} $UpdateMode = 1 ${|} StrCpy $R1 "$R1 /UPDATE" ${|} ; append /UPDATE
       ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
       StrCpy $R1 "$R1 _?=$4" ; append uninstall directory
+      ; TaroBot: an installed older uninstaller reads the saved language before
+      ; /P and asks when there is none; lend this run's language while it runs.
+      !insertmacro BirdLendLanguage
       ExecWait '$R1' $0
+      !insertmacro BirdReturnLanguage
     ${EndIf}
 
     BringToFront
@@ -490,7 +497,6 @@ FunctionEnd
 !insertmacro MUI_RESERVEFILE_LANGDLL
   !include "SimpChinese.nsh"
   !include "English.nsh"
-!include "installer-language.nsh"
 
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
