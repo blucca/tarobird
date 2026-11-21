@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,14 +24,16 @@ describe("Gateway Bot-message steering (#62)", () => {
     const channel = { canSteerConversation: vi.fn(async () => true), transport: { capabilities: [STEERING_OUTCOME_CAPABILITY], options: {}, request: vi.fn(async (method: string, params: unknown) => { requests.push({ method, params }); return null; }) } };
     const create = () => gatewaySteering(bridge, runtime, channel as unknown as GatewayChannel, root, engine);
     const run = create();
-    const status = () => run("botMessage.steer.status", { conversationId: "gw_chat" }) as Promise<{ supported: boolean; targetId?: string; sourceMessageId?: string; reason?: string }>;
+    const status = () => run("botMessage.steer.status", { conversationId: "gw_chat" }) as Promise<{ supported: boolean; targetId?: string; sourceMessageId?: string; reason?: string; receiptEpoch?: string }>;
     const call = async (extra: Record<string, unknown> = {}) => ({ conversationId: "gw_chat", userId: "owner", requestId: "bm_one", targetId: (await status()).targetId!, sourceMessageId: "msg_turn", text: "Use staging", source, ...extra });
     return { runtime, key, bridge, channel, requests, run, create, status, call };
   }
 
   it("reports the live run of exactly this conversation with its source input", async () => {
     const f = fixture();
-    expect(await f.status()).toEqual({ supported: true, targetId: expect.any(String), sourceMessageId: "msg_turn" });
+    expect(await f.status()).toEqual({ supported: true, targetId: expect.any(String), sourceMessageId: "msg_turn", receiptEpoch: expect.stringMatching(/^[A-Za-z0-9_-]+$/) });
+    // The receipt store's identity is stable across Gateway processes on the same state directory.
+    expect((await f.create()("botMessage.steer.status", { conversationId: "gw_chat" }) as { receiptEpoch: string }).receiptEpoch).toBe((await f.status()).receiptEpoch);
     expect(await f.run("botMessage.steer.status", { conversationId: "gw_other" })).toEqual({ supported: true, reason: "no_active_turn" });
     await expect(f.run("botMessage.steer.status", { conversationId: "gw_chat", backgroundReview: true })).rejects.toThrow();
   });
@@ -73,7 +75,7 @@ describe("Gateway Bot-message steering (#62)", () => {
 
   it("refuses control text, another run, another source input and a changed binding before writing anything", async () => {
     const f = fixture(), request = await f.call();
-    for (const text of ["/stop", " /approve", "/new task"]) expect(await f.run("botMessage.steer", { ...request, requestId: `bm_${text.trim().slice(1, 4)}`, text })).toEqual({ outcome: "rejected", reason: "unsupported" });
+    for (const text of ["/stop", " /approve", "/new task"]) expect(await f.run("botMessage.steer", { ...request, requestId: `bm_${text.trim().slice(1, 4)}`, text })).toEqual({ outcome: "rejected", reason: "control_forbidden" });
     expect(await f.run("botMessage.steer", { ...request, requestId: "bm_src", sourceMessageId: "msg_other" })).toEqual({ outcome: "rejected", reason: "stale" });
     expect(await f.run("botMessage.steer", { ...request, requestId: "bm_tok", targetId: "other_run" })).toEqual({ outcome: "rejected", reason: "stale" });
     f.channel.canSteerConversation.mockResolvedValueOnce(false);
@@ -98,7 +100,8 @@ describe("Gateway Bot-message steering (#62)", () => {
 
   it("reconciles without steering: fences a call that never started, joins one in progress, keeps interrupted unknown", async () => {
     const f = fixture(), request = await f.call({ requestId: "bm_fence" });
-    const reconcile = { conversationId: request.conversationId, requestId: request.requestId, targetId: request.targetId, sourceMessageId: request.sourceMessageId };
+    const epoch = (await f.status()).receiptEpoch!;
+    const reconcile = { conversationId: request.conversationId, requestId: request.requestId, targetId: request.targetId, sourceMessageId: request.sourceMessageId, receiptEpoch: epoch };
     expect(await f.run("botMessage.steer.reconcile", reconcile)).toEqual({ outcome: "rejected", reason: "stale" });
     // The original call arriving late cannot run any more.
     expect(await f.run("botMessage.steer", request)).toEqual({ outcome: "rejected", reason: "stale" });
@@ -125,6 +128,27 @@ describe("Gateway Bot-message steering (#62)", () => {
     await vi.waitFor(async () => expect((await dying.inspect("bot-steer:bm_dead"))?.state).toBe("running"));
     expect(await f.create()("botMessage.steer.reconcile", { ...reconcile, requestId: "bm_dead" })).toEqual({ outcome: "unknown", reason: "uncertain", sourceMessageId: "msg_turn" });
     expect(f.bridge.steerActiveTurn).toHaveBeenCalledTimes(2);
+  });
+
+  it("C2: never fences a missing receipt when the receipt store is not the one the steer was decided against", async () => {
+    const f = fixture(), request = await f.call({ requestId: "bm_lost_store" });
+    expect(await f.run("botMessage.steer", request)).toEqual({ outcome: "accepted", sourceMessageId: "msg_turn" });
+    const before = (await f.status()).receiptEpoch!;
+    // The Gateway's state was wiped (receipts and their store identity gone).
+    await rm(path.join(root, "gateway-receipts"), { recursive: true, force: true });
+    const reconcile = { conversationId: request.conversationId, requestId: request.requestId, targetId: request.targetId, sourceMessageId: request.sourceMessageId, receiptEpoch: before };
+    expect(await f.create()("botMessage.steer.reconcile", reconcile)).toEqual({ outcome: "unknown", reason: "uncertain", sourceMessageId: "msg_turn" });
+    // Nothing was fenced: the key stays unwritten, and the new store has a new identity.
+    const { GatewayReceipts } = await import("../src/gateway/receipts.js");
+    expect(await new GatewayReceipts(root).inspect("bot-steer:bm_lost_store")).toBeNull();
+    expect((await f.status()).receiptEpoch).not.toBe(before);
+    // An unreadable receipt is never treated as missing either.
+    const g = fixture(), other = await g.call({ requestId: "bm_corrupt" });
+    expect(await g.run("botMessage.steer", other)).toEqual({ outcome: "accepted", sourceMessageId: "msg_turn" });
+    const { createHash } = await import("node:crypto");
+    await writeFile(path.join(root, "gateway-receipts", `${createHash("sha256").update("bot-steer:bm_corrupt").digest("hex")}.json`), "{not json");
+    await expect(g.create()("botMessage.steer.reconcile", { ...reconcile, requestId: "bm_corrupt", receiptEpoch: (await g.status()).receiptEpoch })).rejects.toThrow();
+    expect(g.bridge.steerActiveTurn).toHaveBeenCalledTimes(1);
   });
 
   it("keeps Bot steer receipts apart from owner steer receipts", async () => {

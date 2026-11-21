@@ -40,7 +40,7 @@ beforeEach(async () => {
   runs = new Map();
   fake = {
     capable: vi.fn(() => true),
-    status: vi.fn(async (_bot: string, conversationId: string) => { const run = runs.get(conversationId); return run ? { supported: true, ...run } : { supported: true, reason: "no_active_turn" }; }),
+    status: vi.fn(async (_bot: string, conversationId: string) => { const run = runs.get(conversationId); return run ? { supported: true, ...run, receiptEpoch: "epoch_1" } : { supported: true, reason: "no_active_turn" }; }),
     steer: vi.fn(async (_bot: string, call: { targetId: string; conversationId: string }) => {
       const run = runs.get(call.conversationId);
       return run?.targetId === call.targetId ? { outcome: "accepted", sourceMessageId: run.sourceMessageId } : { outcome: "rejected", reason: "stale" };
@@ -338,7 +338,7 @@ describe("reconciling an unknown outcome (R1)", () => {
     const after = await wait(chat.conversationId, receipt.messageId);
     expect(after).toMatchObject({ status: "pending", delivery: { actual: "fell_back_to_queue", reason: "turn_ended" } });
     expect(fake.reconcile).toHaveBeenCalledTimes(1);
-    expect(fake.reconcile.mock.calls[0]![1]).toEqual({ conversationId: chat.conversationId, requestId: (await b.store.messageForUser("owner", receipt.messageId)).clientMsgId, targetId: runs.get(chat.conversationId)!.targetId, sourceMessageId: runs.get(chat.conversationId)!.sourceMessageId });
+    expect(fake.reconcile.mock.calls[0]![1]).toEqual({ conversationId: chat.conversationId, requestId: (await b.store.messageForUser("owner", receipt.messageId)).clientMsgId, targetId: runs.get(chat.conversationId)!.targetId, sourceMessageId: runs.get(chat.conversationId)!.sourceMessageId, receiptEpoch: "epoch_1" });
     expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
     // Later waits and a replay neither reconcile nor queue again.
     await wait(chat.conversationId, receipt.messageId);
@@ -412,6 +412,70 @@ describe("waits always end (R5)", () => {
     const receipt = await send(chat.conversationId, "Fix", { delivery: "steer" });
     await b.store.db.run("UPDATE bots SET deleted_at=? WHERE id='target'", [Date.now()]);
     await expect(wait(chat.conversationId, receipt.messageId)).rejects.toThrow(/bot_deleted|not_authorized/);
+  });
+});
+
+describe("second code review (C1–C5)", () => {
+  it("C1: concurrent requests with one request ID share the first record's outcome, never a conflict", async () => {
+    const chat = await resolve(), run = await liveTurn(chat.conversationId);
+    let release!: (value: unknown) => void;
+    fake.steer.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const requestId = randomUUID();
+    const first = send(chat.conversationId, "Same", { delivery: "steer" }, requestId);
+    await vi.waitFor(() => expect(fake.steer).toHaveBeenCalledTimes(1));
+    const others = await Promise.all([send(chat.conversationId, "Same", { delivery: "steer" }, requestId), send(chat.conversationId, "Same", { delivery: "queue" }, requestId), send(chat.conversationId, "Same", {}, requestId)]);
+    release({ outcome: "accepted", sourceMessageId: run.sourceMessageId });
+    const original = await first;
+    for (const other of others) expect(other).toMatchObject({ messageId: original.messageId, duplicate: true, delivery: { actual: expect.stringMatching(/^(pending|steered)$/) } });
+    expect(fake.steer).toHaveBeenCalledTimes(1);
+    expect(await deliveries(original.messageId)).toEqual([]);
+  });
+
+  it("C1: a concurrent duplicate whose own plan hits a limit still reports the first record", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    for (let i = 0; i < 2; i++) await send(chat.conversationId, `Earlier ${i}`, { delivery: "steer" });
+    const requestId = randomUUID();
+    const results = await Promise.all([send(chat.conversationId, "Third", { delivery: "steer" }, requestId), send(chat.conversationId, "Third", { delivery: "steer" }, requestId)]);
+    expect(new Set(results.map(result => result.messageId)).size).toBe(1);
+    expect(results.map(result => result.duplicate).sort()).toEqual([false, true]);
+    for (const result of results) expect(result.delivery.actual).toBe("steered");
+    expect(await deliveries(results[0]!.messageId)).toEqual([]);
+  });
+
+  it("C3: counts a turn's Bot steers from its records and keeps no per-turn counter", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    for (let i = 0; i < 3; i++) await send(chat.conversationId, `Fix ${i}`, { delivery: "steer" });
+    expect((await send(chat.conversationId, "Fix 3", { delivery: "steer" })).delivery.reason).toBe("turn_steer_limit");
+    expect(await b.store.db.all("SELECT key FROM meta WHERE key LIKE 'bot-messages:steer-turn:%'")).toEqual([]);
+  });
+
+  it("C4: a Gateway control refusal is never queued and never reported as an engine limitation", async () => {
+    const chat = await resolve(); await liveTurn(chat.conversationId);
+    fake.steer.mockResolvedValueOnce({ outcome: "rejected", reason: "control_forbidden" });
+    const receipt = await send(chat.conversationId, "Looks plain to the Hub", { delivery: "steer" });
+    expect(receipt.delivery.actual).toBe("steer_uncertain");
+    expect(receipt.delivery.reason).toBeUndefined();
+    expect(await deliveries(receipt.messageId)).toEqual([]);
+    const audit = await b.store.db.all<{ detail_json: string }>("SELECT detail_json FROM audit_log WHERE kind='bot-message.steer'");
+    expect(audit.map(row => JSON.parse(row.detail_json))).toContainEqual(expect.objectContaining({ outcome: "steer_uncertain", reason: "control_forbidden_unreachable" }));
+  });
+
+  it("C5: the legacy path's extra lookup, empty or failing, leaves the legacy receipt and stored input unchanged", async () => {
+    const chat = await resolve();
+    const lookup = vi.spyOn(b.botMessages as unknown as { priorSteerRequest: (key: string) => Promise<unknown> }, "priorSteerRequest");
+    const stored = async (messageId: string) => b.store.db.get<Record<string, unknown>>("SELECT author_id,author_type,blocks_json,status,version,client_msg_id,reply_to,mentions_json,forwarded_json,bot_source_json FROM messages WHERE id=?", [messageId]);
+    const outcomes = [];
+    for (const behaviour of ["empty", "failing"] as const) {
+      if (behaviour === "failing") lookup.mockRejectedValueOnce(new Error("meta_read_failed"));
+      const requestId = `legacy_${behaviour}`, receipt = await send(chat.conversationId, "Plain", {}, requestId);
+      expect(JSON.stringify(receipt)).toBe(JSON.stringify({ hostId: chat.hostId, hostName: "Windows", botId: "target", botName: "Target", conversationId: chat.conversationId, conversationName: chat.conversationName, requestId, messageId: receipt.messageId, duplicate: false, status: "queued" }));
+      const row = await stored(receipt.messageId);
+      outcomes.push({ ...row, client_msg_id: undefined, bot_source_json: JSON.parse(String(row!.bot_source_json)).botId });
+      expect(await deliveries(receipt.messageId)).toEqual([{ status: "pending", dispatched: 0 }]);
+    }
+    expect(lookup).toHaveBeenCalledTimes(2);
+    expect(outcomes[0]).toEqual(outcomes[1]);
+    expect(outcomes[0]).toMatchObject({ author_id: "owner", author_type: "user", blocks_json: JSON.stringify([{ type: "text", text: "Plain" }]), mentions_json: JSON.stringify(["target"]), status: "complete", version: 1, reply_to: null, forwarded_json: null });
   });
 });
 

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { EngineSteeringRejectedError } from "../codex/adapter.js";
 import { z } from "zod";
 import { blocksText, conversationSchema, idSchema, messageSchema } from "../client-protocol/index.js";
-import { steerCallSchema, steerStatusCallSchema, nativeInputControlRequestSchema, steerResultSchema, botSteerCallSchema, botSteerStatusCallSchema, botSteerReconcileCallSchema, type SteerResult, type BotSteerCall } from "../client-protocol/steering.js";
+import { steerCallSchema, steerStatusCallSchema, nativeInputControlRequestSchema, steerResultSchema, botSteerCallSchema, botSteerStatusCallSchema, botSteerReconcileCallSchema, type SteerResult, type BotSteerCall, type BotSteerReconcileCall } from "../client-protocol/steering.js";
 import { isBotControl, type BotSource } from "../client-protocol/bot-messages.js";
 import { supportsBotMessageSteerEngine } from "../client-protocol/bot-message-delivery.js";
 import { CoreGoalRunController } from "../core/bus.js";
@@ -112,7 +112,9 @@ export function gatewaySteering(bridge: ReviewTargetBridge, runtime: CoreService
    * native-input mode, background review, goal pursuit or other engine. */
   const botSupported = () => supported() && !!engine && supportsBotMessageSteerEngine(engine);
   const botSend = async (p: BotSteerCall): Promise<SteerResult> => {
-    if (!botSupported() || isBotControl(p.text)) return { outcome: "rejected", reason: "unsupported" };
+    if (!botSupported()) return { outcome: "rejected", reason: "unsupported" };
+    // The Hub refuses control text before any record exists; never append one here either.
+    if (isBotControl(p.text)) return { outcome: "rejected", reason: "control_forbidden" };
     const run = current(p.conversationId);
     if (!run || token(run) !== p.targetId || run.sourceMessageId !== p.sourceMessageId || reviewTurns.has(p.conversationId)) return { outcome: "rejected", reason: "stale" };
     if (!await channel.canSteerConversation?.(p.conversationId)) return { outcome: "rejected", reason: "binding_changed" };
@@ -138,17 +140,21 @@ export function gatewaySteering(bridge: ReviewTargetBridge, runtime: CoreService
       const run = current(conversationId);
       if (!run || !idSchema.safeParse(run.sourceMessageId).success) return { supported: true, reason: "no_active_turn" };
       if (reviewTurns.has(conversationId)) return { supported: true, reason: "background_review" };
-      return { supported: true, targetId: token(run), sourceMessageId: run.sourceMessageId! };
+      return { supported: true, targetId: token(run), sourceMessageId: run.sourceMessageId!, receiptEpoch: await receipts.epoch() };
     }
     if (method === "botMessage.steer" || method === "botMessage.steer.reconcile") {
       const reconcile = method === "botMessage.steer.reconcile";
       const p = reconcile ? botSteerReconcileCallSchema.parse(raw) : botSteerCallSchema.parse(raw);
-      const identity = { conversationId: p.conversationId, targetId: p.targetId, sourceMessageId: p.sourceMessageId };
+      const identity = { conversationId: p.conversationId, targetId: p.targetId, sourceMessageId: p.sourceMessageId }, key = `bot-steer:${p.requestId}`;
+      // A receipt store that is not the one this steer was decided on (wiped,
+      // replaced) cannot prove "never started": stay uncertain, fence nothing.
+      // An unreadable receipt throws here and stays uncertain at the Hub.
+      if (reconcile && (p as BotSteerReconcileCall).receiptEpoch !== await receipts.epoch() && !await receipts.inspect(key)) return { outcome: "unknown", reason: "uncertain", sourceMessageId: p.sourceMessageId };
       // At most once per Hub record, apart from owner steer receipts. The
       // receipt is fsynced as running before the engine sees anything, so a
       // missing receipt proves the steer never started; reconciliation then
       // records a refusal in its place (and joins one still in progress).
-      const receipt = await receipts.run(`bot-steer:${p.requestId}`, async () => ({ ...identity,
+      const receipt = await receipts.run(key, async () => ({ ...identity,
         result: reconcile ? { outcome: "rejected" as const, reason: "stale" as const } : await botSend(p as BotSteerCall) }));
       if (!receipt.ok) return { outcome: "unknown", reason: "uncertain", sourceMessageId: p.sourceMessageId };
       const stored = z.object({ conversationId: idSchema, targetId: idSchema, sourceMessageId: idSchema, result: steerResultSchema }).parse(receipt.result);

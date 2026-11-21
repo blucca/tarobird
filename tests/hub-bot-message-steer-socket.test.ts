@@ -43,7 +43,7 @@ describe("Hub ↔ Gateway Bot steer wiring (#62)", () => {
     const sending = local("send", { text: "Correction", attachments: [], delivery: "steer" }, chat.conversationId);
     const status = await peer.next("instance.call", f => f.method === "botMessage.steer.status");
     expect(status.params).toEqual({ conversationId: chat.conversationId });
-    peer.send({ type: "instance.result", id: status.id, result: { supported: true, targetId: "run_live", sourceMessageId: task.messageId } });
+    peer.send({ type: "instance.result", id: status.id, result: { supported: true, targetId: "run_live", sourceMessageId: task.messageId, receiptEpoch: "rs_fixture_store" } });
     const steer = await peer.next("instance.call", f => f.method === "botMessage.steer");
     expect(steer.params).toMatchObject({ conversationId: chat.conversationId, userId: "owner", targetId: "run_live", sourceMessageId: task.messageId, text: "Correction", source: { botId: "source", hops: 1 } });
     peer.send({ type: "instance.result", id: steer.id, result: { outcome: "accepted", sourceMessageId: task.messageId } });
@@ -68,7 +68,7 @@ describe("Hub ↔ Gateway Bot steer wiring (#62)", () => {
     await hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [task.messageId]);
     const sending = local("send", { text: "Correction", attachments: [], delivery: "steer" }, chat.conversationId);
     const status = await peer.next("instance.call", f => f.method === "botMessage.steer.status");
-    peer.send({ type: "instance.result", id: status.id, result: { supported: true, targetId: "run_live", sourceMessageId: task.messageId } });
+    peer.send({ type: "instance.result", id: status.id, result: { supported: true, targetId: "run_live", sourceMessageId: task.messageId, receiptEpoch: "rs_fixture_store" } });
     await peer.next("instance.call", f => f.method === "botMessage.steer");
     peer.ws.terminate();
     const receipt = await sending;
@@ -78,7 +78,7 @@ describe("Hub ↔ Gateway Bot steer wiring (#62)", () => {
     const replacement = await worker([BOT_MESSAGE_STEER_CAPABILITY]);
     const waiting = local("wait", { messageId: receipt.messageId }, chat.conversationId);
     const reconcile = await replacement.next("instance.call", f => f.method === "botMessage.steer.reconcile");
-    expect(reconcile.params).toEqual({ conversationId: chat.conversationId, requestId: expect.stringMatching(/^bm_/), targetId: "run_live", sourceMessageId: task.messageId });
+    expect(reconcile.params).toEqual({ conversationId: chat.conversationId, requestId: expect.stringMatching(/^bm_/), targetId: "run_live", sourceMessageId: task.messageId, receiptEpoch: "rs_fixture_store" });
     replacement.send({ type: "instance.result", id: reconcile.id, result: { outcome: "rejected", reason: "stale" } });
     expect(await waiting).toMatchObject({ status: "pending", delivery: { actual: "fell_back_to_queue", reason: "turn_ended" } });
     expect(await hub.store.db.all("SELECT status,dispatched FROM deliveries WHERE message_id=?", [receipt.messageId])).toEqual([{ status: "pending", dispatched: 0 }]);

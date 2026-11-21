@@ -4,7 +4,8 @@ import { idSchema, textSchema } from "./index.js";
 import { botSourceSchema } from "./bot-messages.js";
 import { workbenchContextSchema } from "./workbench.js";
 
-export const steerReasonSchema = z.enum(["unsupported", "idle", "stale", "binding_changed", "queued", "not_ready", "uncertain"]);
+/** `control_forbidden`: a Bot steer whose text is a control command (issue #62); the Hub refuses those first. */
+export const steerReasonSchema = z.enum(["unsupported", "idle", "stale", "binding_changed", "queued", "not_ready", "uncertain", "control_forbidden"]);
 /** `background-review` is only an input target: Claude is reviewing a finished
  * background task and no foreground run exists. It carries no Stop authority. */
 export const steerStatusSchema = z.object({ supported: z.boolean(), targetId: idSchema.optional(), targetKind: z.literal("background-review").optional(), reason: steerReasonSchema.optional(), sendBehavior: z.literal("steer").optional(), nativeInput: nativeInputCapabilitySchema.optional() });
@@ -30,7 +31,9 @@ export const nativeInputControlRequestSchema = z.object({ requestId: idSchema, a
 export const botSteerStatusCallSchema = z.object({ conversationId: idSchema }).strict();
 /** `sourceMessageId` is the Hub input message that started the live run; the
  * Hub accepts a Bot steer only into a run its own sender started. */
-export const botSteerStatusSchema = z.object({ supported: z.boolean(), targetId: idSchema.optional(), sourceMessageId: idSchema.optional(),
+/** `receiptEpoch` identifies the Gateway receipt store; reconciliation trusts a
+ * missing receipt only against the same store the steer was decided on. */
+export const botSteerStatusSchema = z.object({ supported: z.boolean(), targetId: idSchema.optional(), sourceMessageId: idSchema.optional(), receiptEpoch: idSchema.optional(),
   reason: z.enum(["unsupported", "unsupported_engine", "no_active_turn", "background_review"]).optional() }).strict();
 /** Hub → Gateway. Plain text append only: no native-input mode, attachments,
  * stop, card answer or approval. `requestId` is the Hub record's client ID. */
@@ -41,5 +44,5 @@ export type BotSteerCall = z.infer<typeof botSteerCallSchema>;
  * It never steers: a recorded outcome is returned; a request that never
  * started is fenced with a recorded refusal, so a late original call cannot
  * run either; one still running (or interrupted) stays unknown. */
-export const botSteerReconcileCallSchema = z.object({ conversationId: idSchema, requestId: idSchema, targetId: idSchema, sourceMessageId: idSchema }).strict();
+export const botSteerReconcileCallSchema = z.object({ conversationId: idSchema, requestId: idSchema, targetId: idSchema, sourceMessageId: idSchema, receiptEpoch: idSchema }).strict();
 export type BotSteerReconcileCall = z.infer<typeof botSteerReconcileCallSchema>;

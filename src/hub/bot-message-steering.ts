@@ -37,7 +37,7 @@ export const botMessageSteeringProofTarget = (command: BotMessageSteeringCommand
 
 /** The `incoming` request memo. `steer` exists only for requests that asked
  * to steer; older Hubs read `content` alone. */
-export type IncomingMemo = { content: string; at: number; steer?: { turn?: string; targetId?: string; reason?: BotSteerFallbackReason } };
+export type IncomingMemo = { content: string; at: number; steer?: { turn?: string; targetId?: string; epoch?: string; reason?: BotSteerFallbackReason } };
 
 const REASON_TEXT: Record<BotSteerFallbackReason, string> = {
   steering_disabled: "接收方未允许其他 Bot 引导", unsupported_engine: "目标引擎不支持引导", unsupported_conversation: "仅支持直连对话",

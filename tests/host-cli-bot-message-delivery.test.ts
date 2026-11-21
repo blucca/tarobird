@@ -31,7 +31,7 @@ async function liveTurn() {
   await hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=?", [task.messageId]);
   hub.botMessages.steering = {
     capable: () => true,
-    status: async () => ({ supported: true, targetId: "run_live", sourceMessageId: task.messageId }),
+    status: async () => ({ supported: true, targetId: "run_live", sourceMessageId: task.messageId, receiptEpoch: "rs_fixture_store" }),
     steer: async (_bot, call) => { steered.push(call); return { outcome: "accepted", sourceMessageId: task.messageId }; },
     reconcile: async () => ({ outcome: "unknown", reason: "uncertain" }),
   } satisfies BotMessageSteeringHooks;

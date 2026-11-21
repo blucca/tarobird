@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
 import { jsonSchema, type Json } from "../client-protocol/index.js";
@@ -13,6 +13,16 @@ export type ReceiptResult = z.infer<typeof resultSchema>;
 export class GatewayReceipts {
   private active = new Map<string, Promise<ReceiptResult>>();
   constructor(private readonly directory: string) {}
+  private creatingEpoch?: Promise<string>;
+  /** Identity of this receipt store, read from disk on every call (never
+   * cached): a wiped or replaced store gets a new one. A missing receipt
+   * proves "never started" only under the identity seen when deciding. */
+  async epoch(): Promise<string> {
+    const file = new JsonStore(path.join(this.directory, "gateway-receipts", "store-identity.json"), value => z.object({ id: z.string().regex(/^[A-Za-z0-9_-]{8,128}$/) }).passthrough().nullable().parse(value));
+    const stored = await file.read(null);
+    if (stored) return stored.id;
+    return this.creatingEpoch ??= (async () => { const id = `rs_${randomUUID().replace(/-/g, "")}`; await file.write({ id }); return id; })().finally(() => { this.creatingEpoch = undefined; });
+  }
   /** Readback must never turn an interrupted mutation into another invocation. */
   async inspect(key: string): Promise<z.infer<typeof receiptSchema> | null> {
     const id = createHash("sha256").update(key).digest("hex");
