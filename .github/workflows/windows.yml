@@ -1,6 +1,10 @@
-# ACCEPTANCE-ONLY BRANCH COPY (#50). Never merge this file into main as is:
-# it removes signing, publishing and every artifact upload so a disposable
-# GitHub-hosted runner can install/uninstall without releasing unreviewed bytes.
+# ACCEPTANCE-ONLY BRANCH COPY (#50 extension: custom directory, release
+# upgrades, Tauri -> Electron). Never merge this file into main as is: it removes
+# signing, publishing and every artifact upload so a disposable GitHub-hosted
+# runner can install/uninstall without releasing unreviewed bytes. The main #50
+# suite (native regressions, baseline, #50 cases, migration) stays on
+# accept/50-final-20261121; it needs the same pristine runner as group C, so the
+# two never share a job.
 name: Windows desktop installer
 on:
   workflow_dispatch:
@@ -90,92 +94,30 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installer extraction failed" }
           node scripts/verify-windows-runtime.mjs windows-installer-extracted
           if ($LASTEXITCODE -ne 0) { throw "Installer requires an unbundled runtime" }
-      - name: Native Rust regressions on the x64 runner
-        if: inputs.arch == 'x64'
-        shell: pwsh
-        env:
-          TAROBOT_TEST_NODE: ${{ github.workspace }}/client/src-tauri/host/node.exe
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
-          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
-        run: |
-          cargo test --manifest-path client/src-desktop-core/Cargo.toml --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Desktop core regressions failed" }
-          cargo test --manifest-path client/src-desktop-native/Cargo.toml --locked --no-default-features
-          if ($LASTEXITCODE -ne 0) { throw "Desktop native regressions failed" }
-          cargo test --manifest-path client/src-desktop-updater/Cargo.toml --locked --lib --bins --test real_archive
-          if ($LASTEXITCODE -ne 0) { throw "Desktop updater regressions failed" }
-      # Record only, never a gate: the real WinRT Setting of a never-registered
-      # AUMID and how windows_status classifies it. A Server runner proves
-      # neither banner delivery nor Windows 10/11 behaviour.
-      - name: Record-only Windows toast status probe (non-blocking)
-        if: inputs.arch == 'x64'
-        continue-on-error: true
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
-          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
-        run: |
-          $output = cargo test --manifest-path client/src-desktop-native/Cargo.toml --locked --no-default-features windows_toast_status_probe -- --ignored --nocapture 2>&1 | Out-String
-          $code = $LASTEXITCODE
-          Write-Output $output
-          $fence = '```'
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @('### Windows toast status probe (record only)', $fence, $output.Trim(), $fence)
-          if ($code -ne 0) { throw "Toast status probe did not classify as prompt/granted; recorded only" }
-      - name: Real Windows install, first launch and uninstall
-        # Acceptance branch: run even when the unrelated packaged-host smoke
-        # assertion fails, so the install/uninstall baseline is still recorded.
+      - name: "#50 extension: custom directory, release upgrades, Tauri to Electron (acceptance only)"
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 35
+        timeout-minutes: 110
         shell: pwsh
         env:
           TAROBOT_WINDOWS_ACCEPTANCE: disposable
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
-          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+          # Optional, owner-provided read-only token for the private, archived
+          # cloveric/tarobot 1.0.119 release asset. Without it group C reports
+          # "blocked" (a skip, never a pass); nothing is uploaded either way.
+          TAROBOT_LEGACY_RELEASE_TOKEN: ${{ secrets.TAROBOT_LEGACY_RELEASE_READ }}
         run: |
           $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
           if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
-          node client/scripts/windows-acceptance.mjs --confirm-disposable-windows --installer $installers[0].FullName `
-            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-acceptance.noindex" `
-            --native-tests client/src-desktop-updater --scope install,native
-          if ($LASTEXITCODE -ne 0) { throw "Windows installation or native acceptance failed; see the receipt" }
-      - name: "#50 uninstall recovery, in-place uninstall, helper backup and dialogs (acceptance only)"
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 75
-        shell: pwsh
-        env:
-          TAROBOT_WINDOWS_ACCEPTANCE: disposable
-        run: |
-          $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
-          if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
-          node client/scripts/windows-uninstall-recovery-acceptance.mjs --confirm-disposable-windows --installer $installers[0].FullName `
-            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex" --budget-minutes 60
-          if ($LASTEXITCODE -ne 0) { throw "#50 uninstall recovery acceptance did not pass; see the receipt in the job summary" }
-      - name: Build isolated Windows migration acceptance package
-        shell: pwsh
-        run: |
-          npm run desktop:build --prefix client -- --platform win32 --arch x64 --development --package-only `
-            --out "$env:RUNNER_TEMP/windows-migration-package.noindex"
-          if ($LASTEXITCODE -ne 0) { throw "Migration acceptance package build failed" }
-      - name: Persistent WebView2 data to Electron content acceptance
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-migration-target.noindex
-        run: |
-          $build = Get-Content "$env:RUNNER_TEMP/windows-migration-package.noindex/desktop-build.json" -Raw | ConvertFrom-Json
-          if ($build.production -or $build.packaged.paths.Count -ne 1) { throw "Expected one isolated development package" }
-          node client/scripts/desktop-persisted-migration-audit.mjs "$env:RUNNER_TEMP/windows-persisted-migration.noindex" $build.packaged.paths[0]
-          if ($LASTEXITCODE -ne 0) { throw "Persistent WebView2 to Electron migration failed" }
+          node client/scripts/windows-acceptance-extension.mjs --confirm-disposable-windows --installer $installers[0].FullName `
+            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-extension.noindex" --groups C,A,B --budget-minutes 100
+          if ($LASTEXITCODE -ne 0) { throw "#50 extension acceptance did not pass; see the receipt in the job summary" }
       - name: Show acceptance evidence (log and summary only, no upload)
         if: always()
         shell: pwsh
         run: |
-          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/windows-acceptance.md", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.md" -ErrorAction SilentlyContinue)) {
+          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/windows-acceptance.md", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.md", "$env:RUNNER_TEMP/windows-extension.noindex/*.md" -ErrorAction SilentlyContinue)) {
             Get-Content -LiteralPath $file.FullName -Raw | Add-Content -Path $env:GITHUB_STEP_SUMMARY
           }
-          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/*.json", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.json", "$env:RUNNER_TEMP/windows-persisted-migration.noindex/*.json" -ErrorAction SilentlyContinue)) {
+          foreach ($file in @(Get-ChildItem "$env:RUNNER_TEMP/windows-acceptance.noindex/*.json", "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex/*.json", "$env:RUNNER_TEMP/windows-persisted-migration.noindex/*.json", "$env:RUNNER_TEMP/windows-extension.noindex/*.json" -ErrorAction SilentlyContinue)) {
             "===== $($file.Name) ====="; Get-Content -LiteralPath $file.FullName -Raw
           }
       - name: Installer checksum (log only, the installer is never uploaded)
