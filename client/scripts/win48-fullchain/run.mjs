@@ -240,7 +240,12 @@ try {
     await page.evaluate(() => (window).accHarness.suppressBlur(true));
     await btn('连接屏幕').click(); await until(async () => await btn('开始控制').isEnabled(), 20000);
     await btn('开始控制').click(); await until(() => btn('停止控制').isVisible(), 8000);
-    const ci = await canvasInfo(page); await page.evaluate(() => document.querySelector('.remote-screen-panel canvas').focus());
+    let ci = await canvasInfo(page); await page.evaluate(() => document.querySelector('.remote-screen-panel canvas').focus());
+    // Bring A's test window to the foreground first with one remote click on its blank area (this
+    // ends control on the shared desktop, as recorded above), then start control again and drag.
+    { const p0 = toB(ci, 250, 445); await page.mouse.click(p0.x, p0.y); await sleep(800);
+      if (await btn('开始控制').isVisible().catch(() => false)) { await btn('开始控制').click(); await until(() => btn('停止控制').isVisible(), 8000); }
+      ci = await canvasInfo(page); await page.evaluate(() => document.querySelector('.remote-screen-panel canvas').focus()); await snap(page, lang, 'drag-ready'); }
     await sleep(500);
     await page.evaluate(() => { const c = document.querySelector('.remote-screen-panel canvas'); const d = (window).__dr = { moves: 0, movesWithButton: 0, downs: 0, ups: 0, lost: 0, cancels: 0, samples: [] };
       c.addEventListener('pointermove', e => { d.moves++; if (e.buttons) d.movesWithButton++; if (d.samples.length < 12) d.samples.push([document.hasFocus(), document.activeElement === c, e.buttons, c.hasPointerCapture(e.pointerId)]); });
