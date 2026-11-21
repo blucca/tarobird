@@ -437,6 +437,10 @@ const describe = ui => ui.error ? `driver error: ${ui.error}` : `seen ${ui.seen}
  * earlier data aside (renamed, never deleted) and clear the remembered location. */
 async function pristine(x, receipt, phase) {
   await x.cleanSlate(receipt, phase);
+  const left = (await x.sys.powershell(`@(Get-Process -Name tarocub-client -ErrorAction SilentlyContinue) | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue; "$($_.Id)" }`)).stdout.trim();
+  if (left) receipt.info(phase, 'stopped-app-processes', left.replace(/\r?\n/g, ', '));
+  const item = (await x.reg(RUN_KEY)).values?.TaroBot;
+  if (item !== undefined) { receipt.info(phase, 'login-item-cleared', `${RUN_KEY}\\TaroBot = ${JSON.stringify(item)}`); await x.sys.run('reg.exe', ['delete', RUN_KEY, '/v', 'TaroBot', '/f']); }
   let n = 0;
   for (const root of x.presentRoots()) {
     const aside = W.join(W.dirname(root), `TaroBird-acceptance-aside-${Date.now()}-${++n}`);
@@ -622,7 +626,15 @@ async function groupC(x, receipt) {
   await x.cleanSlate(receipt, P);
 }
 
-const RUNNERS = { A: groupA, B: groupB, C: groupC, D: groupD };
+// P: restore a pristine profile between suites (a later windows-acceptance.mjs
+// preflight refuses earlier installs, data or login items); judged only on that.
+async function groupP(x, receipt) {
+  await pristine(x, receipt, 'P-pristine');
+  const state = await x.state();
+  receipt.expect('P-pristine', 'pristine-for-next-suite', state.uninstall.state === 'absent' && state.location.state === 'absent' && !x.presentRoots().length,
+    `uninstall key ${state.uninstall.state}; ${LOCATION_KEY} ${state.location.state}; data roots left ${x.presentRoots().length}`);
+}
+const RUNNERS = { A: groupA, B: groupB, C: groupC, D: groupD, P: groupP };
 
 export async function run(options, sys = windowsSystem()) {
   const receipt = new Receipt();
