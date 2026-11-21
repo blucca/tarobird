@@ -1,94 +1,89 @@
+# ACCEPTANCE-ONLY BRANCH COPY (#48 full chain). Never merge into main. On a
+# disposable GitHub-hosted Windows runner: real Hub; controlled side = the
+# product ScreenService (real desktopCapturer capture, real native input) with
+# an owned test window; controller = the real RemoteScreenPanel in an Electron
+# shell with the product DesktopServices/ScreenViewers, driven by Playwright.
+# Redacted results to the job log only: no artifacts, signing, publishing or
+# cache writes.
 name: Windows release upgrade acceptance
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: Version of the reviewed draft release to verify
-        required: true
-        type: string
-      source_commit:
-        description: Full source commit of the signed candidate
-        required: true
-        type: string
-      baseline_version:
-        description: Published Windows version to upgrade from
-        required: true
-        default: '1.3.1'
-        type: string
-      public_key:
-        description: Public Minisign verification key (never a private key)
-        required: true
-        type: string
+      scope:
+        description: Acceptance scope
+        type: choice
+        options: [fullchain]
+        default: fullchain
 permissions:
-  contents: write # GitHub requires write access to read an unpublished draft.
+  contents: read
 jobs:
-  upgrade:
+  win48-fullchain:
     runs-on: windows-latest
-    timeout-minutes: 60
-    env:
-      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-      TAROBOT_WINDOWS_ACCEPTANCE: disposable
-      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    timeout-minutes: 40
     steps:
+      - name: Acceptance-only guard (disposable GitHub-hosted runner, no uploads)
+        shell: pwsh
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "Acceptance runs only on a disposable GitHub-hosted runner" }
+          if (-not $env:REF.StartsWith('refs/heads/accept/')) { throw "This acceptance-only workflow copy runs only from an accept/* branch" }
+          "runner=$env:RUNNER_ENVIRONMENT os=$env:ImageOS image=$env:ImageVersion ref=$env:REF sha=${{ github.sha }}"
+      - name: LF checkout
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_commit }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            client/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Download the source-bound candidate and released baseline
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CANDIDATE_VERSION: ${{ inputs.version }}
-          CANDIDATE_COMMIT: ${{ inputs.source_commit }}
-          BASELINE_VERSION: ${{ inputs.baseline_version }}
-          TAROBOT_UPDATE_PUBLIC_KEY: ${{ inputs.public_key }}
-        run: |
-          if ($env:CANDIDATE_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
-          if ($env:BASELINE_VERSION -notmatch '^\d+\.\d+\.\d+$' -or [version]$env:BASELINE_VERSION -ge [version]$env:CANDIDATE_VERSION) { throw "Expected an older published baseline version" }
-          if ($env:CANDIDATE_COMMIT -notmatch '^[0-9a-f]{40}$') { throw "Expected a full source SHA" }
-          $sourceCommit = git rev-parse HEAD
-          if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne $env:CANDIDATE_COMMIT) { throw "Wrong source checkout" }
-          $version = (Get-Content release-version.json -Raw | ConvertFrom-Json).version
-          if ($version -ne $env:CANDIDATE_VERSION) { throw "Candidate version differs from source" }
-          $tag = "windows-tarobot-v$version"
-          $release = gh release view $tag --repo $env:GITHUB_REPOSITORY --json targetCommitish,isDraft | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or !$release.isDraft -or $release.targetCommitish -ne $sourceCommit) { throw "Expected a draft bound to this exact source commit" }
-          gh release download $tag --repo $env:GITHUB_REPOSITORY --dir test-results/candidate --pattern '*-setup.exe*'
-          if ($LASTEXITCODE -ne 0) { throw "Candidate download failed" }
-          gh release download "windows-tarobot-v$($env:BASELINE_VERSION)" --repo $env:GITHUB_REPOSITORY --dir test-results/baseline --pattern '*-setup.exe*'
-          if ($LASTEXITCODE -ne 0) { throw "Baseline download failed" }
-          node client/scripts/windows-update-manifest.mjs --verify-only --installer "test-results/candidate/TaroBird_${version}_x64-setup.exe" --version $version
-          if ($LASTEXITCODE -ne 0) { throw "Candidate signature failed" }
-          node client/scripts/windows-update-manifest.mjs --verify-only --installer "test-results/baseline/TaroBird_$($env:BASELINE_VERSION)_x64-setup.exe" --version $env:BASELINE_VERSION
-          if ($LASTEXITCODE -ne 0) { throw "Baseline signature failed" }
-          Get-ChildItem test-results/candidate/*-setup.exe | Get-FileHash -Algorithm SHA256 | ConvertTo-Json | Set-Content test-results/candidate-sha256.json
-      - run: npm ci
-      - run: npm run build
-      - name: Native updater and real released-App upgrade
-        shell: pwsh
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/windows-native-tests.noindex
-          CANDIDATE_VERSION: ${{ inputs.version }}
-          BASELINE_VERSION: ${{ inputs.baseline_version }}
-        run: |
-          node client/scripts/windows-acceptance.mjs --confirm-disposable-windows `
-            --installer "test-results/baseline/TaroBird_$($env:BASELINE_VERSION)_x64-setup.exe" --version $env:BASELINE_VERSION `
-            --next-installer "test-results/candidate/TaroBird_$($env:CANDIDATE_VERSION)_x64-setup.exe" --next-version $env:CANDIDATE_VERSION `
-            --report "$env:RUNNER_TEMP/windows-upgrade.noindex" --native-tests client/src-desktop-updater --scope install,update,native
-          if ($LASTEXITCODE -ne 0) { throw "Windows upgrade acceptance failed; publication remains blocked" }
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - uses: Swatinem/rust-cache@v2
         with:
-          name: TaroBird-windows-upgrade-evidence
-          path: |
-            test-results/candidate-sha256.json
-            ${{ runner.temp }}/windows-upgrade.noindex/windows-acceptance.*
-          if-no-files-found: warn
+          workspaces: client/src-desktop-native -> target
+          save-if: false
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "root npm ci failed" }
+          npm ci --prefix client
+          if ($LASTEXITCODE -ne 0) { throw "client npm ci failed" }
+      - name: Build root Hub and protocol dist
+        shell: pwsh
+        run: |
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "root build failed" }
+      - name: Build native Windows addon
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fc-native-target.noindex
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --manifest-path client/src-desktop-native/Cargo.toml --release --locked --target x86_64-pc-windows-msvc --lib
+          if ($LASTEXITCODE -ne 0) { throw "native addon build failed" }
+          $outDir = Join-Path $env:RUNNER_TEMP "fc-native.noindex"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $addon = Join-Path $outDir "tarobot-desktop-native.node"
+          Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\tarobot_desktop_native.dll") -Destination $addon -Force
+          "addon_sha256=$((Get-FileHash -LiteralPath $addon -Algorithm SHA256).Hash.ToLower())"
+          "TAROBOT_WIN_ADDON=$addon" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Full chain (controller B -> real Hub -> controlled A, real capture and input)
+        shell: pwsh
+        env:
+          TAROBOT_WINDOWS_ACCEPTANCE: disposable
+        run: |
+          node client/node_modules/electron/install.js
+          if ($LASTEXITCODE -ne 0) { throw "Electron binary install failed" }
+          $electron = (node -p "require('./client/node_modules/electron')").Trim()
+          node client/scripts/win48-fullchain/run.mjs --electron $electron --addon $env:TAROBOT_WIN_ADDON --report (Join-Path $env:RUNNER_TEMP "fc-report.noindex") --source-commit ${{ github.sha }}
+          if ($LASTEXITCODE -ne 0) { throw "full chain reported failure; see log" }
