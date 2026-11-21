@@ -483,3 +483,29 @@ test("stopping a short pointer burst still delivers the final hover position", a
  await expect.poll(()=>page.evaluate(()=>(window as any).screenFixture.commands.filter((c:any)=>c.type==="input").at(-1)?.event.x)).toBeCloseTo(.8,3);
  expect(await page.evaluate(()=>(window as any).screenFixture.commands.filter((c:any)=>c.type==="input").length)).toBe(2);
 });
+test("controlling a Mac hides the local pointer over the picture only and shows it again the moment input stops",async({page},info)=>{
+ const canvas=page.locator(".screen-viewport canvas"),cursor=()=>canvas.evaluate(node=>getComputedStyle(node).cursor);
+ // Viewing only: the local pointer stays.
+ expect(await cursor()).not.toBe("none");
+ const start=async()=>{await page.getByRole("button",{name:"开始控制",exact:true}).click();await expect(page.getByRole("button",{name:"停止控制",exact:true})).toBeVisible();await expect.poll(cursor).toBe("none");};
+ await start();
+ // Only over the picture: the toolbar, the panel and the letterbox keep it.
+ for(const node of [page.getByRole("button",{name:"停止控制",exact:true}),page.locator(".screen-viewport"),page.locator(".screen-chrome")])expect(await node.evaluate(n=>getComputedStyle(n).cursor)).not.toBe("none");
+ await page.screenshot({path:info.outputPath("controlling-mac.png")});
+ // Stop control: back at once.
+ await page.getByRole("button",{name:"停止控制",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeVisible();expect(await cursor()).not.toBe("none");
+ // Window focus leaves: control is released and the pointer returns in the same step.
+ await start();await page.evaluate(()=>window.dispatchEvent(new Event("blur")));
+ await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeVisible();expect(await cursor()).not.toBe("none");
+ // The picture stops updating: the pointer returns as soon as it is stale.
+ await start();await page.evaluate(()=>{(window as any).screenFixture.active=false;});
+ await expect.poll(cursor,{timeout:4000}).not.toBe("none");await expect(page.getByRole("button",{name:"停止控制",exact:true})).toHaveCount(0);
+ // The session ends while controlling: the pointer is not left hidden.
+ await page.evaluate(()=>{(window as any).screenFixture.active=true;});await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled({timeout:4000});
+ await start();await page.getByRole("button",{name:"断开",exact:true}).click();await expect(page.getByRole("button",{name:"连接屏幕",exact:true})).toBeVisible();expect(await cursor()).not.toBe("none");
+});
+test("a Windows target keeps the local pointer while controlling until its picture is known to show one",async({page})=>{
+ await page.goto(server.resolvedUrls!.local[0]+"e2e/fixtures/remote-screen.html?target=windows");await page.getByRole("button",{name:"连接屏幕",exact:true}).click();
+ await page.getByRole("button",{name:"开始控制",exact:true}).click();await expect(page.getByRole("button",{name:"停止控制",exact:true})).toBeVisible();
+ expect(await page.locator(".screen-viewport canvas").evaluate(node=>getComputedStyle(node).cursor)).not.toBe("none");
+});

@@ -18,6 +18,8 @@
 .screen-fit canvas{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain}
 .screen-viewport canvas{display:block;touch-action:none;flex:none;outline-offset:-3px}
 .screen-viewport canvas:focus-visible{outline:2px solid var(--accent)}.screen-stale{opacity:.55}
+/* Controlling a computer whose picture shows its own pointer: one pointer only. */
+.screen-viewport canvas.screen-pointer-hidden{cursor:none}
 .screen-settings button,.remote-screen-panel button:not(.icon-button),.remote-screen-panel select,.screen-settings select{border:1px solid var(--border);border-radius:6px;background-color:var(--surface);color:var(--text);padding:5px 8px;font-size:12px}
 .remote-screen-panel button:disabled{opacity:.45}
 /* Retain the select chevron gutter across theme/panel stylesheet load order. */
