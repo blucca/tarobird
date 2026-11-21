@@ -95,6 +95,37 @@ function Responsive($w) {
   return [BirdProbe.Win32Alive]::SendMessageTimeout($h, 0, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 400, [ref]$r) -ne [IntPtr]::Zero
 }
 function OwnerPath($w) { try { [string](Get-CimInstance Win32_Process -Filter "ProcessId=$($w.Current.ProcessId)").ExecutablePath } catch { '' } }
+
+# Top-level windows WITHOUT UI Automation: EnumWindows + InternalGetWindowText
+# never send a message, so a window whose UI thread is blocked (setup's
+# page-leave ExecWait, probe run 44860748632) cannot hang the enumeration.
+# Only visible windows that answer WM_NULL within 400 ms get a UIA element.
+Add-Type -Namespace BirdProbe -Name TopWindows -UsingNamespace System.Text, System.Collections.Generic -MemberDefinition @"
+public delegate bool EnumProc(IntPtr h, IntPtr l);
+[DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+[DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int InternalGetWindowText(IntPtr h, StringBuilder s, int n);
+[DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);
+public static string[] List() {
+  var found = new List<string>();
+  EnumWindows((h, l) => {
+    if (!IsWindowVisible(h)) return true;
+    var sb = new StringBuilder(512); InternalGetWindowText(h, sb, 512); var t = sb.ToString();
+    if (t.Contains("TaroBird") || t.Contains("Language")) { IntPtr r; bool alive = SendMessageTimeout(h, 0, IntPtr.Zero, IntPtr.Zero, 2, 400, out r) != IntPtr.Zero; found.Add(h.ToInt64() + "|" + (alive ? "1" : "0") + "|" + t); }
+    return true;
+  }, IntPtr.Zero);
+  return found.ToArray();
+}
+"@
+function Windows {
+  $list = @()
+  foreach ($entry in [BirdProbe.TopWindows]::List()) {
+    $part = $entry.Split('|', 3)
+    if ($part[1] -ne '1') { if (Get-Command Once -ErrorAction SilentlyContinue) { Once 'unresponsive' $part[0] "$($part[2]) hwnd=$($part[0]) (UI thread busy; skipped while it is)" }; continue }
+    try { $list += $AE::FromHandle([IntPtr][long]$part[0]) } catch { }
+  }
+  return $list
+}
 function BtnRx($el, [string]$rx) {
   foreach ($c in (Kids $el)) { if ((IsButton $c) -and (Clean $c.Current.Name) -match $rx) { return $c } }
   return $null
@@ -143,13 +174,13 @@ while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSec) {
           $waited = 0; while (-not (Test-Path -LiteralPath $ReleasedFile) -and $waited -lt 120) { Start-Sleep -Seconds 1; $waited++ }
           Note 'released' "after ${waited}s"
         }
-        $r = BtnRx $dialog '^(Retry|重试)'; Press $r; Note 'answer' "Retry $(Desc $r)"; $acted[$key] = $true; continue
+        $r = BtnRx $dialog '^(Retry|重试)'; $d = Desc $r; Press $r; Note 'answer' "Retry $d"; $acted[$key] = $true; continue
       }
       $yes = Btn $w 'Yes'
       if ($yes -and (Btn (Scope $yes) 'No')) { $q = Scope $yes; Note 'question' (Text $q); Press (Btn $q 'No'); Note 'answer' 'No'; $acted[$key] = $true; continue }
       $un = BtnRx $w '^(Uninstall|卸载)'; $close = BtnRx $w '^(Close|关闭)'
-      if ($un -and (Enabled $un)) { Note 'confirm-page' "$($w.Current.Name): $now"; Press $un; Note 'answer' "Uninstall $(Desc $un)"; $acted[$key] = $true }
-      elseif ($close -and (Enabled $close)) { Note 'finished' "Close $(Desc $close): $now"; Press $close; $closed = $true; $acted[$key] = $true }
+      if ($un -and (Enabled $un)) { Note 'confirm-page' "$($w.Current.Name): $now"; $d = Desc $un; Press $un; Note 'answer' "Uninstall $d"; $acted[$key] = $true }
+      elseif ($close -and (Enabled $close)) { $d = Desc $close; Note 'finished' "Close ${d}: $now"; Press $close; $closed = $true; $acted[$key] = $true }
       elseif ($now -match 'Aborted|not completed successfully|中止|未能') { $cancel = BtnRx $w '^(Cancel|取消)'; if ($cancel -and (Enabled $cancel)) { Note 'finished' "aborted: $now"; Press $cancel; $closed = $true; $acted[$key] = $true } }
     } catch { Note 'error' $_.Exception.Message }
   }
