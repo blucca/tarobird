@@ -645,3 +645,56 @@ test('only a Tauri layout uses the main program as Host stopper', async () => {
   const targets = plan.resources.map(item => item.target);
   for (const marker of ['resources\\app.asar', 'resources\\host\\node.exe']) assert.ok(targets.includes(marker), `Electron installs ${marker}`);
 });
+
+// Review F2 (47450f7): the notes test above passed with six behaviour-breaking
+// edits. Each property is now an exact run of code lines, and every edit below
+// must fail on the property it breaks.
+function checkSetupNotes(notes) {
+  const lines = nsisCode(notes).split('\n').map(line => line.trim()).filter(Boolean);
+  const run = (property, ...expected) => {
+    const found = lines.some((line, index) => line === expected[0] && expected.every((want, offset) => lines[index + offset] === want));
+    assert.ok(found, `${property}: expected consecutive lines\n  ${expected.join('\n  ')}`);
+  };
+  run('folder is a plain directory', 'CreateDirectory "$8"', "System::Call 'kernel32::GetFileAttributesW(w r8) i .r6'", 'IntOp $5 $6 & 0x410',
+    '${If} $6 = -1', '${OrIf} $5 <> 0x10', 'Goto bird_note_release', '${EndIf}');
+  for (const file of ['BIRDNOTESFILE', 'BIRDNOTESPREVIOUS']) {
+    run(`${file} is a plain file or absent`, `StrCpy $5 "$8\\\${${file}}"`, "System::Call 'kernel32::GetFileAttributesW(w r5) i .r6'", 'IntOp $5 $6 & 0x410',
+      '${If} $6 <> -1', '${AndIf} $5 <> 0', 'Goto bird_note_release', '${EndIf}');
+  }
+  run('a full file rotates', 'StrCpy $5 0', 'ClearErrors', 'FileOpen $4 "$8\\${BIRDNOTESFILE}" r', '${IfNot} ${Errors}', '${Do}', 'ClearErrors', 'FileReadUTF16LE $4 $3',
+    '${If} ${Errors}', '${ExitDo}', '${EndIf}', 'IntOp $5 $5 + 1', '${LoopUntil} $5 >= ${BIRDNOTESMAX}', 'FileClose $4', '${EndIf}',
+    '${If} $5 >= ${BIRDNOTESMAX}', 'Delete "$8\\${BIRDNOTESPREVIOUS}"', 'Rename "$8\\${BIRDNOTESFILE}" "$8\\${BIRDNOTESPREVIOUS}"');
+  run('a line is appended at the end and the file closed', 'ClearErrors', 'FileOpen $4 "$8\\${BIRDNOTESFILE}" a', '${IfNot} ${Errors}', 'FileSeek $4 0 END', 'ClearErrors',
+    'FileWriteUTF16LE /BOM $4 "$3"', '${IfNot} ${Errors}', 'StrCpy $BirdNoteKept 1', '${EndIf}', 'FileClose $4', '${EndIf}');
+  assert.equal(lines.filter(line => line.startsWith('FileOpen ')).length, 2, 'every open file is closed: two opens');
+  assert.equal(lines.filter(line => line === 'FileClose $4').length, 2, 'every open file is closed: two closes');
+  run('a finished run records no stop code', '!macro BirdNoteDone', 'StrCpy $BirdNoteCode ""', '!insertmacro BirdNoteCall', '!macroend');
+  run('a finished run writes the done text', '${If} $BirdNoteCode == ""', 'StrCpy $3 "$3$(birdNoteDone)"', '${Else}', 'StrCpy $3 "$3$BirdNotePhase · TB-$BirdNoteCode"', '${EndIf}');
+}
+
+test('setup notes append, rotate, refuse links, close their files and record finished runs', async () => {
+  const [notes] = await templates('installer-notes.nsh');
+  checkSetupNotes(notes);
+  const edit = (from, to, nth = 0) => {
+    let at = -1;
+    for (let i = 0; i <= nth; i++) { at = notes.indexOf(from, at + 1); assert.ok(at >= 0, `mutation source missing: ${from}`); }
+    return notes.slice(0, at) + to + notes.slice(at + from.length);
+  };
+  // The six edits the review found passing, plus the neighbouring ones.
+  const broken = [
+    ['FileSeek END removed: mode a writes at offset 0', edit('    FileSeek $4 0 END\n', ''), 'appended at the end'],
+    ['note file link check never true', edit('  ${AndIf} $5 <> 0\n', '  ${AndIf} $5 = 0x7FFF\n'), 'BIRDNOTESFILE is a plain file'],
+    ['previous file link check never true', edit('  ${AndIf} $5 <> 0\n', '  ${AndIf} $5 = 0x7FFF\n', 1), 'BIRDNOTESPREVIOUS is a plain file'],
+    ['folder junction check never true', edit('  ${OrIf} $5 <> 0x10\n', '  ${OrIf} $5 = 0x7FFF\n'), 'folder is a plain directory'],
+    ['count never grows: never rotates', edit('      IntOp $5 $5 + 1\n', '      IntOp $5 $5 + 0\n'), 'a full file rotates'],
+    ['count loop stops at once', edit('    ${LoopUntil} $5 >= ${BIRDNOTESMAX}\n', '    ${LoopUntil} $5 >= 0\n'), 'a full file rotates'],
+    ['rotation threshold unreachable', edit('  ${If} $5 >= ${BIRDNOTESMAX}\n', '  ${If} $5 > 100000\n'), 'a full file rotates'],
+    ['finished run keeps the last stop code', edit('  StrCpy $BirdNoteCode ""\n', ''), 'a finished run records no stop code'],
+    ['note file left open after writing', edit('    FileClose $4\n  ${EndIf}\n  bird_note_release:', '  ${EndIf}\n  bird_note_release:'), 'appended at the end and the file closed'],
+    ['note file left open after counting', edit('    FileClose $4\n  ${EndIf}\n  ${If} $5 >= ${BIRDNOTESMAX}', '  ${EndIf}\n  ${If} $5 >= ${BIRDNOTESMAX}'), 'a full file rotates'],
+  ];
+  for (const [label, source, property] of broken) {
+    assert.notEqual(source, notes, `${label}: mutation applied`);
+    assert.throws(() => checkSetupNotes(source), error => error instanceof assert.AssertionError && error.message.includes(property), label);
+  }
+});
