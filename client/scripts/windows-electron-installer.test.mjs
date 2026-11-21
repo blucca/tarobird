@@ -526,15 +526,29 @@ function checkPassiveLanguage(nsi, language) {
   const lang = nsisCode(language), code = nsisCode(nsi);
   // Only an interactive run reaches MUI's dialog macros; a /P run picks without them.
   const choose = between(lang, '!macro BirdChooseLanguage', '!macroend');
-  ordered(choose, '${If} $PassiveMode = 1', '!insertmacro BirdPassiveLanguage', '${Else}', '!ifdef __UNINSTALL__', '!insertmacro MUI_UNGETLANGUAGE', '!else', '!insertmacro MUI_LANGDLL_DISPLAY', '!endif', '${EndIf}');
-  const passive = between(lang, '!macro BirdPassiveLanguage', '!macroend');
+  ordered(choose, '${If} $PassiveMode = 1', '!insertmacro BirdPassiveLanguage\n', '${Else}', '!ifdef __UNINSTALL__', '!insertmacro MUI_UNGETLANGUAGE', '!else', '!insertmacro MUI_LANGDLL_DISPLAY', '!endif', '${EndIf}');
+  const passive = between(lang, '!macro BirdPassiveLanguage\n', '!macroend');
   assert.doesNotMatch(passive, /LangDLL|LANGDLL_DISPLAY|UNGETLANGUAGE|MessageBox|nsDialogs|Abort|Quit/, 'a /P run never shows a dialog or stops');
-  // It reads the value MUI saves, uses it only if it is one of this setup's languages, and keeps $0.
-  ordered(passive, 'Push $0', 'ReadRegStr $0 ${MUI_LANGDLL_REGISTRY_ROOT} "${MUI_LANGDLL_REGISTRY_KEY}" "${MUI_LANGDLL_REGISTRY_VALUENAME}"', 'StrCpy $LANGUAGE $0', '${EndIf}', 'Pop $0');
+  // It reads the value MUI saves and the real Windows display language, picks, and keeps $0/$1.
+  ordered(passive, 'Push $0', 'Push $1', 'ClearErrors', 'ReadRegStr $1 ${MUI_LANGDLL_REGISTRY_ROOT} "${MUI_LANGDLL_REGISTRY_KEY}" "${MUI_LANGDLL_REGISTRY_VALUENAME}"',
+    '${If} ${Errors}', 'StrCpy $BirdLanguageFound 0', '${Else}', 'StrCpy $BirdLanguageFound 1', 'StrCpy $BirdLanguageValue $1',
+    "System::Call 'kernel32::GetUserDefaultUILanguage() i .r0'", '!insertmacro BirdPassiveLanguagePick', '${If} $0 != $1', 'StrCpy $BirdLanguageRestore 1', '${EndIf}', 'StrCpy $LANGUAGE $0', 'Pop $1', 'Pop $0');
   assert.equal(passive.match(/StrCpy \$LANGUAGE/g).length, 1);
-  const accepted = [...passive.matchAll(/\$\{(?:If|OrIf)\} \$0 == \$\{LANG_(\w+)\}/g)].map(match => match[1]).sort();
+  // A saved language of this setup wins; else Chinese (primary language 0x04) -> Simplified Chinese, anything else -> English.
+  const pick = between(lang, '!macro BirdPassiveLanguagePick', '!macroend');
+  const accepted = [...pick.matchAll(/\$\{(?:If|OrIf)\} \$1 == \$\{LANG_(\w+)\}/g)].map(match => match[1]).sort();
   const compiled = [...code.matchAll(/^!insertmacro MUI_LANGUAGE "(\w+)"$/gm)].map(match => match[1].toUpperCase()).sort();
   assert.deepEqual(accepted, compiled, 'a saved language is used only when this setup has it');
+  ordered(pick, '${If} $1 == ${LANG_', 'StrCpy $0 $1', '${Else}', 'IntOp $0 $0 & 0x3FF', '${If} $0 = 4', 'StrCpy $0 ${LANG_SIMPCHINESE}', '${Else}', 'StrCpy $0 ${LANG_ENGLISH}', '${EndIf}', '${EndIf}');
+  assert.equal(pick.match(/StrCpy \$0 /g).length, 3);
+  assert.doesNotMatch(pick, /\$LANGUAGE|ReadReg|WriteReg|System::/, 'the pick only maps its two inputs, so a probe can drive it');
+  // A /P run leaves the saved language as it found it: it never saves a language nobody chose.
+  const keep = between(lang, '!macro BirdKeepSavedLanguage', '!macroend');
+  ordered(keep, '${If} $BirdLanguageRestore = 1', '${If} $BirdLanguageFound = 1',
+    'WriteRegStr ${MUI_LANGDLL_REGISTRY_ROOT} "${MUI_LANGDLL_REGISTRY_KEY}" "${MUI_LANGDLL_REGISTRY_VALUENAME}" $BirdLanguageValue', '${Else}',
+    'DeleteRegValue ${MUI_LANGDLL_REGISTRY_ROOT} "${MUI_LANGDLL_REGISTRY_KEY}" "${MUI_LANGDLL_REGISTRY_VALUENAME}"', '${EndIf}', '${EndIf}');
+  assert.match(between(code, 'Function .onInstSuccess', 'FunctionEnd'), /^\s*!insertmacro BirdKeepSavedLanguage$/m, 'after MUI saved the language');
+  assert.equal(code.match(/BirdKeepSavedLanguage/g).length, 1);
   assert.match(code, /^!define MUI_LANGDLL_REGISTRY_VALUENAME "Installer Language"$/m);
   ordered(code, '!insertmacro MUI_LANGUAGE "English"', '!include "installer-language.nsh"', 'Function .onInit');
   // Each program reads /P (and /UPDATE) before choosing, and has no other language dialog.
@@ -547,20 +561,26 @@ function checkPassiveLanguage(nsi, language) {
   assert.equal(code.match(/MUI_LANGDLL_DISPLAY|MUI_UNGETLANGUAGE|LangDLL::/g), null, 'no other language dialog in installer.nsi');
 }
 
-test('a /P run never stops at the language dialog; interactive runs keep it and reuse a saved language', async () => {
+test('a /P run never stops at the language dialog, never saves a language nobody chose; interactive runs keep MUI', async () => {
   const [nsi, language] = await templates('installer.nsi', 'installer-language.nsh');
   checkPassiveLanguage(nsi, language);
-  // Negative: the cfbf8f0 shapes that blocked, and nearby regressions, are rejected.
+  // Negative: the cfbf8f0 and 8a86382 shapes, and nearby regressions, are rejected.
   const onInit = between(nsi, 'Function .onInit\n', 'FunctionEnd'), unInit = between(nsi, 'Function un.onInit\n', 'FunctionEnd');
   const swap = (body, edit) => nsi.replace(body, edit(body));
   const baselineUnInit = body => body.replace('  !insertmacro BirdChooseLanguage\n', '').replace('  ${GetOptions} $CMDLINE "/P"', '  !insertmacro MUI_UNGETLANGUAGE\n\n  ${GetOptions} $CMDLINE "/P"');
+  const pick = between(language, '!macro BirdPassiveLanguagePick', '!macroend');
   const broken = {
     'installer always shows the dialog (cfbf8f0)': [swap(onInit, body => body.replace('!insertmacro BirdChooseLanguage', '!insertmacro MUI_LANGDLL_DISPLAY')), language],
     'uninstaller reads the language before /P (cfbf8f0)': [swap(unInit, baselineUnInit), language],
     'uninstaller chooses before /P': [swap(unInit, body => body.replace('  !insertmacro BirdChooseLanguage\n', '').replace('  ${GetOptions} $CMDLINE "/P"', '  !insertmacro BirdChooseLanguage\n  ${GetOptions} $CMDLINE "/P"')), language],
     'passive branch shows the dialog': [nsi, language.replace('    !insertmacro BirdPassiveLanguage\n', '    !insertmacro MUI_LANGDLL_DISPLAY\n')],
-    'any saved value is trusted': [nsi, language.replace(/  \$\{If\} \$0 == \$\{LANG_SIMPCHINESE\}\n  \$\{OrIf\} \$0 == \$\{LANG_ENGLISH\}\n    StrCpy \$LANGUAGE \$0\n  \$\{EndIf\}\n/, '  StrCpy $LANGUAGE $0\n')],
-    'a compiled language is not accepted': [nsi, language.replace('  ${OrIf} $0 == ${LANG_ENGLISH}\n', '')],
+    'any saved value is trusted': [nsi, language.replace(pick, pick.replace(/\$\{If\} \$1 == [\s\S]*/, 'StrCpy $0 $1\n'))],
+    'a compiled language is not accepted': [nsi, language.replace('  ${OrIf} $1 == ${LANG_ENGLISH}\n', '')],
+    'no valid saved language falls back to the first language (8a86382)': [nsi, language.replace("  System::Call 'kernel32::GetUserDefaultUILanguage() i .r0'\n  !insertmacro BirdPassiveLanguagePick\n", '')],
+    'every other language falls back to Simplified Chinese': [nsi, language.replace(pick, pick.replace('StrCpy $0 ${LANG_ENGLISH}', 'StrCpy $0 ${LANG_SIMPCHINESE}'))],
+    'the primary language is not used': [nsi, language.replace('IntOp $0 $0 & 0x3FF', 'IntOp $0 $0 + 0')],
+    'an unchosen language is saved (8a86382)': [nsi.replace(/^\s*!insertmacro BirdKeepSavedLanguage\n/m, ''), language],
+    'an unknown saved value is overwritten': [nsi, language.replace(/    WriteRegStr \$\{MUI_LANGDLL_REGISTRY_ROOT\}[^\n]*\n/, '')],
   };
   for (const [label, [candidate, candidateLanguage]] of Object.entries(broken)) {
     assert.notEqual(candidate + candidateLanguage, nsi + language, `${label}: mutation applied`);
