@@ -7,6 +7,7 @@ import { classifyFailure } from "../src/runtime/error-classification.js";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, realpath, rm as fsRm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
+import { engineTaskSnapshotSchema } from "../src/client-protocol/engine-tasks.js";
 import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7544,4 +7545,47 @@ it("serializes default instruction sync with turn startup across adapter instanc
     harness.children[0]!.server.respondPrompt(); await Promise.all([turn, sync]);
     expect(observed).toEqual(["turn rules"]); expect(synced).toBe(true);
   } finally { release(); turnAdapter.destroy(); syncAdapter.destroy(); await Promise.allSettled([turn, sync]); await rm(root, { recursive: true, force: true }); }
+});
+
+describe("Kimi background tasks in the App task list", () => {
+  const until = async (check: () => Promise<boolean>) => {
+    for (let attempt = 0; attempt < 300; attempt++) { if (await check()) return; await realDelay(10); }
+    throw new Error("condition not reached");
+  };
+  it("lists detached Kimi tasks of the live worker without native ids, paths or stop controls", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-task-list-"));
+    const harness = createHarness();
+    const adapter = new KimiAcpAdapter("kimi", { ...adapterOptions(harness), engineHomePath: root, hookRelayEnabled: true });
+    try {
+      expect(await adapter.listTasks("kimi-session-1")).toEqual({ supported: true, tasks: [] });
+      const turn = adapter.sendUserMessage("telegram-task-list", { text: "start the work", files: [], onEngineEvent: () => undefined });
+      await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+      await postKimiHook(harness, { hook_event_name: "TaskStarted", session_id: "kimi-session-1", task_id: "bash-nightly/../x", kind: "process", description: "Nightly build", detached: true });
+      await postKimiHook(harness, { hook_event_name: "TaskStarted", session_id: "kimi-session-1", task_id: "agent-review", kind: "agent", description: "Review the diff", detached: true });
+      // Foreground work stays in the transcript as a tool card, not in the task list.
+      await postKimiHook(harness, { hook_event_name: "TaskStarted", session_id: "kimi-session-1", task_id: "fg-read", kind: "process", description: "Read files", detached: false });
+      await until(async () => (await adapter.listTasks("kimi-session-1")).tasks.length === 2);
+      const snapshot = engineTaskSnapshotSchema.parse(await adapter.listTasks("kimi-session-1"));
+      expect(snapshot.supported).toBe(true);
+      expect(snapshot.tasks.map(task => [task.label, task.kind, task.mode, task.status, task.canStop])).toEqual([
+        ["Nightly build", "shell", "background", "running", false],
+        ["Review the diff", "subagent", "background", "running", false],
+      ]);
+      expect(snapshot.tasks.every(task => task.owner === "bound")).toBe(true);
+      expect(JSON.stringify(snapshot)).not.toContain("bash-nightly");
+      expect(JSON.stringify(snapshot)).not.toContain(root);
+      expect((await adapter.listTasks("kimi-session-1")).tasks.map(task => task.id)).toEqual(snapshot.tasks.map(task => task.id));
+      expect(await adapter.listTasks("another-session")).toEqual({ supported: true, tasks: [] });
+
+      harness.children[0].server.respondPrompt();
+      await turn;
+      await postKimiHook(harness, { hook_event_name: "Notification", session_id: "kimi-session-1", notification_type: "task.completed", source_kind: "background_task", source_id: "bash-nightly/../x", title: "Background process completed", body: "Nightly build completed." });
+      await until(async () => (await adapter.listTasks("kimi-session-1")).tasks.some(task => task.label === "Nightly build" && task.status === "done"));
+      const ended = engineTaskSnapshotSchema.parse(await adapter.listTasks("kimi-session-1"));
+      expect(ended.tasks.find(task => task.label === "Nightly build")).toMatchObject({ status: "done", canStop: false });
+    } finally {
+      await adapter.destroy();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
