@@ -439,6 +439,66 @@ final class ScreenClock: @unchecked Sendable {
         FileHandle.standardError.write(report); FileHandle.standardError.write(Data("\n".utf8))
         for (name, value) in expected.sorted(by: { $0.key < $1.key }) { try check(observed[name] == value, "restart_" + name) }
     }
+    static func refusal(_ manager: HubTransport, _ id: String, _ command: [String: Any]) async -> String {
+        do { _ = try await call(manager, "screenSend", ["id": id, "command": command]); return "accepted" }
+        catch { return (error as? HubNetworkError)?.code ?? String(describing: error) }
+    }
+    /** F-AND-3 (as Android's NativeScreenAudit.controlWithdrawn). Native applies a state on
+     * arrival, so a renew or input the page sent before consuming "control ended" arrives late. */
+    static func controlWithdrawn(_ fixture: ScreenFixture) async throws {
+        let log = ScreenEvents()
+        let manager = HubTransport { log.append($0) }; defer { manager.reset(destroy: true) }
+        manager.setScreenActive(true)
+        let document = try await call(manager, "document")["value"] as! String
+        var observed: [String: String] = [:]
+        let value = join(true), id = try await open(manager, log, fixture, document, value)
+        _ = try fixture.request(["action": "control-state", "id": sid(value), "active": true])
+        let granted = try await event(manager, log, id, "screen"); _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": granted["deliverySequence"]!])
+        let renew = command(value, "renew", ["leaseId": String(repeating: "L", count: 43), "challenge": String(repeating: "C", count: 43), "frameSequence": 1])
+        let input = command(value, "input", ["desktopId": "synthetic-desktop", "displayId": "synthetic", "displayRevision": 1, "leaseId": String(repeating: "L", count: 43), "sequence": 1,
+                                             "frameSequence": 1, "expiresAt": Int(Date().timeIntervalSince1970 * 1000) + 1000, "event": ["kind": "move", "x": 0.5, "y": 0.5]])
+        _ = try await call(manager, "screenSend", ["id": id, "command": command(value, "input-focus", ["enabled": true])])
+        observed["renewWhileControlling"] = await refusal(manager, id, renew)
+        // Withdrawn: native applies the state on arrival; the page has not consumed it yet.
+        _ = try fixture.request(["action": "control-state", "id": sid(value), "active": false])
+        let viewing = try await event(manager, log, id, "screen")
+        observed["lateRenewRefusedAsControlEnded"] = await refusal(manager, id, renew)
+        observed["lateInputRefusedAsControlEnded"] = await refusal(manager, id, input)
+        var malformed = renew; malformed["challenge"] = "short"
+        observed["malformedRenewStillProtocolError"] = await refusal(manager, id, malformed)
+        var foreign = input; foreign["desktopId"] = "other"
+        observed["foreignInputStillProtocolError"] = await refusal(manager, id, foreign)
+        _ = try await call(manager, "screenAck", ["id": id, "deliverySequence": viewing["deliverySequence"]!])
+        try await Task.sleep(nanoseconds: 300_000_000)
+        observed["viewingSurvivesWithdrawnControl"] = log.count(id) == 0 ? "open" : "closed"
+        var forwarded = (0, 0)
+        for _ in 0..<100 {
+            let commands = (try fixture.request(["action": "stats"])["commands"] as! [[String: Any]]).filter { $0["id"] as? String == sid(value) }.compactMap { ($0["value"] as? [String: Any])?["type"] as? String }
+            forwarded = (commands.filter { $0 == "renew" }.count, commands.filter { $0 == "input" }.count)
+            if forwarded.0 > 0 { break }; try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let commands = (try fixture.request(["action": "stats"])["commands"] as! [[String: Any]]).filter { $0["id"] as? String == sid(value) }.compactMap { ($0["value"] as? [String: Any])?["type"] as? String }
+        forwarded = (commands.filter { $0 == "renew" }.count, commands.filter { $0 == "input" }.count)
+        observed["withdrawnControlForwardsNothing"] = "renews=\(forwarded.0) inputs=\(forwarded.1)"
+        try frame(fixture, value, 1, 1); let flowing = try await packets(manager, log, id, 1)
+        if flowing.closed == nil, let packet = flowing.packets.first { try await consume(manager, id, packet) }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        observed["framesFlowAfterWithdrawnControl"] = flowing.closed == nil && log.count(id) == 0 ? "open" : "closed"
+        _ = try await call(manager, "screenClose", ["id": id]); _ = try await event(manager, log, id, "close"); try await peerClosed(fixture, value)
+        // screen_input_denied stays the controlled computer's own refusal (Accessibility, held
+        // input); a view-only session asking for control is a protocol error, as on Android.
+        let viewOnly = join(false), viewOnlyID = try await open(manager, log, fixture, document, viewOnly)
+        observed["viewOnlyControlIsProtocolError"] = await refusal(manager, viewOnlyID, command(viewOnly, "control", ["frameSequence": 1]))
+        _ = try await call(manager, "screenClose", ["id": viewOnlyID]); _ = try await event(manager, log, viewOnlyID, "close"); try await peerClosed(fixture, viewOnly)
+        let expected = ["renewWhileControlling": "accepted", "lateRenewRefusedAsControlEnded": "screen_control_ended", "lateInputRefusedAsControlEnded": "screen_control_ended",
+                        "malformedRenewStillProtocolError": "screen_command_invalid", "foreignInputStillProtocolError": "screen_command_invalid",
+                        "viewingSurvivesWithdrawnControl": "open", "withdrawnControlForwardsNothing": "renews=1 inputs=0", "framesFlowAfterWithdrawnControl": "open",
+                        "viewOnlyControlIsProtocolError": "screen_command_invalid"]
+        let report = try JSONSerialization.data(withJSONObject: ["observed": observed, "expected": expected], options: [.prettyPrinted, .sortedKeys])
+        FileHandle.standardError.write(report); FileHandle.standardError.write(Data("\n".utf8))
+        for (name, value) in expected.sorted(by: { $0.key < $1.key }) { try check(observed[name] == value, "withdrawn_" + name) }
+    }
     static func main() async throws {
         let args = CommandLine.arguments
         if ProcessInfo.processInfo.environment["SCREEN_AUDIT_FOCUS"] == "real-hub" {
@@ -454,12 +514,13 @@ final class ScreenClock: @unchecked Sendable {
             else if focus == "clock" { try await attachClock(fixture) }
             else if focus == "order" { try await attachOrder(fixture) }
             else if focus == "restart" { try await streamRestart(fixture) }
+            else if focus == "withdrawn" { try await controlWithdrawn(fixture) }
             else { throw HubNetworkError("unknown_screen_audit_focus") }
             let receipt: [String: Any] = ["surface": "Apple Foundation production source; real pinned TLS dual sockets; injected monotonic clock only", "checks": checks]
             let bytes = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys]); try bytes.write(to: URL(fileURLWithPath: args[3]))
             print(String(data: bytes, encoding: .utf8)!); return
         }
-        try await closeReasons(fixture); try await attachClock(fixture); try await attachOrder(fixture); try await streamRestart(fixture)
+        try await closeReasons(fixture); try await attachClock(fixture); try await attachOrder(fixture); try await streamRestart(fixture); try await controlWithdrawn(fixture)
         let log = ScreenEvents()
         // Event capture does not acknowledge automatically; the same delivery
         // gate used by the plugin is exercised explicitly for every event.

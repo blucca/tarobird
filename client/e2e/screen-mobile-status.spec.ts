@@ -115,8 +115,9 @@ test("a page call rejected as an Android session ends never hides why it ended",
 });
 
 // F-AND-3: control withdrawn by the Hub while a renew is on its way ends control, not the session.
-test("a renew refused because the Hub already withdrew control returns to viewing",async({page})=>{
-  await page.goto(url("android"));await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
+// Android and iOS native refuse it with the same screen_control_ended; both page paths keep viewing.
+for(const platform of ["android","ios"]) test(`a renew refused because the Hub already withdrew control returns to viewing (${platform})`,async({page})=>{
+  await page.goto(url(platform));await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
   await page.getByRole("button",{name:"开始控制",exact:true}).click();await expect(page.getByRole("button",{name:"停止控制",exact:true})).toBeVisible();
   const opens=(await log(page)).opens;await page.evaluate(()=>{(window as any).screenMobileFixture.withdrawOnRenew=true;});
   await expect.poll(async()=>(await log(page)).withdrawOnRenew,{timeout:5000}).toBe(false);

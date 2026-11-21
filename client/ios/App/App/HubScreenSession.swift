@@ -39,6 +39,11 @@ final class HubScreenSession: @unchecked Sendable {
     /// while the page still reads the old one's, so superseded packets count only against the
     /// total: one current window plus one superseded window. Same names and values as Android.
     static let BINARY_WINDOW = 3, BINARY_RETAINED = 2 * BINARY_WINDOW
+    /// A well-formed renew or input after native has seen control end (the Hub withdrew the
+    /// lease, or focus was lost): refused and never forwarded. The page may simply not have
+    /// processed that state yet, so this ends control, not the session (as on Android).
+    /// screen_input_denied stays the controlled computer's own refusal, never a local one.
+    static let controlEnded = "screen_control_ended"
     private final class Delivery {
         let bytes: Data?, size: Int, created: TimeInterval, generation: Int
         var offset = 0, notified = false
@@ -279,15 +284,16 @@ final class HubScreenSession: @unchecked Sendable {
             if !visible { fail("screen_inactive"); return }
         case "control":
             try Self.keys(command, "type sessionId generation frameSequence")
-            guard controlAllowed, visible, Self.revision(command["frameSequence"]) else { throw HubNetworkError("screen_input_denied") }
+            guard controlAllowed, visible, Self.revision(command["frameSequence"]) else { throw HubNetworkError("screen_command_invalid") }
         case "renew":
+            // Shape first: a malformed command stays a protocol error.
             try Self.keys(command, "type sessionId generation leaseId frameSequence challenge")
-            guard canControl, inputFocused, visible, Self.revision(command["frameSequence"]),
-                  let lease = command["leaseId"] as? String, Self.ticket(lease),
-                  let challenge = command["challenge"] as? String, Self.ticket(challenge) else { throw HubNetworkError("screen_input_denied") }
+            guard Self.revision(command["frameSequence"]), let lease = command["leaseId"] as? String, Self.ticket(lease),
+                  let challenge = command["challenge"] as? String, Self.ticket(challenge) else { throw HubNetworkError("screen_command_invalid") }
+            guard canControl, inputFocused, visible else { throw HubNetworkError(Self.controlEnded) }
         case "input":
-            guard canControl, inputFocused, visible else { throw HubNetworkError("screen_input_denied") }
             try validateInput(command)
+            guard canControl, inputFocused, visible else { throw HubNetworkError(Self.controlEnded) }
         case "ack":
             try Self.keys(command, "type sessionId generation frameSequence")
             guard Self.revision(command["frameSequence"]) else { throw HubNetworkError("screen_command_invalid") }

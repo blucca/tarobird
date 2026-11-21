@@ -59,6 +59,8 @@ it("a Windows target has its own sentence wherever the usual one names a Mac or 
 it("the target decides the sentence; an unknown reason is the same bounded code for both", () => {
   expect(screenError("screen_locked", "windows")).toBe("目标电脑已锁定或正在显示安全提示，请在那台电脑上处理后重新连接。");
   expect(screenError("screen_locked", "macos")).toBe(screenError("screen_locked"));
+  // iOS native's malformed-command codes read as a protocol mismatch, never as the target's Accessibility refusal.
+  for (const code of ["screen_command_invalid", "screen_scope_invalid"]) { expect(screenError(code)).toBe(screenError("screen_protocol_invalid")); expect(screenError(code)).not.toBe(screenError("screen_input_denied")); }
   // Refused input is explained without claiming which of the possible causes it was.
   expect(screenError("screen_input_denied", "windows")).toBe("目标电脑没有接受远程输入，控制已停止。以管理员身份运行的窗口和安全提示不能被远程控制。");
   // A reason that names no target reads the same for both.
