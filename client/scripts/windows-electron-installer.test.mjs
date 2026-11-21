@@ -421,10 +421,12 @@ test('a rerun after a partial uninstall skips only notification cleanup an earli
   // A missing program is never executed, and an unproven state stops without a futile retry.
   assert.doesNotMatch(notice.slice(notice.indexOf('${ElseIf} $R0 ==')), /ExecWait|bird_notice_retry/);
   const section = nsi.split('Section Uninstall')[1];
-  ordered(section, '!insertmacro NSIS_HOOK_PREUNINSTALL', 'CheckIfAppIsRunning', '${If} $TaroBotNoticesCleared = 1',
-    'WriteRegStr SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}" "1"', '!insertmacro BirdDeleteOwnedFile');
-  // The program is the first file removed, so the marker only ever describes an App that can no longer run.
+  // The program is the first file removed, and the marker is written only once it is gone (review N1):
+  // a cancelled removal leaves a runnable App and no marker; any later stop finds both gone and marked.
+  ordered(section, '!insertmacro NSIS_HOOK_PREUNINSTALL', 'CheckIfAppIsRunning', '!insertmacro BirdDeleteOwnedFile "$INSTDIR\\${MAINBINARYNAME}.exe"',
+    '${If} $TaroBotNoticesCleared = 1', 'WriteRegStr SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}" "1"', '${EndIf}', '!include "${TB_RESOURCES_UNINSTALL}"');
   assert.ok(section.indexOf('!insertmacro BirdDeleteOwnedFile "$INSTDIR\\${MAINBINARYNAME}.exe"') === section.indexOf('!insertmacro BirdDeleteOwnedFile'));
+  assert.equal(nsisCode(section).match(/TAROBOTNOTICESCLEARED\}" "1"/g).length, 1, 'one place writes the marker');
   // Any install or repair makes the App runnable again and drops the marker.
   const install = nsi.split('Section Uninstall')[0];
   ordered(install, 'WriteRegStr SHCTX "${UNINSTKEY}" "UninstallString"', 'DeleteRegValue SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}"');

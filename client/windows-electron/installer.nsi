@@ -794,16 +794,18 @@ Section Uninstall
 
   !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${DISPLAYNAME}"
 
-  ; From here on the program cannot run again, so a later attempt cannot clear
-  ; notifications itself. Record that this attempt already cleared them.
-  ${If} $TaroBotNoticesCleared = 1
-    WriteRegStr SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}" "1"
-  ${EndIf}
-
   ; Delete the app directory and its content from disk
   ; The main executable goes first: until it is gone nothing else is removed,
   ; so a failed attempt either leaves a runnable App or no App at all.
   !insertmacro BirdDeleteOwnedFile "$INSTDIR\${MAINBINARYNAME}.exe"
+
+  ; Now the program cannot run again, so a later attempt cannot clear
+  ; notifications itself. Record that this attempt already cleared them.
+  ; Written only once the program is gone: a cancelled removal leaves a
+  ; runnable App and no record (that App clears its own notifications).
+  ${If} $TaroBotNoticesCleared = 1
+    WriteRegStr SHCTX "${UNINSTKEY}" "${TAROBOTNOTICESCLEARED}" "1"
+  ${EndIf}
 
   ; Delete resources (generated: exactly the files this version installed)
   !include "${TB_RESOURCES_UNINSTALL}"
