@@ -32,15 +32,14 @@ function mapSchemeMedia(){
   try{visitList(sheet,sheet.media);visit(sheet.cssRules)}catch{/* An unreadable sheet keeps its media. */}
  }
 }
-// A top-level element may declare data-canvas-theme="light|dark" for a design
-// drawn for one canvas. When it differs from the App scheme, the frame takes
-// that scheme's tokens (the "<name>-light|dark" entries) and color-scheme;
-// authored colours are never rewritten.
+// A design drawn for one canvas (decided below from its source) takes that
+// scheme's tokens (the "<name>-light|dark" entries) and color-scheme when it
+// differs from the App scheme; authored colours are never rewritten.
 let suppliedTheme=initialTheme,canvas='';
 const effectiveTheme=()=>{const theme=suppliedTheme??{};if(!canvas||canvas===theme.scheme)return theme;const next={...theme,scheme:canvas};for(const name of allowedTheme){const value=theme[name+'-'+canvas];if(typeof value==='string')next[name]=value}return next};
 const applyTheme=theme=>{suppliedTheme=theme;const effective=effectiveTheme();for(const name of allowedTheme){const value=effective[name];if(typeof value!=='string'||value.length>500)continue;if(name==='scheme'){suppliedScheme=value==='dark'?'dark':'light';htmlElement.style.colorScheme=suppliedScheme}else htmlElement.style.setProperty('--'+name,value)}mapSchemeMedia()};
 applyTheme(initialTheme);deviceDark.addEventListener('change',mapSchemeMedia);
-// Without a declaration, source that paints its own colours yet uses none of
+// Source that paints its own colours yet uses none of
 // the scheme-following techniques (App colour variables, light-dark(),
 // prefers-color-scheme, the tarobot:theme event) was drawn for a light canvas.
 // SVG counts as painted because its default fill is black, and so do external
@@ -61,8 +60,7 @@ const designCanvas=()=>{
  const luminance=[r,g,b].map(v=>{v/=255;return v<=.04045?v/12.92:((v+.055)/1.055)**2.4}).reduce((sum,v,i)=>sum+v*[.2126,.7152,.0722][i],0);
  return defaultCanvas=a>=.5&&luminance<.18?'dark':'light';
 };
-const declaredCanvas=()=>{const value=root.querySelector(':scope>[data-canvas-theme]')?.getAttribute('data-canvas-theme')?.trim().toLowerCase();return value==='light'||value==='dark'?value:designCanvas()};
-function refreshCanvas(){const next=declaredCanvas();if(next===canvas)return;canvas=next;applyTheme(suppliedTheme);worker?.postMessage({type:'theme',theme:effectiveTheme()})}
+function refreshCanvas(){const next=designCanvas();if(next===canvas)return;canvas=next;applyTheme(suppliedTheme);worker?.postMessage({type:'theme',theme:effectiveTheme()})}
 // IDs remain local to this opaque viewer, whose authority is captured in lexical
 // bindings. Preserve ordinary IDs such as "title"/"method" for CSS and virtual
 // DOM correspondence; frames/embedded plugins and executable attributes remain

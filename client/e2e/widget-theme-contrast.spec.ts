@@ -110,45 +110,7 @@ test('categorical colours stay distinct and readable in their three roles for ev
   } finally { await f.dispose(); }
 });
 
-for (const canvas of ['light', 'dark'] as const) test(`a declared ${canvas} canvas keeps fixed authored colours readable in every palette and mode`, async ({ page }) => {
-  test.setTimeout(300_000);
-  // Fixed colours drawn for one canvas, plus App tokens and a scripted scheme probe.
-  const ink = canvas === 'light' ? '#1f2937' : '#f3f4f6', tint = canvas === 'light' ? 'rgba(59,130,246,.12)' : 'rgba(96,165,250,.16)';
-  const html = `<style>.fixed{color:${ink}}.tint{background:${tint};padding:8px;border-radius:8px}@media (prefers-color-scheme: dark){.mq{color:#e5e7eb}}@media (prefers-color-scheme: light){.mq{color:#374151}}</style>
-<section data-canvas-theme="${canvas}"><p id="fixed" class="fixed">作者写死的颜色</p><div class="tint"><b id="tinted" class="fixed" style="font-size:1.4rem">53.8 万</b></div>
-<p id="themed">主题正文</p><p id="themed-muted" class="muted">主题次要</p><p id="mq" class="mq">媒体查询</p><b id="cat-ink" style="color:var(--cat-2-ink)">分类文字</b><i id="cat-fill" style="display:inline-block;width:40px;height:10px;background:var(--cat-2)"></i>
-<button id="primary" class="primary">应用</button><span id="worker-scheme">pending</span></section>
-<script>document.getElementById("worker-scheme").textContent=matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";</script>`;
-  const targets: ContrastTarget[] = [{ id: 'fixed', kind: 'text' }, { id: 'tinted', kind: 'large' }, { id: 'themed', kind: 'text' }, { id: 'themed-muted', kind: 'text' }, { id: 'mq', kind: 'text' }, { id: 'cat-ink', kind: 'text' }, { id: 'primary', kind: 'text' }, { id: 'cat-fill', kind: 'graphic', paint: 'background' }];
-  const f = await fixture(page, html);
-  try {
-    await expect(guest(page).locator('#worker-scheme')).toHaveText(canvas);
-    const failures: string[] = [];
-    for (const { palette, theme, device } of combinations) {
-      await page.emulateMedia({ colorScheme: device });
-      await page.evaluate(({ palette, theme }) => Object.assign(document.documentElement.dataset, { palette, theme: palette === 'cli' ? 'dark' : theme }), { palette, theme });
-      await page.waitForTimeout(100);
-      await expect.poll(() => guest(page).locator('html').evaluate(node => getComputedStyle(node).colorScheme)).toBe(canvas);
-      for (const result of await guest(page).locator('#report-root').evaluate(measureContrast, targets))
-        if (result.ratio < minimum[result.kind]) failures.push(`${palette}/${theme}/device-${device} ${result.id} ${result.fg} on ${result.bg} = ${result.ratio}`);
-    }
-    expect(failures).toEqual([]);
-    await expect(guest(page).locator('#worker-scheme')).toHaveText(canvas);
-  } finally { await f.dispose(); }
-});
-
-test('undeclared widgets keep the App scheme', async ({ page }) => {
-  const f = await fixture(page, '<section><p id="x">正文</p><div data-canvas-theme="light">只有最外层声明生效</div></section><p data-canvas-theme="sepia">无效值</p>');
-  try {
-    await expect(guest(page).locator('#x')).toBeVisible();
-    for (const scheme of ['light', 'dark'] as const) {
-      await page.evaluate(scheme => Object.assign(document.documentElement.dataset, { palette: 'mono', theme: scheme }), scheme);
-      await expect.poll(() => guest(page).locator('html').evaluate(node => getComputedStyle(node).colorScheme)).toBe(scheme);
-    }
-  } finally { await f.dispose(); }
-});
-
-// Without a declaration: own colours and no scheme-following technique mean a
+// Own colours and no scheme-following technique mean a
 // light-canvas design; colourless or theme-aware source follows the App.
 const defaults = [
   { name: 'fixed light design', canvas: 'light' as const, html: '<style>.fixed{color:#1f2937}.tint{background:rgba(59,130,246,.12);padding:8px}</style><section><p id="fixed" class="fixed">写死的深色字</p><div class="tint"><b id="tinted" class="fixed" style="font-size:1.4rem">53.8 万</b></div><svg viewBox="0 0 200 24" width="200" height="24"><text id="svg-default" x="2" y="18">SVG 默认填充</text></svg><span id="named" style="color:black">命名颜色</span></section>', targets: [{ id: 'fixed', kind: 'text' }, { id: 'tinted', kind: 'large' }, { id: 'svg-default', kind: 'text' }, { id: 'named', kind: 'text' }] as ContrastTarget[] },
@@ -156,7 +118,7 @@ const defaults = [
   { name: 'colourless', canvas: undefined, html: '<section><p id="plain">只用继承的文字颜色</p><div class="card"><span id="plain-muted" class="muted">内置类</span></div></section>', targets: [{ id: 'plain', kind: 'text' }, { id: 'plain-muted', kind: 'text' }] as ContrastTarget[] },
   { name: 'theme-aware', canvas: undefined, html: '<section style="border:1px solid var(--border)"><p id="aware" style="color:var(--text)">用了主题变量</p><b id="aware-cat" style="color:var(--cat-3-ink)">分类</b></section>', targets: [{ id: 'aware', kind: 'text' }, { id: 'aware-cat', kind: 'text' }] as ContrastTarget[] },
 ];
-for (const widget of defaults) test(`an undeclared ${widget.name} widget ${widget.canvas ? 'gets a light canvas' : 'follows the App'} and stays readable in every palette and mode`, async ({ page }) => {
+for (const widget of defaults) test(`a ${widget.name} widget ${widget.canvas ? 'gets a light canvas' : 'follows the App'} and stays readable in every palette and mode`, async ({ page }) => {
   test.setTimeout(300_000);
   const f = await fixture(page, widget.html);
   try {

@@ -7,11 +7,11 @@ export const WIDGET_CSP = "default-src 'none'; script-src 'nonce-WIDGET_NONCE' '
 export const WIDGET_NETWORK_CSP = "default-src 'none'; script-src 'nonce-WIDGET_NONCE' 'unsafe-eval'; worker-src blob:; style-src 'unsafe-inline' https:; img-src data: https:; media-src https:; font-src data: https:; connect-src https: wss:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 export type WidgetTheme = Record<string, string>;
 // Categorical data colours (--cat-N graphics, -ink text, -soft tint) plus the
-// palette's light and dark sets. A widget that declares data-canvas-theme gets
-// that scheme's set even when the App currently uses the other one.
+// palette's light and dark sets. A widget drawn for a fixed canvas gets that
+// scheme's set even when the App currently uses the other one.
 const dataTokens: Record<string, string> = Object.fromEntries([1, 2, 3, 4, 5, 6, 7, 8].flatMap(index => ["", "-ink", "-soft"].flatMap(role => ["", "-light", "-dark"].map(scheme => [`cat-${index}${role}${scheme}`, `--cat-${index}${role}${scheme}`])))
   .concat([1, 2, 3, 4].flatMap(index => ["-light", "-dark"].map(scheme => [`chart-series-${index}${scheme}`, `--chart-series-${index}${scheme}`]))));
-// Neutral canvases (Monochrome's own values) for a declared scheme that differs
+// Neutral canvases (Monochrome's own values) for a fixed-canvas scheme that differs
 // from the App's; the palette's matching tokens are used when the schemes agree.
 const canvasTokens: Record<string, string> = Object.fromEntries(Object.entries({
   light: { text: "#171717", muted: "#666666", surface: "#ffffff", card: "#f2f2f2", border: "#e4e4e4", accent: "#2b4f8e", "accent-soft": "#ebeef5", "primary-bg": "#171717", "on-primary": "#ffffff", ok: "#1d7a45", warn: "#9a5800", danger: "#c1353b" },

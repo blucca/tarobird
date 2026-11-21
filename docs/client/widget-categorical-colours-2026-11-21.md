@@ -1,4 +1,4 @@
-# Categorical widget colours and declared canvases
+# Categorical widget colours and default canvases
 
 The on-demand widget guidance used to steer authors towards one accent plus
 greys ("reserve saturated colour", "emphasize one leading finding", "mute the
@@ -20,7 +20,7 @@ each with a light and a dark set and three roles:
 
 Three value sets are used: a standard set (white palettes, Sage, Ocean), a
 lower-chroma set for Monochrome and a brighter terminal set for CLI's dark
-mode. CLI's light set only serves a declared light canvas. Each palette leads
+mode. CLI's light set only serves light-canvas widgets. Each palette leads
 with its own hue while the first two slots stay one cool and one warm. Soft
 tints are mixed into the palette's reading surface. App chrome, chat and
 semantic status colours do not use these tokens. `--chart-series-1..4` are
@@ -29,14 +29,6 @@ unchanged.
 `widgetTheme` passes the current roles plus the palette's `-light`/`-dark`
 sets and neutral light/dark canvas tokens (Monochrome's own values).
 
-A widget whose outermost element declares `data-canvas-theme="light"` or
-`"dark"` is shown on that canvas in every App theme: when the declaration
-differs from the App scheme, the viewer applies that scheme's tokens and
-`color-scheme`, and the Worker receives the same effective theme (so
-`matchMedia('(prefers-color-scheme: dark)')`, `light-dark()` and authored
-`@media (prefers-color-scheme)` agree). Authored colours are never rewritten.
-Nested or unknown values are ignored.
-
 Monochrome's `--chart-series-1..4` (used by App reports and older widgets) now
 point at its first four categorical hues in both modes; a Monochrome accent
 sets only the data emphasis (report headline metric, timeline nodes, data
@@ -44,7 +36,7 @@ widget accent and primary action). Other palettes' series are unchanged.
 
 ### Default canvas
 
-Without a declaration the viewer decides once from the widget source:
+The viewer decides the canvas once from the widget source:
 
 1. Source that mentions an App colour variable (`--text` … `--cat-N-soft`,
    `--chart-series-N`), `light-dark()`, `prefers-color-scheme` or the
@@ -57,7 +49,7 @@ Without a declaration the viewer decides once from the widget source:
    the App.
 
 Known limits: a design drawn for dark with a transparent background and light
-text gets a light canvas unless it declares `data-canvas-theme="dark"`; a
+text gets a light canvas; a
 design that mixes App variables with fixed dark text follows the App and can
 be hard to read in dark themes.
 
@@ -75,12 +67,12 @@ Usage, layout, colour, interaction and data-presentation advice was removed.
   definition changes. The headless CLI shares the guidance; no new command.
 - Older clients do not define `--cat-*`; widgets that rely on them lose those
   fills there. Historical widgets keep their own colours; a hardcoded
-  light-canvas widget becomes readable only if it declares a canvas.
+  light-canvas widget gets a light canvas on updated clients.
 - Physical devices and WebKit were not part of this verification.
 
 ## Verification
 
 `client/e2e/widget-theme-contrast.spec.ts` renders in Chromium for every
 palette × saved theme × device preference: built-in classes and theme tokens,
-the three categorical roles with eight distinct hues, and declared light and
-dark canvases with fixed authored colours and a scripted scheme probe.
+the three categorical roles with eight distinct hues, and fixed light and dark
+designs, colourless and theme-aware widgets under the default canvas rule.
