@@ -41,7 +41,7 @@ const EXPORT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
  * before the upgrade, which a fresh disposable machine does not have. */
 export const SCOPES = Object.freeze({
   install: ['install/installer-exit', 'install/install-location', 'install/uninstall-key', 'install/host-runtime', 'install/deep-link',
-    'install/start-menu-shortcut', 'install/notification-receipt', 'install/notification-aumid', 'first-launch/app-running',
+    'install/start-menu-shortcut', 'install/notification-receipt', 'install/shortcut-appusermodel-id', 'install/notification-aumid', 'first-launch/app-running',
     'first-launch/profile-marker', 'first-launch/stop-own-processes', 'uninstall/uninstaller-exit', 'uninstall/program-removed',
     'uninstall/uninstall-key-removed', 'uninstall/deep-link-removed', 'uninstall/data-retained'],
   upgrade: ['legacy/installer-exit', 'legacy/tauri-layout', 'legacy/seed-login-item', 'legacy/legacy-webview2-profile', 'legacy/stop-own-processes',
@@ -195,21 +195,27 @@ async function verifyElectron(sys, report, phase, directory, version) {
   let receiptPath;
   try { receiptPath = JSON.parse(await sys.readFile(receipt)); } catch { /* reported below */ }
   report.expect(phase, 'notification-receipt', !!shortcut && typeof receiptPath === 'string' && same(receiptPath, shortcut), `${receipt} → ${receiptPath ?? 'missing'}`);
-  const apps = (await sys.powershell(`Get-StartApps | Where-Object { $_.AppID -eq '${AUMID}' } | ForEach-Object { $_.AppID }`)).stdout.trim();
-  report.expect(phase, 'notification-aumid', apps.split(/\r?\n/).includes(AUMID), apps || `no Start app with AppID ${AUMID}`);
-  // Diagnostic only, never judged (the check above is unchanged): the AppID the
-  // shortcut itself carries, and what Start lists for TaroBird now and ~30 s
-  // later, tell a shortcut without the AppUserModelID (product) from a Start
-  // apps list that has not indexed it yet (runner). Read-only.
-  if (shortcut) {
-    const q = value => value.replaceAll("'", "''");
-    const property = (await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${q(path.win32.dirname(shortcut))}').ParseName('${q(path.win32.basename(shortcut))}'); [string]$i.ExtendedProperty('System.AppUserModel.ID')`)).stdout.trim();
-    report.info(phase, 'diag:shortcut-appusermodel-id', property || 'no System.AppUserModel.ID on the shortcut');
-    const listed = async () => (await sys.powershell(`Get-StartApps | Where-Object { $_.Name -like '*TaroBird*' -or $_.Name -like '*TaroBot*' -or $_.AppID -like '*tarobot*' -or $_.AppID -like '*tarocub*' } | ForEach-Object { "$($_.Name) = $($_.AppID)" }`)).stdout.trim() || 'none';
-    report.info(phase, 'diag:start-apps-now', await listed());
-    await sys.sleep(30_000);
-    report.info(phase, 'diag:start-apps-after-30s', await listed());
+  // Two separate facts. The shortcut itself must carry the AppUserModelID the
+  // installer writes (utils.nsh SetLnkAppUserModelId): a wrong or missing value
+  // is a product defect. Start's app list is built asynchronously, so it is
+  // polled up to 60 s with every read recorded; a correct shortcut that Start
+  // still does not list is reported as environment pending (a skip), not a pass.
+  const q = value => value.replaceAll("'", "''");
+  const shortcutAppId = shortcut ? (await sys.powershell(`$i = (New-Object -ComObject Shell.Application).Namespace('${q(path.win32.dirname(shortcut))}').ParseName('${q(path.win32.basename(shortcut))}'); [string]$i.ExtendedProperty('System.AppUserModel.ID')`)).stdout.trim() : '';
+  report.expect(phase, 'shortcut-appusermodel-id', !!shortcut && shortcutAppId === AUMID, shortcut ? `${shortcut}: System.AppUserModel.ID=${shortcutAppId || 'none'}` : 'no Start Menu shortcut');
+  const polls = [];
+  let listed = false;
+  for (let waited = 0; ; waited += 5000) {
+    const apps = (await sys.powershell(`Get-StartApps | Where-Object { $_.AppID -eq '${AUMID}' -or $_.Name -like '*TaroBird*' } | ForEach-Object { "$($_.Name)=$($_.AppID)" }`)).stdout.trim();
+    listed = apps.split(/\r?\n/).some(line => line.endsWith(`=${AUMID}`));
+    polls.push(`${waited / 1000}s:${listed ? 'listed' : 'absent'}${apps ? ` [${apps.replaceAll(/\r?\n/g, '; ')}]` : ''}`);
+    if (listed || waited >= 60_000) break;
+    await sys.sleep(5000);
   }
+  const trail = `polls ${polls.join(', ')}`;
+  if (listed) report.expect(phase, 'notification-aumid', true, trail);
+  else if (shortcutAppId === AUMID) report.add(phase, 'notification-aumid', 'skip', `Start did not list ${AUMID} within 60 s although the shortcut carries it: index not shown (environment pending, not a pass); ${trail}`);
+  else report.expect(phase, 'notification-aumid', false, `no Start app with AppID ${AUMID}; the shortcut carries ${shortcutAppId || 'no AppID'}; ${trail}`);
 }
 
 /** Read-only by default: never register the production AUMID before App first
