@@ -3,6 +3,9 @@ export const DESKTOP_CONTROLLER_CAPABILITIES = ["desktop-controller-challenge", 
 const SAFE_RESTART_CAPABILITIES = ["drain", "drain-renew", "drain-cancel", "drained-stop"] as const;
 export type DesktopRuntimePolicy = "current" | "upgrade" | "update_required" | "restart_required";
 export type DesktopRuntimeIssue = "runtime_update_required" | "runtime_restart_required" | "runtime_waiting" | "runtime_recovery_failed";
+/** Why an explicit desktop start did not start the host (issue #63). Values
+ * only, never paths or raw error text. The database was not opened. */
+export type DesktopStartIssue = { code: "schema_incompatible"; schema: number; minHubSchema: number; maxHubSchema: number };
 type RunningRuntime = { version?: string; controlCapabilities?: readonly string[]; drained?: boolean };
 
 export function desktopControllerSupported(status: RunningRuntime): boolean {

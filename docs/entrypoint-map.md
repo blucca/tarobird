@@ -534,6 +534,23 @@ CLI boundaries, pending native acceptance and verification limits. Regressions:
 `local-controller-recovery`, `local-host-recovery`, native error diagnostics,
 browser `native-transport`, root/client builds and translation checks.
 
+## Explicitly stopped local Host (#63)
+
+`desktop-host stop` (for example `tarobot stop`) writes `desktop-enabled=false`
+for an App-managed Host; automatic `resume` never re-enables it (it only reports
+a Hub that is nevertheless running). The explicit start is the same native
+`desktop_host` `start` as first launch: the App offers it as "Start local host"
+in the stopped notice, beside this desktop's own entry on the devices page and,
+when it is the coordinator, in the network status. `tarobot start` uses the same
+`desktopHost("start")`. An older database is upgraded by the Hub on that start,
+exactly as after an App upgrade; for a desktop-managed host (no OS service)
+`tarobot start` no longer refuses it or points to a standalone runtime. A
+database from a newer schema is refused with `startIssue: schema_incompatible`
+before any Hub starts. Hosts run by an OS service manager keep requiring
+`update stage/apply` for an upgrade. Regressions: `desktop-host-reenable`,
+`host-cli-start-migration`, `local-host-start`, browser `local-host-start`,
+`local-host-start-network`.
+
 ## Windows physical Host directory admission
 
 `host-cli/windows-state-admission.ts` owns the shared physical-view and package-context gate for desktop, CLI, initialization and service/runtime handoff. `host-launcher/src/storage_probe.rs` is the read-only native probe, also reused by native desktop/reset entry points. `hub/cli.ts` holds the path admission lease, and `hub/server.ts` holds the identity lease for the lifetime of the Hub. `host-cli/directory-recovery.ts` owns read-only recovery plan/hash verification; it does not migrate or merge state. `local-controller.ts` reuses native proof at boot and recovery, while `HostApp.tsx` publishes verified pool state and scoped diagnostics.

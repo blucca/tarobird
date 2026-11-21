@@ -28,7 +28,7 @@ import { z } from "zod";
 import { exists, resolveHostDirectory } from "./paths.js";
 import { initializeHost, requireInitialized, readHostProfile } from "./setup.js";
 import { inspectHost, inspectEngines } from "./doctor.js";
-import { desktopHost } from "../hub/desktop.js";
+import { desktopHost, type DesktopStartIssue } from "../hub/desktop.js";
 import { hubServiceCommand, inspectHubService } from "../hub/service.js";
 import { assertHostSupervisor, assertWindowsHostLauncher, enableManagedServiceOnLogin, installManagedService, managedServiceStatus, reassertManagedServiceIntent, refreshManagedServiceRuntime, uninstallManagedService } from "./service-manager.js";
 import { LocalHostClient, resetCliController } from "./client.js";
@@ -481,11 +481,14 @@ export async function runHostCli(argv: string[]): Promise<void> {
     try { return await waitForHostIdle(directory, waitMs, abort.signal); }
     catch (error) { if (abort.signal.aborted && error instanceof Error) Object.assign(error, { exitCode: 130 }); throw error; }
   };
-  const startCompatible = async () => {
+  const startCompatible = async (explicitStart = false) => {
     const selected = await resolveHostRuntime(directory, entrypoint);
     await assertWindowsRuntimeAdmission(selected.entrypoint);
-    // Only an explicitly selected, snapshotted update may migrate state.
-    await assertHostRuntimeCompatible(directory, selected.entrypoint, { allowMigration: !!selected.revisionId });
+    // Only an explicitly selected, snapshotted update may migrate state, or an
+    // explicit start of a desktop-managed host (no OS service): its Hub then
+    // upgrades the database as on an App upgrade, without switching runtimes.
+    const desktopManaged = explicitStart && !(await managedServiceStatus(directory)).configured;
+    await assertHostRuntimeCompatible(directory, selected.entrypoint, { allowMigration: !!selected.revisionId || desktopManaged });
     return selected;
   };
   const start = async () => {
@@ -493,7 +496,16 @@ export async function runHostCli(argv: string[]): Promise<void> {
     // older CLI must not disrupt a healthy host started by a newer desktop.
     let result = await desktopHost("status", directory, entrypoint);
     if (result.running && ("draining" in result && result.draining || "drainId" in result && result.drainId)) throw new Error("主机正在收尾或退出，请稍后执行 status 检查；未启动第二个主机。");
-    if (!result.running) { await startCompatible(); result = await desktopHost("start", directory, entrypoint); }
+    if (!result.running) {
+      await startCompatible(true);
+      result = await desktopHost("start", directory, entrypoint).catch((error: unknown) => {
+        // The Hub was started but never answered; its log has the reason.
+        if (error instanceof Error && error.message.startsWith("Hub did not become ready")) throw new Error("主机未启动：主机进程没有在 15 秒内就绪。请运行 tarobot logs 查看原因（例如端口被占用），处理后重新运行 tarobot start。", { cause: error });
+        throw error;
+      });
+      const issue = (result as { startIssue?: DesktopStartIssue }).startIssue;
+      if (issue) throw new Error(`主机未启动：数据库（schema ${issue.schema}）来自更新版本的 TaroBird，当前运行时只支持 ${issue.minHubSchema}-${issue.maxHubSchema}。数据库未修改。请先更新 TaroBird，再启动主机。`);
+    }
     try { return { ...result, cliController: { ready: true, ...await enroll() } }; }
     catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -557,7 +569,11 @@ export async function runHostCli(argv: string[]): Promise<void> {
   checkCancelled();
   if (command === "start") { await output(await start()); return; }
   if (command === "enroll") { if (v.reset) { yes(); await resetCliController(directory); } await output(await enroll()); return; }
-  if (command === "stop") { await output(await stop()); return; }
+  if (command === "stop") {
+    const result = await stop(); await output(result);
+    if (!v.json && "hostEnabled" in result && result.hostEnabled === false) console.error("主机已停用，自动恢复（包括桌面 App）不会重新启用它。需要时运行 tarobot start；使用桌面 App 时也可在 App 中点「启动本机主机」。");
+    return;
+  }
   if (command === "restart") { await startCompatible(); await stop(); checkCancelled(); await output(await start()); return; }
   if (command === "run") {
     if ((await inspectHubService(directory)).running) throw new Error("同一主机已经运行；不会启动第二个 Hub。");

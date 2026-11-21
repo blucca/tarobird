@@ -54,7 +54,7 @@ export async function assertHostRuntimeCompatible(directory: string, entrypoint:
   try { schema = await readHostSchema(directory); }
   catch (error) { if (options.allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return { minHubSchema, maxHubSchema, writeHubSchema }; throw error; }
   if (schema < minHubSchema || schema > maxHubSchema) throw new Error(`host_schema_incompatible:${schema}:runtime_${minHubSchema}-${maxHubSchema}`);
-  if (!options.allowMigration && schema !== writeHubSchema) throw new Error(`host_schema_migration_requires_update:${schema}:${writeHubSchema}。请通过 service install 或 update stage/apply 先制作恢复副本，再切换运行时。`);
+  if (!options.allowMigration && schema !== writeHubSchema) throw new Error(`host_schema_migration_requires_update:${schema}:${writeHubSchema}。桌面管理的主机请在 App 中点「启动本机主机」或运行 tarobot start，由主机自行升级数据库；已安装后台服务的主机请用 update stage/apply。`);
   return { schema, minHubSchema, maxHubSchema, writeHubSchema };
 }
 

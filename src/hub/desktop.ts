@@ -18,6 +18,7 @@ import { HubDatabase } from "./database.js";
 import { defaultHostName, HOST_PROFILE_KEY, HostProfile } from "./host-profile.js";
 import { desktopControllerProofSchema } from "./local-controller.js";
 import { isCurrentHostRuntime } from "../host-cli/foreground.js";
+import type { DesktopStartIssue } from "../client-protocol/desktop-runtime.js";
 
 const actionSchema = z.enum(["status", "start", "resume", "stop", "pair", "pair-challenge", "network", "tailscale"]);
 const startSchema = z.object({ hostName: hostNameSchema.optional() }).strict();
@@ -75,6 +76,21 @@ export async function refreshDesktopHostNetworks(directory: string, apply: (list
     }, { waitTimeoutMs: 1000 });
   } catch (error) { if (!(error instanceof FileMutexTimeoutError)) throw error; }
 }
+export type { DesktopStartIssue };
+/** Explicit start (issue #63): a database written by a newer schema than this
+ * runtime supports is reported before any Hub is started. An older one is
+ * upgraded by the Hub itself, as on any App upgrade. */
+async function explicitStartIssue(directory: string, entrypoint: string): Promise<DesktopStartIssue | undefined> {
+  if (!await stat(path.join(directory, "hub.sqlite")).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; })) return undefined;
+  const selected = await (await import("../host-cli/update.js")).resolveHostRuntime(directory, entrypoint);
+  try { await (await import("../host-cli/schema-guard.js")).assertHostRuntimeCompatible(directory, selected.entrypoint, { allowMigration: true }); }
+  catch (error) {
+    const incompatible = error instanceof Error && /^host_schema_incompatible:(\d+):runtime_(\d+)-(\d+)$/.exec(error.message);
+    if (incompatible) return { code: "schema_incompatible", schema: Number(incompatible[1]), minHubSchema: Number(incompatible[2]), maxHubSchema: Number(incompatible[3]) };
+    throw error;
+  }
+  return undefined;
+}
 /** Called by native desktop IPC and the local host CLI. No public HTTP bootstrap or
  * first-device auto-approval: owning the local OS account is the authority. */
 export interface DesktopHostNetworkHooks {
@@ -103,7 +119,14 @@ export async function desktopHost(action: string, directory: string, entrypoint:
   if (stopOptions.force && command !== "stop") throw new Error("host_force_only_explicit_stop");
   const enabledFile = path.join(directory, "desktop-enabled.json");
   if (command === "status") return { available: true, ...(directoryState === "missing" ? { directoryState } : {}), ...await inspectHubService(directory), hostName: await existingHostName(directory) };
-  if (command === "resume" && !await readFile(enabledFile).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; })) return { available: true, running: false as const, directoryState, hostEnabled: false, hostName: await existingHostName(directory) };
+  // Resume of a host without the enabled flag never starts anything; it reports
+  // a Hub that is nevertheless running (an explicit start whose Hub came up
+  // after its readiness wait, before the flag was saved).
+  const stoppedResume = async () => {
+    const live = directoryState === "missing" ? { running: false as const } : await inspectHubService(directory).catch(() => ({ running: false as const }));
+    return { available: true, ...(live.running ? live : { running: false as const }), directoryState, hostEnabled: false, hostName: await existingHostName(directory) };
+  };
+  if (command === "resume" && !await readFile(enabledFile).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; })) return stoppedResume();
   if (command === "stop") {
     if (directoryState === "missing") return { available: true, running: false as const, directoryState };
     return withFileMutex(path.join(directory, "desktop-start"), async () => {
@@ -120,10 +143,11 @@ export async function desktopHost(action: string, directory: string, entrypoint:
         if (error && typeof error === "object" && "stopRejected" in error && error.stopRejected === true) await writeFile(enabledFile, previousEnabled, { mode: 0o600 });
         throw error;
       }
-      return { available: true, ...await inspectHubService(directory), hostName: await existingHostName(directory) };
+      // Only an explicit start re-enables it (App action or `tarobot start`).
+      return { available: true, ...await inspectHubService(directory), hostEnabled: false, hostName: await existingHostName(directory) };
     });
   }
-  if (command === "resume" && (await readFile(enabledFile, "utf8")).trim() !== "true") return { available: true, running: false as const, directoryState, hostEnabled: false, hostName: await existingHostName(directory) };
+  if (command === "resume" && (await readFile(enabledFile, "utf8")).trim() !== "true") return stoppedResume();
   if (command === "start" || command === "resume") {
     // Initialize only through the shared, admitted setup path. In particular,
     // never leave a DB for a child Hub to invent an identity for.
@@ -146,6 +170,10 @@ export async function desktopHost(action: string, directory: string, entrypoint:
       // never re-enables the host. Installed OS managers own their recovery and
       // must not be rearmed by a UI timer racing a service stop/uninstall.
       if (command === "resume" && (supervised || (await readFile(enabledFile, "utf8").catch(() => "false")).trim() !== "true")) return { available: true, ...await inspectHubService(directory), hostName: await existingHostName(directory) };
+      if (command === "start" && !supervised && !(await inspectHubService(directory)).running) {
+        const startIssue = await explicitStartIssue(directory, entrypoint);
+        if (startIssue) return { available: true, running: false as const, directoryState, hostEnabled: (await readFile(enabledFile, "utf8").catch(() => "false")).trim() === "true", hostName: await existingHostName(directory), startIssue };
+      }
       const config = path.join(directory, "config.json");
       if (!await readFile(config).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; })) {
         const port = await freeDesktopPort(); let instancePort = await freeDesktopPort(); while (instancePort === port) instancePort = await freeDesktopPort();
