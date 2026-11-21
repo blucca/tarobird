@@ -84,7 +84,8 @@ try {
   wss.on('connection', ws => { aws = ws; ws.on('message', raw => { const m = JSON.parse(String(raw)); if (m.event === 'ready') { aReady(); return; } const p = pending.get(m.id); if (p) { pending.delete(m.id); m.ok ? p.resolve(m.result) : p.reject(new Error(m.error)); } }); });
   const a = (op, payload = {}, ms = 30000) => new Promise((resolve, reject) => { const id = next++; const t = setTimeout(() => { pending.delete(id); reject(new Error('a_timeout:' + op)); }, ms); pending.set(id, { resolve: v => { clearTimeout(t); resolve(v); }, reject: e => { clearTimeout(t); reject(e); } }); aws.send(JSON.stringify({ id, op, ...payload })); });
   const aChild = spawn(electronBin, [path.join(work, 'a.cjs'), '--addon', addonPath, '--host-dir', hostDir, '--app-state', path.join(work, 'a-state'), '--assets', assets, '--rpc-url', `ws://127.0.0.1:${wss.address().port}`], { stdio: ['ignore', 'pipe', 'pipe'] });
-  aChild.stdout.on('data', () => {}); aChild.stderr.on('data', () => {}); cleanups.push(async () => { try { await a('shutdown', {}, 3000); } catch {} try { aChild.kill(); } catch {} });
+  const hb = []; aChild.stdout.on('data', chunk => { for (const m of String(chunk).matchAll(/HB (\d+)/g)) { hb.push(Date.now()); if (hb.length > 20000) hb.splice(0, 10000); } });
+  const hbGap = (from, to) => { const xs = hb.filter(t => t >= from - 1000 && t <= to); let gap = 0; for (let i = 1; i < xs.length; i++) gap = Math.max(gap, xs[i] - xs[i - 1]); return { maxGapMs: gap, beats: xs.length, lastBeatAgoMs: hb.length ? Date.now() - hb.at(-1) : null }; }; aChild.stderr.on('data', () => {}); cleanups.push(async () => { try { await a('shutdown', {}, 3000); } catch {} try { aChild.kill(); } catch {} });
   await aUp;
   const aStart = await a('start', {}, 40000); globalThis.accDiag = () => a('diag', {}, 5000);
   expect('a', 'product-screen-service-registered', aStart.registered && aStart.platform === 'windows', aStart);
@@ -164,13 +165,6 @@ try {
     evs = await until(async () => { const l = await seenFrom(from); return l.some(e => e.type === 'wheel') && l; }, 4000) || await seenFrom(from);
     await snap(page, lang, 'after-wheel');
     const wh = evs.filter(e => e.type === 'wheel'); expect('input', 'wheel', wh.length > 0 && wh.every(e => near2(e, 250, 200)), { wheel: wh.slice(0, 4).map(e => [e.dx, e.dy, e.x, e.y]) });
-    // drag
-    from = await count(); const s0 = toB(ci, 100, 300), s1 = toB(ci, 300, 350);
-    await page.mouse.move(s0.x, s0.y); await page.mouse.down(); await page.mouse.move(s1.x, s1.y, { steps: 10 }); await page.mouse.up();
-    evs = await until(async () => { const l = await seenFrom(from); return l.some(e => e.type === 'mouseup') && l; }, 4000) || await seenFrom(from);
-    await snap(page, lang, 'after-drag');
-    const dn = evs.find(e => e.type === 'mousedown'), up = evs.find(e => e.type === 'mouseup'), dragMoves = evs.filter(e => e.type === 'mousemove' && e.buttons === 1);
-    expect('input', 'drag', !!dn && !!up && near2(dn, 100, 300) && near2(up, 300, 350) && dragMoves.length > 0, { down: dn && [dn.x, dn.y], up: up && [up.x, up.y], movesWithButton: dragMoves.length });
     // focus the remote textarea with a real remote click, then text with Chinese and a newline
     const ti = (await a('info')).textarea; const tx = Math.round(ti.x + ti.w / 2), ty = Math.round(ti.y + ti.h / 2);
     p = toB(ci, tx, ty); await page.mouse.click(p.x, p.y);
@@ -231,6 +225,26 @@ try {
     await grant('view'); await sleep(2500); await snap(page, lang, 'downgraded-to-view');
     await grant(null); await sleep(2500); await page.evaluate(() => (window).accRefresh()); await sleep(1000); await snap(page, lang, 'revoked');
     await bApp.close();
+  }
+  // ===== Drag, last: a hang here must not cost the other evidence =====
+  {
+    await grant('control'); const lang = 'zh', t = L(lang); const { bApp, page } = await runB(lang);
+    const btn = name => page.getByRole('button', { name: t(name), exact: true });
+    await page.evaluate(() => (window).accHarness.suppressBlur(true));
+    await btn('连接屏幕').click(); await until(async () => await btn('开始控制').isEnabled(), 20000);
+    await btn('开始控制').click(); await until(() => btn('停止控制').isVisible(), 8000);
+    const ci = await canvasInfo(page); await page.evaluate(() => document.querySelector('.remote-screen-panel canvas').focus());
+    const from = await count(), t0 = Date.now(); const s0 = toB(ci, 100, 300), s1 = toB(ci, 300, 350);
+    await page.mouse.move(s0.x, s0.y); await page.mouse.down(); await sleep(150);
+    for (let i = 1; i <= 10; i++) { await page.mouse.move(s0.x + (s1.x - s0.x) * i / 10, s0.y + (s1.y - s0.y) * i / 10); await sleep(40); }
+    await page.mouse.up(); await sleep(2500);
+    const health = hbGap(t0, Date.now());
+    let evs = null; try { evs = (await a('seen', { from }, 8000)).events; } catch (e) { evs = null; }
+    await snap(page, lang, 'after-drag');
+    if (!evs) rec('input', 'drag', 'fail', { aResponsive: false, heartbeat: health, state: texts[lang].at(-1) });
+    else { const dn = evs.find(e => e.type === 'mousedown'), up = evs.find(e => e.type === 'mouseup'), mv = evs.filter(e => e.type === 'mousemove' && e.buttons === 1);
+      expect('input', 'drag', !!dn && !!up && near2(dn, 100, 300) && near2(up, 300, 350) && mv.length > 0, { down: dn && [dn.x, dn.y], up: up && [up.x, up.y], movesWithButton: mv.length, heartbeat: health }); }
+    await bApp.close().catch(() => {});
   }
   const diag = await a('diag');
   rec('a', 'capture-and-service', 'info', diag);

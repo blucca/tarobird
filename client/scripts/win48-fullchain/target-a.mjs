@@ -72,6 +72,8 @@ async function handle(cmd) {
 }
 app.whenReady().then(() => {
   setTimeout(() => app.exit(1), 30 * 60000).unref?.();
+  // Main-thread heartbeat on stdout: the orchestrator measures gaps (a blocked main loop).
+  setInterval(() => process.stdout.write(`HB ${Date.now()}\n`), 200);
   rpc = new WebSocket(arg('rpc-url'));
   rpc.on('open', () => rpc.send(JSON.stringify({ event: 'ready' })));
   rpc.on('message', async raw => { let c; try { c = JSON.parse(String(raw)); } catch { return; }
