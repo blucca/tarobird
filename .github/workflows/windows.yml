@@ -23,7 +23,7 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 240
+    timeout-minutes: 300
     env:
       TAROBOT_SOURCE_COMMIT: ${{ github.sha }}
     outputs:
@@ -133,7 +133,7 @@ jobs:
         # Acceptance branch: run even when the unrelated packaged-host smoke
         # assertion fails, so the install/uninstall baseline is still recorded.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 35
+        timeout-minutes: 30
         shell: pwsh
         env:
           TAROBOT_WINDOWS_ACCEPTANCE: disposable
@@ -143,10 +143,11 @@ jobs:
         run: |
           $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
           if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
-          node client/scripts/windows-acceptance.mjs --confirm-disposable-windows --installer $installers[0].FullName `
-            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-acceptance.noindex" `
-            --native-tests client/src-desktop-updater --scope install,native
-          if ($LASTEXITCODE -ne 0) { throw "Windows installation or native acceptance failed; see the receipt" }
+          # Watchdog: node's output goes to files (no child can hold this step's
+          # pipes) and a hung tree is ended with a process dump (packages
+          # 44824551439 and 44863289041 hung here past the step timeout).
+          & client/scripts/acceptance-step-watchdog.ps1 -Name baseline -Minutes 25 -ArgumentLine "client/scripts/windows-acceptance.mjs --confirm-disposable-windows --installer `"$($installers[0].FullName)`" --version ${{ steps.version.outputs.version }} --report `"$env:RUNNER_TEMP/windows-acceptance.noindex`" --native-tests client/src-desktop-updater --scope install,native"
+          if ($LASTEXITCODE -ne 0) { throw "Windows installation or native acceptance failed ($LASTEXITCODE); see the receipt" }
       - name: "#50 uninstall recovery, in-place uninstall, helper backup and dialogs (acceptance only)"
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 75
@@ -156,12 +157,11 @@ jobs:
         run: |
           $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
           if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
-          node client/scripts/windows-uninstall-recovery-acceptance.mjs --confirm-disposable-windows --installer $installers[0].FullName `
-            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-uninstall-recovery.noindex" --budget-minutes 60
-          if ($LASTEXITCODE -ne 0) { throw "#50 uninstall recovery acceptance did not pass; see the receipt in the job summary" }
+          & client/scripts/acceptance-step-watchdog.ps1 -Name recovery -Minutes 70 -ArgumentLine "client/scripts/windows-uninstall-recovery-acceptance.mjs --confirm-disposable-windows --installer `"$($installers[0].FullName)`" --version ${{ steps.version.outputs.version }} --report `"$env:RUNNER_TEMP/windows-uninstall-recovery.noindex`" --budget-minutes 60"
+          if ($LASTEXITCODE -ne 0) { throw "#50 uninstall recovery acceptance did not pass ($LASTEXITCODE); see the receipt in the job summary" }
       - name: "#50 extension: C, A custom directory, D dialog text, B release upgrades incl. B-E (acceptance only)"
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 140
+        timeout-minutes: 135
         shell: pwsh
         env:
           TAROBOT_WINDOWS_ACCEPTANCE: disposable
@@ -172,9 +172,8 @@ jobs:
         run: |
           $installers = @(Get-ChildItem "$env:TAROBOT_DESKTOP_OUTPUT/*-setup.exe")
           if ($installers.Count -ne 1) { throw "Expected exactly one Windows installer" }
-          node client/scripts/windows-acceptance-extension.mjs --confirm-disposable-windows --installer $installers[0].FullName `
-            --version '${{ steps.version.outputs.version }}' --report "$env:RUNNER_TEMP/windows-extension.noindex" --groups C,A,D,B --budget-minutes 125
-          if ($LASTEXITCODE -ne 0) { throw "#50 extension acceptance did not pass; see the receipt in the job summary" }
+          & client/scripts/acceptance-step-watchdog.ps1 -Name extension -Minutes 130 -ArgumentLine "client/scripts/windows-acceptance-extension.mjs --confirm-disposable-windows --installer `"$($installers[0].FullName)`" --version ${{ steps.version.outputs.version }} --report `"$env:RUNNER_TEMP/windows-extension.noindex`" --groups C,A,D,B --budget-minutes 125"
+          if ($LASTEXITCODE -ne 0) { throw "#50 extension acceptance did not pass ($LASTEXITCODE); see the receipt in the job summary" }
       - name: Show acceptance evidence (log and summary only, no upload)
         if: always()
         shell: pwsh
