@@ -38,10 +38,10 @@ jobs:
         run: |
           choco install nsis --no-progress -y
           "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
-      - name: "Installer follow-ups probe (product 83924da147445fed7e35f3ef367911d53af2ba7e, language baseline 2e4e35e274cb6bf045dbe077bb4a018414804661, baseline 47450f7a732e2d2625b7acafc63f8d6c190a3522)"
+      - name: "Installer follow-ups probe (product 197934185864f61d9ac3bd110de871342f1c78e6, language baseline 2e4e35e274cb6bf045dbe077bb4a018414804661, baseline 47450f7a732e2d2625b7acafc63f8d6c190a3522)"
         shell: pwsh
         env:
           TAROBOT_WINDOWS_ACCEPTANCE: disposable
         run: |
-          node client/scripts/acceptance-installer-followups/run.mjs --confirm-disposable-windows --report "$env:RUNNER_TEMP\installer-followups.noindex" --product 83924da147445fed7e35f3ef367911d53af2ba7e --language-baseline 2e4e35e274cb6bf045dbe077bb4a018414804661 --baseline 47450f7a732e2d2625b7acafc63f8d6c190a3522
+          node client/scripts/acceptance-installer-followups/run.mjs --confirm-disposable-windows --report "$env:RUNNER_TEMP\installer-followups.noindex" --product 197934185864f61d9ac3bd110de871342f1c78e6 --language-baseline 2e4e35e274cb6bf045dbe077bb4a018414804661 --baseline 47450f7a732e2d2625b7acafc63f8d6c190a3522
           if ($LASTEXITCODE -ne 0) { throw "Installer follow-ups acceptance did not pass" }

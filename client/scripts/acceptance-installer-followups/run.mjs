@@ -262,6 +262,8 @@ async function layout(name, { app, helper, tauri }) {
     if (helper) await fs.copyFile(fakes.helperinst, path.join(dir, 'tarobot-installer-helper.exe'));
   }
   if (app?.leftover || tauri) { await fs.mkdir(path.join(dir, 'host'), { recursive: true }); await fs.writeFile(path.join(dir, 'host', 'node.exe'), 'MZ'); }
+  // The shape read on a real Win11 machine upgraded from Tauri: host\ holds only node-runtime.exe.
+  if (app?.runtimeOnly) { await fs.mkdir(path.join(dir, 'host'), { recursive: true }); await fs.writeFile(path.join(dir, 'host', 'node-runtime.exe'), 'MZ'); }
   return dir;
 }
 async function stopCase(label, kind, name, shape, verify) {
@@ -287,6 +289,22 @@ await stopCase('candidate', 'uninstall', 'Electron with its helper and a Tauri h
   ok: s => s.r.exited && s.r.status === 0 && !s.app && s.installed.includes('--stop-desktop-host') && s.confirmed });
 await stopCase('candidate', 'uninstall', 'real Tauri layout (host\\, no resources\\)', { tauri: true }, { label: 'the Tauri program still stops the Host',
   ok: s => s.r.exited && s.r.status === 0 && s.tauri.includes('--stop-desktop-host') && s.confirmed });
+
+// Both left-over Tauri host\ shapes: only node-runtime.exe (real machine), with and without the helper.
+const runtimeOnly = { app: { runtimeOnly: true } };
+await stopCase('baseline', 'uninstall', 'Electron + host\\ with only node-runtime.exe, no helper', runtimeOnly, { label: 'TB-HOST-NO-STOPPER already before the fix (this shape was never mistaken for Tauri)',
+  ok: s => s.r.exited && s.r.status === 2 && !s.app && s.line.includes('TB-HOST-NO-STOPPER') && !s.confirmed });
+await stopCase('candidate', 'uninstall', 'Electron + host\\ with only node-runtime.exe, no helper', runtimeOnly, { label: 'TB-HOST-NO-STOPPER before any change, Electron program never run',
+  ok: s => s.r.exited && s.r.status === 2 && !s.app && s.line.includes('TB-HOST-NO-STOPPER') && s.line.endsWith(` · TaroBird ${version}`) && !s.confirmed });
+await stopCase('candidate', 'install', 'Electron + host\\ with only node-runtime.exe, no helper', runtimeOnly, { label: 'staged helper confirms read-only, Electron program never run',
+  ok: s => s.r.exited && s.r.status === 0 && !s.app && s.helper.includes('--confirm-host-stopped-v2') && s.confirmed });
+const realMachine = { helper: true, app: { runtimeOnly: true } };
+for (const label of ['baseline', 'candidate']) {
+  await stopCase(label, 'uninstall', 'real upgraded machine (helper, resources\\, host\\ with only node-runtime.exe)', realMachine, { label: 'its helper stops the Host',
+    ok: s => s.r.exited && s.r.status === 0 && !s.app && s.installed.includes('--stop-desktop-host') && s.confirmed });
+}
+await stopCase('candidate', 'install', 'real upgraded machine (helper, resources\\, host\\ with only node-runtime.exe)', realMachine, { label: 'its helper stops the Host, no fallback needed',
+  ok: s => s.r.exited && s.r.status === 0 && !s.app && s.installed.includes('--stop-desktop-host') && !s.helper && s.confirmed });
 
 // --- Cleanup.
 reg('delete', REG_KEY, '/f');
