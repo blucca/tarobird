@@ -7,6 +7,7 @@ import { PermissionControl } from "./PermissionControl.js";
 import { PersonaControl } from "./PersonaControl.js";
 import { BotNameControl } from "./BotNameControl.js";
 import { BotMessageGrantsControl } from "./BotMessageGrantsControl.js";
+import { BotSteeringControl } from "./BotSteeringControl.js";
 import { useState, useSyncExternalStore, type RefObject } from "react";
 import type { Bot, HubConnection } from "./connection.js";
 import { AvatarEditor } from "./Avatar.js";
@@ -41,6 +42,7 @@ export function BotSettings({ connection, bot: initialBot, name: initialName, ch
     {isDispatcher(bot) && state.dispatchAvailable && <div className="details-effort"><div className="dispatcher-role-label">{t("幕僚长设置")}<DispatcherRoutingHelp key={`routing-${bot.id}`}/></div><DispatcherSettingsControl key={`dispatch-${bot.id}`} connection={connection} bot={bot} online={state.status === "online"} owner={state.user?.role === "owner"}/></div>}
     {bot.engine === "claude" && <div className="details-effort"><span>{t("Chrome 浏览器联动")}</span><ClaudeChromeControl key={`chrome-${bot.id}`} connection={connection} bot={bot} online={online} owner={state.user?.role === "owner"}/></div>}
     <BotMessageGrantsControl key={`messages-${bot.id}`} connection={connection} bot={bot} online={state.status === "online"} owner={state.user?.role === "owner"}/>
+    <BotSteeringControl key={`steering-${bot.id}`} connection={connection} bot={bot} owner={state.user?.role === "owner" && state.status === "online"}/>
     {!online && <p className="muted" role="status">{t("Bot 当前离线。连接恢复后再调整模型和思考强度。")}</p>}
     {state.user?.role !== "owner" && <p className="muted">{t("仅拥有者可修改 Bot 设置")}</p>}
     <PersonaControl key={`persona-${bot.id}`} connection={connection} bot={bot} online={online} owner={state.user?.role === "owner"}/></>}

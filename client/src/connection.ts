@@ -53,6 +53,7 @@ import { cache as legacyCache, type ClientCache, type OutboxEntry, type Identity
 import { randomNonce, signChallenge, signDeviceAction, verifyHub, verifyRevocation } from "./identity.js";
 import { boundDeviceActionStatement, deviceActionSchema } from "../../src/client-protocol/device-actions.js";
 import { botMessageGrantsCommandSchema, botMessageGrantsSnapshotSchema, type BotMessageGrantsCommand, crossHostMessageGrantsCommandSchema, crossHostMessageGrantsSnapshotSchema, type CrossHostMessageGrantsCommand } from "../../src/client-protocol/bot-message-grants.js";
+import { botMessageSteeringCommandSchema, botMessageSteeringProofPayload, botMessageSteeringSnapshotSchema, type BotMessageSteeringCommand } from "../../src/client-protocol/bot-message-delivery.js";
 import { HubHttpError } from "./http-error.js";
 /** Bound for `screenStatus` / `screenOpen` / `screenStop` only. */
 export const SCREEN_REQUEST_TIMEOUT_MS = 15_000;
@@ -1292,11 +1293,16 @@ export class HubConnection {
   async saveCrossHostMessageGrants(raw: CrossHostMessageGrantsCommand, signal?: AbortSignal, submitting?: () => void) {
     return this.duringMutation(async () => crossHostMessageGrantsSnapshotSchema.parse(await this.performMessageGrantRequest("/api/bot-messages/cross-host-grants", crossHostMessageGrantsCommandSchema.parse(raw), signal, submitting)));
   }
-  private async performMessageGrantRequest(route: string, command: BotMessageGrantsCommand | CrossHostMessageGrantsCommand, signal?: AbortSignal, submitting?: () => void) {
+  /** Receiving owner's "allow other Bots to steer this Bot" switch (issue #62). */
+  async saveBotMessageSteering(raw: BotMessageSteeringCommand, signal?: AbortSignal) {
+    const command = botMessageSteeringCommandSchema.parse(raw);
+    return this.duringMutation(async () => botMessageSteeringSnapshotSchema.parse(await this.performMessageGrantRequest("/api/bot-messages/steering", command, signal, undefined, botMessageSteeringProofPayload(command))));
+  }
+  private async performMessageGrantRequest(route: string, command: BotMessageGrantsCommand | CrossHostMessageGrantsCommand | BotMessageSteeringCommand, signal?: AbortSignal, submitting?: () => void, payload = networkCanonical(command)) {
     const token = this.token, epoch = this.httpEpoch;
     const current = () => { if (!token || this.closed || this.token !== token || this.httpEpoch !== epoch || epoch.signal.aborted || signal?.aborted) throw new HubHttpError(409, "device_action_cancelled"); };
     current();
-    const action = deviceActionSchema.parse({ operation: "bot-message-grant", target: bytesToHex(sha256(new TextEncoder().encode(networkCanonical(command)))) });
+    const action = deviceActionSchema.parse({ operation: "bot-message-grant", target: bytesToHex(sha256(new TextEncoder().encode(payload))) });
     const statement = boundDeviceActionStatement(await this.httpRequest("/api/devices/challenge", { method: "POST", body: JSON.stringify(action), signal }),
       { action, hubPublicKey: this.identity.hubPublicKey ?? "", deviceId: this.identity.deviceId, sessionHash: bytesToHex(sha256(new TextEncoder().encode(token!))) });
     current(); const signature = await signDeviceAction(this.identity, statement); current();

@@ -1,4 +1,5 @@
 import { useAndroidPackageOpen } from "./android-package-actions.js";
+import { steerFallbackReason, steerFallbackText } from "./bot-steer-delivery.js";
 import { InlineAudioControls } from "./InlineAudioControls.js";
 import { WorkbenchChartEntry } from "./WorkbenchEntry.js";
 import { nativePlatform } from "./native.js";
@@ -385,6 +386,8 @@ export const MessageContent = memo(function MessageContent({ message, connection
         if (message.authorType === "user" && queue && typeof queue === "object" && !Array.isArray(queue) && queue.state === "cancelled") {
           return <small key={i} className="prompt-queue-cancelled">{t("已取消排队，未发送给 Bot。")}</small>;
         }
+        const fallback = message.authorType === "user" && message.botSource ? steerFallbackReason(block) : undefined;
+        if (fallback) return <small key={i} className="prompt-queue-cancelled bot-steer-fallback" role="status">{steerFallbackText(fallback.reason)}</small>;
         const run = anyRun(block); return run ? <RunPresentation key={i} run={run} block={block} connection={connection} message={message} backgroundSource={backgroundSource}/> : message.authorType === "bot" && isBackgroundReport(block) ? <BackgroundReport key={i} block={block} connection={connection} message={message} source={backgroundSource}/> : <Card key={i} block={block} connection={connection} message={message} backgroundSource={backgroundSource}/>;
       }
       case "image": {

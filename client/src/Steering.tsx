@@ -6,12 +6,24 @@ import { blocksText, messageSchema, type Block, type Message } from "../../src/c
 import type { HubConnection } from "./connection.js";
 import { steerReason } from "./steering-reason.js";
 import { settleSteeringRequest } from "./steering-request.js";
+import { botSteerLabel } from "./bot-steer-delivery.js";
 export { steerReason } from "./steering-reason.js";
 import { t, useLocale } from "./i18n.js";
 
 
 export function SteeringReceipt(props: { block: Extract<Block, { type: "steering" }>; message: Message; connection: HubConnection }) {
+  // A Bot's message merged into a live reply (issue #62) is owner-authored on
+  // the Host but is not the owner's input: show its outcome, offer no action.
+  if (props.message.botSource) return <BotSteerReceipt block={props.block}/>;
   return props.block.mode === "message" ? <NativeInputReceipt {...props}/> : <LegacySteeringReceipt {...props}/>;
+}
+function BotSteerReceipt({ block }: { block: Extract<Block, { type: "steering" }> }) {
+  useLocale();
+  const dropped = block.application?.status === "dropped";
+  return <div className={`steering-receipt bot-steer-receipt ${dropped ? "rejected" : block.outcome}`} role="status">
+    {block.outcome === "accepted" && !dropped ? <Check size={13}/> : block.outcome === "pending" ? <LoaderCircle size={13} className="spin"/> : <Compass size={13}/>}
+    <span>{botSteerLabel(block)}</span>
+  </div>;
 }
 function LegacySteeringReceipt({ block, message, connection }: { block: Extract<Block, { type: "steering" }>; message: Message; connection: HubConnection }) {
   useLocale(); const [busy, setBusy] = useState(false), [error, setError] = useState("");
