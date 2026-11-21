@@ -15,6 +15,8 @@ import { JsonStore } from "../src/state/json-store.js";
 let root: string, hub: HubServer, docs: GoogleDocs, admitted: AuthSession | undefined;
 const centers: HubFileCenter[] = [];
 const spec = { requestId: "create_once", name: "Fixture", engine: "codex" as const, model: "gpt-5.5", effort: "high" as const, workspace: "" };
+// Creation reads a model list only when a check needs it; an Antigravity effort does.
+const discovering = { ...spec, engine: "antigravity" as const, model: "gemini-3.8-flash-high", effort: "high" as const };
 const barrier = () => {
   let enter!: () => void, release!: () => void;
   const waiting = new Promise<void>((r) => { enter = r; }), gate = new Promise<void>((r) => { release = r; });
@@ -25,8 +27,8 @@ beforeEach(async () => {
   const auth = new GoogleAuthorization({ client_id: "fixture" }, { read: async () => JSON.stringify({ refreshToken: "fixture" }), write: async () => {}, remove: async () => {} }, async () => Response.json({ access_token: "fixture", expires_in: 3600 }));
   docs = new GoogleDocs(auth, async () => { throw new Error("unexpected_google_request"); });
   // This authorization fixture must not discover the operator's live Antigravity
-  // service. Only the synthetic Codex executable is needed by these cases.
-  hub = await HubServer.start({ stateDir: root, managedBots: { entrypoint: path.resolve("tests/fixtures/managed-bot-worker.mjs"), env: { ...process.env, CODEX_EXECUTABLE: process.execPath, ANTIGRAVITY_EXECUTABLE: path.join(root, "no-antigravity") } }, googleDocs: async () => docs });
+  // service: a read-only fixture lists its models, and Codex is synthetic.
+  hub = await HubServer.start({ stateDir: root, managedBots: { entrypoint: path.resolve("tests/fixtures/managed-bot-worker.mjs"), env: { ...process.env, CODEX_EXECUTABLE: process.execPath, ANTIGRAVITY_EXECUTABLE: path.resolve("tests/fixtures/agy-models.mjs") } }, googleDocs: async () => docs });
   admitted = undefined;
   const authorize = hub.auth.authorize.bind(hub.auth);
   vi.spyOn(hub.auth, "authorize").mockImplementation(async (token) => { admitted = await authorize(token); return admitted; });
@@ -50,9 +52,9 @@ async function invalidate(kind: "revoke" | "demote" | "expire") {
 
 it.each(["revoke", "demote", "expire"] as const)("does not register or start a Bot after %s while discovering engines", async (kind) => {
   const session = await login(), held = barrier();
-  const catalog = BotManager.prototype.catalog;
-  vi.spyOn(BotManager.prototype, "catalog").mockImplementationOnce(async function (this: BotManager) { const value = await catalog.call(this); held.enter(); await held.gate; return value; });
-  const pending = post(session.token, "/api/bots", spec);
+  const catalog = BotManager.prototype.engineCatalog;
+  vi.spyOn(BotManager.prototype, "engineCatalog").mockImplementationOnce(async function (this: BotManager, ...args) { const value = await catalog.apply(this, args); held.enter(); await held.gate; return value; });
+  const pending = post(session.token, "/api/bots", discovering);
   try { await held.waiting; await invalidate(kind); } finally { held.release(); }
   const response = await pending;
   expect(response.status).toBe(kind === "demote" ? 403 : 401);
@@ -78,14 +80,14 @@ it("rechecks registration after preparing files and preserves the staged specifi
 
 it("rejects a second device's queued Bot creation but finishes the trusted creation ahead of it", async () => {
   const source = await login(), trusted = await login("trusted"), held = barrier(), queued = barrier();
-  const catalog = BotManager.prototype.catalog, create = BotManager.prototype.create;
-  vi.spyOn(BotManager.prototype, "catalog").mockImplementationOnce(async function (this: BotManager) { const value = await catalog.call(this); held.enter(); await held.gate; return value; });
+  const catalog = BotManager.prototype.engineCatalog, create = BotManager.prototype.create;
+  vi.spyOn(BotManager.prototype, "engineCatalog").mockImplementationOnce(async function (this: BotManager, ...args) { const value = await catalog.apply(this, args); held.enter(); await held.gate; return value; });
   vi.spyOn(BotManager.prototype, "create").mockImplementation(function (this: BotManager, ...args) { const pending = create.apply(this, args); if (args[1].requestId === "queued") queued.enter(); return pending; });
-  const first = post(trusted.token, "/api/bots", spec); await held.waiting;
-  const second = post(source.token, "/api/bots", { ...spec, requestId: "queued" });
+  const first = post(trusted.token, "/api/bots", discovering); await held.waiting;
+  const second = post(source.token, "/api/bots", { ...discovering, requestId: "queued" });
   try { await queued.waiting; await invalidate("revoke"); } finally { held.release(); }
   expect((await first).status).toBe(201); expect((await second).status).toBe(401);
-  expect(await hub.store.db.all("SELECT request_id FROM managed_bots")).toEqual([{ request_id: spec.requestId }]);
+  expect(await hub.store.db.all("SELECT request_id FROM managed_bots")).toEqual([{ request_id: discovering.requestId }]);
 });
 
 it("finishes launching an already registered Bot when the original device is revoked afterward", async () => {

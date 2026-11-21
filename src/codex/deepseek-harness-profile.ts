@@ -114,6 +114,44 @@ export async function prepareDeepSeekHarnessPrivateProfile(
   }
 }
 
+/**
+ * Refresh only the root files of a private profile that a complete
+ * preparation already mirrored, comparing contents as that preparation does.
+ * A catalog read whose shared packages are known to be unchanged uses this
+ * instead of walking every package file again. Runs in the same per-home
+ * queue as a full preparation.
+ */
+export async function syncDeepSeekHarnessProfileRootFiles(
+  options: Pick<PrepareDeepSeekHarnessPrivateProfileOptions, "sharedHome" | "privateHome">,
+): Promise<void> {
+  const key = path.resolve(options.privateHome);
+  const earlier = preparing.get(key);
+  const current = (earlier ? earlier.then(() => {}, () => {}) : Promise.resolve()).then(async () => {
+    const sharedProfile = path.join(path.resolve(options.sharedHome), "profiles", DEEPSEEK_HARNESS_PROFILE);
+    const privateProfiles = path.join(key, "profiles");
+    const profileDir = path.join(privateProfiles, DEEPSEEK_HARNESS_PROFILE);
+    await ensurePrivateDirectory(privateProfiles);
+    await ensurePrivateDirectory(profileDir);
+    const tree = new PrivateProfileTree(profileDir);
+    await tree.clearStaging();
+    for (const name of await readDirectoryNames(sharedProfile)) {
+      if (DSH_OWNED_ENTRY.test(name) || name === LEGACY_LINK_PROJECTION_DIR || isMirrorOwnName(name)) continue;
+      const source = path.join(sharedProfile, name);
+      const info = await stat(source).catch(() => undefined);
+      if (!info?.isFile()) continue;
+      await mirrorFile(tree, { kind: "file", rel: name, source, size: info.size, mtimeMs: info.mtimeMs, mode: 0o600, top: true }, path.join(profileDir, name), { kind: "file" }, () => {});
+    }
+    await tree.clearStaging();
+    return { profileDir, patchPath: path.join(profileDir, "cordis.patch.yml") };
+  });
+  preparing.set(key, current);
+  try {
+    await current;
+  } finally {
+    if (preparing.get(key) === current) preparing.delete(key);
+  }
+}
+
 /** Preparations in progress, by private home. */
 const preparing = new Map<string, Promise<PreparedDeepSeekHarnessPrivateProfile>>();
 

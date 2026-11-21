@@ -7,10 +7,11 @@ import { botRoleSchema, dispatcherSettingsSchema } from "./dispatch.js";
 
 // Shared HTTP contract. Keep host process, database and filesystem imports out
 // of this module so clients can build with only their own dependencies.
+export const botEngineSchema = z.enum(["codex", "claude", "kimi", "deepseek", "antigravity", "pi"]);
 export const createBotSchema = z.object({
   requestId: idSchema,
   name: z.string().trim().min(1).max(100),
-  engine: z.enum(["codex", "claude", "kimi", "deepseek", "antigravity", "pi"]),
+  engine: botEngineSchema,
   model: z.string().trim().max(512),
   effort: z.enum(["", ...EFFORT_LEVELS]),
   permission: permissionChoiceSchema.optional(),
@@ -30,6 +31,10 @@ export const botNameSchema = z.object({ name: z.string() }).strict();
 export const renameBotSchema = z.object({ name: z.string().trim().min(1).max(100) }).extend({ expectedName: z.string() }).strict();
 export type RenameBotInput = z.infer<typeof renameBotSchema>;
 export type BotCatalog = {
+  /** `models=deferred` answer: engines carry availability only, and each
+   * engine's models are read with `engine=ID`. Older Hosts ignore the
+   * parameter and return the complete catalog without this mark. */
+  modelsDeferred?: true;
   engines: {
     id: CreateBotInput["engine"];
     available: boolean;
@@ -38,6 +43,12 @@ export type BotCatalog = {
     defaultEffort: string;
     catalogStatus?: "ready" | "no-models" | "unavailable";
     permissions?: { defaultChoice: PermissionChoice; choices: PermissionOption[] };
+    /** Per-engine reads only. Host clock time of the read behind `models`. */
+    readAt?: number;
+    /** An earlier answer, served while the Host reads a replacement; ask again with `after=readAt`. */
+    stale?: true;
+    /** The engine did not answer within the read's deadline; `models` is its fallback. */
+    modelsTimedOut?: true;
   }[];
 };
 

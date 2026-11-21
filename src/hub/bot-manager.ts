@@ -7,7 +7,7 @@ import { resolveDeepSeekExecutable } from "../runtime/deepseek-executable.js";
 import { killProcessTree } from "../codex/process-tree.js";
 import { applyPermission, currentPermission, defaultPermission, permissionOptions } from "../state/permission-options.js";
 import { isRunActive, runSummarySchema } from "../client-protocol/run.js";
-import { antigravityEffortChoices, discoverAntigravityModels, preferredAntigravityModel } from "../codex/antigravity-models.js";
+import { antigravityEffortChoices, preferredAntigravityModel, type AntigravityModel } from "../codex/antigravity-models.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { fork, type ChildProcess } from "node:child_process";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -19,7 +19,8 @@ import { createBotSchema, type CreateBotInput, type BotCatalog } from "../client
 import { defaultDispatcherSettings } from "../client-protocol/dispatch.js";
 import { saveDispatcherSettingsInTransaction } from "./dispatch.js";
 import { CODEX_MODEL_CHOICES } from "../codex/model-capabilities.js";
-import { readModelCatalog } from "../runtime/model-catalog.js";
+import { deepseekCatalogHome, fallbackModelCatalog, type ModelCatalogRead } from "../runtime/model-catalog.js";
+import { MODEL_CATALOG_DEADLINE_MS, MODEL_CATALOG_REFRESH_DEADLINE_MS, ModelCatalogCache, type ModelCatalogRequest } from "./model-catalog-cache.js";
 import { findDeepSeekModel } from "../codex/deepseek-models.js";
 import { decodePiModel } from "../codex/pi-models.js";
 import { readEngineCapabilities } from "../runtime/bot-capabilities.js";
@@ -33,7 +34,12 @@ import { drainCancelledSchema, drainStatusReceiptSchema, restartQueuedSchema, ty
 
 export { createBotSchema, type CreateBotInput, type BotCatalog } from "../client-protocol/bots.js";
 type Managed = { bot_id: string; owner_id: string; request_id: string; specification_json: string };
-export interface BotManagerOptions { entrypoint: string; env?: NodeJS.ProcessEnv }
+type CatalogEngine = BotCatalog["engines"][number];
+export interface BotManagerOptions {
+  entrypoint: string; env?: NodeJS.ProcessEnv;
+  /** Per-engine model list deadlines for bounded reads (tests shorten them). */
+  catalogDeadlinesMs?: { passive: number; refresh: number };
+}
 const restartResultSchema = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(true), result: z.object({ text: z.string() }) }),
   z.object({ ok: z.literal(false), error: z.enum(["hub_stopping", "bot_worker_stopping", "restart_send_failed", "restart_confirmation_unavailable", "operation_failed", "operation_interrupted", "engine_settings_unavailable"]) }),
@@ -62,6 +68,9 @@ export class BotManager {
   private restartTasks = new Set<Promise<RestartResult>>();
   /** Bots whose last launch was refused because the engine path settings were unreadable. */
   private settingsBlocked = new Set<string>();
+  /** Engine model lists shared by every catalog reader of this Hub. */
+  private catalogCache?: ModelCatalogCache;
+  private get catalogs(): ModelCatalogCache { return this.catalogCache ??= new ModelCatalogCache({ deepseekCatalogHome: deepseekCatalogHome(this.directory) }); }
   constructor(readonly store: HubStore, readonly directory: string, readonly options: BotManagerOptions, readonly instanceUrl: () => string, readonly changed: (id: string) => Promise<void>) {}
   private get env(): NodeJS.ProcessEnv {
     try { return hostEngineEnvironment(this.directory, this.options.env ?? process.env); }
@@ -72,17 +81,38 @@ export class BotManager {
     return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: resolveDeepSeekExecutable(env), antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy", pi: resolvePiExecutable(env) };
   }
   engineAvailable(engine: InstanceEngine): boolean { const env = this.env; return !!resolveEngineExecutable(this.engineBinaries(env)[engine], env); }
-  async catalog(workspace?: string, freshEngine?: InstanceEngine): Promise<BotCatalog> {
-    const workspaceAvailable = !workspace || path.isAbsolute(workspace) && await stat(workspace).then(s => s.isDirectory(), () => false);
+  private engineEntry(id: InstanceEngine, available: boolean, catalog: Pick<ModelCatalogRead, "choices" | "status">): CatalogEngine {
+    const models = catalog.choices;
+    const defaults: Record<string, unknown> = {}; applyEngineSelection(defaults, id);
+    if (id === "antigravity") defaults.model = preferredAntigravityModel(models);
+    return { id, available, models, ...(catalog.status ? { catalogStatus: catalog.status } : {}), permissions: { defaultChoice: defaultPermission(id), choices: permissionOptions(id) }, defaultModel: String(defaults.model ?? (id === "codex" ? CODEX_MODEL_CHOICES[0] : "")), defaultEffort: String(defaults.effort ?? "") };
+  }
+  /** File checks only, so the New Bot form can offer engines at once. Model
+   * lists follow per engine; Antigravity's default model needs its list. */
+  engineAvailability(): BotCatalog {
     const env = this.env, bins = this.engineBinaries(env);
-    return { engines: await Promise.all((Object.keys(bins) as InstanceEngine[]).map(async (id) => {
-      const available = !!resolveEngineExecutable(bins[id], env);
-      const catalog: Awaited<ReturnType<typeof readModelCatalog>> = id === "pi" && !workspaceAvailable ? { choices: [{ id: "", efforts: [""] }], status: "unavailable" }
-        : (id === "antigravity" || id === "pi" || id === "deepseek") && !available ? { choices: [{ id: "", efforts: [""] }] } : await readModelCatalog(id, env, workspace, freshEngine === id);
-      const models = catalog.choices;
-      const defaults: Record<string, unknown> = {}; applyEngineSelection(defaults, id);
-      if (id === "antigravity") defaults.model = preferredAntigravityModel(models);
-      return { id, available, models, ...(catalog.status ? { catalogStatus: catalog.status } : {}), permissions: { defaultChoice: defaultPermission(id), choices: permissionOptions(id) }, defaultModel: String(defaults.model ?? (id === "codex" ? CODEX_MODEL_CHOICES[0] : "")), defaultEffort: String(defaults.effort ?? "") };
+    return { modelsDeferred: true, engines: (Object.keys(bins) as InstanceEngine[]).map(id => this.engineEntry(id, !!resolveEngineExecutable(bins[id], env), { choices: [] })) };
+  }
+  /** One engine's catalog entry. A slow or hung engine affects only its own
+   * entry; a `bounded` read answers within this Host's per-engine deadline. */
+  async engineCatalog(id: InstanceEngine, workspace?: string, request: ModelCatalogRequest & { bounded?: boolean } = {}): Promise<CatalogEngine> {
+    const { bounded, ...read } = request, deadlines = this.options.catalogDeadlinesMs ?? { passive: MODEL_CATALOG_DEADLINE_MS, refresh: MODEL_CATALOG_REFRESH_DEADLINE_MS };
+    if (bounded) read.deadlineMs = read.refresh ? deadlines.refresh : deadlines.passive;
+    const env = this.env, bins = this.engineBinaries(env), available = !!resolveEngineExecutable(bins[id], env);
+    const placeholder: Pick<ModelCatalogRead, "choices"> = { choices: [{ id: "", efforts: [""] }] };
+    if (id === "pi" && workspace && !(path.isAbsolute(workspace) && await stat(workspace).then(s => s.isDirectory(), () => false))) return this.engineEntry(id, available, { ...placeholder, status: "unavailable" });
+    if ((id === "antigravity" || id === "pi" || id === "deepseek") && !available) return this.engineEntry(id, available, placeholder);
+    // A missing CLI cannot answer; its built-in list is what a failed read gives.
+    if ((id === "claude" || id === "codex") && !available) return this.engineEntry(id, available, fallbackModelCatalog(id));
+    const result = await this.catalogs.get(id, env, bins[id], workspace, read);
+    return { ...this.engineEntry(id, available, result), readAt: result.readAt, ...(result.stale ? { stale: true as const } : {}), ...(result.timedOut ? { modelsTimedOut: true as const } : {}) };
+  }
+  /** The complete catalog older Apps, the CLI and dispatch read: every engine, without a deadline. */
+  async catalog(workspace?: string, freshEngine?: InstanceEngine): Promise<BotCatalog> {
+    const ids = Object.keys(this.engineBinaries()) as InstanceEngine[];
+    return { engines: await Promise.all(ids.map(async id => {
+      const { readAt: _readAt, stale: _stale, modelsTimedOut: _timedOut, ...entry } = await this.engineCatalog(id, workspace, { refresh: freshEngine === id });
+      return entry;
     })) };
   }
   async restore(): Promise<void> {
@@ -107,17 +137,25 @@ export class BotManager {
       const creating = !row;
       if (!row) {
         if (spec.workspace && (!path.isAbsolute(spec.workspace) || !await stat(spec.workspace).then((s) => s.isDirectory(), () => false))) throw new HubError("bot_workspace_unavailable");
-        const engine = (await this.catalog(spec.engine === "pi" || spec.engine === "deepseek" ? spec.workspace || undefined : undefined, spec.engine === "deepseek" ? "deepseek" : undefined)).engines.find((e) => e.id === spec.engine);
-        if (!engine?.available) throw new HubError("bot_engine_unavailable", 409);
-        if (spec.engine === "deepseek") {
-          if (engine.catalogStatus === "unavailable") throw new HubError("model_catalog_unavailable", 409);
-          const selected = findDeepSeekModel(engine.models, spec.model);
-          if (!selected?.provider || !selected.modelId) throw new HubError("model_unavailable", 409);
-          if (!selected.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
+        if (!this.engineAvailable(spec.engine)) throw new HubError("bot_engine_unavailable", 409);
+        // Only the chosen engine's list, and only when a check below reads it:
+        // other CLIs are never started to create a Bot.
+        if (spec.engine === "deepseek" || spec.effort && (spec.engine === "kimi" || spec.engine === "pi" || spec.engine === "antigravity")) {
+          const workspace = spec.engine === "pi" || spec.engine === "deepseek" ? spec.workspace || undefined : undefined;
+          let engine = await this.engineCatalog(spec.engine, workspace, { refresh: spec.engine === "deepseek" });
+          // A stale list is fine to show, not to validate against: wait for its replacement.
+          if (engine.stale) engine = await this.engineCatalog(spec.engine, workspace, { after: engine.readAt! });
+          if (!engine.available) throw new HubError("bot_engine_unavailable", 409);
+          if (spec.engine === "deepseek") {
+            if (engine.catalogStatus === "unavailable") throw new HubError("model_catalog_unavailable", 409);
+            const selected = findDeepSeekModel(engine.models, spec.model);
+            if (!selected?.provider || !selected.modelId) throw new HubError("model_unavailable", 409);
+            if (!selected.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
+          }
+          if (spec.engine === "kimi" && engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort) === false) throw new HubError("bot_effort_incompatible");
+          if (spec.engine === "pi" && !engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
+          if (spec.engine === "antigravity" && !antigravityEffortChoices(engine.models as AntigravityModel[], spec.model).includes(spec.effort)) throw new HubError("bot_effort_incompatible");
         }
-        if (spec.engine === "kimi" && spec.effort && engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort) === false) throw new HubError("bot_effort_incompatible");
-        if (spec.engine === "pi" && spec.effort && !engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
-        if (spec.engine === "antigravity" && spec.effort && !antigravityEffortChoices(await discoverAntigravityModels(this.env), spec.model).includes(spec.effort)) throw new HubError("bot_effort_incompatible");
         await this.store.db.serial(authorize);
         row = { bot_id: botId, owner_id: userId, request_id: spec.requestId, specification_json: JSON.stringify(spec) };
         const secret = await this.prepare(row);

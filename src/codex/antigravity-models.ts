@@ -38,16 +38,17 @@ export function antigravityEffortChoices(models: AntigravityModel[], model: stri
   const variants = models.filter((item) => item.id.replace(/-(low|medium|high|xhigh|max|ultra)$/, "") === model);
   return ["", ...EFFORT_LEVELS.filter(level => variants.some(item => item.efforts.includes(level)))];
 }
-const cache = new Map<string, { expires: number; result: Promise<AntigravityModel[]> }>();
-/** Bounded read-only discovery; never runs a model turn or exposes stderr. */
-export function discoverAntigravityModels(env: NodeJS.ProcessEnv = process.env): Promise<AntigravityModel[]> {
+const cache = new Map<string, { expires: number; settled: boolean; result: Promise<AntigravityModel[]> }>();
+/** Bounded read-only discovery; never runs a model turn or exposes stderr.
+ * `reread` skips a settled answer but still joins a read in progress. */
+export function discoverAntigravityModels(env: NodeJS.ProcessEnv = process.env, reread = false): Promise<AntigravityModel[]> {
   const executable = (env.ANTIGRAVITY_EXECUTABLE || "agy").trim().replace(/^"(.*)"$/, "$1");
   const key = createHash("sha256").update(JSON.stringify([executable, env])).digest("hex");
-  const current = cache.get(key); if (current && current.expires > Date.now()) return current.result;
+  const current = cache.get(key); if (current && (reread ? !current.settled : current.expires > Date.now())) return current.result;
   let command = executable, args = ["models"];
   if (/\.(cmd|bat)$/i.test(command)) { args = ["/d", "/s", "/c", command, ...args]; command = env.ComSpec || "cmd.exe"; }
   else if (/\.ps1$/i.test(command)) { args = ["-NoProfile", "-File", command, ...args]; command = "pwsh"; }
-  const entry = { expires: Date.now() + 300_000, result: Promise.resolve([] as AntigravityModel[]) };
+  const entry = { expires: Date.now() + 300_000, settled: false, result: Promise.resolve([] as AntigravityModel[]) };
   const result = process.platform === "win32" ? new Promise<{ stdout: string }>((resolve, reject) => {
     const child = spawnEngine(executable, ["models"], { env, cwd: os.tmpdir(), stdio: ["ignore", "pipe", "pipe"], timeout: 8000, killSignal: "SIGKILL" });
     let output = "", length = 0;
@@ -55,7 +56,7 @@ export function discoverAntigravityModels(env: NodeJS.ProcessEnv = process.env):
     child.stderr?.resume(); child.once("error", reject); child.once("close", code => code === 0 ? resolve({ stdout: output }) : reject(new Error("model_list_failed")));
   }) : run(command, args, { env, cwd: os.tmpdir(), encoding: "utf8", timeout: 8000, killSignal: "SIGKILL", maxBuffer: 128 * 1024, windowsHide: true });
   entry.result = result
-    .then(({ stdout }) => parseAntigravityModels(stdout), () => []).then((models) => { if (!models.length) entry.expires = Date.now() + 3000; return models; });
-  if (cache.size >= 16) cache.delete(cache.keys().next().value!);
+    .then(({ stdout }) => parseAntigravityModels(stdout), () => []).then((models) => { entry.settled = true; if (!models.length) entry.expires = Date.now() + 3000; return models; });
+  if (cache.size >= 16 && !current) cache.delete(cache.keys().next().value!);
   cache.set(key, entry); return entry.result;
 }

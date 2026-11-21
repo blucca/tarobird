@@ -92,6 +92,7 @@ import { nodeFrameReader, writeFrame } from "../client-protocol/fragments-node.j
 import { linkUrlSchema } from "../client-protocol/links.js";
 import { HubLinkPreviews } from "./link-previews.js";
 import { BotManager, createBotSchema, type BotManagerOptions } from "./bot-manager.js";
+import { botEngineSchema, type BotCatalog } from "../client-protocol/bots.js";
 import { deleteBotSchema, renameBotSchema } from "../client-protocol/bots.js";
 import { type RouteAlert } from "./route-monitor.js";
 import { createHash, timingSafeEqual, randomUUID } from "node:crypto";
@@ -2062,10 +2063,20 @@ export class HubServer {
         await requireOwner();
         if (!this.botManager) throw new HubError("bot_creation_unavailable", 503);
         if (req.method === "GET") {
-          const catalog = await this.botManager.catalog(z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined));
+          const workspace = z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined);
           // Existing clients do not understand Pi's provider/effort settings.
           // New App and CLI catalog readers opt in, just as engine settings do.
-          await reply(200, url.searchParams.get("includePi") === "1" ? catalog : { ...catalog, engines: catalog.engines.filter(engine => engine.id !== "pi") });
+          const includePi = url.searchParams.get("includePi") === "1", engineId = url.searchParams.get("engine");
+          const visible = (catalog: BotCatalog): BotCatalog => includePi ? catalog : { ...catalog, engines: catalog.engines.filter(engine => engine.id !== "pi") };
+          if (engineId !== null) {
+            // One engine's models, read only by clients that received `modelsDeferred`.
+            const engine = botEngineSchema.parse(engineId);
+            const refresh = url.searchParams.get("refresh") === "1", after = url.searchParams.get("after");
+            const entry = await this.botManager.engineCatalog(engine, workspace, { refresh, ...(after !== null && !refresh ? { after: z.coerce.number().int().nonnegative().parse(after) } : {}), bounded: true });
+            await reply(200, visible({ modelsDeferred: true, engines: [entry] }));
+          }
+          else if (url.searchParams.get("models") === "deferred") await reply(200, visible(this.botManager.engineAvailability()));
+          else await reply(200, visible(await this.botManager.catalog(workspace)));
         }
         else await reply(201, await this.botManager.create(userId, createBotSchema.parse(await this.jsonBody(req)), validateInQueue));
         return;

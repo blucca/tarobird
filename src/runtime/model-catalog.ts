@@ -1,3 +1,4 @@
+import path from "node:path";
 import { CODEX_MODEL_CHOICES } from "../codex/model-capabilities.js";
 import { antigravityEffortChoices, discoverAntigravityModels } from "../codex/antigravity-models.js";
 import { readKimiModelConfig } from "../codex/kimi-models.js";
@@ -20,38 +21,60 @@ export function modelEffortChoices(engine: InstanceEngine, model: string, discov
   if (engine === "pi") return [""];
   return engine === "antigravity" ? antigravityEffortChoices(discovered, model) : ["", ...EFFORT_LEVELS.filter(effort => !getEngineEffortValidationError(engine, effort, model || undefined))];
 }
-/** Creation and existing-Bot settings use the same host-owned catalog. */
-export async function readModelCatalog(engine: InstanceEngine, env = process.env, cwd?: string, fresh = false): Promise<{ choices: ModelSettings["choices"]; status?: "ready" | "no-models" | "unavailable" }> {
+export type ModelCatalogRead = {
+  choices: ModelSettings["choices"]; status?: "ready" | "no-models" | "unavailable";
+  /** False when the engine did not answer and the choices are this release's fallback. */
+  answered: boolean;
+};
+export type ModelCatalogOptions = {
+  /** Skip the other engines' short-lived discovery caches, joining a read in
+   * progress; the Hub's catalog cache owns their freshness. */
+  reread?: boolean;
+  /** DeepSeek's persistent catalog home. A managed Bot shares its Host's. */
+  deepseekCatalogHome?: string;
+};
+/** The Host directory's DeepSeek catalog home, for the Hub and its Bot processes alike. */
+export function deepseekCatalogHome(hostDirectory: string): string { return path.join(hostDirectory, "deepseek-catalog"); }
+/** Creation and existing-Bot settings use the same host-owned catalog.
+ * `fresh` keeps its DeepSeek meaning (a new read with the longer budget). */
+export async function readModelCatalog(engine: InstanceEngine, env = process.env, cwd?: string, fresh = false, options: ModelCatalogOptions = {}): Promise<Omit<ModelCatalogRead, "answered">> {
+  const { answered: _answered, ...catalog } = await readModelCatalogAnswer(engine, env, cwd, fresh, options);
+  return catalog;
+}
+/** The same read, saying whether the engine answered or its fallback stands. */
+export async function readModelCatalogAnswer(engine: InstanceEngine, env = process.env, cwd?: string, fresh = false, options: ModelCatalogOptions = {}): Promise<ModelCatalogRead> {
+  const reread = options.reread ?? false;
   if (engine === "deepseek") {
-    const result = await discoverDeepSeekModels(env, cwd, fresh), selected = result.models.find(model => model.id === result.defaultModel);
-    return { choices: [{ id: "", ...(selected ? { label: `${selected.provider} / ${selected.label}`, provider: selected.provider, modelId: selected.modelId } : {}), efforts: selected?.efforts ?? [""] }, ...result.models], status: result.status };
+    const catalogHome = options.deepseekCatalogHome ?? (env.TAROBOT_HOST_DIR?.trim() ? deepseekCatalogHome(env.TAROBOT_HOST_DIR.trim()) : undefined);
+    const result = await discoverDeepSeekModels(env, cwd, fresh, catalogHome ? { catalogHome } : {}), selected = result.models.find(model => model.id === result.defaultModel);
+    return { choices: [{ id: "", ...(selected ? { label: `${selected.provider} / ${selected.label}`, provider: selected.provider, modelId: selected.modelId } : {}), efforts: selected?.efforts ?? [""] }, ...result.models], status: result.status, answered: result.status !== "unavailable" };
   }
   if (engine === "pi") {
-    const result = await discoverPiModels(env, cwd), selected = result.models.find(model => model.id === result.defaultModel);
-    return { choices: [{ id: "", ...(selected ? { label: selected.label } : {}), efforts: selected?.efforts ?? [""] }, ...result.models], status: result.status };
+    const result = await (reread ? discoverPiModels(env, cwd, true) : discoverPiModels(env, cwd)), selected = result.models.find(model => model.id === result.defaultModel);
+    return { choices: [{ id: "", ...(selected ? { label: selected.label } : {}), efforts: selected?.efforts ?? [""] }, ...result.models], status: result.status, answered: result.status !== "unavailable" };
   }
-  return { choices: await legacyModelCatalog(engine, env) };
+  return legacyModelCatalog(engine, env, reread);
 }
 
 export async function modelCatalog(engine: InstanceEngine, env = process.env, cwd?: string): Promise<ModelSettings["choices"]> {
   return (await readModelCatalog(engine, env, cwd)).choices;
 }
 
-async function legacyModelCatalog(engine: InstanceEngine, env: NodeJS.ProcessEnv): Promise<ModelSettings["choices"]> {
-  if (engine === "antigravity") return [{ id: "", efforts: [""] }, ...await discoverAntigravityModels(env)];
+async function legacyModelCatalog(engine: InstanceEngine, env: NodeJS.ProcessEnv, reread: boolean): Promise<ModelCatalogRead> {
+  if (engine === "antigravity") { const models = await (reread ? discoverAntigravityModels(env, true) : discoverAntigravityModels(env)); return { choices: [{ id: "", efforts: [""] }, ...models], answered: models.length > 0 }; }
   if (engine === "kimi") {
     const config = await readKimiModelConfig(env);
     const current = config.models.find(model => model.id === config.defaultModel);
-    return [{ id: "", ...(config.defaultModel ? { label: current?.label ?? config.defaultModel } : {}), efforts: current?.efforts ?? modelEffortChoices(engine, "") },
-      ...config.models.map(({ id, label, efforts }) => ({ id, ...(label ? { label } : {}), efforts }))];
+    return { answered: true, choices: [{ id: "", ...(config.defaultModel ? { label: current?.label ?? config.defaultModel } : {}), efforts: current?.efforts ?? modelEffortChoices(engine, "") },
+      ...config.models.map(({ id, label, efforts }) => ({ id, ...(label ? { label } : {}), efforts }))] };
   }
   const fixed = ["", ...(engine === "codex" ? CODEX_MODEL_CHOICES : engine === "claude" ? CLAUDE_MODEL_CHOICES : [])].map(id => ({ id, efforts: modelEffortChoices(engine, id) }));
-  if (engine !== "codex" && engine !== "claude") return fixed;
+  if (engine !== "codex" && engine !== "claude") return { choices: fixed, answered: true };
   // Ask the installed CLI first, so a model it gained since this release is
   // offered and an alias shows the version it resolves to. Without an answer
   // the built-in list stands unchanged.
-  const discovered = await discoverCliModels(engine, env);
-  if (!discovered) return fixed;
+  const discovered = await (reread ? discoverCliModels(engine, env, true) : discoverCliModels(engine, env));
+  if (!discovered) return { choices: fixed, answered: false };
   const choices: ModelSettings["choices"] = [{ id: "", ...(discovered.defaultLabel ? { label: discovered.defaultLabel } : {}), efforts: fixed[0]!.efforts }];
   for (const model of discovered.models) {
     if (!model.id || choices.some(choice => choice.id === model.id)) continue;
@@ -61,5 +84,13 @@ async function legacyModelCatalog(engine: InstanceEngine, env: NodeJS.ProcessEnv
   }
   // Built-in entries the CLI did not list (e.g. "claude-opus-5-5[1m]") stay selectable.
   for (const choice of fixed) if (!choices.some(existing => existing.id === choice.id)) choices.push(choice);
-  return choices;
+  return { choices, answered: true };
+}
+
+/** What an engine offers when its catalog cannot be read in time: the same
+ * choices an unanswered read yields, never another engine's or an invented list. */
+export function fallbackModelCatalog(engine: InstanceEngine): ModelCatalogRead {
+  if (engine === "deepseek" || engine === "pi") return { choices: [{ id: "", efforts: [""] }], status: "unavailable", answered: false };
+  if (engine === "codex" || engine === "claude") return { choices: ["", ...(engine === "codex" ? CODEX_MODEL_CHOICES : CLAUDE_MODEL_CHOICES)].map(id => ({ id, efforts: modelEffortChoices(engine, id) })), answered: false };
+  return { choices: [{ id: "", efforts: engine === "kimi" ? modelEffortChoices(engine, "") : [""] }], answered: false };
 }

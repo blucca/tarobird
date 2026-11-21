@@ -79,7 +79,7 @@ export async function inspectHost(directory: string, env: NodeJS.ProcessEnv = pr
   const config = initialized ? await readHubConfig(directory) : undefined;
   let liveEngines: { id: string; available: boolean }[] | undefined, liveCheck: string | undefined;
   if (inspectLiveEngines && service.running && await exists(path.join(directory, "cli", "identity.json"))) {
-    try { const client = await LocalHostClient.connect(directory); try { liveEngines = (await new HostManagement(client).catalog()).engines.map(({ id, available }) => ({ id, available })); } finally { client.close(); } }
+    try { const client = await LocalHostClient.connect(directory); try { liveEngines = (await new HostManagement(client).engineAvailability()).engines.map(({ id, available }) => ({ id, available })); } finally { client.close(); } }
     catch (error) { liveCheck = error instanceof Error ? error.message : "host_catalog_unavailable"; }
   }
   let desktopDirectory: string | undefined, desktopDirectoryIssue: string | undefined;
