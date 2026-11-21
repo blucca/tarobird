@@ -84,6 +84,7 @@ function windows({ faults = new Set(), existing = false, host = false, displayNa
       if (script.includes('CreateShortcut')) return { code: 0, stdout: `${exe}\r\n` };
       // The shortcut's own System.AppUserModel.ID (written by the installer) and Start's list.
       if (script.includes('System.AppUserModel.ID')) return { code: 0, stdout: faults.has('shortcut-aumid') ? '\r\n' : `${AUMID}\r\n` };
+      if (script.includes('Get-StartApps') && faults.has('startapps-error')) return { code: 1, stdout: '', stderr: "Get-StartApps : The term 'Get-StartApps' is not recognized as the name of a cmdlet\r\n" };
       if (script.includes('Get-StartApps')) return { code: 0, stdout: faults.has('aumid') || faults.has('shortcut-aumid') ? '' : `TaroBird=${AUMID}\r\n` };
       if (script.includes('ToastNotificationManager')) {
         calls.push(['toast-probe', script]);
@@ -274,7 +275,13 @@ test('a shortcut without its AppUserModelID is a product failure; a correct one 
   ({ report } = await runAcceptance({ installer: SETUP, confirmed: true, scopes: ['install'] }, windows({ faults: new Set(['aumid']) })));
   assert.equal(statuses(report)['install/shortcut-appusermodel-id'], 'pass');
   assert.equal(statuses(report)['install/notification-aumid'], 'skip', 'never a silent pass');
-  assert.match(detail(report, 'install/notification-aumid'), /environment pending, not a pass.*polls 0s:absent.*60s:absent/);
+  assert.match(detail(report, 'install/notification-aumid'), /environment pending, not a pass.*polls 0s:absent exit 0.*60s:absent exit 0/);
+  assert.notEqual(report.outcome, 'pass');
+  // A Get-StartApps that cannot run is recorded with its exit code and stderr, never read as "absent".
+  ({ report } = await runAcceptance({ installer: SETUP, confirmed: true, scopes: ['install'] }, windows({ faults: new Set(['startapps-error']) })));
+  assert.equal(statuses(report)['install/shortcut-appusermodel-id'], 'pass');
+  assert.equal(statuses(report)['install/notification-aumid'], 'skip');
+  assert.match(detail(report, 'install/notification-aumid'), /Get-StartApps failed in 13\/13 calls.*0s:absent exit 1 stderr: Get-StartApps : The term 'Get-StartApps' is not recognized.*5s:absent exit 1 stderr: \(same\)/);
   assert.notEqual(report.outcome, 'pass');
 });
 

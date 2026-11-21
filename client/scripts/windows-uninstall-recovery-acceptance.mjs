@@ -35,6 +35,7 @@ const ALL_CASES = ['silent-locked', 'silent-repair', 'inplace', 'helper-missing'
 const NOTICE_RECORD = 'TaroBirdNoticesCleared';
 const RUNTIME = ['resources', 'host', 'node.exe'];
 const SYNTHETIC = 'tarobird-acceptance-synthetic.txt';
+const LANGUAGE_VALUE = 'Installer Language';
 
 class Receipt {
   checks = [];
@@ -191,6 +192,47 @@ export function makeContext(sys, options) {
     for (const [name, value] of Object.entries(extra)) { await mkdir(W.dirname(W.join(root, name)), { recursive: true }); await writeFile(W.join(root, name), value); }
     return body;
   };
+  /** Silent cases measure retention on synthetic data they seed themselves, so
+   * an earlier step that left no real data cannot make them pass empty. */
+  const seedData = async () => {
+    const seeded = bases.map(base => W.join(base, 'com.tarobot.client'));
+    for (const root of seeded) await seed(root);
+    return seeded;
+  };
+  const kept = async (before, seeded) => {
+    const now = presentRoots(), intact = [];
+    for (const root of seeded) {
+      try { if ((await readFile(W.join(root, SYNTHETIC), 'utf8')) === `synthetic #50 acceptance data for ${W.basename(root)}`) intact.push(root); } catch { /* lost */ }
+    }
+    return {
+      ok: seeded.length > 0 && seeded.every(root => before.includes(root)) && JSON.stringify(now) === JSON.stringify(before) && intact.length === seeded.length,
+      detail: `roots before ${before.length} [${before.join(', ')}], after ${now.length}; seeded synthetic data intact in ${intact.length}/${seeded.length}`,
+    };
+  };
+  /** Records every start of the named images (WMI process start trace; the
+   * runner is elevated) until stopped. It first proves itself on a short-lived
+   * whoami.exe, so a watcher that sees nothing cannot pass a "never ran" check. */
+  const watchStarts = async names => {
+    const id = ++counter, log = W.join(tmp, `starts-${id}.log`), ready = W.join(tmp, `starts-${id}.ready`);
+    const where = [...names, 'whoami.exe'].map(name => `ProcessName = '${name}'`).join(' OR ');
+    const script = `$ErrorActionPreference = 'Stop'; Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStartTrace WHERE ${where}" -SourceIdentifier tbstarts | Out-Null; Set-Content -LiteralPath '${ps(ready)}' -Value 'ready'; while ($true) { $e = Wait-Event -SourceIdentifier tbstarts -Timeout 1; if ($e) { $n = $e.SourceEventArgs.NewEvent; Add-Content -LiteralPath '${ps(log)}' -Value "$($n.ProcessID) <- $($n.ParentProcessID) $($n.ProcessName)"; Remove-Event -EventIdentifier $e.EventIdentifier } }`;
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+    let stderr = '', done = false; child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise(resolve => { child.once('exit', () => { done = true; resolve(); }); child.once('error', error => { done = true; stderr += String(error); resolve(); }); });
+    const lines = async () => { try { return (await readFile(log, 'utf8')).split(/\r?\n/).filter(Boolean); } catch { return []; } };
+    for (let waited = 0; waited < 30_000 && !existsSync(ready) && !done; waited += 250) await sys.sleep(250);
+    let proven = false;
+    if (existsSync(ready) && !done) {
+      await exec('whoami.exe', [], { timeout: 30_000 });
+      for (let waited = 0; waited < 10_000 && !proven; waited += 250) { proven = (await lines()).some(line => / whoami\.exe$/i.test(line)); if (!proven) await sys.sleep(250); }
+    }
+    const skip = (await lines()).length;
+    const detail = proven ? `start watcher pid ${child.pid} saw its whoami.exe check` : `start watcher not proven: ${existsSync(ready) ? 'its whoami.exe start was not seen within 10 s' : `not ready: ${stderr.trim().slice(0, 400) || (done ? 'exited' : 'no answer in 30 s')}`}`;
+    return {
+      proven, detail,
+      stop: async () => { await sys.sleep(3000); const seen = (await lines()).slice(skip); if (!done) { child.kill(); await Promise.race([exited, sys.sleep(15_000)]); } return seen; },
+    };
+  };
   const helper = async (directory, flag) => {
     const result = await exec(W.join(directory, HELPER), [flag], { timeout: 120_000, capture: true });
     return { code: result.code, stderr: `${result.timedOut ? 'TIMED OUT ' : ''}${result.stderr.trim().slice(0, 300)}` };
@@ -215,19 +257,19 @@ export function makeContext(sys, options) {
     child.once('exit', code => finish(code));
   });
   /** Optional diagnostics (setup notes, 47450f7): the last line setup wrote. */
-  const lastNote = async () => {
-    const file = W.join(env.LOCALAPPDATA, 'TaroBird Setup Notes', 'setup-notes.txt');
+  const noteLines = async (name = 'setup-notes.txt') => {
+    const file = W.join(env.LOCALAPPDATA, 'TaroBird Setup Notes', name);
     if (!existsSync(file)) return undefined;
-    const lines = (await readFile(file)).toString('utf16le').replace(/^\ufeff/, '').split(/\r?\n/).filter(Boolean);
-    return lines.at(-1);
+    return (await readFile(file)).toString('utf16le').replaceAll('\ufeff', '').split(/\r?\n/).filter(Boolean);
   };
+  const lastNote = async () => (await noteLines())?.at(-1);
   /** Records the note of a refused run and, when notes exist, judges its code. */
   const noteFor = async (receipt, phase, id, code) => {
     const line = await lastNote();
     if (line === undefined) { receipt.info(phase, id, 'no setup notes on this build (optional diagnostic)'); return; }
     receipt.expect(phase, id, line.includes(`TB-${code}`), line.slice(0, 400));
   };
-  return { sys, exec, outcome, options, tmp, bases, roots, reg, state, backups, presentRoots, lock, install, snapshot, uninstallRegistered, uninstallSync, recover, ensureUninstalled, seed, helper, execWatchingLanguage, lastNote, noteFor };
+  return { sys, exec, outcome, options, tmp, bases, roots, reg, state, backups, presentRoots, lock, install, snapshot, uninstallRegistered, uninstallSync, recover, ensureUninstalled, seed, helper, execWatchingLanguage, noteLines, lastNote, noteFor, seedData, kept, watchStarts };
 }
 
 /** A failed silent uninstall must keep the recovery entry and data; a retry of
@@ -235,6 +277,7 @@ export function makeContext(sys, options) {
 async function silentLocked(ctx, receipt, phase) {
   const directory = await ctx.install(receipt, phase);
   if (!directory) return;
+  const seeded = await ctx.seedData();
   const rootsBefore = ctx.presentRoots();
   const target = W.join(directory, ...LOCK_TARGET);
   const held = await ctx.lock(target);
@@ -249,7 +292,8 @@ async function silentLocked(ctx, receipt, phase) {
   receipt.expect(phase, 'deep-link-kept-until-files-removed', after.link.state === 'present', `${PROTOCOL_KEY}: ${after.link.state}`);
   receipt.expect(phase, 'locked-file-kept', existsSync(target), target);
   receipt.info(phase, 'partial-state', await ctx.snapshot(directory));
-  receipt.expect(phase, 'data-untouched', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots before ${rootsBefore.length}, after ${ctx.presentRoots().length}`);
+  let data = await ctx.kept(rootsBefore, seeded);
+  receipt.expect(phase, 'data-untouched', data.ok, data.detail);
   // The program goes first, only after notifications were cleared, and the record says so.
   receipt.expect(phase, 'program-removed-first-with-notice-record', !existsSync(W.join(directory, EXE)) && after.uninstall.values?.[NOTICE_RECORD] === '1',
     `${EXE} ${existsSync(W.join(directory, EXE)) ? 'present' : 'absent'}; ${NOTICE_RECORD}=${after.uninstall.values?.[NOTICE_RECORD] ?? 'absent'}`);
@@ -257,13 +301,16 @@ async function silentLocked(ctx, receipt, phase) {
   await ctx.recover(receipt, phase);
   const link = await ctx.reg(PROTOCOL_KEY);
   receipt.expect(phase, 'deep-link-removed-after-recovery', link.state === 'absent' || link.values?.['(Default)'] === undefined, `${PROTOCOL_KEY}: ${link.state}`);
-  receipt.expect(phase, 'data-retained-after-recovery', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().join(', ') || 'none'}`);
+  data = await ctx.kept(rootsBefore, seeded);
+  receipt.expect(phase, 'data-retained-after-recovery', data.ok, data.detail);
 }
 
 /** The dialog's other recovery: reinstall this version, then uninstall. */
 async function silentRepair(ctx, receipt, phase) {
   const directory = await ctx.install(receipt, phase);
   if (!directory) return;
+  const seeded = await ctx.seedData();
+  const rootsBefore = ctx.presentRoots();
   const held = await ctx.lock(W.join(directory, ...LOCK_TARGET));
   if (!held.held) { receipt.add(phase, 'induce-locked-file', 'skip', held.detail); await held.release(); return; }
   const code = await ctx.uninstallSync(directory);
@@ -280,6 +327,8 @@ async function silentRepair(ctx, receipt, phase) {
     receipt.expect(phase, 'repair-drops-notice-record', record === undefined, `${NOTICE_RECORD}=${record ?? 'absent'} (before repair: ${partialRecord ?? 'absent'})`);
   }
   await ctx.uninstallRegistered(receipt, phase, 'uninstall-after-repair-completes');
+  const data = await ctx.kept(rootsBefore, seeded);
+  receipt.expect(phase, 'silent-uninstall-keeps-data', data.ok, data.detail);
 }
 
 /** The installer's own "uninstall before installing" runs `uninstall.exe _?=<dir>`
@@ -302,13 +351,21 @@ async function inPlace(ctx, receipt, phase) {
   // Same-version passive reinstall: PageLeaveReinstall takes reinst_uninstall.
   directory = await ctx.install(receipt, phase);
   if (!directory) return;
-  // A /S install saves no language; a passive run must still never ask.
+  // A /S install saves no language; a passive run must still never ask, and
+  // (S1, 185a175) must not save a language nobody chose.
+  const languageBefore = await ctx.reg(LOCATION_KEY);
+  const savedBefore = languageBefore.values?.[LANGUAGE_VALUE];
+  receipt.expect(phase, 'no-saved-language-before-passive', languageBefore.state !== 'error' && savedBefore === undefined, `${LOCATION_KEY} ${languageBefore.state}; ${LANGUAGE_VALUE}=${savedBefore ?? 'absent'} (a /S install saves none)`);
   const passive = await ctx.execWatchingLanguage(ctx.options.installer, ['/P'], { timeout: 300_000 });
   receipt.expect(phase, 'passive-reinstall-never-asks-language', !passive.dialog, passive.dialog ? `stopped at ${passive.dialog}; ended early` : `no language chooser in ${passive.seconds} s`);
   const key = await ctx.reg(UNINSTALL_KEY);
   const missing = [EXE, 'uninstall.exe', HELPER, W.join(...LOCK_TARGET)].filter(file => !existsSync(W.join(directory, file)));
   receipt.expect(phase, 'passive-same-version-reinstall', passive.code === 0 && key.state === 'present' && !missing.length,
     `setup /P exit ${passive.code}${passive.dialog ? ' (language chooser)' : passive.timedOut ? ' (TIMED OUT)' : ''} in ${passive.seconds} s; key ${key.state} ${key.values?.DisplayVersion ?? ''}; missing ${missing.join(', ') || 'none'}`);
+  const languageAfter = await ctx.reg(LOCATION_KEY);
+  const savedAfter = languageAfter.values?.[LANGUAGE_VALUE];
+  receipt.expect(phase, 'passive-reinstall-saves-no-language', passive.code === 0 && !passive.dialog && languageAfter.state !== 'error' && savedAfter === savedBefore,
+    `setup /P exit ${passive.code}; ${LOCATION_KEY} ${languageAfter.state}; ${LANGUAGE_VALUE} before ${savedBefore ?? 'absent'}, after ${savedAfter ?? 'absent'}`);
   if (passive.code !== 0 || missing.length) {
     const repair = await ctx.install(receipt, phase);
     if (repair) receipt.info(phase, 'repair-after-passive', 'silent reinstall restored the installation');
@@ -324,6 +381,7 @@ async function inPlace(ctx, receipt, phase) {
 async function helperMissing(ctx, receipt, phase) {
   let directory = await ctx.install(receipt, phase);
   if (!directory) return;
+  const seeded = await ctx.seedData();
   const rootsBefore = ctx.presentRoots();
   await rm(W.join(directory, HELPER));
   const code = await ctx.uninstallSync(directory);
@@ -332,7 +390,32 @@ async function helperMissing(ctx, receipt, phase) {
   await ctx.noteFor(receipt, phase, 'setup-note-host-no-stopper', 'HOST-NO-STOPPER');
   receipt.expect(phase, 'runtime-without-stopper-refused-before-changes', code !== 0 && after.uninstall.state === 'present' && kept.length === 5 && after.uninstall.values?.[NOTICE_RECORD] === undefined,
     `exit ${code}; kept ${kept.length}/5; ${await ctx.snapshot(directory)}; ${NOTICE_RECORD}=${after.uninstall.values?.[NOTICE_RECORD] ?? 'absent'}`);
-  receipt.expect(phase, 'data-untouched', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().length}/${rootsBefore.length}`);
+  let data = await ctx.kept(rootsBefore, seeded);
+  receipt.expect(phase, 'data-untouched', data.ok, data.detail);
+  // S2 (6166221): a Tauri host\ folder left beside this Electron layout must not
+  // make the uninstaller run the Electron program as Host stopper (it exits 64,
+  // a futile retry); it refuses before any change with TB-HOST-NO-STOPPER.
+  if (!existsSync(W.join(directory, ...RUNTIME)) || after.uninstall.state !== 'present') {
+    receipt.add(phase, 'tauri-leftover-refused-with-no-stopper', 'skip', 'the first refusal did not keep the installation, so the host\\ leftover cannot be set up (see runtime-without-stopper-refused-before-changes)');
+  } else {
+    const leftover = W.join(directory, 'host', 'node.exe');
+    await mkdir(W.dirname(leftover), { recursive: true });
+    await copyFile(W.join(directory, ...RUNTIME), leftover);
+    const notePrior = await ctx.lastNote();
+    const watch = await ctx.watchStarts([EXE]);
+    const s2code = await ctx.uninstallSync(directory);
+    const started = (await watch.stop()).filter(line => line.toLowerCase().endsWith(` ${EXE.toLowerCase()}`));
+    const s2 = await ctx.state();
+    const s2kept = [EXE, 'uninstall.exe', W.join(...RUNTIME), 'resources\\app.asar', W.join(...LOCK_TARGET), 'host\\node.exe'].filter(file => existsSync(W.join(directory, file)));
+    const s2note = await ctx.lastNote();
+    receipt.expect(phase, 'tauri-leftover-refused-with-no-stopper', s2code !== 0 && s2.uninstall.state === 'present' && s2kept.length === 6 && s2.uninstall.values?.[NOTICE_RECORD] === undefined && s2note !== notePrior && !!s2note?.includes('TB-HOST-NO-STOPPER'),
+      `exit ${s2code}; kept ${s2kept.length}/6; ${NOTICE_RECORD}=${s2.uninstall.values?.[NOTICE_RECORD] ?? 'absent'}; ${s2note === notePrior ? 'no new setup note' : `note ${s2note?.slice(0, 300) ?? 'none'}`}`);
+    if (watch.proven) receipt.expect(phase, 'tauri-leftover-program-not-run-as-stopper', !started.length, `${EXE} starts during the uninstall: ${started.join('; ') || 'none'} (${watch.detail})`);
+    else receipt.add(phase, 'tauri-leftover-program-not-run-as-stopper', 'skip', `process starts could not be observed, not a pass: ${watch.detail}`);
+    await rm(W.join(directory, 'host'), { recursive: true, force: true });
+  }
+  data = await ctx.kept(rootsBefore, seeded);
+  receipt.expect(phase, 'tauri-leftover-data-untouched', data.ok, data.detail);
   directory = await ctx.install(receipt, phase);
   receipt.expect(phase, 'installer-confirms-with-own-helper-and-repairs', !!directory && existsSync(W.join(directory, HELPER)), directory ? await ctx.snapshot(directory) : 'repair install failed');
   if (!directory) return;
@@ -343,7 +426,8 @@ async function helperMissing(ctx, receipt, phase) {
   const free = await ctx.uninstallSync(directory);
   const done = await ctx.state();
   receipt.expect(phase, 'no-runtime-no-stopper-uninstall-completes', free === 0 && done.uninstall.state === 'absent' && !existsSync(W.join(directory, EXE)), `exit ${free}; ${await ctx.snapshot(directory)}`);
-  receipt.expect(phase, 'data-retained', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().length}/${rootsBefore.length}`);
+  data = await ctx.kept(rootsBefore, seeded);
+  receipt.expect(phase, 'data-retained', data.ok, data.detail);
 }
 
 /** #50-B (4b5ed5f): the program is missing without this uninstaller's record
@@ -353,6 +437,7 @@ async function helperMissing(ctx, receipt, phase) {
 async function programMissing(ctx, receipt, phase) {
   let directory = await ctx.install(receipt, phase);
   if (!directory) return;
+  const seeded = await ctx.seedData();
   const rootsBefore = ctx.presentRoots();
   const fresh = await ctx.reg(UNINSTALL_KEY);
   receipt.expect(phase, 'install-has-no-notice-record', fresh.values?.[NOTICE_RECORD] === undefined, `${NOTICE_RECORD}=${fresh.values?.[NOTICE_RECORD] ?? 'absent'}`);
@@ -363,11 +448,13 @@ async function programMissing(ctx, receipt, phase) {
   await ctx.noteFor(receipt, phase, 'setup-note-notice-missing', 'NOTICE-MISSING');
   receipt.expect(phase, 'missing-program-without-record-refused-before-files', code !== 0 && after.uninstall.state === 'present' && after.link.state === 'present' && kept.length === 5,
     `exit ${code}; kept ${kept.length}/5; ${await ctx.snapshot(directory)}`);
-  receipt.expect(phase, 'data-untouched', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().length}/${rootsBefore.length}`);
+  let data = await ctx.kept(rootsBefore, seeded);
+  receipt.expect(phase, 'data-untouched', data.ok, data.detail);
   directory = await ctx.install(receipt, phase);
   if (!directory) return;
   await ctx.uninstallRegistered(receipt, phase, 'uninstall-after-repair-completes');
-  receipt.expect(phase, 'data-retained', JSON.stringify(ctx.presentRoots()) === JSON.stringify(rootsBefore), `roots ${ctx.presentRoots().length}/${rootsBefore.length}`);
+  data = await ctx.kept(rootsBefore, seeded);
+  receipt.expect(phase, 'data-retained', data.ok, data.detail);
 }
 
 /** Native backup/reset helper: diagnostic exit codes, no-data, refusal before any
@@ -605,6 +692,11 @@ export async function run(options, sys = windowsSystem()) {
     catch (error) { receipt.add(name, 'unexpected-error', 'fail', error instanceof Error ? error.stack ?? error.message : String(error)); }
     try { await ctx.ensureUninstalled(receipt, name); } catch (error) { receipt.add(name, 'cleanup', 'fail', String(error)); }
   }
+  // S3 (e8f276a): every setup note line names the real version, never a literal ${VERSION}.
+  const notes = [...((await ctx.noteLines('setup-notes.previous.txt')) ?? []), ...((await ctx.noteLines()) ?? [])];
+  const wrong = notes.filter(line => !line.endsWith(`TaroBird ${options.version}`) || line.includes('${VERSION}'));
+  receipt.expect('setup-notes', 'notes-end-with-real-version', notes.length > 0 && !wrong.length,
+    `${notes.length} line(s); ${wrong.length ? `${wrong.length} not ending with "TaroBird ${options.version}": ${wrong.slice(0, 3).join(' | ')}` : `all end with "TaroBird ${options.version}"; last: ${notes.at(-1) ?? 'none'}`}`);
   return { receipt, meta };
 }
 
