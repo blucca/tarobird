@@ -34,6 +34,12 @@ describe("App platform contract", () => {
     expect(guide).toContain("return clarifying questions as plain text");
     expect(guide).toContain("a new message will not answer the card");
     expect(guide).toContain("Never impersonate the owner or bypass native permission approval");
+    // Issue #62: when to steer and when to queue, kept apart from the owner-level steer send command.
+    expect(guide).toContain("--delivery steer");
+    expect(guide).toContain("never for new tasks");
+    for (const outcome of ["steered", "fell_back_to_queue", "steer_uncertain", "merged_turn"]) expect(guide).toContain(outcome);
+    expect(guide).toContain("owner-level steer send command");
+    for (const engine of ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const) expect(appAgentInstructions({ engine })).toContain("messages send/wait (--help), not steer send");
     expect(appAgentInstructions({ context: "discussion" })).toContain("do not delegate");
   });
   it.each(["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const)("keeps %s question guidance consistent for ordinary Bot delegation", engine => {
