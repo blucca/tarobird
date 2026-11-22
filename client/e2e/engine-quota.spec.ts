@@ -13,20 +13,15 @@ import { fixtureInvitation } from "./fixtures/pairing-invite.js";
 import { pairingLink } from "../src/pairing-link.js";
 import en from "../src/locales/en.json" with { type: "json" };
 
-// Settings › Model quotas is hidden in ordinary builds (src/engine-quota-feature.ts).
-// The page tests below need a client built with the switch on, served from its own directory:
-//   VITE_TAROBIRD_ENGINE_QUOTA_UI=1 npx vite build --outDir /tmp/quota-ui-dist --emptyOutDir
-//   TAROBIRD_QUOTA_TEST_CLIENT_DIR=/tmp/quota-ui-dist npx playwright test e2e/engine-quota.spec.ts
-// Without that directory they are skipped; the default-build tests always use `dist`.
+// Settings › Model quotas is part of an ordinary build again (src/engine-quota-feature.ts), so every test here
+// uses `dist`. TAROBIRD_QUOTA_TEST_CLIENT_DIR still points the page tests at another client directory.
 const quotaUiClient = process.env.TAROBIRD_QUOTA_TEST_CLIENT_DIR;
-const needsQuotaUi = () => test.skip(!quotaUiClient, "Model quotas is hidden in this build; set TAROBIRD_QUOTA_TEST_CLIENT_DIR to a client built with VITE_TAROBIRD_ENGINE_QUOTA_UI=1.");
 
 type RecordState = { revision: string; snapshot: QuotaSnapshot; reads: number; refreshes: number; hold?: Promise<void> };
-async function fixture(page: Page, english = false, oldHost = false, client: "quota-ui" | "default" = "quota-ui") {
-  if (client === "quota-ui") needsQuotaUi();
+async function fixture(page: Page, english = false, oldHost = false) {
   const text = (key: string) => english ? (en as Record<string, string>)[key] || key : key;
   const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-quota-ui-"));
-  const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: client === "quota-ui" ? quotaUiClient! : path.resolve("dist") });
+  const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: quotaUiClient ?? path.resolve("dist") });
   await hub.profile.update({ name: "Quota fixture Host", revision: (await hub.profile.read()).revision });
   const now = Date.now(), stamp = (delta = 0) => new Date(now + delta).toISOString();
   const ready = (used: number): QuotaSnapshot => ({ authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "allowed", observedAt: stamp(), pools: [{ id: "native_pool", label: "Native shared pool", sharing: "shared", availability: "allowed", windows: [
@@ -83,19 +78,21 @@ async function fixture(page: Page, english = false, oldHost = false, client: "qu
 }
 
 test.use({ serviceWorkers: "block", actionTimeout: 10_000 });
-for (const [width, english] of [[1360, false], [1360, true], [390, false], [390, true]] as const) test(`default build has no Model quotas entry, page or quota read at ${width}px ${english ? "en" : "zh"}`, async ({ browser }) => {
+for (const [width, english] of [[1360, false], [1360, true], [390, false], [390, true]] as const) test(`the owner finds Model quotas in Settings, and nothing is read before it is opened, at ${width}px ${english ? "en" : "zh"}`, async ({ browser }) => {
   const context = await browser.newContext({ viewport: { width, height: 900 }, locale: english ? "en-US" : "zh-CN", serviceWorkers: "block" });
-  const page = await context.newPage(), f = await fixture(page, english, false, "default");
+  const page = await context.newPage(), f = await fixture(page, english);
   try {
     await f.openSettings(); const navigation = page.getByRole("navigation", { name: f.text("设置分类") });
-    await expect(navigation.getByRole("button", { name: new RegExp(`^${f.text("通用")}`) })).toBeVisible();
-    await expect(navigation.getByRole("button", { name: new RegExp(`^${f.text("模型额度")}`) })).toHaveCount(0);
-    await expect(navigation.locator('[data-section="quota"]')).toHaveCount(0);
-    await expect(page.locator(".engine-quota")).toHaveCount(0); await expect(page.getByText(f.text("模型额度"))).toHaveCount(0);
-    // Desktop shows every category beside the list: visit each so a page mounted anywhere would have read by now.
-    if (width > 760) for (const button of await navigation.getByRole("button").all()) { await button.click(); await expect(button).toHaveAttribute("aria-current", "page"); }
-    await expect(page.locator(".engine-quota")).toHaveCount(0); await expect(page.getByText(f.text("模型额度"))).toHaveCount(0);
+    const entry = navigation.getByRole("button", { name: new RegExp(`^${f.text("模型额度")}`) });
+    await expect(entry).toBeVisible();
+    // Opening Settings alone asks the Host nothing about quotas.
     expect(f.requests()).toBe(0);
+    await entry.click();
+    const panel = page.locator(".engine-quota:visible");
+    await expect(panel.getByRole("region", { name: "Coding Bot · Codex", exact: true })).toBeVisible();
+    // An engine this Host cannot read is listed and says so; it is not left out.
+    await expect(panel.getByRole("region", { name: "Research Bot · Kimi", exact: true })).toContainText(f.text("此引擎尚未接入原生额度。"));
+    expect(f.requests()).toBeGreaterThan(0);
   } finally { await f.close(); await context.close(); }
 });
 
@@ -119,7 +116,7 @@ test("quota page reads actual Host cache and explicit refresh never sends a mode
 });
 
 for (const width of [1360, 390, 320]) for (const english of [false, true]) test(`quota values and independent restrictions fit ${width}px ${english ? "en" : "zh"}`, async ({ browser }, info) => {
-  needsQuotaUi(); const context = await browser.newContext({ viewport: { width, height: 900 }, locale: english ? "en-US" : "zh-CN", serviceWorkers: "block" });
+  const context = await browser.newContext({ viewport: { width, height: 900 }, locale: english ? "en-US" : "zh-CN", serviceWorkers: "block" });
   const page = await context.newPage(), f = await fixture(page, english), errors: string[] = []; page.on("pageerror", error => errors.push(error.message));
   try {
     f.records.reviewer!.snapshot.availability = "blocked";

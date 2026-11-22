@@ -61,11 +61,13 @@ test("Bot messages: both ends of a long route, whole cards to a page, plain stat
     });
     await expect(cards).toHaveCount(5);
     await expect(rail(page).locator(".workspace-pager")).toContainText("1 / 2");
-    expect(await fits()).toEqual({ cut: false, pager: true, scrolls: false });
+    // Polled: a page that gave a card back settles one layout later than the count.
+    await expect.poll(fits).toEqual({ cut: false, pager: true, scrolls: false });
     // A taller rail holds more, still whole. (Four was the fixed number before; it left this rail half empty.)
     await page.setViewportSize({ width: 1440, height: 1300 });
+    // The count first: the page of five also fits the taller rail until the rail's new height is applied.
+    await expect.poll(() => cards.count()).toBeGreaterThanOrEqual(8);
     await expect.poll(fits).toEqual({ cut: false, pager: true, scrolls: false });
-    expect(await cards.count()).toBeGreaterThanOrEqual(8);
     await page.setViewportSize({ width: 1440, height: 640 });
     await expect(cards).toHaveCount(4);
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -158,6 +160,27 @@ test("jumping to a conversation that is gone stays here and says why", async ({ 
     await expect(page.getByRole("heading", { name: f.mainTitle, exact: true, level: 1 })).toBeVisible();
     await expect(rail(page)).toBeVisible();
     await expect(page.getByText("conversation_forbidden")).toHaveCount(0);
+  } finally { await done(); }
+});
+
+test("a jump leaves the keyboard in the conversation that opened, and a full list says it is not everything", async ({ browser }) => {
+  const { page, L, f, open, done } = await ready(browser, "zh", 1440, async (page, f) => {
+    await mockComms(page, f.ids.empty, comms(f.ids.empty, Array.from({ length: 60 }, (_, index) => item(index + 1))));
+  });
+  try {
+    await open();
+    // The real item of this fixture: Architect asked Researcher, who has replied.
+    await rail(page).getByRole("button", { name: "去协作对话" }).first().click();
+    await expect(page.getByRole("heading", { level: 1 })).not.toHaveText(f.mainTitle);
+    await expect.poll(() => page.evaluate(() => !!document.activeElement?.closest(".composer"))).toBe(true);
+    // Sixty is all the Host returns: the list says so, and a shorter one does not.
+    await openConv(page, "空白对话");
+    await rail(page).getByRole("tab", { name: new RegExp(L("Bot 通信")) }).click();
+    await expect(rail(page).locator(".workspace-more-hint")).toHaveText("这里最多显示最近 60 条，更早的往来不在其中。");
+    await openConv(page, f.mainTitle);
+    await rail(page).getByRole("tab", { name: new RegExp(L("Bot 通信")) }).click();
+    await expect(rail(page).locator(".workspace-comm-card")).toHaveCount(2);
+    await expect(rail(page).locator(".workspace-more-hint")).toHaveCount(0);
   } finally { await done(); }
 });
 

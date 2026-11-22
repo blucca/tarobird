@@ -456,6 +456,9 @@ type UnscopedEngineStreamEvent =
       origin?: "bound" | "unattributed";
       /** Host-authored fallback only; engine-authored text is never translated. */
       reason?: "no_result" | "engine_exit";
+      /** A Host-authored remark shown after the text, in the reader's language: why the engine's own review
+       * of this result did not end normally. */
+      note?: "review_timeout" | "review_failed" | "review_interrupted";
       sessionId?: string;
       taskId?: string;
       status?: string;

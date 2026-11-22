@@ -155,7 +155,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   const addButton = useRef<HTMLButtonElement>(null), stepHeading = useRef<HTMLHeadingElement>(null), deviceList = useRef<HTMLDivElement>(null), reveal = useRef(false);
   const locale = preferences.locale === "en" ? "en" : "zh-CN";
 
-  // Hidden by default (engine-quota-feature.ts): no entry, no page, no quota reads.
+  // The owner only; a build can leave it out (engine-quota-feature.ts): then no entry, no page, no quota reads.
   const quotaPage = engineQuotaPageVisible(state.user?.role);
   const sections = [
     { id: "general" as const, title: t("通用"), detail: t("语言、外观与个人头像"), icon: Settings2 },

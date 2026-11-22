@@ -1137,6 +1137,29 @@ describe("KimiAcpAdapter", () => {
     } finally { await adapter.destroy(); await rm(root, { recursive: true, force: true }); }
   });
 
+  it("leaves the wording to the App when the Kimi process exits under a running background command", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-exit-notice-test-"));
+    const configPath = path.join(root, "config.json");
+    await writeFile(configPath, JSON.stringify({ engine: "kimi", effort: "high" }), "utf8");
+    const harness = createHarness(), events: EngineStreamEvent[] = [];
+    const adapter = new KimiAcpAdapter("kimi", { ...adapterOptions(harness), configPath, engineHomePath: root, hookRelayEnabled: true });
+    try {
+      const turn = adapter.sendUserMessage("telegram-54", { text: "build", files: [], onEngineEvent: async event => { events.push(event); } });
+      await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+      await postKimiHook(harness, { session_id: "kimi-session-1", hook_event_name: "TaskStarted", task_id: "bash-build", kind: "process", description: "构建发布包", status: "running", detached: true });
+      await waitFor(() => events.some(event => event.type === "background_task_started"));
+      harness.children[0].server.sendUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "已在后台构建。" } });
+      harness.children[0].server.respondPrompt();
+      await turn;
+      harness.children[0].close(1);
+      const notices = () => events.filter((event): event is Extract<EngineStreamEvent, { type: "task_notification" }> => event.type === "task_notification" && event.taskId === "bash-build");
+      await waitFor(() => notices().length === 1);
+      expect(notices()[0]).toMatchObject({ status: "failed", reason: "engine_exit", summary: "构建发布包" });
+      expect(backgroundTaskBody(notices()[0]!, "zh")).toBe("构建发布包\n\n引擎进程已退出，未收到此任务的完成结果。");
+      expect(backgroundTaskBody(notices()[0]!, "en")).toBe("构建发布包\n\nThe engine process exited before this task completed.");
+    } finally { await adapter.destroy(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("relays Kimi hook background tasks into start and out-of-band completion events", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-hook-test-"));
     const configPath = path.join(root, "config.json");
@@ -2884,13 +2907,16 @@ describe("KimiAcpAdapter", () => {
       )));
       const expiryNotification = events.find((event) => (
         event.type === "task_notification" && event.taskId === "bash-lost-review"
-      ))! as { status?: string; text?: string };
+      ))! as Extract<EngineStreamEvent, { type: "task_notification" }>;
       // The TASK completed (its Notification was captured) — only the review
       // timed out. The captured result must be delivered, not dropped, and
       // the status must not lie "failed".
       expect(expiryNotification.status).toBe("completed");
       expect(expiryNotification.text).toContain("The process exited, but the synthetic review turn never arrived.");
-      expect(expiryNotification.text).toContain("safety timeout");
+      // Why the review did not end is a remark the App writes in the reader's language, not English text.
+      expect(expiryNotification.text).not.toContain("safety timeout");
+      expect(expiryNotification.note).toBe("review_timeout");
+      expect(backgroundTaskBody(expiryNotification, "zh")).toBe("The process exited, but the synthetic review turn never arrived.\n\n引擎没有在限定时间内完成对这个后台结果的复核。");
     } finally {
       await adapter.destroy();
       await rm(root, { recursive: true, force: true });

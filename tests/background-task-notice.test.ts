@@ -20,7 +20,11 @@ it("localizes host fallbacks without translating or replacing authored results",
   const event = { type: "task_notification", text: "Authored English result" } as const;
   expect(backgroundTaskBody(event, "zh")).toBe(event.text);
   expect(backgroundTaskBody({ ...event, reason: "no_result" }, "zh")).toBe("引擎没有提供更多结果。");
-  expect(backgroundTaskBody({ ...event, reason: "engine_exit" }, "zh")).toContain("Claude 进程已退出");
+  expect(backgroundTaskBody({ ...event, reason: "engine_exit" }, "zh")).toBe("引擎进程已退出，未收到此任务的完成结果。");
+  expect(backgroundTaskBody({ ...event, summary: "核对报告", reason: "no_result" }, "zh")).toBe("核对报告\n\n引擎没有提供更多结果。");
+  // A remark about the engine's own review follows what the engine wrote, or stands in when it wrote nothing.
+  expect(backgroundTaskBody({ ...event, note: "review_timeout" }, "zh")).toBe("Authored English result\n\n引擎没有在限定时间内完成对这个后台结果的复核。");
+  expect(backgroundTaskBody({ ...event, summary: "核对报告", reason: "no_result", note: "review_failed" }, "en")).toBe("核对报告\n\nThe engine failed while reviewing this background result.");
   expect(backgroundTaskBody({ ...event, summary: "核对报告", reason: "engine_exit" }, "zh")).toContain("核对报告");
   expect(engineEventTimelineMetadata({ ...event, origin: "unattributed", reason: "engine_exit" })).toMatchObject({ taskOrigin: "unattributed", notificationReason: "engine_exit" });
   expect(renderBackgroundTaskHeader("zh", "interrupted")).toBe("后台任务已中断");

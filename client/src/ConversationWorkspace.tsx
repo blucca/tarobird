@@ -22,7 +22,7 @@ import { engineTaskSnapshotSchema, type EngineTask } from "../../src/client-prot
 import { promptQueueSnapshotSchema, type PromptQueueSnapshot } from "../../src/client-protocol/prompt-queue.js";
 import { conversationFilesPageSchema, type ConversationFile } from "../../src/client-protocol/conversation-files.js";
 import { permissionSettingsSchema, type PermissionSettings } from "../../src/client-protocol/permissions.js";
-import { conversationBotCommsSchema, type BotCommItem, type ConversationBotComms } from "../../src/client-protocol/workspace-comms.js";
+import { BOT_COMMS_LIMIT, conversationBotCommsSchema, type BotCommItem, type ConversationBotComms } from "../../src/client-protocol/workspace-comms.js";
 import { nativeRun } from "../../src/client-protocol/run.js";
 import { runChangesSummarySchema } from "../../src/client-protocol/run-changes.js";
 import type { Bot, HubConnection } from "./connection.js";
@@ -833,6 +833,9 @@ export function ConversationWorkspace({
                       ? t("暂时读不到 Bot 之间的往来，请稍后再刷新。")
                       : t("正在读取…")}
               </div>
+            )}
+            {commItems.length >= BOT_COMMS_LIMIT && (
+              <div className="workspace-more-hint">{t("这里最多显示最近 {0} 条，更早的往来不在其中。", BOT_COMMS_LIMIT)}</div>
             )}
           </section>
         )}

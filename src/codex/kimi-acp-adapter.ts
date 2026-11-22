@@ -281,7 +281,10 @@ type IgnoredKimiHookTurn = {
 
 type KimiHookTerminal = {
   status: "completed" | "failed";
+  /** What Kimi itself said about the failure. */
   errorText?: string;
+  /** Why the review did not end normally when Kimi said nothing: the App writes that line. */
+  note?: "review_timeout" | "review_failed" | "review_interrupted";
   safetyExpiry?: boolean;
 };
 
@@ -5131,7 +5134,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       ).catch(() => undefined)
       : undefined;
     const assistantText = recoveredAssistantText?.trim() || streamedAssistantText;
-    if (continuation.lateAfterFallback && !assistantText && !capturedText && !terminal.errorText?.trim()) {
+    if (continuation.lateAfterFallback && !assistantText && !capturedText && !terminal.errorText?.trim() && !terminal.note) {
       return;
     }
     // Kimi can start the review of a command without ever sending that task's own Notification hook (seen with
@@ -5156,6 +5159,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       type: "task_notification",
       text,
       ...(content ? {} : { reason: "no_result" as const }),
+      ...(terminal.note ? { note: terminal.note } : {}),
       sessionId: deliverySessionId,
       taskId: continuation.taskId,
       status: finalStatus,
@@ -5206,14 +5210,14 @@ export class KimiAcpAdapter implements CodexAdapter {
     if (event.hookEventName === "StopFailure") {
       await this.handleKimiHookTerminal(worker, {
         status: "failed",
-        errorText: event.errorMessage ?? event.errorType ?? "Kimi background review failed.",
+        ...(event.errorMessage ?? event.errorType ? { errorText: event.errorMessage ?? event.errorType } : { note: "review_failed" as const }),
       });
       return;
     }
     if (event.hookEventName === "Interrupt") {
       await this.handleKimiHookTerminal(worker, {
         status: "failed",
-        errorText: event.reason ?? "Kimi background review was interrupted.",
+        ...(event.reason ? { errorText: event.reason } : { note: "review_interrupted" as const }),
       });
       return;
     }
@@ -6218,7 +6222,9 @@ export class KimiAcpAdapter implements CodexAdapter {
           });
           void this.emitEngineEvent(task.onEngineEvent ?? worker.onEngineEvent, {
             type: "task_notification",
+            // The text is the fallback for logs; a person reads the App's own line (reason).
             text: `${task.description ?? "Kimi background task"} produced no terminal notification before the safety timeout and was settled quietly.`,
+            reason: "no_result",
             sessionId,
             taskId,
             status: "failed",
@@ -6233,7 +6239,7 @@ export class KimiAcpAdapter implements CodexAdapter {
         }
         void this.finishKimiBackgroundContinuation(worker, continuation, {
           status: "failed",
-          errorText: "Kimi did not finish reviewing this background result before the safety timeout.",
+          note: "review_timeout",
           safetyExpiry: true,
         });
       }
@@ -6302,6 +6308,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       deliveries.push(this.emitEngineEvent(continuation.onEngineEvent ?? task?.onEngineEvent ?? worker.onEngineEvent, {
         type: "task_notification",
         text: `${continuation.summary ?? task?.description ?? "Kimi background task"} stopped because the Kimi engine process exited before its result review completed.`,
+        reason: "engine_exit",
         sessionId: continuation.sessionId ?? task?.sessionId ?? worker.currentSessionId ?? undefined,
         taskId: continuation.taskId,
         status: "failed",
@@ -6331,6 +6338,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       deliveries.push(this.emitEngineEvent(task.onEngineEvent ?? worker.onEngineEvent, {
         type: "task_notification",
         text: `${task.description ?? "Kimi background task"} stopped because the Kimi engine process exited before completion.`,
+        reason: "engine_exit",
         sessionId: task.sessionId ?? worker.currentSessionId ?? undefined,
         taskId: task.taskId,
         status: "failed",

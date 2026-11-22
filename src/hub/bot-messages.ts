@@ -15,7 +15,7 @@ import { botMessageCapabilitiesSchema, botMessageSendSchema, botMessageSteeringC
   type BotMessageDelivery, type BotMessageDeliveryReceipt, type BotMessageSteeringSnapshot, type BotSteerFallbackReason } from "../client-protocol/bot-message-delivery.js";
 import { botSteerCallSchema, botSteerStatusSchema, steerResultSchema, type SteerResult } from "../client-protocol/steering.js";
 import { hasPendingCardAction } from "../client-protocol/message-clear.js";
-import { botCommDeliverySchema, botCommItemSchema, conversationBotCommsSchema, type BotCommDelivery, type BotCommItem, type BotCommPendingApproval, type BotCommStatus, type ConversationBotComms } from "../client-protocol/workspace-comms.js";
+import { BOT_COMMS_LIMIT, botCommDeliverySchema, botCommItemSchema, conversationBotCommsSchema, type BotCommDelivery, type BotCommItem, type BotCommPendingApproval, type BotCommStatus, type ConversationBotComms } from "../client-protocol/workspace-comms.js";
 import type { Message } from "../client-protocol/index.js";
 import { STEER_EDGE_LIMIT, STEER_EDGE_WINDOW_MS, STEER_TURN_LIMIT, offlineSteering, steerFallbackNotice, steeringDisabledKey, type BotMessageSteeringHooks, type IncomingMemo } from "./bot-message-steering.js";
 
@@ -1499,7 +1499,7 @@ export class BotMessages {
         return b.updatedAt - a.updatedAt;
       });
       // An item that does not fit the public shape is left out instead of failing the list.
-      const bounded = items.flatMap(item => { const parsed = botCommItemSchema.safeParse(item); return parsed.success ? [parsed.data] : []; }).slice(0, 60);
+      const bounded = items.flatMap(item => { const parsed = botCommItemSchema.safeParse(item); return parsed.success ? [parsed.data] : []; }).slice(0, BOT_COMMS_LIMIT);
       const needsApproval = bounded.filter(item => item.status === "needs_approval").length;
       const active = bounded.filter(item => item.status === "running" || item.status === "steered" || item.status === "queued" || item.status === "needs_approval").length;
       return conversationBotCommsSchema.parse({

@@ -5672,5 +5672,6 @@
   "已并入回复": "Merged into the reply",
   "未能并入，已改为排队": "Couldn't join the reply; queued instead",
   "经排队投递": "Delivered through the queue",
-  "无法确认是否已并入": "Can't confirm whether it was merged"
+  "无法确认是否已并入": "Can't confirm whether it was merged",
+  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed."
 }

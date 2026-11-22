@@ -48,9 +48,12 @@ export const botCommItemSchema = z.object({
   finishedAt: z.number().optional(),
 }).strict();
 
+/** The Host returns this many items at most, newest first; the App says so when the list is full. */
+export const BOT_COMMS_LIMIT = 60;
+
 export const conversationBotCommsSchema = z.object({
   conversationId: idSchema,
-  items: z.array(botCommItemSchema).max(60),
+  items: z.array(botCommItemSchema).max(BOT_COMMS_LIMIT),
   summary: z.object({
     total: z.number().int().nonnegative(),
     active: z.number().int().nonnegative(),
