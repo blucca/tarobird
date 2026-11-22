@@ -57,10 +57,12 @@ let renderTimer=0, lastRender=0, nextRenderAt=0, lastSnapshot="", started=false,
 // stale snapshot never overwrites newer user input in the real control.
 let live=new WeakMap(), sentControls=new Map(), ack=0, activeElement, activation='', composeSerial=0;
 const composeRequests=new Map(), pointerCaptures=new Map();
-const error = cause => {
-  const now=nativeNow();reportedErrors=reportedErrors.filter(at=>now-at<2000);reportedErrors.push(now);
+// Only runtime errors count towards retirement. A failed external script
+// download (offline, CDN outage) is a warning: it drops that script alone.
+const error = (cause, counted=true) => {
+  const now=nativeNow();if(counted){reportedErrors=reportedErrors.filter(at=>now-at<2000);reportedErrors.push(now)}
   let detail;try{const value=typeof cause==='string'?cause:cause?.message;if(typeof value==='string')detail=value.slice(0,500)}catch{/* Error accessors are untrusted. */}
-  send({type:'error',persistent:reportedErrors.length>=3,...(detail?{detail}:{})});
+  send({type:'error',persistent:counted&&reportedErrors.length>=3,...(detail?{detail}:{})});
 };
 listen('error',event=>{event.preventDefault();error(event.error??event.reason??event.message)});listen('unhandledrejection',event=>{event.preventDefault();error(event.error??event.reason??event.message)});
 function schedule(interactive=false) {
@@ -589,7 +591,7 @@ async function externalScripts(sources){
     text+=decoder.decode(value,{stream:true});
    }
    texts.push(text+decoder.decode());
-  }catch(cause){error(`External script ${String(src).slice(0,200)} did not load: ${cause?.message??cause}`)}
+  }catch(cause){error(`External script ${String(src).slice(0,200)} did not load: ${cause?.message??cause}`,false)}
   finally{cancel(timer);controller.abort()}
  }
  return texts;

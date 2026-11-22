@@ -187,3 +187,19 @@ chain.then(function(){out.wrappers=[WebSocket.OPEN,EventSource.CLOSED,XMLHttpReq
     expect(o.seen.filter(s => s.host?.startsWith('127.0.0.1')).map(s => s.probe)).toEqual([]);
   } finally { await f.dispose(); await o.close(); }
 });
+
+// Offline or a CDN outage: each failed download is a warning, never the
+// repeated runtime errors that retire and quarantine a widget.
+test('failed external script downloads leave the widget running and unquarantined', async ({ page }) => {
+  test.setTimeout(120_000);
+  const o = await origin();
+  const f = await fixture(page, `<p id="static">静态内容</p><button id="tap" onclick="this.textContent='tapped'">tap</button><script src="${o.base}/missing-1.js"></script><script src="${o.base}/missing-2.js"></script><script src="${o.base}/missing-3.js"></script><script>document.getElementById('static').textContent='ran';</script>`);
+  try {
+    await f.publish();
+    await expect(guest(page).locator('#static')).toHaveText('ran', { timeout: 20_000 });
+    await expect(page.getByText('组件未能完整运行', { exact: false }).first()).toBeVisible();
+    await guest(page).locator('#tap').click();
+    await expect(guest(page).locator('#tap')).toHaveText('tapped');
+    expect(await page.evaluate(() => localStorage.getItem('tarobot-widget-quarantine-v1'))).toBeNull();
+  } finally { await f.dispose(); await o.close(); }
+});
