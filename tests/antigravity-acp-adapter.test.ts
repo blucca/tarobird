@@ -1,0 +1,576 @@
+import { EventEmitter } from "node:events";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type { EngineApprovalRequest, EngineStreamEvent } from "../src/codex/adapter.js";
+import {
+  AntigravityAcpAdapter,
+  type AgyAcpChildProcess,
+  type SpawnAgyAcp,
+} from "../src/codex/antigravity-acp-adapter.js";
+
+type JsonRpcMessage = {
+  jsonrpc: "2.0";
+  id?: number | string;
+  method?: string;
+  params?: Record<string, unknown>;
+  result?: unknown;
+  error?: unknown;
+};
+
+async function waitFor(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("Condition was not met in time");
+}
+
+async function settleWithin<T>(promise: Promise<T>, ms = 1_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([promise, new Promise<T>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("did not settle in time")), ms);
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+class FakeReadable extends EventEmitter {
+  emitData(chunk: string): void { this.emit("data", chunk); }
+  end(): void { this.emit("end"); }
+}
+
+class FakeWritable {
+  ended = false;
+  constructor(private readonly onWrite: (chunk: string) => void, private readonly onEnd: () => void) {}
+  write(chunk: string, callback?: (error?: Error | null) => void): boolean {
+    this.onWrite(chunk.toString());
+    callback?.(null);
+    return true;
+  }
+  end(callback?: () => void): void { this.ended = true; this.onEnd(); callback?.(); }
+  destroy(): void {}
+}
+
+const MODEL_OPTIONS = [
+  { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+  { value: "gemini-4-argon", name: "Gemini 4 Argon" },
+  { value: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+];
+const LEVEL_OPTIONS = [
+  { value: "low", name: "Low" },
+  { value: "medium", name: "Medium" },
+  { value: "high", name: "High" },
+  { value: "xhigh", name: "Extra" },
+];
+
+class FakeAgyServer {
+  readonly clientMessages: JsonRpcMessage[] = [];
+  readonly clientResponses = new Map<number | string, JsonRpcMessage>();
+  readonly prompts: JsonRpcMessage[] = [];
+  readonly pendingPrompts = new Map<number | string, JsonRpcMessage>();
+  answerClose = true;
+  autoCancel = true;
+  currentModeId = "default";
+  configOptions: Array<Record<string, unknown>> = [
+    { id: "model", name: "Model", category: "model", type: "select", currentValue: "gemini-4-neon", options: MODEL_OPTIONS },
+    { id: "thought_level", name: "Thinking Level", category: "thought_level", type: "select", currentValue: "high", options: LEVEL_OPTIONS },
+    { id: "mode", name: "Mode", category: "mode", type: "select", currentValue: "default", options: [{ value: "default", name: "Default" }, { value: "plan", name: "Plan" }] },
+  ];
+  private inputBuffer = "";
+  private nextServerRequestId = 1;
+
+  constructor(private readonly stdout: FakeReadable, public sessionId: string, private readonly log: string[]) {}
+
+  receive(chunk: string): void {
+    this.inputBuffer += chunk;
+    const lines = this.inputBuffer.split("\n");
+    this.inputBuffer = lines.pop() ?? "";
+    for (const line of lines) if (line.trim()) this.handle(JSON.parse(line) as JsonRpcMessage);
+  }
+
+  requests(method: string): JsonRpcMessage[] {
+    return this.clientMessages.filter((message) => message.method === method);
+  }
+
+  sendUpdate(update: Record<string, unknown>, sessionId = this.sessionId): void {
+    this.send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
+  }
+
+  text(text: string): void { this.sendUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } }); }
+
+  requestPermission(toolCallId = "call_1", toolInput: Record<string, unknown> = { CommandLine: "touch x" }): string {
+    const id = String(this.nextServerRequestId++);
+    this.send({ jsonrpc: "2.0", id, method: "session/request_permission", params: {
+      sessionId: this.sessionId,
+      toolCall: { sessionUpdate: "tool_call", toolCallId, name: "run_command", status: "pending", kind: "execute", title: String(toolInput.CommandLine), rawInput: toolInput },
+      options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }],
+    } });
+    return id;
+  }
+
+  /** Answer one outstanding prompt; the newest by default. */
+  respondPrompt(result: Record<string, unknown> = { stopReason: "end_turn" }, which: "newest" | "oldest" = "newest"): void {
+    const entries = [...this.pendingPrompts.entries()];
+    const entry = which === "newest" ? entries.at(-1) : entries[0];
+    if (!entry) throw new Error("No pending prompt");
+    this.pendingPrompts.delete(entry[0]);
+    this.send({ jsonrpc: "2.0", id: entry[0], result });
+  }
+
+  failPrompt(error: { code: number; message: string }, which: "newest" | "oldest" = "newest"): void {
+    const entries = [...this.pendingPrompts.entries()];
+    const entry = which === "newest" ? entries.at(-1) : entries[0];
+    if (!entry) throw new Error("No pending prompt");
+    this.pendingPrompts.delete(entry[0]);
+    this.send({ jsonrpc: "2.0", id: entry[0], error });
+  }
+
+  private sessionResult(): Record<string, unknown> {
+    return {
+      sessionId: this.sessionId,
+      modes: { currentModeId: this.currentModeId, availableModes: [{ id: "default", name: "Default" }, { id: "plan", name: "Plan" }] },
+      configOptions: this.configOptions,
+    };
+  }
+
+  private handle(message: JsonRpcMessage): void {
+    this.clientMessages.push(message);
+    if (!message.method) {
+      if (message.id !== undefined) this.clientResponses.set(message.id, message);
+      return;
+    }
+    if (message.method === "initialize") {
+      this.respond(message, {
+        protocolVersion: 1,
+        agentInfo: { name: "Fake Antigravity ACP Server", version: "test" },
+        agentCapabilities: {
+          loadSession: true,
+          promptCapabilities: { image: true, audio: false, embeddedContext: true },
+          sessionCapabilities: { resume: {}, close: {}, load: {}, list: {}, additionalDirectories: {} },
+        },
+        authMethods: [],
+      });
+      return;
+    }
+    if (message.method === "session/new") { this.respond(message, this.sessionResult()); return; }
+    if (message.method === "session/resume") {
+      this.sessionId = String(message.params?.sessionId);
+      this.respond(message, { ...this.sessionResult(), sessionId: undefined });
+      return;
+    }
+    if (message.method === "session/load") {
+      this.text("replayed history must never be shown");
+      this.respond(message, this.sessionResult());
+      return;
+    }
+    if (message.method === "session/set_config_option") {
+      const configId = String(message.params?.configId);
+      const value = String(message.params?.value);
+      this.configOptions = this.configOptions.map((option) => option.id === configId ? { ...option, currentValue: value } : option);
+      this.respond(message, { configOptions: this.configOptions });
+      return;
+    }
+    if (message.method === "session/set_mode") {
+      this.currentModeId = String(message.params?.modeId);
+      this.respond(message, {});
+      return;
+    }
+    if (message.method === "session/prompt") {
+      this.prompts.push(message);
+      this.pendingPrompts.set(message.id!, message);
+      return;
+    }
+    if (message.method === "session/cancel") {
+      this.log.push(`cancel:${String(message.params?.sessionId)}`);
+      if (this.autoCancel && this.pendingPrompts.size) this.respondPrompt({ stopReason: "cancelled" });
+      return;
+    }
+    if (message.method === "session/close") {
+      this.log.push(`close:${String(message.params?.sessionId)}`);
+      if (this.answerClose) this.respond(message, {});
+      return;
+    }
+    if (message.id !== undefined) this.send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } });
+  }
+
+  private respond(request: JsonRpcMessage, result: unknown): void {
+    this.send({ jsonrpc: "2.0", id: request.id, result });
+  }
+
+  private send(message: JsonRpcMessage): void {
+    queueMicrotask(() => this.stdout.emitData(`${JSON.stringify(message)}\n`));
+  }
+}
+
+class FakeAgyChild extends EventEmitter {
+  readonly stdout = new FakeReadable();
+  readonly stderr = new FakeReadable();
+  readonly stdin: FakeWritable;
+  readonly server: FakeAgyServer;
+  constructor(readonly pid: number, sessionId: string, log: string[]) {
+    super();
+    this.server = new FakeAgyServer(this.stdout, sessionId, log);
+    this.stdin = new FakeWritable((chunk) => this.server.receive(chunk), () => log.push(`stdin-end:${pid}`));
+  }
+  exit(code: number | null, signal: NodeJS.Signals | null = null): void {
+    this.stdout.end();
+    this.emit("close", code, signal);
+  }
+}
+
+const SESSION_A = "3dc54fa6-0000-4000-8000-00000000000a";
+const SESSION_B = "3dc54fa6-0000-4000-8000-00000000000b";
+
+function createHarness(configure?: (server: FakeAgyServer, index: number) => void) {
+  const log: string[] = [];
+  const children: FakeAgyChild[] = [];
+  const spawnCalls: Array<{ command: string; args: string[]; cwd?: string; env?: NodeJS.ProcessEnv }> = [];
+  const spawnFn: SpawnAgyAcp = (command, args, options) => {
+    const index = children.length;
+    const child = new FakeAgyChild(900 + index, index === 0 ? SESSION_A : SESSION_B, log);
+    configure?.(child.server, index);
+    children.push(child);
+    spawnCalls.push({ command, args, cwd: options.cwd, env: options.env });
+    return child as unknown as AgyAcpChildProcess;
+  };
+  const killProcessTreeFn = (pid: number | undefined) => {
+    log.push(`kill:${pid}`);
+    const child = children.find((candidate) => candidate.pid === pid);
+    queueMicrotask(() => child?.exit(null, "SIGTERM"));
+  };
+  return { log, children, spawnCalls, spawnFn, killProcessTreeFn };
+}
+
+const tempRoots: string[] = [];
+async function configFile(config: Record<string, unknown>): Promise<string> {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agy-acp-test-"));
+  tempRoots.push(root);
+  const file = path.join(root, "config.json");
+  await writeFile(file, JSON.stringify({ engine: "antigravity", ...config }));
+  return file;
+}
+
+async function adapterFor(harness: ReturnType<typeof createHarness>, config: Record<string, unknown> = { approvalMode: "bypass" }, extra: Record<string, unknown> = {}) {
+  return new AntigravityAcpAdapter("agy", {
+    childEnv: { PATH: process.env.PATH },
+    configPath: await configFile(config),
+    workspacePath: "/tmp/agy-workspace",
+    spawnFn: harness.spawnFn,
+    killProcessTreeFn: harness.killProcessTreeFn,
+    idleSweepIntervalMs: 0,
+    closeTimeoutMs: 50,
+    cancelGraceMs: 50,
+    wakeQuietMs: 20,
+    turnTimeoutMs: null,
+    inactivityTimeoutMs: null,
+    ...extra,
+  });
+}
+
+const adapters: AntigravityAcpAdapter[] = [];
+afterEach(async () => {
+  await Promise.all(adapters.splice(0).map((adapter) => adapter.destroy()));
+  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+function track(adapter: AntigravityAcpAdapter): AntigravityAcpAdapter {
+  adapters.push(adapter);
+  return adapter;
+}
+
+function promptBlocks(server: FakeAgyServer, index = 0): Array<Record<string, unknown>> {
+  return server.prompts[index]!.params!.prompt as Array<Record<string, unknown>>;
+}
+
+describe("AntigravityAcpAdapter core", () => {
+  it("starts agy acp with the approval flags and workspace, then streams one turn", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "full-auto" }));
+    const events: EngineStreamEvent[] = [];
+    const progress: string[] = [];
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "hello", files: [], onEngineEvent: (event) => { events.push(event); }, onProgress: (text) => progress.push(text) });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    expect(harness.spawnCalls[0]).toMatchObject({ command: "agy", cwd: "/tmp/agy-workspace" });
+    expect(harness.spawnCalls[0]!.args).toEqual(["acp", "--dangerously-skip-permissions", "--sandbox", "--add-dir", "/tmp/agy-workspace"]);
+    expect(harness.spawnCalls[0]!.env?.AGY_CLI_HIDE_ACCOUNT_INFO).toBe("1");
+    expect(server.requests("session/new")[0]!.params).toMatchObject({ cwd: "/tmp/agy-workspace", mcpServers: [] });
+    expect(server.requests("session/load")).toHaveLength(0);
+    expect(JSON.stringify(promptBlocks(server))).toContain("<user_message>\\nhello\\n</user_message>");
+
+    server.sendUpdate({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking" } });
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_7", name: "run_command", kind: "execute", title: "ls", status: "in_progress", rawInput: { CommandLine: "ls" } });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_7", status: "completed", rawOutput: { output: "a.txt\n", exit_code: 0 } });
+    server.text("Hel");
+    server.text("lo!");
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 1200, size: 1_048_576 });
+    await waitFor(() => events.some((event) => event.type === "assistant_text" && event.text === "lo!"));
+    server.respondPrompt({ stopReason: "end_turn", usage: { inputTokens: 100, outputTokens: 20, cachedReadTokens: 30, thoughtTokens: 5, totalTokens: 155 } });
+
+    await expect(settleWithin(reply)).resolves.toEqual({ text: "Hello!", sessionId: SESSION_A, usage: { inputTokens: 100, outputTokens: 20, cachedTokens: 30 } });
+    expect(events).toEqual(expect.arrayContaining([
+      { type: "session", sessionId: SESSION_A },
+      { type: "thinking", text: "thinking", sessionId: SESSION_A },
+      { type: "tool_use", toolName: "run_command", toolInput: { CommandLine: "ls" }, toolUseId: "call_7", sessionId: SESSION_A },
+      { type: "tool_result", toolName: "run_command", toolUseId: "call_7", output: "a.txt\n", exitCode: 0, isError: false, sessionId: SESSION_A },
+      { type: "assistant_text", text: "Hel", delta: true, sessionId: SESSION_A },
+    ]));
+    expect(progress.at(-1)).toBe("Hello!");
+    await expect(adapter.getContextUsage(SESSION_A)).resolves.toEqual({ pressureTokens: 1200, contextWindow: 1_048_576 });
+  });
+
+  it("uses bypass flags only for bypass and no permission flags for normal approval", async () => {
+    const bypass = createHarness();
+    const bypassAdapter = track(await adapterFor(bypass, { approvalMode: "bypass" }));
+    void bypassAdapter.sendUserMessage("tarobot-1", { text: "x", files: [] }).catch(() => undefined);
+    await waitFor(() => bypass.spawnCalls.length === 1);
+    expect(bypass.spawnCalls[0]!.args).toEqual(["acp", "--dangerously-skip-permissions", "--add-dir", "/tmp/agy-workspace"]);
+
+    const normal = createHarness();
+    const normalAdapter = track(await adapterFor(normal, { approvalMode: "normal" }));
+    void normalAdapter.sendUserMessage("tarobot-1", { text: "x", files: [], onApprovalRequest: async () => ({ behavior: "deny" }) }).catch(() => undefined);
+    await waitFor(() => normal.spawnCalls.length === 1);
+    expect(normal.spawnCalls[0]!.args).toEqual(["acp", "--add-dir", "/tmp/agy-workspace"]);
+    await expect(normalAdapter.sendUserMessage("tarobot-2", { text: "x", files: [] })).rejects.toThrow(/approval handler/);
+  });
+
+  it("resumes a saved conversation with session/resume and never replays it with session/load", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    const events: EngineStreamEvent[] = [];
+    const reply = adapter.sendUserMessage(SESSION_A, { text: "again", files: [], onEngineEvent: (event) => { events.push(event); } });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    expect(server.requests("session/resume")[0]!.params).toMatchObject({ sessionId: SESSION_A, cwd: "/tmp/agy-workspace" });
+    expect(server.requests("session/load")).toHaveLength(0);
+    expect(server.requests("session/new")).toHaveLength(0);
+    server.text("resumed");
+    server.respondPrompt();
+    await expect(settleWithin(reply)).resolves.toMatchObject({ text: "resumed", sessionId: SESSION_A });
+  });
+
+  it("maps a concrete model preset onto the model and thought_level options and resets a non-default mode", async () => {
+    const harness = createHarness((server) => { server.currentModeId = "plan"; });
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass", model: "gemini-4-argon-medium" }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    expect(server.requests("session/set_config_option").map((message) => message.params)).toEqual([
+      { sessionId: SESSION_A, configId: "model", value: "gemini-4-argon" },
+      { sessionId: SESSION_A, configId: "thought_level", value: "medium" },
+    ]);
+    expect(server.requests("session/set_mode")[0]!.params).toEqual({ sessionId: SESSION_A, modeId: "default" });
+    server.text("ok");
+    server.respondPrompt();
+    await settleWithin(reply);
+
+    // An exact option id is used as-is; an explicit effort is applied separately.
+    const exact = createHarness();
+    const exactAdapter = track(await adapterFor(exact, { approvalMode: "bypass", model: "gpt-oss-120b-medium", effort: "low" }));
+    void exactAdapter.sendUserMessage("tarobot-1", { text: "x", files: [] }).catch(() => undefined);
+    await waitFor(() => exact.children[0]?.server.prompts.length === 1);
+    expect(exact.children[0]!.server.requests("session/set_config_option").map((message) => message.params)).toEqual([
+      { sessionId: SESSION_A, configId: "model", value: "gpt-oss-120b-medium" },
+      { sessionId: SESSION_A, configId: "thought_level", value: "low" },
+    ]);
+    expect(exact.children[0]!.server.requests("session/set_mode")).toHaveLength(0);
+  });
+
+  it("refuses an effort the CLI does not offer before sending the prompt", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass", model: "gemini-4-argon", effort: "max" }));
+    await expect(adapter.sendUserMessage("tarobot-1", { text: "x", files: [] })).rejects.toThrow(
+      'Invalid model selection: gemini-4-argon has no "max" effort (available: low, medium, high, xhigh)',
+    );
+    expect(harness.children[0]!.server.prompts).toHaveLength(0);
+  });
+
+  it("bridges session/request_permission to the turn's approval handler with allow_once and reject_once only", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "normal" }));
+    const requests: EngineApprovalRequest[] = [];
+    const decisions: Array<"allow" | "deny"> = ["allow", "deny"];
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [], onApprovalRequest: async (request) => {
+      requests.push(request);
+      const behavior = decisions.shift()!;
+      return behavior === "allow" ? { behavior, scope: "once" } : { behavior };
+    } });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const first = server.requestPermission("call_1", { CommandLine: "touch a" });
+    await waitFor(() => server.clientResponses.has(first));
+    const second = server.requestPermission("call_2", { CommandLine: "touch b" });
+    await waitFor(() => server.clientResponses.has(second));
+    expect(server.clientResponses.get(first)!.result).toEqual({ outcome: { outcome: "selected", optionId: "allow" } });
+    expect(server.clientResponses.get(second)!.result).toEqual({ outcome: { outcome: "selected", optionId: "deny" } });
+    expect(requests[0]).toMatchObject({ engine: "antigravity", toolName: "run_command", toolInput: { CommandLine: "touch a" }, sessionId: SESSION_A, approvalScopes: { once: "once" } });
+    server.text("done");
+    server.respondPrompt();
+    await settleWithin(reply);
+  });
+
+  it("sends images and text files natively and binary files only as paths", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agy-acp-files-"));
+    tempRoots.push(root);
+    const image = path.join(root, "red.png");
+    const notes = path.join(root, "notes.txt");
+    const binary = path.join(root, "data.bin");
+    await writeFile(image, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]));
+    await writeFile(notes, "CODEWORD=VIOLET");
+    await writeFile(binary, Buffer.from([0, 1, 2, 3, 0, 255]));
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "look", files: [image, notes, binary] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const blocks = promptBlocks(harness.children[0]!.server);
+    expect(blocks).toContainEqual({ type: "image", mimeType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]).toString("base64"), uri: expect.stringContaining("red.png") });
+    expect(blocks).toContainEqual({ type: "resource", resource: { uri: expect.stringContaining("notes.txt"), mimeType: "text/plain", text: "CODEWORD=VIOLET" } });
+    expect(JSON.stringify(blocks)).not.toContain("blob");
+    expect(JSON.stringify(blocks)).toContain(`Attachment: ${binary}`);
+    harness.children[0]!.server.text("seen");
+    harness.children[0]!.server.respondPrompt();
+    await settleWithin(reply);
+  });
+
+  it("sends a native slash command as the first block, outside the user message wrapper", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    void adapter.sendUserMessage("tarobot-1", { text: "/compact now", files: [], instructions: "private rules" }).catch(() => undefined);
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const blocks = promptBlocks(harness.children[0]!.server);
+    expect(blocks[0]).toEqual({ type: "text", text: "/compact now" });
+    expect(JSON.stringify(blocks)).not.toContain("<user_message>");
+    expect(JSON.stringify(blocks)).toContain("private rules");
+  });
+
+  it("stops with session/cancel and keeps the live session for the next turn", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    const controller = new AbortController();
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "long", files: [], abortSignal: controller.signal });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    controller.abort();
+    await expect(settleWithin(reply)).rejects.toThrow("Task was stopped by user");
+    expect(harness.log).toEqual([`cancel:${SESSION_A}`]);
+    const next = adapter.sendUserMessage(SESSION_A, { text: "next", files: [] });
+    await waitFor(() => harness.children[0]!.server.prompts.length === 2);
+    harness.children[0]!.server.text("fine");
+    harness.children[0]!.server.respondPrompt();
+    await expect(settleWithin(next)).resolves.toMatchObject({ text: "fine" });
+    expect(harness.spawnCalls).toHaveLength(1);
+  });
+
+  it("closes the session before killing the process when a stop is not confirmed", async () => {
+    const harness = createHarness((server) => { server.autoCancel = false; });
+    const adapter = track(await adapterFor(harness));
+    const controller = new AbortController();
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "long", files: [], abortSignal: controller.signal });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    controller.abort();
+    await expect(settleWithin(reply)).rejects.toThrow("Task was stopped by user");
+    expect(harness.log).toEqual([`cancel:${SESSION_A}`, `close:${SESSION_A}`, "stdin-end:900", "kill:900"]);
+  });
+
+  it("reports a turn that ended without any answer as an error", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    harness.children[0]!.server.respondPrompt({ stopReason: "end_turn" });
+    await expect(settleWithin(reply)).rejects.toThrow("Antigravity completed without returning a response");
+  });
+});
+
+describe("AntigravityAcpAdapter cleanup", () => {
+  it("destroy closes every active session before ending stdin and killing the process tree", async () => {
+    const harness = createHarness();
+    const adapter = await adapterFor(harness);
+    const first = adapter.sendUserMessage("tarobot-1", { text: "a", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    harness.children[0]!.server.text("a");
+    harness.children[0]!.server.respondPrompt();
+    await settleWithin(first);
+    const second = adapter.sendUserMessage("tarobot-2", { text: "b", files: [] }).catch((error: Error) => error);
+    await waitFor(() => harness.children[1]?.server.prompts.length === 1);
+
+    await adapter.destroy();
+    expect(harness.log.filter((entry) => entry.startsWith("close:")).sort()).toEqual([`close:${SESSION_A}`, `close:${SESSION_B}`]);
+    for (const pid of [900, 901]) {
+      const sessionId = pid === 900 ? SESSION_A : SESSION_B;
+      expect(harness.log.indexOf(`close:${sessionId}`)).toBeLessThan(harness.log.indexOf(`kill:${pid}`));
+      expect(harness.log.indexOf(`stdin-end:${pid}`)).toBeLessThan(harness.log.indexOf(`kill:${pid}`));
+    }
+    await expect(second).resolves.toBeInstanceOf(Error);
+  });
+
+  it("still kills the process after a short timeout when session/close never answers", async () => {
+    const harness = createHarness((server) => { server.answerClose = false; });
+    const adapter = await adapterFor(harness);
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "a", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    harness.children[0]!.server.text("a");
+    harness.children[0]!.server.respondPrompt();
+    await settleWithin(reply);
+    await settleWithin(adapter.destroy());
+    expect(harness.log).toEqual([`close:${SESSION_A}`, "stdin-end:900", "kill:900"]);
+  });
+
+  it("recycles an idle session by closing it before the kill", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "Date"] });
+    try {
+      const harness = createHarness();
+      const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { idleWorkerTtlMs: 1_000, idleSweepIntervalMs: 500 }));
+      const reply = adapter.sendUserMessage("tarobot-1", { text: "a", files: [] });
+      await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+      harness.children[0]!.server.text("a");
+      harness.children[0]!.server.respondPrompt();
+      await settleWithin(reply);
+      vi.advanceTimersByTime(1_600);
+      await waitFor(() => harness.log.includes("kill:900"));
+      expect(harness.log).toEqual([`close:${SESSION_A}`, "stdin-end:900", "kill:900"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("restarts for new launch flags only after closing the old session, then resumes it", async () => {
+    const harness = createHarness();
+    const configPath = await configFile({ approvalMode: "bypass" });
+    const adapter = track(new AntigravityAcpAdapter("agy", {
+      childEnv: {}, configPath, workspacePath: "/tmp/agy-workspace", spawnFn: harness.spawnFn, killProcessTreeFn: harness.killProcessTreeFn,
+      idleSweepIntervalMs: 0, closeTimeoutMs: 50, cancelGraceMs: 50, wakeQuietMs: 20, turnTimeoutMs: null, inactivityTimeoutMs: null,
+    }));
+    const first = adapter.sendUserMessage("tarobot-1", { text: "a", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    harness.children[0]!.server.text("a");
+    harness.children[0]!.server.respondPrompt();
+    await settleWithin(first);
+
+    await writeFile(configPath, JSON.stringify({ engine: "antigravity", approvalMode: "full-auto" }));
+    const second = adapter.sendUserMessage(SESSION_A, { text: "b", files: [] });
+    await waitFor(() => harness.children[1]?.server.prompts.length === 1);
+    expect(harness.log.slice(0, 3)).toEqual([`close:${SESSION_A}`, "stdin-end:900", "kill:900"]);
+    expect(harness.spawnCalls[1]!.args).toContain("--sandbox");
+    expect(harness.children[1]!.server.requests("session/resume")[0]!.params).toMatchObject({ sessionId: SESSION_A });
+    harness.children[1]!.server.text("b");
+    harness.children[1]!.server.respondPrompt();
+    await settleWithin(second);
+  });
+
+  it("fails the turn when agy acp exits unexpectedly", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "a", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    harness.children[0]!.stderr.emitData("fatal: boom\n");
+    harness.children[0]!.exit(2);
+    await expect(settleWithin(reply)).rejects.toThrow(/exited with code 2/);
+  });
+});

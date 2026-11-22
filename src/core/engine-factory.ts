@@ -13,6 +13,7 @@ import { PiRpcAdapter } from "../codex/pi-rpc-adapter.js";
 import { hasCorePostTurnDelivery } from "./delivery.js";
 import { KimiAcpAdapter } from "../codex/kimi-acp-adapter.js";
 import { ProcessAntigravityAdapter } from "../codex/antigravity-adapter.js";
+import { AntigravityAcpAdapter } from "../codex/antigravity-acp-adapter.js";
 import { CodexAppServerAdapter } from "../codex/app-server-adapter.js";
 import { decodeDeepSeekModel } from "../codex/deepseek-models.js";
 import { DeepSeekHarnessAdapter, type DeepSeekHarnessModelSelection } from "../codex/deepseek-harness-adapter.js";
@@ -261,11 +262,13 @@ async function seedIsolatedClaudeConfig(
 
 export type EngineType = "codex" | "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
 type CodexRuntime = "app-server" | "process";
+type AntigravityRuntime = "print" | "acp";
 
 export async function readInstanceRuntimeConfig(configPath: string): Promise<{
   engine: EngineType;
   approvalMode: ApprovalMode;
   codexRuntime: CodexRuntime | undefined;
+  antigravityRuntime: AntigravityRuntime;
   claudeChrome: boolean;
 }> {
   const parsed = await readValidatedConfigFile(configPath);
@@ -284,6 +287,8 @@ export async function readInstanceRuntimeConfig(configPath: string): Promise<{
       parsed.codexRuntime === "process" || parsed.codexRuntime === "app-server"
         ? parsed.codexRuntime
         : undefined,
+    // Print mode stays the default until the ACP runtime is accepted.
+    antigravityRuntime: parsed.antigravityRuntime === "acp" ? "acp" : "print",
     claudeChrome: parsed.claudeChrome === true,
   };
 }
@@ -300,13 +305,14 @@ export function resolveEngineRuntime(
   engine: EngineType,
   _approvalMode: ApprovalMode,
   codexRuntime?: CodexRuntime,
+  antigravityRuntime?: AntigravityRuntime,
 ): "app-server" | "process" | "stream" | "acp" | "web" | "rpc" {
   if (engine === "pi") return "rpc";
   if (engine === "claude") {
     return "stream";
   }
   if (engine === "antigravity") {
-    return "process";
+    return antigravityRuntime === "acp" ? "acp" : "process";
   }
   if (engine === "kimi") {
     return "acp";
@@ -523,7 +529,7 @@ async function createAdapter(
   const engine = runtimeConfig.engine;
   const workspacePath = path.join(config.stateDir, "workspace");
   const approvalMode = runtimeConfig.approvalMode;
-  const engineRuntime = resolveEngineRuntime(engine, approvalMode, runtimeConfig.codexRuntime);
+  const engineRuntime = resolveEngineRuntime(engine, approvalMode, runtimeConfig.codexRuntime, runtimeConfig.antigravityRuntime);
   const childEnv = buildEngineEnvironment(env, options.transport);
   const searchRouting = await resolveSearchRouting(childEnv);
   const nativeSearchMcp = createNativeSearchMcpPlanner(childEnv);
@@ -572,6 +578,15 @@ async function createAdapter(
       enableChromeIntegration: runtimeConfig.claudeChrome,
       nativeSearchMcp,
       disallowedTools: options.transport !== "telegram" ? [] : ["AskUserQuestion"],
+    });
+  }
+
+  if (engine === "antigravity" && engineRuntime === "acp") {
+    await mkdir(workspacePath, { recursive: true });
+    return new AntigravityAcpAdapter(resolveAntigravityExecutable(env, config.antigravityExecutable), {
+      childEnv,
+      configPath,
+      workspacePath,
     });
   }
 

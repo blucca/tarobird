@@ -503,7 +503,7 @@ export async function readValidatedConfigFile(configPath: string, options: { for
     // invalid approval value by dropping it and thereby selecting Bypass/YOLO.
     const record = parsed as Record<string, unknown>;
     if (record.engine === "pi" && record.role === "dispatcher") throw new EngineConfigError();
-    for (const key of ["engine", "approvalMode", "claudePermissionMode", "kimiAutoNeverAskAcknowledged", "codexRuntime"] as const) {
+    for (const key of ["engine", "approvalMode", "claudePermissionMode", "kimiAutoNeverAskAcknowledged", "codexRuntime", "antigravityRuntime"] as const) {
       if (!ConfigFileSchema.shape[key].safeParse(record[key]).success) throw new EngineConfigError();
     }
   }

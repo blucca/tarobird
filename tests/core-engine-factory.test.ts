@@ -15,6 +15,7 @@ import { CodexAppServerAdapter } from "../src/codex/app-server-adapter.js";
 import { DeepSeekHarnessAdapter } from "../src/codex/deepseek-harness-adapter.js";
 import { KimiAcpAdapter } from "../src/codex/kimi-acp-adapter.js";
 import { ProcessAntigravityAdapter } from "../src/codex/antigravity-adapter.js";
+import { AntigravityAcpAdapter } from "../src/codex/antigravity-acp-adapter.js";
 import { ProcessCodexAdapter } from "../src/codex/process-adapter.js";
 import {
   createBridgeDependencies,
@@ -23,6 +24,7 @@ import {
   resolveEngineRuntime,
 } from "../src/core/engine-factory.js";
 import { appAgentInstructions } from "../src/gateway/agent-instructions.js";
+import { readValidatedConfigFile } from "../src/state/instance-config.js";
 import { removeTempRoot } from "./helpers/temp-files.js";
 
 // Never resolve the developer's real Codex credentials into fixture adapters.
@@ -447,6 +449,32 @@ describe("engine adapter construction", () => {
       expect((result.bridge as any).adapter).toBeInstanceOf(ProcessAntigravityAdapter);
       expect((result.bridge as any).adapter.antigravityExecutable).toBe("agy-test");
       expect((result.bridge as any).adapter.childEnv.TELEGRAM_BOT_TOKEN).toBeUndefined();
+    } finally {
+      await removeTempRoot(root);
+    }
+  });
+
+  it("uses the Antigravity ACP adapter only when the Bot opts in, and blocks an invalid runtime value", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-telegram-channel-"));
+    const stateDir = path.join(root, ".cctb", "alpha");
+    const configPath = path.join(stateDir, "config.json");
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      const env = { USERPROFILE: root, TAROCUB_INSTANCE: "alpha", ANTIGRAVITY_EXECUTABLE: "agy-test" };
+      await writeFile(configPath, JSON.stringify({ engine: "antigravity", antigravityRuntime: "acp" }) + "\n", "utf8");
+      const acp = await createGatewayBridgeDependencies(env);
+      expect((acp.bridge as any).adapter).toBeInstanceOf(AntigravityAcpAdapter);
+      expect((acp.bridge as any).adapter.executable).toBe("agy-test");
+      await (acp.bridge as any).adapter.destroy();
+
+      await writeFile(configPath, JSON.stringify({ engine: "antigravity", antigravityRuntime: "print" }) + "\n", "utf8");
+      const print = await createGatewayBridgeDependencies(env);
+      expect((print.bridge as any).adapter).toBeInstanceOf(ProcessAntigravityAdapter);
+      await (print.bridge as any).adapter.destroy();
+
+      await writeFile(configPath, JSON.stringify({ engine: "antigravity", antigravityRuntime: "stream" }) + "\n", "utf8");
+      await expect(readValidatedConfigFile(configPath, { forExecution: true })).rejects.toThrow(/execution blocked/);
     } finally {
       await removeTempRoot(root);
     }

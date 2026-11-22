@@ -44,6 +44,8 @@ export const ConfigFileSchema = z.object({
   claudePermissionMode: z.enum(["manual", "auto", "acceptEdits"]).optional(),
   kimiAutoNeverAskAcknowledged: z.literal(true).optional(),
   codexRuntime: z.enum(["app-server", "process"]).optional(),
+  /** Antigravity transport; absent means the print-mode adapter. Applied when the Bot restarts. */
+  antigravityRuntime: z.enum(["print", "acp"]).optional(),
   locale: z.enum(["en", "zh"]).optional(),
   verbosity: z.union([z.literal(0), z.literal(1), z.literal(2)]).optional(),
   budgetUsd: z.number().positive().optional(),

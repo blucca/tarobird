@@ -3847,6 +3847,15 @@ session, Gateway, Bus and scoped App-tool suites listed in the audit.
   expiry reviews do not create chat replies or complete tasks. See the Monitor
   follow-up in `client/context-isolation-audit-2026-10-14.md`.
   Tests: `claude-stream-adapter`, `core-card-renderer`.
+- `src/codex/antigravity-acp-adapter.ts`
+  Antigravity through `agy acp`, selected per Bot with `antigravityRuntime: "acp"`
+  in config.json (default and absent: the print-mode `antigravity-adapter.ts`;
+  takes effect when the Bot restarts). One process per session; `session/resume`
+  (never `session/load`, which replays history); model/effort/mode through session
+  config; Normal approval through `session/request_permission` (allow once / reject
+  once); bypass/full-auto through launch flags. Every path that ends a process sends
+  `session/close` first: only that stops the session's background commands.
+  Tests: `antigravity-acp-adapter`, `core-engine-factory`, `permissions-settings`.
 - `src/codex/kimi-acp-adapter.ts`
   Persistent Kimi ACP worker, session configuration/loading, streaming event mapping,
   approvals/questions, cancellation, compact support, and background-task lifecycle mapping.
