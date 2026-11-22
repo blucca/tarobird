@@ -3126,17 +3126,20 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     };
   }
 
-  private async loadHostDefaultModel(signal?: AbortSignal): Promise<DeepSeekHarnessModelSelection> {
+  private async loadHostDefaultModel(signal?: AbortSignal, retried = false): Promise<DeepSeekHarnessModelSelection> {
     if (this.hostDefaultModel) {
       return this.hostDefaultModel;
     }
-    this.hostDefaultModelPromise ??= this.readHostDefaultModel(signal);
+    const read = this.hostDefaultModelPromise ??= this.readHostDefaultModel(signal);
     try {
-      const model = await this.hostDefaultModelPromise;
+      const model = await read;
       this.hostDefaultModel = model;
       return model;
     } catch (error) {
-      this.hostDefaultModelPromise = undefined;
+      if (this.hostDefaultModelPromise === read) this.hostDefaultModelPromise = undefined;
+      // The shared read carries the signal of the session that began it. Stopped there, it is read
+      // once more for a session that was not stopped.
+      if (!retried && !signal?.aborted && error instanceof Error && error.name === "AbortError") return this.loadHostDefaultModel(signal, true);
       throw error;
     }
   }
