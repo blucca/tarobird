@@ -17,7 +17,9 @@ function safeUrl(value: string): string | undefined {
   try {
     const url = new URL(value);
     if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) return undefined;
-    return url.href.replace(/[\[\]`{}\\|]/gu, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+    // Brackets around an IPv6 host are syntax; escape only what follows the host.
+    const origin = `${url.protocol}//${url.host}`;
+    return origin + url.href.slice(origin.length).replace(/[\[\]`{}\\|]/gu, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
   } catch { return undefined; }
 }
 
