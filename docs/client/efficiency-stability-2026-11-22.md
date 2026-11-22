@@ -121,9 +121,14 @@ Seen while verifying, and present on 1.5.1 or the baseline with unchanged
 code, in headless Chromium on this Mac:
 
 - `e2e/claude-interaction.spec.ts` (2) and `e2e/async-answer-feedback.spec.ts`
-  (6) fail on the 1.5.1 tag, on `4803293` and on the baseline.
+  (6) failed on the 1.5.1 tag, on `4803293` and on the baseline. Both specs
+  had fallen behind the App and were corrected afterwards; the App was not
+  changed. The first clicked Stop and never confirmed the "停止当前消息？"
+  dialog, which a Claude stop shows while a background subagent is running.
+  The second filled its next message before the previous send had left the
+  box, and the App refuses a send whose text changed under it.
 - `e2e/widget-mobile-parity.spec.ts` "workbench 320x740" and "workbench
   844x390" fail on `4803293` and on the baseline; with waits added the first
   passes, so the clicks appear to land during the enlarge/collapse handover.
 
-They were not investigated further.
+The widget cases were not investigated further.

@@ -40,7 +40,8 @@ for (const phone of [false, true]) test(`${phone ? "phone" : "desktop"}: native 
     gateway = await attachGateway({ stateDir, url: hub.instanceUrl.replace("http", "ws") + "/instance", secret, botId: "bot", engine: "claude", runtime,
       bridge: {
         supportsSteering: () => true, inFlightSendBehavior: () => "steer",
-        listTasks: async () => ({ supported: true, tasks: structuredClone(tasks) }),
+        // The scope the real adapter declares while it can stop a turn without ending the process.
+        listTasks: async () => ({ supported: true, tasks: structuredClone(tasks), foregroundStopScope: "subagents" }),
         stopTask: async ({ taskId }) => { stopped.push(taskId); const task = tasks.find(task => task.id === taskId); if (task) task.status = "stopped"; return { outcome: "accepted" }; },
         steerActiveTurn: async input => { expect(input.isCurrentTurn?.()).toBe(true); if (failure) { const reason = failure; failure = undefined; throw reason === "stale" ? new EngineSteeringRejectedError("stale") : new Error("lost receipt"); } steers.push(input.text); input.onOutcome?.({ status: "applied", via: "fold" }); return true; },
         handleAuthorizedMessage: async input => {
@@ -115,6 +116,11 @@ for (const phone of [false, true]) test(`${phone ? "phone" : "desktop"}: native 
     await page.screenshot({ path: info.outputPath("task-control.png") });
     await dialog.getByRole("button", { name: "关闭任务列表", exact: true }).click();
     await page.getByRole("button", { name: "停止当前轮次", exact: true }).click();
+    // A stop reaches the subagent still running, so the App names it and sends nothing until the user confirms.
+    const stopWarning = page.getByRole("dialog", { name: "停止当前消息？", exact: true });
+    await expect(stopWarning.locator(".turn-stop-tasks li")).toHaveText(["子代理 beta"]);
+    expect(calls).toHaveLength(1); expect(activeInput?.abortSignal?.aborted).toBe(false);
+    await stopWarning.getByRole("button", { name: "确认停止", exact: true }).click();
     await expect.poll(() => calls.length).toBe(3);
     expect(calls.slice(1)).toEqual(["完成后另做总结", "编辑后的待执行任务"]); expect(tasks.find(task => task.id === "beta")?.status).toBe("running");
     await expect(page.getByRole("main").getByText("下一轮处理完成", { exact: true }).last()).toBeVisible();

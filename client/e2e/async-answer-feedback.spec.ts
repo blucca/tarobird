@@ -70,7 +70,8 @@ for (const layout of ["desktop", "phone", "adhd"] as const) for (const cancel of
     const run = page.locator(`[data-message-id="${runId}"] .native-run`);
     await expect(run.locator(".native-run-status")).toContainText("读取文件");
     await expect(run.locator(".run-stop")).toBeEnabled();
-    await composer.fill("等补答完成后再处理这条"); await send.click();
+    // A send that finds the text changed under it is refused, so the second message waits for the first to leave the box.
+    await composer.fill("等补答完成后再处理这条"); await send.click(); await expect(composer).toHaveValue("");
     await composer.fill("下一条可调整顺序"); await send.click();
     await page.getByRole("button", { name: "管理待执行消息，共 2 条", exact: true }).click();
     const pending = page.getByRole("dialog", { name: "待执行消息", exact: true });
