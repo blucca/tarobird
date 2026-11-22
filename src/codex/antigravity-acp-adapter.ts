@@ -273,9 +273,12 @@ function createAcpStream(stdout: AgyReadable, stdin: AgyWritable, onActivity: ()
         if (settled) return;
         enqueueLine(buffer + decoder.decode());
         buffer = "";
-        if (!settled) { settled = true; controller.close(); }
+        if (!settled) { settled = true; try { controller.close(); } catch { /* the reader already cancelled */ } }
       });
     },
+    // The protocol reader cancels when a write fails (the process never started or is gone).
+    // Nothing may be queued or closed afterwards: a throw in these listeners ends the Bot process.
+    cancel() { settled = true; },
   });
   const writable = new WritableStream<unknown>({
     write(message) {
@@ -576,7 +579,9 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     if (this.destroyed) throw new Error("Adapter destroyed");
     const config = resolveEngineOverride("antigravity", await this.loadRuntimeConfig(), input.engineOverride);
-    if (config.approvalMode === "normal" && this.options.configPath && !input.onApprovalRequest) {
+    // The Host's compact command carries no approval handler. A native /compact needs none:
+    // a permission request that arrives without a handler is declined.
+    if (config.approvalMode === "normal" && this.options.configPath && !input.onApprovalRequest && input.text.trim() !== "/compact") {
       throw new Error("Antigravity normal mode requires an approval handler");
     }
     const prompt = await this.buildPrompt(input);

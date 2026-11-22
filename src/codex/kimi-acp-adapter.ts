@@ -1885,10 +1885,13 @@ function createBoundedAcpStream(
         enqueueLine(tail);
         if (!settled) {
           settled = true;
-          controller.close();
+          try { controller.close(); } catch { /* the reader already cancelled */ }
         }
       });
     },
+    // Same guard as the Antigravity ACP stream: after the protocol reader cancels,
+    // these listeners must neither queue nor close, or the throw ends the Bot process.
+    cancel() { settled = true; },
   });
 
   const writable = new WritableStream<unknown>({

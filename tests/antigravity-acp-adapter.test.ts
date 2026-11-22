@@ -534,6 +534,22 @@ describe("AntigravityAcpAdapter core", () => {
     await expect(settleWithin(other)).rejects.toThrow("Antigravity completed without returning a response");
   });
 
+  it("runs a native /compact in normal approval without an approval handler, declining anything it asks for", async () => {
+    // The Host's compact command passes no approval handler.
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "normal" }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "/compact", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const requestId = server.requestPermission();
+    await waitFor(() => server.clientResponses.has(requestId));
+    expect(JSON.stringify(server.clientResponses.get(requestId))).not.toContain("allow");
+    server.respondPrompt({ stopReason: "end_turn" });
+    await settleWithin(reply).catch(() => undefined);
+    // An ordinary message still needs the handler.
+    await expect(adapter.sendUserMessage(SESSION_A, { text: "do it", files: [] })).rejects.toThrow("requires an approval handler");
+  });
+
   it("stops with session/cancel and keeps the live session for the next turn", async () => {
     const harness = createHarness();
     const adapter = track(await adapterFor(harness));
@@ -646,6 +662,25 @@ describe("AntigravityAcpAdapter cleanup", () => {
     harness.children[1]!.server.text("b");
     harness.children[1]!.server.respondPrompt();
     await settleWithin(second);
+  });
+
+  it("fails the turn without throwing from the output stream when agy acp cannot start", async () => {
+    // A missing executable, a missing workspace or a binary that exits at once: the first write fails,
+    // the protocol reader is cancelled, and Node then emits "end" on stdout from the event loop.
+    const harness = createHarness();
+    const stdout = new FakeReadable();
+    const spawnFn: SpawnAgyAcp = () => {
+      const child = new EventEmitter();
+      const broken = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+      const stdin = { write: (_chunk: string, callback?: (error?: Error | null) => void) => { queueMicrotask(() => callback?.(broken)); return false; }, end: () => undefined, destroy: () => undefined };
+      return Object.assign(child, { pid: undefined, stdout, stderr: new FakeReadable(), stdin }) as unknown as AgyAcpChildProcess;
+    };
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { spawnFn }));
+    await expect(settleWithin(adapter.sendUserMessage("tarobot-1", { text: "a", files: [] }))).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // In production this listener runs with no caller above it: a throw here ends the Bot process.
+    expect(() => stdout.end()).not.toThrow();
+    expect(() => stdout.emitData("late\n")).not.toThrow();
   });
 
   it("fails the turn when agy acp exits unexpectedly", async () => {
