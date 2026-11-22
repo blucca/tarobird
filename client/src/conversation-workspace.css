@@ -12,7 +12,8 @@
   height: 32px;
   padding: 0 10px;
   border-radius: 7px;
-  border: 1px solid var(--border);
+  /* At rest it has no frame, like the header buttons beside it; the edge shows only while the rail is open. */
+  border: 1px solid transparent;
   background: transparent;
   color: var(--grey);
   font-size: 12px;

@@ -211,3 +211,13 @@ test("keyboard: opening moves into the rail, arrows change tab, Escape closes an
     expect(await page.evaluate(() => !!document.activeElement?.closest("aside.conversation-workspace-rail"))).toBe(false);
   } finally { await done(); }
 });
+
+test("the entry rests without a frame, like the header buttons beside it, and shows its edge only while the rail is open", async ({ browser }) => {
+  const { trigger, open, done } = await ready(browser, "zh", 1400);
+  try {
+    const edge = () => trigger.evaluate(node => getComputedStyle(node).borderTopColor);
+    expect(await edge()).toBe("rgba(0, 0, 0, 0)");
+    await open();
+    await expect.poll(edge).not.toBe("rgba(0, 0, 0, 0)");
+  } finally { await done(); }
+});
