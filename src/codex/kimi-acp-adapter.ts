@@ -62,6 +62,8 @@ import type {
   NativeHistoryAnchor,
   NativeHistoryResult,
   NativeHistoryState,
+  EngineTask,
+  EngineTaskSnapshot,
 } from "./adapter.js";
 import {
   ENGINE_DEFAULT_INACTIVITY_TIMEOUT_MS,
@@ -341,6 +343,8 @@ type KimiWorker = {
   detachedQuestions: Map<string, KimiDetachedQuestion>;
   detachedApprovalControllers: Map<string, KimiDetachedApproval>;
   terminalBackgroundTasks: Map<string, KimiTerminalBackgroundTask>;
+  /** What the App task list shows for detached work, kept while its tombstone lives. */
+  taskListEntries: Map<string, { label: string; kind?: string; startedAt: number }>;
   terminals: Map<string, KimiAcpTerminal>;
   activeHookTurn?: KimiHookTurn;
   ignoredHookTurn?: IgnoredKimiHookTurn;
@@ -2590,6 +2594,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       detachedQuestions: new Map(),
       detachedApprovalControllers: new Map(),
       terminalBackgroundTasks: new Map(),
+      taskListEntries: new Map(),
       terminals: new Map(),
       ignoredHookTerminalStarts: [],
       lastActivityAt: Date.now(),
@@ -2694,6 +2699,50 @@ export class KimiAcpAdapter implements CodexAdapter {
       this.removeWorker(worker);
       throw this.withDiagnostics(worker, normalizeKimiAcpError(error));
     }
+  }
+
+  /**
+   * Detached Kimi work of this session's live worker, for the App task list:
+   * running tasks first by start, then those that ended within the tombstone
+   * window. Kimi's ACP has no per-task stop, so nothing is stoppable here.
+   * Ids are digests scoped to the worker, never Kimi task ids or paths.
+   */
+  async listTasks(sessionId: string): Promise<EngineTaskSnapshot> {
+    const worker = this.findWorkerForHook(sessionId);
+    if (!worker) return { supported: true, tasks: [] };
+    const now = Date.now();
+    const handle = (taskId: string) => `kt_${createHash("sha256").update(`${worker.requestedSessionId}\0${taskId}`).digest("hex").slice(0, 32)}`;
+    const kindOf = (kind?: string): EngineTask["kind"] => kind === "agent" ? "subagent" : kind && /^(process|bash|shell)$/.test(kind) ? "shell" : "unknown";
+    const labelOf = (taskId: string, kind?: string) => (worker.taskListEntries.get(taskId)?.label || (kind === "agent" ? "Kimi subagent" : "Kimi background task")).slice(0, 500);
+    const statusOf = (status?: string): EngineTask["status"] => {
+      const value = (status ?? "").toLowerCase();
+      if (!value || value === "running" || value === "started" || value === "pending") return "running";
+      if (/^(completed|done|succeeded|success)$/.test(value)) return "done";
+      if (/^(failed|error|errored|timeout|timed_out)$/.test(value)) return "error";
+      if (/^(stopped|cancelled|canceled|killed|terminated|interrupted)$/.test(value)) return "stopped";
+      return "unknown";
+    };
+    const ended: EngineTask[] = [];
+    for (const [taskId, terminal] of worker.terminalBackgroundTasks) {
+      if (worker.backgroundTasks.has(taskId) || now - terminal.terminalAt >= DEFAULT_BACKGROUND_TASK_TOMBSTONE_TTL_MS) continue;
+      const entry = worker.taskListEntries.get(taskId);
+      const status = statusOf(terminal.status ?? "completed");
+      ended.push({ id: handle(taskId), label: labelOf(taskId, entry?.kind), kind: kindOf(entry?.kind), mode: "background",
+        status: status === "running" ? "unknown" : status, canStop: false, ...(entry ? { startedAt: entry.startedAt } : {}), updatedAt: terminal.terminalAt,
+        owner: terminal.onEngineEvent ? "bound" : "unattributed" });
+    }
+    const live = [...worker.backgroundTasks.values()].filter(task => !task.internalContinuationStage).map((task): EngineTask => {
+      const entry = worker.taskListEntries.get(task.taskId);
+      const parent = task.ownerAgentId ? [...worker.backgroundTasks.values()].find(other => other !== task && other.subagentId === task.ownerAgentId) : undefined;
+      return { id: handle(task.taskId), label: labelOf(task.taskId, task.kind), kind: kindOf(task.kind), mode: "background", status: statusOf(task.status),
+        canStop: false, ...(entry ? { startedAt: entry.startedAt } : {}), updatedAt: task.lastSeenAt,
+        ...(parent ? { parentId: handle(parent.taskId) } : {}), owner: task.onEngineEvent ? "bound" : "unattributed" };
+    });
+    for (const taskId of worker.taskListEntries.keys()) {
+      if (!worker.backgroundTasks.has(taskId) && !worker.terminalBackgroundTasks.has(taskId)) worker.taskListEntries.delete(taskId);
+    }
+    const tasks = [...ended.sort((a, b) => a.updatedAt - b.updatedAt), ...live];
+    return { supported: true, tasks: tasks.slice(-128) };
   }
 
   sideCapability(): SideCapability {
@@ -4852,6 +4901,9 @@ export class KimiAcpAdapter implements CodexAdapter {
   }
 
   private emitBackgroundTaskStarted(worker: KimiWorker, task: KimiBackgroundTask): void {
+    const listed = worker.taskListEntries.get(task.taskId);
+    const label = (task.description || task.subagentName || listed?.label || "").trim();
+    worker.taskListEntries.set(task.taskId, { label, kind: task.kind ?? listed?.kind, startedAt: listed?.startedAt ?? Date.now() });
     if (task.startEmitted) {
       return;
     }

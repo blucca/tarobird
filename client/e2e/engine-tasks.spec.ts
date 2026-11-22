@@ -103,3 +103,18 @@ test("child steps direct users to their parent; forced recovery needs explicit s
   const calls = await page.evaluate(() => (window as any).taskFixture.calls.filter((c: any) => c.input));
   expect(calls).toHaveLength(1); expect(calls[0].route).toBe("/api/conversations/chat/tasks/recover"); expect(calls[0].input.token).toBe("fence");
 });
+
+for (const lang of ["zh", "en"] as const) for (const phone of [false, true]) test(`${lang} ${phone ? "phone" : "desktop"}: monitor-only tasks (Kimi) show status without stop controls`, async ({ page }, info) => {
+  await page.setViewportSize(phone ? { width: 390, height: 844 } : { width: 1360, height: 900 });
+  await page.goto(server.resolvedUrls!.local[0] + `e2e/fixtures/engine-tasks.html?shape=kimi&lang=${lang}`);
+  const panel = lang === "en" ? "Subagents & background tasks" : "子代理与后台任务";
+  await page.getByRole("button", { name: panel, exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: panel, exact: true });
+  await expect(dialog.getByRole("article")).toHaveCount(4);
+  await expect(dialog.getByRole("button", { name: lang === "en" ? "Stop this task" : "停止此任务", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("article", { name: "检查类型与格式", exact: true })).toContainText(lang === "en" ? "Completed" : "已完成");
+  await expect(dialog.getByRole("article", { name: "回归测试 · 手机端滚动与键盘", exact: true })).toContainText(lang === "en" ? "Failed" : "失败");
+  expect(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+  await page.mouse.move(0, 0);
+  await page.screenshot({ path: info.outputPath(`kimi-tasks-${lang}-${phone ? "phone" : "desktop"}.png`) });
+});

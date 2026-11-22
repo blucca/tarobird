@@ -17,7 +17,8 @@ import "../../src/cli-typography.css";
 import "../../src/layout-density.css";
 import "../../src/motion.css";
 import "../../src/conversation-creation.css";
-setLocale("zh");
+const fixtureQuery = new URLSearchParams(location.search);
+setLocale(fixtureQuery.get("lang") === "en" ? "en" : "zh");
 let fail = false, uncertain = false, rejectOnce = false, stopScope: "foreground" | "subagents" = "foreground";
 let recovery: { token: string; reason: "stop_unconfirmed" } | undefined;
 const unknownReceipts = new Set<string>(); let unknownOnce = false;
@@ -27,7 +28,13 @@ const tasks: EngineTask[] = [
   { id: "beta", label: "检查消息队列", kind: "subagent", mode: "background", status: "running", canStop: true, updatedAt: Date.now(), progress: "等待消息接收回执。" },
   { id: "foreground", label: "读取配置", parentId: "alpha", kind: "subagent", mode: "foreground", status: "running", canStop: false, updatedAt: Date.now() },
 ];
-const count = Math.min(30, Number(new URLSearchParams(location.search).get("count")) || 3);
+// Kimi's ACP has no per-task stop: detached work is listed for monitoring only.
+if (fixtureQuery.get("shape") === "kimi") tasks.splice(0, tasks.length,
+  { id: "kt_build", label: "运行全量单元测试", kind: "shell", mode: "background", status: "running", canStop: false, startedAt: Date.now() - 95_000, updatedAt: Date.now(), owner: "bound" },
+  { id: "kt_review", label: "Review the release notes", kind: "subagent", mode: "background", status: "running", canStop: false, startedAt: Date.now() - 40_000, updatedAt: Date.now(), owner: "bound" },
+  { id: "kt_lint", label: "检查类型与格式", kind: "shell", mode: "background", status: "done", canStop: false, startedAt: Date.now() - 300_000, updatedAt: Date.now() - 120_000, owner: "bound" },
+  { id: "kt_e2e", label: "回归测试 · 手机端滚动与键盘", kind: "shell", mode: "background", status: "error", canStop: false, startedAt: Date.now() - 600_000, updatedAt: Date.now() - 200_000, owner: "unattributed" });
+const count = fixtureQuery.get("shape") === "kimi" ? tasks.length : Math.min(30, Number(fixtureQuery.get("count")) || 3);
 for (let i = tasks.length; i < count; i++) tasks.push({ ...tasks[0]!, id: `extra-${i + 1}`, label: `Kimi film 场景 ${i + 1} · 检查画面与字幕`, startedAt: Date.now() + i, progress: "检查画面、字幕与音频同步。" });
 const hub = { identity: { hubPublicKey: "host", deviceId: "device" }, http: async (route: string, init?: RequestInit) => {
   const input = init?.body ? JSON.parse(String(init.body)) : undefined; calls.push({ route, input });
