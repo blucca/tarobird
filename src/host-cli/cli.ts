@@ -486,6 +486,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     try { return await waitForHostIdle(directory, waitMs, abort.signal); }
     catch (error) { if (abort.signal.aborted && error instanceof Error) Object.assign(error, { exitCode: 130 }); throw error; }
   };
+  const newerDatabaseMessage = (issue: DesktopStartIssue) => `主机未启动：数据库（schema ${issue.schema}）来自更新版本的 TaroBird，当前运行时只支持 ${issue.minHubSchema}-${issue.maxHubSchema}。数据库未修改。请先更新 TaroBird，再启动主机。`;
   const startCompatible = async (explicitStart = false) => {
     const selected = await resolveHostRuntime(directory, entrypoint);
     await assertWindowsRuntimeAdmission(selected.entrypoint);
@@ -493,7 +494,14 @@ export async function runHostCli(argv: string[]): Promise<void> {
     // explicit start of a desktop-managed host (no OS service): its Hub then
     // upgrades the database as on an App upgrade, without switching runtimes.
     const desktopManaged = explicitStart && !(await managedServiceStatus(directory)).configured;
-    await assertHostRuntimeCompatible(directory, selected.entrypoint, { allowMigration: !!selected.revisionId || desktopManaged });
+    try { await assertHostRuntimeCompatible(directory, selected.entrypoint, { allowMigration: !!selected.revisionId || desktopManaged }); }
+    catch (error) {
+      // The guard rejects a newer database before any Hub starts, so this is
+      // where the readable explanation has to be given.
+      const newer = error instanceof Error && /^host_schema_incompatible:(\d+):runtime_(\d+)-(\d+)$/.exec(error.message);
+      if (newer) throw new Error(newerDatabaseMessage({ code: "schema_incompatible", schema: Number(newer[1]), minHubSchema: Number(newer[2]), maxHubSchema: Number(newer[3]) }), { cause: error });
+      throw error;
+    }
     return selected;
   };
   const start = async () => {
@@ -509,7 +517,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
         throw error;
       });
       const issue = (result as { startIssue?: DesktopStartIssue }).startIssue;
-      if (issue) throw new Error(`主机未启动：数据库（schema ${issue.schema}）来自更新版本的 TaroBird，当前运行时只支持 ${issue.minHubSchema}-${issue.maxHubSchema}。数据库未修改。请先更新 TaroBird，再启动主机。`);
+      if (issue) throw new Error(newerDatabaseMessage(issue));
     }
     try { return { ...result, cliController: { ready: true, ...await enroll() } }; }
     catch (error) {
@@ -579,7 +587,8 @@ export async function runHostCli(argv: string[]): Promise<void> {
     if (!v.json && "hostEnabled" in result && result.hostEnabled === false) console.error("主机已停用，自动恢复（包括桌面 App）不会重新启用它。需要时运行 tarobot start；使用桌面 App 时也可在 App 中点「启动本机主机」。");
     return;
   }
-  if (command === "restart") { await startCompatible(); await stop(); checkCancelled(); await output(await start()); return; }
+  // Checked as the start that follows the stop will check it, before stopping.
+  if (command === "restart") { await startCompatible(true); await stop(); checkCancelled(); await output(await start()); return; }
   if (command === "run") {
     if ((await inspectHubService(directory)).running) throw new Error("同一主机已经运行；不会启动第二个 Hub。");
     const selected = await startCompatible();
