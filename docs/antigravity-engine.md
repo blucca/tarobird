@@ -91,6 +91,9 @@ resume or other installed AGY versions.
 
 ## Capability Matrix
 
+This matrix describes the print runtime (`stream-json`). The ACP runtime is
+described in the next section.
+
 | Capability | Status | Boundary |
 |---|---|---|
 | Structured answer streaming | Supported | Native `stream-json` |
@@ -113,6 +116,46 @@ the skip-permissions flag with `--sandbox`; only explicit `bypass` omits the
 sandbox. This is not equivalent to the per-tool approval flows available from
 Claude Code, Kimi ACP, or DeepSeek Harness.
 
+## ACP Runtime (`agy acp`)
+
+A Bot's `config.json` key `antigravityRuntime` selects the runtime: `"acp"` runs
+the Bot through the official ACP server `agy acp`; absent (or `"print"`) keeps
+the print runtime above. A new ordinary Antigravity Bot is created with `"acp"`
+when the installed `agy --version` is 1.5.10 or newer (the adapter relies on two
+1.5.10 fixes: output pushed after a turn reaches the client, and session/close
+ends the session's background work). A dispatcher and the workers it starts stay
+on print, and a saved Bot keeps the runtime it has. Neither the App nor the CLI
+has a setting for it: to switch an existing Bot, edit that key in the Bot's
+`config.json` and restart the Bot.
+
+- One `agy acp` process serves one conversation. A new conversation uses
+  `session/new`; a saved one uses `session/resume` (never `session/load`, which
+  would replay history). Before any process is ended, its session is closed with
+  `session/close` (bounded), then stdin is ended and the process tree is killed.
+  If a CLI does not advertise `session/close`, only the last two steps run, and
+  background commands that the session started may keep running.
+- Model and effort are applied per session with `session/set_config_option`; a
+  plan or other non-default native mode is reset to `default`. A session config
+  that fails on a new conversation, or a config write that gets no answer in
+  time, ends the process; the next message starts a new one (a saved
+  conversation is resumed).
+- Approval: `normal` starts `agy acp` without permission flags and bridges each
+  `session/request_permission` to the chat (allow once or reject once). There is
+  no terminal sandbox in this mode, unlike the print runtime's whole-turn
+  approval. `full-auto` passes `--dangerously-skip-permissions --sandbox`;
+  `bypass` passes `--dangerously-skip-permissions`.
+- A message sent during a reply joins it as another `session/prompt` (steering).
+  agy refuses one while an approval is unanswered; that refusal is reported, not
+  queued.
+- Context usage comes from `usage_update`; native `/compact` and the native
+  commands agy advertises are available.
+- Background commands still running after the model moved on are listed as
+  tasks that cannot be stopped one by one (ACP has only session cancel and
+  close). Output agy pushes to an idle session is delivered as a follow-up
+  message. An idle process is closed after two hours unless one of its
+  background commands still runs.
+- The account quota is read with the same one-shot `agy -p /usage` as print.
+
 ## 中文摘要
 
 TaroCub 已按 Antigravity 1.2.2 的原生结构化协议接入：每个活跃 conversation
@@ -134,3 +177,9 @@ step index 去重重复工具快照。
 尚未对齐 Codex/Claude 的部分来自当前上游边界，而不是 bridge 伪装支持：
 Antigravity headless 暂无单工具远程审批、运行中 steer、结果后的后台任务生命
 周期，以及手动 compact/context API。TaroCub 对这些能力明确显示为不支持。
+
+以上是 print 运行时。Bot 的 `config.json` 里 `antigravityRuntime: "acp"` 时改走
+官方 ACP 服务 `agy acp`：逐次审批（普通审批不带终端沙箱）、运行中引导、上下文
+用量、原生 `/compact` 和后台命令列表都可用。agy 1.5.10 及以上时，新建的普通
+Antigravity Bot 默认用 ACP；幕僚长及其派出的 Bot、已有 Bot 保持原运行时。App
+和 CLI 没有切换入口，需手改该 Bot 的 `config.json` 后重启 Bot。
