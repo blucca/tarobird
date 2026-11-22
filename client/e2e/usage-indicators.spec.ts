@@ -1,6 +1,6 @@
 import { preparePairing } from "./fixtures/pairing-invite.js";
 import { test, expect, type Page } from "@playwright/test";
-import { randomBytes } from "node:crypto";
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,7 @@ import type { CoreBridgeLike } from "../../src/core/types.js";
 import { clickAppAction } from "./fixtures/desktop-actions.js";
 import { selectConversation, waitForClientOnline } from "./fixtures/mobile.js";
 import { createServer } from "./fixtures/vite.js";
+import type { multipleHosts } from "./fixtures/multiple-hosts.js";
 
 test.use({ serviceWorkers: "block" });
 type Readings = { context?: { used: number; window: number; compact?: number }; limits: Array<{ id: "primary" | "secondary"; used: number; period: number; resetHours: number }> };
@@ -275,4 +276,29 @@ test("phone with two computers: the red battery sits under the computer's name",
     await expect(header.locator(":scope > .host-source-badge.header-host-source")).toHaveAttribute("title", "运行于 办公室电脑");
     await header.screenshot({ path: info.outputPath("phone-two-hosts-plenty.png"), animations: "disabled" });
   } finally { await page.close(); await gateway.disconnect(); await a.close(); await b.close(); await vite.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("forgetting a computer on this device also forgets its saved quota readings", async ({ page }) => {
+  const server = await createServer({ server: { port: 0, strictPort: false, host: "127.0.0.1" } }); await server.listen();
+  try {
+    await page.goto(server.resolvedUrls!.local[0]! + "e2e/fixtures/multiple-hosts.html");
+    await page.waitForFunction(() => !!(window as unknown as { multipleHosts?: unknown }).multipleHosts);
+    const key = () => generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "der" }).toString("base64");
+    const left = await page.evaluate(async ([reset, removed]) => {
+      const f = (window as unknown as { multipleHosts: typeof multipleHosts }).multipleHosts;
+      const stored = () => JSON.parse(localStorage.getItem("tarobird.quotaReadings.v1") ?? "null") as unknown;
+      localStorage.setItem("tarobird.quotaReadings.v1", JSON.stringify({ [reset]: { alpha: {} }, [removed]: { beta: {} }, other: { gamma: {} } }));
+      // A local reset of one computer's cache.
+      const a = await f.registry.add({ deviceId: "device_a", name: "A", publicKey: "fixture", hubPublicKey: reset, routes: [] }, "A");
+      await (await f.registry.open(a.id))!.cache.forgetIdentity();
+      const afterReset = stored();
+      // Removing a computer from this device.
+      const b = await f.registry.add({ deviceId: "device_b", name: "B", publicKey: "fixture", hubPublicKey: removed, routes: [] }, "B");
+      await f.registry.beginRemoval(b.id);
+      await f.registry.finishRemoval(b.id, b.registrationId, { shared: async () => undefined, push: async () => undefined, browser: async () => undefined, key: async () => undefined });
+      return { afterReset, afterRemoval: stored() };
+    }, [key(), key()] as const);
+    expect(Object.keys(left.afterReset as object).length).toBe(2); expect(left.afterReset).toHaveProperty("other");
+    expect(left.afterRemoval).toEqual({ other: { gamma: {} } });
+  } finally { await server.close(); }
 });

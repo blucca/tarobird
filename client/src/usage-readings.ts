@@ -109,6 +109,14 @@ export function saveQuota(raw: string | null, hostKey: string, readings: Readonl
   }
   return JSON.stringify(hosts);
 }
+/** The stored text without one Host's readings, for when this device forgets that Host. */
+export function forgetSavedQuota(raw: string | null, hostKey: string): string {
+  const hosts = savedHosts(raw); delete hosts[hostKey]; return JSON.stringify(hosts);
+}
+/** Drops one Host's saved readings from this device's storage. */
+export function forgetSavedQuotaHost(hostKey: string): void {
+  try { const raw = localStorage.getItem(SAVED_QUOTA_KEY); if (raw !== null) localStorage.setItem(SAVED_QUOTA_KEY, forgetSavedQuota(raw, hostKey)); } catch { /* blocked storage holds no readings */ }
+}
 /** What becomes of a saved reading once its Host has answered for that Bot. It is shown only after the Bot's
  * worker says it is still the same login ("adopt"); another login discards it ("drop"); while only the Hub
  * answers for a worker that is away, it keeps waiting ("wait"). */

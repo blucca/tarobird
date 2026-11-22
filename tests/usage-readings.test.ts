@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { QuotaScope, QuotaWindow } from "../src/client-protocol/engine-quota.js";
-import { contextView, loadSavedQuota, mayAskEngine, nextHeldQuota, poolCoversModel, quotaView, quotaViewEndsAt, savedQuotaAfter, saveQuota, shortTokens, usageTone, QUOTA_SHOWN_FOR_MS, QUOTA_SIGN_IN_RETRY_MS } from "../client/src/usage-readings.js";
+import { contextView, forgetSavedQuota, loadSavedQuota, mayAskEngine, nextHeldQuota, poolCoversModel, quotaView, quotaViewEndsAt, savedQuotaAfter, saveQuota, shortTokens, usageTone, QUOTA_SHOWN_FOR_MS, QUOTA_SIGN_IN_RETRY_MS } from "../client/src/usage-readings.js";
 
 const now = Date.parse("2026-11-22T10:00:00Z");
 const iso = (minutes: number) => new Date(now + minutes * 60_000).toISOString();
@@ -187,6 +187,12 @@ describe("readings saved on the device", () => {
     for (const raw of [null, "", "{not json", "[]", "7", JSON.stringify({ "host-a": 7 }), JSON.stringify({ "host-a": { alpha: { id: "alpha" } } }), JSON.stringify({ "host-a": { alpha: reading("beta", -1) } }), JSON.stringify({ "host-a": { alpha: { ...reading("alpha", -1), extra: true } } })])
       expect(loadSavedQuota(raw, "host-a", now).size).toBe(0);
     expect(saveQuota("{not json", "host-a", new Map([["alpha", reading("alpha", -1)]]), now)).toContain("alpha");
+  });
+  it("forgets one Host's saved readings and keeps the others", () => {
+    const text = saveQuota(saveQuota(null, "host-a", new Map([["alpha", reading("alpha", -1)]]), now), "host-b", new Map([["alpha", reading("alpha", -1)]]), now);
+    const left = forgetSavedQuota(text, "host-a");
+    expect(loadSavedQuota(left, "host-a", now).size).toBe(0); expect(loadSavedQuota(left, "host-b", now).size).toBe(1);
+    expect(forgetSavedQuota("{not json", "host-a")).toBe("{}");
   });
   it("holds no account identity, only the reading", () => {
     const text = saveQuota(null, "host-a", new Map([["alpha", reading("alpha", -1)]]), now);

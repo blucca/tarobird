@@ -17,6 +17,7 @@ import { conversationFoldersSchema, emptyConversationFolders, type ConversationF
 import { DEFAULT_MONO_ACCENT, DEFAULT_PALETTE, DEFAULT_THEME, isColorPalette, isMonoAccent, type ColorPalette, type MonoAccent } from "./palettes.js";
 import { normalizeLayoutDensity, type LayoutDensity } from "./layout-density.js";
 import { storedLocale, systemLocale } from "./system-locale.js";
+import { forgetSavedQuotaHost } from "./usage-readings.js";
 import type { NamedBot } from "./bot-references.js";
 import { profileCacheSchema, type ProfileCache } from "../../src/client-protocol/avatars.js";
 import { openDB, type DBSchema, type StoreNames, type IDBPTransaction, type IDBPDatabase } from "idb";
@@ -727,6 +728,8 @@ export class ClientCache {
     // Large downloads live on disk, outside these stores; drop them with the rest.
     await clearAttachmentDiskCache();
     if (identity) { clearNoteRecoveries(identity.deviceId); this.clearSelectionHint(this.selectionHintKey(identity, generation as string | undefined)); }
+    // Quota readings are saved per Host outside these stores (Bot ids, pool names, percentages); the forgotten Host's go too.
+    if (identity?.hubPublicKey) forgetSavedQuotaHost(identity.hubPublicKey);
     this.draftsChanged();
     this.diffReviewsChanged();
   }

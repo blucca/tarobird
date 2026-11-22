@@ -12,6 +12,7 @@ import { DEFAULT_MONO_ACCENT, DEFAULT_PALETTE, isColorPalette, isMonoAccent } fr
 import { normalizeLayoutDensity } from "./layout-density.js";
 import { hostProfileSchema, type HostProfileState } from "../../src/client-protocol/host-profile.js";
 import { removeCrossHostFolderOrderHost } from "./cross-host-folder-order.js";
+import { forgetSavedQuotaHost } from "./usage-readings.js";
 
 export type RuntimeHost = {
   id: string;
@@ -405,7 +406,7 @@ export class HostRegistry {
           await tx.objectStore("meta").put(JSON.stringify(ids.filter(value => value !== id)), "desktopMigrationRepair");
         }
         await tx.objectStore("hosts").delete(id); await tx.done;
-        if (this.databaseName === "tarocub-hosts-v1") removeCrossHostFolderOrderHost(record.publicKey);
+        if (this.databaseName === "tarocub-hosts-v1") { removeCrossHostFolderOrderHost(record.publicKey); forgetSavedQuotaHost(record.publicKey); }
         this.changed();
       } finally { cache?.close(); }
     });
