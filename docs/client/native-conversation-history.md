@@ -117,14 +117,24 @@ mutation is never replayed by the Gateway outbox; only anchor/result evidence is
 replayed. Reconnect recovery reads existing receipts and can complete local
 binding or Hub projection for a confirmed native result.
 
+The Hub waits for the Gateway's apply answer for up to the same 10 minutes
+(reads such as the snapshot keep the ordinary 10 s Bot call deadline). The App
+and the CLI stop waiting for their own request sooner (20 s and 30 s); the
+operation then shows as not yet confirmed, and `history status`, `history
+reconcile` or the App's check read the outcome once the Gateway has answered.
+
 A disconnect, timeout, interrupted receipt or unconfirmed native result remains
-unknown. The source remains fenced, for at most 10 minutes from admission:
+unknown. The source remains fenced. From 10 minutes after admission:
 longer than a live Gateway can spend on one operation (Codex allows 180 s for
-`thread/fork` and as long again to read the fork back). The Hub then reads the
-Gateway receipt once more; a recorded result is finalized as usual. Otherwise
-the operation is released as rejected (`cancelled`): the Gateway clears its
-fence unless it is still running the operation itself, and the conversation can
-be used and forked again. A fork or rewind the engine did complete but never
+`thread/fork` and as long again to read the fork back), the Hub reads the
+Gateway receipt once more whenever the Bot's worker is connected; a recorded
+result is finalized as usual. Otherwise the operation is released as rejected
+(`cancelled`): the Gateway clears its fence unless it is still running the
+operation itself, and the conversation can be used and forked again. Release
+needs that worker, because the Gateway's own fence must be cleared too: while
+the Bot stays offline the conversation stays fenced, and it is released
+shortly after the worker reconnects. A confirmed result whose local
+finalization keeps failing is not released; it stays unknown. A fork or rewind the engine did complete but never
 recorded stays outside TaroBird: a fork remains an unbound native session, a
 rewind remains in effect natively while App messages keep no exclusion mark. Status lookup does not invoke the mutation
 again. Do not change the request ID to retry an uncertain mutation. No generic

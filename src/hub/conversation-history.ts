@@ -256,7 +256,13 @@ export class HubConversationHistory {
   /** Releases operations left unconfirmed for HISTORY_RELEASE_AFTER_MS. A result the Gateway recorded meanwhile still wins. */
   releaseExpired(now = Date.now()): Promise<void> {
     return this.releasing ??= (async () => {
-      const rows = await this.store.db.serial(() => this.store.db.all<OperationRow>("SELECT * FROM history_operations WHERE state NOT IN ('applied','rejected') AND created_at<? ORDER BY created_at LIMIT 20", [now - HISTORY_RELEASE_AFTER_MS]));
+      const rows = await this.store.db.serial(async () => {
+        // Release needs the Bot's worker. Only rows a connected worker can release fill the batch,
+        // so older rows of an offline Bot never keep an online Bot's rows waiting.
+        const due = await this.store.db.all<{ bot_id: string }>("SELECT DISTINCT bot_id FROM history_operations WHERE state NOT IN ('applied','rejected') AND created_at<?", [now - HISTORY_RELEASE_AFTER_MS]);
+        const ready = due.map(row => row.bot_id).filter(botId => this.host.available(botId) === "ready");
+        return ready.length ? this.store.db.all<OperationRow>(`SELECT * FROM history_operations WHERE state NOT IN ('applied','rejected') AND created_at<? AND bot_id IN (${ready.map(() => "?").join(",")}) ORDER BY created_at LIMIT 20`, [now - HISTORY_RELEASE_AFTER_MS, ...ready]) : [];
+      });
       for (const row of rows) if (this.host.available(row.bot_id) === "ready") await this.release(row).catch(() => undefined);
     })().finally(() => { this.releasing = undefined; });
   }
