@@ -790,6 +790,42 @@ configuration, including the short-lived loopback capability URL, to a private
 only the file path. This does not provide isolation from arbitrary code running
 as the same OS user.
 
+## Remote screen target
+
+Being paired gives a device no screen access. The Host's screen policy starts
+disabled and holds explicit per-device `view` or `control` grants bound to the
+device's public key; only an enrolled local owner controller changes it, with a
+signed `screen-grant` action and a revision compare-and-swap. A `view` grant
+never yields a control lease. Control is a separate explicit request, granted
+only after a fresh keyframe the target confirmed, as a short lease the viewer
+must keep renewing; losing focus, backgrounding or a stale picture lets it end.
+
+The target service (the App on the controlled computer) registers only on the
+Host's loopback instance listener, with a short one-use ticket from the
+owner-only Host control socket. Remote TLS clients, relay peers included, also
+arrive on loopback but cannot reach the target routes, and unauthenticated
+sockets are bounded separately from target ones (`remote-screen-sockets.ts`).
+Frames and input never enter the message store, Bot queues, outbox or journal;
+there is no clipboard synchronization. Each session has a byte budget; only a
+viewer whose own address is on the local network (not loopback, not Tailscale)
+gets the larger one.
+
+On the target, input runs with the App's own rights. macOS requires the
+user-granted Screen Recording, Accessibility and Input Monitoring permissions.
+Windows input runs at the App's integrity level, without elevation or desktop
+switching: elevated windows and consent screens cannot be controlled, and a
+locked, unknown or non-interactive desktop refuses control; a local lock stops
+capture and unlocking does not restore the session. Local input during control
+(local takeover) ends control. On Windows, keys and buttons the target presses
+are journalled before they are pressed (`screen-held-journal.mjs`) so that what
+may still be down after a crash is released on restart.
+
+Residual risk: a granted controller acts with the target user's full rights
+inside that desktop session. Crash recovery is best effort: it releases only
+what the journal records and the desktop can take input for. See
+[the remote screen design](client/remote-screen-2026-10-31.md) and
+[targets and mobile viewers](client/remote-screen-platforms-2026-11-21.md).
+
 ## Readonly workspace diff boundary
 
 The `workspace.diff.v1` routes additionally require owner status, conversation

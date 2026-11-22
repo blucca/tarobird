@@ -22,7 +22,9 @@ text uses explicit text input, not clipboard synchronization.
 The target requires the Host's `screen-windows-v1` capability. App and CLI status
 and open requests opt in with `includeWindows=1`. Legacy requests receive no
 Windows desktop, and cannot open a Windows control session. Mac descriptions
-and signed device-grant policy bodies retain their prior contract. A missing
+and signed device-grant policy bodies retain their prior contract; an App
+older than this change, asking without the opt-in, therefore says the desktop
+service is not running (`screen_service_offline`) for a running Windows target. A missing
 native addon, an older Host and a missing device grant are separate conditions.
 Reason sentences follow the target's platform as last read for that Host; when
 it was never disclosed, they name neither a Mac nor a Windows-only cause.
@@ -86,16 +88,19 @@ bound ends the session. The Android audit checks each side of the rule.
 - Windows logic and integration: `screen_windows.rs`, Electron
   `screen-windows.test.mjs`, root `screen-service-hub-windows.test.ts` and
   `remote-screen-keys-windows.test.ts`.
-- Shared viewer and mobile UI: existing desktop screen tests plus
-  `screen-mobile`, `screen-mobile-transport` and `screen-touch` browser specs.
+- Shared viewer and mobile UI: existing desktop screen tests plus the
+  `remote-screen-windows`, `screen-mobile`, `screen-mobile-entry`,
+  `screen-mobile-keyboard-focus`, `screen-mobile-landscape`,
+  `screen-mobile-network`, `screen-mobile-safe-area`, `screen-mobile-status`,
+  `screen-mobile-transport`, `screen-touch` and `screen-touch-scroll` browser specs.
 - Native loopback: `node client/scripts/ios-screen-audit.mjs <private-output>`
   on Apple Foundation; `node client/scripts/android-transport-audit.mjs
-  <private-output>` on a JVM. Both use a synthetic TLS peer. The Android run
-  then drives the same transport against a real HubServer
-  (`client/android/audit/real-hub-peer.mjs`, run with the root `tsx`): its TLS
-  listener and identity proof, screen sockets and heartbeat, a paired and
-  granted viewer, and the Host's own stop, sign-in expiry and revocation. Only
-  the target's capture is synthetic. The client workflow's native jobs run these
+  <private-output>` on a JVM. Both use a synthetic TLS peer, then drive the same
+  transport against a real HubServer (iOS: `tests/helpers/ios-screen-real-hub.ts`;
+  Android: `client/android/audit/real-hub-peer.mjs`, both run with the root
+  `tsx`): its TLS listener, real tickets, sign-in and screen sockets, and a
+  paired and granted viewer. The Android run also covers the Host's own stop,
+  sign-in expiry and revocation. Only the target's capture is synthetic. The client workflow's native jobs run these
   checks in addition to platform compilation; the Android runner records the
   hashes of the production and audit sources it ran.
 - Native mobile checks have separately exercised real WKWebView/Capacitor and
