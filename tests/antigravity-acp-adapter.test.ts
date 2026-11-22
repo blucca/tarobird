@@ -519,6 +519,21 @@ describe("AntigravityAcpAdapter core", () => {
     expect(JSON.stringify(blocks)).toContain("private rules");
   });
 
+  it("ends a native /compact normally when agy compacts without any text", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "/compact", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    harness.children[0]!.server.sendUpdate({ sessionUpdate: "usage_update", used: 900, size: 1_048_576 });
+    harness.children[0]!.server.respondPrompt({ stopReason: "end_turn" });
+    await expect(settleWithin(reply)).resolves.toEqual({ text: "", sessionId: SESSION_A });
+    // Any other prompt that ends without text keeps the empty-reply error.
+    const other = adapter.sendUserMessage(SESSION_A, { text: "/compact now", files: [] });
+    await waitFor(() => harness.children[0]!.server.prompts.length === 2);
+    harness.children[0]!.server.respondPrompt({ stopReason: "end_turn" });
+    await expect(settleWithin(other)).rejects.toThrow("Antigravity completed without returning a response");
+  });
+
   it("stops with session/cancel and keeps the live session for the next turn", async () => {
     const harness = createHarness();
     const adapter = track(await adapterFor(harness));

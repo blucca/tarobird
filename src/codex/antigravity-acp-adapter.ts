@@ -139,6 +139,8 @@ type Turn = {
   toolSeen: boolean;
   /** Length of the reply text when the owner last declined an approval in this turn. */
   declinedAt?: number;
+  /** The prompt is exactly the native /compact, which agy completes without text. */
+  compact: boolean;
   locale?: CodexUserMessageInput["locale"];
   onProgress?: CodexUserMessageInput["onProgress"];
   onEngineEvent?: CodexUserMessageInput["onEngineEvent"];
@@ -744,7 +746,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private runTurn(worker: Worker, prompt: ContentBlock[], input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     return new Promise<CodexAdapterResponse>((resolve, reject) => {
       const turn: Turn = {
-        worker, prompts: [], text: "", usage: undefined, toolSeen: false, locale: input.locale,
+        worker, prompts: [], text: "", usage: undefined, toolSeen: false, compact: input.text.trim() === "/compact", locale: input.locale,
         onProgress: input.onProgress, onEngineEvent: input.onEngineEvent, onApprovalRequest: input.onApprovalRequest,
         approvals: new AbortController(), eventChain: Promise.resolve(), stopRequested: false,
         timeoutsDisabled: input.disableRuntimeTimeout === true, done: false, resolve, reject,
@@ -827,6 +829,10 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       const note = turn.locale === "zh" ? "已拒绝执行该操作，Antigravity 已停止本轮。" : "The action was declined, so Antigravity stopped this turn.";
       const before = turn.text.trim();
       this.settleTurn(turn, undefined, before ? `${before}\n\n${note}` : note);
+      return;
+    } else if (!turn.text.trim() && turn.compact) {
+      // agy 1.5.14 compacts and ends with end_turn and no text; the Host reports the compaction itself.
+      this.settleTurn(turn, undefined, "");
       return;
     } else if (!turn.text.trim()) {
       error = turn.toolSeen

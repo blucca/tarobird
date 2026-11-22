@@ -285,9 +285,8 @@ export async function handleLocalEngineCoreCommand(input: {
         abortSignal: context.abortSignal,
       });
 
-      const compactMsg = locale === "zh"
-        ? `上下文已压缩。\n\n${result.text}`
-        : `Context compacted.\n\n${result.text}`;
+      // A native compact can finish without any text of its own (Antigravity ACP).
+      const compactMsg = [locale === "zh" ? "上下文已压缩。" : "Context compacted.", result.text.trim() ? result.text : ""].filter(Boolean).join("\n\n");
       compactAuditText = compactMsg;
       const chunks = chunkReplyMessage(compactMsg);
       await context.api.sendMessage(normalized.chatId, chunks[0]!);

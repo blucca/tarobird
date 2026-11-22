@@ -498,6 +498,25 @@ describe("handleLocalEngineTelegramCommand", () => {
     }
   });
 
+  it("reports a native compact that returned no text with the Host line alone", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agy-compact-empty-"));
+    try {
+      for (const locale of ["en", "zh"] as const) {
+        const api = { sendMessage: vi.fn().mockResolvedValue({ message_id: 11 }) };
+        await handleLocalEngineCoreCommand({
+          stateDir: root, startedAt: Date.now() - 10, locale,
+          cfg: { engine: "antigravity", antigravityRuntime: "acp" },
+          normalized: createNormalizedMessage("/compact"), context: { api: api as never, instanceName: "default", updateId: 82 },
+          bridge: { handleAuthorizedMessage: vi.fn().mockResolvedValue({ text: "" }) },
+          sessionStore: { removeByChatId: vi.fn(), clearAll: vi.fn() }, updateInstanceConfig: vi.fn(),
+        });
+        expect(api.sendMessage).toHaveBeenNthCalledWith(2, 123, locale === "zh" ? "上下文已压缩。" : "Context compacted.");
+      }
+    } finally {
+      await removeTempRoot(root);
+    }
+  });
+
   it("uses Pi's configured workspace before a fallback resume workspace for /context", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-context-"));
     const api = { sendMessage: vi.fn().mockResolvedValue({ message_id: 1 }) };
