@@ -30,11 +30,12 @@ session.json
 asr-jobs/
 integrations/tingwu-asr/.venv/
 integrations/tingwu-asr/output/
-integrations/tingwu-asr/__pycache__/
 integrations/qwen3-asr/.venv/
 integrations/qwen3-asr/models/
-integrations/qwen3-asr/__pycache__/
 integrations/qwen3-asr/output/
+# Python bytecode embeds the absolute source path of the machine that ran it.
+__pycache__/
+*.py[co]
 tingwu_asr/output/
 .cctb/
 
