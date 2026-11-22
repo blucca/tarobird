@@ -5650,5 +5650,6 @@
   "文件与改动": "Files & Changes",
   "关闭工作区": "Close workspace",
   "刷新工作区": "Refresh workspace",
-  "后台命令": "Shell task"
+  "后台命令": "Shell task",
+  "附件与文档": "Files & docs"
 }

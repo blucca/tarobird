@@ -292,14 +292,19 @@ for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
         await expect(page.locator(".app-shell")).not.toHaveClass(/has-side-panel/);
       }
 
-      // Overview tab: Environment + Bot-to-Bot Comms (needs approval + replied)
+      // Overview tab: Environment + Bot-to-Bot Comms + Artifacts, fitting cleanly in a single desktop viewport (zero vertical overflow!)
       await expect(container).toContainText("Example Studio Host");
       await expect(container).toContainText("Architect");
       await expect(container).toContainText("Reviewer");
       await expect(container).toContainText(L("待审批"));
       await expect(container).toContainText("Researcher");
       await expect(container).toContainText(L("已回传"));
+      await expect(container).toContainText("workspace-rail-spec.md");
       await noHorizontalOverflow(page, phone ? ".conversation-workspace-sheet" : ".conversation-workspace-rail");
+      if (!phone) {
+        const fitsWithoutScroll = await container.locator(".workspace-body").evaluate(node => node.scrollHeight <= node.clientHeight + 1);
+        expect(fitsWithoutScroll).toBe(true);
+      }
       await shot(page, info, `${tag}-overview`);
 
       // Expand details inline on the completed comm
@@ -322,6 +327,10 @@ for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
       const diffButton = container.getByRole("button", { name: /2.*14.*3/ });
       await expect(diffButton).toBeVisible();
       await noHorizontalOverflow(page, phone ? ".conversation-workspace-sheet" : ".conversation-workspace-rail");
+      if (!phone) {
+        const filesFitWithoutScroll = await container.locator(".workspace-body").evaluate(node => node.scrollHeight <= node.clientHeight + 1);
+        expect(filesFitWithoutScroll).toBe(true);
+      }
       await shot(page, info, `${tag}-files`);
 
       // Click the recorded run diff trigger from inside Workspace Rail to open RunDiffViewer

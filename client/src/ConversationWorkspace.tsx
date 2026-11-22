@@ -7,13 +7,11 @@ import {
   Cpu,
   ExternalLink,
   FileCode2,
-  FileText,
   FolderOpen,
   Globe,
   Layers,
   ListOrdered,
   Network,
-  Paperclip,
   RefreshCw,
   ShieldCheck,
   Square,
@@ -38,6 +36,9 @@ import "./conversation-workspace.css";
 
 export type WorkspaceTab = "overview" | "comms" | "files";
 
+const FILES_PAGE_SIZE = 6;
+const COMMS_PAGE_SIZE = 4;
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -50,6 +51,17 @@ function formatRelativeTime(timestamp: number, locale: string): string {
   if (diffSec < 3600) return t("{0} 分钟前", Math.floor(diffSec / 60));
   if (diffSec < 86400) return t("{0} 小时前", Math.floor(diffSec / 3600));
   return new Date(timestamp).toLocaleDateString(locale === "en" ? "en-US" : "zh-CN", { month: "short", day: "numeric" });
+}
+
+function fileBadge(name: string, mime?: string): { label: string; tone: string } {
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+  if (ext === "md" || ext === "markdown" || mime === "text/markdown") return { label: "MD", tone: "is-md" };
+  if (ext === "pdf" || mime === "application/pdf") return { label: "PDF", tone: "is-pdf" };
+  if (["png", "jpg", "jpeg", "webp", "gif", "svg"].includes(ext) || mime?.startsWith("image/")) return { label: "IMG", tone: "is-img" };
+  if (["json", "ts", "tsx", "js", "jsx", "py", "go", "rs", "css", "html", "yml", "yaml", "sh", "sql"].includes(ext)) {
+    return { label: ext.slice(0, 4).toUpperCase(), tone: "is-code" };
+  }
+  return { label: (ext || "FILE").slice(0, 4).toUpperCase(), tone: "" };
 }
 
 function commStatusLabel(status: BotCommItem["status"]): string {
@@ -186,6 +198,9 @@ export function ConversationWorkspace({
   const locale = useLocale();
   const [tab, setTab] = useState<WorkspaceTab>("overview");
   const [commFilter, setCommFilter] = useState<"all" | "active" | "cross_host">("all");
+  const [commPage, setCommPage] = useState(0);
+  const [fileFilter, setFileFilter] = useState<"all" | "diff" | "files">("all");
+  const [filePage, setFilePage] = useState(0);
   const [expandedComms, setExpandedComms] = useState<ReadonlySet<string>>(() => new Set());
   const [tasks, setTasks] = useState<EngineTask[]>([]);
   const [stoppingTaskId, setStoppingTaskId] = useState<string | undefined>(undefined);
@@ -203,9 +218,10 @@ export function ConversationWorkspace({
   );
   const directBot = conversation.type === "direct" && convBots.length === 1 ? convBots[0] : undefined;
 
-  // Reset per-conversation expanded items on switch
   useEffect(() => {
     setExpandedComms(new Set());
+    setCommPage(0);
+    setFilePage(0);
     setTasks([]);
     setQueue(undefined);
     setPermissions(undefined);
@@ -214,12 +230,13 @@ export function ConversationWorkspace({
     setWorkbenchItems([]);
   }, [conversation.id, connection.identity.hubPublicKey]);
 
-  // Fetch live tasks, queue, permissions, files, and local workbench entries
+  useEffect(() => { setCommPage(0); }, [commFilter]);
+  useEffect(() => { setFilePage(0); }, [fileFilter]);
+
   useEffect(() => {
     const abort = new AbortController();
     const convId = conversation.id;
 
-    // 1. Local workbench items for this conversation (IndexedDB, works offline too)
     void listWorkbenchLibrary(connection, { maxScopes: 200, maxEntries: 500 })
       .then(listing => {
         if (abort.signal.aborted) return;
@@ -229,18 +246,16 @@ export function ConversationWorkspace({
 
     if (!online) return () => abort.abort();
 
-    // 2. Conversation files
     const fileParams = new URLSearchParams({ conversationId: convId, q: "" });
     void connection.http(`/api/conversation-files?${fileParams}`, { signal: abort.signal })
       .then(raw => {
         if (abort.signal.aborted) return;
         const page = conversationFilesPageSchema.parse(raw);
-        setFiles(page.items.slice(0, 12));
-        setFilesHasMore(!!page.nextCursor || page.items.length > 12);
+        setFiles(page.items.slice(0, 24));
+        setFilesHasMore(!!page.nextCursor || page.items.length > 24);
       })
       .catch(() => undefined);
 
-    // 3. Direct-bot runtime details (tasks, queue, permissions)
     if (directBot) {
       if (connection.state.engineTasksAvailable && directBot.online) {
         void connection.http(`/api/conversations/${encodeURIComponent(convId)}/tasks?botId=${encodeURIComponent(directBot.id)}`, { signal: abort.signal })
@@ -294,13 +309,12 @@ export function ConversationWorkspace({
       );
       if (res.outcome === "accepted") setRefreshTick(n => n + 1);
     } catch {
-      // ignore; user can retry or inspect in full tasks modal
+      // ignore
     } finally {
       setStoppingTaskId(undefined);
     }
   };
 
-  // Extract latest bot messages with runChanges summaries (for code conversations)
   const diffMessages = useMemo(() => {
     if (connection.state.user?.role !== "owner") return [];
     const found: Message[] = [];
@@ -334,7 +348,38 @@ export function ConversationWorkspace({
     return commItems;
   }, [commItems, commFilter]);
 
-  const artifactsCount = diffMessages.length + workbenchItems.length + files.length;
+  const commTotalPages = Math.max(1, Math.ceil(filteredComms.length / COMMS_PAGE_SIZE));
+  const pagedComms = filteredComms.slice(commPage * COMMS_PAGE_SIZE, (commPage + 1) * COMMS_PAGE_SIZE);
+
+  // Unified non-diff artifacts (workbench docs + conversation files) for clean pagination & grid
+  const fileArtifacts = useMemo(() => [
+    ...workbenchItems.map(entry => ({
+      kind: "workbench" as const,
+      key: `wb:${entry.kind}:${entry.id}`,
+      name: entry.title || workbenchKindLabel(entry.kind),
+      badgeLabel: entry.kind === "whiteboard" ? "WB" : entry.kind === "markdown" ? "DOC" : "DES",
+      badgeTone: "is-wb",
+      meta: t("工作台 · {0}", workbenchKindLabel(entry.kind)),
+      entry,
+    })),
+    ...files.map(file => {
+      const badge = fileBadge(file.name, file.mime);
+      return {
+        kind: "file" as const,
+        key: `file:${file.attachmentId}:${file.messageId}`,
+        name: file.name,
+        badgeLabel: badge.label,
+        badgeTone: badge.tone,
+        meta: `${formatBytes(file.size)} · ${formatRelativeTime(file.createdAt, locale)}`,
+        file,
+      };
+    }),
+  ], [workbenchItems, files, locale]);
+
+  const fileTotalPages = Math.max(1, Math.ceil(fileArtifacts.length / FILES_PAGE_SIZE));
+  const pagedFileArtifacts = fileArtifacts.slice(filePage * FILES_PAGE_SIZE, (filePage + 1) * FILES_PAGE_SIZE);
+
+  const artifactsCount = diffMessages.length + fileArtifacts.length;
   const permissionLabel = useMemo(() => {
     if (!permissions) return undefined;
     return permissions.choices.find(c => c.id === permissions.choice)?.label ?? permissions.choice;
@@ -354,7 +399,22 @@ export function ConversationWorkspace({
     onRefreshComms();
   };
 
-  const renderCommCard = (item: BotCommItem) => {
+  const openArtifact = (artifact: (typeof fileArtifacts)[number]) => {
+    if (artifact.kind === "workbench") {
+      onOpenWorkbenchFile({
+        scope: artifact.entry.scope,
+        conversationId: artifact.entry.conversationId,
+        id: artifact.entry.id,
+        kind: artifact.entry.kind,
+        title: artifact.entry.title || workbenchKindLabel(artifact.entry.kind),
+      });
+    } else {
+      onLocateMessage(artifact.file.conversationId, artifact.file.messageId);
+    }
+    if (phone) onClose();
+  };
+
+  const renderCommCard = (item: BotCommItem, compact: boolean) => {
     const expanded = expandedComms.has(item.id);
     const deliveryLabel = commDeliveryLabel(item.delivery);
     const needsApproval = item.status === "needs_approval";
@@ -366,45 +426,45 @@ export function ConversationWorkspace({
               : item.status === "failed" ? "is-failed"
                 : "is-queued";
     return (
-      <article key={item.id} className={`workspace-comm-card${needsApproval ? " is-needs-approval" : ""}`}>
+      <article key={item.id} className={`workspace-comm-card${compact ? " is-compact" : ""}${needsApproval ? " is-needs-approval" : ""}`}>
         <div className="workspace-comm-top">
           <div className="workspace-comm-route">
             <span>{item.sourceBotName}</span>
-            <ArrowRight size={12} aria-hidden="true"/>
+            <ArrowRight size={11} aria-hidden="true"/>
             <span>{item.targetBotName}</span>
           </div>
           <span className={`workspace-comm-status ${statusClass}`}>
-            {needsApproval && <AlertTriangle size={11} aria-hidden="true"/>}
+            {needsApproval && <AlertTriangle size={10} aria-hidden="true"/>}
             {commStatusLabel(item.status)}
           </span>
         </div>
-        <div className="workspace-comm-sub">
-          {item.crossHost && (
-            <span className="workspace-chip is-accent">
-              <Globe size={10} aria-hidden="true"/>
-              {t("跨主机 · {0}", item.direction === "outgoing" ? item.targetHostName : item.sourceHostName)}
-            </span>
-          )}
-          {item.kind === "agent_bus_stage" && item.workspaceName && (
-            <span className="workspace-chip">
-              <Network size={10} aria-hidden="true"/>
-              {item.workspaceName}
-            </span>
-          )}
-          {item.direction === "incoming" && (
-            <span>{t("协作入站")}</span>
-          )}
-          {deliveryLabel && item.kind !== "agent_bus_stage" && <span>{deliveryLabel}</span>}
-          <span>{formatRelativeTime(item.updatedAt, locale)}</span>
-        </div>
+        {!compact && (
+          <div className="workspace-comm-sub">
+            {item.crossHost && (
+              <span className="workspace-chip is-accent">
+                <Globe size={10} aria-hidden="true"/>
+                {t("跨主机 · {0}", item.direction === "outgoing" ? item.targetHostName : item.sourceHostName)}
+              </span>
+            )}
+            {item.kind === "agent_bus_stage" && item.workspaceName && (
+              <span className="workspace-chip">
+                <Network size={10} aria-hidden="true"/>
+                {item.workspaceName}
+              </span>
+            )}
+            {item.direction === "incoming" && <span>{t("协作入站")}</span>}
+            {deliveryLabel && item.kind !== "agent_bus_stage" && <span>{deliveryLabel}</span>}
+            <span>{formatRelativeTime(item.updatedAt, locale)}</span>
+          </div>
+        )}
         {needsApproval && item.pendingApproval && (
           <div className="workspace-comm-alert-box">
             <strong>{item.pendingApproval.title || t("下游等待审批或确认")}</strong>
-            {item.pendingApproval.detail && <span>{item.pendingApproval.detail}</span>}
+            {item.pendingApproval.detail && <span title={item.pendingApproval.detail}>{item.pendingApproval.detail}</span>}
           </div>
         )}
         {!expanded && !(needsApproval && item.pendingApproval) && (item.replyExcerpt || item.sentExcerpt) && (
-          <p className="workspace-comm-excerpt">{item.replyExcerpt ?? item.sentExcerpt}</p>
+          <p className="workspace-comm-excerpt" title={item.replyExcerpt ?? item.sentExcerpt}>{item.replyExcerpt ?? item.sentExcerpt}</p>
         )}
         {expanded && (
           <div className="workspace-comm-expanded">
@@ -453,65 +513,6 @@ export function ConversationWorkspace({
     );
   };
 
-  const renderArtifactsSection = (limit?: number) => {
-    const shownDiffs = limit ? diffMessages.slice(0, limit) : diffMessages;
-    const shownWb = limit ? workbenchItems.slice(0, limit) : workbenchItems;
-    const shownFiles = limit ? files.slice(0, limit) : files;
-    const empty = !shownDiffs.length && !shownWb.length && !shownFiles.length;
-    if (empty) {
-      return <div className="workspace-empty">{t("暂无本轮改动、工作台内容或对话文件。")}</div>;
-    }
-    return (
-      <div className="workspace-list">
-        {shownDiffs.map(msg => (
-          <div key={`diff:${msg.id}`} className="workspace-diff-row">
-            <DiffViewerTrigger connection={connection} message={msg}/>
-          </div>
-        ))}
-        {shownWb.map(entry => (
-          <button
-            key={`wb:${entry.kind}:${entry.id}`}
-            type="button"
-            className="workspace-item-row is-interactive"
-            onClick={() => {
-              onOpenWorkbenchFile({ scope: entry.scope, conversationId: entry.conversationId, id: entry.id, kind: entry.kind, title: entry.title || workbenchKindLabel(entry.kind) });
-              if (phone) onClose();
-            }}
-          >
-            <span className="workspace-item-icon"><FileText size={15}/></span>
-            <span className="workspace-item-main">
-              <span className="workspace-item-title">{entry.title || workbenchKindLabel(entry.kind)}</span>
-              <span className="workspace-item-meta">{t("工作台 · {0}", workbenchKindLabel(entry.kind))}</span>
-            </span>
-          </button>
-        ))}
-        {shownFiles.map(file => (
-          <button
-            key={`file:${file.attachmentId}:${file.messageId}`}
-            type="button"
-            className="workspace-item-row is-interactive"
-            onClick={() => {
-              onLocateMessage(file.conversationId, file.messageId);
-              if (phone) onClose();
-            }}
-          >
-            <span className="workspace-item-icon"><Paperclip size={14}/></span>
-            <span className="workspace-item-main">
-              <span className="workspace-item-title">{file.name}</span>
-              <span className="workspace-item-meta">{formatBytes(file.size)} · {formatRelativeTime(file.createdAt, locale)}</span>
-            </span>
-          </button>
-        ))}
-        {(filesHasMore || (limit && files.length > limit)) && (
-          <button type="button" className="workspace-section-action" onClick={onOpenAllFiles}>
-            <FolderOpen size={12}/>
-            <span>{t("查看全部对话文件")}</span>
-          </button>
-        )}
-      </div>
-    );
-  };
-
   const content = (
     <>
       <div className="workspace-tabs" role="tablist" aria-label={t("工作区标签")}>
@@ -553,70 +554,54 @@ export function ConversationWorkspace({
       <div className="workspace-body">
         {tab === "overview" && (
           <>
-            {/* 1. Environment & Context */}
+            {/* 1. Compact Environment & Context Strip */}
             <section className="workspace-section" aria-label={t("环境与上下文")}>
               <div className="workspace-section-header">
                 <span className="workspace-section-title">
-                  <Cpu size={13} aria-hidden="true"/>
+                  <Cpu size={12} aria-hidden="true"/>
                   <span>{t("环境与上下文")}</span>
                 </span>
               </div>
-              <div className="workspace-card">
-                <div className="workspace-kv-grid">
-                  <div className="workspace-kv-row">
-                    <span className="workspace-kv-label">{t("主机")}</span>
-                    <span className="workspace-kv-value" title={hostName}>
-                      <span className={`status-dot${online ? " online" : ""}`}/>
-                      <span>{hostName}</span>
-                    </span>
-                  </div>
-                  <div className="workspace-kv-row">
-                    <span className="workspace-kv-label">{t("连接")}</span>
-                    <span className="workspace-kv-value">{connectionSummary}</span>
-                  </div>
+              <div className="workspace-env-card">
+                <div className="workspace-env-top">
+                  <span className="workspace-env-host" title={hostName}>
+                    <span className={`status-dot${online ? " online" : ""}`}/>
+                    <span>{hostName}</span>
+                  </span>
+                  <span className="workspace-env-route">{connectionSummary}</span>
+                </div>
+                <div className="workspace-env-meta">
                   {directBot ? (
                     <>
-                      <div className="workspace-kv-row">
-                        <span className="workspace-kv-label">Bot</span>
-                        <span className="workspace-kv-value">{botLabels.get(directBot.id) ?? directBot.name}</span>
-                      </div>
+                      <span className="workspace-env-bot">{botLabels.get(directBot.id) ?? directBot.name}</span>
                       {(directBot.model || directBot.engine) && (
-                        <div className="workspace-kv-row">
-                          <span className="workspace-kv-label">{t("引擎 / 模型")}</span>
-                          <span className="workspace-kv-value">{[directBot.engine, directBot.model, directBot.effort].filter(Boolean).join(" · ")}</span>
-                        </div>
+                        <span className="workspace-env-model">{[directBot.engine, directBot.model, directBot.effort].filter(Boolean).join(" · ")}</span>
+                      )}
+                      <span className={`workspace-chip${directBot.online ? " is-online" : ""}`}>
+                        {directBot.online ? t("在线") : t("离线")}
+                      </span>
+                      {permissionLabel && (
+                        <span className="workspace-chip is-accent">
+                          <ShieldCheck size={10} aria-hidden="true"/>
+                          <span>{permissionLabel}</span>
+                        </span>
                       )}
                     </>
                   ) : (
-                    <div className="workspace-kv-row">
-                      <span className="workspace-kv-label">{t("群组成员")}</span>
-                      <span className="workspace-kv-value">
-                        <Users size={12} aria-hidden="true"/>
-                        <span>{t("{0} 位 Bot", convBots.length)}</span>
+                    <>
+                      <span className="workspace-env-bot">
+                        <Users size={11} aria-hidden="true"/> {t("{0} 位 Bot", convBots.length)}
                       </span>
-                    </div>
-                  )}
-                </div>
-                <div className="workspace-chips">
-                  {directBot && (
-                    <span className={`workspace-chip${directBot.online ? " is-online" : ""}`}>
-                      {directBot.online ? t("在线") : t("离线")}
-                    </span>
-                  )}
-                  {permissionLabel && (
-                    <span className="workspace-chip is-accent">
-                      <ShieldCheck size={11} aria-hidden="true"/>
-                      <span>{permissionLabel}</span>
-                    </span>
+                      {convBots.slice(0, 3).map(bot => (
+                        <span key={bot.id} className={`workspace-chip${bot.online ? " is-online" : ""}`}>
+                          {botLabels.get(bot.id) ?? bot.name}
+                        </span>
+                      ))}
+                    </>
                   )}
                   {group && conversation.parentId && (
                     <span className="workspace-chip">{t("话题 · {0}", group.title)}</span>
                   )}
-                  {!directBot && convBots.slice(0, 4).map(bot => (
-                    <span key={bot.id} className={`workspace-chip${bot.online ? " is-online" : ""}`}>
-                      {botLabels.get(bot.id) ?? bot.name}
-                    </span>
-                  ))}
                 </div>
               </div>
             </section>
@@ -625,7 +610,7 @@ export function ConversationWorkspace({
             <section className="workspace-section" aria-label={t("进行中与队列")}>
               <div className="workspace-section-header">
                 <span className="workspace-section-title">
-                  <ListOrdered size={13} aria-hidden="true"/>
+                  <ListOrdered size={12} aria-hidden="true"/>
                   <span>{t("进行中与队列")}</span>
                 </span>
                 {onOpenTasksModal && directBot && connection.state.engineTasksAvailable && (
@@ -645,7 +630,7 @@ export function ConversationWorkspace({
                       </span>
                     </div>
                   )}
-                  {activeTasks.map(task => (
+                  {activeTasks.slice(0, 2).map(task => (
                     <div key={task.id} className="workspace-item-row">
                       <span className="workspace-item-icon"><span className="status-dot online"/></span>
                       <span className="workspace-item-main">
@@ -665,9 +650,9 @@ export function ConversationWorkspace({
                       )}
                     </div>
                   ))}
-                  {queuedItems.slice(0, 3).map((item, idx) => (
+                  {queuedItems.slice(0, 2).map((item, idx) => (
                     <div key={item.message.id} className="workspace-item-row">
-                      <span className="workspace-item-icon"><ListOrdered size={13}/></span>
+                      <span className="workspace-item-icon"><ListOrdered size={12}/></span>
                       <span className="workspace-item-main">
                         <span className="workspace-item-title">{blocksText(item.message.blocks).trim() || t("排队消息 #{0}", idx + 1)}</span>
                         <span className="workspace-item-meta">{t("队列第 {0} 位", idx + 1)}</span>
@@ -676,44 +661,73 @@ export function ConversationWorkspace({
                   ))}
                 </div>
               ) : (
-                <div className="workspace-empty">{t("当前空闲，无运行中或排队任务。")}</div>
+                <div className="workspace-idle-strip">{t("当前空闲，无运行中或排队任务。")}</div>
               )}
             </section>
 
-            {/* 3. Bot-to-Bot Comms (auto-hidden in Overview when 0 items) */}
+            {/* 3. Bot-to-Bot Comms (auto-hidden in Overview when 0 items; capped to 2 compact cards) */}
             {commItems.length > 0 && (
               <section className="workspace-section" aria-label={t("Bot 间通信")}>
                 <div className="workspace-section-header">
                   <span className="workspace-section-title">
-                    <Network size={13} aria-hidden="true"/>
+                    <Network size={12} aria-hidden="true"/>
                     <span>{t("Bot 间通信")}</span>
                   </span>
-                  {commItems.length > 3 && (
+                  {commItems.length > 2 && (
                     <button type="button" className="workspace-section-action" onClick={() => setTab("comms")}>
                       {t("查看全部 ({0})", commItems.length)}
                     </button>
                   )}
                 </div>
                 <div className="workspace-list">
-                  {commItems.slice(0, 4).map(renderCommCard)}
+                  {commItems.slice(0, 2).map(item => renderCommCard(item, true))}
                 </div>
               </section>
             )}
 
-            {/* 4. Artifacts & Run Changes */}
+            {/* 4. Artifacts & Run Changes (compact Diff bar + 2-column file tile grid) */}
             <section className="workspace-section" aria-label={t("产物与本轮改动")}>
               <div className="workspace-section-header">
                 <span className="workspace-section-title">
-                  <FileCode2 size={13} aria-hidden="true"/>
+                  <FileCode2 size={12} aria-hidden="true"/>
                   <span>{t("产物与本轮改动")}</span>
                 </span>
-                {artifactsCount > 4 && (
+                {artifactsCount > 0 && (
                   <button type="button" className="workspace-section-action" onClick={() => setTab("files")}>
                     {t("全部 ({0})", artifactsCount)}
                   </button>
                 )}
               </div>
-              {renderArtifactsSection(4)}
+              {diffMessages.length === 0 && fileArtifacts.length === 0 ? (
+                <div className="workspace-idle-strip">{t("暂无本轮改动、工作台内容或对话文件。")}</div>
+              ) : (
+                <div className="workspace-list">
+                  {diffMessages.slice(0, 1).map(msg => (
+                    <div key={`diff:${msg.id}`} className="workspace-diff-row">
+                      <DiffViewerTrigger connection={connection} message={msg}/>
+                    </div>
+                  ))}
+                  {fileArtifacts.length > 0 && (
+                    <div className="workspace-file-grid">
+                      {fileArtifacts.slice(0, 4).map(artifact => (
+                        <button
+                          key={artifact.key}
+                          type="button"
+                          className="workspace-file-tile"
+                          title={artifact.name}
+                          onClick={() => openArtifact(artifact)}
+                        >
+                          <span className={`workspace-file-badge ${artifact.badgeTone}`}>{artifact.badgeLabel}</span>
+                          <span className="workspace-file-tile-text">
+                            <span className="workspace-file-tile-name">{artifact.name}</span>
+                            <span className="workspace-file-tile-meta">{artifact.meta}</span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </section>
           </>
         )}
@@ -731,8 +745,17 @@ export function ConversationWorkspace({
                 {t("跨主机")} ({commItems.filter(i => i.crossHost).length})
               </button>
             </div>
-            {filteredComms.length > 0 ? (
-              <div className="workspace-list">{filteredComms.map(renderCommCard)}</div>
+            {pagedComms.length > 0 ? (
+              <>
+                <div className="workspace-list">{pagedComms.map(item => renderCommCard(item, false))}</div>
+                {commTotalPages > 1 && (
+                  <div className="workspace-pager">
+                    <button type="button" disabled={commPage === 0} onClick={() => setCommPage(p => Math.max(0, p - 1))}>{t("上一页")}</button>
+                    <span>{commPage + 1} / {commTotalPages}</span>
+                    <button type="button" disabled={commPage + 1 >= commTotalPages} onClick={() => setCommPage(p => Math.min(commTotalPages - 1, p + 1))}>{t("下一页")}</button>
+                  </div>
+                )}
+              </>
             ) : (
               <div className="workspace-empty">
                 {commItems.length > 0
@@ -745,7 +768,74 @@ export function ConversationWorkspace({
 
         {tab === "files" && (
           <section className="workspace-section" aria-label={t("文件与改动")}>
-            {renderArtifactsSection()}
+            <div className="workspace-filter-bar">
+              <button type="button" className="workspace-filter-pill" aria-pressed={fileFilter === "all"} onClick={() => setFileFilter("all")}>
+                {t("全部")} ({artifactsCount})
+              </button>
+              {diffMessages.length > 0 && (
+                <button type="button" className="workspace-filter-pill" aria-pressed={fileFilter === "diff"} onClick={() => setFileFilter("diff")}>
+                  {t("本轮改动")} ({diffMessages.length})
+                </button>
+              )}
+              <button type="button" className="workspace-filter-pill" aria-pressed={fileFilter === "files"} onClick={() => setFileFilter("files")}>
+                {t("附件与文档")} ({fileArtifacts.length})
+              </button>
+            </div>
+
+            {artifactsCount === 0 ? (
+              <div className="workspace-empty">{t("暂无本轮改动、工作台内容或对话文件。")}</div>
+            ) : (
+              <div className="workspace-list">
+                {fileFilter !== "files" && diffMessages.length > 0 && (
+                  <>
+                    <div className="workspace-group-label">{t("本轮改动")}</div>
+                    {diffMessages.map(msg => (
+                      <div key={`diff:${msg.id}`} className="workspace-diff-row">
+                        <DiffViewerTrigger connection={connection} message={msg}/>
+                      </div>
+                    ))}
+                  </>
+                )}
+
+                {fileFilter !== "diff" && pagedFileArtifacts.length > 0 && (
+                  <>
+                    <div className="workspace-group-label">{t("附件与文档")}</div>
+                    <div className="workspace-file-grid">
+                      {pagedFileArtifacts.map(artifact => (
+                        <button
+                          key={artifact.key}
+                          type="button"
+                          className="workspace-file-tile"
+                          title={artifact.name}
+                          onClick={() => openArtifact(artifact)}
+                        >
+                          <span className={`workspace-file-badge ${artifact.badgeTone}`}>{artifact.badgeLabel}</span>
+                          <span className="workspace-file-tile-text">
+                            <span className="workspace-file-tile-name">{artifact.name}</span>
+                            <span className="workspace-file-tile-meta">{artifact.meta}</span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {fileFilter !== "diff" && fileTotalPages > 1 && (
+                  <div className="workspace-pager">
+                    <button type="button" disabled={filePage === 0} onClick={() => setFilePage(p => Math.max(0, p - 1))}>{t("上一页")}</button>
+                    <span>{filePage + 1} / {fileTotalPages}</span>
+                    <button type="button" disabled={filePage + 1 >= fileTotalPages} onClick={() => setFilePage(p => Math.min(fileTotalPages - 1, p + 1))}>{t("下一页")}</button>
+                  </div>
+                )}
+
+                {filesHasMore && (
+                  <button type="button" className="workspace-section-action" onClick={onOpenAllFiles}>
+                    <FolderOpen size={12}/>
+                    <span>{t("查看全部对话文件")}</span>
+                  </button>
+                )}
+              </div>
+            )}
           </section>
         )}
       </div>
