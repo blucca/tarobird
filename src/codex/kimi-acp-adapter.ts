@@ -2822,9 +2822,7 @@ export class KimiAcpAdapter implements CodexAdapter {
         canStop: false, ...(entry ? { startedAt: entry.startedAt } : {}), updatedAt: task.lastSeenAt,
         ...(parent ? { parentId: handle(parent.taskId) } : {}), owner: task.onEngineEvent ? "bound" : "unattributed" };
     });
-    for (const taskId of worker.taskListEntries.keys()) {
-      if (!worker.backgroundTasks.has(taskId) && !worker.terminalBackgroundTasks.has(taskId)) worker.taskListEntries.delete(taskId);
-    }
+    this.forgetEndedTaskListEntries(worker);
     const tasks = [...ended.sort((a, b) => a.updatedAt - b.updatedAt), ...live];
     return { supported: true, tasks: tasks.slice(-128) };
   }
@@ -6081,6 +6079,13 @@ export class KimiAcpAdapter implements CodexAdapter {
     }
   }
 
+  /** Drops task-list labels of work that is neither running nor within its tombstone window. */
+  private forgetEndedTaskListEntries(worker: KimiWorker): void {
+    for (const taskId of worker.taskListEntries.keys()) {
+      if (!worker.backgroundTasks.has(taskId) && !worker.terminalBackgroundTasks.has(taskId)) worker.taskListEntries.delete(taskId);
+    }
+  }
+
   private pruneExpiredBackgroundTasks(worker: KimiWorker, now: number): void {
     if (this.backgroundTaskMaxAgeMs > 0) {
       for (const [taskId, task] of worker.backgroundTasks.entries()) {
@@ -6130,6 +6135,8 @@ export class KimiAcpAdapter implements CodexAdapter {
         worker.terminalBackgroundTasks.delete(taskId);
       }
     }
+    // The task list is read only while its panel is open; forget its labels here too.
+    this.forgetEndedTaskListEntries(worker);
     if (this.backgroundTaskMaxAgeMs > 0) {
       for (const [toolCallId, question] of worker.detachedQuestions.entries()) {
         if (now - question.lastSeenAt < this.backgroundTaskMaxAgeMs) {
