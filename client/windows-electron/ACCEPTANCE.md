@@ -57,6 +57,10 @@ node client\scripts\windows-acceptance.mjs --confirm-disposable-windows ^
     `windows_control_job` (ControlJob retires the CLI and spares its detached
     child, with a negative control), and `windows_source_guard` (old-App
     mutex and forwarding window).
+  - `--show-toast-probe`: after the first-launch checks, shows one toast as
+    the production AppID `com.tarobot.client` and removes it again. This may
+    create that AppID's Windows notification profile, so later runs on the
+    same user no longer start unregistered. Recorded as `info` only.
 - `--scope install,upgrade,update,native,paired`: the scopes the verdict
   covers. The default is all five. Each scope lists required checks in
   `SCOPES` in the script.
@@ -79,8 +83,9 @@ node client\scripts\windows-acceptance.mjs --confirm-disposable-windows ^
 | preflight | Windows; confirmation flag and env var; uninstall, location and Run keys read through .NET, where "absent" and "unreadable" are told apart; data folders `stat`ed; process list from CIM. Anything unreadable is a refusal. |
 | native | the three Windows Rust test suites, built for `x86_64-pc-windows-msvc` with `+crt-static` as in release (`RUSTFLAGS` is not inherited, since it would override the target flags) and run one at a time (`--test-threads=1`: the source-guard tests share fixed mutex names). Each test binary must report at least one passed test, and no test may report `skipped:`. |
 | legacy | Tauri layout (`<install>\host`); seeded login item read back; the old App creates `EBWebView` |
-| install | installer exit code; uninstall key (name, binary, version); App, helper, updater, core, exporter, addon and `resources\host` runtime files; `tarocub` deep link; Start Menu shortcut target; notification receipt written by `--register-notification-shortcut`; `Get-StartApps` lists AppID `com.tarobot.client`; **the old `<install>\host` folder is gone**; login item kept |
+| install | installer exit code; uninstall key (name, binary, version); App, helper, updater, core, exporter, addon and `resources\host` runtime files; `tarocub` deep link; Start Menu shortcut target; notification receipt written by `--register-notification-shortcut`; `Get-StartApps` lists AppID `com.tarobot.client`; **the old `<install>\host` folder is gone**; login item kept. `notification-status-probe` (`info`, never judged, read-only): the toast setting HRESULT and whether `Notifications\Settings\com.tarobot.client` exists |
 | first-launch | the App is still running; `electron-profile\tarobot-desktop-profile-v1.json` is `fresh` for a new install, or `imported` with a UUID `exportId` after a Tauri upgrade; for an import, `desktop-migration\receipts\<exportId>.json` names the same export, target `electron` and more than 0 records (main writes it only after the renderer committed the import); Host and credentials (scope `paired`) |
+| notification-show | only with `--show-toast-probe`: `notification-status-probe` again, before and after one shown toast (`info`); it does not prove that a banner appeared |
 | update | same install checks at the new version; profile marker unchanged (same mode and `exportId`) after relaunch |
 | uninstall | uninstaller exit code; program, uninstall key and deep link removed; user data kept (a fresh start needs consent). Login item: after a Tauri upgrade, this installation's `Run\TaroBot` (`<exe> `) is removed (scope `upgrade`). On a fresh run, the suite first writes a `Run\TaroBot` for another directory; it must survive the uninstall, and then the suite deletes that value itself. |
 
