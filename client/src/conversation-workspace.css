@@ -52,23 +52,6 @@
   color: #fff;
 }
 
-.workspace-rail-trigger.is-phone {
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  border: 0;
-  border-radius: 8px;
-}
-
-.workspace-rail-trigger.is-phone .workspace-rail-trigger-badge {
-  position: absolute;
-  top: 2px;
-  right: 2px;
-  min-width: 14px;
-  height: 14px;
-  font-size: 9px;
-}
-
 .conversation-workspace-rail {
   position: relative;
   display: flex;
@@ -804,16 +787,4 @@
   line-height: 1.5;
   color: var(--muted);
   text-align: center;
-}
-
-/* Mobile sheet adaptation inside CreationDialog */
-.conversation-workspace-sheet .workspace-tabs {
-  margin: -4px -4px 8px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-}
-
-.conversation-workspace-sheet .workspace-body {
-  padding: 0 0 14px;
-  max-height: min(68dvh, 560px);
 }

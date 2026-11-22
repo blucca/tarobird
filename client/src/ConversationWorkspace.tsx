@@ -28,7 +28,6 @@ import { nativeRun } from "../../src/client-protocol/run.js";
 import { runChangesSummarySchema } from "../../src/client-protocol/run-changes.js";
 import type { Bot, HubConnection } from "./connection.js";
 import { DiffViewerTrigger } from "./DiffViewerTrigger.js";
-import { CreationDialog } from "./CreationDialog.js";
 import { listWorkbenchLibrary, type WorkbenchLibraryEntry } from "./workbench-library.js";
 import type { WorkbenchFileTarget } from "./workbench-library-context.js";
 import { t, useLocale } from "./i18n.js";
@@ -150,7 +149,6 @@ export function useConversationBotComms(
 
 export interface ConversationWorkspaceProps {
   id: string;
-  phone: boolean;
   connection: HubConnection;
   conversation: Conversation;
   group?: Conversation;
@@ -174,7 +172,6 @@ export interface ConversationWorkspaceProps {
 
 export function ConversationWorkspace({
   id,
-  phone,
   connection,
   conversation,
   group,
@@ -411,7 +408,6 @@ export function ConversationWorkspace({
     } else {
       onLocateMessage(artifact.file.conversationId, artifact.file.messageId);
     }
-    if (phone) onClose();
   };
 
   const renderCommCard = (item: BotCommItem, compact: boolean) => {
@@ -501,7 +497,6 @@ export function ConversationWorkspace({
               className={`workspace-jump-btn${needsApproval ? " is-alert" : ""}`}
               onClick={() => {
                 onJumpConversation(item.targetConversationId!, item.pendingApproval?.messageId ?? item.targetMessageId);
-                if (phone) onClose();
               }}
             >
               <span>{needsApproval ? t("去批准") : t("去协作对话")}</span>
@@ -841,20 +836,6 @@ export function ConversationWorkspace({
       </div>
     </>
   );
-
-  if (phone) {
-    return (
-      <CreationDialog
-        title={t("会话工作区")}
-        closeLabel={t("关闭工作区")}
-        returnFocus={returnFocus}
-        close={onClose}
-        className="conversation-workspace-sheet"
-      >
-        {content}
-      </CreationDialog>
-    );
-  }
 
   return (
     <aside id={id} className="conversation-workspace-rail" aria-label={t("会话工作区")}>

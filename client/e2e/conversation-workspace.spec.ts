@@ -274,23 +274,27 @@ for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
       }
       await expect(page.getByRole("heading", { name: mainTitle, exact: true, level: 1 })).toBeVisible();
 
-      // Workspace trigger is closed by default and shows the amber approval alert badge ("1").
+      // On phone viewports, the Conversation Workspace entry and rail stay hidden to keep mobile clean.
       const trigger = page.getByRole("button", { name: L("会话工作区"), exact: true });
+      if (phone) {
+        await expect(trigger).toHaveCount(0);
+        await expect(page.locator("aside.conversation-workspace-rail")).toHaveCount(0);
+        expect(errors).toEqual([]);
+        return;
+      }
+
+      // Desktop: Workspace trigger is closed by default and shows the amber approval alert badge ("1").
       await expect(trigger).toBeVisible();
       await expect(trigger).toHaveAttribute("aria-expanded", "false");
       await expect(trigger.locator(".workspace-rail-trigger-badge.is-alert")).toHaveText("1");
 
-      // Open Workspace Rail / Sheet
+      // Open Workspace Rail
       await trigger.click();
       await expect(trigger).toHaveAttribute("aria-expanded", "true");
-      const container = phone
-        ? page.getByRole("dialog", { name: L("会话工作区"), exact: true })
-        : page.locator("aside.conversation-workspace-rail");
+      const container = page.locator("aside.conversation-workspace-rail");
       await expect(container).toBeVisible();
-      if (!phone) {
-        // Light rail does NOT trigger desktop side-panel window expansion.
-        await expect(page.locator(".app-shell")).not.toHaveClass(/has-side-panel/);
-      }
+      // Light rail does NOT trigger desktop side-panel window expansion.
+      await expect(page.locator(".app-shell")).not.toHaveClass(/has-side-panel/);
 
       // Overview tab: Environment + Bot-to-Bot Comms + Artifacts, fitting cleanly in a single desktop viewport (zero vertical overflow!)
       await expect(container).toContainText("Example Studio Host");
