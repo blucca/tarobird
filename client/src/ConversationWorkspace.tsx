@@ -709,7 +709,7 @@ export function ConversationWorkspace({
                   ))}
                   {fileArtifacts.length > 0 && (
                     <div className="workspace-file-grid">
-                      {fileArtifacts.slice(0, 4).map(artifact => (
+                      {fileArtifacts.slice(0, diffMessages.length > 0 ? 2 : 3).map(artifact => (
                         <button
                           key={artifact.key}
                           type="button"
