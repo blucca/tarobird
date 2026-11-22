@@ -1064,7 +1064,8 @@ function condensedProcessPanel(
     parts.push(`🧠 ${truncate(state.reasoning.content.trim(), 600)}`);
   }
   let toolCount = 0;
-  const finalTextBlockIndex = findFinalAnswerBlockIndex(state, answer, locale);
+  const answerBlocks = answerClosingBlocks(state, answer, locale);
+  const finalTextBlockIndex = answerBlocks.size ? -1 : findFinalAnswerBlockIndex(state, answer, locale);
   for (const [blockIndex, block] of state.blocks.entries()) {
     if (block.kind === "tool") {
       // TodoWrite shows as the dedicated plan panel, not in the process list.
@@ -1073,6 +1074,9 @@ function condensedProcessPanel(
       }
       toolCount += 1;
       parts.push(`- ${toolHeaderText(block.tool)}`);
+      continue;
+    }
+    if (answerBlocks.has(blockIndex)) {
       continue;
     }
     const text = cleanCardText(block.content, locale, { sources: state.webSources }).trim();
@@ -1118,6 +1122,35 @@ function condensedProcessPanel(
     color: "grey",
     body: truncate(body, PROCESS_PANEL_MAX),
   });
+}
+
+/**
+ * The text blocks the answer ends with, whole. An engine may give every sentence of the turn as its reply (Kimi
+ * joins the sentence before the tools and the text after them), so the answer can be more than the closing block.
+ * Read from the end, paragraph by paragraph, and stop at the first block the answer does not end with: a sentence
+ * the answer does not contain stays in the process. Empty when the closing block is not complete in the answer
+ * (streamed in part); `findFinalAnswerBlockIndex` handles that case.
+ */
+function answerClosingBlocks(state: CoreRunState, answer: string, locale: Locale): Set<number> {
+  const covered = new Set<number>();
+  let rest = answer;
+  for (let index = state.blocks.length - 1; index >= 0 && rest; index -= 1) {
+    const block = state.blocks[index];
+    if (block?.kind !== "text") {
+      continue;
+    }
+    const text = cleanCardText(block.content, locale, { sources: state.webSources }).trim();
+    if (!text) {
+      continue;
+    }
+    const before = rest.endsWith(text) ? rest.slice(0, rest.length - text.length) : undefined;
+    if (before === undefined || before && !/\s$/.test(before)) {
+      break;
+    }
+    covered.add(index);
+    rest = before.trimEnd();
+  }
+  return covered;
 }
 
 function findFinalAnswerBlockIndex(state: CoreRunState, answer: string, locale: Locale): number {

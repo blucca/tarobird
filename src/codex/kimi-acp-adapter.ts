@@ -10,6 +10,7 @@ import { open, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { StringDecoder } from "node:string_decoder";
 
 import {
@@ -166,6 +167,8 @@ type KimiToolState = {
   rawInput?: unknown;
   rawOutput?: unknown;
   latestContentText?: string;
+  /** The newest content text that arrived while the call's input was not known yet: the arguments being written. */
+  argumentText?: string;
   content?: ToolCallContent[];
   terminalIds?: Set<string>;
   emittedInput?: unknown;
@@ -1403,6 +1406,17 @@ function toolContentText(content: ToolCallContent[] | null | undefined): string 
     }
   }
   return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+/**
+ * The content text that is what the call printed. Kimi (seen in 2.7.2) first writes a call's arguments as growing
+ * content text, then repeats them together with `rawInput`; the output, if any, comes after. Until the input is
+ * known the text is returned as it is, because an agent that never sends `rawInput` reports output this way.
+ */
+function kimiToolOutputText(state: KimiToolState): string | undefined {
+  const text = state.latestContentText;
+  if (text === undefined || state.rawInput === undefined) return text;
+  return text === state.argumentText || isDeepStrictEqual(maybeParseJson(text), state.rawInput) ? undefined : text;
 }
 
 function maybeParseJson(value: string | undefined): unknown {
@@ -3870,6 +3884,7 @@ export class KimiAcpAdapter implements CodexAdapter {
         rawInput: update.rawInput ?? existing?.rawInput,
         rawOutput: update.rawOutput ?? existing?.rawOutput,
         latestContentText: toolContentText(update.content) ?? existing?.latestContentText,
+        argumentText: (update.rawInput ?? existing?.rawInput) === undefined ? toolContentText(update.content) ?? existing?.argumentText : existing?.argumentText,
         content: update.content ?? existing?.content,
         terminalIds: new Set([...(existing?.terminalIds ?? []), ...(update.content?.flatMap(item => item.type === "terminal" ? [item.terminalId] : []) ?? [])]),
         emittedUse: existing?.emittedUse ?? false,
@@ -3917,6 +3932,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       const contentText = toolContentText(update.content);
       if (contentText !== undefined) {
         state.latestContentText = contentText;
+        if (state.rawInput === undefined) state.argumentText = contentText;
       }
       worker.tools.set(update.toolCallId, state);
       this.rememberDetachedQuestion(worker, state, pending, continuation);
@@ -4234,7 +4250,10 @@ export class KimiAcpAdapter implements CodexAdapter {
   private emitToolProgress(worker: KimiWorker, state: KimiToolState): void {
     if (state.emittedResult || this.backgroundContinuationForUpdate(worker)) return;
     const pending = worker.pendingTurn;
-    const text = typeof state.rawOutput === "string" ? state.rawOutput : state.latestContentText;
+    // Text that begins like a JSON object before the input is known may be the arguments being written; it is
+    // not shown as progress. If it was output after all, the result still carries it.
+    const text = typeof state.rawOutput === "string" ? state.rawOutput
+      : state.rawInput === undefined && /^\s*\{/.test(state.latestContentText ?? "") ? undefined : kimiToolOutputText(state);
     if (!pending || !text || !text.startsWith(state.progressText ?? "")) return;
     const delta = text.slice(state.progressText?.length ?? 0);
     state.progressText = text;
@@ -4248,7 +4267,7 @@ export class KimiAcpAdapter implements CodexAdapter {
     this.maybeEmitToolUse(worker, state);
     state.emittedResult = true;
     const evidence = { ...(state.terminalIds?.size === 1 ? state.terminalEvidence : {}), ...kimiToolEvidence(state.content, worker.terminals, state.terminalIds) };
-    const output = stringifyOutput(state.rawOutput) ?? state.latestContentText ?? evidence.output;
+    const output = stringifyOutput(state.rawOutput) ?? kimiToolOutputText(state) ?? evidence.output;
     await this.captureBackgroundTaskToolOutput(worker, state.toolName, output, isError);
     if (this.backgroundContinuationForUpdate(worker)) {
       return;

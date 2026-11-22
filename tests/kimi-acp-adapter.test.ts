@@ -1056,6 +1056,36 @@ describe("KimiAcpAdapter", () => {
     } finally { await adapter.destroy(); }
   });
 
+  it("does not show the arguments Kimi writes as content before rawInput as the call's output", async () => {
+    // Recorded from kimi 2.7.2 on 2026-11-22: the arguments arrive as growing content text with status
+    // in_progress, then once more together with rawInput and the "Running: ..." title; the output follows.
+    const harness = createHarness(), events: EngineStreamEvent[] = [];
+    const adapter = new KimiAcpAdapter("kimi", adapterOptions(harness));
+    const text = (value: string) => [{ type: "content" as const, content: { type: "text" as const, text: value } }];
+    const written = '{"command":"sleep 4 && echo hello","timeout":30}', input = { command: "sleep 4 && echo hello", timeout: 30 };
+    try {
+      const turn = adapter.sendUserMessage("telegram-54", { text: "run", files: [], onEngineEvent: event => { events.push(event); } });
+      await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+      const server = harness.children[0].server;
+      for (const [id, output] of [["with-output", "hello"], ["silent", undefined]] as const) {
+        server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: id, title: "Bash", kind: "execute", status: "pending", content: [] });
+        for (const part of ['{"command":"', '{"command":"sleep 4 && echo', written]) server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: id, status: "in_progress", content: text(part) });
+        server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: id, status: "in_progress", title: "Running: sleep 4 && echo hello", rawInput: input, content: text(written) });
+        if (output) server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: id, status: "in_progress", content: text(output) });
+        server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: id, status: "completed" });
+      }
+      server.sendUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done" } });
+      server.respondPrompt(); await turn;
+      const of = (id: string, type: string) => events.filter(event => event.type === type && "toolUseId" in event && event.toolUseId === id);
+      expect(of("with-output", "tool_progress").map(event => "text" in event ? event.text : "").join("")).toBe("hello");
+      expect(of("with-output", "tool_result")).toMatchObject([{ output: "hello" }]);
+      expect(of("with-output", "tool_use").at(-1)).toMatchObject({ toolInput: input });
+      expect(of("silent", "tool_progress")).toEqual([]);
+      expect(of("silent", "tool_result")).toHaveLength(1);
+      expect(JSON.stringify(of("silent", "tool_result"))).not.toContain("sleep 4");
+    } finally { await adapter.destroy(); }
+  });
+
   it("relays Kimi hook background tasks into start and out-of-band completion events", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-hook-test-"));
     const configPath = path.join(root, "config.json");
