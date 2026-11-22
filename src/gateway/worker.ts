@@ -23,6 +23,7 @@ import { appendServiceLifecycleEventSync, monitorServiceCrashes } from "../runti
 import { appendAuditEventBestEffort } from "../runtime/audit-events.js";
 import { cancelDrainRequestSchema, drainCommitSchema, drainStatusRequestSchema, restartRequestSchema, shutdownRequestSchema, type DrainBlocker } from "./control.js";
 import { gatewayActiveWorkCount, gatewayDrainBlockers } from "./activity.js";
+import { createIdleWatch } from "./idle-watch.js";
 import { settleProcessTreeKills } from "../codex/process-tree.js";
 
 export async function createGatewayBridge(env: EnvSource) {
@@ -43,6 +44,8 @@ export async function runGatewayWorker(argv: string[]): Promise<void> {
   let stopRequested = false, startupComplete = false, channelStop: Promise<void> | undefined;
   let drainId: string | undefined, drainCommitted = false, isIdle = () => false;
   let drainBlockers = (): DrainBlocker[] => [{ botId, type: "worker", count: 1 }];
+  // Only a requested restart or a committed drain waits for the worker to go quiet.
+  const idleWatch = createIdleWatch(() => (draining ? drainCommitted : restartRequested) && isIdle(), () => resolveStop());
   const stop = () => {
     // A dead parent must not leave its retiring worker reconnecting to a new
     // Hub and accepting input while cron/Bus cleanup is still in progress.
@@ -54,6 +57,7 @@ export async function runGatewayWorker(argv: string[]): Promise<void> {
     const cancel = cancelDrainRequestSchema.safeParse(value);
     if (cancel.success) {
       draining = false; drainId = undefined; drainCommitted = false; restarting = restartRequested;
+      idleWatch.want(restartRequested);
       restartReceipts++;
       void Promise.resolve(scheduler?.resumeAdmission()).then(() => true, error => { console.error(error instanceof Error ? error.message : "cron_resume_failed"); return false; }).then(ok => {
         if (cancel.data.requestId && process.send) {
@@ -71,6 +75,7 @@ export async function runGatewayWorker(argv: string[]): Promise<void> {
     restarting = true;
     if (request.data.type === "drain.whenIdle") { draining = true; drainId = request.data.requestId; drainCommitted = false; scheduler?.pauseAdmission(); }
     else restartRequested = true;
+    idleWatch.want(true);
     if (request.data.requestId && process.send) {
       restartReceipts++;
       try { process.send({ type: "restart.queued", requestId: request.data.requestId, pid: process.pid }, () => { restartReceipts--; }); }
@@ -78,7 +83,7 @@ export async function runGatewayWorker(argv: string[]): Promise<void> {
     }
   };
   process.once("SIGINT", stop); process.once("SIGTERM", stop); process.once("disconnect", stop); process.on("message", message);
-  let channel: Awaited<ReturnType<typeof attachGateway>> | undefined; let scheduler: CronScheduler | undefined; let idle: ReturnType<typeof setInterval> | undefined;
+  let channel: Awaited<ReturnType<typeof attachGateway>> | undefined; let scheduler: CronScheduler | undefined; let alive: ReturnType<typeof setInterval> | undefined;
   let bus: Awaited<ReturnType<typeof startGatewayBus>>; let workerBridge: CoreBridgeLike | undefined;
   try {
     lock = await acquireInstanceLock(stateDir);
@@ -129,11 +134,14 @@ export async function runGatewayWorker(argv: string[]): Promise<void> {
           return reasons;
         };
         isIdle = () => drainBlockers().length === 0;
-        idle = setInterval(() => { if ((draining ? drainCommitted : restartRequested) && isIdle()) resolveStop(); }, 250);
+        idleWatch.arm();
+        // The poll this replaced also kept the process alive while every other handle was unreferenced
+        // (a reconnect wait, for instance). One timer that practically never fires does that without waking it.
+        alive = setInterval(() => {}, 0x7fffffff);
         await stopped;
       }
     } finally {
-      if (idle) clearInterval(idle);
+      idleWatch.stop(); if (alive) clearInterval(alive);
       try { await scheduler?.stop(); } finally {
         try { await bus?.stop(); } finally {
           try { await (channelStop ?? channel?.disconnect()); } finally {
