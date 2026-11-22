@@ -1768,6 +1768,9 @@ export class PiRpcAdapter implements CodexAdapter {
     const guard = () => { if (!isCurrent()) throw stale(); };
     const read = async <T>(work: () => Promise<T>): Promise<T> => { guard(); const value = await work(); guard(); return value; };
     const write = (choice: Parameters<PiRpcAdapter["chooseForSession"]>[1], options: { isCurrent: () => Promise<boolean> }) => read(async () => {
+      // A change is use of the worker, so the idle sweep does not close it mid-change. Reads do not count:
+      // a client that keeps looking must not keep an idle process alive.
+      worker.lastUsedAt = Date.now();
       // Checked on both sides of the caller's own asynchronous check, right before each native write.
       await this.chooseForSession(worker, choice, async () => { guard(); if (!(await options.isCurrent())) throw stale(); guard(); });
       guard();
@@ -2034,9 +2037,12 @@ export class PiRpcAdapter implements CodexAdapter {
       const held = worker.turn ? "a turn is running" : worker.exclusive ? `${worker.exclusive} is in progress` : worker.dialogs.size ? `${worker.dialogs.size} extension dialog(s) open` : undefined;
       if (held) { this.keepIdle(worker, held, idle); continue; }
       // Ask Pi itself before closing: an extension may have started work the Host did not see.
+      const usedAt = worker.lastUsedAt;
       let state: PiSessionState;
       try { state = await this.refreshState(worker); } catch (error) { this.keepIdle(worker, `Pi did not report its state (${error instanceof Error ? error.name : "error"})`, idle); continue; }
-      const busy = worker.turn ? "a turn started" : state.isStreaming ? "Pi reports a run in progress" : state.isCompacting ? "Pi reports a compaction"
+      // The Host may have started something while Pi answered: looked at again here, not taken from before the question.
+      const busy = worker.turn ? "a turn started" : worker.exclusive ? `${worker.exclusive} started` : worker.dialogs.size ? "an extension dialog opened"
+        : worker.lastUsedAt !== usedAt ? "used while Pi was asked" : state.isStreaming ? "Pi reports a run in progress" : state.isCompacting ? "Pi reports a compaction"
         : state.pendingMessageCount > 0 ? `pending messages: ${state.pendingMessageCount}` : undefined;
       if (busy) { this.keepIdle(worker, busy, idle); continue; }
       this.log(`[pi] closed idle worker ${worker.sessionId.slice(0, 8)} after ${Math.round(idle / 1000)} s idle`);
