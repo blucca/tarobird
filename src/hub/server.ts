@@ -1950,6 +1950,10 @@ export class HubServer {
         }
         await reply(200, result); return;
       }
+      const botCommsRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/bot-comms$/);
+      if (botCommsRoute && req.method === "GET") {
+        await reply(200, await this.botMessages.listConversationComms(userId, botCommsRoute[1]!, validateInQueue)); return;
+      }
       const tasksRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/tasks(\/recover)?$/);
       if (tasksRoute && (req.method === "GET" || req.method === "POST")) {
         const conversationId = tasksRoute[1]!;

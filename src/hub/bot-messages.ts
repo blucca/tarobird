@@ -15,6 +15,7 @@ import { botMessageCapabilitiesSchema, botMessageSendSchema, botMessageSteeringC
   type BotMessageDelivery, type BotMessageDeliveryReceipt, type BotMessageSteeringSnapshot, type BotSteerFallbackReason } from "../client-protocol/bot-message-delivery.js";
 import { botSteerCallSchema, botSteerStatusSchema, steerResultSchema, type SteerResult } from "../client-protocol/steering.js";
 import { hasPendingCardAction } from "../client-protocol/message-clear.js";
+import { botCommDeliverySchema, conversationBotCommsSchema, type BotCommDelivery, type BotCommItem, type BotCommPendingApproval, type BotCommStatus, type ConversationBotComms } from "../client-protocol/workspace-comms.js";
 import type { Message } from "../client-protocol/index.js";
 import { STEER_EDGE_LIMIT, STEER_EDGE_WINDOW_MS, STEER_TURN_LIMIT, offlineSteering, steerFallbackNotice, steeringDisabledKey, type BotMessageSteeringHooks, type IncomingMemo } from "./bot-message-steering.js";
 
@@ -23,6 +24,66 @@ const digest = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 const activeRunPhases = runSummarySchema.shape.phase.options.filter(isRunActive);
 const activeRunPhaseParams = activeRunPhases.map(() => "?").join(",");
 const memoKey = (kind: string, ...parts: string[]) => `bot-messages:${kind}:${hashSecret(JSON.stringify(parts))}`;
+const TRACE_LIMIT = 32;
+const traceIndexKey = (conversationId: string) => `bot-messages:trace-index:${conversationId}`;
+const traceKey = (conversationId: string, sourceBot: string, requestId: string) => `bot-messages:trace:${conversationId}:${hashSecret(JSON.stringify([sourceBot, requestId]))}`;
+const traceMsgRefKey = (sourceBot: string, targetHostId: string, messageId: string) => `bot-messages:trace-msg:${hashSecret(JSON.stringify([sourceBot, targetHostId, messageId]))}`;
+type OutgoingTrace = {
+  sourceConversationId: string;
+  contextMessageId?: string;
+  requestId: string;
+  sourceHostId: string;
+  sourceHostName: string;
+  sourceBotId: string;
+  sourceBotName: string;
+  targetHostId: string;
+  targetHostName: string;
+  targetBotId?: string;
+  targetBotName: string;
+  crossHost: boolean;
+  targetConversationId?: string;
+  targetConversationTitle?: string;
+  targetMessageId?: string;
+  hops: number;
+  sentExcerpt?: string;
+  replyExcerpt?: string;
+  remoteStatus?: string;
+  delivery?: BotCommDelivery;
+  deliveryReason?: string;
+  sentAt: number;
+  updatedAt: number;
+  finishedAt?: number;
+};
+const trimExcerpt = (value: string | undefined, max: number): string | undefined => {
+  if (!value) return undefined;
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.length <= max ? normalized : `${normalized.slice(0, Math.max(1, max - 1))}…`;
+};
+const parseDeliveryActual = (value: unknown): BotCommDelivery | undefined => {
+  const parsed = botCommDeliverySchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+};
+const extractCardMarkdown = (elements: { type?: string; text?: string; children?: unknown[] }[] | undefined): string[] => {
+  if (!Array.isArray(elements)) return [];
+  const out: string[] = [];
+  for (const el of elements) {
+    if (el.type === "markdown" && typeof el.text === "string" && el.text.trim()) out.push(el.text.trim());
+    if (Array.isArray(el.children)) out.push(...extractCardMarkdown(el.children as { type?: string; text?: string; children?: unknown[] }[]));
+  }
+  return out;
+};
+const summarizePendingCard = (messageId: string, blocks: Block[]): BotCommPendingApproval | undefined => {
+  for (const block of blocks) {
+    if (block.type !== "card" || !hasPendingCardAction([block])) continue;
+    const title = trimExcerpt(block.title, 140);
+    const md = extractCardMarkdown(block.elements).join(" ");
+    const detailText = md || blocksText([block]).replace(title ?? "", "").trim();
+    const detail = trimExcerpt(detailText, 240);
+    return { messageId, ...(title ? { title } : {}), ...(detail ? { detail } : {}) };
+  }
+  return undefined;
+};
 /** Steer records with no final outcome yet (pending call or unconfirmed),
  * per recipient Bot; reconciled when its worker attaches. Bot IDs are idSchema. */
 const OPEN_STEER = "bot-messages:steer-open:";
@@ -263,7 +324,7 @@ export class BotMessages {
       const input = botLocalRequestSchema.parse(raw); requestId = input.requestId;
       const contextBound = input.contextMessage && ["resolve", "send", "upload", "chunk", "complete"].includes(input.operation);
       const context = async () => {
-        const row = await this.store.db.get<{ bot_source_json: string | null }>("SELECT m.bot_source_json FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND d.bot_id=? AND d.status='pending' AND d.dispatched=1", [input.contextMessage!, sourceBot]);
+        const row = await this.store.db.get<{ conversation_id: string; bot_source_json: string | null }>("SELECT m.conversation_id, m.bot_source_json FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND d.bot_id=? AND d.status='pending' AND d.dispatched=1", [input.contextMessage!, sourceBot]);
         if (!row) throw new HubError("bot_message_context_not_active", 403);
         if (await this.store.db.get("SELECT 1 FROM group_discussion_turns WHERE input_message_id=?", [input.contextMessage!])) throw new HubError("group_discussion_bot_messages_blocked", 403);
         return row;
@@ -273,6 +334,7 @@ export class BotMessages {
       const admit = async () => { await guard(); if (contextBound) await context(); };
       const hosts = await this.hosts(guard), own = hosts.find(h => h.publicKey === this.auth.publicKey)!;
       const host = resolveBotTarget(input.host, hosts, "host");
+      let sourceConversationId: string | undefined;
       const source = await this.store.db.serial(async () => {
         await guard(); await this.network.requireMessagePeerInTransaction(host.publicKey);
         const bot = await this.store.db.get<{ name: string }>("SELECT name FROM bots WHERE id=? AND deleted_at IS NULL", [sourceBot]);
@@ -280,6 +342,7 @@ export class BotMessages {
         let hops = 1;
         if (contextBound) {
           const row = await context();
+          sourceConversationId = row.conversation_id;
           // A group discussion turn speaks only in its own group. It never
           // delegates or messages other Bots (which could also leak a sealed
           // independent answer), whatever the Hub-side grants allow.
@@ -333,6 +396,11 @@ export class BotMessages {
       if (input.operation === "send" || input.operation === "wait") await this.store.audit(`bot-message.outgoing-${input.operation}`, sourceBot, { requestId: input.requestId, hostId: host.id, ...(downgraded ? { delivery: "receiver_update_required" } : {}) });
       if (downgraded && result && typeof result === "object") result = { ...result, delivery: { requested: "steer", actual: "fell_back_to_queue", reason: "receiver_update_required" } satisfies BotMessageDeliveryReceipt };
       if (queueRequested && result && typeof result === "object" && !("delivery" in result)) result = { ...result, delivery: { requested: "queue", actual: "queued" } satisfies BotMessageDeliveryReceipt };
+      if (input.operation === "send" && sourceConversationId && result && typeof result === "object") {
+        await this.recordOutgoingTrace(sourceConversationId, input.contextMessage, source, host, host.publicKey !== this.auth.publicKey, typeof data.text === "string" ? data.text : undefined, result as Record<string, unknown>).catch(() => undefined);
+      } else if (input.operation === "wait" && result && typeof result === "object") {
+        await this.updateOutgoingTraceFromWait(sourceBot, host.id, result as Record<string, unknown>).catch(() => undefined);
+      }
       return result;
     } catch (error) {
       await this.store.audit("bot-message.rejected", sourceBot, { stage: "source", requestId, reason: error instanceof HubError ? error.code : "invalid_request" }); throw error instanceof TargetResolutionError ? new HubError(error.message, 409) : error;
@@ -905,6 +973,487 @@ export class BotMessages {
       else await this.put(steeringDisabledKey(command.botId), true);
       await this.store.db.run("INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)", [Date.now(), actor, "bot-message.steering-updated", JSON.stringify({ botId: command.botId, allowed: command.allowed, previous: before.allowed })]);
       return this.steeringInTransaction(command.botId);
+    });
+  }
+  private async recordOutgoingTrace(
+    sourceConversationId: string,
+    contextMessageId: string | undefined,
+    source: BotSource,
+    host: { id: string; name: string },
+    crossHost: boolean,
+    sentText: string | undefined,
+    result: Record<string, unknown>,
+  ): Promise<void> {
+    const now = Date.now();
+    const deliveryObj = result.delivery && typeof result.delivery === "object" ? result.delivery as Record<string, unknown> : undefined;
+    const delivery = parseDeliveryActual(deliveryObj?.actual);
+    const deliveryReason = typeof deliveryObj?.reason === "string" ? deliveryObj.reason.slice(0, 64) : undefined;
+    const key = traceKey(sourceConversationId, source.botId, source.requestId);
+    const targetMessageId = typeof result.messageId === "string" && idSchema.safeParse(result.messageId).success ? result.messageId : undefined;
+    const targetConversationId = typeof result.conversationId === "string" && idSchema.safeParse(result.conversationId).success ? result.conversationId : undefined;
+    const targetBotId = typeof result.botId === "string" ? result.botId.slice(0, 128) : undefined;
+    const targetBotName = typeof result.botName === "string" ? result.botName.slice(0, 128) : (targetBotId ?? "Bot");
+    const targetHostId = typeof result.hostId === "string" ? result.hostId.slice(0, 128) : host.id;
+    const targetHostName = typeof result.hostName === "string" ? result.hostName.slice(0, 128) : host.name;
+    const targetConversationTitle = typeof result.conversationName === "string" ? result.conversationName.slice(0, 256) : undefined;
+    const remoteStatus = typeof result.status === "string" ? result.status.slice(0, 32) : undefined;
+    await this.store.db.transaction(async () => {
+      const existing = await this.memo<OutgoingTrace>(key);
+      const trace: OutgoingTrace = {
+        sourceConversationId,
+        contextMessageId: existing?.contextMessageId ?? contextMessageId,
+        requestId: source.requestId,
+        sourceHostId: source.hostId,
+        sourceHostName: source.hostName.slice(0, 128),
+        sourceBotId: source.botId,
+        sourceBotName: source.botName.slice(0, 128),
+        targetHostId,
+        targetHostName,
+        targetBotId: targetBotId ?? existing?.targetBotId,
+        targetBotName,
+        crossHost,
+        targetConversationId: targetConversationId ?? existing?.targetConversationId,
+        targetConversationTitle: targetConversationTitle ?? existing?.targetConversationTitle,
+        targetMessageId: targetMessageId ?? existing?.targetMessageId,
+        hops: source.hops,
+        sentExcerpt: trimExcerpt(sentText, 280) ?? existing?.sentExcerpt,
+        replyExcerpt: existing?.replyExcerpt,
+        remoteStatus: remoteStatus ?? existing?.remoteStatus,
+        delivery: delivery ?? existing?.delivery,
+        deliveryReason: deliveryReason ?? existing?.deliveryReason,
+        sentAt: existing?.sentAt ?? now,
+        updatedAt: now,
+        finishedAt: existing?.finishedAt,
+      };
+      await this.put(key, trace);
+      if (targetMessageId) {
+        await this.put(traceMsgRefKey(source.botId, targetHostId, targetMessageId), { traceKey: key, at: now });
+      }
+      const indexKey = traceIndexKey(sourceConversationId);
+      const prev = await this.memo<string[]>(indexKey) ?? [];
+      const next = [key, ...prev.filter(item => item !== key)];
+      const evicted = next.slice(TRACE_LIMIT);
+      await this.put(indexKey, next.slice(0, TRACE_LIMIT));
+      for (const oldKey of evicted) {
+        const old = await this.memo<OutgoingTrace>(oldKey);
+        if (old?.targetMessageId) {
+          await this.store.db.run("DELETE FROM meta WHERE key=?", [traceMsgRefKey(old.sourceBotId, old.targetHostId, old.targetMessageId)]);
+        }
+        await this.store.db.run("DELETE FROM meta WHERE key=?", [oldKey]);
+      }
+    });
+  }
+  private async updateOutgoingTraceFromWait(sourceBot: string, targetHostId: string, result: Record<string, unknown>): Promise<void> {
+    const messageId = typeof result.messageId === "string" && idSchema.safeParse(result.messageId).success ? result.messageId : undefined;
+    if (!messageId) return;
+    const now = Date.now();
+    await this.store.db.transaction(async () => {
+      const ref = await this.memo<{ traceKey: string }>(traceMsgRefKey(sourceBot, targetHostId, messageId));
+      if (!ref?.traceKey) return;
+      const existing = await this.memo<OutgoingTrace>(ref.traceKey);
+      if (!existing) return;
+      const status = typeof result.status === "string" ? result.status.slice(0, 32) : existing.remoteStatus;
+      const text = typeof result.text === "string" ? trimExcerpt(result.text, 400) : undefined;
+      const deliveryObj = result.delivery && typeof result.delivery === "object" ? result.delivery as Record<string, unknown> : undefined;
+      const delivery = parseDeliveryActual(deliveryObj?.actual) ?? existing.delivery;
+      const deliveryReason = typeof deliveryObj?.reason === "string" ? deliveryObj.reason.slice(0, 64) : existing.deliveryReason;
+      const terminal = status === "completed" || status === "failed" || status === "cancelled" || status === "uncertain";
+      await this.put(ref.traceKey, {
+        ...existing,
+        remoteStatus: status,
+        replyExcerpt: text ?? existing.replyExcerpt,
+        delivery,
+        deliveryReason,
+        updatedAt: now,
+        ...(terminal && !existing.finishedAt ? { finishedAt: now } : {}),
+      } satisfies OutgoingTrace);
+    });
+  }
+  private async findPendingApprovalInTransaction(conversationId: string, botId: string | undefined, replyTo: string | undefined, since: number): Promise<BotCommPendingApproval | undefined> {
+    const rows = botId
+      ? await this.store.db.all<{ id: string; blocks_json: string }>(
+        `SELECT id, blocks_json FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND status NOT IN ('deleted','error')
+         AND (${replyTo ? "reply_to=? OR " : ""}(reply_to IS NULL AND created_at>=?)) ORDER BY created_at DESC, id DESC LIMIT 20`,
+        replyTo ? [conversationId, botId, replyTo, since] : [conversationId, botId, since],
+      )
+      : await this.store.db.all<{ id: string; blocks_json: string }>(
+        `SELECT id, blocks_json FROM messages WHERE conversation_id=? AND author_type='bot' AND status NOT IN ('deleted','error')
+         AND created_at>=? ORDER BY created_at DESC, id DESC LIMIT 20`,
+        [conversationId, since],
+      );
+    for (const row of rows) {
+      try {
+        const blocks = JSON.parse(row.blocks_json) as Block[];
+        const summary = summarizePendingCard(row.id, blocks);
+        if (summary) return summary;
+      } catch { /* ignore malformed historical blocks */ }
+    }
+    return undefined;
+  }
+  private async inspectLocalTargetInTransaction(
+    conversationId: string,
+    targetBotId: string | undefined,
+    messageId: string | undefined,
+    sentAt: number,
+    fallbackDelivery?: BotCommDelivery,
+    fallbackDeliveryReason?: string,
+  ): Promise<{ status: BotCommStatus; delivery?: BotCommDelivery; deliveryReason?: string; replyExcerpt?: string; pendingApproval?: BotCommPendingApproval; updatedAt: number; finishedAt?: number }> {
+    let delivery = fallbackDelivery;
+    let deliveryReason = fallbackDeliveryReason;
+    let updatedAt = sentAt;
+    if (!messageId) {
+      const pendingApproval = await this.findPendingApprovalInTransaction(conversationId, targetBotId, undefined, sentAt - 1000);
+      return { status: pendingApproval ? "needs_approval" : "queued", delivery, deliveryReason, pendingApproval, updatedAt };
+    }
+    const deliveryRow: { bot_id?: string; status: string; dispatched: number } | undefined = targetBotId
+      ? await this.store.db.get<{ status: string; dispatched: number }>("SELECT status, dispatched FROM deliveries WHERE message_id=? AND bot_id=?", [messageId, targetBotId])
+      : await this.store.db.get<{ bot_id: string; status: string; dispatched: number }>("SELECT bot_id, status, dispatched FROM deliveries WHERE message_id=? LIMIT 1", [messageId]);
+    const botId: string | undefined = targetBotId ?? deliveryRow?.bot_id;
+    if (deliveryRow && botId) {
+      const reply = await this.replyStateInTransaction(botId, conversationId, messageId, deliveryRow.status);
+      const pendingApproval = await this.findPendingApprovalInTransaction(conversationId, botId, messageId, sentAt - 1000);
+      const replyExcerpt = trimExcerpt(reply.text, 400);
+      const latestBot = await this.store.db.get<{ created_at: number }>("SELECT MAX(created_at) AS created_at FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND reply_to=? AND status!='deleted'", [conversationId, botId, messageId]);
+      if (latestBot?.created_at) updatedAt = Math.max(updatedAt, latestBot.created_at);
+      if (pendingApproval) return { status: "needs_approval", delivery: delivery ?? "queued", deliveryReason, replyExcerpt, pendingApproval, updatedAt };
+      if (reply.status === "completed") return { status: "replied", delivery: delivery ?? "queued", deliveryReason, replyExcerpt, updatedAt, finishedAt: updatedAt };
+      if (reply.status === "failed") return { status: "failed", delivery: delivery ?? "queued", deliveryReason, replyExcerpt, updatedAt, finishedAt: updatedAt };
+      if (reply.status === "cancelled") return { status: "cancelled", delivery: delivery ?? "queued", deliveryReason, replyExcerpt, updatedAt, finishedAt: updatedAt };
+      const running = deliveryRow.dispatched === 1 || (reply.activeReplies ?? 0) > 0;
+      return { status: running ? "running" : "queued", delivery: delivery ?? "queued", deliveryReason, replyExcerpt, updatedAt };
+    }
+    // Check whether this was a steered input message (no delivery row of its own).
+    const msgRow = await this.store.db.get<{ blocks_json: string; created_at: number }>("SELECT blocks_json, created_at FROM messages WHERE id=? AND conversation_id=? AND status!='deleted'", [messageId, conversationId]);
+    if (msgRow) {
+      updatedAt = Math.max(updatedAt, msgRow.created_at);
+      try {
+        const blocks = JSON.parse(msgRow.blocks_json) as Block[];
+        const steer = blocks.find((b): b is Extract<Block, { type: "steering" }> => b.type === "steering" && (!botId || b.botId === botId));
+        if (steer) {
+          const steerBotId = botId ?? steer.botId;
+          const pendingApproval = await this.findPendingApprovalInTransaction(conversationId, steerBotId, undefined, msgRow.created_at - 1000);
+          if (steer.outcome === "rejected") {
+            return { status: "failed", delivery: "not_delivered", deliveryReason: steer.reason?.slice(0, 64), updatedAt, finishedAt: updatedAt };
+          }
+          if (steer.outcome === "pending") {
+            return { status: pendingApproval ? "needs_approval" : "running", delivery: "pending", deliveryReason: "steer_in_flight", pendingApproval, updatedAt };
+          }
+          if (steer.outcome === "unknown") {
+            return { status: pendingApproval ? "needs_approval" : "uncertain", delivery: "steer_uncertain", deliveryReason: steer.reason?.slice(0, 64), pendingApproval, updatedAt };
+          }
+          // Steer accepted into an active turn. Inspect bot replies after the steer.
+          const recentReplies = await this.store.db.all<{ blocks_json: string; status: string; created_at: number }>(
+            "SELECT blocks_json, status, created_at FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND status!='deleted' AND created_at>=? ORDER BY created_at DESC, id DESC LIMIT 10",
+            [conversationId, steerBotId, msgRow.created_at - 1000],
+          );
+          if (recentReplies[0]?.created_at) updatedAt = Math.max(updatedAt, recentReplies[0].created_at);
+          const replyText = recentReplies.slice().reverse().map(r => {
+            try { return blocksText(JSON.parse(r.blocks_json) as Block[]); } catch { return ""; }
+          }).filter(Boolean).join("\n\n");
+          const replyExcerpt = trimExcerpt(replyText, 400);
+          if (pendingApproval) return { status: "needs_approval", delivery: "steered", deliveryReason, replyExcerpt, pendingApproval, updatedAt };
+          const activeDelivery = await this.store.db.get<{ active: number }>(
+            "SELECT COUNT(*) AS active FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE m.conversation_id=? AND d.bot_id=? AND d.status='pending'",
+            [conversationId, steerBotId],
+          );
+          const streaming = recentReplies.some(r => r.status === "pending" || r.status === "streaming");
+          if ((activeDelivery?.active ?? 0) > 0 || streaming) {
+            return { status: "steered", delivery: "steered", deliveryReason, replyExcerpt, updatedAt };
+          }
+          if (recentReplies.some(r => r.status === "error")) {
+            return { status: "failed", delivery: "steered", deliveryReason, replyExcerpt, updatedAt, finishedAt: updatedAt };
+          }
+          return { status: recentReplies.length ? "replied" : "steered", delivery: "steered", deliveryReason, replyExcerpt, updatedAt, ...(recentReplies.length ? { finishedAt: updatedAt } : {}) };
+        }
+      } catch { /* ignore */ }
+    }
+    return { status: "uncertain", delivery, deliveryReason, updatedAt };
+  }
+  /** Live Bot-to-Bot and Agent Bus communication trace for one conversation. */
+  async listConversationComms(userId: string, conversationId: string, guard?: Guard): Promise<ConversationBotComms> {
+    const ownHost = await this.ownSource();
+    return this.store.db.serial(async () => {
+      await guard?.();
+      await this.store.requireMember(userId, conversationId);
+      const botRows = await this.store.db.all<{ id: string; name: string }>("SELECT id, name FROM bots");
+      const botNames = new Map(botRows.map(b => [b.id, b.name]));
+      const convBots = await this.store.db.all<{ member_id: string }>("SELECT member_id FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [conversationId]);
+      const defaultConvBotId = convBots[0]?.member_id;
+      const memberCache = new Map<string, { title: string } | null>();
+      const checkMember = async (targetConvId: string): Promise<{ title: string } | null> => {
+        if (memberCache.has(targetConvId)) return memberCache.get(targetConvId)!;
+        const row = await this.store.db.get<{ title: string }>(
+          "SELECT c.title FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id WHERE c.id=? AND m.member_type='user' AND m.member_id=?",
+          [targetConvId, userId],
+        );
+        const value = row ? { title: row.title } : null;
+        memberCache.set(targetConvId, value);
+        return value;
+      };
+      const items: BotCommItem[] = [];
+      // 1. Outgoing Bot-to-Bot delegations originating from this conversation.
+      const keys = await this.memo<string[]>(traceIndexKey(conversationId)) ?? [];
+      for (const key of keys) {
+        const trace = await this.memo<OutgoingTrace>(key);
+        if (!trace) continue;
+        if (!trace.crossHost && trace.targetConversationId) {
+          const targetConv = await checkMember(trace.targetConversationId);
+          if (targetConv) {
+            const live = await this.inspectLocalTargetInTransaction(
+              trace.targetConversationId,
+              trace.targetBotId,
+              trace.targetMessageId,
+              trace.sentAt,
+              trace.delivery,
+              trace.deliveryReason,
+            );
+            items.push({
+              id: `out:${trace.sourceBotId}:${trace.requestId}`,
+              kind: "outgoing_bot_message",
+              direction: "outgoing",
+              requestId: trace.requestId,
+              sourceHostId: trace.sourceHostId,
+              sourceHostName: trace.sourceHostName,
+              sourceBotId: trace.sourceBotId,
+              sourceBotName: botNames.get(trace.sourceBotId) ?? trace.sourceBotName,
+              targetHostId: trace.targetHostId,
+              targetHostName: trace.targetHostName,
+              targetBotId: trace.targetBotId,
+              targetBotName: (trace.targetBotId ? botNames.get(trace.targetBotId) : undefined) ?? trace.targetBotName,
+              crossHost: false,
+              status: live.status,
+              ...(live.delivery ? { delivery: live.delivery } : {}),
+              ...(live.deliveryReason ? { deliveryReason: live.deliveryReason } : {}),
+              targetConversationId: trace.targetConversationId,
+              targetConversationTitle: targetConv.title.slice(0, 256),
+              ...(trace.targetMessageId ? { targetMessageId: trace.targetMessageId } : {}),
+              canJumpToTarget: true,
+              hops: trace.hops,
+              ...(trace.sentExcerpt ? { sentExcerpt: trace.sentExcerpt } : {}),
+              ...(live.replyExcerpt ?? trace.replyExcerpt ? { replyExcerpt: live.replyExcerpt ?? trace.replyExcerpt } : {}),
+              ...(live.pendingApproval ? { pendingApproval: live.pendingApproval } : {}),
+              createdAt: trace.sentAt,
+              updatedAt: Math.max(trace.updatedAt, live.updatedAt),
+              ...(live.finishedAt ? { finishedAt: live.finishedAt } : {}),
+            });
+            continue;
+          }
+          // Not a member of the same-host target chat: keep minimal non-leaking trace.
+          items.push({
+            id: `out:${trace.sourceBotId}:${trace.requestId}`,
+            kind: "outgoing_bot_message",
+            direction: "outgoing",
+            requestId: trace.requestId,
+            sourceHostId: trace.sourceHostId,
+            sourceHostName: trace.sourceHostName,
+            sourceBotId: trace.sourceBotId,
+            sourceBotName: botNames.get(trace.sourceBotId) ?? trace.sourceBotName,
+            targetHostId: trace.targetHostId,
+            targetHostName: trace.targetHostName,
+            targetBotId: trace.targetBotId,
+            targetBotName: (trace.targetBotId ? botNames.get(trace.targetBotId) : undefined) ?? trace.targetBotName,
+            crossHost: false,
+            status: trace.remoteStatus === "completed" ? "replied" : trace.remoteStatus === "failed" ? "failed" : trace.remoteStatus === "cancelled" ? "cancelled" : trace.delivery === "steered" ? "steered" : "queued",
+            ...(trace.delivery ? { delivery: trace.delivery } : {}),
+            ...(trace.deliveryReason ? { deliveryReason: trace.deliveryReason } : {}),
+            canJumpToTarget: false,
+            hops: trace.hops,
+            ...(trace.sentExcerpt ? { sentExcerpt: trace.sentExcerpt } : {}),
+            createdAt: trace.sentAt,
+            updatedAt: trace.updatedAt,
+            ...(trace.finishedAt ? { finishedAt: trace.finishedAt } : {}),
+          });
+          continue;
+        }
+        // Cross-host trace (or unresolved target chat): derive from send/wait receipts.
+        const remoteStatus: BotCommStatus =
+          trace.remoteStatus === "completed" ? "replied"
+            : trace.remoteStatus === "failed" ? "failed"
+              : trace.remoteStatus === "cancelled" ? "cancelled"
+                : trace.remoteStatus === "uncertain" ? "uncertain"
+                  : trace.delivery === "steered" ? "steered"
+                    : trace.delivery === "not_delivered" ? "failed"
+                      : trace.delivery === "steer_uncertain" ? "uncertain"
+                        : trace.remoteStatus === "pending" ? "running"
+                          : "queued";
+        items.push({
+          id: `out:${trace.sourceBotId}:${trace.requestId}`,
+          kind: "outgoing_bot_message",
+          direction: "outgoing",
+          requestId: trace.requestId,
+          sourceHostId: trace.sourceHostId,
+          sourceHostName: trace.sourceHostName,
+          sourceBotId: trace.sourceBotId,
+          sourceBotName: botNames.get(trace.sourceBotId) ?? trace.sourceBotName,
+          targetHostId: trace.targetHostId,
+          targetHostName: trace.targetHostName,
+          ...(trace.targetBotId ? { targetBotId: trace.targetBotId } : {}),
+          targetBotName: trace.targetBotName,
+          crossHost: trace.crossHost,
+          status: remoteStatus,
+          ...(trace.delivery ? { delivery: trace.delivery } : {}),
+          ...(trace.deliveryReason ? { deliveryReason: trace.deliveryReason } : {}),
+          ...(trace.targetConversationId ? { targetConversationId: trace.targetConversationId } : {}),
+          ...(trace.targetConversationTitle ? { targetConversationTitle: trace.targetConversationTitle } : {}),
+          ...(trace.targetMessageId ? { targetMessageId: trace.targetMessageId } : {}),
+          canJumpToTarget: false,
+          hops: trace.hops,
+          ...(trace.sentExcerpt ? { sentExcerpt: trace.sentExcerpt } : {}),
+          ...(trace.replyExcerpt ? { replyExcerpt: trace.replyExcerpt } : {}),
+          createdAt: trace.sentAt,
+          updatedAt: trace.updatedAt,
+          ...(trace.finishedAt ? { finishedAt: trace.finishedAt } : {}),
+        });
+      }
+      // 2. Incoming Bot-to-Bot messages received in this conversation.
+      const incomingRows = await this.store.db.all<{ id: string; bot_source_json: string; blocks_json: string; created_at: number }>(
+        "SELECT id, bot_source_json, blocks_json, created_at FROM messages WHERE conversation_id=? AND bot_source_json IS NOT NULL AND status!='deleted' ORDER BY created_at DESC, id DESC LIMIT 20",
+        [conversationId],
+      );
+      for (const row of incomingRows) {
+        let origin: BotSource;
+        try { origin = botSourceSchema.parse(JSON.parse(row.bot_source_json)); } catch { continue; }
+        let blocks: Block[] = [];
+        try { blocks = JSON.parse(row.blocks_json) as Block[]; } catch { /* ignore */ }
+        const steerBlock = blocks.find((b): b is Extract<Block, { type: "steering" }> => b.type === "steering");
+        const deliv = await this.store.db.get<{ bot_id: string }>("SELECT bot_id FROM deliveries WHERE message_id=? LIMIT 1", [row.id]);
+        const targetBotId = deliv?.bot_id ?? steerBlock?.botId ?? defaultConvBotId;
+        const targetBotName = (targetBotId ? botNames.get(targetBotId) : undefined) ?? "Bot";
+        const live = await this.inspectLocalTargetInTransaction(conversationId, targetBotId, row.id, row.created_at);
+        const sentExcerpt = trimExcerpt(blocksText(blocks), 280);
+        items.push({
+          id: `in:${row.id}`,
+          kind: "incoming_bot_message",
+          direction: "incoming",
+          requestId: origin.requestId,
+          sourceHostId: origin.hostId,
+          sourceHostName: origin.hostName.slice(0, 128),
+          sourceBotId: origin.botId,
+          sourceBotName: origin.botName.slice(0, 128),
+          targetHostId: ownHost.hostId,
+          targetHostName: ownHost.hostName.slice(0, 128),
+          ...(targetBotId ? { targetBotId } : {}),
+          targetBotName: targetBotName.slice(0, 128),
+          crossHost: origin.hostId !== ownHost.hostId,
+          status: live.status,
+          ...(live.delivery ? { delivery: live.delivery } : {}),
+          ...(live.deliveryReason ? { deliveryReason: live.deliveryReason } : {}),
+          targetConversationId: conversationId,
+          targetMessageId: row.id,
+          canJumpToTarget: false,
+          hops: origin.hops,
+          ...(sentExcerpt ? { sentExcerpt } : {}),
+          ...(live.replyExcerpt ? { replyExcerpt: live.replyExcerpt } : {}),
+          ...(live.pendingApproval ? { pendingApproval: live.pendingApproval } : {}),
+          createdAt: row.created_at,
+          updatedAt: live.updatedAt,
+          ...(live.finishedAt ? { finishedAt: live.finishedAt } : {}),
+        });
+      }
+      // 3. Same-host Agent Bus runs & stages linked to this conversation.
+      const busRuns = await this.store.db.all<{ id: string; coordinator_id: string; conversation_id: string; snapshot_json: string; text: string; created_at: number }>(
+        "SELECT id, coordinator_id, conversation_id, snapshot_json, text, created_at FROM agent_bus_runs WHERE owner_id=? AND conversation_id=? ORDER BY created_at DESC, id DESC LIMIT 5",
+        [userId, conversationId],
+      );
+      for (const run of busRuns) {
+        let workspaceName: string | undefined;
+        try { workspaceName = trimExcerpt((JSON.parse(run.snapshot_json) as { name?: string }).name, 140); } catch { /* ignore */ }
+        const stages = await this.store.db.all<{ id: string; bot_id: string; conversation_id: string; status: string; message_id: string | null; started_at: number; finished_at: number | null; error: string | null }>(
+          "SELECT id, bot_id, conversation_id, status, message_id, started_at, finished_at, error FROM agent_bus_stages WHERE run_id=? ORDER BY seq DESC LIMIT 12",
+          [run.id],
+        );
+        for (const stage of stages) {
+          const targetConv = await checkMember(stage.conversation_id);
+          const pendingApproval = targetConv ? await this.findPendingApprovalInTransaction(stage.conversation_id, stage.bot_id, undefined, stage.started_at - 1000) : undefined;
+          const status: BotCommStatus = pendingApproval ? "needs_approval"
+            : stage.status === "completed" ? "replied"
+              : stage.status === "failed" ? "failed"
+                : stage.status === "stopped" ? "cancelled"
+                  : stage.status === "running" ? "running"
+                    : "queued";
+          items.push({
+            id: `bus:out:${run.id}:${stage.id}`,
+            kind: "agent_bus_stage",
+            direction: "outgoing",
+            sourceHostId: ownHost.hostId,
+            sourceHostName: ownHost.hostName.slice(0, 128),
+            sourceBotId: run.coordinator_id,
+            sourceBotName: (botNames.get(run.coordinator_id) ?? run.coordinator_id).slice(0, 128),
+            targetHostId: ownHost.hostId,
+            targetHostName: ownHost.hostName.slice(0, 128),
+            targetBotId: stage.bot_id,
+            targetBotName: (botNames.get(stage.bot_id) ?? stage.bot_id).slice(0, 128),
+            crossHost: false,
+            status,
+            ...(targetConv ? { targetConversationId: stage.conversation_id, targetConversationTitle: targetConv.title.slice(0, 256) } : {}),
+            ...(targetConv && stage.message_id ? { targetMessageId: stage.message_id } : {}),
+            canJumpToTarget: !!targetConv,
+            ...(trimExcerpt(run.text, 280) ? { sentExcerpt: trimExcerpt(run.text, 280) } : {}),
+            ...(stage.error ? { replyExcerpt: trimExcerpt(stage.error, 400) } : {}),
+            ...(pendingApproval ? { pendingApproval } : {}),
+            ...(workspaceName ? { workspaceName } : {}),
+            createdAt: stage.started_at,
+            updatedAt: stage.finished_at ?? stage.started_at,
+            ...(stage.finished_at ? { finishedAt: stage.finished_at } : {}),
+          });
+        }
+      }
+      const incomingStages = await this.store.db.all<{ run_id: string; id: string; bot_id: string; status: string; started_at: number; finished_at: number | null; error: string | null; coordinator_id: string; run_conv_id: string; snapshot_json: string; text: string }>(
+        `SELECT s.run_id, s.id, s.bot_id, s.status, s.started_at, s.finished_at, s.error, r.coordinator_id, r.conversation_id AS run_conv_id, r.snapshot_json, r.text
+         FROM agent_bus_stages s JOIN agent_bus_runs r ON r.id=s.run_id
+         WHERE r.owner_id=? AND s.conversation_id=? AND r.conversation_id!=? ORDER BY s.started_at DESC, s.seq DESC LIMIT 10`,
+        [userId, conversationId, conversationId],
+      );
+      for (const stage of incomingStages) {
+        let workspaceName: string | undefined;
+        try { workspaceName = trimExcerpt((JSON.parse(stage.snapshot_json) as { name?: string }).name, 140); } catch { /* ignore */ }
+        const sourceConv = await checkMember(stage.run_conv_id);
+        const pendingApproval = await this.findPendingApprovalInTransaction(conversationId, stage.bot_id, undefined, stage.started_at - 1000);
+        const status: BotCommStatus = pendingApproval ? "needs_approval"
+          : stage.status === "completed" ? "replied"
+            : stage.status === "failed" ? "failed"
+              : stage.status === "stopped" ? "cancelled"
+                : stage.status === "running" ? "running"
+                  : "queued";
+        items.push({
+          id: `bus:in:${stage.run_id}:${stage.id}`,
+          kind: "agent_bus_stage",
+          direction: "incoming",
+          sourceHostId: ownHost.hostId,
+          sourceHostName: ownHost.hostName.slice(0, 128),
+          sourceBotId: stage.coordinator_id,
+          sourceBotName: (botNames.get(stage.coordinator_id) ?? stage.coordinator_id).slice(0, 128),
+          targetHostId: ownHost.hostId,
+          targetHostName: ownHost.hostName.slice(0, 128),
+          targetBotId: stage.bot_id,
+          targetBotName: (botNames.get(stage.bot_id) ?? stage.bot_id).slice(0, 128),
+          crossHost: false,
+          status,
+          ...(sourceConv ? { targetConversationId: stage.run_conv_id, targetConversationTitle: sourceConv.title.slice(0, 256) } : {}),
+          canJumpToTarget: !!sourceConv,
+          ...(trimExcerpt(stage.text, 280) ? { sentExcerpt: trimExcerpt(stage.text, 280) } : {}),
+          ...(stage.error ? { replyExcerpt: trimExcerpt(stage.error, 400) } : {}),
+          ...(pendingApproval ? { pendingApproval } : {}),
+          ...(workspaceName ? { workspaceName } : {}),
+          createdAt: stage.started_at,
+          updatedAt: stage.finished_at ?? stage.started_at,
+          ...(stage.finished_at ? { finishedAt: stage.finished_at } : {}),
+        });
+      }
+      items.sort((a, b) => {
+        const aAttn = a.status === "needs_approval" ? 2 : (a.status === "running" || a.status === "steered" || a.status === "queued") ? 1 : 0;
+        const bAttn = b.status === "needs_approval" ? 2 : (b.status === "running" || b.status === "steered" || b.status === "queued") ? 1 : 0;
+        if (aAttn !== bAttn) return bAttn - aAttn;
+        return b.updatedAt - a.updatedAt;
+      });
+      const bounded = items.slice(0, 60);
+      const needsApproval = bounded.filter(item => item.status === "needs_approval").length;
+      const active = bounded.filter(item => item.status === "running" || item.status === "steered" || item.status === "queued" || item.status === "needs_approval").length;
+      return conversationBotCommsSchema.parse({
+        conversationId,
+        items: bounded,
+        summary: { total: bounded.length, active, needsApproval },
+      });
     });
   }
 }
