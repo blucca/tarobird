@@ -126,6 +126,8 @@ describe("what the App holds and when it asks the engine", () => {
     const held = reading(-2);
     expect(nextHeldQuota(held, without("not_loaded", { revision: "other" }))).toBeUndefined();
     for (const reason of ["auth_changed", "login_required", "mode_not_supported", "not_adapted"] as const) expect(nextHeldQuota(held, without(reason))).toBeUndefined();
+    // A login the Host cannot verify (a Codex keyring): the one-shot reading is not kept past the next answer.
+    expect(nextHeldQuota(held, without("scope_unverifiable"))).toBeUndefined();
     expect(nextHeldQuota(undefined, without("not_loaded"))).toBeUndefined();
   });
   it("never replaces a reading with the same login's older one", () => {
@@ -197,6 +199,8 @@ describe("readings saved on the device", () => {
     // Another login: the saved number is about another account.
     expect(savedQuotaAfter(earlier, plain({ revision: "other" }))).toBe("drop");
     expect(savedQuotaAfter(earlier, reading("alpha", 0, { revision: "other" }))).toBe("drop");
+    // The same revision but a login the Host cannot verify: adopted, then not held.
+    expect(nextHeldQuota(earlier, plain({ reason: "scope_unverifiable" }))).toBeUndefined();
     // Only the Hub answered for a worker that is away: nothing is known yet, so nothing is shown yet.
     for (const reason of ["offline", "timeout", "invalid_response", "host_upgrade_required"] as const) expect(savedQuotaAfter(earlier, plain({ reason, revision: reason, state: "unavailable" }))).toBe("wait");
     // Adopted, it is then held like any reading; a newer answer replaces it.

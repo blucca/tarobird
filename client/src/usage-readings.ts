@@ -78,8 +78,9 @@ export function nextHeldQuota(previous: QuotaScope | undefined, scope: QuotaScop
   // A reading replaces the held one unless it is the same login's older answer: another process of the Bot
   // may still hold an earlier one.
   if (scope.observedAt) return previous?.revision === scope.revision && previous.observedAt && previous.observedAt > scope.observedAt ? previous : scope;
-  // Another login, or a login without quota: the earlier number is not about it.
-  return previous && (previous.revision !== scope.revision || ["auth_changed", "login_required", "mode_not_supported", "not_adapted"].includes(scope.reason ?? "")) ? undefined : previous;
+  // Another login, or a login without quota: the earlier number is not about it. A login the Host cannot verify
+  // keeps the same revision when the account behind it changes, so its one-shot reading is not kept either.
+  return previous && (previous.revision !== scope.revision || ["auth_changed", "login_required", "mode_not_supported", "not_adapted", "scope_unverifiable"].includes(scope.reason ?? "")) ? undefined : previous;
 }
 /** Readings saved on this device, so a Bot's battery is there when the App starts again within the time a
  * reading is shown. Only percentages, reset times and pool names are in a reading; no account identity is. */
