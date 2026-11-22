@@ -325,7 +325,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     if (method === "commands") {
       const { query } = z.object({ query: z.string() }).parse(raw);
       const config = await loadInstanceConfig(options.stateDir);
-      return gatewayCommands(config.engine, query).map((c) => ({ command: c.command, description: c.description }));
+      return gatewayCommands(config.engine, query, config.engine === "antigravity" ? bridge.advertisedCommands?.() : undefined).map((c) => ({ command: c.command, description: c.description }));
     }
     // Local authenticated Hub only; client HTTP never accepts state paths.
     if (method === "diagnostics") return z.json().parse(await readBotDiagnostics(options.stateDir, raw));

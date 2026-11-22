@@ -16,7 +16,8 @@ export const GATEWAY_COMMAND_POLICIES: Readonly<Record<string, "shared" | "nativ
   "approve-session": "shared", deny: "shared", meeting: "feishu",
 };
 
-export function gatewayCommands(engine: string, query = "") {
+/** `engineCommands`: the live engine's own commands (Antigravity ACP). A Host command of the same name wins, since the Host handles it first. */
+export function gatewayCommands(engine: string, query = "", engineCommands: ReadonlyArray<{ name: string; description?: string }> = []) {
   const shared = CORE_SLASH_COMMANDS.filter(({ command }) =>
     (GATEWAY_COMMAND_POLICIES[command] === "shared" || command === "group")
     && (command !== "fast" || engine === "codex")
@@ -32,6 +33,19 @@ export function gatewayCommands(engine: string, query = "") {
         },
       },
     });
+  if (engine === "antigravity" && engineCommands.length) {
+    const prefix = query.replace(/^\//, "").toLowerCase();
+    const taken = new Set(CORE_SLASH_COMMANDS.map(({ command }) => command));
+    const seen = new Set<string>();
+    const agy = engineCommands.flatMap(({ name, description }) => {
+      const command = name.toLowerCase();
+      if (taken.has(command) || seen.has(command) || !command.startsWith(prefix)) return [];
+      seen.add(command);
+      const text = description?.trim() || name;
+      return [{ command: name, description: { defaultValue: text, i18n: { en_us: text, zh_cn: text } } }];
+    });
+    return [...shared, ...agy];
+  }
   if (engine !== "pi") return shared;
   const native = new Map(PI_APP_COMMANDS.map(command => [command.command, command]));
   const names = new Set(shared.map(command => command.command));

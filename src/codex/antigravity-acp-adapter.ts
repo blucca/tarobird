@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -31,6 +32,8 @@ import type {
   EngineApprovalRequest,
   EngineContextUsage,
   EngineStreamEvent,
+  EngineTask,
+  EngineTaskSnapshot,
 } from "./adapter.js";
 import { EngineIncompleteResponseError, EngineSteeringRejectedError } from "./adapter.js";
 import { killProcessTree } from "./process-tree.js";
@@ -98,6 +101,8 @@ type ConfigSelect = { id: string; category?: string | null; currentValue?: strin
 
 type ToolState = {
   id: string;
+  /** Opaque handle shown to the App instead of the native call id. */
+  token: string;
   name: string;
   kind?: string;
   title?: string;
@@ -204,6 +209,8 @@ export const ANTIGRAVITY_ACP_TURN_TIMEOUT_MS = 6 * 60 * 60_000;
 export const ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS = 30 * 60_000;
 const STOPPED_BY_USER = "Task was stopped by user";
 const STEER_ADMISSION_TIMEOUT_MS = 10_000;
+const MAX_NATIVE_COMMANDS = 500;
+const NATIVE_COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const ANTIGRAVITY_EFFORTS: ReadonlySet<string> = new Set(ANTIGRAVITY_EFFORT_LEVELS);
 const PRESET_SUFFIX = /-(low|medium|high|xhigh|max|ultra)$/;
 const IMAGE_MIME: Record<string, string> = {
@@ -424,6 +431,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private readonly sweepTimer: ReturnType<typeof setInterval> | undefined;
   private destroyPromise: Promise<void> | undefined;
   private destroyed = false;
+  /** The newest available_commands_update; every session of this Bot shares the CLI and workspace. */
+  private commands: Array<{ name: string; description: string }> = [];
 
   constructor(private readonly executable: string, private readonly options: AntigravityAcpAdapterOptions) {
     const env = { ...(options.childEnv ?? process.env) };
@@ -489,6 +498,32 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     // No answer, or an unexpected one: whether agy took the input is unknown.
     if (input.throwOnError) throw new Error("Antigravity did not confirm the steering input");
     return false;
+  }
+
+  /** Native slash commands and skills agy advertised, for the App command menu. */
+  advertisedCommands(): Array<{ name: string; description: string }> {
+    return this.commands.map((command) => ({ ...command }));
+  }
+
+  /**
+   * Background commands still running in this session. ACP has no task list
+   * and no per-task stop (only session/cancel and session/close), so each is
+   * inferred from its tool call and cannot be stopped on its own. Subagents
+   * report completion at once and carry no id, so they cannot be listed.
+   */
+  async listTasks(sessionId: string): Promise<EngineTaskSnapshot> {
+    const worker = this.liveWorker(sessionId);
+    if (!worker) return { supported: true, tasks: [] };
+    const tasks: EngineTask[] = [];
+    for (const tool of worker.tools.values()) {
+      if (!tool.background || (tool.status !== "pending" && tool.status !== "in_progress")) continue;
+      if (tool.name !== "run_command" && !(tool.kind === "execute" && !tool.name)) continue;
+      const commandLine = asRecord(tool.rawInput)?.CommandLine;
+      const label = (tool.title || (typeof commandLine === "string" ? commandLine : "") || "run_command").slice(0, 500);
+      tasks.push({ id: tool.token, label, kind: "shell", mode: "background", status: "running", canStop: false,
+        startedAt: tool.startedAt, updatedAt: tool.updatedAt, owner: tool.turn ? "bound" : "unattributed" });
+    }
+    return { supported: true, tasks: tasks.slice(-128) };
   }
 
   private liveWorker(sessionId: string): Worker | undefined {
@@ -864,6 +899,12 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     } else if (kind === "config_option_update") {
       const next = readSelectOptions(update.configOptions);
       if (next.length) worker.configOptions = next;
+    } else if (kind === "available_commands_update" && Array.isArray(update.availableCommands)) {
+      this.commands = update.availableCommands.flatMap((item) => {
+        const command = asRecord(item);
+        if (!command || typeof command.name !== "string" || !NATIVE_COMMAND_NAME.test(command.name)) return [];
+        return [{ name: command.name, description: typeof command.description === "string" ? command.description.slice(0, 300) : "" }];
+      }).slice(0, MAX_NATIVE_COMMANDS);
     }
     const turn = worker.turn;
     if (kind === "tool_call" || kind === "tool_call_update") this.trackTool(worker, update, turn);
@@ -871,7 +912,12 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       // A model call after a still-running tool means the model left it running in the background.
       for (const tool of worker.tools.values()) if (tool.status === "pending" || tool.status === "in_progress") tool.background = true;
     }
-    if (!turn) { this.trackWake(worker, kind, update); return; }
+    if (!turn) this.trackWake(worker, kind, update);
+    // A finished call is no longer needed: its result and any wake-up owner were taken above.
+    if ((kind === "tool_call" || kind === "tool_call_update") && (update.status === "completed" || update.status === "failed") && typeof update.toolCallId === "string") {
+      worker.tools.delete(update.toolCallId);
+    }
+    if (!turn) return;
     const sessionId = worker.sessionId!;
     if (kind === "agent_message_chunk") {
       const content = asRecord(update.content);
@@ -929,7 +975,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const now = Date.now();
     let tool = worker.tools.get(id);
     if (!tool) {
-      tool = { id, name: "", status: "pending", startedAt: now, updatedAt: now, ...(turn ? { turn } : {}), background: !turn, emittedUse: false, emittedResult: false };
+      tool = { id, token: randomUUID(), name: "", status: "pending", startedAt: now, updatedAt: now, ...(turn ? { turn } : {}), background: !turn, emittedUse: false, emittedResult: false };
       worker.tools.set(id, tool);
     }
     if (typeof update.name === "string" && update.name) tool.name = update.name;

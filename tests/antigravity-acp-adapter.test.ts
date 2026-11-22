@@ -785,3 +785,62 @@ describe("AntigravityAcpAdapter idle wake-up", () => {
     }
   });
 });
+
+describe("AntigravityAcpAdapter tasks and native commands", () => {
+  it("lists background commands still running as shell tasks that cannot be stopped one by one", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    await expect(adapter.listTasks("tarobot-1")).resolves.toEqual({ supported: true, tasks: [] });
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_fg", name: "run_command", kind: "execute", title: "sleep 2", status: "in_progress", rawInput: { CommandLine: "sleep 2" } });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    // A command the model is still waiting for is part of the reply, not a background task.
+    await expect(adapter.listTasks(SESSION_A)).resolves.toEqual({ supported: true, tasks: [] });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_fg", status: "completed" });
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_bg", name: "run_command", kind: "execute", title: "npm run build", status: "in_progress", rawInput: { CommandLine: "npm run build", WaitMsBeforeAsync: 500 } });
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_sub", name: "invoke_subagent", kind: "other", title: "Run invoke_subagent", status: "in_progress" });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_sub", status: "completed" });
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 10, size: 100 });
+    server.text("started");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const running = await adapter.listTasks(SESSION_A);
+    expect(running.tasks).toEqual([{
+      id: expect.stringMatching(/^[A-Za-z0-9_-]+$/), label: "npm run build", kind: "shell", mode: "background", status: "running",
+      canStop: false, startedAt: expect.any(Number), updatedAt: expect.any(Number), owner: "bound",
+    }]);
+    expect(running.tasks[0]!.id).not.toContain("call_bg");
+    expect(adapter.stopTask).toBeUndefined();
+    server.respondPrompt();
+    await settleWithin(reply);
+    expect((await adapter.listTasks(SESSION_A)).tasks.map((task) => task.label)).toEqual(["npm run build"]);
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_bg", status: "completed" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await expect(adapter.listTasks(SESSION_A)).resolves.toEqual({ supported: true, tasks: [] });
+  });
+
+  it("keeps the latest native command list from available_commands_update", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    expect(adapter.advertisedCommands()).toEqual([]);
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({ sessionUpdate: "available_commands_update", availableCommands: [
+      { name: "goal", description: "Run until the specified goal is completely finished." },
+      { name: "grill-me", description: "Interview me to align on a plan." },
+      { name: "bad name!", description: "ignored" },
+      { name: "pr2-echo", description: "x".repeat(400) },
+    ] });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(adapter.advertisedCommands()).toEqual([
+      { name: "goal", description: "Run until the specified goal is completely finished." },
+      { name: "grill-me", description: "Interview me to align on a plan." },
+      { name: "pr2-echo", description: "x".repeat(300) },
+    ]);
+    server.text("ok");
+    server.respondPrompt();
+    await settleWithin(reply);
+  });
+});
