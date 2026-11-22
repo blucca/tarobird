@@ -24,7 +24,7 @@ mode. CLI's light set only serves light-canvas widgets. Each palette leads
 with its own hue while the first two slots stay one cool and one warm. Soft
 tints are mixed into the palette's reading surface. App chrome, chat and
 semantic status colours do not use these tokens. `--chart-series-1..4` are
-unchanged.
+unchanged except in Monochrome (below).
 
 `widgetTheme` passes the current roles plus the palette's `-light`/`-dark`
 sets and neutral light/dark canvas tokens (Monochrome's own values).

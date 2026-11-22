@@ -38,6 +38,17 @@ tarobird engines reset --engine codex --revision REV --json
 界面的「重新读取」只重读已修复的文件，不会自动修改它。
 详见[发现机制和验证边界](client/host-engine-paths-2026-11-13.md)。
 
+## 模型额度
+
+```sh
+tarobird engines quota --json
+tarobird engines quota --bot BOT --refresh --revision REV --json
+```
+
+列出主机上各 Bot 的模型额度读数；`--refresh` 让支持主动读取的引擎重读一次，
+`REV` 使用刚读取的 `revision`。字段、刷新冷却和各引擎的官方查看方式见
+[模型额度](client/engine-quota.md)。
+
 ## Bot 人设小节（源码新增）
 
 `tarobot bots persona BOT_ID --json` 读取当前人设和 `revision`。

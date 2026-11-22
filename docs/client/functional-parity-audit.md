@@ -48,7 +48,7 @@
 | `/q` | 强制作为新一轮 FIFO 排队，不当成 steer | 共享 message handler；queue 回归 |
 | `/bg` | 该实例的后台进程检查／终止；仍由现有进程归属检查负责 | `background-processes`；既有后台进程测试 |
 | `/continue` | 继续等待中的压缩包分析工作流 | `file-workflow` 与共享命令；既有工作流回归 |
-| `/ws` | list/save/use/remove；切换 workspace 按原规则清理绑定 | `commands`、SessionStore；workspace/session 回归 |
+| `/ws` | 当时为 list/save/use/remove。**2026-11-21 已移除**（`7c2c3ce`），现在 `/ws` 作为普通消息发给引擎；已保存的 workspaceProfiles 保留但不再使用 | 已无处理器与测试 |
 | `/context` | 原引擎 context 数据；没有原生数据时明确说明 | 共享命令、adapter；五引擎回归 |
 | `/compact` | 原生 compact 或既有 fallback；不当作普通提示发送 | 共享 session commands；五引擎回归 |
 | `/ultrareview` | 仅 Claude 专用审查；其他引擎菜单不展示 | 共享命令；命令清单和 Claude 回归 |
