@@ -39,7 +39,7 @@ test("the conversation title keeps its room just above 1100px while the rail is 
   } finally { await done(); }
 });
 
-test("Bot messages: both ends of a long route, eight to a page, plain status words, readable approval in the dark theme", async ({ browser }) => {
+test("Bot messages: both ends of a long route, whole cards to a page, plain status words, readable approval in the dark theme", async ({ browser }) => {
   const { page, L, open, done } = await ready(browser, "zh", 1440, async (page, f) => {
     await mockComms(page, f.ids.main, comms(f.ids.main, [
       item(1, { status: "needs_approval", sourceBotName: LONG_BOT, targetBotName: "Reviewer-Security-Auditor-与合规审查-Bot", canJumpToTarget: true, targetConversationId: f.ids.revConv,
@@ -54,8 +54,23 @@ test("Bot messages: both ends of a long route, eight to a page, plain status wor
     await open();
     await rail(page).getByRole("tab", { name: new RegExp(L("Bot 通信")) }).click();
     const cards = rail(page).locator(".workspace-comm-card");
-    await expect(cards).toHaveCount(8);
+    // As many whole cards as the rail is tall: nothing is cut at the bottom edge, and the pager is in view.
+    const fits = () => rail(page).locator(".workspace-body").evaluate(node => {
+      const edge = node.getBoundingClientRect().bottom, last = [...node.querySelectorAll(".workspace-comm-card")].at(-1)!.getBoundingClientRect().bottom;
+      return { cut: last > edge, pager: node.querySelector(".workspace-pager")!.getBoundingClientRect().bottom <= edge, scrolls: node.scrollHeight > node.clientHeight };
+    });
+    await expect(cards).toHaveCount(5);
     await expect(rail(page).locator(".workspace-pager")).toContainText("1 / 2");
+    expect(await fits()).toEqual({ cut: false, pager: true, scrolls: false });
+    // A taller rail holds more, still whole. (Four was the fixed number before; it left this rail half empty.)
+    await page.setViewportSize({ width: 1440, height: 1300 });
+    await expect.poll(fits).toEqual({ cut: false, pager: true, scrolls: false });
+    expect(await cards.count()).toBeGreaterThanOrEqual(8);
+    await page.setViewportSize({ width: 1440, height: 640 });
+    await expect(cards).toHaveCount(4);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await expect(cards).toHaveCount(5);
+    await expect.poll(fits).toEqual({ cut: false, pager: true, scrolls: false });
     // The sender, the arrow and the receiver are all on screen, each name shortened rather than one end lost.
     const route = await cards.first().locator(".workspace-comm-route").evaluate(node => {
       const box = node.getBoundingClientRect(), parts = [...node.children].map(child => child.getBoundingClientRect());
@@ -65,12 +80,16 @@ test("Bot messages: both ends of a long route, eight to a page, plain status wor
     expect(route).toEqual({ inside: true, names: [true, true], arrow: true });
     if (process.env.WORKSPACE_RAIL_UI_SHOTS) await rail(page).screenshot({ path: `${process.env.WORKSPACE_RAIL_UI_SHOTS}/comms-fixed.png` });
     await expect(cards.first().locator(".workspace-comm-route > span").last()).toHaveAttribute("title", "Reviewer-Security-Auditor-与合规审查-Bot");
-    await expect(rail(page).locator(".workspace-comm-status")).toContainText(["待审批", "运行中", "已并入回复", "排队中", "失败", "已取消", "结果未确认", "已回传"]);
+    await expect(rail(page).locator(".workspace-comm-status")).toContainText(["待审批", "运行中", "已并入回复", "排队中", "失败"]);
     await expect(cards.nth(1).locator(".workspace-comm-sub")).toContainText("经排队投递");
     await expect(cards.nth(3).locator(".workspace-comm-sub")).toContainText("未能并入，已改为排队");
     // A failed item's text is not a reply.
     await cards.nth(4).getByRole("button", { name: "展开详情" }).click();
     await expect(cards.nth(4).locator(".workspace-comm-expanded-label")).toContainText(["失败信息"]);
+    await cards.nth(4).getByRole("button", { name: "收起" }).click();
+    await rail(page).getByRole("button", { name: "下一页" }).click();
+    await expect(rail(page).locator(".workspace-comm-status")).toContainText(["已取消", "结果未确认", "已回传"]);
+    await rail(page).getByRole("button", { name: "上一页" }).click();
     expect(await contrast(page, "aside.conversation-workspace-rail .workspace-jump-btn.is-alert")).toBeGreaterThan(4.5);
     await setTheme(page, "dark");
     // White on the dark theme's light orange was about 2:1.

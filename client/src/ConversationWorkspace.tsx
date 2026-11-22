@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -36,8 +36,13 @@ import "./conversation-workspace.css";
 export type WorkspaceTab = "overview" | "comms" | "files";
 
 const FILES_PAGE_SIZE = 6;
-// The list scrolls inside the rail; four to a page left half of it empty and made a long list many pages.
-const COMMS_PAGE_SIZE = 8;
+// A page of Bot messages holds as many whole cards as the rail is tall: four left half of a tall rail empty,
+// and a fixed larger number cut a card in two at the bottom edge. A card is about 104px plus the 8px gap (an
+// approval card about 135px); the filter row, the pager and the body's padding take about 150px.
+const COMMS_PAGE_MIN = 4, COMMS_CARD_PITCH = 114, COMMS_PAGE_CHROME = 150;
+export function commsPageSize(bodyHeight: number): number {
+  return Math.max(COMMS_PAGE_MIN, Math.floor((bodyHeight - COMMS_PAGE_CHROME) / COMMS_CARD_PITCH));
+}
 
 function formatRelativeTime(timestamp: number, locale: string): string {
   const diffSec = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
@@ -359,10 +364,29 @@ export function ConversationWorkspace({
     return commItems;
   }, [commItems, commFilter]);
 
-  const commTotalPages = Math.max(1, Math.ceil(filteredComms.length / COMMS_PAGE_SIZE));
+  const body = useRef<HTMLDivElement>(null);
+  const [commPageSize, setCommPageSize] = useState(COMMS_PAGE_MIN);
+  useLayoutEffect(() => {
+    const node = body.current;
+    if (!node) return;
+    const fit = () => setCommPageSize(commsPageSize(node.clientHeight));
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+  // The estimate can be one card too many (cards with two lines of text are taller). When the page then
+  // runs past the bottom, it gives one card back, until it fits. An opened card is the person's own choice
+  // to see more than fits, and scrolls. The estimate returns when the rail is resized.
+  useLayoutEffect(() => {
+    const node = body.current;
+    if (!node || tab !== "comms" || expandedComms.size > 0 || commPageSize <= COMMS_PAGE_MIN) return;
+    if (node.scrollHeight > node.clientHeight + 1) setCommPageSize(size => Math.max(COMMS_PAGE_MIN, size - 1));
+  });
+  const commTotalPages = Math.max(1, Math.ceil(filteredComms.length / commPageSize));
   useEffect(() => { if (commPage > commTotalPages - 1) setCommPage(commTotalPages - 1); }, [commPage, commTotalPages]);
   const shownCommPage = Math.min(commPage, commTotalPages - 1);
-  const pagedComms = filteredComms.slice(shownCommPage * COMMS_PAGE_SIZE, (shownCommPage + 1) * COMMS_PAGE_SIZE);
+  const pagedComms = filteredComms.slice(shownCommPage * commPageSize, (shownCommPage + 1) * commPageSize);
 
   // Unified non-diff artifacts (workbench docs + conversation files) for clean pagination & grid
   const fileArtifacts = useMemo(() => [
@@ -594,7 +618,7 @@ export function ConversationWorkspace({
         </button>
       </div>
 
-      <div className="workspace-body">
+      <div className="workspace-body" ref={body}>
         {tab === "overview" && (
           <>
             {/* 1. Compact Environment & Context Strip */}

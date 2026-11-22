@@ -223,7 +223,11 @@
   overscroll-behavior: contain;
   scrollbar-width: thin;
   scrollbar-color: transparent transparent;
-  padding: 14px 14px 18px;
+  /* What runs past the bottom edge (an opened card, a short window) fades out there, so it reads as "more
+     below" and not as a cut. The fade is no taller than the padding: at the end of the list it covers nothing. */
+  padding: 14px 14px 28px;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent);
   display: flex;
   flex-direction: column;
   gap: 16px;
