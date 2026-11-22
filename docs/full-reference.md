@@ -382,7 +382,7 @@ For Kimi 0.32 or newer, TaroCub registers an inert hook plugin under the active
 `KIMI_CODE_HOME`. Only bridge-owned ACP subprocesses receive the authenticated
 loopback relay environment, so ordinary Kimi sessions do not send events to
 TaroCub. The relay consumes task start/notification/subagent events plus
-`TurnStarted`, `Stop`, `StopFailure`, and `Interrupt`. The turn hooks preserve
+`TurnStarted`, `Stop`, `StopFailure`, `Interrupt`, and `UserPromptQueued`. The turn hooks preserve
 Kimi 0.33's autonomous post-task review: retries remain linked to the original
 work, intermediate failures are timeline-only, and the final reviewed answer is
 delivered once. It deliberately ignores `SessionHeartbeat` because process

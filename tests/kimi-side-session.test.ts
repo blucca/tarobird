@@ -231,6 +231,7 @@ describe("Kimi native side forks", () => {
       await expect(h.adapter.openSideSession({ sourceSessionId: "kimi-parent" })).rejects.toThrow("busy");
       expect(h.children).toHaveLength(1);
       expect(h.killed).toHaveLength(0);
+      h.children[0]!.server.update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done." } }, h.children[0]!.server.sessionId);
       h.children[0]!.server.respondPrompt();
       await turn;
     } finally { await h.adapter.destroy(); }

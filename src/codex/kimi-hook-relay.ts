@@ -9,7 +9,7 @@ export const KIMI_HOOK_RELAY_URL_ENV = "TAROCUB_KIMI_HOOK_URL";
 export const KIMI_HOOK_RELAY_TOKEN_ENV = "TAROCUB_KIMI_HOOK_TOKEN";
 
 const PLUGIN_ID = "tarocub-hook-relay";
-const PLUGIN_VERSION = "3";
+const PLUGIN_VERSION = "4";
 const MAX_HOOK_BODY_BYTES = 1024 * 1024;
 
 export type KimiHookEvent =
@@ -76,6 +76,15 @@ export type KimiHookEvent =
       severity?: string;
       sourceKind?: string;
       sourceId: string;
+    }
+  | {
+      /** A prompt arrived while Kimi was running a turn and waits in its queue. */
+      hookEventName: "UserPromptQueued";
+      sessionId: string;
+      cwd?: string;
+      promptId?: string;
+      prompt?: string;
+      queueLength?: number;
     }
   | {
       hookEventName: "SubagentStop";
@@ -267,6 +276,20 @@ export function parseKimiHookEvent(input: unknown): KimiHookEvent | null {
     };
   }
 
+  if (hookEventName === "UserPromptQueued") {
+    const promptId = optionalIdentifier(raw.prompt_id);
+    const prompt = optionalPromptText(raw.prompt);
+    const queueLength = optionalNumber(raw.queue_length);
+    return {
+      hookEventName,
+      sessionId,
+      ...(cwd ? { cwd } : {}),
+      ...(promptId ? { promptId } : {}),
+      ...(prompt ? { prompt } : {}),
+      ...(queueLength !== undefined ? { queueLength } : {}),
+    };
+  }
+
   if (hookEventName === "SubagentStop") {
     return {
       hookEventName,
@@ -364,6 +387,7 @@ function relayManifest(command: string): string {
       { event: "SubagentStop", command, timeout: 5 },
       { event: "PreCompact", command, timeout: 5 },
       { event: "PostCompact", command, timeout: 5 },
+      { event: "UserPromptQueued", command, timeout: 5 },
     ],
   }, null, 2)}\n`;
 }

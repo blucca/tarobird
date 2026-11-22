@@ -15,7 +15,7 @@ import { AttachmentFile } from "./Content.js";
 import { exportAttachment } from "./attachment-export.js";
 import { RuntimeHostActiveContext } from "./RuntimeHost.js";
 import { STOP_CONFIRMATION_MS, stopOutcome, type StopWait } from "./run-stop.js";
-import { entryStatus, formatRunDuration, runDiff, runEntryTitle, runKind, runPhaseLabel, runSources, runExitCode, runPlan, runScopeLabel, runScopeParent, runProse, runInput, codexAgentReports, codexAgentStatus } from "./run-presentation.js";
+import { entryStatus, formatRunDuration, runDiff, runEntryTitle, runKind, runPhaseLabel, runSources, runExitCode, runPlan, runScopeLabel, runScopeParent, runProse, runInput, runWaitEngine, codexAgentReports, codexAgentStatus } from "./run-presentation.js";
 import { backgroundTaskNotice } from "../../src/client-protocol/background-task.js";
 import { scopedTaskLabelSchema } from "../../src/client-protocol/engine-tasks.js";
 import { BackgroundTaskReference, type BackgroundSource } from "./BackgroundTaskReference.js";
@@ -137,6 +137,8 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
   const elapsed = (run.endedAt ?? (ticking ? Math.max(run.updatedAt, observedNow) : run.updatedAt)) - run.startedAt;
   const waitingForBackground = active && run.current?.name === "background_review_wait" && run.current.status === "waiting";
   const waitingForNativeInput = active && run.current?.name === "native_input_wait" && run.current.status === "waiting";
+  // ACP cannot withdraw a prompt from Kimi's own queue: stopping only ends this wait.
+  const waitingInKimiQueue = waitingForNativeInput && runWaitEngine(run.current!) === "kimi";
   const recovering = active && phase !== "stopping" && !disconnected && run.current?.name === "engine_retry";
   const retrySeconds = recovering && run.current?.status === "waiting"
     ? Math.max(0, Math.ceil((run.current.at + Number(runInput(run.current).delayMs ?? 0) - Math.max(run.current.at, observedNow)) / 1000)) : 0;
@@ -172,7 +174,8 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
     {scopeUnsupported && <p className="run-notice">{t("当前连接暂不提供子任务过程，已保留公开回复。")}</p>}
     {scoped && run.detailsUnavailable && <p className="run-notice">{t("部分过程尚未同步，回复不受影响。")}</p>}
     {disconnected && <small>{t("最后确认：{0}", runPhaseLabel(run.phase))}</small>}
-    {waitingForBackground && <p className="run-notice">{t("Claude 正在处理上一项后台结果，本条消息尚未交给模型。")}</p>}
+    {waitingForBackground && <p className="run-notice">{runWaitEngine(run.current!) === "kimi" ? t("Kimi 正在处理上一项后台结果，本条消息尚未交给模型。") : t("Claude 正在处理上一项后台结果，本条消息尚未交给模型。")}</p>}
+    {waitingInKimiQueue && <p className="run-notice">{t("停止等待只结束这里的等待：Kimi 仍会执行这条消息，它的回复不会显示在这里。")}</p>}
     {recovering && <p className="run-notice run-recovery-notice" role="status">{retrySeconds > 0
       ? t("会话进度已保留，约 {0} 秒后自动重试。可随时停止。", retrySeconds)
       : run.current?.status === "waiting" ? t("会话进度已保留，即将自动重试。可随时停止。")
@@ -182,7 +185,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
     {backgroundNote && <p className="run-notice">{backgroundNote}</p>}
     <div className="native-run-actions">{scoped && !inlineScopedReply && reportPreview.needsReader && <button type="button" ref={reportTrigger} className="run-report-trigger" onClick={() => open({ key, kind: "report" })}>{t("查看完整回复")}</button>}{!scopeUnsupported && <button ref={trigger} className="run-process-trigger" onClick={() => open({ key, kind: "process" })} aria-label={t("查看运行过程")}><ChevronRight size={14}/><span>{run.count ? t("过程 · {0} 个动作", run.count) : t("查看运行过程")}</span></button>}
       {!scoped && <DiffViewerTrigger connection={connection} message={message}/>}
-      {!scoped && active && !interrupted && <button className="run-stop" disabled={disconnected || waiting} onClick={() => void stop()}><CircleStop size={14}/>{waiting ? t("等待停止确认") : waitingForBackground || waitingForNativeInput ? t("取消等待") : t("停止")}</button>}
+      {!scoped && active && !interrupted && <button className="run-stop" disabled={disconnected || waiting} onClick={() => void stop()}><CircleStop size={14}/>{waiting ? t("等待停止确认") : waitingInKimiQueue ? t("停止等待") : waitingForBackground || waitingForNativeInput ? t("取消等待") : t("停止")}</button>}
     </div>{error && <p role="alert">{error}</p>}
     {!scoped && active && !interrupted && !disconnected && stopState === "unconfirmed" && <p className="run-notice" role="status">{t("尚未收到停止确认。请核对运行状态，需要时可再次停止。")}</p>}
     {readers}

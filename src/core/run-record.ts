@@ -128,7 +128,7 @@ export function recordRunEvent(record: RunRecord, event: EngineStreamEvent, now 
   } else if (event.type === "background_review_wait" || event.type === "native_input_wait") {
     const previous = record.entries.filter(entry => sameScope(entry) && entry.name === event.type && entry.status === "waiting").at(-1);
     if (event.status === "started") {
-      if (!previous) add({ kind: "text", name: event.type, status: "waiting" });
+      if (!previous) add({ kind: "text", name: event.type, status: "waiting", ...(event.engine ? { input: json({ engine: event.engine }) } : {}) });
       record.phase = "working";
     } else if (previous) {
       update(record, { ...previous, revision: record.revision, status: event.status === "cancelled" ? "stopped" : "done", endedAt: now }, previous);
@@ -222,6 +222,7 @@ export function summarizeRun(record: RunRecord, status: string): RunSummary {
       if (["capacity", "connection", "rate-limit"].includes(raw.reason)) labels.reason = raw.reason;
       for (const key of ["attempt", "delayMs"]) if (Number.isFinite(raw[key]) && raw[key] >= 0) labels[key] = raw[key];
     }
+    if ((active?.name === "background_review_wait" || active?.name === "native_input_wait") && raw.engine === "kimi") labels.engine = raw.engine;
     const action = Array.isArray(raw?.commandActions) && raw.commandActions.length === 1 ? raw.commandActions[0] : undefined;
     if (action && ["read", "search", "listFiles"].includes(action.type)) labels.commandActions = [Object.fromEntries(["type", "path", "name", "query"].flatMap(key => typeof action[key] === "string" ? [[key, action[key].slice(0, 160)]] : []))];
     input = JSON.stringify(labels);

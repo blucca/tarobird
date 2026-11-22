@@ -1,6 +1,6 @@
 import { createRunRecord, recordRunEvent, summarizeRun } from "../src/core/run-record.js";
 import { expect, it } from "vitest";
-import { entryStatus, formatRunDuration, runEntryTitle, runExitCode, runDiff, runSources, runKind, runProse, runReportExcerpt, runReportNeedsFormatting, scopedTaskDescription } from "../client/src/run-presentation.js";
+import { entryStatus, formatRunDuration, runEntryTitle, runExitCode, runDiff, runSources, runKind, runProse, runReportExcerpt, runReportNeedsFormatting, runWaitEngine, scopedTaskDescription } from "../client/src/run-presentation.js";
 import type { Block } from "../src/client-protocol/index.js";
 import type { RunEntry } from "../src/client-protocol/run.js";
 
@@ -238,6 +238,21 @@ it.each(['## Review', 'first\n\nsecond', '- one item', '[reference](https://exam
   expect(description.expandable).toBe(true);
   expect(description.excerpt.length).toBeLessThanOrEqual(181);
   expect(description.excerpt).not.toMatch(/\*\*|##|```/);
+});
+
+it("names Kimi in its native queue and background-review waits instead of Claude", () => {
+  const record = createRunRecord();
+  recordRunEvent(record, { type: "native_input_wait", status: "started", engine: "kimi" }, 1000);
+  const queued = summarizeRun(record, "running");
+  expect(queued).toMatchObject({ phase: "working", count: 0, current: { name: "native_input_wait", status: "waiting" } });
+  expect(runEntryTitle(queued.current!)).toBe("等待 Kimi 读入");
+  recordRunEvent(record, { type: "native_input_wait", status: "finished", engine: "kimi" }, 2000);
+  expect(summarizeRun(record, "running").current).toBeUndefined();
+  recordRunEvent(record, { type: "background_review_wait", status: "started", engine: "kimi" }, 3000);
+  const held = summarizeRun(record, "running").current!;
+  expect(runEntryTitle(held)).toBe("等待后台结果处理");
+  expect(runWaitEngine(held)).toBe("kimi");
+  expect(runWaitEngine({ kind: "text", name: "background_review_wait", status: "waiting", seq: 1, at: 1, revision: 1 })).toBeUndefined();
 });
 
 it("shows native input waiting without claiming the model is thinking or counting a tool", () => {

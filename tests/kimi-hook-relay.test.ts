@@ -157,6 +157,27 @@ describe("Kimi hook relay", () => {
     })).toBeNull();
   });
 
+  it("parses Kimi queued-prompt receipts", () => {
+    expect(parseKimiHookEvent({
+      hook_event_name: "UserPromptQueued",
+      session_id: "session-1",
+      session_title: "Untitled",
+      prompt_id: "msg_01",
+      prompt: [{ type: "text", text: "<private_bridge_turn_instructions>\nx\n</private_bridge_turn_instructions>\nhello" }],
+      queue_length: 2,
+    })).toEqual({
+      hookEventName: "UserPromptQueued",
+      sessionId: "session-1",
+      promptId: "msg_01",
+      prompt: "<private_bridge_turn_instructions>\nx\n</private_bridge_turn_instructions>\nhello",
+      queueLength: 2,
+    });
+    expect(parseKimiHookEvent({ hook_event_name: "UserPromptQueued", session_id: "session-1" })).toEqual({
+      hookEventName: "UserPromptQueued",
+      sessionId: "session-1",
+    });
+  });
+
   it("registers an inert plugin without replacing existing Kimi plugins", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "tarocub-kimi-hook-home-"));
     const installedPath = path.join(home, "plugins", "installed.json");
@@ -200,6 +221,7 @@ describe("Kimi hook relay", () => {
         "SubagentStop",
         "PreCompact",
         "PostCompact",
+        "UserPromptQueued",
       ]);
       expect(manifest.hooks.some((hook) => hook.event === "SessionHeartbeat")).toBe(false);
       expect(manifest.hooks[0]?.command).toContain("forward.mjs");
