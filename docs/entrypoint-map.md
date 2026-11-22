@@ -3858,6 +3858,13 @@ session, Gateway, Bus and scoped App-tool suites listed in the audit.
   Steering sends another `session/prompt` into the running turn; the prompt it
   replaces returns `end_turn` early and does not end the turn. A steer while an
   approval is unanswered is refused (agy answers -32603), never queued.
+  Output agy pushes to an idle session after a background command or subagent
+  finishes (no request id, no end marker) ends after the last `usage_update` and
+  a quiet period with no tool started after it still running; it is delivered as
+  a background-task follow-up (`task_notification`, bound to the turn that
+  started a finishing command, otherwise unattributed). A new message first
+  delivers what already arrived. Idle recycling keeps a session whose
+  background command still runs.
   Tests: `antigravity-acp-adapter`, `core-engine-factory`, `permissions-settings`.
 - `src/codex/kimi-acp-adapter.ts`
   Persistent Kimi ACP worker, session configuration/loading, streaming event mapping,

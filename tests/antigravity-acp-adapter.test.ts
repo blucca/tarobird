@@ -683,3 +683,105 @@ describe("AntigravityAcpAdapter steering", () => {
     expect(harness.log).toEqual([`cancel:${SESSION_A}`]);
   });
 });
+
+describe("AntigravityAcpAdapter idle wake-up", () => {
+  async function finishedTurn(prepare: (server: FakeAgyServer) => void = () => undefined, extra: Record<string, unknown> = {}) {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, extra));
+    const events: EngineStreamEvent[] = [];
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "start it", files: [], onEngineEvent: (event) => { events.push(event); } });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    prepare(server);
+    server.text("STARTED");
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 100, size: 1000 });
+    server.respondPrompt();
+    await settleWithin(reply);
+    return { harness, adapter, events, server };
+  }
+  const backgroundCommand = (server: FakeAgyServer) => {
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 90, size: 1000 });
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_bg", name: "run_command", kind: "execute", title: "sleep 10 && echo BG_OK", status: "in_progress", rawInput: { CommandLine: "sleep 10 && echo BG_OK", WaitMsBeforeAsync: 500 } });
+  };
+  const notifications = (events: EngineStreamEvent[]) => events.filter((event) => event.type === "task_notification");
+
+  it("delivers output pushed to an idle session after a background command as a follow-up of the turn that started it", async () => {
+    const { events, server } = await finishedTurn(backgroundCommand);
+    const before = events.length;
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_bg", status: "completed", rawOutput: { output: "BG_OK\n", exit_code: 0 } });
+    server.text("\n\nThe background command finished: ");
+    server.text("BG_OK");
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 140, size: 1000 });
+    await waitFor(() => notifications(events).length === 1);
+    expect(notifications(events)).toEqual([{ type: "task_notification", text: "The background command finished: BG_OK", sessionId: SESSION_A, status: "completed", origin: "bound" }]);
+    // Wake-up output is a separate follow-up, never more text of the finished reply.
+    expect(events.slice(before).filter((event) => event.type !== "task_notification")).toEqual([]);
+  });
+
+  it("waits while a tool the wake-up started is still running", async () => {
+    const { events, server } = await finishedTurn();
+    server.text("Checking the result");
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 120, size: 1000 });
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_w", name: "run_command", kind: "execute", title: "cat out.txt", status: "in_progress", rawInput: { CommandLine: "cat out.txt" } });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(notifications(events)).toHaveLength(0);
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_w", status: "completed", rawOutput: { output: "ok" } });
+    server.text(" - all good.");
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 130, size: 1000 });
+    await waitFor(() => notifications(events).length === 1);
+    expect(notifications(events)[0]).toMatchObject({ text: "Checking the result - all good.", origin: "unattributed" });
+  });
+
+  it("marks a wake-up it cannot tie to a request, such as a finished subagent, as unattributed", async () => {
+    const { events, server } = await finishedTurn((s) => {
+      s.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_sub", name: "invoke_subagent", kind: "other", title: "Run invoke_subagent", status: "in_progress", rawInput: { TypeName: "research" } });
+      s.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_sub", status: "completed" });
+    });
+    server.text("The research subagent reported back.");
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 150, size: 1000 });
+    await waitFor(() => notifications(events).length === 1);
+    expect(notifications(events)[0]).toEqual({ type: "task_notification", text: "The research subagent reported back.", sessionId: SESSION_A, status: "completed", origin: "unattributed" });
+  });
+
+  it("hands what already arrived to the App before a new message takes the session over", async () => {
+    const { adapter, events, server } = await finishedTurn(backgroundCommand);
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_bg", status: "completed", rawOutput: { output: "BG_OK" } });
+    server.text("Partial wake-up text");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const nextEvents: EngineStreamEvent[] = [];
+    const next = adapter.sendUserMessage(SESSION_A, { text: "new question", files: [], onEngineEvent: (event) => { nextEvents.push(event); } });
+    await waitFor(() => server.prompts.length === 2);
+    expect(notifications(events)).toEqual([expect.objectContaining({ text: "Partial wake-up text", origin: "bound" })]);
+    server.text("Answer to the new question");
+    server.respondPrompt();
+    await expect(settleWithin(next)).resolves.toMatchObject({ text: "Answer to the new question" });
+    expect(notifications(nextEvents)).toHaveLength(0);
+  });
+
+  it("delivers an open wake-up before destroy closes the session", async () => {
+    const { adapter, events, server, harness } = await finishedTurn(undefined, { wakeQuietMs: 10_000 });
+    server.text("Late report");
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 160, size: 1000 });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await adapter.destroy();
+    expect(notifications(events)).toEqual([expect.objectContaining({ text: "Late report" })]);
+    expect(harness.log).toEqual([`close:${SESSION_A}`, "stdin-end:900", "kill:900"]);
+  });
+
+  it("does not recycle an idle session whose background command is still running", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "Date"] });
+    try {
+      const { harness } = await finishedTurn(backgroundCommand, { idleWorkerTtlMs: 1_000, idleSweepIntervalMs: 500 });
+      vi.advanceTimersByTime(5_000);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(harness.log).toEqual([]);
+      harness.children[0]!.server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_bg", status: "completed" });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      vi.advanceTimersByTime(5_000);
+      await waitFor(() => harness.log.includes("kill:900"));
+      expect(harness.log).toEqual([`close:${SESSION_A}`, "stdin-end:900", "kill:900"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

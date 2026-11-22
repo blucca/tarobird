@@ -107,6 +107,8 @@ type ToolState = {
   updatedAt: number;
   /** The turn that started this call; undefined when it began while idle. */
   turn?: Turn;
+  /** The model moved on (a later model call or the turn ended) while this call still runs. */
+  background: boolean;
   emittedUse: boolean;
   emittedResult: boolean;
 };
@@ -144,6 +146,21 @@ type Turn = {
   reject: (error: Error) => void;
 };
 
+/**
+ * Output agy pushes to an idle session (a background command or subagent
+ * finished). It carries no request id and no end marker: it ends after the
+ * last usage_update once nothing arrives for a quiet period, unless a tool
+ * started after that model call is still running.
+ */
+type Wake = {
+  text: string;
+  /** Tools started after the latest usage_update that are still running. */
+  openTools: Set<string>;
+  /** Handler of the turn that started a background command finishing here. */
+  owner?: CodexUserMessageInput["onEngineEvent"];
+  timer?: ReturnType<typeof setTimeout>;
+};
+
 type Worker = {
   child: AgyAcpChildProcess;
   connection: ClientConnection;
@@ -157,6 +174,9 @@ type Worker = {
   /** Created with session/new: the Host learns the native id from the first turn. */
   announceSession: boolean;
   turn: Turn | null;
+  /** The latest turn's event handler; idle wake-ups without an owner report through it. */
+  lastTurnHandler?: CodexUserMessageInput["onEngineEvent"];
+  wake: Wake | null;
   promptSeq: number;
   tools: Map<string, ToolState>;
   pendingPermissions: number;
@@ -561,7 +581,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       .onNotification(acpMethods.client.session.update, ({ params }) => { this.handleUpdate(worker, params); })
       .connect(stream);
     worker = {
-      child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, promptSeq: 0,
+      child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, wake: null, promptSeq: 0,
       tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), removed: false, exited: false,
     };
     this.workers.set(requestedId, worker);
@@ -678,7 +698,11 @@ export class AntigravityAcpAdapter implements CodexAdapter {
         approvals: new AbortController(), eventChain: Promise.resolve(), stopRequested: false,
         timeoutsDisabled: input.disableRuntimeTimeout === true, done: false, resolve, reject,
       };
+      // Whatever an idle wake-up already pushed is delivered before this
+      // message takes the session over; agy streams the rest under it.
+      this.flushWake(worker);
       worker.turn = turn;
+      worker.lastTurnHandler = input.onEngineEvent;
       if (worker.announceSession) {
         worker.announceSession = false;
         this.emit(turn, { type: "session", sessionId: worker.sessionId! });
@@ -761,6 +785,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     turn.done = true;
     const worker = turn.worker;
     if (worker.turn === turn) worker.turn = null;
+    for (const tool of worker.tools.values()) if (tool.turn === turn && (tool.status === "pending" || tool.status === "in_progress")) tool.background = true;
     this.clearTimers(turn);
     turn.abortCleanup?.();
     turn.approvals.abort();
@@ -842,7 +867,11 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
     const turn = worker.turn;
     if (kind === "tool_call" || kind === "tool_call_update") this.trackTool(worker, update, turn);
-    if (!turn) return;
+    if (kind === "usage_update") {
+      // A model call after a still-running tool means the model left it running in the background.
+      for (const tool of worker.tools.values()) if (tool.status === "pending" || tool.status === "in_progress") tool.background = true;
+    }
+    if (!turn) { this.trackWake(worker, kind, update); return; }
     const sessionId = worker.sessionId!;
     if (kind === "agent_message_chunk") {
       const content = asRecord(update.content);
@@ -856,13 +885,51 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
   }
 
+  private trackWake(worker: Worker, kind: unknown, update: Record<string, unknown>): void {
+    if (kind !== "agent_message_chunk" && kind !== "agent_thought_chunk" && kind !== "tool_call" && kind !== "tool_call_update" && kind !== "usage_update") return;
+    if (kind === "usage_update" && !worker.wake) return;
+    const wake = worker.wake ??= { text: "", openTools: new Set() };
+    if (wake.timer) clearTimeout(wake.timer);
+    wake.timer = undefined;
+    const id = typeof update.toolCallId === "string" ? update.toolCallId : undefined;
+    const finished = update.status === "completed" || update.status === "failed";
+    if (kind === "agent_message_chunk") {
+      const content = asRecord(update.content);
+      if (content?.type === "text" && typeof content.text === "string") wake.text += content.text;
+    } else if (kind === "tool_call" && id && !finished) {
+      wake.openTools.add(id);
+    } else if (kind === "tool_call_update" && id && finished) {
+      wake.openTools.delete(id);
+      const owner = worker.tools.get(id)?.turn;
+      if (owner?.onEngineEvent) wake.owner ??= owner.onEngineEvent;
+    } else if (kind === "usage_update") {
+      wake.openTools.clear();
+    }
+    if (kind !== "usage_update" || wake.openTools.size) return;
+    wake.timer = setTimeout(() => this.flushWake(worker), this.wakeQuietMs);
+    wake.timer.unref?.();
+  }
+
+  /** Hand an idle wake-up to the App as a follow-up message; it is never dropped silently. */
+  private flushWake(worker: Worker): void {
+    const wake = worker.wake;
+    if (!wake) return;
+    worker.wake = null;
+    if (wake.timer) clearTimeout(wake.timer);
+    const text = wake.text.trim();
+    const handler = wake.owner ?? worker.lastTurnHandler;
+    if (!text || !handler || !worker.sessionId) return;
+    const event: EngineStreamEvent = { type: "task_notification", text, sessionId: worker.sessionId, status: "completed", origin: wake.owner ? "bound" : "unattributed" };
+    try { void Promise.resolve(handler(event)).catch(() => undefined); } catch { /* Delivery is best-effort here; the Host ledgers it. */ }
+  }
+
   private trackTool(worker: Worker, update: Record<string, unknown>, turn: Turn | null): void {
     const id = typeof update.toolCallId === "string" ? update.toolCallId : undefined;
     if (!id) return;
     const now = Date.now();
     let tool = worker.tools.get(id);
     if (!tool) {
-      tool = { id, name: "", status: "pending", startedAt: now, updatedAt: now, ...(turn ? { turn } : {}), emittedUse: false, emittedResult: false };
+      tool = { id, name: "", status: "pending", startedAt: now, updatedAt: now, ...(turn ? { turn } : {}), background: !turn, emittedUse: false, emittedResult: false };
       worker.tools.set(id, tool);
     }
     if (typeof update.name === "string" && update.name) tool.name = update.name;
@@ -965,6 +1032,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     worker.closing = (async () => {
       const turn = worker.turn;
       this.removeWorker(worker);
+      this.flushWake(worker);
       if (turn && !turn.done) this.settleTurn(turn, error ?? new Error("Antigravity ACP worker was closed"));
       const close = worker.initialized?.agentCapabilities?.sessionCapabilities?.close;
       if (worker.sessionId && close && !worker.exited) {
@@ -986,7 +1054,10 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
   }
 
-  protected isReapable(_worker: Worker): boolean {
+  /** Closing a session stops its background commands, so a session still running one is kept.
+   * An open wake-up is delivered by closeWorker; a live one keeps the worker active anyway. */
+  private isReapable(worker: Worker): boolean {
+    for (const tool of worker.tools.values()) if (tool.background && (tool.status === "pending" || tool.status === "in_progress")) return false;
     return true;
   }
 
