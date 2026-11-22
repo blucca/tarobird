@@ -114,9 +114,15 @@ export class ModelCatalogCache {
     return request.refresh || !entry.value ? { ...result, readAt: entry.readAt || this.now() } : answer();
   }
 
-  private start(key: string, entry: Entry, engine: InstanceEngine, env: NodeJS.ProcessEnv, executable: string, cwd: string | undefined, explicit: boolean): Promise<ModelCatalogRead> {
-    if (this.entries.size >= 64 && !this.entries.has(key)) this.entries.delete(this.entries.keys().next().value!);
+  /** At most 64 entries; the one least recently read goes first, never the one being filed. */
+  private file(key: string, entry: Entry): void {
+    this.entries.delete(key);
+    if (this.entries.size >= 64) this.entries.delete(this.entries.keys().next().value!);
     this.entries.set(key, entry);
+  }
+
+  private start(key: string, entry: Entry, engine: InstanceEngine, env: NodeJS.ProcessEnv, executable: string, cwd: string | undefined, explicit: boolean): Promise<ModelCatalogRead> {
+    this.file(key, entry);
     const options: ModelCatalogOptions = { reread: true, ...this.options.deepseekCatalogHome ? { deepseekCatalogHome: this.options.deepseekCatalogHome } : {} };
     const promise = this.read(engine, env, cwd, explicit, options).catch(() => fallbackModelCatalog(engine)).then(result => {
       if (entry.inflight === promise) entry.inflight = undefined;
@@ -127,7 +133,7 @@ export class ModelCatalogCache {
       // A CLI may refresh its own sign-in file while answering. File the
       // answer under the state it left too, so the next request still finds it.
       const after = this.key(engine, env, executable, cwd);
-      if (after !== key && !this.entries.has(after)) this.entries.set(after, entry);
+      if (after !== key && !this.entries.has(after)) this.file(after, entry);
       return result;
     });
     entry.inflight = promise;
