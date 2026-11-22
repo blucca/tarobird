@@ -3589,6 +3589,7 @@
   "此路径可能包含凭据，不提供内容预览。": "This path may contain credentials. Content preview is unavailable.",
   "此文件暂时无法预览，请刷新后重试。": "This file cannot be previewed right now. Refresh and try again.",
   "改动 {0} 个文件": "{0} changed files",
+  "还有 {0} 个文件": "{0} more files",
   "批注尚未保存，请先复制或恢复草稿再关闭。": "Notes have not been saved. Copy or recover them before closing.",
   "最多保留 50 条批注，请先发送或删除部分批注。": "You can keep up to 50 notes. Send or delete some first.",
   "操作未完成，批注仍保留，请检查连接、草稿状态或内容长度后重试。": "The action failed. Your notes are retained. Check the connection, draft state or content length and try again.",

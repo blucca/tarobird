@@ -5,6 +5,7 @@ import { runChangesSchema, runChangeDetailSchema, type RunChanges, type RunChang
 import type { WorkspaceDiffLine } from "../../src/client-protocol/workspace-diff.js";
 import type { HubConnection } from "./connection.js";
 import { HubHttpError } from "./http-error.js";
+import { readRunEvidence as readEvidence } from "./run-changes-read.js";
 import { CreationDialog } from "./CreationDialog.js";
 import DiffViewer from "./DiffViewer.js";
 import { DiffCode } from "./DiffCode.js";
@@ -27,20 +28,6 @@ function failure(error: unknown): string {
     if ([404, 410].includes(error.status)) return t("这条消息或修改记录已不可用。");
   }
   return t("暂时无法读取修改记录，请稍后重试。");
-}
-/** Only these idempotent reads retry temporary admission/timeout failures. */
-async function readEvidence(connection: HubConnection, route: string, signal: AbortSignal): Promise<unknown> {
-  for (let attempt = 0; ; attempt++) {
-    try { return await connection.http<unknown>(route, { signal }); }
-    catch (error) {
-      if (signal.aborted || attempt >= 3 || !(error instanceof HubHttpError) || ![429, 504].includes(error.status)) throw error;
-      await new Promise<void>((resolve, reject) => {
-        const abort = () => { clearTimeout(timer); reject(signal.reason); };
-        const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, 250 * 2 ** attempt);
-        signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort();
-      });
-    }
-  }
 }
 function Counts({ value }: { value: { additions: number | null; deletions: number | null } }) {
   return <span className="diff-counts"><span>+{value.additions ?? "—"}</span><span>−{value.deletions ?? "—"}</span></span>;

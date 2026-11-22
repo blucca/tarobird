@@ -332,7 +332,8 @@ for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
       await expect(container.getByRole("tabpanel")).toHaveAttribute("aria-labelledby", (await filesTab.getAttribute("id"))!);
       await expect(container).toContainText("workspace-rail-spec.md");
       await expect(container).toContainText("layout-benchmark.json");
-      const diffButton = container.getByRole("button", { name: /2.*14.*3/ });
+      // The turn's changes are listed by file name, each with its own counts, on desktop and phone alike.
+      const diffButton = container.getByRole("button", { name: /ConversationWorkspace\.tsx \+11 −1.*bot-messages\.ts \+4 −2/ });
       await expect(diffButton).toBeVisible();
       await noHorizontalOverflow(page, phone ? ".conversation-workspace-sheet" : ".conversation-workspace-rail");
       if (!phone) {

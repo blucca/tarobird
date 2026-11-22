@@ -26,7 +26,7 @@ import { BOT_COMMS_LIMIT, conversationBotCommsSchema, type BotCommItem, type Con
 import { nativeRun } from "../../src/client-protocol/run.js";
 import { runChangesSummarySchema } from "../../src/client-protocol/run-changes.js";
 import type { Bot, HubConnection } from "./connection.js";
-import { DiffViewerTrigger } from "./DiffViewerTrigger.js";
+import { WorkspaceRunChanges } from "./WorkspaceRunChanges.js";
 import { listWorkbenchLibrary, type WorkbenchLibraryEntry } from "./workbench-library.js";
 import type { WorkbenchFileTarget } from "./workbench-library-context.js";
 import { t, useLocale } from "./i18n.js";
@@ -777,11 +777,7 @@ export function ConversationWorkspace({
                 <div className="workspace-idle-strip">{t("暂无本轮改动、工作台内容或对话文件。")}</div>
               ) : (
                 <div className="workspace-list">
-                  {diffMessages.slice(0, 1).map(msg => (
-                    <div key={`diff:${msg.id}`} className="workspace-diff-row">
-                      <DiffViewerTrigger connection={connection} message={msg}/>
-                    </div>
-                  ))}
+                  {diffMessages.slice(0, 1).map(msg => <WorkspaceRunChanges key={`diff:${msg.id}`} connection={connection} message={msg}/>)}
                   {fileArtifacts.length > 0 && (
                     <div className="workspace-file-grid">
                       {fileArtifacts.slice(0, diffMessages.length > 0 ? 2 : 3).map(artifact => (
@@ -871,11 +867,7 @@ export function ConversationWorkspace({
                 {fileFilter !== "files" && diffMessages.length > 0 && (
                   <>
                     <div className="workspace-group-label">{t("本轮改动")}</div>
-                    {diffMessages.map(msg => (
-                      <div key={`diff:${msg.id}`} className="workspace-diff-row">
-                        <DiffViewerTrigger connection={connection} message={msg}/>
-                      </div>
-                    ))}
+                    {diffMessages.map(msg => <WorkspaceRunChanges key={`diff:${msg.id}`} connection={connection} message={msg}/>)}
                   </>
                 )}
 

@@ -10,9 +10,11 @@ test.beforeAll(async () => {
 });
 test.afterAll(async () => { await server.close(); });
 const file = (page: import("@playwright/test").Page) => page.getByRole("button", { name: /\/project\/src\/ReviewPanel/ });
-test("reply shows saved counts and opens recorded changes without workspace lookup", async ({ page }) => {
+test("reply's entry reads 本轮改动, with no counts, and opens recorded changes without workspace lookup", async ({ page }) => {
   await page.goto(url + "?mode=trigger");
-  await page.getByRole("button", { name: "改动 1 个文件 · +4 −2" }).click();
+  // The card carries saved counts (1 file, +4 −2); the owner asked for the plain entry on a reply. The rail names the files.
+  await expect(page.getByRole("button", { name: /改动 \d+ 个文件/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "本轮改动", exact: true }).click();
   await file(page).click(); await expect(page.getByTestId("diff-code")).toContainText("one-1");
   expect(await page.evaluate(() => (window as any).runDiffFixture.requests.every((path: string) => path.includes("/messages/message-one/changes")))).toBe(true);
 });
@@ -156,7 +158,7 @@ test("a slow viewer chunk opens exactly one changes sheet, without a placeholder
   // Hold the lazily loaded viewer module so the first open waits for it.
   await page.route("**/src/RunDiffViewer.tsx*", async route => { await new Promise(resolve => setTimeout(resolve, 800)); await route.continue(); });
   await page.goto(url + "?mode=trigger");
-  const trigger = page.getByRole("button", { name: "改动 1 个文件 · +4 −2" });
+  const trigger = page.getByRole("button", { name: "本轮改动", exact: true });
   await trigger.click();
   await expect(page.getByRole("dialog", { name: "本轮改动", exact: true })).toBeVisible();
   await expect(file(page)).toBeVisible();

@@ -221,3 +221,45 @@ test("the entry rests without a frame, like the header buttons beside it, and sh
     await expect.poll(edge).not.toBe("rgba(0, 0, 0, 0)");
   } finally { await done(); }
 });
+
+/** The colour a theme token resolves to, as a computed colour string. */
+const token = (page: Page, name: string) => page.evaluate(value => {
+  const probe = document.body.appendChild(document.createElement("span")); probe.style.color = `var(${value})`;
+  const colour = getComputedStyle(probe).color; probe.remove(); return colour;
+}, name);
+
+test("a turn's changes are listed by file name with green and red counts; the reply's own entry stays 本轮改动", async ({ browser }) => {
+  const { page, open, done } = await ready(browser, "zh", 1400);
+  try {
+    await open();
+    const row = rail(page).locator(".workspace-diff-row");
+    // The names are the Hub's record of that run (two edits in the fixture's journal), not the totals on the card.
+    await expect(row.locator(".workspace-diff-name")).toHaveText(["ConversationWorkspace.tsx", "bot-messages.ts"]);
+    await expect(row.locator(".workspace-diff-name").first()).toHaveAttribute("title", "client/src/ConversationWorkspace.tsx");
+    await expect(row.locator(".workspace-diff-counts").first().locator("span")).toHaveText(["+2", "−1"]);
+    await expect(row.locator(".workspace-diff-counts").last().locator("span")).toHaveText(["+1", "−1"]);
+    const colours = await row.locator(".workspace-diff-counts").first().locator("span").evaluateAll(spans => spans.map(span => getComputedStyle(span).color));
+    expect(colours).toEqual([await token(page, "--green"), await token(page, "--red")]);
+    expect(colours[0]).not.toBe(colours[1]);
+    expect(await row.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+    // On the reply itself the entry carries no counts and no names.
+    const reply = page.locator(".host-workspace:not([hidden])").getByRole("region", { name: "运行回复", exact: true });
+    await expect(reply.getByRole("button", { name: "本轮改动", exact: true })).toBeVisible();
+    await expect(reply.getByRole("button", { name: /改动 \d+ 个文件|\+\d+/ })).toHaveCount(0);
+    await row.getByRole("button").click();
+    await expect(page.getByRole("dialog", { name: "本轮改动", exact: true })).toBeVisible();
+  } finally { await done(); }
+});
+
+test("when the names cannot be read, the saved totals stand in, still green and red", async ({ browser }) => {
+  const { page, open, done } = await ready(browser, "zh", 1400, async page => {
+    await page.route("**/api/messages/*/changes?*", route => route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "unavailable" }) }));
+  });
+  try {
+    await open();
+    const row = rail(page).locator(".workspace-diff-row");
+    await expect(row.locator(".workspace-diff-name")).toHaveText(["改动 2 个文件"]);
+    await expect(row.locator(".workspace-diff-counts span")).toHaveText(["+14", "−3"]);
+    expect(await row.locator(".workspace-diff-counts span").evaluateAll(spans => spans.map(span => getComputedStyle(span).color))).toEqual([await token(page, "--green"), await token(page, "--red")]);
+  } finally { await done(); }
+});
