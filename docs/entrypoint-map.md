@@ -3849,8 +3849,14 @@ session, Gateway, Bus and scoped App-tool suites listed in the audit.
   Tests: `claude-stream-adapter`, `core-card-renderer`.
 - `src/codex/antigravity-acp-adapter.ts`
   Antigravity through `agy acp`, selected per Bot with `antigravityRuntime: "acp"`
-  in config.json (default and absent: the print-mode `antigravity-adapter.ts`;
-  takes effect when the Bot restarts). One process per session; `session/resume`
+  in config.json (absent: the print-mode `antigravity-adapter.ts`; takes effect
+  when the Bot restarts). `bot-manager.ts` writes `"acp"` for an ordinary Bot it
+  creates when the installed agy is 1.5.10 or newer
+  (`antigravity-acp-support.ts`; the creation dialog's permission choices follow
+  the same answer); saved Bots keep what they have, and a dispatcher and its
+  workers stay on the print runtime. A conversation started in one runtime
+  continues in the other (checked both ways against agy 1.5.14 on 2026-11-22).
+  One process per session; `session/resume`
   (never `session/load`, which replays history); model/effort/mode through session
   config; Normal approval through `session/request_permission` (allow once / reject
   once); bypass/full-auto through launch flags. Every path that ends a process sends
@@ -3870,7 +3876,7 @@ session, Gateway, Bus and scoped App-tool suites listed in the audit.
   newest `available_commands_update` joins the App command menu through
   `advertisedCommands()`; a Host command of the same name keeps its route.
   Tests: `antigravity-acp-adapter`, `core-engine-factory`, `permissions-settings`,
-  `gateway-command-parity`.
+  `gateway-command-parity`, `hub-bot-manager-agy-runtime`.
 - `src/codex/kimi-acp-adapter.ts`
   Persistent Kimi ACP worker, session configuration/loading, streaming event mapping,
   approvals/questions, cancellation, compact support, and background-task lifecycle mapping.

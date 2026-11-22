@@ -21,6 +21,7 @@ import { saveDispatcherSettingsInTransaction } from "./dispatch.js";
 import { CODEX_MODEL_CHOICES } from "../codex/model-capabilities.js";
 import { deepseekCatalogHome, fallbackModelCatalog, type ModelCatalogRead } from "../runtime/model-catalog.js";
 import { ModelCatalogCache, type ModelCatalogRequest } from "./model-catalog-cache.js";
+import { antigravitySupportsAcp } from "../codex/antigravity-acp-support.js";
 import { findDeepSeekModel } from "../codex/deepseek-models.js";
 import { decodePiModel } from "../codex/pi-models.js";
 import { readEngineCapabilities } from "../runtime/bot-capabilities.js";
@@ -79,11 +80,20 @@ export class BotManager {
     return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: resolveDeepSeekExecutable(env), antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy", pi: resolvePiExecutable(env) };
   }
   engineAvailable(engine: InstanceEngine): boolean { const env = this.env; return !!resolveEngineExecutable(this.engineBinaries(env)[engine], env); }
-  private engineEntry(id: InstanceEngine, available: boolean, catalog: Pick<ModelCatalogRead, "choices" | "status">): CatalogEngine {
+  private agyAcp?: { executable: string; at: number; supported: Promise<boolean> };
+  /** Whether a Bot created now runs Antigravity through `agy acp`: the installed CLI must be new enough.
+   * Read at most once a minute; the catalog asks every time the creation dialog opens. */
+  private antigravityAcp(env = this.env): Promise<boolean> {
+    const executable = this.engineBinaries(env).antigravity, now = Date.now();
+    if (!resolveEngineExecutable(executable, env)) return Promise.resolve(false);
+    if (this.agyAcp?.executable !== executable || now - this.agyAcp.at >= 60_000) this.agyAcp = { executable, at: now, supported: antigravitySupportsAcp(executable, env) };
+    return this.agyAcp.supported;
+  }
+  private engineEntry(id: InstanceEngine, available: boolean, catalog: Pick<ModelCatalogRead, "choices" | "status">, runtime?: "acp"): CatalogEngine {
     const models = catalog.choices;
     const defaults: Record<string, unknown> = {}; applyEngineSelection(defaults, id);
     if (id === "antigravity") defaults.model = preferredAntigravityModel(models);
-    return { id, available, models, ...(catalog.status ? { catalogStatus: catalog.status } : {}), permissions: { defaultChoice: defaultPermission(id), choices: permissionOptions(id) }, defaultModel: String(defaults.model ?? (id === "codex" ? CODEX_MODEL_CHOICES[0] : "")), defaultEffort: String(defaults.effort ?? "") };
+    return { id, available, models, ...(catalog.status ? { catalogStatus: catalog.status } : {}), permissions: { defaultChoice: defaultPermission(id), choices: permissionOptions(id, runtime) }, defaultModel: String(defaults.model ?? (id === "codex" ? CODEX_MODEL_CHOICES[0] : "")), defaultEffort: String(defaults.effort ?? "") };
   }
   /** One engine's catalog entry, read through the Hub cache. */
   async engineCatalog(id: InstanceEngine, workspace?: string, request: ModelCatalogRequest = {}): Promise<EngineRead> {
@@ -94,7 +104,9 @@ export class BotManager {
     // A missing CLI cannot answer; its built-in list is what a failed read gives.
     if ((id === "claude" || id === "codex") && !available) return { ...this.engineEntry(id, available, fallbackModelCatalog(id)), readAt: now };
     const result = await this.catalogs.get(id, env, bins[id], workspace, request);
-    return { ...this.engineEntry(id, available, result), readAt: result.readAt, ...(result.stale ? { stale: true as const } : {}) };
+    // The choices describe what a Bot created now will get; see prepare().
+    const runtime = id === "antigravity" && await this.antigravityAcp(env) ? "acp" as const : undefined;
+    return { ...this.engineEntry(id, available, result, runtime), readAt: result.readAt, ...(result.stale ? { stale: true as const } : {}) };
   }
   /** The complete catalog the App, the CLI and dispatch read: every engine. */
   async catalog(workspace?: string, freshEngine?: InstanceEngine): Promise<BotCatalog> {
@@ -242,8 +254,14 @@ export class BotManager {
     try { await publishExclusive(key, randomBytes(32).toString("base64url")); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     const workspace = spec.workspace || path.join(stateDir, "workspace"); await mkdir(workspace, { recursive: true, mode: 0o700 });
     // Only initialize a new config. /model and /effort changes survive Hub restarts.
-    if (!await stat(path.join(stateDir, "config.json")).then(() => true, () => false)) await updateInstanceConfig(stateDir, (config) => {
+    const fresh = !await stat(path.join(stateDir, "config.json")).then(() => true, () => false);
+    // A new ordinary Antigravity Bot runs through `agy acp` when the installed CLI is new enough: steering,
+    // context usage and per-call approval need it. Saved Bots keep the runtime they have; a dispatcher and
+    // its workers stay on the print runtime, which is what they were built and tested with.
+    const acp = fresh && spec.engine === "antigravity" && !spec.role && await this.antigravityAcp();
+    if (fresh) await updateInstanceConfig(stateDir, (config) => {
       applyEngineSelection(config, spec.engine); config.model = spec.model || undefined; config.effort = spec.effort || undefined; config.workspacePath = workspace; config.locale = "zh";
+      if (acp) config.antigravityRuntime = "acp";
       if (spec.permission) applyPermission(config, spec.engine, spec.permission);
       // The Gateway reads the role to add the host-owned dispatcher contract.
       if (spec.role === "dispatcher") config.role = spec.role;

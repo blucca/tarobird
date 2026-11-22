@@ -1608,6 +1608,10 @@ function renderToolInput(tool: CoreToolEntry): string {
   }
 }
 
+// agy ends the reply of a finished native /goal with this comment. The App's Markdown does not show it, but
+// previews, notifications and a reply read by another Bot are plain text.
+const AGY_GOAL_MARKER_AT_END = /\s*<!--\s*GOAL_COMPLETE\s*-->\s*$/;
+
 export function cleanCardText(
   content: string,
   locale: Locale = "zh",
@@ -1615,7 +1619,7 @@ export function cleanCardText(
 ): string {
   const stripped = stripInvalidDeliveryPseudoTags(
     stripCronAddTags(stripCoreToolTags(stripDeliveryTags(content))),
-  );
+  ).replace(AGY_GOAL_MARKER_AT_END, "");
   const text = renderCodexWebCitations(renderCodexFileCitations(stripped, locale, options), locale, options);
   // The App supports real headings and math. Feishu's compatibility downgrade
   // must not erase their semantics before the shared Markdown reader sees them.
