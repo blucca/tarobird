@@ -152,6 +152,8 @@ export interface InstanceConfig {
   role?: "dispatcher";
   /** Claude native Chrome integration. Only meaningful for the Claude engine. */
   claudeChrome: boolean;
+  /** Present only when the Antigravity ACP runtime is selected (applied at Bot start). */
+  antigravityRuntime?: "acp";
   locale: "en" | "zh";
   verbosity: 0 | 1 | 2;
   budgetUsd: number | undefined;
@@ -555,6 +557,7 @@ export async function loadInstanceConfig(stateDir: string): Promise<InstanceConf
     engine: config.engine === "claude" || config.engine === "antigravity" || config.engine === "kimi" || config.engine === "deepseek" || config.engine === "pi" ? config.engine : "codex",
     ...(config.role === "dispatcher" ? { role: "dispatcher" as const } : {}),
     claudeChrome: config.claudeChrome === true,
+    ...(config.antigravityRuntime === "acp" ? { antigravityRuntime: "acp" as const } : {}),
     locale: config.locale === "zh" ? "zh" : "en",
     verbosity: config.verbosity === 0 ? 0 : config.verbosity === 2 ? 2 : 1,
     budgetUsd: typeof config.budgetUsd === "number" && config.budgetUsd > 0 ? config.budgetUsd : undefined,

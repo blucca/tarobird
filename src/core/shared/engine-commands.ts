@@ -122,6 +122,8 @@ function renderEngineSwitchMessage(input: {
 
 export interface EngineCommandConfig {
   engine: InstanceEngine;
+  /** Antigravity transport; only "acp" has native /compact and context usage. */
+  antigravityRuntime?: "acp";
   role?: "dispatcher";
   disableRuntimeTimeout?: boolean;
   model?: string;
@@ -247,7 +249,8 @@ export async function handleLocalEngineCoreCommand(input: {
   if (isCompactCommand(normalized.text)) {
     // Keep Pi's native command suffix, extension callbacks and turn scope.
     if (cfg.engine === "pi") return false;
-    if (cfg.engine !== "claude" && cfg.engine !== "kimi" && cfg.engine !== "deepseek") {
+    const agyAcp = cfg.engine === "antigravity" && cfg.antigravityRuntime === "acp";
+    if (cfg.engine !== "claude" && cfg.engine !== "kimi" && cfg.engine !== "deepseek" && !agyAcp) {
       const msg = locale === "zh"
         ? "/compact 仅支持 Claude、Kimi 与 DeepSeek 引擎。当前引擎不会执行本地上下文压缩；如需清空当前会话，请使用 /reset。"
         : "/compact is only supported with the Claude, Kimi, and DeepSeek engines. The current engine does not run local context compaction; use /reset to clear this conversation.";
@@ -364,14 +367,14 @@ export async function handleLocalEngineCoreCommand(input: {
   }
 
   if (isContextCommand(normalized.text)) {
-    if (cfg.engine === "deepseek" || cfg.engine === "pi") {
+    if (cfg.engine === "deepseek" || cfg.engine === "pi" || cfg.engine === "antigravity" && cfg.antigravityRuntime === "acp") {
       const usage = await bridge.getContextUsage?.({
         chatId: normalized.chatId,
         messageThreadId: normalized.messageThreadId,
         conversationKey: normalized.conversationKey,
         workspaceOverride: cfg.engine === "pi" ? cfg.workspacePath ?? cfg.resume?.workspacePath : cfg.resume?.workspacePath,
       }) ?? null;
-      const msg = renderContextUsage(usage, locale, cfg.engine === "pi" ? "Pi" : "DeepSeek Harness");
+      const msg = renderContextUsage(usage, locale, cfg.engine === "pi" ? "Pi" : cfg.engine === "antigravity" ? "Antigravity" : "DeepSeek Harness");
       await context.api.sendMessage(normalized.chatId, msg);
       await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
         startedAt,

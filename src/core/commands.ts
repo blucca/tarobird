@@ -471,6 +471,7 @@ async function handleCoreLocalEngineCommand(
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
       workspacePath: cfg.workspacePath,
       resume: cfg.resume,
+      ...(cfg.antigravityRuntime ? { antigravityRuntime: cfg.antigravityRuntime } : {}),
     },
     normalized: toSessionCommandMessage(normalized, commandText),
     context: {
