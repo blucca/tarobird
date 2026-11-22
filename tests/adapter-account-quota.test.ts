@@ -96,6 +96,15 @@ it("destroy during a quota helper's initialize cancels it and waits for its actu
   expect((await read).snapshot.reason).toBe("cancelled");
   expect(child.methods).not.toContain("account/read");
 });
+it("app-server destroy cancels its own quota helper and waits for its actual close", async () => {
+  const f = await fixture(), child = new Child(); child.hold.add("initialize"); child.closeDelayMs = 60;
+  const adapter = new CodexAppServerAdapter("codex", f.root, f.env, () => child);
+  const read = adapter.getAccountQuota({ refresh: true });
+  await vi.waitFor(() => expect(child.methods).toContain("initialize"));
+  await adapter.destroy();
+  expect(child.closed).toBe(true);
+  expect((await read).snapshot.reason).toBe("cancelled");
+});
 it("Claude passive events of a verified login still count with a CLI that refuses get_usage, and a changed credential source hides them", async () => {
   const f = await fixture(), child = new Child(); child.refuse.add("get_usage");
   const env = { HOME: f.home, CLAUDE_CODE_OAUTH_TOKEN: "synthetic-oauth" };

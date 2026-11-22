@@ -4581,11 +4581,13 @@ export class CodexAppServerAdapter implements CodexAdapter {
     return { text, usage: readTurnUsage(targetTurn) };
   }
 
-  destroy(expectedChildGeneration?: number, reason?: string): void {
+  /** The returned promise ends once this adapter's own quota helpers have closed (as the other adapters' destroy);
+   * it never rejects, so the internal respawn callers may leave it. */
+  destroy(expectedChildGeneration?: number, reason?: string): Promise<void> {
     if (expectedChildGeneration !== undefined && expectedChildGeneration !== this.childGeneration) {
-      return;
+      return Promise.resolve();
     }
-    void cancelOwnedQuotaReads(this.quotaCache).catch(() => undefined);
+    const quotaReads = cancelOwnedQuotaReads(this.quotaCache).catch(() => undefined);
     this.quotaCache.invalidate();
     this.terminateChild();
     // `reason` preserves a diagnosable cause (e.g. the thread/read timeout that
@@ -4593,6 +4595,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
     // bare "Adapter destroyed" and the real failure was unrecoverable from chat.
     this.failAllPending(this.withDiagnostics(reason ?? "Adapter destroyed"));
     this.resetChildState();
+    return quotaReads;
   }
 
   /**
