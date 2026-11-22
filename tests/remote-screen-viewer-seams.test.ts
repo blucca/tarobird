@@ -204,3 +204,52 @@ it("a phone two-finger scroll reaches the Host as one move, then wheels fixed at
   touch.up(1); touch.up(2); await sleep(60);
   expect(sent().length).toBe(stopped);
 });
+
+it("a viewer opened with a capacity takes that many frames before their receipts and says how long it held each; without one it stays at three", async () => {
+  const outputs: ((frame: unknown) => void)[] = [];
+  class Decoder { state = "unconfigured"; constructor(init: { output: (frame: unknown) => void }) { outputs.push(init.output); } configure() { this.state = "configured"; } decode() {} close() { this.state = "closed"; } }
+  vi.stubGlobal("VideoDecoder", Decoder);
+  const repaints: (() => void)[] = []; vi.stubGlobal("requestAnimationFrame", (run: () => void) => { repaints.push(run); return repaints.length; });
+  let now = 1000; vi.spyOn(performance, "now").mockImplementation(() => now);
+  const surface = () => ({ width: 0, height: 0, focus() {}, getContext: () => ({ drawImage() {} }) }) as unknown as HTMLCanvasElement;
+  const open = async (flight?: number) => {
+    const f = fakeTransport(), states: ViewerState[] = [];
+    const viewer = new RemoteScreenViewer(join, surface(), state => states.push(state), { transport: f.transport, inputActive: () => true, ...(flight ? { flight } : {}) });
+    await viewer.open(network); f.attach(); f.deliver(viewing); f.deliver(stream(1));
+    return { f, viewer, states };
+  };
+  const decoded = (sequence: number) => { outputs.at(-1)!({ timestamp: sequence, close() {} }); repaints.splice(0).forEach(run => run()); };
+  const acks = (f: ReturnType<typeof fakeTransport>) => f.posted.filter(message => message.type === "ack");
+
+  // Eight named: six frames wait undecoded without a failure, and each receipt carries the time the frame spent here.
+  const wide = await open(8);
+  const settle = () => new Promise(resolve => setTimeout(resolve, 5));   // a refusal lands asynchronously
+  for (let sequence = 1; sequence <= 6; sequence++) wide.f.deliver(frame(1, sequence));
+  await settle(); expect(wide.viewer.state.state).not.toBe("closed");
+  now = 1012; decoded(1); now = 1031.4; decoded(2);
+  expect(acks(wide.f)).toEqual([{ type: "ack", frameSequence: 1, heldMs: 12, ...stamp }, { type: "ack", frameSequence: 2, heldMs: 31, ...stamp }]);
+  for (let sequence = 7; sequence <= 10; sequence++) wide.f.deliver(frame(1, sequence));   // 3..10: eight held
+  await settle(); expect(wide.viewer.state.state).not.toBe("closed");
+  wide.f.deliver(frame(1, 11));
+  await vi.waitFor(() => expect(wide.viewer.state).toMatchObject({ state: "closed", reason: "screen_decoder_congested" }));
+  wide.viewer.dispose();
+
+  // A capacity outside the range is brought inside it; a held time is never reported above two seconds.
+  const most = await open(400);
+  for (let sequence = 1; sequence <= 16; sequence++) most.f.deliver(frame(1, sequence));
+  await settle(); expect(most.viewer.state.state).not.toBe("closed");
+  now += 9000; decoded(1);
+  expect(acks(most.f)).toEqual([{ type: "ack", frameSequence: 1, heldMs: 2000, ...stamp }]);
+  most.f.deliver(frame(1, 17)); most.f.deliver(frame(1, 18));
+  await vi.waitFor(() => expect(most.viewer.state).toMatchObject({ state: "closed", reason: "screen_decoder_congested" }));
+  most.viewer.dispose();
+
+  // None named: three, and the receipt it always sent.
+  const plain = await open();
+  for (let sequence = 1; sequence <= 3; sequence++) plain.f.deliver(frame(1, sequence));
+  decoded(1);
+  expect(acks(plain.f)).toEqual([{ type: "ack", frameSequence: 1, ...stamp }]);
+  plain.f.deliver(frame(1, 4)); plain.f.deliver(frame(1, 5));
+  await vi.waitFor(() => expect(plain.viewer.state).toMatchObject({ state: "closed", reason: "screen_decoder_congested" }));
+  plain.viewer.dispose();
+});

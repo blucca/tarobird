@@ -3,8 +3,8 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { WebSocket } from 'ws';
 import { z } from 'zod';
-import { SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_CONTROL_WINDOWS_CAPABILITY, SCREEN_MAX_CONTROL_BYTES, SCREEN_MAX_VIEWERS, SCREEN_SERVICE_QUALITY_FEATURE, screenDesktopSchema, screenServiceCommandSchema, screenServiceEventSchema } from '../../src/client-protocol/remote-screen.ts';
-import { screenQualityProfile } from '../../src/client-protocol/screen-quality.ts';
+import { SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_CONTROL_RATE_CAPABILITY, SCREEN_CONTROL_WINDOWS_CAPABILITY, SCREEN_MAX_CONTROL_BYTES, SCREEN_MAX_VIEWERS, SCREEN_SERVICE_FLIGHT_FEATURE, SCREEN_SERVICE_PACE_FEATURE, SCREEN_SERVICE_QUALITY_FEATURE, screenDesktopSchema, screenServiceCommandSchema, screenServiceEventSchema } from '../../src/client-protocol/remote-screen.ts';
+import { SCREEN_LEGACY_FPS, screenQualityProfile } from '../../src/client-protocol/screen-quality.ts';
 import { ScreenGeometry, encodeSize } from './screen-geometry.mjs';
 import { HeldJournal, readHeldJournal } from './screen-held-journal.mjs';
 import { ScreenInput, SCREEN_FRAME_FRESH_MS } from './screen-input.mjs';
@@ -19,7 +19,8 @@ const STOPS = new Set(['screen_local_takeover', 'screen_capture_failed', 'screen
 const stopReason = reason => STOPS.has(reason) ? reason : reason === 'screen_frame_stale' ? 'screen_capture_stale' : reason === 'screen_input_denied' ? 'screen_input_failed' : 'screen_service_stopped';
 const attachedSchema = z.object({ type: z.literal('attached'), sessionId: z.string().regex(ID) }).strict();
 const CONTROL_BACKLOG = 16 * 1024;
-const MEDIA_BACKLOG = 2 * 1024 * 1024, LEDGER = 64, TAKEOVER_POINTS = 12, CLOCK_JUMP_MS = 1000;
+// LEDGER: sent frames remembered for their receipts; 512 covers four seconds at 120 fps (frames are fresh for two).
+const MEDIA_BACKLOG = 2 * 1024 * 1024, LEDGER = 512, PACE_SHARE = 0.85, TAKEOVER_POINTS = 12, CLOCK_JUMP_MS = 1000;
 const captureState = status => status === 'granted' ? 'granted' : status === 'not-determined' ? 'not-determined' : ['denied', 'restricted'].includes(status) ? 'denied' : 'unavailable';
 /** Service readiness errors (`status().error`) are bounded `[a-z_]` codes; the
  * ticket step reports screen-host-control's codes, a Host refusal before
@@ -36,7 +37,7 @@ const PANES = { capture: 'Privacy_ScreenCapture', accessibility: 'Privacy_Access
  * session; the capture renderer is released after the last one ends. */
 export class ScreenService {
   #ws; #registered = false; #epoch; #timer; #retry; #retryAt; #retryDelay; #disposed = false; #started = false; #startFailed = false;
-  #connecting = false; #attempt = 0; #wsFailure;
+  #connecting = false; #attempt = 0; #wsFailure; #hostRate = false;
   #sessions = new Map(); #instancePort; #lastError; #clock; #takeover; #hostRelease = false; #lockedEvent = false; #readyCache; #leaseReady;
   // Windows only. `#journal`: the on-disk record of what remote control holds (screen-held-journal.mjs).
   // `#stale`: what a process that died during control left behind, until that is settled.
@@ -235,7 +236,10 @@ export class ScreenService {
       if (this.isUpdating()) { this.#wsFailure ??= 'screen_service_updating'; ws.terminate(); return; }
       // Optional features only for a Host that advertised them on the ticket
       // reply: an older Hub parses this hello strictly and would refuse it.
-      const features = Array.isArray(ticket.capabilities) && ticket.capabilities.includes(SCREEN_CONTROL_QUALITY_CAPABILITY) ? [SCREEN_SERVICE_QUALITY_FEATURE] : undefined;
+      const capabilities = Array.isArray(ticket.capabilities) ? ticket.capabilities : [];
+      // Above the legacy frame rate, and a named byte budget, only with a Host that says it handles both.
+      this.#hostRate = capabilities.includes(SCREEN_CONTROL_RATE_CAPABILITY);
+      const features = capabilities.includes(SCREEN_CONTROL_QUALITY_CAPABILITY) ? [SCREEN_SERVICE_QUALITY_FEATURE, ...(this.#hostRate ? [SCREEN_SERVICE_PACE_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE] : [])] : undefined;
       try { this.#send(ws, { type: 'hello', ticket: ticket.ticket, desktop: this.#desktop(), ...(features ? { features } : {}) }); }
       catch { this.#wsFailure ??= 'screen_desktop_invalid'; ws.terminate(); }
     });
@@ -342,7 +346,7 @@ export class ScreenService {
       default: return;
     }
   }
-  #startSession({ session, mediaTicket, streamGeneration, codecs, quality }) {
+  #startSession({ session, mediaTicket, streamGeneration, codecs, quality, mediaBytesPerMs, flight }) {
     if (this.#sessions.has(session.id)) return;
     const fail = reason => this.#emit({ type: 'stop', sessionId: session.id, reason });
     // An App update replaces this process: no new sessions while it installs.
@@ -379,7 +383,9 @@ export class ScreenService {
       // size, frame rate and quantizer/bitrate (omitted = legacy balanced).
       const profile = screenQualityProfile(quality);
       this.capture.start({ sessionId: session.id, display, streamGeneration: record.streamGeneration, codecs, encode: encodeSize(display, profile),
-        fps: profile.fps, profile: { qpBase: profile.qpBase, qpMax: profile.qpMax, bitrate: profile.bitrate, h264Only: profile.h264Only } })
+        // The Host names a byte budget only when it is not the default; the encoder paces itself 15% below it.
+        fps: this.#hostRate ? profile.fps : Math.min(profile.fps, SCREEN_LEGACY_FPS), profile: { qpBase: profile.qpBase, qpMax: profile.qpMax, bitrate: profile.bitrate, h264Only: profile.h264Only,
+          ...(mediaBytesPerMs ? { bytesPerMs: Math.floor(mediaBytesPerMs * PACE_SHARE) } : {}) }, ...(flight ? { flight } : {}) })
         .then(() => {
           if (this.#sessions.get(session.id) !== record || this.#disposed) { this.capture?.stop(session.id); return; }
           record.started = true;
@@ -429,10 +435,10 @@ export class ScreenService {
   }
   /** Confirms a viewer-decoded frame only if this service actually sent it in the
    * current generation, it is still fresh, and capture/geometry are healthy. */
-  #ack(record, { frameSequence, streamGeneration }) {
+  #ack(record, { frameSequence, streamGeneration, heldMs }) {
     const entry = record.ledger.get(frameSequence);
     if (!entry || entry.confirmed || streamGeneration !== record.streamGeneration || entry.streamGeneration !== streamGeneration) return;
-    this.capture.credit(record.session.id, frameSequence, streamGeneration);
+    this.capture.credit(record.session.id, frameSequence, streamGeneration, heldMs);
     const display = this.geometry.find(record.display.id);
     const fresh = this.wall() <= entry.captureMs + SCREEN_FRAME_FRESH_MS && this.monotonic() <= entry.captureMono + SCREEN_FRAME_FRESH_MS;
     if (!fresh || !display || display.revision !== entry.geometryRevision) return;

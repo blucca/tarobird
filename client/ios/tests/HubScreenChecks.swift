@@ -410,30 +410,31 @@ final class ScreenClock: @unchecked Sendable {
         let value = join(true), id = try await open(manager, log, fixture, document, value)
         try frame(fixture, value, 1, 1); let old = try await packets(manager, log, id, 1)
         observed["restartConfigDelivered"] = String(describing: try await restart(manager, log, fixture, value, id, 2))
-        for sequence in 1...3 { try frame(fixture, value, 2, sequence) }
-        let fresh = try await packets(manager, log, id, 3)
+        let w = HubScreenSession.BINARY_WINDOW // the flight window; the bounds below are one window per generation and two in all
+        for sequence in 1...w { try frame(fixture, value, 2, sequence) }
+        let fresh = try await packets(manager, log, id, w)
         observed["restartWindowAdmittedBehindUnreadPacket"] = fresh.closed.map { "closed:" + $0 } ?? "admitted:\(fresh.packets.count)"
         if fresh.closed == nil {
             for packet in old.packets + fresh.packets { try await consume(manager, id, packet) }
             try await Task.sleep(nanoseconds: 300_000_000)
             observed["restartedSessionStaysOpen"] = log.count(id) == 0 ? "open" : "closed"
-            for sequence in 4...6 { try frame(fixture, value, 2, sequence) }
-            let window = try await packets(manager, log, id, 3)
+            for sequence in (w + 1)...(2 * w) { try frame(fixture, value, 2, sequence) }
+            let window = try await packets(manager, log, id, w)
             observed["generationWindowRefills"] = window.closed.map { "closed:" + $0 } ?? "admitted:\(window.packets.count)"
-            try frame(fixture, value, 2, 7)
+            try frame(fixture, value, 2, 2 * w + 1)
             observed["generationWindowStillBounded"] = try await packets(manager, log, id, 1).closed.map { "closed:" + $0 } ?? "admitted"
         }
         try await peerClosed(fixture, value)
         // Two restarts without reading: the total stays bounded at one current plus one superseded window.
         let chain = join(true), chainID = try await open(manager, log, fixture, document, chain)
-        for sequence in 1...3 { try frame(fixture, chain, 1, sequence) }
-        var stage = try await packets(manager, log, chainID, 3)
-        if stage.closed == nil { _ = try await restart(manager, log, fixture, chain, chainID, 2); for sequence in 1...3 { try frame(fixture, chain, 2, sequence) }; stage = try await packets(manager, log, chainID, 3) }
+        for sequence in 1...w { try frame(fixture, chain, 1, sequence) }
+        var stage = try await packets(manager, log, chainID, w)
+        if stage.closed == nil { _ = try await restart(manager, log, fixture, chain, chainID, 2); for sequence in 1...w { try frame(fixture, chain, 2, sequence) }; stage = try await packets(manager, log, chainID, w) }
         if stage.closed == nil { _ = try await restart(manager, log, fixture, chain, chainID, 3); try frame(fixture, chain, 3, 1); stage = try await packets(manager, log, chainID, 1) }
         observed["retainedPacketsStillBounded"] = stage.closed.map { "closed:" + $0 } ?? "admitted"
         try await peerClosed(fixture, chain)
-        let expected = ["restartConfigDelivered": "Optional(2)", "restartWindowAdmittedBehindUnreadPacket": "admitted:3", "restartedSessionStaysOpen": "open",
-                        "generationWindowRefills": "admitted:3", "generationWindowStillBounded": "closed:screen_viewer_congested",
+        let expected = ["restartConfigDelivered": "Optional(2)", "restartWindowAdmittedBehindUnreadPacket": "admitted:\(w)", "restartedSessionStaysOpen": "open",
+                        "generationWindowRefills": "admitted:\(w)", "generationWindowStillBounded": "closed:screen_viewer_congested",
                         "retainedPacketsStillBounded": "closed:screen_viewer_congested"]
         let report = try JSONSerialization.data(withJSONObject: ["observed": observed, "expected": expected], options: [.prettyPrinted, .sortedKeys])
         FileHandle.standardError.write(report); FileHandle.standardError.write(Data("\n".utf8))

@@ -22,11 +22,16 @@ import org.json.JSONObject;
 final class HubScreenSession {
     static final int PACKET_LIMIT=1024*1024, READ_LIMIT=256*1024, CONTROL_LIMIT=16384;
     static final long ACK_NANOS=TimeUnit.SECONDS.toNanos(2);
-    /** The target's encoder credits: three frames per stream generation. A restart
-     * (start control, keyframe, resume) retires them and the next generation may send
-     * three at once while the page still reads the old one's, so superseded packets
-     * count only against the total: one current window plus one superseded window. */
-    static final int BINARY_WINDOW=3, BINARY_RETAINED=2*BINARY_WINDOW;
+    /** The target's flight window: the most frames of one stream generation it keeps
+     * unacknowledged (three by default, up to this many for a viewer that names its
+     * capacity; the page asks for this value through screenWindow). A restart (start
+     * control, keyframe, resume) retires them and the next generation may send a full
+     * window while the page still reads the old one's, so superseded packets count only
+     * against the total: one current window plus one superseded window. JSON deliveries,
+     * commands queued before the control socket is ready and frames waiting in a screen
+     * socket's write queue (HubSocket) are bounded five beyond the window: a frame-ready
+     * and a receipt per frame, plus state and input. */
+    static final int BINARY_WINDOW=16, BINARY_RETAINED=2*BINARY_WINDOW, PENDING=BINARY_WINDOW+5;
     interface Events { void send(JSONObject event) throws Exception; void closed(); }
     private static final class Delivery {
         final byte[] bytes; final int size; final long generation, sent=System.nanoTime(); int offset;
@@ -188,7 +193,7 @@ final class HubScreenSession {
     private void applyState(JSONObject value) throws Exception { canControl=controlGrant(value); if(!canControl) inputFocused=false; }
     /** Queues one JSON delivery for the page; false when the bound closed the session. */
     private boolean deliver(JSONObject value,int size) throws Exception {
-        if(jsonCount>=8 || jsonBytes+size>65536) { close("screen_viewer_congested"); return false; }
+        if(jsonCount>=PENDING || jsonBytes+size>65536) { close("screen_viewer_congested"); return false; }
         Delivery delivery=new Delivery(null,size,0); long receipt=++sequence; deliveries.put(receipt,delivery); jsonCount++; jsonBytes+=size;
         emit(new JSONObject().put("kind","screen").put("deliverySequence",receipt).put("value",value));
         return true;
@@ -222,12 +227,13 @@ final class HubScreenSession {
         else if(type.equals("control")) { keys(command,"type sessionId generation frameSequence",""); integer(command,"frameSequence",1,0xffffffffL); if(!controlAllowed||!visible) throw invalid(); }
         else if(type.equals("renew")) { keys(command,"type sessionId generation leaseId frameSequence challenge",""); token(command,"leaseId"); token(command,"challenge"); integer(command,"frameSequence",1,0xffffffffL); if(!canControl||!inputFocused||!visible) throw controlEnded(); }
         else if(type.equals("input")) { validateInput(command); if(!canControl||!inputFocused||!visible) throw controlEnded(); }
-        else if(type.equals("ack")) { keys(command,"type sessionId generation frameSequence",""); integer(command,"frameSequence",1,0xffffffffL); }
+        // heldMs: how long the page held the frame, from a viewer that named its capacity.
+        else if(type.equals("ack")) { keys(command,"type sessionId generation frameSequence","heldMs"); integer(command,"frameSequence",1,0xffffffffL); if(command.has("heldMs")) integer(command,"heldMs",0,2000); }
         else if(Arrays.asList("release","disconnect","keyframe").contains(type)) { keys(command,"type sessionId generation",""); if(!type.equals("keyframe")) { inputFocused=false; canControl=false; } }
         else throw invalid();
         String encoded=command.toString(); int size=encoded.getBytes(StandardCharsets.UTF_8).length;
         if(size>CONTROL_LIMIT) throw invalid();
-        if(!controlReady) { if(outgoing.size()>=8||outgoingBytes+size>CONTROL_LIMIT) { close("screen_control_backpressure"); throw new IOException("screen_control_backpressure"); } outgoing.add(encoded); outgoingBytes+=size; }
+        if(!controlReady) { if(outgoing.size()>=PENDING||outgoingBytes+size>CONTROL_LIMIT) { close("screen_control_backpressure"); throw new IOException("screen_control_backpressure"); } outgoing.add(encoded); outgoingBytes+=size; }
         else if(!control.sendText(encoded)) { close("screen_control_closed"); throw new IOException("screen_control_closed"); }
     } }
     private void validateInput(JSONObject command) throws Exception {

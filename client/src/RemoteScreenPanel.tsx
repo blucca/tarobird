@@ -11,7 +11,7 @@ import { t, useLocale } from "./i18n.js";
 import "./remote-screen.css";
 import { SCREEN_DEFAULT_QUALITY, type ScreenQuality } from "../../src/client-protocol/screen-quality.js";
 import { useScreenFullscreen } from "./use-screen-fullscreen.js";
-import { isMobileScreenApp, mobileScreenViewerTransport } from "./mobile-screen-viewer-transport.js";
+import { isMobileScreenApp, mobileScreenViewerTransport, screenViewerFlight } from "./mobile-screen-viewer-transport.js";
 import { isScreenReasonCode } from "./screen-errors.js";
 import { useScreenMobileLifecycle } from "./use-screen-mobile-lifecycle.js";
 import { ScreenTouch, SCREEN_TOUCH_HOLD_MS, type ScreenTransform } from "./screen-touch.js";
@@ -123,12 +123,14 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
       const d=s.desktop?.displays.find(d=>d.id===display);if(!s.desktop||!d)throw new Error("screen_service_offline");
       const codecs=await supportedScreenCodecs(connection.state.screenQualityAvailable&&!legacy?requested:SCREEN_DEFAULT_QUALITY);if(n!==attempt.current)return;
       const explicit=connection.state.screenQualityAvailable&&!legacy;
-      const result=await connection.screenOpen({desktopId:s.desktop.desktopId,displayId:d.id,displayRevision:d.revision,requestId:crypto.randomUUID(),codecs,...(explicit?{quality:requested}:{})});
+      // What this App can hold unacknowledged, named only to a Host that knows the field.
+      const flight=connection.state.screenFlightAvailable?await screenViewerFlight():undefined;if(n!==attempt.current)return;
+      const result=await connection.screenOpen({desktopId:s.desktop.desktopId,displayId:d.id,displayRevision:d.revision,requestId:crypto.randomUUID(),codecs,...(explicit?{quality:requested}:{}),...(flight?{flight}:{})});
       lifecycle.sessions.add(result.join.session.id);cleanupOnError=true;
       if(n!==attempt.current||!canvas.current){cleanupOnError=false;await retire();return;}
       if(explicit&&result.join.quality!==requested)throw new Error("screen_quality_unconfirmed");
       setQuality(result.join.quality??SCREEN_DEFAULT_QUALITY);
-      const next=new RemoteScreenViewer(result.join,canvas.current,value=>{if(n===attempt.current){if(mobile&&value.state==="closed")clearPicture();setState(value);}},mobile?{transport:mobileScreenViewerTransport,inputActive:()=>activeNow.current&&document.hasFocus()&&document.visibilityState==="visible"&&!!panel.current?.contains(document.activeElement)}:undefined);viewer.current=next;
+      const next=new RemoteScreenViewer(result.join,canvas.current,value=>{if(n===attempt.current){if(mobile&&value.state==="closed")clearPicture();setState(value);}},mobile?{transport:mobileScreenViewerTransport,flight,inputActive:()=>activeNow.current&&document.hasFocus()&&document.visibilityState==="visible"&&!!panel.current?.contains(document.activeElement)}:{flight});viewer.current=next;
       next.visibility(visibleNow.current&&document.visibilityState==="visible");await next.open(result.network);
       if(n!==attempt.current){next.dispose();cleanupOnError=false;await retire();return;}next.visibility(visibleNow.current&&document.visibilityState==="visible");
     }catch(e){if(n===attempt.current){viewer.current?.dispose();viewer.current=undefined;setError(mobile&&e instanceof Error&&e.message==="screen_decoder_unavailable"?"screen_mobile_decoder_unavailable":e instanceof Error?e.message:String(e));setState({state:"closed",controlling:false,pending:false,fresh:false});}if(cleanupOnError)await retire().catch(()=>undefined);}};
@@ -154,10 +156,10 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   // Desktop control: the picture carries the target's own pointer, so the local
   // one is hidden over the picture only (toolbar, menus and the letterbox keep
   // it). It returns the moment input stops: stale picture, control withdrawn,
-  // window blur (which releases control) or the end of the session. Verified
-  // for Mac targets (their captured frames show the pointer); a Windows target
-  // keeps the local pointer until that is confirmed for its capture.
-  const hideLocalPointer = !mobile && status?.desktop?.platform === "macos" && state.controlling && state.fresh;
+  // window blur (which releases control) or the end of the session. Both kinds
+  // of target capture their own pointer into the picture (Mac verified
+  // 2026-11-21; Windows 2026-11-22, the ordinary arrow in a captured frame).
+  const hideLocalPointer = !mobile && state.controlling && state.fresh;
   // Reasons name the computer last read for this Host: once a session ends its
   // desktop service may be gone (sleep, App quit), leaving no platform to read.
   if(status?.desktop?.platform)knownTarget.current={connection,platform:status.desktop.platform};

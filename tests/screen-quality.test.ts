@@ -10,13 +10,14 @@ import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HubServer } from "../src/hub/server.js";
 import { HubRemoteScreen } from "../src/hub/remote-screen.js";
+import { isLocalNetworkAddress } from "../src/hub/network.js";
 import { inspectHubService, startHubControl } from "../src/hub/service.js";
 import { hashSecret } from "../src/hub/auth.js";
 import { deviceActionProofText } from "../src/client-protocol/device-actions.js";
-import { CAPABILITIES } from "../src/client-protocol/index.js";
+import { CAPABILITIES, SERVER_CAPABILITIES } from "../src/client-protocol/index.js";
 import {
-  REMOTE_SCREEN_QUALITY_CAPABILITY, SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_SERVICE_QUALITY_FEATURE,
-  screenConfigureText, screenJoinSchema, screenOpenSchema, screenServiceCommandSchema, screenServiceHelloSchema,
+  REMOTE_SCREEN_FLIGHT_CAPABILITY, REMOTE_SCREEN_QUALITY_CAPABILITY, SCREEN_CONTROL_QUALITY_CAPABILITY, SCREEN_SERVICE_FLIGHT_FEATURE, SCREEN_CONTROL_RATE_CAPABILITY, SCREEN_MEDIA_BYTES_PER_MS, SCREEN_MEDIA_DIRECT_BYTES_PER_MS, SCREEN_SERVICE_PACE_FEATURE, SCREEN_SERVICE_QUALITY_FEATURE,
+  screenConfigureText, screenJoinSchema, screenOpenSchema, screenServiceCommandSchema, screenServiceHelloSchema, screenViewerCommandSchema,
   type ScreenConfigure, type ScreenDesktop, type ScreenJoin,
 } from "../src/client-protocol/remote-screen.js";
 import { writeScreenFrame } from "../src/client-protocol/screen-wire.js";
@@ -30,8 +31,8 @@ type Any = any;
 // Shapes an older peer parses strictly: what the new side emits by default
 // must still be accepted by them.
 const legacyJoin = screenJoinSchema.omit({ quality: true }).strict();
-const legacyStart = (screenServiceCommandSchema.options.find(o => o.shape.type.value === "start") as Any).omit({ quality: true }).strict();
-const legacyOpen = screenOpenSchema.omit({ quality: true }).strict();
+const legacyStart = (screenServiceCommandSchema.options.find(o => o.shape.type.value === "start") as Any).omit({ quality: true, mediaBytesPerMs: true, flight: true }).strict();
+const legacyOpen = screenOpenSchema.omit({ quality: true, flight: true }).strict();
 
 describe("Hub authority", () => {
   let root: string, hub: HubServer, screen: HubRemoteScreen, clock: number;
@@ -91,6 +92,71 @@ describe("Hub authority", () => {
       expect(sink.messages.at(-1)).toMatchObject({ type: "stop", sessionId: join.session.id });
     }
     expect((await screen.status(local.session)).sessions).toEqual([]);
+  });
+
+  it("a viewer straight from the local network gets the larger byte budget; any other viewer keeps the default and the old start", async () => {
+    const { sink } = register([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_PACE_FEATURE]);
+    const view = async (origin?: { direct?: boolean }) => {
+      const join = await open();
+      await screen.attachViewer(join.controlTicket, "control", channel(), { direct: true }); // only the media socket's origin counts
+      await screen.attachViewer(join.mediaTicket, "media", channel(), origin);
+      const result = { start: sink.messages.findLast(m => m.type === "start"), rate: screen.mediaBytesPerMs(join.session.id) };
+      screen.viewerCommand(join.session.id, { type: "disconnect", sessionId: join.session.id, generation: join.session.generation });
+      return result;
+    };
+    for (const other of [await view({ direct: false }), await view(), await view({})]) {
+      expect("mediaBytesPerMs" in other.start).toBe(false);
+      expect(() => legacyStart.parse(other.start)).not.toThrow();
+      expect(other.rate).toBe(SCREEN_MEDIA_BYTES_PER_MS);
+    }
+    const direct = await view({ direct: true });
+    expect([direct.start.mediaBytesPerMs, direct.rate]).toEqual([SCREEN_MEDIA_DIRECT_BYTES_PER_MS, SCREEN_MEDIA_DIRECT_BYTES_PER_MS]);
+    expect(() => screenServiceCommandSchema.parse(direct.start)).not.toThrow();
+    expect(screen.mediaBytesPerMs("no-such-session")).toBe(SCREEN_MEDIA_BYTES_PER_MS);
+  });
+
+  it("a viewer's capacity and its reported delay reach only a target that understands them", async () => {
+    // A Host-only feature: advertised by the Hub, never in a client hello (older Hubs cap that list at 64).
+    expect(SERVER_CAPABILITIES).toContain(REMOTE_SCREEN_FLIGHT_CAPABILITY); expect(CAPABILITIES).not.toContain(REMOTE_SCREEN_FLIGHT_CAPABILITY);
+    const stream = { type: "stream", streamGeneration: 1, geometryRevision: 1, codec: "h264", codecString: "avc1.640028", width: 1920, height: 1080, contentRect: { x: 0, y: 0, width: 1920, height: 1080 } };
+    const header = (sequence: number) => ({ key: sequence === 1, codec: "h264" as const, sequence, geometryRevision: 1, streamGeneration: 1, captureMs: clock, width: 1920, height: 1080 });
+    const round = async (features: string[], extra: Record<string, unknown>, heldMs?: number) => {
+      const { sink, epoch } = register(features), join = await open(extra);
+      await attach(join);
+      const { id, generation } = join.session;
+      expect(screen.stream(epoch, id, generation, stream)).toBe(true);
+      expect(screen.frame(epoch, id, generation, header(1), new Uint8Array([1]))).toBe(true);
+      screen.viewerCommand(id, { type: "ack", sessionId: id, generation, frameSequence: 1, ...(heldMs !== undefined ? { heldMs } : {}) });
+      const result = { start: sink.messages.find(m => m.type === "start"), ack: sink.messages.find(m => m.type === "ack") };
+      screen.viewerCommand(id, { type: "disconnect", sessionId: id, generation });
+      screen.serviceLost(epoch, "screen_service_stopped"); // the next round registers another target
+      return result;
+    };
+    const both = await round([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE], { flight: 12 }, 14);
+    expect([both.start.flight, both.ack.heldMs]).toEqual([12, 14]);
+    expect(() => screenServiceCommandSchema.parse(both.start)).not.toThrow(); expect(() => screenServiceCommandSchema.parse(both.ack)).not.toThrow();
+    expect((await round([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE], { flight: 3 }, 0)).ack.heldMs).toBe(0);
+    // An older target: the same viewer, the start and the receipt it always got.
+    const oldTarget = await round([SCREEN_SERVICE_QUALITY_FEATURE], { flight: 12 }, 14);
+    expect("flight" in oldTarget.start || "heldMs" in oldTarget.ack).toBe(false);
+    expect(() => legacyStart.parse(oldTarget.start)).not.toThrow();
+    // A viewer that named no capacity: its delay is not passed on either.
+    const plain = await round([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE], {}, 14);
+    expect("flight" in plain.start || "heldMs" in plain.ack).toBe(false);
+    register([SCREEN_SERVICE_QUALITY_FEATURE, SCREEN_SERVICE_FLIGHT_FEATURE]);
+    for (const flight of [2, 17, 3.5]) await expect(open({ flight })).rejects.toThrow();
+    const receipt = (heldMs: unknown) => screenViewerCommandSchema.safeParse({ type: "ack", sessionId: "s", generation: "g", frameSequence: 1, heldMs }).success;
+    expect([receipt(0), receipt(2000), receipt(2001), receipt(-1), receipt(1.5)]).toEqual([true, true, false, false, false]);
+  });
+
+  it("a target that never advertised the pace feature is never sent a budget, wherever the viewer is", async () => {
+    const { sink } = register([SCREEN_SERVICE_QUALITY_FEATURE]);
+    const join = await open({ quality: "smooth" });
+    await screen.attachViewer(join.controlTicket, "control", channel()); await screen.attachViewer(join.mediaTicket, "media", channel(), { direct: true });
+    const start = sink.messages.find(m => m.type === "start");
+    expect("mediaBytesPerMs" in start).toBe(false);
+    expect(start.quality).toBe("smooth");
+    expect(screen.mediaBytesPerMs(join.session.id)).toBe(SCREEN_MEDIA_BYTES_PER_MS);
   });
 
   it("request-id idempotency covers quality; invalid qualities are schema errors", async () => {
@@ -181,9 +247,11 @@ const cleanups: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const close of cleanups.reverse()) await close(); cleanups.length = 0; });
 const wait = async (check: () => unknown, ms = 3000) => { const end = Date.now() + ms; while (!(await check())) { if (Date.now() > end) throw new Error("test_wait_timeout"); await new Promise(r => setTimeout(r, 5)); } };
 
-async function fixture({ oldHost = false } = {}) {
+async function fixture({ oldHost = false, direct = false } = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "screen-quality-svc-")); cleanups.push(() => rm(dir, { recursive: true, force: true }));
   const hub = await HubServer.start({ stateDir: dir }); cleanups.push(() => hub.close());
+  // Test sockets always arrive from loopback; `direct` stands in for a viewer whose media socket came from a local-network address.
+  if (direct) { const attach = hub.remoteScreen.attachViewer.bind(hub.remoteScreen); hub.remoteScreen.attachViewer = (ticket, kind, sink) => attach(ticket, kind, sink, { direct: true }); }
   const owner = testDevice("local"), viewer = testDevice("viewer");
   await hub.enrollLocalController(deviceFields(owner)); await enrollTrusted(hub.auth, viewer);
   const local = await loginFor(hub.auth, owner), remote = await loginFor(hub.auth, viewer);
@@ -198,8 +266,8 @@ async function fixture({ oldHost = false } = {}) {
     powerMonitor: new EventEmitter(), systemPreferences: { getMediaAccessStatus: () => "granted", isTrustedAccessibilityClient: () => true }, shell: { openExternal: async () => {} } };
   const capture: Any = { starts: [] as Any[], stops: [] as Any[] };
   const service = new ScreenService({ electron, addon, stateDir: path.join(dir, "app"), platform: "darwin",
-    // An older Host's control reply has no quality capability.
-    hostControl: { ticket: async (id: string) => { const ticket = await screenServiceTicket(dir, id); if (oldHost) ticket.capabilities = ticket.capabilities.filter((c: string) => c !== SCREEN_CONTROL_QUALITY_CAPABILITY); return ticket; } },
+    // An older Host's control reply has neither the quality nor the rate capability.
+    hostControl: { ticket: async (id: string) => { const ticket = await screenServiceTicket(dir, id); if (oldHost) ticket.capabilities = ticket.capabilities.filter((c: string) => c !== SCREEN_CONTROL_QUALITY_CAPABILITY && c !== SCREEN_CONTROL_RATE_CAPABILITY); return ticket; } },
     captureHost: (hooks: Any) => Object.assign(capture, { hooks,
       start: async (s: Any) => { capture.starts.push(s); hooks.onMessage({ type: "started", sessionId: s.sessionId, cursor: "always" }); },
       reset: () => true, pause: () => true, keyframe() {}, credit() {}, stop: (id: string) => capture.stops.push(id), close() {} }) });
@@ -223,13 +291,14 @@ it("control socket advertises the quality capability next to the ticket", async 
   const f = await fixture();
   const status = await inspectHubService(f.dir, "status") as Any;
   expect(status.controlCapabilities).toContain(SCREEN_CONTROL_QUALITY_CAPABILITY);
+  expect(status.controlCapabilities).toContain(SCREEN_CONTROL_RATE_CAPABILITY);
 });
 
 it("end to end: the requested quality reaches the real capture profile and is confirmed; switching leaves nothing behind", async () => {
   const f = await fixture();
   const sharp = await f.view("sharp");
   expect(sharp.join.quality).toBe("sharp");
-  expect(f.capture.starts[0]).toMatchObject({ sessionId: sharp.join.session.id, encode: { width: 2880, height: 1800 }, fps: 15, profile: { qpBase: 28, qpMax: 40, h264Only: true } });
+  expect(f.capture.starts[0]).toMatchObject({ sessionId: sharp.join.session.id, encode: { width: 2880, height: 1800 }, fps: 60, profile: { qpBase: 28, qpMax: 40, h264Only: true } });
   // Switching = disconnect, then a new open: new session, generation and stream.
   sharp.control.send({ type: "disconnect", sessionId: sharp.join.session.id, generation: sharp.join.session.generation });
   await wait(() => f.capture.stops.includes(sharp.join.session.id) && f.service.status().sessions.length === 0);
@@ -246,13 +315,44 @@ it("end to end: the requested quality reaches the real capture profile and is co
   expect(smooth.media.values.filter(v => v instanceof Uint8Array)).toEqual([]);
 });
 
+it("end to end: the Hub holds a target to its session's byte budget, and a local-network viewer's larger one reaches the capture pace", async () => {
+  // 300 KB every 80 ms is 3.75 MB/s: seven times the default budget, inside the local-network one.
+  const run = async (direct: boolean) => {
+    const f = await fixture({ direct }), v = await f.view("balanced"), id = v.join.session.id;
+    const rate = f.hub.remoteScreen.mediaBytesPerMs(id), pace = f.capture.starts[0].profile.bytesPerMs;
+    await wait(() => f.service.status().sessions.length === 1);
+    let closed = ""; v.control.ws.once("close", (_code, reason) => { closed = reason.toString(); });
+    f.capture.hooks.onMessage({ type: "stream", sessionId: id, stream: { type: "stream", streamGeneration: 1, geometryRevision: 1, codec: "h264", codecString: "avc1.640028", width: 1280, height: 800, contentRect: { x: 0, y: 0, width: 1280, height: 800 } } });
+    const payload = new Uint8Array(300_000); payload.set([0, 0, 0, 1, 0x65]);
+    for (let sequence = 1; sequence <= 12 && f.service.status().sessions.length; sequence++) {
+      const captureMs = Date.now();
+      f.capture.hooks.onMessage({ type: "frame", sessionId: id, sequence, streamGeneration: 1, captureMs, geometryRevision: 1, key: sequence === 1,
+        bytes: writeScreenFrame({ key: sequence === 1, codec: "h264", sequence, geometryRevision: 1, streamGeneration: 1, captureMs, width: 1280, height: 800 }, payload) });
+      await new Promise(r => setTimeout(r, 80));
+    }
+    await new Promise(r => setTimeout(r, 100));
+    return { rate, pace, closed, frames: v.media.values.filter((x: Any) => x instanceof Uint8Array).length };
+  };
+  const relayed = await run(false);
+  expect([relayed.rate, relayed.pace, relayed.closed]).toEqual([SCREEN_MEDIA_BYTES_PER_MS, undefined, "screen_bandwidth_exceeded"]);
+  expect(relayed.frames).toBeGreaterThan(2); expect(relayed.frames).toBeLessThan(8); // the 1 MiB burst, then 500 B/ms
+  expect(await run(true)).toEqual({ rate: SCREEN_MEDIA_DIRECT_BYTES_PER_MS, pace: 4250, closed: "", frames: 12 });
+}, 15_000);
+
 it("end to end: a target registered against an older Host refuses quality explicitly and keeps legacy viewing", async () => {
   const f = await fixture({ oldHost: true });
   await expect(f.view("sharp")).rejects.toMatchObject({ code: "screen_quality_unsupported" });
   expect(f.capture.starts).toEqual([]);
   const legacy = await f.view();
   expect("quality" in legacy.join).toBe(false);
-  expect(f.capture.starts[0]).toMatchObject({ encode: { width: 1818, height: 1136 }, profile: { qpBase: 28, qpMax: 40, bitrate: 2_500_000, h264Only: false } });
+  expect(f.capture.starts[0]).toMatchObject({ encode: { width: 1818, height: 1136 }, fps: 15, profile: { qpBase: 28, qpMax: 40, bitrate: 2_500_000, h264Only: false } });
+});
+
+it("only private-use addresses count as the local network; loopback (a relay) and overlay ranges do not", () => {
+  for (const address of ["192.168.1.20", "10.0.0.7", "172.16.5.1", "172.31.255.254", "169.254.10.1", "::ffff:192.168.1.20", "::FFFF:10.1.2.3", "fd12:3456::1", "fc00::1", "fe80::1c2:3ff:fe04:5%en0"]) expect(isLocalNetworkAddress(address), address).toBe(true);
+  // Just outside each private block (built from parts: these are ordinary public addresses), and documentation ranges.
+  const outside = [[172, 15, 0, 1], [172, 32, 0, 1], [192, 169, 1, 1], [11, 0, 0, 1], [169, 253, 0, 1]].map(parts => parts.join("."));
+  for (const address of ["127.0.0.1", "::1", "::ffff:127.0.0.1", "100.64.0.1", ...outside, "203.0.113.9", "198.51.100.7", "2001:db8::1", "fe70::1", "", "localhost"]) expect(isLocalNetworkAddress(address), address).toBe(false);
 });
 
 it("hello features are bounded and unknown names are ignored", () => {

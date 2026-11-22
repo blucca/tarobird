@@ -45,6 +45,9 @@ test("screen native pull is bounded and missing old App methods never fall back"
     const missing = await invoke("net_screen_open", { id: "screen", events: { onmessage: () => {} } }).then(() => "", (error: Error) => error.message);
     const old = window.mobileNetwork({ screenSend: async () => { throw Object.assign(Error("not implemented"), { code: "UNIMPLEMENTED" }); } } as unknown as Parameters<typeof window.mobileNetwork>[0]);
     const unavailable = await old("net_screen_send").then(() => "", (error: Error) => error.message);
-    return { bytes, oversized, missing, unavailable };
-  })).toEqual({ bytes: [0, 255, 128], oversized: true, missing: "screen_mobile_update_required", unavailable: "screen_mobile_update_required" });
+    // The packet window: a native layer that reports one, and an older App that has no such call.
+    const wide = await window.mobileNetwork({ screenWindow: async () => ({ value: 16 }) } as unknown as Parameters<typeof window.mobileNetwork>[0])("net_screen_window");
+    const narrow = await invoke("net_screen_window").then(() => "", (error: Error) => error.message);
+    return { bytes, oversized, missing, unavailable, wide, narrow };
+  })).toEqual({ bytes: [0, 255, 128], oversized: true, missing: "screen_mobile_update_required", unavailable: "screen_mobile_update_required", wide: 16, narrow: "screen_mobile_update_required" });
 });

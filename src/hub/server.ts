@@ -120,7 +120,7 @@ import { CONVERSATION_SYNC_CAPABILITY, SNAPSHOT_ACTIVITY_CAPABILITY, SNAPSHOT_DE
 import { botPublishSchema, instanceFrameSchema } from "../client-protocol/instance.js";
 import { HubAttachments } from "./attachments.js";
 import { HubAuth, hashSecret, parsePublicKey, type AuthSession } from "./auth.js";
-import { assertSafeBind, isLoopback, NATIVE_ORIGINS, type ListenerExposure } from "./network.js";
+import { assertSafeBind, isLocalNetworkAddress, isLoopback, NATIVE_ORIGINS, type ListenerExposure } from "./network.js";
 import { HubError, HubStore, newId } from "./store.js";
 import { NOTIFICATION_OPTION_KEYS, notificationPreferencesSchema, pushSubscriptionSchema, pushRotationSchema } from "../client-protocol/push.js";
 import { allowedApnsTopics, assertApnsTopicAllowed, createPushSender, validatePushDestination, type PushConfig } from "./push/providers.js";
@@ -453,7 +453,7 @@ export class HubServer {
     });
     server.on("upgrade", (req, socket, head) => {
       if (!this.stopping && this.originAllowed(req) && this.screenSockets.handles(req.url ?? "")) {
-        this.screenSockets.upgrade(req, socket, head, instance && !tls && isLoopback(req.socket.remoteAddress ?? "")); return;
+        this.screenSockets.upgrade(req, socket, head, instance && !tls && isLoopback(req.socket.remoteAddress ?? ""), isLocalNetworkAddress(req.socket.remoteAddress ?? "")); return;
       }
       // A relay arrives from loopback, so the socket address alone cannot
       // distinguish an instance connection from an untrusted remote client.
