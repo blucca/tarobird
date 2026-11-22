@@ -251,6 +251,8 @@ export function ConversationWorkspace({
     setFiles([]);
     setFilesHasMore(false);
     setWorkbenchItems([]);
+    // Another conversation may have no changes, and then no "changes" filter to switch back with.
+    setFileFilter("all");
   }, [conversation.id, connection.identity.hubPublicKey]);
 
   const [settledMessageCount, setSettledMessageCount] = useState(messages.length);
@@ -584,6 +586,8 @@ export function ConversationWorkspace({
           type="button"
           role="tab"
           className="workspace-tab"
+          id={`${id}-tab-overview`}
+          aria-controls={`${id}-panel`}
           aria-selected={tab === "overview"}
           tabIndex={tab === "overview" ? 0 : -1}
           onClick={() => setTab("overview")}
@@ -594,6 +598,8 @@ export function ConversationWorkspace({
           type="button"
           role="tab"
           className="workspace-tab"
+          id={`${id}-tab-comms`}
+          aria-controls={`${id}-panel`}
           aria-selected={tab === "comms"}
           tabIndex={tab === "comms" ? 0 : -1}
           onClick={() => setTab("comms")}
@@ -609,6 +615,8 @@ export function ConversationWorkspace({
           type="button"
           role="tab"
           className="workspace-tab"
+          id={`${id}-tab-files`}
+          aria-controls={`${id}-panel`}
           aria-selected={tab === "files"}
           tabIndex={tab === "files" ? 0 : -1}
           onClick={() => setTab("files")}
@@ -618,7 +626,7 @@ export function ConversationWorkspace({
         </button>
       </div>
 
-      <div className="workspace-body" ref={body}>
+      <div className="workspace-body" ref={body} id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-tab-${tab}`}>
         {tab === "overview" && (
           <>
             {/* 1. Compact Environment & Context Strip */}

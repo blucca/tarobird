@@ -326,6 +326,10 @@ for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
 
       // Switch to Files tab — verify both recorded run diff trigger and conversation files appear
       await container.getByRole("tab", { name: new RegExp(`^${L("文件")}`) }).click();
+      // The tabs name the panel they show, and the panel is labelled by the selected tab.
+      const filesTab = container.getByRole("tab", { name: new RegExp(`^${L("文件")}`) });
+      await expect(container.getByRole("tabpanel")).toHaveAttribute("id", (await filesTab.getAttribute("aria-controls"))!);
+      await expect(container.getByRole("tabpanel")).toHaveAttribute("aria-labelledby", (await filesTab.getAttribute("id"))!);
       await expect(container).toContainText("workspace-rail-spec.md");
       await expect(container).toContainText("layout-benchmark.json");
       const diffButton = container.getByRole("button", { name: /2.*14.*3/ });
@@ -383,10 +387,16 @@ for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
         await expect(container.locator(".workspace-stop-btn")).toHaveCount(0);
       }
 
-      // Jump directly to the approval collaboration conversation
+      // Jump directly to the approval collaboration conversation, with the files narrowed to this one's changes.
+      await container.getByRole("tab", { name: new RegExp(`^${L("文件")}`) }).click();
+      await container.getByRole("button", { name: new RegExp(`^${L("本轮改动")}`) }).click();
       await container.getByRole("tab", { name: new RegExp(L("总览")) }).click();
       await container.getByRole("button", { name: L("去批准"), exact: true }).click();
       await expect(page.getByRole("heading", { level: 1 })).toContainText("Architect");
+      // The other conversation has no changes: its files page starts from "all", not from an empty filter.
+      await container.getByRole("tab", { name: new RegExp(`^${L("文件")}`) }).click();
+      await expect(container.getByRole("button", { name: new RegExp(`^${L("本轮改动")}`) })).toHaveCount(0);
+      await expect(container.getByRole("button", { name: new RegExp(`^${L("全部")}`) })).toHaveAttribute("aria-pressed", "true");
       expect(errors).toEqual([]);
     } finally {
       await context.close();
