@@ -18,6 +18,8 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 
 import { isLogicalSessionId } from "../runtime/logical-session.js";
+import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
+import { cancelOwnedAntigravityQuotaReads, readOwnedAntigravityQuota, type AntigravityQuotaSpawn } from "./antigravity-account-quota.js";
 import { spawnEngine } from "../runtime/engine-process.js";
 import { appStopKillOptions } from "../runtime/turn-cancellation.js";
 import { DEFAULT_APPROVAL_MODE, normalizeApprovalMode, type ApprovalMode } from "../state/approval-mode.js";
@@ -76,6 +78,8 @@ export type AntigravityAcpAdapterOptions = {
   configPath?: string;
   workspacePath: string;
   spawnFn?: SpawnAgyAcp;
+  /** Starts the one-shot `agy -p /usage` read; never the ACP server. */
+  quotaSpawnFn?: AntigravityQuotaSpawn;
   killProcessTreeFn?: (pid: number | undefined, options?: { graceMs: number }) => void;
   initializeTimeoutMs?: number;
   /** Bound for each session/close before the process is ended anyway. */
@@ -452,6 +456,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private destroyed = false;
   /** The newest available_commands_update; every session of this Bot shares the CLI and workspace. */
   private commands: Array<{ name: string; description: string }> = [];
+  private readonly quotaCache: AdapterQuotaCache;
 
   constructor(private readonly executable: string, private readonly options: AntigravityAcpAdapterOptions) {
     const env = { ...(options.childEnv ?? process.env) };
@@ -459,6 +464,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     env.AGY_CLI_HIDE_ACCOUNT_INFO ??= "1";
     this.childEnv = env;
     this.spawnFn = options.spawnFn ?? (spawnEngine as unknown as SpawnAgyAcp);
+    this.quotaCache = new AdapterQuotaCache("antigravity", executable, env, options.workspacePath, options.configPath);
     this.killProcessTreeFn = options.killProcessTreeFn ?? ((pid, kill) => killProcessTree(pid, kill));
     this.initializeTimeoutMs = options.initializeTimeoutMs ?? DEFAULT_INITIALIZE_TIMEOUT_MS;
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
@@ -477,6 +483,21 @@ export class AntigravityAcpAdapter implements CodexAdapter {
 
   async createSession(chatId: number): Promise<CodexSessionHandle> {
     return { sessionId: `tarobot-${chatId}` };
+  }
+
+  /** Quota belongs to the login, not to the runtime: the same one-shot `agy -p /usage` read as the print
+   * runtime, with its rules (never started without local login state, version checked, zero turns). */
+  async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
+    const captureScope = () => this.quotaCache.capture("process");
+    const scope = captureScope();
+    if (this.destroyed || this.destroyPromise) return this.quotaCache.failure(scope, "cancelled");
+    const cached = this.quotaCache.response(scope, options);
+    if (cached) return cached;
+    return readOwnedAntigravityQuota({
+      executable: this.executable, cwd: this.options.workspacePath, env: this.childEnv,
+      spawn: this.options.quotaSpawnFn ?? (spawnEngine as unknown as AntigravityQuotaSpawn),
+      cache: this.quotaCache, scope, options, captureScope,
+    });
   }
 
   async getContextUsage(sessionId: string): Promise<EngineContextUsage | null> {
@@ -1188,6 +1209,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
 
   private async destroyInternal(): Promise<void> {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
+    const quotaReads = cancelOwnedAntigravityQuotaReads(this.quotaCache).catch(() => undefined);
+    this.quotaCache.invalidate();
     // A process that is still starting is ended now; its start then fails at once instead of timing out.
     for (const worker of new Set(this.workers.values())) if (worker.rejectStart) void this.closeWorker(worker, new Error("Adapter destroyed"));
     const created = await Promise.allSettled([...this.pendingWorkers.values()]);
@@ -1196,5 +1219,6 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     await Promise.all([...workers].map((worker) => this.closeWorker(worker, new Error("Adapter destroyed"))));
     this.workers.clear();
     this.pendingWorkers.clear();
+    await quotaReads;
   }
 }

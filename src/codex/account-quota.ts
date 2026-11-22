@@ -205,6 +205,26 @@ export function applyClaudeQuotaEvent(previous: QuotaSnapshot | undefined, value
   return safeSnapshot(snapshot);
 }
 
+/** The reply to Claude Code's `get_usage` control request, asked of a Bot's own running engine: no prompt, no model call.
+ * Observed on Claude Code 2.1.330 (isolated probe, 2026-11-22): a process on an API key answers
+ * `rate_limits_available: false` with `rate_limits: null`; a subscription answers one entry per window,
+ * each `null` or `{ utilization, resets_at }`, with utilization already in percent. Other entries are ignored. */
+export function parseClaudeUsage(value: unknown, now = Date.now()): QuotaSnapshot {
+  const reply = quotaObject(value);
+  if (reply.rate_limits_available !== true || reply.rate_limits == null) return unavailableQuota("claude", "mode_not_supported", now);
+  const limits = quotaObject(reply.rate_limits), windows: QuotaWindow[] = [];
+  for (const [id, detail] of Object.entries(claudeWindows)) {
+    if (limits[id] == null) continue;
+    const reading = quotaObject(limits[id]);
+    if (reading.utilization == null) continue;
+    const resetsAt = typeof reading.resets_at === "number" ? unixTime(reading.resets_at) : isoTime(reading.resets_at);
+    windows.push({ id, label: detail.label, ...(detail.periodSeconds ? { periodSeconds: detail.periodSeconds } : {}), metric: "percent", usedPercent: number(reading.utilization, 100_000), availability: "unknown", ...observed(now), ...(resetsAt ? { resetsAt } : {}) });
+  }
+  const at = new Date(now).toISOString();
+  return safeSnapshot({ authMode: "subscription", capability: { mode: "active" }, state: windows.length ? "ready" : "unknown", availability: "unknown", observedAt: at, lastAttemptAt: at,
+    pools: windows.length ? [{ id: "claude", label: "Claude", sharing: "shared", availability: "unknown", windows, balances: [], constraints: [] }] : [], constraints: [], help: "claude_usage" });
+}
+
 /** Antigravity CLI only guarantees local zero-turn `/usage --output-format json` from 1.1.11 onward. */
 export function isAntigravityQuotaSupportedVersion(versionOutput: string): boolean {
   const match = versionOutput.trim().match(/\bv?(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]*)?\b/);
@@ -220,6 +240,15 @@ const antigravityWindows: Record<string, { label: string; periodSeconds: number 
   "5h": { label: "5 hours", periodSeconds: 18000 },
   weekly: { label: "7 days", periodSeconds: 604800 },
 };
+
+/** The models one usage group covers. agy 1.5.14 states them as "Models within this group: A, B" in the
+ * group's description; a group without that sentence is named after its own model ("Gemini 4 Argon").
+ * The names are those of `agy models` without the effort suffix. No other prose of the description is kept. */
+function antigravityGroupModels(name: string, description: unknown): string[] {
+  const text = description == null ? undefined : quotaNativeIdentity(description);
+  const listed = text ? /^Models within this group:\s*(.+)$/.exec(text)?.[1]?.split(",").map(item => item.trim()).filter(Boolean) : undefined;
+  return listed?.length && listed.length <= 32 && listed.every(item => item.length <= 120) ? listed : [name];
+}
 
 /** Parses `agy -p /usage --output-format json`. Requires `num_turns === 0` so a model turn is never accepted as quota. */
 export function parseAntigravityQuota(value: unknown, now = Date.now()): QuotaSnapshot {
@@ -260,7 +289,8 @@ export function parseAntigravityQuota(value: unknown, now = Date.now()): QuotaSn
     return {
       id: poolId(`${name}:${index}`),
       label: name,
-      sharing: "shared",
+      models: antigravityGroupModels(name, group.description),
+      sharing: "model",
       availability: "unknown",
       windows,
       balances: [],

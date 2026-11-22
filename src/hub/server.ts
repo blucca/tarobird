@@ -64,6 +64,7 @@ import { exchangeNetworkPeer, MAX_NETWORK_BYTES } from "./network-peer.js";
 import { permissionPatchSchema, permissionResultSchema } from "../client-protocol/permissions.js";
 import { personaPatchSchema, personaResultSchema } from "../client-protocol/persona.js";
 import { steerRequestSchema, steerResultSchema, steerStatusSchema } from "../client-protocol/steering.js";
+import { CONTEXT_USAGE_CAPABILITY, contextUsageSchema } from "../client-protocol/context-usage.js";
 import { ENGINE_TASKS_CAPABILITY, engineSessionRecoverySchema, engineTaskSnapshotSchema, engineTaskStopSchema, engineTaskControlResultSchema } from "../client-protocol/engine-tasks.js";
 import { PI_SESSION_CAPABILITY, piSessionChangeSchema, piSessionSnapshotSchema, piSessionResultSchema } from "../client-protocol/pi-session.js";
 import { deviceActionProofSchema } from "../client-protocol/device-actions.js";
@@ -149,7 +150,7 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
   const { workbench, ...rest } = metadata, { openTarget: _opener, ...context } = workbench;
   return (workbenchOpenerOnly(workbench) ? rest : { ...rest, workbench: context }) as T;
 }
-type BotConnection = { botSteer: boolean; engineQuota: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
+type BotConnection = { botSteer: boolean; engineQuota: boolean; contextUsage: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
 export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
@@ -1283,7 +1284,7 @@ export class HubServer {
           botId = frame.botId; if (frame.capabilities?.includes(FRAGMENT_CAPABILITY)) this.fragmentSockets.add(ws); clearTimeout(timeout); this.bots.get(botId)?.ws.close(4000, "replaced");
           const queueAdvertised = frame.capabilities?.includes(PROMPT_QUEUE_CAPABILITY) ?? false;
           const queueCapable = queueAdvertised && supportsPromptQueueEngine(frame.engine);
-          const connection: BotConnection = { botSteer: frame.capabilities?.includes(BOT_MESSAGE_STEER_CAPABILITY) ?? false, engineQuota: frame.capabilities?.includes(ENGINE_QUOTA_CAPABILITY) ?? false, history: frame.capabilities?.includes(CONVERSATION_HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
+          const connection: BotConnection = { botSteer: frame.capabilities?.includes(BOT_MESSAGE_STEER_CAPABILITY) ?? false, engineQuota: frame.capabilities?.includes(ENGINE_QUOTA_CAPABILITY) ?? false, contextUsage: frame.capabilities?.includes(CONTEXT_USAGE_CAPABILITY) ?? false, history: frame.capabilities?.includes(CONVERSATION_HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
           // Reserve socket ownership before awaiting SQLite. Concurrent hellos
           // must replace this exact socket, not both replace its predecessor.
           this.bots.set(botId, connection);
@@ -1966,6 +1967,21 @@ export class HubServer {
         const result = input
           ? engineTaskControlResultSchema.parse(await this.callBot(botId, "token" in input ? "tasks.recover" : "tasks.stop", { conversationId, userId, requestId: input.requestId, ...("token" in input ? { token: input.token } : { taskId: input.taskId }) }))
           : engineTaskSnapshotSchema.parse(await this.callBot(botId, "tasks.list", { conversationId }));
+        await authorize();
+        await reply(200, result); return;
+      }
+      const contextRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/context-usage$/);
+      if (contextRoute && req.method === "GET") {
+        const conversationId = contextRoute[1]!, botId = idSchema.parse(url.searchParams.get("botId"));
+        const authorize = async () => {
+          await this.auth.validateSession(session);
+          await serial(async () => { await this.store.requireMember(userId, conversationId); await this.store.requireBot(botId, conversationId); });
+        };
+        await authorize();
+        const worker = this.bots.get(botId);
+        // An offline or older worker simply has no reading; the indicator is then absent, not an error.
+        if (!worker?.contextUsage) { await reply(200, { supported: false }); return; }
+        const result = contextUsageSchema.parse(await this.callBot(botId, "context.usage", { conversationId }, 5_000));
         await authorize();
         await reply(200, result); return;
       }

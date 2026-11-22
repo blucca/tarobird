@@ -1012,6 +1012,9 @@ describe("CodexAppServerAdapter", () => {
     child.stdout.emitData('{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-compact","turnId":"turn-1","tokenUsage":{"total":{"totalTokens":999999,"inputTokens":999999,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"last":{"totalTokens":212435,"inputTokens":211344,"cachedInputTokens":209280,"cacheWriteInputTokens":0,"outputTokens":1091,"reasoningOutputTokens":392},"modelContextWindow":258400}}}\n');
     child.stdout.emitData('{"method":"turn/completed","params":{"threadId":"thread-compact","turn":{"id":"turn-1","items":[],"status":"completed","error":null}}}\n');
     await expect(first).resolves.toMatchObject({ text: "first answer", sessionId: "thread-compact" });
+    // The thread usage Codex pushed is readable per conversation; the compaction point is this adapter's own.
+    expect(await adapter.getContextUsage("thread-compact")).toEqual({ pressureTokens: 212435, contextWindow: 258400, autoCompactTokens: 206720 });
+    expect(await adapter.getContextUsage("thread-unknown")).toBeNull();
 
     const onEngineEvent = vi.fn((event) => { if (progressFails && event.type === "context_compaction") throw new Error("progress unavailable"); });
     const second = adapter.sendUserMessage("thread-compact", { text: "second", files: [], onEngineEvent });

@@ -1,6 +1,6 @@
 import { isLogicalSessionId } from "../runtime/logical-session.js";
 import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
-import { applyClaudeQuotaEvent } from "./account-quota.js";
+import { applyClaudeQuotaEvent, parseClaudeUsage, QuotaReadError, QUOTA_TTL_MS, unavailableQuota } from "./account-quota.js";
 import type { QuotaSnapshot } from "../client-protocol/engine-quota.js";
 import { claudeAssistantError, claudeError, claudeResultRepeatsError } from "./claude-errors.js";
 import { wholeFilePatch } from "../core/recorded-diff.js";
@@ -54,6 +54,7 @@ import type {
   EngineApprovalDecision,
   EngineApprovalRequest,
   EngineAnswerProgress,
+  EngineContextUsage,
   EngineStreamEvent,
   NativeHistoryAnchor,
   NativeHistoryResult,
@@ -561,6 +562,8 @@ export const CLAUDE_STREAM_INACTIVITY_TIMEOUT_MS = ENGINE_DEFAULT_INACTIVITY_TIM
 // within ~10 ms). Past these bounds the stop is unconfirmed and falls back to
 // the bounded process cleanup instead of leaving the session wedged.
 const CLAUDE_INTERRUPT_ACK_TIMEOUT_MS = 3_000;
+/** `get_usage` and `get_context_usage` answered within 10 ms on a running 2.1.330 process, also during a turn. */
+const CLAUDE_USAGE_ACK_TIMEOUT_MS = 3_000;
 /** A stop that Claude has not confirmed by then is reported as unconfirmed. */
 const CLAUDE_STOP_CONFIRM_TIMEOUT_MS = 10_000;
 const CLAUDE_STEER_ACK_TIMEOUT_MS = 5_000;
@@ -1154,7 +1157,9 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   private readonly historyRuns = new Set<Promise<unknown>>();
   private readonly historyAbort = new AbortController();
   private readonly quotaCache: AdapterQuotaCache;
-  private readonly quotaWorkers = new WeakMap<ClaudeWorker, { id: number; credentialRevision: string; snapshot?: QuotaSnapshot }>();
+  /** `usage` is this process's own answer to `get_usage`; it ends with the process. `unasked` names
+   * the usage requests this process refused, so an older CLI is asked once. */
+  private readonly quotaWorkers = new WeakMap<ClaudeWorker, { id: number; credentialRevision: string; snapshot?: QuotaSnapshot; usage?: QuotaSnapshot; unasked?: Set<string> }>();
   private quotaWorkerSequence = 0;
   private quotaSource?: ClaudeWorker;
   private readonly sessionUsage: ClaudeSessionUsage;
@@ -1248,9 +1253,66 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     return this.quotaCache.capture(this.destroyPromise ? "destroyed" : active ? String(this.quotaWorkers.get(source)?.id ?? "none") : "none");
   }
 
+  /** The running engine of this Bot that worked last and has not refused `request`. */
+  private usageWorker(request: string): ClaudeWorker | undefined {
+    if (this.destroyPromise) return undefined;
+    let latest: ClaudeWorker | undefined;
+    for (const worker of this.workers.values()) {
+      if (worker.retired || this.quotaWorkers.get(worker)?.unasked?.has(request)) continue;
+      if (!latest || worker.lastActivityAt > latest.lastActivityAt) latest = worker;
+    }
+    return latest;
+  }
+
+  /** One usage request to a running process. A refusal ("Unsupported control request subtype") is remembered for it. */
+  private async askUsage(worker: ClaudeWorker, request: string, timeoutMs = CLAUDE_USAGE_ACK_TIMEOUT_MS): Promise<Record<string, unknown>> {
+    try { return await worker.control.request(request, {}, Math.max(1, Math.min(timeoutMs, CLAUDE_USAGE_ACK_TIMEOUT_MS))); }
+    catch (error) {
+      const entry = this.quotaWorkers.get(worker);
+      if (entry && error instanceof ClaudeControlError && error.kind === "rejected") (entry.unasked ??= new Set()).add(request);
+      throw error;
+    }
+  }
+
+  /** Claude's own `/context` accounting for this conversation's running process. No process is started for it. */
+  async getContextUsage(sessionId: string): Promise<EngineContextUsage | null> {
+    const worker = this.workers.get(sessionId);
+    if (!worker || worker.retired || this.destroyPromise || this.quotaWorkers.get(worker)?.unasked?.has("get_context_usage")) return null;
+    let reply: Record<string, unknown>;
+    try { reply = await this.askUsage(worker, "get_context_usage"); } catch { return null; }
+    const count = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+    const used = count(reply.totalTokens), window = count(reply.maxTokens) ?? count(reply.rawMaxTokens), compact = count(reply.autoCompactThreshold);
+    if (this.workers.get(sessionId) !== worker || used === undefined || !window) return null;
+    return { pressureTokens: used, contextWindow: window, ...(reply.isAutoCompactEnabled === true && compact ? { autoCompactTokens: compact } : {}) };
+  }
+
+  /** Quota is read from a running engine of this Bot, so the answer is about the account that engine uses;
+   * where its login is kept (a file, the system keychain) does not matter. The reading stays on that
+   * process's record and is gone with it. Without a running engine only the earlier passive rules apply. */
   async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
     const scope = this.quotaScope();
-    return this.quotaCache.response(scope, options) ?? this.quotaCache.failure(scope, "no_passive_event");
+    const passive = this.quotaCache.response(scope, options) ?? this.quotaCache.failure(scope, "no_passive_event");
+    const worker = this.usageWorker("get_usage"), entry = worker && this.quotaWorkers.get(worker);
+    if (!worker || !entry || options.signal?.aborted || passive.snapshot.capability.mode === "unsupported"
+      || options.expectedRevision && options.expectedRevision !== scope.revision) return passive;
+    let failure: Parameters<typeof unavailableQuota>[1] | undefined;
+    if (options.refresh) {
+      try {
+        const usage = parseClaudeUsage(await this.askUsage(worker, "get_usage", options.timeoutMs), Date.now());
+        // An API key, or a login without windows: answered for this call and not kept.
+        if (usage.capability.mode === "unsupported") return { revision: scope.revision, snapshot: usage };
+        entry.usage = usage;
+      } catch (error) {
+        if (error instanceof ClaudeControlError && error.kind === "rejected") return passive;
+        failure = error instanceof QuotaReadError ? error.reason : error instanceof ClaudeControlError && error.kind === "timeout" ? "timeout" : "native_error";
+      }
+    }
+    const now = Date.now(), active = { mode: "active" as const };
+    const reading = entry.usage ? structuredClone(entry.usage) : passive.snapshot.observedAt ? { ...passive.snapshot, capability: active } : undefined;
+    if (!reading) return { revision: scope.revision, snapshot: { ...unavailableQuota("claude", failure ?? "not_loaded", now, scope.authMode), capability: active } };
+    if (failure) { reading.state = "stale"; reading.reason = failure; reading.lastAttemptAt = new Date(now).toISOString(); }
+    else if (reading.state === "ready" && reading.observedAt && now - Date.parse(reading.observedAt) >= QUOTA_TTL_MS) reading.state = "stale";
+    return { revision: scope.revision, snapshot: reading };
   }
 
   private observeAccountQuota(worker: ClaudeWorker, message: unknown): void {

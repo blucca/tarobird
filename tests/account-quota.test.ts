@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { quotaScopeSchema, quotaSnapshotSchema } from "../src/client-protocol/engine-quota.js";
-import { applyClaudeQuotaEvent, parseCodexQuota, unavailableQuota } from "../src/codex/account-quota.js";
+import { applyClaudeQuotaEvent, parseClaudeUsage, parseCodexQuota, unavailableQuota } from "../src/codex/account-quota.js";
 import { readCodexAccountQuota, type CodexQuotaRequest } from "../src/codex/codex-account-quota.js";
 
 const now = Date.parse("2026-11-21T00:00:00Z");
@@ -65,6 +65,29 @@ describe("account quota parsers", () => {
     expect(next.pools[0].windows[0]).toMatchObject({ usedPercent: 40, observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 60000).toISOString(), availability: "blocked" });
     expect(next.availability).toBe("blocked");
     expect(next.state).toBe("stale");
+  });
+  it("reads the windows of a get_usage reply as percent already, and nothing else from it", () => {
+    const reply = { session: { id: "private-session" }, subscription_type: "max", rate_limits_available: true, behaviors: {},
+      rate_limits: { five_hour: { utilization: 12, resets_at: "2026-11-21T03:00:00+00:00", note: "private" }, seven_day: { utilization: 61.5, resets_at: 1795651200 },
+        seven_day_opus: null, seven_day_sonnet: { utilization: null, resets_at: null }, extra_usage: { is_enabled: true, used_credits: 5 }, model_scoped: [{ display_name: "private", utilization: 3 }] } };
+    const result = parseClaudeUsage(reply, now);
+    expect(result).toMatchObject({ authMode: "subscription", capability: { mode: "active" }, state: "ready", observedAt: "2026-11-21T00:00:00.000Z", help: "claude_usage" });
+    expect(result.pools).toHaveLength(1);
+    expect(result.pools[0].windows.map(window => [window.id, window.metric === "percent" && window.usedPercent, window.resetsAt, window.periodSeconds])).toEqual([
+      ["five_hour", 12, "2026-11-21T03:00:00.000Z", 18000], ["seven_day", 61.5, "2026-11-26T00:00:00.000Z", 604800]]);
+    expect(JSON.stringify(result)).not.toMatch(/private|max|credits/);
+    expect(quotaSnapshotSchema.safeParse(result).success).toBe(true);
+  });
+  it("answers an API-key or window-less get_usage reply as unsupported, never as zero", () => {
+    for (const reply of [{ rate_limits_available: false, rate_limits: null }, { rate_limits_available: true, rate_limits: null }, { rate_limits: { five_hour: { utilization: 1 } } }])
+      expect(parseClaudeUsage(reply, now)).toMatchObject({ state: "unsupported", reason: "mode_not_supported", pools: [] });
+    expect(parseClaudeUsage({ rate_limits_available: true, rate_limits: { five_hour: null } }, now)).toMatchObject({ state: "unknown", pools: [] });
+  });
+  it("rejects a malformed get_usage reply instead of guessing", () => {
+    for (const reply of [null, [], "ok", { rate_limits_available: true, rate_limits: [] }, { rate_limits_available: true, rate_limits: { five_hour: "12" } },
+      { rate_limits_available: true, rate_limits: { five_hour: { utilization: "12" } } }, { rate_limits_available: true, rate_limits: { five_hour: { utilization: -1 } } },
+      { rate_limits_available: true, rate_limits: { five_hour: { utilization: 5, resets_at: "soon" } } }])
+      expect(() => parseClaudeUsage(reply, now)).toThrow("invalid_response");
   });
   it("does not invent a five-hour window for an untyped native event", () => {
     const result = applyClaudeQuotaEvent(undefined, { type: "rate_limit_event", rate_limit_info: { status: "rejected", utilization: 0.5 } }, now)!;

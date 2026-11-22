@@ -108,6 +108,8 @@ export interface EngineContextUsage {
   /** Estimated prompt size for the next request after surface changes. */
   projectedTokens?: number;
   contextWindow?: number;
+  /** Where the engine compacts by itself, when it reports that. */
+  autoCompactTokens?: number;
 }
 
 export interface CodexAdapterResponse {

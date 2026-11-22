@@ -9,6 +9,7 @@ import { permissionSettings } from "../runtime/permissions-settings.js";
 import { personaSettings } from "../runtime/persona-settings.js";
 import { gatewaySteering } from "./steering.js";
 import { gatewayEngineTasks } from "./engine-tasks.js";
+import { gatewayContextUsage } from "./context-usage.js";
 import { gatewayPiSession } from "./pi-session.js";
 import { gatewaySideSessions, instanceAttachmentDownload } from "./side.js";
 import { readBotDiagnostics } from "../runtime/diagnostics.js";
@@ -267,6 +268,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   channel.on("error", () => options.onWarning?.("gateway_dispatch_failed"));
   const steering = gatewaySteering(bridge, runtime, channel, options.stateDir, options.engine);
   const engineTasks = gatewayEngineTasks(bridge, channel, options.stateDir);
+  const contextUsage = gatewayContextUsage(bridge, channel);
   const piSession = gatewayPiSession(bridge, channel, options.stateDir, options.botId);
   const history = gatewayConversationHistory(bridge, channel, runtime, options.stateDir, options.botId, () => (sideSessions?.activeCount() ?? 0) > 0);
   // Side audio uses the main transcriber and cloud policy, without its chat progress cards.
@@ -278,6 +280,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     if (method.startsWith("history.")) return history(method, raw);
     if (method === "quota.get") { if (!quotas) throw new Error("quota_engine_unavailable"); return z.json().parse(await quotas(raw)); }
     if (method === "tasks.list" || method === "tasks.stop" || method === "tasks.recover") return z.json().parse(await engineTasks(method, raw));
+    if (method === "context.usage") return z.json().parse(await contextUsage(raw));
     if (method === "pi.session.get" || method === "pi.session.set") return z.json().parse(await piSession(method, raw));
     if (["side.status", "side.open", "side.read", "side.ask", "side.stop", "side.close"].includes(method)) return z.json().parse(await sideSessions!.call(method, raw));
     if (method === "persona.get" || method === "persona.set") {

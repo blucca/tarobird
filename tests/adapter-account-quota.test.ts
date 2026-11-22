@@ -17,8 +17,17 @@ const account = { account: { type: "chatgpt", email: "fixture@example.invalid", 
 class Child extends EventEmitter {
   stdout = new EventEmitter(); stderr = new EventEmitter(); methods: string[] = []; killCount = 0; closed = false;
   hold = new Set<string>(); closeDelayMs = 20; accounts: unknown[] = []; limits?: unknown; errors: Record<string, { code: number; message: string }> = {};
+  /** Claude control requests: `answers[subtype]` is the success payload, `refuse` answers like a CLI that does not know the subtype. */
+  controls: string[] = []; answers: Record<string, unknown> = {}; refuse = new Set<string>();
   stdin = { write: (line: string, callback?: (error?: Error | null) => void) => {
-    const request = JSON.parse(line); this.methods.push(request.method);
+    const request = JSON.parse(line);
+    if (request.type === "control_request") {
+      const subtype = String(request.request?.subtype); this.controls.push(subtype);
+      if (this.refuse.has(subtype)) queueMicrotask(() => this.event({ type: "control_response", response: { subtype: "error", request_id: request.request_id, error: `Unsupported control request subtype: ${subtype}` } }));
+      else if (subtype in this.answers) queueMicrotask(() => this.event({ type: "control_response", response: { subtype: "success", request_id: request.request_id, response: this.answers[subtype] } }));
+      callback?.(null); return true;
+    }
+    this.methods.push(request.method);
     if (request.id != null && this.errors[request.method]) { const error = this.errors[request.method]; queueMicrotask(() => this.stdout.emit("data", JSON.stringify({ id: request.id, error }) + "\n")); }
     else if (request.id != null && !this.hold.has(request.method)) queueMicrotask(() => this.reply(request.id,
       request.method === "account/read" ? this.accounts.length ? this.accounts.shift() : account : request.method === "account/rateLimits/read" ? this.limits ?? { accountId: "fixture-account", rateLimits: { primary: { usedPercent: 25 } } } : {}));
@@ -87,8 +96,8 @@ it("destroy during a quota helper's initialize cancels it and waits for its actu
   expect((await read).snapshot.reason).toBe("cancelled");
   expect(child.methods).not.toContain("account/read");
 });
-it("Claude quota refresh is passive, and rejects late events from a changed credential source", async () => {
-  const f = await fixture(), child = new Child();
+it("Claude passive events of a verified login still count with a CLI that refuses get_usage, and a changed credential source hides them", async () => {
+  const f = await fixture(), child = new Child(); child.refuse.add("get_usage");
   const env = { HOME: f.home, CLAUDE_CODE_OAUTH_TOKEN: "synthetic-oauth" };
   const spawn = vi.fn(() => child);
   const adapter = new ClaudeStreamAdapter("claude", { childEnv: env, spawnFn: spawn, workspacePath: f.root, idleSweepIntervalMs: 0 });
@@ -106,6 +115,113 @@ it("Claude quota refresh is passive, and rejects late events from a changed cred
   expect(child.methods).toEqual([]);
   worker.retired = true; child.event(event);
   expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools).toEqual([]);
+  // The refusal is remembered for that process: it was asked once.
+  expect(child.controls).toEqual(["get_usage"]);
+});
+const future = (hours: number) => new Date(Date.now() + hours * 3_600_000).toISOString();
+const usageReply = () => ({ session: {}, subscription_type: "max", rate_limits_available: true, behaviors: {},
+  rate_limits: { five_hour: { utilization: 12, resets_at: future(3) }, seven_day: { utilization: 61.5, resets_at: future(90) }, seven_day_opus: null } });
+async function claudeFixture() {
+  const f = await fixture(), child = new Child(), spawn = vi.fn(() => child);
+  // No credential file and no token in the environment: the login is wherever the CLI keeps it.
+  const adapter = new ClaudeStreamAdapter("claude", { childEnv: { HOME: f.home }, spawnFn: spawn, workspacePath: f.root, idleSweepIntervalMs: 0 });
+  disposals.push(() => adapter.destroy());
+  const start = () => (adapter as any).getOrCreateWorker("tarobot-fixture", null, null, "normal", f.root);
+  return { f, child, spawn, adapter, start };
+}
+describe("Claude quota from the Bot's own running engine", () => {
+  it("starts no process for a reading", async () => {
+    const { adapter, spawn } = await claudeFixture();
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "scope_unverifiable", capability: { mode: "passive" }, pools: [] });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it("asks get_usage only on an explicit refresh and keeps the answer with that process", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply();
+    const worker = await start();
+    const idle = await adapter.getAccountQuota({ refresh: false });
+    expect(idle.snapshot).toMatchObject({ state: "unknown", reason: "not_loaded", capability: { mode: "active" }, pools: [] });
+    expect(child.controls).toEqual([]);
+    const read = await adapter.getAccountQuota({ refresh: true, expectedRevision: idle.revision });
+    expect(read.revision).toBe(idle.revision);
+    expect(read.snapshot).toMatchObject({ state: "ready", authMode: "subscription", capability: { mode: "active" } });
+    expect(read.snapshot.pools[0].windows.map(window => [window.id, window.metric === "percent" && window.usedPercent])).toEqual([["five_hour", 12], ["seven_day", 61.5]]);
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools[0].windows).toHaveLength(2);
+    expect(child.controls).toEqual(["get_usage"]); expect(child.methods).toEqual([]);
+    worker.retired = true;
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+  });
+  it("answers the Gateway's refresh and asks the engine once per cooldown", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); await start();
+    const run = gatewayEngineQuota({ botId: "bot", engine: "claude", read: options => adapter.getAccountQuota(options) });
+    const listed = await run({ scopeId: "bot", refresh: false });
+    expect(listed.value).toMatchObject({ state: "unknown", capability: { mode: "active" } });
+    for (let index = 0; index < 3; index++) expect((await run({ scopeId: "bot", refresh: true, expectedRevision: listed.revision })).value).toMatchObject({ state: "ready", sharing: "unverified", botIds: ["bot"] });
+    expect(child.controls).toEqual(["get_usage"]);
+  });
+  it("marks a kept reading stale after its lifetime instead of renewing it", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); await start();
+    await adapter.getAccountQuota({ refresh: true });
+    const later = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ state: "stale" });
+    later.mockRestore();
+  });
+  it("does not keep an API-key answer and shows no quota for it", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = { session: {}, subscription_type: null, rate_limits_available: false, rate_limits: null }; await start();
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ state: "unsupported", reason: "mode_not_supported", pools: [] });
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ reason: "not_loaded", capability: { mode: "active" } });
+  });
+  it("keeps the earlier rules for a CLI that refuses get_usage and does not ask it again", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.refuse.add("get_usage"); await start();
+    for (let index = 0; index < 2; index++) expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "scope_unverifiable", capability: { mode: "passive" }, pools: [] });
+    expect(child.controls).toEqual(["get_usage"]);
+  });
+  it("reports a silent engine as a timeout and keeps an earlier reading as stale", async () => {
+    const { adapter, child, start } = await claudeFixture(); await start();
+    expect((await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 })).snapshot).toMatchObject({ state: "unavailable", reason: "timeout", capability: { mode: "active" }, pools: [] });
+    child.answers.get_usage = usageReply(); await adapter.getAccountQuota({ refresh: true });
+    delete child.answers.get_usage;
+    const stale = (await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 })).snapshot;
+    expect(stale).toMatchObject({ state: "stale", reason: "timeout" }); expect(stale.pools[0].windows).toHaveLength(2);
+  });
+  it("rejects a malformed answer without values", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = { rate_limits_available: true, rate_limits: { five_hour: { utilization: "12" } } }; await start();
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "invalid_response", pools: [] });
+  });
+  it("answers no reading for another revision or a cancelled read, without asking", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); await start();
+    expect((await adapter.getAccountQuota({ refresh: true, expectedRevision: "other" })).snapshot).toMatchObject({ reason: "auth_changed", pools: [] });
+    expect((await adapter.getAccountQuota({ refresh: true, signal: AbortSignal.abort() })).snapshot).toMatchObject({ reason: "cancelled", pools: [] });
+    expect(child.controls).toEqual([]);
+  });
+});
+describe("Claude context usage of one conversation", () => {
+  const context = { totalTokens: 17_669, maxTokens: 200_000, rawMaxTokens: 1_000_000, percentage: 9, autoCompactThreshold: 167_000, isAutoCompactEnabled: true, model: "private", categories: [] };
+  it("is Claude's own accounting from the conversation's running process", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_context_usage = context; await start();
+    expect(await adapter.getContextUsage("tarobot-fixture")).toEqual({ pressureTokens: 17_669, contextWindow: 200_000, autoCompactTokens: 167_000 });
+    child.answers.get_context_usage = { ...context, isAutoCompactEnabled: false };
+    expect(await adapter.getContextUsage("tarobot-fixture")).toEqual({ pressureTokens: 17_669, contextWindow: 200_000 });
+    expect(child.controls).toEqual(["get_context_usage", "get_context_usage"]); expect(child.methods).toEqual([]);
+  });
+  it("has no reading without a running process, and starts none", async () => {
+    const { adapter, child, spawn, start } = await claudeFixture(); child.answers.get_context_usage = context;
+    expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull(); expect(spawn).not.toHaveBeenCalled();
+    const worker = await start();
+    expect(await adapter.getContextUsage("tarobot-other")).toBeNull();
+    worker.retired = true;
+    expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull();
+    expect(child.controls).toEqual([]);
+  });
+  it("has no reading for a malformed answer, and asks a refusing CLI once", async () => {
+    const { adapter, child, start } = await claudeFixture(); await start();
+    for (const answer of [{}, { totalTokens: "1", maxTokens: 10 }, { totalTokens: 1, maxTokens: 0 }, { totalTokens: -1, maxTokens: 10 }]) {
+      child.answers.get_context_usage = answer;
+      expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull();
+    }
+    child.controls.length = 0; child.refuse.add("get_context_usage");
+    expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull(); expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull();
+    expect(child.controls).toEqual(["get_context_usage"]);
+  });
 });
 it("does not treat opaque native Keychain or dynamic helpers as proof of a stable account", async () => {
   const f = await fixture();

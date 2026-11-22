@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { quotaSnapshotSchema } from "../src/client-protocol/engine-quota.js";
 import { isAntigravityQuotaSupportedVersion, parseAntigravityQuota } from "../src/codex/account-quota.js";
 import { ProcessAntigravityAdapter } from "../src/codex/antigravity-adapter.js";
+import { AntigravityAcpAdapter } from "../src/codex/antigravity-acp-adapter.js";
 import { gatewayEngineQuota } from "../src/gateway/engine-quota.js";
 
 const now = Date.parse("2026-11-22T00:00:00Z");
@@ -135,7 +136,12 @@ describe("Antigravity quota version check and parser", () => {
       help: "antigravity_usage",
     });
     expect(snapshot.pools).toHaveLength(3);
-    expect(snapshot.pools[0]).toMatchObject({ label: "Gemini Models", sharing: "shared" });
+    // Each group says which models it covers: listed in its description, or the group is the model itself.
+    expect(snapshot.pools.map(pool => [pool.label, pool.sharing, pool.models])).toEqual([
+      ["Gemini Models", "model", ["Gemini 4 Neon", "Gemini 3.8 Flash"]],
+      ["Claude and GPT models", "model", ["Claude and GPT models"]],
+      ["Gemini 4 Argon", "model", ["Gemini 4 Argon"]],
+    ]);
     expect(snapshot.pools[0]!.windows[0]).toMatchObject({
       id: "gemini-weekly",
       label: "7 days",
@@ -173,6 +179,22 @@ describe("Antigravity quota version check and parser", () => {
     const snapshot = parseAntigravityQuota(sparse, now);
     expect(snapshot.pools[0]!.windows[0]).toMatchObject({ id: "gemini-5h", metric: "unknown" });
     expect(snapshot.pools[0]!.windows[0]).not.toHaveProperty("usedPercent");
+  });
+
+  it("keeps only a stated model list of a group's description, never its other prose", () => {
+    const group = (description: unknown) => {
+      const payload = structuredClone(sampleUsagePayload);
+      payload.command.data.groups = [{ name: "Gemini 4 Argon", ...(description === undefined ? {} : { description: description as string }), buckets: [] }];
+      return parseAntigravityQuota(payload, now).pools[0]!.models;
+    };
+    // The real 1.5.14 sentence for its separately metered model.
+    expect(group("For paid Pro plans, Argon quota is separate. Higher Argon quota is available on Ultra plans.")).toEqual(["Gemini 4 Argon"]);
+    expect(group("Models within this group: Claude Opus 5.5, Claude Sonnet 5.5 ,  GPT-OSS 120B")).toEqual(["Claude Opus 5.5", "Claude Sonnet 5.5", "GPT-OSS 120B"]);
+    expect(group("Models within this group: Orchestrator (Neon)")).toEqual(["Orchestrator (Neon)"]);
+    for (const loose of [undefined, null, "", "Models within this group:", "Models within this group: , ,", `Models within this group: ${"x".repeat(121)}`, `Models within this group: ${Array.from({ length: 33 }, (_, index) => `m${index}`).join(", ")}`])
+      expect(group(loose)).toEqual(["Gemini 4 Argon"]);
+    expect(() => group(7)).toThrow("invalid_response");
+    expect(() => group("Models within this group: a\u0007b")).toThrow("invalid_response");
   });
 
   it("rejects non-SUCCESS status or wrong command name", () => {
@@ -338,5 +360,53 @@ describe("ProcessAntigravityAdapter account quota", () => {
     await stopped;
     expect(slowChild.closed).toBe(true);
     expect((await pending).snapshot).toMatchObject({ reason: "cancelled", help: "antigravity_usage" });
+  });
+});
+
+describe("Antigravity ACP runtime account quota", () => {
+  function acp(f: Awaited<ReturnType<typeof agyFixture>>, quotaSpawnFn: unknown) {
+    const acpSpawn = vi.fn(() => { throw new Error("the ACP server must not be started for a quota read"); });
+    const adapter = new AntigravityAcpAdapter("agy", { childEnv: f.env, workspacePath: f.root, spawnFn: acpSpawn as any, quotaSpawnFn: quotaSpawnFn as any, idleSweepIntervalMs: 0 });
+    disposals.push(() => adapter.destroy());
+    return { adapter, acpSpawn };
+  }
+  it("reads quota with the same one-shot /usage read as the print runtime and starts no ACP server", async () => {
+    const f = await agyFixture();
+    const calls: string[][] = [];
+    const spawn = vi.fn((_cmd: string, args: string[]) => {
+      calls.push(args);
+      const child = new MockChild();
+      if (args.includes("--version")) child.finish(0, "1.5.14\n"); else child.finish(0, JSON.stringify(sampleUsagePayload));
+      return child;
+    });
+    const { adapter, acpSpawn } = acp(f, spawn);
+    const run = gatewayEngineQuota({ botId: "bot-agy", engine: "antigravity", read: opts => adapter.getAccountQuota(opts) });
+    const cached = await run({ scopeId: "bot-agy", refresh: false });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(cached.value).toMatchObject({ state: "unknown", reason: "not_loaded", capability: { mode: "active" } });
+    const refreshed = await run({ scopeId: "bot-agy", refresh: true, expectedRevision: cached.revision });
+    expect(calls).toEqual([["--version"], ["-p", "/usage", "--output-format", "json"]]);
+    expect(refreshed.value).toMatchObject({ state: "ready", authMode: "subscription" });
+    expect(refreshed.value.pools.map(pool => pool.label)).toEqual(["Gemini Models", "Claude and GPT models", "Gemini 4 Argon"]);
+    expect((await run({ scopeId: "bot-agy", refresh: false })).value.state).toBe("ready");
+    expect(spawn).toHaveBeenCalledTimes(2); expect(acpSpawn).not.toHaveBeenCalled();
+  });
+  it("never starts agy without local login state, as in the print runtime", async () => {
+    const f = await agyFixture({ withState: false });
+    const spawn = vi.fn();
+    const { adapter } = acp(f, spawn);
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ state: "login_required", reason: "login_required", pools: [] });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it("ends an unfinished read when the adapter is destroyed and answers nothing afterwards", async () => {
+    const f = await agyFixture();
+    const slow = new MockChild();
+    const { adapter } = acp(f, () => slow);
+    const reading = adapter.getAccountQuota({ refresh: true });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await adapter.destroy();
+    expect(slow.killed).toBe(true);
+    expect((await reading).snapshot.pools).toEqual([]);
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "cancelled", pools: [] });
   });
 });

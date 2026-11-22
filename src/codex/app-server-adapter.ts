@@ -22,6 +22,7 @@ import type {
   CodexUserMessageInput,
   EngineApprovalDecision,
   EngineApprovalRequest,
+  EngineContextUsage,
   EngineSideSession,
   EngineStreamEvent,
   NativeHistoryAnchor,
@@ -1004,6 +1005,14 @@ export class CodexAppServerAdapter implements CodexAdapter {
   }
 
   private quotaScope() { return this.quotaCache.capture(`${this.childGeneration}:${Math.max(0, this.quotaAccountGeneration - 1)}:${this.child ? "live" : "none"}`); }
+
+  /** The thread usage Codex last pushed (`thread/tokenUsage/updated`); null before the first turn of this process. */
+  async getContextUsage(sessionId: string): Promise<EngineContextUsage | null> {
+    const usage = this.threadContextUsage.get(sessionId);
+    return usage
+      ? { pressureTokens: usage.totalTokens, contextWindow: usage.modelContextWindow, autoCompactTokens: Math.round(usage.modelContextWindow * CODEX_APP_SERVER_AUTO_COMPACT_RATIO) }
+      : null;
+  }
 
   async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
     const scope = this.quotaScope();
