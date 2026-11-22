@@ -530,26 +530,44 @@ function identify(node){let id=ids.get(node);if(!id){id=String(++nextId);ids.set
 const rect=value=>value&&typeof value==='object'&&['x','y','width','height'].every(key=>Number.isFinite(value[key]))?{x:value.x,y:value.y,width:value.width,height:value.height,top:value.y,left:value.x,right:value.x+value.width,bottom:value.y+value.height}:undefined;
 // https/wss only, never credentials or a referrer, and no host written as a
 // loopback, private, link-local or local name. A public name that resolves to a
-// private address is not detectable here; browser private-network rules apply.
+// private address, or a redirect to one, is not detectable here; browser
+// private-network rules apply, and Electron's session repeats this check.
+// Guest code shares this realm and can replace String, RegExp, URL or Request
+// members, so the guard uses only primitives captured before any guest script.
+const lower=uncurry(String.prototype.toLowerCase),cut=uncurry(String.prototype.slice),match=uncurry(RegExp.prototype.exec),text=String;
+const urlPart=name=>uncurry(Object.getOwnPropertyDescriptor(NativeURL.prototype,name).get),urlProtocol=urlPart('protocol'),urlUsername=urlPart('username'),urlPassword=urlPart('password'),urlHostname=urlPart('hostname'),urlHref=urlPart('href');
+const requestUrl=self.Request&&uncurry(Object.getOwnPropertyDescriptor(Request.prototype,'url').get),construct=Reflect.construct,defineOwn=Object.defineProperty,ownNames=Object.getOwnPropertyNames;
 const localHost=name=>{
- const host=name.toLowerCase().replace(/^\[|\]$/g,'').replace(/\.$/,'');
- if(host==='localhost'||/\.(?:localhost|local|internal|lan|home\.arpa)$/.test(host)||!host.includes('.')&&!host.includes(':'))return true;
- const v4=/^(\d+)\.(\d+)\.\d+\.\d+$/.exec(host);
- if(v4){const a=Number(v4[1]),b=Number(v4[2]);return a===0||a===10||a===127||a===169&&b===254||a===172&&b>=16&&b<=31||a===192&&b===168||a===100&&b>=64&&b<=127||a>=224}
- return host.includes(':')&&(host==='::1'||host==='::'||/^f[cd]|^fe[89ab]|^::ffff:/.test(host));
+ let host=lower(text(name));if(host[0]==='[')host=cut(host,1);if(host[host.length-1]===']')host=cut(host,0,-1);if(host[host.length-1]==='.')host=cut(host,0,-1);
+ if(host==='localhost'||match(/\.(?:localhost|local|internal|lan|home\.arpa)$/,host)||!match(/[.:]/,host))return true;
+ const v4=match(/^(\d+)\.(\d+)\.\d+\.\d+$/,host);
+ if(v4){const a=+v4[1],b=+v4[2];return a===0||a===10||a===127||a===169&&b===254||a===172&&b>=16&&b<=31||a===192&&b===168||a===100&&b>=64&&b<=127||a>=224}
+ return !!match(/:/,host)&&(host==='::1'||host==='::'||!!match(/^f[cd]|^fe[89ab]|^::ffff:/,host));
 };
 const networkUrl=(value,protocol)=>{
- let url;try{url=new NativeURL(String(value))}catch{throw new TypeError(`Widget network needs an absolute ${protocol}// URL`)}
- if(url.protocol!==protocol)throw new TypeError(`Widget network uses ${protocol} only`);
- if(url.username||url.password||localHost(url.hostname))throw new TypeError('Widget network cannot reach local or private hosts or send credentials');
- return url.href;
+ let url;try{url=new NativeURL(text(value))}catch{throw new TypeError(`Widget network needs an absolute ${protocol}// URL`)}
+ if(urlProtocol(url)!==protocol)throw new TypeError(`Widget network uses ${protocol} only`);
+ if(urlUsername(url)||urlPassword(url)||localHost(urlHostname(url)))throw new TypeError('Widget network cannot reach local or private hosts or send credentials');
+ return urlHref(url);
 };
+// Every native instance leads back to its constructor and prototype, so a
+// subclass would hand guest code the unchecked native constructor. Instead the
+// native prototype is shared and points at a checking constructor, and XHR's
+// open and withCredentials are replaced on the native prototype itself.
+const adopt=(Wrapper,Native)=>{Wrapper.prototype=Native.prototype;defineOwn(Native.prototype,'constructor',{value:Wrapper,writable:true,configurable:true});for(const name of ownNames(Native))if(/^[A-Z_]+$/.test(name))defineOwn(Wrapper,name,{value:Native[name],enumerable:true});return Wrapper};
 function networkApis(){
- const fetch=(input,init)=>{try{const url=networkUrl(typeof input==='object'&&input!==null&&!(input instanceof NativeURL)?input.url:input,'https:');return nativeFetch(typeof input==='object'&&input!==null&&!(input instanceof NativeURL)?input:url,{...(init??{}),credentials:'omit',referrerPolicy:'no-referrer'})}catch(cause){return Promise.reject(cause)}};
- class XMLHttpRequest extends NativeXMLHttpRequest{open(method,url,...rest){return super.open(method,networkUrl(url,'https:'),...rest)}get withCredentials(){return false}set withCredentials(value){/* Credentials are never sent. */}}
- class WebSocket extends NativeWebSocket{constructor(url,protocols){super(networkUrl(url,'wss:'),protocols)}}
- class EventSource extends NativeEventSource{constructor(url){super(networkUrl(url,'https:'),{withCredentials:false})}}
- return {fetch,XMLHttpRequest,WebSocket,EventSource};
+ // A Request is read through its own url slot; anything else becomes one
+ // string, which is both what is checked and what is fetched.
+ const fetch=(input,init)=>{try{
+  let request=false;if(requestUrl&&(typeof input==='object'||typeof input==='function')&&input!==null)try{requestUrl(input);request=true}catch{/* Not a Request. */}
+  const url=networkUrl(request?requestUrl(input):input,'https:');
+  return nativeFetch(request?input:url,{...(init??{}),credentials:'omit',referrerPolicy:'no-referrer'});
+ }catch(cause){return Promise.reject(cause)}};
+ const xhr=NativeXMLHttpRequest?.prototype,nativeOpen=xhr&&uncurry(xhr.open);
+ if(xhr){defineOwn(xhr,'open',{configurable:true,writable:true,value:function open(method,url,...rest){return nativeOpen(this,method,networkUrl(url,'https:'),...rest)}});defineOwn(xhr,'withCredentials',{configurable:true,get(){return false},set(value){/* Credentials are never sent. */}})}
+ const WebSocket=NativeWebSocket&&adopt(function WebSocket(url,protocols){if(new.target===undefined)throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator");return construct(NativeWebSocket,arguments.length>1?[networkUrl(url,'wss:'),protocols]:[networkUrl(url,'wss:')],new.target)},NativeWebSocket);
+ const EventSource=NativeEventSource&&adopt(function EventSource(url){if(new.target===undefined)throw new TypeError("Failed to construct 'EventSource': Please use the 'new' operator");return construct(NativeEventSource,[networkUrl(url,'https:'),{withCredentials:false}],new.target)},NativeEventSource);
+ return {fetch,XMLHttpRequest:NativeXMLHttpRequest,WebSocket,EventSource};
 }
 // External <script src="https://..."> text is fetched under the same guard and
 // evaluated in the guest scope before inline scripts, in document order. Each

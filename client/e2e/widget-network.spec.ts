@@ -19,7 +19,7 @@ import { selectConversation, waitForClientOnline } from './fixtures/mobile.js';
 const HOST = 'widget-net.test';
 test.use({ serviceWorkers: 'block', ignoreHTTPSErrors: true, launchOptions: { args: [`--host-resolver-rules=MAP ${HOST} 127.0.0.1`] } });
 
-type Seen = { path: string; cookie?: string; referer?: string; authorization?: string };
+type Seen = { path: string; host?: string; probe?: string | null; cookie?: string; referer?: string; authorization?: string };
 let tls: { key: Buffer; cert: Buffer }, certDir: string;
 test.beforeAll(async () => {
   certDir = await mkdtemp(path.join(os.tmpdir(), 'widget-net-cert-'));
@@ -33,7 +33,7 @@ async function origin() {
   const pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
   const server: Server = createHttpsServer(tls, (req, res) => {
     const url = new URL(req.url!, `https://${HOST}`);
-    seen.push({ path: url.pathname, cookie: req.headers.cookie, referer: req.headers.referer, authorization: req.headers.authorization });
+    seen.push({ path: url.pathname, host: req.headers.host, probe: url.searchParams.get('p'), cookie: req.headers.cookie, referer: req.headers.referer, authorization: req.headers.authorization });
     const cors = { 'Access-Control-Allow-Origin': '*' };
     if (url.pathname === '/set-cookie') { res.writeHead(200, { 'Set-Cookie': 'site_session=third-party; SameSite=None; Secure; Path=/', 'Content-Type': 'text/plain' }); res.end('ok'); return; }
     if (url.pathname === '/data.json') { res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Set-Cookie': 'tracker=1; SameSite=None; Secure; Path=/' }); res.end('{"ok":1}'); return; }
@@ -54,7 +54,7 @@ async function origin() {
     res.writeHead(404, cors); res.end();
   });
   const sockets = new WebSocketServer({ server });
-  sockets.on('connection', (socket, req) => { seen.push({ path: '/ws', cookie: req.headers.cookie, referer: req.headers.referer }); socket.on('message', data => socket.send('echo:' + data)); });
+  sockets.on('connection', (socket, req) => { seen.push({ path: '/ws', host: req.headers.host, probe: new URL(req.url!, 'wss://x').searchParams.get('p'), cookie: req.headers.cookie, referer: req.headers.referer }); socket.on('message', data => socket.send('echo:' + data)); });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const insecure = createHttpServer((req, res) => { plain.push(req.url!); res.writeHead(200, { 'Access-Control-Allow-Origin': '*' }); res.end('plain'); });
   await new Promise<void>(resolve => insecure.listen(0, '127.0.0.1', resolve));
@@ -145,5 +145,45 @@ test('an external script that never ends or stalls after its headers is cut off 
     expect(stalled.closed! - stalled.started).toBeGreaterThanOrEqual(14_000);
     expect(stalled.closed! - stalled.started).toBeLessThan(30_000);
     expect(Date.now() - started).toBeLessThan(60_000);
+  } finally { await f.dispose(); await o.close(); }
+});
+
+// Guest code shares the Worker realm with the network guard. None of these may
+// reach a loopback listener: native constructors behind the wrappers, deeper
+// prototype methods, objects whose url and string form differ, or replaced
+// String, RegExp, URL or Request prototype members.
+test('guest code cannot get past the network guard to a loopback listener', async ({ page }) => {
+  test.setTimeout(120_000);
+  const o = await origin();
+  const L = `https://127.0.0.1:${o.port}`, W = `wss://127.0.0.1:${o.port}`;
+  const f = await fixture(page, `<p id="results">pending</p><script>
+var out={},B='${o.base}',L='${L}',W='${W}';
+function xhr(X,url,open){return new Promise(function(res,rej){var x=new X();(open||x.open).call(x,'GET',url);x.onload=function(){res('reached')};x.onerror=rej;x.send()})}
+function deepest(proto,name){var found;for(var p=proto;p;p=Object.getPrototypeOf(p))if(Object.getOwnPropertyDescriptor(p,name))found=p[name];return found}
+function socket(S,url){return new Promise(function(res,rej){var w=new S(url);w.onopen=function(){w.close();res('reached')};w.onerror=rej})}
+function events(E,url){return new Promise(function(res,rej){var s=new E(url);s.onmessage=function(){s.close();res('reached')};s.onerror=function(){s.close();rej()}})}
+function reach(r){return r.then(function(x){return x&&x.ok!==undefined?'reached':x})}
+function tamper(object,name,descriptor,run){var saved=Object.getOwnPropertyDescriptor(object,name);Object.defineProperty(object,name,descriptor);try{return run()}finally{Object.defineProperty(object,name,saved)}}
+var probes=[
+ ['nativeXhr',function(){return xhr(Object.getPrototypeOf(XMLHttpRequest),L+'/data.json?p=nativeXhr')}],
+ ['protoOpen',function(){return xhr(XMLHttpRequest,L+'/data.json?p=protoOpen',deepest(XMLHttpRequest.prototype,'open'))}],
+ ['nativeWebSocket',function(){return socket(Object.getPrototypeOf(WebSocket),W+'/ws?p=nativeWebSocket')}],
+ ['nativeEventSource',function(){return events(Object.getPrototypeOf(EventSource),L+'/events?p=nativeEventSource')}],
+ ['fetchObject',function(){return reach(fetch({url:B+'/data.json',toString:function(){return L+'/data.json?p=fetchObject'}}))}],
+ ['urlHostname',function(){return reach(tamper(URL.prototype,'hostname',{configurable:true,get:function(){return 'widget-net.test'}},function(){return fetch(L+'/data.json?p=urlHostname')}))}],
+ ['stringLower',function(){return reach(tamper(String.prototype,'toLowerCase',{configurable:true,writable:true,value:function(){return 'widget-net.test'}},function(){return fetch(L+'/data.json?p=stringLower')}))}],
+ ['regExp',function(){return reach(tamper(RegExp.prototype,'exec',{configurable:true,writable:true,value:function(){return null}},function(){return tamper(RegExp.prototype,'test',{configurable:true,writable:true,value:function(){return false}},function(){return fetch(L+'/data.json?p=regExp')})}))}],
+ ['requestUrl',function(){var request=new Request(L+'/data.json?p=requestUrl');return reach(tamper(Request.prototype,'url',{configurable:true,get:function(){return B+'/data.json'}},function(){return fetch(request)}))}],
+];
+var chain=Promise.resolve();
+probes.forEach(function(p){chain=chain.then(function(){return Promise.resolve().then(p[1])}).then(function(v){out[p[0]]=v},function(){out[p[0]]='blocked'})});
+chain.then(function(){out.wrappers=[WebSocket.OPEN,EventSource.CLOSED,XMLHttpRequest.DONE,new XMLHttpRequest() instanceof XMLHttpRequest];document.getElementById('results').textContent=JSON.stringify(out)});
+</script>`);
+  try {
+    await f.publish();
+    await expect(guest(page).locator('#results')).not.toHaveText('pending', { timeout: 30_000 });
+    const results = JSON.parse(await guest(page).locator('#results').innerText());
+    expect(results).toEqual({ nativeXhr: 'blocked', protoOpen: 'blocked', nativeWebSocket: 'blocked', nativeEventSource: 'blocked', fetchObject: 'blocked', urlHostname: 'blocked', stringLower: 'blocked', regExp: 'blocked', requestUrl: 'blocked', wrappers: [1, 2, 4, true] });
+    expect(o.seen.filter(s => s.host?.startsWith('127.0.0.1')).map(s => s.probe)).toEqual([]);
   } finally { await f.dispose(); await o.close(); }
 });
