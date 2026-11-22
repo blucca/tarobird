@@ -22,11 +22,29 @@ invented as App controls; following that model's native default remains possible
 choice. The same distinction applies to CLI `--effort`.
 
 Discovery uses the configured executable, environment, workspace and web
-profile, copied into a disposable private DSH home. Credentials are copied for
-this read, rather than linked. Only the public catalog is requested: no Session
-is created and no prompt, selection or native settings write is sent. Native
-startup itself may write in the disposable home. Temporary children and homes
-are cleaned on success, failure and timeout.
+profile. A Host (and every managed Bot, through `TAROBOT_HOST_DIR`) reads in one
+persistent private home, `<host directory>/deepseek-catalog/home`, one read at a
+time across processes (a file mutex). The first read mirrors the whole shared
+web profile into it, as a Bot's own start does (about 40 s and 514 MB on the
+Windows machine measured with a 511 MB shared profile; DeepSeek shows as
+unavailable until it is done). Later reads compare a signature of the
+shared packages (root entry names, each package directory and manifest, the
+package managers' records) and, while it is unchanged, only refresh the
+profile's root files; a package file edited in place without any of those
+changing is picked up at the next full mirror. A directory linked into the
+profile's root stays a link between reads. A shared home with no `profiles`
+directory empties the mirror. Credentials, configuration and anything dsh
+wrote are removed after each read; credentials are copied for the read, never
+linked. A process without a Host directory reads in a temporary home that is
+removed afterwards, and temporary homes left by earlier versions are swept.
+Only the public catalog is requested: no Session is created and no prompt,
+selection or native settings write is sent.
+
+The Hub keeps each engine's list for five minutes and then serves it, marked
+stale, while one replacement is read; an unanswered read is retried no sooner
+than 15 seconds later, so opening New Bot again does not start dsh each time.
+"Refresh models" asks the Hub for a new read of that engine (`refresh=<engine>`
+on `/api/bots/catalog`), and creating a DeepSeek Bot always reads again.
 
 Reads of one configuration never overlap: a read that has not answered is
 joined, including by a refresh. A passive read may reuse a ready answer for 30

@@ -105,7 +105,7 @@ TaroCub instance
 
 `DSH_EXECUTABLE` overrides the executable; otherwise TaroCub uses `dsh` from
 `PATH`. `DSH_HOME` points at the user's authenticated Harness home (default
-`~/.dsh`). TaroCub creates `<stateDir>/dsh-home` with mode `0700`, links the
+`~/.dsh`). TaroCub creates `<stateDir>/dsh-home` with mode `0700`, gives it the
 shared credentials, copies mutable `settings.yaml` when the shared
 home has one (current dsh no longer writes it), and installs
 the bridge `AGENTS.md` plus permission presets. dsh saves every model and
@@ -122,7 +122,22 @@ private profile one-way from the shared profile; nothing is written back, so a
 Bot's selection never changes another Bot's or the user's own `dsh web` default.
 Changes made in the user's DSH, including installed or updated plugins, reach a
 Bot at its next Host start; an unchanged package file is not copied again. Each
-Bot therefore holds its own copy of the installed plugins on disk.
+Bot therefore holds its own copy of the installed plugins on disk: on the
+Windows machine measured when the catalog home was added the shared profile
+was about 17,700 files and 511 MB, and each DeepSeek Bot plus the Host's model
+catalog home holds a copy of that size.
+
+The credentials file is shared differently by platform. On macOS and Linux
+`.credentials.yaml` in the Bot's home is a symbolic link to the shared file,
+so every Bot and the user's own `dsh` read the same credentials. dsh writing
+that file in place changes the shared file; replacing it leaves the Bot its own
+file until its next Host start, which links it again. On Windows, where a file
+link needs elevation or Developer Mode, it is a private copy refreshed from the
+shared file at every Host start; nothing is copied back, so a credential
+changed under a Bot's home lasts until that Bot's next Host start. The bridge
+`AGENTS.md` follows the same rule. Model catalog reads always copy the
+credentials and remove the copy after the read.
+
 If a refresh fails partway through, completed file records are retained so a
 retry does not copy unchanged package files again. Replacing a file with a link
 is staged before rename; if Windows cannot create that link, the copy fallback
