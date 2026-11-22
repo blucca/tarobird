@@ -1,4 +1,4 @@
-import { HubConversationHistory } from "./conversation-history.js";
+import { HISTORY_RELEASE_AFTER_MS, HubConversationHistory } from "./conversation-history.js";
 import { CONVERSATION_HISTORY_CAPABILITY, historyChangeSchema } from "../client-protocol/conversation-history.js";
 import { hubEngineQuotas } from "./engine-quota.js";
 import { ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_HUB_REFRESH_MS } from "../client-protocol/engine-quota.js";
@@ -331,7 +331,9 @@ export class HubServer {
     this.conversationHistory = new HubConversationHistory(store, {
       available: botId => { const worker = this.bots.get(botId); return !worker?.ready ? "offline" : worker.history ? "ready" : "unsupported"; },
       busy: (botId, conversationId) => [...this.nativeTurns.values(), ...this.steersInFlight.values()].some(value => value.botId === botId && value.conversationId === conversationId),
-      call: (botId, method, input) => this.callBot(botId, method, input),
+      // A native fork or rewind may legitimately run for minutes (Codex thread/fork alone allows 180 s);
+      // an earlier timeout would report a success as unknown. Reads keep the ordinary RPC deadline.
+      call: (botId, method, input) => this.callBot(botId, method, input, method === "history.apply" ? HISTORY_RELEASE_AFTER_MS : undefined),
       changed: async conversation => { for (const client of this.clients) if (client.session?.userId === conversation.ownerId) { client.conversationIds.add(conversation.id); this.publishClient(client, { v: 1, type: "conversation.updated", conversation }); } },
       log: line => options.onWarning?.(line),
     });
