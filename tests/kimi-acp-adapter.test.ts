@@ -3,6 +3,7 @@ import { nativeRunProbe } from "./helpers/native-run.js";
 import { runEntryTitle, runDiff, runPlan } from "../client/src/run-presentation.js";
 import { summarizeRun } from "../src/core/run-record.js";
 import { renderCoreUserFacingError } from "../src/core/errors.js";
+import { backgroundTaskBody } from "../src/core/background-task-notice.js";
 import { classifyFailure } from "../src/runtime/error-classification.js";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, realpath, rm as fsRm, symlink, writeFile } from "node:fs/promises";
@@ -1084,6 +1085,56 @@ describe("KimiAcpAdapter", () => {
       expect(of("silent", "tool_result")).toHaveLength(1);
       expect(JSON.stringify(of("silent", "tool_result"))).not.toContain("sleep 4");
     } finally { await adapter.destroy(); }
+  });
+
+  it.each([
+    ["the end of what the command printed", "building...\n".repeat(900) + " Test Files  3 failed | 773 passed\n      Tests  3 failed | 10843 passed"],
+    ["a line the App writes in the reader's language when the command printed nothing", undefined],
+  ])("reports a failed background command whose review turn said nothing with %s", async (_label, output) => {
+    // Seen with kimi 2.7.2 on 2026-11-22: the command failed while another turn ran, Kimi sent no Notification
+    // hook for it and went straight to a review turn; that turn ended on a tool call when the next task
+    // notification took over. The owner read "<task name> failed." and nothing else.
+    const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-failed-task-test-"));
+    const configPath = path.join(root, "config.json");
+    await writeFile(configPath, JSON.stringify({ engine: "kimi", effort: "high" }), "utf8");
+    const harness = createHarness(), events: EngineStreamEvent[] = [], reads: string[] = [];
+    const adapter = new KimiAcpAdapter("kimi", {
+      ...adapterOptions(harness), configPath, engineHomePath: root, hookRelayEnabled: true,
+      readBackgroundTaskOutputFn: async (_home, _session, taskId) => { reads.push(taskId); return output; },
+    });
+    try {
+      const turn = adapter.sendUserMessage("telegram-54", { text: "verify", files: [], onEngineEvent: async event => { events.push(event); } });
+      await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+      const server = harness.children[0].server;
+      const hook = (body: Record<string, unknown>) => postKimiHook(harness, { session_id: "kimi-session-1", ...body });
+      await hook({ hook_event_name: "TaskStarted", task_id: "bash-verify", kind: "process", description: "验证构建与全量回归", status: "running", detached: true });
+      await waitFor(() => events.some(event => event.type === "background_task_started"));
+      server.sendUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "已在后台开始验证。" } });
+      server.respondPrompt();
+      await turn;
+      const notice = (id: string, status: string) => [{ type: "text", text: `<notification id="task:${id}:${status}" type="task.${status}" source_kind="background_task" source_id="${id}">${id} ${status}</notification>` }];
+      await hook({ hook_event_name: "TurnStarted", turn_id: 26, origin_kind: "task", prompt: notice("bash-verify", "failed") });
+      // The review reads files and is cut off by the next notification before it writes a word.
+      server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "read-1", title: "Read", kind: "read", status: "completed", rawInput: { path: "/x" }, rawOutput: "ok" });
+      await hook({ hook_event_name: "TurnStarted", turn_id: 27, origin_kind: "task", prompt: notice("bash-other", "completed") });
+      const shown = () => events.filter((event): event is Extract<EngineStreamEvent, { type: "task_notification" }> => event.type === "task_notification" && event.taskId === "bash-verify" && !event.suppressUserDelivery);
+      await waitFor(() => shown().length === 1);
+      const event = shown()[0]!;
+      expect(event).toMatchObject({ status: "failed", summary: "验证构建与全量回归" });
+      expect(event.text).not.toMatch(/failed\.$/);
+      expect(reads).toEqual(["bash-verify"]);
+      if (output) {
+        expect(event.reason).toBeUndefined();
+        expect(event.text).toContain("Test Files  3 failed | 773 passed");
+        // One card's worth, from the end: the reason is at the bottom of a long log.
+        expect(event.text.length).toBeLessThan(4_500);
+        expect(event.text.startsWith("…")).toBe(true);
+      } else {
+        expect(event.reason).toBe("no_result");
+        expect(backgroundTaskBody(event, "zh")).toBe("验证构建与全量回归\n\n引擎没有提供更多结果。");
+        expect(backgroundTaskBody(event, "en")).toBe("验证构建与全量回归\n\nThe engine provided no further result.");
+      }
+    } finally { await adapter.destroy(); await rm(root, { recursive: true, force: true }); }
   });
 
   it("relays Kimi hook background tasks into start and out-of-band completion events", async () => {
@@ -3825,6 +3876,38 @@ describe("KimiAcpAdapter", () => {
         await postKimiHook(harness, { hook_event_name: "Stop", turn_id: "31", stop_hook_active: false });
         await expect(settleWithin(turn, 2_000)).resolves.toMatchObject({ text: "Done." });
         expect(probe.events).toContainEqual(expect.objectContaining({ type: "native_input_wait", status: "finished" }));
+      } finally {
+        await adapter.destroy();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it("still follows a queued prompt whose turn Kimi started before the ACP request came back", async () => {
+      // The queue receipt and the start of the queued turn can both arrive while the (empty) answer to the ACP
+      // request is on its way. The turn is known then, and it is still this prompt's reply that is owed.
+      const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-queued-early-start-test-"));
+      const harness = createHarness(), probe = nativeRunProbe();
+      const adapter = new KimiAcpAdapter("kimi", { ...adapterOptions(harness), engineHomePath: root, hookTerminalGraceMs: 0, hookRelayEnabled: true });
+      try {
+        let settled = false;
+        const turn = adapter.sendUserMessage("telegram-queued-early-start", { text: "summarize the review", files: [], onEngineEvent: probe.onEngineEvent });
+        void turn.then(() => { settled = true; }, () => { settled = true; });
+        await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+        const server = harness.children[0].server, sentPrompt = promptText(server);
+        await postKimiHook(harness, { hook_event_name: "UserPromptQueued", prompt_id: "msg_early", prompt: [{ type: "text", text: sentPrompt }], queue_length: 1 });
+        await postKimiHook(harness, { hook_event_name: "TurnStarted", turn_id: "41", origin_kind: "user", prompt: sentPrompt });
+        server.respondPrompt({ stopReason: "end_turn" }, { processed: false });
+        await new Promise(resolve => setTimeout(resolve, 150));
+        expect(settled).toBe(false);
+        await writeKimiWire(root, [
+          { type: "turn.prompt", turnId: 41, origin: { kind: "user" }, promptId: "msg_early", input: [{ type: "text", text: sentPrompt }], time: 1 },
+          { type: "context.append_loop_event", event: { type: "content.part", turnId: "41", step: 1, part: { type: "text", text: "The summary." } }, time: 2 },
+          { type: "context.append_loop_event", event: { type: "step.end", turnId: "41", step: 1, finishReason: "end_turn" }, time: 3 },
+          { type: "turn.ended", turnId: 41, reason: "completed", time: 4 },
+        ]);
+        await postKimiHook(harness, { hook_event_name: "Stop", turn_id: "41", stop_hook_active: false });
+        await expect(settleWithin(turn, 2_000)).resolves.toMatchObject({ text: "The summary." });
+        expect(probe.events).not.toContainEqual(expect.objectContaining({ text: "Kimi completed the request." }));
       } finally {
         await adapter.destroy();
         await rm(root, { recursive: true, force: true });

@@ -4,7 +4,8 @@ import { channelProfile, type ChannelProfile } from "./channel-profile.js";
 
 type Notification = Extract<EngineStreamEvent, { type: "task_notification" }>;
 export function backgroundTaskBody(event: Notification, locale: Locale): string {
-  if (event.reason === "no_result") return locale === "en" ? "The engine provided no further result." : "引擎没有提供更多结果。";
+  // The task's name, when the engine gave one, says which task this is about.
+  if (event.reason === "no_result") return [event.summary?.trim(), locale === "en" ? "The engine provided no further result." : "引擎没有提供更多结果。"].filter(Boolean).join("\n\n");
   if (event.reason === "engine_exit") return [event.summary?.trim(), locale === "en" ? "The Claude process exited before this task completed." : "Claude 进程已退出，未收到此任务的完成结果。"].filter(Boolean).join("\n\n");
   return event.text;
 }

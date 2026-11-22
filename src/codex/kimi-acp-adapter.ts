@@ -1375,6 +1375,15 @@ async function readKimiBackgroundTaskOutput(
   }
 }
 
+/** What a notice shows of a command's output: the end, where a failing build or test run says why. */
+const BACKGROUND_TASK_NOTICE_OUTPUT_CHARS = 4_000;
+function kimiOutputTail(output: string | undefined): string {
+  const text = output?.trim() ?? "";
+  if (text.length <= BACKGROUND_TASK_NOTICE_OUTPUT_CHARS) return text;
+  const tail = text.slice(-BACKGROUND_TASK_NOTICE_OUTPUT_CHARS), line = tail.indexOf("\n");
+  return `…\n${(line >= 0 && line < 400 ? tail.slice(line + 1) : tail).trimStart()}`;
+}
+
 function taskStatusFromNotificationType(notificationType: string): string {
   const status = notificationType.startsWith("task.")
     ? notificationType.slice("task.".length)
@@ -3629,10 +3638,12 @@ export class KimiAcpAdapter implements CodexAdapter {
         pending.interruptionPromise,
       ]);
       let text = pending.assistantText.trim();
-      if (!text && !pending.engineActivity && pending.kimiTurnId === undefined) {
+      if (!text && !pending.engineActivity && (pending.kimiTurnId === undefined || pending.queuedPromptId !== undefined)) {
         // No update and no started turn: Kimi either queued this prompt behind
         // its own turn (Kimi 2.7 answers that ACP request at once) or did not
         // process it. Never report an unprocessed prompt as completed.
+        // A queue receipt says it was queued even when the queued turn has
+        // already started by now: its reply is still owed.
         text = await this.resolveQueuedKimiPrompt(worker, pending, sessionId);
       }
       text ||= "Kimi completed the request.";
@@ -5093,7 +5104,7 @@ export class KimiAcpAdapter implements CodexAdapter {
         ? "failed"
         : "completed";
     const streamedAssistantText = continuation.assistantText.trim();
-    const capturedText = continuation.rawText?.trim() || "";
+    let capturedText = continuation.rawText?.trim() || "";
     const deliverySessionId = continuation.sessionId ?? sourceTask?.sessionId ?? worker.currentSessionId ?? undefined;
     const deliveryHandler = continuation.onEngineEvent ?? sourceTask?.onEngineEvent ?? worker.onEngineEvent;
     const deliveryApprovalHandler = continuation.onApprovalRequest ?? sourceTask?.onApprovalRequest;
@@ -5123,19 +5134,28 @@ export class KimiAcpAdapter implements CodexAdapter {
     if (continuation.lateAfterFallback && !assistantText && !capturedText && !terminal.errorText?.trim()) {
       return;
     }
+    // Kimi can start the review of a command without ever sending that task's own Notification hook (seen with
+    // 2.7.2 when the command ends while another turn runs), and the review can end on a tool call when the next
+    // notification takes over. Then nothing was read and nothing was said, while what the command printed is
+    // on disk. A person is about to read this notice: give them the end of that output.
+    if (!capturedText && !assistantText && !intermediate && !suppressUserDelivery
+      && (sourceTask?.kind === "process" || continuation.taskId.startsWith("bash-"))) {
+      capturedText = kimiOutputTail(await this.readBackgroundTaskOutputFn(this.engineHomePath, deliverySessionId, continuation.taskId).catch(() => undefined));
+    }
     const bodyText = terminal.status === "failed"
       ? [...new Set([capturedText, assistantText].filter(Boolean))].join("\n\n")
       : assistantText || capturedText;
-    const rawText = [bodyText, terminal.errorText?.trim()]
+    const content = [bodyText, terminal.errorText?.trim()]
       .filter(Boolean)
-      .join("\n\n")
-      || `${continuation.summary ?? "Kimi background task"} ${finalStatus}.`;
-    const text = finalStatus === "completed"
-      ? await appendSavedArtifactDeliveryTags(rawText, worker.workspacePath)
-      : rawText;
+      .join("\n\n");
+    // With nothing to show, the App writes the line itself in the reader's language (reason "no_result",
+    // next to the task's name). The text is only the name: engine-side English is never put before a person.
+    const text = !content ? deliverySummary ?? "Kimi background task"
+      : finalStatus === "completed" ? await appendSavedArtifactDeliveryTags(content, worker.workspacePath) : content;
     await this.emitEngineEvent(deliveryHandler, {
       type: "task_notification",
       text,
+      ...(content ? {} : { reason: "no_result" as const }),
       sessionId: deliverySessionId,
       taskId: continuation.taskId,
       status: finalStatus,
@@ -5360,14 +5380,15 @@ export class KimiAcpAdapter implements CodexAdapter {
     const processOutput = task.kind === "process" || task.taskId.startsWith("bash-")
       ? await this.readBackgroundTaskOutputFn(this.engineHomePath, sessionId, task.taskId)
       : undefined;
-    const rawText = task.subagentResponse?.trim()
+    const content = task.subagentResponse?.trim()
       || processOutput
       || notification.body?.trim()
       || notification.title?.trim()
-      || `${task.description ?? "Kimi background task"} ${status}.`;
-    const text = status === "completed"
-      ? await appendSavedArtifactDeliveryTags(rawText, worker.workspacePath)
-      : rawText;
+      || "";
+    // Nothing to show: only the task's name, and the App adds its own line (see the review's finish).
+    const noResult = content ? {} : { reason: "no_result" as const };
+    const text = !content ? task.description ?? "Kimi background task"
+      : status === "completed" ? await appendSavedArtifactDeliveryTags(content, worker.workspacePath) : content;
     // TaskStop can race this output read. Once another terminal path removes
     // the task or installs a tombstone, this stale flush must not resurrect it.
     if (
@@ -5396,6 +5417,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       await this.emitEngineEvent(task.onEngineEvent ?? worker.onEngineEvent, {
         type: "task_notification",
         text,
+        ...noResult,
         sessionId,
         taskId: task.taskId,
         status,
@@ -5424,6 +5446,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       await this.emitEngineEvent(task.onEngineEvent ?? worker.onEngineEvent, {
         type: "task_notification",
         text,
+        ...noResult,
         sessionId,
         taskId: task.taskId,
         status,
@@ -5450,7 +5473,8 @@ export class KimiAcpAdapter implements CodexAdapter {
     continuation.sessionId ??= sessionId;
     continuation.status = status;
     continuation.summary ??= task.description;
-    continuation.rawText = text;
+    // Only what the task itself gave: the review's finish decides what to say when there is nothing.
+    continuation.rawText = content ? text : undefined;
     continuation.lastSeenAt = Date.now();
     continuation.onEngineEvent ??= task.onEngineEvent ?? worker.onEngineEvent;
     continuation.onApprovalRequest ??= task.onApprovalRequest;
