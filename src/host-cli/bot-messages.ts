@@ -228,6 +228,14 @@ export async function runBotMessagesCommand(directory: string, command: string, 
       }
       // Queue is the default and keeps the legacy request bytes on the wire.
       const receipt = await call("send", { text, attachments, ...(delivery === "steer" ? { delivery } : {}) });
+      // Final outcomes that delivered nothing for certain fail the command, like `steer send`; the receipt is still printed.
+      const actual = receipt && typeof receipt === "object" ? (receipt as { delivery?: { actual?: unknown } }).delivery?.actual : undefined;
+      if (actual === "not_delivered" || actual === "steer_uncertain") {
+        console.error(actual === "not_delivered"
+          ? "not_delivered: 消息既没有并入对方进行中的回复，也没有排队；原因见 delivery.reason。 / The message was neither merged into the live reply nor queued; see delivery.reason."
+          : "steer_uncertain: 对方主机无法确认消息是否并入进行中的回复，也不会再排队。先用 messages wait 查看 delivery.turn 那次回复，再决定是否重发。 / The receiving host cannot tell whether the message joined the live reply, and will not queue it. Check that reply with messages wait --message <delivery.turn.messageId> before sending again.");
+        process.exitCode = 1;
+      }
       return delivery === "queue" && receipt && typeof receipt === "object" && !("delivery" in receipt) ? { ...receipt, delivery: { requested: "queue", actual: "queued" } } : receipt;
     }
     const messageId = idSchema.parse(required(options.message, "message")), timeout = Number(options.timeout ?? "120");
