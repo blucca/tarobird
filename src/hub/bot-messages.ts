@@ -134,6 +134,8 @@ export class BotMessages {
   /** Steer records whose Gateway call this process is still awaiting: they are
    * reconciled only after that call has returned or been lost. */
   private readonly steersInFlight = new Set<string>();
+  /** In-flight records a reconciliation (a worker attach) skipped: if their call is then lost, nothing else would ask again. */
+  private readonly skippedInFlight = new Set<string>();
   private async memo<T>(key: string): Promise<T | undefined> {
     const row = await this.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [key]);
     return row ? JSON.parse(row.value) as T : undefined;
@@ -615,6 +617,8 @@ export class BotMessages {
     const control = blocks.find(block => block.type === "steering"), turn = memo?.steer?.turn ? { turn: { messageId: memo.steer.turn } } : {};
     if (!control) return memo?.steer?.reason ? { requested: "steer", actual: "fell_back_to_queue", reason: memo.steer.reason } : { requested: "steer", actual: "queued" };
     if (control.outcome === "rejected") return { requested: "steer", actual: "not_delivered", ...(control.reason && /^[a-z_]{1,64}$/.test(control.reason) ? { reason: control.reason } : {}), ...turn };
+    // The engine's own adoption receipt outranks a Gateway answer that could not tell (Claude may confirm after the Gateway stopped waiting).
+    if (control.outcome === "unknown" && adoptedSteer(control)) return { requested: "steer", actual: "steered", ...turn };
     // Not final: the call is in flight, or this Host got no answer yet (reconcilable).
     if (control.outcome === "pending") return { requested: "steer", actual: "pending", reason: "steer_in_flight", ...turn };
     if (control.outcome === "unknown" && control.reason !== "gateway_uncertain") return { requested: "steer", actual: "pending", reason: "steer_unconfirmed", ...turn };
@@ -809,15 +813,18 @@ export class BotMessages {
     // The Gateway journals this call at most once. Only its explicit refusal
     // proves nothing reached the engine; its own "unknown" is final; a lost
     // call leaves the record unconfirmed for reconciliation.
-    let result: SteerResult, answered = true;
+    let result: SteerResult, answered = true, skipped = false;
     this.steersInFlight.add(created.message.id);
     try {
       try { result = steerResultSchema.parse(await this.steering.steer(c.bot.id, call)); }
       catch { result = { outcome: "unknown", reason: "uncertain" }; answered = false; }
       await this.settleSteer(c.p.source, c.bot.id, created.message.id, c.key, result, plan.turn, answered);
-    } finally { this.steersInFlight.delete(created.message.id); }
+    } finally { this.steersInFlight.delete(created.message.id); skipped = this.skippedInFlight.delete(created.message.id); }
     const message = await this.store.db.serial(() => this.store.queuedMessageInTransaction(created.message.id));
     const delivery = this.deliveryOf(message.blocks, await this.store.db.serial(() => this.memo<IncomingMemo>(c.key)));
+    // A lost call leaves the record unconfirmed. A worker that attached during the call skipped it
+    // (still in flight then): ask for the recorded outcome now instead of waiting for the next attach.
+    if (!answered && skipped) void this.reconcileRecord(c.bot.id, created.message.id).catch(() => undefined);
     await c.validate();
     return this.receipt(c, message, false, delivery);
   }
@@ -875,7 +882,8 @@ export class BotMessages {
    * steering again). Skipped while this process still awaits the original
    * call, or while no capable worker is attached: the record stays open. */
   private async reconcileRecord(botId: string, messageId: string, sender?: { hostId: string; botId: string }): Promise<void> {
-    if (this.steersInFlight.has(messageId) || this.steering.capable(botId) !== true) return;
+    if (this.steersInFlight.has(messageId)) { this.skippedInFlight.add(messageId); return; }
+    if (this.steering.capable(botId) !== true) return;
     const found = await this.store.db.serial(async () => {
       const open = await this.memo<OpenSteer>(openSteerKey(botId, messageId));
       const row = await this.store.db.get<{ bot_source_json: string | null; blocks_json: string; client_msg_id: string | null; conversation_id: string }>("SELECT bot_source_json,blocks_json,client_msg_id,conversation_id FROM messages WHERE id=? AND author_type='user'", [messageId]);
@@ -891,7 +899,7 @@ export class BotMessages {
     let result: SteerResult;
     try { result = steerResultSchema.parse(await this.steering.reconcile(botId, { conversationId: found.conversationId, requestId: found.requestId, targetId: found.targetId, sourceMessageId: found.turn, receiptEpoch: found.epoch })); }
     catch { return; }
-    if (this.steersInFlight.has(messageId)) return;
+    if (this.steersInFlight.has(messageId)) { this.skippedInFlight.add(messageId); return; }
     // Without a sender request no passport was checked: before a recorded
     // refusal becomes a queued task, the source must still be allowed now.
     const recheck = sender ? undefined : async (): Promise<string | undefined> => {
@@ -956,9 +964,10 @@ export class BotMessages {
   }
   /** Caller holds the DB queue. Internal dispatch workers are not listed. */
   private async steeringInTransaction(botId: string): Promise<BotMessageSteeringSnapshot> {
-    const bot = await this.store.db.get<{ engine: string }>("SELECT engine FROM bots WHERE id=? AND deleted_at IS NULL AND role!='worker'", [botId]);
+    const bot = await this.store.db.get<{ engine: string; role: string }>("SELECT engine,role FROM bots WHERE id=? AND deleted_at IS NULL AND role!='worker'", [botId]);
     if (!bot) throw new HubError("bot_not_found", 404);
-    return { botId, allowed: !await this.memo(steeringDisabledKey(botId)), supported: supportsBotMessageSteerEngine(bot.engine) };
+    // A dispatcher's chats only queue (hubSteerConditionsInTransaction): its switch would change nothing.
+    return { botId, allowed: !await this.memo(steeringDisabledKey(botId)), supported: supportsBotMessageSteerEngine(bot.engine) && bot.role !== "dispatcher" };
   }
   /** Receiving owner's switch "allow other Bots to steer this Bot" (default on). */
   /** `bot` is an ID or an exact unique name (IDs first); the snapshot names the ID. */
