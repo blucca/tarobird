@@ -238,7 +238,7 @@ kbd{font:500 11px/1 var(--font-sans);color:var(--muted)}
   .sidebar .conversation-row>span.row-text{gap:2px;line-height:1.4}
   .sidebar .conversation-row strong{font-size:13.5px;font-weight:600;line-height:1.4}
   .sidebar .conversation-row small{font-size:12px;font-weight:400;line-height:1.4}
-  .sidebar .conversation-row:is(.selected,:has(.unread-badge)) strong{font-weight:650}
+  .sidebar .conversation-row:is(.selected,.has-unread) strong{font-weight:650}
 }
 /* The current conversation is a raised chip on the stone: crisp edge, no tint. */
 .conversation-row.selected,.conversation-row.selected:hover:not(:disabled){background:var(--selected-row);box-shadow:none}
@@ -251,7 +251,8 @@ kbd{font:500 11px/1 var(--font-sans);color:var(--muted)}
 /* Unread is a tinted counter and the row title gains weight, so the sidebar reads
    by hierarchy instead of a column of solid dots. */
 .unread-badge{min-width:18px;height:18px;padding:0 6px;border-radius:9px;background:var(--primary-bg);color:var(--on-primary);font-size:10.5px;font-weight:700;line-height:18px;letter-spacing:.01em;text-align:center;font-variant-numeric:tabular-nums}
-.conversation-row:has(.unread-badge) strong{font-weight:620;color:var(--text)}
+/* .has-unread is set with the badge (ConversationList). :has(.unread-badge) before a bare tag made streamed updates restyle whole messages. */
+.conversation-row.has-unread strong{font-weight:620;color:var(--text)}
 .file-center-entry{min-height:32px;margin:1px 0;padding:6px 8px;gap:10px;justify-content:flex-start;border-radius:var(--radius);font-size:13px;font-weight:500;color:var(--grey)}
 .file-center-entry svg{width:16px;height:16px;color:var(--muted)}
 .file-center-entry:hover:not(:disabled){background:var(--canvas-hover);color:var(--text)}
@@ -512,7 +513,9 @@ kbd{font:500 11px/1 var(--font-sans);color:var(--muted)}
      Full-width cards (tables, forms, questions) keep the whole column. */
   /* Run cards keep their stable reading width through streamed patches. */
   .message.bot .message-body:has(>.message-blocks>.rich-card:not(.reply-card):only-child):not(:has(.native-question,.card-form,.card-columns,.table-scroll)){display:grid;grid-template-columns:fit-content(100%);align-content:start}
-  .message.bot .message-body:has(>.message-blocks>.rich-card:not(.reply-card):only-child):not(:has(.native-question,.card-form,.card-columns,.table-scroll))>*{min-width:0}
+  /* Grid items of the fitted body may shrink. Written without :has(): block children ignore min-width, and a
+     :has() ancestor followed by >* made every streamed update restyle the whole message. */
+  .message.bot:not(.is-discussion-input) .message-body>*{min-width:0}
   .message.user .message-meta{align-self:stretch;margin-bottom:2px}
   .message.user .message-meta>.message-actions{order:-1;margin:0 0 0 auto}
   /* Export feedback is exceptional content: let it wrap without pushing the

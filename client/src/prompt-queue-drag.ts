@@ -1,3 +1,4 @@
+import { dragSelectLock } from "./drag-select-lock.js";
 import { useLayoutEffect, useRef, type RefObject } from "react";
 
 type Target = { id: string; after: boolean; beforeId: string | null };
@@ -67,7 +68,7 @@ export function usePromptQueueDrag(root: RefObject<HTMLDivElement | null>, optio
       if (target) { const row = state?.slots.find(slot => slot.id === target!.id)?.row; row?.classList.remove("is-drop-before", "is-drop-after"); }
       target = undefined;
       for (const slot of state?.slots ?? []) { slot.row.style.removeProperty("transform"); delete slot.row.dataset.dragging; }
-      delete list.dataset.dragging; delete list.dataset.queueSaving;
+      delete list.dataset.dragging; delete list.dataset.queueSaving; dragSelectLock("queue", false);
     };
     const settle = (before: Positions, motion = true) => {
       const offsets: { row: HTMLElement; x: number; y: number }[] = [];
@@ -158,7 +159,7 @@ export function usePromptQueueDrag(root: RefObject<HTMLDivElement | null>, optio
       if (destination) {
         const slot = previous.slots.find(slot => slot.id === previous.source)!;
         const from = getComputedStyle(previous.row).transform, to = `translateY(${destinations(previous, previous.source, destination.beforeId).get(previous.source)! - slot.top}px)`;
-        delete previous.row.dataset.dragging; delete list.dataset.dragging;
+        delete previous.row.dataset.dragging; delete list.dataset.dragging; dragSelectLock("queue", false);
         previous.row.style.transform = to; animate(previous.row, from, to);
         persist(previous, previous.source, destination.beforeId);
       } else { clearAnimations(); clearPreview(previous); settle(before, motion && safeGeometry); }
@@ -197,7 +198,7 @@ export function usePromptQueueDrag(root: RefObject<HTMLDivElement | null>, optio
         Object.assign(drag, geometry(drag.scroller), { moved: true, listWidth: list.clientWidth, listHeight: list.clientHeight });
         observeSize(drag);
         for (const slot of drag.slots) { const before = pickup.get(slot.row); if (before) slot.row.style.transform = `translateY(${before.top + drag.scroller.scrollTop - slot.top}px)`; }
-        list.dataset.dragging = "true"; drag.row.dataset.dragging = "true";
+        list.dataset.dragging = "true"; drag.row.dataset.dragging = "true"; dragSelectLock("queue", true);
         placeholder = document.createElement("div"); placeholder.className = "prompt-queue-drop-slot"; placeholder.setAttribute("aria-hidden", "true");
         const source = drag.slots.find(slot => slot.id === drag!.source)!;
         Object.assign(placeholder.style, { top: `${source.row.offsetTop}px`, left: `${source.row.offsetLeft}px`, width: `${source.width}px`, height: `${source.height}px` }); list.append(placeholder);

@@ -243,7 +243,7 @@
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .message-selection-bar .message-delete-action:hover:not(:disabled){border-color:transparent;background:color-mix(in srgb,var(--red) 12%,var(--bg));color:var(--red)}
 /* ---------- 6. Menus ---------- */
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) :is(.desktop-menu,.desktop-menu-context)>button{font-weight:400}
-:root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .desktop-menu>button:has(.desktop-menu-text) .desktop-menu-text>:first-child{font-weight:400}
+:root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .desktop-menu>button .desktop-menu-text.desktop-menu-text>:first-child{font-weight:400}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .create-menu>button .desktop-menu-text>:first-child{font-weight:500}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .desktop-menu-text>small{font-size:12px;color:var(--muted)}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .chat-menu{max-width:280px}
@@ -441,7 +441,7 @@
 /* CJK weights: PingFang renders only real steps, so use 400/500/600 deliberately. */
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .sidebar .bot-identity strong{font-size:14px;font-weight:500}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .sidebar .conversation-row strong{font-size:13px;font-weight:500}
-:root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .sidebar .conversation-row:has(.unread-badge) strong{font-weight:600}
+:root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .sidebar .conversation-row.has-unread strong{font-weight:600}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .sidebar .conversation-row small{font-size:12px}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .header-title h1{font-size:16px;font-weight:600}
 :root:is(:not([data-palette]),[data-palette^=white-],[data-palette=mono]) .message-meta strong{font-size:13px;font-weight:600}

@@ -144,8 +144,7 @@
 .adhd-card .adhd-grip:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
 .adhd-card .adhd-grip{touch-action:none;-webkit-user-drag:none}
 .adhd-grid[data-adhd-dragging=true],.adhd-grid[data-adhd-dragging=true] *{cursor:grabbing!important;user-select:none;-webkit-user-select:none}
-/* A captured drag may cross the sidebar before being cancelled. */
-body:has(.adhd-grid[data-adhd-dragging=true]),body:has(.adhd-grid[data-adhd-dragging=true]) *{user-select:none!important;-webkit-user-select:none!important}
+/* A captured drag may cross the sidebar before being cancelled: drag-select-lock.ts marks the root (styles.css). */
 .adhd-grid{position:relative;isolation:isolate}
 .adhd-grid[data-adhd-dragging=true]{overflow-anchor:none}
 .adhd-grid[data-adhd-reorderable=true] .adhd-card :is(.conversation-header:not(.history-search-header),.adhd-card-bar){cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}

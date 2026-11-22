@@ -1,3 +1,4 @@
+import { dragSelectLock } from "./drag-select-lock.js";
 import { useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 
 const headerSelector = ".conversation-header,.adhd-card-bar";
@@ -71,7 +72,7 @@ export function useAdhdPaneDrag(root: RefObject<HTMLDivElement | null>, keys: st
       const previous = drag, destination = target?.key;
       const positions: Positions = new Map(previous?.moved ? previous.slots.map(slot => [slot.row, slot.row.getBoundingClientRect()]) : []);
       drag = undefined; cancelAnimationFrame(frame); frame = 0; lastFrame = 0;
-      highlight(); placeholder?.remove(); placeholder = undefined; delete grid.dataset.adhdDragging;
+      highlight(); placeholder?.remove(); placeholder = undefined; delete grid.dataset.adhdDragging; dragSelectLock("adhd", false);
       if (!previous) return;
       suppressClick = previous.moved;
       if (!previous.moved) {
@@ -182,7 +183,7 @@ export function useAdhdPaneDrag(root: RefObject<HTMLDivElement | null>, keys: st
         const bounds = grid.getBoundingClientRect();
         Object.assign(drag, { moved: true, scrollX: grid.scrollLeft, scrollY: grid.scrollTop, width: bounds.width, height: bounds.height, contentWidth: grid.scrollWidth, contentHeight: grid.scrollHeight });
         drag.row.querySelector<HTMLButtonElement>(".adhd-grip")?.focus({ preventScroll: true });
-        grid.dataset.adhdDragging = "true"; drag.row.dataset.adhdDragging = "true";
+        grid.dataset.adhdDragging = "true"; drag.row.dataset.adhdDragging = "true"; dragSelectLock("adhd", true);
         placeholder = document.createElement("div"); placeholder.className = "adhd-drop-slot"; placeholder.setAttribute("aria-hidden", "true"); grid.append(placeholder);
         target = drag.slots.find(slot => slot.key === drag!.key); highlight();
         frame = requestAnimationFrame(tick);

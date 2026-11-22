@@ -23,7 +23,6 @@
 .prompt-queue-drop-slot{position:absolute;z-index:0;pointer-events:none;box-sizing:border-box;border:1px dashed color-mix(in srgb,var(--accent) 55%,var(--border));border-radius:10px;background:color-mix(in srgb,var(--accent) 6%,var(--bg))}
 .prompt-queue-list:is([data-dragging="true"],[data-queue-saving="true"]) .prompt-queue-item:is(.is-drop-before,.is-drop-after){box-shadow:none}
 .prompt-queue-list[data-dragging="true"],.prompt-queue-list[data-dragging="true"] *{cursor:grabbing!important;user-select:none;-webkit-user-select:none}
-body:has(.prompt-queue-list[data-dragging="true"]),body:has(.prompt-queue-list[data-dragging="true"]) *{user-select:none!important;-webkit-user-select:none!important}
 .prompt-queue-grip{-webkit-user-drag:none}
 @media(pointer:coarse){.prompt-queue-panel .prompt-queue-grip{min-width:44px;min-height:44px}}
 .prompt-queue-text{font-size:13px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere;margin:5px 0 8px;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
