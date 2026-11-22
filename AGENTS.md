@@ -95,7 +95,7 @@ and the [release checklist](docs/release-checklist.md#android-distribution-check
 Preparing or handing off an AAB is not evidence of store publication.
 
 For the next Android release, carry forward the recorded
-[Play Console optimization and system-bar follow-ups](docs/release-checklist.md#next-android-release-play-console-follow-ups-2026-11-17).
+[Play Console system-bar follow-ups](docs/release-checklist.md#next-android-release-play-console-follow-ups-2026-11-17).
 Resolve or explicitly report their status during preflight; a successful upload
 does not establish that these warnings have been resolved.
 
