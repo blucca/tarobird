@@ -2,13 +2,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ContextUsage } from "../../src/client-protocol/context-usage.js";
 import type { QuotaScope } from "../../src/client-protocol/engine-quota.js";
 import type { HubConnection } from "./connection.js";
-import { contextView, mayAskEngine, nextHeldQuota, quotaView, quotaViewEndsAt, type QuotaAttempt } from "./usage-readings.js";
+import { contextView, loadSavedQuota, mayAskEngine, nextHeldQuota, quotaView, quotaViewEndsAt, savedQuotaAfter, saveQuota, SAVED_QUOTA_KEY, type QuotaAttempt } from "./usage-readings.js";
 
 /** The engine is asked for quota again only once the shown reading is this old; opening the details asks after a minute.
  * There is no timer: a reading is taken when a conversation opens and when a reply ends. */
 const QUOTA_READ_AGAIN_MS = 5 * 60_000, QUOTA_DETAILS_READ_AGAIN_MS = 60_000;
-/** The last quota reading per Host and Bot, in memory only, so a Bot's battery is there when another of its conversations opens. */
+/** The last quota reading per Host and Bot, so a Bot's battery is there when another of its conversations opens. */
 const held = new WeakMap<HubConnection, Map<string, QuotaScope>>();
+/** Readings saved on this device by an earlier run of the App. One is shown only after its Bot's worker has
+ * answered that the login is still the same; until then it waits here. */
+const saved = new WeakMap<HubConnection, Map<string, QuotaScope>>();
+const storage = { read: () => { try { return localStorage.getItem(SAVED_QUOTA_KEY); } catch { return null; } }, write: (value: string) => { try { localStorage.setItem(SAVED_QUOTA_KEY, value); } catch { /* a full or blocked store only loses the saved copy */ } } };
 /** When the engine was last asked per Host and Bot, so a failing read is not repeated at every opened conversation. */
 const attempts = new WeakMap<HubConnection, Map<string, QuotaAttempt>>();
 
@@ -37,7 +41,17 @@ export function useUsageReadings(connection: HubConnection, input: {
     if (quota) readings.push((async () => {
       const store = held.get(connection) ?? new Map<string, QuotaScope>(); held.set(connection, store);
       const asked = attempts.get(connection) ?? new Map<string, QuotaAttempt>(); attempts.set(connection, asked);
-      const keep = (scope: QuotaScope) => { const next = nextHeldQuota(store.get(botId), scope); if (next) store.set(botId, next); else store.delete(botId); };
+      // Readings are saved per Host by its public key; a connection without one saves nothing.
+      const host = connection.identity.hubPublicKey;
+      const waiting = saved.get(connection) ?? (host ? loadSavedQuota(storage.read(), host, Date.now()) : new Map<string, QuotaScope>()); saved.set(connection, waiting);
+      const keep = (scope: QuotaScope) => {
+        const earlier = waiting.get(botId), fate = earlier && !store.has(botId) ? savedQuotaAfter(earlier, scope) : "drop";
+        if (fate !== "wait") waiting.delete(botId);
+        const next = nextHeldQuota(store.get(botId) ?? (fate === "adopt" ? earlier : undefined), scope);
+        if (next) store.set(botId, next); else store.delete(botId);
+        // A reading still waiting for its worker stays saved; everything else follows what is held now.
+        if (host) storage.write(saveQuota(storage.read(), host, new Map([...waiting, ...store]), Date.now()));
+      };
       try {
         let scope = await connection.readEngineQuota(botId); keep(scope);
         if (mayAskEngine(scope, store.get(botId), asked.get(botId), Date.now(), olderThan)) {

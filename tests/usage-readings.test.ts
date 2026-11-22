@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { QuotaScope, QuotaWindow } from "../src/client-protocol/engine-quota.js";
-import { contextView, mayAskEngine, nextHeldQuota, poolCoversModel, quotaView, quotaViewEndsAt, shortTokens, usageTone, QUOTA_SHOWN_FOR_MS, QUOTA_SIGN_IN_RETRY_MS } from "../client/src/usage-readings.js";
+import { contextView, loadSavedQuota, mayAskEngine, nextHeldQuota, poolCoversModel, quotaView, quotaViewEndsAt, savedQuotaAfter, saveQuota, shortTokens, usageTone, QUOTA_SHOWN_FOR_MS, QUOTA_SIGN_IN_RETRY_MS } from "../client/src/usage-readings.js";
 
 const now = Date.parse("2026-11-22T10:00:00Z");
 const iso = (minutes: number) => new Date(now + minutes * 60_000).toISOString();
@@ -160,5 +160,47 @@ describe("what the App holds and when it asks the engine", () => {
     expect(mayAskEngine(without("offline", { revision: "offline", state: "offline" }), undefined, undefined, now, 60_000)).toBe(false);
     expect(mayAskEngine({ ...without("no_passive_event"), capability: { mode: "passive" } }, undefined, undefined, now, 60_000)).toBe(false);
     expect(mayAskEngine({ ...without("mode_not_supported", { state: "unsupported" }), capability: { mode: "unsupported" } }, undefined, undefined, now, 60_000)).toBe(false);
+  });
+});
+
+describe("readings saved on the device", () => {
+  const reading = (id: string, minutes: number, extra: Partial<QuotaScope> = {}) => scope("codex", [{ label: "Codex", windows: [window("primary", 20)] }], { id, botIds: [id], observedAt: iso(minutes), ...extra });
+  it("round-trips the readings of one Host and keeps other Hosts' readings", () => {
+    const first = saveQuota(null, "host-a", new Map([["alpha", reading("alpha", -2)], ["beta", reading("beta", -10)]]), now);
+    const both = saveQuota(first, "host-b", new Map([["gamma", reading("gamma", -1)]]), now);
+    expect([...loadSavedQuota(both, "host-a", now).keys()]).toEqual(["alpha", "beta"]);
+    expect([...loadSavedQuota(both, "host-b", now).keys()]).toEqual(["gamma"]);
+    expect(quotaView(loadSavedQuota(both, "host-a", now).get("alpha"), "", now)).toMatchObject({ left: 80 });
+    // Replacing a Host's readings removes the ones it no longer holds.
+    expect([...loadSavedQuota(saveQuota(both, "host-a", new Map([["beta", reading("beta", -3)]]), now), "host-a", now).keys()]).toEqual(["beta"]);
+  });
+  it("keeps only readings young enough to be shown, when saving and when loading", () => {
+    const text = saveQuota(null, "host-a", new Map([["fresh", reading("fresh", -29)], ["old", reading("old", -31)], ["unknown", reading("unknown", -1, { state: "unknown" })], ["none", reading("none", -1, { observedAt: undefined })]]), now);
+    expect(Object.keys(JSON.parse(text)["host-a"])).toEqual(["fresh"]);
+    expect([...loadSavedQuota(text, "host-a", now + 2 * 60_000).keys()]).toEqual([]);
+    // Another Host's expired readings go when anything is saved.
+    expect(JSON.parse(saveQuota(text, "host-b", new Map(), now + 2 * 60_000))).toEqual({});
+  });
+  it("ignores anything it cannot read back as a reading of that Bot", () => {
+    for (const raw of [null, "", "{not json", "[]", "7", JSON.stringify({ "host-a": 7 }), JSON.stringify({ "host-a": { alpha: { id: "alpha" } } }), JSON.stringify({ "host-a": { alpha: reading("beta", -1) } }), JSON.stringify({ "host-a": { alpha: { ...reading("alpha", -1), extra: true } } })])
+      expect(loadSavedQuota(raw, "host-a", now).size).toBe(0);
+    expect(saveQuota("{not json", "host-a", new Map([["alpha", reading("alpha", -1)]]), now)).toContain("alpha");
+  });
+  it("holds no account identity, only the reading", () => {
+    const text = saveQuota(null, "host-a", new Map([["alpha", reading("alpha", -1)]]), now);
+    expect(Object.keys(JSON.parse(text)["host-a"].alpha).sort()).toEqual(["authMode", "availability", "botIds", "capability", "constraints", "engine", "id", "label", "observedAt", "pools", "revision", "sharing", "state"]);
+  });
+  it("shows a saved reading only after the Bot's worker confirms the same login", () => {
+    const earlier = reading("alpha", -3), plain = (extra: Partial<QuotaScope>): QuotaScope => ({ ...scope("codex", [], { id: "alpha", observedAt: undefined, state: "unknown" }), reason: "not_loaded", ...extra });
+    expect(savedQuotaAfter(earlier, plain({}))).toBe("adopt");
+    expect(savedQuotaAfter(earlier, reading("alpha", 0))).toBe("adopt");
+    // Another login: the saved number is about another account.
+    expect(savedQuotaAfter(earlier, plain({ revision: "other" }))).toBe("drop");
+    expect(savedQuotaAfter(earlier, reading("alpha", 0, { revision: "other" }))).toBe("drop");
+    // Only the Hub answered for a worker that is away: nothing is known yet, so nothing is shown yet.
+    for (const reason of ["offline", "timeout", "invalid_response", "host_upgrade_required"] as const) expect(savedQuotaAfter(earlier, plain({ reason, revision: reason, state: "unavailable" }))).toBe("wait");
+    // Adopted, it is then held like any reading; a newer answer replaces it.
+    expect(nextHeldQuota(earlier, plain({}))).toBe(earlier);
+    const newer = reading("alpha", 0); expect(nextHeldQuota(earlier, newer)).toBe(newer);
   });
 });

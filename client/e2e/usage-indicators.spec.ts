@@ -26,11 +26,13 @@ function quota(limits: Readings["limits"]): QuotaSnapshot {
       availability: "unknown" as const, observedAt: at, expiresAt, periodSeconds: item.period, resetsAt: new Date(now + item.resetHours * 3_600_000).toISOString() })) }] };
 }
 /** A Bot whose engine reports the given readings. Like a real engine it has no quota reading until it is asked once. */
-async function bot(hub: HubServer, root: string, id: string, engine: "codex" | "claude", readings?: { value: Readings; quota: boolean; asked: boolean[] }) {
+async function bot(hub: HubServer, root: string, id: string, engine: "codex" | "claude", readings?: { value: Readings; quota: boolean; asked: boolean[]; forget?: () => void }) {
   const stateDir = path.join(root, id), secret = randomBytes(32).toString("base64url"); await mkdir(stateDir, { recursive: true });
   await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine, model: engine === "codex" ? "gpt-6.1-sol" : "opus", effort: "high", locale: "zh" }));
   await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES(?,?,?)", [id, id, hashSecret(secret)]);
   let loaded = false;
+  // As after a restart of the Bot's worker: the Host holds no reading until the engine is asked again.
+  if (readings) readings.forget = () => { loaded = false; };
   const bridge: CoreBridgeLike = { handleAuthorizedMessage: async () => ({ text: "好的" }),
     ...(readings ? { getContextUsage: async () => readings.value.context ? { pressureTokens: readings.value.context.used, contextWindow: readings.value.context.window, autoCompactTokens: readings.value.context.compact } : null } : {}),
     ...(readings?.quota ? { readAccountQuota: async (options: { refresh: boolean }) => { readings.asked.push(options.refresh); if (options.refresh) loaded = true; return { revision: "revision_one", snapshot: loaded ? quota(readings.value.limits) : unavailableQuota("codex", "not_loaded") }; } } : {}) };
@@ -46,7 +48,7 @@ async function fixture(page: Page) {
   const root = await mkdtemp(path.join(os.tmpdir(), "usage-indicators-"));
   const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: path.resolve("dist") });
   await hub.profile.update({ name: "测试主机", revision: (await hub.profile.read()).revision });
-  const readings = { value: plenty(), quota: true, asked: [] as boolean[] };
+  const readings: { value: Readings; quota: boolean; asked: boolean[]; forget?: () => void } = { value: plenty(), quota: true, asked: [] };
   const gateways = [await bot(hub, root, "alpha", "codex", readings), await bot(hub, root, "beta", "claude"), await bot(hub, root, "gamma", "codex", { value: plenty(), quota: false, asked: [] })];
   const both = await hub.store.createConversation("owner", ["alpha"], "有读数", "both");
   await hub.store.createConversation("owner", ["beta"], "读不到", "none");
@@ -132,6 +134,14 @@ test("desktop: ring and battery sit left of the model controls, each only when r
     await expect(ring).toHaveText("50%"); await expect(battery).toHaveText("80%");
     // The engine itself was asked once; every later number came from what the Host already held.
     expect(f.readings.asked.filter(Boolean)).toHaveLength(1);
+
+    // The App restarts and the Host holds nothing any more: the reading saved on this device is shown once the
+    // Bot's worker has answered that the login is the same, and the engine is not asked for it.
+    f.readings.forget!();
+    await page.reload(); await waitForClientOnline(page); await selectConversation(page, "有读数");
+    await expect(battery).toHaveText("80%");
+    expect(f.readings.asked.filter(Boolean)).toHaveLength(1);
+    expect(Object.keys(JSON.parse(await page.evaluate(() => localStorage.getItem("tarobird.quotaReadings.v1") ?? "{}")))).toHaveLength(1);
   } finally { await f.dispose(); }
 });
 

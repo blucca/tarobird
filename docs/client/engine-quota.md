@@ -135,9 +135,17 @@ reading is five minutes old, or one minute when the details are opened; in
 between, the App shows what the Host holds. A read that failed is not repeated
 before the same time has passed, and after "sign in first" the engine is left
 alone for thirty minutes or until the login changes. The last reading of a Bot
-is kept in memory only and shown for thirty minutes at most; an older answer
-never replaces a newer one, and a Hub reply for a worker that did not answer
-changes nothing.
+is shown for thirty minutes at most; an older answer never replaces a newer
+one, and a Hub reply for a worker that did not answer changes nothing.
+
+**Saved on the device.** The last reading per Host and Bot is also saved in
+the App's local storage (`tarobird.quotaReadings.v1`), so the battery is there
+when the App starts again within those thirty minutes. A saved reading is not
+shown by itself: it waits until the Bot's worker has answered, and is shown
+only if that answer carries the same revision (the same login state); another
+revision discards it, and a Hub reply for an absent worker leaves it waiting.
+It holds percentages, reset times and pool names, no account identity, and is
+dropped once it is too old to show.
 
 **What a reading may start.** Nothing for context. For quota, only the readers
 that already existed: Codex's temporary helper when its app-server is not

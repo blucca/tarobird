@@ -1,5 +1,5 @@
 import type { ContextUsage } from "../../src/client-protocol/context-usage.js";
-import type { QuotaConstraint, QuotaScope } from "../../src/client-protocol/engine-quota.js";
+import { quotaScopeSchema, type QuotaConstraint, type QuotaScope } from "../../src/client-protocol/engine-quota.js";
 
 /** How long the last quota reading stays on screen. An older one counts as not readable:
  * the symbol disappears instead of showing a number nobody has confirmed since. */
@@ -81,6 +81,40 @@ export function nextHeldQuota(previous: QuotaScope | undefined, scope: QuotaScop
   // Another login, or a login without quota: the earlier number is not about it.
   return previous && (previous.revision !== scope.revision || ["auth_changed", "login_required", "mode_not_supported", "not_adapted"].includes(scope.reason ?? "")) ? undefined : previous;
 }
+/** Readings saved on this device, so a Bot's battery is there when the App starts again within the time a
+ * reading is shown. Only percentages, reset times and pool names are in a reading; no account identity is. */
+export const SAVED_QUOTA_KEY = "tarobird.quotaReadings.v1";
+const SAVED_HOSTS = 16, SAVED_BOTS = 64;
+const savedHosts = (raw: string | null): Record<string, Record<string, unknown>> => {
+  try { const value: unknown = raw ? JSON.parse(raw) : undefined; return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, Record<string, unknown>> : {}; }
+  catch { return {}; }
+};
+const worthSaving = (scope: QuotaScope, now: number) => !!scope.observedAt && (scope.state === "ready" || scope.state === "stale") && now - Date.parse(scope.observedAt) < QUOTA_SHOWN_FOR_MS;
+/** The saved readings of one Host that are still young enough to show. Anything unreadable is left out. */
+export function loadSavedQuota(raw: string | null, hostKey: string, now: number): Map<string, QuotaScope> {
+  const found = new Map<string, QuotaScope>(), host = savedHosts(raw)[hostKey];
+  if (host && typeof host === "object") for (const [botId, value] of Object.entries(host).slice(0, SAVED_BOTS)) {
+    const scope = quotaScopeSchema.safeParse(value);
+    if (scope.success && scope.data.id === botId && worthSaving(scope.data, now)) found.set(botId, scope.data);
+  }
+  return found;
+}
+/** The stored text after this Host's readings are replaced. Readings too old to show are dropped for every Host. */
+export function saveQuota(raw: string | null, hostKey: string, readings: ReadonlyMap<string, QuotaScope>, now: number): string {
+  const hosts: Record<string, Record<string, QuotaScope>> = {};
+  for (const key of [hostKey, ...Object.keys(savedHosts(raw)).filter(key => key !== hostKey)].slice(0, SAVED_HOSTS)) {
+    const kept = Object.fromEntries([...(key === hostKey ? readings : loadSavedQuota(raw, key, now))].filter(([, scope]) => worthSaving(scope, now)).slice(0, SAVED_BOTS));
+    if (Object.keys(kept).length) hosts[key] = kept;
+  }
+  return JSON.stringify(hosts);
+}
+/** What becomes of a saved reading once its Host has answered for that Bot. It is shown only after the Bot's
+ * worker says it is still the same login ("adopt"); another login discards it ("drop"); while only the Hub
+ * answers for a worker that is away, it keeps waiting ("wait"). */
+export function savedQuotaAfter(saved: QuotaScope, scope: QuotaScope): "adopt" | "drop" | "wait" {
+  return !workerAnswered(scope) ? "wait" : saved.revision === scope.revision ? "adopt" : "drop";
+}
+
 /** After "sign in first" the engine is left alone this long: asking again can open a browser sign-in. */
 export const QUOTA_SIGN_IN_RETRY_MS = 30 * 60_000;
 export type QuotaAttempt = { revision: string; at: number; signIn: boolean };
