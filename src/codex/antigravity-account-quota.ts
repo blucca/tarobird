@@ -1,5 +1,5 @@
 import { StringDecoder } from "node:string_decoder";
-import type { QuotaReason } from "../client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_REFRESH_MS, type QuotaReason } from "../client-protocol/engine-quota.js";
 import {
   isAntigravityQuotaSupportedVersion,
   parseAntigravityQuota,
@@ -247,7 +247,7 @@ export async function readOwnedAntigravityQuota(input: {
   if (owned.get(input.cache)?.size) return input.cache.failure(input.scope, "timeout");
   if (input.options.signal?.aborted) return input.cache.failure(input.scope, "cancelled");
   const now = input.now ?? Date.now;
-  const timeoutMs = Math.max(1, Math.min(7000, input.options.timeoutMs ?? 7000));
+  const timeoutMs = Math.max(1, Math.min(ENGINE_QUOTA_REFRESH_MS, input.options.timeoutMs ?? ENGINE_QUOTA_REFRESH_MS));
   const abort = new AbortController();
   let timedOut = false;
   let closedResolve!: () => void;

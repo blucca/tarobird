@@ -1,6 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { gatewayEngineQuota } from "../src/gateway/engine-quota.js";
-import { quotaReadingExpired } from "../src/client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_REFRESH_MS, quotaReadingExpired } from "../src/client-protocol/engine-quota.js";
 import { unavailableQuota } from "../src/codex/account-quota.js";
 import type { EngineQuotaReadResult } from "../src/codex/adapter.js";
 
@@ -17,6 +17,15 @@ it("reads cached native quotas without refreshing and omits private account proo
   expect(read).toHaveBeenCalledOnce(); expect(read.mock.calls[0]?.[0]).toMatchObject({ refresh: false });
   expect(result.value).toMatchObject({ botIds: ["bot"], sharing: "unverified", revision: "one" });
   expect(JSON.stringify(result)).not.toContain("private");
+});
+
+it("gives an explicit refresh the shared time limit and a plain read a short one", async () => {
+  const read = vi.fn(async () => ({ revision: "one", snapshot: snapshot() }));
+  const run = gatewayEngineQuota({ botId: "bot", engine: "antigravity", read, now: () => 2000 });
+  await run({ scopeId: "bot", expectedRevision: "one", refresh: true });
+  expect(ENGINE_QUOTA_REFRESH_MS).toBe(15_000);
+  expect(read.mock.calls.map(call => (call as unknown as [{ refresh: boolean; timeoutMs: number }])[0]).map(options => [options.refresh, options.timeoutMs]))
+    .toEqual([[false, 1_500], [true, ENGINE_QUOTA_REFRESH_MS]]);
 });
 
 it("coalesces explicit refresh and does not repeat it within the cooldown", async () => {

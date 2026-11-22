@@ -2,6 +2,10 @@ import { z } from "zod";
 
 export const ENGINE_QUOTA_CAPABILITY = "engines.quota.v1";
 export const ENGINE_QUOTA_TTL_MS = 60_000;
+/** How long one explicit refresh may take inside an engine. Antigravity's `agy -p /usage` took 4 to 8 seconds
+ * when measured (2026-11-22); Codex and Claude Code keep their own shorter limits. The Gateway and the Hub wait
+ * a little longer than this, so the engine's own answer ("timeout" included) is the one that comes back. */
+export const ENGINE_QUOTA_REFRESH_MS = 15_000;
 const identifier = z.string().min(1).max(128).regex(/^[a-zA-Z0-9_.:-]+$/);
 const label = z.string().min(1).max(120).refine(value => !/[\x00-\x1f\x7f]/.test(value));
 const timestamp = z.string().datetime({ offset: true });

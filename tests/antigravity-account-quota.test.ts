@@ -240,6 +240,32 @@ describe("ProcessAntigravityAdapter account quota", () => {
     expect(spawn).toHaveBeenCalledTimes(2);
   });
 
+  it("waits for an answer that takes nine seconds, and gives up on one that never comes", async () => {
+    // Measured on the owner's machine on 2026-11-22: six reads in a row took 4.0 to 8.0 seconds.
+    const f = await agyFixture();
+    let answerAfterMs: number | undefined = 9_000;
+    const spawn = vi.fn((_cmd: string, args: string[]) => {
+      const child = new MockChild();
+      if (args.includes("--version")) child.finish(0, "1.5.14\n");
+      else if (answerAfterMs !== undefined) setTimeout(() => child.finish(0, JSON.stringify(currentUsagePayload())), answerAfterMs);
+      return child;
+    });
+    const adapter = new ProcessAntigravityAdapter("agy", f.env, spawn as any, undefined, undefined, f.root, undefined, undefined, 0, 0);
+    disposals.push(() => adapter.destroy());
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const slow = adapter.getAccountQuota({ refresh: true });
+      await vi.advanceTimersByTimeAsync(9_100);
+      expect((await slow).snapshot).toMatchObject({ state: "ready" });
+
+      answerAfterMs = undefined;
+      const silent = adapter.getAccountQuota({ refresh: true });
+      await vi.advanceTimersByTimeAsync(20_000);
+      // The earlier reading stays, marked as old, with the reason of the failed attempt.
+      expect((await silent).snapshot).toMatchObject({ state: "stale", reason: "timeout" });
+    } finally { vi.useRealTimers(); }
+  });
+
   it("refuses to call /usage when agy version is below 1.1.11 and keeps antigravity_usage hint", async () => {
     const f = await agyFixture();
     const calls: string[][] = [];

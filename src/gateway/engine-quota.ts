@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { nativeQuotaRequestSchema, nativeQuotaReplySchema, quotaReadingExpired, quotaSnapshotSchema, type QuotaEngine, type QuotaSnapshot } from "../client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_REFRESH_MS, nativeQuotaRequestSchema, nativeQuotaReplySchema, quotaReadingExpired, quotaSnapshotSchema, type QuotaEngine, type QuotaSnapshot } from "../client-protocol/engine-quota.js";
 import { unavailableQuota } from "../codex/account-quota.js";
 import type { EngineQuotaReadResult, EngineQuotaReadOptions } from "../codex/adapter.js";
 
@@ -17,10 +17,10 @@ export function gatewayEngineQuota(options: {
   let nextRefreshAt = 0;
   const read = async (refresh: boolean, expectedRevision?: string): Promise<EngineQuotaReadResult> => {
     if (!options.read) return { revision: unsupportedRevision, snapshot: unavailableQuota(options.engine, "not_adapted", now()) };
-    const signal = AbortSignal.timeout(refresh ? 7_500 : 2_000);
+    const signal = AbortSignal.timeout(refresh ? ENGINE_QUOTA_REFRESH_MS + 500 : 2_000);
     // A cancelled read must not stop a chatting worker. Native adapters own
     // their helpers and are responsible for observing this deadline.
-    return await options.read({ refresh, ...(expectedRevision ? { expectedRevision } : {}), signal, timeoutMs: refresh ? 7_000 : 1_500 })
+    return await options.read({ refresh, ...(expectedRevision ? { expectedRevision } : {}), signal, timeoutMs: refresh ? ENGINE_QUOTA_REFRESH_MS : 1_500 })
       ?? { revision: unsupportedRevision, snapshot: unavailableQuota(options.engine, "not_adapted", now()) };
   };
   return async (raw: unknown) => {

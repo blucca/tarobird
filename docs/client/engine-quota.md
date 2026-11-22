@@ -193,6 +193,12 @@ Checked on 2026-11-22 for the symbols:
 - The repository's Antigravity reader against a real signed-in agy 1.5.14
   through the ACP adapter and the Gateway: three groups with their model
   lists, about five seconds for the two processes.
+- Later the same day, in the installed App, a new Antigravity Bot on the ACP
+  runtime answered "timeout" twice. The runtime was not the cause: six `agy -p
+  /usage` reads in a row took 4.0 to 8.0 s, and the reader gave up after 7 s.
+  An explicit refresh may now take 15 s inside the reader
+  (`ENGINE_QUOTA_REFRESH_MS`); the Gateway and the Hub wait slightly longer.
+  Codex and Claude Code keep their 7 s limits.
 
 Not checked: Codex context figures against a real session, and any of this in
 an installed App on a device. The probe above showed that Claude Code answers
