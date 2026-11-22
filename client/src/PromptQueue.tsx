@@ -99,8 +99,10 @@ export function useSteeringCapability(connection: HubConnection, conversationId:
   return status === "online" && active && supported?.scope === scope ? { supported: supported.value, sendBehavior: supported.sendBehavior, nativeInput: supported.nativeInput, targetId: supported.targetId, idle: supported.idle } : { supported: false };
 }
 
-export function PromptQueue({ connection, conversationId, botId, phone, active, available, online, cacheRevision, locate }: {
+export function PromptQueue({ connection, conversationId, botId, phone, active, available, online, cacheRevision, messageCount, locate }: {
   connection: HubConnection; conversationId: string; botId: string; phone: boolean; active: boolean; available: boolean; online: boolean; cacheRevision: number;
+  /** How many messages the conversation shows: it changes when one arrives or leaves, which is when the queue changes. */
+  messageCount: number;
   locate: (conversationId: string, messageId: string) => void;
 }) {
   useLocale();
@@ -116,7 +118,9 @@ export function PromptQueue({ connection, conversationId, botId, phone, active, 
   const applySnapshot = (next: PromptQueueSnapshot) => { beforeQueueSnapshot.current?.(next.items.filter(item => item.state === "queued").map(item => item.message.id)); setSnapshot(next); };
   const trigger = useRef<HTMLButtonElement>(null), busyRef = useRef(false), scope = useRef(new AbortController());
   const readRequest = useRef<AbortController | undefined>(undefined), readVersion = useRef(0), readAgain = useRef(false);
-  const observedCacheRevision = useRef(cacheRevision);
+  const observedCacheRevision = useRef(cacheRevision), latestCacheRevision = useRef(cacheRevision), observedMessageCount = useRef(messageCount);
+  latestCacheRevision.current = cacheRevision;
+  const changeRead = useRef<{ timer?: ReturnType<typeof setTimeout>; due: number; readAt: number }>({ due: 0, readAt: 0 });
   const route = `/api/conversations/${encodeURIComponent(conversationId)}/queue`;
   const setEdit = (next: Edit | undefined) => { local.edit = next; setEditState(next); };
   const setPending = (next: Mutation | undefined) => { local.pending = next; setPendingState(next); };
@@ -156,14 +160,28 @@ export function PromptQueue({ connection, conversationId, botId, phone, active, 
     if (local.pending) setError("");
     if (!active) setOpen(false);
     void load();
-    const timer = active && available && online ? setInterval(() => void load(), 2000) : undefined;
-    return () => { scope.current.abort(); readRequest.current?.abort(); clearInterval(timer); };
+    return () => { scope.current.abort(); readRequest.current?.abort(); clearTimeout(changeRead.current.timer); changeRead.current.timer = undefined; };
   }, [load]);
+  // The timer is for what happens to a waiting entry without a new message: the Bot takes it, or another
+  // device moves it. An empty queue can only gain an entry through a message, and that is read below, so
+  // an idle conversation asks the Host nothing. Until a first reading exists the timer also retries.
+  const timed = !snapshot || snapshot.items.length > 0;
   useEffect(() => {
-    if (!active || !online || !available || observedCacheRevision.current === cacheRevision) return;
-    const timer = setTimeout(() => { observedCacheRevision.current = cacheRevision; void load(false, true); }, 150);
-    return () => clearTimeout(timer);
-  }, [cacheRevision, active, online, available, load]);
+    if (!active || !available || !online || !timed) return;
+    const timer = setInterval(() => void load(), 2000);
+    return () => clearInterval(timer);
+  }, [load, active, available, online, timed]);
+  useEffect(() => {
+    const counted = observedMessageCount.current !== messageCount; observedMessageCount.current = messageCount;
+    if (!active || !online || !available || observedCacheRevision.current === cacheRevision && !counted) return;
+    // A message arriving or leaving is read at once. The other changes of a conversation come several times
+    // a second while a reply streams and seldom concern the queue: for those one read a second is enough.
+    const pending = changeRead.current, now = performance.now();
+    const due = counted ? now + 150 : Math.max(now + 150, pending.readAt + 1000);
+    if (pending.timer !== undefined && pending.due <= due) return;   // an earlier read is due and will see this change too
+    clearTimeout(pending.timer); pending.due = due;
+    pending.timer = setTimeout(() => { pending.timer = undefined; pending.readAt = performance.now(); observedCacheRevision.current = latestCacheRevision.current; void load(false, true); }, due - now);
+  }, [cacheRevision, messageCount, active, online, available, load]);
 
   const execute = async (operation: Mutation) => {
     if (!active || !online || !available || busyRef.current || connection.state.status !== "online") return;
