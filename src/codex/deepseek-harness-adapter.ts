@@ -615,12 +615,11 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
 
   async getContextUsage(
     sessionId: string,
-    _input: { workspaceOverride?: string } = {},
+    input: { workspaceOverride?: string; passive?: boolean } = {},
   ): Promise<EngineContextUsage | null> {
-    await this.ensureOperational();
-    await this.ensureGoalStateLoaded();
-    const values = await this.readProtectedGoalValues(sessionId);
-    await this.reconcileGoalState(sessionId, { throwOnPauseFailure: true });
+    // A reading for display uses only the values this adapter already holds for the session: the harness
+    // is not started or asked, and no goal is reconciled (that can pause or stop one).
+    const values = input.passive ? this.projectionValues.get(sessionId) ?? {} : await this.readContextValues(sessionId);
     const pressure = asRecord(values.contextPressure);
     if (!pressure) {
       return null;
@@ -634,6 +633,14 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       ...(contextWindow !== undefined ? { contextWindow } : {}),
     };
     return Object.keys(result).length > 0 ? result : null;
+  }
+
+  private async readContextValues(sessionId: string): Promise<Record<string, unknown>> {
+    await this.ensureOperational();
+    await this.ensureGoalStateLoaded();
+    const values = await this.readProtectedGoalValues(sessionId);
+    await this.reconcileGoalState(sessionId, { throwOnPauseFailure: true });
+    return values;
   }
 
   async getThreadGoal(

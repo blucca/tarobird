@@ -1,7 +1,7 @@
-import { useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { DesktopMenu, DesktopMenuPortalContext } from "./DesktopMenu.js";
 import { t, useLocale, type Locale } from "./i18n.js";
-import { shortTokens, usageTone, type ContextView, type QuotaView, type QuotaWindowView } from "./usage-readings.js";
+import { shortTokens, usageTone, type ContextView, type QuotaBlock, type QuotaView, type QuotaWindowView } from "./usage-readings.js";
 import "./usage-indicators.css";
 
 /** Context: a ring whose drawn part is what is left of the window. */
@@ -33,6 +33,15 @@ function clock(value: string, locale: Locale, now = new Date()): string {
   const time: Intl.DateTimeFormatOptions = locale === "zh" ? { hour: "2-digit", minute: "2-digit", hour12: false } : { hour: "numeric", minute: "2-digit" };
   return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en", sameDay ? time : { month: locale === "zh" ? "long" : "short", day: "numeric", ...time }).format(date);
 }
+// The same wording as the quota page uses for these engine limits.
+function blockText(code: QuotaBlock): string {
+  switch (code) {
+    case "ordinary_usage_blocked": return t("常规使用受限");
+    case "spend_control": return t("已触发原生消费限制");
+    case "credits_depleted": return t("原生 credits 已耗尽");
+    default: return t("存在其他原生限制");
+  }
+}
 function Bar({ left, label }: { left: number; label: string }) {
   return <div className="usage-bar" role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={left}><i data-tone={usageTone(left)} style={{ width: `${left}%` }}/></div>;
 }
@@ -58,6 +67,10 @@ export function UsageDetails({ context, quota }: { context?: ContextView; quota?
         </div>)}
       </section>;
     })}
+    {quota && quota.blocked.length > 0 && <section aria-label={t("额度")}>
+      {!quota.windows.length && <h4><QuotaBattery left={0} height={13}/>{t("额度")}</h4>}
+      {quota.blocked.map(code => <p className="usage-note usage-blocked" role="status" key={code}>{blockText(code)}</p>)}
+    </section>}
     {quota && <p className="usage-note usage-read-at">{t("{0} 读取", clock(quota.observedAt, locale))}</p>}
   </div>;
 }
@@ -66,7 +79,10 @@ export function UsageDetails({ context, quota }: { context?: ContextView; quota?
 export function UsageIndicators({ context, quota, onOpen }: { context?: ContextView; quota?: QuotaView; onOpen?: () => void }) {
   useLocale();
   const [open, setOpen] = useState(false), trigger = useRef<HTMLButtonElement>(null), id = useId();
-  if (!context && !quota) return null;
+  const shown = !!context || !!quota;
+  // Details that lost both readings are closed for good; they do not come back by themselves with the next reading.
+  useEffect(() => { if (!shown) setOpen(false); }, [shown]);
+  if (!shown) return null;
   const label = [context && t("上下文可用 {0}%", context.left), quota && t("额度可用 {0}%", quota.left)].filter(Boolean).join(t("，"));
   return <>
     <button ref={trigger} type="button" className="usage-indicators" aria-label={label} title={label} aria-expanded={open} aria-controls={open ? id : undefined}

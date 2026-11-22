@@ -135,6 +135,22 @@ test("desktop: ring and battery sit left of the model controls, each only when r
   } finally { await f.dispose(); }
 });
 
+test("quota is never requested for a user who is not the owner", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    await f.hub.store.db.run("UPDATE users SET role='member' WHERE id='owner'");
+    const seen = requests(page);
+    await page.reload(); await waitForClientOnline(page);
+    // A member has no Bot directory in this App, so the conversation that opens has no Bot to read for.
+    await expect(workspace(page).locator(".composer textarea")).toBeVisible();
+    await page.getByLabel("消息", { exact: true }).fill("成员发一条"); await page.getByLabel("消息", { exact: true }).press("Enter");
+    await expect(workspace(page).locator(".message-blocks").filter({ hasText: "好的" })).toHaveCount(1);
+    await expect(page.locator(".usage-indicators")).toHaveCount(0);
+    expect(seen.filter(url => url.includes("/api/engine-quotas"))).toEqual([]);
+    expect(f.readings.asked).toEqual([]);
+  } finally { await f.dispose(); }
+});
+
 test("ADHD panes show no symbols and ask for no readings", async ({ page }) => {
   const f = await fixture(page);
   try {

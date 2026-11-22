@@ -1,5 +1,5 @@
 import type { ContextUsage } from "../../src/client-protocol/context-usage.js";
-import type { QuotaScope } from "../../src/client-protocol/engine-quota.js";
+import type { QuotaConstraint, QuotaScope } from "../../src/client-protocol/engine-quota.js";
 
 /** How long the last quota reading stays on screen. An older one counts as not readable:
  * the symbol disappears instead of showing a number nobody has confirmed since. */
@@ -32,20 +32,29 @@ const CLAUDE_MODEL_WINDOWS: Record<string, string> = { seven_day_opus: "opus", s
 const CLAUDE_EXTRA_WINDOWS = new Set(["seven_day_overage_included", "overage"]);
 
 export type QuotaWindowView = { id: string; pool: string; label: string; periodSeconds?: number; left: number; resetsAt?: string };
-export type QuotaView = { left: number; windows: QuotaWindowView[]; observedAt: string };
+/** Engine limits that refuse ordinary use whatever the windows say. Disabled extra usage is not one of them. */
+export type QuotaBlock = Exclude<QuotaConstraint["code"], "overage_disabled">;
+export type QuotaView = { left: number; windows: QuotaWindowView[]; blocked: QuotaBlock[]; observedAt: string };
 /** The quota that counts for a Bot on `model`: the windows of the pools that cover that model, and
  * the tightest of them. A pool that names models counts only for a Bot on one of them, so one
  * exhausted model group does not alarm every Bot of the account; when the Bot's group cannot be
- * told, nothing is shown. A window past its reset time is left out: its number is no longer true. */
+ * told, nothing is shown. A window past its reset time is left out: its number is no longer true.
+ * When the engine reports that ordinary use is refused, nothing is left whatever the windows say. */
 export function quotaView(scope: QuotaScope | undefined, model: string, now: number): QuotaView | undefined {
   if (!scope?.observedAt || scope.state !== "ready" && scope.state !== "stale") return undefined;
   const age = now - Date.parse(scope.observedAt);
   if (!(age < QUOTA_SHOWN_FOR_MS)) return undefined;
-  const windows: QuotaWindowView[] = [];
   // Claude names a model family ("Fable"), which a Bot's model id contains; other engines name whole models.
   const covers = (models: readonly string[]) => scope.engine === "claude" ? models.some(name => plain(name) !== "" && plain(model).includes(plain(name))) : poolCoversModel(models, model);
+  const windows: QuotaWindowView[] = [], blocks = (constraints: readonly QuotaConstraint[]) => constraints.flatMap(item =>
+    item.availability === "blocked" && item.code !== "overage_disabled" && !(item.resetsAt && Date.parse(item.resetsAt) <= now) ? [item.code] : []);
+  const blocked = new Set<QuotaBlock>(blocks(scope.constraints));
+  let counted = 0;
   for (const pool of scope.pools) {
-    if (pool.models?.length && !covers(pool.models)) continue;
+    // Every Antigravity group is for certain models. One that names none (an older Host) cannot be attributed.
+    if (pool.models?.length ? !covers(pool.models) : scope.engine === "antigravity") continue;
+    counted++;
+    for (const code of blocks(pool.constraints)) blocked.add(code);
     for (const window of pool.windows) {
       if (window.metric !== "percent" || window.resetsAt && Date.parse(window.resetsAt) <= now) continue;
       if (scope.engine === "claude") {
@@ -55,7 +64,33 @@ export function quotaView(scope: QuotaScope | undefined, model: string, now: num
       windows.push({ id: `${pool.id}:${window.id}`, pool: pool.label, label: window.label, left: percent(100 - window.usedPercent), ...(window.periodSeconds ? { periodSeconds: window.periodSeconds } : {}), ...(window.resetsAt ? { resetsAt: window.resetsAt } : {}) });
     }
   }
-  return windows.length ? { left: Math.min(...windows.map(window => window.left)), windows, observedAt: scope.observedAt } : undefined;
+  // An account-wide block counts only where some pool of the reading counts for this Bot.
+  if (!windows.length && !(blocked.size && (counted || !scope.pools.length))) return undefined;
+  return { left: blocked.size ? 0 : Math.min(...windows.map(window => window.left)), windows, blocked: [...blocked], observedAt: scope.observedAt };
+}
+
+/** Replies the Hub makes up when a worker did not answer in time or is away; they say nothing about the account. */
+const NO_ANSWER = new Set(["offline", "timeout", "invalid_response", "host_upgrade_required"]);
+const workerAnswered = (scope: QuotaScope) => !(scope.reason !== undefined && scope.revision === scope.reason && NO_ANSWER.has(scope.reason));
+/** What the App holds for a Bot after a reply from its Host. */
+export function nextHeldQuota(previous: QuotaScope | undefined, scope: QuotaScope): QuotaScope | undefined {
+  if (!workerAnswered(scope)) return previous;
+  // A reading replaces the held one unless it is the same login's older answer: another process of the Bot
+  // may still hold an earlier one.
+  if (scope.observedAt) return previous?.revision === scope.revision && previous.observedAt && previous.observedAt > scope.observedAt ? previous : scope;
+  // Another login, or a login without quota: the earlier number is not about it.
+  return previous && (previous.revision !== scope.revision || ["auth_changed", "login_required", "mode_not_supported", "not_adapted"].includes(scope.reason ?? "")) ? undefined : previous;
+}
+/** After "sign in first" the engine is left alone this long: asking again can open a browser sign-in. */
+export const QUOTA_SIGN_IN_RETRY_MS = 30 * 60_000;
+export type QuotaAttempt = { revision: string; at: number; signIn: boolean };
+/** Whether the engine itself may be asked now: not while the held reading is newer than `olderThan`, and not
+ * sooner than that after the last attempt for this login, so a failing read is not repeated each time a
+ * conversation opens. */
+export function mayAskEngine(scope: QuotaScope, held: QuotaScope | undefined, attempt: QuotaAttempt | undefined, now: number, olderThan: number): boolean {
+  if (!workerAnswered(scope) || scope.capability.mode !== "active" || scope.state === "login_required") return false;
+  if (held?.observedAt && held.revision === scope.revision && now - Date.parse(held.observedAt) < olderThan) return false;
+  return !(attempt && attempt.revision === scope.revision && now - attempt.at < (attempt.signIn ? Math.max(olderThan, QUOTA_SIGN_IN_RETRY_MS) : olderThan));
 }
 
 /** When a shown reading stops counting (its age limit or its next reset), so the view can drop it then. */

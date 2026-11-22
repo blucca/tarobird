@@ -320,6 +320,7 @@ export class Bridge {
     messageThreadId?: number;
     conversationKey?: string;
     workspaceOverride?: string;
+    passive?: boolean;
   }): Promise<EngineContextUsage | null> {
     if (!this.adapter.getContextUsage) {
       throw new Error("Context usage is not available for this runtime");
@@ -332,6 +333,7 @@ export class Bridge {
       return null;
     }
     return await this.adapter.getContextUsage(session.sessionId, {
+      ...(input.passive ? { passive: true } : {}),
       workspaceOverride: input.workspaceOverride,
     });
   }

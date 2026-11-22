@@ -3789,6 +3789,19 @@ describe("DeepSeekHarnessAdapter", () => {
     });
   });
 
+  it("answers a passive context reading from what it already holds, without asking the harness or touching a goal", async () => {
+    const { adapter, gateway } = createAdapter();
+    const { sessionId } = await adapter.createSession(17);
+    await expect(adapter.getContextUsage("never-seen", { passive: true })).resolves.toBeNull();
+    await gateway.emitProjection(sessionId, "contextPressure", { pressureTokens: 20_000, projectedTokens: 21_000, contextWindow: 131_072 }, 10);
+    gateway.responses.set("session.history", new Error("a passive reading must not ask"));
+    const calls = gateway.calls.length;
+    await expect(adapter.getContextUsage(sessionId, { passive: true })).resolves.toEqual({ pressureTokens: 20_000, projectedTokens: 21_000, contextWindow: 131_072 });
+    expect(gateway.calls).toHaveLength(calls);
+    // The explicit /context read still asks, as before.
+    await expect(adapter.getContextUsage(sessionId)).rejects.toThrow("a passive reading must not ask");
+  });
+
   it("releases a goal event callback that never settles when the watcher is aborted", async () => {
     const { adapter, gateway } = createAdapter();
     const { sessionId } = await adapter.createSession(16);

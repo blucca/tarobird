@@ -573,9 +573,11 @@ export interface CodexAdapter {
     input?: { workspaceOverride?: string },
   ): Promise<ExternalSessionInfo | void>;
   listExternalSessions?(input?: { cwd?: string; limit?: number }): Promise<ExternalSessionInfo[]>;
+  /** `passive`: a reading for display. Only what a running engine or this adapter already has is reported;
+   * nothing is started, resumed, reconciled or marked as used, and null is the answer otherwise. */
   getContextUsage?(
     sessionId: string,
-    input?: { workspaceOverride?: string },
+    input?: { workspaceOverride?: string; passive?: boolean },
   ): Promise<EngineContextUsage | null>;
   getThreadGoal?(sessionId: string, input?: { workspaceOverride?: string }): Promise<CodexThreadGoalResponse>;
   setThreadGoal?(sessionId: string, input: {

@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { QuotaScope, QuotaWindow } from "../src/client-protocol/engine-quota.js";
-import { contextView, poolCoversModel, quotaView, quotaViewEndsAt, shortTokens, usageTone, QUOTA_SHOWN_FOR_MS } from "../client/src/usage-readings.js";
+import { contextView, mayAskEngine, nextHeldQuota, poolCoversModel, quotaView, quotaViewEndsAt, shortTokens, usageTone, QUOTA_SHOWN_FOR_MS, QUOTA_SIGN_IN_RETRY_MS } from "../client/src/usage-readings.js";
 
 const now = Date.parse("2026-11-22T10:00:00Z");
 const iso = (minutes: number) => new Date(now + minutes * 60_000).toISOString();
 const window = (id: string, usedPercent: number, extra: Partial<QuotaWindow> = {}): QuotaWindow =>
   ({ id, label: id, metric: "percent", usedPercent, availability: "unknown", observedAt: iso(-1), expiresAt: iso(0), resetsAt: iso(120), ...extra }) as QuotaWindow;
-const scope = (engine: QuotaScope["engine"], pools: Array<{ label: string; models?: string[]; windows: QuotaWindow[] }>, extra: Partial<QuotaScope> = {}): QuotaScope => ({
+const scope = (engine: QuotaScope["engine"], pools: Array<{ label: string; models?: string[]; windows: QuotaWindow[]; constraints?: QuotaScope["constraints"] }>, extra: Partial<QuotaScope> = {}): QuotaScope => ({
   id: "bot", revision: "r", engine, label: engine, botIds: ["bot"], sharing: "unverified", authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "unknown",
-  observedAt: iso(-1), constraints: [], pools: pools.map((pool, index) => ({ id: `p${index}`, label: pool.label, ...(pool.models ? { models: pool.models } : {}), sharing: pool.models ? "model" : "shared", availability: "unknown", windows: pool.windows, balances: [], constraints: [] })), ...extra });
+  observedAt: iso(-1), constraints: [], pools: pools.map((pool, index) => ({ id: `p${index}`, label: pool.label, ...(pool.models ? { models: pool.models } : {}), sharing: pool.models ? "model" : "shared", availability: "unknown", windows: pool.windows, balances: [], constraints: pool.constraints ?? [] })), ...extra });
 
 describe("context left", () => {
   it("is the share of the window not in use, with the engine's compaction point", () => {
@@ -75,6 +75,25 @@ describe("quota left for one Bot", () => {
     expect(quotaView(scope("codex", pools, { observedAt: undefined }), "", now)).toBeUndefined();
     expect(quotaView(undefined, "", now)).toBeUndefined();
   });
+  it("does not count an Antigravity group that names no models (an older Host), instead of alarming every Bot", () => {
+    const old = scope("antigravity", [{ label: "Gemini Models", windows: [window("gemini-weekly", 37)] }, { label: "Gemini 4 Argon", windows: [window("argon-weekly", 100)] }]);
+    for (const model of ["gemini-4-neon-high", "gemini-4-argon-medium", ""]) expect(quotaView(old, model, now)).toBeUndefined();
+  });
+  it("shows nothing left when the engine refuses ordinary use, whatever the windows say", () => {
+    const blocked = (code: QuotaScope["constraints"][number]["code"], extra: Partial<QuotaScope["constraints"][number]> = {}) => [{ code, availability: "blocked" as const, ...extra }];
+    const codex = (constraints: QuotaScope["constraints"], pool: QuotaScope["constraints"] = []) => scope("codex", [{ label: "Codex", windows: [window("primary", 40)], constraints: pool }], { constraints });
+    expect(quotaView(codex(blocked("ordinary_usage_blocked")), "", now)).toMatchObject({ left: 0, blocked: ["ordinary_usage_blocked"], windows: [{ left: 60 }] });
+    expect(quotaView(codex([], [...blocked("spend_control"), ...blocked("credits_depleted")]), "", now)).toMatchObject({ left: 0, blocked: ["spend_control", "credits_depleted"] });
+    // Disabled extra usage, a warning, or a block whose own reset has passed is not a refusal.
+    expect(quotaView(codex(blocked("overage_disabled")), "", now)).toMatchObject({ left: 60, blocked: [] });
+    expect(quotaView(codex([{ code: "spend_control", availability: "warning" }]), "", now)).toMatchObject({ left: 60, blocked: [] });
+    expect(quotaView(codex(blocked("credits_depleted", { resetsAt: iso(-1) })), "", now)).toMatchObject({ left: 60, blocked: [] });
+    // A block without any window is still a reading; a block on another model's pool is not this Bot's.
+    expect(quotaView(scope("codex", [], { constraints: blocked("ordinary_usage_blocked") }), "", now)).toMatchObject({ left: 0, windows: [], blocked: ["ordinary_usage_blocked"] });
+    const other = scope("antigravity", [{ label: "Gemini Models", models: ["Gemini 4 Neon"], windows: [window("weekly", 10)] }, { label: "Gemini 4 Argon", models: ["Gemini 4 Argon"], windows: [], constraints: blocked("other_native_limit") }]);
+    expect(quotaView(other, "gemini-4-neon-high", now)).toMatchObject({ left: 90, blocked: [] });
+    expect(quotaView(other, "gemini-4-argon-low", now)).toMatchObject({ left: 0, blocked: ["other_native_limit"] });
+  });
   it("clamps an overdrawn window to nothing left", () => {
     expect(quotaView(scope("codex", [{ label: "Codex", windows: [window("primary", 140)] }]), "", now)!.left).toBe(0);
   });
@@ -91,4 +110,55 @@ it("turns amber at a fifth left and red at a twentieth", () => {
 });
 it("shortens token counts", () => {
   expect([0, 999, 1000, 1240, 9949, 76_000, 199_600, 1_000_000, 1_250_000].map(shortTokens)).toEqual(["0", "999", "1k", "1.2k", "9.9k", "76k", "200k", "1M", "1.3M"]);
+});
+
+describe("what the App holds and when it asks the engine", () => {
+  const reading = (minutes: number, extra: Partial<QuotaScope> = {}) => scope("codex", [{ label: "Codex", windows: [window("primary", 20)] }], { observedAt: iso(minutes), ...extra });
+  const without = (reason: QuotaScope["reason"], extra: Partial<QuotaScope> = {}): QuotaScope => ({ ...scope("codex", [], { observedAt: undefined, state: "unknown" }), reason, ...extra });
+  it("keeps the held reading when the Hub answers for a worker that did not", () => {
+    const held = reading(-2);
+    for (const reason of ["offline", "timeout", "invalid_response", "host_upgrade_required"] as const) expect(nextHeldQuota(held, without(reason, { revision: reason, state: "unavailable" }))).toBe(held);
+    // The worker's own timeout carries its real revision: nothing new, the reading stays.
+    expect(nextHeldQuota(held, without("timeout", { state: "unavailable" }))).toBe(held);
+    expect(nextHeldQuota(held, without("not_loaded"))).toBe(held);
+  });
+  it("drops the held reading for another login or a login without quota", () => {
+    const held = reading(-2);
+    expect(nextHeldQuota(held, without("not_loaded", { revision: "other" }))).toBeUndefined();
+    for (const reason of ["auth_changed", "login_required", "mode_not_supported", "not_adapted"] as const) expect(nextHeldQuota(held, without(reason))).toBeUndefined();
+    expect(nextHeldQuota(undefined, without("not_loaded"))).toBeUndefined();
+  });
+  it("never replaces a reading with the same login's older one", () => {
+    const newer = reading(-1), older = reading(-25);
+    expect(nextHeldQuota(newer, older)).toBe(newer); expect(nextHeldQuota(older, newer)).toBe(newer); expect(nextHeldQuota(undefined, older)).toBe(older);
+    // Another login's reading is about another account, however old.
+    const other = reading(-25, { revision: "other" });
+    expect(nextHeldQuota(newer, other)).toBe(other);
+  });
+  it("asks the engine only when nothing fresh is held and the last attempt is not recent", () => {
+    const idle = without("not_loaded"), minute = 60_000, five = 5 * minute;
+    expect(mayAskEngine(idle, undefined, undefined, now, five)).toBe(true);
+    expect(mayAskEngine(idle, reading(-4), undefined, now, five)).toBe(false);
+    expect(mayAskEngine(idle, reading(-6), undefined, now, five)).toBe(true);
+    expect(mayAskEngine(idle, reading(-4), undefined, now, minute)).toBe(true);
+    // A reading of another login does not excuse this one.
+    expect(mayAskEngine(idle, reading(-1, { revision: "other" }), undefined, now, five)).toBe(true);
+    // A read that just failed is not repeated at once; a new login may be asked at once.
+    expect(mayAskEngine(idle, undefined, { revision: "r", at: now - 4 * minute, signIn: false }, now, five)).toBe(false);
+    expect(mayAskEngine(idle, undefined, { revision: "r", at: now - 6 * minute, signIn: false }, now, five)).toBe(true);
+    expect(mayAskEngine(idle, undefined, { revision: "before", at: now - minute, signIn: true }, now, five)).toBe(true);
+  });
+  it("leaves an engine that asked for a sign-in alone for half an hour, also from the details", () => {
+    const idle = without("not_loaded"), attempt = (ago: number) => ({ revision: "r", at: now - ago, signIn: true });
+    for (const olderThan of [60_000, 5 * 60_000]) {
+      expect(mayAskEngine(idle, undefined, attempt(QUOTA_SIGN_IN_RETRY_MS - 1000), now, olderThan)).toBe(false);
+      expect(mayAskEngine(idle, undefined, attempt(QUOTA_SIGN_IN_RETRY_MS + 1000), now, olderThan)).toBe(true);
+    }
+    expect(mayAskEngine(without("login_required", { state: "login_required" }), undefined, undefined, now, 60_000)).toBe(false);
+  });
+  it("never asks through a Hub fallback, a passive source or an unsupported one", () => {
+    expect(mayAskEngine(without("offline", { revision: "offline", state: "offline" }), undefined, undefined, now, 60_000)).toBe(false);
+    expect(mayAskEngine({ ...without("no_passive_event"), capability: { mode: "passive" } }, undefined, undefined, now, 60_000)).toBe(false);
+    expect(mayAskEngine({ ...without("mode_not_supported", { state: "unsupported" }), capability: { mode: "unsupported" } }, undefined, undefined, now, 60_000)).toBe(false);
+  });
 });

@@ -6,6 +6,7 @@ import type { QuotaAuthMode, QuotaEngine, QuotaSnapshot } from "../client-protoc
 import type { QuotaAccountProof } from "../runtime/engine-quota-scope.js";
 import { QUOTA_TTL_MS, unavailableQuota } from "./account-quota.js";
 
+const ANTIGRAVITY_SIGN_IN_RETRY_MS = 30 * 60_000;
 export type EngineQuotaReadOptions = { refresh: boolean; expectedRevision?: string; signal?: AbortSignal; timeoutMs?: number };
 export type EngineQuotaReadResult = { revision: string; snapshot: QuotaSnapshot; proof?: QuotaAccountProof };
 export type AdapterQuotaScope = { revision: string; credentialRevision: string; verifiable: boolean; authMode: QuotaAuthMode };
@@ -126,7 +127,13 @@ export class AdapterQuotaCache {
     }
     if (scope.authMode !== "subscription") { this.cached = undefined; return { revision: scope.revision, snapshot: unavailableQuota(this.engine, "mode_not_supported", Date.now(), scope.authMode) }; }
     if (this.cached?.revision !== scope.revision) this.cached = undefined;
-    if (options.refresh && (this.engine === "codex" || this.engine === "antigravity")) return undefined;
+    if (options.refresh && (this.engine === "codex" || this.engine === "antigravity")) {
+      // `agy` may open a browser sign-in each time it is asked while signed out. Once it has said so, it is
+      // not started again for the same login state until this long has passed.
+      if (this.engine === "antigravity" && this.cached?.snapshot.state === "login_required" && this.cached.snapshot.lastAttemptAt
+        && Date.now() - Date.parse(this.cached.snapshot.lastAttemptAt) < ANTIGRAVITY_SIGN_IN_RETRY_MS) return structuredClone(this.cached);
+      return undefined;
+    }
     if (!this.cached) return this.failure(scope, this.engine === "claude" ? "no_passive_event" : "not_loaded");
     const value = structuredClone(this.cached);
     if (value.snapshot.observedAt && Date.now() - Date.parse(value.snapshot.observedAt) >= QUOTA_TTL_MS) value.snapshot.state = "stale";

@@ -183,6 +183,58 @@ describe("Claude quota from the Bot's own running engine", () => {
     const stale = (await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 })).snapshot;
     expect(stale).toMatchObject({ state: "stale", reason: "timeout" }); expect(stale.pools[0].windows).toHaveLength(2);
   });
+  it("asks only a process that is not working on a turn, and the newest earlier answer stands meanwhile", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); const worker = await start();
+    await adapter.getAccountQuota({ refresh: true });
+    for (const busy of [{ pendingTurn: {} }, { continuationTurn: {} }, { nativeTurnOpen: true }, { taskNotificationTurnActive: true }]) {
+      Object.assign(worker, busy);
+      const read = (await adapter.getAccountQuota({ refresh: true })).snapshot;
+      expect(read.pools[0].windows).toHaveLength(2); expect(read.reason).toBeUndefined();
+      Object.assign(worker, { pendingTurn: null, continuationTurn: undefined, nativeTurnOpen: false, taskNotificationTurnActive: false });
+    }
+    expect(child.controls).toEqual(["get_usage"]);
+    await adapter.getAccountQuota({ refresh: true });
+    expect(child.controls).toEqual(["get_usage", "get_usage"]);
+  });
+  it("does not count a question as use of the process", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); child.answers.get_context_usage = { totalTokens: 5, maxTokens: 10 }; const worker = await start();
+    worker.lastActivityAt = 1_000;
+    await adapter.getAccountQuota({ refresh: true }); await adapter.getContextUsage("tarobot-fixture");
+    expect(child.controls).toEqual(["get_usage", "get_context_usage"]); expect(worker.lastActivityAt).toBe(1_000);
+    delete child.answers.get_usage;
+    await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 });
+    expect(worker.lastActivityAt).toBe(1_000);
+  });
+  it("asks again after a failure that is not the CLI's own refusal of the request", async () => {
+    const { adapter, child, start } = await claudeFixture(); await start();
+    const fail = (error: string) => { child.stdin.write = ((line: string, callback?: (error?: Error | null) => void) => { const request = JSON.parse(line); child.controls.push(String(request.request?.subtype));
+      queueMicrotask(() => child.event({ type: "control_response", response: { subtype: "error", request_id: request.request_id, error } })); callback?.(null); return true; }) as typeof child.stdin.write; };
+    fail("usage could not be fetched");
+    for (let index = 0; index < 2; index++) expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "native_error", capability: { mode: "active" }, pools: [] });
+    expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull(); expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull();
+    expect(child.controls).toEqual(["get_usage", "get_usage", "get_context_usage", "get_context_usage"]);
+    fail("Unsupported control request subtype: get_usage");
+    for (let index = 0; index < 2; index++) expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "scope_unverifiable", capability: { mode: "passive" } });
+    expect(child.controls.filter(name => name === "get_usage")).toHaveLength(3);
+  });
+  it("drops this process's earlier reading when it later answers that it has no windows", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); await start();
+    await adapter.getAccountQuota({ refresh: true });
+    child.answers.get_usage = { rate_limits_available: false, rate_limits: null };
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ state: "unsupported", pools: [] });
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ reason: "not_loaded", pools: [] });
+  });
+  it("counts a model's own allowance by the model the process stated at its start", async () => {
+    const { adapter, child, start } = await claudeFixture(); const worker = await start();
+    child.answers.get_usage = { ...usageReply(), rate_limits: { seven_day: { utilization: 31, resets_at: future(90) }, model_scoped: [{ display_name: "Fable", utilization: 64, resets_at: future(90) }] } };
+    const pools = async () => (await adapter.getAccountQuota({ refresh: true })).snapshot.pools.map(pool => [pool.label, pool.models]);
+    // Not stated yet: the model's pool keeps naming its model for the App to decide.
+    expect(await pools()).toEqual([["Claude", undefined], ["Fable", ["Fable"]]]);
+    child.event({ type: "system", subtype: "init", model: "claude-fable-5-2" }); worker.nativeTurnOpen = false;
+    expect(await pools()).toEqual([["Claude", undefined], ["Fable", undefined]]);
+    child.event({ type: "system", subtype: "init", model: "claude-sonnet-5-5" }); worker.nativeTurnOpen = false;
+    expect(await pools()).toEqual([["Claude", undefined]]);
+  });
   it("rejects a malformed answer without values", async () => {
     const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = { rate_limits_available: true, rate_limits: { five_hour: { utilization: "12" } } }; await start();
     expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "invalid_response", pools: [] });
@@ -202,6 +254,19 @@ describe("Claude context usage of one conversation", () => {
     child.answers.get_context_usage = { ...context, isAutoCompactEnabled: false };
     expect(await adapter.getContextUsage("tarobot-fixture")).toEqual({ pressureTokens: 17_669, contextWindow: 200_000 });
     expect(child.controls).toEqual(["get_context_usage", "get_context_usage"]); expect(child.methods).toEqual([]);
+  });
+  it("is not asked during a turn: the last answer for the same session stands", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_context_usage = context; const worker = await start();
+    worker.pendingTurn = {};
+    expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull(); expect(child.controls).toEqual([]);
+    worker.pendingTurn = null;
+    expect(await adapter.getContextUsage("tarobot-fixture")).toMatchObject({ pressureTokens: 17_669 });
+    child.answers.get_context_usage = { ...context, totalTokens: 90_000 }; worker.nativeTurnOpen = true;
+    expect(await adapter.getContextUsage("tarobot-fixture")).toMatchObject({ pressureTokens: 17_669 });
+    // Another session on the same process (after /clear) has no answer of its own yet.
+    worker.currentSessionId = "another-session";
+    expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull();
+    expect(child.controls).toEqual(["get_context_usage"]);
   });
   it("has no reading without a running process, and starts none", async () => {
     const { adapter, child, spawn, start } = await claudeFixture(); child.answers.get_context_usage = context;

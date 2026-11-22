@@ -33,6 +33,8 @@
 .usage-window+.usage-window{margin-top:8px}
 .usage-note{margin:0;color:var(--muted);font-size:11.5px}
 .usage-read-at{margin-top:9px;text-align:right}
+.usage-blocked{color:var(--red)}
+.usage-window+.usage-blocked,section>.usage-blocked+.usage-blocked{margin-top:6px}
 
 /* Phone: a row in the chat actions sheet, its details, and the low mark in the header. */
 .mobile-chat-action-list>button>.action-value[data-tone=low]{color:var(--orange)}

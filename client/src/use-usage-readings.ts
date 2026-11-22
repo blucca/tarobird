@@ -2,13 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ContextUsage } from "../../src/client-protocol/context-usage.js";
 import type { QuotaScope } from "../../src/client-protocol/engine-quota.js";
 import type { HubConnection } from "./connection.js";
-import { contextView, quotaView, quotaViewEndsAt } from "./usage-readings.js";
+import { contextView, mayAskEngine, nextHeldQuota, quotaView, quotaViewEndsAt, type QuotaAttempt } from "./usage-readings.js";
 
 /** The engine is asked for quota again only once the shown reading is this old; opening the details asks after a minute.
  * There is no timer: a reading is taken when a conversation opens and when a reply ends. */
 const QUOTA_READ_AGAIN_MS = 5 * 60_000, QUOTA_DETAILS_READ_AGAIN_MS = 60_000;
 /** The last quota reading per Host and Bot, in memory only, so a Bot's battery is there when another of its conversations opens. */
 const held = new WeakMap<HubConnection, Map<string, QuotaScope>>();
+/** When the engine was last asked per Host and Bot, so a failing read is not repeated at every opened conversation. */
+const attempts = new WeakMap<HubConnection, Map<string, QuotaAttempt>>();
 
 /** Context left in one conversation and quota left for its Bot. Each is absent when it cannot be read. */
 export function useUsageReadings(connection: HubConnection, input: {
@@ -30,26 +32,28 @@ export function useUsageReadings(connection: HubConnection, input: {
     if (reading.current?.key === key) { reading.current.again = Math.min(reading.current.again ?? Infinity, olderThan); return; }
     const mine = reading.current = { key } as { key: string; again?: number };
     const readings: Promise<void>[] = [];
-    if (context && conversationId) readings.push(connection.readContextUsage(conversationId, botId).then(value => { if (current()) setUsage({ key, value }); }));
+    // A context read that fails has no answer: the ring goes rather than keep an old number.
+    if (context && conversationId) readings.push(connection.readContextUsage(conversationId, botId).then(value => { if (current()) setUsage({ key, value }); }, () => { if (current()) setUsage(undefined); }));
     if (quota) readings.push((async () => {
       const store = held.get(connection) ?? new Map<string, QuotaScope>(); held.set(connection, store);
-      const keep = (scope: QuotaScope) => {
-        const previous = store.get(botId);
-        if (scope.observedAt) store.set(botId, scope);
-        // Another login, or a login without quota: the earlier number is not about it.
-        else if (previous && (previous.revision !== scope.revision || ["auth_changed", "login_required", "mode_not_supported"].includes(scope.reason ?? ""))) store.delete(botId);
-      };
+      const asked = attempts.get(connection) ?? new Map<string, QuotaAttempt>(); attempts.set(connection, asked);
+      const keep = (scope: QuotaScope) => { const next = nextHeldQuota(store.get(botId), scope); if (next) store.set(botId, next); else store.delete(botId); };
       try {
         let scope = await connection.readEngineQuota(botId); keep(scope);
-        const shown = store.get(botId)?.observedAt;
-        if (scope.capability.mode === "active" && !(shown && Date.now() - Date.parse(shown) < olderThan)) { scope = await connection.refreshEngineQuota(scope); keep(scope); }
+        if (mayAskEngine(scope, store.get(botId), asked.get(botId), Date.now(), olderThan)) {
+          asked.set(botId, { revision: scope.revision, at: Date.now(), signIn: false });
+          scope = await connection.refreshEngineQuota(scope); keep(scope);
+          if (scope.state === "login_required") asked.set(botId, { revision: scope.revision, at: Date.now(), signIn: true });
+        }
       } finally { if (current()) redraw(count => count + 1); }
     })());
-    // A failed read leaves what was shown; the symbol goes away by its own age rule.
+    // A failed quota read leaves the held reading; that one goes away by its own age rule.
     await Promise.allSettled(readings);
     if (reading.current === mine) reading.current = undefined;
-    if (mine.again !== undefined && current()) void read(mine.again);
+    // The request that waited runs with the view's current settings, not the ones this read started with.
+    if (mine.again !== undefined && current()) void latest.current(mine.again);
   }, [connection, conversationId, botId, key, quota, context]);
+  const latest = useRef(read); latest.current = read;
   useEffect(() => { void read(QUOTA_READ_AGAIN_MS); }, [read]);
   const seen = useRef<{ key: string; turn: string | undefined }>(undefined);
   useEffect(() => {

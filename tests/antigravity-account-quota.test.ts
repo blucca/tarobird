@@ -61,6 +61,14 @@ const sampleUsagePayload = {
   },
 };
 
+/** The sample as `agy` would answer it now. The parser tests use a fixed clock; a read that passes the Gateway
+ * is judged against the real one, where a reset time in the past ends the reading. */
+function currentUsagePayload() {
+  const payload = structuredClone(sampleUsagePayload);
+  for (const group of payload.command.data.groups) for (const bucket of group.buckets) bucket.reset_time = new Date(Date.now() + (bucket.window === "5h" ? 3 : 100) * 3_600_000).toISOString();
+  return payload;
+}
+
 const roots: string[] = [];
 const disposals: Array<() => unknown> = [];
 afterEach(async () => {
@@ -191,10 +199,10 @@ describe("Antigravity quota version check and parser", () => {
     expect(group("For paid Pro plans, Argon quota is separate. Higher Argon quota is available on Ultra plans.")).toEqual(["Gemini 4 Argon"]);
     expect(group("Models within this group: Claude Opus 5.5, Claude Sonnet 5.5 ,  GPT-OSS 120B")).toEqual(["Claude Opus 5.5", "Claude Sonnet 5.5", "GPT-OSS 120B"]);
     expect(group("Models within this group: Orchestrator (Neon)")).toEqual(["Orchestrator (Neon)"]);
-    for (const loose of [undefined, null, "", "Models within this group:", "Models within this group: , ,", `Models within this group: ${"x".repeat(121)}`, `Models within this group: ${Array.from({ length: 33 }, (_, index) => `m${index}`).join(", ")}`])
+    // Anything that is not that one sentence states no list; it never fails the reading.
+    for (const loose of [undefined, null, "", 7, ["Models within this group: A"], "Models within this group:", "Models within this group: , ,", "Models within this group: a\u0007b", "First line.\nModels within this group: A",
+      "Models within this group: A\nmore prose", `Models within this group: ${"x".repeat(121)}`, `Models within this group: ${Array.from({ length: 33 }, (_, index) => `m${index}`).join(", ")}`])
       expect(group(loose)).toEqual(["Gemini 4 Argon"]);
-    expect(() => group(7)).toThrow("invalid_response");
-    expect(() => group("Models within this group: a\u0007b")).toThrow("invalid_response");
   });
 
   it("rejects non-SUCCESS status or wrong command name", () => {
@@ -211,7 +219,7 @@ describe("ProcessAntigravityAdapter account quota", () => {
       calls.push(args);
       const child = new MockChild();
       if (args.includes("--version")) child.finish(0, "1.5.14\n");
-      else child.finish(0, JSON.stringify(sampleUsagePayload));
+      else child.finish(0, JSON.stringify(currentUsagePayload()));
       return child;
     });
     const adapter = new ProcessAntigravityAdapter("agy", f.env, spawn as any, undefined, undefined, f.root);
@@ -300,6 +308,14 @@ describe("ProcessAntigravityAdapter account quota", () => {
     expect(children[1]?.closed).toBe(true);
     expect(result.snapshot).toMatchObject({ state: "login_required", reason: "login_required", pools: [], help: "antigravity_usage" });
     expect(JSON.stringify(result)).not.toMatch(/accounts\.google\.com|oauth2|secret/i);
+    // Asking again can open the browser sign-in again: agy is left alone for half an hour, then asked once more.
+    expect(spawn).toHaveBeenCalledTimes(2);
+    for (let index = 0; index < 3; index++) expect((await adapter.getAccountQuota!({ refresh: true })).snapshot).toMatchObject({ state: "login_required", pools: [] });
+    expect(spawn).toHaveBeenCalledTimes(2);
+    const later = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 31 * 60_000);
+    expect((await adapter.getAccountQuota!({ refresh: true })).snapshot).toMatchObject({ state: "login_required" });
+    later.mockRestore();
+    expect(spawn).toHaveBeenCalledTimes(4);
   });
 
   it("reports mode_not_supported for GEMINI_API_KEY without subscription state", async () => {
@@ -318,7 +334,7 @@ describe("ProcessAntigravityAdapter account quota", () => {
     const spawn = vi.fn((_cmd: string, args: string[]) => {
       const child = new MockChild();
       if (args.includes("--version")) child.finish(0, "1.5.14\n");
-      else child.finish(0, JSON.stringify(sampleUsagePayload));
+      else child.finish(0, JSON.stringify(currentUsagePayload()));
       return child;
     });
     const adapter = new ProcessAntigravityAdapter("agy", f.env, spawn as any, undefined, undefined, f.root);
@@ -376,7 +392,7 @@ describe("Antigravity ACP runtime account quota", () => {
     const spawn = vi.fn((_cmd: string, args: string[]) => {
       calls.push(args);
       const child = new MockChild();
-      if (args.includes("--version")) child.finish(0, "1.5.14\n"); else child.finish(0, JSON.stringify(sampleUsagePayload));
+      if (args.includes("--version")) child.finish(0, "1.5.14\n"); else child.finish(0, JSON.stringify(currentUsagePayload()));
       return child;
     });
     const { adapter, acpSpawn } = acp(f, spawn);

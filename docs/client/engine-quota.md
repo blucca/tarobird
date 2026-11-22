@@ -20,8 +20,8 @@ the conversation's context. They use the same Host API as the page and CLI.
 | Engine | Source and limits |
 | --- | --- |
 | Codex | Explicit read of native account and rate-limit APIs for a subscription identity. API-key/provider balances are not inferred. A cold reader uses a temporary CLI helper without creating a thread or sending a prompt. When the Host cannot verify the credential source from files (no `auth.json`, a keyring/auto store or an external helper), an explicit refresh still asks Codex's public `account/read`: "not signed in" becomes login required, and an account answer is shown for that one read only after the before/after identity check and only when the replies tie one stable user (`userId`), the workspace (`workspaceRouting.chatgptAccountId`, identical in both `account/read` replies) and the usage snapshot's own `accountId` to the same account, each a bounded whitespace-free token. Codex 0.170.0 documents none of these as guaranteed and does not scope `account/rateLimits/read` to the routed workspace in its protocol, so a missing usage account is never filled in from routing; such a reply, or one with only a type, plan or email, stays unverifiable and shows no values. A JSON-RPC -32603 reply with the CLI's exact unauthorized text from these quota calls (`workspace routing discovery unauthorized (401)`, `failed to fetch codex rate limits: … 401 Unauthorized`) is shown as login required, and the rate-limit call's `failed: 429 Too Many Requests` (status in its own position, not in a response body) as rate limited until a later read succeeds. A 429 during account discovery reaches `account/read` only as `workspace routing discovery failed`, with the status swallowed, so it stays a generic native error rather than a guess. Other native failures stay unavailable. Such a reading is never cached or reused. |
-| Claude | On an explicit refresh, a running Claude Code process of the Bot is asked with the `get_usage` control request (no prompt, no model call). The answer is about the account that process uses, so it is shown wherever the login is stored (credential file or system keychain). The reading is kept on that process's record and ends with it; no process is started for a reading. The shared windows form one pool; a model with its own weekly allowance (`model_scoped`) is a pool of its own that names that model. A process on an API key answers that it has no windows and nothing is shown. A CLI that refuses `get_usage` is asked once per process, and the earlier passive rule then applies: native quota events observed during an ordinary conversation count only for a credential source the Host can verify. |
-| Antigravity | On an explicit refresh, one `agy -p /usage --output-format json` read after an `agy --version` check (1.1.11 or newer), accepted only with zero turns. Never started without local login state, because an unauthenticated `agy` opens a browser sign-in. The print runtime and the ACP runtime use the same reader. Each usage group states the models it covers: the names listed in its description ("Models within this group: …"), or the group's own name for a separately metered model. |
+| Claude | On an explicit refresh, a running Claude Code process of the Bot is asked with the `get_usage` control request (no prompt, no model call). The answer is about the account that process uses, so it is shown wherever the login is stored (credential file or system keychain). The process is asked only while it is not working on a turn; during a turn the newest earlier answer stands. Asking does not count as use of the process: its idle clock is put back, so a reading never keeps a process alive. The reading is kept on that process's record and ends with it; no Claude process is started for a reading. The process states its model when it starts a turn, and the Host uses that to decide whether a model's own pool counts (see below). The shared windows form one pool; a model with its own weekly allowance (`model_scoped`) is a pool of its own that names that model. A process on an API key answers that it has no windows and nothing is shown. A CLI that answers "Unsupported control request subtype" is asked once per process, and the earlier passive rule then applies (any other failure may be asked again): native quota events observed during an ordinary conversation count only for a credential source the Host can verify. |
+| Antigravity | On an explicit refresh, one `agy -p /usage --output-format json` read after an `agy --version` check (1.1.11 or newer), accepted only with zero turns. Never started without local login state, because an unauthenticated `agy` opens a browser sign-in; after `agy` has answered that a sign-in is required, it is not started again for the same login state for thirty minutes. The print runtime and the ACP runtime use the same reader. Each usage group states the models it covers: the names listed in its description ("Models within this group: …"), or the group's own name for a separately metered model. |
 | Kimi | The currently integrated ACP contract has no verified quota reader. |
 | DeepSeek / Pi | No generic balance estimate is made across arbitrary providers. |
 
@@ -114,8 +114,15 @@ in that place otherwise.
 of them; a pool that names none counts for every Bot. Antigravity's groups all
 name models, so one exhausted group does not alarm Bots on another. The number
 is the tightest remaining window of the pools that count. Claude names a model
-family ("Fable"), so its per-model pool counts for a Bot whose model id
-contains that name; extra-usage windows are not counted. When the Bot's pool cannot be told, no battery is
+family ("Fable"): the Host counts its pool for a process whose stated model
+contains that name and then no longer marks it as per-model, so it counts
+whatever the Bot's configuration calls the model, including the default. Until
+a process has stated its model, the App decides by the Bot's configured model.
+Extra-usage windows are not counted. When the engine reports that ordinary use
+is refused (blocked ordinary usage, a spending control, depleted credits, or
+another native limit), nothing is left whatever the windows say, and the
+details name the limit. An Antigravity group that names no models (an older
+Host) is not counted. When the Bot's pool cannot be told, no battery is
 shown: an Antigravity Bot on the engine's default model, or on a model no group
 lists (in agy 1.5.14, "Orchestrator (Argon)"; "Orchestrator (Neon)" is listed
 by its display name, which its id does not carry). A window past its reset
@@ -125,21 +132,32 @@ time is left out.
 conversation opens and when its newest finished Bot message changes (a reply
 has ended). The engine itself is asked for quota again only once the shown
 reading is five minutes old, or one minute when the details are opened; in
-between, the App shows what the Host holds. The last reading of a Bot is kept
-in memory only and shown for thirty minutes at most.
+between, the App shows what the Host holds. A read that failed is not repeated
+before the same time has passed, and after "sign in first" the engine is left
+alone for thirty minutes or until the login changes. The last reading of a Bot
+is kept in memory only and shown for thirty minutes at most; an older answer
+never replaces a newer one, and a Hub reply for a worker that did not answer
+changes nothing.
+
+**What a reading may start.** Nothing for context. For quota, only the readers
+that already existed: Codex's temporary helper when its app-server is not
+running (no thread, no prompt), and Antigravity's one-shot `/usage`. Claude is
+asked only through a process that is already running.
 
 **Context usage.** `GET /api/conversations/:id/context-usage?botId=` returns
 `{ supported, usedTokens?, windowTokens?, autoCompactTokens? }` to a member of
 that conversation; the Host and worker advertise
 `conversations.context-usage.v1`. The worker reports the engine's own figures
-for the session the conversation is bound to and never creates or resumes one:
+for the session the conversation is bound to, as a passive reading: no session
+is created or resumed, no engine process is started and nothing is reconciled:
 
 | Engine | Source |
 | --- | --- |
 | Codex | The thread usage Codex pushes (`thread/tokenUsage/updated`); the compaction point is this adapter's own (80% of the window). Absent before the first turn of a worker process and after a compaction until the next turn. |
-| Claude | `get_context_usage` on the conversation's running process, the figures of Claude's own `/context`. Absent without a running process. |
+| Claude | `get_context_usage` on the conversation's running process, the figures of Claude's own `/context`; asked while the process is idle, and its last answer for the same session during a turn. Absent without a running process. |
 | Antigravity | ACP runtime: the session's `usage_update`. Print runtime: none, because it reports token counts without a window. |
-| DeepSeek / Pi | The usage those adapters already report for `/context`. |
+| Pi | `get_session_stats` of a process that is already running; absent otherwise. (`/context` itself still starts one.) |
+| DeepSeek | The context pressure the adapter already holds for the session from the harness's events; the harness is not started or asked and no goal is reconciled. (`/context` itself still reads and reconciles.) |
 | Kimi | None. |
 
 ## Validation boundary
@@ -168,6 +186,6 @@ Checked on 2026-11-22 for the symbols:
   through the ACP adapter and the Gateway: three groups with their model
   lists, about five seconds for the two processes.
 
-Not checked: `get_usage` during a real turn on a subscription, Codex context
-figures against a real session, and any of this in an installed App on a
-device.
+Not checked: Codex context figures against a real session, and any of this in
+an installed App on a device. The probe above showed that Claude Code answers
+during a turn, but the adapter does not ask during one.

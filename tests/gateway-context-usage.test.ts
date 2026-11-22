@@ -11,7 +11,7 @@ describe("context usage of one conversation", () => {
   it("reports what the engine says for the bound session and starts nothing", async () => {
     const f = fixture({ pressureTokens: 1200.4, contextWindow: 200_000, autoCompactTokens: 167_000 });
     expect(await f.run({ conversationId: "chat" })).toEqual({ supported: true, usedTokens: 1200, windowTokens: 200_000, autoCompactTokens: 167_000 });
-    expect(f.bridge.getContextUsage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ conversationKey: "lark:chat" }));
+    expect(f.bridge.getContextUsage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ conversationKey: "lark:chat", passive: true }));
     expect(f.bridge.handleAuthorizedMessage).not.toHaveBeenCalled();
   });
   it("prefers the engine's projection over its last sample, as /context does", async () => {

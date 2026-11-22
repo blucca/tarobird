@@ -195,6 +195,8 @@ export interface CoreBridgeLike {
     messageThreadId?: number;
     conversationKey?: string;
     workspaceOverride?: string;
+    /** A reading for display: nothing is started, resumed or changed for it. */
+    passive?: boolean;
   }): Promise<EngineContextUsage | null>;
   supportsSteering?(): boolean;
   canStartQueuedTurn?(input: { chatId: number; conversationKey: string }): Promise<boolean>;

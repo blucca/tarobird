@@ -241,6 +241,21 @@ export function parseClaudeUsage(value: unknown, now = Date.now()): QuotaSnapsho
   return safeSnapshot({ authMode: "subscription", capability: { mode: "active" }, state: pools.length ? "ready" : "unknown", availability: "unknown", observedAt: at, lastAttemptAt: at, pools, constraints: [], help: "claude_usage" });
 }
 
+/** A running Claude process states its model, so which pools count for it is decided here: the shared ones, and
+ * a model's own pool only when the process is on that model. A pool that counts no longer names models: the
+ * reading then counts for the Bot whatever name its configuration uses for the model (or none, for the default). */
+export function claudeQuotaForModel(snapshot: QuotaSnapshot, model: string | undefined): QuotaSnapshot {
+  if (!model) return snapshot;
+  const plain = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, ""), id = plain(model);
+  const pools = snapshot.pools.flatMap((pool): QuotaPool[] => {
+    if (!pool.models?.length) return [pool];
+    if (!pool.models.some(name => plain(name) !== "" && id.includes(plain(name)))) return [];
+    const { models: _models, ...rest } = pool;
+    return [{ ...rest, sharing: "shared" }];
+  });
+  return { ...snapshot, pools, ...(!pools.length && snapshot.state === "ready" ? { state: "unknown" as const } : {}) };
+}
+
 /** Antigravity CLI only guarantees local zero-turn `/usage --output-format json` from 1.1.11 onward. */
 export function isAntigravityQuotaSupportedVersion(versionOutput: string): boolean {
   const match = versionOutput.trim().match(/\bv?(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]*)?\b/);
@@ -261,8 +276,8 @@ const antigravityWindows: Record<string, { label: string; periodSeconds: number 
  * group's description; a group without that sentence is named after its own model ("Gemini 4 Argon").
  * The names are those of `agy models` without the effort suffix. No other prose of the description is kept. */
 function antigravityGroupModels(name: string, description: unknown): string[] {
-  const text = description == null ? undefined : quotaNativeIdentity(description);
-  const listed = text ? /^Models within this group:\s*(.+)$/.exec(text)?.[1]?.split(",").map(item => item.trim()).filter(Boolean) : undefined;
+  // Any other description (prose, several lines, not text) simply states no list; it never fails the reading.
+  const listed = typeof description === "string" ? /^Models within this group:[ \t]*([^\x00-\x1f\x7f]+)$/.exec(description)?.[1]?.split(",").map(item => item.trim()).filter(Boolean) : undefined;
   return listed?.length && listed.length <= 32 && listed.every(item => item.length <= 120) ? listed : [name];
 }
 

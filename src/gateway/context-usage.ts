@@ -5,8 +5,8 @@ import { buildCoreConversationKey, stableCoreNumericId } from "../core/message-n
 import type { CoreBridgeLike } from "../core/types.js";
 import type { GatewayChannel } from "./channel.js";
 
-/** The engine's own context accounting for one conversation. Reading it never
- * creates or resumes a session and never asks the model anything. */
+/** The engine's own context accounting for one conversation, as a passive reading: it never creates or
+ * resumes a session, never starts an engine process and never asks the model anything. */
 export function gatewayContextUsage(bridge: CoreBridgeLike, channel: Pick<GatewayChannel, "canSteerConversation">) {
   return async (raw: unknown): Promise<ContextUsage> => {
     const { conversationId } = z.object({ conversationId: idSchema }).strict().parse(raw);
@@ -16,9 +16,9 @@ export function gatewayContextUsage(bridge: CoreBridgeLike, channel: Pick<Gatewa
     const conversationKey = buildCoreConversationKey(conversationId);
     let usage: Awaited<ReturnType<NonNullable<CoreBridgeLike["getContextUsage"]>>>;
     try {
-      usage = await bridge.getContextUsage({ chatId: stableCoreNumericId(conversationKey), conversationKey });
+      usage = await bridge.getContextUsage({ chatId: stableCoreNumericId(conversationKey), conversationKey, passive: true });
     } catch {
-      // The adapter of this runtime has no source; that is not an error for the caller.
+      // This runtime has no source, or its engine could not answer: either way there is no reading.
       return { supported: false };
     }
     const count = (value: number | undefined) => value !== undefined && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;

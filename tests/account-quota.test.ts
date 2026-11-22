@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { quotaScopeSchema, quotaSnapshotSchema } from "../src/client-protocol/engine-quota.js";
-import { applyClaudeQuotaEvent, parseClaudeUsage, parseCodexQuota, unavailableQuota } from "../src/codex/account-quota.js";
+import { applyClaudeQuotaEvent, claudeQuotaForModel, parseClaudeUsage, parseCodexQuota, unavailableQuota } from "../src/codex/account-quota.js";
 import { readCodexAccountQuota, type CodexQuotaRequest } from "../src/codex/codex-account-quota.js";
 
 const now = Date.parse("2026-11-21T00:00:00Z");
@@ -94,6 +94,18 @@ describe("account quota parsers", () => {
     expect(parseClaudeUsage({ rate_limits_available: true, rate_limits: { five_hour: null, model_scoped: [{ display_name: "Fable", utilization: 5, resets_at: null }] } }, now)).toMatchObject({ state: "ready", pools: [{ label: "Fable" }] });
     for (const bad of [{}, "x", Array.from({ length: 33 }, () => ({ display_name: "A", utilization: 1 })), [7], [{ display_name: 7, utilization: 1 }], [{ display_name: "Fable", utilization: "1" }]])
       expect(() => parseClaudeUsage({ rate_limits_available: true, rate_limits: { model_scoped: bad } }, now)).toThrow("invalid_response");
+  });
+  it("decides a model's own pool by the model the running process states", () => {
+    const reading = parseClaudeUsage({ rate_limits_available: true, rate_limits: { seven_day: { utilization: 31, resets_at: null }, model_scoped: [{ display_name: "Fable", utilization: 64, resets_at: null }] } }, now);
+    // On that model its pool counts, and no longer depends on how the Bot's configuration names the model.
+    expect(claudeQuotaForModel(reading, "claude-fable-5-2[1m]").pools.map(pool => [pool.label, pool.models, pool.sharing])).toEqual([["Claude", undefined, "shared"], ["Fable", undefined, "shared"]]);
+    expect(claudeQuotaForModel(reading, "claude-sonnet-5-5").pools.map(pool => pool.label)).toEqual(["Claude"]);
+    // A process that has not stated its model leaves the choice to the Bot's configured model.
+    expect(claudeQuotaForModel(reading, undefined)).toBe(reading);
+    const only = parseClaudeUsage({ rate_limits_available: true, rate_limits: { model_scoped: [{ display_name: "Fable", utilization: 64, resets_at: null }] } }, now);
+    expect(claudeQuotaForModel(only, "claude-sonnet-5-5")).toMatchObject({ state: "unknown", pools: [] });
+    expect(quotaSnapshotSchema.safeParse(claudeQuotaForModel(reading, "claude-fable-5-2")).success).toBe(true);
+    expect(reading.pools[1].models).toEqual(["Fable"]);
   });
   it("answers an API-key or window-less get_usage reply as unsupported, never as zero", () => {
     for (const reply of [{ rate_limits_available: false, rate_limits: null }, { rate_limits_available: true, rate_limits: null }, { rate_limits: { five_hour: { utilization: 1 } } }])

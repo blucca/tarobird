@@ -647,13 +647,22 @@ export class PiRpcAdapter implements CodexAdapter {
     }));
   }
 
-  async getContextUsage(sessionId: string, input: { workspaceOverride?: string } = {}): Promise<EngineContextUsage | null> {
+  async getContextUsage(sessionId: string, input: { workspaceOverride?: string; passive?: boolean } = {}): Promise<EngineContextUsage | null> {
     this.assertUsable();
+    const read = async (worker: Worker): Promise<EngineContextUsage | null> => {
+      const context = (await worker.client.request({ type: "get_session_stats" })).contextUsage;
+      return context ? { ...(typeof context.tokens === "number" ? { pressureTokens: context.tokens } : {}), contextWindow: context.contextWindow } : null;
+    };
+    if (input.passive) {
+      // A reading for display asks only a process that is already running, does not count as using it,
+      // and has no answer when that process cannot give one (it may be ending).
+      const live = this.workers.get(sessionId);
+      if (!live || live.closed || !live.client.isAlive) return null;
+      try { return await read(live); } catch { return null; }
+    }
     const worker = await this.ensureWorker(sessionId, await this.resolveWorkspace(input.workspaceOverride));
     if (!worker.turn) worker.touchedBy = "a context usage read";
-    const context = (await worker.client.request({ type: "get_session_stats" })).contextUsage;
-    if (!context) return null;
-    return { ...(typeof context.tokens === "number" ? { pressureTokens: context.tokens } : {}), contextWindow: context.contextWindow };
+    return read(worker);
   }
 
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {

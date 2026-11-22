@@ -298,6 +298,20 @@ describe("PiRpcAdapter sessions and process lifecycle", () => {
     expect(r.spawner.processes).toHaveLength(1);
   });
 
+  it("answers a passive context reading only from a process that is already running, and starts none", async () => {
+    const r = await rig();
+    const { sessionId } = await r.adapter.createSession(1);
+    expect(await r.adapter.getContextUsage(sessionId, { passive: true })).toBeNull();
+    expect(r.spawner.processes).toHaveLength(0);
+    const live = (await r.adapter.sendUserMessage(sessionId, message("hello"))).sessionId ?? sessionId;
+    const asked = commands(r.spawner.last(), "get_session_stats").length;
+    expect(await r.adapter.getContextUsage(live, { passive: true })).toEqual({ pressureTokens: 266, contextWindow: 32000 });
+    expect(commands(r.spawner.last(), "get_session_stats")).toHaveLength(asked + 1);
+    r.spawner.last().exit(0, null);
+    await waitFor(async () => await r.adapter.getContextUsage(live, { passive: true }) === null);
+    expect(r.spawner.processes).toHaveLength(1);
+  });
+
   it("uses the current configured workspace for session listing, resume validation and context controls", async () => {
     const r = await rig();
     const custom = path.join(r.root, "custom-workspace");
