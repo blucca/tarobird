@@ -268,8 +268,12 @@ one entry per further computer (the whole procedure is in step 8):
 - Public ports must differ from each other and from `tunnelPort` and `healthPort`;
   fingerprints must differ.
 - Every computer's tunnel client certificate must be issued by a CA in `tls.ca` (the
-  file may hold several CA certificates), and every computer must trust this relay's
-  tunnel server certificate.
+  file may hold several CA certificates, in any order), and every computer must trust
+  this relay's tunnel server certificate.
+- `maxConnections` applies to each computer on its own: a busy or stalled computer
+  does not use up the connections of the others.
+- The relay bundle must be built from a checkout that has this feature; an older
+  bundle rejects `additionalHosts` and does not start.
 - Open the added public ports in the firewall and the cloud provider's inbound rules;
   `tunnelPort` needs nothing more.
 - `/health` gains `hosts`, one entry per computer with its public port and whether its
@@ -507,5 +511,7 @@ works. Then run the step 7 checks through the new public port.
 
 Computers on one relay do not receive each other's connections: the relay hands a
 connection only to the computer whose certificate belongs to that public port, and
-a phone's TLS ends at its own Hub. What they share is the VPS's bandwidth and this
-one relay process.
+a phone's TLS ends at its own Hub. Each computer also has its own connection
+limit. What they share is the VPS's bandwidth and this one relay process; a flood
+of unauthenticated connections to the tunnel port can hold up new connections for
+all of them while it lasts, as it could for the one before.

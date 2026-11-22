@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { relayHosts, relayServerSchema } from "./config.js";
+import { RELAY_MAX_HOSTS, relayHosts, relayServerSchema } from "./config.js";
 import { ntfyDeploymentSchema, peerRelayDeploymentSchema, prepareCompanions } from "./companions.js";
 import { companionStatusSchema } from "./health.js";
 import { relayUpdateConfigSchema } from "./update.js";
@@ -44,16 +44,18 @@ export async function prepareRelayDeployment(configFile: string, bundleFile: str
   const healthPort = relay.healthPort ?? 9877;
   const companions = await prepareCompanions(config, configFile);
   if (relay.localTls) throw new Error("Deployment owns localTls; configure ntfy instead");
-  if (config.ntfy && (config.ntfy.serverName.toLowerCase() === relay.serverName.toLowerCase() || new Set([relay.publicPort, relay.tunnelPort, healthPort, config.ntfy.tlsPort, config.ntfy.healthPort]).size !== 5 || relay.publicPort !== 443)) throw new Error("ntfy requires a separate domain, distinct loopback ports and public TCP 443");
   // The public port of every computer, the first included.
   const publicPorts = relayHosts(relay).map(host => host.publicPort);
+  if (config.ntfy && (config.ntfy.serverName.toLowerCase() === relay.serverName.toLowerCase() || new Set([...publicPorts, relay.tunnelPort, healthPort, config.ntfy.tlsPort, config.ntfy.healthPort]).size !== publicPorts.length + 4 || relay.publicPort !== 443)) throw new Error("ntfy requires a separate domain, distinct loopback ports and public TCP 443");
   if (new Set([...publicPorts, relay.tunnelPort, healthPort]).size !== publicPorts.length + 2) throw new Error("Relay ports must be distinct");
   const file = (value: string) => readFile(path.resolve(path.dirname(configFile), value));
   const [bundle, ca, cert, key] = await Promise.all([readFile(bundleFile), file(relay.tls.ca), file(relay.tls.cert), file(relay.tls.key)]);
   if (!bundle.length || bundle.length > 10 * 1024 * 1024) throw new Error("Relay bundle missing or too large; run npm run build");
   if ([ca, cert, key].some((v) => v.length > 64 * 1024)) throw new Error("Tunnel credentials too large");
-  const authority = new X509Certificate(ca); const server = new X509Certificate(cert);
-  if (!authority.ca || server.ca || !server.verify(authority.publicKey) || !server.checkPrivateKey(createPrivateKey(key)) || [authority, server].some((cert) => Date.parse(cert.validTo) <= Date.now() || Date.parse(cert.validFrom) > Date.now())) throw new Error("Invalid, expired or mismatched tunnel credentials");
+  // The CA file may hold one certificate per computer, in any order; one of them issued the relay's own.
+  const blocks = ca.toString("latin1").match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g);
+  const authorities = blocks ? blocks.map(block => new X509Certificate(block)) : [new X509Certificate(ca)]; const server = new X509Certificate(cert);
+  if (authorities.some(authority => !authority.ca) || server.ca || !authorities.some(authority => server.verify(authority.publicKey)) || !server.checkPrivateKey(createPrivateKey(key)) || [...authorities, server].some((cert) => Date.parse(cert.validTo) <= Date.now() || Date.parse(cert.validFrom) > Date.now())) throw new Error("Invalid, expired or mismatched tunnel credentials");
   const remote = { ...relay, healthPort, ...(config.ntfy ? { localTls: { serverName: config.ntfy.serverName, targetPort: config.ntfy.tlsPort } } : {}), tls: { ca: `${root}/current/ca.pem`, cert: `${root}/current/server.pem`, key: `${root}/current/server.key` } };
   const files = { "relay.mjs": bundle, "relay.json": JSON.stringify(remote, null, 2) + "\n", "ca.pem": ca, "server.pem": cert, "server.key": key, ...companions.files };
   const revision = hash(Buffer.concat([...Object.values(files).map((v) => Buffer.from(v)), Buffer.from(JSON.stringify(runtime)), Buffer.from(JSON.stringify(config.updates ?? null)), Buffer.from(JSON.stringify(config.ntfy?.archive ?? null)), Buffer.from(JSON.stringify(config.peerRelay?.archive ?? null))])).slice(0, 24);
@@ -250,7 +252,8 @@ export async function deployRelay(host: string, plan: Awaited<ReturnType<typeof 
   relayHealthSchema.parse(JSON.parse(output.slice(output.indexOf("\n", marker) + 1)));
   return output;
 }
-const relayHealthSchema = z.object({ service: z.literal("tarocub-relay"), connected: z.boolean(), pending: z.number().int().min(0), connections: z.number().int().min(0), publicPort: z.number().int().min(1).max(65535), tunnelPort: z.number().int().min(1).max(65535) });
+const relayHealthSchema = z.object({ service: z.literal("tarocub-relay"), connected: z.boolean(), pending: z.number().int().min(0), connections: z.number().int().min(0), publicPort: z.number().int().min(1).max(65535), tunnelPort: z.number().int().min(1).max(65535),
+  hosts: z.array(z.object({ publicPort: z.number().int().min(1).max(65535), connected: z.boolean() })).max(RELAY_MAX_HOSTS).optional() });
 export async function inspectRemoteRelay(host: string, runner: SshRunner = runRelaySsh): Promise<unknown> {
   validateSshHost(host);
   const command = `if test "$(id -u)" = 0; then cat ${root}/current/relay.json; else sudo -n cat ${root}/current/relay.json; fi`;

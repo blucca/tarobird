@@ -30,16 +30,18 @@ export interface RelayServerOptions {
   healthPort?: number;
   localTls?: { serverName: string; targetPort: number };
 }
-/** One computer: where its devices arrive, the certificate its tunnel shows, and that tunnel's control channel. */
-type Host = { port: number; fingerprint: string; server: TcpServer; control?: TLSSocket; lastPong: number };
+/** One computer: where its devices arrive, the certificate its tunnel shows, and that tunnel's control channel.
+ * `sockets` are its device connections and the tunnel connections that showed its certificate; the limits
+ * apply to each computer on its own, so a busy or stalled one leaves the others their capacity. */
+type Host = { port: number; fingerprint: string; server: TcpServer; control?: TLSSocket; lastPong: number; sockets: Set<Socket>; handshakes: Map<string, number>; handshaking: number };
 type Pending = { host: Host; socket: Socket; token: string; timer: ReturnType<typeof setTimeout>; hello: Buffer };
 export class RelayServer {
   private hosts: Host[];
   private tunnelServer: TlsServer;
   private pending = new Map<string, Pending>();
   private sockets = new Set<Socket>();
-  private handshakes = new Map<string, number>();
-  private handshaking = 0;
+  /** Connections to the tunnel port, whether or not they have shown a certificate yet. */
+  private tunnels = new Set<Socket>();
   private timer?: ReturnType<typeof setInterval>;
   private healthServer?: HttpServer;
   private constructor(readonly options: RelayServerOptions) {
@@ -49,14 +51,14 @@ export class RelayServer {
     if (hosts.length > RELAY_MAX_HOSTS || new Set(hosts.map(host => host.clientFingerprint256.toUpperCase())).size !== hosts.length) throw new Error("invalid_relay_hosts");
     if (options.localTls) { localTlsRouteSchema.parse(options.localTls); if (options.localTls.serverName.toLowerCase() === options.serverName.toLowerCase() || [options.publicPort, options.tunnelPort, options.healthPort].includes(options.localTls.targetPort)) throw new Error("invalid_local_tls_route"); }
     this.hosts = hosts.map(({ publicPort, clientFingerprint256 }, index) => {
-      const host: Host = { port: index === 0 ? options.publicPort ?? 443 : publicPort, fingerprint: clientFingerprint256.toUpperCase(), lastPong: 0, server: createTcpServer((socket) => this.acceptPublic(socket, host)) };
+      const host: Host = { port: index === 0 ? options.publicPort ?? 443 : publicPort, fingerprint: clientFingerprint256.toUpperCase(), lastPong: 0, sockets: new Set(), handshakes: new Map(), handshaking: 0, server: createTcpServer((socket) => this.acceptPublic(socket, host)) };
       return host;
     });
     // Bound unauthenticated handshakes at the TLS layer. A timeout on the raw
     // parent socket survives the handshake and kills otherwise healthy idle
     // streams even after their TLSSocket receives its longer data timeout.
     this.tunnelServer = createTlsServer({ ...options.tls, handshakeTimeout: 15_000, requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3", ALPNProtocols: [SOURCE_CONTROL_ALPN, CONTROL_ALPN, DATA_ALPN] }, (socket) => this.acceptTunnel(socket));
-    this.tunnelServer.on("connection", (socket) => { if (this.sockets.size >= (options.maxConnections ?? 256) * 2) { socket.destroy(); return; } this.track(socket); });
+    this.tunnelServer.on("connection", (socket) => { if (this.tunnels.size >= (options.maxConnections ?? 256) * 2 * this.hosts.length) { socket.destroy(); return; } this.track(socket, this.tunnels); });
     this.tunnelServer.on("tlsClientError", (_error, socket) => { socket.destroy(); options.onWarning?.("tunnel_authentication_failed"); });
   }
   static async start(options: RelayServerOptions): Promise<RelayServer> {
@@ -77,26 +79,26 @@ export class RelayServer {
     } catch (error) { await relay.close(); throw error; }
   }
   private listen(server: TcpServer, port: number, host: string): Promise<void> { return new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, host, () => { server.off("error", reject); resolve(); }); }); }
-  private track(socket: Socket): void { this.sockets.add(socket); socket.on("error", () => undefined); socket.once("close", () => this.sockets.delete(socket)); }
+  private track(socket: Socket, owner: Set<Socket>): void { this.sockets.add(socket); owner.add(socket); socket.on("error", () => undefined); socket.once("close", () => { this.sockets.delete(socket); owner.delete(socket); }); }
   private acceptPublic(socket: Socket, host: Host): void {
     const maximum = this.options.maxConnections ?? 256;
-    if (this.sockets.size >= maximum) { socket.destroy(); return; }
+    if (host.sockets.size >= maximum) { socket.destroy(); return; }
     // Before a complete ClientHello a socket is unauthenticated. Bound it by an
     // absolute deadline (each byte resets the inactivity timer), a per-source
-    // cap and half of all slots, so one slow sender cannot hold the capacity
-    // other clients and established streams need. Distributed floods remain
-    // the documented boundary.
+    // cap and half of this computer's slots, so one slow sender cannot hold the
+    // capacity other clients and established streams need. Distributed floods
+    // remain the documented boundary.
     const source = handshakeSource(socket.remoteAddress);
-    if (this.handshaking >= Math.max(1, Math.floor(maximum / 2)) || (this.handshakes.get(source) ?? 0) >= (this.options.maxHandshakesPerSource ?? 16)) { socket.destroy(); return; }
-    this.handshaking++; this.handshakes.set(source, (this.handshakes.get(source) ?? 0) + 1);
+    if (host.handshaking >= Math.max(1, Math.floor(maximum / 2)) || (host.handshakes.get(source) ?? 0) >= (this.options.maxHandshakesPerSource ?? 16)) { socket.destroy(); return; }
+    host.handshaking++; host.handshakes.set(source, (host.handshakes.get(source) ?? 0) + 1);
     let handshaking = true;
     const deadline = setTimeout(() => socket.destroy(), this.options.helloTimeoutMs ?? 10_000); deadline.unref();
     const handshakeDone = () => {
-      if (!handshaking) return; handshaking = false; clearTimeout(deadline); this.handshaking--;
-      const count = (this.handshakes.get(source) ?? 1) - 1; if (count > 0) this.handshakes.set(source, count); else this.handshakes.delete(source);
+      if (!handshaking) return; handshaking = false; clearTimeout(deadline); host.handshaking--;
+      const count = (host.handshakes.get(source) ?? 1) - 1; if (count > 0) host.handshakes.set(source, count); else host.handshakes.delete(source);
     };
     socket.once("close", handshakeDone);
-    this.track(socket); socket.setTimeout(10_000, () => socket.destroy());
+    this.track(socket, host.sockets); socket.setTimeout(10_000, () => socket.destroy());
     const ipEndpoint = isIP(this.options.serverName) !== 0;
     const reader = new ClientHelloReader(ipEndpoint);
     const receive = (chunk: Buffer) => {
@@ -104,7 +106,7 @@ export class RelayServer {
         const name = reader.push(chunk); if (name === undefined) return;
         handshakeDone();
         const hello = reader.bytes();
-        if (name === this.options.localTls?.serverName.toLowerCase()) { socket.pause(); socket.off("data", receive); this.forwardLocal(socket, hello, this.options.localTls.targetPort); return; }
+        if (name === this.options.localTls?.serverName.toLowerCase()) { socket.pause(); socket.off("data", receive); this.forwardLocal(socket, hello, this.options.localTls.targetPort, host); return; }
         const control = host.control;
         if (!(name === this.options.serverName.toLowerCase() || ipEndpoint && name === "") || !control) { socket.destroy(); return; }
         socket.pause(); socket.off("data", receive);
@@ -119,8 +121,8 @@ export class RelayServer {
   }
   /** Only the configured sibling service may terminate its own TLS on the VPS.
    * The Hub route always uses the authenticated Mac tunnel, including outages. */
-  private forwardLocal(socket: Socket, hello: Buffer, port: number): void {
-    const upstream = tcpConnect({ host: "127.0.0.1", port }); this.track(upstream);
+  private forwardLocal(socket: Socket, hello: Buffer, port: number, host: Host): void {
+    const upstream = tcpConnect({ host: "127.0.0.1", port }); this.track(upstream, host.sockets);
     upstream.setTimeout(10_000, () => upstream.destroy());
     coupleSockets(socket, upstream);
     upstream.once("connect", () => {
@@ -133,7 +135,8 @@ export class RelayServer {
     // The certificate says which computer this is. Everything it may do from here on is that computer's alone.
     const fingerprint = socket.getPeerCertificate().fingerprint256?.toUpperCase();
     const host = socket.authorized && fingerprint ? this.hosts.find(candidate => candidate.fingerprint === fingerprint) : undefined;
-    if (!host) { socket.destroy(); return; }
+    if (!host || host.sockets.size >= (this.options.maxConnections ?? 256) * 2) { socket.destroy(); return; }
+    host.sockets.add(socket); socket.once("close", () => host.sockets.delete(socket));
     socket.setTimeout(0);
     if (socket.alpnProtocol === CONTROL_ALPN || socket.alpnProtocol === SOURCE_CONTROL_ALPN) {
       if (host.control && !host.control.destroyed) { socket.destroy(); return; }
