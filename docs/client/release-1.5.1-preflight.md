@@ -22,6 +22,8 @@ Play DEX optimization / R8 follow-up. Keep `minifyEnabled false` for this
 release. The reported 1% obfuscation warning and February 2027 deadline remain
 open for the next version; no optimized-package regression or resolved-warning
 claim is made. The system-bar changes already merged in PR #45 remain in scope.
+Owner, 2026-11-22: "这条先去掉" removes the R8 / DEX item for now; it is not
+carried into the next release.
 
 Excalidraw, Vditor, Baoyu Design/PPT, runtime and ordinary library versions are
 not changed by this preflight. Complete the listed-integrations check and

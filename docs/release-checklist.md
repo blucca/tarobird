@@ -562,12 +562,10 @@ a test without an authorized rollout plan.
 
 ### Next Android release: Play Console follow-ups (2026-11-17)
 
-Owner amendment, 2026-11-18: "这次不要做了 等下次" defers the R8 / DEX
-optimization item below for release 1.5.1. Keep its existing configuration and
-carry the warning forward; this does not defer the already merged system-bar
-changes or their affected validation. GitHub APK and Play AAB use one version
-and code, with their distinct channel policies preserved. See
-[1.5.1 preflight](client/release-1.5.1-preflight.md).
+Owner instruction, 2026-11-22: "这条先去掉" removes the R8 / DEX optimization
+item from this follow-up for now. The deferral recorded in the
+[1.5.1 preflight](client/release-1.5.1-preflight.md) is history, not a pending
+release task.
 
 Owner instruction, 2026-11-17: "我们下一版安卓发版要注意", accompanied by three
 Console warnings for **1.5.0 / 2026110414**. Track them in the next release's
@@ -575,22 +573,6 @@ preflight with source changes, package evidence and any remaining limitation.
 This records future work; it does not change the current package or authorize
 an immediate rebuild, dependency upgrade or new publication.
 
-- **DEX optimization / obfuscation:** the screenshot reports **1% obfuscation**
-  and a **February 2027** deadline. The
-  [current Play requirement](https://support.google.com/googleplay/android-developer/answer/17492799?hl=en)
-  applies to apps with DEX code over 10 MB and requires at least 25% in each of
-  optimization, obfuscation and shrinking. Recheck applicability, deadline and
-  all three measured values for the actual uploaded bundle; do not substitute
-  the APK download size or infer compliance from a Gradle flag.
-- At source baseline `60ad1fb`, `client/android/app/build.gradle` has
-  `minifyEnabled false`. Prepare R8 changes before freezing, using the
-  [optimization guidance](https://developer.android.com/topic/performance/app-optimization/enable-app-optimization)
-  and narrow [keep rules](https://developer.android.com/topic/performance/app-optimization/keep-rules-overview).
-  Audit Capacitor/Cordova plugin discovery, JavaScript/native bridges,
-  reflection and serialization. Retain the exact build's mapping file for
-  retracing and supply it through the appropriate Play deobfuscation flow.
-  Do not add blanket keep rules merely to get a build to pass, or assume debug
-  tests exercise optimized release code.
 - **Edge-to-edge compatibility and deprecated system-bar APIs:** obtain the
   affected classes/methods from the Console report and distinguish app-owned
   code from dependencies. The baseline has safe-area handling in `NativeInsets`
@@ -612,11 +594,10 @@ an immediate rebuild, dependency upgrade or new publication.
   and three-button navigation; light/dark themes; keyboard open/close;
   portrait/landscape; background/resume; and fullscreen preview return. Check
   chat, bottom navigation and attachment controls for overlap or double padding.
-  For R8, exercise pairing/connection, messaging, push, plugin callbacks,
-  file save/share/open and each channel's updater/install policy. Preserve the
-  existing GitHub-to-Play data-retention checks and test both distributions.
-- After an authorized upload, read back the new bundle's DEX measurements and
-  all three Console warning statuses. Record unresolved items explicitly;
+  Preserve the existing GitHub-to-Play data-retention checks and test both
+  distributions.
+- After an authorized upload, read back the remaining Console warning statuses.
+  Record unresolved items explicitly;
   compilation, upload success or a quiet screen is not evidence that they are
   fixed. Keep the shared GitHub/Play version/code policy and existing freeze,
   dependency and mobile-runtime rules; this follow-up does not expand them.
