@@ -179,7 +179,10 @@ final class HubScreenSession: @unchecked Sendable {
         }
         if channel.role == .media {
             guard type == "stream" else { throw HubNetworkError("screen_protocol_invalid") }
-            try validateStream(value); stream = value; lastFrame = 0
+            try validateStream(value)
+            // Each stream config names a newer generation than the last (as Android).
+            if let last = stream.flatMap({ Self.integer($0["streamGeneration"]) }), let next = Self.integer(value["streamGeneration"]), next <= last { throw HubNetworkError("screen_stream_invalid") }
+            stream = value; lastFrame = 0
         } else {
             switch type {
             case "state": try applyState(value)

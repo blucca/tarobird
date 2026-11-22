@@ -433,9 +433,15 @@ final class ScreenClock: @unchecked Sendable {
         if stage.closed == nil { _ = try await restart(manager, log, fixture, chain, chainID, 3); try frame(fixture, chain, 3, 1); stage = try await packets(manager, log, chainID, 1) }
         observed["retainedPacketsStillBounded"] = stage.closed.map { "closed:" + $0 } ?? "admitted"
         try await peerClosed(fixture, chain)
+        // As Android: each stream config must name a newer generation than the last one.
+        let repeated = join(true), repeatedID = try await open(manager, log, fixture, document, repeated)
+        _ = try await restart(manager, log, fixture, repeated, repeatedID, 2)
+        _ = try fixture.request(["action": "stream", "id": sid(repeated), "generation": 2])
+        observed["repeatedGenerationRejected"] = try await packets(manager, log, repeatedID, 1).closed.map { "closed:" + $0 } ?? "admitted"
+        try await peerClosed(fixture, repeated)
         let expected = ["restartConfigDelivered": "Optional(2)", "restartWindowAdmittedBehindUnreadPacket": "admitted:\(w)", "restartedSessionStaysOpen": "open",
                         "generationWindowRefills": "admitted:\(w)", "generationWindowStillBounded": "closed:screen_viewer_congested",
-                        "retainedPacketsStillBounded": "closed:screen_viewer_congested"]
+                        "retainedPacketsStillBounded": "closed:screen_viewer_congested", "repeatedGenerationRejected": "closed:screen_stream_invalid"]
         let report = try JSONSerialization.data(withJSONObject: ["observed": observed, "expected": expected], options: [.prettyPrinted, .sortedKeys])
         FileHandle.standardError.write(report); FileHandle.standardError.write(Data("\n".utf8))
         for (name, value) in expected.sorted(by: { $0.key < $1.key }) { try check(observed[name] == value, "restart_" + name) }
