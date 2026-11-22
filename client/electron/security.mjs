@@ -78,9 +78,11 @@ export function secureSession(session, { owns = () => false, systemPreferences, 
   session.setDevicePermissionHandler(() => false);
   session.on('will-download', event => event.preventDefault());
   session.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !internalResource(details.url) && !widgetNetworkRequest(details) }));
-  // Widget requests never carry or receive cookies or HTTP credentials.
-  session.webRequest.onBeforeSendHeaders((details, callback) => callback(widgetNetworkRequest(details) ? { requestHeaders: withoutHeaders(details.requestHeaders, /^(?:cookie|authorization|proxy-authorization)$/i) } : {}));
-  session.webRequest.onHeadersReceived((details, callback) => callback(widgetNetworkRequest(details) ? { responseHeaders: withoutHeaders(details.responseHeaders, /^set-cookie2?$/i) } : {}));
+  // Widget requests never carry or receive cookies or HTTP credentials. Every
+  // allowed external request is a widget request, but its frame can detach
+  // after onBeforeRequest (details.frame becomes null), so strip by URL alone.
+  session.webRequest.onBeforeSendHeaders((details, callback) => callback(!internalResource(details.url) ? { requestHeaders: withoutHeaders(details.requestHeaders, /^(?:cookie|authorization|proxy-authorization)$/i) } : {}));
+  session.webRequest.onHeadersReceived((details, callback) => callback(!internalResource(details.url) ? { responseHeaders: withoutHeaders(details.responseHeaders, /^set-cookie2?$/i) } : {}));
 }
 
 export function secureContents(contents) {

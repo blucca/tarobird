@@ -93,7 +93,26 @@ test('both permission check and request paths deny unimplemented capabilities', 
   session.network({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: guest }, result => assert.deepEqual(result, { cancel: false }));
   session.send({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: guest, requestHeaders: { Cookie: 'a=1', Authorization: 'x', Accept: '*/*' } }, result => assert.deepEqual(result, { requestHeaders: { Accept: '*/*' } }));
   session.receive({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: guest, responseHeaders: { 'Set-Cookie': ['a=1'], 'Content-Type': ['image/png'] } }, result => assert.deepEqual(result, { responseHeaders: { 'Content-Type': ['image/png'] } }));
-  session.send({ url: 'https://evil.example', resourceType: 'image', requestHeaders: { Cookie: 'a=1' } }, result => assert.deepEqual(result, {}));
+  session.send({ url: 'https://evil.example', resourceType: 'image', requestHeaders: { Cookie: 'a=1' } }, result => assert.deepEqual(result, { requestHeaders: {} }));
+});
+
+// Electron documents details.frame as null once the frame is gone. A widget
+// request allowed while its frame was alive must not gain or send cookies
+// when the frame detaches before its headers.
+test('widget requests whose frame detached still lose cookies and credentials', () => {
+  const session = new EventEmitter(); Object.assign(session, {
+    setPermissionRequestHandler() {}, setPermissionCheckHandler() {}, setDevicePermissionHandler() {},
+    webRequest: { onBeforeRequest: fn => session.network = fn, onBeforeSendHeaders: fn => session.send = fn, onHeadersReceived: fn => session.receive = fn },
+  });
+  secureSession(session);
+  const guest = { url: 'about:srcdoc', parent: { url: 'tarobot-widget://sandbox/widget-sandbox.html', parent: { url: 'tarobot://app/index.html', parent: null } } };
+  session.network({ url: 'https://cdn.example.com/data.json', resourceType: 'xhr', frame: guest }, result => assert.deepEqual(result, { cancel: false }));
+  for (const frame of [null, undefined]) {
+    session.send({ url: 'https://cdn.example.com/data.json', resourceType: 'xhr', frame, requestHeaders: { Cookie: 'a=1', Authorization: 'x', 'Proxy-Authorization': 'y', Accept: '*/*' } }, result => assert.deepEqual(result, { requestHeaders: { Accept: '*/*' } }));
+    session.receive({ url: 'https://cdn.example.com/data.json', resourceType: 'xhr', frame, responseHeaders: { 'Set-Cookie': ['a=1'], 'set-cookie2': ['b=2'], 'Content-Type': ['application/json'] } }, result => assert.deepEqual(result, { responseHeaders: { 'Content-Type': ['application/json'] } }));
+  }
+  // App resources keep their headers.
+  session.send({ url: 'tarobot://app/index.html', resourceType: 'mainFrame', requestHeaders: { Accept: '*/*' } }, result => assert.deepEqual(result, {}));
 });
 
 test('design loader stays off the App origin and only its fixed path can load', async t => {
