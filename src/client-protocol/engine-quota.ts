@@ -54,6 +54,8 @@ export const quotaSnapshotSchema = z.object({
 }).strict();
 export const quotaScopeSchema = quotaSnapshotSchema.extend({
   id: identifier, revision: identifier, engine: quotaEngineSchema, label,
+  // Every Gateway and the Hub send "unverified": no reader proves that two Bots share an account, and the App
+  // never adds readings together. "verified" is accepted only so the schema need not change if one ever does.
   botIds: z.array(identifier).max(1000), sharing: z.enum(["verified", "unverified"]),
 }).strict();
 export const quotaDirectorySchema = z.object({ generatedAt: timestamp, scopes: z.array(quotaScopeSchema).max(256), truncated: z.boolean().optional() }).strict();
