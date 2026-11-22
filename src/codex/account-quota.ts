@@ -206,23 +206,39 @@ export function applyClaudeQuotaEvent(previous: QuotaSnapshot | undefined, value
 }
 
 /** The reply to Claude Code's `get_usage` control request, asked of a Bot's own running engine: no prompt, no model call.
- * Observed on Claude Code 2.1.330 (isolated probe, 2026-11-22): a process on an API key answers
- * `rate_limits_available: false` with `rate_limits: null`; a subscription answers one entry per window,
- * each `null` or `{ utilization, resets_at }`, with utilization already in percent. Other entries are ignored. */
+ * Observed on Claude Code 2.1.330 on 2026-11-22. A process on an API key answers `rate_limits_available: false`
+ * with `rate_limits: null` (isolated probe). A subscription answers one entry per shared window, each `null`
+ * (no such window running) or `{ utilization, resets_at }` with utilization already in percent, and
+ * `model_scoped: [{ display_name, utilization, resets_at }]` for a model with its own weekly allowance (the
+ * same reply lists it under `limits` as kind "weekly_scoped"). A model's window is its own pool naming that
+ * model, so it counts only for a Bot on it. Everything else in the reply is ignored. */
 export function parseClaudeUsage(value: unknown, now = Date.now()): QuotaSnapshot {
   const reply = quotaObject(value);
   if (reply.rate_limits_available !== true || reply.rate_limits == null) return unavailableQuota("claude", "mode_not_supported", now);
   const limits = quotaObject(reply.rate_limits), windows: QuotaWindow[] = [];
-  for (const [id, detail] of Object.entries(claudeWindows)) {
-    if (limits[id] == null) continue;
-    const reading = quotaObject(limits[id]);
-    if (reading.utilization == null) continue;
+  const window = (id: string, detail: { label: string; periodSeconds?: number }, source: unknown): QuotaWindow | undefined => {
+    const reading = quotaObject(source);
+    if (reading.utilization == null) return undefined;
     const resetsAt = typeof reading.resets_at === "number" ? unixTime(reading.resets_at) : isoTime(reading.resets_at);
-    windows.push({ id, label: detail.label, ...(detail.periodSeconds ? { periodSeconds: detail.periodSeconds } : {}), metric: "percent", usedPercent: number(reading.utilization, 100_000), availability: "unknown", ...observed(now), ...(resetsAt ? { resetsAt } : {}) });
+    return { id, label: detail.label, ...(detail.periodSeconds ? { periodSeconds: detail.periodSeconds } : {}), metric: "percent", usedPercent: number(reading.utilization, 100_000), availability: "unknown", ...observed(now), ...(resetsAt ? { resetsAt } : {}) };
+  };
+  for (const [id, detail] of Object.entries(claudeWindows)) {
+    const reading = limits[id] == null ? undefined : window(id, detail, limits[id]);
+    if (reading) windows.push(reading);
+  }
+  const pools: QuotaPool[] = windows.length ? [{ id: "claude", label: "Claude", sharing: "shared", availability: "unknown", windows, balances: [], constraints: [] }] : [];
+  if (limits.model_scoped != null) {
+    if (!Array.isArray(limits.model_scoped) || limits.model_scoped.length > 32) throw new QuotaReadError("invalid_response");
+    for (const [index, entry] of limits.model_scoped.entries()) {
+      const name = quotaNativeIdentity(quotaObject(entry).display_name);
+      // Only a plain model name is kept as a label; anything else is skipped, not guessed.
+      if (!name || !/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/.test(name)) continue;
+      const reading = window("seven_day", claudeWindows.seven_day, entry);
+      if (reading) pools.push({ id: `claude-model-${poolId(`${name}:${index}`)}`, label: name, models: [name], sharing: "model", availability: "unknown", windows: [reading], balances: [], constraints: [] });
+    }
   }
   const at = new Date(now).toISOString();
-  return safeSnapshot({ authMode: "subscription", capability: { mode: "active" }, state: windows.length ? "ready" : "unknown", availability: "unknown", observedAt: at, lastAttemptAt: at,
-    pools: windows.length ? [{ id: "claude", label: "Claude", sharing: "shared", availability: "unknown", windows, balances: [], constraints: [] }] : [], constraints: [], help: "claude_usage" });
+  return safeSnapshot({ authMode: "subscription", capability: { mode: "active" }, state: pools.length ? "ready" : "unknown", availability: "unknown", observedAt: at, lastAttemptAt: at, pools, constraints: [], help: "claude_usage" });
 }
 
 /** Antigravity CLI only guarantees local zero-turn `/usage --output-format json` from 1.1.11 onward. */

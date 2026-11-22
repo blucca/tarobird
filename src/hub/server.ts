@@ -1981,7 +1981,7 @@ export class HubServer {
         const worker = this.bots.get(botId);
         // An offline or older worker simply has no reading; the indicator is then absent, not an error.
         if (!worker?.contextUsage) { await reply(200, { supported: false }); return; }
-        const result = contextUsageSchema.parse(await this.callBot(botId, "context.usage", { conversationId }, 5_000));
+        const result = contextUsageSchema.parse(await this.callBot(botId, "context.usage", { conversationId }, 6_000));
         await authorize();
         await reply(200, result); return;
       }

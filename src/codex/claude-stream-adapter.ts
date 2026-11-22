@@ -562,8 +562,10 @@ export const CLAUDE_STREAM_INACTIVITY_TIMEOUT_MS = ENGINE_DEFAULT_INACTIVITY_TIM
 // within ~10 ms). Past these bounds the stop is unconfirmed and falls back to
 // the bounded process cleanup instead of leaving the session wedged.
 const CLAUDE_INTERRUPT_ACK_TIMEOUT_MS = 3_000;
-/** `get_usage` and `get_context_usage` answered within 10 ms on a running 2.1.330 process, also during a turn. */
-const CLAUDE_USAGE_ACK_TIMEOUT_MS = 3_000;
+/** Measured on Claude Code 2.1.330 (2026-11-22): on a subscription every `get_usage` took 3.6 to 4.5 s, because the
+ * CLI fetches the figures each time; `get_context_usage` took about 0.9 s with a full user configuration and
+ * under 10 ms with an empty one. An isolated process answered both while a turn was held open. */
+const CLAUDE_USAGE_ACK_TIMEOUT_MS = 7_000, CLAUDE_CONTEXT_ACK_TIMEOUT_MS = 4_000;
 /** A stop that Claude has not confirmed by then is reported as unconfirmed. */
 const CLAUDE_STOP_CONFIRM_TIMEOUT_MS = 10_000;
 const CLAUDE_STEER_ACK_TIMEOUT_MS = 5_000;
@@ -1279,7 +1281,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     const worker = this.workers.get(sessionId);
     if (!worker || worker.retired || this.destroyPromise || this.quotaWorkers.get(worker)?.unasked?.has("get_context_usage")) return null;
     let reply: Record<string, unknown>;
-    try { reply = await this.askUsage(worker, "get_context_usage"); } catch { return null; }
+    try { reply = await this.askUsage(worker, "get_context_usage", CLAUDE_CONTEXT_ACK_TIMEOUT_MS); } catch { return null; }
     const count = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
     const used = count(reply.totalTokens), window = count(reply.maxTokens) ?? count(reply.rawMaxTokens), compact = count(reply.autoCompactThreshold);
     if (this.workers.get(sessionId) !== worker || used === undefined || !window) return null;

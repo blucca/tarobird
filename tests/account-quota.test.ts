@@ -69,7 +69,7 @@ describe("account quota parsers", () => {
   it("reads the windows of a get_usage reply as percent already, and nothing else from it", () => {
     const reply = { session: { id: "private-session" }, subscription_type: "max", rate_limits_available: true, behaviors: {},
       rate_limits: { five_hour: { utilization: 12, resets_at: "2026-11-21T03:00:00+00:00", note: "private" }, seven_day: { utilization: 61.5, resets_at: 1795651200 },
-        seven_day_opus: null, seven_day_sonnet: { utilization: null, resets_at: null }, extra_usage: { is_enabled: true, used_credits: 5 }, model_scoped: [{ display_name: "private", utilization: 3 }] } };
+        seven_day_opus: null, seven_day_sonnet: { utilization: null, resets_at: null }, extra_usage: { is_enabled: true, used_credits: 5 }, seven_day_breakdown: { rows: [{ key: "private", display_name: "private", percent: 9 }] }, model_scoped: [] } };
     const result = parseClaudeUsage(reply, now);
     expect(result).toMatchObject({ authMode: "subscription", capability: { mode: "active" }, state: "ready", observedAt: "2026-11-21T00:00:00.000Z", help: "claude_usage" });
     expect(result.pools).toHaveLength(1);
@@ -77,6 +77,23 @@ describe("account quota parsers", () => {
       ["five_hour", 12, "2026-11-21T03:00:00.000Z", 18000], ["seven_day", 61.5, "2026-11-26T00:00:00.000Z", 604800]]);
     expect(JSON.stringify(result)).not.toMatch(/private|max|credits/);
     expect(quotaSnapshotSchema.safeParse(result).success).toBe(true);
+  });
+  it("keeps a model's own weekly allowance as its own pool, as the 2.1.330 subscription reply states it", () => {
+    // Field names and types of a real reply; the values are made up.
+    const reply = { session: {}, subscription_type: "max", rate_limits_available: true, behaviors: {}, rate_limits: { five_hour: null, seven_day: { utilization: 31, resets_at: "2026-11-25T02:00:00+00:00", limit_dollars: null, locked_reason: null },
+      seven_day_opus: null, seven_day_sonnet: null, extra_usage: { is_enabled: false, utilization: null }, spend: { percent: 0, severity: "normal" },
+      limits: [{ kind: "weekly_all", group: "g", percent: 31, severity: "normal", resets_at: "2026-11-25T02:00:00+00:00", scope: null, is_active: true }, { kind: "weekly_scoped", group: "g", percent: 64, severity: "normal", resets_at: "2026-11-25T02:00:00+00:00", scope: { model: {}, surface: null }, is_active: true }],
+      weekly_scoped_shares: [{ limit_index: 1, used_percent_of_weekly: 20, allowance_percent_of_weekly: 50 }],
+      model_scoped: [{ display_name: "Fable", utilization: 64, resets_at: "2026-11-25T02:00:00+00:00" }, { display_name: "No reading", utilization: null, resets_at: null }, { display_name: "<script>", utilization: 1, resets_at: null }] } };
+    const result = parseClaudeUsage(reply, now);
+    expect(result.pools.map(pool => [pool.label, pool.sharing, pool.models, pool.windows.map(window => [window.id, window.label, window.metric === "percent" && window.usedPercent, window.periodSeconds])])).toEqual([
+      ["Claude", "shared", undefined, [["seven_day", "7 days", 31, 604800]]],
+      ["Fable", "model", ["Fable"], [["seven_day", "7 days", 64, 604800]]],
+    ]);
+    expect(quotaSnapshotSchema.safeParse(result).success).toBe(true);
+    expect(parseClaudeUsage({ rate_limits_available: true, rate_limits: { five_hour: null, model_scoped: [{ display_name: "Fable", utilization: 5, resets_at: null }] } }, now)).toMatchObject({ state: "ready", pools: [{ label: "Fable" }] });
+    for (const bad of [{}, "x", Array.from({ length: 33 }, () => ({ display_name: "A", utilization: 1 })), [7], [{ display_name: 7, utilization: 1 }], [{ display_name: "Fable", utilization: "1" }]])
+      expect(() => parseClaudeUsage({ rate_limits_available: true, rate_limits: { model_scoped: bad } }, now)).toThrow("invalid_response");
   });
   it("answers an API-key or window-less get_usage reply as unsupported, never as zero", () => {
     for (const reply of [{ rate_limits_available: false, rate_limits: null }, { rate_limits_available: true, rate_limits: null }, { rate_limits: { five_hour: { utilization: 1 } } }])

@@ -11,13 +11,17 @@ page, it describes such a build; the Host API and CLI are unchanged.
 This is separate from conversation token counts and estimated costs: those do
 not establish an account's remaining allowance.
 
+A conversation also shows two symbols of its own (issue 68), described under
+"Symbols in a conversation" below: a battery for the Bot's quota and a ring for
+the conversation's context. They use the same Host API as the page and CLI.
+
 ## Supported native sources
 
 | Engine | Source and limits |
 | --- | --- |
 | Codex | Explicit read of native account and rate-limit APIs for a subscription identity. API-key/provider balances are not inferred. A cold reader uses a temporary CLI helper without creating a thread or sending a prompt. When the Host cannot verify the credential source from files (no `auth.json`, a keyring/auto store or an external helper), an explicit refresh still asks Codex's public `account/read`: "not signed in" becomes login required, and an account answer is shown for that one read only after the before/after identity check and only when the replies tie one stable user (`userId`), the workspace (`workspaceRouting.chatgptAccountId`, identical in both `account/read` replies) and the usage snapshot's own `accountId` to the same account, each a bounded whitespace-free token. Codex 0.170.0 documents none of these as guaranteed and does not scope `account/rateLimits/read` to the routed workspace in its protocol, so a missing usage account is never filled in from routing; such a reply, or one with only a type, plan or email, stays unverifiable and shows no values. A JSON-RPC -32603 reply with the CLI's exact unauthorized text from these quota calls (`workspace routing discovery unauthorized (401)`, `failed to fetch codex rate limits: … 401 Unauthorized`) is shown as login required, and the rate-limit call's `failed: 429 Too Many Requests` (status in its own position, not in a response body) as rate limited until a later read succeeds. A 429 during account discovery reaches `account/read` only as `workspace routing discovery failed`, with the status swallowed, so it stays a generic native error rather than a guess. Other native failures stay unavailable. Such a reading is never cached or reused. |
-| Claude | Native quota events observed during an ordinary conversation. Reading the card does not start a conversation or request a model response. An identity that cannot be verified, including an opaque Keychain credential source, remains unknown. |
-| Antigravity | No active reader until a successful public quota response and identity contract are verified. |
+| Claude | On an explicit refresh, a running Claude Code process of the Bot is asked with the `get_usage` control request (no prompt, no model call). The answer is about the account that process uses, so it is shown wherever the login is stored (credential file or system keychain). The reading is kept on that process's record and ends with it; no process is started for a reading. The shared windows form one pool; a model with its own weekly allowance (`model_scoped`) is a pool of its own that names that model. A process on an API key answers that it has no windows and nothing is shown. A CLI that refuses `get_usage` is asked once per process, and the earlier passive rule then applies: native quota events observed during an ordinary conversation count only for a credential source the Host can verify. |
+| Antigravity | On an explicit refresh, one `agy -p /usage --output-format json` read after an `agy --version` check (1.1.11 or newer), accepted only with zero turns. Never started without local login state, because an unauthenticated `agy` opens a browser sign-in. The print runtime and the ACP runtime use the same reader. Each usage group states the models it covers: the names listed in its description ("Models within this group: …"), or the group's own name for a separately metered model. |
 | Kimi | The currently integrated ACP contract has no verified quota reader. |
 | DeepSeek / Pi | No generic balance estimate is made across arbitrary providers. |
 
@@ -49,16 +53,16 @@ checked against the local CLIs' own help/changelog text and official docs:
 | `kimi_usage` | Interactive Kimi Code CLI `/usage`; ACP `/usage` only reports session tokens | Kimi Code 2.7.0 command definitions |
 | `deepseek_balance` | DeepSeek Platform balance for the official API; other providers' own consoles | DeepSeek API balance docs; DSH 0.2.2-rc.5 account plugin default origin |
 
-The guidance never triggers a read, a login or a model request. Claude's
-passive source stays hidden when its credential source cannot be verified
-(for example, a macOS Keychain login); the card states that limit instead of
-showing values that could belong to another account.
+The guidance never triggers a read, a login or a model request. Without a
+running Claude Code process there is nothing to ask, and a passive observation
+from a credential source the Host cannot verify (for example, a macOS Keychain
+login) stays hidden.
 
 ## Read and refresh behavior
 
-Opening the page and refreshing the directory reads worker caches only. Codex's
+Opening the page and refreshing the directory reads worker caches only. A
 per-card refresh is explicit, coalesced and limited to once per minute for the
-same identity revision. Claude reads passive observations only. Expired values
+same identity revision. Expired values
 are marked stale; reaching a reset time does not manufacture a full allowance.
 One shared rule (`quotaReadingExpired`) decides this for the Gateway, CLI output
 and the App: the reading's TTL, any window/credit expiry, or any reported reset
@@ -90,6 +94,54 @@ only in host-private identity hashing. Raw native failures are not forwarded.
 Cancelling a quota read must not destroy a shared chatting worker; dedicated
 helpers must actually exit before their reservation is released.
 
+## Symbols in a conversation
+
+In one conversation's own view the composer shows, left of the model control,
+a ring for context and a battery for quota, each with a number. The drawn part
+and the number are what is left. A symbol is there only while its value can be
+read; there is no placeholder. A board pane (ADHD) shows neither and asks for
+nothing. At a fifth left a symbol turns amber, at a twentieth red. Selecting
+the symbols opens the details: context used against its window and where the
+engine compacts by itself, and each quota window with its reset time.
+
+On a phone nothing sits beside the composer and context is not shown or asked
+for. The chat actions sheet has a "Quota" row with the number, opening the
+same details. When a twentieth or less is left, a red empty battery appears in
+the header: under the computer's name when several computers are paired, alone
+in that place otherwise.
+
+**Which quota counts.** A pool that names models counts only for a Bot on one
+of them; a pool that names none counts for every Bot. Antigravity's groups all
+name models, so one exhausted group does not alarm Bots on another. The number
+is the tightest remaining window of the pools that count. Claude names a model
+family ("Fable"), so its per-model pool counts for a Bot whose model id
+contains that name; extra-usage windows are not counted. When the Bot's pool cannot be told, no battery is
+shown: an Antigravity Bot on the engine's default model, or on a model no group
+lists (in agy 1.5.14, "Orchestrator (Argon)"; "Orchestrator (Neon)" is listed
+by its display name, which its id does not carry). A window past its reset
+time is left out.
+
+**When readings are taken.** There is no timer. A reading is taken when the
+conversation opens and when its newest finished Bot message changes (a reply
+has ended). The engine itself is asked for quota again only once the shown
+reading is five minutes old, or one minute when the details are opened; in
+between, the App shows what the Host holds. The last reading of a Bot is kept
+in memory only and shown for thirty minutes at most.
+
+**Context usage.** `GET /api/conversations/:id/context-usage?botId=` returns
+`{ supported, usedTokens?, windowTokens?, autoCompactTokens? }` to a member of
+that conversation; the Host and worker advertise
+`conversations.context-usage.v1`. The worker reports the engine's own figures
+for the session the conversation is bound to and never creates or resumes one:
+
+| Engine | Source |
+| --- | --- |
+| Codex | The thread usage Codex pushes (`thread/tokenUsage/updated`); the compaction point is this adapter's own (80% of the window). Absent before the first turn of a worker process and after a compaction until the next turn. |
+| Claude | `get_context_usage` on the conversation's running process, the figures of Claude's own `/context`. Absent without a running process. |
+| Antigravity | ACP runtime: the session's `usage_update`. Print runtime: none, because it reports token counts without a window. |
+| DeepSeek / Pi | The usage those adapters already report for `/context`. |
+| Kimi | None. |
+
 ## Validation boundary
 
 Parser, cache, revision, cancellation, authenticated HTTP/Gateway and App UI
@@ -98,3 +150,24 @@ against isolated loopback providers with synthetic identities. This establishes
 the native protocol and no-extra-prompt behavior, not subscription acceptance
 against every real account or installed device. Unsupported sources remain
 explicitly unsupported until that source has an implemented and verified path.
+
+Checked on 2026-11-22 for the symbols:
+
+- An isolated Claude Code 2.1.330 against a loopback model answered
+  `get_context_usage` and `get_usage` while a turn was held open (within
+  10 ms) and the turn then completed; it refused an unknown control subtype at
+  once, and on an API key it answered `rate_limits_available: false`.
+- The repository's Claude adapter and Gateway against a real Claude Code
+  2.1.330 on a subscription, with a process started for the check and no
+  prompt sent: every `get_usage` took 3.6 to 5.1 s (the CLI fetches the figures
+  each time), which is why the adapter waits up to 7 s; the reply gave the
+  shared weekly window and one `model_scoped` entry; a second refresh inside
+  the cooldown was answered from the process's record. `get_context_usage`
+  took 0.8 to 0.9 s with that user's full configuration.
+- The repository's Antigravity reader against a real signed-in agy 1.5.14
+  through the ACP adapter and the Gateway: three groups with their model
+  lists, about five seconds for the two processes.
+
+Not checked: `get_usage` during a real turn on a subscription, Codex context
+figures against a real session, and any of this in an installed App on a
+device.
