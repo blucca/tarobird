@@ -1106,3 +1106,54 @@ describe("AntigravityAcpAdapter launch flags under concurrent starts", () => {
     }
   });
 });
+
+describe("AntigravityAcpAdapter session config failures", () => {
+  it("ends the new agy acp process when a new conversation's session config fails, so retries do not pile up processes", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass", model: "gemini-0-removed" }));
+    await expect(adapter.sendUserMessage("tarobot-1", { text: "x", files: [] })).rejects.toThrow(/not available in this CLI/);
+    await expect(adapter.sendUserMessage("tarobot-1", { text: "x", files: [] })).rejects.toThrow(/not available in this CLI/);
+    expect(harness.spawnCalls).toHaveLength(2);
+    // Nobody learned these native sessions, so nothing could reach either process again.
+    await waitFor(() => harness.log.includes("kill:900") && harness.log.includes("kill:901"));
+    expect(harness.log.indexOf(`close:${SESSION_A}`)).toBeLessThan(harness.log.indexOf("kill:900"));
+  });
+
+  it("keeps a resumed conversation's process when its config is refused before any write", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass", model: "gemini-0-removed" }));
+    await expect(adapter.sendUserMessage(SESSION_A, { text: "x", files: [] })).rejects.toThrow(/not available in this CLI/);
+    expect(harness.log).not.toContain("kill:900");
+    expect(adapter.supportsSessionSteering(SESSION_A)).toBe(true);
+  });
+
+  it("ends the process when a config write times out, so a late write cannot change the next message's model", async () => {
+    // agy takes the model write but answers (and applies it) only later.
+    const late: Array<() => void> = [];
+    const harness = createHarness((server, index) => {
+      if (index !== 0) return;
+      const target = server as unknown as { handle(message: JsonRpcMessage): void };
+      const handle = target.handle.bind(server);
+      target.handle = (message) => {
+        if (message.method === "session/set_config_option" && message.params?.value === "gemini-4-argon") { late.push(() => handle(message)); return; }
+        handle(message);
+      };
+    });
+    const configPath = await configFile({ approvalMode: "bypass", model: "gemini-4-argon" });
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { configPath, initializeTimeoutMs: 40 }));
+    const first = adapter.sendUserMessage(SESSION_A, { text: "a", files: [] });
+    await expect(settleWithin(first)).rejects.toThrow(/set_config_option timed out/);
+
+    await writeFile(configPath, JSON.stringify({ engine: "antigravity", approvalMode: "bypass", model: "gemini-4-neon" }));
+    const second = adapter.sendUserMessage(SESSION_A, { text: "b", files: [] });
+    await waitFor(() => harness.children.some((child) => child.server.prompts.length === 1));
+    // The late write lands now, while the next message runs.
+    late[0]?.();
+    const running = harness.children.find((child) => child.server.prompts.length === 1)!.server;
+    const model = running.configOptions.find((option) => option.id === "model")?.currentValue;
+    expect(model).toBe("gemini-4-neon");
+    running.text("b");
+    running.respondPrompt();
+    await settleWithin(second);
+  });
+});

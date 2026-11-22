@@ -302,9 +302,12 @@ function createAcpStream(stdout: AgyReadable, stdin: AgyWritable, onActivity: ()
   return { readable, writable } as Stream;
 }
 
+/** A request that got no answer in time: agy may still carry it out later. */
+class AcpTimeoutError extends Error {}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
+    const timer = setTimeout(() => reject(new AcpTimeoutError(message)), ms);
     timer.unref?.();
     promise.then((value) => { clearTimeout(timer); resolve(value); }, (error: unknown) => { clearTimeout(timer); reject(error); });
   });
@@ -618,6 +621,12 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     worker.reserved = true;
     try {
       await this.applySessionConfig(worker, config);
+    } catch (error) {
+      // A new conversation's process is reachable by nobody once this message fails (the Host never
+      // learned its session id), and after an unanswered write the session's model or mode is unknown
+      // and may still change: either way the process is ended; a later message resumes the session.
+      if (worker.announceSession || error instanceof AcpTimeoutError) await this.closeWorker(worker, error instanceof Error ? error : undefined);
+      throw error;
     } finally {
       worker.reserved = false;
     }
