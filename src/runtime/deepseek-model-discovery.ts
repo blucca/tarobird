@@ -197,7 +197,9 @@ async function persistentRead(catalogHome: string, sharedHome: string, cwd: stri
 
 /** Keep only the package mirror between reads: credentials, configuration,
  * native state dsh wrote (imported settings, storages) and the profile's root
- * files are removed; the next read copies what it needs again. */
+ * files are removed; the next read copies what it needs again. A directory
+ * linked into the profile's root is part of the mirror: only a full mirror
+ * recreates it, and a Windows junction may refuse a plain unlink. */
 async function scrubCatalogHome(home: string): Promise<void> {
   await rm(path.join(home, CREDENTIALS), { force: true });
   for (const name of await readdir(home).catch(() => [] as string[])) {
@@ -208,7 +210,7 @@ async function scrubCatalogHome(home: string): Promise<void> {
   for (const name of await readdir(profile).catch(() => [] as string[])) {
     if (name === ".tarobird-profile-mirror.json") continue;
     const entry = path.join(profile, name), info = await lstat(entry).catch(() => undefined);
-    if (info && !info.isDirectory()) await rm(entry, { force: true });
+    if (info && !info.isDirectory() && !info.isSymbolicLink()) await rm(entry, { force: true });
   }
 }
 
