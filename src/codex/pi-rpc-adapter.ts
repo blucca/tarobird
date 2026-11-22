@@ -1139,9 +1139,11 @@ export class PiRpcAdapter implements CodexAdapter {
     if (event.type === "editor_text") worker.ui.editorText = { text: event.text, revision: ++worker.editorRevision };
     const turn = worker.turn, zh = turn?.input.locale === "zh";
     // Marked as coming from Pi or one of its extensions, so it is never read as something the model wrote.
-    const line = event.type === "editor_text"
+    // The Host can take an earlier text block as the answer (an empty or placeholder result) and act on its
+    // delivery tags; an extension's words are shown as written, never executed.
+    const line = this.shownNotExecuted(event.type === "editor_text"
       ? `${zh ? "[Pi 扩展] 建议的输入" : "[Pi extension] Suggested input"}:\n${event.text}`
-      : `${source === "host" ? "[Pi]" : zh ? "[Pi 扩展]" : "[Pi extension]"} ${event.text}`;
+      : `${source === "host" ? "[Pi]" : zh ? "[Pi 扩展]" : "[Pi extension]"} ${event.text}`, turn?.input.locale);
     if (turn && !turn.done.settled) {
       if (event.type === "notify") turn.notices.push(event.text);
       void this.emit(turn, { type: "assistant_text", text: line, sessionId: worker.sessionId });
