@@ -2094,7 +2094,10 @@ export class HubServer {
         await requireOwner();
         if (!this.botManager) throw new HubError("bot_creation_unavailable", 503);
         if (req.method === "GET") {
-          const catalog = await this.botManager.catalog(z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined));
+          // `refresh=<engine>` is the owner's "Refresh models": a new read of that engine, past the short retry
+          // window that keeps an unanswered read from starting the CLI on every look.
+          const refresh = createBotSchema.shape.engine.optional().parse(url.searchParams.get("refresh") ?? undefined);
+          const catalog = await this.botManager.catalog(z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined), refresh);
           // Existing clients do not understand Pi's provider/effort settings.
           // New App and CLI catalog readers opt in, just as engine settings do.
           await reply(200, url.searchParams.get("includePi") === "1" ? catalog : { ...catalog, engines: catalog.engines.filter(engine => engine.id !== "pi") });

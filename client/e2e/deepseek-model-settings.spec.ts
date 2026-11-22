@@ -159,9 +159,13 @@ test("DeepSeek creation retains selection on failed and empty refresh without al
     await page.getByLabel("工作区（可选）", { exact: true }).fill("/fixture/workspace");
     await page.getByLabel("工作区（可选）", { exact: true }).blur();
     await expect.poll(() => new URL(f.catalogRequests.at(-1)!).searchParams.get("workspace")).toBe("/fixture/workspace");
+    // Moving to another workspace is a look, not the owner's reread.
+    expect(new URL(f.catalogRequests.at(-1)!).searchParams.get("refresh")).toBeNull();
     await expect(create).toBeEnabled(); await expect(model).toHaveValue(choices[3]!.id); await expect(effort).toHaveValue("off");
     let release!: () => void; f.hold = new Promise<void>(resolve => { release = resolve; });
     await page.getByRole("button", { name: "重新读取模型", exact: true }).click();
+    // The button asks the Hub for a new read, which an unanswered read in its retry window would otherwise answer.
+    await expect.poll(() => new URL(f.catalogRequests.at(-1)!).searchParams.get("refresh")).toBe("deepseek");
     await expect(model).toHaveValue(choices[3]!.id); await expect(effort).toHaveValue("off"); await expect(create).toBeDisabled();
     f.failure = true; release(); f.hold = undefined;
     await expect(page.getByRole("alert")).toContainText("暂时无法读取可用引擎"); await expect(model).toHaveValue(choices[3]!.id); await expect(create).toBeDisabled();

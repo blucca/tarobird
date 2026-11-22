@@ -39,6 +39,8 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
   const [busy, setBusy] = useState(false), [error, setError] = useState(""); const [created, setCreated] = useState<Bot>();
   const pending = useRef<CreateBotInput>(undefined);
   const selectionOnRefresh = useRef<{ connection: HubConnection; engine: CreateBotInput["engine"] }>(undefined);
+  // Set only by "Refresh models": the Hub then reads that engine again instead of serving its last unanswered read.
+  const refreshEngine = useRef<CreateBotInput["engine"]>(undefined);
   const loadedCatalog = useRef<{ connection: HubConnection; attempt: number }>(undefined);
   const pathsReason = useId();
   const options = catalog?.engines.find((e) => e.id === engine);
@@ -59,7 +61,8 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
   useEffect(() => {
     if (catalog && loadedCatalog.current?.connection === connection && loadedCatalog.current.attempt === catalogAttempt) return;
     let alive = true; setCatalogError(undefined); setCatalogLoading(true);
-    void connection.http<BotCatalog>(`/api/bots/catalog?includePi=1${workspace.trim() ? `&workspace=${encodeURIComponent(workspace.trim())}` : ""}`).then((value) => { if (alive) {
+    const refresh = refreshEngine.current; refreshEngine.current = undefined;
+    void connection.http<BotCatalog>(`/api/bots/catalog?includePi=1${workspace.trim() ? `&workspace=${encodeURIComponent(workspace.trim())}` : ""}${refresh ? `&refresh=${refresh}` : ""}`).then((value) => { if (alive) {
       setCatalog(value);
       const keep = selectionOnRefresh.current ?? (catalog && loadedCatalog.current?.connection === connection ? { connection, engine } : undefined);
       loadedCatalog.current = { connection, attempt: catalogAttempt };
@@ -124,7 +127,7 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
         {engine === "pi" ? <PiModelSelect models={models} value={model} disabled={busy || catalogLoading} change={value => { const next = selectModel(models, value, { model, effort }); setModel(next.model); setEffort(next.effort); setEffortAdjusted(!!displayedEffort && next.effort !== displayedEffort); }}/> : <label>{t("模型")}<select aria-label={t("模型")} disabled={catalogLoading} value={selectedModel?.id ?? model} onChange={(e) => { const next = selectModel(models, e.target.value, { model, effort }); setModel(next.model); setEffort(next.effort); setEffortAdjusted(!!displayedEffort && next.effort !== displayedEffort); }}>{options?.available && !selectedModel && <option value={model} disabled>{model || t("引擎默认")}</option>}{models.map((m) => <option key={m.id} value={m.id} disabled={defaultUnavailable && !m.id}>{defaultUnavailable && !m.id ? t("跟随引擎默认模型（未设置）") : modelOptionLabel(m, t("跟随引擎默认模型"))}</option>)}</select></label>}
         <label>{t("推理强度（effort）")}<select aria-label={t("推理强度（effort）")} disabled={catalogLoading} value={displayedEffort} onChange={(e) => { const next = selectModelEffort(selectedModel, model, e.target.value as CreateBotInput["effort"]); if (next) { setModel(next.model); setEffort(next.effort); setEffortAdjusted(false); } }}>{!levels.includes(displayedEffort) && <option value={displayedEffort} disabled>{displayedEffort} · {t("当前模型不支持")}</option>}{levels.map((value) => <option key={value} value={value}>{engine === "deepseek" && value === "off" ? t("关闭推理（off）") : value || t("跟随引擎默认强度")}</option>)}</select></label>
       </div>
-      {(engine === "pi" || engine === "deepseek") && options?.available && <>{engine === "pi" ? <PiModelCatalogNotice status={options.catalogStatus}/> : <DeepSeekModelCatalogNotice status={options.catalogStatus} defaultUnavailable={defaultUnavailable}/>}<button type="button" disabled={busy || catalogLoading || !online || !!pending.current} onClick={reloadCatalog}>{t("重新读取模型")}</button></>}
+      {(engine === "pi" || engine === "deepseek") && options?.available && <>{engine === "pi" ? <PiModelCatalogNotice status={options.catalogStatus}/> : <DeepSeekModelCatalogNotice status={options.catalogStatus} defaultUnavailable={defaultUnavailable}/>}<button type="button" disabled={busy || catalogLoading || !online || !!pending.current} onClick={() => { refreshEngine.current = engine; reloadCatalog(); }}>{t("重新读取模型")}</button></>}
       {options?.available && !validSelection && !followsUnavailableDefault && !deepSeekCatalogBlocked(engine, options.catalogStatus) && <p role="alert" className="dashboard-notice">{t("此前选择的模型或推理强度已不可用，请重新选择。")}</p>}
       {effortAdjusted && <p className="dashboard-notice">{t("已调整为此模型支持的思考强度，请确认。")}</p>}
       {engine === "antigravity" && !model && <p className="new-bot-hint">{t("跟随默认模型时也跟随默认强度；选择具体模型后可调整其支持的档位。")}</p>}
