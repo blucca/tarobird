@@ -84,6 +84,8 @@ export type AntigravityAcpAdapterOptions = {
   cancelGraceMs?: number;
   /** Quiet period after an idle session's last usage_update. */
   wakeQuietMs?: number;
+  /** How long a steer waits for agy to take it over before it is reported as uncertain. */
+  steerAdmissionTimeoutMs?: number;
   idleWorkerTtlMs?: number;
   idleSweepIntervalMs?: number;
   turnTimeoutMs?: number | null;
@@ -123,6 +125,7 @@ type Admission = { admitted: true } | { admitted: false; error?: unknown };
 type PromptEntry = {
   seq: number;
   settled: boolean;
+  steer?: boolean;
   outcome?: PromptOutcome;
   /** A steer waits for agy to take it: the prompt it replaces returns first. */
   admission?: (result: Admission | undefined) => void;
@@ -134,8 +137,8 @@ type Turn = {
   text: string;
   usage: AdapterUsage | undefined;
   toolSeen: boolean;
-  /** The owner declined an approval request in this turn. */
-  declined: boolean;
+  /** Length of the reply text when the owner last declined an approval in this turn. */
+  declinedAt?: number;
   locale?: CodexUserMessageInput["locale"];
   onProgress?: CodexUserMessageInput["onProgress"];
   onEngineEvent?: CodexUserMessageInput["onEngineEvent"];
@@ -213,7 +216,7 @@ const DEFAULT_IDLE_SWEEP_INTERVAL_MS = 60_000;
 export const ANTIGRAVITY_ACP_TURN_TIMEOUT_MS = 6 * 60 * 60_000;
 export const ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS = 30 * 60_000;
 const STOPPED_BY_USER = "Task was stopped by user";
-const STEER_ADMISSION_TIMEOUT_MS = 10_000;
+const DEFAULT_STEER_ADMISSION_TIMEOUT_MS = 10_000;
 const MAX_NATIVE_COMMANDS = 500;
 const NATIVE_COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const ANTIGRAVITY_EFFORTS: ReadonlySet<string> = new Set(ANTIGRAVITY_EFFORT_LEVELS);
@@ -430,6 +433,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private readonly closeTimeoutMs: number;
   private readonly cancelGraceMs: number;
   protected readonly wakeQuietMs: number;
+  private readonly steerAdmissionTimeoutMs: number;
   private readonly idleWorkerTtlMs: number;
   private readonly turnTimeoutMs: number | null;
   private readonly inactivityTimeoutMs: number | null;
@@ -450,6 +454,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.cancelGraceMs = options.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS;
     this.wakeQuietMs = options.wakeQuietMs ?? DEFAULT_WAKE_QUIET_MS;
+    this.steerAdmissionTimeoutMs = options.steerAdmissionTimeoutMs ?? DEFAULT_STEER_ADMISSION_TIMEOUT_MS;
     this.idleWorkerTtlMs = options.idleWorkerTtlMs ?? DEFAULT_IDLE_WORKER_TTL_MS;
     this.turnTimeoutMs = options.turnTimeoutMs === undefined ? ANTIGRAVITY_ACP_TURN_TIMEOUT_MS : options.turnTimeoutMs;
     this.inactivityTimeoutMs = options.inactivityTimeoutMs === undefined ? ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS : options.inactivityTimeoutMs;
@@ -495,7 +500,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const admission = await new Promise<Admission | undefined>((resolve) => {
       const entry = this.sendPrompt(turn, [{ type: "text", text }], (result) => { if (timer) clearTimeout(timer); entry.admission = undefined; resolve(result); });
-      timer = setTimeout(() => { entry.admission = undefined; resolve(undefined); }, STEER_ADMISSION_TIMEOUT_MS);
+      timer = setTimeout(() => { entry.admission = undefined; resolve(undefined); }, this.steerAdmissionTimeoutMs);
       timer.unref?.();
     });
     if (admission?.admitted) return true;
@@ -709,11 +714,13 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       if (level) {
         // Changing the model returns that model's own thinking levels.
         const levels = findOption(worker.configOptions, "thought_level");
+        // A model without thinking levels (agy drops the option, e.g. for
+        // gpt-oss-120b-medium) runs with the model alone; the effort is skipped.
         const allowed = levels?.options.map((option) => option.value) ?? [];
-        if (!allowed.includes(level)) {
+        if (levels && !allowed.includes(level)) {
           throw new Error(`Invalid model selection: ${model ?? modelOption?.currentValue ?? "the current model"} has no "${level}" effort (available: ${allowed.join(", ")})`);
         }
-        if (levels?.currentValue !== level) await this.setConfigOption(worker, levels!.id, level);
+        if (levels && levels.currentValue !== level) await this.setConfigOption(worker, levels.id, level);
       }
       worker.configKey = key;
     }
@@ -737,7 +744,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private runTurn(worker: Worker, prompt: ContentBlock[], input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     return new Promise<CodexAdapterResponse>((resolve, reject) => {
       const turn: Turn = {
-        worker, prompts: [], text: "", usage: undefined, toolSeen: false, declined: false, locale: input.locale,
+        worker, prompts: [], text: "", usage: undefined, toolSeen: false, locale: input.locale,
         onProgress: input.onProgress, onEngineEvent: input.onEngineEvent, onApprovalRequest: input.onApprovalRequest,
         approvals: new AbortController(), eventChain: Promise.resolve(), stopRequested: false,
         timeoutsDisabled: input.disableRuntimeTimeout === true, done: false, resolve, reject,
@@ -766,7 +773,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   /** One session/prompt of a turn. The newest outstanding prompt owns the turn's result. */
   protected sendPrompt(turn: Turn, prompt: ContentBlock[], admission?: PromptEntry["admission"]): PromptEntry {
     const worker = turn.worker;
-    const entry: PromptEntry = { seq: ++worker.promptSeq, settled: false, ...(admission ? { admission } : {}) };
+    const entry: PromptEntry = { seq: ++worker.promptSeq, settled: false, ...(admission ? { admission, steer: true } : {}) };
     turn.prompts.push(entry);
     this.markActivity(worker);
     worker.connection.agent.request(acpMethods.agent.session.prompt, { sessionId: worker.sessionId!, prompt }).then(
@@ -780,13 +787,10 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     entry.settled = true;
     entry.outcome = outcome;
     if (outcome.result) turn.usage = addUsage(turn.usage, usageFromPrompt(outcome.result));
-    if (entry.admission) {
-      if (outcome.error !== undefined) {
-        // A refused steer never joined the run; the prompt before it still owns the turn.
-        turn.prompts = turn.prompts.filter((candidate) => candidate !== entry);
-        entry.admission({ admitted: false, error: outcome.error });
-      } else entry.admission({ admitted: true });
-    }
+    // A refused steer never joined the run, even when its admission wait has
+    // already ended; the prompt before it still owns the turn.
+    if (entry.steer && outcome.error !== undefined) turn.prompts = turn.prompts.filter((candidate) => candidate !== entry);
+    if (entry.admission) entry.admission(outcome.error !== undefined ? { admitted: false, error: outcome.error } : { admitted: true });
     if (outcome.result) {
       // agy returned this prompt because the next one took over the run.
       turn.prompts.find((candidate) => candidate.seq > entry.seq && !candidate.settled)?.admission?.({ admitted: true });
@@ -816,12 +820,13 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       error = new Error("Antigravity refused to continue this request");
     } else if (stopReason === "max_tokens" || stopReason === "max_turn_requests") {
       error = new EngineIncompleteResponseError(`Antigravity stopped (${stopReason}): the answer is incomplete`, "interrupted");
-    } else if (!turn.text.trim() && turn.declined) {
-      // agy often ends the turn without text once an action is declined. That
-      // is the owner's choice, not a failure: say so plainly.
-      this.settleTurn(turn, undefined, turn.locale === "zh"
-        ? "已拒绝执行该操作，Antigravity 已停止本轮。"
-        : "The action was declined, so Antigravity stopped this turn.");
+    } else if (turn.declinedAt !== undefined && !turn.text.slice(turn.declinedAt).trim()) {
+      // agy often ends the turn without more text once an action is declined.
+      // That is the owner's choice, not a failure: say so plainly, after any
+      // text the model wrote before the declined action.
+      const note = turn.locale === "zh" ? "已拒绝执行该操作，Antigravity 已停止本轮。" : "The action was declined, so Antigravity stopped this turn.";
+      const before = turn.text.trim();
+      this.settleTurn(turn, undefined, before ? `${before}\n\n${note}` : note);
       return;
     } else if (!turn.text.trim()) {
       error = turn.toolSeen
@@ -1057,7 +1062,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
     if (turn.approvals.signal.aborted || turn.done) return { outcome: { outcome: "cancelled" } };
     if (decision.behavior === "allow" && allow) return { outcome: { outcome: "selected", optionId: allow } };
-    if (decision.behavior === "deny") turn.declined = true;
+    if (decision.behavior === "deny") turn.declinedAt = turn.text.length;
     return reject ? { outcome: { outcome: "selected", optionId: reject } } : { outcome: { outcome: "cancelled" } };
   }
 

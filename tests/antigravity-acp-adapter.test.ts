@@ -174,6 +174,11 @@ class FakeAgyServer {
       const configId = String(message.params?.configId);
       const value = String(message.params?.value);
       this.configOptions = this.configOptions.map((option) => option.id === configId ? { ...option, currentValue: value } : option);
+      // agy 1.5.14 drops thought_level for a model without thinking levels (gpt-oss-120b-medium).
+      if (configId === "model") this.configOptions = value === "gpt-oss-120b-medium"
+        ? this.configOptions.filter((option) => option.id !== "thought_level")
+        : this.configOptions.some((option) => option.id === "thought_level") ? this.configOptions
+          : [...this.configOptions, { id: "thought_level", name: "Thinking Level", category: "thought_level", type: "select", currentValue: "high", options: LEVEL_OPTIONS }];
       this.respond(message, { configOptions: this.configOptions });
       return;
     }
@@ -373,14 +378,28 @@ describe("AntigravityAcpAdapter core", () => {
 
     // An exact option id is used as-is; an explicit effort is applied separately.
     const exact = createHarness();
-    const exactAdapter = track(await adapterFor(exact, { approvalMode: "bypass", model: "gpt-oss-120b-medium", effort: "low" }));
+    const exactAdapter = track(await adapterFor(exact, { approvalMode: "bypass", model: "gemini-4-neon", effort: "low" }));
     void exactAdapter.sendUserMessage("tarobot-1", { text: "x", files: [] }).catch(() => undefined);
     await waitFor(() => exact.children[0]?.server.prompts.length === 1);
     expect(exact.children[0]!.server.requests("session/set_config_option").map((message) => message.params)).toEqual([
-      { sessionId: SESSION_A, configId: "model", value: "gpt-oss-120b-medium" },
       { sessionId: SESSION_A, configId: "thought_level", value: "low" },
     ]);
     expect(exact.children[0]!.server.requests("session/set_mode")).toHaveLength(0);
+  });
+
+  it("applies a model that has no thinking levels and skips the saved effort", async () => {
+    // The App saves the preset's own effort with gpt-oss-120b-medium; agy then offers no thought_level.
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass", model: "gpt-oss-120b-medium", effort: "medium" }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    expect(server.requests("session/set_config_option").map((message) => message.params)).toEqual([
+      { sessionId: SESSION_A, configId: "model", value: "gpt-oss-120b-medium" },
+    ]);
+    server.text("OK");
+    server.respondPrompt();
+    await expect(settleWithin(reply)).resolves.toMatchObject({ text: "OK" });
   });
 
   it("refuses an effort the CLI does not offer before sending the prompt", async () => {
@@ -430,6 +449,27 @@ describe("AntigravityAcpAdapter core", () => {
     const text = locale === "zh" ? "已拒绝执行该操作，Antigravity 已停止本轮。" : "The action was declined, so Antigravity stopped this turn.";
     await expect(settleWithin(reply)).resolves.toEqual({ text, sessionId: SESSION_A });
     expect(events.filter((event) => event.type === "result")).toEqual([{ type: "result", text, sessionId: SESSION_A }]);
+  });
+
+  it("adds the declined note after text the model wrote before the declined action", async () => {
+    for (const after of ["", "I will not run it then."]) {
+      const harness = createHarness();
+      const adapter = track(await adapterFor(harness, { approvalMode: "normal" }));
+      const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [], locale: "zh", onApprovalRequest: async () => ({ behavior: "deny" }) });
+      await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+      const server = harness.children[0]!.server;
+      server.text("好的，我现在执行命令。");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const permission = server.requestPermission();
+      await waitFor(() => server.clientResponses.has(permission));
+      server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_1", status: "failed", rawOutput: { output: "" } });
+      if (after) server.text(after);
+      server.respondPrompt({ stopReason: "end_turn" });
+      await expect(settleWithin(reply)).resolves.toMatchObject({ text: after
+        // Text after the decline means the model already answered it: the reply is left as is.
+        ? `好的，我现在执行命令。${after}`
+        : "好的，我现在执行命令。\n\n已拒绝执行该操作，Antigravity 已停止本轮。" });
+    }
   });
 
   it("keeps the empty-reply error when an action was allowed, not declined", async () => {
@@ -691,6 +731,16 @@ describe("AntigravityAcpAdapter steering", () => {
     await waitFor(() => server.prompts.length === 2);
     server.failPrompt({ code: -32603, message: "Can't add this prompt to session: the running prompt is waiting for a permission or question answer" });
     await expect(settleWithin(steer)).rejects.toMatchObject({ name: "EngineSteeringRejectedError", reason: "not_ready" });
+    server.text("original answer");
+    server.respondPrompt();
+    await expect(settleWithin(reply)).resolves.toMatchObject({ text: "original answer" });
+  });
+
+  it("drops a steer that agy refuses after the admission wait ended, so the turn still completes", async () => {
+    const { adapter, server, reply } = await runningTurn({ approvalMode: "bypass" }, { steerAdmissionTimeoutMs: 20 });
+    await expect(adapter.steerActiveTurn(SESSION_A, { text: "extra", throwOnError: true })).rejects.toThrow("did not confirm");
+    server.failPrompt({ code: -32603, message: "Can't add this prompt to session: the running prompt is waiting for a permission or question answer" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
     server.text("original answer");
     server.respondPrompt();
     await expect(settleWithin(reply)).resolves.toMatchObject({ text: "original answer" });
