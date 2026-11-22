@@ -75,3 +75,17 @@ test("keyboard users keep their place, and without a session focus returns to th
   await expect(toggle).toBeFocused();await page.keyboard.press("Enter");await expect(page.getByLabel("发送到远端的文本")).toHaveCount(0);await expect(toggle).toBeFocused();
   await typeInTray(page,presses.touch!);await presses.touch!(page,"键盘与快捷键");await expect(toggle).toBeFocused();
 });
+
+// The "more" tray unmounts with its buttons. A tapped button there (Android
+// focuses it) must not leave focus on <body>, where renewals stop.
+for(const [platform,pointer] of [["android","touch"]] as const)
+test(`${platform} ${pointer}: fitting the picture from the more tray keeps control and its renewals`,async({page})=>{
+  await controlling(page,platform);const press=presses[pointer]!;
+  const controls=await sent(page,"control");
+  await press(page,"屏幕更多操作");await press(page,"适应窗口");await expect(page.getByRole("button",{name:"适应窗口",exact:true})).toHaveCount(0);
+  expect.soft(await focusName(page),"focus stays in the viewer").not.toBe("body");
+  const renewed=await sent(page,"renew");await page.waitForTimeout(3500);
+  expect(await sent(page,"renew"),"renewals continue").toBeGreaterThanOrEqual(renewed+2);
+  await expect(page.getByRole("button",{name:"停止控制",exact:true})).toBeVisible();
+  expect(await sent(page,"control")).toBe(controls);
+});
