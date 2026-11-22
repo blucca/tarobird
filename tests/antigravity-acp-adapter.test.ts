@@ -416,6 +416,35 @@ describe("AntigravityAcpAdapter core", () => {
     await settleWithin(reply);
   });
 
+  for (const locale of [undefined, "zh"] as const) it(`ends a turn normally when the user declined an action and agy stopped without text · ${locale ?? "default"}`, async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "normal" }));
+    const events: EngineStreamEvent[] = [];
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [], ...(locale ? { locale } : {}), onEngineEvent: (event) => { events.push(event); }, onApprovalRequest: async () => ({ behavior: "deny" }) });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const permission = server.requestPermission();
+    await waitFor(() => server.clientResponses.has(permission));
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_1", status: "failed", rawOutput: { output: "" } });
+    server.respondPrompt({ stopReason: "end_turn" });
+    const text = locale === "zh" ? "已拒绝执行该操作，Antigravity 已停止本轮。" : "The action was declined, so Antigravity stopped this turn.";
+    await expect(settleWithin(reply)).resolves.toEqual({ text, sessionId: SESSION_A });
+    expect(events.filter((event) => event.type === "result")).toEqual([{ type: "result", text, sessionId: SESSION_A }]);
+  });
+
+  it("keeps the empty-reply error when an action was allowed, not declined", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "normal" }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [], onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }) });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const permission = server.requestPermission();
+    await waitFor(() => server.clientResponses.has(permission));
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_1", status: "completed", rawOutput: { output: "" } });
+    server.respondPrompt({ stopReason: "end_turn" });
+    await expect(settleWithin(reply)).rejects.toThrow("Antigravity completed without returning a response");
+  });
+
   it("sends images and text files natively and binary files only as paths", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agy-acp-files-"));
     tempRoots.push(root);

@@ -134,6 +134,9 @@ type Turn = {
   text: string;
   usage: AdapterUsage | undefined;
   toolSeen: boolean;
+  /** The owner declined an approval request in this turn. */
+  declined: boolean;
+  locale?: CodexUserMessageInput["locale"];
   onProgress?: CodexUserMessageInput["onProgress"];
   onEngineEvent?: CodexUserMessageInput["onEngineEvent"];
   onApprovalRequest?: CodexUserMessageInput["onApprovalRequest"];
@@ -734,7 +737,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private runTurn(worker: Worker, prompt: ContentBlock[], input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     return new Promise<CodexAdapterResponse>((resolve, reject) => {
       const turn: Turn = {
-        worker, prompts: [], text: "", usage: undefined, toolSeen: false,
+        worker, prompts: [], text: "", usage: undefined, toolSeen: false, declined: false, locale: input.locale,
         onProgress: input.onProgress, onEngineEvent: input.onEngineEvent, onApprovalRequest: input.onApprovalRequest,
         approvals: new AbortController(), eventChain: Promise.resolve(), stopRequested: false,
         timeoutsDisabled: input.disableRuntimeTimeout === true, done: false, resolve, reject,
@@ -813,6 +816,13 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       error = new Error("Antigravity refused to continue this request");
     } else if (stopReason === "max_tokens" || stopReason === "max_turn_requests") {
       error = new EngineIncompleteResponseError(`Antigravity stopped (${stopReason}): the answer is incomplete`, "interrupted");
+    } else if (!turn.text.trim() && turn.declined) {
+      // agy often ends the turn without text once an action is declined. That
+      // is the owner's choice, not a failure: say so plainly.
+      this.settleTurn(turn, undefined, turn.locale === "zh"
+        ? "已拒绝执行该操作，Antigravity 已停止本轮。"
+        : "The action was declined, so Antigravity stopped this turn.");
+      return;
     } else if (!turn.text.trim()) {
       error = turn.toolSeen
         ? new EngineIncompleteResponseError("Antigravity completed without returning a response", "interrupted")
@@ -821,7 +831,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     this.settleTurn(turn, error);
   }
 
-  private settleTurn(turn: Turn, error?: Error): void {
+  private settleTurn(turn: Turn, error?: Error, reply?: string): void {
     if (turn.done) return;
     turn.done = true;
     const worker = turn.worker;
@@ -832,7 +842,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     turn.approvals.abort();
     for (const entry of turn.prompts) entry.admission?.(undefined);
     worker.lastActivityAt = Date.now();
-    const text = turn.text.trim();
+    const text = reply ?? turn.text.trim();
     if (!error) this.emit(turn, { type: "result", text, sessionId: worker.sessionId! });
     void turn.eventChain.then(() => {
       if (error) turn.reject(error);
@@ -1047,6 +1057,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
     if (turn.approvals.signal.aborted || turn.done) return { outcome: { outcome: "cancelled" } };
     if (decision.behavior === "allow" && allow) return { outcome: { outcome: "selected", optionId: allow } };
+    if (decision.behavior === "deny") turn.declined = true;
     return reject ? { outcome: { outcome: "selected", optionId: reject } } : { outcome: { outcome: "cancelled" } };
   }
 
