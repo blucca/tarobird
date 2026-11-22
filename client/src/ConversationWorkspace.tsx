@@ -230,13 +230,13 @@ export function ConversationWorkspace({
     if (!online) return () => abort.abort();
 
     // 2. Conversation files
-    const fileParams = new URLSearchParams({ conversationId: convId, limit: "12" });
+    const fileParams = new URLSearchParams({ conversationId: convId, q: "" });
     void connection.http(`/api/conversation-files?${fileParams}`, { signal: abort.signal })
       .then(raw => {
         if (abort.signal.aborted) return;
         const page = conversationFilesPageSchema.parse(raw);
-        setFiles(page.items);
-        setFilesHasMore(!!page.nextCursor);
+        setFiles(page.items.slice(0, 12));
+        setFilesHasMore(!!page.nextCursor || page.items.length > 12);
       })
       .catch(() => undefined);
 

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { HubServer } from "../../src/hub/server.js";
+import { RunJournal } from "../../src/hub/run-journal.js";
 import { hashSecret } from "../../src/hub/auth.js";
 import { networkId } from "../../src/hub/private-network.js";
 import { networkManifestSchema } from "../../src/client-protocol/private-network.js";
@@ -29,13 +30,14 @@ async function noHorizontalOverflow(page: Page, selector?: string) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 }
 
-async function insertBotMessage(hub: HubServer, botId: string, conversationId: string, replyTo: string, blocks: unknown[], status = "complete") {
-  const id = `bm_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
-  await hub.store.db.run(
-    "INSERT INTO messages(id,conversation_id,author_type,author_id,reply_to,blocks_json,status,version,created_at) VALUES(?,?,'bot',?,?,?,?,1,?)",
-    [id, conversationId, botId, replyTo, JSON.stringify(blocks), status, Date.now()],
-  );
-  return id;
+async function insertBotMessage(hub: HubServer, botId: string, conversationId: string, replyTo: string, blocks: unknown[], status: "complete" | "streaming" = "complete") {
+  const message = await hub.store.publishBotMessage(botId, {
+    conversationId,
+    replyTo,
+    blocks: blocks as never,
+    status,
+  });
+  return message.id;
 }
 
 for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
@@ -99,9 +101,114 @@ for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
         mentions: ["bot_arch"],
         previewUrl: null,
       });
-      await insertBotMessage(hub, "bot_arch", mainChat.id, userMsg.id, [
-        { type: "text", text: locale === "en" ? "I delegated the code audit to Reviewer and the benchmark summary to Researcher." : "我已将代码审计委派给 Reviewer，并将基准测试汇总交给 Researcher。" },
+      const runId = "run_ws_demo_1";
+      const runStart = Date.now() - 12_000;
+      const runEnd = Date.now() - 2_000;
+      await hub.store.db.run(
+        "INSERT INTO attachments(id,conversation_id,owner_id,sha256,size,mime,name,stored_name,complete,created_at) VALUES(?,?,'owner',?,18420,'text/markdown','workspace-rail-spec.md','att_spec_1.blob',1,?)",
+        ["att_spec_1", mainChat.id, "a".repeat(64), runEnd - 1000],
+      );
+      await hub.store.db.run(
+        "INSERT INTO attachments(id,conversation_id,owner_id,sha256,size,mime,name,stored_name,complete,created_at) VALUES(?,?,'owner',?,4280,'application/json','layout-benchmark.json','att_bench_2.blob',1,?)",
+        ["att_bench_2", mainChat.id, "b".repeat(64), runEnd],
+      );
+      const runMsgId = await insertBotMessage(hub, "bot_arch", mainChat.id, userMsg.id, [
+        {
+          type: "card",
+          title: locale === "en" ? "Workspace implementation" : "工作区实现完成",
+          elements: [{ type: "markdown", text: locale === "en" ? "Updated the workspace rail and added live Bot-to-Bot comms tracking." : "已完成会话工作区侧栏并接入实时 Bot 间通信追踪。" }],
+          extra: {
+            nativeRun: {
+              version: 1,
+              id: runId,
+              revision: 2,
+              phase: "done",
+              startedAt: runStart,
+              updatedAt: runEnd,
+              endedAt: runEnd,
+              count: 2,
+              completed: 2,
+              failed: 0,
+              truncated: false,
+              model: "claude-sonnet-4-6",
+            },
+            runChanges: {
+              v: 1,
+              runId,
+              revision: 2,
+              files: 2,
+              edits: 2,
+              additions: 14,
+              deletions: 3,
+              unavailable: 0,
+              partial: false,
+              childEdits: 0,
+            },
+          },
+        },
+        { type: "file", attachmentId: "att_spec_1", name: "workspace-rail-spec.md", size: 18420, mime: "text/markdown" },
+        { type: "file", attachmentId: "att_bench_2", name: "layout-benchmark.json", size: 4280, mime: "application/json" },
       ]);
+      await new RunJournal(hub.store).write("bot_arch", {
+        conversationId: mainChat.id,
+        messageId: runMsgId,
+        runId,
+        entries: [
+          {
+            seq: 1,
+            revision: 1,
+            kind: "tool",
+            status: "done",
+            at: runStart + 2000,
+            endedAt: runStart + 5000,
+            name: "edit_file",
+            changes: [
+              {
+                path: "client/src/ConversationWorkspace.tsx",
+                diff: [
+                  "@@ -12,6 +12,14 @@ export function ConversationWorkspace({",
+                  "   const [tab, setTab] = useState<WorkspaceTab>(\"overview\");",
+                  "-  const [expanded, setExpanded] = useState(false);",
+                  "+  const [expandedComms, setExpandedComms] = useState<ReadonlySet<string>>(() => new Set());",
+                  "+  const needsApproval = comms?.summary.needsApproval ?? 0;",
+                  "+  const activeComms = comms?.summary.active ?? 0;",
+                  "+  const artifactsCount = diffMessages.length + workbenchItems.length + files.length;",
+                  "+  const toggleCommExpand = (itemId: string) => {",
+                  "+    setExpandedComms(prev => {",
+                  "+      const next = new Set(prev);",
+                  "+      if (next.has(itemId)) next.delete(itemId); else next.add(itemId);",
+                  "+      return next;",
+                  "+    });",
+                  "+  };",
+                ].join("\n"),
+              },
+            ],
+          },
+          {
+            seq: 2,
+            revision: 2,
+            kind: "tool",
+            status: "done",
+            at: runStart + 6000,
+            endedAt: runEnd,
+            name: "edit_file",
+            changes: [
+              {
+                path: "src/hub/bot-messages.ts",
+                diff: [
+                  "@@ -958,4 +958,8 @@ export class BotMessages {",
+                  "-  // legacy outgoing trace",
+                  "-  // no live status join",
+                  "+  async listConversationComms(userId: string, conversationId: string, guard?: Guard) {",
+                  "+    const ownHost = await this.ownSource();",
+                  "+    return this.store.db.serial(async () => {",
+                  "+      await guard?.(); await this.store.requireMember(userId, conversationId);",
+                ].join("\n"),
+              },
+            ],
+          },
+        ],
+      });
       await hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id=?", [userMsg.id, "bot_arch"]);
 
       // Bot-to-Bot delegation #1: Architect -> Reviewer (pending approval card!)
@@ -208,9 +315,23 @@ for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
       await expect(container).toContainText("Reviewer");
       await shot(page, info, `${tag}-comms`);
 
-      // Switch to Files tab
+      // Switch to Files tab — verify both recorded run diff trigger and conversation files appear
       await container.getByRole("tab", { name: new RegExp(`^${L("文件")}`) }).click();
-      await expect(container).toContainText(L("暂无本轮改动、工作台内容或对话文件。"));
+      await expect(container).toContainText("workspace-rail-spec.md");
+      await expect(container).toContainText("layout-benchmark.json");
+      const diffButton = container.getByRole("button", { name: /2.*14.*3/ });
+      await expect(diffButton).toBeVisible();
+      await noHorizontalOverflow(page, phone ? ".conversation-workspace-sheet" : ".conversation-workspace-rail");
+      await shot(page, info, `${tag}-files`);
+
+      // Click the recorded run diff trigger from inside Workspace Rail to open RunDiffViewer
+      await diffButton.click();
+      const diffDialog = page.getByRole("dialog").filter({ hasText: "ConversationWorkspace.tsx" });
+      await expect(diffDialog).toBeVisible();
+      await expect(diffDialog).toContainText("bot-messages.ts");
+      await shot(page, info, `${tag}-diff`);
+      await page.keyboard.press("Escape");
+      await expect(diffDialog).toBeHidden();
 
       // Desktop mutual exclusion: opening Workbench hides Workspace Rail; closing Workbench restores it!
       if (!phone) {
