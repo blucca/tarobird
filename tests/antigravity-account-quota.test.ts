@@ -344,6 +344,25 @@ describe("ProcessAntigravityAdapter account quota", () => {
     expect(spawn).toHaveBeenCalledTimes(4);
   });
 
+  it("still reports login_required when the sign-in prompt keeps writing after agy was stopped", async () => {
+    const f = await agyFixture({ withState: true });
+    const spawn = vi.fn((_cmd: string, args: string[]) => {
+      const child = new MockChild();
+      if (args.includes("--version")) child.finish(0, "1.5.14\n");
+      else queueMicrotask(() => {
+        child.stderr.emit("data", "Authentication required. Please visit the URL to log in:\n");
+        // The rest of the prompt arrives after the stop has finished but before the pipe closes.
+        setTimeout(() => child.stderr.emit("data", "Waiting for authentication\n"), 1);
+      });
+      return child;
+    });
+    const adapter = new ProcessAntigravityAdapter("agy", f.env, spawn as any, undefined, undefined, f.root);
+    disposals.push(() => adapter.destroy());
+    expect((await adapter.getAccountQuota!({ refresh: true })).snapshot).toMatchObject({ state: "login_required", reason: "login_required" });
+    expect((await adapter.getAccountQuota!({ refresh: true })).snapshot).toMatchObject({ state: "login_required" });
+    expect(spawn).toHaveBeenCalledTimes(2);
+  });
+
   it("reports mode_not_supported for GEMINI_API_KEY without subscription state", async () => {
     const f = await agyFixture({ withState: false, extraEnv: { GEMINI_API_KEY: "synthetic-api-key" } });
     const spawn = vi.fn();

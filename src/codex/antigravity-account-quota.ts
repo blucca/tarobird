@@ -139,9 +139,9 @@ async function runBoundedQuotaCommand(input: {
   const stderrDecoder = new StringDecoder("utf8");
 
   let stopping: Promise<void> | undefined;
+  // Only the first call stops the child; a later one (more stderr, the abort) must not undo a finished stop.
   const terminate = () => {
-    didStop = false;
-    stopping ??= stopChild(child).then(() => { didStop = true; });
+    if (!stopping) { didStop = false; stopping = stopChild(child).then(() => { didStop = true; }); }
     return stopping;
   };
 
