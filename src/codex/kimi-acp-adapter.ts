@@ -3652,7 +3652,8 @@ export class KimiAcpAdapter implements CodexAdapter {
         // already started by now: its reply is still owed.
         text = await this.resolveQueuedKimiPrompt(worker, pending, sessionId);
       }
-      text ||= "Kimi completed the request.";
+      // This line is the whole answer of a turn that wrote none, so it is in the conversation's language.
+      text ||= input.locale === "zh" ? "Kimi 已完成这次请求，没有文字回复。" : "Kimi completed the request.";
       await Promise.race([
         this.emitEngineEvent(pending.onEngineEvent, { type: "result", text, sessionId }),
         pending.failurePromise,

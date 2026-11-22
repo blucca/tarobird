@@ -1017,6 +1017,25 @@ describe("KimiAcpAdapter", () => {
     } finally { await adapter.destroy(); }
   });
 
+  // A turn that only ran a tool has no text of its own; the line standing in for it is the Bot's whole
+  // answer, so it is written in the conversation's language.
+  it.each([["zh", "Kimi 已完成这次请求，没有文字回复。"], ["en", "Kimi completed the request."], [undefined, "Kimi completed the request."]] as const)(
+    "answers a tool-only turn in the conversation's language (%s)", async (locale, expected) => {
+      const harness = createHarness();
+      const adapter = new KimiAcpAdapter("kimi", adapterOptions(harness));
+      try {
+        const turn = adapter.sendUserMessage("telegram-54", { text: "run it", files: [], ...(locale ? { locale } : {}) });
+        await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+        const server = harness.children[0].server;
+        server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "shell", title: "Shell", kind: "execute", status: "in_progress", rawInput: { command: "true" } });
+        server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "shell", status: "completed", rawOutput: "" });
+        server.respondPrompt();
+        await expect(turn).resolves.toMatchObject({ text: expected });
+      } finally {
+        await adapter.destroy();
+      }
+    });
+
   it("preserves ACP plan, late input, diff content and tool progress in the native journal", async () => {
     const harness = createHarness(), probe = nativeRunProbe();
     const adapter = new KimiAcpAdapter("kimi", adapterOptions(harness));
