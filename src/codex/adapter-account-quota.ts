@@ -96,7 +96,7 @@ export class AdapterQuotaCache {
           : this.env.GEMINI_API_KEY ? "api_key"
           : this.env.GOOGLE_APPLICATION_CREDENTIALS ? "adc"
           : "unknown";
-        verifiable = authMode !== "unknown";
+        verifiable = true;
         material = [this.executable, engineHome, configured, settings, onboardingText, oauthCreds, googleAccounts, env];
       }
     } catch {
@@ -119,6 +119,10 @@ export class AdapterQuotaCache {
       // store() never retains it, because later reads cannot prove the opaque source is unchanged.
       if (this.engine === "codex" && options.refresh) return undefined;
       return this.failure(scope, "scope_unverifiable");
+    }
+    if (this.engine === "antigravity" && scope.authMode === "unknown") {
+      this.cached = undefined;
+      return { revision: scope.revision, snapshot: unavailableQuota(this.engine, "login_required", Date.now(), scope.authMode) };
     }
     if (scope.authMode !== "subscription") { this.cached = undefined; return { revision: scope.revision, snapshot: unavailableQuota(this.engine, "mode_not_supported", Date.now(), scope.authMode) }; }
     if (this.cached?.revision !== scope.revision) this.cached = undefined;

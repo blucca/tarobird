@@ -242,16 +242,16 @@ describe("ProcessAntigravityAdapter account quota", () => {
     expect(result.snapshot).toMatchObject({ state: "unavailable", reason: "invalid_response", pools: [], help: "antigravity_usage" });
   });
 
-  it("never spawns agy when local login state is missing (prevents browser OAuth popup)", async () => {
+  it("never spawns agy when local login state is missing (reports login_required without browser OAuth popup)", async () => {
     const f = await agyFixture({ withState: false });
     const spawn = vi.fn();
     const adapter = new ProcessAntigravityAdapter("agy", f.env, spawn as any, undefined, undefined, f.root);
     disposals.push(() => adapter.destroy());
 
     const cached = await adapter.getAccountQuota!({ refresh: false });
-    expect(cached.snapshot).toMatchObject({ state: "unknown", reason: "scope_unverifiable", pools: [], help: "antigravity_usage" });
+    expect(cached.snapshot).toMatchObject({ state: "login_required", reason: "login_required", pools: [], help: "antigravity_usage" });
     const refreshed = await adapter.getAccountQuota!({ refresh: true, expectedRevision: cached.revision });
-    expect(refreshed.snapshot).toMatchObject({ state: "unknown", reason: "scope_unverifiable", pools: [], help: "antigravity_usage" });
+    expect(refreshed.snapshot).toMatchObject({ state: "login_required", reason: "login_required", pools: [], help: "antigravity_usage" });
     expect(spawn).not.toHaveBeenCalled();
   });
 
