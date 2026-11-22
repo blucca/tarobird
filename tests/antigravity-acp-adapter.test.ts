@@ -76,6 +76,7 @@ class FakeAgyServer {
   readonly prompts: JsonRpcMessage[] = [];
   readonly pendingPrompts = new Map<number | string, JsonRpcMessage>();
   answerClose = true;
+  answerInitialize = true;
   autoCancel = true;
   currentModeId = "default";
   configOptions: Array<Record<string, unknown>> = [
@@ -147,6 +148,7 @@ class FakeAgyServer {
       return;
     }
     if (message.method === "initialize") {
+      if (!this.answerInitialize) return;
       this.respond(message, {
         protocolVersion: 1,
         agentInfo: { name: "Fake Antigravity ACP Server", version: "test" },
@@ -683,6 +685,44 @@ describe("AntigravityAcpAdapter cleanup", () => {
     expect(() => stdout.emitData("late\n")).not.toThrow();
   });
 
+  it("ends the worker when the protocol stream breaks, and starts a new process for the next message", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "a", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    harness.children[0]!.stdout.emitData("this is not JSON\n");
+    await expect(settleWithin(reply)).rejects.toThrow(/invalid JSON/);
+    expect(harness.log).toContain("kill:900");
+    expect(adapter.supportsSessionSteering(SESSION_A)).toBe(false);
+    const next = adapter.sendUserMessage(SESSION_A, { text: "b", files: [] });
+    await waitFor(() => harness.children[1]?.server.prompts.length === 1);
+    harness.children[1]!.server.text("ok");
+    harness.children[1]!.server.respondPrompt();
+    await expect(settleWithin(next)).resolves.toMatchObject({ text: "ok" });
+  });
+
+  it("stops a message whose agy acp is still starting, and ends that process", async () => {
+    const harness = createHarness((server) => { server.answerInitialize = false; });
+    const adapter = track(await adapterFor(harness));
+    const stop = new AbortController();
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "a", files: [], abortSignal: stop.signal });
+    await waitFor(() => harness.children[0]?.server.requests("initialize").length === 1);
+    stop.abort();
+    await expect(settleWithin(reply)).rejects.toThrow("Task was stopped by user");
+    await waitFor(() => harness.log.includes("kill:900"));
+  });
+
+  it("destroy does not wait for an agy acp that never finishes starting", async () => {
+    const harness = createHarness((server) => { server.answerInitialize = false; });
+    const adapter = await adapterFor(harness);
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "a", files: [] });
+    reply.catch(() => undefined);
+    await waitFor(() => harness.children[0]?.server.requests("initialize").length === 1);
+    await settleWithin(adapter.destroy());
+    await expect(settleWithin(reply)).rejects.toThrow();
+    expect(harness.log).toContain("kill:900");
+  });
+
   it("fails the turn when agy acp exits unexpectedly", async () => {
     const harness = createHarness();
     const adapter = track(await adapterFor(harness));
@@ -784,6 +824,17 @@ describe("AntigravityAcpAdapter steering", () => {
     server.text("original answer");
     server.respondPrompt();
     await expect(settleWithin(reply)).resolves.toMatchObject({ text: "original answer" });
+  });
+
+  it("fails the turn with the steer's error when agy took the steer and it then failed", async () => {
+    const { adapter, server, reply } = await runningTurn();
+    server.text("Part one.");
+    const steer = adapter.steerActiveTurn(SESSION_A, { text: "extra", throwOnError: true });
+    await waitFor(() => server.prompts.length === 2);
+    server.respondPrompt({ stopReason: "end_turn" }, "oldest");   // handed over: the steer now owns the run
+    await expect(settleWithin(steer)).resolves.toBe(true);
+    server.failPrompt({ code: -32000, message: "quota exceeded" });
+    await expect(settleWithin(reply)).rejects.toThrow(/quota exceeded/);
   });
 
   it("drops a steer that agy refuses after the admission wait ended, so the turn still completes", async () => {
@@ -895,6 +946,15 @@ describe("AntigravityAcpAdapter idle wake-up", () => {
     await adapter.destroy();
     expect(notifications(events)).toEqual([expect.objectContaining({ text: "Late report" })]);
     expect(harness.log).toEqual([`close:${SESSION_A}`, "stdin-end:900", "kill:900"]);
+  });
+
+  it("delivers an open wake-up when the process exits by itself", async () => {
+    const { events, server, harness } = await finishedTurn(undefined, { wakeQuietMs: 10_000 });
+    server.text("Late report");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    harness.children[0]!.exit(1);
+    await waitFor(() => notifications(events).length === 1);
+    expect(notifications(events)).toEqual([expect.objectContaining({ text: "Late report" })]);
   });
 
   it("does not recycle an idle session whose background command is still running", async () => {

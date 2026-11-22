@@ -126,6 +126,8 @@ type PromptEntry = {
   seq: number;
   settled: boolean;
   steer?: boolean;
+  /** agy handed the run to this steer: the prompt before it returned. */
+  admitted?: boolean;
   outcome?: PromptOutcome;
   /** A steer waits for agy to take it: the prompt it replaces returns first. */
   admission?: (result: Admission | undefined) => void;
@@ -199,6 +201,8 @@ type Worker = {
   stderrTail: string;
   lastActivityAt: number;
   removed: boolean;
+  /** Set while initialize and the session request are in flight; ends that wait when the worker is removed. */
+  rejectStart?: (error: Error) => void;
   closing?: Promise<void>;
   exited: boolean;
   failure?: Error;
@@ -246,13 +250,14 @@ function buildCommandInvocation(command: string, args: string[]): { command: str
   return { command: normalized, args, shell: false };
 }
 
-function createAcpStream(stdout: AgyReadable, stdin: AgyWritable, onActivity: () => void): Stream {
+function createAcpStream(stdout: AgyReadable, stdin: AgyWritable, onActivity: () => void, onFailure: (error: Error) => void): Stream {
   const decoder = new TextDecoder();
   let buffer = "";
   let settled = false;
   const readable = new ReadableStream<unknown>({
     start(controller) {
-      const fail = (error: Error) => { if (!settled) { settled = true; controller.error(error); } };
+      // A line that is not protocol JSON, an oversized line or a failed pipe: the session cannot continue.
+      const fail = (error: Error) => { if (!settled) { settled = true; controller.error(error); onFailure(error); } };
       const enqueueLine = (line: string) => {
         const trimmed = line.trim();
         if (!trimmed) return;
@@ -587,7 +592,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const prompt = await this.buildPrompt(input);
     const workspace = path.resolve(input.workspaceOverride ?? this.options.workspacePath);
     const launchKey = JSON.stringify({ workspace, flags: permissionFlags(config.approvalMode) });
-    const worker = await this.getOrCreateWorker(sessionId, workspace, launchKey, config.approvalMode);
+    const worker = await this.startedWorker(sessionId, workspace, launchKey, config.approvalMode, input.abortSignal);
     if (worker.turn || worker.reserved) throw new Error("Antigravity session already has an in-flight turn");
     worker.reserved = true;
     try {
@@ -597,6 +602,28 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
     if (worker.removed) throw worker.failure ?? new Error("Antigravity ACP worker is no longer available");
     return await this.runTurn(worker, prompt, input);
+  }
+
+  /** The worker for a message. A stop while agy acp is still starting ends that process and the message. */
+  private async startedWorker(requestedId: string, workspace: string, launchKey: string, approvalMode: ApprovalMode, signal?: AbortSignal): Promise<Worker> {
+    if (signal?.aborted) throw new Error(STOPPED_BY_USER);
+    const creation = this.getOrCreateWorker(requestedId, workspace, launchKey, approvalMode);
+    if (!signal) return await creation;
+    let onAbort: (() => void) | undefined;
+    const stopped = new Promise<never>((_resolve, reject) => {
+      onAbort = () => {
+        const starting = this.workers.get(requestedId);
+        if (starting?.rejectStart) void this.closeWorker(starting, new Error(STOPPED_BY_USER), appStopKillOptions(signal));
+        reject(new Error(STOPPED_BY_USER));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    creation.catch(() => undefined);
+    try {
+      return await Promise.race([creation, stopped]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
   }
 
   private async getOrCreateWorker(requestedId: string, workspace: string, launchKey: string, approvalMode: ApprovalMode): Promise<Worker> {
@@ -631,7 +658,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       throw new Error("Antigravity ACP subprocess did not expose stdio pipes");
     }
     let worker!: Worker;
-    const stream = createAcpStream(child.stdout, child.stdin, () => { if (worker) this.markActivity(worker); });
+    const stream = createAcpStream(child.stdout, child.stdin, () => { if (worker) this.markActivity(worker); }, (error) => this.failWorker(worker, error));
     const connection = acpClient()
       .onRequest(acpMethods.client.session.requestPermission, ({ params }) => this.handlePermission(worker, params))
       .onNotification(acpMethods.client.session.update, ({ params }) => { this.handleUpdate(worker, params); })
@@ -652,19 +679,23 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       this.failWorker(worker, new Error(formatExit(worker.stderrTail, code, signal)));
     });
 
+    // A stop, destroy or a dead process must not wait out the start-up timeouts.
+    const removedWhileStarting = new Promise<never>((_resolve, reject) => { worker.rejectStart = reject; });
+    removedWhileStarting.catch(() => undefined);
+    const starting = <T>(request: Promise<T>): Promise<T> => { request.catch(() => undefined); return Promise.race([request, removedWhileStarting]); };
     try {
-      const initialized = await withTimeout(connection.agent.request(acpMethods.agent.initialize, {
+      const initialized = await starting(withTimeout(connection.agent.request(acpMethods.agent.initialize, {
         protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: "tarobird", version: "1" },
         clientCapabilities: {},
-      }), this.initializeTimeoutMs, `Antigravity ACP initialize timed out after ${this.initializeTimeoutMs}ms`);
+      }), this.initializeTimeoutMs, `Antigravity ACP initialize timed out after ${this.initializeTimeoutMs}ms`));
       if (initialized.protocolVersion !== PROTOCOL_VERSION) throw new Error(`Antigravity ACP negotiated unsupported protocol version ${String(initialized.protocolVersion)}`);
       worker.initialized = initialized;
       const params = { cwd: workspace, mcpServers: [] };
       let result: Record<string, unknown>;
       if (isLogicalSessionId(requestedId)) {
-        result = await withTimeout(connection.agent.request(acpMethods.agent.session.new, params), this.initializeTimeoutMs,
-          `Antigravity ACP session/new timed out after ${this.initializeTimeoutMs}ms`) as unknown as Record<string, unknown>;
+        result = await starting(withTimeout(connection.agent.request(acpMethods.agent.session.new, params), this.initializeTimeoutMs,
+          `Antigravity ACP session/new timed out after ${this.initializeTimeoutMs}ms`)) as unknown as Record<string, unknown>;
         const created = typeof result.sessionId === "string" ? result.sessionId : "";
         if (!created) throw new Error("Antigravity ACP session/new returned no session id");
         worker.sessionId = created;
@@ -673,16 +704,18 @@ export class AntigravityAcpAdapter implements CodexAdapter {
         // session/load would replay the whole history as fresh updates.
         if (!initialized.agentCapabilities?.sessionCapabilities?.resume) throw new Error("This Antigravity CLI does not support ACP session/resume");
         worker.sessionId = requestedId;
-        result = await withTimeout(connection.agent.request(acpMethods.agent.session.resume, { sessionId: requestedId, ...params }), this.initializeTimeoutMs,
-          `Antigravity ACP session/resume timed out after ${this.initializeTimeoutMs}ms`) as unknown as Record<string, unknown>;
+        result = await starting(withTimeout(connection.agent.request(acpMethods.agent.session.resume, { sessionId: requestedId, ...params }), this.initializeTimeoutMs,
+          `Antigravity ACP session/resume timed out after ${this.initializeTimeoutMs}ms`)) as unknown as Record<string, unknown>;
       }
       worker.configOptions = readSelectOptions(result.configOptions);
       const modes = asRecord(result.modes);
       if (typeof modes?.currentModeId === "string") worker.currentModeId = modes.currentModeId;
       if (worker.removed) throw worker.failure ?? new Error("Antigravity ACP worker is no longer available");
+      worker.rejectStart = undefined;
       this.rekey(worker, worker.sessionId);
       return worker;
     } catch (error) {
+      worker.rejectStart = undefined;
       const failure = error instanceof Error ? error : new Error(rpcErrorMessage(error));
       await this.closeWorker(worker, failure);
       throw failure.message.includes(worker.stderrTail.trim()) || !worker.stderrTail.trim()
@@ -795,12 +828,14 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     entry.outcome = outcome;
     if (outcome.result) turn.usage = addUsage(turn.usage, usageFromPrompt(outcome.result));
     // A refused steer never joined the run, even when its admission wait has
-    // already ended; the prompt before it still owns the turn.
-    if (entry.steer && outcome.error !== undefined) turn.prompts = turn.prompts.filter((candidate) => candidate !== entry);
+    // already ended; the prompt before it still owns the turn. A steer agy took
+    // over owns the run: when it fails, that failure is the turn's outcome.
+    if (entry.steer && outcome.error !== undefined && !entry.admitted) turn.prompts = turn.prompts.filter((candidate) => candidate !== entry);
     if (entry.admission) entry.admission(outcome.error !== undefined ? { admitted: false, error: outcome.error } : { admitted: true });
     if (outcome.result) {
       // agy returned this prompt because the next one took over the run.
-      turn.prompts.find((candidate) => candidate.seq > entry.seq && !candidate.settled)?.admission?.({ admitted: true });
+      const next = turn.prompts.find((candidate) => candidate.seq > entry.seq && !candidate.settled);
+      if (next) { next.admitted = true; next.admission?.({ admitted: true }); }
     }
     this.finishIfSettled(turn);
   }
@@ -1086,6 +1121,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private failWorker(worker: Worker, error: Error): void {
     if (!worker) return;
     worker.failure ??= error;
+    if (!worker.removed) this.flushWake(worker);
     const turn = worker.turn;
     if (turn && !turn.done) {
       const failure = turn.stopRequested ? new Error(STOPPED_BY_USER)
@@ -1099,6 +1135,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
 
   private removeWorker(worker: Worker): void {
     worker.removed = true;
+    worker.rejectStart?.(worker.failure ?? new Error("Antigravity ACP worker is no longer available"));
     for (const [key, candidate] of this.workers) if (candidate === worker) this.workers.delete(key);
   }
 
@@ -1110,6 +1147,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (worker.closing) return worker.closing;
     worker.closing = (async () => {
       const turn = worker.turn;
+      if (error) worker.failure ??= error;
       this.removeWorker(worker);
       this.flushWake(worker);
       if (turn && !turn.done) this.settleTurn(turn, error ?? new Error("Antigravity ACP worker was closed"));
@@ -1150,6 +1188,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
 
   private async destroyInternal(): Promise<void> {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
+    // A process that is still starting is ended now; its start then fails at once instead of timing out.
+    for (const worker of new Set(this.workers.values())) if (worker.rejectStart) void this.closeWorker(worker, new Error("Adapter destroyed"));
     const created = await Promise.allSettled([...this.pendingWorkers.values()]);
     const workers = new Set(this.workers.values());
     for (const result of created) if (result.status === "fulfilled") workers.add(result.value);
