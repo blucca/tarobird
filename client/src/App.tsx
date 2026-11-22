@@ -566,21 +566,27 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const workspaceComms = useConversationBotComms(connection, selected, workspaceEligible, workspaceVisible, messagesReady ? lastBotReply : "");
   const workspaceNeedsApproval = workspaceComms.data?.summary.needsApproval ?? 0;
   const workspaceActiveComms = workspaceComms.data?.summary.active ?? 0;
+  // What the rail was put in front of, per conversation, so closing the rail shows that panel again.
+  const workspaceCovers = useRef(new Map<string, "side" | "workbench" | "screen">());
   const closeWorkspace = useCallback(() => {
     setDesktopWorkspaceOpen(false);
     // Whatever the rail was in front of shows again.
-    if (rightMode === "workspace") setRightMode("side");
-  }, [rightMode, setRightMode, setDesktopWorkspaceOpen]);
+    const covered = workspaceCovers.current.get(rightModeScope); workspaceCovers.current.delete(rightModeScope);
+    if (rightMode === "workspace") setRightMode(covered === "screen" && !screenOpened ? "side" : covered ?? "side");
+  }, [rightMode, rightModeScope, screenOpened, setRightMode, setDesktopWorkspaceOpen]);
   const toggleWorkspace = useCallback(() => {
     if (workspaceVisible) { closeWorkspace(); return; }
     if (details) setDetails(false);
     // Another panel is showing: the rail goes in front of it and closes nothing. A side conversation keeps its
     // session, draft and attachments, and the remote screen stays connected.
     if (workbenchVisible) designOpener.revoke();
-    if (workbenchVisible || sideVisible || screenVisible) setRightMode("workspace");
+    if (workbenchVisible || sideVisible || screenVisible) {
+      workspaceCovers.current.set(rightModeScope, workbenchVisible ? "workbench" : screenVisible ? "screen" : "side");
+      setRightMode("workspace");
+    }
     workspaceTakesFocus.current = true;
     setDesktopWorkspaceOpen(true);
-  }, [workspaceVisible, workbenchVisible, sideVisible, screenVisible, details, designOpener, setRightMode, closeWorkspace, setDesktopWorkspaceOpen]);
+  }, [workspaceVisible, workbenchVisible, sideVisible, screenVisible, details, designOpener, rightModeScope, setRightMode, closeWorkspace, setDesktopWorkspaceOpen]);
   const toggleSide = useCallback(() => {
     if (sideVisible) { void side.close(); sideTrigger.current?.focus(); }
     else { setRightMode("side"); setDetails(false); closeSearch(); void side.open(); }

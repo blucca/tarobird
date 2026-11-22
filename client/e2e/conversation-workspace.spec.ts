@@ -353,6 +353,19 @@ for (const locale of ["zh", "en"] as const) for (const phone of [false, true]) {
         await expect(page.locator("aside.conversation-workspace-rail")).toHaveCount(0);
         await workbenchBtn.click();
         await expect(page.locator("aside.conversation-workspace-rail")).toBeVisible();
+        // The rail opened in front of the Workbench hands it back when the rail closes.
+        await workbenchBtn.click();
+        await expect(workbenchBtn).toHaveAttribute("aria-expanded", "true");
+        await trigger.click();
+        await expect(container).toBeVisible();
+        await expect(workbenchBtn).toHaveAttribute("aria-expanded", "false");
+        await page.keyboard.press("Escape");
+        await expect(container).toHaveCount(0);
+        await expect(workbenchBtn).toHaveAttribute("aria-expanded", "true");
+        await workbenchBtn.click();
+        await expect(workbenchBtn).toHaveAttribute("aria-expanded", "false");
+        await trigger.click();
+        await expect(container).toBeVisible();
       }
 
       if (!phone) {
