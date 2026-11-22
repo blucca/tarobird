@@ -225,7 +225,19 @@ async function mirrorProfile(sharedHome: string, home: string): Promise<void> {
   const profiles = await stat(path.join(sharedHome, "profiles")).catch(error => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error;
   });
-  if (!profiles) { await mkdir(path.join(home, "profiles", DEEPSEEK_HARNESS_PROFILE), { recursive: true, mode: 0o700 }); return; }
+  if (!profiles) {
+    // A mirror of another DeepSeek home (DSH_HOME moved) would still load its plugins here. It is emptied
+    // the way a full mirror removes what it made (recorded entries only, a link as a link), against an
+    // empty profile; the mark goes once that is done.
+    if (await stat(path.join(home, MIRROR_MARK)).then(() => true, () => false)) {
+      const empty = path.join(path.dirname(home), "empty-home");
+      await mkdir(path.join(empty, "profiles"), { recursive: true, mode: 0o700 });
+      await prepareDeepSeekHarnessPrivateProfile({ sharedHome: empty, privateHome: home });
+      await rm(path.join(home, MIRROR_MARK), { force: true });
+    }
+    await mkdir(path.join(home, "profiles", DEEPSEEK_HARNESS_PROFILE), { recursive: true, mode: 0o700 });
+    return;
+  }
   const mark = path.join(home, MIRROR_MARK), signature = await sharedPackagesSignature(sharedHome);
   const previous = await readFile(mark, "utf8").then(text => (JSON.parse(text) as { signature?: unknown }).signature, () => undefined);
   if (previous === signature) { await syncDeepSeekHarnessProfileRootFiles({ sharedHome, privateHome: home }); return; }

@@ -48,7 +48,8 @@ async function fixture() {
   // A read answers before its cleanup ends; wait for the cleanup so what it leaves is what is checked.
   const settled = () => expect.poll(() => stat(path.join(catalogHome, "catalog.mutex.lock")).then(() => true, () => false), { timeout: 5000 }).toBe(false);
   const read = async () => { resetDeepSeekModelDiscoveryForTest(); const result = await discoverDeepSeekModels(env, workspace, false, { catalogHome }); await settled(); return result; };
-  return { dev, read, link: path.join(catalogHome, "home", "profiles", "web", "dev-plugin") };
+  const readFrom = async (home: string) => { resetDeepSeekModelDiscoveryForTest(); const result = await discoverDeepSeekModels({ ...env, DSH_HOME: home }, workspace, false, { catalogHome }); await settled(); return result; };
+  return { root, dev, read, readFrom, home: path.join(catalogHome, "home"), link: path.join(catalogHome, "home", "profiles", "web", "dev-plugin") };
 }
 
 it("keeps a directory linked into the profile's root across catalog reads", async () => {
@@ -67,4 +68,17 @@ it("still reads when removing a linked directory would fail, as a junction's unl
   expect((await f.read()).status).toBe("ready");
   // The scrub before this read meets the link the first read left.
   expect((await f.read()).status).toBe("ready");
+});
+
+it("does not keep another DeepSeek home's packages when the current one has no profile", async () => {
+  const f = await fixture();
+  expect((await f.read()).status).toBe("ready");
+  expect(await stat(path.join(f.home, "profiles", "web", "node_modules", "plugin")).then(() => true, () => false)).toBe(true);
+  const bare = path.join(f.root, "bare"); await mkdir(bare);
+  expect((await f.readFrom(bare)).status).toBe("ready");
+  // dsh would load the plugins of the home read before; this home has none.
+  expect(await stat(path.join(f.home, "profiles", "web", "node_modules")).then(() => true, () => false)).toBe(false);
+  // Reading the first home again mirrors it again.
+  expect((await f.read()).status).toBe("ready");
+  expect(await stat(path.join(f.home, "profiles", "web", "node_modules", "plugin", "package.json")).then(() => true, () => false)).toBe(true);
 });
