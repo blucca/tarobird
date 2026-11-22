@@ -30,18 +30,14 @@ import { DiffViewerTrigger } from "./DiffViewerTrigger.js";
 import { listWorkbenchLibrary, type WorkbenchLibraryEntry } from "./workbench-library.js";
 import type { WorkbenchFileTarget } from "./workbench-library-context.js";
 import { t, useLocale } from "./i18n.js";
+import { formatFileLimit } from "./files.js";
 import "./conversation-workspace.css";
 
 export type WorkspaceTab = "overview" | "comms" | "files";
 
 const FILES_PAGE_SIZE = 6;
-const COMMS_PAGE_SIZE = 4;
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+// The list scrolls inside the rail; four to a page left half of it empty and made a long list many pages.
+const COMMS_PAGE_SIZE = 8;
 
 function formatRelativeTime(timestamp: number, locale: string): string {
   const diffSec = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
@@ -62,26 +58,27 @@ function fileBadge(name: string, mime?: string): { label: string; tone: string }
   return { label: (ext || "FILE").slice(0, 4).toUpperCase(), tone: "" };
 }
 
+// The wording follows what the conversation itself says about the same events (bot-steer-delivery.ts).
 function commStatusLabel(status: BotCommItem["status"]): string {
   switch (status) {
     case "needs_approval": return t("待审批");
     case "running": return t("运行中");
-    case "steered": return t("已并入当前轮");
+    case "steered": return t("已并入回复");
     case "queued": return t("排队中");
     case "replied": return t("已回传");
     case "failed": return t("失败");
     case "cancelled": return t("已取消");
-    case "uncertain": return t("状态未确认");
+    case "uncertain": return t("结果未确认");
   }
 }
 
 function commDeliveryLabel(delivery: BotCommItem["delivery"]): string | undefined {
   switch (delivery) {
-    case "steered": return t("引导并入");
-    case "fell_back_to_queue": return t("回退排队");
-    case "queued": return t("排队投递");
+    case "steered": return t("已并入正在进行的回复");
+    case "fell_back_to_queue": return t("未能并入，已改为排队");
+    case "queued": return t("经排队投递");
     case "not_delivered": return t("未投递");
-    case "steer_uncertain": return t("并入未确认");
+    case "steer_uncertain": return t("无法确认是否已并入");
     case "pending": return t("投递中");
     default: return undefined;
   }
@@ -92,6 +89,8 @@ function workbenchKindLabel(kind: WorkbenchLibraryEntry["kind"]): string {
   if (kind === "markdown") return t("文档");
   return t("设计稿");
 }
+
+const BOT_COMMS_READ_MS = 20_000;
 
 /** Lightweight hook shared by the header trigger badge and the Workspace panel. */
 export function useConversationBotComms(
@@ -123,7 +122,8 @@ export function useConversationBotComms(
     setLoading(true);
     let answered = true;
     try {
-      const raw = await connection.http(`/api/conversations/${encodeURIComponent(conversationId)}/bot-comms`);
+      // The general request limit is five minutes; the refresh button waits on this read.
+      const raw = await connection.http(`/api/conversations/${encodeURIComponent(conversationId)}/bot-comms`, { signal: AbortSignal.timeout(BOT_COMMS_READ_MS) });
       if (scopeRef.current === reqScope) { setData(conversationBotCommsSchema.parse(raw)); setError(false); }
     } catch {
       if (scopeRef.current === reqScope) { setError(true); answered = false; }
@@ -176,8 +176,12 @@ export interface ConversationWorkspaceProps {
   messages: Message[];
   comms: ConversationBotComms | undefined;
   commsLoading: boolean;
+  /** The newest read of the Bot messages failed. */
+  commsError?: boolean;
   onRefreshComms: () => void;
   returnFocus?: React.RefObject<HTMLButtonElement | null>;
+  /** Set by whoever opens the rail on the person's request; the rail then takes the focus once. */
+  takeFocus?: React.RefObject<boolean>;
   onClose: () => void;
   onJumpConversation: (conversationId: string, messageId?: string) => void;
   onLocateMessage: (conversationId: string, messageId: string) => void;
@@ -199,8 +203,10 @@ export function ConversationWorkspace({
   messages,
   comms,
   commsLoading,
+  commsError,
   onRefreshComms,
   returnFocus,
+  takeFocus,
   onClose,
   onJumpConversation,
   onLocateMessage,
@@ -341,6 +347,7 @@ export function ConversationWorkspace({
     [tasks],
   );
   const queuedItems = queue?.items ?? [];
+  const waitingItems = queuedItems.filter(item => item.state === "queued");
   const commItems = comms?.items ?? [];
   const filteredComms = useMemo(() => {
     if (commFilter === "active") {
@@ -376,7 +383,8 @@ export function ConversationWorkspace({
         name: file.name,
         badgeLabel: badge.label,
         badgeTone: badge.tone,
-        meta: `${formatBytes(file.size)} · ${formatRelativeTime(file.createdAt, locale)}`,
+        // The same figure as on the card of this file in the conversation.
+        meta: `${formatFileLimit(file.size)} · ${formatRelativeTime(file.createdAt, locale)}`,
         file,
       };
     }),
@@ -438,9 +446,9 @@ export function ConversationWorkspace({
       <article key={item.id} className={`workspace-comm-card${compact ? " is-compact" : ""}${needsApproval ? " is-needs-approval" : ""}`}>
         <div className="workspace-comm-top">
           <div className="workspace-comm-route">
-            <span>{item.sourceBotName}</span>
+            <span title={item.sourceBotName}>{item.sourceBotName}</span>
             <ArrowRight size={11} aria-hidden="true"/>
-            <span>{item.targetBotName}</span>
+            <span title={item.targetBotName}>{item.targetBotName}</span>
           </div>
           <span className={`workspace-comm-status ${statusClass}`}>
             {needsApproval && <AlertTriangle size={10} aria-hidden="true"/>}
@@ -485,7 +493,7 @@ export function ConversationWorkspace({
             )}
             {item.replyExcerpt && (
               <div>
-                <span className="workspace-comm-expanded-label">{t("最新回传")}</span>
+                <span className="workspace-comm-expanded-label">{item.status === "failed" ? t("失败信息") : t("最新回传")}</span>
                 <div>{item.replyExcerpt}</div>
               </div>
             )}
@@ -521,14 +529,39 @@ export function ConversationWorkspace({
     );
   };
 
+  // The tabs are one stop for the Tab key; the arrow keys, Home and End move between them.
+  const tabList = useRef<HTMLDivElement>(null);
+  const onTabKey = (event: React.KeyboardEvent) => {
+    const order: WorkspaceTab[] = ["overview", "comms", "files"], at = order.indexOf(tab);
+    const next = event.key === "ArrowRight" ? order[(at + 1) % order.length]
+      : event.key === "ArrowLeft" ? order[(at + order.length - 1) % order.length]
+        : event.key === "Home" ? order[0] : event.key === "End" ? order.at(-1) : undefined;
+    if (!next) return;
+    event.preventDefault();
+    setTab(next);
+    tabList.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[order.indexOf(next)]?.focus({ preventScroll: true });
+  };
+  // Opened on the person's request: the rail takes the focus, so the keyboard continues inside it and not
+  // through every message first. A rail restored with the page leaves the focus where it is.
+  useEffect(() => {
+    if (!takeFocus?.current) return;
+    takeFocus.current = false;
+    tabList.current?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
+  }, [takeFocus]);
+  const close = () => {
+    onClose();
+    returnFocus?.current?.focus({ preventScroll: true });
+  };
+
   const content = (
     <>
-      <div className="workspace-tabs" role="tablist" aria-label={t("工作区标签")}>
+      <div className="workspace-tabs" role="tablist" aria-label={t("工作区标签")} ref={tabList} onKeyDown={onTabKey}>
         <button
           type="button"
           role="tab"
           className="workspace-tab"
           aria-selected={tab === "overview"}
+          tabIndex={tab === "overview" ? 0 : -1}
           onClick={() => setTab("overview")}
         >
           <span>{t("总览")}</span>
@@ -538,6 +571,7 @@ export function ConversationWorkspace({
           role="tab"
           className="workspace-tab"
           aria-selected={tab === "comms"}
+          tabIndex={tab === "comms" ? 0 : -1}
           onClick={() => setTab("comms")}
         >
           <span>{t("Bot 通信")}</span>
@@ -552,6 +586,7 @@ export function ConversationWorkspace({
           role="tab"
           className="workspace-tab"
           aria-selected={tab === "files"}
+          tabIndex={tab === "files" ? 0 : -1}
           onClick={() => setTab("files")}
         >
           <span>{t("文件")}</span>
@@ -605,6 +640,11 @@ export function ConversationWorkspace({
                           {botLabels.get(bot.id) ?? bot.name}
                         </span>
                       ))}
+                      {convBots.length > 3 && (
+                        <span className="workspace-chip" title={convBots.slice(3).map(bot => botLabels.get(bot.id) ?? bot.name).join("、")}>
+                          +{convBots.length - 3}
+                        </span>
+                      )}
                     </>
                   )}
                   {group && conversation.parentId && (
@@ -652,10 +692,16 @@ export function ConversationWorkspace({
                       <span className="workspace-item-icon"><ListOrdered size={12}/></span>
                       <span className="workspace-item-main">
                         <span className="workspace-item-title">{blocksText(item.message.blocks).trim() || t("排队消息 #{0}", idx + 1)}</span>
-                        <span className="workspace-item-meta">{t("队列第 {0} 位", idx + 1)}</span>
+                        {/* A message already handed to the Bot is no longer waiting in line. */}
+                        <span className="workspace-item-meta">{item.state === "queued" ? t("队列第 {0} 位", waitingItems.indexOf(item) + 1) : t("处理中")}</span>
                       </span>
                     </div>
                   ))}
+                  {(activeTasks.length > 2 || queuedItems.length > 2) && (
+                    <div className="workspace-more-hint">
+                      {[activeTasks.length > 2 ? t("还有 {0} 个后台任务", activeTasks.length - 2) : "", queuedItems.length > 2 ? t("还有 {0} 条排队消息", queuedItems.length - 2) : ""].filter(Boolean).join(" · ")}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="workspace-idle-strip">{t("当前空闲，无运行中或排队任务。")}</div>
@@ -757,7 +803,11 @@ export function ConversationWorkspace({
               <div className="workspace-empty">
                 {commItems.length > 0
                   ? t("当前筛选下没有匹配的通信记录。")
-                  : t("此对话尚未发起或收到 Bot 间通信。Bot 委托、跨主机调用与 Agent Bus 协作都会自动在此追踪。")}
+                  : comms !== undefined
+                    ? t("这个对话里还没有 Bot 之间的往来。Bot 互相委托、跨主机调用和多 Bot 协作会自动显示在这里。")
+                    : commsError && !commsLoading
+                      ? t("暂时读不到 Bot 之间的往来，请稍后再刷新。")
+                      : t("正在读取…")}
               </div>
             )}
           </section>
@@ -840,7 +890,14 @@ export function ConversationWorkspace({
   );
 
   return (
-    <aside id={id} className="conversation-workspace-rail" aria-label={t("会话工作区")}>
+    <aside id={id} className="conversation-workspace-rail" aria-label={t("会话工作区")}
+      onKeyDown={event => {
+        // Only an Escape pressed in the rail itself: one that closes a dialog opened from here (the changes
+        // viewer) reaches this handler too, through React's tree or from inside the rail's own element.
+        const target = event.target as Element;
+        if (event.key !== "Escape" || event.defaultPrevented || !event.currentTarget.contains(target) || target.closest("dialog,[role='dialog'],[role='menu']")) return;
+        event.preventDefault(); close();
+      }}>
       <header className="workspace-rail-header">
         <div className="workspace-rail-title">
           <Layers size={15} aria-hidden="true"/>
@@ -862,10 +919,7 @@ export function ConversationWorkspace({
             className="icon-button"
             aria-label={t("关闭工作区")}
             title={t("关闭工作区")}
-            onClick={() => {
-              onClose();
-              returnFocus?.current?.focus({ preventScroll: true });
-            }}
+            onClick={close}
           >
             <X size={15}/>
           </button>

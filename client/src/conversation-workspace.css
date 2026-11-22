@@ -44,12 +44,14 @@
   font-weight: 600;
   line-height: 1;
   background: var(--accent, var(--blue));
-  color: #fff;
+  /* The page background is the opposite of the accent and of --orange in every theme; white is not
+     (dark themes use a light orange). */
+  color: var(--bg);
 }
 
 .workspace-rail-trigger-badge.is-alert {
   background: var(--orange);
-  color: #fff;
+  color: var(--bg);
 }
 
 .conversation-workspace-rail {
@@ -85,6 +87,14 @@
   /* The header keeps its title readable: the entry is its icon (and badge) here. */
   .workspace-rail-trigger { padding: 0 8px; }
   .workspace-rail-trigger > .workspace-rail-trigger-label { display: none; }
+}
+
+@media (min-width: 1101px) and (max-width: 1359px) {
+  /* Here the sidebar stays next to the open rail, and the chat column is at its narrowest just above
+     1100px: the open entry is its icon, so the conversation title keeps its room. The rail has its own
+     title. From 1360px a 239px title fits beside the labelled entry (measured). */
+  .app-shell:has(> .conversation-workspace-rail) .workspace-rail-trigger { padding: 0 8px; }
+  .app-shell:has(> .conversation-workspace-rail) .workspace-rail-trigger > .workspace-rail-trigger-label { display: none; }
 }
 
 @media (min-width: 761px) and (max-width: 1100px) {
@@ -203,23 +213,25 @@
   color: var(--accent, var(--blue));
 }
 
-/* Keep the body scrollbar-free visually; desktop Overview is balanced to fill
-   a single viewport comfortably without clipping or leaving empty space. */
+/* The bar stays out of sight until the pointer is over the rail: content below the fold must not look
+   like the end of the list. */
 .workspace-body {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
-  scrollbar-width: none;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
   padding: 14px 14px 18px;
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
 
-.workspace-body::-webkit-scrollbar {
-  display: none;
+.workspace-body:hover,
+.workspace-body:focus-within {
+  scrollbar-color: color-mix(in srgb, var(--grey) 45%, transparent) transparent;
 }
 
 .workspace-section {
@@ -459,8 +471,15 @@
   color: var(--text);
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Who sent it and who received it both stay readable: each name gives way, never the arrow or one end. */
+.workspace-comm-route > span {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .workspace-comm-route svg {
@@ -496,6 +515,22 @@
 .workspace-comm-status.is-uncertain {
   background: var(--surface);
   color: var(--grey);
+}
+
+/* The single-colour palette has one accent, so shape carries the difference: a dot for work under way, an
+   outline for what ended without an answer. */
+.workspace-comm-status.is-running::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.workspace-comm-status.is-cancelled,
+.workspace-comm-status.is-uncertain {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 
 .workspace-comm-status.is-needs-approval {
@@ -602,7 +637,7 @@
 }
 
 .workspace-comm-actions .workspace-jump-btn.is-alert {
-  color: #fff;
+  color: var(--bg);
   background: var(--orange);
   border-color: var(--orange);
 }
@@ -788,4 +823,10 @@
   line-height: 1.5;
   color: var(--muted);
   text-align: center;
+}
+
+.workspace-more-hint {
+  padding: 0 4px;
+  font-size: 11px;
+  color: var(--grey);
 }
