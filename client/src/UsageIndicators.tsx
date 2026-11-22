@@ -96,8 +96,10 @@ export function UsageIndicators({ context, quota, onOpen }: { context?: ContextV
   </>;
 }
 
-/** Phone header: shown only when quota is nearly gone. */
-export function QuotaLowMark({ onOpen }: { onOpen: () => void }) {
+/** What the phone header's battery says to a screen reader: it shows no number, so the name carries it. */
+export const quotaMarkLabel = (left: number): string => usageTone(left) === "empty" ? t("额度快用完了，查看额度") : t("额度可用 {0}%", left);
+/** Phone header: the battery alone, whenever the quota can be read. Its charge is what is left; there is no number. */
+export function QuotaMark({ left, onOpen }: { left: number; onOpen: () => void }) {
   useLocale();
-  return <button type="button" className="quota-low-mark" aria-label={t("额度快用完了，查看额度")} title={t("额度快用完了，查看额度")} onClick={onOpen}><QuotaBattery left={0} height={12}/></button>;
+  return <button type="button" className="quota-mark" aria-label={quotaMarkLabel(left)} title={quotaMarkLabel(left)} onClick={onOpen}><QuotaBattery left={left} height={12}/></button>;
 }

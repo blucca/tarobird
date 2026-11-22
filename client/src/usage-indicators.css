@@ -36,7 +36,7 @@
 .usage-blocked{color:var(--red)}
 .usage-window+.usage-blocked,section>.usage-blocked+.usage-blocked{margin-top:6px}
 
-/* Phone: a row in the chat actions sheet, its details, and the low mark in the header. */
+/* Phone: a row in the chat actions sheet, its details, and the battery in the header. */
 .mobile-chat-action-list>button>.action-value[data-tone=low]{color:var(--orange)}
 .mobile-chat-action-list>button>.action-value[data-tone=empty]{color:var(--red)}
 .mobile-chat-action-list>button>svg.usage-battery{width:22px;height:15px;color:var(--grey)}
@@ -45,6 +45,6 @@
 .usage-sheet .usage-row>b{font-size:15px}
 .usage-sheet .usage-row>span,.usage-sheet .usage-note{font-size:12.5px}
 .usage-sheet .usage-bar{height:6px}
-.conversation-header>.quota-low-mark{display:inline-flex;align-items:center;justify-content:center;flex:none;min-width:32px;min-height:32px;margin:0 2px 0 4px;padding:0;border:0;background:transparent}
+.conversation-header>.quota-mark{display:inline-flex;align-items:center;justify-content:center;flex:none;min-width:32px;min-height:32px;margin:0 2px 0 4px;padding:0;border:0;background:transparent}
 .conversation-header>.header-host-usage{display:inline-flex;flex-direction:column;align-items:center;gap:3px;flex-shrink:0;min-width:0;max-width:24%;margin:0 2px 0 4px;padding:0;border:0;background:transparent}
 .header-host-usage>.host-source-badge.header-host-source{display:inline-flex;max-width:100%;margin:0;font-size:10px}

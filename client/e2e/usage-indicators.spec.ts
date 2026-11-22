@@ -185,7 +185,7 @@ test("ADHD panes show no symbols and ask for no readings", async ({ page }) => {
   } finally { await f.dispose(); }
 });
 
-test("phone: nothing beside the composer and no context; quota in the more sheet; a red battery in the header only when nearly gone", async ({ page }, info) => {
+test("phone: nothing beside the composer and no context; quota in the more sheet; the battery alone in the header whenever quota can be read", async ({ page }, info) => {
   const f = await fixture(page);
   try {
     const seen = requests(page);
@@ -196,7 +196,7 @@ test("phone: nothing beside the composer and no context; quota in the more sheet
     await page.getByRole("button", { name: "更多聊天操作", exact: true }).filter({ visible: true }).click();
     const row = page.getByRole("button", { name: "额度", exact: true });
     await expect(row).toBeVisible(); await expect(row.locator(".action-value")).toHaveText("80%");
-    await expect(page.locator(".usage-indicators")).toHaveCount(0); await expect(header.locator(".quota-low-mark")).toHaveCount(0);
+    await expect(page.locator(".usage-indicators")).toHaveCount(0);
     const rows = await page.locator(".mobile-chat-action-list").filter({ has: row }).locator("button").evaluateAll(nodes => nodes.map(node => ({ text: node.querySelector(".action-label")?.textContent, height: node.getBoundingClientRect().height, overflow: node.scrollWidth - node.clientWidth })));
     expect(rows[0]!.text).toBe("额度"); expect(rows[1]!.text).toBe("连接状态与线路"); expect(rows[0]!.height).toBeCloseTo(rows[1]!.height, 0); expect(rows[0]!.overflow).toBeLessThanOrEqual(1);
     await page.screenshot({ path: info.outputPath("phone-more.png"), animations: "disabled" });
@@ -208,15 +208,34 @@ test("phone: nothing beside the composer and no context; quota in the more sheet
     await page.screenshot({ path: info.outputPath("phone-details.png"), animations: "disabled" });
     await details.getByRole("button", { name: "关闭额度", exact: true }).click(); await expect(details).toBeHidden();
 
-    // Nearly gone: the battery appears alone where the computer's name would be.
+    // With quota to spare the battery is there too, alone where the computer's name would be: its charge is
+    // what is left, in the quiet tone, and there is no number beside it (the name carries it for a screen reader).
+    const spare = header.getByRole("button", { name: "额度可用 80%", exact: true });
+    for (const width of [390, 320]) {
+      await page.setViewportSize({ width, height: 844 });
+      await expect(spare).toBeVisible();
+      const shown = await header.evaluate(node => { const item = node.querySelector<HTMLElement>(".quota-mark")!, box = item.getBoundingClientRect(), title = node.querySelector(".header-title")!.getBoundingClientRect(), battery = item.querySelector(".usage-battery")!, charge = item.querySelector(".usage-battery-left")!;
+        return { text: item.innerText.trim(), tone: battery.getAttribute("data-tone"), charge: Number(charge.getAttribute("width")), fill: getComputedStyle(charge).fill, red: getComputedStyle(node).getPropertyValue("--red"), left: box.left, right: box.right, width: box.width, titleRight: title.right, headerRight: node.getBoundingClientRect().right, overflow: node.scrollWidth - node.clientWidth, page: document.documentElement.scrollWidth - innerWidth }; });
+      expect(shown.text).toBe(""); expect(shown.tone).toBe("ok"); expect(shown.charge).toBeCloseTo(13 * 0.8, 3);
+      expect(shown.left).toBeGreaterThanOrEqual(shown.titleRight - 1); expect(shown.right).toBeLessThanOrEqual(shown.headerRight + 1);
+      expect(shown.width).toBeGreaterThanOrEqual(32); expect(shown.overflow).toBeLessThanOrEqual(1); expect(shown.page).toBeLessThanOrEqual(0);
+      await header.screenshot({ path: info.outputPath(`phone-header-spare-${width}.png`), animations: "disabled" });
+    }
+    await page.setViewportSize({ width: 390, height: 844 });
+    await spare.click();
+    await expect(details).toContainText("80%");
+    await details.getByRole("button", { name: "关闭额度", exact: true }).click(); await expect(details).toBeHidden();
+
+    // A Bot whose quota cannot be read shows nothing. Nearly gone: the same battery, red and all but empty.
     f.readings.value = nearlyGone();
-    await selectConversation(page, "读不到"); await expect(header.locator(".quota-low-mark")).toHaveCount(0);
+    await selectConversation(page, "读不到"); await expect(header.locator(".quota-mark")).toHaveCount(0);
     await selectConversation(page, "有读数");
     const mark = header.getByRole("button", { name: "额度快用完了，查看额度", exact: true });
     for (const width of [390, 320]) {
       await page.setViewportSize({ width, height: 844 });
       await expect(mark).toBeVisible();
-      const layout = await header.evaluate(node => { const box = node.getBoundingClientRect(), title = node.querySelector(".header-title")!.getBoundingClientRect(), item = node.querySelector(".quota-low-mark")!.getBoundingClientRect(), battery = node.querySelector(".quota-low-mark .usage-battery-left")!;
+      await expect(header.locator(".quota-mark .usage-battery")).toHaveAttribute("data-tone", "empty");
+      const layout = await header.evaluate(node => { const box = node.getBoundingClientRect(), title = node.querySelector(".header-title")!.getBoundingClientRect(), item = node.querySelector(".quota-mark")!.getBoundingClientRect(), battery = node.querySelector(".quota-mark .usage-battery-left")!;
         return { titleRight: title.right, markLeft: item.left, markRight: item.right, markWidth: item.width, right: box.right, overflow: node.scrollWidth - node.clientWidth, page: document.documentElement.scrollWidth - innerWidth, fill: getComputedStyle(battery).fill, red: getComputedStyle(node).getPropertyValue("--red") }; });
       expect(layout.markLeft).toBeGreaterThanOrEqual(layout.titleRight - 1); expect(layout.markRight).toBeLessThanOrEqual(layout.right + 1);
       expect(layout.markWidth).toBeGreaterThanOrEqual(32); expect(layout.overflow).toBeLessThanOrEqual(1); expect(layout.page).toBeLessThanOrEqual(0);
@@ -230,7 +249,7 @@ test("phone: nothing beside the composer and no context; quota in the more sheet
   } finally { await f.dispose(); }
 });
 
-test("phone with two computers: the red battery sits under the computer's name", async ({ page }, info) => {
+test("phone with two computers: the battery sits under the computer's name", async ({ page }, info) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "usage-two-hosts-"));
   const vite = await createServer({ server: { host: "127.0.0.1", port: 0, hmr: false } }); await vite.listen();
   const origin = vite.resolvedUrls!.local[0]!;
@@ -268,12 +287,18 @@ test("phone with two computers: the red battery sits under the computer's name",
     await low.click();
     await expect(page.getByRole("dialog", { name: "额度", exact: true })).toContainText("1%");
     await page.getByRole("dialog", { name: "额度", exact: true }).getByRole("button", { name: "关闭额度", exact: true }).click();
-    // With quota to spare the computer's name is the plain chip it was, and nothing sits under it.
+    await expect(header.locator(".header-host-usage .usage-battery")).toHaveAttribute("data-tone", "empty");
+    // With quota to spare the battery stays under the name, charged to what is left, in the quiet tone and without a number.
     readings.value = plenty();
     await workspace(page).getByRole("button", { name: "打开会话列表", exact: true }).click();
     await workspace(page).locator(".mobile-home .mh-row").filter({ hasText: "有读数" }).click();
-    await expect(header.locator(".header-host-usage")).toHaveCount(0);
-    await expect(header.locator(":scope > .host-source-badge.header-host-source")).toHaveAttribute("title", "运行于 办公室电脑");
+    const spare = header.getByRole("button", { name: "运行于 办公室电脑，额度可用 80%", exact: true });
+    await expect(spare).toBeVisible();
+    await expect(spare.locator(".usage-battery")).toHaveAttribute("data-tone", "ok");
+    expect(Number(await spare.locator(".usage-battery-left").getAttribute("width"))).toBeCloseTo(13 * 0.8, 3);
+    expect(await spare.innerText()).toContain("办公室电脑"); expect(await spare.innerText()).not.toMatch(/[0-9%]/);
+    const under = await spare.evaluate(node => { const chip = node.querySelector(".host-source-badge")!.getBoundingClientRect(), battery = node.querySelector(".usage-battery")!.getBoundingClientRect(); return { chipBottom: chip.bottom, batteryTop: battery.top, middle: Math.abs(chip.left + chip.width / 2 - battery.left - battery.width / 2) }; });
+    expect(under.batteryTop).toBeGreaterThanOrEqual(under.chipBottom - 1); expect(under.middle).toBeLessThan(2);
     await header.screenshot({ path: info.outputPath("phone-two-hosts-plenty.png"), animations: "disabled" });
   } finally { await page.close(); await gateway.disconnect(); await a.close(); await b.close(); await vite.close(); await rm(root, { recursive: true, force: true }); }
 });

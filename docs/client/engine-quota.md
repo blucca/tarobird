@@ -107,9 +107,11 @@ engine compacts by itself, and each quota window with its reset time.
 
 On a phone nothing sits beside the composer and context is not shown or asked
 for. The chat actions sheet has a "Quota" row with the number, opening the
-same details. When a twentieth or less is left, a red empty battery appears in
-the header: under the computer's name when several computers are paired, alone
-in that place otherwise.
+same details. The header shows the battery alone, without a number, whenever
+the quota can be read: under the computer's name when several computers are
+paired, alone in that place otherwise. Its charge is what is left, amber and
+red at the same marks as on the desktop; selecting it opens the details. When
+the quota cannot be read there is no battery.
 
 **Which quota counts.** A pool that names models counts only for a Bot on one
 of them; a pool that names none counts for every Bot. Antigravity's groups all
