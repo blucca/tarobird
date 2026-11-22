@@ -932,7 +932,8 @@ export class PiRpcAdapter implements CodexAdapter {
     }
     // Stable instructions ride in the system prompt (through the bridge) so they stay out of the transcript and cacheable.
     const viaBridge = Boolean(worker.bridge?.isOpen);
-    turn.instructions = viaBridge ? instructions?.trim() || undefined : undefined;
+    // A command goes out bare so Pi dispatches it; the turn's private guidance then rides with this run's system prompt.
+    turn.instructions = viaBridge ? [instructions?.trim(), sessionCommand ? turnInstructions?.trim() : undefined].filter(Boolean).join("\n\n") || undefined : undefined;
     let text = sessionCommand ? await this.sessionCommandLine(turn, commandText) : prependPrivateTurnInstructions(input.text, turnInstructions);
     this.throwIfStopped(turn);
     if (!viaBridge && !sessionCommand && instructions?.trim()) {
