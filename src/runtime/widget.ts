@@ -25,8 +25,8 @@ export function validateWidget(raw: unknown): WidgetInput {
   let script: string | undefined, scriptNumber = 0;
   const parser = new Parser({
     onopentag(name, attrs) {
-      // External https stylesheets and scripts load only on clients that allow widget
-      // network access; others ignore them and keep the static markup.
+      // External https stylesheets and scripts load on current clients, where widget
+      // network access is always on; older clients ignore them and keep the static markup.
       if (name === "link" && !(attrs.rel?.trim().toLowerCase() === "stylesheet" && httpsUrl(attrs.href))) throw new Error("Widget <link> supports only rel=\"stylesheet\" with an https href");
       if (["iframe", "frame", "object", "embed", "base", "meta"].includes(name)) throw new Error(`Widget does not support <${name}>; use an HTML fragment`);
       for (const [attribute, value] of Object.entries(attrs)) {

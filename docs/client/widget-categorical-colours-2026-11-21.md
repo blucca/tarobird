@@ -42,14 +42,17 @@ The viewer decides the canvas once from the widget source:
    `--chart-series-N`), `light-dark()`, `prefers-color-scheme` or the
    `tarobot:theme` event follows the App.
 2. Otherwise, source that paints its own colours (hex, `rgb()`/`hsl()`/
-   `oklch()` and similar, a named colour on a colour property, or any `<svg>`,
-   whose default paint is black) gets a light canvas, or a dark one when its
-   outermost element has an opaque dark background.
+   `oklch()` and similar, a named colour on a colour property, any `<svg>`,
+   whose default paint is black, or an external stylesheet or script) gets a
+   light canvas, or a dark one when its outermost element (or, when that is
+   transparent, the body) has an opaque dark background.
 3. Source with no colour of its own inherits the App's text colour and follows
    the App.
 
 Known limits: a design drawn for dark with a transparent background and light
-text gets a light canvas; a
+text gets a light canvas; `prefers-color-scheme` rules inside an external
+stylesheet follow the device, not the App, because the opaque frame cannot
+read or rewrite a cross-origin sheet; a
 design that mixes App variables with fixed dark text follows the App and can
 be hard to read in dark themes.
 

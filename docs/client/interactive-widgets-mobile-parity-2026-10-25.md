@@ -25,7 +25,7 @@ an independent run of OpenClaw's native apps.
 |---|---|---|
 | Generic interaction | Authored real browser DOM; local controls, forms, SVG/Canvas and allowed libraries | Generic fixed reports plus authored HTML/SVG, linked filters, parameter calculations, multi-step plans and process steps |
 | Execution | Isolated iframe/WebView, full browser APIs inside its sandbox | Terminable Worker, virtual DOM and sanitized real controls; no authored script on the App UI thread |
-| External dependencies | Approved CDN libraries/modules/styles/fonts | No remote scripts, modules or arbitrary network; embed bounded observations from normal tools |
+| External dependencies | Approved CDN libraries/modules/styles/fonts | No remote scripts, modules or arbitrary network; embed bounded observations from normal tools (since 2026-11-21: https/wss network and external scripts/stylesheets, no modules) |
 | Geometry/animation | Browser layout, Canvas/WebGL and browser animation APIs | Event/observed-element geometry and CSS transitions; no complete synchronous layout, Canvas/WebGL or smooth continuous Worker-DOM animation guarantee |
 | Follow-up question | Web Control UI can directly submit a user turn after activation checks; native inline prompt bridge is documented as absent | Explicit user action fills the current conversation's draft across App clients; acceptance is not sending or model receipt |
 | Local state | No general inline persistence API in the referenced contract | Explicit bounded per-window state; terminal flush on normal navigation, not disk persistence |

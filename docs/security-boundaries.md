@@ -930,19 +930,25 @@ endpoints.
   reachable.
 - Worker `fetch`/`XMLHttpRequest`/`EventSource` force `credentials: omit` and
   no referrer; URLs with credentials and hosts written as loopback, private,
-  link-local, CGNAT, multicast or local names (`localhost`, `*.local`,
-  `*.internal`, `*.lan`, single labels) are refused. Each external script
-  download, body included, must finish within 15 s, and all external scripts
-  of a widget share a 16 MiB total counted while reading; a failure aborts that
-  download, leaves the static markup and reports a widget warning.
+  link-local, CGNAT, IPv4 multicast or local names (`localhost`, `*.local`,
+  `*.internal`, `*.lan`, single labels) are refused, for `WebSocket` too. The
+  check uses only primitives captured before guest code runs, and the native
+  constructors are not reachable through the wrappers' prototypes, so guest
+  code cannot replace `String`/`RegExp`/`URL`/`Request` members or reach the
+  unchecked constructors to skip it (Chromium test in `widget-network.spec.ts`).
+  Each external script download, body included, must finish within 15 s, and
+  all external scripts of a widget share a 16 MiB total counted while reading;
+  a failure aborts that download, leaves the static markup and reports a widget
+  warning that does not count towards retiring the widget.
 - The guest document and relay use `Referrer-Policy: no-referrer`; the sanitizer
   keeps only `<link rel="stylesheet">` and https media, SVG image and stylesheet
   URLs, never navigable links, and strips `autoplay`.
 - Electron allows https/wss in the App session only for requests whose frame
   chain is a widget guest under the widget relay (its Workers' requests carry
   that frame); frameless requests are refused. It strips `Cookie`,
-  `Authorization`, `Proxy-Authorization` and `Set-Cookie` on them, so the
-  App session's cookie jar never gains widget cookies.
+  `Authorization`, `Proxy-Authorization` and `Set-Cookie` on every external
+  request, also when the widget frame detached before the headers, so the App
+  session's cookie jar never gains widget cookies.
 
 **Residual exposure.**
 
@@ -950,7 +956,16 @@ endpoints.
   and public names that resolve or redirect to private addresses, remain
   reachable: name resolution and redirects are not inspected. Responses need
   CORS to be readable, but requests with side effects still arrive. Browser
-  private-network protections vary by engine and were not relied on.
+  private-network protections vary by engine and were not relied on. In
+  Chromium a public name redirecting to `127.0.0.1` was followed by Worker
+  `fetch`, `XMLHttpRequest` and markup images.
+- Only Electron checks requests outside the page. On the Web build, Tauri and
+  the mobile WebViews the written-host check above is the Worker's own and
+  there is none for markup resources: `<img>`, media, `<link>` stylesheets and
+  CSS `url()`/`@import` may name a loopback or private address directly (an
+  `<img src="https://127.0.0.1:…">` loaded in Chromium). Those requests need
+  an https certificate valid for the name, carry no App cookies and cannot be
+  read by the widget unless CORS allows it.
 - Document resource loads (images, stylesheets, fonts) and WebSocket handshakes
   follow the engine's third-party cookie policy. In Chromium tests they carried
   the target site's own `SameSite=None` cookie from earlier top-level browsing;

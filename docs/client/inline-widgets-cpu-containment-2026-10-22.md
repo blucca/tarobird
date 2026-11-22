@@ -77,7 +77,7 @@ SVG/CSS, throttled pointer movement, local filters and asynchronous real-size
 and minimum/maximum pixel width; this is not a full CSS media-query parser.
 Canvas/WebGL, complete browser DOM APIs, synchronous accurate layout, external
 libraries/resources, storage, networking and native App APIs are unsupported.
-Use the fixed format or SVG/CSS for those reports. There is no fallback that
+Use the fixed format or SVG/CSS for those reports. (Superseded on 2026-11-21: widgets now have https/wss network access and may load external scripts and stylesheets; see "Widget network access" in [security boundaries](../security-boundaries.md).) There is no fallback that
 re-enables authored JavaScript on the UI thread. Older Canvas-based reports
 may need regeneration; their saved text summary remains readable. An independent
 OffscreenCanvas/ImageBitmap compatibility prototype was evaluated but not merged:
@@ -101,7 +101,9 @@ random values and the virtual DOM. Networking, storage, messaging, nested
 workers, WebGPU/WebNN (`navigator.gpu`/`navigator.ml`), WebCodecs encoders and
 decoders, `ImageDecoder`, font loading and `OffscreenCanvas`/`createImageBitmap`
 are removed before authored code runs; CSP and the opaque origin still bound
-syntax such as dynamic `import()`. These are presence checks in Chromium and
+syntax such as dynamic `import()`. Since 2026-11-21 fetch, XMLHttpRequest,
+EventSource and WebSocket are back as https/wss-only wrappers; see "Widget
+network access" in [security boundaries](../security-boundaries.md). These are presence checks in Chromium and
 WebKit, not WKWebView, WebView2 or Android acceptance.
 
 Worker DOM snapshots are limited to 2,048 elements and 128K authored characters

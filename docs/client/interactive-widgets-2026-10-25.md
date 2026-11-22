@@ -97,7 +97,7 @@ opaque frame and native bridge guards remain. No arbitrary Host API, network,
 external library, Canvas/WebGL or UI-thread script execution is added. Ordinary
 local controls and SVG/CSS remain the authoring target; this is not a claim of
 complete browser DOM compatibility. Old clients require an App update to gain
-new control semantics; their readable text fallback is retained.
+new control semantics; their readable text fallback is retained. (Superseded on 2026-11-21: widgets now have https/wss network access and may load external scripts and stylesheets; see "Widget network access" in [security boundaries](../security-boundaries.md).)
 
 See `docs/examples/widget-scenario-explorer.html` for an adaptable local
 calculator with range/select/checkbox controls, a local form, a comparative SVG,
@@ -125,7 +125,7 @@ cannot synchronously cancel native scrolling or a real checkbox click; authors
 should use `disabled` and explicit zoom controls. Geometry is current for the
 event target/ancestors and observed elements, not arbitrary synchronous layout.
 The small state cache and composer handoff do not grant new Host or network
-permissions.
+permissions. (Superseded on 2026-11-21: widgets now have https/wss network access and may load external scripts and stylesheets; see "Widget network access" in [security boundaries](../security-boundaries.md).)
 
 ## Verification
 
@@ -183,7 +183,7 @@ network/native APIs remain unavailable, initialization/click loops are
 terminated, hidden widgets release execution, hover cannot steal composer
 focus, and forged/replayed handoff attempts cannot silently insert text.
 Draft handoff tests include existing text, quotation, attachment, queue choice,
-conversation change and forwarded-widget authority.
+conversation change and forwarded-widget authority. (Superseded on 2026-11-21: widgets now have https/wss network access and may load external scripts and stylesheets; see "Widget network access" in [security boundaries](../security-boundaries.md).)
 
 Screenshots are browser acceptance at phone and desktop widths, not physical
 iPhone/Android or installed Tauri/WebView2 acceptance. WebKit is an engine
