@@ -1412,7 +1412,7 @@ export class PiRpcAdapter implements CodexAdapter {
 
   private async applyGate(worker: Worker, gate: boolean): Promise<void> {
     if (gate && !worker.bridge?.isOpen) {
-      throw new Error("Pi tool approval is unavailable for this session (the TaroBird bridge did not connect), so the turn was not started. Restart the conversation or switch the Bot to full access.");
+      throw new Error("Pi tool approval is unavailable for this session (the TaroBird bridge did not connect), so the turn was not started. Start a new conversation or restart the Bot to connect it again. Full access also starts the turn, but then Pi runs every tool without asking.");
     }
     if (worker.gate === gate) return;
     if (worker.bridge?.isOpen) await worker.bridge.setGate(gate);
