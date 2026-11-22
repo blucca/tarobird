@@ -15,7 +15,7 @@ import { botMessageCapabilitiesSchema, botMessageSendSchema, botMessageSteeringC
   type BotMessageDelivery, type BotMessageDeliveryReceipt, type BotMessageSteeringSnapshot, type BotSteerFallbackReason } from "../client-protocol/bot-message-delivery.js";
 import { botSteerCallSchema, botSteerStatusSchema, steerResultSchema, type SteerResult } from "../client-protocol/steering.js";
 import { hasPendingCardAction } from "../client-protocol/message-clear.js";
-import { botCommDeliverySchema, conversationBotCommsSchema, type BotCommDelivery, type BotCommItem, type BotCommPendingApproval, type BotCommStatus, type ConversationBotComms } from "../client-protocol/workspace-comms.js";
+import { botCommDeliverySchema, botCommItemSchema, conversationBotCommsSchema, type BotCommDelivery, type BotCommItem, type BotCommPendingApproval, type BotCommStatus, type ConversationBotComms } from "../client-protocol/workspace-comms.js";
 import type { Message } from "../client-protocol/index.js";
 import { STEER_EDGE_LIMIT, STEER_EDGE_WINDOW_MS, STEER_TURN_LIMIT, offlineSteering, steerFallbackNotice, steeringDisabledKey, type BotMessageSteeringHooks, type IncomingMemo } from "./bot-message-steering.js";
 
@@ -25,9 +25,16 @@ const activeRunPhases = runSummarySchema.shape.phase.options.filter(isRunActive)
 const activeRunPhaseParams = activeRunPhases.map(() => "?").join(",");
 const memoKey = (kind: string, ...parts: string[]) => `bot-messages:${kind}:${hashSecret(JSON.stringify(parts))}`;
 const TRACE_LIMIT = 32;
+/** An outgoing trace nobody has updated for this long is no longer shown as in progress: only a later
+ * `wait` by the sending Bot updates a cross-host trace, and a Bot may never wait. */
+const TRACE_STALE_MS = 2 * 60 * 60_000;
+/** Incoming handoffs are listed from this far back; older ones are ordinary history of the chat. */
+const INCOMING_COMMS_WINDOW_MS = 7 * 24 * 60 * 60_000;
+const SETTLED_TARGETS_LIMIT = 512;
 const traceIndexKey = (conversationId: string) => `bot-messages:trace-index:${conversationId}`;
 const traceKey = (conversationId: string, sourceBot: string, requestId: string) => `bot-messages:trace:${conversationId}:${hashSecret(JSON.stringify([sourceBot, requestId]))}`;
 const traceMsgRefKey = (sourceBot: string, targetHostId: string, messageId: string) => `bot-messages:trace-msg:${hashSecret(JSON.stringify([sourceBot, targetHostId, messageId]))}`;
+type LocalTargetState = { status: BotCommStatus; delivery?: BotCommDelivery; deliveryReason?: string; replyExcerpt?: string; pendingApproval?: BotCommPendingApproval; updatedAt: number; finishedAt?: number };
 type OutgoingTrace = {
   sourceConversationId: string;
   contextMessageId?: string;
@@ -1030,7 +1037,8 @@ export class BotMessages {
         await this.put(traceMsgRefKey(source.botId, targetHostId, targetMessageId), { traceKey: key, at: now });
       }
       const indexKey = traceIndexKey(sourceConversationId);
-      const prev = await this.memo<string[]>(indexKey) ?? [];
+      const stored = await this.storedTrace<unknown>(indexKey);
+      const prev = Array.isArray(stored) ? stored.filter((item): item is string => typeof item === "string") : [];
       const next = [key, ...prev.filter(item => item !== key)];
       const evicted = next.slice(TRACE_LIMIT);
       await this.put(indexKey, next.slice(0, TRACE_LIMIT));
@@ -1073,8 +1081,10 @@ export class BotMessages {
     const rows = botId
       ? await this.store.db.all<{ id: string; blocks_json: string }>(
         `SELECT id, blocks_json FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND status NOT IN ('deleted','error')
-         AND (${replyTo ? "reply_to=? OR " : ""}(reply_to IS NULL AND created_at>=?)) ORDER BY created_at DESC, id DESC LIMIT 20`,
-        replyTo ? [conversationId, botId, replyTo, since] : [conversationId, botId, since],
+         AND ${replyTo ? "reply_to=?" : "reply_to IS NULL AND created_at>=?"} ORDER BY created_at DESC, id DESC LIMIT 20`,
+        // With the input message known, only a card that answers it counts: a later unrelated card of the same
+        // Bot must not turn every older exchange into "needs approval".
+        replyTo ? [conversationId, botId, replyTo] : [conversationId, botId, since],
       )
       : await this.store.db.all<{ id: string; blocks_json: string }>(
         `SELECT id, blocks_json FROM messages WHERE conversation_id=? AND author_type='bot' AND status NOT IN ('deleted','error')
@@ -1090,6 +1100,11 @@ export class BotMessages {
     }
     return undefined;
   }
+  /** Finished exchanges by conversation, Bot and input message. A finished exchange does not change, and reading
+   * one decodes its replies, so it is read once per Hub run instead of at every poll of an open rail. */
+  private readonly settledTargets = new Map<string, LocalTargetState>();
+  /** A stored trace row that cannot be read is treated as absent: it must not fail a list or stop later traces. */
+  private async storedTrace<T>(key: string): Promise<T | undefined> { try { return await this.memo<T>(key); } catch { return undefined; } }
   private async inspectLocalTargetInTransaction(
     conversationId: string,
     targetBotId: string | undefined,
@@ -1097,7 +1112,25 @@ export class BotMessages {
     sentAt: number,
     fallbackDelivery?: BotCommDelivery,
     fallbackDeliveryReason?: string,
-  ): Promise<{ status: BotCommStatus; delivery?: BotCommDelivery; deliveryReason?: string; replyExcerpt?: string; pendingApproval?: BotCommPendingApproval; updatedAt: number; finishedAt?: number }> {
+  ): Promise<LocalTargetState> {
+    const key = messageId ? `${conversationId}\0${targetBotId ?? ""}\0${messageId}` : undefined;
+    const settled = key ? this.settledTargets.get(key) : undefined;
+    if (settled) return settled;
+    const state = await this.readLocalTargetInTransaction(conversationId, targetBotId, messageId, sentAt, fallbackDelivery, fallbackDeliveryReason);
+    if (key && state.finishedAt && (state.status === "replied" || state.status === "failed" || state.status === "cancelled")) {
+      if (this.settledTargets.size >= SETTLED_TARGETS_LIMIT) this.settledTargets.delete(this.settledTargets.keys().next().value!);
+      this.settledTargets.set(key, state);
+    }
+    return state;
+  }
+  private async readLocalTargetInTransaction(
+    conversationId: string,
+    targetBotId: string | undefined,
+    messageId: string | undefined,
+    sentAt: number,
+    fallbackDelivery?: BotCommDelivery,
+    fallbackDeliveryReason?: string,
+  ): Promise<LocalTargetState> {
     let delivery = fallbackDelivery;
     let deliveryReason = fallbackDeliveryReason;
     let updatedAt = sentAt;
@@ -1192,13 +1225,27 @@ export class BotMessages {
       };
       const items: BotCommItem[] = [];
       // 1. Outgoing Bot-to-Bot delegations originating from this conversation.
-      const keys = await this.memo<string[]>(traceIndexKey(conversationId)) ?? [];
+      // Stored rows are read defensively: one bad row must not fail the whole list.
+      const storedKeys = await this.storedTrace<unknown>(traceIndexKey(conversationId));
+      const keys = Array.isArray(storedKeys) ? storedKeys.filter((key): key is string => typeof key === "string").slice(0, TRACE_LIMIT) : [];
+      const now = Date.now();
+      // Removed for everyone, or by this user for themselves (a deleted message or a cleared chat).
+      const gone = async (messageId: string | undefined) => !!messageId && !!await this.store.db.get(
+        "SELECT 1 FROM messages WHERE id=? AND (status='deleted' OR EXISTS(SELECT 1 FROM message_deletions d WHERE d.message_id=messages.id AND d.user_id=?))", [messageId, userId]);
+      const replyGone = async (targetConversationId: string, messageId: string | undefined) => !!messageId && !!await this.store.db.get(
+        "SELECT 1 FROM messages m JOIN message_deletions d ON d.message_id=m.id AND d.user_id=? WHERE m.conversation_id=? AND m.reply_to=? LIMIT 1", [userId, targetConversationId, messageId]);
+      const settledOrStale = (trace: OutgoingTrace, status: BotCommStatus): BotCommStatus =>
+        (status === "queued" || status === "running" || status === "steered") && now - trace.updatedAt > TRACE_STALE_MS ? "uncertain" : status;
       for (const key of keys) {
-        const trace = await this.memo<OutgoingTrace>(key);
-        if (!trace) continue;
+        const trace = await this.storedTrace<OutgoingTrace>(key);
+        if (!trace || typeof trace.sourceBotId !== "string" || typeof trace.requestId !== "string" || typeof trace.sentAt !== "number" || typeof trace.updatedAt !== "number") continue;
+        // The user removed the message whose turn made this delegation: its trace goes with it.
+        if (await gone(trace.contextMessageId)) continue;
         if (!trace.crossHost && trace.targetConversationId) {
           const targetConv = await checkMember(trace.targetConversationId);
           if (targetConv) {
+            if (await gone(trace.targetMessageId)) continue;
+            const hidden = await replyGone(trace.targetConversationId, trace.targetMessageId);
             const live = await this.inspectLocalTargetInTransaction(
               trace.targetConversationId,
               trace.targetBotId,
@@ -1208,18 +1255,18 @@ export class BotMessages {
               trace.deliveryReason,
             );
             items.push({
-              id: `out:${trace.sourceBotId}:${trace.requestId}`,
+              id: `out:${trace.sourceBotId}:${trace.requestId}`.slice(0, 160),
               kind: "outgoing_bot_message",
               direction: "outgoing",
               requestId: trace.requestId,
               sourceHostId: trace.sourceHostId,
               sourceHostName: trace.sourceHostName,
               sourceBotId: trace.sourceBotId,
-              sourceBotName: botNames.get(trace.sourceBotId) ?? trace.sourceBotName,
+              sourceBotName: String(botNames.get(trace.sourceBotId) ?? trace.sourceBotName ?? "Bot").slice(0, 128),
               targetHostId: trace.targetHostId,
               targetHostName: trace.targetHostName,
               targetBotId: trace.targetBotId,
-              targetBotName: (trace.targetBotId ? botNames.get(trace.targetBotId) : undefined) ?? trace.targetBotName,
+              targetBotName: String((trace.targetBotId ? botNames.get(trace.targetBotId) : undefined) ?? trace.targetBotName ?? "Bot").slice(0, 128),
               crossHost: false,
               status: live.status,
               ...(live.delivery ? { delivery: live.delivery } : {}),
@@ -1230,8 +1277,9 @@ export class BotMessages {
               canJumpToTarget: true,
               hops: trace.hops,
               ...(trace.sentExcerpt ? { sentExcerpt: trace.sentExcerpt } : {}),
-              ...(live.replyExcerpt ?? trace.replyExcerpt ? { replyExcerpt: live.replyExcerpt ?? trace.replyExcerpt } : {}),
-              ...(live.pendingApproval ? { pendingApproval: live.pendingApproval } : {}),
+              // A reply this user removed is not quoted, from the live chat or from the stored excerpt.
+              ...(!hidden && (live.replyExcerpt ?? trace.replyExcerpt) ? { replyExcerpt: live.replyExcerpt ?? trace.replyExcerpt } : {}),
+              ...(!hidden && live.pendingApproval ? { pendingApproval: live.pendingApproval } : {}),
               createdAt: trace.sentAt,
               updatedAt: Math.max(trace.updatedAt, live.updatedAt),
               ...(live.finishedAt ? { finishedAt: live.finishedAt } : {}),
@@ -1240,25 +1288,25 @@ export class BotMessages {
           }
           // Not a member of the same-host target chat: keep minimal non-leaking trace.
           items.push({
-            id: `out:${trace.sourceBotId}:${trace.requestId}`,
+            id: `out:${trace.sourceBotId}:${trace.requestId}`.slice(0, 160),
             kind: "outgoing_bot_message",
             direction: "outgoing",
             requestId: trace.requestId,
             sourceHostId: trace.sourceHostId,
             sourceHostName: trace.sourceHostName,
             sourceBotId: trace.sourceBotId,
-            sourceBotName: botNames.get(trace.sourceBotId) ?? trace.sourceBotName,
+            sourceBotName: String(botNames.get(trace.sourceBotId) ?? trace.sourceBotName ?? "Bot").slice(0, 128),
             targetHostId: trace.targetHostId,
             targetHostName: trace.targetHostName,
             targetBotId: trace.targetBotId,
-            targetBotName: (trace.targetBotId ? botNames.get(trace.targetBotId) : undefined) ?? trace.targetBotName,
+            targetBotName: String((trace.targetBotId ? botNames.get(trace.targetBotId) : undefined) ?? trace.targetBotName ?? "Bot").slice(0, 128),
             crossHost: false,
-            status: trace.remoteStatus === "completed" ? "replied" : trace.remoteStatus === "failed" ? "failed" : trace.remoteStatus === "cancelled" ? "cancelled" : trace.delivery === "steered" ? "steered" : "queued",
+            status: settledOrStale(trace, trace.remoteStatus === "completed" ? "replied" : trace.remoteStatus === "failed" ? "failed" : trace.remoteStatus === "cancelled" ? "cancelled" : trace.delivery === "steered" ? "steered" : "queued"),
             ...(trace.delivery ? { delivery: trace.delivery } : {}),
             ...(trace.deliveryReason ? { deliveryReason: trace.deliveryReason } : {}),
             canJumpToTarget: false,
             hops: trace.hops,
-            ...(trace.sentExcerpt ? { sentExcerpt: trace.sentExcerpt } : {}),
+            // No text, title or id of a chat this user is not in: the message was posted there.
             createdAt: trace.sentAt,
             updatedAt: trace.updatedAt,
             ...(trace.finishedAt ? { finishedAt: trace.finishedAt } : {}),
@@ -1277,20 +1325,20 @@ export class BotMessages {
                         : trace.remoteStatus === "pending" ? "running"
                           : "queued";
         items.push({
-          id: `out:${trace.sourceBotId}:${trace.requestId}`,
+          id: `out:${trace.sourceBotId}:${trace.requestId}`.slice(0, 160),
           kind: "outgoing_bot_message",
           direction: "outgoing",
           requestId: trace.requestId,
           sourceHostId: trace.sourceHostId,
           sourceHostName: trace.sourceHostName,
           sourceBotId: trace.sourceBotId,
-          sourceBotName: botNames.get(trace.sourceBotId) ?? trace.sourceBotName,
+          sourceBotName: String(botNames.get(trace.sourceBotId) ?? trace.sourceBotName ?? "Bot").slice(0, 128),
           targetHostId: trace.targetHostId,
           targetHostName: trace.targetHostName,
           ...(trace.targetBotId ? { targetBotId: trace.targetBotId } : {}),
-          targetBotName: trace.targetBotName,
+          targetBotName: String(trace.targetBotName ?? "Bot").slice(0, 128),
           crossHost: trace.crossHost,
-          status: remoteStatus,
+          status: settledOrStale(trace, remoteStatus),
           ...(trace.delivery ? { delivery: trace.delivery } : {}),
           ...(trace.deliveryReason ? { deliveryReason: trace.deliveryReason } : {}),
           ...(trace.targetConversationId ? { targetConversationId: trace.targetConversationId } : {}),
@@ -1307,8 +1355,9 @@ export class BotMessages {
       }
       // 2. Incoming Bot-to-Bot messages received in this conversation.
       const incomingRows = await this.store.db.all<{ id: string; bot_source_json: string; blocks_json: string; created_at: number }>(
-        "SELECT id, bot_source_json, blocks_json, created_at FROM messages WHERE conversation_id=? AND bot_source_json IS NOT NULL AND status!='deleted' ORDER BY created_at DESC, id DESC LIMIT 20",
-        [conversationId],
+        `SELECT id, bot_source_json, blocks_json, created_at FROM messages WHERE conversation_id=? AND created_at>=? AND bot_source_json IS NOT NULL AND status!='deleted'
+         AND NOT EXISTS(SELECT 1 FROM message_deletions d WHERE d.message_id=messages.id AND d.user_id=?) ORDER BY created_at DESC, id DESC LIMIT 20`,
+        [conversationId, now - INCOMING_COMMS_WINDOW_MS, userId],
       );
       for (const row of incomingRows) {
         let origin: BotSource;
@@ -1320,6 +1369,7 @@ export class BotMessages {
         const targetBotId = deliv?.bot_id ?? steerBlock?.botId ?? defaultConvBotId;
         const targetBotName = (targetBotId ? botNames.get(targetBotId) : undefined) ?? "Bot";
         const live = await this.inspectLocalTargetInTransaction(conversationId, targetBotId, row.id, row.created_at);
+        const hidden = await replyGone(conversationId, row.id);
         const sentExcerpt = trimExcerpt(blocksText(blocks), 280);
         items.push({
           id: `in:${row.id}`,
@@ -1343,8 +1393,8 @@ export class BotMessages {
           canJumpToTarget: false,
           hops: origin.hops,
           ...(sentExcerpt ? { sentExcerpt } : {}),
-          ...(live.replyExcerpt ? { replyExcerpt: live.replyExcerpt } : {}),
-          ...(live.pendingApproval ? { pendingApproval: live.pendingApproval } : {}),
+          ...(!hidden && live.replyExcerpt ? { replyExcerpt: live.replyExcerpt } : {}),
+          ...(!hidden && live.pendingApproval ? { pendingApproval: live.pendingApproval } : {}),
           createdAt: row.created_at,
           updatedAt: live.updatedAt,
           ...(live.finishedAt ? { finishedAt: live.finishedAt } : {}),
@@ -1363,8 +1413,10 @@ export class BotMessages {
           [run.id],
         );
         for (const stage of stages) {
+          // The coordinator's own stage is this chat's turn, not a handoff to another Bot.
+          if (stage.bot_id === run.coordinator_id && stage.conversation_id === run.conversation_id) continue;
           const targetConv = await checkMember(stage.conversation_id);
-          const pendingApproval = targetConv ? await this.findPendingApprovalInTransaction(stage.conversation_id, stage.bot_id, undefined, stage.started_at - 1000) : undefined;
+          const pendingApproval = targetConv && stage.status === "running" ? await this.findPendingApprovalInTransaction(stage.conversation_id, stage.bot_id, undefined, stage.started_at - 1000) : undefined;
           const status: BotCommStatus = pendingApproval ? "needs_approval"
             : stage.status === "completed" ? "replied"
               : stage.status === "failed" ? "failed"
@@ -1408,7 +1460,7 @@ export class BotMessages {
         let workspaceName: string | undefined;
         try { workspaceName = trimExcerpt((JSON.parse(stage.snapshot_json) as { name?: string }).name, 140); } catch { /* ignore */ }
         const sourceConv = await checkMember(stage.run_conv_id);
-        const pendingApproval = await this.findPendingApprovalInTransaction(conversationId, stage.bot_id, undefined, stage.started_at - 1000);
+        const pendingApproval = stage.status === "running" ? await this.findPendingApprovalInTransaction(conversationId, stage.bot_id, undefined, stage.started_at - 1000) : undefined;
         const status: BotCommStatus = pendingApproval ? "needs_approval"
           : stage.status === "completed" ? "replied"
             : stage.status === "failed" ? "failed"
@@ -1446,7 +1498,8 @@ export class BotMessages {
         if (aAttn !== bAttn) return bAttn - aAttn;
         return b.updatedAt - a.updatedAt;
       });
-      const bounded = items.slice(0, 60);
+      // An item that does not fit the public shape is left out instead of failing the list.
+      const bounded = items.flatMap(item => { const parsed = botCommItemSchema.safeParse(item); return parsed.success ? [parsed.data] : []; }).slice(0, 60);
       const needsApproval = bounded.filter(item => item.status === "needs_approval").length;
       const active = bounded.filter(item => item.status === "running" || item.status === "steered" || item.status === "queued" || item.status === "needs_approval").length;
       return conversationBotCommsSchema.parse({

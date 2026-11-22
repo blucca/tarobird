@@ -437,9 +437,11 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   // The panel choice belongs to this conversation, just like its workbench
   // contents. Resolve it during render so navigation never opens B using A's mode.
   const rightModeScope = JSON.stringify([connection.identity.hubPublicKey, state.user?.id, selected]);
-  const [rightModes, setRightModes] = useState<ReadonlyMap<string, "side" | "workbench" | "screen">>(() => new Map());
+  // "workspace": the workspace rail is in front. A side conversation or the remote screen underneath stays
+  // alive, as under the Workbench, and shows again when the rail closes.
+  const [rightModes, setRightModes] = useState<ReadonlyMap<string, "side" | "workbench" | "screen" | "workspace">>(() => new Map());
   const rightMode = rightModes.get(rightModeScope) ?? "side";
-  const setRightMode = useCallback((mode: "side" | "workbench" | "screen") => {
+  const setRightMode = useCallback((mode: "side" | "workbench" | "screen" | "workspace") => {
     setRightModes(previous => {
       if ((previous.get(rightModeScope) ?? "side") === mode) return previous;
       const next = new Map(previous);
@@ -560,17 +562,23 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   }, []);
   const workspaceEligible = !pane && !phone && !!current && visible && searchResults === undefined;
   const workspaceVisible = workspaceEligible && workspaceOpen && !details && !sideVisible && !workbenchVisible && !screenVisible;
-  const workspaceComms = useConversationBotComms(connection, selected, workspaceEligible, workspaceVisible, state.cacheRevision);
+  const workspaceComms = useConversationBotComms(connection, selected, workspaceEligible, workspaceVisible, messagesReady ? lastBotReply : "");
   const workspaceNeedsApproval = workspaceComms.data?.summary.needsApproval ?? 0;
   const workspaceActiveComms = workspaceComms.data?.summary.active ?? 0;
+  const closeWorkspace = useCallback(() => {
+    setDesktopWorkspaceOpen(false);
+    // Whatever the rail was in front of shows again.
+    if (rightMode === "workspace") setRightMode("side");
+  }, [rightMode, setRightMode, setDesktopWorkspaceOpen]);
   const toggleWorkspace = useCallback(() => {
-    if (workspaceVisible) { setDesktopWorkspaceOpen(false); return; }
-    if (workbenchVisible) { designOpener.revoke(); setRightMode("side"); }
-    if (sideVisible) void side.close();
-    if (screenVisible) closeScreen();
+    if (workspaceVisible) { closeWorkspace(); return; }
     if (details) setDetails(false);
+    // Another panel is showing: the rail goes in front of it and closes nothing. A side conversation keeps its
+    // session, draft and attachments, and the remote screen stays connected.
+    if (workbenchVisible) designOpener.revoke();
+    if (workbenchVisible || sideVisible || screenVisible) setRightMode("workspace");
     setDesktopWorkspaceOpen(true);
-  }, [workspaceVisible, workbenchVisible, sideVisible, screenVisible, details, designOpener, setRightMode, side, closeScreen, setDesktopWorkspaceOpen]);
+  }, [workspaceVisible, workbenchVisible, sideVisible, screenVisible, details, designOpener, setRightMode, closeWorkspace, setDesktopWorkspaceOpen]);
   const toggleSide = useCallback(() => {
     if (sideVisible) { void side.close(); sideTrigger.current?.focus(); }
     else { setRightMode("side"); setDetails(false); closeSearch(); void side.open(); }
@@ -1713,7 +1721,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const screenButton = !pane && !phone && isElectron() && <button className="icon-button screen-trigger" aria-label={t("查看屏幕")} title={`${t("查看屏幕")} · ${hostName}`} aria-expanded={screenVisible} onClick={() => { if (screenVisible) closeScreen(); else openScreen(); }}><MonitorPlay size={18}/></button>;
   const sideButton = sideCanOpen && <button ref={sideTrigger} className="icon-button side-trigger" aria-label={t("侧边对话")} title={t("侧边对话") + " (⌘⇧K / Ctrl+Shift+K)"} aria-expanded={sideVisible} aria-controls="side-conversation" disabled={!side.shown && (state.status !== "online" || !activeBot?.online)} onClick={toggleSide}><PanelRight size={18}/></button>;
   const workspaceBadgeCount = workspaceNeedsApproval > 0 ? workspaceNeedsApproval : workspaceActiveComms;
-  const workspaceButton = workspaceEligible && <button ref={workspaceRailTrigger} className="workspace-rail-trigger" aria-label={t("会话工作区")} title={t("会话工作区")} aria-expanded={workspaceVisible} aria-controls={workspaceId} onClick={toggleWorkspace}><Layers size={16}/><span>{t("工作区")}</span>{workspaceBadgeCount > 0 && <span className={`workspace-rail-trigger-badge${workspaceNeedsApproval > 0 ? " is-alert" : ""}`}>{workspaceBadgeCount}</span>}</button>;
+  const workspaceButton = workspaceEligible && <button ref={workspaceRailTrigger} className="workspace-rail-trigger" aria-label={t("会话工作区")} title={t("会话工作区")} aria-expanded={workspaceVisible} aria-controls={workspaceId} onClick={toggleWorkspace}><Layers size={16}/><span className="workspace-rail-trigger-label">{t("工作区")}</span>{workspaceBadgeCount > 0 && <span className={`workspace-rail-trigger-badge${workspaceNeedsApproval > 0 ? " is-alert" : ""}`}>{workspaceBadgeCount}</span>}</button>;
   const phoneTurnActions = chatActions && (
     <div className="mobile-chat-action-list">
       {current?.botIds.length === 1 && !current.archived && !group?.archived && searchResults === undefined && state.engineTasksAvailable && <button onClick={() => { setChatActions(false); setTaskListRequest({ conversationId: selected, id: Date.now() }); }}><ListOrdered size={20}/><span>{t("子代理与后台任务")}</span></button>}
@@ -1847,7 +1855,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   {screenOpened && <RemoteScreenPanel connection={connection} hostName={hostName} visible={screenVisible && (!!pane || sideWindowLayout !== "pending")} close={closeScreen} openSettings={() => { setSettingsFromMenu(false); setSettingsSection("screen"); setSettings(true); }}/> }
   {workbench.controller ? <Suspense fallback={workbenchLoading}><Workbench id={workbenchId} compact={!!pane && paneWorkbenchCompact} controller={workbench.controller} visible={workbenchVisible && (phone || sideWindowLayout !== "pending")} phone={phone} onManageFiles={() => { setSettingsFromMenu(false); setSettingsSection("workbench"); setSettings(true); }} onAnnotate={annotateWorkbench} onDesignCompose={composeDesign} onCompose={dispatchWidgetCompose} onClose={() => { designOpener.revoke(); setRightMode("side"); workbenchTrigger.current?.focus({preventScroll:true}); }}/></Suspense> : !phone && !pane ? workbenchLoading : null}
   {side.shown && sideEligible && <SideConversation key={side.scope} side={side} appearance={`${preferences.palette}:${preferences.fontSize}`} mainRecording={recording} recordingChanged={setSideRecording} online={state.status === "online" && !!activeBot?.online} visible={sideVisible && sideWindowLayout !== "pending"} trigger={sideTrigger} close={() => { void side.close(); }} returnToComposer={() => composer.current?.focus({ preventScroll: true })} insert={text => { changeDraft(`${draft}${draft ? "\n\n" : ""}${text.split("\n").map(line => `> ${line}`).join("\n")}`); composer.current?.focus({ preventScroll: true }); }}/>}
-  {workspaceVisible && current && <ConversationWorkspace id={workspaceId} connection={connection} conversation={current} group={group} bots={state.bots} botLabels={labels} hostName={hostName} connectionSummary={connectionSummary} streamingBots={streamingBots} messages={messages} comms={workspaceComms.data} commsLoading={workspaceComms.loading} onRefreshComms={() => { void workspaceComms.refresh(); }} returnFocus={workspaceRailTrigger} onClose={() => setDesktopWorkspaceOpen(false)} onJumpConversation={(conversationId, messageId) => { setFocusTarget(messageId ? { conversationId, messageId } : undefined); selectChat(conversationId); }} onLocateMessage={(conversationId, messageId) => { setSelected(conversationId); setSidebar(false); closeSearch(); setFocusTarget({ conversationId, messageId }); }} onOpenAllFiles={() => setConversationFiles(current)} onOpenWorkbenchFile={target => { void openLocalLibraryFile(target).catch(reportWorkbenchOpenError); }} onOpenTasksModal={current.botIds.length === 1 && !current.archived && !group?.archived && state.engineTasksAvailable ? () => setTaskListRequest({ conversationId: selected, id: Date.now() }) : undefined}/>}
+  {workspaceVisible && current && <ConversationWorkspace id={workspaceId} connection={connection} conversation={current} group={group} bots={state.bots} botLabels={labels} hostName={hostName} connectionSummary={connectionSummary} streamingBots={streamingBots} messages={messages} comms={workspaceComms.data} commsLoading={workspaceComms.loading} onRefreshComms={() => { void workspaceComms.refresh(); }} returnFocus={workspaceRailTrigger} onClose={closeWorkspace} onJumpConversation={(conversationId, messageId) => { selectChat(conversationId); if (messageId) setFocusTarget({ conversationId, messageId }); }} onLocateMessage={(conversationId, messageId) => { setSelected(conversationId); setSidebar(false); closeSearch(); setFocusTarget({ conversationId, messageId }); }} onOpenAllFiles={() => setConversationFiles(current)} onOpenWorkbenchFile={target => { void openLocalLibraryFile(target).catch(reportWorkbenchOpenError); }} onOpenTasksModal={current.botIds.length === 1 && !current.archived && !group?.archived && state.engineTasksAvailable ? () => setTaskListRequest({ conversationId: selected, id: Date.now() }) : undefined}/>}
   {details && current && chatVisible && !searching && <ConversationDetails historySource={conversations.find(value => value.id === current.historyOrigin?.sourceConversationId)} openHistorySource={id => { setDetails(false); selectChat(id); }} key={`details:${current.id}`} suspended={manage || !!conversationFiles || fileCenter || capabilities || operations || settings} phone={phone} browseBot={phone ? browseBotConversations : undefined} returnFocus={detailTrigger} connection={connection} conversation={current} group={group} bots={state.bots} hostName={hostName} connectionSummary={connectionSummary} close={() => setDetails(false)} newChat={botId => { setDetails(false); setNewChat({ kind: "direct", botId }); }} open={(destination, botId) => { setDetailBot(botId); if (destination === "manage") setManage(true); else if (destination === "conversation-files") setConversationFiles(current); else if (destination === "files") setFileCenter(true); else if (destination === "capabilities") setCapabilities(true); else if (destination === "operations") { const bot = state.bots.find(value => value.id === botId); setOperationBot(bot ? { botId: bot.id, name: labels.get(bot.id) ?? bot.name, view: "dashboard" } : undefined); setOperations(true); } else { setSettingsSection("connection"); setSettings(true); } }}/>}
   {phone && !discussionComposer && menu === "recipients" && <CreationDialog title={t("回复的 Bot")} closeLabel={t("关闭回复选择")} close={closeMenu} returnFocus={recipientTrigger}><div className="mobile-chat-action-list">{conversationBots.map(bot => <button key={bot.id} role="checkbox" aria-label={labels.get(bot.id) ?? bot.name} aria-checked={recipients.includes(bot.id)} onClick={() => setRecipients(old => old.includes(bot.id) ? old.filter(id => id !== bot.id) : [...old, bot.id])}><span className="recipient-check">{recipients.includes(bot.id) && <Check size={14}/>}</span><Avatar kind="bot" id={bot.id} name={labels.get(bot.id) ?? bot.name} size={26}/><BotName id={bot.id} name={labels.get(bot.id) ?? bot.name} bot={bot}/></button>)}</div><button className="primary full" onClick={closeMenu}>{t("完成")}</button></CreationDialog>}
   {attachments.input}{attachments.sheet}

@@ -417,6 +417,12 @@ test("temporary desktop panel preserves main draft, follows up, stops independen
     await page.setViewportSize({ width: 1440, height: 940 });
     const separator = page.getByRole("separator", { name: "调整侧边对话宽度", exact: true }); await separator.focus(); await separator.press("Home"); await expect(separator).toHaveAttribute("aria-valuenow", "320"); await separator.press("End"); await expect(separator).toHaveAttribute("aria-valuenow", (await separator.getAttribute("aria-valuemax"))!);
     await input.fill("草稿"); await input.press("Escape"); await expect(main).toBeFocused(); await expect(panel).toBeVisible();
+    // The workspace rail goes in front of the side conversation without closing it: its session, its
+    // exchanges and its draft are there again when the rail closes.
+    const exchanges = await panel.locator(".side-exchange").count(), disposals = f.disposed.length, rail = page.getByRole("button", { name: "会话工作区", exact: true });
+    await rail.click(); await expect(page.locator("aside.conversation-workspace-rail")).toBeVisible(); await expect(panel).toHaveCount(0); await expect(rail).toHaveAttribute("aria-expanded", "true");
+    await rail.click(); await expect(page.locator("aside.conversation-workspace-rail")).toHaveCount(0); await expect(panel).toBeVisible();
+    await expect(input).toHaveValue("草稿"); await expect(panel.locator(".side-exchange")).toHaveCount(exchanges); expect(f.disposed.length).toBe(disposals);
     await page.reload(); await expect(panel).toHaveCount(0); expect(errors).toEqual([]);
     expect(await readFile(path.join(f.stateDir, "usage.json"), "utf8")).not.toContain("还有哪些风险");
     await expect(trigger).toBeVisible(); await f.offline(); await expect(trigger).toBeDisabled();

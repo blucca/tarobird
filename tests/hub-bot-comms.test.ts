@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HubServer } from "../src/hub/server.js";
 import { BotMessages } from "../src/hub/bot-messages.js";
 import { hashSecret } from "../src/hub/auth.js";
@@ -253,10 +253,147 @@ describe("conversation bot-comms tracking", () => {
       canJumpToTarget: true,
     });
 
-    // Non-member conversation returns 403.
-    const forbidden = await fetch(`${hubA.url}/api/conversations/nonexistent_conv/bot-comms`, {
-      headers: { authorization: `Bearer ${sessionToken}` },
-    });
-    expect([403, 404]).toContain(forbidden.status);
+    // A conversation that exists but that this user is not in is refused, not just an unknown id.
+    await hubA.store.db.run("DELETE FROM conversation_members WHERE conversation_id=? AND member_type='user'", [stageConv.id]);
+    const forbidden = await fetch(`${hubA.url}/api/conversations/${stageConv.id}/bot-comms`, { headers: { authorization: `Bearer ${sessionToken}` } });
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.text()).not.toContain("Research Crew");
+    // The coordinator's own stage is not a handoff: no "Alpha → Alpha" row.
+    await hubA.store.db.run(
+      "INSERT INTO agent_bus_stages(run_id,id,bot_id,conversation_id,status,message_id,started_at,finished_at,error,seq) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      ["run_1", "stage_0", "bot_alpha", conv.id, "running", null, now, null, null, 0],
+    );
+    const again = conversationBotCommsSchema.parse(await (await fetch(`${hubA.url}/api/conversations/${conv.id}/bot-comms`, { headers: { authorization: `Bearer ${sessionToken}` } })).json());
+    expect(again.items.map(item => [item.sourceBotName, item.targetBotName])).toEqual([["Alpha", "Beta"]]);
+    // Without membership of the stage's chat there is no title, id or jump for it.
+    expect(again.items[0]).toMatchObject({ canJumpToTarget: false });
+    expect(again.items[0]?.targetConversationId).toBeUndefined(); expect(again.items[0]?.targetConversationTitle).toBeUndefined();
+  });
+
+  /** One same-host delegation from Alpha's chat to Beta, optionally answered. */
+  async function delegate(requestId: string, text = "Run the regression suite") {
+    const { conv, message } = await startActiveContextTurn(hubA, "bot_alpha");
+    const target = await hubA.botMessages.local({ operation: "resolve", host: "ExampleHostA", bot: "bot_beta", requestId: randomUUID(), contextMessage: message.id, data: {} }, "bot_alpha", guard) as { conversationId: string };
+    const sent = await hubA.botMessages.local({ operation: "send", host: "ExampleHostA", bot: "bot_beta", conversation: target.conversationId, requestId, contextMessage: message.id, data: { text } }, "bot_alpha", guard) as { messageId: string; conversationId: string };
+    const answer = async (reply: string) => {
+      const row = await insertBotMessage(hubA, "bot_beta", target.conversationId, sent.messageId, [{ type: "text", text: reply }], "complete");
+      await hubA.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [sent.messageId, "bot_beta"]);
+      return row;
+    };
+    return { conv, message, target, sent, answer, list: () => hubA.botMessages.listConversationComms("owner", conv.id, guard) };
+  }
+
+  it("shows a user who is not in the target chat no text, title or id of it", async () => {
+    const d = await delegate("req-hidden-chat", "Private instruction for the other chat");
+    await d.answer("Private reply in the other chat");
+    await hubA.store.db.run("DELETE FROM conversation_members WHERE conversation_id=? AND member_type='user'", [d.target.conversationId]);
+    const listed = await d.list();
+    expect(listed.items).toHaveLength(1);
+    expect(listed.items[0]).toMatchObject({ kind: "outgoing_bot_message", sourceBotName: "Alpha", targetBotName: "Beta", canJumpToTarget: false });
+    for (const field of ["sentExcerpt", "replyExcerpt", "pendingApproval", "targetConversationId", "targetConversationTitle", "targetMessageId"] as const) expect(listed.items[0]?.[field]).toBeUndefined();
+    expect(JSON.stringify(listed)).not.toMatch(/Private|other chat/);
+  });
+
+  it("stops showing what the user has removed for themselves", async () => {
+    const d = await delegate("req-removed");
+    const reply = await d.answer("All 42 regression tests passed.");
+    expect((await d.list()).items[0]).toMatchObject({ status: "replied", replyExcerpt: expect.stringContaining("42") });
+    // The reply removed: the exchange stays, its quoted reply does not (also not from the stored copy).
+    await hubA.store.db.run("INSERT INTO message_deletions VALUES(?,?,?)", ["owner", reply.id, Date.now()]);
+    const withoutReply = (await d.list()).items[0];
+    expect(withoutReply).toMatchObject({ status: "replied", sentExcerpt: "Run the regression suite" }); expect(withoutReply?.replyExcerpt).toBeUndefined();
+    // The incoming view in the target chat follows the same rule.
+    const incoming = await hubA.botMessages.listConversationComms("owner", d.target.conversationId, guard);
+    expect(incoming.items).toHaveLength(1); expect(incoming.items[0]?.replyExcerpt).toBeUndefined();
+    // The delivered message removed: the exchange is gone from both chats.
+    await hubA.store.db.run("INSERT INTO message_deletions VALUES(?,?,?)", ["owner", d.sent.messageId, Date.now()]);
+    expect((await d.list()).items).toEqual([]);
+    expect((await hubA.botMessages.listConversationComms("owner", d.target.conversationId, guard)).items).toEqual([]);
+  });
+
+  it("drops a trace when the message whose turn made it is removed", async () => {
+    const d = await delegate("req-cleared");
+    expect((await d.list()).items).toHaveLength(1);
+    await hubA.store.db.run("INSERT INTO message_deletions VALUES(?,?,?)", ["owner", d.message.id, Date.now()]);
+    expect((await d.list()).items).toEqual([]);
+  });
+
+  it("reads a finished exchange once, not at every poll", async () => {
+    const d = await delegate("req-settled");
+    const read = vi.spyOn(hubA.botMessages as unknown as { readLocalTargetInTransaction: (...args: unknown[]) => Promise<unknown> }, "readLocalTargetInTransaction");
+    await d.list(); await d.list();
+    // Still in progress: read each time.
+    expect(read).toHaveBeenCalledTimes(2);
+    await d.answer("Done.");
+    for (let index = 0; index < 4; index++) expect((await d.list()).items[0]).toMatchObject({ status: "replied", replyExcerpt: "Done." });
+    expect(read).toHaveBeenCalledTimes(3);
+  });
+
+  it("matches an approval only to the message it answers", async () => {
+    const first = await delegate("req-first");
+    await first.answer("First is done.");
+    // A later card of the same Bot in the same chat that answers nothing in particular.
+    await hubA.store.db.run("INSERT INTO messages(id,conversation_id,author_type,author_id,reply_to,blocks_json,status,version,created_at) VALUES(?,?,'bot','bot_beta',NULL,?,'streaming',1,?)",
+      [`bm_${randomUUID().replace(/-/g, "").slice(0, 12)}`, first.target.conversationId, JSON.stringify([{ type: "card", title: "Permission required", elements: [{ type: "button", text: "Allow once", actionId: "act_allow", value: { cctb_lark: "approval", requestId: "perm-2", decision: "allow_once" } }] }]), Date.now() + 5]);
+    expect((await first.list()).items[0]).toMatchObject({ status: "replied" });
+    expect((await first.list()).summary).toEqual({ total: 1, active: 0, needsApproval: 0 });
+  });
+
+  it("survives a damaged stored row and keeps tracing afterwards", async () => {
+    const d = await delegate("req-damaged-1");
+    const index = await hubA.store.db.get<{ key: string }>("SELECT key FROM meta WHERE key LIKE 'bot-messages:trace-index:%'");
+    const trace = await hubA.store.db.get<{ key: string }>("SELECT key FROM meta WHERE key LIKE 'bot-messages:trace:%'");
+    // A trace row that is not JSON, then one that is the wrong shape: each is skipped.
+    for (const value of ["{not json", JSON.stringify({ requestId: 7 }), JSON.stringify(null)]) {
+      await hubA.store.db.run("UPDATE meta SET value=? WHERE key=?", [value, trace!.key]);
+      expect(await d.list()).toMatchObject({ items: [], summary: { total: 0, active: 0, needsApproval: 0 } });
+    }
+    // An index row that is not a list: the list is empty, and the next send starts a new index.
+    for (const value of ["{not json", JSON.stringify({ keys: [] }), JSON.stringify("x")]) {
+      await hubA.store.db.run("UPDATE meta SET value=? WHERE key=?", [value, index!.key]);
+      expect((await d.list()).items).toEqual([]);
+    }
+    const sent = await hubA.botMessages.local({ operation: "send", host: "ExampleHostA", bot: "bot_beta", conversation: d.target.conversationId, requestId: "req-damaged-2", contextMessage: d.message.id, data: { text: "Second instruction" } }, "bot_alpha", guard) as { messageId: string };
+    expect(sent.messageId).toBeTruthy();
+    expect((await d.list()).items.map(item => item.sentExcerpt)).toEqual(["Second instruction"]);
+  });
+
+  it("keeps the list when one item does not fit the public shape", async () => {
+    const d = await delegate("req-long-name");
+    await hubA.store.db.run("UPDATE bots SET name=? WHERE id='bot_beta'", ["B".repeat(400)]);
+    const listed = await d.list();
+    expect(listed.items).toHaveLength(1); expect(listed.items[0]?.targetBotName).toHaveLength(128);
+    // A request id at the allowed length still yields a valid item id.
+    const long = await delegate("r".repeat(128));
+    expect((await long.list()).items[0]?.id.length).toBeLessThanOrEqual(160);
+  });
+
+  it("stops counting a cross-host delegation as in progress once nobody has updated it for two hours", async () => {
+    const { conv, message } = await startActiveContextTurn(hubA, "bot_alpha");
+    const target = await crossBotMessages.local({ operation: "resolve", host: "ExampleHostB", bot: "bot_beta", requestId: randomUUID(), contextMessage: message.id, data: {} }, "bot_alpha", guard) as { conversationId: string };
+    await crossBotMessages.local({ operation: "send", host: "ExampleHostB", bot: "bot_beta", conversation: target.conversationId, requestId: "req-never-waited", contextMessage: message.id, data: { text: "Fire and forget" } }, "bot_alpha", guard);
+    expect(await crossBotMessages.listConversationComms("owner", conv.id, guard)).toMatchObject({ items: [{ status: "queued" }], summary: { active: 1 } });
+    const later = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2 * 60 * 60_000 + 1000);
+    try { expect(await crossBotMessages.listConversationComms("owner", conv.id, guard)).toMatchObject({ items: [{ status: "uncertain", sentExcerpt: "Fire and forget" }], summary: { total: 1, active: 0 } }); }
+    finally { later.mockRestore(); }
+  });
+
+  it("keeps at most thirty-two traces per conversation and removes what it evicts", async () => {
+    const d = await delegate("req-bound-0");
+    // A Bot may send ten messages a minute, so the clock moves on between sends.
+    const start = Date.now(), clock = vi.spyOn(Date, "now");
+    try {
+      for (let index = 1; index <= 34; index++) {
+        clock.mockReturnValue(start + index * 7_000);
+        await hubA.botMessages.local({ operation: "send", host: "ExampleHostA", bot: "bot_beta", conversation: d.target.conversationId, requestId: `req-bound-${index}`, contextMessage: d.message.id, data: { text: `Instruction ${index}` } }, "bot_alpha", guard);
+      }
+    } finally { clock.mockRestore(); }
+    const rows = await hubA.store.db.all<{ key: string }>("SELECT key FROM meta WHERE key LIKE 'bot-messages:trace%'");
+    expect(rows.filter(row => row.key.startsWith("bot-messages:trace:"))).toHaveLength(32);
+    expect(rows.filter(row => row.key.startsWith("bot-messages:trace-msg:"))).toHaveLength(32);
+    expect(rows.filter(row => row.key.startsWith("bot-messages:trace-index:"))).toHaveLength(1);
+    const listed = await d.list();
+    expect(listed.items.filter(item => item.kind === "outgoing_bot_message")).toHaveLength(32);
+    expect(listed.items.some(item => item.sentExcerpt === "Run the regression suite")).toBe(false);
   });
 });

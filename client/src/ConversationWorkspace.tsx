@@ -14,15 +14,14 @@ import {
   Network,
   RefreshCw,
   ShieldCheck,
-  Square,
   Users,
   X,
 } from "lucide-react";
 import { blocksText, type Conversation, type Message } from "../../src/client-protocol/index.js";
-import { engineTaskControlResultSchema, engineTaskSnapshotSchema, type EngineTask } from "../../src/client-protocol/engine-tasks.js";
+import { engineTaskSnapshotSchema, type EngineTask } from "../../src/client-protocol/engine-tasks.js";
 import { promptQueueSnapshotSchema, type PromptQueueSnapshot } from "../../src/client-protocol/prompt-queue.js";
 import { conversationFilesPageSchema, type ConversationFile } from "../../src/client-protocol/conversation-files.js";
-import { permissionResultSchema, type PermissionSettings } from "../../src/client-protocol/permissions.js";
+import { permissionSettingsSchema, type PermissionSettings } from "../../src/client-protocol/permissions.js";
 import { conversationBotCommsSchema, type BotCommItem, type ConversationBotComms } from "../../src/client-protocol/workspace-comms.js";
 import { nativeRun } from "../../src/client-protocol/run.js";
 import { runChangesSummarySchema } from "../../src/client-protocol/run-changes.js";
@@ -99,8 +98,10 @@ export function useConversationBotComms(
   connection: HubConnection,
   conversationId: string | undefined,
   enabled: boolean,
-  poll: boolean,
-  revision: number,
+  /** The rail is showing. A closed rail only feeds the header badge. */
+  visible: boolean,
+  /** Changes when a reply in this conversation has ended. */
+  turn: string,
 ) {
   const [data, setData] = useState<ConversationBotComms | undefined>(undefined);
   const [loading, setLoading] = useState(false);
@@ -108,41 +109,56 @@ export function useConversationBotComms(
   const scope = `${connection.identity.hubPublicKey}:${conversationId ?? ""}`;
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
+  // One request at a time per conversation: a slow Host must not collect a queue of polls. A read asked for
+  // meanwhile (a reply just ended, the rail just opened) runs once when the current one is back.
+  const running = useRef<{ scope: string; again: boolean }>(undefined);
+  const available = enabled && !!conversationId && connection.state.status === "online" && !!connection.state.botCommsAvailable;
 
-  const refresh = useCallback(async (signal?: AbortSignal) => {
-    if (!enabled || !conversationId || connection.state.status !== "online" || !connection.state.botCommsAvailable) return;
+  /** Resolves false only when the Host was asked and did not answer. */
+  const refresh = useCallback(async (): Promise<boolean> => {
+    if (!available || !conversationId) return true;
     const reqScope = scopeRef.current;
+    if (running.current?.scope === reqScope) { running.current.again = true; return true; }
+    const mine = running.current = { scope: reqScope, again: false };
     setLoading(true);
+    let answered = true;
     try {
-      const raw = await connection.http(`/api/conversations/${encodeURIComponent(conversationId)}/bot-comms`, { signal });
-      if (signal?.aborted || scopeRef.current !== reqScope) return;
-      setData(conversationBotCommsSchema.parse(raw));
-      setError(false);
+      const raw = await connection.http(`/api/conversations/${encodeURIComponent(conversationId)}/bot-comms`);
+      if (scopeRef.current === reqScope) { setData(conversationBotCommsSchema.parse(raw)); setError(false); }
     } catch {
-      if (!signal?.aborted && scopeRef.current === reqScope) setError(true);
+      if (scopeRef.current === reqScope) { setError(true); answered = false; }
     } finally {
-      if (!signal?.aborted && scopeRef.current === reqScope) setLoading(false);
+      if (running.current === mine) running.current = undefined;
+      if (scopeRef.current === reqScope) setLoading(false);
     }
-  }, [connection, conversationId, enabled]);
+    if (mine.again && scopeRef.current === reqScope) return latest.current();
+    return answered;
+  }, [connection, conversationId, available]);
+  const latest = useRef(refresh); latest.current = refresh;
 
   useEffect(() => {
     setData(undefined);
     setError(false);
   }, [scope]);
 
+  // Read when the conversation opens, the rail opens, the connection returns, and a reply ends.
+  useEffect(() => { if (available) void refresh(); }, [available, visible, turn, refresh]);
+
+  // Between those, only while something is still in progress (quickly with the rail open, slowly for the
+  // badge of a closed one) or slowly with the rail open. A Host that does not answer is asked less often.
+  const inProgress = (data?.summary.active ?? 0) > 0;
   useEffect(() => {
-    if (!enabled || !conversationId || connection.state.status !== "online" || !connection.state.botCommsAvailable) return;
-    const abort = new AbortController();
-    void refresh(abort.signal);
-    if (!poll) return () => abort.abort();
-    const timer = setInterval(() => {
-      if (document.visibilityState === "visible") void refresh(abort.signal);
-    }, 4500);
-    return () => {
-      clearInterval(timer);
-      abort.abort();
+    if (!available) return;
+    const interval = visible ? inProgress ? 6_000 : 30_000 : inProgress ? 30_000 : 0;
+    if (!interval) return;
+    let delay = interval, stopped = false, timer: ReturnType<typeof setTimeout>;
+    const tick = async () => {
+      if (document.visibilityState === "visible") delay = await refresh() ? interval : Math.min(delay * 2, 120_000);
+      if (!stopped) timer = setTimeout(tick, delay);
     };
-  }, [enabled, poll, conversationId, connection.state.status, connection.state.botCommsAvailable, revision, refresh]);
+    timer = setTimeout(tick, delay);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [available, visible, inProgress, refresh]);
 
   return { data, loading, error, refresh };
 }
@@ -200,7 +216,6 @@ export function ConversationWorkspace({
   const [filePage, setFilePage] = useState(0);
   const [expandedComms, setExpandedComms] = useState<ReadonlySet<string>>(() => new Set());
   const [tasks, setTasks] = useState<EngineTask[]>([]);
-  const [stoppingTaskId, setStoppingTaskId] = useState<string | undefined>(undefined);
   const [queue, setQueue] = useState<PromptQueueSnapshot | undefined>(undefined);
   const [permissions, setPermissions] = useState<PermissionSettings | undefined>(undefined);
   const [files, setFiles] = useState<ConversationFile[]>([]);
@@ -226,6 +241,12 @@ export function ConversationWorkspace({
     setFilesHasMore(false);
     setWorkbenchItems([]);
   }, [conversation.id, connection.identity.hubPublicKey]);
+
+  const [settledMessageCount, setSettledMessageCount] = useState(messages.length);
+  useEffect(() => {
+    const timer = setTimeout(() => setSettledMessageCount(messages.length), 1500);
+    return () => clearTimeout(timer);
+  }, [messages.length]);
 
   useEffect(() => { setCommPage(0); }, [commFilter]);
   useEffect(() => { setFilePage(0); }, [fileFilter]);
@@ -271,13 +292,6 @@ export function ConversationWorkspace({
           })
           .catch(() => undefined);
       }
-      void connection.http(`/api/bots/${encodeURIComponent(directBot.id)}/permissions`, { signal: abort.signal })
-        .then(raw => {
-          if (abort.signal.aborted) return;
-          const parsed = permissionResultSchema.parse(raw);
-          if (parsed.ok) setPermissions(parsed.settings);
-        })
-        .catch(() => undefined);
     }
 
     return () => abort.abort();
@@ -290,27 +304,20 @@ export function ConversationWorkspace({
     connection.state.engineTasksAvailable,
     connection.state.promptQueueAvailable,
     refreshTick,
-    messages.length,
+    settledMessageCount,
   ]);
 
-  const stopTask = async (task: EngineTask) => {
-    if (!directBot || stoppingTaskId) return;
-    setStoppingTaskId(task.id);
-    try {
-      const requestId = `ws_stop_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const res = engineTaskControlResultSchema.parse(
-        await connection.http(`/api/conversations/${encodeURIComponent(conversation.id)}/tasks`, {
-          method: "POST",
-          body: JSON.stringify({ botId: directBot.id, taskId: task.id, requestId }),
-        }),
-      );
-      if (res.outcome === "accepted") setRefreshTick(n => n + 1);
-    } catch {
-      // ignore
-    } finally {
-      setStoppingTaskId(undefined);
-    }
-  };
+  // The permission mode is a Bot setting, owner-only on the Host: read when the rail opens for a Bot and on a
+  // manual refresh, not with every message.
+  const mayReadPermissions = online && connection.state.user?.role === "owner" && !!directBot?.online;
+  useEffect(() => {
+    if (!directBot || !mayReadPermissions) return;
+    const abort = new AbortController();
+    void connection.http(`/api/bots/${encodeURIComponent(directBot.id)}/permissions`, { signal: abort.signal })
+      .then(raw => { if (!abort.signal.aborted) setPermissions(permissionSettingsSchema.parse(raw)); })
+      .catch(() => undefined);
+    return () => abort.abort();
+  }, [connection, directBot?.id, mayReadPermissions, refreshTick]);
 
   const diffMessages = useMemo(() => {
     if (connection.state.user?.role !== "owner") return [];
@@ -346,7 +353,9 @@ export function ConversationWorkspace({
   }, [commItems, commFilter]);
 
   const commTotalPages = Math.max(1, Math.ceil(filteredComms.length / COMMS_PAGE_SIZE));
-  const pagedComms = filteredComms.slice(commPage * COMMS_PAGE_SIZE, (commPage + 1) * COMMS_PAGE_SIZE);
+  useEffect(() => { if (commPage > commTotalPages - 1) setCommPage(commTotalPages - 1); }, [commPage, commTotalPages]);
+  const shownCommPage = Math.min(commPage, commTotalPages - 1);
+  const pagedComms = filteredComms.slice(shownCommPage * COMMS_PAGE_SIZE, (shownCommPage + 1) * COMMS_PAGE_SIZE);
 
   // Unified non-diff artifacts (workbench docs + conversation files) for clean pagination & grid
   const fileArtifacts = useMemo(() => [
@@ -374,7 +383,9 @@ export function ConversationWorkspace({
   ], [workbenchItems, files, locale]);
 
   const fileTotalPages = Math.max(1, Math.ceil(fileArtifacts.length / FILES_PAGE_SIZE));
-  const pagedFileArtifacts = fileArtifacts.slice(filePage * FILES_PAGE_SIZE, (filePage + 1) * FILES_PAGE_SIZE);
+  useEffect(() => { if (filePage > fileTotalPages - 1) setFilePage(fileTotalPages - 1); }, [filePage, fileTotalPages]);
+  const shownFilePage = Math.min(filePage, fileTotalPages - 1);
+  const pagedFileArtifacts = fileArtifacts.slice(shownFilePage * FILES_PAGE_SIZE, (shownFilePage + 1) * FILES_PAGE_SIZE);
 
   const artifactsCount = diffMessages.length + fileArtifacts.length;
   const permissionLabel = useMemo(() => {
@@ -420,7 +431,9 @@ export function ConversationWorkspace({
           : item.status === "running" ? "is-running"
             : item.status === "steered" ? "is-steered"
               : item.status === "failed" ? "is-failed"
-                : "is-queued";
+                : item.status === "cancelled" ? "is-cancelled"
+                  : item.status === "uncertain" ? "is-uncertain"
+                    : "is-queued";
     return (
       <article key={item.id} className={`workspace-comm-card${compact ? " is-compact" : ""}${needsApproval ? " is-needs-approval" : ""}`}>
         <div className="workspace-comm-top">
@@ -632,17 +645,6 @@ export function ConversationWorkspace({
                         <span className="workspace-item-title">{task.label || task.id}</span>
                         <span className="workspace-item-meta">{task.kind === "subagent" ? t("子代理") : task.kind === "shell" ? t("后台命令") : t("后台任务")}</span>
                       </span>
-                      {task.canStop && (
-                        <button
-                          type="button"
-                          className="workspace-stop-btn"
-                          disabled={stoppingTaskId === task.id}
-                          onClick={() => void stopTask(task)}
-                        >
-                          <Square size={10} aria-hidden="true"/>
-                          <span>{t("停止")}</span>
-                        </button>
-                      )}
                     </div>
                   ))}
                   {queuedItems.slice(0, 2).map((item, idx) => (
@@ -745,9 +747,9 @@ export function ConversationWorkspace({
                 <div className="workspace-list">{pagedComms.map(item => renderCommCard(item, false))}</div>
                 {commTotalPages > 1 && (
                   <div className="workspace-pager">
-                    <button type="button" disabled={commPage === 0} onClick={() => setCommPage(p => Math.max(0, p - 1))}>{t("上一页")}</button>
-                    <span>{commPage + 1} / {commTotalPages}</span>
-                    <button type="button" disabled={commPage + 1 >= commTotalPages} onClick={() => setCommPage(p => Math.min(commTotalPages - 1, p + 1))}>{t("下一页")}</button>
+                    <button type="button" disabled={shownCommPage === 0} onClick={() => setCommPage(p => Math.max(0, p - 1))}>{t("上一页")}</button>
+                    <span>{shownCommPage + 1} / {commTotalPages}</span>
+                    <button type="button" disabled={shownCommPage + 1 >= commTotalPages} onClick={() => setCommPage(p => Math.min(commTotalPages - 1, p + 1))}>{t("下一页")}</button>
                   </div>
                 )}
               </>
@@ -817,9 +819,9 @@ export function ConversationWorkspace({
 
                 {fileFilter !== "diff" && fileTotalPages > 1 && (
                   <div className="workspace-pager">
-                    <button type="button" disabled={filePage === 0} onClick={() => setFilePage(p => Math.max(0, p - 1))}>{t("上一页")}</button>
-                    <span>{filePage + 1} / {fileTotalPages}</span>
-                    <button type="button" disabled={filePage + 1 >= fileTotalPages} onClick={() => setFilePage(p => Math.min(fileTotalPages - 1, p + 1))}>{t("下一页")}</button>
+                    <button type="button" disabled={shownFilePage === 0} onClick={() => setFilePage(p => Math.max(0, p - 1))}>{t("上一页")}</button>
+                    <span>{shownFilePage + 1} / {fileTotalPages}</span>
+                    <button type="button" disabled={shownFilePage + 1 >= fileTotalPages} onClick={() => setFilePage(p => Math.min(fileTotalPages - 1, p + 1))}>{t("下一页")}</button>
                   </div>
                 )}
 
