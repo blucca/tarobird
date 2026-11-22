@@ -174,9 +174,22 @@ function compareRows(a: InboxRow, b: InboxRow): number {
 
 
 /** Numeric calendar day used wherever space is tight: 11/15, or 2025/12/3 once the year differs. */
+// Building an Intl.DateTimeFormat costs far more than using one, and these functions run for every visible
+// row and message on every render. Each formatter is built once per locale and shape. The set follows the
+// device's time zone offset, so a change of zone builds new ones.
+const formatters = new Map<string, Intl.DateTimeFormat>(); let formattersOffset: number | undefined;
+function formatter(key: string, tag: string | undefined, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const offset = new Date().getTimezoneOffset();
+  if (offset !== formattersOffset) { formatters.clear(); formattersOffset = offset; }
+  const id = `${tag ?? ''}|${key}`;
+  let found = formatters.get(id);
+  if (!found) formatters.set(id, found = new Intl.DateTimeFormat(tag ?? [], options));
+  return found;
+}
 function numericDay(date: Date, today: Date, tag: string): string {
-  return new Intl.DateTimeFormat(tag, date.getFullYear() === today.getFullYear()
-    ? { month: 'numeric', day: 'numeric' } : { year: 'numeric', month: 'numeric', day: 'numeric' }).format(date);
+  return date.getFullYear() === today.getFullYear()
+    ? formatter('numeric-day', tag, { month: 'numeric', day: 'numeric' }).format(date)
+    : formatter('numeric-year-day', tag, { year: 'numeric', month: 'numeric', day: 'numeric' }).format(date);
 }
 
 /**
@@ -195,7 +208,7 @@ export function formatRowTime(at: number, locale: Locale, now: number = Date.now
     return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
   }
   if (at >= startOfDay(1)) return t('昨天');
-  if (at >= startOfDay(6)) return new Intl.DateTimeFormat(tag, { weekday: 'short' }).format(date);
+  if (at >= startOfDay(6)) return formatter('weekday', tag, { weekday: 'short' }).format(date);
   return numericDay(date, today, tag);
 }
 
@@ -213,7 +226,8 @@ export function formatRowTime(at: number, locale: Locale, now: number = Date.now
  */
 export function formatMessageTime(at: number, locale: Locale, compact = false, now: number = Date.now()): string {
   const date = new Date(at);
-  const time = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // The device's own clock format, as toLocaleTimeString([], …) gives it.
+  const time = formatter('clock', undefined, { hour: '2-digit', minute: '2-digit' }).format(date);
   if (!Number.isFinite(at)) return time;
   const today = new Date(now);
   const startOfDay = (daysAgo: number) =>
@@ -225,6 +239,6 @@ export function formatMessageTime(at: number, locale: Locale, compact = false, n
   if (at >= startOfDay(1)) return `${t('昨天')} ${time}`;
   // zh-CN "long" months read 11月15日 / 2025年12月3日; en-US "short" reads Nov 15 / Dec 3, 2025.
   const month = locale === 'zh' ? 'long' : 'short';
-  const day = new Intl.DateTimeFormat(tag, sameYear ? { month, day: 'numeric' } : { year: 'numeric', month, day: 'numeric' });
+  const day = sameYear ? formatter(`day-${month}`, tag, { month, day: 'numeric' }) : formatter(`year-day-${month}`, tag, { year: 'numeric', month, day: 'numeric' });
   return `${day.format(date)} ${time}`;
 }

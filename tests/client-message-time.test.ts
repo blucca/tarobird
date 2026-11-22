@@ -75,3 +75,20 @@ describe("message timestamps inside a conversation", () => {
     expect(formatMessageTime(ahead, "zh", false, now)).toBe(clock(ahead));
   });
 });
+
+describe("formatters are built once, not per call", () => {
+  it("formats many rows and messages without constructing a formatter for each", () => {
+    use("zh");
+    const at = [local(2026, 11, 17, 14, 5), local(2026, 11, 16, 14, 5), local(2026, 11, 13, 14, 5), local(2026, 1, 2, 9, 7), local(2025, 12, 3, 14, 5)];
+    for (const value of at) { formatMessageTime(value, "zh", false, now); formatMessageTime(value, "zh", true, now); formatRowTime(value, "zh", now); }   // warm
+    const built = vi.spyOn(Intl, "DateTimeFormat"), clockCalls = vi.spyOn(Date.prototype, "toLocaleTimeString");
+    const first = at.map(value => [formatMessageTime(value, "zh", false, now), formatMessageTime(value, "zh", true, now), formatRowTime(value, "zh", now)]);
+    for (let i = 0; i < 200; i++) for (const value of at) { formatMessageTime(value, "zh", false, now); formatMessageTime(value, "zh", true, now); formatRowTime(value, "zh", now); }
+    expect(built).not.toHaveBeenCalled();
+    expect(clockCalls).not.toHaveBeenCalled();
+    expect(at.map(value => [formatMessageTime(value, "zh", false, now), formatMessageTime(value, "zh", true, now), formatRowTime(value, "zh", now)])).toEqual(first);
+    // The clock part is still what the device's own format gives.
+    built.mockRestore(); clockCalls.mockRestore();
+    expect(formatMessageTime(at[0]!, "zh", false, now)).toBe(clock(at[0]!));
+  });
+});
