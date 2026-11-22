@@ -196,36 +196,23 @@ async function runBoundedQuotaCommand(input: {
   child.stdin?.on?.("error", () => undefined);
   try { child.stdin?.end(); } catch { /* ignore */ }
 
+  // Waiting for the stop and the close after an abort shares one 2 s allowance (three separate ones added up to
+  // 6 s), so a read ends within its limit plus 2 s and the Hub, which waits longer, gets this answer.
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
+  let allowance: Promise<void> | undefined;
+  const allow = () => allowance ??= new Promise<void>(resolve => { closeTimer = setTimeout(resolve, 2000); });
+  let onSignal: (() => void) | undefined;
   try {
-    await new Promise<void>(resolve => {
-      const done = () => resolve();
-      void closed.then(done);
-      if (input.signal.aborted) {
-        void terminate();
-        closeTimer = setTimeout(done, 2000);
-      } else {
-        const onSignal = () => {
-          closeTimer = setTimeout(done, 2000);
-        };
-        input.signal.addEventListener("abort", onSignal, { once: true });
-        void closed.then(() => input.signal.removeEventListener("abort", onSignal));
-      }
-    });
-    if (stopping) {
-      await Promise.race([
-        stopping,
-        new Promise<void>(resolve => { const t = setTimeout(resolve, 2000); void stopping?.finally(() => clearTimeout(t)); }),
-      ]);
-    }
-    if (!didClose) {
-      await Promise.race([
-        closed,
-        new Promise<void>(resolve => { const t = setTimeout(resolve, 2000); void closed.finally(() => clearTimeout(t)); }),
-      ]);
-    }
+    if (input.signal.aborted) void terminate();
+    await Promise.race([closed, input.signal.aborted ? allow() : new Promise<void>(resolve => {
+      onSignal = () => { void allow().then(resolve); };
+      input.signal.addEventListener("abort", onSignal, { once: true });
+    })]);
+    if (stopping) await Promise.race([stopping, allow()]);
+    if (!didClose) await Promise.race([closed, allow()]);
   } finally {
     if (closeTimer) clearTimeout(closeTimer);
+    if (onSignal) input.signal.removeEventListener("abort", onSignal);
     input.signal.removeEventListener("abort", onAbort);
   }
 

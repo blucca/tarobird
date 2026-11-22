@@ -6,6 +6,9 @@ export const ENGINE_QUOTA_TTL_MS = 60_000;
  * when measured (2026-11-22); Codex and Claude Code keep their own shorter limits. The Gateway and the Hub wait
  * a little longer than this, so the engine's own answer ("timeout" included) is the one that comes back. */
 export const ENGINE_QUOTA_REFRESH_MS = 15_000;
+/** The Hub's wait for one refresh: the engine's limit, the up to 2 s a reader then takes to stop its process, and a
+ * margin. The App's Settings page waits longer still, so the Hub's answer is the one it shows. */
+export const ENGINE_QUOTA_HUB_REFRESH_MS = ENGINE_QUOTA_REFRESH_MS + 3_000;
 const identifier = z.string().min(1).max(128).regex(/^[a-zA-Z0-9_.:-]+$/);
 const label = z.string().min(1).max(120).refine(value => !/[\x00-\x1f\x7f]/.test(value));
 const timestamp = z.string().datetime({ offset: true });

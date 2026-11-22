@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Capacitor } from "@capacitor/core";
-import type { QuotaDirectory, QuotaScope } from "../../src/client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_HUB_REFRESH_MS, type QuotaDirectory, type QuotaScope } from "../../src/client-protocol/engine-quota.js";
 import type { HubConnection } from "./connection.js";
 import { HubHttpError } from "./http-error.js";
 
 type View = { connection: HubConnection; userId?: string; directory?: QuotaDirectory; loading: boolean; busy: string[]; errors: Record<string, string>; error?: string; notice?: string };
 type Request = { controller: AbortController; timer: ReturnType<typeof setTimeout> };
-const request = (): Request => { const controller = new AbortController(); return { controller, timer: setTimeout(() => controller.abort(), 15_000) }; };
+// Longer than the Hub waits for a refresh, so the page shows the Hub's answer (the engine's own "timeout" included).
+const request = (): Request => { const controller = new AbortController(); return { controller, timer: setTimeout(() => controller.abort(), ENGINE_QUOTA_HUB_REFRESH_MS + 2_000) }; };
 const finish = (value: Request) => clearTimeout(value.timer);
 const cancel = (value: Request) => { finish(value); value.controller.abort(); };
 

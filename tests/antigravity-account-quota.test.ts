@@ -363,6 +363,23 @@ describe("ProcessAntigravityAdapter account quota", () => {
     expect(spawn).toHaveBeenCalledTimes(2);
   });
 
+  it("ends a timed-out read within one 2 s stop allowance, so the Hub still gets its answer", async () => {
+    const f = await agyFixture({ withState: true });
+    const spawn = vi.fn((_cmd: string, args: string[]) => {
+      const child = new MockChild();
+      if (args.includes("--version")) child.finish(0, "1.5.14\n");
+      // A usage run that neither answers nor closes when it is told to stop.
+      else child.kill = () => { child.killed = true; };
+      return child;
+    });
+    const adapter = new ProcessAntigravityAdapter("agy", f.env, spawn as any, undefined, undefined, f.root);
+    disposals.push(() => adapter.destroy());
+    const began = performance.now();
+    const result = await adapter.getAccountQuota!({ refresh: true, timeoutMs: 50 });
+    expect(result.snapshot).toMatchObject({ reason: "timeout" });
+    expect(performance.now() - began).toBeLessThan(50 + 2_000 + 400);
+  }, 10_000);
+
   it("reports mode_not_supported for GEMINI_API_KEY without subscription state", async () => {
     const f = await agyFixture({ withState: false, extraEnv: { GEMINI_API_KEY: "synthetic-api-key" } });
     const spawn = vi.fn();

@@ -1,6 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { gatewayEngineQuota } from "../src/gateway/engine-quota.js";
-import { ENGINE_QUOTA_REFRESH_MS, quotaReadingExpired } from "../src/client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_HUB_REFRESH_MS, ENGINE_QUOTA_REFRESH_MS, quotaReadingExpired } from "../src/client-protocol/engine-quota.js";
 import { unavailableQuota } from "../src/codex/account-quota.js";
 import type { EngineQuotaReadResult } from "../src/codex/adapter.js";
 
@@ -24,6 +24,8 @@ it("gives an explicit refresh the shared time limit and a plain read a short one
   const run = gatewayEngineQuota({ botId: "bot", engine: "antigravity", read, now: () => 2000 });
   await run({ scopeId: "bot", expectedRevision: "one", refresh: true });
   expect(ENGINE_QUOTA_REFRESH_MS).toBe(15_000);
+  // A reader may take up to 2 s past the limit to stop its process; the Hub waits beyond that.
+  expect(ENGINE_QUOTA_HUB_REFRESH_MS).toBeGreaterThan(ENGINE_QUOTA_REFRESH_MS + 2_000);
   expect(read.mock.calls.map(call => (call as unknown as [{ refresh: boolean; timeoutMs: number }])[0]).map(options => [options.refresh, options.timeoutMs]))
     .toEqual([[false, 1_500], [true, ENGINE_QUOTA_REFRESH_MS]]);
 });

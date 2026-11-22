@@ -198,7 +198,10 @@ Checked on 2026-11-22 for the symbols:
   runtime answered "timeout" twice. The runtime was not the cause: six `agy -p
   /usage` reads in a row took 4.0 to 8.0 s, and the reader gave up after 7 s.
   An explicit refresh may now take 15 s inside the reader
-  (`ENGINE_QUOTA_REFRESH_MS`); the Gateway and the Hub wait slightly longer.
+  (`ENGINE_QUOTA_REFRESH_MS`), and stopping a process that did not finish may
+  add up to 2 s more; the Gateway passes the limit on, the Hub waits 18 s
+  (`ENGINE_QUOTA_HUB_REFRESH_MS`) and the Settings page 20 s, so the reader's
+  own answer is the one shown.
   Codex and Claude Code keep their 7 s limits.
 
 Not checked: Codex context figures against a real session, and any of this in

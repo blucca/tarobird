@@ -1,7 +1,7 @@
 import { HubConversationHistory } from "./conversation-history.js";
 import { CONVERSATION_HISTORY_CAPABILITY, historyChangeSchema } from "../client-protocol/conversation-history.js";
 import { hubEngineQuotas } from "./engine-quota.js";
-import { ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_REFRESH_MS } from "../client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_HUB_REFRESH_MS } from "../client-protocol/engine-quota.js";
 import { DesignShareBroker, metaDesignShareRepository, type DesignSharePeer } from "./workbench-design-sharing.js";
 import { DESIGN_SHARE_CLIENT_CAPABILITY } from "../client-protocol/workbench-design-sharing.js";
 import { HubRemoteScreen } from "./remote-screen.js";
@@ -1600,7 +1600,7 @@ export class HubServer {
         if (revision && (revision.length > 128 || !/^[a-zA-Z0-9_.:-]+$/.test(revision)) || refresh && !quotaRoute[1]) throw new HubError("quota_request_invalid", 400);
         const quotas = hubEngineQuotas({ bots: () => this.store.bots(userId), validate,
           connection: id => { const connection = this.bots.get(id); return connection ? { key: connection, supported: connection.engineQuota, ready: connection.ready } : undefined; },
-          call: (id, request) => this.callBot(id, "quota.get", request, request.refresh ? ENGINE_QUOTA_REFRESH_MS + 2_000 : 2_500),
+          call: (id, request) => this.callBot(id, "quota.get", request, request.refresh ? ENGINE_QUOTA_HUB_REFRESH_MS : 2_500),
         });
         await reply(200, quotaRoute[1] ? await quotas.scope(quotaRoute[1], refresh, revision) : await quotas.directory()); return;
       }
