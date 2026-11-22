@@ -87,7 +87,7 @@ export class RemoteScreenSockets {
           localBudget = Math.min(SCREEN_PACKET_LIMIT, localBudget + Math.max(0, now - localAt) * rate); localAt = now;
           this.totalBudget = Math.min(2 * SCREEN_PACKET_LIMIT, this.totalBudget + Math.max(0, now - this.budgetAt) * 2 * SCREEN_MEDIA_BYTES_PER_MS); this.budgetAt = now;
           localBudget -= bytes.byteLength; if (shared) this.totalBudget -= bytes.byteLength;
-          if (localBudget < 0 || this.totalBudget < 0) throw new HubError("screen_bandwidth_exceeded", 429);
+          if (localBudget < 0 || shared && this.totalBudget < 0) throw new HubError("screen_bandwidth_exceeded", 429);
           if (!this.authority.frame(epoch, sessionId, generation, readScreenFrame(bytes), bytes)) throw new HubError("screen_frame_rejected", 409);
           return;
         }
