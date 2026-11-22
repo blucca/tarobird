@@ -36,6 +36,9 @@ async function bootstrap(page: Page) {
         if (plugin !== "TaroCubShareInbox") throw new Error(`unexpected_native:${plugin}.${method}`);
         if (method === "list") {
           if (w.__share.mode === "error") throw new Error("share_app_group_unavailable");
+          // One record this build cannot read (wrong types, no files) between two it can.
+          if (w.__share.mode === "broken") return { items: [{ id: "0d1f0a52-3b0e-4d6c-9a57-1f2e3d4c5b6a", createdAt: "yesterday", text: 7 }] };
+          if (w.__share.mode === "mixed") return { items: [structuredClone(item), { id: "0d1f0a52-3b0e-4d6c-9a57-1f2e3d4c5b6a", createdAt: "yesterday", text: 7 }, { id: "5a6c0c1e-7d1b-4c7e-8f3a-2b9d6e4f1a20", createdAt: Date.now(), text: "第二条完好的分享", files: [] }] };
           return { items: w.__share.mode === "one" ? [structuredClone(item)] : [] };
         }
         if (method === "pushTokenSnapshot") return { revision: 0 };
@@ -225,6 +228,29 @@ for (const [label, platform, width, height, insets, keyboardHeight] of [
     if (shots) await page.screenshot({ path: path.join(shots, `${label}-dialog.png`) });
     await dialog.getByRole("button", { name: "关闭", exact: true }).click();
     await expect(dialog).toBeHidden(); await expect(entry(page)).toBeFocused();
+  });
+  await context.close();
+});
+
+test("one unreadable record does not hide the shares beside it", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 430, height: 932 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true, locale: "zh-CN" });
+  await withHub(await context.newPage(), async page => {
+    await page.evaluate(() => { (window as any).__share.mode = "mixed"; });
+    await goNative(page, "android", NONE);
+    // Any App render after the flip picks up the native share bridge.
+    await nav(page).getByRole("button", { name: /^Bot/ }).click(); await nav(page).getByRole("button", { name: /^消息/ }).click();
+    // Three records are listed and one cannot be read: the entry counts the two that can, and the dialog shows both.
+    const two = page.getByRole("button", { name: "待发送分享 (2)", exact: true });
+    await expect(two).toBeVisible({ timeout: 10_000 });
+    await two.click();
+    const dialog = page.getByRole("dialog", { name: "收到的分享", exact: true });
+    await expect(dialog).toContainText("来自系统分享的草稿");
+    await expect(dialog).toContainText("第二条完好的分享");
+    await expect(dialog.getByRole("alert")).toHaveCount(0);
+    await dialog.getByRole("button", { name: "关闭", exact: true }).click();
+    // When the broken record is the only one left, there is nothing to send and no entry.
+    await page.evaluate(() => { (window as any).__share.mode = "broken"; });
+    await expect(page.locator(".share-inbox-button")).toHaveCount(0, { timeout: 10_000 });
   });
   await context.close();
 });

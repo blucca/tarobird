@@ -13,6 +13,17 @@ export const sharedItemSchema = z.object({
 });
 export type SharedItem = z.infer<typeof sharedItemSchema>;
 export type ShareDelivery = z.infer<typeof shareDeliverySchema>;
+/** What a native listing holds: the items this build can show, and the id of every record in it, shown or not.
+ *  One record that cannot be read must not hide the others. It stays in the native inbox and ages out there, and
+ *  because its id is still listed, nothing saved for it on this device is thrown away on its account. */
+export function readSharedListing(records: unknown[]): { items: SharedItem[]; ids: string[] } {
+  const items: SharedItem[] = [], ids: string[] = [];
+  for (const record of records) {
+    const id = (record as { id?: unknown } | null)?.id; if (typeof id === "string") ids.push(id);
+    const parsed = sharedItemSchema.safeParse(record); if (parsed.success) items.push(parsed.data);
+  }
+  return { items, ids };
+}
 // Editable local review state is separate from the immutable native delivery
 // receipt. Merely saving a draft must never prepare or send a share.
 export { shareDraftSchema, type ShareDraft, type SavedShareDraft } from "../../src/client-protocol/share-drafts.js";

@@ -74,6 +74,26 @@ public class ShareInboxExpiryTest {
         }
     }
 
+    @Test public void oneUnreadableEntryDoesNotHideTheOthers() throws Exception {
+        File first = temp.newFolder("11111111-1111-4111-8111-111111111111"), second = temp.newFolder("33333333-3333-4333-8333-333333333333");
+        publish(first, new JSONObject().put("id", first.getName()).put("text", "first").put("files", new JSONArray()));
+        publish(second, new JSONObject().put("id", second.getName()).put("text", "second").put("files", new JSONArray()));
+        File cutShort = temp.newFolder("22222222-2222-4222-8222-222222222222"), notAnObject = temp.newFolder("44444444-4444-4444-8444-444444444444");
+        File oversized = temp.newFolder("55555555-5555-4555-8555-555555555555"), importing = temp.newFolder("66666666-6666-4666-8666-666666666666");
+        Files.writeString(new File(cutShort, "item.json").toPath(), "{\"id\":\"22222222-2222-4222-8222-22222222");
+        Files.writeString(new File(notAnObject, "item.json").toPath(), "[]");
+        Files.write(new File(oversized, "item.json").toPath(), new byte[1024 * 1024 + 1]);
+        Files.writeString(new File(importing, "item.tmp").toPath(), "unpublished");
+        File stray = temp.newFolder("not-an-item-id");
+        publish(stray, new JSONObject().put("id", "not-an-item-id").put("text", "stray").put("files", new JSONArray()));
+        java.util.List<JSONObject> items = ShareInboxExpiry.readableItems(new File[]{first, cutShort, second, notAnObject, oversized, importing, stray});
+        assertEquals(2, items.size());
+        assertEquals("first", items.get(0).getString("text"));
+        assertEquals("second", items.get(1).getString("text"));
+        // The unreadable entries are left where they are; the age-based cleanup still owns them.
+        for (File left : new File[]{cutShort, notAnObject, oversized, importing, stray}) assertTrue(left.isDirectory());
+    }
+
     @Test public void oversizedManifestsStillRejectNormalReads() throws Exception {
         File directory = temp.newFolder();
         Files.write(new File(directory, "item.json").toPath(), new byte[1024 * 1024 + 1]);

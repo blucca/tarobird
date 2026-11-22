@@ -93,7 +93,7 @@ public class ShareInboxPlugin extends Plugin {
     }
     private interface Operation { JSObject run() throws Exception; }
     private void perform(PluginCall call, Operation action) { IO.execute(() -> { try { call.resolve(action.run()); } catch (Exception error) { call.reject("share_operation_failed", error); } }); }
-    @PluginMethod public void list(PluginCall call) { perform(call, () -> { JSArray result = new JSArray(); for (File dir : entries()) if (new File(dir, "item.json").isFile()) result.put(read(dir.getName())); JSObject value = new JSObject(); value.put("items", result); return value; }); }
+    @PluginMethod public void list(PluginCall call) { perform(call, () -> { JSArray result = new JSArray(); for (JSONObject item : ShareInboxExpiry.readableItems(entries())) result.put(item); JSObject value = new JSObject(); value.put("items", result); return value; }); }
     @PluginMethod public void setMaxFileBytes(PluginCall call) { perform(call, () -> {
         long value = integer(call, "maxFileBytes"); if (value < 1) throw new IOException("share_limit_invalid");
         if (!limits().edit().putLong("maxFileBytes", value).commit()) throw new IOException("share_storage_failed");

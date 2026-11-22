@@ -43,6 +43,15 @@ import Foundation
         try store.remove(group)
         try store.remove(id); try store.remove(id)
         let emptyItems = try restored.list(); precondition(emptyItems.isEmpty)
+        // One record that cannot be read does not hide the one beside it (Android lists the same way); it stays
+        // where it is for the age-based cleanup.
+        let kept = try store.create(); try store.write(kept, ["id": kept, "createdAt": Date().timeIntervalSince1970 * 1000, "text": "kept", "files": [[String: Any]]()])
+        let broken = try store.create(); try Data("{\"id\":\"cut sho".utf8).write(to: store.directory(broken).appendingPathComponent("item.json"))
+        let stray = temporary.appendingPathComponent("inbox/not-an-item-id"); try fm.createDirectory(at: stray, withIntermediateDirectories: false)
+        let readable = try restored.list(); precondition(readable.count == 1 && readable[0]["text"] as? String == "kept")
+        let brokenPath = try store.directory(broken).path
+        precondition(fm.fileExists(atPath: brokenPath) && fm.fileExists(atPath: stray.path))
+        try store.remove(kept); try store.remove(broken); try fm.removeItem(at: stray)
         try store.setMaxFileBytes(1024)
         precondition(restored.maxBytes == 1024)
         reject { _ = try restored.copyFile(source, id: try restored.create(), index: 0, name: "x", mime: "text/plain", remaining: bytes.count) }

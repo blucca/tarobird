@@ -7,7 +7,7 @@ import { t, useLocale } from "./i18n.js";
 import { uploadFile } from "./files.js";
 import { useBotLabels } from "./BotReferences.js";
 import { shareInbox, supportsShareInbox } from "./share-inbox.js";
-import { sharedItemSchema, sendSharedItem, type SharedItem, type ShareBridge, type ShareDelivery } from "./share-controller.js";
+import { readSharedListing, sendSharedItem, type SharedItem, type ShareBridge, type ShareDelivery } from "./share-controller.js";
 import { HostLocation } from "./RuntimeHost.js";
 import { useShareDraft } from "./share-drafts.js";
 
@@ -119,11 +119,12 @@ export function useShareInbox({ connection, conversations, active = true, enable
   useBackAction(panel, () => setOpen(false));
   async function refresh() {
     if (!native) return; const request = ++requested.current;
-    let next: SharedItem[] | undefined, failure = "";
-    try { next = (await native.list()).items.map((item) => sharedItemSchema.parse(item)); } catch (e) { failure = String(e); }
+    let next: SharedItem[] | undefined, present: string[] = [], failure = "";
+    try { const listing = readSharedListing((await native.list()).items); next = listing.items; present = listing.ids; } catch (e) { failure = String(e); }
     if (!mounted.current || request < applied.current) return; applied.current = request;
     if (next) {
-      const removed = previousItems.current.filter(id => !next!.some(item => item.id === id)); previousItems.current = next.map(item => item.id);
+      // An item counts as finished only when the inbox no longer lists it at all, not when it merely cannot be read.
+      const removed = previousItems.current.filter(id => !present.includes(id)); previousItems.current = next.map(item => item.id);
       // Expiry is coarse: prune at most once a minute (or when items finished),
       // not with a write transaction on every poll.
       if (removed.length || Date.now() - pruned.current > 60_000) { pruned.current = Date.now(); void connection.cache.pruneExpiredShareDrafts(connection.identity).catch(() => undefined); }

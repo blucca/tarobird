@@ -1,6 +1,8 @@
 package com.tarobot.client;
 
 import java.io.*;
+import java.util.ArrayList;
+import java.util.List;
 import org.json.*;
 
 /** Published shares keep their import lifetime when delivery metadata changes. */
@@ -20,6 +22,20 @@ final class ShareInboxExpiry {
             }
             return new JSONObject(data.toString("UTF-8"));
         }
+    }
+
+    /**
+     * The items a listing can show, in the given order. An entry whose manifest cannot be read (cut short, not an
+     * object, oversized) or whose folder is not an item id is left out, so that it cannot hide the others; it stays
+     * on disk and ages out as before. An entry still being imported has no item.json yet and is left out as well.
+     */
+    static List<JSONObject> readableItems(File[] directories) {
+        List<JSONObject> items = new ArrayList<>();
+        for (File directory : directories) {
+            if (!directory.getName().matches("[a-f0-9-]{36}") || !new File(directory, "item.json").isFile()) continue;
+            try { items.add(readItem(directory)); } catch (IOException | JSONException unreadable) { /* Left out; see above. */ }
+        }
+        return items;
     }
 
     static boolean isExpired(File directory, long now, long ttl) {
