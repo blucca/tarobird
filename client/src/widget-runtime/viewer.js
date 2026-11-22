@@ -43,8 +43,9 @@ applyTheme(initialTheme);deviceDark.addEventListener('change',mapSchemeMedia);
 // SVG counts as painted because its default fill is black, and so do external
 // stylesheets and scripts, which assume a light page unless they say otherwise. Source without any
 // colour of its own inherits the App's and keeps following it. A painted design
-// whose outermost element has an opaque dark background was drawn for a dark
-// canvas; this reads the authored background once and rewrites nothing.
+// whose outermost painted layer (its first element, else a body rule) has an
+// opaque dark background was drawn for a dark canvas; this reads the authored
+// background once and rewrites nothing.
 const themeFollowing=/--(?:text|muted|surface|card|border|accent|accent-soft|primary-bg|on-primary|ok|warn|danger|cat-[1-8](?:-ink|-soft)?|chart-series-[1-4])(?![\w-])(?!\s*:)|light-dark\s*\(|prefers-color-scheme|tarobot:theme/i;
 const paintedColour=/(?:^|[^&\w])#[0-9a-f]{3,8}(?![\w-])|\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\s*\(|<svg\b|<link\b|<script\b[^>]*\ssrc\s*=/i,colourWords=['transparent','currentcolor','inherit','initial','unset','revert','none','auto'];
 const namedColour=source=>{for(const match of source.matchAll(/(?:color|background|fill|stroke)\s*[:=]\s*["']?\s*([a-z]+)\b/gi)){const word=match[1].toLowerCase();if(!colourWords.includes(word)&&CSS.supports('color',word))return true}return false};
@@ -53,10 +54,17 @@ let defaultCanvas;
 const designCanvas=()=>{
  if(defaultCanvas!==undefined)return defaultCanvas;
  if(!ownDesign)return defaultCanvas='';
- const outer=root.querySelector(':scope>:not(style,script,template)'),rgb=outer&&/^rgba?\(([^)]+)\)$/.exec(getComputedStyle(outer).backgroundColor);
- const [r,g,b,a=1]=rgb?rgb[1].split(/[\s,/]+/).filter(Boolean).map(Number):[255,255,255,0];
- const luminance=[r,g,b].map(v=>{v/=255;return v<=.04045?v/12.92:((v+.055)/1.055)**2.4}).reduce((sum,v,i)=>sum+v*[.2126,.7152,.0722][i],0);
- return defaultCanvas=a>=.5&&luminance<.18?'dark':'light';
+ // Computed colours keep their authored space (oklch(), color(srgb …)); a
+ // 1x1 canvas converts any of them to sRGB bytes.
+ const paint=createElement('canvas').getContext('2d',{willReadFrequently:true});
+ for(const node of [root.querySelector(':scope>:not(style,script,template)'),bodyElement]){
+  if(!node||!paint)continue;
+  paint.clearRect(0,0,1,1);paint.fillStyle='transparent';paint.fillStyle=getComputedStyle(node).backgroundColor;paint.fillRect(0,0,1,1);
+  const [r,g,b,alpha]=paint.getImageData(0,0,1,1).data;if(alpha<128)continue;
+  const luminance=[r,g,b].map(v=>{v/=255;return v<=.04045?v/12.92:((v+.055)/1.055)**2.4}).reduce((sum,v,i)=>sum+v*[.2126,.7152,.0722][i],0);
+  return defaultCanvas=luminance<.18?'dark':'light';
+ }
+ return defaultCanvas='light';
 };
 function refreshCanvas(){const next=designCanvas();if(next===canvas)return;canvas=next;applyTheme(suppliedTheme);worker?.postMessage({type:'theme',theme:effectiveTheme()})}
 // IDs remain local to this opaque viewer, whose authority is captured in lexical
