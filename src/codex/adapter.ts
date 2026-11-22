@@ -325,6 +325,8 @@ type UnscopedEngineStreamEvent =
     }
   | { /** Host admission state, never model output or a fabricated tool call. */
       type: "background_review_wait" | "native_input_wait"; status: "started" | "finished" | "cancelled"; sessionId?: string;
+      /** Names a non-Claude engine in the waiting copy; absent for Claude. */
+      engine?: "kimi";
     }
   | {
       /** Explicit engine context maintenance, before or during a user turn. */

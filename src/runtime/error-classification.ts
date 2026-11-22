@@ -172,7 +172,17 @@ function isDeepSeekWriterHeld(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "session/writer-held";
 }
 
+/** Kimi answered at once with no output and no queue receipt: the prompt was
+ * not processed. The adapter owns this exact message; model text never uses it. */
+export const KIMI_PROMPT_NOT_PROCESSED_MESSAGE = "Kimi did not process this message: the prompt ended at once with no output and no queue receipt";
+function isKimiPromptNotProcessed(error: unknown): boolean {
+  return normalizeErrorText(error).includes(KIMI_PROMPT_NOT_PROCESSED_MESSAGE);
+}
+
 export function renderEngineBusyError(locale: "zh" | "en", error?: unknown): string {
+  if (isKimiPromptNotProcessed(error)) return locale === "zh"
+    ? "Kimi 没有处理这条消息：它立即结束了本轮，没有任何输出，可能正忙于自己的后台任务。请稍后重新发送。"
+    : "Kimi did not process this message: it ended the turn at once without any output, possibly while busy with its own background work. Send the message again in a moment.";
   // Telegram passes the detail string only after classifying the typed error.
   if (isDeepSeekWriterHeld(error) || typeof error === "string" && error.includes("is already owned by an active write handle")) return locale === "zh"
     ? "DeepSeek 会话仍被占用，暂时无法接收这条消息。请稍后重试，无需清空对话。"
@@ -242,7 +252,7 @@ export function classifyFailure(error: unknown): FailureCategory {
   if (error instanceof Error && ["EngineRecoveryUnconfirmedError", "EngineRecoveryExhaustedError"].includes(error.name)) return "engine-incomplete";
   if (error instanceof Error && error.name === "EngineRecoveryBudgetError") return "engine-quota";
   if (error instanceof EngineIncompleteResponseError) return "engine-incomplete";
-  if (isDeepSeekWriterHeld(error)) return "engine-busy";
+  if (isDeepSeekWriterHeld(error) || isKimiPromptNotProcessed(error)) return "engine-busy";
   if (error instanceof EngineConfigError || normalizeErrorText(error).includes(`${ENGINE_CONFIG_ERROR_CODE}:`)) return "engine-settings";
   if (error instanceof FileWorkflowPreparationError) {
     return "file-workflow";

@@ -88,6 +88,7 @@ import {
 import { readValidatedConfigFile, resolveEngineOverride, type EngineOverride } from "../state/instance-config.js";
 import { readKimiModelConfig } from "./kimi-models.js";
 import { resolveSearchRoutingSync, SEARCH_CREDENTIAL_KEYS } from "../runtime/search-routing.js";
+import { KIMI_PROMPT_NOT_PROCESSED_MESSAGE } from "../runtime/error-classification.js";
 import { resolveSearchMcpServerInvocation } from "../../deepseek-harness-plugin/src/search-mcp-server.js";
 
 type SpawnOptions = {
@@ -124,6 +125,21 @@ export type SpawnKimi = (command: string, args: string[], options: SpawnOptions)
 type PendingKimiTurn = {
   compactionId?: string;
   turnId: number;
+  /** Exact ACP prompt text; Kimi hooks echo it for a queued or started turn. */
+  promptText: string;
+  /** A turn-content ACP update was routed to this turn. */
+  engineActivity: boolean;
+  /** The ACP session/prompt request itself has settled. */
+  promptReturned: boolean;
+  /** UserPromptQueued carried this prompt: Kimi queued it behind its own turn. */
+  queuedPromptId?: string;
+  /** TurnStarted(origin user) carried this prompt. */
+  kimiTurnId?: string;
+  /** End of the Kimi turn `kimiTurnId` (hook, next TurnStarted or wire). */
+  kimiTurnTerminal?: KimiHookTerminal;
+  /** ACP returned at once and Kimi runs this prompt later, without an ACP driver. */
+  awaitingQueuedTurn?: boolean;
+  notifyKimiTurn?: () => void;
   assistantText: string;
   assistantBoundaryPending: boolean;
   onProgress?: (partialText: string) => void;
@@ -256,6 +272,8 @@ type KimiHookTurn = {
 type IgnoredKimiHookTurn = {
   turnId: string;
   startedAt: number;
+  /** Its terminal already arrived: drop its late updates, never hold prompts. */
+  endedAt?: number;
 };
 
 type KimiHookTerminal = {
@@ -350,6 +368,8 @@ type KimiWorker = {
   ignoredHookTurn?: IgnoredKimiHookTurn;
   pendingHookTerminal?: PendingKimiHookTerminal;
   ignoredHookTerminalStarts: number[];
+  /** Polls the wire for Kimi-owned turns whose end produced no hook. */
+  kimiTurnWatchTimer?: ReturnType<typeof setTimeout>;
   lastActivityAt: number;
   removed: boolean;
   failureError?: Error;
@@ -406,6 +426,13 @@ const DEFAULT_HOOK_TERMINAL_GRACE_MS = 250;
 const HOOK_RELAY_DRAIN_TIMEOUT_MS = 5_000;
 const SESSION_UPDATE_HOOK_DRAIN_TIMEOUT_MS = 2_000;
 const PENDING_HOOK_TERMINAL_TTL_MS = 5_000;
+// A Kimi-owned turn normally ends with its own Stop/StopFailure/Interrupt hook
+// or, when Kimi has more input waiting, with the next TurnStarted. This bound
+// only covers lost hooks; a prompt sent after it is still caught as queued.
+const DEFAULT_TASK_TURN_HOLD_SAFETY_MS = KIMI_ACP_TURN_TIMEOUT_MS;
+const DEFAULT_QUEUED_PROMPT_RECEIPT_GRACE_MS = 3_000;
+const QUEUED_REPLY_WIRE_READ_ATTEMPTS = 20;
+const QUEUED_REPLY_WIRE_READ_INTERVAL_MS = 100;
 const KIMI_VERSION_PROBE_TIMEOUT_MS = 5_000;
 const MAX_ACP_ERROR_DETAILS_CHARS = 2_000;
 
@@ -848,6 +875,12 @@ function parseKimiTaskTurnPrompt(prompt: string | undefined): {
   };
 }
 
+/** Kimi hooks echo the exact prompt text; our turns carry a private
+ * instruction prefix, so equality identifies this adapter's own input. */
+function kimiPromptMatches(hookPrompt: string | undefined, sentPrompt: string): boolean {
+  return hookPrompt !== undefined && hookPrompt.trim() === sentPrompt.trim();
+}
+
 function isSafeKimiPathSegment(value: string): boolean {
   return value !== "." && value !== ".." && /^[A-Za-z0-9._-]+$/.test(value);
 }
@@ -985,14 +1018,29 @@ async function readKimiTaskReviewTextFromWire(
   taskId: string,
   turnId: string,
 ): Promise<string | undefined> {
+  if (!isSafeKimiPathSegment(taskId)) {
+    return undefined;
+  }
+  return readKimiTurnTextFromWire(engineHomePath, sessionId, turnId, { taskId });
+}
+
+/** The final text of one ended Kimi turn. A task id restricts it to that
+ * task-origin review; without one only a non-task turn of the main agent
+ * matches (a queued user prompt has no ACP driver, so the wire holds its reply). */
+async function readKimiTurnTextFromWire(
+  engineHomePath: string | undefined,
+  sessionId: string,
+  turnId: string,
+  options: { taskId?: string; mainAgentOnly?: boolean } = {},
+): Promise<string | undefined> {
   if (
     !engineHomePath
     || !isSafeKimiPathSegment(sessionId)
-    || !isSafeKimiPathSegment(taskId)
     || !isSafeKimiPathSegment(turnId)
   ) {
     return undefined;
   }
+  const taskId = options.taskId;
 
   let latest: { text: string; time: number } | undefined;
   const wirePaths = await listKimiSessionWirePaths(engineHomePath, sessionId);
@@ -1011,7 +1059,7 @@ async function readKimiTaskReviewTextFromWire(
         continue;
       }
       const record = parseKimiWireRecord(line);
-      if (!record) {
+      if (!record || options.mainAgentOnly && typeof record.agentId === "string" && record.agentId !== "main") {
         continue;
       }
       if (record.type === "turn.prompt") {
@@ -1084,6 +1132,36 @@ async function readKimiTaskReviewTextFromWire(
     }
   }
   return latest?.text;
+}
+
+/** Kimi records every turn's end in its wire, including prompt_only turns and
+ * turns that end while more input is queued, neither of which runs a Stop hook. */
+async function readKimiTurnEndFromWire(
+  engineHomePath: string | undefined,
+  sessionId: string,
+  turnId: string,
+): Promise<{ reason?: string } | undefined> {
+  if (!engineHomePath || !isSafeKimiPathSegment(sessionId) || !isSafeKimiPathSegment(turnId)) {
+    return undefined;
+  }
+  for (const wirePath of await listKimiSessionWirePaths(engineHomePath, sessionId)) {
+    const lines = await readKimiWireTailLines(wirePath);
+    for (let index = lines.length - 1; index >= 0; index--) {
+      const line = lines[index]?.trim();
+      if (!line || !line.includes("turn.ended")) {
+        continue;
+      }
+      const record = parseKimiWireRecord(line);
+      if (
+        record?.type === "turn.ended"
+        && String(record.turnId ?? "") === turnId
+        && (typeof record.agentId !== "string" || record.agentId === "main")
+      ) {
+        return typeof record.reason === "string" ? { reason: record.reason } : {};
+      }
+    }
+  }
+  return undefined;
 }
 
 async function resolveKimiBackgroundTaskOutputPath(
@@ -1855,6 +1933,8 @@ export class KimiAcpAdapter implements CodexAdapter {
   private readonly backgroundTaskMaxAgeMs: number;
   private readonly backgroundContinuationGraceMs: number;
   private readonly hookTerminalGraceMs: number;
+  private readonly taskTurnHoldSafetyMs: number;
+  private readonly queuedPromptReceiptGraceMs: number;
   private readonly killProcessTreeFn: (pid: number | undefined) => void;
   private readonly mcpServers: McpServer[];
   private readonly syncWorkspaceInstructionsFn: SyncWorkspaceInstructions;
@@ -1901,6 +1981,8 @@ export class KimiAcpAdapter implements CodexAdapter {
       backgroundTaskMaxAgeMs?: number;
       backgroundContinuationGraceMs?: number;
       hookTerminalGraceMs?: number;
+      taskTurnHoldSafetyMs?: number;
+      queuedPromptReceiptGraceMs?: number;
       killProcessTreeFn?: (pid: number | undefined) => void;
       mcpServers?: McpServer[];
       syncWorkspaceInstructionsFn?: SyncWorkspaceInstructions;
@@ -1939,6 +2021,8 @@ export class KimiAcpAdapter implements CodexAdapter {
     this.backgroundContinuationGraceMs = options?.backgroundContinuationGraceMs
       ?? DEFAULT_BACKGROUND_CONTINUATION_GRACE_MS;
     this.hookTerminalGraceMs = options?.hookTerminalGraceMs ?? DEFAULT_HOOK_TERMINAL_GRACE_MS;
+    this.taskTurnHoldSafetyMs = options?.taskTurnHoldSafetyMs ?? DEFAULT_TASK_TURN_HOLD_SAFETY_MS;
+    this.queuedPromptReceiptGraceMs = options?.queuedPromptReceiptGraceMs ?? DEFAULT_QUEUED_PROMPT_RECEIPT_GRACE_MS;
     this.killProcessTreeFn = options?.killProcessTreeFn ?? killProcessTree;
     this.mcpServers = options?.mcpServers ?? resolveDefaultKimiMcpServers(this.childEnv);
     this.syncWorkspaceInstructionsFn = options?.syncWorkspaceInstructionsFn ?? syncKimiWorkspaceInstructions;
@@ -3385,11 +3469,8 @@ export class KimiAcpAdapter implements CodexAdapter {
     // Kimi can start a synthetic task-origin review independently of ACP
     // prompt calls. Sending a foreground prompt while that continuation exists
     // makes both turns share one update stream, so one answer can consume the
-    // other's text. Re-check after every wake-up because another review can
-    // start in the same relay batch that completed the previous one.
-    while (this.backgroundContinuationTurnBusy(worker)) {
-      await this.waitForBackgroundContinuation(worker, input.abortSignal);
-    }
+    // other's text.
+    await this.waitForKimiOwnedTurns(worker, input);
     let rejectFailure!: (error: Error) => void;
     const failurePromise = new Promise<never>((_resolve, reject) => {
       rejectFailure = reject;
@@ -3404,6 +3485,9 @@ export class KimiAcpAdapter implements CodexAdapter {
     void interruptionPromise.catch(() => undefined);
     const pending: PendingKimiTurn = {
       turnId: this.nextTurnId++,
+      promptText: prompt,
+      engineActivity: false,
+      promptReturned: false,
       assistantText: "",
       assistantBoundaryPending: false,
       onProgress: input.onProgress,
@@ -3433,6 +3517,8 @@ export class KimiAcpAdapter implements CodexAdapter {
     }
     const autonomousTurnActive = Boolean(this.backgroundContinuationForUpdate(worker));
     worker.pendingTurn = pending;
+    // An ignored turn whose end is already known must not drop this turn's updates.
+    if (worker.ignoredHookTurn?.endedAt !== undefined) worker.ignoredHookTurn = undefined;
     worker.onEngineEvent = input.onEngineEvent;
     if (!autonomousTurnActive) {
       worker.tools.clear();
@@ -3467,6 +3553,7 @@ export class KimiAcpAdapter implements CodexAdapter {
         }),
         pending.failurePromise,
       ]);
+      pending.promptReturned = true;
       if (result.stopReason === "cancelled") {
         throw pending.stopError ?? new Error("Kimi ACP turn was cancelled");
       }
@@ -3487,7 +3574,14 @@ export class KimiAcpAdapter implements CodexAdapter {
         pending.failurePromise,
         pending.interruptionPromise,
       ]);
-      const text = pending.assistantText.trim() || "Kimi completed the request.";
+      let text = pending.assistantText.trim();
+      if (!text && !pending.engineActivity && pending.kimiTurnId === undefined) {
+        // No update and no started turn: Kimi either queued this prompt behind
+        // its own turn (Kimi 2.7 answers that ACP request at once) or did not
+        // process it. Never report an unprocessed prompt as completed.
+        text = await this.resolveQueuedKimiPrompt(worker, pending, sessionId);
+      }
+      text ||= "Kimi completed the request.";
       await Promise.race([
         this.emitEngineEvent(pending.onEngineEvent, { type: "result", text, sessionId }),
         pending.failurePromise,
@@ -3500,6 +3594,106 @@ export class KimiAcpAdapter implements CodexAdapter {
     } finally {
       this.finishPendingTurn(worker, pending);
     }
+  }
+
+  /** Wait for a hook-driven change of this turn; false only when timed out. */
+  private async waitForKimiTurnChange(
+    pending: PendingKimiTurn,
+    ready: () => boolean,
+    timeoutMs?: number,
+  ): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = timeoutMs === undefined
+      ? undefined
+      : new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), Math.max(0, timeoutMs));
+        });
+    try {
+      while (!ready()) {
+        const changed = new Promise<"changed">((resolve) => {
+          pending.notifyKimiTurn = () => resolve("changed");
+        });
+        const outcome = await Promise.race([
+          changed,
+          ...(deadline ? [deadline] : []),
+          pending.failurePromise,
+          pending.interruptionPromise,
+        ]);
+        if (outcome === "timeout") {
+          return ready();
+        }
+      }
+      return true;
+    } finally {
+      if (timer) clearTimeout(timer);
+      pending.notifyKimiTurn = undefined;
+    }
+  }
+
+  private endQueuedKimiTurn(pending: PendingKimiTurn, terminal: KimiHookTerminal): void {
+    if (pending.kimiTurnTerminal) {
+      return;
+    }
+    pending.kimiTurnTerminal = terminal;
+    pending.notifyKimiTurn?.();
+  }
+
+  /** Follow a prompt Kimi queued behind its own turn to the reply of the
+   * user-origin turn that later runs it. */
+  private async resolveQueuedKimiPrompt(worker: KimiWorker, pending: PendingKimiTurn, sessionId: string): Promise<string> {
+    const receipt = worker.hookRelayActive && this.hookRelayRuntime
+      ? await this.waitForKimiTurnChange(
+          pending,
+          () => pending.queuedPromptId !== undefined || pending.kimiTurnId !== undefined,
+          this.queuedPromptReceiptGraceMs,
+        )
+      : false;
+    if (!receipt) {
+      throw new Error(KIMI_PROMPT_NOT_PROCESSED_MESSAGE);
+    }
+    pending.awaitingQueuedTurn = true;
+    const report = (status: "started" | "finished" | "cancelled") => Promise.race([
+      this.emitEngineEvent(pending.onEngineEvent, { type: "native_input_wait", status, sessionId, engine: "kimi" }),
+      pending.failurePromise,
+      pending.interruptionPromise,
+    ]);
+    if (pending.kimiTurnId === undefined) {
+      await report("started");
+      try {
+        await this.waitForKimiTurnChange(pending, () => pending.kimiTurnId !== undefined);
+      } catch (error) {
+        await report("cancelled").catch(() => undefined);
+        throw error;
+      }
+      await report("finished");
+    }
+    this.armKimiTurnWatch(worker);
+    await this.waitForKimiTurnChange(pending, () => pending.kimiTurnTerminal !== undefined);
+    await Promise.race([this.drainKimiSessionUpdates(worker), pending.failurePromise, pending.interruptionPromise]);
+    await Promise.race([pending.eventChain, pending.failurePromise, pending.interruptionPromise]);
+    const terminal = pending.kimiTurnTerminal!;
+    if (terminal.status === "failed") {
+      throw new Error(terminal.errorText?.trim() || "Kimi failed while answering the queued message.");
+    }
+    const streamed = pending.assistantText.trim();
+    if (streamed) {
+      return streamed;
+    }
+    // Kimi 2.7 forwards ACP updates only for the turn an ACP request drives,
+    // so the queued turn's reply is read from its session wire.
+    for (let attempt = 0; attempt < QUEUED_REPLY_WIRE_READ_ATTEMPTS; attempt++) {
+      const recovered = await readKimiTurnTextFromWire(this.engineHomePath, sessionId, pending.kimiTurnId!, { mainAgentOnly: true })
+        .catch(() => undefined);
+      if (recovered !== undefined) {
+        return recovered.trim();
+      }
+      await Promise.race([
+        new Promise((resolve) => setTimeout(resolve, QUEUED_REPLY_WIRE_READ_INTERVAL_MS)),
+        pending.failurePromise,
+        pending.interruptionPromise,
+      ]);
+    }
+    throw new Error("Kimi answered the queued message, but its reply could not be read from the Kimi session.");
   }
 
   private queueKimiSessionUpdate(worker: KimiWorker, notification: SessionNotification): Promise<void> {
@@ -3562,6 +3756,9 @@ export class KimiAcpAdapter implements CodexAdapter {
     }
     const update = notification.update;
     const sessionId = worker.currentSessionId ?? notification.sessionId;
+    if (pending && ["agent_message_chunk", "agent_thought_chunk", "plan", "tool_call", "tool_call_update"].includes(update.sessionUpdate)) {
+      pending.engineActivity = true;
+    }
 
     if (update.sessionUpdate === "agent_message_chunk") {
       if (update.content.type !== "text" || !update.content.text) {
@@ -3801,7 +3998,36 @@ export class KimiAcpAdapter implements CodexAdapter {
   }
 
   private backgroundContinuationTurnBusy(worker: KimiWorker): boolean {
-    return worker.backgroundContinuations.size > 0;
+    // An ignored duplicate review is still a turn Kimi runs: a prompt sent now
+    // would be queued behind it and answered at once with an empty end_turn.
+    return worker.backgroundContinuations.size > 0 || this.isIgnoredKimiHookTurnRunning(worker, Date.now());
+  }
+
+  /** Hold a foreground prompt until no Kimi-owned turn is running, and show
+   * the hold as the existing background-review admission wait. */
+  private async waitForKimiOwnedTurns(worker: KimiWorker, input: CodexUserMessageInput): Promise<void> {
+    await this.refreshIgnoredKimiHookTurnFromWire(worker);
+    if (!this.backgroundContinuationTurnBusy(worker)) {
+      return;
+    }
+    const report = (status: "started" | "finished" | "cancelled") => this.emitEngineEvent(input.onEngineEvent, {
+      type: "background_review_wait",
+      status,
+      sessionId: worker.currentSessionId ?? undefined,
+      engine: "kimi",
+    });
+    await report("started");
+    try {
+      // Re-check after every wake-up: another review can start in the same
+      // relay batch that completed the previous one.
+      while (this.backgroundContinuationTurnBusy(worker)) {
+        await this.waitForBackgroundContinuation(worker, input.abortSignal);
+      }
+    } catch (error) {
+      await report("cancelled");
+      throw error;
+    }
+    await report("finished");
   }
 
   private async waitForBackgroundContinuation(worker: KimiWorker, abortSignal?: AbortSignal): Promise<void> {
@@ -4240,8 +4466,17 @@ export class KimiAcpAdapter implements CodexAdapter {
     worker: KimiWorker,
     event: Extract<KimiHookEvent, { hookEventName: "TurnStarted" }>,
   ): Promise<void> {
+    const pending = worker.pendingTurn;
+    const queuedTurn = this.queuedKimiTurnOpen(worker);
+    if (queuedTurn && queuedTurn.kimiTurnId !== event.turnId) {
+      // While more input is queued Kimi runs no Stop hook; the next turn's
+      // start is the end of the queued prompt's turn.
+      this.endQueuedKimiTurn(queuedTurn, { status: "completed" });
+    }
     if (event.originKind !== "task") {
-      worker.ignoredHookTurn = undefined;
+      const ownPrompt = Boolean(pending && pending.kimiTurnId === undefined
+        && kimiPromptMatches(event.prompt, pending.promptText));
+      this.clearIgnoredKimiHookTurn(worker);
       if (worker.activeHookTurn?.originKind === "task") {
         const previous = worker.activeHookTurn.continuationTaskId
           ? worker.backgroundContinuations.get(worker.activeHookTurn.continuationTaskId)
@@ -4254,6 +4489,10 @@ export class KimiAcpAdapter implements CodexAdapter {
       worker.activeHookTurn = terminalAlreadyArrived
         ? undefined
         : { turnId: event.turnId, originKind: event.originKind };
+      if (pending && ownPrompt) {
+        pending.kimiTurnId = event.turnId;
+        pending.notifyKimiTurn?.();
+      }
       worker.tools.clear();
       return;
     }
@@ -4330,7 +4569,7 @@ export class KimiAcpAdapter implements CodexAdapter {
         suppressUserDelivery: lateTerminal.terminal.suppressUserDelivery,
       };
       worker.backgroundContinuations.set(lateTerminal.id, continuation);
-      worker.ignoredHookTurn = undefined;
+      this.clearIgnoredKimiHookTurn(worker);
       worker.activeHookTurn = {
         turnId: event.turnId,
         originKind: event.originKind,
@@ -4409,7 +4648,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       continuation.fallbackTimer = undefined;
     }
     worker.backgroundContinuations.set(taskId, continuation);
-    worker.ignoredHookTurn = undefined;
+    this.clearIgnoredKimiHookTurn(worker);
     worker.activeHookTurn = {
       turnId: event.turnId,
       originKind: event.originKind,
@@ -4445,17 +4684,26 @@ export class KimiAcpAdapter implements CodexAdapter {
 
   private markIgnoredKimiHookTurn(worker: KimiWorker, turnId: string, now: number, terminalObserved = false): void {
     this.pruneIgnoredKimiHookTerminals(worker, now);
-    worker.ignoredHookTurn = { turnId, startedAt: now };
     // An already handled terminal must not leave a second expectation that
     // would consume the next live turn's Stop, including an internal stage.
-    if (terminalObserved) return;
-    // Stop/StopFailure can arrive before TurnStarted. If one is already
+    // Stop/StopFailure can also arrive before TurnStarted. If one is already
     // buffered, it belongs to this ignored tombstoned turn and must not be
-    // inherited by the next live continuation.
-    if (this.takePendingKimiHookTerminal(worker)) {
+    // inherited by the next live continuation. Either way this turn is over.
+    if (terminalObserved || this.takePendingKimiHookTerminal(worker)) {
+      worker.ignoredHookTurn = { turnId, startedAt: now, endedAt: now };
+      this.resolveBackgroundContinuationWaiters(worker);
       return;
     }
+    worker.ignoredHookTurn = { turnId, startedAt: now };
     worker.ignoredHookTerminalStarts.push(now);
+    // A prompt_only turn ends at once without any Stop hook; only the wire
+    // records it, so check soon instead of after the full fallback grace.
+    this.armKimiTurnWatch(worker, this.hookTerminalGraceMs);
+  }
+
+  private clearIgnoredKimiHookTurn(worker: KimiWorker): void {
+    worker.ignoredHookTurn = undefined;
+    this.resolveBackgroundContinuationWaiters(worker);
   }
 
   private consumeIgnoredKimiHookTerminal(worker: KimiWorker): boolean {
@@ -4465,29 +4713,111 @@ export class KimiAcpAdapter implements CodexAdapter {
     }
     worker.ignoredHookTerminalStarts.shift();
     if (worker.ignoredHookTerminalStarts.length === 0) {
-      worker.ignoredHookTurn = undefined;
+      this.clearIgnoredKimiHookTurn(worker);
     }
     return true;
   }
 
+  /** The ignored turn still owns ACP updates: it runs, or ended moments ago. */
   private isIgnoredKimiHookTurnActive(worker: KimiWorker, now: number): boolean {
     const ignored = worker.ignoredHookTurn;
     if (!ignored) {
       return false;
     }
-    if (now - ignored.startedAt > PENDING_HOOK_TERMINAL_TTL_MS) {
-      worker.ignoredHookTurn = undefined;
+    // A running turn ends with its own terminal hook, the next TurnStarted or
+    // its wire record, not after a fixed few seconds; the bound covers lost hooks.
+    const expired = ignored.endedAt !== undefined
+      ? now - ignored.endedAt > PENDING_HOOK_TERMINAL_TTL_MS
+      : now - ignored.startedAt > this.taskTurnHoldSafetyMs;
+    if (expired) {
+      this.clearIgnoredKimiHookTurn(worker);
       return false;
     }
     return true;
   }
 
+  private isIgnoredKimiHookTurnRunning(worker: KimiWorker, now: number): boolean {
+    return this.isIgnoredKimiHookTurnActive(worker, now) && worker.ignoredHookTurn?.endedAt === undefined;
+  }
+
+  private async refreshIgnoredKimiHookTurnFromWire(worker: KimiWorker): Promise<void> {
+    const ignored = worker.ignoredHookTurn;
+    const sessionId = worker.currentSessionId;
+    if (!ignored || !sessionId || !this.isIgnoredKimiHookTurnRunning(worker, Date.now())) {
+      return;
+    }
+    const ended = await readKimiTurnEndFromWire(this.engineHomePath, sessionId, ignored.turnId).catch(() => undefined);
+    if (ended && worker.ignoredHookTurn === ignored) {
+      this.clearIgnoredKimiHookTurn(worker);
+    }
+  }
+
+  /** A queued prompt's started turn that has not been seen to end yet. */
+  private queuedKimiTurnOpen(worker: KimiWorker): PendingKimiTurn | undefined {
+    const pending = worker.pendingTurn;
+    return pending?.awaitingQueuedTurn && pending.kimiTurnId !== undefined && !pending.kimiTurnTerminal
+      ? pending
+      : undefined;
+  }
+
+  /** Poll the wire for Kimi-owned turns that can end without any hook. */
+  private armKimiTurnWatch(worker: KimiWorker, delayMs = this.backgroundContinuationGraceMs): void {
+    if (worker.kimiTurnWatchTimer || worker.removed || this.backgroundContinuationGraceMs <= 0) {
+      return;
+    }
+    worker.kimiTurnWatchTimer = setTimeout(() => {
+      worker.kimiTurnWatchTimer = undefined;
+      void this.checkKimiTurnWatch(worker).catch((error: unknown) => {
+        console.error(`Kimi turn watch failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, Math.max(0, delayMs));
+    worker.kimiTurnWatchTimer.unref?.();
+  }
+
+  private async checkKimiTurnWatch(worker: KimiWorker): Promise<void> {
+    if (worker.removed) {
+      return;
+    }
+    await this.refreshIgnoredKimiHookTurnFromWire(worker);
+    const pending = this.queuedKimiTurnOpen(worker);
+    const sessionId = worker.currentSessionId;
+    if (pending && sessionId) {
+      const ended = await readKimiTurnEndFromWire(this.engineHomePath, sessionId, pending.kimiTurnId!).catch(() => undefined);
+      if (ended && this.queuedKimiTurnOpen(worker) === pending) {
+        this.endQueuedKimiTurn(pending, ended.reason === undefined || ended.reason === "completed"
+          ? { status: "completed" }
+          : { status: "failed", errorText: `Kimi ended the queued message's turn: ${ended.reason}.` });
+      }
+    }
+    if (this.isIgnoredKimiHookTurnRunning(worker, Date.now()) || this.queuedKimiTurnOpen(worker)) {
+      this.armKimiTurnWatch(worker);
+    }
+  }
+
   private async handleKimiHookTerminal(worker: KimiWorker, terminal: KimiHookTerminal): Promise<void> {
+    const pending = worker.pendingTurn;
+    if (
+      pending?.promptReturned
+      && pending.kimiTurnId !== undefined
+      && !pending.kimiTurnTerminal
+      && worker.activeHookTurn?.turnId === pending.kimiTurnId
+    ) {
+      // The prompt's own turn ended after its ACP request had already returned.
+      worker.activeHookTurn = undefined;
+      this.endQueuedKimiTurn(pending, terminal);
+      return;
+    }
     if (this.consumeIgnoredKimiHookTerminal(worker)) {
       return;
     }
     const active = worker.activeHookTurn;
     if (!active) {
+      if (this.isIgnoredKimiHookTurnRunning(worker, Date.now())) {
+        // No other turn can own this terminal: it ends the running ignored turn.
+        worker.ignoredHookTerminalStarts.length = 0;
+        this.clearIgnoredKimiHookTurn(worker);
+        return;
+      }
       worker.pendingHookTerminal = { terminal, receivedAt: Date.now() };
       return;
     }
@@ -4759,6 +5089,16 @@ export class KimiAcpAdapter implements CodexAdapter {
     }
     if (event.hookEventName === "Stop") {
       await this.handleKimiHookTerminal(worker, { status: "completed" });
+      return;
+    }
+    if (event.hookEventName === "UserPromptQueued") {
+      // Kimi 2.7 queues a prompt that arrives during its own turn and answers
+      // the ACP request at once; this receipt keeps the foreground turn open.
+      const pending = worker.pendingTurn;
+      if (pending && pending.queuedPromptId === undefined && kimiPromptMatches(event.prompt, pending.promptText)) {
+        pending.queuedPromptId = event.promptId ?? "queued";
+        pending.notifyKimiTurn?.();
+      }
       return;
     }
     if (event.hookEventName === "StopFailure") {
@@ -5580,6 +5920,12 @@ export class KimiAcpAdapter implements CodexAdapter {
           return;
         }
       }
+      // Kimi forwards no ACP update for a queued prompt's turn; the total
+      // turn timeout still bounds it.
+      if (pending.awaitingQueuedTurn) {
+        this.armInactivityTimeout(worker, pending);
+        return;
+      }
       const minutes = Math.max(1, Math.round(this.inactivityTimeoutMs! / 60_000));
       this.requestStop(
         worker,
@@ -5600,6 +5946,11 @@ export class KimiAcpAdapter implements CodexAdapter {
     pending.stopError = error;
     pending.rejectInterruption(error);
     pending.approvalAbortController.abort(error);
+    if (pending.promptReturned) {
+      // The ACP request has settled. Kimi owns any queued turn now; ACP cancel
+      // would reach only whatever turn Kimi is running, never this prompt.
+      return;
+    }
     const sessionId = worker.currentSessionId;
     if (!sessionId) {
       this.hardStopWorker(worker, pending, error);
@@ -5799,6 +6150,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       }
     }
     this.pruneIgnoredKimiHookTerminals(worker, now);
+    this.isIgnoredKimiHookTurnActive(worker, now);
   }
 
   private async failBackgroundTasks(worker: KimiWorker): Promise<void> {
@@ -5912,6 +6264,10 @@ export class KimiAcpAdapter implements CodexAdapter {
     worker.activeHookTurn = undefined;
     worker.pendingHookTerminal = undefined;
     worker.ignoredHookTerminalStarts.length = 0;
+    if (worker.kimiTurnWatchTimer) {
+      clearTimeout(worker.kimiTurnWatchTimer);
+      worker.kimiTurnWatchTimer = undefined;
+    }
     for (const [key, candidate] of this.workers.entries()) {
       if (candidate === worker) {
         this.workers.delete(key);

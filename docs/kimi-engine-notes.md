@@ -465,6 +465,31 @@ thinking, or instruction changes are deferred, while workspace and approval-mode
 changes fail closed until completion or explicit `/reset`. `SessionHeartbeat`
 still does not extend either bound.
 
+### Kimi 2.7 queued prompts and Kimi-owned turns
+
+Kimi 2.7.2 runs one turn at a time per session. A `session/prompt` that arrives
+while Kimi runs its own turn (for example a task-origin review) is queued: the
+ACP request returns `end_turn` at once with no update, `UserPromptQueued`
+carries the prompt text and id, and the prompt later runs as a user-origin turn
+that has no ACP driver, so Kimi forwards none of its updates over ACP; only the
+session wire records its reply. A prompt-only turn (a notification already
+steered into an earlier turn) and a turn that ends while more input is queued
+run no `Stop` hook. The wire records every turn's end.
+
+TaroCub therefore holds a foreground prompt while a Kimi-owned task-origin turn
+runs, including a duplicate review it ignores, until that turn's own `Stop`,
+`StopFailure` or `Interrupt`, the next `TurnStarted`, or its wire end record;
+a one-hour bound covers lost hooks. The
+App shows this as the background-review wait. If Kimi still queues a prompt,
+the matching `UserPromptQueued` keeps the foreground turn open and shown as
+waiting for Kimi to read it; the reply of the later user-origin turn with the
+same prompt text is returned from streamed updates or the wire. An immediate
+empty `end_turn` with neither an update nor a queue receipt ends as a readable
+"Kimi did not process this message" error, never as completed. ACP offers no
+way to withdraw a queued prompt: the App's stop control for it says that
+stopping only ends the wait here, while Kimi still runs the message and its
+reply does not appear in the App.
+
 ## Kimi 0.33 Agent-Core-v2 Re-probe
 
 - Probe date: 2026-08-06

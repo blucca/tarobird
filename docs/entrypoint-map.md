@@ -3862,7 +3862,8 @@ session, Gateway, Bus and scoped App-tool suites listed in the audit.
 - `src/codex/kimi-hook-relay.ts`
   Kimi 0.32+ observer-hook plugin registration and authenticated loopback relay. It accepts
   task lifecycle plus `TurnStarted`/`Stop`/`StopFailure`/`Interrupt` events so Kimi 0.33
-  task-origin review turns can be retained; `SessionHeartbeat` is deliberately ignored.
+  task-origin review turns can be retained, and `UserPromptQueued` so a prompt Kimi 2.7
+  queues behind its own turn keeps its reply; `SessionHeartbeat` is deliberately ignored.
 - `src/codex/kimi-workspace.ts`
   Atomic managed-block synchronization for Kimi workspace instructions.
 - `src/codex/deepseek-parent-guard.ts`
