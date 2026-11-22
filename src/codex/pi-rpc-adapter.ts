@@ -191,6 +191,18 @@ interface SettingsScope {
   record(patch: Partial<PiSessionRecord>): Promise<void>;
 }
 
+/** `work`, or an AbortError as soon as `signal` aborts. The work itself goes on. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return work;
+  work.catch(() => {});
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const quit = () => reject(abortError());
+    signal.addEventListener("abort", quit, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener("abort", quit));
+  });
+}
+
 function abortError(): Error {
   const error = new Error("Pi turn was aborted");
   error.name = "AbortError";
@@ -261,6 +273,8 @@ export class PiRpcAdapter implements CodexAdapter {
   private readonly sweepReasons = new WeakMap<Worker, string>();
   private readonly bridgeExtensionPath: string | null;
   private destroyed = false;
+  /** Aborted by `destroy`: a start still waiting on Pi stops waiting, so destroy does not wait out its deadlines. */
+  private readonly retiring = new AbortController();
 
   constructor(private readonly options: PiRpcAdapterOptions) {
     this.store = new PiSessionStore({ stateDir: options.stateDir, childEnv: options.childEnv });
@@ -671,7 +685,8 @@ export class PiRpcAdapter implements CodexAdapter {
     this.assertUsable();
     if (input.abortSignal?.aborted) throw abortError();
     const cwd = await this.resolveWorkspace(input.workspaceOverride);
-    const first = await this.ensureWorker(sessionId, cwd, input.abortSignal);
+    // A stop ends this wait at once. A start already past Pi's handshake goes on and is kept for the next message.
+    const first = await untilAborted(this.ensureWorker(sessionId, cwd, input.abortSignal), input.abortSignal);
     // Readying the workspace and the process can outlast the request. A stop that came meanwhile would
     // never reach a listener attached from here on, so no turn begins. Nothing has been sent to Pi, and
     // the process is left as it is: another caller may have started it.
@@ -742,6 +757,7 @@ export class PiRpcAdapter implements CodexAdapter {
   async destroy(): Promise<void> {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.retiring.abort();
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     // A start in flight sees `destroyed` and closes what it created; wait so no process outlives the adapter.
     await Promise.allSettled([...this.starting.values()]);
@@ -1905,12 +1921,13 @@ export class PiRpcAdapter implements CodexAdapter {
     let client: PiRpcClient | undefined;
     let bridge: PiBridgeConnection | undefined;
     const discard = async () => { client?.terminate(); bridge?.close(); await endpoint?.dispose(); };
+    const retired = () => new Error("Pi adapter has been destroyed");
     try {
       signal?.throwIfAborted();
       if (this.destroyed) throw new Error("Pi adapter has been destroyed");
       client = await PiRpcClient.start({
         launch: this.options.launch, cwd, args, env: { ...this.options.childEnv, ...(endpoint?.env ?? {}) },
-        ...(signal ? { signal } : {}),
+        signal: signal ? AbortSignal.any([signal, this.retiring.signal]) : this.retiring.signal,
         // Nobody can answer a dialog an extension opens while Pi is still starting; notices are kept for the first turn.
         onExtensionUi: (request, peer) => {
           if (worker) return;
@@ -1930,14 +1947,15 @@ export class PiRpcAdapter implements CodexAdapter {
       });
     } catch (error) {
       await discard();
+      if (this.destroyed) throw retired();
       if (signal?.aborted) throw abortError();
       throw error instanceof PiStartupError ? new PiStartupError(this.startupMessage(error), error.reason, error.exit) : error;
     }
     if (endpoint) {
-      try { bridge = await endpoint.connection; } catch { bridge = undefined; await endpoint.dispose(); }
+      try { bridge = await untilAborted(endpoint.connection, this.retiring.signal); } catch { bridge = undefined; await endpoint.dispose(); }
     }
     try {
-      const state = await client.request({ type: "get_state" });
+      const state = await untilAborted(client.request({ type: "get_state" }), this.retiring.signal);
       if (state.sessionId !== sessionId) throw new Error("Pi opened a different session than requested");
       // The adapter may have been retired, or the caller may have given up, while Pi was starting.
       if (this.destroyed) throw new Error("Pi adapter has been destroyed");
@@ -1948,7 +1966,7 @@ export class PiRpcAdapter implements CodexAdapter {
       };
     } catch (error) {
       await discard();
-      throw error;
+      throw this.destroyed ? retired() : error;
     }
     const current = worker;
     for (const event of startup.events.splice(0)) if (event.type === "session_start" && typeof event.trusted === "boolean") current.trusted = event.trusted;
@@ -1965,7 +1983,7 @@ export class PiRpcAdapter implements CodexAdapter {
     void bridge?.closed.then(() => { if (!current.closed) { current.bridge = undefined; current.managedSearchPrefix = undefined; this.publishState(current); } });
     if (bridge?.isOpen && managedSearch) {
       try {
-        const registered = await bridge.setMcpServers([{ name: managedSearch.name, config: managedSearch.config }]);
+        const registered = await untilAborted(bridge.setMcpServers([{ name: managedSearch.name, config: managedSearch.config }]), this.retiring.signal);
         if (registered.includes(managedSearch.name)) current.managedSearchPrefix = managedSearch.toolPrefix;
       } catch { /* search is an extra; the session works without it */ }
     }
