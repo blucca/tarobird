@@ -102,6 +102,8 @@ interface Turn {
   readonly stopped: Deferred<void>;
   /** The prompt command in flight, if any. Pi answers it only after extension and input preflight. */
   promptOutcome?: Promise<PiPromptDisposition | "failed">;
+  /** Pi answered that prompt, taken in stream order: an agent_settled before it ended a run this turn did not start. */
+  promptAnswered?: boolean;
   instructions?: string;
   appTools?: AppPlatformTools;
   notices: string[];
@@ -1122,7 +1124,8 @@ export class PiRpcAdapter implements CodexAdapter {
     else if (event.type === "agent_start" || event.type === "turn_start" || (event.type === "message_start" && event.message.role === "assistant")) turn.wrappingUp = false;
     for (const mapped of turn.mapper.apply(event)) void this.emit(turn, mapped);
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") turn.input.onProgress?.(turn.mapper.currentText);
-    if (event.type === "agent_settled") turn.done.resolve();
+    // Pi defers a prompt sent while it settles another run (an extension's own), so that settle can come first.
+    if (event.type === "agent_settled" && turn.promptAnswered) turn.done.resolve();
   }
 
   /**
@@ -1950,7 +1953,10 @@ export class PiRpcAdapter implements CodexAdapter {
     client.onExtensionUi(request => this.handleExtensionUi(current, request));
     // Pi's own state, applied where it sits in the stream: a reply read while a run was going must not
     // overwrite the agent_settled that followed it in the same chunk (the awaited reply resumes after it).
-    client.onResponse((command, data) => { if (command === "get_state" && !current.closed) current.state = data as PiSessionState; });
+    client.onResponse((command, data) => {
+      if (command === "get_state" && !current.closed) current.state = data as PiSessionState;
+      if (command === "prompt" && current.turn?.promptOutcome) current.turn.promptAnswered = true;
+    });
     for (const request of uiAtStartup.splice(0)) this.handleExtensionUi(current, request);
     void client.exited.then(() => this.handleExit(current));
     void bridge?.closed.then(() => { if (!current.closed) { current.bridge = undefined; current.managedSearchPrefix = undefined; this.publishState(current); } });
