@@ -1033,3 +1033,76 @@ describe("AntigravityAcpAdapter tasks and native commands", () => {
     await settleWithin(reply);
   });
 });
+
+describe("AntigravityAcpAdapter launch flags under concurrent starts", () => {
+  async function adapterWithConfig(harness: ReturnType<typeof createHarness>, approvalMode: string) {
+    const configPath = await configFile({ approvalMode });
+    const adapter = track(await adapterFor(harness, { approvalMode }, { configPath }));
+    const setMode = (mode: string) => writeFile(configPath, JSON.stringify({ engine: "antigravity", approvalMode: mode }));
+    return { adapter, setMode };
+  }
+  const deny = async () => ({ behavior: "deny" as const });
+
+  it("never runs a normal-approval message on a process another message started with --dangerously-skip-permissions", async () => {
+    const harness = createHarness((server, index) => {
+      if (index === 0) server.answerClose = false;
+      if (index === 1) server.answerInitialize = false;
+    });
+    const { adapter, setMode } = await adapterWithConfig(harness, "full-auto");
+    const first = adapter.sendUserMessage("tarobot-1", { text: "a", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    harness.children[0]!.server.text("a");
+    harness.children[0]!.server.respondPrompt();
+    await settleWithin(first);
+
+    // The owner switches to normal: this message closes the full-auto session (session/close is slow).
+    await setMode("normal");
+    const normal = adapter.sendUserMessage(SESSION_A, { text: "normal", files: [], onApprovalRequest: deny });
+    normal.catch(() => undefined);
+    await waitFor(() => harness.log.includes(`close:${SESSION_A}`));
+    // Then to bypass before that close finished: another message starts a bypass process.
+    await setMode("bypass");
+    // A stop signal (never used) adds a step to that message's wait, so the normal one reaches the worker first.
+    const bypass = adapter.sendUserMessage(SESSION_A, { text: "bypass", files: [], abortSignal: new AbortController().signal });
+    bypass.catch(() => undefined);
+    await waitFor(() => harness.spawnCalls.length === 2);
+    expect(harness.spawnCalls[1]!.args).toContain("--dangerously-skip-permissions");
+    // The bypass process is still starting when the slow close ends.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const starting = harness.children[1]!.server;
+    starting.answerInitialize = true;
+    const init = starting.requests("initialize")[0]!;
+    (starting as unknown as { respond(request: unknown, result: unknown): void }).respond(init, {
+      protocolVersion: 1, agentInfo: { name: "Fake", version: "test" },
+      agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {} } }, authMethods: [],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await expect(settleWithin(normal)).rejects.toThrow(/changed while agy acp was starting/);
+
+    for (const [index, child] of harness.children.entries()) {
+      const flags = harness.spawnCalls[index]!.args;
+      for (const prompt of child.server.prompts) {
+        if (JSON.stringify(prompt.params).includes("<user_message>\\nnormal\\n")) expect(flags).not.toContain("--dangerously-skip-permissions");
+      }
+    }
+  });
+
+  it("does not hand a still-starting bypass process to a message sent after the switch to normal", async () => {
+    const harness = createHarness((server, index) => { if (index === 0) server.answerInitialize = false; });
+    const { adapter, setMode } = await adapterWithConfig(harness, "bypass");
+    const bypass = adapter.sendUserMessage(SESSION_A, { text: "bypass", files: [] });
+    bypass.catch(() => undefined);
+    await waitFor(() => harness.children[0]?.server.requests("initialize").length === 1);
+    await setMode("normal");
+    const normal = adapter.sendUserMessage(SESSION_A, { text: "normal", files: [], onApprovalRequest: deny });
+    normal.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    // The starting bypass process is closed instead of shared.
+    expect(harness.log).toContain("kill:900");
+    for (const [index, child] of harness.children.entries()) {
+      for (const prompt of child.server.prompts) {
+        if (JSON.stringify(prompt.params).includes("<user_message>\\nnormal\\n")) expect(harness.spawnCalls[index]!.args).not.toContain("--dangerously-skip-permissions");
+      }
+    }
+  });
+});

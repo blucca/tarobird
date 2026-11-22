@@ -657,7 +657,12 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       await this.closeWorker(existing);
     }
     const pending = this.pendingWorkers.get(sessionId);
-    if (pending) return await pending;
+    if (pending) {
+      // Another message started this process, maybe with other approval flags or another workspace.
+      const started = await pending;
+      if (started.launchKey === launchKey) return started;
+      throw new Error("Antigravity approval or workspace settings changed while agy acp was starting; send the message again");
+    }
     const creation = this.createWorker(sessionId, workspace, launchKey, approvalMode);
     this.pendingWorkers.set(sessionId, creation);
     try {
