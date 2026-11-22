@@ -32,7 +32,7 @@ import type {
   EngineContextUsage,
   EngineStreamEvent,
 } from "./adapter.js";
-import { EngineIncompleteResponseError } from "./adapter.js";
+import { EngineIncompleteResponseError, EngineSteeringRejectedError } from "./adapter.js";
 import { killProcessTree } from "./process-tree.js";
 import { renderPrivateTurnInstructions } from "./turn-instructions.js";
 
@@ -112,7 +112,14 @@ type ToolState = {
 };
 
 type PromptOutcome = { result?: PromptResponse; error?: unknown };
-type PromptEntry = { seq: number; settled: boolean; outcome?: PromptOutcome };
+type Admission = { admitted: true } | { admitted: false; error?: unknown };
+type PromptEntry = {
+  seq: number;
+  settled: boolean;
+  outcome?: PromptOutcome;
+  /** A steer waits for agy to take it: the prompt it replaces returns first. */
+  admission?: (result: Admission | undefined) => void;
+};
 
 type Turn = {
   worker: Worker;
@@ -176,6 +183,7 @@ const DEFAULT_IDLE_SWEEP_INTERVAL_MS = 60_000;
 export const ANTIGRAVITY_ACP_TURN_TIMEOUT_MS = 6 * 60 * 60_000;
 export const ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS = 30 * 60_000;
 const STOPPED_BY_USER = "Task was stopped by user";
+const STEER_ADMISSION_TIMEOUT_MS = 10_000;
 const ANTIGRAVITY_EFFORTS: ReadonlySet<string> = new Set(ANTIGRAVITY_EFFORT_LEVELS);
 const PRESET_SUFFIX = /-(low|medium|high|xhigh|max|ultra)$/;
 const IMAGE_MIME: Record<string, string> = {
@@ -378,6 +386,8 @@ function rpcErrorMessage(error: unknown): string {
 export class AntigravityAcpAdapter implements CodexAdapter {
   readonly bridgeInstructionMode = "output-directory" as const;
   readonly supportsTurnScopedEnv = false;
+  /** A message sent during a reply can join it as another session/prompt. */
+  readonly inFlightSendBehavior = "steer" as const;
 
   private readonly childEnv: NodeJS.ProcessEnv;
   private readonly spawnFn: SpawnAgyAcp;
@@ -423,6 +433,42 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   async getContextUsage(sessionId: string): Promise<EngineContextUsage | null> {
     const usage = this.liveWorker(sessionId)?.contextUsage;
     return usage ? { pressureTokens: usage.used, contextWindow: usage.size } : null;
+  }
+
+  supportsSessionSteering(sessionId: string): boolean {
+    const worker = this.liveWorker(sessionId);
+    return Boolean(worker && !worker.closing && !worker.exited);
+  }
+
+  /**
+   * agy accepts a session/prompt while one is running: the running prompt
+   * returns end_turn at once and the new one carries the rest of the run. It
+   * is read at the next model boundary; a running tool is not interrupted.
+   * A prompt sent while an approval is unanswered is refused (-32603), so
+   * that case is refused here, never queued as a later turn.
+   */
+  async steerActiveTurn(sessionId: string, input: { text: string; throwOnError?: boolean }): Promise<boolean> {
+    const refuse = (reason: EngineSteeringRejectedError["reason"]) => {
+      if (input.throwOnError) throw new EngineSteeringRejectedError(reason);
+      return false;
+    };
+    const worker = this.liveWorker(sessionId);
+    const turn = worker?.turn;
+    if (!worker || worker.closing || !turn || turn.done || turn.stopRequested) return refuse("stale");
+    const text = input.text.trim();
+    if (!text || !turn.prompts.some((entry) => !entry.settled)) return refuse("not_ready");
+    if (worker.pendingPermissions > 0) return refuse("not_ready");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const admission = await new Promise<Admission | undefined>((resolve) => {
+      const entry = this.sendPrompt(turn, [{ type: "text", text }], (result) => { if (timer) clearTimeout(timer); entry.admission = undefined; resolve(result); });
+      timer = setTimeout(() => { entry.admission = undefined; resolve(undefined); }, STEER_ADMISSION_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    if (admission?.admitted) return true;
+    if (admission && !admission.admitted && admission.error !== undefined && (admission.error as { code?: unknown }).code === -32603) return refuse("not_ready");
+    // No answer, or an unexpected one: whether agy took the input is unknown.
+    if (input.throwOnError) throw new Error("Antigravity did not confirm the steering input");
+    return false;
   }
 
   private liveWorker(sessionId: string): Worker | undefined {
@@ -650,9 +696,9 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   /** One session/prompt of a turn. The newest outstanding prompt owns the turn's result. */
-  protected sendPrompt(turn: Turn, prompt: ContentBlock[]): PromptEntry {
+  protected sendPrompt(turn: Turn, prompt: ContentBlock[], admission?: PromptEntry["admission"]): PromptEntry {
     const worker = turn.worker;
-    const entry: PromptEntry = { seq: ++worker.promptSeq, settled: false };
+    const entry: PromptEntry = { seq: ++worker.promptSeq, settled: false, ...(admission ? { admission } : {}) };
     turn.prompts.push(entry);
     this.markActivity(worker);
     worker.connection.agent.request(acpMethods.agent.session.prompt, { sessionId: worker.sessionId!, prompt }).then(
@@ -666,6 +712,17 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     entry.settled = true;
     entry.outcome = outcome;
     if (outcome.result) turn.usage = addUsage(turn.usage, usageFromPrompt(outcome.result));
+    if (entry.admission) {
+      if (outcome.error !== undefined) {
+        // A refused steer never joined the run; the prompt before it still owns the turn.
+        turn.prompts = turn.prompts.filter((candidate) => candidate !== entry);
+        entry.admission({ admitted: false, error: outcome.error });
+      } else entry.admission({ admitted: true });
+    }
+    if (outcome.result) {
+      // agy returned this prompt because the next one took over the run.
+      turn.prompts.find((candidate) => candidate.seq > entry.seq && !candidate.settled)?.admission?.({ admitted: true });
+    }
     this.finishIfSettled(turn);
   }
 
@@ -707,6 +764,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     this.clearTimers(turn);
     turn.abortCleanup?.();
     turn.approvals.abort();
+    for (const entry of turn.prompts) entry.admission?.(undefined);
     worker.lastActivityAt = Date.now();
     const text = turn.text.trim();
     if (!error) this.emit(turn, { type: "result", text, sessionId: worker.sessionId! });

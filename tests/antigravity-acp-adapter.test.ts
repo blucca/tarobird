@@ -574,3 +574,112 @@ describe("AntigravityAcpAdapter cleanup", () => {
     await expect(settleWithin(reply)).rejects.toThrow(/exited with code 2/);
   });
 });
+
+describe("AntigravityAcpAdapter steering", () => {
+  async function runningTurn(config: Record<string, unknown> = { approvalMode: "bypass" }, extra: Record<string, unknown> = {}) {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, config, extra));
+    const events: EngineStreamEvent[] = [];
+    let settled = false;
+    const reply = adapter.sendUserMessage("tarobot-1", {
+      text: "write the report", files: [], onEngineEvent: (event) => { events.push(event); },
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    void reply.then(() => { settled = true; }, () => { settled = true; });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    return { harness, adapter, events, reply, server: harness.children[0]!.server, isSettled: () => settled };
+  }
+
+  it("offers steering for a live session and refuses it without a running turn", async () => {
+    const { adapter, server, reply } = await runningTurn();
+    expect(adapter.inFlightSendBehavior).toBe("steer");
+    expect(adapter.supportsSessionSteering(SESSION_A)).toBe(true);
+    expect(adapter.supportsSessionSteering("tarobot-9")).toBe(false);
+    server.text("done");
+    server.respondPrompt();
+    await settleWithin(reply);
+    await expect(adapter.steerActiveTurn(SESSION_A, { text: "late" })).resolves.toBe(false);
+    await expect(adapter.steerActiveTurn(SESSION_A, { text: "late", throwOnError: true })).rejects.toMatchObject({ name: "EngineSteeringRejectedError", reason: "stale" });
+    expect(server.prompts).toHaveLength(1);
+  });
+
+  it("sends a second session/prompt and keeps the turn open past the first prompt's early end_turn", async () => {
+    const { adapter, server, reply, events, isSettled } = await runningTurn();
+    server.text("Part one. ");
+    await waitFor(() => events.some((event) => event.type === "assistant_text"));
+    const steer = adapter.steerActiveTurn(SESSION_A, { text: "  also cover costs  ", throwOnError: true });
+    await waitFor(() => server.prompts.length === 2);
+    expect(server.prompts[1]!.params).toEqual({ sessionId: SESSION_A, prompt: [{ type: "text", text: "also cover costs" }] });
+    // agy hands the run over: the earlier prompt returns end_turn at once.
+    server.respondPrompt({ stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 1, cachedReadTokens: 2 } }, "oldest");
+    await expect(settleWithin(steer)).resolves.toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(isSettled()).toBe(false);
+    server.text("Part two with costs.");
+    server.respondPrompt({ stopReason: "end_turn", usage: { inputTokens: 5, outputTokens: 7, cachedReadTokens: 3 } });
+    await expect(settleWithin(reply)).resolves.toEqual({ text: "Part one. Part two with costs.", sessionId: SESSION_A, usage: { inputTokens: 15, outputTokens: 8, cachedTokens: 5 } });
+    expect(events.filter((event) => event.type === "result")).toEqual([{ type: "result", text: "Part one. Part two with costs.", sessionId: SESSION_A }]);
+  });
+
+  it("chains two steers; only the newest prompt settles the turn", async () => {
+    const { adapter, server, reply, isSettled } = await runningTurn();
+    const first = adapter.steerActiveTurn(SESSION_A, { text: "alpha" });
+    await waitFor(() => server.prompts.length === 2);
+    server.respondPrompt({ stopReason: "end_turn" }, "oldest");
+    await expect(settleWithin(first)).resolves.toBe(true);
+    const second = adapter.steerActiveTurn(SESSION_A, { text: "beta" });
+    await waitFor(() => server.prompts.length === 3);
+    server.respondPrompt({ stopReason: "end_turn" }, "oldest");
+    await expect(settleWithin(second)).resolves.toBe(true);
+    expect(isSettled()).toBe(false);
+    server.text("alpha and beta");
+    server.respondPrompt();
+    await expect(settleWithin(reply)).resolves.toMatchObject({ text: "alpha and beta" });
+  });
+
+  it("refuses to steer while an approval is unanswered instead of queueing it", async () => {
+    let answer!: (decision: { behavior: "allow"; scope: "once" }) => void;
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "normal" }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [], onApprovalRequest: () => new Promise((resolve) => { answer = resolve; }) });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const permission = server.requestPermission();
+    await waitFor(() => Boolean(answer));
+    await expect(adapter.steerActiveTurn(SESSION_A, { text: "hurry", throwOnError: true })).rejects.toMatchObject({ reason: "not_ready" });
+    await expect(adapter.steerActiveTurn(SESSION_A, { text: "hurry" })).resolves.toBe(false);
+    expect(server.prompts).toHaveLength(1);
+    answer({ behavior: "allow", scope: "once" });
+    await waitFor(() => server.clientResponses.has(permission));
+    server.text("ok");
+    server.respondPrompt();
+    await expect(settleWithin(reply)).resolves.toMatchObject({ text: "ok" });
+  });
+
+  it("reports agy's -32603 refusal truthfully and lets the earlier prompt finish the turn", async () => {
+    const { adapter, server, reply } = await runningTurn();
+    const steer = adapter.steerActiveTurn(SESSION_A, { text: "extra", throwOnError: true });
+    await waitFor(() => server.prompts.length === 2);
+    server.failPrompt({ code: -32603, message: "Can't add this prompt to session: the running prompt is waiting for a permission or question answer" });
+    await expect(settleWithin(steer)).rejects.toMatchObject({ name: "EngineSteeringRejectedError", reason: "not_ready" });
+    server.text("original answer");
+    server.respondPrompt();
+    await expect(settleWithin(reply)).resolves.toMatchObject({ text: "original answer" });
+  });
+
+  it("stops a steered turn with session/cancel", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    const controller = new AbortController();
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "x", files: [], abortSignal: controller.signal });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const steer = adapter.steerActiveTurn(SESSION_A, { text: "more" });
+    await waitFor(() => server.prompts.length === 2);
+    server.respondPrompt({ stopReason: "end_turn" }, "oldest");
+    await settleWithin(steer);
+    controller.abort();
+    await expect(settleWithin(reply)).rejects.toThrow("Task was stopped by user");
+    expect(harness.log).toEqual([`cancel:${SESSION_A}`]);
+  });
+});

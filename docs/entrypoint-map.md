@@ -3855,6 +3855,9 @@ session, Gateway, Bus and scoped App-tool suites listed in the audit.
   config; Normal approval through `session/request_permission` (allow once / reject
   once); bypass/full-auto through launch flags. Every path that ends a process sends
   `session/close` first: only that stops the session's background commands.
+  Steering sends another `session/prompt` into the running turn; the prompt it
+  replaces returns `end_turn` early and does not end the turn. A steer while an
+  approval is unanswered is refused (agy answers -32603), never queued.
   Tests: `antigravity-acp-adapter`, `core-engine-factory`, `permissions-settings`.
 - `src/codex/kimi-acp-adapter.ts`
   Persistent Kimi ACP worker, session configuration/loading, streaming event mapping,
