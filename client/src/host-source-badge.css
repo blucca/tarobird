@@ -26,7 +26,9 @@
 .conversation-header > .host-source-badge.header-host-source { display: inline-flex; flex: 0 1 auto; max-width: min(22%, 14em); margin: 0 2px 0 auto; font-size: 11px; }
 .mobile-home .mh-row-bottom > .host-source-badge { flex-shrink: 0; max-width: 42%; margin-left: auto; }
 @media (max-width: 760px) {
-  .conversation-header > .host-source-badge.header-host-source { display: inline-flex; flex-shrink: 0; max-width: 24%; margin: 0 2px 0 4px; font-size: 10px; }
+  /* Clear of the reply dot that ends the title row (its ring reaches 3px further): 12px before the name, and
+     6px into the empty edge of the button that follows, so the name sits to the right and the title keeps its room. */
+  .conversation-header > .host-source-badge.header-host-source { display: inline-flex; flex-shrink: 0; max-width: 24%; margin: 0 -6px 0 12px; font-size: 10px; }
 }
 /* The conversation name remains the primary identity on small phones. Bot
    details remain available through the identity button and its details page. */

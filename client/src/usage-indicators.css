@@ -46,5 +46,6 @@
 .usage-sheet .usage-row>span,.usage-sheet .usage-note{font-size:12.5px}
 .usage-sheet .usage-bar{height:6px}
 .conversation-header>.quota-mark{display:inline-flex;align-items:center;justify-content:center;flex:none;min-width:32px;min-height:32px;margin:0 2px 0 4px;padding:0;border:0;background:transparent}
-.conversation-header>.header-host-usage{display:inline-flex;flex-direction:column;align-items:center;gap:3px;flex-shrink:0;min-width:0;max-width:24%;margin:0 2px 0 4px;padding:0;border:0;background:transparent}
+/* The name with its battery keeps the same distance from the reply dot as the name alone (host-source-badge.css). */
+.conversation-header>.header-host-usage{display:inline-flex;flex-direction:column;align-items:center;gap:3px;flex-shrink:0;min-width:0;max-width:24%;margin:0 -6px 0 12px;padding:0;border:0;background:transparent}
 .header-host-usage>.host-source-badge.header-host-source{display:inline-flex;max-width:100%;margin:0;font-size:10px}

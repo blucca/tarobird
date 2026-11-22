@@ -308,6 +308,20 @@ test("phone with two computers: the battery sits under the computer's name", asy
       expect(layout.titleWidth).toBeGreaterThan(88); expect(layout.overflow).toBeLessThanOrEqual(1); expect(layout.page).toBeLessThanOrEqual(0);
       await header.screenshot({ path: info.outputPath(`phone-two-hosts-low-${width}.png`), animations: "disabled" });
     }
+    // While a reply runs, a narrow phone shows only a dot at the end of the title row. The name with its battery
+    // keeps clear of it (the dot's ring reaches 3px further) and does not run into the button after it.
+    const conversationId = (await a.store.db.get<{ id: string }>("SELECT id FROM conversations WHERE title=?", ["有读数"]))!.id;
+    const reply = await a.store.publishBotMessage("alpha", { conversationId, blocks: [{ type: "text", text: "正在整理" }], status: "streaming" });
+    for (const width of [360, 320]) {
+      await page.setViewportSize({ width, height: 844 });
+      await expect(header.locator(".header-activity .activity-dot")).toBeVisible();
+      const spacing = await header.evaluate(node => { const dot = node.querySelector(".activity-dot")!.getBoundingClientRect(), group = node.querySelector(".header-host-usage")!, box = group.getBoundingClientRect(), next = group.nextElementSibling!, glyph = (next.querySelector("svg") ?? next).getBoundingClientRect();
+        return { fromDot: box.left - dot.right, toNextGlyph: glyph.left - box.right, title: node.querySelector(".header-title")!.getBoundingClientRect().width, overflow: node.scrollWidth - node.clientWidth }; });
+      expect(spacing.fromDot).toBeGreaterThanOrEqual(11); expect(spacing.toNextGlyph).toBeGreaterThanOrEqual(4);
+      expect(spacing.title).toBeGreaterThan(88); expect(spacing.overflow).toBeLessThanOrEqual(1);
+    }
+    await a.store.publishBotMessage("alpha", { id: reply.id, conversationId, blocks: [{ type: "text", text: "整理好了" }], status: "complete" });
+    await page.setViewportSize({ width: 320, height: 844 });
     await low.click();
     await expect(page.getByRole("dialog", { name: "额度", exact: true })).toContainText("1%");
     await page.getByRole("dialog", { name: "额度", exact: true }).getByRole("button", { name: "关闭额度", exact: true }).click();
