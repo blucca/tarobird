@@ -66,6 +66,20 @@ it("does not attach an old in-flight refresh to a new account", async () => {
   resolve({ revision: "two", snapshot: unavailableQuota("codex", "auth_changed") }); await first;
 });
 
+it("gives no refresh cooldown to a login that changed during the refresh", async () => {
+  let revision = "one";
+  const read = vi.fn(async (options: { refresh: boolean }) => {
+    if (!options.refresh) return { revision, snapshot: unavailableQuota("codex", "not_loaded") };
+    revision = "two"; return { revision, snapshot: unavailableQuota("codex", "auth_changed") };
+  });
+  const run = gatewayEngineQuota({ botId: "bot", engine: "codex", read, now: () => 2000 });
+  const changed = await run({ scopeId: "bot", expectedRevision: "one", refresh: true });
+  // The page says "check and refresh again"; the new login may be read at once.
+  expect(changed.value).toMatchObject({ revision: "two", reason: "auth_changed" }); expect(changed.value.nextRefreshAt).toBeUndefined();
+  await run({ scopeId: "bot", expectedRevision: "two", refresh: true });
+  expect(read.mock.calls.filter(([options]) => options.refresh)).toHaveLength(2);
+});
+
 it.each([50_000, 70_000])("marks elapsed reset or TTL stale without inventing a refill (%s)", async now => {
   const result = await gatewayEngineQuota({ botId: "bot", engine: "codex", read: async () => ({ revision: "one", snapshot: snapshot() }), now: () => now })({ scopeId: "bot", refresh: false });
   expect(result.value.state).toBe("stale");

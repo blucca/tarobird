@@ -44,7 +44,8 @@ export function gatewayEngineQuota(options: {
     }
     const snapshot: QuotaSnapshot = quotaSnapshotSchema.parse(result.snapshot);
     if (snapshot.state === "ready" && quotaReadingExpired(snapshot, now())) snapshot.state = "stale";
-    if (snapshot.capability.mode === "active" && nextRefreshAt > now()) snapshot.nextRefreshAt = new Date(nextRefreshAt).toISOString();
+    // The cooldown belongs to the login it was started for; a reply about another one (auth_changed) has none.
+    if (snapshot.capability.mode === "active" && nextRefreshAt > now() && result.revision === refreshRevision) snapshot.nextRefreshAt = new Date(nextRefreshAt).toISOString();
     return nativeQuotaReplySchema.parse({ scopeId: options.botId, revision: result.revision,
       value: { ...snapshot, id: options.botId, revision: result.revision, engine: options.engine, label: options.engine,
         botIds: [options.botId], sharing: "unverified" } });
