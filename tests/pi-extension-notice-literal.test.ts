@@ -38,11 +38,12 @@ async function rig(pi: FakePiOptions) {
   });
   cleanups.push(async () => { await adapter.destroy(); await rm(root, { recursive: true, force: true }); });
   const { sessionId } = await adapter.createSession(1);
-  /** What the Host would take as this turn's answer and act on. */
+  /** What the Host would take as this turn's answer and act on. A failed turn is recovered from its stream
+   * (message-handler: resolveCoreFinalAnswerText(state, "")) when the tags in it name files that exist. */
   const hostAnswer = async (text: string): Promise<string> => {
     const events: EngineStreamEvent[] = [];
     const input = { text, authoredText: text, files: [], locale: "en", onEngineEvent: (event: EngineStreamEvent) => { events.push(event); } } as unknown as CodexUserMessageInput;
-    const result = await adapter.sendUserMessage(sessionId, input);
+    const result = await adapter.sendUserMessage(sessionId, input).catch(() => ({ text: "" }));
     let state = initialCoreRunState("lark:oc_chat");
     for (const event of events) if (event.type !== "result") state = applyCoreEngineEvent(state, event);
     return resolveCoreFinalAnswerText(state, result.text);
@@ -76,6 +77,16 @@ describe("extension text that reaches the Host's final answer", () => {
       run.reply("Working on it."); run.finish();
     } });
     const answer = await hostAnswer("go");
+    expect(hasCorePostTurnDelivery(answer)).toBe(false);
+  });
+
+  it("does not send a file named in an extension error when the turn then fails", async () => {
+    const { hostAnswer } = await rig({ onPrompt: run => {
+      run.emit({ type: "extension_error", extensionPath: "/synthetic/ext/a.ts", event: "tool_call", error: `could not write ${SEND} to the output folder` });
+      run.reply("", { stopReason: "error", errorMessage: "provider failed" }); run.finish();
+    } });
+    const answer = await hostAnswer("go");
+    expect(answer).toContain("report.pdf");
     expect(hasCorePostTurnDelivery(answer)).toBe(false);
   });
 

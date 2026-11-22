@@ -462,7 +462,8 @@ export class PiRpcAdapter implements CodexAdapter {
       : zh ? "[Pi] 这些补充在本轮回复结束后才到达，没有送达模型，已收回，不会自动重发：" : "[Pi] These additions arrived after the reply had finished and did not reach the model. They were taken back and will not be sent again automatically:";
     worker.ui.editorText = { text: texts.join("\n\n"), revision: ++worker.editorRevision };
     this.publish(worker.sessionId, { type: "editor_text", text: texts.join("\n\n") });
-    await this.emit(turn, { type: "assistant_text", text: `${head}\n${shown}`, sessionId: worker.sessionId });
+    // Taken-back input is shown, never acted on, should the Host take this block as the answer.
+    await this.emit(turn, { type: "assistant_text", text: this.shownNotExecuted(`${head}\n${shown}`, turn.input.locale), sessionId: worker.sessionId });
   }
 
   async validateExternalSession(sessionId: string, input: { workspaceOverride?: string } = {}): Promise<ExternalSessionInfo> {
@@ -1182,7 +1183,7 @@ export class PiRpcAdapter implements CodexAdapter {
     turn.extensionErrors++;
     if (turn.extensionErrors > NOTICE_BACKLOG_LIMIT) return;
     const label = turn.input.locale === "zh" ? "[Pi 扩展错误]" : "[Pi extension error]";
-    void this.emit(turn, { type: "assistant_text", text: `${label} ${error.extensionPath} (${error.event}): ${error.error}`, sessionId: turn.worker.sessionId });
+    void this.emit(turn, { type: "assistant_text", text: this.shownNotExecuted(`${label} ${error.extensionPath} (${error.event}): ${error.error}`, turn.input.locale), sessionId: turn.worker.sessionId });
   }
 
   private withExtensionErrorNotice(turn: Turn, text: string): string {
