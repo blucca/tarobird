@@ -447,6 +447,76 @@ describe("handleLocalEngineTelegramCommand", () => {
     }
   });
 
+  it("reads /context from an Antigravity ACP session and keeps rejecting it in print mode", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agy-context-"));
+    try {
+      for (const antigravityRuntime of ["acp", undefined] as const) {
+        const api = { sendMessage: vi.fn().mockResolvedValue({ message_id: 1 }) };
+        const bridge = { handleAuthorizedMessage: vi.fn(), getContextUsage: vi.fn().mockResolvedValue({ pressureTokens: 18833, contextWindow: 1048576 }) };
+        await handleLocalEngineCoreCommand({
+          stateDir: root, startedAt: Date.now(), locale: "en",
+          cfg: { engine: "antigravity", ...(antigravityRuntime ? { antigravityRuntime } : {}) },
+          normalized: createNormalizedMessage("/context"), context: { api: api as never }, bridge,
+          sessionStore: { removeByChatId: vi.fn(), clearAll: vi.fn() }, updateInstanceConfig: vi.fn(),
+        });
+        if (antigravityRuntime) {
+          expect(bridge.getContextUsage).toHaveBeenCalledTimes(1);
+          expect(api.sendMessage).toHaveBeenCalledWith(123, "Context: ~18,833 / 1,048,576 tokens (1.8%)\nLast provider sample: 18,833 tokens");
+        } else {
+          expect(bridge.getContextUsage).not.toHaveBeenCalled();
+          expect(api.sendMessage).toHaveBeenCalledWith(123, "/context is only supported with the Claude or DeepSeek engine. The current engine does not expose local context.");
+        }
+      }
+    } finally {
+      await removeTempRoot(root);
+    }
+  });
+
+  it("forwards /compact to an Antigravity ACP session and keeps rejecting it in print mode", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agy-compact-"));
+    try {
+      for (const antigravityRuntime of ["acp", undefined] as const) {
+        const api = { sendMessage: vi.fn().mockResolvedValue({ message_id: 11 }) };
+        const bridge = { handleAuthorizedMessage: vi.fn().mockResolvedValue({ text: "Compacted the conversation." }) };
+        const handled = await handleLocalEngineCoreCommand({
+          stateDir: root, startedAt: Date.now() - 10, locale: "en",
+          cfg: { engine: "antigravity", ...(antigravityRuntime ? { antigravityRuntime } : {}) },
+          normalized: createNormalizedMessage("/compact"), context: { api: api as never, instanceName: "default", updateId: 81 }, bridge,
+          sessionStore: { removeByChatId: vi.fn(), clearAll: vi.fn() }, updateInstanceConfig: vi.fn(),
+        });
+        expect(handled).toBe(true);
+        if (antigravityRuntime) {
+          expect(bridge.handleAuthorizedMessage).toHaveBeenCalledWith(expect.objectContaining({ text: "/compact", files: [] }));
+          expect(api.sendMessage).toHaveBeenNthCalledWith(2, 123, "Context compacted.\n\nCompacted the conversation.");
+        } else {
+          expect(bridge.handleAuthorizedMessage).not.toHaveBeenCalled();
+          expect(api.sendMessage).toHaveBeenCalledWith(123, "/compact is only supported with the Claude, Kimi, and DeepSeek engines. The current engine does not run local context compaction; use /reset to clear this conversation.");
+        }
+      }
+    } finally {
+      await removeTempRoot(root);
+    }
+  });
+
+  it("reports a native compact that returned no text with the Host line alone", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agy-compact-empty-"));
+    try {
+      for (const locale of ["en", "zh"] as const) {
+        const api = { sendMessage: vi.fn().mockResolvedValue({ message_id: 11 }) };
+        await handleLocalEngineCoreCommand({
+          stateDir: root, startedAt: Date.now() - 10, locale,
+          cfg: { engine: "antigravity", antigravityRuntime: "acp" },
+          normalized: createNormalizedMessage("/compact"), context: { api: api as never, instanceName: "default", updateId: 82 },
+          bridge: { handleAuthorizedMessage: vi.fn().mockResolvedValue({ text: "" }) },
+          sessionStore: { removeByChatId: vi.fn(), clearAll: vi.fn() }, updateInstanceConfig: vi.fn(),
+        });
+        expect(api.sendMessage).toHaveBeenNthCalledWith(2, 123, locale === "zh" ? "上下文已压缩。" : "Context compacted.");
+      }
+    } finally {
+      await removeTempRoot(root);
+    }
+  });
+
   it("uses Pi's configured workspace before a fallback resume workspace for /context", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-context-"));
     const api = { sendMessage: vi.fn().mockResolvedValue({ message_id: 1 }) };

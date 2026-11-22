@@ -135,3 +135,18 @@ it("preserves old positive group overrides and refuses malformed new durable pol
     expect(await readFile(path.join(root, "gateway-group-mode.json"), "utf8")).toContain("invalid");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+it("adds Antigravity ACP native commands to the App menu without shadowing Host commands", () => {
+  const native = [
+    { name: "goal", description: "Run until the goal is finished." },
+    { name: "grill-me", description: "Interview me to align on a plan." },
+    { name: "compact", description: "Compact the conversation now." },
+    { name: "boost", description: "Invoke the Boost orchestrator." },
+  ];
+  const menu = gatewayCommands("antigravity", "", native);
+  expect(menu.filter((item) => item.command === "goal")).toHaveLength(1);
+  expect(menu.filter((item) => item.command === "compact")).toHaveLength(1);
+  expect(menu.find((item) => item.command === "grill-me")).toEqual({ command: "grill-me", description: { defaultValue: "Interview me to align on a plan.", i18n: { en_us: "Interview me to align on a plan.", zh_cn: "Interview me to align on a plan." } } });
+  expect(gatewayCommands("antigravity", "/gr", native).map((item) => item.command)).toEqual(["group", "grill-me"]);
+  expect(gatewayCommands("claude", "", native).some((item) => item.command === "grill-me")).toBe(false);
+});

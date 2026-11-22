@@ -559,6 +559,8 @@ export interface CodexAdapter {
   nativeInputCapability?(sessionId: string): NativeInputCapability | undefined;
   backgroundInputTarget?(sessionId: string, ownerKey: string): string | undefined;
   controlNativeInput?(sessionId: string, input: { inputId: string; action: NativeInputAction }): Promise<NativeInputControlResult>;
+  /** Slash commands the engine advertised (ACP available_commands_update); absent means none. */
+  advertisedCommands?(): Array<{ name: string; description: string }>;
   /** Native live tasks; absent means unsupported. Handles must be worker-scoped. */
   listTasks?(sessionId: string): Promise<EngineTaskSnapshot>;
   stopTask?(sessionId: string, input: { taskId: string }): Promise<EngineTaskControlResult>;

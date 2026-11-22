@@ -1,4 +1,4 @@
-import { currentPermission, permissionOptions } from "../state/permission-options.js";
+import { currentPermission, permissionOptions, permissionRuntime } from "../state/permission-options.js";
 import { constants } from "node:fs";
 import { lstat, open, readdir } from "node:fs/promises";
 import path from "node:path";
@@ -112,7 +112,7 @@ export async function readBotDashboard(stateDir: string, live: DashboardLive | n
     }
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") warnings.push("crew-runs: unreadable"); }
   return botDashboardSchema.parse({ generatedAt: new Date().toISOString(), live,
-    config: config ? { engine: config.engine ?? null, model: maybe(config.model, 200), effort: config.effort ?? null, approvalMode: config.approvalMode ?? null, permissionLabel: permissionOptions(config.engine ?? "codex", config.codexRuntime).find(option => option.id === currentPermission(config.engine ?? "codex", config))!.label, budgetUsd: config.budgetUsd ?? null } : null,
+    config: config ? { engine: config.engine ?? null, model: maybe(config.model, 200), effort: config.effort ?? null, approvalMode: config.approvalMode ?? null, permissionLabel: permissionOptions(config.engine ?? "codex", permissionRuntime(config.engine ?? "codex", config)).find(option => option.id === currentPermission(config.engine ?? "codex", config))!.label, budgetUsd: config.budgetUsd ?? null } : null,
     sessions: sessions ? new Set(sessions.chats.map((s) => s.codexSessionId)).size : null,
     usage,
     cron,

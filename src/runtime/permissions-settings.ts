@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { permissionErrorSchema, permissionPatchSchema, type PermissionSettings } from "../client-protocol/permissions.js";
-import { applyPermission, currentPermission, defaultPermission, permissionOptions } from "../state/permission-options.js";
+import { applyPermission, currentPermission, defaultPermission, permissionOptions, permissionRuntime } from "../state/permission-options.js";
 import { ConfigFileSchema, type ConfigFile } from "../state/config-file-schema.js";
 import { withFileMutex } from "../state/file-mutex.js";
 import { type InstanceEngine } from "../state/instance-config.js";
@@ -15,8 +15,8 @@ async function readConfig(file: string): Promise<ConfigFile> {
 function snapshot(config: ConfigFile, runtimeEngine: InstanceEngine, activeTurns: number): PermissionSettings {
   const engine = config.engine ?? "codex";
   if (engine !== runtimeEngine) throw new Error("permissions_engine_changed");
-  const revision = createHash("sha256").update(JSON.stringify([engine, config.approvalMode ?? null, config.claudePermissionMode ?? null, config.kimiAutoNeverAskAcknowledged ?? null, config.codexRuntime ?? null, config._clientPermissionsRevision ?? null])).digest("hex");
-  return { scope: "bot", revision, engine, choice: currentPermission(engine, config), defaultChoice: defaultPermission(engine), choices: permissionOptions(engine, config.codexRuntime), activeTurns };
+  const revision = createHash("sha256").update(JSON.stringify([engine, config.approvalMode ?? null, config.claudePermissionMode ?? null, config.kimiAutoNeverAskAcknowledged ?? null, config.codexRuntime ?? null, config._clientPermissionsRevision ?? null, ...(config.antigravityRuntime ? [config.antigravityRuntime] : [])])).digest("hex");
+  return { scope: "bot", revision, engine, choice: currentPermission(engine, config), defaultChoice: defaultPermission(engine), choices: permissionOptions(engine, permissionRuntime(engine, config)), activeTurns };
 }
 /** Same Bot-level config and file mutex as other settings. Never touches session bindings
  * or live workers: each native adapter reads this at its next safe boundary. */

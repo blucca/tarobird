@@ -975,6 +975,10 @@ export class Bridge {
     }
   }
 
+  advertisedCommands(): Array<{ name: string; description: string }> {
+    return this.adapter.advertisedCommands?.() ?? [];
+  }
+
   async listTasks(input: { chatId: number; conversationKey: string }): Promise<EngineTaskSnapshot> {
     if (!this.adapter.listTasks || !this.sessionManager.getExistingSession) return { supported: false, tasks: [] };
     const session = await this.sessionManager.getExistingSession(this.conversationScope(input));

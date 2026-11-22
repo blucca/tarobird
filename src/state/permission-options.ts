@@ -7,7 +7,12 @@ export type PermissionChoice = typeof PERMISSION_CHOICES[number];
 export type PermissionEngine = "codex" | "claude" | "kimi" | "deepseek" | "antigravity" | "pi";
 export type PermissionOption = { id: PermissionChoice; label: string; description: string };
 export function defaultPermission(engine: PermissionEngine): PermissionChoice { return engine === "kimi" ? "full-auto" : "bypass"; }
-export function permissionOptions(engine: PermissionEngine, codexRuntime?: unknown): PermissionOption[] {
+/** The saved runtime that changes what a choice means: Codex process/app-server, Antigravity print/acp. */
+export function permissionRuntime(engine: PermissionEngine, config: Record<string, unknown>): unknown {
+  return engine === "antigravity" ? config.antigravityRuntime : config.codexRuntime;
+}
+export function permissionOptions(engine: PermissionEngine, runtime?: unknown): PermissionOption[] {
+  const codexRuntime = engine === "antigravity" ? undefined : runtime;
   switch (engine) {
     case "pi": return [
       { id: "bypass", label: "原生访问 · Pi", description: "按 Pi 原生方式运行工具；没有系统沙箱。扩展请求确认时仍会询问。" },
@@ -27,7 +32,9 @@ export function permissionOptions(engine: PermissionEngine, codexRuntime?: unkno
     case "antigravity": return [
       { id: "bypass", label: "完全访问 · Bypass", description: "跳过工具权限确认，不启用终端沙箱。" },
       { id: "full-auto", label: "沙箱自动执行", description: "自动批准工具操作，并启用 Antigravity 的终端沙箱。" },
-      { id: "normal", label: "每轮批准 · 终端沙箱", description: "每轮开始前在对话中批准整轮任务；批准后在终端沙箱内自动执行，并非逐条命令审批。" },
+      runtime === "acp"
+        ? { id: "normal", label: "普通审批 · 逐项确认", description: "执行命令、修改文件等需要批准的操作会逐项在对话中请求批准，只能允许或拒绝本次；不启用终端沙箱。" }
+        : { id: "normal", label: "每轮批准 · 终端沙箱", description: "每轮开始前在对话中批准整轮任务；批准后在终端沙箱内自动执行，并非逐条命令审批。" },
     ];
     default: return [
       { id: "bypass", label: "完全访问 · Bypass", description: "跳过工具权限确认，并允许工作区以外的访问。" },

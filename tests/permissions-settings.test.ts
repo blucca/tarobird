@@ -32,7 +32,20 @@ describe("Bot permissions", () => {
     expect(currentPermission("claude", { approvalMode: "full-auto" })).toBe("bypass");
     expect(currentPermission("kimi", { approvalMode: "bypass" })).toBe("full-auto");
     expect(permissionOptions("codex", "process").find(option => option.id === "normal")?.label).toContain("每轮批准");
+    // Antigravity ACP asks per tool call and has no terminal sandbox in Normal; print mode approves a whole turn.
+    expect(permissionOptions("antigravity").find(option => option.id === "normal")?.label).toContain("每轮批准");
+    expect(permissionOptions("antigravity", "acp").find(option => option.id === "normal")).toMatchObject({ label: "普通审批 · 逐项确认" });
+    expect(permissionOptions("antigravity", "acp").find(option => option.id === "normal")?.description).not.toContain("沙箱内");
     expect(() => applyPermission({}, "kimi", "claude-auto")).toThrow("permissions_incompatible");
+  });
+  it("describes Antigravity Normal approval by the Bot's runtime", async () => {
+    await config({ engine: "antigravity", approvalMode: "normal", antigravityRuntime: "acp" });
+    const acp = await settings("antigravity");
+    expect(acp.choices.find(option => option.id === "normal")?.label).toBe("普通审批 · 逐项确认");
+    await config({ engine: "antigravity", approvalMode: "normal" });
+    const print = await settings("antigravity");
+    expect(print.choices.find(option => option.id === "normal")?.label).toContain("每轮批准");
+    expect(print.revision).not.toBe(acp.revision);
   });
   it("rejects stale device writes, unsupported modes and saves during active turns", async () => {
     await config({ engine: "codex" }); const before = await settings("codex");

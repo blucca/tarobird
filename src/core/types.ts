@@ -203,6 +203,8 @@ export interface CoreBridgeLike {
   backgroundInputTarget?(input: { chatId: number; conversationKey: string }): Promise<string | undefined>;
   controlNativeInput?(input: { chatId: number; conversationKey: string; inputId: string; action: NativeInputAction; isCurrentSession?: () => Promise<boolean> }): Promise<NativeInputControlResult>;
   listTasks?(input: { chatId: number; conversationKey: string }): Promise<EngineTaskSnapshot>;
+  /** The engine's own slash commands for the command menu, when it advertises them. */
+  advertisedCommands?(): Array<{ name: string; description: string }>;
   getPiSession?(input: { chatId: number; conversationKey: string; isCurrentSession?: () => Promise<boolean> }): Promise<PiSessionSnapshot>;
   changePiSession?(input: { chatId: number; conversationKey: string; isCurrentSession?: () => Promise<boolean> } & Pick<PiSessionChange, "expectedSession" | "action" | "value">): Promise<PiSessionResult>;
   stopTask?(input: { chatId: number; conversationKey: string; taskId: string; isCurrentSession?: () => Promise<boolean> }): Promise<EngineTaskControlResult>;
