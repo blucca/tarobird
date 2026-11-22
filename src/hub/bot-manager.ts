@@ -141,7 +141,7 @@ export class BotManager {
         if (!this.engineAvailable(spec.engine)) throw new HubError("bot_engine_unavailable", 409);
         // Only the chosen engine's list, and only when a check below reads it:
         // other CLIs are never started to create a Bot.
-        if (spec.engine === "deepseek" || spec.effort && (spec.engine === "kimi" || spec.engine === "pi" || spec.engine === "antigravity")) {
+        if (spec.engine === "deepseek" || spec.engine === "pi" && spec.model || spec.effort && (spec.engine === "kimi" || spec.engine === "pi" || spec.engine === "antigravity")) {
           const workspace = spec.engine === "pi" || spec.engine === "deepseek" ? spec.workspace || undefined : undefined;
           let engine = await this.engineCatalog(spec.engine, workspace, { refresh: spec.engine === "deepseek" });
           // A stale list is fine to show, not to validate against: wait for its replacement.
@@ -154,7 +154,12 @@ export class BotManager {
             if (!selected.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
           }
           if (spec.engine === "kimi" && engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort) === false) throw new HubError("bot_effort_incompatible");
-          if (spec.engine === "pi" && !engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
+          if (spec.engine === "pi") {
+            const listed = engine.models.find(model => model.id === spec.model);
+            // A model a complete list leaves out is the problem, not the effort; an incomplete list cannot refuse a model.
+            if (spec.model && !listed && engine.catalogStatus === "ready") throw new HubError("model_unavailable", 409);
+            if (spec.effort && !listed?.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
+          }
           if (spec.engine === "antigravity" && !antigravityEffortChoices(engine.models as AntigravityModel[], spec.model).includes(spec.effort)) throw new HubError("bot_effort_incompatible");
         }
         await this.store.db.serial(authorize);
