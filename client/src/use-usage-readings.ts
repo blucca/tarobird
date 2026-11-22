@@ -5,8 +5,9 @@ import type { HubConnection } from "./connection.js";
 import { contextView, loadSavedQuota, mayAskEngine, nextHeldQuota, quotaView, quotaViewEndsAt, savedQuotaAfter, saveQuota, SAVED_QUOTA_KEY, type QuotaAttempt } from "./usage-readings.js";
 
 /** The engine is asked for quota again only once the shown reading is this old; opening the details asks after a minute.
- * There is no timer: a reading is taken when a conversation opens and when a reply ends. */
-const QUOTA_READ_AGAIN_MS = 5 * 60_000, QUOTA_DETAILS_READ_AGAIN_MS = 60_000;
+ * Nothing is polled: a reading is taken when a conversation opens, when a reply ends, and once shortly before
+ * the shown reading would stop counting, so an open conversation keeps its battery while the engine can answer. */
+const QUOTA_READ_AGAIN_MS = 5 * 60_000, QUOTA_DETAILS_READ_AGAIN_MS = 60_000, QUOTA_RENEW_BEFORE_MS = 20_000;
 /** The last quota reading per Host and Bot, so a Bot's battery is there when another of its conversations opens. */
 const held = new WeakMap<HubConnection, Map<string, QuotaScope>>();
 /** Readings saved on this device by an earlier run of the App. One is shown only after its Bot's worker has
@@ -78,8 +79,12 @@ export function useUsageReadings(connection: HubConnection, input: {
   const endsAt = quotaReading ? quotaViewEndsAt(quotaReading) : undefined;
   useEffect(() => {
     if (endsAt === undefined) return;
-    const timer = setTimeout(() => redraw(count => count + 1), Math.max(0, endsAt - Date.now()) + 50);
-    return () => clearTimeout(timer);
+    const left = endsAt - Date.now();
+    // One more reading before this one ends (its age limit or a window's reset). If none can be taken, the redraw
+    // at the end drops the symbol, and nothing asks again until the conversation opens or a reply ends.
+    const renew = left > QUOTA_RENEW_BEFORE_MS ? setTimeout(() => void latest.current(QUOTA_READ_AGAIN_MS), left - QUOTA_RENEW_BEFORE_MS) : undefined;
+    const timer = setTimeout(() => redraw(count => count + 1), Math.max(0, left) + 50);
+    return () => { clearTimeout(timer); clearTimeout(renew); };
   }, [endsAt]);
   return {
     context: context && usage?.key === key ? contextView(usage.value) : undefined,

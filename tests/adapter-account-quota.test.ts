@@ -152,7 +152,7 @@ describe("Claude quota from the Bot's own running engine", () => {
     expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "scope_unverifiable", capability: { mode: "passive" }, pools: [] });
     expect(spawn).not.toHaveBeenCalled();
   });
-  it("asks get_usage only on an explicit refresh and keeps the answer with that process", async () => {
+  it("asks get_usage only on an explicit refresh, and the answer stays the Bot's reading after that process has ended", async () => {
     const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply();
     const worker = await start();
     const idle = await adapter.getAccountQuota({ refresh: false });
@@ -164,8 +164,13 @@ describe("Claude quota from the Bot's own running engine", () => {
     expect(read.snapshot.pools[0].windows.map(window => [window.id, window.metric === "percent" && window.usedPercent])).toEqual([["five_hour", 12], ["seven_day", 61.5]]);
     expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools[0].windows).toHaveLength(2);
     expect(child.controls).toEqual(["get_usage"]); expect(child.methods).toEqual([]);
+    // The process ends (an idle Bot keeps none): the reading is still the Bot's, under the same revision, and nothing is started or asked.
     worker.retired = true;
-    expect((await adapter.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ reason: "scope_unverifiable", pools: [] });
+    const after = await adapter.getAccountQuota({ refresh: false });
+    expect(after.revision).toBe(read.revision); expect(after.snapshot.observedAt).toBe(read.snapshot.observedAt);
+    expect(after.snapshot.pools[0].windows).toHaveLength(2);
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot.observedAt).toBe(read.snapshot.observedAt);
+    expect(child.controls).toEqual(["get_usage"]); expect(child.methods).toEqual([]);
   });
   it("answers the Gateway's refresh and asks the engine once per cooldown", async () => {
     const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); await start();
@@ -200,18 +205,27 @@ describe("Claude quota from the Bot's own running engine", () => {
     const stale = (await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 })).snapshot;
     expect(stale).toMatchObject({ state: "stale", reason: "timeout" }); expect(stale.pools[0].windows).toHaveLength(2);
   });
-  it("asks only a process that is not working on a turn, and the newest earlier answer stands meanwhile", async () => {
+  it("asks a process that is working on a turn when none is idle, and leaves its activity clock alone", async () => {
     const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); const worker = await start();
-    await adapter.getAccountQuota({ refresh: true });
-    for (const busy of [{ pendingTurn: {} }, { continuationTurn: {} }, { nativeTurnOpen: true }, { taskNotificationTurnActive: true }]) {
-      Object.assign(worker, busy);
+    for (const [index, busy] of [{ pendingTurn: {} }, { continuationTurn: {} }, { nativeTurnOpen: true }, { taskNotificationTurnActive: true }].entries()) {
+      Object.assign(worker, busy); worker.lastActivityAt = 1_000 + index;
       const read = (await adapter.getAccountQuota({ refresh: true })).snapshot;
-      expect(read.pools[0].windows).toHaveLength(2); expect(read.reason).toBeUndefined();
+      expect(read).toMatchObject({ state: "ready" }); expect(read.pools[0].windows).toHaveLength(2); expect(read.reason).toBeUndefined();
+      expect(child.controls).toHaveLength(index + 1);
+      // A process on a turn is in use: nothing is put back.
+      expect(worker.lastActivityAt).toBeGreaterThanOrEqual(1_000 + index);
       Object.assign(worker, { pendingTurn: null, continuationTurn: undefined, nativeTurnOpen: false, taskNotificationTurnActive: false });
     }
-    expect(child.controls).toEqual(["get_usage"]);
-    await adapter.getAccountQuota({ refresh: true });
-    expect(child.controls).toEqual(["get_usage", "get_usage"]);
+    expect(child.controls).toEqual(["get_usage", "get_usage", "get_usage", "get_usage"]);
+  });
+  it("prefers an idle process to one on a turn", async () => {
+    const { adapter, child, start, spawn } = await claudeFixture(); child.answers.get_usage = usageReply();
+    const busy = await start(); Object.assign(busy, { pendingTurn: {} }); busy.lastActivityAt = 9_000;
+    const other = new Child(); other.answers.get_usage = usageReply(); spawn.mockReturnValueOnce(other);
+    const idle = await (adapter as any).getOrCreateWorker("tarobot-other", null, null, "normal", undefined); idle.lastActivityAt = 1_000;
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot.state).toBe("ready");
+    expect(other.controls).toEqual(["get_usage"]); expect(child.controls).toEqual([]);
+    Object.assign(busy, { pendingTurn: null });
   });
   it("does not count a question as use of the process", async () => {
     const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); child.answers.get_context_usage = { totalTokens: 5, maxTokens: 10 }; const worker = await start();
@@ -273,18 +287,47 @@ describe("Claude quota from the Bot's own running engine", () => {
     expect(result.snapshot).toMatchObject({ reason: "auth_changed", pools: [] });
     expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools).toEqual([]);
   });
-  it("names the running processes in the revision, so a reading does not outlive its process in the App", async () => {
-    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply();
+  it("keeps one revision and the Bot's reading while its processes come and go, also through a new process's first turn", async () => {
+    const { adapter, child, start, spawn } = await claudeFixture(); child.answers.get_usage = usageReply();
+    const before = await adapter.getAccountQuota({ refresh: false });          // no process yet
     const worker = await start();
     const listed = await adapter.getAccountQuota({ refresh: false });
+    expect(listed.revision).toBe(before.revision);
     const read = await adapter.getAccountQuota({ refresh: true, expectedRevision: listed.revision });
     expect(read.revision).toBe(listed.revision); expect(read.snapshot.state).toBe("ready");
     worker.retired = true;
-    expect((await adapter.getAccountQuota({ refresh: false })).revision).not.toBe(read.revision);
-    const next = await (adapter as any).getOrCreateWorker("tarobot-other", null, null, "normal", undefined);
-    const again = await adapter.getAccountQuota({ refresh: false });
-    expect(again.revision).not.toBe(read.revision); expect(again.snapshot.pools).toEqual([]);
-    expect(next.retired).toBeFalsy();
+    expect((await adapter.getAccountQuota({ refresh: false })).revision).toBe(read.revision);
+    // The next turn starts a new process, which is busy from the start and whose CLI does not answer yet.
+    const second = new Child(); spawn.mockReturnValueOnce(second);
+    const next = await (adapter as any).getOrCreateWorker("tarobot-other", null, null, "normal", undefined); Object.assign(next, { pendingTurn: {} });
+    const during = await adapter.getAccountQuota({ refresh: false });
+    expect(during.revision).toBe(read.revision); expect(during.snapshot.observedAt).toBe(read.snapshot.observedAt);
+    expect(during.snapshot.pools[0].windows).toHaveLength(2);
+    // Asked on its turn, it answers with the newer figures, and those replace the kept ones.
+    second.answers.get_usage = { ...usageReply(), rate_limits: { five_hour: { utilization: 40, resets_at: future(3) }, seven_day: { utilization: 70, resets_at: future(90) }, seven_day_opus: null } };
+    const newer = await adapter.getAccountQuota({ refresh: true });
+    expect(newer.revision).toBe(read.revision);
+    expect(newer.snapshot.pools[0].windows.map(window => window.metric === "percent" && window.usedPercent)).toEqual([40, 70]);
+    expect(second.controls).toEqual(["get_usage"]);
+    Object.assign(next, { pendingTurn: null });
+  });
+  it("drops the kept reading when the login state on disk changes or a process answers that the login has no windows", async () => {
+    const { f, adapter, child, start, spawn } = await claudeFixture(); child.answers.get_usage = usageReply();
+    const worker = await start(); await adapter.getAccountQuota({ refresh: true }); worker.retired = true;
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools).toHaveLength(1);
+    // A process on an API key answers: nothing of the earlier login is shown any more.
+    const keyed = new Child(); keyed.answers.get_usage = { session: {}, subscription_type: null, rate_limits_available: false, rate_limits: null }; spawn.mockReturnValueOnce(keyed);
+    await (adapter as any).getOrCreateWorker("tarobot-other", null, null, "normal", undefined);
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ state: "unsupported", pools: [] });
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools).toEqual([]);
+    // Another login written to disk: an earlier reading is not this login's.
+    const again = await claudeFixture(); again.child.answers.get_usage = usageReply();
+    const first = await again.start(); const shown = await again.adapter.getAccountQuota({ refresh: true }); first.retired = true;
+    await mkdir(path.join(again.f.home, ".claude"), { recursive: true });
+    await writeFile(path.join(again.f.home, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-b" } }));
+    const changed = await again.adapter.getAccountQuota({ refresh: false });
+    expect(changed.revision).not.toBe(shown.revision); expect(changed.snapshot.pools).toEqual([]);
+    void f;
   });
   it("does not attribute a process started under another login to the current one", async () => {
     const { f, adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply();

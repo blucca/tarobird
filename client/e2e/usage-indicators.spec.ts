@@ -146,6 +146,30 @@ test("desktop: ring and battery sit left of the model controls, each only when r
   } finally { await f.dispose(); }
 });
 
+test("an open conversation takes one more reading shortly before the shown one ends", async ({ page }) => {
+  test.setTimeout(120_000);
+  const f = await fixture(page);
+  try {
+    const seen = requests(page), quotaReads = () => seen.filter(url => url.includes("/api/engine-quotas/alpha")).length;
+    // Both windows reset in 35 s: that is when this reading stops counting.
+    const soon = 35 / 3600;
+    f.readings.value = { limits: [{ id: "primary", used: 20, period: 18_000, resetHours: soon }, { id: "secondary", used: 10, period: 604_800, resetHours: soon }] };
+    await workspace(page).locator(".conversation-row").filter({ hasText: "有读数" }).filter({ visible: true }).click();
+    const battery = page.locator(".usage-indicators [data-usage=quota]");
+    await expect(battery).toBeVisible(); await expect(battery).toContainText("80%");
+    const shownAt = Date.now(), before = quotaReads();
+    // What the engine would answer next has later resets and another level.
+    f.readings.value = { limits: [{ id: "primary", used: 45, period: 18_000, resetHours: 2 }, { id: "secondary", used: 30, period: 604_800, resetHours: 120 }] };
+    // Nothing is opened and no reply ends. About 20 s before the end the App reads once more, and the battery
+    // carries on with the newer figures past the moment the first reading ended.
+    await expect.poll(quotaReads, { timeout: 30_000 }).toBeGreaterThan(before);
+    expect(Date.now() - shownAt).toBeGreaterThan(8_000);
+    await expect(battery).toContainText("55%", { timeout: 10_000 });
+    await page.waitForTimeout(Math.max(0, shownAt + 40_000 - Date.now()));
+    await expect(battery).toBeVisible(); await expect(battery).toContainText("55%");
+  } finally { await f.dispose(); }
+});
+
 test("quota is never requested for a user who is not the owner", async ({ page }) => {
   const f = await fixture(page);
   try {

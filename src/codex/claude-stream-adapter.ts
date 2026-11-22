@@ -558,6 +558,8 @@ const BACKGROUND_TASK_TURN_SETTLE_GRACE_MS = 1500;
 // (stale only after 12h) and blocking every channel and cron turn on that
 // session. `/timeout off` (disableRuntimeTimeout) disables it per turn.
 export const CLAUDE_STREAM_INACTIVITY_TIMEOUT_MS = ENGINE_DEFAULT_INACTIVITY_TIMEOUT_MS;
+type ClaudeQuotaRecord = { id: number; credentialRevision: string; snapshot?: QuotaSnapshot; usage?: QuotaSnapshot; unasked?: Set<string>;
+  /** The model this process stated when it started a turn. */ model?: string; context?: { sessionId: string | null; usage: EngineContextUsage } };
 // Native soft stop (CLI 2.1.307 probes: receipt and interrupted result arrive
 // within ~10 ms). Past these bounds the stop is unconfirmed and falls back to
 // the bounded process cleanup instead of leaving the session wedged.
@@ -1159,10 +1161,14 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   private readonly historyRuns = new Set<Promise<unknown>>();
   private readonly historyAbort = new AbortController();
   private readonly quotaCache: AdapterQuotaCache;
-  /** `usage` is this process's own answer to `get_usage`; it ends with the process. `unasked` names
-   * the usage requests this process refused, so an older CLI is asked once. */
-  private readonly quotaWorkers = new WeakMap<ClaudeWorker, { id: number; credentialRevision: string; snapshot?: QuotaSnapshot; usage?: QuotaSnapshot; unasked?: Set<string>;
-    /** The model this process stated when it started a turn. */ model?: string; context?: { sessionId: string | null; usage: EngineContextUsage } }>();
+  /** `usage` is this process's own answer to `get_usage`. `unasked` names the usage requests this process
+   * refused, so an older CLI is asked once. */
+  private readonly quotaWorkers = new WeakMap<ClaudeWorker, ClaudeQuotaRecord>();
+  /** The record that holds this Bot's newest `get_usage` answer. The answer is about the account the answering
+   * process used, and it stays the Bot's reading after that process has ended: a Bot's processes come and go
+   * with its turns, its account seldom does. It goes when a process answers again, when a process answers that
+   * the login has no windows, or when the login state the Host can see has changed. */
+  private keptUsage?: ClaudeQuotaRecord;
   private quotaWorkerSequence = 0;
   private quotaSource?: ClaudeWorker;
   private readonly sessionUsage: ClaudeSessionUsage;
@@ -1253,11 +1259,10 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   private quotaScope() {
     const source = this.quotaSource, live = [...new Set(this.workers.values())].filter(worker => !worker.retired);
     const active = source && live.includes(source);
-    // Without a passive source the readings are get_usage answers, which belong to the processes that gave them, and
-    // a login the CLI keeps in the system keychain changes no file here. The revision names the running processes,
-    // so the App does not keep a reading past them.
-    const running = live.map(worker => this.quotaWorkers.get(worker)?.id).filter(id => id !== undefined).sort((a, b) => a - b).join(",");
-    return this.quotaCache.capture(this.destroyPromise ? "destroyed" : active ? String(this.quotaWorkers.get(source)?.id ?? "none") : running ? `run:${running}` : "none");
+    // Without a passive source the readings are get_usage answers. Their revision does not name processes: a Bot
+    // starts and ends processes with its turns, and a revision that changed each time made the App drop the Bot's
+    // reading whenever the Bot was busy. It changes with the login state the Host can see (files, environment).
+    return this.quotaCache.capture(this.destroyPromise ? "destroyed" : active ? String(this.quotaWorkers.get(source)?.id ?? "none") : "usage");
   }
 
   /** Usage is asked only of a process that is not working on a turn. A question during a turn would count
@@ -1270,17 +1275,17 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     return this.usageIdle(worker) && !this.quotaWorkers.get(worker)?.unasked?.has(request);
   }
 
-  /** One usage request to an idle process. Asking is not use: the process's idle clock is put back, so a reading
+  /** One usage request. Asking is not use: the idle clock of a process that was idle is put back, so a reading
    * never keeps a process alive. Only the CLI's own "Unsupported control request subtype" answer is remembered
    * for the process; any other failure may be asked again. */
   private async askUsage(worker: ClaudeWorker, request: string, timeoutMs: number): Promise<Record<string, unknown>> {
-    const idleSince = worker.lastActivityAt;
+    const idleSince = worker.lastActivityAt, wasIdle = this.usageIdle(worker);
     try { return await worker.control.request(request, {}, Math.max(1, timeoutMs)); }
     catch (error) {
       const entry = this.quotaWorkers.get(worker);
       if (entry && error instanceof ClaudeControlError && error.kind === "rejected" && /unsupported control request/i.test(error.message)) (entry.unasked ??= new Set()).add(request);
       throw error;
-    } finally { if (this.usageIdle(worker)) worker.lastActivityAt = idleSince; }
+    } finally { if (wasIdle && this.usageIdle(worker)) worker.lastActivityAt = idleSince; }
   }
 
   /** Claude's own `/context` accounting for this conversation's running process: asked while it is idle, and
@@ -1303,39 +1308,38 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     return { ...usage };
   }
 
-  /** The idle process that worked last and has not refused `get_usage`, started under the login `credentialRevision`. */
+  /** The process to ask for `get_usage`, among those started under the login `credentialRevision` that have not
+   * refused it: the idle one that worked last, or, when every process is on a turn, the busy one that worked
+   * last. Claude Code answers this request during a turn, and a Bot on a long turn has no other moment. */
   private usageWorker(credentialRevision: string): ClaudeWorker | undefined {
-    let latest: ClaudeWorker | undefined;
-    for (const worker of this.workers.values()) {
-      if (!this.usageAskable(worker, "get_usage") || this.quotaWorkers.get(worker)?.credentialRevision !== credentialRevision) continue;
-      if (!latest || worker.lastActivityAt > latest.lastActivityAt) latest = worker;
-    }
-    return latest;
-  }
-  /** The newest answer any running process of this Bot started under the login `credentialRevision` has given, with that process's model. */
-  private newestUsage(credentialRevision: string): { usage: QuotaSnapshot; model?: string } | undefined {
-    let newest: { usage: QuotaSnapshot; model?: string } | undefined;
+    let idle: ClaudeWorker | undefined, busy: ClaudeWorker | undefined;
     for (const worker of new Set(this.workers.values())) {
-      const entry = worker.retired ? undefined : this.quotaWorkers.get(worker);
-      if (entry?.credentialRevision !== credentialRevision) continue;
-      if (entry?.usage?.observedAt && (!newest || entry.usage.observedAt > newest.usage.observedAt!)) newest = { usage: entry.usage, model: entry.model };
+      const entry = this.quotaWorkers.get(worker);
+      if (worker.retired || !entry || entry.unasked?.has("get_usage") || entry.credentialRevision !== credentialRevision) continue;
+      if (this.usageIdle(worker)) { if (!idle || worker.lastActivityAt > idle.lastActivityAt) idle = worker; }
+      else if (!busy || worker.lastActivityAt > busy.lastActivityAt) busy = worker;
     }
-    return newest;
+    return idle ?? busy;
+  }
+  /** The Bot's newest `get_usage` answer given under the login `credentialRevision`, with the answering process's model. */
+  private newestUsage(credentialRevision: string): { usage: QuotaSnapshot; model?: string } | undefined {
+    const kept = this.keptUsage;
+    return kept?.usage?.observedAt && kept.credentialRevision === credentialRevision ? { usage: kept.usage, model: kept.model } : undefined;
   }
 
   /** Quota is read from a running engine of this Bot, so the answer is about the account that engine uses;
-   * where its login is kept (a file, the system keychain) does not matter. A reading stays on its process's
-   * record and is gone with it. Without a running engine only the earlier passive rules apply. */
+   * where its login is kept (a file, the system keychain) does not matter. The newest answer stays the Bot's
+   * reading while no process can give a newer one. With no answer yet and no running engine only the earlier
+   * passive rules apply; no process is started for a reading. */
   async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
     const scope = this.quotaScope();
     const passive = this.quotaCache.response(scope, options) ?? this.quotaCache.failure(scope, "no_passive_event");
     const running = !this.destroyPromise && [...this.workers.values()].some(worker => !worker.retired && this.quotaWorkers.has(worker) && !this.quotaWorkers.get(worker)!.unasked?.has("get_usage"));
-    // No process to ask (none is started for a reading), or the request itself is void.
-    if (!running || options.signal?.aborted || passive.snapshot.capability.mode === "unsupported"
+    // No process to ask (none is started for a reading) and no earlier answer, or the request itself is void.
+    if (!running && !this.newestUsage(scope.credentialRevision) || options.signal?.aborted || passive.snapshot.capability.mode === "unsupported"
       || options.expectedRevision && options.expectedRevision !== scope.revision) return passive;
     let failure: Parameters<typeof unavailableQuota>[1] | undefined;
-    // With every process busy on a turn nothing is asked now; the newest earlier answer stands.
-    const worker = options.refresh ? this.usageWorker(scope.credentialRevision) : undefined, entry = worker && this.quotaWorkers.get(worker);
+    const worker = options.refresh && running ? this.usageWorker(scope.credentialRevision) : undefined, entry = worker && this.quotaWorkers.get(worker);
     let after = scope;
     if (worker && entry) {
       let usage: QuotaSnapshot | undefined;
@@ -1348,9 +1352,9 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       // The login changed while the question was out: the answer cannot be told to be about the current one.
       after = this.quotaScope();
       if (after.credentialRevision !== scope.credentialRevision) return this.quotaCache.failure(after, "auth_changed");
-      // An API key, or a login without windows: answered for this call, and an earlier reading of this process no longer holds.
-      if (usage?.capability.mode === "unsupported") { entry.usage = undefined; return { revision: after.revision, snapshot: usage }; }
-      if (usage) entry.usage = usage;
+      // An API key, or a login without windows: answered for this call, and no earlier reading of the Bot holds any longer.
+      if (usage?.capability.mode === "unsupported") { entry.usage = undefined; this.keptUsage = undefined; return { revision: after.revision, snapshot: usage }; }
+      if (usage) { entry.usage = usage; this.keptUsage = entry; }
     }
     const now = Date.now(), active = { mode: "active" as const }, newest = this.newestUsage(scope.credentialRevision);
     const reading = newest ? claudeQuotaForModel(structuredClone(newest.usage), newest.model) : passive.snapshot.observedAt ? { ...passive.snapshot, capability: active } : undefined;
