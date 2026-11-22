@@ -47,12 +47,12 @@ export async function modelSettings(stateDir: string, engine: InstanceEngine, ac
         if (model) model = selected.id;
       }
       if (engine === "pi" && model && !decodePiModel(model)) throw new Error("model_id_invalid");
+      // A Pi model a complete catalog does not list is the problem, whatever effort it was asked with
+      // (an unlisted model's only effort is the native default, so "" alone would let it through).
+      // The saved model is shown even when no longer listed; keeping it is not choosing it.
+      if (engine === "pi" && model && model !== before.model && catalog.status === "ready" && !choices.some(choice => choice.id === model)) throw new Error("model_unavailable");
       const efforts = choices.find(choice => choice.id === model)?.efforts ?? modelEffortChoices(engine, model, choices);
-      if (!efforts.includes(effort)) {
-        // A Pi model a complete catalog does not list is the problem, not the effort it was asked with.
-        if (engine === "pi" && model && catalog.status === "ready" && !choices.some(choice => choice.id === model)) throw new Error("model_unavailable");
-        throw new Error("model_effort_incompatible");
-      }
+      if (!efforts.includes(effort)) throw new Error("model_effort_incompatible");
       if (model === before.model && effort === before.effort) return before;
       if (model) config.model = model; else delete config.model;
       if (effort) config.effort = effort; else delete config.effort;

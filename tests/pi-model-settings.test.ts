@@ -59,3 +59,13 @@ it("names an unknown Pi model as unavailable rather than as an effort mismatch",
   // A model the catalog lists keeps the precise effort error.
   expect(await modelSettings(root, "pi", 0, { revision: before.revision, model: models[1]!.id, effort: "high" })).toEqual({ ok: false, error: "model_effort_incompatible" });
 });
+
+it("refuses a Pi model a complete catalog does not list when it is asked with the native default effort", async () => {
+  const before = await read(), bytes = await readFile(path.join(root, "config.json"), "utf8");
+  expect(await modelSettings(root, "pi", 0, { revision: before.revision, model: "one/no-such-model", effort: "" })).toEqual({ ok: false, error: "model_unavailable" });
+  expect(await readFile(path.join(root, "config.json"), "utf8")).toBe(bytes);
+  // Without a complete catalog the choice cannot be checked, and following the native default stays possible.
+  discovery.mockResolvedValue({ status: "unavailable", models: [] });
+  const unavailable = await read();
+  expect(await modelSettings(root, "pi", 0, { revision: unavailable.revision, model: "one/no-such-model", effort: "" })).toMatchObject({ ok: true, settings: { model: "one/no-such-model", effort: "" } });
+});
