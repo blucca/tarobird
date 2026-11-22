@@ -364,6 +364,8 @@ type KimiWorker = {
   backgroundTasks: Map<string, KimiBackgroundTask>;
   backgroundContinuations: Map<string, KimiBackgroundContinuation>;
   backgroundContinuationWaiters: Set<KimiBackgroundContinuationWaiter>;
+  /** Prompt texts of queued prompts whose wait ended before their turn started: Kimi still runs them. */
+  abandonedQueuedPrompts: string[];
   detachedQuestions: Map<string, KimiDetachedQuestion>;
   detachedApprovalControllers: Map<string, KimiDetachedApproval>;
   terminalBackgroundTasks: Map<string, KimiTerminalBackgroundTask>;
@@ -2743,6 +2745,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       backgroundTasks: new Map(),
       backgroundContinuations: new Map(),
       backgroundContinuationWaiters: new Set(),
+      abandonedQueuedPrompts: [],
       detachedQuestions: new Map(),
       detachedApprovalControllers: new Map(),
       terminalBackgroundTasks: new Map(),
@@ -3735,6 +3738,9 @@ export class KimiAcpAdapter implements CodexAdapter {
       this.armKimiTurnWatch(worker);
       await this.waitForKimiTurnChange(pending, () => pending.kimiTurnTerminal !== undefined);
     } catch (error) {
+      // Kimi keeps the prompt queued and later starts a turn with the same text;
+      // that turn must not become the answer of a later message with that text.
+      if (pending.kimiTurnId === undefined) worker.abandonedQueuedPrompts.push(pending.promptText);
       await report("cancelled").catch(() => undefined);
       throw error;
     }
@@ -3816,7 +3822,10 @@ export class KimiAcpAdapter implements CodexAdapter {
     if (continuation) {
       continuation.lastSeenAt = Date.now();
     }
-    const pending = continuation ? null : worker.pendingTurn;
+    // Kimi forwards no ACP update for the turn that runs a queued prompt (its
+    // reply is read from the wire): an update now belongs to another turn,
+    // for example a review whose hold bound has passed.
+    const pending = continuation || worker.pendingTurn?.awaitingQueuedTurn ? null : worker.pendingTurn;
     // Replayed history arrives with neither a foreground turn nor a retained
     // task-origin continuation, so it remains ignored. Kimi 0.33 can start a
     // synthetic task-origin turn after the foreground ACP prompt has returned;
@@ -4085,24 +4094,39 @@ export class KimiAcpAdapter implements CodexAdapter {
     if (worker.removed || !this.backgroundContinuationTurnBusy(worker)) {
       return;
     }
-    const report = (status: "started" | "finished" | "cancelled") => this.emitEngineEvent(input.onEngineEvent, {
+    // No turn is registered yet, so a stop reaches this hold only here: a
+    // hung event delivery must not outlast it.
+    const signal = input.abortSignal;
+    let onAbort: (() => void) | undefined;
+    const stopped = new Promise<never>((_resolve, reject) => {
+      if (!signal) return;
+      onAbort = () => reject(new Error("Task was stopped by user"));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+    stopped.catch(() => undefined);
+    const report = (status: "started" | "finished" | "cancelled") => Promise.race([this.emitEngineEvent(input.onEngineEvent, {
       type: "background_review_wait",
       status,
       sessionId: worker.currentSessionId ?? undefined,
       engine: "kimi",
-    });
-    await report("started");
+    }), stopped]);
     try {
-      // Re-check after every wake-up: another review can start in the same
-      // relay batch that completed the previous one.
-      while (!worker.removed && this.backgroundContinuationTurnBusy(worker)) {
-        await this.waitForBackgroundContinuation(worker, input.abortSignal);
+      try {
+        await report("started");
+        // Re-check after every wake-up: another review can start in the same
+        // relay batch that completed the previous one.
+        while (!worker.removed && this.backgroundContinuationTurnBusy(worker)) {
+          await this.waitForBackgroundContinuation(worker, input.abortSignal);
+        }
+      } catch (error) {
+        await report("cancelled").catch(() => undefined);
+        throw error;
       }
-    } catch (error) {
-      await report("cancelled");
-      throw error;
+      await report(worker.removed ? "cancelled" : "finished");
+    } finally {
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
-    await report(worker.removed ? "cancelled" : "finished");
   }
 
   private async waitForBackgroundContinuation(worker: KimiWorker, abortSignal?: AbortSignal): Promise<void> {
@@ -4552,7 +4576,11 @@ export class KimiAcpAdapter implements CodexAdapter {
       this.endQueuedKimiTurn(queuedTurn, { status: "completed" });
     }
     if (event.originKind !== "task") {
-      const ownPrompt = Boolean(pending && pending.kimiTurnId === undefined
+      // Kimi runs its queue in order: the first turn with an abandoned prompt's
+      // text is that prompt's, even when a waiting message has the same text.
+      const abandoned = worker.abandonedQueuedPrompts.findIndex((text) => kimiPromptMatches(event.prompt, text));
+      if (abandoned >= 0) worker.abandonedQueuedPrompts.splice(abandoned, 1);
+      const ownPrompt = Boolean(abandoned < 0 && pending && pending.kimiTurnId === undefined
         && kimiPromptMatches(event.prompt, pending.promptText));
       this.clearIgnoredKimiHookTurn(worker);
       if (worker.activeHookTurn?.originKind === "task") {
