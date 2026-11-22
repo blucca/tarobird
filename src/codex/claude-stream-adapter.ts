@@ -1251,9 +1251,13 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   }
 
   private quotaScope() {
-    const source = this.quotaSource;
-    const active = source && !source.retired && [...this.workers.values()].includes(source);
-    return this.quotaCache.capture(this.destroyPromise ? "destroyed" : active ? String(this.quotaWorkers.get(source)?.id ?? "none") : "none");
+    const source = this.quotaSource, live = [...new Set(this.workers.values())].filter(worker => !worker.retired);
+    const active = source && live.includes(source);
+    // Without a passive source the readings are get_usage answers, which belong to the processes that gave them, and
+    // a login the CLI keeps in the system keychain changes no file here. The revision names the running processes,
+    // so the App does not keep a reading past them.
+    const running = live.map(worker => this.quotaWorkers.get(worker)?.id).filter(id => id !== undefined).sort((a, b) => a - b).join(",");
+    return this.quotaCache.capture(this.destroyPromise ? "destroyed" : active ? String(this.quotaWorkers.get(source)?.id ?? "none") : running ? `run:${running}` : "none");
   }
 
   /** Usage is asked only of a process that is not working on a turn. A question during a turn would count
@@ -1287,7 +1291,10 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     const last = () => entry.context && entry.context.sessionId === worker.currentSessionId ? { ...entry.context.usage } : null;
     if (!this.usageAskable(worker, "get_context_usage")) return last();
     let reply: Record<string, unknown>;
+    const asked = worker.currentSessionId;
     try { reply = await this.askUsage(worker, "get_context_usage", CLAUDE_CONTEXT_ACK_TIMEOUT_MS); } catch { return null; }
+    // A /clear or resume while the question was out: the answer is about the session before it.
+    if (worker.currentSessionId !== asked) return null;
     const count = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
     const used = count(reply.totalTokens), window = count(reply.maxTokens) ?? count(reply.rawMaxTokens), compact = count(reply.autoCompactThreshold);
     if (this.workers.get(sessionId) !== worker || used === undefined || !window) return null;
@@ -1296,20 +1303,21 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     return { ...usage };
   }
 
-  /** The idle process that worked last and has not refused `get_usage`. */
-  private usageWorker(): ClaudeWorker | undefined {
+  /** The idle process that worked last and has not refused `get_usage`, started under the login `credentialRevision`. */
+  private usageWorker(credentialRevision: string): ClaudeWorker | undefined {
     let latest: ClaudeWorker | undefined;
     for (const worker of this.workers.values()) {
-      if (!this.usageAskable(worker, "get_usage")) continue;
+      if (!this.usageAskable(worker, "get_usage") || this.quotaWorkers.get(worker)?.credentialRevision !== credentialRevision) continue;
       if (!latest || worker.lastActivityAt > latest.lastActivityAt) latest = worker;
     }
     return latest;
   }
-  /** The newest answer any running process of this Bot has given, with that process's model. */
-  private newestUsage(): { usage: QuotaSnapshot; model?: string } | undefined {
+  /** The newest answer any running process of this Bot started under the login `credentialRevision` has given, with that process's model. */
+  private newestUsage(credentialRevision: string): { usage: QuotaSnapshot; model?: string } | undefined {
     let newest: { usage: QuotaSnapshot; model?: string } | undefined;
     for (const worker of new Set(this.workers.values())) {
       const entry = worker.retired ? undefined : this.quotaWorkers.get(worker);
+      if (entry?.credentialRevision !== credentialRevision) continue;
       if (entry?.usage?.observedAt && (!newest || entry.usage.observedAt > newest.usage.observedAt!)) newest = { usage: entry.usage, model: entry.model };
     }
     return newest;
@@ -1327,24 +1335,29 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       || options.expectedRevision && options.expectedRevision !== scope.revision) return passive;
     let failure: Parameters<typeof unavailableQuota>[1] | undefined;
     // With every process busy on a turn nothing is asked now; the newest earlier answer stands.
-    const worker = options.refresh ? this.usageWorker() : undefined, entry = worker && this.quotaWorkers.get(worker);
+    const worker = options.refresh ? this.usageWorker(scope.credentialRevision) : undefined, entry = worker && this.quotaWorkers.get(worker);
+    let after = scope;
     if (worker && entry) {
+      let usage: QuotaSnapshot | undefined;
       try {
-        const usage = parseClaudeUsage(await this.askUsage(worker, "get_usage", Math.min(options.timeoutMs ?? CLAUDE_USAGE_ACK_TIMEOUT_MS, CLAUDE_USAGE_ACK_TIMEOUT_MS)), Date.now());
-        // An API key, or a login without windows: answered for this call, and an earlier reading of this process no longer holds.
-        if (usage.capability.mode === "unsupported") { entry.usage = undefined; return { revision: scope.revision, snapshot: usage }; }
-        entry.usage = usage;
+        usage = parseClaudeUsage(await this.askUsage(worker, "get_usage", Math.min(options.timeoutMs ?? CLAUDE_USAGE_ACK_TIMEOUT_MS, CLAUDE_USAGE_ACK_TIMEOUT_MS)), Date.now());
       } catch (error) {
         if (entry.unasked?.has("get_usage")) return passive;
         failure = error instanceof QuotaReadError ? error.reason : error instanceof ClaudeControlError && error.kind === "timeout" ? "timeout" : "native_error";
       }
+      // The login changed while the question was out: the answer cannot be told to be about the current one.
+      after = this.quotaScope();
+      if (after.credentialRevision !== scope.credentialRevision) return this.quotaCache.failure(after, "auth_changed");
+      // An API key, or a login without windows: answered for this call, and an earlier reading of this process no longer holds.
+      if (usage?.capability.mode === "unsupported") { entry.usage = undefined; return { revision: after.revision, snapshot: usage }; }
+      if (usage) entry.usage = usage;
     }
-    const now = Date.now(), active = { mode: "active" as const }, newest = this.newestUsage();
+    const now = Date.now(), active = { mode: "active" as const }, newest = this.newestUsage(scope.credentialRevision);
     const reading = newest ? claudeQuotaForModel(structuredClone(newest.usage), newest.model) : passive.snapshot.observedAt ? { ...passive.snapshot, capability: active } : undefined;
-    if (!reading) return { revision: scope.revision, snapshot: { ...unavailableQuota("claude", failure ?? "not_loaded", now, scope.authMode), capability: active } };
+    if (!reading) return { revision: after.revision, snapshot: { ...unavailableQuota("claude", failure ?? "not_loaded", now, scope.authMode), capability: active } };
     if (failure) { reading.state = "stale"; reading.reason = failure; reading.lastAttemptAt = new Date(now).toISOString(); }
     else if (reading.state === "ready" && reading.observedAt && now - Date.parse(reading.observedAt) >= QUOTA_TTL_MS) reading.state = "stale";
-    return { revision: scope.revision, snapshot: reading };
+    return { revision: after.revision, snapshot: reading };
   }
 
   private observeAccountQuota(worker: ClaudeWorker, message: unknown): void {

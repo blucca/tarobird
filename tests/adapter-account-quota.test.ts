@@ -121,6 +121,14 @@ it("Claude passive events of a verified login still count with a CLI that refuse
 const future = (hours: number) => new Date(Date.now() + hours * 3_600_000).toISOString();
 const usageReply = () => ({ session: {}, subscription_type: "max", rate_limits_available: true, behaviors: {},
   rate_limits: { five_hour: { utilization: 12, resets_at: future(3) }, seven_day: { utilization: 61.5, resets_at: future(90) }, seven_day_opus: null } });
+/** Holds the next control request's answer until the returned function sends it. */
+function holdControls(child: Child) {
+  let pending: string | undefined;
+  child.stdin.write = ((line: string, callback?: (error?: Error | null) => void) => {
+    const request = JSON.parse(line); child.controls.push(String(request.request?.subtype)); pending = request.request_id; callback?.(null); return true;
+  }) as typeof child.stdin.write;
+  return (response: unknown) => child.event({ type: "control_response", response: { subtype: "success", request_id: pending, response } });
+}
 async function claudeFixture() {
   const f = await fixture(), child = new Child(), spawn = vi.fn(() => child);
   // No credential file and no token in the environment: the login is wherever the CLI keeps it.
@@ -239,6 +247,46 @@ describe("Claude quota from the Bot's own running engine", () => {
     const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = { rate_limits_available: true, rate_limits: { five_hour: { utilization: "12" } } }; await start();
     expect((await adapter.getAccountQuota({ refresh: true })).snapshot).toMatchObject({ reason: "invalid_response", pools: [] });
   });
+  it("returns no reading when the login changes while get_usage is out, and keeps none", async () => {
+    const { f, adapter, child, start } = await claudeFixture();
+    const credentials = path.join(f.home, ".claude", ".credentials.json");
+    await mkdir(path.dirname(credentials), { recursive: true });
+    await writeFile(credentials, JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-a" } }));
+    await start();
+    const answer = holdControls(child);
+    const listed = await adapter.getAccountQuota({ refresh: false });
+    const read = adapter.getAccountQuota({ refresh: true, expectedRevision: listed.revision });
+    await vi.waitFor(() => expect(child.controls).toEqual(["get_usage"]));
+    await writeFile(credentials, JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-b" } }));
+    answer(usageReply());
+    const result = await read;
+    expect(result.revision).not.toBe(listed.revision);
+    expect(result.snapshot).toMatchObject({ reason: "auth_changed", pools: [] });
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools).toEqual([]);
+  });
+  it("names the running processes in the revision, so a reading does not outlive its process in the App", async () => {
+    const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply();
+    const worker = await start();
+    const listed = await adapter.getAccountQuota({ refresh: false });
+    const read = await adapter.getAccountQuota({ refresh: true, expectedRevision: listed.revision });
+    expect(read.revision).toBe(listed.revision); expect(read.snapshot.state).toBe("ready");
+    worker.retired = true;
+    expect((await adapter.getAccountQuota({ refresh: false })).revision).not.toBe(read.revision);
+    const next = await (adapter as any).getOrCreateWorker("tarobot-other", null, null, "normal", undefined);
+    const again = await adapter.getAccountQuota({ refresh: false });
+    expect(again.revision).not.toBe(read.revision); expect(again.snapshot.pools).toEqual([]);
+    expect(next.retired).toBeFalsy();
+  });
+  it("does not attribute a process started under another login to the current one", async () => {
+    const { f, adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply();
+    await start();
+    await adapter.getAccountQuota({ refresh: true });
+    await mkdir(path.join(f.home, ".claude"), { recursive: true });
+    await writeFile(path.join(f.home, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-b" } }));
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools).toEqual([]);
+    expect((await adapter.getAccountQuota({ refresh: true })).snapshot.pools).toEqual([]);
+    expect(child.controls).toEqual(["get_usage"]);
+  });
   it("answers no reading for another revision or a cancelled read, without asking", async () => {
     const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); await start();
     expect((await adapter.getAccountQuota({ refresh: true, expectedRevision: "other" })).snapshot).toMatchObject({ reason: "auth_changed", pools: [] });
@@ -267,6 +315,18 @@ describe("Claude context usage of one conversation", () => {
     worker.currentSessionId = "another-session";
     expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull();
     expect(child.controls).toEqual(["get_context_usage"]);
+  });
+  it("does not give a session the answer asked for the session before it", async () => {
+    const { adapter, child, start } = await claudeFixture(); const worker = await start();
+    worker.currentSessionId = "first-session";
+    const answer = holdControls(child);
+    const read = adapter.getContextUsage("tarobot-fixture");
+    await vi.waitFor(() => expect(child.controls).toEqual(["get_context_usage"]));
+    worker.currentSessionId = "second-session";
+    answer(context);
+    expect(await read).toBeNull();
+    worker.nativeTurnOpen = true;
+    expect(await adapter.getContextUsage("tarobot-fixture")).toBeNull();
   });
   it("has no reading without a running process, and starts none", async () => {
     const { adapter, child, spawn, start } = await claudeFixture(); child.answers.get_context_usage = context;
