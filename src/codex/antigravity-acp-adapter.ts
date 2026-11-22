@@ -179,6 +179,8 @@ type Worker = {
   /** Created with session/new: the Host learns the native id from the first turn. */
   announceSession: boolean;
   turn: Turn | null;
+  /** A turn is being prepared (session config) and will start next. */
+  reserved: boolean;
   /** The latest turn's event handler; idle wake-ups without an owner report through it. */
   lastTurnHandler?: CodexUserMessageInput["onEngineEvent"];
   wake: Wake | null;
@@ -571,9 +573,13 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const workspace = path.resolve(input.workspaceOverride ?? this.options.workspacePath);
     const launchKey = JSON.stringify({ workspace, flags: permissionFlags(config.approvalMode) });
     const worker = await this.getOrCreateWorker(sessionId, workspace, launchKey, config.approvalMode);
-    if (worker.turn) throw new Error("Antigravity session already has an in-flight turn");
-    await this.applySessionConfig(worker, config);
-    if (worker.turn) throw new Error("Antigravity session already has an in-flight turn");
+    if (worker.turn || worker.reserved) throw new Error("Antigravity session already has an in-flight turn");
+    worker.reserved = true;
+    try {
+      await this.applySessionConfig(worker, config);
+    } finally {
+      worker.reserved = false;
+    }
     if (worker.removed) throw worker.failure ?? new Error("Antigravity ACP worker is no longer available");
     return await this.runTurn(worker, prompt, input);
   }
@@ -583,7 +589,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const existing = this.liveWorker(sessionId);
     if (existing) {
       if (existing.launchKey === launchKey && !existing.closing) return existing;
-      if (existing.turn) throw new Error("Cannot reconfigure Antigravity session while a turn is in flight");
+      if (existing.turn || existing.reserved) throw new Error("Cannot reconfigure Antigravity session while a turn is in flight");
       sessionId = existing.sessionId ?? sessionId;
       await this.closeWorker(existing);
     }
@@ -616,7 +622,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       .onNotification(acpMethods.client.session.update, ({ params }) => { this.handleUpdate(worker, params); })
       .connect(stream);
     worker = {
-      child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, wake: null, promptSeq: 0,
+      child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, reserved: false, wake: null, promptSeq: 0,
       tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), removed: false, exited: false,
     };
     this.workers.set(requestedId, worker);
@@ -1094,7 +1100,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private reapIdleWorkers(): void {
     const now = Date.now();
     for (const worker of new Set(this.workers.values())) {
-      if (worker.removed || worker.turn || now - worker.lastActivityAt < this.idleWorkerTtlMs) continue;
+      if (worker.removed || worker.turn || worker.reserved || now - worker.lastActivityAt < this.idleWorkerTtlMs) continue;
       if (!this.isReapable(worker)) continue;
       void this.closeWorker(worker);
     }
