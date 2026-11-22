@@ -4,7 +4,7 @@ import { ENGINE_SETTINGS_REPAIR_HINT } from "../../src/client-protocol/engine-se
 import { deepSeekDefaultUnavailable } from "../../src/client-protocol/model.js";
 import { EngineSettings } from "./EngineSettings.js";
 import { PermissionSelect } from "./PermissionSelect.js";
-import type { PermissionChoice } from "../../src/state/permission-options.js";
+import { permissionOptions, type PermissionChoice } from "../../src/state/permission-options.js";
 import { useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import { Bot as BotIcon, LoaderCircle, SquareTerminal } from "lucide-react";
 import type { BotCatalog, CreateBotInput } from "../../src/client-protocol/bots.js";
@@ -42,6 +42,9 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
   const loadedCatalog = useRef<{ connection: HubConnection; attempt: number }>(undefined);
   const pathsReason = useId();
   const options = catalog?.engines.find((e) => e.id === engine);
+  // The catalog describes the runtime a new ordinary Bot gets; an Antigravity dispatcher always runs print.
+  const permissions = options?.permissions && engine === "antigravity" && dispatcher && dispatcherAvailable
+    ? { ...options.permissions, choices: permissionOptions("antigravity") } : options?.permissions;
   const models = modelOptions(engine, options?.models ?? []), selectedModel = selectedModelOption(models, model);
   const displayedEffort = selectedModelEffort(selectedModel, { model, effort }), levels = selectedModel?.efforts ?? [""];
   // Following a DSH default that does not exist is known to be refused; keep the choice, ask for a model.
@@ -133,7 +136,7 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
         <p id={`${cliHelp}-dispatcher`} className="new-bot-hint">{t("你只说目标，它会拆分任务，并调用这台主机上已安装的 CLI 去做。只能在创建时选择。")}<strong className="new-bot-role-advice">{t("刚开始建议先建普通 Bot，这里不勾选。")}</strong></p>
         {dispatcher && <div className="new-bot-role-details"><p className="new-bot-hint">{t("不需要另外建 Bot；过程不占对话列表，只在需要你决定或验收时提醒你。")}</p><p className="new-bot-hint">{t("上面的引擎、模型和推理强度是它自己思考用的；派出去的每张工单可以各自选择。")}</p><details><summary>{t("幕僚长设置")}</summary><DispatcherSettingsFields value={dispatch} change={setDispatch} engines={targets} loading={!catalog}/></details></div>}
       </div>}
-      {options?.permissions && <PermissionSelect value={permission} choices={options.permissions.choices} defaultChoice={options.permissions.defaultChoice} change={setPermission}/>}
+      {permissions && <PermissionSelect value={permission} choices={permissions.choices} defaultChoice={permissions.defaultChoice} change={setPermission}/>}
     </div>}
     <details><summary>{t("高级设置")}</summary><label>{t("工作区（可选）")}<input value={workspace} placeholder={t("留空，自动创建独立工作区")} onChange={(e) => setWorkspace(e.target.value)} onBlur={() => { if ((engine === "pi" || engine === "deepseek") && !pending.current) reloadCatalog(); }}/></label><p className="new-bot-hint">{t("填写运行 Bot 的主机上的文件夹路径；主机在 VPS 时，请填写 VPS 路径。")}</p></details></fieldset>
     <div className="new-bot-footer">
