@@ -33,7 +33,7 @@
   "继续清理": "Continue clearing",
   "清理记录": "Clear history",
   "等待 Claude 读入": "Waiting for Claude to read input",
-  "等待 Kimi 读入": "Waiting for Kimi to read input",
+  "等待 Kimi 处理这条消息": "Waiting for Kimi to handle this message",
   "停止等待": "Stop waiting",
   "停止等待只结束这里的等待：Kimi 仍会执行这条消息，它的回复不会显示在这里。": "Stopping only ends the wait here: Kimi will still run this message, and its reply will not appear here.",
   "返回配置": "Back to configuration",

@@ -245,7 +245,7 @@ it("names Kimi in its native queue and background-review waits instead of Claude
   recordRunEvent(record, { type: "native_input_wait", status: "started", engine: "kimi" }, 1000);
   const queued = summarizeRun(record, "running");
   expect(queued).toMatchObject({ phase: "working", count: 0, current: { name: "native_input_wait", status: "waiting" } });
-  expect(runEntryTitle(queued.current!)).toBe("等待 Kimi 读入");
+  expect(runEntryTitle(queued.current!)).toBe("等待 Kimi 处理这条消息");
   recordRunEvent(record, { type: "native_input_wait", status: "finished", engine: "kimi" }, 2000);
   expect(summarizeRun(record, "running").current).toBeUndefined();
   recordRunEvent(record, { type: "background_review_wait", status: "started", engine: "kimi" }, 3000);

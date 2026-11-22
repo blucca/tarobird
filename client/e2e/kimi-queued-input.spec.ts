@@ -17,8 +17,8 @@ import { enterMobileChat, mobileHome } from "./fixtures/mobile.js";
 // scripted bridge emitting the adapter's wait events. Screenshots record App
 // behavior, not a live Kimi run.
 const copy = {
-  zh: { hold: "等待后台结果处理", holdNotice: "Kimi 正在处理上一项后台结果，本条消息尚未交给模型。", queued: "等待 Kimi 读入", queueNotice: "停止等待只结束这里的等待：Kimi 仍会执行这条消息，它的回复不会显示在这里。", stopQueued: "停止等待", cancel: "取消等待", pair: "配对此设备", code: "配对码" },
-  en: { hold: "Waiting for background result review", holdNotice: "Kimi is reviewing an earlier background result. This message has not reached the model.", queued: "Waiting for Kimi to read input", queueNotice: "Stopping only ends the wait here: Kimi will still run this message, and its reply will not appear here.", stopQueued: "Stop waiting", cancel: "Cancel wait", pair: "Pair this device", code: "Pairing code" },
+  zh: { hold: "等待后台结果处理", holdNotice: "Kimi 正在处理上一项后台结果，本条消息尚未交给模型。", queued: "等待 Kimi 处理这条消息", queueNotice: "停止等待只结束这里的等待：Kimi 仍会执行这条消息，它的回复不会显示在这里。", stopQueued: "停止等待", cancel: "取消等待", pair: "配对此设备", code: "配对码" },
+  en: { hold: "Waiting for background result review", holdNotice: "Kimi is reviewing an earlier background result. This message has not reached the model.", queued: "Waiting for Kimi to handle this message", queueNotice: "Stopping only ends the wait here: Kimi will still run this message, and its reply will not appear here.", stopQueued: "Stop waiting", cancel: "Cancel wait", pair: "Pair this device", code: "Pairing code" },
 };
 
 async function openChat(browser: Browser, hub: HubServer, phone: boolean, english: boolean, title: string) {

@@ -107,7 +107,7 @@ export function runEntryTitle(entry: RunEntry): string {
     return title + (typeof label === "string" && label ? ` · ${label.split("/").filter(Boolean).at(-1)}` : "");
   }
   if (entry.kind === "text" && entry.name === "background_review_wait") return t("等待后台结果处理");
-  if (entry.kind === "text" && entry.name === "native_input_wait") return runWaitEngine(entry) === "kimi" ? t("等待 Kimi 读入") : t("等待 Claude 读入");
+  if (entry.kind === "text" && entry.name === "native_input_wait") return runWaitEngine(entry) === "kimi" ? t("等待 Kimi 处理这条消息") : t("等待 Claude 读入");
   if (entry.kind === "text" && entry.name === "context_compaction") return entry.status === "running" ? t("正在压缩上下文") : t("压缩上下文");
   if (entry.kind === "text" && entry.name === "context_checkpoint") return entry.status === "running" ? t("正在整理上下文摘要") : t("整理上下文摘要");
   if (entry.kind === "text" && entry.name === "background_task_started") return t("后台任务已启动");

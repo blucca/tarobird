@@ -3592,6 +3592,44 @@ describe("KimiAcpAdapter", () => {
       }
     });
 
+    it("stops holding a user prompt when its worker is removed while the hold is being announced", async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-hold-removed-test-"));
+      const harness = createHarness();
+      const taskEvents: EngineStreamEvent[] = [];
+      const adapter = new KimiAcpAdapter("kimi", { ...adapterOptions(harness), engineHomePath: root, hookTerminalGraceMs: 0, hookRelayEnabled: true });
+      try {
+        await reviewTwoTasks(harness, adapter, taskEvents);
+        // The same state as the hold above: a long task-origin turn that Kimi runs and the adapter ignores.
+        await postKimiHook(harness, { hook_event_name: "TurnStarted", turn_id: "19", origin_kind: "task", prompt: taskNotification("bash-steered-a") });
+        await postKimiHook(harness, { hook_event_name: "TurnStarted", turn_id: "20", origin_kind: "task", prompt: taskNotification("bash-steered-b") });
+        await writeKimiWire(root, [
+          { type: "turn.prompt", turnId: 19, origin: { kind: "task", taskId: "bash-steered-a" }, input: [{ type: "text", text: taskNotification("bash-steered-a") }], time: 1 },
+          { type: "turn.ended", turnId: 19, reason: "completed", durationMs: 0, stopReason: "prompt_only", time: 2 },
+          { type: "turn.prompt", turnId: 20, origin: { kind: "task", taskId: "bash-steered-b" }, input: [{ type: "text", text: taskNotification("bash-steered-b") }], time: 3 },
+        ]);
+        let announced = false;
+        const held = adapter.sendUserMessage("kimi-session-1", {
+          text: "what is the status?",
+          files: [],
+          // The worker is removed (as a failure, a replacement or the idle sweep does) after the
+          // hold was announced and before its waiter exists, so nothing is there to be rejected.
+          onEngineEvent: (event) => {
+            if (event.type !== "background_review_wait" || event.status !== "started") return;
+            announced = true;
+            const internals = adapter as unknown as { workers: Map<string, unknown>; removeWorker(worker: unknown): void };
+            internals.removeWorker([...internals.workers.values()][0]);
+          },
+        });
+        await settleWithin(held, 2_000).then(() => undefined, (error: unknown) => {
+          expect(String(error)).not.toContain("did not settle in time");
+        });
+        expect(announced).toBe(true);
+      } finally {
+        await adapter.destroy();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
     it("releases a held prompt when the wire shows a prompt_only task turn ended without a Stop hook", async () => {
       const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-prompt-only-release-test-"));
       const harness = createHarness();
@@ -3696,11 +3734,10 @@ describe("KimiAcpAdapter", () => {
         await new Promise((resolve) => setTimeout(resolve, 120));
         expect(settled).toBe(false);
         expect(probe.events).toContainEqual(expect.objectContaining({ type: "native_input_wait", status: "started" }));
-        expect(runEntryTitle(summarizeRun(probe.record, "running").current!)).toBe("等待 Kimi 读入");
+        expect(runEntryTitle(summarizeRun(probe.record, "running").current!)).toBe("等待 Kimi 处理这条消息");
         expect(probe.events).not.toContainEqual(expect.objectContaining({ type: "result" }));
 
         await postKimiHook(harness, { hook_event_name: "TurnStarted", turn_id: "21", origin_kind: "user", prompt: sentPrompt });
-        await waitFor(() => probe.events.some((event) => event.type === "native_input_wait" && event.status === "finished"));
         // The queued turn has no ACP driver; its reply is recorded in the wire.
         await writeKimiWire(root, [
           { type: "turn.prompt", turnId: 21, origin: { kind: "user" }, promptId: "msg_queued_1", input: [{ type: "text", text: sentPrompt }], time: 1 },
@@ -3715,6 +3752,94 @@ describe("KimiAcpAdapter", () => {
         await expect(settleWithin(turn, 2_000)).resolves.toMatchObject({ text: "The review found two fixed issues." });
         expect(probe.events).toContainEqual(expect.objectContaining({ type: "result", text: "The review found two fixed issues." }));
         expect(probe.events).not.toContainEqual(expect.objectContaining({ text: "Kimi completed the request." }));
+      } finally {
+        await adapter.destroy();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    /** A prompt that Kimi queued: the ACP request returned empty and the queue receipt arrived. */
+    async function queuedPrompt(root: string, sessionKey: string, promptId: string) {
+      const harness = createHarness();
+      const probe = nativeRunProbe();
+      const adapter = new KimiAcpAdapter("kimi", { ...adapterOptions(harness), engineHomePath: root, hookTerminalGraceMs: 0, hookRelayEnabled: true });
+      let settled = false;
+      const turn = adapter.sendUserMessage(sessionKey, { text: "summarize the review", files: [], onEngineEvent: probe.onEngineEvent });
+      void turn.then(() => { settled = true; }, () => { settled = true; });
+      await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+      const server = harness.children[0].server;
+      const sentPrompt = promptText(server);
+      server.respondPrompt({ stopReason: "end_turn" }, { processed: false });
+      await postKimiHook(harness, { hook_event_name: "UserPromptQueued", prompt_id: promptId, prompt: [{ type: "text", text: sentPrompt }], queue_length: 1 });
+      await waitFor(() => probe.events.some((event) => event.type === "native_input_wait" && event.status === "started"));
+      return { harness, probe, adapter, turn, sentPrompt, isSettled: () => settled };
+    }
+
+    it("keeps the wait open while Kimi runs the queued prompt, because that turn cannot be stopped from here", async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-queued-running-test-"));
+      const { harness, probe, adapter, turn, sentPrompt } = await queuedPrompt(root, "telegram-queued-running", "msg_queued_run");
+      try {
+        await postKimiHook(harness, { hook_event_name: "TurnStarted", turn_id: "31", origin_kind: "user", prompt: sentPrompt });
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        // Kimi is answering now. ACP still cannot stop that turn, so the App keeps the honest control and notice.
+        expect(probe.events).not.toContainEqual(expect.objectContaining({ type: "native_input_wait", status: "finished" }));
+        const running = summarizeRun(probe.record, "running").current!;
+        expect(running).toMatchObject({ name: "native_input_wait", status: "waiting" });
+        expect(runEntryTitle(running)).toBe("等待 Kimi 处理这条消息");
+        await writeKimiWire(root, [
+          { type: "turn.prompt", turnId: 31, origin: { kind: "user" }, promptId: "msg_queued_run", input: [{ type: "text", text: sentPrompt }], time: 1 },
+          { type: "context.append_loop_event", event: { type: "content.part", turnId: "31", step: 1, part: { type: "text", text: "Done." } }, time: 2 },
+          { type: "context.append_loop_event", event: { type: "step.end", turnId: "31", step: 1, finishReason: "end_turn" }, time: 3 },
+          { type: "turn.ended", turnId: 31, reason: "completed", time: 4 },
+        ]);
+        await postKimiHook(harness, { hook_event_name: "Stop", turn_id: "31", stop_hook_active: false });
+        await expect(settleWithin(turn, 2_000)).resolves.toMatchObject({ text: "Done." });
+        expect(probe.events).toContainEqual(expect.objectContaining({ type: "native_input_wait", status: "finished" }));
+      } finally {
+        await adapter.destroy();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it("returns what Kimi wrote before its last tool when the queued turn ends on a tool step", async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-queued-tool-end-test-"));
+      const { harness, probe, adapter, turn, sentPrompt } = await queuedPrompt(root, "telegram-queued-tool-end", "msg_queued_tool");
+      try {
+        await postKimiHook(harness, { hook_event_name: "TurnStarted", turn_id: "32", origin_kind: "user", prompt: sentPrompt });
+        // A task notification steered into the turn makes Kimi end it right after a tool step.
+        await writeKimiWire(root, [
+          { type: "turn.prompt", turnId: 32, origin: { kind: "user" }, promptId: "msg_queued_tool", input: [{ type: "text", text: sentPrompt }], time: 1 },
+          { type: "context.append_loop_event", event: { type: "content.part", turnId: "32", step: 1, part: { type: "text", text: "The review found two fixed issues." } }, time: 2 },
+          { type: "context.append_loop_event", event: { type: "tool.call", turnId: "32", step: 1, toolCallId: "call_1", name: "Bash" }, time: 3 },
+          { type: "context.append_loop_event", event: { type: "step.end", turnId: "32", step: 1, finishReason: "tool_use" }, time: 4 },
+          { type: "turn.ended", turnId: 32, reason: "completed", time: 5 },
+        ]);
+        await postKimiHook(harness, { hook_event_name: "Stop", turn_id: "32", stop_hook_active: false });
+        await expect(settleWithin(turn, 2_000)).resolves.toMatchObject({ text: "The review found two fixed issues." });
+        expect(probe.events).not.toContainEqual(expect.objectContaining({ text: "Kimi completed the request." }));
+      } finally {
+        await adapter.destroy();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it("finds the queued prompt's turn in the wire by its prompt id when the TurnStarted hook is lost", async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "kimi-acp-queued-lost-hook-test-"));
+      const { probe, adapter, turn, sentPrompt, isSettled } = await queuedPrompt(root, "telegram-queued-lost-hook", "msg_queued_lost");
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        expect(isSettled()).toBe(false);
+        // No TurnStarted and no Stop hook ever arrive; only Kimi's own record shows the turn.
+        await writeKimiWire(root, [
+          { type: "turn.prompt", turnId: 33, origin: { kind: "user" }, promptId: "another_prompt", input: [{ type: "text", text: "something else" }], time: 1 },
+          { type: "turn.ended", turnId: 33, reason: "completed", time: 2 },
+          { type: "turn.prompt", turnId: 34, origin: { kind: "user" }, promptId: "msg_queued_lost", input: [{ type: "text", text: sentPrompt }], time: 3 },
+          { type: "context.append_loop_event", event: { type: "content.part", turnId: "34", step: 1, part: { type: "text", text: "Found through the record." } }, time: 4 },
+          { type: "context.append_loop_event", event: { type: "step.end", turnId: "34", step: 1, finishReason: "end_turn" }, time: 5 },
+          { type: "turn.ended", turnId: 34, reason: "completed", time: 6 },
+        ]);
+        await expect(settleWithin(turn, 3_000)).resolves.toMatchObject({ text: "Found through the record." });
+        expect(probe.events).toContainEqual(expect.objectContaining({ type: "native_input_wait", status: "finished" }));
       } finally {
         await adapter.destroy();
         await rm(root, { recursive: true, force: true });
