@@ -43,8 +43,11 @@ renderer accepts up to 120.
 (`screenH264Codec`: 4.0, or 5.1 above 1080p-class), the same string viewers
 were always given. The encoder is configured with the level its size needs at
 that rate (`screenH264EncoderCodec`): 1080p-class is 4.0 up to 30, 4.2 at 60
-and 5.1 at 120; `sharp` at 60 is 5.2. Decoders follow the level in the
-bitstream.
+and 5.1 at 120; `smooth` (1280×800-class) is 4.2 at 120; `sharp` at 60 is 5.2
+above about 2560×1600 (5.1 at 2560×1440). The encoder takes the first rate of
+the ladder its `isConfigSupported` accepts, whatever the display repaints at.
+Decoders are expected to follow the level in the bitstream; that was measured
+only for Chromium on a Mac (below).
 
 **Cadence.** Encodes follow a schedule of slots one interval apart. A frame may
 be encoded up to a quarter interval before its slot, so ordinary source jitter
