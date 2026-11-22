@@ -42,12 +42,16 @@ function jsonRecord(text: string): Record<string, unknown> {
 export class AdapterQuotaCache {
   readonly proofKey = randomBytes(32);
   private cached?: { revision: string; snapshot: QuotaSnapshot; proof?: QuotaAccountProof };
-  constructor(private readonly engine: "codex" | "claude", private readonly executable: string, private readonly env: NodeJS.ProcessEnv, private readonly cwd?: string, private readonly configPath?: string) {}
+  constructor(private readonly engine: "codex" | "claude" | "antigravity", private readonly executable: string, private readonly env: NodeJS.ProcessEnv, private readonly cwd?: string, private readonly configPath?: string) {}
 
   capture(workerGeneration: string): AdapterQuotaScope {
     const digest = (value: unknown) => createHmac("sha256", this.proofKey).update(JSON.stringify(value)).digest("hex");
     const home = this.env.HOME || this.env.USERPROFILE || homedir();
-    const engineHome = this.engine === "codex" ? this.env.CODEX_HOME || path.join(home, ".codex") : this.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude");
+    const engineHome = this.engine === "codex"
+      ? this.env.CODEX_HOME || path.join(home, ".codex")
+      : this.engine === "claude"
+        ? this.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude")
+        : path.join(home, ".gemini", "antigravity-cli");
     let authMode: QuotaAuthMode = "unknown", verifiable = false;
     let material: unknown;
     try {
@@ -64,7 +68,7 @@ export class AdapterQuotaCache {
         const opaque = /cli_auth_credentials_store\s*=\s*["'](?:keyring|auto)["']|(?:auth_command|credential_helper|include)\s*=/.test(`${config}\n${project}`);
         verifiable = !opaque && authMode !== "unknown";
         material = [this.executable, engineHome, configured, config, project, authText, env];
-      } else {
+      } else if (this.engine === "claude") {
         const authText = readBounded(path.join(engineHome, ".credentials.json"));
         const settings = readBounded(path.join(engineHome, "settings.json"));
         const project = this.cwd ? readBounded(path.join(this.cwd, ".claude", "settings.json")) + readBounded(path.join(this.cwd, ".claude", "settings.local.json")) : "";
@@ -77,6 +81,23 @@ export class AdapterQuotaCache {
         // The macOS CLI may prefer Keychain over the plaintext file. Only an explicit env token proves that source here.
         verifiable = !opaque && authMode !== "unknown" && (process.platform !== "darwin" || Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN || this.env.ANTHROPIC_API_KEY || this.env.ANTHROPIC_AUTH_TOKEN) || cloud);
         material = [this.executable, engineHome, configured, settings, project, authText, env];
+      } else {
+        const geminiHome = path.join(home, ".gemini");
+        const settings = readBounded(path.join(engineHome, "settings.json"));
+        const onboardingText = readBounded(path.join(engineHome, "cache", "onboarding.json"));
+        const onboarding = jsonRecord(onboardingText);
+        const oauthCreds = readBounded(path.join(geminiHome, "oauth_creds.json"));
+        const googleAccounts = readBounded(path.join(geminiHome, "google_accounts.json"));
+        const env = Object.fromEntries(Object.entries(this.env).filter(([key]) => /^(GEMINI_|GOOGLE_|ANTIGRAVITY_|AGY_|CLOUDSDK_)/.test(key)));
+        const onboarded = onboarding.onboardingComplete === true
+          || onboarding.consumerOnboardingComplete === true
+          || onboarding.enterpriseOnboardingComplete === true;
+        authMode = onboarded || oauthCreds.trim().length > 0 ? "subscription"
+          : this.env.GEMINI_API_KEY ? "api_key"
+          : this.env.GOOGLE_APPLICATION_CREDENTIALS ? "adc"
+          : "unknown";
+        verifiable = authMode !== "unknown";
+        material = [this.executable, engineHome, configured, settings, onboardingText, oauthCreds, googleAccounts, env];
       }
     } catch {
       // A failed identity read invalidates the cache; it is never equivalent to an empty/default identity.
@@ -93,13 +114,15 @@ export class AdapterQuotaCache {
       this.cached = undefined;
       // Codex's public account/read can still answer one explicit read: it reports "not signed in"
       // natively, and the before/after identity check binds that single reading to one account.
+      // Antigravity is intentionally excluded here because `agy -p /usage` opens a browser OAuth
+      // tab when unauthenticated; missing local login state must never spawn `agy`.
       // store() never retains it, because later reads cannot prove the opaque source is unchanged.
       if (this.engine === "codex" && options.refresh) return undefined;
       return this.failure(scope, "scope_unverifiable");
     }
     if (scope.authMode !== "subscription") { this.cached = undefined; return { revision: scope.revision, snapshot: unavailableQuota(this.engine, "mode_not_supported", Date.now(), scope.authMode) }; }
     if (this.cached?.revision !== scope.revision) this.cached = undefined;
-    if (options.refresh && this.engine === "codex") return undefined;
+    if (options.refresh && (this.engine === "codex" || this.engine === "antigravity")) return undefined;
     if (!this.cached) return this.failure(scope, this.engine === "claude" ? "no_passive_event" : "not_loaded");
     const value = structuredClone(this.cached);
     if (value.snapshot.observedAt && Date.now() - Date.parse(value.snapshot.observedAt) >= QUOTA_TTL_MS) value.snapshot.state = "stale";

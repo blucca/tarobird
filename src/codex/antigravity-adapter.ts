@@ -13,9 +13,13 @@ import type {
   CodexAdapterResponse,
   CodexSessionHandle,
   CodexUserMessageInput,
+  EngineQuotaReadOptions,
+  EngineQuotaReadResult,
   EngineStreamEvent,
 } from "./adapter.js";
 import { EngineIncompleteResponseError } from "./adapter.js";
+import { AdapterQuotaCache } from "./adapter-account-quota.js";
+import { cancelOwnedAntigravityQuotaReads, readOwnedAntigravityQuota } from "./antigravity-account-quota.js";
 import { killProcessTree } from "./process-tree.js";
 import { appStopKillOptions } from "../runtime/turn-cancellation.js";
 import { renderPrivateTurnInstructions } from "./turn-instructions.js";
@@ -43,6 +47,7 @@ type ProcessChildLike = {
   };
   stdout?: ProcessStreamLike;
   stderr?: ProcessStreamLike;
+  kill?: (signal?: string) => void;
   once(event: "error", listener: (error: Error) => void): void;
   once(event: "close", listener: (code: number | null, signal?: NodeJS.Signals | null) => void): void;
 };
@@ -403,6 +408,7 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
   private readonly pendingWorkers = new Map<string, Promise<AntigravityWorker>>();
   private readonly nativeGoalSessions = new Set<string>();
   private readonly oneShotStops = new Set<(error: Error) => void>();
+  private readonly quotaCache: AdapterQuotaCache;
   private readonly idleSweepTimer: ReturnType<typeof setInterval> | undefined;
   private destroyPromise: Promise<void> | undefined;
   private destroyed = false;
@@ -433,10 +439,29 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
     this.spawnAntigravity = typeof childEnvOrSpawn === "function"
       ? childEnvOrSpawn
       : spawnAntigravityArg ?? (spawnEngine as unknown as SpawnAntigravity);
+    this.quotaCache = new AdapterQuotaCache("antigravity", antigravityExecutable, this.childEnv, workspacePath, configPath);
     if (this.idleWorkerTtlMs > 0 && idleSweepIntervalMs > 0) {
       this.idleSweepTimer = setInterval(() => this.reapIdleWorkers(), idleSweepIntervalMs);
       this.idleSweepTimer.unref?.();
     }
+  }
+
+  async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
+    const captureScope = () => this.quotaCache.capture("process");
+    const scope = captureScope();
+    if (this.destroyed) return this.quotaCache.failure(scope, "cancelled");
+    const cached = this.quotaCache.response(scope, options);
+    if (cached) return cached;
+    return readOwnedAntigravityQuota({
+      executable: this.antigravityExecutable,
+      cwd: this.workspacePath ?? process.cwd(),
+      env: this.childEnv,
+      spawn: this.spawnAntigravity,
+      cache: this.quotaCache,
+      scope,
+      options,
+      captureScope,
+    });
   }
 
   async createSession(chatId: number): Promise<CodexSessionHandle> {
@@ -1278,6 +1303,8 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
 
   private async destroyInternal(): Promise<void> {
     if (this.idleSweepTimer) clearInterval(this.idleSweepTimer);
+    await cancelOwnedAntigravityQuotaReads(this.quotaCache).catch(() => undefined);
+    this.quotaCache.invalidate();
     for (const stop of [...this.oneShotStops]) {
       stop(new Error("Adapter destroyed"));
     }

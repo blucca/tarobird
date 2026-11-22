@@ -204,3 +204,79 @@ export function applyClaudeQuotaEvent(previous: QuotaSnapshot | undefined, value
   delete snapshot.reason;
   return safeSnapshot(snapshot);
 }
+
+/** Antigravity CLI only guarantees local zero-turn `/usage --output-format json` from 1.1.11 onward. */
+export function isAntigravityQuotaSupportedVersion(versionOutput: string): boolean {
+  const match = versionOutput.trim().match(/\bv?(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]*)?\b/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch)) return false;
+  return major > 1 || (major === 1 && minor > 1) || (major === 1 && minor === 1 && patch >= 11);
+}
+
+const antigravityWindows: Record<string, { label: string; periodSeconds: number }> = {
+  "5h": { label: "5 hours", periodSeconds: 18000 },
+  weekly: { label: "7 days", periodSeconds: 604800 },
+};
+
+/** Parses `agy -p /usage --output-format json`. Requires `num_turns === 0` so a model turn is never accepted as quota. */
+export function parseAntigravityQuota(value: unknown, now = Date.now()): QuotaSnapshot {
+  const reply = quotaObject(value);
+  if (reply.num_turns !== 0 || reply.status !== "SUCCESS") throw new QuotaReadError("invalid_response");
+  const command = quotaObject(reply.command);
+  if (command.name !== "usage") throw new QuotaReadError("invalid_response");
+  const data = quotaObject(command.data);
+  if (!Array.isArray(data.groups) || data.groups.length > 64) throw new QuotaReadError("invalid_response");
+  const pools = data.groups.map((entry, index): QuotaPool => {
+    const group = quotaObject(entry);
+    const name = quotaNativeIdentity(group.name);
+    if (!name || name.length > 120) throw new QuotaReadError("invalid_response");
+    if (!Array.isArray(group.buckets) || group.buckets.length > 32) throw new QuotaReadError("invalid_response");
+    const windows: QuotaWindow[] = group.buckets.map((rawBucket, bucketIndex): QuotaWindow => {
+      const bucket = quotaObject(rawBucket);
+      const rawId = quotaNativeIdentity(bucket.id);
+      if (!rawId) throw new QuotaReadError("invalid_response");
+      const id = /^[a-zA-Z0-9_.:-]{1,128}$/.test(rawId) ? rawId : poolId(`${rawId}:${bucketIndex}`);
+      const windowKind = bucket.window == null ? undefined : quotaNativeIdentity(bucket.window);
+      const rawBucketName = bucket.name == null ? undefined : quotaNativeIdentity(bucket.name);
+      const known = windowKind && Object.hasOwn(antigravityWindows, windowKind) ? antigravityWindows[windowKind] : undefined;
+      const label = known?.label ?? (rawBucketName && rawBucketName.length <= 120 ? rawBucketName : `Window ${bucketIndex + 1}`);
+      const resetsAt = isoTime(bucket.reset_time);
+      const common = {
+        id,
+        label,
+        availability: "unknown" as const,
+        ...observed(now),
+        ...(known ? { periodSeconds: known.periodSeconds } : {}),
+        ...(resetsAt ? { resetsAt } : {}),
+      };
+      if (bucket.remaining_fraction == null) return { ...common, metric: "unknown" };
+      const remaining = number(bucket.remaining_fraction, 1);
+      const usedPercent = Math.round((1 - remaining) * 10000) / 100;
+      return { ...common, metric: "percent", usedPercent };
+    });
+    return {
+      id: poolId(`${name}:${index}`),
+      label: name,
+      sharing: "shared",
+      availability: "unknown",
+      windows,
+      balances: [],
+      constraints: [],
+    };
+  });
+  const hasData = pools.some(pool => pool.windows.length > 0);
+  return safeSnapshot({
+    authMode: "subscription",
+    capability: { mode: "active" },
+    state: hasData ? "ready" : "unknown",
+    availability: "unknown",
+    observedAt: new Date(now).toISOString(),
+    lastAttemptAt: new Date(now).toISOString(),
+    pools,
+    constraints: [],
+    help: "antigravity_usage",
+  });
+}
