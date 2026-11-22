@@ -97,3 +97,18 @@ for (const [reason, text] of [
   await expect(page.getByRole('alert')).not.toContainText('desktop_host_');
   await expect(page.getByLabel('主机名称', { exact:true })).toHaveValue('原主机');
 });
+
+test("a database from a newer version says to update the App instead of retrying", async ({ page }) => {
+  await page.evaluate(() => {
+    const fixture = (window as any).nativeTransportFixture;
+    fixture.mockIPC((command: string, args: any) => {
+      if (command === "desktop_host" && args.action === "status") return { available: true, running: false, hostName: "工作电脑" };
+      if (command === "desktop_host" && args.action === "start") return { available: true, running: false, hostEnabled: false, hostName: "工作电脑", startIssue: { code: "schema_incompatible", schema: 27, minHubSchema: 1, maxHubSchema: 26 } };
+      throw new Error("unexpected_native_request");
+    });
+    fixture.renderPairing();
+  });
+  await page.getByRole("button", { name: "将这台电脑设为主机", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("主机数据来自更新版本的 TaroBird");
+  await expect(page.getByRole("alert")).not.toContainText("请重试");
+});

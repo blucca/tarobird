@@ -10,11 +10,12 @@ import { deleteNativeIdentity, nativePlatform } from "./native.js";
 import { t } from "./i18n.js";
 import { hostNameSchema } from "../../src/client-protocol/host-profile.js";
 import { startupAttempt } from "./startup-diagnostics.js";
-import { localControllerMessage } from "./local-controller-message.js";
+import { localControllerMessage, localHostStartIssueMessage } from "./local-controller-message.js";
+import type { DesktopStartIssue } from "../../src/client-protocol/desktop-runtime.js";
 import type { LocalControllerIssue } from "./local-controller.js";
 import "./desktop-host.css";
 
-export type DesktopHostStatus = { available: boolean; running: boolean; url?: string; publicKey?: string; hostName?: string; directoryState?: string };
+export type DesktopHostStatus = { available: boolean; running: boolean; url?: string; publicKey?: string; hostName?: string; directoryState?: string; startIssue?: DesktopStartIssue };
 export function DesktopWelcome({ remote, connected, save, beforePair, discard, cancel, pending = false, localHostReady = false }: PairingProps & { remote: () => void; pending?: boolean; localHostReady?: boolean }) {
   const [joiningExisting, setJoiningExisting] = useState(false);
   const [busy, setBusy] = useState(false), [error, setError] = useState("");
@@ -35,6 +36,8 @@ export function DesktopWelcome({ remote, connected, save, beforePair, discard, c
     setJoiningExisting(joinExisting); setBusy(true); setError(""); let device: Identity | undefined;
     try {
       const host = await invoke<DesktopHostStatus>("desktop_host", { action: "start", device: { hostName: name.data } });
+      // A newer database is refused before any Hub starts; retrying cannot help.
+      if (!host.running && host.startIssue) throw new Error(localHostStartIssueMessage(host.startIssue));
       if (!host.running || !host.url || !host.publicKey) throw new Error(`desktop_host_operation_failed${host.directoryState ? `|reason=state_${host.directoryState}` : ""}`);
       const authoritativeName = hostNameSchema.safeParse(host.hostName);
       const savedName = authoritativeName.success ? authoritativeName.data : name.data;
