@@ -183,6 +183,24 @@ test("an open rejected after native already ended the session reports that sessi
   expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_permission_revoked" }]);
 });
 
+// Android: a socket that cannot connect ends the session inside net_screen_open; the open
+// call's rejection is sent straight to the page, the close event with the reason after it.
+test("an open rejected before native's close event arrives still reports that session's reason", async () => {
+  const f = fixture(); f.options.reject.net_screen_open = "screen_inactive";
+  const opened = f.open().then(() => "resolved", (error: Error) => error.message);
+  await expect.poll(() => f.calls.some(value => value.name === "net_screen_open")).toBe(true); await tick();
+  f.event({ kind: "close", reason: "screen_network_closed" });
+  expect(await opened).toBe("screen_network_closed");
+  expect(closes(f.values)).toEqual([{ type: "closed", reason: "screen_network_closed" }]);
+  expect(f.calls.filter(value => value.name === "net_screen_close")).toHaveLength(1);
+});
+
+test("an open rejected as inactive with no close from native still says inactive, within the grace", async () => {
+  const f = fixture(); f.options.reject.net_screen_open = "screen_inactive"; const started = Date.now();
+  await expect(f.open()).rejects.toThrow("screen_inactive");
+  expect(Date.now() - started).toBeLessThan(SCREEN_NATIVE_CLOSE_GRACE_MS + 500);
+});
+
 // A-5. The target's three-frame credit window belongs to one stream generation. A restart
 // (start control, keyframe, resume) retires it and the next generation may send three packets
 // at once while the page is still reading the old generation's.

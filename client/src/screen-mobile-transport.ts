@@ -37,7 +37,7 @@ const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value))
 export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): ScreenViewerTransport {
   return (join: ScreenJoin) => {
     let allocation: ScreenAllocation | undefined, closed = false, opening = false, focused = false, focusGeneration = 0;
-    let receive: ((value: unknown) => void) | undefined, terminal: string | undefined, ending: ReturnType<typeof setTimeout> | undefined;
+    let receive: ((value: unknown) => void) | undefined, terminal: string | undefined, ending: ReturnType<typeof setTimeout> | undefined, settled: (() => void) | undefined;
     let sequence = 0, jsonCount = 0, jsonBytes = 0, binaryCount = 0, binaryBytes = 0, commands = 0, commandBytes = 0;
     // Stream configs counted as they arrive: native delivers each before its generation's packets.
     let streams = 0, streamBinaries = 0, capacity = BINARY_WINDOW;
@@ -45,7 +45,7 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
     const receipts = new Map<number, { deliverySequence: number; bytes: number; stream: number }>();
     const close = (reason?: string) => {
       if (closed) return;
-      closed = true; focused = false; receipts.clear(); clearTimeout(ending);
+      closed = true; focused = false; receipts.clear(); clearTimeout(ending); settled?.();
       allocation?.signal.removeEventListener("abort", retired);
       if (allocation) void bridge.invoke("net_screen_close", { id: allocation.id }).catch(() => undefined);
       if (reason) { terminal = reason; receive?.({ type: "closed", reason }); }
@@ -149,7 +149,14 @@ export function createMobileScreenViewerTransport(bridge: ScreenNativeBridge): S
           events.attach(port);
           if (!closed) await bridge.invoke("net_screen_open", { id: lease.id, network, join, events: { onmessage: event } });
         // A session native already ended keeps its own reason over the open call's.
-        } catch (error) { close(); throw terminal ? new Error(terminal) : error; }
+        // Its close event may also still be on the way (Android sends the open
+        // call's rejection first): wait for it, bounded, as for any other call.
+        } catch (error) {
+          if (!closed && allocation && error instanceof Error && NATIVE_SESSION_ENDED.has(error.message)) {
+            await new Promise<void>(resolve => { settled = resolve; ending = setTimeout(resolve, SCREEN_NATIVE_CLOSE_GRACE_MS); });
+          }
+          close(); throw terminal ? new Error(terminal) : error;
+        }
       },
       close: () => close(),
     };
