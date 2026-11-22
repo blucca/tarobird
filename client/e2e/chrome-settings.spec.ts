@@ -35,22 +35,22 @@ test("Chrome setting works on phone/desktop with conflicts, offline and old-host
       await page.getByRole("button", { name: "设置 Chrome 浏览器联动", exact: true }).click();
       await expect(page.getByRole("switch", { name: "允许此 Bot 使用 Chrome" })).not.toBeChecked();
     }
-    await phone!.getByRole("switch").check();
+    await phone!.getByRole("switch", { name: "允许此 Bot 使用 Chrome" }).check();
     await phone!.getByRole("button", { name: "保存到此 Bot", exact: true }).click();
     await expect(phone!.getByRole("status")).toContainText("已保存");
-    await desktop!.getByRole("switch").check();
+    await desktop!.getByRole("switch", { name: "允许此 Bot 使用 Chrome" }).check();
     await desktop!.getByRole("button", { name: "保存到此 Bot", exact: true }).click();
     await expect(desktop!.getByRole("alert")).toContainText("其他设备或本机已修改设置");
     await desktop!.getByRole("button", { name: "重新读取", exact: true }).click();
-    await expect(desktop!.getByRole("switch")).toBeChecked();
+    await expect(desktop!.getByRole("switch", { name: "允许此 Bot 使用 Chrome" })).toBeChecked();
     for (const [page, name] of [[desktop!, "desktop"], [phone!, "phone"]] as const) {
       await expect(page.getByText("此开关控制 Bot 的联动权限，不代表扩展已连接。网站访问仍遵循 Claude 与扩展的权限设置。", { exact: true })).toBeVisible();
       await page.screenshot({ path: info.outputPath(`chrome-${name}.png`) });
     }
     await phone!.getByRole("button", { name: "关闭浏览器联动设置", exact: true }).click();
     await phone!.getByRole("button", { name: "设置 Chrome 浏览器联动", exact: true }).click();
-    await expect(phone!.getByRole("switch")).toBeChecked();
-    await phone!.getByRole("switch").uncheck(); await phone!.getByRole("button", { name: "保存到此 Bot", exact: true }).click();
+    await expect(phone!.getByRole("switch", { name: "允许此 Bot 使用 Chrome" })).toBeChecked();
+    await phone!.getByRole("switch", { name: "允许此 Bot 使用 Chrome" }).uncheck(); await phone!.getByRole("button", { name: "保存到此 Bot", exact: true }).click();
     await expect(phone!.getByRole("status")).toContainText("已保存");
     expect(JSON.parse(await readFile(path.join(stateDir, "config.json"), "utf8")).claudeChrome).toBe(false);
     expect(await readFile(path.join(stateDir, "session.json"), "utf8")).toBe("preserved-session");

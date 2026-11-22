@@ -64,7 +64,8 @@ test("stale and lost save responses require read-back without repeating the writ
     await f.panel.getByRole("button", { name: "放弃修改并重新读取", exact: true }).click();
     await row.getByRole("button", { name: "指定路径", exact: true }).click(); await row.getByLabel("Codex CLI 程序路径").fill(f.executable);
     let writes = 0;
-    await page.route("**/api/settings/engines", async route => { if (route.request().method() !== "PUT") return route.continue(); writes++; await route.fetch(); await route.abort("failed"); });
+    // The App's requests carry a query (includePi=1) since the Pi engine; match the path with or without one.
+    await page.route("**/api/settings/engines*", async route => { if (route.request().method() !== "PUT") return route.continue(); writes++; await route.fetch(); await route.abort("failed"); });
     await row.getByRole("button", { name: "保存路径", exact: true }).click();
     await expect(f.panel.getByRole("alert")).toContainText("保存结果未确认"); expect(writes).toBe(1);
     expect(f.hub.engineSettings.status().engines.find(e => e.id === "codex")?.override).toBe(f.executable);
@@ -86,7 +87,7 @@ for (const width of [1360, 390]) test(`IME confirmation does not save a path or 
   const f = await fixture(page, false);
   try {
     let writes = 0, creations = 0;
-    await page.route("**/api/settings/engines", route => { if (route.request().method() === "PUT") writes++; return route.continue(); });
+    await page.route("**/api/settings/engines*", route => { if (route.request().method() === "PUT") writes++; return route.continue(); });
     await page.route("**/api/bots", route => { if (route.request().method() === "POST") creations++; return route.fulfill({ status: 409, json: { error: "fixture" } }); });
     await page.getByRole("button", { name: "新建", exact: true }).filter({ visible: true }).click();
     await page.getByRole("button", { name: "新建 Bot", exact: true }).or(page.getByRole("menuitem", { name: "新建 Bot", exact: true })).click();
@@ -146,7 +147,7 @@ test("refreshing paths keeps the selected engine and model in a new Bot", async 
     await page.getByText("找不到引擎？检查 CLI 路径", { exact: true }).click();
     const row = f.panel.getByRole("region", { name: "Claude Code", exact: true });
     await row.getByRole("button", { name: "指定路径", exact: true }).click();
-    const refreshed = page.waitForResponse(response => response.url().endsWith("/api/bots/catalog"));
+    const refreshed = page.waitForResponse(response => new URL(response.url()).pathname === "/api/bots/catalog");
     await row.getByRole("button", { name: "保存路径", exact: true }).click();
     await refreshed;
     await expect(f.panel.getByText("已保存并核实。", { exact: true })).toBeVisible();
@@ -156,7 +157,7 @@ test("refreshing paths keeps the selected engine and model in a new Bot", async 
     await expect(effort).toHaveValue(chosenEffort); await expect(permission).toHaveValue("normal");
     await expect(page.getByLabel("Bot 名称", { exact: true })).toHaveValue("Example Claude");
     await page.getByText("找不到引擎？检查 CLI 路径", { exact: true }).click();
-    const cleared = page.waitForResponse(response => response.url().endsWith("/api/bots/catalog"));
+    const cleared = page.waitForResponse(response => new URL(response.url()).pathname === "/api/bots/catalog");
     await row.getByRole("button", { name: "清除手动路径", exact: true }).click();
     await cleared;
     await page.getByText("找不到引擎？检查 CLI 路径", { exact: true }).click();
@@ -180,7 +181,7 @@ test("a pending path save prevents creating a Bot with the old path", async ({ p
     let entered = () => {};
     const arrived = new Promise<void>(resolve => { entered = resolve; });
     const gate = new Promise<void>(resolve => { release = resolve; });
-    await page.route("**/api/settings/engines", async route => { if (route.request().method() === "PUT") { entered(); await gate; } await route.continue(); });
+    await page.route("**/api/settings/engines*", async route => { if (route.request().method() === "PUT") { entered(); await gate; } await route.continue(); });
     await row.getByRole("button", { name: "保存路径", exact: true }).click();
     await arrived;
     await expect(create).toBeDisabled();
@@ -197,7 +198,7 @@ test("cancel after an uncertain save leaves a visible recovery action", async ({
     const row = f.panel.getByRole("region", { name: "Codex", exact: true });
     await row.getByRole("button", { name: "指定路径", exact: true }).click();
     await row.getByLabel("Codex CLI 程序路径").fill(f.executable);
-    await page.route("**/api/settings/engines", route => route.request().method() === "PUT" ? route.abort("failed") : route.continue());
+    await page.route("**/api/settings/engines*", route => route.request().method() === "PUT" ? route.abort("failed") : route.continue());
     await row.getByRole("button", { name: "保存路径", exact: true }).click();
     await expect(row.getByRole("alert")).toContainText("保存结果未确认");
     await row.getByRole("button", { name: "取消", exact: true }).click();
@@ -263,7 +264,7 @@ test("a disappeared model is shown as unavailable without changing approval pref
   try {
     await f.hub.engineSettings.update({ engine: "codex", path: f.executable, requestId: "seed", revision: "default" }, apply => apply());
     let missing = false;
-    await page.route("**/api/bots/catalog", async route => {
+    await page.route("**/api/bots/catalog*",async route => {
       const response = await route.fetch(), body = await response.json();
       if (missing) for (const engine of body.engines) if (engine.id === "codex") engine.models = engine.models.filter((model: { id: string }) => model.id !== "gpt-6.1-sol");
       await route.fulfill({ response, json: body });
@@ -369,7 +370,7 @@ test("a path saved after a failed first engine read still applies the engine def
     const defaults = { model: await model.inputValue(), effort: await effort.inputValue() };
     await page.keyboard.press("Escape"); await expect(engine).toHaveCount(0);
     let fail = true;
-    await page.route("**/api/bots/catalog", route => fail ? route.fulfill({ status: 500, json: { error: "fixture" } }) : route.continue());
+    await page.route("**/api/bots/catalog*",route => fail ? route.fulfill({ status: 500, json: { error: "fixture" } }) : route.continue());
     await openNewBot(page);
     await expect(page.getByText("暂时无法读取可用引擎，请重试。", { exact: true })).toBeVisible();
     fail = false;
@@ -386,7 +387,7 @@ test("a detection during an uncertain creation does not reload the engine list u
   const f = await fixture(page, false);
   try {
     await f.hub.engineSettings.update({ engine: "codex", path: f.executable, requestId: "seed", revision: "default" }, apply => apply());
-    let catalogReads = 0; page.on("request", request => { if (request.url().endsWith("/api/bots/catalog")) catalogReads++; });
+    let catalogReads = 0; page.on("request", request => { if (new URL(request.url()).pathname === "/api/bots/catalog") catalogReads++; });
     await openNewBot(page);
     await page.getByLabel("Bot 名称", { exact: true }).fill("Example Bot");
     const engine = page.getByRole("combobox", { name: "引擎", exact: true }); await expect(engine).toHaveValue("codex");
@@ -438,8 +439,9 @@ for (const context of ["settings", "new Bot"] as const) for (const width of [390
     const redetect = f.panel.getByRole("button", { name: "重新检测", exact: true });
     failRead = true; await redetect.focus(); await redetect.press("Enter");
     const reload = f.panel.getByRole("button", { name: "重新读取", exact: true });
-    // At the scroll boundary Chromium can clip a fractional CSS pixel.
-    await expect(reload).toBeInViewport({ ratio: 0.99 }); await expect(reload).toBeFocused();
+    // At the scroll boundary Chromium can clip a fractional CSS pixel: with the Pi row in the list it measured
+    // 0.9896 at 1360px, about a third of a pixel on this button. Up to one pixel is allowed.
+    await expect(reload).toBeInViewport({ ratio: 0.97 }); await expect(reload).toBeFocused();
     await expect(f.panel.getByRole("alert")).toBeInViewport();
     failRead = false; await reload.press("Enter"); await expect(redetect).toBeFocused(); expect(writes).toBe(3);
   } finally { await f.dispose(); }

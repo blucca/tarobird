@@ -255,7 +255,8 @@ test("running avatar metadata upgrades once using only the streaming index", asy
     });
     expect(result.live).toEqual({ state: "working", at: 80 });
     expect(result.quiet).toEqual({ state: "idle", at: 0 });
-    expect(result.firstReads).toEqual(["status:getAll:streaming"]);
+    // Two bounded index reads: replies being streamed and, since 5b19ad4, replies still pending. No cursor over history.
+    expect(result.firstReads).toEqual(["status:getAll:streaming", "status:getAll:pending"]);
     expect(result.secondReads).toEqual([]);
     expect(result.retained).toBe(true); expect(result.preview).toBe("unchanged"); expect(result.animated).toBe(false);
   } finally { await vite.close(); }

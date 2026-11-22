@@ -54,7 +54,8 @@ test("pair, render a real streamed reply, use offline outbox, search and revoke"
     await page.evaluate(() => navigator.serviceWorker.ready.then(() => undefined));
     await expect.poll(() => page.evaluate(() => !!navigator.serviceWorker.controller)).toBe(true);
     networkOnline = false; for (const socket of sockets) socket.destroy(); await expect(page.locator(".connection-pill.offline")).toBeVisible();
-    for (const text of ["离线消息一", "离线消息二", "离线消息三"]) { await page.getByRole("textbox", { name: "消息", exact: true }).fill(text); await page.getByRole("button", { name: "发送消息", exact: true }).click(); }
+    // A send that finds the text changed under it is refused, so each message waits for the one before it to leave the box.
+    for (const text of ["离线消息一", "离线消息二", "离线消息三"]) { const box = page.getByRole("textbox", { name: "消息", exact: true }); await box.fill(text); await page.getByRole("button", { name: "发送消息", exact: true }).click(); await expect(box).toHaveValue(""); }
     await expect(page.getByText("等待发送", { exact: true })).toHaveCount(3);
     await page.reload(); await expect(page.getByText("等待发送", { exact: true })).toHaveCount(3); await expect(page.getByText("测试回答完成", { exact: true })).toBeVisible();
     // A fresh offline page must start the cached parser worker, not merely show

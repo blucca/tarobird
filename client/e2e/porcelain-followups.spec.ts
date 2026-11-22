@@ -86,6 +86,8 @@ async function expectReadablePreview(preview: Locator, selector = "strong,.link-
 }
 
 for (const width of [320, 390, 1360]) test(`link previews stay readable beside attachments and inside text bubbles (${width})`, async ({ browser }, info) => {
+  // Three palettes, two themes, four messages, five readings each: about 55 s alone on this Mac.
+  test.setTimeout(150_000);
   const root = await mkdtemp(path.join(os.tmpdir(), "porcelain-links-"));
   const hub = await HubServer.start({ stateDir: root, clientDir: path.resolve("dist") });
   const context = await browser.newContext({ viewport: { width, height: 900 }, serviceWorkers: "block", reducedMotion: "reduce" });
@@ -113,6 +115,9 @@ for (const width of [320, 390, 1360]) test(`link previews stay readable beside a
     await hub.auth.approve(await page.getByLabel("配对码", { exact: true }).innerText(), "local-owner");
     await page.getByLabel("配对码", { exact: true }).waitFor({ state: "hidden" });
     await waitForClientOnline(page); await showDisconnectedBots(page); await selectConversation(page, chat.title);
+    // Colours are measured at rest. With transitions on, a reading taken right after a hover or a theme change
+    // catches the colour part-way: the same control gave 2.3, 3.9 and 4.48 on three runs of one build.
+    await page.addStyleTag({ content: "*,*::before,*::after{transition:none!important}" });
     for (const palette of ["mono", "white-violet", "cli"]) for (const theme of ["light", "dark"]) {
       await page.evaluate(settings => Object.assign(document.documentElement.dataset, settings), { palette, theme });
       for (const id of messages) {

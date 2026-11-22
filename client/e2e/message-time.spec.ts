@@ -245,6 +245,9 @@ for (const touch of [true, false]) for (const english of [false, true]) test(`re
       // The long-press sheet repeats the timestamp. It stays open across the first midnight.
       const prompt = page.locator(`${chatRows}[data-message-id="${prompts.get(0)}"]`);
       const author = await prompt.locator(".message-meta > strong").innerText();
+      // The App takes about a quarter of a second to turn into the phone layout after the resize above. Only
+      // then does a row offer its sheet; a key pressed earlier does nothing.
+      await expect(prompt).toHaveAttribute("aria-haspopup", "dialog");
       await prompt.focus(); await page.keyboard.press("Enter");
       const sheetLine = page.getByRole("dialog", { name: text("消息操作", "Message actions"), exact: true }).locator(".message-sheet-preview > small");
       await expect(sheetLine).toHaveText(`${author} · ${clock}`);
