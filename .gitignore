@@ -13,8 +13,11 @@ client/ios/App/build/
 client/ios/App/App/public/
 client/android/app/src/main/assets/public/
 dist/
+client/src/generated/
 !deepseek-harness-plugin/dist/
-!deepseek-harness-plugin/dist/search-mcp.js
+client/src/generated/
+!deepseek-harness-plugin/dist/
+client/src/generated/search-mcp.js
 .DS_Store
 .env
 .env.local
@@ -41,6 +44,7 @@ tingwu_asr/output/
 
 client/e2e/fixtures/generated-cards/
 client/.native-audit-dist/
+client/src/generated/
 
 # TaroBot source repository: private runtime and generated acceptance artifacts
 /test-results/
@@ -81,12 +85,16 @@ GoogleService-Info.plist
 /client/src-tauri/audit/widget-ui/document.js
 
 /.image-viewer-audit-dist/
+client/src/generated/
 
 /.side-window-audit-dist/
+client/src/generated/
 /.migration-audit-dist/
+client/src/generated/
 
 client/src-desktop-native/target.noindex/
 .desktop-migration-exporter-dist/
+client/src/generated/
 
 # Temporary native applications and Cargo outputs must stay unindexed.
 *.noindex/

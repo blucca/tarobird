@@ -20,7 +20,7 @@ import { FontSizeSlider } from "./FontSizeSlider.js";
 import { LayoutDensityPicker } from "./LayoutDensityPicker.js";
 import { useBackAction } from "./back-navigation.js";
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject } from "react";
-import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Link, Monitor, MonitorCog, Plus, QrCode, ScanLine, Settings2, ShieldCheck, Gauge, X } from "lucide-react";
+import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Info, Link, Monitor, MonitorCog, Plus, QrCode, ScanLine, Settings2, ShieldCheck, Gauge, X } from "lucide-react";
 import { ConnectionPanel } from "./ConnectionPanel.js";
 import { ScreenControlPanel } from "./ScreenControlPanel.js";
 import { hasScreenViewer } from "./mobile-screen-viewer-transport.js";
@@ -45,8 +45,9 @@ import type { Preferences } from "./storage.js";
 import { ambiguousDeviceName, deviceDisplayName, deviceRevokeScope } from "./device-presentation.js";
 import "./device-settings.css";
 import { BotMessageGrants } from "./BotMessageGrants.js";
+import { AboutSettings } from "./AboutSettings.js";
 
-type Section = "workbench" | "backups" | "general" | "network" | "notifications" | "devices" | "botMessages" | "voice" | "engines" | "quota";
+type Section = "workbench" | "backups" | "general" | "network" | "notifications" | "devices" | "botMessages" | "voice" | "engines" | "quota" | "about";
 /** `created_at`/`last_seen` come from the host; 0 or missing means never recorded. */
 type Device = { id: string; name: string; nameSource?: "host"; platform: string; revoked: number; created_at?: number | string | null; last_seen?: number | string | null };
 /** Messages appear beside the control that produced them, not at the page end. */
@@ -168,6 +169,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
     { id: "notifications" as const, title: t("通知"), detail: t("此设备的提醒与勿扰时段"), icon: Bell },
     { id: "devices" as const, title: t("设备与安全"), detail: t("查看设备、修改名称与撤销授权"), icon: ShieldCheck },
     { id: "botMessages" as const, title: t("Bot 消息授权"), detail: t("管理本机与跨主机 Bot 的直接消息权限"), icon: Link },
+    { id: "about" as const, title: t("关于"), detail: t("版本、协议与开源致谢"), icon: Info },
   ];
   useEffect(() => { if (section === "quota" && !quotaPage) { setSection("general"); setOverview(true); } }, [section, quotaPage]);
   const requestClose = () => {
@@ -446,6 +448,10 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
           <h3>{t("Bot 消息授权")}</h3>
           {hostName && <p className="device-host-scope">{t("管理主机：{0}", hostName)}</p>}
           <BotMessageGrants key={connection.identity.hubPublicKey} connection={connection} active={section === "botMessages" && (!phone || !overview)} online={online} onDirty={setMessageGrantsDirty} onBusy={setMessageGrantsBusy}/>
+        </section>
+        <section hidden={section !== "about"} aria-label={t("关于")}>
+          <h3>{t("关于")}</h3>
+          <AboutSettings active={section === "about" && (!phone || !overview)}/>
         </section>
         <section hidden={section !== "general"} aria-label={t("通用")}>
           <h3>{t("通用")}</h3>

@@ -1,0 +1,238 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "jetbrains-mono",
+      "name": "JetBrains Mono",
+      "category": "asset",
+      "repository": "https://github.com/JetBrains/JetBrainsMono",
+      "version": "2.x",
+      "license": "OFL-1.1",
+      "licenseFile": "client/public/licenses/JetBrains-Mono.txt",
+      "usage": "Monospace code and terminal font bundled in the App",
+      "location": "client/public/licenses/JetBrains-Mono.txt"
+    },
+    {
+      "id": "sarasa-term-sc",
+      "name": "Sarasa Term SC",
+      "category": "asset",
+      "repository": "https://github.com/be5invis/Sarasa-Gothic",
+      "version": "1.x",
+      "license": "OFL-1.1",
+      "licenseFile": "client/public/licenses/Sarasa-Term-SC.txt",
+      "usage": "CJK monospace font used for code blocks and terminal views",
+      "location": "client/src/assets/fonts/sarasa-term-sc/"
+    },
+    {
+      "id": "lobehub-model-brand-icons",
+      "name": "LobeHub Model Brand Icons",
+      "category": "asset",
+      "repository": "https://github.com/lobehub/lobe-icons",
+      "version": "bcdb7c82792a854c2967f7328e11a30205ea584d",
+      "license": "MIT",
+      "licenseFile": "client/public/licenses/model-brand-icons.txt",
+      "usage": "Model provider brand icons (OpenAI, Claude, Gemini, DeepSeek, Kimi); trademarks belong to their respective owners",
+      "location": "client/src/assets/model-brands/"
+    },
+    {
+      "id": "pi-mark",
+      "name": "Pi Project Mark",
+      "category": "asset",
+      "repository": "https://pi.dev",
+      "version": "monochrome mark",
+      "license": "Trademark notice",
+      "licenseFile": "third-party/licenses/pi-mark.txt",
+      "usage": "Monochrome mark identifying the supported Pi engine in product documentation artwork",
+      "location": "assets/product/engines.png"
+    },
+    {
+      "id": "bricolage-grotesque",
+      "name": "Bricolage Grotesque",
+      "category": "asset",
+      "repository": "https://github.com/ateliertriay/bricolage",
+      "version": "1.x",
+      "license": "OFL-1.1",
+      "licenseFile": "assets/product/fonts/BricolageGrotesque-OFL.txt",
+      "usage": "Display typeface used in product artwork",
+      "location": "assets/product/fonts/BricolageGrotesque-Bold.ttf"
+    },
+    {
+      "id": "instrument-sans",
+      "name": "Instrument Sans",
+      "category": "asset",
+      "repository": "https://github.com/Instrument/instrument-sans",
+      "version": "1.x",
+      "license": "OFL-1.1",
+      "licenseFile": "assets/product/fonts/InstrumentSans-OFL.txt",
+      "usage": "Sans-serif typeface used in product artwork",
+      "location": "assets/product/fonts/InstrumentSans-Regular.ttf"
+    },
+    {
+      "id": "ibm-plex-mono",
+      "name": "IBM Plex Mono",
+      "category": "asset",
+      "repository": "https://github.com/IBM/plex",
+      "version": "1.x",
+      "license": "OFL-1.1",
+      "licenseFile": "assets/product/fonts/IBMPlexMono-OFL.txt",
+      "usage": "Monospace typeface used in product artwork",
+      "location": "assets/product/fonts/IBMPlexMono-Regular.ttf"
+    },
+    {
+      "id": "baoyu-design",
+      "name": "baoyu-design",
+      "category": "vendored",
+      "repository": "https://github.com/JimLiu/baoyu-design",
+      "version": "2.15.2 (016a68e1b1ac1c7c291b2cb88d66ff087e50b017)",
+      "license": "Mixed (MIT / upstream notices)",
+      "licenseFile": "client/vendor/baoyu-design/LICENSE",
+      "noticeFile": "client/vendor/baoyu-design/NOTICE.md",
+      "usage": "Vendored design canvas editor, references and runtime notices",
+      "location": "client/vendor/baoyu-design/, skills/baoyu-design/"
+    },
+    {
+      "id": "baoyu-slides",
+      "name": "baoyu-slides",
+      "category": "vendored",
+      "repository": "https://github.com/JimLiu/baoyu-design",
+      "version": "2.15.2 (016a68e1b1ac1c7c291b2cb88d66ff087e50b017)",
+      "license": "Mixed (MIT / upstream notices)",
+      "licenseFile": "client/vendor/baoyu-slides/LICENSE",
+      "noticeFile": "client/vendor/baoyu-slides/NOTICE.md",
+      "usage": "Vendored slides editor, compiler and runtime notices",
+      "location": "client/vendor/baoyu-slides/, skills/baoyu-ppt/"
+    },
+    {
+      "id": "deepseek-harness-plugin",
+      "name": "deepseek-harness-plugin",
+      "category": "vendored",
+      "repository": "https://github.com/cloveric/tarobird",
+      "version": "workspace",
+      "license": "MIT",
+      "licenseFile": "deepseek-harness-plugin/LICENSE",
+      "usage": "Independently published DeepSeek search MCP plugin",
+      "location": "deepseek-harness-plugin/"
+    },
+    {
+      "id": "anthropic-claude-agent-sdk",
+      "name": "@anthropic-ai/claude-agent-sdk",
+      "category": "vendored",
+      "repository": "https://code.claude.com/docs/en/legal-and-compliance",
+      "version": "0.3.329",
+      "license": "Anthropic Terms",
+      "licenseFile": "third-party/licenses/anthropic-claude-agent-sdk.txt",
+      "usage": "Bundled Claude Code history helper (not covered by AGPL-3.0-only)",
+      "location": "dist/licenses/claude-agent-sdk/"
+    },
+    {
+      "id": "sheetjs-xlsx",
+      "name": "xlsx (SheetJS Community Edition)",
+      "category": "npm",
+      "repository": "https://cdn.sheetjs.com",
+      "version": "0.20.3",
+      "license": "Apache-2.0",
+      "licenseFile": "client/public/licenses/sheetjs.txt",
+      "usage": "Spreadsheet parsing and preview in the App",
+      "location": "client/package.json"
+    },
+    {
+      "id": "scrapling-skill-reference",
+      "name": "Scrapling (skill reference)",
+      "category": "vendored",
+      "repository": "https://github.com/D4Vinci/Scrapling",
+      "version": "0.5 reference",
+      "license": "Upstream notice",
+      "licenseFile": "third-party/licenses/scrapling-notice.txt",
+      "usage": "Upstream fetching reference attributed in the Scrapling skill guide",
+      "location": "skills/scrapling/SKILL.md"
+    },
+    {
+      "id": "android-okhttp",
+      "name": "OkHttp",
+      "category": "android",
+      "repository": "https://github.com/square/okhttp",
+      "version": "5.5.1",
+      "license": "Apache-2.0",
+      "licenseFile": "third-party/licenses/apache-2.0.txt",
+      "usage": "Android native HTTPS transport with pinned certificate verification",
+      "location": "client/android/app/build.gradle"
+    },
+    {
+      "id": "android-java-websocket",
+      "name": "Java-WebSocket",
+      "category": "android",
+      "repository": "https://github.com/TooTallNate/Java-WebSocket",
+      "version": "1.6.0",
+      "license": "MIT",
+      "licenseFile": "third-party/licenses/java-websocket-mit.txt",
+      "usage": "Android native WebSocket transport to self-hosted Hubs",
+      "location": "client/android/app/build.gradle"
+    },
+    {
+      "id": "android-slf4j",
+      "name": "SLF4J",
+      "category": "android",
+      "repository": "https://github.com/qos-ch/slf4j",
+      "version": "2.0.20",
+      "license": "MIT",
+      "licenseFile": "third-party/licenses/slf4j-mit.txt",
+      "usage": "Android logging facade for native networking dependencies",
+      "location": "client/android/app/build.gradle"
+    },
+    {
+      "id": "android-bouncy-castle",
+      "name": "Bouncy Castle (bcprov-jdk15to18)",
+      "category": "android",
+      "repository": "https://github.com/bcgit/bc-java",
+      "version": "1.86",
+      "license": "MIT",
+      "licenseFile": "third-party/licenses/bouncycastle-mit.txt",
+      "usage": "Android Ed25519 cryptography and certificate handling",
+      "location": "client/android/app/build.gradle"
+    },
+    {
+      "id": "android-unifiedpush",
+      "name": "UnifiedPush Android Connector",
+      "category": "android",
+      "repository": "https://codeberg.org/UnifiedPush/android-connector",
+      "version": "3.3.5",
+      "license": "Apache-2.0",
+      "licenseFile": "third-party/licenses/apache-2.0.txt",
+      "usage": "Optional self-hosted push notifications on Android",
+      "location": "client/android/app/build.gradle"
+    },
+    {
+      "id": "android-firebase-messaging",
+      "name": "Firebase Cloud Messaging (Android)",
+      "category": "android",
+      "repository": "https://github.com/firebase/firebase-android-sdk",
+      "version": "26.0.1",
+      "license": "Apache-2.0",
+      "licenseFile": "third-party/licenses/apache-2.0.txt",
+      "usage": "Optional FCM push notification delivery on Android",
+      "location": "client/android/app/build.gradle"
+    },
+    {
+      "id": "android-androidx",
+      "name": "AndroidX Libraries (Activity, AppCompat, CoordinatorLayout, Core SplashScreen)",
+      "category": "android",
+      "repository": "https://github.com/androidx/androidx",
+      "version": "AndroidX",
+      "license": "Apache-2.0",
+      "licenseFile": "third-party/licenses/apache-2.0.txt",
+      "usage": "Android platform UI shell, insets, and splash screen support",
+      "location": "client/android/app/build.gradle"
+    },
+    {
+      "id": "ios-capacitor-swift-pm",
+      "name": "Capacitor Swift Package (capacitor-swift-pm)",
+      "category": "ios",
+      "repository": "https://github.com/ionic-team/capacitor-swift-pm",
+      "version": "8.6.0",
+      "license": "MIT",
+      "licenseFile": "third-party/licenses/capacitor-mit.txt",
+      "usage": "iOS Capacitor and Cordova native runtime bridge",
+      "location": "client/ios/App/CapApp-SPM/Package.swift"
+    }
+  ]
+}
