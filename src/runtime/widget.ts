@@ -16,26 +16,21 @@ function checkScript(source: string, label: string, handler = false): void {
   }
 }
 
-const httpsUrl = (value: string | undefined) => { try { return !!value && new URL(value).protocol === "https:"; } catch { return false; } };
-/** Parse classic scripts without executing model code. Only https may be referenced
- * externally; the renderer enforces the real resource/authority boundary. */
+/** Parse classic scripts without executing model code. Widgets are deliberately
+ * self-contained: the renderer enforces the real resource/authority boundary. */
 export function validateWidget(raw: unknown): WidgetInput {
   const widget = widgetInputSchema.parse(raw);
   if ("report" in widget) return widget;
   let script: string | undefined, scriptNumber = 0;
   const parser = new Parser({
     onopentag(name, attrs) {
-      // External https stylesheets and scripts load on current clients, where widget
-      // network access is always on; older clients ignore them and keep the static markup.
-      if (name === "link" && !(attrs.rel?.trim().toLowerCase() === "stylesheet" && httpsUrl(attrs.href))) throw new Error("Widget <link> supports only rel=\"stylesheet\" with an https href");
-      if (["iframe", "frame", "object", "embed", "base", "meta"].includes(name)) throw new Error(`Widget does not support <${name}>; use an HTML fragment`);
+      if (["iframe", "frame", "object", "embed", "base", "meta", "link"].includes(name)) throw new Error(`Widget does not support <${name}>; use a self-contained HTML fragment`);
       for (const [attribute, value] of Object.entries(attrs)) {
         if (/^on[a-z]+$/i.test(attribute) && value.trim()) checkScript(value, `<${name}> ${attribute} handler`, true);
       }
       if (name === "script") {
-        if (attrs.type && !["text/javascript", "application/javascript"].includes(attrs.type.toLowerCase())) throw new Error("Use classic JavaScript; modules are unavailable");
-        if (attrs.src !== undefined && !httpsUrl(attrs.src)) throw new Error("External widget scripts must use an https URL");
-        script = attrs.src !== undefined ? undefined : ""; if (script !== undefined) scriptNumber++;
+        if (attrs.src || attrs.type && !["text/javascript", "application/javascript"].includes(attrs.type.toLowerCase())) throw new Error("Use inline classic JavaScript; external scripts and modules are unavailable");
+        script = ""; scriptNumber++;
       }
     },
     ontext(text) { if (script !== undefined) script += text; },

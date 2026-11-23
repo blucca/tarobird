@@ -199,11 +199,32 @@ describe("Claude quota from the Bot's own running engine", () => {
   });
   it("reports a silent engine as a timeout and keeps an earlier reading as stale", async () => {
     const { adapter, child, start } = await claudeFixture(); await start();
+    // A question stays out after its reader stopped waiting; here it is given up after 40 ms so the next read asks anew.
+    (adapter as any).usageLateMs = 40;
     expect((await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 })).snapshot).toMatchObject({ state: "unavailable", reason: "timeout", capability: { mode: "active" }, pools: [] });
+    await new Promise(resolve => setTimeout(resolve, 60));
     child.answers.get_usage = usageReply(); await adapter.getAccountQuota({ refresh: true });
     delete child.answers.get_usage;
     const stale = (await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 })).snapshot;
     expect(stale).toMatchObject({ state: "stale", reason: "timeout" }); expect(stale.pools[0].windows).toHaveLength(2);
+  });
+  it("keeps an answer that comes after the read stopped waiting, with one question out at a time", async () => {
+    const { adapter, child, start } = await claudeFixture(); await start();
+    // A slow CLI: the question is taken and answered by hand later.
+    const asked: string[] = [], write = child.stdin.write;
+    child.stdin.write = (line: string, callback?: (error?: Error | null) => void) => {
+      const request = JSON.parse(line);
+      if (request.type !== "control_request" || request.request?.subtype !== "get_usage") return write(line, callback);
+      asked.push(request.request_id); callback?.(null); return true;
+    };
+    expect((await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 })).snapshot).toMatchObject({ state: "unavailable", reason: "timeout" });
+    expect((await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 })).snapshot.state).toBe("unavailable");
+    expect(asked).toHaveLength(1);
+    child.event({ type: "control_response", response: { subtype: "success", request_id: asked[0], response: usageReply() } });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const kept = (await adapter.getAccountQuota({ refresh: false })).snapshot;
+    expect(kept.state).toBe("ready"); expect(kept.pools[0].windows).toHaveLength(2);
+    expect(asked).toHaveLength(1);
   });
   it("asks a process that is working on a turn when none is idle, and leaves its activity clock alone", async () => {
     const { adapter, child, start } = await claudeFixture(); child.answers.get_usage = usageReply(); const worker = await start();

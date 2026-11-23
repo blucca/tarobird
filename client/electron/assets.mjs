@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { APP_ORIGIN } from './contract.mjs';
 
 export const APP_CSP = "default-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; worker-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src blob: data: tarobot-widget://sandbox; font-src 'self' data:";
-export const WIDGET_CSP = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; worker-src blob:; style-src 'unsafe-inline' https:; img-src data: https:; media-src https:; font-src data: https:; connect-src https: wss:; frame-src about:; base-uri 'none'; form-action 'none'";
+export const WIDGET_CSP = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; worker-src blob:; style-src 'unsafe-inline'; img-src data:; font-src data:; frame-src about:; base-uri 'none'; form-action 'none'";
 export const SCHEMES = [
   { scheme: 'tarobot', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, codeCache: true } },
   { scheme: 'tarobot-widget', privileges: { standard: true, secure: true } },

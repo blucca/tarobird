@@ -95,8 +95,9 @@ const workbenchDefinitionV13 = workbenchDefinitionFor("Operate the current user'
 const workbenchDefinitionsV13 = [...widgetDefinitions.slice(0, -1), htmlWidgetDefinition, workbenchDefinitionV13];
 const minimalWorkbenchDefinitionsV13 = [...permissionDefinitions, workbenchDefinitionV13];
 const toolVersionV13 = hash(JSON.stringify(workbenchDefinitionsV13)), minimalToolVersionV13 = hash(JSON.stringify(minimalWorkbenchDefinitionsV13));
-// v14 corrects the widget description for network access. Without widgets the
-// minimal contract is unchanged and stays v13; older contracts stay frozen.
+// v14 described widget network access (main only, 2026-11-21 to 2026-11-23). It is
+// kept so that sessions registered with it still resolve; new sessions use v13.
+// Without widgets the minimal contract is unchanged and stays v13; older contracts stay frozen.
 const workbenchDefinitionsV14 = [...widgetDefinitions.slice(0, -1), networkWidgetDefinition, workbenchDefinitionV13];
 const toolVersionV14 = hash(JSON.stringify(workbenchDefinitionsV14));
 const reportToolVersion = hash(JSON.stringify(definitions));
@@ -283,5 +284,7 @@ export function createAppPlatformTools(input: {
       })),
     };
   };
-  return makeTools(14, !enabled);
+  // New sessions get v13 again: its widget description says "No network or host APIs", which is what the App
+  // enforces since 2026-11-23. A session registered with v14 between 2026-11-21 and then keeps that contract.
+  return makeTools(13, !enabled);
 }

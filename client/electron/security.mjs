@@ -77,7 +77,9 @@ export function secureSession(session, { owns = () => false, systemPreferences, 
   });
   session.setDevicePermissionHandler(() => false);
   session.on('will-download', event => event.preventDefault());
-  session.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !internalResource(details.url) && !widgetNetworkRequest(details) }));
+  // Widgets have no network (1.5.1 policy, restored 2026-11-23): every request that is not one of the App's own
+  // resources is cancelled here, outside the page. widgetNetworkRequest above is kept, unused, for a later design.
+  session.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !internalResource(details.url) }));
   // Widget requests never carry or receive cookies or HTTP credentials. Every
   // allowed external request is a widget request, but its frame can detach
   // after onBeforeRequest (details.frame becomes null), so strip by URL alone.

@@ -559,15 +559,19 @@ const BACKGROUND_TASK_TURN_SETTLE_GRACE_MS = 1500;
 // session. `/timeout off` (disableRuntimeTimeout) disables it per turn.
 export const CLAUDE_STREAM_INACTIVITY_TIMEOUT_MS = ENGINE_DEFAULT_INACTIVITY_TIMEOUT_MS;
 type ClaudeQuotaRecord = { id: number; credentialRevision: string; snapshot?: QuotaSnapshot; usage?: QuotaSnapshot; unasked?: Set<string>;
-  /** The model this process stated when it started a turn. */ model?: string; context?: { sessionId: string | null; usage: EngineContextUsage } };
+  /** The model this process stated when it started a turn. */ model?: string; context?: { sessionId: string | null; usage: EngineContextUsage };
+  /** The `get_usage` question this process has not answered yet. One at a time; its answer is kept whenever it comes. */ asking?: Promise<QuotaSnapshot> };
 // Native soft stop (CLI 2.1.307 probes: receipt and interrupted result arrive
 // within ~10 ms). Past these bounds the stop is unconfirmed and falls back to
 // the bounded process cleanup instead of leaving the session wedged.
 const CLAUDE_INTERRUPT_ACK_TIMEOUT_MS = 3_000;
 /** Measured on Claude Code 2.1.330 (2026-11-22): on a subscription every `get_usage` took 3.6 to 5.1 s, because the
  * CLI fetches the figures each time; `get_context_usage` took about 0.9 s with a full user configuration and
- * under 10 ms with an empty one. */
-const CLAUDE_USAGE_ACK_TIMEOUT_MS = 7_000, CLAUDE_CONTEXT_ACK_TIMEOUT_MS = 4_000;
+ * under 10 ms with an empty one. On 2026-11-23, on the same machine under heavy load, `get_usage` took 69 to 90 s
+ * and longer with the full configuration. A read therefore waits `CLAUDE_USAGE_ACK_TIMEOUT_MS` for its caller's
+ * sake, and the question stays out for `CLAUDE_USAGE_LATE_MS`: an answer inside that time becomes the Bot's
+ * reading for the next read. */
+const CLAUDE_USAGE_ACK_TIMEOUT_MS = 7_000, CLAUDE_USAGE_LATE_MS = 5 * 60_000, CLAUDE_CONTEXT_ACK_TIMEOUT_MS = 4_000;
 /** A stop that Claude has not confirmed by then is reported as unconfirmed. */
 const CLAUDE_STOP_CONFIRM_TIMEOUT_MS = 10_000;
 const CLAUDE_STEER_ACK_TIMEOUT_MS = 5_000;
@@ -1169,6 +1173,8 @@ export class ClaudeStreamAdapter implements CodexAdapter {
    * with its turns, its account seldom does. It goes when a process answers again, when a process answers that
    * the login has no windows, or when the login state the Host can see has changed. */
   private keptUsage?: ClaudeQuotaRecord;
+  /** How long a `get_usage` question stays out before it is given up (tests shorten it). */
+  private usageLateMs = CLAUDE_USAGE_LATE_MS;
   private quotaWorkerSequence = 0;
   private quotaSource?: ClaudeWorker;
   private readonly sessionUsage: ClaudeSessionUsage;
@@ -1279,13 +1285,20 @@ export class ClaudeStreamAdapter implements CodexAdapter {
    * never keeps a process alive. Only the CLI's own "Unsupported control request subtype" answer is remembered
    * for the process; any other failure may be asked again. */
   private async askUsage(worker: ClaudeWorker, request: string, timeoutMs: number): Promise<Record<string, unknown>> {
-    const idleSince = worker.lastActivityAt, wasIdle = this.usageIdle(worker);
-    try { return await worker.control.request(request, {}, Math.max(1, timeoutMs)); }
-    catch (error) {
+    // A question is not use of the process, but sending it and receiving its answer both touch the activity
+    // clock. It is put back right after the send, and again for an answer that comes promptly. An answer that is
+    // minutes late leaves the clock at its arrival: a turn may have run meanwhile, and its time must not be undone.
+    const idleSince = worker.lastActivityAt, wasIdle = this.usageIdle(worker), sentAt = Date.now();
+    const putBack = () => { if (wasIdle && this.usageIdle(worker)) worker.lastActivityAt = idleSince; };
+    try {
+      const answer = worker.control.request(request, {}, Math.max(1, timeoutMs));
+      putBack();
+      return await answer;
+    } catch (error) {
       const entry = this.quotaWorkers.get(worker);
       if (entry && error instanceof ClaudeControlError && error.kind === "rejected" && /unsupported control request/i.test(error.message)) (entry.unasked ??= new Set()).add(request);
       throw error;
-    } finally { if (wasIdle && this.usageIdle(worker)) worker.lastActivityAt = idleSince; }
+    } finally { if (Date.now() - sentAt <= CLAUDE_USAGE_ACK_TIMEOUT_MS) putBack(); }
   }
 
   /** Claude's own `/context` accounting for this conversation's running process: asked while it is idle, and
@@ -1321,6 +1334,26 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     }
     return idle ?? busy;
   }
+  /** Asks a process for `get_usage`, once at a time, and keeps its answer whenever it arrives within
+   * `usageLateMs`, also after the read that asked has given up waiting. Claude Code fetches the figures on every
+   * request and can take over a minute; dropping a late answer left the Bot with no reading at all. */
+  private usageQuestion(worker: ClaudeWorker, entry: ClaudeQuotaRecord): Promise<QuotaSnapshot> {
+    if (entry.asking) return entry.asking;
+    const question = (async () => {
+      try {
+        const usage = parseClaudeUsage(await this.askUsage(worker, "get_usage", this.usageLateMs), Date.now());
+        // Asked under one login and answered under another: not a reading of the current one.
+        if (this.quotaScope().credentialRevision !== entry.credentialRevision) return usage;
+        if (usage.capability.mode === "unsupported") { entry.usage = undefined; this.keptUsage = undefined; }
+        else { entry.usage = usage; this.keptUsage = entry; }
+        return usage;
+        // One question at a time: nothing else can have taken this slot meanwhile.
+      } finally { entry.asking = undefined; }
+    })();
+    // A late failure has no reader left to report to.
+    question.catch(() => undefined);
+    return entry.asking = question;
+  }
   /** The Bot's newest `get_usage` answer given under the login `credentialRevision`, with the answering process's model. */
   private newestUsage(credentialRevision: string): { usage: QuotaSnapshot; model?: string } | undefined {
     const kept = this.keptUsage;
@@ -1343,18 +1376,20 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     let after = scope;
     if (worker && entry) {
       let usage: QuotaSnapshot | undefined;
+      const question = this.usageQuestion(worker, entry), waitMs = Math.min(options.timeoutMs ?? CLAUDE_USAGE_ACK_TIMEOUT_MS, CLAUDE_USAGE_ACK_TIMEOUT_MS);
+      let timer: NodeJS.Timeout | undefined;
       try {
-        usage = parseClaudeUsage(await this.askUsage(worker, "get_usage", Math.min(options.timeoutMs ?? CLAUDE_USAGE_ACK_TIMEOUT_MS, CLAUDE_USAGE_ACK_TIMEOUT_MS)), Date.now());
+        // This read waits only so long. The question stays out; its answer is stored when it comes (usageQuestion).
+        usage = await Promise.race([question, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new ClaudeControlError("get_usage", "Claude get_usage has not answered yet", "timeout")), Math.max(1, waitMs)); })]);
       } catch (error) {
         if (entry.unasked?.has("get_usage")) return passive;
         failure = error instanceof QuotaReadError ? error.reason : error instanceof ClaudeControlError && error.kind === "timeout" ? "timeout" : "native_error";
-      }
+      } finally { clearTimeout(timer); }
       // The login changed while the question was out: the answer cannot be told to be about the current one.
       after = this.quotaScope();
       if (after.credentialRevision !== scope.credentialRevision) return this.quotaCache.failure(after, "auth_changed");
       // An API key, or a login without windows: answered for this call, and no earlier reading of the Bot holds any longer.
-      if (usage?.capability.mode === "unsupported") { entry.usage = undefined; this.keptUsage = undefined; return { revision: after.revision, snapshot: usage }; }
-      if (usage) { entry.usage = usage; this.keptUsage = entry; }
+      if (usage?.capability.mode === "unsupported") return { revision: after.revision, snapshot: usage };
     }
     const now = Date.now(), active = { mode: "active" as const }, newest = this.newestUsage(scope.credentialRevision);
     const reading = newest ? claudeQuotaForModel(structuredClone(newest.usage), newest.model) : passive.snapshot.observedAt ? { ...passive.snapshot, capability: active } : undefined;

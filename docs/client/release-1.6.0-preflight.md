@@ -66,8 +66,17 @@ during the cycle. New in this cycle, among others: the Pi engine and the
 Antigravity ACP runtime, native conversation fork and rewind, remote screen
 viewing on phones and Windows with a shared relay line, model quota and
 context indicators, the conversation workspace rail, Bot-to-Bot message
-delivery and steering between computers, Kimi task panel, widgets with network
-access, and the share inbox fix for one unreadable record.
+delivery and steering between computers, Kimi task panel, and the share inbox
+fix for one unreadable record.
+
+Widgets stay offline, as in 1.5.1. Main allowed https/wss in widgets from
+2026-11-21; on 2026-11-23, after the first freeze (`344f0d9`), the owner
+withdrew it ("感觉还是卡片不要联网了，和以前一样", then "恢复，然后继续发版吧",
+written as "回复"). The restored policy and what is enforced are in
+[security boundaries](../security-boundaries.md#widget-network-access-2026-11-21).
+This moved the frozen commit; the owner asked for the related tests only, not
+another full run, so the validation figures below are from before this change
+plus the widget unit, Electron and browser specs after it.
 
 Android Play Console follow-ups carried from 1.5.0 (edge-to-edge and
 deprecated system-bar calls): the source state recorded in the checklist on

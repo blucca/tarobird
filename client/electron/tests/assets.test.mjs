@@ -90,7 +90,9 @@ test('both permission check and request paths deny unimplemented capabilities', 
   session.network({ url: 'https://evil.example' }, result => assert.deepEqual(result, { cancel: true }));
   session.network({ url: 'https://evil.example', resourceType: 'image', frame: { url: 'tarobot://app/index.html', parent: null } }, result => assert.deepEqual(result, { cancel: true }));
   const guest = { url: 'about:srcdoc', parent: { url: 'tarobot-widget://sandbox/widget-sandbox.html', parent: { url: 'tarobot://app/index.html', parent: null } } };
-  session.network({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: guest }, result => assert.deepEqual(result, { cancel: false }));
+  // Widgets have no network (1.5.1 policy, restored 2026-11-23): a request from a widget guest is cancelled like any other.
+  for (const [url, resourceType] of [['https://cdn.example.com/a.png', 'image'], ['https://cdn.example.com/lib.js', 'xhr'], ['wss://echo.example.com/', 'webSocket']])
+    session.network({ url, resourceType, frame: guest }, result => assert.deepEqual(result, { cancel: true }));
   session.send({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: guest, requestHeaders: { Cookie: 'a=1', Authorization: 'x', Accept: '*/*' } }, result => assert.deepEqual(result, { requestHeaders: { Accept: '*/*' } }));
   session.receive({ url: 'https://cdn.example.com/a.png', resourceType: 'image', frame: guest, responseHeaders: { 'Set-Cookie': ['a=1'], 'Content-Type': ['image/png'] } }, result => assert.deepEqual(result, { responseHeaders: { 'Content-Type': ['image/png'] } }));
   session.send({ url: 'https://evil.example', resourceType: 'image', requestHeaders: { Cookie: 'a=1' } }, result => assert.deepEqual(result, { requestHeaders: {} }));
@@ -106,7 +108,7 @@ test('widget requests whose frame detached still lose cookies and credentials', 
   });
   secureSession(session);
   const guest = { url: 'about:srcdoc', parent: { url: 'tarobot-widget://sandbox/widget-sandbox.html', parent: { url: 'tarobot://app/index.html', parent: null } } };
-  session.network({ url: 'https://cdn.example.com/data.json', resourceType: 'xhr', frame: guest }, result => assert.deepEqual(result, { cancel: false }));
+  session.network({ url: 'https://cdn.example.com/data.json', resourceType: 'xhr', frame: guest }, result => assert.deepEqual(result, { cancel: true }));
   for (const frame of [null, undefined]) {
     session.send({ url: 'https://cdn.example.com/data.json', resourceType: 'xhr', frame, requestHeaders: { Cookie: 'a=1', Authorization: 'x', 'Proxy-Authorization': 'y', Accept: '*/*' } }, result => assert.deepEqual(result, { requestHeaders: { Accept: '*/*' } }));
     session.receive({ url: 'https://cdn.example.com/data.json', resourceType: 'xhr', frame, responseHeaders: { 'Set-Cookie': ['a=1'], 'set-cookie2': ['b=2'], 'Content-Type': ['application/json'] } }, result => assert.deepEqual(result, { responseHeaders: { 'Content-Type': ['application/json'] } }));

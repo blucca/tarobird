@@ -194,7 +194,13 @@ Checked on 2026-11-22 for the symbols:
 - The repository's Claude adapter and Gateway against a real Claude Code
   2.1.330 on a subscription, with a process started for the check and no
   prompt sent: every `get_usage` took 3.6 to 5.1 s (the CLI fetches the figures
-  each time), which is why the adapter waits up to 7 s; the reply gave the
+  each time), which is why a read waits up to 7 s. Since 2026-11-23 the
+  question is not dropped when that read gives up: it stays out for up to five
+  minutes, one per process at a time, and an answer inside that time becomes the
+  Bot's reading for the next read. On that day, with the machine heavily
+  loaded, another Bot measured 69 to 90 s per `get_usage` and no reading was
+  ever kept; how long it takes on an idle machine was not measured again. The
+  2026-11-22 reply gave the
   shared weekly window and one `model_scoped` entry; a second refresh inside
   the cooldown was answered from the process's record. `get_context_usage`
   took 0.8 to 0.9 s with that user's full configuration.

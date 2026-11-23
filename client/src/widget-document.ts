@@ -1,9 +1,10 @@
 import type { Widget } from "../../src/client-protocol/widget.js";
 
-// The opaque guest may load https/wss only. External scripts are fetched and
-// evaluated inside the Worker, so script-src stays nonce-only; frames, objects,
-// forms, base URLs and every non-https scheme stay closed.
-export const WIDGET_CSP = "default-src 'none'; script-src 'nonce-WIDGET_NONCE' 'unsafe-eval'; worker-src blob:; style-src 'unsafe-inline' https:; img-src data: https:; media-src https:; font-src data: https:; connect-src https: wss:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+// The opaque guest has no network, as in 1.5.1: nothing is requested and nothing
+// outside the widget is loaded. Images and fonts are data: only; styles and
+// scripts are inline. (https/wss was allowed from 2026-11-21 to 2026-11-23 on
+// main and never released.) This policy is the boundary, not the guidance.
+export const WIDGET_CSP = "default-src 'none'; script-src 'nonce-WIDGET_NONCE' 'unsafe-eval'; worker-src blob:; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 export type WidgetTheme = Record<string, string>;
 // Categorical data colours (--cat-N graphics, -ink text, -soft tint) plus the
 // palette's light and dark sets. A widget drawn for a fixed canvas gets that

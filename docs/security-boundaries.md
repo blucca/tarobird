@@ -905,7 +905,33 @@ JavaScript-thread guarantee. Older clients retain their old reader. See the
 
 ### Widget network access (2026-11-21)
 
-**What a widget can now do.** Any published widget can
+**Withdrawn on 2026-11-23, before any release.** Widgets have no network
+again, as in 1.5.1. The owner's decision, after reading the exfiltration risk
+described below: "感觉还是卡片不要联网了，和以前一样". What is in force:
+
+- The widget frame's policy is the 1.5.1 one (`connect-src 'none'`, images and
+  fonts `data:` only, inline styles and scripts only), in the guest document
+  (`client/src/widget-document.ts`), the relay page
+  (`client/public/widget-sandbox.html`) and the Electron response header
+  (`client/electron/assets.mjs`). The browser engine enforces it on every
+  platform; no request leaves a widget and nothing external loads.
+- Electron cancels every request that is not one of the App's own resources,
+  widget frames included.
+- The Host refuses a widget that references an external script or stylesheet
+  when it is published, so a Bot is told at once.
+- New sessions get the tool description that says "No network or host APIs",
+  and the widget guidance says the same.
+
+Widgets published between 2026-11-21 and 2026-11-23 that relied on external
+resources show their static markup only. The loopback and redirect exposure
+listed under "Residual exposure" below does not apply while widgets are
+offline. The Worker's network wrappers and Electron's `widgetNetworkRequest`
+are still in the source, unused. The rest of this section records the
+main-only design of those three days; it does not describe the shipped App.
+Other documents that point here with "Superseded on 2026-11-21" are superseded
+in turn by this paragraph.
+
+**What a widget could do under that design.** Any published widget can
 send data it contains (including anything the Bot put into it from the
 conversation or from tools) to any public https/wss endpoint, load tracking
 images or fonts, and run third-party scripts fetched at view time inside its
