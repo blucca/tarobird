@@ -352,9 +352,18 @@ test("a late fullscreen close cannot remove the same Host viewer reopened after 
  await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
 });
 
+test("quality menu labels options by resolution and shows actual stream resolution in tooltip once connected",async({page})=>{
+ const select=page.getByLabel("画面清晰度",{exact:true});
+ await expect(select).toHaveValue("balanced");
+ await expect(select.locator("option")).toHaveText(["720p","1080p","最高 3K"]);
+ await expect(select).toHaveAttribute("title","当前 1280×720 · 720p 节省带宽，最高 3K 保留更多文字细节");
+ await page.getByRole("button",{name:"断开",exact:true}).click();
+ await expect(select).toHaveAttribute("title","720p 节省带宽，最高 3K 保留更多文字细节");
+});
+
 test("Sharp requires a compatible high-resolution decoder before any replacement session is created",async({page})=>{
  await page.evaluate(()=>{const original=VideoDecoder.isConfigSupported.bind(VideoDecoder);VideoDecoder.isConfigSupported=async config=>config.codec==="avc1.640033"?{supported:false,config}:original(config);});
- await page.getByLabel("画面清晰度",{exact:true}).selectOption("sharp");await expect(page.getByRole("status")).toContainText("此设备不支持清晰画质解码");
+ await page.getByLabel("画面清晰度",{exact:true}).selectOption("sharp");await expect(page.getByRole("status")).toContainText("此设备不支持最高 3K 解码");
  expect(await page.evaluate(()=>(window as any).screenFixture.requests.length)).toBe(1);
  await page.getByLabel("画面清晰度",{exact:true}).selectOption("smooth");await page.getByRole("button",{name:"连接屏幕",exact:true}).click();await expect(page.getByRole("button",{name:"开始控制",exact:true})).toBeEnabled();
  expect(await page.evaluate(()=>(window as any).screenFixture.requests.at(-1).quality)).toBe("smooth");

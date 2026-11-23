@@ -80,6 +80,7 @@
 @media(max-width:440px){.screen-readiness{gap:8px}.screen-permission-row{gap:8px}.screen-settings-heading{gap:6px}.screen-setting-row{flex-wrap:wrap}.screen-setting-row select{max-width:100%}}
 
 .screen-resolution{white-space:nowrap;font-variant-numeric:tabular-nums}
+.screen-quality-actual{display:block;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
 
 /* Native mobile viewing owns the available window, independently of chat width.
    Safe insets use the shared tokens: env() on iOS (Capacitor injects no
