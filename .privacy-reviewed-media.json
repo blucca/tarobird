@@ -556,10 +556,10 @@
     },
     {
       "path": "assets/product/engines.png",
-      "sha256": "47dff7f83c2c737fc11ac9bf5b019a07a61a536fd6a766a1aad4a9b0e39ea7a7",
-      "reviewer": "codex",
+      "sha256": "51c35944fcffd3448f967a18ef3d0f15686ebacb70c9d76b1f020056fc81b0aa",
+      "reviewer": "claude",
       "method": "visual-review",
-      "note": "Visual review of exact product demonstration image; OCR and known-owner-marker checks passed. Demonstration UI text only."
+      "note": "Visual review of the exact image: the previous engines strip unchanged plus a Pi card (Pi logo in one colour, title and command). Demonstration text only; PNG has no text or EXIF metadata."
     },
     {
       "path": "assets/product/feature-changes-en.png",

@@ -21,6 +21,7 @@ The project license does not replace those component notices.
 | --- | --- |
 | `deepseek-harness-plugin/` | Independently published DeepSeek search plugin; MIT, as stated in its own `LICENSE` and package metadata |
 | `client/src/assets/model-brands/`, also used in `assets/product/engines.png` | LobeHub model-brand icons; MIT and the existing trademark notice |
+| Pi mark in `assets/product/engines.png` | Pi project logo from pi.dev, shown in one colour to identify the supported engine; the existing trademark notice applies |
 | `client/src/assets/fonts/sarasa-term-sc/` | Sarasa Term SC; its included font license |
 | `assets/product/fonts/` | Bricolage Grotesque and Instrument Sans; their included OFL notices |
 | `client/vendor/baoyu-{design,slides}/`, `skills/baoyu-{design,ppt}/` | baoyu-design: mixed licensing. Maintainer original work is MIT; reconstructed Anthropic editor, references and Anthropicons are excluded from that grant. See upstream LICENSE, NOTICE.md and editor/third-party-licenses.txt. Pinned source and file hashes: UPSTREAM.json. Build retains notices in client/dist/licenses/baoyu-*/ for both editors. Skill references retain the same upstream notices; they are not represented as MIT. |

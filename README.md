@@ -214,7 +214,7 @@ Right-click a folder name or an empty area of the desktop list to group by host,
 
 ## Supported engines
 
-<p align="center"><img src="assets/product/engines.png" width="100%" alt="Supported engines: Codex (codex), Claude Code (claude), Kimi Code (kimi), DeepSeek Harness (dsh), Antigravity (agy)"></p>
+<p align="center"><img src="assets/product/engines.png" width="100%" alt="Supported engines: Codex (codex), Claude Code (claude), Kimi Code (kimi), DeepSeek Harness (dsh), Antigravity (agy), Pi (pi)"></p>
 
 **Built on official native CLIs.** TaroBird does not reimplement agents. It runs the official command-line tools of Codex, Claude Code, Kimi Code, DeepSeek Harness, Antigravity and Pi. A harness is the execution system around a model — its agent loop, tool use, context and session management — and the harness a provider builds and tunes for its own model brings out the best in it. TaroBird adds desktop and phone access, multi-Bot collaboration and a unified workspace on top.
 

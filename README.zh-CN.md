@@ -214,7 +214,7 @@ TaroBird 是一款自托管的 AI 智能体工作空间。它把电脑或服务�
 
 ## 支持的引擎
 
-<p align="center"><img src="assets/product/engines.png" width="100%" alt="支持的引擎：Codex（codex）、Claude Code（claude）、Kimi Code（kimi）、DeepSeek Harness（dsh）、Antigravity（agy）"></p>
+<p align="center"><img src="assets/product/engines.png" width="100%" alt="支持的引擎：Codex（codex）、Claude Code（claude）、Kimi Code（kimi）、DeepSeek Harness（dsh）、Antigravity（agy）、Pi（pi）"></p>
 
 **基于官方原生 CLI 构建。** TaroBird 不重新实现智能体，而是直接调用 Codex、Claude Code、Kimi Code、DeepSeek Harness、Antigravity 与 Pi 的官方命令行工具。Harness 是模型背后的执行系统，涵盖智能体循环、工具调用、上下文与会话管理；由模型厂商亲自打磨的 harness，最能发挥模型的能力。TaroBird 在此之上提供桌面与手机入口、多 Bot 协作与统一的对话界面。
 
