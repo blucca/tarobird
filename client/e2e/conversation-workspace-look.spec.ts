@@ -236,11 +236,26 @@ test("a turn's changes are listed by file name with green and red counts; the re
     // The names are the Hub's record of that run (two edits in the fixture's journal), not the totals on the card.
     await expect(row.locator(".workspace-diff-name")).toHaveText(["ConversationWorkspace.tsx", "bot-messages.ts"]);
     await expect(row.locator(".workspace-diff-name").first()).toHaveAttribute("title", "client/src/ConversationWorkspace.tsx");
-    await expect(row.locator(".workspace-diff-counts").first().locator("span")).toHaveText(["+2", "−1"]);
-    await expect(row.locator(".workspace-diff-counts").last().locator("span")).toHaveText(["+1", "−1"]);
-    const colours = await row.locator(".workspace-diff-counts").first().locator("span").evaluateAll(spans => spans.map(span => getComputedStyle(span).color));
-    expect(colours).toEqual([await token(page, "--green"), await token(page, "--red")]);
-    expect(colours[0]).not.toBe(colours[1]);
+    await expect(row.locator(".workspace-diff-counts").first().locator("span")).toHaveText(["+2", "-1"]);
+    await expect(row.locator(".workspace-diff-counts").last().locator("span")).toHaveText(["+1", "-1"]);
+    const countsMetrics = await row.locator(".workspace-diff-counts").first().evaluate(node => {
+      const style = getComputedStyle(node);
+      const spans = [...node.querySelectorAll("span")].map(span => {
+        const box = span.getBoundingClientRect();
+        const range = document.createRange();
+        range.selectNodeContents(span);
+        const textBox = range.getBoundingClientRect();
+        return { color: getComputedStyle(span).color, top: box.top, bottom: box.bottom, height: box.height, textTop: textBox.top, textBottom: textBox.bottom };
+      });
+      return { alignItems: style.alignItems, fontVariantNumeric: style.fontVariantNumeric, spans };
+    });
+    expect(countsMetrics.alignItems).toBe("baseline");
+    expect(countsMetrics.fontVariantNumeric).toBe("tabular-nums");
+    expect(countsMetrics.spans.map(s => s.color)).toEqual([await token(page, "--green"), await token(page, "--red")]);
+    expect(countsMetrics.spans[0]!.color).not.toBe(countsMetrics.spans[1]!.color);
+    expect(Math.abs(countsMetrics.spans[0]!.top - countsMetrics.spans[1]!.top)).toBeLessThan(0.5);
+    expect(Math.abs(countsMetrics.spans[0]!.height - countsMetrics.spans[1]!.height)).toBeLessThan(0.5);
+    expect(Math.abs(countsMetrics.spans[0]!.textBottom - countsMetrics.spans[1]!.textBottom)).toBeLessThan(0.5);
     expect(await row.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
     // On the reply itself the entry carries no counts and no names.
     const reply = page.locator(".host-workspace:not([hidden])").getByRole("region", { name: "运行回复", exact: true });
@@ -259,7 +274,7 @@ test("when the names cannot be read, the saved totals stand in, still green and 
     await open();
     const row = rail(page).locator(".workspace-diff-row");
     await expect(row.locator(".workspace-diff-name")).toHaveText(["改动 2 个文件"]);
-    await expect(row.locator(".workspace-diff-counts span")).toHaveText(["+14", "−3"]);
+    await expect(row.locator(".workspace-diff-counts span")).toHaveText(["+14", "-3"]);
     expect(await row.locator(".workspace-diff-counts span").evaluateAll(spans => spans.map(span => getComputedStyle(span).color))).toEqual([await token(page, "--green"), await token(page, "--red")]);
   } finally { await done(); }
 });
