@@ -133,8 +133,10 @@ test("overview: a message being handled is not in line, hidden tasks are counted
   try {
     await open();
     const live = rail(page).locator(".workspace-section").nth(1);
-    // The Host says this message is "dispatched": the Bot has it. It used to read "队列第 1 位".
-    await expect(live.locator(".workspace-item-meta").last()).toHaveText("处理中");
+    // The Host says this message is "dispatched": it belongs in the Replying row, not a queue row.
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["请协调评审并汇总基准测试结果。"]);
+    await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toHaveText(["正在回复 · Architect"]);
+    await expect(live.locator(".workspace-queue-row")).toHaveCount(0);
     await expect(live).not.toContainText("队列第");
     await expect(live.locator(".workspace-more-hint")).toHaveText("还有 1 个后台任务");
     const chatSize = await page.locator(".file-card-meta small").first().innerText();
@@ -261,5 +263,47 @@ test("when the names cannot be read, the saved totals stand in, still green and 
     await expect(row.locator(".workspace-diff-name")).toHaveText(["改动 2 个文件"]);
     await expect(row.locator(".workspace-diff-counts span")).toHaveText(["+14", "−3"]);
     expect(await row.locator(".workspace-diff-counts span").evaluateAll(spans => spans.map(span => getComputedStyle(span).color))).toEqual([await token(page, "--green"), await token(page, "--red")]);
+  } finally { await done(); }
+});
+
+test("Replying row names the answered message, avoids duplicate queue rows, advances when done, and lists each replying Bot in a group", async ({ browser }) => {
+  const { page, f, open, done } = await ready(browser, "zh", 1440);
+  try {
+    // Direct chat: send 1st message (being answered), then 2nd and 3rd queued behind it.
+    const m1 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.main, clientMsgId: "q-1", text: "第一条：正在处理中的长消息内容", attachments: [], mentions: ["bot_arch"], previewUrl: null })).message;
+    const m2 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.main, clientMsgId: "q-2", text: "第二条：排在前面的消息", attachments: [], mentions: ["bot_arch"], previewUrl: null })).message;
+    const m3 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.main, clientMsgId: "q-3", text: "第三条：排在后面的消息", attachments: [], mentions: ["bot_arch"], previewUrl: null })).message;
+    await f.hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [f.ids.userMsg, "bot_arch"]);
+    await f.hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id=?", [m1.id, "bot_arch"]);
+    const reply1 = await f.hub.store.publishBotMessage("bot_arch", { conversationId: f.ids.main, replyTo: m1.id, blocks: [{ type: "text", text: "正在分析第一条…" }], status: "streaming" });
+    await open();
+    const live = rail(page).locator(".workspace-section").nth(1);
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(1);
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["第一条：正在处理中的长消息内容"]);
+    await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toHaveText(["正在回复 · Architect"]);
+    await expect(live.locator(".workspace-queue-row")).toHaveCount(2);
+    await expect(live.locator(".workspace-queue-row .workspace-item-title")).toHaveText(["第二条：排在前面的消息", "第三条：排在后面的消息"]);
+    await expect(live.locator(".workspace-queue-row .workspace-item-meta")).toHaveText(["队列第 1 位", "队列第 2 位"]);
+
+    // First reply finishes and second message moves into Replying; queue shrinks to 1.
+    await f.hub.store.publishBotMessage("bot_arch", { id: reply1.id, conversationId: f.ids.main, replyTo: m1.id, blocks: [{ type: "text", text: "第一条已完成。" }], status: "complete" });
+    await f.hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [m1.id, "bot_arch"]);
+    await f.hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id=?", [m2.id, "bot_arch"]);
+    await f.hub.store.publishBotMessage("bot_arch", { conversationId: f.ids.main, replyTo: m2.id, blocks: [{ type: "text", text: "正在处理第二条…" }], status: "streaming" });
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["第二条：排在前面的消息"]);
+    await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toHaveText(["正在回复 · Architect"]);
+    await expect(live.locator(".workspace-queue-row")).toHaveCount(1);
+    await expect(live.locator(".workspace-queue-row .workspace-item-title")).toHaveText(["第三条：排在后面的消息"]);
+    await expect(live.locator(".workspace-queue-row .workspace-item-meta")).toHaveText(["队列第 1 位"]);
+
+    // Group chat: two Bots replying concurrently show one row each with Bot + answered message.
+    const g1 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.group, clientMsgId: "g-1", text: "请架构师核对接口设计", attachments: [], mentions: ["bot_arch"], previewUrl: null })).message;
+    const g2 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.group, clientMsgId: "g-2", text: "请审查员检查回归用例", attachments: [], mentions: ["bot_rev"], previewUrl: null })).message;
+    await f.hub.store.publishBotMessage("bot_arch", { conversationId: f.ids.group, replyTo: g1.id, blocks: [{ type: "text", text: "核对中…" }], status: "streaming" });
+    await f.hub.store.publishBotMessage("bot_rev", { conversationId: f.ids.group, replyTo: g2.id, blocks: [{ type: "text", text: "检查中…" }], status: "streaming" });
+    await openConv(page, "发布群");
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(2);
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["请架构师核对接口设计", "请审查员检查回归用例"]);
+    await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toHaveText(["正在回复 · Architect", "正在回复 · Reviewer"]);
   } finally { await done(); }
 });
