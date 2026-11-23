@@ -4,7 +4,7 @@ TaroBird runs [Pi](https://github.com/earendil-works/pi) as its own engine throu
 Pi's JSONL RPC transport. It does not translate requests into Codex or another
 engine. The integration is checked against Pi 1.5.2 and 1.6.0. Pi is an ordinary Bot
 engine; it cannot be selected as a Chancellor (Chief of Staff) or a dispatched
-engine worker. This development integration is not yet in a stable release.
+engine worker. Pi support ships from TaroBird 1.6.0.
 
 ## Install and select
 

@@ -41,6 +41,7 @@
 | Kimi Code | `kimi` | — | ACP 会话与原生 compact；暂不提供逐轮用量与原生 goal |
 | DeepSeek Harness | `dsh` | 支持 | 原生 goal 与 token 预算；不提供美元费用统计 |
 | Antigravity | `agy` | — | 按主机与账号发现模型，可用时包含 Gemini 4 Argon；不支持手动 compact |
+| Pi | `pi` | 支持 | 按 Pi 自身目录选择「提供商＋模型」；原生 `/model`、`/thinking`、`/session`、分叉与 compact；仅作普通 Bot，不参与幕僚长派工。[Pi 引擎](client/pi-engine.md) |
 
 创建 Bot 前，请先在主机终端用所选 CLI 完成一次简单请求。检测到程序并不代表已登录、有额度或有模型权限；引擎只安装在当前主机，不会同步到其他主机或中转服务器。
 
@@ -230,7 +231,7 @@ tarobot devices approve 12345678
 | 回答提问或批准请求 | 在对应卡片里提交。输入栏另发的普通消息是下一条任务，不会被猜成答案。 |
 | 看哪条 prompt 已被回复 | 用户消息时间旁的小标识显示回复中、已回复或回复失败；等待、已停止、中断、未确认状态分别表达。没有可靠回复记录时不加标记。 |
 
-队列管理要求主机与 worker 版本支持，目前用于**私聊**，不用于群聊或话题。五种引擎都可使用这份主机待执行队列；它不是 CLI 原生队列的镜像。`tarobot queue list/move/edit/cancel` 共用相同状态和冲突检查。[队列行为](client/prompt-queue-2026-10-14.md) · [回复标识](client/user-reply-status-2026-10-16.md)。
+队列管理要求主机与 worker 版本支持，目前用于**私聊**，不用于群聊或话题。六种引擎都可使用这份主机待执行队列；它不是 CLI 原生队列的镜像。`tarobot queue list/move/edit/cancel` 共用相同状态和冲突检查。[队列行为](client/prompt-queue-2026-10-14.md) · [回复标识](client/user-reply-status-2026-10-16.md)。
 
 运行卡片保留清晰的最终结果，过程可展开。工具执行错误仍留在过程记录里，但某次工具失败不会直接把整个任务判为失败。Claude 的后台/子代理事件保留自己的归属，不会作为无关 prompt 的回复。思考只展示引擎实际公开的内容，不编造私有推理或进度百分比。[Claude 事件覆盖](client/claude-scoped-process-2026-10-15.md)。
 

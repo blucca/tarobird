@@ -41,6 +41,7 @@ Install and sign in to an engine on the computer that will run the Bot, under th
 | Kimi Code | `kimi` | — | ACP sessions and native compact; no per-turn usage or native goals in the current adapter |
 | DeepSeek Harness | `dsh` | Yes | Native goals and token budgets; no dollar-cost reporting |
 | Antigravity | `agy` | — | Host/account model discovery, including Gemini 4 Argon when available; no manual compact |
+| Pi | `pi` | Yes | Provider-and-model pairs from Pi's own catalog; native `/model`, `/thinking`, `/session`, forks and compaction; ordinary Bots only, not Chancellor dispatch. [Pi engine](client/pi-engine.md) |
 
 Before creating a Bot, run a simple request with the chosen CLI in the host's terminal. Detecting an executable does not prove sign-in, quota or model access, and an engine installed on one host is not installed on other hosts or relays.
 
@@ -230,7 +231,7 @@ These are current-user services, normally started at login. The computer must st
 | Answer a question or approval | Submit in its card. Sending a new ordinary chat message queues another task; it is not guessed to be the answer. |
 | Check which prompt was answered | A quiet marker beside the user-message time shows replying, replied or reply failure. Waiting, stopped, interrupted and unconfirmed states remain distinct. No reliable reply evidence means no marker. |
 
-Queue controls require a compatible host and worker, and currently apply to **direct conversations**, not groups/topics. All five engines can use this host-held queue; it is not a mirror of their native CLI queues. `tarobot queue list/move/edit/cancel` uses the same state and conflict checks. [Queue behavior](client/prompt-queue-2026-10-14.md) · [Reply markers](client/user-reply-status-2026-10-16.md).
+Queue controls require a compatible host and worker, and currently apply to **direct conversations**, not groups/topics. All six engines can use this host-held queue; it is not a mirror of their native CLI queues. `tarobot queue list/move/edit/cancel` uses the same state and conflict checks. [Queue behavior](client/prompt-queue-2026-10-14.md) · [Reply markers](client/user-reply-status-2026-10-16.md).
 
 Run cards keep the final answer readable and the process expandable. Tool errors remain visible in the process, but a failed tool attempt alone does not label the whole task failed. Claude background/subagent events keep their own scope rather than becoming a reply to an unrelated prompt. Reasoning shows only what the engine actually exposes, never a fabricated private thought process or progress percentage. [Claude event coverage](client/claude-scoped-process-2026-10-15.md).
 

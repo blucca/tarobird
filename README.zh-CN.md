@@ -5,7 +5,7 @@
 <h3 align="center">你的 AI 智能体，运行在你自己的电脑上。<br>桌面与手机，延续同一段对话。</h3>
 
 <p align="center">
-  Codex · Claude Code · Kimi Code · DeepSeek Harness · Antigravity
+  Codex · Claude Code · Kimi Code · DeepSeek Harness · Antigravity · Pi
 </p>
 
 <p align="center">
@@ -216,13 +216,13 @@ TaroBird 是一款自托管的 AI 智能体工作空间。它把电脑或服务�
 
 <p align="center"><img src="assets/product/engines.png" width="100%" alt="支持的引擎：Codex（codex）、Claude Code（claude）、Kimi Code（kimi）、DeepSeek Harness（dsh）、Antigravity（agy）"></p>
 
-**基于官方原生 CLI 构建。** TaroBird 不重新实现智能体，而是直接调用 Codex、Claude Code、Kimi Code、DeepSeek Harness 与 Antigravity 的官方命令行工具。Harness 是模型背后的执行系统，涵盖智能体循环、工具调用、上下文与会话管理；由模型厂商亲自打磨的 harness，最能发挥模型的能力。TaroBird 在此之上提供桌面与手机入口、多 Bot 协作与统一的对话界面。
+**基于官方原生 CLI 构建。** TaroBird 不重新实现智能体，而是直接调用 Codex、Claude Code、Kimi Code、DeepSeek Harness、Antigravity 与 Pi 的官方命令行工具。Harness 是模型背后的执行系统，涵盖智能体循环、工具调用、上下文与会话管理；由模型厂商亲自打磨的 harness，最能发挥模型的能力。TaroBird 在此之上提供桌面与手机入口、多 Bot 协作与统一的对话界面。
 
 **随上游演进持续增强。** 主机上的 CLI 升级后，其在执行、上下文处理与稳定性方面的改进会直接惠及 TaroBird 中的 Bot。具体能力取决于所安装的 CLI、账号与适配器，新增接口可能需要 TaroBird 进一步适配。[引擎能力对照](docs/client/capability-map.md)
 
 在运行 Bot 的电脑上安装并登录任意一种引擎即可开始使用；TaroBird 不附带 AI 引擎、模型账号或额度。各引擎的适配差异见[引擎对照](docs/details.zh-CN.md#引擎对照)。
 
-**开发分支新增：** [Pi 原生接入](docs/client/pi-engine.md)，按提供商选择模型，并支持原生对话控制。当前稳定版尚未包含；Pi 仅作为普通 Bot，不加入幕僚长及其派工引擎。
+**1.6.0 起支持 Pi：** [Pi 原生接入](docs/client/pi-engine.md)，按提供商选择模型，并支持原生对话控制。Pi 仅作为普通 Bot，不加入幕僚长及其派工引擎。
 
 <a id="引擎"></a>
 

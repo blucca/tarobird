@@ -12,6 +12,7 @@
 | 新对话、群组、群内话题 | 沿用 Bot 配置，以 conversation ID 划分原生 session；话题继承群的 Bot | `gateway-service`，浏览器 `creation`、`topics` |
 | 原生 session 恢复／解绑／重置 | `/resume`、`/detach`、`/reset` 及会话管理；显式绑定后才共享 session | `gateway-service`、`gateway-operations`；引擎原生会话格式由既有适配器负责 |
 | Codex／Claude／Kimi／DeepSeek／Antigravity | 继续启动各自本机 CLI/协议；保留项目指令、认证、MCP 和插件 | 五引擎均有双端真实轮次、重启记忆和强杀恢复证据。最新精简提示词后的 Claude／Kimi／DeepSeek／Antigravity 还通过带说明文件交付、两端下载及手机停止续聊；修正了 AGY 命令检测和 Claude 停止时序。见当前跨引擎验收（本地材料：`evidence/cross-engine-app-acceptance.md`）；原生 App 文件工具已接入 Codex、[Claude](claude-native-app-tools.md) 和 [DeepSeek](deepseek-native-app-tools.md)，对应文件／批次和重启证据见各自记录；Kimi／Antigravity 的[原生接入缺口](native-tool-extension-gaps.md)及各引擎完整功能矩阵继续验收 |
+| Pi（1.6.0 起） | 通过 Pi 的 JSONL RPC 直接运行本机 `pi`，保留其提供商、模型、技能、扩展和 MCP 设置；仅作普通 Bot，不参与幕僚长派工 | 实现与验证边界见 [Pi 原生引擎](pi-engine.md) |
 | MCP、插件、技能 | 引擎读取原生全局配置和受信任的当前工作区配置；worker 载入 instance `lark.env` 与共享 `~/.cctb/shared.env` | `gateway-environment` 验证覆盖顺序和受限键过滤；`gateway-voice` 验证 MCP 工具事件、结果和审批。真实 Claude／Kimi＋本机 MCP 已验证正常审批、手机拒绝阻止写入、回传文件和两端下载字节；Codex 0.159.3 已验证正常模式的 MCP 单次确认、原生表单、两端下载与手机停止无追加写入；Kimi 2.1.1 的项目 MCP 需要预先原生工作区信任；远端 MCP 可用性仍取决于其服务和凭证 |
 | 流式文字／思考／工具／计划 | 共用运行卡片和事件翻译；运行中工具详情可见，完成后按 TaroCub 原逻辑折叠摘要 | `gateway-cards`、`gateway-card-states`；浏览器 `stream`、`card-layout` |
 | 停止、排队、中途引导、后台进程 | 停止按钮与 `/stop`；`/q`、`/steer`、`/bg` 复用原处理器及引擎能力 | `gateway-recovery`、`gateway-workflows`、`gateway-voice`；引导仍受引擎和窗口限制 |

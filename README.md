@@ -5,7 +5,7 @@
 <h3 align="center">Your AI agents, running on your own computers.<br>The same conversations on desktop and phone.</h3>
 
 <p align="center">
-  Codex · Claude Code · Kimi Code · DeepSeek Harness · Antigravity
+  Codex · Claude Code · Kimi Code · DeepSeek Harness · Antigravity · Pi
 </p>
 
 <p align="center">
@@ -216,13 +216,13 @@ Right-click a folder name or an empty area of the desktop list to group by host,
 
 <p align="center"><img src="assets/product/engines.png" width="100%" alt="Supported engines: Codex (codex), Claude Code (claude), Kimi Code (kimi), DeepSeek Harness (dsh), Antigravity (agy)"></p>
 
-**Built on official native CLIs.** TaroBird does not reimplement agents. It runs the official command-line tools of Codex, Claude Code, Kimi Code, DeepSeek Harness and Antigravity. A harness is the execution system around a model — its agent loop, tool use, context and session management — and the harness a provider builds and tunes for its own model brings out the best in it. TaroBird adds desktop and phone access, multi-Bot collaboration and a unified workspace on top.
+**Built on official native CLIs.** TaroBird does not reimplement agents. It runs the official command-line tools of Codex, Claude Code, Kimi Code, DeepSeek Harness, Antigravity and Pi. A harness is the execution system around a model — its agent loop, tool use, context and session management — and the harness a provider builds and tunes for its own model brings out the best in it. TaroBird adds desktop and phone access, multi-Bot collaboration and a unified workspace on top.
 
 **Improves as the CLIs evolve.** When a host's CLI is updated, its gains in execution, context handling and reliability carry straight into TaroBird's Bots. Available capabilities depend on the installed CLI, account and adapter, and new interfaces may require further TaroBird adaptation. [Engine capabilities](docs/client/capability-map.md)
 
 Install and sign in to any one engine on the computer that runs your Bots to get started; TaroBird does not include AI engines, model accounts or credits. See the [engine comparison](docs/details.md#engine-comparison) for adapter differences.
 
-**Development branch:** [Pi native integration](docs/client/pi-engine.md) adds provider-aware model selection and native conversation controls for ordinary Bots. It is not part of the current stable release and is excluded from Chancellor dispatch.
+**Pi, from 1.6.0:** [Pi native integration](docs/client/pi-engine.md) adds provider-aware model selection and native conversation controls for ordinary Bots. Pi is excluded from Chancellor dispatch.
 
 <a id="engines"></a>
 
