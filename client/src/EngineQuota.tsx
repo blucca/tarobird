@@ -5,6 +5,7 @@ import type { HubConnection } from "./connection.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
 import { SettingsGroupHeading } from "./SettingsParts.js";
 import { useEngineQuota } from "./use-engine-quota.js";
+import { QUOTA_SHOWN_FOR_MS, quotaReadingAgeLabel } from "./usage-readings.js";
 import { t, useLocale } from "./i18n.js";
 import "./engine-quota.css";
 
@@ -87,9 +88,11 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
       {quota.directory?.truncated && <p className="quota-notice" role="status">{t("主机只返回了部分 Bot 的额度状态。")}</p>}
       {quota.directory && !quota.directory.scopes.length && <p role="status">{t("当前主机还没有可展示额度的 Bot。")}</p>}
       <div className="quota-list">{quota.directory?.scopes.map(scope => {
-        // Same rule as the Gateway, re-evaluated locally as time passes: TTL, window/balance expiry and constraint resets.
-        const stale = !online || !!quota.error || !!quota.errors[scope.id] || scope.state === "stale" || quotaReadingExpired(scope, now);
-        const status = stale ? t("待更新") : ({ ready: t("已读取"), stale: t("待更新"), unknown: t("尚无数据"), login_required: t("需要登录"), offline: t("离线"), unavailable: t("暂不可用"), unsupported: t("暂不支持") })[scope.state];
+        // Same rule as the conversation battery: stale once past fresh period, host-marked stale, or offline.
+        const observedAge = scope.observedAt ? Math.max(0, now - Date.parse(scope.observedAt)) : 0;
+        const stale = !online || !!quota.error || !!quota.errors[scope.id] || scope.state === "stale" || quotaReadingExpired(scope, now) || (!!scope.observedAt && observedAge >= QUOTA_SHOWN_FOR_MS);
+        const ageLabel = scope.observedAt ? quotaReadingAgeLabel(scope.observedAt, now, locale) : "";
+        const status = stale ? (ageLabel ? t("旧读数 · {0}", ageLabel) : t("待更新")) : ({ ready: t("已读取"), stale: t("待更新"), unknown: t("尚无数据"), login_required: t("需要登录"), offline: t("离线"), unavailable: t("暂不可用"), unsupported: t("暂不支持") })[scope.state];
         const passive = scope.capability.mode === "passive";
         const canRead = scope.capability.mode !== "unsupported" && scope.state !== "offline" && scope.state !== "unsupported" && scope.reason !== "host_upgrade_required";
         const cooling = !!scope.nextRefreshAt && Date.parse(scope.nextRefreshAt) > now;
@@ -105,10 +108,14 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
           {passive && <p className="muted">{t("仅显示正常使用中收到的状态；读取不会触发新对话。")}</p>}
           {availabilityNotice && <p className="quota-notice">{stale ? t("上次读数：{0}", availabilityNotice) : availabilityNotice}</p>}
           {constraints.length > 0 && <ul className="quota-constraints">{constraints.map((value, index) => <li key={`${value.code}:${index}`}>{constraintText(value)}{value.resetsAt && <span> · {Date.parse(value.resetsAt) <= now ? t("已到重置时间，等待更新") : t("重置：{0}", formatTime(value.resetsAt))}</span>}</li>)}</ul>}
-          {scope.pools.map(pool => <div className="quota-pool" key={pool.id}><h5>{pool.label}</h5>{pool.models?.length ? <p className="muted">{pool.models.join(" · ")}</p> : null}
-            {pool.windows.map(window => <WindowQuota key={window.id} window={window} stale={stale} now={now} formatTime={formatTime} formatNumber={formatNumber}/>)}
-            {pool.balances.map(balance => <p className="quota-balance" key={balance.id}>{t("原生 credits")}<strong>{balance.unlimited ? t("不限额") : balance.amount === null ? t("尚无数据") : `${balance.amount} credits`}</strong>{(stale || expired(balance, now)) && <small>{t("上次读数，需重新读取")}</small>}</p>)}
-          </div>)}
+          {scope.pools.map(pool => {
+            const visibleWindows = pool.windows.filter(window => !(window.resetsAt && Date.parse(window.resetsAt) <= now));
+            return <div className="quota-pool" key={pool.id}><h5>{pool.label}</h5>{pool.models?.length ? <p className="muted">{pool.models.join(" · ")}</p> : null}
+              {visibleWindows.map(window => <WindowQuota key={window.id} window={window} stale={stale} now={now} formatTime={formatTime} formatNumber={formatNumber}/>)}
+              {pool.windows.length > 0 && visibleWindows.length === 0 && <p className="muted">{t("所有额度窗口已过重置时间，等待最新读数。")}</p>}
+              {pool.balances.map(balance => <p className="quota-balance" key={balance.id}>{t("原生 credits")}<strong>{balance.unlimited ? t("不限额") : balance.amount === null ? t("尚无数据") : `${balance.amount} credits`}</strong>{(stale || expired(balance, now)) && <small>{t("上次读数，需重新读取")}</small>}</p>)}
+            </div>;
+          })}
           {quota.errors[scope.id] && <p className="quota-notice" role="alert">{t("本次刷新失败，可重试。保留的读数不代表当前余额。")}</p>}
           <footer className="quota-card-footer"><div>{scope.observedAt && <time dateTime={scope.observedAt}>{t("读取于 {0}", formatTime(scope.observedAt))}</time>}{cooling && <time dateTime={scope.nextRefreshAt}>{t("{0} 后可再刷新", formatTime(scope.nextRefreshAt!))}</time>}</div>
             {canRead && <button type="button" className="secondary" disabled={!online || quota.loading || quota.busy.length >= 2 || busy || cooling || quota.error === "permission"} onClick={() => void quota.refresh(scope)}>{busy ? <LoaderCircle size={14} className="spin" aria-hidden="true"/> : <RefreshCw size={14} aria-hidden="true"/>}{busy ? t("正在读取…") : passive ? t("读取已知状态") : t("刷新")}</button>}

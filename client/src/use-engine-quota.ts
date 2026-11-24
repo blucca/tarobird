@@ -3,6 +3,7 @@ import { Capacitor } from "@capacitor/core";
 import { ENGINE_QUOTA_HUB_REFRESH_MS, type QuotaDirectory, type QuotaScope } from "../../src/client-protocol/engine-quota.js";
 import type { HubConnection } from "./connection.js";
 import { HubHttpError } from "./http-error.js";
+import { applyHostQuotaScope, cachedQuotaDirectory, subscribeQuotaStore, syncQuotaDirectory } from "./quota-store.js";
 
 type View = { connection: HubConnection; userId?: string; directory?: QuotaDirectory; loading: boolean; busy: string[]; errors: Record<string, string>; error?: string; notice?: string };
 type Request = { controller: AbortController; timer: ReturnType<typeof setTimeout> };
@@ -12,7 +13,8 @@ const finish = (value: Request) => clearTimeout(value.timer);
 const cancel = (value: Request) => { finish(value); value.controller.abort(); };
 
 /** Quota values live only in the currently authorized settings view. Opening
- * the page reads caches; native refresh is an explicit single-scope action. */
+ * the page shows saved readings immediately (marked stale) and reads live state;
+ * updates stay synchronized with the in-conversation battery via the shared quota store. */
 export function useEngineQuota(connection: HubConnection, options: { userId?: string; owner: boolean; online: boolean; supported: boolean; active: boolean }) {
   const { userId, owner, online, supported, active } = options;
   const pageVisible = () => document.visibilityState !== "hidden" && document.documentElement.dataset.mobileLocked !== "true";
@@ -35,7 +37,14 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
     }).catch(() => undefined);
     return () => { disposed = true; remove?.(); };
   }, []);
-  const [view, setView] = useState<View>({ connection, userId, loading: false, busy: [], errors: {} });
+  const [view, setView] = useState<View>(() => ({
+    connection,
+    userId,
+    directory: owner && supported ? cachedQuotaDirectory(connection, Date.now()) : undefined,
+    loading: false,
+    busy: [],
+    errors: {},
+  }));
   const viewRef = useRef(view); viewRef.current = view;
   const version = useRef(0), directoryRequest = useRef<Request>(undefined), scopes = useRef(new Map<string, Request>());
   const allowed = owner && online && supported && active && visible;
@@ -47,10 +56,21 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
   const readDirectory = useCallback(async (notice?: string) => {
     if (!current.current.allowed) return;
     stop(); const generation = version.current, operation = request(); directoryRequest.current = operation;
-    setView(previous => ({ connection, userId, directory: previous.connection === connection && previous.userId === userId ? previous.directory : undefined, loading: true, busy: [], errors: {}, notice }));
+    setView(previous => ({
+      connection,
+      userId,
+      directory: previous.connection === connection && previous.userId === userId
+        ? (previous.directory ?? cachedQuotaDirectory(connection, Date.now()))
+        : cachedQuotaDirectory(connection, Date.now()),
+      loading: true,
+      busy: [],
+      errors: {},
+      notice,
+    }));
     try {
-      const directory = await connection.readEngineQuotas(operation.controller.signal);
+      const raw = await connection.readEngineQuotas(operation.controller.signal);
       if (generation !== version.current || directoryRequest.current !== operation) return;
+      const directory = syncQuotaDirectory(connection, raw, Date.now());
       setView({ connection, userId, directory, loading: false, busy: [], errors: {}, notice });
     } catch (error) {
       if (generation !== version.current || directoryRequest.current !== operation) return;
@@ -59,10 +79,33 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
     } finally { finish(operation); if (directoryRequest.current === operation) directoryRequest.current = undefined; }
   }, [connection, userId, stop]);
   useEffect(() => {
-    stop(); setView(previous => ({ connection, userId, directory: owner && supported && active && visible && previous.connection === connection && previous.userId === userId ? previous.directory : undefined, loading: false, busy: [], errors: {} }));
+    stop();
+    setView(previous => ({
+      connection,
+      userId,
+      directory: owner && supported && active && visible
+        ? (previous.connection === connection && previous.userId === userId ? (previous.directory ?? cachedQuotaDirectory(connection, Date.now())) : cachedQuotaDirectory(connection, Date.now()))
+        : undefined,
+      loading: false,
+      busy: [],
+      errors: {},
+    }));
     if (allowed) void readDirectory();
     return stop;
   }, [connection, userId, owner, supported, active, visible, online, allowed, stop, readDirectory]);
+
+  // Keep Settings → Model quotas synchronized when an open conversation updates a Bot's quota in the background.
+  useEffect(() => {
+    if (!owner || !supported || !active || !visible) return;
+    return subscribeQuotaStore(connection, () => {
+      setView(previous => {
+        if (previous.connection !== connection || previous.userId !== userId || !previous.directory) return previous;
+        const synced = syncQuotaDirectory(connection, previous.directory, Date.now());
+        return { ...previous, directory: synced };
+      });
+    });
+  }, [connection, userId, owner, supported, active, visible]);
+
   async function refresh(scope: QuotaScope) {
     if (!current.current.allowed || directoryRequest.current || scopes.current.has(scope.id) || scopes.current.size >= 2) return;
     const before = viewRef.current;
@@ -72,6 +115,7 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
     try {
       const value = await connection.refreshEngineQuota(scope, operation.controller.signal);
       if (generation !== version.current || scopes.current.get(scope.id) !== operation) return;
+      applyHostQuotaScope(connection, scope.id, value, Date.now());
       // A directory refresh or authorization change can retire this exact card.
       setView(previous => previous.directory?.scopes.find(item => item.id === scope.id)?.revision !== scope.revision ? previous
         : { ...previous, directory: { ...previous.directory, scopes: previous.directory.scopes.map(item => item.id === scope.id ? value : item) } });
