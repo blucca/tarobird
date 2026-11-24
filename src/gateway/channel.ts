@@ -1,4 +1,4 @@
-import { WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, isSlidesRequest, designOperationCapability } from "../client-protocol/workbench-design.js";
+import { WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, isSlidesRequest, designOperationCapability, workbenchDesignError } from "../client-protocol/workbench-design.js";
 import { WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, workbenchReceiptSchema, workbenchPublishedSource, workbenchContextSchema, workbenchContextOmittedSchema, type WorkbenchSource, type WorkbenchRequest, type WorkbenchContext, type WorkbenchContextOmitted } from "../client-protocol/workbench.js";
 import { widgetsEnabled } from "../runtime/widget-policy.js";
 import { backgroundTaskSchema } from "../client-protocol/background-task.js";
@@ -178,9 +178,10 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
     if (!turn?.messageId || turn.botSource || turn.groupDiscussion) throw new Error("workbench_user_turn_required");
     if (turn.workbenchContextOmitted) throw new Error("workbench_context_unavailable");
     if (!this.transport.capabilities.includes(WORKBENCH_CAPABILITY)) throw new Error("workbench_host_update_required");
+    const designError = workbenchDesignError(request); if (designError) throw new Error(designError);
     const feature = designOperationCapability(request.operation); if(feature && !this.transport.capabilities.includes(feature)) throw new Error("workbench_design_suite_host_update_required");
     if (isSlidesRequest(request) && !this.transport.capabilities.includes(WORKBENCH_SLIDES_CAPABILITY)) throw new Error("workbench_slides_host_update_required");
-    if (request.operation.startsWith("design.") && !this.transport.capabilities.includes(WORKBENCH_DESIGN_CAPABILITY)) throw new Error("workbench_design_host_update_required");
+    if (request.operation.startsWith("design.") && !this.transport.capabilities.includes(WORKBENCH_SLIDES_CAPABILITY)) throw new Error("workbench_slides_host_update_required");
     // The Host resolves the opener of the latest input that reached this turn.
     if (request.operation === "design.open" && !this.transport.capabilities.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY)) throw new Error("workbench_design_open_host_update_required");
     if (request.operation.startsWith("markdown.") && !this.transport.capabilities.includes(WORKBENCH_MARKDOWN_CAPABILITY)) throw new Error("workbench_markdown_host_update_required");

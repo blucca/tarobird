@@ -1,8 +1,10 @@
-# 工作台「Baoyu 设计」与「Baoyu PPT」
+# 工作台「PPT」（原 Baoyu Design 画布已移除）
 
-工作台的 `+ → Baoyu 设计` 使用 [Jim Liu / baoyu-design](https://github.com/JimLiu/baoyu-design)
-的 claude-design 画布编辑器；`+ → Baoyu PPT` 使用独立的 claude-slides 幻灯片编辑器。两者共享工作台保存与 Bot 接口，但保留各自的文件格式。支持编辑画板、幻灯片、文字、布局和素材；可以让当前对话里的 Bot
-读取、创建并修改设计。不是跳转到网站，也不需要启动另一项本地服务。
+> **变更说明（#89）**：Baoyu Design 画布编辑器（`claude-design`、`client/vendor/baoyu-design`、`skills/baoyu-design`）已从工作台移除；画布需求交由可选的「无限画布」扩展承接。当前工作台保留幻灯片编辑器（`+ → PPT`，`client/vendor/baoyu-slides`、`skills/baoyu-ppt`），`design.open` / `design.create` 仅接受 `format: "slides"`，画布请求返回 `design_canvas_removed`。新版本 Host 与 App 不再声明 `workbench.design.v1` / `design.v1` 能力，改由 `workbench.design.slides.v1` / `design.slides.v1` 承载 PPT 能力。
+
+工作台的 `+ → PPT` 使用 [Jim Liu / baoyu-design](https://github.com/JimLiu/baoyu-design)
+的 claude-slides 幻灯片编辑器，支持编辑幻灯片、文字、布局和素材；可以让当前对话里的 Bot
+读取、创建并修改 PPT。不是跳转到网站，也不需要启动另一项本地服务。
 
 ## 使用与保存范围
 

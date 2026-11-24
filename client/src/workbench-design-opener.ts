@@ -116,7 +116,8 @@ export class WorkbenchDesignOpener {
     try {
       check();
       const {format} = designOpenSchema.parse(frame.request.payload ?? {});
-      if (format === "slides" && !this.connection.state.workbenchSlidesAvailable) throw new Error("workbench_slides_host_update_required");
+      if (format !== "slides") throw new Error("design_canvas_removed");
+      if (!this.connection.state.workbenchSlidesAvailable) throw new Error("workbench_slides_host_update_required");
       const admission = await untilCancelled(this.connection.http<{admitted: boolean; generation: string; target: WorkbenchTarget}>("/api/workbench/admit", {
         method: "POST", body: JSON.stringify({ dispatchId: frame.dispatchId }), signal: task.abort.signal,
       }), task.abort.signal);

@@ -10,9 +10,10 @@ import { nativePlatform } from "./native.js";
 // not make it same-origin with TaroBird. Never replace this with an App/blob URL.
 const loaderURL = () => location.protocol === "tarobot:" ? "tarobot-widget://sandbox/design-loader.html" : new URL("design-loader.html", document.baseURI).href;
 const runtimes = new Map<string, Promise<string>>();
-const loadRuntime = (format = "canvas") => {
+const loadRuntime = (format = "slides") => {
+  if (format !== "slides") return Promise.reject(new Error("design_canvas_removed"));
   let runtime = runtimes.get(format);
-  if (!runtime) { runtime = fetch(new URL(({canvas:"design",slides:"slides"} as Record<string,string>)[format] + "-sandbox.html", document.baseURI)).then(async response => { if (!response.ok) throw new Error("design_editor_load_failed"); return response.text(); }).catch(error => { runtimes.delete(format); throw error; }); runtimes.set(format, runtime); }
+  if (!runtime) { runtime = fetch(new URL("slides-sandbox.html", document.baseURI)).then(async response => { if (!response.ok) throw new Error("design_editor_load_failed"); return response.text(); }).catch(error => { runtimes.delete(format); throw error; }); runtimes.set(format, runtime); }
   return runtime;
 };
 const overlays = () => [...document.querySelectorAll<HTMLElement>('dialog:modal,[aria-modal="true"],[role="menu"],.desktop-menu,[data-workbench-overlay]')].some(node => !node.hidden && node.getBoundingClientRect().width > 0 && getComputedStyle(node).visibility !== "hidden");
@@ -106,7 +107,7 @@ class DesignFrame {
   };
   private open() {
     const format = designFormatSchema.safeParse(this.session.document.format ?? "canvas");
-    if (!format.success) { this.report("design_format_unavailable"); return; }
+    if (!format.success || format.data !== "slides") { this.report("design_canvas_removed"); return; }
     const frame = document.createElement("iframe"); this.iframe = frame; const generation = ++this.generation;
     this.updateTheme();
     this.themeObserver = new MutationObserver(this.updateTheme);

@@ -11,7 +11,7 @@ import { WorkbenchBroker, type WorkbenchActor, type WorkbenchPeer } from "./work
 import { readWorkbenchTurnMetadata, type WorkbenchContextReceipt } from "./workbench-history.js";
 import type { WorkbenchContext } from "../client-protocol/workbench.js";
 import { WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, workbenchRequestSchema, workbenchContextSchema, workbenchPublishedSource, workbenchOpenerOnly } from "../client-protocol/workbench.js";
-import { WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY } from "../client-protocol/workbench-design.js";
+import { WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY } from "../client-protocol/workbench-design.js";
 import { PAIRING_INVITES_PATH, PAIRING_INVITE_REVOKE_PATH } from "../client-protocol/pairing-invites.js";
 import { ConversationBatchOperations } from './conversation-batch.js';
 import { nativeInputControlRequestSchema } from "../client-protocol/steering.js";
@@ -1293,7 +1293,7 @@ export class HubServer {
           const ownsConnection = () => active() && this.bots.get(botId!) === connection;
           if (!await new HubPromptQueue(this.store).registerWorker(botId, queueCapable, ownsConnection, frame) || !ownsConnection()) return;
           connection.ready = true;
-          this.send(ws, { v: 1, type: "instance.ready", capabilities: [CONVERSATION_HISTORY_CAPABILITY, PI_SESSION_CAPABILITY, WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, RUN_CHANGES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY] });
+          this.send(ws, { v: 1, type: "instance.ready", capabilities: [CONVERSATION_HISTORY_CAPABILITY, PI_SESSION_CAPABILITY, WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, RUN_CHANGES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY] });
           // Never await RPC results in this socket's frame chain: its result
           // frames are handled by that same chain after hello completes.
           if (connection.history) this.trackTask(this.conversationHistory.recoverBot(botId).catch(() => this.options.onWarning?.("history_recovery_failed")));

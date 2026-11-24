@@ -214,20 +214,20 @@ export class WorkbenchController {
     if (!this.snapshot.ready || this.disposed) return;
     const layout = this.committedChartLayout ?? this.snapshot.layout;
     return { windowId: this.snapshot.windowId, conversationId: this.conversationId, generation: this.snapshot.generation,
-      capabilities: [...(this.connection.state.workbenchDesignCommentsAvailable ? ["design.comments.v1" as const] : []), ...(this.connection.state.workbenchDesignHistoryAvailable ? ["design.history.v1" as const] : []), ...(this.connection.state.workbenchSlidesAvailable ? ["design.slides.v1" as const] : []), ...(this.connection.state.workbenchDesignAvailable ? ["design.v1" as const] : []), "whiteboard.v1", "charts.v1", ...(this.connection.state.workbenchMarkdownAvailable ? ["markdown.v1" as const] : []), ...(this.snapshot.browser ? ["browser.v1" as const] : [])],
-      tabs: layout.tabs.filter(tab => (tab.designFormat !== "slides" || this.connection.state.workbenchSlidesAvailable) && (tab.kind !== "markdown" || this.connection.state.workbenchMarkdownAvailable) && (tab.kind !== "design" || this.connection.state.workbenchDesignAvailable)).map(tab => ({ id: tab.id, kind: tab.kind, title: tab.title, ...(tab.designFormat && this.connection.state.workbenchSlidesAvailable ? {designFormat: tab.designFormat} : {}), ...(tab.source ? { source: tab.source } : {}), ...(tab.kind === "design" && this.designSessions.has(tab.id) ? { revision: this.designSessions.get(tab.id)!.document.revision } : {}), ...(tab.kind === "markdown" && this.snapshot.notes.has(tab.id) ? { revision: this.snapshot.notes.get(tab.id)!.revision, readOnly: this.noteSessions.get(tab.id)?.readOnly } : {}), ...(tab.kind === "whiteboard" && this.snapshot.boards.has(tab.id) ? { revision: this.snapshot.boards.get(tab.id)!.revision } : {}) })),
-      ...(layout.active && (layout.tabs.find(tab => tab.id === layout.active)?.designFormat !== "slides" || this.connection.state.workbenchSlidesAvailable) && (this.connection.state.workbenchDesignAvailable || layout.tabs.find(tab => tab.id === layout.active)?.kind !== "design") && (this.connection.state.workbenchMarkdownAvailable || layout.tabs.find(tab => tab.id === layout.active)?.kind !== "markdown") ? { activeTabId: layout.active } : {}), visible: this.isVisible };
+      capabilities: [...(this.connection.state.workbenchDesignCommentsAvailable ? ["design.comments.v1" as const] : []), ...(this.connection.state.workbenchDesignHistoryAvailable ? ["design.history.v1" as const] : []), ...(this.connection.state.workbenchSlidesAvailable ? ["design.slides.v1" as const] : []), "whiteboard.v1", "charts.v1", ...(this.connection.state.workbenchMarkdownAvailable ? ["markdown.v1" as const] : []), ...(this.snapshot.browser ? ["browser.v1" as const] : [])],
+      tabs: layout.tabs.filter(tab => (tab.kind !== "design" || tab.designFormat === "slides" && this.connection.state.workbenchSlidesAvailable) && (tab.kind !== "markdown" || this.connection.state.workbenchMarkdownAvailable)).map(tab => ({ id: tab.id, kind: tab.kind, title: tab.title, ...(tab.designFormat && this.connection.state.workbenchSlidesAvailable ? {designFormat: tab.designFormat} : {}), ...(tab.source ? { source: tab.source } : {}), ...(tab.kind === "design" && this.designSessions.has(tab.id) ? { revision: this.designSessions.get(tab.id)!.document.revision } : {}), ...(tab.kind === "markdown" && this.snapshot.notes.has(tab.id) ? { revision: this.snapshot.notes.get(tab.id)!.revision, readOnly: this.noteSessions.get(tab.id)?.readOnly } : {}), ...(tab.kind === "whiteboard" && this.snapshot.boards.has(tab.id) ? { revision: this.snapshot.boards.get(tab.id)!.revision } : {}) })),
+      ...(layout.active && (layout.tabs.find(tab => tab.id === layout.active)?.kind !== "design" || layout.tabs.find(tab => tab.id === layout.active)?.designFormat === "slides" && this.connection.state.workbenchSlidesAvailable) && (this.connection.state.workbenchMarkdownAvailable || layout.tabs.find(tab => tab.id === layout.active)?.kind !== "markdown") ? { activeTabId: layout.active } : {}), visible: this.isVisible };
   }
   async context(): Promise<WorkbenchContext | undefined> {
     if (this.chartApplying) throw new Error("workbench_chart_updating");
     this.check(); const tab = this.snapshot.layout.tabs.find(tab => tab.id === this.snapshot.layout.active);
-    if (!tab || !this.isVisible || tab.designFormat === "slides" && !this.connection.state.workbenchSlidesAvailable) return;
+    if (!tab || !this.isVisible || tab.kind === "design" && (tab.designFormat !== "slides" || !this.connection.state.workbenchSlidesAvailable)) return;
     let revision: number | undefined, selection: string[] | undefined;
     if (tab.kind === "whiteboard") {
       const board = await this.waitBoard(tab.id); await board.flush();
       const current = await board.read(); revision = current.document.revision; selection = [...current.selection];
     }
-    if (tab.kind === "design") { if (!this.connection.state.workbenchDesignAvailable) return; try { const design = await this.ensureDesign(tab.id); await design.flush(); revision = (await design.refresh()).revision; } catch { this.setError("design_context_not_saved"); return; } }
+    if (tab.kind === "design") { if (!this.connection.state.workbenchSlidesAvailable) return; try { const design = await this.ensureDesign(tab.id); await design.flush(); revision = (await design.refresh()).revision; } catch { this.setError("design_context_not_saved"); return; } }
     if (tab.kind === "markdown") { if (!this.connection.state.workbenchMarkdownAvailable) return; try { const note = await this.ensureMarkdown(tab.id); const current = await note.read(); revision = current.document.revision; }
       catch { this.setError("markdown_context_not_saved"); return; } }
     this.check();
@@ -307,6 +307,7 @@ export class WorkbenchController {
       this.check(); assertActive?.();
       if (kind === "design" && !document) throw new Error("design_not_found");
       const format = designFormatSchema.parse(document?.format ?? "canvas");
+      if (kind === "design" && format !== "slides") throw new Error("design_canvas_removed");
       const title = target.title?.trim().slice(0, 128).replace(/[\uD800-\uDBFF]$/, "") || (kind === "whiteboard" ? "白板" : kind === "markdown" ? "笔记.md" : designFormatTitle(format));
       await this.changeNow({ type: "open", tab: { id, kind, title, ...(document?.format ? { designFormat: format } : {}) } }, assertActive); return "restored";
     });
@@ -429,13 +430,18 @@ export class WorkbenchController {
     })();
     this.designLoading.set(id, promise); void promise.finally(() => this.designLoading.delete(id)).catch(() => undefined); return promise;
   }
-  async createDesign(title = "画布", requestId?: string, assertActive?: () => void, imported?: DesignDocument, format: DesignFormat = "canvas", importedBackup?: DesignBackupContent): Promise<string> {
+  async createDesign(title = "PPT", requestId?: string, assertActive?: () => void, imported?: DesignDocument, format: DesignFormat = "slides", importedBackup?: DesignBackupContent): Promise<string> {
+    if (format !== "slides") throw new Error("design_canvas_removed");
     await this.initialize(); this.check(); assertActive?.(); const id = stableId("design", requestId);
     await this.serial(async () => {
       this.check(); assertActive?.(); const existing = await this.connection.cache.readWorkbenchDesign(this.scope, id); this.check(); assertActive?.();
-      if (existing) { await this.changeNow({ type: "open", tab: { id, kind: "design", title, ...(existing.format ? {designFormat: designFormatSchema.parse(existing.format)} : {}) } }, assertActive); return; }
+      if (existing) {
+        if (existing.format !== "slides") throw new Error("design_canvas_removed");
+        await this.changeNow({ type: "open", tab: { id, kind: "design", title, designFormat: "slides" } }, assertActive); return;
+      }
       const document = imported ? validateDesignDocument({ ...imported, id, revision: 0, receipts: [] }) : emptyDesignDocument(id, title, format);
-      const old = this.snapshot.layout, layout = changeWorkbench(old, { type: "open", tab: { id, kind: "design", title, ...(document.format ? {designFormat: designFormatSchema.parse(document.format)} : {}) } });
+      if (document.format !== "slides") throw new Error("design_canvas_removed");
+      const old = this.snapshot.layout, layout = changeWorkbench(old, { type: "open", tab: { id, kind: "design", title, designFormat: "slides" } });
       await this.flushLeavingEditors(layout, assertActive); this.check(); assertActive?.();
       await this.connection.cache.createWorkbenchDesignAndLayout(this.scope, document, old.revision, layout, importedBackup);
       this.check(); this.publish({ layout }); assertActive?.(); await this.ensureDesign(id);
@@ -450,7 +456,9 @@ export class WorkbenchController {
   async importDesign(file: File): Promise<string> {
     if (!file.name.endsWith(".tarobot-design.json") || file.size > DESIGN_BACKUP_MAX_BYTES) throw new Error("design_invalid_import");
     const value=parseDesignBackup(await file.text(),stableId("import"));this.check();
-    return this.createDesign(value.title,undefined,undefined,value.document,designFormatSchema.parse(value.document.format??"canvas"),value);
+    const format = designFormatSchema.parse(value.document.format ?? "canvas");
+    if (format !== "slides") throw new Error("design_canvas_removed");
+    return this.createDesign(value.title,undefined,undefined,value.document,"slides",value);
   }
   async deleteDesign(id: string): Promise<void> {
     await this.serial(async () => {
@@ -798,8 +806,10 @@ export class WorkbenchController {
       check(); if (!admission.admitted || admission.generation !== frame.generation || JSON.stringify(admission.target) !== JSON.stringify(target)) throw new Error("workbench_admission_changed");
       if (request.operation === "tabs.list") return { ...base, status: "success", result: json(this.getRegistration()) };
       if (request.operation === "design.create") {
-        const input = designCreateSchema.parse(payload); dispatched = true;
-        const tabId = await this.createDesign(input.title ?? designFormatTitle(input.format ?? "canvas"), request.requestId, check, undefined, input.format); check();
+        const input = designCreateSchema.parse(payload);
+        if (input.format !== "slides") throw new Error("design_canvas_removed");
+        dispatched = true;
+        const tabId = await this.createDesign(input.title ?? designFormatTitle("slides"), request.requestId, check, undefined, "slides"); check();
         return { ...base, status: "applied", saved: true, revision: this.designSessions.get(tabId)?.document.revision ?? 0, result: { tabId } };
       }
       if (request.operation.startsWith("design.")) {

@@ -1,4 +1,4 @@
-import { WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, isSlidesRequest, designOperationCapability } from "../client-protocol/workbench-design.js";
+import { WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, isSlidesRequest, designOperationCapability, workbenchDesignError } from "../client-protocol/workbench-design.js";
 import { createHash } from "node:crypto";
 import { readWorkbenchImage } from "../runtime/workbench-image.js";
 import { loadInstanceConfig, resolveInstanceWorkspacePath } from "../state/instance-config.js";
@@ -69,9 +69,10 @@ export async function runWorkbenchCommand(directory: string, command: string | u
   if (!botId) {
     const client = await LocalHostClient.connect(directory);
     try {
+      const designError = request && workbenchDesignError(request); if (designError) throw new Error(designError);
       const feature = request && designOperationCapability(request.operation); if(feature && !client.supports(feature)) throw new Error("workbench_design_suite_host_update_required");
       if (request && isSlidesRequest(request) && !client.supports(WORKBENCH_SLIDES_CAPABILITY)) throw new Error("workbench_slides_host_update_required");
-      if (request?.operation.startsWith("design.") && !client.supports(WORKBENCH_DESIGN_CAPABILITY)) throw new Error("workbench_design_host_update_required");
+      if (request?.operation.startsWith("design.") && !client.supports(WORKBENCH_SLIDES_CAPABILITY)) throw new Error("workbench_slides_host_update_required");
       if (request?.operation === "design.open" && !client.supports(WORKBENCH_DESIGN_OPEN_CAPABILITY)) throw new Error("workbench_design_open_host_update_required");
       // The owner names the exact opener from targets; there is no implicit fallback.
       if (request?.operation === "design.open" && !request.target) throw new Error("workbench_open_target_required");
