@@ -109,9 +109,14 @@ interface RemoteFollowSnapshot {
   };
 }
 
+type RemoteFollowAddress =
+  | { kind: "session"; sessionId: string }
+  | { kind: "subagent"; parentSessionId: string; childSessionId: string; mode: "continuable" | "one-shot" | "unknown" };
+
 interface RemoteFollowState {
   streamId: string;
   sessionId: string;
+  address: RemoteFollowAddress;
   promise: Promise<RemoteFollowSnapshot>;
   resolve: (snapshot: RemoteFollowSnapshot) => void;
   reject: (error: Error) => void;
@@ -174,7 +179,7 @@ export class DeepSeekHarnessProtocolClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private authenticationPromise: Promise<void> | undefined;
   private sessionCookie: string | undefined;
-  private readonly followedSessions = new Set<string>();
+  private readonly followedSessions = new Map<string, RemoteFollowAddress>();
   private readonly remoteWaterfalls = new Map<string, PendingRemoteWaterfall>();
   private readonly remoteProjections = new Map<string, RemoteFollowSnapshot["projections"]>();
   private closing = false;
@@ -357,6 +362,35 @@ export class DeepSeekHarnessProtocolClient {
     }
     if (method === "session.history") {
       return await this.readRemoteHistory(input, signal);
+    }
+    if (method === "session.followSubagent") {
+      const parentSessionId = requiredString(input.parentSessionId, "session.followSubagent parentSessionId");
+      const childSessionId = requiredString(input.childSessionId, "session.followSubagent childSessionId");
+      const rawMode = input.mode;
+      const mode: "continuable" | "one-shot" | "unknown" = rawMode === "continuable" || rawMode === "one-shot"
+        ? rawMode
+        : "unknown";
+      const follow = await this.ensureRemoteFollow(
+        childSessionId,
+        signal,
+        { kind: "subagent", parentSessionId, childSessionId, mode },
+      );
+      // Replay any already-recorded child events from the initial snapshot so
+      // fast subagents that completed before follow opened still surface their steps.
+      const generation = this.generation;
+      if (generation && generation.mode === "remote") {
+        for (const rec of follow.records) {
+          const event = recordValue(recordValue(rec)?.event);
+          if (event) {
+            this.deliverSyntheticFrame(generation, "mux", randomUUID(), {
+              type: "session/event",
+              sessionId: childSessionId,
+              event,
+            });
+          }
+        }
+      }
+      return { sessionId: childSessionId, events: follow.records.length };
     }
     if (method === "host.describe") {
       const catalog = recordValue(await this.invokeRemote("session/modelCatalog", {}, signal));
@@ -643,8 +677,8 @@ export class DeepSeekHarnessProtocolClient {
       try {
         this.openRemoteStream(generation, "events", "$events", { args: {} });
         this.openRemoteStream(generation, "control", "session/control", { args: {} });
-        for (const sessionId of this.followedSessions) {
-          this.openRemoteFollow(generation, sessionId);
+        for (const [sessionId, address] of this.followedSessions) {
+          this.openRemoteFollow(generation, sessionId, address);
         }
       } catch (error) {
         failed(error instanceof Error ? error : new Error(String(error)));
@@ -695,7 +729,11 @@ export class DeepSeekHarnessProtocolClient {
     return streamId;
   }
 
-  private openRemoteFollow(generation: RemoteMuxGeneration, sessionId: string): RemoteFollowState {
+  private openRemoteFollow(
+    generation: RemoteMuxGeneration,
+    sessionId: string,
+    address: RemoteFollowAddress = { kind: "session", sessionId },
+  ): RemoteFollowState {
     const existing = generation.follows.get(sessionId);
     if (existing) {
       return existing;
@@ -714,7 +752,7 @@ export class DeepSeekHarnessProtocolClient {
       {
         args: {
           request: {
-            address: { kind: "session", sessionId },
+            address,
             maxMessages: 50,
             assistantStream: true,
           },
@@ -725,6 +763,7 @@ export class DeepSeekHarnessProtocolClient {
     const state: RemoteFollowState = {
       streamId,
       sessionId,
+      address,
       promise,
       resolve,
       reject,
@@ -737,13 +776,14 @@ export class DeepSeekHarnessProtocolClient {
   private async ensureRemoteFollow(
     sessionId: string,
     signal?: AbortSignal,
+    address: RemoteFollowAddress = { kind: "session", sessionId },
   ): Promise<RemoteFollowSnapshot> {
-    this.followedSessions.add(sessionId);
+    this.followedSessions.set(sessionId, address);
     const generation = this.generation;
     if (!generation || generation.mode !== "remote") {
       throw new Error("DeepSeek Harness remote event stream is not connected");
     }
-    const state = generation.follows.get(sessionId) ?? this.openRemoteFollow(generation, sessionId);
+    const state = generation.follows.get(sessionId) ?? this.openRemoteFollow(generation, sessionId, address);
     return await waitForPromiseOrAbort(state.promise, signal);
   }
 
@@ -760,12 +800,15 @@ export class DeepSeekHarnessProtocolClient {
     if (frame.type === "error") {
       const error = new DeepSeekHarnessRpcError(frame.error);
       if (registration.kind === "follow" && registration.sessionId) {
+        const isSubagent = generation.follows.get(registration.sessionId)?.address.kind === "subagent";
         this.dropRemoteFollow(generation, registration.sessionId, error);
-        this.deliverSyntheticFrame(generation, "host", randomUUID(), {
-          type: "host/agent-error",
-          sessionId: registration.sessionId,
-          message: error.message,
-        });
+        if (!isSubagent) {
+          this.deliverSyntheticFrame(generation, "host", randomUUID(), {
+            type: "host/agent-error",
+            sessionId: registration.sessionId,
+            message: error.message,
+          });
+        }
       } else {
         failed(error);
       }
@@ -774,12 +817,15 @@ export class DeepSeekHarnessProtocolClient {
     if (frame.type === "end") {
       const error = new Error(`DeepSeek Harness ${registration.kind} stream ended`);
       if (registration.kind === "follow" && registration.sessionId) {
+        const isSubagent = generation.follows.get(registration.sessionId)?.address.kind === "subagent";
         this.dropRemoteFollow(generation, registration.sessionId, error);
-        this.deliverSyntheticFrame(generation, "host", randomUUID(), {
-          type: "host/agent-error",
-          sessionId: registration.sessionId,
-          message: error.message,
-        });
+        if (!isSubagent) {
+          this.deliverSyntheticFrame(generation, "host", randomUUID(), {
+            type: "host/agent-error",
+            sessionId: registration.sessionId,
+            message: error.message,
+          });
+        }
       } else {
         failed(error);
       }
@@ -930,8 +976,28 @@ export class DeepSeekHarnessProtocolClient {
     }
     if (type === "projection") {
       const sessionId = requiredString(item?.sessionId, "control projection sessionId");
-      const key = requiredString(item?.key, "control projection key");
       const seq = finiteNumber(item?.seq, "control projection sequence");
+      const changes = recordValue(item?.changes);
+      if (changes) {
+        const prior = this.remoteProjections.get(sessionId);
+        if (!prior || seq >= prior.asOfSeq) {
+          this.remoteProjections.set(sessionId, {
+            asOfSeq: seq,
+            values: { ...(prior?.values ?? {}), ...changes },
+          });
+        }
+        for (const [key, projectionValue] of Object.entries(changes)) {
+          this.deliverSyntheticFrame(generation, "mux", randomUUID(), {
+            type: "session/projection",
+            sessionId,
+            key,
+            value: projectionValue,
+            seq,
+          });
+        }
+        return;
+      }
+      const key = requiredString(item?.key, "control projection key");
       const prior = this.remoteProjections.get(sessionId);
       if (!prior || seq >= prior.asOfSeq) {
         this.remoteProjections.set(sessionId, {

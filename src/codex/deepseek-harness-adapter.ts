@@ -19,12 +19,17 @@ import type {
   EngineApprovalRequest,
   EngineContextUsage,
   EngineStreamEvent,
+  EngineTask,
+  EngineTaskControlResult,
+  EngineTaskSnapshot,
   ExternalSessionInfo,
   NativeHistoryAnchor,
   NativeHistoryRejection,
   NativeHistoryResult,
   NativeHistoryState,
+  ScopedEngineEvent,
 } from "./adapter.js";
+import type { RunScope } from "../client-protocol/run.js";
 import {
   DeepSeekHarnessRpcError,
   type DeepSeekHarnessProtocolHandlers,
@@ -119,6 +124,31 @@ type Job = {
   finishedAt?: number;
 };
 
+type TrackedSubagent = {
+  childId: string;
+  parentSessionId: string;
+  rootSessionId: string;
+  parentSubagentId?: string;
+  name: string;
+  label: string;
+  mode: "continuable" | "one-shot" | "external" | "unknown";
+  scope: RunScope;
+  rootScope?: RunScope;
+  owner?: SessionTurnClaim;
+  status: "running" | "done" | "error" | "stopped" | "unknown";
+  startedAt: number;
+  updatedAt: number;
+  finishedAt?: number;
+  progress?: string;
+  finalText?: string;
+  resultEmitted: boolean;
+  closed: boolean;
+  toolCalls: Map<string, ToolCall>;
+  assistantPrefixes: Map<string, AssistantPresentation>;
+  chunkedSteps: Set<string>;
+  reasoningChunkedSteps: Set<string>;
+};
+
 type GoalProjection = {
   goal: {
     id: string;
@@ -169,6 +199,8 @@ type PendingTurn = {
   officeToolTimers: Map<string, ReturnType<typeof setTimeout>>;
   officeApprovalWaits: Map<string, Set<symbol>>;
   liveJobs: Set<string>;
+  liveSubagents: Set<string>;
+  subagentSettledInTurn: boolean;
   sawBackground: boolean;
   awaitingReview: boolean;
   settling: boolean;
@@ -293,6 +325,11 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
   private readonly sessionEventSeqs = new Map<string, number>();
   private readonly jobsBySession = new Map<string, Map<string, Job>>();
   private readonly jobOwnersBySession = new Map<string, Map<string, SessionTurnClaim>>();
+  private readonly subagentsByRoot = new Map<string, Map<string, TrackedSubagent>>();
+  private readonly subagentByChildId = new Map<string, TrackedSubagent>();
+  private readonly taskTokensBySession = new Map<string, Map<string, string>>();
+  private readonly tokenByTaskBySession = new Map<string, Map<string, string>>();
+  private readonly recentSubagentCallId = new Map<string, string>();
   private readonly sessionApprovalGrants = new Map<string, Set<string>>();
   private readonly projectionValues = new Map<string, Record<string, unknown>>();
   private readonly projectionWatermarks = new Map<string, Map<string, number>>();
@@ -490,6 +527,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     if (values.goal !== null && !goal) throw new Error("DeepSeek Harness did not report a goal state this adapter can read");
     const questions = asRecord(values.userQuestions), team = asRecord(values.agentTeam);
     const jobs = [...(this.jobsBySession.get(sessionId)?.values() ?? [])];
+    const subagents = [...(this.subagentsByRoot.get(sessionId)?.values() ?? [])];
     // Team tasks are durable: finished and deleted ones stay listed for good, and a pending one is not being worked on.
     // Only one in progress is work going on; a status this adapter does not know is not assumed to be finished.
     const teamAtWork = Array.isArray(team?.tasks) && team.tasks.some(task => {
@@ -499,7 +537,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     const blocked = goal?.goal.phase === "active" ? "goal_active" as const
       // `running` is Harness's word for "this session's Agent is running", whoever started it.
       : row.running || inbox["next-turn"].length > 0 || inbox["next-step"].length > 0 || (Array.isArray(questions?.active) && questions.active.length > 0) ? "busy" as const
-        : teamAtWork || jobs.some(job => job.status === "running" || job.status === "stopping") ? "background_work" as const
+        : teamAtWork || jobs.some(job => job.status === "running" || job.status === "stopping") || subagents.some(sub => sub.status === "running") ? "background_work" as const
           : undefined;
     return { head: Math.max(...seqs), blank: row.blank, ...(blocked ? { blocked } : {}) };
   }
@@ -771,6 +809,140 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     }
   }
 
+  async listTasks(sessionId: string): Promise<EngineTaskSnapshot> {
+    if (this.destroyed) return { supported: true, tasks: [], foregroundStopScope: "subagents" };
+    const subagents = [...(this.subagentsByRoot.get(sessionId)?.values() ?? [])];
+    const jobs = [...(this.jobsBySession.get(sessionId)?.values() ?? [])];
+    const jobOwners = this.jobOwnersBySession.get(sessionId);
+
+    const runningSubs = subagents.filter((sub) => sub.status === "running");
+    const endedSubs = subagents.filter((sub) => sub.status !== "running");
+    const runningJobs = jobs.filter((job) => isLiveJob(job));
+    const endedJobs = jobs.filter((job) => !isLiveJob(job));
+
+    const keptRunningSubs = runningSubs.slice(-128);
+    let room = 128 - keptRunningSubs.length;
+    const keptRunningJobs = room > 0 ? runningJobs.slice(-room) : [];
+    room -= keptRunningJobs.length;
+    const keptEndedSubs = room > 0 ? endedSubs.slice(-room) : [];
+    room -= keptEndedSubs.length;
+    const keptEndedJobs = room > 0 ? endedJobs.slice(-room) : [];
+
+    const visibleSubIds = new Set([...keptRunningSubs, ...keptEndedSubs].map((sub) => sub.childId));
+    const visibleIds = new Set<string>([
+      ...visibleSubIds,
+      ...[...keptRunningJobs, ...keptEndedJobs].map((job) => `job:${job.id}`),
+    ]);
+    const tokenMap = this.taskTokensBySession.get(sessionId);
+    const reverseMap = this.tokenByTaskBySession.get(sessionId);
+    if (tokenMap && reverseMap) {
+      for (const [token, nativeId] of tokenMap) {
+        if (!visibleIds.has(nativeId)) {
+          tokenMap.delete(token);
+          reverseMap.delete(nativeId);
+        }
+      }
+    }
+
+    const toSubagentTask = (sub: TrackedSubagent): EngineTask => {
+      const parentId = sub.parentSubagentId && visibleSubIds.has(sub.parentSubagentId)
+        ? this.taskToken(sessionId, sub.parentSubagentId)
+        : undefined;
+      return {
+        id: this.taskToken(sessionId, sub.childId),
+        label: (sub.label || sub.name || "Subagent").slice(0, 500),
+        kind: "subagent",
+        mode: "background",
+        status: sub.status,
+        canStop: sub.status === "running",
+        startedAt: sub.startedAt,
+        updatedAt: sub.updatedAt,
+        ...(sub.progress ? { progress: sub.progress.slice(0, 2000) } : {}),
+        ...(parentId ? { parentId } : {}),
+        owner: sub.owner ? "bound" : "unattributed",
+      };
+    };
+
+    const toJobTask = (job: Job): EngineTask => ({
+      id: this.taskToken(sessionId, `job:${job.id}`),
+      label: (job.label || job.kind || "Background job").slice(0, 500),
+      kind: job.kind === "shell" || job.kind === "bash" ? "shell" : "unknown",
+      mode: "background",
+      status: job.status === "running" || job.status === "stopping"
+        ? "running"
+        : job.status === "completed"
+          ? "done"
+          : job.status === "killed"
+            ? "stopped"
+            : "error",
+      canStop: false,
+      startedAt: job.startedAt,
+      updatedAt: job.finishedAt ?? job.startedAt,
+      ...(job.detail ? { progress: job.detail.slice(0, 2000) } : {}),
+      owner: jobOwners?.has(job.id) ? "bound" : "unattributed",
+    });
+
+    return {
+      supported: true,
+      tasks: [
+        ...keptEndedSubs.map(toSubagentTask),
+        ...keptEndedJobs.map(toJobTask),
+        ...keptRunningSubs.map(toSubagentTask),
+        ...keptRunningJobs.map(toJobTask),
+      ],
+      foregroundStopScope: "subagents",
+    };
+  }
+
+  async stopTask(sessionId: string, input: { taskId: string }): Promise<EngineTaskControlResult> {
+    if (this.destroyed) return { outcome: "rejected", reason: "not_ready" };
+    const nativeId = this.taskTokensBySession.get(sessionId)?.get(input.taskId);
+    if (!nativeId || nativeId.startsWith("job:")) {
+      return { outcome: "rejected", reason: "stale" };
+    }
+    const sub = this.subagentsByRoot.get(sessionId)?.get(nativeId);
+    if (!sub || sub.status !== "running") {
+      return { outcome: "rejected", reason: "stale" };
+    }
+    try {
+      const response = asRecord(await this.gateway.request("subagents.interruptByUser", {
+        childSessionId: sub.childId,
+      }));
+      if (response?.accepted === true) {
+        return { outcome: "accepted" };
+      }
+      return { outcome: "unknown", reason: "uncertain" };
+    } catch (error) {
+      if (error instanceof DeepSeekHarnessRpcError) {
+        if (/not supported|unknown|unrecognized|not found/i.test(error.message) || error.code === "gateway/not-found") {
+          return { outcome: "rejected", reason: "unsupported" };
+        }
+        if (/unauthorized|not running|already|closed|invalid/i.test(error.message)) {
+          return { outcome: "rejected", reason: "stale" };
+        }
+      }
+      return { outcome: "unknown", reason: "uncertain" };
+    }
+  }
+
+  private taskToken(sessionId: string, nativeId: string): string {
+    let byTask = this.tokenByTaskBySession.get(sessionId);
+    let byToken = this.taskTokensBySession.get(sessionId);
+    if (!byTask || !byToken) {
+      byTask = new Map();
+      byToken = new Map();
+      this.tokenByTaskBySession.set(sessionId, byTask);
+      this.taskTokensBySession.set(sessionId, byToken);
+    }
+    let token = byTask.get(nativeId);
+    if (!token) {
+      token = randomUUID();
+      byTask.set(nativeId, token);
+      byToken.set(token, nativeId);
+    }
+    return token;
+  }
+
   async clearThreadGoal(
     sessionId: string,
     _input: { workspaceOverride?: string } = {},
@@ -784,7 +956,10 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       const cancelOwnedGoal = this.goalWatchers.has(sessionId) && !this.pendingTurns.has(sessionId);
       try { return await this.clearNativeGoal(sessionId); }
       finally {
-        if (cancelOwnedGoal) await this.gateway.request("session.cancel", { sessionId });
+        if (cancelOwnedGoal) {
+          await this.interruptSessionSubagents(sessionId);
+          await this.gateway.request("session.cancel", { sessionId });
+        }
       }
     })();
     this.goalClearOperations.set(sessionId, operation);
@@ -965,6 +1140,11 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     const parsed = deepseekAssistantPrefixSchema.safeParse(payload.prefix);
     if (!sessionId || !parsed.success) return;
     const prefix = parsed.data;
+    const subagent = this.subagentByChildId.get(sessionId);
+    if (subagent) {
+      await this.handleSubagentAssistantPrefix(subagent, prefix);
+      return;
+    }
     // Only a durable turn's existing claim can own transient presentation.
     // Never infer a new owner from a late, cancelled or replayed attempt.
     const claim = this.turnRouting.get(sessionId)?.claims.get(prefix.turn);
@@ -1025,6 +1205,17 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       this.sessionEventSeqs.set(sessionId, seq);
     }
 
+    const subagent = this.subagentByChildId.get(sessionId);
+    if (subagent) {
+      await this.handleSubagentSessionEvent(subagent, type, data);
+      return;
+    }
+
+    if (type === "subagent/catalog") {
+      await this.handleSubagentCatalog(sessionId, data);
+      return;
+    }
+
     if (type === "turn/start") {
       const turn = numberValue(data.turn);
       if (turn !== undefined) {
@@ -1044,10 +1235,13 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     }
 
     if (type === "user/message") {
-      const routing = this.routingFor(sessionId);
-      const turn = routing.openTurn;
       const source = asRecord(data.source);
       const sourceKind = stringValue(source?.kind);
+      if (sourceKind === "subagent-settled") {
+        await this.handleSubagentSettled(sessionId, data);
+      }
+      const routing = this.routingFor(sessionId);
+      const turn = routing.openTurn;
       const goalRound = numberValue(source?.round);
       const rpcId = stringValue(source?.rpcId);
       const owner: SessionTurnOwner | undefined = sourceKind === "goal" && (goalRound ?? 0) > 0
@@ -1122,6 +1316,9 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       const callId = stringValue(data.callId);
       const name = stringValue(data.name);
       if (callId && name) {
+        if (name === "subagent") {
+          this.recentSubagentCallId.set(sessionId, callId);
+        }
         const call = { name, input: parseJsonValue(data.arguments) };
         if (pending) {
           pending.toolCalls.set(callId, call);
@@ -1607,9 +1804,358 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       this.jobOwnersBySession.delete(sessionId);
     }
     const pending = this.pendingTurns.get(sessionId);
-    if (pending?.sawBackground && pending.liveJobs.size === 0 && pending.turnsEnded.size > 0) {
+    if (pending?.sawBackground && pending.liveJobs.size === 0 && pending.liveSubagents.size === 0 && pending.turnsEnded.size > 0) {
       this.waitForBackgroundReview(pending);
     }
+  }
+
+  private async handleSubagentCatalog(parentSessionId: string, data: Record<string, unknown>): Promise<void> {
+    const childId = stringValue(data.childId);
+    if (!childId || this.subagentByChildId.has(childId)) {
+      return;
+    }
+    const parentSub = this.subagentByChildId.get(parentSessionId);
+    const rootSessionId = parentSub ? parentSub.rootSessionId : parentSessionId;
+    const owner = parentSub?.owner ?? this.activeClaimForSession(rootSessionId);
+    const rawName = stringValue(data.name)?.trim() ?? "";
+    const rawLabel = stringValue(data.label)?.trim() ?? "";
+    const label = rawLabel || rawName || childId;
+    const name = rawName || label;
+    const rawMode = stringValue(data.mode);
+    const mode: TrackedSubagent["mode"] = rawMode === "continuable" || rawMode === "one-shot" || rawMode === "external"
+      ? rawMode
+      : "unknown";
+    const startedAt = numberValue(data.childCreatedAt) ?? Date.now();
+    const callId = this.recentSubagentCallId.get(parentSessionId);
+    this.recentSubagentCallId.delete(parentSessionId);
+
+    const scope: RunScope = {
+      id: childId.slice(0, 512),
+      kind: "subagent",
+      label: label.slice(0, 512),
+      ...(parentSub ? { parentId: parentSub.scope.id } : {}),
+      ...(callId ? { parentCallId: callId.slice(0, 512) } : {}),
+    };
+    const sub: TrackedSubagent = {
+      childId,
+      parentSessionId,
+      rootSessionId,
+      ...(parentSub ? { parentSubagentId: parentSub.childId } : {}),
+      name,
+      label,
+      mode,
+      scope,
+      ...(parentSub ? { rootScope: parentSub.rootScope ?? parentSub.scope } : {}),
+      ...(owner ? { owner } : {}),
+      status: "running",
+      startedAt,
+      updatedAt: startedAt,
+      resultEmitted: false,
+      closed: false,
+      toolCalls: new Map(),
+      assistantPrefixes: new Map(),
+      chunkedSteps: new Set(),
+      reasoningChunkedSteps: new Set(),
+    };
+
+    const byRoot = this.subagentsByRoot.get(rootSessionId) ?? new Map<string, TrackedSubagent>();
+    this.subagentsByRoot.set(rootSessionId, byRoot);
+    byRoot.set(childId, sub);
+    this.subagentByChildId.set(childId, sub);
+
+    const pending = owner ? this.pendingForClaim(rootSessionId, owner) : undefined;
+    if (pending) {
+      pending.sawBackground = true;
+      pending.liveSubagents.add(childId);
+      this.noteTurnActivity(pending);
+    }
+
+    await this.emitSubagentActivity(sub, "started");
+    await this.emitSubagentEvent(sub, { type: "scope_status", status: "running" });
+
+    if (mode !== "external") {
+      // Follow the child session using its durable parent address so internal
+      // child thinking, text, and tool events stream into this subagent's scope.
+      void this.gateway.request("session.followSubagent", {
+        parentSessionId,
+        childSessionId: childId,
+        mode,
+      }).catch(() => {
+        // Following is best-effort: settlement notices on the parent still deliver the final report.
+      });
+    }
+  }
+
+  private async handleSubagentAssistantPrefix(
+    sub: TrackedSubagent,
+    prefix: { turn: number; step: number; attemptId: string; text: string; reasoning: string },
+  ): Promise<void> {
+    if (sub.closed) return;
+    const key = `${prefix.turn}:${prefix.step}`;
+    let shown = sub.assistantPrefixes.get(key);
+    if (shown?.complete) return;
+    if (!shown || shown.attemptId !== prefix.attemptId) {
+      shown = { attemptId: prefix.attemptId, text: "", reasoning: "", complete: false };
+      sub.assistantPrefixes.set(key, shown);
+    }
+    await this.reconcileSubagentPrefix(sub, shown, prefix.text, prefix.reasoning);
+  }
+
+  private async reconcileSubagentPrefix(
+    sub: TrackedSubagent,
+    shown: AssistantPresentation,
+    text: string,
+    reasoning: string,
+  ): Promise<void> {
+    if (reasoning !== shown.reasoning) {
+      const suffix = reasoning.startsWith(shown.reasoning) ? reasoning.slice(shown.reasoning.length) : reasoning;
+      if (suffix) {
+        sub.updatedAt = Date.now();
+        await this.emitSubagentEvent(sub, { type: "thinking", text: suffix, sessionId: sub.childId });
+      }
+      shown.reasoning = reasoning;
+    }
+    if (text !== shown.text) {
+      const delta = shown.text.length > 0 && text.startsWith(shown.text);
+      const suffix = delta ? text.slice(shown.text.length) : text;
+      if (suffix) {
+        sub.updatedAt = Date.now();
+        sub.progress = text.trim().slice(-500) || sub.progress;
+        await this.emitSubagentEvent(sub, { type: "assistant_text", text: suffix, delta, sessionId: sub.childId });
+      }
+      shown.text = text;
+    }
+  }
+
+  private async handleSubagentSessionEvent(
+    sub: TrackedSubagent,
+    type: string | undefined,
+    data: Record<string, unknown>,
+  ): Promise<void> {
+    if (type === "subagent/catalog") {
+      await this.handleSubagentCatalog(sub.childId, data);
+      return;
+    }
+    if (sub.closed) return;
+    const pending = sub.owner ? this.pendingForClaim(sub.rootSessionId, sub.owner) : undefined;
+    if (pending) this.noteTurnActivity(pending);
+    sub.updatedAt = Date.now();
+
+    if (type === "tool/call") {
+      const callId = stringValue(data.callId);
+      const name = stringValue(data.name);
+      if (callId && name) {
+        if (name === "subagent") {
+          this.recentSubagentCallId.set(sub.childId, callId);
+        }
+        const call = { name, input: parseJsonValue(data.arguments) };
+        sub.toolCalls.set(callId, call);
+        sub.progress = name;
+        await this.emitSubagentEvent(sub, {
+          type: "tool_use",
+          toolName: name,
+          toolInput: call.input,
+          toolUseId: callId,
+          sessionId: sub.childId,
+        });
+      }
+      return;
+    }
+
+    if (type === "tool/result") {
+      for (const event of deepseekToolResults(data, sub.toolCalls, sub.childId)) {
+        await this.emitSubagentEvent(sub, event);
+      }
+      return;
+    }
+
+    if (type === "assistant/chunk") {
+      const turn = numberValue(data.turn);
+      const step = numberValue(data.step);
+      const chunk = asRecord(data.chunk);
+      if (!chunk || turn === undefined || step === undefined) return;
+      const key = `${turn}:${step}`;
+      if (chunk.type === "text-delta") {
+        const text = stringValue(chunk.text) ?? "";
+        if (text) {
+          sub.chunkedSteps.add(key);
+          sub.progress = ((sub.progress ?? "") + text).slice(-500);
+          await this.emitSubagentEvent(sub, { type: "assistant_text", text, delta: true, sessionId: sub.childId });
+        }
+      } else if (chunk.type === "reasoning-delta") {
+        const text = stringValue(chunk.text) ?? "";
+        if (text) {
+          sub.reasoningChunkedSteps.add(key);
+          await this.emitSubagentEvent(sub, { type: "thinking", text, sessionId: sub.childId });
+        }
+      }
+      return;
+    }
+
+    if (type === "assistant/message") {
+      const turn = numberValue(data.turn);
+      const step = numberValue(data.step);
+      if (turn === undefined || step === undefined) return;
+      const key = `${turn}:${step}`;
+      const content = asRecord(data.message)?.content;
+      const text = assistantContentText(content, "text");
+      const reasoning = assistantContentText(content, "reasoning");
+      if (text && !assistantContentHasType(content, "tool-call")) {
+        sub.finalText = text;
+        sub.progress = text.trim().slice(-500) || sub.progress;
+      }
+      const shown = sub.assistantPrefixes.get(key);
+      if (shown) {
+        await this.reconcileSubagentPrefix(sub, shown, text, reasoning);
+        shown.complete = true;
+        return;
+      }
+      if (!sub.reasoningChunkedSteps.has(key) && reasoning) {
+        await this.emitSubagentEvent(sub, { type: "thinking", text: reasoning, sessionId: sub.childId });
+      }
+      sub.assistantPrefixes.set(key, { attemptId: "", text, reasoning, complete: true });
+      if (text && !sub.chunkedSteps.has(key)) {
+        await this.emitSubagentEvent(sub, { type: "assistant_text", text, sessionId: sub.childId });
+      }
+      return;
+    }
+
+    if (type === "turn/end") {
+      const kind = stringValue(asRecord(data.reason)?.kind) ?? "completed";
+      const status: TrackedSubagent["status"] = kind === "completed"
+        ? "done"
+        : kind === "aborted" || kind === "interrupted"
+          ? "stopped"
+          : "error";
+      await this.finishSubagent(sub, status, sub.finalText);
+    }
+  }
+
+  private async handleSubagentSettled(parentSessionId: string, data: Record<string, unknown>): Promise<void> {
+    const source = asRecord(data.source);
+    const childId = stringValue(source?.senderSessionId);
+    if (!childId) return;
+    const sub = this.subagentByChildId.get(childId);
+    if (!sub) return;
+    const stopReason = stringValue(source?.stopReason) ?? "completed";
+    const status: TrackedSubagent["status"] = stopReason === "completed"
+      ? "done"
+      : stopReason === "aborted" || stopReason === "interrupted"
+        ? "stopped"
+        : "error";
+    const report = extractSubagentSettledReport(data.content) ?? sub.finalText;
+    const pending = this.pendingTurns.get(sub.rootSessionId);
+    if (pending && pending.activeTurns.size > 0) {
+      pending.subagentSettledInTurn = true;
+    }
+    await this.finishSubagent(sub, status, report);
+    if (pending && pending.sawBackground && pending.liveJobs.size === 0 && pending.liveSubagents.size === 0 && pending.turnsEnded.size > 0 && pending.activeTurns.size === 0) {
+      this.waitForBackgroundReview(pending);
+    }
+  }
+
+  private async finishSubagent(
+    sub: TrackedSubagent,
+    status: Exclude<TrackedSubagent["status"], "running">,
+    report?: string,
+  ): Promise<void> {
+    if (report && report.trim() && !sub.resultEmitted && !sub.closed) {
+      sub.finalText = report;
+      sub.progress = report.trim().slice(-500);
+      sub.resultEmitted = true;
+      await this.emitSubagentEvent(sub, { type: "result", text: report, sessionId: sub.childId });
+    }
+    if (sub.closed) return;
+    sub.closed = true;
+    sub.status = status;
+    const now = Date.now();
+    sub.updatedAt = now;
+    sub.finishedAt = now;
+
+    const pending = sub.owner ? this.pendingForClaim(sub.rootSessionId, sub.owner) : undefined;
+    if (pending) {
+      pending.liveSubagents.delete(sub.childId);
+      this.noteTurnActivity(pending);
+    }
+    await this.emitSubagentEvent(sub, { type: "scope_status", status });
+    await this.emitSubagentActivity(sub, status === "stopped" ? "interrupted" : "completed");
+  }
+
+  private async emitSubagentEvent(sub: TrackedSubagent, event: ScopedEngineEvent): Promise<void> {
+    const owner = sub.owner;
+    if (!owner) return;
+    const wrapped: EngineStreamEvent = {
+      type: "scoped",
+      scope: sub.scope,
+      ...(sub.rootScope ? { rootScope: sub.rootScope } : {}),
+      origin: "bound",
+      detached: true,
+      taskId: sub.childId,
+      event,
+    };
+    if (owner.owner === "foreground") {
+      const pending = this.pendingForClaim(sub.rootSessionId, owner);
+      if (pending && !pending.abortController.signal.aborted) {
+        await this.emit(pending, wrapped);
+      } else if (owner.onEngineEvent) {
+        await owner.onEngineEvent(wrapped);
+      }
+      return;
+    }
+    const watcher = this.watcherForClaim(sub.rootSessionId, owner);
+    if (watcher) {
+      await this.emitGoal(watcher, wrapped);
+    } else if (owner.onEngineEvent) {
+      await owner.onEngineEvent(wrapped);
+    }
+  }
+
+  private async emitSubagentActivity(
+    sub: TrackedSubagent,
+    kind: "started" | "interacted" | "interrupted" | "completed",
+  ): Promise<void> {
+    const owner = sub.owner;
+    if (!owner) return;
+    const event: EngineStreamEvent = {
+      type: "subagent_activity",
+      id: `${sub.childId}:${kind}`,
+      kind,
+      agentId: sub.childId,
+      label: sub.label || sub.name,
+      sessionId: sub.rootSessionId,
+    };
+    if (owner.owner === "foreground") {
+      const pending = this.pendingForClaim(sub.rootSessionId, owner);
+      if (pending && !pending.abortController.signal.aborted) {
+        await this.emit(pending, event);
+      } else if (owner.onEngineEvent) {
+        await owner.onEngineEvent(event);
+      }
+      return;
+    }
+    const watcher = this.watcherForClaim(sub.rootSessionId, owner);
+    if (watcher) {
+      await this.emitGoal(watcher, event);
+    } else if (owner.onEngineEvent) {
+      await owner.onEngineEvent(event);
+    }
+  }
+
+  private async interruptSessionSubagents(sessionId: string, claimId?: string): Promise<void> {
+    const subs = [...(this.subagentsByRoot.get(sessionId)?.values() ?? [])].filter(
+      (sub) => sub.status === "running" && (!claimId || sub.owner?.claimId === claimId),
+    );
+    if (subs.length === 0) return;
+    await Promise.allSettled(
+      subs.map(async (sub) => {
+        try {
+          await this.gateway.request("subagents.interruptByUser", { childSessionId: sub.childId });
+        } catch {
+          // Best-effort interrupt during parent stop; continue stopping remaining subagents.
+        }
+        await this.finishSubagent(sub, "stopped");
+      }),
+    );
   }
 
   private trackLiveBackgroundJob(
@@ -2008,6 +2554,14 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     if (!sessionId) {
       return;
     }
+    const sub = this.subagentByChildId.get(sessionId);
+    if (sub) {
+      this.sessionEventSeqs.delete(sessionId);
+      if (sub.status === "running") {
+        await this.finishSubagent(sub, sub.finalText ? "done" : "unknown", sub.finalText);
+      }
+      return;
+    }
     // Terminalize live owned jobs BEFORE wiping the ledgers: a start without a
     // finished event left the timeline pairing open, and the restart busy-guard
     // then refused to restart the instance for six hours.
@@ -2037,6 +2591,24 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     this.turnRouting.delete(sessionId);
     this.jobsBySession.delete(sessionId);
     this.jobOwnersBySession.delete(sessionId);
+    const removedSubs = this.subagentsByRoot.get(sessionId);
+    if (removedSubs) {
+      for (const sub of removedSubs.values()) {
+        if (sub.status === "running") {
+          try {
+            await this.finishSubagent(sub, "error");
+          } catch {
+            // The pending turn / watcher is failed below with the removal error.
+          }
+        }
+        this.subagentByChildId.delete(sub.childId);
+        this.sessionEventSeqs.delete(sub.childId);
+      }
+      this.subagentsByRoot.delete(sessionId);
+    }
+    this.taskTokensBySession.delete(sessionId);
+    this.tokenByTaskBySession.delete(sessionId);
+    this.recentSubagentCallId.delete(sessionId);
     this.sessionApprovalGrants.delete(sessionId);
     this.projectionValues.delete(sessionId);
     this.projectionWatermarks.delete(sessionId);
@@ -2091,6 +2663,8 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       officeToolTimers: new Map(),
       officeApprovalWaits: new Map(),
       liveJobs: new Set(),
+      liveSubagents: new Set(),
+      subagentSettledInTurn: false,
       sawBackground: false,
       awaitingReview: false,
       settling: false,
@@ -2116,10 +2690,10 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       this.settleSuccess(pending);
       return;
     }
-    if (pending.liveJobs.size > 0) {
+    if (pending.liveJobs.size > 0 || pending.liveSubagents.size > 0) {
       return;
     }
-    if (pending.turnsStarted > 1) {
+    if (pending.turnsStarted > 1 || pending.subagentSettledInTurn) {
       this.settleSuccess(pending);
       return;
     }
@@ -2127,7 +2701,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
   }
 
   private waitForBackgroundReview(pending: PendingTurn): void {
-    if (pending.settled || pending.settling || pending.liveJobs.size > 0 || pending.turnsStarted > 1) {
+    if (pending.settled || pending.settling || pending.liveJobs.size > 0 || pending.liveSubagents.size > 0 || pending.turnsStarted > 1) {
       return;
     }
     pending.awaitingReview = true;
@@ -2136,7 +2710,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     }
     pending.backgroundTimer = setTimeout(() => {
       pending.backgroundTimer = undefined;
-      if (pending.awaitingReview && pending.liveJobs.size === 0 && pending.activeTurns.size === 0) {
+      if (pending.awaitingReview && pending.liveJobs.size === 0 && pending.liveSubagents.size === 0 && pending.activeTurns.size === 0) {
         this.settleSuccess(pending);
       }
     }, this.backgroundReviewGraceMs);
@@ -2183,6 +2757,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       || pending.activeTurns.size > 0
       || pending.outstandingToolCalls.size > 0
       || pending.liveJobs.size > 0
+      || pending.liveSubagents.size > 0
       || pending.awaitingReview
       || this.goalWatchers.has(pending.sessionId)
     ) return error;
@@ -2296,6 +2871,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       || this.inactivityTimeoutMs === null
       || pending.outstandingToolCalls.size > 0
       || pending.liveJobs.size > 0
+      || pending.liveSubagents.size > 0
     ) {
       return;
     }
@@ -2307,6 +2883,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
         pending.settled
         || pending.outstandingToolCalls.size > 0
         || pending.liveJobs.size > 0
+        || pending.liveSubagents.size > 0
       ) {
         return;
       }
@@ -2335,6 +2912,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     pending.abortController.abort();
     pending.cancellation = (async () => {
       try {
+        await this.interruptSessionSubagents(pending.sessionId, pending.claimId);
         if (pending.promptAdmission) {
           // Never replay admission on an unknown result. The private host
           // operation checks the exact source in both inbox and current turn.
@@ -3838,7 +4416,7 @@ function deepseekToolResults(data: Record<string, unknown>, calls: Map<string, T
   // with a single result; never finish the first parallel call by position.
   const results = blocks.length ? blocks : [{ content: message?.content }];
   return results.flatMap(block => {
-    const callId = stringValue(block?.toolCallId) ?? (results.length === 1 ? stringValue(source?.callId) : undefined);
+    const callId = stringValue(block?.toolCallId) ?? (results.length === 1 ? (stringValue(source?.callId) ?? stringValue(message?.toolCallId)) : undefined);
     if (!callId) return [];
     // Harness fs tools expose applied hunks in presentation meta, separate
     // from model-facing text. Only one result may inherit envelope metadata.
@@ -3874,6 +4452,21 @@ function textFromContent(value: unknown): string {
     }
   }
   return texts.join("\n");
+}
+
+function extractSubagentSettledReport(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const texts = content
+    .map((item) => asRecord(item))
+    .filter((block): block is Record<string, unknown> => block?.type === "text" && typeof block.text === "string")
+    .map((block) => String(block.text));
+  if (texts.length === 0) return undefined;
+  const markerIndex = texts.findIndex((text) => text.trim() === "Its closing message:");
+  if (markerIndex >= 0) {
+    const rest = texts.slice(markerIndex + 1).join("\n").trim();
+    return rest || undefined;
+  }
+  return texts.slice(1).join("\n").trim() || texts[0]?.trim() || undefined;
 }
 
 function assistantContentText(value: unknown, type: "text" | "reasoning"): string {
