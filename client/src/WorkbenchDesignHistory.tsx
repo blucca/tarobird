@@ -4,7 +4,7 @@ import { useLocale } from "./i18n.js";
 import type { DesignSession } from "./workbench-design-session.js";
 import "./workbench-design-history.css";
 
-// App-side History panel for a Baoyu document. It runs in the App, outside the
+// App-side History panel for a Workbench document. It runs in the App, outside the
 // opaque editor frame; file contents are shown only as text nodes. Restores go
 // through the session's flush → lock → CAS → reload path and become new versions.
 type Listing = Awaited<ReturnType<DesignSession["historyList"]>>["result"];

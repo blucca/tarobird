@@ -3,13 +3,12 @@ import type { DesignDocument } from "./workbench-design.js";
 import { decodeDesignFile } from "./workbench-design.js";
 import { designPath } from "../../src/client-protocol/workbench-design.js";
 
-// Comment threads for Baoyu documents. The wire shape follows the upstream
-// baoyu-design local comments service (MIT, Jim Liu) so its editor UI works
-// unchanged, but identity is never taken from the frame: the parent stamps the
-// authenticated TaroBird user, and Bot authors come only from Host-attested
-// actors. There is no agent long-poll, hook command or id-prefix lookup.
-// Comments live beside the document, never inside its executable files or its
-// revision, so a new comment cannot invalidate a Bot's expectedRevision.
+// Comment threads for Workbench documents. Identity is never taken from the
+// frame: the parent stamps the authenticated TaroBird user, and Bot authors
+// come only from Host-attested actors. There is no agent long-poll, hook
+// command or id-prefix lookup. Comments live beside the document, never inside
+// its executable files or its revision, so a new comment cannot invalidate a
+// Bot's expectedRevision.
 
 export const DESIGN_COMMENT_LIMITS = { text: 10_000, label: 1_000, detail: 4_000, anchor: 2_048, section: 200, name: 100, threads: 500, messages: 200, bytes: 2 * 1024 * 1024, receipts: 128 } as const;
 const threadId = z.string().regex(/^c_[a-f0-9]{10,32}$/), messageId = z.string().regex(/^m_[a-f0-9]{10,32}$/);
@@ -83,7 +82,7 @@ export const designCommentsResolveSchema = z.object({ threadId, status: z.enum([
 export type DesignCommentRequest = z.infer<typeof newThreadInput>;
 
 /** Resolve the file a comment points at, from the current document only. */
-export function locateComment(input: { label: string; detail?: string }, document: DesignDocument): DesignCommentThread["location"] {
+export function locateComment(input: { label: string; detail?: string; anchor?: string }, document: DesignDocument): DesignCommentThread["location"] {
   const json = (path: string) => { try { const file = document.files[path]; return file ? JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decodeDesignFile(file))) : undefined; } catch { return undefined; } };
   const format = document.format ?? "canvas";
   if (format === "canvas") {
@@ -110,9 +109,19 @@ export function locateComment(input: { label: string; detail?: string }, documen
     return { file: "project/canvas.json" };
   }
   if (format === "slides") {
+    const order = json("project/deck.json")?.order;
+    if (typeof input.anchor === "string" && input.anchor.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(input.anchor) as { slide?: unknown };
+        if (typeof parsed.slide === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(parsed.slide) && document.files[`project/slides/${parsed.slide}.html`]) {
+          const slide = Array.isArray(order) ? order.indexOf(parsed.slide) + 1 : 0;
+          return { file: `project/slides/${parsed.slide}.html`, ...(slide > 0 ? { slide } : {}), slideId: parsed.slide };
+        }
+      } catch { /* fall through to label matching */ }
+    }
     const match = /^(?:Area on slide|Slide) (\d+)(?: #([A-Za-z0-9_.-]+))?/.exec(input.detail ?? input.label);
     if (!match) return { file: "project/deck.json" };
-    const slide = Number(match[1]), order = json("project/deck.json")?.order;
+    const slide = Number(match[1]);
     const slideId = match[2] ?? (Array.isArray(order) && typeof order[slide - 1] === "string" ? order[slide - 1] : undefined);
     return slideId && /^[A-Za-z0-9_-]{1,64}$/.test(slideId) && document.files[`project/slides/${slideId}.html`] ? { file: `project/slides/${slideId}.html`, slide, slideId } : { file: "project/deck.json", ...(Number.isSafeInteger(slide) && slide > 0 ? { slide } : {}) };
   }

@@ -49,13 +49,20 @@ class DesignFrame {
   private readyTimer?: ReturnType<typeof setTimeout>;
   private exportPrompt?: ReturnType<typeof designExportPrompt>;
   private exportBusy = false;
+  private readOnly = false;
+  private title = "";
   private activate: () => void = () => {};
   private pending = new Map<string, { resolve(): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
   private report: (error?: string) => void = () => {};
   constructor(private readonly session: DesignSession) {}
-  attach(element: HTMLElement, report: (error?: string) => void, activate: () => void) {
+  attach(element: HTMLElement, report: (error?: string) => void, activate: () => void, options: { readOnly?: boolean; title?: string } = {}) {
+    const nextReadOnly = options.readOnly === true || this.session.readOnly;
+    const readOnlyChanged = !!this.iframe && this.readOnly !== nextReadOnly;
+    this.readOnly = nextReadOnly;
+    if (options.title !== undefined) this.title = options.title;
     this.placeholder = element; this.report = report; this.activate = activate;
     if (!this.iframe) this.open();
+    else if (readOnlyChanged) void this.reload();
     else this.observePlaceholder();
     this.layout();
     return () => {
@@ -170,7 +177,14 @@ class DesignFrame {
       this.unsubscribeEvents = this.session.onEvent(event=>{if(this.generation===generation)channel.port1.postMessage({type:"design-event",event});});
       let revision = this.session.document.revision;
       this.unsubscribe = this.session.subscribe(()=>{ if(generation===this.generation && revision!==this.session.document.revision) {revision=this.session.document.revision;channel.port1.postMessage({type:"document-changed",revision});} });
-      frame!.contentWindow!.postMessage({ type: "tarobot-design-init", dark: this.dark, repairRequests: nativePlatform() !== "ios" }, "*", [channel.port2]); return;
+      frame!.contentWindow!.postMessage({
+        type: "tarobot-design-init",
+        dark: this.dark,
+        repairRequests: nativePlatform() !== "ios",
+        readOnly: this.readOnly || this.session.readOnly,
+        designId: this.session.document.id,
+        title: this.title || designFormatTitle(this.session.document.format === "slides" ? "slides" : "canvas"),
+      }, "*", [channel.port2]); return;
     }
     if (value?.type === "tarobot-design-error") { clearTimeout(this.readyTimer); this.report("design_editor_load_failed"); return; }
     if (value?.type === "editor:ready") { this.ready = true; clearTimeout(this.readyTimer); this.report(undefined); return; }

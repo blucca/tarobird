@@ -8,7 +8,7 @@ import type { DesignSession } from "./workbench-design-session.js";
 import { designShareListActions, designShareManager, type DesignShareManager, type DesignShareMember, type DesignShareView } from "./workbench-design-collaboration.js";
 import "./workbench-design-sharing.css";
 
-// Authenticated collaboration on one Baoyu document: only through this Host's
+// Authenticated collaboration on one Workbench document: only through this Host's
 // signed App connection, to members of this conversation or the owner's other
 // devices. No links, no LAN service. A joined copy has no offline fallback.
 type Word = (zh: string, en: string) => string;

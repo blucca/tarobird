@@ -78,7 +78,7 @@ describe('Gateway design.open contract', () => {
   it('guidance requires an explicit Design request and the returned real target', () => {
     const guide = appCapabilityInstructions('widgets', { widgetsEnabled: true });
     expect(guide).toContain("operation:'design.open'");
-    expect(guide).toContain("ordinary requests to make PPT, presentations, graphics or designs do not select Baoyu");
+    expect(guide).toContain("ordinary requests that only ask for a standalone .pptx file, retain the engine's built-in presentation skill");
     expect(guide).toContain("format:'slides'");
     expect(guide).toMatch(/not a mention, discussion, comparison or question/);
     expect(guide).toMatch(/Use result\.target for later design\.read\/design\.publish/);

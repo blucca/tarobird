@@ -343,9 +343,10 @@ One Bot can hold many independent conversations that share its persona, model an
 Thank you to the [LINUX DO](https://linux.do/) community for supporting TaroBird.
 
 Workbench builds on [Excalidraw](https://github.com/excalidraw/excalidraw) for whiteboards,
-[Vditor](https://github.com/Vanessa219/vditor) for Markdown notes, and
-[Jim Liu's baoyu-design](https://github.com/JimLiu/baoyu-design) for the canvas and slide editors and their adapted authoring skills.
-Thank you to their authors and contributors. Excalidraw and Vditor use MIT. baoyu-design has [mixed licensing](client/vendor/baoyu-design/NOTICE.md), with the reconstructed editor outside its MIT grant. Original copyright, scope notices and bundled
+[Vditor](https://github.com/Vanessa219/vditor) for Markdown notes,
+[Open Artifact](https://github.com/JimLiu/open-artifact) (`@open-artifact/slides-editor`, Apache-2.0) for Workbench presentations, and
+[Jim Liu's baoyu-design](https://github.com/JimLiu/baoyu-design) for the legacy canvas editor.
+Thank you to their authors and contributors. Excalidraw and Vditor use MIT; Open Artifact uses Apache-2.0 (LICENSE and NOTICE retained in `client/vendor/workbench-slides/`); baoyu-design has [mixed licensing](client/vendor/baoyu-design/NOTICE.md). Original copyright, scope notices and bundled
 dependency notices are retained; see [third-party notices](LICENSING.md) and the
 [Design integration guide](docs/client/workbench-design.md).
 

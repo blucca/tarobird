@@ -36,15 +36,12 @@ skill (MIT); the tool-routing section is TaroBot-specific.
 Temporary App storage and safe post-publication retirement. Install through the
 same script above; see [the operator guide](../docs/macos-artifact-retention.md).
 
-## Baoyu Design and Baoyu PPT
+## Canvas adapter (`baoyu-design`)
 
-These are TaroBot adapters for the separately pinned canvas and slides editors.
-They operate App projects with `app_workbench` / `tarobot workbench run`; they do
-not run the upstream filesystem server. Explicit Baoyu/宝玉 requests select them;
-ordinary design/PPT requests retain each engine's usual skills.
+This is a TaroBot adapter for the separately pinned canvas editor. Workbench presentations use TaroBird's built-in Apache-2.0 slide format directly through `app_workbench` / `tarobot workbench run` without a separate presentation skill.
 
 ```bash
-bash scripts/install-skills.sh --skill baoyu-design --skill baoyu-ppt
+bash scripts/install-skills.sh --skill baoyu-design
 ```
 
 To use an engine-specific skill location, pass `--destination /path/to/skills`
