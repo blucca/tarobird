@@ -61,7 +61,7 @@ export const QUOTA_REASON_TEXT: Record<QuotaReason, Text> = {
 };
 export const QUOTA_CLAUDE_UNVERIFIABLE_TEXT: Text = ["Claude Code 的凭据来源无法由公开接口核实（例如 macOS 钥匙串登录），为避免显示其他账号的额度，不展示被动收到的读数。", "Claude Code's credential source cannot be verified through a public interface (for example, a macOS Keychain login). Passive readings are hidden so another account's quota is never shown."];
 export const QUOTA_EXPIRED_TEXT: Text = ["已过期，需重新读取", "Expired; refresh required"];
-const ENGINE_NAMES: Record<QuotaEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
+const ENGINE_NAMES: Record<QuotaEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi", omp: "oh-my-pi (omp)" };
 
 /** Human explanation for standard error in normal mode: why each Bot has no current reading, how to
  * refresh it, and where to check officially. Built only from protocol enums, the Bot label and the

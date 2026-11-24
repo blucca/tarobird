@@ -39,7 +39,7 @@ type Choice = { id: string; provider?: string; efforts: readonly string[] };
  * providers, so a provider absent from the catalog is the sign-in case.
  */
 export function piModelSettingsRejectionText(code: string, context: { engine?: string; model: string; effort: string; choices: readonly Choice[] }): string | undefined {
-  if (context.engine !== "pi" || !context.model) return undefined;
+  if ((context.engine !== "pi" && context.engine !== "omp") || !context.model) return undefined;
   if (code === "model_unavailable") {
     const provider = providerOf(context.model);
     if (!provider) return undefined;
@@ -63,7 +63,7 @@ export function piModelSettingsRejectionText(code: string, context: { engine?: s
 
 /** A refused Bot default thinking level for a Pi Bot, with the levels its current model offers. */
 export function piEffortSettingsRejectionText(code: string, context: { engine?: string; effort: string; choices: readonly string[] }): string | undefined {
-  if (context.engine !== "pi" || code !== "effort_incompatible" || !context.effort) return undefined;
+  if ((context.engine !== "pi" && context.engine !== "omp") || code !== "effort_incompatible" || !context.effort) return undefined;
   const levels = context.choices.filter(level => level && level !== context.effort);
   return levels.length ? t("当前模型不支持思考强度 {0}。可选：{1}，或跟随默认。", context.effort, levelList(levels)) : undefined;
 }

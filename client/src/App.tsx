@@ -932,7 +932,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     lastDraftEdits.current.set(selected, { version: draftVersions.current.get(selected)!, text });
     editGroupDraft(text, !!files.length || !!reply); groupDraft(selected).text = text;
     queueDraftText(selected, text);
-    if (current?.type === "direct" && (activeBot?.engine === "codex" || activeBot?.engine === "pi")) void retireEditedSteeringDraft(connection, selected, current.botIds[0]!, text).catch(() => undefined);
+    if (current?.type === "direct" && (activeBot?.engine === "codex" || activeBot?.engine === "pi" || activeBot?.engine === "omp")) void retireEditedSteeringDraft(connection, selected, current.botIds[0]!, text).catch(() => undefined);
     if (current?.type === "direct" && activeBot?.engine === "claude") void retireEditedNativeInputDraft(connection, selected, current.botIds[0]!, text).catch(() => undefined);
   };
   const composeWidget = (message: Message, raw: string): boolean => {
@@ -1538,7 +1538,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const sendChoiceScope = `send-choice:${connection.identity.hubPublicKey}:${selected}:${current?.botIds[0] ?? ""}`;
   const sendChoice = useClaudeSendChoice(connection, selected, current?.botIds[0], steeringCapability, !!draft.trim() || !!files.length || !!reply);
   const claudeChoice = current?.type === "direct" && activeBot?.engine === "claude" && !!activeBot.online && !!nativeInput && steeringAvailable && !!steeringCapability.targetId && steeringCapability.sendBehavior === "steer";
-  const piChoice = current?.type === "direct" && activeBot?.engine === "pi" && !!activeBot.online && !!replying && steeringAvailable && !!steeringCapability.targetId && steeringCapability.sendBehavior === "steer";
+  const piChoice = current?.type === "direct" && (activeBot?.engine === "pi" || activeBot?.engine === "omp") && !!activeBot.online && !!replying && steeringAvailable && !!steeringCapability.targetId && steeringCapability.sendBehavior === "steer";
   // Only an Antigravity Bot on the ACP runtime advertises in-flight steering; print mode never shows this choice.
   const agyChoice = current?.type === "direct" && activeBot?.engine === "antigravity" && !!activeBot.online && !!replying && steeringAvailable && !!steeringCapability.targetId && steeringCapability.sendBehavior === "steer";
   const codexDirect = current?.type === "direct" && activeBot?.engine === "codex";
@@ -1547,7 +1547,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const richNextTurn = !!files.length || !!reply;
   const codexLockedToNext = richNextTurn || workbenchVisible || !!workbenchDraft || !!steerExplicit.length;
   const codexSupplement = codexDirect && !!codexSendChoice.targetId && !codexLockedToNext && !draft.trimStart().startsWith("/");
-  const queueChosen = !draft.trimStart().startsWith("/") && (current?.type === "direct" && (activeBot?.engine === "claude" || activeBot?.engine === "pi" || activeBot?.engine === "antigravity") && sendChoice.next || codexChoice && !codexSupplement);
+  const queueChosen = !draft.trimStart().startsWith("/") && (current?.type === "direct" && (activeBot?.engine === "claude" || activeBot?.engine === "pi" || activeBot?.engine === "omp" || activeBot?.engine === "antigravity") && sendChoice.next || codexChoice && !codexSupplement);
   const showSendChoice = (claudeChoice || piChoice || agyChoice || codexChoice || codexSupplement) && !connection.isReadOnly && !recording && !draft.trimStart().startsWith("/");
   const composerQueues = queueChosen || (claudeChoice || piChoice || agyChoice || codexChoice) && richNextTurn;
   const sendFromComposer = () => send(queueChosen);

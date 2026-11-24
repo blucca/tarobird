@@ -1,4 +1,5 @@
 import { resolvePiExecutable } from "../runtime/pi-executable.js";
+import { resolveOmpExecutable } from "../runtime/omp-executable.js";
 import { EngineSettingsReadError, hostEngineEnvironment } from "../runtime/host-engine-settings.js";
 import { assignNewBotAvatar } from "./bot-avatar-default.js";
 import { publishExclusive } from "../state/publish-exclusive.js";
@@ -77,7 +78,7 @@ export class BotManager {
   }
   capabilities(engine: InstanceEngine) { return readEngineCapabilities(engine, { env: this.env }); }
   private engineBinaries(env = this.env): Record<InstanceEngine, string> {
-    return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: resolveDeepSeekExecutable(env), antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy", pi: resolvePiExecutable(env) };
+    return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: resolveDeepSeekExecutable(env), antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy", pi: resolvePiExecutable(env), omp: resolveOmpExecutable(env) };
   }
   engineAvailable(engine: InstanceEngine): boolean { const env = this.env; return !!resolveEngineExecutable(this.engineBinaries(env)[engine], env); }
   private agyAcp?: { executable: string; at: number; supported: Promise<boolean> };
@@ -99,8 +100,8 @@ export class BotManager {
   async engineCatalog(id: InstanceEngine, workspace?: string, request: ModelCatalogRequest = {}): Promise<EngineRead> {
     const env = this.env, bins = this.engineBinaries(env), available = !!resolveEngineExecutable(bins[id], env);
     const placeholder: Pick<ModelCatalogRead, "choices"> = { choices: [{ id: "", efforts: [""] }] }, now = Date.now();
-    if (id === "pi" && workspace && !(path.isAbsolute(workspace) && await stat(workspace).then(s => s.isDirectory(), () => false))) return { ...this.engineEntry(id, available, { ...placeholder, status: "unavailable" }), readAt: now };
-    if ((id === "antigravity" || id === "pi" || id === "deepseek") && !available) return { ...this.engineEntry(id, available, placeholder), readAt: now };
+    if ((id === "pi" || id === "omp") && workspace && !(path.isAbsolute(workspace) && await stat(workspace).then(s => s.isDirectory(), () => false))) return { ...this.engineEntry(id, available, { ...placeholder, status: "unavailable" }), readAt: now };
+    if ((id === "antigravity" || id === "pi" || id === "omp" || id === "deepseek") && !available) return { ...this.engineEntry(id, available, placeholder), readAt: now };
     // A missing CLI cannot answer; its built-in list is what a failed read gives.
     if ((id === "claude" || id === "codex") && !available) return { ...this.engineEntry(id, available, fallbackModelCatalog(id)), readAt: now };
     const result = await this.catalogs.get(id, env, bins[id], workspace, request);
@@ -130,7 +131,7 @@ export class BotManager {
       if (spec.permission && !permissionOptions(spec.engine).some(option => option.id === spec.permission)) throw new HubError("permissions_incompatible");
       const incompatible = getEngineEffortValidationError(spec.engine, spec.effort || undefined, spec.model || undefined);
       if (incompatible) throw new HubError("bot_effort_incompatible");
-      if (spec.engine === "pi" && spec.model && !decodePiModel(spec.model)) throw new HubError("model_id_invalid");
+      if ((spec.engine === "pi" || spec.engine === "omp") && spec.model && !decodePiModel(spec.model)) throw new HubError("model_id_invalid");
       const botId = `client_${createHash("sha256").update(`${userId}:${spec.requestId}`).digest("hex").slice(0, 24)}`;
       if (await this.store.db.serial(() => this.store.db.get("SELECT 1 FROM bots WHERE id=? AND deleted_at IS NOT NULL", [botId]))) throw new HubError("bot_deleted", 410);
       let row = await this.store.db.serial(() => this.store.db.get<Managed>("SELECT * FROM managed_bots WHERE bot_id=?", [botId]));
@@ -141,8 +142,8 @@ export class BotManager {
         if (!this.engineAvailable(spec.engine)) throw new HubError("bot_engine_unavailable", 409);
         // Only the chosen engine's list, and only when a check below reads it:
         // other CLIs are never started to create a Bot.
-        if (spec.engine === "deepseek" || spec.engine === "pi" && spec.model || spec.effort && (spec.engine === "kimi" || spec.engine === "pi" || spec.engine === "antigravity")) {
-          const workspace = spec.engine === "pi" || spec.engine === "deepseek" ? spec.workspace || undefined : undefined;
+        if (spec.engine === "deepseek" || (spec.engine === "pi" || spec.engine === "omp") && spec.model || spec.effort && (spec.engine === "kimi" || spec.engine === "pi" || spec.engine === "omp" || spec.engine === "antigravity")) {
+          const workspace = spec.engine === "pi" || spec.engine === "omp" || spec.engine === "deepseek" ? spec.workspace || undefined : undefined;
           let engine = await this.engineCatalog(spec.engine, workspace, { refresh: spec.engine === "deepseek" });
           // A stale list is fine to show, not to validate against: wait for its replacement.
           if (engine.stale) engine = await this.engineCatalog(spec.engine, workspace, { after: engine.readAt });
@@ -154,7 +155,7 @@ export class BotManager {
             if (!selected.efforts.includes(spec.effort)) throw new HubError("bot_effort_incompatible");
           }
           if (spec.engine === "kimi" && engine.models.find(model => model.id === spec.model)?.efforts.includes(spec.effort) === false) throw new HubError("bot_effort_incompatible");
-          if (spec.engine === "pi") {
+          if (spec.engine === "pi" || spec.engine === "omp") {
             const listed = engine.models.find(model => model.id === spec.model);
             // A model a complete list leaves out is the problem, not the effort; an incomplete list cannot refuse a model.
             if (spec.model && !listed && engine.catalogStatus === "ready") throw new HubError("model_unavailable", 409);
@@ -205,7 +206,7 @@ export class BotManager {
     // explicit bypass/manual; otherwise fall back to manual rather than widen.
     const permission = config.engine === engine || selected === "bypass" || selected === "normal" ? selected : "normal";
     const workspace = resolveInstanceWorkspacePath({ workspacePath: config.workspacePath, resume: config.resume }) ?? "";
-    const label = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi" }[engine];
+    const label = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi", omp: "oh-my-pi" }[engine];
     const guard = async () => {
       await validate?.();
       if (!await this.store.db.get("SELECT 1 FROM bots WHERE id=? AND role='dispatcher' AND deleted_at IS NULL", [dispatcherId])) throw new HubError("dispatcher_required", 409);

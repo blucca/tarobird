@@ -8,7 +8,7 @@ import { timeoutSignal } from "./abort-signals.js";
 import { t, useLocale } from "./i18n.js";
 import "./engine-settings.css";
 
-const labels: Record<HostEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
+const labels: Record<HostEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi", omp: "oh-my-pi (omp)" };
 export function EngineSettings({ connection, active, onBusy, onDirty, onSaved, onDetected }: { connection: HubConnection; active: boolean; onBusy?: (busy: boolean) => void; onDirty?: (dirty: boolean) => void; onSaved?: () => void; /** Engines the host reported as present in a completed read (not a save). */ onDetected?: (available: HostEngine[]) => void }) {
   useLocale(); const host = useContext(RuntimeHostContext);
   const state = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);

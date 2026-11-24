@@ -15,7 +15,7 @@ import { redactSecrets } from "./secret-redaction.js";
 
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const clean = (value: unknown, max = 500) => typeof value === "string" ? redactSecrets(value).replace(/https?:\/\/\S+/g, "[URL]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, max) : "";
-const engineNames = ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"] as const;
+const engineNames = ["codex", "claude", "kimi", "deepseek", "antigravity", "pi", "omp"] as const;
 export type CapabilityEngine = typeof engineNames[number];
 type Options = { env?: NodeJS.ProcessEnv; offline?: boolean };
 /** A registered Bot: its own state, workspace and project-scoped settings. */
@@ -229,6 +229,18 @@ async function scanEngine(scan: Scanner, engine: CapabilityEngine, env: NodeJS.P
       // resources actually load; this scanner never grants that trust.
       await jsonMcp(path.join(workspace, ".pi/mcp.json"), "workspace/.pi/mcp.json", "workspace");
       await piSkills(path.join(workspace, ".pi/skills"), "workspace/.pi/skills", "workspace");
+      await piSkills(path.join(workspace, ".agents/skills"), "workspace/.agents/skills", "workspace");
+    }
+  } else if (engine === "omp") {
+    const ompDir = env.OMP_CONFIG_DIR?.trim() || path.join(home, ".omp");
+    if (user) {
+      await jsonMcp(path.join(ompDir, "mcp.json"), "~/.omp/mcp.json", "user");
+      await piSkills(path.join(ompDir, "skills"), "~/.omp/skills", "user");
+      await piSkills(path.join(home, ".agents/skills"), "~/.agents/skills", "user");
+    }
+    if (workspace) {
+      await jsonMcp(path.join(workspace, ".omp/mcp.json"), "workspace/.omp/mcp.json", "workspace");
+      await piSkills(path.join(workspace, ".omp/skills"), "workspace/.omp/skills", "workspace");
       await piSkills(path.join(workspace, ".agents/skills"), "workspace/.agents/skills", "workspace");
     }
   } else {

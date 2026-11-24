@@ -5,7 +5,7 @@ import path from "node:path";
 import { discoverEngineDirectories } from "./engine-discovery.js";
 import { deepseekExecutableOverride } from "../runtime/deepseek-executable.js";
 
-export const HOST_ENGINE_EXECUTABLE_KEYS = ["CODEX_EXECUTABLE", "CLAUDE_EXECUTABLE", "ANTIGRAVITY_EXECUTABLE", "KIMI_EXECUTABLE", "DSH_EXECUTABLE", "PI_EXECUTABLE"] as const;
+export const HOST_ENGINE_EXECUTABLE_KEYS = ["CODEX_EXECUTABLE", "CLAUDE_EXECUTABLE", "ANTIGRAVITY_EXECUTABLE", "KIMI_EXECUTABLE", "DSH_EXECUTABLE", "PI_EXECUTABLE", "OMP_EXECUTABLE"] as const;
 export const HOST_CONFIG_DIRECTORY_KEYS = ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "DSH_HOME", "KIMI_CODE_HOME", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"] as const;
 export const HOST_PROXY_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"] as const;
 export const HOST_PRESERVED_ENVIRONMENT_KEYS = [...HOST_ENGINE_EXECUTABLE_KEYS, ...HOST_CONFIG_DIRECTORY_KEYS, ...HOST_PROXY_KEYS] as const;

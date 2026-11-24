@@ -302,8 +302,8 @@ export class HubDispatch {
     return { settings,
       defaults: "Empty model IDs or efforts are valid CLI defaults: omit --model or --effort to select them. A default-only engine is a normal candidate; defaultModel/defaultEffort are creation presets, not task recommendations.",
       evidence: "Use tickets capabilities --engine E [--match TEXT] [--offset N] for partial user-scope metadata; presence does not verify runtime access or quality. Model IDs/labels carry no quality ranking. Ticket outcomes alone are not owner acceptance or comparative quality evidence.",
-      // Pi is an ordinary Bot engine, not part of Chancellor dispatch.
-      targets: catalog.engines.filter((engine): engine is typeof engine & { id: Exclude<typeof engine.id, "pi"> } => engine.id !== "pi").map(engine => {
+      // Pi and omp are ordinary Bot engines, not part of Chancellor dispatch.
+      targets: catalog.engines.filter((engine): engine is typeof engine & { id: Exclude<typeof engine.id, "pi" | "omp"> } => engine.id !== "pi" && engine.id !== "omp").map(engine => {
       const state = health.find(item => item.engine === engine.id);
       return { engine: engine.id, installed: engine.available, allowed: !settings.allowedEngines || settings.allowedEngines.includes(engine.id),
         models: engine.models.map(model => ({ ...model, label: model.label ?? (model.id || "CLI configured default") })), defaultModel: engine.defaultModel, defaultEffort: engine.defaultEffort, ...(state ? { health: state } : {}) };

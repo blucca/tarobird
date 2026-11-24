@@ -1646,7 +1646,7 @@ export class HubServer {
         } else view = this.engineSettings.status(idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined));
         // Existing clients validate a closed five-engine enum. Keep their
         // complete settings page usable until they opt into Pi support.
-        await reply(200, url.searchParams.get("includePi") === "1" ? view : { ...view, engines: view.engines.filter(engine => engine.id !== "pi") }); return;
+        await reply(200, url.searchParams.get("includePi") === "1" ? view : { ...view, engines: view.engines.filter(engine => engine.id !== "pi" && engine.id !== "omp") }); return;
       }
       if (route === "/api/settings/widgets" && ["GET", "PUT"].includes(req.method ?? "")) {
         await requireOwner();
@@ -2100,7 +2100,7 @@ export class HubServer {
           const catalog = await this.botManager.catalog(z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined), refresh);
           // Existing clients do not understand Pi's provider/effort settings.
           // New App and CLI catalog readers opt in, just as engine settings do.
-          await reply(200, url.searchParams.get("includePi") === "1" ? catalog : { ...catalog, engines: catalog.engines.filter(engine => engine.id !== "pi") });
+          await reply(200, url.searchParams.get("includePi") === "1" ? catalog : { ...catalog, engines: catalog.engines.filter(engine => engine.id !== "pi" && engine.id !== "omp") });
         }
         else await reply(201, await this.botManager.create(userId, createBotSchema.parse(await this.jsonBody(req)), validateInQueue));
         return;

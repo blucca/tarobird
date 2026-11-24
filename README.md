@@ -5,7 +5,7 @@
 <h3 align="center">Your AI agents, running on your own computers.<br>The same conversations on desktop and phone.</h3>
 
 <p align="center">
-  Codex · Claude Code · Kimi Code · DeepSeek Harness · Antigravity · Pi
+  Codex · Claude Code · Kimi Code · DeepSeek Harness · Antigravity · Pi · oh-my-pi (omp)
 </p>
 
 <p align="center">
@@ -223,6 +223,8 @@ Right-click a folder name or an empty area of the desktop list to group by host,
 Install and sign in to any one engine on the computer that runs your Bots to get started; TaroBird does not include AI engines, model accounts or credits. See the [engine comparison](docs/details.md#engine-comparison) for adapter differences.
 
 **Pi, from 1.6.0:** [Pi native integration](docs/client/pi-engine.md) adds provider-aware model selection and native conversation controls for ordinary Bots. Pi is excluded from Chancellor dispatch.
+
+**oh-my-pi (`omp`):** [oh-my-pi native integration](docs/client/omp-engine.md) connects directly to `omp --mode rpc-ui` via its dedicated v2 RPC protocol (per-prompt `prompt_result` + `session_settled`, `steer` / `follow_up` / `aside` queues, and native subagent task tracking) as a separate engine alongside Pi.
 
 <a id="engines"></a>
 

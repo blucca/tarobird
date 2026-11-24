@@ -8,7 +8,7 @@ import { useEngineQuota } from "./use-engine-quota.js";
 import { t, useLocale } from "./i18n.js";
 import "./engine-quota.css";
 
-const engines = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
+const engines: Record<QuotaEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi", omp: "oh-my-pi (omp)" };
 function reasonText(reason: QuotaReason | undefined, engine: QuotaEngine): string {
   switch (reason) {
     case "not_adapted": return t("此引擎尚未接入原生额度。");

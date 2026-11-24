@@ -10,7 +10,7 @@ import { HubHttpError } from "./http-error.js";
 import { t, useLocale } from "./i18n.js";
 import "./dispatch.css";
 
-export const ENGINE_NAMES: Record<string, string> = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi" };
+export const ENGINE_NAMES: Record<string, string> = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi", omp: "oh-my-pi" };
 type Engine = NonNullable<DispatcherSettings["allowedEngines"]>[number];
 /** Engine CLIs installed on the Host, from its Bot catalog. */
 export const installedEngines = (catalog?: BotCatalog): Engine[] => (catalog?.engines ?? []).filter(engine => engine.available).map(engine => engine.id).filter((id): id is Engine => (DISPATCH_ENGINES as readonly string[]).includes(id));

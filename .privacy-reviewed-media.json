@@ -3138,6 +3138,13 @@
       "note": "SVG source and rendered brand/model logo review; local artwork references checked, no private data or external resource references."
     },
     {
+      "path": "client/src/assets/model-brands/omp.svg",
+      "sha256": "15487d2733fa772a2c3a9f716dae8e83de560347d876277a9ce0b4dbf2423b28",
+      "reviewer": "codex",
+      "method": "visual-review",
+      "note": "Original monochrome geometric SVG icon for oh-my-pi (omp); full SVG source reviewed, no private data or external resource references."
+    },
+    {
       "path": "client/src/brand/apple-touch-icon.png",
       "sha256": "f34571eee51a273e09c02bd85b60dce433cd3ed106374f8b56fc7f0d1f0fea13",
       "reviewer": "codex",
