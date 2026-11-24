@@ -5674,5 +5674,21 @@
   "未能并入，已改为排队": "Couldn't join the reply; queued instead",
   "经排队投递": "Delivered through the queue",
   "无法确认是否已并入": "Can't confirm whether it was merged",
-  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed."
+  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed.",
+  "自动发现（已记住）": "Auto-discovered (remembered)",
+  "自动检测 · 登录 Shell": "Auto-detected · Login shell",
+  "自动检测 · 包管理器全局目录": "Auto-detected · Package manager global bin",
+  "自动检测 · Windows 注册表 PATH": "Auto-detected · Windows registry PATH",
+  "自动检测 · 主机 PATH": "Auto-detected · Host PATH",
+  "自动检测 · 常见安装目录": "Auto-detected · Known install directory",
+  "版本：{0}": "Version: {0}",
+  "{0} 指向的 {1} 已不存在": "{1}, which {0} points to, no longer exists",
+  "已跳过失效软链接：{0} 指向的 {1} 已不存在": "Skipped dangling symlink: {1}, which {0} points to, no longer exists",
+  "主机默认 PATH 未找到，但终端可找到：": "Not found on the host default PATH, but found in the terminal:",
+  "主机与终端找到的路径不同，终端路径为：": "The host and terminal resolved different paths. Terminal path:",
+  "由终端登录 Shell 的 PATH 发现（不在主机默认 PATH 中），可固定保存为手动路径：": "Found via the terminal login shell PATH (outside the host default PATH). You can save it as a fixed path:",
+  "采用终端路径": "Adopt terminal path",
+  "确认采用终端路径 {0}？将保存为该引擎的固定路径。": "Adopt terminal path {0}? It will be saved as this engine’s fixed path.",
+  "确认采用": "Confirm",
+  "登录 Shell 探测超时，已回退到主机常规目录规则。": "Login shell probe timed out; fell back to standard host directory rules."
 }

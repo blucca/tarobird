@@ -1,11 +1,21 @@
 import { resolvePiExecutable } from "../runtime/pi-executable.js";
-import { ENGINE_SETTINGS_REPAIR_HINT } from "../client-protocol/engine-settings.js";
+import { ENGINE_SETTINGS_REPAIR_HINT, hostEngineSchema, type EngineDiscoveryRule } from "../client-protocol/engine-settings.js";
 import path from "node:path";
-import { hostEngineEnvironment } from "../runtime/host-engine-settings.js";
+import { ENGINE_COMMANDS, ENGINE_ENV_KEYS, hostEngineEnvironment, readHostEngineSettings } from "../runtime/host-engine-settings.js";
 import { readHubConfig } from "../hub/config.js";
 import { inspectHubService } from "../hub/service.js";
 import { resolveEngineExecutable } from "../runtime/engine-process.js";
 import { deepseekExecutableOverride, resolveDeepSeekExecutable } from "../runtime/deepseek-executable.js";
+import {
+  diagnoseExecutableCandidates,
+  discoverEngineDirectories,
+  lookupEnvCaseInsensitive,
+  mergeTaggedDirectories,
+  probeExecutableVersion,
+  runEnvironmentDiscovery,
+  type DanglingLinkInfo,
+  type TaggedDirectory,
+} from "./engine-discovery.js";
 import { HubDatabase } from "../hub/database.js";
 import { exists, resolveDesktopHostDirectory } from "./paths.js";
 import { readHostProfile } from "./setup.js";
@@ -15,16 +25,99 @@ import { LocalHostClient } from "./client.js";
 import { HostDirectoryError } from "./windows-state-admission.js";
 import { HostManagement } from "./management.js";
 
-export function inspectEngines(env: NodeJS.ProcessEnv = process.env) {
+export type InspectedEngine = {
+  engine: "codex" | "claude" | "pi" | "antigravity" | "kimi" | "deepseek";
+  installed: boolean;
+  executable?: string;
+  version?: string | null;
+  rule?: EngineDiscoveryRule | null;
+  danglingLinks?: DanglingLinkInfo[];
+  terminalExecutable?: string | null;
+  searchedDirectories?: string[];
+  authentication: "unverified";
+};
+
+export function inspectEngines(env: NodeJS.ProcessEnv = process.env): InspectedEngine[] {
+  const windows = process.platform === "win32", sep = windows ? ";" : ":";
+  const pathDirs = (lookupEnvCaseInsensitive(env, "PATH") ?? "").split(sep).filter(Boolean);
+  const taggedDirs: TaggedDirectory[] = pathDirs.map((dir) => ({ dir, rule: "path" }));
   return ([
     ["codex", env.CODEX_EXECUTABLE || "codex"], ["claude", env.CLAUDE_EXECUTABLE || "claude"],
     ["pi", resolvePiExecutable(env)],
     ["antigravity", env.ANTIGRAVITY_EXECUTABLE || "agy"], ["kimi", env.KIMI_EXECUTABLE || "kimi"],
     ["deepseek", resolveDeepSeekExecutable(env)],
   ] as const).map(([engine, command]) => {
-    const executable = resolveEngineExecutable(command, env);
-    return { engine, installed: !!executable, ...(executable ? { executable } : {}), authentication: "unverified" as const };
+    const diagnosed = diagnoseExecutableCandidates(command, taggedDirs, env);
+    const executable = diagnosed.executable ?? resolveEngineExecutable(command, env);
+    const rule: EngineDiscoveryRule | null = executable
+      ? (lookupEnvCaseInsensitive(env, ENGINE_ENV_KEYS[engine]) ? "environment" : diagnosed.rule ?? "path")
+      : null;
+    return {
+      engine,
+      installed: !!executable,
+      ...(executable ? { executable } : {}),
+      rule,
+      ...(diagnosed.danglingLinks.length ? { danglingLinks: diagnosed.danglingLinks } : {}),
+      ...(!executable ? { searchedDirectories: pathDirs } : {}),
+      authentication: "unverified" as const,
+    };
   });
+}
+
+export async function inspectEnginesWithDiscovery(directory: string, baseEnv: NodeJS.ProcessEnv = process.env): Promise<InspectedEngine[]> {
+  const settings = readHostEngineSettings(directory);
+  const env = hostEngineEnvironment(directory, baseEnv, settings);
+  const platform = process.platform, windows = platform === "win32", sep = windows ? ";" : ":";
+  const home = windows
+    ? lookupEnvCaseInsensitive(baseEnv, "USERPROFILE", "win32") ?? lookupEnvCaseInsensitive(baseEnv, "HOME", "win32") ?? ""
+    : baseEnv.HOME ?? baseEnv.USERPROFILE ?? "";
+
+  const probe = await runEnvironmentDiscovery({ baseEnv, commands: Object.values(ENGINE_COMMANDS), home: home || undefined, platform });
+  const baseDirs = (lookupEnvCaseInsensitive(baseEnv, "PATH", platform) ?? "").split(sep).filter(Boolean).map((dir): TaggedDirectory => ({ dir, rule: "path" }));
+  const knownDirs = home ? discoverEngineDirectories(home, baseEnv, platform).map((dir): TaggedDirectory => ({ dir, rule: "known-directory" })) : [];
+  const hostTagged = mergeTaggedDirectories([baseDirs, knownDirs], platform);
+  const merged = mergeTaggedDirectories([
+    probe.shell.pathDirs.map((dir): TaggedDirectory => ({ dir, rule: "login-shell" })),
+    probe.windowsRegistryDirs.map((dir): TaggedDirectory => ({ dir, rule: "windows-registry" })),
+    probe.packageManagerDirs.map((dir): TaggedDirectory => ({ dir, rule: "package-manager" })),
+    hostTagged,
+  ], platform);
+  const enhancedEnv: NodeJS.ProcessEnv = { ...env };
+  if (windows) for (const key of Object.keys(enhancedEnv)) if (key.toUpperCase() === "PATH") delete enhancedEnv[key];
+  enhancedEnv.PATH = merged.map(item => item.dir).join(sep);
+
+  return Promise.all(hostEngineSchema.options.map(async (engine) => {
+    const explicit = engine === "deepseek" ? deepseekExecutableOverride(baseEnv) !== undefined : !!lookupEnvCaseInsensitive(baseEnv, ENGINE_ENV_KEYS[engine], platform);
+    const hasManual = !!settings.paths[engine];
+    const defaultCmd = ENGINE_COMMANDS[engine];
+    const command = hasManual
+      ? settings.paths[engine]!
+      : explicit
+        ? (engine === "deepseek" ? resolveDeepSeekExecutable(env, platform) : lookupEnvCaseInsensitive(baseEnv, ENGINE_ENV_KEYS[engine], platform)!)
+        : engine === "pi" ? resolvePiExecutable(enhancedEnv, platform)
+          : engine === "deepseek" ? resolveDeepSeekExecutable(enhancedEnv, platform)
+            : defaultCmd;
+    const diagnosed = diagnoseExecutableCandidates(command, merged, enhancedEnv, platform);
+    const executable = diagnosed.executable ?? resolveEngineExecutable(command, enhancedEnv, platform);
+    const shellHit = probe.shell.resolvedCommands[defaultCmd];
+    const terminalExecutable = shellHit && resolveEngineExecutable(shellHit, enhancedEnv, platform) ? shellHit : null;
+    const hostBaseline = !hasManual && !explicit ? diagnoseExecutableCandidates(defaultCmd, hostTagged, env, platform) : undefined;
+    const rule: EngineDiscoveryRule | null = executable
+      ? (hasManual ? "setting" : explicit ? "environment" : settings.discoveredPaths?.[engine] === executable ? "auto-discovered" : diagnosed.rule ?? "path")
+      : null;
+    const version = executable ? await probeExecutableVersion(executable, enhancedEnv) : null;
+    return {
+      engine,
+      installed: !!executable,
+      ...(executable ? { executable } : {}),
+      version,
+      rule,
+      ...(diagnosed.danglingLinks.length ? { danglingLinks: diagnosed.danglingLinks } : {}),
+      ...(terminalExecutable && hostBaseline && hostBaseline.executable !== terminalExecutable ? { terminalExecutable } : {}),
+      ...(!executable ? { searchedDirectories: merged.map(item => item.dir) } : {}),
+      authentication: "unverified" as const,
+    };
+  }));
 }
 
 /** Read-only inspection. No new identity, DB migrations, engine execution or login. */
@@ -35,8 +128,13 @@ export async function inspectHost(directory: string, env: NodeJS.ProcessEnv = pr
   let serviceEnvironmentDifferences: string[] = [], serviceEnvironmentCheck: string | undefined;
   try { serviceEnvironmentDifferences = await managedServiceEnvironmentDifferences(directory, env); }
   catch { serviceEnvironmentCheck = "host_service_environment_unavailable"; }
-  let engines: ReturnType<typeof inspectEngines>, environmentCheck: { error: string; variables: string[]; hint?: string } | undefined;
-  try { engines = inspectEngines(hostEngineEnvironment(directory, buildHostEnvironment({ env }))); }
+  let engines: InspectedEngine[], environmentCheck: { error: string; variables: string[]; hint?: string } | undefined;
+  try {
+    const hostEnv = buildHostEnvironment({ env });
+    engines = inspectLiveEngines
+      ? await inspectEnginesWithDiscovery(directory, hostEnv)
+      : inspectEngines(hostEngineEnvironment(directory, hostEnv));
+  }
   catch (error) {
     if (error instanceof Error && error.message === "engine_settings_unavailable") {
       engines = []; environmentCheck = { error: "engine_settings_unavailable", variables: [], hint: ENGINE_SETTINGS_REPAIR_HINT };
@@ -57,7 +155,12 @@ export async function inspectHost(directory: string, env: NodeJS.ProcessEnv = pr
     }
     // The fallback still applies the Host's saved paths: reporting a different
     // program than the Host would start, or hiding a damaged file, is a silent fallback.
-    try { engines = inspectEngines(hostEngineEnvironment(directory, buildHostEnvironment({ env: fallback }))); }
+    try {
+      const hostFallback = buildHostEnvironment({ env: fallback });
+      engines = inspectLiveEngines
+        ? await inspectEnginesWithDiscovery(directory, hostFallback)
+        : inspectEngines(hostEngineEnvironment(directory, hostFallback));
+    }
     catch (settingsError) {
       if (!(settingsError instanceof Error && settingsError.message === "engine_settings_unavailable")) throw settingsError;
       engines = []; environmentCheck = { ...environmentCheck, hint: ENGINE_SETTINGS_REPAIR_HINT };

@@ -2,13 +2,17 @@ import { constants, openSync, closeSync, fstatSync, lstatSync, readSync } from "
 import path from "node:path";
 import { z } from "zod";
 import { enginePathSchema, hostEngineSchema } from "../client-protocol/engine-settings.js";
-import { discoverEngineDirectories } from "../host-cli/engine-discovery.js";
+import { discoverEngineDirectories, lookupEnvCaseInsensitive } from "../host-cli/engine-discovery.js";
+import { resolveEngineExecutable } from "./engine-process.js";
 
 export const ENGINE_COMMANDS = { codex: "codex", claude: "claude", antigravity: "agy", kimi: "kimi", deepseek: "dsh", pi: "pi" } as const;
 export const ENGINE_ENV_KEYS = { codex: "CODEX_EXECUTABLE", claude: "CLAUDE_EXECUTABLE", antigravity: "ANTIGRAVITY_EXECUTABLE", kimi: "KIMI_EXECUTABLE", deepseek: "DSH_EXECUTABLE", pi: "PI_EXECUTABLE" } as const;
 export const engineSettingsFile = (directory: string) => path.join(directory, "engine-settings.json");
 export const storedEngineSettingsSchema = z.object({
-  format: z.literal(1), revision: z.string().min(1).max(100), paths: z.partialRecord(hostEngineSchema, enginePathSchema),
+  format: z.literal(1),
+  revision: z.string().min(1).max(100),
+  paths: z.partialRecord(hostEngineSchema, enginePathSchema),
+  discoveredPaths: z.partialRecord(hostEngineSchema, enginePathSchema).optional(),
   receipts: z.array(z.object({ requestId: z.string(), digest: z.string(), revision: z.string() })).max(32),
 }).strict();
 export type StoredEngineSettings = z.infer<typeof storedEngineSettingsSchema>;
@@ -32,6 +36,7 @@ export function readHostEngineSettings(directory: string): StoredEngineSettings 
     if (size > 65536) throw new Error();
     const value = storedEngineSettingsSchema.parse(JSON.parse(bytes.subarray(0, size).toString("utf8")));
     if (Object.values(value.paths).some(file => !path.isAbsolute(file!) || file !== file!.trim())) throw new Error();
+    if (value.discoveredPaths && Object.values(value.discoveredPaths).some(file => !path.isAbsolute(file!) || file !== file!.trim())) throw new Error();
     return value;
   } catch { throw new EngineSettingsReadError(); }
   finally { closeSync(fd); }
@@ -39,15 +44,32 @@ export function readHostEngineSettings(directory: string): StoredEngineSettings 
 export function hostEngineEnvironment(directory: string, base: NodeJS.ProcessEnv, settings = readHostEngineSettings(directory)): NodeJS.ProcessEnv {
   // The entrypoint already built the baseline PATH. Do not prepend the desktop
   // defaults again: callers can deliberately supply an isolated environment.
-  const env = { ...base }, home = process.platform === "win32" ? base.USERPROFILE ?? base.HOME : base.HOME ?? base.USERPROFILE;
-  if (process.platform === "win32") {
+  const env = { ...base }, windows = process.platform === "win32";
+  const home = windows ? lookupEnvCaseInsensitive(base, "USERPROFILE", "win32") ?? lookupEnvCaseInsensitive(base, "HOME", "win32") : base.HOME ?? base.USERPROFILE;
+  if (windows) {
     // Canonicalize only a real inherited override, never an auto-discovered
     // path. Worker-local bot.env must not outrank a differently-cased Host key.
-    const explicit = base.DSH_EXECUTABLE ?? Object.entries(base).find(([key, value]) => key.toUpperCase() === "DSH_EXECUTABLE" && value !== undefined)?.[1];
+    const explicit = lookupEnvCaseInsensitive(base, "DSH_EXECUTABLE", "win32");
     for (const key of Object.keys(env)) if (key !== "DSH_EXECUTABLE" && key.toUpperCase() === "DSH_EXECUTABLE") delete env[key];
     if (explicit !== undefined) env.DSH_EXECUTABLE = explicit;
   }
-  if (home && process.platform !== "win32") env.PATH = [...new Set([...(base.PATH ?? "").split(path.delimiter).filter(Boolean), ...discoverEngineDirectories(home, base, process.platform)])].join(path.delimiter);
-  for (const engine of hostEngineSchema.options) if (settings.paths[engine]) env[ENGINE_ENV_KEYS[engine]] = settings.paths[engine];
+  const basePath = lookupEnvCaseInsensitive(base, "PATH", process.platform) ?? "";
+  if (home) {
+    const merged = [...basePath.split(path.delimiter).filter(Boolean), ...discoverEngineDirectories(home, base, process.platform)];
+    const seen = new Set<string>();
+    const dedup = merged.filter(dir => { const key = windows ? dir.toLowerCase() : dir; if (seen.has(key)) return false; seen.add(key); return true; });
+    if (windows) for (const key of Object.keys(env)) if (key.toUpperCase() === "PATH") delete env[key];
+    env.PATH = dedup.join(path.delimiter);
+  }
+  for (const engine of hostEngineSchema.options) {
+    const envKey = ENGINE_ENV_KEYS[engine];
+    if (settings.paths[engine]) {
+      env[envKey] = settings.paths[engine];
+    } else if (!lookupEnvCaseInsensitive(base, envKey, process.platform) && settings.discoveredPaths?.[engine]) {
+      // Reuse remembered auto-discovered path only while it still points to a valid executable.
+      const remembered = settings.discoveredPaths[engine]!;
+      if (resolveEngineExecutable(remembered, env)) env[envKey] = remembered;
+    }
+  }
   return env;
 }

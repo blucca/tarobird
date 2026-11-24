@@ -1643,7 +1643,10 @@ export class HubServer {
             // Executable paths are private host diagnostics, never audit payloads.
             await this.store.db.run("INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)", [Date.now(), session.deviceId, "engines.settings-updated", JSON.stringify({ engine: command.engine, manual: command.path !== null, requestId: command.requestId })]);
           }));
-        } else view = this.engineSettings.status(idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined));
+        } else view = await this.engineSettings.statusAsync(
+          idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined),
+          { forceRefresh: url.searchParams.get("refresh") === "1" },
+        );
         // Existing clients validate a closed five-engine enum. Keep their
         // complete settings page usable until they opt into Pi support.
         await reply(200, url.searchParams.get("includePi") === "1" ? view : { ...view, engines: view.engines.filter(engine => engine.id !== "pi") }); return;

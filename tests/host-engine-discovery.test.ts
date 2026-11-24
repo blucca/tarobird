@@ -1,12 +1,26 @@
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { hostProcessEnvironment } from "../src/host-cli/environment.js";
 import { resolveEngineExecutable } from "../src/runtime/engine-process.js";
+import {
+  clearDiscoveryCaches,
+  diagnoseExecutableCandidates,
+  discoverWindowsEngineDirectories,
+  lookupEnvCaseInsensitive,
+  parseWindowsRegistryPathOutput,
+  probeLoginShellEnvironment,
+  probePackageManagerBinDirectories,
+  readWindowsRegistryPath,
+  SHELL_ENV_PROBE_FLAG,
+  type CommandRunner,
+} from "../src/host-cli/engine-discovery.js";
+import { HubEngineSettings } from "../src/hub/engine-settings.js";
+import { engineSettingsFile, hostEngineEnvironment } from "../src/runtime/host-engine-settings.js";
 
 const roots: string[] = [];
-afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { clearDiscoveryCaches(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 async function fixture() { const home = await mkdtemp(path.join(os.tmpdir(), "cli-discovery-")); roots.push(home); return home; }
 async function file(home: string, relative: string, text = "#!/bin/sh\nexit 0\n") {
   const target = path.join(home, relative); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, text); await chmod(target, 0o700); return target;
@@ -93,4 +107,209 @@ it.runIf(process.platform !== "win32")("does not search an fnm directory that fn
   // Application Support is a macOS location only.
   const linuxHome = await fixture(); await file(linuxHome, "Library/Application Support/fnm/aliases/default/bin/discovery-cli");
   expect(resolveEngineExecutable("discovery-cli", hostProcessEnvironment({ home: linuxHome, platform: "linux", env: { PATH: "/usr/bin:/bin" } }))).toBeUndefined();
+});
+
+it.runIf(process.platform !== "win32")("recovers from a dangling symlink on PATH when the real binary lives in a manual Node directory found via login shell", async () => {
+  const root = await fixture();
+  const stateDir = path.join(root, "state"); await mkdir(stateDir, { recursive: true });
+  const localBin = path.join(root, ".local/bin"); await mkdir(localBin, { recursive: true });
+  const deletedTarget = path.join(root, "deleted-tool/node/bin/dsh");
+  const danglingLink = path.join(localBin, "dsh");
+  await symlink(deletedTarget, danglingLink);
+
+  const manualNodeBin = path.join(root, ".local/share/node/node-v24.0.0-darwin-arm64/bin");
+  const realDsh = await file(root, ".local/share/node/node-v24.0.0-darwin-arm64/bin/dsh", "#!/bin/sh\necho 'dsh 0.9.4'\n");
+
+  // Without login shell discovery, diagnosing Host PATH sees the dangling symlink and fails to find dsh.
+  const baseline = diagnoseExecutableCandidates("dsh", [{ dir: localBin, rule: "path" }], { PATH: localBin });
+  expect(baseline.executable).toBeNull();
+  expect(baseline.danglingLinks).toEqual([{ linkPath: danglingLink, targetPath: deletedTarget }]);
+
+  // Login shell probe passes TAROBIRD_SHELL_ENV_PROBE=1 and returns the terminal PATH + `command -v dsh`.
+  let sawProbeFlag = false;
+  const runner: CommandRunner = async (cmd, args, opts) => {
+    if (args[0] === "-ilc") {
+      sawProbeFlag = opts.env?.[SHELL_ENV_PROBE_FLAG] === "1";
+      return {
+        stdout: `__TAROBIRD_SHELL_PATH_BEGIN__\n${localBin}:${manualNodeBin}:/usr/bin\n__TAROBIRD_SHELL_PATH_END__\n__TAROBIRD_CMD__:dsh=${realDsh}\n`,
+        stderr: "",
+      };
+    }
+    if (cmd === realDsh && args[0] === "--version") return { stdout: "dsh 0.9.4\n", stderr: "" };
+    throw new Error(`unexpected command: ${cmd}`);
+  };
+
+  const baseEnv = { HOME: root, PATH: localBin, SHELL: "/bin/zsh" };
+  const settings = new HubEngineSettings(stateDir, () => baseEnv);
+  const status = await settings.statusAsync(undefined, { forceRefresh: true, runner });
+  expect(sawProbeFlag).toBe(true);
+  expect(status.shellProbeStatus).toBe("ok");
+
+  const dshRow = status.engines.find(e => e.id === "deepseek")!;
+  expect(dshRow.available).toBe(true);
+  expect(dshRow.executable).toBe(realDsh);
+  expect(dshRow.rule).toBe("login-shell");
+  expect(dshRow.version).toBe("dsh 0.9.4");
+  expect(dshRow.danglingLinks).toEqual([{ linkPath: danglingLink, targetPath: deletedTarget }]);
+  expect(dshRow.terminalExecutable).toBe(realDsh);
+  expect(dshRow.override).toBeNull();
+
+  // Auto-discovered path is persisted without becoming a manual override.
+  const savedJson = JSON.parse(await readFile(engineSettingsFile(stateDir), "utf8"));
+  expect(savedJson.paths).toEqual({});
+  expect(savedJson.discoveredPaths?.deepseek).toBe(realDsh);
+  expect(hostEngineEnvironment(stateDir, baseEnv).DSH_EXECUTABLE).toBe(realDsh);
+
+  // When the remembered auto-discovered binary becomes invalid, Host stops reusing it and searches again.
+  await rm(realDsh);
+  expect(hostEngineEnvironment(stateDir, baseEnv).DSH_EXECUTABLE).toBeUndefined();
+  const movedDsh = await file(root, ".local/share/node/node-v24.1.0-darwin-arm64/bin/dsh", "#!/bin/sh\necho 'dsh 0.9.5'\n");
+  const movedBin = path.dirname(movedDsh);
+  const runner2: CommandRunner = async (cmd, args) => {
+    if (args[0] === "-ilc") {
+      return {
+        stdout: `__TAROBIRD_SHELL_PATH_BEGIN__\n${localBin}:${movedBin}:/usr/bin\n__TAROBIRD_SHELL_PATH_END__\n__TAROBIRD_CMD__:dsh=${movedDsh}\n`,
+        stderr: "",
+      };
+    }
+    if (cmd === movedDsh && args[0] === "--version") return { stdout: "dsh 0.9.5\n", stderr: "" };
+    throw new Error(`unexpected command: ${cmd}`);
+  };
+  const rechecked = await settings.statusAsync(undefined, { forceRefresh: true, runner: runner2 });
+  expect(rechecked.engines.find(e => e.id === "deepseek")?.executable).toBe(movedDsh);
+  expect(rechecked.engines.find(e => e.id === "deepseek")?.version).toBe("dsh 0.9.5");
+});
+
+it.runIf(process.platform !== "win32")("queries custom npm prefix -g and other package managers for global bin directories", async () => {
+  const root = await fixture();
+  const stateDir = path.join(root, "state"); await mkdir(stateDir, { recursive: true });
+  const customPrefix = path.join(root, "custom-npm-prefix");
+  const customBin = path.join(customPrefix, "bin");
+  const dsh = await file(root, "custom-npm-prefix/bin/dsh", "#!/bin/sh\necho 'dsh 1.0.0'\n");
+  const npmDir = path.join(root, "tool-bin");
+  const fakeNpm = await file(root, "tool-bin/npm", "#!/bin/sh\nexit 0\n");
+
+  const pmDirs = await probePackageManagerBinDirectories({
+    searchDirs: [npmDir],
+    platform: "darwin",
+    runner: async (cmd, args) => {
+      if (cmd === fakeNpm && args.join(" ") === "prefix -g") return { stdout: `${customPrefix}\n`, stderr: "" };
+      throw new Error("not installed");
+    },
+  });
+  expect(pmDirs).toEqual([customBin]);
+
+  const settings = new HubEngineSettings(stateDir, () => ({ HOME: root, PATH: npmDir, SHELL: "/bin/zsh" }));
+  const status = await settings.statusAsync(undefined, {
+    forceRefresh: true,
+    runner: async (cmd, args) => {
+      if (args[0] === "-ilc") return { stdout: `__TAROBIRD_SHELL_PATH_BEGIN__\n${npmDir}\n__TAROBIRD_SHELL_PATH_END__\n`, stderr: "" };
+      if (cmd === fakeNpm && args.join(" ") === "prefix -g") return { stdout: `${customPrefix}\n`, stderr: "" };
+      if (cmd === dsh && args[0] === "--version") return { stdout: "dsh 1.0.0\n", stderr: "" };
+      throw new Error("missing");
+    },
+  });
+  const row = status.engines.find(e => e.id === "deepseek")!;
+  expect(row.available).toBe(true);
+  expect(row.executable).toBe(dsh);
+  expect(row.rule).toBe("package-manager");
+  expect(row.version).toBe("dsh 1.0.0");
+});
+
+it("parses Windows registry PATH (HKCU + HKLM), expands variables, handles Path casing and discovers Scoop/WinGet/nvm-windows/APPDATA/Git Bash/WSL", async () => {
+  const winEnv: NodeJS.ProcessEnv = {
+    Path: "C:\\Windows\\System32",
+    APPDATA: "C:\\Users\\example\\AppData\\Roaming",
+    LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local",
+    PNPM_HOME: "C:\\Users\\example\\AppData\\Local\\pnpm",
+    VOLTA_HOME: "C:\\Users\\example\\AppData\\Local\\Volta",
+    SCOOP: "C:\\Users\\example\\scoop",
+    NVM_SYMLINK: "C:\\Program Files\\nodejs",
+    ProgramFiles: "C:\\Program Files",
+    SystemRoot: "C:\\Windows",
+  };
+  expect(lookupEnvCaseInsensitive(winEnv, "PATH", "win32")).toBe("C:\\Windows\\System32");
+
+  const parsed = parseWindowsRegistryPathOutput(
+    "\r\nHKEY_CURRENT_USER\\Environment\r\n    Path    REG_EXPAND_SZ    %APPDATA%\\npm;%LOCALAPPDATA%\\Microsoft\\WinGet\\Links;C:\\Tools\\Custom\r\n",
+    winEnv,
+  );
+  expect(parsed).toEqual([
+    "C:\\Users\\example\\AppData\\Roaming\\npm",
+    "C:\\Users\\example\\AppData\\Local\\Microsoft\\WinGet\\Links",
+    "C:\\Tools\\Custom",
+  ]);
+
+  const regPaths = await readWindowsRegistryPath({
+    env: winEnv,
+    platform: "win32",
+    runner: async (_cmd, args) => {
+      if (args[1] === "HKCU\\Environment") {
+        return { stdout: "    Path    REG_EXPAND_SZ    %APPDATA%\\npm;C:\\Users\\example\\scoop\\shims\r\n", stderr: "" };
+      }
+      return { stdout: "    PATH    REG_EXPAND_SZ    %NVM_SYMLINK%;C:\\Users\\example\\scoop\\shims\r\n", stderr: "" };
+    },
+  });
+  expect(regPaths).toEqual([
+    "C:\\Users\\example\\AppData\\Roaming\\npm",
+    "C:\\Users\\example\\scoop\\shims",
+    "C:\\Program Files\\nodejs",
+  ]);
+
+  const existing = new Set([
+    "C:\\Users\\example\\AppData\\Roaming\\npm",
+    "C:\\Users\\example\\AppData\\Local\\pnpm",
+    "C:\\Users\\example\\AppData\\Local\\Volta\\bin",
+    "C:\\Users\\example\\scoop\\shims",
+    "C:\\Program Files\\nodejs",
+    "C:\\Users\\example\\AppData\\Local\\Microsoft\\WinGet\\Links",
+    "C:\\Program Files\\Git\\cmd",
+    "C:\\Windows\\System32",
+  ]);
+  const discovered = discoverWindowsEngineDirectories("C:\\Users\\example", winEnv, dir => existing.has(dir));
+  expect(discovered).toEqual([
+    "C:\\Users\\example\\AppData\\Roaming\\npm",
+    "C:\\Users\\example\\AppData\\Local\\pnpm",
+    "C:\\Users\\example\\AppData\\Local\\Volta\\bin",
+    "C:\\Users\\example\\scoop\\shims",
+    "C:\\Program Files\\nodejs",
+    "C:\\Users\\example\\AppData\\Local\\Microsoft\\WinGet\\Links",
+    "C:\\Program Files\\Git\\cmd",
+    "C:\\Windows\\System32",
+  ]);
+});
+
+it.runIf(process.platform !== "win32")("falls back cleanly to existing rules when the login shell probe times out", async () => {
+  const root = await fixture();
+  const stateDir = path.join(root, "state"); await mkdir(stateDir, { recursive: true });
+  const voltaCodex = await file(root, ".volta/bin/codex", "#!/bin/sh\necho 'codex 2.1.0'\n");
+
+  const timedOutProbe = await probeLoginShellEnvironment({
+    commands: ["codex"],
+    env: { HOME: root, PATH: "/usr/bin:/bin", SHELL: "/bin/zsh" },
+    runner: async () => {
+      const err = Object.assign(new Error("Command timed out"), { killed: true, signal: "SIGTERM" });
+      throw err;
+    },
+  });
+  expect(timedOutProbe.ok).toBe(false);
+  expect(timedOutProbe.status).toBe("timeout");
+
+  const settings = new HubEngineSettings(stateDir, () => ({ HOME: root, PATH: "/usr/bin:/bin", SHELL: "/bin/zsh" }));
+  const status = await settings.statusAsync(undefined, {
+    forceRefresh: true,
+    runner: async (cmd, args) => {
+      if (args[0] === "-ilc") {
+        throw Object.assign(new Error("timeout"), { killed: true, signal: "SIGTERM" });
+      }
+      if (cmd === voltaCodex && args[0] === "--version") return { stdout: "codex 2.1.0\n", stderr: "" };
+      throw new Error("not found");
+    },
+  });
+  expect(status.shellProbeStatus).toBe("timeout");
+  const codexRow = status.engines.find(e => e.id === "codex")!;
+  expect(codexRow.available).toBe(true);
+  expect(codexRow.executable).toBe(voltaCodex);
+  expect(codexRow.rule).toBe("known-directory");
+  expect(codexRow.version).toBe("codex 2.1.0");
 });
