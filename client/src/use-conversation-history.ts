@@ -14,8 +14,10 @@ const initial = (key: string): View => ({ key, anchors: {}, ready: false, stale:
 
 /** One durable operation per Host/user/conversation. Only submit() applies a
  * native action. Explicit recovery reconciles this receipt without replay. */
-export function useConversationHistory({ connection, conversation, enabled, activity, pendingMessages, localBusy, fallback, opened, forkTitles = [] }: {
+export function useConversationHistory({ connection, conversation, enabled, activity, backgroundBusy = false, sideBusy = false, pendingMessages, localBusy, fallback, opened, forkTitles = [] }: {
   connection: HubConnection; conversation?: Conversation; enabled: boolean; activity: string;
+  /** True while background tasks or a side conversation are active in this chat. */
+  backgroundBusy?: boolean; sideBusy?: boolean;
   /** Titles of conversations already forked from this one; a default title is numbered past them. */
   forkTitles?: string[];
   pendingMessages: boolean; localBusy: boolean; fallback: RefObject<HTMLElement | null>; opened: (conversation: Conversation) => void;
@@ -57,7 +59,7 @@ export function useConversationHistory({ connection, conversation, enabled, acti
       });
     } catch { if (serial === readSerial.current) patch(scope, { stale: true }); }
   }
-  useEffect(() => { if (!flight.current && view.ready) void refresh(); }, [key, enabled, available, state.status, activity, conversation?.bindingId, view.ready, settled]);
+  useEffect(() => { if (!flight.current && view.ready) void refresh(); }, [key, enabled, available, state.status, activity, backgroundBusy, sideBusy, conversation?.bindingId, view.ready, settled]);
   useEffect(() => {
     if (!eligible || !state.user?.id || flight.current) return;
     let cancelled = false;

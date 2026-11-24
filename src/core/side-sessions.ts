@@ -54,7 +54,9 @@ export class CoreSideSessions {
     this.now = options.now ?? Date.now;
     this.timer = setInterval(() => this.sweep(), 10_000); this.timer.unref();
   }
-  activeCount(): number { return [...this.slots.values()].filter(s => s.view.phase === "thinking" || s.view.phase === "preparing" || s.view.phase === "stopping").length; }
+  activeCount(conversationId?: string): number {
+    return [...this.slots.values()].filter(s => (!conversationId || s.scope.conversationId === conversationId) && (s.view.phase === "thinking" || s.view.phase === "preparing" || s.view.phase === "stopping")).length;
+  }
   private track(task: Promise<unknown>): void {
     this.pending.add(task);
     void task.then(() => this.pending.delete(task), () => this.pending.delete(task));

@@ -6,7 +6,7 @@ const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
 export const historyBoundarySchema = z.enum(["before-input", "after-turn"]);
 export const historyReasonSchema = z.enum([
   "unsupported", "wrong_scope", "not_ready", "busy", "queued", "goal_active",
-  "background_work", "shared_session", "binding_pending", "outcome_unknown",
+  "background_work", "side_session", "shared_session", "binding_pending", "outcome_unknown",
   "source_changed", "source_missing", "anchor_unavailable", "request_conflict", "storage_unavailable",
   "uncertain", "cancelled",
 ]);

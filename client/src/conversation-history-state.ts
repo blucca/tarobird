@@ -11,7 +11,9 @@ export function historyRecordKey(connection: HubConnection, conversationId: stri
 }
 export function historyReason(reason?: HistoryReason): string {
   switch (reason) {
-    case "busy": case "background_work": return t("请等待当前任务结束后再操作。");
+    case "busy": return t("当前对话正在回复中，请等待结束后再操作。");
+    case "background_work": return t("后台任务正在运行中，请等待结束后再操作。");
+    case "side_session": return t("侧边追问正在进行中，请等待结束后再操作。");
     case "queued": return t("请先处理待执行消息。");
     case "goal_active": return t("请先暂停当前目标。");
     case "shared_session": return t("此会话正被其他对话共用，暂不能修改历史。");

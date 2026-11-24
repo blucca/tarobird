@@ -2217,8 +2217,11 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     if (parsed.type === "result") worker.nativeTurnOpen = false;
     if (parsed.type === "system" && parsed.subtype === "init") { const model = (parsed as { model?: unknown }).model, usage = this.quotaWorkers.get(worker); if (usage && typeof model === "string") usage.model = model; }
     this.observeNativeReceipt(worker, parsed);
-    if (parsed.type === "assistant" || parsed.type === "user"
-      || parsed.type === "system" && (parsed.subtype === "init" || parsed.subtype === "status" && parsed.status === "requesting")
+    const isTaskNotificationUserFrame = parsed.type === "user" && Boolean(toUserTaskNotificationMetadata(parsed));
+    const hasActiveTurn = Boolean(worker.pendingTurn || worker.continuationTurn || worker.taskNotificationTurnActive);
+    if (parsed.type === "assistant"
+      || (parsed.type === "user" && !isTaskNotificationUserFrame)
+      || parsed.type === "system" && (parsed.subtype === "init" && hasActiveTurn || parsed.subtype === "status" && parsed.status === "requesting")
       || parsed.type === "stream_event" && (parsed.event as { type?: string } | undefined)?.type === "message_start") worker.nativeTurnOpen = true;
     if (worker.appMcp?.handle(parsed as Record<string, unknown>)) return;
 
@@ -2362,6 +2365,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       this.ensureReviewScope(worker, reviewEntry);
       worker.pendingTaskNotification = reviewEntry;
       worker.taskNotificationTurnActive = true;
+      worker.nativeTurnOpen = true;
       worker.taskNotificationAssistantText = "";
       worker.taskNotificationDeliveryText = "";
       return;
@@ -2400,6 +2404,13 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       this.finishReview(worker, { type: "review_adopted" }, true);
     }
 
+    // Settle any expired grace-window notification before deciding whether a
+    // stray system/init frame belongs to a review turn; otherwise an expired
+    // pendingTaskNotification would permanently latch taskNotificationTurnActive.
+    // Keep zero-grace test fixtures intact when init follows in the same turn batch.
+    if (parsed.type === "system" && parsed.subtype === "init" && this.taskNotificationStartGraceMs > 0) {
+      this.advanceTaskNotificationQueue(worker);
+    }
     // Only arm task-notification suppression when NO real turn is in flight.
     // Otherwise a mid-turn re-init (e.g. /compact re-initializes the session)
     // would arm the flag and swallow the FIRST assistant chunk of the resumed
@@ -3195,6 +3206,9 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     }
 
     worker.pendingTaskNotification = null;
+    if (!worker.pendingTurn && !worker.continuationTurn && !worker.taskNotificationTurnActive) {
+      worker.nativeTurnOpen = false;
+    }
     const taskId = pending.taskId;
     const task = taskId ? worker.backgroundTasks.get(taskId) : undefined;
     if (!taskId || !task || !worker.finishedBackgroundTaskIds.has(taskId)) {
@@ -3252,10 +3266,11 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       return;
     }
     const next = worker.queuedTaskNotifications.shift()!;
-    worker.pendingTaskNotification = { ...next.entry, lastSeenAt: now };
+    worker.pendingTaskNotification = { ...next.entry, lastSeenAt: next.reviewTurn ? now : next.entry.lastSeenAt };
     if (next.reviewTurn) {
       this.ensureReviewScope(worker, worker.pendingTaskNotification);
       worker.taskNotificationTurnActive = true;
+      worker.nativeTurnOpen = true;
       worker.taskNotificationAssistantText = "";
       worker.taskNotificationDeliveryText = "";
     }
@@ -3910,6 +3925,8 @@ export class ClaudeStreamAdapter implements CodexAdapter {
 
   async getHistoryState(sessionId: string, input: { workspaceOverride?: string; signal?: AbortSignal } = {}): Promise<NativeHistoryState> {
     if (isLogicalTelegramSessionId(sessionId) || this.destroyPromise) return { head: null, blocked: "not_ready" };
+    const liveWorker = this.workers.get(sessionId);
+    if (liveWorker && !liveWorker.retired) this.advanceTaskNotificationQueue(liveWorker);
     const workspace = input.workspaceOverride ?? this.workspacePath;
     // Without the helper, or without a project directory to look in, nothing is offered.
     if (!this.historyHelper || !workspace) return { head: null };
@@ -3924,6 +3941,8 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   } = {}): Promise<NativeHistoryResult> {
     if (input.signal?.aborted) return { outcome: "rejected", reason: "cancelled" };
     if (isLogicalTelegramSessionId(sessionId)) return { outcome: "rejected", reason: "not_ready" };
+    const liveWorker = this.workers.get(sessionId);
+    if (liveWorker && !liveWorker.retired) this.advanceTaskNotificationQueue(liveWorker);
     const workspace = input.workspaceOverride ?? this.workspacePath;
     if (!this.historyHelper || !workspace) return { outcome: "rejected", reason: "unsupported" };
     // A retired adapter is refused by historyBlock(), which is asked before anything else and again before the fork.
@@ -3942,11 +3961,15 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     return false;
   }
 
+  private hasPendingQueuedTaskNotifications(worker: ClaudeWorker, now = Date.now()): boolean {
+    return worker.queuedTaskNotifications.some(({ entry, reviewTurn }) => reviewTurn || now - entry.lastSeenAt < this.taskNotificationStartGraceMs);
+  }
+
   private workerHasPendingWork(worker: ClaudeWorker): boolean {
     return Boolean(worker.pendingTurn || worker.continuationTurn || worker.stopFence
       || [...worker.backgroundTasks.keys()].some(taskId => !worker.finishedBackgroundTaskIds.has(taskId))
       || this.unstartedBackgroundCalls(worker).some(owner => Date.now() - owner.lastSeenAt < this.taskNotificationStartGraceMs)
-      || this.taskNotificationTurnBusy(worker) || worker.queuedTaskNotifications.length
+      || this.taskNotificationTurnBusy(worker) || this.hasPendingQueuedTaskNotifications(worker)
       || worker.taskNotificationWaiters.size || worker.scoped.hasPendingDeliveries());
   }
 
