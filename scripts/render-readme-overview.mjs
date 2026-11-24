@@ -20,7 +20,7 @@ const chapters=[
  ['canvas-demo','画布 · 选中文字，继续修改','Canvas · Select the text. Make it yours.',0,9,''],
  ['workbench-tools-demo','侧边工作台 · 白板与笔记','Side panel · Whiteboard and notes',0,6.6,''],
  ['screen-demo','屏幕控制 · 查看与接管','Screen control · View and interact.',0,4.3,''],
- ['chancellor-demo','幕僚长 · 跟进每张工单','Chancellor · Follow every ticket.',0,3.8,''],
+ ['chancellor-demo','幕僚长 · 跟进每张工单','Superagent · Follow every ticket.',0,3.8,''],
 ];
 const browser=await chromium.launch({headless:true}),images=[];
 try{

@@ -472,10 +472,10 @@
     },
     {
       "path": "assets/product/chancellor-demo-en.gif",
-      "sha256": "ab3ab1dba2fe1051bbcfd13cd153a0d750ebfd69d6c7d28a5149aa8c46af8efb",
-      "reviewer": "codex",
+      "sha256": "8e4afa0c7b27debeb91ac05b9dd080e7f91d1802a38a640b0254ba7596c3abae",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed recaptured English Superagent ticket-expand GIF from disposable Demo Studio hub; fictional tickets only, no private data."
     },
     {
       "path": "assets/product/chancellor-demo-zh.gif",
@@ -486,17 +486,17 @@
     },
     {
       "path": "assets/product/chancellor-en.png",
-      "sha256": "5270a5c835fbf9a3ef3f6f7fc1b8d292f624b13d096e8ddf3d54cb62286dcc8a",
-      "reviewer": "codex",
+      "sha256": "9d0a4dbe9ffba845f89d58681bd943f5fc6b2940507019e99f2f66ac9b280fe5",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed recaptured English Superagent screenshot from disposable Demo Studio hub; fictional tickets only, no private data."
     },
     {
       "path": "assets/product/chancellor-workspace-en.png",
-      "sha256": "f975c2a2fe65bb8b45c797fb27c10116ba547809c35d321ffe9c660805ebb1cd",
-      "reviewer": "codex",
+      "sha256": "8d30903fc811007a072b9fd5df6b2f40f9bd54c22158378287b3f49efd747d99",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed framed English Superagent workspace screenshot (TAROBIRD / SUPERAGENT); fictional Demo Studio data only, no private data."
     },
     {
       "path": "assets/product/chancellor-workspace-zh.png",
@@ -3314,10 +3314,10 @@
     },
     {
       "path": "assets/product/bot-team-en.png",
-      "sha256": "5d6542e04490de7fed3fc82f20fa835fce01743739169c19be2f0055a64777c9",
-      "reviewer": "codex",
+      "sha256": "077dbac4ac08a69a8fa02706ed87ebd99b413ea5e4eec6057aba188228dac273",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Authored bilingual collaboration diagram with fictional roles; no live-run claim or private identifiers."
+      "note": "Visually reviewed re-rendered English connected-bots diagram updated from Chancellor to Superagent; fictional roles only, no private data."
     },
     {
       "path": "assets/product/bot-team-zh.png",

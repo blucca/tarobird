@@ -1,6 +1,6 @@
 # Dispatcher Bots (2026-11-01, issue #110)
 
-The App calls this Bot type **幕僚长** (English: **Chancellor**); code, APIs and
+The App calls this Bot type **幕僚长** (English: **Superagent**); code, APIs and
 the CLI keep the technical name *dispatcher* (`role: "dispatcher"`, `tickets`).
 
 A dispatcher Bot is a Bot type chosen only when the Bot is created. The owner

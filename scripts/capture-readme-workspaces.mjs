@@ -30,7 +30,7 @@ try {
   const errors = []; page.on('pageerror', e => errors.push(e.message));
   try {
    await hub.profile.update({ name: words('演示工作室', 'Demo Studio'), revision: (await hub.profile.read()).revision });
-   const bots = [['studio', words('设计搭档', 'Design partner'), 'codex', '', readmeAvatars.codex], ['chief', words('幕僚长', 'Chancellor'), 'claude', 'dispatcher', readmeAvatars.claude], ['research', words('研究助手', 'Research'), 'codex', '', readmeAvatars.kimi], ['brand', words('品牌顾问', 'Brand partner'), 'claude', '', readmeAvatars.gemini], ['writing', words('文案编辑', 'Copy editor'), 'claude', '', readmeAvatars.studio], ['review', words('代码审阅', 'Code reviewer'), 'codex', '', readmeAvatars.deepseek], ['library', words('资料管家', 'Librarian'), 'codex', '', readmeAvatars.agy]];
+   const bots = [['studio', words('设计搭档', 'Design partner'), 'codex', '', readmeAvatars.codex], ['chief', words('幕僚长', 'Superagent'), 'claude', 'dispatcher', readmeAvatars.claude], ['research', words('研究助手', 'Research'), 'codex', '', readmeAvatars.kimi], ['brand', words('品牌顾问', 'Brand partner'), 'claude', '', readmeAvatars.gemini], ['writing', words('文案编辑', 'Copy editor'), 'claude', '', readmeAvatars.studio], ['review', words('代码审阅', 'Code reviewer'), 'codex', '', readmeAvatars.deepseek], ['library', words('资料管家', 'Librarian'), 'codex', '', readmeAvatars.agy]];
    for (const [id, name, engine, role, avatar] of bots) {
     await hub.store.db.run('INSERT INTO bots(id,name,secret_hash,engine,role,online) VALUES(?,?,?,?,?,1)', [id, name, 'documentation-only', engine, role]);
     await hub.store.db.run('INSERT INTO meta(key,value) VALUES(?,?)', [BOT_AVATAR_DEFAULT_PREFIX + id, avatar]);
