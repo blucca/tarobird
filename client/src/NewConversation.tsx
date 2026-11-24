@@ -7,15 +7,11 @@ import type { Bot, HubConnection } from "./connection.js";
 import { HubHttpError } from "./http-error.js";
 import { CreationDialog } from "./CreationDialog.js";
 import { t, useLocale } from "./i18n.js";
-import { isDispatcher } from "./dispatcher.js";
 import "./conversation-creation.css";
 
 export type ConversationCreation = { kind: "direct" | "group"; botId?: string } | { kind: "topic"; group: Conversation };
-export function NewConversation({ hostName, connection, bots: allBots, request, created, close, newBot }: { hostName?: string; connection: HubConnection; bots: Bot[]; request: ConversationCreation; created: (conversation: Conversation) => void; close: () => void; newBot: () => void }) {
+export function NewConversation({ hostName, connection, bots, request, created, close, newBot }: { hostName?: string; connection: HubConnection; bots: Bot[]; request: ConversationCreation; created: (conversation: Conversation) => void; close: () => void; newBot: () => void }) {
   useLocale(); const labels = useBotLabels();
-  // A dispatcher has one conversation and joins no group. Opening it without that
-  // conversation is the only way it is requested here.
-  const bots = allBots.filter(bot => !isDispatcher(bot) || request.kind === "direct" && bot.id === request.botId);
   const [title, setTitle] = useState("");
   const [chosen, setChosen] = useState(request.kind === "topic" ? request.group.botIds : request.botId ? [request.botId] : []);
   const [busy, setBusy] = useState(false), [error, setError] = useState("");

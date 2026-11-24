@@ -238,21 +238,16 @@ export class HubStore {
     const user = await this.db.get<User>("SELECT * FROM users WHERE id=?", [userId]);
     const ids = [...new Set(botIds)];
     if (ids.length === 0) throw new HubError("bots_required");
-    let dispatcher = false;
     for (const id of ids) {
       const bot = await this.db.get<{ role: string }>("SELECT role FROM bots WHERE id=? AND deleted_at IS NULL", [id]);
       if (!bot) throw new HubError("bot_not_found", 404);
       if (!parent && user?.role !== "owner" && !await this.db.get("SELECT 1 FROM bot_grants WHERE user_id=? AND bot_id=?", [userId, id])) throw new HubError("bot_forbidden", 403);
-      dispatcher ||= bot.role === "dispatcher";
       // A dispatcher's engine worker only runs its hidden ticket conversations.
       if (bot.role === "worker" && !options.dispatchWorker) throw new HubError("dispatch_worker_internal", 409);
     }
     const id = newId("gw");
     const type = parent ? "group" : options.type ?? (ids.length === 1 ? "direct" : "group");
     if (type === "direct" && ids.length !== 1) throw new HubError("direct_requires_one_bot");
-    // A dispatcher works through exactly one conversation and is never a group member.
-    if (dispatcher && type === "group") throw new HubError("dispatcher_group_forbidden", 409);
-    if (dispatcher && await this.db.get("SELECT 1 FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id WHERE m.member_type='bot' AND m.member_id=? AND c.type='direct'", [ids[0]!])) throw new HubError("dispatcher_single_conversation", 409);
     await this.db.run("INSERT INTO conversations(id,type,title,owner_id,created_at,client_action_id,parent_id) VALUES(?,?,?,?,?,?,?)", [id, type, title, userId, Date.now(), clientActionId, parent?.id ?? null]);
     if (parent) await this.db.run("INSERT INTO conversation_members SELECT ?,'user',member_id,0 FROM conversation_members WHERE conversation_id=? AND member_type='user'", [id, parent.id]);
     else await this.db.run("INSERT INTO conversation_members VALUES(?,'user',?,0)", [id, userId]);
@@ -324,7 +319,6 @@ export class HubStore {
       for (const bot of change.botIds.filter(bot => !current.botIds.includes(bot))) {
         const added = await this.db.get<{ role: string }>("SELECT role FROM bots WHERE id=? AND deleted_at IS NULL", [bot]);
         if (!added) throw new HubError("bot_not_found", 404);
-        if (added.role === "dispatcher") throw new HubError("dispatcher_group_forbidden", 409);
         if (added.role === "worker") throw new HubError("dispatch_worker_internal", 409);
         if (user?.role !== "owner" && !await this.db.get("SELECT 1 FROM bot_grants WHERE user_id=? AND bot_id=?", [userId, bot])) throw new HubError("bot_forbidden", 403);
       }

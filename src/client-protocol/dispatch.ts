@@ -97,6 +97,7 @@ export type ConversationTicket = z.infer<typeof conversationTicketSchema>;
 
 export const createTicketSchema = z.object({
   requestId: id, title: z.string().trim().min(1).max(200), request: z.string().trim().min(1).max(20_000),
+  conversationId: id.optional(),
 }).strict();
 export const dispatchTicketRequestBaseSchema = z.object({
   requestId: id, ticketId: id, engine: dispatchEngineSchema,

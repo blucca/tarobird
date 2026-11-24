@@ -80,7 +80,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     [--workspace DIRECTORY] [--permission CHOICE] [--request-id ID]
     权限选项以 bots catalog 为准；Claude 还支持 claude-auto / claude-accept-edits。
     [--role dispatcher [--dispatch-mode ask|auto] [--max-concurrent N] [--allow ENGINE,ENGINE|all]]
-    --role dispatcher 创建幕僚长（Chancellor）：只有一个对话，把任务拆成工单，直接交给本机已装的 CLI 执行；只能在创建时选择。
+    --role dispatcher 创建幕僚长（Chancellor）：支持多个对话、群组和 Bot 消息，把任务拆成工单交给本机已装的 CLI 执行；只能在创建时选择。
   bots status ID | restart ID | rename ID --name N --expected-name OLD
   bots chrome ID                        读取 Claude 浏览器联动开关和 revision
   bots chrome ID --enabled on|off --revision REV

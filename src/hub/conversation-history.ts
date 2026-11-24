@@ -45,7 +45,7 @@ export class HubConversationHistory {
     const conversation = await this.store.conversationInTransaction(conversationId);
     const bot = await this.store.db.get<{ role: string; owner_id: string | null }>("SELECT b.role,m.owner_id FROM bots b LEFT JOIN managed_bots m ON m.bot_id=b.id WHERE b.id=? AND b.deleted_at IS NULL", [botId]);
     if (conversation.ownerId !== userId || bot?.owner_id && bot.owner_id !== userId) throw new HubError("history_forbidden", 403);
-    if (!bot || bot.role || conversation.type !== "direct" || conversation.parentId || conversation.hidden || conversation.ticket || conversation.botIds.length !== 1) throw new HubError("history_wrong_scope", 409);
+    if (!bot || bot.role === "worker" || conversation.type !== "direct" || conversation.parentId || conversation.hidden || conversation.ticket || conversation.botIds.length !== 1) throw new HubError("history_wrong_scope", 409);
     if (conversation.archived) throw new HubError("conversation_archived", 409);
     return conversation;
   }

@@ -126,11 +126,33 @@ export class HubDispatch {
     if (!row) { const settings = defaultDispatcherSettings(); return { settings, revision: revisionOf(settings) }; }
     return { settings: dispatcherSettingsSchema.parse(JSON.parse(row.settings_json)), revision: row.revision };
   }
-  /** The dispatcher's single direct conversation, owned by the Host owner. */
+  /** Fallback conversation for a dispatcher when no specific conversation is supplied.
+   * Prefers the earliest direct conversation (upgrading existing single-conversation
+   * dispatchers cleanly), then any non-hidden conversation the dispatcher belongs to. */
   private async home(botId: string): Promise<{ id: string; ownerId: string }> {
-    const row = await this.db.get<{ id: string; owner_id: string }>("SELECT c.id,c.owner_id FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id AND m.member_type='bot' AND m.member_id=? WHERE c.type='direct' ORDER BY c.created_at LIMIT 1", [botId]);
+    const row = await this.db.get<{ id: string; owner_id: string }>(
+      "SELECT c.id,c.owner_id FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id AND m.member_type='bot' AND m.member_id=? WHERE c.hidden=0 ORDER BY CASE WHEN c.type='direct' THEN 0 ELSE 1 END, c.created_at LIMIT 1",
+      [botId],
+    );
     if (!row) throw new HubError("dispatcher_conversation_required", 409);
     return { id: row.id, ownerId: row.owner_id };
+  }
+  /** Resolve a specific conversation that this dispatcher belongs to. */
+  private async conversationOf(botId: string, conversationId: string): Promise<{ id: string; ownerId: string } | undefined> {
+    const row = await this.db.get<{ id: string; owner_id: string }>(
+      "SELECT c.id,c.owner_id FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id AND m.member_type='bot' AND m.member_id=? WHERE c.id=? AND c.hidden=0",
+      [botId, conversationId],
+    );
+    return row ? { id: row.id, ownerId: row.owner_id } : undefined;
+  }
+  /** Resolve the conversation for an existing ticket (its originating conversation,
+   * falling back to home if the originating chat was removed). */
+  private async ticketConversation(botId: string, conversationId?: string): Promise<{ id: string; ownerId: string }> {
+    if (conversationId) {
+      const target = await this.conversationOf(botId, conversationId);
+      if (target) return target;
+    }
+    return this.home(botId);
   }
   /** Within db.serial: the actor may act on this dispatcher. */
   private async authorize(actor: DispatchActor, dispatcherBotId: string, mutate: boolean): Promise<void> {
@@ -261,18 +283,18 @@ export class HubDispatch {
     });
     this.options.changed?.(botId); return result;
   }
-  list(actor: DispatchActor, dispatcherBotId: string, options: { open?: boolean } = {}): Promise<TicketList> {
+  list(actor: DispatchActor, dispatcherBotId: string, options: { open?: boolean; conversationId?: string } = {}): Promise<TicketList> {
     return this.db.serial(async () => {
       await this.authorize(actor, dispatcherBotId, false);
-      const rows = await this.listRows<TicketRow>(dispatcherBotId, options.open, "*");
+      const rows = await this.listRows<TicketRow>(dispatcherBotId, options.open, options.conversationId, "*");
       return { tickets: rows.map(row => this.ticket(row)), engines: await this.health() };
     });
   }
   /** Owner App projection. Full CLI/instance reads keep their original contract. */
-  overview(actor: DispatchActor, dispatcherBotId: string, options: { open?: boolean; capabilities?: boolean } = {}): Promise<TicketOverviewList> {
+  overview(actor: DispatchActor, dispatcherBotId: string, options: { open?: boolean; capabilities?: boolean; conversationId?: string } = {}): Promise<TicketOverviewList> {
     return this.db.serial(async () => {
       await this.authorize(actor, dispatcherBotId, false);
-      const rows = await this.listRows<Pick<TicketRow, "id" | "dispatcher_bot_id" | "conversation_id" | "title" | "status" | "paused" | "created_at" | "updated_at"> & { attempt_json: string | null }>(dispatcherBotId, options.open,
+      const rows = await this.listRows<Pick<TicketRow, "id" | "dispatcher_bot_id" | "conversation_id" | "title" | "status" | "paused" | "created_at" | "updated_at"> & { attempt_json: string | null }>(dispatcherBotId, options.open, options.conversationId,
         "id,dispatcher_bot_id,conversation_id,title,status,paused,created_at,updated_at,json_extract(attempts_json,'$[#-1]') AS attempt_json");
       return { tickets: rows.map(row => ticketOverviewSchema.parse({ id: row.id, dispatcherBotId: row.dispatcher_bot_id, conversationId: row.conversation_id, title: row.title, status: row.status, paused: !!row.paused,
         attempts: row.attempt_json ? [JSON.parse(row.attempt_json)] : [], createdAt: row.created_at, updatedAt: row.updated_at })), engines: await this.health(),
@@ -280,8 +302,8 @@ export class HubDispatch {
         ...(options.capabilities ? { capabilities: { remove: true } } : {}) };
     });
   }
-  private listRows<T>(dispatcherBotId: string, open: boolean | undefined, columns: string): Promise<T[]> {
-    return this.db.all<T>(`SELECT ${columns} FROM dispatch_tickets WHERE dispatcher_bot_id=? AND NOT EXISTS (SELECT 1 FROM dispatch_ticket_removals r WHERE r.ticket_id=dispatch_tickets.id)${open ? ` AND status IN (${OPEN_TICKET_STATUSES.map(() => "?").join(",")})` : ""} ORDER BY CASE WHEN status IN ('done','cancelled') THEN 1 ELSE 0 END, created_at DESC,id DESC LIMIT 200`, [dispatcherBotId, ...(open ? OPEN_TICKET_STATUSES : [])]);
+  private listRows<T>(dispatcherBotId: string, open: boolean | undefined, conversationId: string | undefined, columns: string): Promise<T[]> {
+    return this.db.all<T>(`SELECT ${columns} FROM dispatch_tickets WHERE dispatcher_bot_id=? AND NOT EXISTS (SELECT 1 FROM dispatch_ticket_removals r WHERE r.ticket_id=dispatch_tickets.id)${conversationId ? " AND conversation_id=?" : ""}${open ? ` AND status IN (${OPEN_TICKET_STATUSES.map(() => "?").join(",")})` : ""} ORDER BY CASE WHEN status IN ('done','cancelled') THEN 1 ELSE 0 END, created_at DESC,id DESC LIMIT 200`, [dispatcherBotId, ...(conversationId ? [conversationId] : []), ...(open ? OPEN_TICKET_STATUSES : [])]);
   }
   show(actor: DispatchActor, ticketId: string): Promise<DispatchTicket> {
     return this.db.serial(async () => { const row = await this.requireTicket(ticketId); await this.authorize(actor, row.dispatcher_bot_id, false); return this.ticket(row); });
@@ -360,8 +382,19 @@ export class HubDispatch {
       await this.authorize(actor, dispatcherBotId, true);
       const old = await this.db.get<TicketRow>("SELECT * FROM dispatch_tickets WHERE dispatcher_bot_id=? AND request_id=?", [dispatcherBotId, input.requestId]);
       if (old) { if (old.title !== input.title || old.request !== input.request) throw new HubError("idempotency_conflict", 409); return this.ticket(old); }
-      const home = await this.home(dispatcherBotId), now = Date.now(), id = newId("tk");
-      await this.db.run("INSERT INTO dispatch_tickets(id,dispatcher_bot_id,conversation_id,request_id,title,request,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", [id, dispatcherBotId, home.id, input.requestId, input.title, input.request, "queued", now, now]);
+      let targetConversationId: string | undefined;
+      if (actor.kind === "bot" && actor.contextMessage) {
+        const message = await this.db.get<{ conversation_id: string }>("SELECT conversation_id FROM messages WHERE id=?", [actor.contextMessage]);
+        targetConversationId = message?.conversation_id;
+      } else if (input.conversationId) {
+        targetConversationId = input.conversationId;
+      }
+      const conversation = targetConversationId
+        ? await this.conversationOf(dispatcherBotId, targetConversationId)
+        : await this.home(dispatcherBotId);
+      if (!conversation) throw new HubError("conversation_not_found", 404);
+      const now = Date.now(), id = newId("tk");
+      await this.db.run("INSERT INTO dispatch_tickets(id,dispatcher_bot_id,conversation_id,request_id,title,request,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", [id, dispatcherBotId, conversation.id, input.requestId, input.title, input.request, "queued", now, now]);
       return this.ticket((await this.requireTicket(id))!);
     });
     await this.store.audit("dispatch.ticket_created", actor.kind === "owner" ? actor.userId : actor.botId, { ticketId: ticket.id, dispatcherBotId });
@@ -435,7 +468,7 @@ export class HubDispatch {
   }
   /** Within the ledger transaction: one worker input in a continued or new hidden ticket conversation. */
   private async openAttempt(ticket: DispatchTicket, target: TicketTarget, input: { conversationId?: string; workspace?: string; text: string; from: { botId: string; botName: string; hops: number } }, source: Source, created: Created): Promise<TicketAttempt> {
-    const home = await this.home(ticket.dispatcherBotId), attemptId = newId("ta");
+    const home = await this.ticketConversation(ticket.dispatcherBotId, ticket.conversationId), attemptId = newId("ta");
     let conversationId = input.conversationId;
     if (!conversationId) {
       const conversation = await this.store.createConversationInTransaction(home.ownerId, [target.botId], ticket.title.slice(0, 256), `tk_${attemptId}`, { dispatchWorker: true });
@@ -505,7 +538,7 @@ export class HubDispatch {
       const ownerId = await this.db.serial(async () => {
         const current = this.ticket(await this.requireTicket(ticket.id)), last = current.attempts.at(-1);
         if (last?.id !== attempt.id || last.endedAt || !last.stopRequested) return undefined;
-        return (await this.home(ticket.dispatcherBotId)).ownerId;
+        return (await this.ticketConversation(ticket.dispatcherBotId, current.conversationId)).ownerId;
       });
       if (ownerId) await this.options.stop(attempt.botId, attempt.conversationId, ownerId, attempt.inputMessageId);
     })().catch(() => undefined).finally(() => this.stoppingAttempts.delete(attempt.id));
@@ -540,7 +573,7 @@ export class HubDispatch {
           case "resume":
             if (current.attempts.at(-1)?.stopRequested && !current.attempts.at(-1)?.endedAt) throw new HubError("ticket_stop_pending", 409);
             next = { ...current, paused: false, updatedAt: now };
-            events.push(...[await this.noticeInTransaction(source!, row.dispatcher_bot_id, `resume_${ticketId}_${input.requestId}`, current.id, `【工单恢复】「${current.title}」（${current.id}）已由你恢复，当前状态：${STATUS_LABELS[current.status]}。请继续处理。`)].filter(event => !!event)); break;
+            events.push(...[await this.noticeInTransaction(source!, row.dispatcher_bot_id, `resume_${ticketId}_${input.requestId}`, current.id, `【工单恢复】「${current.title}」（${current.id}）已由你恢复，当前状态：${STATUS_LABELS[current.status]}。请继续处理。`, undefined, current.conversationId)].filter(event => !!event)); break;
           case "cancel":
             next = await this.requestStop({ ...current, updatedAt: now }, "cancel", events); break;
           case "accept":
@@ -560,12 +593,12 @@ export class HubDispatch {
     return this.db.transaction(async () => { await validate?.(); await this.store.requireOwner(userId); await this.markEngine(engine); return this.health(); });
   }
 
-  /** Within the ticket's transaction: a notice in the dispatcher's conversation,
+  /** Within the ticket's transaction: a notice in the ticket's originating conversation,
    * whose delivery wakes the dispatcher. Returns the event to emit after commit. */
-  private async noticeInTransaction(source: { hostId: string; hostName: string }, dispatcherBotId: string, key: string, ticketId: string, text: string, from?: { botId: string; botName: string }): Promise<HubEvent | undefined> {
-    const dispatcher = await this.dispatcher(dispatcherBotId), home = await this.home(dispatcherBotId);
+  private async noticeInTransaction(source: { hostId: string; hostName: string }, dispatcherBotId: string, key: string, ticketId: string, text: string, from?: { botId: string; botName: string }, conversationId?: string): Promise<HubEvent | undefined> {
+    const dispatcher = await this.dispatcher(dispatcherBotId), target = await this.ticketConversation(dispatcherBotId, conversationId);
     const clientMsgId = `tn_${createHash("sha256").update(key).digest("hex").slice(0, 40)}`;
-    return (await this.store.sendMessageInTransaction(home.ownerId, { conversationId: home.id, clientMsgId, text, attachments: [], mentions: [dispatcher.id], previewUrl: null,
+    return (await this.store.sendMessageInTransaction(target.ownerId, { conversationId: target.id, clientMsgId, text, attachments: [], mentions: [dispatcher.id], previewUrl: null,
       botSource: { hostId: source.hostId, hostName: source.hostName.slice(0, 256), botId: from?.botId ?? dispatcher.id, botName: (from?.botName ?? dispatcher.name).slice(0, 256), requestId: ticketId.slice(0, 128), hops: 1 } })).event;
   }
   /** Settles finished worker attempts. Idempotent: a restart re-reads durable state. */
@@ -631,7 +664,7 @@ export class HubDispatch {
           await this.save(current);
           if (waitingFor) {
             const event = await this.noticeInTransaction(source, current.dispatcherBotId, `waiting_${attempt.id}_${waitingFor.messageId}_${waitingFor.kind}`, current.id,
-              `【工单需要处理】「${current.title}」（${current.id}）${waitingFor.kind === "approval" ? "正在等待权限审批" : "有问题需要回答"}。请提醒主人从工单的「打开」进入执行会话处理；你不能替主人批准。执行尚未结束，不要重复派单。`);
+              `【工单需要处理】「${current.title}」（${current.id}）${waitingFor.kind === "approval" ? "正在等待权限审批" : "有问题需要回答"}。请提醒主人从工单的「打开」进入执行会话处理；你不能替主人批准。执行尚未结束，不要重复派单。`, undefined, current.conversationId);
             if (event) created.events.push(event);
             return { ticket: current };
           }
@@ -703,7 +736,7 @@ export class HubDispatch {
       if (assisted.length) notice += `\n\n执行中协助：${assisted.map(row => `${toolLabel(row)}${assistOutcomeLabel(row, failureLabel)}`).join("；")}。`;
       if (requested) notice += "\n\n执行者请求的协助未执行。";
       // In the same transaction: a crash can never settle a ticket without waking its dispatcher.
-      const event = await this.noticeInTransaction(source, ticket.dispatcherBotId, `settle_${attempt.id}`, ticket.id, notice, { botId: attempt.botId, botName });
+      const event = await this.noticeInTransaction(source, ticket.dispatcherBotId, `settle_${attempt.id}`, ticket.id, notice, { botId: attempt.botId, botName }, ticket.conversationId);
       if (event) created.events.push(event);
       return { ticket };
     });
@@ -736,7 +769,7 @@ export class HubDispatch {
       await this.db.run("UPDATE dispatch_assists SET state='returned',outcome=?,updated_at=? WHERE id=?", [result.kind, now, row.id]);
       const next: DispatchTicket = { ...ticket, status: "blocked", updatedAt: now };
       await this.save(next);
-      const event = await this.noticeInTransaction(source, next.dispatcherBotId, `assist_orphan_${row.id}`, next.id, `【工单卡住】「${next.title}」（${next.id}）的原执行会话已失效，协助结果无法交回原执行者。先核对工单目录与执行会话，向主人说明并确认下一步，不要自动重做。`);
+      const event = await this.noticeInTransaction(source, next.dispatcherBotId, `assist_orphan_${row.id}`, next.id, `【工单卡住】「${next.title}」（${next.id}）的原执行会话已失效，协助结果无法交回原执行者。先核对工单目录与执行会话，向主人说明并确认下一步，不要自动重做。`, undefined, next.conversationId);
       if (event) created.events.push(event);
       return next;
     }

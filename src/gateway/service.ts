@@ -155,13 +155,15 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       const instructionOptions: AppInstructionOptions = { engine: config.engine, claudeChrome: config.claudeChrome, timezone: config.timezone,
         context: discussionTurn ? "discussion" : input.instructions?.includes("This scheduled run must not") ? "cron" : "chat" };
       const source = channel.currentBotSource();
-      const dispatcherContext = { scheduled: instructionOptions.context === "cron", delegated: !!source };
+      // Host ticket notices also carry botSource (requestId tk_*); preserve the dispatcher's owner-facing flow for those,
+      // while treating genuine Bot-to-Bot messages to a dispatcher just like ordinary Bot collaboration turns.
+      const ticketNotice = config.role === "dispatcher" && !!source && /^tk_/.test(source.requestId);
+      const dispatcherContext = { scheduled: instructionOptions.context === "cron", delegated: !!source && !ticketNotice };
       const workerInstructions = channel.currentTicket() && conversationId && input.conversationKey === buildCoreConversationKey(conversationId) && !discussionTurn && instructionOptions.context !== "cron"
         ? workerExecutionInstructions(channel.currentMessageId()) : undefined;
       instructionOptions.ticketWorker = !!workerInstructions;
-      // Ticket notices also carry botSource; preserve the dispatcher's owner-facing flow.
       // Turn-local provenance only: owner text/history must not disable questions.
-      instructionOptions.botMessageTask = !!source && !workerInstructions && !discussionTurn && config.role !== "dispatcher";
+      instructionOptions.botMessageTask = !!source && !ticketNotice && !workerInstructions && !discussionTurn;
       const ordinaryGroup = !discussionTurn && conversationId && await channel.getChatMode(conversationId) === "group";
       // A discussion turn gets no cross-Bot CLI context: the Hub rejects it too.
       const frozenWorkbench = conversationId && channel.currentMessageId() ? await channel.workbenchContext().catch(() => undefined) : undefined;

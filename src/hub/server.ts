@@ -2263,7 +2263,8 @@ export class HubServer {
         if (kind === "dispatcher" && req.method === "GET") { await reply(200, await this.dispatch.settings(userId, botId)); return; }
         if (kind === "dispatcher" && req.method === "PUT") { const result = await this.dispatch.updateSettings(userId, botId, await this.jsonBody(req), validateInQueue); await this.store.audit("dispatch.settings_updated", session.deviceId, { botId }); await reply(200, result); return; }
         if (kind === "tickets" && req.method === "GET") {
-          const query = new URL(req.url ?? "/", "http://hub").searchParams, options = { open: query.get("open") === "1", capabilities: query.get("capabilities") === "1" };
+          const query = new URL(req.url ?? "/", "http://hub").searchParams, conversationId = query.get("conversationId") || undefined;
+          const options = { open: query.get("open") === "1", capabilities: query.get("capabilities") === "1", ...(conversationId ? { conversationId } : {}) };
           await reply(200, query.get("summary") === "1" ? await this.dispatch.overview(owner, botId, options) : await this.dispatch.list(owner, botId, options)); return;
         }
         if (kind === "tickets" && req.method === "POST") { await reply(201, await this.dispatch.create(owner, botId, await this.jsonBody(req))); return; }
@@ -2723,7 +2724,7 @@ export class HubServer {
         : input.operation === "assist" ? await this.dispatch.requestAssist(actor, input.data)
         : input.operation === "assist-status" ? await this.dispatch.assistStatus(actor)
         : input.operation === "assists" ? await this.dispatch.assists(actor, idSchema.parse(input.data.ticketId))
-        : input.operation === "list" ? await this.dispatch.list(actor, botId, { open: input.data.open === true })
+        : input.operation === "list" ? await this.dispatch.list(actor, botId, { open: input.data.open === true, ...(typeof input.data.conversationId === "string" && input.data.conversationId ? { conversationId: input.data.conversationId } : {}) })
         : input.operation === "show" ? await this.dispatch.show(actor, idSchema.parse(input.data.ticketId))
         : input.operation === "targets" ? await this.dispatch.targets(actor, botId)
         : input.operation === "capabilities" ? await this.dispatch.capabilities(actor, botId, input.data)

@@ -259,7 +259,7 @@ const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
             if (searching) closeSearch();
             else { focusSearch.current = true; setSearchTab(tab); }
           }}>{searching ? <CloseIcon size={22}/> : <SearchIcon size={22}/>}</button>}
-          {tab === 'messages' && scopeHost && scopeBot ? !isDispatcher(scopeBot) && (
+          {tab === 'messages' && scopeHost && scopeBot ? (
             <button type="button" className="mh-icon-button" aria-label={t('与 {0} 新建对话', scopeBot.name)} onClick={() => props.newChat(scopeHost.id, scopeBot.id)}><PlusIcon size={22}/></button>
           ) : tab !== 'me' && (
             <CreateMenu hostName={hosts.length === 1 ? activeHost?.name : undefined} disabled={hosts.length === 0} onCreate={create} />
@@ -553,8 +553,7 @@ function BotRow({ host, bot, count, showHost, onBrowse, onNew, onSettings }: {
   return (
     <div className="mh-bot-row">
       <button type="button" className="mh-bot-main" aria-label={t('查看 {0} 的全部对话', bot.name)} onClick={() => onBrowse(host.id, bot.id)}>{body}</button>
-      {/* A dispatcher Bot keeps exactly one conversation. */}
-      {!isDispatcher(bot) && <button
+      <button
         type="button"
         className="mh-new-chat"
         aria-label={t('与 {0} 新建对话', bot.name)}
@@ -562,7 +561,7 @@ function BotRow({ host, bot, count, showHost, onBrowse, onNew, onSettings }: {
       >
         <PlusIcon size={16} />
         <span>{t('新对话')}</span>
-      </button>}
+      </button>
       <button type="button" className="mh-bot-settings" data-bot-settings={bot.id} data-settings-host={host.id} aria-label={t('{0} 的 Bot 设置', bot.name)} title={t('Bot 设置')} onClick={event => { event.currentTarget.focus(); onSettings(host.id, bot.id); }}><Settings size={20} /></button>
     </div>
   );

@@ -1,4 +1,3 @@
-import { isDispatcher } from "./dispatcher.js";
 import { useId, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import { Activity, Camera, Monitor, Users, ChevronDown, ChevronRight, FolderOpen, MessageSquare, MessageSquarePlus, Plug, Settings, Wifi } from "lucide-react";
 import type { Conversation } from "../../src/client-protocol/index.js";
@@ -57,7 +56,7 @@ export function ConversationDetails({ connection, conversation, group, bots, pho
       <div className="details-section-heading"><h4>Bot</h4>{members.length > 1 && <select aria-label={t("查看 Bot")} value={bot?.id ?? ""} onChange={event => setSelection(event.target.value)}>{members.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}</select>}</div>
       <button ref={botTrigger} className="details-link" aria-label={t("Bot 设置")} aria-describedby={`${scopeId}-bot`} disabled={!bot} onClick={() => setBotSettings(true)}><Settings size={20}/><span><strong>{t("Bot 设置")}</strong><small id={`${scopeId}-bot`}>{t("模型、人设与权限 · 所有对话共用")}</small></span><ChevronRight size={16}/></button>
       {browseBot && bot && <button className="details-link" aria-label={t("查看此 Bot 的全部对话")} onClick={() => browseBot(bot.id)}><MessageSquare size={20}/><span><strong>{t("查看此 Bot 的全部对话")}</strong><small>{bot.name}</small></span><ChevronRight size={16}/></button>}
-      {!isDispatcher(bot) && <button className="details-link" aria-label={t("新建独立对话")} aria-describedby={`${scopeId}-new`} disabled={!bot} onClick={() => bot && newChat(bot.id)}><MessageSquarePlus size={20}/><span><strong>{t("新建独立对话")}</strong><small id={`${scopeId}-new`}>{t("沿用 Bot 设置，从新的上下文开始")}</small></span><ChevronRight size={16}/></button>}
+      <button className="details-link" aria-label={t("新建独立对话")} aria-describedby={`${scopeId}-new`} disabled={!bot} onClick={() => bot && newChat(bot.id)}><MessageSquarePlus size={20}/><span><strong>{t("新建独立对话")}</strong><small id={`${scopeId}-new`}>{t("沿用 Bot 设置，从新的上下文开始")}</small></span><ChevronRight size={16}/></button>
     </section>
     <section className="details-host" aria-label={t("主机工具")}>
       <button className="details-link details-tools-toggle" aria-expanded={toolsOpen} aria-controls={`${scopeId}-tools`} onClick={() => setToolsOpen(value => !value)}><Monitor size={20}/><span><strong>{t("主机工具")}</strong><small className="details-host-summary"><span>{hostName}</span><span>{" · "}{connectionSummary}</span></small></span><ChevronDown size={16}/></button>

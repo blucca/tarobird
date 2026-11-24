@@ -198,7 +198,7 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
           <button className={`bot-identity${currentHidden ? " is-collapsed-current" : ""}`} aria-current={currentHidden ? "page" : undefined} aria-describedby={folded ? `${prefix}_bot_summary_${id}` : undefined} aria-haspopup="menu" aria-expanded={botMenu?.id === id} aria-controls={botMenu?.id === id ? `${prefix}_bot_actions` : undefined} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); openBotMenu(id, event.currentTarget, event.clientX || event.clientY ? { x: event.clientX, y: event.clientY } : undefined); }} onKeyDown={event => { if (event.key === "ContextMenu" || event.key === "F10" && event.shiftKey) { event.preventDefault(); event.stopPropagation(); openBotMenu(id, event.currentTarget); } }} aria-label={t("打开 {0}", name)} title={[bot?.engine, bot?.model].filter(Boolean).join(" · ") || undefined} onClick={openChat}><AgentAvatar signal={botAgentSignal({ conversations: chats, activity }, id)} size={40} className="avatar" dispatcher={isDispatcher(bot)} tickets={isDispatcher(bot) ? { connection, botId: id } : undefined}><Avatar kind="bot" id={id} name={name} size={40}/><i className={state.status === "online" && bot?.online ? "online" : ""}/></AgentAvatar><span><strong><BotName id={id} name={name} bot={bot}/></strong></span></button>
           {sourceHost}
           {folded && <><span className="bot-fold-signals" aria-hidden="true" title={summary}>{attention > 0 && <span className="folder-attention"/>}{unread > 0 ? <b className="unread-badge">{unread > 99 ? "99+" : unread}</b> : <span className="bot-fold-count">{children.length}</span>}</span><span id={`${prefix}_bot_summary_${id}`} hidden>{summary}</span></>}
-          {!isDispatcher(bot) ? <button className="icon-button" aria-label={t("为 {0} 新建对话", name)} title={t("为 {0} 新建对话", name)} disabled={bulk?.active} onClick={createChat}><Plus size={16}/></button> : <span className="bot-tree-action-space" aria-hidden="true"/>}
+          <button className="icon-button" aria-label={t("为 {0} 新建对话", name)} title={t("为 {0} 新建对话", name)} disabled={bulk?.active} onClick={createChat}><Plus size={16}/></button>
         </div>
         <div className="bot-tree-conversations" id={`${prefix}_bot_chats_${id}`} hidden={folded}>{!folded && children.map(c => row(c, true))}</div>
       </div>;
@@ -233,7 +233,7 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
     </DesktopMenu>}
     {visible && botMenu && <DesktopMenu id={`${prefix}_bot_actions`} label={t("Bot 操作")} className="sidebar-list-menu" open point={botMenu.point} placement="down-start" trigger={botTrigger} close={() => setBotMenu(undefined)}>
       <button type="button" role="menuitem" onClick={() => setSettingsBot(botMenu.id)}><Settings size={16}/>{t("Bot 设置")}</button>
-      {!isDispatcher(bots.find(bot => bot.id === botMenu.id)) && <button type="button" role="menuitem" onClick={() => { botFolds.set(botMenu.id, false); newChat(botMenu.id); }}><MessageSquarePlus size={16}/>{t("新建对话")}</button>}
+      <button type="button" role="menuitem" onClick={() => { botFolds.set(botMenu.id, false); newChat(botMenu.id); }}><MessageSquarePlus size={16}/>{t("新建对话")}</button>
       <hr/>
       <button type="button" role="menuitem" onClick={() => openBot(botMenu.id, "capabilities")}><Plug size={16}/>Skills &amp; MCP</button>
       <button type="button" role="menuitem" onClick={() => openBot(botMenu.id, "operations")}><Activity size={16}/>{t("运行状态")}</button>
