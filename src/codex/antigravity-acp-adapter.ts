@@ -39,6 +39,7 @@ import type {
 } from "./adapter.js";
 import { EngineIncompleteResponseError, EngineSteeringRejectedError } from "./adapter.js";
 import { killProcessTree } from "./process-tree.js";
+import { extractAntigravityTaskPlan, parseAcpPlanEntries } from "./antigravity-task-plan.js";
 import { renderPrivateTurnInstructions } from "./turn-instructions.js";
 
 type SpawnOptions = {
@@ -122,6 +123,8 @@ type ToolState = {
   background: boolean;
   emittedUse: boolean;
   emittedResult: boolean;
+  /** Internal Antigravity brain/<sessionId>/task.md artifact surfaced as TodoWrite plan. */
+  isTaskArtifact?: boolean;
 };
 
 type PromptOutcome = { result?: PromptResponse; error?: unknown };
@@ -143,6 +146,8 @@ type Turn = {
   text: string;
   usage: AdapterUsage | undefined;
   toolSeen: boolean;
+  /** Last emitted TodoWrite payload JSON to deduplicate identical task.md updates. */
+  lastPlanJson?: string;
   /** Length of the reply text when the owner last declined an approval in this turn. */
   declinedAt?: number;
   /** The prompt is exactly the native /compact, which agy completes without text. */
@@ -200,6 +205,7 @@ type Worker = {
   wake: Wake | null;
   promptSeq: number;
   tools: Map<string, ToolState>;
+  lastTaskMarkdown?: string;
   pendingPermissions: number;
   contextUsage?: { used: number; size: number };
   stderrTail: string;
@@ -1030,7 +1036,17 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     } else if (kind === "agent_thought_chunk") {
       const content = asRecord(update.content);
       if (content?.type === "text" && typeof content.text === "string" && content.text) this.emit(turn, { type: "thinking", text: content.text, sessionId });
+    } else if (kind === "plan") {
+      const todos = parseAcpPlanEntries(update.entries);
+      if (todos.length) this.emitPlan(turn, sessionId, todos);
     }
+  }
+
+  private emitPlan(turn: Turn, sessionId: string, todos: Array<{ content: string; status: "pending" | "in_progress" | "completed" }>): void {
+    const serialized = JSON.stringify(todos);
+    if (turn.lastPlanJson === serialized) return;
+    turn.lastPlanJson = serialized;
+    this.emit(turn, { type: "tool_use", toolName: "TodoWrite", toolInput: { todos }, toolUseId: `agy-task-plan:${sessionId}`, sessionId });
   }
 
   private trackWake(worker: Worker, kind: unknown, update: Record<string, unknown>): void {
@@ -1087,9 +1103,18 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (typeof update.status === "string") tool.status = update.status;
     tool.updatedAt = now;
     const owner = tool.turn && !tool.turn.done ? tool.turn : undefined;
+    const taskPlan = extractAntigravityTaskPlan(update, worker.sessionId ?? "", worker.lastTaskMarkdown);
+    if (taskPlan?.isTaskArtifact) {
+      tool.isTaskArtifact = true;
+      if (taskPlan.markdown !== undefined) worker.lastTaskMarkdown = taskPlan.markdown;
+    }
     if (!owner) return;
-    owner.toolSeen = true;
     const sessionId = worker.sessionId!;
+    if (tool.isTaskArtifact) {
+      if (taskPlan?.todos.length) this.emitPlan(owner, sessionId, taskPlan.todos);
+      return;
+    }
+    owner.toolSeen = true;
     const toolName = tool.name || tool.title || "Antigravity tool";
     if (!tool.emittedUse) {
       tool.emittedUse = true;

@@ -1156,4 +1156,68 @@ describe("AntigravityAcpAdapter session config failures", () => {
     running.respondPrompt();
     await settleWithin(second);
   });
+
+  it("surfaces brain/<sessionId>/task.md edits as TodoWrite plans without emitting raw task artifact tool noise", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }));
+    const events: EngineStreamEvent[] = [];
+    const reply = adapter.sendUserMessage(SESSION_A, {
+      text: "Run a multi-step plan",
+      files: [],
+      onEngineEvent: (event) => { events.push(event); },
+    });
+    await waitFor(() => harness.children.length === 1 && harness.children[0]!.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const taskPath = `/srv/state/.gemini/antigravity-cli/brain/${SESSION_A}/task.md`;
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_task_1",
+      kind: "edit",
+      status: "completed",
+      name: "write_file",
+      title: `File .../brain/${SESSION_A}/task.md`,
+      content: [{ type: "diff", path: taskPath, newText: "# Plan\n- [ ] Read files\n- [ ] Write summary\n" }],
+      rawInput: { ArtifactMetadata: { UserFacing: true, RequestFeedback: false, Summary: "Plan" }, Path: taskPath },
+    });
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_task_2",
+      kind: "edit",
+      status: "completed",
+      name: "edit_file",
+      title: `File .../brain/${SESSION_A}/task.md`,
+      content: [{ type: "diff", path: taskPath, oldText: "- [ ] Read files\n- [ ] Write summary\n", newText: "- [x] Read files\n- [/] Write summary\n" }],
+      rawInput: { ArtifactMetadata: { UserFacing: true, RequestFeedback: false, Summary: "Progress" }, Path: taskPath },
+    });
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_normal_1",
+      kind: "edit",
+      status: "completed",
+      name: "write_file",
+      title: "File /srv/workspace/result.md",
+      content: [{ type: "diff", path: "/srv/workspace/result.md", newText: "- [ ] Not an internal task artifact\n" }],
+      rawInput: { Path: "/srv/workspace/result.md", Content: "- [ ] Not an internal task artifact\n" },
+    });
+    server.text("All done.");
+    server.respondPrompt();
+    await settleWithin(reply);
+
+    const todoEvents = events.filter((event) => event.type === "tool_use" && event.toolName === "TodoWrite");
+    expect(todoEvents).toHaveLength(2);
+    expect(todoEvents[0]).toMatchObject({
+      type: "tool_use",
+      toolName: "TodoWrite",
+      toolInput: { todos: [{ content: "Read files", status: "pending" }, { content: "Write summary", status: "pending" }] },
+    });
+    expect(todoEvents[1]).toMatchObject({
+      type: "tool_use",
+      toolName: "TodoWrite",
+      toolInput: { todos: [{ content: "Read files", status: "completed" }, { content: "Write summary", status: "in_progress" }] },
+    });
+    // Internal task.md writes do not leak as raw write_file/edit_file events, while normal workspace writes still appear.
+    const rawFileWrites = events.filter((event) => event.type === "tool_use" && (event.toolName === "write_file" || event.toolName === "edit_file"));
+    expect(rawFileWrites).toHaveLength(1);
+    expect(rawFileWrites[0]).toMatchObject({ toolUseId: "call_normal_1", toolName: "write_file" });
+  });
 });

@@ -29,6 +29,8 @@ import { t, useLocale } from "./i18n.js";
 import { useConnectionSelection } from "./connection-selection.js";
 import { isContextMaintenance } from "../../src/client-protocol/run.js";
 import { runThinkingPreview } from "../../src/client-protocol/run-thinking.js";
+import { runPlanPreview } from "../../src/client-protocol/run-plan.js";
+import { RunPlanList, RunPlanPanel } from "./RunPlanPanel.js";
 import { runReportExcerpt } from "./run-presentation.js";
 import "./run-presentation.css";
 
@@ -84,6 +86,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
   const sync = scopedJournal(block, run);
   const active = !message.historyContext && activePhase(run.phase);
   const thinking = runThinkingPreview(block, run);
+  const planPreview = runPlanPreview(block, run);
   const disconnected = active && (state.status !== "online" || !state.bots.find(bot => bot.id === message.authorId)?.online);
   const interrupted = active && message.status === "error";
   // A request waits until the run reports "stopping", which shows the host
@@ -181,6 +184,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
       : run.current?.status === "waiting" ? t("会话进度已保留，即将自动重试。可随时停止。")
         : t("正在续接原会话，已完成的工作仍然保留。可随时停止。")}</p>}
     {thinking && <div className="run-thinking-preview"><span>{t("公开思考摘要")}</span><p>{(thinking.truncated ? "…" : "") + runReportExcerpt(thinking.text, true).replace(/^…/, thinking.truncated ? "" : "…")}</p></div>}
+    {planPreview && <RunPlanPanel items={planPreview.items} active={active && !disconnected && !interrupted && !scopeUnsupported}/>}
     {scoped && !inlineScopedReply ? reportPreview.preview : <div className="native-run-prose">{prose.map((entry, index) => <div className="card-text" key={entry.id ?? index}><MarkdownText text={entry.text!} reply/></div>)}</div>}
     {backgroundNote && <p className="run-notice">{backgroundNote}</p>}
     <div className="native-run-actions">{scoped && !inlineScopedReply && reportPreview.needsReader && <button type="button" ref={reportTrigger} className="run-report-trigger" onClick={() => open({ key, kind: "report" })}>{t("查看完整回复")}</button>}{!scopeUnsupported && <button ref={trigger} className="run-process-trigger" onClick={() => open({ key, kind: "process" })} aria-label={t("查看运行过程")}><ChevronRight size={14}/><span>{run.count ? t("过程 · {0} 个动作", run.count) : t("查看运行过程")}</span></button>}
@@ -378,7 +382,7 @@ function RunStep({ entry, initialOpen, change }: { entry: RunEntry; initialOpen:
       </> : entry.name && entry.name !== "CodexAgent" && <small>{entry.name}</small>}{entry.truncated && <p className="run-notice">{t("此步骤内容已截短")}</p>}
       {entry.scope && <><small>{t("作用域：{0}", entry.scope.id)}</small>{runScopeParent(entry.scope) && <small>{runScopeParent(entry.scope)}</small>}</>}
       {exit !== undefined && <p>{t("退出状态：{0}", exit)}</p>}{(entry.durationMs !== undefined || entry.endedAt !== undefined) && <p>{t("耗时：{0}", formatRunDuration(entry.durationMs ?? (entry.endedAt! - entry.at), true))}</p>}{entry.text && <section className={runKind(entry) === "delegate" ? "run-child-progress" : undefined}>{runKind(entry) === "delegate" && <h4>{t("子代理进展")}</h4>}<div className="card-text"><MarkdownText text={prose(entry.text)}/></div></section>}
-      {!!plan.length && <ul className="run-plan">{plan.map((item, index) => <li key={index}><span>{item.status === "completed" ? "✓" : item.status === "in_progress" ? "◉" : "○"}</span><span>{item.content}</span><small>{item.status === "completed" ? t("已完成") : item.status === "in_progress" ? t("执行中") : t("待执行")}</small></li>)}</ul>}
+      {!!plan.length && <div className="run-plan-inline"><RunPlanList items={plan.map(item => ({ content: item.content, status: item.status === "completed" ? "completed" : item.status === "in_progress" ? "in_progress" : "pending" }))}/></div>}
       {diff && <section><h4>{entry.changes?.length ? t("工具返回的差异") : t("请求的修改")}</h4><pre className="run-diff">{diff.split("\n").map((line, i) => <span key={i} className={line.startsWith("+") ? "added" : line.startsWith("-") ? "removed" : ""}>{line}{"\n"}</span>)}</pre></section>}
       {!!sources.length && <section><h4>{t("搜索来源")}</h4><ul>{sources.map(url => <li key={url}><a href={url} target="_blank" rel="noopener noreferrer">{url}</a></li>)}</ul></section>}
       {entry.input && <details className="run-raw"><summary>{t("原始参数")}</summary><CodeBlock text={entry.input} language="json" className="run-code" copyLabel={t("复制原始参数")}/></details>}
