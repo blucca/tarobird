@@ -5674,5 +5674,9 @@
   "未能并入，已改为排队": "Couldn't join the reply; queued instead",
   "经排队投递": "Delivered through the queue",
   "无法确认是否已并入": "Can't confirm whether it was merged",
-  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed."
+  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed.",
+  "当前供应商不提供可读取的账号额度（Pi 仅统计本会话 token 与费用）。": "This provider does not provide account quotas (Pi only tracks local session tokens and cost).",
+  "充值余额": "Recharge balance",
+  "赠送余额": "Bonus balance",
+  "账户余额": "Account balance"
 }

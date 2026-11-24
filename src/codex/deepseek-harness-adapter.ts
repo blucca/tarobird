@@ -4,6 +4,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { EngineCancellationUnconfirmedError, EngineStopTooLateError, EngineSteeringRejectedError } from "./adapter.js";
 import { EngineRetryableError, type EngineRetryReason } from "./turn-retry.js";
 import { deepseekGoalUsageSchema } from "./deepseek-goal-usage.js";
+import { parseDeepSeekAccountBalance } from "./deepseek-account-quota.js";
+import { QUOTA_TTL_MS, QuotaReadError, unavailableQuota } from "./account-quota.js";
+import type { EngineQuotaReadOptions, EngineQuotaReadResult } from "./adapter-account-quota.js";
+import type { QuotaSnapshot } from "../client-protocol/engine-quota.js";
 import { deepseekAssistantPrefixSchema } from "./deepseek-assistant-stream.js";
 import { mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -817,7 +821,61 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     return { cleared, sessionId };
   }
 
+  private cachedQuota: { revision: string; snapshot: QuotaSnapshot } | undefined;
+  private readonly quotaRevision = randomUUID();
+
+  /** Query DeepSeek Platform recharge and bonus wallet balances via the existing private `dsh web`
+   * service (`account.getBalance`). Never reads credentials directly or sends model messages. */
+  async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
+    const revision = this.quotaRevision;
+    if (this.destroyed || options.signal?.aborted) {
+      return { revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+    }
+    if (options.expectedRevision && options.expectedRevision !== revision) {
+      this.cachedQuota = undefined;
+      return { revision, snapshot: unavailableQuota("deepseek", "auth_changed") };
+    }
+    if (!options.refresh) {
+      if (!this.cachedQuota) {
+        return { revision, snapshot: unavailableQuota("deepseek", "not_loaded") };
+      }
+      const snap = structuredClone(this.cachedQuota.snapshot);
+      if (snap.state === "ready" && snap.observedAt && Date.now() - Date.parse(snap.observedAt) >= QUOTA_TTL_MS) {
+        snap.state = "stale";
+      }
+      return { revision, snapshot: snap };
+    }
+
+    try {
+      await this.ensureOperational(options.signal);
+      const client = {
+        version: "1.6.0",
+        locale: "en",
+        timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+      };
+      const outcome = await this.gateway.request("account.getBalance", { client }, options.signal);
+      const hasApiKey = Boolean(process.env.DEEPSEEK_API_KEY);
+      const snapshot = parseDeepSeekAccountBalance(outcome, { now: Date.now(), hasApiKey });
+      this.cachedQuota = { revision, snapshot };
+      return { revision, snapshot: structuredClone(snapshot) };
+    } catch (error) {
+      if (options.signal?.aborted) {
+        return { revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+      }
+      const reason = error instanceof QuotaReadError ? error.reason : "native_error";
+      const snap = unavailableQuota("deepseek", reason);
+      if (this.cachedQuota?.snapshot.observedAt) {
+        return {
+          revision,
+          snapshot: { ...structuredClone(this.cachedQuota.snapshot), state: "stale", reason, lastAttemptAt: snap.lastAttemptAt },
+        };
+      }
+      return { revision, snapshot: snap };
+    }
+  }
+
   async destroy(): Promise<void> {
+    this.cachedQuota = undefined;
     if (this.destroyed) {
       return;
     }

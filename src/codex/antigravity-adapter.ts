@@ -461,6 +461,7 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
       scope,
       options,
       captureScope,
+      localProbe: this.spawnAntigravity === (spawnEngine as unknown as SpawnAntigravity),
     });
   }
 
