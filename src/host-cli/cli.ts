@@ -101,6 +101,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   folders pin --unfiled --enabled on|off --revision N
     取消置顶恢复普通分组位置；旧置顶未保存原位置时回到普通分组末尾
   conversations list --host HOST --bot BOT [--source-bot LOCAL_BOT_ID]
+  conversations create [--host auto] --engine ENGINE [--model M] [--title T] [--workspace DIR] [--request-id ID]
   conversations local                 当前本地主机的全部可见对话（含已归档）
   history snapshot|anchors CONVERSATION --bot BOT [--message MESSAGE] [--cursor CURSOR]
   history rewind|fork CONVERSATION --bot BOT --revision REV --request-id ID [--anchor ANCHOR] [--title TITLE]
@@ -799,6 +800,12 @@ export async function runHostCli(argv: string[]): Promise<void> {
         const note = piSessionUpdate && "outcome" in result ? piSessionRejectionNote(result, piSessionUpdate.value) : undefined;
         if (note && !v.json) console.error(note);
         await output(result); return;
+      }
+      if (sub === "create") {
+        await output(await runConversationsCommand(management.client, sub, {
+          host: v.host, engine: v.engine, model: v.model, title: v.title, workspace: v.workspace, bot: v.bot, requestId: v["request-id"],
+        }));
+        return;
       }
       if (argument || [v.host, v.bot, v["source-bot"]].some(value => value !== undefined)) throw new Error("批量整理使用当前本地主机；不接受跨 Bot 路由参数。");
       await output(await runConversationsCommand(management.client, sub, { ids: v.ids, yes: v.yes, folder: v.folder, unfiled: v.unfiled, newFolder: v["new-folder"], revision: v.revision, requestId: v["request-id"] }, id => console.error(`批量操作编号：${id}。结果不确定时保留原编号和参数核对，勿换编号重复提交。`))); return;

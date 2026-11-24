@@ -54,6 +54,7 @@ import { RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY } from "
 import { BACKGROUND_TASK_GROUP_CAPABILITY } from "../client-protocol/background-task-group.js";
 import { ConversationFolders } from "./conversation-folders.js";
 import { HostProfile } from "./host-profile.js";
+import { readHostResources } from "./host-resources.js";
 import { hostNameSchema } from "../client-protocol/host-profile.js";
 import { PrivateNetwork } from "./private-network.js";
 import { certificateAuthorityFromChain, lanInterfaceKey, HostRoutes, type ManagedListener } from "./host-routes.js";
@@ -1806,6 +1807,10 @@ export class HubServer {
       if (route === "/api/host-profile" && (req.method === "GET" || req.method === "PATCH")) {
         if (req.method === "GET") await reply(200, await this.profile.read(validateInQueue));
         else { await requireOwner(); await reply(200, await this.profile.update(await this.jsonBody(req), validateInQueue)); }
+        return;
+      }
+      if (route === "/api/host-resources" && req.method === "GET") {
+        await reply(200, await readHostResources(this.store));
         return;
       }
       if (route === "/api/network" && req.method === "GET") {

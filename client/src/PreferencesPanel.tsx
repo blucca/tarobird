@@ -45,6 +45,7 @@ import type { Preferences } from "./storage.js";
 import { ambiguousDeviceName, deviceDisplayName, deviceRevokeScope } from "./device-presentation.js";
 import "./device-settings.css";
 import { BotMessageGrants } from "./BotMessageGrants.js";
+import { LoadBalancingSettings } from "./LoadBalancingSettings.js";
 
 type Section = "workbench" | "backups" | "general" | "network" | "notifications" | "devices" | "botMessages" | "voice" | "engines" | "quota";
 /** `created_at`/`last_seen` come from the host; 0 or missing means never recorded. */
@@ -436,6 +437,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
             </button>
           </div>
           <details className="network-settings-help"><summary>{t("第一次连接，应该从哪里开始？")}</summary><p>{t("新手机或电脑：点击「添加设备」展示二维码，让新设备扫码，再输入新设备上的 8 位配对码确认。")}</p><p>{t("外出时需要访问主机：到「连接状态与线路」配置可用的 VPS 中转或 Tailscale。填写地址不会自动部署服务器和隧道。")}</p></details>
+          <LoadBalancingSettings value={preferences.loadBalancing} onChange={loadBalancing => update({ ...preferences, loadBalancing })} active={section === "network" && (!phone || !overview)}/>
         </section>
         <section hidden={section !== "engines"} aria-label={t("引擎程序")}><h3>{t("引擎程序")}</h3><EngineSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "engines" && (!phone || !overview)} onDirty={setEngineDirty} onBusy={setEngineBusy}/></section>
         {quotaPage && <section hidden={section !== "quota"} aria-label={t("模型额度")}><h3>{t("模型额度")}</h3><EngineQuota key={connection.identity.hubPublicKey} connection={connection} active={section === "quota" && (!phone || !overview)}/></section>}

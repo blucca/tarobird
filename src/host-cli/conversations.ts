@@ -2,16 +2,82 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { conversationSchema } from '../client-protocol/index.js';
 import { CONVERSATION_BATCH_CAPABILITY, CONVERSATION_RESTORE_CAPABILITY, conversationBatchSchema, conversationBatchResultSchema } from '../client-protocol/conversation-batch.js';
+import { createBotSchema } from '../client-protocol/bots.js';
+import { hostResourcesSchema } from '../client-protocol/host-resources.js';
+import { selectBalancedHost, type HostBalanceCandidate } from '../client-protocol/host-balancer.js';
 import { HostCliError, type LocalHostClient } from './client.js';
 
 export async function runConversationsCommand(client: Pick<LocalHostClient, 'request' | 'ready'>, action: string | undefined,
-  flags: { ids?: string; yes?: boolean; folder?: string; unfiled?: boolean; newFolder?: string; revision?: string; requestId?: string },
+  flags: { ids?: string; yes?: boolean; folder?: string; unfiled?: boolean; newFolder?: string; revision?: string; requestId?: string; host?: string; engine?: string; model?: string; title?: string; workspace?: string; bot?: string },
   announce: (requestId: string) => void = () => undefined) {
   if (action === 'local') {
     if (Object.values(flags).some(value => value !== undefined)) throw new Error('conversations local 不接受修改参数。');
     return z.array(conversationSchema).parse(await client.request('/api/conversations'));
   }
-  if (!['archive', 'restore', 'move'].includes(action ?? '')) throw new Error('使用 conversations local、archive、restore 或 move。');
+  if (action === 'create') {
+    const engine = flags.engine?.trim();
+    const requestId = flags.requestId ?? `cc_${randomUUID()}`;
+    if (flags.host && flags.host !== 'auto' && flags.host !== 'local') {
+      throw new Error('conversations create 目前支持 --host auto 或本地主机（省略 --host）。');
+    }
+    const profile = await client.request('/api/host-profile').catch(() => ({ name: 'local' })) as { name?: string };
+    const resources = await client.request('/api/host-resources').then(raw => hostResourcesSchema.parse(raw)).catch(() => undefined);
+    const bots = (client.ready.bots ?? []).filter(bot => !bot.deletedAt && bot.role !== 'worker');
+    let chosenBot = flags.bot ? bots.find(b => b.id === flags.bot) : undefined;
+    if (!chosenBot && engine) {
+      chosenBot = bots.find(b => b.engine === engine && b.online) ?? bots.find(b => b.engine === engine);
+    }
+    let engineAvailable = Boolean(chosenBot);
+    if (engine && !engineAvailable) {
+      const catalog = await client.request('/api/bots/catalog').catch(() => undefined) as { engines?: Array<{ id?: string; engine?: string; available?: boolean; installed?: boolean }> } | undefined;
+      const item = catalog?.engines?.find(e => (e.id ?? e.engine) === engine);
+      if (item) engineAvailable = item.available !== false && item.installed !== false;
+    }
+    if (flags.host === 'auto') {
+      const candidates: HostBalanceCandidate[] = [{
+        hostId: 'local',
+        hostName: profile.name ?? 'local',
+        online: true,
+        preference: 'normal',
+        engineAvailable: engine ? engineAvailable : bots.length > 0,
+        quotaExhausted: false,
+        latencyMs: 1,
+        resources,
+        ...(chosenBot ? { matchingBotId: chosenBot.id, matchingBotName: chosenBot.name } : {}),
+      }];
+      const selection = selectBalancedHost(candidates);
+      if (!selection.selected) {
+        throw new Error(`自动选择主机失败（${selection.excluded.map(e => `${e.hostName}:${e.reason}`).join(', ') || 'no_eligible_host'}），请手动指定主机或检查引擎状态。`);
+      }
+    }
+    let botId = chosenBot?.id;
+    let botName = chosenBot?.name;
+    let createdBot = false;
+    if (!botId) {
+      if (!engine) throw new Error('conversations create 需要 --bot ID 或 --engine ENGINE。');
+      const botInput = createBotSchema.parse({
+        requestId: `bot_${requestId}`,
+        name: engine,
+        engine,
+        model: flags.model ?? '',
+        effort: '',
+        workspace: flags.workspace ?? '',
+      });
+      const res = await client.request('/api/bots', 'POST', botInput) as { bot?: { id: string; name: string }; id?: string; name?: string };
+      botId = res.bot?.id ?? res.id;
+      botName = res.bot?.name ?? res.name ?? engine;
+      createdBot = true;
+      if (!botId) throw new Error('自动创建 Bot 失败。');
+    }
+    const conversation = conversationSchema.parse(await client.request('/api/conversations', 'POST', {
+      conversationType: 'direct',
+      botIds: [botId],
+      title: flags.title?.trim() || `与 ${botName ?? botId} 的新对话`,
+      clientActionId: requestId,
+    }));
+    return { host: profile.name ?? 'local', hostSelection: flags.host === 'auto' ? 'auto' : 'local', botId, createdBot, conversation };
+  }
+  if (!['archive', 'restore', 'move'].includes(action ?? '')) throw new Error('使用 conversations local、create、archive、restore 或 move。');
   if (!client.ready.serverCapabilities.includes(CONVERSATION_BATCH_CAPABILITY)) throw new Error('请更新主机后使用批量整理对话。');
   if (action === 'restore' && !client.ready.serverCapabilities.includes(CONVERSATION_RESTORE_CAPABILITY)) throw new Error('请更新主机后使用恢复对话。');
   const requestId = flags.requestId ?? `cb_${randomUUID()}`;
