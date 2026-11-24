@@ -5674,5 +5674,18 @@
   "未能并入，已改为排队": "Couldn't join the reply; queued instead",
   "经排队投递": "Delivered through the queue",
   "无法确认是否已并入": "Can't confirm whether it was merged",
-  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed."
+  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed.",
+  "浏览器配对二维码": "Browser pairing QR code",
+  "复制浏览器链接": "Copy browser link",
+  "已复制浏览器链接。在目标浏览器中打开后点「配对此设备」，再核对 8 位配对码确认。": "Browser link copied. Open it in your target browser, click “Pair this device”, then approve the 8-digit code.",
+  "本机浏览器": "Browser on this computer",
+  "连接方式": "Connection target",
+  "配对 App": "Pair an App",
+  "在浏览器中使用": "Use in a browser",
+  "浏览器通过哪条线路访问？": "Which route will the browser use?",
+  "这条局域网线路使用主机自签名证书，浏览器不会信任它。请勿绕过浏览器的证书安全警告。": "This LAN route uses the Host’s private self-signed certificate, which browsers do not trust. Never bypass browser certificate warnings.",
+  "要从其他设备的浏览器打开，请切换到具备受信任 HTTPS 证书的线路（如 VPS 中转、Tailscale HTTPS），或在本机直接选择「本机浏览器」。": "To open TaroBird from another device’s browser, switch to a route with a trusted HTTPS certificate (such as a VPS relay or Tailscale HTTPS), or choose “Browser on this computer” locally.",
+  "用桌面或手机浏览器打开一次性链接（或直接用系统相机扫码），再在已配对设备核对 8 位配对码确认。浏览器会出现在设备列表中，可随时吊销。": "Open the one-time link in a desktop or phone browser (or scan with your phone camera), then approve the 8-digit code on a trusted device. The browser appears in your device list and can be revoked at any time.",
+  "已读取浏览器配对链接": "Browser pairing link loaded",
+  "点击下方「配对此设备」，再在已配对设备上确认 8 位配对码。": "Click “Pair this device” below, then approve the 8-digit code on a paired device."
 }

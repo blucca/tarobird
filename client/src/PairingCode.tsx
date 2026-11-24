@@ -13,9 +13,9 @@ import { useEffect, useId, useRef, useState } from "react";
  * reports, at the moment of the request, that it is neither expired nor replaced. */
 export type QrSaveBinding = { key: string; valid: () => boolean };
 
-export function PairingCode({ payload, save }: { payload: PairingPayload; save?: QrSaveBinding }) {
+export function PairingCode({ payload, save, textOverride, browserMode = false }: { payload: PairingPayload; save?: QrSaveBinding; textOverride?: string; browserMode?: boolean }) {
   useLocale();
-  const text = pairingLink(payload);
+  const text = textOverride ?? pairingLink(payload);
   const [qr, setQr] = useState<{ text: string; url: string }>(); const [error, setError] = useState(false);
   const url = qr?.text === text ? qr.url : "";
   const [copyState, setCopyState] = useState<{ text: string; status: "copied" | "manual" }>();
@@ -90,16 +90,16 @@ export function PairingCode({ payload, save }: { payload: PairingPayload; save?:
   };
   const label = qrSaveLabel(target);
   return <>
-    {error ? <p role="alert">{t("线路信息过长，无法生成二维码。请复制配对信息，在新设备粘贴。")}</p> : url ? <img ref={image} className="pair-qr" data-save={saveKey ? "hold" : undefined} draggable={false} src={url} width={300} height={300} alt={payload.kind === "connect" ? t("连接二维码") : t("确认新设备二维码")}/> : null}
+    {error ? <p role="alert">{t("线路信息过长，无法生成二维码。请复制配对信息，在新设备粘贴。")}</p> : url ? <img ref={image} className="pair-qr" data-save={saveKey ? "hold" : undefined} draggable={false} src={url} width={300} height={300} alt={browserMode ? t("浏览器配对二维码") : payload.kind === "connect" ? t("连接二维码") : t("确认新设备二维码")}/> : null}
     <div className="pair-code-actions">
-      <button type="button" onClick={() => void copy()}><Copy size={15}/>{payload.kind === "connect" ? t("复制连接信息") : t("复制配对信息")}</button>
+      <button type="button" onClick={() => void copy()}><Copy size={15}/>{browserMode ? t("复制浏览器链接") : payload.kind === "connect" ? t("复制连接信息") : t("复制配对信息")}</button>
       {saveKey && url && <button ref={saveButton} type="button" disabled={busy} aria-busy={busy || undefined} onClick={() => void saveImage()}>{busy ? <LoaderCircle size={15} className="spin" aria-hidden="true"/> : <ImageDown size={15} aria-hidden="true"/>}{label}</button>}
-      {copyState?.text === text && (copyState.status === "copied" ? <small role="status">{t("已复制。在新设备选择「粘贴连接信息」；确认配对时也可粘贴到扫码窗口。")}</small> : <><small role="status">{t("无法自动复制，请选中下方信息复制。")}</small><textarea aria-label={t("可复制的配对信息")} readOnly value={text} onFocus={event => event.currentTarget.select()}/></>)}
+      {copyState?.text === text && (copyState.status === "copied" ? <small role="status">{browserMode ? t("已复制浏览器链接。在目标浏览器中打开后点「配对此设备」，再核对 8 位配对码确认。") : t("已复制。在新设备选择「粘贴连接信息」；确认配对时也可粘贴到扫码窗口。")}</small> : <><small role="status">{t("无法自动复制，请选中下方信息复制。")}</small><textarea aria-label={t("可复制的配对信息")} readOnly value={text} onFocus={event => event.currentTarget.select()}/></>)}
       {saving && saving.key === saveKey && <small role={saving.error ? "alert" : "status"} className={saving.error ? "error-text" : undefined}>{saving.text}</small>}
     </div>
     {menu && menu.key === saveKey && menu.text === text && url && <DesktopMenu id={menuId} label={t("二维码操作")} open point={menu.point} placement="down-start" trigger={saveButton} portalTarget={image.current?.closest("dialog")} close={() => setMenu(undefined)}>
       <button type="button" role="menuitem" disabled={busy} onClick={() => void saveImage()}><ImageDown size={16}/>{label}</button>
-      <button type="button" role="menuitem" onClick={() => void copy()}><Copy size={16}/>{payload.kind === "connect" ? t("复制连接信息") : t("复制配对信息")}</button>
+      <button type="button" role="menuitem" onClick={() => void copy()}><Copy size={16}/>{browserMode ? t("复制浏览器链接") : payload.kind === "connect" ? t("复制连接信息") : t("复制配对信息")}</button>
     </DesktopMenu>}
   </>;
 }

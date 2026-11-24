@@ -15,6 +15,7 @@ import { t, useLocale } from "./i18n.js";
 import { hubFetch, usesPinnedTransport } from "./transport.js";
 import { connectionVerificationFailure, connectionVerificationMessage, preferredVerificationFailure, validHubPublicKey } from "./connection-verification.js";
 import { pairingInviteError } from "./pairing-invite-errors.js";
+import { parseBrowserPairingHash } from "./web-browser.js";
 
 const PairingCode = lazy(() => import("./PairingCode.js").then(module => ({ default: module.PairingCode })));
 const PairingScanner = lazy(() => import("./PairingCode.js").then(module => ({ default: module.PairingScanner })));
@@ -39,7 +40,26 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   const [deployment, setDeployment] = useState<Deployment>(), [legacyDirect, setLegacyDirect] = useState<Route>();
   const [address, setAddress] = useState(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""), [relays, setRelays] = useState<Route[]>([]);
   const [name, setName] = useState(() => defaultDeviceName(platform));
+  const [fromBrowserLink, setFromBrowserLink] = useState(false);
   const pairButton = useRef<HTMLButtonElement>(null), imported = useRef(false), failure = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (platform !== "web" || !window.location.hash) return;
+    const payload = parseBrowserPairingHash(window.location.hash);
+    if (!payload) return;
+    // Strip the one-time invite fragment immediately so it is never kept in browser history.
+    try { window.history.replaceState(null, "", window.location.pathname + window.location.search); } catch { /* ignore */ }
+    imported.current = true;
+    setFromBrowserLink(true);
+    setInvite(payload.invite);
+    setDeployment(payload.deployment);
+    setLegacyDirect(payload.routes.find((r) => r.name !== "VPS"));
+    setAddress(payload.routes.find((r) => r.name !== "VPS")?.url ?? "");
+    setRelays(payload.routes.filter((r) => r.name === "VPS"));
+    setExpectedKey(payload.hubPublicKey);
+    setManual(false);
+    setOptionsOpen(false);
+    setError("");
+  }, [platform]);
   useEffect(() => {
     if (scan || !imported.current) return;
     imported.current = false;
@@ -227,7 +247,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
         <button type="button" className="pairing-scan full" disabled={busy} onClick={() => { setInputMode("image"); setScan(true); }}><ImagePlus size={18}/>{t("导入二维码图片")}</button>
         <button type="button" className="pairing-scan full" disabled={busy} onClick={(event) => { event.currentTarget.focus(); setInputMode("scan"); setScan(true); }}><QrCode size={20} aria-hidden="true"/>{t("扫描连接二维码")}</button>
         </div>}
-        {expectedKey && <div className="pairing-import" role="status"><Monitor size={18}/><div><strong>{t("已读取主机信息")}</strong><p className="muted">{address ? directHost || address : t("VPS 中转")}</p>{reviewing && <p className="pairing-import-state">{t("尚未连接，请继续完成下方配对。")}</p>}</div><button type="button" disabled={busy} onClick={() => { setInputMode("text"); setScan(true); }}>{t("更换连接信息")}</button></div>}
+        {expectedKey && <div className="pairing-import" role="status"><Monitor size={18}/><div><strong>{fromBrowserLink ? t("已读取浏览器配对链接") : t("已读取主机信息")}</strong><p className="muted">{address ? directHost || address : t("VPS 中转")}</p>{(reviewing || fromBrowserLink) && <p className="pairing-import-state">{fromBrowserLink ? t("点击下方「配对此设备」，再在已配对设备上确认 8 位配对码。") : t("尚未连接，请继续完成下方配对。")}</p>}</div><button type="button" disabled={busy} onClick={() => { setInputMode("text"); setScan(true); }}>{t("更换连接信息")}</button></div>}
         {!reviewing && routeHint}
         {(manual || expectedKey) && <>
           <label>{t("设备名称")}<input value={name} required maxLength={100} disabled={busy} aria-describedby="pairing-device-name-help" onChange={(e) => setName(e.target.value)}/></label><p id="pairing-device-name-help" className="settings-note muted">{t("确认一个其他设备也能认出的名称，例如 MacBook Pro 或 vivo 手机。")}</p>
