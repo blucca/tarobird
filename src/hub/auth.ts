@@ -5,7 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 import { pairingSchema } from "../client-protocol/index.js";
 import { authDeniedProof, authDeniedSchema, type AuthDenied } from "../client-protocol/auth-status.js";
-import { tlsIdentityNonceSchema, tlsIdentityProof, type TlsIdentity, type TlsIdentityUnsigned } from "../client-protocol/tls-identity.js";
+import { edgeIdentityProof, edgeOriginSchema, tlsIdentityNonceSchema, tlsIdentityProof, type EdgeIdentity, type EdgeIdentityUnsigned, type TlsIdentity, type TlsIdentityUnsigned } from "../client-protocol/tls-identity.js";
 import { JsonStore } from "../state/json-store.js";
 import { withFileMutex } from "../state/file-mutex.js";
 import { isLoopback } from "./network.js";
@@ -392,6 +392,16 @@ export class HubAuth {
     const proof: TlsIdentityUnsigned = { v: 1, type: "tls.identity", publicKey: this.publicKey, nonce,
       certificateSha256: createHash("sha256").update(certificate).digest("hex") };
     return { ...proof, signature: sign(null, Buffer.from(tlsIdentityProof(proof)), this.privateKey).toString("base64") };
+  }
+  /** Signed proof for an explicitly authorized edge-terminated HTTPS route
+   * (e.g. DIY Cloudflare Tunnel). Always rate-limited as anonymous/external,
+   * never granted loopback trusted quota. */
+  edgeIdentity(nonce: string, rawOrigin: string, source: string): EdgeIdentity {
+    this.rate(`edge-identity:${rateSource(source)}`, 60, "anonymous");
+    tlsIdentityNonceSchema.parse(nonce);
+    const origin = edgeOriginSchema.parse(rawOrigin);
+    const proof: EdgeIdentityUnsigned = { v: 1, type: "edge.identity", publicKey: this.publicKey, nonce, origin };
+    return { ...proof, signature: sign(null, Buffer.from(edgeIdentityProof(proof)), this.privateKey).toString("base64") };
   }
   async challenge(connectionId: string, deviceId: string, clientNonce: string, source: string): Promise<{ nonce: string; signature: string; publicKey: string }> {
     const device = await this.store.device(deviceId);

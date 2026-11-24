@@ -1,6 +1,6 @@
 import { QrCode, ScanLine } from "lucide-react";
 import { useId, useLayoutEffect, useRef, useState } from "react";
-import { deploymentMatchesRoutes, localRoutesSchema, type Deployment } from "../../src/client-protocol/routes.js";
+import { deploymentMatchesRoutes, isDirectRoute, isRelayRoute, localRoutesSchema, type Deployment } from "../../src/client-protocol/routes.js";
 import { CreationDialog } from "./CreationDialog.js";
 import { PairingScanner, type PairingPayload } from "./PairingCode.js";
 import { routeTitle } from "./RouteFields.js";
@@ -18,7 +18,7 @@ export type RouteRepair = { routes: Route[]; deployment?: Deployment; direct: Ro
 export function repairRoutes(identity: Pick<Identity, "hubPublicKey" | "routes" | "deployment">, payload: PairingPayload): RouteRepair | undefined {
   if (payload.kind !== "connect") throw new Error(t("请扫描已信任设备显示的 Hub 二维码"));
   if (!identity.hubPublicKey || payload.hubPublicKey !== identity.hubPublicKey) throw new Error(t("这不是当前主机的二维码。请扫描此主机显示的连接二维码。"));
-  const scanned = payload.routes.find((route) => route.name !== "VPS");
+  const scanned = payload.routes.find(isDirectRoute);
   if (!scanned) throw new Error(t("此二维码不含直连地址。如需修改中转，请使用「编辑线路」。"));
   if (loopback(scanned.url)) throw new Error(t("二维码中的地址只能在主机本机使用。请在主机上开启局域网配对后重新扫描。"));
   const managedMatches = identity.routes.filter(route => route.name === scanned.name
@@ -29,7 +29,7 @@ export function repairRoutes(identity: Pick<Identity, "hubPublicKey" | "routes" 
   // cannot identify a stale LAN address; append when ownership is ambiguous.
   const replaced = identity.routes.find(route => route.name === scanned.name && route.url === scanned.url)
     ?? (managedMatches.length === 1 ? managedMatches[0] : undefined);
-  const relays = identity.routes.filter((route) => route.name === "VPS");
+  const relays = identity.routes.filter(isRelayRoute);
   // A refreshed address keeps the user's own name for the same origin.
   const direct: Route = { ...scanned, ...(!scanned.label && replaced?.url === scanned.url && replaced.label ? { label: replaced.label } : {}) };
   // Only the address and its trust anchor matter; a differing display name alone is no repair.
@@ -48,7 +48,7 @@ export function renewedPairingRoutes(identity: Pick<Identity, "hubPublicKey" | "
   const host = repair && new URL(repair.direct.url).hostname;
   const ip = host ? ipv4Octets(host) : undefined;
   const tailnet = !!host && (!!ip && ip[0] === 100 && ip[1]! >= 64 && ip[1]! <= 127 || /^\[fd7a:115c:a1e0:/.test(host));
-  const knownAuthority = repair && repair.direct.certificateAuthority && identity.routes.some(route => route.name !== "VPS" && route.certificateAuthority === repair.direct.certificateAuthority);
+  const knownAuthority = repair && repair.direct.certificateAuthority && identity.routes.some(route => isDirectRoute(route) && route.certificateAuthority === repair.direct.certificateAuthority);
   if (repair && ((!privateLan(repair.direct.url) && !tailnet) || !knownAuthority || repair.certificateChanged)) {
     throw new Error("pairing_route_confirmation_required");
   }
@@ -62,7 +62,7 @@ export function RepairHostRoute({ connection, online, busyChange }: { connection
   const busyRef = useRef(false), button = useRef<HTMLButtonElement>(null), titleId = useId();
   useLayoutEffect(() => { busyChange?.(busy); }, [busy, busyChange]);
   useLayoutEffect(() => () => { busyChange?.(false); }, [busyChange]);
-  const identity = connection.identity, current = identity.routes.find((route) => route.name !== "VPS");
+  const identity = connection.identity, current = identity.routes.find(isDirectRoute);
   // The host's own loopback connection never needs a LAN address.
   if (!identity.hubPublicKey || (current && loopback(current.url))) return null;
   const unchanged = () => online ? t("已保存的地址与二维码一致，无需更新。") : t("已保存的地址与二维码一致，无需更新。如仍无法连接，请确认此设备与主机在同一网络，且主机正在运行。");

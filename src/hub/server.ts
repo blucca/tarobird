@@ -58,6 +58,8 @@ import { hostNameSchema } from "../client-protocol/host-profile.js";
 import { PrivateNetwork } from "./private-network.js";
 import { certificateAuthorityFromChain, lanInterfaceKey, HostRoutes, type ManagedListener } from "./host-routes.js";
 import { HOST_ROUTES_PATH, HOST_LAN_SELECTION_PATH, managedLanSelectionSchema } from "../client-protocol/host-routes.js";
+import { HOST_CLOUDFLARE_PATH, HOST_CLOUDFLARE_QUICK_PATH, cloudflareQuickActionSchema } from "../client-protocol/cloudflare.js";
+import { HubCloudflareTunnel } from "./cloudflare-tunnel.js";
 import { markDeviceNameAlias } from "./network-device-name.js";
 import { networkCommandSchema } from "../client-protocol/private-network.js";
 import { exchangeNetworkPeer, MAX_NETWORK_BYTES } from "./network-peer.js";
@@ -172,6 +174,7 @@ export class HubServer {
   readonly profile: HostProfile;
   readonly network: PrivateNetwork;
   readonly hostRoutes: HostRoutes;
+  readonly cloudflare: HubCloudflareTunnel;
   readonly botMessages: BotMessages;
   readonly agentBuses: HubAgentBuses;
   readonly dispatch: HubDispatch;
@@ -356,6 +359,7 @@ export class HubServer {
       exchange: options.networkExchange ?? ((host, request) => exchangeNetworkPeer(host, request, { signal: this.networkAbort.signal })),
     });
     this.hostRoutes = new HostRoutes({ store, network: this.network, publicKey: auth.publicKey, stateDir: options.stateDir, listeners: () => this.managedListeners() });
+    this.cloudflare = new HubCloudflareTunnel({ store, loopbackTarget: () => this.url });
     const conversationsCreated = (userId: string, conversations: Conversation[]) => {
       for (const conversation of conversations) for (const c of this.clients) if (c.session?.userId === userId && (!conversation.hidden || c.capabilities.includes(DISPATCH_CAPABILITY))) { c.conversationIds.add(conversation.id); this.publishClient(c, { v: 1, type: "conversation.updated", conversation }); }
     };
@@ -460,7 +464,7 @@ export class HubServer {
       // A relay arrives from loopback, so the socket address alone cannot
       // distinguish an instance connection from an untrusted remote client.
       if (this.stopping || !this.originAllowed(req) || !["/ws", "/instance"].includes(req.url ?? "") || (req.url === "/instance" && (!instance || !isLoopback(req.socket.remoteAddress ?? "")))) { socket.destroy(); return; }
-      this.sockets.handleUpgrade(req, socket, head, (ws) => req.url === "/instance" ? this.instanceSocket(ws) : this.clientSocket(ws, this.relaySources.source(req.socket)));
+      this.sockets.handleUpgrade(req, socket, head, (ws) => req.url === "/instance" ? this.instanceSocket(ws) : this.clientSocket(ws, this.requestSource(req)));
     });
   }
   private trackTask(work: Promise<unknown>): void {
@@ -550,6 +554,7 @@ export class HubServer {
       await hub.agentBuses.reconcile();
       // Discussion turns settled while stopped advance once; uncertain ones pause.
       await hub.groupDiscussions.reconcile();
+      await hub.cloudflare.load();
       for (const listener of hub.listeners) await hub.bindListener(listener);
       const runningHub = hub;
       const retryListeners = setInterval(() => {
@@ -605,6 +610,7 @@ export class HubServer {
     await errors.run("workers.close", () => this.botManager?.close());
     await errors.run("dispatch.stop", () => this.dispatch.stop());
     await errors.run("push.stop", () => this.pushWorker.stop());
+    await errors.run("cloudflare.close", () => this.cloudflare.close());
     for (const dispose of this.disposers.splice(0)) await errors.run("subscription.close", dispose);
     await errors.run("listeners.finish", () => Promise.allSettled([...this.listenerStarts.values()]));
     for (const ws of this.sockets.clients) await errors.run("websocket.close", () => ws.terminate());
@@ -657,7 +663,16 @@ export class HubServer {
   private originAllowed(req: IncomingMessage): boolean {
     const origin = req.headers.origin;
     if (!origin) return true;
-    return [...this.urls, ...NATIVE_ORIGINS, ...(this.options.origins ?? [])].includes(origin);
+    return [...this.urls, ...NATIVE_ORIGINS, ...(this.options.origins ?? [])].includes(origin) || this.cloudflare.isOriginAllowed(origin);
+  }
+  private requestSource(req: IncomingMessage): string {
+    const raw = this.relaySources.source(req.socket);
+    // Requests arriving via a local reverse proxy / cloudflared over loopback
+    // must never inherit trusted loopback rate buckets or spoofable header IPs.
+    if (isLoopback(raw) && (req.headers["cf-ray"] || req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"] || req.headers["forwarded"])) {
+      return "edge-proxy";
+    }
+    return raw;
   }
   private send(ws: WebSocket, value: unknown): Promise<void> {
     const work = writeFrame(ws, value, this.fragmentSockets.has(ws));
@@ -1528,7 +1543,7 @@ export class HubServer {
     bucket.remaining--;
   }
   private async request(req: IncomingMessage, res: ServerResponse, instanceAllowed: boolean): Promise<void> {
-    const source = this.relaySources.source(req.socket);
+    const source = this.requestSource(req);
     if (!this.originAllowed(req)) throw new HubError("origin_forbidden", 403);
     if (req.headers.origin) { res.setHeader("Access-Control-Allow-Origin", req.headers.origin); res.setHeader("Vary", "Origin"); }
     res.setHeader("Access-Control-Expose-Headers", "ETag, Content-Range, Accept-Ranges, Date");
@@ -1547,6 +1562,15 @@ export class HubServer {
       const certificate = localCertificate && "raw" in localCertificate ? localCertificate.raw : undefined;
       if (!Buffer.isBuffer(certificate) || !certificate.length) throw new HubError("tls_identity_unavailable", 503);
       this.json(res, 200, this.auth.tlsIdentity(url.searchParams.get("nonce") ?? "", certificate, source)); return;
+    }
+    if (route === "/api/edge-identity" && req.method === "GET") {
+      // Edge-terminated HTTPS proofs (e.g. DIY Cloudflare Tunnel) are ONLY
+      // issued to real loopback tunnel hops for explicitly authorized origins,
+      // preventing remote third-party proxies from replaying another Hub's proof.
+      if (!isLoopback(req.socket.remoteAddress ?? "")) throw new HubError("edge_identity_loopback_only", 403);
+      const requestedOrigin = url.searchParams.get("origin") ?? "";
+      if (!this.cloudflare.isOriginAllowed(requestedOrigin)) throw new HubError("edge_origin_not_allowed", 403);
+      this.json(res, 200, this.auth.edgeIdentity(url.searchParams.get("nonce") ?? "", requestedOrigin, "edge-proxy")); return;
     }
     if (route === "/api/pair" && req.method === "POST") { this.json(res, 201, await this.auth.pairInvited(await this.jsonBody(req, 8192), source)); return; }
     if (route === "/api/bot-messages/challenge" && req.method === "GET") {
@@ -1819,6 +1843,20 @@ export class HubServer {
       }
       if (route === HOST_ROUTES_PATH && req.method === "GET") {
         await requireOwner(); await reply(200, await this.hostRoutes.view(validateInQueue)); return;
+      }
+      if (route === HOST_CLOUDFLARE_PATH && req.method === "GET") {
+        await requireOwner(); await reply(200, await this.cloudflare.view()); return;
+      }
+      if (route === HOST_CLOUDFLARE_PATH && req.method === "PUT") {
+        await requireOwner();
+        const view = await this.cloudflare.update(await this.jsonBody(req, 8192));
+        await reply(200, view); return;
+      }
+      if (route === HOST_CLOUDFLARE_QUICK_PATH && req.method === "POST") {
+        await requireOwner();
+        const action = cloudflareQuickActionSchema.parse(await this.jsonBody(req, 2048));
+        const view = action.action === "start" ? await this.cloudflare.startQuickTunnel(action.protocol) : await this.cloudflare.stopQuickTunnel();
+        await reply(200, view); return;
       }
       if (route === "/api/network/manage" && req.method === "POST") {
         await requireOwner();

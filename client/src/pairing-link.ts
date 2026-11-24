@@ -1,4 +1,4 @@
-import { routesSchema, deploymentSchema, deploymentMatchesRoutes, type Deployment } from "../../src/client-protocol/routes.js";
+import { isDirectRoute, isRelayRoute, routesSchema, deploymentSchema, deploymentMatchesRoutes, type Deployment } from "../../src/client-protocol/routes.js";
 import { z } from "zod";
 import { t } from "./i18n.js";
 import { validateRoute } from "./identity.js";
@@ -17,8 +17,8 @@ export const MAX_PAIRING_LINK_LENGTH = 8192;
 /** QR v1 keeps its single-direct contract. Extra local routes arrive over the
  * authenticated host-routes capability after pairing, never in an invalid QR. */
 export function connectionPairingPayload(hubPublicKey: string, local: readonly Route[], deployment?: Deployment, activeUrl?: string): Extract<PairingPayload, { kind: "connect" }> {
-  const direct = local.find(route => route.name !== "VPS" && route.url === activeUrl) ?? local.find(route => route.name === "Tailscale") ?? local.find(route => route.name === "Direct");
-  const routes = routesSchema.parse([...(direct ? [direct] : []), ...local.filter(route => route.name === "VPS")]);
+  const direct = local.find(route => isDirectRoute(route) && route.url === activeUrl) ?? local.find(route => route.name === "Tailscale") ?? local.find(route => route.name === "Direct");
+  const routes = routesSchema.parse([...(direct ? [direct] : []), ...local.filter(isRelayRoute)]);
   return { v: 1, kind: "connect", hubPublicKey, routes, ...(deployment && deploymentMatchesRoutes(deployment, routes) ? { deployment } : {}) };
 }
 

@@ -1,12 +1,12 @@
 import { pairingInviteTokenSchema } from "../client-protocol/pairing-invites.js";
 import qrcode from "qrcode-terminal";
-import { routesSchema, type Route } from "../client-protocol/routes.js";
+import { isDirectRoute, routesSchema, type Route } from "../client-protocol/routes.js";
 import { sharedRoutesSchema } from "../client-protocol/private-network.js";
 
 /** A phone's one-time pairing route must not replace a configured network route. */
 export function pairingSharedRoutes(existing: Route[], selected: Route): Route[] {
   const current = sharedRoutesSchema.parse(existing), incoming = routesSchema.parse([selected])[0]!;
-  const direct = current.find(route => route.name !== "VPS");
+  const direct = current.find(isDirectRoute);
   if (direct) {
     if (direct.url !== incoming.url) return current;
     // Renew the certificate for the same endpoint, retaining the user's label.

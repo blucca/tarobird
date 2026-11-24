@@ -1,6 +1,7 @@
 import { timeoutSignal } from "./abort-signals.js";
 import { pairingClockOffset, pairingRemaining } from "./pairing-time.js";
 import { defaultDeviceName } from "./device-presentation.js";
+import { isDirectRoute, isRelayRoute } from "../../src/client-protocol/routes.js";
 import { rememberRouteTrust } from "./route-trust.js";
 import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import { ArrowLeft, ChevronLeft, ClipboardPaste, ImagePlus, LoaderCircle, Monitor, QrCode, ShieldCheck, Smartphone } from "lucide-react";
@@ -258,7 +259,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       const next: PendingPairing = { code: "", expiresAt: 0, request: { invite: payload.invite, requestId: randomNonce() } };
       void (async () => {
         const snapshot = { ...pendingConnection.identity };
-        const direct = payload.routes.find(route => route.name !== "VPS");
+        const direct = payload.routes.find(isDirectRoute);
         const unchanged = !direct || snapshot.routes.some(route => route.url === direct.url && route.certificateAuthority === direct.certificateAuthority);
         let repair;
         if (!unchanged) {
@@ -277,6 +278,6 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     }
     imported.current = true;
     setInvite(payload.invite);
-    setDeployment(payload.deployment); setLegacyDirect(payload.routes.find((r) => r.name !== "VPS")); setAddress(payload.routes.find((r) => r.name !== "VPS")?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError("");
+    setDeployment(payload.deployment); setLegacyDirect(payload.routes.find(isDirectRoute)); setAddress(payload.routes.find(isDirectRoute)?.url ?? ""); setRelays(payload.routes.filter(isRelayRoute)); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError("");
   }}/></Suspense>}</main>;
 }

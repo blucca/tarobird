@@ -2,7 +2,7 @@ import { sharedRoutesSchema, networkCanonical, type NetworkView } from "../../sr
 import { routeUrlSchema, type Route } from "../../src/client-protocol/routes.js";
 import { t } from "./i18n.js";
 
-/** This edits the host's advertised routes, never the desktop's loopback route. */
+/** This edits the host's advertised VPS routes, preserving Direct, Tailscale and Cloudflare routes. */
 export function localRelayRoutes(existing: Route[], relays: Route[]): Route[] {
   const normalized = relays.map(route => {
     const parsed = routeUrlSchema.safeParse(route.url.trim());
@@ -11,6 +11,18 @@ export function localRelayRoutes(existing: Route[], relays: Route[]): Route[] {
   });
   const parsed = sharedRoutesSchema.safeParse([...existing.filter(route => route.name !== "VPS"), ...normalized]);
   if (!parsed.success) throw new Error(t("请填写不重复的 HTTPS 中转地址，最多 8 条；不能使用本机回环地址。"));
+  return parsed.data;
+}
+
+/** This edits the host's advertised Cloudflare DIY Tunnel routes, preserving Direct, Tailscale and VPS routes. */
+export function localCloudflareRoutes(existing: Route[], cloudflareOrigins: string[]): Route[] {
+  const normalized: Route[] = cloudflareOrigins.map(url => {
+    const parsed = routeUrlSchema.safeParse(url.trim());
+    if (!parsed.success) throw new Error(t("请输入有效的 Cloudflare Tunnel HTTPS 地址"));
+    return { name: "Cloudflare" as const, url: parsed.data };
+  });
+  const parsed = sharedRoutesSchema.safeParse([...existing.filter(route => route.name !== "Cloudflare"), ...normalized]);
+  if (!parsed.success) throw new Error(t("请填写不重复的 HTTPS Cloudflare Tunnel 地址；所有中转合计最多 8 条，且不能使用本机回环地址。"));
   return parsed.data;
 }
 
