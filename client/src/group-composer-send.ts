@@ -81,7 +81,7 @@ export async function sendGroupComposerMessage(connection: HubConnection, frame:
     const legacy = mode!.delivery === "legacy";
     const guarded = connection.state.groupReplyGuardAvailable || mode!.delivery === "guarded";
     if (!legacy && !guarded && connection.state.status !== "online") throw new Error(unavailableGroupReplyGuard());
-    const message = { ...frame, ...(legacy || guarded ? { groupReplyGuard: { mode: mode!.mode as "mentions" | "parallel", revision: legacy ? LEGACY_GROUP_REPLY_REVISION : mode!.revision } } : {}) };
+    const message = { ...frame, ...(legacy || guarded ? { groupReplyGuard: { mode: mode!.mode as "designated" | "mentions" | "parallel", revision: legacy ? LEGACY_GROUP_REPLY_REVISION : mode!.revision } } : {}) };
     if (designComments?.context.kind === "design") await connection.send(message, designComments); else await connection.send(message);
     return;
   }

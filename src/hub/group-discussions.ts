@@ -142,7 +142,7 @@ export class HubGroupDiscussions {
       // membership change on another device rejects the whole start atomically.
       if (settings.revision !== input.revision) throw new HubError("group_settings_conflict", 409);
       const { policy } = settings;
-      if (policy.mode === "mentions" || policy.mode === "parallel") throw new HubError("group_discussion_mode_required", 409);
+      if (policy.mode !== "sequential" && policy.mode !== "independent") throw new HubError("group_discussion_mode_required", 409);
       // An explicit speaker selection narrows this run only; the saved order
       // still decides who speaks when. Omitted means every member.
       if (input.participants?.some(botId => !policy.botOrder.includes(botId))) throw new HubError("group_discussion_participants_invalid", 409);

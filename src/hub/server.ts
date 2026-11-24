@@ -39,6 +39,7 @@ import { STEER_CALL_TIMEOUT_MS, STEER_RECONCILE_TIMEOUT_MS, STEER_STATUS_TIMEOUT
 import { BOT_MESSAGE_STEER_CAPABILITY, botMessageSteeringCommandSchema } from "../client-protocol/bot-message-delivery.js";
 import { HubAgentBuses } from "./agent-bus.js";
 import { HubGroupDiscussions } from "./group-discussions.js";
+import { HubCrossHostGroups } from "./group-cross-host.js";
 import { GROUP_DISCUSSION_WORKER_CAPABILITY, GROUP_PARALLEL_CAPABILITY } from "../client-protocol/group-discussion.js";
 import { AGENT_BUS_WORKER_CAPABILITY } from "../client-protocol/agent-bus.js";
 import { BOT_TRANSFER_BYTES } from "./bot-message-transport.js";
@@ -176,6 +177,7 @@ export class HubServer {
   readonly agentBuses: HubAgentBuses;
   readonly dispatch: HubDispatch;
   readonly groupDiscussions: HubGroupDiscussions;
+  readonly crossHostGroups: HubCrossHostGroups;
   readonly conversationHistory: HubConversationHistory;
   private readonly networkAbort = new AbortController();
   private networkTick?: Promise<void>;
@@ -384,6 +386,26 @@ export class HubServer {
       // Exactly this input's live run; never another turn of the conversation.
       stop: (botId, conversationId, messageId) => this.callBot(botId, "stop", { conversationId, messageId }),
     });
+    this.crossHostGroups = new HubCrossHostGroups(store, this.auth, {
+      localUrl: () => this.url,
+      localHostName: async () => (await this.profile.read()).name,
+      networkPeers: async () => {
+        const view = await this.network.view().catch(() => undefined);
+        const hosts = view?.membership?.manifest?.hosts ?? [];
+        return hosts
+          .filter((h) => !h.revoked && h.state === "active" && h.publicKey !== this.auth.publicKey && h.routes.length > 0)
+          .map((h) => ({ hostId: `host_${createHash("sha256").update(h.publicKey).digest("hex").slice(0, 12)}`, hostName: h.name, publicKey: h.publicKey, url: h.routes[0]!.url }));
+      },
+      onGroupStopLocal: async (groupId) => {
+        const conv = await this.store.db.all<{ id: string }>("SELECT id FROM conversations WHERE id=? OR parent_id=?", [groupId, groupId]);
+        for (const row of conv) {
+          const bots = await this.store.db.all<{ member_id: string }>("SELECT member_id FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [row.id]);
+          for (const b of bots) {
+            await this.callBot(b.member_id, "stop", { conversationId: row.id }).catch(() => undefined);
+          }
+        }
+      },
+    });
     this.conversationFolders = new ConversationFolders(store.db);
     this.avatars = new HubAvatars(store);
     this.linkPreviews = new HubLinkPreviews(store, attachments);
@@ -550,6 +572,7 @@ export class HubServer {
       await hub.agentBuses.reconcile();
       // Discussion turns settled while stopped advance once; uncertain ones pause.
       await hub.groupDiscussions.reconcile();
+      await hub.crossHostGroups.init();
       for (const listener of hub.listeners) await hub.bindListener(listener);
       const runningHub = hub;
       const retryListeners = setInterval(() => {
@@ -1576,6 +1599,31 @@ export class HubServer {
       this.networkRate(source, "enroll");
       this.json(res, 200, await this.network.enroll(await this.jsonBody(req, MAX_NETWORK_BYTES))); return;
     }
+    if (route.startsWith("/api/group-mail/")) {
+      const method = req.method === "POST" ? "POST" : req.method === "GET" ? "GET" : undefined;
+      if (!method) throw new HubError("method_not_allowed", 405);
+      const rawBuf = method === "POST" ? await this.body(req, 2 * MAX_FRAME_BYTES) : Buffer.alloc(0);
+      const bodyText = rawBuf.toString("utf8");
+      const peer = await this.crossHostGroups.verifyPeerRequest(method, route, req.headers, bodyText);
+      if (route === "/api/group-mail/directory" && method === "GET") {
+        this.json(res, 200, await this.crossHostGroups.handlePeerDirectory()); return;
+      }
+      if (route === "/api/group-mail/sessions" && method === "POST") {
+        const parsed = z.object({ botId: idSchema, title: z.string().trim().min(1).max(256) }).strict().parse(JSON.parse(bodyText));
+        this.json(res, 200, await this.crossHostGroups.handlePeerEnsureSession(parsed)); return;
+      }
+      if (route === "/api/group-mail/deliver" && method === "POST") {
+        this.json(res, 200, await this.crossHostGroups.handlePeerDeliver(peer, JSON.parse(bodyText))); return;
+      }
+      if (route === "/api/group-mail/reply" && method === "POST") {
+        this.json(res, 200, await this.crossHostGroups.handlePeerReply(peer, JSON.parse(bodyText))); return;
+      }
+      const statusRoute = route.match(/^\/api\/group-mail\/status\/([A-Za-z0-9_-]+)$/);
+      if (statusRoute && method === "GET") {
+        this.json(res, 200, await this.crossHostGroups.handlePeerStatus(statusRoute[1]!)); return;
+      }
+      throw new HubError("not_found", 404);
+    }
     if (route.startsWith("/api/instance/")) { if (!instanceAllowed) throw new HubError("instance_unauthorized", 401); await this.instanceHttp(req, res, route); return; }
     if (!route.startsWith("/api/")) { await this.staticFile(route, res); return; }
     const token = req.headers.authorization?.replace(/^Bearer /, "");
@@ -2143,6 +2191,24 @@ export class HubServer {
         for (const conversation of changed) for (const client of this.clients) if (client.conversationIds.has(conversation.id)) this.publishClient(client, { v: 1, type: "conversation.updated", conversation });
         await reply(200, changed); return;
       }
+      const groupMembersRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/members(?:\/([A-Za-z0-9_.:%-]+)(?:\/(session))?)?$/);
+      if (groupMembersRoute) {
+        const groupId = groupMembersRoute[1]!;
+        const memberKeyParam = groupMembersRoute[2] ? decodeURIComponent(groupMembersRoute[2]) : undefined;
+        const sub = groupMembersRoute[3];
+        if (!memberKeyParam && req.method === "GET") { await reply(200, await this.crossHostGroups.getState(userId, groupId, url.searchParams.get("directory") !== "0")); return; }
+        if (!memberKeyParam && req.method === "POST") { await reply(200, await this.crossHostGroups.addMember(userId, groupId, await this.jsonBody(req))); return; }
+        if (memberKeyParam && sub === "session" && req.method === "PATCH") { await reply(200, await this.crossHostGroups.switchMemberSession(userId, groupId, memberKeyParam, await this.jsonBody(req))); return; }
+        if (memberKeyParam && !sub && req.method === "DELETE") { await reply(200, await this.crossHostGroups.removeMember(userId, groupId, memberKeyParam)); return; }
+      }
+      const groupDesignatedRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/designated$/);
+      if (groupDesignatedRoute && req.method === "PUT") { await reply(200, await this.crossHostGroups.setDesignatedMember(userId, groupDesignatedRoute[1]!, await this.jsonBody(req))); return; }
+      const groupRoomsRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/rooms$/);
+      if (groupRoomsRoute && req.method === "POST") { await reply(201, await this.crossHostGroups.createRoom(userId, groupRoomsRoute[1]!, await this.jsonBody(req))); return; }
+      const groupStopRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/stop$/);
+      if (groupStopRoute && req.method === "POST") { await reply(200, await this.crossHostGroups.stopGroup(userId, groupStopRoute[1]!)); return; }
+      const groupQuestionRetryRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/questions\/([A-Za-z0-9_-]+)\/retry$/);
+      if (groupQuestionRetryRoute && req.method === "POST") { await reply(200, await this.crossHostGroups.reconcileOrRetryQuestion(userId, groupQuestionRetryRoute[1]!, groupQuestionRetryRoute[2]!)); return; }
       const discussionRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/discussion(?:\/([A-Za-z0-9_-]+)\/(control|notes|steps\/([A-Za-z0-9_-]+)))?$/);
       if (discussionRoute && (req.method === "POST" ? !discussionRoute[3] || discussionRoute[3] === "control" || discussionRoute[3] === "notes" : req.method === "GET" && (!discussionRoute[2] || !!discussionRoute[4]))) {
         const conversationId = discussionRoute[1]!, runId = discussionRoute[2];

@@ -85,6 +85,7 @@ export class HubAuth {
   signBotPassport(p: BotPassport): string { return sign(null, Buffer.from(botPassportProof(p)), this.privateKey).toString("base64"); }
   signBotChallenge(nonce: string): string { return sign(null, Buffer.from(botChallengeProof(this.publicKey, nonce)), this.privateKey).toString("base64"); }
   signBotReply(nonce: string, result: unknown): string { return sign(null, Buffer.from(botReplyProof(nonce, result)), this.privateKey).toString("base64"); }
+  signGroupMail(payload: string): string { return sign(null, Buffer.from(payload), this.privateKey).toString("base64"); }
   private prune(): void {
     const now = this.now();
     for (const [id, c] of this.challenges) if (c.expiresAt < now) this.challenges.delete(id);

@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUp, Check, ListOrdered, MessageSquare, MessagesSquare, PanelsTopLeft } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, ListOrdered, MessageSquare, MessagesSquare, PanelsTopLeft, UserCheck } from "lucide-react";
 import { useRef } from "react";
 import type { GroupDiscussionPolicy } from "../../src/client-protocol/group-discussion.js";
 import { GROUP_DISCUSSION_MAX_MEMBERS, automaticGroupDiscussion } from "../../src/client-protocol/group-discussion.js";
@@ -15,8 +15,9 @@ export function GroupDiscussionOptions({ value, change, bots, disabled, parallel
 }) {
   const orderList = useRef<HTMLOListElement>(null);
   const modes = [
-    { id: "mentions" as const, title: t("普通群聊"), description: t("@ 谁，谁回应；不 @ 时只记录发言。"), icon: MessageSquare },
-    { id: "parallel" as const, title: t("并行回复"), description: t("不 @ 时全员各自回复你；@ 谁就只让谁回复，不互相讨论。"), icon: MessagesSquare },
+    { id: "designated" as const, title: t("指定 Bot 回复"), description: t("默认由一位指定成员回复，@ 其他成员时由对方回应。"), icon: UserCheck },
+    { id: "parallel" as const, title: t("全员回复"), description: t("不 @ 时全员各自回复你；@ 谁就只让谁回复，不互相讨论。"), icon: MessagesSquare },
+    { id: "mentions" as const, title: t("仅 @ 回复"), description: t("@ 谁，谁回应；不 @ 时只记录发言。"), icon: MessageSquare },
     { id: "sequential" as const, title: t("轮流讨论"), description: t("按顺序回应，参考前面的观点。"), icon: ListOrdered },
     { id: "independent" as const, title: t("独立评议"), description: t("先各自思考，收齐观点后再讨论。"), icon: PanelsTopLeft },
   ];

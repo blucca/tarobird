@@ -356,7 +356,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     side: ["bot", "text", "text-file", "file", "timeout", "request-id"],
     changes: ["bot", "path", "preview", "message", "operation"],
     bus: ["from", "revision", "text-file", "request-id", "run", "yes", "coordinator", "members", "abandon"],
-    groups: ["from", "revision", "text-file", "file", "run", "request-id", "reply-to", "participants", "supersedes", "then", "if-running"],
+    groups: ["from", "revision", "text-file", "file", "run", "request-id", "reply-to", "participants", "supersedes", "then", "if-running", "host", "bot", "session", "member", "history", "new-session", "title"],
   };
   for (const key of Object.keys(v)) if (!["state-dir", "json", "help", ...(allowed[command] ?? [])].includes(key)) throw new Error(`此命令不支持 --${key}。请执行 tarobot --help。`);
   let piSessionUpdate: Omit<PiSessionChange, "botId"> | undefined;
