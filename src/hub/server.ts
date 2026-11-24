@@ -92,6 +92,8 @@ import { workspaceChangesQuerySchema, workspaceFileDiffQuerySchema } from "../cl
 import { nodeFrameReader, writeFrame } from "../client-protocol/fragments-node.js";
 import { linkUrlSchema } from "../client-protocol/links.js";
 import { HubLinkPreviews } from "./link-previews.js";
+import { HOST_RESOURCES_PATH, HOST_RESOURCES_STOP_PATH, hostResourceStopRequestSchema } from "../client-protocol/host-resources.js";
+import { HubHostResources, type OsProcessSample } from "./host-resources.js";
 import { BotManager, createBotSchema, type BotManagerOptions } from "./bot-manager.js";
 import { deleteBotSchema, renameBotSchema } from "../client-protocol/bots.js";
 import { type RouteAlert } from "./route-monitor.js";
@@ -153,13 +155,14 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
 type BotConnection = { botSteer: boolean; engineQuota: boolean; contextUsage: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
-export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
+export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; hostResourcesSampler?: () => Promise<OsProcessSample[]>; hostResourcesBotPids?: () => Map<string, number>; hostResourcesKillPid?: (pid: number) => Promise<void>; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
 export class HubServer {
   private readonly relaySources: RelaySources;
   private readonly fragmentSockets = new WeakSet<WebSocket>();
   private readonly requestGuards = new WeakMap<IncomingMessage, () => Promise<void>>();
   private readonly downloads = new Map<AbortController, AuthSession>();
   readonly http: Server;
+  readonly hostResources: HubHostResources;
   readonly linkPreviews: HubLinkPreviews;
   readonly fileCenter: HubFileCenter;
   readonly workspaceDiff: HubWorkspaceDiff;
@@ -356,6 +359,16 @@ export class HubServer {
       exchange: options.networkExchange ?? ((host, request) => exchangeNetworkPeer(host, request, { signal: this.networkAbort.signal })),
     });
     this.hostRoutes = new HostRoutes({ store, network: this.network, publicKey: auth.publicKey, stateDir: options.stateDir, listeners: () => this.managedListeners() });
+    this.hostResources = new HubHostResources({
+      store,
+      childPids: options.hostResourcesBotPids ?? (() => this.botManager?.childPids() ?? new Map()),
+      stopBotTurn: async (botId, conversationId, userId) => {
+        const result = z.object({ stopped: z.boolean() }).parse(await this.callBot(botId, "stop", { conversationId, userId }));
+        return result.stopped;
+      },
+      sampleProcesses: options.hostResourcesSampler,
+      killPid: options.hostResourcesKillPid,
+    });
     const conversationsCreated = (userId: string, conversations: Conversation[]) => {
       for (const conversation of conversations) for (const c of this.clients) if (c.session?.userId === userId && (!conversation.hidden || c.capabilities.includes(DISPATCH_CAPABILITY))) { c.conversationIds.add(conversation.id); this.publishClient(c, { v: 1, type: "conversation.updated", conversation }); }
     };
@@ -1802,6 +1815,19 @@ export class HubServer {
         const query = z.string().max(200).parse(url.searchParams.get("q") ?? "");
         const includeScopes = url.searchParams.get("scopes") === "1";
         await reply(200, await new RunJournal(this.store).read(userId, runRoute[1]!, after, query, includeScopes, { tail, before })); return;
+      }
+      if (route === HOST_RESOURCES_PATH && req.method === "GET") {
+        await validate();
+        const user = await this.store.user(userId);
+        const force = url.searchParams.get("force") === "1";
+        await reply(200, await this.hostResources.snapshot(userId, user?.role === "owner", force));
+        return;
+      }
+      if (route === HOST_RESOURCES_STOP_PATH && req.method === "POST") {
+        await requireOwner();
+        const input = hostResourceStopRequestSchema.parse(await this.jsonBody(req));
+        await reply(200, await this.hostResources.stop(userId, input));
+        return;
       }
       if (route === "/api/host-profile" && (req.method === "GET" || req.method === "PATCH")) {
         if (req.method === "GET") await reply(200, await this.profile.read(validateInQueue));

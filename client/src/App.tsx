@@ -149,6 +149,7 @@ import { UserReplyStatus } from "./UserReplyStatus.js";
 import { userReplyStatuses } from "./user-reply-status.js";
 import { FileCenter } from "./FileCenter.js";
 import { OperationsPanel } from "./OperationsPanel.js";
+import { DesktopResourcesBar, MobileResourcesDialog } from "./ResourcesPanel.js";
 import { startDesktopUpdateChecks } from "./DesktopUpdates.js";
 import { installPushActions } from "./notifications.js";
 import { runtimeHostId } from "./host-registry.js";
@@ -294,7 +295,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const [menu, setMenu] = useState<"create" | "workspace" | "chat" | "recipients">();
   const closeMenu = () => setMenu(undefined), toggleMenu = (kind: NonNullable<typeof menu>) => setMenu((open) => open === kind ? undefined : kind);
   const menuId = useId(), createTrigger = useRef<HTMLButtonElement>(null), workspaceTrigger = useRef<HTMLButtonElement>(null), recipientTrigger = useRef<HTMLButtonElement>(null);
-  const chatVisible = visible && (!phone || !sidebar); const [scheduledTasks, setScheduledTasks] = useState<"create" | "list">(); const [newBot, setNewBot] = useState(false); const [newChat, setNewChat] = useState<ConversationCreation>();
+  const chatVisible = visible && (!phone || !sidebar); const [scheduledTasks, setScheduledTasks] = useState<"create" | "list">(); const [newBot, setNewBot] = useState(false); const [newChat, setNewChat] = useState<ConversationCreation>(); const [resourcesOpen, setResourcesOpen] = useState(false);
   const { messages, readRevision: historyRevision, ready: messagesReady, failed: messageReadFailed, retry: retryMessageRead } = useConversationMessages(connection, selected, chatVisible, true);
   const [individualBackgroundRecords, setIndividualBackgroundRecords] = useState(false);
   const backgroundGroups = useMemo(() => groupBackgroundTasks(messages, state.runGroupsAvailable !== false && !individualBackgroundRecords), [messages, state.runGroupsAvailable, individualBackgroundRecords]);
@@ -1760,7 +1761,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     settingsBot={(hostId, botId) => { if (shell && hostId !== shell.host.id) shell.mobileSelect(hostId, { kind: "bot-settings", botId }); else showBotSettings([botId], document.activeElement as HTMLElement | null); }}
     create={(kind) => { if (shell) shell.create(kind); else if (kind === "bot") setNewBot(true); else if (kind === "schedule") setScheduledTasks("create"); else setNewChat({ kind }); }}
     selectHost={(hostId) => shell?.mobileSelect(hostId, { kind: "home" })}
-    open={(kind) => { if (kind === "settings" || kind === "notifications" || kind === "devices" || kind === "connection" || kind === "screen") { setSettingsFromMenu(false); setSettingsSection(kind === "notifications" ? "notifications" : kind === "devices" ? "devices" : kind === "connection" ? "connection" : kind === "screen" ? "screen" : "general"); setSettings(true); } else if (kind === "files") setFileCenter(true); else if (kind === "capabilities") { setDetailBot(undefined); setCapabilities(true); } else if (kind === "schedules") setScheduledTasks("list"); else if (kind === "operations") setOperations(true); else if (kind === "archives") setArchives(true); else if (kind === "hosts") shell?.manageHosts(); }}
+    open={(kind) => { if (kind === "settings" || kind === "notifications" || kind === "devices" || kind === "connection" || kind === "screen") { setSettingsFromMenu(false); setSettingsSection(kind === "notifications" ? "notifications" : kind === "devices" ? "devices" : kind === "connection" ? "connection" : kind === "screen" ? "screen" : "general"); setSettings(true); } else if (kind === "files") setFileCenter(true); else if (kind === "capabilities") { setDetailBot(undefined); setCapabilities(true); } else if (kind === "schedules") setScheduledTasks("list"); else if (kind === "operations") setOperations(true); else if (kind === "resources") setResourcesOpen(true); else if (kind === "archives") setArchives(true); else if (kind === "hosts") shell?.manageHosts(); }}
     searchHistory={(text) => { setSearchConversation(undefined); setQuery(text); setSearchBot(""); setSearchFrom(""); setSearchTo(""); setSearchFiles(false); setSidebar(false); setFocusTarget(undefined); historySearch.start(new URLSearchParams({ q: text }).toString(), ""); }}/></Suspense>}
   <main ref={attachmentDrop.ref} className={`conversation-main${attachmentDrop.hover ? " is-file-drop-target" : ""}`} {...attachmentDrop.events}>{searching ? <header className="conversation-header history-search-header">
     {phone ? <button className="icon-button" aria-label={t("打开会话列表")} onClick={exitHistorySearch}><ChevronLeft size={24}/></button> : <Search className="history-search-symbol" size={20} aria-hidden="true"/>}
@@ -1904,6 +1905,8 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     setCapabilityHelp(undefined); setCapabilities(false); setSidebar(false); closeSearch(); setFocusTarget(undefined); if (!phone) pendingComposerFocus.current = conversation.id;
   }}/> }
   {operations && <OperationsPanel connection={connection} initialBot={operationBot} initialView={operationBot?.view} close={() => { setOperations(false); setOperationBot(undefined); }}/> }
+  {!phone && !pane && state.hostResourcesAvailable && <DesktopResourcesBar hosts={shell?.resourceHosts?.length ? shell.resourceHosts : [{ id: shell?.host.id ?? "local", name: hostName, connection }]} activeHostId={shell?.host.id ?? "local"} visible={visible} />}
+  {phone && resourcesOpen && <MobileResourcesDialog connection={connection} hostName={hostName} close={() => setResourcesOpen(false)} />}
   <MessageContextMenu historyActions={history.messageActions} opened={(message) => {
     history.inspect(message);
     readHistory(true);
