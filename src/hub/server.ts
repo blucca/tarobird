@@ -89,6 +89,9 @@ import { fileLabelPatchSchema, fileUnitIdSchema } from "../client-protocol/file-
 import { HubFileCenter, type FileCenterRoots } from "./file-center.js";
 import { HubWorkspaceDiff } from "./workspace-diff.js";
 import { workspaceChangesQuerySchema, workspaceFileDiffQuerySchema } from "../client-protocol/workspace-diff.js";
+import { SavedWorkspaces, resolveExistingWorkspaceDirectory } from "./saved-workspaces.js";
+import { botWorkspacePatchSchema, botWorkspaceResultSchema } from "../client-protocol/saved-workspaces.js";
+import { workspaceSettings } from "../runtime/workspace-settings.js";
 import { nodeFrameReader, writeFrame } from "../client-protocol/fragments-node.js";
 import { linkUrlSchema } from "../client-protocol/links.js";
 import { HubLinkPreviews } from "./link-previews.js";
@@ -163,6 +166,7 @@ export class HubServer {
   readonly linkPreviews: HubLinkPreviews;
   readonly fileCenter: HubFileCenter;
   readonly workspaceDiff: HubWorkspaceDiff;
+  readonly savedWorkspaces: SavedWorkspaces;
   readonly runChanges: HubRunChanges;
   readonly engineSettings: HubEngineSettings;
   readonly widgetSettings: HubWidgetSettings;
@@ -387,11 +391,12 @@ export class HubServer {
     this.conversationFolders = new ConversationFolders(store.db);
     this.avatars = new HubAvatars(store);
     this.linkPreviews = new HubLinkPreviews(store, attachments);
+    this.savedWorkspaces = new SavedWorkspaces(store);
     this.workspaceDiff = new HubWorkspaceDiff(async (botId, remainingMs) => {
       const deadline = Date.now() + remainingMs;
       if (this.botManager && await this.botManager.owns(botId)) return path.join(options.stateDir, "bots", botId);
       return z.object({ stateDir: z.string().refine(path.isAbsolute) }).parse(await this.callBot(botId, "files.root", {}, Math.max(1, deadline - Date.now()))).stateDir;
-    });
+    }, { conversationWorkspace: conversationId => store.conversationWorkspacePath(conversationId) });
     this.fileCenter = new HubFileCenter(options.stateDir, async () => {
       const result: FileCenterRoots = { instances: [], warnings: [] };
       for (const bot of await store.bots("owner")) {
@@ -1030,10 +1035,36 @@ export class HubServer {
     ws.on("error", () => { this.options.onWarning?.("client_socket_error"); });
     ws.on("close", () => { if (client.session) { this.workbench.unregister(this.workbenchPeer(client));this.designSharing.disconnect(this.designSharePeer(client)); } clearTimeout(timeout); client.pendingPublications.length = 0; this.auth.forgetConnection(id); this.clients.delete(client); });
   }
+  private async resolveBotDefaultWorkspace(botId: string): Promise<string | undefined> {
+    if (this.botManager && await this.botManager.owns(botId)) {
+      const stateDir = path.join(this.options.stateDir, "bots", botId);
+      const read = await workspaceSettings(stateDir, 0).catch(() => undefined);
+      if (read?.ok) return read.settings.workspacePath;
+    }
+    if (this.bots.get(botId)?.ready) {
+      const read = await this.callBot(botId, "workspace.get", {}).then(raw => botWorkspaceResultSchema.parse(raw)).catch(() => undefined);
+      if (read?.ok) return read.settings.workspacePath;
+    }
+    const row = await this.store.db.serial(() => this.store.db.get<{ workspace_path: string | null }>("SELECT workspace_path FROM bots WHERE id=?", [botId]));
+    return row?.workspace_path?.trim() || undefined;
+  }
   private async createConversation(userId: string, frame: Extract<ClientFrame, { type: "conversation.create" | "topic.create" }>, validate: () => Promise<unknown>) {
+    let workspacePath: string | undefined;
+    if (frame.type === "conversation.create") {
+      if (frame.workspacePath) {
+        await this.store.db.serial(() => this.store.requireOwner(userId));
+        workspacePath = await resolveExistingWorkspaceDirectory(frame.workspacePath);
+        await this.savedWorkspaces.touch(userId, workspacePath);
+      } else {
+        const type = frame.conversationType ?? (frame.botIds.length === 1 ? "direct" : "group");
+        if (type === "direct" && frame.botIds.length === 1) {
+          workspacePath = await this.resolveBotDefaultWorkspace(frame.botIds[0]!);
+        }
+      }
+    }
     const conversation = frame.type === "topic.create"
       ? await this.store.createConversation(userId, [], frame.title, frame.clientActionId, { parentId: frame.groupId }, validate)
-      : await this.store.createConversation(userId, frame.botIds, frame.title, frame.clientActionId, { type: frame.conversationType }, validate);
+      : await this.store.createConversation(userId, frame.botIds, frame.title, frame.clientActionId, { type: frame.conversationType, ...(workspacePath ? { workspacePath } : {}) }, validate);
     for (const c of this.clients) if (c.session && (c.session.userId === userId || conversation.parentId && c.conversationIds.has(conversation.parentId))) { c.conversationIds.add(conversation.id); this.publishClient(c, { v: 1, type: "conversation.updated", conversation, ...(c.session.userId === userId ? { clientActionId: frame.clientActionId } : {}) }); }
     return conversation;
   }
@@ -1302,7 +1333,12 @@ export class HubServer {
           // Issue #62: open Bot steers learn their journaled outcome now, not on the sender's next wait.
           if (connection.botSteer) this.trackTask(this.botMessages.reconcileForBot(botId).catch(() => this.options.onWarning?.("bot_steer_reconcile_failed")));
           else this.trackTask(this.botMessages.closeOpenSteersForBot(botId, "worker_without_steer").catch(() => this.options.onWarning?.("bot_steer_close_failed")));
-          this.scheduleDispatch(botId); await this.broadcastBotStatus(botId); return;
+          this.scheduleDispatch(botId);
+          this.trackTask((async () => {
+            const ws = await this.resolveBotDefaultWorkspace(botId);
+            if (ws) await this.store.botStatus(botId, { workspacePath: ws });
+            await this.broadcastBotStatus(botId);
+          })().catch(() => undefined)); return;
         }
         if (!botId) throw new HubError("instance_unauthorized", 401);
         if (frame.type === "ping") {
@@ -2284,6 +2320,61 @@ export class HubServer {
       }
       const engineReset = route.match(/^\/api\/dispatch\/engines\/([a-z]+)\/reset$/);
       if (engineReset && req.method === "POST") { await requireOwner(); await reply(200, await this.dispatch.resetEngine(userId, engineReset[1], validateInQueue)); return; }
+      if (route === "/api/workspaces" && (req.method === "GET" || req.method === "POST")) {
+        await requireOwner();
+        if (req.method === "GET") { await reply(200, { items: await this.savedWorkspaces.list(userId) }); return; }
+        const added = await this.savedWorkspaces.add(userId, await this.jsonBody(req), validateInQueue);
+        await this.store.audit("workspace.saved", session.deviceId, { workspaceId: added.workspace.id });
+        await reply(201, added);
+        return;
+      }
+      if (route === "/api/workspaces/browse" && req.method === "GET") {
+        await requireOwner();
+        const target = url.searchParams.get("path") ?? undefined;
+        const showHidden = url.searchParams.get("showHidden") === "1";
+        await reply(200, await this.savedWorkspaces.browse(userId, target, showHidden));
+        return;
+      }
+      const workspaceItem = route.match(/^\/api\/workspaces\/([A-Za-z0-9_-]+)$/);
+      if (workspaceItem && req.method === "DELETE") {
+        await requireOwner();
+        const items = await this.savedWorkspaces.remove(userId, workspaceItem[1]!, validateInQueue);
+        await this.store.audit("workspace.removed", session.deviceId, { workspaceId: workspaceItem[1]! });
+        await reply(200, { items });
+        return;
+      }
+      const botWorkspace = route.match(/^\/api\/bots\/([A-Za-z0-9_-]+)\/workspace$/);
+      if (botWorkspace && (req.method === "GET" || req.method === "PUT")) {
+        await requireOwner();
+        const botId = botWorkspace[1]!;
+        if (!(await this.store.bots(userId)).some(bot => bot.id === botId)) throw new HubError("bot_forbidden", 403);
+        const input = req.method === "PUT" ? botWorkspacePatchSchema.parse(await this.jsonBody(req)) : {};
+        const managed = this.botManager ? await this.botManager.owns(botId) : false;
+        const readOrWrite = async (method: "workspace.get" | "workspace.set", payload: unknown) => {
+          if (this.bots.get(botId)?.ready) return botWorkspaceResultSchema.parse(await this.callBot(botId, method, payload));
+          if (managed) return workspaceSettings(path.join(this.options.stateDir, "bots", botId), 0, method === "workspace.set" ? payload : undefined);
+          throw new HubError("bot_offline", 503);
+        };
+        const previousWorkspace = req.method === "PUT" ? await this.resolveBotDefaultWorkspace(botId) : undefined;
+        const result = await readOrWrite(req.method === "PUT" ? "workspace.set" : "workspace.get", input);
+        if (!result.ok) throw new HubError(result.error, result.error === "workspace_unavailable" ? 400 : 409);
+        if (req.method === "PUT") {
+          if (previousWorkspace && previousWorkspace !== result.settings.workspacePath) {
+            const pinned = await this.store.pinUnassignedBotConversations(botId, previousWorkspace);
+            for (const conversation of pinned) {
+              for (const c of this.clients) if (c.conversationIds.has(conversation.id)) this.publishClient(c, { v: 1, type: "conversation.updated", conversation });
+            }
+          }
+          await this.store.botStatus(botId, { workspacePath: result.settings.workspacePath });
+          await this.savedWorkspaces.touch(userId, result.settings.workspacePath);
+          await this.broadcastBotStatus(botId);
+          await this.store.audit("bot.workspace_updated", session.deviceId, { botId });
+        } else {
+          await this.store.botStatus(botId, { workspacePath: result.settings.workspacePath }).catch(() => undefined);
+        }
+        await reply(200, result.settings);
+        return;
+      }
       const persona = route.match(/^\/api\/bots\/([A-Za-z0-9_-]+)\/persona$/);
       if (persona && (req.method === "GET" || req.method === "PUT")) {
         await requireOwner();

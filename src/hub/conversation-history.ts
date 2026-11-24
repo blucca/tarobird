@@ -225,7 +225,7 @@ export class HubConversationHistory {
         // managed Bots are created with locale zh.
         const forks = action.title ? [] : await this.store.db.all<{ title: string }>("SELECT title FROM conversations WHERE json_extract(history_origin_json,'$.sourceConversationId')=?", [row.source_conversation_id]);
         const title = action.title ?? numberedForkTitle(`${source.title.slice(0, 230)} · 分叉`, forks.map(fork => fork.title));
-        const destination = await this.store.createConversationInTransaction(row.owner_id, [row.bot_id], title, `fork_${id}`, { type: "direct" });
+        const destination = await this.store.createConversationInTransaction(row.owner_id, [row.bot_id], title, `fork_${id}`, { type: "direct", ...(source.workspacePath ? { workspacePath: source.workspacePath } : {}) });
         const anchor = row.anchor_json ? historyAnchorEvidenceSchema.parse(JSON.parse(row.anchor_json)) : undefined;
         const origin = { operationId: id, sourceConversationId: row.source_conversation_id, sourceRevision: row.expected_revision, ...(anchor ? { sourceMessageId: anchor.messageId } : {}), boundary: action.scope === "whole" ? "whole" : result.forkBoundary ?? "before-input" };
         await this.store.db.run("UPDATE conversations SET history_origin_json=? WHERE id=?", [JSON.stringify(origin), destination.id]);

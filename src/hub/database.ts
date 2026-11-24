@@ -70,6 +70,7 @@ export class HubDatabase {
         const botColumns = await result.all<{ name: string }>("PRAGMA table_info(bots)");
         if (!botColumns.some(c => c.name === "deleted_at")) await result.exec("ALTER TABLE bots ADD COLUMN deleted_at INTEGER");
         if (!botColumns.some(c => c.name === "role")) await result.exec("ALTER TABLE bots ADD COLUMN role TEXT NOT NULL DEFAULT ''");
+        if (!botColumns.some(c => c.name === "workspace_path")) await result.exec("ALTER TABLE bots ADD COLUMN workspace_path TEXT");
         const messageColumns = await result.all<{ name: string }>("PRAGMA table_info(messages)");
         if (!messageColumns.some(c => c.name === "history_json")) await result.exec("ALTER TABLE messages ADD COLUMN history_json TEXT");
         if (!messageColumns.some(c => c.name === "bot_source_json")) await result.exec("ALTER TABLE messages ADD COLUMN bot_source_json TEXT");
@@ -98,6 +99,7 @@ export class HubDatabase {
         if (!conversationColumns.some((c) => c.name === "binding_id")) await result.exec("ALTER TABLE conversations ADD COLUMN binding_id TEXT");
         if (!conversationColumns.some((c) => c.name === "hidden")) await result.exec("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0");
         if (!conversationColumns.some((c) => c.name === "ticket_json")) await result.exec("ALTER TABLE conversations ADD COLUMN ticket_json TEXT");
+        if (!conversationColumns.some((c) => c.name === "workspace_path")) await result.exec("ALTER TABLE conversations ADD COLUMN workspace_path TEXT");
         if (version && Number(version.value) < 11) {
           // Old tombstones have empty blocks. Read their own retained events
           // in small pages, using the protocol's attachment traversal so button
@@ -345,6 +347,8 @@ CREATE INDEX IF NOT EXISTS dispatch_assists_child ON dispatch_assists(child_atte
 CREATE INDEX IF NOT EXISTS dispatch_assists_continuation ON dispatch_assists(continuation_attempt_id) WHERE continuation_attempt_id IS NOT NULL;
 -- Assistance allowed since the ticket's latest dispatch; continuations keep it.
 CREATE TABLE IF NOT EXISTS dispatch_assist_windows (ticket_id TEXT PRIMARY KEY REFERENCES dispatch_tickets(id), attempt_id TEXT NOT NULL, remaining INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS saved_workspaces (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL, path TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL, UNIQUE(owner_id,path));
+CREATE INDEX IF NOT EXISTS saved_workspaces_owner ON saved_workspaces(owner_id,last_used_at DESC,created_at DESC);
 ${MESSAGE_ACTIVITY_SCHEMA}
 ${EVENT_HISTORY_SCHEMA}
 `;

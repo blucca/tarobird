@@ -5,7 +5,7 @@ type Result<T> = { connection: HubConnection; botId: string; data?: T; pending?:
 /** Settings reads can be abandoned; saves retain an explicit, bounded receipt.
  * A response belongs to one connection and Bot even if membership changes while
  * its request is in flight. Aborting a save does not imply it was rolled back. */
-export function useBotSettingsRequest<T>(connection: HubConnection, botId: string, kind: "permissions" | "effort" | "persona" | "model" | "chrome" | "dispatcher", schema: { parse: (raw: unknown) => T }, retainReadData = false) {
+export function useBotSettingsRequest<T>(connection: HubConnection, botId: string, kind: "permissions" | "effort" | "persona" | "model" | "chrome" | "dispatcher" | "workspace", schema: { parse: (raw: unknown) => T }, retainReadData = false) {
   const [result, setResult] = useState<Result<T>>({ connection, botId });
   const current = useRef<{ controller: AbortController; timer: ReturnType<typeof setTimeout>; method: "GET" | "PUT" } | undefined>(undefined);
   const cancel = useCallback(() => {

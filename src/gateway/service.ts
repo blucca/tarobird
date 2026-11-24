@@ -47,6 +47,7 @@ import { GatewayReceipts } from "./receipts.js";
 import { gatewayActiveWorkCount } from "./activity.js";
 import { effortSettings } from "../runtime/effort-settings.js";
 import { modelSettings } from "../runtime/model-settings.js";
+import { workspaceSettings } from "../runtime/workspace-settings.js";
 import { appTurnInstructions, botMessageQuestionInstructions, dispatcherExecutionInstructions, dispatcherInstructions, workerExecutionInstructions, type AppInstructionOptions } from "./agent-instructions.js";
 import { mergeTurnInstructions } from "../core/agent-instructions.js";
 import { stripAlreadyDeliveredAppArtifacts, type AppDeliveryReceipt } from "./app-delivery.js";
@@ -283,6 +284,10 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     if (method === "context.usage") return z.json().parse(await contextUsage(raw));
     if (method === "pi.session.get" || method === "pi.session.set") return z.json().parse(await piSession(method, raw));
     if (["side.status", "side.open", "side.read", "side.ask", "side.stop", "side.close"].includes(method)) return z.json().parse(await sideSessions!.call(method, raw));
+    if (method === "workspace.get" || method === "workspace.set") {
+      if (method === "workspace.get") z.object({}).strict().parse(raw);
+      return z.json().parse(await workspaceSettings(options.stateDir, activeWorkCount, method === "workspace.set" ? raw : undefined));
+    }
     if (method === "persona.get" || method === "persona.set") {
       if (method === "persona.get") z.object({}).strict().parse(raw);
       return z.json().parse(await personaSettings(options.stateDir, activeWorkCount, method === "persona.set" ? raw : undefined));

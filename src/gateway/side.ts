@@ -28,7 +28,7 @@ export function instanceAttachmentDownload(transport: { httpUrl: string; authHea
   };
 }
 
-export function gatewaySideSessions(bridge: CoreBridgeLike, stateDir: string, botId: string, bindingReady: (conversationId: string) => Promise<boolean>, download?: SideAttachmentDownload, transcribe?: SideTranscribe, channel?: Pick<GatewayChannel, "uploadSideArtifact">) {
+export function gatewaySideSessions(bridge: CoreBridgeLike, stateDir: string, botId: string, bindingReady: (conversationId: string) => Promise<boolean>, download?: SideAttachmentDownload, transcribe?: SideTranscribe, channel?: Pick<GatewayChannel, "uploadSideArtifact"> & Partial<Pick<GatewayChannel, "conversationWorkspace">>) {
   // Private copies sit beside ordinary inbound files, under per-handle names
   // that never collide with message directories; Hub uploads are untouched.
   const attachmentRoot = workspaceArtifactRoot(stateDir, "input", "gateway");
@@ -48,14 +48,16 @@ export function gatewaySideSessions(bridge: CoreBridgeLike, stateDir: string, bo
       if (!await bindingReady(scope.conversationId)) throw new SideSessionError("no_main_session");
       const cfg = await config(), conversationKey = buildCoreConversationKey(scope.conversationId);
       if (!bridge.openSideSession) throw new SideSessionError("unsupported");
-      return bridge.openSideSession({ chatId: stableCoreNumericId(conversationKey), conversationKey, userId: stableCoreNumericId(`user:gwuser_${scope.userId}`), chatType: "bus", locale: cfg.locale === "zh" ? "zh" : "en", workspaceOverride: resolveInstanceWorkspacePath(cfg), ...(tools === "inherited" ? { tools } : {}), abortSignal });
+      const workspaceOverride = (await channel?.conversationWorkspace?.(scope.conversationId)) ?? resolveInstanceWorkspacePath(cfg);
+      return bridge.openSideSession({ chatId: stableCoreNumericId(conversationKey), conversationKey, userId: stableCoreNumericId(`user:gwuser_${scope.userId}`), chatType: "bus", locale: cfg.locale === "zh" ? "zh" : "en", workspaceOverride, ...(tools === "inherited" ? { tools } : {}), abortSignal });
     },
     ...(channel ? { deliveryTools: async (scope: SideScope, _sideId: string, _requestId: string, signal: AbortSignal, publish: Parameters<typeof createSideDeliveryTools>[0]["publish"]) => {
       const cfg = await config();
       if (signature(cfg) !== fingerprint) throw new SideSessionError("expired");
       let budget = deliveryBudgets.get(scope);
       if (!budget) { budget = { bytes: 0, files: 0 }; deliveryBudgets.set(scope, budget); }
-      return createSideDeliveryTools({ channel, stateDir, workspaceOverride: resolveInstanceWorkspacePath(cfg), conversationId: scope.conversationId, signal, budget, publish });
+      const workspaceOverride = (await channel.conversationWorkspace?.(scope.conversationId)) ?? resolveInstanceWorkspacePath(cfg);
+      return createSideDeliveryTools({ channel, stateDir, workspaceOverride, conversationId: scope.conversationId, signal, budget, publish });
     } } : {}),
     beforeAsk: async () => {
       const cfg = await config();

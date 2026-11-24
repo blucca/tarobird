@@ -49,7 +49,7 @@ export function gatewayConversationHistory(bridge: HistoryBridge, channel: Gatew
       const config = await readConfig();
       // A legacy global resume belongs to one conversation only. Its scoped
       // fallback is resolved by the controller, not copied into every request.
-      const workspaceOverride = config.workspacePath?.trim();
+      const workspaceOverride = (await channel.conversationWorkspace?.(p.conversationId))?.trim() || config.workspacePath?.trim();
       if (workspaceOverride) scope.workspaceOverride = workspaceOverride;
       const result = historyInternalSnapshotSchema.parse(await bridge.getConversationHistory(scope));
       if (!await authorized()) throw new Error("history_forbidden");
@@ -97,7 +97,7 @@ export function gatewayConversationHistory(bridge: HistoryBridge, channel: Gatew
     const reservation = await receipts.run(`${key}:identity`, async (): Promise<Json> => {
       try {
         const config = await readConfig();
-        const workspaceOverride = config.workspacePath?.trim();
+        const workspaceOverride = (await channel.conversationWorkspace?.(p.conversationId))?.trim() || config.workspacePath?.trim();
         return { identity, ...(workspaceOverride ? { workspaceOverride } : {}) };
       } catch {
         return { identity, workspaceUnreadable: true };

@@ -121,7 +121,8 @@ import { lazy, Suspense, useCallback, useContext, useEffect, useId, useLayoutEff
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import { createReadingScroll } from "./reading-scroll.js";
 import { useConnectionSelection } from "./connection-selection.js";
-import { CalendarClock, Activity, Archive, ArrowLeft, AtSign, FolderInput, FolderOpen, ArrowUp, CornerDownLeft, Compass, Bot as BotIcon, Check, ChevronDown, ChevronLeft, ChevronRight, CircleStop, Copy, Forward, Hash, LoaderCircle, MoreHorizontal, MessageSquare, MessageSquarePlus, Monitor, MonitorPlay, PanelRight, Pencil, Plug, Plus, RotateCcw, Search, Settings, ShieldCheck, Trash2, Users, Wifi, WifiOff, X, MonitorCog } from "lucide-react";
+import { CalendarClock, Activity, Archive, ArrowLeft, AtSign, Folder, FolderInput, FolderOpen, ArrowUp, CornerDownLeft, Compass, Bot as BotIcon, Check, ChevronDown, ChevronLeft, ChevronRight, CircleStop, Copy, Forward, Hash, LoaderCircle, MoreHorizontal, MessageSquare, MessageSquarePlus, Monitor, MonitorPlay, PanelRight, Pencil, Plug, Plus, RotateCcw, Search, Settings, ShieldCheck, Trash2, Users, Wifi, WifiOff, X, MonitorCog } from "lucide-react";
+import { workspaceDisplayName } from "../../src/client-protocol/saved-workspaces.js";
 import { BrandName } from "./BrandScenes.js";
 import { DirectEmpty, WelcomeHome } from "./ChatEmpty.js";
 import { blocksText, messageSchema, type Conversation, type Message } from "../../src/client-protocol/index.js";
@@ -1769,6 +1770,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     <div className="header-heading-row"><h1 aria-label={current?.title}>{current ? <button ref={detailTrigger} className="chat-identity" aria-label={t("查看对话详情")} aria-expanded={details} onClick={() => setDetails(value => !value)}><ConversationAvatar conversation={current} size={30}/><span title={current.title}>{current.title}</span><ChevronDown size={14}/></button> : t("欢迎回来")}</h1>
       {pane?.headerMeta}
       {!phone && directBotName && <span className="header-bot-name" title={directBotName}><BotName id={directBotId!} name={directBotName} compact/></span>}
+      {current?.workspacePath && <span className="header-workspace-name" title={current.workspacePath}><Folder size={12} aria-hidden="true"/><span>{workspaceDisplayName(current.workspacePath)}</span></span>}
       {current && <ReplyActivity group={!!group} names={streamingBots} offline={live && !!directBotId && state.bots.some(bot => bot.id === directBotId && !bot.online)}/>}
     </div>
   </div>{shell?.multiHost && phoneQuota ? <button type="button" className="header-host-source header-host-usage" aria-label={`${t("运行于 {0}", shell.host.name)}${t("，")}${quotaMarkLabel(phoneQuota.left)}`} onClick={openQuotaDetails}><HostSourceBadge name={shell.host.name} header/><QuotaBattery left={phoneQuota.left} height={11}/></button>

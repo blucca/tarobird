@@ -469,7 +469,7 @@ async function handleCoreLocalEngineCommand(
       role: cfg.role,
       model: cfg.model,
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
-      workspacePath: cfg.workspacePath,
+      workspacePath: input.workspaceOverride ?? normalized.workspaceOverride ?? cfg.workspacePath,
       resume: cfg.resume,
       ...(cfg.antigravityRuntime ? { antigravityRuntime: cfg.antigravityRuntime } : {}),
     },
@@ -505,6 +505,7 @@ async function handleCoreSessionCommand(
       cfg.resume,
     )
     : input.conversationResume ?? undefined;
+  const effectiveWorkspace = input.workspaceOverride ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
   return await handleLocalSessionCoreCommand({
     stateDir: input.stateDir,
     startedAt: Date.now(),
@@ -530,7 +531,7 @@ async function handleCoreSessionCommand(
     scanRecentSessions: input.runtime.sessionRuntime?.scanRecentSessions,
     scanRecentAntigravitySessions: input.runtime.sessionRuntime?.scanRecentAntigravitySessions,
     scanRecentKimiSessions: input.bridge.listExternalSessions
-      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+      ? async () => (await input.bridge.listExternalSessions!({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
           const modifiedAt = new Date(session.updatedAt ?? 0);
           return {
             sessionId: session.sessionId,
@@ -542,7 +543,7 @@ async function handleCoreSessionCommand(
         })
       : undefined,
     scanRecentDeepSeekSessions: input.bridge.listExternalSessions
-      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+      ? async () => (await input.bridge.listExternalSessions!({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
           const modifiedAt = new Date(session.updatedAt ?? 0);
           return {
             sessionId: session.sessionId,
@@ -554,7 +555,7 @@ async function handleCoreSessionCommand(
         })
       : undefined,
     scanRecentPiSessions: input.bridge.listExternalSessions
-      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+      ? async () => (await input.bridge.listExternalSessions!({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
           const modifiedAt = new Date(session.updatedAt ?? 0);
           return {
             sessionId: session.sessionId,

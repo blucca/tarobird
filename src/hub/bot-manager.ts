@@ -118,7 +118,16 @@ export class BotManager {
   }
   async restore(): Promise<void> {
     const rows = await this.store.db.serial(() => this.store.db.all<Managed>("SELECT m.* FROM managed_bots m JOIN bots b ON b.id=m.bot_id WHERE b.deleted_at IS NULL"));
-    for (const row of rows) { try { await this.prepare(row); this.launch(row.bot_id); } catch { await this.store.audit("bot.start_failed", null, { botId: row.bot_id }); } }
+    for (const row of rows) {
+      try {
+        await this.prepare(row);
+        const stateDir = path.join(this.directory, "bots", row.bot_id);
+        const cfg = await loadInstanceConfig(stateDir).catch(() => undefined);
+        const ws = cfg ? resolveInstanceWorkspacePath(cfg) ?? path.resolve(path.join(stateDir, "workspace")) : undefined;
+        if (ws) await this.store.botStatus(row.bot_id, { workspacePath: path.resolve(ws) }).catch(() => undefined);
+        this.launch(row.bot_id);
+      } catch { await this.store.audit("bot.start_failed", null, { botId: row.bot_id }); }
+    }
   }
   create(userId: string, input: CreateBotInput, validate?: TransactionGuard, options: { internal?: true; dispatcherId?: string } = {}) {
     const authorize = async () => { await validate?.(); await this.store.requireOwner(userId); };
@@ -165,9 +174,10 @@ export class BotManager {
         await this.store.db.serial(authorize);
         row = { bot_id: botId, owner_id: userId, request_id: spec.requestId, specification_json: JSON.stringify(spec) };
         const secret = await this.prepare(row);
+        const initialWorkspace = path.resolve(spec.workspace || path.join(this.directory, "bots", botId, "workspace"));
         await this.store.db.transaction(async () => {
           await authorize();
-          await this.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role) VALUES(?,?,?,?,?,?,?)", [botId, spec.name, hashSecret(secret), spec.engine, spec.model, spec.effort, spec.role ?? ""]);
+          await this.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role,workspace_path) VALUES(?,?,?,?,?,?,?,?)", [botId, spec.name, hashSecret(secret), spec.engine, spec.model, spec.effort, spec.role ?? "", initialWorkspace]);
           if (spec.role === "dispatcher") await saveDispatcherSettingsInTransaction(this.store.db, botId, spec.dispatcher ?? defaultDispatcherSettings());
           await this.store.db.run("INSERT INTO managed_bots VALUES(?,?,?,?)", [botId, userId, spec.requestId, row!.specification_json]);
           if (options.internal && options.dispatcherId && spec.role === "worker") await this.store.db.run("INSERT INTO dispatch_workers VALUES(?,?,?) ON CONFLICT(dispatcher_bot_id,engine) DO UPDATE SET bot_id=excluded.bot_id", [options.dispatcherId, spec.engine, botId]);

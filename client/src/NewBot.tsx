@@ -6,8 +6,10 @@ import { EngineSettings } from "./EngineSettings.js";
 import { PermissionSelect } from "./PermissionSelect.js";
 import { permissionOptions, type PermissionChoice } from "../../src/state/permission-options.js";
 import { useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
-import { Bot as BotIcon, LoaderCircle, SquareTerminal } from "lucide-react";
+import { Bot as BotIcon, Folder, LoaderCircle, SquareTerminal } from "lucide-react";
 import type { BotCatalog, CreateBotInput } from "../../src/client-protocol/bots.js";
+import { workspaceDisplayName } from "../../src/client-protocol/saved-workspaces.js";
+import { useSavedWorkspaces } from "./WorkspacePicker.js";
 import type { Bot, HubConnection } from "./connection.js";
 import { Avatar } from "./Avatar.js";
 import { CreationDialog } from "./CreationDialog.js";
@@ -58,6 +60,7 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
   // offer an explicit retry instead of requiring the dialog to be reopened.
   const [catalogError, setCatalogError] = useState<"offline" | "failed" | "forbidden" | "unsupported" | "settingsUnavailable">();
   const [catalogAttempt, setCatalogAttempt] = useState(0), [pathsOpen, setPathsOpen] = useState(false), [pathsBusy, setPathsBusy] = useState(false), [pathsDirty, setPathsDirty] = useState(false), online = state.status === "online";
+  const savedWorkspaces = useSavedWorkspaces(connection, online && !!state.savedWorkspacesAvailable && state.user?.role === "owner");
   useEffect(() => {
     if (catalog && loadedCatalog.current?.connection === connection && loadedCatalog.current.attempt === catalogAttempt) return;
     let alive = true; setCatalogError(undefined); setCatalogLoading(true);
@@ -141,7 +144,7 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
       </div>}
       {permissions && <PermissionSelect value={permission} choices={permissions.choices} defaultChoice={permissions.defaultChoice} change={setPermission}/>}
     </div>}
-    <details><summary>{t("高级设置")}</summary><label>{t("工作区（可选）")}<input value={workspace} placeholder={t("留空，自动创建独立工作区")} onChange={(e) => setWorkspace(e.target.value)} onBlur={() => { if ((engine === "pi" || engine === "deepseek") && !pending.current) reloadCatalog(); }}/></label><p className="new-bot-hint">{t("填写运行 Bot 的主机上的文件夹路径；主机在 VPS 时，请填写 VPS 路径。")}</p></details></fieldset>
+    <details><summary>{t("高级设置")}</summary><label>{t("工作区（可选）")}<input value={workspace} placeholder={t("留空，自动创建独立工作区")} onChange={(e) => setWorkspace(e.target.value)} onBlur={() => { if ((engine === "pi" || engine === "deepseek") && !pending.current) reloadCatalog(); }}/></label>{savedWorkspaces.items.some(item => item.exists !== false) && <div className="workspace-quick-chips">{savedWorkspaces.items.filter(item => item.exists !== false).map(item => <button key={item.id} type="button" className={`workspace-chip${workspace.trim() === item.path ? " is-selected" : ""}`} title={item.path} onClick={() => { setWorkspace(item.path); if ((engine === "pi" || engine === "deepseek") && !pending.current) reloadCatalog(); }}><Folder size={13} aria-hidden="true"/><span>{item.name || workspaceDisplayName(item.path)}</span></button>)}</div>}<p className="new-bot-hint">{t("填写运行 Bot 的主机上的文件夹路径；主机在 VPS 时，请填写 VPS 路径。")}</p></details></fieldset>
     <div className="new-bot-footer">
       {catalogLoading && <p role="status" className="new-bot-status"><LoaderCircle className="spin" size={14} aria-hidden="true"/>{t("正在读取可用引擎…")}</p>}
       {error && <p role="alert" className="error-text new-bot-alert">{error}</p>}
