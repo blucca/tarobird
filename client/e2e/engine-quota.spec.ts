@@ -175,11 +175,11 @@ test("constraint reset times expire the reading like the Gateway, without a refi
     snapshot.pools = []; snapshot.availability = "blocked"; snapshot.observedAt = new Date().toISOString(); snapshot.help = "codex_usage";
     snapshot.constraints = [{ code: "ordinary_usage_blocked", availability: "blocked", resetsAt: new Date(Date.now() + 4_000).toISOString() }];
     await f.open(); const coder = page.getByRole("region", { name: "Coding Bot · Codex", exact: true }), constraints = coder.locator(".quota-constraints");
-    await expect(coder.locator(".quota-state")).toHaveText("已读取"); await expect(constraints).toContainText("重置："); await expect(coder.locator(".quota-help")).toHaveCount(0);
+    await expect(coder.locator(".quota-state")).toHaveText("已读取"); await expect(constraints).toContainText("分钟后重置"); await expect(coder.locator(".quota-help")).toHaveCount(0);
     await expect(coder.locator(".quota-notice")).toHaveText("原生服务报告使用受限；窗口剩余量不代表可以继续请求。");
     const requests = f.requests();
     await expect(coder.locator(".quota-state")).toHaveText("待更新", { timeout: 8_000 });
-    await expect(constraints).toContainText("常规使用受限 · 已到重置时间，等待更新"); await expect(constraints).not.toContainText("重置：");
+    await expect(constraints).toContainText("常规使用受限 · 已到重置时间，等待更新"); await expect(constraints).not.toContainText("分钟后重置");
     await expect(coder.locator(".quota-notice")).toHaveText("上次读数：原生服务报告使用受限；窗口剩余量不代表可以继续请求。");
     await expect(coder.locator(".quota-help")).toContainText("/usage");
     await expect(coder).not.toContainText("剩余 100%");
