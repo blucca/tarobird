@@ -1,9 +1,10 @@
 import { screenControllerCode, screenModifierModeApplies, screenShortcuts, type ScreenModifierMode } from "../../src/client-protocol/screen-keys.js";
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Capacitor } from "@capacitor/core";
-import { Maximize, Maximize2, Minimize, Minimize2, X, Monitor, MoreHorizontal, ChevronDown, Unplug, Keyboard, Plug, MousePointer2, CornerDownLeft } from "lucide-react";
+import { Activity, Maximize, Maximize2, Minimize, Minimize2, X, Monitor, MoreHorizontal, ChevronDown, Unplug, Keyboard, Plug, MousePointer2, CornerDownLeft } from "lucide-react";
 import type { HubConnection } from "./connection.js";
 import type { ScreenStatus } from "../../src/client-protocol/remote-screen.js";
+import type { ScreenPerformanceSnapshot, ScreenRouteKind } from "../../src/client-protocol/screen-metrics.js";
 import { screenInputEventSchema, screenKeyCodeSchema } from "../../src/client-protocol/remote-screen.js";
 import { RemoteScreenViewer, supportedScreenCodecs, type ViewerState } from "./remote-screen-viewer.js";
 import { screenError } from "./screen-errors.js";
@@ -28,6 +29,51 @@ function useLandscapePhone(enabled: boolean) { const matches = useSyncExternalSt
  * contains the caption; "连接" alone is already the noun "Connection". */
 const RAIL_LABELS = { zh: { connect: "连接", disconnect: "断开", control: "控制", stop: "停止", wait: "等待", send: "发送" }, en: { connect: "Connect", disconnect: "End", control: "Control", stop: "Stop", wait: "Wait", send: "Send" } } as const;
 const SCREEN_STATUS_LABEL_MS = 4000;
+
+function routeDisplayLabel(route: ScreenRouteKind, udpRequested: boolean, udpConnected: boolean): string {
+  switch (route) {
+    case "udp_lan_direct": return t("UDP · 局域网直连");
+    case "udp_tailscale_direct": return t("UDP · Tailscale 直连");
+    case "udp_p2p": return t("UDP · P2P 直连");
+    case "udp_vps_relay": return t("UDP · VPS 中转");
+    case "tcp_lan_direct": return udpRequested && !udpConnected ? t("TCP · 局域网直连（UDP 未连通）") : t("TCP · 局域网直连");
+    case "tcp_tailscale": return udpRequested && !udpConnected ? t("TCP · Tailscale（UDP 未连通）") : t("TCP · Tailscale");
+    case "tcp_vps_relay": return udpRequested && !udpConnected ? t("TCP · VPS 中转（UDP 未连通）") : t("TCP · VPS 中转");
+    default: return udpRequested && !udpConnected ? t("TCP（UDP 未连通）") : t("TCP（默认）");
+  }
+}
+
+function formatBitrate(kbps: number): string {
+  if (kbps >= 1000) return `${(kbps / 1000).toFixed(1)} Mbps`;
+  return `${kbps} kbps`;
+}
+
+function ScreenMetricsOverlay({ metrics, status, fallbackWidth, fallbackHeight }: {
+  metrics?: ScreenPerformanceSnapshot;
+  status?: ScreenStatus;
+  fallbackWidth?: number;
+  fallbackHeight?: number;
+}) {
+  const fps = metrics?.fps ?? 0;
+  const latency = metrics?.latencyMs;
+  const p95 = metrics?.p95LatencyMs;
+  const bitrate = formatBitrate(metrics?.bitrateKbps ?? 0);
+  const w = metrics?.width || fallbackWidth || 0;
+  const h = metrics?.height || fallbackHeight || 0;
+  const codec = metrics?.codec ? metrics.codec.toUpperCase() : "";
+  const dropped = metrics?.droppedFrames ?? 0;
+  const skipped = metrics?.skippedFrames ?? 0;
+  const route = metrics?.route ?? status?.udpStatus?.route ?? "tcp_default";
+  const udpRequested = metrics?.udpRequested ?? status?.udpStatus?.enabled ?? false;
+  const udpConnected = metrics?.udpConnected ?? status?.udpStatus?.state === "connected";
+  return <div className="screen-metrics-overlay" role="region" aria-label={t("屏幕性能数据")}>
+    <div className="screen-metrics-row"><span>{t("帧率")}</span><strong>{fps} fps</strong></div>
+    <div className="screen-metrics-row"><span>{t("端到端延迟")}</span><strong>{latency !== null && latency !== undefined ? `${latency} ms${p95 !== null && p95 !== undefined ? ` (p95 ${p95})` : ""}` : "—"}</strong></div>
+    <div className="screen-metrics-row"><span>{t("码率与分辨率")}</span><strong>{bitrate}{w && h ? ` · ${w}×${h}` : ""}{codec ? ` · ${codec}` : ""}</strong></div>
+    <div className="screen-metrics-row"><span>{t("丢帧 / 跳帧")}</span><strong>{dropped} / {skipped}</strong></div>
+    <div className="screen-metrics-row"><span>{t("当前链路")}</span><strong>{routeDisplayLabel(route, udpRequested, udpConnected)}</strong></div>
+  </div>;
+}
 
 export function RemoteScreenPanel({connection,hostName,visible,close,openSettings,standalone=false}:{connection:HubConnection;hostName:string;visible:boolean;close:()=>void;openSettings?:()=>void;standalone?:boolean}) {
   const locale = useLocale(), windows = window.tarobotDesktop?.platform === "win32", mobile = isMobileScreenApp(), landscape = useLandscapePhone(mobile);
@@ -72,7 +118,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   const mobileForeground=useScreenMobileLifecycle(mobile,visible,reason=>{if(!reason)setNotice("");else if(viewer.current||state.state!=="closed")setNotice(reason);disconnect();clearPicture();});
   const activeNow=useRef(true);activeNow.current=!mobile||mobileForeground&&visible&&document.documentElement.dataset.mobileLocked!=="true";
   const chrome=useRef<HTMLDivElement>(null), hideTimer=useRef<ReturnType<typeof setTimeout>>(undefined);
-  const [tools,setTools]=useState(false),[chromeVisible,setChromeVisible]=useState(true);
+  const [tools,setTools]=useState(false),[chromeVisible,setChromeVisible]=useState(true),[showMetrics,setShowMetrics]=useState(false);
   const closing=useRef<object>(undefined),[isClosing,setClosing]=useState(false);
   // Navigation hides this Host-owned viewer without unmounting it. A pending
   // close belongs to the visibility instance where the user requested it.
@@ -130,7 +176,8 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
       if(n!==attempt.current||!canvas.current){cleanupOnError=false;await retire();return;}
       if(explicit&&result.join.quality!==requested)throw new Error("screen_quality_unconfirmed");
       setQuality(result.join.quality??SCREEN_DEFAULT_QUALITY);
-      const next=new RemoteScreenViewer(result.join,canvas.current,value=>{if(n===attempt.current){if(mobile&&value.state==="closed")clearPicture();setState(value);}},mobile?{transport:mobileScreenViewerTransport,flight,inputActive:()=>activeNow.current&&document.hasFocus()&&document.visibilityState==="visible"&&!!panel.current?.contains(document.activeElement)}:{flight});viewer.current=next;
+      const metricsOpts = { routeHint: s.udpStatus?.route ?? "tcp_default", udpRequested: s.udpStatus?.enabled ?? false, udpConnected: s.udpStatus?.state === "connected" };
+      const next=new RemoteScreenViewer(result.join,canvas.current,value=>{if(n===attempt.current){if(mobile&&value.state==="closed")clearPicture();setState(value);}},mobile?{...metricsOpts,transport:mobileScreenViewerTransport,flight,inputActive:()=>activeNow.current&&document.hasFocus()&&document.visibilityState==="visible"&&!!panel.current?.contains(document.activeElement)}:{...metricsOpts,flight});viewer.current=next;
       next.visibility(visibleNow.current&&document.visibilityState==="visible");await next.open(result.network);
       if(n!==attempt.current){next.dispose();cleanupOnError=false;await retire();return;}next.visibility(visibleNow.current&&document.visibilityState==="visible");
     }catch(e){if(n===attempt.current){viewer.current?.dispose();viewer.current=undefined;setError(mobile&&e instanceof Error&&e.message==="screen_decoder_unavailable"?"screen_mobile_decoder_unavailable":e instanceof Error?e.message:String(e));setState({state:"closed",controlling:false,pending:false,fresh:false});}if(cleanupOnError)await retire().catch(()=>undefined);}};
@@ -203,6 +250,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
         {mobile&&<button ref={keyboardButton} className="icon-button" aria-label={t("键盘与快捷键")} aria-expanded={showText} onMouseDown={e=>e.preventDefault()} onClick={toggleKeyboard}><Keyboard size={19}/></button>}
         {!mobile&&!standalone&&!fullscreen.active&&<button className="icon-button" aria-label={wide?t("返回并排"):t("展开屏幕")} title={wide?t("返回并排"):t("展开屏幕")} onClick={()=>setWide(v=>!v)}>{wide?<Minimize2 size={17}/>:<Maximize2 size={17}/>}</button>}
         {!mobile&&<button className="icon-button" aria-label={fullscreen.active?t("退出全屏"):t("全屏")} title={fullscreen.active?t("退出全屏"):t("全屏")} disabled={isClosing||!fullscreen.supported} onClick={fullscreen.toggle}>{fullscreen.active?<Minimize size={17}/>:<Maximize size={17}/>}</button>}
+        <button className="icon-button" aria-label={showMetrics?t("隐藏性能数据"):t("显示性能数据")} title={showMetrics?t("隐藏性能数据"):t("显示性能数据")} aria-pressed={showMetrics} onMouseDown={e=>e.preventDefault()} onClick={()=>setShowMetrics(v=>!v)}><Activity size={16}/></button>
         <button className="icon-button" aria-label={t("屏幕更多操作")} title={t("屏幕更多操作")} aria-expanded={tools} onMouseDown={e=>e.preventDefault()} onClick={()=>setTools(v=>!v)}><MoreHorizontal size={17}/></button>
         <button className="icon-button" aria-label={t("断开并关闭屏幕")} title={t("断开并关闭屏幕")} disabled={isClosing} onClick={()=>void closeViewer()}><X size={18}/></button>
       </div>
@@ -226,6 +274,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
     {tools&&<div className="screen-tools-popover" role="region" aria-label={t("屏幕更多操作")}>
     {mobile&&<><label className="screen-display">{t("画面清晰度")}{qualitySelect}</label><button onMouseDown={e=>e.preventDefault()} onClick={()=>{touch.current?.fit();setTools(false);}}>{t("适应窗口")}</button><p className="screen-touch-help">{t("查看时拖动画面、双指缩放。控制时点按左键、长按右键、单指拖动、双指滚动；捏合只缩放画面。")}</p></>}
     {landscape&&<p className="screen-touch-help">{t("仅在开始控制后，点击发送才会提交文本。")}</p>}
+    <label className="screen-display"><span>{t("性能数据覆盖层")}</span><input type="checkbox" checked={showMetrics} onChange={e=>setShowMetrics(e.target.checked)}/></label>
     <label className="screen-display">{t("显示器")}<select aria-label={t("显示器")} value={display} onChange={e=>{disconnect();setDisplay(e.target.value);}}>{status?.desktop?.displays.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>
     <div className="screen-shortcuts"><details><summary onMouseDown={e=>e.preventDefault()}>{t("发送组合键")}</summary><div>{screenShortcuts(target).map(shortcut=><button key={shortcut.id} disabled={!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={e=>{canvas.current?.focus();for(const code of shortcut.codes)viewer.current?.input({kind:"key",code,down:true});for(const code of [...shortcut.codes].reverse())viewer.current?.input({kind:"key",code,down:false});e.currentTarget.closest("details")?.removeAttribute("open");}}>{shortcut.label[locale]}</button>)}</div></details>{remap&&<select aria-label={controller==="windows"?t("Windows 修饰键"):t("Mac 修饰键")} value={modifierMode} onChange={e=>{viewer.current?.release();setModifierMode(e.target.value as ScreenModifierMode);}}>{controller==="windows"?<><option value="command">Ctrl → ⌘ · Win → ⌃</option><option value="physical">Ctrl → ⌃ · Win → ⌘</option></>:<><option value="command">⌘ → Ctrl · ⌃ → Win</option><option value="physical">⌃ → Ctrl · ⌘ → Win</option></>}</select>}</div>
     {!mobile&&<div className="screen-bottom"><button onClick={()=>{viewer.current?.release();setShowText(v=>!v);}}>{t("发送文本")}</button><span>{target==="windows"?<>{remap&&<>{modifierMode==="command"?t("Command 对应 Ctrl，Control 对应 Win，Option 对应 Alt"):t("Control 对应 Ctrl，Command 对应 Win，Option 对应 Alt")}{" · "}</>}{t("按键按键位发送，字符由目标电脑的键盘布局决定。")}</>:windows?(modifierMode==="command"?t("Ctrl 对应 Command，Win 对应 Control，Alt 对应 Option"):t("Windows：Ctrl 对应 Control，Win 对应 Command，Alt 对应 Option")):t("点击聊天输入框会立即停止远端控制。")}</span></div>}
@@ -242,6 +291,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
         onKeyDown={e=>{if(!state.controlling)return;if(e.code==="Escape"&&e.ctrlKey&&e.altKey&&e.shiftKey){e.preventDefault();viewer.current?.release();return;}if(e.nativeEvent.isComposing||!screenKeyCodeSchema.safeParse(e.code).success)return;e.preventDefault();viewer.current?.input({kind:"key",code:screenControllerCode(e.code,controller,modifierMode,target),down:true});}}
         onKeyUp={e=>{if(!state.controlling||e.nativeEvent.isComposing||!screenKeyCodeSchema.safeParse(e.code).success)return;e.preventDefault();viewer.current?.input({kind:"key",code:screenControllerCode(e.code,controller,modifierMode,target),down:false});}}
       />
+      {showMetrics&&<ScreenMetricsOverlay metrics={state.metrics} status={status} fallbackWidth={state.width} fallbackHeight={state.height}/>}
     </div>
 
   </aside>;

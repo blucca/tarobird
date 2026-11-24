@@ -80,6 +80,18 @@
 @media(max-width:440px){.screen-readiness{gap:8px}.screen-permission-row{gap:8px}.screen-settings-heading{gap:6px}.screen-setting-row{flex-wrap:wrap}.screen-setting-row select{max-width:100%}}
 
 .screen-resolution{white-space:nowrap;font-variant-numeric:tabular-nums}
+.screen-metrics-overlay{position:absolute;top:10px;left:10px;z-index:2;pointer-events:none;min-width:210px;max-width:min(320px,calc(100% - 20px));padding:8px 10px;border-radius:8px;background:rgba(15,18,22,.82);color:#f2f5f8;border:1px solid rgba(255,255,255,.14);backdrop-filter:blur(6px);font-size:11px;line-height:1.45;font-variant-numeric:tabular-nums;box-shadow:0 4px 16px rgba(0,0,0,.35)}
+.screen-metrics-row{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.screen-metrics-row span{color:rgba(242,245,248,.72);white-space:nowrap}
+.screen-metrics-row strong{color:#fff;font-weight:550;text-align:right;overflow-wrap:anywhere}
+.screen-mobile .screen-metrics-overlay{top:8px;left:8px;font-size:10.5px;padding:6px 8px;min-width:185px}
+.screen-udp-boost{margin-top:14px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
+.screen-udp-boost-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.screen-udp-boost .screen-enable{color:var(--text);font-weight:550;font-size:13px}
+.screen-udp-boost .screen-settings-intro{margin:0}
+.screen-udp-status{font-size:11.5px;color:var(--muted);white-space:nowrap}
+.screen-udp-status[data-state="connected"]{color:var(--accent);font-weight:550}
+.screen-udp-status[data-state="fallback_tcp"]{color:var(--text)}
 
 /* Native mobile viewing owns the available window, independently of chat width.
    Safe insets use the shared tokens: env() on iOS (Capacitor injects no

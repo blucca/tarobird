@@ -3,6 +3,8 @@ import { SCREEN_MAC_KEYCODES, SCREEN_TARGET_PLATFORMS } from "./screen-keys.js";
 import { idSchema } from "./index.js";
 import { deviceActionProofSchema } from "./device-actions.js";
 import { SCREEN_FLIGHT_MAX, SCREEN_FLIGHT_MIN, SCREEN_HELD_MAX_MS, SCREEN_QUALITIES, SCREEN_STREAM_MAX_AREA, SCREEN_STREAM_MAX_EDGE } from "./screen-quality.js";
+import { screenUdpStatusSchema, type ScreenUdpStatus } from "./screen-metrics.js";
+export { screenUdpStatusSchema, type ScreenUdpStatus } from "./screen-metrics.js";
 
 export const REMOTE_SCREEN_CAPABILITY = "desktop.screen.v1";
 /** Hub → App (`serverCapabilities`): `screenOpen` accepts `quality`. Whether the
@@ -52,10 +54,10 @@ const publicKey = z.string().regex(/^[A-Za-z0-9+/]{59}=$/);
 const revision = z.number().int().positive().max(0xffffffff);
 const displayId = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 export const screenGrantSchema = z.object({ deviceId: idSchema, publicKey, permission: z.enum(["view", "control"]) }).strict();
-export const screenPolicySchema = z.object({ revision: integer, enabled: z.boolean(), grants: z.array(screenGrantSchema).max(64) }).strict()
+export const screenPolicySchema = z.object({ revision: integer, enabled: z.boolean(), grants: z.array(screenGrantSchema).max(64), udpBoost: z.boolean().optional() }).strict()
   .refine(v => new Set(v.grants.map(g => g.deviceId)).size === v.grants.length, "duplicate_screen_device");
 export type ScreenPolicy = z.infer<typeof screenPolicySchema>;
-export const screenConfigureSchema = z.object({ operation: z.literal("screen.configure"), expectedRevision: integer, enabled: z.boolean(), grants: z.array(screenGrantSchema).max(64), requestId: idSchema }).strict()
+export const screenConfigureSchema = z.object({ operation: z.literal("screen.configure"), expectedRevision: integer, enabled: z.boolean(), grants: z.array(screenGrantSchema).max(64), requestId: idSchema, udpBoost: z.boolean().optional() }).strict()
   .refine(v => new Set(v.grants.map(g => g.deviceId)).size === v.grants.length, "duplicate_screen_device");
 export type ScreenConfigure = z.infer<typeof screenConfigureSchema>;
 export const signedScreenConfigureSchema = z.object({ command: screenConfigureSchema, proof: deviceActionProofSchema }).strict();
@@ -63,7 +65,8 @@ export const signedScreenConfigureSchema = z.object({ command: screenConfigureSc
 export function screenConfigureText(command: ScreenConfigure): string {
   const v = screenConfigureSchema.parse(command);
   return JSON.stringify(["tarobot/screen-configure/v1", v.expectedRevision, v.enabled,
-    [...v.grants].sort((a, b) => a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0).map(g => [g.deviceId, g.publicKey, g.permission]), v.requestId]);
+    [...v.grants].sort((a, b) => a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0).map(g => [g.deviceId, g.publicKey, g.permission]), v.requestId,
+    ...(v.udpBoost !== undefined ? [v.udpBoost] : [])]);
 }
 export const screenDisplaySchema = z.object({
   id: displayId, nativeId: z.string().regex(/^[0-9]{1,20}$/), name: z.string().min(1).max(128), revision,
@@ -97,6 +100,7 @@ export const screenStatusSchema = z.object({
   supported: z.literal(true), enabled: z.boolean(), canManage: z.boolean(), permission: z.enum(["none", "view", "control"]),
   policy: screenPolicySchema.optional(), devices: z.array(z.object({ id: idSchema, name: z.string(), platform: z.string(), publicKey }).strict()).max(256).optional(), desktop: screenDesktopSchema.nullable(),
   sessions: z.array(screenSessionSchema).max(SCREEN_MAX_VIEWERS), serverTime: integer,
+  udpStatus: screenUdpStatusSchema.optional(),
 }).strict();
 export type ScreenStatus = z.infer<typeof screenStatusSchema>;
 /** `quality` is present only when the open requested it and the Host and its

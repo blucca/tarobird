@@ -69,10 +69,14 @@ export class HubRemoteScreen {
     await this.readPolicy(); const { device, canManage } = await this.principal(session), policy = this.policy!;
     const devices = canManage ? await this.store.db.serial(() => this.store.db.all<{ id: string; name: string; platform: string; publicKey: string }>("SELECT id,name,platform,public_key AS publicKey FROM devices WHERE revoked=0 ORDER BY created_at LIMIT 256")) : undefined;
     const permission = policy.grants.find(g => g.deviceId === device.id && g.publicKey === device.public_key)?.permission ?? "none";
+    const udpEnabled = policy.udpBoost === true;
     return { supported: true, enabled: policy.enabled, canManage, permission,
       ...(canManage ? { policy: structuredClone(policy), devices } : {}),
       desktop: (canManage || policy.enabled && permission !== "none") && this.desktop && this.readableBy(viewer) ? structuredClone(this.desktop) : null,
-      sessions: [...this.sessions.values()].filter(s => canManage || s.auth.deviceId === device.id).map(s => structuredClone(s.value)), serverTime: this.now() };
+      sessions: [...this.sessions.values()].filter(s => canManage || s.auth.deviceId === device.id).map(s => structuredClone(s.value)), serverTime: this.now(),
+      udpStatus: udpEnabled
+        ? { enabled: true, state: "fallback_tcp", route: "tcp_default", reasonCode: "udp_transport_unavailable" }
+        : { enabled: false, state: "disabled", route: "tcp_default", reasonCode: "disabled" } };
   }
   async configure(session: AuthSession, raw: unknown, proof: DeviceActionProof): Promise<ScreenPolicy> {
     const command = screenConfigureSchema.parse(raw), digest = hashSecret(screenConfigureText(command));
@@ -102,7 +106,7 @@ export class HubRemoteScreen {
         }
         grants.push(grant);
       }
-      const next = screenPolicySchema.parse({ revision: command.expectedRevision + 1, enabled: command.enabled, grants });
+      const next = screenPolicySchema.parse({ revision: command.expectedRevision + 1, enabled: command.enabled, grants, ...(command.udpBoost !== undefined ? { udpBoost: command.udpBoost } : current.udpBoost !== undefined ? { udpBoost: current.udpBoost } : {}) });
       await this.store.db.run("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", [POLICY_KEY, JSON.stringify(next)]);
       await this.store.db.run("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", [LAST_COMMAND_KEY, JSON.stringify({ deviceId: session.deviceId, requestId: command.requestId, digest })]);
       return next;

@@ -78,7 +78,7 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
     try { await work(); } catch (e) { if (lifetime.current === scope) setActionError(reason(e)); }
     finally { if (lifetime.current === scope) { operation.current = false; setBusy(false); busyChange?.(false); refresh.current(); } }
   };
-  const save = (policy: ScreenPolicy) => run(() => connection.screenConfigure({ operation: "screen.configure", expectedRevision: policy.revision, enabled: policy.enabled, grants: policy.grants, requestId: crypto.randomUUID() }));
+  const save = (policy: ScreenPolicy) => run(() => connection.screenConfigure({ operation: "screen.configure", expectedRevision: policy.revision, enabled: policy.enabled, grants: policy.grants, ...(policy.udpBoost !== undefined ? { udpBoost: policy.udpBoost } : {}), requestId: crypto.randomUUID() }));
   const permission = (kind: "capture" | "accessibility" | "input-monitoring") => run(async () => {
     if (!localMac || !status?.canManage) return;
     const scope = lifetime.current;
@@ -154,6 +154,28 @@ export function RemoteScreenSettings({ connection, local, open, openBlocked, bus
     </div>}
     {!!status?.sessions.length && <div className="screen-active-sessions"><h4>{t("当前共享")}</h4>{status.sessions.map(session => <div className="screen-setting-row" key={session.id}><span>{session.deviceName}<small>{session.display.name} · {session.state === "controlling" ? t("正在控制") : t("查看中")}</small></span><button disabled={busy} onClick={() => void run(() => connection.screenStop(session.id))}>{t("断开")}</button></div>)}</div>}
     {!targetUnsupported && status?.canManage && status.policy && <>
+      <div className="screen-udp-boost">
+        <div className="screen-udp-boost-row">
+          <label className="screen-enable">
+            <input type="checkbox" checked={Boolean(status.policy.udpBoost)} disabled={busy} onChange={event => void save({ ...status.policy!, udpBoost: event.target.checked })}/>
+            <span>{t("UDP 加速（实验性）")}</span>
+          </label>
+          <span className="screen-udp-status" data-state={status.udpStatus?.state ?? (status.policy.udpBoost ? "fallback_tcp" : "disabled")}>
+            {!status.policy.udpBoost
+              ? t("未开启 · 当前使用 TCP")
+              : status.udpStatus?.state === "connected"
+                ? t("已连通")
+                : t("未连通 · 已自动回退 TCP")}
+          </span>
+        </div>
+        <p className="screen-settings-intro">
+          {!status.policy.udpBoost
+            ? t("开启后对本机所有查看设备生效，查看端无需单独设置。取消勾选时始终使用当前 TCP 传输。")
+            : status.udpStatus?.reasonCode === "udp_relay_port_closed"
+              ? t("VPS 的 8443/udp 端口未开放，请在云安全组放行该端口。未连通期间自动保持 TCP 传输，不会黑屏或断线。")
+              : t("当前主机或中继尚未启用 UDP 媒体通道，已自动回退 TCP 传输（不会黑屏或断线）。开启查看器性能数据覆盖层可对比链路指标。")}
+        </p>
+      </div>
       {localMac && <div className="screen-system-permissions">
         <h4>{t("本机系统权限")}</h4>
         <div className="screen-permissions">
