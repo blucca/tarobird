@@ -24,6 +24,7 @@ import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRigh
 import { ConnectionPanel } from "./ConnectionPanel.js";
 import { ScreenControlPanel } from "./ScreenControlPanel.js";
 import { hasScreenViewer } from "./mobile-screen-viewer-transport.js";
+import { HostTerminalSettings } from "./TerminalPanel.js";
 import type { OpenNetwork } from "./network-navigation.js";
 import "./network-settings.css";
 import { CreationDialog } from "./CreationDialog.js";
@@ -525,6 +526,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
           </div>
           {!detailDevice && message("devices")}
           {!wizard && message("pair")}
+          <HostTerminalSettings connection={connection}/>
           <MobileLockSettings/>
           {!hostName && <div className="settings-danger">
             <h4>{t("危险操作")}</h4>

@@ -92,6 +92,8 @@ import { workspaceChangesQuerySchema, workspaceFileDiffQuerySchema } from "../cl
 import { nodeFrameReader, writeFrame } from "../client-protocol/fragments-node.js";
 import { linkUrlSchema } from "../client-protocol/links.js";
 import { HubLinkPreviews } from "./link-previews.js";
+import { HOST_TERMINAL_CONFIGURE_PATH, HOST_TERMINAL_STATUS_PATH, HOST_TERMINALS_PATH } from "../client-protocol/host-terminal.js";
+import { HubHostTerminal, type TerminalProcessHandle } from "./host-terminal.js";
 import { BotManager, createBotSchema, type BotManagerOptions } from "./bot-manager.js";
 import { deleteBotSchema, renameBotSchema } from "../client-protocol/bots.js";
 import { type RouteAlert } from "./route-monitor.js";
@@ -153,13 +155,14 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
 type BotConnection = { botSteer: boolean; engineQuota: boolean; contextUsage: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
-export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
+export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; hostTerminalSpawner?: (options: { cwd: string; cols: number; rows: number }) => Promise<TerminalProcessHandle>; hostTerminalDefaultWorkspace?: string; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
 export class HubServer {
   private readonly relaySources: RelaySources;
   private readonly fragmentSockets = new WeakSet<WebSocket>();
   private readonly requestGuards = new WeakMap<IncomingMessage, () => Promise<void>>();
   private readonly downloads = new Map<AbortController, AuthSession>();
   readonly http: Server;
+  readonly hostTerminal: HubHostTerminal;
   readonly linkPreviews: HubLinkPreviews;
   readonly fileCenter: HubFileCenter;
   readonly workspaceDiff: HubWorkspaceDiff;
@@ -338,8 +341,15 @@ export class HubServer {
       log: line => options.onWarning?.(line),
     });
     this.remoteScreen = new HubRemoteScreen(store, auth);
+    this.hostTerminal = new HubHostTerminal({
+      store,
+      auth,
+      stateDir: options.stateDir,
+      defaultWorkspace: options.hostTerminalDefaultWorkspace,
+      spawnProcess: options.hostTerminalSpawner,
+    });
     this.screenSockets = new RemoteScreenSockets(this.remoteScreen);
-    this.disposers.push(() => { this.remoteScreen.dispose(); this.screenSockets.dispose(); });
+    this.disposers.push(() => { this.remoteScreen.dispose(); this.screenSockets.dispose(); void this.hostTerminal.dispose(); });
     const screenTick = setInterval(() => this.remoteScreen.tick(), 250); screenTick.unref(); this.disposers.push(() => clearInterval(screenTick));
     this.workbench = new WorkbenchBroker(store);
     this.designSharing = new DesignShareBroker({repository:metaDesignShareRepository(store.db),requireMember:(userId,conversationId)=>store.db.serial(()=>store.requireMember(userId,conversationId)),userName:async userId=>(await store.user(userId))?.name});
@@ -418,7 +428,7 @@ export class HubServer {
         this.trackTask(this.dispatchPending().catch(() => options.onWarning?.("queue_dispatch_failed")));
       }
     }));
-    this.disposers.push(auth.onRevoke((deviceId) => { for (const c of this.clients) if (c.session?.deviceId === deviceId) this.endClientSession(c, "device_revoked"); }));
+    this.disposers.push(auth.onRevoke((deviceId) => { void this.hostTerminal.revokeDevice(deviceId); for (const c of this.clients) if (c.session?.deviceId === deviceId) this.endClientSession(c, "device_revoked"); }));
     this.disposers.push(auth.onRevoke((deviceId) => {
       this.sideSessions.revoke(deviceId);
       for (const [controller, session] of this.downloads) if (session.deviceId === deviceId) controller.abort(new HubError("device_revoked", 401));
@@ -1802,6 +1812,52 @@ export class HubServer {
         const query = z.string().max(200).parse(url.searchParams.get("q") ?? "");
         const includeScopes = url.searchParams.get("scopes") === "1";
         await reply(200, await new RunJournal(this.store).read(userId, runRoute[1]!, after, query, includeScopes, { tail, before })); return;
+      }
+      if (route === HOST_TERMINAL_STATUS_PATH && req.method === "GET") {
+        await validate();
+        await reply(200, await this.hostTerminal.status(session));
+        return;
+      }
+      if (route === HOST_TERMINAL_CONFIGURE_PATH && req.method === "POST") {
+        await requireOwner();
+        const input = z.object({ command: z.unknown(), proof: deviceActionProofSchema.optional() }).strict().parse(await this.jsonBody(req));
+        await reply(200, await this.hostTerminal.configure(session, input.command, input.proof));
+        return;
+      }
+      if (route === HOST_TERMINALS_PATH && req.method === "GET") {
+        await validate();
+        const conversationId = idSchema.parse(url.searchParams.get("conversationId") ?? "");
+        await reply(200, { sessions: await this.hostTerminal.list(session, conversationId) });
+        return;
+      }
+      if (route === HOST_TERMINALS_PATH && req.method === "POST") {
+        await validate();
+        await reply(201, { terminal: await this.hostTerminal.create(session, await this.jsonBody(req)) });
+        return;
+      }
+      const termRoute = route.match(/^\/api\/terminals\/([A-Za-z0-9_-]+)(?:\/(output|input|resize))?$/);
+      if (termRoute) {
+        const termId = termRoute[1]!;
+        const sub = termRoute[2];
+        await validate();
+        if (!sub && req.method === "DELETE") {
+          await reply(200, await this.hostTerminal.close(session, termId));
+          return;
+        }
+        if (sub === "output" && req.method === "GET") {
+          const after = z.coerce.number().int().min(0).default(0).parse(url.searchParams.get("after") ?? "0");
+          const wait = z.coerce.number().int().min(0).max(8000).default(0).parse(url.searchParams.get("wait") ?? "0");
+          await reply(200, await this.hostTerminal.readOutput(session, termId, after, wait));
+          return;
+        }
+        if (sub === "input" && req.method === "POST") {
+          await reply(200, await this.hostTerminal.writeInput(session, termId, await this.jsonBody(req, 128 * 1024)));
+          return;
+        }
+        if (sub === "resize" && req.method === "POST") {
+          await reply(200, await this.hostTerminal.resize(session, termId, await this.jsonBody(req)));
+          return;
+        }
       }
       if (route === "/api/host-profile" && (req.method === "GET" || req.method === "PATCH")) {
         if (req.method === "GET") await reply(200, await this.profile.read(validateInQueue));
