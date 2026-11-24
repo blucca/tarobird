@@ -238,7 +238,7 @@ test("closing and locking quota settings discard late responses and never replay
   } finally { release(); await f.close(); }
 });
 
-test("quota discovery keeps not-loaded, unsupported, offline and partial directories distinct", async ({ page }) => {
+test("quota discovery keeps not-loaded, unsupported, offline and partial directories distinct and auto-reads readable cards on open", async ({ page }) => {
   const f = await fixture(page);
   try {
     f.records.coder!.snapshot = unavailableQuota("codex", "not_loaded");
@@ -247,11 +247,75 @@ test("quota discovery keeps not-loaded, unsupported, offline and partial directo
       const response = await route.fetch(); await route.fulfill({ response, json: { ...await response.json(), truncated: true } });
     });
     await f.open(); const panel = page.locator(".engine-quota:visible"), coder = panel.getByRole("region", { name: "Coding Bot · Codex", exact: true });
-    await expect(panel).toContainText("只返回了部分 Bot"); await expect(coder).toContainText("尚未读取原生额度");
-    await expect(coder.getByRole("button", { name: "刷新", exact: true })).toBeEnabled(); await expect(coder.getByRole("meter")).toHaveCount(0);
+    await expect(panel).toContainText("只返回了部分 Bot");
+    // Readable active cards without data auto-refresh once on page open without manual clicking.
+    await expect.poll(() => f.records.coder!.refreshes).toBe(1);
+    await expect(coder).toContainText("尚未读取原生额度");
+    await expect(coder.getByRole("meter")).toHaveCount(0);
     await expect(panel.getByRole("region", { name: "Review Bot · Codex", exact: true })).toContainText("当前离线");
     for (const name of ["Review Bot · Codex", "Research Bot · Kimi"]) await expect(panel.getByRole("region", { name, exact: true }).getByRole("button")).toHaveCount(0);
-    for (const record of Object.values(f.records)) expect(record.refreshes).toBe(0);
+    expect(f.records.reviewer!.refreshes).toBe(0);
+    expect(f.records.research!.refreshes).toBe(0);
+  } finally { await f.close(); }
+});
+
+test("model quotas auto-read stale/empty cards on open and update automatically when a slow Claude answer arrives late", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    const now = Date.now(), stamp = (delta = 0) => new Date(now + delta).toISOString();
+    const readyCodex: QuotaSnapshot = {
+      authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "allowed", observedAt: stamp(),
+      pools: [{
+        id: "codex_pool", label: "Codex", sharing: "shared", availability: "allowed",
+        windows: [{ id: "secondary", label: "Secondary", metric: "percent", usedPercent: 18, availability: "allowed", observedAt: stamp(), expiresAt: stamp(60_000), resetsAt: stamp((3 * 24 + 17) * 3_600_000), periodSeconds: 604_800 }],
+        balances: [], constraints: [],
+      }], constraints: [],
+    };
+    const readyClaude: QuotaSnapshot = {
+      authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "allowed", observedAt: stamp(5_000),
+      pools: [{
+        id: "claude_pool", label: "Claude", sharing: "shared", availability: "allowed",
+        windows: [{ id: "seven_day", label: "7 days", metric: "percent", usedPercent: 26, availability: "allowed", observedAt: stamp(5_000), expiresAt: stamp(65_000), resetsAt: stamp((4 * 24 + 5) * 3_600_000), periodSeconds: 604_800 }],
+        balances: [], constraints: [],
+      }], constraints: [],
+    };
+    // Start with coder unloaded and writer (Claude) active but timing out on its first refresh.
+    f.records.coder!.snapshot = unavailableQuota("codex", "not_loaded");
+    f.records.writer!.snapshot = { ...unavailableQuota("claude", "not_loaded"), capability: { mode: "active" }, authMode: "subscription" };
+
+    // Intercept refresh calls on the server side by updating records right after refresh starts.
+    const origCoder = f.records.coder!;
+    let claudeTimedOut = false;
+    await page.route("**/api/engine-quotas/coder?*", async route => {
+      origCoder.snapshot = readyCodex;
+      return route.continue();
+    });
+    await page.route("**/api/engine-quotas/writer?*", async route => {
+      if (route.request().method() === "POST" || route.request().url().includes("refresh=1")) {
+        f.records.writer!.snapshot = { ...unavailableQuota("claude", "timeout"), capability: { mode: "active" }, authMode: "subscription" };
+        claudeTimedOut = true;
+      }
+      return route.continue();
+    });
+
+    await f.open();
+    const panel = page.locator(".engine-quota:visible");
+    const coder = panel.getByRole("region", { name: "Coding Bot · Codex", exact: true });
+    const writer = panel.getByRole("region", { name: "Writing Bot · Claude Code", exact: true });
+
+    // Both cards started reading automatically on open without clicking Refresh.
+    await expect(coder).toContainText("剩余 82%");
+    await expect(coder).toContainText("3 天 17 小时");
+    await expect.poll(() => claudeTimedOut).toBe(true);
+    // Slow Claude shows "正在读取…" instead of an immediate timeout error.
+    await expect(writer.locator(".quota-state")).toHaveText("正在读取…");
+    await expect(writer).not.toContainText("读取原生额度超时");
+
+    // Late answer arrives on the Host cache; the Settings card picks it up automatically.
+    f.records.writer!.snapshot = readyClaude;
+    await expect(writer).toContainText("剩余 74%", { timeout: 10_000 });
+    await expect(writer).toContainText("4 天 5 小时");
+    await expect(writer.locator(".quota-state")).toHaveText("已读取");
   } finally { await f.close(); }
 });
 

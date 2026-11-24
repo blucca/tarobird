@@ -147,3 +147,23 @@ export function shortTokens(value: number): string {
   if (value < 999_500) return `${value < 9950 ? Math.round(value / 100) / 10 : Math.round(value / 1000)}k`;
   return `${Math.round(value / 100_000) / 10}M`;
 }
+
+/** Accurate time remaining computed from a provider's reset timestamp (not the window length).
+ * Returns null once the reset timestamp has passed. */
+export function formatTimeRemaining(resetsAt: string | undefined, now: number, locale: "zh" | "en"): string | null {
+  if (!resetsAt) return null;
+  const ms = Date.parse(resetsAt) - now;
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const totalMinutes = Math.max(1, Math.ceil(ms / 60_000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (locale === "en") {
+    if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+    if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+    return `${minutes}m`;
+  }
+  if (days > 0) return hours > 0 ? `${days} 天 ${hours} 小时` : `${days} 天`;
+  if (hours > 0) return minutes > 0 ? `${hours} 小时 ${minutes} 分钟` : `${hours} 小时`;
+  return `${minutes} 分钟`;
+}

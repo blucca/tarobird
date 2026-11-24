@@ -109,7 +109,7 @@ it("Claude passive events of a verified login still count with a CLI that refuse
   const f = await fixture(), child = new Child(); child.refuse.add("get_usage");
   const env = { HOME: f.home, CLAUDE_CODE_OAUTH_TOKEN: "synthetic-oauth" };
   const spawn = vi.fn(() => child);
-  const adapter = new ClaudeStreamAdapter("claude", { childEnv: env, spawnFn: spawn, workspacePath: f.root, idleSweepIntervalMs: 0 });
+  const adapter = new ClaudeStreamAdapter("claude", { childEnv: env, spawnFn: spawn, workspacePath: f.root, idleSweepIntervalMs: 0, oauthQuotaReader: null });
   disposals.push(() => adapter.destroy());
   expect((await adapter.getAccountQuota({ refresh: true })).snapshot.reason).toBe("no_passive_event"); expect(spawn).not.toHaveBeenCalled();
   const worker = await (adapter as any).getOrCreateWorker("tarobot-fixture", null, null, "normal", f.root);

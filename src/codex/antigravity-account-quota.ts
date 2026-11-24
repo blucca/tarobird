@@ -12,6 +12,7 @@ import {
   type EngineQuotaReadOptions,
   type EngineQuotaReadResult,
 } from "./adapter-account-quota.js";
+import { fetchGeminiOAuthQuota, readGeminiStoredOAuth } from "./gemini-oauth-quota.js";
 import { killProcessTree } from "./process-tree.js";
 
 export type AntigravityQuotaSpawnOptions = {
@@ -229,6 +230,7 @@ export async function readOwnedAntigravityQuota(input: {
   scope: AdapterQuotaScope;
   options: EngineQuotaReadOptions;
   captureScope: () => AdapterQuotaScope;
+  fetchFn?: typeof fetch;
   now?: () => number;
 }): Promise<EngineQuotaReadResult> {
   if (owned.get(input.cache)?.size) return input.cache.failure(input.scope, "timeout");
@@ -256,6 +258,26 @@ export async function readOwnedAntigravityQuota(input: {
   };
 
   try {
+    // Part B (owner-approved 2026-11-23): when a live, non-expired Gemini OAuth access token is
+    // already stored locally, query Google's retrieveUserQuota read-only without spawning `agy`.
+    const storedOAuth = readGeminiStoredOAuth(input.env, now());
+    if (storedOAuth) {
+      const oauthSnapshot = await fetchGeminiOAuthQuota({
+        accessToken: storedOAuth.accessToken,
+        projectId: storedOAuth.projectId,
+        signal: abort.signal,
+        timeoutMs: Math.min(timeoutMs, 10_000),
+        fetchFn: input.fetchFn,
+        now,
+      });
+      if (abort.signal.aborted) return fail(timedOut ? "timeout" : "cancelled");
+      const afterOAuth = input.captureScope();
+      if (afterOAuth.revision !== input.scope.revision) return input.cache.failure(afterOAuth, "auth_changed");
+      if (oauthSnapshot.state === "ready") {
+        return input.cache.store(afterOAuth, { snapshot: oauthSnapshot });
+      }
+    }
+
     const versionRun = await runBoundedQuotaCommand({
       executable: input.executable,
       args: ["--version"],
