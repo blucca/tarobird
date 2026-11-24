@@ -31,10 +31,10 @@ export const quotaWindowSchema = z.discriminatedUnion("metric", [
   z.object({ ...windowFields, metric: z.literal("percent"), usedPercent: z.number().finite().min(0).max(2147483647) }).strict(),
   z.object({ ...windowFields, metric: z.literal("unknown") }).strict(),
 ]);
-// Only native credit balances are currently implemented. They are not currency or token estimates.
+// Native credit or top-up currency balances. They are not token estimates.
 export const quotaBalanceSchema = z.object({
-  id: identifier, kind: z.literal("credits"), amount: z.string().max(80).regex(/^\d+(?:\.\d+)?$/).nullable(),
-  unit: z.literal("credits"), observedAt: timestamp, expiresAt: timestamp, unlimited: z.boolean().optional(),
+  id: identifier, kind: z.enum(["credits", "currency"]), amount: z.string().max(80).regex(/^\d+(?:\.\d+)?$/).nullable(),
+  unit: z.string().min(1).max(16).regex(/^[A-Za-z0-9._-]+$/), observedAt: timestamp, expiresAt: timestamp, unlimited: z.boolean().optional(),
 }).strict();
 export const quotaConstraintSchema = z.object({
   code: z.enum(["ordinary_usage_blocked", "spend_control", "credits_depleted", "overage_disabled", "other_native_limit"]),

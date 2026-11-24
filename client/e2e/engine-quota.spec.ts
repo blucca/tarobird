@@ -271,3 +271,46 @@ test("a failed quota card preserves marked old values while a retired scope only
     await expect(coder).toContainText("剩余 62%"); await expect(coder.getByRole("alert")).toHaveCount(0);
   } finally { await f.close(); }
 });
+
+test("Kimi quota card renders plan windows, top-up balance, and distinct 404 / API-key / login-required explanations", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    const now = Date.now(), stamp = (delta = 0) => new Date(now + delta).toISOString();
+    f.records.research!.snapshot = {
+      authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "allowed", observedAt: stamp(),
+      pools: [{
+        id: "kimi", label: "Kimi Code", sharing: "shared", availability: "allowed",
+        windows: [
+          { id: "five_hour", label: "5 hours", metric: "percent", usedPercent: 12, availability: "allowed", observedAt: stamp(), expiresAt: stamp(60_000), resetsAt: stamp(2 * 3_600_000), periodSeconds: 18_000 },
+          { id: "seven_day", label: "7 days", metric: "percent", usedPercent: 30, availability: "allowed", observedAt: stamp(), expiresAt: stamp(60_000), resetsAt: stamp(5 * 86_400_000), periodSeconds: 604_800 },
+        ],
+        balances: [{ id: "top_up", kind: "currency", unit: "CNY", amount: "45.50", observedAt: stamp(), expiresAt: stamp(60_000) }],
+        constraints: [],
+      }],
+      constraints: [],
+      help: "kimi_usage",
+    };
+    await f.open();
+    const panel = page.locator(".engine-quota:visible");
+    const kimi = panel.getByRole("region", { name: "Research Bot · Kimi", exact: true });
+    await expect(kimi).toContainText("剩余 88%");
+    await expect(kimi).toContainText("剩余 70%");
+    await expect(kimi).toContainText("加油包余额");
+    await expect(kimi).toContainText("45.50 CNY");
+
+    // 404 non-Kimi-For-Coding explanation.
+    f.records.research!.snapshot = unavailableQuota("kimi", "mode_not_supported", now, "other");
+    await panel.getByRole("button", { name: "重新读取列表", exact: true }).click();
+    await expect(kimi).toContainText("不是 Kimi For Coding 套餐账号");
+
+    // API key only explanation.
+    f.records.research!.snapshot = unavailableQuota("kimi", "mode_not_supported", now, "api_key");
+    await panel.getByRole("button", { name: "重新读取列表", exact: true }).click();
+    await expect(kimi).toContainText("仅配置了 API Key");
+
+    // Not signed in explanation.
+    f.records.research!.snapshot = unavailableQuota("kimi", "login_required", now, "unknown");
+    await panel.getByRole("button", { name: "重新读取列表", exact: true }).click();
+    await expect(kimi).toContainText("完成引擎登录");
+  } finally { await f.close(); }
+});

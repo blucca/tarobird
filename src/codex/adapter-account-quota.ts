@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { openSync, readSync, fstatSync, closeSync, constants } from "node:fs";
+import { openSync, readSync, fstatSync, statSync, closeSync, constants } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { QuotaAuthMode, QuotaEngine, QuotaSnapshot } from "../client-protocol/engine-quota.js";
@@ -39,11 +39,21 @@ function jsonRecord(text: string): Record<string, unknown> {
   return parsed;
 }
 
+function statFingerprint(file: string): string {
+  try {
+    const st = statSync(file);
+    return `${st.ino}:${st.size}:${Math.trunc(st.mtimeMs)}:${Math.trunc(st.ctimeMs)}`;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return "missing";
+    return "unreadable";
+  }
+}
+
 /** Private in-memory scope guard. No credential values, hashes or file paths are emitted to logs/public DTOs. */
 export class AdapterQuotaCache {
   readonly proofKey = randomBytes(32);
   private cached?: { revision: string; snapshot: QuotaSnapshot; proof?: QuotaAccountProof };
-  constructor(private readonly engine: "codex" | "claude" | "antigravity", private readonly executable: string, private readonly env: NodeJS.ProcessEnv, private readonly cwd?: string, private readonly configPath?: string) {}
+  constructor(private readonly engine: "codex" | "claude" | "antigravity" | "kimi", private readonly executable: string, private readonly env: NodeJS.ProcessEnv, private readonly cwd?: string, private readonly configPath?: string) {}
 
   capture(workerGeneration: string): AdapterQuotaScope {
     const digest = (value: unknown) => createHmac("sha256", this.proofKey).update(JSON.stringify(value)).digest("hex");
@@ -52,7 +62,9 @@ export class AdapterQuotaCache {
       ? this.env.CODEX_HOME || path.join(home, ".codex")
       : this.engine === "claude"
         ? this.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude")
-        : path.join(home, ".gemini", "antigravity-cli");
+        : this.engine === "kimi"
+          ? this.env.KIMI_CODE_HOME || path.join(home, ".kimi-code")
+          : path.join(home, ".gemini", "antigravity-cli");
     let authMode: QuotaAuthMode = "unknown", verifiable = false;
     let material: unknown;
     try {
@@ -82,6 +94,28 @@ export class AdapterQuotaCache {
         // The macOS CLI may prefer Keychain over the plaintext file. Only an explicit env token proves that source here.
         verifiable = !opaque && authMode !== "unknown" && (process.platform !== "darwin" || Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN || this.env.ANTHROPIC_API_KEY || this.env.ANTHROPIC_AUTH_TOKEN) || cloud);
         material = [this.executable, engineHome, configured, settings, project, authText, env];
+      } else if (this.engine === "kimi") {
+        // Never read or copy Kimi's credential bytes; track login/config changes via filesystem metadata only.
+        const legacyHome = path.join(home, ".kimi");
+        const meta = [
+          statFingerprint(path.join(engineHome, "config.toml")),
+          statFingerprint(path.join(engineHome, "credentials")),
+          statFingerprint(path.join(engineHome, "credentials.json")),
+          statFingerprint(path.join(engineHome, "oauth.json")),
+          statFingerprint(path.join(legacyHome, "config.toml")),
+          statFingerprint(path.join(legacyHome, "credentials")),
+          statFingerprint(path.join(legacyHome, "credentials.json")),
+        ];
+        const hasApiKeyOnly = Boolean(this.env.KIMI_API_KEY)
+          && meta[1] === "missing" && meta[2] === "missing" && meta[3] === "missing" && meta[5] === "missing" && meta[6] === "missing";
+        const envFlags = [
+          Boolean(this.env.KIMI_API_KEY),
+          this.env.KIMI_CODE_HOME ?? "",
+          this.env.KIMI_BASE_URL ?? "",
+        ];
+        authMode = hasApiKeyOnly ? "api_key" : "subscription";
+        verifiable = true;
+        material = [this.executable, engineHome, configured, meta, envFlags];
       } else {
         const geminiHome = path.join(home, ".gemini");
         const settings = readBounded(path.join(engineHome, "settings.json"));
@@ -127,7 +161,7 @@ export class AdapterQuotaCache {
     }
     if (scope.authMode !== "subscription") { this.cached = undefined; return { revision: scope.revision, snapshot: unavailableQuota(this.engine, "mode_not_supported", Date.now(), scope.authMode) }; }
     if (this.cached?.revision !== scope.revision) this.cached = undefined;
-    if (options.refresh && (this.engine === "codex" || this.engine === "antigravity")) {
+    if (options.refresh && (this.engine === "codex" || this.engine === "antigravity" || this.engine === "kimi")) {
       // `agy` may open a browser sign-in each time it is asked while signed out. Once it has said so, it is
       // not started again for the same login state until this long has passed.
       if (this.engine === "antigravity" && this.cached?.snapshot.state === "login_required" && this.cached.snapshot.lastAttemptAt

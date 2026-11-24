@@ -1,6 +1,6 @@
 import { useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { LoaderCircle, RefreshCw } from "lucide-react";
-import { quotaReadingExpired, type QuotaConstraint, type QuotaEngine, type QuotaReason, type QuotaSnapshot, type QuotaWindow } from "../../src/client-protocol/engine-quota.js";
+import { quotaReadingExpired, type QuotaAuthMode, type QuotaConstraint, type QuotaEngine, type QuotaReason, type QuotaSnapshot, type QuotaWindow } from "../../src/client-protocol/engine-quota.js";
 import type { HubConnection } from "./connection.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
 import { SettingsGroupHeading } from "./SettingsParts.js";
@@ -9,12 +9,18 @@ import { t, useLocale } from "./i18n.js";
 import "./engine-quota.css";
 
 const engines = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
-function reasonText(reason: QuotaReason | undefined, engine: QuotaEngine): string {
+function reasonText(reason: QuotaReason | undefined, engine: QuotaEngine, authMode?: QuotaAuthMode): string {
   switch (reason) {
     case "not_adapted": return t("此引擎尚未接入原生额度。");
     case "not_loaded": return t("尚未读取原生额度，可点击刷新。");
     case "native_unverified": return t("此引擎的原生额度接口尚未验证。");
-    case "mode_not_supported": return t("此授权方式不提供可读取的原生额度。");
+    case "mode_not_supported":
+      if (engine === "kimi") {
+        return authMode === "api_key"
+          ? t("当前仅配置了 API Key，未登录 Kimi For Coding 套餐账号，无套餐额度可读取。")
+          : t("当前账号不是 Kimi For Coding 套餐账号（服务端返回 404），不提供编程套餐额度。");
+      }
+      return t("此授权方式不提供可读取的原生额度。");
     case "no_passive_event": return t("尚未收到原生额度状态，仅在正常使用中被动更新。");
     case "login_required": return t("请先在运行主机上完成引擎登录，再刷新。");
     case "auth_changed": return t("授权信息已变化，旧额度已清除。请核对后再次刷新。");
@@ -93,7 +99,7 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
         const passive = scope.capability.mode === "passive";
         const canRead = scope.capability.mode !== "unsupported" && scope.state !== "offline" && scope.state !== "unsupported" && scope.reason !== "host_upgrade_required";
         const cooling = !!scope.nextRefreshAt && Date.parse(scope.nextRefreshAt) > now;
-        const busy = quota.busy.includes(scope.id), reason = reasonText(scope.reason ?? scope.capability.reason, scope.engine);
+        const busy = quota.busy.includes(scope.id), reason = reasonText(scope.reason ?? scope.capability.reason, scope.engine, scope.authMode);
         const help = scope.state === "ready" && !stale ? "" : helpText(scope.help);
         const auth = ({ subscription: t("订阅授权"), api_key: "API Key", adc: t("应用默认凭据"), other: t("其他授权"), unknown: t("授权方式未确认") })[scope.authMode];
         const constraints = [...scope.constraints, ...scope.pools.flatMap(pool => pool.constraints)];
@@ -107,7 +113,7 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
           {constraints.length > 0 && <ul className="quota-constraints">{constraints.map((value, index) => <li key={`${value.code}:${index}`}>{constraintText(value)}{value.resetsAt && <span> · {Date.parse(value.resetsAt) <= now ? t("已到重置时间，等待更新") : t("重置：{0}", formatTime(value.resetsAt))}</span>}</li>)}</ul>}
           {scope.pools.map(pool => <div className="quota-pool" key={pool.id}><h5>{pool.label}</h5>{pool.models?.length ? <p className="muted">{pool.models.join(" · ")}</p> : null}
             {pool.windows.map(window => <WindowQuota key={window.id} window={window} stale={stale} now={now} formatTime={formatTime} formatNumber={formatNumber}/>)}
-            {pool.balances.map(balance => <p className="quota-balance" key={balance.id}>{t("原生 credits")}<strong>{balance.unlimited ? t("不限额") : balance.amount === null ? t("尚无数据") : `${balance.amount} credits`}</strong>{(stale || expired(balance, now)) && <small>{t("上次读数，需重新读取")}</small>}</p>)}
+            {pool.balances.map(balance => <p className="quota-balance" key={balance.id}>{balance.kind === "currency" ? t("加油包余额") : t("原生 credits")}<strong>{balance.unlimited ? t("不限额") : balance.amount === null ? t("尚无数据") : `${balance.amount} ${balance.unit}`}</strong>{(stale || expired(balance, now)) && <small>{t("上次读数，需重新读取")}</small>}</p>)}
           </div>)}
           {quota.errors[scope.id] && <p className="quota-notice" role="alert">{t("本次刷新失败，可重试。保留的读数不代表当前余额。")}</p>}
           <footer className="quota-card-footer"><div>{scope.observedAt && <time dateTime={scope.observedAt}>{t("读取于 {0}", formatTime(scope.observedAt))}</time>}{cooling && <time dateTime={scope.nextRefreshAt}>{t("{0} 后可再刷新", formatTime(scope.nextRefreshAt!))}</time>}</div>
