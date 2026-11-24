@@ -323,6 +323,7 @@ export class CronScheduler {
           });
         } else if (executionError === undefined) {
           await this.recordRunBestEffort(tracked.job(), { success: true, ranAt });
+          const mode = job.deliveryMode ?? (job.runOnce ? "notify" : "agent");
           await appendTimelineEventBestEffort(this.stateDir, {
             type: "cron.completed",
             instanceName: this.instanceName,
@@ -330,7 +331,8 @@ export class CronScheduler {
             chatId: job.chatId,
             userId: job.userId,
             outcome: "success",
-            metadata: { cronJobId: job.id },
+            detail: mode === "notify" ? "reminder sent (Bot did not run)" : "Bot turn completed",
+            metadata: { cronJobId: job.id, deliveryMode: mode },
           });
         } else {
           const detail = executionError instanceof Error ? executionError.message : String(executionError);

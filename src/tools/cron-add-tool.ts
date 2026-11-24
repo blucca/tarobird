@@ -308,9 +308,13 @@ function renderAccepted(record: CronJobRecord, locale: Locale): string {
     ? formatInCronTimezone(record.targetAt, record.timezone)
     : record.cronExpr;
   const timezone = record.timezone && !record.runOnce ? ` (${record.timezone})` : "";
+  const isNotify = record.deliveryMode === "notify";
+  const modeLine = locale === "zh"
+    ? (isNotify ? "🔔 模式：仅发送提醒卡片，不会运行 Bot" : "🤖 模式：到点自动运行 Bot 执行此任务")
+    : (isNotify ? "🔔 Mode: reminder only — the Bot will not run" : "🤖 Mode: the Bot will run this prompt");
   return locale === "zh"
-    ? `✓ 已添加定时任务  ID  ${record.id}\n⏰ ${when}${timezone}\n📝 ${record.prompt}`
-    : `✓ Scheduled task added  ID  ${record.id}\n⏰ ${when}${timezone}\n📝 ${record.prompt}`;
+    ? `✓ 已添加定时任务  ID  ${record.id}\n⏰ ${when}${timezone}\n${modeLine}\n📝 ${record.prompt}`
+    : `✓ Scheduled task added  ID  ${record.id}\n⏰ ${when}${timezone}\n${modeLine}\n📝 ${record.prompt}`;
 }
 
 export function renderCronAddInvalidPayloadMessage(detail: string, locale: Locale): string | null {
@@ -356,12 +360,13 @@ export async function executeCronAddTool(payload: unknown, context: CronAddToolC
       detail: "cron.add tool accepted",
       metadata: {
         cronJobId: record.id,
+        deliveryMode: record.deliveryMode ?? (record.runOnce ? "notify" : "agent"),
         targetAt: record.targetAt,
         cronExpr: record.cronExpr,
         timezone: record.timezone,
       },
     });
-    return { ok: true, status: "accepted", message, metadata: { cronJobId: record.id } };
+    return { ok: true, status: "accepted", message, metadata: { cronJobId: record.id, deliveryMode: record.deliveryMode ?? (record.runOnce ? "notify" : "agent") } };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     const message = renderRejected(detail, context.locale);
