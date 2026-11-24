@@ -29,7 +29,7 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import { CalendarClock, Archive as ArchiveIcon, ArrowLeft, Settings, Bell, ShieldCheck, Wifi, WifiOff, RefreshCw, MonitorCog } from 'lucide-react';
+import { CalendarClock, Archive as ArchiveIcon, ArrowLeft, Settings, Bell, ShieldCheck, Wifi, WifiOff, RefreshCw, MonitorCog, Puzzle } from 'lucide-react';
 import type { Conversation } from '../../src/client-protocol/index.js';
 import { Avatar, AvatarProvider, ConversationAvatar } from './Avatar.js';
 import { BotReferences, ReferencePreview } from './BotReferences.js';
@@ -53,7 +53,7 @@ type BotScope = { hostId: string; botId: string };
 export type MobileInboxState = { query: string; filter: MobileFilter; botScope?: BotScope; botQuery?: string };
 export type MobileScrollPositions = Record<MobileTab, number>;
 export type MobileCreateKind = 'bot' | 'group' | 'direct' | 'schedule';
-export type MobileOpenTarget = 'settings' | 'connection' | 'screen' | 'devices' | 'notifications' | 'files' | 'capabilities' | 'operations' | 'schedules' | 'hosts' | 'archives';
+export type MobileOpenTarget = 'settings' | 'connection' | 'screen' | 'devices' | 'notifications' | 'files' | 'capabilities' | 'operations' | 'schedules' | 'hosts' | 'archives' | 'plugins';
 type Locale = ReturnType<typeof useLocale>;
 
 export type MobileHomeProps = {
@@ -711,6 +711,7 @@ function MePane({ hosts, activeHost, selectHost, open }: PaneProps) {
       <section>
         <ul className="mh-group">
           <Cell icon={<Bell size={20}/>} label={t('消息通知')} description={notificationSummary(activeHost)} disabled={!activeHost} onClick={() => open('notifications')} />
+          <Cell icon={<Puzzle size={20}/>} label={t('插件管理')} description={t('浏览、安装与管理扩展插件')} onClick={() => open('plugins')} />
           <Cell settingsEntry="settings" icon={<SlidersIcon />} label={t('设置')} onClick={() => open('settings')} />
         </ul>
       </section>

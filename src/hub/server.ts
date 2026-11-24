@@ -2656,6 +2656,11 @@ export class HubServer {
         "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; worker-src blob:; style-src 'unsafe-inline' https:; img-src data: https:; media-src https:; font-src data: https:; connect-src https: wss:; frame-src about:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts" });
       res.end(await readFile(file)); return;
     }
+    if (relative === "plugin-sandbox.html") {
+      res.writeHead(200, { "Content-Type": "text/html", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src https: wss:; frame-src about:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts" });
+      res.end(await readFile(file)); return;
+    }
     const localConnect = this.options.tls ? "" : " http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*";
     res.writeHead(200, { "Content-Type": mime, "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": `default-src 'self'; connect-src 'self' https: wss:${localConnect}; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src 'self' blob: data:; font-src 'self' data:; frame-ancestors 'none'` }); res.end(await readFile(file));
   }

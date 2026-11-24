@@ -20,7 +20,8 @@ import { FontSizeSlider } from "./FontSizeSlider.js";
 import { LayoutDensityPicker } from "./LayoutDensityPicker.js";
 import { useBackAction } from "./back-navigation.js";
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject } from "react";
-import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Link, Monitor, MonitorCog, Plus, QrCode, ScanLine, Settings2, ShieldCheck, Gauge, X } from "lucide-react";
+import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Link, Monitor, MonitorCog, Plus, Puzzle, QrCode, ScanLine, Settings2, ShieldCheck, Gauge, X } from "lucide-react";
+import { PluginsView } from "./PluginsPanel.js";
 import { ConnectionPanel } from "./ConnectionPanel.js";
 import { ScreenControlPanel } from "./ScreenControlPanel.js";
 import { hasScreenViewer } from "./mobile-screen-viewer-transport.js";
@@ -46,7 +47,7 @@ import { ambiguousDeviceName, deviceDisplayName, deviceRevokeScope } from "./dev
 import "./device-settings.css";
 import { BotMessageGrants } from "./BotMessageGrants.js";
 
-type Section = "workbench" | "backups" | "general" | "network" | "notifications" | "devices" | "botMessages" | "voice" | "engines" | "quota";
+type Section = "workbench" | "plugins" | "backups" | "general" | "network" | "notifications" | "devices" | "botMessages" | "voice" | "engines" | "quota";
 /** `created_at`/`last_seen` come from the host; 0 or missing means never recorded. */
 type Device = { id: string; name: string; nameSource?: "host"; platform: string; revoked: number; created_at?: number | string | null; last_seen?: number | string | null };
 /** Messages appear beside the control that produced them, not at the page end. */
@@ -163,6 +164,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
     ...(quotaPage ? [{ id: "quota" as const, title: t("模型额度"), detail: t("原生剩余额度与重置时间"), icon: Gauge }] : []),
     { id: "network" as const, title: t("网络与连接"), detail: t("连接线路、VPS 与主机组网"), icon: Globe },
     { id: "workbench" as const, title: t("工作台文件"), detail: t("集中管理白板、笔记与设计"), icon: FolderOpen },
+    { id: "plugins" as const, title: t("插件管理"), detail: t("浏览、安装与管理隔离沙箱插件"), icon: Puzzle },
     { id: "backups" as const, title: t("数据与备份"), detail: t("自动备份、保留天数与空间占用"), icon: Database },
     { id: "voice" as const, title: t("语音转写"), detail: t("本地语音与通义长录音转写"), icon: AudioLines },
     { id: "notifications" as const, title: t("通知"), detail: t("此设备的提醒与勿扰时段"), icon: Bell },
@@ -440,6 +442,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
         <section hidden={section !== "engines"} aria-label={t("引擎程序")}><h3>{t("引擎程序")}</h3><EngineSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "engines" && (!phone || !overview)} onDirty={setEngineDirty} onBusy={setEngineBusy}/></section>
         {quotaPage && <section hidden={section !== "quota"} aria-label={t("模型额度")}><h3>{t("模型额度")}</h3><EngineQuota key={connection.identity.hubPublicKey} connection={connection} active={section === "quota" && (!phone || !overview)}/></section>}
         <section hidden={section !== "workbench"} aria-label={t("工作台文件")}><h3>{t("工作台文件")}</h3><WorkbenchLibrary connection={connection} active={section === "workbench" && (!phone || !overview)} onBusy={setLibraryBusy} onOpened={close} openLocalFile={openWorkbenchFile}/></section>
+        <section hidden={section !== "plugins"} aria-label={t("插件管理")}><h3>{t("插件管理")}</h3><PluginsView platform={phone ? "phone" : "desktop"}/></section>
         <section hidden={section !== "backups"} aria-label={t("数据与备份")}><h3>{t("数据与备份")}</h3><BackupSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "backups" && (!phone || !overview)} onDirty={setBackupDirty} onBusy={setBackupBusy}/></section>
         <section hidden={section !== "voice"} aria-label={t("语音转写")}><h3>{t("语音转写")}</h3><VoiceSettings key={connection.identity.hubPublicKey} connection={connection} active={section === "voice" && (!phone || !overview)} onDirty={setVoiceDirty} onBusy={setVoiceBusy}/></section>
         <section hidden={section !== "botMessages"} aria-label={t("Bot 消息授权")}>
