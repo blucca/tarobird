@@ -13,7 +13,7 @@ import { cache, type Route, type Identity, type PendingPairing } from "./storage
 import { nativePlatform, deleteNativeIdentity } from "./native.js";
 import { t, useLocale } from "./i18n.js";
 import { hubFetch, usesPinnedTransport } from "./transport.js";
-import { connectionVerificationFailure, connectionVerificationMessage, preferredVerificationFailure, validHubPublicKey } from "./connection-verification.js";
+import { connectionDiagnosticCode, connectionVerificationFailure, connectionVerificationMessage, preferredVerificationFailure, validHubPublicKey } from "./connection-verification.js";
 import { pairingInviteError } from "./pairing-invite-errors.js";
 
 const PairingCode = lazy(() => import("./PairingCode.js").then(module => ({ default: module.PairingCode })));
@@ -51,7 +51,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     });
     return () => cancelAnimationFrame(frame);
   }, [scan]);
-  const [createdIdentity, setIdentity] = useState<Identity>(), [error, setError] = useState(""), [busy, setBusy] = useState(false);
+  const [createdIdentity, setIdentity] = useState<Identity>(), [error, setError] = useState(""), [diagnostic, setDiagnostic] = useState<string>(), [busy, setBusy] = useState(false);
   // On a short phone screen the action sits at the bottom edge, so a refusal
   // below it would look like nothing happened. Reveal it; focus stays put.
   const revealFailure = () => { if (phone) failure.current?.scrollIntoView({ block: "nearest", behavior: "instant" }); };
@@ -99,7 +99,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     return { code: result.code, expiresAt: result.expiresAt, request: { requestId: request.requestId }, serverTimeOffset: Number.isFinite(result.serverTime) ? result.serverTime! - Date.now() : pairingClockOffset(response.headers.get("date"), Date.now()) };
   };
   const pair = async (event: FormEvent) => {
-    event.preventDefault(); if (admission.current) return; admission.current = true; setBusy(true); setError(""); let created: Identity | undefined, persisted = false;
+    event.preventDefault(); if (admission.current) return; admission.current = true; setBusy(true); setError(""); setDiagnostic(undefined); let created: Identity | undefined, persisted = false;
     try {
       if (!invite) throw new Error(pairingInviteError("invite_required"));
       const { routes, deployment: routeDeployment } = connectionConfiguration(address, relays, deployment, legacyDirect);
@@ -107,7 +107,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       if (usesPinnedTransport() && trustedKey && !validHubPublicKey(trustedKey)) throw new Error("invalid_hub_key");
       rememberRouteTrust(routes, trustedKey);
       const probes = await Promise.allSettled(orderedRoutes(routes).map(async (route) => {
-        const response = await hubFetch(route.url, "/health", trustedKey, { signal: timeoutSignal(usesPinnedTransport() ? 6000 : 2000), cache: "no-store" });
+        const response = await hubFetch(route.url, "/health", trustedKey, { signal: timeoutSignal(usesPinnedTransport() ? 15_000 : 4000), cache: "no-store" });
         const health = await response.json() as { ok?: boolean; publicKey?: string; pairingInvites?: number };
         if (!response.ok || health.ok !== true || typeof health.publicKey !== "string") throw new Error("hub_unavailable");
         if (trustedKey && health.publicKey !== trustedKey) throw new Error("tls_identity_mismatch");
@@ -115,7 +115,10 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       }));
       const available = probes.find((result) => result.status === "fulfilled");
       if (!available || available.status !== "fulfilled") {
-        const failure = preferredVerificationFailure(probes.map((result) => result.status === "rejected" ? connectionVerificationFailure(result.reason) : undefined));
+        const reasons = probes.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+        const failure = preferredVerificationFailure(reasons.map((reason) => connectionVerificationFailure(reason)));
+        const code = reasons.map((reason) => connectionDiagnosticCode(reason)).find((value): value is string => !!value);
+        setDiagnostic(code);
         throw new Error(connectionVerificationMessage(failure) ?? t("没有可用且身份匹配的线路，请检查地址后重试。"));
       }
       if (!available.value.supportsInvites) throw new Error(t("请先更新此主机，才能使用限时连接码配对新设备。"));
@@ -127,6 +130,8 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       setIdentity(device); setNow(Date.now());
     } catch (e) {
       if (created && !persisted) { if (discard) await discard(created).catch(() => undefined); else if (created.keyRef) await deleteNativeIdentity(created.keyRef).catch(() => undefined); }
+      const code = connectionDiagnosticCode(e);
+      if (code) setDiagnostic(code);
       setError(connectionVerificationMessage(connectionVerificationFailure(e)) ?? (e instanceof Error ? e.message : t("连接失败")));
     } finally { admission.current = false; setBusy(false); }
   };
@@ -244,6 +249,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       </form>
     </>}
     {error && <p ref={failure} role="alert" className="error-text">{error}</p>}
+    {error && diagnostic && <details className="pairing-options pairing-diagnostic"><summary>{t("技术诊断")}</summary><p className="muted">{t("诊断码：{0}", diagnostic)}</p></details>}
     {reviewing && routeHint}
     <footer><ShieldCheck size={13} aria-hidden="true"/>{t("只有经过你确认的设备才能访问 Bot。")}</footer>
   </div>{!pending && <PairingIntro/>}</div>
@@ -277,6 +283,6 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     }
     imported.current = true;
     setInvite(payload.invite);
-    setDeployment(payload.deployment); setLegacyDirect(payload.routes.find((r) => r.name !== "VPS")); setAddress(payload.routes.find((r) => r.name !== "VPS")?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError("");
+    setDeployment(payload.deployment); setLegacyDirect(payload.routes.find((r) => r.name !== "VPS")); setAddress(payload.routes.find((r) => r.name !== "VPS")?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError(""); setDiagnostic(undefined);
   }}/></Suspense>}</main>;
 }

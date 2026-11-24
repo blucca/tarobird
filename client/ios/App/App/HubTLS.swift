@@ -74,6 +74,45 @@ enum HubTLS {
             .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
     }
 
+    static func classifyTrustError(_ error: CFError?) -> String {
+        guard let cfError = error else { return "native_tls_untrusted" }
+        switch OSStatus(CFErrorGetCode(cfError)) {
+        case errSecHostNameMismatch:
+            return "native_tls_hostname_mismatch"
+        case errSecCertificateExpired, errSecCertificateNotValidYet:
+            return "native_tls_cert_expired"
+        case errSecInvalidExtendedKeyUsage, errSecInvalidKeyUsageForPolicy, errSecCertificateValidityPeriodTooLong:
+            return "native_tls_cert_policy_rejected"
+        default:
+            return "native_tls_untrusted"
+        }
+    }
+
+    static func classifyTransportError(_ error: Error) -> String {
+        if let network = error as? HubNetworkError { return network.code }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut:
+                return "native_request_timeout"
+            case .cannotFindHost, .dnsLookupFailed:
+                return "native_dns_failed"
+            case .cannotConnectToHost, .networkConnectionLost, .notConnectedToInternet:
+                return "native_connect_failed"
+            case .appTransportSecurityRequiresSecureConnection:
+                return "native_ats_blocked"
+            case .serverCertificateHasBadDate, .serverCertificateNotYetValid:
+                return "native_tls_cert_expired"
+            case .serverCertificateUntrusted, .serverCertificateHasUnknownRoot:
+                return "native_tls_untrusted"
+            case .secureConnectionFailed, .clientCertificateRejected, .clientCertificateRequired:
+                return "native_tls_handshake_failed"
+            default:
+                return "native_transport_failed"
+            }
+        }
+        return "native_transport_failed"
+    }
+
     static func verify(_ bytes: Data, publicKey: String, nonce: String, certificate: Data) throws {
         let verifier = try self.publicKey(publicKey)
         guard bytes.count <= proofLimit, let value = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
@@ -157,12 +196,12 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
         let connection = HubTLSSession(base: base, queue: queue, anchors: anchors)
         let probe = HubProofHandler(connection: connection, publicKey: publicKey, nonce: nonce, completion: completion)
         var request = URLRequest(url: try HubTLS.target(base, "/api/tls-identity?nonce=" + nonce))
-        request.timeoutInterval = 5
+        request.timeoutInterval = 12
         let task = connection.session.dataTask(with: request)
         connection.handlers[task.taskIdentifier] = probe
-        let deadline = DispatchWorkItem { task.cancel() }
+        let deadline = DispatchWorkItem { [weak probe] in probe?.markTimedOut(); task.cancel() }
         probe.deadline = deadline
-        queue.asyncAfter(deadline: .now() + 5, execute: deadline)
+        queue.asyncAfter(deadline: .now() + 12, execute: deadline)
         task.resume()
         return connection
     }
@@ -262,15 +301,18 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
                   SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess else {
                 rejectTrust("native_tls_untrusted", completion); return
             }
+            // Route-scoped private CAs have no public AIA/OCSP responders;
+            // disable network fetch so restricted/VPN networks never stall trust evaluation.
+            _ = SecTrustSetNetworkFetchAllowed(trust, false)
         }
         // Evaluate the supplied system policies, including hostname and ATS;
         // do not replace them with a weaker custom SSL policy.
         // Trust evaluation can fetch intermediates/revocation information.
         // Keep cancellation, deadlines and other hosts responsive while it runs.
-        let status = SecTrustEvaluateAsyncWithError(trust, queue) { [weak self] trust, trusted, _ in
+        let status = SecTrustEvaluateAsyncWithError(trust, queue) { [weak self] trust, trusted, trustError in
             guard let self = self, !self.cancelled else { completion(.cancelAuthenticationChallenge, nil); return }
             guard trusted, let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let certificate = chain.first else {
-                self.rejectTrust("native_tls_untrusted", completion); return
+                self.rejectTrust(HubTLS.classifyTrustError(trustError), completion); return
             }
             let leaf = SecCertificateCopyData(certificate) as Data
             guard (self.pin == nil || self.pin == leaf), (self.observedLeaf == nil || self.observedLeaf == leaf) else {
@@ -388,6 +430,8 @@ private final class HubProofHandler: HubTaskHandler {
     var deadline: DispatchWorkItem?
     private var bytes = Data()
     private var failure: Error?
+    private var timedOut = false
+    func markTimedOut() { timedOut = true }
     init(connection: HubTLSSession, publicKey: String, nonce: String, completion: @escaping (Result<HubTLSSession, Error>) -> Void) {
         self.connection = connection; key = publicKey; self.nonce = nonce; self.completion = completion
     }
@@ -406,7 +450,7 @@ private final class HubProofHandler: HubTaskHandler {
     override func completed(_ error: Error?) {
         deadline?.cancel(); deadline = nil
         do {
-            if let error = failure ?? error { throw error }
+            if let error = failure ?? (timedOut ? HubNetworkError("native_tls_identity_timeout") : error) { throw error }
             try connection.bindProof(bytes, key: key, nonce: nonce)
             completion(.success(connection))
         } catch { connection.cancelAll(); completion(.failure(error)) }

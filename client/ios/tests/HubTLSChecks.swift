@@ -120,7 +120,19 @@ private final class SocketProbe: HubTaskHandler, @unchecked Sendable {
             let hub = peer.peers["hub"]!, proxy = peer.peers["proxy"]!, rotating = peer.peers["rotating"]!, key = peer.peers["key"]!
             let ca = SecCertificateCreateWithData(nil, try Data(contentsOf: URL(fileURLWithPath: scratch + "/ca.der")) as CFData)!
             try await rejects("systemTrustRejectsPrivateCa") { _ = try await prepare(hub, key, nil) }
-            try await rejects("hostnameMismatchRejected") { _ = try await prepare(hub.replacingOccurrences(of: "127.0.0.1", with: "localhost"), key, ca) }
+            do { _ = try await prepare(hub.replacingOccurrences(of: "127.0.0.1", with: "localhost"), key, ca); try check(false, "hostnameMismatchRejected") }
+            catch {
+                let code = HubTLS.classifyTransportError(error)
+                try check(code == "native_tls_hostname_mismatch" || code == "native_tls_untrusted", "hostnameMismatchRejected")
+                results["hostnameMismatchCode"] = code
+            }
+            try check(HubTLS.classifyTransportError(URLError(.timedOut)) == "native_request_timeout", "classifyTimeoutError")
+            try check(HubTLS.classifyTransportError(URLError(.cannotFindHost)) == "native_dns_failed", "classifyDnsError")
+            try check(HubTLS.classifyTransportError(URLError(.cannotConnectToHost)) == "native_connect_failed", "classifyConnectError")
+            try check(HubTLS.classifyTransportError(URLError(.appTransportSecurityRequiresSecureConnection)) == "native_ats_blocked", "classifyAtsError")
+            try check(HubTLS.classifyTransportError(URLError(.secureConnectionFailed)) == "native_tls_handshake_failed", "classifyHandshakeError")
+            try check(HubTLS.classifyTransportError(URLError(.serverCertificateHasBadDate)) == "native_tls_cert_expired", "classifyExpiredError")
+            try check(HubTLS.classifyTransportError(HubNetworkError("native_tls_identity_timeout")) == "native_tls_identity_timeout", "classifyIdentityTimeoutError")
             try await rejects("activeProxyRejectedBeforeCredentials") { _ = try await prepare(proxy, key, ca) }
             try await rejects("cleartextLoopbackRejected") { _ = try HubTLS.origin("http://127.0.0.1:1") }
             let real = try await prepare(hub, key, ca); sessions.append(real)

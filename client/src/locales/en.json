@@ -5674,5 +5674,20 @@
   "未能并入，已改为排队": "Couldn't join the reply; queued instead",
   "经排队投递": "Delivered through the queue",
   "无法确认是否已并入": "Can't confirm whether it was merged",
-  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed."
+  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed.",
+  "暂时无法连接到主机地址，正在自动重试。请检查网络、代理或端口转发状态。": "Unable to reach the host address right now; retrying automatically. Check your network, proxy, or port-forwarding settings.",
+  "主机 TLS 证书未覆盖当前连接域名或 IP（SAN 不匹配），请更新主机证书后重试。": "The host TLS certificate does not cover this domain or IP address (SAN mismatch). Update the host certificate and try again.",
+  "主机 TLS 证书已过期或尚未生效，请检查主机与本机系统时间，或重新生成主机证书。": "The host TLS certificate has expired or is not yet valid. Check the system clock on both devices, or regenerate the host certificate.",
+  "系统安全策略拒绝了主机证书（如缺少 serverAuth 扩展、有效期过长或 TLS 套件不满足要求），请更新主机证书配置后重试。": "System security policy rejected the host certificate (for example missing serverAuth EKU, excessive validity period, or unsupported TLS parameters). Update the host certificate and try again.",
+  "未能信任主机 TLS 证书。请使用最新连接二维码导入完整证书信息；若经过代理或隧道，请确认未开启 HTTPS 解密或中间人拦截。": "The host TLS certificate is not trusted. Scan or paste the latest connection QR code so the private CA is included; if using a proxy or tunnel, make sure HTTPS decryption / MITM interception is turned off.",
+  "与主机建立 TLS 安全连接失败。请确认目标端口提供 HTTPS 透传，并检查代理或防火墙设置。": "TLS handshake with the host failed. Confirm the target port passes HTTPS through directly and check proxy or firewall settings.",
+  "主机安全验证超时。当前网络或代理延迟较高，请检查网络与代理节点后重试。": "Host security verification timed out. Network or proxy latency may be high — check your connection or proxy node and try again.",
+  "证书域名不匹配": "Certificate host mismatch",
+  "证书已过期": "Certificate expired",
+  "证书策略未通过": "Certificate policy rejected",
+  "证书未受信任": "Certificate untrusted",
+  "TLS 握手失败": "TLS handshake failed",
+  "安全验证超时": "Security check timed out",
+  "技术诊断": "Technical details",
+  "诊断码：{0}": "Diagnostic code: {0}"
 }
