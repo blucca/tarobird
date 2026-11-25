@@ -3,7 +3,7 @@ import { Capacitor } from "@capacitor/core";
 import { ENGINE_QUOTA_HUB_REFRESH_MS, type QuotaDirectory, type QuotaScope } from "../../src/client-protocol/engine-quota.js";
 import type { HubConnection } from "./connection.js";
 import { HubHttpError } from "./http-error.js";
-import { applyHostQuotaScope, cachedQuotaDirectory, subscribeQuotaStore, syncQuotaDirectory } from "./quota-store.js";
+import { applyHostQuotaScope, cachedQuotaDirectory, mergeStoredQuotaDirectory, subscribeQuotaStore, syncQuotaDirectory } from "./quota-store.js";
 
 type View = { connection: HubConnection; userId?: string; directory?: QuotaDirectory; loading: boolean; busy: string[]; errors: Record<string, string>; error?: string; notice?: string };
 type Request = { controller: AbortController; timer: ReturnType<typeof setTimeout> };
@@ -100,7 +100,7 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
     return subscribeQuotaStore(connection, () => {
       setView(previous => {
         if (previous.connection !== connection || previous.userId !== userId || !previous.directory) return previous;
-        const synced = syncQuotaDirectory(connection, previous.directory, Date.now());
+        const synced = mergeStoredQuotaDirectory(connection, previous.directory, Date.now());
         return { ...previous, directory: synced };
       });
     });

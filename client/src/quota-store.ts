@@ -8,6 +8,7 @@ import { hasUnresetQuotaData, loadSavedQuota, nextHeldQuota, savedQuotaAfter, sa
 type StoreEntry = {
   held: Map<string, QuotaScope>;
   saved: Map<string, QuotaScope>;
+  verified: Map<string, QuotaScope>;
   hydrated: boolean;
   listeners: Set<() => void>;
 };
@@ -22,7 +23,7 @@ const storage = {
 function entryFor(connection: HubConnection, now = Date.now()): StoreEntry {
   let entry = stores.get(connection);
   if (!entry) {
-    entry = { held: new Map(), saved: new Map(), hydrated: false, listeners: new Set() };
+    entry = { held: new Map(), saved: new Map(), verified: new Map(), hydrated: false, listeners: new Set() };
     stores.set(connection, entry);
   }
   const host = connection.identity.hubPublicKey;
@@ -71,6 +72,9 @@ export function readAllStoredQuotas(connection: HubConnection, now = Date.now())
 /** Reconciles an incoming Host/worker scope reply with held + persisted readings and persists the result. */
 export function applyHostQuotaScope(connection: HubConnection, botId: string, scope: QuotaScope, now = Date.now()): QuotaScope | undefined {
   const entry = entryFor(connection, now);
+  // Keep a worker's current login/status even when it invalidates a held reading.
+  // A Hub fallback cannot confirm or retire the login.
+  if (workerAnswered(scope)) entry.verified.set(botId, scope);
   const earlier = entry.saved.get(botId);
   const fate = earlier && !entry.held.has(botId) ? savedQuotaAfter(earlier, scope) : "drop";
   if (fate !== "wait") entry.saved.delete(botId);
@@ -89,15 +93,27 @@ export function applyHostQuotaScope(connection: HubConnection, botId: string, sc
  * keeps showing the last valid reading (marked stale) whenever the worker has not yet
  * returned a fresh reading, and shares any newly read scopes with open conversations. */
 export function syncQuotaDirectory(connection: HubConnection, directory: QuotaDirectory, now = Date.now()): QuotaDirectory {
+  for (const scope of directory.scopes) applyHostQuotaScope(connection, scope.id, scope, now);
+  return mergeStoredQuotaDirectory(connection, directory, now);
+}
+
+/** Projects the shared store into a directory without writing or notifying. Store
+ * subscribers must only read here, or their update would notify themselves again. */
+export function mergeStoredQuotaDirectory(connection: HubConnection, directory: QuotaDirectory, now = Date.now()): QuotaDirectory {
+  const entry = entryFor(connection, now);
   const scopes = directory.scopes.map((scope) => {
-    const held = applyHostQuotaScope(connection, scope.id, scope, now);
-    const stored = held ? { scope: held, fromCache: false } : readStoredQuota(connection, scope.id, now);
-    if (!scope.observedAt && stored && hasUnresetQuotaData(stored.scope, now)) {
+    const stored = readStoredQuota(connection, scope.id, now);
+    const verified = entry.verified.get(scope.id);
+    // The subscriber may hold a snapshot from a retired login. Reflect the
+    // worker's new login or invalidation, not the retired account's numbers.
+    if (verified && (!stored || verified.revision !== scope.revision)) return verified;
+    if (stored && hasUnresetQuotaData(stored.scope, now) &&
+        (!scope.observedAt || stored.scope.observedAt! > scope.observedAt)) {
       const canFallback = !workerAnswered(scope) || stored.scope.revision === scope.revision;
       if (canFallback) {
         return {
           ...scope,
-          state: "stale" as const,
+          state: scope.observedAt ? stored.scope.state : "stale" as const,
           availability: stored.scope.availability,
           observedAt: stored.scope.observedAt,
           pools: stored.scope.pools,

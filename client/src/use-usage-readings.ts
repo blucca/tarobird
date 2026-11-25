@@ -33,6 +33,10 @@ export function useUsageReadings(connection: HubConnection, input: {
 }) {
   const { conversationId, botId, model, quota, context, turn } = input;
   const [, redraw] = useState(0);
+  // A successful cache read can leave the sample unchanged; its next poll still
+  // needs arming. Age-only ticks must not postpone that independent poll.
+  const [readGeneration, completedRead] = useState(0);
+  const [ageTick, tickAge] = useState(0);
   const [usage, setUsage] = useState<{ key: string; value: ContextUsage }>();
   const key = `${conversationId ?? ""}:${botId ?? ""}`;
   const live = useRef({ connection, key }); live.current = { connection, key };
@@ -90,7 +94,7 @@ export function useUsageReadings(connection: HubConnection, input: {
         }
       } catch {
         recordFailure(false);
-      } finally { if (current()) redraw(count => count + 1); }
+      } finally { if (current()) { redraw(count => count + 1); completedRead(count => count + 1); } }
     })());
     await Promise.allSettled(readings);
     if (reading.current === mine) reading.current = undefined;
@@ -121,7 +125,7 @@ export function useUsageReadings(connection: HubConnection, input: {
     const retryOlderThan = failCount > 0 ? Math.min(QUOTA_READ_AGAIN_MS, delay) : QUOTA_READ_AGAIN_MS;
     const timer = setTimeout(() => { void latest.current(retryOlderThan); }, delay);
     return () => clearTimeout(timer);
-  }, [quota, botId, failCount, signInBackoff, quotaReading?.observedAt, quotaReading?.stale]);
+  }, [connection, key, quota, botId, failCount, signInBackoff, readGeneration, quotaReading?.observedAt, quotaReading?.stale]);
 
   // Redraw at fresh→stale boundary, window reset, or every minute while stale so age text stays current.
   const nextChangeAt = quotaReading ? quotaViewNextChangeAt(quotaReading) : undefined;
@@ -129,9 +133,9 @@ export function useUsageReadings(connection: HubConnection, input: {
     if (!quotaReading || nextChangeAt === undefined) return;
     const untilChange = Math.max(0, nextChangeAt - Date.now()) + 50;
     const wait = quotaReading.stale ? Math.min(untilChange, QUOTA_AGE_TICK_MS) : untilChange;
-    const timer = setTimeout(() => redraw(count => count + 1), wait);
+    const timer = setTimeout(() => tickAge(count => count + 1), wait);
     return () => clearTimeout(timer);
-  }, [quotaReading?.observedAt, quotaReading?.stale, nextChangeAt]);
+  }, [quotaReading?.observedAt, quotaReading?.stale, nextChangeAt, ageTick]);
 
   return {
     context: context && usage?.key === key ? contextView(usage.value) : undefined,
