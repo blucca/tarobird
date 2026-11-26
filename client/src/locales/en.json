@@ -5674,5 +5674,9 @@
   "未能并入，已改为排队": "Couldn't join the reply; queued instead",
   "经排队投递": "Delivered through the queue",
   "无法确认是否已并入": "Can't confirm whether it was merged",
-  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed."
+  "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed.",
+  "、": ", ",
+  "重新检测引擎": "Re-check engines",
+  "未检测到 {0}。若刚安装 CLI，可点击重新检测或在「找不到引擎？检查 CLI 路径」中指定路径；如仍找不到，请重启主机。": "Not detected: {0}. If you just installed a CLI, click Re-check engines or set its path under “Engine missing? Check CLI paths”. If it still isn’t found, restart the host.",
+  "未检测到 {0}。若刚安装 CLI，可点击重新检测或在「设置 → 引擎程序路径」中配置；如仍找不到，请重启主机。": "Not detected: {0}. If you just installed a CLI, click Re-check engines or configure it in Settings → Engine programs. If it still isn’t found, restart the host."
 }

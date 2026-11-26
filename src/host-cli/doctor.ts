@@ -2,6 +2,7 @@ import { resolvePiExecutable } from "../runtime/pi-executable.js";
 import { ENGINE_SETTINGS_REPAIR_HINT } from "../client-protocol/engine-settings.js";
 import path from "node:path";
 import { hostEngineEnvironment } from "../runtime/host-engine-settings.js";
+import { isLiveHostEnvironment, markLiveHostEnvironment, refreshWindowsRegistryPath } from "../runtime/windows-registry-path.js";
 import { readHubConfig } from "../hub/config.js";
 import { inspectHubService } from "../hub/service.js";
 import { resolveEngineExecutable } from "../runtime/engine-process.js";
@@ -35,6 +36,7 @@ export async function inspectHost(directory: string, env: NodeJS.ProcessEnv = pr
   let serviceEnvironmentDifferences: string[] = [], serviceEnvironmentCheck: string | undefined;
   try { serviceEnvironmentDifferences = await managedServiceEnvironmentDifferences(directory, env); }
   catch { serviceEnvironmentCheck = "host_service_environment_unavailable"; }
+  await refreshWindowsRegistryPath(env, { force: true });
   let engines: ReturnType<typeof inspectEngines>, environmentCheck: { error: string; variables: string[]; hint?: string } | undefined;
   try { engines = inspectEngines(hostEngineEnvironment(directory, buildHostEnvironment({ env }))); }
   catch (error) {
@@ -47,6 +49,7 @@ export async function inspectHost(directory: string, env: NodeJS.ProcessEnv = pr
     // Engine presence can still be checked without adopting invalid service
     // config/proxy settings. Never expose rejected values in diagnostic JSON.
     const fallback: NodeJS.ProcessEnv = {};
+    if (isLiveHostEnvironment(env)) markLiveHostEnvironment(fallback);
     const lookup = (key: string) => env[key] ?? (process.platform === "win32" ? Object.entries(env).find(([name]) => name.toUpperCase() === key)?.[1] : undefined);
     const search = lookup("PATH");
     if (search && !/[\x00-\x1f\x7f]/.test(search)) fallback.PATH = search;

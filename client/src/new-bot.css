@@ -30,6 +30,8 @@
 .bot-setup .new-bot-hint,.bot-setup .permission-select>p{font-size:12px;line-height:1.55;color:var(--muted);overflow-wrap:anywhere}
 .bot-setup .new-bot-cli{display:flex;align-items:flex-start;gap:6px}
 .bot-setup .new-bot-cli>svg{flex:none;margin-top:2px;color:var(--label,var(--muted))}
+.bot-setup .new-bot-unavailable{display:flex;flex-direction:column;align-items:flex-start;gap:6px;margin-top:8px}
+.bot-setup .new-bot-redetect{min-height:32px;padding:4px 12px;font-size:12px}
 .bot-setup .new-bot-block>.dashboard-notice{margin-bottom:0}
 
 /* Chancellor: one bordered option, short by default; details follow the tick. */
