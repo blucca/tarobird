@@ -502,6 +502,13 @@ test("explains dangling symlinks, version/rule metadata, and offers confirmed on
             eng.rule = "package-manager";
             eng.version = "codex 1.4.2";
           }
+          if (eng.id === "pi") {
+            eng.source = "auto";
+            eng.override = null;
+            eng.available = true;
+            eng.executable = f.executable;
+            eng.rule = "known-directory";
+          }
         }
       }
       return route.fulfill({ response, json: body });
@@ -511,6 +518,10 @@ test("explains dangling symlinks, version/rule metadata, and offers confirmed on
     const codexRow = f.panel.getByRole("region", { name: "Codex", exact: true });
     await expect(codexRow).toContainText("自动检测 · 包管理器全局目录");
     await expect(codexRow).toContainText("版本：codex 1.4.2");
+
+    const piRow = f.panel.getByRole("region", { name: "Pi", exact: true });
+    await expect(piRow).toContainText("自动检测 · 常见安装目录");
+    await expect(piRow).not.toContainText("手动指定");
 
     const dshRow = f.panel.getByRole("region", { name: "DeepSeek", exact: true });
     await expect(dshRow).toContainText(`${danglingLink} 指向的 ${danglingTarget} 已不存在`);

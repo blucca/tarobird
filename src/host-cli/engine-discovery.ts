@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
 import { accessSync, closeSync, constants, lstatSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { spawnEngine } from "../runtime/engine-process.js";
 
 export type DiscoveryRule =
   | "setting"
@@ -42,16 +39,104 @@ export type CommandRunner = (
 
 export const SHELL_ENV_PROBE_FLAG = "TAROBIRD_SHELL_ENV_PROBE";
 
-const defaultRunner: CommandRunner = async (file, args, options) => {
-  const { stdout, stderr } = await execFileAsync(file, args, {
-    timeout: options.timeout,
-    maxBuffer: 2 * 1024 * 1024,
-    env: options.env,
-    windowsHide: options.windowsHide ?? true,
-    encoding: "utf8",
+const MAX_RUNNER_BUFFER = 2 * 1024 * 1024;
+
+function isTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { killed?: boolean; signal?: string; code?: string };
+  return !!candidate.killed || candidate.signal === "SIGTERM" || candidate.code === "ETIMEDOUT";
+}
+
+/** Execute a discovery helper command with stdin closed (`ignore`) and Windows
+ * `.cmd`/`.bat` shim support (via `spawnEngine`, avoiding Node 22+ `execFile` EINVAL). */
+export const defaultCommandRunner: CommandRunner = (file, args, options) =>
+  new Promise((resolve, reject) => {
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+    let totalBytes = 0;
+    let child: ReturnType<typeof spawnEngine>;
+    try {
+      child = spawnEngine(file, args, {
+        env: options.env,
+        windowsHide: options.windowsHide ?? true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (hardKillTimer) clearTimeout(hardKillTimer);
+    };
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (err) reject(err);
+      else resolve({ stdout, stderr });
+    };
+    const killChild = () => {
+      try {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGTERM");
+          if (process.platform !== "win32") {
+            hardKillTimer = setTimeout(() => {
+              try {
+                if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+              } catch { /* ignore */ }
+            }, 250);
+            hardKillTimer.unref();
+          }
+        }
+      } catch { /* ignore */ }
+    };
+
+    const timeoutTimer = options.timeout > 0
+      ? setTimeout(() => {
+        killChild();
+        finish(Object.assign(new Error(`Command timed out after ${options.timeout}ms`), {
+          killed: true,
+          signal: "SIGTERM",
+          code: "ETIMEDOUT",
+        }));
+      }, options.timeout)
+      : undefined;
+    timeoutTimer?.unref();
+
+    const onData = (target: "stdout" | "stderr", chunk: Buffer) => {
+      if (settled) return;
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_RUNNER_BUFFER) {
+        killChild();
+        finish(Object.assign(new Error("Command maxBuffer exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }));
+        return;
+      }
+      if (target === "stdout") stdout += chunk.toString("utf8");
+      else stderr += chunk.toString("utf8");
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => onData("stdout", chunk));
+    child.stderr?.on("data", (chunk: Buffer) => onData("stderr", chunk));
+    child.once("error", error => finish(error));
+    child.once("close", (code, signal) => {
+      if (code === 0 && !signal) {
+        finish();
+      } else {
+        finish(Object.assign(new Error(`Command failed (${signal ?? code ?? "unknown"})`), {
+          code: code ?? undefined,
+          signal: signal ?? undefined,
+          stdout,
+          stderr,
+        }));
+      }
+    });
   });
-  return { stdout: String(stdout ?? ""), stderr: String(stderr ?? "") };
-};
+
+const defaultRunner: CommandRunner = defaultCommandRunner;
 
 const directoryExists = (directory: string) => { try { return statSync(directory).isDirectory(); } catch { return false; } };
 function smallAlias(file: string): string | undefined {
@@ -188,7 +273,8 @@ export function parseWindowsRegistryPathOutput(stdout: string, env: NodeJS.Proce
   return [];
 }
 
-/** Read latest user and system PATH directly from Windows Registry (HKCU + HKLM). */
+/** Read latest system and user PATH directly from Windows Registry (HKLM then HKCU,
+ * matching how Windows constructs terminal PATH). */
 export async function readWindowsRegistryPath(options: {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
@@ -201,8 +287,8 @@ export async function readWindowsRegistryPath(options: {
   const runner = options.runner ?? defaultRunner;
   const timeout = options.timeoutMs ?? 2500;
   const keys = [
-    "HKCU\\Environment",
     "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+    "HKCU\\Environment",
   ];
   const results = await Promise.all(keys.map(async (key) => {
     try {
@@ -237,7 +323,8 @@ function safeShellPath(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): strin
       if (statSync(candidate).isFile()) return candidate;
     } catch { /* fall through */ }
   }
-  if (env === process.env) {
+  const sameHome = !env.HOME || path.resolve(env.HOME) === path.resolve(os.homedir());
+  if (sameHome) {
     try {
       const userShell = os.userInfo().shell?.trim();
       if (userShell && path.posix.isAbsolute(userShell) && !/[\x00-\x1f\x7f\s]/.test(userShell)) {
@@ -249,8 +336,54 @@ function safeShellPath(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): strin
   return platform === "darwin" ? "/bin/zsh" : "/bin/sh";
 }
 
+function buildShellProbeInvocation(shell: string, commands: readonly string[]): { args: string[]; script: string } {
+  const name = path.posix.basename(shell).toLowerCase();
+  if (name === "fish") {
+    const cmdChecks = commands
+      .map(cmd => `set -l p (type -P -- ${cmd} 2>/dev/null); if test -n "$p"; printf '%s%s=%s\\n' '${SHELL_CMD_PREFIX}' '${cmd}' "$p"; end`)
+      .join("; ");
+    const script = `printf '%s\\n%s\\n%s\\n' '${SHELL_PATH_BEGIN}' (string join : -- $PATH) '${SHELL_PATH_END}'; ${cmdChecks ? `${cmdChecks}; ` : ""}true`;
+    return { args: ["-ilc", script], script };
+  }
+  if (name === "tcsh" || name === "csh") {
+    const lines = [
+      'if ( $?HOME ) then',
+      '  if ( -r "$HOME/.login" ) source "$HOME/.login" >& /dev/null',
+      'endif',
+      `printf '%s\\n%s\\n%s\\n' '${SHELL_PATH_BEGIN}' "$PATH" '${SHELL_PATH_END}'`,
+      ...commands.flatMap(cmd => [
+        `unalias ${cmd}`,
+        `set p = "\`which ${cmd}\`"`,
+        `if ( "$p" =~ /* ) printf '%s%s=%s\\n' '${SHELL_CMD_PREFIX}' '${cmd}' "$p"`,
+      ]),
+      "exit 0",
+    ];
+    const script = lines.join("\n");
+    return { args: ["-ic", script], script };
+  }
+  if (name === "zsh") {
+    const cmdChecks = commands
+      .map(cmd => `p=$(whence -p -- ${cmd} 2>/dev/null || true); if [ -n "$p" ]; then printf '%s%s=%s\\n' '${SHELL_CMD_PREFIX}' '${cmd}' "$p"; fi`)
+      .join("; ");
+    const script = `printf '%s\\n%s\\n%s\\n' '${SHELL_PATH_BEGIN}' "$PATH" '${SHELL_PATH_END}'; ${cmdChecks ? `${cmdChecks}; ` : ""}true`;
+    return { args: ["-ilc", script], script };
+  }
+  if (name === "bash") {
+    const cmdChecks = commands
+      .map(cmd => `p=$(type -P -- ${cmd} 2>/dev/null || true); if [ -n "$p" ]; then printf '%s%s=%s\\n' '${SHELL_CMD_PREFIX}' '${cmd}' "$p"; fi`)
+      .join("; ");
+    const script = `printf '%s\\n%s\\n%s\\n' '${SHELL_PATH_BEGIN}' "$PATH" '${SHELL_PATH_END}'; ${cmdChecks ? `${cmdChecks}; ` : ""}true`;
+    return { args: ["-ilc", script], script };
+  }
+  const cmdChecks = commands
+    .map(cmd => `unset -f ${cmd} 2>/dev/null || true; p=$(command -v ${cmd} 2>/dev/null || true); case "$p" in /*) printf '%s%s=%s\\n' '${SHELL_CMD_PREFIX}' '${cmd}' "$p" ;; esac`)
+    .join("; ");
+  const script = `unalias -a 2>/dev/null || true; printf '%s\\n%s\\n%s\\n' '${SHELL_PATH_BEGIN}' "$PATH" '${SHELL_PATH_END}'; ${cmdChecks ? `${cmdChecks}; ` : ""}true`;
+  return { args: ["-ilc", script], script };
+}
+
 /** Probe the user's login interactive shell once (macOS / Linux) to read PATH
- * and `command -v` for each engine command. Times out safely without failing startup. */
+ * and resolve each engine command. Times out safely without failing startup. */
 export async function probeLoginShellEnvironment(options: {
   commands?: readonly string[];
   env?: NodeJS.ProcessEnv;
@@ -263,8 +396,11 @@ export async function probeLoginShellEnvironment(options: {
   if (platform === "win32") return { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
 
   const env = options.env ?? process.env;
-  if (env[SHELL_ENV_PROBE_FLAG] === "0") return { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
-  if (!options.shell && !options.runner && !env.SHELL && env !== process.env) {
+  if (env[SHELL_ENV_PROBE_FLAG] === "0" || env[SHELL_ENV_PROBE_FLAG] === "1") {
+    return { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
+  }
+  const hasDifferentSyntheticHome = !!env.HOME && path.resolve(env.HOME) !== path.resolve(os.homedir());
+  if (!options.shell && !options.runner && !env.SHELL && hasDifferentSyntheticHome) {
     return { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
   }
   const runner = options.runner ?? defaultRunner;
@@ -272,8 +408,7 @@ export async function probeLoginShellEnvironment(options: {
   const shell = options.shell ?? safeShellPath(env, platform);
   const commands = (options.commands ?? []).filter(cmd => /^[A-Za-z0-9._-]+$/.test(cmd));
 
-  const cmdChecks = commands.map(cmd => `p=$(command -v ${cmd} 2>/dev/null || true); [ -n "$p" ] && printf '%s%s=%s\\n' '${SHELL_CMD_PREFIX}' '${cmd}' "$p"`).join("; ");
-  const script = `printf '%s\\n%s\\n%s\\n' '${SHELL_PATH_BEGIN}' "$PATH" '${SHELL_PATH_END}'; ${cmdChecks}`;
+  const { args } = buildShellProbeInvocation(shell, commands);
   const probeEnv: NodeJS.ProcessEnv = {
     ...env,
     [SHELL_ENV_PROBE_FLAG]: "1",
@@ -283,7 +418,7 @@ export async function probeLoginShellEnvironment(options: {
   };
 
   try {
-    const { stdout } = await runner(shell, ["-ilc", script], { timeout, env: probeEnv });
+    const { stdout } = await runner(shell, args, { timeout, env: probeEnv });
     const startIdx = stdout.indexOf(SHELL_PATH_BEGIN);
     const endIdx = stdout.indexOf(SHELL_PATH_END, startIdx >= 0 ? startIdx + SHELL_PATH_BEGIN.length : 0);
     if (startIdx < 0 || endIdx < 0) {
@@ -310,7 +445,7 @@ export async function probeLoginShellEnvironment(options: {
     }
     return { ok: true, status: "ok", pathDirs, resolvedCommands };
   } catch (error) {
-    const timedOut = !!(error && typeof error === "object" && ("killed" in error && (error as { killed?: boolean }).killed || "signal" in error && (error as { signal?: string }).signal === "SIGTERM" || "code" in error && (error as { code?: string }).code === "ETIMEDOUT"));
+    const timedOut = isTimeoutError(error);
     return { ok: false, timedOut, status: timedOut ? "timeout" : "failed", pathDirs: [], resolvedCommands: {} };
   }
 }
@@ -318,7 +453,7 @@ export async function probeLoginShellEnvironment(options: {
 function findCommandInDirs(command: string, dirs: readonly string[], platform: NodeJS.Platform): string | undefined {
   const windows = platform === "win32";
   const p = windows ? path.win32 : path.posix;
-  const exts = windows ? [".exe", ".cmd", ".bat", ""] : [""];
+  const exts = windows ? [".exe", ".cmd", ".bat"] : [""];
   for (const dir of dirs) {
     for (const ext of exts) {
       const candidate = p.join(dir, command + ext);
@@ -454,9 +589,19 @@ export function diagnoseExecutableCandidates(
       try {
         const link = lstatSync(file);
         if (link.isSymbolicLink()) {
-          const rawTarget = readlinkSync(file);
-          const resolvedTarget = p.isAbsolute(rawTarget) ? rawTarget : p.resolve(p.dirname(file), rawTarget);
-          return { dangling: resolvedTarget };
+          try {
+            statSync(file);
+            // Target exists on disk (e.g. non-executable file with EACCES); not a dangling symlink.
+            return "missing";
+          } catch (statError) {
+            const code = (statError as NodeJS.ErrnoException).code;
+            if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") {
+              const rawTarget = readlinkSync(file);
+              const resolvedTarget = p.isAbsolute(rawTarget) ? rawTarget : p.resolve(p.dirname(file), rawTarget);
+              return { dangling: resolvedTarget };
+            }
+            return "missing";
+          }
         }
       } catch { /* truly missing */ }
       return "missing";
@@ -468,7 +613,7 @@ export function diagnoseExecutableCandidates(
     for (const ext of extensions) {
       const candidate = name + ext;
       const status = checkFile(candidate);
-      if (status === "ok") return { executable: candidate, rule: "setting", danglingLinks };
+      if (status === "ok") return { executable: candidate, rule: null, danglingLinks };
       if (typeof status === "object") danglingLinks.push({ linkPath: candidate, targetPath: status.dangling });
     }
     return { executable: null, rule: null, danglingLinks };
@@ -487,19 +632,32 @@ export function diagnoseExecutableCandidates(
 
 // --- Cached probe coordinator + version cache ---
 
-type CachedProbe = {
+export type EnvironmentDiscoveryResult = {
   at: number;
   shell: ShellProbeResult;
   packageManagerDirs: string[];
   windowsRegistryDirs: string[];
 };
 
+type CachedProbeEntry = {
+  key: string;
+  runner?: CommandRunner;
+  windowsRegistryKey: string;
+  value: {
+    at: number;
+    shell: ShellProbeResult;
+    packageManagerDirs: string[];
+  };
+};
+
 const PROBE_CACHE_TTL_MS = 60_000;
-let probeCache: { key: string; value: CachedProbe } | undefined;
+let probeCache: CachedProbeEntry | undefined;
+let inFlightProbe: { key: string; runner?: CommandRunner; promise: Promise<EnvironmentDiscoveryResult> } | undefined;
 const versionCache = new Map<string, { mtimeMs: number; version: string | null }>();
 
 export function clearDiscoveryCaches(): void {
   probeCache = undefined;
+  inFlightProbe = undefined;
   versionCache.clear();
 }
 
@@ -511,40 +669,97 @@ export async function runEnvironmentDiscovery(options: {
   forceRefresh?: boolean;
   timeoutMs?: number;
   runner?: CommandRunner;
-}): Promise<CachedProbe> {
+}): Promise<EnvironmentDiscoveryResult> {
   const platform = options.platform ?? process.platform;
   const home = options.home ?? os.homedir();
   const basePath = lookupEnvCaseInsensitive(options.baseEnv, "PATH", platform) ?? "";
-  const cacheKey = `${platform}|${home}|${options.baseEnv.SHELL ?? ""}|${basePath}`;
+  const cacheKey = `${platform}|${home}|${options.baseEnv.SHELL ?? ""}|${options.baseEnv.ZDOTDIR ?? ""}|${options.baseEnv[SHELL_ENV_PROBE_FLAG] ?? ""}|${options.commands.join(",")}|${basePath}`;
 
-  if (!options.forceRefresh && probeCache && probeCache.key === cacheKey && Date.now() - probeCache.value.at < PROBE_CACHE_TTL_MS) {
-    return probeCache.value;
+  // On Windows, always read fresh Registry PATH on every call (never stale-cached for 60s).
+  if (platform === "win32") {
+    const windowsRegistryDirs = await readWindowsRegistryPath({ env: options.baseEnv, platform, runner: options.runner });
+    const windowsRegistryKey = windowsRegistryDirs.map(dir => dir.toLowerCase()).join(";");
+    if (
+      !options.forceRefresh
+      && probeCache
+      && probeCache.key === cacheKey
+      && probeCache.runner === options.runner
+      && probeCache.windowsRegistryKey === windowsRegistryKey
+      && Date.now() - probeCache.value.at < PROBE_CACHE_TTL_MS
+    ) {
+      return {
+        at: probeCache.value.at,
+        shell: probeCache.value.shell,
+        packageManagerDirs: probeCache.value.packageManagerDirs,
+        windowsRegistryDirs,
+      };
+    }
+    const baseDirs = basePath.split(";").filter(Boolean);
+    const knownDirs = discoverEngineDirectories(home, options.baseEnv, platform);
+    const combinedForPm = [...new Set([...windowsRegistryDirs, ...baseDirs, ...knownDirs])];
+    const packageManagerDirs = await probePackageManagerBinDirectories({
+      searchDirs: combinedForPm,
+      env: { ...options.baseEnv, PATH: combinedForPm.join(";") },
+      platform,
+      runner: options.runner,
+    });
+    const shell: ShellProbeResult = { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
+    const at = Date.now();
+    probeCache = { key: cacheKey, runner: options.runner, windowsRegistryKey, value: { at, shell, packageManagerDirs } };
+    return { at, shell, packageManagerDirs, windowsRegistryDirs };
   }
 
-  const [shell, windowsRegistryDirs] = await Promise.all([
-    probeLoginShellEnvironment({
+  if (
+    !options.forceRefresh
+    && probeCache
+    && probeCache.key === cacheKey
+    && probeCache.runner === options.runner
+    && Date.now() - probeCache.value.at < PROBE_CACHE_TTL_MS
+  ) {
+    return {
+      at: probeCache.value.at,
+      shell: probeCache.value.shell,
+      packageManagerDirs: probeCache.value.packageManagerDirs,
+      windowsRegistryDirs: [],
+    };
+  }
+
+  if (!options.forceRefresh && inFlightProbe && inFlightProbe.key === cacheKey && inFlightProbe.runner === options.runner) {
+    return inFlightProbe.promise;
+  }
+
+  const work = (async (): Promise<EnvironmentDiscoveryResult> => {
+    const shell = await probeLoginShellEnvironment({
       commands: options.commands,
       env: options.baseEnv,
       platform,
-      timeoutMs: options.timeoutMs ?? (platform === "win32" ? 10_000 : 6_000),
+      timeoutMs: options.timeoutMs ?? 6_000,
       runner: options.runner,
-    }),
-    readWindowsRegistryPath({ env: options.baseEnv, platform, runner: options.runner }),
-  ]);
+    });
 
-  const baseDirs = basePath.split(platform === "win32" ? ";" : ":").filter(Boolean);
-  const knownDirs = discoverEngineDirectories(home, options.baseEnv, platform);
-  const combinedForPm = [...new Set([...shell.pathDirs, ...windowsRegistryDirs, ...baseDirs, ...knownDirs])];
-  const packageManagerDirs = await probePackageManagerBinDirectories({
-    searchDirs: combinedForPm,
-    env: { ...options.baseEnv, PATH: combinedForPm.join(platform === "win32" ? ";" : ":") },
-    platform,
-    runner: options.runner,
-  });
+    const baseDirs = basePath.split(":").filter(Boolean);
+    const knownDirs = discoverEngineDirectories(home, options.baseEnv, platform);
+    const combinedForPm = [...new Set([...shell.pathDirs, ...baseDirs, ...knownDirs])];
+    const packageManagerDirs = await probePackageManagerBinDirectories({
+      searchDirs: combinedForPm,
+      env: { ...options.baseEnv, PATH: combinedForPm.join(":") },
+      platform,
+      runner: options.runner,
+    });
 
-  const value: CachedProbe = { at: Date.now(), shell, packageManagerDirs, windowsRegistryDirs };
-  probeCache = { key: cacheKey, value };
-  return value;
+    const at = Date.now();
+    probeCache = { key: cacheKey, runner: options.runner, windowsRegistryKey: "", value: { at, shell, packageManagerDirs } };
+    return { at, shell, packageManagerDirs, windowsRegistryDirs: [] };
+  })();
+
+  if (!options.forceRefresh) {
+    const entry = { key: cacheKey, runner: options.runner, promise: work };
+    inFlightProbe = entry;
+    void work.finally(() => {
+      if (inFlightProbe === entry) inFlightProbe = undefined;
+    }).catch(() => undefined);
+  }
+  return work;
 }
 
 function looksLikeUnixExecutable(file: string): boolean {
@@ -571,17 +786,23 @@ function looksLikeUnixExecutable(file: string): boolean {
   }
 }
 
-/** Read an engine CLI's `--version` safely with a short timeout and mtime cache.
- * Never modifies HOME or runs interactive/login commands. */
+/** Read an engine CLI's `--version` safely with a bounded timeout and mtime cache.
+ * Never caches transient failures/timeouts, and bypasses cache on `forceRefresh`. */
 export async function probeExecutableVersion(
   executable: string,
   env: NodeJS.ProcessEnv = process.env,
   runner: CommandRunner = defaultRunner,
+  options: { forceRefresh?: boolean; timeoutMs?: number } = {},
 ): Promise<string | null> {
   let mtimeMs = 0;
   try { mtimeMs = statSync(executable).mtimeMs; } catch { return null; }
-  const cached = versionCache.get(executable);
-  if (cached && cached.mtimeMs === mtimeMs) return cached.version;
+
+  if (options.forceRefresh) {
+    versionCache.delete(executable);
+  } else {
+    const cached = versionCache.get(executable);
+    if (cached && cached.mtimeMs === mtimeMs) return cached.version;
+  }
 
   if (runner === defaultRunner && process.platform !== "win32" && !looksLikeUnixExecutable(executable)) {
     versionCache.set(executable, { mtimeMs, version: null });
@@ -589,13 +810,13 @@ export async function probeExecutableVersion(
   }
 
   try {
-    const { stdout, stderr } = await runner(executable, ["--version"], { timeout: 2500, env, windowsHide: true });
+    const { stdout, stderr } = await runner(executable, ["--version"], { timeout: options.timeoutMs ?? 4500, env, windowsHide: true });
     const raw = (stdout || stderr).split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? "";
     const version = raw ? raw.slice(0, 80) : null;
-    versionCache.set(executable, { mtimeMs, version });
+    if (version !== null) versionCache.set(executable, { mtimeMs, version });
     return version;
   } catch {
-    versionCache.set(executable, { mtimeMs, version: null });
+    // Do not cache transient errors or timeouts so subsequent reads can recover.
     return null;
   }
 }

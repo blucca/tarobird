@@ -10,8 +10,8 @@ import "./engine-settings.css";
 
 const labels: Record<HostEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
 function ruleLabel(source: "setting" | "environment" | "auto", rule?: EngineDiscoveryRule | null): string {
-  if (source === "setting" || rule === "setting") return "手动指定";
-  if (source === "environment" || rule === "environment") return "主机环境变量";
+  if (source === "setting") return "手动指定";
+  if (source === "environment") return "主机环境变量";
   switch (rule) {
     case "auto-discovered": return "自动发现（已记住）";
     case "login-shell": return "自动检测 · 登录 Shell";

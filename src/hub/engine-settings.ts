@@ -12,7 +12,12 @@ import {
   ENGINE_ENV_KEYS,
   engineSettingsFile,
   hostEngineEnvironment,
+  readEngineDiscoveryCache,
   readHostEngineSettings,
+  resolveDiscoveredEngines,
+  storedEngineSettingsSchema,
+  writeEngineDiscoveryCache,
+  type LiveEngineDiscovery,
   type StoredEngineSettings,
 } from "../runtime/host-engine-settings.js";
 import {
@@ -21,7 +26,6 @@ import {
   type EngineDiscoveryRule,
   type EngineSettingsState,
   type EngineSettingsUpdate,
-  type HostEngine,
 } from "../client-protocol/engine-settings.js";
 import {
   diagnoseExecutableCandidates,
@@ -31,6 +35,7 @@ import {
   probeExecutableVersion,
   runEnvironmentDiscovery,
   type CommandRunner,
+  type DanglingLinkInfo,
   type TaggedDirectory,
 } from "../host-cli/engine-discovery.js";
 import { HubError } from "./store.js";
@@ -44,10 +49,18 @@ export type EngineDiscoveryOptions = {
 };
 
 export class HubEngineSettings {
+  private liveDiscovery?: LiveEngineDiscovery;
+  private warmInFlight?: Promise<LiveEngineDiscovery>;
   constructor(readonly directory: string, readonly base: () => NodeJS.ProcessEnv) {}
   private read(): StoredEngineSettings {
     try { return readHostEngineSettings(this.directory); }
     catch (error) { if (error instanceof EngineSettingsReadError) throw new HubError(error.message, 503); throw error; }
+  }
+
+  /** Effective Host environment combining strict manual settings, baseline PATH,
+   * known manager directories, and the latest live/cached discovery snapshot. */
+  environment(): NodeJS.ProcessEnv {
+    return hostEngineEnvironment(this.directory, this.base(), this.read(), { liveDiscovery: this.liveDiscovery });
   }
 
   private buildHostTaggedDirs(base: NodeJS.ProcessEnv, env: NodeJS.ProcessEnv, platform = process.platform): TaggedDirectory[] {
@@ -61,82 +74,140 @@ export class HubEngineSettings {
     return mergeTaggedDirectories([baseDirs, knownDirs, envDirs], platform);
   }
 
-  private async rememberDiscoveredPaths(discovered: Partial<Record<HostEngine, string>>): Promise<void> {
-    const file = engineSettingsFile(this.directory);
-    try {
-      await withFileMutex(file, async () => {
-        const before = this.read();
-        const prev = before.discoveredPaths ?? {};
-        const nextDiscovered: Partial<Record<HostEngine, string>> = {};
-        for (const id of hostEngineSchema.options) {
-          const val = discovered[id];
-          if (val && path.isAbsolute(val) && val === val.trim()) nextDiscovered[id] = val;
-        }
-        if (JSON.stringify(prev) === JSON.stringify(nextDiscovered)) return;
-        const next: StoredEngineSettings = {
-          ...before,
-          ...(Object.keys(nextDiscovered).length ? { discoveredPaths: nextDiscovered } : {}),
-        };
-        if (!Object.keys(nextDiscovered).length) delete next.discoveredPaths;
-        const temporary = `${file}.${randomUUID()}.tmp`;
-        let handle;
-        try {
-          handle = await open(temporary, "wx", 0o600);
-          await handle.writeFile(JSON.stringify(next));
-          await handle.sync();
-          await handle.close();
-          handle = undefined;
-          await rename(temporary, file);
-        } finally {
-          await handle?.close();
-          await unlink(temporary).catch(() => undefined);
-        }
-      }, { waitTimeoutMs: 3_000 });
-    } catch {
-      /* Auto-discovered cache is opportunistic and never fails a status read. */
+  /** Run environment discovery (login shell, package managers, and fresh Windows
+   * registry PATH) without executing engine `--version` commands, hydrating the
+   * shared live discovery snapshot and opportunistic discovery cache. */
+  async warmDiscovery(options: Pick<EngineDiscoveryOptions, "forceRefresh" | "probeShell" | "runner" | "timeoutMs"> = {}): Promise<LiveEngineDiscovery> {
+    if (!options.forceRefresh && !options.runner && this.warmInFlight) {
+      return this.warmInFlight;
     }
+    const work = (async (): Promise<LiveEngineDiscovery> => {
+      const base = this.base();
+      const platform = process.platform, windows = platform === "win32";
+      const home = windows
+        ? lookupEnvCaseInsensitive(base, "USERPROFILE", "win32") ?? lookupEnvCaseInsensitive(base, "HOME", "win32") ?? os.homedir()
+        : base.HOME ?? base.USERPROFILE ?? os.homedir();
+      const probeShell = options.probeShell !== false;
+      const probe = probeShell
+        ? await runEnvironmentDiscovery({
+          baseEnv: base,
+          commands: Object.values(ENGINE_COMMANDS),
+          home,
+          platform,
+          forceRefresh: options.forceRefresh,
+          timeoutMs: options.timeoutMs,
+          runner: options.runner,
+        })
+        : { at: Date.now(), shell: { ok: false, status: "skipped" as const, pathDirs: [], resolvedCommands: {} }, packageManagerDirs: [], windowsRegistryDirs: [] };
+      let settings: StoredEngineSettings;
+      try { settings = readHostEngineSettings(this.directory); }
+      catch { settings = { format: 1, revision: "default", paths: {}, receipts: [] }; }
+      const cache = readEngineDiscoveryCache(this.directory, platform);
+      const resolved = resolveDiscoveredEngines({
+        directory: this.directory,
+        base,
+        settings,
+        cache,
+        probe,
+        platform,
+      });
+      const snapshot: LiveEngineDiscovery = {
+        dirs: resolved.discoveredDirs,
+        paths: resolved.discoveredPaths,
+      };
+      this.liveDiscovery = snapshot;
+      await writeEngineDiscoveryCache(this.directory, {
+        paths: resolved.discoveredPaths,
+        searchDirs: resolved.discoveredDirs,
+      }, platform);
+      return snapshot;
+    })();
+
+    if (!options.forceRefresh && !options.runner) {
+      this.warmInFlight = work;
+      void work.finally(() => {
+        if (this.warmInFlight === work) this.warmInFlight = undefined;
+      }).catch(() => undefined);
+    }
+    return work;
   }
 
   status(requestId?: string): EngineSettingsState {
-    const settings = this.read(), base = this.base(), env = hostEngineEnvironment(this.directory, base, settings);
+    const settings = this.read(), base = this.base(), platform = process.platform;
+    const windows = platform === "win32", p = windows ? path.win32 : path.posix;
+    const cache = readEngineDiscoveryCache(this.directory, platform);
+    const baselineEnv = hostEngineEnvironment(this.directory, base, settings, { skipDiscoveryCache: true });
+    const env = hostEngineEnvironment(this.directory, base, settings, { discoveryCache: cache, liveDiscovery: this.liveDiscovery });
     const receipt = requestId ? settings.receipts.find(item => item.requestId === requestId) : settings.receipts.at(-1);
-    const taggedDirs = this.buildHostTaggedDirs(base, env);
+    const taggedDirs = this.buildHostTaggedDirs(base, env, platform);
     return {
       revision: settings.revision,
-      platform: process.platform,
+      platform,
       searchPaths: taggedDirs.map(item => item.dir),
       receipt: receipt ? { requestId: receipt.requestId, revision: receipt.revision } : null,
       engines: hostEngineSchema.options.map(id => {
-        const command = id === "pi" ? resolvePiExecutable(env) : id === "deepseek" ? resolveDeepSeekExecutable(env) : env[ENGINE_ENV_KEYS[id]] || ENGINE_COMMANDS[id];
-        const explicit = id === "deepseek" ? deepseekExecutableOverride(base) !== undefined : !!lookupEnvCaseInsensitive(base, ENGINE_ENV_KEYS[id]);
-        const remembered = !settings.paths[id] && !explicit ? settings.discoveredPaths?.[id] : undefined;
-        const diagnosed = diagnoseExecutableCandidates(command, taggedDirs, env);
-        const executable = diagnosed.executable ?? resolveEngineExecutable(command, env) ?? null;
+        const hasManual = !!settings.paths[id];
+        const explicit = id === "deepseek"
+          ? deepseekExecutableOverride(base, platform) !== undefined
+          : !!lookupEnvCaseInsensitive(base, ENGINE_ENV_KEYS[id], platform);
+        const defaultCmd = ENGINE_COMMANDS[id];
+        const remembered = !hasManual && !explicit ? (this.liveDiscovery?.paths?.[id] ?? cache.paths[id]) : undefined;
+        let command: string;
+        let executable: string | null = null;
         let rule: EngineDiscoveryRule | null = null;
-        if (executable) {
-          if (settings.paths[id]) rule = "setting";
-          else if (explicit) rule = "environment";
-          else if (remembered && executable === remembered) rule = "auto-discovered";
-          else rule = diagnosed.rule ?? "path";
+        let danglingLinks: DanglingLinkInfo[] = [];
+
+        if (hasManual) {
+          command = settings.paths[id]!;
+          const diagnosed = diagnoseExecutableCandidates(command, taggedDirs, env, platform);
+          executable = diagnosed.executable ?? resolveEngineExecutable(command, env, platform) ?? null;
+          rule = executable ? "setting" : null;
+          danglingLinks = diagnosed.danglingLinks;
+        } else if (explicit) {
+          command = id === "deepseek" ? resolveDeepSeekExecutable(baselineEnv, platform) : lookupEnvCaseInsensitive(base, ENGINE_ENV_KEYS[id], platform)!;
+          const diagnosed = diagnoseExecutableCandidates(command, taggedDirs, env, platform);
+          executable = diagnosed.executable ?? resolveEngineExecutable(command, env, platform) ?? null;
+          rule = executable ? "environment" : null;
+          danglingLinks = diagnosed.danglingLinks;
+        } else {
+          const pathDiagnosed = diagnoseExecutableCandidates(defaultCmd, taggedDirs, env, platform);
+          const autoCmd = id === "pi" ? resolvePiExecutable(baselineEnv, platform) : id === "deepseek" ? resolveDeepSeekExecutable(baselineEnv, platform) : defaultCmd;
+          command = autoCmd;
+          if (p.isAbsolute(autoCmd)) {
+            const knownDiagnosed = diagnoseExecutableCandidates(autoCmd, taggedDirs, baselineEnv, platform);
+            executable = knownDiagnosed.executable ?? resolveEngineExecutable(autoCmd, baselineEnv, platform) ?? null;
+            rule = executable ? "known-directory" : null;
+            danglingLinks = pathDiagnosed.danglingLinks.length ? pathDiagnosed.danglingLinks : knownDiagnosed.danglingLinks;
+          } else {
+            executable = pathDiagnosed.executable ?? resolveEngineExecutable(autoCmd, env, platform) ?? null;
+            rule = executable ? (pathDiagnosed.rule ?? "path") : null;
+            danglingLinks = pathDiagnosed.danglingLinks;
+          }
+          if (!executable && remembered && resolveEngineExecutable(remembered, env, platform)) {
+            executable = remembered;
+            rule = "auto-discovered";
+          } else if (executable && remembered && executable === remembered && !resolveEngineExecutable(autoCmd, baselineEnv, platform)) {
+            rule = "auto-discovered";
+          }
         }
         return {
           id,
           override: settings.paths[id] ?? null,
-          source: settings.paths[id] ? "setting" : explicit ? "environment" : "auto",
+          source: hasManual ? "setting" : explicit ? "environment" : "auto",
           command,
           executable,
           available: !!executable,
           rule,
-          ...(diagnosed.danglingLinks.length ? { danglingLinks: diagnosed.danglingLinks } : {}),
+          ...(danglingLinks.length ? { danglingLinks } : {}),
         };
       }),
     };
   }
 
   async statusAsync(requestId?: string, options: EngineDiscoveryOptions = {}): Promise<EngineSettingsState> {
-    const settings = this.read(), base = this.base(), env = hostEngineEnvironment(this.directory, base, settings);
+    const settings = this.read(), base = this.base();
     const receipt = requestId ? settings.receipts.find(item => item.requestId === requestId) : settings.receipts.at(-1);
-    const platform = process.platform, windows = platform === "win32", sep = windows ? ";" : ":";
+    const platform = process.platform, windows = platform === "win32";
     const home = windows
       ? lookupEnvCaseInsensitive(base, "USERPROFILE", "win32") ?? lookupEnvCaseInsensitive(base, "HOME", "win32") ?? os.homedir()
       : base.HOME ?? base.USERPROFILE ?? os.homedir();
@@ -154,99 +225,48 @@ export class HubEngineSettings {
       })
       : { at: Date.now(), shell: { ok: false, status: "skipped" as const, pathDirs: [], resolvedCommands: {} }, packageManagerDirs: [], windowsRegistryDirs: [] };
 
-    const hostTaggedDirs = this.buildHostTaggedDirs(base, env, platform);
-    const mergedDirs = mergeTaggedDirectories([
-      probe.shell.pathDirs.map((dir): TaggedDirectory => ({ dir, rule: "login-shell" })),
-      probe.windowsRegistryDirs.map((dir): TaggedDirectory => ({ dir, rule: "windows-registry" })),
-      probe.packageManagerDirs.map((dir): TaggedDirectory => ({ dir, rule: "package-manager" })),
-      hostTaggedDirs,
-    ], platform);
+    const cache = readEngineDiscoveryCache(this.directory, platform);
+    const resolved = resolveDiscoveredEngines({
+      directory: this.directory,
+      base,
+      settings,
+      cache,
+      probe,
+      platform,
+    });
 
-    const enhancedEnv: NodeJS.ProcessEnv = { ...env };
-    if (windows) for (const key of Object.keys(enhancedEnv)) if (key.toUpperCase() === "PATH") delete enhancedEnv[key];
-    enhancedEnv.PATH = mergedDirs.map(item => item.dir).join(sep);
-
-    const discoveredToRemember: Partial<Record<HostEngine, string>> = {};
-    const engineRows = await Promise.all(hostEngineSchema.options.map(async (id) => {
-      const explicit = id === "deepseek" ? deepseekExecutableOverride(base) !== undefined : !!lookupEnvCaseInsensitive(base, ENGINE_ENV_KEYS[id], platform);
-      const hasManual = !!settings.paths[id];
-      const remembered = !hasManual && !explicit ? settings.discoveredPaths?.[id] : undefined;
-      const defaultCmd = ENGINE_COMMANDS[id];
-
-      // Check what the Host's own baseline PATH sees (before login-shell/pm discovery) to spot terminal-vs-host differences.
-      const hostBaseline = !hasManual && !explicit
-        ? diagnoseExecutableCandidates(defaultCmd, hostTaggedDirs, env, platform)
-        : undefined;
-
-      // Resolve via manual setting -> env override -> valid remembered path -> enhanced merged directories.
-      const rememberedValid = remembered && resolveEngineExecutable(remembered, enhancedEnv, platform) ? remembered : undefined;
-      const command = hasManual
-        ? settings.paths[id]!
-        : explicit
-          ? (id === "deepseek" ? resolveDeepSeekExecutable(env, platform) : lookupEnvCaseInsensitive(base, ENGINE_ENV_KEYS[id], platform)!)
-          : rememberedValid
-            ? rememberedValid
-            : id === "pi"
-              ? resolvePiExecutable(enhancedEnv, platform)
-              : id === "deepseek"
-                ? resolveDeepSeekExecutable(enhancedEnv, platform)
-                : defaultCmd;
-
-      const diagnosed = diagnoseExecutableCandidates(command, mergedDirs, enhancedEnv, platform);
-      let executable = diagnosed.executable ?? resolveEngineExecutable(command, enhancedEnv, platform) ?? null;
-      let rule: EngineDiscoveryRule | null = null;
-      if (executable) {
-        if (hasManual) rule = "setting";
-        else if (explicit) rule = "environment";
-        else if (rememberedValid && executable === rememberedValid) rule = "auto-discovered";
-        else rule = diagnosed.rule ?? "path";
-      }
-
-      // Check terminal (`command -v` from login shell) when available.
-      const shellCmdHit = probe.shell.resolvedCommands[defaultCmd];
-      const terminalExecutable = shellCmdHit && resolveEngineExecutable(shellCmdHit, enhancedEnv, platform)
-        ? shellCmdHit
-        : null;
-
-      // If merged directories didn't find it but login-shell `command -v` did, record terminalExecutable so UI can offer one-click adopt.
-      if (!executable && terminalExecutable && !hasManual && !explicit) {
-        executable = terminalExecutable;
-        rule = "login-shell";
-      }
-
-      if (!hasManual && !explicit && executable && path.isAbsolute(executable)) {
-        discoveredToRemember[id] = executable;
-      }
-
-      const version = executable && options.probeVersions !== false
-        ? await probeExecutableVersion(executable, enhancedEnv, options.runner)
-        : null;
-
-      // Surface terminalExecutable explicitly whenever the terminal finds a path that the Host's own baseline PATH missed or differs from.
-      const showTerminalDiff = !hasManual && terminalExecutable && hostBaseline && hostBaseline.executable !== terminalExecutable
-        ? terminalExecutable
+    const engineRows = await Promise.all(resolved.engines.map(async (row) => {
+      const version = row.executable && options.probeVersions !== false
+        ? await probeExecutableVersion(row.executable, resolved.enhancedEnv, options.runner, { forceRefresh: options.forceRefresh })
         : null;
 
       return {
-        id,
-        override: settings.paths[id] ?? null,
-        source: hasManual ? "setting" as const : explicit ? "environment" as const : "auto" as const,
-        command,
-        executable,
-        available: !!executable,
+        id: row.id,
+        override: row.override,
+        source: row.source,
+        command: row.command,
+        executable: row.executable,
+        available: row.available,
         version,
-        rule,
-        ...(diagnosed.danglingLinks.length ? { danglingLinks: diagnosed.danglingLinks } : {}),
-        ...(showTerminalDiff ? { terminalExecutable: showTerminalDiff } : {}),
+        rule: row.rule,
+        ...(row.danglingLinks.length ? { danglingLinks: row.danglingLinks } : {}),
+        ...(row.showTerminalDiff && row.terminalExecutable ? { terminalExecutable: row.terminalExecutable } : {}),
       };
     }));
 
-    await this.rememberDiscoveredPaths(discoveredToRemember);
+    this.liveDiscovery = {
+      dirs: resolved.discoveredDirs,
+      paths: resolved.discoveredPaths,
+    };
+    await writeEngineDiscoveryCache(this.directory, {
+      paths: resolved.discoveredPaths,
+      searchDirs: resolved.discoveredDirs,
+    }, platform);
 
     return {
       revision: settings.revision,
       platform,
-      searchPaths: mergedDirs.map(item => item.dir),
+      searchPaths: resolved.mergedDirs.map(item => item.dir),
       shellProbeStatus: probe.shell.status,
       receipt: receipt ? { requestId: receipt.requestId, revision: receipt.revision } : null,
       engines: engineRows,
@@ -264,13 +284,12 @@ export class HubEngineSettings {
       const check = () => { if (command.path !== null && !resolveEngineExecutable(command.path, this.base())) throw new HubError("engine_path_unavailable"); };
       check();
       const paths = { ...before.paths }; if (command.path === null) delete paths[command.engine]; else paths[command.engine] = command.path;
-      const revision = randomUUID(), next: StoredEngineSettings = {
+      const revision = randomUUID(), next = storedEngineSettingsSchema.parse({
         format: 1,
         revision,
         paths,
-        ...(before.discoveredPaths ? { discoveredPaths: before.discoveredPaths } : {}),
         receipts: [...before.receipts, { requestId: command.requestId, digest, revision }].slice(-32),
-      };
+      });
       const temporary = `${file}.${randomUUID()}.tmp`; let handle;
       try {
         handle = await open(temporary, "wx", 0o600); await handle.writeFile(JSON.stringify(next)); await handle.sync(); await handle.close(); handle = undefined;

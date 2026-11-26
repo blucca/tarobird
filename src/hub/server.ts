@@ -558,7 +558,7 @@ export class HubServer {
       }, 30_000); retryListeners.unref(); hub.disposers.push(() => clearInterval(retryListeners));
       if (options.managedBots) {
         const running = hub;
-        hub.botManager = new BotManager(store, options.stateDir, options.managedBots, () => running.instanceUrl, (id) => running.broadcastBotStatus(id));
+        hub.botManager = new BotManager(store, options.stateDir, { ...options.managedBots, engineSettings: hub.engineSettings }, () => running.instanceUrl, (id) => running.broadcastBotStatus(id));
         hub.dispatch.workers = hub.botManager;
         await hub.botManager.restore();
       }

@@ -1,23 +1,38 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it } from "vitest";
-import { hostProcessEnvironment } from "../src/host-cli/environment.js";
+import { buildHostEnvironment, hostProcessEnvironment } from "../src/host-cli/environment.js";
+import { inspectEngines, inspectEnginesWithDiscovery, inspectHost, mergeDiscoveryMetadata } from "../src/host-cli/doctor.js";
+import { initializeHost } from "../src/host-cli/setup.js";
+import { LocalHostClient } from "../src/host-cli/client.js";
+import { HubServer } from "../src/hub/server.js";
+import { startHubControl } from "../src/hub/service.js";
 import { resolveEngineExecutable } from "../src/runtime/engine-process.js";
 import {
   clearDiscoveryCaches,
+  defaultCommandRunner,
   diagnoseExecutableCandidates,
   discoverWindowsEngineDirectories,
   lookupEnvCaseInsensitive,
   parseWindowsRegistryPathOutput,
+  probeExecutableVersion,
   probeLoginShellEnvironment,
   probePackageManagerBinDirectories,
   readWindowsRegistryPath,
+  runEnvironmentDiscovery,
   SHELL_ENV_PROBE_FLAG,
   type CommandRunner,
 } from "../src/host-cli/engine-discovery.js";
 import { HubEngineSettings } from "../src/hub/engine-settings.js";
-import { engineSettingsFile, hostEngineEnvironment } from "../src/runtime/host-engine-settings.js";
+import {
+  engineDiscoveryCacheFile,
+  engineSettingsFile,
+  hostEngineEnvironment,
+  readEngineDiscoveryCache,
+  readHostEngineSettings,
+  storedEngineSettingsSchema,
+} from "../src/runtime/host-engine-settings.js";
 
 const roots: string[] = [];
 afterEach(async () => { clearDiscoveryCaches(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -154,11 +169,15 @@ it.runIf(process.platform !== "win32")("recovers from a dangling symlink on PATH
   expect(dshRow.terminalExecutable).toBe(realDsh);
   expect(dshRow.override).toBeNull();
 
-  // Auto-discovered path is persisted without becoming a manual override.
-  const savedJson = JSON.parse(await readFile(engineSettingsFile(stateDir), "utf8"));
-  expect(savedJson.paths).toEqual({});
-  expect(savedJson.discoveredPaths?.deepseek).toBe(realDsh);
-  expect(hostEngineEnvironment(stateDir, baseEnv).DSH_EXECUTABLE).toBe(realDsh);
+  // Auto-discovered path is persisted in the separate discovery cache without mutating strict engine-settings.json.
+  await expect(readFile(engineSettingsFile(stateDir), "utf8")).rejects.toThrow();
+  const cacheJson = JSON.parse(await readFile(engineDiscoveryCacheFile(stateDir), "utf8"));
+  expect(cacheJson.paths?.deepseek).toBe(realDsh);
+  expect(cacheJson.searchDirs).toContain(manualNodeBin);
+  expect((await stat(engineDiscoveryCacheFile(stateDir))).mode & 0o777).toBe(0o600);
+  const hydratedEnv = hostEngineEnvironment(stateDir, baseEnv);
+  expect(hydratedEnv.DSH_EXECUTABLE).toBe(realDsh);
+  expect(hydratedEnv.PATH?.split(":")).toContain(manualNodeBin);
 
   // When the remembered auto-discovered binary becomes invalid, Host stops reusing it and searches again.
   await rm(realDsh);
@@ -251,9 +270,9 @@ it("parses Windows registry PATH (HKCU + HKLM), expands variables, handles Path 
     },
   });
   expect(regPaths).toEqual([
-    "C:\\Users\\example\\AppData\\Roaming\\npm",
-    "C:\\Users\\example\\scoop\\shims",
     "C:\\Program Files\\nodejs",
+    "C:\\Users\\example\\scoop\\shims",
+    "C:\\Users\\example\\AppData\\Roaming\\npm",
   ]);
 
   const existing = new Set([
@@ -312,4 +331,395 @@ it.runIf(process.platform !== "win32")("falls back cleanly to existing rules whe
   expect(codexRow.executable).toBe(voltaCodex);
   expect(codexRow.rule).toBe("known-directory");
   expect(codexRow.version).toBe("codex 2.1.0");
+});
+
+it.runIf(process.platform !== "win32")("wires login-shell discovery into Hub startup, BotManager, /api/bots/catalog, doctor liveEngines, and worker PATH without touching engine-settings.json", async () => {
+  const root = await fixture();
+  const home = path.join(root, "home");
+  const stateDir = path.join(root, "state");
+  await mkdir(home, { recursive: true });
+  await mkdir(stateDir, { recursive: true });
+  await initializeHost(stateDir, "Discovery startup host");
+
+  const manualNodeBin = path.join(home, ".local/share/node/node-v24/bin");
+  const realDsh = await file(home, ".local/share/node/node-v24/bin/dsh", "#!/bin/sh\necho 'dsh 0.9.9'\n");
+  await writeFile(path.join(home, ".zshrc"), `export PATH="${manualNodeBin}:$PATH"\n`);
+
+  const minimalEnv: NodeJS.ProcessEnv = {
+    HOME: home,
+    PATH: "/usr/bin:/bin",
+    SHELL: "/bin/zsh",
+    TAROBOT_MODEL_DISCOVERY: "0",
+  };
+  const hub = await HubServer.start({
+    stateDir,
+    managedBots: { entrypoint: path.resolve("dist/src/index.js"), env: minimalEnv },
+  });
+  const closeControl = await startHubControl(
+    stateDir,
+    { running: true, pid: process.pid, url: hub.url, instanceUrl: hub.instanceUrl, publicKey: hub.auth.publicKey },
+    () => {},
+    { enrollController: value => hub.enrollLocalController(value) },
+  );
+  const client = await LocalHostClient.connect(stateDir, { enroll: true });
+  try {
+    // Before GET /api/settings/engines is ever called, /api/bots/catalog already sees DeepSeek.
+    const catalog = await client.request<{ engines: Array<{ id: string; available: boolean }> }>("/api/bots/catalog?includePi=1");
+    expect(catalog.engines.find(e => e.id === "deepseek")?.available).toBe(true);
+
+    // Strict engine-settings.json was never polluted (v1.6.0 rollback safe).
+    await expect(readFile(engineSettingsFile(stateDir), "utf8")).rejects.toThrow();
+    expect(storedEngineSettingsSchema.parse(readHostEngineSettings(stateDir)).paths).toEqual({});
+
+    // hostEngineEnvironment includes the discovered bin dir and manual path bin dir in PATH.
+    const hydrated = hostEngineEnvironment(stateDir, minimalEnv);
+    expect(hydrated.DSH_EXECUTABLE).toBe(realDsh);
+    expect(hydrated.PATH?.split(":")).toContain(manualNodeBin);
+
+    const manualBin = path.join(root, "manual-cli-bin");
+    const manualCodex = await file(root, "manual-cli-bin/codex", "#!/bin/sh\nexit 0\n");
+    const manualEnv = hostEngineEnvironment(stateDir, minimalEnv, {
+      format: 1,
+      revision: "manual-1",
+      paths: { codex: manualCodex },
+      receipts: [],
+    });
+    expect(manualEnv.CODEX_EXECUTABLE).toBe(manualCodex);
+    expect(manualEnv.PATH?.split(":")).toContain(manualBin);
+
+    // `tarobot doctor` (`inspectHost(..., true)`) discovers the `.zshrc`-configured dsh and checks liveEngines.
+    const report = await inspectHost(stateDir, minimalEnv, true);
+    const doctorDsh = report.engines.find(e => e.engine === "deepseek")!;
+    expect(doctorDsh.installed).toBe(true);
+    expect(doctorDsh.executable).toBe(realDsh);
+    expect(doctorDsh.terminalExecutable).toBe(realDsh);
+    expect(report.liveEngines?.find(e => e.id === "deepseek")?.available).toBe(true);
+  } finally {
+    client.close();
+    await closeControl();
+    await hub.close();
+  }
+}, 25_000);
+
+it("keeps engine-discovery-cache.json non-fail-closed while strict engine-settings.json stays v1.6.0-compatible", async () => {
+  const root = await fixture();
+  const stateDir = path.join(root, "state");
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(engineDiscoveryCacheFile(stateDir), "not-valid-json", { mode: 0o600 });
+  expect(readEngineDiscoveryCache(stateDir)).toEqual({ format: 1, paths: {}, searchDirs: [] });
+  expect(() => hostEngineEnvironment(stateDir, { HOME: root, PATH: "/usr/bin:/bin" })).not.toThrow();
+  // v1.6.0 strict schema rejects unknown keys like `discoveredPaths`.
+  expect(() => storedEngineSettingsSchema.parse({ format: 1, revision: "r1", paths: {}, receipts: [], discoveredPaths: {} })).toThrow();
+});
+
+it("reads fresh Windows registry PATH on every runEnvironmentDiscovery call without 60s staleness and ignores extensionless npm files on Windows", async () => {
+  let regCalls = 0;
+  let currentPath = "C:\\Tools\\v1";
+  const runner: CommandRunner = async (cmd, args) => {
+    if (cmd === "reg.exe") {
+      regCalls++;
+      if (args[1] === "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment") {
+        return { stdout: `    Path    REG_EXPAND_SZ    ${currentPath}\r\n`, stderr: "" };
+      }
+      return { stdout: "    Path    REG_EXPAND_SZ    %APPDATA%\\npm\r\n", stderr: "" };
+    }
+    throw new Error(`unexpected: ${cmd}`);
+  };
+  const winEnv: NodeJS.ProcessEnv = {
+    USERPROFILE: "C:\\Users\\example",
+    APPDATA: "C:\\Users\\example\\AppData\\Roaming",
+    PATH: "C:\\Windows\\System32",
+  };
+  const first = await runEnvironmentDiscovery({ baseEnv: winEnv, commands: ["dsh"], home: "C:\\Users\\example", platform: "win32", runner });
+  expect(first.windowsRegistryDirs).toEqual(["C:\\Tools\\v1", "C:\\Users\\example\\AppData\\Roaming\\npm"]);
+  expect(regCalls).toBe(2);
+
+  currentPath = "C:\\Tools\\v2";
+  const second = await runEnvironmentDiscovery({ baseEnv: winEnv, commands: ["dsh"], home: "C:\\Users\\example", platform: "win32", runner });
+  expect(second.windowsRegistryDirs).toEqual(["C:\\Tools\\v2", "C:\\Users\\example\\AppData\\Roaming\\npm"]);
+  expect(regCalls).toBe(4);
+
+  // On Windows, findCommandInDirs inside probePackageManagerBinDirectories must ignore extensionless POSIX npm scripts.
+  const root = await fixture();
+  const fakeBin = path.join(root, "fake-win-bin");
+  await file(root, "fake-win-bin/npm", "#!/bin/sh\necho posix\n");
+  const invoked: string[] = [];
+  await probePackageManagerBinDirectories({
+    searchDirs: [fakeBin],
+    platform: "win32",
+    runner: async (cmd) => { invoked.push(cmd); return { stdout: "", stderr: "" }; },
+  });
+  expect(invoked).toEqual([]);
+});
+
+it.runIf(process.platform !== "win32")("does not skip login shell probing for buildHostEnvironment/managed-service envs and preserves discovery metadata in doctor", async () => {
+  // Managed service / buildHostEnvironment({ env: process.env }) returns a new object with HOME === os.homedir() and no SHELL.
+  const built = buildHostEnvironment({ env: process.env });
+  expect(built).not.toBe(process.env);
+  expect(built.SHELL).toBeUndefined();
+  const probed = await probeLoginShellEnvironment({ env: built, commands: ["sh"], timeoutMs: 5000 });
+  expect(probed.status).toBe("ok");
+  expect(probed.pathDirs.length).toBeGreaterThan(0);
+
+  // mergeDiscoveryMetadata retains safe Unix/Windows discovery metadata while excluding proxies/secrets.
+  const unixMerged = mergeDiscoveryMetadata(
+    { HOME: "/home/example", PATH: "/usr/bin" },
+    { SHELL: "/bin/zsh", ZDOTDIR: "/home/example/.zsh", NVM_DIR: "/home/example/.nvm", HTTPS_PROXY: "http://secret:pass@proxy.invalid", CODEX_HOME: "relative-secret" },
+    "darwin",
+  );
+  expect(unixMerged.SHELL).toBe("/bin/zsh");
+  expect(unixMerged.ZDOTDIR).toBe("/home/example/.zsh");
+  expect(unixMerged.NVM_DIR).toBe("/home/example/.nvm");
+  expect(unixMerged.HTTPS_PROXY).toBeUndefined();
+  expect(unixMerged.CODEX_HOME).toBeUndefined();
+
+  const winMerged = mergeDiscoveryMetadata(
+    { HOME: "C:\\Users\\example", USERPROFILE: "C:\\Users\\example", PATH: "C:\\Windows\\System32" },
+    { SystemRoot: "C:\\Windows", ProgramFiles: "C:\\Program Files", SCOOP: "C:\\Users\\example\\scoop", PNPM_HOME: "C:\\pnpm", VOLTA_HOME: "C:\\Volta", NVM_SYMLINK: "C:\\Program Files\\nodejs", HTTPS_PROXY: "http://secret@proxy.invalid" },
+    "win32",
+  );
+  expect(winMerged).toMatchObject({
+    SystemRoot: "C:\\Windows",
+    ProgramFiles: "C:\\Program Files",
+    SCOOP: "C:\\Users\\example\\scoop",
+    PNPM_HOME: "C:\\pnpm",
+    VOLTA_HOME: "C:\\Volta",
+    NVM_SYMLINK: "C:\\Program Files\\nodejs",
+  });
+  expect(winMerged.HTTPS_PROXY).toBeUndefined();
+});
+
+it.runIf(process.platform !== "win32")("prefers fresh discovery over remembered cache on re-detect, keeps dangling symlinks visible, and avoids stale pinning in hostEngineEnvironment", async () => {
+  const root = await fixture();
+  const stateDir = path.join(root, "state");
+  await mkdir(stateDir, { recursive: true });
+  const localBin = path.join(root, ".local/bin");
+  await mkdir(localBin, { recursive: true });
+  const deletedTarget = path.join(root, "deleted/bin/dsh");
+  const danglingLink = path.join(localBin, "dsh");
+  await symlink(deletedTarget, danglingLink);
+
+  const dsh22 = await file(root, "node-v22/bin/dsh", "#!/bin/sh\necho 'dsh 22.0.0'\n");
+  const dsh24 = await file(root, "node-v24/bin/dsh", "#!/bin/sh\necho 'dsh 24.0.0'\n");
+  const bin22 = path.dirname(dsh22);
+  const bin24 = path.dirname(dsh24);
+
+  let activeBin = bin22;
+  let activeExe = dsh22;
+  let activeVer = "dsh 22.0.0";
+  let shouldTimeout = false;
+  const runner: CommandRunner = async (cmd, args) => {
+    if (args[0] === "-ilc") {
+      if (shouldTimeout) throw Object.assign(new Error("timeout"), { killed: true, signal: "SIGTERM" });
+      return {
+        stdout: `__TAROBIRD_SHELL_PATH_BEGIN__\n${localBin}:${activeBin}:/usr/bin\n__TAROBIRD_SHELL_PATH_END__\n__TAROBIRD_CMD__:dsh=${activeExe}\n`,
+        stderr: "",
+      };
+    }
+    if (args[0] === "--version" && cmd === activeExe) return { stdout: `${activeVer}\n`, stderr: "" };
+    throw new Error(`unexpected: ${cmd}`);
+  };
+
+  const baseEnv = { HOME: root, PATH: localBin, SHELL: "/bin/zsh" };
+  const settings = new HubEngineSettings(stateDir, () => baseEnv);
+  const first = await settings.statusAsync(undefined, { forceRefresh: true, runner });
+  const row1 = first.engines.find(e => e.id === "deepseek")!;
+  expect(row1.executable).toBe(dsh22);
+  expect(row1.rule).toBe("login-shell");
+  expect(row1.danglingLinks).toEqual([{ linkPath: danglingLink, targetPath: deletedTarget }]);
+
+  // Switch terminal PATH to node-v24 and re-detect: fresh discovery outranks remembered v22 AND preserves danglingLinks.
+  activeBin = bin24;
+  activeExe = dsh24;
+  activeVer = "dsh 24.0.0";
+  const second = await settings.statusAsync(undefined, { forceRefresh: true, runner });
+  const row2 = second.engines.find(e => e.id === "deepseek")!;
+  expect(row2.executable).toBe(dsh24);
+  expect(row2.rule).toBe("login-shell");
+  expect(row2.version).toBe("dsh 24.0.0");
+  expect(row2.danglingLinks).toEqual([{ linkPath: danglingLink, targetPath: deletedTarget }]);
+
+  // When shell probe times out, remembered v24 acts as fallback while keeping danglingLinks visible.
+  shouldTimeout = true;
+  const timedOut = await settings.statusAsync(undefined, { forceRefresh: true, runner });
+  const row3 = timedOut.engines.find(e => e.id === "deepseek")!;
+  expect(row3.executable).toBe(dsh24);
+  expect(row3.rule).toBe("auto-discovered");
+  expect(row3.danglingLinks).toEqual([{ linkPath: danglingLink, targetPath: deletedTarget }]);
+
+  // Normal PATH binary outranks stale remembered cache in hostEngineEnvironment.
+  const normalBin = path.join(root, "normal-bin");
+  const normalDsh = await file(root, "normal-bin/dsh", "#!/bin/sh\nexit 0\n");
+  const envWithNormalPath = hostEngineEnvironment(stateDir, { HOME: root, PATH: normalBin });
+  expect(envWithNormalPath.DSH_EXECUTABLE).toBeUndefined();
+  expect(resolveEngineExecutable("dsh", envWithNormalPath)).toBe(normalDsh);
+
+  // doctor.ts inspectEnginesWithDiscovery aligns with statusAsync: falls back to terminalExecutable for all engines.
+  const onlyCmdCodex = await file(root, "terminal-only/codex", "#!/bin/sh\necho 'codex 3.0.0'\n");
+  const doctorRows = await inspectEnginesWithDiscovery(stateDir, baseEnv, {
+    forceRefresh: true,
+    runner: async (cmd, args) => {
+      if (args[0] === "-ilc") {
+        return {
+          stdout: `__TAROBIRD_SHELL_PATH_BEGIN__\n${localBin}\n__TAROBIRD_SHELL_PATH_END__\n__TAROBIRD_CMD__:codex=${onlyCmdCodex}\n`,
+          stderr: "",
+        };
+      }
+      if (args[0] === "--version" && cmd === onlyCmdCodex) return { stdout: "codex 3.0.0\n", stderr: "" };
+      throw new Error(`unexpected: ${cmd}`);
+    },
+  });
+  const docCodex = doctorRows.find(e => e.engine === "codex")!;
+  expect(docCodex.installed).toBe(true);
+  expect(docCodex.executable).toBe(onlyCmdCodex);
+  expect(docCodex.rule).toBe("login-shell");
+  expect(docCodex.terminalExecutable).toBe(onlyCmdCodex);
+});
+
+it.runIf(process.platform !== "win32")("reports auto-discovered Pi in ~/.pi/agent/bin as known-directory (never setting) and keeps cached paths labeled auto-discovered in non-live doctor", async () => {
+  const root = await fixture();
+  const stateDir = path.join(root, "state");
+  await mkdir(stateDir, { recursive: true });
+  const piExe = await file(root, ".pi/agent/bin/pi", "#!/bin/sh\necho 'pi 1.2.3'\n");
+  const baseEnv = { HOME: root, PATH: "/usr/bin:/bin", [SHELL_ENV_PROBE_FLAG]: "0" };
+  const settings = new HubEngineSettings(stateDir, () => baseEnv);
+
+  const syncRow = settings.status().engines.find(e => e.id === "pi")!;
+  expect(syncRow).toMatchObject({ source: "auto", override: null, executable: piExe, available: true, rule: "known-directory" });
+
+  const asyncRow = (await settings.statusAsync(undefined, { forceRefresh: true, probeVersions: false })).engines.find(e => e.id === "pi")!;
+  expect(asyncRow).toMatchObject({ source: "auto", override: null, executable: piExe, available: true, rule: "known-directory" });
+
+  // Non-live inspectEngines / inspectHost must not mislabel cached auto-discovered paths as "environment" or "setting".
+  const dshExe = await file(root, "custom-node/bin/dsh", "#!/bin/sh\nexit 0\n");
+  await writeFile(engineDiscoveryCacheFile(stateDir), JSON.stringify({ format: 1, paths: { deepseek: dshExe }, searchDirs: [path.dirname(dshExe)] }), { mode: 0o600 });
+  const storedSettings = readHostEngineSettings(stateDir);
+  const discoveryCache = readEngineDiscoveryCache(stateDir);
+  const isolatedNonLive = inspectEngines(
+    hostEngineEnvironment(stateDir, baseEnv, storedSettings, { discoveryCache }),
+    { baseEnv, settings: storedSettings, discoveryCache },
+  );
+  expect(isolatedNonLive.find(e => e.engine === "pi")).toMatchObject({ installed: true, executable: piExe, rule: "known-directory" });
+  expect(isolatedNonLive.find(e => e.engine === "deepseek")).toMatchObject({ installed: true, executable: dshExe, rule: "auto-discovered" });
+  expect(inspectEngines(baseEnv).find(e => e.engine === "pi")?.rule).toBe("known-directory");
+
+  const report = await inspectHost(stateDir, { HOME: root, PATH: "/usr/bin:/bin" }, false);
+  for (const row of report.engines) {
+    expect(row.rule).not.toBe("setting");
+    expect(row.rule).not.toBe("environment");
+  }
+});
+
+it.runIf(process.platform !== "win32")("does not misclassify a symlink to an existing non-executable file as a dangling symlink", async () => {
+  const root = await fixture();
+  const binDir = path.join(root, "bin");
+  await mkdir(binDir, { recursive: true });
+  const nonExecTarget = path.join(root, "real-dsh");
+  await writeFile(nonExecTarget, "#!/bin/sh\nexit 0\n");
+  await chmod(nonExecTarget, 0o644);
+  await symlink(nonExecTarget, path.join(binDir, "dsh"));
+
+  const diagnosed = diagnoseExecutableCandidates("dsh", [{ dir: binDir, rule: "path" }], { PATH: binDir });
+  expect(diagnosed.executable).toBeNull();
+  expect(diagnosed.danglingLinks).toEqual([]);
+
+  const missingTarget = path.join(root, "does-not-exist");
+  const brokenLink = path.join(binDir, "codex");
+  await symlink(missingTarget, brokenLink);
+  const broken = diagnoseExecutableCandidates("codex", [{ dir: binDir, rule: "path" }], { PATH: binDir });
+  expect(broken.executable).toBeNull();
+  expect(broken.danglingLinks).toEqual([{ linkPath: brokenLink, targetPath: missingTarget }]);
+});
+
+it.runIf(process.platform !== "win32")("closes stdin in defaultCommandRunner, guards recursive shell probing, resolves past aliases, and supports non-POSIX shells", async () => {
+  // Stdin is closed immediately (`stdio: ["ignore", ...]`), so `cat` returns quickly instead of timing out.
+  const started = Date.now();
+  const catResult = await defaultCommandRunner("/bin/sh", ["-c", "cat"], { timeout: 2000 });
+  expect(catResult.stdout).toBe("");
+  expect(Date.now() - started).toBeLessThan(1500);
+
+  // Recursion guard skips when TAROBIRD_SHELL_ENV_PROBE is "1" or "0".
+  for (const flag of ["0", "1"]) {
+    const res = await probeLoginShellEnvironment({ env: { PATH: "/usr/bin:/bin", SHELL: "/bin/zsh", [SHELL_ENV_PROBE_FLAG]: flag } });
+    expect(res).toEqual({ ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} });
+  }
+
+  // Shell aliases in .zshrc / .bashrc must not break resolvedCommands, and a missing last command must not fail exit status.
+  const root = await fixture();
+  const toolBin = path.join(root, "tool-bin");
+  const realDsh = await file(root, "tool-bin/dsh", "#!/bin/sh\nexit 0\n");
+  await writeFile(path.join(root, ".zshrc"), `export PATH="${toolBin}:$PATH"\nalias dsh="echo wrapped"\n`);
+  await writeFile(path.join(root, ".bashrc"), `shopt -s expand_aliases\nexport PATH="${toolBin}:$PATH"\nalias dsh="echo wrapped"\ndsh() { echo fn; }\n`);
+  await writeFile(path.join(root, ".bash_profile"), `source "$HOME/.bashrc"\n`);
+
+  const zshProbe = await probeLoginShellEnvironment({
+    shell: "/bin/zsh",
+    commands: ["dsh", "definitely_missing_engine_xyz"],
+    env: { HOME: root, PATH: "/usr/bin:/bin", SHELL: "/bin/zsh" },
+    timeoutMs: 5000,
+  });
+  expect(zshProbe.ok).toBe(true);
+  expect(zshProbe.resolvedCommands.dsh).toBe(realDsh);
+
+  const bashProbe = await probeLoginShellEnvironment({
+    shell: "/bin/bash",
+    commands: ["dsh", "definitely_missing_engine_xyz"],
+    env: { HOME: root, PATH: "/usr/bin:/bin", SHELL: "/bin/bash" },
+    timeoutMs: 5000,
+  });
+  expect(bashProbe.ok).toBe(true);
+  expect(bashProbe.resolvedCommands.dsh).toBe(realDsh);
+
+  // Non-POSIX tcsh succeeds on macOS/Unix where /bin/tcsh exists.
+  if (resolveEngineExecutable("/bin/tcsh")) {
+    await writeFile(path.join(root, ".tcshrc"), `setenv PATH "${toolBin}:$PATH"\nalias dsh "echo wrapped"\n`);
+    const tcshProbe = await probeLoginShellEnvironment({
+      shell: "/bin/tcsh",
+      commands: ["dsh", "definitely_missing_engine_xyz"],
+      env: { HOME: root, PATH: "/usr/bin:/bin", SHELL: "/bin/tcsh" },
+      timeoutMs: 5000,
+    });
+    expect(tcshProbe.ok).toBe(true);
+    expect(tcshProbe.pathDirs).toContain(toolBin);
+    expect(tcshProbe.resolvedCommands.dsh).toBe(realDsh);
+  }
+
+  // Fish uses `string join : -- $PATH` and `type -P`.
+  let fishArgs: string[] = [];
+  const fishProbe = await probeLoginShellEnvironment({
+    shell: "/usr/local/bin/fish",
+    commands: ["dsh"],
+    env: { HOME: root, PATH: "/usr/bin:/bin" },
+    runner: async (_cmd, args) => {
+      fishArgs = args;
+      return {
+        stdout: `__TAROBIRD_SHELL_PATH_BEGIN__\n${toolBin}:/usr/bin\n__TAROBIRD_SHELL_PATH_END__\n__TAROBIRD_CMD__:dsh=${realDsh}\n`,
+        stderr: "",
+      };
+    },
+  });
+  expect(fishProbe.ok).toBe(true);
+  expect(fishArgs[1]).toContain("string join : -- $PATH");
+  expect(fishArgs[1]).toContain("type -P -- dsh");
+});
+
+it.runIf(process.platform !== "win32")("recovers probeExecutableVersion from transient failures and refreshes static shims on forceRefresh", async () => {
+  const root = await fixture();
+  const shim = await file(root, "volta/bin/dsh", "#!/bin/sh\necho 'dsh 1.0.0'\n");
+
+  let mode: "fail" | "v1" | "v2" = "fail";
+  const runner: CommandRunner = async () => {
+    if (mode === "fail") throw Object.assign(new Error("timeout"), { killed: true, signal: "SIGTERM", code: "ETIMEDOUT" });
+    return { stdout: mode === "v1" ? "dsh 1.0.0\n" : "dsh 2.0.0\n", stderr: "" };
+  };
+
+  // Transient error/timeout must NOT be permanently cached.
+  expect(await probeExecutableVersion(shim, process.env, runner)).toBeNull();
+  mode = "v1";
+  expect(await probeExecutableVersion(shim, process.env, runner)).toBe("dsh 1.0.0");
+
+  // Upgrade behind a static shim whose mtimeMs never changed: cached until forceRefresh.
+  mode = "v2";
+  expect(await probeExecutableVersion(shim, process.env, runner)).toBe("dsh 1.0.0");
+  expect(await probeExecutableVersion(shim, process.env, runner, { forceRefresh: true })).toBe("dsh 2.0.0");
 });
