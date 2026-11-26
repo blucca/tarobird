@@ -44,6 +44,11 @@ export function piModelSettingsRejectionText(code: string, context: { engine?: s
     const provider = providerOf(context.model);
     if (!provider) return undefined;
     const signedIn = context.choices.some(choice => choice.id && (choice.provider ?? providerOf(choice.id)) === provider);
+    if (context.engine === "omp") {
+      return signedIn
+        ? t("提供商 {0} 已登录，但 omp 的模型目录里没有 {1}。请从列表选择，或检查模型 ID。", provider, context.model)
+        : t("提供商 {0} 当前没有可用凭据（或不存在）。请在运行 Bot 的主机终端运行 omp 并执行 /login，然后重新读取。", provider);
+    }
     return signedIn
       ? t("提供商 {0} 已登录，但 Pi 的模型目录里没有 {1}。请从列表选择，或检查模型 ID。", provider, context.model)
       : t("提供商 {0} 当前没有可用凭据（或不存在）。请在运行 Bot 的主机终端执行 pi auth login {0}，然后重新读取。", provider);

@@ -1644,9 +1644,11 @@ export class HubServer {
             await this.store.db.run("INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)", [Date.now(), session.deviceId, "engines.settings-updated", JSON.stringify({ engine: command.engine, manual: command.path !== null, requestId: command.requestId })]);
           }));
         } else view = this.engineSettings.status(idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined));
-        // Existing clients validate a closed five-engine enum. Keep their
-        // complete settings page usable until they opt into Pi support.
-        await reply(200, url.searchParams.get("includePi") === "1" ? view : { ...view, engines: view.engines.filter(engine => engine.id !== "pi" && engine.id !== "omp") }); return;
+        // Existing clients validate a closed engine enum (five pre-Pi, six in v1.6.0).
+        // Gate Pi on includePi=1 and omp on includeOmp=1 so older clients stay compatible.
+        const includePi = url.searchParams.get("includePi") === "1";
+        const includeOmp = url.searchParams.get("includeOmp") === "1";
+        await reply(200, { ...view, engines: view.engines.filter(engine => (engine.id !== "pi" || includePi) && (engine.id !== "omp" || includeOmp)) }); return;
       }
       if (route === "/api/settings/widgets" && ["GET", "PUT"].includes(req.method ?? "")) {
         await requireOwner();
@@ -2098,9 +2100,11 @@ export class HubServer {
           // window that keeps an unanswered read from starting the CLI on every look.
           const refresh = createBotSchema.shape.engine.optional().parse(url.searchParams.get("refresh") ?? undefined);
           const catalog = await this.botManager.catalog(z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined), refresh);
-          // Existing clients do not understand Pi's provider/effort settings.
-          // New App and CLI catalog readers opt in, just as engine settings do.
-          await reply(200, url.searchParams.get("includePi") === "1" ? catalog : { ...catalog, engines: catalog.engines.filter(engine => engine.id !== "pi" && engine.id !== "omp") });
+          // Existing clients validate closed engine enums (five pre-Pi, six in v1.6.0).
+          // Gate Pi on includePi=1 and omp on includeOmp=1 independently.
+          const includePi = url.searchParams.get("includePi") === "1";
+          const includeOmp = url.searchParams.get("includeOmp") === "1";
+          await reply(200, { ...catalog, engines: catalog.engines.filter(engine => (engine.id !== "pi" || includePi) && (engine.id !== "omp" || includeOmp)) });
         }
         else await reply(201, await this.botManager.create(userId, createBotSchema.parse(await this.jsonBody(req)), validateInQueue));
         return;

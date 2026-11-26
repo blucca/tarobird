@@ -25,7 +25,7 @@ import { CoreKnownChatStore } from "./known-chats.js";
 import { readRawCoreConfig } from "./locale.js";
 import { coreAccessChatIdFromConversationKey, stableCoreNumericId } from "./message-normalizer.js";
 
-const CORE_CONFIG_ENGINES: InstanceEngine[] = ["codex", "claude", "kimi", "deepseek", "antigravity", "pi"];
+const CORE_CONFIG_ENGINES: InstanceEngine[] = ["codex", "claude", "kimi", "deepseek", "antigravity", "pi", "omp"];
 
 export type CoreConfigActionName = "engine" | "fast" | "yolo" | "locale" | "group" | "refresh" | "submit";
 
@@ -120,14 +120,17 @@ export async function renderCoreConfigCard(input: CoreConfigCardContext): Promis
       button(optionLabel(labels.kimi, cfg.engine === "kimi", labels), "engine", "kimi", input, cfg.engine === "kimi" ? "primary" : "default"),
       button(optionLabel(labels.deepseek, cfg.engine === "deepseek", labels), "engine", "deepseek", input, cfg.engine === "deepseek" ? "primary" : "default"),
       button(optionLabel(labels.antigravity, cfg.engine === "antigravity", labels), "engine", "antigravity", input, cfg.engine === "antigravity" ? "primary" : "default"),
-      ...(cfg.role === "dispatcher" ? [] : [button(optionLabel(labels.pi, cfg.engine === "pi", labels), "engine", "pi", input, cfg.engine === "pi" ? "primary" : "default")]),
+      ...(cfg.role === "dispatcher" ? [] : [
+        button(optionLabel(labels.pi, cfg.engine === "pi", labels), "engine", "pi", input, cfg.engine === "pi" ? "primary" : "default"),
+        button(optionLabel(labels.omp, cfg.engine === "omp", labels), "engine", "omp", input, cfg.engine === "omp" ? "primary" : "default"),
+      ]),
     ]),
     section(labels.speedSection, [
       button(optionLabel(labels.fastOn, fastOn, labels), "fast", "on", input, fastOn ? "primary" : "default"),
       button(optionLabel(labels.fastOff, !fastOn, labels), "fast", "off", input, !fastOn ? "primary" : "default"),
     ]),
     section(labels.approvalSection, [
-      ...(cfg.engine === "pi" ? [] : [button(optionLabel(labels.yoloOn, resolvedApprovalMode === "full-auto", labels), "yolo", "on", input, resolvedApprovalMode === "full-auto" ? "primary" : "default")]),
+      ...(cfg.engine === "pi" || cfg.engine === "omp" ? [] : [button(optionLabel(labels.yoloOn, resolvedApprovalMode === "full-auto", labels), "yolo", "on", input, resolvedApprovalMode === "full-auto" ? "primary" : "default")]),
       button(optionLabel(labels.yoloOff, resolvedApprovalMode === "normal", labels), "yolo", "off", input, resolvedApprovalMode === "normal" ? "primary" : "default"),
       button(optionLabel(labels.yoloUnsafe, resolvedApprovalMode === "bypass", labels), "yolo", "unsafe", input, resolvedApprovalMode === "bypass" ? "danger" : "default"),
     ]),
@@ -280,8 +283,10 @@ async function applyEngineAction(stateDir: string, value: string | undefined, lo
   }
   const selected = value as InstanceEngine;
   const cfg = await loadInstanceConfig(stateDir);
-  if (selected === "pi" && cfg.role === "dispatcher") {
-    return locale === "en" ? "Pi is available for ordinary Bots, not Chief of Staff Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
+  if ((selected === "pi" || selected === "omp") && cfg.role === "dispatcher") {
+    return selected === "omp"
+      ? (locale === "en" ? "omp is available for ordinary Bots, not Chief of Staff Bots." : "omp 仅用于普通 Bot，不支持幕僚长。")
+      : (locale === "en" ? "Pi is available for ordinary Bots, not Chief of Staff Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。");
   }
   const engineChanged = cfg.engine !== selected;
   let resetSessionBindings = false;
@@ -329,9 +334,13 @@ async function applyFastAction(stateDir: string, value: string | undefined, loca
 
 async function applyYoloAction(stateDir: string, value: string | undefined, locale: Locale): Promise<string> {
   if (value === "on") {
-    if ((await loadInstanceConfig(stateDir)).engine === "pi") return locale === "en"
+    const currentEngine = (await loadInstanceConfig(stateDir)).engine;
+    if (currentEngine === "pi") return locale === "en"
       ? "Pi does not provide sandboxed full-auto. Permissions were not changed; select normal approval or unsafe bypass."
       : "Pi 不提供带沙箱的 full-auto，权限未更改；请选择普通审批或 unsafe bypass。";
+    if (currentEngine === "omp") return locale === "en"
+      ? "omp does not provide sandboxed full-auto. Permissions were not changed; select normal approval or unsafe bypass."
+      : "omp 不提供带沙箱的 full-auto，权限未更改；请选择普通审批或 unsafe bypass。";
     await updateInstanceApprovalMode(stateDir, "full-auto");
     return locale === "en" ? "YOLO/full-auto enabled." : "YOLO/full-auto 已开启。";
   }
@@ -495,14 +504,14 @@ function configFormSection(
       ["kimi", "Kimi"],
       ["deepseek", "DeepSeek Harness"],
       ["antigravity", "Antigravity"],
-      ...(cfg.role === "dispatcher" ? [] : [["pi", "Pi"] as [string, string]]),
+      ...(cfg.role === "dispatcher" ? [] : [["pi", "Pi"] as [string, string], ["omp", "omp"] as [string, string]]),
     ]),
     selectStatic("fast", cfg.codexServiceTier === "fast" ? "on" : "off", [
       ["on", isEn ? "Fast on" : "Fast 开"],
       ["off", isEn ? "Fast off" : "Fast 关"],
     ]),
     selectStatic("yolo", yoloValue, [
-      ...(cfg.engine === "pi" ? [] : [["on", isEn ? "YOLO on" : "YOLO 开"] as [string, string]]),
+      ...(cfg.engine === "pi" || cfg.engine === "omp" ? [] : [["on", isEn ? "YOLO on" : "YOLO 开"] as [string, string]]),
       ["off", isEn ? "YOLO off" : "YOLO 关"],
       ["unsafe", isEn ? "Unsafe bypass" : "Unsafe bypass"],
     ]),
@@ -662,6 +671,7 @@ function coreConfigLabels(locale: Locale): {
   kimi: string;
   deepseek: string;
   pi: string;
+  omp: string;
   antigravity: string;
   speedSection: string;
   fastOn: string;
@@ -710,7 +720,8 @@ function coreConfigLabels(locale: Locale): {
       claude: "Claude",
       kimi: "Kimi",
       deepseek: "DeepSeek Harness",
-    pi: "Pi",
+      pi: "Pi",
+      omp: "omp",
       antigravity: "Antigravity",
       speedSection: "Speed",
       fastOn: "Fast On",
@@ -760,6 +771,7 @@ function coreConfigLabels(locale: Locale): {
     kimi: "Kimi",
     deepseek: "DeepSeek Harness",
     pi: "Pi",
+    omp: "omp",
     antigravity: "Antigravity",
     speedSection: "速度",
     fastOn: "Fast 开",

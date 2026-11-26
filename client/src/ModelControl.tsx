@@ -18,7 +18,9 @@ export function modelSettingsErrorText(error: unknown, attempt?: { engine?: stri
   const deepSeekError = deepSeekSettingsErrorText(error); if (deepSeekError) return deepSeekError;
   if (error instanceof HubHttpError && error.status === 404) return t("此主机尚不支持在设置中切换模型，请更新主机版本。");
   switch (error instanceof Error ? error.message : "") {
-    case "model_id_invalid": return t("Pi 模型必须包含提供商，例如 provider/model。请从列表选择，或填写完整 ID。");
+    case "model_id_invalid": return attempt?.engine === "omp"
+      ? t("omp 模型必须包含提供商，例如 provider/model。请从列表选择，或填写完整 ID。")
+      : t("Pi 模型必须包含提供商，例如 provider/model。请从列表选择，或填写完整 ID。");
     case "model_conflict": return t("其他设备或本机已修改设置。请重新读取后再选择，避免覆盖对方的修改。");
     case "model_effort_incompatible": return t("所选模型不支持此思考强度，请选择跟随默认或重新读取可用档位。");
     case "model_config_unreadable": return t("无法完整读取 Bot 配置，请先检查主机上的配置文件。");
@@ -64,17 +66,17 @@ function ModelDialog({ connection, bot, online, close, returnFocus }: { connecti
     && (!custom || !!draft.trim()) && levels.includes(displayedEffort);
   return <CreationDialog mobilePage title={t("模型设置")} closeLabel={t("关闭模型设置")} close={close} busy={saving} returnFocus={returnFocus}>
     <div className="effort-settings" data-engine={data?.engine}>
-      <p className="effort-scope"><strong>{bot.name}</strong><span>{bot.engine === "pi" || bot.engine === "omp" ? t("修改 Bot 默认会用于后续任务；/model 只调整当前对话") : t("此 Bot 的所有对话、群聊和话题共用")}</span></p>
+      <p className="effort-scope"><strong>{bot.name}</strong><span>{bot.engine === "pi" ? t("修改 Bot 默认会用于后续任务；/model 只调整当前对话") : t("此 Bot 的所有对话、群聊和话题共用")}</span></p>
       {data && <form onSubmit={event => { event.preventDefault(); if (!writeBlocked && valid) { attempt.current = { model: draft, effort }; void save({ revision: data.revision, model: draft, effort }); } }}>
         <p className="muted">{t("引擎")} · {data.engine}</p>
-        {(data.engine === "pi" || data.engine === "omp") && !custom ? <PiModelSelect models={models} value={draft} disabled={busy || !online} change={changeModel}/> : <label>{t("选择模型")}<select aria-label={t("选择模型")} disabled={busy || !online} value={custom ? "__custom__" : selectedModel?.id ?? draft} onChange={event => {
+        {(data.engine === "pi" || data.engine === "omp") && !custom ? <PiModelSelect engine={data.engine} models={models} value={draft} disabled={busy || !online} change={changeModel}/> : <label>{t("选择模型")}<select aria-label={t("选择模型")} disabled={busy || !online} value={custom ? "__custom__" : selectedModel?.id ?? draft} onChange={event => {
           const value = event.target.value; setCustom(value === "__custom__"); changeModel(value === "__custom__" ? "" : value);
         }}>
           {!custom && !selectedModel && <option value={draft} disabled>{draft || t("引擎默认模型")}</option>}
           {models.map(choice => <option key={choice.id} value={choice.id} disabled={defaultUnavailable && !choice.id}>{defaultUnavailable && !choice.id ? t("引擎默认模型（未设置）") : modelOptionLabel(choice, t("引擎默认模型"))}</option>)}
           <option value="__custom__">{t("自定义模型…")}</option>
         </select></label>}
-        {(data.engine === "pi" || data.engine === "omp") && <><PiModelCatalogNotice status={data.catalogStatus}/><button type="button" disabled={busy || !online} onClick={() => { setCustom(!custom); }}>{custom ? t("从列表选择模型") : t("自定义模型…")}</button></>}
+        {(data.engine === "pi" || data.engine === "omp") && <><PiModelCatalogNotice engine={data.engine} status={data.catalogStatus}/><button type="button" disabled={busy || !online} onClick={() => { setCustom(!custom); }}>{custom ? t("从列表选择模型") : t("自定义模型…")}</button></>}
         {data.engine === "deepseek" && <DeepSeekModelCatalogNotice status={data.catalogStatus} defaultUnavailable={defaultUnavailable}/>}
         {custom && <label>{t("模型 ID")}<input aria-label={t("模型 ID")} value={draft} maxLength={data.engine === "pi" || data.engine === "omp" || data.engine === "deepseek" ? 512 : 128} disabled={busy || !online} autoCapitalize="none" autoCorrect="off" spellCheck={false} onChange={event => {
           const value = event.target.value; setDraft(value);

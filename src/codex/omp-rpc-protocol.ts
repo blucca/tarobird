@@ -87,30 +87,52 @@ export interface OmpAvailableCommandsUpdateFrame {
   commands: OmpSlashCommand[];
 }
 
+export interface OmpSubagentSummary {
+  id: string;
+  index?: number;
+  agent?: string;
+  agentSource?: string;
+  description?: string;
+  status: "started" | "running" | "completed" | "failed" | "aborted" | (string & {});
+  task?: string;
+  sessionFile?: string;
+  parentToolCallId?: string;
+  error?: string;
+}
+
+export interface OmpSubagentProgressPayload {
+  id?: string;
+  index?: number;
+  agent?: string;
+  task?: string;
+  description?: string;
+  progress?: {
+    status?: string;
+    currentTool?: string;
+    lastIntent?: string;
+    text?: string;
+    recentTools?: Array<{ tool?: string; args?: string }>;
+    [key: string]: unknown;
+  } | string;
+  [key: string]: unknown;
+}
+
 export interface OmpSubagentLifecycleFrame {
   type: "subagent_lifecycle";
-  subagentId: string;
-  status: "running" | "completed" | "failed" | "aborted" | (string & {});
-  label?: string;
-  task?: string;
-  parentSubagentId?: string;
-  sessionFile?: string;
-  error?: string;
+  payload?: OmpSubagentSummary;
 }
 
 export interface OmpSubagentProgressFrame {
   type: "subagent_progress";
-  subagentId: string;
-  text?: string;
-  progress?: string;
-  toolName?: string;
-  label?: string;
+  payload?: OmpSubagentProgressPayload;
 }
 
 export interface OmpSubagentEventFrame {
   type: "subagent_event";
-  subagentId: string;
-  event: Record<string, unknown>;
+  payload?: {
+    id?: string;
+    event?: Record<string, unknown>;
+  };
 }
 
 export type OmpBtwStatus = "running" | "complete" | "cancelled" | "error" | "interrupted";
@@ -144,12 +166,22 @@ export interface OmpExtensionUiRequest {
   title?: string;
   message?: string;
   placeholder?: string;
+  prefill?: string;
   options?: string[];
   optionDetails?: Array<{ description?: string }>;
   timeout?: number;
   secret?: boolean;
   targetId?: string;
   html?: string;
+  fields?: Array<{
+    name: string;
+    type?: string;
+    label?: string;
+    placeholder?: string;
+    value?: string;
+    options?: Array<string | { value?: string; label: string; description?: string }>;
+    required?: boolean;
+  }>;
   questions?: Array<{
     id: string;
     question: string;
@@ -223,7 +255,7 @@ export interface OmpSessionEntry {
 
 export interface OmpGoalRecord {
   objective: string;
-  status?: "active" | "paused" | "blocked" | "complete" | "usageLimited" | "budgetLimited" | (string & {});
+  status?: "active" | "paused" | "blocked" | "complete" | "usageLimited" | "budgetLimited" | "budget-limited" | "dropped" | (string & {});
   token_budget?: number | null;
   tokenBudget?: number | null;
   tokens_used?: number;
@@ -236,10 +268,21 @@ export interface OmpGoalRecord {
   updatedAt?: number;
 }
 
+export interface OmpGoalModeState {
+  enabled?: boolean;
+  mode?: string;
+  reason?: string;
+  goal?: OmpGoalRecord | null;
+  status?: string;
+  tokensUsed?: number;
+  timeUsedSeconds?: number;
+  [key: string]: unknown;
+}
+
 export interface OmpGoalUpdatedFrame {
   type: "goal_updated";
-  goal?: OmpGoalRecord | null;
-  state?: { status?: string; tokensUsed?: number; timeUsedSeconds?: number; [key: string]: unknown } | null;
+  goal?: OmpGoalRecord | OmpGoalModeState | null;
+  state?: OmpGoalModeState | null;
 }
 
 export interface OmpResponseFrame {
@@ -252,14 +295,16 @@ export interface OmpResponseFrame {
   code?: string;
 }
 
-export interface OmpSessionState extends Omit<PiSessionState, "thinkingLevel"> {
+export interface OmpSessionState extends Omit<PiSessionState, "thinkingLevel" | "pendingMessageCount"> {
   thinkingLevel: PiThinkingLevel | "inherit" | "auto";
+  pendingMessageCount?: number;
+  queuedMessageCount?: number;
   isSettled?: boolean;
   hasPendingAsyncWork?: boolean;
   interruptMode?: "immediate" | "wait";
   queuedMessages?: { steering: string[]; followUp: string[] };
   contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null } | null;
-  goal?: OmpGoalRecord | null;
+  goal?: OmpGoalModeState | OmpGoalRecord | null;
 }
 
 export type OmpCommand =

@@ -33,7 +33,7 @@ export function gatewayCommands(engine: string, query = "", engineCommands: Read
         },
       },
     });
-  if (engine === "antigravity" && engineCommands.length) {
+  if ((engine === "antigravity" || engine === "omp") && engineCommands.length) {
     const prefix = query.replace(/^\//, "").toLowerCase();
     const taken = new Set(CORE_SLASH_COMMANDS.map(({ command }) => command));
     const seen = new Set<string>();

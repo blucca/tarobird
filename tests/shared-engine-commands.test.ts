@@ -79,6 +79,7 @@ describe("handleLocalEngineTelegramCommand", () => {
           "/engine deepseek",
           "/engine antigravity",
           "/engine pi",
+          "/engine omp",
           "Restart this instance after switching to apply the change.",
         ].join("\n"),
       );
@@ -279,7 +280,7 @@ describe("handleLocalEngineTelegramCommand", () => {
       });
 
       expect(handled).toBe(true);
-      expect(api.sendMessage).toHaveBeenCalledWith(123, "Usage: /engine [claude|codex|kimi|deepseek|antigravity|pi]");
+      expect(api.sendMessage).toHaveBeenCalledWith(123, "Usage: /engine [claude|codex|kimi|deepseek|antigravity|pi|omp]");
     } finally {
       await removeTempRoot(root);
     }

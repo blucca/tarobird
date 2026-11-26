@@ -1,5 +1,36 @@
+import os from "node:os";
 import path from "node:path";
+import { expandPiPath } from "../codex/pi-session-store.js";
 import { executableCandidates, resolveEngineExecutable } from "./engine-process.js";
+
+const SAFE_PROFILE_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+
+/**
+ * Resolve oh-my-pi's active agent directory, matching upstream `packages/utils/src/dirs.ts`:
+ * - Named profile (`OMP_PROFILE`): `<ompRoot>/profiles/<profile>/agent` (supersedes `PI_CODING_AGENT_DIR`).
+ * - Default profile: `PI_CODING_AGENT_DIR` if set, else `<ompRoot>/agent`, where `<ompRoot>` is
+ *   `PI_CONFIG_DIR` / `OMP_CONFIG_DIR` or `~/.omp`.
+ */
+export function ompAgentDir(env: NodeJS.ProcessEnv, homeDir = os.homedir(), cwd?: string): string {
+  const resolveDir = (raw: string) => {
+    const expanded = expandPiPath(raw, homeDir);
+    return cwd ? path.resolve(cwd, expanded) : path.resolve(expanded);
+  };
+  const baseRootRaw = env.PI_CONFIG_DIR?.trim() || env.OMP_CONFIG_DIR?.trim();
+  const baseRoot = baseRootRaw ? resolveDir(baseRootRaw) : path.join(homeDir, ".omp");
+  const profile = env.OMP_PROFILE?.trim();
+  if (profile && SAFE_PROFILE_NAME.test(profile) && !profile.includes("..")) {
+    return path.join(baseRoot, "profiles", profile, "agent");
+  }
+  const agentOverride = env.PI_CODING_AGENT_DIR?.trim();
+  if (agentOverride) return resolveDir(agentOverride);
+  return path.join(baseRoot, "agent");
+}
+
+/** Native oh-my-pi sessions directory (`<ompAgentDir>/sessions`). */
+export function ompNativeSessionsDir(env: NodeJS.ProcessEnv, homeDir = os.homedir(), cwd?: string): string {
+  return path.join(ompAgentDir(env, homeDir, cwd), "sessions");
+}
 
 /**
  * Resolve the file an `omp` launch executes. A bare command name is resolved
@@ -36,7 +67,7 @@ export function resolveOmpExecutable(env: NodeJS.ProcessEnv, platform = process.
   const home = absolute(value(windows ? "USERPROFILE" : "HOME"));
   const bunInstall = absolute(value("BUN_INSTALL"));
   const roaming = absolute(value("APPDATA")) ?? (home && p.join(home, "AppData", "Roaming"));
-  const binNames = windows ? ["omp.exe", "omp.cmd"] : ["omp"];
+  const binNames = windows ? ["omp.exe", "omp.cmd", "omp.ps1"] : ["omp"];
   const dirs = [
     ...(bunInstall ? [p.join(bunInstall, "bin")] : []),
     ...(home ? [p.join(home, ".bun", "bin"), p.join(home, ".local", "bin"), p.join(home, ".omp", "bin")] : []),

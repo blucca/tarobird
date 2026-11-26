@@ -20,7 +20,7 @@ export function permissionOptions(engine: PermissionEngine, runtime?: unknown): 
     ];
     case "omp": return [
       { id: "bypass", label: "原生访问 · omp", description: "按 oh-my-pi 原生方式运行工具；没有系统沙箱。扩展或工具请求确认时仍会询问。" },
-      { id: "normal", label: "工具审批 · omp", description: "由 TaroBird 在确认请求时询问；oh-my-pi 本身没有系统沙箱。" },
+      { id: "normal", label: "工具审批 · omp", description: "由 TaroBird 在写入、执行命令和扩展工具前询问；oh-my-pi 本身没有系统沙箱。" },
     ];
     case "claude": return [
       { id: "bypass", label: "完全访问 · Bypass", description: "跳过工具权限确认；不提供系统沙箱。" },

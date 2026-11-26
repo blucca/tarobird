@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { resolveDeepSeekHome } from "../config.js";
 import { piAgentDir } from "../codex/pi-session-store.js";
+import { ompAgentDir } from "../runtime/omp-executable.js";
 import { deepseekDesktopLauncher, npmShimEntrypoint, resolveEngineExecutable } from "../runtime/engine-process.js";
 import { fallbackModelCatalog, readModelCatalogAnswer, type ModelCatalogOptions, type ModelCatalogRead } from "../runtime/model-catalog.js";
 import type { InstanceEngine } from "../state/instance-config.js";
@@ -52,7 +53,7 @@ export function engineStateFiles(engine: InstanceEngine, env: NodeJS.ProcessEnv,
     case "claude": return [...within(env.CLAUDE_CONFIG_DIR?.trim() || path.join(home, ".claude"), [".credentials.json", "settings.json", "settings.local.json"]), claudeManagedSettings()];
     case "antigravity": return [...within(path.join(home, ".gemini"), ["oauth_creds.json", "google_accounts.json"]), path.join(home, ".gemini", "antigravity-cli", "settings.json"), path.join(home, ".gemini", "config", "config.json")];
     case "pi": return [...within(piAgentDir(env, home, cwd), ["auth.json", "settings.json", "models.json"]), ...cwd ? within(path.join(cwd, ".pi"), ["settings.json", "models.json"]) : []];
-    case "omp": return [...within(path.join(home, ".omp", "agent"), ["auth.json", "settings.json", "models.json", "models.yml", "config.yml"]), ...cwd ? within(path.join(cwd, ".omp"), ["settings.json", "models.yml", "config.yml"]) : []];
+    case "omp": return [...within(ompAgentDir(env, home, cwd), ["auth.json", "settings.json", "models.json", "models.yml", "config.yml"]), ...cwd ? within(path.join(cwd, ".omp"), ["settings.json", "models.yml", "config.yml"]) : []];
     case "deepseek": {
       let dsh: string; try { dsh = resolveDeepSeekHome(env); } catch { return []; }
       return within(dsh, ["cordis.patch.yml", "settings.yaml", ".credentials.yaml", "profiles/web/cordis.patch.yml", "profiles/web/package.json"]);

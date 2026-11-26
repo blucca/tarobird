@@ -77,7 +77,7 @@ function ComposerModelMenu({ id, picker, connection, bot, online, trigger, close
   return <DesktopMenuPortalContext.Provider value={true}>
     <DesktopMenu id={id} label={picker === "model" ? t("快捷选择模型") : t("快捷选择思考强度")} open close={() => { if (!saving) close(); }} trigger={trigger} placement="up-end" className="composer-settings-menu">
       <p className="desktop-menu-heading"><span>{picker === "model" ? t("选择模型") : (selected ? modelOptionLabel(selected, t("引擎默认模型")) : data?.model || bot.model || t("引擎默认模型"))}</span><span className="desktop-menu-value">{data?.engine ?? bot.engine}</span></p>
-      {(data?.engine === "pi" || data?.engine === "omp") && picker === "model" && <><input className="pi-model-search" type="search" aria-label={t("搜索提供商或模型")} placeholder={t("搜索提供商或模型")} value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key !== "Escape" && event.key !== "Tab") event.stopPropagation(); }}/><PiModelCatalogNotice status={data.catalogStatus}/></>}
+      {(data?.engine === "pi" || data?.engine === "omp") && picker === "model" && <><input className="pi-model-search" type="search" aria-label={t("搜索提供商或模型")} placeholder={t("搜索提供商或模型")} value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key !== "Escape" && event.key !== "Tab") event.stopPropagation(); }}/><PiModelCatalogNotice engine={data.engine} status={data.catalogStatus}/></>}
       {data?.engine === "deepseek" && <DeepSeekModelCatalogNotice status={data.catalogStatus} defaultUnavailable={defaultUnavailable}/>}
       {data && picker === "model" && shownOptions.map(option => {
         const next = selectModel(options, option.id, data, data.customEfforts);

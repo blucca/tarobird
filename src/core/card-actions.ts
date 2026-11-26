@@ -1709,7 +1709,7 @@ export async function handleCoreCardAction(input: {
         ...root,
         questions: Array.isArray(root.questions) ? root.questions : questions,
         answers,
-        ...(pending.approvalEngine === "pi" ? { selections: askFormPiSelections(questions, formValue) } : {}),
+        ...(pending.approvalEngine === "pi" || pending.approvalEngine === "omp" ? { selections: askFormPiSelections(questions, formValue) } : {}),
       },
       ...(onAnswerProgress ? { onAnswerProgress } : {}),
     };
@@ -3347,7 +3347,9 @@ async function applyCoreResumeCardActionUnlocked(
       ? "kimi"
       : value.engine === "deepseek"
         ? "deepseek"
-        : value.engine === "pi" ? "pi" : "claude";
+        : value.engine === "pi"
+          ? "pi"
+          : value.engine === "omp" ? "omp" : "claude";
   const sessionId = String(value.sessionId);
   const sessionStore = new SessionStore(path.join(stateDir, "session.json"));
   const cfg = await loadInstanceConfig(stateDir);
@@ -3355,7 +3357,7 @@ async function applyCoreResumeCardActionUnlocked(
     return renderCoreResumeEngineChanged(locale);
   }
   let workspacePath: string | null = null;
-  if (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi") {
+  if (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi" || engine === "omp") {
     const candidate = typeof value.workspacePath === "string" && value.workspacePath.trim()
       ? value.workspacePath
       : null;
@@ -3379,7 +3381,7 @@ async function applyCoreResumeCardActionUnlocked(
 
   const existing = await sessionStore.findByConversationKeySafe(conversationKey);
   const currentResume = resolveConversationResume(existing.record, cfg.resume);
-  const nextResume: ResumeState | null = (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi") && workspacePath
+  const nextResume: ResumeState | null = (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi" || engine === "omp") && workspacePath
     ? {
       sessionId,
       dirName: typeof value.dirName === "string" ? value.dirName : sessionId,
@@ -3399,7 +3401,7 @@ async function applyCoreResumeCardActionUnlocked(
     }),
   });
 
-  if ((engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi") && workspacePath) {
+  if ((engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi" || engine === "omp") && workspacePath) {
     await updateInstanceConfig(stateDir, (config) => {
       delete config.resume;
     });
@@ -3413,6 +3415,11 @@ async function applyCoreResumeCardActionUnlocked(
       return locale === "en"
         ? `Attached Pi session: ${sessionId}\nWorkspace: ${workspacePath}\n\nSend a message to continue. Use /detach when done.`
         : `已绑定 Pi session：${sessionId}\n工作区：${workspacePath}\n\n发送消息继续对话，完成后发 /detach 断开。`;
+    }
+    if (engine === "omp") {
+      return locale === "en"
+        ? `Attached omp session: ${sessionId}\nWorkspace: ${workspacePath}\n\nSend a message to continue. Use /detach when done.`
+        : `已绑定 omp session：${sessionId}\n工作区：${workspacePath}\n\n发送消息继续对话，完成后发 /detach 断开。`;
     }
     if (engine === "deepseek") {
       return locale === "en"

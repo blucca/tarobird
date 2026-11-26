@@ -5,12 +5,13 @@ import { killProcessTree } from "./process-tree.js";
 import {
   OmpFrameDecoder, OmpProtocolVersionError, encodeOmpRecord, selectOmpProtocolVersion,
   type OmpAvailableCommandsUpdateFrame, type OmpBtwDeltaFrame, type OmpBtwRecord, type OmpBtwRecordFrame,
-  type OmpCommand, type OmpExtensionUiRequest, type OmpExtensionUiResponse, type OmpGoalRecord,
+  type OmpCommand, type OmpExtensionUiRequest, type OmpExtensionUiResponse, type OmpGoalModeState, type OmpGoalRecord,
   type OmpGoalUpdatedFrame, type OmpHostToolCallFrame, type OmpHostToolCancelFrame, type OmpHostToolDefinition,
   type OmpHostToolResultFrame, type OmpHostToolUpdateFrame, type OmpModel, type OmpOutboundFrame,
   type OmpPromptResultFrame, type OmpQueueUpdateFrame, type OmpReadyFrame, type OmpResponseFrame,
   type OmpSessionEntry, type OmpSessionEvent, type OmpSessionSettledFrame, type OmpSessionState,
   type OmpSlashCommand, type OmpSubagentEventFrame, type OmpSubagentLifecycleFrame, type OmpSubagentProgressFrame,
+  type OmpSubagentSummary,
 } from "./omp-rpc-protocol.js";
 import type { PiImageContent } from "./pi-rpc-protocol.js";
 
@@ -46,6 +47,7 @@ export interface OmpExit {
   signal: NodeJS.Signals | null;
   expected: boolean;
   stderrTail: string;
+  fatalError?: Error;
 }
 
 export class OmpStartupError extends Error {
@@ -55,10 +57,26 @@ export class OmpStartupError extends Error {
   }
 }
 
+export interface OmpRpcErrorDetails {
+  provider?: string;
+  model?: string;
+  httpStatus?: number;
+  retryable?: boolean;
+  code?: string;
+}
+
 export class OmpRpcCommandError extends Error {
-  constructor(readonly command: string, message: string, readonly code?: string) {
+  readonly httpStatus?: number;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly retryable?: boolean;
+  constructor(readonly command: string, message: string, readonly code?: string, details?: OmpRpcErrorDetails) {
     super(message);
     this.name = "OmpRpcCommandError";
+    if (details?.httpStatus !== undefined) this.httpStatus = details.httpStatus;
+    if (details?.provider !== undefined) this.provider = details.provider;
+    if (details?.model !== undefined) this.model = details.model;
+    if (details?.retryable !== undefined) this.retryable = details.retryable;
   }
 }
 
@@ -93,6 +111,7 @@ export class OmpRpcClient {
   private sequence = 0;
   private closing = false;
   private exit: OmpExit | undefined;
+  private fatalError: Error | undefined;
   private protocolVersion: 1 | 2 = 1;
   private readyFrame?: OmpReadyFrame;
   readonly exited: Promise<OmpExit>;
@@ -110,19 +129,29 @@ export class OmpRpcClient {
     this.exited = new Promise<OmpExit>((resolve) => {
       const finish = (code: number | null, signal: NodeJS.Signals | null) => {
         if (this.exit) return;
-        try {
-          for (const frame of this.decoder.end()) this.dispatchFrame(frame);
-        } catch {
-          // Ignore trailing corrupt frame on shutdown.
+        if (!this.fatalError) {
+          try {
+            for (const frame of this.decoder.end()) this.dispatchFrame(frame);
+          } catch (error) {
+            if (!this.closing) {
+              this.fatalError = error instanceof Error ? error : new Error(String(error));
+            }
+          }
         }
-        this.exit = { code, signal, expected: this.closing, stderrTail: this.stderrTail.slice(-1200) };
-        this.readyReject?.(new OmpStartupError(`omp exited before ready (code=${code})`, "exit", this.exit));
+        this.exit = {
+          code,
+          signal,
+          expected: this.closing && !this.fatalError,
+          stderrTail: this.stderrTail.slice(-1200),
+          ...(this.fatalError ? { fatalError: this.fatalError } : {}),
+        };
+        this.readyReject?.(this.fatalError ?? new OmpStartupError(`omp exited before ready (code=${code})`, "exit", this.exit));
         this.readyResolve = undefined;
         this.readyReject = undefined;
         for (const [id, req] of this.pending) {
           this.pending.delete(id);
           req.cleanup();
-          req.reject(new OmpRpcCommandError(req.command, `omp exited before answering ${req.command}`));
+          req.reject(this.fatalError ?? new OmpRpcCommandError(req.command, `omp exited before answering ${req.command}`));
         }
         resolve(this.exit);
       };
@@ -137,7 +166,15 @@ export class OmpRpcClient {
         frames = this.decoder.push(chunk);
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
+        this.fatalError = err;
         this.readyReject?.(err);
+        this.readyResolve = undefined;
+        this.readyReject = undefined;
+        for (const [id, req] of this.pending) {
+          this.pending.delete(id);
+          req.cleanup();
+          req.reject(err);
+        }
         this.terminate();
         return;
       }
@@ -367,11 +404,11 @@ export class OmpRpcClient {
       explicitId,
     );
   }
-  steer(message: string, images?: PiImageContent[]): Promise<void> {
-    return this.command({ type: "steer", message, ...(images?.length ? { images } : {}) }, null).then(() => undefined);
+  steer(message: string, images?: PiImageContent[], timeoutMs = QUICK_COMMAND_TIMEOUT_MS): Promise<void> {
+    return this.command({ type: "steer", message, ...(images?.length ? { images } : {}) }, timeoutMs).then(() => undefined);
   }
-  followUp(message: string, images?: PiImageContent[]): Promise<void> {
-    return this.command({ type: "follow_up", message, ...(images?.length ? { images } : {}) }, null).then(() => undefined);
+  followUp(message: string, images?: PiImageContent[], timeoutMs = QUICK_COMMAND_TIMEOUT_MS): Promise<void> {
+    return this.command({ type: "follow_up", message, ...(images?.length ? { images } : {}) }, timeoutMs).then(() => undefined);
   }
   btw(question: string, recordId?: string): Promise<{ record: OmpBtwRecord }> {
     return this.command<{ record: OmpBtwRecord }>({ type: "btw", question, ...(recordId ? { recordId } : {}) }, null).then(r => r.data);
@@ -381,6 +418,9 @@ export class OmpRpcClient {
   }
   abort(): Promise<void> {
     return this.command({ type: "abort" }, 10_000).then(() => undefined);
+  }
+  abortAndRestoreQueue(): Promise<{ steering?: string[]; followUp?: string[] }> {
+    return this.command<{ steering?: string[]; followUp?: string[] }>({ type: "abort_and_restore_queue" }, 10_000).then(r => r.data ?? {});
   }
   abortAndPrompt(message: string, images?: PiImageContent[]): Promise<{ id: string; data?: { agentInvoked?: boolean } }> {
     return this.command<{ agentInvoked?: boolean }>({ type: "abort_and_prompt", message, ...(images?.length ? { images } : {}) }, null);
@@ -392,7 +432,7 @@ export class OmpRpcClient {
     return this.command<{ cancelled: boolean }>({ type: "cancel_subagent", subagentId }).then(r => r.data);
   }
   steerSubagent(subagentId: string, message: string): Promise<void> {
-    return this.command({ type: "steer_subagent", subagentId, message }, null).then(() => undefined);
+    return this.command({ type: "steer_subagent", subagentId, message }, QUICK_COMMAND_TIMEOUT_MS).then(() => undefined);
   }
   setAskDialog(enabled: boolean): Promise<void> {
     return this.command({ type: "set_ask_dialog", enabled }).then(() => undefined);
@@ -412,14 +452,14 @@ export class OmpRpcClient {
   switchSession(sessionPath: string, provider?: string, modelId?: string): Promise<{ cancelled: boolean }> {
     return this.command<{ cancelled: boolean }>({ type: "switch_session", sessionPath, ...(provider && modelId ? { provider, modelId } : {}) }).then(r => r.data ?? { cancelled: false });
   }
-  getSubagents(): Promise<{ subagents?: Array<{ subagentId: string; status: string; label?: string; task?: string }> }> {
-    return this.command<{ subagents?: Array<{ subagentId: string; status: string; label?: string; task?: string }> }>({ type: "get_subagents" }).then(r => r.data ?? {});
+  getSubagents(): Promise<{ subagents?: OmpSubagentSummary[] }> {
+    return this.command<{ subagents?: OmpSubagentSummary[] }>({ type: "get_subagents" }).then(r => r.data ?? {});
   }
   compact(customInstructions?: string): Promise<unknown> {
     return this.command({ type: "compact", ...(customInstructions ? { customInstructions } : {}) }, null).then(r => r.data);
   }
-  goal(op: "get" | "create" | "resume" | "pause" | "drop", options: { objective?: string; token_budget?: number } = {}): Promise<{ goal: OmpGoalRecord | null; state?: { status?: string; tokensUsed?: number; timeUsedSeconds?: number } | null }> {
-    return this.command<{ goal: OmpGoalRecord | null; state?: { status?: string; tokensUsed?: number; timeUsedSeconds?: number } | null }>({ type: "goal", op, ...options }).then(r => r.data ?? { goal: null });
+  goal(op: "get" | "create" | "resume" | "pause" | "drop", options: { objective?: string; token_budget?: number } = {}): Promise<{ goal: OmpGoalRecord | null; state?: OmpGoalModeState | null }> {
+    return this.command<{ goal: OmpGoalRecord | null; state?: OmpGoalModeState | null }>({ type: "goal", op, ...options }).then(r => r.data ?? { goal: null });
   }
 
   private dispatchFrame(frame: OmpOutboundFrame): void {
