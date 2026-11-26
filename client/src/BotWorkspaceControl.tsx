@@ -181,8 +181,9 @@ function BotWorkspaceDialog({
           disabled={busy || !online}
           onSelect={item => void selectPath(item.path)}
           onRemove={id => void workspaces.remove(id)}
-          emptyText={t("还没有常用工作区。点击「添加文件夹」保存一次，之后一键切换。")}
+          emptyText={workspaces.error || workspaces.loading ? undefined : t("还没有常用工作区。点击「添加文件夹」保存一次，之后一键切换。")}
         />
+        {workspaces.error && <p role="alert" className="error-text">{workspaces.error}</p>}
 
         {saved && data && (
           <p role="status" className="dashboard-notice">
@@ -193,7 +194,11 @@ function BotWorkspaceDialog({
         {saving && <p role="status" className="muted">{t("正在切换…")}</p>}
         {!online && <p role="status" className="muted">{t("连接恢复后即可操作")}</p>}
         {error !== undefined && <p role="alert" className="error-text">{workspaceErrorText(error)}</p>}
-        {!data && !busy && <button type="button" disabled={!online} onClick={() => void load()}>{t("重新读取")}</button>}
+        {(!data || error !== undefined || !!workspaces.error) && !busy && (
+          <button type="button" disabled={!online} onClick={() => { void load(); void workspaces.reload(); }}>
+            {t("重新读取")}
+          </button>
+        )}
       </div>
     </CreationDialog>
   );

@@ -90,7 +90,7 @@ import { HubFileCenter, type FileCenterRoots } from "./file-center.js";
 import { HubWorkspaceDiff } from "./workspace-diff.js";
 import { workspaceChangesQuerySchema, workspaceFileDiffQuerySchema } from "../client-protocol/workspace-diff.js";
 import { SavedWorkspaces, resolveExistingWorkspaceDirectory } from "./saved-workspaces.js";
-import { botWorkspacePatchSchema, botWorkspaceResultSchema } from "../client-protocol/saved-workspaces.js";
+import { botWorkspacePatchSchema, botWorkspaceResultSchema, type BotWorkspacePatch } from "../client-protocol/saved-workspaces.js";
 import { workspaceSettings } from "../runtime/workspace-settings.js";
 import { nodeFrameReader, writeFrame } from "../client-protocol/fragments-node.js";
 import { linkUrlSchema } from "../client-protocol/links.js";
@@ -118,6 +118,11 @@ import { HubDispatch } from "./dispatch.js";
 import type { Bot } from "./store.js";
 /** Dispatcher engine workers are listed only to dispatch.v1 clients, which hide them. */
 const listedBots = (bots: Bot[], capabilities: string[]) => capabilities.includes(DISPATCH_CAPABILITY) ? bots : bots.filter(bot => bot.role !== "worker");
+const omitConversationWorkspace = (conversation: Conversation): Conversation => {
+  if (!conversation.workspacePath) return conversation;
+  const { workspacePath: _workspacePath, ...rest } = conversation;
+  return rest;
+};
 import { CARD_EXTRA_STREAM_CAPABILITY, messageDelta } from "../client-protocol/stream.js";
 import { CONVERSATION_SYNC_CAPABILITY, SNAPSHOT_ACTIVITY_CAPABILITY, SNAPSHOT_DELTA_CAPABILITY, SNAPSHOT_DELTA_THRESHOLD, SNAPSHOT_EVENT_THRESHOLD, SYNC_LINEAGE_CAPABILITY } from "../client-protocol/snapshot.js";
 import { botPublishSchema, instanceFrameSchema } from "../client-protocol/instance.js";
@@ -194,6 +199,7 @@ export class HubServer {
   private readonly dispatchTails = new Map<string, Promise<void>>();
   private permissionOperations = new Map<string, Promise<void>>();
   private effortOperations = new Map<string, Promise<void>>();
+  private workspaceOperations = new Map<string, Promise<void>>();
   private pendingRpc = new Map<string, Rpc>();
   private actionDispatch = new Set<string>();
   private stopping = false;
@@ -338,7 +344,7 @@ export class HubServer {
       // A native fork or rewind may legitimately run for minutes (Codex thread/fork alone allows 180 s);
       // an earlier timeout would report a success as unknown. Reads keep the ordinary RPC deadline.
       call: (botId, method, input) => this.callBot(botId, method, input, method === "history.apply" ? HISTORY_RELEASE_AFTER_MS : undefined),
-      changed: async conversation => { for (const client of this.clients) if (client.session?.userId === conversation.ownerId) { client.conversationIds.add(conversation.id); this.publishClient(client, { v: 1, type: "conversation.updated", conversation }); } },
+      changed: async conversation => { await this.broadcastConversation(conversation, client => client.session?.userId === conversation.ownerId, undefined, true); },
       log: line => options.onWarning?.(line),
     });
     this.remoteScreen = new HubRemoteScreen(store, auth);
@@ -361,7 +367,14 @@ export class HubServer {
     });
     this.hostRoutes = new HostRoutes({ store, network: this.network, publicKey: auth.publicKey, stateDir: options.stateDir, listeners: () => this.managedListeners() });
     const conversationsCreated = (userId: string, conversations: Conversation[]) => {
-      for (const conversation of conversations) for (const c of this.clients) if (c.session?.userId === userId && (!conversation.hidden || c.capabilities.includes(DISPATCH_CAPABILITY))) { c.conversationIds.add(conversation.id); this.publishClient(c, { v: 1, type: "conversation.updated", conversation }); }
+      for (const conversation of conversations) {
+        this.trackTask(this.broadcastConversation(
+          conversation,
+          c => c.session?.userId === userId && (!conversation.hidden || c.capabilities.includes(DISPATCH_CAPABILITY)),
+          undefined,
+          true,
+        ).catch(() => undefined));
+      }
     };
     this.botMessages = new BotMessages(store, auth, this.network, attachments, undefined,
       botId => { const connection = this.bots.get(botId); return connection?.ready ? connection.botMessages : undefined; },
@@ -1035,14 +1048,36 @@ export class HubServer {
     ws.on("error", () => { this.options.onWarning?.("client_socket_error"); });
     ws.on("close", () => { if (client.session) { this.workbench.unregister(this.workbenchPeer(client));this.designSharing.disconnect(this.designSharePeer(client)); } clearTimeout(timeout); client.pendingPublications.length = 0; this.auth.forgetConnection(id); this.clients.delete(client); });
   }
+  private async conversationForUser(userId: string, conversation: Conversation): Promise<Conversation> {
+    if (!conversation.workspacePath) return conversation;
+    return (await this.store.isOwner(userId)) ? conversation : omitConversationWorkspace(conversation);
+  }
+  private async broadcastConversation(
+    conversation: Conversation,
+    predicate: (client: Client) => boolean,
+    extra?: (client: Client) => Record<string, unknown>,
+    addConversationId = false,
+  ): Promise<void> {
+    const targets = [...this.clients].filter(client => client.session && predicate(client));
+    if (!targets.length) return;
+    if (addConversationId) for (const client of targets) client.conversationIds.add(conversation.id);
+    const ownerByUser = new Map<string, boolean>();
+    if (conversation.workspacePath) {
+      const userIds = [...new Set(targets.map(client => client.session!.userId))];
+      const roles = await this.store.db.serial(() =>
+        Promise.all(userIds.map(async id => [id, (await this.store.db.get<{ role: string }>("SELECT role FROM users WHERE id=?", [id]))?.role === "owner"] as const)),
+      );
+      for (const [id, isOwner] of roles) ownerByUser.set(id, isOwner);
+    }
+    for (const client of targets) {
+      const visible = !conversation.workspacePath || ownerByUser.get(client.session!.userId) ? conversation : omitConversationWorkspace(conversation);
+      this.publishClient(client, { v: 1, type: "conversation.updated", conversation: visible, ...(extra?.(client) ?? {}) });
+    }
+  }
   private async resolveBotDefaultWorkspace(botId: string): Promise<string | undefined> {
     if (this.botManager && await this.botManager.owns(botId)) {
       const stateDir = path.join(this.options.stateDir, "bots", botId);
       const read = await workspaceSettings(stateDir, 0).catch(() => undefined);
-      if (read?.ok) return read.settings.workspacePath;
-    }
-    if (this.bots.get(botId)?.ready) {
-      const read = await this.callBot(botId, "workspace.get", {}).then(raw => botWorkspaceResultSchema.parse(raw)).catch(() => undefined);
       if (read?.ok) return read.settings.workspacePath;
     }
     const row = await this.store.db.serial(() => this.store.db.get<{ workspace_path: string | null }>("SELECT workspace_path FROM bots WHERE id=?", [botId]));
@@ -1056,17 +1091,22 @@ export class HubServer {
         workspacePath = await resolveExistingWorkspaceDirectory(frame.workspacePath);
         await this.savedWorkspaces.touch(userId, workspacePath);
       } else {
-        const type = frame.conversationType ?? (frame.botIds.length === 1 ? "direct" : "group");
-        if (type === "direct" && frame.botIds.length === 1) {
-          workspacePath = await this.resolveBotDefaultWorkspace(frame.botIds[0]!);
+        const uniqueBots = [...new Set(frame.botIds)];
+        if (uniqueBots.length === 1) {
+          workspacePath = await this.resolveBotDefaultWorkspace(uniqueBots[0]!);
         }
       }
     }
     const conversation = frame.type === "topic.create"
       ? await this.store.createConversation(userId, [], frame.title, frame.clientActionId, { parentId: frame.groupId }, validate)
       : await this.store.createConversation(userId, frame.botIds, frame.title, frame.clientActionId, { type: frame.conversationType, ...(workspacePath ? { workspacePath } : {}) }, validate);
-    for (const c of this.clients) if (c.session && (c.session.userId === userId || conversation.parentId && c.conversationIds.has(conversation.parentId))) { c.conversationIds.add(conversation.id); this.publishClient(c, { v: 1, type: "conversation.updated", conversation, ...(c.session.userId === userId ? { clientActionId: frame.clientActionId } : {}) }); }
-    return conversation;
+    await this.broadcastConversation(
+      conversation,
+      c => c.session!.userId === userId || !!(conversation.parentId && c.conversationIds.has(conversation.parentId)),
+      c => c.session!.userId === userId ? { clientActionId: frame.clientActionId } : {},
+      true,
+    );
+    return this.conversationForUser(userId, conversation);
   }
   private designSharePeer(client:Client):DesignSharePeer {
     const session=client.session!;
@@ -1155,7 +1195,7 @@ export class HubServer {
         }
         const conversation = await this.store.updateConversation(userId, frame.conversationId, frame, validate);
         if (frame.type === "conversation.bind" && frame.sessionId === null) await this.store.audit("conversation.binding_cleared", userId, { conversationId: frame.conversationId });
-        for (const c of this.clients) if (c.conversationIds.has(conversation.id)) this.publishClient(c, { v: 1, type: "conversation.updated", conversation });
+        await this.broadcastConversation(conversation, c => c.conversationIds.has(conversation.id));
         break;
       }
       case "turn.stop": {
@@ -1334,29 +1374,32 @@ export class HubServer {
           if (connection.botSteer) this.trackTask(this.botMessages.reconcileForBot(botId).catch(() => this.options.onWarning?.("bot_steer_reconcile_failed")));
           else this.trackTask(this.botMessages.closeOpenSteersForBot(botId, "worker_without_steer").catch(() => this.options.onWarning?.("bot_steer_close_failed")));
           this.scheduleDispatch(botId);
-          this.trackTask((async () => {
-            const ws = await this.resolveBotDefaultWorkspace(botId);
-            if (ws) await this.store.botStatus(botId, { workspacePath: ws });
-            await this.broadcastBotStatus(botId);
-          })().catch(() => undefined)); return;
+          await this.broadcastBotStatus(botId); return;
         }
         if (!botId) throw new HubError("instance_unauthorized", 401);
         if (frame.type === "ping") {
           if (frame.status && this.bots.get(botId)?.ws === ws) {
             const status = frame.status;
-            const changed = await this.store.db.serial(async () => {
-              const current = await this.store.db.get<{ engine: string; model: string; effort: string }>("SELECT engine,model,effort FROM bots WHERE id=?", [botId!]);
-              if (this.bots.get(botId!)?.ws !== ws || !current || (current.engine === status.engine && current.model === status.model && current.effort === status.effort)) return false;
-              await this.store.db.run("UPDATE bots SET engine=?,model=?,effort=? WHERE id=?", [status.engine, status.model, status.effort, botId!]);
-              return true;
+            const nextWorkspace = status.workspacePath?.trim() || undefined;
+            const change = await this.store.db.serial(async () => {
+              const current = await this.store.db.get<{ engine: string; model: string; effort: string; workspace_path: string | null }>("SELECT engine,model,effort,workspace_path FROM bots WHERE id=?", [botId!]);
+              if (this.bots.get(botId!)?.ws !== ws || !current) return { meta: false, workspace: false };
+              const meta = current.engine !== status.engine || current.model !== status.model || current.effort !== status.effort;
+              const workspace = nextWorkspace !== undefined && nextWorkspace !== (current.workspace_path?.trim() || undefined);
+              if (!meta && !workspace) return { meta: false, workspace: false };
+              await this.store.db.run("UPDATE bots SET engine=?,model=?,effort=?,workspace_path=? WHERE id=?", [status.engine, status.model, status.effort, nextWorkspace ?? current.workspace_path, botId!]);
+              return { meta, workspace };
             });
-            if (changed) {
-              const connection = this.bots.get(botId);
-              if (connection?.ws === ws) {
-                connection.queueCapable = connection.queueAdvertised && supportsPromptQueueEngine(status.engine);
-                await new HubPromptQueue(this.store).registerWorker(botId, connection.queueCapable, () => active() && this.bots.get(botId!) === connection);
+            if (change.meta || change.workspace) {
+              if (change.meta) {
+                const connection = this.bots.get(botId);
+                if (connection?.ws === ws) {
+                  connection.queueCapable = connection.queueAdvertised && supportsPromptQueueEngine(status.engine);
+                  await new HubPromptQueue(this.store).registerWorker(botId, connection.queueCapable, () => active() && this.bots.get(botId!) === connection);
+                }
               }
-              await this.broadcastBotStatus(botId); this.scheduleDispatch(botId);
+              await this.broadcastBotStatus(botId);
+              if (change.meta) this.scheduleDispatch(botId);
             }
           }
           this.send(ws, { v: 1, type: "pong" }); return;
@@ -1874,11 +1917,12 @@ export class HubServer {
       }
       if (route === "/api/conversations/batch" && req.method === "POST") {
         const result = await new ConversationBatchOperations(this.store).apply(userId, await this.jsonBody(req), validateInQueue);
-        for (const conversation of result.conversations) for (const client of this.clients) {
-          if (client.conversationIds.has(conversation.id)) this.publishClient(client, { v: 1, type: "conversation.updated", conversation });
+        for (const conversation of result.conversations) {
+          await this.broadcastConversation(conversation, client => client.conversationIds.has(conversation.id));
         }
         if (result.folders) for (const client of this.clients) if (client.session?.userId === userId) this.publishClient(client, { v: 1, type: "conversation-folders.updated", folders: result.folders });
-        await reply(200, result);
+        const visibleConversations = await Promise.all(result.conversations.map(conversation => this.conversationForUser(userId, conversation)));
+        await reply(200, { ...result, conversations: visibleConversations });
         return;
       }
       if (route === "/api/conversation-folders" && (req.method === "GET" || req.method === "PATCH")) {
@@ -2154,7 +2198,7 @@ export class HubServer {
         await this.settleDiscussion(() => this.groupDiscussions.settleBot(botId));
         // The deletion is committed; later Bus reads and startup reconcile retry.
         await this.agentBuses.settleCoordinator(botId).catch(() => this.options.onWarning?.("agent_bus_settle_failed"));
-        for (const conversation of conversations) for (const client of this.clients) if (client.conversationIds.has(conversation.id)) this.publishClient(client, { v: 1, type: "conversation.updated", conversation });
+        for (const conversation of conversations) await this.broadcastConversation(conversation, client => client.conversationIds.has(conversation.id));
         await reply(200, { bot: (await this.store.bots(userId, true)).find(bot => bot.id === botId), conversations });
         return;
       }
@@ -2176,8 +2220,8 @@ export class HubServer {
       if (groupSettingsRoute && req.method === "PUT") {
         const { groupSettingsSchema } = await import("../client-protocol/groups.js");
         const changed = await this.store.updateGroup(userId, groupSettingsRoute[1]!, groupSettingsSchema.parse(await this.jsonBody(req)), validateInQueue);
-        for (const conversation of changed) for (const client of this.clients) if (client.conversationIds.has(conversation.id)) this.publishClient(client, { v: 1, type: "conversation.updated", conversation });
-        await reply(200, changed); return;
+        for (const conversation of changed) await this.broadcastConversation(conversation, client => client.conversationIds.has(conversation.id));
+        await reply(200, await Promise.all(changed.map(conversation => this.conversationForUser(userId, conversation)))); return;
       }
       const discussionRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/discussion(?:\/([A-Za-z0-9_-]+)\/(control|notes|steps\/([A-Za-z0-9_-]+)))?$/);
       if (discussionRoute && (req.method === "POST" ? !discussionRoute[3] || discussionRoute[3] === "control" || discussionRoute[3] === "notes" : req.method === "GET" && (!discussionRoute[2] || !!discussionRoute[4]))) {
@@ -2349,30 +2393,47 @@ export class HubServer {
         const botId = botWorkspace[1]!;
         if (!(await this.store.bots(userId)).some(bot => bot.id === botId)) throw new HubError("bot_forbidden", 403);
         const input = req.method === "PUT" ? botWorkspacePatchSchema.parse(await this.jsonBody(req)) : {};
-        const managed = this.botManager ? await this.botManager.owns(botId) : false;
-        const readOrWrite = async (method: "workspace.get" | "workspace.set", payload: unknown) => {
-          if (this.bots.get(botId)?.ready) return botWorkspaceResultSchema.parse(await this.callBot(botId, method, payload));
-          if (managed) return workspaceSettings(path.join(this.options.stateDir, "bots", botId), 0, method === "workspace.set" ? payload : undefined);
-          throw new HubError("bot_offline", 503);
-        };
-        const previousWorkspace = req.method === "PUT" ? await this.resolveBotDefaultWorkspace(botId) : undefined;
-        const result = await readOrWrite(req.method === "PUT" ? "workspace.set" : "workspace.get", input);
-        if (!result.ok) throw new HubError(result.error, result.error === "workspace_unavailable" ? 400 : 409);
-        if (req.method === "PUT") {
-          if (previousWorkspace && previousWorkspace !== result.settings.workspacePath) {
-            const pinned = await this.store.pinUnassignedBotConversations(botId, previousWorkspace);
+        const operation = (this.workspaceOperations.get(botId) ?? Promise.resolve()).catch(() => undefined).then(async () => {
+          await this.auth.validateSession(session);
+          await requireOwner();
+          const managed = this.botManager ? await this.botManager.owns(botId) : false;
+          const readOrWrite = async (method: "workspace.get" | "workspace.set", payload: unknown) => {
+            if (this.bots.get(botId)?.ready) return botWorkspaceResultSchema.parse(await this.callBot(botId, method, payload));
+            if (managed) return workspaceSettings(path.join(this.options.stateDir, "bots", botId), 0, method === "workspace.set" ? payload : undefined);
+            throw new HubError("bot_offline", 503);
+          };
+          if (req.method === "GET") {
+            const result = await readOrWrite("workspace.get", input);
+            if (!result.ok) throw new HubError(result.error, result.error === "workspace_unavailable" ? 400 : 409);
+            await this.store.botStatus(botId, { workspacePath: result.settings.workspacePath }, validateInQueue).catch(() => undefined);
+            await reply(200, result.settings);
+            return;
+          }
+          const patch = input as BotWorkspacePatch;
+          const current = await readOrWrite("workspace.get", {});
+          if (!current.ok) throw new HubError(current.error, current.error === "workspace_unavailable" ? 400 : 409);
+          if (patch.revision !== current.settings.revision) throw new HubError("workspace_conflict", 409);
+          const requested = patch.workspacePath.trim();
+          const targetPath = requested ? await resolveExistingWorkspaceDirectory(requested) : current.settings.defaultWorkspacePath;
+          const previousWorkspace = current.settings.workspacePath;
+          if (previousWorkspace && previousWorkspace !== targetPath) {
+            const pinned = await this.store.pinUnassignedBotConversations(botId, previousWorkspace, validateInQueue);
             for (const conversation of pinned) {
-              for (const c of this.clients) if (c.conversationIds.has(conversation.id)) this.publishClient(c, { v: 1, type: "conversation.updated", conversation });
+              await this.broadcastConversation(conversation, c => c.conversationIds.has(conversation.id));
             }
           }
+          await this.auth.validateSession(session);
+          await requireOwner();
+          const result = await readOrWrite("workspace.set", patch);
+          if (!result.ok) throw new HubError(result.error, result.error === "workspace_unavailable" ? 400 : 409);
           await this.store.botStatus(botId, { workspacePath: result.settings.workspacePath });
           await this.savedWorkspaces.touch(userId, result.settings.workspacePath);
           await this.broadcastBotStatus(botId);
           await this.store.audit("bot.workspace_updated", session.deviceId, { botId });
-        } else {
-          await this.store.botStatus(botId, { workspacePath: result.settings.workspacePath }).catch(() => undefined);
-        }
-        await reply(200, result.settings);
+          await reply(200, result.settings);
+        });
+        this.workspaceOperations.set(botId, operation);
+        try { await operation; } finally { if (this.workspaceOperations.get(botId) === operation) this.workspaceOperations.delete(botId); }
         return;
       }
       const persona = route.match(/^\/api\/bots\/([A-Za-z0-9_-]+)\/persona$/);

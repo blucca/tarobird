@@ -104,8 +104,12 @@ export class HubStore {
     if (!await this.db.get("SELECT 1 FROM conversation_members WHERE conversation_id=? AND member_type='bot' AND member_id=?", [conversationId, botId])) throw new HubError("bot_forbidden", 403);
   }
   async requireOwner(userId: string): Promise<void> {
-    if ((await this.db.get<User>("SELECT * FROM users WHERE id=?", [userId]))?.role !== "owner") throw new HubError("owner_required", 403);
+    if (!await this.isOwnerInTransaction(userId)) throw new HubError("owner_required", 403);
   }
+  private async isOwnerInTransaction(userId: string): Promise<boolean> {
+    return (await this.db.get<Pick<User, "role">>("SELECT role FROM users WHERE id=?", [userId]))?.role === "owner";
+  }
+  isOwner(userId: string): Promise<boolean> { return this.db.serial(() => this.isOwnerInTransaction(userId)); }
   user(userId: string): Promise<User | undefined> { return this.db.serial(() => this.db.get<User>("SELECT * FROM users WHERE id=?", [userId])); }
   device(deviceId: string): Promise<Device | undefined> { return this.db.serial(() => this.db.get<Device>("SELECT * FROM devices WHERE id=?", [deviceId])); }
   devices(userId: string): Promise<DeviceSummary[]> {
@@ -118,15 +122,17 @@ export class HubStore {
   }
   bots(userId: string, includeDeleted = false): Promise<Bot[]> {
     return this.db.serial(async () => {
+      const owner = await this.isOwnerInTransaction(userId);
       const rows = await this.db.all<Omit<Bot, "role" | "workspacePath"> & { role: string; deleted_at: number | null; assigned_avatar: string | null; workspace_path: string | null }>(`SELECT id,name,engine,model,effort,online,role,deleted_at,workspace_path,(SELECT value FROM meta WHERE key=?||bots.id) AS assigned_avatar,EXISTS(SELECT 1 FROM managed_bots m WHERE m.bot_id=bots.id) AS managed FROM bots WHERE (? OR deleted_at IS NULL) AND (EXISTS(SELECT 1 FROM users WHERE id=? AND role='owner') OR id IN (SELECT bot_id FROM bot_grants WHERE user_id=?)) ORDER BY id`, [BOT_AVATAR_DEFAULT_PREFIX, Number(includeDeleted), userId, userId]);
       return rows.map(({ deleted_at, assigned_avatar, role, workspace_path, ...bot }) => {
         const assigned = botAvatarById(assigned_avatar), known = botRoleSchema.safeParse(role);
-        return { ...bot, ...(known.success ? { role: known.data } : {}), ...(workspace_path ? { workspacePath: workspace_path } : {}), ...(assigned ? { defaultAvatar: assigned.id } : {}), ...(deleted_at ? { online: 0, managed: 0, deletedAt: deleted_at } : {}) };
+        return { ...bot, ...(known.success ? { role: known.data } : {}), ...(owner && workspace_path ? { workspacePath: workspace_path } : {}), ...(assigned ? { defaultAvatar: assigned.id } : {}), ...(deleted_at ? { online: 0, managed: 0, deletedAt: deleted_at } : {}) };
       });
     });
   }
-  async botStatus(id: string, status: Partial<Pick<Bot, "engine" | "model" | "effort" | "online" | "workspacePath">>): Promise<void> {
+  async botStatus(id: string, status: Partial<Pick<Bot, "engine" | "model" | "effort" | "online" | "workspacePath">>, validate?: TransactionGuard): Promise<void> {
     await this.db.serial(async () => {
+      await validate?.();
       if (!await this.db.get("SELECT 1 FROM bots WHERE id=? AND deleted_at IS NULL", [id])) throw new HubError("bot_deleted", 410);
       for (const field of ["engine", "model", "effort", "online"] as const) if (status[field] !== undefined) await this.db.run(`UPDATE bots SET ${field}=? WHERE id=?`, [status[field]!, id]);
       if (status.workspacePath !== undefined) await this.db.run("UPDATE bots SET workspace_path=? WHERE id=?", [status.workspacePath || null, id]);
@@ -202,11 +208,11 @@ export class HubStore {
     for (const event of result.events) this.emit(event);
     return result.conversations;
   }
-  private async conversationRow(id: string): Promise<Conversation> {
+  private async conversationRow(id: string, includeWorkspace = true): Promise<Conversation> {
     const row = await this.db.get<ConversationRow>("SELECT * FROM conversations WHERE id=?", [id]);
     if (!row) throw new HubError("conversation_not_found", 404);
     const bots = await this.db.all<{ member_id: string }>("SELECT member_id FROM conversation_members WHERE conversation_id=? AND member_type='bot' ORDER BY member_id", [id]);
-    return conversationSchema.parse({ ...(row.history_origin_json ? { historyOrigin: JSON.parse(row.history_origin_json) } : {}), id: row.id, type: row.type, title: row.title, ownerId: row.owner_id, ...(row.parent_id ? { parentId: row.parent_id } : {}), botIds: bots.map((b) => b.member_id), archived: !!row.archived, ...(row.session_id ? { sessionId: row.session_id } : {}), ...(row.binding_id ? { bindingId: row.binding_id } : {}), ...(row.workspace_path ? { workspacePath: row.workspace_path } : {}), createdAt: row.created_at,
+    return conversationSchema.parse({ ...(row.history_origin_json ? { historyOrigin: JSON.parse(row.history_origin_json) } : {}), id: row.id, type: row.type, title: row.title, ownerId: row.owner_id, ...(row.parent_id ? { parentId: row.parent_id } : {}), botIds: bots.map((b) => b.member_id), archived: !!row.archived, ...(row.session_id ? { sessionId: row.session_id } : {}), ...(row.binding_id ? { bindingId: row.binding_id } : {}), ...(includeWorkspace && row.workspace_path ? { workspacePath: row.workspace_path } : {}), createdAt: row.created_at,
       ...(row.hidden ? { hidden: true } : {}), ...(row.ticket_json ? { ticket: conversationTicketSchema.parse(JSON.parse(row.ticket_json)) } : {}) });
   }
   conversationWorkspacePath(conversationId: string): Promise<string | undefined> {
@@ -220,14 +226,17 @@ export class HubStore {
       return row.workspace_path?.trim() || undefined;
     });
   }
-  /** Pin legacy direct conversations of a Bot that have no explicit workspace yet
-   * before changing the Bot's default workspace, so they remain in their original folder. */
-  pinUnassignedBotConversations(botId: string, workspacePath: string): Promise<Conversation[]> {
+  /** Pin legacy single-Bot conversations (direct chats and 1-Bot groups/topics)
+   * that have no explicit workspace yet before changing the Bot's default workspace,
+   * so they remain in their original folder. */
+  pinUnassignedBotConversations(botId: string, workspacePath: string, validate?: TransactionGuard): Promise<Conversation[]> {
     return this.db.transaction(async () => {
+      await validate?.();
       const rows = await this.db.all<{ id: string }>(
         `SELECT c.id FROM conversations c
          JOIN conversation_members m ON m.conversation_id=c.id AND m.member_type='bot' AND m.member_id=?
-         WHERE c.workspace_path IS NULL AND c.hidden=0 AND c.type='direct'`,
+         WHERE c.workspace_path IS NULL AND c.hidden=0
+           AND (c.type='direct' OR (SELECT COUNT(*) FROM conversation_members cm WHERE cm.conversation_id=c.id AND cm.member_type='bot')=1)`,
         [botId],
       );
       if (!rows.length) return [];
@@ -239,8 +248,9 @@ export class HubStore {
    * it would show dispatcher worker conversations as ordinary chats. */
   conversations(userId: string, options: { hidden?: boolean } = {}): Promise<Conversation[]> {
     return this.db.serial(async () => {
+      const owner = await this.isOwnerInTransaction(userId);
       const rows = await this.db.all<{ id: string }>(`SELECT c.id FROM conversations c JOIN conversation_members m ON c.id=m.conversation_id WHERE m.member_type='user' AND m.member_id=? AND NOT EXISTS(SELECT 1 FROM history_operations h WHERE h.destination_conversation_id=c.id AND h.state!='applied')${options.hidden === false ? " AND c.hidden=0" : ""} ORDER BY c.created_at`, [userId]);
-      return Promise.all(rows.map((r) => this.conversationRow(r.id)));
+      return Promise.all(rows.map((r) => this.conversationRow(r.id, owner)));
     });
   }
   conversationForBot(botId: string, conversationId: string): Promise<Conversation> { return this.db.serial(async () => { await this.requireBot(botId, conversationId); return this.conversationRow(conversationId); }); }
@@ -325,7 +335,15 @@ export class HubStore {
     return { group, policy, revision };
   }
   groupSettings(userId: string, groupId: string, validate?: TransactionGuard): Promise<GroupSettingsSnapshot> {
-    return this.db.serial(async () => { await validate?.(); await this.requireMember(userId, groupId); return this.groupSettingsInTransaction(groupId); });
+    return this.db.serial(async () => {
+      await validate?.(); await this.requireMember(userId, groupId);
+      const settings = await this.groupSettingsInTransaction(groupId);
+      if (settings.group.workspacePath && !await this.isOwnerInTransaction(userId)) {
+        const { workspacePath: _workspacePath, ...group } = settings.group;
+        return { ...settings, group };
+      }
+      return settings;
+    });
   }
   async updateGroup(userId: string, id: string, input: GroupSettingsInput, validate?: TransactionGuard): Promise<Conversation[]> {
     const change = groupSettingsSchema.parse(input);
@@ -1264,10 +1282,11 @@ export class HubStore {
   snapshot(userId: string, conversationId: string): Promise<{ conversation: Conversation; messages: Message[]; seq: number }> {
     return this.db.serial(async () => {
       await this.requireMember(userId, conversationId);
+      const owner = await this.isOwnerInTransaction(userId);
       const messages = (await this.db.all<MessageRow>("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at,rowid", [conversationId])).map((r) => this.decodeMessage(r));
       const seq = (await this.db.get<{ seq: number }>("SELECT COALESCE(MAX(seq),0) AS seq FROM events WHERE conversation_id=?", [conversationId]))!.seq;
       const hidden = await this.hiddenMessages(userId, conversationId);
-      return { conversation: await this.conversationRow(conversationId), messages: messages.map(message => hidden.has(message.id) ? deletedMessage(message) : message), seq };
+      return { conversation: await this.conversationRow(conversationId, owner), messages: messages.map(message => hidden.has(message.id) ? deletedMessage(message) : message), seq };
     });
   }
   syncHead(userId: string, conversationId: string): Promise<{ seq: number; firstSeq: number }> {
@@ -1314,7 +1333,8 @@ export class HubStore {
     const db = await HubDatabase.snapshot(this.db.file), view = new HubStore(db), id = newId("snapshot");
     try {
       await db.exec("BEGIN"); await view.requireMember(userId, conversationId);
-      const conversation = await view.conversationRow(conversationId);
+      const owner = await view.isOwnerInTransaction(userId);
+      const conversation = await view.conversationRow(conversationId, owner);
       const { seq, firstSeq } = (await db.get<{ seq: number; firstSeq: number }>(replayHeadSql, [conversationId]))!;
       const readSeq = (await db.get<{ seq: number }>("SELECT seq FROM reads WHERE user_id=? AND conversation_id=?", [userId, conversationId]))?.seq ?? 0;
       // Completion transitions match ClientCache.apply; editing an already-complete

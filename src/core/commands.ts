@@ -514,6 +514,7 @@ async function handleCoreSessionCommand(
       engine: cfg.engine,
       resume: cfg.resume,
     },
+    workspaceOverride: effectiveWorkspace,
     normalized: toSessionCommandMessage(normalized, commandText),
     context: {
       api: {
@@ -2435,7 +2436,7 @@ export async function tryHandleCoreGoalControlBeforeQueue(input: CoreCommandInpu
     cfg.resume = warning ? undefined : resolveConversationResume(record, cfg.resume);
     if (!await current()) return false;
     const handled = await applyCoreGoalCommand({ ...input,
-      workspaceOverride: input.workspaceOverride ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
+      workspaceOverride: input.workspaceOverride ?? cfg.resume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
       isCurrentGoalSession: current,
     }, normalized, cfg, action, text, await resolveCoreLocale(input.stateDir));
     return handled ?? false;
@@ -2514,7 +2515,7 @@ async function applyCoreGoalCommand(
     userId: normalized.bridgeUserId,
     chatType: normalized.bridgeChatType,
     conversationKey: normalized.conversationKey,
-    workspaceOverride: input.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
+    workspaceOverride: input.workspaceOverride ?? cfg.resume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
     ...(input.isCurrentGoalSession ? { isCurrentSession: input.isCurrentGoalSession } : {}),
   };
   // activeRuns key for this conversation — shared by the live watcher (which claims

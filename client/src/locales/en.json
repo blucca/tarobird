@@ -5698,6 +5698,7 @@
   "清空筛选": "Clear filter",
   "目录不存在：{0}": "Missing folder: {0}",
   "移除常用工作区「{0}」": "Remove saved workspace \"{0}\"",
+  "移除常用工作区失败，请稍后重试。": "Could not remove this saved workspace. Try again later.",
   "从常用列表移除": "Remove from saved workspaces",
   "没有匹配的常用工作区": "No matching saved workspaces",
   "此主机尚不支持在设置中切换默认工作区，请更新主机版本。": "This Host does not support switching the default workspace in Settings yet. Update the Host.",

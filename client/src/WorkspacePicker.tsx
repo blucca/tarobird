@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUp, Check, Folder, FolderOpen, FolderPlus, Home, LoaderCircle, Plus, Search, Trash2, X } from "lucide-react";
 import {
   addSavedWorkspaceResultSchema,
@@ -17,21 +17,33 @@ export function useSavedWorkspaces(connection: HubConnection, enabled: boolean) 
   const [items, setItems] = useState<SavedWorkspace[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const reloadSeq = useRef(0);
+  const reloadAbort = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => { reloadAbort.current?.abort(); }, []);
   const reload = useCallback(async () => {
     if (!enabled) return;
+    reloadAbort.current?.abort();
+    const controller = new AbortController();
+    reloadAbort.current = controller;
+    const seq = ++reloadSeq.current;
     setLoading(true);
     setError("");
     try {
-      const data = savedWorkspaceListSchema.parse(await connection.http("/api/workspaces"));
+      const data = savedWorkspaceListSchema.parse(await connection.http("/api/workspaces", { signal: controller.signal }));
+      if (reloadSeq.current !== seq) return;
       setItems(data.items);
     } catch (e) {
+      if (controller.signal.aborted || reloadSeq.current !== seq) return;
       setError(e instanceof HubHttpError && e.status === 404 ? t("当前主机暂不支持常用工作区，请更新主机。") : t("暂时无法读取常用工作区列表。"));
     } finally {
-      setLoading(false);
+      if (reloadSeq.current === seq) setLoading(false);
     }
   }, [connection, enabled]);
   useEffect(() => { if (enabled) void reload(); }, [enabled, reload]);
   const add = useCallback(async (folderPath: string, name?: string) => {
+    reloadAbort.current?.abort();
+    reloadSeq.current++;
+    setError("");
     const result = addSavedWorkspaceResultSchema.parse(await connection.http("/api/workspaces", {
       method: "POST",
       body: JSON.stringify({ path: folderPath, ...(name?.trim() ? { name: name.trim() } : {}) }),
@@ -40,8 +52,15 @@ export function useSavedWorkspaces(connection: HubConnection, enabled: boolean) 
     return result.workspace;
   }, [connection]);
   const remove = useCallback(async (id: string) => {
-    const result = savedWorkspaceListSchema.parse(await connection.http(`/api/workspaces/${encodeURIComponent(id)}`, { method: "DELETE" }));
-    setItems(result.items);
+    reloadAbort.current?.abort();
+    reloadSeq.current++;
+    setError("");
+    try {
+      const result = savedWorkspaceListSchema.parse(await connection.http(`/api/workspaces/${encodeURIComponent(id)}`, { method: "DELETE" }));
+      setItems(result.items);
+    } catch {
+      setError(t("移除常用工作区失败，请稍后重试。"));
+    }
   }, [connection]);
   return { items, loading, error, reload, add, remove };
 }
@@ -65,23 +84,38 @@ export function WorkspaceAddForm({
   const [browsing, setBrowsing] = useState(false);
   const [browseData, setBrowseData] = useState<WorkspaceBrowseResult>();
   const [browseLoading, setBrowseLoading] = useState(false);
+  const browseSeq = useRef(0);
+  const browseAbort = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => { browseAbort.current?.abort(); }, []);
 
   const loadBrowse = useCallback(async (targetPath?: string) => {
+    browseAbort.current?.abort();
+    const controller = new AbortController();
+    browseAbort.current = controller;
+    const seq = ++browseSeq.current;
     setBrowseLoading(true);
     setError("");
     try {
       const qs = targetPath ? `?path=${encodeURIComponent(targetPath)}` : "";
-      const data = workspaceBrowseSchema.parse(await connection.http(`/api/workspaces/browse${qs}`));
+      const data = workspaceBrowseSchema.parse(await connection.http(`/api/workspaces/browse${qs}`, { signal: controller.signal }));
+      if (browseSeq.current !== seq) return;
       setBrowseData(data);
     } catch {
+      if (controller.signal.aborted || browseSeq.current !== seq) return;
       setError(t("无法浏览主机上的该目录，请检查路径或权限。"));
     } finally {
-      setBrowseLoading(false);
+      if (browseSeq.current === seq) setBrowseLoading(false);
     }
   }, [connection]);
 
   const toggleBrowse = () => {
-    if (browsing) { setBrowsing(false); return; }
+    if (browsing) {
+      browseAbort.current?.abort();
+      browseSeq.current++;
+      setBrowseLoading(false);
+      setBrowsing(false);
+      return;
+    }
     setBrowsing(true);
     void loadBrowse(folderPath.trim() || undefined);
   };
@@ -159,8 +193,8 @@ export function WorkspaceAddForm({
               className="icon-button"
               aria-label={t("回到主目录")}
               title={t("回到主目录")}
-              disabled={browseLoading || !browseData}
-              onClick={() => browseData && void loadBrowse(browseData.home)}
+              disabled={browseLoading}
+              onClick={() => void loadBrowse(browseData?.home)}
             >
               <Home size={14} aria-hidden="true" />
             </button>

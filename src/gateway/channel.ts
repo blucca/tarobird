@@ -52,7 +52,8 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
   private readonly processingConversations = new Map<string, string>();
   async conversationWorkspace(conversationId: string): Promise<string | undefined> {
     const cached = this.conversations.get(conversationId);
-    if (cached) return cached.ticket?.workspace ?? cached.workspacePath;
+    const known = cached?.ticket?.workspace ?? cached?.workspacePath;
+    if (known) return known;
     try {
       const fetched = conversationSchema.parse(await this.transport.request("conversation", { conversationId }));
       this.conversations.set(fetched.id, fetched);

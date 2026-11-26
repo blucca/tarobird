@@ -69,6 +69,7 @@ export function NewConversation({ hostName, connection, bots: allBots, request, 
         ))}
       </div>
       {(workspaceOverride || defaultWorkspacePath) && <p className="workspace-chip-hint" title={workspaceOverride || defaultWorkspacePath}>{workspaceOverride || defaultWorkspacePath}</p>}
+      {savedWorkspaces.error && <p role="alert" className="error-text">{savedWorkspaces.error}</p>}
       {addingWorkspace && <WorkspaceAddForm connection={connection} disabled={busy || !!submitted.current || state.status !== "online"} onAdded={async workspace => { setAddingWorkspace(false); await savedWorkspaces.reload(); setWorkspaceOverride(workspace.path); }} onCancel={() => setAddingWorkspace(false)}/>}
     </div>}
     {request.kind === "topic" && <div className="inherited-bots">{bots.filter((b) => chosen.includes(b.id)).map((b) => <span key={b.id}><BotIcon size={15}/>{labels.get(b.id) ?? b.name}</span>)}</div>}
