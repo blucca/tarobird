@@ -5,9 +5,9 @@ import type { HubConnection, OutboxSettlement } from "./connection.js";
 import type { OutboxEntry } from "./storage.js";
 import { t } from "./i18n.js";
 
-type Receipt = OutboxSettlement & { reconciling?: boolean };
-type View = { connection: HubConnection; conversationId: string; entries: OutboxEntry[]; readRevision: number };
-const initial = (connection: HubConnection, conversationId: string): View => ({ connection, conversationId, entries: [], readRevision: -1 });
+type Receipt = Omit<OutboxSettlement, "queueRevision"> & { queueRevision?: number; reconciling?: boolean };
+type View = { connection: HubConnection; conversationId: string; entries: OutboxEntry[]; readRevision: number; readQueueRevision: number };
+const initial = (connection: HubConnection, conversationId: string): View => ({ connection, conversationId, entries: [], readRevision: -1, readQueueRevision: -1 });
 const belongs = (entry: OutboxEntry, conversationId: string) => "conversationId" in entry.frame && entry.frame.conversationId === conversationId;
 const waitingForHistory = (receipt: Receipt, historyRevision: number, messages: Message[]) => (receipt.messageAccepted || receipt.reconciling)
   && (receipt.entry.frame.type === "message.send" || receipt.entry.frame.type === "message.forward")
@@ -91,7 +91,7 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
           settled.set(entry.id, { entry, revision: connection.state.cacheRevision, messageAccepted: false, reconciling: true });
           reconcile = true;
         }
-        const updated = { ...current, entries: next, readRevision };
+        const updated = { ...current, entries: next, readRevision, readQueueRevision };
         views.set(conversationId, updated); setView(updated);
         // Confirmation needs a fresh read of this conversation only.
         if (reconcile) { receiptChanged(); connection.refreshConversation(conversationId); }
@@ -126,7 +126,11 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
       const queued = view.entries.find(entry => entry.id === id);
       // Re-enqueuing an acknowledged ID creates a new outbox order. It is a
       // new send attempt, even when the Hub will deduplicate its message.
-      if (queued && queued.order > receipt.entry.order || !queued && view.readRevision > receipt.revision && !waitingForHistory(receipt, historyRevision, messages)) {
+      // Non-reconciling settlements may retire once an outbox read started
+      // after settlement confirms removal and history no longer needs the bridge.
+      const settledRead = view.readRevision > receipt.revision
+        || receipt.queueRevision !== undefined && view.readQueueRevision > receipt.queueRevision;
+      if (queued && queued.order > receipt.entry.order || !queued && settledRead && !waitingForHistory(receipt, historyRevision, messages)) {
         settled.delete(id); removed = true;
       }
     }

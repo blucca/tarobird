@@ -248,6 +248,47 @@ test.describe("pending feedback during cache changes", () => {
     await expect(row).toContainText("NEW_PENDING pending");
   });
 
+  test("outbox mutations do not trigger premature history reads before the message event arrives", async ({ page }) => {
+    await page.evaluate(() => {
+      const f = (window as any).outboxFixture, cache = f.hosts.a.cache, original = cache.messages.bind(cache);
+      f.historyReadCount = 0;
+      cache.messages = async (id: string) => { f.historyReadCount++; return original(id); };
+    });
+    await page.evaluate(() => (window as any).outboxFixture.send("decoupled-1", "DECOUPLED_1"));
+    const row = page.locator('.fixture-workspace:not([hidden]) #queued [data-id="decoupled-1"]');
+    await expect(row).toContainText("DECOUPLED_1 pending");
+    expect(await page.evaluate(() => (window as any).outboxFixture.historyReadCount)).toBe(0);
+
+    // ACK before message.created: keeps "sent" feedback without reading history.
+    await page.evaluate(() => Reflect.get((window as any).outboxFixture.hosts.a.connection, "ack").call((window as any).outboxFixture.hosts.a.connection, "decoupled-1", true));
+    await expect(row).toContainText("DECOUPLED_1 sent");
+    expect(await page.evaluate(() => (window as any).outboxFixture.historyReadCount)).toBe(0);
+
+    // Canonical history event arrives: triggers exactly one history read and retires pending row.
+    await page.evaluate(() => (window as any).outboxFixture.publish("decoupled-1", "DECOUPLED_1"));
+    await expect(page.locator('.fixture-workspace:not([hidden]) #history [data-id="decoupled-1"]')).toContainText("DECOUPLED_1");
+    await expect(row).toHaveCount(0);
+    expect(await page.evaluate(() => (window as any).outboxFixture.historyReadCount)).toBe(1);
+
+    // Failure, retry, and discard also leave history unread.
+    await page.evaluate(async () => {
+      const f = (window as any).outboxFixture, c = f.hosts.a.connection;
+      await f.send("decoupled-fail", "DECOUPLED_FAIL");
+      await Reflect.get(c, "rejectOperation").call(c, { code: "conversation_archived", message: "archived", retryable: false, requestId: "decoupled-fail" });
+    });
+    const failedRow = page.locator('.fixture-workspace:not([hidden]) #queued [data-id="decoupled-fail"]');
+    await expect(failedRow).toContainText("archived");
+    await page.evaluate(() => (window as any).outboxFixture.hosts.a.connection.retryFailed("decoupled-fail"));
+    await expect(failedRow).toContainText("DECOUPLED_FAIL pending");
+    await page.evaluate(async () => {
+      const f = (window as any).outboxFixture, c = f.hosts.a.connection;
+      await Reflect.get(c, "rejectOperation").call(c, { code: "conversation_archived", message: "archived", retryable: false, requestId: "decoupled-fail" });
+      await f.discard("decoupled-fail");
+    });
+    await expect(failedRow).toHaveCount(0);
+    expect(await page.evaluate(() => (window as any).outboxFixture.historyReadCount)).toBe(1);
+  });
+
 });
 
 for (const width of [1360, 390]) test(`long conversation follows new queued rows but preserves reading position (${width}px)`, async ({ page }, info) => {
