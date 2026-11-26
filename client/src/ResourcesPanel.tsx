@@ -617,15 +617,14 @@ export function DesktopResourcesBar({
     }
   };
 
-  const summaryCpu = snapshot ? `${Math.round(snapshot.summary.totalCpuPercent)}%` : "—";
-  const summaryMem = snapshot ? formatMemoryBytes(snapshot.summary.totalMemoryBytes) : "—";
+  const summaryMem = snapshot ? formatMemoryBytes(snapshot.summary.totalMemoryBytes) : "";
 
   return (
-    <div className="resources-statusbar">
+    <>
       <button
         ref={triggerRef}
         type="button"
-        className={`resources-status-pill${open ? " is-open" : ""}`}
+        className={`icon-button resources-footer-button${open ? " is-open" : ""}`}
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls={open ? dialogId : undefined}
@@ -633,11 +632,7 @@ export function DesktopResourcesBar({
         title={snapshot ? t("资源 · CPU {0} · 内存 {1}", formatCpuPercent(snapshot.summary.totalCpuPercent), summaryMem) : t("资源")}
         onClick={() => { setStopNotice(""); setOpen(true); }}
       >
-        {snapshot ? (
-          <span className="resources-status-value">{`CPU ${summaryCpu} · ${summaryMem}`}</span>
-        ) : (
-          <span className="resources-status-value muted">{t("资源")}</span>
-        )}
+        <Activity size={16} aria-hidden="true" />
       </button>
 
       {open && (
@@ -662,6 +657,6 @@ export function DesktopResourcesBar({
           returnFocus={triggerRef}
         />
       )}
-    </div>
+    </>
   );
 }
