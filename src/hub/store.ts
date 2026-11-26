@@ -15,6 +15,7 @@ import { SEARCH_EXCERPT_CHARS, SEARCH_PAGE_SIZE, searchCursorSchema, searchPageS
 import { steerResultSchema, type SteerResult } from "../client-protocol/steering.js";
 import { extractLinks, normalizedLink, linkPreviewSchema, linkPreviewStyleSchema, type LinkPreview, type LinkPreviewStyle } from "../client-protocol/links.js";
 import { forwardedBlocks, messageAttachmentIds } from "../client-protocol/forwarding.js";
+import { isGeneratedVoiceFilename } from "../client-protocol/voice-presentation.js";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { MAX_FRAME_BYTES, idSchema, blocksText, conversationSchema, eventSchema, messageSchema, type Block, type CardElement, type ClientFrame, type Conversation, type HubEvent, type Json, type Message } from "../client-protocol/index.js";
@@ -477,9 +478,15 @@ export class HubStore {
     if (input.previewUrl && (!previewUrl || !links.includes(previewUrl))) throw new HubError("preview_url_not_in_message");
     const blocks: Block[] = input.text ? [{ type: "text", text: input.text }] : [];
     for (const id of input.attachments) {
-      const file = await this.db.get<AttachmentRow>("SELECT * FROM attachments WHERE id=? AND complete=1 AND conversation_id=?", [id, conv.id]);
+      const file = await this.db.get<AttachmentRow & { recording: number | null }>("SELECT a.*, ar.recording AS recording FROM attachments a LEFT JOIN attachment_recording ar ON ar.attachment_id=a.id WHERE a.id=? AND a.complete=1 AND a.conversation_id=?", [id, conv.id]);
       if (!file) throw new HubError("attachment_not_found", 404);
-      blocks.push(file.mime.startsWith("image/") ? { type: "image", attachmentId: id, title: file.name } : file.mime.startsWith("audio/") ? { type: "audio", attachmentId: id, name: file.name } : { type: "file", attachmentId: id, name: file.name, size: file.size, mime: file.mime });
+      const isRecording = file.recording === 1
+        || (file.recording == null && file.mime.startsWith("audio/") && isGeneratedVoiceFilename(file.name));
+      blocks.push(
+        file.mime.startsWith("image/") ? { type: "image", attachmentId: id, title: file.name }
+        : isRecording ? { type: "audio", attachmentId: id, name: file.name, ...(file.recording === 1 ? { recording: true } : {}) }
+        : { type: "file", attachmentId: id, name: file.name, size: file.size, mime: file.mime },
+      );
     }
     if (!blocks.length) throw new HubError("empty_message");
     if (input.replyTo && !await this.db.get("SELECT 1 FROM messages WHERE id=? AND conversation_id=? AND status!='deleted' AND NOT EXISTS(SELECT 1 FROM message_deletions d WHERE d.message_id=messages.id AND d.user_id=?)", [input.replyTo, conv.id, userId])) throw new HubError("reply_not_found", 404);
@@ -893,6 +900,7 @@ export class HubStore {
         if (!file) throw new HubError("attachment_not_found", 404);
         const id = newId("att"); await copy(file, id);
         await this.db.run("INSERT INTO attachments VALUES(?,?,?,?,?,?,?,?,1,?)", [id, conv.id, userId, file.sha256, file.size, file.mime, file.name, `${id}.blob`, Date.now()]);
+        await this.db.run("INSERT OR IGNORE INTO attachment_recording(attachment_id, recording) SELECT ?, recording FROM attachment_recording WHERE attachment_id=?", [id, sourceId]);
         remapped.set(sourceId, id);
       }
       const author = original.authorType === "bot" ? await this.db.get<{ name: string }>("SELECT name FROM bots WHERE id=?", [original.authorId]) : await this.db.get<{ name: string }>("SELECT name FROM users WHERE id=?", [original.authorId]);

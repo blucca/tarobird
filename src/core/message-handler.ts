@@ -1,4 +1,5 @@
 import { isBotControl } from "../client-protocol/bot-messages.js";
+import { isGeneratedVoiceFilename } from "../client-protocol/voice-presentation.js";
 import { backgroundTaskBody, backgroundTaskContext, backgroundTaskReplyTo } from "./background-task-notice.js";
 import { createRunRecord, recordRunEvent } from "./run-record.js";
 import { createScopedRunPresentation, finishScopedRunPresentation } from "./scoped-run-presentation.js";
@@ -4119,6 +4120,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isTranscribableCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
+  if (channelProfile() === "gateway") {
+    if (isVideoCoreMedia(downloaded)) {
+      return true;
+    }
+    if (downloaded.attachment.recording !== undefined) {
+      return downloaded.attachment.recording;
+    }
+    return downloaded.attachment.kind === "audio"
+      && !!downloaded.attachment.fileName
+      && isGeneratedVoiceFilename(downloaded.attachment.fileName);
+  }
   if (downloaded.attachment.kind === "audio" || downloaded.attachment.kind === "video") {
     return true;
   }
@@ -4138,6 +4150,9 @@ function isVideoCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
     return true;
   }
   if (downloaded.attachment.kind !== "file") {
+    return false;
+  }
+  if (channelProfile() === "gateway" && downloaded.attachment.mime?.startsWith("audio/")) {
     return false;
   }
   return hasTranscribableVideoExtension(downloaded.attachment.fileName ?? downloaded.localPath);

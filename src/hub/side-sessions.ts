@@ -23,10 +23,16 @@ export class HubSideSessions {
   /** Only the caller's own completed, unretired uploads in this conversation.
    * Unknown, foreign and incomplete IDs are indistinguishable to the caller. */
   private async attachments(session: AuthSession, conversationId: string, ids: string[]): Promise<SideAttachmentRef[] | undefined> {
-    const rows = await this.store.db.serial(() => this.store.db.all<AttachmentRow>("SELECT * FROM attachments a WHERE a.id IN (SELECT value FROM json_each(?)) AND a.owner_id=? AND a.conversation_id=? AND a.complete=1 AND NOT EXISTS(SELECT 1 FROM retired_attachments r WHERE r.attachment_id=a.id)", [JSON.stringify(ids), session.userId, conversationId]));
+    const rows = await this.store.db.serial(() => this.store.db.all<AttachmentRow & { recording: number | null }>("SELECT a.*, ar.recording AS recording FROM attachments a LEFT JOIN attachment_recording ar ON ar.attachment_id=a.id WHERE a.id IN (SELECT value FROM json_each(?)) AND a.owner_id=? AND a.conversation_id=? AND a.complete=1 AND NOT EXISTS(SELECT 1 FROM retired_attachments r WHERE r.attachment_id=a.id)", [JSON.stringify(ids), session.userId, conversationId]));
     const found = new Map(rows.map(row => [row.id, row]));
     if (new Set(ids).size !== ids.length || ids.some(id => !found.has(id))) return undefined;
-    return ids.map(id => { const row = found.get(id)!; return { id, name: row.name, mime: row.mime, size: row.size, sha256: row.sha256 }; });
+    return ids.map(id => {
+      const row = found.get(id)!;
+      return {
+        id, name: row.name, mime: row.mime, size: row.size, sha256: row.sha256,
+        ...(row.recording !== null ? { recording: row.recording === 1 } : {}),
+      };
+    });
   }
   async request(session: AuthSession, conversationId: string, botId: string, method: string, raw: Input = {}): Promise<SideReply> {
     await this.validate(session, conversationId, botId);

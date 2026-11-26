@@ -36,8 +36,8 @@ async function attach(transcribeMedia: ReturnType<typeof createDefaultTranscribe
   gateway = await attachGateway({ stateDir, botId: "alpha", secret, engine: "codex", url: hub.instanceUrl.replace("http", "ws") + "/instance", bridge, runtime });
   return runtime;
 }
-async function send(conversationId: string, id: string, name = "voice.webm", mime = "audio/webm", text = "结合这段录音回答") {
-  const bytes = Buffer.from(`fixture audio ${id}`), upload = await hub.attachments.create("owner", { conversationId, name, mime, size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
+async function send(conversationId: string, id: string, name = "voice.webm", mime = "audio/webm", text = "结合这段录音回答", recording = true) {
+  const bytes = Buffer.from(`fixture audio ${id}`), upload = await hub.attachments.create("owner", { conversationId, name, mime, size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), ...(recording ? { recording: true } : {}) });
   await hub.attachments.putChunk("owner", upload.id, 0, bytes); await hub.attachments.complete("owner", upload.id);
   return hub.store.sendMessage("owner", { conversationId, clientMsgId: id, text, attachments: [upload.id] });
 }
@@ -58,7 +58,7 @@ function transcriber(duration: number, env: NodeJS.ProcessEnv = {}) {
 it("sends a short microphone recording with its caption through shared local ASR and publishes the transcript", async () => {
   const { transcribe, fetchImpl } = transcriber(5), engine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>().mockResolvedValue({ text: "语音处理完成" });
   const hook = vi.fn(transcribe); await attach(hook, { handleAuthorizedMessage: engine });
-  const c = await hub.store.createConversation("owner", ["alpha"], "Voice", "create"); await send(c.id, "short", "voice-1791780593981.webm"); await drained();
+  const c = await hub.store.createConversation("owner", ["alpha"], "Voice", "create"); await send(c.id, "short", "voice-1791780593981.webm", "audio/webm", "结合这段录音回答", false); await drained();
   expect(fetchImpl).toHaveBeenCalledTimes(1); expect(hook.mock.calls[0]![0]).toMatch(/\.webm$/);
   expect(hook.mock.calls[0]![1]).toMatchObject({ messageText: expect.stringContaining("结合这段录音回答"), stateDir, abortSignal: expect.any(AbortSignal) });
   expect(engine).toHaveBeenCalledTimes(1); expect(engine.mock.calls[0]![0].text).toContain(transcript); expect(engine.mock.calls[0]![0].text).toContain("Bridge media transcription completed"); expect(engine.mock.calls[0]![0].text).toContain("结合这段录音回答");
@@ -84,15 +84,15 @@ it("routing keywords in forwarded content or attachment names cannot override au
   expect(fetchImpl).toHaveBeenCalledTimes(2);
   expect(engine).toHaveBeenCalledTimes(3);
 });
-it("routes a long audio document through Tingwu and retains its original, while explicit local routing bypasses cloud", async () => {
+it("routes a long recording through Tingwu, while explicit local routing bypasses cloud", async () => {
   const dir = path.join(root, "tingwu"), { transcribe, fetchImpl } = transcriber(901, { TINGWU_ASR_DIR: dir });
   const engine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>().mockResolvedValue({ text: "processed" }); await attach(transcribe, { handleAuthorizedMessage: engine });
-  const c = await hub.store.createConversation("owner", ["alpha"], "Long voice", "create"); await send(c.id, "long", "meeting.m4a", "application/octet-stream", "整理会议记录"); await drained();
-  expect(fetchImpl).not.toHaveBeenCalled(); const input = engine.mock.calls[0]![0]; expect(input.text).toContain("long cloud transcript"); expect(input.text).toContain("Bridge media transcription completed"); expect(input.files?.some((f) => f.endsWith(".m4a"))).toBe(true);
-  expect(transcribeViaTingwuCloud).toHaveBeenCalledWith(expect.stringMatching(/meeting\.m4a$/), expect.objectContaining({
+  const c = await hub.store.createConversation("owner", ["alpha"], "Long voice", "create"); await send(c.id, "long", "voice-1791780593982.m4a", "audio/mp4", "整理会议记录", true); await drained();
+  expect(fetchImpl).not.toHaveBeenCalled(); const input = engine.mock.calls[0]![0]; expect(input.text).toContain("long cloud transcript"); expect(input.text).toContain("Bridge media transcription completed");
+  expect(transcribeViaTingwuCloud).toHaveBeenCalledWith(expect.stringMatching(/voice-1791780593982\.m4a$/), expect.objectContaining({
     config: expect.objectContaining({ dir, thresholdSeconds: 900 }), jobRootDir: path.join(stateDir, "asr-jobs"), abortSignal: expect.any(AbortSignal),
   }));
-  await send(c.id, "local", "local.m4a", "audio/mp4", "强制本地转写"); await drained();
+  await send(c.id, "local", "voice-1791780593983.m4a", "audio/mp4", "强制本地转写", true); await drained();
   expect(fetchImpl).toHaveBeenCalledTimes(1); expect(engine.mock.calls[1]![0].text).toContain(transcript);
   expect(transcribeViaTingwuCloud).toHaveBeenCalledTimes(1);
 });
@@ -178,14 +178,29 @@ it.each(["zh", "en"])("explains cloud-only failure in the real Gateway card and 
   expect(messages.filter(m => blocksText(m.blocks).includes(locale === "en" ? "cloud-only" : "全部云端"))).toHaveLength(2);
   expect(fetchImpl).not.toHaveBeenCalled(); expect(engine).not.toHaveBeenCalled();
 });
-it("does not encourage automatic retries after cloud-only failure for an attached recording", async () => {
-  vi.mocked(transcribeViaTingwuCloud).mockRejectedValue(new Error("fixture cloud failure"));
-  const { transcribe, fetchImpl } = transcriber(5, { TINGWU_ASR_DIR: root, ASR_CLOUD_MODE: "cloud" });
-  const engine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>().mockResolvedValue({ text: "notified" }); await attach(transcribe, { handleAuthorizedMessage: engine });
-  const c = await hub.store.createConversation("owner", ["alpha"], "No retry", "create"); await send(c.id, "no-retry", "recording.m4a", "application/octet-stream"); await drained();
-  expect(engine.mock.calls[0]![0].text).toContain("Do not automatically re-upload");
-  expect(engine.mock.calls[0]![0].text).not.toContain("inspect or transcribe the attached file if needed");
-  expect(fetchImpl).not.toHaveBeenCalled(); expect(transcribeViaTingwuCloud).toHaveBeenCalledTimes(1);
+it("does not transcribe uploaded audio files in the App and passes the file directly to the engine without cloud billing", async () => {
+  vi.mocked(transcribeViaTingwuCloud).mockRejectedValue(new Error("cloud must not be called"));
+  const { transcribe, fetchImpl } = transcriber(901, { TINGWU_ASR_DIR: root, ASR_CLOUD_MODE: "cloud" });
+  const hook = vi.fn(transcribe);
+  const engine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>().mockResolvedValue({ text: "file received" });
+  await attach(hook, { handleAuthorizedMessage: engine });
+  const c = await hub.store.createConversation("owner", ["alpha"], "Uploaded audio", "create");
+  await send(c.id, "upload-m4a", "meeting.m4a", "audio/mp4", "保留原文件", false);
+  await send(c.id, "upload-mp3", "podcast.mp3", "audio/mpeg", "", false);
+  await send(c.id, "upload-wav", "sample.wav", "audio/wav", "", false);
+  await send(c.id, "upload-octet", "recording.m4a", "application/octet-stream", "", false);
+  await drained();
+  expect(hook).not.toHaveBeenCalled();
+  expect(fetchImpl).not.toHaveBeenCalled();
+  expect(transcribeViaTingwuCloud).not.toHaveBeenCalled();
+  expect(engine).toHaveBeenCalledTimes(4);
+  expect(engine.mock.calls[0]![0].files.some((f) => f.endsWith("meeting.m4a"))).toBe(true);
+  expect(engine.mock.calls[1]![0].files.some((f) => f.endsWith("podcast.mp3"))).toBe(true);
+  expect(engine.mock.calls[2]![0].files.some((f) => f.endsWith("sample.wav"))).toBe(true);
+  expect(engine.mock.calls[3]![0].files.some((f) => f.endsWith("recording.m4a"))).toBe(true);
+  const messages = (await hub.store.snapshot("owner", c.id)).messages;
+  expect(messages.filter((m) => m.authorType === "user").every((m) => m.blocks.some((b) => b.type === "file"))).toBe(true);
+  expect(messages.some((m) => blocksText(m.blocks).includes("音频转写") || blocksText(m.blocks).includes("转写未完成"))).toBe(false);
 });
 
 it("describes empty cloud output without diagnosing credentials or using local ASR", async () => {
@@ -203,7 +218,7 @@ it("extracts audio for an App .3gp video before calling the cloud adapter", asyn
   const runtime = await attach(transcribe, { handleAuthorizedMessage: engine });
   runtime.prepareVideoInput = async () => ({ durationSeconds: 5, framePaths: [], mode: "frames" });
   const c = await hub.store.createConversation("owner", ["alpha"], "Video audio privacy", "create");
-  await send(c.id, "3gp-cloud", "clip.3gp", "video/3gpp"); await drained();
+  await send(c.id, "3gp-cloud", "clip.3gp", "video/3gpp", "结合这段录音回答", false); await drained();
   expect(transcribeViaTingwuCloud).toHaveBeenCalledTimes(1);
   expect(vi.mocked(transcribeViaTingwuCloud).mock.calls[0]![0]).toMatch(/tarobot-asr-audio-.*audio\.wav$/);
   expect(fetchImpl).not.toHaveBeenCalled(); expect(engine).toHaveBeenCalledTimes(1);

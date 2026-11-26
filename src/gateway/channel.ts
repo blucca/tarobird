@@ -291,7 +291,13 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
   private incoming(message: Message, conversation: Conversation): NormalizedMessage {
     const resources: NormalizedMessage["resources"] = [];
     for (const b of message.blocks) {
-      if ("attachmentId" in b) resources.push({ type: b.type === "image" ? "image" : b.type === "audio" ? "audio" : "file", fileKey: b.attachmentId, fileName: "name" in b ? b.name : b.type === "image" ? b.title : undefined });
+      if ("attachmentId" in b) resources.push({
+        type: b.type === "image" ? "image" : b.type === "audio" ? "audio" : "file",
+        fileKey: b.attachmentId,
+        fileName: "name" in b ? b.name : b.type === "image" ? b.title : undefined,
+        ...(b.type === "file" ? { mime: b.mime } : {}),
+        ...(b.type === "audio" && b.recording !== undefined ? { recording: b.recording } : {}),
+      });
       if (b.type === "card") {
         const walk = (elements: typeof b.elements) => { for (const e of elements) { if (e.attachmentId && !resources.some((r) => r.fileKey === e.attachmentId)) resources.push({ type: "image", fileKey: e.attachmentId, fileName: e.text }); walk(e.children ?? []); } };
         walk(b.elements);
