@@ -72,6 +72,12 @@ const newThreadInput = z.object({
 const replyInput = z.object({ id: threadId, text: z.string().max(DESIGN_COMMENT_LIMITS.text * 2), send: z.boolean().optional() }).strict();
 const editInput = replyInput.extend({ messageId });
 const statusInput = z.object({ id: threadId, status: z.enum(["open", "resolved"]) }).strict();
+const moveInput = z.object({
+  id: threadId,
+  anchor: z.string().min(1).max(DESIGN_COMMENT_LIMITS.anchor),
+  label: z.string().max(DESIGN_COMMENT_LIMITS.label).optional(),
+  detail: z.string().max(DESIGN_COMMENT_LIMITS.detail).optional(),
+}).strict();
 const idInput = z.object({ id: threadId }).strict();
 /** Bot/CLI reads are paged to stay under the workbench result limit (512 KiB). */
 export const DESIGN_COMMENTS_READ_BYTES = 384 * 1024;
@@ -152,6 +158,7 @@ const need = (allowed: boolean, code: string) => { if (!allowed) throw new Desig
 
 export type DesignCommentMutation =
   | { op: "create"; payload: unknown; location: (input: DesignCommentRequest) => DesignCommentThread["location"] }
+  | { op: "move"; payload: unknown; location: (input: { anchor: string; label: string; detail?: string }) => DesignCommentThread["location"] }
   | { op: "reply" | "edit" | "status" | "delete"; payload: unknown }
   | { op: "sent"; ids: string[]; messageId?: string }
   /** A Host-attested actor (a Bot, or a person through the App/CLI): reply and optional resolve in one write. */
@@ -192,6 +199,20 @@ export function applyDesignComment(doc: DesignCommentsDoc, mutation: DesignComme
     if (!input.success) throw new DesignCommentsError("INVALID_STATUS", 400, 'expected {status: "open" | "resolved"}');
     need(viewer.canComment, "NOT_ALLOWED");
     const thread = findThread(next, input.data.id); setStatus(thread, input.data.status, now);
+    outcome = { status: 200, body: { thread } };
+  } else if (mutation.op === "move") {
+    const input = moveInput.safeParse(mutation.payload);
+    if (!input.success) throw new DesignCommentsError("INVALID_COMMENT", 400, "expected {id, anchor}");
+    need(viewer.canComment, "NOT_ALLOWED");
+    const thread = findThread(next, input.data.id);
+    thread.anchor = input.data.anchor;
+    if (input.data.label !== undefined && input.data.label.trim()) thread.label = input.data.label.trim();
+    if (input.data.detail !== undefined) {
+      if (input.data.detail) thread.detail = input.data.detail;
+      else delete thread.detail;
+    }
+    thread.location = { ...mutation.location({ anchor: thread.anchor, label: thread.label, detail: thread.detail }) };
+    thread.updatedAt = now;
     outcome = { status: 200, body: { thread } };
   } else if (mutation.op === "delete") {
     const input = idInput.safeParse(mutation.payload);

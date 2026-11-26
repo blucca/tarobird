@@ -28,6 +28,78 @@ export function buildDesignSandbox(format: DesignFormat = "canvas"): string {
     // Slides uses the Apache-2.0 Open Artifact editor core via the official
     // window.openartifact capability runtime installed by design-runtime.js.
     js = js.replaceAll("import.meta.url", '"https://design.invalid/"');
+    // Register a synchronous text-edit committer so host editor:flush never
+    // races the 400ms input debounce or React's async unmount cleanup.
+    patch(
+      'const I=()=>{g.current&&clearTimeout(g.current),g.current=null,KfA(i,o,l,s,r.current)},C=',
+      'const I=()=>{g.current&&clearTimeout(g.current),g.current=null,KfA(i,o,l,s,r.current)};window.__tarobotSlidesCommitText=I;const C=',
+    );
+    patch(
+      '()=>{l.removeEventListener("input",C),l.removeEventListener("keydown",Q),l.removeEventListener("paste",u),l.removeEventListener("blur",E),I(),Vl===l&&(Vl=null),Wl=null}',
+      '()=>{l.removeEventListener("input",C),l.removeEventListener("keydown",Q),l.removeEventListener("paste",u),l.removeEventListener("blur",E),I(),window.__tarobotSlidesCommitText===I&&(window.__tarobotSlidesCommitText=null),Vl===l&&(Vl=null),Wl=null}',
+    );
+    // Ensure Ch.flush() awaits any already in-flight save and re-flushes if
+    // another edit landed concurrently.
+    patch(
+      'let n=null,i=!1,o=!1,s=Qy;const r=new Map;function g(u=A.saveDelay){A.readOnly()||(A.isDirty()&&A.setSave(A.save()==="offline"?"offline":"dirty"),n!==null&&t.clear(n),n=t.set(()=>{n=null,l()},u))}async function l(){if(i){o=!0;return}i=!0;try{for(let E=0;E<=e;E++){const{batch:h,sent:p}=A.collect();if(Object.keys(h).length===0){A.unsent?.(p);break}A.setSave("saving");try{const y=await A.artifact().publish(h);A.acknowledge(p,y.hashes),s=Qy;break}catch(y){if(nF(y,"conflict")&&E<e){await I(y.paths??[]);continue}if(nF(y,"not_writer")){A.lostWriteAccess();return}A.setSave("offline"),s=Math.min(s*2,HtA),g(s);return}}}finally{i=!1}const u=A.isDirty();o||u?(o=!1,g(u?A.saveDelay:0)):(A.setSave("saved"),A.saved?.())}',
+      'let n=null,i=!1,o=!1,s=Qy,_p=null;const r=new Map;function g(u=A.saveDelay){A.readOnly()||(A.isDirty()&&A.setSave(A.save()==="offline"?"offline":"dirty"),n!==null&&t.clear(n),n=t.set(()=>{n=null,l()},u))}function l(){if(i){o=!0;return _p?_p.then(()=>{if(o){o=!1;return l()}}):Promise.resolve()}i=!0;return _p=(async()=>{try{for(let E=0;E<=e;E++){const{batch:h,sent:p}=A.collect();if(Object.keys(h).length===0){A.unsent?.(p);break}A.setSave("saving");try{const y=await A.artifact().publish(h);A.acknowledge(p,y.hashes),s=Qy;break}catch(y){if(nF(y,"conflict")&&E<e){await I(y.paths??[]);continue}if(nF(y,"not_writer")){A.lostWriteAccess();return}A.setSave("offline"),s=Math.min(s*2,HtA),g(s);return}}}finally{i=!1;_p=null}const u=A.isDirty();o||u?(o=!1,g(u?A.saveDelay:0)):(A.setSave("saved"),A.saved?.())})()}',
+    );
+    patch(
+      'const t=async()=>{try{return eA.getState().endTextEdit(),await Ux(),!na(oA.getState())}catch{return!1}};',
+      'const t=async()=>{try{window.__tarobotSlidesCommitText?.(),eA.getState().endTextEdit(),await Promise.resolve(),await Ux(),na(oA.getState())&&oA.getState().save!=="offline"&&await Ux();return!na(oA.getState())}catch{return!1}};',
+    );
+    // Keep unsupported standalone batch-send ("Send all to Bot") out of the
+    // embedded App, and describe single-thread Send-to-Bot honestly as a draft.
+    patch('B.jsx(REA,{comments:A,agent:e,threads:I})', 'null');
+    patch(
+      'function _v(A,e){return e===!1?{title:`Sent to ${A}`,description:`${A} gets it on its next turn. If it is idle, send it a message there to start one.`}:{title:`Sent to ${A}`}}',
+      'function _v(A){return{title:"Added to your message to the agent. Send it when you’re ready.",description:`Review and send your message to ${A} in the conversation.`}}',
+    );
+    // Treat user-cancelled export confirmations cleanly without a failure modal.
+    patch(
+      'catch(n){const i=n instanceof Error&&n.message?n.message:String(n);throw new Error(`The file could not be saved: ${i}`)}',
+      'catch(n){if(n&&n.code==="declined")throw n;const i=n instanceof Error&&n.message?n.message:String(n);throw new Error(`The file could not be saved: ${i}`)}',
+    );
+    patch(
+      'catch(o){const s=o instanceof Error?o.message:String(o);n?.exportState(e,"failed",s),zt.getState().setNotes({name:"Download failed",notes:[s]})}',
+      'catch(o){if(o&&o.code==="declined"){n?.exportState(e,"declined");return}const s=o instanceof Error?o.message:String(o);n?.exportState(e,"failed",s),zt.getState().setNotes({name:"Download failed",notes:[s]})}',
+    );
+    // Accept live tab renames from the host without remounting the editor.
+    patch(
+      'document.title=A.title||"Slides",window.parent&&window.parent!==window',
+      'window.__tarobotSlidesSetTitle=next=>{if(typeof next==="string"&&next.trim()){oA.setState({title:next.trim()});document.title=next.trim();}},document.title=A.title||"Slides",window.parent&&window.parent!==window',
+    );
+    patch(
+      'function ruA(){const A=oA.getState();return A.index.title.trim()?jF(A.index):A.title.trim()||jF(A.index)}',
+      'function ruA(){const A=oA.getState();return A.title.trim()||jF(A.index)}',
+    );
+    // Show the compact slide pager on narrow viewports (when the rail is hidden)
+    // as well as read-only preview mode.
+    patch(
+      'e&&s==="edit"&&o.length>1?B.jsx("div",{className:"pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center px-3"',
+      '(e||!E)&&s==="edit"&&o.length>1?B.jsx("div",{className:"pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center px-3"',
+    );
+    // Without an external Open Artifact Shell, Comments button / C / Escape
+    // toggle embedded comment-pin mode directly.
+    patch(
+      'onClick:()=>{const o=Ut.getState(),s=!o.listOpen;o.setListOpen(s),!s&&o.on&&o.setOn(!1)}',
+      'onClick:()=>{const o=Ut.getState(),s=!o.listOpen;o.setListOpen(s),Ig()&&o.setOn(s)}',
+    );
+    patch(
+      'Ut.getState().on?Ii()?.shell?.requestCommentMode(!1):',
+      'Ut.getState().on?(Ii()?.shell?Ii().shell.requestCommentMode(!1):Ut.getState().setOn(!1)):',
+    );
+    patch(
+      'if(o==="c"&&!e.shiftKey&&Ut.getState().available){Ii()?.shell?.requestCommentMode(!Ut.getState().on);return}',
+      'if(o==="c"&&!e.shiftKey&&Ut.getState().available){Ii()?.shell?Ii().shell.requestCommentMode(!Ut.getState().on):Ut.getState().setOn(!Ut.getState().on);return}',
+    );
+    // Normalize stage wheel zoom and overflow pan with the same bounded curve as canvas,
+    // and rebind once the stage ref mounts (I transitions from null to the slide root).
+    const wheel = `(${designWheelDelta.toString()})`;
+    patch(
+      'const v=F=>{if(!(F.ctrlKey||F.metaKey))return;F.preventDefault();const J=eA.getState();J.setZoom(eE(J)*Math.exp(-F.deltaY*.01))};return K.addEventListener("wheel",v,{passive:!1}),()=>K.removeEventListener("wheel",v)},[]',
+      `const v=F=>{const d=${wheel}(F,K.clientWidth,K.clientHeight);if(F.ctrlKey||F.metaKey){F.preventDefault();const J=eA.getState();J.setZoom(eE(J)*Math.exp(d.zoomLog));return}if((K.scrollHeight>K.clientHeight||K.scrollWidth>K.clientWidth)&&!(F.target instanceof Element&&F.target.closest("[data-open-artifact-notes],[data-open-artifact-comment-ui],[data-comments-panel]"))){F.preventDefault();K.scrollLeft+=d.dx;K.scrollTop+=d.dy}};return K.addEventListener("wheel",v,{passive:!1}),()=>K.removeEventListener("wheel",v)},[I]`,
+    );
   } else if (format === "canvas") {
   // A chat receipt proves delivery, not that a Bot has started working. Keep
   // the status readable without the upstream activity spinner or that claim.

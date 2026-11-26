@@ -15,6 +15,8 @@ export function workbenchErrorText(code: string, locale: Locale): string {
     workbench_browser_requires_desktop: ["网页浏览需要 Electron 桌面版。你仍可在主对话中控制已连接的桌面网页。", "Web browsing requires the Electron desktop App. Chat can still control an authorized connected desktop."],
     workbench_revision_conflict: ["另一窗口已修改工作台，请检查当前布局后重试。若仍冲突，请先导出未保存的内容。", "Another window changed this workbench. Check the current layout before retrying. If conflicts continue, export unsaved content first."],
     design_invalid_import: ["请选择从设计页导出的 .tarobot-design.json 文件。", "Choose a .tarobot-design.json file exported from Design."],
+    slides_invalid_pptx_import: ["请选择有效的 PowerPoint (.pptx) 文件（不超过 32 MB，最多 200 页）。", "Choose a valid PowerPoint (.pptx) file (up to 32 MB and 200 slides)."],
+    design_file_too_large: ["单个文件超过 8 MB 上限，请压缩图片或减小文件体积后重试。", "A single file exceeds the 8 MB limit. Compress images or reduce the file size and try again."],
     design_not_found: ["设计内容不可用，请检查是否已在其他窗口删除。", "The design is unavailable. Check whether another window deleted it."],
     design_in_use: ["另一窗口正在打开这份设计，暂不能删除。请先在该窗口关闭设计标签后重试。", "Another window has this design open. Close its Design tab there before retrying deletion."],
     workbench_design_suite_host_update_required: ["请更新主机后再让 Bot 操作这类项目。本机编辑仍可用。", "Update the Host for Bot access to this project format. Local editing remains available."],

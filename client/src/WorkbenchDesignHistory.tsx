@@ -45,7 +45,7 @@ export function historyStatusText(status: { status: string; code?: string } | un
   return undefined;
 }
 
-export function WorkbenchDesignHistory({ session, onRestored }: { session: DesignSession; onRestored?(): void }) {
+export function WorkbenchDesignHistory({ session, readOnly = false, onRestored }: { session: DesignSession; readOnly?: boolean; onRestored?(): void }) {
   const locale = useLocale(), word: Word = (zh, en) => locale === "en" ? en : zh;
   const snapshot = useSyncExternalStore(session.subscribe, session.getSnapshot), notice = historyStatusText(snapshot.history, word);
   const [listing, setListing] = useState<Listing>(), [busy, setBusy] = useState(false), [error, setError] = useState("");
@@ -66,14 +66,14 @@ export function WorkbenchDesignHistory({ session, onRestored }: { session: Desig
     catch { setError(word("无法读取这次改动。", "Could not load this change.")); }
     finally { setBusy(false); }
   };
+  const canRestore = !session.readOnly && !readOnly;
   const restore = async () => {
-    if (!confirm) return;
+    if (!confirm || !canRestore) return;
     setBusy(true); setError(""); setRestoreError("");
     try { await session.restoreFromUi(confirm.row.n, confirm.path ? [confirm.path] : undefined); setConfirm(undefined); setDiff(undefined); onRestored?.(); setBusy(false); await load(); }
     catch (cause) { setConfirm(undefined); setRestoreError(historyErrorText(cause, word)); setBusy(false); await load(); }
   };
   const close = () => { setListing(undefined); setDiff(undefined); setConfirm(undefined); setError(""); setRestoreError(""); };
-  const canRestore = !session.readOnly;
   return <span className="design-history">
     <button disabled={busy} aria-expanded={!!listing} title={notice} onClick={() => listing ? close() : void load()}><History size={14}/>{word("历史", "History")}{notice ? " ⚠" : ""}</button>
     {notice && !listing && <span className="design-history-warning" role="status">{word("历史不完整", "History incomplete")}</span>}

@@ -1,12 +1,20 @@
 import { unzipSync } from "fflate";
+import { DESIGN_FILE_BYTES } from "../../src/client-protocol/workbench-design.js";
 import { designTextFile, encodeDesignFile, validateDesignDocument, type DesignDocument, type DesignFile } from "./workbench-design.js";
 
 /** Limits for untrusted .pptx uploads (zip-bomb and memory safety). */
 const MAX_PPTX_ARCHIVE_BYTES = 32 * 1024 * 1024;
 const MAX_PPTX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024;
 const MAX_PPTX_ENTRIES = 512;
+const MAX_PPTX_ENTRY_NAME_BYTES = 512;
 const MAX_SLIDES = 200;
+/** Open Artifact slide compiler limits: 24 pinned children per host, 800 elements hard max. */
+const MAX_PINNED_PER_HOST = 24;
+const MAX_SLIDE_ELEMENTS = 720;
 const EMU_PER_PT = 12700;
+
+/** Only inflate OOXML entries that the slides importer actually reads. */
+const NEEDED_PPTX_ENTRY = /^ppt\/(?:presentation\.xml|_rels\/presentation\.xml\.rels|(?:slides|notesSlides|theme|media)\/.+)$/;
 
 type RelMap = Map<string, { target: string; type: string }>;
 type ThemeColors = Record<string, string>;
@@ -28,14 +36,24 @@ const DEFAULT_THEME_COLORS: ThemeColors = {
   accent6: "#0891b2",
 };
 
+function safeCodePoint(cp: number): string {
+  if (
+    Number.isInteger(cp) &&
+    (cp === 0x09 || cp === 0x0a || cp === 0x0d || (cp >= 0x20 && cp <= 0xd7ff) || (cp >= 0xe000 && cp <= 0x10ffff))
+  ) {
+    return String.fromCodePoint(cp);
+  }
+  return "";
+}
+
 function decodeXmlEntities(text: string): string {
   return text
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_m, n) => String.fromCodePoint(Number(n)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_m, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_m, n) => safeCodePoint(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, h) => safeCodePoint(parseInt(h, 16)))
     .replace(/&amp;/g, "&");
 }
 
@@ -45,6 +63,24 @@ function escapeHtml(text: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function sanitizeFontFamily(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = decodeXmlEntities(raw).trim();
+  if (!trimmed || trimmed.startsWith("+")) return undefined;
+  // Drop any CSS injection tail after delimiters, then allow only safe font-name characters.
+  const head = trimmed.split(/[;:{}"'\\()<>\r\n\t]/)[0] ?? "";
+  const clean = head.replace(/[^\p{L}\p{N} ._-]/gu, "").replace(/\s+/g, " ").trim().slice(0, 64);
+  return clean || undefined;
+}
+
+function formatFontFamilyCss(font: string): string {
+  return `font-family:'${escapeHtml(font)}'`;
+}
+
+function getZipEntry(entries: Record<string, Uint8Array>, path: string): Uint8Array | undefined {
+  return Object.hasOwn(entries, path) ? entries[path] : undefined;
 }
 
 function attr(tag: string, name: string): string | undefined {
@@ -102,7 +138,7 @@ function extractColor(xml: string | undefined, theme: ThemeColors): string | und
   const srgb = /<a:srgbClr\b[^>]*val="([0-9A-Fa-f]{6})"/.exec(xml)?.[1];
   if (srgb) return `#${srgb}`;
   const scheme = /<a:schemeClr\b[^>]*val="([^"]+)"/.exec(xml)?.[1];
-  if (scheme && theme[scheme]) return theme[scheme];
+  if (scheme && Object.hasOwn(theme, scheme)) return theme[scheme];
   return undefined;
 }
 
@@ -110,6 +146,17 @@ function extractSolidFill(xml: string | undefined, theme: ThemeColors): string |
   if (!xml) return undefined;
   const solid = /<a:solidFill\b[^>]*>([\s\S]*?)<\/a:solidFill>/.exec(xml)?.[1];
   return extractColor(solid, theme);
+}
+
+/** Extract fill on a shape or cell properties block while ignoring border (<a:ln*>) and effects. */
+function extractContainerFill(propsXml: string | undefined, theme: ThemeColors): string | undefined {
+  if (!propsXml) return undefined;
+  const stripped = propsXml
+    .replace(/<a:ln[A-Za-z]*\b[^>]*\/>/g, "")
+    .replace(/<a:ln[A-Za-z]*\b[^>]*>[\s\S]*?<\/a:ln[A-Za-z]*>/g, "")
+    .replace(/<a:effectLst\b[^>]*>[\s\S]*?<\/a:effectLst>/g, "");
+  if (/<a:noFill\b/.test(stripped)) return undefined;
+  return extractSolidFill(stripped, theme);
 }
 
 /** Extract top-level blocks matching `<tagName ...>...</tagName>` (handles nesting). */
@@ -148,6 +195,49 @@ function extractTagBlocks(xml: string, tagName: string): string[] {
   return results;
 }
 
+/** Walk direct child XML elements in exact document order. */
+function extractDirectChildren(xml: string, wantedTags: ReadonlySet<string>): Array<{ tag: string; xml: string }> {
+  const out: Array<{ tag: string; xml: string }> = [];
+  const tokenRe = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<\/([A-Za-z0-9_:-]+)\s*>|<([A-Za-z0-9_:-]+)(?:\s[^>]*)?>/g;
+  let depth = 0;
+  let captureTag: string | undefined;
+  let captureStart = 0;
+
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(xml)) !== null) {
+    const closeTag = m[1];
+    const openTag = m[2];
+    const selfClose = m[0].endsWith("/>");
+    if (closeTag !== undefined) {
+      if (depth > 0) depth--;
+      if (depth === 0 && captureTag !== undefined) {
+        out.push({ tag: captureTag, xml: xml.slice(captureStart, m.index + m[0].length) });
+        captureTag = undefined;
+      }
+    } else if (openTag !== undefined) {
+      if (selfClose) {
+        if (depth === 0 && wantedTags.has(openTag)) {
+          out.push({ tag: openTag, xml: m[0] });
+        }
+      } else {
+        if (depth === 0 && wantedTags.has(openTag)) {
+          captureTag = openTag;
+          captureStart = m.index;
+        }
+        depth++;
+      }
+    }
+  }
+  return out;
+}
+
+function unwrapOuterTag(xml: string): string {
+  const openEnd = xml.indexOf(">");
+  const closeStart = xml.lastIndexOf("</");
+  if (openEnd < 0 || closeStart <= openEnd) return "";
+  return xml.slice(openEnd + 1, closeStart);
+}
+
 interface BoxRect {
   x: number;
   y: number;
@@ -156,7 +246,14 @@ interface BoxRect {
   rot?: number;
 }
 
-function extractXfrm(xml: string, scaleX: number, scaleY: number): BoxRect | undefined {
+interface EmuTransform {
+  tx: number;
+  ty: number;
+  sx: number;
+  sy: number;
+}
+
+function extractXfrm(xml: string, xform: EmuTransform): BoxRect | undefined {
   const xfrm = /<(?:a|p):xfrm\b([^>]*)>([\s\S]*?)<\/(?:a|p):xfrm>/.exec(xml);
   if (!xfrm) return undefined;
   const attrs = xfrm[1] ?? "";
@@ -172,11 +269,42 @@ function extractXfrm(xml: string, scaleX: number, scaleY: number): BoxRect | und
   const rotRaw = Number(attr(attrs, "rot") ?? 0);
   const rot = Number.isFinite(rotRaw) && rotRaw !== 0 ? Math.round((rotRaw / 60000) * 10) / 10 : undefined;
   return {
-    x: Math.round(x * scaleX),
-    y: Math.round(y * scaleY),
-    w: Math.max(8, Math.round(cx * scaleX)),
-    h: Math.max(8, Math.round(cy * scaleY)),
+    x: Math.round(xform.tx + x * xform.sx),
+    y: Math.round(xform.ty + y * xform.sy),
+    w: Math.max(8, Math.round(cx * xform.sx)),
+    h: Math.max(8, Math.round(cy * xform.sy)),
     ...(rot ? { rot } : {}),
+  };
+}
+
+function composeGroupTransform(grpSpXml: string, parent: EmuTransform): EmuTransform {
+  const grpSpPr = /<p:grpSpPr\b[^>]*>([\s\S]*?)<\/p:grpSpPr>/.exec(grpSpXml)?.[1];
+  if (!grpSpPr) return parent;
+  const xfrmInner = /<a:xfrm\b[^>]*>([\s\S]*?)<\/a:xfrm>/.exec(grpSpPr)?.[1];
+  if (!xfrmInner) return parent;
+  const offTag = /<a:off\b([^>]*)\/?>/.exec(xfrmInner)?.[1];
+  const extTag = /<a:ext\b([^>]*)\/?>/.exec(xfrmInner)?.[1];
+  const chOffTag = /<a:chOff\b([^>]*)\/?>/.exec(xfrmInner)?.[1];
+  const chExtTag = /<a:chExt\b([^>]*)\/?>/.exec(xfrmInner)?.[1];
+  if (!offTag || !extTag || !chOffTag || !chExtTag) return parent;
+  const ox = Number(attr(offTag, "x") ?? 0);
+  const oy = Number(attr(offTag, "y") ?? 0);
+  const ecx = Number(attr(extTag, "cx") ?? 0);
+  const ecy = Number(attr(extTag, "cy") ?? 0);
+  const chx = Number(attr(chOffTag, "x") ?? 0);
+  const chy = Number(attr(chOffTag, "y") ?? 0);
+  const chcx = Number(attr(chExtTag, "cx") ?? 0);
+  const chcy = Number(attr(chExtTag, "cy") ?? 0);
+  if (![ox, oy, ecx, ecy, chx, chy, chcx, chcy].every(Number.isFinite) || ecx <= 0 || ecy <= 0 || chcx <= 0 || chcy <= 0) {
+    return parent;
+  }
+  const sx = parent.sx * (ecx / chcx);
+  const sy = parent.sy * (ecy / chcy);
+  return {
+    tx: parent.tx + ox * parent.sx - chx * sx,
+    ty: parent.ty + oy * parent.sy - chy * sy,
+    sx,
+    sy,
   };
 }
 
@@ -232,7 +360,7 @@ function parseParagraphs(txBodyXml: string, theme: ThemeColors, ptToPx: number):
       const color = extractSolidFill(rPrBody, theme);
       const latin = /<a:latin\b[^>]*typeface="([^"]+)"/.exec(rPrBody)?.[1];
       const ea = /<a:ea\b[^>]*typeface="([^"]+)"/.exec(rPrBody)?.[1];
-      const fontFamily = (latin && !latin.startsWith("+") ? latin : undefined) ?? (ea && !ea.startsWith("+") ? ea : undefined);
+      const fontFamily = sanitizeFontFamily(latin) ?? sanitizeFontFamily(ea);
       runs.push({ text, bold, italic, underline, color, fontSizePx, fontFamily });
     }
     if (runs.length > 0) out.push({ runs, align, bullet });
@@ -274,14 +402,20 @@ function positionStyle(box: BoxRect): string {
   return parts.join(";");
 }
 
-function renderShapeHtml(spXml: string, scaleX: number, scaleY: number, ptToPx: number, theme: ThemeColors): string | undefined {
+interface RenderedElement {
+  html: string;
+  /** Approximate count of slide AST elements contributed toward Open Artifact's elementsHard limit. */
+  cost: number;
+}
+
+function renderShapeHtml(spXml: string, xform: EmuTransform, ptToPx: number, theme: ThemeColors): RenderedElement | undefined {
   const spPr = /<p:spPr\b[^>]*>([\s\S]*?)<\/p:spPr>/.exec(spXml)?.[1] ?? "";
-  const box = extractXfrm(spPr, scaleX, scaleY);
+  const box = extractXfrm(spPr, xform);
   const txBody = /<p:txBody\b[^>]*>([\s\S]*?)<\/p:txBody>/.exec(spXml)?.[1];
   const paragraphs = txBody ? parseParagraphs(txBody, theme, ptToPx) : [];
-  const bg = extractSolidFill(spPr, theme);
+  const bg = extractContainerFill(spPr, theme);
   const lnBlock = /<a:ln\b([^>]*)>([\s\S]*?)<\/a:ln>/.exec(spPr);
-  const lnColor = lnBlock ? extractSolidFill(lnBlock[2], theme) : undefined;
+  const lnColor = lnBlock && !/<a:noFill\b/.test(lnBlock[2] ?? "") ? extractSolidFill(lnBlock[2], theme) : undefined;
   const lnW = lnBlock ? Number(attr(lnBlock[1] ?? "", "w") ?? 0) : 0;
   const borderWidth = lnColor ? Math.max(1, Math.round((lnW / EMU_PER_PT) * ptToPx)) : 0;
   const prst = /<a:prstGeom\b[^>]*prst="([^"]+)"/.exec(spPr)?.[1];
@@ -299,7 +433,7 @@ function renderShapeHtml(spXml: string, scaleX: number, scaleY: number, ptToPx: 
   // Pure decorative shape without text
   if (paragraphs.length === 0) {
     if (!bg && !lnColor) return undefined;
-    return `  <div style="${shapeStyles.join(";")}"></div>`;
+    return { html: `  <div style="${shapeStyles.join(";")}"></div>`, cost: 1 };
   }
 
   const firstRun = paragraphs[0]?.runs.find(r => r.text.trim());
@@ -318,10 +452,10 @@ function renderShapeHtml(spXml: string, scaleX: number, scaleY: number, ptToPx: 
       "line-height:1.25",
     ];
     if (defaultColor) styles.push(`color:${defaultColor}`);
-    if (defaultFont) styles.push(`font-family:${escapeHtml(defaultFont)}`);
+    if (defaultFont) styles.push(formatFontFamilyCss(defaultFont));
     if (p.align) styles.push(`text-align:${p.align}`);
     const inner = p.runs.map(r => renderRunHtml(r, defaultColor)).join("");
-    return `  <${tag} style="${styles.join(";")}">${inner}</${tag}>`;
+    return { html: `  <${tag} style="${styles.join(";")}">${inner}</${tag}>`, cost: 1 };
   }
 
   if (allBullets && !bg && !lnColor) {
@@ -334,12 +468,19 @@ function renderShapeHtml(spXml: string, scaleX: number, scaleY: number, ptToPx: 
       "line-height:1.4",
     ];
     if (defaultColor) styles.push(`color:${defaultColor}`);
-    if (defaultFont) styles.push(`font-family:${escapeHtml(defaultFont)}`);
+    if (defaultFont) styles.push(formatFontFamilyCss(defaultFont));
     const items = paragraphs.map(p => `    <li>${p.runs.map(r => renderRunHtml(r, defaultColor)).join("")}</li>`).join("\n");
-    return `  <${listTag} style="${styles.join(";")}">\n${items}\n  </${listTag}>`;
+    return { html: `  <${listTag} style="${styles.join(";")}">\n${items}\n  </${listTag}>`, cost: 1 };
   }
 
-  // Multi-paragraph or boxed text container
+  // Multi-paragraph or boxed text container.
+  // Open Artifact's <div data-text> strips styles from child <p>/<ul>/<ol>.
+  // Use <div data-text> with unstyled children when all paragraphs share alignment
+  // and font size; otherwise use a regular <div> so per-paragraph styles survive.
+  const aligns = new Set(paragraphs.map(p => p.align ?? "left"));
+  const sizes = new Set(paragraphs.map(p => p.runs.find(r => r.text.trim())?.fontSizePx ?? defaultSize));
+  const useDataText = aligns.size <= 1 && sizes.size <= 1;
+
   const boxStyles = [
     ...shapeStyles,
     "display:flex",
@@ -350,7 +491,8 @@ function renderShapeHtml(spXml: string, scaleX: number, scaleY: number, ptToPx: 
     "line-height:1.35",
   ];
   if (defaultColor) boxStyles.push(`color:${defaultColor}`);
-  if (defaultFont) boxStyles.push(`font-family:${escapeHtml(defaultFont)}`);
+  if (defaultFont) boxStyles.push(formatFontFamilyCss(defaultFont));
+  if (useDataText && paragraphs[0]?.align) boxStyles.push(`text-align:${paragraphs[0].align}`);
 
   const children: string[] = [];
   let i = 0;
@@ -364,33 +506,46 @@ function renderShapeHtml(spXml: string, scaleX: number, scaleY: number, ptToPx: 
         i++;
       }
       const items = group.map(item => `      <li>${item.runs.map(r => renderRunHtml(r, defaultColor)).join("")}</li>`).join("\n");
-      children.push(`    <${kind} style="margin:0;padding-left:36px">\n${items}\n    </${kind}>`);
+      if (useDataText) {
+        children.push(`    <${kind}>\n${items}\n    </${kind}>`);
+      } else {
+        children.push(`    <${kind} style="margin:0;padding-left:36px">\n${items}\n    </${kind}>`);
+      }
     } else {
-      const pStyle = [
-        "margin:0",
-        ...(p.align ? [`text-align:${p.align}`] : []),
-        ...(p.runs[0]?.fontSizePx && p.runs[0].fontSizePx !== defaultSize ? [`font-size:${p.runs[0].fontSizePx}px`] : []),
-      ].join(";");
-      children.push(`    <p style="${pStyle}">${p.runs.map(r => renderRunHtml(r, defaultColor)).join("")}</p>`);
+      const inner = p.runs.map(r => renderRunHtml(r, defaultColor)).join("");
+      if (useDataText) {
+        children.push(`    <p>${inner}</p>`);
+      } else {
+        const pStyle = [
+          "margin:0",
+          ...(p.align ? [`text-align:${p.align}`] : []),
+          ...(p.runs[0]?.fontSizePx && p.runs[0].fontSizePx !== defaultSize ? [`font-size:${p.runs[0].fontSizePx}px`] : []),
+        ].join(";");
+        children.push(`    <p style="${pStyle}">${inner}</p>`);
+      }
       i++;
     }
   }
-  return `  <div data-text style="${boxStyles.join(";")}">\n${children.join("\n")}\n  </div>`;
+  const openTag = useDataText ? `<div data-text style="${boxStyles.join(";")}">` : `<div style="${boxStyles.join(";")}">`;
+  return {
+    html: `  ${openTag}\n${children.join("\n")}\n  </div>`,
+    cost: useDataText ? 1 : 1 + children.length,
+  };
 }
 
-function renderTableHtml(frameXml: string, scaleX: number, scaleY: number, ptToPx: number, theme: ThemeColors): string | undefined {
+function renderTableHtml(frameXml: string, xform: EmuTransform, ptToPx: number, theme: ThemeColors): RenderedElement | undefined {
   const tblXml = /<a:tbl\b[^>]*>([\s\S]*?)<\/a:tbl>/.exec(frameXml)?.[1];
   if (!tblXml) return undefined;
   const rows = extractTagBlocks(tblXml, "a:tr");
   if (rows.length === 0) return undefined;
-  const box = extractXfrm(frameXml, scaleX, scaleY) ?? { x: 120, y: 200, w: 1680, h: 500 };
+  const box = extractXfrm(frameXml, xform) ?? { x: 120, y: 200, w: 1680, h: 500 };
   const trHtml: string[] = [];
   rows.forEach((trXml, rowIndex) => {
     const cells = extractTagBlocks(trXml, "a:tc");
     const tdHtml = cells.map(tcXml => {
       const txBody = /<a:txBody\b[^>]*>([\s\S]*?)<\/a:txBody>/.exec(tcXml)?.[1];
       const tcPr = /<a:tcPr\b[^>]*>([\s\S]*?)<\/a:tcPr>/.exec(tcXml)?.[1];
-      const cellBg = extractSolidFill(tcPr, theme);
+      const cellBg = extractContainerFill(tcPr, theme);
       const paragraphs = txBody ? parseParagraphs(txBody, theme, ptToPx) : [];
       const text = paragraphs.map(p => p.runs.map(r => renderRunHtml(r)).join("")).join("<br>");
       const cellTag = rowIndex === 0 ? "th" : "td";
@@ -404,7 +559,10 @@ function renderTableHtml(frameXml: string, scaleX: number, scaleY: number, ptToP
     });
     trHtml.push(`      <tr>\n${tdHtml.join("\n")}\n      </tr>`);
   });
-  return `  <div style="${positionStyle(box)};overflow:hidden">\n    <table style="width:100%;height:100%;border-collapse:collapse;font-size:26px;color:#1a1a1a">\n${trHtml.join("\n")}\n    </table>\n  </div>`;
+  return {
+    html: `  <div style="${positionStyle(box)};overflow:hidden">\n    <table style="width:100%;height:100%;border-collapse:collapse;font-size:26px;color:#1a1a1a">\n${trHtml.join("\n")}\n    </table>\n  </div>`,
+    cost: 2,
+  };
 }
 
 function renderPictureHtml(
@@ -413,28 +571,96 @@ function renderPictureHtml(
   slideDir: string,
   entries: Record<string, Uint8Array>,
   assets: Record<string, DesignFile>,
-  scaleX: number,
-  scaleY: number,
-): string | undefined {
+  xform: EmuTransform,
+): RenderedElement | undefined {
   const embedId = /<a:blip\b[^>]*r:embed="([^"]+)"/.exec(picXml)?.[1];
   if (!embedId) return undefined;
   const rel = slideRels.get(embedId);
   if (!rel) return undefined;
   const mediaPath = normalizeZipPath(slideDir, rel.target);
-  const bytes = entries[mediaPath];
+  const bytes = getZipEntry(entries, mediaPath);
   const contentType = mediaContentType(mediaPath);
   if (!bytes || !contentType) return undefined;
 
   const encoded = encodeDesignFile(bytes, contentType);
   const assetId = encoded.sha256.slice(0, 32);
   const assetPath = `project/assets/${assetId}`;
-  if (!assets[assetPath]) assets[assetPath] = encoded;
+  if (!Object.hasOwn(assets, assetPath)) assets[assetPath] = encoded;
 
   const spPr = /<p:spPr\b[^>]*>([\s\S]*?)<\/p:spPr>/.exec(picXml)?.[1] ?? "";
-  const box = extractXfrm(spPr, scaleX, scaleY) ?? { x: 160, y: 160, w: 640, h: 480 };
+  const box = extractXfrm(spPr, xform) ?? { x: 160, y: 160, w: 640, h: 480 };
   const cNvPr = /<p:cNvPr\b([^>]*)\/?>/.exec(picXml)?.[1] ?? "";
   const alt = escapeHtml(attr(cNvPr, "descr") ?? attr(cNvPr, "name") ?? "Image");
-  return `  <img src="/_blob/${assetId}" alt="${alt}" style="${positionStyle(box)};object-fit:contain">`;
+  return { html: `  <img src="/_blob/${assetId}" alt="${alt}" style="${positionStyle(box)};object-fit:contain">`, cost: 1 };
+}
+
+const TREE_NODE_TAGS = new Set(["p:sp", "p:graphicFrame", "p:pic", "p:grpSp", "mc:AlternateContent"]);
+
+function collectTreeElements(
+  treeInnerXml: string,
+  xform: EmuTransform,
+  ptToPx: number,
+  theme: ThemeColors,
+  slideRels: RelMap,
+  slideDir: string,
+  entries: Record<string, Uint8Array>,
+  assets: Record<string, DesignFile>,
+  out: RenderedElement[],
+  budget: { used: number },
+  depth = 0,
+): void {
+  if (depth > 16 || budget.used >= MAX_SLIDE_ELEMENTS) return;
+  for (const child of extractDirectChildren(treeInnerXml, TREE_NODE_TAGS)) {
+    if (budget.used >= MAX_SLIDE_ELEMENTS) break;
+    if (child.tag === "p:sp") {
+      const rendered = renderShapeHtml(child.xml, xform, ptToPx, theme);
+      if (rendered && budget.used + rendered.cost <= MAX_SLIDE_ELEMENTS) {
+        out.push(rendered);
+        budget.used += rendered.cost;
+      }
+    } else if (child.tag === "p:graphicFrame") {
+      const rendered = renderTableHtml(child.xml, xform, ptToPx, theme);
+      if (rendered && budget.used + rendered.cost <= MAX_SLIDE_ELEMENTS) {
+        out.push(rendered);
+        budget.used += rendered.cost;
+      }
+    } else if (child.tag === "p:pic") {
+      const rendered = renderPictureHtml(child.xml, slideRels, slideDir, entries, assets, xform);
+      if (rendered && budget.used + rendered.cost <= MAX_SLIDE_ELEMENTS) {
+        out.push(rendered);
+        budget.used += rendered.cost;
+      }
+    } else if (child.tag === "p:grpSp") {
+      const nextXform = composeGroupTransform(child.xml, xform);
+      collectTreeElements(unwrapOuterTag(child.xml), nextXform, ptToPx, theme, slideRels, slideDir, entries, assets, out, budget, depth + 1);
+    } else if (child.tag === "mc:AlternateContent") {
+      const choice = /<mc:Choice\b[^>]*>([\s\S]*?)<\/mc:Choice>/.exec(child.xml)?.[1];
+      const fallback = /<mc:Fallback\b[^>]*>([\s\S]*?)<\/mc:Fallback>/.exec(child.xml)?.[1];
+      const branch = choice ?? fallback;
+      if (branch) {
+        collectTreeElements(branch, xform, ptToPx, theme, slideRels, slideDir, entries, assets, out, budget, depth + 1);
+      }
+    }
+  }
+}
+
+/**
+ * Open Artifact limits each positioning host to 24 positioned children.
+ * Partition larger element lists into position:relative <div> layers (0px flow
+ * height when holding only position:absolute children, so every layer keeps
+ * exact slide coordinates).
+ */
+function layoutSlideElements(elements: RenderedElement[]): string[] {
+  if (elements.length <= MAX_PINNED_PER_HOST) {
+    return elements.map(item => item.html);
+  }
+  const layers: string[] = [];
+  for (let i = 0; i < elements.length; i += MAX_PINNED_PER_HOST) {
+    const chunk = elements.slice(i, i + MAX_PINNED_PER_HOST);
+    const indented = chunk.map(item => item.html.split("\n").map(line => `  ${line}`).join("\n"));
+    layers.push(`  <div style="position:relative">\n${indented.join("\n")}\n  </div>`);
+  }
+  return layers;
 }
 
 function extractNotesText(notesXml: string | undefined, theme: ThemeColors): string {
@@ -464,26 +690,71 @@ function decodeUtf8(bytes: Uint8Array | undefined): string | undefined {
  */
 export function importPptxToSlides(archiveBytes: Uint8Array, options: { id: string; title?: string }): DesignDocument {
   if (!(archiveBytes instanceof Uint8Array) || archiveBytes.byteLength === 0 || archiveBytes.byteLength > MAX_PPTX_ARCHIVE_BYTES) {
-    throw new Error("design_invalid_import");
-  }
-  let entries: Record<string, Uint8Array>;
-  try {
-    entries = unzipSync(archiveBytes);
-  } catch {
-    throw new Error("design_invalid_import");
-  }
-  const names = Object.keys(entries);
-  if (names.length === 0 || names.length > MAX_PPTX_ENTRIES) throw new Error("design_invalid_import");
-  let totalUncompressed = 0;
-  for (const name of names) {
-    if (name.includes("..") || name.startsWith("/")) throw new Error("design_invalid_import");
-    totalUncompressed += entries[name]!.byteLength;
-    if (totalUncompressed > MAX_PPTX_UNCOMPRESSED_BYTES) throw new Error("design_invalid_import");
+    throw new Error("slides_invalid_pptx_import");
   }
 
-  const presentationXml = decodeUtf8(entries["ppt/presentation.xml"]);
-  if (!presentationXml) throw new Error("design_invalid_import");
-  const presentationRels = parseRels(decodeUtf8(entries["ppt/_rels/presentation.xml.rels"]));
+  let entryCount = 0;
+  let declaredUncompressed = 0;
+  let filterError: Error | undefined;
+
+  let entries: Record<string, Uint8Array>;
+  try {
+    entries = unzipSync(archiveBytes, {
+      filter(file) {
+        entryCount++;
+        if (entryCount > MAX_PPTX_ENTRIES) {
+          filterError = new Error("slides_invalid_pptx_import");
+          throw filterError;
+        }
+        const name = file.name;
+        if (
+          !name ||
+          name.length > MAX_PPTX_ENTRY_NAME_BYTES ||
+          name.includes("..") ||
+          name.startsWith("/") ||
+          name.includes("\\") ||
+          /[\x00-\x1f]/.test(name)
+        ) {
+          filterError = new Error("slides_invalid_pptx_import");
+          throw filterError;
+        }
+        const orig = Number(file.originalSize);
+        if (!Number.isFinite(orig) || orig < 0) {
+          filterError = new Error("slides_invalid_pptx_import");
+          throw filterError;
+        }
+        declaredUncompressed += orig;
+        if (declaredUncompressed > MAX_PPTX_UNCOMPRESSED_BYTES) {
+          filterError = new Error("slides_invalid_pptx_import");
+          throw filterError;
+        }
+        if (!NEEDED_PPTX_ENTRY.test(name)) return false;
+        if (name.startsWith("ppt/media/") && orig > DESIGN_FILE_BYTES) {
+          filterError = new Error("design_file_too_large");
+          throw filterError;
+        }
+        return true;
+      },
+    });
+  } catch {
+    throw filterError ?? new Error("slides_invalid_pptx_import");
+  }
+
+  const names = Object.keys(entries);
+  if (entryCount === 0 || names.length === 0 || names.length > MAX_PPTX_ENTRIES) throw new Error("slides_invalid_pptx_import");
+  // Re-verify actual inflated byte counts to guard against spoofed central-directory sizes.
+  let totalUncompressed = 0;
+  for (const name of names) {
+    if (name.includes("..") || name.startsWith("/") || name.includes("\\")) throw new Error("slides_invalid_pptx_import");
+    const data = getZipEntry(entries, name);
+    if (!data) continue;
+    totalUncompressed += data.byteLength;
+    if (totalUncompressed > MAX_PPTX_UNCOMPRESSED_BYTES) throw new Error("slides_invalid_pptx_import");
+  }
+
+  const presentationXml = decodeUtf8(getZipEntry(entries, "ppt/presentation.xml"));
+  if (!presentationXml) throw new Error("slides_invalid_pptx_import");
+  const presentationRels = parseRels(decodeUtf8(getZipEntry(entries, "ppt/_rels/presentation.xml.rels")));
 
   // Slide size in EMUs (default widescreen 16:9: 12192000 x 6858000 = 960pt x 540pt)
   const sldSzTag = /<p:sldSz\b([^>]*)\/?>/.exec(presentationXml)?.[1] ?? "";
@@ -496,8 +767,9 @@ export function importPptxToSlides(archiveBytes: Uint8Array, options: { id: stri
   const scaleX = targetW / cxEmu;
   const scaleY = targetH / cyEmu;
   const ptToPx = targetH / (cyEmu / EMU_PER_PT);
+  const rootTransform: EmuTransform = { tx: 0, ty: 0, sx: scaleX, sy: scaleY };
 
-  const theme = parseThemeColors(decodeUtf8(entries["ppt/theme/theme1.xml"]));
+  const theme = parseThemeColors(decodeUtf8(getZipEntry(entries, "ppt/theme/theme1.xml")));
 
   // Resolve slide paths in deck order
   const slidePaths: string[] = [];
@@ -506,7 +778,7 @@ export function importPptxToSlides(archiveBytes: Uint8Array, options: { id: stri
     const rel = rId ? presentationRels.get(rId) : undefined;
     if (!rel) continue;
     const resolved = normalizeZipPath("ppt", rel.target);
-    if (entries[resolved]) slidePaths.push(resolved);
+    if (getZipEntry(entries, resolved)) slidePaths.push(resolved);
   }
   if (slidePaths.length === 0) {
     // Fallback: sorted ppt/slides/slide*.xml
@@ -515,14 +787,14 @@ export function importPptxToSlides(archiveBytes: Uint8Array, options: { id: stri
       .sort((a, b) => Number(/\d+/.exec(a)![0]) - Number(/\d+/.exec(b)![0]));
     slidePaths.push(...found);
   }
-  if (slidePaths.length === 0 || slidePaths.length > MAX_SLIDES) throw new Error("design_invalid_import");
+  if (slidePaths.length === 0 || slidePaths.length > MAX_SLIDES) throw new Error("slides_invalid_pptx_import");
 
   const files: Record<string, DesignFile> = {};
   const order: string[] = [];
 
   for (let idx = 0; idx < slidePaths.length; idx++) {
     const slidePath = slidePaths[idx]!;
-    const slideXml = decodeUtf8(entries[slidePath]);
+    const slideXml = decodeUtf8(getZipEntry(entries, slidePath));
     if (!slideXml) continue;
     const slideId = `slide-${idx + 1}`;
     order.push(slideId);
@@ -530,39 +802,29 @@ export function importPptxToSlides(archiveBytes: Uint8Array, options: { id: stri
     const slash = slidePath.lastIndexOf("/");
     const slideDir = slash >= 0 ? slidePath.slice(0, slash) : "";
     const slideFile = slash >= 0 ? slidePath.slice(slash + 1) : slidePath;
-    const slideRels = parseRels(decodeUtf8(entries[`${slideDir}/_rels/${slideFile}.rels`]));
+    const slideRels = parseRels(decodeUtf8(getZipEntry(entries, `${slideDir}/_rels/${slideFile}.rels`)));
 
     const bgBlock = /<p:bg\b[^>]*>([\s\S]*?)<\/p:bg>/.exec(slideXml)?.[1];
     const bgColor = extractSolidFill(bgBlock, theme) ?? "#ffffff";
-    const elements: string[] = [];
+    const elements: RenderedElement[] = [];
 
     const spTree = /<p:spTree\b[^>]*>([\s\S]*?)<\/p:spTree>/.exec(slideXml)?.[1] ?? slideXml;
-    for (const spXml of extractTagBlocks(spTree, "p:sp")) {
-      const rendered = renderShapeHtml(spXml, scaleX, scaleY, ptToPx, theme);
-      if (rendered) elements.push(rendered);
-    }
-    for (const frameXml of extractTagBlocks(spTree, "p:graphicFrame")) {
-      const rendered = renderTableHtml(frameXml, scaleX, scaleY, ptToPx, theme);
-      if (rendered) elements.push(rendered);
-    }
-    for (const picXml of extractTagBlocks(spTree, "p:pic")) {
-      const rendered = renderPictureHtml(picXml, slideRels, slideDir, entries, files, scaleX, scaleY);
-      if (rendered) elements.push(rendered);
-    }
+    collectTreeElements(spTree, rootTransform, ptToPx, theme, slideRels, slideDir, entries, files, elements, { used: 0 });
 
     // Optional speaker notes
     let notes = "";
     for (const rel of slideRels.values()) {
       if (rel.type.endsWith("/notesSlide")) {
         const notesPath = normalizeZipPath(slideDir, rel.target);
-        notes = extractNotesText(decodeUtf8(entries[notesPath]), theme);
+        notes = extractNotesText(decodeUtf8(getZipEntry(entries, notesPath)), theme);
         break;
       }
     }
 
+    const bodyLines = layoutSlideElements(elements);
     const lines = [
-      `<section id="${slideId}" style="position:relative;background:${bgColor};color:#1a1a1a;font-family:Arial,sans-serif">`,
-      ...elements,
+      `<section id="${slideId}" style="background:${bgColor};color:#1a1a1a;font-family:Arial,sans-serif">`,
+      ...bodyLines,
       ...(notes ? ["  <aside>", `    ${escapeHtml(notes).replace(/\n/g, "\n    ")}`, "  </aside>"] : []),
       "</section>",
       "",

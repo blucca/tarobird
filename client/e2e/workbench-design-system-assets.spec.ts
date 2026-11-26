@@ -85,7 +85,7 @@ test("the real frame returns the export receipt and permits trusted fullscreen",
   await editor.evaluate(() => {
     const button = document.createElement('button'); button.textContent = 'Fixture export';
     button.style.cssText = 'position:fixed;top:0;left:0;z-index:2147483647';
-    button.onclick = () => { void (window as any).__baoyuSave(new Blob(['portable export'], { type: 'text/plain' }), 'design-export.txt')
+    button.onclick = () => { void (window as any).__tarobotLegacySave(new Blob(['portable export'], { type: 'text/plain' }), 'design-export.txt')
       .then((result: unknown) => { (window as any).exportReceipt = result; }, (error: unknown) => { (window as any).exportError = error; });
     };
     document.body.append(button);

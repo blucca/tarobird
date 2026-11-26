@@ -37,10 +37,11 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
   // server normally serves /_blob; an opaque offline frame cannot request it.
   globalThis.__tarobotDesignAssets = html => typeof html !== "string" ? html : html
     .replace(/(?<![A-Za-z0-9_:/.-])(?:\.?\/)?_blob\/([a-f0-9]{32})(?![a-f0-9])/g, (ref, id) => assetUrls.get(id) ?? ref)
-    .replace(/(?<![A-Za-z0-9_:/.-])\/(project\/ds\/[A-Za-z0-9_-]+\/assets\/[a-f0-9]{32})(?![A-Za-z0-9_./-])/g, (ref, path) => projectAssetUrls.get(path) ?? ref);
+    .replace(/(?<![A-Za-z0-9_:/.-])(?:\.?\/)?(project\/ds\/[A-Za-z0-9_-]+\/assets\/[a-f0-9]{32})(?![A-Za-z0-9_./-])/g, (ref, path) => projectAssetUrls.get(path) ?? ref);
+  const dsPrefix = format === "slides" ? "" : "/";
   const canonicalText = content => {
     for (const [id, url] of assetUrls) content = content.replaceAll(url, `/_blob/${id}`);
-    for (const [path, url] of projectAssetUrls) content = content.replaceAll(url, `/${path}`);
+    for (const [path, url] of projectAssetUrls) content = content.replaceAll(url, `${dsPrefix}${path}`);
     return content;
   };
   const canonicalFiles = files => Object.fromEntries(Object.entries(files).map(([path, file]) => {
@@ -202,8 +203,9 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
 
   const installOpenArtifactRuntime = init => {
     const artifactId = typeof init.designId === "string" && init.designId ? init.designId : "presentation";
-    const deckTitle = typeof init.title === "string" && init.title ? init.title : "Presentation";
+    let deckTitle = typeof init.title === "string" && init.title ? init.title : "Presentation";
     const forcedReadOnly = init.readOnly === true;
+    const repairEnabled = globalThis.__tarobirdDesignRepairEnabled !== false;
     const selfPeerId = crypto.randomUUID();
     let cachedPeers = [];
     const loadSession = async () => {
@@ -211,9 +213,10 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
       return res?.body ?? { canEdit: false, role: "viewer" };
     };
     const loadAgentStatus = async () => {
+      if (forcedReadOnly || !repairEnabled) return { available: false, busy: false, name: "Bot", wakesIdle: true };
       try {
         const res = await request("comments.snapshot");
-        const available = !forcedReadOnly && res?.status === 200 && res?.body?.agent?.available === true;
+        const available = res?.status === 200 && res?.body?.agent?.available === true;
         return { available, busy: false, name: "Bot", wakesIdle: true };
       } catch {
         return { available: false, busy: false, name: "Bot", wakesIdle: true };
@@ -242,12 +245,14 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
         },
         async readText(path) {
           const file = await request("read", { path });
-          if (!file) throw artifactError("not_found", `Missing file: ${path}`);
+          if (!file) { lastKnownHashes.delete(path); throw artifactError("not_found", `Missing file: ${path}`); }
+          if (typeof file.sha256 === "string") lastKnownHashes.set(path, file.sha256);
           return new TextDecoder("utf-8").decode(bytes(file.base64));
         },
         async readBytes(path) {
           const file = await request("read", { path });
-          if (!file) throw artifactError("not_found", `Missing file: ${path}`);
+          if (!file) { lastKnownHashes.delete(path); throw artifactError("not_found", `Missing file: ${path}`); }
+          if (typeof file.sha256 === "string") lastKnownHashes.set(path, file.sha256);
           return bytes(file.base64);
         },
         async publish(batch) {
@@ -286,13 +291,20 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
           }
           if (result?.status === 403) throw artifactError("not_writer", result.body?.message || "Read-only");
           if (result?.status === 409) {
-            const latest = await request("list", {}).catch(() => ({ files: {} }));
+            const latest = await request("list", {}).catch(() => null);
+            const latestFiles = latest?.files;
+            if (latestFiles && typeof latestFiles === "object") {
+              lastKnownHashes.clear();
+              for (const [p, meta] of Object.entries(latestFiles)) {
+                if (typeof meta?.sha256 === "string") lastKnownHashes.set(p, meta.sha256);
+              }
+            }
             const conflictPaths = [];
             for (const [path, expected] of Object.entries(expectedHashes)) {
-              const actual = latest?.files?.[path]?.sha256 ?? null;
+              const actual = latestFiles?.[path]?.sha256 ?? null;
               if (actual !== expected) conflictPaths.push({ path, expected, actual });
             }
-            throw artifactError("conflict", result.body?.message || "Conflict", conflictPaths.length ? conflictPaths : Object.keys(batch ?? {}).map(path => ({ path, expected: expectedHashes[path] ?? null, actual: latest?.files?.[path]?.sha256 ?? null })));
+            throw artifactError("conflict", result.body?.message || "Conflict", conflictPaths.length ? conflictPaths : Object.keys(batch ?? {}).map(path => ({ path, expected: expectedHashes[path] ?? null, actual: latestFiles?.[path]?.sha256 ?? null })));
           }
           throw artifactError("invalid", result?.body?.message || "Could not save presentation");
         },
@@ -319,7 +331,7 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
           return {};
         },
       },
-      agent: forcedReadOnly ? null : {
+      agent: forcedReadOnly || !repairEnabled ? null : {
         async status() { return loadAgentStatus(); },
         onStatus(listener) {
           agentStatusListeners.add(listener);
@@ -376,11 +388,13 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
           if (res?.status >= 400 || !res?.body?.thread) throw artifactError(res?.status === 403 ? "not_writer" : "invalid", res?.body?.message || "Could not update status");
           return mapCommentThread(res.body.thread);
         },
-        async move(threadId) {
-          const list = await capabilities.comments.list();
-          const found = list.find(t => t.id === threadId);
-          if (!found) throw artifactError("not_found", "Thread not found");
-          return found;
+        async move(threadId, anchor, location) {
+          if (forcedReadOnly) throw artifactError("not_writer", "Read-only preview");
+          if (typeof anchor !== "string" || !anchor) throw artifactError("invalid", "Invalid comment anchor");
+          const label = typeof location?.label === "string" && location.label.trim() ? location.label.trim() : undefined;
+          const res = await request("comments.move", { id: threadId, anchor, ...(label ? { label } : {}) });
+          if (res?.status >= 400 || !res?.body?.thread) throw artifactError(res?.status === 403 ? "not_writer" : res?.status === 404 ? "not_found" : "invalid", res?.body?.message || "Could not move comment");
+          return mapCommentThread(res.body.thread);
         },
         async remove(threadId) {
           if (forcedReadOnly) throw artifactError("not_writer", "Read-only preview");
@@ -389,11 +403,14 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
         },
         async sendToAgent(threadId) {
           if (forcedReadOnly) throw artifactError("not_writer", "Read-only preview");
+          if (!repairEnabled) throw artifactError("unavailable", "Not available here.");
           const res = await request("comments.send", { id: threadId });
           if (res?.status !== 202 || res.body?.draft !== "opened") throw artifactError("unavailable", res?.body?.message || "Draft unavailable");
           const thread = res.body?.thread ? mapCommentThread(res.body.thread) : (await capabilities.comments.list()).find(t => t.id === threadId);
           if (!thread) throw artifactError("not_found", "Thread not found");
-          return { ...thread, agent: { status: "delivered", drafted: true } };
+          // Opening a chat composer draft does not send the message yet; keep the
+          // actual server thread state so the user can retry if the draft is cleared.
+          return thread;
         },
         onChange(listener) {
           commentChangeListeners.add(listener);
@@ -443,6 +460,12 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
         cachedPeers = Array.isArray(peers) ? peers.map(p => ({ id: String(p.id ?? p.userId ?? ""), name: String(p.name ?? ""), kind: "person", state: p.state ?? {} })) : [];
         for (const fn of [...peerListeners]) { try { fn(cachedPeers); } catch {} }
       },
+      onTitle(nextTitle) {
+        if (typeof nextTitle !== "string" || !nextTitle.trim()) return;
+        deckTitle = nextTitle.trim();
+        document.title = deckTitle;
+        try { globalThis.__tarobotSlidesSetTitle?.(deckTitle); } catch {}
+      },
     };
   };
 
@@ -458,7 +481,8 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
     const requestId = crypto.randomUUID();
     const finish = outcome => {
       clearTimeout(timer); removeEventListener("message", receive);
-      if (outcome === "saved") resolve(); else reject({code:outcome, message:"Export was not saved"});
+      if (outcome === "saved") resolve();
+      else reject(artifactError(outcome, outcome === "declined" ? "Export cancelled" : "Export was not saved"));
     };
     const receive = event => {
       if (event.source === parent && event.data?.type === "editor:save-file-result" && event.data.requestId === requestId) finish(event.data.outcome);
@@ -490,6 +514,7 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
   addEventListener("message", async function initialize(event) {
     if (event.source !== parent) return;
     if (event.data?.type === "tarobot-design-theme" && port && typeof event.data.dark === "boolean") { setTheme(event.data.dark); return; }
+    if (event.data?.type === "tarobot-design-title" && port && typeof event.data.title === "string") { openArtifactBridge?.onTitle(event.data.title); return; }
     if (event.data?.type !== "tarobot-design-init" || port || !event.ports[0]) return;
     // Host-owned presentation capability, settled before the editor boots.
     // iOS keeps editing and error details, but omits automatic repair requests.

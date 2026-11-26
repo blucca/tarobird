@@ -3,9 +3,11 @@ import { createHash } from "node:crypto";
 import { zipSync, strToU8 } from "fflate";
 import { describe, expect, it } from "vitest";
 import { buildDesignSandbox, designAssets } from "../design-assets.js";
-import { emptySlides, applyDesignFiles, designTextFile, decodeDesignFile, validateDesignDocument } from "../src/workbench-design.js";
+import { emptyDesign, emptySlides, applyDesignFiles, designTextFile, decodeDesignFile, validateDesignDocument } from "../src/workbench-design.js";
 import { DesignSession } from "../src/workbench-design-session.js";
+import { designSystemInstall } from "../src/workbench-design-system.js";
 import { locateComment } from "../src/workbench-design-comments.js";
+import { workbenchErrorText } from "../src/workbench-error.js";
 import { importPptxToSlides } from "../src/workbench-slides-pptx-import.js";
 
 function makeMinimalPng(): Uint8Array {
@@ -239,4 +241,151 @@ describe("Workbench Presentation (#90): Apache-2.0 slides editor, PPTX import, c
     expect(files).toContain("licenses/workbench-slides/UPSTREAM.json");
     expect(files.some(name => name.includes("baoyu-slides"))).toBe(false);
   }, 30_000);
+
+  it("rejects zip-bomb archives and oversized entries before full decompression with dedicated error codes", () => {
+    // 70 MiB of zeros compresses to ~70 KiB; filter must abort before allocating/inflating it.
+    const bomb = zipSync({
+      "ppt/presentation.xml": strToU8("<p:presentation/>"),
+      "ppt/slides/bomb.xml": new Uint8Array(70 * 1024 * 1024),
+    }, { level: 9 });
+    expect(bomb.byteLength).toBeLessThan(200_000);
+    const start = Date.now();
+    expect(() => importPptxToSlides(bomb, { id: "bomb" })).toThrow("slides_invalid_pptx_import");
+    expect(Date.now() - start).toBeLessThan(2000);
+
+    // > 512 entries rejected cleanly
+    const many: Record<string, Uint8Array> = { "ppt/presentation.xml": strToU8("<p:presentation/>") };
+    for (let i = 0; i < 520; i++) many[`ppt/slides/s${i}.xml`] = strToU8("<p:sld/>");
+    expect(() => importPptxToSlides(zipSync(many), { id: "many" })).toThrow("slides_invalid_pptx_import");
+
+    // Path traversal / backslash rejected
+    const badPath = zipSync({ "ppt\\presentation.xml": strToU8("<p:presentation/>") });
+    expect(() => importPptxToSlides(badPath, { id: "badpath" })).toThrow("slides_invalid_pptx_import");
+
+    // Oversized media (> 8 MiB) throws design_file_too_large before decoding
+    const bigMedia = zipSync({
+      "ppt/presentation.xml": strToU8("<p:presentation/>"),
+      "ppt/media/huge.png": new Uint8Array(9 * 1024 * 1024),
+    }, { level: 9 });
+    expect(() => importPptxToSlides(bigMedia, { id: "bigmedia" })).toThrow("design_file_too_large");
+
+    // Localized error text for both codes
+    expect(workbenchErrorText("slides_invalid_pptx_import", "en")).toContain(".pptx");
+    expect(workbenchErrorText("slides_invalid_pptx_import", "en")).not.toContain(".tarobot-design.json");
+    expect(workbenchErrorText("slides_invalid_pptx_import", "zh")).toContain(".pptx");
+    expect(workbenchErrorText("design_file_too_large", "en")).toContain("8 MB");
+    expect(workbenchErrorText("design_file_too_large", "zh")).toContain("8 MB");
+  });
+
+  it("partitions >24 positioned shapes into position:relative layers so slides stay editable", () => {
+    const shapes = Array.from({ length: 30 }, (_, i) => `
+      <p:sp>
+        <p:nvSpPr><p:cNvPr id="${i + 2}" name="Box ${i + 1}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+        <p:spPr><a:xfrm><a:off x="${(i % 6) * 1800000}" y="${Math.floor(i / 6) * 1200000}"/><a:ext cx="1500000" cy="900000"/></a:xfrm></p:spPr>
+        <p:txBody><a:bodyPr/><a:p><a:r><a:rPr sz="1800"/><a:t>Item ${i + 1}</a:t></a:r></a:p></p:txBody>
+      </p:sp>`).join("\n");
+    const pptx = zipSync({
+      "ppt/presentation.xml": strToU8(`<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>`),
+      "ppt/_rels/presentation.xml.rels": strToU8(`<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>`),
+      "ppt/slides/slide1.xml": strToU8(`<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree>${shapes}</p:spTree></p:cSld></p:sld>`),
+    });
+    const doc = importPptxToSlides(pptx, { id: "deck_30", title: "Thirty Shapes" });
+    const html = new TextDecoder().decode(decodeDesignFile(doc.files["project/slides/slide-1.html"]));
+    expect((html.match(/<div style="position:relative">/g) ?? []).length).toBe(2);
+    expect(html).toContain("Item 1");
+    expect(html).toContain("Item 30");
+  });
+
+  it("keeps transparent bordered shapes transparent, preserves spTree z-order, transforms grpSp, and sanitizes XML/CSS", () => {
+    const slideXml = `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+      <p:cSld><p:spTree>
+        <p:pic>
+          <p:nvPicPr><p:cNvPr id="2" name="Backdrop"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+          <p:blipFill><a:blip r:embed="rIdBg"/></p:blipFill>
+          <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="12192000" cy="6858000"/></a:xfrm></p:spPr>
+        </p:pic>
+        <p:sp>
+          <p:nvSpPr><p:cNvPr id="3" name="Bordered"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+          <p:spPr>
+            <a:xfrm><a:off x="914400" y="914400"/><a:ext cx="4000000" cy="1200000"/></a:xfrm>
+            <a:noFill/>
+            <a:ln w="38100"><a:solidFill><a:srgbClr val="112233"/></a:solidFill></a:ln>
+          </p:spPr>
+          <p:txBody><a:bodyPr/>
+            <a:p><a:pPr algn="ctr"/><a:r><a:rPr sz="2400"><a:solidFill><a:srgbClr val="112233"/></a:solidFill><a:latin typeface="Arial;color:#ff0000;opacity:0"/></a:rPr><a:t>Cover &#99999999; Title</a:t></a:r></a:p>
+            <a:p><a:pPr algn="r"/><a:r><a:rPr sz="1600"/><a:t>Right subtitle</a:t></a:r></a:p>
+          </p:txBody>
+        </p:sp>
+        <p:grpSp>
+          <p:grpSpPr><a:xfrm><a:off x="6096000" y="3429000"/><a:ext cx="6096000" cy="3429000"/><a:chOff x="0" y="0"/><a:chExt cx="6096000" cy="3429000"/></a:xfrm></p:grpSpPr>
+          <p:sp>
+            <p:nvSpPr><p:cNvPr id="4" name="Grouped"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+            <p:spPr><a:xfrm><a:off x="609600" y="342900"/><a:ext cx="1219200" cy="685800"/></a:xfrm></p:spPr>
+            <p:txBody><a:bodyPr/><a:p><a:r><a:rPr sz="2000"/><a:t>Grouped Label</a:t></a:r></a:p></p:txBody>
+          </p:sp>
+        </p:grpSp>
+      </p:spTree></p:cSld>
+    </p:sld>`;
+    const slideRels = `<Relationships>
+      <Relationship Id="rIdBg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/bg.png"/>
+      <Relationship Id="rIdProto" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../toString"/>
+    </Relationships>`;
+    const pptx = zipSync({
+      "ppt/presentation.xml": strToU8(`<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/><p:sldId id="257" r:id="rIdProto"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>`),
+      "ppt/_rels/presentation.xml.rels": strToU8(`<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/><Relationship Id="rIdProto" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="../toString"/></Relationships>`),
+      "ppt/slides/slide1.xml": strToU8(slideXml),
+      "ppt/slides/_rels/slide1.xml.rels": strToU8(slideRels),
+      "ppt/media/bg.png": makeMinimalPng(),
+    });
+    const doc = importPptxToSlides(pptx, { id: "deck_zorder", title: "ZOrder" });
+    const html = new TextDecoder().decode(decodeDesignFile(doc.files["project/slides/slide-1.html"]));
+    // Z-order: background <img ...> emitted BEFORE bordered text
+    expect(html.indexOf("<img ")).toBeGreaterThan(-1);
+    expect(html.indexOf("Cover  Title")).toBeGreaterThan(html.indexOf("<img "));
+    // Transparent bordered shape has border:#112233 but NOT background:#112233
+    expect(html).toContain("border:");
+    expect(html).toContain("solid #112233");
+    expect(html).not.toContain("background:#112233");
+    // CSS injection stripped and font quoted
+    expect(html).toContain("font-family:'Arial'");
+    expect(html).not.toContain("color:#ff0000");
+    expect(html).not.toContain("opacity:0");
+    // Mixed-alignment multi-paragraph box uses regular <div> (not <div data-text>) so styles are preserved
+    expect(html).not.toContain("<div data-text");
+    expect(html).toContain("text-align:center");
+    expect(html).toContain("text-align:right");
+    // Grouped shape coordinate transformed: off (6096000 + 609600) / 12192000 * 1920 = 1056px, top (3429000 + 342900) / 6858000 * 1080 = 594px
+    expect(html).toContain("left:1056px;top:594px");
+    expect((html.match(/Grouped Label/g) ?? []).length).toBe(1);
+  });
+
+  it("installs design-system assets without leading slash for slides and with leading slash for canvas", () => {
+    const asset = designTextFile('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"/>', "image/svg+xml");
+    const assetId = asset.sha256.slice(0, 32);
+    const dsSource = validateDesignDocument({
+      schema: 1, id: "brand", format: "design-system", revision: 0, receipts: [],
+      files: {
+        "project/tokens.json": designTextFile("{}", "application/json"),
+        [`project/assets/${assetId}`]: asset,
+        "project/snippet.html": designTextFile(`<img src="/_blob/${assetId}">`, "text/html"),
+      },
+    });
+    const identity = { scope: "scope-1", id: "brand", title: "Brand" };
+    const slidesTarget = emptySlides("s1", "Deck");
+    const slidesInstalled = applyDesignFiles(slidesTarget, designSystemInstall(slidesTarget, dsSource, identity));
+    const slidesSnippet = new TextDecoder().decode(decodeDesignFile(slidesInstalled.files["project/ds/system-brand/snippet.html"]!));
+    expect(slidesSnippet).toBe(`<img src="project/ds/system-brand/assets/${assetId}">`);
+
+    const canvasTarget = emptyDesign("c1", "Canvas");
+    const canvasInstalled = applyDesignFiles(canvasTarget, designSystemInstall(canvasTarget, dsSource, identity));
+    const canvasSnippet = new TextDecoder().decode(decodeDesignFile(canvasInstalled.files["project/ds/system-brand/snippet.html"]!));
+    expect(canvasSnippet).toBe(`<img src="/project/ds/system-brand/assets/${assetId}">`);
+  });
+
+  it("removes deleted skills/baoyu-ppt entries from package.json and baoyu-design SKILL.md", () => {
+    const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+    expect((pkg.files as string[]).some(entry => entry.includes("baoyu-ppt"))).toBe(false);
+    const skillMd = readFileSync(new URL("../../skills/baoyu-design/SKILL.md", import.meta.url), "utf8");
+    expect(skillMd).not.toContain("baoyu-ppt");
+  });
 });

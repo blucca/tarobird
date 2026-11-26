@@ -44,6 +44,13 @@ test('Baoyu PPT keeps a nine-slide deck ordered across edits and reopen on a pho
     await expect(editor.getByRole('heading',{name:'第 1 页',exact:true})).toBeVisible({timeout:20000});
     for(let i=2;i<=9;i++){await editor.getByRole('button',{name:'Next slide',exact:true}).click();await expect(editor.getByRole('heading',{name:`第 ${i} 页`,exact:true})).toBeVisible();}
     await expect(editor.getByRole('button',{name:'Next slide',exact:true})).toBeDisabled();
+    // Phone read-only presentation preview hides History Restore controls.
+    await expect(panel(page).getByText('手机端仅预览',{exact:true})).toBeVisible();
+    await panel(page).getByRole('button',{name:'历史',exact:true}).click();
+    const historyDialog=page.getByRole('dialog',{name:'版本历史',exact:true});
+    await expect(historyDialog).toBeVisible();
+    await expect(historyDialog.getByRole('button',{name:'恢复整版',exact:true})).toHaveCount(0);
+    await historyDialog.getByRole('button',{name:'关闭',exact:true}).click();
     await page.screenshot({path:info.outputPath('baoyu-ppt-phone.png')});
     await page.reload();await waitForClientOnline(page);await selectConversation(page,f.conversation.title);await page.getByRole('button',{name:'工作台',exact:true}).click();
     await expect(editor.getByRole('heading',{name:'第 1 页',exact:true})).toBeVisible({timeout:20000});

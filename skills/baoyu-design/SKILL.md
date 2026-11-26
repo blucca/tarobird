@@ -1,15 +1,15 @@
 ---
 name: baoyu-design
-description: Create or revise Baoyu Design canvases when the user names Baoyu/宝玉设计, explicitly requests a Workbench Design canvas, or continues that selected canvas. Design alone or a Workbench destination in a PPT request uses the engine's native presentation skill, not this canvas or Baoyu PPT. Ordinary design and image requests retain their usual skills. This is the TaroBot adapter, not the upstream standalone server.
+description: Create or revise Baoyu Design canvases when the user names Baoyu/宝玉设计, explicitly requests a Workbench Design canvas, or continues that selected canvas. Design alone or a Workbench destination in a PPT request uses the engine's native presentation skill, not this canvas. Ordinary design and image requests retain their usual skills. This is the TaroBot adapter, not the upstream standalone server.
 license: Mixed; see LICENSE and NOTICE.md for the upstream references. The TaroBot adapter follows the repository license.
 ---
 
 # Baoyu Design in TaroBot
 
 "用 Design 做 PPT" / "Use Design to make a PPT" uses the engine's native
-presentation skill. A Workbench label or an open canvas does not select Baoyu
-for a new PPT; use `baoyu-ppt` only when the user explicitly chooses Baoyu PPT
-or unambiguously continues a selected Baoyu PPT project.
+presentation skill (and Workbench Presentation `format: "slides"` when placing
+a deck in Workbench). A Workbench label or an open canvas does not select this
+canvas skill for a PPT.
 
 "做 PPT 放工作台" / "put the deck in Workbench" chooses a destination, not
 this skill. Native presentation skills can author content for the same Workbench
@@ -17,14 +17,15 @@ editor. Do not recommend a branded option or ask native-versus-Baoyu merely to
 put a PPT there. Use neutral PPT/canvas/Workbench labels in generated questions;
 accepting an assistant-invented branded option does not replace the original intent.
 
-An explicit Baoyu Design request for a PPT uses `baoyu-ppt`, never a canvas.
-If "current PPT" could mean both a native attachment and the selected Baoyu deck,
+Never turn a canvas into a slide deck; presentation requests use the engine's
+native presentation skill or a Workbench Presentation (`format: "slides"`).
+If "current PPT" could mean both a native attachment and a Workbench presentation,
 resolve the intended project before editing.
 
 Use the current conversation's workbench, not a new local server or filesystem project.
 First read `app_capability` topic `browser` (or `widgets`), or run `tarobot workbench guide`.
 That current Host guide defines the actual protocol, limits and target binding.
-For Baoyu PPT use the `baoyu-ppt` skill; do not turn a canvas into a slide deck.
+Do not turn a canvas into a slide deck.
 Do not claim one model's native skill or Baoyu is inherently better.
 
 An explicit request to work in Baoyu Design may call `design.open` with

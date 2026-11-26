@@ -15,17 +15,21 @@ for (const scope of [
   await page.setViewportSize({ width: scope.width, height: scope.height });
   await page.goto(`${server.resolvedUrls!.local[0]}e2e/fixtures/design-repair-platform.html?platform=${scope.platform}&format=${format}`);
   const editor = page.frameLocator(".workbench-design-frame");
-  const notice = editor.locator(format === "canvas" ? '[data-testid^="mega-artboard-notice-"]:not([data-testid*="-ask-"]):not([data-testid*="-dismiss-"]):not([data-testid*="-sign-"])' : '[data-testid="slides-held-notice"]');
+  const notice = format === "canvas"
+    ? editor.locator('[data-testid^="mega-artboard-notice-"]:not([data-testid*="-ask-"]):not([data-testid*="-dismiss-"]):not([data-testid*="-sign-"])')
+    : editor.getByText(/This slide's file has errors, so it's read-only here/i);
   await expect(notice).toBeVisible({ timeout: 30000 });
-  const repair = editor.getByRole("button", { name: "Ask the agent to fix", exact: true });
+  const repair = editor.getByRole("button", { name: format === "canvas" ? "Ask the agent to fix" : "Ask Bot to fix", exact: true });
   if (scope.platform === "ios") {
     await expect(repair).toHaveCount(0);
     if (format === "canvas") {
       await editor.getByRole("button", { name: "Show all artboards with errors", exact: true }).click();
       await expect(editor.getByTestId("design-problems-list")).toContainText("PLATFORM_REPAIR_FIXTURE");
       await expect(editor.getByTestId("design-problems-ask")).toHaveCount(0);
+    } else {
+      await expect(editor.getByRole("textbox", { name: /^Ask Bot/i })).toHaveCount(0);
     }
-    await expect(editor.locator("body")).not.toContainText(/can ask the agent|Ask the agent to fix/);
+    await expect(editor.locator("body")).not.toContainText(/can ask the agent|Ask the agent to fix|Ask Bot to fix/);
     const refusal = await editor.locator("body").evaluate(async () => {
       try { await (window as any).__tarobotDesignSuggest("Repair fixture"); return "accepted"; }
       catch (error) { return error instanceof Error ? error.message : String(error); }

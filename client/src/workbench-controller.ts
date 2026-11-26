@@ -454,7 +454,7 @@ export class WorkbenchController {
     return this.createDesign(value.title,undefined,undefined,value.document,designFormatSchema.parse(value.document.format??"canvas"),value);
   }
   async importPptx(file: File): Promise<string> {
-    if (!/\.pptx$/i.test(file.name) || file.size > DESIGN_DOCUMENT_BYTES) throw new Error("design_invalid_import");
+    if (!/\.pptx$/i.test(file.name) || file.size > DESIGN_DOCUMENT_BYTES) throw new Error("slides_invalid_pptx_import");
     const bytes = new Uint8Array(await file.arrayBuffer());
     this.check();
     const id = stableId("import");
