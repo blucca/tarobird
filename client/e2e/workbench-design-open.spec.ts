@@ -19,6 +19,14 @@ async function fixture(page: Page) {
   const a = await hub.store.createConversation("owner", ["alpha"], "设计请求 A", "open_a");
   const b = await hub.store.createConversation("owner", ["alpha"], "另一个对话 B", "open_b");
   for (const conversation of [a, b]) await hub.store.publishBotMessage("alpha", { conversationId: conversation.id, status: "complete", blocks: [{ type: "text", text: conversation.title }] });
+  const confirmedWindows = new Set<string>();
+  page.on("response", async response => {
+    if (!response.url().endsWith("/workbench/targets") || !response.ok()) return;
+    try {
+      const list = await response.json() as Array<{ windowId?: string }>;
+      for (const item of list) if (typeof item.windowId === "string") confirmedWindows.add(item.windowId);
+    } catch { /* ignore aborted/closed page responses */ }
+  });
   await page.goto(hub.url); await preparePairing(page, hub); await page.getByRole("button", { name: "配对此设备", exact: true }).click();
   await hub.auth.approve(await page.getByLabel("配对码", { exact: true }).innerText(), "local-owner");
   await page.getByLabel("配对码", { exact: true }).waitFor({ state: "hidden" });
@@ -26,7 +34,7 @@ async function fixture(page: Page) {
   const broker = (hub as unknown as { workbench: WorkbenchBroker }).workbench;
   const actor = (conversationId = a.id): WorkbenchActor => ({ userId: "owner", conversationId, validate: async () => undefined });
   const windows = (conversationId = a.id) => broker.list(actor(conversationId));
-  const opener = async () => (await windows()).find(window => window.capabilities.includes("design.open.v1"));
+  const opener = async () => (await windows()).find(window => window.capabilities.includes("design.open.v1") && confirmedWindows.has(window.windowId));
   await expect.poll(opener).toBeTruthy();
   async function source(p = page, conversation = a, text = "请明确用 Design 做这个页面") {
     const previous = await hub.store.db.all<{ id: string }>("SELECT id FROM messages WHERE author_type='user' AND conversation_id=?", [conversation.id]);
@@ -74,7 +82,10 @@ for (const phone of [false, true]) test(`explicit Design command opens the close
     await page.screenshot({ path: info.outputPath(phone ? "design-auto-phone.png" : "design-auto-desktop.png") });
     await panel(page).getByRole("button", { name: "返回聊天", exact: true }).click();
     await expect(panel(page)).toBeHidden();
-    await expect.poll(async () => (await f.opener())?.windowId).not.toBe(source.context!.openTarget!.windowId);
+    await expect.poll(async () => {
+      const next = await f.opener();
+      return next && next.windowId !== source.context!.openTarget!.windowId ? next.windowId : undefined;
+    }).toBeTruthy();
     await expect(f.command(source, "old-turn-after-close")).rejects.toThrow(/workbench_(open_target|app)_unavailable/);
     await expect(panel(page)).toBeHidden();
     const fresh = await f.source(page, f.a, "再用 Design 继续这个设计");

@@ -1159,9 +1159,9 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     sendBusy.current = true; setSteeringBusy(true);
     try {
       if (!text.trim()) throw new Error(t("请先输入要补充给当前任务的文字。"));
-      // Ordinary sending already captured this once. Reuse even an absent
-      // optional context: a failed opener must not add a second wait to chat.
-      const openContext = origin ? origin.context : await designOpener.context();
+      // Ordinary sending already captured this once; reading the immediate
+      // snapshot avoids blocking chat sends or steers on background registration.
+      const openContext = origin ? origin.context : designOpener.contextSnapshot();
       if (currentSelection.current !== conversationId) return;
       const boundTarget = expectedTargetId ?? (codexDirect ? steeringCapability.targetId : undefined);
       const receipt = await sendSteering(connection, conversationId, targets[0]!, text, () => currentSelection.current === conversationId, ordinarySend, immediately, openContext, boundTarget);
@@ -1323,7 +1323,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       catch { throw new Error(workbenchDraft.context.kind === "design" ? t("请先在工作台打开原设计，再发送评论。草稿已保留。") : t("请先在工作台打开原白板，再发送改图材料。草稿已保留。")); }
     }
     const activeWorkbenchContext = imageDraft?.context ?? await workbench.context();
-    let workbenchContext = await designOpener.context(activeWorkbenchContext);
+    let workbenchContext = designOpener.contextSnapshot(activeWorkbenchContext);
     if (sendBusy.current || currentSelection.current !== workbenchSendOrigin) return;
     if (draftRevision.current !== workbenchSendRevision) throw new Error(t("发送时内容已修改，未发送。请确认后再次发送。"));
     if (discussionTransitioning) throw new Error(t("请等待本次讨论停止或暂停完成，内容已保留。"));
