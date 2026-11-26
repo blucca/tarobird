@@ -8,6 +8,13 @@ import { WORKSPACE_FILES_CAPABILITY } from "../src/client-protocol/workspace-fil
 import { CAPABILITIES, SERVER_CAPABILITIES } from "../src/client-protocol/index.js";
 import { HubServer } from "../src/hub/server.js";
 import { deviceProof, hashSecret } from "../src/hub/auth.js";
+import { setLocale } from "../client/src/i18n.js";
+import {
+  changeBadgeLabel,
+  classifyWorkspaceEntry,
+  entryToneClass,
+  formatSafeWorkspaceErrorHint,
+} from "../client/src/workspace-files-meta.js";
 
 const tempDirs: string[] = [];
 async function makeTemp(prefix: string): Promise<string> {
@@ -133,5 +140,50 @@ describe("Workspace read-only file tree and preview (#99)", () => {
     } finally {
       await hub.close();
     }
+  });
+
+  it("renders plain-language change pills, color-coded file kinds, and safe error hints", () => {
+    const origDocument = globalThis.document;
+    try {
+      // @ts-expect-error minimal document stub for i18n.setLocale in node vitest
+      globalThis.document = { documentElement: { lang: "" } };
+
+      setLocale("zh");
+      expect(changeBadgeLabel("added")).toBe("新增");
+      expect(changeBadgeLabel("modified")).toBe("改过");
+      expect(changeBadgeLabel("deleted")).toBe("已删");
+      expect(changeBadgeLabel("untracked")).toBe("新文件");
+      expect(changeBadgeLabel("conflicted")).toBe("有冲突");
+      expect(changeBadgeLabel("type_changed")).toBe("变更");
+
+      setLocale("en");
+      expect(changeBadgeLabel("added")).toBe("Added");
+      expect(changeBadgeLabel("modified")).toBe("Edited");
+      expect(changeBadgeLabel("deleted")).toBe("Deleted");
+      expect(changeBadgeLabel("untracked")).toBe("New");
+      expect(changeBadgeLabel("conflicted")).toBe("Conflict");
+      expect(changeBadgeLabel("type_changed")).toBe("Type");
+    } finally {
+      if (origDocument === undefined) {
+        // @ts-expect-error restore node test global
+        delete globalThis.document;
+      } else {
+        globalThis.document = origDocument;
+      }
+    }
+
+    expect(entryToneClass(classifyWorkspaceEntry({ kind: "dir", name: "src", sensitive: false }))).toBe("is-dir");
+    expect(entryToneClass(classifyWorkspaceEntry({ kind: "file", name: ".env", sensitive: true }))).toBe("is-sensitive");
+    expect(entryToneClass(classifyWorkspaceEntry({ kind: "file", name: "README.md", sensitive: false }))).toBe("is-doc");
+    expect(entryToneClass(classifyWorkspaceEntry({ kind: "file", name: "budget.xlsx", sensitive: false }))).toBe("is-sheet");
+    expect(entryToneClass(classifyWorkspaceEntry({ kind: "file", name: "metrics.csv", sensitive: false }))).toBe("is-sheet");
+    expect(entryToneClass(classifyWorkspaceEntry({ kind: "file", name: "diagram.png", sensitive: false }))).toBe("is-img");
+    expect(entryToneClass(classifyWorkspaceEntry({ kind: "file", name: "report.pdf", sensitive: false }))).toBe("is-pdf");
+    expect(entryToneClass(classifyWorkspaceEntry({ kind: "file", name: "App.tsx", sensitive: false }))).toBe("is-code");
+    expect(entryToneClass(classifyWorkspaceEntry({ kind: "file", name: "archive.bin", sensitive: false }))).toBe("is-file");
+
+    expect(formatSafeWorkspaceErrorHint(Object.assign(new Error("boom"), { status: 503 }), "tree_unavailable")).toBe("HTTP 503");
+    expect(formatSafeWorkspaceErrorHint(new Error("workspace_offline"), "tree_unavailable")).toBe("workspace_offline");
+    expect(formatSafeWorkspaceErrorHint(new Error("/Users/example/secret/path failed"), "tree_unavailable")).toBe("tree_unavailable");
   });
 });

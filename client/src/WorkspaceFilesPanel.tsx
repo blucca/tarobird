@@ -5,8 +5,10 @@ import {
   ChevronRight,
   Code2,
   Eye,
+  File,
   FileCode2,
   FileImage,
+  FileSpreadsheet,
   FileText,
   Folder,
   FolderOpen,
@@ -16,13 +18,11 @@ import {
   Lock,
   RefreshCw,
   Search,
-  ShieldAlert,
   X,
 } from "lucide-react";
 import {
   workspacePreviewResponseSchema,
   workspaceTreeResponseSchema,
-  type WorkspaceChangeBadge,
   type WorkspaceFileEntry,
   type WorkspacePreviewResponse,
   type WorkspaceTreeResponse,
@@ -32,6 +32,13 @@ import { MarkdownText } from "./MarkdownText.js";
 import { CodeBlock } from "./CodeBlock.js";
 import { t, useLocale } from "./i18n.js";
 import { formatFileLimit } from "./files.js";
+import {
+  changeBadgeLabel,
+  changeBadgeTitle,
+  classifyWorkspaceEntry,
+  entryToneClass,
+  formatSafeWorkspaceErrorHint,
+} from "./workspace-files-meta.js";
 import "./workspace-files.css";
 
 const PdfPreview = lazy(() => import("./PdfPreview.js"));
@@ -42,35 +49,85 @@ export function formatWorkspaceFileMention(relativePath: string): string {
   return /\s/.test(relativePath) ? `@"${relativePath}"` : `@${relativePath}`;
 }
 
-function changeBadgeLabel(status: WorkspaceChangeBadge): string {
-  switch (status) {
-    case "added": return "A";
-    case "modified": return "M";
-    case "deleted": return "D";
-    case "untracked": return "U";
-    case "conflicted": return "C";
-    case "type_changed": return "T";
-  }
-}
-
-function changeBadgeTitle(status: WorkspaceChangeBadge): string {
-  switch (status) {
-    case "added": return t("新增文件");
-    case "modified": return t("已修改");
-    case "deleted": return t("已删除");
-    case "untracked": return t("未跟踪文件");
-    case "conflicted": return t("存在冲突");
-    case "type_changed": return t("类型变更");
-  }
-}
+export { changeBadgeLabel, classifyWorkspaceEntry } from "./workspace-files-meta.js";
 
 function entryIcon(entry: WorkspaceFileEntry, open: boolean) {
-  if (entry.kind === "dir") return open ? <FolderOpen size={15}/> : <Folder size={15}/>;
-  if (entry.sensitive) return <Lock size={14}/>;
-  const lower = entry.name.toLowerCase();
-  if (/\.(png|jpe?g|gif|webp|svg|ico)$/.test(lower)) return <FileImage size={14}/>;
-  if (/\.(ts|tsx|mts|js|jsx|mjs|py|go|rs|java|kt|swift|c|cpp|h|css|scss|html|json|yaml|yml|toml|sh|sql)$/.test(lower)) return <FileCode2 size={14}/>;
-  return <FileText size={14}/>;
+  const kind = classifyWorkspaceEntry(entry);
+  const toneClass = entryToneClass(kind);
+  switch (kind) {
+    case "dir":
+      return { icon: open ? <FolderOpen size={15}/> : <Folder size={15}/>, toneClass };
+    case "sensitive":
+      return { icon: <Lock size={14}/>, toneClass };
+    case "image":
+      return { icon: <FileImage size={14}/>, toneClass };
+    case "sheet":
+      return { icon: <FileSpreadsheet size={14}/>, toneClass };
+    case "pdf":
+    case "doc":
+      return { icon: <FileText size={14}/>, toneClass };
+    case "code":
+      return { icon: <FileCode2 size={14}/>, toneClass };
+    case "file":
+      return { icon: <File size={14}/>, toneClass };
+  }
+}
+
+/** Friendly spot illustrations for Workspace Files empty, error, and sensitive states. */
+function WorkspaceFileStateArt({ kind }: { kind: "changed" | "search" | "empty" | "error" | "sensitive" | "file" }) {
+  if (kind === "changed") {
+    return (
+      <svg className="wf-state-art is-changed" viewBox="0 0 64 48" width="56" height="42" fill="none" aria-hidden="true">
+        <path d="M16 9a3.5 3.5 0 0 1 3.5-3.5h15l9 9V38.5a3.5 3.5 0 0 1-3.5 3.5h-20.5A3.5 3.5 0 0 1 16 38.5V9Z" fill="currentColor" fillOpacity="0.1" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/>
+        <path d="M34.5 5.5v9h9" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/>
+        <path d="M24.5 26.5l4.2 4.2 8.8-8.8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+      </svg>
+    );
+  }
+  if (kind === "search") {
+    return (
+      <svg className="wf-state-art" viewBox="0 0 64 48" width="56" height="42" fill="none" aria-hidden="true">
+        <path d="M13 13a4 4 0 0 1 4-4h9l3.5 3.5H45a4 4 0 0 1 4 4v18a4 4 0 0 1-4 4H17a4 4 0 0 1-4-4V13Z" fill="currentColor" fillOpacity="0.09" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/>
+        <circle cx="31" cy="24.5" r="6.5" fill="var(--bg)" stroke="currentColor" strokeWidth="1.6"/>
+        <path d="M35.8 29.3l4.7 4.7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+      </svg>
+    );
+  }
+  if (kind === "error") {
+    return (
+      <svg className="wf-state-art is-error" viewBox="0 0 64 48" width="56" height="42" fill="none" aria-hidden="true">
+        <circle cx="32" cy="24" r="16" fill="currentColor" fillOpacity="0.12" stroke="currentColor" strokeWidth="1.6"/>
+        <path d="M32 16v10" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"/>
+        <circle cx="32" cy="31.5" r="1.6" fill="currentColor"/>
+      </svg>
+    );
+  }
+  if (kind === "sensitive") {
+    return (
+      <svg className="wf-state-art is-sensitive" viewBox="0 0 64 48" width="56" height="42" fill="none" aria-hidden="true">
+        <path d="M32 6.5 18 12v11.5c0 9.2 5.9 16.5 14 19 8.1-2.5 14-9.8 14-19V12L32 6.5Z" fill="currentColor" fillOpacity="0.12" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/>
+        <rect x="26.5" y="21.5" width="11" height="9.5" rx="2.5" fill="var(--bg)" stroke="currentColor" strokeWidth="1.5"/>
+        <path d="M29 21.5v-2.8a3 3 0 0 1 6 0v2.8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+        <circle cx="32" cy="26.3" r="1.1" fill="currentColor"/>
+      </svg>
+    );
+  }
+  if (kind === "file") {
+    return (
+      <svg className="wf-state-art" viewBox="0 0 64 48" width="56" height="42" fill="none" aria-hidden="true">
+        <path d="M18 8.5a3.5 3.5 0 0 1 3.5-3.5h14l9 9v25.5a3.5 3.5 0 0 1-3.5 3.5h-19.5A3.5 3.5 0 0 1 18 39.5V8.5Z" fill="currentColor" fillOpacity="0.1" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/>
+        <path d="M35.5 5v9h9" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/>
+        <path d="M25 25.5h14M25 31h9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" opacity="0.65"/>
+      </svg>
+    );
+  }
+  return (
+    <svg className="wf-state-art" viewBox="0 0 64 48" width="56" height="42" fill="none" aria-hidden="true">
+      <path d="M12 14a4 4 0 0 1 4-4h10l4 4h18a4 4 0 0 1 4 4v18a4 4 0 0 1-4 4H16a4 4 0 0 1-4-4V14Z" fill="currentColor" fillOpacity="0.1" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/>
+      <path d="M24 26h16M24 31h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" opacity="0.7"/>
+      <circle cx="48" cy="11" r="2.2" fill="currentColor" fillOpacity="0.5"/>
+    </svg>
+  );
 }
 
 function decodeBase64Blob(base64: string, mime: string): Blob {
@@ -111,12 +168,14 @@ export function WorkspaceFilesPanel({
   const [changedOnly, setChangedOnly] = useState(false);
   const [filter, setFilter] = useState("");
   const [rootError, setRootError] = useState("");
+  const [rootErrorHint, setRootErrorHint] = useState("");
   const [refreshing, setRefreshing] = useState(false);
 
   const [selectedPath, setSelectedPath] = useState<string | undefined>(undefined);
   const [preview, setPreview] = useState<WorkspacePreviewResponse | undefined>(undefined);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const [previewErrorHint, setPreviewErrorHint] = useState("");
   const [rawMarkdown, setRawMarkdown] = useState(false);
 
   const expandedRef = useRef(expanded);
@@ -136,6 +195,7 @@ export function WorkspaceFilesPanel({
         setWorkspaceName(parsed.workspaceName);
         setChangedFiles(parsed.changedFiles);
         setRootError("");
+        setRootErrorHint("");
       }
       setNodes((prev) => {
         const next = new Map(prev);
@@ -146,7 +206,8 @@ export function WorkspaceFilesPanel({
     } catch (error) {
       if ((error as { name?: string })?.name === "AbortError") return undefined;
       if (dirPath === "") {
-        setRootError(t("暂时无法读取当前工作区目录，请确认 Bot 在线后重试。"));
+        setRootError(t("暂时读不到工作区文件，可以点一下重试。"));
+        setRootErrorHint(formatSafeWorkspaceErrorHint(error, "tree_unavailable"));
       }
       return undefined;
     } finally {
@@ -163,6 +224,7 @@ export function WorkspaceFilesPanel({
     setSelectedPath(filePath);
     setPreviewLoading(true);
     setPreviewError("");
+    setPreviewErrorHint("");
     setRawMarkdown(false);
     try {
       const qs = new URLSearchParams({ botId, path: filePath, ...(reveal ? { reveal: "1" } : {}) });
@@ -171,7 +233,8 @@ export function WorkspaceFilesPanel({
     } catch (error) {
       if ((error as { name?: string })?.name === "AbortError") return;
       setPreview(undefined);
-      setPreviewError(t("无法预览该文件，可能已被移动或超出工作区边界。"));
+      setPreviewError(t("暂时打不开这个文件预览，可以点一下重试。"));
+      setPreviewErrorHint(formatSafeWorkspaceErrorHint(error, "preview_unavailable"));
     } finally {
       setPreviewLoading(false);
     }
@@ -194,7 +257,9 @@ export function WorkspaceFilesPanel({
     setSelectedPath(undefined);
     setPreview(undefined);
     setPreviewError("");
+    setPreviewErrorHint("");
     setRootError("");
+    setRootErrorHint("");
     setFilter("");
     setChangedOnly(false);
     fingerprints.current.clear();
@@ -270,6 +335,18 @@ export function WorkspaceFilesPanel({
 
   const normalizedFilter = filter.trim().toLowerCase();
 
+  const dirHasLoadedMatch = (dirPath: string): boolean => {
+    const children = nodes.get(dirPath);
+    if (!children) return false;
+    return children.some((child) => {
+      if (changedOnly && !child.changed && !child.hasChangedChildren) return false;
+      if (child.name.toLowerCase().includes(normalizedFilter) || child.path.toLowerCase().includes(normalizedFilter)) {
+        return true;
+      }
+      return child.kind === "dir" && expanded.has(child.path) && dirHasLoadedMatch(child.path);
+    });
+  };
+
   const renderDir = (dirPath: string, depth: number) => {
     const list = nodes.get(dirPath);
     if (!list) return null;
@@ -277,14 +354,46 @@ export function WorkspaceFilesPanel({
       if (changedOnly && !entry.changed && !entry.hasChangedChildren) return false;
       if (normalizedFilter) {
         if (entry.kind === "dir") {
-          return entry.name.toLowerCase().includes(normalizedFilter) || expanded.has(entry.path);
+          return (
+            entry.name.toLowerCase().includes(normalizedFilter)
+            || entry.path.toLowerCase().includes(normalizedFilter)
+            || (expanded.has(entry.path) && dirHasLoadedMatch(entry.path))
+          );
         }
         return entry.name.toLowerCase().includes(normalizedFilter) || entry.path.toLowerCase().includes(normalizedFilter);
       }
       return true;
     });
     if (!visibleEntries.length && depth === 0) {
-      return <div className="wf-empty">{changedOnly ? t("本轮暂无改动文件") : normalizedFilter ? t("没有匹配的文件") : t("当前目录为空")}</div>;
+      const emptyKind = normalizedFilter ? "search" : changedOnly ? "changed" : "empty";
+      return (
+        <div className="wf-state-card" role="status">
+          <WorkspaceFileStateArt kind={emptyKind}/>
+          <p className="wf-state-title">
+            {normalizedFilter ? t("没有匹配的文件") : changedOnly ? t("本轮暂无改动文件") : t("当前目录为空")}
+          </p>
+          <p className="wf-state-detail">
+            {normalizedFilter
+              ? t("试试换个关键词，或清空筛选查看全部文件。")
+              : changedOnly
+                ? t("Bot 新建或修改文件后，这里会自动标出变化。")
+                : t("工作区里新增文件后，点一下刷新就会出现在这里。")}
+          </p>
+          {normalizedFilter && (
+            <button type="button" className="wf-secondary-btn" onClick={() => setFilter("")}>
+              {t("清空筛选")}
+            </button>
+          )}
+          {!normalizedFilter && changedOnly && (
+            <button type="button" className="wf-secondary-btn" onClick={() => setChangedOnly(false)}>
+              {t("查看全部文件")}
+            </button>
+          )}
+        </div>
+      );
+    }
+    if (!visibleEntries.length && depth > 0 && !changedOnly && !normalizedFilter) {
+      return <div className="wf-empty-sub" style={{ paddingInlineStart: `${30 + depth * 15}px` }}>{t("空文件夹")}</div>;
     }
     return <ul className="wf-tree-list" role={depth === 0 ? "tree" : "group"}>
       {visibleEntries.map((entry) => {
@@ -292,6 +401,7 @@ export function WorkspaceFilesPanel({
         const isOpen = isDir && expanded.has(entry.path);
         const isLoading = isDir && loadingDirs.has(entry.path);
         const isSelected = !isDir && selectedPath === entry.path;
+        const { icon, toneClass } = entryIcon(entry, isOpen);
         return <li key={entry.path} role="treeitem" aria-expanded={isDir ? isOpen : undefined} aria-selected={isSelected}>
           <div
             className={`wf-row${isSelected ? " is-selected" : ""}${entry.heavy ? " is-heavy" : ""}${entry.sensitive ? " is-sensitive" : ""}`}
@@ -312,7 +422,7 @@ export function WorkspaceFilesPanel({
               <span className={`wf-caret${isDir ? "" : " is-leaf"}${isOpen ? " is-open" : ""}`} aria-hidden="true">
                 {isLoading ? <LoaderCircle size={12} className="spin"/> : isDir ? <ChevronRight size={13}/> : null}
               </span>
-              <span className={`wf-icon${isDir ? " is-dir" : ""}`} aria-hidden="true">{entryIcon(entry, isOpen)}</span>
+              <span className={`wf-icon ${toneClass}`} aria-hidden="true">{icon}</span>
               <span className="wf-name">{entry.name}</span>
               {entry.sensitive && <span className="wf-tag is-sensitive" title={t("可能包含敏感凭据")}>{t("敏感")}</span>}
               {entry.changed && <span className={`wf-git-badge is-${entry.changed}`} title={changeBadgeTitle(entry.changed)}>{changeBadgeLabel(entry.changed)}</span>}
@@ -413,9 +523,12 @@ export function WorkspaceFilesPanel({
     <div className="wf-body">
       {!showingPreview ? (
         rootError ? (
-          <div className="wf-state-box" role="alert">
-            <p>{rootError}</p>
-            <button type="button" onClick={() => void refreshExpanded()}>{t("重试")}</button>
+          <div className="wf-state-card is-error" role="alert">
+            <WorkspaceFileStateArt kind="error"/>
+            <p className="wf-state-title">{rootError}</p>
+            <p className="wf-state-detail">{t("请确认 Bot 在线并且工作区目录可访问。")}</p>
+            <button type="button" className="wf-retry-btn" onClick={() => void refreshExpanded()}>{t("重试")}</button>
+            {rootErrorHint && <small className="wf-error-code">{rootErrorHint}</small>}
           </div>
         ) : !nodes.has("") ? (
           <div className="wf-state-box" role="status">
@@ -426,7 +539,7 @@ export function WorkspaceFilesPanel({
       ) : (
         <div className="wf-preview">
           <div className="wf-preview-bar">
-            <button type="button" className="wf-back-btn" onClick={() => { setSelectedPath(undefined); setPreview(undefined); setPreviewError(""); }}>
+            <button type="button" className="wf-back-btn" onClick={() => { setSelectedPath(undefined); setPreview(undefined); setPreviewError(""); setPreviewErrorHint(""); }}>
               <ArrowLeft size={14}/>
               <span>{t("返回目录")}</span>
             </button>
@@ -445,16 +558,29 @@ export function WorkspaceFilesPanel({
           </div>
 
           {previewLoading && <div className="wf-state-box" role="status"><LoaderCircle size={18} className="spin"/><span>{t("正在加载预览…")}</span></div>}
-          {previewError && <div className="wf-state-box" role="alert"><p>{previewError}</p></div>}
+          {previewError && (
+            <div className="wf-state-card is-error" role="alert">
+              <WorkspaceFileStateArt kind="error"/>
+              <p className="wf-state-title">{previewError}</p>
+              <p className="wf-state-detail">{t("文件可能已经被移动、删除，或超出了当前工作区范围。")}</p>
+              {selectedPath && (
+                <button type="button" className="wf-retry-btn" onClick={() => void fetchPreview(selectedPath, false)}>
+                  {t("重试")}
+                </button>
+              )}
+              {previewErrorHint && <small className="wf-error-code">{previewErrorHint}</small>}
+            </div>
+          )}
 
           {!previewLoading && !previewError && preview?.kind === "sensitive" && (
-            <div className="wf-sensitive-gate">
-              <ShieldAlert size={24} aria-hidden="true"/>
-              <h3>{t("此文件可能包含敏感凭据")}</h3>
-              <p>{t("为避免意外暴露密钥或令牌，{0} 默认不直接预览内容。", preview.name)}</p>
-              <button type="button" className="primary" onClick={() => void fetchPreview(preview.path, true)}>
+            <div className="wf-state-card is-sensitive">
+              <WorkspaceFileStateArt kind="sensitive"/>
+              <h3 className="wf-state-title">{t("此文件可能包含敏感凭据")}</h3>
+              <p className="wf-state-detail">{t("为避免意外暴露密钥或令牌，{0} 默认不直接预览内容。", preview.name)}</p>
+              <button type="button" className="wf-retry-btn" onClick={() => void fetchPreview(preview.path, true)}>
                 {t("确认查看内容")}
               </button>
+              <small className="wf-state-hint">{t("仅在本地只读查看，不会自动发送给其他人。")}</small>
             </div>
           )}
 
@@ -488,10 +614,11 @@ export function WorkspaceFilesPanel({
           )}
 
           {!previewLoading && !previewError && (preview?.kind === "binary" || preview?.kind === "too_large") && (
-            <div className="wf-state-box">
-              <FileText size={24} aria-hidden="true"/>
-              <p>{preview.kind === "too_large" ? t("文件过大，暂不支持直接预览。") : t("此二进制文件暂不支持文本预览。")}</p>
-              <small>{formatFileLimit(preview.size)}</small>
+            <div className="wf-state-card">
+              <WorkspaceFileStateArt kind="file"/>
+              <p className="wf-state-title">{preview.kind === "too_large" ? t("文件过大，暂不支持直接预览。") : t("此二进制文件暂不支持文本预览。")}</p>
+              <p className="wf-state-detail">{preview.kind === "too_large" ? t("仅支持预览 10 MB 以内的常见文本、图片或 PDF 文件。") : t("你可以先把它引用给 Bot，由 Bot 在工作区里读取或处理。")}</p>
+              <small className="wf-error-code">{formatFileLimit(preview.size)}</small>
             </div>
           )}
         </div>
