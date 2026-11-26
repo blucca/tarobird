@@ -11,7 +11,7 @@ import { unavailableQuota } from "../src/codex/account-quota.js";
 import { quotaDirectorySchema, quotaScopeSchema } from "../src/client-protocol/engine-quota.js";
 import { bootstrapTrusted } from "./helpers/pairing-invite.js";
 import { engineQuotaCommand } from "../src/host-cli/engine-quota.js";
-import { ENGINE_QUOTA_CAPABILITY } from "../src/client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_CURRENCY_CAPABILITY } from "../src/client-protocol/engine-quota.js";
 
 let root: string, hub: HubServer, token: string, transport: GatewayTransport;
 let read: ReturnType<typeof vi.fn>;
@@ -87,4 +87,55 @@ it("uses the same authenticated HTTP quota contract from the headless CLI", asyn
   expect(refreshed.id).toBe("quota_bot");
   expect(read.mock.calls.filter(args => args[0].refresh)).toHaveLength(1);
   expect(await hub.store.db.get("SELECT COUNT(*) AS count FROM messages")).toEqual({ count: 0 });
+});
+
+it("omits currency balances for legacy v1.6.0 HTTP requests and returns them when ?balances=currency is requested", async () => {
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+  read.mockImplementation(async () => ({
+    revision: "revision_currency",
+    snapshot: {
+      authMode: "subscription",
+      capability: { mode: "active" },
+      state: "ready",
+      availability: "unknown",
+      observedAt: now,
+      lastAttemptAt: now,
+      constraints: [],
+      pools: [{
+        id: "kimi",
+        label: "Kimi Code",
+        sharing: "shared",
+        availability: "unknown",
+        windows: [{ id: "five_hour", label: "5 hours", metric: "percent", usedPercent: 10, availability: "unknown", observedAt: now, expiresAt }],
+        balances: [
+          { id: "credits", kind: "credits", amount: "5.00", unit: "credits", observedAt: now, expiresAt },
+          { id: "top_up", kind: "currency", amount: "45.50", unit: "CNY", observedAt: now, expiresAt },
+        ],
+        constraints: [],
+      }],
+    },
+  }));
+
+  const legacyDir = quotaDirectorySchema.parse(await (await request("/api/engine-quotas")).json());
+  expect(legacyDir.scopes[0]!.pools[0]!.balances.map(b => b.kind)).toEqual(["credits"]);
+  const legacyScope = quotaScopeSchema.parse(await (await request("/api/engine-quotas/quota_bot")).json());
+  expect(legacyScope.pools[0]!.balances.map(b => b.kind)).toEqual(["credits"]);
+
+  const currencyDir = quotaDirectorySchema.parse(await (await request("/api/engine-quotas?balances=currency")).json());
+  expect(currencyDir.scopes[0]!.pools[0]!.balances.map(b => [b.kind, b.amount, b.unit])).toEqual([
+    ["credits", "5.00", "credits"],
+    ["currency", "45.50", "CNY"],
+  ]);
+
+  const cliClient = {
+    ready: { serverCapabilities: [ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_CURRENCY_CAPABILITY] },
+    request: async (route: string) => {
+      const response = await request(route);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    },
+  };
+  const cliDir = quotaDirectorySchema.parse(await engineQuotaCommand(cliClient as any, {}));
+  expect(cliDir.scopes[0]!.pools[0]!.balances.map(b => b.kind)).toEqual(["credits", "currency"]);
 });

@@ -1598,13 +1598,13 @@ export class HubServer {
       const quotaRoute = route.match(/^\/api\/engine-quotas(?:\/([A-Za-z0-9_-]+))?$/);
       if (quotaRoute && req.method === "GET") {
         await requireOwner();
-        const url = new URL(req.url ?? "/", "http://hub"), refresh = url.searchParams.get("refresh") === "1", revision = url.searchParams.get("revision") ?? undefined;
+        const url = new URL(req.url ?? "/", "http://hub"), refresh = url.searchParams.get("refresh") === "1", revision = url.searchParams.get("revision") ?? undefined, includeCurrencyBalances = url.searchParams.get("balances") === "currency";
         if (revision && (revision.length > 128 || !/^[a-zA-Z0-9_.:-]+$/.test(revision)) || refresh && !quotaRoute[1]) throw new HubError("quota_request_invalid", 400);
         const quotas = hubEngineQuotas({ bots: () => this.store.bots(userId), validate,
           connection: id => { const connection = this.bots.get(id); return connection ? { key: connection, supported: connection.engineQuota, ready: connection.ready } : undefined; },
           call: (id, request) => this.callBot(id, "quota.get", request, request.refresh ? ENGINE_QUOTA_HUB_REFRESH_MS : 2_500),
         });
-        await reply(200, quotaRoute[1] ? await quotas.scope(quotaRoute[1], refresh, revision) : await quotas.directory()); return;
+        await reply(200, quotaRoute[1] ? await quotas.scope(quotaRoute[1], refresh, revision, { includeCurrencyBalances }) : await quotas.directory({ includeCurrencyBalances })); return;
       }
       if (route === "/api/workbench/admit" && req.method === "POST") {
         const input = z.object({ dispatchId: idSchema }).strict().parse(await this.jsonBody(req, 2048));

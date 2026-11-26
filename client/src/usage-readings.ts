@@ -30,6 +30,8 @@ export function poolCoversModel(models: readonly string[], model: string): boole
 // Claude reports its per-model weekly windows beside the shared ones; extra-usage windows are not quota left.
 const CLAUDE_MODEL_WINDOWS: Record<string, string> = { seven_day_opus: "opus", seven_day_sonnet: "sonnet" };
 const CLAUDE_EXTRA_WINDOWS = new Set(["seven_day_overage_included", "overage"]);
+// Kimi's monthly top-up spending cap is an extra-usage ceiling, not remaining plan quota.
+const KIMI_EXTRA_WINDOWS = new Set(["extra_monthly"]);
 
 export type QuotaWindowView = { id: string; pool: string; label: string; periodSeconds?: number; left: number; resetsAt?: string };
 /** Engine limits that refuse ordinary use whatever the windows say. Disabled extra usage is not one of them. */
@@ -61,6 +63,7 @@ export function quotaView(scope: QuotaScope | undefined, model: string, now: num
         const family = CLAUDE_MODEL_WINDOWS[window.id];
         if (CLAUDE_EXTRA_WINDOWS.has(window.id) || family && !model.toLowerCase().includes(family)) continue;
       }
+      if (scope.engine === "kimi" && KIMI_EXTRA_WINDOWS.has(window.id)) continue;
       windows.push({ id: `${pool.id}:${window.id}`, pool: pool.label, label: window.label, left: percent(100 - window.usedPercent), ...(window.periodSeconds ? { periodSeconds: window.periodSeconds } : {}), ...(window.resetsAt ? { resetsAt: window.resetsAt } : {}) });
     }
   }
@@ -131,7 +134,7 @@ export type QuotaAttempt = { revision: string; at: number; signIn: boolean };
  * sooner than that after the last attempt for this login, so a failing read is not repeated each time a
  * conversation opens. */
 export function mayAskEngine(scope: QuotaScope, held: QuotaScope | undefined, attempt: QuotaAttempt | undefined, now: number, olderThan: number): boolean {
-  if (!workerAnswered(scope) || scope.capability.mode !== "active" || scope.state === "login_required") return false;
+  if (!workerAnswered(scope) || scope.capability.mode !== "active" || scope.state === "login_required" || scope.state === "unsupported") return false;
   if (held?.observedAt && held.revision === scope.revision && now - Date.parse(held.observedAt) < olderThan) return false;
   return !(attempt && attempt.revision === scope.revision && now - attempt.at < (attempt.signIn ? Math.max(olderThan, QUOTA_SIGN_IN_RETRY_MS) : olderThan));
 }

@@ -1,6 +1,10 @@
 import { z } from "zod";
 
 export const ENGINE_QUOTA_CAPABILITY = "engines.quota.v1";
+/** Additive Host capability: clients pass `?balances=currency` to receive non-`credits` currency
+ * balances; `engines.quota.v1` callers without it receive only `credits` balances so v1.6.0 clients
+ * with `z.literal("credits")` never fail schema parsing. */
+export const ENGINE_QUOTA_CURRENCY_CAPABILITY = "engines.quota.currency.v1";
 export const ENGINE_QUOTA_TTL_MS = 60_000;
 /** How long one explicit refresh may take inside an engine. Antigravity's `agy -p /usage` took 4 to 8 seconds
  * when measured (2026-11-22); Codex and Claude Code keep their own shorter limits. The Gateway and the Hub wait

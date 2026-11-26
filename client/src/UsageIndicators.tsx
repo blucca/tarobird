@@ -21,12 +21,16 @@ export function QuotaBattery({ left, height = 16 }: { left: number; height?: num
   </svg>;
 }
 
-function periodLabel(window: QuotaWindowView): string {
+export function periodLabel(window: QuotaWindowView, siblings?: readonly QuotaWindowView[]): string {
   const hours = (window.periodSeconds ?? 0) / 3600;
   const period = hours >= 48 && hours % 24 === 0 ? t("{0} 天", hours / 24) : hours >= 1 && Number.isInteger(hours) ? t("{0} 小时", hours) : undefined;
-  // The Host labels a per-model window "Opus · 7 days"; an unknown window keeps the engine's own name.
-  const model = /^(.+?) · /.exec(window.label)?.[1];
-  return period ? model ? `${model} · ${period}` : period : window.label;
+  // The Host labels a per-model or scoped window "Opus · 7 days" / "Coding · 30 days"; an unknown window keeps the engine's own name.
+  const rawPrefix = /^(.+?) · /.exec(window.label)?.[1];
+  const prefix = rawPrefix === "Coding" ? t("编程") : rawPrefix;
+  if (siblings && period && !rawPrefix && siblings.some(other => other.id !== window.id && other.periodSeconds === window.periodSeconds && !/^.+? · /.test(other.label))) {
+    return window.label;
+  }
+  return period ? prefix ? `${prefix} · ${period}` : period : window.label;
 }
 function clock(value: string, locale: Locale, now = new Date()): string {
   const date = new Date(value), sameDay = date.toDateString() === now.toDateString();
@@ -61,10 +65,13 @@ export function UsageDetails({ context, quota }: { context?: ContextView; quota?
       const windows = quota.windows.filter(window => window.pool === pool);
       return <section key={pool} aria-label={t("额度 · {0}", pool)}>
         <h4><QuotaBattery left={Math.min(...windows.map(window => window.left))} height={13}/>{t("额度 · {0}", pool)}</h4>
-        {windows.map(window => <div className="usage-window" key={window.id}>
-          <div className="usage-row"><b data-tone={usageTone(window.left)}>{periodLabel(window)}<span className="usage-gap"/>{window.left}%</b>{window.resetsAt && <span>{t("{0} 重置", clock(window.resetsAt, locale))}</span>}</div>
-          <Bar left={window.left} label={t("{0} 额度可用", periodLabel(window))}/>
-        </div>)}
+        {windows.map(window => {
+          const displayLabel = periodLabel(window, windows);
+          return <div className="usage-window" key={window.id}>
+            <div className="usage-row"><b data-tone={usageTone(window.left)}>{displayLabel}<span className="usage-gap"/>{window.left}%</b>{window.resetsAt && <span>{t("{0} 重置", clock(window.resetsAt, locale))}</span>}</div>
+            <Bar left={window.left} label={t("{0} 额度可用", displayLabel)}/>
+          </div>;
+        })}
       </section>;
     })}
     {quota && quota.blocked.length > 0 && <section aria-label={t("额度")}>

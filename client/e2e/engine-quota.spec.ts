@@ -243,7 +243,7 @@ test("quota discovery keeps not-loaded, unsupported, offline and partial directo
   try {
     f.records.coder!.snapshot = unavailableQuota("codex", "not_loaded");
     f.records.reviewer!.snapshot = unavailableQuota("codex", "offline");
-    await page.route("**/api/engine-quotas", async route => {
+    await page.route(/\/api\/engine-quotas(?:\?.*)?$/, async route => {
       const response = await route.fetch(); await route.fulfill({ response, json: { ...await response.json(), truncated: true } });
     });
     await f.open(); const panel = page.locator(".engine-quota:visible"), coder = panel.getByRole("region", { name: "Coding Bot · Codex", exact: true });
@@ -283,6 +283,8 @@ test("Kimi quota card renders plan windows, top-up balance, and distinct 404 / A
         windows: [
           { id: "five_hour", label: "5 hours", metric: "percent", usedPercent: 12, availability: "allowed", observedAt: stamp(), expiresAt: stamp(60_000), resetsAt: stamp(2 * 3_600_000), periodSeconds: 18_000 },
           { id: "seven_day", label: "7 days", metric: "percent", usedPercent: 30, availability: "allowed", observedAt: stamp(), expiresAt: stamp(60_000), resetsAt: stamp(5 * 86_400_000), periodSeconds: 604_800 },
+          { id: "month_total", label: "Monthly", metric: "percent", usedPercent: 20, availability: "allowed", observedAt: stamp(), expiresAt: stamp(60_000), periodSeconds: 30 * 86_400 },
+          { id: "month_code", label: "Coding · 30 days", metric: "percent", usedPercent: 25, availability: "allowed", observedAt: stamp(), expiresAt: stamp(60_000), periodSeconds: 30 * 86_400 },
         ],
         balances: [{ id: "top_up", kind: "currency", unit: "CNY", amount: "45.50", observedAt: stamp(), expiresAt: stamp(60_000) }],
         constraints: [],
@@ -295,18 +297,22 @@ test("Kimi quota card renders plan windows, top-up balance, and distinct 404 / A
     const kimi = panel.getByRole("region", { name: "Research Bot · Kimi", exact: true });
     await expect(kimi).toContainText("剩余 88%");
     await expect(kimi).toContainText("剩余 70%");
+    await expect(kimi).toContainText("Monthly");
+    await expect(kimi).toContainText("Coding · 30 days");
     await expect(kimi).toContainText("加油包余额");
     await expect(kimi).toContainText("45.50 CNY");
 
-    // 404 non-Kimi-For-Coding explanation.
-    f.records.research!.snapshot = unavailableQuota("kimi", "mode_not_supported", now, "other");
+    // 404 non-Kimi-For-Coding explanation keeps Refresh enabled so plan upgrades are discoverable.
+    f.records.research!.snapshot = { ...unavailableQuota("kimi", "mode_not_supported", now, "other"), capability: { mode: "active", reason: "mode_not_supported" } };
     await panel.getByRole("button", { name: "重新读取列表", exact: true }).click();
     await expect(kimi).toContainText("不是 Kimi For Coding 套餐账号");
+    await expect(kimi.getByRole("button", { name: "刷新", exact: true })).toBeEnabled();
 
-    // API key only explanation.
+    // API key only explanation hides Refresh because credential mode is local-only.
     f.records.research!.snapshot = unavailableQuota("kimi", "mode_not_supported", now, "api_key");
     await panel.getByRole("button", { name: "重新读取列表", exact: true }).click();
     await expect(kimi).toContainText("仅配置了 API Key");
+    await expect(kimi.getByRole("button")).toHaveCount(0);
 
     // Not signed in explanation.
     f.records.research!.snapshot = unavailableQuota("kimi", "login_required", now, "unknown");

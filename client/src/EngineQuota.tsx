@@ -97,7 +97,7 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
         const stale = !online || !!quota.error || !!quota.errors[scope.id] || scope.state === "stale" || quotaReadingExpired(scope, now);
         const status = stale ? t("待更新") : ({ ready: t("已读取"), stale: t("待更新"), unknown: t("尚无数据"), login_required: t("需要登录"), offline: t("离线"), unavailable: t("暂不可用"), unsupported: t("暂不支持") })[scope.state];
         const passive = scope.capability.mode === "passive";
-        const canRead = scope.capability.mode !== "unsupported" && scope.state !== "offline" && scope.state !== "unsupported" && scope.reason !== "host_upgrade_required";
+        const canRead = scope.capability.mode !== "unsupported" && scope.state !== "offline" && (scope.state !== "unsupported" || scope.capability.mode === "active") && scope.reason !== "host_upgrade_required";
         const cooling = !!scope.nextRefreshAt && Date.parse(scope.nextRefreshAt) > now;
         const busy = quota.busy.includes(scope.id), reason = reasonText(scope.reason ?? scope.capability.reason, scope.engine, scope.authMode);
         const help = scope.state === "ready" && !stale ? "" : helpText(scope.help);

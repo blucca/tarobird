@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { openSync, readSync, fstatSync, statSync, closeSync, constants } from "node:fs";
+import { openSync, readSync, readdirSync, fstatSync, statSync, closeSync, constants, type BigIntStats } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { QuotaAuthMode, QuotaEngine, QuotaSnapshot } from "../client-protocol/engine-quota.js";
@@ -39,14 +39,72 @@ function jsonRecord(text: string): Record<string, unknown> {
   return parsed;
 }
 
-function statFingerprint(file: string): string {
+const KIMI_MAX_DIR_ENTRIES = 256;
+const KIMI_MAX_DIR_DEPTH = 2;
+
+function formatStat(st: BigIntStats): string {
+  const kind = st.isDirectory() ? "d" : st.isFile() ? "f" : "o";
+  return `${kind}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+}
+
+function statMetadata(file: string): string {
   try {
-    const st = statSync(file);
-    return `${st.ino}:${st.size}:${Math.trunc(st.mtimeMs)}:${Math.trunc(st.ctimeMs)}`;
+    return formatStat(statSync(file, { bigint: true }));
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return "missing";
-    return "unreadable";
+    throw new Error("scope_unverifiable");
   }
+}
+
+function fingerprintKimiDir(dir: string, depth = 0): { meta: string; entries: unknown[]; fileCount: number } {
+  let st: BigIntStats;
+  try {
+    st = statSync(dir, { bigint: true });
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return { meta: "missing", entries: [], fileCount: 0 };
+    }
+    throw new Error("scope_unverifiable");
+  }
+  const meta = formatStat(st);
+  if (st.isFile()) return { meta, entries: [], fileCount: 1 };
+  if (!st.isDirectory()) throw new Error("scope_unverifiable");
+  if (depth >= KIMI_MAX_DIR_DEPTH) throw new Error("scope_unverifiable");
+
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return { meta: "missing", entries: [], fileCount: 0 };
+    }
+    throw new Error("scope_unverifiable");
+  }
+  if (names.length > KIMI_MAX_DIR_ENTRIES) throw new Error("scope_unverifiable");
+  names.sort();
+
+  const entries: unknown[] = [];
+  let fileCount = 0;
+  for (const name of names) {
+    const entryPath = path.join(dir, name);
+    let entryStat: BigIntStats;
+    try {
+      entryStat = statSync(entryPath, { bigint: true });
+    } catch {
+      throw new Error("scope_unverifiable");
+    }
+    if (entryStat.isDirectory()) {
+      const nested = fingerprintKimiDir(entryPath, depth + 1);
+      entries.push([name, nested.meta, nested.entries]);
+      fileCount += nested.fileCount;
+    } else if (entryStat.isFile()) {
+      entries.push([name, formatStat(entryStat)]);
+      if (name !== ".DS_Store") fileCount++;
+    } else {
+      throw new Error("scope_unverifiable");
+    }
+  }
+  return { meta, entries, fileCount };
 }
 
 /** Private in-memory scope guard. No credential values, hashes or file paths are emitted to logs/public DTOs. */
@@ -96,26 +154,43 @@ export class AdapterQuotaCache {
         material = [this.executable, engineHome, configured, settings, project, authText, env];
       } else if (this.engine === "kimi") {
         // Never read or copy Kimi's credential bytes; track login/config changes via filesystem metadata only.
+        // Any non-ENOENT error throws `scope_unverifiable`, failing closed instead of reusing stale quotas.
         const legacyHome = path.join(home, ".kimi");
-        const meta = [
-          statFingerprint(path.join(engineHome, "config.toml")),
-          statFingerprint(path.join(engineHome, "credentials")),
-          statFingerprint(path.join(engineHome, "credentials.json")),
-          statFingerprint(path.join(engineHome, "oauth.json")),
-          statFingerprint(path.join(legacyHome, "config.toml")),
-          statFingerprint(path.join(legacyHome, "credentials")),
-          statFingerprint(path.join(legacyHome, "credentials.json")),
+        const credDirs = [
+          fingerprintKimiDir(path.join(engineHome, "credentials")),
+          fingerprintKimiDir(path.join(engineHome, "oauth")),
+          fingerprintKimiDir(path.join(legacyHome, "credentials")),
+          fingerprintKimiDir(path.join(legacyHome, "oauth")),
         ];
-        const hasApiKeyOnly = Boolean(this.env.KIMI_API_KEY)
-          && meta[1] === "missing" && meta[2] === "missing" && meta[3] === "missing" && meta[5] === "missing" && meta[6] === "missing";
+        const metaFiles = [
+          statMetadata(path.join(engineHome, "config.toml")),
+          statMetadata(path.join(engineHome, "region")),
+          statMetadata(path.join(engineHome, "credentials.json")),
+          statMetadata(path.join(engineHome, "oauth.json")),
+          statMetadata(path.join(legacyHome, "config.toml")),
+          statMetadata(path.join(legacyHome, "region")),
+          statMetadata(path.join(legacyHome, "credentials.json")),
+          statMetadata(path.join(legacyHome, "oauth.json")),
+        ];
+        const hasCredentialFiles = credDirs.some(dir => dir.fileCount > 0)
+          || metaFiles[2] !== "missing"
+          || metaFiles[3] !== "missing"
+          || metaFiles[6] !== "missing"
+          || metaFiles[7] !== "missing";
+        const hasApiKeyOnly = Boolean(this.env.KIMI_API_KEY) && !hasCredentialFiles;
         const envFlags = [
           Boolean(this.env.KIMI_API_KEY),
           this.env.KIMI_CODE_HOME ?? "",
           this.env.KIMI_BASE_URL ?? "",
+          this.env.KIMI_CODE_BASE_URL ?? "",
+          this.env.KIMI_CODE_OAUTH_HOST ?? "",
+          this.env.KIMI_OAUTH_HOST ?? "",
+          this.env.KIMI_CODE_REGION ?? "",
+          this.env.KIMI_REGION ?? "",
         ];
         authMode = hasApiKeyOnly ? "api_key" : "subscription";
         verifiable = true;
-        material = [this.executable, engineHome, configured, meta, envFlags];
+        material = [this.executable, engineHome, configured, credDirs, metaFiles, envFlags];
       } else {
         const geminiHome = path.join(home, ".gemini");
         const settings = readBounded(path.join(engineHome, "settings.json"));

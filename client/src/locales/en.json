@@ -5677,5 +5677,6 @@
   "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed.",
   "当前仅配置了 API Key，未登录 Kimi For Coding 套餐账号，无套餐额度可读取。": "Only an API key is configured without a Kimi For Coding subscription login, so no plan quota is available.",
   "当前账号不是 Kimi For Coding 套餐账号（服务端返回 404），不提供编程套餐额度。": "This account is not a Kimi For Coding subscription account (404), so coding plan quotas are not available.",
-  "加油包余额": "Top-up balance"
+  "加油包余额": "Top-up balance",
+  "编程": "Coding"
 }

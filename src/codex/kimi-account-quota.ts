@@ -41,11 +41,12 @@ export type KimiQuotaSpawn = (
 ) => KimiQuotaChildLike;
 
 const MAX_STDOUT_BYTES = 64 * 1024;
+const MAX_HTTP_BODY_BYTES = 256 * 1024;
 const KIMI_WINDOWS: Array<{ key: "limit5h" | "limit7d" | "monthTotal" | "monthCode"; id: string; label: string; periodSeconds: number }> = [
   { key: "limit5h", id: "five_hour", label: "5 hours", periodSeconds: 18_000 },
   { key: "limit7d", id: "seven_day", label: "7 days", periodSeconds: 604_800 },
   { key: "monthTotal", id: "month_total", label: "Monthly", periodSeconds: 30 * 86_400 },
-  { key: "monthCode", id: "month_code", label: "Monthly coding", periodSeconds: 30 * 86_400 },
+  { key: "monthCode", id: "month_code", label: "Coding · 30 days", periodSeconds: 30 * 86_400 },
 ];
 
 type OwnedRead = { abort: AbortController; closed: Promise<void> };
@@ -94,14 +95,25 @@ export function parseKimiManagedUsage(payload: unknown, now = Date.now()): Quota
   if (data.kind === "error") {
     const status = typeof data.status === "number" ? data.status : undefined;
     const message = typeof data.message === "string" ? data.message : "";
-    if (status === 401 || /authorization failed|not logged in|unauthorized|try \/login|please login/i.test(message)) {
+    if (
+      status === 401
+      || /no token for|run \/login|re-?login required|authorization failed|not logged in|unauthorized|try \/login|please login/i.test(message)
+    ) {
       return unavailableQuota("kimi", "login_required", now, "unknown");
     }
     if (status === 404 || /usage endpoint not available|kimi for coding/i.test(message)) {
-      return unavailableQuota("kimi", "mode_not_supported", now, "other");
+      // Keep capability.mode="active" so the owner can explicitly refresh after upgrading to
+      // Kimi For Coding on the web without restarting the Host or modifying credential files.
+      return {
+        ...unavailableQuota("kimi", "mode_not_supported", now, "other"),
+        capability: { mode: "active", reason: "mode_not_supported" },
+      };
     }
     if (status === 429 || /rate.?limit|too many requests/i.test(message)) {
       return unavailableQuota("kimi", "rate_limited", now, "subscription");
+    }
+    if (status === 408 || status === 504 || /request timed out|timed out|\btimeout\b/i.test(message)) {
+      return unavailableQuota("kimi", "timeout", now, "subscription");
     }
     if (/api.?key/i.test(message)) {
       return unavailableQuota("kimi", "mode_not_supported", now, "api_key");
@@ -205,13 +217,75 @@ export function parseKimiManagedUsage(payload: unknown, now = Date.now()): Quota
   return parsed.data;
 }
 
-function isLoopbackOrigin(raw: string): boolean {
+export function normalizeLoopbackOrigin(raw: string): string | undefined {
   try {
     const u = new URL(raw);
-    return (u.protocol === "http:" || u.protocol === "https:") && (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1");
+    if (u.protocol !== "http:" && u.protocol !== "https:") return undefined;
+    if (u.username || u.password) return undefined;
+    if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost" && u.hostname !== "[::1]") return undefined;
+    return u.origin;
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+async function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    throw new Error("quota_aborted");
+  }
+  void promise.catch(() => undefined);
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error("quota_aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function readBoundedResponseText(res: Response, maxBytes: number, signal: AbortSignal): Promise<string> {
+  if (signal.aborted) throw new Error("quota_aborted");
+  const contentLengthHeader = res.headers?.get?.("content-length");
+  if (contentLengthHeader !== null && contentLengthHeader !== undefined && /^\d+$/.test(contentLengthHeader.trim())) {
+    if (Number(contentLengthHeader.trim()) > maxBytes) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new QuotaReadError("invalid_response");
+    }
+  }
+  if (res.body && typeof res.body.getReader === "function") {
+    const reader = res.body.getReader();
+    const onAbort = () => { void reader.cancel().catch(() => undefined); };
+    signal.addEventListener("abort", onAbort, { once: true });
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        if (signal.aborted) throw new Error("quota_aborted");
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader.cancel().catch(() => undefined);
+          throw new QuotaReadError("invalid_response");
+        }
+        chunks.push(value);
+      }
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      try { reader.releaseLock(); } catch { /* ignore */ }
+    }
+    if (signal.aborted) throw new Error("quota_aborted");
+    return Buffer.concat(chunks.map(chunk => Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)), totalBytes).toString("utf8");
+  }
+  const text = await res.text();
+  if (signal.aborted) throw new Error("quota_aborted");
+  if (Buffer.byteLength(text, "utf8") > maxBytes) throw new QuotaReadError("invalid_response");
+  return text;
 }
 
 /** Start a short-lived local `kimi web --port 0 --json`, query its loopback
@@ -256,13 +330,39 @@ export async function readOwnedKimiQuota(input: {
   };
 
   let child: KimiQuotaChildLike | undefined;
-  let childClosed = false;
+  let didClose = false;
+  let didStop = true;
   let childClosePromise: Promise<void> = Promise.resolve();
   let stopping: Promise<void> | undefined;
   const terminate = () => {
     if (!child) return Promise.resolve();
-    return stopping ??= stopChild(child);
+    if (didClose) return stopping ?? Promise.resolve();
+    if (!stopping) {
+      didStop = false;
+      stopping = stopChild(child).then(() => { didStop = true; });
+    }
+    return stopping;
   };
+  let stopWaitPromise: Promise<void> | undefined;
+  // Stopping the process tree and waiting for its close share one cleared 2 s allowance so the read
+  // finishes within its limit plus 2 s (inside ENGINE_QUOTA_HUB_REFRESH_MS) with no leaked timers.
+  const stopAndAwaitClose = (): Promise<void> => {
+    if (!child) return Promise.resolve();
+    return stopWaitPromise ??= (async () => {
+      const stopPromise = terminate();
+      if (didClose && didStop) return;
+      let stopTimer: ReturnType<typeof setTimeout> | undefined;
+      const allowance = new Promise<void>(resolve => { stopTimer = setTimeout(resolve, 2000); });
+      try {
+        await Promise.race([Promise.all([stopPromise, childClosePromise]), allowance]);
+      } finally {
+        if (stopTimer) clearTimeout(stopTimer);
+      }
+    })();
+  };
+
+  const onAbort = () => { void terminate(); };
+  abort.signal.addEventListener("abort", onAbort, { once: true });
 
   try {
     try {
@@ -280,27 +380,30 @@ export async function readOwnedKimiQuota(input: {
 
     let spawnErrorCode: string | undefined;
     childClosePromise = new Promise<void>(resolve => {
-      const done = () => { if (!childClosed) { childClosed = true; resolve(); } };
+      const done = () => { if (!didClose) { didClose = true; resolve(); } };
       child!.once("error", err => {
         spawnErrorCode = err && typeof err === "object" && "code" in err ? String(err.code) : "error";
         done();
       });
       child!.once("close", () => done());
     });
+    // Drain stderr continuously so diagnostic logs from `kimi web` never fill the OS pipe buffer and deadlock.
+    child.stderr?.on("data", () => undefined);
     child.stdin?.on?.("error", () => undefined);
     try { child.stdin?.end(); } catch { /* ignore */ }
+    if (abort.signal.aborted) void terminate();
 
     const ready = await new Promise<{ origin: string; token?: string } | { error: QuotaReason }>((resolve) => {
       let settled = false;
       const finish = (value: { origin: string; token?: string } | { error: QuotaReason }) => {
         if (settled) return;
         settled = true;
-        abort.signal.removeEventListener("abort", onAbort);
+        abort.signal.removeEventListener("abort", onReadyAbort);
         resolve(value);
       };
-      const onAbort = () => finish({ error: timedOut ? "timeout" : "cancelled" });
-      abort.signal.addEventListener("abort", onAbort, { once: true });
-      if (abort.signal.aborted) { onAbort(); return; }
+      const onReadyAbort = () => finish({ error: timedOut ? "timeout" : "cancelled" });
+      abort.signal.addEventListener("abort", onReadyAbort, { once: true });
+      if (abort.signal.aborted) { onReadyAbort(); return; }
 
       const decoder = new StringDecoder("utf8");
       let buf = "";
@@ -317,9 +420,10 @@ export async function readOwnedKimiQuota(input: {
           if (!trimmed.startsWith("{")) continue;
           try {
             const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-            const origin = typeof parsed.origin === "string" ? parsed.origin.trim() : "";
+            const rawOrigin = typeof parsed.origin === "string" ? parsed.origin.trim() : "";
+            const origin = rawOrigin ? normalizeLoopbackOrigin(rawOrigin) : undefined;
             const token = typeof parsed.token === "string" ? parsed.token.trim() : undefined;
-            if (origin && isLoopbackOrigin(origin)) {
+            if (origin) {
               finish({ origin, token });
               return;
             }
@@ -332,48 +436,71 @@ export async function readOwnedKimiQuota(input: {
     });
 
     if ("error" in ready) {
-      await terminate();
-      await Promise.race([childClosePromise, new Promise(r => setTimeout(r, 1500))]);
+      await stopAndAwaitClose();
+      if (abort.signal.aborted) return fail(timedOut ? "timeout" : "cancelled");
+      if (!didClose || !didStop) return fail("native_error");
       return fail(ready.error);
     }
 
     if (input.captureScope().revision !== input.scope.revision) {
-      await terminate();
-      await Promise.race([childClosePromise, new Promise(r => setTimeout(r, 1500))]);
+      await stopAndAwaitClose();
       return input.cache.failure(input.captureScope(), "auth_changed");
     }
 
-    const res = await fetchFn(`${ready.origin}/api/v1/oauth/usage`, {
+    const usageUrl = new URL("/api/v1/oauth/usage", ready.origin).toString();
+    const res = await raceWithAbort(fetchFn(usageUrl, {
       method: "GET",
       headers: ready.token ? { Authorization: `Bearer ${ready.token}` } : {},
       credentials: "omit",
+      redirect: "error",
       signal: abort.signal,
-    });
+    }), abort.signal);
 
-    await terminate();
-    await Promise.race([childClosePromise, new Promise(r => setTimeout(r, 1500))]);
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
+      clearTimeout(timer);
+      await stopAndAwaitClose();
+      const after = input.captureScope();
+      if (after.revision !== input.scope.revision) return input.cache.failure(after, "auth_changed");
+      if (abort.signal.aborted) return fail(timedOut ? "timeout" : "cancelled");
+      if (!didClose || !didStop) return fail("native_error");
+      // Local `kimi web` wraps upstream API errors (401/404/429) inside HTTP 200 envelopes.
+      // A raw HTTP 404 means this CLI version lacks `/api/v1/oauth/usage`, not a non-coding account.
+      if (res.status === 404) return fail("native_unverified");
+      if (res.status === 429) return fail("rate_limited");
+      return fail("native_error");
+    }
+
+    // Drain and parse the bounded HTTP response body BEFORE terminating `kimi web` so chunked
+    // responses are never aborted mid-stream.
+    const bodyText = await raceWithAbort(readBoundedResponseText(res, MAX_HTTP_BODY_BYTES, abort.signal), abort.signal);
+    let payload: unknown;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      throw new QuotaReadError("invalid_response");
+    }
+    const snapshot = parseKimiManagedUsage(payload, now());
+
+    clearTimeout(timer);
+    await stopAndAwaitClose();
 
     const after = input.captureScope();
     if (after.revision !== input.scope.revision) return input.cache.failure(after, "auth_changed");
     if (abort.signal.aborted) return fail(timedOut ? "timeout" : "cancelled");
-    if (res.status === 401 || res.status === 403) return fail("login_required", "unknown");
-    if (res.status === 404) return fail("mode_not_supported", "other");
-    if (res.status === 429) return fail("rate_limited");
-    if (!res.ok) return fail("native_error");
-
-    const payload = await res.json();
-    const snapshot = parseKimiManagedUsage(payload, now());
+    if (!didClose || !didStop) return fail("native_error");
     return input.cache.store(after, { snapshot });
   } catch (error) {
-    await terminate();
-    await Promise.race([childClosePromise, new Promise(r => setTimeout(r, 1500))]);
+    await stopAndAwaitClose();
     if (abort.signal.aborted) return fail(timedOut ? "timeout" : "cancelled");
+    if (!didClose || !didStop) return fail("native_error");
     const reason = error instanceof QuotaReadError ? error.reason : "native_error";
     return fail(reason);
   } finally {
     clearTimeout(timer);
     input.options.signal?.removeEventListener("abort", cancel);
-    void terminate();
+    abort.signal.removeEventListener("abort", onAbort);
+    await stopAndAwaitClose();
     closedResolve();
   }
 }
