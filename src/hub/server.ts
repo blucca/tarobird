@@ -110,8 +110,10 @@ import { pipeline } from "node:stream/promises";
 import { WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
 import { SERVER_CAPABILITIES, CHUNK_BYTES, MAX_FRAME_BYTES, blocksText, idSchema, messageSchema, pairingSchema, parseClientFrame, type Block, type CardElement, type ClientFrame, type Conversation, type HubEvent, type Json, type Message } from "../client-protocol/index.js";
-import { DISPATCH_CAPABILITY } from "../client-protocol/dispatch.js";
+import { DISPATCH_CAPABILITY, REMOTE_DISPATCH_TARGET_BOT } from "../client-protocol/dispatch.js";
 import { HubDispatch } from "./dispatch.js";
+import { handleRemoteDispatchRequest, readCrossHostDispatchGrants, readLocalHostLoad, updateCrossHostDispatchGrants, type RemoteDispatchContext } from "./dispatch-remote.js";
+import { BOT_PASSPORT_TTL_MS, type BotPassport } from "../client-protocol/bot-messages.js";
 import type { Bot } from "./store.js";
 /** Dispatcher engine workers are listed only to dispatch.v1 clients, which hide them. */
 const listedBots = (bots: Bot[], capabilities: string[]) => capabilities.includes(DISPATCH_CAPABILITY) ? bots : bots.filter(bot => bot.role !== "worker");
@@ -175,6 +177,7 @@ export class HubServer {
   readonly botMessages: BotMessages;
   readonly agentBuses: HubAgentBuses;
   readonly dispatch: HubDispatch;
+  private readonly remoteDispatchCtx: RemoteDispatchContext;
   readonly groupDiscussions: HubGroupDiscussions;
   readonly conversationHistory: HubConversationHistory;
   private readonly networkAbort = new AbortController();
@@ -374,6 +377,84 @@ export class HubServer {
       conversationCreated: (userId, conversation) => conversationsCreated(userId, [conversation]),
       stop: (botId, conversationId, userId, messageId) => this.callBot(botId, "stop", { conversationId, userId, messageId }),
     });
+    const remoteDispatchCtx: RemoteDispatchContext = {
+      store,
+      auth,
+      network: this.network,
+      attachments,
+      get workers() { return server.botManager ?? server.dispatch.workers; },
+      quotaScopes: async () => {
+        const quotas = hubEngineQuotas({
+          bots: () => store.bots("owner"),
+          validate: async () => undefined,
+          connection: id => { const connection = this.bots.get(id); return connection ? { key: connection, supported: connection.engineQuota, ready: connection.ready } : undefined; },
+          call: (id, request) => this.callBot(id, "quota.get", request, 2_000),
+        });
+        return (await quotas.directory()).scopes;
+      },
+      conversationCreated: (userId, conversation) => conversationsCreated(userId, [conversation]),
+      stop: (botId, conversationId, userId, messageId) => this.callBot(botId, "stop", { conversationId, userId, messageId }),
+    };
+    const server = this;
+    this.remoteDispatchCtx = remoteDispatchCtx;
+    this.botMessages.remoteDispatch = (passport, routePath, data, localAdmission) =>
+      handleRemoteDispatchRequest(remoteDispatchCtx, passport.sourceKey, passport.source, passport.targetBot, routePath, data, localAdmission);
+    this.dispatch.remote = {
+      ownHost: () => this.botMessages.ownSource(),
+      networkPeers: async () => {
+        const view = await this.network.view();
+        return (view.membership?.manifest.hosts ?? []).filter(h => h.publicKey !== auth.publicKey && h.state === "active" && !h.revoked);
+      },
+      localLoad: health => readLocalHostLoad(remoteDispatchCtx, health),
+      callPeer: async (peer, sourceBot, routePath, data, requestId) => {
+        const own = await this.botMessages.ownSource();
+        const body = Buffer.from(JSON.stringify(data));
+        const passport: BotPassport = {
+          v: 1,
+          sourceKey: auth.publicKey,
+          targetKey: peer.publicKey,
+          source: { hostId: own.hostId, hostName: own.hostName.slice(0, 256), botId: sourceBot.id, botName: sourceBot.name.slice(0, 256), requestId: requestId.slice(0, 128), hops: 1 },
+          targetBot: REMOTE_DISPATCH_TARGET_BOT,
+          method: "POST",
+          path: routePath,
+          digest: createHash("sha256").update(body).digest("hex"),
+          expiresAt: Date.now() + BOT_PASSPORT_TTL_MS,
+          nonce: randomUUID(),
+        };
+        const signed = { passport, signature: auth.signBotPassport(passport) };
+        return this.botMessages.exchange(peer, signed, body);
+      },
+      importAttachment: async (conversationId, ownerId, file, readChunk) => {
+        const hasher = createHash("sha256");
+        const created = await attachments.create(ownerId, {
+          conversationId,
+          name: file.name,
+          size: file.size,
+          mime: file.mime,
+          sha256: file.sha256 ?? createHash("sha256").update("").digest("hex"),
+        });
+        let offset = 0;
+        let index = 0;
+        let actualSha = file.sha256;
+        if (!file.sha256) {
+          // Read all chunks first if sha256 wasn't supplied? Remote always supplies sha256 from attachments table.
+          throw new HubError("remote_attachment_sha256_required", 502);
+        }
+        while (offset < file.size) {
+          const chunk = await readChunk(offset);
+          if (!chunk.length) break;
+          hasher.update(chunk);
+          await attachments.putChunk(ownerId, created.id, index, chunk);
+          offset += chunk.length;
+          index++;
+        }
+        if (offset !== file.size || hasher.digest("hex") !== actualSha) {
+          throw new HubError("remote_attachment_integrity_failed", 502);
+        }
+        await attachments.complete(ownerId, created.id);
+        return created.id;
+      },
+    };
     this.agentBuses = new HubAgentBuses(store, {
       workerCapable: (botId) => { const connection = this.bots.get(botId); return connection?.ready ? connection.agentBus : undefined; },
       stop: (botId, params) => this.callBot(botId, "agentBus.stop", params),
@@ -2256,24 +2337,46 @@ export class HubServer {
         }
         return;
       }
-      const dispatcher = route.match(/^\/api\/bots\/([A-Za-z0-9_-]+)\/(dispatcher|tickets|tickets\/dispatch|tickets\/update|dispatch-targets|dispatch-capabilities)$/);
+      const dispatcher = route.match(/^\/api\/bots\/([A-Za-z0-9_-]+)\/(dispatcher|tickets|tickets\/dispatch|tickets\/update|tickets\/plan|tickets\/bulk-action|dispatch-targets|dispatch-capabilities|dispatch-nodes)$/);
       if (dispatcher) {
         await requireOwner();
         const [, botId, kind] = dispatcher as unknown as [string, string, string], owner = { kind: "owner" as const, userId, validate: validateInQueue };
         if (kind === "dispatcher" && req.method === "GET") { await reply(200, await this.dispatch.settings(userId, botId)); return; }
         if (kind === "dispatcher" && req.method === "PUT") { const result = await this.dispatch.updateSettings(userId, botId, await this.jsonBody(req), validateInQueue); await this.store.audit("dispatch.settings_updated", session.deviceId, { botId }); await reply(200, result); return; }
         if (kind === "tickets" && req.method === "GET") {
-          const query = new URL(req.url ?? "/", "http://hub").searchParams, options = { open: query.get("open") === "1", capabilities: query.get("capabilities") === "1" };
+          const query = new URL(req.url ?? "/", "http://hub").searchParams, options = { open: query.get("open") === "1", capabilities: query.get("capabilities") === "1", excerpts: query.get("excerpts") === "1" };
           await reply(200, query.get("summary") === "1" ? await this.dispatch.overview(owner, botId, options) : await this.dispatch.list(owner, botId, options)); return;
         }
         if (kind === "tickets" && req.method === "POST") { await reply(201, await this.dispatch.create(owner, botId, await this.jsonBody(req))); return; }
         if (kind === "tickets/dispatch" && req.method === "POST") { await reply(200, await this.dispatch.dispatch(owner, botId, await this.jsonBody(req))); return; }
         if (kind === "tickets/update" && req.method === "POST") { await reply(200, await this.dispatch.update(owner, botId, await this.jsonBody(req))); return; }
+        if (kind === "tickets/plan" && req.method === "POST") { await reply(200, await this.dispatch.plan(owner, botId, await this.jsonBody(req))); return; }
+        if (kind === "tickets/bulk-action" && req.method === "POST") { await reply(200, await this.dispatch.bulkAction(userId, botId, await this.jsonBody(req), validateInQueue)); return; }
+        if (kind === "dispatch-nodes" && req.method === "GET") { await reply(200, await this.dispatch.nodes(owner, botId)); return; }
         if (kind === "dispatch-targets" && req.method === "GET") { await reply(200, await this.dispatch.targets(owner, botId)); return; }
         if (kind === "dispatch-capabilities" && req.method === "GET") {
           const query = new URL(req.url ?? "/", "http://hub").searchParams;
           await reply(200, await this.dispatch.capabilities(owner, botId, { ...Object.fromEntries(query), ...(query.has("offset") ? { offset: Number(query.get("offset")) } : {}) })); return;
         }
+      }
+      if (route === "/api/dispatch/load" && req.method === "GET") {
+        await requireOwner();
+        const health = await serial(async () => {
+          const rows = await this.store.db.all<{ engine: string; state: string; until: number | null; reason: string | null; updated_at: number }>("SELECT * FROM engine_health ORDER BY engine");
+          const now = Date.now();
+          return rows.flatMap(r => !(r.state === "cooldown" && r.until !== null && r.until <= now) ? [{ engine: r.engine as any, state: r.state as any, ...(r.until ? { until: r.until } : {}), ...(r.reason ? { reason: r.reason } : {}), updatedAt: r.updated_at }] : []);
+        });
+        await reply(200, await readLocalHostLoad(this.remoteDispatchCtx, health)); return;
+      }
+      if (route === "/api/dispatch/cross-host-grants" && (req.method === "GET" || req.method === "POST")) {
+        await requireOwner();
+        if (req.method === "GET") await reply(200, await readCrossHostDispatchGrants(this.remoteDispatchCtx, userId, validateInQueue));
+        else {
+          const input = z.object({ command: z.record(z.string(), z.unknown()), proof: deviceActionProofSchema }).strict().parse(await this.jsonBody(req));
+          await reply(200, await updateCrossHostDispatchGrants(this.remoteDispatchCtx, userId, session.deviceId, input.command, validateInQueue,
+            () => this.auth.consumeBotMessageGrant(session, hashSecret(networkCanonical(input.command)), input.proof)));
+        }
+        return;
       }
       const ticket = route.match(/^\/api\/tickets\/([A-Za-z0-9_-]+)(\/action|\/assists)?$/);
       if (ticket) {
@@ -2709,7 +2812,7 @@ export class HubServer {
       // The dispatcher's own engine session drives its ledger through the CLI. A
       // hidden worker reads targets for, and requests help within, its own
       // active ticket turn only; the Hub resolves that ticket from the turn.
-      const input = z.object({ operation: z.enum(["list", "show", "targets", "capabilities", "create", "dispatch", "update", "assist", "assist-status", "assists"]), contextMessage: idSchema.optional(), data: z.record(z.string(), z.unknown()).default({}) }).strict().parse(await this.jsonBody(req, 64 * 1024));
+      const input = z.object({ operation: z.enum(["list", "show", "targets", "capabilities", "nodes", "plan", "create", "dispatch", "update", "assist", "assist-status", "assists"]), contextMessage: idSchema.optional(), data: z.record(z.string(), z.unknown()).default({}) }).strict().parse(await this.jsonBody(req, 64 * 1024));
       const guard = async () => {
         const current = await this.store.db.get<{ secret_hash: string }>("SELECT secret_hash FROM bots WHERE id=? AND deleted_at IS NULL", [botId]);
         if (!current || current.secret_hash !== record.secret_hash) throw new HubError("instance_unauthorized", 401);
@@ -2727,6 +2830,8 @@ export class HubServer {
         : input.operation === "show" ? await this.dispatch.show(actor, idSchema.parse(input.data.ticketId))
         : input.operation === "targets" ? await this.dispatch.targets(actor, botId)
         : input.operation === "capabilities" ? await this.dispatch.capabilities(actor, botId, input.data)
+        : input.operation === "nodes" ? await this.dispatch.nodes(actor, botId)
+        : input.operation === "plan" ? await this.dispatch.plan(actor, botId, input.data)
         : input.operation === "create" ? await this.dispatch.create(actor, botId, input.data)
         : input.operation === "dispatch" ? await this.dispatch.dispatch(actor, botId, input.data)
         : await this.dispatch.update(actor, botId, input.data);

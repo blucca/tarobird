@@ -98,6 +98,14 @@ export class HubDatabase {
         if (!conversationColumns.some((c) => c.name === "binding_id")) await result.exec("ALTER TABLE conversations ADD COLUMN binding_id TEXT");
         if (!conversationColumns.some((c) => c.name === "hidden")) await result.exec("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0");
         if (!conversationColumns.some((c) => c.name === "ticket_json")) await result.exec("ALTER TABLE conversations ADD COLUMN ticket_json TEXT");
+        const ticketColumns = await result.all<{ name: string }>("PRAGMA table_info(dispatch_tickets)");
+        if (!ticketColumns.some((c) => c.name === "batch_id")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN batch_id TEXT");
+        if (!ticketColumns.some((c) => c.name === "batch_index")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN batch_index INTEGER");
+        if (!ticketColumns.some((c) => c.name === "batch_total")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN batch_total INTEGER");
+        if (!ticketColumns.some((c) => c.name === "host_id")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN host_id TEXT");
+        if (!ticketColumns.some((c) => c.name === "host_name")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN host_name TEXT");
+        if (!ticketColumns.some((c) => c.name === "artifacts_json")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN artifacts_json TEXT");
+        await result.exec("CREATE INDEX IF NOT EXISTS dispatch_tickets_batch ON dispatch_tickets(batch_id,batch_index) WHERE batch_id IS NOT NULL");
         if (version && Number(version.value) < 11) {
           // Old tombstones have empty blocks. Read their own retained events
           // in small pages, using the protocol's attachment traversal so button
@@ -345,6 +353,10 @@ CREATE INDEX IF NOT EXISTS dispatch_assists_child ON dispatch_assists(child_atte
 CREATE INDEX IF NOT EXISTS dispatch_assists_continuation ON dispatch_assists(continuation_attempt_id) WHERE continuation_attempt_id IS NOT NULL;
 -- Assistance allowed since the ticket's latest dispatch; continuations keep it.
 CREATE TABLE IF NOT EXISTS dispatch_assist_windows (ticket_id TEXT PRIMARY KEY REFERENCES dispatch_tickets(id), attempt_id TEXT NOT NULL, remaining INTEGER NOT NULL);
+-- Cross-host remote execution ledger on receiving Hosts and idempotent batch summaries.
+CREATE TABLE IF NOT EXISTS remote_dispatch_tickets (id TEXT PRIMARY KEY, source_key TEXT NOT NULL, source_host_id TEXT NOT NULL, source_bot_id TEXT NOT NULL, remote_request_id TEXT NOT NULL, title TEXT NOT NULL, request TEXT NOT NULL, engine TEXT NOT NULL, model TEXT NOT NULL, effort TEXT NOT NULL, bot_id TEXT NOT NULL, conversation_id TEXT NOT NULL, input_message_id TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(source_key,source_bot_id,remote_request_id));
+CREATE INDEX IF NOT EXISTS remote_dispatch_tickets_status ON remote_dispatch_tickets(status);
+CREATE TABLE IF NOT EXISTS dispatch_batch_summaries (batch_id TEXT PRIMARY KEY, dispatcher_bot_id TEXT NOT NULL, conversation_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL);
 ${MESSAGE_ACTIVITY_SCHEMA}
 ${EVENT_HISTORY_SCHEMA}
 `;

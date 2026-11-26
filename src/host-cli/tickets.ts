@@ -1,16 +1,22 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveBotTarget } from "../client-protocol/bot-messages.js";
+import { networkCanonical } from "../client-protocol/private-network.js";
 import { z } from "zod";
-import { DISPATCH_ENGINES, dispatchEngineSchema, dispatchCapabilitiesRequestSchema, dispatcherSettingsSchema, type DispatcherSettings } from "../client-protocol/dispatch.js";
+import {
+  DISPATCH_ENGINES, dispatchEngineSchema, dispatchCapabilitiesRequestSchema, dispatcherSettingsSchema,
+  crossHostDispatchGrantCommandSchema, dispatchSplitPlanRequestSchema, ticketBulkActionSchema,
+  type DispatcherSettings,
+} from "../client-protocol/dispatch.js";
 import { requestTicketAssistanceSchema } from "../client-protocol/dispatch-assistance.js";
 import { instanceEndpoint } from "./bot-messages.js";
 import { HostCliError, LocalHostClient } from "./client.js";
 
 export type TicketOptions = { bot?: string; engine?: string; title?: string; text?: string; "text-file"?: string; model?: string; effort?: string; force?: boolean; status?: string; note?: string;
-  open?: boolean; match?: string; offset?: string; assist?: string; "request-id"?: string; "context-message"?: string; "dispatch-mode"?: string; "max-concurrent"?: string; allow?: string; revision?: string };
-const OWNER_ONLY = ["pause", "resume", "cancel", "accept", "remove", "engine-reset", "settings"];
+  open?: boolean; match?: string; offset?: string; assist?: string; "request-id"?: string; "context-message"?: string; "dispatch-mode"?: string; "max-concurrent"?: string; allow?: string; revision?: string;
+  host?: string; total?: string; "per-node"?: string; create?: boolean; dispatch?: boolean; action?: string; batch?: string; from?: string; allowed?: string };
+const OWNER_ONLY = ["pause", "resume", "cancel", "accept", "remove", "engine-reset", "settings", "bulk-action", "allow-remote", "revoke-remote", "load", "remote-grants"];
 function contextError(missing: boolean, status?: number): HostCliError {
   const error = new HostCliError("dispatch_context_not_active", status);
   error.message += missing
@@ -34,7 +40,7 @@ export function allowedEnginesOption(value: string | undefined): DispatcherSetti
 /** `tarobot tickets …`. Inside a dispatcher Bot's turn this uses the Bot's own
  * identity and the turn context; otherwise it is the local owner controller. */
 export async function runTicketsCommand(directory: string, sub: string | undefined, argument: string | undefined, options: TicketOptions, receipt: (id: string) => void): Promise<unknown> {
-  const commands = ["list", "show", "targets", "capabilities", "create", "dispatch", "update", "assist", "assist-status", "assists", "engines", ...OWNER_ONLY];
+  const commands = ["list", "show", "targets", "nodes", "plan", "capabilities", "create", "dispatch", "update", "assist", "assist-status", "assists", "engines", ...OWNER_ONLY];
   if (!sub || !commands.includes(sub)) throw new Error(`请使用 tickets ${commands.join("|")}。`);
   const capabilityQuery = sub === "capabilities" ? dispatchCapabilitiesRequestSchema.parse({ engine: required(options.engine, "缺少 --engine。"), ...(options.match !== undefined ? { match: options.match } : {}), ...(options.offset !== undefined ? { offset: Number(options.offset) } : {}) }) : undefined;
   const botId = process.env.TAROBOT_ACTIVE_INSTANCE ?? process.env.TAROBOT_INSTANCE;
@@ -42,7 +48,7 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
     if (OWNER_ONLY.includes(sub)) throw new Error(`tickets ${sub} 只能由主人在本机 CLI 或 App 中执行。`);
     if (options.bot && options.bot !== botId) throw new Error("调度 Bot 只能管理自己的工单；不要传 --bot。");
     const contextMessage = options["context-message"] ?? process.env.TAROBOT_MESSAGE_ID;
-    if (["create", "dispatch", "update", "assist", "assist-status"].includes(sub) && !contextMessage) throw contextError(true);
+    if ((["create", "dispatch", "update", "assist", "assist-status"].includes(sub) || (sub === "plan" && (options.create || options.dispatch))) && !contextMessage) throw contextError(true);
     const endpoint = await instanceEndpoint(directory, botId);
     const call = async (operation: string, data: Record<string, unknown> = {}) => {
       try { return await endpoint.post("/api/instance/tickets", { operation, ...(contextMessage ? { contextMessage } : {}), data }); }
@@ -55,6 +61,7 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
     if (sub === "engines") return { engines: (await call("list", { open: true })).engines };
     if (sub === "show") return call("show", { ticketId: required(argument, "缺少工单 ID。") });
     if (sub === "targets") return call("targets");
+    if (sub === "nodes") return call("nodes");
     if (sub === "assist-status") return call("assist-status");
     if (sub === "assists") return call("assists", { ticketId: required(argument, "缺少工单 ID。") });
     if (capabilityQuery) return call("capabilities", capabilityQuery);
@@ -63,6 +70,18 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
   if (sub === "assist" || sub === "assist-status") throw new Error(`tickets ${sub} 只供正在执行工单的 Worker 使用；请从幕僚长对话安排任务，或用 tickets assists 工单ID 查看协助记录。`);
   const client = await LocalHostClient.connect(directory);
   try {
+    if (sub === "load") return client.request("/api/dispatch/load");
+    if (sub === "remote-grants") return client.request("/api/dispatch/cross-host-grants");
+    if (sub === "allow-remote" || sub === "revoke-remote") {
+      const command = crossHostDispatchGrantCommandSchema.parse({
+        operation: "cross-host-dispatch-grant",
+        sourceHost: required(options.from, "缺少 --from（远端主机 ID，如 hub_...）。"),
+        sourceBot: required(options.bot, "缺少 --bot（远端幕僚长 Bot ID）。"),
+        allowed: sub === "allow-remote",
+      });
+      const proof = await client.deviceAction({ operation: "bot-message-grant", target: createHash("sha256").update(networkCanonical(command)).digest("hex") });
+      return client.request("/api/dispatch/cross-host-grants", "POST", { command, proof });
+    }
     const dispatchers = client.ready.bots.filter(bot => bot.role === "dispatcher" && !bot.deletedAt);
     const dispatcher = () => {
       if (options.bot) return resolveBotTarget(options.bot, dispatchers, "dispatcher");
@@ -79,9 +98,20 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
     if (sub === "show") return client.request(ticketRoute(required(argument, "缺少工单 ID。")));
     if (sub === "assists") return client.request(`${ticketRoute(required(argument, "缺少工单 ID。"))}/assists`);
     if (sub === "targets") return client.request(`/api/bots/${dispatcher().id}/dispatch-targets`);
+    if (sub === "nodes") return client.request(`/api/bots/${dispatcher().id}/dispatch-nodes`);
     if (capabilityQuery) {
       const query = new URLSearchParams({ engine: capabilityQuery.engine, offset: String(capabilityQuery.offset), ...(capabilityQuery.match !== undefined ? { match: capabilityQuery.match } : {}) });
       return client.request(`/api/bots/${dispatcher().id}/dispatch-capabilities?${query}`);
+    }
+    if (sub === "bulk-action") {
+      const requestId = options["request-id"] ?? randomUUID(); receipt(requestId);
+      const body = ticketBulkActionSchema.parse({
+        requestId,
+        action: required(options.action, "缺少 --action（pause|resume|cancel）。"),
+        ...(options.host !== undefined ? { hostId: options.host } : {}),
+        ...(options.batch !== undefined ? { batchId: options.batch } : {}),
+      });
+      return client.request(`/api/bots/${dispatcher().id}/tickets/bulk-action`, "POST", body);
     }
     if (["pause", "resume", "cancel", "accept", "remove"].includes(sub)) {
       const requestId = options["request-id"] ?? randomUUID(); receipt(requestId);
@@ -116,10 +146,28 @@ async function mutation(sub: string, argument: string | undefined, options: Tick
     const requestId = options["request-id"] ?? randomUUID(); receipt(requestId);
     return { requestId, title: required(options.title, "缺少 --title。"), request: required(await textOf(options), "缺少 --text 或 --text-file（工单要求）。") };
   }
+  if (sub === "plan") {
+    const requestId = options["request-id"] ?? randomUUID();
+    if (options.create || options.dispatch) receipt(requestId);
+    const request = required(await textOf(options), "缺少 --text 或 --text-file（待拆分任务要求）。");
+    return dispatchSplitPlanRequestSchema.parse({
+      requestId,
+      request,
+      ...(options.title !== undefined ? { title: options.title } : {}),
+      ...(options.engine !== undefined ? { engine: dispatchEngineSchema.parse(options.engine) } : {}),
+      ...(options.model !== undefined ? { model: options.model } : {}),
+      ...(options.effort !== undefined ? { effort: options.effort } : {}),
+      ...(options.total !== undefined ? { totalItems: Number(options.total) } : {}),
+      ...(options["per-node"] !== undefined ? { perNode: Number(options["per-node"]) } : {}),
+      ...(options.create ? { create: true } : {}),
+      ...(options.dispatch ? { dispatch: true } : {}),
+    });
+  }
   if (sub === "dispatch") {
     const requestId = options["request-id"] ?? randomUUID(); receipt(requestId);
     const text = await textOf(options);
     return { requestId, ticketId: required(argument, "缺少工单 ID。"), engine: dispatchEngineSchema.parse(required(options.engine, `缺少 --engine（${DISPATCH_ENGINES.join("|")}）。`)),
+      ...(options.host !== undefined ? { hostId: options.host } : {}),
       ...(options.model !== undefined ? { model: options.model } : {}), ...(options.effort !== undefined ? { effort: options.effort } : {}), ...(text ? { text } : {}), ...(options.force ? { force: true } : {}),
       ...(options.assist !== undefined ? { assist: z.number().int().min(0).max(2).parse(Number(options.assist)) } : {}) };
   }

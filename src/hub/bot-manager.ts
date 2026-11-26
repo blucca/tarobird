@@ -243,6 +243,35 @@ export class BotManager {
     await mkdir(directory, { recursive: true, mode: 0o700 });
     return directory;
   }
+  /** Hidden worker Bot on a receiving Host for cross-host Superagent tickets. */
+  async remoteDispatchWorker(sourceHostId: string, engine: InstanceEngine, validate?: TransactionGuard): Promise<string> {
+    idSchema.parse(sourceHostId);
+    const key = `remote-dispatch-worker:${sourceHostId}:${engine}`;
+    const existingId = await this.store.db.serial(async () => {
+      await validate?.();
+      const row = await this.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [key]);
+      if (!row) return undefined;
+      const bot = await this.store.db.get<{ id: string }>("SELECT id FROM bots WHERE id=? AND deleted_at IS NULL", [row.value]);
+      return bot?.id;
+    });
+    if (existingId) return existingId;
+    const label = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi" }[engine];
+    const workspace = path.join(this.directory, "remote-dispatch", sourceHostId);
+    await mkdir(workspace, { recursive: true, mode: 0o700 });
+    const permission = defaultPermission(engine) === "bypass" ? "bypass" : "normal";
+    const requestId = `rdw_${createHash("sha256").update(`${sourceHostId}:${engine}`).digest("hex").slice(0, 20)}`;
+    const bot = await this.create("owner", { requestId, name: `Remote · ${label}`, engine, model: "", effort: "", workspace, role: "worker", permission }, validate, { internal: true });
+    await this.store.db.transaction(async () => {
+      await validate?.();
+      await this.store.db.run("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, bot.id]);
+    });
+    return bot.id;
+  }
+  async remoteTicketWorkspace(sourceHostId: string, remoteTicketId: string): Promise<string> {
+    const directory = path.join(this.directory, "remote-dispatch", idSchema.parse(sourceHostId), "tickets", idSchema.parse(remoteTicketId));
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    return directory;
+  }
   private async prepare(row: Managed): Promise<string> {
     const spec = createBotSchema.parse(JSON.parse(row.specification_json));
     const stateDir = path.join(this.directory, "bots", row.bot_id); await mkdir(stateDir, { recursive: true, mode: 0o700 });

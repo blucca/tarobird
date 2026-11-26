@@ -1,7 +1,8 @@
 import { Fragment, useEffect, useRef, useState } from "react";
-import { ChevronRight, ListChecks } from "lucide-react";
-import { OPEN_TICKET_STATUSES, dispatchTicketSchema, engineHealthSchema, ticketOverviewListSchema, type EngineHealth, type TicketAction, type TicketOverview, type TicketOverviewList, type TicketStatus } from "../../src/client-protocol/dispatch.js";
+import { ChevronRight, ListChecks, Paperclip, Server } from "lucide-react";
+import { OPEN_TICKET_STATUSES, dispatchTicketSchema, engineHealthSchema, ticketOverviewListSchema, type DispatchTicket, type EngineHealth, type TicketAction, type TicketOverview, type TicketOverviewList, type TicketStatus } from "../../src/client-protocol/dispatch.js";
 import type { HubConnection } from "./connection.js";
+import { botMessageHostId } from "./bot-message-hosts.js";
 import { HubHttpError } from "./http-error.js";
 import { t, useLocale } from "./i18n.js";
 import "./dispatch.css";
@@ -44,8 +45,10 @@ function engineNotice(health: EngineHealth, locale: string) {
  * conversations stay hidden and open from here. */
 export function DispatchTickets({ connection, botId, active, online, open }: { connection: HubConnection; botId: string; active: boolean; online: boolean; open: (conversationId: string) => void }) {
   const locale = useLocale() === "en" ? "en" : "zh-CN";
+  const ownHostId = connection.identity.hubPublicKey ? botMessageHostId(connection.identity.hubPublicKey) : undefined;
   const [list, setList] = useState<TicketOverviewList>(), [expanded, setExpanded] = useState(false);
-  const [busy, setBusy] = useState(""), [confirming, setConfirming] = useState<{ id: string; action: "cancel" | "remove" }>(), [error, setError] = useState(""), [refresh, setRefresh] = useState(0);
+  const [busy, setBusy] = useState(""), [confirming, setConfirming] = useState<{ id: string; action: "cancel" | "remove" }>(), [confirmBulkCancel, setConfirmBulkCancel] = useState(false), [error, setError] = useState(""), [refresh, setRefresh] = useState(0);
+  const [detailId, setDetailId] = useState(""), [details, setDetails] = useState<Record<string, DispatchTicket>>({});
   // An unconfirmed action keeps its request ID until a later read shows its
   // effect or a later action on the ticket succeeds. Progress such as a new
   // question or note is not proof either way, so it never changes the ID.
@@ -62,7 +65,7 @@ export function DispatchTickets({ connection, botId, active, online, open }: { c
       if (reading || controller.signal.aborted || document.visibilityState === "hidden") return;
       reading = true; const read = beginTicketRead(connection, botId), local = ++reads.current, request = queueRequest([controller.signal], 8000);
       try {
-        const value = ticketOverviewListSchema.parse(await request.wait(connection.http(`/api/bots/${encodeURIComponent(botId)}/tickets?summary=1&capabilities=1`, { signal: request.signal })));
+        const value = ticketOverviewListSchema.parse(await request.wait(connection.http(`/api/bots/${encodeURIComponent(botId)}/tickets?summary=1&capabilities=1&excerpts=1`, { signal: request.signal })));
         if (!controller.signal.aborted && local === reads.current) {
           // Only a read started after the action ended can show its effect.
           for (const [key, entry] of pending.current) {
@@ -105,37 +108,129 @@ export function DispatchTickets({ connection, botId, active, online, open }: { c
     catch (cause) { if (alive.current) setError(actionError(cause)); }
     finally { request.dispose(); if (alive.current) setBusy(""); }
   };
+  const bulk = async (action: "pause" | "resume" | "cancel") => {
+    if (busy) return;
+    const requestId = `bulk_${crypto.randomUUID()}`;
+    setBusy(`bulk:${action}`); setError(""); setConfirmBulkCancel(false); reads.current++;
+    const request = queueRequest([], 25_000);
+    try {
+      await request.wait(connection.http(`/api/bots/${encodeURIComponent(botId)}/tickets/bulk-action`, { method: "POST", body: JSON.stringify({ requestId, action }), signal: request.signal }));
+    } catch (cause) {
+      if (alive.current) setError(actionError(cause, action));
+    } finally { request.dispose(); reads.current++; if (alive.current) { setBusy(""); setRefresh(value => value + 1); } }
+  };
+  const reassign = async (ticket: TicketOverview) => {
+    const attempt = ticket.attempts.at(-1);
+    if (busy || !attempt) return;
+    const requestId = `reassign_${crypto.randomUUID()}`;
+    setBusy(ticket.id); setError(""); reads.current++;
+    const request = queueRequest([], 25_000);
+    try {
+      const next = dispatchTicketSchema.parse(await request.wait(connection.http(`/api/bots/${encodeURIComponent(botId)}/tickets/dispatch`, {
+        method: "POST",
+        body: JSON.stringify({ requestId, ticketId: ticket.id, engine: attempt.engine, ...(attempt.model ? { model: attempt.model } : {}), ...(attempt.effort ? { effort: attempt.effort } : {}), hostId: "auto" }),
+        signal: request.signal,
+      })));
+      if (alive.current) setList(value => value && { ...value, tickets: value.tickets.map(item => item.id === next.id ? next : item) });
+    } catch (cause) {
+      if (alive.current) setError(actionError(cause));
+    } finally { request.dispose(); reads.current++; if (alive.current) { setBusy(""); setRefresh(value => value + 1); } }
+  };
+  const toggleDetail = async (ticket: TicketOverview) => {
+    if (detailId === ticket.id) { setDetailId(""); return; }
+    setDetailId(ticket.id);
+    if (details[ticket.id]) return;
+    try {
+      const full = dispatchTicketSchema.parse(await connection.http(`/api/tickets/${encodeURIComponent(ticket.id)}`));
+      if (alive.current) setDetails(prev => ({ ...prev, [ticket.id]: full }));
+    } catch { /* Excerpt stays visible even if detail fetch fails. */ }
+  };
   const tickets = [...list?.tickets ?? []].sort((a, b) => Number(isOpen(b)) - Number(isOpen(a)) || b.updatedAt - a.updatedAt);
   const engines = (list?.engines ?? []).filter(health => health.state !== "ok");
   if (!tickets.length && !engines.length) return null;
   const openTickets = tickets.filter(isOpen), shown = expanded, now = Date.now();
+  const hasPausedOpen = openTickets.some(ticket => ticket.paused), hasActiveOpen = openTickets.some(ticket => !ticket.paused);
   const counts = (["needs_answer", "needs_review", "blocked", "working", "queued"] as const).map(status => [status, openTickets.filter(ticket => displayStatus(ticket) === status).length] as const).filter(([, count]) => count);
   const summary = counts.length ? counts.map(([status, count]) => `${count} ${statusLabel(status)}`).join(" · ") : t("没有进行中的工单");
+  const hasCrossHost = tickets.some(ticket => !!(ticket.hostId ?? ticket.attempts.at(-1)?.hostId));
+  const nodeGroups = hasCrossHost ? (() => {
+    const groups = new Map<string, { key: string; hostName: string; items: TicketOverview[] }>();
+    for (const ticket of tickets) {
+      const attempt = ticket.attempts.at(-1);
+      const hostId = ticket.hostId ?? attempt?.hostId ?? ownHostId ?? "local";
+      const hostName = ticket.hostName ?? attempt?.hostName ?? t("本机");
+      const existing = groups.get(hostId);
+      if (existing) existing.items.push(ticket);
+      else groups.set(hostId, { key: hostId, hostName, items: [ticket] });
+    }
+    return [...groups.values()];
+  })() : undefined;
+  const crossHostSupported = !!connection.state.crossHostDispatchAvailable;
+  const renderTicket = (ticket: TicketOverview) => {
+    const attempt = ticket.attempts.at(-1), stopping = !!attempt?.stopRequested && !attempt.endedAt, open_ = isOpen(ticket), disabled = !online || !!busy;
+    const ticketHostId = ticket.hostId ?? attempt?.hostId;
+    const ticketHostName = ticket.hostName ?? attempt?.hostName;
+    const isRemote = !!(ticketHostId && (!ownHostId || ticketHostId !== ownHostId));
+    const canReassign = !!(open_ && crossHostSupported && attempt && (ticket.status === "blocked" || (ticket.status === "queued" && !!attempt.failure)));
+    const detail = detailId === ticket.id ? details[ticket.id] : undefined;
+    const artifactsCount = ticket.artifacts?.length ?? 0;
+    return <li key={ticket.id} className="dispatch-ticket" data-status={ticket.status} data-ticket-id={ticket.id}>
+      <div className="dispatch-ticket-heading"><strong title={ticket.title}>{ticket.title}</strong>{ticket.batchIndex !== undefined && ticket.batchTotal !== undefined && <span className="dispatch-ticket-batch">{t("批次 {0}/{1}", ticket.batchIndex + 1, ticket.batchTotal)}</span>}{!nodeGroups && ticketHostName && <span className="dispatch-ticket-host">{ticketHostName}</span>}{ticket.paused && open_ && !stopping && <span className="dispatch-ticket-paused">{t("已暂停")}</span>}<span className="dispatch-ticket-status">{stopping ? t(attempt.stopRequested === "cancel" ? "正在取消" : "正在暂停") : statusLabel(displayStatus(ticket))}</span></div>
+      {attempt?.waitingFor && !attempt.endedAt && !stopping && <p role="status">{isRemote ? t("远端主机等待确认或回答。") : t("打开执行会话，处理问题或权限审批。")}</p>}
+      {stopping && <p role="status">{t("正在等待执行停止，确认结束后才能继续。")}</p>}
+      {attempt?.failure && !stopping && <p className="dispatch-ticket-failure" role="status">{attempt.failure.message || attempt.failure.category}</p>}
+      {ticket.resultExcerpt && <p className="dispatch-ticket-excerpt">{ticket.resultExcerpt}</p>}
+      <div className="dispatch-ticket-meta"><span>{[attempt ? [ENGINE_NAMES[attempt.engine] ?? attempt.engine, attempt.model || t("默认模型"), attempt.effort].filter(Boolean).join(" · ") : "", artifactsCount === 1 ? t("1 个文件") : artifactsCount > 1 ? t("{0} 个文件", artifactsCount) : ""].filter(Boolean).join(" · ")}</span><time dateTime={new Date(ticket.updatedAt).toISOString()}>{when(ticket.updatedAt, locale, now)}</time></div>
+      <div className="dispatch-ticket-actions">
+        {attempt && !isRemote && <button type="button" onClick={() => open(attempt.conversationId)}>{t("打开")}</button>}
+        {isRemote && <button type="button" onClick={() => void toggleDetail(ticket)}>{detailId === ticket.id ? t("收起详情") : t("查看结果")}</button>}
+        {canReassign && <button type="button" disabled={disabled} onClick={() => void reassign(ticket)}>{t("改派重试")}</button>}
+        {ticket.status === "needs_review" && <button type="button" disabled={disabled} onClick={() => void act(ticket, "accept")}>{t("验收")}</button>}
+        {open_ && <button type="button" disabled={disabled || stopping} onClick={() => void act(ticket, ticket.paused ? "resume" : "pause")}>{ticket.paused && !stopping ? t("继续") : t("暂停")}</button>}
+        {open_ && <button type="button" disabled={disabled} onClick={() => setConfirming({ id: ticket.id, action: "cancel" })}>{t("取消")}</button>}
+        {!open_ && list?.capabilities?.remove === true && <button type="button" disabled={disabled || ticket.attempts.some(item => !item.endedAt)} onClick={() => setConfirming({ id: ticket.id, action: "remove" })}>{t("移除")}</button>}
+      </div>
+      {detailId === ticket.id && <div className="dispatch-ticket-detail">
+        <p>{detail?.result || ticket.resultExcerpt || detail?.note || t("暂无结果摘要。")}</p>
+        {!!(detail?.artifacts?.length ?? ticket.artifacts?.length) && <ul className="dispatch-ticket-artifacts">
+          {(detail?.artifacts ?? ticket.artifacts ?? []).map(file => <li key={file.id}><Paperclip size={11}/><span>{file.name}</span></li>)}
+        </ul>}
+      </div>}
+      {confirming?.id === ticket.id && <div className="prompt-queue-confirm" ref={confirmation}>
+        <p className="prompt-queue-confirm-title">{t(confirming.action === "remove" ? "移除这张工单？" : "取消这张工单？")}</p>
+        <p className="prompt-queue-confirm-description">{t(confirming.action === "remove" ? "从此幕僚长的工单列表移除，保留执行对话和生成文件。" : "正在进行的工作会停止，对话记录保留。")}</p>
+        <div className="prompt-queue-confirm-actions"><button type="button" className="prompt-queue-keep" onClick={() => setConfirming(undefined)}>{t("保留")}</button><button type="button" className="primary" disabled={disabled} onClick={() => void act(ticket, confirming.action)}>{t(confirming.action === "remove" ? "确认移除工单" : "确认取消工单")}</button></div>
+      </div>}
+    </li>;
+  };
   return <section className="dispatch-tickets" aria-label={t("工单")}>
     {tickets.length > 0 && <button type="button" className="dispatch-tickets-trigger" aria-label={`${t("工单 {0}", tickets.length)} · ${summary}`} aria-expanded={shown} onClick={() => setExpanded(!shown)}><ListChecks size={15}/><span>{t("工单 {0}", tickets.length)}</span><small>{counts.length ? counts.map(([status, count], index) => <Fragment key={status}>{index > 0 && " · "}<span className={status === "needs_review" ? "dispatch-ticket-review" : undefined}>{count} {statusLabel(status)}</span></Fragment>) : summary}</small><ChevronRight size={14}/></button>}
     {engines.length > 0 && <p className="dispatch-engines">{engines.map(health => <span key={health.engine} title={health.reason}>{engineNotice(health, locale)}<button type="button" disabled={!online || !!busy} onClick={() => void reset(health.engine)}>{t("清除")}</button></span>)}</p>}
     {error && <p className="dispatch-tickets-error" role="alert">{error}</p>}
-    {shown && tickets.length > 0 && <ul className="dispatch-ticket-list">{tickets.map(ticket => {
-      const attempt = ticket.attempts.at(-1), stopping = !!attempt?.stopRequested && !attempt.endedAt, open_ = isOpen(ticket), disabled = !online || !!busy;
-      return <li key={ticket.id} className="dispatch-ticket" data-status={ticket.status} data-ticket-id={ticket.id}>
-        <div className="dispatch-ticket-heading"><strong title={ticket.title}>{ticket.title}</strong>{ticket.paused && open_ && !stopping && <span className="dispatch-ticket-paused">{t("已暂停")}</span>}<span className="dispatch-ticket-status">{stopping ? t(attempt.stopRequested === "cancel" ? "正在取消" : "正在暂停") : statusLabel(displayStatus(ticket))}</span></div>
-        {attempt?.waitingFor && !attempt.endedAt && !stopping && <p role="status">{t("打开执行会话，处理问题或权限审批。")}</p>}
-        {stopping && <p role="status">{t("正在等待执行停止，确认结束后才能继续。")}</p>}
-        <div className="dispatch-ticket-meta">{attempt && <span>{[ENGINE_NAMES[attempt.engine] ?? attempt.engine, attempt.model || t("默认模型"), attempt.effort].filter(Boolean).join(" · ")}</span>}<time dateTime={new Date(ticket.updatedAt).toISOString()}>{when(ticket.updatedAt, locale, now)}</time></div>
-        <div className="dispatch-ticket-actions">
-          {attempt && <button type="button" onClick={() => open(attempt.conversationId)}>{t("打开")}</button>}
-          {ticket.status === "needs_review" && <button type="button" disabled={disabled} onClick={() => void act(ticket, "accept")}>{t("验收")}</button>}
-          {open_ && <button type="button" disabled={disabled || stopping} onClick={() => void act(ticket, ticket.paused ? "resume" : "pause")}>{ticket.paused && !stopping ? t("继续") : t("暂停")}</button>}
-          {open_ && <button type="button" disabled={disabled} onClick={() => setConfirming({ id: ticket.id, action: "cancel" })}>{t("取消")}</button>}
-          {!open_ && list?.capabilities?.remove === true && <button type="button" disabled={disabled || ticket.attempts.some(item => !item.endedAt)} onClick={() => setConfirming({ id: ticket.id, action: "remove" })}>{t("移除")}</button>}
+    {shown && tickets.length > 0 && <>
+      {openTickets.length > 1 && crossHostSupported && <div className="dispatch-bulk-actions">
+        <span>{t("全部 {0} 张进行中", openTickets.length)}</span>
+        <div className="dispatch-bulk-buttons">
+          {hasActiveOpen && <button type="button" disabled={!online || !!busy} onClick={() => void bulk("pause")}>{t("全部暂停")}</button>}
+          {hasPausedOpen && <button type="button" disabled={!online || !!busy} onClick={() => void bulk("resume")}>{t("全部继续")}</button>}
+          <button type="button" disabled={!online || !!busy} onClick={() => setConfirmBulkCancel(true)}>{t("全部取消")}</button>
         </div>
-        {confirming?.id === ticket.id && <div className="prompt-queue-confirm" ref={confirmation}>
-          <p className="prompt-queue-confirm-title">{t(confirming.action === "remove" ? "移除这张工单？" : "取消这张工单？")}</p>
-          <p className="prompt-queue-confirm-description">{t(confirming.action === "remove" ? "从此幕僚长的工单列表移除，保留执行对话和生成文件。" : "正在进行的工作会停止，对话记录保留。")}</p>
-          <div className="prompt-queue-confirm-actions"><button type="button" className="prompt-queue-keep" onClick={() => setConfirming(undefined)}>{t("保留")}</button><button type="button" className="primary" disabled={disabled} onClick={() => void act(ticket, confirming.action)}>{t(confirming.action === "remove" ? "确认移除工单" : "确认取消工单")}</button></div>
+        {confirmBulkCancel && <div className="prompt-queue-confirm">
+          <p className="prompt-queue-confirm-title">{t("取消全部 {0} 张未完成工单？", openTickets.length)}</p>
+          <p className="prompt-queue-confirm-description">{t("所有主机上正在执行的子任务会停止，已完成的结果保持保留。")}</p>
+          <div className="prompt-queue-confirm-actions"><button type="button" className="prompt-queue-keep" onClick={() => setConfirmBulkCancel(false)}>{t("保留")}</button><button type="button" className="primary" disabled={!online || !!busy} onClick={() => void bulk("cancel")}>{t("确认全部取消")}</button></div>
         </div>}
-      </li>;
-    })}</ul>}
+      </div>}
+      {nodeGroups ? <div className="dispatch-node-groups">
+        {nodeGroups.map(group => {
+          const groupOpen = group.items.filter(isOpen).length;
+          return <div key={group.key} className="dispatch-node-group">
+            <div className="dispatch-node-header"><Server size={12}/><span>{group.hostName}</span><small>{t("{0} 张 · {1} 未完", group.items.length, groupOpen)}</small></div>
+            <ul className="dispatch-ticket-list dispatch-node-tickets">{group.items.map(renderTicket)}</ul>
+          </div>;
+        })}
+      </div> : <ul className="dispatch-ticket-list">{tickets.map(renderTicket)}</ul>}
+    </>}
   </section>;
 }
 

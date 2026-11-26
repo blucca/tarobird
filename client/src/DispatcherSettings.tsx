@@ -1,9 +1,13 @@
-import { useEffect, useId, useMemo, useRef, useState, type RefObject } from "react";
-import { ChevronDown } from "lucide-react";
+import { useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type RefObject } from "react";
+import { ChevronDown, Server } from "lucide-react";
 import { z } from "zod";
-import { DISPATCH_ENGINES, DISPATCH_MAX_CONCURRENT, dispatcherSettingsSchema, type DispatcherSettings } from "../../src/client-protocol/dispatch.js";
+import {
+  DISPATCH_ENGINES, DISPATCH_MAX_CONCURRENT, dispatchNodesResponseSchema, dispatcherSettingsSchema,
+  type DispatchNodeTarget, type DispatchNodesResponse, type DispatcherNodeSettings, type DispatcherSettings, type HostDispatchPreference,
+} from "../../src/client-protocol/dispatch.js";
 import type { Bot, HubConnection } from "./connection.js";
 import type { BotCatalog } from "../../src/client-protocol/bots.js";
+import { BotMessageHostsContext, botMessageHostId } from "./bot-message-hosts.js";
 import { CreationDialog } from "./CreationDialog.js";
 import { useBotSettingsRequest } from "./bot-settings-request.js";
 import { HubHttpError } from "./http-error.js";
@@ -18,8 +22,15 @@ export const installedEngines = (catalog?: BotCatalog): Engine[] => (catalog?.en
  * explicit one never depends on what is installed now: a missing CLI stays
  * listed, and naming every installed CLI does not allow later installs. */
 export function normalizedDispatcherSettings(value: DispatcherSettings, _installed?: readonly Engine[]): DispatcherSettings {
-  const { allowedEngines, ...rest } = value;
-  return allowedEngines ? { ...rest, allowedEngines: DISPATCH_ENGINES.filter(id => allowedEngines.includes(id)) } : rest;
+  const { allowedEngines, nodes, ...rest } = value;
+  const normalizedNodes = nodes?.length ? [...nodes].map(({ allowedEngines: nodeEngines, ...nodeRest }) => (
+    nodeEngines ? { ...nodeRest, allowedEngines: DISPATCH_ENGINES.filter(id => nodeEngines.includes(id)) } : nodeRest
+  )).sort((a, b) => a.hostId.localeCompare(b.hostId)) : undefined;
+  return {
+    ...rest,
+    ...(allowedEngines ? { allowedEngines: DISPATCH_ENGINES.filter(id => allowedEngines.includes(id)) } : {}),
+    ...(normalizedNodes?.length ? { nodes: normalizedNodes } : {}),
+  };
 }
 /** Ticking adds a CLI and unticking narrows the list; undefined when it would leave none. */
 export function toggledDispatcherEngine(value: DispatcherSettings, installed: readonly Engine[], id: Engine, checked: boolean): DispatcherSettings | undefined {
@@ -75,23 +86,125 @@ export function DispatcherSettingsControl({ connection, bot, online, owner }: { 
     {open && owner && <DispatcherDialog connection={connection} bot={bot} online={online} close={() => setOpen(false)} returnFocus={trigger}/>}
   </>;
 }
+function nodeStatusLabel(node: DispatchNodeTarget): string {
+  if (!node.online) return t("离线");
+  if (!node.authorized) return t("未授权");
+  if (!node.enabled) return t("已停用");
+  return t("可用");
+}
+function quotaHint(node: DispatchNodeTarget): string | undefined {
+  const flagged = node.load.engines.filter(e => e.installed && (e.quotaState === "blocked" || e.quotaState === "warning"));
+  if (!flagged.length) return undefined;
+  return flagged.map(e => `${ENGINE_NAMES[e.engine] ?? e.engine}: ${e.quotaState === "blocked" ? t("配额耗尽") : t("配额偏低")}`).join(" · ");
+}
+
 function DispatcherDialog({ connection, bot, online, close, returnFocus }: { connection: HubConnection; bot: Bot; online: boolean; close: () => void; returnFocus: RefObject<HTMLButtonElement | null> }) {
   const { data, busy, saving, error, saved, load, save } = useBotSettingsRequest(connection, bot.id, "dispatcher", snapshotSchema);
+  const hostEntries = useContext(BotMessageHostsContext);
   const [draft, setDraft] = useState<DispatcherSettings>();
   const [confirm, setConfirm] = useState<"close" | "reload">();
   const continueEditing = useRef<HTMLButtonElement>(null);
   const [catalog, setCatalog] = useState<BotCatalog>(), [catalogFailed, setCatalogFailed] = useState(false), [catalogAttempt, setCatalogAttempt] = useState(0);
+  const [nodesView, setNodesView] = useState<DispatchNodesResponse>();
+  const [grantBusyHost, setGrantBusyHost] = useState(""), [grantError, setGrantError] = useState("");
+  const loadNodes = useCallback(async () => {
+    try {
+      const value = dispatchNodesResponseSchema.parse(await connection.http(`/api/bots/${encodeURIComponent(bot.id)}/dispatch-nodes`));
+      setNodesView(value);
+    } catch { /* Optional cross-host capability; older Hubs return 404. */ }
+  }, [connection, bot.id]);
   useEffect(() => { let alive = true; setCatalogFailed(false); void connection.http<BotCatalog>("/api/bots/catalog").then(value => { if (alive) setCatalog(value); }, () => { if (alive) setCatalogFailed(true); }); return () => { alive = false; }; }, [connection, catalogAttempt]);
+  useEffect(() => { if (online) void loadNodes(); }, [online, loadNodes]);
   const engines = useMemo(() => installedEngines(catalog), [catalog]);
   // The draft never waits for the catalog: the allowlist does not depend on it.
   useEffect(() => { if (data) setDraft(normalizedDispatcherSettings(data.settings)); }, [data]);
   const changed = !!data && !!draft && JSON.stringify(normalizedDispatcherSettings(draft)) !== JSON.stringify(normalizedDispatcherSettings(data.settings));
   const leave = () => { if (changed) setConfirm("close"); else close(); };
+  const updateNode = (node: DispatchNodeTarget, patch: Partial<DispatcherNodeSettings>) => {
+    if (!draft) return;
+    const existing = draft.nodes ?? [];
+    const current = existing.find(item => item.hostId === node.hostId) ?? {
+      hostId: node.hostId,
+      enabled: node.enabled,
+      maxConcurrent: node.maxConcurrent,
+      preference: node.preference,
+      ...(node.allowedEngines ? { allowedEngines: node.allowedEngines } : {}),
+    };
+    const nextEntry: DispatcherNodeSettings = { ...current, ...patch };
+    const others = existing.filter(item => item.hostId !== node.hostId);
+    setDraft({ ...draft, nodes: [...others, nextEntry] });
+  };
+  const authorizeRemote = async (node: DispatchNodeTarget) => {
+    if (!nodesView?.ownHostId || grantBusyHost) return;
+    const remoteEntry = hostEntries.find(entry => entry.host.publicKey && botMessageHostId(entry.host.publicKey) === node.hostId);
+    const remoteConn = remoteEntry?.connection;
+    if (!remoteConn || remoteEntry.host.networkBlocked || remoteConn.isNetworkBlocked || remoteConn.state.status !== "online") return;
+    setGrantBusyHost(node.hostId); setGrantError("");
+    try {
+      await remoteConn.saveCrossHostDispatchGrants({ operation: "cross-host-dispatch-grant", sourceHost: nodesView.ownHostId, sourceBot: bot.id, allowed: true });
+      await loadNodes();
+    } catch {
+      setGrantError(t("授权未能确认，请在远端主机确认后重试。"));
+    } finally { setGrantBusyHost(""); }
+  };
+  const showNodes = (nodesView?.nodes.length ?? 0) > 1 || (draft?.nodes?.length ?? 0) > 0;
   return <CreationDialog mobilePage title={t("幕僚长设置")} closeLabel={t("关闭幕僚长设置")} close={leave} busy={saving} returnFocus={returnFocus}>
     <div className="effort-settings">
       <p className="effort-scope"><strong>{bot.name}</strong><span>{t("决定它可以用哪些 CLI、派活前是否先问你，以及同时进行几张。")}</span></p>
       {data && draft && <form onSubmit={event => { event.preventDefault(); if (!busy && online && changed) void save({ settings: normalizedDispatcherSettings(draft), expectedRevision: data.revision }); }}>
         <DispatcherSettingsFields value={draft} change={setDraft} engines={engines} loading={!catalog && !catalogFailed} failed={!catalog && catalogFailed} retry={() => setCatalogAttempt(value => value + 1)} disabled={busy || !online}/>
+        {showNodes && nodesView && <fieldset className="dispatcher-nodes" disabled={busy || !online}>
+          <legend>{t("跨主机协作节点")}</legend>
+          <p className="muted">{t("选择允许参与并发派工的组网主机，并设置调度偏好与每台上限。")}</p>
+          {grantError && <p role="alert" className="error-text">{grantError}</p>}
+          <ul className="dispatcher-node-list">
+            {nodesView.nodes.map(node => {
+              const savedEntry = draft.nodes?.find(item => item.hostId === node.hostId);
+              const enabled = savedEntry?.enabled ?? node.enabled;
+              const preference = savedEntry?.preference ?? node.preference;
+              const maxConcurrent = savedEntry?.maxConcurrent ?? node.maxConcurrent;
+              const remoteEntry = !node.local ? hostEntries.find(entry => entry.host.publicKey && botMessageHostId(entry.host.publicKey) === node.hostId) : undefined;
+              const canAuthorizeHere = !node.local && !node.authorized && !!remoteEntry?.connection && !remoteEntry.host.networkBlocked && !remoteEntry.connection.isNetworkBlocked && remoteEntry.connection.state.status === "online";
+              const qHint = quotaHint(node);
+              return <li key={node.hostId} className="dispatcher-node-row" data-online={node.online ? "1" : "0"} data-authorized={node.authorized ? "1" : "0"}>
+                <div className="dispatcher-node-head">
+                  <label className="collaboration-check">
+                    <input type="checkbox" checked={enabled} onChange={event => updateNode(node, { enabled: event.target.checked })}/>
+                    <Server size={13}/>
+                    <strong>{node.hostName}</strong>
+                    {node.local && <span className="dispatch-node-pill">{t("本机")}</span>}
+                  </label>
+                  <span className="dispatch-node-pill" data-state={node.online && node.authorized && enabled ? "ready" : "muted"}>{nodeStatusLabel(node)}</span>
+                </div>
+                <div className="dispatcher-node-meta">
+                  <span>{t("进行中 {0}/{1}", node.activeOnNode, maxConcurrent)}</span>
+                  {node.load.cpuLoadRatio !== undefined && <span>{t("负载 {0}%", Math.round(node.load.cpuLoadRatio * 100))}</span>}
+                  {qHint && <span>{qHint}</span>}
+                </div>
+                <div className="dispatcher-node-controls">
+                  <label>{t("调度偏好")}
+                    <select value={preference} onChange={event => updateNode(node, { preference: event.target.value as HostDispatchPreference })}>
+                      <option value="prefer">{t("优先使用")}</option>
+                      <option value="normal">{t("正常调度")}</option>
+                      <option value="less_often">{t("尽量少用")}</option>
+                      <option value="manual_only">{t("仅手动指定")}</option>
+                    </select>
+                  </label>
+                  <label>{t("此机并发")}
+                    <select value={maxConcurrent} onChange={event => updateNode(node, { maxConcurrent: Number(event.target.value) })}>
+                      {Array.from({ length: DISPATCH_MAX_CONCURRENT }, (_, index) => index + 1).map(count => <option key={count} value={count}>{count}</option>)}
+                    </select>
+                  </label>
+                </div>
+                {!node.local && !node.authorized && <div className="dispatcher-node-auth">
+                  {canAuthorizeHere
+                    ? <button type="button" disabled={!!grantBusyHost || !online} onClick={() => void authorizeRemote(node)}>{grantBusyHost === node.hostId ? t("授权中…") : t("授权此主机接收派工")}</button>
+                    : <p className="muted">{t("尚未获得远端授权，请在对方主机的终端或已连客户端授权。")}</p>}
+                </div>}
+              </li>;
+            })}
+          </ul>
+        </fieldset>}
         <p className="muted">{t("进行中的工单不受影响；之后派出的工单使用新设置。")}</p>
         <p role="status" className={changed || saved ? "dashboard-notice" : "muted"}>{saving ? t("保存中…") : error !== undefined ? t("保存结果尚未确认，请核对下方提示。") : changed ? t("修改尚未保存，点击「保存到此 Bot」后生效。") : saved ? t("幕僚长设置已保存。") : t("当前显示的是主机已保存的设置。")}</p>
         <div className="effort-actions"><button type="button" disabled={busy || !online} onClick={() => changed ? setConfirm("reload") : void load()}>{t("重新读取")}</button><button type="submit" className="primary" disabled={busy || !online || !changed}>{saving ? t("保存中…") : t("保存到此 Bot")}</button></div>
