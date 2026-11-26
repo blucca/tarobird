@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "../../src/client-protocol/index.js";
-import { ConversationMessageCache } from "../src/message-lru-cache.js";
+import { compareMessages, ConversationMessageCache } from "../src/message-lru-cache.js";
 
 function msg(id: string, conversationId: string, createdAt: number, text = id, version = 1): Message {
   return {
@@ -79,5 +79,51 @@ describe("ConversationMessageCache", () => {
 
     cache.invalidate();
     expect(cache.stats()).toEqual({ conversations: 0, totalMessages: 0 });
+  });
+
+  it("enforces full-snapshot and epoch invariants and fails closed on mismatch", () => {
+    const cache = new ConversationMessageCache(4, 100);
+    // Partial snapshot is refused
+    expect(cache.set("c1", [msg("m1", "c1", 1)], 1, { epoch: 5, hasFullSnapshot: false })).toBe(false);
+    expect(cache.peek("c1")).toBeUndefined();
+
+    // Full snapshot with epoch=5
+    expect(cache.set("c1", [msg("m1", "c1", 1)], 1, { epoch: 5, hasFullSnapshot: true })).toBe(true);
+    expect(cache.peek("c1", 5)?.messages.map((m) => m.id)).toEqual(["m1"]);
+
+    // Patch matching expectedEpoch advances epoch to nextEpoch
+    expect(cache.patchMessage("c1", msg("m2", "c1", 2), { expectedEpoch: 5, nextEpoch: 6 })).toBe(true);
+    expect(cache.peek("c1", 6)?.messages.map((m) => m.id)).toEqual(["m1", "m2"]);
+
+    // Epoch mismatch on patchMessage invalidates and fails closed
+    expect(cache.patchMessage("c1", msg("m3", "c1", 3), { expectedEpoch: 5, nextEpoch: 7 })).toBe(false);
+    expect(cache.peek("c1")).toBeUndefined();
+
+    // Epoch mismatch on peek invalidates and fails closed
+    expect(cache.set("c1", [msg("m1", "c1", 1)], 1, { epoch: 10 })).toBe(true);
+    expect(cache.peek("c1", 9)).toBeUndefined();
+    expect(cache.peek("c1")).toBeUndefined();
+  });
+
+  it("preserves exact IDB createdAt+id order, never rolls back versions, and keeps deleted tombstones", () => {
+    const cache = new ConversationMessageCache(4, 100);
+    const b = msg("msg_b", "c1", 100, "b", 1);
+    const a = msg("msg_a", "c1", 100, "a", 1);
+    const sorted = [b, a].sort(compareMessages);
+    expect(sorted.map((m) => m.id)).toEqual(["msg_a", "msg_b"]);
+
+    cache.set("c1", [msg("msg_a", "c1", 100, "a", 2), msg("msg_c", "c1", 100, "c", 1)]);
+    // Same createdAt tie-breaks by UTF-16 code unit id order: msg_b between msg_a and msg_c
+    expect(cache.patchMessage("c1", msg("msg_b", "c1", 100, "b", 1))).toBe(true);
+    expect(cache.peek("c1")!.messages.map((m) => m.id)).toEqual(["msg_a", "msg_b", "msg_c"]);
+
+    // Never roll back to older version
+    expect(cache.patchMessage("c1", msg("msg_a", "c1", 100, "stale", 1))).toBe(true);
+    expect(cache.peek("c1")!.messages[0]!.version).toBe(2);
+
+    // Deleted tombstone stays in raw cache (matching IDB)
+    const deleted: Message = { ...msg("msg_b", "c1", 100, "b", 2), status: "deleted" };
+    expect(cache.patchMessage("c1", deleted)).toBe(true);
+    expect(cache.peek("c1")!.messages[1]!.status).toBe("deleted");
   });
 });

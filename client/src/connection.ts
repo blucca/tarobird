@@ -83,14 +83,17 @@ export class HubConnection {
   /** Invalidates discussion views without treating every streamed text token as a change. */
   groupDiscussionRevision = 0;
   get outboxRevision(): number { return this.outboxVersion; }
+  private invalidateCachedMessages(conversationId?: string): void {
+    (this.cache as { invalidateMessages?: (id?: string) => void }).invalidateMessages?.(conversationId);
+  }
   /** Request fresh local views without reconnecting or sending application data. */
-  refreshCache(): void { this.update({}, true); }
+  refreshCache(): void { this.invalidateCachedMessages(); this.update({}, true); }
   async pinConversation(id: string, pinned: boolean, scope: "group" | "global" = "group"): Promise<void> {
     await this.cache.setPinned(id, pinned, scope);
     this.refreshCache();
   }
   /** Request fresh local views of one conversation (pending rows, history fences). */
-  refreshConversation(id: string): void { this.changedConversations.add(id); this.update({}, true, true); }
+  refreshConversation(id: string): void { this.invalidateCachedMessages(id); this.changedConversations.add(id); this.update({}, true, true); }
   /** Outbox writes change only the durable queue, not cached message history.
    * Notify outbox observers via `outboxRevision` without marking any
    * conversation's message history dirty or advancing `cacheRevision`. */
@@ -124,9 +127,14 @@ export class HubConnection {
   private globalConversationRevision = 0;
   private readonly conversationRevisions = new Map<string, number>();
   private readonly changedConversations = new Set<string>();
+  private readonly urgentConversationRevisions = new Map<string, number>();
+  private readonly urgentConversations = new Set<string>();
   /** A board pane only rereads history touched by an event. Global invalidations
    * (snapshot, reconnect, local outbox reconciliation) still refresh every pane. */
   conversationRevision(id: string): number { return Math.max(this.globalConversationRevision, this.conversationRevisions.get(id) ?? 0); }
+  /** Monotonic per-conversation revision bumped on urgent user-message arrivals
+   * so active views bypass streaming read-gap throttling immediately. */
+  conversationImmediateRevision(id: string): number { return this.urgentConversationRevisions.get(id) ?? 0; }
   private outboxRetry?: ReturnType<typeof setTimeout>;
   private probeTimer?: ReturnType<typeof setInterval>; private handshake?: ReturnType<typeof setTimeout>; private probing = false;
   private preferredProbeAt = 0; private preferredProbeMisses = 0; private preferredProbeStarted = -Infinity;
@@ -249,11 +257,14 @@ export class HubConnection {
       if (cacheChanged && !scoped) { this.globalConversationRevision = revision; this.conversationRevisions.clear(); }
       else for (const id of this.changedConversations) this.conversationRevisions.set(id, revision);
       this.changedConversations.clear();
+      for (const id of this.urgentConversations) this.urgentConversationRevisions.set(id, revision);
+      this.urgentConversations.clear();
     }
     this.state = { ...this.state, ...changes, cacheRevision: this.state.cacheRevision + Number(changed) }; this.listeners.forEach((f) => f());
   }
-  private eventApplied(conversationId: string, coalesce = false, receiving: () => boolean = () => false): void {
+  private eventApplied(conversationId: string, coalesce = false, receiving: () => boolean = () => false, urgent = false): void {
     this.changedConversations.add(conversationId);
+    if (urgent) this.urgentConversations.add(conversationId);
     const replaying = this.syncing && this.state.status === "online" && (!this.independentSync || this.pendingSync.has(conversationId));
     // History clears and plain-text streams can contain many small updates.
     // Keep every cache write/cursor durable, but avoid rereading the entire
@@ -621,6 +632,7 @@ export class HubConnection {
           // read the committed cache, never unvalidated event payload content.
           const payload = event.payload;
           const deleted = (event.kind === "message.created" || event.kind === "message.updated") && !!payload && typeof payload === "object" && !Array.isArray(payload) && payload.status === "deleted";
+          const userMessage = !deleted && (event.kind === "message.created" || event.kind === "message.updated") && (message?.authorType === "user" || !!payload && typeof payload === "object" && !Array.isArray(payload) && payload.authorType === "user");
           const delta = event.kind === "message.stream" ? messageStreamSchema.safeParse(payload) : undefined;
           // Only plain text may wait for a short batch. First messages, terminal
           // status updates and every card/interactive operation stay immediate.
@@ -628,7 +640,7 @@ export class HubConnection {
             op.op === "appendText" && !op.path || op.op === "replaceBlock" && op.value.type === "text");
           if (deleted) this.groupDiscussionRevision++;
           if (event.kind === "turn.state" && typeof event.payload === "object" && event.payload && !Array.isArray(event.payload) && ("groupDiscussion" in event.payload || "groupSettings" in event.payload)) this.groupDiscussionRevision++;
-          this.eventApplied(event.conversationId, deleted || textStream, () => pendingFrames > 0); return;
+          this.eventApplied(event.conversationId, deleted || textStream, () => pendingFrames > 0, userMessage); return;
         }
         if (["snapshot.begin", "snapshot.message", "snapshot.end"].includes(frame.type)) {
           if (!this.syncing) throw new Error("unexpected_snapshot");
@@ -857,6 +869,7 @@ export class HubConnection {
     const input = deleteMessagesSchema.parse({ messageIds });
     const result = deleteMessagesResultSchema.parse(await this.http(`/api/conversations/${conversationId}/messages`, { method: "DELETE", body: JSON.stringify(input), signal: timeoutSignal(20_000) }));
     if (new Set(result.deletedIds).size !== new Set(messageIds).size || result.deletedIds.some(id => !messageIds.includes(id))) throw new Error("message_deletion_unconfirmed");
+    this.invalidateCachedMessages(conversationId);
     return result;
   }
   async planClearMessages(conversationId: string) {
@@ -865,7 +878,9 @@ export class HubConnection {
   }
   async clearMessagesBatch(conversationId: string, throughId: string) {
     if (!this.state.messageClearAvailable || this.isReadOnly) throw new Error("message_clear_unavailable");
-    return clearMessagesResultSchema.parse(await this.http(`/api/conversations/${conversationId}/messages/clear`, { method: "POST", body: JSON.stringify({ throughId }), signal: timeoutSignal(20_000) }));
+    const result = clearMessagesResultSchema.parse(await this.http(`/api/conversations/${conversationId}/messages/clear`, { method: "POST", body: JSON.stringify({ throughId }), signal: timeoutSignal(20_000) }));
+    this.invalidateCachedMessages(conversationId);
+    return result;
   }
   async confirmHistoryClear(conversationId: string, seq: number): Promise<void> {
     // An empty retry may follow a lost HTTP receipt. Confirm the committed
@@ -873,6 +888,7 @@ export class HubConnection {
     const deadline = performance.now() + 20_000;
     while (performance.now() < deadline) {
       if (await this.cache.cursor(conversationId) >= seq) {
+        this.invalidateCachedMessages(conversationId);
         if (this.replayEvents) this.update({}, true, true);
         return;
       }

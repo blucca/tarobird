@@ -21,7 +21,7 @@ import { forgetSavedQuotaHost } from "./usage-readings.js";
 import type { NamedBot } from "./bot-references.js";
 import { profileCacheSchema, type ProfileCache } from "../../src/client-protocol/avatars.js";
 import { openDB, type DBSchema, type StoreNames, type IDBPTransaction, type IDBPDatabase } from "idb";
-import { ConversationMessageCache } from "./message-lru-cache.js";
+import { compareMessages, ConversationMessageCache } from "./message-lru-cache.js";
 import { activeQuestionDrafts, questionDraftPrefix, questionDraftSchema, type QuestionDraft } from "./question-draft.js";
 import { messageAttention, type MessageAttention } from "./attention.js";
 import { projectReply, projectWorkingReply, type BotReply } from "./agent-state.js";
@@ -215,8 +215,10 @@ export class ClientCache {
   }
   private notifyMessageMutation(conversationId?: string, patched?: Message): void {
     if (patched && conversationId !== undefined) {
+      const expectedEpoch = this.messageEpoch(conversationId);
       this.messageEpochs.set(conversationId, (this.messageEpochs.get(conversationId) ?? 0) + 1);
-      this.messageCache.patchMessage(conversationId, patched);
+      const nextEpoch = this.messageEpoch(conversationId);
+      this.messageCache.patchMessage(conversationId, patched, { expectedEpoch, nextEpoch });
     } else {
       this.bumpMessageEpoch(conversationId);
     }
@@ -231,6 +233,10 @@ export class ClientCache {
       channel.postMessage({ v: 1, ...(conversationId !== undefined ? { conversationId } : {}) });
       if (channel !== this.messageChannel) channel.close();
     }
+  }
+  /** Drop cached history for one or all conversations so the next read fails closed to IDB. */
+  invalidateMessages(conversationId?: string): void {
+    this.bumpMessageEpoch(conversationId);
   }
   // A cache's namespace never changes when the user selects another host.
   // Delayed requests retain the cache belonging to their original connection.
@@ -659,6 +665,7 @@ export class ClientCache {
     await settings.put(JSON.stringify({ ...(identity?.keyRef ? { keyRef: identity.keyRef } : {}) }), "pendingReset");
     await settings.put(crypto.randomUUID(), "cacheGeneration");
     await tx.done;
+    this.bumpMessageEpoch(undefined);
     this.diffReviewsChanged();
     if (identity) clearNoteRecoveries(identity.deviceId);
     if (identity) this.clearSelectionHint(this.selectionHintKey(identity, await this.generation));
@@ -676,6 +683,7 @@ export class ClientCache {
       if (preferences) await settings.put(preferences, "preferences");
       if (generation) await settings.put(generation, "cacheGeneration");
       await tx.done;
+      this.notifyMessageMutation(undefined);
       this.diffReviewsChanged();
     } catch (error) { try { tx.abort(); } catch { /* Already aborted. */ } await tx.done.catch(() => undefined); throw error; }
   }
@@ -1271,19 +1279,20 @@ export class ClientCache {
     await tx.done; return current ?? value;
   }
   peekMessages(conversationId: string): readonly Message[] | undefined {
+    if (this.closed) return undefined;
     this.ensureMessageChannel();
-    return this.messageCache.peek(conversationId)?.messages;
+    return this.messageCache.peek(conversationId, this.messageEpoch(conversationId))?.messages;
   }
   async messages(conversationId: string): Promise<Message[]> {
     this.ensureMessageChannel();
-    const cached = this.messageCache.peek(conversationId);
+    const cached = this.closed ? undefined : this.messageCache.peek(conversationId, this.messageEpoch(conversationId));
     if (cached) return cached.messages.slice();
     const epoch = this.messageEpoch(conversationId);
     const loaded = (await (await this.db).getAllFromIndex("messages", "conversation", conversationId))
-      .sort((a, b) => a.createdAt - b.createdAt)
+      .sort(compareMessages)
       .map(stripMessageMeta);
     if (!this.closed && this.messageEpoch(conversationId) === epoch) {
-      this.messageCache.set(conversationId, loaded);
+      this.messageCache.set(conversationId, loaded, 0, { epoch, hasFullSnapshot: true });
     }
     return loaded.slice();
   }
