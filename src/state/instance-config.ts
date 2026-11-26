@@ -28,6 +28,7 @@ import {
 import { normalizeCronTimezone, resolveDefaultCronTimezone } from "../state/cron-timezone.js";
 import { withFileMutex } from "../state/file-mutex.js";
 import { STATE_FILE_MODE } from "../state/state-permissions.js";
+import { normalizeLocale, type Locale } from "../runtime/locale.js";
 import { EngineConfigError } from "../state/engine-config-error.js";
 import { isExtendedCodexEffort, knownCodexModelSupportsEffort } from "../codex/model-capabilities.js";
 
@@ -154,7 +155,7 @@ export interface InstanceConfig {
   claudeChrome: boolean;
   /** Present only when the Antigravity ACP runtime is selected (applied at Bot start). */
   antigravityRuntime?: "acp";
-  locale: "en" | "zh";
+  locale: Locale;
   verbosity: 0 | 1 | 2;
   budgetUsd: number | undefined;
   effort: EffortLevel | undefined;
@@ -558,7 +559,7 @@ export async function loadInstanceConfig(stateDir: string): Promise<InstanceConf
     ...(config.role === "dispatcher" ? { role: "dispatcher" as const } : {}),
     claudeChrome: config.claudeChrome === true,
     ...(config.antigravityRuntime === "acp" ? { antigravityRuntime: "acp" as const } : {}),
-    locale: config.locale === "zh" ? "zh" : "en",
+    locale: normalizeLocale(config.locale, "en"),
     verbosity: config.verbosity === 0 ? 0 : config.verbosity === 2 ? 2 : 1,
     budgetUsd: typeof config.budgetUsd === "number" && config.budgetUsd > 0 ? config.budgetUsd : undefined,
     effort,

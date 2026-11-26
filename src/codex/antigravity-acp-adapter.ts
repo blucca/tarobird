@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { hostT } from "../locales/index.js";
 
 import {
   client as acpClient,
@@ -901,7 +902,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       // agy often ends the turn without more text once an action is declined.
       // That is the owner's choice, not a failure: say so plainly, after any
       // text the model wrote before the declined action.
-      const note = turn.locale === "zh" ? "已拒绝执行该操作，Antigravity 已停止本轮。" : "The action was declined, so Antigravity stopped this turn.";
+      const note = hostT(turn.locale ?? "en", "已拒绝执行该操作，Antigravity 已停止本轮。");
       const before = turn.text.trim();
       this.settleTurn(turn, undefined, before ? `${before}\n\n${note}` : note);
       return;

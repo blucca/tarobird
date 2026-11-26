@@ -4,9 +4,8 @@ import type { ConversationActivity } from './storage.js';
 import { attentionTargets, type AttentionTarget } from './attention.js';
 import { agentSignal, type AgentSignal } from './agent-state.js';
 import { conversationPreview, conversationActivityPreview } from './conversation-preview.js';
-import { t } from './i18n.js';
+import { localeIntlTag, t, type Locale } from './i18n.js';
 import { listedConversations } from './dispatcher.js';
-type Locale = 'zh' | 'en';
 
 export type InboxHost = {
   id: string;
@@ -199,7 +198,7 @@ function numericDay(date: Date, today: Date, tag: string): string {
  */
 export function formatRowTime(at: number, locale: Locale, now: number = Date.now()): string {
   if (!Number.isFinite(at) || at <= 0) return '';
-  const tag = locale === 'zh' ? 'zh-CN' : 'en-US';
+  const tag = localeIntlTag(locale);
   const date = new Date(at);
   const today = new Date(now);
   const startOfDay = (daysAgo: number) =>
@@ -233,12 +232,12 @@ export function formatMessageTime(at: number, locale: Locale, compact = false, n
   const startOfDay = (daysAgo: number) =>
     new Date(today.getFullYear(), today.getMonth(), today.getDate() - daysAgo).getTime();
   if (at >= startOfDay(0)) return time;
-  const tag = locale === 'zh' ? 'zh-CN' : 'en-US';
+  const tag = localeIntlTag(locale);
   const sameYear = date.getFullYear() === today.getFullYear();
   if (compact) return sameYear ? `${numericDay(date, today, tag)} ${time}` : numericDay(date, today, tag);
   if (at >= startOfDay(1)) return `${t('昨天')} ${time}`;
-  // zh-CN "long" months read 11月15日 / 2025年12月3日; en-US "short" reads Nov 15 / Dec 3, 2025.
-  const month = locale === 'zh' ? 'long' : 'short';
+  // zh-CN and ja-JP "long" months read 11月15日 / 2025年12月3日; en-US "short" reads Nov 15 / Dec 3, 2025.
+  const month = locale === 'en' ? 'short' : 'long';
   const day = sameYear ? formatter(`day-${month}`, tag, { month, day: 'numeric' }) : formatter(`year-day-${month}`, tag, { year: 'numeric', month, day: 'numeric' });
   return `${day.format(date)} ${time}`;
 }

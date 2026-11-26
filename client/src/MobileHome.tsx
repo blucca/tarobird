@@ -462,7 +462,7 @@ function ConversationRow({ row, connection, conversations, dispatcher, multiHost
   const isGroup = conversation.type === 'group' && !conversation.parentId;
   const title = titleOf(conversation);
   const botId = conversation.botIds[0];
-  const tag = conversation.parentId ? conversations.find(parent => parent.id === conversation.parentId)?.title ?? t('独立话题') : isGroup ? t('群组') : row.botNames.join(locale === 'zh' ? '、' : ', ');
+  const tag = conversation.parentId ? conversations.find(parent => parent.id === conversation.parentId)?.title ?? t('独立话题') : isGroup ? t('群组') : row.botNames.join(locale === 'en' ? ', ' : '、');
   const target = attentionOnly ? row.attention[0] : undefined;
   const attentionLabel = target?.kind === 'approval' ? t('审批请求') : t('回答请求');
   const preview = target

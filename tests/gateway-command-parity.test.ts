@@ -146,7 +146,7 @@ it("adds Antigravity ACP native commands to the App menu without shadowing Host 
   const menu = gatewayCommands("antigravity", "", native);
   expect(menu.filter((item) => item.command === "goal")).toHaveLength(1);
   expect(menu.filter((item) => item.command === "compact")).toHaveLength(1);
-  expect(menu.find((item) => item.command === "grill-me")).toEqual({ command: "grill-me", description: { defaultValue: "Interview me to align on a plan.", i18n: { en_us: "Interview me to align on a plan.", zh_cn: "Interview me to align on a plan." } } });
+  expect(menu.find((item) => item.command === "grill-me")).toEqual({ command: "grill-me", description: { defaultValue: "Interview me to align on a plan.", i18n: { en_us: "Interview me to align on a plan.", ja_jp: "Interview me to align on a plan.", zh_cn: "Interview me to align on a plan." } } });
   expect(gatewayCommands("antigravity", "/gr", native).map((item) => item.command)).toEqual(["group", "grill-me"]);
   expect(gatewayCommands("claude", "", native).some((item) => item.command === "grill-me")).toBe(false);
 });

@@ -3,6 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import { copyFile, lstat, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { hostT } from "../locales/index.js";
 
 import {
   EngineIncompleteResponseError, EngineSteeringRejectedError, withFailedTurnUsage,
@@ -420,14 +421,14 @@ export class PiRpcAdapter implements CodexAdapter {
   }
 
   private handBackNote(turn: Turn, locale: string): string | undefined {
-    const zh = locale === "zh", count = turn.handedBack;
+    const count = turn.handedBack;
     const parts: string[] = [];
-    if (count > 0) parts.push(zh
-      ? `[Pi] 有 ${count} 条补充没有送达模型，已收回，全文见本轮运行过程，未自动重发。`
-      : `[Pi] ${count} ${count === 1 ? "addition" : "additions"} did not reach the model and ${count === 1 ? "was" : "were"} taken back. The full text is in this turn's run details; nothing was resent.`);
-    if (turn.queueUnconfirmed) parts.push(zh
-      ? "[Pi] Pi 没有确认是否还留有本轮的补充，已结束该 Pi 进程，未自动重发；请核对补充是否已被采纳。"
-      : "[Pi] Pi did not confirm whether additions from this turn were still pending, so its process was ended. Nothing was resent; check whether they were applied.");
+    if (count > 0) parts.push(
+      count === 1
+        ? hostT(locale, "[Pi] 有 1 条补充没有送达模型，已收回，全文见本轮运行过程，未自动重发。")
+        : hostT(locale, "[Pi] 有 {0} 条补充没有送达模型，已收回，全文见本轮运行过程，未自动重发。", count),
+    );
+    if (turn.queueUnconfirmed) parts.push(hostT(locale, "[Pi] Pi 没有确认是否还留有本轮的补充，已结束该 Pi 进程，未自动重发；请核对补充是否已被采纳。"));
     return parts.length ? parts.join("\n") : undefined;
   }
 
@@ -437,11 +438,9 @@ export class PiRpcAdapter implements CodexAdapter {
    * says what is known and does not claim the input was never applied.
    */
   private async dropUnconfirmedQueue(turn: Turn): Promise<void> {
-    const worker = turn.worker, zh = turn.input.locale === "zh";
+    const worker = turn.worker, loc = turn.input.locale ?? "en";
     turn.queueUnconfirmed = true;
-    await this.emit(turn, { type: "assistant_text", sessionId: worker.sessionId, text: zh
-      ? "[Pi] Pi 没有确认它是否还留有本轮的补充。为避免带入下一轮，已结束这个 Pi 进程（会话记录保留）。请核对本轮回复，确认补充是否已被采纳。"
-      : "[Pi] Pi did not confirm whether it still holds additions from this turn. To keep them out of the next turn, this Pi process was ended (the session history is kept). Check this turn's reply to see whether they were applied." });
+    await this.emit(turn, { type: "assistant_text", sessionId: worker.sessionId, text: hostT(loc, "[Pi] Pi 没有确认它是否还留有本轮的补充。为避免带入下一轮，已结束这个 Pi 进程（会话记录保留）。请核对本轮回复，确认补充是否已被采纳。") });
     await this.closeWorker(worker, { terminate: true });
   }
 
@@ -455,11 +454,14 @@ export class PiRpcAdapter implements CodexAdapter {
     const texts = [...cleared.steering, ...cleared.followUp].filter(text => text.trim());
     if (!texts.length) return;
     turn.handedBack += texts.length;
-    const zh = turn.input.locale === "zh";
+    const loc = turn.input.locale ?? "en";
     const shown = texts.map(text => `- ${text}`).join("\n");
-    const head = reason === "stopped"
-      ? zh ? "[Pi] 停止时这些补充还没有送达模型，已收回，不会自动重发：" : "[Pi] These additions had not reached the model when the turn stopped. They were taken back and will not be sent again automatically:"
-      : zh ? "[Pi] 这些补充在本轮回复结束后才到达，没有送达模型，已收回，不会自动重发：" : "[Pi] These additions arrived after the reply had finished and did not reach the model. They were taken back and will not be sent again automatically:";
+    const head = hostT(
+      loc,
+      reason === "stopped"
+        ? "[Pi] 停止时这些补充还没有送达模型，已收回，不会自动重发："
+        : "[Pi] 这些补充在本轮回复结束后才到达，没有送达模型，已收回，不会自动重发：",
+    );
     worker.ui.editorText = { text: texts.join("\n\n"), revision: ++worker.editorRevision };
     this.publish(worker.sessionId, { type: "editor_text", text: texts.join("\n\n") });
     // Taken-back input is shown, never acted on, should the Host take this block as the answer.
@@ -720,9 +722,7 @@ export class PiRpcAdapter implements CodexAdapter {
         if (!canRepairDefaults || !(error instanceof PiNativeRejectedError)
           || (error.reason !== "thinking-unsupported" && error.reason !== "model-unavailable")) throw error;
         rejectedDefault = error;
-        defaultsNotice = input.locale === "zh"
-          ? "Bot 默认设置暂时无法应用。可以用 /model 或 /thinking 调整当前对话。"
-          : "Bot defaults could not be applied. Use /model or /thinking to adjust this conversation.";
+        defaultsNotice = hostT(input.locale ?? "en", "Bot 默认设置暂时无法应用。可以用 /model 或 /thinking 调整当前对话。");
       }
       this.throwIfStopped(turn);
       await this.emit(turn, { type: "session", sessionId: turn.worker.sessionId });
@@ -876,10 +876,10 @@ export class PiRpcAdapter implements CodexAdapter {
    * once, and has no deadline that could lead to sending it again.
    */
   private async runCommandDuringRun(worker: Worker, turn: Turn, text: string, name: string, onAdmitted: () => void = () => {}): Promise<void> {
-    const zh = turn.input.locale === "zh";
+    const loc = turn.input.locale ?? "en";
     let reply: string;
     if (name !== "!" && PI_TUI_BUILTIN_COMMANDS[name] !== "terminal" && !PI_LIVE_COMMANDS.has(name)) {
-      reply = zh ? `/${name} 需要等当前回复结束后再执行。` : `/${name} can run once the current reply has finished.`;
+      reply = hostT(loc, "/{0} 需要等当前回复结束后再执行。", name);
     } else {
       try {
         const sessionId = worker.sessionId;
@@ -926,9 +926,7 @@ export class PiRpcAdapter implements CodexAdapter {
         instructions = input.appPlatformTools.instructions;
         turnInstructions = input.appPlatformTools.turnInstructions;
       } else {
-        await this.emit(turn, { type: "assistant_text", sessionId, text: locale === "en"
-          ? "Native App tools are unavailable in this Pi session; compatible delivery is active for this turn."
-          : "当前 Pi 会话的原生 App 工具不可用，本轮使用兼容交付。" });
+        await this.emit(turn, { type: "assistant_text", sessionId, text: hostT(locale, "当前 Pi 会话的原生 App 工具不可用，本轮使用兼容交付。") });
       }
     }
     // Stable instructions ride in the system prompt (through the bridge) so they stay out of the transcript and cacheable.
@@ -985,11 +983,11 @@ export class PiRpcAdapter implements CodexAdapter {
     if (current !== sessionId) await this.emit(turn, { type: "session", sessionId: current });
     // Extension notices are external/tool text, not an assistant instruction to send files or run Host commands.
     let finalText = turn.mapper.finalText || (turn.notices.length
-      ? locale === "en" ? "Pi extension notices are available in this turn's run details." : "Pi 扩展发出了提示，详情见本轮运行过程。"
+      ? hostT(locale, "Pi 扩展发出了提示，详情见本轮运行过程。")
       : "");
     // An extension command that printed nothing still gets a visible answer; an empty reply reads as a failure.
     if (!finalText && response.disposition === "handled" && !turn.mapper.runStarted) {
-      finalText = locale === "en" ? "The command ran and produced no output." : "命令已执行，没有输出。";
+      finalText = hostT(locale, "命令已执行，没有输出。");
     }
     // The final answer is what the Host shows and acts on (card-renderer finalAnswerText). It carries a count only:
     // the taken-back text stays in this turn's run details, so nothing the owner typed is replayed as the reply.
@@ -1018,9 +1016,7 @@ export class PiRpcAdapter implements CodexAdapter {
     const fence = "`".repeat(longest + 1);
     const literal = `${fence}\n${text}\n${fence}`;
     if (!carries(literal)) return literal;
-    return locale === "zh"
-      ? "[Pi] 这条命令的回复里有会被当作投递指令的文本，没有在这里显示。"
-      : "[Pi] This command's reply contained text that reads as a delivery instruction, so it is not shown here.";
+    return hostT(locale ?? "en", "[Pi] 这条命令的回复里有会被当作投递指令的文本，没有在这里显示。");
   }
 
   /** What the owner typed for this turn, trimmed, when it can be a command at all: their own message, without files. */
@@ -1158,13 +1154,13 @@ export class PiRpcAdapter implements CodexAdapter {
     if (event.type === "widget") { if (event.lines?.length) worker.ui.widgets[event.key] = { lines: event.lines, placement: event.placement }; else delete worker.ui.widgets[event.key]; return; }
     if (event.type === "title") { worker.ui.title = event.title; return; }
     if (event.type === "editor_text") worker.ui.editorText = { text: event.text, revision: ++worker.editorRevision };
-    const turn = worker.turn, zh = turn?.input.locale === "zh";
+    const turn = worker.turn, loc = turn?.input.locale ?? "en";
     // Marked as coming from Pi or one of its extensions, so it is never read as something the model wrote.
     // The Host can take an earlier text block as the answer (an empty or placeholder result) and act on its
     // delivery tags; an extension's words are shown as written, never executed.
     const line = this.shownNotExecuted(event.type === "editor_text"
-      ? `${zh ? "[Pi 扩展] 建议的输入" : "[Pi extension] Suggested input"}:\n${event.text}`
-      : `${source === "host" ? "[Pi]" : zh ? "[Pi 扩展]" : "[Pi extension]"} ${event.text}`, turn?.input.locale);
+      ? `${hostT(loc, "[Pi 扩展] 建议的输入")}:\n${event.text}`
+      : `${source === "host" ? "[Pi]" : hostT(loc, "[Pi 扩展]")} ${event.text}`, turn?.input.locale);
     if (turn && !turn.done.settled) {
       if (event.type === "notify") turn.notices.push(event.text);
       void this.emit(turn, { type: "assistant_text", text: line, sessionId: worker.sessionId });
@@ -1182,7 +1178,7 @@ export class PiRpcAdapter implements CodexAdapter {
   private emitExtensionError(turn: Turn, error: Extract<PiNativeEvent, { type: "extension_error" }>): void {
     turn.extensionErrors++;
     if (turn.extensionErrors > NOTICE_BACKLOG_LIMIT) return;
-    const label = turn.input.locale === "zh" ? "[Pi 扩展错误]" : "[Pi extension error]";
+    const label = hostT(turn.input.locale ?? "en", "[Pi 扩展错误]");
     void this.emit(turn, { type: "assistant_text", text: this.shownNotExecuted(`${label} ${error.extensionPath} (${error.event}): ${error.error}`, turn.input.locale), sessionId: turn.worker.sessionId });
   }
 
@@ -1190,9 +1186,10 @@ export class PiRpcAdapter implements CodexAdapter {
     if (!turn.extensionErrors) return text;
     // Extension diagnostics can contain text that resembles a delivery directive.
     // Keep their details in the process; only a fixed count belongs in the final answer.
-    const warning = turn.input.locale === "zh"
-      ? `[Pi] 本轮出现 ${turn.extensionErrors} 个扩展错误；详情见本轮运行过程。`
-      : `[Pi] ${turn.extensionErrors} extension ${turn.extensionErrors === 1 ? "error" : "errors"} occurred. See this turn's run details.`;
+    const loc = turn.input.locale ?? "en";
+    const warning = turn.extensionErrors === 1
+      ? hostT(loc, "[Pi] 本轮出现 1 个扩展错误；详情见本轮运行过程。")
+      : hostT(loc, "[Pi] 本轮出现 {0} 个扩展错误；详情见本轮运行过程。", turn.extensionErrors);
     return text.trim() ? `${text}\n\n${warning}` : warning;
   }
 
@@ -1218,9 +1215,7 @@ export class PiRpcAdapter implements CodexAdapter {
       // Cancelling keeps the extension's original text; a truncated "edit" would silently destroy the rest.
       cancel();
       const size = request.prefill!.length.toLocaleString("en-US");
-      this.publishUi(worker, { type: "notify", level: "warning", text: locale === "zh"
-        ? `一个扩展要求编辑 ${size} 个字符的文本，超过了这里编辑卡片能容纳的 16,000 个字符。这次编辑已取消，原文没有改动；这类编辑请在 Pi 的终端界面里做。`
-        : `An extension asked to edit ${size} characters of text, more than the edit card here can hold (16,000). The edit was cancelled and the original text is unchanged; do this kind of edit in Pi's terminal UI.` }, "host");
+      this.publishUi(worker, { type: "notify", level: "warning", text: hostT(locale, "一个扩展要求编辑 {0} 个字符的文本，超过了这里编辑卡片能容纳的 16,000 个字符。这次编辑已取消，原文没有改动；这类编辑请在 Pi 的终端界面里做。", size) }, "host");
       return;
     }
     worker.dialogs.set(request.id, request);
@@ -1816,13 +1811,11 @@ export class PiRpcAdapter implements CodexAdapter {
     const worker = turn.worker;
     if (worker.trusted !== false || !worker.bridge?.isOpen || !turn.input.onApprovalRequest) return;
     if ((await this.store.trustDecision(cwd)) !== undefined || !(await hasPiTrustGatedFiles(cwd))) return;
-    const zh = turn.input.locale === "zh";
-    const yes = zh ? "信任并加载" : "Trust and load", no = zh ? "不加载" : "Do not load";
+    const loc = turn.input.locale ?? "en";
+    const yes = hostT(loc, "信任并加载"), no = hostT(loc, "不加载");
     const answer = await this.askCommandQuestion(turn, {
-      title: zh ? "要加载这个项目自带的 Pi 文件吗？" : "Load this project's own Pi files?",
-      message: zh
-        ? "这个工作区带有项目级 Pi 配置（.pi 下的设置、扩展、技能、提示词或 MCP 配置）。扩展和 MCP 服务会在你的电脑上运行代码。"
-        : "This workspace has project-level Pi files (settings, extensions, skills, prompts or MCP servers under .pi). Extensions and MCP servers run code on your computer.",
+      title: hostT(loc, "要加载这个项目自带的 Pi 文件吗？"),
+      message: hostT(loc, "这个工作区带有项目级 Pi 配置（.pi 下的设置、扩展、技能、提示词或 MCP 配置）。扩展和 MCP 服务会在你的电脑上运行代码。"),
       options: [{ label: yes, value: "yes" }, { label: no, value: "no" }],
     });
     this.throwIfStopped(turn);

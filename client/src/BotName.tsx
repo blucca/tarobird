@@ -15,7 +15,7 @@ export function BotName({ id, name, bot, compact = false }: { id: string; name: 
   const directory = useBotDirectory(), identity = bot ?? directory.find(value => value.id === id);
   const match = resolveModelBrand(identity);
   const description = match && (match.source === "model" ? t("当前配置模型：{0}", identity?.model) : t("引擎默认品牌：{0}，具体模型未指定", modelBrandNames[match.brand]));
-  return <span className={`bot-name${compact ? " bot-name-compact" : ""}`} data-bot-name={id} data-model-brand={match?.brand} data-brand-source={match?.source} title={description} aria-label={description ? `${name}${locale === "en" ? ", " : "，"}${description}` : undefined}>
+  return <span className={`bot-name${compact ? " bot-name-compact" : ""}`} data-bot-name={id} data-model-brand={match?.brand} data-brand-source={match?.source} title={description} aria-label={description ? `${name}${locale === "en" ? ", " : locale === "ja" ? "、" : "，"}${description}` : undefined}>
     <span className="bot-name-label">{name}</span>
     {match && <span className="bot-brand-icon" aria-hidden="true" style={{ "--brand-icon": `url("${icons[match.brand]}")` } as CSSProperties}/>}
   </span>;

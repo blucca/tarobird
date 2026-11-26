@@ -17,6 +17,8 @@ import { routeAlertSchema, type RouteAlert } from "../hub/route-monitor.js";
 import path from "node:path";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
+import { hostT } from "../locales/index.js";
+import { normalizeLocale } from "../runtime/locale.js";
 import { conversationSchema, idSchema, type Json } from "../client-protocol/index.js";
 import { handleCoreCardAction, renderCoreConversationStop, stopCoreConversation, stopCoreRunForMessage } from "../core/card-actions.js";
 import { resolveCoreLocale } from "../core/locale.js";
@@ -136,7 +138,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     // Configuration IO can overlap shutdown even when the sweep succeeded.
     // Do not claim obligations (and spend their retry budget) on a stopped worker.
     channel.transport.throwIfStopped();
-    const result = await redeliverRecoveredCoreObligations({ channel, stateDir: options.stateDir, runtime, instanceName: options.botId, workspaceOverride: resolveInstanceWorkspacePath(config), locale: config.locale === "zh" ? "zh" : "en" });
+    const result = await redeliverRecoveredCoreObligations({ channel, stateDir: options.stateDir, runtime, instanceName: options.botId, workspaceOverride: resolveInstanceWorkspacePath(config), locale: normalizeLocale(config.locale, "en") });
     if (result.failed) options.onWarning?.("gateway_delivery_recovery_failed");
   };
   // Real Bridge entrypoints re-check access internally. Give this independently
@@ -218,13 +220,13 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
           const parsed = parseGroupStance(response.text);
           // A reply that is only a position block still shows that position.
           const position = parsed.stance;
-          const positionLabel = position?.stance === "agree" ? input.locale === "en" ? `Agrees with ${position.proposalId}.` : `同意 ${position.proposalId}。`
-            : position?.stance === "disagree" ? input.locale === "en" ? "Disagrees with the current proposal." : "不同意当前提案。"
-            : input.locale === "en" ? "Abstains from this position." : "本轮不表态。";
+          const positionLabel = position?.stance === "agree" ? hostT(input.locale, "同意 {0}。", position.proposalId)
+            : position?.stance === "disagree" ? hostT(input.locale, "不同意当前提案。")
+            : hostT(input.locale, "本轮不表态。");
           const visible = parsed.text.trim() || (position ? [position.proposal, position.summary].filter(Boolean).join("\n\n") || positionLabel : "");
           // Avoid Core falling back to a raw/empty streamed result when the only
           // output was an invalid control block. Do not report this UI notice as a view.
-          response = { ...response, text: visible || (parsed.invalid ? input.locale === "en" ? "No readable reply was provided. This turn did not record a valid position." : "本轮未提供可读回复，也未记录有效立场。" : "") };
+          response = { ...response, text: visible || (parsed.invalid ? hostT(input.locale, "本轮未提供可读回复，也未记录有效立场。") : "") };
           // Only the turn's primary engine call is the speaker's view. A Core
           // repair call in the same turn (artifact delivery) is never reported.
           if (isGroupDiscussionPrompt(input.text)) {
@@ -237,7 +239,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
         }
         // An empty final would make the shared handler recover raw streamed
         // text, potentially reintroducing a duplicate delivery marker.
-        return delivered.length ? { ...response, text: await stripAlreadyDeliveredAppArtifacts(response.text, delivered) || (input.locale === "en" ? "Attachment delivered." : "附件已发送。"), appDeliveries: delivered } : response;
+        return delivered.length ? { ...response, text: await stripAlreadyDeliveredAppArtifacts(response.text, delivered) || hostT(input.locale, "附件已发送。"), appDeliveries: delivered } : response;
       } finally { lifetime.abort(); }
     };
     const value: unknown = Reflect.get(target, key, receiver);

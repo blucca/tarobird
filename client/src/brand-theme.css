@@ -70,6 +70,9 @@
   --card-blue-bg:#e9eef7; --card-blue-fg:#2c4f86; --card-green-bg:#e7f3eb; --card-green-fg:#1d6f3f; --card-orange-bg:#fbf0dd; --card-orange-fg:#8a5200; --card-red-bg:#fcebea; --card-red-fg:#b02f2f;
   font-family:var(--font-sans); color-scheme:light;
 }
+:root[lang^="ja"]{
+  --font-sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI","Yu Gothic","Meiryo","Noto Sans JP","Noto Sans CJK JP",sans-serif;
+}
 /* ---------- Tokens: dark (explicit, and system on a dark OS) ---------- */
 :root[data-theme=dark]{
 

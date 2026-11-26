@@ -37,6 +37,7 @@
   },
   "scripts": {
     "build": "node scripts/build-standalone.mjs",
+    "check:translations": "node scripts/check-translations.mjs",
     "build:web": "vite build web && node scripts/inline-web.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/src/index.js",

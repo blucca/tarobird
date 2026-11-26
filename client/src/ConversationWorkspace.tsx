@@ -29,7 +29,7 @@ import type { Bot, HubConnection } from "./connection.js";
 import { WorkspaceRunChanges } from "./WorkspaceRunChanges.js";
 import { listWorkbenchLibrary, type WorkbenchLibraryEntry } from "./workbench-library.js";
 import type { WorkbenchFileTarget } from "./workbench-library-context.js";
-import { t, useLocale } from "./i18n.js";
+import { localeIntlTag, t, useLocale } from "./i18n.js";
 import { formatFileLimit } from "./files.js";
 import "./conversation-workspace.css";
 
@@ -49,7 +49,7 @@ function formatRelativeTime(timestamp: number, locale: string): string {
   if (diffSec < 45) return t("刚刚");
   if (diffSec < 3600) return t("{0} 分钟前", Math.floor(diffSec / 60));
   if (diffSec < 86400) return t("{0} 小时前", Math.floor(diffSec / 3600));
-  return new Date(timestamp).toLocaleDateString(locale === "en" ? "en-US" : "zh-CN", { month: "short", day: "numeric" });
+  return new Date(timestamp).toLocaleDateString(localeIntlTag(locale), { month: "short", day: "numeric" });
 }
 
 function fileBadge(name: string, mime?: string): { label: string; tone: string } {

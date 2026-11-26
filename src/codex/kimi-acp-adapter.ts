@@ -3,6 +3,7 @@ import { KimiHistoryError, KimiHistoryReplay, kimiHistoryRejection } from "./kim
 import { isLogicalSessionId as isHostLogicalSessionId } from "../runtime/logical-session.js";
 import { withFileMutex } from "../state/file-mutex.js";
 import { raceAbort } from "../runtime/abort-race.js";
+import { hostT } from "../locales/index.js";
 import { spawnEngine } from "../runtime/engine-process.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -423,11 +424,9 @@ function renderDeferredSettingsNotice(
   notice: KimiDeferredSettingsNotice,
   locale: NonNullable<CodexUserMessageInput["locale"]>,
 ): string {
-  if (locale === "zh") {
-    return `⏳ 新的引擎设置已记录，但本会话还有 ${notice.taskCount} 个后台任务在跑，会在它们结束后的下一轮生效（本轮仍用当前设置）。想立刻生效可发 /reset 开新会话。`;
-  }
-  const taskLabel = notice.taskCount === 1 ? "background task" : "background tasks";
-  return `⏳ New engine settings were saved, but this session still has ${notice.taskCount} ${taskLabel} running. They will take effect on the next turn after the background work finishes (this turn still uses the current settings). Send /reset to start a new session if you want them to take effect immediately.`;
+  return notice.taskCount === 1
+    ? hostT(locale, "⏳ 新的引擎设置已记录，但本会话还有 1 个后台任务在跑，会在它结束后的下一轮生效（本轮仍用当前设置）。想立刻生效可发 /reset 开新会话。")
+    : hostT(locale, "⏳ 新的引擎设置已记录，但本会话还有 {0} 个后台任务在跑，会在它们结束后的下一轮生效（本轮仍用当前设置）。想立刻生效可发 /reset 开新会话。", notice.taskCount);
 }
 const DEFAULT_BACKGROUND_CONTINUATION_GRACE_MS = 10_000;
 const DEFAULT_HOOK_TERMINAL_GRACE_MS = 250;
@@ -3653,7 +3652,7 @@ export class KimiAcpAdapter implements CodexAdapter {
         text = await this.resolveQueuedKimiPrompt(worker, pending, sessionId);
       }
       // This line is the whole answer of a turn that wrote none, so it is in the conversation's language.
-      text ||= input.locale === "zh" ? "Kimi 已完成这次请求，没有文字回复。" : "Kimi completed the request.";
+      text ||= hostT(input.locale ?? "en", "Kimi 已完成这次请求，没有文字回复。");
       await Promise.race([
         this.emitEngineEvent(pending.onEngineEvent, { type: "result", text, sessionId }),
         pending.failurePromise,

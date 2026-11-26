@@ -3,6 +3,8 @@ import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadRes
 import { applyClaudeQuotaEvent, claudeQuotaForModel, parseClaudeUsage, QuotaReadError, QUOTA_TTL_MS, unavailableQuota } from "./account-quota.js";
 import type { QuotaSnapshot } from "../client-protocol/engine-quota.js";
 import { claudeAssistantError, claudeError, claudeResultRepeatsError } from "./claude-errors.js";
+import { hostT } from "../locales/index.js";
+import type { Locale } from "../runtime/locale.js";
 import { wholeFilePatch } from "../core/recorded-diff.js";
 import { ClaudeScopedEvents, type ClaudeScope } from "./claude-scoped-events.js";
 import { spawnEngine } from "../runtime/engine-process.js";
@@ -202,7 +204,7 @@ type PendingTurn = {
   absorbedReview?: boolean;
   compactionId?: string;
   compactionBoundaries?: Set<string>;
-  locale?: "zh" | "en";
+  locale?: Locale;
   appPlatformTools?: AppPlatformTools;
   promptWritten: boolean;
   turnId: number;
@@ -656,15 +658,15 @@ function sumUsage(a: AdapterUsage | undefined, b: AdapterUsage | undefined): Ada
 
 /** The answer streamed before Claude cut its turn for a send-now input stays
  * as shown; this says why it ends mid-way. */
-function withSendNowCutNotice(text: string, locale: "zh" | "en" | undefined): string {
+function withSendNowCutNotice(text: string, locale: Locale | undefined): string {
   if (!text.trim()) return text;
-  return `${text}\n\n${locale === "en" ? "(Claude stopped this answer to take in a message sent with Send now.)" : "（Claude 为立即发送的消息中断了以上回答。）"}`;
+  return `${text}\n\n${hostT(locale ?? "en", "（Claude 为立即发送的消息中断了以上回答。）")}`;
 }
 
 /** A cut answer whose send-now input then did not run (stopped or never started). */
-function withInterruptedAnswerNotice(text: string, locale: "zh" | "en" | undefined): string {
+function withInterruptedAnswerNotice(text: string, locale: Locale | undefined): string {
   if (!text.trim()) return text;
-  return `${text}\n\n${locale === "en" ? "(This answer was interrupted.)" : "（以上回答在中途被中断。）"}`;
+  return `${text}\n\n${hostT(locale ?? "en", "（以上回答在中途被中断。）")}`;
 }
 
 /** A Claude error answer to a native input control: nothing was done. */
@@ -672,11 +674,9 @@ function nativeControlRejection(error: ClaudeControlError): NativeInputControlRe
   return /unsupported|not supported|unrecognized/i.test(error.message) ? { outcome: "rejected", reason: "unsupported" } : { outcome: "rejected", reason: "stale" };
 }
 
-function withDroppedSteerNotice(text: string, dropped: number, locale: "zh" | "en" | undefined): string {
+function withDroppedSteerNotice(text: string, dropped: number, locale: Locale | undefined): string {
   if (dropped <= 0) return text;
-  const notice = locale === "en"
-    ? `(${dropped} message(s) added while Claude was working did not reach this turn. Send again if still needed.)`
-    : `（运行中补充的 ${dropped} 条消息未进入本轮，如仍需要请重新发送。）`;
+  const notice = hostT(locale ?? "en", "（运行中补充的 {0} 条消息未进入本轮，如仍需要请重新发送。）", dropped);
   return text ? `${text}\n\n${notice}` : notice;
 }
 
@@ -1523,9 +1523,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
         // Only this typed pre-prompt handshake failure is safe to retry. Never
         // replay a model turn after an engine/tool/publish failure or user stop.
         if (!(error instanceof ClaudeAppMcpInitializationError) || input.abortSignal?.aborted || this.destroyPromise) throw error;
-        const notice = input.locale === "en"
-          ? "Claude native App tools could not initialize. This turn uses compatible file delivery; other conversations are unaffected."
-          : "Claude 原生 App 工具初始化失败，本轮已改用兼容文件交付；其他会话不受影响。";
+        const notice = hostT(input.locale ?? "en", "Claude 原生 App 工具初始化失败，本轮已改用兼容文件交付；其他会话不受影响。");
         await this.emitEngineEvent(worker, { type: "assistant_text", text: notice, sessionId: worker.currentSessionId ?? undefined }, input.onEngineEvent);
         worker = await this.getOrCreateWorker(sessionId, agentInstructions, input.instructions ?? null, approvalMode, effectiveWorkspace, engineOptions);
         // A deterministic rejection disables only this fallback worker. A slow
@@ -4634,7 +4632,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       }
       this.emitEngineEvent(worker, { type: "result", text: eventText, sessionId: worker.currentSessionId ?? undefined }, pending.onEngineEvent);
     }
-    const finalText = eventText.trim() || (pending.locale === "zh" ? "Claude 本轮已结束，未返回文字回复。" : "Claude ended this turn without a text reply.");
+    const finalText = eventText.trim() || hostT(pending.locale ?? "en", "Claude 本轮已结束，未返回文字回复。");
     const sessionId = worker.currentSessionId ?? undefined;
     void usage.then((value) => pending.resolve({ text: finalText, sessionId, usage: value }), () => pending.resolve({ text: finalText, sessionId }));
   }

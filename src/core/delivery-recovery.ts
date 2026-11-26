@@ -21,6 +21,8 @@ import { redactCoreErrorDetail } from "./redaction.js";
 import { createCoreServiceRuntime, type CoreServiceRuntime } from "./runtime.js";
 import type { CoreChannelLike } from "./types.js";
 import { isGatewayChannel } from "./channel-profile.js";
+import type { Locale } from "../runtime/locale.js";
+import { hostT } from "../locales/index.js";
 
 export interface CoreRedeliveryChannel {
   profile?: "gateway" | "feishu";
@@ -32,10 +34,8 @@ export interface CoreRedeliveryChannel {
 
 /** Visible prefix for redeliveries that might duplicate an already-received
  *  message (crash mid-send / post-rejection retry). Honest at-least-once. */
-export function recoveredReplyMarker(locale: "en" | "zh"): string {
-  return locale === "zh"
-    ? "♻️ 服务重启前有一条回复未确认送达，现补发（可能与之前收到的重复）："
-    : "♻️ Recovered reply — the service restarted during delivery, so this may be a duplicate:";
+export function recoveredReplyMarker(locale: Locale): string {
+  return hostT(locale, "♻️ 服务重启前有一条回复未确认送达，现补发（可能与之前收到的重复）：");
 }
 
 export async function redeliverRecoveredCoreObligations(input: {
@@ -43,7 +43,7 @@ export async function redeliverRecoveredCoreObligations(input: {
   stateDir: string;
   workspaceOverride?: string;
   instanceName?: string;
-  locale: "en" | "zh";
+  locale: Locale;
   runtime?: CoreServiceRuntime;
   log?: (message: string) => void;
 }): Promise<{ recovered: number; failed: number; abandoned: number }> {
@@ -61,9 +61,7 @@ export async function redeliverRecoveredCoreObligations(input: {
       const conversationKey = row.conversationKey ?? `lark:${row.chatId}`;
       try {
         const content = await readDeliveryObligationContent(input.stateDir, row);
-        const safeReplay = buildCoreRecoveryResponse(content).trim() || (input.locale === "en"
-          ? "A recovered reply contained only actions that are unsafe to rerun, so those actions were skipped."
-          : "恢复的回复只包含不适合自动重跑的操作，因此已跳过这些操作。");
+        const safeReplay = buildCoreRecoveryResponse(content).trim() || hostT(input.locale, "恢复的回复只包含不适合自动重跑的操作，因此已跳过这些操作。");
         const replayPreflight = await preflightCoreResponseDeliveryDirectives(safeReplay, {
           stateDir: input.stateDir,
           workspaceOverride: input.workspaceOverride,

@@ -513,7 +513,7 @@ export interface CodexUserMessageInput {
    */
   authoredText?: string;
   files: string[];
-  locale?: "en" | "zh";
+  locale?: Locale;
   /** Stable channel/runtime contract. Changes may reconfigure persistent workers. */
   instructions?: string;
   /** Private guidance for this request only. Must never participate in worker settings. */

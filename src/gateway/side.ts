@@ -48,7 +48,7 @@ export function gatewaySideSessions(bridge: CoreBridgeLike, stateDir: string, bo
       if (!await bindingReady(scope.conversationId)) throw new SideSessionError("no_main_session");
       const cfg = await config(), conversationKey = buildCoreConversationKey(scope.conversationId);
       if (!bridge.openSideSession) throw new SideSessionError("unsupported");
-      return bridge.openSideSession({ chatId: stableCoreNumericId(conversationKey), conversationKey, userId: stableCoreNumericId(`user:gwuser_${scope.userId}`), chatType: "bus", locale: cfg.locale === "zh" ? "zh" : "en", workspaceOverride: resolveInstanceWorkspacePath(cfg), ...(tools === "inherited" ? { tools } : {}), abortSignal });
+      return bridge.openSideSession({ chatId: stableCoreNumericId(conversationKey), conversationKey, userId: stableCoreNumericId(`user:gwuser_${scope.userId}`), chatType: "bus", locale: cfg.locale, workspaceOverride: resolveInstanceWorkspacePath(cfg), ...(tools === "inherited" ? { tools } : {}), abortSignal });
     },
     ...(channel ? { deliveryTools: async (scope: SideScope, _sideId: string, _requestId: string, signal: AbortSignal, publish: Parameters<typeof createSideDeliveryTools>[0]["publish"]) => {
       const cfg = await config();
@@ -60,7 +60,7 @@ export function gatewaySideSessions(bridge: CoreBridgeLike, stateDir: string, bo
     beforeAsk: async () => {
       const cfg = await config();
       if (signature(cfg) !== fingerprint) throw new SideSessionError("expired");
-      if (await checkBudgetAvailability(stateDir, cfg.budgetUsd, cfg.locale === "zh" ? "zh" : "en")) throw new SideSessionError("budget_exhausted");
+      if (await checkBudgetAvailability(stateDir, cfg.budgetUsd, cfg.locale)) throw new SideSessionError("budget_exhausted");
     },
     ...(download ? {
       prepareAttachments: async (scope, sideId, requestId, refs, signal) => {

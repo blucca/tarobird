@@ -2352,6 +2352,10 @@ exports[`Gateway card translation > translates actual config, board, status, res
               "label": "English",
               "value": "en",
             },
+            {
+              "label": "日本語",
+              "value": "ja",
+            },
           ],
           "type": "select",
         },
@@ -2861,7 +2865,7 @@ exports[`Gateway card translation > translates actual config, board, status, res
         {
           "children": [
             {
-              "text": "**语言**",
+              "text": "**语言区块**",
               "type": "markdown",
             },
             {
@@ -2934,6 +2938,42 @@ exports[`Gateway card translation > translates actual config, board, status, res
                 "larkChatId": "fixture",
                 "revision": "render_revision_fixture",
                 "value": "en",
+              },
+            },
+            {
+              "actionId": "action:5.0.3",
+              "extra": {
+                "behaviors": [
+                  {
+                    "type": "callback",
+                    "value": {
+                      "action": "locale",
+                      "bridgeChatId": 42,
+                      "bridgeChatType": "private",
+                      "cctb_lark": "config",
+                      "conversationKey": "lark:fixture",
+                      "larkChatId": "fixture",
+                      "revision": "render_revision_fixture",
+                      "value": "ja",
+                    },
+                  },
+                ],
+              },
+              "layout": {
+                "width": "fill",
+              },
+              "style": "default",
+              "text": "日本語",
+              "type": "button",
+              "value": {
+                "action": "locale",
+                "bridgeChatId": 42,
+                "bridgeChatType": "private",
+                "cctb_lark": "config",
+                "conversationKey": "lark:fixture",
+                "larkChatId": "fixture",
+                "revision": "render_revision_fixture",
+                "value": "ja",
               },
             },
           ],

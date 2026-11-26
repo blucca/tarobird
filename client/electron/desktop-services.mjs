@@ -8,6 +8,7 @@ import { captureScreenshot } from './screenshot.mjs';
 import { DesktopUpdates, UPDATE_COMMANDS } from './updater.mjs';
 import { BROWSER_COMMANDS, BROWSER_EVENT, WorkbenchBrowser } from './browser.mjs';
 import { prepareDesignQuit, cancelDesignQuit } from './design-quit.mjs';
+import { resolveElectronLocale, pickElectronCopy } from './locale.mjs';
 import { windowsUnreadBadge } from './windows-unread-badge.mjs';
 import { readClipboardImage } from './clipboard-image.mjs';
 
@@ -153,7 +154,11 @@ export class DesktopServices {
         try { await shell.openExternal(url); }
         catch {
           if (active() && !w.isDestroyed()) await this.electron.dialog.showMessageBox(w, { type: 'error', title: 'TaroBird',
-            message: app.getLocale().startsWith('en') ? 'Could not open this link in your browser. Copy the link and try again.' : '无法在浏览器中打开链接，请复制链接后重试。' });
+            message: pickElectronCopy(resolveElectronLocale({ app }), {
+              zh: '无法在浏览器中打开链接，请复制链接后重试。',
+              en: 'Could not open this link in your browser. Copy the link and try again.',
+              ja: 'ブラウザでこのリンクを開けませんでした。リンクをコピーしてもう一度お試しください。',
+            }) });
           throw new Error('external_open_failed');
         }
         return null;
@@ -166,7 +171,12 @@ export class DesktopServices {
       case 'unread_count':
         if (this.platform === 'win32') {
           this.unreadBadge ??= windowsUnreadBadge(this.electron.nativeImage);
-          const description = args.count ? (app.getLocale().startsWith('en') ? `${args.count} unread messages` : `${args.count} 条未读消息`) : '';
+          const loc = resolveElectronLocale({ app });
+          const description = args.count ? pickElectronCopy(loc, {
+            zh: `${args.count} 条未读消息`,
+            en: `${args.count} unread messages`,
+            ja: `${args.count} 件の未読メッセージ`,
+          }) : '';
           const overlay = [this.unreadBadge(args.count), description];
           w.setOverlayIcon(...overlay);
           this.unreadOverlay = overlay;

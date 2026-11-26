@@ -5,7 +5,7 @@ import type { HubConnection } from "./connection.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
 import { SettingsGroupHeading } from "./SettingsParts.js";
 import { useEngineQuota } from "./use-engine-quota.js";
-import { t, useLocale } from "./i18n.js";
+import { localeIntlTag, t, useLocale } from "./i18n.js";
 import "./engine-quota.css";
 
 const engines = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
@@ -72,8 +72,8 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
   const [clock, setClock] = useState(Date.now);
   useEffect(() => { if (!active || !quota.visible) return; setClock(Date.now()); const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, [active, quota.visible]);
   const now = clock + (state.serverTimeOffset ?? 0);
-  const formatTime = (value: string) => new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
-  const formatNumber = (value: number) => new Intl.NumberFormat(locale === "zh" ? "zh-CN" : "en", { maximumFractionDigits: 2 }).format(value);
+  const formatTime = (value: string) => new Intl.DateTimeFormat(localeIntlTag(locale), { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+  const formatNumber = (value: number) => new Intl.NumberFormat(localeIntlTag(locale), { maximumFractionDigits: 2 }).format(value);
   if (!owner) return null;
   return <div className="engine-quota">
     <SettingsGroupHeading scope="host" host={host}>{t("原生模型额度")}</SettingsGroupHeading>

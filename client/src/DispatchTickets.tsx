@@ -3,7 +3,7 @@ import { ChevronRight, ListChecks } from "lucide-react";
 import { OPEN_TICKET_STATUSES, dispatchTicketSchema, engineHealthSchema, ticketOverviewListSchema, type EngineHealth, type TicketAction, type TicketOverview, type TicketOverviewList, type TicketStatus } from "../../src/client-protocol/dispatch.js";
 import type { HubConnection } from "./connection.js";
 import { HubHttpError } from "./http-error.js";
-import { t, useLocale } from "./i18n.js";
+import { localeIntlTag, t, useLocale } from "./i18n.js";
 import "./dispatch.css";
 import { ENGINE_NAMES } from "./DispatcherSettings.js";
 import { blocksText, type Message } from "../../src/client-protocol/index.js";
@@ -43,7 +43,7 @@ function engineNotice(health: EngineHealth, locale: string) {
  * and the window are visible, and shares each read with the list avatar; worker
  * conversations stay hidden and open from here. */
 export function DispatchTickets({ connection, botId, active, online, open }: { connection: HubConnection; botId: string; active: boolean; online: boolean; open: (conversationId: string) => void }) {
-  const locale = useLocale() === "en" ? "en" : "zh-CN";
+  const locale = localeIntlTag(useLocale());
   const [list, setList] = useState<TicketOverviewList>(), [expanded, setExpanded] = useState(false);
   const [busy, setBusy] = useState(""), [confirming, setConfirming] = useState<{ id: string; action: "cancel" | "remove" }>(), [error, setError] = useState(""), [refresh, setRefresh] = useState(0);
   // An unconfirmed action keeps its request ID until a later read shows its

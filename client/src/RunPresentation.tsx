@@ -25,7 +25,7 @@ import { ReplyWidthContext, replyWidthKey, setReplyWide, useReplyWide } from "./
 import { useRunReportPreview } from "./RunReportPreview.js";
 import { RunReport } from "./RunReport.js";
 import { ScopedTaskDescription } from "./ScopedTaskDescription.js";
-import { t, useLocale } from "./i18n.js";
+import { localeBcp47, localeIntlTag, t, useLocale } from "./i18n.js";
 import { useConnectionSelection } from "./connection-selection.js";
 import { isContextMaintenance } from "../../src/client-protocol/run.js";
 import { runThinkingPreview } from "../../src/client-protocol/run-thinking.js";
@@ -227,10 +227,10 @@ function RunDetails({ goalTurnEnded, scoped, run, phase, observedNow, sync, mess
   const disconnected = activePhase(run.phase) && (online !== "online" || !connectionState.bots.find(bot => bot.id === message.authorId)?.online);
   const live = activePhase(phase) && !disconnected;
   const age = Math.max(0, observedNow - run.updatedAt);
-  const updateDate = new Date(run.updatedAt), updateAt = updateDate.toLocaleString(locale === "zh" ? "zh-CN" : "en-GB", { hourCycle: "h23" });
+  const updateDate = new Date(run.updatedAt), updateAt = updateDate.toLocaleString(locale === "en" ? "en-GB" : localeIntlTag(locale), { hourCycle: "h23" });
   const unit: Intl.RelativeTimeFormatUnit = age >= 86_400_000 ? "day" : age >= 3_600_000 ? "hour" : "minute";
   const unitMs = unit === "day" ? 86_400_000 : unit === "hour" ? 3_600_000 : 60_000;
-  const updateWhen = age < 60_000 ? t("刚刚") : new Intl.RelativeTimeFormat(locale, { numeric: "always" }).format(-Math.floor(age / unitMs), unit);
+  const updateWhen = age < 60_000 ? t("刚刚") : new Intl.RelativeTimeFormat(localeBcp47(locale), { numeric: "always" }).format(-Math.floor(age / unitMs), unit);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   useEffect(() => {
     const controller = new AbortController(); setBusy(true); setError("");

@@ -3,6 +3,7 @@ import { backgroundTaskBody, backgroundTaskContext, backgroundTaskReplyTo } from
 import { createRunRecord, recordRunEvent } from "./run-record.js";
 import { createScopedRunPresentation, finishScopedRunPresentation } from "./scoped-run-presentation.js";
 import { channelProfile } from "./channel-profile.js";
+import { hostT } from "../locales/index.js";
 import { workspaceArtifactRoot } from "./artifact-paths.js";
 import { applyGatewayGroupMode, gatewayNativeCommandHelp } from "./platform-policy.js";
 import { gatewayRequiresMention } from "./platform-policy.js";
@@ -171,22 +172,22 @@ const defaultPrepareLarkVideoInput = prepareVideoInput;
 
 type CoreTurnUsage = Awaited<ReturnType<CoreBridgeLike["handleAuthorizedMessage"]>>["usage"];
 
-function claudeGoalReceiptText(receipt: ClaudeNativeGoalReceipt | undefined, locale: "zh" | "en"): string {
-  if (receipt?.rejection) return locale === "en"
-    ? `Claude did not accept the goal.${receipt.state === "active" ? " The existing native goal is still active." : ""} Use /goal to check the native state.`
-    : `Claude 未受理这个目标。${receipt.state === "active" ? "原有目标仍保留。" : ""}可用 /goal 查询原生状态。`;
-  if (receipt?.state === "active") return locale === "en"
-    ? `${receipt.capped ? "Claude reached its evaluator limit for this turn; the" : "This turn ended; the"} goal is still active. Use /goal to check it or /goal clear to remove it.`
-    : `${receipt.capped ? "本轮达到 Claude 的目标检查次数限制；" : "本轮已结束；"}原生目标仍保留。可用 /goal 查询，或用 /goal clear 清除。`;
-  if (receipt?.state === "none") {
-    if (receipt.cleared) return locale === "en" ? "Claude confirmed that the goal was cleared." : "Claude 已确认清除目标。";
-    return locale === "en"
-      ? "Claude reports no goal set. This does not confirm that its completion condition was met."
-      : "Claude 当前未报告已设置的目标；这不代表已确认达成目标条件。";
+function claudeGoalReceiptText(receipt: ClaudeNativeGoalReceipt | undefined, locale: Locale): string {
+  if (receipt?.rejection) {
+    return receipt.state === "active"
+      ? hostT(locale, "Claude 未受理这个目标。原有目标仍保留。可用 /goal 查询原生状态。")
+      : hostT(locale, "Claude 未受理这个目标。可用 /goal 查询原生状态。");
   }
-  return locale === "en"
-    ? "The native goal state could not be verified. Use /goal to check it."
-    : "尚未核实原生目标状态，可用 /goal 查询。";
+  if (receipt?.state === "active") {
+    return receipt.capped
+      ? hostT(locale, "本轮达到 Claude 的目标检查次数限制；原生目标仍保留。可用 /goal 查询，或用 /goal clear 清除。")
+      : hostT(locale, "本轮已结束；原生目标仍保留。可用 /goal 查询，或用 /goal clear 清除。");
+  }
+  if (receipt?.state === "none") {
+    if (receipt.cleared) return hostT(locale, "Claude 已确认清除目标。");
+    return hostT(locale, "Claude 当前未报告已设置的目标；这不代表已确认达成目标条件。");
+  }
+  return hostT(locale, "尚未核实原生目标状态，可用 /goal 查询。");
 }
 
 function mergeCoreTurnUsage(first: CoreTurnUsage, second: CoreTurnUsage): CoreTurnUsage {
@@ -922,7 +923,7 @@ async function enqueueCoreTurn(
     reactionSettings?: LarkReactionSettings;
   },
   normalized: CoreNormalizedBridgeMessage,
-  locale: "zh" | "en",
+  locale: Locale,
   onWait: (event: ChatQueueWaitEvent) => Promise<void>,
 ): Promise<boolean> {
   if (input.channel.ownsMessageQueueSlot?.(normalized.chatId, normalized.messageId)) {
@@ -1011,7 +1012,7 @@ async function updateCoreQueueCardInPlace(
 async function settleLingeringCoreQueueCard(
   channel: CoreChannelLike,
   ref: CoreQueueCardRef,
-  locale: "zh" | "en",
+  locale: Locale,
 ): Promise<void> {
   // A queued task ran without a run card taking this "queued" card over — most
   // commonly a slash command, which handleLarkSimpleCommand processes and returns
@@ -1030,7 +1031,7 @@ async function settleLingeringCoreQueueCard(
     body: {
       direction: "vertical",
       padding: "12px 12px 12px 12px",
-      elements: [{ tag: "markdown", content: locale === "en" ? "✅ Done." : "✅ 已结束。" }],
+      elements: [{ tag: "markdown", content: hostT(locale, "✅ 已结束。") }],
     },
   }).catch(() => undefined);
 }
@@ -1039,7 +1040,7 @@ async function transitionQueuedCoreCardToStarted(
   channel: CoreChannelLike,
   runtime: CoreServiceRuntime,
   normalized: CoreNormalizedBridgeMessage,
-  locale: "zh" | "en",
+  locale: Locale,
 ): Promise<void> {
   const queuedRef = runtime.queueCards.get(normalized.messageId);
   if (!queuedRef) {
@@ -1051,17 +1052,11 @@ async function transitionQueuedCoreCardToStarted(
     || attachment.kind === "video"
     || (attachment.kind === "file" && hasTranscribableMediaExtension(attachment.fileName ?? "")));
   const hasAttachments = normalized.attachments.length > 0;
-  const progressText = locale === "en"
-    ? hasMedia
-      ? "Queue finished. Downloading and transcribing the media now; the model will continue automatically when it is ready."
-      : hasAttachments
-        ? "Queue finished. Reading the attachments now; processing will continue automatically when they are ready."
-        : "Queue finished. This task has started processing."
-    : hasMedia
-      ? "已结束排队，正在转写音视频（包含下载准备）；完成后会自动交给模型继续处理。"
-      : hasAttachments
-        ? "已结束排队，正在读取附件；完成后会自动继续处理。"
-        : "已结束排队，当前任务已经开始处理。";
+  const progressText = hasMedia
+    ? hostT(locale, "已结束排队，正在转写音视频（包含下载准备）；完成后会自动交给模型继续处理。")
+    : hasAttachments
+      ? hostT(locale, "已结束排队，正在读取附件；完成后会自动继续处理。")
+      : hostT(locale, "已结束排队，当前任务已经开始处理。");
   const state: CoreRunState = {
     ...initialCoreRunState(normalized.conversationKey, normalized.bridgeChatType),
     blocks: [{ kind: "text", content: progressText, streaming: false }],
@@ -1342,9 +1337,7 @@ async function trySteerActiveCoreTurn(
       type: "command.handled", outcome: "unknown", detail: "steer",
       metadata: { eventType: "engine.turn.steer_uncertain" },
     });
-    await sendCoreMarkdown(input.channel, normalized.chatId, locale === "en"
-      ? "The Bot may have received this follow-up, but its receipt could not be confirmed. It has not been queued again. Check the Bot's reply before resending to avoid duplicate work."
-      : "这条补充可能已被 Bot 接收，但暂时无法确认回执，因此没有再次排队。请先核对 Bot 的回复，再决定是否重发，避免重复执行。", {
+    await sendCoreMarkdown(input.channel, normalized.chatId, hostT(locale, "这条补充可能已被 Bot 接收，但暂时无法确认回执，因此没有再次排队。请先核对 Bot 的回复，再决定是否重发，避免重复执行。"), {
       replyTo: normalized.messageId,
       replyInThread: Boolean(normalized.threadId),
     }).catch(async () => {
@@ -1393,7 +1386,7 @@ function scheduleBatchedCoreTurn(
   },
   normalized: CoreNormalizedBridgeMessage,
   commandText: string,
-  locale: "zh" | "en",
+  locale: Locale,
   onWait: (event: ChatQueueWaitEvent) => Promise<void>,
 ): Promise<boolean> {
   const configuredWindowMs = input.runtime.queuePolicy.batchWindowMs;
@@ -1480,7 +1473,7 @@ async function flushBatchedCoreTurn(
     reactionSettings?: LarkReactionSettings;
   },
   conversationKey: string,
-  locale: "zh" | "en",
+  locale: Locale,
 ): Promise<void> {
   const batch = input.runtime.pendingBatches.get(conversationKey);
   if (!batch) {
@@ -1514,7 +1507,7 @@ async function flushBatchedCoreTurn(
 function queuePendingCoreBatchNow(
   input: Parameters<typeof flushBatchedCoreTurn>[0],
   conversationKey: string,
-  locale: "zh" | "en",
+  locale: Locale,
 ): boolean {
   const batch = input.runtime.pendingBatches.get(conversationKey);
   if (!batch) return false;
@@ -1602,15 +1595,13 @@ function stripCoreAttachmentSummary(body: string, attachments: CoreNormalizedBri
 function formatCoreDeniedAccessReply(
   text: string,
   normalized: CoreNormalizedBridgeMessage,
-  locale: "zh" | "en",
+  locale: Locale,
 ): string {
   const base = formatCoreAccessReply(text);
   if (normalized.bridgeChatType !== "group" || base.includes("/invite group") || base.includes("/group allow")) {
     return base;
   }
-  const hint = locale === "en"
-    ? "If you are an authorized user, send `/invite group` or `/group allow` in this group. Otherwise, pair with the bot in private chat first."
-    : "如果你是已授权用户，可在本群发送 `/invite group` 或 `/group allow` 允许当前群；否则请先私聊 bot 完成配对。";
+  const hint = hostT(locale, "如果你是已授权用户，可在本群发送 `/invite group` 或 `/group allow` 允许当前群；否则请先私聊 bot 完成配对。");
   return `${base}\n\n${hint}`;
 }
 
@@ -2389,9 +2380,7 @@ async function runNormalizedCoreMessage(
             reason: event.reason,
           },
         });
-        const waitText = locale === "zh"
-          ? "另一个入口正在使用同一个 AI session，这条消息已排队等待。前一个任务完成后会继续处理。"
-          : "Another entry is using the same AI session. This message is queued and will continue after the active turn finishes.";
+        const waitText = hostT(locale, "另一个入口正在使用同一个 AI session，这条消息已排队等待。前一个任务完成后会继续处理。");
         try {
           await deliverCoreResponse({
             channel: input.channel,
@@ -2473,10 +2462,12 @@ async function runNormalizedCoreMessage(
             if (saved?.goal?.status === "active" && input.bridge.updateThreadGoal && !input.runtime.activeRuns.get(normalized.conversationKey)?.goalWatch) {
               const paused = await input.bridge.updateThreadGoal!({ ...goalReconcileInput, sessionId: saved.goal.threadId, status: "paused", origin: "automatic" });
               if (!paused.goal) return;
-              await sendCoreMarkdown(input.channel, normalized.chatId, locale === "en"
-                ? "The saved goal has been paused after reconnecting. Its objective and usage are retained; use /goal resume to continue."
-                : "重新连接后，已暂停先前未受监控的目标，目标和用量仍保留；使用 /goal resume 可继续执行。",
-                coreReplyOptions(normalized.messageId, Boolean(normalized.threadId)));
+              await sendCoreMarkdown(
+                input.channel,
+                normalized.chatId,
+                hostT(locale, "重新连接后，已暂停先前未受监控的目标，目标和用量仍保留；使用 /goal resume 可继续执行。"),
+                coreReplyOptions(normalized.messageId, Boolean(normalized.threadId)),
+              );
             }
           });
         } else if (cfg.engine !== "claude" && input.bridge.clearThreadGoal) {
@@ -2496,7 +2487,7 @@ async function runNormalizedCoreMessage(
         const appDeliveryCache: AppDeliveryCache = new Map();
         const cleanAppDeliveryText = async (text: string): Promise<string> => {
           const cleaned = await stripAlreadyDeliveredAppArtifacts(text, [...appDeliveries.values()]);
-          return cleaned || (appDeliveries.size ? (locale === "en" ? "Attachment delivered." : "附件已发送。") : cleaned);
+          return cleaned || (appDeliveries.size ? hostT(locale, "附件已发送。") : cleaned);
         };
         const resolveFinalText = async (text: string): Promise<string> => cleanAppDeliveryText(resolveRunCardFinalText(text));
         const deliveryPreflight = { stateDir: input.stateDir, requestOutputDir, workspaceOverride };
@@ -2956,9 +2947,7 @@ async function runNormalizedCoreMessage(
             ? postTurnDeliveryFailed
               ? await runCard.failDelivery(
                   runCardAnswerText,
-                  locale === "en"
-                    ? "The result was generated, but attachments or follow-up content could not be confirmed."
-                    : "结果已生成，但附件或后续内容未确认送达。",
+                  hostT(locale, "结果已生成，但附件或后续内容未确认送达。"),
                 )
               : recoveredEngineError !== undefined
                 ? await runCard.finishPartial(
@@ -3012,9 +3001,7 @@ async function runNormalizedCoreMessage(
         if (runCard && !runCardFinished) {
           const salvageResult = await runCard.failDelivery(
             completedEngineText,
-            locale === "en"
-              ? "The result was generated, but attachments or follow-up content could not be delivered."
-              : "结果已生成，但附件或后续内容交付失败。",
+            hostT(locale, "结果已生成，但附件或后续内容交付失败。"),
           ).catch(() => undefined);
           salvaged = salvaged || salvageResult?.shown === true;
         }
@@ -3055,9 +3042,7 @@ async function runNormalizedCoreMessage(
         if (runCard && !runCardFinished) {
           const salvageResult = await runCard.failDelivery(
             completedEngineText,
-            locale === "en"
-              ? "The result was generated, but attachments or follow-up content could not be delivered."
-              : "结果已生成，但附件或后续内容交付失败。",
+            hostT(locale, "结果已生成，但附件或后续内容交付失败。"),
           ).catch(() => undefined);
           salvaged = salvaged || salvageResult?.shown === true;
         }
@@ -3084,9 +3069,7 @@ async function runNormalizedCoreMessage(
       await recordFailedTurnUsage(input.stateDir, error, cfg.budgetUsd);
       const terminal = classifyCoreTurnTermination(error, runController.signal);
       const goalStopNote = cfg.engine === "claude" && (claudeGoalSetTurn || nativeGoalObserved)
-        ? locale === "en"
-          ? "Stopping this turn does not clear a native goal. Use /goal to check it or /goal clear to remove it."
-          : "停止本轮不会清除原生目标。可用 /goal 查询，或用 /goal clear 清除。"
+        ? hostT(locale, "停止本轮不会清除原生目标。可用 /goal 查询，或用 /goal clear 清除。")
         : "";
       let engineFailureOutcome: "error" | "partial" = "error";
       if (terminal.kind === "interrupted") {
@@ -3102,11 +3085,9 @@ async function runNormalizedCoreMessage(
       if (!runCard) {
         await input.channel.send(normalized.chatId, {
           text: terminal.kind === "interrupted"
-            ? (goalStopNote || (locale === "en" ? "Stopped." : "已停止。"))
+            ? (goalStopNote || hostT(locale, "已停止。"))
             : terminal.kind === "idle_timeout"
-              ? (locale === "en"
-                ? `No response for ${terminal.minutes} minute(s); the task was auto-stopped. Restart the instance if it keeps happening.`
-                : `${terminal.minutes} 分钟无响应，任务已自动终止。若反复出现，请重启实例。`)
+              ? hostT(locale, "{0} 分钟无响应，任务已自动终止。若反复出现，请重启实例。", terminal.minutes)
               : renderCoreUserFacingError(error, "engine", locale),
         }, {
           replyTo: normalized.messageId,
@@ -3195,7 +3176,7 @@ export async function createCoreRunCardController(input: {
   /** Optional: a scheduled (cron) run card has no originating message to reply to → send fresh. */
   replyTo?: string;
   replyInThread?: boolean;
-  locale: "zh" | "en";
+  locale: Locale;
   /** Reuse the queued card (managed → CardKit in place; inline → patch) instead of sending a new one. */
   existingCard?: CoreQueueCardRef;
   /** When set, frames the card as an autonomous /goal pursuit (🎯 banner). */
@@ -3265,9 +3246,7 @@ export async function createCoreRunCardController(input: {
         channel: input.channel,
         chatId: input.chatId,
         card: renderCoreRunCard(state, input.locale),
-        fallbackText: input.locale === "en"
-          ? "Task is running. Send /stop to cancel it."
-          : "任务处理中，可发送 /stop 停止。",
+        fallbackText: hostT(input.locale, "任务处理中，可发送 /stop 停止。"),
         options: coreReplyOptions(input.replyTo, input.replyInThread),
         locale: input.locale,
       });
@@ -3774,9 +3753,12 @@ export async function createCoreRunCardController(input: {
       });
     },
     discard: async (reason) => {
-      state = { ...state, status: "interrupted", footer: null,
-        errorText: input.locale === "en" ? reason === "withdrawn" ? "Message withdrawn." : "Message not sent."
-          : reason === "withdrawn" ? "消息已撤回。" : "消息未发送。" };
+      state = {
+        ...state,
+        status: "interrupted",
+        footer: null,
+        errorText: hostT(input.locale, reason === "withdrawn" ? "消息已撤回。" : "消息未发送。"),
+      };
       cancelScheduledUpdate();
       await enqueuePatch(async () => {
         await finalize();
