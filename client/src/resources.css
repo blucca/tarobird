@@ -1,33 +1,35 @@
-.workspace-bottom-bar {
+.workspace-rail-footer {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 6px;
+  gap: 4px;
   flex: none;
-  height: 34px;
-  padding: 0 20px;
+  height: 30px;
+  padding: 0 10px;
   border-top: 1px solid var(--border);
   background: var(--bg);
 }
 
-:root[data-palette="cli"] .workspace-bottom-bar {
+:root[data-palette="cli"] .workspace-rail-footer {
   border-top-color: var(--cli-line);
 }
 
-.composer-wrap:has(+ .workspace-bottom-bar) {
+.conversation-workspace-rail:has(> .workspace-rail-footer) .workspace-body {
   padding-bottom: 14px;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
 }
 
-.workspace-bottom-bar .resources-footer-button {
-  width: 26px;
-  height: 26px;
+.workspace-rail-footer .resources-footer-button {
+  width: 24px;
+  height: 24px;
   padding: 0;
   border-radius: 6px;
   color: var(--muted);
 }
 
-.workspace-bottom-bar .resources-footer-button:hover,
-.workspace-bottom-bar .resources-footer-button.is-open {
+.workspace-rail-footer .resources-footer-button:hover,
+.workspace-rail-footer .resources-footer-button.is-open {
   background: var(--surface);
   color: var(--text);
 }

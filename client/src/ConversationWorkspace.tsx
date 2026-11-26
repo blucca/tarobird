@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -193,6 +193,7 @@ export interface ConversationWorkspaceProps {
   onOpenAllFiles: () => void;
   onOpenWorkbenchFile: (target: WorkbenchFileTarget) => void;
   onOpenTasksModal?: () => void;
+  footerTools?: ReactNode;
 }
 
 export function ConversationWorkspace({
@@ -218,6 +219,7 @@ export function ConversationWorkspace({
   onOpenAllFiles,
   onOpenWorkbenchFile,
   onOpenTasksModal,
+  footerTools,
 }: ConversationWorkspaceProps) {
   const locale = useLocale();
   const [tab, setTab] = useState<WorkspaceTab>("overview");
@@ -953,6 +955,11 @@ export function ConversationWorkspace({
         </div>
       </header>
       {content}
+      {footerTools && (
+        <footer className="workspace-rail-footer">
+          {footerTools}
+        </footer>
+      )}
     </aside>
   );
 }

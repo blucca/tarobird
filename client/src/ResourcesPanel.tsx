@@ -632,7 +632,7 @@ export function DesktopResourcesBar({
         title={snapshot ? t("资源 · CPU {0} · 内存 {1}", formatCpuPercent(snapshot.summary.totalCpuPercent), summaryMem) : t("资源")}
         onClick={() => { setStopNotice(""); setOpen(true); }}
       >
-        <Activity size={16} aria-hidden="true" />
+        <Activity size={15} aria-hidden="true" />
       </button>
 
       {open && (
