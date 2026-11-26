@@ -252,10 +252,11 @@ for (const phone of [false, true]) test(`${engine} ${phone ? "phone" : "desktop"
     const last = page.locator(".native-run").last(); await expect(last).toContainText("执行慢速任务");
     await last.getByRole("button", { name: "停止", exact: true }).click();
     const stopWarning = page.getByRole("dialog", { name: "停止当前消息？", exact: true });
-    if (engine === "claude") {
-      // Only a Claude stop first reads the worker's native tasks. This worker
-      // cannot list them, so what the stop reaches is unverified: nothing is
-      // sent, and the card does not wait, until the user confirms.
+    if (engine === "claude" || engine === "deepseek") {
+      // Engines whose foreground stop reaches background subagents first read
+      // the worker's native tasks. This worker cannot list them, so what the
+      // stop reaches is unverified: nothing is sent, and the card does not
+      // wait, until the user confirms.
       await expect(stopWarning).toContainText("后台任务列表暂时无法核对");
       await expect(last.locator(".run-stop")).toHaveText("停止"); await expect(last).toHaveAttribute("data-phase", "working");
       expect(input.abortSignal?.aborted).toBe(false);

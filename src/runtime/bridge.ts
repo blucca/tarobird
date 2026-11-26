@@ -557,7 +557,7 @@ export class Bridge {
         return;
       }
       if (event.type === "subagent_activity") {
-        if (event.kind === "completed") unfinishedAgents.delete(event.agentId);
+        if (event.kind === "completed" || (event.kind === "interrupted" && event.terminal)) unfinishedAgents.delete(event.agentId);
         else unfinishedAgents.add(event.agentId); // An interrupt request alone is not a terminal receipt.
       }
       if (event.type === "background_task_started") unfinishedBackground.add(event.taskId);
