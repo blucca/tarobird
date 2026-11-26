@@ -127,6 +127,8 @@ import { DirectEmpty, WelcomeHome } from "./ChatEmpty.js";
 import { blocksText, messageSchema, type Conversation, type Message } from "../../src/client-protocol/index.js";
 import { isRunActive, runSummarySchema } from "../../src/client-protocol/run.js";
 import { HubConnection, type Bot } from "./connection.js";
+import { addGlobalListener, subscribeMediaQuery } from "./global-event-hub.js";
+import { WorkspaceMessageRow } from "./WorkspaceMessageRow.js";
 import { MessageOverlayContext, useMessageOverlayRows } from "./message-overlay.js";
 import { GoogleExport } from "./Content.js";
 import { ConversationMessageContent } from "./ConversationMessageContent.js";
@@ -175,14 +177,14 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const locale = useLocale();
   const macKeyboard = /Mac/.test(navigator.platform);
   const narrow = useSyncExternalStore(
-    (notify) => { const query = matchMedia("(max-width:760px)"); query.addEventListener("change", notify); return () => query.removeEventListener("change", notify); },
+    useCallback((notify: () => void) => subscribeMediaQuery("(max-width:760px)", notify), []),
     () => matchMedia("(max-width:760px)").matches,
   );
   const phone = !pane && narrow;
   // Panes and small desktop windows reserve the hover action row beside the
   // timestamp, so dated timestamps use their compact form there.
   const tightDesktop = useSyncExternalStore(
-    (notify) => { const query = matchMedia("(min-width:761px) and (max-width:860px)"); query.addEventListener("change", notify); return () => query.removeEventListener("change", notify); },
+    useCallback((notify: () => void) => subscribeMediaQuery("(min-width:761px) and (max-width:860px)", notify), []),
     () => matchMedia("(min-width:761px) and (max-width:860px)").matches,
   );
   const compactTime = !!pane || tightDesktop;
@@ -203,6 +205,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   useEffect(() => { if (state.status === "online") { receivedDirectory.current = true; setCachedBotNames([...state.bots, ...(state.deletedBots ?? [])]); void cache.saveBotNames([...state.bots, ...(state.deletedBots ?? [])], connection.identity).catch(() => undefined); } }, [connection, state.status, state.bots, state.deletedBots]);
   // Engine workers are named here for their ticket chats; lists use state.bots.
   const botDirectory = useMemo(() => state.status === "online" || receivedDirectory.current ? [...state.bots, ...(state.deletedBots ?? []), ...(state.dispatchWorkers ?? [])] : cachedBotNames, [state.status, state.bots, state.deletedBots, state.dispatchWorkers, cachedBotNames]);
+  const botsById = useMemo(() => new Map(botDirectory.map(bot => [bot.id, bot])), [botDirectory]);
   // Every navigation surface needs the same offline name fallback. The current
   // host overrides the background directory, so passing state.bots here loses
   // cached names during an offline cold start. Cached entries never imply online.
@@ -214,6 +217,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const [delegation, setDelegation] = useState<DelegationMode>();
   const [operationBot, setOperationBot] = useState<{ botId: string; name: string; view?: "dashboard" }>();
   const [conversations, setConversations] = useState<Conversation[]>([]); const [normalSelected, setNormalSelected] = useState("");
+  const conversationIdSet = useMemo(() => new Set(conversations.map(c => c.id)), [conversations]);
   // Opening uses the full cache (a ticket panel may open a hidden worker chat); lists and pickers use listedChats.
   const showTickets = useTicketConversationsVisible(), listedChats = useMemo(() => listedConversations(conversations), [conversations, showTickets]);
   // Panes never own the device share inbox; the entry sits in the notice slots below.
@@ -382,8 +386,12 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     const flushAll = () => { for (const id of [...draftWindows.current.keys()]) void flushDraft.current(id); };
     const hidden = () => { if (document.visibilityState === "hidden") flushAll(); };
     const protect = (event: BeforeUnloadEvent) => { flushAll(); if (pendingDraftWrites.current || unsavedDrafts.current.size) { event.preventDefault(); event.returnValue = ""; } };
-    window.addEventListener("beforeunload", protect); window.addEventListener("pagehide", flushAll); document.addEventListener("visibilitychange", hidden);
-    return () => { window.removeEventListener("beforeunload", protect); window.removeEventListener("pagehide", flushAll); document.removeEventListener("visibilitychange", hidden); flushAll(); };
+    const cleanups = [
+      addGlobalListener(window, "beforeunload", protect),
+      addGlobalListener(window, "pagehide", flushAll),
+      addGlobalListener(document, "visibilitychange", hidden),
+    ];
+    return () => { for (const cleanup of cleanups) cleanup(); flushAll(); };
   }, []);
   const pendingComposerFocus = useRef<string | undefined>(undefined);
   const readTail = useRef<HTMLSpanElement>(null);
@@ -418,16 +426,15 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       }
       scrollbarOrigin.current = undefined;
     };
-    window.addEventListener("pointerup", finishPointer, true);
-    window.addEventListener("pointercancel", finishPointer, true);
-    window.addEventListener("touchend", finishTouch, true);
-    window.addEventListener("touchcancel", finishTouch, true);
+    const cleanups = [
+      addGlobalListener(window, "pointerup", finishPointer, { capture: true }),
+      addGlobalListener(window, "pointercancel", finishPointer, { capture: true }),
+      addGlobalListener(window, "touchend", finishTouch, { capture: true }),
+      addGlobalListener(window, "touchcancel", finishTouch, { capture: true }),
+    ];
     return () => {
       finishTouch();
-      window.removeEventListener("pointerup", finishPointer, true);
-      window.removeEventListener("pointercancel", finishPointer, true);
-      window.removeEventListener("touchend", finishTouch, true);
-      window.removeEventListener("touchcancel", finishTouch, true);
+      for (const cleanup of cleanups) cleanup();
     };
   }, [finishTouch]);
   const readHistory = (force = false) => { scrollingTowardLatest.current = false; releaseFocus(); const node = scroll.current; if (node && (force || node.scrollHeight > node.clientHeight + 2)) { followLatest.current = false; setShowLatest(true); } };
@@ -594,7 +601,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   useEffect(() => {
     if (!sideCanOpen) return;
     const key = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "k" && !event.repeat && !event.isComposing && !document.querySelector("dialog[open]")) { event.preventDefault(); toggleSide(); } };
-    window.addEventListener("keydown", key); return () => window.removeEventListener("keydown", key);
+    return addGlobalListener(window, "keydown", key);
   }, [sideCanOpen, toggleSide]);
   const nativePiCommands = activeBot?.engine === "pi" && piCommands.scope === `${connection.identity.hubPublicKey}:${selected}:${activeBot.id}` ? piCommands.values : [];
   const completedCommands = [...commands, ...nativePiCommands.filter(command => isPiSessionCommand(command.name)
@@ -823,8 +830,10 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     // Several panes can be read at once. Keyboard ownership controls shortcuts,
     // not read receipts; the visible tail and loaded history gate those instead.
     const mark = () => { const item = activity[selected]; if (historyVisible && (!pane || paneMessagesVisible && !showLatest && historyRevision >= conversationRevision) && messagesReady && searchResults === undefined && state.status === "online" && document.visibilityState === "visible" && document.hasFocus() && item && Object.keys(item.unread).length) void connection.send({ v: 1, type: "read.mark", conversationId: selected, seq: Math.max(...Object.values(item.unread)) }).catch(() => undefined); };
-    const timer = setTimeout(mark, 250); window.addEventListener("focus", mark); document.addEventListener("visibilitychange", mark);
-    return () => { clearTimeout(timer); window.removeEventListener("focus", mark); document.removeEventListener("visibilitychange", mark); };
+    const timer = setTimeout(mark, 250);
+    const stopFocus = addGlobalListener(window, "focus", mark);
+    const stopVisibility = addGlobalListener(document, "visibilitychange", mark);
+    return () => { clearTimeout(timer); stopFocus(); stopVisibility(); };
   }, [activity, selected, state.status, connection, historyVisible, searchResults, showLatest, paneMessagesVisible, messagesReady, historyRevision, conversationRevision]);
   useEffect(() => { if (focusTarget && conversations.some((c) => c.id === focusTarget.conversationId)) { if (pane && focusTarget.conversationId !== selected) { pane.navigate(focusTarget.conversationId, focusTarget.messageId); setFocusTarget(undefined); return; } setSelected(focusTarget.conversationId); closeSearch(); setSidebar(false); } }, [focusTarget, conversations, closeSearch]);
   // Position each search/reference/notification target once, after it loads in
@@ -1731,6 +1740,84 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const sideButton = sideCanOpen && <button ref={sideTrigger} className="icon-button side-trigger" aria-label={t("侧边对话")} title={t("侧边对话") + " (⌘⇧K / Ctrl+Shift+K)"} aria-expanded={sideVisible} aria-controls="side-conversation" disabled={!side.shown && (state.status !== "online" || !activeBot?.online)} onClick={toggleSide}><PanelRight size={18}/></button>;
   const workspaceBadgeCount = workspaceNeedsApproval > 0 ? workspaceNeedsApproval : workspaceActiveComms;
   const workspaceButton = workspaceEligible && <button ref={workspaceRailTrigger} className="workspace-rail-trigger" aria-label={t("会话工作区")} title={t("会话工作区")} aria-expanded={workspaceVisible} aria-controls={workspaceId} onClick={toggleWorkspace}><Layers size={16}/><span className="workspace-rail-trigger-label">{t("工作区")}</span>{workspaceBadgeCount > 0 && <span className={`workspace-rail-trigger-badge${workspaceNeedsApproval > 0 ? " is-alert" : ""}`}>{workspaceBadgeCount}</span>}</button>;
+  const rowActionsRef = useRef({
+    copyReadableMessage,
+    report,
+    setReply,
+    setForwarding,
+    retryMessage,
+    openMessageSheet,
+    deletion,
+    setFocusTarget,
+    setSelected,
+    setSidebar,
+    closeSearch,
+    setDetailBot,
+    setCapabilities,
+    setOperationBot,
+    setOperations,
+    setNewChat,
+    labels,
+    bots: state.bots,
+  });
+  rowActionsRef.current = {
+    copyReadableMessage,
+    report,
+    setReply,
+    setForwarding,
+    retryMessage,
+    openMessageSheet,
+    deletion,
+    setFocusTarget,
+    setSelected,
+    setSidebar,
+    closeSearch,
+    setDetailBot,
+    setCapabilities,
+    setOperationBot,
+    setOperations,
+    setNewChat,
+    labels,
+    bots: state.bots,
+  };
+  const onPreparePlainText = useCallback((message: Message) => { if (copiesReadableMessages()) prepareMessagePlainText(message.blocks); }, []);
+  const onCopyRow = useCallback((message: Message) => {
+    const actions = rowActionsRef.current;
+    if (copiesReadableMessages()) actions.copyReadableMessage(message);
+    else actions.report(writeClipboardText(blocksText(message.blocks)));
+  }, []);
+  const onQuoteRow = useCallback((message: Message) => {
+    rowActionsRef.current.setReply(message);
+    composer.current?.focus();
+  }, []);
+  const onForwardRow = useCallback((message: Message, trigger: HTMLElement) => {
+    forwardTrigger.current = trigger;
+    rowActionsRef.current.setForwarding(message);
+  }, []);
+  const onRetryRow = useCallback((message: Message) => {
+    const actions = rowActionsRef.current;
+    actions.report(actions.retryMessage(message));
+  }, []);
+  const onOpenSheetRow = useCallback((message: Message, trigger: HTMLElement) => rowActionsRef.current.openMessageSheet(message, trigger), []);
+  const onDeletionToggle = useCallback((id: string) => rowActionsRef.current.deletion.toggle(id), []);
+  const onDeletionClose = useCallback(() => rowActionsRef.current.deletion.close(), []);
+  const renderDeletionCheck = useCallback((id: string) => rowActionsRef.current.deletion.check(id), []);
+  const selectStandaloneChat = useCallback((id: string) => {
+    const actions = rowActionsRef.current;
+    actions.setFocusTarget(undefined);
+    actions.setSelected(id);
+    actions.setSidebar(false);
+    actions.closeSearch();
+  }, []);
+  const newStandaloneDirectChat = useCallback((botId: string) => rowActionsRef.current.setNewChat({ kind: "direct", botId }), []);
+  const openStandaloneBot = useCallback((botId: string, destination: "capabilities" | "operations") => {
+    const actions = rowActionsRef.current;
+    if (destination === "capabilities") { actions.setDetailBot(botId); actions.setCapabilities(true); return; }
+    const bot = actions.bots.find(item => item.id === botId);
+    if (bot) { actions.setOperationBot({ botId, name: actions.labels.get(botId) ?? bot.name, view: "dashboard" }); actions.setOperations(true); }
+  }, []);
+  const standaloneSidebarHosts = useMemo(() => [{ id: "local", name: hostName ?? "", connection }], [hostName, connection]);
+  const standaloneSidebarOptions = useMemo(() => <DisconnectedBotsSwitch menu checked={preferences.showDisconnectedBots} change={showDisconnectedBots => setPreferences({ ...preferences, showDisconnectedBots })}/>, [preferences.showDisconnectedBots]);
   const phoneTurnActions = chatActions && (
     <div className="mobile-chat-action-list">
       {current?.botIds.length === 1 && !current.archived && !group?.archived && searchResults === undefined && state.engineTasksAvailable && <button onClick={() => { setChatActions(false); setTaskListRequest({ conversationId: selected, id: Date.now() }); }}><ListOrdered size={20}/><span>{t("子代理与后台任务")}</span></button>}
@@ -1745,7 +1832,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     ["bot", BotIcon, t("新建 Bot"), t("独立的工作区、人设与记忆"), () => shell ? shell.create("bot") : setNewBot(true)],
     ["group", Users, t("新建群组"), t("多个 Bot 同群，按话题分开讨论"), () => shell ? shell.create("group") : setNewChat({ kind: "group", ...(activeBot ? { botId: activeBot.id } : {}) })],
     ["schedule", CalendarClock, t("新建定时任务"), t("让 Bot 按计划自动完成工作"), () => shell ? shell.create("schedule") : setScheduledTasks("create")],
-  ] as const).map(([kind, Icon, label, detail, run]) => <button key={kind} aria-labelledby={`${menuId}-create-${kind}`} aria-describedby={`${menuId}-create-${kind}-detail`} onClick={run}><Icon size={16}/><span className="desktop-menu-text"><span id={`${menuId}-create-${kind}`}>{label}</span><small id={`${menuId}-create-${kind}-detail`}>{detail}</small></span></button>)}</DesktopMenu></div>{shell?.controls}<form className="search-box" onSubmit={(event) => search(event, true)}><Search size={16}/><input aria-label={t("搜索历史消息")} placeholder={shell ? t("搜索 {0} 的消息…", shell.host.name) : t("搜索消息…")} maxLength={256} value={query} onChange={(e) => setQuery(e.target.value)}/><kbd>↵</kbd></form><SidebarLayoutSwitch value={preferences.sidebarLayout} change={sidebarLayout => setPreferences({ ...preferences, sidebarLayout })} adhd={shell?.openAdhd ? { open: shell.openAdhd, disabled: paneBusy || shell.adhdBlocked, reason: paneBusy || shell.adhdBlocked ? t("请先完成各对话的发送、上传或录音。") : undefined } : undefined}/>{shell ? shell.navigation({ conversations, bots: navigationBots, selected, pins, globalPins, activity }) : <FolderListOptions hosts={[{ id: "local", name: hostName ?? "", connection }]} defaultConnection={connection} visible={visible} scope={preferences.sidebarLayout} options={<DisconnectedBotsSwitch menu checked={preferences.showDisconnectedBots} change={showDisconnectedBots => setPreferences({ ...preferences, showDisconnectedBots })}/>}><ConversationList showDisconnectedBots={preferences.showDisconnectedBots} layout={preferences.sidebarLayout} openBot={(botId, destination) => { if (destination === "capabilities") { setDetailBot(botId); setCapabilities(true); } else { const bot = state.bots.find(bot => bot.id === botId); if (bot) { setOperationBot({ botId, name: labels.get(botId) ?? bot.name, view: "dashboard" }); setOperations(true); } } }} connection={connection} newChat={(botId) => setNewChat({ kind: "direct", botId })} conversations={conversations} bots={navigationBots} selected={selected} pins={pins} globalPins={globalPins} activity={activity} select={(id) => { setFocusTarget(undefined); setSelected(id); setSidebar(false); closeSearch(); }}/></FolderListOptions>}<WorkspaceFooter hostName={hostName} status={state.status} userId={state.user?.id} archivedCount={archivedChats.length} menuId={`${menuId}-workspace`} menuOpen={menu === "workspace"} trigger={workspaceTrigger} toggleMenu={() => toggleMenu("workspace")} closeMenu={closeMenu} openAdhd={shell?.openAdhd} adhdBlocked={paneBusy || shell?.adhdBlocked} manageHosts={shell?.manageHosts} addHost={shell?.addHost} open={tool => {
+  ] as const).map(([kind, Icon, label, detail, run]) => <button key={kind} aria-labelledby={`${menuId}-create-${kind}`} aria-describedby={`${menuId}-create-${kind}-detail`} onClick={run}><Icon size={16}/><span className="desktop-menu-text"><span id={`${menuId}-create-${kind}`}>{label}</span><small id={`${menuId}-create-${kind}-detail`}>{detail}</small></span></button>)}</DesktopMenu></div>{shell?.controls}<form className="search-box" onSubmit={(event) => search(event, true)}><Search size={16}/><input aria-label={t("搜索历史消息")} placeholder={shell ? t("搜索 {0} 的消息…", shell.host.name) : t("搜索消息…")} maxLength={256} value={query} onChange={(e) => setQuery(e.target.value)}/><kbd>↵</kbd></form><SidebarLayoutSwitch value={preferences.sidebarLayout} change={sidebarLayout => setPreferences({ ...preferences, sidebarLayout })} adhd={shell?.openAdhd ? { open: shell.openAdhd, disabled: paneBusy || shell.adhdBlocked, reason: paneBusy || shell.adhdBlocked ? t("请先完成各对话的发送、上传或录音。") : undefined } : undefined}/>{shell ? shell.navigation({ conversations, bots: navigationBots, selected, pins, globalPins, activity }) : <FolderListOptions hosts={standaloneSidebarHosts} defaultConnection={connection} visible={visible} scope={preferences.sidebarLayout} options={standaloneSidebarOptions}><ConversationList showDisconnectedBots={preferences.showDisconnectedBots} layout={preferences.sidebarLayout} openBot={openStandaloneBot} connection={connection} newChat={newStandaloneDirectChat} conversations={conversations} bots={navigationBots} selected={selected} pins={pins} globalPins={globalPins} activity={activity} select={selectStandaloneChat}/></FolderListOptions>}<WorkspaceFooter hostName={hostName} status={state.status} userId={state.user?.id} archivedCount={archivedChats.length} menuId={`${menuId}-workspace`} menuOpen={menu === "workspace"} trigger={workspaceTrigger} toggleMenu={() => toggleMenu("workspace")} closeMenu={closeMenu} openAdhd={shell?.openAdhd} adhdBlocked={paneBusy || shell?.adhdBlocked} manageHosts={shell?.manageHosts} addHost={shell?.addHost} open={tool => {
       if (tool === "profile" || tool === "settings" || tool === "connection" || tool === "screen") { setSettingsFromMenu(false); setSettingsSection(tool === "connection" || tool === "screen" ? tool : "general"); setSettings(true); }
       else if (tool === "files") setFileCenter(true);
       else if (tool === "capabilities") { setDetailBot(undefined); setCapabilities(true); }
@@ -1832,7 +1919,64 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
         // Being near the bottom is not consent to follow: the first few pixels
         // of a pull are still near it. Rejoin only on an intentional return.
         if ((scrollingTowardLatest.current || scrollbarOrigin.current !== undefined && node.scrollTop > scrollbarOrigin.current) && node.scrollHeight - node.scrollTop - node.clientHeight <= 2) { followLatest.current = true; setShowLatest(false); setFocusTarget(undefined); }
-      }}>{phone && <div className="conversation-intro"><ShieldCheck size={14}/>{t("仅已授权设备可访问")}</div>}{messagesReady && group && current && !messages.length && <div className="conversation-empty"><MessageSquare size={28}/><h2>{current.parentId ? t("从这个话题开始") : t("默认讨论")}</h2><p>{current.parentId ? t("这里的消息只属于「{0}」。", current.title) : t("日常交流留在这里，不同事项可以新建话题。")}</p>{!group.archived && !current.parentId && !conversations.some((c) => c.parentId === group.id) && <button onClick={() => setNewChat({ kind: "topic", group })}><Plus size={16}/>{t("创建第一个话题")}</button>}</div>}{messagesReady && current?.historyOrigin && <ConversationHistoryOrigin conversation={current} source={conversations.find(value => value.id === current.historyOrigin?.sourceConversationId)} open={selectChat}/>}{messagesReady && !group && current && !current.historyOrigin && !messages.length && !queued.length && <DirectEmpty botId={current.botIds[0] ?? "unknown"} name={labels.get(current.botIds[0] ?? "") ?? activeBot?.name ?? current.title} archived={!!current.archived} online={state.status === "online"} draftEmpty={!draft} commands={() => { if (draft) return; changeDraft("/"); composer.current?.focus(); }} attach={attachments.show} dispatcher={isDispatcher(activeBot)}/>}<div ref={historyRows} className="virtual-messages" style={{ height: Math.max(0, virtualizer.getTotalSize() - readingScroll.shift), transform: readingScroll.shift ? `translateY(${-readingScroll.shift}px)` : undefined }}><ReplyWidthContext.Provider value={replyWidth}>{virtualizer.getVirtualItems().map((item) => { const message = displayedMessages[item.index]!; const bot = botDirectory.find((b) => b.id === message.authorId); const scheduled = message.groupDiscussion?.role === "input"; const original = message.replyTo ? messagesById.get(message.replyTo) : undefined; if (isTicketNotice(message, isDispatcher(activeBot))) return <article ref={message.id === tailMessageId ? measureTail : virtualizer.measureElement} data-index={item.index} data-message-id={message.id} key={message.id} className="message dispatch-notice-row" style={{ transform: `translateY(${item.start}px)` }}><DispatchNotice message={message}/></article>; return <article ref={message.id === tailMessageId ? measureTail : virtualizer.measureElement} data-index={item.index} data-message-id={message.id} tabIndex={0} role={deletion.active ? "checkbox" : undefined} aria-checked={deletion.active ? deletion.selected.has(message.id) : undefined} aria-label={deletion.active ? t("选择消息：{0}", messageExcerpt(message).slice(0, 80) || authorName(message)) : undefined} aria-haspopup={phone && !deletion.active && !scheduled && !backgroundGroups.byAnchor.has(message.id) ? "dialog" : undefined} aria-expanded={phone && !deletion.active && !backgroundGroups.byAnchor.has(message.id) ? sheetTarget?.messageId === message.id : undefined} onKeyDown={event => { if (deletion.active) { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); deletion.toggle(message.id); } else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); deletion.close(); } return; } if (phone && !backgroundGroups.byAnchor.has(message.id) && event.target === event.currentTarget && (event.key === "Enter" || event.key === " " || event.key === "ContextMenu" || event.key === "F10" && event.shiftKey)) { event.preventDefault(); event.stopPropagation(); openMessageSheet(message, event.currentTarget); } }} onClick={event => { if (deletion.active) { event.preventDefault(); event.stopPropagation(); deletion.toggle(message.id); return; } if (phone && !backgroundGroups.byAnchor.has(message.id) && event.detail === 0 && event.target === event.currentTarget) openMessageSheet(message, event.currentTarget); }} key={backgroundGroups.byAnchor.get(message.id)?.key ?? message.id} className={`message ${message.authorType} ${scheduled ? "is-discussion-input" : ""} ${deletion.active ? `is-selecting ${deletion.selected.has(message.id) ? "is-selected" : ""}` : ""} ${(backgroundGroups.anchors.get(focusTarget?.messageId ?? "") ?? focusTarget?.messageId) === message.id ? "focused-message" : ""}`} style={{ transform: `translateY(${item.start}px)` }}>{deletion.active && deletion.check(message.id)}<div className="message-selection-content" inert={deletion.active || undefined}><div className={`message-avatar ${message.authorType}${live ? presence(message) : ""}`}><Avatar kind={message.authorType === "bot" ? "bot" : "user"} id={message.authorId} name={labels.get(message.authorId) ?? (message.authorType === "user" ? t("我") : "TaroBird")} size={32}/></div><div className="message-body"><div className="message-meta"><strong>{message.botSource?.botName ?? labels.get(message.authorId) ?? bot?.name ?? (message.authorType === "user" ? t("我") : "TaroBird")}</strong><time>{formatMessageTime(message.createdAt, locale, compactTime)}</time><HistoryExclusion message={message}/>{message.authorType === "user" && <UserReplyStatus replies={replyStatuses.get(message.id)} group={!!group} labels={labels}/>}{phone && <span className="message-action-status" aria-live="polite">{copied === message.id ? t("已复制") : ""}</span>}{!phone && !scheduled && !backgroundGroups.byAnchor.has(message.id) && <div className="message-actions"><button aria-label={t("复制消息")} onPointerDown={() => { if (copiesReadableMessages()) prepareMessagePlainText(message.blocks); }} onClick={() => { if (copiesReadableMessages()) copyReadableMessage(message); else report(writeClipboardText(blocksText(message.blocks))); }}><Copy size={13}/></button><button aria-label={t("引用回复")} title={t("引用回复")} disabled={groupSending || !!current?.archived || !!group?.archived} onClick={() => { setReply(message); composer.current?.focus(); }}><MessageSquare size={13}/><span>{t("引用")}</span></button><button aria-label={t("转发消息")} title={message.status === "streaming" ? t("生成完成后可转发") : t("转发消息")} disabled={!["complete", "error"].includes(message.status)} onClick={(event) => { forwardTrigger.current = event.currentTarget; setForwarding(message); }}><Forward size={13}/><span>{t("转发")}</span></button><GoogleExport connection={connection} messageId={message.id}/>{canRetry(message) && <button aria-label={t("重新发送消息")} disabled={retryBlocked} title={retryBlocked ? t("对话已归档，恢复后可重新发送。") : t("重新发送消息")} onClick={() => report(retryMessage(message))}><RotateCcw size={13}/></button>}</div>}</div>{message.botSource && <div className="bot-message-source" title={`${message.botSource.hostId}/${message.botSource.botId}`}><span>{t("来自 {0} · {1}", message.botSource.hostName, message.botSource.botName)}</span><small>{t("转发 {0} 层", message.botSource.hops)}</small></div>}<TurnStopContext.Provider value={turnStop.request}><MessageOverlayContext.Provider value={retainMessageOverlay}><WidgetComposeProvider owner={widgetOwner} active={!message.historyContext && widgetAllowed(selected)} scope={`${connection.identity.hubPublicKey}:${state.user?.id ?? ""}:${message.conversationId}:${message.id}`} message={message} compose={dispatchWidgetCompose}>{backgroundGroups.byAnchor.has(message.id) ? <BackgroundTaskGroup group={backgroundGroups.byAnchor.get(message.id)!} connection={connection} original={original} locate={locateMessage} focusRequest={focusTarget}/> : <ConversationMessageContent focusRequest={focusTarget} message={message} original={original} referenceAuthor={original ? messageAuthor(original, botDirectory) : undefined} referenceAvailable={!message.forwardedFrom || conversations.some(c => c.id === message.forwardedFrom!.conversationId)} scheduledName={labels.get(message.groupDiscussion?.botId ?? "") ?? botDirectory.find(b => b.id === message.groupDiscussion?.botId)?.name ?? t("Bot")} connection={connection} locate={locateMessage}/>}</WidgetComposeProvider></MessageOverlayContext.Provider></TurnStopContext.Provider></div></div></article>; })}</ReplyWidthContext.Provider></div><div ref={queuedRows} style={{ display: "flow-root" }}>{queued.filter((q) => q.error || !messages.some((m) => m.clientMsgId === q.id)).map((q) => <div className="queued-message" key={q.id}><span><ReferencePreview text={q.text}/></span><small>{q.error ? q.expired ? q.error : t("发送失败：{0}", q.error) : q.sent ? t("已发送") : q.syncing ? t("正在同步发送状态…") : q.blocked ? t("等待前一条消息处理") : t("等待发送")}</small>{q.error && <>{current?.type === "group" && q.copyable && <button onClick={() => { clearTimeout(copiedTimer.current); setCopied(undefined); let write: Promise<void>; try { write = writeClipboardText(q.text); } catch (error) { write = Promise.reject(error); } write.then(() => { setCopied(q.id); copiedTimer.current = setTimeout(() => setCopied(undefined), 3000); }, () => setError(t("无法写入剪贴板，请检查权限后重试。"))); }}>{copied === q.id ? t("已复制") : t("复制文字")}</button>}{!q.expired && <button disabled={retryBlocked} title={retryBlocked ? t("对话已归档，恢复后可重新发送。") : undefined} onClick={() => { if (retryBlocked) return; report(connection.retryFailed(q.id)); }}>{t("重试")}</button>}<button onClick={() => report(connection.discardFailed(q.id))}>{t("移除待发送项")}</button></>}</div>)}</div>{pane && <span ref={readTail} aria-hidden="true" style={{ display: "block", height: 1 }}/>}</div>
+      }}>{phone && <div className="conversation-intro"><ShieldCheck size={14}/>{t("仅已授权设备可访问")}</div>}{messagesReady && group && current && !messages.length && <div className="conversation-empty"><MessageSquare size={28}/><h2>{current.parentId ? t("从这个话题开始") : t("默认讨论")}</h2><p>{current.parentId ? t("这里的消息只属于「{0}」。", current.title) : t("日常交流留在这里，不同事项可以新建话题。")}</p>{!group.archived && !current.parentId && !conversations.some((c) => c.parentId === group.id) && <button onClick={() => setNewChat({ kind: "topic", group })}><Plus size={16}/>{t("创建第一个话题")}</button>}</div>}{messagesReady && current?.historyOrigin && <ConversationHistoryOrigin conversation={current} source={conversations.find(value => value.id === current.historyOrigin?.sourceConversationId)} open={selectChat}/>}{messagesReady && !group && current && !current.historyOrigin && !messages.length && !queued.length && <DirectEmpty botId={current.botIds[0] ?? "unknown"} name={labels.get(current.botIds[0] ?? "") ?? activeBot?.name ?? current.title} archived={!!current.archived} online={state.status === "online"} draftEmpty={!draft} commands={() => { if (draft) return; changeDraft("/"); composer.current?.focus(); }} attach={attachments.show} dispatcher={isDispatcher(activeBot)}/>}<div ref={historyRows} className="virtual-messages" style={{ height: Math.max(0, virtualizer.getTotalSize() - readingScroll.shift), transform: readingScroll.shift ? `translateY(${-readingScroll.shift}px)` : undefined }}><TurnStopContext.Provider value={turnStop.request}><MessageOverlayContext.Provider value={retainMessageOverlay}><ReplyWidthContext.Provider value={replyWidth}>{virtualizer.getVirtualItems().map((item) => {
+  const message = displayedMessages[item.index]!;
+  const bot = botsById.get(message.authorId);
+  const original = message.replyTo ? messagesById.get(message.replyTo) : undefined;
+  const backgroundGroup = backgroundGroups.byAnchor.get(message.id);
+  const rowKey = backgroundGroup?.key ?? message.id;
+  const focusedHere = (backgroundGroups.anchors.get(focusTarget?.messageId ?? "") ?? focusTarget?.messageId) === message.id;
+  const rowFocusRequest = focusTarget && (focusedHere || message.authorType === "user" && !!message.botSource && focusTarget.conversationId === message.conversationId) ? focusTarget : undefined;
+  const authorLabel = labels.get(message.authorId) ?? (message.authorType === "user" ? t("我") : "TaroBird");
+  const scheduledName = labels.get(message.groupDiscussion?.botId ?? "") ?? botsById.get(message.groupDiscussion?.botId ?? "")?.name ?? t("Bot");
+  return <WorkspaceMessageRow
+    key={rowKey}
+    message={message}
+    index={item.index}
+    start={item.start}
+    measureRef={message.id === tailMessageId ? measureTail : virtualizer.measureElement}
+    connection={connection}
+    locale={locale}
+    phone={phone}
+    compactTime={compactTime}
+    live={live}
+    isGroup={!!group}
+    archived={!!current?.archived || !!group?.archived}
+    groupSending={groupSending}
+    retryBlocked={retryBlocked}
+    canRetryMessage={canRetry(message)}
+    isTicketNoticeRow={isTicketNotice(message, isDispatcher(activeBot))}
+    copiedHere={copied === message.id}
+    focusedHere={focusedHere}
+    focusRequest={rowFocusRequest}
+    sheetExpanded={phone && !deletion.active && message.groupDiscussion?.role !== "input" && !backgroundGroup ? sheetTarget?.messageId === message.id : undefined}
+    deletionActive={deletion.active}
+    deletionSelected={deletion.active ? deletion.selected.has(message.id) : false}
+    renderDeletionCheck={deletion.active ? renderDeletionCheck : undefined}
+    authorLabel={authorLabel}
+    botName={bot?.name}
+    scheduledName={scheduledName}
+    original={original}
+    referenceAuthor={original ? messageAuthor(original, botDirectory) : undefined}
+    referenceAvailable={!message.forwardedFrom || conversationIdSet.has(message.forwardedFrom.conversationId)}
+    backgroundGroup={backgroundGroup}
+    userReplies={message.authorType === "user" ? replyStatuses.get(message.id) : undefined}
+    labels={labels}
+    widgetOwner={widgetOwner}
+    widgetActive={!message.historyContext && widgetAllowed(selected)}
+    widgetScope={`${connection.identity.hubPublicKey}:${state.user?.id ?? ""}:${message.conversationId}:${message.id}`}
+    onLocate={locateMessage}
+    onWidgetCompose={dispatchWidgetCompose}
+    onPreparePlainText={onPreparePlainText}
+    onCopy={onCopyRow}
+    onQuote={onQuoteRow}
+    onForward={onForwardRow}
+    onRetry={onRetryRow}
+    onOpenSheet={onOpenSheetRow}
+    onDeletionToggle={onDeletionToggle}
+    onDeletionClose={onDeletionClose}
+  />;
+})}</ReplyWidthContext.Provider></MessageOverlayContext.Provider></TurnStopContext.Provider></div><div ref={queuedRows} style={{ display: "flow-root" }}>{queued.filter((q) => q.error || !messages.some((m) => m.clientMsgId === q.id)).map((q) => <div className="queued-message" key={q.id}><span><ReferencePreview text={q.text}/></span><small>{q.error ? q.expired ? q.error : t("发送失败：{0}", q.error) : q.sent ? t("已发送") : q.syncing ? t("正在同步发送状态…") : q.blocked ? t("等待前一条消息处理") : t("等待发送")}</small>{q.error && <>{current?.type === "group" && q.copyable && <button onClick={() => { clearTimeout(copiedTimer.current); setCopied(undefined); let write: Promise<void>; try { write = writeClipboardText(q.text); } catch (error) { write = Promise.reject(error); } write.then(() => { setCopied(q.id); copiedTimer.current = setTimeout(() => setCopied(undefined), 3000); }, () => setError(t("无法写入剪贴板，请检查权限后重试。"))); }}>{copied === q.id ? t("已复制") : t("复制文字")}</button>}{!q.expired && <button disabled={retryBlocked} title={retryBlocked ? t("对话已归档，恢复后可重新发送。") : undefined} onClick={() => { if (retryBlocked) return; report(connection.retryFailed(q.id)); }}>{t("重试")}</button>}<button onClick={() => report(connection.discardFailed(q.id))}>{t("移除待发送项")}</button></>}</div>)}</div>{pane && <span ref={readTail} aria-hidden="true" style={{ display: "block", height: 1 }}/>}</div>
     : <WelcomeHome pairDevice={["macos", "windows"].includes(nativePlatform()) && state.status === "online" && state.user?.role === "owner" ? () => { setSettingsSection("pairing"); setSettings(true); } : undefined} hasBots={state.status !== "online" || state.bots.length > 0} newChat={() => setNewChat({ kind: "direct", ...(choosableBot ? { botId: choosableBot.id } : {}) })} newBot={() => shell ? shell.create("bot") : setNewBot(true)} newGroup={() => setNewChat({ kind: "group", ...(choosableBot ? { botId: choosableBot.id } : {}) })}/>}
     {deletion.toolbar}
     {!searchResults && selected && (current?.archived || group?.archived) && <div className="archived-notice"><span>{!current?.botIds.length || current.botIds.some(id => state.deletedBots?.some(bot => bot.id === id)) ? t("Bot 已删除，此对话仅保留历史记录。") : t("已归档，历史记录仍可查看。恢复后可继续讨论。")}</span><button onClick={() => { if (group?.archived) setSelected(group.id); setManage(true); }}>{current?.parentId && !group?.archived ? t("管理话题") : t("管理对话")}</button></div>}

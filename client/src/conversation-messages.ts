@@ -9,6 +9,34 @@ type View = { connection: HubConnection; conversationId: string; messages: Messa
 export const MIN_HISTORY_READ_GAP_MS = 80;
 export const MAX_HISTORY_READ_GAP_MS = 1000;
 
+const filteredMessagesCache = new WeakMap<readonly Message[], Message[]>();
+const lastReadRevisions = new WeakMap<HubConnection, Map<string, number>>();
+const MAX_REVISION_TRACKED = 32;
+
+function visibleFromRaw(raw: readonly Message[]): Message[] {
+  let visible = filteredMessagesCache.get(raw);
+  if (!visible) {
+    visible = raw.filter(message => message.status !== "deleted");
+    filteredMessagesCache.set(raw, visible);
+  }
+  return visible;
+}
+
+function rememberReadRevision(connection: HubConnection, conversationId: string, revision: number): void {
+  let map = lastReadRevisions.get(connection);
+  if (!map) {
+    map = new Map();
+    lastReadRevisions.set(connection, map);
+  }
+  map.delete(conversationId);
+  map.set(conversationId, revision);
+  while (map.size > MAX_REVISION_TRACKED) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
 /** Every IDB read returns fresh objects. Keep the previous object for a message
  * whose version and status are unchanged (versions advance on every content
  * change), so memoised rows only re-render for messages that actually changed.
@@ -77,12 +105,20 @@ export function useConversationMessages(connection: HubConnection, conversationI
             reading = connection.cache.messages(conversationId);
             inFlight.set(conversationId, reading);
             const messages = await reading;
+            rememberReadRevision(connection, conversationId, readRevision);
             // Publish each completed read so a continuous stream cannot starve
             // rendering. A revision received during it requests one fresh read.
-            const visibleMessages = messages.filter(message => message.status !== "deleted");
-            if (!disposed) setView(previous => ({ connection, conversationId, failed: false, readRevision,
-              messages: previous?.connection === connection && previous.conversationId === conversationId ? shareMessages(previous.messages, visibleMessages) : visibleMessages,
-            }));
+            const visibleMessages = visibleFromRaw(messages);
+            if (!disposed) {
+              setView(previous => {
+                const sameScope = previous?.connection === connection && previous.conversationId === conversationId;
+                const shared = sameScope ? shareMessages(previous.messages, visibleMessages) : visibleMessages;
+                if (sameScope && !previous.failed && previous.readRevision === readRevision && shared === previous.messages) {
+                  return previous;
+                }
+                return { connection, conversationId, failed: false, readRevision, messages: shared };
+              });
+            }
           } catch {
             if (!disposed) setView(previous => ({ connection, conversationId,
               messages: previous?.connection === connection && previous.conversationId === conversationId ? previous.messages : emptyMessages,
@@ -109,6 +145,13 @@ export function useConversationMessages(connection: HubConnection, conversationI
   }, [connection, conversationId, visible, scoped]);
   // A hidden host retains its reading position, but another conversation must
   // never render the previous conversation's messages while its read is pending.
-  const current = view?.connection === connection && view.conversationId === conversationId ? view : undefined;
+  let current = view?.connection === connection && view.conversationId === conversationId ? view : undefined;
+  if (!current && visible && conversationId) {
+    const peeked = (connection.cache as { peekMessages?: (id: string) => readonly Message[] | undefined }).peekMessages?.(conversationId);
+    if (peeked) {
+      const readRevision = lastReadRevisions.get(connection)?.get(conversationId) ?? connection.state.cacheRevision;
+      current = { connection, conversationId, messages: visibleFromRaw(peeked), failed: false, readRevision };
+    }
+  }
   return { readRevision: current?.readRevision ?? -1, messages: current?.messages ?? emptyMessages, failed: current?.failed ?? false, ready: !!current && !current.failed, retry };
 }

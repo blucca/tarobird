@@ -21,6 +21,7 @@ import { forgetSavedQuotaHost } from "./usage-readings.js";
 import type { NamedBot } from "./bot-references.js";
 import { profileCacheSchema, type ProfileCache } from "../../src/client-protocol/avatars.js";
 import { openDB, type DBSchema, type StoreNames, type IDBPTransaction, type IDBPDatabase } from "idb";
+import { ConversationMessageCache } from "./message-lru-cache.js";
 import { activeQuestionDrafts, questionDraftPrefix, questionDraftSchema, type QuestionDraft } from "./question-draft.js";
 import { messageAttention, type MessageAttention } from "./attention.js";
 import { projectReply, projectWorkingReply, type BotReply } from "./agent-state.js";
@@ -81,6 +82,17 @@ function workbenchChange(value: unknown): { scope: string; ids: string[] } | und
   if (v !== 1 || typeof scope !== "string" || scope.length > 4096 || !Array.isArray(ids) || !ids.length || ids.length > 256
     || !ids.every(id => typeof id === "string" && workbenchItemId.test(id))) return;
   return { scope, ids: ids as string[] };
+}
+const siblingCaches = new Map<string, Set<ClientCache>>();
+function stripMessageMeta(raw: Cache["messages"]["value"]): Message {
+  const { activitySeq: _seq, activityAt: _at, ...message } = raw;
+  return message;
+}
+function messageInvalidation(value: unknown): { conversationId?: string } | undefined {
+  if (!value || typeof value !== "object") return;
+  const { v, conversationId } = value as Record<string, unknown>;
+  if (v !== 1 || (conversationId !== undefined && (typeof conversationId !== "string" || conversationId.length > 512))) return;
+  return { conversationId };
 }
 export class ClientCache {
   private draftListeners = new Set<() => void>();
@@ -176,9 +188,56 @@ export class ClientCache {
   private readonly snapshotOwner = crypto.randomUUID();
   private snapshotLease?: Promise<void>;
   private releaseSnapshotLease?: () => void;
+  private readonly messageCache = new ConversationMessageCache();
+  private readonly messageEpochs = new Map<string, number>();
+  private globalMessageEpoch = 0;
+  private messageChannel?: BroadcastChannel;
+  private messageEpoch(conversationId: string): number {
+    return this.globalMessageEpoch + (this.messageEpochs.get(conversationId) ?? 0);
+  }
+  private ensureMessageChannel(): void {
+    if (this.closed || this.messageChannel || typeof BroadcastChannel === "undefined") return;
+    this.messageChannel = new BroadcastChannel(`tarobot-messages:${this.databaseName}`);
+    this.messageChannel.onmessage = (event) => {
+      const change = messageInvalidation(event.data);
+      if (change) this.bumpMessageEpoch(change.conversationId);
+    };
+  }
+  private bumpMessageEpoch(conversationId?: string): void {
+    if (conversationId === undefined) {
+      this.globalMessageEpoch++;
+      this.messageEpochs.clear();
+      this.messageCache.invalidate();
+      return;
+    }
+    this.messageEpochs.set(conversationId, (this.messageEpochs.get(conversationId) ?? 0) + 1);
+    this.messageCache.invalidate(conversationId);
+  }
+  private notifyMessageMutation(conversationId?: string, patched?: Message): void {
+    if (patched && conversationId !== undefined) {
+      this.messageEpochs.set(conversationId, (this.messageEpochs.get(conversationId) ?? 0) + 1);
+      this.messageCache.patchMessage(conversationId, patched);
+    } else {
+      this.bumpMessageEpoch(conversationId);
+    }
+    const siblings = siblingCaches.get(this.databaseName);
+    if (siblings) {
+      for (const sibling of siblings) {
+        if (sibling !== this) sibling.bumpMessageEpoch(conversationId);
+      }
+    }
+    if (typeof BroadcastChannel !== "undefined") {
+      const channel = this.messageChannel ?? new BroadcastChannel(`tarobot-messages:${this.databaseName}`);
+      channel.postMessage({ v: 1, ...(conversationId !== undefined ? { conversationId } : {}) });
+      if (channel !== this.messageChannel) channel.close();
+    }
+  }
   // A cache's namespace never changes when the user selects another host.
   // Delayed requests retain the cache belonging to their original connection.
   constructor(readonly databaseName = "tarocub-v1") {
+    let siblings = siblingCaches.get(databaseName);
+    if (!siblings) siblingCaches.set(databaseName, siblings = new Set());
+    siblings.add(this);
     this.db = openDB<Cache>(databaseName, 13, { upgrade(db, oldVersion, _newVersion, transaction) {
       if (oldVersion < 13) { db.createObjectStore("workbenchDesignMeta"); db.createObjectStore("workbenchDesignObjects"); }
       if (oldVersion < 12) db.createObjectStore("workbenchDesign");
@@ -226,7 +285,7 @@ export class ClientCache {
     // depend on mounting its ShareInbox. A closed app cleans up on next open.
     void this.identity().then(identity => identity ? this.pruneExpiredShareDrafts(identity) : undefined).catch(() => undefined);
   }
-  close(): void { this.closed = true; this.notifyDiffReviews(); this.diffReviewChannel?.close(); this.diffReviewChannel = undefined; this.workbenchChannel?.close(); this.workbenchChannel = undefined; this.designCommentChannel?.close(); this.designCommentChannel = undefined; this.releaseSnapshotLease?.(); void this.db.then((db) => db.close(), () => undefined); }
+  close(): void { this.closed = true; const siblings = siblingCaches.get(this.databaseName); siblings?.delete(this); if (siblings && !siblings.size) siblingCaches.delete(this.databaseName); this.messageChannel?.close(); this.messageChannel = undefined; this.messageCache.invalidate(); this.notifyDiffReviews(); this.diffReviewChannel?.close(); this.diffReviewChannel = undefined; this.workbenchChannel?.close(); this.workbenchChannel = undefined; this.designCommentChannel?.close(); this.designCommentChannel = undefined; this.releaseSnapshotLease?.(); void this.db.then((db) => db.close(), () => undefined); }
   private ownSnapshot(): Promise<void> {
     if (this.closed) return Promise.reject(new Error("local_cache_closed"));
     if (!navigator.locks) return Promise.resolve();
@@ -730,6 +789,7 @@ export class ClientCache {
     if (identity) { clearNoteRecoveries(identity.deviceId); this.clearSelectionHint(this.selectionHintKey(identity, generation as string | undefined)); }
     // Quota readings are saved per Host outside these stores (Bot ids, pool names, percentages); the forgotten Host's go too.
     if (identity?.hubPublicKey) forgetSavedQuotaHost(identity.hubPublicKey);
+    this.notifyMessageMutation(undefined);
     this.draftsChanged();
     this.diffReviewsChanged();
   }
@@ -1210,7 +1270,23 @@ export class ClientCache {
     if (!current) await store.put(value);
     await tx.done; return current ?? value;
   }
-  async messages(conversationId: string): Promise<Message[]> { return (await (await this.db).getAllFromIndex("messages", "conversation", conversationId)).sort((a, b) => a.createdAt - b.createdAt).map(({ activitySeq: _seq, activityAt: _at, ...message }) => message); }
+  peekMessages(conversationId: string): readonly Message[] | undefined {
+    this.ensureMessageChannel();
+    return this.messageCache.peek(conversationId)?.messages;
+  }
+  async messages(conversationId: string): Promise<Message[]> {
+    this.ensureMessageChannel();
+    const cached = this.messageCache.peek(conversationId);
+    if (cached) return cached.messages.slice();
+    const epoch = this.messageEpoch(conversationId);
+    const loaded = (await (await this.db).getAllFromIndex("messages", "conversation", conversationId))
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map(stripMessageMeta);
+    if (!this.closed && this.messageEpoch(conversationId) === epoch) {
+      this.messageCache.set(conversationId, loaded);
+    }
+    return loaded.slice();
+  }
   async deletedMessageIds(): Promise<Set<string>> { return new Set(await (await this.db).getAllKeysFromIndex("messages", "status", "deleted")); }
   async activeMessages(): Promise<string[]> {
     const tx = (await this.db).transaction("messages"), status = tx.store.index("status");
@@ -1317,6 +1393,7 @@ export class ClientCache {
     await this.ownSnapshot();
     const tx = await this.write(["syncState", "syncMessages", "messages", "activity", "cursors", "conversations", "conversationDrafts", "settings"]);
     const complete = tx.done; void complete.catch(() => undefined);
+    let snapshotConversationId: string | undefined;
     try {
       if (frame.type === "snapshot.begin") {
         if (frame.readSeq > frame.seq || (await tx.objectStore("cursors").get(frame.conversation.id) ?? 0) !== frame.after) throw new Error("snapshot_cursor_mismatch");
@@ -1335,6 +1412,7 @@ export class ClientCache {
           await tx.objectStore("syncState").put({ ...state, count: state.count + 1, updatedAt: Date.now() }, this.snapshotOwner);
         } else {
           const conversationId = state.conversation.id;
+          snapshotConversationId = conversationId;
           if (frame.count !== state.count) throw new Error("snapshot_incomplete");
           const lineage = await tx.objectStore("settings").get(`syncLineage:${conversationId}`) as string | undefined;
           if (lineage !== state.previousLineage && lineage !== state.lineage) throw new Error("snapshot_lineage_mismatch");
@@ -1399,7 +1477,7 @@ export class ClientCache {
           await this.dropSnapshot(tx, this.snapshotOwner);
         }
       }
-      await complete; if (frame.type === "snapshot.end") this.draftsChanged(); return frame.type === "snapshot.end";
+      await complete; if (frame.type === "snapshot.end") { if (snapshotConversationId !== undefined) this.notifyMessageMutation(snapshotConversationId); this.draftsChanged(); } return frame.type === "snapshot.end";
     } catch (error) { try { tx.abort(); } catch { /* Already aborted. */ } await complete.catch(() => undefined); throw error; }
   }
   async apply(raw: HubEvent, userId?: string, expected?: { lineage?: string }): Promise<Message | undefined> {
@@ -1470,7 +1548,13 @@ export class ClientCache {
         const activity = await tx.objectStore("activity").get(event.conversationId);
         if (activity) { const readSeq = event.payload.seq; activity.unread = Object.fromEntries(Object.entries(activity.unread).filter(([, seq]) => seq > readSeq)); await tx.objectStore("activity").put(activity, event.conversationId); }
       }
-      await tx.objectStore("cursors").put(event.seq, event.conversationId); await complete; if (draftChanged) this.draftsChanged(); return applied;
+      await tx.objectStore("cursors").put(event.seq, event.conversationId); await complete;
+      if (applied) {
+        const clean = stripMessageMeta(applied as Cache["messages"]["value"]);
+        this.notifyMessageMutation(event.conversationId, clean);
+        applied = clean;
+      }
+      if (draftChanged) this.draftsChanged(); return applied;
     } catch (error) { try { tx.abort(); } catch { /* Already completed or aborted. */ } await complete.catch(() => undefined); throw error; }
   }
   private async putOutboxFrame(tx: IDBPTransaction<Cache, StoreNames<Cache>[], "readwrite">, frame: ClientFrame): Promise<OutboxEntry> {
