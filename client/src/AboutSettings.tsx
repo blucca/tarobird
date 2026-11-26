@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { ArrowLeft, ChevronRight, ExternalLink, FileText, LoaderCircle, Search, X } from "lucide-react";
 import pkg from "../package.json";
 import { t, useLocale } from "./i18n.js";
 import "./about-settings.css";
 
-export type AcknowledgementCategory = "npm" | "asset" | "vendored" | "android" | "ios";
+export type AcknowledgementCategory = "npm" | "asset" | "vendored" | "desktop" | "android" | "ios";
 
 export type AcknowledgementEntry = {
   id: string;
@@ -19,21 +19,85 @@ export type AcknowledgementEntry = {
   noticeText?: string;
 };
 
-type AcknowledgementsPayload = {
-  version: number;
-  entries: AcknowledgementEntry[];
+type RawAcknowledgementEntry = Omit<AcknowledgementEntry, "licenseText"> & {
+  licenseText?: string;
+  licenseTextIndex?: number;
 };
 
-const CATEGORIES: Array<"all" | AcknowledgementCategory> = ["all", "npm", "asset", "vendored", "android", "ios"];
+type AcknowledgementsPayload = {
+  version: number;
+  licenseTexts?: string[];
+  entries: RawAcknowledgementEntry[];
+};
 
-export function AboutSettings({ active }: { active: boolean }) {
-  useLocale();
+export type AboutNavigationState = {
+  inSubView: boolean;
+  title?: string;
+  backLabel?: string;
+};
+
+const CATEGORIES: Array<"all" | AcknowledgementCategory> = ["all", "npm", "asset", "vendored", "desktop", "android", "ios"];
+
+function safeHttpUrl(raw: string): string | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = new URL(raw);
+    if ((parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password) {
+      return parsed.href;
+    }
+  } catch {
+    // Reject non-URL or relative shorthand strings.
+  }
+  return undefined;
+}
+
+function hydrateEntries(payload: AcknowledgementsPayload | undefined): AcknowledgementEntry[] {
+  if (!payload || !Array.isArray(payload.entries)) return [];
+  const pool = Array.isArray(payload.licenseTexts) ? payload.licenseTexts : [];
+  return payload.entries.map((raw) => ({
+    id: raw.id,
+    name: raw.name,
+    category: raw.category,
+    repository: raw.repository,
+    version: raw.version,
+    license: raw.license,
+    usage: raw.usage,
+    location: raw.location,
+    licenseText: typeof raw.licenseText === "string"
+      ? raw.licenseText
+      : typeof raw.licenseTextIndex === "number" && typeof pool[raw.licenseTextIndex] === "string"
+        ? pool[raw.licenseTextIndex]
+        : "",
+    ...(raw.noticeText ? { noticeText: raw.noticeText } : {}),
+  }));
+}
+
+export function AboutSettings({
+  active,
+  phone = false,
+  backActionRef,
+  onNavigationChange,
+}: {
+  active: boolean;
+  phone?: boolean;
+  backActionRef?: MutableRefObject<(() => boolean) | undefined>;
+  onNavigationChange?: (state: AboutNavigationState) => void;
+}) {
+  const locale = useLocale();
   const [view, setView] = useState<"about" | "acknowledgements">("about");
   const [entries, setEntries] = useState<AcknowledgementEntry[] | undefined>();
   const [loadError, setLoadError] = useState(false);
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState<"all" | AcknowledgementCategory>("all");
   const [selectedId, setSelectedId] = useState<string>();
+
+  const rootRef = useRef<HTMLDivElement>(null);
+  const aboutAckButtonRef = useRef<HTMLButtonElement>(null);
+  const listBackButtonRef = useRef<HTMLButtonElement>(null);
+  const detailHeadingRef = useRef<HTMLHeadingElement>(null);
+  const savedListScrollTopRef = useRef(0);
+  const lastOpenedIdRef = useRef<string | undefined>(undefined);
+  const prevNavRef = useRef<{ view: "about" | "acknowledgements"; selectedId?: string }>({ view: "about", selectedId: undefined });
 
   useEffect(() => {
     if (!active) return;
@@ -44,7 +108,7 @@ export function AboutSettings({ active }: { active: boolean }) {
       .then((mod) => {
         if (!alive) return;
         const data = mod.default as AcknowledgementsPayload;
-        setEntries(Array.isArray(data?.entries) ? data.entries : []);
+        setEntries(hydrateEntries(data));
       })
       .catch(() => {
         if (alive) setLoadError(true);
@@ -59,8 +123,99 @@ export function AboutSettings({ active }: { active: boolean }) {
       setSelectedId(undefined);
       setQuery("");
       setCategory("all");
+      savedListScrollTopRef.current = 0;
+      lastOpenedIdRef.current = undefined;
     }
   }, [active]);
+
+  const selectedEntry = selectedId ? entries?.find((item) => item.id === selectedId) : undefined;
+
+  // Register step-back handler with PreferencesPanel so Android native Back,
+  // phone header Back, and Escape unwind Detail -> Acknowledgements -> About one level at a time.
+  useLayoutEffect(() => {
+    if (!backActionRef) return;
+    backActionRef.current = () => {
+      if (!active) return false;
+      if (view === "acknowledgements" && selectedId !== undefined) {
+        setSelectedId(undefined);
+        return true;
+      }
+      if (view === "acknowledgements") {
+        setView("about");
+        setQuery("");
+        setCategory("all");
+        return true;
+      }
+      return false;
+    };
+    return () => {
+      backActionRef.current = undefined;
+    };
+  }, [active, backActionRef, view, selectedId]);
+
+  useEffect(() => {
+    if (!onNavigationChange) return;
+    if (!active || view === "about") {
+      onNavigationChange({ inSubView: false });
+      return;
+    }
+    if (selectedEntry) {
+      onNavigationChange({
+        inSubView: true,
+        title: selectedEntry.name,
+        backLabel: t("返回致谢列表"),
+      });
+      return;
+    }
+    onNavigationChange({
+      inSubView: true,
+      title: t("致谢"),
+      backLabel: t("返回关于"),
+    });
+  }, [active, view, selectedEntry, locale, onNavigationChange]);
+
+  // Keep .settings-content scroll position and focus synchronized across About sub-views.
+  useLayoutEffect(() => {
+    if (!active) {
+      prevNavRef.current = { view: "about", selectedId: undefined };
+      return;
+    }
+    const prev = prevNavRef.current;
+    if (prev.view === view && prev.selectedId === selectedId) return;
+    prevNavRef.current = { view, selectedId };
+
+    const scrollContainer = rootRef.current?.closest<HTMLElement>(".settings-content");
+    if (view === "acknowledgements" && selectedId !== undefined) {
+      if (scrollContainer) scrollContainer.scrollTop = 0;
+      detailHeadingRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    if (view === "acknowledgements" && prev.selectedId !== undefined) {
+      if (scrollContainer) scrollContainer.scrollTop = savedListScrollTopRef.current;
+      const lastId = lastOpenedIdRef.current;
+      if (lastId) {
+        const escaped = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(lastId)
+          : lastId.replace(/["\\]/g, "\\$&");
+        const row = rootRef.current?.querySelector<HTMLElement>(`button[data-ack-id="${escaped}"]`);
+        row?.focus({ preventScroll: true });
+      }
+      return;
+    }
+    if (view === "acknowledgements" && prev.view === "about") {
+      savedListScrollTopRef.current = 0;
+      lastOpenedIdRef.current = undefined;
+      if (scrollContainer) scrollContainer.scrollTop = 0;
+      (listBackButtonRef.current ?? rootRef.current)?.focus({ preventScroll: true });
+      return;
+    }
+    if (view === "about" && prev.view === "acknowledgements") {
+      savedListScrollTopRef.current = 0;
+      lastOpenedIdRef.current = undefined;
+      if (scrollContainer) scrollContainer.scrollTop = 0;
+      aboutAckButtonRef.current?.focus({ preventScroll: true });
+    }
+  }, [active, view, selectedId]);
 
   const categoryLabel = (cat: "all" | AcknowledgementCategory): string => {
     switch (cat) {
@@ -68,6 +223,7 @@ export function AboutSettings({ active }: { active: boolean }) {
       case "npm": return t("npm 依赖");
       case "asset": return t("字体与素材");
       case "vendored": return t("内置组件");
+      case "desktop": return t("桌面");
       case "android": return "Android";
       case "ios": return "iOS";
     }
@@ -87,11 +243,16 @@ export function AboutSettings({ active }: { active: boolean }) {
     });
   }, [entries, category, query]);
 
-  const selectedEntry = selectedId ? entries?.find((item) => item.id === selectedId) : undefined;
+  const openEntry = (id: string) => {
+    const scrollContainer = rootRef.current?.closest<HTMLElement>(".settings-content");
+    savedListScrollTopRef.current = scrollContainer?.scrollTop ?? 0;
+    lastOpenedIdRef.current = id;
+    setSelectedId(id);
+  };
 
   if (view === "about") {
     return (
-      <div className="about-settings">
+      <div ref={rootRef} className="about-settings">
         <div className="about-hero">
           <div className="about-hero-title">
             <strong>TaroBird</strong>
@@ -114,6 +275,7 @@ export function AboutSettings({ active }: { active: boolean }) {
 
         <div className="network-settings-options">
           <button
+            ref={aboutAckButtonRef}
             type="button"
             className="network-settings-option"
             data-about-action="acknowledgements"
@@ -132,20 +294,23 @@ export function AboutSettings({ active }: { active: boolean }) {
   }
 
   if (selectedEntry) {
+    const repoHref = safeHttpUrl(selectedEntry.repository);
     return (
-      <div className="about-acknowledgements-detail">
-        <button
-          type="button"
-          className="about-back-button"
-          onClick={() => setSelectedId(undefined)}
-        >
-          <ArrowLeft size={16} aria-hidden="true" />
-          <span>{t("返回致谢列表")}</span>
-        </button>
+      <div ref={rootRef} className="about-acknowledgements-detail">
+        {!phone && (
+          <button
+            type="button"
+            className="about-back-button"
+            onClick={() => setSelectedId(undefined)}
+          >
+            <ArrowLeft size={16} aria-hidden="true" />
+            <span>{t("返回致谢列表")}</span>
+          </button>
+        )}
 
         <header className="about-detail-header">
           <div>
-            <h4>{selectedEntry.name}</h4>
+            <h4 ref={detailHeadingRef} tabIndex={-1}>{selectedEntry.name}</h4>
             <p className="about-detail-sub">
               <span>{categoryLabel(selectedEntry.category)}</span>
               {selectedEntry.version && <> · <code>{selectedEntry.version}</code></>}
@@ -167,10 +332,14 @@ export function AboutSettings({ active }: { active: boolean }) {
             <div>
               <dt>{t("来源地址")}</dt>
               <dd>
-                <a href={selectedEntry.repository} target="_blank" rel="noreferrer noopener" className="about-repo-link">
+                {repoHref ? (
+                  <a href={repoHref} target="_blank" rel="noreferrer noopener" className="about-repo-link">
+                    <span>{selectedEntry.repository}</span>
+                    <ExternalLink size={13} aria-hidden="true" />
+                  </a>
+                ) : (
                   <span>{selectedEntry.repository}</span>
-                  <ExternalLink size={13} aria-hidden="true" />
-                </a>
+                )}
               </dd>
             </div>
           )}
@@ -192,16 +361,19 @@ export function AboutSettings({ active }: { active: boolean }) {
   }
 
   return (
-    <div className="about-acknowledgements">
+    <div ref={rootRef} tabIndex={-1} className="about-acknowledgements">
       <div className="about-ack-topbar">
-        <button
-          type="button"
-          className="about-back-button"
-          onClick={() => { setView("about"); setQuery(""); setCategory("all"); }}
-        >
-          <ArrowLeft size={16} aria-hidden="true" />
-          <span>{t("返回关于")}</span>
-        </button>
+        {!phone && (
+          <button
+            ref={listBackButtonRef}
+            type="button"
+            className="about-back-button"
+            onClick={() => { setView("about"); setQuery(""); setCategory("all"); }}
+          >
+            <ArrowLeft size={16} aria-hidden="true" />
+            <span>{t("返回关于")}</span>
+          </button>
+        )}
         {entries && (
           <span className="about-ack-count">
             {t("共 {0} 项", filtered.length)}
@@ -221,6 +393,13 @@ export function AboutSettings({ active }: { active: boolean }) {
           placeholder={t("按名称、协议或用途搜索…")}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && query) {
+              event.preventDefault();
+              event.stopPropagation();
+              setQuery("");
+            }
+          }}
         />
         {query && (
           <button
@@ -266,7 +445,7 @@ export function AboutSettings({ active }: { active: boolean }) {
                 type="button"
                 className="about-ack-row"
                 data-ack-id={entry.id}
-                onClick={() => setSelectedId(entry.id)}
+                onClick={() => openEntry(entry.id)}
               >
                 <span className="about-ack-row-main">
                   <span className="about-ack-row-title">
