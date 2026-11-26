@@ -171,7 +171,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   // localized reason that ended the session.
   const endedBy=state.reason||(state.state==="closed"&&!blocked?notice:""),statusShown=statusError&&!(endedBy&&!isScreenReasonCode(statusError));
   const stateText=error?screenError(error,errorTarget):statusShown?screenError(statusError,errorTarget):state.reason?screenError(state.reason,errorTarget):state.controlling?mobile?t("正在控制 · 可随时停止控制"):t("正在控制 · Ctrl+Alt+Shift+Esc 退出控制"):state.state==="connecting"?t("正在连接屏幕…"):state.state==="closed"?(blocked?screenError(blocked,errorTarget):notice?screenError(notice,errorTarget):t("尚未连接")):!state.fresh?t("画面暂未更新，控制已停止，请等待新画面。"):state.controlAllowed?t("查看中 · 点击开始控制后操作"):t("查看中 · 仅查看");
-  const actualResolution=!error&&!statusError&&!state.reason&&state.fresh&&state.width&&state.height?`${state.width}×${state.height}`:"";
+  const actualResolution=!error&&!statusError&&state.state!=="closed"&&state.fresh&&state.width&&state.height?`${state.width}×${state.height}`:"";
   const qualityHint=sharpSupported?t("720p 节省带宽，最高 3K 保留更多文字细节"):t("此设备不支持最高 3K 解码，请改用 1080p 或 720p。");
   const qualityTitle=!connection.state.screenQualityAvailable?t("更新主机后可选择清晰度"):legacyQuality?t("目标电脑的 App 暂不支持画质选择，请更新后重试，或以默认画质连接。"):actualResolution?t("当前 {0} · {1}",actualResolution,qualityHint):qualityHint;
   const qualitySelect=<select aria-label={t("画面清晰度")} title={qualityTitle} value={quality} disabled={!connection.state.screenQualityAvailable||legacyQuality||state.state==="connecting"} onChange={e=>changeQuality(e.target.value as ScreenQuality)}><option value="smooth">720p</option><option value="balanced">1080p</option><option value="sharp" disabled={!sharpSupported}>{t("最高 3K")}</option></select>;

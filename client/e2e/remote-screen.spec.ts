@@ -357,6 +357,9 @@ test("quality menu labels options by resolution and shows actual stream resoluti
  await expect(select).toHaveValue("balanced");
  await expect(select.locator("option")).toHaveText(["720p","1080p","最高 3K"]);
  await expect(select).toHaveAttribute("title","当前 1280×720 · 720p 节省带宽，最高 3K 保留更多文字细节");
+ await page.evaluate(()=>(window as any).screenDenyControl("screen_takeover_unavailable"));
+ await expect(page.getByRole("status")).toContainText("目标 Mac 的本机接管检测未就绪");
+ await expect(select).toHaveAttribute("title","当前 1280×720 · 720p 节省带宽，最高 3K 保留更多文字细节");
  await page.getByRole("button",{name:"断开",exact:true}).click();
  await expect(select).toHaveAttribute("title","720p 节省带宽，最高 3K 保留更多文字细节");
 });
