@@ -7,6 +7,7 @@ import "./bot-conversation-folds.css";
 import { DraftPreviewText, listDraftPreview, useDraftPreviews } from "./DraftPreview.js";
 import { FolderSections, MoveToFolder, type CrossHostFolderActionsContext } from "./ConversationFolders.js";
 import { botAgentSignal, buildBotRows, buildConversationRows, navigationItems, formatRowTime, type InboxRow } from "./conversation-inbox.js";
+import { filterUnreadHostItems } from "./conversation-unread.js";
 import { useLocalDay } from "./local-day.js";
 import { agentSignal } from "./agent-state.js";
 import { AgentAvatar } from "./AgentAvatar.js";
@@ -39,7 +40,7 @@ export type ConversationSelection = {
   disabled: (id: string) => boolean; reason?: (id: string) => string | undefined; toggle: (id: string) => void;
 };
 
-export function ConversationList({ connection, hostId, hostName, slice, showHostBadge = false, showDisconnectedBots = false, visible = true, layout = "bots", selection, filtered = false, conversations, bots, selected, pins, globalPins = [], showGlobalPins = true, activity, select, newChat, openBot }: { connection: HubConnection; hostId?: string; hostName?: string; slice?: SidebarSlice; showHostBadge?: boolean; showDisconnectedBots?: boolean; visible?: boolean; layout?: SidebarLayout; selection?: ConversationSelection; filtered?: boolean; conversations: Conversation[]; bots: Bot[]; selected: string; pins: string[]; globalPins?: string[]; showGlobalPins?: boolean; activity: Record<string, ConversationActivity>; select: (id: string) => void; newChat: (botId: string) => void; openBot: (botId: string, destination: "capabilities" | "operations") => void }) {
+export function ConversationList({ connection, hostId, hostName, slice, showHostBadge = false, showDisconnectedBots = false, visible = true, layout = "bots", selection, filtered = false, unreadOnly = false, retainedConversationId, conversations, bots, selected, pins, globalPins = [], showGlobalPins = true, activity, select, newChat, openBot }: { connection: HubConnection; hostId?: string; hostName?: string; slice?: SidebarSlice; showHostBadge?: boolean; showDisconnectedBots?: boolean; visible?: boolean; layout?: SidebarLayout; selection?: ConversationSelection; filtered?: boolean; unreadOnly?: boolean; retainedConversationId?: string; conversations: Conversation[]; bots: Bot[]; selected: string; pins: string[]; globalPins?: string[]; showGlobalPins?: boolean; activity: Record<string, ConversationActivity>; select: (id: string) => void; newChat: (botId: string) => void; openBot: (botId: string, destination: "capabilities" | "operations") => void }) {
   const drafts = useDraftPreviews(connection.cache);
   const sourceHost = showHostBadge && hostName ? <HostSourceBadge name={hostName}/> : null;
   const bulk = useConversationBulk();
@@ -122,9 +123,12 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
     });
   }, [foldScope, pins, globalPins, menu, layout, conversations, connection]);
   const parent = conversations.find((c) => c.id === selected)?.parentId;
+  const effectiveFiltered = filtered || unreadOnly;
+  const unreadMatch = unreadOnly ? filterUnreadHostItems(conversations, activity, globalPins, retainedConversationId) : undefined;
+  const retainedIds = unreadMatch ? (selection?.selected ? new Set([...selection.selected, ...unreadMatch.matchingIds]) : unreadMatch.matchingIds) : selection?.selected;
   // A selected topic may remain in a manually folded group. Mode changes and
   // mounted hidden sidebars must not overwrite the owner's disclosure choice.
-  const listed = navigationItems({ connection, bots, conversations }, showDisconnectedBots, selection?.selected);
+  const listed = navigationItems({ connection, bots, conversations: unreadMatch ? unreadMatch.conversations : conversations }, showDisconnectedBots, retainedIds);
   const hiddenBots = listed.bots.length < bots.length;
   const listedIds = new Set(listed.conversations.map(chat => chat.id));
   const hiddenConversations = listedConversations(conversations).some(chat => !chat.archived && !chat.parentId && !listedIds.has(chat.id));
@@ -136,21 +140,21 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
   // Nested rows sit on their parent's guide line: the Bot or group avatar above
   // already identifies them, so chats show text only and topics a "#".
   const row = (c: Conversation, nested = false, inbox?: InboxRow) => {
-    const current = selected === c.id || c.id === parent && !globalPins.includes(selected) && (!!inbox || topicFolds.collapsed.has(c.id));
+    const current = selected === c.id || c.id === parent && !globalPins.includes(selected) && (!!inbox || !effectiveFiltered && topicFolds.collapsed.has(c.id));
     const bot = bots.find((b) => b.id === c.botIds[0]);
     const online = state.status === "online" && bots.some((b) => c.botIds.includes(b.id) && b.online);
-    const children = ordinary.filter((child) => child.parentId === c.id);
-    const unread = inbox?.unread ?? (Object.keys(activity[c.id]?.unread ?? {}).length + (topicFolds.collapsed.has(c.id) ? children.reduce((sum, child) => sum + Object.keys(activity[child.id]?.unread ?? {}).length, 0) : 0));
+    const children = ordinary.filter((child) => child.parentId === c.id && (!unreadMatch || unreadMatch.matchingIds.has(child.id)));
+    const unread = inbox?.unread ?? (Object.keys(activity[c.id]?.unread ?? {}).length + (!effectiveFiltered && topicFolds.collapsed.has(c.id) ? children.reduce((sum, child) => sum + Object.keys(activity[child.id]?.unread ?? {}).length, 0) : 0));
     const parentName = c.parentId && (pins.includes(c.id) || globalPins.includes(c.id)) ? conversations.find((p) => p.id === c.parentId)?.title : undefined;
     // Nested rows show a preview only when there is one: the parent row already
     // carries the Bot's model/engine, so children do not repeat it (or "独立话题").
-    const draftPreview = listDraftPreview(c, conversations, drafts, !!inbox || !!topicFolds.collapsed.has(c.id));
+    const draftPreview = listDraftPreview(c, conversations, drafts, !!inbox || !effectiveFiltered && !!topicFolds.collapsed.has(c.id));
     const detail = draftPreview ? <DraftPreviewText text={draftPreview}/> : inbox ? (inbox.preview ? <ReferencePreview text={inbox.previewTopic ? t("{0}：{1}", inbox.previewTopic, inbox.preview) : inbox.preview}/> : t("暂无消息")) : activity[c.id]?.preview ? <ReferencePreview text={conversationPreview(conversationActivityPreview(activity[c.id]))}/> : nested ? undefined : c.parentId ? t("独立话题") : c.type === "group" ? t("{0} 个话题 · {1} 个 Bot", children.length, c.botIds.length) : bot?.model || bot?.engine || "TaroBird";
     // Inbox rows put the host label on this preview line, so it never narrows the title line.
     const preview = (parentName || detail) && <small>{parentName && `${parentName} · `}{detail}</small>;
     // A folded ADHD group must still expose requests in its hidden topics.
     // Expanded/search results show each topic marker on its own row.
-    const foldedTopics = selection && inbox && isGroup(c) && !filtered && !selection.topics.expanded(c.id);
+    const foldedTopics = selection && inbox && isGroup(c) && !effectiveFiltered && !selection.topics.expanded(c.id);
     const attention = foldedTopics
       ? inbox.attention[0]
       : Object.values(activity[c.id]?.attention ?? {}).sort((a, b) => a.at - b.at)[0];
@@ -161,28 +165,32 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
       {content}<label className="adhd-picker-check" title={selection.reason?.(c.id) ?? (checked ? t("从面板移除，对话保留") : t("加入面板"))}><input type="checkbox" data-pane-toggle={selection.key(c.id)} aria-label={t("加入面板：{0} · {1}", hostName ?? "", c.title)} checked={checked} disabled={!selection.ready || selection.disabled(c.id)} onChange={() => selection.toggle(c.id)}/><span aria-hidden="true">{checked && <Check size={12}/>}</span></label>
     </div>;
   };
-  const groupRow = (c: Conversation) => <div className="group-tree" key={c.id}><div className="group-tree-heading" onContextMenu={event => { event.preventDefault(); event.stopPropagation(); openConversationMenu(c, rows.current.get(c.id) ?? event.currentTarget, { x: event.clientX, y: event.clientY }); }}>{row(c)}<button className="group-toggle" onKeyDown={event => { if (event.key === "ContextMenu" || event.key === "F10" && event.shiftKey) { event.preventDefault(); event.stopPropagation(); openConversationMenu(c, event.currentTarget); } }} aria-expanded={!topicFolds.collapsed.has(c.id)} aria-controls={`${prefix}_topics_${c.id}`} aria-label={topicFolds.collapsed.has(c.id) ? t("展开「{0}」的话题", c.title) : t("收起「{0}」的话题", c.title)} onClick={() => topicFolds.set(c.id, !topicFolds.collapsed.has(c.id))}>{topicFolds.collapsed.has(c.id) ? <ChevronRight size={16}/> : <ChevronDown size={16}/>}</button></div><div id={`${prefix}_topics_${c.id}`} className="group-tree-topics">{!topicFolds.collapsed.has(c.id) && ordinary.filter((topic) => topic.parentId === c.id).map((topic) => row(topic, true))}</div></div>;
+  const groupRow = (c: Conversation) => {
+    const topics = ordinary.filter((topic) => topic.parentId === c.id && (!unreadMatch || unreadMatch.matchingIds.has(topic.id)));
+    const topicsFolded = !effectiveFiltered && topicFolds.collapsed.has(c.id);
+    return <div className="group-tree" key={c.id}><div className="group-tree-heading" onContextMenu={event => { event.preventDefault(); event.stopPropagation(); openConversationMenu(c, rows.current.get(c.id) ?? event.currentTarget, { x: event.clientX, y: event.clientY }); }}>{row(c)}<button className="group-toggle" disabled={effectiveFiltered} onKeyDown={event => { if (event.key === "ContextMenu" || event.key === "F10" && event.shiftKey) { event.preventDefault(); event.stopPropagation(); openConversationMenu(c, event.currentTarget); } }} aria-expanded={!topicsFolded} aria-controls={`${prefix}_topics_${c.id}`} aria-label={topicsFolded ? t("展开「{0}」的话题", c.title) : t("收起「{0}」的话题", c.title)} onClick={() => topicFolds.set(c.id, !topicsFolded)}>{topicsFolded ? <ChevronRight size={16}/> : <ChevronDown size={16}/>}</button></div><div id={`${prefix}_topics_${c.id}`} className="group-tree-topics">{!topicsFolded && topics.map((topic) => row(topic, true))}</div></div>;
+  };
   const inboxRow = (item: InboxRow) => {
     const c = item.conversation;
     // The ADHD inbox has no separate pinned-topic section. Keep every topic
     // reachable here, including topics pinned in the ordinary Bot tree.
     const children = selection && isGroup(c) ? ordinary.filter(child => child.parentId === c.id) : [];
     if (!children.length) return row(c, false, item);
-    const expanded = filtered || !!selection?.topics.expanded(c.id);
-    return <div className="adhd-group-topics" key={c.id}>{row(c, false, item)}<button className="adhd-topic-toggle" disabled={filtered} aria-expanded={expanded} aria-controls={`${prefix}_topics_${c.id}`} onClick={() => selection?.topics.setExpanded(c.id, !expanded)}>{expanded ? <ChevronDown size={12} aria-hidden="true"/> : <ChevronRight size={12} aria-hidden="true"/>}<span>{t("{0} 个话题", children.length)}</span></button><div id={`${prefix}_topics_${c.id}`} hidden={!expanded}>{children.map(child => row(child, true))}</div></div>;
+    const expanded = effectiveFiltered || !!selection?.topics.expanded(c.id);
+    return <div className="adhd-group-topics" key={c.id}>{row(c, false, item)}<button className="adhd-topic-toggle" disabled={effectiveFiltered} aria-expanded={expanded} aria-controls={`${prefix}_topics_${c.id}`} onClick={() => selection?.topics.setExpanded(c.id, !expanded)}>{expanded ? <ChevronDown size={12} aria-hidden="true"/> : <ChevronRight size={12} aria-hidden="true"/>}<span>{t("{0} 个话题", children.length)}</span></button><div id={`${prefix}_topics_${c.id}`} hidden={!expanded}>{children.map(child => row(child, true))}</div></div>;
   };
-  const botIds = buildBotRows([{ id: "local", ...listed, activity }]).map(bot => bot.id);
+  const botIds = buildBotRows([{ id: "local", ...listed, activity }]).map(bot => bot.id).filter(id => !unreadMatch || unreadMatch.botIds.has(id));
   // Cached or historical conversations may have no remaining Bot member. Keep
   // them readable without inventing an undefined Bot or enabling its actions.
-  const unassigned = ordinary.filter((c) => c.type === "direct" && !c.botIds.length);
-  const groups = ordinary.filter((c) => c.type === "group" && !c.parentId);
-  const inbox = layout === "conversations" && (!slice || slice.kind === "folders" || slice.kind === "folder") ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }]) : undefined;
+  const unassigned = ordinary.filter((c) => c.type === "direct" && !c.botIds.length && (!unreadMatch || unreadMatch.matchingIds.has(c.id)));
+  const groups = ordinary.filter((c) => c.type === "group" && !c.parentId && (!unreadMatch || unreadMatch.groupIds.has(c.id)));
+  const inbox = layout === "conversations" && (!slice || slice.kind === "folders" || slice.kind === "folder") ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }]).filter(item => !unreadMatch || unreadMatch.matchingIds.has(item.conversation.id) || unreadMatch.groupIds.has(item.conversation.id)) : undefined;
   const botRow = (id: string) => {
       const bot = bots.find((b) => b.id === id), name = labels.get(id) ?? bot?.name ?? id;
       const chats = ordinary.filter((c) => c.type === "direct" && c.botIds[0] === id);
       const current = chats.find((c) => c.id === selected) ?? chats[0];
       const children = chats;
-      const folded = !filtered && children.length > 0 && botFolds.collapsed.has(id);
+      const folded = !effectiveFiltered && children.length > 0 && botFolds.collapsed.has(id);
       const unread = children.reduce((sum, chat) => sum + Object.keys(activity[chat.id]?.unread ?? {}).length, 0);
       const attention = children.reduce((sum, chat) => sum + Object.keys(activity[chat.id]?.attention ?? {}).length, 0);
       const currentHidden = folded && children.some(chat => chat.id === selected);
@@ -194,7 +202,7 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
       // conversation's details menu, so the list reads as names and chats.
       return <div className="bot-tree" key={id} data-bot-id={id} data-bot-fold-scope={foldScope} data-collapsed={folded || undefined}>
         <div className="bot-tree-heading">
-          {children.length ? <button type="button" className="bot-tree-toggle" disabled={!botFolds.ready || filtered} aria-label={foldLabel} title={foldLabel} aria-expanded={!folded} aria-controls={`${prefix}_bot_chats_${id}`} aria-describedby={folded ? `${prefix}_bot_summary_${id}` : undefined} onClick={event => { event.currentTarget.focus({ preventScroll: true }); setMenu(undefined); botFolds.set(id, !folded); }} onKeyDown={event => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); event.stopPropagation(); setMenu(undefined); botFolds.set(id, event.key === "ArrowLeft"); } }}><ChevronRight size={14} aria-hidden="true"/></button> : <span className="bot-tree-disclosure-space" aria-hidden="true"/>}
+          {children.length ? <button type="button" className="bot-tree-toggle" disabled={!botFolds.ready || effectiveFiltered} aria-label={foldLabel} title={foldLabel} aria-expanded={!folded} aria-controls={`${prefix}_bot_chats_${id}`} aria-describedby={folded ? `${prefix}_bot_summary_${id}` : undefined} onClick={event => { event.currentTarget.focus({ preventScroll: true }); setMenu(undefined); botFolds.set(id, !folded); }} onKeyDown={event => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); event.stopPropagation(); setMenu(undefined); botFolds.set(id, event.key === "ArrowLeft"); } }}><ChevronRight size={14} aria-hidden="true"/></button> : <span className="bot-tree-disclosure-space" aria-hidden="true"/>}
           <button className={`bot-identity${currentHidden ? " is-collapsed-current" : ""}`} aria-current={currentHidden ? "page" : undefined} aria-describedby={folded ? `${prefix}_bot_summary_${id}` : undefined} aria-haspopup="menu" aria-expanded={botMenu?.id === id} aria-controls={botMenu?.id === id ? `${prefix}_bot_actions` : undefined} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); openBotMenu(id, event.currentTarget, event.clientX || event.clientY ? { x: event.clientX, y: event.clientY } : undefined); }} onKeyDown={event => { if (event.key === "ContextMenu" || event.key === "F10" && event.shiftKey) { event.preventDefault(); event.stopPropagation(); openBotMenu(id, event.currentTarget); } }} aria-label={t("打开 {0}", name)} title={[bot?.engine, bot?.model].filter(Boolean).join(" · ") || undefined} onClick={openChat}><AgentAvatar signal={botAgentSignal({ conversations: chats, activity }, id)} size={40} className="avatar" dispatcher={isDispatcher(bot)} tickets={isDispatcher(bot) ? { connection, botId: id } : undefined}><Avatar kind="bot" id={id} name={name} size={40}/><i className={state.status === "online" && bot?.online ? "online" : ""}/></AgentAvatar><span><strong><BotName id={id} name={name} bot={bot}/></strong></span></button>
           {sourceHost}
           {folded && <><span className="bot-fold-signals" aria-hidden="true" title={summary}>{attention > 0 && <span className="folder-attention"/>}{unread > 0 ? <b className="unread-badge">{unread > 99 ? "99+" : unread}</b> : <span className="bot-fold-count">{children.length}</span>}</span><span id={`${prefix}_bot_summary_${id}`} hidden>{summary}</span></>}
@@ -204,19 +212,19 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
       </div>;
   };
   const slicedConversation = slice?.kind === "conversation" ? active.find(c => c.id === slice.id) : undefined;
-  const globalRows = showGlobalPins ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }]).filter(item => item.globallyPinned) : [];
+  const globalRows = showGlobalPins ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }]).filter(item => item.globallyPinned && (!unreadMatch || unreadMatch.matchingIds.has(item.conversation.id) || unreadMatch.groupIds.has(item.conversation.id))) : [];
   const globalSection = globalRows.length > 0 && <GlobalPinSection>{globalRows.map(item => layout === "conversations" ? inboxRow(item) : isGroup(item.conversation) ? groupRow(item.conversation) : row(item.conversation))}</GlobalPinSection>;
   const Container = slice ? "div" : "nav";
   return <Container data-pin-scope={foldScope} className={slice ? "conversation-list-slice" : `conversation-list${inbox ? " conversation-inbox" : ""}`}>
-    {slice ? slice.kind === "bot" ? botIds.includes(slice.id) ? botRow(slice.id) : null : slice.kind === "folders" ? <FolderSections connection={connection} hostId={hostId} rows={(inbox ?? []).filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} showHostBadge filtered={filtered} renderRow={inboxRow}/> : slice.kind === "folder" ? <FolderSections connection={connection} hostId={hostId} folderFilter={slice.folderId} crossHost={slice.crossHost} rows={(inbox ?? []).filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} showHostBadge filtered={filtered} renderRow={inboxRow}/> : slicedConversation ? slice.inbox ? inboxRow(slice.inbox) : isGroup(slicedConversation) ? groupRow(slicedConversation) : row(slicedConversation) : null : <>
-    {inbox ? <>{globalSection}<FolderSections connection={connection} hostId={hostId} rows={inbox.filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} filtered={filtered} renderRow={inboxRow}/></> : <>
+    {slice ? slice.kind === "bot" ? botIds.includes(slice.id) ? botRow(slice.id) : null : slice.kind === "folders" ? <FolderSections connection={connection} hostId={hostId} rows={(inbox ?? []).filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} showHostBadge filtered={effectiveFiltered} renderRow={inboxRow}/> : slice.kind === "folder" ? <FolderSections connection={connection} hostId={hostId} folderFilter={slice.folderId} crossHost={slice.crossHost} rows={(inbox ?? []).filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} showHostBadge filtered={effectiveFiltered} renderRow={inboxRow}/> : slicedConversation ? slice.inbox ? inboxRow(slice.inbox) : isGroup(slicedConversation) ? groupRow(slicedConversation) : row(slicedConversation) : null : <>
+    {inbox ? <>{globalSection}<FolderSections connection={connection} hostId={hostId} rows={inbox.filter(item => !item.globallyPinned)} visible={visible} hostName={hostName} filtered={effectiveFiltered} renderRow={inboxRow}/></> : <>
     {globalSection}
 
     {!!botIds.length && <section aria-label={t("Bot")}><SidebarListHeading>{t("Bot")}</SidebarListHeading>{botIds.map(botRow)}</section>}
     {!!unassigned.length && <section><SidebarListHeading>{t("对话")}</SidebarListHeading>{unassigned.map((c) => row(c))}</section>}
     {!!groups.length && <section><SidebarListHeading>{t("群组")}</SidebarListHeading>{groups.map((c) => groupRow(c))}</section>}
     </>}
-    {!(inbox ? inbox.length : active.length || botIds.length) && <p className="empty-sidebar">{(inbox ? hiddenConversations : hiddenBots) ? t("未连接的 Bot 已隐藏，勾选「显示未连接 Bot」即可查看。") : t("选择 Bot 开始新对话，或点击新建群组。")}</p>}
+    {!(inbox ? inbox.length : unreadMatch ? botIds.length || unassigned.length || groups.length || globalRows.length : active.length || botIds.length) && <p className="empty-sidebar">{unreadOnly ? t("没有未读会话") : (inbox ? hiddenConversations : hiddenBots) ? t("未连接的 Bot 已隐藏，勾选「显示未连接 Bot」即可查看。") : t("选择 Bot 开始新对话，或点击新建群组。")}</p>}
     </>}
     {actionError && <p className="error-text" role="alert">{actionError}</p>}
     {visible && menu && menuTarget && <DesktopMenu id={`${prefix}_actions`} label={isGroup(menuTarget) ? t("群组操作") : t("对话操作")} open point={menu.point} placement="down-start" trigger={trigger} close={() => setMenu(undefined)}>
