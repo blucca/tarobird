@@ -281,7 +281,8 @@ for (const width of [1360, 390]) test(`long conversation follows new queued rows
     for (let i = 0; i < 4; i++) {
       await page.getByLabel("消息", { exact: true }).fill(`PENDING_TAIL_${i}\n` + "待发送内容。".repeat(20));
       await page.getByRole("button", { name: "发送消息", exact: true }).click();
-      await expect(page.locator(".queued-message").filter({ hasText: `PENDING_TAIL_${i}` })).toBeInViewport();
+      await expect(page.locator(".message.user").filter({ hasText: `PENDING_TAIL_${i}` })).toBeInViewport();
+      await expect(page.locator(".queued-message")).toHaveCount(0);
     }
     const scroller = page.locator(".message-scroll");
     await scroller.evaluate(node => { node.dispatchEvent(new WheelEvent("wheel", { deltaY: -600, bubbles: true })); node.scrollTop -= 600; });
@@ -296,7 +297,7 @@ for (const width of [1360, 390]) test(`long conversation follows new queued rows
     const beforeDetails = await measure(), before = beforeDetails.scrollTop;
     await page.getByLabel("消息", { exact: true }).fill("PRESERVE_READING_POSITION");
     await page.getByRole("button", { name: "发送消息", exact: true }).click();
-    await expect(page.locator(".queued-message").filter({ hasText: "PRESERVE_READING_POSITION" })).toBeAttached();
+    await expect(page.locator(".message.user").filter({ hasText: "PRESERVE_READING_POSITION" })).toBeAttached();
     try {
       await settleReadingLayout(scroller);
       await expect.poll(() => scroller.evaluate(node => node.scrollTop)).toBeCloseTo(before, 0);
@@ -304,7 +305,7 @@ for (const width of [1360, 390]) test(`long conversation follows new queued rows
     }
     finally { await info.attach("reading-position", { body: JSON.stringify({ before: beforeDetails, after: await measure() }, null, 2), contentType: "application/json" }); }
     await page.getByRole("button", { name: "回到最新消息", exact: true }).click();
-    await expect(page.locator(".queued-message").filter({ hasText: "PRESERVE_READING_POSITION" })).toBeInViewport();
+    await expect(page.locator(".message.user").filter({ hasText: "PRESERVE_READING_POSITION" })).toBeInViewport();
     await page.screenshot({ path: info.outputPath(`long-outbox-${width}.png`) });
   } finally {
     await page.evaluate(() => (window as any).releaseTailHistory?.()).catch(() => undefined);
@@ -343,8 +344,9 @@ for (const width of [1360, 390]) test(`two actual pages sharing IDB bridge the s
     await expect.poll(() => !!releaseSend).toBe(true);
     await peer.setViewportSize({ width, height: 844 }); await peer.goto(url);
     if (width <= 760) await selectConversation(peer, "两个窗口");
-    const pending = peer.locator(".queued-message").filter({ hasText: "SHARED_WINDOW_SEND" });
-    await expect(pending).toContainText("等待发送");
+    const pending = peer.locator(".message.user").filter({ hasText: "SHARED_WINDOW_SEND" });
+    await expect(pending).toContainText("发送中…");
+    await expect(peer.locator(".queued-message")).toHaveCount(0);
     await peer.evaluate(async () => {
       const { ClientCache } = await import("/src/storage.ts"), original = ClientCache.prototype.messages;
       let release!: () => void; const barrier = new Promise<void>(resolve => { release = resolve; });
@@ -361,8 +363,9 @@ for (const width of [1360, 390]) test(`two actual pages sharing IDB bridge the s
     await expect(pending).toContainText("正在同步发送状态…"); await expect(pending).toBeInViewport();
     await expect(pending.getByRole("button")).toHaveCount(0); expect(passiveAcks).toBe(0);
     await peer.evaluate(() => (window as any).sharedHistory.release());
-    await expect(peer.locator(".message.user").filter({ hasText: "SHARED_WINDOW_SEND" })).toBeVisible();
-    await expect(pending).toHaveCount(0);
+    await expect(peer.locator(".message.user").filter({ hasText: "SHARED_WINDOW_SEND" })).toHaveCount(1);
+    await expect(peer.locator(".message.user").filter({ hasText: "正在同步发送状态…" })).toHaveCount(0);
+    await expect(peer.locator(".queued-message")).toHaveCount(0);
     expect((await hub.store.snapshot("owner", chat.id)).messages.filter(item => item.clientMsgId === clientMsgId)).toHaveLength(1);
   } finally {
     await peer.evaluate(() => (window as any).sharedHistory?.release()).catch(() => undefined);

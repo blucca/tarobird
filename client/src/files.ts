@@ -1,4 +1,5 @@
 import { t } from "./i18n.js";
+import { rememberUploadedAttachment } from "./pending-messages.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { CHUNK_BYTES, MAX_FILE_BYTES } from "../../src/client-protocol/index.js";
@@ -58,7 +59,7 @@ export async function uploadFile(connection: UploadConnection, conversationId: s
         id ??= (await connection.http<{ id: string }>("/api/uploads", { method: "POST", body: metadata, signal: options.signal })).id;
         const state = await connection.http<{ complete: boolean; chunks: number[] }>(`/api/uploads/${id}`, { signal: options.signal });
         options.recovering?.(false);
-        if (state.complete) { progress(1); return id; }
+        if (state.complete) { rememberUploadedAttachment(id, file); progress(1); return id; }
         // Always reconcile receipts after a failed request. The server may have
         // durably accepted a chunk even though its response was lost.
         for (let start = 0; start < file.size; start += CHUNK_BYTES) {
@@ -67,7 +68,7 @@ export async function uploadFile(connection: UploadConnection, conversationId: s
           const next = Math.min(file.size, start + CHUNK_BYTES); if (next > confirmed) { confirmed = next; failedSince = undefined; }
           progress(confirmed / file.size);
         }
-        await connection.http(`/api/uploads/${id}/complete`, { method: "POST", signal: options.signal }); return id;
+        await connection.http(`/api/uploads/${id}/complete`, { method: "POST", signal: options.signal }); rememberUploadedAttachment(id, file); return id;
       } catch (error) {
         checkUpload(connection, options.signal);
         if (!transientUploadError(error)) throw error;

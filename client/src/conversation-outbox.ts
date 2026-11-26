@@ -146,6 +146,8 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
   const ordered = [...entries.values()].sort((a, b) => a.entry.order - b.entry.order);
   return ordered.map(({ entry, sent, syncing }, index) => ({
     id: entry.id,
+    order: entry.order,
+    frame: entry.frame,
     copyable: entry.frame.type === "message.send" && !!entry.frame.text,
     text: entry.frame.type === "message.send" ? entry.frame.text : entry.frame.type === "message.forward" ? t("转发消息") : t("卡片操作"),
     expired: !sent && !syncing && isUnavailableCardAction(entry),
