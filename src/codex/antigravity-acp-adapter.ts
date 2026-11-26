@@ -228,6 +228,8 @@ export const ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS = 30 * 60_000;
 const STOPPED_BY_USER = "Task was stopped by user";
 const DEFAULT_STEER_ADMISSION_TIMEOUT_MS = 10_000;
 const MAX_NATIVE_COMMANDS = 500;
+/** Orchestration tools whose child agents/workflows run inside `agy` without emitting parent ACP updates. */
+const SILENT_LONG_RUNNING_TOOLS = new Set(["run_workflow", "invoke_subagent"]);
 const NATIVE_COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const ANTIGRAVITY_EFFORTS: ReadonlySet<string> = new Set(ANTIGRAVITY_EFFORT_LEVELS);
 const PRESET_SUFFIX = /-(low|medium|high|xhigh|max|ultra)$/;
@@ -561,11 +563,18 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const tasks: EngineTask[] = [];
     for (const tool of worker.tools.values()) {
       if (!tool.background || (tool.status !== "pending" && tool.status !== "in_progress")) continue;
-      if (tool.name !== "run_command" && !(tool.kind === "execute" && !tool.name)) continue;
-      const commandLine = asRecord(tool.rawInput)?.CommandLine;
-      const label = (tool.title || (typeof commandLine === "string" ? commandLine : "") || "run_command").slice(0, 500);
-      tasks.push({ id: tool.token, label, kind: "shell", mode: "background", status: "running", canStop: false,
-        startedAt: tool.startedAt, updatedAt: tool.updatedAt, owner: tool.turn ? "bound" : "unattributed" });
+      if (tool.name === "run_command" || (tool.kind === "execute" && !tool.name)) {
+        const commandLine = asRecord(tool.rawInput)?.CommandLine;
+        const label = (tool.title || (typeof commandLine === "string" ? commandLine : "") || "run_command").slice(0, 500);
+        tasks.push({ id: tool.token, label, kind: "shell", mode: "background", status: "running", canStop: false,
+          startedAt: tool.startedAt, updatedAt: tool.updatedAt, owner: tool.turn ? "bound" : "unattributed" });
+      } else if (SILENT_LONG_RUNNING_TOOLS.has(tool.name || tool.title || "")) {
+        const input = asRecord(tool.rawInput);
+        const desc = typeof input?.Description === "string" ? input.Description : typeof input?.Role === "string" ? input.Role : "";
+        const label = (tool.title || desc || tool.name || "workflow").slice(0, 500);
+        tasks.push({ id: tool.token, label, kind: "subagent", mode: "background", status: "running", canStop: false,
+          startedAt: tool.startedAt, updatedAt: tool.updatedAt, owner: tool.turn ? "bound" : "unattributed" });
+      }
     }
     return { supported: true, tasks: tasks.slice(-128) };
   }
@@ -963,10 +972,28 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     this.armInactivity(turn);
   }
 
+  /**
+   * True when this turn is legitimately waiting without parent ACP stream updates:
+   * awaiting a user permission decision, or waiting on its own background tools /
+   * multi-agent orchestration tools (`run_workflow`, `invoke_subagent`).
+   * Unrelated background tools from earlier turns do not suppress this turn's watchdog.
+   */
+  private hasSilentLongRunningWait(turn: Turn): boolean {
+    const worker = turn.worker;
+    if (worker.pendingPermissions > 0) return true;
+    for (const tool of worker.tools.values()) {
+      if (tool.status !== "pending" && tool.status !== "in_progress") continue;
+      if (tool.turn !== turn) continue;
+      if (tool.background || SILENT_LONG_RUNNING_TOOLS.has(tool.name || tool.title || "")) return true;
+    }
+    return false;
+  }
+
   private armInactivity(turn: Turn): void {
     if (turn.inactivityTimer) clearTimeout(turn.inactivityTimer);
     turn.inactivityTimer = undefined;
-    if (turn.timeoutsDisabled || !this.inactivityTimeoutMs || this.inactivityTimeoutMs <= 0) return;
+    if (turn.done || turn.timeoutsDisabled || !this.inactivityTimeoutMs || this.inactivityTimeoutMs <= 0) return;
+    if (this.hasSilentLongRunningWait(turn)) return;
     turn.inactivityTimer = setTimeout(() => {
       void this.closeWorker(turn.worker, new Error(`Antigravity ACP turn became inactive after ${Math.max(1, Math.round(this.inactivityTimeoutMs! / 60_000))} minutes`));
     }, this.inactivityTimeoutMs);
@@ -1019,6 +1046,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if ((kind === "tool_call" || kind === "tool_call_update") && (update.status === "completed" || update.status === "failed") && typeof update.toolCallId === "string") {
       worker.tools.delete(update.toolCallId);
     }
+    // Re-sync the inactivity timer after worker.tools reflects newly started, backgrounded, or finished tools.
+    if (turn) this.armInactivity(turn);
     if (!turn) return;
     const sessionId = worker.sessionId!;
     if (kind === "agent_message_chunk") {
@@ -1133,6 +1162,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     };
     if (typeof toolCall.toolCallId === "string") this.emit(turn, { type: "permission_request", toolName, toolInput: approval.toolInput, toolUseId: toolCall.toolCallId, sessionId: worker.sessionId! });
     worker.pendingPermissions += 1;
+    this.armInactivity(turn);
     let decision: EngineApprovalDecision;
     try {
       decision = await turn.onApprovalRequest(approval);
@@ -1140,6 +1170,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       decision = { behavior: "deny" };
     } finally {
       worker.pendingPermissions = Math.max(0, worker.pendingPermissions - 1);
+      if (worker.turn === turn && !turn.done) this.armInactivity(turn);
     }
     if (turn.approvals.signal.aborted || turn.done) return { outcome: { outcome: "cancelled" } };
     if (decision.behavior === "allow" && allow) return { outcome: { outcome: "selected", optionId: allow } };
