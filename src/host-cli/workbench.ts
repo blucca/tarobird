@@ -88,6 +88,7 @@ export async function runWorkbenchCommand(directory: string, command: string | u
     finally { client.close(); }
   }
   if (!contextMessageId) throw new Error("workbench_current_context_required");
+  const botDesignError = request && workbenchDesignError(request); if (botDesignError) throw new Error(botDesignError);
   idSchema.parse(botId);
   const state = process.env.TAROBOT_ACTIVE_STATE_DIR ?? process.env.TAROBOT_STATE_DIR;
   if (!state || await realpath(state) !== await realpath(path.join(directory, "bots", botId))) throw new Error("workbench_source_directory_mismatch");

@@ -112,6 +112,18 @@ describe("the lightweight Design opener", () => {
     try { expect(await endpoint.context()).toBeUndefined(); expect(f.sent).toHaveLength(0); }
     finally { endpoint.dispose(); }
   });
+  it("hosts without workbenchSlidesAvailable never register an opener or freeze openTarget", async () => {
+    const f = fixture(); f.endpoint.dispose();
+    f.connection.state.workbenchDesignOpenAvailable = true;
+    f.connection.state.workbenchSlidesAvailable = false;
+    f.sent.length = 0; f.connection.http.mockClear();
+    const endpoint = new WorkbenchDesignOpener(f.connection as unknown as HubConnection, "chat", { eligible: () => true, open: f.open });
+    try {
+      expect(await endpoint.context()).toBeUndefined();
+      expect(f.sent).toHaveLength(0);
+      expect(f.connection.http).not.toHaveBeenCalled();
+    } finally { endpoint.dispose(); }
+  });
   it("a retired opener cannot be reused by another chat view", async () => {
     const f = fixture(); const old = f.frame("old"); f.endpoint.dispose();
     const endpoint = new WorkbenchDesignOpener(f.connection as unknown as HubConnection, "chat", { eligible: () => true, open: f.open });

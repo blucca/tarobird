@@ -59,7 +59,7 @@ describe('workbench signed socket and API boundary',()=>{
   // directly bypasses capability negotiation and missed the 1.0.123 regression.
   it.each(['deepseek', 'codex', 'claude', 'kimi', 'antigravity', 'pi'])('%s Design and PPT tools pass the real handshake and wait for the exact App receipt', async engine => {
     const app = await client('design-capability-check');
-    expect(app.serverCapabilities).not.toContain(WORKBENCH_DESIGN_CAPABILITY);
+    expect(app.serverCapabilities).toContain(WORKBENCH_DESIGN_CAPABILITY);
     expect(app.serverCapabilities).toContain(WORKBENCH_SLIDES_CAPABILITY);
     const target = { deviceId: 'desktop', windowId: 'design-window', tabId: 'design-tab' };
     peer.send({ type: 'workbench.register', registration: { windowId: target.windowId, generation: 'design-generation', conversationId, capabilities: ['design.slides.v1'], tabs: [{ id: target.tabId, kind: 'design', title: 'Design', revision: 0, designFormat: 'slides' }], activeTabId: target.tabId, visible: true } });
@@ -91,8 +91,7 @@ describe('workbench signed socket and API boundary',()=>{
     await until(() => responses.length > 0 || failures.length > 0 || peer.frames.some(frame => frame.type === 'workbench.command') || undefined);
     expect(failures).toEqual([]);
     expect(responses[0]?.error).toBeUndefined();
-    expect(transport.capabilities).not.toContain(WORKBENCH_DESIGN_CAPABILITY);
-    expect(transport.capabilities).toContain(WORKBENCH_SLIDES_CAPABILITY);
+    expect(transport.capabilities).toContain(WORKBENCH_DESIGN_CAPABILITY);
     expect(transport.capabilities).toContain(WORKBENCH_SLIDES_CAPABILITY);
     const reading = await peer.next('workbench.command');
     expect(reading).toMatchObject({ conversationId, target, request: { operation: 'design.read', contextMessageId: sourceMessageId } });

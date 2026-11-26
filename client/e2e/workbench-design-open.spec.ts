@@ -11,7 +11,7 @@ import { selectConversation, showDisconnectedBots, waitForClientOnline } from ".
 
 test.use({ serviceWorkers: "block" });
 const panel = (page: Page) => page.getByRole("complementary", { name: "工作台", exact: true });
-const renderedTitle = (page: Page) => page.frameLocator(".workbench-design-frame:visible").frameLocator("iframe").locator("h1");
+const renderedTitle = (page: Page) => page.frameLocator(".workbench-design-frame:visible").getByRole("heading", { level: 1 }).first();
 async function fixture(page: Page) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "design-auto-open-"));
   const hub = await HubServer.start({ stateDir: directory, clientDir: path.resolve("dist") });
@@ -39,7 +39,7 @@ async function fixture(page: Page) {
     expect(context?.openTarget).toBeTruthy();
     return { ...actor(conversation.id), sourceMessageId, context };
   }
-  const command = (source: WorkbenchActor, requestId: string, target?: WorkbenchTarget) => broker.request(source, { requestId, operation: "design.open", target, payload: {} });
+  const command = (source: WorkbenchActor, requestId: string, target?: WorkbenchTarget) => broker.request(source, { requestId, operation: "design.open", target, payload: { format: "slides" } });
   return { hub, a, b, broker, actor, windows, opener, source, command,
     close: async () => { for (const p of page.context().pages()) await p.close({ runBeforeUnload: false }); await hub.close(); await rm(directory, { recursive: true, force: true }); } };
 }
@@ -54,18 +54,19 @@ for (const phone of [false, true]) test(`explicit Design command opens the close
     const source = await f.source();
     // Sending a Design request alone does not guess from keywords or open UI.
     await expect(panel(page)).toHaveCount(0);
+    await expect(f.broker.request(source, { requestId: "open-canvas-rejected", operation: "design.open", payload: {} })).rejects.toThrow("design_canvas_removed");
     const receipt = await f.command(source, "open-from-user");
     expect(receipt).toMatchObject({ status: "applied", saved: true, result: { created: true } });
     const target = (receipt.result as { target: WorkbenchTarget }).target;
     await expect(panel(page)).toBeVisible();
-    await expect(page.frameLocator(".workbench-design-frame:visible").getByText("画布", { exact: true }).first()).toBeVisible({ timeout: 20000 });
-    await expect(renderedTitle(page)).toHaveText("画布", { timeout: 20000 });
-    const read: WorkbenchRequest = { requestId: "read-opened", operation: "design.read", target, payload: { path: "project/Main.dc.html" } };
+    await expect(page.frameLocator(".workbench-design-frame:visible").getByText("PPT", { exact: true }).first()).toBeVisible({ timeout: 20000 });
+    await expect(renderedTitle(page)).toHaveText("PPT", { timeout: 20000 });
+    const read: WorkbenchRequest = { requestId: "read-opened", operation: "design.read", target, payload: { path: "project/slides/cover.html" } };
     const content = await f.broker.request(source, read);
-    const html = (content.result as { content: string }).content.replace("画布", "Automatically opened Design");
-    const published = await f.broker.request(source, { requestId: "publish-opened", operation: "design.publish", target, expectedRevision: content.revision, payload: { files: { "project/Main.dc.html": { content: html, contentType: "text/html" } } } });
+    const html = (content.result as { content: string }).content.replace("PPT", "Automatically opened PPT");
+    const published = await f.broker.request(source, { requestId: "publish-opened", operation: "design.publish", target, expectedRevision: content.revision, payload: { files: { "project/slides/cover.html": { content: html, contentType: "text/html" } } } });
     expect(published).toMatchObject({ status: "applied", saved: true });
-    await expect(renderedTitle(page)).toHaveText("Automatically opened Design", { timeout: 15000 });
+    await expect(renderedTitle(page)).toHaveText("Automatically opened PPT", { timeout: 15000 });
     expect(await f.command(source, "open-from-user")).toEqual(receipt);
     const repeat = await f.command(source, "open-existing");
     expect(repeat).toMatchObject({ status: "applied", result: { target, created: false } });
@@ -77,9 +78,9 @@ for (const phone of [false, true]) test(`explicit Design command opens the close
     await expect.poll(async () => (await f.opener())?.windowId).not.toBe(source.context!.openTarget!.windowId);
     await expect(f.command(source, "old-turn-after-close")).rejects.toThrow(/workbench_(open_target|app)_unavailable/);
     await expect(panel(page)).toBeHidden();
-    const fresh = await f.source(page, f.a, "再用 Design 继续这个设计");
+    const fresh = await f.source(page, f.a, "再用 Baoyu PPT 继续这个演示");
     expect(await f.command(fresh, "fresh-reopen")).toMatchObject({ status: "applied", result: { target, created: false } });
-    await expect(renderedTitle(page)).toHaveText("Automatically opened Design", { timeout: 15000 });
+    await expect(renderedTitle(page)).toHaveText("Automatically opened PPT", { timeout: 15000 });
   } finally { await f.close(); }
 });
 
@@ -104,12 +105,12 @@ test("a queued open cannot follow navigation, and a source never targets another
     const opened = await f.command(next, "only-b");
     expect(opened).toMatchObject({ status: "applied", saved: true });
     await expect(panel(page)).toBeVisible();
-    await expect(panel(page).getByRole("tab", { name: "画布", exact: true })).toHaveAttribute("aria-selected", "true");
+    await expect(panel(page).getByRole("tab", { name: "PPT", exact: true })).toHaveAttribute("aria-selected", "true");
     // This case tests window/navigation routing; preview render and publish
     // are covered by both desktop/phone journeys above. The legacy multi-window
     // inner-preview timeout also reproduces on unchanged base (see audit doc).
-    const content = await f.broker.request(next, { requestId: "read-only-b", operation: "design.read", target: (opened.result as { target: WorkbenchTarget }).target, payload: { path: "project/Main.dc.html" } });
-    expect(content).toMatchObject({ status: "success", result: { content: expect.stringContaining("设计") } });
+    const content = await f.broker.request(next, { requestId: "read-only-b", operation: "design.read", target: (opened.result as { target: WorkbenchTarget }).target, payload: { path: "project/slides/cover.html" } });
+    expect(content).toMatchObject({ status: "success", result: { content: expect.stringContaining("PPT") } });
     await expect(panel(other)).toHaveCount(0);
   } finally { release(); f.broker.admit = original; await f.close(); }
 });

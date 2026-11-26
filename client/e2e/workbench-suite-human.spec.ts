@@ -46,56 +46,6 @@ const panel = (page: Page) => page.getByRole("complementary", { name: "工作台
 // disposable Hub, with Chinese/English payloads. They do not invoke a model.
 test.describe("production offline cache",()=>{
  test.use({serviceWorkers:"allow"});
- test("bilingual canvas offline edit survives close, reconnect, backup and language switch", async ({page},info)=>{
- test.setTimeout(150000);const f=await fixture(page);
- try {
-  const title="中文画布 English";
-  const made=await f.command({requestId:"human-canvas",operation:"design.create",payload:{title}});
-  let target={...made.target,tabId:(made.result as {tabId:string}).tabId};
-  const titles=()=>Promise.all(page.frames().filter(frame=>frame.parentFrame()?.parentFrame()===page.mainFrame()).map(frame=>frame.locator("h1").textContent({timeout:300}).catch(()=>"")));
-  await expect.poll(titles,{timeout:45000}).toContain(title);
-  await page.evaluate(()=>navigator.serviceWorker.ready);
-  await expect.poll(()=>page.evaluate(()=>!!navigator.serviceWorker.controller),{timeout:20000}).toBe(true);
-  await expect.poll(()=>page.evaluate(async()=>!!(await caches.match(new URL("/design-loader.html",location.href).href))),{timeout:20000}).toBe(true);
-  // Exercise a controlled online reload before cutting transport. This proves
-  // the app shell and Workbench lazy resources are cached for a fresh document.
-  await page.reload();await waitForClientOnline(page);await selectConversation(page,f.conversation.title);await page.getByRole("button",{name:"工作台",exact:true}).click();
-  await expect.poll(titles,{timeout:45000}).toContain(title);
-  await expect.poll(()=>page.evaluate(async()=>{const urls=performance.getEntriesByType("resource").map(e=>e.name).filter(url=>url.startsWith(location.origin+"/assets/")||url.endsWith("/design-sandbox.html"));return (await Promise.all(urls.map(async url=>(await caches.match(url,{ignoreVary:true}))?null:new URL(url).pathname))).filter(Boolean)}),{timeout:20000}).toEqual([]);
-  const active=(await f.targets())[0];target={deviceId:active.deviceId,windowId:active.windowId,tabId:target.tabId};
-  await page.context().setOffline(true);
-  for(const peer of (f.hub as unknown as {clients:Set<{ws:{terminate():void}}>}).clients)peer.ws.terminate();
-  await expect.poll(()=>page.evaluate(()=>navigator.onLine)).toBe(false);await expect.poll(async()=>(await f.targets()).length).toBe(0);
-  const artboard=page.frames().find(frame=>frame.parentFrame()?.parentFrame()===page.mainFrame())!;
-  await artboard.locator("h1").dblclick();await page.keyboard.press("Meta+A");await page.keyboard.insertText("你好 café English e\u0301 🌿");await page.keyboard.press("Escape");
-  await panel(page).getByRole("tab",{name:title,exact:true}).click({button:"right"});
-  await page.getByRole("menu",{name:"标签选项",exact:true}).getByRole("button",{name:"关闭标签",exact:true}).click();
-  await expect(page.locator(".workbench-design-frame")).toHaveCount(0,{timeout:15000});
-  await panel(page).getByRole("button",{name:"全部标签和已关闭内容",exact:true}).click();
-  await panel(page).locator(".workbench-closed-row").getByRole("button",{name:title,exact:true}).click();
-  await expect.poll(titles,{timeout:45000}).toContain("你好 café English e\u0301 🌿");
-  await page.reload();
-  await selectConversation(page,f.conversation.title);await page.getByRole("button",{name:"工作台",exact:true}).click();
-  await expect.poll(titles,{timeout:45000}).toContain("你好 café English e\u0301 🌿");
-  await page.context().setOffline(false);await waitForClientOnline(page);await expect.poll(async()=>(await f.targets()).length).toBe(1);
-  const reconnected=(await f.targets())[0];target={deviceId:reconnected.deviceId,windowId:reconnected.windowId,tabId:target.tabId};
-  const downloaded=page.waitForEvent("download");await panel(page).getByRole("button",{name:/^(导出设计|备份 PPT 项目)$/,exact:true}).click();const exportFile=await downloaded;
-  const bytes=await readFile((await exportFile.path())!);const backup=JSON.parse(bytes.toString());expect(backup).toMatchObject({format:"tarobot-design",version:2});
-  await panel(page).locator('input[accept=".tarobot-design.json"]').setInputFiles({name:"中文 copy.tarobot-design.json",mimeType:"application/json",buffer:bytes});
-  await expect(panel(page).getByRole("tab",{name:title,exact:true})).toHaveCount(2);
-  await expect.poll(titles,{timeout:45000}).toContain("你好 café English e\u0301 🌿");
-  const after=(await f.targets())[0];expect(after.tabs.filter(t=>t.title===title).map(t=>t.id)).toHaveLength(2);
-  // The imported copy has a distinct document identity and cannot rewrite the source.
-  const original=await f.command({requestId:"human-canvas-original",operation:"design.read",target,payload:{path:"project/Main.dc.html"}});
-  expect(original.status).toBe("success");expect((original.result as {content:string}).content).toContain("你好 café English e\u0301 🌿");
-  await openSettings(page,"general");await page.locator("#language").selectOption("en");await closeSettings(page,true);
-  await expect(page.locator("html")).toHaveAttribute("lang","en");
-  await expect(page.getByRole("complementary",{name:"Workbench",exact:true}).getByRole("tab",{name:title,exact:true})).toHaveCount(2);
-  await page.reload();await waitForClientOnline(page);await selectConversation(page,f.conversation.title);await page.getByRole("button",{name:"Workbench",exact:true}).click();
-  await expect.poll(titles,{timeout:45000}).toContain("你好 café English e\u0301 🌿");
-  await page.screenshot({path:info.outputPath("bilingual-canvas.png")});
- }catch(error){console.log("OFFLINE_FINAL",JSON.stringify({body:(await page.locator("body").innerText().catch(()=>"unavailable")).slice(0,6000),frames:page.frames().map(frame=>frame.url().slice(0,100))}));await page.screenshot({path:info.outputPath("offline-final.png")}).catch(()=>undefined);throw error;}finally{await f.close();}
-});
  test("PPT offline typing survives immediate close and reopens before reconnect",async({page},info)=>{
   test.setTimeout(120000);const f=await fixture(page);
   try {
@@ -152,31 +102,25 @@ test("bilingual PPT manual typing, close/reopen and imported backup preserve con
 });
 
 
-for (const language of ["zh", "en"] as const) test(`canvas and PPT user entrypoints preserve edits through menus and tab switches (${language})`, async ({page},info) => {
+for (const language of ["zh", "en"] as const) test(`PPT user entrypoints preserve edits through menus and omit removed canvas (${language})`, async ({page},info) => {
  test.setTimeout(120000);
  const f=await fixture(page);
  try {
   if(language==="en") {await openSettings(page,"general");await page.locator("#language").selectOption("en");await closeSettings(page,true);}
   const wb=page.getByRole("complementary",{name:language==="en"?"Workbench":"工作台",exact:true});
   const newButton=wb.getByRole("button",{name:language==="en"?"New content":"新建内容",exact:true});
-  const designName=language==="en"?"Canvas":"画布";
+  const removedCanvas=language==="en"?"Canvas":"画布";
   const times:Record<string,number>={};let phase=Date.now();
-  await newButton.click();await wb.getByRole("menu").getByRole("button",{name:designName,exact:true}).click();
+  await newButton.click();
+  await expect(wb.getByRole("menu").getByRole("button",{name:removedCanvas,exact:true})).toHaveCount(0);
+  await wb.getByRole("menu").getByRole("button",{name:"PPT",exact:true}).click();
   const editor=page.frameLocator(".workbench-design-frame:visible");
-  const heading=editor.frameLocator("iframe").locator("h1");
-  await expect(heading).toHaveText(designName,{timeout:45000});times.canvasOpenMs=Date.now()-phase;
-  // Guard the upstream handshake itself, not a flaky wall-clock deadline.
-  const revealCount = () => page.frames().find(frame => frame.parentFrame() === page.mainFrame())!.evaluate(() => performance.getEntriesByName("design:revealed").length);
-  expect(await revealCount()).toBe(1);
-  const edited=`${language} 手工修改 Canvas café 🌿`;
+  const heading=editor.getByRole("heading",{level:1}).first();
+  await expect(heading).toHaveText("PPT",{timeout:45000});times.pptOpenMs=Date.now()-phase;
+  const edited=`${language} 手工修改 PPT café 🌿`;
   await heading.dblclick();await page.keyboard.press("Meta+A");await page.keyboard.insertText(edited);await page.keyboard.press("Escape");
-  await page.keyboard.press("Meta+z");await expect(heading).toHaveText(designName);await page.keyboard.press("Meta+Shift+z");await expect(heading).toHaveText(edited);
+  await expect(heading).toHaveText(edited);
   await newButton.click();await expect(page.locator(".workbench-design-frame")).not.toBeVisible();await page.keyboard.press("Escape");await expect(heading).toBeVisible();
-  phase=Date.now();await newButton.click();await wb.getByRole("menu").getByRole("button",{name:"PPT",exact:true}).click();
-  await expect(editor.getByText("PPT",{exact:true}).first()).toBeVisible({timeout:45000});times.pptOpenMs=Date.now()-phase;
-  phase=Date.now();await wb.getByRole("tab",{name:designName,exact:true}).click();await expect(heading).toHaveText(edited,{timeout:45000});times.canvasReturnMs=Date.now()-phase;
-  expect(await revealCount()).toBe(1);
-  await wb.getByRole("tab",{name:"PPT",exact:true}).click();await expect(editor.getByText("PPT",{exact:true}).first()).toBeVisible({timeout:45000});
   await expect(page.locator(".workbench-design-frame:visible")).toHaveCount(1);
   console.log("HUMAN_ENTRY_TIMING",JSON.stringify({language,...times}));
   await page.screenshot({path:info.outputPath(`entrypoints-${language}.png`)});

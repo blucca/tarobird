@@ -41,6 +41,7 @@ export class WorkbenchDesignOpener {
   private available() {
     return !this.disposed && this.options.eligible() && !this.connection.isClosed && !this.connection.isReadOnly
       && this.connection.state.status === "online" && this.connection.state.workbenchDesignOpenAvailable === true
+      && this.connection.state.workbenchSlidesAvailable === true
       && !!this.userId && this.connection.state.user?.id === this.userId;
   }
   private target(): WorkbenchTarget { return { deviceId: this.connection.identity.deviceId, windowId: this.windowId }; }

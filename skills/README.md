@@ -36,20 +36,22 @@ skill (MIT); the tool-routing section is TaroBot-specific.
 Temporary App storage and safe post-publication retirement. Install through the
 same script above; see [the operator guide](../docs/macos-artifact-retention.md).
 
-## Baoyu Design and Baoyu PPT
+## Baoyu PPT
 
-These are TaroBot adapters for the separately pinned canvas and slides editors.
-They operate App projects with `app_workbench` / `tarobot workbench run`; they do
-not run the upstream filesystem server. Explicit Baoyu/宝玉 requests select them;
-ordinary design/PPT requests retain each engine's usual skills.
+This is the TaroBot adapter for the pinned slides editor (`claude-slides`). It
+operates App projects with `app_workbench` / `tarobot workbench run`; it does
+not run the upstream filesystem server. Explicit Baoyu/宝玉 PPT requests select
+it; ordinary PPT requests retain each engine's usual presentation skills. (The
+former Baoyu Design canvas editor and `baoyu-design` skill were removed in #89;
+canvas editing is handled by the optional Infinite Canvas extension.)
 
 ```bash
-bash scripts/install-skills.sh --skill baoyu-design --skill baoyu-ppt
+bash scripts/install-skills.sh --skill baoyu-ppt
 ```
 
 To use an engine-specific skill location, pass `--destination /path/to/skills`
 (repeat for multiple locations). Existing sessions may cache their catalog; do not
 reset user conversations just to refresh metadata. Shared App/CLI capability guidance
 also exposes the route to supported engines without relying on global skill discovery.
-Standalone/App Host packages carry these adapters and their references. Check both
-UPSTREAM.json files, upstream skills and editors at every release.
+Standalone/App Host packages carry this adapter and its references. Check
+`UPSTREAM.json`, the upstream skill and the slides editor at every release.

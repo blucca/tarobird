@@ -1,6 +1,5 @@
 import { test, expect } from "@playwright/test";
 import type { ViteDevServer } from "vite";
-import { readFile } from "node:fs/promises";
 import { createServer } from "./fixtures/vite.js";
 import { DESIGN_PREPARE_SCRIPT } from "../electron/design-quit.mjs";
 
@@ -11,7 +10,7 @@ import {ClientCache} from '/src/storage.ts';
 import {DesignSession} from '/src/workbench-design-session.ts';
 import {designFrame} from '/src/design-frame.ts';
 import {emptyDesignDocument,decodeDesignFile} from '/src/workbench-design.ts';
-const format=new URL(location.href).searchParams.get('format')==='slides'?'slides':'canvas';
+const format='slides';
 const cache=new ClientCache('upstream-editor-test');
 let doc=await cache.readWorkbenchDesign('fixture',format);
 if(!doc){doc=emptyDesignDocument(format,'中文 Editor upgrade',format);await cache.saveWorkbenchDesign('fixture',-1,doc);}
@@ -36,11 +35,11 @@ test.beforeAll(async () => {
 });
 test.afterAll(async () => { await server?.close(); });
 
-for (const format of ["canvas", "slides"]) test(`${format} persists active bilingual editing with the actual editor`, async ({ page }) => {
+for (const format of ["slides"]) test(`${format} persists active bilingual editing with the actual editor`, async ({ page }) => {
   const errors: string[] = []; page.on("pageerror", error => errors.push(error.message));
   await page.goto(url + "__upstream?format=" + format);
   const editor = page.frameLocator('.workbench-design-frame');
-  const title = format === 'canvas' ? editor.frameLocator('iframe').locator('h1') : editor.getByRole('heading', { level: 1 }).first();
+  const title = editor.getByRole('heading', { level: 1 }).first();
   await expect(title).toHaveText('中文 Editor upgrade', { timeout: 30_000 });
   await title.dblclick(); await page.keyboard.press('Meta+A'); await page.keyboard.insertText('更新后 中文 English');
   expect(await page.evaluate(DESIGN_PREPARE_SCRIPT)).toBe(true);
@@ -52,26 +51,7 @@ for (const format of ["canvas", "slides"]) test(`${format} persists active bilin
   expect(errors).toEqual([]);
 });
 
-test('canvas exports rendered HTML for Figma without frames or scripts', async ({ page }, info) => {
-  await page.goto(url + "__upstream");
-  const editor = page.frameLocator('.workbench-design-frame');
-  await expect(editor.frameLocator('iframe').locator('h1')).toHaveText('中文 Editor upgrade', { timeout: 30_000 });
-  try {
-    await editor.getByRole('button', { name: 'Export', exact: true }).click();
-    const download = page.waitForEvent('download');
-    await editor.getByRole('menuitem', { name: /HTML for Figma/ }).click();
-    const file = await download;
-    expect(file.suggestedFilename()).toMatch(/\.figma\.html$/);
-    const contents = await readFile((await file.path())!, 'utf8');
-    expect(contents).toContain('中文 Editor upgrade');
-    expect(contents).not.toMatch(/<(?:iframe|script)\b/i);
-  } catch (error) {
-    await info.attach('editor-state', { body: await editor.locator('body').ariaSnapshot(), contentType: 'text/plain' });
-    throw error;
-  }
-});
-
-for (const format of ['canvas', 'slides']) test(`${format} comments keep unsupported standalone batch sending out of the App`, async ({ page }) => {
+for (const format of ['slides']) test(`${format} comments keep unsupported standalone batch sending out of the App`, async ({ page }) => {
   await page.goto(url + '__upstream?format=' + format);
   const editor = page.frameLocator('.workbench-design-frame');
   const title = format === 'canvas' ? editor.frameLocator('iframe').locator('h1') : editor.getByRole('heading', { level: 1 }).first();

@@ -1,4 +1,4 @@
-import { workbenchDesignGuidance, workbenchPptRouting } from "./design-guidance.js";
+import { workbenchCanvasRemovedGuidance, workbenchDesignGuidance, workbenchPptRouting } from "./design-guidance.js";
 import { workbenchContextSchema, workbenchOpenerOnly } from "../client-protocol/workbench.js";
 import { widgetsEnabled } from "../runtime/widget-policy.js";
 import { widgetGuidance, reportCompatibilityGuidance, widgetFormatPolicy, widgetCompatibilityFence } from "./widget-guidance.js";
@@ -195,6 +195,7 @@ export function appTurnInstructions(text: string, options: AppInstructionOptions
   // This adds a selection rule, not a keyword-driven tool choice or permission.
   // In particular it corrects old persistent tool descriptions that equate Design with Baoyu.
   if (/\b(?:pptx?|powerpoint|presentations?|slides?|decks?|keynote)\b|幻[灯燈]片|投影片|演示|汇报材料|匯報材料|[简簡][报報]/iu.test(text)) guidance.push(workbenchPptRouting);
+  else if (/\bbaoyu[- ]?(?:design|canvas)\b|宝[玉育]\s*(?:design|设计|設計|[画畫]布)|(?:workbench|工作台).{0,16}(?:\bcanvas\b|[画畫]布)|(?:\bcanvas\b|[画畫]布).{0,16}(?:workbench|工作台)|\bdesign\b.{0,16}\bcanvas\b|\bcanvas\b.{0,16}\bdesign\b|\bdesign\b.{0,12}[画畫]布|[画畫]布.{0,12}\bdesign\b/iu.test(text)) guidance.push(workbenchCanvasRemovedGuidance);
   // A discussion turn never delegates; callers pass only the user's topic here.
   const discussion = options.context === "discussion";
   if (!discussion && !options.ticketWorker && /(?:跨.?主机|跨.?[Bb]ot|另.{0,8}[Bb]ot|[Bb]ot.{0,8}协作|委托|转交|发给.{0,12}[Bb]ot|collaborat|messages (?:send|wait)|send.{0,12}bot)/iu.test(text)) guidance.push(botCollaborationInstructions());

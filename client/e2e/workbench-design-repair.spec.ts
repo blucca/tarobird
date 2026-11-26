@@ -39,7 +39,7 @@ async function storedAssociation(page:Page,conversationId:string){return page.ev
 
 for (const phone of [false, true]) test.describe(phone ? "phone touch" : "desktop", () => {
 test.use({ hasTouch: phone, isMobile: phone });
-for (const format of ["canvas", "slides"] as const) test(`the upstream ${format} repair button opens and sends a reviewable draft for its exact tab`, async ({ page }) => {
+for (const format of ["slides"] as const) test(`the upstream ${format} repair button opens and sends a reviewable draft for its exact tab`, async ({ page }) => {
   test.setTimeout(70000);
   await page.setViewportSize(phone ? { width: 390, height: 844 } : { width: 1360, height: 900 });
   const f = await fixture(page);
@@ -86,7 +86,7 @@ for (const format of ["canvas", "slides"] as const) test(`the upstream ${format}
 
 test.describe("phone repair focus ownership", () => {
   test.use({ hasTouch: true, isMobile: true });
-  for (const format of ["canvas", "slides"] as const) test(`an asynchronous ${format} suggestion preserves the focused chat input`, async ({ page }) => {
+  for (const format of ["slides"] as const) test(`an asynchronous ${format} suggestion preserves the focused chat input`, async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     const f = await fixture(page);
     try {

@@ -279,9 +279,7 @@ export class WorkbenchBroker {
       if (journal.fingerprint !== fingerprint || request.operation.startsWith("design.") && journal.sourceMessageId !== actor.sourceMessageId) throw new HubError("request_id_conflict", 409);
       return journal.receipt ?? { requestId: request.requestId, target: journal.target, status: "unknown", error: "workbench_previous_outcome_unknown" };
     }
-    if (workbenchDesignError(request) === "design_canvas_removed") {
-      return { requestId: request.requestId, target: request.target ?? { deviceId: "", windowId: "" }, status: "not_executed", error: "design_canvas_removed" };
-    }
+    if (workbenchDesignError(request) === "design_canvas_removed") throw new HubError("design_canvas_removed", 400);
     // design.open goes only to the turn's frozen opener (a Bot), or to the
     // owner's explicit opener; never to another window. A context frozen with
     // the panel closed names only that opener and targets nothing else.
@@ -303,7 +301,9 @@ export class WorkbenchBroker {
     // Reads may use the turn's exact frozen context; writes must name their tab.
     if (designMutationOperations.includes(request.operation) && !request.target?.tabId || designReadOperations.includes(request.operation) && !wanted?.tabId) throw new HubError("workbench_target_required", 400);
     const tabId = creates || opening || request.operation === "tabs.list" ? undefined : wanted?.tabId ?? chosen.activeTabId;
-    if (tabId && !chosen.tabs.some(tab => tab.id === tabId)) throw new HubError("workbench_target_closed", 409);
+    const tab = tabId ? chosen.tabs.find(item => item.id === tabId) : undefined;
+    if (tabId && !tab) throw new HubError("workbench_target_closed", 409);
+    if (workbenchOperationKind(request.operation) === "design" && tab && tab.kind === "design" && tab.designFormat !== "slides") throw new HubError("design_canvas_removed", 400);
     const target: WorkbenchTarget = { deviceId: chosen.deviceId, windowId: chosen.windowId, ...(tabId ? { tabId } : {}) };
     // Synchronous with creating the pending command: a later cancel finds it.
     const cancelled = intake.cancelled;

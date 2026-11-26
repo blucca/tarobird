@@ -26,12 +26,11 @@ async function fixture(page: Page) {
 }
 const panel = (page: Page) => page.getByRole("complementary", { name: "工作台", exact: true });
 
-test("PPT renders a real deck, Bot edits persist, and canvas stays separate", async ({page}, info) => {
+test("PPT renders a real deck, Bot edits persist, and canvas creation is rejected", async ({page}, info) => {
   const errors: string[] = []; page.on("pageerror", e => errors.push(e.message));
   const f = await fixture(page);
   try {
-    const canvas = await f.command({requestId:"existing-canvas",operation:"design.create",payload:{title:"Canvas retained"}});
-    expect(canvas).toMatchObject({status:"applied",saved:true});
+    await expect(f.command({requestId:"existing-canvas",operation:"design.create",payload:{title:"Canvas retained"}})).rejects.toThrow("design_canvas_removed");
     const created = await f.command({requestId:"slides-new",operation:"design.create",payload:{title:"Slide acceptance",format:"slides"}});
     expect(created).toMatchObject({status:"applied",saved:true});
     const target = {...created.target,tabId:(created.result as {tabId:string}).tabId};
@@ -50,8 +49,6 @@ test("PPT renders a real deck, Bot edits persist, and canvas stays separate", as
     expect(await guest.evaluate(async () => {try{await fetch("https://example.com");return "connected"}catch{return "blocked"}})).toBe("blocked");
     await page.reload();await waitForClientOnline(page);await selectConversation(page,f.conversation.title);await page.getByRole("button",{name:"工作台",exact:true}).click();
     await expect(editor.getByText("Bot edited slide",{exact:true}).first()).toBeVisible({timeout:20000});
-    await panel(page).getByRole("tab",{name:"Canvas retained",exact:true}).click();
-    await expect(page.frameLocator(".workbench-design-frame:visible").frameLocator("iframe").locator("h1")).toHaveText("Canvas retained",{timeout:20000});
     expect(errors).toEqual([]);
   } catch (error) {
     console.log("SLIDES_ERRORS", errors);

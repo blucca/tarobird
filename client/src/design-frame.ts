@@ -180,7 +180,9 @@ class DesignFrame {
     }
     if (value?.type === "editor:flushed" && typeof value.requestId === "string") {
       const task = this.pending.get(value.requestId); if (!task) return; this.pending.delete(value.requestId); clearTimeout(task.timer);
-      value.saved === true ? task.resolve() : task.reject(new Error("design_not_saved")); return;
+      if (value.saved === true) { this.report(undefined); task.resolve(); }
+      else task.reject(new Error("design_not_saved"));
+      return;
     }
     if (value?.type === "editor:save-file") {
       const id = value.requestId;

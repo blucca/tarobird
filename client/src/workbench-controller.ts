@@ -167,7 +167,7 @@ export class WorkbenchController {
       });
       // One unavailable item (deleted meanwhile, unreadable) reports its own error;
       // the rest of the workbench still opens. A scope loss still fails below.
-      for (const tab of layout.tabs) if (tab.kind === "design" && layout.visible.includes(tab.id)) await this.ensureDesign(tab.id).catch(error => { this.check(); this.setError(errorCode(error)); });
+      for (const tab of layout.tabs) if (tab.kind === "design" && tab.designFormat === "slides" && layout.visible.includes(tab.id)) await this.ensureDesign(tab.id).catch(error => { this.check(); this.setError(errorCode(error)); });
       for (const tab of layout.tabs) if (tab.kind === "markdown" && layout.visible.includes(tab.id) && this.isVisible) await this.ensureMarkdown(tab.id).catch(error => { this.check(); this.setError(errorCode(error)); });
       this.check();
       for (const value of nativeTabs) this.browserEvent({ ...value, kind: "state", tab: String(value.tab) });
@@ -196,7 +196,7 @@ export class WorkbenchController {
     this.publish();
     if (!this.snapshot.ready) return;
     if (value) {
-      for (const id of this.snapshot.layout.visible) if (this.snapshot.layout.tabs.find(tab => tab.id === id)?.kind === "design") void this.ensureDesign(id).catch(error => this.setError(errorCode(error)));
+      for (const id of this.snapshot.layout.visible) { const tab = this.snapshot.layout.tabs.find(item => item.id === id); if (tab?.kind === "design" && tab.designFormat === "slides") void this.ensureDesign(id).catch(error => this.setError(errorCode(error))); }
       for (const id of this.snapshot.layout.visible) if (this.snapshot.layout.tabs.some(tab => tab.id === id && tab.kind === "markdown")) void this.ensureMarkdown(id).catch(error => this.setError(errorCode(error)));
       void Promise.all(this.snapshot.layout.visible.filter(id => this.snapshot.layout.tabs.some(tab => tab.id === id && tab.kind === "whiteboard")).map(id => this.ensureBoard(id)))
         .catch(error => this.setError(errorCode(error)));
@@ -214,7 +214,7 @@ export class WorkbenchController {
     if (!this.snapshot.ready || this.disposed) return;
     const layout = this.committedChartLayout ?? this.snapshot.layout;
     return { windowId: this.snapshot.windowId, conversationId: this.conversationId, generation: this.snapshot.generation,
-      capabilities: [...(this.connection.state.workbenchDesignCommentsAvailable ? ["design.comments.v1" as const] : []), ...(this.connection.state.workbenchDesignHistoryAvailable ? ["design.history.v1" as const] : []), ...(this.connection.state.workbenchSlidesAvailable ? ["design.slides.v1" as const] : []), "whiteboard.v1", "charts.v1", ...(this.connection.state.workbenchMarkdownAvailable ? ["markdown.v1" as const] : []), ...(this.snapshot.browser ? ["browser.v1" as const] : [])],
+      capabilities: [...(this.connection.state.workbenchDesignCommentsAvailable ? ["design.comments.v1" as const] : []), ...(this.connection.state.workbenchDesignHistoryAvailable ? ["design.history.v1" as const] : []), ...(this.connection.state.workbenchSlidesAvailable ? ["design.slides.v1" as const] : []), ...(this.connection.state.workbenchDesignAvailable && this.connection.state.workbenchSlidesAvailable ? ["design.v1" as const] : []), "whiteboard.v1", "charts.v1", ...(this.connection.state.workbenchMarkdownAvailable ? ["markdown.v1" as const] : []), ...(this.snapshot.browser ? ["browser.v1" as const] : [])],
       tabs: layout.tabs.filter(tab => (tab.kind !== "design" || tab.designFormat === "slides" && this.connection.state.workbenchSlidesAvailable) && (tab.kind !== "markdown" || this.connection.state.workbenchMarkdownAvailable)).map(tab => ({ id: tab.id, kind: tab.kind, title: tab.title, ...(tab.designFormat && this.connection.state.workbenchSlidesAvailable ? {designFormat: tab.designFormat} : {}), ...(tab.source ? { source: tab.source } : {}), ...(tab.kind === "design" && this.designSessions.has(tab.id) ? { revision: this.designSessions.get(tab.id)!.document.revision } : {}), ...(tab.kind === "markdown" && this.snapshot.notes.has(tab.id) ? { revision: this.snapshot.notes.get(tab.id)!.revision, readOnly: this.noteSessions.get(tab.id)?.readOnly } : {}), ...(tab.kind === "whiteboard" && this.snapshot.boards.has(tab.id) ? { revision: this.snapshot.boards.get(tab.id)!.revision } : {}) })),
       ...(layout.active && (layout.tabs.find(tab => tab.id === layout.active)?.kind !== "design" || layout.tabs.find(tab => tab.id === layout.active)?.designFormat === "slides" && this.connection.state.workbenchSlidesAvailable) && (this.connection.state.workbenchMarkdownAvailable || layout.tabs.find(tab => tab.id === layout.active)?.kind !== "markdown") ? { activeTabId: layout.active } : {}), visible: this.isVisible };
   }
@@ -252,7 +252,7 @@ export class WorkbenchController {
     for (const id of stored.visible) if (stored.tabs.find(tab => tab.id === id)?.kind === "whiteboard") await this.ensureBoard(id).catch(() => undefined);
     this.check(); if (this.snapshot.layout !== old) return;
     this.publish({ layout: stored }); this.pruneBoards(); this.pruneMarkdown();
-    if (this.isVisible) for (const id of stored.visible) if (stored.tabs.find(tab => tab.id === id)?.kind === "design") void this.ensureDesign(id).catch(error => this.setError(errorCode(error)));
+    if (this.isVisible) for (const id of stored.visible) { const tab = stored.tabs.find(item => item.id === id); if (tab?.kind === "design" && tab.designFormat === "slides") void this.ensureDesign(id).catch(error => this.setError(errorCode(error))); }
     if (this.isVisible) for (const id of stored.visible) if (stored.tabs.find(tab => tab.id === id)?.kind === "markdown") void this.ensureMarkdown(id).catch(() => undefined);
   }
   change(action: LayoutAction, assertActive?: () => void): Promise<void> { return this.serial(() => this.changeNow(action, assertActive)); }
@@ -335,7 +335,7 @@ export class WorkbenchController {
     await this.flushLeavingEditors(next, assertActive);
     for (const id of next.visible) if (next.tabs.find(tab => tab.id === id)?.kind === "whiteboard") { await this.ensureBoard(id); assertActive?.(); }
     for (const id of next.visible) if (next.tabs.find(tab => tab.id === id)?.kind === "markdown") { await this.ensureMarkdown(id); assertActive?.(); }
-    for (const id of next.visible) if (next.tabs.find(tab => tab.id === id)?.kind === "design") { await this.ensureDesign(id); assertActive?.(); }
+    for (const id of next.visible) { const tab = next.tabs.find(item => item.id === id); if (tab?.kind === "design" && tab.designFormat === "slides") { await this.ensureDesign(id); assertActive?.(); } }
     assertActive?.(); await this.connection.cache.saveWorkbench(this.scope, old.revision, next); this.check(); this.publish({ layout: next, error: undefined }); assertActive?.();
     this.pruneBoards(); this.pruneMarkdown();
   }
@@ -408,6 +408,7 @@ export class WorkbenchController {
     const promise = (async () => {
       const document = await this.connection.cache.readWorkbenchDesign(this.scope, id); this.check();
       if (!document) throw new Error("design_not_found");
+      if (document.format !== "slides") throw new Error("design_canvas_removed");
       const session = new DesignSession(document, () => this.connection.cache.readWorkbenchDesign(this.scope, id), async (expected, next, sidecar) => {
         if (this.connection.isClosed || this.connection.isReadOnly || this.connection.state.user?.id !== this.userId) throw new Error("workbench_scope_unavailable");
         this.tab(id, "design"); await this.connection.cache.saveWorkbenchDesign(this.scope, expected, next, sidecar);
@@ -801,6 +802,11 @@ export class WorkbenchController {
         image = new File([blob], "edited-image", { type: blob.type });
       }
       if (request.operation === "browser") browserAction = await this.browser.prepare(payload, request.requestId, abort.signal);
+      if (request.operation === "design.create" && designCreateSchema.parse(payload).format !== "slides") throw new Error("design_canvas_removed");
+      if (request.operation.startsWith("design.") && request.operation !== "design.create") {
+        if (!target.tabId) throw new Error("workbench_target_required");
+        if (this.tab(target.tabId, "design").designFormat !== "slides") throw new Error("design_canvas_removed");
+      }
       check();
       const admission = await this.connection.http<{ admitted: boolean; generation: string; target: typeof target }>("/api/workbench/admit", { method: "POST", body: JSON.stringify({ dispatchId: frame.dispatchId }), signal: abort.signal });
       check(); if (!admission.admitted || admission.generation !== frame.generation || JSON.stringify(admission.target) !== JSON.stringify(target)) throw new Error("workbench_admission_changed");
@@ -813,8 +819,11 @@ export class WorkbenchController {
         return { ...base, status: "applied", saved: true, revision: this.designSessions.get(tabId)?.document.revision ?? 0, result: { tabId } };
       }
       if (request.operation.startsWith("design.")) {
-        if (!target.tabId) throw new Error("workbench_target_required"); this.tab(target.tabId, "design");
+        if (!target.tabId) throw new Error("workbench_target_required");
+        const tab = this.tab(target.tabId, "design");
+        if (tab.designFormat !== "slides") throw new Error("design_canvas_removed");
         const session = await this.ensureDesign(target.tabId); check();
+        if (session.document.format !== "slides") throw new Error("design_canvas_removed");
         if (request.operation === "design.read") { const value = await session.read(payload); check(); return workbenchReceiptSchema.parse({ ...base, status: "success", ...value }); }
         if (["design.comments.read","design.history.list","design.history.diff"].includes(request.operation)) {
           const value = request.operation === "design.comments.read" ? await session.commentsRead(payload) : request.operation === "design.history.list" ? await session.historyList(payload) : await session.historyDiff(payload); check();
