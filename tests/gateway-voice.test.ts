@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { isActiveTranscriptionMessage } from "../src/client-protocol/voice-presentation.js";
 import { blocksText, type CardElement } from "../src/client-protocol/index.js";
 import { attachGateway } from "../src/gateway/service.js";
 import type { GatewayChannel } from "../src/gateway/channel.js";
@@ -31,9 +32,9 @@ beforeEach(async () => {
 });
 afterEach(async () => { await gateway?.disconnect(); gateway = undefined; await hub.close(); await rm(root, { recursive: true, force: true }); });
 const until = async (check: () => Promise<boolean>) => { const end = Date.now() + 10_000; while (!await check()) { if (Date.now() > end) throw new Error("voice_timeout"); await new Promise((resolve) => setTimeout(resolve, 20)); } };
-async function attach(transcribeMedia: ReturnType<typeof createDefaultTranscribeVoice>, bridge: CoreBridgeLike) {
+async function attach(transcribeMedia: ReturnType<typeof createDefaultTranscribeVoice>, bridge: CoreBridgeLike, engine: "pi" | "claude" | "codex" | "kimi" | "antigravity" | "deepseek" = "codex") {
   const runtime = createCoreServiceRuntime({ transcribeMedia });
-  gateway = await attachGateway({ stateDir, botId: "alpha", secret, engine: "codex", url: hub.instanceUrl.replace("http", "ws") + "/instance", bridge, runtime });
+  gateway = await attachGateway({ stateDir, botId: "alpha", secret, engine, url: hub.instanceUrl.replace("http", "ws") + "/instance", bridge, runtime });
   return runtime;
 }
 async function send(conversationId: string, id: string, name = "voice.webm", mime = "audio/webm", text = "结合这段录音回答") {
@@ -207,4 +208,64 @@ it("extracts audio for an App .3gp video before calling the cloud adapter", asyn
   expect(transcribeViaTingwuCloud).toHaveBeenCalledTimes(1);
   expect(vi.mocked(transcribeViaTingwuCloud).mock.calls[0]![0]).toMatch(/tarobot-asr-audio-.*audio\.wav$/);
   expect(fetchImpl).not.toHaveBeenCalled(); expect(engine).toHaveBeenCalledTimes(1);
+});
+
+it.each([
+  ["pi", "zh"],
+  ["claude", "en"],
+  ["codex", "zh"],
+  ["kimi", "en"],
+  ["antigravity", "zh"],
+  ["deepseek", "en"],
+] as const)("publishes active transcription metadata, hides steering targets, stops cleanly and delivers queued input (%s/%s)", async (engineName, locale) => {
+  await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: engineName, locale }));
+  await hub.store.db.run("UPDATE bots SET engine=? WHERE id='alpha'", [engineName]);
+  const engine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>().mockResolvedValue({ text: "queued reply" });
+  let entered = false;
+  let aborted = false;
+  const runtime = await attach(
+    async (_file, options) => new Promise((_resolve, reject) => {
+      entered = true;
+      options?.abortSignal?.addEventListener("abort", () => { aborted = true; reject(new Error("cancelled")); }, { once: true });
+    }),
+    {
+      handleAuthorizedMessage: engine,
+      supportsSteering: () => true,
+      inFlightSendBehavior: () => (engineName === "pi" || engineName === "claude" || engineName === "antigravity" ? "steer" : undefined),
+      nativeInputCapability: async () => (engineName === "claude" ? { sendNow: true, cancel: true, modelReceipt: true } : undefined),
+      steerActiveTurn: vi.fn(async () => false),
+    },
+    engineName,
+  );
+  const c = await hub.store.createConversation("owner", ["alpha"], "Stop transcription", `stop-${engineName}`);
+  await send(c.id, `voice-${engineName}`);
+  await until(async () => entered);
+  const activeSnap = (await hub.store.snapshot("owner", c.id)).messages;
+  const progress = activeSnap.find((m) => m.authorType === "bot" && blocksText(m.blocks).includes(locale === "en" ? "Transcribing audio" : "正在转写音频"));
+  expect(progress).toBeDefined();
+  expect(progress!.status).toBe("streaming");
+  expect(isActiveTranscriptionMessage(progress!)).toBe(true);
+
+  const steerStatus = await gateway!.onCall!("steer.status", { conversationId: c.id, backgroundReview: true }) as { targetId?: string; reason?: string };
+  expect(steerStatus.targetId).toBeUndefined();
+  expect(steerStatus.reason).toBe("idle");
+
+  // Message typed while transcribing queues behind the active transcription instead of steering or cancelling it.
+  await hub.store.sendMessage("owner", { conversationId: c.id, clientMsgId: `queued-${engineName}`, text: "no transcription", attachments: [] });
+  expect(engine).not.toHaveBeenCalled();
+
+  expect(await gateway!.onCall!("stop", { conversationId: c.id })).toEqual({ stopped: true });
+  await drained();
+  await until(async () => !runtime.chatQueue.isBusy(`lark:${c.id}`));
+  expect(aborted).toBe(true);
+  const finalSnap = (await hub.store.snapshot("owner", c.id)).messages;
+  const stoppedCard = finalSnap.find((m) => m.id === progress!.id)!;
+  expect(stoppedCard.status).toBe("complete");
+  expect(isActiveTranscriptionMessage(stoppedCard)).toBe(false);
+  expect(blocksText(stoppedCard.blocks)).toContain(locale === "en" ? "Transcription stopped" : "已停止转写");
+  expect(finalSnap.some((m) => blocksText(m.blocks).includes("准备飞书消息时失败") || blocksText(m.blocks).includes("failed to prepare the Lark message"))).toBe(false);
+  expect(finalSnap.some((m) => m.status === "error" || blocksText(m.blocks).includes("未处理完成"))).toBe(false);
+  expect(finalSnap.some((m) => blocksText(m.blocks) === "已停止。" || blocksText(m.blocks) === "Stopped.")).toBe(false);
+  expect(engine).toHaveBeenCalledTimes(1);
+  expect(engine.mock.calls[0]![0].text).toContain("no transcription");
 });

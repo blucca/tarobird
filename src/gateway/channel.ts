@@ -7,6 +7,7 @@ import { scopedTaskLabelSchema } from "../client-protocol/engine-tasks.js";
 import { summarizeRecordedChanges } from "../core/recorded-diff.js";
 import { RUN_CHANGES_CAPABILITY } from "../client-protocol/run-changes.js";
 import { queueNoticeSchema } from "../client-protocol/queue-notice.js";
+import { transcriptionStateSchema } from "../client-protocol/voice-presentation.js";
 import { publicThinkingPreview } from "../client-protocol/run-thinking.js";
 import { attachmentMime } from "../client-protocol/attachment-mime.js";
 import { RUN_CAPABILITY, RUN_SCOPES_CAPABILITY, isRunActive, anyRun, runSummarySchema, scopedJournal, type RunEntry, type ScopedJournal } from "../client-protocol/run.js";
@@ -353,11 +354,14 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
     const raw = z.record(z.string(), z.unknown()).parse(card);
     // Always consume producer-only grouping: translation would otherwise keep it
     // as an unknown property and bypass the Hub capability gate.
-    const { appRun, appBackgroundTask, appScopedTask, appScopedGroup, appQueue, ...fallback } = raw;
+    const { appRun, appBackgroundTask, appScopedTask, appScopedGroup, appQueue, appTranscription, ...fallback } = raw;
     let translated = translateCard(fallback, () => this.transport.options.onWarning?.("card_property_preserved"));
     const queue = queueNoticeSchema.safeParse(appQueue);
     if (queue.success) translated = { ...translated, extra: { ...translated.extra, appQueue: queue.data } };
     else if (appQueue !== undefined) translated = { ...translated, extra: { ...translated.extra, appQueue: null } }; // Do not reinterpret an unknown version as a historical queue notice.
+    const transcription = transcriptionStateSchema.safeParse(appTranscription);
+    if (transcription.success) translated = { ...translated, extra: { ...translated.extra, appTranscription: transcription.data } };
+    else if (appTranscription !== undefined) translated = { ...translated, extra: { ...translated.extra, appTranscription: null } };
     const background = backgroundTaskSchema.safeParse(appBackgroundTask);
     if (background.success) translated = { ...translated, extra: { ...translated.extra, backgroundTask: background.data } };
     const taskLabel = scopedTaskLabelSchema.safeParse(appScopedTask);
@@ -537,6 +541,8 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
     // including on older clients that only inspect the message envelope.
     if (native.success && native.data.appRun.background) return "complete";
     if (native.success) return isRunActive(native.data.appRun.summary.phase) ? "streaming" : "complete";
+    const transcription = z.object({ appTranscription: transcriptionStateSchema }).safeParse(card);
+    if (transcription.success) return transcription.data.appTranscription.active ? "streaming" : "complete";
     const parsed = z.object({ config: z.object({ streaming_mode: z.boolean().optional() }).optional() }).safeParse(card);
     return parsed.success && parsed.data.config?.streaming_mode ? "streaming" : "complete";
   }

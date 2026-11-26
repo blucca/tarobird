@@ -1,4 +1,22 @@
-import type { CardElement } from "./index.js";
+import { z } from "zod";
+import type { Block, CardElement } from "./index.js";
+
+/** Gateway-authored marker for an in-flight Host audio transcription card. */
+export const transcriptionStateSchema = z.object({ version: z.literal(1), active: z.boolean() }).strict();
+export type TranscriptionState = z.infer<typeof transcriptionStateSchema>;
+
+export function isTranscriptionMessage(message: { blocks: readonly Block[] }): boolean {
+  return message.blocks.some(block => block.type === "card" && block.extra?.appTranscription !== undefined);
+}
+
+export function isActiveTranscriptionMessage(message: { status: string; forwardedFrom?: unknown; blocks: readonly Block[] }): boolean {
+  if (message.forwardedFrom || !["pending", "streaming"].includes(message.status)) return false;
+  return message.blocks.some(block => {
+    if (block.type !== "card") return false;
+    const parsed = transcriptionStateSchema.safeParse(block.extra?.appTranscription);
+    return parsed.success && parsed.data.active;
+  });
+}
 
 export const isGeneratedVoiceFilename = (name: string): boolean => /^voice-\d{10,}\.(?:m4a|mp4|webm|ogg|wav)$/i.test(name);
 

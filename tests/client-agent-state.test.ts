@@ -33,10 +33,11 @@ describe('projectReply', () => {
     expect(agentSignal([activity])).toBe(IDLE_AGENT);
   });
 
-  it('does not count forwarded or mirrored work as this conversation running', () => {
+  it('does not count forwarded, mirrored or active transcription cards as a Bot reply working', () => {
     const activity = { unread: {}, replies: {} };
     projectReply(activity, message('forward', 'streaming', 10, { forwardedFrom: { conversationId: 'x', messageId: 'y' } } as Partial<Message>), 10);
     projectReply(activity, message('mirror', 'streaming', 20, { blocks: [{ type: 'card', elements: [], extra: { agentBusStage: { runId: 'run', workspaceId: 'ws', stageId: 's1', status: 'running' } } }] }), 20);
+    projectReply(activity, message('transcribe', 'streaming', 30, { blocks: [{ type: 'card', elements: [{ type: 'markdown', text: '**正在转写音频…**' }], extra: { appTranscription: { version: 1, active: true } } }] }), 30);
     expect(agentSignal([activity])).toBe(IDLE_AGENT);
   });
 

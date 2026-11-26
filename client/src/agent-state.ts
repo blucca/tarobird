@@ -1,4 +1,5 @@
 import type { Message } from "../../src/client-protocol/index.js";
+import { isTranscriptionMessage } from "../../src/client-protocol/voice-presentation.js";
 import { isAgentBusRecord } from "./agent-bus-record.js";
 import type { MessageAttention } from "./attention.js";
 
@@ -31,7 +32,7 @@ export function projectReply(activity: ReplyActivity, message: Message, at: numb
  * Only active IDs/timestamps are retained; terminal updates remove their ID. */
 export function projectWorkingReply(activity: Pick<ReplyActivity, "workingReplies">, message: Message, at: number): void {
   const working = activity.workingReplies ??= {};
-  if (message.authorType === "bot" && !message.forwardedFrom && !isAgentBusRecord(message) && message.status === "streaming") working[message.id] = at;
+  if (message.authorType === "bot" && !message.forwardedFrom && !isAgentBusRecord(message) && !isTranscriptionMessage(message) && message.status === "streaming") working[message.id] = at;
   else delete working[message.id];
 }
 
