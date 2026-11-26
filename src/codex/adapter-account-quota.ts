@@ -39,19 +39,31 @@ function jsonRecord(text: string): Record<string, unknown> {
   return parsed;
 }
 
+function readEnv(env: NodeJS.ProcessEnv, key: string, platform: NodeJS.Platform): string | undefined {
+  const direct = env[key];
+  if (direct !== undefined && direct !== "") return direct;
+  if (platform !== "win32") return undefined;
+  const upper = key.toUpperCase();
+  return Object.entries(env).find(([name, value]) => name.toUpperCase() === upper && value !== undefined && value !== "")?.[1];
+}
+
 /** Private in-memory scope guard. No credential values, hashes or file paths are emitted to logs/public DTOs. */
 export class AdapterQuotaCache {
   readonly proofKey = randomBytes(32);
   private cached?: { revision: string; snapshot: QuotaSnapshot; proof?: QuotaAccountProof };
-  constructor(private readonly engine: "codex" | "claude" | "antigravity", private readonly executable: string, private readonly env: NodeJS.ProcessEnv, private readonly cwd?: string, private readonly configPath?: string) {}
+  constructor(private readonly engine: "codex" | "claude" | "antigravity", private readonly executable: string, private readonly env: NodeJS.ProcessEnv, private readonly cwd?: string, private readonly configPath?: string, private readonly platform: NodeJS.Platform = process.platform) {}
 
   capture(workerGeneration: string): AdapterQuotaScope {
     const digest = (value: unknown) => createHmac("sha256", this.proofKey).update(JSON.stringify(value)).digest("hex");
-    const home = this.env.HOME || this.env.USERPROFILE || homedir();
+    const userProfile = readEnv(this.env, "USERPROFILE", this.platform);
+    const homeVar = readEnv(this.env, "HOME", this.platform);
+    // On Windows, Claude Code / Node `os.homedir()` resolve USERPROFILE rather than
+    // HOME (which Git for Windows / MSYS may set to another directory).
+    const home = (this.platform === "win32" ? userProfile || homeVar : homeVar || userProfile) || homedir();
     const engineHome = this.engine === "codex"
-      ? this.env.CODEX_HOME || path.join(home, ".codex")
+      ? readEnv(this.env, "CODEX_HOME", this.platform)?.trim() || path.join(home, ".codex")
       : this.engine === "claude"
-        ? this.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude")
+        ? readEnv(this.env, "CLAUDE_CONFIG_DIR", this.platform)?.trim() || path.join(home, ".claude")
         : path.join(home, ".gemini", "antigravity-cli");
     let authMode: QuotaAuthMode = "unknown", verifiable = false;
     let material: unknown;
@@ -63,8 +75,10 @@ export class AdapterQuotaCache {
         const project = this.cwd ? readBounded(path.join(this.cwd, ".codex", "config.toml")) : "";
         const account = jsonRecord(authText);
         const tokens = account.tokens && typeof account.tokens === "object" ? account.tokens as Record<string, unknown> : {};
-        const env = Object.fromEntries(Object.entries(this.env).filter(([key]) => /^(OPENAI_|CODEX_|CHATGPT_)/.test(key)));
-        authMode = typeof tokens.access_token === "string" && tokens.access_token ? "subscription" : this.env.OPENAI_API_KEY || account.OPENAI_API_KEY ? "api_key" : "unknown";
+        const codexPrefix = this.platform === "win32" ? /^(OPENAI_|CODEX_|CHATGPT_)/i : /^(OPENAI_|CODEX_|CHATGPT_)/;
+        const env = Object.fromEntries(Object.entries(this.env).filter(([key]) => codexPrefix.test(key)).map(([key, value]) => [this.platform === "win32" ? key.toUpperCase() : key, value] as const).sort(([a], [b]) => a.localeCompare(b)));
+        const openAiKey = readEnv(this.env, "OPENAI_API_KEY", this.platform);
+        authMode = typeof tokens.access_token === "string" && tokens.access_token ? "subscription" : openAiKey || account.OPENAI_API_KEY ? "api_key" : "unknown";
         // Keyring/auto, includes and external auth helpers are not proven by an auth.json file next to them.
         const opaque = /cli_auth_credentials_store\s*=\s*["'](?:keyring|auto)["']|(?:auth_command|credential_helper|include)\s*=/.test(`${config}\n${project}`);
         verifiable = !opaque && authMode !== "unknown";
@@ -75,12 +89,17 @@ export class AdapterQuotaCache {
         const project = this.cwd ? readBounded(path.join(this.cwd, ".claude", "settings.json")) + readBounded(path.join(this.cwd, ".claude", "settings.local.json")) : "";
         const account = jsonRecord(authText);
         const oauth = account.claudeAiOauth && typeof account.claudeAiOauth === "object" ? account.claudeAiOauth as Record<string, unknown> : {};
-        const env = Object.fromEntries(Object.entries(this.env).filter(([key]) => /^(ANTHROPIC_|CLAUDE_|AWS_|GOOGLE_|AZURE_)/.test(key)));
-        const cloud = this.env.CLAUDE_CODE_USE_BEDROCK === "1" || this.env.CLAUDE_CODE_USE_VERTEX === "1" || this.env.CLAUDE_CODE_USE_FOUNDRY === "1";
-        authMode = cloud ? "other" : this.env.ANTHROPIC_API_KEY || this.env.ANTHROPIC_AUTH_TOKEN ? "api_key" : this.env.CLAUDE_CODE_OAUTH_TOKEN || (typeof oauth.accessToken === "string" && oauth.accessToken) ? "subscription" : "unknown";
+        const claudePrefix = this.platform === "win32" ? /^(ANTHROPIC_|CLAUDE_|AWS_|GOOGLE_|AZURE_)/i : /^(ANTHROPIC_|CLAUDE_|AWS_|GOOGLE_|AZURE_)/;
+        const env = Object.fromEntries(Object.entries(this.env).filter(([key]) => claudePrefix.test(key)).map(([key, value]) => [this.platform === "win32" ? key.toUpperCase() : key, value] as const).sort(([a], [b]) => a.localeCompare(b)));
+        const cloud = readEnv(this.env, "CLAUDE_CODE_USE_BEDROCK", this.platform) === "1"
+          || readEnv(this.env, "CLAUDE_CODE_USE_VERTEX", this.platform) === "1"
+          || readEnv(this.env, "CLAUDE_CODE_USE_FOUNDRY", this.platform) === "1";
+        const apiKey = readEnv(this.env, "ANTHROPIC_API_KEY", this.platform) || readEnv(this.env, "ANTHROPIC_AUTH_TOKEN", this.platform);
+        const oauthEnv = readEnv(this.env, "CLAUDE_CODE_OAUTH_TOKEN", this.platform);
+        authMode = cloud ? "other" : apiKey ? "api_key" : oauthEnv || (typeof oauth.accessToken === "string" && oauth.accessToken) ? "subscription" : "unknown";
         const opaque = /"apiKeyHelper"\s*:|"ANTHROPIC_|"CLAUDE_CODE_OAUTH_TOKEN"\s*:/.test(`${settings}\n${project}`);
         // The macOS CLI may prefer Keychain over the plaintext file. Only an explicit env token proves that source here.
-        verifiable = !opaque && authMode !== "unknown" && (process.platform !== "darwin" || Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN || this.env.ANTHROPIC_API_KEY || this.env.ANTHROPIC_AUTH_TOKEN) || cloud);
+        verifiable = !opaque && authMode !== "unknown" && (this.platform !== "darwin" || Boolean(oauthEnv || apiKey) || cloud);
         material = [this.executable, engineHome, configured, settings, project, authText, env];
       } else {
         const geminiHome = path.join(home, ".gemini");

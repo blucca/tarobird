@@ -617,9 +617,9 @@ function normalizeExecutableCommand(command: string): string {
   return trimmed;
 }
 
-function buildCommandInvocation(command: string, args: string[]): { command: string; args: string[]; shell?: boolean } {
+export function buildClaudeCommandInvocation(command: string, args: string[], platform: NodeJS.Platform = process.platform): { command: string; args: string[]; shell?: boolean } {
   const normalizedCommand = normalizeExecutableCommand(command);
-  if (process.platform === "win32") return { command: normalizedCommand, args, shell: false };
+  if (platform === "win32") return { command: normalizedCommand, args, shell: false };
 
   if (/\.(cmd|bat)$/i.test(normalizedCommand)) {
     return {
@@ -1158,6 +1158,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   private readonly disallowedTools: string[];
   private readonly enableChromeIntegration: boolean;
   private readonly nativeSearchMcp?: NativeSearchMcpPlanner;
+  private readonly platform: NodeJS.Platform;
   private readonly idleSweepTimer: ReturnType<typeof setInterval> | undefined;
   private readonly workers = new Map<string, ClaudeWorker>();
   private readonly historyHelper: ClaudeHistoryHelper | undefined;
@@ -1215,6 +1216,8 @@ export class ClaudeStreamAdapter implements CodexAdapter {
        * build put next to this module, if there is one. Null: no native history.
        */
       historyHelper?: ClaudeHistoryHelper | null;
+      /** Platform override for tests (defaults to process.platform). */
+      platform?: NodeJS.Platform;
     },
   ) {
     const builtHistoryHelper = options?.historyHelper === undefined ? resolveClaudeHistoryHelperPath() : undefined;
@@ -1229,12 +1232,13 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     })();
 
     this.spawnClaude = options?.spawnFn ?? (spawnEngine as unknown as SpawnClaude);
+    this.platform = options?.platform ?? process.platform;
     this.instructionsPath = options?.instructionsPath;
     this.configPath = options?.configPath;
     this.turnRecovery = new ClaudeTurnRecovery(options?.recoveryStatePath);
     this.sessionUsage = new ClaudeSessionUsage(options?.usageStatePath);
     this.workspacePath = options?.workspacePath;
-    this.quotaCache = new AdapterQuotaCache("claude", claudeExecutable, this.childEnv, this.workspacePath, this.configPath);
+    this.quotaCache = new AdapterQuotaCache("claude", claudeExecutable, this.childEnv, this.workspacePath, this.configPath, this.platform);
     this.idleWorkerTtlMs = options?.idleWorkerTtlMs ?? DEFAULT_IDLE_WORKER_TTL_MS;
     this.turnInactivityTimeoutMs = options?.turnInactivityTimeoutMs === undefined
       ? CLAUDE_STREAM_INACTIVITY_TIMEOUT_MS
@@ -1296,7 +1300,22 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       return await answer;
     } catch (error) {
       const entry = this.quotaWorkers.get(worker);
-      if (entry && error instanceof ClaudeControlError && error.kind === "rejected" && /unsupported control request/i.test(error.message)) (entry.unasked ??= new Set()).add(request);
+      if (entry && error instanceof ClaudeControlError && error.kind === "rejected" && /unsupported control request/i.test(error.message)) {
+        (entry.unasked ??= new Set()).add(request);
+        if (request === "get_usage" && entry.snapshot && !worker.retired && !this.destroyPromise) {
+          const scope = this.quotaCache.capture(String(entry.id));
+          if (scope.verifiable && scope.authMode === "subscription" && scope.credentialRevision === entry.credentialRevision) {
+            this.quotaSource = worker;
+            this.quotaCache.store(scope, { snapshot: entry.snapshot });
+          } else {
+            entry.snapshot = undefined;
+            if (this.quotaSource === worker) {
+              this.quotaSource = undefined;
+              this.quotaCache.invalidate();
+            }
+          }
+        }
+      }
       throw error;
     } finally { if (Date.now() - sentAt <= CLAUDE_USAGE_ACK_TIMEOUT_MS) putBack(); }
   }
@@ -1382,7 +1401,12 @@ export class ClaudeStreamAdapter implements CodexAdapter {
         // This read waits only so long. The question stays out; its answer is stored when it comes (usageQuestion).
         usage = await Promise.race([question, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new ClaudeControlError("get_usage", "Claude get_usage has not answered yet", "timeout")), Math.max(1, waitMs)); })]);
       } catch (error) {
-        if (entry.unasked?.has("get_usage")) return passive;
+        if (entry.unasked?.has("get_usage")) {
+          const fallbackScope = this.quotaScope();
+          if (fallbackScope.credentialRevision !== scope.credentialRevision) return this.quotaCache.failure(fallbackScope, "auth_changed");
+          return this.quotaCache.response(fallbackScope, { ...options, expectedRevision: undefined })
+            ?? this.quotaCache.failure(fallbackScope, "no_passive_event");
+        }
         failure = error instanceof QuotaReadError ? error.reason : error instanceof ClaudeControlError && error.kind === "timeout" ? "timeout" : "native_error";
       } finally { clearTimeout(timer); }
       // The login changed while the question was out: the answer cannot be told to be about the current one.
@@ -1408,15 +1432,23 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     const scope = this.quotaCache.capture(String(entry.id));
     if (!scope.verifiable || scope.authMode !== "subscription" || scope.credentialRevision !== entry.credentialRevision) {
       entry.snapshot = undefined;
-      if (this.quotaSource === worker) this.quotaCache.invalidate();
+      if (this.quotaSource === worker) {
+        this.quotaSource = undefined;
+        this.quotaCache.invalidate();
+      }
       return;
     }
     try {
       const snapshot = applyClaudeQuotaEvent(entry.snapshot, value);
       if (!snapshot) return;
       entry.snapshot = snapshot;
-      this.quotaSource = worker;
-      this.quotaCache.store(scope, { snapshot });
+      // Passive stream events only drive the quota cache once this worker refuses `get_usage`.
+      // Promoting them before then changes `quotaScope()`'s revision mid-turn on Windows/Linux
+      // (where `.credentials.json` is verifiable) and lets sparse single-window events shadow `get_usage`.
+      if (entry.unasked?.has("get_usage")) {
+        this.quotaSource = worker;
+        this.quotaCache.store(scope, { snapshot });
+      }
     } catch { /* Invalid native quota data must never interrupt the user's conversation. */ }
   }
 
@@ -1642,7 +1674,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     const agentInstructions = this.instructionsPath ? await this.loadInstructions() : null;
     const instructionsFile = agentInstructions ? await createClaudeInstructionsFile(agentInstructions) : null;
     const args = claudeSideProcessArgs({ sourceSessionId, forkSessionId, effort: engineOptions.effort, model: engineOptions.model, workspacePath, appendSystemPromptFile: instructionsFile?.path });
-    const invocation = buildCommandInvocation(this.claudeExecutable, args);
+    const invocation = buildClaudeCommandInvocation(this.claudeExecutable, args, this.platform);
     let child: ClaudeChildProcess;
     try {
       child = this.spawnClaude(invocation.command, invocation.args, { stdio: ["pipe", "pipe", "pipe"], shell: invocation.shell, env: this.childEnv, cwd: workspacePath, windowsHide: true });
@@ -1650,7 +1682,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       await instructionsFile?.cleanup().catch(() => {});
       throw error;
     }
-    const side: ClaudeSideProcess = new ClaudeSideProcess(child, { configDir: resolveClaudeConfigDir(this.childEnv), sessionId: forkSessionId }, () => {
+    const side: ClaudeSideProcess = new ClaudeSideProcess(child, { configDir: resolveClaudeConfigDir(this.childEnv, this.platform), sessionId: forkSessionId }, () => {
       this.sideProcesses.delete(side);
       void instructionsFile?.cleanup().catch(() => {});
     });
@@ -1955,7 +1987,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       args.push("--append-system-prompt-file", instructionsFile.path);
     }
 
-    const invocation = buildCommandInvocation(this.claudeExecutable, args);
+    const invocation = buildClaudeCommandInvocation(this.claudeExecutable, args, this.platform);
     const quotaCredentialAtSpawn = this.quotaCache.capture("spawn").credentialRevision;
     let child: ClaudeChildProcess;
     try {

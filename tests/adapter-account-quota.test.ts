@@ -5,9 +5,11 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexAppServerAdapter, type AppServerSpawnCodex } from "../src/codex/app-server-adapter.js";
 import { ProcessCodexAdapter } from "../src/codex/process-adapter.js";
-import { ClaudeStreamAdapter } from "../src/codex/claude-stream-adapter.js";
+import { buildClaudeCommandInvocation, ClaudeStreamAdapter } from "../src/codex/claude-stream-adapter.js";
+import { resolveClaudeConfigDir } from "../src/codex/claude-side-question.js";
 import { AdapterQuotaCache } from "../src/codex/adapter-account-quota.js";
 import { gatewayEngineQuota } from "../src/gateway/engine-quota.js";
+import { executableCandidates, npmShimEntrypoint, resolveEngineExecutable } from "../src/runtime/engine-process.js";
 
 const roots: string[] = [];
 const disposals: Array<() => unknown> = [];
@@ -724,5 +726,210 @@ describe("native Codex rate limiting on the quota read", () => {
     const recovered = (await adapter.getAccountQuota({ refresh: true })).snapshot;
     expect(recovered).toMatchObject({ state: "ready" }); expect(recovered.reason).toBeUndefined();
     expect(recovered.pools[0]?.windows[0]).toMatchObject({ usedPercent: 25 });
+  });
+});
+
+describe("Windows Host Claude quota home resolution, invocation, and framing", () => {
+  it("prefers USERPROFILE over HOME on win32 (e.g. Git for Windows / MSYS HOME) and supports case-insensitive keys", async () => {
+    const f = await fixture();
+    const msysHome = path.join(f.root, "msys-home");
+    const winProfile = path.join(f.root, "win-profile");
+    await mkdir(path.join(msysHome, ".claude"), { recursive: true });
+    await mkdir(path.join(winProfile, ".claude"), { recursive: true });
+    await writeFile(path.join(winProfile, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-win-a" } }));
+
+    const env = { HOME: msysHome, UserProfile: winProfile };
+    const winCache = new AdapterQuotaCache("claude", "claude", env, f.root, undefined, "win32");
+    const first = winCache.capture("usage");
+    expect(first.authMode).toBe("subscription");
+    expect(first.verifiable).toBe(true);
+
+    // Changing credentials under USERPROFILE changes credentialRevision; changing MSYS HOME does not.
+    await writeFile(path.join(msysHome, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-ignored" } }));
+    expect(winCache.capture("usage").credentialRevision).toBe(first.credentialRevision);
+    await writeFile(path.join(winProfile, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-win-b" } }));
+    expect(winCache.capture("usage").credentialRevision).not.toBe(first.credentialRevision);
+
+    // POSIX platforms continue preferring HOME over USERPROFILE.
+    const emptyHome = path.join(f.root, "empty-home");
+    await mkdir(emptyHome, { recursive: true });
+    const linuxCache = new AdapterQuotaCache("claude", "claude", { HOME: emptyHome, USERPROFILE: winProfile }, f.root, undefined, "linux");
+    expect(linuxCache.capture("usage").authMode).toBe("unknown");
+    expect(linuxCache.capture("usage").verifiable).toBe(false);
+
+    // Case-insensitive env keys work on win32 for CLAUDE_CONFIG_DIR and cloud flags.
+    const customDir = path.join(f.root, "custom-claude");
+    await mkdir(customDir, { recursive: true });
+    const bedrockCache = new AdapterQuotaCache("claude", "claude", { UserProfile: winProfile, Claude_Config_Dir: customDir, claude_code_use_bedrock: "1" }, f.root, undefined, "win32");
+    expect(bedrockCache.capture("usage")).toMatchObject({ authMode: "other", verifiable: true });
+    expect(resolveClaudeConfigDir({ HOME: msysHome, UserProfile: winProfile }, "win32")).toBe(path.join(winProfile, ".claude"));
+    expect(resolveClaudeConfigDir({ HOME: msysHome, UserProfile: winProfile, Claude_Config_Dir: customDir }, "win32")).toBe(customDir);
+  });
+
+  it("keeps win32 quota aligned with macOS: stream rate_limit_event frames do not flip revision or shadow get_usage", async () => {
+    const f = await fixture();
+    const msysHome = path.join(f.root, "msys-home");
+    const winProfile = path.join(f.root, "win-profile");
+    await mkdir(path.join(msysHome, ".claude"), { recursive: true });
+    await mkdir(path.join(winProfile, ".claude"), { recursive: true });
+    await writeFile(path.join(winProfile, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-win-sub" } }));
+
+    const child = new Child();
+    child.answers.get_usage = usageReply();
+    const adapter = new ClaudeStreamAdapter("claude", {
+      childEnv: { HOME: msysHome, USERPROFILE: winProfile },
+      spawnFn: () => child,
+      workspacePath: f.root,
+      idleSweepIntervalMs: 0,
+      platform: "win32",
+    });
+    disposals.push(() => adapter.destroy());
+
+    const worker = await (adapter as any).getOrCreateWorker("tarobot-win", null, null, "normal", f.root);
+    const run = gatewayEngineQuota({ botId: "bot-win", engine: "claude", read: options => adapter.getAccountQuota(options) });
+    const initial = await run({ scopeId: "bot-win", refresh: false });
+    expect(initial.value).toMatchObject({ state: "unknown", reason: "not_loaded", authMode: "subscription", capability: { mode: "active" } });
+
+    // A partial rate_limit_event (single window or status-only) arrives during a turn.
+    // On Windows this must neither change the scope revision nor masquerade as a full ready reading.
+    child.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.05 } });
+    const afterEvent = await run({ scopeId: "bot-win", refresh: false });
+    expect(afterEvent.revision).toBe(initial.revision);
+    expect(afterEvent.value).toMatchObject({ state: "unknown", reason: "not_loaded" });
+    expect(child.controls).toEqual([]);
+
+    // Explicit refresh succeeds with expectedRevision (no auth_changed) and reads both windows from get_usage.
+    const refreshed = await run({ scopeId: "bot-win", refresh: true, expectedRevision: initial.revision });
+    expect(refreshed.revision).toBe(initial.revision);
+    expect(refreshed.value).toMatchObject({ state: "ready", authMode: "subscription", capability: { mode: "active" } });
+    expect(refreshed.value.pools[0]?.windows.map(window => [window.id, window.metric === "percent" && window.usedPercent])).toEqual([["five_hour", 12], ["seven_day", 61.5]]);
+    expect(child.controls).toEqual(["get_usage"]);
+
+    // Retiring the worker keeps the reading under the same revision; changing USERPROFILE credentials drops it.
+    worker.retired = true;
+    expect((await adapter.getAccountQuota({ refresh: false })).revision).toBe(initial.revision);
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools[0]?.windows).toHaveLength(2);
+    await writeFile(path.join(winProfile, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-win-other" } }));
+    const switched = await adapter.getAccountQuota({ refresh: false });
+    expect(switched.revision).not.toBe(initial.revision);
+    expect(switched.snapshot.pools).toEqual([]);
+  });
+
+  it("still falls back to passive rate_limit_event on win32 when an older CLI refuses get_usage", async () => {
+    const f = await fixture();
+    const winProfile = path.join(f.root, "win-profile");
+    await mkdir(path.join(winProfile, ".claude"), { recursive: true });
+    await writeFile(path.join(winProfile, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-win-old-cli" } }));
+
+    const child = new Child();
+    child.refuse.add("get_usage");
+    const adapter = new ClaudeStreamAdapter("claude", {
+      childEnv: { USERPROFILE: winProfile },
+      spawnFn: () => child,
+      workspacePath: f.root,
+      idleSweepIntervalMs: 0,
+      platform: "win32",
+    });
+    disposals.push(() => adapter.destroy());
+
+    const worker = await (adapter as any).getOrCreateWorker("tarobot-win-old", null, null, "normal", f.root);
+    const listed = await adapter.getAccountQuota({ refresh: false });
+    child.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.25 } });
+    // Before get_usage is asked, the worker stays active so the App asks get_usage first.
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ state: "unknown", reason: "not_loaded" });
+
+    // Once the CLI refuses get_usage, the already-observed passive event is promoted and later events keep updating it.
+    const promoted = await adapter.getAccountQuota({ refresh: true, expectedRevision: listed.revision });
+    expect(promoted.snapshot.pools[0]?.windows[0]).toMatchObject({ id: "five_hour", usedPercent: 25 });
+    child.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.5 } });
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 50 });
+
+    // Retiring the worker clears the passive-only reading.
+    worker.retired = true;
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot.pools).toEqual([]);
+  });
+
+  it("handles win32 command invocation, npm shim resolution, and slow/chunked CRLF UTF-8 get_usage responses", async () => {
+    expect(buildClaudeCommandInvocation('"C:\\Users\\Example\\AppData\\Roaming\\npm\\claude.cmd"', ["-p"], "win32")).toEqual({
+      command: "C:\\Users\\Example\\AppData\\Roaming\\npm\\claude.cmd",
+      args: ["-p"],
+      shell: false,
+    });
+    expect(buildClaudeCommandInvocation("C:\\Tools\\claude.ps1", ["-p"], "win32")).toEqual({
+      command: "C:\\Tools\\claude.ps1",
+      args: ["-p"],
+      shell: false,
+    });
+
+    const f = await fixture();
+    const npmBin = path.join(f.root, "npm-bin");
+    const cliEntry = path.join(npmBin, "node_modules", "@anthropic-ai", "claude-code", "cli.js");
+    await mkdir(path.dirname(cliEntry), { recursive: true });
+    await writeFile(cliEntry, "// fixture");
+    const cmdShim = path.join(npmBin, "claude.cmd");
+    await writeFile(cmdShim, '@ECHO off\r\n"%_prog%" "%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n');
+    expect(executableCandidates("claude", { Path: "C:\\Users\\Example\\AppData\\Roaming\\npm", PATHEXT: ".EXE;.CMD" }, "win32")).toEqual([
+      "C:\\Users\\Example\\AppData\\Roaming\\npm\\claude.EXE",
+      "C:\\Users\\Example\\AppData\\Roaming\\npm\\claude.CMD",
+    ]);
+    expect(npmShimEntrypoint(cmdShim)).toBe(cliEntry);
+    if (process.platform === "win32") expect(resolveEngineExecutable("claude", { PATH: npmBin, PATHEXT: ".EXE;.CMD" }, "win32")?.toLowerCase()).toBe(cmdShim.toLowerCase());
+
+    const winProfile = path.join(f.root, "win-profile");
+    await mkdir(path.join(winProfile, ".claude"), { recursive: true });
+    await writeFile(path.join(winProfile, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-win-slow" } }));
+
+    const child = new Child();
+    let requestId: string | undefined;
+    child.stdin.write = ((line: string, callback?: (error?: Error | null) => void) => {
+      const request = JSON.parse(line);
+      if (request.type === "control_request" && request.request?.subtype === "get_usage") {
+        child.controls.push("get_usage");
+        requestId = request.request_id;
+        callback?.(null);
+        return true;
+      }
+      return true;
+    }) as typeof child.stdin.write;
+
+    const adapter = new ClaudeStreamAdapter(cmdShim, {
+      childEnv: { USERPROFILE: winProfile },
+      spawnFn: () => child,
+      workspacePath: f.root,
+      idleSweepIntervalMs: 0,
+      platform: "win32",
+    });
+    disposals.push(() => adapter.destroy());
+    await (adapter as any).getOrCreateWorker("tarobot-win-chunked", null, null, "normal", f.root);
+
+    // Slow initial read times out at timeoutMs, while usageQuestion stays open for the late answer.
+    expect((await adapter.getAccountQuota({ refresh: true, timeoutMs: 20 })).snapshot).toMatchObject({ state: "unavailable", reason: "timeout" });
+
+    // Deliver the late answer split across multi-byte UTF-8 Buffer chunks with CRLF endings.
+    const payload = Buffer.from(JSON.stringify({
+      type: "control_response",
+      response: {
+        subtype: "success",
+        request_id: requestId,
+        response: {
+          rate_limits_available: true,
+          note: "Windows 额度",
+          rate_limits: {
+            five_hour: { utilization: 18, resets_at: future(4) },
+            seven_day: { utilization: 42, resets_at: future(100) },
+          },
+        },
+      },
+    }) + "\r\n", "utf8");
+    const splitPoint = payload.indexOf("额度") + 2;
+    child.stdout.emit("data", payload.subarray(0, splitPoint));
+    child.stdout.emit("data", payload.subarray(splitPoint));
+
+    await vi.waitFor(async () => {
+      const kept = (await adapter.getAccountQuota({ refresh: false })).snapshot;
+      expect(kept.state).toBe("ready");
+      expect(kept.pools[0]?.windows.map(window => [window.id, window.metric === "percent" && window.usedPercent])).toEqual([["five_hour", 18], ["seven_day", 42]]);
+    });
+    expect(child.controls).toEqual(["get_usage"]);
   });
 });

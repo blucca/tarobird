@@ -200,8 +200,14 @@ export class ClaudeSideProcess {
   }
 }
 
-export function resolveClaudeConfigDir(env: NodeJS.ProcessEnv): string {
-  return env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
+export function resolveClaudeConfigDir(env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): string {
+  const configured = env.CLAUDE_CONFIG_DIR?.trim()
+    || (platform === "win32" ? Object.entries(env).find(([key, value]) => key.toUpperCase() === "CLAUDE_CONFIG_DIR" && value?.trim())?.[1]?.trim() : undefined);
+  if (configured) return configured;
+  const userProfile = env.USERPROFILE || (platform === "win32" ? Object.entries(env).find(([key, value]) => key.toUpperCase() === "USERPROFILE" && value)?.[1] : undefined);
+  const homeVar = env.HOME || (platform === "win32" ? Object.entries(env).find(([key, value]) => key.toUpperCase() === "HOME" && value)?.[1] : undefined);
+  const home = (platform === "win32" ? userProfile || homeVar : homeVar || userProfile) || os.homedir();
+  return path.join(home, ".claude");
 }
 
 /** Returns the path when an owned entry is still present after removal. */
