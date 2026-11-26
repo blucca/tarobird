@@ -308,7 +308,7 @@ function renderAccepted(record: CronJobRecord, locale: Locale): string {
     ? formatInCronTimezone(record.targetAt, record.timezone)
     : record.cronExpr;
   const timezone = record.timezone && !record.runOnce ? ` (${record.timezone})` : "";
-  const isNotify = record.deliveryMode === "notify";
+  const isNotify = (record.deliveryMode ?? (record.runOnce ? "notify" : "agent")) === "notify";
   const modeLine = locale === "zh"
     ? (isNotify ? "🔔 模式：仅发送提醒卡片，不会运行 Bot" : "🤖 模式：到点自动运行 Bot 执行此任务")
     : (isNotify ? "🔔 Mode: reminder only — the Bot will not run" : "🤖 Mode: the Bot will run this prompt");

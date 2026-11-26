@@ -337,7 +337,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     if (["sessions", "status", "service.status", "restart"].includes(method)) return gatewayOperation(method, options);
     throw new Error("unknown_gateway_call");
   });
-  const executeCron = buildCoreCronExecutor({ channel, bridge, runtime, stateDir: options.stateDir, deliverResponse: deliverCoreResponse, createRunCard: createCoreRunCardController, requestApproval: requestCoreApproval });
+  const executeCron = buildCoreCronExecutor({ channel, bridge, runtime, stateDir: options.stateDir, instanceName: options.botId, deliverResponse: deliverCoreResponse, createRunCard: createCoreRunCardController, requestApproval: requestCoreApproval });
   channel.runCron = (job, signal, lifecycle) => channel.inConversation(job.larkChatId ?? "", () => executeCron(job, signal, lifecycle));
   await channel.connect(); return channel;
 }
