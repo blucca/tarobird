@@ -458,10 +458,10 @@
     },
     {
       "path": "assets/product/canvas-demo-en.gif",
-      "sha256": "b7631ad737b0c94115a01aab97dec0ad89cf8cbe48fffb99e894d1b089fc10b9",
-      "reviewer": "codex",
+      "sha256": "2516abd47fe4333cbf99e4c3617b30c8873dbac3a1d9621579cf95daf7b7f74d",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed recaptured English Workbench Canvas edit GIF from disposable Demo Studio hub (sidebar updated to Superagent); fictional content only, no private data."
     },
     {
       "path": "assets/product/canvas-demo-zh.gif",
@@ -473,6 +473,13 @@
     {
       "path": "assets/product/chancellor-demo-en.gif",
       "sha256": "8e4afa0c7b27debeb91ac05b9dd080e7f91d1802a38a640b0254ba7596c3abae",
+      "reviewer": "antigravity",
+      "method": "visual-review",
+      "note": "Visually reviewed recaptured English Superagent ticket-expand GIF from disposable Demo Studio hub; fictional tickets only, no private data."
+    },
+    {
+      "path": "assets/product/chancellor-demo-en.gif",
+      "sha256": "140a51911faafde35f508c25d5c075dfe4c9767643e4661d6e080ebccc395ab9",
       "reviewer": "antigravity",
       "method": "visual-review",
       "note": "Visually reviewed recaptured English Superagent ticket-expand GIF from disposable Demo Studio hub; fictional tickets only, no private data."
@@ -492,8 +499,22 @@
       "note": "Visually reviewed recaptured English Superagent screenshot from disposable Demo Studio hub; fictional tickets only, no private data."
     },
     {
+      "path": "assets/product/chancellor-en.png",
+      "sha256": "e5c17366325fc8b4656010a9abca1840b3b7c511b6866038b5bf3ffe910a353e",
+      "reviewer": "antigravity",
+      "method": "visual-review",
+      "note": "Visually reviewed recaptured English Superagent screenshot from disposable Demo Studio hub; fictional tickets only, no private data."
+    },
+    {
       "path": "assets/product/chancellor-workspace-en.png",
       "sha256": "8d30903fc811007a072b9fd5df6b2f40f9bd54c22158378287b3f49efd747d99",
+      "reviewer": "antigravity",
+      "method": "visual-review",
+      "note": "Visually reviewed framed English Superagent workspace screenshot (TAROBIRD / SUPERAGENT); fictional Demo Studio data only, no private data."
+    },
+    {
+      "path": "assets/product/chancellor-workspace-en.png",
+      "sha256": "bbe80df1b30972d8d70fe29e45a05496097e083fcdf5aabe059d8818fe78a915",
       "reviewer": "antigravity",
       "method": "visual-review",
       "note": "Visually reviewed framed English Superagent workspace screenshot (TAROBIRD / SUPERAGENT); fictional Demo Studio data only, no private data."
@@ -528,10 +549,10 @@
     },
     {
       "path": "assets/product/demo-en.gif",
-      "sha256": "96633b156df3520de975fc332c76edc4946a53893cc42e6ace807fae3756841c",
-      "reviewer": "codex",
+      "sha256": "006d715791f7d336f422c5465582d1d28bd2fa68f1c3020146e8e9264bd3dd3a",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed re-composed 8-chapter English README overview GIF (chapters 01-08 inspected; Superagent sidebar and chapter 08 banner verified); synthetic Demo Studio/Studio UI only, no private data."
     },
     {
       "path": "assets/product/demo-zh.gif",
@@ -878,17 +899,17 @@
     },
     {
       "path": "assets/product/workbench-canvas-en.png",
-      "sha256": "fc3d61b00f38e5a3ada510d2afcc256e79a89c2e4934be88af5eb7a4d01df10f",
-      "reviewer": "codex",
+      "sha256": "b83c19274197204cc44bfaad767e18b5dc1083efc4fd5a0269d76a1dcb065883",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed recaptured English Workbench Canvas screenshot from disposable Demo Studio hub (sidebar updated to Superagent); fictional studio launch page only, no private data."
     },
     {
       "path": "assets/product/workbench-canvas-framed-en.png",
-      "sha256": "3c62b1fb7eb623a17259479d010e19517b0bdb85d1fe44cba2412e1dcc4a5428",
-      "reviewer": "codex",
+      "sha256": "cdf4d774d67ba6464474103ead0a945ac4e7c769dfac7bfe0f15ea82521cbc86",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed framed English Workbench Canvas screenshot (TAROBIRD / CANVAS, sidebar updated to Superagent); fictional Demo Studio data only, no private data."
     },
     {
       "path": "assets/product/workbench-canvas-framed-zh.png",
@@ -920,17 +941,17 @@
     },
     {
       "path": "assets/product/workbench-notes-en.png",
-      "sha256": "0236aa134dfa7dd2358fdd165fc71e9aef0cd620c7f00c06ad4c2030c3f8abf3",
-      "reviewer": "codex",
+      "sha256": "1d9828e0856edcb78a4dd6fef9aea1bcb7091f410fb4ff3b894a38d1c675c425",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed recaptured English Workbench Markdown notes screenshot from disposable Demo Studio hub (sidebar updated to Superagent); fictional notes only, no private data."
     },
     {
       "path": "assets/product/workbench-notes-framed-en.png",
-      "sha256": "2d7335ac9c94f0be4db7f0cf99007c19e291afd228abcc67b271e14c449a90a1",
-      "reviewer": "codex",
+      "sha256": "0d139aff97ea43bb5274015c9e35c68e1fbc8d809c20f8e829162a02ba600200",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed framed English Workbench Markdown notes screenshot (TAROBIRD / NOTES, sidebar updated to Superagent); fictional Demo Studio data only, no private data."
     },
     {
       "path": "assets/product/workbench-notes-framed-zh.png",
@@ -962,17 +983,17 @@
     },
     {
       "path": "assets/product/workbench-side-en.png",
-      "sha256": "3e7e932467689dbd507bd37529ec6bdcc45304e222a085179b66051ff608d253",
-      "reviewer": "codex",
+      "sha256": "3e56aed5b199555f49bdf54748365fd3dd326ce28ff030446170c983b391570b",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed recaptured English Workbench side-panel screenshot from disposable Demo Studio hub (sidebar updated to Superagent); fictional Demo Studio chat and notes only, no private data."
     },
     {
       "path": "assets/product/workbench-side-framed-en.png",
-      "sha256": "bb12d548f5b6f8a8493f7f6ca91baf3b4dc6d9afbb51be22311005fa83d1ae92",
-      "reviewer": "codex",
+      "sha256": "7850eaf61ca305b2f948beef72689bb76eb27eb4c2280e8c10254aeadfcb5e8f",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed framed English Workbench side-panel screenshot (TAROBIRD / SIDE PANEL, sidebar updated to Superagent); fictional Demo Studio data only, no private data."
     },
     {
       "path": "assets/product/workbench-side-framed-zh.png",
@@ -990,10 +1011,10 @@
     },
     {
       "path": "assets/product/workbench-tools-demo-en.gif",
-      "sha256": "c8ecfeb4c2371cf3d558ff650247cf4c43bfe5417f92209a06152beaa68ddae2",
-      "reviewer": "codex",
+      "sha256": "fe039ce1f070cabafefd51698ca107867ab532ed081238392aaefcaf11321144",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed recaptured English Workbench side-panel/whiteboard/notes GIF from disposable Demo Studio hub (sidebar updated to Superagent); fictional content only, no private data."
     },
     {
       "path": "assets/product/workbench-tools-demo-zh.gif",
@@ -1004,17 +1025,17 @@
     },
     {
       "path": "assets/product/workbench-whiteboard-en.png",
-      "sha256": "73ac1e23ea07da055323871ed61ff9f27df578283062b7401d2623c8e777ca4d",
-      "reviewer": "codex",
+      "sha256": "e05a7a6743e6e0effb68c2a1c264bc93a62f5896ccc2e628975a40240ce97766",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed recaptured English Workbench Whiteboard screenshot from disposable Demo Studio hub (sidebar updated to Superagent); fictional diagram only, no private data."
     },
     {
       "path": "assets/product/workbench-whiteboard-framed-en.png",
-      "sha256": "4658e318674089a06fa086b81dd24345c0418b46ff384309e3cf3e7ecd3174fd",
-      "reviewer": "codex",
+      "sha256": "006cd2a6d65f5998ee4a50d84a46bd17797e4266b90dbc56f9cd69a3d2b3594d",
+      "reviewer": "antigravity",
       "method": "visual-review",
-      "note": "Reviewed synthetic product stills and recorded UI motion, sampled frames, OCR and metadata. No personal accounts, conversations, device identities or private paths observed; fixture browser site and screen data are synthetic."
+      "note": "Visually reviewed framed English Workbench Whiteboard screenshot (TAROBIRD / WHITEBOARD, sidebar updated to Superagent); fictional Demo Studio data only, no private data."
     },
     {
       "path": "assets/product/workbench-whiteboard-framed-zh.png",

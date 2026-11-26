@@ -16,12 +16,14 @@ import os from 'node:os';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const output = path.join(root, 'assets/product');
 const provenance = await captureProvenance(root);
+const locales = process.argv.slice(2).length ? process.argv.slice(2) : ['zh', 'en'];
+for (const locale of locales) if (locale !== 'zh' && locale !== 'en') throw new Error(`Unknown locale: ${locale}`);
 const browser = await chromium.launch({ headless: true });
 const images = [], animations = [];
 const textFile = content => ({ content, contentType: 'text/html' });
 await mkdir(output, { recursive: true });
 try {
- for (const locale of ['zh', 'en']) {
+ for (const locale of locales) {
   const zh = locale === 'zh', words = (cn, en) => zh ? cn : en;
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'tarobird-showcase-'));
   const hub = await HubServer.start({ stateDir, clientDir: path.join(root, 'client/dist') });
@@ -48,9 +50,9 @@ try {
     await hub.store.markRead('owner',chat.id,Number.MAX_SAFE_INTEGER);
    }
    await page.goto(hub.url); await prepareReadmePairing(page, hub);
-   await page.getByRole('button', { name: '配对此设备', exact: true }).click();
-   await hub.auth.approve(await page.getByLabel('配对码', { exact: true }).innerText(), 'local-owner');
-   await page.getByLabel('配对码', { exact: true }).waitFor({ state: 'hidden' });
+   await page.getByRole('button', { name: /^(?:配对此设备|Pair this device)$/ }).click();
+   await hub.auth.approve(await page.getByLabel(/^(?:配对码|Pairing code)$/).innerText(), 'local-owner');
+   await page.getByLabel(/^(?:配对码|Pairing code)$/).waitFor({ state: 'hidden' });
    await readmePreferences(page, locale, 'conversations'); await page.reload();
    await page.locator('.app-shell').filter({ visible: true }).waitFor();
    await page.locator(`.conversation-row[data-conversation-id="${design.id}"]`).filter({ visible: true }).click();
@@ -169,5 +171,10 @@ try {
    throw error;
   } finally { await context.close(); await hub.close(); await rm(stateDir, { recursive: true, force: true }); }
  }
- await writeFile(path.join(output, 'workspaces-capture.json'), JSON.stringify({ ...provenance, captured: new Date().toISOString(), source: 'Real built App, disposable loopback Hubs, fictional projects and ticket states; no model execution', images, animations }, null, 2) + '\n');
+ const metaFile = path.join(output, 'workspaces-capture.json');
+ let previous = { images: [], animations: [] };
+ if (locales.length < 2) { try { previous = JSON.parse(await readFile(metaFile, 'utf8')); } catch {} }
+ const mergedImages = [...(previous.images ?? []).filter(item => !locales.includes(item.locale)), ...images];
+ const mergedAnimations = [...(previous.animations ?? []).filter(item => !locales.includes(item.locale)), ...animations];
+ await writeFile(metaFile, JSON.stringify({ ...provenance, captured: new Date().toISOString(), source: 'Real built App, disposable loopback Hubs, fictional projects and ticket states; no model execution', images: mergedImages, animations: mergedAnimations }, null, 2) + '\n');
 } finally { await browser.close(); }

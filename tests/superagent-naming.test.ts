@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { dispatcherInstructions } from "../src/gateway/agent-instructions.js";
@@ -37,6 +38,18 @@ describe("Superagent English naming and New Bot experimental copy (#123)", () =>
     const instructions = dispatcherInstructions("msg_test");
     expect(instructions).toContain("幕僚长 (Superagent)");
     expect(instructions).not.toMatch(/\bchancellor\b/i);
+
+    for (const rel of [
+      "src/core/commands.ts",
+      "src/core/config-card.ts",
+      "src/core/shared/engine-commands.ts",
+      "src/state/instance-config.ts",
+      "src/ui/ui-api.ts",
+    ]) {
+      const content = readFileSync(path.join(root, rel), "utf8");
+      expect(content, rel).not.toContain("Chief of Staff");
+      expect(content, rel).toContain("Pi is available for ordinary Bots, not Superagent Bots.");
+    }
   });
 
   it("shows the experimental badge and concise superagent Chinese hint in NewBot", () => {
@@ -66,5 +79,30 @@ describe("Superagent English naming and New Bot experimental copy (#123)", () =>
       }
     }
     expect(leaks).toEqual([]);
+  });
+
+  it("keeps workspaces-capture.json and demo-capture.json hashes synced with disk and uses Superagent in demo-capture.json", () => {
+    const sha256 = (rel: string) => createHash("sha256").update(readFileSync(path.join(root, rel))).digest("hex");
+    const workspaces = JSON.parse(readFileSync(path.join(root, "assets/product/workspaces-capture.json"), "utf8")) as {
+      images: Array<{ file: string; sha256: string }>;
+      animations: Array<{ file: string; sha256: string }>;
+    };
+    for (const item of [...workspaces.images, ...workspaces.animations]) {
+      expect(sha256(`assets/product/${item.file}`), item.file).toBe(item.sha256);
+    }
+
+    const demo = JSON.parse(readFileSync(path.join(root, "assets/product/demo-capture.json"), "utf8")) as {
+      images: Array<{ file: string; locale: string; sha256: string; scenes: Array<{ label: string; source: string; sourceSha256: string }> }>;
+    };
+    for (const image of demo.images) {
+      expect(sha256(`assets/product/${image.file}`), image.file).toBe(image.sha256);
+      for (const scene of image.scenes) {
+        expect(sha256(`assets/product/${scene.source}`), `${image.file} -> ${scene.source}`).toBe(scene.sourceSha256);
+      }
+    }
+    const enDemo = demo.images.find(image => image.locale === "en");
+    expect(enDemo).toBeDefined();
+    expect(enDemo!.scenes.map(scene => scene.label)).toContain("Superagent · Follow every ticket.");
+    expect(enDemo!.scenes.some(scene => /\bchancellor\b/i.test(scene.label))).toBe(false);
   });
 });
