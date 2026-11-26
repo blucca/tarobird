@@ -2,7 +2,7 @@ import { historyCommandFailure, runHistoryCommand } from "./history.js";
 import { engineQuotaCommand, engineQuotaNotes } from "./engine-quota.js";
 import { screenCommand } from "./screens.js";
 import { runWorkbenchCommand } from "./workbench.js";
-import { runConversationsCommand } from './conversations.js';
+import { runConversationsCommand, runConversationPinsCommand } from './conversations.js';
 import { runBackupsCommand } from "./backups.js";
 import { runFoldersCommand } from './folders.js';
 import { engineSettingsCommand } from "./engine-settings.js";
@@ -102,6 +102,8 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     取消置顶恢复普通分组位置；旧置顶未保存原位置时回到普通分组末尾
   conversations list --host HOST --bot BOT [--source-bot LOCAL_BOT_ID]
   conversations local                 当前本地主机的全部可见对话（含已归档）
+  conversations pins                  读取当前用户的置顶对话和 revision
+  conversations pin ID [--global] --enabled on|off --revision N
   history snapshot|anchors CONVERSATION --bot BOT [--message MESSAGE] [--cursor CURSOR]
   history rewind|fork CONVERSATION --bot BOT --revision REV --request-id ID [--anchor ANCHOR] [--title TITLE]
   history status CONVERSATION --bot BOT --request-id ID
@@ -314,7 +316,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     wait: { type: "string" }, from: { type: "string" }, out: { type: "string" }, routes: { type: "string" },
     lan: { type: "boolean" }, tailscale: { type: "boolean" }, address: { type: "string" }, reset: { type: "boolean" },
     role: { type: "string" }, "dispatch-mode": { type: "string" }, "max-concurrent": { type: "string" }, allow: { type: "string" }, assist: { type: "string" }, status: { type: "string" }, note: { type: "string" }, open: { type: "boolean" }, match: { type: "string" }, offset: { type: "string" },
-    folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
+    folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, global: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
     "html-file": { type: "string" }, "report-file": { type: "string" }, title: { type: "string" }, summary: { type: "string" },
     token: { type: "string" }, session: { type: "string" }, thinking: { type: "string" }, target: { type: "string" }, task: { type: "string" }, bot: { type: "string" }, message: { type: "string" }, before: { type: "string" }, through: { type: "string" }, last: { type: "boolean" },
     refresh: { type: "boolean" }, path: { type: "string" }, operation: { type: "string" }, preview: { type: "boolean" },
@@ -346,7 +348,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     tickets: ["bot", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
     devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
     folders: ["enabled", "revision", "unfiled"],
-    conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session"],
+    conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session", "enabled", "global"],
     widgets: ["html-file", "report-file", "title", "summary", "request-id", "enabled", "revision"],
     messages: ["ids", "before", "through", "yes", "to", "source-bot", "text-file", "file", "new-conversation", "message", "timeout", "out", "request-id", "from", "bot", "context-message", "cross-host", "delivery", "enabled"],
     queue: ["bot", "message", "before", "last", "text", "text-file", "revision", "request-id"],
@@ -372,9 +374,10 @@ export async function runHostCli(argv: string[]): Promise<void> {
         piSessionUpdate = { expectedSession, requestId, action, value: selected === "default" ? null : action === "thinking" ? piSessionThinkingSchema.parse(selected) : selected };
       } else if (v.session !== undefined || v["request-id"] !== undefined) throw new Error("只读 Pi 会话不接受 --session 或 --request-id；修改时需填写 --model 或 --thinking。");
     } else if ([v.model, v.thinking, v.session].some(value => value !== undefined)) throw new Error("--model、--thinking、--session 仅支持 conversations pi-session。");
+    if (sub !== "pin" && (v.enabled !== undefined || v.global !== undefined)) throw new Error("--enabled 与 --global 仅支持 conversations pin。");
   }
   const positionalLimit: Record<string, number> = { history: 3, screens: 3, workbench: 3, engines: 2, backups: 2, integrations: 3, directory: 2, name: 2, bots: 3, queue: 3, tasks: 3, steer: 3, side: 3, changes: 3, bus: 3, groups: 3, messages: 3, tickets: 3, widgets: 3, folders: 3, conversations: 2, devices: 3, service: 2, network: 3, update: 3, backup: 2, restore: 2 };
-  if (command === "conversations" && sub === "pi-session") positionalLimit.conversations = 3;
+  if (command === "conversations" && (sub === "pi-session" || sub === "pin")) positionalLimit.conversations = 3;
   if (command === "bus" && ["list", "create", "prepare"].includes(sub ?? "")) positionalLimit.bus = 2;
   if (command === "bots" && ["list", "catalog", "create"].includes(sub ?? "") || command === "devices" && ["list", "pending", "invites"].includes(sub ?? "") || command === "network" && sub !== "remove" || command === "update" && sub !== "apply") positionalLimit[command] = 2;
   if (p.length > (positionalLimit[command] ?? 1)) throw new Error("此命令不接受额外的位置参数。请执行 tarobot --help。");
@@ -799,6 +802,13 @@ export async function runHostCli(argv: string[]): Promise<void> {
         const note = piSessionUpdate && "outcome" in result ? piSessionRejectionNote(result, piSessionUpdate.value) : undefined;
         if (note && !v.json) console.error(note);
         await output(result); return;
+      }
+      if (sub === "pins" || sub === "pin") {
+        if ([v.host, v.bot, v["source-bot"], v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v["request-id"]].some(value => value !== undefined)) {
+          throw new Error(`conversations ${sub} 不接受批量整理或跨 Bot 路由参数。`);
+        }
+        await output(await runConversationPinsCommand(management.client, sub, argument, { global: v.global, enabled: v.enabled, revision: v.revision }));
+        return;
       }
       if (argument || [v.host, v.bot, v["source-bot"]].some(value => value !== undefined)) throw new Error("批量整理使用当前本地主机；不接受跨 Bot 路由参数。");
       await output(await runConversationsCommand(management.client, sub, { ids: v.ids, yes: v.yes, folder: v.folder, unfiled: v.unfiled, newFolder: v["new-folder"], revision: v.revision, requestId: v["request-id"] }, id => console.error(`批量操作编号：${id}。结果不确定时保留原编号和参数核对，勿换编号重复提交。`))); return;
