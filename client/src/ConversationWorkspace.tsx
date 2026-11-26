@@ -1,21 +1,25 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
-  AlertTriangle,
-  ArrowRight,
+  Ban,
+  Bell,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
-  Cpu,
+  Clock,
+  CornerDownRight,
   ExternalLink,
-  FileCode2,
   FolderOpen,
   Globe,
+  HelpCircle,
   Layers,
   ListOrdered,
+  LoaderCircle,
   Network,
   RefreshCw,
   ShieldCheck,
   Users,
   X,
+  XCircle,
 } from "lucide-react";
 import { blocksText, type Conversation, type Message } from "../../src/client-protocol/index.js";
 import { engineTaskSnapshotSchema, type EngineTask } from "../../src/client-protocol/engine-tasks.js";
@@ -25,15 +29,40 @@ import { permissionSettingsSchema, type PermissionSettings } from "../../src/cli
 import { BOT_COMMS_LIMIT, conversationBotCommsSchema, type BotCommItem, type ConversationBotComms } from "../../src/client-protocol/workspace-comms.js";
 import { nativeRun } from "../../src/client-protocol/run.js";
 import { runChangesSummarySchema } from "../../src/client-protocol/run-changes.js";
+import { isAgentBusRecord } from "./agent-bus-record.js";
+import { messageAttention } from "./attention.js";
+import { useAvatarMotion } from "./avatar-motion.js";
+import { BotName } from "./BotName.js";
 import type { Bot, HubConnection } from "./connection.js";
 import { WorkspaceRunChanges } from "./WorkspaceRunChanges.js";
 import { listWorkbenchLibrary, type WorkbenchLibraryEntry } from "./workbench-library.js";
 import type { WorkbenchFileTarget } from "./workbench-library-context.js";
+import { usageTone, type ContextView } from "./usage-readings.js";
+import {
+  approvalPlainSummary,
+  EmptyStateArt,
+  fileKindInfo,
+  FileTypeArt,
+  findApprovalAllowAction,
+  formatElapsedBrief,
+  formatModelDisplayName,
+  HelperCountArt,
+  HostComputerArt,
+  SectionHelpButton,
+  SignalBarsArt,
+  signalStrength,
+  WaitingHandArt,
+  WorkingMotionArt,
+  WorkspaceBotAvatar,
+  WorkspaceFileThumbnail,
+  type WorkspaceFileKind,
+} from "./workspace-visuals.js";
 import { t, useLocale } from "./i18n.js";
 import { formatFileLimit } from "./files.js";
 import "./conversation-workspace.css";
 
 export type WorkspaceTab = "overview" | "comms" | "files";
+type HelpSectionId = "waiting" | "who" | "doing" | "comms" | "made";
 
 const FILES_PAGE_SIZE = 6;
 // A page of Bot messages holds as many whole cards as the rail is tall: four left half of a tall rail empty,
@@ -52,39 +81,48 @@ function formatRelativeTime(timestamp: number, locale: string): string {
   return new Date(timestamp).toLocaleDateString(locale === "en" ? "en-US" : "zh-CN", { month: "short", day: "numeric" });
 }
 
-function fileBadge(name: string, mime?: string): { label: string; tone: string } {
-  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
-  if (ext === "md" || ext === "markdown" || mime === "text/markdown") return { label: "MD", tone: "is-md" };
-  if (ext === "pdf" || mime === "application/pdf") return { label: "PDF", tone: "is-pdf" };
-  if (["png", "jpg", "jpeg", "webp", "gif", "svg"].includes(ext) || mime?.startsWith("image/")) return { label: "IMG", tone: "is-img" };
-  if (["json", "ts", "tsx", "js", "jsx", "py", "go", "rs", "css", "html", "yml", "yaml", "sh", "sql"].includes(ext)) {
-    return { label: ext.slice(0, 4).toUpperCase(), tone: "is-code" };
-  }
-  return { label: (ext || "FILE").slice(0, 4).toUpperCase(), tone: "" };
+function previewMessage(message: Message | undefined): string {
+  if (!message) return "";
+  const text = blocksText(message.blocks).replace(/\s+/g, " ").trim();
+  if (text) return text;
+  if (message.blocks.some(block => ["file", "image", "audio"].includes(block.type))) return t("附件消息");
+  return "";
 }
 
-// The wording follows what the conversation itself says about the same events (bot-steer-delivery.ts).
 function commStatusLabel(status: BotCommItem["status"]): string {
   switch (status) {
-    case "needs_approval": return t("待审批");
-    case "running": return t("运行中");
-    case "steered": return t("已并入回复");
-    case "queued": return t("排队中");
-    case "replied": return t("已回传");
-    case "failed": return t("失败");
+    case "needs_approval": return t("等你同意");
+    case "running": return t("正在处理");
+    case "steered": return t("已顺带告诉对方");
+    case "queued": return t("排队等回复");
+    case "replied": return t("已回复");
+    case "failed": return t("失败了");
     case "cancelled": return t("已取消");
-    case "uncertain": return t("结果未确认");
+    case "uncertain": return t("没收到回音");
+  }
+}
+
+function commStatusIcon(status: BotCommItem["status"]) {
+  switch (status) {
+    case "needs_approval": return <Bell size={10} aria-hidden="true"/>;
+    case "running": return <LoaderCircle size={10} aria-hidden="true"/>;
+    case "steered": return <CornerDownRight size={10} aria-hidden="true"/>;
+    case "queued": return <Clock size={10} aria-hidden="true"/>;
+    case "replied": return <CheckCircle2 size={10} aria-hidden="true"/>;
+    case "failed": return <XCircle size={10} aria-hidden="true"/>;
+    case "cancelled": return <Ban size={10} aria-hidden="true"/>;
+    case "uncertain": return <HelpCircle size={10} aria-hidden="true"/>;
   }
 }
 
 function commDeliveryLabel(delivery: BotCommItem["delivery"]): string | undefined {
   switch (delivery) {
-    case "steered": return t("已并入正在进行的回复");
-    case "fell_back_to_queue": return t("未能并入，已改为排队");
-    case "queued": return t("经排队投递");
-    case "not_delivered": return t("未投递");
-    case "steer_uncertain": return t("无法确认是否已并入");
-    case "pending": return t("投递中");
+    case "steered": return t("已顺便加进正在进行的回复");
+    case "fell_back_to_queue": return t("没赶上这轮，已排到下一轮");
+    case "queued": return t("按顺序排队送达");
+    case "not_delivered": return t("没有送出去");
+    case "steer_uncertain": return t("不确定对方有没有收到");
+    case "pending": return t("正在送过去");
     default: return undefined;
   }
 }
@@ -94,6 +132,18 @@ function workbenchKindLabel(kind: WorkbenchLibraryEntry["kind"]): string {
   if (kind === "markdown") return t("文档");
   return t("设计稿");
 }
+
+type WaitingApprovalItem = {
+  id: string;
+  botName: string;
+  conversationId?: string;
+  messageId: string;
+  title?: string;
+  detail?: string;
+  allowActionId?: string;
+  canOpen: boolean;
+  isLocalMessage: boolean;
+};
 
 const BOT_COMMS_READ_MS = 20_000;
 
@@ -113,8 +163,6 @@ export function useConversationBotComms(
   const scope = `${connection.identity.hubPublicKey}:${conversationId ?? ""}`;
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
-  // One request at a time per conversation: a slow Host must not collect a queue of polls. A read asked for
-  // meanwhile (a reply just ended, the rail just opened) runs once when the current one is back.
   const running = useRef<{ scope: string; again: boolean }>(undefined);
   const available = enabled && !!conversationId && connection.state.status === "online" && !!connection.state.botCommsAvailable;
 
@@ -127,7 +175,6 @@ export function useConversationBotComms(
     setLoading(true);
     let answered = true;
     try {
-      // The general request limit is five minutes; the refresh button waits on this read.
       const raw = await connection.http(`/api/conversations/${encodeURIComponent(conversationId)}/bot-comms`, { signal: AbortSignal.timeout(BOT_COMMS_READ_MS) });
       if (scopeRef.current === reqScope) { setData(conversationBotCommsSchema.parse(raw)); setError(false); }
     } catch {
@@ -146,11 +193,8 @@ export function useConversationBotComms(
     setError(false);
   }, [scope]);
 
-  // Read when the conversation opens, the rail opens, the connection returns, and a reply ends.
   useEffect(() => { if (available) void refresh(); }, [available, visible, turn, refresh]);
 
-  // Between those, only while something is still in progress (quickly with the rail open, slowly for the
-  // badge of a closed one) or slowly with the rail open. A Host that does not answer is asked less often.
   const inProgress = (data?.summary.active ?? 0) > 0;
   useEffect(() => {
     if (!available) return;
@@ -177,6 +221,7 @@ export interface ConversationWorkspaceProps {
   botLabels: ReadonlyMap<string, string>;
   hostName: string;
   connectionSummary: string;
+  contextUsage?: ContextView;
   streamingBots: string[];
   messages: Message[];
   comms: ConversationBotComms | undefined;
@@ -204,6 +249,7 @@ export function ConversationWorkspace({
   botLabels,
   hostName,
   connectionSummary,
+  contextUsage,
   streamingBots,
   messages,
   comms,
@@ -220,12 +266,15 @@ export function ConversationWorkspace({
   onOpenTasksModal,
 }: ConversationWorkspaceProps) {
   const locale = useLocale();
+  const connState = useSyncExternalStore(cb => connection.subscribe(cb), () => connection.state);
+  const animatedMotion = useAvatarMotion();
   const [tab, setTab] = useState<WorkspaceTab>("overview");
   const [commFilter, setCommFilter] = useState<"all" | "active" | "cross_host">("all");
   const [commPage, setCommPage] = useState(0);
   const [fileFilter, setFileFilter] = useState<"all" | "diff" | "files">("all");
   const [filePage, setFilePage] = useState(0);
   const [expandedComms, setExpandedComms] = useState<ReadonlySet<string>>(() => new Set());
+  const [openHelp, setOpenHelp] = useState<HelpSectionId | undefined>(undefined);
   const [tasks, setTasks] = useState<EngineTask[]>([]);
   const [queue, setQueue] = useState<PromptQueueSnapshot | undefined>(undefined);
   const [permissions, setPermissions] = useState<PermissionSettings | undefined>(undefined);
@@ -233,8 +282,12 @@ export function ConversationWorkspace({
   const [filesHasMore, setFilesHasMore] = useState(false);
   const [workbenchItems, setWorkbenchItems] = useState<WorkbenchLibraryEntry[]>([]);
   const [refreshTick, setRefreshTick] = useState(0);
+  const [approvalActions, setApprovalActions] = useState<Record<string, string>>({});
+  const [approvingId, setApprovingId] = useState<string | undefined>(undefined);
+  const [approvalNotice, setApprovalNotice] = useState<{ id: string; text: string } | undefined>(undefined);
 
-  const online = connection.state.status === "online";
+  const online = connState.status === "online";
+  const signal = signalStrength(connState.status, connState.latency);
   const convBots = useMemo(
     () => bots.filter(bot => conversation.botIds.includes(bot.id)),
     [bots, conversation.botIds],
@@ -243,6 +296,7 @@ export function ConversationWorkspace({
 
   useEffect(() => {
     setExpandedComms(new Set());
+    setOpenHelp(undefined);
     setCommPage(0);
     setFilePage(0);
     setTasks([]);
@@ -251,6 +305,9 @@ export function ConversationWorkspace({
     setFiles([]);
     setFilesHasMore(false);
     setWorkbenchItems([]);
+    setApprovalActions({});
+    setApprovingId(undefined);
+    setApprovalNotice(undefined);
     // Another conversation may have no changes, and then no "changes" filter to switch back with.
     setFileFilter("all");
   }, [conversation.id, connection.identity.hubPublicKey]);
@@ -263,6 +320,7 @@ export function ConversationWorkspace({
 
   useEffect(() => { setCommPage(0); }, [commFilter]);
   useEffect(() => { setFilePage(0); }, [fileFilter]);
+  useEffect(() => { setOpenHelp(undefined); }, [tab]);
 
   useEffect(() => {
     const abort = new AbortController();
@@ -288,20 +346,12 @@ export function ConversationWorkspace({
       .catch(() => undefined);
 
     if (directBot) {
-      if (connection.state.engineTasksAvailable && directBot.online) {
+      if (connState.engineTasksAvailable && directBot.online) {
         void connection.http(`/api/conversations/${encodeURIComponent(convId)}/tasks?botId=${encodeURIComponent(directBot.id)}`, { signal: abort.signal })
           .then(raw => {
             if (abort.signal.aborted) return;
             const snap = engineTaskSnapshotSchema.parse(raw);
             setTasks(snap.tasks);
-          })
-          .catch(() => undefined);
-      }
-      if (connection.state.promptQueueAvailable) {
-        void connection.http(`/api/conversations/${encodeURIComponent(convId)}/queue?${new URLSearchParams({ botId: directBot.id })}`, { signal: abort.signal })
-          .then(raw => {
-            if (abort.signal.aborted) return;
-            setQueue(promptQueueSnapshotSchema.parse(raw));
           })
           .catch(() => undefined);
       }
@@ -314,15 +364,53 @@ export function ConversationWorkspace({
     directBot?.id,
     directBot?.online,
     online,
-    connection.state.engineTasksAvailable,
-    connection.state.promptQueueAvailable,
+    connState.engineTasksAvailable,
     refreshTick,
     settledMessageCount,
   ]);
 
+  // Refresh the prompt queue promptly when messages arrive or active replies start/finish (#93 coordination).
+  const queueSignal = useMemo(() => {
+    let streaming = "";
+    let lastBot = "";
+    for (const msg of messages) {
+      if (msg.conversationId !== conversation.id || msg.authorType !== "bot" || msg.forwardedFrom || isAgentBusRecord(msg)) continue;
+      if (msg.status === "streaming") streaming += `${msg.id}:${msg.replyTo ?? ""};`;
+      else lastBot = `${msg.id}:${msg.status}`;
+    }
+    return `${messages.length}|${streaming}|${lastBot}`;
+  }, [messages, conversation.id]);
+
+  const queueNeedsPoll = (queue?.items.length ?? 0) > 0 || streamingBots.length > 0;
+  useEffect(() => {
+    if (!online || !directBot || !connState.promptQueueAvailable) return;
+    let active = true;
+    const abort = new AbortController();
+    const readQueue = () => {
+      void connection.http(`/api/conversations/${encodeURIComponent(conversation.id)}/queue?${new URLSearchParams({ botId: directBot.id })}`, { signal: abort.signal })
+        .then(raw => {
+          if (!active || abort.signal.aborted) return;
+          setQueue(promptQueueSnapshotSchema.parse(raw));
+        })
+        .catch(() => undefined);
+    };
+    readQueue();
+    const poll = queueNeedsPoll ? setInterval(readQueue, 2000) : undefined;
+    return () => { active = false; abort.abort(); if (poll) clearInterval(poll); };
+  }, [
+    connection,
+    conversation.id,
+    directBot?.id,
+    online,
+    connState.promptQueueAvailable,
+    refreshTick,
+    queueSignal,
+    queueNeedsPoll,
+  ]);
+
   // The permission mode is a Bot setting, owner-only on the Host: read when the rail opens for a Bot and on a
   // manual refresh, not with every message.
-  const mayReadPermissions = online && connection.state.user?.role === "owner" && !!directBot?.online;
+  const mayReadPermissions = online && connState.user?.role === "owner" && !!directBot?.online;
   useEffect(() => {
     if (!directBot || !mayReadPermissions) return;
     const abort = new AbortController();
@@ -333,7 +421,7 @@ export function ConversationWorkspace({
   }, [connection, directBot?.id, mayReadPermissions, refreshTick]);
 
   const diffMessages = useMemo(() => {
-    if (connection.state.user?.role !== "owner") return [];
+    if (connState.user?.role !== "owner") return [];
     const found: Message[] = [];
     for (let i = messages.length - 1; i >= 0 && found.length < 4; i--) {
       const msg = messages[i]!;
@@ -347,15 +435,186 @@ export function ConversationWorkspace({
       }
     }
     return found;
-  }, [messages, connection.state.user?.role]);
+  }, [messages, connState.user?.role]);
 
-  const activeTasks = useMemo(
-    () => tasks.filter(task => task.status === "running"),
-    [tasks],
-  );
+  const activeTasks = useMemo(() => tasks.filter(task => task.status === "running"), [tasks]);
+  const subagentTasks = useMemo(() => activeTasks.filter(task => task.kind === "subagent"), [activeTasks]);
+  const otherActiveTasks = useMemo(() => activeTasks.filter(task => task.kind !== "subagent"), [activeTasks]);
+
   const queuedItems = queue?.items ?? [];
-  const waitingItems = queuedItems.filter(item => item.state === "queued");
+  const dispatchedItems = useMemo(() => queuedItems.filter(item => item.state === "dispatched"), [queuedItems]);
+  const waitingItems = useMemo(() => queuedItems.filter(item => item.state === "queued"), [queuedItems]);
+
+  // Deduplicated active replying vs waiting items (#93 coordination).
+  const replyingEntries = useMemo(() => {
+    const byId = new Map<string, Message>();
+    for (const msg of messages) {
+      if (msg.conversationId === conversation.id) byId.set(msg.id, msg);
+    }
+    const resolveBotName = (botId: string) => botLabels.get(botId) ?? bots.find(bot => bot.id === botId)?.name ?? botId;
+    const entries: { key: string; botId: string; botName: string; text: string; startedAt?: number }[] = [];
+    const coveredBots = new Set<string>();
+    const coveredMessages = new Set<string>();
+
+    if (online) {
+      const activeByBot = new Map<string, Message>();
+      for (const msg of messages) {
+        if (
+          msg.conversationId !== conversation.id ||
+          msg.authorType !== "bot" ||
+          msg.forwardedFrom ||
+          isAgentBusRecord(msg) ||
+          msg.status !== "streaming"
+        ) continue;
+        activeByBot.set(msg.authorId, msg);
+      }
+      for (const [botId, reply] of activeByBot) {
+        const source = reply.replyTo ? byId.get(reply.replyTo) : undefined;
+        let text = previewMessage(source);
+        let sourceId = source?.id ?? reply.replyTo;
+        if (!text && directBot?.id === botId && dispatchedItems[0]) {
+          text = previewMessage(dispatchedItems[0].message);
+          sourceId = dispatchedItems[0].message.id;
+        }
+        coveredBots.add(botId);
+        if (sourceId) coveredMessages.add(sourceId);
+        entries.push({ key: `reply:${botId}:${reply.id}`, botId, botName: resolveBotName(botId), text, startedAt: reply.createdAt });
+      }
+    }
+
+    if (directBot) {
+      for (const item of dispatchedItems) {
+        if (coveredBots.has(directBot.id) || coveredMessages.has(item.message.id)) continue;
+        coveredBots.add(directBot.id);
+        coveredMessages.add(item.message.id);
+        entries.push({
+          key: `dispatched:${item.message.id}`,
+          botId: directBot.id,
+          botName: resolveBotName(directBot.id),
+          text: previewMessage(item.message),
+          startedAt: item.message.createdAt,
+        });
+      }
+    }
+
+    if (entries.length === 0 && streamingBots.length > 0) {
+      for (const name of streamingBots) {
+        entries.push({ key: `streaming:${name}`, botId: name, botName: name, text: "" });
+      }
+    }
+    return entries;
+  }, [messages, conversation.id, online, botLabels, bots, directBot, dispatchedItems, streamingBots]);
+
   const commItems = comms?.items ?? [];
+
+  // Pending approvals promoted to the highlighted amber Waiting for you block at the top of Overview.
+  const waitingApprovals = useMemo<WaitingApprovalItem[]>(() => {
+    const items: WaitingApprovalItem[] = [];
+    const seenMessages = new Set<string>();
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i]!;
+      if (msg.conversationId !== conversation.id) continue;
+      if (messageAttention(msg)?.kind !== "approval") continue;
+      const allowActionId = findApprovalAllowAction(msg);
+      const card = msg.blocks.find((b): b is Extract<Message["blocks"][number], { type: "card" }> => b.type === "card");
+      const detail = card ? card.elements.filter(e => e.type === "markdown").map(e => e.text ?? "").join(" ").trim() : "";
+      seenMessages.add(`${msg.conversationId}:${msg.id}`);
+      items.push({
+        id: `msg:${msg.id}`,
+        botName: botLabels.get(msg.authorId) ?? bots.find(b => b.id === msg.authorId)?.name ?? msg.authorId,
+        conversationId: msg.conversationId,
+        messageId: msg.id,
+        title: card?.title,
+        detail: detail || undefined,
+        allowActionId,
+        canOpen: true,
+        isLocalMessage: true,
+      });
+    }
+    for (const comm of commItems) {
+      if (comm.status !== "needs_approval" || !comm.pendingApproval) continue;
+      const msgKey = `${comm.targetConversationId ?? ""}:${comm.pendingApproval.messageId}`;
+      if (seenMessages.has(msgKey)) continue;
+      seenMessages.add(msgKey);
+      items.push({
+        id: `comm:${comm.id}`,
+        botName: comm.targetBotName,
+        conversationId: comm.targetConversationId,
+        messageId: comm.pendingApproval.messageId,
+        title: comm.pendingApproval.title,
+        detail: comm.pendingApproval.detail,
+        allowActionId: approvalActions[msgKey],
+        canOpen: comm.canJumpToTarget && !!comm.targetConversationId,
+        isLocalMessage: false,
+      });
+    }
+    return items;
+  }, [messages, conversation.id, botLabels, bots, commItems, approvalActions]);
+
+  // Lazily resolve direct approval button IDs for jumpable Bot-to-Bot approval items.
+  useEffect(() => {
+    if (!online || connection.isReadOnly) return;
+    const missing = commItems.filter(
+      comm => comm.status === "needs_approval" && comm.canJumpToTarget && comm.targetConversationId && comm.pendingApproval?.messageId
+        && !(`${comm.targetConversationId}:${comm.pendingApproval.messageId}` in approvalActions),
+    );
+    if (!missing.length) return;
+    const abort = new AbortController();
+    void Promise.all(missing.map(async comm => {
+      const convId = comm.targetConversationId!;
+      const msgId = comm.pendingApproval!.messageId;
+      const key = `${convId}:${msgId}`;
+      try {
+        const cached = await connection.cache.messages(convId).catch(() => []);
+        let target = cached.find(m => m.id === msgId);
+        if (!target) {
+          const raw = await connection.http<{ messages?: Message[] }>(`/api/conversations/${encodeURIComponent(convId)}/messages`, { signal: abort.signal });
+          target = raw.messages?.find(m => m.id === msgId);
+        }
+        const actionId = findApprovalAllowAction(target);
+        if (!abort.signal.aborted && actionId) {
+          setApprovalActions(prev => prev[key] === actionId ? prev : { ...prev, [key]: actionId });
+        }
+      } catch { /* fallback to Open button */ }
+    }));
+    return () => abort.abort();
+  }, [online, connection, commItems, approvalActions]);
+
+  const handleApprove = async (item: WaitingApprovalItem) => {
+    if (!online || connection.isReadOnly || !item.conversationId) return;
+    setApprovingId(item.id);
+    setApprovalNotice(undefined);
+    try {
+      let actionId = item.allowActionId;
+      if (!actionId && item.canOpen) {
+        const raw = await connection.http<{ messages?: Message[] }>(`/api/conversations/${encodeURIComponent(item.conversationId)}/messages`);
+        actionId = findApprovalAllowAction(raw.messages?.find(m => m.id === item.messageId));
+      }
+      if (!actionId) {
+        if (item.canOpen) {
+          if (item.isLocalMessage) onLocateMessage(item.conversationId, item.messageId);
+          else onJumpConversation(item.conversationId, item.messageId);
+        }
+        return;
+      }
+      await connection.send({
+        v: 1,
+        type: "interaction.submit",
+        conversationId: item.conversationId,
+        messageId: item.messageId,
+        actionId,
+        values: {},
+        clientActionId: `action_${crypto.randomUUID()}`,
+      });
+      onRefreshComms();
+      window.setTimeout(() => onRefreshComms(), 450);
+    } catch {
+      setApprovalNotice({ id: item.id, text: t("暂时无法直接同意，点「去看看」在原对话里处理。") });
+    } finally {
+      setApprovingId(current => current === item.id ? undefined : current);
+    }
+  };
+
   const filteredComms = useMemo(() => {
     if (commFilter === "active") {
       return commItems.filter(item => item.status === "needs_approval" || item.status === "running" || item.status === "steered" || item.status === "queued");
@@ -377,9 +636,6 @@ export function ConversationWorkspace({
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
-  // The estimate can be one card too many (cards with two lines of text are taller). When the page then
-  // runs past the bottom, it gives one card back, until it fits. An opened card is the person's own choice
-  // to see more than fits, and scrolls. The estimate returns when the rail is resized.
   useLayoutEffect(() => {
     const node = body.current;
     if (!node || tab !== "comms" || expandedComms.size > 0 || commPageSize <= COMMS_PAGE_MIN) return;
@@ -390,27 +646,25 @@ export function ConversationWorkspace({
   const shownCommPage = Math.min(commPage, commTotalPages - 1);
   const pagedComms = filteredComms.slice(shownCommPage * commPageSize, (shownCommPage + 1) * commPageSize);
 
-  // Unified non-diff artifacts (workbench docs + conversation files) for clean pagination & grid
   const fileArtifacts = useMemo(() => [
     ...workbenchItems.map(entry => ({
       kind: "workbench" as const,
       key: `wb:${entry.kind}:${entry.id}`,
       name: entry.title || workbenchKindLabel(entry.kind),
-      badgeLabel: entry.kind === "whiteboard" ? "WB" : entry.kind === "markdown" ? "DOC" : "DES",
-      badgeTone: "is-wb",
+      artKind: "workbench" as WorkspaceFileKind,
+      ext: entry.kind === "whiteboard" ? "WB" : entry.kind === "markdown" ? "DOC" : "DES",
       meta: t("工作台 · {0}", workbenchKindLabel(entry.kind)),
       entry,
     })),
     ...files.map(file => {
-      const badge = fileBadge(file.name, file.mime);
+      const info = fileKindInfo(file.name, file.mime);
       return {
         kind: "file" as const,
         key: `file:${file.attachmentId}:${file.messageId}`,
         name: file.name,
-        badgeLabel: badge.label,
-        badgeTone: badge.tone,
-        // The same figure as on the card of this file in the conversation.
-        meta: `${formatFileLimit(file.size)} · ${formatRelativeTime(file.createdAt, locale)}`,
+        artKind: info.kind,
+        ext: info.ext,
+        meta: `${info.label} · ${formatFileLimit(file.size)} · ${formatRelativeTime(file.createdAt, locale)}`,
         file,
       };
     }),
@@ -472,13 +726,19 @@ export function ConversationWorkspace({
       <article key={item.id} className={`workspace-comm-card${compact ? " is-compact" : ""}${needsApproval ? " is-needs-approval" : ""}`}>
         <div className="workspace-comm-top">
           <div className="workspace-comm-route">
-            <span title={item.sourceBotName}>{item.sourceBotName}</span>
-            <ArrowRight size={11} aria-hidden="true"/>
-            <span title={item.targetBotName}>{item.targetBotName}</span>
+            <span className="workspace-comm-bot" title={item.sourceBotName}>
+              <WorkspaceBotAvatar hostId={item.sourceHostId} botId={item.sourceBotId} name={item.sourceBotName} size={18} />
+              <span className="workspace-comm-bot-name">{item.sourceBotName}</span>
+            </span>
+            <span className="workspace-comm-arrow" aria-hidden="true">→</span>
+            <span className="workspace-comm-bot" title={item.targetBotName}>
+              <WorkspaceBotAvatar hostId={item.targetHostId} botId={item.targetBotId} name={item.targetBotName} size={18} />
+              <span className="workspace-comm-bot-name">{item.targetBotName}</span>
+            </span>
           </div>
           <span className={`workspace-comm-status ${statusClass}`}>
-            {needsApproval && <AlertTriangle size={10} aria-hidden="true"/>}
-            {commStatusLabel(item.status)}
+            {commStatusIcon(item.status)}
+            <span>{commStatusLabel(item.status)}</span>
           </span>
         </div>
         {!compact && (
@@ -486,7 +746,7 @@ export function ConversationWorkspace({
             {item.crossHost && (
               <span className="workspace-chip is-accent">
                 <Globe size={10} aria-hidden="true"/>
-                {t("跨主机 · {0}", item.direction === "outgoing" ? item.targetHostName : item.sourceHostName)}
+                {t("另一台电脑 · {0}", item.direction === "outgoing" ? item.targetHostName : item.sourceHostName)}
               </span>
             )}
             {item.kind === "agent_bus_stage" && item.workspaceName && (
@@ -495,37 +755,39 @@ export function ConversationWorkspace({
                 {item.workspaceName}
               </span>
             )}
-            {item.direction === "incoming" && <span>{t("协作入站")}</span>}
+            {item.direction === "incoming" && <span>{t("对方来找这边帮忙")}</span>}
             {deliveryLabel && item.kind !== "agent_bus_stage" && <span>{deliveryLabel}</span>}
             <span>{formatRelativeTime(item.updatedAt, locale)}</span>
           </div>
         )}
-        {needsApproval && item.pendingApproval && (
+        {!compact && needsApproval && item.pendingApproval && (
           <div className="workspace-comm-alert-box">
-            <strong>{item.pendingApproval.title || t("下游等待审批或确认")}</strong>
+            <strong>{approvalPlainSummary(item.targetBotName, item.pendingApproval.title, item.pendingApproval.detail)}</strong>
             {item.pendingApproval.detail && <span title={item.pendingApproval.detail}>{item.pendingApproval.detail}</span>}
           </div>
         )}
-        {!expanded && !(needsApproval && item.pendingApproval) && (item.replyExcerpt || item.sentExcerpt) && (
-          <p className="workspace-comm-excerpt" title={item.replyExcerpt ?? item.sentExcerpt}>{item.replyExcerpt ?? item.sentExcerpt}</p>
+        {!expanded && (compact || !(needsApproval && item.pendingApproval)) && (item.replyExcerpt || item.pendingApproval?.detail || item.sentExcerpt) && (
+          <p className="workspace-comm-excerpt" title={item.replyExcerpt ?? item.pendingApproval?.detail ?? item.sentExcerpt}>
+            {item.replyExcerpt ?? item.pendingApproval?.detail ?? item.sentExcerpt}
+          </p>
         )}
         {expanded && (
           <div className="workspace-comm-expanded">
             {item.sentExcerpt && (
               <div>
-                <span className="workspace-comm-expanded-label">{t("发出的指令")}</span>
+                <span className="workspace-comm-expanded-label">{t("托付给对方的话")}</span>
                 <div>{item.sentExcerpt}</div>
               </div>
             )}
             {item.replyExcerpt && (
               <div>
-                <span className="workspace-comm-expanded-label">{item.status === "failed" ? t("失败信息") : t("最新回传")}</span>
+                <span className="workspace-comm-expanded-label">{item.status === "failed" ? t("出了什么错") : t("对方回的话")}</span>
                 <div>{item.replyExcerpt}</div>
               </div>
             )}
             {item.targetConversationTitle && (
               <div>
-                <span className="workspace-comm-expanded-label">{t("协作对话")}</span>
+                <span className="workspace-comm-expanded-label">{t("所在对话")}</span>
                 <div>{item.targetConversationTitle}</div>
               </div>
             )}
@@ -546,7 +808,7 @@ export function ConversationWorkspace({
                 onJumpConversation(item.targetConversationId!, item.pendingApproval?.messageId ?? item.targetMessageId);
               }}
             >
-              <span>{needsApproval ? t("去批准") : t("去协作对话")}</span>
+              <span>{needsApproval ? t("去批准") : t("去看看")}</span>
               <ExternalLink size={11} aria-hidden="true"/>
             </button>
           )}
@@ -555,7 +817,24 @@ export function ConversationWorkspace({
     );
   };
 
-  // The tabs are one stop for the Tab key; the arrow keys, Home and End move between them.
+  const renderArtifactTile = (artifact: (typeof fileArtifacts)[number]) => (
+    <button
+      key={artifact.key}
+      type="button"
+      className="workspace-file-tile"
+      title={artifact.name}
+      onClick={() => openArtifact(artifact)}
+    >
+      {artifact.kind === "file" && artifact.artKind === "image"
+        ? <WorkspaceFileThumbnail connection={connection} attachmentId={artifact.file.attachmentId} name={artifact.name} />
+        : <FileTypeArt kind={artifact.artKind} ext={artifact.ext} />}
+      <span className="workspace-file-tile-text">
+        <span className="workspace-file-tile-name">{artifact.name}</span>
+        <span className="workspace-file-tile-meta">{artifact.meta}</span>
+      </span>
+    </button>
+  );
+
   const tabList = useRef<HTMLDivElement>(null);
   const onTabKey = (event: React.KeyboardEvent) => {
     const order: WorkspaceTab[] = ["overview", "comms", "files"], at = order.indexOf(tab);
@@ -567,17 +846,21 @@ export function ConversationWorkspace({
     setTab(next);
     tabList.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[order.indexOf(next)]?.focus({ preventScroll: true });
   };
-  // Opened on the person's request: the rail takes the focus, so the keyboard continues inside it and not
-  // through every message first. A rail restored with the page leaves the focus where it is.
+
   useEffect(() => {
     if (!takeFocus?.current) return;
     takeFocus.current = false;
     tabList.current?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
   }, [takeFocus]);
+
   const close = () => {
     onClose();
     returnFocus?.current?.focus({ preventScroll: true });
   };
+
+  const readableModel = directBot ? formatModelDisplayName(directBot.model, directBot.engine) : undefined;
+  const rawModelTitle = directBot ? [directBot.engine, directBot.model, directBot.effort].filter(Boolean).join(" · ") : undefined;
+  const overviewFileSlice = diffMessages.length > 0 ? 2 : 3;
 
   const content = (
     <>
@@ -629,30 +912,110 @@ export function ConversationWorkspace({
       <div className="workspace-body" ref={body} id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-tab-${tab}`}>
         {tab === "overview" && (
           <>
-            {/* 1. Compact Environment & Context Strip */}
-            <section className="workspace-section" aria-label={t("环境与上下文")}>
+            {/* 0. Waiting for you: promoted highlighted amber block whenever approvals are pending */}
+            {waitingApprovals.length > 0 && (
+              <section className="workspace-section workspace-waiting-section" aria-label={t("等你确认")}>
+                <div className="workspace-section-header">
+                  <span className="workspace-section-title is-waiting">
+                    <span>{t("等你确认")}</span>
+                    <span className="workspace-waiting-count">{waitingApprovals.length}</span>
+                    <SectionHelpButton
+                      title={t("等你确认")}
+                      description={t("Bot 要运行命令或改动重要内容前，会先停下来请你点头。点「同意」就能继续，或点「去看看」查看完整上下文。")}
+                      art={<WaitingHandArt />}
+                      open={openHelp === "waiting"}
+                      onToggle={() => setOpenHelp(prev => prev === "waiting" ? undefined : "waiting")}
+                      onClose={() => setOpenHelp(undefined)}
+                    />
+                  </span>
+                </div>
+                <div className="workspace-list">
+                  {waitingApprovals.slice(0, 2).map(item => (
+                    <article key={item.id} className="workspace-waiting-card">
+                      <div className="workspace-waiting-body">
+                        <WaitingHandArt />
+                        <div className="workspace-waiting-text">
+                          <strong className="workspace-waiting-title">
+                            {approvalPlainSummary(item.botName, item.title, item.detail)}
+                          </strong>
+                          {item.detail && (
+                            <span className="workspace-waiting-detail" title={item.detail}>
+                              {item.detail}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="workspace-waiting-actions">
+                        <button
+                          type="button"
+                          className="workspace-approve-btn"
+                          disabled={connection.isReadOnly || !online || approvingId === item.id || (!item.canOpen && !item.allowActionId)}
+                          onClick={() => { void handleApprove(item); }}
+                        >
+                          {approvingId === item.id ? t("正在同意…") : t("同意")}
+                        </button>
+                        {item.canOpen && (
+                          <button
+                            type="button"
+                            className="workspace-open-btn"
+                            onClick={() => {
+                              if (item.isLocalMessage) onLocateMessage(item.conversationId!, item.messageId);
+                              else onJumpConversation(item.conversationId!, item.messageId);
+                            }}
+                          >
+                            <span>{t("去看看")}</span>
+                            <ExternalLink size={11} aria-hidden="true"/>
+                          </button>
+                        )}
+                      </div>
+                      {approvalNotice?.id === item.id && (
+                        <p className="workspace-waiting-notice" role="status">{approvalNotice.text}</p>
+                      )}
+                    </article>
+                  ))}
+                  {waitingApprovals.length > 2 && (
+                    <div className="workspace-more-hint">{t("还有 {0} 件事在等你同意", waitingApprovals.length - 2)}</div>
+                  )}
+                </div>
+              </section>
+            )}
+
+            {/* 1. Who is helping you (Environment & Context) */}
+            <section className="workspace-section" aria-label={t("谁在帮你")}>
               <div className="workspace-section-header">
                 <span className="workspace-section-title">
-                  <Cpu size={12} aria-hidden="true"/>
-                  <span>{t("环境与上下文")}</span>
+                  <span>{t("谁在帮你")}</span>
+                  <SectionHelpButton
+                    title={t("谁在帮你")}
+                    description={t("显示现在是谁在陪你聊天、它连在哪台电脑上，以及网络顺不顺畅、对话记忆还剩多少。")}
+                    art={<HostComputerArt online={online} />}
+                    open={openHelp === "who"}
+                    onToggle={() => setOpenHelp(prev => prev === "who" ? undefined : "who")}
+                    onClose={() => setOpenHelp(undefined)}
+                  />
                 </span>
               </div>
               <div className="workspace-env-card">
                 <div className="workspace-env-top">
                   <span className="workspace-env-host" title={hostName}>
-                    <span className={`status-dot${online ? " online" : ""}`}/>
-                    <span>{hostName}</span>
+                    <HostComputerArt online={online} />
+                    <span className="workspace-env-hostname">{hostName}</span>
                   </span>
-                  <span className="workspace-env-route">{connectionSummary}</span>
+                  <span className={`workspace-env-signal is-${signal.tone}`} title={connectionSummary}>
+                    <SignalBarsArt bars={signal.bars} tone={signal.tone} />
+                    <span>{signal.label}</span>
+                  </span>
                 </div>
                 <div className="workspace-env-meta">
                   {directBot ? (
                     <>
-                      <span className="workspace-env-bot">{botLabels.get(directBot.id) ?? directBot.name}</span>
-                      {(directBot.model || directBot.engine) && (
-                        <span className="workspace-env-model">{[directBot.engine, directBot.model, directBot.effort].filter(Boolean).join(" · ")}</span>
+                      <span className="workspace-env-bot">
+                        <BotName id={directBot.id} name={botLabels.get(directBot.id) ?? directBot.name} bot={directBot} />
+                      </span>
+                      {readableModel && (
+                        <span className="workspace-env-model" title={rawModelTitle}>{readableModel}</span>
                       )}
-                      <span className={`workspace-chip${directBot.online ? " is-online" : ""}`}>
+                      <span className={`workspace-chip${directBot.online ? " is-online" : " is-offline"}`}>
                         {directBot.online ? t("在线") : t("离线")}
                       </span>
                       {permissionLabel && (
@@ -683,70 +1046,120 @@ export function ConversationWorkspace({
                     <span className="workspace-chip">{t("话题 · {0}", group.title)}</span>
                   )}
                 </div>
+                {contextUsage && (
+                  <div className="workspace-memory-row" title={t("对话记忆已用 {0}%，还剩 {1}% 可用", 100 - contextUsage.left, contextUsage.left)}>
+                    <span className="workspace-memory-label">{t("记忆")}</span>
+                    <span className="workspace-memory-bar" role="meter" aria-label={t("记忆空间")} aria-valuemin={0} aria-valuemax={100} aria-valuenow={contextUsage.left}>
+                      <i className={`is-${usageTone(contextUsage.left)}`} style={{ width: `${contextUsage.left}%` }} />
+                    </span>
+                    <span className={`workspace-memory-pct is-${usageTone(contextUsage.left)}`}>
+                      {t("剩 {0}%", contextUsage.left)}
+                    </span>
+                  </div>
+                )}
               </div>
             </section>
 
-            {/* 2. Live Tasks & Queue */}
-            <section className="workspace-section" aria-label={t("进行中与队列")}>
+            {/* 2. Doing now (deduplicated replying vs waiting queue + helper count) */}
+            <section className="workspace-section" aria-label={t("现在在做")}>
               <div className="workspace-section-header">
                 <span className="workspace-section-title">
-                  <ListOrdered size={12} aria-hidden="true"/>
-                  <span>{t("进行中与队列")}</span>
+                  <span>{t("现在在做")}</span>
+                  <SectionHelpButton
+                    title={t("现在在做")}
+                    description={t("看 Bot 这会儿正在忙什么、有没有请小帮手分担，以及后面还有几条话在排队等着处理。")}
+                    art={<HelperCountArt />}
+                    open={openHelp === "doing"}
+                    onToggle={() => setOpenHelp(prev => prev === "doing" ? undefined : "doing")}
+                    onClose={() => setOpenHelp(undefined)}
+                  />
                 </span>
-                {onOpenTasksModal && directBot && connection.state.engineTasksAvailable && (
-                  <button type="button" className="workspace-section-action" onClick={onOpenTasksModal}>
-                    {t("全部任务")}
-                  </button>
-                )}
+                <span className="workspace-section-right">
+                  {waitingItems.length > 0 && (
+                    <span className="workspace-queue-pill">
+                      {t("接下来还有 {0} 件", waitingItems.length)}
+                    </span>
+                  )}
+                  {onOpenTasksModal && directBot && connState.engineTasksAvailable && (
+                    <button type="button" className="workspace-section-action" onClick={onOpenTasksModal}>
+                      {t("全部任务")}
+                    </button>
+                  )}
+                </span>
               </div>
-              {activeTasks.length > 0 || queuedItems.length > 0 || streamingBots.length > 0 ? (
+              {activeTasks.length > 0 || waitingItems.length > 0 || replyingEntries.length > 0 ? (
                 <div className="workspace-list">
-                  {streamingBots.length > 0 && activeTasks.length === 0 && (
-                    <div className="workspace-item-row">
-                      <span className="workspace-item-icon"><span className="status-dot online"/></span>
+                  {replyingEntries.map(entry => (
+                    <div key={entry.key} className="workspace-item-row workspace-replying-row">
+                      <span className="workspace-item-icon"><WorkingMotionArt animated={animatedMotion} /></span>
                       <span className="workspace-item-main">
-                        <span className="workspace-item-title">{t("正在回复")}</span>
-                        <span className="workspace-item-meta">{streamingBots.join("、")}</span>
+                        <span className="workspace-item-title" title={entry.text || undefined}>{entry.text || t("正在回复")}</span>
+                        <span className="workspace-item-meta">
+                          {entry.text ? t("正在回复 · {0}", entry.botName) : entry.botName}
+                          {entry.startedAt ? ` · ${t("已做 {0}", formatElapsedBrief(entry.startedAt))}` : ""}
+                        </span>
+                      </span>
+                    </div>
+                  ))}
+                  {subagentTasks.length > 0 && (
+                    <div className="workspace-item-row workspace-helper-row">
+                      <span className="workspace-item-icon"><HelperCountArt /></span>
+                      <span className="workspace-item-main">
+                        <span className="workspace-item-title">
+                          {subagentTasks.length === 1 ? t("请了 1 个小帮手") : t("请了 {0} 个小帮手", subagentTasks.length)}
+                        </span>
+                        <span className="workspace-item-meta" title={subagentTasks.map(task => task.label || task.id).join(" · ")}>
+                          {subagentTasks.slice(0, 2).map(task => task.label || task.id).join(" · ")}
+                        </span>
                       </span>
                     </div>
                   )}
-                  {activeTasks.slice(0, 2).map(task => (
+                  {otherActiveTasks.slice(0, 2).map(task => (
                     <div key={task.id} className="workspace-item-row">
-                      <span className="workspace-item-icon"><span className="status-dot online"/></span>
+                      <span className="workspace-item-icon"><WorkingMotionArt animated={animatedMotion} /></span>
                       <span className="workspace-item-main">
                         <span className="workspace-item-title">{task.label || task.id}</span>
-                        <span className="workspace-item-meta">{task.kind === "subagent" ? t("子代理") : task.kind === "shell" ? t("后台命令") : t("后台任务")}</span>
+                        <span className="workspace-item-meta">{task.kind === "shell" ? t("正在运行命令") : t("后台小任务")}</span>
                       </span>
                     </div>
                   ))}
-                  {queuedItems.slice(0, 2).map((item, idx) => (
-                    <div key={item.message.id} className="workspace-item-row">
+                  {waitingItems.slice(0, 2).map((item, idx) => (
+                    <div key={item.message.id} className="workspace-item-row workspace-queue-row">
                       <span className="workspace-item-icon"><ListOrdered size={12}/></span>
                       <span className="workspace-item-main">
-                        <span className="workspace-item-title">{blocksText(item.message.blocks).trim() || t("排队消息 #{0}", idx + 1)}</span>
-                        {/* A message already handed to the Bot is no longer waiting in line. */}
-                        <span className="workspace-item-meta">{item.state === "queued" ? t("队列第 {0} 位", waitingItems.indexOf(item) + 1) : t("处理中")}</span>
+                        <span className="workspace-item-title" title={previewMessage(item.message) || undefined}>{previewMessage(item.message) || t("排队消息 #{0}", idx + 1)}</span>
+                        <span className="workspace-item-meta">{t("队列第 {0} 位", idx + 1)}</span>
                       </span>
                     </div>
                   ))}
-                  {(activeTasks.length > 2 || queuedItems.length > 2) && (
+                  {(otherActiveTasks.length > 2 || waitingItems.length > 2) && (
                     <div className="workspace-more-hint">
-                      {[activeTasks.length > 2 ? t("还有 {0} 个后台任务", activeTasks.length - 2) : "", queuedItems.length > 2 ? t("还有 {0} 条排队消息", queuedItems.length - 2) : ""].filter(Boolean).join(" · ")}
+                      {[otherActiveTasks.length > 2 ? t("还有 {0} 个后台任务", otherActiveTasks.length - 2) : "", waitingItems.length > 2 ? t("还有 {0} 条排队消息", waitingItems.length - 2) : ""].filter(Boolean).join(" · ")}
                     </div>
                   )}
                 </div>
               ) : (
-                <div className="workspace-idle-strip">{t("当前空闲，无运行中或排队任务。")}</div>
+                <div className="workspace-idle-strip">
+                  <EmptyStateArt kind="idle" />
+                  <span>{t("现在闲着呢，随时可以聊新事情。")}</span>
+                </div>
               )}
             </section>
 
-            {/* 3. Bot-to-Bot Comms (auto-hidden in Overview when 0 items; capped to 2 compact cards) */}
+            {/* 3. Bot-to-Bot Comms (the ONE place with Bot avatars; auto-hidden in Overview when 0 items) */}
             {commItems.length > 0 && (
-              <section className="workspace-section" aria-label={t("Bot 间通信")}>
+              <section className="workspace-section" aria-label={t("Bot 之间在聊什么")}>
                 <div className="workspace-section-header">
                   <span className="workspace-section-title">
-                    <Network size={12} aria-hidden="true"/>
-                    <span>{t("Bot 间通信")}</span>
+                    <span>{t("Bot 之间在聊什么")}</span>
+                    <SectionHelpButton
+                      title={t("Bot 之间在聊什么")}
+                      description={t("当你的 Bot 请别的 Bot 帮忙（甚至在另一台电脑上），它们谁找谁、进展到哪一步、回说了什么，都会用头像连线展示在这里。")}
+                      art={<EmptyStateArt kind="comms" />}
+                      open={openHelp === "comms"}
+                      onToggle={() => setOpenHelp(prev => prev === "comms" ? undefined : "comms")}
+                      onClose={() => setOpenHelp(undefined)}
+                    />
                   </span>
                   {commItems.length > 2 && (
                     <button type="button" className="workspace-section-action" onClick={() => setTab("comms")}>
@@ -760,12 +1173,19 @@ export function ConversationWorkspace({
               </section>
             )}
 
-            {/* 4. Artifacts & Run Changes (compact Diff bar + 2-column file tile grid) */}
-            <section className="workspace-section" aria-label={t("产物与本轮改动")}>
+            {/* 4. What was made (code changes summary + bar + cute file-type art & thumbnails) */}
+            <section className="workspace-section" aria-label={t("做出来的东西")}>
               <div className="workspace-section-header">
                 <span className="workspace-section-title">
-                  <FileCode2 size={12} aria-hidden="true"/>
-                  <span>{t("产物与本轮改动")}</span>
+                  <span>{t("做出来的东西")}</span>
+                  <SectionHelpButton
+                    title={t("做出来的东西")}
+                    description={t("汇总这轮聊天里新做的文档、图片、表格，还有改过的代码行数，点一下就能打开或看详细改动。")}
+                    art={<EmptyStateArt kind="files" />}
+                    open={openHelp === "made"}
+                    onToggle={() => setOpenHelp(prev => prev === "made" ? undefined : "made")}
+                    onClose={() => setOpenHelp(undefined)}
+                  />
                 </span>
                 {artifactsCount > 0 && (
                   <button type="button" className="workspace-section-action" onClick={() => setTab("files")}>
@@ -774,27 +1194,16 @@ export function ConversationWorkspace({
                 )}
               </div>
               {diffMessages.length === 0 && fileArtifacts.length === 0 ? (
-                <div className="workspace-idle-strip">{t("暂无本轮改动、工作台内容或对话文件。")}</div>
+                <div className="workspace-idle-strip">
+                  <EmptyStateArt kind="files" />
+                  <span>{t("做好的文件、画板和代码改动，都会收在这里。")}</span>
+                </div>
               ) : (
                 <div className="workspace-list">
                   {diffMessages.slice(0, 1).map(msg => <WorkspaceRunChanges key={`diff:${msg.id}`} connection={connection} message={msg}/>)}
                   {fileArtifacts.length > 0 && (
                     <div className="workspace-file-grid">
-                      {fileArtifacts.slice(0, diffMessages.length > 0 ? 2 : 3).map(artifact => (
-                        <button
-                          key={artifact.key}
-                          type="button"
-                          className="workspace-file-tile"
-                          title={artifact.name}
-                          onClick={() => openArtifact(artifact)}
-                        >
-                          <span className={`workspace-file-badge ${artifact.badgeTone}`}>{artifact.badgeLabel}</span>
-                          <span className="workspace-file-tile-text">
-                            <span className="workspace-file-tile-name">{artifact.name}</span>
-                            <span className="workspace-file-tile-meta">{artifact.meta}</span>
-                          </span>
-                        </button>
-                      ))}
+                      {fileArtifacts.slice(0, overviewFileSlice).map(renderArtifactTile)}
                     </div>
                   )}
                 </div>
@@ -804,16 +1213,16 @@ export function ConversationWorkspace({
         )}
 
         {tab === "comms" && (
-          <section className="workspace-section" aria-label={t("Bot 间通信")}>
+          <section className="workspace-section" aria-label={t("Bot 之间在聊什么")}>
             <div className="workspace-filter-bar">
               <button type="button" className="workspace-filter-pill" aria-pressed={commFilter === "all"} onClick={() => setCommFilter("all")}>
                 {t("全部")} ({commItems.length})
               </button>
               <button type="button" className="workspace-filter-pill" aria-pressed={commFilter === "active"} onClick={() => setCommFilter("active")}>
-                {t("进行中 / 待审批")} ({comms?.summary.active ?? 0})
+                {t("进行中 / 等你同意")} ({comms?.summary.active ?? 0})
               </button>
               <button type="button" className="workspace-filter-pill" aria-pressed={commFilter === "cross_host"} onClick={() => setCommFilter("cross_host")}>
-                {t("跨主机")} ({commItems.filter(i => i.crossHost).length})
+                {t("跨电脑")} ({commItems.filter(i => i.crossHost).length})
               </button>
             </div>
             {pagedComms.length > 0 ? (
@@ -829,13 +1238,20 @@ export function ConversationWorkspace({
               </>
             ) : (
               <div className="workspace-empty">
-                {commItems.length > 0
-                  ? t("当前筛选下没有匹配的通信记录。")
-                  : comms !== undefined
-                    ? t("这个对话里还没有 Bot 之间的往来。Bot 互相委托、跨主机调用和多 Bot 协作会自动显示在这里。")
-                    : commsError && !commsLoading
-                      ? t("暂时读不到 Bot 之间的往来，请稍后再刷新。")
-                      : t("正在读取…")}
+                <EmptyStateArt kind={commsError && !commsLoading ? "error" : "comms"} />
+                {commItems.length > 0 ? (
+                  <p>{t("当前筛选下没有匹配的往来记录。")}</p>
+                ) : comms !== undefined ? (
+                  <p>{t("这个对话里还没有 Bot 互相找过对方。需要多个 Bot 配合时，往来记录会出现在这里。")}</p>
+                ) : commsError && !commsLoading ? (
+                  <>
+                    <p>{t("暂时读不到 Bot 之间的往来，可以点一下重试。")}</p>
+                    <button type="button" className="workspace-retry-btn" onClick={onRefreshComms}>{t("重试")}</button>
+                    <small className="workspace-error-code">comms_unavailable</small>
+                  </>
+                ) : (
+                  <p>{t("正在读取…")}</p>
+                )}
               </div>
             )}
             {commItems.length >= BOT_COMMS_LIMIT && (
@@ -845,51 +1261,40 @@ export function ConversationWorkspace({
         )}
 
         {tab === "files" && (
-          <section className="workspace-section" aria-label={t("文件与改动")}>
+          <section className="workspace-section" aria-label={t("做出来的东西")}>
             <div className="workspace-filter-bar">
               <button type="button" className="workspace-filter-pill" aria-pressed={fileFilter === "all"} onClick={() => setFileFilter("all")}>
                 {t("全部")} ({artifactsCount})
               </button>
               {diffMessages.length > 0 && (
                 <button type="button" className="workspace-filter-pill" aria-pressed={fileFilter === "diff"} onClick={() => setFileFilter("diff")}>
-                  {t("本轮改动")} ({diffMessages.length})
+                  {t("代码改动")} ({diffMessages.length})
                 </button>
               )}
               <button type="button" className="workspace-filter-pill" aria-pressed={fileFilter === "files"} onClick={() => setFileFilter("files")}>
-                {t("附件与文档")} ({fileArtifacts.length})
+                {t("文件与画板")} ({fileArtifacts.length})
               </button>
             </div>
 
             {artifactsCount === 0 ? (
-              <div className="workspace-empty">{t("暂无本轮改动、工作台内容或对话文件。")}</div>
+              <div className="workspace-empty">
+                <EmptyStateArt kind="files" />
+                <p>{t("做好的文件、画板和代码改动，都会收在这里。")}</p>
+              </div>
             ) : (
               <div className="workspace-list">
                 {fileFilter !== "files" && diffMessages.length > 0 && (
                   <>
-                    <div className="workspace-group-label">{t("本轮改动")}</div>
+                    <div className="workspace-group-label">{t("代码改动")}</div>
                     {diffMessages.map(msg => <WorkspaceRunChanges key={`diff:${msg.id}`} connection={connection} message={msg}/>)}
                   </>
                 )}
 
                 {fileFilter !== "diff" && pagedFileArtifacts.length > 0 && (
                   <>
-                    <div className="workspace-group-label">{t("附件与文档")}</div>
+                    <div className="workspace-group-label">{t("文件与画板")}</div>
                     <div className="workspace-file-grid">
-                      {pagedFileArtifacts.map(artifact => (
-                        <button
-                          key={artifact.key}
-                          type="button"
-                          className="workspace-file-tile"
-                          title={artifact.name}
-                          onClick={() => openArtifact(artifact)}
-                        >
-                          <span className={`workspace-file-badge ${artifact.badgeTone}`}>{artifact.badgeLabel}</span>
-                          <span className="workspace-file-tile-text">
-                            <span className="workspace-file-tile-name">{artifact.name}</span>
-                            <span className="workspace-file-tile-meta">{artifact.meta}</span>
-                          </span>
-                        </button>
-                      ))}
+                      {pagedFileArtifacts.map(renderArtifactTile)}
                     </div>
                   </>
                 )}
@@ -919,8 +1324,6 @@ export function ConversationWorkspace({
   return (
     <aside id={id} className="conversation-workspace-rail" aria-label={t("会话工作区")}
       onKeyDown={event => {
-        // Only an Escape pressed in the rail itself: one that closes a dialog opened from here (the changes
-        // viewer) reaches this handler too, through React's tree or from inside the rail's own element.
         const target = event.target as Element;
         if (event.key !== "Escape" || event.defaultPrevented || !event.currentTarget.contains(target) || target.closest("dialog,[role='dialog'],[role='menu']")) return;
         event.preventDefault(); close();

@@ -80,17 +80,19 @@ test("Bot messages: both ends of a long route, whole cards to a page, plain stat
       return { inside: parts.every(part => part.right <= box.right + 0.5), names: [parts[0]!.width > 40, parts[2]!.width > 40], arrow: parts[1]!.width > 8 };
     });
     expect(route).toEqual({ inside: true, names: [true, true], arrow: true });
+    // Both source and target Bots show their real Avatars in Bot-to-Bot comms.
+    await expect(cards.first().locator(".workspace-comm-route .profile-avatar")).toHaveCount(2);
     if (process.env.WORKSPACE_RAIL_UI_SHOTS) await rail(page).screenshot({ path: `${process.env.WORKSPACE_RAIL_UI_SHOTS}/comms-fixed.png` });
-    await expect(cards.first().locator(".workspace-comm-route > span").last()).toHaveAttribute("title", "Reviewer-Security-Auditor-与合规审查-Bot");
-    await expect(rail(page).locator(".workspace-comm-status")).toContainText(["待审批", "运行中", "已并入回复", "排队中", "失败"]);
-    await expect(cards.nth(1).locator(".workspace-comm-sub")).toContainText("经排队投递");
-    await expect(cards.nth(3).locator(".workspace-comm-sub")).toContainText("未能并入，已改为排队");
+    await expect(cards.first().locator(".workspace-comm-route > .workspace-comm-bot").last()).toHaveAttribute("title", "Reviewer-Security-Auditor-与合规审查-Bot");
+    await expect(rail(page).locator(".workspace-comm-status")).toContainText(["等你同意", "正在处理", "已顺带告诉对方", "排队等回复", "失败了"]);
+    await expect(cards.nth(1).locator(".workspace-comm-sub")).toContainText("按顺序排队送达");
+    await expect(cards.nth(3).locator(".workspace-comm-sub")).toContainText("没赶上这轮，已排到下一轮");
     // A failed item's text is not a reply.
     await cards.nth(4).getByRole("button", { name: "展开详情" }).click();
-    await expect(cards.nth(4).locator(".workspace-comm-expanded-label")).toContainText(["失败信息"]);
+    await expect(cards.nth(4).locator(".workspace-comm-expanded-label")).toContainText(["出了什么错"]);
     await cards.nth(4).getByRole("button", { name: "收起" }).click();
     await rail(page).getByRole("button", { name: "下一页" }).click();
-    await expect(rail(page).locator(".workspace-comm-status")).toContainText(["已取消", "结果未确认", "已回传"]);
+    await expect(rail(page).locator(".workspace-comm-status")).toContainText(["已取消", "没收到回音", "已回复"]);
     await rail(page).getByRole("button", { name: "上一页" }).click();
     expect(await contrast(page, "aside.conversation-workspace-rail .workspace-jump-btn.is-alert")).toBeGreaterThan(4.5);
     await setTheme(page, "dark");
@@ -101,7 +103,7 @@ test("Bot messages: both ends of a long route, whole cards to a page, plain stat
   } finally { await done(); }
 });
 
-test("a slow read says it is reading, and a failed one says so", async ({ browser }) => {
+test("a slow read says it is reading, and a failed one says so with a retry button", async ({ browser }) => {
   let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
   let fail = false;
   const { page, L, f, open, done } = await ready(browser, "zh", 1440, async (page, f) => {
@@ -113,7 +115,7 @@ test("a slow read says it is reading, and a failed one says so", async ({ browse
   try {
     await open();
     await rail(page).getByRole("tab", { name: new RegExp(L("Bot 通信")) }).click();
-    await expect(rail(page).locator(".workspace-empty")).toHaveText("正在读取…");
+    await expect(rail(page).locator(".workspace-empty")).toContainText("正在读取…");
     release();
     await expect(rail(page).locator(".workspace-comm-card")).toHaveCount(2);
     // Another conversation whose first read fails.
@@ -121,25 +123,34 @@ test("a slow read says it is reading, and a failed one says so", async ({ browse
     await page.route(`**/api/conversations/${f.ids.empty}/bot-comms`, route => route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "unavailable" }) }));
     await openConv(page, "空白对话");
     await rail(page).getByRole("tab", { name: new RegExp(L("Bot 通信")) }).click();
-    await expect(rail(page).locator(".workspace-empty")).toHaveText("暂时读不到 Bot 之间的往来，请稍后再刷新。");
+    await expect(rail(page).locator(".workspace-empty")).toContainText("暂时读不到 Bot 之间的往来，可以点一下重试。");
+    await expect(rail(page).locator(".workspace-empty").getByRole("button", { name: "重试" })).toBeVisible();
   } finally { await done(); }
 });
 
-test("overview: a message being handled is not in line, hidden tasks are counted, sizes match the conversation, a group names the rest", async ({ browser }) => {
+test("overview: a message being handled is not in line, subagents show helper count without avatars, hidden tasks are counted, sizes match, a group names the rest", async ({ browser }) => {
   const { page, f, open, done } = await ready(browser, "zh", 1440, async (page, f) => {
-    await page.route(`**/api/conversations/${f.ids.main}/tasks*`, route => route.fulfill({ contentType: "application/json", body: JSON.stringify({ supported: true, tasks: [1, 2, 3].map(n => (
-      { id: `t${n}`, label: `后台任务 ${n}`, kind: "shell", mode: "background", status: "running", canStop: false, updatedAt: Date.now() })) }) }));
+    await page.route(`**/api/conversations/${f.ids.main}/tasks*`, route => route.fulfill({ contentType: "application/json", body: JSON.stringify({ supported: true, tasks: [
+      ...[1, 2, 3].map(n => ({ id: `t${n}`, label: `后台任务 ${n}`, kind: "shell", mode: "background", status: "running", canStop: false, updatedAt: Date.now() })),
+      { id: "sub1", label: "查接口", kind: "subagent", mode: "background", status: "running", canStop: false, updatedAt: Date.now() },
+      { id: "sub2", label: "跑单测", kind: "subagent", mode: "background", status: "running", canStop: false, updatedAt: Date.now() },
+    ] }) }));
   });
   try {
     await open();
-    const live = rail(page).locator(".workspace-section").nth(1);
-    // The Host says this message is "dispatched": the Bot has it. It used to read "队列第 1 位".
-    await expect(live.locator(".workspace-item-meta").last()).toHaveText("处理中");
+    const live = rail(page).getByRole("region", { name: "现在在做", exact: true });
+    // The Host says this message is "dispatched": it belongs in the Replying row, not a queue row.
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["请协调评审并汇总基准测试结果。"]);
+    await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toContainText(["正在回复 · Architect"]);
+    await expect(live.locator(".workspace-queue-row")).toHaveCount(0);
     await expect(live).not.toContainText("队列第");
+    // Subagents appear as a plain-language helper count with NO avatars.
+    await expect(live.locator(".workspace-helper-row")).toContainText("请了 2 个小帮手");
+    await expect(live.locator(".workspace-helper-row .profile-avatar")).toHaveCount(0);
     await expect(live.locator(".workspace-more-hint")).toHaveText("还有 1 个后台任务");
     const chatSize = await page.locator(".file-card-meta small").first().innerText();
     expect(chatSize).toBe("17.99 KiB");
-    await expect(rail(page).locator(".workspace-section").last()).toContainText(chatSize);
+    await expect(rail(page).getByRole("region", { name: "做出来的东西", exact: true })).toContainText(chatSize);
     await openConv(page, "发布群");
     await expect(rail(page)).toBeVisible();
     await expect(rail(page).locator(".workspace-env-bot")).toContainText("5 位 Bot");
@@ -155,7 +166,7 @@ test("jumping to a conversation that is gone stays here and says why", async ({ 
   try {
     await open();
     await rail(page).getByRole("tab", { name: new RegExp(L("Bot 通信")) }).click();
-    await rail(page).getByRole("button", { name: "去协作对话" }).click();
+    await rail(page).getByRole("button", { name: "去看看" }).click();
     await expect(page.getByText("协作对话已不存在，或当前不可访问。")).toBeVisible();
     await expect(page.getByRole("heading", { name: f.mainTitle, exact: true, level: 1 })).toBeVisible();
     await expect(rail(page)).toBeVisible();
@@ -170,7 +181,7 @@ test("a jump leaves the keyboard in the conversation that opened, and a full lis
   try {
     await open();
     // The real item of this fixture: Architect asked Researcher, who has replied.
-    await rail(page).getByRole("button", { name: "去协作对话" }).first().click();
+    await rail(page).getByRole("button", { name: "去看看" }).last().click();
     await expect(page.getByRole("heading", { level: 1 })).not.toHaveText(f.mainTitle);
     await expect.poll(() => page.evaluate(() => !!document.activeElement?.closest(".composer"))).toBe(true);
     // Sixty is all the Host returns: the list says so, and a shorter one does not.
@@ -228,19 +239,37 @@ const token = (page: Page, name: string) => page.evaluate(value => {
   const colour = getComputedStyle(probe).color; probe.remove(); return colour;
 }, name);
 
-test("a turn's changes are listed by file name with green and red counts; the reply's own entry stays 本轮改动", async ({ browser }) => {
+test("a turn's changes are listed by file name with baseline-aligned green and red counts and ratio bar; the reply's own entry stays 本轮改动", async ({ browser }) => {
   const { page, open, done } = await ready(browser, "zh", 1400);
   try {
     await open();
     const row = rail(page).locator(".workspace-diff-row");
+    await expect(row).toContainText("改了 2 个代码文件 · 新增 14 行，删掉 3 行");
+    await expect(row.locator(".workspace-diff-bar .is-add")).toBeVisible();
+    await expect(row.locator(".workspace-diff-bar .is-del")).toBeVisible();
     // The names are the Hub's record of that run (two edits in the fixture's journal), not the totals on the card.
     await expect(row.locator(".workspace-diff-name")).toHaveText(["ConversationWorkspace.tsx", "bot-messages.ts"]);
     await expect(row.locator(".workspace-diff-name").first()).toHaveAttribute("title", "client/src/ConversationWorkspace.tsx");
-    await expect(row.locator(".workspace-diff-counts").first().locator("span")).toHaveText(["+2", "−1"]);
-    await expect(row.locator(".workspace-diff-counts").last().locator("span")).toHaveText(["+1", "−1"]);
-    const colours = await row.locator(".workspace-diff-counts").first().locator("span").evaluateAll(spans => spans.map(span => getComputedStyle(span).color));
-    expect(colours).toEqual([await token(page, "--green"), await token(page, "--red")]);
-    expect(colours[0]).not.toBe(colours[1]);
+    await expect(row.locator(".workspace-diff-counts").first().locator("span")).toHaveText(["+2", "-1"]);
+    await expect(row.locator(".workspace-diff-counts").last().locator("span")).toHaveText(["+1", "-1"]);
+    const countsMetrics = await row.locator(".workspace-diff-counts").first().evaluate(node => {
+      const style = getComputedStyle(node);
+      const spans = [...node.querySelectorAll("span")].map(span => {
+        const box = span.getBoundingClientRect();
+        const range = document.createRange();
+        range.selectNodeContents(span);
+        const textBox = range.getBoundingClientRect();
+        return { color: getComputedStyle(span).color, top: box.top, bottom: box.bottom, height: box.height, textTop: textBox.top, textBottom: textBox.bottom };
+      });
+      return { alignItems: style.alignItems, fontVariantNumeric: style.fontVariantNumeric, spans };
+    });
+    expect(countsMetrics.alignItems).toBe("baseline");
+    expect(countsMetrics.fontVariantNumeric).toBe("tabular-nums");
+    expect(countsMetrics.spans.map(s => s.color)).toEqual([await token(page, "--green"), await token(page, "--red")]);
+    expect(countsMetrics.spans[0]!.color).not.toBe(countsMetrics.spans[1]!.color);
+    expect(Math.abs(countsMetrics.spans[0]!.top - countsMetrics.spans[1]!.top)).toBeLessThan(0.5);
+    expect(Math.abs(countsMetrics.spans[0]!.height - countsMetrics.spans[1]!.height)).toBeLessThan(0.5);
+    expect(Math.abs(countsMetrics.spans[0]!.textBottom - countsMetrics.spans[1]!.textBottom)).toBeLessThan(0.5);
     expect(await row.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
     // On the reply itself the entry carries no counts and no names.
     const reply = page.locator(".host-workspace:not([hidden])").getByRole("region", { name: "运行回复", exact: true });
@@ -259,7 +288,48 @@ test("when the names cannot be read, the saved totals stand in, still green and 
     await open();
     const row = rail(page).locator(".workspace-diff-row");
     await expect(row.locator(".workspace-diff-name")).toHaveText(["改动 2 个文件"]);
-    await expect(row.locator(".workspace-diff-counts span")).toHaveText(["+14", "−3"]);
+    await expect(row.locator(".workspace-diff-counts span")).toHaveText(["+14", "-3"]);
     expect(await row.locator(".workspace-diff-counts span").evaluateAll(spans => spans.map(span => getComputedStyle(span).color))).toEqual([await token(page, "--green"), await token(page, "--red")]);
+  } finally { await done(); }
+});
+
+test("Waiting for you block approves directly and Replying row deduplicates queued messages", async ({ browser }) => {
+  const { page, f, open, done } = await ready(browser, "zh", 1440);
+  try {
+    // 1. Direct Approve from the highlighted amber Waiting for you block.
+    await open();
+    const waiting = rail(page).getByRole("region", { name: "等你确认", exact: true });
+    await expect(waiting).toBeVisible();
+    await expect(waiting).toContainText("Reviewer 想运行一条命令，需要你同意");
+    await expect(waiting).toContainText("npm run test:regression");
+    await waiting.getByRole("button", { name: "同意", exact: true }).click();
+    await expect.poll(async () => {
+      const row = await f.hub.store.db.get<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM action_deliveries");
+      return row?.cnt ?? 0;
+    }).toBeGreaterThanOrEqual(1);
+
+    // 2. Direct chat queue deduplication (#93 coordination): dispatched message shows in Replying row, not queue row.
+    const m1 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.main, clientMsgId: "q-1", text: "第一条：正在处理中的长消息内容", attachments: [], mentions: ["bot_arch"], previewUrl: null })).message;
+    const m2 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.main, clientMsgId: "q-2", text: "第二条：排在前面的消息", attachments: [], mentions: ["bot_arch"], previewUrl: null })).message;
+    const m3 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.main, clientMsgId: "q-3", text: "第三条：排在后面的消息", attachments: [], mentions: ["bot_arch"], previewUrl: null })).message;
+    await f.hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [f.ids.userMsg, "bot_arch"]);
+    await f.hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id=?", [m1.id, "bot_arch"]);
+    const reply1 = await f.hub.store.publishBotMessage("bot_arch", { conversationId: f.ids.main, replyTo: m1.id, blocks: [{ type: "text", text: "正在分析第一条…" }], status: "streaming" });
+    const live = rail(page).getByRole("region", { name: "现在在做", exact: true });
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(1);
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["第一条：正在处理中的长消息内容"]);
+    await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toContainText(["正在回复 · Architect"]);
+    await expect(live).toContainText("接下来还有 2 件");
+    await expect(live.locator(".workspace-queue-row")).toHaveCount(2);
+    await expect(live.locator(".workspace-queue-row .workspace-item-title")).toHaveText(["第二条：排在前面的消息", "第三条：排在后面的消息"]);
+    await expect(live.locator(".workspace-queue-row .workspace-item-meta")).toHaveText(["队列第 1 位", "队列第 2 位"]);
+
+    await f.hub.store.publishBotMessage("bot_arch", { id: reply1.id, conversationId: f.ids.main, replyTo: m1.id, blocks: [{ type: "text", text: "第一条已完成。" }], status: "complete" });
+    await f.hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [m1.id, "bot_arch"]);
+    await f.hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id=?", [m2.id, "bot_arch"]);
+    await f.hub.store.publishBotMessage("bot_arch", { conversationId: f.ids.main, replyTo: m2.id, blocks: [{ type: "text", text: "正在处理第二条…" }], status: "streaming" });
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["第二条：排在前面的消息"]);
+    await expect(live.locator(".workspace-queue-row")).toHaveCount(1);
+    await expect(live.locator(".workspace-queue-row .workspace-item-title")).toHaveText(["第三条：排在后面的消息"]);
   } finally { await done(); }
 });
