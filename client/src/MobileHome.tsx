@@ -29,7 +29,7 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import { CalendarClock, Archive as ArchiveIcon, ArrowLeft, Cpu, Settings, Bell, ShieldCheck, Wifi, WifiOff, RefreshCw, MonitorCog } from 'lucide-react';
+import { CalendarClock, Archive as ArchiveIcon, ArrowLeft, Settings, Bell, ShieldCheck, Wifi, WifiOff, RefreshCw, MonitorCog } from 'lucide-react';
 import type { Conversation } from '../../src/client-protocol/index.js';
 import { Avatar, AvatarProvider, ConversationAvatar } from './Avatar.js';
 import { BotReferences, ReferencePreview } from './BotReferences.js';
@@ -53,7 +53,7 @@ type BotScope = { hostId: string; botId: string };
 export type MobileInboxState = { query: string; filter: MobileFilter; botScope?: BotScope; botQuery?: string };
 export type MobileScrollPositions = Record<MobileTab, number>;
 export type MobileCreateKind = 'bot' | 'group' | 'direct' | 'schedule';
-export type MobileOpenTarget = 'settings' | 'connection' | 'screen' | 'devices' | 'notifications' | 'files' | 'capabilities' | 'operations' | 'resources' | 'schedules' | 'hosts' | 'archives';
+export type MobileOpenTarget = 'settings' | 'connection' | 'screen' | 'devices' | 'notifications' | 'files' | 'capabilities' | 'operations' | 'schedules' | 'hosts' | 'archives';
 type Locale = ReturnType<typeof useLocale>;
 
 export type MobileHomeProps = {
@@ -703,7 +703,6 @@ function MePane({ hosts, activeHost, selectHost, open }: PaneProps) {
           <Cell settingsEntry="capabilities" icon={<PlugIcon />} label={t('Skills 与 MCP')} disabled={!activeHost} onClick={() => open('capabilities')} />
           <Cell icon={<CalendarClock />} label={t('定时任务')} disabled={!activeHost} onClick={() => open('schedules')} />
           <Cell settingsEntry="operations" icon={<ActivityIcon />} label={t('运行状态')} disabled={!activeHost} onClick={() => open('operations')} />
-          {activeHost?.connection.state.hostResourcesAvailable && <Cell icon={<Cpu size={20}/>} label={t('资源监控')} description={t('CPU 与内存（只读）')} disabled={!activeHost} onClick={() => open('resources')} />}
           <Cell icon={<ShieldCheck size={20}/>} label={t('设备与安全')} description={t('设备名称与访问授权')} disabled={!activeHost} onClick={() => open('devices')} />
           <Cell icon={<ArchiveIcon />} label={t('已归档对话')} disabled={!activeHost} onClick={() => open('archives')} />
         </ul>

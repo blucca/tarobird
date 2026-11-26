@@ -5677,8 +5677,6 @@
   "这里最多显示最近 {0} 条，更早的往来不在其中。": "Only the {0} most recent are shown here; earlier ones are not listed.",
   "资源": "Resources",
   "资源管理": "Resource Manager",
-  "资源监控": "Resources",
-  "CPU 与内存（只读）": "CPU & memory (read-only)",
   "无法读取资源数据": "Unable to read resource usage",
   "暂时无法读取资源使用情况。": "Unable to read resource usage right now.",
   "正在采样进程资源…": "Sampling process resources…",
@@ -5713,6 +5711,5 @@
   "将停止「{0}」的引擎进程（PID {1}）。": "This stops the engine process (PID {1}) for \"{0}\".",
   "目标进程：{0} (PID {1})": "Target process: {0} (PID {1})",
   "正在停止…": "Stopping…",
-  "确认停止": "Stop process",
-  "手机端仅支持查看资源占用；如需停止异常引擎进程，请在电脑端操作。": "Phone view is read-only. To stop a runaway engine process, use the desktop app."
+  "确认停止": "Stop process"
 }

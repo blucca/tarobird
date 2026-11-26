@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { Activity, ChevronDown, ChevronRight, Cpu, Monitor, RefreshCw, Square, X } from "lucide-react";
 import {
   formatCpuPercent,
@@ -12,8 +12,10 @@ import {
   type ResourceSortKey,
   type ResourceSparklinePoint,
 } from "../../src/client-protocol/host-resources.js";
+import { useBackAction } from "./back-navigation.js";
 import type { HubConnection } from "./connection.js";
 import { CreationDialog } from "./CreationDialog.js";
+import { useDialogDrag } from "./dialog-drag.js";
 import { t, useLocale } from "./i18n.js";
 import "./resources.css";
 
@@ -113,7 +115,6 @@ function ResourceTreeBody({
   loading,
   error,
   sort,
-  readOnly,
   stoppingKey,
   onRequestStop,
 }: {
@@ -121,7 +122,6 @@ function ResourceTreeBody({
   loading: boolean;
   error: string;
   sort: ResourceSortKey;
-  readOnly: boolean;
   stoppingKey?: string;
   onRequestStop?: (target: PendingStop) => void;
 }) {
@@ -135,7 +135,8 @@ function ResourceTreeBody({
     return <p className="resources-empty muted" role="status">{loading ? t("正在采样进程资源…") : t("暂无资源数据")}</p>;
   }
 
-  const canStop = !readOnly && snapshot.canStop;
+  const readOnly = !snapshot.canStop;
+  const canStop = snapshot.canStop;
   const toggleBot = (botId: string) => setCollapsed((old) => ({ ...old, [botId]: !old[botId] }));
 
   return (
@@ -156,25 +157,25 @@ function ResourceTreeBody({
         <div className="resources-sparkline-row">
           <div className="resources-sparkline-box">
             <span>{t("内存趋势")}</span>
-            <ResourceSparkline points={snapshot.history} metric="memory" width={104} height={24} />
+            <ResourceSparkline points={snapshot.history} metric="memory" width={144} height={28} />
           </div>
           <div className="resources-sparkline-box">
             <span>{t("CPU 趋势")}</span>
-            <ResourceSparkline points={snapshot.history} metric="cpu" width={104} height={24} />
+            <ResourceSparkline points={snapshot.history} metric="cpu" width={144} height={28} />
           </div>
         </div>
         <div className="resources-breakdown">
-          <div>
+          <div className="resources-breakdown-card">
             <small>{t("主机服务")}</small>
             <span>{formatCpuPercent(snapshot.summary.hostCpuPercent)} · {formatMemoryBytes(snapshot.summary.hostMemoryBytes)}</span>
           </div>
           {snapshot.summary.appMemoryBytes > 0 && (
-            <div>
+            <div className="resources-breakdown-card">
               <small>{t("桌面应用")}</small>
               <span>{formatCpuPercent(snapshot.summary.appCpuPercent)} · {formatMemoryBytes(snapshot.summary.appMemoryBytes)}</span>
             </div>
           )}
-          <div>
+          <div className="resources-breakdown-card">
             <small>{t("引擎与 Bot")}</small>
             <span>{formatCpuPercent(snapshot.summary.engineCpuPercent)} · {formatMemoryBytes(snapshot.summary.engineMemoryBytes)}</span>
           </div>
@@ -328,7 +329,7 @@ function ResourceTreeBody({
           <header className="resources-section-head">
             <h3>{t("未归属进程")}</h3>
           </header>
-          <ul className="resources-proc-list">
+          <ul className="resources-proc-list resources-unattributed-list">
             {snapshot.unattributed.map((proc) => (
               <li key={proc.id} className="resources-proc-row">
                 <span className="resources-proc-name">{proc.name}</span>
@@ -346,7 +347,217 @@ function ResourceTreeBody({
   );
 }
 
-/** Desktop bottom-right status bar entry + Resource Manager popover. */
+/** Centered desktop Resource Manager modal dialog. */
+function ResourcesDialog({
+  id,
+  hosts,
+  targetHost,
+  onSelectHost,
+  snapshot,
+  loading,
+  error,
+  sort,
+  onSortChange,
+  stopNotice,
+  stoppingKey,
+  pendingStop,
+  onRequestStop,
+  onConfirmStop,
+  onCancelStop,
+  onRefresh,
+  onClose,
+  returnFocus,
+}: {
+  id: string;
+  hosts: readonly ResourceHostEntry[];
+  targetHost: ResourceHostEntry;
+  onSelectHost: (hostId: string) => void;
+  snapshot?: HostResourcesSnapshot;
+  loading: boolean;
+  error: string;
+  sort: ResourceSortKey;
+  onSortChange: (sort: ResourceSortKey) => void;
+  stopNotice: string;
+  stoppingKey?: string;
+  pendingStop?: PendingStop;
+  onRequestStop: (target: PendingStop) => void;
+  onConfirmStop: () => void;
+  onCancelStop: () => void;
+  onRefresh: () => void;
+  onClose: () => void;
+  returnFocus: RefObject<HTMLButtonElement | null>;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const headerRef = useRef<HTMLElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const backdropPress = useRef(false);
+  const intentionalClose = useRef(false);
+  const titleId = useId();
+  const busy = !!pendingStop || !!stoppingKey;
+
+  const requestClose = useCallback(() => {
+    if (busy) return;
+    onClose();
+  }, [busy, onClose]);
+
+  useBackAction(dialogRef, requestClose);
+  useDialogDrag(dialogRef, headerRef, true);
+
+  useLayoutEffect(() => {
+    const before = document.activeElement as HTMLElement | null;
+    const node = dialogRef.current;
+    intentionalClose.current = false;
+    node?.showModal();
+    if (document.activeElement === closeButtonRef.current || !node?.contains(document.activeElement)) {
+      headingRef.current?.focus({ preventScroll: true });
+    }
+    return () => {
+      intentionalClose.current = true;
+      node?.close();
+      (returnFocus.current ?? before)?.focus({ preventScroll: true });
+    };
+  }, [returnFocus]);
+
+  return (
+    <>
+      <dialog
+        ref={dialogRef}
+        id={id}
+        className="resources-dialog is-movable"
+        aria-labelledby={titleId}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" && (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+        }}
+        onCancel={(event) => {
+          if (event.target !== event.currentTarget) return;
+          event.preventDefault();
+          event.stopPropagation();
+          requestClose();
+        }}
+        onClose={(event) => {
+          if (event.target !== event.currentTarget || intentionalClose.current || event.currentTarget.open) return;
+          if (busy) {
+            event.currentTarget.showModal();
+          } else {
+            onClose();
+          }
+        }}
+        onPointerDown={(event) => {
+          const r = event.currentTarget.getBoundingClientRect();
+          backdropPress.current = event.button === 0 && event.target === event.currentTarget
+            && (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom);
+        }}
+        onClick={(event) => {
+          const startedOutside = backdropPress.current;
+          backdropPress.current = false;
+          if (startedOutside && event.target === event.currentTarget && !busy) {
+            const r = event.currentTarget.getBoundingClientRect();
+            if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) {
+              onClose();
+            }
+          }
+        }}
+      >
+        <header ref={headerRef} className="resources-dialog-header">
+          <div className="resources-dialog-title">
+            <Activity size={17} aria-hidden="true" />
+            <h2 id={titleId} ref={headingRef} tabIndex={-1}>{t("资源管理")}</h2>
+          </div>
+          <div className="resources-dialog-actions">
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={t("刷新资源")}
+              title={t("刷新资源")}
+              disabled={loading}
+              onClick={onRefresh}
+            >
+              <RefreshCw size={15} className={loading ? "spin" : undefined} />
+            </button>
+            <button
+              ref={closeButtonRef}
+              type="button"
+              className="icon-button"
+              aria-label={t("关闭资源面板")}
+              onClick={requestClose}
+            >
+              <X size={18} />
+            </button>
+          </div>
+        </header>
+
+        <div className="resources-toolbar">
+          {hosts.length > 1 ? (
+            <label className="resources-select-wrap">
+              <Monitor size={14} aria-hidden="true" />
+              <select
+                aria-label={t("切换主机")}
+                value={targetHost.id}
+                onChange={(e) => onSelectHost(e.target.value)}
+              >
+                {hosts.map((host) => (
+                  <option key={host.id} value={host.id}>{host.name}</option>
+                ))}
+              </select>
+            </label>
+          ) : (
+            <span className="resources-host-label"><Monitor size={14} aria-hidden="true" />{targetHost.name}</span>
+          )}
+          <label className="resources-select-wrap">
+            <span className="screen-reader-only">{t("排序方式")}</span>
+            <select aria-label={t("排序方式")} value={sort} onChange={(e) => onSortChange(e.target.value as ResourceSortKey)}>
+              <option value="memory">{t("按内存排序")}</option>
+              <option value="cpu">{t("按 CPU 排序")}</option>
+              <option value="name">{t("按名称排序")}</option>
+            </select>
+          </label>
+        </div>
+
+        {stopNotice && <p className="resources-notice" role="status">{stopNotice}</p>}
+
+        <ResourceTreeBody
+          snapshot={snapshot}
+          loading={loading}
+          error={error}
+          sort={sort}
+          stoppingKey={stoppingKey}
+          onRequestStop={onRequestStop}
+        />
+      </dialog>
+
+      {pendingStop && (
+        <CreationDialog
+          title={t("确认停止进程？")}
+          closeLabel={t("取消")}
+          close={onCancelStop}
+          busy={!!stoppingKey}
+          showHost={false}
+        >
+          <p>
+            {pendingStop.conversationTitle
+              ? t("将停止「{0}」在对话「{1}」中的当前运行，效果与在聊天中点击停止相同，对话中会显示已停止。", pendingStop.botName, pendingStop.conversationTitle)
+              : t("将停止「{0}」的引擎进程（PID {1}）。", pendingStop.botName, pendingStop.pid ?? 0)}
+          </p>
+          {pendingStop.pid && (
+            <p className="muted">{t("目标进程：{0} (PID {1})", pendingStop.processName ?? "engine", pendingStop.pid)}</p>
+          )}
+          <div className="quick-actions">
+            <button type="button" disabled={!!stoppingKey} onClick={onCancelStop}>{t("取消")}</button>
+            <button type="button" className="text-danger" disabled={!!stoppingKey} onClick={onConfirmStop}>
+              {stoppingKey ? t("正在停止…") : t("确认停止")}
+            </button>
+          </div>
+        </CreationDialog>
+      )}
+    </>
+  );
+}
+
+/** Desktop bottom-right status bar entry + centered Resource Manager modal dialog. */
 export function DesktopResourcesBar({
   hosts,
   activeHostId,
@@ -363,32 +574,22 @@ export function DesktopResourcesBar({
   const [pendingStop, setPendingStop] = useState<PendingStop>();
   const [stoppingKey, setStoppingKey] = useState<string>();
   const [stopNotice, setStopNotice] = useState("");
-  const popoverId = useId();
-  const rootRef = useRef<HTMLDivElement>(null);
+  const dialogId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!open) setSelectedHostId(activeHostId);
   }, [activeHostId, open]);
 
+  useEffect(() => {
+    if (!visible && open) {
+      setPendingStop(undefined);
+      setOpen(false);
+    }
+  }, [visible, open]);
+
   const targetHost = hosts.find((h) => h.id === selectedHostId) ?? hosts.find((h) => h.id === activeHostId) ?? hosts[0];
   const { snapshot, loading, error, refresh } = useHostResources(targetHost?.connection, visible, open ? POLL_OPEN_MS : POLL_CLOSED_MS);
-
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (event: MouseEvent) => {
-      if (pendingStop) return;
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !pendingStop) setOpen(false);
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open, pendingStop]);
 
   if (!targetHost || !targetHost.connection.state.hostResourcesAvailable) return null;
 
@@ -417,14 +618,16 @@ export function DesktopResourcesBar({
   };
 
   return (
-    <div ref={rootRef} className="resources-statusbar-anchor">
+    <div className="resources-statusbar">
       <button
+        ref={triggerRef}
         type="button"
         className={`resources-status-pill${open ? " is-open" : ""}`}
+        aria-haspopup="dialog"
         aria-expanded={open}
-        aria-controls={open ? popoverId : undefined}
+        aria-controls={open ? dialogId : undefined}
         aria-label={t("资源")}
-        onClick={() => { setStopNotice(""); setOpen((v) => !v); }}
+        onClick={() => { setStopNotice(""); setOpen(true); }}
       >
         <Cpu size={13} aria-hidden="true" />
         <span className="resources-status-label">{t("资源")}</span>
@@ -441,141 +644,27 @@ export function DesktopResourcesBar({
       </button>
 
       {open && (
-        <section id={popoverId} className="resources-popover" role="dialog" aria-label={t("资源管理")}>
-          <header className="resources-popover-header">
-            <div className="resources-popover-title">
-              <Activity size={16} aria-hidden="true" />
-              <strong>{t("资源管理")}</strong>
-            </div>
-            <div className="resources-popover-actions">
-              <button
-                type="button"
-                className="icon-button"
-                aria-label={t("刷新资源")}
-                title={t("刷新资源")}
-                disabled={loading}
-                onClick={refresh}
-              >
-                <RefreshCw size={14} className={loading ? "spin" : undefined} />
-              </button>
-              <button type="button" className="icon-button" aria-label={t("关闭资源面板")} onClick={() => setOpen(false)}>
-                <X size={15} />
-              </button>
-            </div>
-          </header>
-
-          <div className="resources-toolbar">
-            {hosts.length > 1 ? (
-              <label className="resources-select-wrap">
-                <Monitor size={13} aria-hidden="true" />
-                <select
-                  aria-label={t("切换主机")}
-                  value={targetHost.id}
-                  onChange={(e) => { setStopNotice(""); setSelectedHostId(e.target.value); }}
-                >
-                  {hosts.map((host) => (
-                    <option key={host.id} value={host.id}>{host.name}</option>
-                  ))}
-                </select>
-              </label>
-            ) : (
-              <span className="resources-host-label"><Monitor size={13} aria-hidden="true" />{targetHost.name}</span>
-            )}
-            <label className="resources-select-wrap">
-              <span className="screen-reader-only">{t("排序方式")}</span>
-              <select aria-label={t("排序方式")} value={sort} onChange={(e) => setSort(e.target.value as ResourceSortKey)}>
-                <option value="memory">{t("按内存排序")}</option>
-                <option value="cpu">{t("按 CPU 排序")}</option>
-                <option value="name">{t("按名称排序")}</option>
-              </select>
-            </label>
-          </div>
-
-          {stopNotice && <p className="resources-notice" role="status">{stopNotice}</p>}
-
-          <ResourceTreeBody
-            snapshot={snapshot}
-            loading={loading}
-            error={error}
-            sort={sort}
-            readOnly={false}
-            stoppingKey={stoppingKey}
-            onRequestStop={setPendingStop}
-          />
-        </section>
-      )}
-
-      {pendingStop && (
-        <CreationDialog
-          title={t("确认停止进程？")}
-          closeLabel={t("取消")}
-          close={() => { if (!stoppingKey) setPendingStop(undefined); }}
-          busy={!!stoppingKey}
-          showHost={false}
-        >
-          <p>
-            {pendingStop.conversationTitle
-              ? t("将停止「{0}」在对话「{1}」中的当前运行，效果与在聊天中点击停止相同，对话中会显示已停止。", pendingStop.botName, pendingStop.conversationTitle)
-              : t("将停止「{0}」的引擎进程（PID {1}）。", pendingStop.botName, pendingStop.pid ?? 0)}
-          </p>
-          {pendingStop.pid && (
-            <p className="muted">{t("目标进程：{0} (PID {1})", pendingStop.processName ?? "engine", pendingStop.pid)}</p>
-          )}
-          <div className="quick-actions">
-            <button type="button" disabled={!!stoppingKey} onClick={() => setPendingStop(undefined)}>{t("取消")}</button>
-            <button type="button" className="text-danger" disabled={!!stoppingKey} onClick={() => void confirmStop()}>
-              {stoppingKey ? t("正在停止…") : t("确认停止")}
-            </button>
-          </div>
-        </CreationDialog>
+        <ResourcesDialog
+          id={dialogId}
+          hosts={hosts}
+          targetHost={targetHost}
+          onSelectHost={(hostId) => { setStopNotice(""); setSelectedHostId(hostId); }}
+          snapshot={snapshot}
+          loading={loading}
+          error={error}
+          sort={sort}
+          onSortChange={setSort}
+          stopNotice={stopNotice}
+          stoppingKey={stoppingKey}
+          pendingStop={pendingStop}
+          onRequestStop={setPendingStop}
+          onConfirmStop={() => void confirmStop()}
+          onCancelStop={() => { if (!stoppingKey) setPendingStop(undefined); }}
+          onRefresh={refresh}
+          onClose={() => setOpen(false)}
+          returnFocus={triggerRef}
+        />
       )}
     </div>
-  );
-}
-
-/** Read-only mobile resource list on the Host's page. */
-export function MobileResourcesDialog({
-  connection,
-  hostName,
-  close,
-}: {
-  connection: HubConnection;
-  hostName: string;
-  close: () => void;
-}) {
-  useLocale();
-  const [sort, setSort] = useState<ResourceSortKey>("memory");
-  const { snapshot, loading, error, refresh } = useHostResources(connection, true, POLL_OPEN_MS);
-
-  return (
-    <CreationDialog
-      mobilePage
-      title={t("资源监控")}
-      closeLabel={t("返回")}
-      close={close}
-      className="resources-mobile-dialog"
-    >
-      <div className="resources-toolbar">
-        <span className="resources-host-label"><Monitor size={14} aria-hidden="true" />{hostName}</span>
-        <div className="resources-mobile-controls">
-          <select aria-label={t("排序方式")} value={sort} onChange={(e) => setSort(e.target.value as ResourceSortKey)}>
-            <option value="memory">{t("按内存排序")}</option>
-            <option value="cpu">{t("按 CPU 排序")}</option>
-            <option value="name">{t("按名称排序")}</option>
-          </select>
-          <button type="button" className="icon-button" aria-label={t("刷新资源")} disabled={loading} onClick={refresh}>
-            <RefreshCw size={15} className={loading ? "spin" : undefined} />
-          </button>
-        </div>
-      </div>
-      <p className="muted resources-mobile-note">{t("手机端仅支持查看资源占用；如需停止异常引擎进程，请在电脑端操作。")}</p>
-      <ResourceTreeBody
-        snapshot={snapshot}
-        loading={loading}
-        error={error}
-        sort={sort}
-        readOnly={true}
-      />
-    </CreationDialog>
   );
 }
