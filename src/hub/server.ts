@@ -137,10 +137,10 @@ import { ShutdownErrors } from "./shutdown.js";
 
 const SNAPSHOT_WINDOW_MESSAGES = 32, SNAPSHOT_WINDOW_BYTES = 1024 * 1024;
 const BOT_RPC_TIMEOUT_MS = 10_000;
-/** Model/effort reads and saves may run an explicit DeepSeek catalog refresh (its own 12 s startup
- * budget, including the bounded wait for a previous reader). The RPC outlives it, so a slow but
- * successful refresh is not reported as an unconfirmed save. */
-export const BOT_MODEL_SETTINGS_RPC_TIMEOUT_MS = 15_000;
+/** Model/effort reads and saves may run an explicit DeepSeek catalog refresh (12 s budget)
+ * or Antigravity `agy models` discovery (15 s budget). The RPC outlives both, so a slow
+ * but successful catalog read is not reported as an unconfirmed save. */
+export const BOT_MODEL_SETTINGS_RPC_TIMEOUT_MS = 18_000;
 type SnapshotTransfer = { id: string; sent: number; received: number; bytes: number; pending: { count: number; bytes: number }[]; changed?: () => void };
 type Client = { foreground: boolean; ws: WebSocket; session?: AuthSession; rejected?: "device_revoked" | "session_expired"; capabilities: string[]; cursors: Record<string, number>; syncLineages: Record<string, string>; conversationIds: Set<string>; readySent: boolean; pendingPublications: unknown[]; syncing: boolean; pendingSync: Set<string>; syncingConversations: Set<string>; syncFailures: Set<string>; streams: Map<string, Message>; snapshot?: SnapshotTransfer };
 /** Older gateways parse turn metadata strictly and predate design.open: give
