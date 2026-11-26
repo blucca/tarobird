@@ -19,6 +19,7 @@ export const workspaceRequiredPathSchema = workspaceFilePathSchema.refine((value
 export const workspaceTreeQuerySchema = z.object({
   botId: idSchema,
   path: workspaceFilePathSchema.default(""),
+  changes: z.enum(["0", "1"]).optional(),
 }).strict();
 
 export const workspacePreviewQuerySchema = z.object({

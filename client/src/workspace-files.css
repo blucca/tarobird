@@ -1,5 +1,6 @@
 .workspace-files-panel{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg);color:var(--text)}
-.workspace-files-phone{position:fixed;inset:var(--shell-top,0px) 0 0 0;z-index:30;height:var(--shell-height,100dvh);padding-top:var(--app-safe-top,0px);padding-bottom:var(--app-safe-bottom,0px)}
+.workspace-files-panel[hidden]{display:none!important}
+.workspace-files-phone{position:fixed;inset:var(--shell-top,0px) 0 0 0;z-index:30;height:var(--shell-height,100dvh);box-sizing:border-box;padding-top:var(--app-safe-top,0px);padding-bottom:var(--app-safe-bottom,0px);padding-left:var(--app-safe-left,0px);padding-right:var(--app-safe-right,0px)}
 .wf-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px 10px 14px;border-bottom:1px solid var(--border);flex:none}
 .wf-header-title{display:flex;align-items:center;gap:7px;min-width:0}
 .wf-header-title>svg{color:var(--accent,var(--blue));flex:none}
@@ -25,6 +26,9 @@
 .wf-row:hover{background:var(--hover)}
 .wf-row.is-selected{background:color-mix(in srgb,var(--accent,var(--blue)) 11%,transparent)}
 .wf-row.is-heavy .wf-name,.wf-row.is-heavy .wf-icon{opacity:.58}
+.wf-row.is-deleted .wf-name{opacity:.62;text-decoration:line-through}
+.wf-row.is-deleted .wf-icon{opacity:.55}
+.wf-row.is-deleted .wf-row-main{cursor:default}
 .wf-row-main{flex:1;min-width:0;display:flex;align-items:center;gap:6px;border:0;background:transparent;padding:4px 2px;color:inherit;text-align:left;cursor:pointer;font-size:13px;line-height:1.4}
 .wf-caret{width:14px;height:14px;display:inline-flex;align-items:center;justify-content:center;flex:none;color:var(--muted);transition:transform .14s ease}
 .wf-caret.is-open{transform:rotate(90deg)}
@@ -64,6 +68,7 @@
 .wf-error-code{margin-top:2px;font-family:var(--font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:10.5px;color:var(--muted)}
 .wf-state-hint{margin-top:2px;font-size:11px;color:var(--muted)}
 .wf-empty-sub{padding-block:4px;font-size:11.5px;color:var(--muted)}
+.wf-truncated-dir{padding:6px 12px 6px 0;font-size:11.5px;color:var(--muted)}
 .wf-preview{display:flex;flex-direction:column;height:100%;min-height:0}
 .wf-preview-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);flex:none}
 .wf-back-btn,.wf-mini-btn{display:inline-flex;align-items:center;gap:5px;min-height:30px;padding:4px 9px;border:1px solid var(--border);border-radius:7px;background:transparent;color:var(--text);font-size:12px;cursor:pointer}

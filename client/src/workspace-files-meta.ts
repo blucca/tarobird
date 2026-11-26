@@ -65,6 +65,17 @@ export function entryToneClass(kind: WorkspaceEntryVisualKind): string {
   }
 }
 
+/** Format a workspace relative path as an inline-code mention so group-chat Bot
+ * recipient parsing never treats filenames, folders, or spaces as unknown Bots. */
+export function formatWorkspaceFileMention(relativePath: string): string {
+  const raw = `@${relativePath}`;
+  if (!raw.includes("`")) return `\`${raw}\``;
+  const runs = raw.match(/`+/g) ?? [];
+  const fence = "`".repeat(Math.max(...runs.map((run) => run.length)) + 1);
+  const pad = raw.startsWith("`") || raw.endsWith("`") ? " " : "";
+  return `${fence}${pad}${raw}${pad}${fence}`;
+}
+
 /** Extract a compact, path-free error hint code for secondary display under friendly messages. */
 export function formatSafeWorkspaceErrorHint(error: unknown, fallbackCode: string): string {
   const status = (error as { status?: unknown })?.status;

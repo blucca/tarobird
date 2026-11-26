@@ -5727,6 +5727,8 @@
   "清空筛选": "Clear filter",
   "空文件夹": "Empty folder",
   "仅在本地只读查看，不会自动发送给其他人。": "Read-only local view — not shared with anyone.",
-  "仅支持预览 10 MB 以内的常见文本、图片或 PDF 文件。": "Only text, image, or PDF files up to 10 MB can be previewed.",
-  "你可以先把它引用给 Bot，由 Bot 在工作区里读取或处理。": "You can mention it to the Bot to inspect or handle it in the workspace."
+  "仅支持直接预览 4 MB 以内的图片和 10 MB 以内的 PDF 文件。": "Direct preview supports images up to 4 MB and PDF files up to 10 MB.",
+  "你可以先把它引用给 Bot，由 Bot 在工作区里读取或处理。": "You can mention it to the Bot to inspect or handle it in the workspace.",
+  "文件已删除，无法预览": "Deleted file — preview unavailable",
+  "目录项较多，仅展示前 {0} 项": "Showing the first {0} items in this folder"
 }

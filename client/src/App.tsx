@@ -568,31 +568,31 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     try { localStorage.setItem("tarobird.workspaceRailOpen", next ? "1" : "0"); } catch { /* ignore */ }
   }, []);
   const workspaceEligible = !pane && !phone && !!current && visible && searchResults === undefined;
-  const workspaceVisible = workspaceEligible && workspaceOpen && !details && !sideVisible && !workbenchVisible && !screenVisible;
+  const workspaceVisible = workspaceEligible && workspaceOpen && !details && !sideVisible && !workbenchVisible && !filesVisible && !screenVisible;
   const workspaceComms = useConversationBotComms(connection, selected, workspaceEligible, workspaceVisible, messagesReady ? lastBotReply : "");
   const workspaceNeedsApproval = workspaceComms.data?.summary.needsApproval ?? 0;
   const workspaceActiveComms = workspaceComms.data?.summary.active ?? 0;
   // What the rail was put in front of, per conversation, so closing the rail shows that panel again.
-  const workspaceCovers = useRef(new Map<string, "side" | "workbench" | "screen">());
+  const workspaceCovers = useRef(new Map<string, "side" | "workbench" | "files" | "screen">());
   const closeWorkspace = useCallback(() => {
     setDesktopWorkspaceOpen(false);
     // Whatever the rail was in front of shows again.
     const covered = workspaceCovers.current.get(rightModeScope); workspaceCovers.current.delete(rightModeScope);
-    if (rightMode === "workspace") setRightMode(covered === "screen" && !screenOpened ? "side" : covered ?? "side");
-  }, [rightMode, rightModeScope, screenOpened, setRightMode, setDesktopWorkspaceOpen]);
+    if (rightMode === "workspace") setRightMode(covered === "screen" && !screenOpened || covered === "files" && !filesEligible ? "side" : covered ?? "side");
+  }, [rightMode, rightModeScope, screenOpened, filesEligible, setRightMode, setDesktopWorkspaceOpen]);
   const toggleWorkspace = useCallback(() => {
     if (workspaceVisible) { closeWorkspace(); return; }
     if (details) setDetails(false);
     // Another panel is showing: the rail goes in front of it and closes nothing. A side conversation keeps its
     // session, draft and attachments, and the remote screen stays connected.
     if (workbenchVisible) designOpener.revoke();
-    if (workbenchVisible || sideVisible || screenVisible) {
-      workspaceCovers.current.set(rightModeScope, workbenchVisible ? "workbench" : screenVisible ? "screen" : "side");
+    if (workbenchVisible || filesVisible || sideVisible || screenVisible) {
+      workspaceCovers.current.set(rightModeScope, workbenchVisible ? "workbench" : filesVisible ? "files" : screenVisible ? "screen" : "side");
       setRightMode("workspace");
     }
     workspaceTakesFocus.current = true;
     setDesktopWorkspaceOpen(true);
-  }, [workspaceVisible, workbenchVisible, sideVisible, screenVisible, details, designOpener, rightModeScope, setRightMode, closeWorkspace, setDesktopWorkspaceOpen]);
+  }, [workspaceVisible, workbenchVisible, filesVisible, sideVisible, screenVisible, details, designOpener, rightModeScope, setRightMode, closeWorkspace, setDesktopWorkspaceOpen]);
   const toggleSide = useCallback(() => {
     if (sideVisible) { void side.close(); sideTrigger.current?.focus(); }
     else { setRightMode("side"); setDetails(false); closeSearch(); void side.open(); }
@@ -1227,7 +1227,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const recording = voice.busy;
   const backRoot = useRef<HTMLDivElement>(null);
   // ADHD expands only its owning card, never the shared native window.
-  const sideWindowLayout = useSideWindowExpansion(backRoot, !pane && (sideVisible || screenVisible || workbenchVisible && !phone));
+  const sideWindowLayout = useSideWindowExpansion(backRoot, !pane && (sideVisible || screenVisible || (workbenchVisible || filesVisible) && !phone));
   // Native expansion can finish before IndexedDB or the lazy Workbench chunk.
   // Reserve the same column in both stages; late loading after Close stays hidden.
   const workbenchLoading = workbenchVisible ? <aside className={`workbench-loading ${!phone && !pane ? "conversation-side-panel" : ""}`} hidden={!phone && sideWindowLayout === "pending"} aria-label={t("工作台")}>

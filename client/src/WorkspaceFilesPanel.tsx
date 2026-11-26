@@ -21,8 +21,10 @@ import {
   X,
 } from "lucide-react";
 import {
+  WORKSPACE_FILES_MAX_ENTRIES,
   workspacePreviewResponseSchema,
   workspaceTreeResponseSchema,
+  type WorkspaceChangeBadge,
   type WorkspaceFileEntry,
   type WorkspacePreviewResponse,
   type WorkspaceTreeResponse,
@@ -32,12 +34,14 @@ import { MarkdownText } from "./MarkdownText.js";
 import { CodeBlock } from "./CodeBlock.js";
 import { t, useLocale } from "./i18n.js";
 import { formatFileLimit } from "./files.js";
+import { useBackAction } from "./back-navigation.js";
 import {
   changeBadgeLabel,
   changeBadgeTitle,
   classifyWorkspaceEntry,
   entryToneClass,
   formatSafeWorkspaceErrorHint,
+  formatWorkspaceFileMention,
 } from "./workspace-files-meta.js";
 import "./workspace-files.css";
 
@@ -45,11 +49,46 @@ const PdfPreview = lazy(() => import("./PdfPreview.js"));
 
 export const WORKSPACE_FILE_DRAG_MIME = "application/x-tarobird-workspace-file";
 
-export function formatWorkspaceFileMention(relativePath: string): string {
-  return /\s/.test(relativePath) ? `@"${relativePath}"` : `@${relativePath}`;
+export { changeBadgeLabel, classifyWorkspaceEntry, formatWorkspaceFileMention } from "./workspace-files-meta.js";
+
+function combineSignals(a?: AbortSignal, b?: AbortSignal): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const sources = [a, b].filter((item): item is AbortSignal => Boolean(item));
+  const onAbort = (source: AbortSignal) => {
+    if (!controller.signal.aborted) {
+      controller.abort(source.reason ?? new DOMException("Aborted", "AbortError"));
+    }
+  };
+  const listeners: Array<{ source: AbortSignal; handler: () => void }> = [];
+  for (const source of sources) {
+    if (source.aborted) {
+      onAbort(source);
+      return { signal: controller.signal, dispose: () => undefined };
+    }
+    const handler = () => onAbort(source);
+    source.addEventListener("abort", handler, { once: true });
+    listeners.push({ source, handler });
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const { source, handler } of listeners) {
+        source.removeEventListener("abort", handler);
+      }
+    },
+  };
 }
 
-export { changeBadgeLabel, classifyWorkspaceEntry } from "./workspace-files-meta.js";
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  return Boolean(signal?.aborted) || (error as { name?: string } | undefined)?.name === "AbortError";
+}
+
+function compareEntriesDisplay(a: WorkspaceFileEntry, b: WorkspaceFileEntry): number {
+  const aDir = a.kind === "dir" ? 0 : 1;
+  const bDir = b.kind === "dir" ? 0 : 1;
+  if (aDir !== bDir) return aDir - bDir;
+  return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+}
 
 function entryIcon(entry: WorkspaceFileEntry, open: boolean) {
   const kind = classifyWorkspaceEntry(entry);
@@ -160,8 +199,10 @@ export function WorkspaceFilesPanel({
   onClose: () => void;
 }) {
   useLocale();
+  const panelRef = useRef<HTMLElement>(null);
   const [workspaceName, setWorkspaceName] = useState("workspace");
   const [nodes, setNodes] = useState<ReadonlyMap<string, WorkspaceFileEntry[]>>(() => new Map());
+  const [truncatedDirs, setTruncatedDirs] = useState<ReadonlySet<string>>(() => new Set());
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set([""]));
   const [loadingDirs, setLoadingDirs] = useState<ReadonlySet<string>>(() => new Set());
   const [changedFiles, setChangedFiles] = useState<WorkspaceTreeResponse["changedFiles"]>([]);
@@ -178,50 +219,164 @@ export function WorkspaceFilesPanel({
   const [previewErrorHint, setPreviewErrorHint] = useState("");
   const [rawMarkdown, setRawMarkdown] = useState(false);
 
-  const expandedRef = useRef(expanded);
-  expandedRef.current = expanded;
-  const selectedRef = useRef(selectedPath);
-  selectedRef.current = selectedPath;
+  const scopeGenRef = useRef(0);
+  const scopeAbortRef = useRef<AbortController | null>(null);
+  const manualRefreshAbortRef = useRef<AbortController | null>(null);
+  const previewAbortRef = useRef<AbortController | null>(null);
+  const previewSeqRef = useRef(0);
+  const activeRefreshCountRef = useRef(0);
+
+  const expandedRef = useRef<ReadonlySet<string>>(expanded);
+  const nodesRef = useRef<ReadonlyMap<string, WorkspaceFileEntry[]>>(nodes);
+  nodesRef.current = nodes;
+  const selectedRef = useRef<string | undefined>(selectedPath);
+  const virtualDirsRef = useRef<Set<string>>(new Set());
   const fingerprints = useRef(new Map<string, string>());
 
-  const fetchDir = useCallback(async (dirPath: string, signal?: AbortSignal) => {
+  const updateExpanded = useCallback((updater: (prev: ReadonlySet<string>) => ReadonlySet<string>) => {
+    const next = updater(expandedRef.current);
+    expandedRef.current = next;
+    setExpanded(next);
+  }, []);
+
+  const pruneDeletedDir = useCallback((dirPath: string) => {
+    const prefix = `${dirPath}/`;
+    const isUnder = (candidate: string) => candidate === dirPath || candidate.startsWith(prefix);
+    updateExpanded((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const item of prev) {
+        if (isUnder(item)) changed = true;
+        else next.add(item);
+      }
+      return changed ? next : prev;
+    });
+    for (const key of [...fingerprints.current.keys()]) {
+      if (isUnder(key)) fingerprints.current.delete(key);
+    }
+    for (const key of [...virtualDirsRef.current]) {
+      if (isUnder(key)) virtualDirsRef.current.delete(key);
+    }
+    setNodes((prev) => {
+      let changed = false;
+      const next = new Map<string, WorkspaceFileEntry[]>();
+      for (const [key, value] of prev) {
+        if (isUnder(key)) changed = true;
+        else next.set(key, value);
+      }
+      if (changed) nodesRef.current = next;
+      return changed ? next : prev;
+    });
+    setTruncatedDirs((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const item of prev) {
+        if (isUnder(item)) changed = true;
+        else next.add(item);
+      }
+      return changed ? next : prev;
+    });
+  }, [updateExpanded]);
+
+  const closePreview = useCallback(() => {
+    previewAbortRef.current?.abort();
+    previewAbortRef.current = null;
+    previewSeqRef.current += 1;
+    selectedRef.current = undefined;
+    setSelectedPath(undefined);
+    setPreview(undefined);
+    setPreviewLoading(false);
+    setPreviewError("");
+    setPreviewErrorHint("");
+    setRawMarkdown(false);
+  }, []);
+
+  const fetchDir = useCallback(async (dirPath: string, callerSignal?: AbortSignal) => {
+    const gen = scopeGenRef.current;
+    const { signal, dispose } = combineSignals(scopeAbortRef.current?.signal, callerSignal);
+    if (signal.aborted) {
+      dispose();
+      return undefined;
+    }
     setLoadingDirs((prev) => new Set(prev).add(dirPath));
     try {
-      const qs = new URLSearchParams({ botId, path: dirPath });
+      const qs = new URLSearchParams({
+        botId,
+        path: dirPath,
+        ...(dirPath !== "" ? { changes: "0" } : {}),
+      });
       const raw = await connection.http<unknown>(`/api/conversations/${conversationId}/workspace-files/tree?${qs}`, { signal });
+      if (scopeGenRef.current !== gen || signal.aborted) return undefined;
       const parsed = workspaceTreeResponseSchema.parse(raw);
-      fingerprints.current.set(dirPath, parsed.fingerprint);
+      if (scopeGenRef.current !== gen || signal.aborted) return undefined;
+      const unchangedFingerprint = fingerprints.current.get(dirPath) === parsed.fingerprint && nodesRef.current.has(dirPath);
       if (dirPath === "") {
-        setWorkspaceName(parsed.workspaceName);
-        setChangedFiles(parsed.changedFiles);
         setRootError("");
         setRootErrorHint("");
       }
-      setNodes((prev) => {
-        const next = new Map(prev);
-        next.set(dirPath, parsed.entries);
-        return next;
-      });
+      if (!unchangedFingerprint) {
+        fingerprints.current.set(dirPath, parsed.fingerprint);
+        for (const entry of parsed.entries) {
+          if (entry.kind === "dir" && entry.mtimeMs !== null) {
+            virtualDirsRef.current.delete(entry.path);
+          }
+        }
+        if (dirPath === "") {
+          setWorkspaceName(parsed.workspaceName);
+          setChangedFiles(parsed.changedFiles);
+        }
+        setNodes((prev) => {
+          const next = new Map(prev);
+          next.set(dirPath, parsed.entries);
+          nodesRef.current = next;
+          return next;
+        });
+        setTruncatedDirs((prev) => {
+          const has = prev.has(dirPath);
+          if (has === parsed.truncated) return prev;
+          const next = new Set(prev);
+          if (parsed.truncated) next.add(dirPath);
+          else next.delete(dirPath);
+          return next;
+        });
+      }
       return parsed;
     } catch (error) {
-      if ((error as { name?: string })?.name === "AbortError") return undefined;
+      if (scopeGenRef.current !== gen || isAbortError(error, signal)) return undefined;
+      const status = (error as { status?: unknown } | undefined)?.status;
+      if (dirPath !== "" && status === 404) {
+        pruneDeletedDir(dirPath);
+        return undefined;
+      }
       if (dirPath === "") {
         setRootError(t("暂时读不到工作区文件，可以点一下重试。"));
         setRootErrorHint(formatSafeWorkspaceErrorHint(error, "tree_unavailable"));
       }
       return undefined;
     } finally {
-      setLoadingDirs((prev) => {
-        if (!prev.has(dirPath)) return prev;
-        const next = new Set(prev);
-        next.delete(dirPath);
-        return next;
-      });
+      dispose();
+      if (scopeGenRef.current === gen) {
+        setLoadingDirs((prev) => {
+          if (!prev.has(dirPath)) return prev;
+          const next = new Set(prev);
+          next.delete(dirPath);
+          return next;
+        });
+      }
     }
-  }, [botId, connection, conversationId]);
+  }, [botId, connection, conversationId, pruneDeletedDir]);
 
-  const fetchPreview = useCallback(async (filePath: string, reveal = false, signal?: AbortSignal) => {
+  const fetchPreview = useCallback(async (filePath: string, reveal = false) => {
+    const gen = scopeGenRef.current;
+    previewAbortRef.current?.abort();
+    const controller = new AbortController();
+    previewAbortRef.current = controller;
+    const seq = ++previewSeqRef.current;
+    const { signal, dispose } = combineSignals(scopeAbortRef.current?.signal, controller.signal);
+
+    selectedRef.current = filePath;
     setSelectedPath(filePath);
+    setPreview(undefined);
     setPreviewLoading(true);
     setPreviewError("");
     setPreviewErrorHint("");
@@ -229,41 +384,102 @@ export function WorkspaceFilesPanel({
     try {
       const qs = new URLSearchParams({ botId, path: filePath, ...(reveal ? { reveal: "1" } : {}) });
       const raw = await connection.http<unknown>(`/api/conversations/${conversationId}/workspace-files/preview?${qs}`, { signal });
-      setPreview(workspacePreviewResponseSchema.parse(raw));
+      if (scopeGenRef.current !== gen || previewSeqRef.current !== seq || signal.aborted) return;
+      const parsed = workspacePreviewResponseSchema.parse(raw);
+      if (scopeGenRef.current !== gen || previewSeqRef.current !== seq || signal.aborted) return;
+      setPreview(parsed);
     } catch (error) {
-      if ((error as { name?: string })?.name === "AbortError") return;
+      if (scopeGenRef.current !== gen || previewSeqRef.current !== seq || isAbortError(error, signal)) return;
       setPreview(undefined);
       setPreviewError(t("暂时打不开这个文件预览，可以点一下重试。"));
       setPreviewErrorHint(formatSafeWorkspaceErrorHint(error, "preview_unavailable"));
     } finally {
-      setPreviewLoading(false);
+      dispose();
+      if (scopeGenRef.current === gen && previewSeqRef.current === seq) {
+        setPreviewLoading(false);
+        if (previewAbortRef.current === controller) {
+          previewAbortRef.current = null;
+        }
+      }
     }
   }, [botId, connection, conversationId]);
 
-  const refreshExpanded = useCallback(async (signal?: AbortSignal) => {
+  const refreshExpanded = useCallback(async (callerSignal?: AbortSignal) => {
+    const gen = scopeGenRef.current;
+    activeRefreshCountRef.current += 1;
     setRefreshing(true);
     try {
-      const dirs = ["", ...[...expandedRef.current].filter((dir) => dir !== "")];
-      await Promise.all(dirs.map((dir) => fetchDir(dir, signal)));
+      const dirs = ["", ...[...expandedRef.current].filter((dir) => dir !== "" && !virtualDirsRef.current.has(dir))];
+      await Promise.all(dirs.map((dir) => fetchDir(dir, callerSignal)));
     } finally {
-      setRefreshing(false);
+      if (scopeGenRef.current === gen) {
+        activeRefreshCountRef.current = Math.max(0, activeRefreshCountRef.current - 1);
+        if (activeRefreshCountRef.current === 0) setRefreshing(false);
+      }
     }
   }, [fetchDir]);
 
-  // Reset state when switching conversation or bot
+  const triggerManualRefresh = useCallback(() => {
+    manualRefreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    manualRefreshAbortRef.current = controller;
+    void refreshExpanded(controller.signal).finally(() => {
+      if (manualRefreshAbortRef.current === controller) {
+        manualRefreshAbortRef.current = null;
+      }
+    });
+  }, [refreshExpanded]);
+
+  // Reset state synchronously and cancel all in-flight requests when switching conversation, bot, or connection.
+  // Declared BEFORE the load effect so expandedRef is reset in the same commit before refreshExpanded reads it.
   useEffect(() => {
-    setNodes(new Map());
-    setExpanded(new Set([""]));
+    scopeGenRef.current += 1;
+    scopeAbortRef.current?.abort();
+    const scopeController = new AbortController();
+    scopeAbortRef.current = scopeController;
+    manualRefreshAbortRef.current?.abort();
+    manualRefreshAbortRef.current = null;
+    previewAbortRef.current?.abort();
+    previewAbortRef.current = null;
+    previewSeqRef.current += 1;
+    activeRefreshCountRef.current = 0;
+
+    const initialExpanded = new Set([""]);
+    const emptyNodes = new Map<string, WorkspaceFileEntry[]>();
+    expandedRef.current = initialExpanded;
+    nodesRef.current = emptyNodes;
+    selectedRef.current = undefined;
+    virtualDirsRef.current.clear();
+    fingerprints.current.clear();
+
+    setNodes(emptyNodes);
+    setTruncatedDirs(new Set());
+    setExpanded(initialExpanded);
+    setLoadingDirs(new Set());
+    setChangedFiles([]);
     setSelectedPath(undefined);
     setPreview(undefined);
+    setPreviewLoading(false);
     setPreviewError("");
     setPreviewErrorHint("");
     setRootError("");
     setRootErrorHint("");
+    setRefreshing(false);
     setFilter("");
     setChangedOnly(false);
-    fingerprints.current.clear();
-  }, [conversationId, botId]);
+    setRawMarkdown(false);
+
+    return () => {
+      scopeGenRef.current += 1;
+      scopeController.abort();
+      if (scopeAbortRef.current === scopeController) scopeAbortRef.current = null;
+      manualRefreshAbortRef.current?.abort();
+      manualRefreshAbortRef.current = null;
+      previewAbortRef.current?.abort();
+      previewAbortRef.current = null;
+      previewSeqRef.current += 1;
+    };
+  }, [conversationId, botId, connection]);
 
   // Initial load & refresh on new turns while visible
   useEffect(() => {
@@ -276,45 +492,153 @@ export function WorkspaceFilesPanel({
   // Periodic background auto-refresh while visible & foregrounded
   useEffect(() => {
     if (!visible) return;
+    let pollController: AbortController | null = null;
     const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") void refreshExpanded();
+      if (document.visibilityState !== "visible") return;
+      pollController?.abort();
+      const controller = new AbortController();
+      pollController = controller;
+      void refreshExpanded(controller.signal).finally(() => {
+        if (pollController === controller) pollController = null;
+      });
     }, 5000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      pollController?.abort();
+      pollController = null;
+    };
   }, [visible, refreshExpanded]);
 
+  // Android / mobile Back navigates Preview -> File tree -> Chat cleanly.
+  useBackAction(panelRef, () => {
+    if (!visible || !phone) return false;
+    if (selectedRef.current) {
+      closePreview();
+      return;
+    }
+    onClose();
+  });
+
+  const { changedMap, changedDirs } = useMemo(() => {
+    const map = new Map<string, WorkspaceChangeBadge>();
+    const dirs = new Set<string>();
+    for (const item of changedFiles) {
+      map.set(item.path, item.status);
+      const parts = item.path.split("/");
+      for (let i = 1; i < parts.length; i++) {
+        dirs.add(parts.slice(0, i).join("/"));
+      }
+    }
+    return { changedMap: map, changedDirs: dirs };
+  }, [changedFiles]);
+
+  const getEffectiveEntries = useCallback((dirPath: string): WorkspaceFileEntry[] | undefined => {
+    const diskList = nodes.get(dirPath);
+    const isVirtual = virtualDirsRef.current.has(dirPath);
+    if (!diskList && !isVirtual) return undefined;
+
+    const merged: WorkspaceFileEntry[] = [];
+    const seen = new Set<string>();
+
+    if (diskList) {
+      for (const entry of diskList) {
+        const liveChanged = changedMap.get(entry.path);
+        const liveHasChangedChildren = entry.kind === "dir" && changedDirs.has(entry.path);
+        // Drop previously synthesized virtual entries if Git no longer reports them.
+        if (entry.mtimeMs === null) {
+          if (entry.kind === "dir" && !liveHasChangedChildren) continue;
+          if (entry.kind !== "dir" && liveChanged !== "deleted") continue;
+        }
+        seen.add(entry.name);
+        const { changed: _oldChanged, hasChangedChildren: _oldHasChildren, ...base } = entry;
+        merged.push({
+          ...base,
+          ...(liveChanged ? { changed: liveChanged } : {}),
+          ...(liveHasChangedChildren ? { hasChangedChildren: true } : {}),
+        });
+      }
+    }
+
+    const prefix = dirPath ? `${dirPath}/` : "";
+    for (const item of changedFiles) {
+      if (item.status !== "deleted") continue;
+      if (prefix && !item.path.startsWith(prefix)) continue;
+      const tail = prefix ? item.path.slice(prefix.length) : item.path;
+      if (!tail) continue;
+      const slash = tail.indexOf("/");
+      if (slash < 0) {
+        if (seen.has(tail)) continue;
+        seen.add(tail);
+        merged.push({
+          name: tail,
+          path: item.path,
+          kind: "file",
+          size: null,
+          mtimeMs: null,
+          sensitive: false,
+          heavy: false,
+          changed: "deleted",
+        });
+      } else {
+        const dirName = tail.slice(0, slash);
+        const dirRel = dirPath ? `${dirPath}/${dirName}` : dirName;
+        if (seen.has(dirName)) continue;
+        seen.add(dirName);
+        merged.push({
+          name: dirName,
+          path: dirRel,
+          kind: "dir",
+          size: null,
+          mtimeMs: null,
+          sensitive: false,
+          heavy: false,
+          hasChangedChildren: true,
+        });
+      }
+    }
+
+    merged.sort(compareEntriesDisplay);
+    return merged;
+  }, [changedDirs, changedFiles, changedMap, nodes]);
+
   const toggleDir = (entry: WorkspaceFileEntry) => {
-    const isOpen = expanded.has(entry.path);
+    const isOpen = expandedRef.current.has(entry.path);
     if (isOpen) {
-      setExpanded((prev) => {
+      updateExpanded((prev) => {
         const next = new Set(prev);
         next.delete(entry.path);
         return next;
       });
     } else {
-      setExpanded((prev) => new Set(prev).add(entry.path));
-      if (!nodes.has(entry.path)) void fetchDir(entry.path);
+      updateExpanded((prev) => new Set(prev).add(entry.path));
+      if (entry.mtimeMs === null) {
+        virtualDirsRef.current.add(entry.path);
+      } else {
+        virtualDirsRef.current.delete(entry.path);
+        if (!nodesRef.current.has(entry.path)) void fetchDir(entry.path);
+      }
     }
   };
 
   const openPathFromBreadcrumb = (targetPath: string) => {
     if (!targetPath) {
-      setSelectedPath(undefined);
-      setPreview(undefined);
+      closePreview();
       return;
     }
-    // Expand all ancestors of targetPath and clear preview if it's a directory
     const parts = targetPath.split("/");
-    const ancestors = new Set(expanded);
+    const ancestors = new Set(expandedRef.current);
     ancestors.add("");
     for (let i = 1; i <= parts.length; i++) {
       const prefix = parts.slice(0, i).join("/");
       ancestors.add(prefix);
-      if (!nodes.has(prefix)) void fetchDir(prefix);
+      if (!nodesRef.current.has(prefix) && !virtualDirsRef.current.has(prefix)) {
+        void fetchDir(prefix);
+      }
     }
+    expandedRef.current = ancestors;
     setExpanded(ancestors);
-    if (targetPath !== selectedPath) {
-      setSelectedPath(undefined);
-      setPreview(undefined);
+    if (targetPath !== selectedRef.current) {
+      closePreview();
     }
   };
 
@@ -336,7 +660,7 @@ export function WorkspaceFilesPanel({
   const normalizedFilter = filter.trim().toLowerCase();
 
   const dirHasLoadedMatch = (dirPath: string): boolean => {
-    const children = nodes.get(dirPath);
+    const children = getEffectiveEntries(dirPath);
     if (!children) return false;
     return children.some((child) => {
       if (changedOnly && !child.changed && !child.hasChangedChildren) return false;
@@ -348,8 +672,9 @@ export function WorkspaceFilesPanel({
   };
 
   const renderDir = (dirPath: string, depth: number) => {
-    const list = nodes.get(dirPath);
+    const list = getEffectiveEntries(dirPath);
     if (!list) return null;
+    const isTruncated = truncatedDirs.has(dirPath);
     const visibleEntries = list.filter((entry) => {
       if (changedOnly && !entry.changed && !entry.hasChangedChildren) return false;
       if (normalizedFilter) {
@@ -395,61 +720,75 @@ export function WorkspaceFilesPanel({
     if (!visibleEntries.length && depth > 0 && !changedOnly && !normalizedFilter) {
       return <div className="wf-empty-sub" style={{ paddingInlineStart: `${30 + depth * 15}px` }}>{t("空文件夹")}</div>;
     }
-    return <ul className="wf-tree-list" role={depth === 0 ? "tree" : "group"}>
-      {visibleEntries.map((entry) => {
-        const isDir = entry.kind === "dir";
-        const isOpen = isDir && expanded.has(entry.path);
-        const isLoading = isDir && loadingDirs.has(entry.path);
-        const isSelected = !isDir && selectedPath === entry.path;
-        const { icon, toneClass } = entryIcon(entry, isOpen);
-        return <li key={entry.path} role="treeitem" aria-expanded={isDir ? isOpen : undefined} aria-selected={isSelected}>
-          <div
-            className={`wf-row${isSelected ? " is-selected" : ""}${entry.heavy ? " is-heavy" : ""}${entry.sensitive ? " is-sensitive" : ""}`}
-            style={{ paddingInlineStart: `${10 + depth * 15}px` }}
-            draggable={!phone}
-            onDragStart={(event) => {
-              event.dataTransfer.setData(WORKSPACE_FILE_DRAG_MIME, entry.path);
-              event.dataTransfer.setData("text/plain", formatWorkspaceFileMention(entry.path));
-              event.dataTransfer.effectAllowed = "copy";
-            }}
-          >
-            <button
-              type="button"
-              className="wf-row-main"
-              onClick={() => isDir ? toggleDir(entry) : void fetchPreview(entry.path, false)}
-              title={entry.path}
+    return <>
+      <ul className="wf-tree-list" role={depth === 0 ? "tree" : "group"}>
+        {visibleEntries.map((entry) => {
+          const isDir = entry.kind === "dir";
+          const isOpen = isDir && expanded.has(entry.path);
+          const isLoading = isDir && loadingDirs.has(entry.path);
+          const isDeletedUnavailable = !isDir && entry.changed === "deleted" && entry.mtimeMs === null;
+          const isSelected = !isDir && selectedPath === entry.path;
+          const { icon, toneClass } = entryIcon(entry, isOpen);
+          return <li key={entry.path} role="treeitem" aria-expanded={isDir ? isOpen : undefined} aria-selected={isSelected}>
+            <div
+              className={`wf-row${isSelected ? " is-selected" : ""}${entry.heavy ? " is-heavy" : ""}${entry.sensitive ? " is-sensitive" : ""}${isDeletedUnavailable ? " is-deleted" : ""}`}
+              style={{ paddingInlineStart: `${10 + depth * 15}px` }}
+              draggable={!phone}
+              onDragStart={(event) => {
+                event.dataTransfer.setData(WORKSPACE_FILE_DRAG_MIME, entry.path);
+                event.dataTransfer.setData("text/plain", formatWorkspaceFileMention(entry.path));
+                event.dataTransfer.effectAllowed = "copy";
+              }}
             >
-              <span className={`wf-caret${isDir ? "" : " is-leaf"}${isOpen ? " is-open" : ""}`} aria-hidden="true">
-                {isLoading ? <LoaderCircle size={12} className="spin"/> : isDir ? <ChevronRight size={13}/> : null}
-              </span>
-              <span className={`wf-icon ${toneClass}`} aria-hidden="true">{icon}</span>
-              <span className="wf-name">{entry.name}</span>
-              {entry.sensitive && <span className="wf-tag is-sensitive" title={t("可能包含敏感凭据")}>{t("敏感")}</span>}
-              {entry.changed && <span className={`wf-git-badge is-${entry.changed}`} title={changeBadgeTitle(entry.changed)}>{changeBadgeLabel(entry.changed)}</span>}
-              {!entry.changed && entry.hasChangedChildren && <span className="wf-git-dot" title={t("包含改动文件")} aria-label={t("包含改动文件")}/>}
-            </button>
-            <button
-              type="button"
-              className="wf-mention-btn"
-              aria-label={t("引用文件：{0}", entry.path)}
-              title={t("引用给 Bot")}
-              onClick={(event) => { event.stopPropagation(); onMentionFile(entry.path); }}
-            >
-              <AtSign size={13}/>
-            </button>
-          </div>
-          {isDir && isOpen && renderDir(entry.path, depth + 1)}
-        </li>;
-      })}
-    </ul>;
+              <button
+                type="button"
+                className="wf-row-main"
+                aria-disabled={isDeletedUnavailable || undefined}
+                onClick={() => {
+                  if (isDir) toggleDir(entry);
+                  else if (!isDeletedUnavailable) void fetchPreview(entry.path, false);
+                }}
+                title={isDeletedUnavailable ? t("文件已删除，无法预览") : entry.path}
+              >
+                <span className={`wf-caret${isDir ? "" : " is-leaf"}${isOpen ? " is-open" : ""}`} aria-hidden="true">
+                  {isLoading ? <LoaderCircle size={12} className="spin"/> : isDir ? <ChevronRight size={13}/> : null}
+                </span>
+                <span className={`wf-icon ${toneClass}`} aria-hidden="true">{icon}</span>
+                <span className="wf-name">{entry.name}</span>
+                {entry.sensitive && <span className="wf-tag is-sensitive" title={t("可能包含敏感凭据")}>{t("敏感")}</span>}
+                {entry.changed && <span className={`wf-git-badge is-${entry.changed}`} title={changeBadgeTitle(entry.changed)}>{changeBadgeLabel(entry.changed)}</span>}
+                {!entry.changed && entry.hasChangedChildren && <span className="wf-git-dot" title={t("包含改动文件")} aria-label={t("包含改动文件")}/>}
+              </button>
+              <button
+                type="button"
+                className="wf-mention-btn"
+                aria-label={t("引用文件：{0}", entry.path)}
+                title={t("引用给 Bot")}
+                onClick={(event) => { event.stopPropagation(); onMentionFile(entry.path); }}
+              >
+                <AtSign size={13}/>
+              </button>
+            </div>
+            {isDir && isOpen && renderDir(entry.path, depth + 1)}
+          </li>;
+        })}
+      </ul>
+      {isTruncated && (
+        <div className="wf-truncated-dir" role="status" style={{ paddingInlineStart: `${30 + depth * 15}px` }}>
+          {t("目录项较多，仅展示前 {0} 项", WORKSPACE_FILES_MAX_ENTRIES)}
+        </div>
+      )}
+    </>;
   };
 
   const showingPreview = Boolean(selectedPath);
 
   return <aside
+    ref={panelRef}
     id={id}
     className={`workspace-files-panel${phone ? " workspace-files-phone" : " conversation-side-panel"}`}
     hidden={!visible}
+    inert={!visible || undefined}
     aria-label={t("工作区文件")}
   >
     <header className="wf-header">
@@ -464,7 +803,7 @@ export function WorkspaceFilesPanel({
           className="icon-button"
           aria-label={t("刷新文件树")}
           title={t("刷新文件树")}
-          onClick={() => void refreshExpanded()}
+          onClick={triggerManualRefresh}
         >
           <RefreshCw size={15} className={refreshing ? "spin" : undefined}/>
         </button>
@@ -527,7 +866,7 @@ export function WorkspaceFilesPanel({
             <WorkspaceFileStateArt kind="error"/>
             <p className="wf-state-title">{rootError}</p>
             <p className="wf-state-detail">{t("请确认 Bot 在线并且工作区目录可访问。")}</p>
-            <button type="button" className="wf-retry-btn" onClick={() => void refreshExpanded()}>{t("重试")}</button>
+            <button type="button" className="wf-retry-btn" onClick={triggerManualRefresh}>{t("重试")}</button>
             {rootErrorHint && <small className="wf-error-code">{rootErrorHint}</small>}
           </div>
         ) : !nodes.has("") ? (
@@ -539,7 +878,7 @@ export function WorkspaceFilesPanel({
       ) : (
         <div className="wf-preview">
           <div className="wf-preview-bar">
-            <button type="button" className="wf-back-btn" onClick={() => { setSelectedPath(undefined); setPreview(undefined); setPreviewError(""); setPreviewErrorHint(""); }}>
+            <button type="button" className="wf-back-btn" onClick={closePreview}>
               <ArrowLeft size={14}/>
               <span>{t("返回目录")}</span>
             </button>
@@ -617,7 +956,7 @@ export function WorkspaceFilesPanel({
             <div className="wf-state-card">
               <WorkspaceFileStateArt kind="file"/>
               <p className="wf-state-title">{preview.kind === "too_large" ? t("文件过大，暂不支持直接预览。") : t("此二进制文件暂不支持文本预览。")}</p>
-              <p className="wf-state-detail">{preview.kind === "too_large" ? t("仅支持预览 10 MB 以内的常见文本、图片或 PDF 文件。") : t("你可以先把它引用给 Bot，由 Bot 在工作区里读取或处理。")}</p>
+              <p className="wf-state-detail">{preview.kind === "too_large" ? t("仅支持直接预览 4 MB 以内的图片和 10 MB 以内的 PDF 文件。") : t("你可以先把它引用给 Bot，由 Bot 在工作区里读取或处理。")}</p>
               <small className="wf-error-code">{formatFileLimit(preview.size)}</small>
             </div>
           )}
