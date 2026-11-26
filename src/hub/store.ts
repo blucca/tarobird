@@ -8,6 +8,7 @@ import { steeringApplicationSchema } from "../client-protocol/steering-outcome.j
 import { deletedMessage, deleteMessagesSchema, personalMessageEvent, messageEventId } from "../client-protocol/message-deletion.js";
 import { MAX_CLEAR_MESSAGES, MESSAGE_CLEAR_ACTIVE, clearMessagesInputSchema, hasPendingCardAction, type ClearMessagesInput, type ClearMessagesPlan, type ClearMessagesResult } from "../client-protocol/message-clear.js";
 import { isRunActive, anyRun, runSummarySchema } from "../client-protocol/run.js";
+import { runPlanPreview } from "../client-protocol/run-plan.js";
 import { backgroundTaskGroup } from "../client-protocol/background-task-group.js";
 import { answerFollowup, activeAnswerFollowup } from "../client-protocol/answer-followup.js";
 import { queueNotice } from "../client-protocol/queue-notice.js";
@@ -1017,6 +1018,7 @@ export class HubStore {
       // Forwarding strips grouping; an interrupted member keeps its validated
       // original record, still bound to the same scoped run ID.
       const group = original.type === "card" && original.extra?.scopedRun !== undefined && run && backgroundTaskGroup(original, run) ? original.extra.backgroundTaskGroup : undefined;
+      const plan = original.type === "card" && original.extra?.scopedRun === undefined && run ? runPlanPreview(original, run) : undefined;
       const answer = original.type === "card" ? answerFollowup(original) : undefined;
       const queue = original.type === "card" ? queueNotice(original, old) : undefined;
       if (block.type === "card" && queue && ["queued", "started"].includes(queue.state)) {
@@ -1032,7 +1034,7 @@ export class HubStore {
           elements: block.elements.filter(element => element.type !== "button").map(element => element.id === "answer_followup_status" ? { ...element, text } : element) };
       }
       return block.type === "card" ? { ...block,
-      ...(run ? { extra: { ...block.extra, ...(group !== undefined ? { backgroundTaskGroup: group } : {}), [original.type === "card" && original.extra?.scopedRun !== undefined ? "scopedRun" : "nativeRun"]: { ...JSON.parse(JSON.stringify(run)), phase: reason === "interrupted" ? "interrupted" : "error", revision: run.revision + 1, updatedAt: Date.now(), endedAt: Date.now() } } } : {}),
+      ...(run ? { extra: { ...block.extra, ...(group !== undefined ? { backgroundTaskGroup: group } : {}), ...(plan ? { nativeRunPlan: { ...plan, items: plan.items.map(item => ({ ...item })), revision: run.revision + 1 } } : {}), [original.type === "card" && original.extra?.scopedRun !== undefined ? "scopedRun" : "nativeRun"]: { ...JSON.parse(JSON.stringify(run)), phase: reason === "interrupted" ? "interrupted" : "error", revision: run.revision + 1, updatedAt: Date.now(), endedAt: Date.now() } } } : {}),
       title: reason === "interrupted" ? "处理已中断" : "处理未完成", template: "orange",
       elements: run ? [...block.elements, { type: "markdown", text: note }] : [{ type: "markdown", text: note }, { type: "collapsible", text: block.title ? `中断前：${block.title}` : "查看中断前的内容", open: false, children: block.elements }],
     } : block; }));
