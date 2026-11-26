@@ -261,7 +261,7 @@ export async function readOwnedAntigravityQuota(input: {
   };
 
   try {
-    if (input.localProbe) {
+    if (input.localProbe && input.preferredPids?.length) {
       const localDeps = typeof input.localProbe === "object" ? input.localProbe : undefined;
       const localSnapshot = await probeAntigravityLocalServerQuota({
         preferredPids: input.preferredPids,

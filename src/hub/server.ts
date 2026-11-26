@@ -1,7 +1,14 @@
 import { HISTORY_RELEASE_AFTER_MS, HubConversationHistory } from "./conversation-history.js";
 import { CONVERSATION_HISTORY_CAPABILITY, historyChangeSchema } from "../client-protocol/conversation-history.js";
 import { hubEngineQuotas } from "./engine-quota.js";
-import { ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_HUB_REFRESH_MS } from "../client-protocol/engine-quota.js";
+import {
+  ENGINE_QUOTA_CAPABILITIES_HEADER,
+  ENGINE_QUOTA_CAPABILITY,
+  ENGINE_QUOTA_CURRENCY_CAPABILITY,
+  ENGINE_QUOTA_HUB_REFRESH_MS,
+  projectQuotaDirectoryForClient,
+  projectQuotaScopeForClient,
+} from "../client-protocol/engine-quota.js";
 import { DesignShareBroker, metaDesignShareRepository, type DesignSharePeer } from "./workbench-design-sharing.js";
 import { DESIGN_SHARE_CLIENT_CAPABILITY } from "../client-protocol/workbench-design-sharing.js";
 import { HubRemoteScreen } from "./remote-screen.js";
@@ -1532,7 +1539,7 @@ export class HubServer {
     if (!this.originAllowed(req)) throw new HubError("origin_forbidden", 403);
     if (req.headers.origin) { res.setHeader("Access-Control-Allow-Origin", req.headers.origin); res.setHeader("Vary", "Origin"); }
     res.setHeader("Access-Control-Expose-Headers", "ETag, Content-Range, Accept-Ranges, Date");
-    if (req.method === "OPTIONS") { res.writeHead(204, { "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS", "Access-Control-Allow-Headers": "Authorization, Content-Type, Range, If-Range", "Access-Control-Max-Age": "600" }); res.end(); return; }
+    if (req.method === "OPTIONS") { res.writeHead(204, { "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS", "Access-Control-Allow-Headers": `Authorization, Content-Type, Range, If-Range, ${ENGINE_QUOTA_CAPABILITIES_HEADER}`, "Access-Control-Max-Age": "600" }); res.end(); return; }
     const url = new URL(req.url ?? "/", this.url); const route = url.pathname;
     // Worker-only, one-use browser downloads must never fall back to HTML when
     // a worker has expired or a browser retries the navigation on the network.
@@ -1600,11 +1607,16 @@ export class HubServer {
         await requireOwner();
         const url = new URL(req.url ?? "/", "http://hub"), refresh = url.searchParams.get("refresh") === "1", revision = url.searchParams.get("revision") ?? undefined;
         if (revision && (revision.length > 128 || !/^[a-zA-Z0-9_.:-]+$/.test(revision)) || refresh && !quotaRoute[1]) throw new HubError("quota_request_invalid", 400);
+        const quotaCapsHeader = req.headers[ENGINE_QUOTA_CAPABILITIES_HEADER.toLowerCase()];
+        const quotaCaps = (Array.isArray(quotaCapsHeader) ? quotaCapsHeader.join(",") : quotaCapsHeader ?? "").split(",").map(value => value.trim());
+        const currencyBalances = quotaCaps.includes(ENGINE_QUOTA_CURRENCY_CAPABILITY);
         const quotas = hubEngineQuotas({ bots: () => this.store.bots(userId), validate,
           connection: id => { const connection = this.bots.get(id); return connection ? { key: connection, supported: connection.engineQuota, ready: connection.ready } : undefined; },
           call: (id, request) => this.callBot(id, "quota.get", request, request.refresh ? ENGINE_QUOTA_HUB_REFRESH_MS : 2_500),
         });
-        await reply(200, quotaRoute[1] ? await quotas.scope(quotaRoute[1], refresh, revision) : await quotas.directory()); return;
+        await reply(200, quotaRoute[1]
+          ? projectQuotaScopeForClient(await quotas.scope(quotaRoute[1], refresh, revision), { currencyBalances })
+          : projectQuotaDirectoryForClient(await quotas.directory(), { currencyBalances })); return;
       }
       if (route === "/api/workbench/admit" && req.method === "POST") {
         const input = z.object({ dispatchId: idSchema }).strict().parse(await this.jsonBody(req, 2048));

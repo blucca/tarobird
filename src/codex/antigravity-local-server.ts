@@ -11,14 +11,16 @@ const execFileAsync = promisify(execFile);
 const SUMMARY_PATH = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 const STATUS_PATH = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
 const LOCAL_TIMEOUT_MS = 2_500;
+const MAX_RESPONSE_BYTES = 256 * 1024;
 
-export type LocalExecFn = (file: string, args: string[]) => Promise<{ stdout: string }>;
+export type LocalExecFn = (file: string, args: string[], signal?: AbortSignal) => Promise<{ stdout: string }>;
 export type LocalConnectRequestFn = (
   port: number,
   tls: boolean,
   pathName: string,
   body: string,
   csrf?: string,
+  signal?: AbortSignal,
 ) => Promise<{ status: number; text: string } | null>;
 
 export type AntigravityLocalProbeDeps = {
@@ -34,33 +36,86 @@ type CandidateProcess = {
   extPort?: number;
 };
 
-const LANGUAGE_SERVER_RE = /language[_-]server(_macos)?(_arm)?/;
+const LANGUAGE_SERVER_BASENAME_RE = /^language[_-]server(?:[_-][a-z0-9]+)*(?:\.exe)?$/i;
 const IDE_MARKER_RE = /antigravity[-_]ide/i;
-const CLI_MARKER_RE = /antigravity[-_]cli/i;
-const AGY_BINARY_RE = /(^|\/|\s)agy(\s|$)/;
-const APP_MARKER_RE = /--app_data_dir[= ]"?antigravity(?![\w-])|\/antigravity\//i;
+const AGY_BASENAME_RE = /^(?:agy|antigravity[-_]cli)(?:\.(?:exe|cmd|bat))?$/i;
+const APP_MARKER_RE = /--app_data_dir(?:=|\s+)"?antigravity(?![\w-])|[\\/]antigravity(?:\.app)?[\\/]/i;
+const NON_LISTENING_NETSTAT_STATE_RE = /^(?:ESTABLISHED|CLOSE_WAIT|TIME_WAIT|FIN_WAIT_1|FIN_WAIT_2|SYN_SENT|SYN_RECEIVED|LAST_ACK|CLOSING|BOUND)$/i;
+
+function extractExecutablePath(command: string): string {
+  const trimmed = command.trimStart();
+  if (!trimmed) return "";
+  const first = trimmed[0];
+  if (first === "\"" || first === "'") {
+    const end = trimmed.indexOf(first, 1);
+    return end > 1 ? trimmed.slice(1, end) : trimmed.slice(1);
+  }
+  const firstToken = trimmed.split(/\s+/, 1)[0] ?? "";
+  // On Windows/macOS, an unquoted absolute path may contain spaces before `--flags`.
+  if (/^(?:[A-Za-z]:\\|\/)/.test(trimmed)) {
+    const beforeFlag = trimmed.split(/\s+--/, 1)[0]?.trim() ?? firstToken;
+    const candidateBase = basenameAnySep(beforeFlag);
+    if (LANGUAGE_SERVER_BASENAME_RE.test(candidateBase) || AGY_BASENAME_RE.test(candidateBase)) {
+      return beforeFlag;
+    }
+  }
+  return firstToken;
+}
+
+function basenameAnySep(executablePath: string): string {
+  const trimmed = executablePath.replace(/[\\/]+$/, "");
+  const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return index >= 0 ? trimmed.slice(index + 1) : trimmed;
+}
 
 function flagValue(line: string, flag: string): string | undefined {
-  const match = line.match(new RegExp(`${flag}[= ]([^\\s]+)`));
-  return match?.[1];
+  const match = line.match(new RegExp(`(?:^|\\s)${flag}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|([^\\s"']+))`));
+  const raw = match?.[1] ?? match?.[2] ?? match?.[3];
+  return raw && raw.length > 0 ? raw : undefined;
 }
 
 export function classifyAntigravityProcessLine(line: string): CandidateProcess | null {
-  const isServer = LANGUAGE_SERVER_RE.test(line);
-  const isCli = !isServer && (CLI_MARKER_RE.test(line) || AGY_BINARY_RE.test(line));
+  const pidMatch = line.trim().match(/^(\d+)\s+(.+)$/);
+  if (!pidMatch) return null;
+  const pid = pidMatch[1]!;
+  const command = pidMatch[2]!;
+  const executablePath = extractExecutablePath(command);
+  const base = basenameAnySep(executablePath);
+  const isServer = LANGUAGE_SERVER_BASENAME_RE.test(base);
+  const isCli = !isServer && AGY_BASENAME_RE.test(base);
   if (!isServer && !isCli) return null;
-  const pid = line.trim().match(/^(\d+)/)?.[1];
-  if (!pid) return null;
-  if (!isCli && (!APP_MARKER_RE.test(line) || IDE_MARKER_RE.test(line))) return null;
-  const csrf = flagValue(line, "--csrf_token");
+  if (!isCli && (!APP_MARKER_RE.test(command) || IDE_MARKER_RE.test(command))) return null;
+  const csrf = flagValue(command, "--csrf_token");
   if (!isCli && !csrf) return null;
-  const extPort = Number(flagValue(line, "--extension_server_port"));
+  const extPortRaw = flagValue(command, "--extension_server_port");
+  const extPort = extPortRaw !== undefined && /^\d+$/.test(extPortRaw) ? Number(extPortRaw) : NaN;
   return {
     pid,
     cli: isCli,
     csrf,
-    extPort: Number.isFinite(extPort) && extPort > 0 ? extPort : undefined,
+    extPort: Number.isInteger(extPort) && extPort > 0 && extPort <= 65535 ? extPort : undefined,
   };
+}
+
+function isLoopbackOrWildcardHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "127.0.0.1"
+    || normalized === "[::1]"
+    || normalized === "0.0.0.0"
+    || normalized === "[::]"
+    || normalized === "*"
+    || normalized === "localhost";
+}
+
+function parseEndpoint(endpoint: string): { host: string; port: number } | null {
+  const colon = endpoint.lastIndexOf(":");
+  if (colon <= 0) return null;
+  const host = endpoint.slice(0, colon);
+  const portText = endpoint.slice(colon + 1);
+  if (!/^\d+$/.test(portText)) return null;
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return { host, port };
 }
 
 export function parseNetstatListeningPorts(stdout: string, pid: string): number[] {
@@ -68,50 +123,119 @@ export function parseNetstatListeningPorts(stdout: string, pid: string): number[
   for (const line of stdout.split(/\r?\n/)) {
     const parts = line.trim().split(/\s+/);
     if (parts.length < 5 || !/^TCP$/i.test(parts[0]!) || parts[parts.length - 1] !== pid) continue;
-    const port = Number(parts[1]!.split(":").pop());
-    if (Number.isFinite(port) && port > 0) ports.add(port);
+    const local = parts[1]!;
+    const foreign = parts[2]!;
+    const state = parts[3]!;
+    if (NON_LISTENING_NETSTAT_STATE_RE.test(state)) continue;
+    const isListening = /^LISTENING$/i.test(state) || foreign === "0.0.0.0:0" || foreign === "[::]:0";
+    if (!isListening) continue;
+    const endpoint = parseEndpoint(local);
+    if (!endpoint || !isLoopbackOrWildcardHost(endpoint.host)) continue;
+    ports.add(endpoint.port);
   }
   return [...ports];
 }
 
 export function parseLsofListeningPorts(stdout: string): number[] {
-  const ports = [...stdout.matchAll(/:(\d+)\s/g)].map(match => Number(match[1]));
-  return [...new Set(ports)].filter(port => Number.isFinite(port) && port > 0);
+  const ports = new Set<number>();
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!/\(LISTEN\)\s*$/.test(line)) continue;
+    const match = line.match(/\bTCP\s+([^\s]+)\s+\(LISTEN\)\s*$/);
+    if (!match) continue;
+    const endpoint = parseEndpoint(match[1]!);
+    if (!endpoint || !isLoopbackOrWildcardHost(endpoint.host)) continue;
+    ports.add(endpoint.port);
+  }
+  return [...ports];
 }
 
-function postLoopbackConnect(
+export function postLoopbackConnect(
   port: number,
   tls: boolean,
   pathName: string,
   body: string,
   csrf?: string,
+  signal?: AbortSignal,
 ): Promise<{ status: number; text: string } | null> {
+  if (signal?.aborted) return Promise.resolve(null);
   return new Promise(resolve => {
-    const req = (tls ? https : http).request(
-      {
-        host: "127.0.0.1",
-        port,
-        method: "POST",
-        path: pathName,
-        ...(tls ? { rejectUnauthorized: false } : {}),
-        headers: {
-          "Content-Type": "application/json",
-          "Connect-Protocol-Version": "1",
-          ...(csrf ? { "X-Codeium-Csrf-Token": csrf } : {}),
+    let settled = false;
+    let gotResponse = false;
+    let req: http.ClientRequest | undefined;
+    const finish = (value: { status: number; text: string } | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const abortReq = () => {
+      if (settled) return;
+      finish(null);
+      try { req?.destroy(); } catch { /* ignore */ }
+    };
+    const onAbort = () => abortReq();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const deadline = setTimeout(abortReq, LOCAL_TIMEOUT_MS);
+    deadline.unref?.();
+
+    try {
+      req = (tls ? https : http).request(
+        {
+          host: "127.0.0.1",
+          port,
+          method: "POST",
+          path: pathName,
+          ...(tls ? { rejectUnauthorized: false } : {}),
+          headers: {
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+            ...(csrf ? { "X-Codeium-Csrf-Token": csrf } : {}),
+          },
+          timeout: LOCAL_TIMEOUT_MS,
         },
-        timeout: LOCAL_TIMEOUT_MS,
-      },
-      res => {
-        let text = "";
-        res.setEncoding("utf8");
-        res.on("data", chunk => {
-          if (text.length <= 256 * 1024) text += chunk;
-        });
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
-      },
-    );
-    req.on("timeout", () => { req.destroy(); resolve(null); });
-    req.on("error", () => resolve(null));
+        res => {
+          gotResponse = true;
+          const chunks: Buffer[] = [];
+          let bytes = 0;
+          res.on("data", (chunk: Buffer | string) => {
+            if (settled) return;
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+            bytes += buf.length;
+            if (bytes > MAX_RESPONSE_BYTES) {
+              abortReq();
+              return;
+            }
+            chunks.push(buf);
+          });
+          res.on("error", () => finish(null));
+          res.on("aborted", () => finish(null));
+          res.on("end", () => {
+            if (!res.complete) {
+              finish(null);
+              return;
+            }
+            finish({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") });
+          });
+          res.on("close", () => {
+            if (!res.complete) finish(null);
+          });
+        },
+      );
+    } catch {
+      finish(null);
+      return;
+    }
+
+    req.on("timeout", abortReq);
+    req.on("error", () => finish(null));
+    req.on("close", () => {
+      if (!gotResponse) finish(null);
+    });
+    if (signal?.aborted) {
+      abortReq();
+      return;
+    }
     req.end(body);
   });
 }
@@ -294,58 +418,23 @@ export function decodeAntigravityLocalStatus(body: unknown, now = Date.now()): Q
   return parsed.data;
 }
 
-const WINDOWS_PROCESS_SCRIPT = [
-  "$ErrorActionPreference = 'SilentlyContinue'",
-  "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
-  "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like '*antigravity*' -or $_.CommandLine -like '*language_server*' -or $_.CommandLine -like '*agy*') } | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }",
-].join("; ");
-
-async function listListeningPorts(deps: AntigravityLocalProbeDeps, pid: string): Promise<number[]> {
+async function listListeningPorts(deps: AntigravityLocalProbeDeps, pid: string, signal?: AbortSignal): Promise<number[]> {
+  if (signal?.aborted) return [];
   try {
     if (deps.platform === "win32") {
-      const { stdout } = await deps.execFile("netstat.exe", ["-ano", "-p", "TCP"]);
+      const { stdout } = await deps.execFile("netstat.exe", ["-ano", "-p", "TCP"], signal);
       return parseNetstatListeningPorts(stdout, pid);
     }
-    const { stdout } = await deps.execFile("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pid]);
+    const { stdout } = await deps.execFile("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pid], signal);
     return parseLsofListeningPorts(stdout);
   } catch {
     return [];
   }
 }
 
-async function discoverLocalCandidates(deps: AntigravityLocalProbeDeps, preferredPids: readonly number[]): Promise<CandidateProcess[]> {
-  const candidates: CandidateProcess[] = [];
-  const seen = new Set<string>();
-  for (const pid of preferredPids) {
-    if (Number.isInteger(pid) && pid > 0) {
-      const id = String(pid);
-      if (!seen.has(id)) {
-        seen.add(id);
-        candidates.push({ pid: id, cli: true });
-      }
-    }
-  }
-  try {
-    const stdout = deps.platform === "win32"
-      ? (await deps.execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_PROCESS_SCRIPT])).stdout
-      : (await deps.execFile("ps", ["-ax", "-o", "pid=,command="])).stdout;
-    const discovered: CandidateProcess[] = [];
-    for (const line of stdout.split(/\r?\n/)) {
-      const c = classifyAntigravityProcessLine(line);
-      if (!c || seen.has(c.pid)) continue;
-      seen.add(c.pid);
-      discovered.push(c);
-    }
-    // Prefer running `agy` CLI candidates we own first, then desktop language servers, then other CLI instances.
-    discovered.sort((a, b) => Number(a.cli) - Number(b.cli));
-    candidates.push(...discovered);
-  } catch { /* ignore process listing failure */ }
-  return candidates;
-}
-
-/** Probe a running `agy acp` process or local Antigravity language server over loopback
- * without spawning a new `agy` process. Returns null when no local server answers so the
- * caller can fall back to `agy -p /usage`. */
+/** Probe only verified Bot-owned `agy` worker PIDs over loopback without spawning
+ * a new `agy` process or scanning system-wide processes. Returns null when no
+ * verified Bot-owned local server answers so the caller falls back to `agy -p /usage`. */
 export async function probeAntigravityLocalServerQuota(options: {
   preferredPids?: readonly number[];
   signal?: AbortSignal;
@@ -353,32 +442,53 @@ export async function probeAntigravityLocalServerQuota(options: {
   deps?: Partial<AntigravityLocalProbeDeps>;
 } = {}): Promise<QuotaSnapshot | null> {
   if (options.signal?.aborted) return null;
+  const pids: string[] = [];
+  const seen = new Set<string>();
+  for (const pid of options.preferredPids ?? []) {
+    if (Number.isInteger(pid) && pid > 0) {
+      const id = String(pid);
+      if (!seen.has(id)) {
+        seen.add(id);
+        pids.push(id);
+      }
+    }
+  }
+  if (pids.length === 0) return null;
+
   const now = options.now ?? Date.now;
   const deps: AntigravityLocalProbeDeps = {
-    execFile: options.deps?.execFile ?? (async (file, args) => {
-      const res = await execFileAsync(file, args, { timeout: LOCAL_TIMEOUT_MS, maxBuffer: 512 * 1024, encoding: "utf8" });
+    execFile: options.deps?.execFile ?? (async (file, args, execSignal) => {
+      const res = await execFileAsync(file, args, {
+        timeout: LOCAL_TIMEOUT_MS,
+        maxBuffer: 512 * 1024,
+        encoding: "utf8",
+        ...(execSignal ?? options.signal ? { signal: execSignal ?? options.signal } : {}),
+      });
       return { stdout: String(res.stdout ?? "") };
     }),
     request: options.deps?.request ?? postLoopbackConnect,
     platform: options.deps?.platform ?? process.platform,
   };
 
-  const candidates = await discoverLocalCandidates(deps, options.preferredPids ?? []);
-  for (const candidate of candidates) {
+  for (const pid of pids) {
     if (options.signal?.aborted) return null;
-    const ports = await listListeningPorts(deps, candidate.pid);
-    if (candidate.extPort !== undefined && !ports.includes(candidate.extPort)) ports.push(candidate.extPort);
+    const ports = await listListeningPorts(deps, pid, options.signal);
+    if (options.signal?.aborted) return null;
     for (const port of ports) {
       if (options.signal?.aborted) return null;
       for (const tls of [false, true]) {
-        const summaryRes = await deps.request(port, tls, SUMMARY_PATH, "{}", candidate.csrf);
+        if (options.signal?.aborted) return null;
+        const summaryRes = await deps.request(port, tls, SUMMARY_PATH, "{}", undefined, options.signal);
+        if (options.signal?.aborted) return null;
         if (summaryRes?.status === 200) {
           try {
             const snapshot = decodeAntigravityLocalSummary(JSON.parse(summaryRes.text), now());
             if (snapshot) return snapshot;
           } catch { /* try next */ }
         }
-        const statusRes = await deps.request(port, tls, STATUS_PATH, "{}", candidate.csrf);
+        if (options.signal?.aborted) return null;
+        const statusRes = await deps.request(port, tls, STATUS_PATH, "{}", undefined, options.signal);
+        if (options.signal?.aborted) return null;
         if (statusRes?.status === 200) {
           try {
             const snapshot = decodeAntigravityLocalStatus(JSON.parse(statusRes.text), now());

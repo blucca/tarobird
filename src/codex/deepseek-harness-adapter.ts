@@ -1,13 +1,15 @@
 import { decodeDeepSeekModel, encodeDeepSeekModel } from "./deepseek-models.js";
 import { wholeFilePatch } from "../core/recorded-diff.js";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from "node:fs";
+import { homedir } from "node:os";
 import { EngineCancellationUnconfirmedError, EngineStopTooLateError, EngineSteeringRejectedError } from "./adapter.js";
 import { EngineRetryableError, type EngineRetryReason } from "./turn-retry.js";
 import { deepseekGoalUsageSchema } from "./deepseek-goal-usage.js";
 import { parseDeepSeekAccountBalance } from "./deepseek-account-quota.js";
 import { QUOTA_TTL_MS, QuotaReadError, unavailableQuota } from "./account-quota.js";
 import type { EngineQuotaReadOptions, EngineQuotaReadResult } from "./adapter-account-quota.js";
-import type { QuotaSnapshot } from "../client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_REFRESH_MS, type QuotaSnapshot } from "../client-protocol/engine-quota.js";
 import { deepseekAssistantPrefixSchema } from "./deepseek-assistant-stream.js";
 import { mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -90,6 +92,8 @@ export interface DeepSeekHarnessAdapterOptions {
   gateway: DeepSeekHarnessGateway;
   searchMcpEnabled?: boolean;
   workspacePath: string;
+  sharedHome?: string;
+  childEnv?: NodeJS.ProcessEnv;
   permissionPreset?: DeepSeekHarnessPermissionPreset;
   model?: DeepSeekHarnessModelSelection;
   configPath?: string;
@@ -276,6 +280,8 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
 
   private readonly gateway: DeepSeekHarnessGateway;
   private readonly workspacePath: string;
+  private readonly sharedHome?: string;
+  private readonly childEnv?: NodeJS.ProcessEnv;
   private readonly permissionPreset: DeepSeekHarnessPermissionPreset;
   private readonly model?: DeepSeekHarnessModelSelection;
   private readonly configPath?: string;
@@ -321,6 +327,8 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
     this.searchMcpEnabled = options.searchMcpEnabled ?? false;
     this.gateway = options.gateway;
     this.workspacePath = path.resolve(options.workspacePath);
+    this.sharedHome = options.sharedHome ? path.resolve(options.sharedHome) : undefined;
+    this.childEnv = options.childEnv ? { ...options.childEnv } : undefined;
     this.permissionPreset = options.permissionPreset ?? "workspace-write";
     this.model = options.model;
     this.configPath = options.configPath;
@@ -822,55 +830,163 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
   }
 
   private cachedQuota: { revision: string; snapshot: QuotaSnapshot } | undefined;
-  private readonly quotaRevision = randomUUID();
+  private readonly quotaProofKey = randomBytes(32);
+  private quotaHostGeneration = 0;
+  private readonly quotaAborts = new Set<AbortController>();
+
+  private captureQuotaScope(): { revision: string; hasApiKey: boolean } {
+    const env = this.childEnv ?? process.env;
+    const home = env.HOME || env.USERPROFILE || homedir();
+    const dshHome = this.sharedHome ?? (env.DSH_HOME ? path.resolve(env.DSH_HOME) : path.join(home, ".dsh"));
+    const credentials = readBoundedQuotaFile(path.join(dshHome, ".credentials.yaml"));
+    const settings = readBoundedQuotaFile(path.join(dshHome, "settings.yaml"));
+    const patch = readBoundedQuotaFile(path.join(dshHome, "cordis.patch.yml"));
+    const configured = this.configPath ? readBoundedQuotaFile(this.configPath) : "";
+    const relevantEnv = Object.fromEntries(
+      Object.entries(env)
+        .filter(([key]) => /^(DEEPSEEK_|DSH_)/.test(key))
+        .sort(([left], [right]) => left.localeCompare(right)),
+    );
+    const revision = createHmac("sha256", this.quotaProofKey)
+      .update(JSON.stringify([dshHome, credentials, settings, patch, configured, relevantEnv, this.quotaHostGeneration]))
+      .digest("hex");
+    return { revision, hasApiKey: Boolean(env.DEEPSEEK_API_KEY) };
+  }
+
+  private storeQuota(revision: string, snapshot: QuotaSnapshot): EngineQuotaReadResult {
+    if (this.destroyed) {
+      this.cachedQuota = undefined;
+      return { revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+    }
+    // Never cache `capability.mode === "unsupported"` under a static scope so a subsequent
+    // DeepSeek Platform sign-in (even when credentials live outside `.credentials.yaml`)
+    // can still be refreshed without restarting the Bot.
+    if (snapshot.capability.mode === "unsupported") {
+      this.cachedQuota = undefined;
+      return { revision, snapshot: structuredClone(snapshot) };
+    }
+    const same = this.cachedQuota?.revision === revision ? this.cachedQuota : undefined;
+    if (same && same.snapshot.observedAt && (snapshot.state === "unavailable" || snapshot.state === "offline")) {
+      this.cachedQuota = {
+        revision,
+        snapshot: {
+          ...structuredClone(same.snapshot),
+          state: "stale",
+          reason: snapshot.reason,
+          lastAttemptAt: snapshot.lastAttemptAt,
+        },
+      };
+    } else {
+      this.cachedQuota = { revision, snapshot: structuredClone(snapshot) };
+    }
+    return { revision, snapshot: structuredClone(this.cachedQuota.snapshot) };
+  }
 
   /** Query DeepSeek Platform recharge and bonus wallet balances via the existing private `dsh web`
    * service (`account.getBalance`). Never reads credentials directly or sends model messages. */
   async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
-    const revision = this.quotaRevision;
-    if (this.destroyed || options.signal?.aborted) {
-      return { revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+    const scope = this.captureQuotaScope();
+    if (this.destroyed) {
+      return { revision: scope.revision, snapshot: unavailableQuota("deepseek", "cancelled") };
     }
-    if (options.expectedRevision && options.expectedRevision !== revision) {
+    if (options.signal?.aborted) {
+      if (isTimeoutAbort(options.signal)) {
+        return this.storeQuota(scope.revision, unavailableQuota("deepseek", "timeout"));
+      }
+      return { revision: scope.revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+    }
+    if (options.expectedRevision && options.expectedRevision !== scope.revision) {
       this.cachedQuota = undefined;
-      return { revision, snapshot: unavailableQuota("deepseek", "auth_changed") };
+      return { revision: scope.revision, snapshot: unavailableQuota("deepseek", "auth_changed") };
     }
     if (!options.refresh) {
-      if (!this.cachedQuota) {
-        return { revision, snapshot: unavailableQuota("deepseek", "not_loaded") };
+      if (!this.cachedQuota || this.cachedQuota.revision !== scope.revision) {
+        this.cachedQuota = undefined;
+        return { revision: scope.revision, snapshot: unavailableQuota("deepseek", "not_loaded") };
       }
       const snap = structuredClone(this.cachedQuota.snapshot);
       if (snap.state === "ready" && snap.observedAt && Date.now() - Date.parse(snap.observedAt) >= QUOTA_TTL_MS) {
         snap.state = "stale";
       }
-      return { revision, snapshot: snap };
+      return { revision: scope.revision, snapshot: snap };
     }
 
+    const timeoutMs = Math.max(1, Math.min(ENGINE_QUOTA_REFRESH_MS, options.timeoutMs ?? ENGINE_QUOTA_REFRESH_MS));
+    const abort = new AbortController();
+    let timedOut = false;
+    this.quotaAborts.add(abort);
+    const onCallerAbort = () => {
+      if (isTimeoutAbort(options.signal)) timedOut = true;
+      abort.abort();
+    };
+    options.signal?.addEventListener("abort", onCallerAbort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      abort.abort();
+    }, timeoutMs);
+    timer.unref?.();
+
     try {
-      await this.ensureOperational(options.signal);
+      await this.ensureOperational(abort.signal);
+      if (this.destroyed) {
+        return { revision: scope.revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+      }
+      if (abort.signal.aborted) {
+        return timedOut
+          ? this.storeQuota(scope.revision, unavailableQuota("deepseek", "timeout"))
+          : { revision: scope.revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+      }
+      const beforeReq = this.captureQuotaScope();
+      if (beforeReq.revision !== scope.revision) {
+        this.cachedQuota = undefined;
+        return { revision: beforeReq.revision, snapshot: unavailableQuota("deepseek", "auth_changed") };
+      }
+
       const client = {
         version: "1.6.0",
         locale: "en",
         timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
       };
-      const outcome = await this.gateway.request("account.getBalance", { client }, options.signal);
-      const hasApiKey = Boolean(process.env.DEEPSEEK_API_KEY);
-      const snapshot = parseDeepSeekAccountBalance(outcome, { now: Date.now(), hasApiKey });
-      this.cachedQuota = { revision, snapshot };
-      return { revision, snapshot: structuredClone(snapshot) };
+      const reqPromise = this.gateway.request("account.getBalance", { client }, abort.signal);
+      void reqPromise.catch(() => {});
+      const outcome = await waitForOperationOrAbort(reqPromise, abort.signal);
+
+      if (this.destroyed) {
+        return { revision: scope.revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+      }
+      if (abort.signal.aborted) {
+        return timedOut
+          ? this.storeQuota(scope.revision, unavailableQuota("deepseek", "timeout"))
+          : { revision: scope.revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+      }
+      const after = this.captureQuotaScope();
+      if (after.revision !== scope.revision) {
+        this.cachedQuota = undefined;
+        return { revision: after.revision, snapshot: unavailableQuota("deepseek", "auth_changed") };
+      }
+      const snapshot = parseDeepSeekAccountBalance(outcome, { now: Date.now(), hasApiKey: after.hasApiKey });
+      return this.storeQuota(after.revision, snapshot);
     } catch (error) {
-      if (options.signal?.aborted) {
-        return { revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+      if (this.destroyed) {
+        return { revision: scope.revision, snapshot: unavailableQuota("deepseek", "cancelled") };
+      }
+      const after = this.captureQuotaScope();
+      if (after.revision !== scope.revision) {
+        this.cachedQuota = undefined;
+        return { revision: after.revision, snapshot: unavailableQuota("deepseek", "auth_changed") };
+      }
+      if (timedOut || isTimeoutAbort(options.signal)) {
+        return this.storeQuota(after.revision, unavailableQuota("deepseek", "timeout"));
+      }
+      if (abort.signal.aborted || options.signal?.aborted) {
+        return { revision: after.revision, snapshot: unavailableQuota("deepseek", "cancelled") };
       }
       const reason = error instanceof QuotaReadError ? error.reason : "native_error";
-      const snap = unavailableQuota("deepseek", reason);
-      if (this.cachedQuota?.snapshot.observedAt) {
-        return {
-          revision,
-          snapshot: { ...structuredClone(this.cachedQuota.snapshot), state: "stale", reason, lastAttemptAt: snap.lastAttemptAt },
-        };
-      }
-      return { revision, snapshot: snap };
+      return this.storeQuota(after.revision, unavailableQuota("deepseek", reason));
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onCallerAbort);
+      this.quotaAborts.delete(abort);
     }
   }
 
@@ -880,6 +996,10 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
       return;
     }
     this.destroyed = true;
+    for (const abort of [...this.quotaAborts]) {
+      abort.abort();
+    }
+    this.quotaAborts.clear();
     const recoveryBarrier = this.transportRecoveryBarrier;
     this.transportRecoveryBarrier = undefined;
     recoveryBarrier?.reject(new Error("DeepSeek Harness adapter was destroyed"));
@@ -902,7 +1022,13 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
 
   private async ensureOperational(signal?: AbortSignal): Promise<void> {
     this.assertUsable();
-    await this.ensureConnected();
+    if (signal) {
+      const connecting = this.ensureConnected();
+      void connecting.catch(() => {});
+      await waitForOperationOrAbort(connecting, signal);
+    } else {
+      await this.ensureConnected();
+    }
     const barrier = this.transportRecoveryBarrier;
     if (barrier) {
       if (signal) {
@@ -916,6 +1042,8 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
 
   private beginTransportRecovery(): TransportRecoveryBarrier {
     this.recoveringTransport = true;
+    this.quotaHostGeneration += 1;
+    this.cachedQuota = undefined;
     this.configuredSessions.clear();
     this.hostDefaultModel = undefined;
     this.hostDefaultModelPromise = undefined;
@@ -3986,6 +4114,37 @@ function abortError(): Error {
   const error = new Error("DeepSeek Harness turn was aborted");
   error.name = "AbortError";
   return error;
+}
+
+function isTimeoutAbort(signal: AbortSignal | undefined): boolean {
+  const reason = signal?.reason;
+  return Boolean(reason && typeof reason === "object" && "name" in reason && (reason as { name?: unknown }).name === "TimeoutError");
+}
+
+function readBoundedQuotaFile(file: string): string {
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > 1024 * 1024) return "unreadable";
+    const buffer = Buffer.allocUnsafe(Math.min(stat.size + 1, 1024 * 1024 + 1));
+    let used = 0;
+    while (used < buffer.length) {
+      const count = readSync(fd, buffer, used, buffer.length - used, used);
+      if (!count) break;
+      used += count;
+    }
+    const after = fstatSync(fd);
+    if (used > 1024 * 1024 || used !== stat.size || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) {
+      return `changed:${after.size}:${after.mtimeMs}:${after.ctimeMs}`;
+    }
+    return buffer.toString("utf8", 0, used);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return "";
+    return "unreadable";
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 function formatTimeoutMinutes(timeoutMs: number): string {

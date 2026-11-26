@@ -1,4 +1,17 @@
-import { ENGINE_QUOTA_CAPABILITY, quotaDirectorySchema, quotaReadingExpired, quotaScopeSchema, type QuotaDirectory, type QuotaEngine, type QuotaReason, type QuotaScope, type QuotaSnapshot, type QuotaState } from "../client-protocol/engine-quota.js";
+import {
+  ENGINE_QUOTA_CAPABILITIES_HEADER,
+  ENGINE_QUOTA_CAPABILITY,
+  ENGINE_QUOTA_CURRENCY_CAPABILITY,
+  quotaDirectorySchema,
+  quotaReadingExpired,
+  quotaScopeSchema,
+  type QuotaDirectory,
+  type QuotaEngine,
+  type QuotaReason,
+  type QuotaScope,
+  type QuotaSnapshot,
+  type QuotaState,
+} from "../client-protocol/engine-quota.js";
 import type { LocalHostClient } from "./client.js";
 
 export async function engineQuotaCommand(client: Pick<LocalHostClient, "request" | "ready">, flags: { bot?: string; refresh?: boolean; revision?: string }) {
@@ -6,7 +19,10 @@ export async function engineQuotaCommand(client: Pick<LocalHostClient, "request"
   if (flags.refresh && (!flags.bot || !flags.revision) || flags.revision && !flags.refresh) throw new Error("刷新前先读取额度，再使用 engines quota --bot BOT --refresh --revision REV / Read quotas before refreshing a Bot scope.");
   if (flags.bot && !/^[A-Za-z0-9_-]{1,128}$/.test(flags.bot) || flags.revision && !/^[a-zA-Z0-9_.:-]{1,128}$/.test(flags.revision)) throw new Error("Invalid quota scope or revision");
   const url = `/api/engine-quotas${flags.bot ? `/${encodeURIComponent(flags.bot)}` : ""}${flags.refresh ? `?refresh=1&revision=${encodeURIComponent(flags.revision!)}` : ""}`;
-  return (flags.bot ? quotaScopeSchema : quotaDirectorySchema).parse(await client.request(url));
+  const raw = client.ready.serverCapabilities.includes(ENGINE_QUOTA_CURRENCY_CAPABILITY)
+    ? await client.request(url, "GET", undefined, { [ENGINE_QUOTA_CAPABILITIES_HEADER]: ENGINE_QUOTA_CURRENCY_CAPABILITY })
+    : await client.request(url);
+  return (flags.bot ? quotaScopeSchema : quotaDirectorySchema).parse(raw);
 }
 
 // Same verified sources as the App settings card (client/src/EngineQuota.tsx).
@@ -60,6 +76,7 @@ export const QUOTA_REASON_TEXT: Record<QuotaReason, Text> = {
   host_upgrade_required: ["请更新主机与 Bot 运行程序以读取额度。", "Update the Host and Bot runtime to read quotas."],
 };
 export const QUOTA_CLAUDE_UNVERIFIABLE_TEXT: Text = ["Claude Code 的凭据来源无法由公开接口核实（例如 macOS 钥匙串登录），为避免显示其他账号的额度，不展示被动收到的读数。", "Claude Code's credential source cannot be verified through a public interface (for example, a macOS Keychain login). Passive readings are hidden so another account's quota is never shown."];
+export const QUOTA_PI_UNSUPPORTED_TEXT: Text = ["当前供应商不提供可读取的账号额度（Pi 仅统计本会话 token 与费用）。", "This provider does not provide account quotas (Pi only tracks local session tokens and cost)."];
 export const QUOTA_EXPIRED_TEXT: Text = ["已过期，需重新读取", "Expired; refresh required"];
 const ENGINE_NAMES: Record<QuotaEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
 
@@ -73,6 +90,7 @@ export function engineQuotaNotes(value: QuotaDirectory | QuotaScope, now = Date.
     if (scope.state === "ready" && !expired) continue;
     const state = QUOTA_STATE_TEXT[expired ? "stale" : scope.state], code = scope.reason ?? scope.capability.reason;
     const reason = code === "scope_unverifiable" && scope.engine === "claude" ? QUOTA_CLAUDE_UNVERIFIABLE_TEXT
+      : code === "mode_not_supported" && scope.engine === "pi" ? QUOTA_PI_UNSUPPORTED_TEXT
       : code ? QUOTA_REASON_TEXT[code] : expired || scope.state === "stale" ? QUOTA_EXPIRED_TEXT : undefined;
     lines.push(`${scope.label}（${ENGINE_NAMES[scope.engine]}）：${state[0]}${reason ? ` — ${reason[0]}` : ""} / ${state[1]}${reason ? ` — ${reason[1]}` : ""}`);
     // Same condition as the App's refresh button for an active (native) reader.

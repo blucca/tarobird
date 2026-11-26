@@ -638,6 +638,8 @@ async function createAdapter(
       gateway: host,
       searchMcpEnabled: searchRouting.enabled && Boolean(searchMcpInvocation),
       workspacePath,
+      sharedHome: config.deepseekHome,
+      childEnv: searchRouting.env,
       configPath,
       goalStatePath: path.join(config.stateDir, "deepseek-goals.json"),
       permissionPreset: deepSeekPermissionPreset(approvalMode),

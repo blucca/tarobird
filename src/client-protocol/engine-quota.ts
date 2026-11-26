@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 export const ENGINE_QUOTA_CAPABILITY = "engines.quota.v1";
+export const ENGINE_QUOTA_CURRENCY_CAPABILITY = "engines.quota.currency.v1";
+export const ENGINE_QUOTA_CAPABILITIES_HEADER = "X-TaroBot-Quota-Capabilities";
 export const ENGINE_QUOTA_TTL_MS = 60_000;
 /** How long one explicit refresh may take inside an engine. Antigravity's `agy -p /usage` took 4 to 8 seconds
  * when measured (2026-11-22); Codex and Claude Code keep their own shorter limits. The Gateway and the Hub wait
@@ -32,10 +34,14 @@ export const quotaWindowSchema = z.discriminatedUnion("metric", [
   z.object({ ...windowFields, metric: z.literal("unknown") }).strict(),
 ]);
 // Native credit or currency wallet balances. They are not token estimates.
-export const quotaBalanceSchema = z.object({
-  id: identifier, kind: z.enum(["credits", "currency"]), amount: z.string().max(80).regex(/^\d+(?:\.\d+)?$/).nullable(),
-  unit: z.string().min(1).max(16).regex(/^[A-Za-z0-9._-]+$/), observedAt: timestamp, expiresAt: timestamp, unlimited: z.boolean().optional(),
-}).strict();
+const balanceFields = {
+  id: identifier, amount: z.string().max(80).regex(/^\d+(?:\.\d+)?$/).nullable(),
+  observedAt: timestamp, expiresAt: timestamp, unlimited: z.boolean().optional(),
+};
+export const quotaBalanceSchema = z.discriminatedUnion("kind", [
+  z.object({ ...balanceFields, kind: z.literal("credits"), unit: z.literal("credits") }).strict(),
+  z.object({ ...balanceFields, kind: z.literal("currency"), unit: z.string().min(1).max(16).regex(/^[A-Za-z0-9._-]+$/) }).strict(),
+]);
 export const quotaConstraintSchema = z.object({
   code: z.enum(["ordinary_usage_blocked", "spend_control", "credits_depleted", "overage_disabled", "other_native_limit"]),
   availability: quotaAvailabilitySchema, resetsAt: timestamp.optional(),
@@ -85,4 +91,36 @@ export function quotaReadingExpired(snapshot: Pick<QuotaSnapshot, "observedAt" |
   if (snapshot.observedAt && Date.parse(snapshot.observedAt) + ENGINE_QUOTA_TTL_MS <= now) return true;
   if ([...snapshot.constraints, ...snapshot.pools.flatMap(pool => pool.constraints)].some(value => past(value.resetsAt))) return true;
   return snapshot.pools.some(pool => [...pool.windows, ...pool.balances].some(value => past(value.expiresAt) || "resetsAt" in value && past(value.resetsAt)));
+}
+
+/** Project a quota scope for v1-only clients (`engines.quota.v1`) that reject
+ * `kind: "currency"` balances in strict schema validation. */
+export function projectQuotaScopeForClient(scope: QuotaScope, options: { currencyBalances: boolean }): QuotaScope {
+  if (options.currencyBalances) return scope;
+  let strippedCurrency = false;
+  const pools: QuotaPool[] = [];
+  for (const pool of scope.pools) {
+    const hadCurrency = pool.balances.some(balance => balance.kind === "currency");
+    if (!hadCurrency) {
+      pools.push(pool);
+      continue;
+    }
+    strippedCurrency = true;
+    const balances = pool.balances.filter(balance => balance.kind !== "currency");
+    if (pool.windows.length > 0 || balances.length > 0 || pool.constraints.length > 0) {
+      pools.push({ ...pool, balances });
+    }
+  }
+  if (!strippedCurrency) return scope;
+  if (pools.length === 0 && scope.constraints.length === 0 && scope.availability === "unknown"
+    && (scope.state === "ready" || scope.state === "stale")) {
+    const { observedAt: _observedAt, ...rest } = scope;
+    return { ...rest, state: "unknown", pools };
+  }
+  return { ...scope, pools };
+}
+
+export function projectQuotaDirectoryForClient(directory: QuotaDirectory, options: { currencyBalances: boolean }): QuotaDirectory {
+  if (options.currencyBalances) return directory;
+  return { ...directory, scopes: directory.scopes.map(scope => projectQuotaScopeForClient(scope, options)) };
 }

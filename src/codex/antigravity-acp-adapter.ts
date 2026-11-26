@@ -205,6 +205,7 @@ type Worker = {
   contextUsage?: { used: number; size: number };
   stderrTail: string;
   lastActivityAt: number;
+  quotaCredentialAtSpawn: string;
   removed: boolean;
   /** Set while initialize and the session request are in flight; ends that wait when the worker is removed. */
   rejectStart?: (error: Error) => void;
@@ -497,9 +498,11 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (this.destroyed || this.destroyPromise) return this.quotaCache.failure(scope, "cancelled");
     const cached = this.quotaCache.response(scope, options);
     if (cached) return cached;
-    const preferredPids = [...this.workers.values()]
-      .filter(worker => !worker.closing && !worker.exited && typeof worker.child.pid === "number")
-      .map(worker => worker.child.pid as number);
+    const preferredPids = [...new Set([...this.workers.values()]
+      .filter(worker => !worker.removed && !worker.closing && !worker.exited
+        && worker.quotaCredentialAtSpawn === scope.credentialRevision
+        && typeof worker.child.pid === "number" && worker.child.pid > 0)
+      .map(worker => worker.child.pid as number))];
     // Keep unit tests with injected fake spawners hermetic unless `localQuotaProbe` is explicitly supplied.
     const localProbe = this.options.localQuotaProbe ?? (!this.options.quotaSpawnFn && !this.options.spawnFn);
     return readOwnedAntigravityQuota({
@@ -693,6 +696,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (this.destroyed) throw new Error("Adapter destroyed");
     const args = ["acp", ...permissionFlags(approvalMode), "--add-dir", workspace];
     const invocation = buildCommandInvocation(this.executable, args);
+    const quotaCredentialAtSpawn = this.quotaCache.capture("spawn").credentialRevision;
     const child = this.spawnFn(invocation.command, invocation.args, {
       stdio: ["pipe", "pipe", "pipe"], shell: invocation.shell, env: this.childEnv, cwd: workspace, windowsHide: true,
     });
@@ -708,7 +712,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       .connect(stream);
     worker = {
       child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, reserved: false, wake: null, promptSeq: 0,
-      tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), removed: false, exited: false,
+      tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), quotaCredentialAtSpawn, removed: false, exited: false,
     };
     this.workers.set(requestedId, worker);
     const decoder = new TextDecoder();

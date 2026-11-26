@@ -10,17 +10,60 @@ export type DeepSeekBalanceOutcome =
   | { status: "ready"; value: readonly DeepSeekWallet[]; bonusWallets?: readonly DeepSeekWallet[] }
   | { status: "failed" };
 
-/** Normalize Platform decimal / scientific balance strings (e.g. "0E-16", "5.000000", "12.5")
- * into a clean unsigned decimal string accepted by `quotaBalanceSchema`. */
+const UNSIGNED_DECIMAL_RE = /^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+const MAX_BALANCE_CHARS = 80;
+const MAX_WALLETS_PER_LIST = 8;
+
+/** Normalize Platform unsigned decimal / scientific balance strings (e.g. "0E-16",
+ * "5.000000", "12.5", "0.00001", "1e21") into a clean unsigned decimal string
+ * accepted by `quotaBalanceSchema`. Rejects non-decimal literals (hex/octal/binary),
+ * negative values, and values that cannot be represented without turning a non-zero
+ * balance into zero. */
 export function normalizeBalanceDecimal(raw: string): string | null {
   const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 80) return null;
-  const parsed = Number(trimmed);
-  if (!Number.isFinite(parsed) || parsed < 0) return null;
-  if (parsed === 0) return "0.00";
-  // Keep 2..6 significant fractional digits cleanly without scientific notation.
-  const fixed = Math.abs(parsed) < 1e-6 ? "0.00" : parsed.toFixed(Math.abs(parsed) < 0.01 ? 4 : 2);
-  return /^\d+(?:\.\d+)?$/.test(fixed) ? fixed : null;
+  if (!trimmed || trimmed.length > MAX_BALANCE_CHARS || !UNSIGNED_DECIMAL_RE.test(trimmed)) return null;
+  const match = /^(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(trimmed);
+  if (!match) return null;
+  const intPart = match[1] ?? "";
+  const fracPart = match[2] ?? "";
+  const exp = match[3] !== undefined ? Number.parseInt(match[3], 10) : 0;
+  if (!Number.isSafeInteger(exp)) return null;
+
+  const digits = intPart + fracPart;
+  const firstNonZero = digits.search(/[1-9]/);
+  if (firstNonZero < 0) return "0.00";
+
+  const sig = digits.slice(firstNonZero).replace(/0+$/, "");
+  const pos = intPart.length - firstNonZero + exp;
+
+  let whole: string;
+  let frac: string;
+  if (pos >= sig.length) {
+    if (pos + 3 > MAX_BALANCE_CHARS) return null;
+    whole = sig + "0".repeat(pos - sig.length);
+    frac = "00";
+  } else if (pos > 0) {
+    whole = sig.slice(0, pos);
+    frac = sig.slice(pos);
+    if (frac.length < 2) frac = frac.padEnd(2, "0");
+  } else {
+    const leadingZeros = -pos;
+    if (2 + leadingZeros >= MAX_BALANCE_CHARS) return null;
+    whole = "0";
+    frac = "0".repeat(leadingZeros) + sig;
+    if (frac.length < 2) frac = frac.padEnd(2, "0");
+  }
+
+  let formatted = `${whole}.${frac}`;
+  if (formatted.length > MAX_BALANCE_CHARS) {
+    const maxFrac = MAX_BALANCE_CHARS - whole.length - 1;
+    if (maxFrac < 2) return null;
+    const truncated = frac.slice(0, maxFrac).replace(/0+$/, "");
+    // Never round a tiny non-zero balance down to zero.
+    if (whole === "0" && !/[1-9]/.test(truncated)) return null;
+    formatted = `${whole}.${truncated.length < 2 ? truncated.padEnd(2, "0") : truncated}`;
+  }
+  return /^\d+(?:\.\d+)?$/.test(formatted) && formatted.length <= MAX_BALANCE_CHARS ? formatted : null;
 }
 
 function mapWallets(
@@ -29,18 +72,39 @@ function mapWallets(
   observedAt: string,
   expiresAt: string,
 ): QuotaBalance[] {
+  if (wallets.length > MAX_WALLETS_PER_LIST) {
+    throw new QuotaReadError("invalid_response");
+  }
   const out: QuotaBalance[] = [];
   const seen = new Set<string>();
-  for (const item of wallets.slice(0, 8)) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+  for (const item of wallets) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new QuotaReadError("invalid_response");
+    }
     const row = item as Record<string, unknown>;
-    const currencyRaw = typeof row.currency === "string" ? row.currency.trim().toUpperCase() : "";
-    const balanceRaw = typeof row.balance === "string" ? row.balance : typeof row.balance === "number" ? String(row.balance) : "";
-    if (!/^[A-Za-z0-9._-]{1,16}$/.test(currencyRaw)) continue;
+    if (typeof row.currency !== "string") {
+      throw new QuotaReadError("invalid_response");
+    }
+    const currencyRaw = row.currency.trim().toUpperCase();
+    if (!/^[A-Za-z0-9._-]{1,16}$/.test(currencyRaw)) {
+      throw new QuotaReadError("invalid_response");
+    }
+    let balanceRaw: string;
+    if (typeof row.balance === "string") {
+      balanceRaw = row.balance;
+    } else if (typeof row.balance === "number" && Number.isFinite(row.balance)) {
+      balanceRaw = String(row.balance);
+    } else {
+      throw new QuotaReadError("invalid_response");
+    }
     const amount = normalizeBalanceDecimal(balanceRaw);
-    if (amount === null) continue;
+    if (amount === null) {
+      throw new QuotaReadError("invalid_response");
+    }
     const id = `${prefix}_${currencyRaw.toLowerCase()}`;
-    if (seen.has(id)) continue;
+    if (seen.has(id)) {
+      throw new QuotaReadError("invalid_response");
+    }
     seen.add(id);
     out.push({
       id,
@@ -74,6 +138,9 @@ export function parseDeepSeekAccountBalance(
     return unavailableQuota("deepseek", "native_error", now, "subscription");
   }
   if (obj.status !== "ready" || !Array.isArray(obj.value)) {
+    throw new QuotaReadError("invalid_response");
+  }
+  if (obj.bonusWallets !== undefined && obj.bonusWallets !== null && !Array.isArray(obj.bonusWallets)) {
     throw new QuotaReadError("invalid_response");
   }
 
