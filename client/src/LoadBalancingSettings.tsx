@@ -1,14 +1,19 @@
-import { useContext, useEffect, useState } from "react";
+import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Activity, Cpu, MemoryStick, RefreshCw, Scale } from "lucide-react";
 import {
   defaultLoadBalancingPreferences,
   type HostBalancePreference,
   type LoadBalancingPreferences,
 } from "../../src/client-protocol/host-balancer.js";
-import { hostResourcesSchema, type HostResources } from "../../src/client-protocol/host-resources.js";
-import { BotMessageHostsContext } from "./bot-message-hosts.js";
+import {
+  HOST_BALANCE_RESOURCES_PATH,
+  hostBalanceResourcesSchema,
+  type HostBalanceResources,
+} from "../../src/client-protocol/host-balance-resources.js";
+import { BotMessageHostsContext, LocalHostKeyContext } from "./bot-message-hosts.js";
+import { networkHostBlocked } from "./host-connections.js";
 import { t, useLocale } from "./i18n.js";
-import { timeoutSignal } from "./abort-signals.js";
+import { anySignal, timeoutSignal } from "./abort-signals.js";
 import "./load-balancing.css";
 
 const PREFERENCE_OPTIONS: Array<{ value: HostBalancePreference; label: () => string }> = [
@@ -17,6 +22,8 @@ const PREFERENCE_OPTIONS: Array<{ value: HostBalancePreference; label: () => str
   { value: "less_often", label: () => t("少用") },
   { value: "manual_only", label: () => t("仅手动") },
 ];
+
+type HostTelemetryState = HostBalanceResources | "error" | "unsupported";
 
 export function LoadBalancingSettings({
   value,
@@ -28,36 +35,74 @@ export function LoadBalancingSettings({
   active: boolean;
 }) {
   useLocale();
-  const hosts = useContext(BotMessageHostsContext).filter((entry) => !entry.host.networkBlocked);
+  const allHosts = useContext(BotMessageHostsContext);
+  const localHostKey = useContext(LocalHostKeyContext);
+  const hosts = allHosts.filter((entry) => !networkHostBlocked(entry, localHostKey));
   const current: LoadBalancingPreferences = {
     ...defaultLoadBalancingPreferences,
     ...value,
     hostPreferences: { ...(value?.hostPreferences ?? {}) },
     botTemplate: { ...defaultLoadBalancingPreferences.botTemplate, ...(value?.botTemplate ?? {}) },
   };
-  const [telemetry, setTelemetry] = useState<Record<string, HostResources | "error">>({});
+  const [telemetry, setTelemetry] = useState<Record<string, HostTelemetryState>>({});
   const [refreshing, setRefreshing] = useState(false);
+  const seqRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+  const hostsRef = useRef(hosts);
+  hostsRef.current = hosts;
 
-  const loadTelemetry = async () => {
+  const hostStatusKey = hosts
+    .map((entry) => `${entry.host.id}:${entry.host.publicKey}:${entry.connection?.state.status ?? "none"}:${entry.connection?.state.hostBalanceResourcesAvailable ? "1" : "0"}`)
+    .join("|");
+
+  const loadTelemetry = useCallback(async () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const seq = ++seqRef.current;
     setRefreshing(true);
-    const next: Record<string, HostResources | "error"> = {};
-    await Promise.all(hosts.map(async (entry) => {
-      if (!entry.connection || entry.connection.state.status !== "online") return;
-      try {
-        const raw = await entry.connection.http<unknown>("/api/host-resources", { signal: timeoutSignal(5_000) });
-        next[entry.host.publicKey] = hostResourcesSchema.parse(raw);
-      } catch {
-        next[entry.host.publicKey] = "error";
-      }
-    }));
-    setTelemetry(next);
-    setRefreshing(false);
-  };
+
+    const snapshot = hostsRef.current;
+    const next: Record<string, HostTelemetryState> = {};
+    try {
+      await Promise.all(snapshot.map(async (entry) => {
+        const conn = entry.connection;
+        if (!conn || conn.state.status !== "online") return;
+        if (conn.state.hostBalanceResourcesAvailable === false) {
+          next[entry.host.publicKey] = "unsupported";
+          return;
+        }
+        try {
+          const raw = await conn.http<unknown>(HOST_BALANCE_RESOURCES_PATH, {
+            signal: anySignal([controller.signal, timeoutSignal(5_000)]),
+          });
+          next[entry.host.publicKey] = hostBalanceResourcesSchema.parse(raw);
+        } catch {
+          if (!controller.signal.aborted) next[entry.host.publicKey] = "error";
+        }
+      }));
+      if (controller.signal.aborted || seq !== seqRef.current) return;
+      setTelemetry(next);
+    } finally {
+      if (seq === seqRef.current) setRefreshing(false);
+    }
+  }, []);
 
   useEffect(() => {
-    if (!active || hosts.length < 2) return;
+    if (!active || hosts.length < 2) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      ++seqRef.current;
+      setRefreshing(false);
+      return;
+    }
     void loadTelemetry();
-  }, [active, hosts.length]);
+    return () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      ++seqRef.current;
+    };
+  }, [active, hosts.length, hostStatusKey, loadTelemetry]);
 
   // Only shown when two or more Hosts are connected/saved.
   if (hosts.length < 2) return null;
@@ -115,15 +160,17 @@ export function LoadBalancingSettings({
               <small>{online ? t("在线") : t("离线")}</small>
             </div>
             <div className="lb-host-metrics">
-              {online && res && res !== "error" ? <>
+              {online && res && res !== "error" && res !== "unsupported" ? <>
                 <span><Cpu size={11} aria-hidden="true"/> CPU {res.cpuPercent}%</span>
                 <span><MemoryStick size={11} aria-hidden="true"/> {t("内存")} {res.memoryUsedPercent}%</span>
                 <span><Activity size={11} aria-hidden="true"/> {t("{0} 个进行中", res.activeTurns + res.activeTickets)}</span>
                 {typeof latency === "number" && <span>{Math.round(latency)} ms</span>}
-              </> : online && res === "error" ? (
+              </> : online && (res === "error" || res === "unsupported") ? (
                 <span className="muted">{t("此主机暂未报告资源状态")}</span>
+              ) : online ? (
+                <span className="muted">{refreshing ? t("正在读取负载…") : t("此主机暂未报告资源状态")}</span>
               ) : (
-                <span className="muted">{online ? t("正在读取负载…") : t("离线主机不参与自动选择")}</span>
+                <span className="muted">{t("离线主机不参与自动选择")}</span>
               )}
             </div>
           </div>

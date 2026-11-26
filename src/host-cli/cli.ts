@@ -101,7 +101,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   folders pin --unfiled --enabled on|off --revision N
     取消置顶恢复普通分组位置；旧置顶未保存原位置时回到普通分组末尾
   conversations list --host HOST --bot BOT [--source-bot LOCAL_BOT_ID]
-  conversations create [--host auto] --engine ENGINE [--model M] [--title T] [--workspace DIR] [--request-id ID]
+  conversations create [--host auto] (--engine ENGINE | --bot BOT) [--model M] [--title T] [--workspace DIR] [--request-id ID]
   conversations local                 当前本地主机的全部可见对话（含已归档）
   history snapshot|anchors CONVERSATION --bot BOT [--message MESSAGE] [--cursor CURSOR]
   history rewind|fork CONVERSATION --bot BOT --revision REV --request-id ID [--anchor ANCHOR] [--title TITLE]
@@ -347,7 +347,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     tickets: ["bot", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
     devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
     folders: ["enabled", "revision", "unfiled"],
-    conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session"],
+    conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session", "engine", "title", "workspace"],
     widgets: ["html-file", "report-file", "title", "summary", "request-id", "enabled", "revision"],
     messages: ["ids", "before", "through", "yes", "to", "source-bot", "text-file", "file", "new-conversation", "message", "timeout", "out", "request-id", "from", "bot", "context-message", "cross-host", "delivery", "enabled"],
     queue: ["bot", "message", "before", "last", "text", "text-file", "revision", "request-id"],
@@ -364,7 +364,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
   if (command === "conversations") {
     if (sub === "pi-session") {
       required(argument, "缺少 CONVERSATION。"); required(v.bot, "缺少 --bot BOT。");
-      if ([v.host, v["source-bot"], v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v.revision].some(value => value !== undefined)) throw new Error("pi-session 仅支持当前主机的对话与 Pi 会话参数。");
+      if ([v.host, v["source-bot"], v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v.revision, v.engine, v.title, v.workspace].some(value => value !== undefined)) throw new Error("pi-session 仅支持当前主机的对话与 Pi 会话参数。");
       if (v.model !== undefined && v.thinking !== undefined) throw new Error("--model 与 --thinking 不能同时使用。");
       if (v.model !== undefined || v.thinking !== undefined) {
         const expectedSession = required(v.session, "修改 Pi 会话必须填写 --session TOKEN。"), requestId = required(v["request-id"], "修改 Pi 会话必须填写 --request-id ID；结果未知时保留同一编号核对。");
@@ -372,7 +372,14 @@ export async function runHostCli(argv: string[]): Promise<void> {
         if (action === "thinking" && selected !== "default" && !piSessionThinkingSchema.safeParse(selected).success) throw piLevelArgumentError("--thinking", selected);
         piSessionUpdate = { expectedSession, requestId, action, value: selected === "default" ? null : action === "thinking" ? piSessionThinkingSchema.parse(selected) : selected };
       } else if (v.session !== undefined || v["request-id"] !== undefined) throw new Error("只读 Pi 会话不接受 --session 或 --request-id；修改时需填写 --model 或 --thinking。");
-    } else if ([v.model, v.thinking, v.session].some(value => value !== undefined)) throw new Error("--model、--thinking、--session 仅支持 conversations pi-session。");
+    } else if (sub === "create") {
+      if (argument !== undefined) throw new Error("conversations create 不接受额外的位置参数。");
+      if ([v.thinking, v.session].some(value => value !== undefined)) throw new Error("--thinking、--session 仅支持 conversations pi-session。");
+      if ([v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v.revision, v["source-bot"]].some(value => value !== undefined)) throw new Error("conversations create 不接受批量整理或跨主机路由参数。");
+    } else {
+      if ([v.model, v.thinking, v.session].some(value => value !== undefined)) throw new Error("--model、--thinking、--session 仅支持 conversations pi-session（--model 也支持 conversations create）。");
+      if ([v.engine, v.title, v.workspace].some(value => value !== undefined)) throw new Error("--engine、--title、--workspace 仅支持 conversations create。");
+    }
   }
   const positionalLimit: Record<string, number> = { history: 3, screens: 3, workbench: 3, engines: 2, backups: 2, integrations: 3, directory: 2, name: 2, bots: 3, queue: 3, tasks: 3, steer: 3, side: 3, changes: 3, bus: 3, groups: 3, messages: 3, tickets: 3, widgets: 3, folders: 3, conversations: 2, devices: 3, service: 2, network: 3, update: 3, backup: 2, restore: 2 };
   if (command === "conversations" && sub === "pi-session") positionalLimit.conversations = 3;
