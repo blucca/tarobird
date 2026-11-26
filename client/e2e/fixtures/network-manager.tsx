@@ -65,16 +65,31 @@ class FixtureConnection {
       if (this.routesWaiting) this.state.network.sync = "waiting";
     }
     if (command.operation === "propose") {
-      const proposal: SignedNetworkProposal = { signature: "A".repeat(86) + "==", proposal: { v: 1, host: { publicKey: this.state.network.host.publicKey, name: this.state.network.host.name, routes: this.state.network.host.routes }, devices: [], authorityKey: command.authorityKey, networkId: command.networkId, seenManifestHash: command.seenManifestHash, nonce: "n".repeat(43), expiresAt: Date.now() + 60_000 } };
+      const gen = command.generation;
+      const proposal: SignedNetworkProposal = { signature: "A".repeat(86) + "==", proposal: { v: 1, host: { publicKey: this.state.network.host.publicKey, name: this.state.network.host.name, routes: this.state.network.host.routes, ...(gen ? { generation: gen, protocol: 2 as const } : {}) }, devices: [], authorityKey: command.authorityKey, networkId: command.networkId, seenManifestHash: command.seenManifestHash, nonce: "n".repeat(43), expiresAt: Date.now() + 60_000 } };
       return { view: this.state.network, proposal };
+    }
+    if (command.operation === "reinstate") {
+      const membership = structuredClone(this.state.network.membership!);
+      membership.manifest.v = 2;
+      membership.manifest.revision++;
+      membership.manifest.hosts = membership.manifest.hosts.map(host => host.publicKey === command.publicKey
+        ? { ...host, reinstated: (host.generation ?? 1) + 1 }
+        : (!host.revoked && host.state === "active" ? { ...host, protocol: 2 as const } : host));
+      this.state.network = { ...this.state.network, membership };
+      this.emit(); return { view: this.state.network, membership };
     }
     if (command.operation === "admit") {
       const prior = this.admissions.get(command.proposal.proposal.nonce);
       if (prior) return { view: this.state.network, membership: prior };
       if (command.proposal.proposal.seenManifestHash !== reviewedNetworkHash(this.state.network.membership!.manifest)) throw new Error("network_review_changed");
       const membership = structuredClone(this.state.network.membership!);
+      if (command.proposal.proposal.host.generation || membership.manifest.v === 2) membership.manifest.v = 2;
       membership.manifest.revision++;
-      membership.manifest.hosts = [...membership.manifest.hosts.filter(host => host.publicKey !== command.proposal.proposal.host.publicKey), { ...command.proposal.proposal.host, state: "pending", revoked: false, proposalNonce: command.proposal.proposal.nonce, expiresAt: command.proposal.proposal.expiresAt }];
+      membership.manifest.hosts = [
+        ...membership.manifest.hosts.filter(host => host.publicKey !== command.proposal.proposal.host.publicKey).map(host => membership.manifest.v === 2 && !host.revoked && host.state === "active" ? { ...host, protocol: 2 as const } : host),
+        { ...command.proposal.proposal.host, state: "pending", revoked: false, proposalNonce: command.proposal.proposal.nonce, expiresAt: command.proposal.proposal.expiresAt },
+      ];
       this.state.network = { ...this.state.network, membership }; this.admissions.set(command.proposal.proposal.nonce, membership); this.emit();
       if (this.dropAdmission) { this.dropAdmission = false; throw new Error("模拟加入确认响应丢失"); }
       return { view: this.state.network, membership };
@@ -82,7 +97,8 @@ class FixtureConnection {
     if (command.operation === "join") {
       if (this.failJoin) { this.failJoin = false; throw new Error("模拟连接中断"); }
       const membership = structuredClone(command.membership); membership.manifest.revision++;
-      membership.manifest.hosts = membership.manifest.hosts.map(host => host.publicKey === this.state.network.host.publicKey ? { publicKey: host.publicKey, name: host.name, routes: host.routes, state: "active", revoked: false } : host);
+      const protocolField = membership.manifest.v === 2 ? { protocol: 2 as const } : {};
+      membership.manifest.hosts = membership.manifest.hosts.map(host => host.publicKey === this.state.network.host.publicKey ? { publicKey: host.publicKey, name: host.name, routes: host.routes, ...(host.generation ? { generation: host.generation } : {}), ...protocolField, state: "active", revoked: false } : host);
       this.state.network = { ...this.state.network, membership, sync: "current" };
       connections[0]!.state.network = { ...connections[0]!.state.network, membership }; connections[0]!.emit();
       if (this.failAfterJoin) connections[0]!.failRefresh = true;
@@ -96,6 +112,12 @@ class FixtureConnection {
       if (this.failLeave) throw new Error(this.failLeave);
       const own = this.state.network.membership?.manifest.hosts.find(host => host.publicKey === this.state.network.host.publicKey);
       if (command.expectedState !== (own?.state ?? "standalone")) throw new Error("network_host_state_changed");
+      if (this.index === 1 && connections[0]!.state.network.membership) {
+        const membership = structuredClone(connections[0]!.state.network.membership);
+        membership.manifest.revision++;
+        membership.manifest.hosts = membership.manifest.hosts.map(host => host.publicKey === this.state.network.host.publicKey ? { ...host, revoked: true } : host);
+        connections[0]!.state.network = { ...connections[0]!.state.network, membership }; connections[0]!.emit();
+      }
       this.state.network = { host: { ...this.state.network.host, state: "active" }, sync: "standalone", lastSyncedAt: Date.now() };
     }
     if ((command.operation === "remove" || command.operation === "leave") && this.failAfterDeparture) this.failRefresh = true;
@@ -156,6 +178,7 @@ const entries = connections.map((connection, index) => ({ host: { id: runtimeHos
   changeReviewAgain() { const view = structuredClone(connections[1]!.state.networkChange!); view.membership!.manifest.name = "再次变更的网络"; view.membership!.manifest.revision++; connections[1]!.state.networkChange = view; connections[1]!.emit(); },
   failRefreshAfterDeparture() { connections[0]!.failAfterDeparture = true; connections[1]!.failAfterDeparture = true; },
   failRefreshAfterJoin() { connections[1]!.failJoin = false; connections[1]!.failAfterJoin = true; },
+  allowJoin() { connections[1]!.failJoin = false; },
   ownMultiHostNetwork() { const membership = structuredClone(initial); membership.manifest.id = "other-network"; membership.manifest.authorityKey = keys[1]!; membership.manifest.hosts[0] = { ...connections[1]!.state.network.host }; connections[1]!.state.network = { ...connections[1]!.state.network, membership, sync: "current" }; connections[1]!.emit(); },
   pendingSource() {
     const membership = structuredClone(initial); membership.manifest.revision++;

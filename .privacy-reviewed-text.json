@@ -67,7 +67,7 @@
     },
     {
       "path": "client/e2e/fixtures/network-manager.tsx",
-      "sha256": "38af0f5d187bde059037a1b5176e60b001f74b8f2bdda490aad41fe40eda1822",
+      "sha256": "e64be4b55321859d94abd057fcc31fcc27e44a81cb1d308d5aa425e74f8b8aed",
       "reviewer": "codex",
       "note": "Reviewed synthetic test identities, addresses and negative-case data; no owner deployment or contact information.",
       "findings": [
@@ -167,7 +167,7 @@
     },
     {
       "path": "client/e2e/network-manager.spec.ts",
-      "sha256": "ba533ec936656c258ca9b7253af86f2d6ea4c5017fa04facdb502ddc4623ddaa",
+      "sha256": "ce5a948b7138f9beff1ce7095ef7c485be40eb0ee70c5e7754c991a1b659716b",
       "reviewer": "codex",
       "note": "Reviewed synthetic test identities, addresses and negative-case data; no owner deployment or contact information.",
       "findings": [
@@ -1331,7 +1331,7 @@
     },
     {
       "path": "tests/host-cli-network-command.test.ts",
-      "sha256": "a88d4718d5256a5f3fe5999a7ba482fc65e66d5be977b61c140101cf4ae8fee3",
+      "sha256": "27cec0645a339fb3b12275eabdded0da2eb3115d1d8d211f59a677d87294ee31",
       "reviewer": "codex",
       "note": "Reviewed synthetic CGNAT addresses in isolated Tailscale route fixtures and negative cases; no owner deployment addresses or credentials.",
       "findings": [

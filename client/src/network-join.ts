@@ -10,6 +10,8 @@ export type NetworkJoinAttempt = {
   authorityKey: string;
   sourceKey: string;
   seenManifestHash: string;
+  generation?: number;
+  recover?: boolean;
   reviewedManifest?: NetworkManifest;
   proposal?: SignedNetworkProposal;
   membership?: SignedNetworkManifest;
@@ -20,13 +22,19 @@ export type NetworkJoinAttempt = {
 export async function joinNetworkHosts(source: NetworkCommandConnection, authority: NetworkCommandConnection, attempt: NetworkJoinAttempt, progress: (attempt: NetworkJoinAttempt) => void): Promise<NetworkView> {
   let next = { ...attempt };
   if (!next.proposal) {
-    const command = { operation: "propose" as const, networkId: next.networkId, authorityKey: next.authorityKey, seenManifestHash: next.seenManifestHash };
+    const command = {
+      operation: "propose" as const,
+      networkId: next.networkId,
+      authorityKey: next.authorityKey,
+      seenManifestHash: next.seenManifestHash,
+      ...(next.recover && next.generation ? { generation: next.generation, recover: true as const } : {}),
+    };
     const result = await source.networkCommand(command);
     if (!result.proposal) throw new Error("network_proposal_missing");
     next = { ...next, proposal: result.proposal }; progress(next);
   }
   const proposal = next.proposal!;
-  if (proposal.proposal.networkId !== next.networkId || proposal.proposal.authorityKey !== next.authorityKey || proposal.proposal.host.publicKey !== next.sourceKey || !("seenManifestHash" in proposal.proposal) || proposal.proposal.seenManifestHash !== next.seenManifestHash) throw new Error("network_proposal_mismatch");
+  if (proposal.proposal.networkId !== next.networkId || proposal.proposal.authorityKey !== next.authorityKey || proposal.proposal.host.publicKey !== next.sourceKey || !("seenManifestHash" in proposal.proposal) || proposal.proposal.seenManifestHash !== next.seenManifestHash || (proposal.proposal.host.generation ?? 1) !== (next.generation ?? 1)) throw new Error("network_proposal_mismatch");
   if (!next.membership) {
     const result = await authority.networkCommand({ operation: "admit", proposal });
     if (!result.membership) throw new Error("network_membership_missing");

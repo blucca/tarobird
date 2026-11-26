@@ -57,6 +57,14 @@ export function RoutesEditor({ connection, dirtyChange, busyChange, localHost = 
       <div><strong>{online ? t("已连接") : state.status === "connecting" ? t("正在连接…") : t("未连接")}</strong><span>{online && state.route ? <>{t("正在使用「{0}」", title(state.route))}{state.latency !== undefined && t(" · 延迟 {0} ms", state.latency)}</> : state.error ? state.error : t("正在检测已保存线路的可达性与主机身份。")}</span></div>
       {!online && <button type="button" className="secondary connection-retry" disabled={state.status === "connecting"} onClick={() => connection.resume(true)}>{t("重新连接")}</button>}
     </div>
+    {!online && !connection.isReadOnly && <div className="connection-checks" role="region" aria-label={t("连不上时先检查")}>
+      <strong>{t("连不上时先检查这几项（无需退出网络）：")}</strong>
+      <ul>
+        <li>{t("确认目标电脑已开机，且 TaroBird 主机正在运行。")}</li>
+        <li>{t("确认两台设备在同一局域网，或 Tailscale 均已登录并连通；外出使用需有可达的 VPS 中转。")}</li>
+        <li>{t("查看下方各条线路的探测状态，或点击「编辑线路」核对地址。")}</li>
+      </ul>
+    </div>}
     {online && state.routeSelection && !localHost && <p className="settings-note muted" role="status">{state.routeSelection.reason === "quality" ? t("已在空闲时切换：这条线路近期持续响应更快。") : state.routeSelection.reason === "failover" ? t("原连接中断，已通过另一条线路恢复。") : state.routeSelection.reason === "reconnected" ? t("已恢复原线路连接。") : t("已通过主机与设备身份验证。")}</p>}
     {!editing || localHost || identityPending ? <>
       {!localHost && !identityPending && <RepairHostRoute connection={connection} online={online} busyChange={setRepairBusy}/>}

@@ -177,3 +177,26 @@ it("selects a managed LAN via CLI while keeping Tailscale and requiring explicit
   expect((await a.hub.hostRoutes.view()).notices).not.toContain("lan_selection_required");
   expect(await a.hub.network.sharedRoutes()).toEqual(shared);
 });
+
+it("supports CLI reinstate and propose --recover after a host leaves, keeping Bots intact", async () => {
+  const a = await host("Coordinator"), b = await host("Peer");
+  await run(a, "network", "create", "--name", "CLI recovery network");
+  await join(a, b);
+  await b.hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('peer_bot','Peer Bot','fixture')");
+  await run(b, "network", "leave", "--yes");
+  expect((await b.hub.network.view()).sync).toBe("standalone");
+
+  const offerBefore = path.join(a.directory, "offer-before.json");
+  await run(a, "network", "offer", "--out", offerBefore);
+  await expect(run(b, "network", "propose", "--from", offerBefore, "--out", path.join(b.directory, "bad.json"), "--yes")).rejects.toThrow("tarobot network reinstate");
+  await expect(run(b, "network", "propose", "--from", offerBefore, "--out", path.join(b.directory, "bad2.json"), "--recover", "--yes")).rejects.toThrow("协调主机尚未允许");
+
+  const offerReinstated = path.join(a.directory, "offer-reinstated.json");
+  await run(a, "network", "reinstate", b.hub.auth.publicKey, "--yes", "--out", offerReinstated);
+  const proposal = path.join(b.directory, "recover-proposal.json"), admission = path.join(a.directory, "recover-admission.json");
+  await run(b, "network", "propose", "--from", offerReinstated, "--out", proposal, "--recover", "--yes");
+  await run(a, "network", "admit", "--from", proposal, "--out", admission, "--yes");
+  await run(b, "network", "join", "--from", admission, "--yes");
+  expect((await b.hub.network.view()).host).toMatchObject({ state: "active", revoked: false, generation: 2 });
+  expect((await b.hub.store.bots("owner")).map(bot => bot.id)).toEqual(["peer_bot"]);
+}, 20_000);

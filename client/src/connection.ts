@@ -161,6 +161,7 @@ export class HubConnection {
   pinNetwork(id:string, authorityKey:string): void { this.networkPin = {id, authorityKey}; }
   suspendNetwork(): void { this.networkBlocked = true; this.close(true); this.update({error:t("网络授权已失效")}); }
   get isNetworkBlocked(): boolean { return this.networkBlocked; }
+  get isDeviceRevoked(): boolean { return this.deviceRevoked; }
   get isReadOnly(): boolean { return this.networkBlocked || this.deviceRevoked || this.pairingRequired; }
   get isClosed(): boolean { return this.closed; }
   beginFileTransfer(): () => void { this.fileTransfers++; let released = false; return () => { if (!released) { released = true; this.fileTransfers--; this.lastTraffic = Date.now(); } }; }
@@ -1212,7 +1213,7 @@ export class HubConnection {
     return this.duringMutation(() => this.performNetworkCommand(raw));
   }
   private async performNetworkCommand(raw: NetworkCommandInput): Promise<{ view: NetworkView; membership?: SignedNetworkManifest; proposal?: SignedNetworkProposal }> {
-    const command = networkCommandSchema.parse(["routes", "attest", "remove", "leave"].includes(raw.operation) ? {networkId: this.networkPin?.id ?? "", ...(["remove", "leave"].includes(raw.operation) ? {expectedState: this.state.network?.membership?.manifest.hosts.find(h => h.publicKey === (raw.operation === "remove" ? raw.publicKey : this.identity.hubPublicKey))?.state ?? "standalone"} : {}), ...raw} : raw), token = this.token, epoch = this.httpEpoch;
+    const command = networkCommandSchema.parse(["routes", "attest", "reinstate", "remove", "leave"].includes(raw.operation) ? {networkId: this.networkPin?.id ?? "", ...(["remove", "leave"].includes(raw.operation) ? {expectedState: this.state.network?.membership?.manifest.hosts.find(h => h.publicKey === (raw.operation === "remove" ? raw.publicKey : this.identity.hubPublicKey))?.state ?? "standalone"} : {}), ...raw} : raw), token = this.token, epoch = this.httpEpoch;
     let revision = this.networkRevision;
     const current = () => { if (!token || this.closed || this.token !== token || epoch !== this.httpEpoch || epoch.signal.aborted || revision !== this.networkRevision) throw new HubHttpError(409, "device_action_cancelled"); };
     current();

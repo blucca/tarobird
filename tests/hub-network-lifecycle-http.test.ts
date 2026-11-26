@@ -57,7 +57,7 @@ async function mutationResponse(host: Host, raw: NetworkCommandInput, actor = ho
   const current = await view(host);
   if (raw.operation === "leave") raw = { expectedState: current.membership ? current.host.state : "standalone", ...raw };
   if (raw.operation === "remove") raw = { expectedState: current.membership!.manifest.hosts.find(value => value.publicKey === raw.publicKey)!.state, ...raw };
-  const command = networkCommandSchema.parse(["routes", "attest", "remove", "leave"].includes(raw.operation) ? { networkId: current.membership?.manifest.id ?? "", ...raw } : raw);
+  const command = networkCommandSchema.parse(["routes", "attest", "reinstate", "remove", "leave"].includes(raw.operation) ? { networkId: current.membership?.manifest.id ?? "", ...raw } : raw);
   const challenge = await http(host.hub, "/api/devices/challenge", { operation: "network", target: hashSecret(networkCanonical(command)) }, actor.token);
   expect(challenge.status).toBe(200); const statement = deviceActionStatementSchema.parse(challenge.body);
   const proof = { nonce: statement.nonce, signature: sign(null, Buffer.from(deviceActionProofText(statement)), actor.privateKey).toString("base64") };
@@ -251,4 +251,50 @@ it("a phone receives a signed departure receipt even when its own C session is r
   expect((await http(c.hub, "/api/network", undefined, phoneC.token)).status).toBe(401);
   expect((await http(a.hub, "/api/network", undefined, phoneA.token)).status).toBe(200);
   expect((await http(c.hub, "/api/network", undefined, c.owner.token)).status).toBe(200);
+});
+
+it("recovers a departed or removed host over signed TLS while keeping its Bots, conversations and files, and recovers a revoked device via fresh pairing", async () => {
+  const a = await host("A"), b = await host("B");
+  await mutation(a, { operation: "create", name: "Recovery network" });
+  await join(a, b);
+  const chatId = await seedChat(b);
+  await b.hub.store.db.run("INSERT INTO attachments(id,conversation_id,owner_id,sha256,size,mime,name,stored_name,complete,created_at) VALUES('file_keep',?,'owner','abc123',11,'text/plain','notes.txt','file_keep.txt',1,?)", [chatId, Date.now()]);
+
+  // 1. Device revocation on B (while in network) preserves host membership, Bots, chats & files, and recovers via normal fresh pairing.
+  const phone1 = await device(b.hub, "phone_revoke_test");
+  await b.hub.auth.revoke(phone1.id, "local-owner", b.owner.session, await (async () => {
+    const c = await http(b.hub, "/api/devices/challenge", { operation: "revoke", target: phone1.id }, b.owner.token);
+    const s = deviceActionStatementSchema.parse(c.body);
+    return { nonce: s.nonce, signature: sign(null, Buffer.from(deviceActionProofText(s)), b.owner.privateKey).toString("base64") };
+  })());
+  expect((await http(b.hub, "/api/network", undefined, phone1.token)).status).toBe(401);
+  expect((await view(b)).sync).toBe("current");
+  const phone2 = await device(b.hub, "phone_repair_test");
+  expect((await http(b.hub, "/api/network", undefined, phone2.token)).status).toBe(200);
+  expect((await b.hub.store.bots("owner")).some(bot => bot.id === "resident_bot")).toBe(true);
+  expect((await b.hub.store.snapshot("owner", chatId)).messages.length).toBeGreaterThan(0);
+
+  // 2. Host B leaves voluntarily, stale rejoin fails, explicit coordinator recovery restores membership and preserves Bots/conversations/files.
+  await b.hub.network.tick();
+  const phoneOnA = await install(b, a, "phone2_on_a", phone2);
+  await mutation(b, { operation: "leave" });
+  expect((await view(b)).sync).toBe("standalone");
+  expect((await http(b.hub, "/api/network", undefined, phone2.token)).status).toBe(401);
+  expect((await http(a.hub, "/api/network", undefined, phoneOnA.token)).status).toBe(200);
+
+  const afterLeave = (await view(a)).membership!.manifest;
+  expect((await mutationResponse(b, { operation: "propose", networkId: afterLeave.id, authorityKey: a.hub.auth.publicKey, seenManifestHash: hashSecret(networkCanonical(afterLeave)) })).status).toBe(403);
+
+  const reinstated = (await mutation(a, { operation: "reinstate", publicKey: b.hub.auth.publicKey })).membership!;
+  const { proposal } = await mutation(b, { operation: "propose", networkId: reinstated.manifest.id, authorityKey: a.hub.auth.publicKey, seenManifestHash: hashSecret(networkCanonical(reinstated.manifest)), generation: 2, recover: true });
+  const { membership } = await mutation(a, { operation: "admit", proposal: proposal! });
+  await mutation(b, { operation: "join", membership: membership!, nonce: proposal!.proposal.nonce });
+  expect((await view(b)).host).toMatchObject({ state: "active", revoked: false, generation: 2 });
+
+  // Bots, conversations, files, and local owner on B are unchanged; phone can re-enroll onto B with a fresh key.
+  expect((await b.hub.store.bots("owner")).some(bot => bot.id === "resident_bot")).toBe(true);
+  expect((await b.hub.store.snapshot("owner", chatId)).messages.some(m => m.blocks.some(block => block.type === "text" && block.text === "History stays on this host"))).toBe(true);
+  expect(await b.hub.store.db.get("SELECT id,name FROM attachments WHERE id='file_keep'")).toEqual({ id: "file_keep", name: "notes.txt" });
+  const phoneOnB2 = await install(a, b, "phone2_on_b_gen2", phoneOnA);
+  expect((await http(b.hub, "/api/network", undefined, phoneOnB2.token)).status).toBe(200);
 });

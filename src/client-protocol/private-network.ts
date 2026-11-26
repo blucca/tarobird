@@ -18,16 +18,19 @@ export const sharedRoutesSchema = z.array(routeSchema).max(9).superRefine((route
     if (u.protocol !== "https:" || isLoopbackOrUnspecified(u.hostname)) ctx.addIssue({ code: "custom", message: "network_route_must_be_remote" });
   }
 });
-export const networkHostDescriptorSchema = z.object({ publicKey: key, name: hostNameSchema, routes: sharedRoutesSchema, protocol: z.literal(2).optional() }).strict();
+export const networkHostDescriptorSchema = z.object({ publicKey: key, name: hostNameSchema, routes: sharedRoutesSchema, protocol: z.literal(2).optional(), generation: z.number().int().min(2).safe().optional() }).strict();
 export type NetworkHostDescriptor = z.infer<typeof networkHostDescriptorSchema>;
-export const networkHostSchema = networkHostDescriptorSchema.extend({ state: z.enum(["pending", "active"]), revoked: z.boolean(), proposalNonce: nonce.optional(), expiresAt: deadline.optional() }).strict()
-  .superRefine((host, ctx) => { if (host.state === "pending" ? !host.proposalNonce || !host.expiresAt : host.proposalNonce !== undefined || host.expiresAt !== undefined) ctx.addIssue({ code: "custom", message: "invalid_network_host_state" }); });
+export const networkHostSchema = networkHostDescriptorSchema.extend({ state: z.enum(["pending", "active"]), revoked: z.boolean(), proposalNonce: nonce.optional(), expiresAt: deadline.optional(), reinstated: z.number().int().min(2).safe().optional() }).strict()
+  .superRefine((host, ctx) => {
+    if (host.state === "pending" ? !host.proposalNonce || !host.expiresAt : host.proposalNonce !== undefined || host.expiresAt !== undefined) ctx.addIssue({ code: "custom", message: "invalid_network_host_state" });
+    if (host.reinstated !== undefined && (!host.revoked || host.reinstated !== (host.generation ?? 1) + 1)) ctx.addIssue({ code: "custom", message: "invalid_network_host_state" });
+  });
 export type NetworkHost = z.infer<typeof networkHostSchema>;
 export const networkEnrollmentSchema = z.object({ id, publicKey: key, host: key, name: hostNameSchema, platform: z.enum(["web", "macos", "windows", "android", "ios"]) }).strict();
 export type NetworkEnrollment = z.infer<typeof networkEnrollmentSchema>;
 export const networkPublishedEnrollmentSchema = networkEnrollmentSchema.extend({ scope: z.enum(["host", "network"]).optional() }).strict();
 export type NetworkPublishedEnrollment = z.infer<typeof networkPublishedEnrollmentSchema>;
-export const networkDeviceSchema = networkPublishedEnrollmentSchema.extend({ memberId: id, originHost: key, attestedBy: key, revoked: z.boolean() }).strict();
+export const networkDeviceSchema = networkPublishedEnrollmentSchema.extend({ memberId: id, originHost: key, attestedBy: key, revoked: z.boolean(), generation: z.number().int().min(2).safe().optional() }).strict();
 export type NetworkDevice = z.infer<typeof networkDeviceSchema>;
 export const networkDeviceRetiredByHosts = (device: NetworkDevice, removed: ReadonlySet<string>): boolean => removed.has(device.host) || device.scope !== "network" && (removed.has(device.originHost) || removed.has(device.attestedBy));
 export const networkBindingKey = (host: string, deviceId: string) => `${host}\0${deviceId}`;
@@ -52,7 +55,7 @@ export const networkManifestSchema = z.object({ v: z.union([z.literal(1), z.lite
     || m.hosts.filter(h => h.state === "active" && !h.revoked).length > 32 || active.length > 256
     || !m.hosts.some(h => h.publicKey === m.authorityKey && h.state === "active" && !h.revoked)
     || new Set(active.map(d => d.publicKey)).size !== active.length) invalid();
-  if (m.v === 1 && (m.devices.some(d => d.scope !== undefined) || m.hosts.some(h => h.protocol !== undefined))) invalid();
+  if (m.v === 1 && (m.devices.some(d => d.scope !== undefined || d.generation !== undefined) || m.hosts.some(h => h.protocol !== undefined || h.generation !== undefined || h.reinstated !== undefined))) invalid();
   if (m.v === 2 && m.hosts.some(h => !h.revoked && h.state === "active" && h.protocol !== 2)) invalid();
   const scopes = new Map<string, string>();
   for (const d of m.devices) {
@@ -60,7 +63,10 @@ export const networkManifestSchema = z.object({ v: z.union([z.literal(1), z.lite
     if (scope !== undefined && scope !== (d.scope ?? "legacy")) invalid();
     scopes.set(d.memberId, d.scope ?? "legacy");
     if (!hosts.has(d.host) || !hosts.has(d.originHost) || !hosts.has(d.attestedBy)) { invalid(); continue; }
+    if ((d.generation ?? 1) > (hosts.get(d.host)!.generation ?? 1)) { invalid(); continue; }
     if (!d.revoked && (hosts.has(d.publicKey) || revokedMembers.has(d.memberId) || blocked.has(networkBindingKey(d.host, d.id))
+      || (d.generation ?? 1) < (hosts.get(d.host)!.generation ?? 1)
+      || d.scope !== "network" && (d.generation ?? 1) < (hosts.get(d.originHost)!.generation ?? 1)
       || networkDeviceRetiredByHosts(d, unavailableHosts))) invalid();
   }
 });
@@ -76,15 +82,17 @@ export type SignedNetworkProposal = z.infer<typeof signedNetworkProposalSchema>;
 export const networkCommandSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("create"), name: hostNameSchema }).strict(),
   z.object({ operation: z.literal("routes"), networkId: z.union([id, z.literal("")]), routes: sharedRoutesSchema }).strict(),
-  z.object({ operation: z.literal("propose"), networkId: id, authorityKey: key, seenManifestHash: z.string().length(64).regex(/^[a-f0-9]{64}$/) }).strict(),
+  z.object({ operation: z.literal("propose"), networkId: id, authorityKey: key, seenManifestHash: z.string().length(64).regex(/^[a-f0-9]{64}$/), generation: z.number().int().min(2).safe().optional(), recover: z.literal(true).optional() }).strict()
+    .refine(v => Boolean(v.recover) === Boolean(v.generation), { message: "invalid_network_recover_propose" }),
   z.object({ operation: z.literal("admit"), proposal: signedNetworkProposalSchema }).strict(),
   z.object({ operation: z.literal("join"), membership: signedNetworkManifestSchema, nonce }).strict(),
   z.object({ operation: z.literal("attest"), networkId: id, device: networkEnrollmentSchema }).strict(),
+  z.object({ operation: z.literal("reinstate"), networkId: id, publicKey: key, expectedGeneration: z.number().int().min(1).safe().optional() }).strict(),
   z.object({ operation: z.literal("remove"), networkId: id, publicKey: key, expectedState: z.enum(["pending", "active"]) }).strict(),
   z.object({ operation: z.literal("leave"), networkId: z.union([id, z.literal("")]), expectedState: z.enum(["standalone", "pending", "active"]) }).strict(),
 ]);
 export type NetworkCommand = z.infer<typeof networkCommandSchema>;
-export type NetworkCommandInput = NetworkCommand extends infer C ? C extends NetworkCommand ? C["operation"] extends "routes" | "attest" | "remove" | "leave" ? Omit<C, "networkId" | "expectedState"> & { networkId?: string } & (C extends { expectedState: infer S } ? { expectedState?: S } : {}) : C : never : never;
+export type NetworkCommandInput = NetworkCommand extends infer C ? C extends NetworkCommand ? C["operation"] extends "routes" | "attest" | "reinstate" | "remove" | "leave" ? Omit<C, "networkId" | "expectedState"> & { networkId?: string } & (C extends { expectedState: infer S } ? { expectedState?: S } : {}) : C : never : never;
 export const networkViewSchema = z.object({ host: networkHostSchema, membership: signedNetworkManifestSchema.optional(),
   sync: z.enum(["standalone", "current", "waiting", "removed"]), lastSyncedAt: z.number().int().nonnegative(),
 }).strict();
@@ -105,7 +113,9 @@ export function networkCanonical(value: unknown): string {
   return JSON.stringify(value);
 }
 export const networkGenesisText = (authorityKey: string, genesisNonce: string) => networkCanonical(["tarocub/network/v1", authorityKey, genesisNonce]);
-export const networkMemberText = (hostKey: string, deviceId: string) => networkCanonical(["tarocub/network-member/v1", hostKey, deviceId]);
+export const networkMemberText = (hostKey: string, deviceId: string, generation = 1) => generation > 1
+  ? networkCanonical(["tarocub/network-member/v1", hostKey, deviceId, generation])
+  : networkCanonical(["tarocub/network-member/v1", hostKey, deviceId]);
 export const networkManifestProof = (m: NetworkManifest) => `tarocub/network-manifest/v1\0${networkCanonical(networkManifestSchema.parse(m))}`;
 export const networkProposalProof = (p: NetworkProposal) => `tarocub/network-proposal/v1\0${networkCanonical(networkProposalSchema.parse(p))}`;
 export const networkPeerProof = (p: NetworkPeerRequest) => `tarocub/network-peer/v1\0${networkCanonical(networkPeerRequestSchema.parse(p))}`;

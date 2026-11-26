@@ -5,14 +5,14 @@ import { hashSecret, parsePublicKey } from "../hub/auth.js";
 import { HostCliError, LocalHostClient } from "./client.js";
 
 export type CliNetworkCommand = Exclude<NetworkCommand, { operation: "attest" }>;
-const CLI_OPERATIONS = new Set(["create", "routes", "propose", "admit", "join", "leave", "remove"]);
+const CLI_OPERATIONS = new Set(["create", "routes", "propose", "admit", "join", "reinstate", "leave", "remove"]);
 
 /** Signed public transfer documents are verified before being displayed or
  * used. No device or host private key belongs in an offer/proposal/receipt. */
 export function verifyCliNetworkMembership(raw: unknown, expectedHostKey?: string, pin?: { id: string; authorityKey: string }): SignedNetworkManifest {
   const signed = signedNetworkManifestSchema.parse(raw), manifest = signed.manifest;
   const blocked = new Set(manifest.blockedKeys ?? []);
-  const origins = new Map(manifest.devices.filter(device => device.memberId === `pm_${createHash("sha256").update(networkMemberText(device.host, device.id)).digest("base64url")}` && device.originHost === device.host && device.attestedBy === device.host).map(device => [device.memberId, device.host]));
+  const origins = new Map(manifest.devices.filter(device => device.memberId === `pm_${createHash("sha256").update(networkMemberText(device.host, device.id, device.generation ?? 1)).digest("base64url")}` && device.originHost === device.host && device.attestedBy === device.host).map(device => [device.memberId, device.host]));
   for (const host of manifest.hosts) parsePublicKey(host.publicKey);
   for (const device of manifest.devices) parsePublicKey(device.publicKey);
   if (networkCanonical(raw) !== networkCanonical(signed)
