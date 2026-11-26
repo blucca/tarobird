@@ -7,20 +7,73 @@ import { HubHttpError } from "./http-error.js";
 export const MAX_CONCURRENT_QUOTA_REFRESH = 8;
 const LATE_POLL_INTERVAL_MS = 2_500;
 const LATE_POLL_MAX_MS = 90_000;
+const LATE_POLL_REQUEST_MS = 10_000;
 
 type View = { connection: HubConnection; userId?: string; directory?: QuotaDirectory; loading: boolean; busy: string[]; waitingLate: string[]; errors: Record<string, string>; error?: string; notice?: string };
 type Request = { controller: AbortController; timer: ReturnType<typeof setTimeout> };
+type LatePoll = { timer?: ReturnType<typeof setTimeout>; request?: Request };
 // Longer than the Hub waits for a refresh, so the page shows the Hub's answer (the engine's own "timeout" included).
-const request = (): Request => { const controller = new AbortController(); return { controller, timer: setTimeout(() => controller.abort(), ENGINE_QUOTA_HUB_REFRESH_MS + 2_000) }; };
+const request = (timeoutMs = ENGINE_QUOTA_HUB_REFRESH_MS + 2_000): Request => {
+  const controller = new AbortController();
+  return { controller, timer: setTimeout(() => controller.abort(), timeoutMs) };
+};
 const finish = (value: Request) => clearTimeout(value.timer);
 const cancel = (value: Request) => { finish(value); value.controller.abort(); };
 
-function shouldAutoRefreshScope(scope: QuotaScope, now: number): boolean {
+export function shouldAutoRefreshScope(scope: QuotaScope, now: number): boolean {
   if (scope.capability.mode !== "active") return false;
   if (scope.state === "offline" || scope.state === "unsupported" || scope.state === "login_required") return false;
   if (scope.reason === "host_upgrade_required") return false;
   if (scope.nextRefreshAt && Date.parse(scope.nextRefreshAt) > now) return false;
   return !scope.observedAt || scope.state === "unknown" || scope.state === "stale" || quotaReadingExpired(scope, now);
+}
+
+/** Decide what one cache-only poll in `watchLateAnswer` means for a slow Claude refresh.
+ * Real `ClaudeStreamAdapter` leaves `get_usage` in flight after its initial 7 s timeout
+ * and returns `"not_loaded"` (no prior reading) or the prior reading (same `observedAt`,
+ * `reason: undefined`) on `refresh: false` until the late answer lands. */
+export function evaluateLatePoll(
+  scope: Pick<QuotaScope, "revision">,
+  previousObservedAt: string | undefined,
+  latest: QuotaScope,
+): "update" | "wait" | "stop" {
+  // Transient Hub cache-read timeout fallback: keep waiting without overwriting the real scope revision.
+  if (latest.revision === "timeout" && latest.reason === "timeout") return "wait";
+  if (latest.revision !== scope.revision) return "update";
+  const newer = Boolean(
+    latest.observedAt
+    && latest.observedAt !== previousObservedAt
+    && (latest.state === "ready" || latest.state === "stale"),
+  );
+  if (newer) return "update";
+  if (latest.capability.mode !== "active" || latest.state === "offline" || latest.state === "unsupported" || latest.state === "login_required") {
+    return "update";
+  }
+  if (latest.reason === undefined || latest.reason === "timeout" || latest.reason === "not_loaded") {
+    return "wait";
+  }
+  return "stop";
+}
+
+/** Drain `items` with at most `concurrency` workers in flight, stopping before
+ * starting new items once `shouldContinue()` turns false. */
+export async function drainBoundedQueue<T>(
+  items: readonly T[],
+  concurrency: number,
+  run: (item: T) => Promise<void>,
+  shouldContinue: () => boolean = () => true,
+): Promise<void> {
+  const workers = Math.min(Math.max(1, concurrency), items.length);
+  if (workers <= 0) return;
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < items.length) {
+      if (!shouldContinue()) return;
+      const item = items[nextIndex++]!;
+      await run(item);
+    }
+  };
+  await Promise.all(Array.from({ length: workers }, () => worker()));
 }
 
 /** Quota values live only in the currently authorized settings view. Opening
@@ -51,57 +104,81 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
   const [view, setView] = useState<View>({ connection, userId, loading: false, busy: [], waitingLate: [], errors: {} });
   const viewRef = useRef(view); viewRef.current = view;
   const version = useRef(0), directoryRequest = useRef<Request>(undefined), scopes = useRef(new Map<string, Request>());
-  const latePolls = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const latePolls = useRef(new Map<string, LatePoll>());
   const allowed = owner && online && supported && active && visible;
   const current = useRef({ connection, userId, allowed }); current.current = { connection, userId, allowed };
   const clearLatePoll = useCallback((id: string) => {
-    const timer = latePolls.current.get(id);
-    if (timer) { clearTimeout(timer); latePolls.current.delete(id); }
+    const poll = latePolls.current.get(id);
+    if (!poll) return;
+    if (poll.timer) clearTimeout(poll.timer);
+    if (poll.request) cancel(poll.request);
+    latePolls.current.delete(id);
   }, []);
   const stop = useCallback(() => {
     version.current++; if (directoryRequest.current) cancel(directoryRequest.current); directoryRequest.current = undefined;
     for (const value of scopes.current.values()) cancel(value); scopes.current.clear();
-    for (const timer of latePolls.current.values()) clearTimeout(timer); latePolls.current.clear();
+    for (const poll of latePolls.current.values()) {
+      if (poll.timer) clearTimeout(poll.timer);
+      if (poll.request) cancel(poll.request);
+    }
+    latePolls.current.clear();
   }, []);
 
   const watchLateAnswer = useCallback((scope: QuotaScope, previousObservedAt: string | undefined, generation: number) => {
     clearLatePoll(scope.id);
     const deadline = Date.now() + LATE_POLL_MAX_MS;
+    const poll: LatePoll = {};
+    latePolls.current.set(scope.id, poll);
     setView(previous => previous.waitingLate.includes(scope.id) ? previous : { ...previous, waitingLate: [...previous.waitingLate, scope.id] });
     const tick = async () => {
-      if (generation !== version.current || !current.current.allowed) return;
+      poll.timer = undefined;
+      if (generation !== version.current || !current.current.allowed || latePolls.current.get(scope.id) !== poll) return;
+      const operation = request(LATE_POLL_REQUEST_MS);
+      poll.request = operation;
       try {
-        const latest = await connection.readEngineQuota(scope.id);
-        if (generation !== version.current || !current.current.allowed) return;
-        const newer = Boolean(latest.observedAt && latest.observedAt !== previousObservedAt && latest.state === "ready");
-        const stoppedWaiting = newer || latest.revision !== scope.revision || (latest.reason !== undefined && latest.reason !== "timeout");
-        if (newer || latest.revision !== scope.revision) {
-          setView(previous => !previous.directory ? previous : {
+        const latest = await connection.readEngineQuota(scope.id, operation.controller.signal);
+        poll.request = undefined;
+        if (generation !== version.current || !current.current.allowed || latePolls.current.get(scope.id) !== poll) return;
+        const outcome = evaluateLatePoll(scope, previousObservedAt, latest);
+        if (outcome === "update") {
+          clearLatePoll(scope.id);
+          setView(previous => ({
             ...previous,
-            directory: { ...previous.directory, scopes: previous.directory.scopes.map(item => item.id === scope.id ? latest : item) },
+            directory: previous.directory?.scopes.find(item => item.id === scope.id)?.revision === scope.revision
+              ? { ...previous.directory, scopes: previous.directory.scopes.map(item => item.id === scope.id ? latest : item) }
+              : previous.directory,
             waitingLate: previous.waitingLate.filter(id => id !== scope.id),
-          });
-          clearLatePoll(scope.id);
+          }));
           return;
         }
-        if (stoppedWaiting || Date.now() >= deadline) {
-          clearLatePoll(scope.id);
-          setView(previous => ({ ...previous, waitingLate: previous.waitingLate.filter(id => id !== scope.id) }));
-          return;
-        }
-      } catch {
-        if (Date.now() >= deadline) {
+        if (outcome === "stop" || Date.now() >= deadline) {
           clearLatePoll(scope.id);
           setView(previous => ({ ...previous, waitingLate: previous.waitingLate.filter(id => id !== scope.id) }));
           return;
         }
+      } catch (error) {
+        poll.request = undefined;
+        if (generation !== version.current || !current.current.allowed || latePolls.current.get(scope.id) !== poll) return;
+        if (error instanceof HubHttpError && [401, 403].includes(error.status)) {
+          stop();
+          setView({ connection, userId, loading: false, busy: [], waitingLate: [], errors: {}, error: "permission" });
+          return;
+        }
+        if (error instanceof HubHttpError && error.status === 404 || Date.now() >= deadline) {
+          clearLatePoll(scope.id);
+          setView(previous => ({ ...previous, waitingLate: previous.waitingLate.filter(id => id !== scope.id) }));
+          return;
+        }
+      } finally {
+        finish(operation);
+        if (poll.request === operation) poll.request = undefined;
       }
-      if (generation === version.current && current.current.allowed) {
-        latePolls.current.set(scope.id, setTimeout(() => void tick(), LATE_POLL_INTERVAL_MS));
+      if (generation === version.current && current.current.allowed && latePolls.current.get(scope.id) === poll) {
+        poll.timer = setTimeout(() => void tick(), LATE_POLL_INTERVAL_MS);
       }
     };
-    latePolls.current.set(scope.id, setTimeout(() => void tick(), LATE_POLL_INTERVAL_MS));
-  }, [connection, clearLatePoll]);
+    poll.timer = setTimeout(() => void tick(), LATE_POLL_INTERVAL_MS);
+  }, [connection, userId, clearLatePoll, stop]);
 
   const refreshRef = useRef<(scope: QuotaScope) => Promise<void>>(async () => undefined);
 
@@ -123,12 +200,14 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
       setView(previous => ({ ...previous, directory: denied ? undefined : previous.directory, loading: false, error: denied ? "permission" : error instanceof HubHttpError && error.status === 404 ? "upgrade" : "read" }));
     } finally { finish(operation); if (directoryRequest.current === operation) directoryRequest.current = undefined; }
     if (loaded && notice !== "changed" && generation === version.current && current.current.allowed) {
-      const now = Date.now();
-      for (const scope of loaded.scopes) {
-        if (shouldAutoRefreshScope(scope, now)) {
-          void refreshRef.current(scope);
-        }
-      }
+      const now = Date.now() + (connection.state.serverTimeOffset ?? 0);
+      const queue = loaded.scopes.filter(scope => shouldAutoRefreshScope(scope, now));
+      void drainBoundedQueue(
+        queue,
+        MAX_CONCURRENT_QUOTA_REFRESH,
+        scope => refreshRef.current(scope),
+        () => generation === version.current && current.current.allowed,
+      );
     }
   }, [connection, userId, stop]);
   useEffect(() => {
@@ -152,7 +231,7 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
       // Slow Claude `get_usage` keeps running in the background and saves its late answer on the Host.
       // Watch the cache briefly instead of showing a timeout error right away.
       if (value.reason === "timeout" && value.engine === "claude" && value.revision === scope.revision) {
-        watchLateAnswer(value, scope.observedAt, generation);
+        watchLateAnswer(value, value.observedAt ?? scope.observedAt, generation);
       }
     } catch (error) {
       if (generation !== version.current || scopes.current.get(scope.id) !== operation) return;

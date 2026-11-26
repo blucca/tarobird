@@ -1,7 +1,6 @@
 import { isLogicalSessionId } from "../runtime/logical-session.js";
 import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
 import { applyClaudeQuotaEvent, claudeQuotaForModel, parseClaudeUsage, QuotaReadError, QUOTA_TTL_MS, unavailableQuota } from "./account-quota.js";
-import { defaultClaudeOAuthQuotaReader, type ClaudeOAuthQuotaReader } from "./claude-oauth-quota.js";
 import type { QuotaSnapshot } from "../client-protocol/engine-quota.js";
 import { claudeAssistantError, claudeError, claudeResultRepeatsError } from "./claude-errors.js";
 import { wholeFilePatch } from "../core/recorded-diff.js";
@@ -1174,9 +1173,6 @@ export class ClaudeStreamAdapter implements CodexAdapter {
    * with its turns, its account seldom does. It goes when a process answers again, when a process answers that
    * the login has no windows, or when the login state the Host can see has changed. */
   private keptUsage?: ClaudeQuotaRecord;
-  /** Newest direct OAuth usage reading (read-only from stored Host login when no running process answered). */
-  private keptOAuthUsage?: { credentialRevision: string; snapshot: QuotaSnapshot };
-  private readonly oauthQuotaReader: ClaudeOAuthQuotaReader | null;
   /** How long a `get_usage` question stays out before it is given up (tests shorten it). */
   private usageLateMs = CLAUDE_USAGE_LATE_MS;
   private quotaWorkerSequence = 0;
@@ -1219,11 +1215,8 @@ export class ClaudeStreamAdapter implements CodexAdapter {
        * build put next to this module, if there is one. Null: no native history.
        */
       historyHelper?: ClaudeHistoryHelper | null;
-      /** Read-only OAuth quota reader (Part B, owner-approved 2026-11-23). Null disables direct OAuth reads. */
-      oauthQuotaReader?: ClaudeOAuthQuotaReader | null;
     },
   ) {
-    this.oauthQuotaReader = options?.oauthQuotaReader === undefined ? defaultClaudeOAuthQuotaReader : options.oauthQuotaReader;
     const builtHistoryHelper = options?.historyHelper === undefined ? resolveClaudeHistoryHelperPath() : undefined;
     this.historyHelper = options?.historyHelper ?? (builtHistoryHelper ? spawnClaudeHistoryHelper(builtHistoryHelper) : undefined);
     this.childEnv = options?.childEnv ?? (() => {
@@ -1361,38 +1354,23 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     question.catch(() => undefined);
     return entry.asking = question;
   }
-  /** The Bot's newest `get_usage` or direct OAuth answer given under the login `credentialRevision`. */
+  /** The Bot's newest `get_usage` answer given under the login `credentialRevision`, with the answering process's model. */
   private newestUsage(credentialRevision: string): { usage: QuotaSnapshot; model?: string } | undefined {
     const kept = this.keptUsage;
-    const workerUsage = kept?.usage?.observedAt && kept.credentialRevision === credentialRevision
-      ? { usage: kept.usage, model: kept.model }
-      : undefined;
-    const oauthUsage = this.keptOAuthUsage?.snapshot.observedAt && this.keptOAuthUsage.credentialRevision === credentialRevision
-      ? { usage: this.keptOAuthUsage.snapshot }
-      : undefined;
-    if (workerUsage && oauthUsage) {
-      return Date.parse(oauthUsage.usage.observedAt!) >= Date.parse(workerUsage.usage.observedAt!)
-        ? oauthUsage
-        : workerUsage;
-    }
-    return workerUsage ?? oauthUsage;
+    return kept?.usage?.observedAt && kept.credentialRevision === credentialRevision ? { usage: kept.usage, model: kept.model } : undefined;
   }
 
-  /** Quota is read from a running engine of this Bot when present, or read-only from Claude's stored OAuth
-   * login on the Host (Part B, owner-approved 2026-11-23) when no process is running. No process is started
-   * for a reading, and credentials are never logged, copied, or refreshed. */
+  /** Quota is read from a running engine of this Bot, so the answer is about the account that engine uses;
+   * where its login is kept (a file, the system keychain) does not matter. The newest answer stays the Bot's
+   * reading while no process can give a newer one. With no answer yet and no running engine only the earlier
+   * passive rules apply; no process is started for a reading. */
   async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
     const scope = this.quotaScope();
     const passive = this.quotaCache.response(scope, options) ?? this.quotaCache.failure(scope, "no_passive_event");
-    if (options.signal?.aborted || passive.snapshot.capability.mode === "unsupported"
-      || options.expectedRevision && options.expectedRevision !== scope.revision) return passive;
     const running = !this.destroyPromise && [...this.workers.values()].some(worker => !worker.retired && this.quotaWorkers.has(worker) && !this.quotaWorkers.get(worker)!.unasked?.has("get_usage"));
-    const storedOAuth = !running && !this.destroyPromise && this.oauthQuotaReader
-      ? await this.oauthQuotaReader.readToken(this.childEnv)
-      : null;
-    // No process to ask, no stored OAuth login, and no earlier answer: keep the passive rules.
-    if (!running && !storedOAuth && !this.newestUsage(scope.credentialRevision)) return passive;
-
+    // No process to ask (none is started for a reading) and no earlier answer, or the request itself is void.
+    if (!running && !this.newestUsage(scope.credentialRevision) || options.signal?.aborted || passive.snapshot.capability.mode === "unsupported"
+      || options.expectedRevision && options.expectedRevision !== scope.revision) return passive;
     let failure: Parameters<typeof unavailableQuota>[1] | undefined;
     const worker = options.refresh && running ? this.usageWorker(scope.credentialRevision) : undefined, entry = worker && this.quotaWorkers.get(worker);
     let after = scope;
@@ -1411,27 +1389,11 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       after = this.quotaScope();
       if (after.credentialRevision !== scope.credentialRevision) return this.quotaCache.failure(after, "auth_changed");
       // An API key, or a login without windows: answered for this call, and no earlier reading of the Bot holds any longer.
-      if (usage?.capability.mode === "unsupported") { this.keptOAuthUsage = undefined; return { revision: after.revision, snapshot: usage }; }
-    } else if (options.refresh && storedOAuth && this.oauthQuotaReader) {
-      const oauthSnapshot = await this.oauthQuotaReader.fetchQuota({
-        token: storedOAuth.token,
-        signal: options.signal,
-        timeoutMs: options.timeoutMs,
-      });
-      after = this.quotaScope();
-      if (after.credentialRevision !== scope.credentialRevision) return this.quotaCache.failure(after, "auth_changed");
-      if (oauthSnapshot.state === "ready") {
-        this.keptOAuthUsage = { credentialRevision: after.credentialRevision, snapshot: oauthSnapshot };
-      } else if (oauthSnapshot.state === "login_required") {
-        this.keptOAuthUsage = undefined;
-        return { revision: after.revision, snapshot: oauthSnapshot };
-      } else {
-        failure = oauthSnapshot.reason ?? "native_error";
-      }
+      if (usage?.capability.mode === "unsupported") return { revision: after.revision, snapshot: usage };
     }
     const now = Date.now(), active = { mode: "active" as const }, newest = this.newestUsage(scope.credentialRevision);
     const reading = newest ? claudeQuotaForModel(structuredClone(newest.usage), newest.model) : passive.snapshot.observedAt ? { ...passive.snapshot, capability: active } : undefined;
-    if (!reading) return { revision: after.revision, snapshot: { ...unavailableQuota("claude", failure ?? "not_loaded", now, storedOAuth ? "subscription" : scope.authMode), capability: active } };
+    if (!reading) return { revision: after.revision, snapshot: { ...unavailableQuota("claude", failure ?? "not_loaded", now, scope.authMode), capability: active } };
     if (failure) { reading.state = "stale"; reading.reason = failure; reading.lastAttemptAt = new Date(now).toISOString(); }
     else if (reading.state === "ready" && reading.observedAt && now - Date.parse(reading.observedAt) >= QUOTA_TTL_MS) reading.state = "stale";
     return { revision: after.revision, snapshot: reading };
