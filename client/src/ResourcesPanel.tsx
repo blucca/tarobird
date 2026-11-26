@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
-import { Activity, ChevronDown, ChevronRight, Cpu, Monitor, RefreshCw, Square, X } from "lucide-react";
+import { Activity, ChevronDown, ChevronRight, Monitor, RefreshCw, Square, X } from "lucide-react";
 import {
   formatCpuPercent,
   formatMemoryBytes,
@@ -617,6 +617,9 @@ export function DesktopResourcesBar({
     }
   };
 
+  const summaryCpu = snapshot ? `${Math.round(snapshot.summary.totalCpuPercent)}%` : "—";
+  const summaryMem = snapshot ? formatMemoryBytes(snapshot.summary.totalMemoryBytes) : "—";
+
   return (
     <div className="resources-statusbar">
       <button
@@ -627,19 +630,13 @@ export function DesktopResourcesBar({
         aria-expanded={open}
         aria-controls={open ? dialogId : undefined}
         aria-label={t("资源")}
+        title={snapshot ? t("资源 · CPU {0} · 内存 {1}", formatCpuPercent(snapshot.summary.totalCpuPercent), summaryMem) : t("资源")}
         onClick={() => { setStopNotice(""); setOpen(true); }}
       >
-        <Cpu size={13} aria-hidden="true" />
-        <span className="resources-status-label">{t("资源")}</span>
         {snapshot ? (
-          <>
-            <span className="resources-status-value">{formatCpuPercent(snapshot.summary.totalCpuPercent)}</span>
-            <span className="resources-status-sep" aria-hidden="true">·</span>
-            <span className="resources-status-value">{formatMemoryBytes(snapshot.summary.totalMemoryBytes)}</span>
-            <ResourceSparkline points={snapshot.history} metric="memory" width={40} height={14} />
-          </>
+          <span className="resources-status-value">{`CPU ${summaryCpu} · ${summaryMem}`}</span>
         ) : (
-          <span className="resources-status-value muted">—</span>
+          <span className="resources-status-value muted">{t("资源")}</span>
         )}
       </button>
 

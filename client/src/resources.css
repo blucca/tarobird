@@ -2,50 +2,41 @@
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  padding: 2px 20px 8px;
+  padding: 0 20px 6px;
   flex-shrink: 0;
 }
 
 @media (min-width: 761px) {
   .conversation-main:has(.resources-statusbar) .composer-wrap {
-    padding-bottom: 6px;
+    padding-bottom: 4px;
   }
 }
 
 .resources-status-pill {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 26px;
-  padding: 0 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 12px;
-  line-height: 1;
-  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06);
+  gap: 4px;
+  padding: 2px 2px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.2;
   cursor: pointer;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition: color 0.15s ease;
 }
 
 .resources-status-pill:hover,
 .resources-status-pill.is-open {
-  border-color: var(--blue);
-  background: var(--bg);
-}
-
-.resources-status-label {
-  font-weight: 500;
+  color: var(--text);
+  background: transparent;
 }
 
 .resources-status-value {
   font-variant-numeric: tabular-nums;
-  color: var(--grey);
-}
-
-.resources-status-sep {
-  color: var(--muted);
+  color: inherit;
 }
 
 /* Centered desktop modal dialog matching PreferencesPanel / OperationsPanel */

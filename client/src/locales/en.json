@@ -5711,5 +5711,6 @@
   "将停止「{0}」的引擎进程（PID {1}）。": "This stops the engine process (PID {1}) for \"{0}\".",
   "目标进程：{0} (PID {1})": "Target process: {0} (PID {1})",
   "正在停止…": "Stopping…",
-  "确认停止": "Stop process"
+  "确认停止": "Stop process",
+  "资源 · CPU {0} · 内存 {1}": "Resources · CPU {0} · Memory {1}"
 }
