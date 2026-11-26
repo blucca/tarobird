@@ -2,6 +2,7 @@
 // cannot be driven into quickly are given as a replaced /bot-comms, /tasks or /queue answer.
 import { test, expect, type Page } from "@playwright/test";
 import { closeHub, comms, item, LONG_BOT, makeHub, mockComms, newPage, openConv, pair, setTheme, tr, type Fixture, type Locale } from "./fixtures/workspace-rail.js";
+import { waitForClientOnline } from "./fixtures/mobile.js";
 
 test.use({ serviceWorkers: "block", actionTimeout: 15_000 });
 
@@ -15,7 +16,7 @@ async function ready(browser: Parameters<typeof newPage>[0], locale: Locale, wid
   const trigger = page.getByRole("button", { name: L("会话工作区"), exact: true });
   const open = async () => { if (await trigger.getAttribute("aria-expanded") !== "true") await trigger.click(); await expect(rail(page)).toBeVisible(); };
   const done = async () => { expect(errors).toEqual([]); await context.close(); await closeHub(f); };
-  return { f, L, page, trigger, open, done };
+  return { f, L, context, page, trigger, open, done };
 }
 /** WCAG contrast of an element's text against its own background. */
 const contrast = (page: Page, selector: string) => page.locator(selector).first().evaluate(node => {
@@ -303,7 +304,189 @@ test("Replying row names the answered message, avoids duplicate queue rows, adva
     await f.hub.store.publishBotMessage("bot_rev", { conversationId: f.ids.group, replyTo: g2.id, blocks: [{ type: "text", text: "检查中…" }], status: "streaming" });
     await openConv(page, "发布群");
     await expect(live.locator(".workspace-replying-row")).toHaveCount(2);
-    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["请架构师核对接口设计", "请审查员检查回归用例"]);
-    await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toHaveText(["正在回复 · Architect", "正在回复 · Reviewer"]);
+    await expect(live.locator(".workspace-replying-row").filter({ hasText: "正在回复 · Architect" }).locator(".workspace-item-title")).toHaveText("请架构师核对接口设计");
+    await expect(live.locator(".workspace-replying-row").filter({ hasText: "正在回复 · Reviewer" }).locator(".workspace-item-title")).toHaveText("请审查员检查回归用例");
+  } finally { await done(); }
+});
+
+for (const locale of ["zh", "en"] as const) {
+  test(`group discussion Replying row shows the topic instead of hardcoded Chinese scheduler input (${locale})`, async ({ browser }) => {
+    const { page, f, open, done } = await ready(browser, locale, 1440);
+    try {
+      const groupTitle = locale === "en" ? "Release group" : "发布群";
+      const topicText = locale === "en" ? "Review staged rollout checklist before shipping" : "发布前核对灰度检查清单";
+      const settings = await f.hub.store.groupSettings("owner", f.ids.group);
+      const botIds = settings.group.botIds;
+      await f.hub.store.updateGroup("owner", f.ids.group, {
+        title: settings.group.title,
+        botIds,
+        expectedTitle: settings.group.title,
+        expectedBotIds: botIds,
+        expectedRevision: settings.revision,
+        policy: { mode: "sequential", botOrder: botIds, maxRounds: 2 },
+      });
+      const updated = await f.hub.store.groupSettings("owner", f.ids.group);
+      const started = await f.hub.groupDiscussions.start("owner", f.ids.group, {
+        requestId: `gd-req-${locale}`,
+        revision: updated.revision,
+        text: topicText,
+        participants: ["bot_arch", "bot_rev"],
+      });
+      const inputMessageId = started.run!.steps[0]!.inputMessageId!;
+      const topicMessageId = started.run!.topicMessageId!;
+      await f.hub.store.publishBotMessage("bot_arch", {
+        conversationId: f.ids.group,
+        replyTo: inputMessageId,
+        blocks: [{ type: "text", text: locale === "en" ? "Drafting analysis..." : "正在分析…" }],
+        status: "streaming",
+      });
+
+      await openConv(page, groupTitle);
+      await open();
+      const live = rail(page).locator(".workspace-section").nth(1);
+      await expect(live.locator(".workspace-replying-row")).toHaveCount(1);
+      await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText([topicText]);
+      await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toHaveText([
+        locale === "en" ? "Replying · Architect" : "正在回复 · Architect",
+      ]);
+      await expect(live).not.toContainText("轮流讨论");
+      await expect(live).not.toContainText("请 Architect");
+
+      // Deleting the topic message falls back to localized "Replying" + Bot name, never raw scheduler text.
+      await f.hub.store.deleteMessages("owner", f.ids.group, { messageIds: [topicMessageId] });
+      await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText([
+        locale === "en" ? "Replying" : "正在回复",
+      ]);
+      await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toHaveText(["Architect"]);
+      await expect(live).not.toContainText("轮流讨论");
+      await expect(live).not.toContainText("请 Architect");
+    } finally { await done(); }
+  });
+}
+
+test("going offline clears live Replying rows for both dispatched and streaming replies, and marks queued rows offline", async ({ browser }) => {
+  const { context, page, f, open, done } = await ready(browser, "zh", 1440);
+  try {
+    await f.hub.store.sendMessage("owner", {
+      conversationId: f.ids.main,
+      clientMsgId: "offline-q-2",
+      text: "离线测试的排队消息",
+      attachments: [],
+      mentions: ["bot_arch"],
+      previewUrl: null,
+    });
+    await open();
+    const live = rail(page).locator(".workspace-section").nth(1);
+    // Initially dispatched (no streaming Bot message yet) + 1 queued item.
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(1);
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["请协调评审并汇总基准测试结果。"]);
+    await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toHaveText(["正在回复 · Architect"]);
+    await expect(live.locator(".workspace-queue-row .workspace-item-meta")).toHaveText(["队列第 1 位"]);
+
+    // Drop offline: dispatched Replying row (with green online dot) clears; queued item stays marked offline.
+    await context.setOffline(true);
+    for (const client of (f.hub as unknown as { clients: Set<{ ws: { terminate(): void } }> }).clients) client.ws.terminate();
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(0);
+    await expect(live.locator(".status-dot.online")).toHaveCount(0);
+    await expect(live.locator(".workspace-queue-row .workspace-item-title")).toHaveText(["离线测试的排队消息"]);
+    await expect(live.locator(".workspace-queue-row .workspace-item-meta")).toHaveText(["队列第 1 位 · 离线"]);
+
+    // Reconnect and also verify dropping offline during an active streaming reply does not let dispatchedItems take over.
+    await context.setOffline(false);
+    await waitForClientOnline(page);
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(1);
+    await expect(live.locator(".workspace-queue-row .workspace-item-meta")).toHaveText(["队列第 1 位"]);
+
+    await f.hub.store.publishBotMessage("bot_arch", {
+      conversationId: f.ids.main,
+      replyTo: f.ids.userMsg,
+      blocks: [{ type: "text", text: "正在流式输出…" }],
+      status: "streaming",
+    });
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["请协调评审并汇总基准测试结果。"]);
+
+    await context.setOffline(true);
+    for (const client of (f.hub as unknown as { clients: Set<{ ws: { terminate(): void } }> }).clients) client.ws.terminate();
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(0);
+    await expect(live.locator(".status-dot.online")).toHaveCount(0);
+    await expect(live.locator(".workspace-queue-row .workspace-item-meta")).toHaveText(["队列第 1 位 · 离线"]);
+  } finally {
+    await context.setOffline(false).catch(() => undefined);
+    await done();
+  }
+});
+
+test("deleted replyTo is never misattributed to another dispatched item, and queue polling stays serialized and scoped across switches", async ({ browser }) => {
+  let holdMainQueue = false;
+  let activeMainQueue = 0;
+  let maxActiveMainQueue = 0;
+  let emptyQueueRequests = 0;
+  let emptyQueueAborts = 0;
+  const { page, f, open, done } = await ready(browser, "zh", 1440, async (page, f) => {
+    page.on("requestfailed", req => {
+      if (req.url().includes(`/api/conversations/${f.ids.empty}/queue`)) emptyQueueAborts++;
+    });
+    await page.route("**/api/conversations/*/queue*", async route => {
+      const url = route.request().url();
+      if (url.includes(`/api/conversations/${f.ids.empty}/queue`)) {
+        emptyQueueRequests++;
+        await route.continue();
+        return;
+      }
+      if (holdMainQueue && url.includes(`/api/conversations/${f.ids.main}/queue`)) {
+        activeMainQueue++;
+        maxActiveMainQueue = Math.max(maxActiveMainQueue, activeMainQueue);
+        await new Promise(resolve => setTimeout(resolve, 2600));
+        activeMainQueue--;
+        await route.continue().catch(() => undefined);
+        return;
+      }
+      await route.continue();
+    });
+  });
+  try {
+    // Bug 4: replyTo points at deleted m1 while unrelated m2 is dispatched -> must never show m2's text.
+    const m1 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.main, clientMsgId: "del-1", text: "即将删除的原消息", attachments: [], mentions: ["bot_arch"], previewUrl: null })).message;
+    const m2 = (await f.hub.store.sendMessage("owner", { conversationId: f.ids.main, clientMsgId: "del-2", text: "另一条不相关的已下发消息", attachments: [], mentions: ["bot_arch"], previewUrl: null })).message;
+    await f.hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [f.ids.userMsg, "bot_arch"]);
+    await f.hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [m1.id, "bot_arch"]);
+    await f.hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id=?", [m2.id, "bot_arch"]);
+    await f.hub.store.deleteMessages("owner", f.ids.main, { messageIds: [m1.id] });
+    await f.hub.store.publishBotMessage("bot_arch", {
+      conversationId: f.ids.main,
+      replyTo: m1.id,
+      blocks: [{ type: "text", text: "仍在流式回复已删消息…" }],
+      status: "streaming",
+    });
+
+    await open();
+    const live = rail(page).locator(".workspace-section").nth(1);
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(1);
+    await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["正在回复"]);
+    await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toHaveText(["Architect"]);
+    await expect(live).not.toContainText("另一条不相关的已下发消息");
+
+    // Bug 3: slow /queue responses (>2s) do not pile up concurrent requests from the workspace poller.
+    holdMainQueue = true;
+    await page.waitForTimeout(4500);
+    holdMainQueue = false;
+    // PromptQueue + ConversationWorkspace are at most 1 in-flight request each (never piling up every 2s).
+    expect(maxActiveMainQueue).toBeLessThanOrEqual(2);
+
+    // Bug 5: switching from a busy direct chat to a group chat or empty direct chat never leaks stale items
+    // or aborts/duplicates the target conversation's initial /queue read.
+    await openConv(page, "发布群");
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(0);
+    await expect(live.locator(".workspace-queue-row")).toHaveCount(0);
+    await openConv(page, f.mainTitle);
+    await expect(live.locator(".workspace-replying-row")).toHaveCount(1);
+    emptyQueueRequests = 0;
+    emptyQueueAborts = 0;
+    await openConv(page, "空白对话");
+    await expect(live.locator(".workspace-idle-strip")).toBeVisible();
+    await page.waitForTimeout(400);
+    expect(emptyQueueAborts).toBe(0);
+    // 1 initial read from PromptQueue + 1 initial read from ConversationWorkspace (no duplicate/abort).
+    expect(emptyQueueRequests).toBeLessThanOrEqual(2);
   } finally { await done(); }
 });
