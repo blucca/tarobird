@@ -657,7 +657,13 @@ export class HubServer {
   private originAllowed(req: IncomingMessage): boolean {
     const origin = req.headers.origin;
     if (!origin) return true;
-    return [...this.urls, ...NATIVE_ORIGINS, ...(this.options.origins ?? [])].includes(origin);
+    const loopbackLocalhost = this.listeners.flatMap(({ server, tls }) => {
+      if (tls || !server.listening) return [];
+      const address = server.address();
+      if (!address || typeof address === "string" || (address.address !== "127.0.0.1" && address.address !== "::1")) return [];
+      return [new URL(`http://localhost:${address.port}`).origin];
+    });
+    return [...this.urls, ...loopbackLocalhost, ...NATIVE_ORIGINS, ...(this.options.origins ?? [])].includes(origin);
   }
   private send(ws: WebSocket, value: unknown): Promise<void> {
     const work = writeFrame(ws, value, this.fragmentSockets.has(ws));

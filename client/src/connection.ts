@@ -161,6 +161,7 @@ export class HubConnection {
   pinNetwork(id:string, authorityKey:string): void { this.networkPin = {id, authorityKey}; }
   suspendNetwork(): void { this.networkBlocked = true; this.close(true); this.update({error:t("网络授权已失效")}); }
   get isNetworkBlocked(): boolean { return this.networkBlocked; }
+  get isRevoked(): boolean { return this.deviceRevoked; }
   get isReadOnly(): boolean { return this.networkBlocked || this.deviceRevoked || this.pairingRequired; }
   get isClosed(): boolean { return this.closed; }
   beginFileTransfer(): () => void { this.fileTransfers++; let released = false; return () => { if (!released) { released = true; this.fileTransfers--; this.lastTraffic = Date.now(); } }; }

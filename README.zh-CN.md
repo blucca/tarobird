@@ -12,7 +12,7 @@
   <a href="https://github.com/cloveric/tarobird/releases/latest"><b>下载</b></a> &nbsp;·&nbsp;
   <a href="https://apps.apple.com/app/tarobird/id6828071641"><b>iOS App Store 正式版</b></a> &nbsp;·&nbsp;
   <a href="https://testflight.apple.com/join/ByFWEfFW"><b>iOS TestFlight 公测</b></a> &nbsp;·&nbsp;
-  <a href="docs/client/web-client.md"><b>浏览器网页版</b></a> &nbsp;·&nbsp;
+  <a href="docs/client/web-client.zh-CN.md"><b>浏览器网页版</b></a> &nbsp;·&nbsp;
   <a href="#快速开始"><b>快速开始</b></a> &nbsp;·&nbsp;
   <a href="#联机方式">联机方式</a> &nbsp;·&nbsp;
   <a href="docs/details.zh-CN.md">详细说明</a> &nbsp;·&nbsp;

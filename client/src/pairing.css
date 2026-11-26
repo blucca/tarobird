@@ -36,6 +36,9 @@
 .pairing-import p { margin:4px 0 0; overflow-wrap:anywhere; font-size:12px; }
 .pairing-import>svg { flex-shrink:0; color:var(--accent,var(--blue)); }
 .pairing-import>button { flex-shrink:0; font-size:12px; }
+.pairing-import .pairing-import-state { margin-top:6px; color:var(--text); font-weight:500; }
+.pairing-existing-host { display:grid; gap:10px; justify-items:start; margin:0 0 18px; padding:12px 14px; border-radius:12px; background:var(--orange-soft,var(--surface)); font-size:13px; line-height:1.55; }
+.pairing-existing-host p { margin:0; }
 .pairing-layout:has(.pairing-waiting) { grid-template-columns:minmax(0,460px); justify-content:center; }
 .pairing-waiting>p { font-size:14px; line-height:1.75; }
 .pair-code { margin:28px 0 12px; padding:20px 10px; border-radius:12px; background:var(--surface); color:var(--text); font:600 30px/1.25 var(--font-mono,monospace); letter-spacing:.16em; text-align:center; font-variant-numeric:tabular-nums; }

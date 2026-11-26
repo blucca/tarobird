@@ -5687,5 +5687,21 @@
   "要从其他设备的浏览器打开，请切换到具备受信任 HTTPS 证书的线路（如 VPS 中转、Tailscale HTTPS），或在本机直接选择「本机浏览器」。": "To open TaroBird from another device’s browser, switch to a route with a trusted HTTPS certificate (such as a VPS relay or Tailscale HTTPS), or choose “Browser on this computer” locally.",
   "用桌面或手机浏览器打开一次性链接（或直接用系统相机扫码），再在已配对设备核对 8 位配对码确认。浏览器会出现在设备列表中，可随时吊销。": "Open the one-time link in a desktop or phone browser (or scan with your phone camera), then approve the 8-digit code on a trusted device. The browser appears in your device list and can be revoked at any time.",
   "已读取浏览器配对链接": "Browser pairing link loaded",
-  "点击下方「配对此设备」，再在已配对设备上确认 8 位配对码。": "Click “Pair this device” below, then approve the 8-digit code on a paired device."
+  "点击下方「配对此设备」，再在已配对设备上确认 8 位配对码。": "Click “Pair this device” below, then approve the 8-digit code on a paired device.",
+  "此浏览器配对链接与当前访问地址不匹配，请使用目标主机生成的链接。": "This browser pairing link does not match the current site origin. Open the link generated for the target Host.",
+  "浏览器配对链接无效或不完整，请在已配对设备重新生成并打开。": "This browser pairing link is invalid or incomplete. Generate a new link on a paired device and open it again.",
+  "当前页面的主机地址不可用或身份不匹配，已阻止切换到其他地址。": "This site’s Host address is unavailable or its identity did not match, so failover to another address was blocked.",
+  "此浏览器在该主机上的旧授权已失效。请先在「此设备的连接」中移除旧连接，再点击下方「配对此设备」。": "This browser’s previous authorization on this Host was revoked. Remove the old connection in “Connections on this device” first, then click “Pair this device” below.",
+  "此浏览器已配对这台主机。如需重新配对，请先在「此设备的连接」中移除旧连接，或返回会话继续使用。": "This browser is already paired with this Host. To re-pair, remove the existing connection in “Connections on this device”, or return to your conversations.",
+  "打开此设备的连接": "Open connections on this device",
+  "正在生成链接…": "Generating link…",
+  "链接已过期或失效，请重新生成。": "Link expired or invalid. Generate a new one.",
+  "链接有效时间 {0}:{1} · 仅限一台新设备": "Link valid for {0}:{1} · single new device",
+  "链接有效期 5 分钟，打开后仍需确认新设备。": "Link valid for 5 minutes; you still approve the new device after opening it.",
+  "重新生成链接": "Regenerate link",
+  "生成链接": "Generate link",
+  "这条 Tailscale 线路使用主机自签名证书（或私有 IP），浏览器不会信任它。请勿绕过浏览器的证书安全警告。": "This Tailscale route uses the Host’s private self-signed certificate (or a private IP), which browsers do not trust. Never bypass browser certificate warnings.",
+  "这条中转线路使用私有证书或非公网受信任地址，浏览器不会信任它。请勿绕过浏览器的证书安全警告。": "This relay route uses a private certificate or untrusted address, which browsers do not trust. Never bypass browser certificate warnings.",
+  "要从浏览器打开，请切换到具备受信任 HTTPS 证书的线路（如 VPS 中转或 Tailscale HTTPS 域名），或使用原生 TaroBird App。": "To open TaroBird in a browser, switch to a route with a trusted HTTPS certificate (such as a VPS relay or a Tailscale HTTPS domain), or use the native TaroBird App.",
+  "复制上方一次性链接并在这台电脑的浏览器中打开（仅限本机访问，无法用手机扫码），再在已配对设备核对 8 位配对码确认。浏览器会出现在设备列表中，可随时吊销。": "Copy the one-time link above and open it in a browser on this computer (loopback works on this computer only and cannot be scanned from a phone), then approve the 8-digit code on a paired device. The browser appears in your device list and can be revoked at any time."
 }

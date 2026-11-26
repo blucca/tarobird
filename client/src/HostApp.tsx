@@ -54,6 +54,7 @@ import "./hosts.css";
 import type { MobileHost, MobileInboxState, MobileScrollPositions } from "./MobileHome.js";
 import { hostNameSchema, hostProfileSchema } from "../../src/client-protocol/host-profile.js";
 import { HubHttpError } from "./http-error.js";
+import { inspectBrowserPairingHash, stripBrowserPairingHash, type ConnectPayload } from "./web-browser.js";
 
 const AdhdBoard = lazy(() => import("./AdhdBoard.js").then(module => ({ default: module.AdhdBoard })));
 const ConnectionPanel = lazy(() => import("./ConnectionPanel.js").then(module => ({ default: module.ConnectionPanel })));
@@ -106,11 +107,16 @@ export type ConversationPane = {
   microphoneBusy: boolean; claimMicrophone: () => boolean; releaseMicrophone: () => void;
 };
 export type WorkspaceProps = { connection: HubConnection; forget: () => Promise<void>; shell?: ManagedWorkspace; pane?: ConversationPane };
+export type BrowserPairingImport = { serial: number; payload?: ConnectPayload; error?: string };
 export type PairingProps = {
   connected: (identity: Identity) => void | Promise<void>;
   pendingConnection?: HubConnection;
   localHostReady?: boolean;
   manage?: () => void;
+  manageConnections?: () => void;
+  existingHostStatus?: (publicKey: string) => "revoked" | "paired" | undefined;
+  browserImport?: BrowserPairingImport;
+  consumeBrowserImport?: (serial: number) => void;
   save?: (identity: Identity, hostName: string) => Promise<void>;
   beforePair?: (publicKey: string) => Promise<void>;
   discard?: (identity: Identity) => Promise<void>;
@@ -229,6 +235,12 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   const [initialJoin, setInitialJoin] = useState<{hostId:string;networkHostId:string}>();
   const [pairingEpoch, setPairingEpoch] = useState(0);
   const [pairing, setPairing] = useState(false), [managing, setManaging] = useState(false);
+  const [capturedBrowserImport, setCapturedBrowserImport] = useState<BrowserPairingImport>();
+  const [deliveredBrowserImport, setDeliveredBrowserImport] = useState<BrowserPairingImport>();
+  const browserImportSerial = useRef(0);
+  const consumeBrowserImport = useCallback((serial: number) => {
+    setDeliveredBrowserImport((old) => old?.serial === serial ? undefined : old);
+  }, []);
   const networkNavigationGuard = useRef<NetworkNavigationGuard | undefined>(undefined);
   const [networkInitialHostKey, setNetworkInitialHostKey] = useState<string>();
   const [networkInitialHostDetails, setNetworkInitialHostDetails] = useState(false);
@@ -398,6 +410,43 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
     void import("./DesktopUpdates.js").then(module => { if (!disposed) stop = module.startDesktopUpdateChecks(); }).catch(() => undefined);
     return () => { disposed = true; stop?.(); };
   }, []);
+  useEffect(() => {
+    if (nativePlatform() !== "web") return;
+    const capture = () => {
+      const result = inspectBrowserPairingHash(window.location.hash, window.location.origin);
+      if (result.kind === "none") return;
+      // Strip the fragment immediately so one-time invites never linger in URL history,
+      // even when the browser is already paired, revoked, or the link is malformed.
+      stripBrowserPairingHash();
+      const serial = ++browserImportSerial.current;
+      if (result.kind === "valid") setCapturedBrowserImport({ serial, payload: result.payload });
+      else if (result.kind === "origin_mismatch") setCapturedBrowserImport({ serial, error: t("此浏览器配对链接与当前访问地址不匹配，请使用目标主机生成的链接。") });
+      else setCapturedBrowserImport({ serial, error: t("浏览器配对链接无效或不完整，请在已配对设备重新生成并打开。") });
+    };
+    capture();
+    window.addEventListener("hashchange", capture);
+    return () => window.removeEventListener("hashchange", capture);
+  }, []);
+  useEffect(() => {
+    if (loading || !capturedBrowserImport) return;
+    const incoming = capturedBrowserImport;
+    setCapturedBrowserImport(undefined);
+    if (incoming.error) {
+      if (!pairingVisible && state.hosts.length > 0) setError(incoming.error);
+      else setDeliveredBrowserImport(incoming);
+      return;
+    }
+    const payload = incoming.payload;
+    if (!payload) return;
+    const matchingPending = state.hosts.find((entry) => entry.host.publicKey === payload.hubPublicKey && entry.connection?.identity.pendingPairing);
+    setAdhd(false); setManaging(false); setConnections(false);
+    if (matchingPending?.connection) {
+      setPairingFocus(matchingPending.connection.identity.deviceId);
+      selectHost(matchingPending.host.id);
+    }
+    setPairing(true);
+    setDeliveredBrowserImport(incoming);
+  }, [loading, capturedBrowserImport, pairingVisible, state.hosts, selectHost]);
   useEffect(() => {
     if (loading) return;
     const ready = state.hosts.filter((entry) => entry.connection && (!networkHostBlocked(entry, localHostKey) || entry.host.id === historyHostId));
@@ -598,7 +647,24 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
       })().catch(() => setError(t("本机已准备好，网络尚未创建。请在「设备与网络」中重试。")));
     }
   };
-  const beforePair = async (publicKey: string) => { const existing = (await registry.list()).find(host => host.publicKey === publicKey); if (existing) throw new Error(state.hosts.some(entry => entry.host.id === existing.id && entry.connection?.identity.pendingPairing) ? t("这台主机已有未完成的配对申请。请返回该申请，扫描或粘贴新的连接码。") : existing.networkBlocked ? t("请先在「此设备的连接」移除此旧连接，再重新配对。历史和草稿会在移除前提示。") : t("此主机已经添加。请在「设置 → 网络与连接 → 此设备的连接」中选择对应主机，打开连接设置并更新线路。")); };
+  const beforePair = async (publicKey: string) => {
+    const existing = (await registry.list()).find(host => host.publicKey === publicKey);
+    if (existing) {
+      const entry = state.hosts.find(item => item.host.id === existing.id);
+      throw new Error(
+        entry?.connection?.identity.pendingPairing
+          ? t("这台主机已有未完成的配对申请。请返回该申请，扫描或粘贴新的连接码。")
+          : existing.networkBlocked || entry?.connection?.isRevoked
+            ? t("请先在「此设备的连接」移除此旧连接，再重新配对。历史和草稿会在移除前提示。")
+            : t("此主机已经添加。请在「设置 → 网络与连接 → 此设备的连接」中选择对应主机，打开连接设置并更新线路。"),
+      );
+    }
+  };
+  const existingHostStatus = (publicKey: string): "revoked" | "paired" | undefined => {
+    const entry = state.hosts.find((item) => item.host.publicKey === publicKey && !item.connection?.identity.pendingPairing);
+    if (!entry) return undefined;
+    return entry.host.networkBlocked || entry.connection?.isRevoked ? "revoked" : "paired";
+  };
   const joinSource = state.hosts.find(entry => entry.host.publicKey === joinIntent?.sourceKey && entry.host.publicKey === localHostKey);
   const joinTarget = state.hosts.find(entry => entry.host.publicKey === joinIntent?.targetKey && !entry.host.networkBlocked);
   const destination = joinTarget?.connection?.state.network?.membership?.manifest;
@@ -623,7 +689,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
         const data = other.host.id === entry.host.id ? current : directories[other.host.id];
         return other.connection && data ? [{ id: other.host.id, name: other.host.name, connection: other.connection, ...data, viewingHistory: viewingHistory(other) }] : [];
       }), mobileInbox, mobileScrollPositions, updateMobileInbox: setMobileInbox, mobileSelect: command, conversationsArchived, manageHosts: openNetwork, manageConnections: openConnections, addHost: () => setPairing(true), multiHost, preferences, updatePreferences: setPreferences, create, selection: (id) => setSelected((old) => old[entry.host.id] === id ? old : { ...old, [entry.host.id]: id }), consumed: (serial) => setCommands((old) => { if (old[entry.host.id]?.serial !== serial) return old; const next = { ...old }; delete next[entry.host.id]; return next; }), shareHosts: hosts.map((other) => ({ hubKey: other.host.publicKey, deviceId: other.host.deviceId, name: other.host.name, open: (conversationId) => command(other.host.id, { kind: "select", conversationId }) })) }}/></section>)}
-    {(pairingVisible || !state.hosts.length) && <Pairing localHostReady={!!localHostKey && state.hosts.some(entry => entry.host.publicKey === localHostKey && !entry.connection?.identity.pendingPairing)} key={pairingEpoch} manage={() => setManaging(true)} pendingConnection={pendingConnection} save={savePairing} beforePair={beforePair} discard={discardPairing} connected={onConnected} cancel={state.hosts.some((entry) => entry.connection && !entry.connection.identity.pendingPairing) ? () => { const ready = state.hosts.find((entry) => entry.connection && !entry.connection.identity.pendingPairing); if (ready) selectHost(ready.host.id); setPairing(false); } : undefined}/>}
+    {(pairingVisible || !state.hosts.length) && <Pairing localHostReady={!!localHostKey && state.hosts.some(entry => entry.host.publicKey === localHostKey && !entry.connection?.identity.pendingPairing)} key={pairingEpoch} manage={() => setManaging(true)} manageConnections={() => setConnections(true)} existingHostStatus={existingHostStatus} browserImport={deliveredBrowserImport} consumeBrowserImport={consumeBrowserImport} pendingConnection={pendingConnection} save={savePairing} beforePair={beforePair} discard={discardPairing} connected={onConnected} cancel={state.hosts.some((entry) => entry.connection && !entry.connection.identity.pendingPairing) ? () => { const ready = state.hosts.find((entry) => entry.connection && !entry.connection.identity.pendingPairing); if (ready) selectHost(ready.host.id); setPairing(false); } : undefined}/>}
     {!pairingVisible && !!state.hosts.length && !hosts.some((entry) => entry.connection) && !historyHostId && <main className="pairing-page"><BrandMark/><p>{t("主机连接尚未就绪。其他主机的配对和数据会保留。")}</p><button onClick={() => { void registry.recoverPreparations().then(() => pool.refresh()); }}>{t("重试")}</button><button onClick={() => setManaging(true)}>{t("设备与网络")}</button><button onClick={() => setPairing(true)}>{t("连接另一台主机")}</button></main>}
     {boardEntryPending && <div className="adhd-entry-notice" role="status"><span>{t("正在保存草稿…")}</span><button onClick={() => setBoardEntryPending(false)}>{t("取消")}</button></div>}
     {boardEntryConfirm && <CreationDialog title={t("有草稿尚未保存")} close={cancelBoardEntry} showHost={false} className="adhd-leave-dialog"><p>{state.hosts.filter(entry => workspaceLocks[entry.host.registrationId]?.dirty).map(entry => entry.host.name).join(" · ")}</p><p>{t("关闭后，未保存的文字或附件修改将丢失。已保存的内容和正在运行的任务会保留。")}</p><footer><button className="primary" onClick={cancelBoardEntry}>{t("继续编辑")}</button><button className="text-danger" disabled={workspaceLocked || state.hosts.some(entry => workspaceLocks[entry.host.registrationId]?.saving)} onClick={() => { setBoardEntryConfirm(false); continueBoardEntry(true); }}>{t("放弃未保存的修改")}</button></footer></CreationDialog>}
