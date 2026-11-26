@@ -11,6 +11,31 @@ const request = (): Request => { const controller = new AbortController(); retur
 const finish = (value: Request) => clearTimeout(value.timer);
 const cancel = (value: Request) => { finish(value); value.controller.abort(); };
 
+const canonicalGroup = (item: Pick<QuotaScope, "sharing" | "botIds">) =>
+  item.sharing === "verified" ? `verified:${[...new Set(item.botIds)].sort().join(",")}` : "unverified";
+
+function propagateSharedSnapshot(sibling: QuotaScope, refreshed: QuotaScope): QuotaScope {
+  return {
+    id: sibling.id,
+    revision: sibling.revision,
+    engine: sibling.engine,
+    label: sibling.label,
+    botIds: sibling.botIds,
+    sharing: sibling.sharing,
+    capability: sibling.capability,
+    authMode: refreshed.authMode,
+    state: refreshed.state,
+    availability: refreshed.availability,
+    pools: refreshed.pools,
+    constraints: refreshed.constraints,
+    ...(refreshed.reason !== undefined ? { reason: refreshed.reason } : {}),
+    ...(refreshed.observedAt !== undefined ? { observedAt: refreshed.observedAt } : {}),
+    ...(refreshed.lastAttemptAt !== undefined ? { lastAttemptAt: refreshed.lastAttemptAt } : {}),
+    ...(refreshed.nextRefreshAt !== undefined ? { nextRefreshAt: refreshed.nextRefreshAt } : {}),
+    ...(refreshed.help !== undefined ? { help: refreshed.help } : {}),
+  };
+}
+
 /** Quota values live only in the currently authorized settings view. Opening
  * the page reads caches; native refresh is an explicit single-scope action. */
 export function useEngineQuota(connection: HubConnection, options: { userId?: string; owner: boolean; online: boolean; supported: boolean; active: boolean }) {
@@ -63,18 +88,52 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
     if (allowed) void readDirectory();
     return stop;
   }, [connection, userId, owner, supported, active, visible, online, allowed, stop, readDirectory]);
-  async function refresh(scope: QuotaScope) {
-    if (!current.current.allowed || directoryRequest.current || scopes.current.has(scope.id) || scopes.current.size >= 2) return;
+  async function refresh(scope: QuotaScope, groupScopeIds?: readonly string[]) {
+    const memberIds = groupScopeIds?.length ? [...new Set([scope.id, ...groupScopeIds])] : [scope.id];
+    if (!current.current.allowed || directoryRequest.current || memberIds.some(id => scopes.current.has(id)) || scopes.current.size >= 2) return;
     const before = viewRef.current;
     if (before.connection !== connection || before.userId !== userId || before.error === "permission" || before.directory?.scopes.find(value => value.id === scope.id)?.revision !== scope.revision) return;
     const generation = version.current, operation = request(); scopes.current.set(scope.id, operation);
-    setView(previous => ({ ...previous, busy: [...previous.busy, scope.id], errors: { ...previous.errors, [scope.id]: "" }, notice: undefined }));
+    setView(previous => {
+      const nextErrors = { ...previous.errors };
+      for (const id of memberIds) nextErrors[id] = "";
+      return { ...previous, busy: [...previous.busy, scope.id], errors: nextErrors, notice: undefined };
+    });
     try {
       const value = await connection.refreshEngineQuota(scope, operation.controller.signal);
       if (generation !== version.current || scopes.current.get(scope.id) !== operation) return;
+      const wasMerged = memberIds.length > 1 || (scope.sharing === "verified" && scope.botIds.length > 1);
+      const membershipChanged = canonicalGroup(scope) !== canonicalGroup(value);
+      const nowMerged = value.sharing === "verified" && value.botIds.length > 1;
+      if (wasMerged && value.reason === "auth_changed") {
+        // Reload the directory so every sibling Bot re-verifies its auth revision and sharing.
+        void readDirectory("changed");
+        return;
+      }
+      if ((wasMerged && (value.state === "login_required" || membershipChanged)) || (!wasMerged && nowMerged)) {
+        setView(previous => previous.directory?.scopes.find(item => item.id === scope.id)?.revision !== scope.revision ? previous
+          : { ...previous, directory: { ...previous.directory, scopes: previous.directory.scopes.map(item => item.id === scope.id ? value : item) } });
+        void readDirectory();
+        return;
+      }
+      const peerIds = new Set(memberIds.filter(id => id !== scope.id));
       // A directory refresh or authorization change can retire this exact card.
-      setView(previous => previous.directory?.scopes.find(item => item.id === scope.id)?.revision !== scope.revision ? previous
-        : { ...previous, directory: { ...previous.directory, scopes: previous.directory.scopes.map(item => item.id === scope.id ? value : item) } });
+      setView(previous => {
+        if (previous.directory?.scopes.find(item => item.id === scope.id)?.revision !== scope.revision) return previous;
+        return {
+          ...previous,
+          directory: {
+            ...previous.directory,
+            scopes: previous.directory.scopes.map(item => {
+              if (item.id === scope.id) return value;
+              if (wasMerged && peerIds.has(item.id) && canonicalGroup(item) === canonicalGroup(value)) {
+                return propagateSharedSnapshot(item, value);
+              }
+              return item;
+            }),
+          },
+        };
+      });
     } catch (error) {
       if (generation !== version.current || scopes.current.get(scope.id) !== operation) return;
       if (error instanceof HubHttpError && [401, 403].includes(error.status)) {

@@ -1,7 +1,8 @@
 import { HISTORY_RELEASE_AFTER_MS, HubConversationHistory } from "./conversation-history.js";
 import { CONVERSATION_HISTORY_CAPABILITY, historyChangeSchema } from "../client-protocol/conversation-history.js";
-import { hubEngineQuotas } from "./engine-quota.js";
+import { hubEngineQuotas, type HubQuotaProofEntry } from "./engine-quota.js";
 import { ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_HUB_REFRESH_MS } from "../client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_ACCOUNT_MATCH_CAPABILITY, quotaAccountProofReplySchema } from "../runtime/engine-quota-scope.js";
 import { DesignShareBroker, metaDesignShareRepository, type DesignSharePeer } from "./workbench-design-sharing.js";
 import { DESIGN_SHARE_CLIENT_CAPABILITY } from "../client-protocol/workbench-design-sharing.js";
 import { HubRemoteScreen } from "./remote-screen.js";
@@ -95,7 +96,7 @@ import { HubLinkPreviews } from "./link-previews.js";
 import { BotManager, createBotSchema, type BotManagerOptions } from "./bot-manager.js";
 import { deleteBotSchema, renameBotSchema } from "../client-protocol/bots.js";
 import { type RouteAlert } from "./route-monitor.js";
-import { createHash, timingSafeEqual, randomUUID } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { attachmentResponse } from "./attachment-response.js";
 import { AUTH_STATUS_CAPABILITY } from "../client-protocol/auth-status.js";
@@ -150,7 +151,7 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
   const { workbench, ...rest } = metadata, { openTarget: _opener, ...context } = workbench;
   return (workbenchOpenerOnly(workbench) ? rest : { ...rest, workbench: context }) as T;
 }
-type BotConnection = { botSteer: boolean; engineQuota: boolean; contextUsage: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
+type BotConnection = { botSteer: boolean; engineQuota: boolean; engineQuotaAccountMatch: boolean; contextUsage: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
 export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
@@ -187,6 +188,10 @@ export class HubServer {
   private readonly sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES, perMessageDeflate: false });
   private clients = new Set<Client>();
   private bots = new Map<string, BotConnection>();
+  /** Ephemeral per-Hub HMAC key and in-memory proof cache for verifying whether
+   * two Bots on this Host share an account. Never written to disk or client DTOs. */
+  private readonly quotaProofKey = randomBytes(32);
+  private readonly quotaAccountProofs = new Map<string, HubQuotaProofEntry>();
   private readonly dispatchTails = new Map<string, Promise<void>>();
   private permissionOperations = new Map<string, Promise<void>>();
   private effortOperations = new Map<string, Promise<void>>();
@@ -1286,14 +1291,15 @@ export class HubServer {
           botId = frame.botId; if (frame.capabilities?.includes(FRAGMENT_CAPABILITY)) this.fragmentSockets.add(ws); clearTimeout(timeout); this.bots.get(botId)?.ws.close(4000, "replaced");
           const queueAdvertised = frame.capabilities?.includes(PROMPT_QUEUE_CAPABILITY) ?? false;
           const queueCapable = queueAdvertised && supportsPromptQueueEngine(frame.engine);
-          const connection: BotConnection = { botSteer: frame.capabilities?.includes(BOT_MESSAGE_STEER_CAPABILITY) ?? false, engineQuota: frame.capabilities?.includes(ENGINE_QUOTA_CAPABILITY) ?? false, contextUsage: frame.capabilities?.includes(CONTEXT_USAGE_CAPABILITY) ?? false, history: frame.capabilities?.includes(CONVERSATION_HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
+          const connection: BotConnection = { botSteer: frame.capabilities?.includes(BOT_MESSAGE_STEER_CAPABILITY) ?? false, engineQuota: frame.capabilities?.includes(ENGINE_QUOTA_CAPABILITY) ?? false, engineQuotaAccountMatch: frame.capabilities?.includes(ENGINE_QUOTA_ACCOUNT_MATCH_CAPABILITY) ?? false, contextUsage: frame.capabilities?.includes(CONTEXT_USAGE_CAPABILITY) ?? false, history: frame.capabilities?.includes(CONVERSATION_HISTORY_CAPABILITY) ?? false, designOpen: frame.capabilities?.includes(WORKBENCH_DESIGN_OPEN_CAPABILITY) ?? false, nativeInput: frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) ?? false, nativeReviewInput: (frame.capabilities?.includes(NATIVE_INPUT_CAPABILITY) && frame.capabilities.includes(NATIVE_REVIEW_INPUT_CAPABILITY)) ?? false, engineTasks: frame.capabilities?.includes(ENGINE_TASKS_CAPABILITY) ?? false, piSession: frame.engine === "pi" && (frame.capabilities?.includes(PI_SESSION_CAPABILITY) ?? false), ws, botId, widgetPolicy: frame.capabilities?.includes(WIDGET_POLICY_CAPABILITY) ?? false, voicePolicy: frame.capabilities?.includes(VOICE_POLICY_CAPABILITY) ?? false, queueAdvertised, queueCapable, queuePull: frame.capabilities?.includes(PROMPT_QUEUE_PULL_CAPABILITY) ?? false, botMessages: frame.capabilities?.includes("bot-messages.v1") ?? false, agentBus: frame.capabilities?.includes(AGENT_BUS_WORKER_CAPABILITY) ?? false, groupDiscussion: frame.capabilities?.includes(GROUP_DISCUSSION_WORKER_CAPABILITY) ?? false, replayQueue: true, ready: false };
           // Reserve socket ownership before awaiting SQLite. Concurrent hellos
           // must replace this exact socket, not both replace its predecessor.
           this.bots.set(botId, connection);
+          this.quotaAccountProofs.delete(botId);
           const ownsConnection = () => active() && this.bots.get(botId!) === connection;
           if (!await new HubPromptQueue(this.store).registerWorker(botId, queueCapable, ownsConnection, frame) || !ownsConnection()) return;
           connection.ready = true;
-          this.send(ws, { v: 1, type: "instance.ready", capabilities: [CONVERSATION_HISTORY_CAPABILITY, PI_SESSION_CAPABILITY, WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, RUN_CHANGES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY] });
+          this.send(ws, { v: 1, type: "instance.ready", ...(connection.engineQuotaAccountMatch ? { quotaProofKey: this.quotaProofKey.toString("hex") } : {}), capabilities: [CONVERSATION_HISTORY_CAPABILITY, PI_SESSION_CAPABILITY, WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, RUN_CHANGES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY] });
           // Never await RPC results in this socket's frame chain: its result
           // frames are handled by that same chain after hello completes.
           if (connection.history) this.trackTask(this.conversationHistory.recoverBot(botId).catch(() => this.options.onWarning?.("history_recovery_failed")));
@@ -1350,7 +1356,7 @@ export class HubServer {
     ws.on("close", () => {
       clearTimeout(timeout); reader.clear();
       for (const [id, lease] of this.nativeTurns) if (lease.connection.ws === ws) this.nativeTurns.delete(id);
-      if (botId && this.bots.get(botId)?.ws === ws) { this.bots.delete(botId); this.trackTask(this.store.botStatus(botId, { online: 0 }).then(() => this.broadcastBotStatus(botId!)).catch(() => undefined)); }
+      if (botId && this.bots.get(botId)?.ws === ws) { this.bots.delete(botId); this.quotaAccountProofs.delete(botId); this.trackTask(this.store.botStatus(botId, { online: 0 }).then(() => this.broadcastBotStatus(botId!)).catch(() => undefined)); }
       for (const [id, rpc] of this.pendingRpc) if (rpc.ws === ws) { clearTimeout(rpc.timer); this.pendingRpc.delete(id); rpc.reject(new HubError("bot_offline", 503)); }
     });
   }
@@ -1603,6 +1609,18 @@ export class HubServer {
         const quotas = hubEngineQuotas({ bots: () => this.store.bots(userId), validate,
           connection: id => { const connection = this.bots.get(id); return connection ? { key: connection, supported: connection.engineQuota, ready: connection.ready } : undefined; },
           call: (id, request) => this.callBot(id, "quota.get", request, request.refresh ? ENGINE_QUOTA_HUB_REFRESH_MS : 2_500),
+          proofStore: this.quotaAccountProofs,
+          accountProof: async (id, expectedRevision) => {
+            const conn = this.bots.get(id);
+            if (!conn?.ready || !conn.engineQuotaAccountMatch) return undefined;
+            try {
+              const raw = await this.callBot(id, "quota.accountProof", { scopeId: id, expectedRevision }, 2_000);
+              const parsed = quotaAccountProofReplySchema.safeParse(raw);
+              return parsed.success && parsed.data.scopeId === id && parsed.data.revision === expectedRevision ? parsed.data.accountKey : undefined;
+            } catch {
+              return undefined;
+            }
+          },
         });
         await reply(200, quotaRoute[1] ? await quotas.scope(quotaRoute[1], refresh, revision) : await quotas.directory()); return;
       }

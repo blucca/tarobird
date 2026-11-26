@@ -5,7 +5,7 @@ import type { HubConnection } from "./connection.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
 import { SettingsGroupHeading } from "./SettingsParts.js";
 import { useEngineQuota } from "./use-engine-quota.js";
-import { formatQuotaWindowLabel, formatResetCountdown, groupQuotaScopesByAccount } from "./quota-ui.js";
+import { formatQuotaWindowLabel, formatResetCountdown, groupQuotaScopesByAccount, shouldShowQuotaPoolHeading } from "./quota-ui.js";
 import { usageTone } from "./usage-readings.js";
 import { t, useLocale } from "./i18n.js";
 import "./engine-quota.css";
@@ -144,7 +144,8 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
   const formatNumber = (value: number) => new Intl.NumberFormat(locale === "zh" ? "zh-CN" : "en", { maximumFractionDigits: 2 }).format(value);
   if (!owner) return null;
 
-  const cards = quota.directory ? groupQuotaScopesByAccount(quota.directory.scopes) : [];
+  const botLabels = new Map(state.bots.map(bot => [bot.id, bot.name]));
+  const cards = quota.directory ? groupQuotaScopesByAccount(quota.directory.scopes, { now, botLabels }) : [];
 
   return <div className="engine-quota">
     <SettingsGroupHeading scope="host" host={host}>{t("原生模型额度")}</SettingsGroupHeading>
@@ -164,7 +165,8 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
       {quota.directory && !cards.length && <p role="status">{t("当前主机还没有可展示额度的 Bot。")}</p>}
       <div className="quota-list">{cards.map(card => {
         const scope = card.primary;
-        const stale = !online || !!quota.error || !!quota.errors[scope.id] || scope.state === "stale" || quotaReadingExpired(scope, now);
+        const cardError = card.scopes.some(item => !!quota.errors[item.id]);
+        const stale = !online || !!quota.error || cardError || scope.state === "stale" || quotaReadingExpired(scope, now);
         const busy = card.scopes.some(item => quota.busy.includes(item.id));
         const status = busy
           ? t("正在读取…")
@@ -173,7 +175,13 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
             : ({ ready: t("已读取"), stale: t("待更新"), unknown: t("尚无数据"), login_required: t("需要登录"), offline: t("离线"), unavailable: t("暂不可用"), unsupported: t("暂不支持") })[scope.state];
         const passive = scope.capability.mode === "passive";
         const canRead = scope.capability.mode !== "unsupported" && scope.state !== "offline" && scope.state !== "unsupported" && scope.reason !== "host_upgrade_required";
-        const cooling = !!scope.nextRefreshAt && Date.parse(scope.nextRefreshAt) > now;
+        const nextRefreshAt = card.scopes.reduce<string | undefined>((latest, item) => {
+          if (!item.nextRefreshAt) return latest;
+          const ms = Date.parse(item.nextRefreshAt);
+          if (!Number.isFinite(ms)) return latest;
+          return !latest || ms > Date.parse(latest) ? item.nextRefreshAt : latest;
+        }, undefined);
+        const cooling = !!nextRefreshAt && Date.parse(nextRefreshAt) > now;
         const reason = reasonText(scope.reason ?? scope.capability.reason, scope.engine);
         const help = scope.state === "ready" && !stale ? "" : helpText(scope.help);
         const auth = ({ subscription: t("订阅授权"), api_key: "API Key", adc: t("应用默认凭据"), other: t("其他授权"), unknown: t("授权方式未确认") })[scope.authMode as QuotaAuthMode];
@@ -215,7 +223,7 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
           })}</ul>}
 
           {scope.pools.map(pool => <div className="quota-pool" key={pool.id}>
-            {scope.pools.length > 1 && <h5>{pool.label}</h5>}
+            {shouldShowQuotaPoolHeading(scope.engine, pool.label, scope.pools.length) && <h5>{pool.label}</h5>}
             {pool.models?.length ? <p className="quota-pool-models muted">{pool.models.join(" · ")}</p> : null}
             <div className="quota-windows">
               {pool.windows.map(window => <WindowQuota key={window.id} window={window} stale={stale} now={now} formatTime={formatTime} formatNumber={formatNumber}/>)}
@@ -230,19 +238,19 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
           {reason && <p className="quota-reason">{reason}</p>}
           {help && <p className="quota-help">{help}</p>}
           {passive && <p className="quota-secondary-note muted">{t("仅显示正常使用中收到的状态；读取不会触发新对话。")}</p>}
-          {quota.errors[scope.id] && <p className="quota-notice" role="alert">{t("本次刷新失败，可重试。保留的读数不代表当前余额。")}</p>}
+          {cardError && <p className="quota-notice" role="alert">{t("本次刷新失败，可重试。保留的读数不代表当前余额。")}</p>}
 
           <footer className="quota-card-footer">
             <div className="quota-card-meta">
               <span>{auth}</span>
               {scope.observedAt && <time dateTime={scope.observedAt}>{t("读取于 {0}", formatTime(scope.observedAt))}</time>}
-              {cooling && <time dateTime={scope.nextRefreshAt}>{t("{0} 后可再刷新", formatTime(scope.nextRefreshAt!))}</time>}
+              {cooling && nextRefreshAt && <time dateTime={nextRefreshAt}>{t("{0} 后可再刷新", formatTime(nextRefreshAt))}</time>}
             </div>
             {canRead && <button
               type="button"
               className="secondary"
               disabled={!online || quota.loading || quota.busy.length >= 2 || busy || cooling || quota.error === "permission"}
-              onClick={() => void quota.refresh(scope)}
+              onClick={() => void quota.refresh(scope, card.scopes.map(item => item.id))}
             >
               {busy ? <LoaderCircle size={14} className="spin" aria-hidden="true"/> : <RefreshCw size={14} aria-hidden="true"/>}
               {busy ? t("正在读取…") : passive ? t("读取已知状态") : t("刷新")}

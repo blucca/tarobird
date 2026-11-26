@@ -9,6 +9,7 @@ import { attachGateway } from "../../src/gateway/service.js";
 import { createCoreServiceRuntime } from "../../src/core/runtime.js";
 import type { QuotaSnapshot } from "../../src/client-protocol/engine-quota.js";
 import { unavailableQuota } from "../../src/codex/account-quota.js";
+import { proveQuotaAccount } from "../../src/runtime/engine-quota-scope.js";
 import { fixtureInvitation } from "./fixtures/pairing-invite.js";
 import { pairingLink } from "../src/pairing-link.js";
 import en from "../src/locales/en.json" with { type: "json" };
@@ -17,7 +18,7 @@ import en from "../src/locales/en.json" with { type: "json" };
 // uses `dist`. TAROBIRD_QUOTA_TEST_CLIENT_DIR still points the page tests at another client directory.
 const quotaUiClient = process.env.TAROBIRD_QUOTA_TEST_CLIENT_DIR;
 
-type RecordState = { revision: string; snapshot: QuotaSnapshot; reads: number; refreshes: number; hold?: Promise<void> };
+type RecordState = { revision: string; snapshot: QuotaSnapshot; reads: number; refreshes: number; hold?: Promise<void>; account?: { accountId: string; userId: string }; onRefresh?: () => void };
 async function fixture(page: Page, english = false, oldHost = false) {
   const text = (key: string) => english ? (en as Record<string, string>)[key] || key : key;
   const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-quota-ui-"));
@@ -50,7 +51,19 @@ async function fixture(page: Page, english = false, oldHost = false) {
     await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES(?,?,?)", [id, name, hashSecret(secret)]);
     gateways.push(await attachGateway({ stateDir, url: hub.instanceUrl.replace("http", "ws") + "/instance", secret, botId: id, engine, runtime: createCoreServiceRuntime(), bridge: {
       handleAuthorizedMessage: async () => { turns++; throw new Error("quota_must_not_send_a_turn"); },
-      readAccountQuota: async options => { const record = records[id]!; record.reads++; if (options.refresh) { record.refreshes++; await record.hold; } return { revision: record.revision, snapshot: record.snapshot }; },
+      readAccountQuota: async options => {
+        const record = records[id]!;
+        record.reads++;
+        if (options.refresh) {
+          record.refreshes++;
+          await record.hold;
+          record.onRefresh?.();
+        }
+        const proof = record.account && options.accountProofKey
+          ? proveQuotaAccount(options.accountProofKey, { engine, scopeStamp: record.revision, accountId: record.account.accountId, userId: record.account.userId })
+          : undefined;
+        return { revision: record.revision, snapshot: record.snapshot, ...(proof ? { proof } : {}) };
+      },
     } }));
   }
   await page.goto(hub.url); const invitation = await fixtureInvitation(hub);
@@ -269,5 +282,90 @@ test("a failed quota card preserves marked old values while a retired scope only
     await coder.getByRole("button", { name: "刷新", exact: true }).click(); await expect(page.locator(".engine-quota")).toContainText("已重新读取列表");
     await expect.poll(() => f.records.coder!.reads).toBeGreaterThan(before); expect(f.records.coder!.refreshes).toBe(0);
     await expect(coder).toContainText("剩余 62%"); await expect(coder.getByRole("alert")).toHaveCount(0);
+  } finally { await f.close(); }
+});
+
+test("verified same-account Bots merge on a real Hub, preserve timeout/cooldown on refresh, and show model-specific single-pool headings", async ({ page }) => {
+  const f = await fixture(page);
+  const responseBodies: string[] = [];
+  page.on("response", async response => {
+    if (response.url().includes("/api/engine-quotas")) {
+      try { responseBodies.push(await response.text()); } catch { /* ignore */ }
+    }
+  });
+  try {
+    const now = Date.now();
+    // Same verified account across two Codex Bots with distinct per-Bot revisions
+    f.records.coder!.account = { accountId: "acct_shared_secret", userId: "user_shared_secret" };
+    f.records.reviewer!.account = { accountId: "acct_shared_secret", userId: "user_shared_secret" };
+    f.records.coder!.snapshot.observedAt = new Date(now - 20_000).toISOString();
+    f.records.reviewer!.snapshot.observedAt = new Date(now - 5_000).toISOString();
+    const reviewerWin = f.records.reviewer!.snapshot.pools[0]!.windows[0]!;
+    if (reviewerWin.metric === "percent") reviewerWin.usedPercent = 20;
+
+    // Model-specific single pool on Claude (e.g. Fable after claudeQuotaForModel strips models)
+    f.records.writer!.snapshot = {
+      authMode: "subscription",
+      capability: { mode: "active" },
+      state: "ready",
+      availability: "allowed",
+      observedAt: new Date(now).toISOString(),
+      pools: [{
+        id: "claude-fable",
+        label: "Fable",
+        sharing: "shared",
+        availability: "allowed",
+        windows: [{
+          id: "seven_day",
+          label: "7 days",
+          metric: "percent",
+          usedPercent: 30,
+          availability: "allowed",
+          observedAt: new Date(now).toISOString(),
+          expiresAt: new Date(now + 60_000).toISOString(),
+          resetsAt: new Date(now + 3 * 86_400_000 + 20 * 3_600_000).toISOString(),
+          periodSeconds: 604_800,
+        }],
+        balances: [],
+        constraints: [],
+      }],
+      constraints: [],
+    };
+
+    await f.open();
+    const panel = page.locator(".engine-quota:visible");
+    const merged = panel.getByRole("region", { name: "Codex · Coding Bot, Review Bot", exact: true });
+    await expect(merged).toBeVisible();
+    await expect(merged.locator(".quota-account-badge")).toHaveText("2 个 Bot 共用同一账号");
+    await expect(merged.locator(".quota-bot-chip")).toHaveText(["Coding Bot", "Review Bot"]);
+    await expect(merged.locator(".quota-separate-note")).toHaveCount(0);
+    // Selects fresher peer (Review Bot: 20% used -> 80% remaining)
+    await expect(merged).toContainText("剩余 80%");
+
+    // Distinct single-pool heading ("Fable") is shown, and 3d 20h countdown includes remaining hours
+    const writer = panel.getByRole("region", { name: "Writing Bot · Claude Code", exact: true });
+    await expect(writer.locator(".quota-pool h5")).toHaveText("Fable");
+    await expect(writer).toContainText("3 天 20 小时后重置");
+
+    // Refreshing the merged card when it times out keeps the fresher timeout + cooldown and never reverts to older peer (62%)
+    f.records.reviewer!.onRefresh = () => {
+      f.records.reviewer!.snapshot = {
+        ...f.records.reviewer!.snapshot,
+        state: "stale",
+        reason: "timeout",
+        lastAttemptAt: new Date(Date.now() + 1_000).toISOString(),
+      };
+    };
+    await merged.getByRole("button", { name: "刷新", exact: true }).click();
+    await expect(merged.locator(".quota-state")).toHaveText("待更新");
+    await expect(merged).toContainText("读取原生额度超时");
+    await expect(merged).toContainText("上次读数：剩余 80%");
+    await expect(merged).not.toContainText("剩余 62%");
+    await expect(merged.getByRole("button", { name: "刷新", exact: true })).toBeDisabled();
+    await expect(merged).toContainText("后可再刷新");
+
+    // No raw account identifiers or proofs ever enter client HTTP responses
+    expect(responseBodies.length).toBeGreaterThan(0);
+    expect(responseBodies.join("\n")).not.toMatch(/acct_shared_secret|user_shared_secret|accountKey|proof/);
   } finally { await f.close(); }
 });

@@ -97,7 +97,7 @@ test("desktop: ring and battery sit left of the model controls, each only when r
     await expect(limits.locator(".usage-window")).toHaveCount(2);
     await expect(limits.locator(".usage-window").nth(0)).toContainText("5 小时窗口"); await expect(limits.locator(".usage-window").nth(0)).toContainText("80%");
     await expect(limits.locator(".usage-window").nth(1)).toContainText("周额度（7 天）"); await expect(limits.locator(".usage-window").nth(1)).toContainText("90%");
-    await expect(limits.locator(".usage-window").nth(0)).toContainText(/小时.*重置|分钟后重置/); await expect(limits.locator(".usage-window").nth(1)).toContainText(/\d+ 天后重置/);
+    await expect(limits.locator(".usage-window").nth(0)).toContainText(/小时.*重置|分钟后重置/); await expect(limits.locator(".usage-window").nth(1)).toContainText(/\d+ 天(?:\s*\d+\s*小时)?后重置/);
     await expect(panel.getByRole("meter", { name: "上下文可用", exact: true })).toHaveAttribute("aria-valuenow", "62");
     await expect(panel).toContainText(/\d{2}:\d{2} 读取/);
     expect(`${await indicators.innerText()}${await panel.innerText()}`).not.toContain("剩");
@@ -364,4 +364,42 @@ test("forgetting a computer on this device also forgets its saved quota readings
     expect(Object.keys(left.afterReset as object).length).toBe(2); expect(left.afterReset).toHaveProperty("other");
     expect(left.afterRemoval).toEqual({ other: { gamma: {} } });
   } finally { await server.close(); }
+});
+
+test("in-chat quota details tick live countdowns and honor serverTimeOffset", async ({ page }) => {
+  // Simulate Host clock 1 hour ahead of browser clock
+  const hostAheadMs = 3_600_000;
+  await page.routeWebSocket("**/ws", socket => {
+    const upstream = socket.connectToServer();
+    upstream.onMessage(message => {
+      if (typeof message !== "string") return socket.send(message);
+      const frame = JSON.parse(message);
+      if (frame.type === "ready" && typeof frame.serverTime === "number") {
+        frame.serverTime += hostAheadMs;
+      }
+      socket.send(JSON.stringify(frame));
+    });
+  });
+  const f = await fixture(page);
+  try {
+    // Primary resets at browserNow + 1h + 64.5s => Host remaining is ~64.5s ("2 分钟后重置", ticking to "1 分钟后重置" within 8s)
+    // Secondary resets at browserNow + 3h => Host remaining is ~2h ("2 小时后重置", not skewed "3 小时后重置")
+    f.readings.value = {
+      limits: [
+        { id: "primary", used: 20, period: 18_000, resetHours: (hostAheadMs + 64_500) / 3_600_000 },
+        { id: "secondary", used: 10, period: 604_800, resetHours: (hostAheadMs + 2 * 3_600_000) / 3_600_000 },
+      ],
+    };
+    const ws = workspace(page), indicators = ws.locator(".usage-indicators");
+    await selectConversation(page, "有读数");
+    await expect(indicators.locator("[data-usage=quota]")).toHaveText("80%");
+    await indicators.click();
+    const panel = page.getByRole("group", { name: "上下文与额度", exact: true });
+    await expect(panel).toBeVisible();
+    const windows = panel.locator(".usage-window");
+    await expect(windows.nth(0)).toContainText("2 分钟后重置");
+    await expect(windows.nth(1)).toContainText("2 小时后重置");
+    // While the popover stays open, its live timer ticks down from 2 min to 1 min without reopening
+    await expect(windows.nth(0)).toContainText("1 分钟后重置", { timeout: 8_000 });
+  } finally { await f.dispose(); }
 });

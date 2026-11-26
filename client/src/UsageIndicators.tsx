@@ -41,9 +41,18 @@ function Bar({ left, label }: { left: number; label: string }) {
 }
 
 /** The numbers behind the two symbols. Every percentage is what is left. */
-export function UsageDetails({ context, quota }: { context?: ContextView; quota?: QuotaView }) {
+export function UsageDetails({ context, quota, serverTimeOffset }: { context?: ContextView; quota?: QuotaView; serverTimeOffset?: number }) {
   const locale = useLocale();
-  const nowMs = Date.now();
+  const [nowClock, setNowClock] = useState(Date.now);
+  const hasQuota = Boolean(quota);
+  useEffect(() => {
+    if (!hasQuota) return;
+    setNowClock(Date.now());
+    const timer = setInterval(() => setNowClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [hasQuota]);
+  const nowMs = nowClock + (serverTimeOffset ?? 0);
+  const nowDate = new Date(nowMs);
   const pools = quota ? [...new Set(quota.windows.map(window => window.pool))] : [];
   return <div className="usage-details">
     {context && <section aria-label={t("上下文")}>
@@ -59,7 +68,7 @@ export function UsageDetails({ context, quota }: { context?: ContextView; quota?
         {windows.map(window => {
           const name = formatQuotaWindowLabel(window);
           const countdown = window.resetsAt ? formatResetCountdown(window.resetsAt, nowMs) : undefined;
-          const exact = window.resetsAt ? clock(window.resetsAt, locale, new Date(nowMs)) : undefined;
+          const exact = window.resetsAt ? clock(window.resetsAt, locale, nowDate) : undefined;
           return <div className="usage-window" key={window.id}>
             <div className="usage-row">
               <span className="usage-window-label">{name}</span>
@@ -78,12 +87,12 @@ export function UsageDetails({ context, quota }: { context?: ContextView; quota?
       {!quota.windows.length && <h4><QuotaBattery left={0} height={13}/>{t("额度")}</h4>}
       {quota.blocked.map(code => <p className="usage-note usage-blocked" role="status" key={code}>{blockText(code)}</p>)}
     </section>}
-    {quota && <p className="usage-note usage-read-at">{t("{0} 读取", clock(quota.observedAt, locale))}</p>}
+    {quota && <p className="usage-note usage-read-at">{t("{0} 读取", clock(quota.observedAt, locale, nowDate))}</p>}
   </div>;
 }
 
 /** Desktop composer: the ring and the battery, each with its number and each only when its value can be read. */
-export function UsageIndicators({ context, quota, onOpen }: { context?: ContextView; quota?: QuotaView; onOpen?: () => void }) {
+export function UsageIndicators({ context, quota, serverTimeOffset, onOpen }: { context?: ContextView; quota?: QuotaView; serverTimeOffset?: number; onOpen?: () => void }) {
   useLocale();
   const [open, setOpen] = useState(false), trigger = useRef<HTMLButtonElement>(null), id = useId();
   const shown = !!context || !!quota;
@@ -98,7 +107,7 @@ export function UsageIndicators({ context, quota, onOpen }: { context?: ContextV
       {quota && <span className="usage-pair" data-tone={usageTone(quota.left)} data-usage="quota"><QuotaBattery left={quota.left}/><span>{quota.left}%</span></span>}
     </button>
     {open && <DesktopMenuPortalContext.Provider value={true}>
-      <DesktopMenu id={id} label={t("上下文与额度")} open close={() => setOpen(false)} trigger={trigger} placement="up-end" className="usage-panel"><UsageDetails context={context} quota={quota}/></DesktopMenu>
+      <DesktopMenu id={id} label={t("上下文与额度")} open close={() => setOpen(false)} trigger={trigger} placement="up-end" className="usage-panel"><UsageDetails context={context} quota={quota} serverTimeOffset={serverTimeOffset}/></DesktopMenu>
     </DesktopMenuPortalContext.Provider>}
   </>;
 }

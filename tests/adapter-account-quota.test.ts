@@ -725,4 +725,27 @@ describe("native Codex rate limiting on the quota read", () => {
     expect(recovered).toMatchObject({ state: "ready" }); expect(recovered.reason).toBeUndefined();
     expect(recovered.pools[0]?.windows[0]).toMatchObject({ usedPercent: 25 });
   });
+
+  it("produces matching Hub-keyed account proofs across distinct Codex adapters on the same account without colliding revisions", async () => {
+    const f = await fixture();
+    const sharedHubKey = Buffer.alloc(32, 0x42);
+    const otherHubKey = Buffer.alloc(32, 0x99);
+    const adapterA = new ProcessCodexAdapter("codex", f.env, () => new Child(), undefined, undefined, undefined, f.root);
+    const adapterB = new ProcessCodexAdapter("codex", f.env, () => new Child(), undefined, undefined, undefined, f.root);
+    disposals.push(() => adapterA.destroy(), () => adapterB.destroy());
+
+    const resA = await adapterA.getAccountQuota({ refresh: true, accountProofKey: sharedHubKey });
+    const resB = await adapterB.getAccountQuota({ refresh: true, accountProofKey: sharedHubKey });
+    expect(resA.revision).not.toBe(resB.revision);
+    expect(resA.proof?.accountKey).toMatch(/^[0-9a-f]{64}$/);
+    expect(resA.proof?.accountKey).toBe(resB.proof?.accountKey);
+    expect(resA.proof?.scopeStamp).toBe(resA.revision);
+    expect(resB.proof?.scopeStamp).toBe(resB.revision);
+
+    // Cached reads retain the proof for the same Hub key, and strip it if the Hub key changes
+    const cachedSame = await adapterA.getAccountQuota({ refresh: false, accountProofKey: sharedHubKey });
+    expect(cachedSame.proof?.accountKey).toBe(resA.proof?.accountKey);
+    const cachedRotated = await adapterA.getAccountQuota({ refresh: false, accountProofKey: otherHubKey });
+    expect(cachedRotated.proof).toBeUndefined();
+  });
 });
