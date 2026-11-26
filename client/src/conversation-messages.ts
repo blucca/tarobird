@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Message } from "../../src/client-protocol/index.js";
 import type { HubConnection } from "./connection.js";
+import { markSendTimingHistoryRead } from "./send-timing.js";
 
 const emptyMessages: Message[] = [];
 type View = { connection: HubConnection; conversationId: string; messages: Message[]; failed: boolean; readRevision: number };
@@ -80,6 +81,8 @@ export function useConversationMessages(connection: HubConnection, conversationI
             // Publish each completed read so a continuous stream cannot starve
             // rendering. A revision received during it requests one fresh read.
             const visibleMessages = messages.filter(message => message.status !== "deleted");
+            const readEndAt = performance.now();
+            markSendTimingHistoryRead(conversationId, visibleMessages, readEndAt, wait > 0 ? wait : 0, readEndAt - started);
             if (!disposed) setView(previous => ({ connection, conversationId, failed: false, readRevision,
               messages: previous?.connection === connection && previous.conversationId === conversationId ? shareMessages(previous.messages, visibleMessages) : visibleMessages,
             }));

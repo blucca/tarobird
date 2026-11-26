@@ -6,6 +6,7 @@ import { timeoutSignal } from "./abort-signals.js";
 import { formatFileLimit, uploadFile } from "./files.js";
 import { negotiateSideCapability } from "./side-capability.js";
 import { t } from "./i18n.js";
+import { beginSendTiming } from "./send-timing.js";
 
 export function sideErrorText(code: SideErrorCode): string {
   const messages: Record<SideErrorCode, string> = {
@@ -190,8 +191,9 @@ class SideSession {
   send = async () => {
     const text = this.snapshot.draft.trim(), files = [...this.snapshot.files], id = this.snapshot.view?.id, serial = this.generation;
     if (!id || !this.online || this.snapshot.sending || !text && !files.length || text.length > SIDE_QUESTION_LIMIT || this.snapshot.view?.phase !== "idle" || this.snapshot.ended) return;
+    const timing = beginSendTiming({ conversationId: this.conversationId, kind: "side", engine: "side", route: "side", messageLength: text.length, matchText: text });
     const fileError = this.validateFiles(files);
-    if (fileError) { this.setError(fileError); return; }
+    if (fileError) { timing?.fail(fileError); this.setError(fileError); return; }
     this.patch({ sending: true, error: "" }); this.stopRequested = false;
     let submitted = false;
     try {
@@ -199,19 +201,23 @@ class SideSession {
       if (files.length) this.patch({ uploadProgress: 0 });
       for (const [index, file] of files.entries()) {
         const attachment = this.uploaded.get(file) ?? await uploadFile(this.connection, this.conversationId, file, value => { if (serial === this.generation) this.patch({ uploadProgress: (index + value) / files.length }); }, { signal: controller.signal, recovering: uploadRecovering => { if (serial === this.generation) this.patch({ uploadRecovering }); } });
-        if (serial !== this.generation) return;
+        if (serial !== this.generation) { timing?.fail("stale_generation"); return; }
         this.uploaded.set(file, attachment); if (!attachments.includes(attachment)) attachments.push(attachment);
       }
       controller.signal.throwIfAborted(); this.upload = undefined; this.patch({ uploadProgress: undefined, uploadRecovering: false });
       const same = this.uncertain?.text === text && JSON.stringify(this.uncertain.attachments) === JSON.stringify(attachments);
       const pending: PendingAsk = { text, files, attachments, requestId: same ? this.uncertain!.requestId : crypto.randomUUID() };
+      timing?.setClientMsgId(pending.requestId);
       this.uncertain = pending; submitted = true;
       const result = sideReplySchema.parse(await this.connection.http(`${this.route}/${id}`, { method: "POST", body: JSON.stringify({ botId: this.botId, requestId: pending.requestId, text, ...(attachments.length ? { attachments } : {}) }), signal: timeoutSignal(20_000) }));
-      if (serial !== this.generation) return;
-      if (!result.ok) { this.uncertain = undefined; this.setError(sideErrorText(result.error)); return; }
+      timing?.mark("outboxFlushSentAt");
+      if (serial !== this.generation) { timing?.fail("stale_generation"); return; }
+      if (!result.ok) { timing?.fail(result.error); this.uncertain = undefined; this.setError(sideErrorText(result.error)); return; }
+      if (text) timing?.expectComposerClear();
       this.uncertain = undefined; this.clearSent(pending); if (result.view) this.accept(result.view);
       if (this.stopRequested) await this.requestStop(id, serial, true);
     } catch (error) {
+      timing?.fail(error);
       if (serial === this.generation) this.setError(submitted ? t("发送状态暂未确认。重试同一问题不会重复发送。") : error instanceof Error ? error.message : t("上传失败，请重试。"));
     } finally {
       if (serial === this.generation) { this.upload = undefined; this.patch({ sending: false, uploadProgress: undefined, uploadRecovering: false }); this.pollSoon(); }
@@ -258,6 +264,6 @@ export function useSideConversation(connection: HubConnection, conversationId: s
     for (const [id, item] of sessions) if (item !== session && !item.getSnapshot().shown) sessions.delete(id);
     return () => session.activate(false);
   }, [session, sessions, eligible, online, runtimeKey]);
-  return { ...snapshot, scope: key, connection, scroll: session.scroll, focus: session.focus, setDraft: session.setDraft, setError: session.setError, addFiles: session.addFiles, captureTarget: session.captureTarget, checkFiles: session.checkFiles, removeFile: session.removeFile, open: session.open, close: session.close, send: session.send, stop: session.stop, retry: session.retry };
+  return { ...snapshot, conversationId: session.conversationId, scope: key, connection, scroll: session.scroll, focus: session.focus, setDraft: session.setDraft, setError: session.setError, addFiles: session.addFiles, captureTarget: session.captureTarget, checkFiles: session.checkFiles, removeFile: session.removeFile, open: session.open, close: session.close, send: session.send, stop: session.stop, retry: session.retry };
 }
 export type SideConversationController = ReturnType<typeof useSideConversation>;

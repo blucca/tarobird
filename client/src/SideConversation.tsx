@@ -16,6 +16,7 @@ import { renderCodexWebCitations } from "../../src/runtime/codex-web-citations.j
 import { SIDE_QUESTION_LIMIT } from "../../src/client-protocol/side.js";
 import { sideErrorText, type SideConversationController } from "./use-side-conversation.js";
 import { t, useLocale } from "./i18n.js";
+import { hasPendingBubbleTiming, hasPendingComposerTiming, markSendTimingComposerCleared, markSendTimingSideVisible } from "./send-timing.js";
 import "./side-conversation.css";
 
 export function SideConversation({ side, online, visible, appearance, mainRecording, recordingChanged, close, returnToComposer, insert, trigger }: { side: SideConversationController; online: boolean; visible: boolean; appearance: string; mainRecording: boolean; recordingChanged(busy: boolean): void; close(): void; returnToComposer(): void; insert(text: string): void; trigger: RefObject<HTMLButtonElement | null> }) {
@@ -58,6 +59,14 @@ export function SideConversation({ side, online, visible, appearance, mainRecord
   useEffect(() => { setLatest(false); setCopied(""); setCopyError(false); }, [side.view?.id]);
   useComposerSize(input, side.draft, side.scope, false, false, `${appearance}:${locale}`, visible);
   useLayoutEffect(() => { const node = log.current; if (!node) return; if (follow.current) node.scrollTop = node.scrollHeight; else if (busy) setLatest(true); }, [side.view?.revision, busy]);
+  useLayoutEffect(() => {
+    if (!hasPendingBubbleTiming(side.conversationId) || !side.view?.exchanges.length) return;
+    const last = side.view.exchanges.at(-1);
+    if (last?.question && log.current?.querySelector(".side-question")) markSendTimingSideVisible(side.conversationId, last.question);
+  }, [side.conversationId, side.view?.revision, side.view?.exchanges]);
+  useLayoutEffect(() => {
+    if (!side.draft && hasPendingComposerTiming(side.conversationId)) markSendTimingComposerCleared(side.conversationId);
+  }, [side.draft, side.conversationId]);
   const choose = (text: string) => { side.setDraft(text); focusInput(); };
   const send = () => { if (!oversize && !voice.busy) { follow.current = true; setLatest(false); void side.send(); } };
   const closePanel = () => { close(); requestAnimationFrame(() => { if (trigger.current?.isConnected) trigger.current.focus({ preventScroll: true }); else returnToComposer(); }); };

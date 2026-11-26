@@ -19,6 +19,7 @@ import { CONVERSATION_BATCH_CAPABILITY, conversationBatchResultSchema, type Conv
 import { groupReplyWireFrame, changedGroupReply } from "./group-reply-guard.js";
 import { rememberGroupReplyCapabilities } from "./group-reply-mode-cache.js";
 import { UNAVAILABLE_CARD_ACTION, outboxFailureBlocks } from "./outbox-failure.js";
+import { markSendTimingByClientMsgId } from "./send-timing.js";
 import { clearMessagesPlanSchema, clearMessagesResultSchema, MESSAGE_CLEAR_CAPABILITY } from "../../src/client-protocol/message-clear.js";
 import { deleteMessagesSchema, deleteMessagesResultSchema, MESSAGE_DELETE_CAPABILITY } from "../../src/client-protocol/message-deletion.js";
 import { timeoutSignal, anySignal } from "./abort-signals.js";
@@ -972,6 +973,7 @@ export class HubConnection {
     if ("conversationId" in frame && ["message.send", "message.forward", "interaction.submit", "conversation.bind"].includes(frame.type)) {
       const owner = this.state.user?.id;
       await this.assertHistorySettled(frame.conversationId);
+      markSendTimingByClientMsgId(frame, "historySettledDoneAt");
       if (this.isReadOnly || this.state.user?.id !== owner) throw new Error(t("连接状态已变化，请核对后重试。"));
     }
     if (frame.type === "message.send") assertMessageTextSize(frame.text);
@@ -979,7 +981,7 @@ export class HubConnection {
     if (new TextEncoder().encode(JSON.stringify(frame)).byteLength > MAX_FRAME_BYTES) throw new Error(t("消息过大，请作为文件发送"));
     if ("clientMsgId" in frame || "clientActionId" in frame) {
       if (this.cache.isClosed) { this.cacheUnavailable(); throw new Error(connectionErrorMessage("local_cache_unavailable")); }
-      await this.cache.enqueue(frame, designComments ? { identity: this.identity, userId: this.state.user?.id ?? "", draft: designComments } : undefined); this.outboxQueued.forEach(listener => listener(frame)); this.outboxChanged(frameConversation(frame)); this.update({ outbox: (await this.cache.outbox()).length }); await this.flush();
+      await this.cache.enqueue(frame, designComments ? { identity: this.identity, userId: this.state.user?.id ?? "", draft: designComments } : undefined); markSendTimingByClientMsgId(frame, "enqueueDoneAt"); this.outboxQueued.forEach(listener => listener(frame)); this.outboxChanged(frameConversation(frame)); this.update({ outbox: (await this.cache.outbox()).length }); await this.flush();
     }
     else { if (this.ws?.readyState !== WebSocket.OPEN || this.state.status !== "online") throw new Error(t("连接恢复后即可操作")); this.ws.send(JSON.stringify(frame)); }
   }
@@ -1085,7 +1087,7 @@ export class HubConnection {
         const error = cause instanceof Error ? cause.message : changedGroupReply();
         await this.cache.fail(entry.id, error); this.outboxChanged(conversation); blocked.add(conversation); continue;
       }
-      this.inflight = entry.id; this.inflightEntry = entry; this.ws.send(JSON.stringify(wire)); return;
+      this.inflight = entry.id; this.inflightEntry = entry; markSendTimingByClientMsgId(entry.frame, "outboxFlushSentAt"); this.ws.send(JSON.stringify(wire)); return;
     }
     if (Number.isFinite(wakeAt)) this.outboxRetry = setTimeout(() => { void this.flush().catch(() => undefined); }, Math.max(1, wakeAt - Date.now()));
   }
