@@ -15,6 +15,7 @@ import { reviewReferenceKey, reviewReferencesSchema, validateReviewReferences, t
 import { networkCanonical, type SignedNetworkManifest } from "../../src/client-protocol/private-network.js";
 import { conversationFoldersSchema, emptyConversationFolders, type ConversationFoldersState } from "../../src/client-protocol/conversation-folders.js";
 import { conversationPinsSchema, pinReconcileItemSchema, type ConversationPinsState, type PinReconcileItem, type PinScope } from "../../src/client-protocol/conversation-pins.js";
+import { crossHostFolderOrderSchema, type CrossHostFolderOrderState } from "../../src/client-protocol/cross-host-folder-order.js";
 import { DEFAULT_MONO_ACCENT, DEFAULT_PALETTE, DEFAULT_THEME, isColorPalette, isMonoAccent, type ColorPalette, type MonoAccent } from "./palettes.js";
 import { normalizeLayoutDensity, type LayoutDensity } from "./layout-density.js";
 import { storedLocale, systemLocale } from "./system-locale.js";
@@ -825,6 +826,30 @@ export class ClientCache {
     const tx = await this.write(["settings"]); const current = await tx.objectStore("settings").get("identity") as Identity | undefined;
     if (current?.deviceId === identity.deviceId && current.hubPublicKey === identity.hubPublicKey) await tx.objectStore("settings").put(JSON.stringify(profiles), "profiles");
     await tx.done;
+  }
+  async crossHostFolderOrder(): Promise<CrossHostFolderOrderState | undefined> {
+    try {
+      const raw = await (await this.db).get("settings", "crossHostFolderOrder");
+      if (typeof raw !== "string") return undefined;
+      const parsed = crossHostFolderOrderSchema.safeParse(JSON.parse(raw));
+      return parsed.success ? parsed.data : undefined;
+    } catch { return undefined; }
+  }
+  async saveCrossHostFolderOrder(value: CrossHostFolderOrderState, identity: Identity, authoritative = false): Promise<boolean> {
+    const tx = await this.write(["settings"]), settings = tx.objectStore("settings");
+    const current = await settings.get("identity") as Identity | undefined;
+    let accepted = false;
+    if (current?.deviceId === identity.deviceId && current.hubPublicKey === identity.hubPublicKey) {
+      const old = await settings.get("crossHostFolderOrder") as string | undefined;
+      let parsed;
+      try { parsed = old ? crossHostFolderOrderSchema.safeParse(JSON.parse(old)) : undefined; } catch { /* Replace an unreadable cache with the confirmed Hub snapshot. */ }
+      if (authoritative || !parsed?.success || parsed.data.revision <= value.revision) {
+        await settings.put(JSON.stringify(value), "crossHostFolderOrder");
+        accepted = true;
+      }
+    }
+    await tx.done;
+    return accepted;
   }
   async conversationFolders(): Promise<ConversationFoldersState> {
     try { return conversationFoldersSchema.parse(JSON.parse((await (await this.db).get("settings", "conversationFolders")) as string)); }

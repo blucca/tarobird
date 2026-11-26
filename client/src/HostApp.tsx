@@ -27,6 +27,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, useSyncExtern
 import { LoaderCircle, Monitor, Plus } from "lucide-react";
 import { HostRegistry, type RuntimeHost } from "./host-registry.js";
 import { HostConnections, networkHostBlocked, type ConnectedHost } from "./host-connections.js";
+import { useCrossHostFolderOrderSync } from "./use-cross-host-folder-order.js";
 import { prepareLocalController, recoverLocalController, startLocalHost, watchLocalHostRecovery, type LocalControllerIssue } from "./local-controller.js";
 import { LocalControllerStartupError, type StartupAttempt } from "./startup-diagnostics.js";
 import { StartupFailure } from "./StartupFailure.js";
@@ -86,6 +87,8 @@ export type ManagedWorkspace = {
   manageHosts: OpenNetwork; manageConnections: OpenNetwork; addHost: () => void;
   /** More than one paired host: host scope is shown in the sidebar and header. */
   multiHost: boolean;
+  /** Total non-blocked registered host count (even while a host is temporarily unready). */
+  registeredHostCount?: number;
   preferences: Preferences; updatePreferences: (value: Preferences) => void;
   create: (kind: "bot" | "group" | "direct" | "schedule") => void;
   selection: (id: string) => void;
@@ -168,6 +171,13 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   const adhdRef = useRef(adhd); adhdRef.current = adhd;
   const [boardNavigation, setBoardNavigation] = useState<{ hostId: string; conversationId: string; messageId?: string; serial: number }>();
   const [pool] = useState(() => new HostConnections(registry));
+  const [crossHostOrderSource] = useState(() => ({
+    subscribe: (listener: () => void) => pool.subscribe(listener),
+    getConnections: () => pool.state.hosts
+      .filter(entry => entry.connection && !networkHostBlocked(entry, pool.localHostKey))
+      .map(entry => entry.connection!),
+  }));
+  useCrossHostFolderOrderSync(crossHostOrderSource);
   const state = useSyncExternalStore((f) => pool.subscribe(f), () => pool.state);
   const [loading, setLoading] = useState(true), [legacyReset, setLegacyReset] = useState(false), [error, setError] = useState("");
   const [localStartupError, setLocalStartupError] = useState("");
@@ -622,7 +632,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
     {!adhd && allHosts.filter((entry) => entry.connection && visited.includes(entry.host.id)).map((entry) => <section key={entry.host.registrationId} hidden={pairingVisible || activeId !== entry.host.id} style={pairingVisible || activeId !== entry.host.id ? { display: "none" } : undefined} className="host-workspace" data-active-host={entry.host.id}><Workspace connection={entry.connection!} forget={async () => { setManaging(true); }} shell={{ host: entry.host, lifecycleChanged, openAgentBus: desktopBoard && !networkHostBlocked(entry, localHostKey) ? () => openAgentBus(entry.host.id, entry.host.registrationId) : undefined, adhdBlocked: workspaceLocked, openAdhd: adhdBoard && !networkHostBlocked(entry, localHostKey) ? enterBoard : undefined, localHost: isDesktop() && !!localHostKey && entry.host.publicKey === localHostKey, active: !pairingVisible && activeId === entry.host.id, command: commands[entry.host.id], directory: directories[entry.host.id]?.registration === entry.host.registrationId ? directories[entry.host.id] : undefined, networkNotice: networkHostBlocked(entry, localHostKey) ? <div className="network-change-notice" role="status"><span>{t("这是已停用连接的本机历史。历史和草稿保留。")}</span><button onClick={() => setConnections(true)}>{t("此设备的连接")}</button></div> : networkNotice, controls, navigation: (current) => navigation(entry.host.id, current), mobileHosts: (current) => (historyHostId === entry.host.id ? allHosts.filter(other => other.host.id === entry.host.id || !networkHostBlocked(other, localHostKey)) : hosts).flatMap((other) => {
         const data = other.host.id === entry.host.id ? current : directories[other.host.id];
         return other.connection && data ? [{ id: other.host.id, name: other.host.name, connection: other.connection, ...data, viewingHistory: viewingHistory(other) }] : [];
-      }), mobileInbox, mobileScrollPositions, updateMobileInbox: setMobileInbox, mobileSelect: command, conversationsArchived, manageHosts: openNetwork, manageConnections: openConnections, addHost: () => setPairing(true), multiHost, preferences, updatePreferences: setPreferences, create, selection: (id) => setSelected((old) => old[entry.host.id] === id ? old : { ...old, [entry.host.id]: id }), consumed: (serial) => setCommands((old) => { if (old[entry.host.id]?.serial !== serial) return old; const next = { ...old }; delete next[entry.host.id]; return next; }), shareHosts: hosts.map((other) => ({ hubKey: other.host.publicKey, deviceId: other.host.deviceId, name: other.host.name, open: (conversationId) => command(other.host.id, { kind: "select", conversationId }) })) }}/></section>)}
+      }), mobileInbox, mobileScrollPositions, updateMobileInbox: setMobileInbox, mobileSelect: command, conversationsArchived, manageHosts: openNetwork, manageConnections: openConnections, addHost: () => setPairing(true), multiHost, registeredHostCount: (historyHostId === entry.host.id ? allHosts.filter(other => other.host.id === entry.host.id || !networkHostBlocked(other, localHostKey)) : hosts).length, preferences, updatePreferences: setPreferences, create, selection: (id) => setSelected((old) => old[entry.host.id] === id ? old : { ...old, [entry.host.id]: id }), consumed: (serial) => setCommands((old) => { if (old[entry.host.id]?.serial !== serial) return old; const next = { ...old }; delete next[entry.host.id]; return next; }), shareHosts: hosts.map((other) => ({ hubKey: other.host.publicKey, deviceId: other.host.deviceId, name: other.host.name, open: (conversationId) => command(other.host.id, { kind: "select", conversationId }) })) }}/></section>)}
     {(pairingVisible || !state.hosts.length) && <Pairing localHostReady={!!localHostKey && state.hosts.some(entry => entry.host.publicKey === localHostKey && !entry.connection?.identity.pendingPairing)} key={pairingEpoch} manage={() => setManaging(true)} pendingConnection={pendingConnection} save={savePairing} beforePair={beforePair} discard={discardPairing} connected={onConnected} cancel={state.hosts.some((entry) => entry.connection && !entry.connection.identity.pendingPairing) ? () => { const ready = state.hosts.find((entry) => entry.connection && !entry.connection.identity.pendingPairing); if (ready) selectHost(ready.host.id); setPairing(false); } : undefined}/>}
     {!pairingVisible && !!state.hosts.length && !hosts.some((entry) => entry.connection) && !historyHostId && <main className="pairing-page"><BrandMark/><p>{t("主机连接尚未就绪。其他主机的配对和数据会保留。")}</p><button onClick={() => { void registry.recoverPreparations().then(() => pool.refresh()); }}>{t("重试")}</button><button onClick={() => setManaging(true)}>{t("设备与网络")}</button><button onClick={() => setPairing(true)}>{t("连接另一台主机")}</button></main>}
     {boardEntryPending && <div className="adhd-entry-notice" role="status"><span>{t("正在保存草稿…")}</span><button onClick={() => setBoardEntryPending(false)}>{t("取消")}</button></div>}

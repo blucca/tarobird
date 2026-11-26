@@ -24,6 +24,7 @@ import { deleteMessagesSchema, deleteMessagesResultSchema, MESSAGE_DELETE_CAPABI
 import { timeoutSignal, anySignal } from "./abort-signals.js";
 import { conversationFoldersSchema, emptyConversationFolders, type ConversationFoldersState, type FolderEdit } from "../../src/client-protocol/conversation-folders.js";
 import { CONVERSATION_PINS_CAPABILITY, conversationPinsSchema, emptyConversationPins, type ConversationPinsState, type PinReconcileItem, type PinScope } from "../../src/client-protocol/conversation-pins.js";
+import { CROSS_HOST_FOLDER_ORDER_CAPABILITY, crossHostFolderOrderSchema, type CrossHostFolderOrderState } from "../../src/client-protocol/cross-host-folder-order.js";
 import { connectionTiming } from "./connection-timing.js";
 import { RoutePerformance, ROUTE_OBSERVATION_MS, ROUTE_DWELL_MS, ROUTE_STABLE_PROBE_MS, ROUTE_CANDIDATE_PROBE_MS } from "./route-performance.js";
 import { rememberRouteTrust } from "./route-trust.js";
@@ -71,12 +72,12 @@ import { DISK_CACHE_MIN_BYTES, diskCacheKey, forgetCachedAttachments, readCached
 export type Bot = { id: string; name: string; engine: string; model: string; effort: string; online: number; managed?: number; deletedAt?: number; defaultAvatar?: string; role?: string };
 // `role` is open-ended so a newer Host role cannot reject the whole directory; only "dispatcher" has meaning here.
 const botSchema = z.object({ id: z.string(), name: z.string(), engine: z.string(), model: z.string(), effort: z.string(), online: z.number(), managed: z.number().optional(), deletedAt: z.number().optional(), defaultAvatar: z.string().max(64).optional(), role: z.string().max(32).optional() });
-const readySchema = z.object({ serverCapabilities: z.array(z.string()).default([]), conversationFolders: conversationFoldersSchema.optional(), conversationPins: conversationPinsSchema.optional(), uploadLimits: uploadLimitsSchema.optional(), user: profileUserSchema, avatars: z.array(avatarSchema).default([]), sessionToken: z.string(), expiresAt: z.number(), serverTime: z.number().optional(), bots: z.array(botSchema), conversations: z.array(conversationSchema) });
+const readySchema = z.object({ serverCapabilities: z.array(z.string()).default([]), conversationFolders: conversationFoldersSchema.optional(), conversationPins: conversationPinsSchema.optional(), crossHostFolderOrder: crossHostFolderOrderSchema.optional(), uploadLimits: uploadLimitsSchema.optional(), user: profileUserSchema, avatars: z.array(avatarSchema).default([]), sessionToken: z.string(), expiresAt: z.number(), serverTime: z.number().optional(), bots: z.array(botSchema), conversations: z.array(conversationSchema) });
 /** Queued frames refresh only their own conversation; creation has no existing scope. */
 const frameConversation = (frame: ClientFrame): string | undefined => "conversationId" in frame ? frame.conversationId : "groupId" in frame ? frame.groupId : undefined;
 export type RouteSyncSource = "host" | "network";
 export type RouteSyncResult = { limited: boolean };
-export type ConnectionState = ProfileCache & { dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ flight })` and an `ack` with `heldMs`. */ screenFlightAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; botCommsAvailable?: boolean; historyAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; engineQuotaAvailable?: boolean; /** Host serves a conversation's context usage. */ contextUsageAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; conversationPins?: ConversationPinsState; pinsAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
+export type ConnectionState = ProfileCache & { dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ flight })` and an `ack` with `heldMs`. */ screenFlightAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; botCommsAvailable?: boolean; historyAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; engineQuotaAvailable?: boolean; /** Host serves a conversation's context usage. */ contextUsageAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; conversationPins?: ConversationPinsState; pinsAvailable?: boolean; crossHostFolderOrder?: CrossHostFolderOrderState; crossHostFolderOrderAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
 export type OutboxSettlement = { entry: OutboxEntry; revision: number; messageAccepted: boolean };
 export class HubConnection {
   state: ConnectionState = { cacheRevision: 0, status: "offline", bots: [], outbox: 0, avatars: [] };
@@ -168,6 +169,8 @@ export class HubConnection {
   private pinVersion = 0;
   private pinSyncQueue: Promise<void> = Promise.resolve();
   private pinSyncPending = false;
+  private crossHostFolderOrderUpdates: Promise<void> = Promise.resolve();
+  private crossHostFolderOrderVersion = 0;
   networkKnown?: SignedNetworkManifest;
   networkRemote?: SignedNetworkManifest;
   networkDeparture?: SignedNetworkManifest;
@@ -307,7 +310,7 @@ export class HubConnection {
     if (this.httpEpoch.signal.aborted) this.httpEpoch = new AbortController();
     window.addEventListener("online", this.networkOnline); document.addEventListener("visibilitychange", this.presence); window.addEventListener("focus", this.presence); window.addEventListener("blur", this.presence);
     const work = (async () => {
-      const [active, profiles, revoked, stored, outbox, conversationFolders, conversationPins, membership] = await Promise.all([this.cache.activeMessages(), this.cache.profiles(), this.cache.identityRevoked(this.identity), this.cache.identity(), this.cache.outbox(), this.cache.conversationFolders(), this.cache.conversationPins?.(), this.cache.networkMembership()]);
+      const [active, profiles, revoked, stored, outbox, conversationFolders, conversationPins, crossHostFolderOrder, membership] = await Promise.all([this.cache.activeMessages(), this.cache.profiles(), this.cache.identityRevoked(this.identity), this.cache.identity(), this.cache.outbox(), this.cache.conversationFolders(), this.cache.conversationPins?.(), this.cache.crossHostFolderOrder?.(), this.cache.networkMembership()]);
       if (this.closed || lifecycle !== this.lifecycle) return;
       if (!stored || stored.deviceId !== this.identity.deviceId || stored.hubPublicKey !== this.identity.hubPublicKey) throw new Error("host_cache_identity_mismatch");
       if (await this.cache.pendingReset()) throw new Error("local_reset_in_progress");
@@ -318,7 +321,7 @@ export class HubConnection {
         const host = membership.manifest.hosts.find(value => value.publicKey === this.identity.hubPublicKey)!;
         cachedNetwork = { host, membership, sync: host.revoked ? "removed" : "waiting", lastSyncedAt: 0 };
       }
-      this.activeMessages = new Set(active); this.update({ ...profiles, conversationFolders, conversationPins, outbox: outbox.length, ...(cachedNetwork ? { network: cachedNetwork } : {}) }, true);
+      this.activeMessages = new Set(active); this.update({ ...profiles, conversationFolders, conversationPins, crossHostFolderOrder, outbox: outbox.length, ...(cachedNetwork ? { network: cachedNetwork } : {}) }, true);
       if (this.networkBlocked) { this.suspendNetwork(); return; }
       if (revoked) { this.deviceRevoked = true; if (this.networkPin) this.networkBlocked = true; this.close(); this.update({ error: t("此设备已被吊销，请重新配对") }); return; }
       void this.downloadCheckpoints.sweep().catch(() => undefined);
@@ -563,6 +566,7 @@ export class HubConnection {
           this.userId = ready.user.id; await this.cache.saveConversations(ready.conversations);
           if (ready.conversationFolders) await this.acceptConversationFolders(ready.conversationFolders, generation, true);
           if (ready.conversationPins) await this.acceptConversationPins(ready.conversationPins, generation, true);
+          if (ready.crossHostFolderOrder) await this.acceptCrossHostFolderOrder(ready.crossHostFolderOrder, generation, true);
           if (ready.serverTime !== undefined && this.cache.saveServerTimeOffset) {
             void this.cache.saveServerTimeOffset(ready.serverTime - Date.now(), this.identity).catch(() => undefined);
           }
@@ -576,7 +580,7 @@ export class HubConnection {
           if (this.lastConnectedUrl !== chosen.route.url) this.lastRouteChange = Date.now();
           this.lastConnectedUrl = chosen.route.url;
           this.update({ routeSelection: { reason, changedAt: Date.now() } });
-          this.update({ dispatchAvailable: ready.serverCapabilities.includes(DISPATCH_CAPABILITY), screenAvailable: ready.serverCapabilities.includes("desktop.screen.v1"), pairingInvitesAvailable: ready.serverCapabilities.includes(PAIRING_INVITES_CAPABILITY), conversationBatchAvailable: ready.serverCapabilities.includes(CONVERSATION_BATCH_CAPABILITY), groupReplyGuardAvailable: ready.serverCapabilities.includes("groups.reply-guard.v1"), groupDiscussionAvailable: ready.serverCapabilities.includes("groups.discussion.v1"), groupDiscussionComposerAvailable: ready.serverCapabilities.includes("groups.discussion.composer.v1"), groupDiscussionRecoveryAvailable: ready.serverCapabilities.includes("groups.discussion.recovery.v1"), groupParallelAvailable: ready.serverCapabilities.includes("groups.parallel.v1"), voiceSettingsAvailable: ready.serverCapabilities.includes("integrations.voice.v2"), widgetSettingsAvailable: ready.serverCapabilities.includes("widgets.settings.v1"), engineSettingsAvailable: ready.serverCapabilities.includes("engines.settings.v1"), engineQuotaAvailable: ready.serverCapabilities.includes(ENGINE_QUOTA_CAPABILITY), contextUsageAvailable: ready.serverCapabilities.includes(CONTEXT_USAGE_CAPABILITY), backupSettingsAvailable: ready.serverCapabilities.includes("backups.settings.v1"), hostRoutesAvailable: ready.serverCapabilities.includes("host-routes.v1"), hostLanSelectionAvailable: ready.serverCapabilities.includes("host-routes.select-lan.v1"), attachmentAdminAvailable: ready.serverCapabilities.includes("attachments.admin.v1"), asrSetupAvailable: ready.serverCapabilities.includes("integrations.asr.v1"), workspaceDiffAvailable: ready.serverCapabilities.includes("workspace.diff.v1"), runChangesAvailable: ready.serverCapabilities.includes("runs.changes.v1"), runScopesAvailable: ready.serverCapabilities.includes(RUN_SCOPES_CAPABILITY), runGroupsAvailable: ready.serverCapabilities.includes(BACKGROUND_TASK_GROUP_CAPABILITY), runTailAvailable: ready.serverCapabilities.includes(RUN_TAIL_CAPABILITY), serverTimeOffset: (ready.serverTime ?? Date.now()) - Date.now(), networkAvailable: ready.serverCapabilities.includes(PRIVATE_NETWORK_CAPABILITY), folderReorderAvailable: ready.serverCapabilities.includes("conversation-folders.reorder.v1"), folderPinAvailable: ready.serverCapabilities.includes("conversation-folders.pin.v1"), conversationAvatarsAvailable: ready.serverCapabilities.includes("conversation-avatars.v1"), foldersAvailable: !!ready.conversationFolders, pinsAvailable: ready.serverCapabilities.includes(CONVERSATION_PINS_CAPABILITY) && !!ready.conversationPins, user: ready.user, avatars: ready.avatars, status: "online", bots: ready.bots.filter(bot => !bot.deletedAt && bot.role !== "worker"), deletedBots: ready.bots.filter(bot => !!bot.deletedAt && bot.role !== "worker"), dispatchWorkers: ready.bots.filter(bot => !bot.deletedAt && bot.role === "worker"), botDeletionAvailable: ready.serverCapabilities.includes("bots.delete.v1"), promptQueueAvailable: ready.serverCapabilities.includes("prompt-queue.v1"), messageDeletionAvailable: ready.serverCapabilities.includes(MESSAGE_DELETE_CAPABILITY), messageClearAvailable: ready.serverCapabilities.includes(MESSAGE_CLEAR_CAPABILITY), maxFileBytes: ready.uploadLimits?.maxFileBytes ?? MAX_FILE_BYTES, error: undefined }, true); void rememberGroupReplyCapabilities(this).catch(() => undefined); void syncShareUploadLimit(this.state.maxFileBytes ?? MAX_FILE_BYTES).catch(() => console.warn("share_limit_cache_failed")); this.lastPong = performance.now(); this.presence(); void this.refreshNotificationPreferences().catch(() => undefined);
+          this.update({ dispatchAvailable: ready.serverCapabilities.includes(DISPATCH_CAPABILITY), screenAvailable: ready.serverCapabilities.includes("desktop.screen.v1"), pairingInvitesAvailable: ready.serverCapabilities.includes(PAIRING_INVITES_CAPABILITY), conversationBatchAvailable: ready.serverCapabilities.includes(CONVERSATION_BATCH_CAPABILITY), groupReplyGuardAvailable: ready.serverCapabilities.includes("groups.reply-guard.v1"), groupDiscussionAvailable: ready.serverCapabilities.includes("groups.discussion.v1"), groupDiscussionComposerAvailable: ready.serverCapabilities.includes("groups.discussion.composer.v1"), groupDiscussionRecoveryAvailable: ready.serverCapabilities.includes("groups.discussion.recovery.v1"), groupParallelAvailable: ready.serverCapabilities.includes("groups.parallel.v1"), voiceSettingsAvailable: ready.serverCapabilities.includes("integrations.voice.v2"), widgetSettingsAvailable: ready.serverCapabilities.includes("widgets.settings.v1"), engineSettingsAvailable: ready.serverCapabilities.includes("engines.settings.v1"), engineQuotaAvailable: ready.serverCapabilities.includes(ENGINE_QUOTA_CAPABILITY), contextUsageAvailable: ready.serverCapabilities.includes(CONTEXT_USAGE_CAPABILITY), backupSettingsAvailable: ready.serverCapabilities.includes("backups.settings.v1"), hostRoutesAvailable: ready.serverCapabilities.includes("host-routes.v1"), hostLanSelectionAvailable: ready.serverCapabilities.includes("host-routes.select-lan.v1"), attachmentAdminAvailable: ready.serverCapabilities.includes("attachments.admin.v1"), asrSetupAvailable: ready.serverCapabilities.includes("integrations.asr.v1"), workspaceDiffAvailable: ready.serverCapabilities.includes("workspace.diff.v1"), runChangesAvailable: ready.serverCapabilities.includes("runs.changes.v1"), runScopesAvailable: ready.serverCapabilities.includes(RUN_SCOPES_CAPABILITY), runGroupsAvailable: ready.serverCapabilities.includes(BACKGROUND_TASK_GROUP_CAPABILITY), runTailAvailable: ready.serverCapabilities.includes(RUN_TAIL_CAPABILITY), serverTimeOffset: (ready.serverTime ?? Date.now()) - Date.now(), networkAvailable: ready.serverCapabilities.includes(PRIVATE_NETWORK_CAPABILITY), folderReorderAvailable: ready.serverCapabilities.includes("conversation-folders.reorder.v1"), folderPinAvailable: ready.serverCapabilities.includes("conversation-folders.pin.v1"), conversationAvatarsAvailable: ready.serverCapabilities.includes("conversation-avatars.v1"), foldersAvailable: !!ready.conversationFolders, pinsAvailable: ready.serverCapabilities.includes(CONVERSATION_PINS_CAPABILITY) && !!ready.conversationPins, crossHostFolderOrderAvailable: ready.serverCapabilities.includes(CROSS_HOST_FOLDER_ORDER_CAPABILITY) && !!ready.crossHostFolderOrder, user: ready.user, avatars: ready.avatars, status: "online", bots: ready.bots.filter(bot => !bot.deletedAt && bot.role !== "worker"), deletedBots: ready.bots.filter(bot => !!bot.deletedAt && bot.role !== "worker"), dispatchWorkers: ready.bots.filter(bot => !bot.deletedAt && bot.role === "worker"), botDeletionAvailable: ready.serverCapabilities.includes("bots.delete.v1"), promptQueueAvailable: ready.serverCapabilities.includes("prompt-queue.v1"), messageDeletionAvailable: ready.serverCapabilities.includes(MESSAGE_DELETE_CAPABILITY), messageClearAvailable: ready.serverCapabilities.includes(MESSAGE_CLEAR_CAPABILITY), maxFileBytes: ready.uploadLimits?.maxFileBytes ?? MAX_FILE_BYTES, error: undefined }, true); void rememberGroupReplyCapabilities(this).catch(() => undefined); void syncShareUploadLimit(this.state.maxFileBytes ?? MAX_FILE_BYTES).catch(() => console.warn("share_limit_cache_failed")); this.lastPong = performance.now(); this.presence(); void this.refreshNotificationPreferences().catch(() => undefined);
           if (ready.conversationPins && ready.serverCapabilities.includes(CONVERSATION_PINS_CAPABILITY)) void this.syncPinsWithHost(generation);
           const timing = connectionTiming(chosen.route, usesPinnedTransport());
           let heartbeatAt = performance.now();
@@ -689,6 +693,7 @@ export class HubConnection {
         if (frame.type === "sync.complete") { if (receiveFailed) return; this.syncing = false; this.pendingSync.clear(); this.update({ syncProgress: undefined }, false, true); await this.flush(); return; }
         if (frame.type === "conversation-folders.updated") { await this.acceptConversationFolders(conversationFoldersSchema.parse(frame.folders), generation); return; }
         if (frame.type === "conversation-pins.updated") { await this.acceptConversationPins(conversationPinsSchema.parse(frame.pins), generation); return; }
+        if (frame.type === "cross-host-folder-order.updated") { await this.acceptCrossHostFolderOrder(crossHostFolderOrderSchema.parse(frame.order), generation); return; }
         if (frame.type === "conversation.updated") { this.groupDiscussionRevision++; await this.cache.saveConversations([conversationSchema.parse(frame.conversation)]); if (typeof frame.clientActionId === "string") await this.ack(frame.clientActionId); this.update({}, true); return; }
         if (frame.type === "message.ack" && typeof frame.clientMsgId === "string") {
           // An earlier event/parse/cache failure invalidates the local-history
@@ -836,6 +841,59 @@ export class HubConnection {
     });
     this.folderUpdates = work.catch(() => undefined);
     return work;
+  }
+  private acceptCrossHostFolderOrder(
+    value: CrossHostFolderOrderState,
+    generation: number,
+    authoritative = false,
+    observedVersion?: number,
+  ): Promise<void> {
+    const work = this.crossHostFolderOrderUpdates.then(async () => {
+      if (this.closed || generation !== this.generation) return;
+      const replace = authoritative && (observedVersion === undefined || observedVersion === this.crossHostFolderOrderVersion);
+      if (!replace && value.revision < (this.state.crossHostFolderOrder?.revision ?? 0)) return;
+      if (this.cache.saveCrossHostFolderOrder) {
+        const accepted = await this.cache.saveCrossHostFolderOrder(value, this.identity, replace);
+        if (!accepted || this.closed || generation !== this.generation) return;
+      }
+      this.crossHostFolderOrderVersion++;
+      this.update({ crossHostFolderOrder: value }, true);
+    });
+    this.crossHostFolderOrderUpdates = work.catch(() => undefined);
+    return work;
+  }
+  async saveCrossHostFolderOrder(
+    order: { updatedAt: number; pinned: readonly string[]; ordinary: readonly string[] },
+    expectedRevision?: number,
+  ): Promise<CrossHostFolderOrderState> {
+    if (this.state.status !== "online" || !this.state.crossHostFolderOrderAvailable) {
+      throw new Error("cross_host_folder_order_unavailable");
+    }
+    const generation = this.generation;
+    const revision = expectedRevision ?? this.state.crossHostFolderOrder?.revision ?? 0;
+    try {
+      const next = crossHostFolderOrderSchema.parse(await this.http("/api/cross-host-folder-order", {
+        method: "PATCH",
+        body: JSON.stringify({
+          revision,
+          updatedAt: order.updatedAt,
+          pinned: [...order.pinned],
+          ordinary: [...order.ordinary],
+        }),
+        signal: timeoutSignal(20_000),
+      }));
+      await this.acceptCrossHostFolderOrder(next, generation, true);
+      return next;
+    } catch (error) {
+      if (error instanceof HubHttpError && error.code === "cross_host_folder_order_changed" && !this.closed && generation === this.generation) {
+        const observedVersion = this.crossHostFolderOrderVersion;
+        try {
+          const latest = crossHostFolderOrderSchema.parse(await this.http("/api/cross-host-folder-order", { signal: timeoutSignal(20_000) }));
+          await this.acceptCrossHostFolderOrder(latest, generation, true, observedVersion);
+        } catch { /* keep last confirmed view */ }
+      }
+      throw error;
+    }
   }
   private acceptConversationPins(
     value: ConversationPinsState,
