@@ -424,7 +424,7 @@ export class HubConnection {
         if (release && !grace && (result.status === "reachable" || result.status === "cooldown")) grace = setTimeout(release, 200);
       }
     };
-    const all = Promise.all(Array.from({ length: Math.min(4, routes.length) }, worker));
+    const all = Promise.all(Array.from({ length: Math.min(6, routes.length) }, worker));
     const completion = all.then(() => undefined); this.probeCompletion = completion;
     void completion.finally(() => { if (this.probeCompletion === completion) this.probeCompletion = undefined; controller.abort(); }).catch(() => undefined);
     await (early ? Promise.race([all, early]) : all); clearTimeout(grace); release = undefined;

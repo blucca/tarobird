@@ -1,4 +1,4 @@
-import { timeoutSignal } from "./abort-signals.js";
+import { anySignal, timeoutSignal } from "./abort-signals.js";
 import { pairingClockOffset, pairingRemaining } from "./pairing-time.js";
 import { defaultDeviceName } from "./device-presentation.js";
 import { rememberRouteTrust } from "./route-trust.js";
@@ -6,15 +6,16 @@ import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore, type
 import { ArrowLeft, ChevronLeft, ClipboardPaste, ImagePlus, LoaderCircle, Monitor, QrCode, ShieldCheck, Smartphone } from "lucide-react";
 import type { PairingProps } from "./HostApp.js";
 import { BrandMark, PairingIntro } from "./BrandScenes.js";
-import { connectionConfiguration } from "./connection-routes.js";
+import { connectionConfiguration, multipathConfiguration } from "./connection-routes.js";
 import { orderedRoutes, type Deployment } from "../../src/client-protocol/routes.js";
 import { createIdentity, randomNonce } from "./identity.js";
 import { cache, type Route, type Identity, type PendingPairing } from "./storage.js";
 import { nativePlatform, deleteNativeIdentity } from "./native.js";
 import { t, useLocale } from "./i18n.js";
 import { hubFetch, usesPinnedTransport } from "./transport.js";
-import { connectionVerificationFailure, connectionVerificationMessage, preferredVerificationFailure, validHubPublicKey } from "./connection-verification.js";
+import { connectionVerificationFailure, connectionVerificationMessage, validHubPublicKey } from "./connection-verification.js";
 import { pairingInviteError } from "./pairing-invite-errors.js";
+import { PairingCandidateRaceError, racePairingCandidates } from "./pairing-candidate-race.js";
 
 const PairingCode = lazy(() => import("./PairingCode.js").then(module => ({ default: module.PairingCode })));
 const PairingScanner = lazy(() => import("./PairingCode.js").then(module => ({ default: module.PairingScanner })));
@@ -36,7 +37,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   const [invite, setInvite] = useState<string>();
   const [requestError, setRequestError] = useState<string>();
   const [manualKey, setManualKey] = useState(""); const trustedKey = expectedKey ?? (manualKey.replace(/\s/g, "") || undefined);
-  const [deployment, setDeployment] = useState<Deployment>(), [legacyDirect, setLegacyDirect] = useState<Route>();
+  const [deployment, setDeployment] = useState<Deployment>(), [legacyDirect, setLegacyDirect] = useState<Route>(), [importedDirects, setImportedDirects] = useState<Route[]>([]);
   const [address, setAddress] = useState(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""), [relays, setRelays] = useState<Route[]>([]);
   const [name, setName] = useState(() => defaultDeviceName(platform));
   const pairButton = useRef<HTMLButtonElement>(null), imported = useRef(false), failure = useRef<HTMLParagraphElement>(null);
@@ -98,29 +99,56 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     if (!/^\d{8}$/.test(result.code) || !Number.isFinite(result.expiresAt)) throw new Error(t("配对请求失败"));
     return { code: result.code, expiresAt: result.expiresAt, request: { requestId: request.requestId }, serverTimeOffset: Number.isFinite(result.serverTime) ? result.serverTime! - Date.now() : pairingClockOffset(response.headers.get("date"), Date.now()) };
   };
+  const probeHealth = async (route: Route, key: string | undefined, signal?: AbortSignal) => {
+    const response = await hubFetch(route.url, "/health", key, {
+      signal: signal ? anySignal([signal, timeoutSignal(usesPinnedTransport() ? 6000 : 2000)]) : timeoutSignal(usesPinnedTransport() ? 6000 : 2000),
+      cache: "no-store",
+    });
+    const health = await response.json() as { ok?: boolean; publicKey?: string; pairingInvites?: number };
+    if (!response.ok || health.ok !== true || typeof health.publicKey !== "string") throw new Error("hub_unavailable");
+    if (key && health.publicKey !== key) throw new Error("tls_identity_mismatch");
+    return { route, publicKey: health.publicKey, supportsInvites: health.pairingInvites === 1 };
+  };
   const pair = async (event: FormEvent) => {
     event.preventDefault(); if (admission.current) return; admission.current = true; setBusy(true); setError(""); let created: Identity | undefined, persisted = false;
     try {
       if (!invite) throw new Error(pairingInviteError("invite_required"));
-      const { routes, deployment: routeDeployment } = connectionConfiguration(address, relays, deployment, legacyDirect);
+      const keepImportedDirects = importedDirects.length > 1
+        && address.trim() === (legacyDirect?.url ?? "")
+        && deployment !== "vps-relay";
+      const { routes, deployment: routeDeployment } = keepImportedDirects
+        ? multipathConfiguration(importedDirects, relays, importedDirects, deployment)
+        : connectionConfiguration(address, relays, deployment, legacyDirect);
       if (usesPinnedTransport() && routes.some((route) => route.url.startsWith("https:")) && !trustedKey) throw new Error(t("请扫描可信设备上的 Hub 二维码，或填写主机身份公钥。"));
       if (usesPinnedTransport() && trustedKey && !validHubPublicKey(trustedKey)) throw new Error("invalid_hub_key");
       rememberRouteTrust(routes, trustedKey);
-      const probes = await Promise.allSettled(orderedRoutes(routes).map(async (route) => {
-        const response = await hubFetch(route.url, "/health", trustedKey, { signal: timeoutSignal(usesPinnedTransport() ? 6000 : 2000), cache: "no-store" });
-        const health = await response.json() as { ok?: boolean; publicKey?: string; pairingInvites?: number };
-        if (!response.ok || health.ok !== true || typeof health.publicKey !== "string") throw new Error("hub_unavailable");
-        if (trustedKey && health.publicKey !== trustedKey) throw new Error("tls_identity_mismatch");
-        return { route, publicKey: health.publicKey, supportsInvites: health.pairingInvites === 1 };
-      }));
-      const available = probes.find((result) => result.status === "fulfilled");
-      if (!available || available.status !== "fulfilled") {
-        const failure = preferredVerificationFailure(probes.map((result) => result.status === "rejected" ? connectionVerificationFailure(result.reason) : undefined));
-        throw new Error(connectionVerificationMessage(failure) ?? t("没有可用且身份匹配的线路，请检查地址后重试。"));
+      const rankedRoutes = orderedRoutes(routes);
+      let available;
+      try {
+        available = await racePairingCandidates(rankedRoutes, {
+          probe: (route, signal) => probeHealth(route, trustedKey, signal),
+        });
+      } catch (raceError) {
+        if (raceError instanceof PairingCandidateRaceError) {
+          if (raceError.kind === "verification") {
+            throw new Error(connectionVerificationMessage(raceError.verificationFailure) ?? t("没有可用且身份匹配的线路，请检查地址后重试。"));
+          }
+          if (raceError.kind === "direct-and-relay-failed") {
+            throw new Error(t("局域网直连和备用中转均未能连上主机。请确认主机正在运行、网络地址与中转配置正确，或改用 Tailscale。"));
+          }
+          if (raceError.kind === "relay-failed") {
+            throw new Error(t("未能连接到中转服务器，请检查网络和中转地址后重试。"));
+          }
+          throw new Error(tailscaleRoute
+            ? t("未能通过 Tailscale 连上主机。请确认两端都已开启并登录同一 Tailscale 网络，且主机正在运行。")
+            : t("无法直连主机（可能不在同一 Wi-Fi、被路由器/访客网络隔离，或被电脑防火墙拦截）。请检查同一网络与防火墙，或改用 Tailscale / VPS 中转。"));
+        }
+        throw raceError;
       }
-      if (!available.value.supportsInvites) throw new Error(t("请先更新此主机，才能使用限时连接码配对新设备。"));
-      await beforePair?.(available.value.publicKey);
-      const device = await createIdentity(name.trim(), routes); device.deployment = routeDeployment; device.hubPublicKey = available.value.publicKey; created = device;
+      if (!available.supportsInvites) throw new Error(t("请先更新此主机，才能使用限时连接码配对新设备。"));
+      await beforePair?.(available.publicKey);
+      const identityRoutes = [available.route, ...routes.filter(route => route.url !== available.route.url)];
+      const device = await createIdentity(name.trim(), identityRoutes); device.deployment = routeDeployment; device.hubPublicKey = available.publicKey; created = device;
       device.pendingPairing = { code: "", expiresAt: 0, request: { invite, requestId: randomNonce() } };
       if (save) await save(device, hostName); else await cache.saveIdentity(device);
       persisted = true;
@@ -138,7 +166,14 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     admission.current = true; setBusy(true); setError(""); setRequestError(undefined);
     try {
       const active = identity.routes.find(route => route.url === pendingConnection.state.route?.url && route.certificateAuthority === pendingConnection.state.route?.certificateAuthority);
-      const routes = [active, ...orderedRoutes(identity.routes)].filter((route): route is Route => !!route);
+      const ordered = orderedRoutes(identity.routes);
+      let fastWinner: Route | undefined;
+      if (!active && ordered.length > 1) {
+        fastWinner = await racePairingCandidates(ordered, {
+          probe: (route, signal) => probeHealth(route, identity.hubPublicKey, signal),
+        }).then(winner => winner.route, () => undefined);
+      }
+      const routes = [active, fastWinner, ...ordered].filter((route): route is Route => !!route);
       let next: PendingPairing | undefined, failure: unknown;
       for (const route of routes.filter((route, index) => routes.findIndex(other => other.url === route.url) === index)) {
         try { next = await requestPair(identity, route, identity.hubPublicKey, request); break; }
@@ -175,7 +210,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   // (its invite, address and key) must not be submitted for another host.
   const startAnother = () => {
     setAnother(true); setIdentity(undefined); setError(""); setRequestError(undefined);
-    setInvite(undefined); setExpectedKey(undefined); setManualKey(""); setDeployment(undefined); setLegacyDirect(undefined); setRelays([]);
+    setInvite(undefined); setExpectedKey(undefined); setManualKey(""); setDeployment(undefined); setLegacyDirect(undefined); setImportedDirects([]); setRelays([]);
     setAddress(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""); setManual(platform === "web"); setOptionsOpen(false); setHostName(t("我的主机"));
   };
   const routeHint = expectedKey && (tailscaleRoute || lanRoute) && <p className="pairing-route-hint">{tailscaleRoute ? t("此连接使用 Tailscale。这台设备也需连接同一 Tailscale 网络，并允许访问目标主机；仅复制地址不会自动建立连接。") : t("此连接包含局域网地址。人在外面时需有可用的 Tailscale 或 VPS 线路；家里的 Wi-Fi 地址通常无法从外部直接访问。")}</p>;
@@ -227,7 +262,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
         <button type="button" className="pairing-scan full" disabled={busy} onClick={() => { setInputMode("image"); setScan(true); }}><ImagePlus size={18}/>{t("导入二维码图片")}</button>
         <button type="button" className="pairing-scan full" disabled={busy} onClick={(event) => { event.currentTarget.focus(); setInputMode("scan"); setScan(true); }}><QrCode size={20} aria-hidden="true"/>{t("扫描连接二维码")}</button>
         </div>}
-        {expectedKey && <div className="pairing-import" role="status"><Monitor size={18}/><div><strong>{t("已读取主机信息")}</strong><p className="muted">{address ? directHost || address : t("VPS 中转")}</p>{reviewing && <p className="pairing-import-state">{t("尚未连接，请继续完成下方配对。")}</p>}</div><button type="button" disabled={busy} onClick={() => { setInputMode("text"); setScan(true); }}>{t("更换连接信息")}</button></div>}
+        {expectedKey && <div className="pairing-import" role="status"><Monitor size={18}/><div><strong>{t("已读取主机信息")}</strong><p className="muted">{importedDirects.length > 1 ? t("{0} 等 {1} 个候选地址{2}", directHost || address, importedDirects.length, relays.length ? t(" + 中转") : "") : address ? directHost || address : t("VPS 中转")}</p>{reviewing && <p className="pairing-import-state">{t("尚未连接，请继续完成下方配对。")}</p>}</div><button type="button" disabled={busy} onClick={() => { setInputMode("text"); setScan(true); }}>{t("更换连接信息")}</button></div>}
         {!reviewing && routeHint}
         {(manual || expectedKey) && <>
           <label>{t("设备名称")}<input value={name} required maxLength={100} disabled={busy} aria-describedby="pairing-device-name-help" onChange={(e) => setName(e.target.value)}/></label><p id="pairing-device-name-help" className="settings-note muted">{t("确认一个其他设备也能认出的名称，例如 MacBook Pro 或 vivo 手机。")}</p>
@@ -276,7 +311,8 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       return;
     }
     imported.current = true;
+    const directRoutes = payload.routes.filter((r) => r.name !== "VPS");
     setInvite(payload.invite);
-    setDeployment(payload.deployment); setLegacyDirect(payload.routes.find((r) => r.name !== "VPS")); setAddress(payload.routes.find((r) => r.name !== "VPS")?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError("");
+    setDeployment(payload.deployment); setImportedDirects(directRoutes); setLegacyDirect(directRoutes[0]); setAddress(directRoutes[0]?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError("");
   }}/></Suspense>}</main>;
 }

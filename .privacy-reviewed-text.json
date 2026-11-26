@@ -1452,6 +1452,62 @@
           "fingerprint": "ffe27392eb3e6ac8cca1fed5637a4c727bca806b99147ec8cf5913c3f82efc98"
         }
       ]
+    },
+    {
+      "path": "client/e2e/fixtures/tailscale-pairing.tsx",
+      "sha256": "121cef84f971e30c67ff209cc75f55af11a92b1834c4cc7a35a6a01c8595b5a9",
+      "reviewer": "codex",
+      "note": "Re-reviewed unchanged synthetic Tailscale test addresses after issue #156 multi-candidate pairing updates; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/tailscale-pairing.spec.ts",
+      "sha256": "48e268f6a6fc628505bce771b58478027b918f4ece98bbc2dc48abcb41c0c276",
+      "reviewer": "codex",
+      "note": "Re-reviewed unchanged synthetic Tailscale test addresses after issue #156 multi-candidate pairing updates; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "tests/desktop-lan-addresses.test.ts",
+      "sha256": "db756a9c20fd8b7b94d9c1d99046e023bb779df461a454cdf4c3f00f8cb8bfb0",
+      "reviewer": "codex",
+      "note": "Re-reviewed unchanged synthetic Tailscale test addresses after issue #156 multi-candidate pairing updates; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "tests/host-cli-day-audit.test.ts",
+      "sha256": "3d1d0689ef131b61645d52fae701397fa1f59feb3c6898a74fbee735c41b3e7e",
+      "reviewer": "codex",
+      "note": "Re-reviewed unchanged synthetic Tailscale test addresses after issue #156 multi-candidate pairing updates; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "b561751746c6b986134f7802acf540666c18c1f35cbcb132a55f9a98e1a4a23a"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "94424f22c21cb2aa20f3ce0a90556555901c009da066016d24a48fc869a4a2b6"
+        }
+      ]
     }
   ]
 }

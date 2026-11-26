@@ -135,13 +135,15 @@ it("restores the existing certificate and leaves the host untouched when pre-res
   expect(await readFile(path.join(f.directory, "config.json"), "utf8")).toBe(config);
 });
 
-it("lists multiple interface addresses before configuring anything and accepts an explicit address", async () => {
+it("requires explicit --address in --v1 mode before configuring TLS, and supports multi-candidate --lan pairing", async () => {
   const f = await pairingFixture(["172.17.0.1", "192.168.1.2"]), leaf = vi.mocked(tls.desktopTls);
-  await expect(runHostCli(["pair", "--lan", ...f.args])).rejects.toThrow("172.17.0.1、192.168.1.2");
+  await expect(runHostCli(["pair", "--lan", "--v1", ...f.args])).rejects.toThrow("172.17.0.1、192.168.1.2");
   expect(leaf).not.toHaveBeenCalled(); expect(f.host).not.toHaveBeenCalled(); expect(f.connect).not.toHaveBeenCalled();
+  await runHostCli(["pair", "--lan", ...f.args]);
+  expect(JSON.parse(f.output.mock.calls[0]![0])).toMatchObject({ routes: [{ url: "https://172.17.0.1:8790" }, { url: "https://192.168.1.2:8790" }] });
   await runHostCli(["pair", "--lan", "--address", "192.168.1.2", ...f.args]);
-  expect(JSON.parse(f.output.mock.calls[0]![0])).toMatchObject({ routes: [{ url: "https://192.168.1.2:8790" }] });
-  expect(f.connect).toHaveBeenCalledTimes(1);
+  expect(JSON.parse(f.output.mock.calls[1]![0])).toMatchObject({ routes: [{ url: "https://192.168.1.2:8790" }] });
+  expect(f.connect).toHaveBeenCalledTimes(2);
 });
 
 it("pairs a dual-stack Tailscale interface through its unique IPv4 by default and honors explicit IPv6", async () => {

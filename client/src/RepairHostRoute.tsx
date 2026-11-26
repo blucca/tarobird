@@ -1,6 +1,6 @@
 import { QrCode, ScanLine } from "lucide-react";
 import { useId, useLayoutEffect, useRef, useState } from "react";
-import { deploymentMatchesRoutes, localRoutesSchema, type Deployment } from "../../src/client-protocol/routes.js";
+import { deploymentMatchesRoutes, localRoutesSchema, MAX_DIRECT_ROUTES, type Deployment } from "../../src/client-protocol/routes.js";
 import { CreationDialog } from "./CreationDialog.js";
 import { PairingScanner, type PairingPayload } from "./PairingCode.js";
 import { routeTitle } from "./RouteFields.js";
@@ -18,9 +18,10 @@ export type RouteRepair = { routes: Route[]; deployment?: Deployment; direct: Ro
 export function repairRoutes(identity: Pick<Identity, "hubPublicKey" | "routes" | "deployment">, payload: PairingPayload): RouteRepair | undefined {
   if (payload.kind !== "connect") throw new Error(t("请扫描已信任设备显示的 Hub 二维码"));
   if (!identity.hubPublicKey || payload.hubPublicKey !== identity.hubPublicKey) throw new Error(t("这不是当前主机的二维码。请扫描此主机显示的连接二维码。"));
-  const scanned = payload.routes.find((route) => route.name !== "VPS");
+  const scannedAll = payload.routes.filter((route) => route.name !== "VPS");
+  const scanned = scannedAll[0];
   if (!scanned) throw new Error(t("此二维码不含直连地址。如需修改中转，请使用「编辑线路」。"));
-  if (loopback(scanned.url)) throw new Error(t("二维码中的地址只能在主机本机使用。请在主机上开启局域网配对后重新扫描。"));
+  if (scannedAll.some(route => loopback(route.url))) throw new Error(t("二维码中的地址只能在主机本机使用。请在主机上开启局域网配对后重新扫描。"));
   const managedMatches = identity.routes.filter(route => route.name === scanned.name
     && !!scanned.certificateAuthority && route.certificateAuthority === scanned.certificateAuthority
     && new URL(route.url).port === new URL(scanned.url).port
@@ -31,10 +32,19 @@ export function repairRoutes(identity: Pick<Identity, "hubPublicKey" | "routes" 
     ?? (managedMatches.length === 1 ? managedMatches[0] : undefined);
   const relays = identity.routes.filter((route) => route.name === "VPS");
   // A refreshed address keeps the user's own name for the same origin.
-  const direct: Route = { ...scanned, ...(!scanned.label && replaced?.url === scanned.url && replaced.label ? { label: replaced.label } : {}) };
+  const refreshedDirects: Route[] = scannedAll.map(item => {
+    const existing = identity.routes.find(route => route.name === item.name && route.url === item.url);
+    return { ...item, ...(!item.label && existing?.label ? { label: existing.label } : {}) };
+  });
+  const direct = refreshedDirects[0]!;
   // Only the address and its trust anchor matter; a differing display name alone is no repair.
-  if (replaced?.url === direct.url && replaced.certificateAuthority === direct.certificateAuthority) return undefined;
-  const parsed = localRoutesSchema.safeParse([direct, ...identity.routes.filter(route => route !== replaced)]);
+  if (refreshedDirects.length === 1 && replaced?.url === direct.url && replaced.certificateAuthority === direct.certificateAuthority) return undefined;
+  const untouched = identity.routes.filter(route => route !== replaced && !refreshedDirects.some(next => next.url === route.url));
+  const keptDirects = untouched.filter(route => route.name !== "VPS");
+  const mergedDirects = [...refreshedDirects, ...keptDirects].slice(0, MAX_DIRECT_ROUTES);
+  const candidateRoutes = [...mergedDirects, ...relays];
+  if (candidateRoutes.length === identity.routes.length && candidateRoutes.every((route, idx) => route.url === identity.routes[idx]?.url && route.certificateAuthority === identity.routes[idx]?.certificateAuthority)) return undefined;
+  const parsed = localRoutesSchema.safeParse(candidateRoutes);
   if (!parsed.success) throw new Error(t("无法添加此地址：地址重复或线路数量已达上限。请使用「编辑线路」调整。"));
   const routes = parsed.data, deployment = payload.deployment ?? (deploymentMatchesRoutes(identity.deployment, routes) ? identity.deployment : undefined);
   if (!deploymentMatchesRoutes(deployment, routes)) throw new Error(t("二维码中的连接方式与已保存的线路不一致，请使用「编辑线路」调整。"));
