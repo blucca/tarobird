@@ -1,10 +1,19 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject, type WheelEvent } from "react";
 import { t, useLocale } from "./i18n.js";
-import { findActiveRailItemId, sampleMessageRailItems, type MessageRailItem } from "./message-rail.js";
+import {
+  clampPreviewCenter,
+  findActiveRailItemId,
+  isRailDense,
+  normalizeWheelDeltaY,
+  railTickBudget,
+  sampleMessageRailItems,
+  type MessageRailItem,
+} from "./message-rail.js";
 import "./message-rail.css";
 
 const MAX_RAIL_TICKS = 44;
 const WAKE_HOLD_MS = 1100;
+const FALLBACK_PREVIEW_HALF_HEIGHT = 68;
 
 export type MessageRailProps = {
   items: readonly MessageRailItem[];
@@ -40,8 +49,10 @@ function formatRailTime(timestamp: number, locale: string): string {
 export function MessageRail({ items, scrollRef, anchorIndex, atBottom, onJump, onWheelDirection }: MessageRailProps) {
   const locale = useLocale();
   const railRef = useRef<HTMLElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
   const [awake, setAwake] = useState(false);
   const [hoveredId, setHoveredId] = useState<string>();
+  const [previewAnchorY, setPreviewAnchorY] = useState<number>(0);
   const [previewTop, setPreviewTop] = useState<number>(0);
   const [bounds, setBounds] = useState<{ top: number; height: number }>();
   const wakeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -50,12 +61,13 @@ export function MessageRail({ items, scrollRef, anchorIndex, atBottom, onJump, o
     () => findActiveRailItemId(items, anchorIndex, atBottom),
     [items, anchorIndex, atBottom],
   );
+  const maxTicks = bounds ? railTickBudget(bounds.height, MAX_RAIL_TICKS) : MAX_RAIL_TICKS;
   const visibleItems = useMemo(
-    () => sampleMessageRailItems(items, activeId, MAX_RAIL_TICKS),
-    [items, activeId],
+    () => sampleMessageRailItems(items, activeId, maxTicks),
+    [items, activeId, maxTicks],
   );
   const hoveredItem = hoveredId ? visibleItems.find((item) => item.id === hoveredId) : undefined;
-  const dense = visibleItems.length >= 24;
+  const dense = isRailDense(visibleItems.length, bounds?.height);
 
   const wake = useCallback(() => {
     setAwake(true);
@@ -102,23 +114,48 @@ export function MessageRail({ items, scrollRef, anchorIndex, atBottom, onJump, o
     const railRect = rail.getBoundingClientRect();
     const btnRect = button.getBoundingClientRect();
     const center = btnRect.top + btnRect.height / 2 - railRect.top;
-    // Clamp so the preview popover stays within the rail's vertical bounds.
-    const margin = 44;
-    const clamped = Math.max(margin, Math.min(Math.max(margin, railRect.height - margin), center));
-    setPreviewTop(clamped);
+    setPreviewAnchorY(center);
+    const measuredHalf = previewRef.current
+      ? previewRef.current.getBoundingClientRect().height / 2
+      : FALLBACK_PREVIEW_HALF_HEIGHT;
+    const halfHeight = measuredHalf > 0 ? measuredHalf : FALLBACK_PREVIEW_HALF_HEIGHT;
+    setPreviewTop(clampPreviewCenter(center, railRect.height, halfHeight));
   }, []);
+
+  // Re-clamp against the actual rendered preview height before paint so tall
+  // cards never bleed into the header or composer on shorter viewports.
+  useLayoutEffect(() => {
+    if (!hoveredItem) return;
+    const rail = railRef.current;
+    const preview = previewRef.current;
+    if (!rail || !preview) return;
+    const clamp = () => {
+      const railHeight = rail.getBoundingClientRect().height;
+      const previewHeight = preview.getBoundingClientRect().height;
+      if (railHeight <= 0 || previewHeight <= 0) return;
+      const next = clampPreviewCenter(previewAnchorY, railHeight, previewHeight / 2);
+      setPreviewTop((prev) => Math.abs(prev - next) < 0.5 ? prev : next);
+    };
+    clamp();
+    const observer = new ResizeObserver(clamp);
+    observer.observe(preview);
+    return () => observer.disconnect();
+  }, [hoveredItem, previewAnchorY, bounds?.height]);
 
   const handleWheel = useCallback((event: WheelEvent<HTMLElement>) => {
     const viewport = scrollRef.current;
     if (!viewport) return;
-    if (event.deltaY !== 0) {
-      onWheelDirection?.(event.deltaY);
-      viewport.scrollTop += event.deltaY;
+    const fontSize = parseFloat(getComputedStyle(viewport).fontSize);
+    const lineHeight = Number.isFinite(fontSize) && fontSize > 0 ? fontSize * 1.5 : 24;
+    const deltaY = normalizeWheelDeltaY(event.deltaY, event.deltaMode, lineHeight, viewport.clientHeight);
+    if (deltaY !== 0) {
+      onWheelDirection?.(deltaY);
+      viewport.scrollTop += deltaY;
       wake();
     }
   }, [scrollRef, onWheelDirection, wake]);
 
-  if (items.length < 2) return null;
+  if (items.length < 2 || maxTicks < 2) return null;
 
   return (
     <nav
@@ -130,33 +167,34 @@ export function MessageRail({ items, scrollRef, anchorIndex, atBottom, onJump, o
       onMouseLeave={() => { setHoveredId(undefined); wake(); }}
       onWheel={handleWheel}
     >
-      <div className="message-rail-track" role="list">
+      <ul className="message-rail-track" role="list">
         {visibleItems.map((item) => {
           const isActive = item.id === activeId;
           const isHovered = item.id === hoveredId;
           const label = t("第 {0} 条消息：{1}", item.turnNumber, item.prompt);
           return (
-            <button
-              key={item.id}
-              type="button"
-              role="listitem"
-              className={`message-rail-tick${isActive ? " is-active" : ""}${isHovered ? " is-hovered" : ""}`}
-              data-rail-message-id={item.id}
-              data-rail-turn={item.turnNumber}
-              aria-label={label}
-              aria-current={isActive ? "location" : undefined}
-              onMouseEnter={(event) => { setHoveredId(item.id); positionPreview(event.currentTarget); }}
-              onFocus={(event) => { setAwake(true); setHoveredId(item.id); positionPreview(event.currentTarget); }}
-              onBlur={() => { setHoveredId((current) => current === item.id ? undefined : current); wake(); }}
-              onClick={() => onJump(item)}
-            >
-              <span className="message-rail-bar" aria-hidden="true" />
-            </button>
+            <li key={item.id} className="message-rail-item">
+              <button
+                type="button"
+                className={`message-rail-tick${isActive ? " is-active" : ""}${isHovered ? " is-hovered" : ""}`}
+                data-rail-message-id={item.id}
+                data-rail-turn={item.turnNumber}
+                aria-label={label}
+                aria-current={isActive ? "location" : undefined}
+                onMouseEnter={(event) => { setHoveredId(item.id); positionPreview(event.currentTarget); }}
+                onFocus={(event) => { setAwake(true); setHoveredId(item.id); positionPreview(event.currentTarget); }}
+                onBlur={() => { setHoveredId((current) => current === item.id ? undefined : current); wake(); }}
+                onClick={() => onJump(item)}
+              >
+                <span className="message-rail-bar" aria-hidden="true" />
+              </button>
+            </li>
           );
         })}
-      </div>
+      </ul>
       {hoveredItem && (
         <div
+          ref={previewRef}
           className="message-rail-preview"
           role="tooltip"
           style={{ top: previewTop }}

@@ -48,8 +48,12 @@ function summarizeMessage(message: Message, attachmentFallback: string, cardFall
   );
   if (plainText) return plainText;
   const media = message.blocks
-    .filter((block) => block.type === "file" || block.type === "image" || block.type === "audio")
-    .map((block) => ("name" in block && typeof block.name === "string" && block.name.trim()) ? block.name.trim() : "")
+    .filter((block): block is Extract<Message["blocks"][number], { type: "file" | "image" | "audio" }> =>
+      block.type === "file" || block.type === "image" || block.type === "audio")
+    .map((block) => {
+      const label = block.type === "image" ? block.title : block.name;
+      return typeof label === "string" ? label.trim() : "";
+    })
     .filter(Boolean);
   if (media.length) return collapseLine(media.join(" · "), MAX_PROMPT_CHARS);
   if (message.blocks.some((block) => block.type === "file" || block.type === "image" || block.type === "audio")) {
@@ -91,10 +95,12 @@ export function buildMessageRailItems(
     const nextAnchorIndex = anchors[ordinal + 1]?.index ?? displayedMessages.length;
     let reply = replyByTarget.get(message.id);
     if (!reply) {
-      // Fall back to the first non-deleted Bot message before the next user turn.
+      // Fall back to the first non-deleted Bot message before the next user turn
+      // that does not explicitly reply to a different message.
       for (let cursor = index + 1; cursor < nextAnchorIndex; cursor++) {
         const candidate = displayedMessages[cursor]!;
         if (candidate.status === "deleted" || candidate.authorType !== "bot") continue;
+        if (candidate.replyTo && candidate.replyTo !== message.id) continue;
         reply = candidate;
         break;
       }
@@ -130,10 +136,14 @@ export function sampleMessageRailItems(
   activeId: string | undefined,
   maxTicks = 44,
 ): MessageRailItem[] {
-  if (items.length <= maxTicks || maxTicks < 3) return [...items];
+  if (maxTicks <= 0 || !items.length) return [];
+  if (items.length <= maxTicks) return [...items];
 
   const lastIndex = items.length - 1;
   const activeIndex = activeId ? items.findIndex((item) => item.id === activeId) : -1;
+  if (maxTicks === 1) return [items[activeIndex >= 0 ? activeIndex : lastIndex]!];
+  if (maxTicks === 2) return [items[0]!, items[lastIndex]!];
+
   const picked = new Set<number>([0, lastIndex]);
   if (activeIndex >= 0) picked.add(activeIndex);
 
@@ -172,4 +182,100 @@ export function findActiveRailItemId(
     else break;
   }
   return active.id;
+}
+
+/** Compute the maximum number of ticks that fit vertically inside the rail
+ * without overflowing into the conversation header or composer. */
+export function railTickBudget(railHeight: number, maxTicks = 44): number {
+  if (!Number.isFinite(railHeight) || railHeight < 48) return 0;
+  // Dense ticks take ~6.5px + 2px gap (9px slot), with 32px total vertical padding/margin.
+  return Math.max(2, Math.min(maxTicks, Math.floor((railHeight - 30) / 9)));
+}
+
+/** Whether ticks should switch to compact spacing to fit cleanly inside `railHeight`. */
+export function isRailDense(visibleCount: number, railHeight?: number): boolean {
+  if (visibleCount >= 24) return true;
+  if (railHeight === undefined || !Number.isFinite(railHeight)) return false;
+  // Normal ticks take ~8.5px + 5px gap (14px slot) inside `railHeight - 32` px.
+  return visibleCount * 14 - 5 > Math.max(0, railHeight - 32);
+}
+
+/** Clamp a vertically centered preview popover's `top` coordinate so both edges
+ * stay inside `[edgePadding, railHeight - edgePadding]` (or centered if taller). */
+export function clampPreviewCenter(
+  anchorY: number,
+  railHeight: number,
+  halfHeight: number,
+  edgePadding = 4,
+): number {
+  if (!Number.isFinite(railHeight) || railHeight <= 0) return Math.max(0, anchorY);
+  const margin = Math.max(0, halfHeight) + Math.max(0, edgePadding);
+  if (margin * 2 >= railHeight) return railHeight / 2;
+  return Math.max(margin, Math.min(railHeight - margin, anchorY));
+}
+
+/** Normalize `WheelEvent.deltaY` to CSS pixels across pixel/line/page delta modes. */
+export function normalizeWheelDeltaY(
+  deltaY: number,
+  deltaMode: number,
+  lineHeightPx = 24,
+  pageHeightPx = 400,
+): number {
+  if (!Number.isFinite(deltaY) || deltaY === 0) return 0;
+  if (deltaMode === 1) return deltaY * (lineHeightPx > 0 ? lineHeightPx : 24);
+  if (deltaMode === 2) return deltaY * (pageHeightPx > 0 ? pageHeightPx : 400);
+  return deltaY;
+}
+
+export type RailScrollAnchor = {
+  index: number;
+  atBottom: boolean;
+};
+
+/** Resolve the active displayed-message index and bottom state from scroll geometry
+ * and currently virtualized items. Guards both `atTop` and `atBottom`, subtracts
+ * the virtual list's top offset (`origin`), and interpolates the viewport probe
+ * smoothly near the top and bottom edges while staying centered mid-thread. */
+export function resolveRailScrollAnchor(params: {
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+  shift: number;
+  origin: number;
+  messageCount: number;
+  virtualItems: ReadonlyArray<{ index: number; start: number }>;
+}): RailScrollAnchor {
+  const { scrollTop, scrollHeight, clientHeight, shift, origin, messageCount, virtualItems } = params;
+  if (messageCount <= 0) return { index: 0, atBottom: true };
+
+  const maxScroll = Math.max(0, scrollHeight - clientHeight);
+  const canScroll = maxScroll > 2;
+  if (!canScroll) return { index: messageCount - 1, atBottom: true };
+
+  const clampedScrollTop = Math.min(maxScroll, Math.max(0, scrollTop));
+  const distFromBottom = maxScroll - clampedScrollTop;
+  const edge = Math.min(8, Math.max(1, maxScroll / 3));
+
+  if (distFromBottom <= edge) return { index: messageCount - 1, atBottom: true };
+  if (clampedScrollTop <= edge) return { index: 0, atBottom: false };
+
+  const half = clientHeight * 0.48;
+  const probeOffset = maxScroll < clientHeight
+    ? (clampedScrollTop / maxScroll) * clientHeight
+    : clampedScrollTop < half
+      ? clampedScrollTop
+      : distFromBottom < clientHeight - half
+        ? clientHeight - distFromBottom
+        : half;
+  const probe = clampedScrollTop + shift + probeOffset - origin;
+
+  let index = 0;
+  if (virtualItems.length) {
+    index = virtualItems[0]!.index;
+    for (const item of virtualItems) {
+      if (item.start <= probe) index = item.index;
+      else break;
+    }
+  }
+  return { index, atBottom: false };
 }
