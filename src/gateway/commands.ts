@@ -41,8 +41,16 @@ export function gatewayCommands(engine: string, query = "", engineCommands: Read
       const command = name.toLowerCase();
       if (taken.has(command) || seen.has(command) || !command.startsWith(prefix)) return [];
       seen.add(command);
-      const text = description?.trim() || name;
-      return [{ command: name, description: { defaultValue: text, i18n: { en_us: text, zh_cn: text } } }];
+      let text = description?.trim() || name;
+      if (command === "swarm" && !/preview/i.test(text)) {
+        text = text === name ? "Start a multi-agent swarm (Preview & Quota Heavy)" : `${text} (Preview & Quota Heavy)`;
+      }
+      const zh = command === "swarm"
+        ? (text.includes("Preview & Quota Heavy")
+          ? "启动多智能体协作 Swarm（Preview & Quota Heavy · 预览 · 高配额消耗）"
+          : `${text}（Preview & Quota Heavy）`)
+        : text;
+      return [{ command: name, description: { defaultValue: text, i18n: { en_us: text, zh_cn: zh } } }];
     });
     return [...shared, ...agy];
   }

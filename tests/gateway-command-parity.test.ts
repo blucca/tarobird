@@ -142,11 +142,15 @@ it("adds Antigravity ACP native commands to the App menu without shadowing Host 
     { name: "grill-me", description: "Interview me to align on a plan." },
     { name: "compact", description: "Compact the conversation now." },
     { name: "boost", description: "Invoke the Boost orchestrator." },
+    { name: "swarm", description: "Start a multi-agent swarm (Preview & Quota Heavy)" },
   ];
   const menu = gatewayCommands("antigravity", "", native);
   expect(menu.filter((item) => item.command === "goal")).toHaveLength(1);
   expect(menu.filter((item) => item.command === "compact")).toHaveLength(1);
   expect(menu.find((item) => item.command === "grill-me")).toEqual({ command: "grill-me", description: { defaultValue: "Interview me to align on a plan.", i18n: { en_us: "Interview me to align on a plan.", zh_cn: "Interview me to align on a plan." } } });
+  const swarmItem = menu.find((item) => item.command === "swarm");
+  expect(swarmItem?.description.i18n.en_us).toContain("Preview & Quota Heavy");
+  expect(swarmItem?.description.i18n.zh_cn).toContain("Preview & Quota Heavy");
   expect(gatewayCommands("antigravity", "/gr", native).map((item) => item.command)).toEqual(["group", "grill-me"]);
   expect(gatewayCommands("claude", "", native).some((item) => item.command === "grill-me")).toBe(false);
 });

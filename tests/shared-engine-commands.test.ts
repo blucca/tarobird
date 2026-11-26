@@ -96,6 +96,44 @@ describe("handleLocalEngineTelegramCommand", () => {
     }
   });
 
+  it("rejects /swarm clearly on Antigravity print runtime without sending to model", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agy-print-swarm-"));
+    const sendMessage = vi.fn().mockResolvedValue({ message_id: 21 });
+    const run = vi.fn().mockResolvedValue({ text: "must not reach model" });
+    try {
+      const handledZh = await handleLocalEngineCoreCommand({
+        stateDir: root,
+        startedAt: Date.now(),
+        locale: "zh",
+        cfg: { engine: "antigravity" },
+        normalized: createNormalizedMessage("/swarm parallel check"),
+        context: { api: { sendMessage } as never },
+        bridge: { handleAuthorizedMessage: run },
+        sessionStore: { removeByChatId: vi.fn(), clearAll: vi.fn() },
+        updateInstanceConfig: vi.fn(),
+      });
+      expect(handledZh).toBe(true);
+      expect(sendMessage).toHaveBeenCalledWith(123, expect.stringContaining("print"));
+      expect(sendMessage.mock.calls[0]![1]).toContain("acp");
+
+      const handledAcp = await handleLocalEngineCoreCommand({
+        stateDir: root,
+        startedAt: Date.now(),
+        locale: "en",
+        cfg: { engine: "antigravity", antigravityRuntime: "acp" },
+        normalized: createNormalizedMessage("/swarm parallel check"),
+        context: { api: { sendMessage } as never },
+        bridge: { handleAuthorizedMessage: run },
+        sessionStore: { removeByChatId: vi.fn(), clearAll: vi.fn() },
+        updateInstanceConfig: vi.fn(),
+      });
+      expect(handledAcp).toBe(false);
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      await removeTempRoot(root);
+    }
+  });
+
   it("switches engine locally and clears incompatible model overrides", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "telegram-engine-commands-"));
     const api = {

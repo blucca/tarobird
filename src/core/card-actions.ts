@@ -87,7 +87,7 @@ type AskUserQuestionCardQuestion = {
 };
 
 function isAskUserQuestionRequest(request: EngineApprovalRequest): boolean {
-  return (request.engine === "claude" || request.engine === "kimi" || request.engine === "deepseek" || request.engine === "codex" || request.engine === "pi")
+  return (request.engine === "claude" || request.engine === "kimi" || request.engine === "deepseek" || request.engine === "codex" || request.engine === "pi" || request.engine === "antigravity")
     && request.toolName === "AskUserQuestion";
 }
 
@@ -180,6 +180,7 @@ export async function requestCoreApproval(input: {
       ...(input.replyInThread ? { replyInThread: true } : {}),
       ...(isAskUserQuestionRequest(input.request) ? { askUserQuestionInput: input.request.toolInput } : {}),
       approvalEngine: input.request.engine,
+      ...(input.request.workerName ? { approvalWorkerName: input.request.workerName } : {}),
       approvalToolName: input.request.toolName,
       approvalToolInput: input.request.toolInput,
       approvalScopes: input.request.approvalScopes,
@@ -214,6 +215,7 @@ export async function requestCoreApproval(input: {
         requestId,
         toolInput: input.request.toolInput,
         engine: input.request.engine,
+        ...(input.request.workerName ? { workerName: input.request.workerName } : {}),
         replyInThread: input.replyInThread,
         locale: input.locale,
       });
@@ -245,6 +247,7 @@ export async function requestCoreApproval(input: {
             input.locale ?? "zh",
             0,
             input.request.engine,
+            input.request.workerName,
           ),
           options: coreReplyOptions(input.replyTo, input.replyInThread),
           locale: input.locale ?? "zh",
@@ -260,6 +263,7 @@ export async function requestCoreApproval(input: {
       requestId,
       toolName: input.request.toolName,
       toolInput: input.request.toolInput,
+      ...(input.request.workerName ? { workerName: input.request.workerName } : {}),
       approvalScopes: input.request.approvalScopes,
       replyInThread: input.replyInThread,
       locale: input.locale,
@@ -302,15 +306,18 @@ function renderCoreApprovalFallbackText(requestId: string, request: EngineApprov
   const toolInput = typeof request.toolInput === "string" ? request.toolInput : JSON.stringify(request.toolInput, null, 2);
   const choices = (["once", "session", "deny"] as const).filter((choice) => approvalScope(request.approvalScopes, choice)).map((choice) =>
     `${choice === "once" ? "/approve" : choice === "session" ? "/approve-session" : "/deny"} ${requestId} (${approvalScopeLabel(request.approvalScopes, choice, locale)})`).join(locale === "en" ? ", " : "、");
+  const workerTag = request.workerName?.trim()
+    ? (locale === "en" ? ` (from @${request.workerName.trim()})` : `（来自 @${request.workerName.trim()}）`)
+    : "";
   if (locale === "en") {
     return [
-      `Approval required: ${request.toolName}`,
+      `Approval required${workerTag}: ${request.toolName}`,
       toolInput,
       `Reply with ${choices}.`,
     ].join("\n\n");
   }
   return [
-    `需要审批：${request.toolName}`,
+    `需要审批${workerTag}：${request.toolName}`,
     toolInput,
     `请回复 ${choices}。`,
   ].join("\n\n");
@@ -372,6 +379,7 @@ function renderCoreAskUserQuestionCard(input: {
   requestId: string;
   toolInput: unknown;
   engine?: EngineApprovalRequest["engine"];
+  workerName?: string;
   replyInThread?: boolean;
   locale?: Locale;
   /**
@@ -500,9 +508,12 @@ function renderCoreAskUserQuestionCard(input: {
     })],
   });
 
-  const title = questions.length > 1
+  const worker = input.workerName?.trim();
+  const baseTitle = questions.length > 1
     ? (locale === "en" ? `${questions.length} questions` : `${questions.length} 个问题`)
     : (questions[0]?.header || (locale === "en" ? "Question" : "请选择"));
+  const title = worker && !baseTitle.toLowerCase().includes(worker.toLowerCase()) ? `@${worker} · ${baseTitle}` : baseTitle;
+  const actor = worker ? `${renderApprovalEngineLabel(input.engine)} (@${worker})` : renderApprovalEngineLabel(input.engine);
 
   return {
     schema: "2.0",
@@ -510,8 +521,8 @@ function renderCoreAskUserQuestionCard(input: {
       update_multi: true,
       summary: {
         content: locale === "en"
-          ? `${renderApprovalEngineLabel(input.engine)} is asking a question`
-          : `${renderApprovalEngineLabel(input.engine)} 请求选择`,
+          ? `${actor} is asking a question`
+          : `${actor} 请求选择`,
       },
     },
     header: {
@@ -668,12 +679,13 @@ function renderCoreAskUserQuestionFallbackText(
   locale: Locale,
   questionIndex = 0,
   engine?: EngineApprovalRequest["engine"],
+  workerName?: string,
 ): string {
   const questions = normalizeAskUserQuestions(toolInput);
   const question = questions[questionIndex] ?? questions[0];
+  const actor = workerName?.trim() ? `${renderApprovalEngineLabel(engine)} (@${workerName.trim()})` : renderApprovalEngineLabel(engine);
   if (!question) {
-    const engineName = renderApprovalEngineLabel(engine);
-    return locale === "en" ? `${engineName} is asking a question.` : `${engineName} 需要你选择。`;
+    return locale === "en" ? `${actor} is asking a question.` : `${actor} 需要你选择。`;
   }
   const options = question.options
     .map((option, index) => {
@@ -681,7 +693,10 @@ function renderCoreAskUserQuestionFallbackText(
       return `${optionMarker(index)}. ${option.label}${description}`;
     })
     .join("\n");
-  return [`**${question.header}**`, question.question, options].filter(Boolean).join("\n");
+  const header = workerName?.trim() && !question.header.toLowerCase().includes(workerName.trim().toLowerCase())
+    ? `@${workerName.trim()} · ${question.header}`
+    : question.header;
+  return [`**${header}**`, question.question, options].filter(Boolean).join("\n");
 }
 
 function normalizeAskUserQuestions(toolInput: unknown): AskUserQuestionCardQuestion[] {
@@ -826,7 +841,13 @@ export function renderCoreDroppedBurstNotice(count: number, locale: Locale): str
 
 /** Shared by /stop, the run card and Gateway's composer stop control.
  * Call only after surface authorization. Queued turns are intentionally kept. */
-export async function stopCoreConversation(runtime: CoreServiceRuntime, conversationKey: string, stateDir?: string) {
+export async function stopCoreConversation(
+  runtime: CoreServiceRuntime,
+  conversationKey: string,
+  stateDir?: string,
+  bridge?: Pick<CoreBridgeLike, "stopBackgroundWork">,
+  locale?: Locale,
+) {
   const active = runtime.activeRuns.get(conversationKey);
   const reason = channelProfile() === "gateway" ? APP_USER_STOP_REASON : undefined;
   // Let a goal route stop to its live ordinary turns before they are aborted;
@@ -840,13 +861,33 @@ export async function stopCoreConversation(runtime: CoreServiceRuntime, conversa
   const cancelledQuestions = [...runtime.pendingApprovals.values()].filter(p => p.asyncQuestion && p.conversationKey === conversationKey
     && (!survivingGoal || p.abortSignal !== survivingGoal));
   for (const pending of cancelledQuestions) pending.abortHandler?.();
+  const background: { stopped: boolean; summary?: string } = bridge?.stopBackgroundWork
+    ? await bridge.stopBackgroundWork({
+      chatId: stableCoreNumericId(conversationKey),
+      conversationKey,
+      ...(locale ? { locale } : {}),
+    }).catch(() => ({ stopped: false }))
+    : { stopped: false };
+  if (background.stopped) {
+    for (const pending of [...runtime.pendingApprovals.values()]) {
+      if (pending.conversationKey === conversationKey && !pending.cancelled) {
+        pending.abortHandler?.();
+      }
+    }
+  }
   const droppedBurst = dropPendingCoreAttachmentBurst(runtime, conversationKey);
   if (droppedBurst && stateDir) {
     await Promise.allSettled(droppedBurst.members.map((member) => appendCoreTimelineEvent(stateDir, member, {
       type: "command.handled", outcome: "noop", detail: "batch-cancelled",
     })));
   }
-  return { active, droppedBurst, cancelledQuestions: cancelledQuestions.length };
+  return {
+    active,
+    droppedBurst,
+    cancelledQuestions: cancelledQuestions.length,
+    backgroundStopped: background.stopped,
+    backgroundSummary: background.summary,
+  };
 }
 
 /** Stops only the run executing one queued input, never another turn of the
@@ -866,11 +907,15 @@ export function stopCoreRunForMessage(runtime: CoreServiceRuntime, conversationK
 }
 
 export function renderCoreConversationStop(result: Awaited<ReturnType<typeof stopCoreConversation>>, locale: Locale): string | undefined {
-  const { active, droppedBurst } = result;
-  const notice = droppedBurst ? renderCoreDroppedBurstNotice(droppedBurst.members.length, locale) : "";
+  const { active, droppedBurst, backgroundStopped, backgroundSummary } = result;
+  const notice = [
+    backgroundStopped && !active?.hasRunCard ? backgroundSummary : "",
+    droppedBurst ? renderCoreDroppedBurstNotice(droppedBurst.members.length, locale) : "",
+  ].filter(Boolean).join("\n");
   // A live run card supplies its own acknowledgment. A dropped burst has no card.
   if (active?.hasRunCard) return notice || undefined;
-  return [renderCoreStopResult(Boolean(active) || Boolean(droppedBurst) || result.cancelledQuestions > 0, locale), notice].filter(Boolean).join("\n");
+  if (backgroundStopped && backgroundSummary) return [backgroundSummary, droppedBurst ? renderCoreDroppedBurstNotice(droppedBurst.members.length, locale) : ""].filter(Boolean).join("\n");
+  return [renderCoreStopResult(Boolean(active) || Boolean(droppedBurst) || result.cancelledQuestions > 0 || backgroundStopped, locale), notice].filter(Boolean).join("\n");
 }
 
 export function isCoreApprovalTextCommand(text: string): boolean {
@@ -952,6 +997,7 @@ export async function handleCoreApprovalTextCommand(input: {
       requestId: pending.requestId,
       toolName: pending.approvalToolName ?? "",
       toolInput: pending.approvalToolInput,
+      ...(pending.approvalWorkerName ? { workerName: pending.approvalWorkerName } : {}),
       approvalScopes: pending.approvalScopes,
       replyInThread: pending.replyInThread,
       locale,
@@ -1088,7 +1134,7 @@ export async function handleCoreCardAction(input: {
       });
       return true;
     }
-    const stopped = await stopCoreConversation(input.runtime, value.conversationKey, input.stateDir);
+    const stopped = await stopCoreConversation(input.runtime, value.conversationKey, input.stateDir, input.bridge, locale);
     const text = renderCoreConversationStop(stopped, locale);
     if (text) {
       await input.channel.send(input.event.chatId, { text }, {
@@ -1479,6 +1525,7 @@ export async function handleCoreCardAction(input: {
         requestId: pending.requestId,
         toolInput: pending.askUserQuestionInput,
         engine: pending.approvalEngine,
+        ...(pending.approvalWorkerName ? { workerName: pending.approvalWorkerName } : {}),
         ...(pending.replyInThread ?? replyInThread ? { replyInThread: true } : {}),
         locale,
         selections: formValue,
@@ -1861,6 +1908,7 @@ export async function handleCoreCardAction(input: {
         requestId: value.requestId,
         toolName: pending.approvalToolName ?? "",
         toolInput: pending.approvalToolInput,
+        ...(pending.approvalWorkerName ? { workerName: pending.approvalWorkerName } : {}),
         approvalScopes: pending.approvalScopes,
         replyInThread: pending.replyInThread ?? replyInThread,
         locale,

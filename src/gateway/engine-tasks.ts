@@ -2,6 +2,7 @@ import { z } from "zod";
 import { idSchema } from "../client-protocol/index.js";
 import { engineSessionRecoverySchema, engineTaskSnapshotSchema, engineTaskStopSchema, engineTaskControlResultSchema } from "../client-protocol/engine-tasks.js";
 import { buildCoreConversationKey, stableCoreNumericId } from "../core/message-normalizer.js";
+import { resolveCoreLocale } from "../core/locale.js";
 import type { CoreBridgeLike } from "../core/types.js";
 import type { GatewayChannel } from "./channel.js";
 import { GatewayReceipts } from "./receipts.js";
@@ -37,10 +38,24 @@ export function gatewayEngineTasks(bridge: CoreBridgeLike, channel: GatewayChann
     const p = engineTaskStopSchema.omit({ botId: true }).extend({ conversationId: idSchema, userId: idSchema }).strict().parse(raw);
     const receipt = await receipts.run(`tasks.stop:${p.userId}:${p.requestId}`, async () => {
       const wrap = (result: unknown) => ({ conversationId: p.conversationId, taskId: p.taskId, result: engineTaskControlResultSchema.parse(result) });
-      if (!bridge.stopTask) return wrap({ outcome: "rejected", reason: "unsupported" });
       const isCurrentSession = async () => await channel.canSteerConversation?.(p.conversationId) === true;
-      if (!await isCurrentSession()) return wrap({ outcome: "rejected", reason: "stale" });
       const conversationKey = buildCoreConversationKey(p.conversationId);
+      if (p.taskId === "swarm") {
+        if (!bridge.stopBackgroundWork) return wrap({ outcome: "rejected", reason: "unsupported" });
+        if (!await isCurrentSession()) return wrap({ outcome: "rejected", reason: "stale" });
+        const locale = await resolveCoreLocale(stateDir);
+        const bg = await bridge.stopBackgroundWork({
+          chatId: stableCoreNumericId(conversationKey),
+          conversationKey,
+          locale,
+        });
+        if (bg.stopped && bg.summary) {
+          await channel.inConversation(p.conversationId, () => channel.send(p.conversationId, { text: bg.summary! })).catch(() => undefined);
+        }
+        return wrap(bg.stopped ? { outcome: "accepted" } : { outcome: "rejected", reason: "stale" });
+      }
+      if (!bridge.stopTask) return wrap({ outcome: "rejected", reason: "unsupported" });
+      if (!await isCurrentSession()) return wrap({ outcome: "rejected", reason: "stale" });
       return wrap(await bridge.stopTask({ chatId: stableCoreNumericId(conversationKey), conversationKey, taskId: p.taskId, isCurrentSession }));
     });
     if (!receipt.ok) return { outcome: "unknown", reason: "uncertain" };

@@ -278,6 +278,8 @@ export interface EngineApprovalRequest {
   engine: "claude" | "codex" | "antigravity" | "kimi" | "deepseek" | "pi";
   toolName: string;
   toolInput: unknown;
+  /** Name of the worker / subagent requesting approval or asking a question (e.g. swarm worker). */
+  workerName?: string;
   cwd?: string;
   sessionId?: string;
   abortSignal?: AbortSignal;
@@ -566,6 +568,10 @@ export interface CodexAdapter {
   controlNativeInput?(sessionId: string, input: { inputId: string; action: NativeInputAction }): Promise<NativeInputControlResult>;
   /** Slash commands the engine advertised (ACP available_commands_update); absent means none. */
   advertisedCommands?(): Array<{ name: string; description: string }>;
+  /** Whether an authoritative advertised-commands snapshot has arrived. */
+  hasReceivedAdvertisedCommands?(): boolean;
+  /** Stop background native work (such as an active swarm) after its initiating turn ended. */
+  stopBackgroundWork?(sessionId: string, input?: { locale?: "en" | "zh" }): Promise<{ stopped: boolean; summary?: string }>;
   /** Native live tasks; absent means unsupported. Handles must be worker-scoped. */
   listTasks?(sessionId: string): Promise<EngineTaskSnapshot>;
   stopTask?(sessionId: string, input: { taskId: string }): Promise<EngineTaskControlResult>;

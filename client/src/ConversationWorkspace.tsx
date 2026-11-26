@@ -18,7 +18,7 @@ import {
   X,
 } from "lucide-react";
 import { blocksText, type Conversation, type Message } from "../../src/client-protocol/index.js";
-import { engineTaskSnapshotSchema, type EngineTask } from "../../src/client-protocol/engine-tasks.js";
+import { engineTaskSnapshotSchema, type EngineTask, type SwarmSnapshot } from "../../src/client-protocol/engine-tasks.js";
 import { promptQueueSnapshotSchema, type PromptQueueSnapshot } from "../../src/client-protocol/prompt-queue.js";
 import { conversationFilesPageSchema, type ConversationFile } from "../../src/client-protocol/conversation-files.js";
 import { permissionSettingsSchema, type PermissionSettings } from "../../src/client-protocol/permissions.js";
@@ -193,6 +193,7 @@ export interface ConversationWorkspaceProps {
   onOpenAllFiles: () => void;
   onOpenWorkbenchFile: (target: WorkbenchFileTarget) => void;
   onOpenTasksModal?: () => void;
+  onOpenSwarmBoard?: () => void;
 }
 
 export function ConversationWorkspace({
@@ -218,6 +219,7 @@ export function ConversationWorkspace({
   onOpenAllFiles,
   onOpenWorkbenchFile,
   onOpenTasksModal,
+  onOpenSwarmBoard,
 }: ConversationWorkspaceProps) {
   const locale = useLocale();
   const [tab, setTab] = useState<WorkspaceTab>("overview");
@@ -227,6 +229,7 @@ export function ConversationWorkspace({
   const [filePage, setFilePage] = useState(0);
   const [expandedComms, setExpandedComms] = useState<ReadonlySet<string>>(() => new Set());
   const [tasks, setTasks] = useState<EngineTask[]>([]);
+  const [swarmSnapshot, setSwarmSnapshot] = useState<SwarmSnapshot | undefined>(undefined);
   const [queue, setQueue] = useState<PromptQueueSnapshot | undefined>(undefined);
   const [permissions, setPermissions] = useState<PermissionSettings | undefined>(undefined);
   const [files, setFiles] = useState<ConversationFile[]>([]);
@@ -246,6 +249,7 @@ export function ConversationWorkspace({
     setCommPage(0);
     setFilePage(0);
     setTasks([]);
+    setSwarmSnapshot(undefined);
     setQueue(undefined);
     setPermissions(undefined);
     setFiles([]);
@@ -294,6 +298,7 @@ export function ConversationWorkspace({
             if (abort.signal.aborted) return;
             const snap = engineTaskSnapshotSchema.parse(raw);
             setTasks(snap.tasks);
+            setSwarmSnapshot(snap.swarm);
           })
           .catch(() => undefined);
       }
@@ -693,13 +698,31 @@ export function ConversationWorkspace({
                   <ListOrdered size={12} aria-hidden="true"/>
                   <span>{t("进行中与队列")}</span>
                 </span>
+                {onOpenSwarmBoard && swarmSnapshot && (
+                  <button type="button" className="workspace-section-action" onClick={onOpenSwarmBoard}>
+                    {t("查看看板")}
+                  </button>
+                )}
                 {onOpenTasksModal && directBot && connection.state.engineTasksAvailable && (
                   <button type="button" className="workspace-section-action" onClick={onOpenTasksModal}>
                     {t("全部任务")}
                   </button>
                 )}
               </div>
-              {activeTasks.length > 0 || queuedItems.length > 0 || streamingBots.length > 0 ? (
+              {swarmSnapshot && (
+                <div className="workspace-item-row">
+                  <span className="workspace-item-icon"><span className={`status-dot${swarmSnapshot.active ? " online" : ""}`}/></span>
+                  <span className="workspace-item-main">
+                    <span className="workspace-item-title">{swarmSnapshot.title || "Swarm"}</span>
+                    <span className="workspace-item-meta">
+                      {swarmSnapshot.active
+                        ? t("Swarm 进行中 · {0} 位活跃成员，{1} 条看板动态", swarmSnapshot.members.filter(m => m.state === "working" || m.state === "waiting" || m.state === "paused").length, swarmSnapshot.posts.length)
+                        : t("Swarm 已结束 · {0} 位成员，{1} 条看板动态", swarmSnapshot.members.length, swarmSnapshot.posts.length)}
+                    </span>
+                  </span>
+                </div>
+              )}
+              {activeTasks.length > 0 || queuedItems.length > 0 || streamingBots.length > 0 || swarmSnapshot ? (
                 <div className="workspace-list">
                   {streamingBots.length > 0 && activeTasks.length === 0 && (
                     <div className="workspace-item-row">
@@ -715,7 +738,7 @@ export function ConversationWorkspace({
                       <span className="workspace-item-icon"><span className="status-dot online"/></span>
                       <span className="workspace-item-main">
                         <span className="workspace-item-title">{task.label || task.id}</span>
-                        <span className="workspace-item-meta">{task.kind === "subagent" ? t("子代理") : task.kind === "shell" ? t("后台命令") : t("后台任务")}</span>
+                        <span className="workspace-item-meta">{task.swarmState ? `${t("Swarm Worker")} · ${task.swarmState}` : task.kind === "subagent" ? t("子代理") : task.kind === "shell" ? t("后台命令") : t("后台任务")}</span>
                       </span>
                     </div>
                   ))}

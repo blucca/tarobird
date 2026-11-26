@@ -155,6 +155,20 @@ has a setting for it: to switch an existing Bot, edit that key in the Bot's
   message. An idle process is closed after two hours unless one of its
   background commands still runs.
 - The account quota is read with the same one-shot `agy -p /usage` as print.
+- **Swarm mode (`/swarm`, Preview & Quota Heavy)**: Supported on the ACP runtime
+  when `agy` is 1.5.5+ (ACP requires 1.5.10+) and `agy acp` advertises `/swarm`.
+  Rejected locally without forwarding to the model on the print runtime, older
+  `agy` versions, or sessions without `/swarm`. While swarm workers are
+  `working` or `waiting` (tracked via `brain/<sessionId>/.system_generated/swarm/{members.json,board.jsonl}`
+  merged with ACP updates), inactivity/total-turn/idle-worker reaping is
+  suppressed; `listTasks` exposes workers, models, states, helper roles
+  (`monitor`/`narrator`), and the read-only Swarm Board; post-coordinator worker
+  approvals and `AskUserQuestion` (`elicitation/create`) remain interactive and
+  attributed to the requesting worker; `@worker <message>` is forwarded unwrapped;
+  and Stop cancels the swarm by closing the ACP session so all workers exit.
+  Swarm lifecycle behavior in TaroBird is verified against fake ACP harnesses and
+  temporary `brain/<sessionId>/.system_generated/swarm/` fixtures rather than live
+  quota-heavy swarm runs.
 
 ## 中文摘要
 
@@ -180,6 +194,10 @@ Antigravity headless 暂无单工具远程审批、运行中 steer、结果后�
 
 以上是 print 运行时。Bot 的 `config.json` 里 `antigravityRuntime: "acp"` 时改走
 官方 ACP 服务 `agy acp`：逐次审批（普通审批不带终端沙箱）、运行中引导、上下文
-用量、原生 `/compact` 和后台命令列表都可用。agy 1.5.10 及以上时，新建的普通
-Antigravity Bot 默认用 ACP；幕僚长及其派出的 Bot、已有 Bot 保持原运行时。App
-和 CLI 没有切换入口，需手改该 Bot 的 `config.json` 后重启 Bot。
+用量、原生 `/compact`、后台命令列表和 `/swarm`（Preview & Quota Heavy）都可用。
+print 运行时与未开放 `/swarm` 的版本/会话会在本地明确拒绝 `/swarm` 而不送入模型；
+Swarm 期间会抑制超时回收，暴露只读 Swarm 看板与 worker 状态/辅助角色、保留带
+worker 名称归属的后续审批与提问，并通过 Stop 关闭 ACP 会话彻底终止 worker。
+agy 1.5.10 及以上时，新建的普通 Antigravity Bot 默认用 ACP；幕僚长及其派出的 Bot、
+已有 Bot 保持原运行时。App 和 CLI 没有切换入口，需手改该 Bot 的 `config.json`
+后重启 Bot。

@@ -5,10 +5,14 @@ import { pathToFileURL } from "node:url";
 
 import {
   client as acpClient,
+  CreateElicitationRequest as CreateElicitationRequestGuard,
   methods as acpMethods,
   PROTOCOL_VERSION,
   type ClientConnection,
   type ContentBlock,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
+  type ElicitationPropertySchema,
   type InitializeResponse,
   type PromptResponse,
   type RequestPermissionRequest,
@@ -20,6 +24,16 @@ import {
 import { isLogicalSessionId } from "../runtime/logical-session.js";
 import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
 import { cancelOwnedAntigravityQuotaReads, readOwnedAntigravityQuota, type AntigravityQuotaSpawn } from "./antigravity-account-quota.js";
+import { antigravitySupportsSwarm } from "./antigravity-acp-support.js";
+import {
+  applySwarmAcpUpdate,
+  extractWorkerAttribution,
+  mergeSwarmSnapshots,
+  readSwarmBoardFiles,
+  resolveAntigravityBrainDir,
+  swarmMembersToEngineTasks,
+  type AcpSwarmState,
+} from "./antigravity-swarm.js";
 import { spawnEngine } from "../runtime/engine-process.js";
 import { appStopKillOptions } from "../runtime/turn-cancellation.js";
 import { DEFAULT_APPROVAL_MODE, normalizeApprovalMode, type ApprovalMode } from "../state/approval-mode.js";
@@ -77,6 +91,10 @@ export type AntigravityAcpAdapterOptions = {
   childEnv?: NodeJS.ProcessEnv;
   configPath?: string;
   workspacePath: string;
+  /** Override Antigravity brain directory (default: ~/.gemini/antigravity-cli/brain). */
+  brainDir?: string;
+  /** Optional version capability check override for `/swarm` availability. */
+  supportsSwarmFn?: () => Promise<boolean>;
   spawnFn?: SpawnAgyAcp;
   /** Starts the one-shot `agy -p /usage` read; never the ACP server. */
   quotaSpawnFn?: AntigravityQuotaSpawn;
@@ -112,6 +130,7 @@ type ToolState = {
   name: string;
   kind?: string;
   title?: string;
+  workerName?: string;
   rawInput?: unknown;
   status: string;
   startedAt: number;
@@ -197,6 +216,12 @@ type Worker = {
   reserved: boolean;
   /** The latest turn's event handler; idle wake-ups without an owner report through it. */
   lastTurnHandler?: CodexUserMessageInput["onEngineEvent"];
+  /** Preserved approval handler for post-coordinator swarm/background worker requests. */
+  lastApprovalHandler?: CodexUserMessageInput["onApprovalRequest"];
+  /** Aborted when the worker is closed or the user stops the swarm. */
+  backgroundApprovals: AbortController;
+  /** Active/recent swarm state observed over ACP for this session. */
+  swarm?: AcpSwarmState & { ownerTurn?: Turn };
   wake: Wake | null;
   promptSeq: number;
   tools: Map<string, ToolState>;
@@ -387,6 +412,36 @@ function isSlashCommand(text: string): boolean {
   return /^\/[A-Za-z][\w.:-]*(?:\s|$)/.test(text.trimStart());
 }
 
+function parseSwarmCommand(text: string): { subcommand: string; task: string } | null {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^\/swarm(?:@\w+)?(?:\s+([\s\S]*))?$/i);
+  if (!match) return null;
+  const rest = (match[1] ?? "").trim();
+  if (!rest) return { subcommand: "", task: "" };
+  const firstSpace = rest.search(/\s/);
+  const firstWord = (firstSpace === -1 ? rest : rest.slice(0, firstSpace)).toLowerCase();
+  return { subcommand: firstWord, task: rest };
+}
+
+function isSwarmWorkerMention(text: string, swarm?: AcpSwarmState): boolean {
+  if (!swarm?.active) return false;
+  const match = text.trimStart().match(/^@([A-Za-z0-9._-]{1,64})(?:\s|$)/);
+  if (!match?.[1]) return false;
+  if (swarm.members.size === 0) return true;
+  return swarm.members.has(match[1].toLowerCase());
+}
+
+function renderSwarmUnavailableMessage(reason: "version" | "not_advertised", locale?: CodexUserMessageInput["locale"]): string {
+  if (reason === "version") {
+    return locale === "en"
+      ? "`/swarm` is not available because the installed `agy` CLI version is older than 1.5.5. Update `agy` to 1.5.10+ to use `/swarm` on the ACP runtime. Nothing was sent to the model."
+      : "当前安装的 `agy` 版本低于 1.5.5，不支持 `/swarm`。请升级 `agy` 到 1.5.10 及以上后再在 ACP 运行时使用 `/swarm`；本次未向模型发送任何内容。";
+  }
+  return locale === "en"
+    ? "`/swarm` is not available in this Antigravity CLI session (`agy acp` did not advertise `/swarm`, for example due to an older CLI version or account/plan policy). Nothing was sent to the model."
+    : "当前 Antigravity CLI 会话未开放 `/swarm` 命令（`agy acp` 未返回 `/swarm`，可能是 CLI 版本或账号/套餐限制）。本次未向模型发送任何内容。";
+}
+
 async function attachmentBlocks(files: string[]): Promise<ContentBlock[]> {
   const blocks: ContentBlock[] = [];
   for (const file of files) {
@@ -442,6 +497,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   readonly inFlightSendBehavior = "steer" as const;
 
   private readonly childEnv: NodeJS.ProcessEnv;
+  private readonly brainDir: string;
   private readonly spawnFn: SpawnAgyAcp;
   private readonly killProcessTreeFn: (pid: number | undefined, options?: { graceMs: number }) => void;
   private readonly workers = new Map<string, Worker>();
@@ -455,10 +511,15 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private readonly turnTimeoutMs: number | null;
   private readonly inactivityTimeoutMs: number | null;
   private readonly sweepTimer: ReturnType<typeof setInterval> | undefined;
+  private reaping = false;
   private destroyPromise: Promise<void> | undefined;
   private destroyed = false;
   /** The newest available_commands_update; every session of this Bot shares the CLI and workspace. */
   private commands: Array<{ name: string; description: string }> = [];
+  private commandsReceived = false;
+  private swarmVersionSupported: Promise<boolean> | undefined;
+  /** Sessions whose active swarm was stopped by user, surviving worker close so listTasks reflects killed state over stale files. */
+  private readonly stoppedSwarmSessions = new Set<string>();
   private readonly quotaCache: AdapterQuotaCache;
 
   constructor(private readonly executable: string, private readonly options: AntigravityAcpAdapterOptions) {
@@ -466,6 +527,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     delete env.TELEGRAM_BOT_TOKEN;
     env.AGY_CLI_HIDE_ACCOUNT_INFO ??= "1";
     this.childEnv = env;
+    this.brainDir = resolveAntigravityBrainDir(env, options.brainDir);
     this.spawnFn = options.spawnFn ?? (spawnEngine as unknown as SpawnAgyAcp);
     this.quotaCache = new AdapterQuotaCache("antigravity", executable, env, options.workspacePath, options.configPath);
     this.killProcessTreeFn = options.killProcessTreeFn ?? ((pid, kill) => killProcessTree(pid, kill));
@@ -479,7 +541,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     this.inactivityTimeoutMs = options.inactivityTimeoutMs === undefined ? ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS : options.inactivityTimeoutMs;
     const interval = options.idleSweepIntervalMs ?? DEFAULT_IDLE_SWEEP_INTERVAL_MS;
     if (this.idleWorkerTtlMs > 0 && interval > 0) {
-      this.sweepTimer = setInterval(() => this.reapIdleWorkers(), interval);
+      this.sweepTimer = setInterval(() => { void this.reapIdleWorkers(); }, interval);
       this.sweepTimer.unref?.();
     }
   }
@@ -549,25 +611,99 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     return this.commands.map((command) => ({ ...command }));
   }
 
+  hasReceivedAdvertisedCommands(): boolean {
+    return this.commandsReceived;
+  }
+
+  hasPendingNativeWork(): boolean {
+    for (const worker of new Set(this.workers.values())) {
+      if (worker.removed || worker.closing) continue;
+      if (worker.turn || worker.reserved || worker.pendingPermissions > 0 || worker.wake) return true;
+      if (worker.swarm?.active && !worker.swarm.stoppedByUser) return true;
+      for (const tool of worker.tools.values()) {
+        if (tool.background && (tool.status === "pending" || tool.status === "in_progress")) return true;
+      }
+    }
+    return false;
+  }
+
+  private async checkSwarmVersionSupported(): Promise<boolean> {
+    if (this.options.supportsSwarmFn) return this.options.supportsSwarmFn();
+    if (this.options.spawnFn) return true;
+    this.swarmVersionSupported ??= antigravitySupportsSwarm(this.executable, this.childEnv);
+    const ok = await this.swarmVersionSupported;
+    if (!ok) this.swarmVersionSupported = undefined;
+    return ok;
+  }
+
   /**
-   * Background commands still running in this session. ACP has no task list
-   * and no per-task stop (only session/cancel and session/close), so each is
-   * inferred from its tool call and cannot be stopped on its own. Subagents
-   * report completion at once and carry no id, so they cannot be listed.
+   * Background commands and swarm workers still running in this session. ACP has
+   * no per-task stop (only session/cancel and session/close), so each entry is
+   * read-only (`canStop: false`); stopping the conversation or swarm closes the session.
    */
   async listTasks(sessionId: string): Promise<EngineTaskSnapshot> {
     const worker = this.liveWorker(sessionId);
-    if (!worker) return { supported: true, tasks: [] };
-    const tasks: EngineTask[] = [];
-    for (const tool of worker.tools.values()) {
-      if (!tool.background || (tool.status !== "pending" && tool.status !== "in_progress")) continue;
-      if (tool.name !== "run_command" && !(tool.kind === "execute" && !tool.name)) continue;
-      const commandLine = asRecord(tool.rawInput)?.CommandLine;
-      const label = (tool.title || (typeof commandLine === "string" ? commandLine : "") || "run_command").slice(0, 500);
-      tasks.push({ id: tool.token, label, kind: "shell", mode: "background", status: "running", canStop: false,
-        startedAt: tool.startedAt, updatedAt: tool.updatedAt, owner: tool.turn ? "bound" : "unattributed" });
+    const effectiveSessionId = worker?.sessionId ?? (!isLogicalSessionId(sessionId) ? sessionId : undefined);
+    if (!effectiveSessionId) return { supported: true, tasks: [] };
+
+    const fileSwarm = await readSwarmBoardFiles(this.brainDir, effectiveSessionId);
+    const stoppedFallback: AcpSwarmState | undefined = !worker?.swarm && (this.stoppedSwarmSessions.has(effectiveSessionId) || this.stoppedSwarmSessions.has(sessionId))
+      ? { active: false, stoppedByUser: true, startedAt: fileSwarm.updatedAt, updatedAt: Date.now(), members: new Map(), posts: [] }
+      : undefined;
+    const swarm = mergeSwarmSnapshots(worker?.swarm ?? stoppedFallback, fileSwarm, { sessionId: effectiveSessionId });
+    const tasks: EngineTask[] = swarmMembersToEngineTasks(effectiveSessionId, swarm, worker?.swarm?.startedAt);
+
+    if (worker) {
+      for (const tool of worker.tools.values()) {
+        if (!tool.background || (tool.status !== "pending" && tool.status !== "in_progress")) continue;
+        if (tool.name !== "run_command" && !(tool.kind === "execute" && !tool.name)) continue;
+        const commandLine = asRecord(tool.rawInput)?.CommandLine;
+        const label = (tool.title || (typeof commandLine === "string" ? commandLine : "") || "run_command").slice(0, 500);
+        tasks.push({
+          id: tool.token, label, kind: "shell", mode: "background", status: "running", canStop: false,
+          startedAt: tool.startedAt, updatedAt: tool.updatedAt, owner: tool.turn ? "bound" : "unattributed",
+        });
+      }
     }
-    return { supported: true, tasks: tasks.slice(-128) };
+
+    return {
+      supported: true,
+      tasks: tasks.slice(-128),
+      ...(swarm?.active ? { foregroundStopScope: "all" as const } : {}),
+      ...(swarm ? { swarm } : {}),
+    };
+  }
+
+  async stopBackgroundWork(sessionId: string, input?: { locale?: "en" | "zh" }): Promise<{ stopped: boolean; summary?: string }> {
+    const worker = this.liveWorker(sessionId);
+    if (!worker || worker.closing) return { stopped: false };
+    const swarmActive = await this.isSwarmActive(worker);
+    const hasTools = this.hasOpenBackgroundTools(worker);
+    if (!swarmActive && !hasTools && worker.pendingPermissions === 0) return { stopped: false };
+
+    if (worker.swarm) {
+      this.markSwarmStopped(worker.swarm, worker.sessionId);
+    } else if (swarmActive) {
+      worker.swarm = {
+        active: false, stoppedByUser: true, startedAt: Date.now(), updatedAt: Date.now(), members: new Map(), posts: [],
+      };
+      if (worker.sessionId) this.stoppedSwarmSessions.add(worker.sessionId);
+    }
+    this.stoppedSwarmSessions.add(sessionId);
+    if (worker.wake?.timer) clearTimeout(worker.wake.timer);
+    worker.wake = null;
+    worker.backgroundApprovals.abort();
+    if (worker.sessionId && !worker.exited) {
+      void worker.connection.agent.notify(acpMethods.agent.session.cancel, { sessionId: worker.sessionId }).catch(() => undefined);
+    }
+    await this.closeWorker(worker, new Error(STOPPED_BY_USER));
+    const locale = input?.locale === "en" ? "en" : "zh";
+    return {
+      stopped: true,
+      summary: swarmActive
+        ? (locale === "en" ? "Stopped the active swarm and ended all running workers." : "已停止当前 Swarm，并结束所有运行中的 worker。")
+        : (locale === "en" ? "Stopped background work in this Antigravity session." : "已停止此 Antigravity 会话中的后台任务。"),
+    };
   }
 
   private liveWorker(sessionId: string): Worker | undefined {
@@ -583,21 +719,21 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     return { approvalMode: normalizeApprovalMode(parsed.approvalMode) ?? DEFAULT_APPROVAL_MODE, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
   }
 
-  private async buildPrompt(input: CodexUserMessageInput): Promise<ContentBlock[]> {
+  private async buildPrompt(input: CodexUserMessageInput, unwrapWorkerMention = false): Promise<ContentBlock[]> {
     // The Host passes the stable channel contract in input.instructions.
     const instructions = combineInstructions(null, input.instructions ?? null);
     const bounded = instructions && instructions.length > MAX_INSTRUCTIONS_CHARS
       ? `${instructions.slice(0, MAX_INSTRUCTIONS_CHARS)}\n\n[Instructions truncated at ${MAX_INSTRUCTIONS_CHARS} characters]`
       : instructions;
     const blocks: ContentBlock[] = [];
-    // agy expands a native command (`/name args`) only from prompt text that
-    // starts with it, so it is sent unwrapped and ahead of the private context.
-    const slash = isSlashCommand(input.text);
-    if (slash) blocks.push({ type: "text", text: input.text.trimStart() });
+    // agy expands a native command (`/name args`) or `@worker message` only from
+    // prompt text that starts with it, so it is sent unwrapped ahead of private context.
+    const unwrapped = isSlashCommand(input.text) || unwrapWorkerMention;
+    if (unwrapped) blocks.push({ type: "text", text: input.text.trimStart() });
     if (bounded) blocks.push({ type: "text", text: renderPrivateInstructions(bounded) });
     const turnInstructions = renderPrivateTurnInstructions(input.turnInstructions);
     if (turnInstructions) blocks.push({ type: "text", text: turnInstructions });
-    if (!slash) blocks.push({ type: "text", text: ["<user_message>", input.text, "</user_message>"].join("\n") });
+    if (!unwrapped) blocks.push({ type: "text", text: ["<user_message>", input.text, "</user_message>"].join("\n") });
     if (input.files.length) {
       blocks.push({ type: "text", text: input.files.map((file) => `Attachment: ${file}`).join("\n") });
       blocks.push(...await attachmentBlocks(input.files));
@@ -613,10 +749,37 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (config.approvalMode === "normal" && this.options.configPath && !input.onApprovalRequest && input.text.trim() !== "/compact") {
       throw new Error("Antigravity normal mode requires an approval handler");
     }
-    const prompt = await this.buildPrompt(input);
+    const swarmCmd = parseSwarmCommand(input.text);
+    if (swarmCmd) {
+      if (!await this.checkSwarmVersionSupported()) {
+        return { text: renderSwarmUnavailableMessage("version", input.locale), sessionId };
+      }
+      if (swarmCmd.subcommand === "board" && swarmCmd.task.toLowerCase() === "board") {
+        const snap = await this.listTasks(sessionId);
+        const { renderSwarmBoardSummary } = await import("./antigravity-swarm.js");
+        return { text: renderSwarmBoardSummary(snap.swarm, input.locale === "zh" ? "zh" : "en"), sessionId };
+      }
+      if (!swarmCmd.task) {
+        return {
+          text: input.locale === "zh"
+            ? "用法：`/swarm <任务>`。例如：`/swarm 并行排查并修复登录测试`。"
+            : "Usage: `/swarm <task>`. For example: `/swarm investigate and fix the failing auth tests`.",
+          sessionId,
+        };
+      }
+    }
     const workspace = path.resolve(input.workspaceOverride ?? this.options.workspacePath);
     const launchKey = JSON.stringify({ workspace, flags: permissionFlags(config.approvalMode) });
     const worker = await this.startedWorker(sessionId, workspace, launchKey, config.approvalMode, input.abortSignal);
+    if (swarmCmd) {
+      await Promise.resolve();
+      if (this.commandsReceived && !this.commands.some((command) => command.name.toLowerCase() === "swarm")) {
+        return { text: renderSwarmUnavailableMessage("not_advertised", input.locale), sessionId: worker.sessionId! };
+      }
+    }
+    const unwrapMention = isSwarmWorkerMention(input.text, worker.swarm)
+      || (!worker.swarm && /^@[A-Za-z0-9._-]{1,64}(?:\s|$)/.test(input.text.trimStart()) && await this.isSwarmActive(worker));
+    const prompt = await this.buildPrompt(input, unwrapMention);
     if (worker.turn || worker.reserved) throw new Error("Antigravity session already has an in-flight turn");
     worker.reserved = true;
     try {
@@ -695,11 +858,13 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     let worker!: Worker;
     const stream = createAcpStream(child.stdout, child.stdin, () => { if (worker) this.markActivity(worker); }, (error) => this.failWorker(worker, error));
     const connection = acpClient()
-      .onRequest(acpMethods.client.session.requestPermission, ({ params }) => this.handlePermission(worker, params))
       .onNotification(acpMethods.client.session.update, ({ params }) => { this.handleUpdate(worker, params); })
+      .onRequest(acpMethods.client.session.requestPermission, ({ params }) => this.handlePermission(worker, params))
+      .onRequest(acpMethods.client.elicitation.create, ({ params }) => this.handleElicitation(worker, params))
       .connect(stream);
     worker = {
-      child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, reserved: false, wake: null, promptSeq: 0,
+      child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, reserved: false,
+      backgroundApprovals: new AbortController(), wake: null, promptSeq: 0,
       tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), removed: false, exited: false,
     };
     this.workers.set(requestedId, worker);
@@ -722,7 +887,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       const initialized = await starting(withTimeout(connection.agent.request(acpMethods.agent.initialize, {
         protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: "tarobird", version: "1" },
-        clientCapabilities: {},
+        clientCapabilities: { elicitation: { form: {} } },
       }), this.initializeTimeoutMs, `Antigravity ACP initialize timed out after ${this.initializeTimeoutMs}ms`));
       if (initialized.protocolVersion !== PROTOCOL_VERSION) throw new Error(`Antigravity ACP negotiated unsupported protocol version ${String(initialized.protocolVersion)}`);
       worker.initialized = initialized;
@@ -829,6 +994,27 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       this.flushWake(worker);
       worker.turn = turn;
       worker.lastTurnHandler = input.onEngineEvent;
+      if (input.onApprovalRequest) {
+        worker.lastApprovalHandler = input.onApprovalRequest;
+        if (worker.backgroundApprovals.signal.aborted) worker.backgroundApprovals = new AbortController();
+      }
+      const swarmCmd = parseSwarmCommand(input.text);
+      if (swarmCmd?.task) {
+        if (worker.sessionId) this.stoppedSwarmSessions.delete(worker.sessionId);
+        const now = Date.now();
+        worker.swarm = {
+          active: true,
+          stoppedByUser: false,
+          title: swarmCmd.task.slice(0, 300),
+          startedAt: now,
+          updatedAt: now,
+          ownerTurn: turn,
+          members: new Map(),
+          posts: [],
+        };
+      } else if (worker.swarm?.active && input.onEngineEvent) {
+        worker.swarm.ownerTurn = turn;
+      }
       if (worker.announceSession) {
         worker.announceSession = false;
         this.emit(turn, { type: "session", sessionId: worker.sessionId! });
@@ -936,14 +1122,69 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     });
   }
 
+  private markSwarmStopped(swarm: AcpSwarmState, sessionId?: string | null): void {
+    const now = Date.now();
+    swarm.active = false;
+    swarm.stoppedByUser = true;
+    swarm.updatedAt = now;
+    if (sessionId) this.stoppedSwarmSessions.add(sessionId);
+    for (const member of swarm.members.values()) {
+      if (member.state === "working" || member.state === "waiting" || member.state === "paused") {
+        member.state = "killed";
+        member.updatedAt = now;
+      }
+    }
+  }
+
+  private hasOpenBackgroundTools(worker: Worker): boolean {
+    for (const tool of worker.tools.values()) {
+      if (tool.background && (tool.status === "pending" || tool.status === "in_progress")) return true;
+    }
+    return false;
+  }
+
+  private async isSwarmActive(worker: Worker): Promise<boolean> {
+    if (worker.swarm?.stoppedByUser) return false;
+    if (worker.swarm?.active) {
+      if (worker.sessionId) {
+        const fileSwarm = await readSwarmBoardFiles(this.brainDir, worker.sessionId);
+        if (fileSwarm.found && fileSwarm.members.length > 0 && !fileSwarm.active) {
+          worker.swarm.active = false;
+          return false;
+        }
+      }
+      return true;
+    }
+    if (!worker.sessionId) return false;
+    const fileSwarm = await readSwarmBoardFiles(this.brainDir, worker.sessionId);
+    return fileSwarm.active;
+  }
+
   private requestStop(turn: Turn, killOptions?: { graceMs: number }): void {
     if (turn.done || turn.stopRequested) return;
     turn.stopRequested = true;
     turn.stopKillOptions = killOptions;
     turn.approvals.abort();
-    if (!turn.prompts.length) { this.settleTurn(turn, new Error(STOPPED_BY_USER)); return; }
     const worker = turn.worker;
+    const swarmKnownActive = Boolean(worker.swarm?.active && !worker.swarm.stoppedByUser);
+    if (swarmKnownActive && worker.swarm) {
+      this.markSwarmStopped(worker.swarm, worker.sessionId);
+      if (worker.wake?.timer) clearTimeout(worker.wake.timer);
+      worker.wake = null;
+      worker.backgroundApprovals.abort();
+    }
+    if (!turn.prompts.length) {
+      this.settleTurn(turn, new Error(STOPPED_BY_USER));
+      if (swarmKnownActive) void this.closeWorker(worker, new Error(STOPPED_BY_USER), killOptions);
+      return;
+    }
     void worker.connection.agent.notify(acpMethods.agent.session.cancel, { sessionId: worker.sessionId! }).catch(() => undefined);
+    if (swarmKnownActive) {
+      // Closing the ACP session guarantees every background swarm worker ends instead of continuing to burn quota.
+      void this.closeWorker(worker, new Error(STOPPED_BY_USER), killOptions);
+      return;
+    }
+    void this.checkAndCloseSwarmOnStop(worker, turn, killOptions);
     turn.stopTimer = setTimeout(() => {
       if (turn.done) return;
       // agy did not confirm the stop: closing the session ends its work.
@@ -952,15 +1193,49 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     turn.stopTimer.unref?.();
   }
 
+  private async checkAndCloseSwarmOnStop(worker: Worker, turn: Turn, killOptions?: { graceMs: number }): Promise<void> {
+    if (worker.removed || worker.closing || !worker.sessionId) return;
+    const fileSwarm = await readSwarmBoardFiles(this.brainDir, worker.sessionId);
+    if (!fileSwarm.active || worker.removed || worker.closing || !turn.stopRequested) return;
+    if (worker.sessionId) this.stoppedSwarmSessions.add(worker.sessionId);
+    worker.swarm = {
+      active: false,
+      stoppedByUser: true,
+      ...(fileSwarm.title ? { title: fileSwarm.title } : {}),
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      members: new Map(),
+      posts: [],
+    };
+    if (worker.wake?.timer) clearTimeout(worker.wake.timer);
+    worker.wake = null;
+    worker.backgroundApprovals.abort();
+    await this.closeWorker(worker, new Error(STOPPED_BY_USER), killOptions);
+  }
+
   private armTimers(turn: Turn): void {
     if (turn.timeoutsDisabled) return;
-    if (this.turnTimeoutMs && this.turnTimeoutMs > 0) {
-      turn.totalTimer = setTimeout(() => {
-        void this.closeWorker(turn.worker, new Error(`Antigravity ACP turn timed out after ${Math.max(1, Math.round(this.turnTimeoutMs! / 60_000))} minutes`));
-      }, this.turnTimeoutMs);
-      turn.totalTimer.unref?.();
-    }
+    this.armTotalTimeout(turn);
     this.armInactivity(turn);
+  }
+
+  private armTotalTimeout(turn: Turn): void {
+    if (turn.totalTimer) clearTimeout(turn.totalTimer);
+    turn.totalTimer = undefined;
+    if (turn.timeoutsDisabled || !this.turnTimeoutMs || this.turnTimeoutMs <= 0) return;
+    turn.totalTimer = setTimeout(() => {
+      void this.onTotalTimeout(turn);
+    }, this.turnTimeoutMs);
+    turn.totalTimer.unref?.();
+  }
+
+  private async onTotalTimeout(turn: Turn): Promise<void> {
+    if (turn.done || turn.stopRequested || turn.worker.removed) return;
+    if (await this.isSwarmActive(turn.worker)) {
+      this.armTotalTimeout(turn);
+      return;
+    }
+    await this.closeWorker(turn.worker, new Error(`Antigravity ACP turn timed out after ${Math.max(1, Math.round(this.turnTimeoutMs! / 60_000))} minutes`));
   }
 
   private armInactivity(turn: Turn): void {
@@ -968,9 +1243,18 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     turn.inactivityTimer = undefined;
     if (turn.timeoutsDisabled || !this.inactivityTimeoutMs || this.inactivityTimeoutMs <= 0) return;
     turn.inactivityTimer = setTimeout(() => {
-      void this.closeWorker(turn.worker, new Error(`Antigravity ACP turn became inactive after ${Math.max(1, Math.round(this.inactivityTimeoutMs! / 60_000))} minutes`));
+      void this.onInactivityTimeout(turn);
     }, this.inactivityTimeoutMs);
     turn.inactivityTimer.unref?.();
+  }
+
+  private async onInactivityTimeout(turn: Turn): Promise<void> {
+    if (turn.done || turn.stopRequested || turn.worker.removed) return;
+    if (await this.isSwarmActive(turn.worker)) {
+      this.armInactivity(turn);
+      return;
+    }
+    await this.closeWorker(turn.worker, new Error(`Antigravity ACP turn became inactive after ${Math.max(1, Math.round(this.inactivityTimeoutMs! / 60_000))} minutes`));
   }
 
   private clearTimers(turn: Turn): void {
@@ -1002,6 +1286,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       const next = readSelectOptions(update.configOptions);
       if (next.length) worker.configOptions = next;
     } else if (kind === "available_commands_update" && Array.isArray(update.availableCommands)) {
+      this.commandsReceived = true;
       this.commands = update.availableCommands.flatMap((item) => {
         const command = asRecord(item);
         if (!command || typeof command.name !== "string" || !NATIVE_COMMAND_NAME.test(command.name)) return [];
@@ -1009,6 +1294,22 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       }).slice(0, MAX_NATIVE_COMMANDS);
     }
     const turn = worker.turn;
+    const isSwarmUpdate = (typeof kind === "string" && kind.startsWith("swarm"))
+      || Boolean(extractWorkerAttribution({ _meta: update._meta, toolCall: update }))
+      || (typeof update.name === "string" && /swarm|board/i.test(update.name));
+    if (isSwarmUpdate && !worker.swarm?.stoppedByUser) {
+      const now = Date.now();
+      worker.swarm ??= {
+        active: true,
+        stoppedByUser: false,
+        startedAt: now,
+        updatedAt: now,
+        ...(turn ? { ownerTurn: turn } : {}),
+        members: new Map(),
+        posts: [],
+      };
+      applySwarmAcpUpdate(worker.swarm, update, now);
+    }
     if (kind === "tool_call" || kind === "tool_call_update") this.trackTool(worker, update, turn);
     if (kind === "usage_update") {
       // A model call after a still-running tool means the model left it running in the background.
@@ -1034,9 +1335,11 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   private trackWake(worker: Worker, kind: unknown, update: Record<string, unknown>): void {
+    if (worker.swarm?.stoppedByUser) return;
     if (kind !== "agent_message_chunk" && kind !== "agent_thought_chunk" && kind !== "tool_call" && kind !== "tool_call_update" && kind !== "usage_update") return;
     if (kind === "usage_update" && !worker.wake) return;
     const wake = worker.wake ??= { text: "", openTools: new Set() };
+    if (worker.swarm?.ownerTurn?.onEngineEvent) wake.owner ??= worker.swarm.ownerTurn.onEngineEvent;
     if (wake.timer) clearTimeout(wake.timer);
     wake.timer = undefined;
     const id = typeof update.toolCallId === "string" ? update.toolCallId : undefined;
@@ -1044,6 +1347,11 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (kind === "agent_message_chunk") {
       const content = asRecord(update.content);
       if (content?.type === "text" && typeof content.text === "string") wake.text += content.text;
+      if (!wake.openTools.size && wake.text.trim()) {
+        wake.timer = setTimeout(() => this.flushWake(worker), Math.max(this.wakeQuietMs * 2, 200));
+        wake.timer.unref?.();
+      }
+      return;
     } else if (kind === "tool_call" && id && !finished) {
       wake.openTools.add(id);
     } else if (kind === "tool_call_update" && id && finished) {
@@ -1064,6 +1372,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (!wake) return;
     worker.wake = null;
     if (wake.timer) clearTimeout(wake.timer);
+    if (worker.swarm?.stoppedByUser) return;
     const text = wake.text.trim();
     const handler = wake.owner ?? worker.lastTurnHandler;
     if (!text || !handler || !worker.sessionId) return;
@@ -1085,6 +1394,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (typeof update.kind === "string") tool.kind = update.kind;
     if (update.rawInput !== undefined) tool.rawInput = update.rawInput;
     if (typeof update.status === "string") tool.status = update.status;
+    const attributed = extractWorkerAttribution({ _meta: update._meta, toolCall: update }, tool.workerName);
+    if (attributed) tool.workerName = attributed;
     tool.updatedAt = now;
     const owner = tool.turn && !tool.turn.done ? tool.turn : undefined;
     if (!owner) return;
@@ -1108,43 +1419,168 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
   }
 
+  private async resolveApprovalContext(worker: Worker, workerName: string | undefined): Promise<{
+    turn: Turn | null;
+    handler: CodexUserMessageInput["onApprovalRequest"] | undefined;
+    signal: AbortSignal;
+    isBackground: boolean;
+  }> {
+    const turn = worker.turn;
+    if (turn && !turn.done && !turn.stopRequested) {
+      return { turn, handler: turn.onApprovalRequest, signal: turn.approvals.signal, isBackground: false };
+    }
+    // After the coordinator turn finishes, swarm workers or background tasks may still request approvals or ask questions.
+    const canRouteBackground = Boolean(worker.lastApprovalHandler)
+      && !worker.backgroundApprovals.signal.aborted
+      && !worker.swarm?.stoppedByUser
+      && (Boolean(workerName) || this.hasOpenBackgroundTools(worker) || await this.isSwarmActive(worker));
+    if (canRouteBackground) {
+      return { turn: null, handler: worker.lastApprovalHandler, signal: worker.backgroundApprovals.signal, isBackground: true };
+    }
+    return { turn: null, handler: undefined, signal: worker.backgroundApprovals.signal, isBackground: false };
+  }
+
   private async handlePermission(worker: Worker, request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     if (!worker || worker.removed || request.sessionId !== worker.sessionId) return { outcome: { outcome: "cancelled" } };
     this.markActivity(worker);
     const option = (kind: string) => request.options.find((candidate) => candidate.kind === kind)?.optionId;
     const reject = option("reject_once");
-    const turn = worker.turn;
-    // A request made while no turn owns this session (an idle wake-up) has no
-    // owner who could answer it: it is declined, never borrowed by another turn.
-    if (!turn || turn.done || turn.stopRequested || !turn.onApprovalRequest) {
+    const toolCall = request.toolCall as unknown as Record<string, unknown>;
+    const trackedTool = typeof toolCall.toolCallId === "string" ? worker.tools.get(toolCall.toolCallId) : undefined;
+    const workerName = extractWorkerAttribution(request, trackedTool?.workerName);
+    const ctx = await this.resolveApprovalContext(worker, workerName);
+    if (!ctx.handler) {
       return reject ? { outcome: { outcome: "selected", optionId: reject } } : { outcome: { outcome: "cancelled" } };
     }
-    const toolCall = request.toolCall as unknown as Record<string, unknown>;
-    const toolName = typeof toolCall.name === "string" && toolCall.name ? toolCall.name : typeof toolCall.title === "string" && toolCall.title ? toolCall.title : "Antigravity tool";
+    const rawName = typeof toolCall.name === "string" && toolCall.name ? toolCall.name : typeof toolCall.title === "string" && toolCall.title ? toolCall.title : "Antigravity tool";
+    const rawInputRecord = asRecord(toolCall.rawInput);
+    const isQuestion = rawName === "AskUserQuestion" || rawName === "ask_user_question" || Array.isArray(rawInputRecord?.questions);
+    const toolName = isQuestion ? "AskUserQuestion" : rawName;
     const allow = option("allow_once");
+    const questionInput = isQuestion && !Array.isArray(rawInputRecord?.questions)
+      ? {
+          questions: [{
+            question: (typeof toolCall.title === "string" && toolCall.title.trim()) || "Choose an option.",
+            header: workerName ? `${workerName}` : "Question",
+            multi_select: false,
+            options: request.options.filter((opt) => opt.kind === "allow_once" || opt.kind === "allow_always").map((opt) => ({ label: opt.name })),
+          }],
+        }
+      : (toolCall.rawInput ?? {});
     const approval: EngineApprovalRequest = {
       engine: "antigravity",
       toolName,
-      toolInput: toolCall.rawInput ?? {},
+      toolInput: isQuestion ? questionInput : (toolCall.rawInput ?? {}),
+      ...(workerName ? { workerName } : {}),
       cwd: worker.workspacePath,
       sessionId: worker.sessionId!,
-      abortSignal: turn.approvals.signal,
+      abortSignal: ctx.signal,
       approvalScopes: allow ? { once: "once" } : {},
     };
-    if (typeof toolCall.toolCallId === "string") this.emit(turn, { type: "permission_request", toolName, toolInput: approval.toolInput, toolUseId: toolCall.toolCallId, sessionId: worker.sessionId! });
+    if (typeof toolCall.toolCallId === "string") {
+      const permEvent: EngineStreamEvent = { type: "permission_request", toolName, toolInput: approval.toolInput, toolUseId: toolCall.toolCallId, sessionId: worker.sessionId! };
+      if (ctx.turn) this.emit(ctx.turn, permEvent);
+      else if (worker.lastTurnHandler) void Promise.resolve(worker.lastTurnHandler(permEvent)).catch(() => undefined);
+    }
     worker.pendingPermissions += 1;
     let decision: EngineApprovalDecision;
     try {
-      decision = await turn.onApprovalRequest(approval);
+      decision = await ctx.handler(approval);
     } catch {
       decision = { behavior: "deny" };
     } finally {
       worker.pendingPermissions = Math.max(0, worker.pendingPermissions - 1);
     }
-    if (turn.approvals.signal.aborted || turn.done) return { outcome: { outcome: "cancelled" } };
-    if (decision.behavior === "allow" && allow) return { outcome: { outcome: "selected", optionId: allow } };
-    if (decision.behavior === "deny") turn.declinedAt = turn.text.length;
+    if (ctx.signal.aborted || (ctx.turn && ctx.turn.done) || worker.removed || worker.closing) return { outcome: { outcome: "cancelled" } };
+    if (decision.behavior === "allow") {
+      if (isQuestion) {
+        const answers = asRecord(asRecord(decision.updatedInput)?.answers);
+        const firstAnswer = answers ? Object.values(answers).find((v): v is string => typeof v === "string" && Boolean(v.trim()))?.trim() : undefined;
+        const matched = firstAnswer ? request.options.find((opt) => opt.name.trim().toLowerCase() === firstAnswer.toLowerCase()) : undefined;
+        if (matched) return { outcome: { outcome: "selected", optionId: matched.optionId }, ...(decision.updatedInput !== undefined ? { _meta: { updatedInput: decision.updatedInput } } : {}) } as RequestPermissionResponse;
+        if (allow) return { outcome: { outcome: "selected", optionId: allow }, ...(decision.updatedInput !== undefined ? { _meta: { updatedInput: decision.updatedInput } } : {}) } as RequestPermissionResponse;
+      } else if (allow) {
+        return { outcome: { outcome: "selected", optionId: allow } };
+      }
+    }
+    if (decision.behavior === "deny" && ctx.turn) ctx.turn.declinedAt = ctx.turn.text.length;
     return reject ? { outcome: { outcome: "selected", optionId: reject } } : { outcome: { outcome: "cancelled" } };
+  }
+
+  private async handleElicitation(worker: Worker, request: CreateElicitationRequest): Promise<CreateElicitationResponse> {
+    if (!worker || worker.removed || !CreateElicitationRequestGuard.isForm(request) || !("sessionId" in request) || request.sessionId !== worker.sessionId) {
+      return { action: "cancel" };
+    }
+    this.markActivity(worker);
+    const workerName = extractWorkerAttribution(request);
+    const ctx = await this.resolveApprovalContext(worker, workerName);
+    if (!ctx.handler) return { action: "decline" };
+
+    const properties = request.requestedSchema.properties ?? {};
+    const entries = Object.entries(properties);
+    if (!entries.length) return { action: "decline" };
+    const required = new Set(request.requestedSchema.required ?? []);
+    const fieldMap: Array<{ key: string; answerKey: string; multiSelect: boolean; options: Array<{ label: string; value: string }> }> = [];
+    const questions = entries.map(([key, schema]: [string, ElicitationPropertySchema], index) => {
+      const header = (typeof schema.title === "string" && schema.title.trim()) || request.requestedSchema.title?.trim() || `Question ${index + 1}`;
+      const questionText = (typeof schema.description === "string" && schema.description.trim()) || (entries.length === 1 ? request.message.trim() : "") || header;
+      const options: Array<{ label: string; value: string; description?: string }> = [];
+      if (schema.type === "string" && Array.isArray(schema.oneOf)) {
+        for (const opt of schema.oneOf) options.push({ label: opt.title.trim() || opt.const, value: opt.const, ...(opt.description?.trim() ? { description: opt.description.trim() } : {}) });
+      } else if (schema.type === "string" && Array.isArray(schema.enum)) {
+        for (const v of schema.enum) options.push({ label: v, value: v });
+      } else if (schema.type === "array" && schema.items && typeof schema.items === "object") {
+        if ("anyOf" in schema.items && Array.isArray(schema.items.anyOf)) {
+          for (const opt of schema.items.anyOf) options.push({ label: opt.title.trim() || opt.const, value: opt.const, ...(opt.description?.trim() ? { description: opt.description.trim() } : {}) });
+        } else if ("enum" in schema.items && Array.isArray(schema.items.enum)) {
+          for (const v of schema.items.enum) options.push({ label: v, value: v });
+        }
+      }
+      const multiSelect = schema.type === "array";
+      fieldMap.push({ key, answerKey: questionText, multiSelect, options });
+      return {
+        question: questionText,
+        header,
+        multi_select: multiSelect,
+        required: required.has(key),
+        allowFreeText: true,
+        options: options.map(({ label, description }) => ({ label, ...(description ? { description } : {}) })),
+      };
+    });
+
+    const approval: EngineApprovalRequest = {
+      engine: "antigravity",
+      toolName: "AskUserQuestion",
+      toolInput: { questions },
+      ...(workerName ? { workerName } : {}),
+      cwd: worker.workspacePath,
+      sessionId: worker.sessionId!,
+      abortSignal: ctx.signal,
+    };
+    worker.pendingPermissions += 1;
+    let decision: EngineApprovalDecision;
+    try {
+      decision = await ctx.handler(approval);
+    } catch {
+      decision = { behavior: "deny" };
+    } finally {
+      worker.pendingPermissions = Math.max(0, worker.pendingPermissions - 1);
+    }
+    if (ctx.signal.aborted || (ctx.turn && ctx.turn.done) || worker.removed || worker.closing) return { action: "cancel" };
+    if (decision.behavior !== "allow") return { action: "decline" };
+    const answers = asRecord(asRecord(decision.updatedInput)?.answers) ?? {};
+    const content: Record<string, string | string[]> = {};
+    for (const field of fieldMap) {
+      const raw = answers[field.answerKey] ?? answers[field.key];
+      if (typeof raw !== "string" || !raw.trim()) continue;
+      if (field.multiSelect) {
+        const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+        content[field.key] = parts.map((part) => field.options.find((o) => o.label === part)?.value ?? part);
+      } else {
+        content[field.key] = field.options.find((o) => o.label === raw.trim())?.value ?? raw.trim();
+      }
+    }
+    return { action: "accept", content };
   }
 
   private withStderr(worker: Worker, error: Error): Error {
@@ -1170,6 +1606,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
 
   private removeWorker(worker: Worker): void {
     worker.removed = true;
+    worker.backgroundApprovals.abort();
     worker.rejectStart?.(worker.failure ?? new Error("Antigravity ACP worker is no longer available"));
     for (const [key, candidate] of this.workers) if (candidate === worker) this.workers.delete(key);
   }
@@ -1197,19 +1634,27 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     return worker.closing;
   }
 
-  private reapIdleWorkers(): void {
-    const now = Date.now();
-    for (const worker of new Set(this.workers.values())) {
-      if (worker.removed || worker.turn || worker.reserved || now - worker.lastActivityAt < this.idleWorkerTtlMs) continue;
-      if (!this.isReapable(worker)) continue;
-      void this.closeWorker(worker);
+  private async reapIdleWorkers(): Promise<void> {
+    if (this.reaping) return;
+    this.reaping = true;
+    try {
+      const now = Date.now();
+      for (const worker of new Set(this.workers.values())) {
+        if (worker.removed || worker.turn || worker.reserved || now - worker.lastActivityAt < this.idleWorkerTtlMs) continue;
+        if (!await this.isReapable(worker)) continue;
+        void this.closeWorker(worker);
+      }
+    } finally {
+      this.reaping = false;
     }
   }
 
-  /** Closing a session stops its background commands, so a session still running one is kept.
+  /** Closing a session stops its background commands and swarm workers, so a session still running one is kept.
    * An open wake-up is delivered by closeWorker; a live one keeps the worker active anyway. */
-  private isReapable(worker: Worker): boolean {
-    for (const tool of worker.tools.values()) if (tool.background && (tool.status === "pending" || tool.status === "in_progress")) return false;
+  private async isReapable(worker: Worker): Promise<boolean> {
+    if (worker.pendingPermissions > 0) return false;
+    if (this.hasOpenBackgroundTools(worker)) return false;
+    if (await this.isSwarmActive(worker)) return false;
     return true;
   }
 

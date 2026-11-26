@@ -438,8 +438,8 @@ export function isCoreLocalEngineCommand(text: string): boolean {
   // here — matching it swallowed the message into a handler that returns false,
   // and it then reached the engine as plain prompt text anyway. Removed from the
   // predicate and from /help; use `/ultrareview` for the deep review path.
-  // Claude-local engine command path.
-  return /^\/(?:compact|context|ultrareview)(?:\s|$)/i.test(text.trim());
+  // Claude-local engine command path, plus Antigravity `/swarm` capability gate.
+  return /^\/(?:compact|context|ultrareview|swarm)(?:\s|$)/i.test(text.trim());
 }
 
 async function handleCoreLocalEngineCommand(

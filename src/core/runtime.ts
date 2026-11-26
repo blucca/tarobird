@@ -107,6 +107,8 @@ export interface PendingCoreApproval {
   replyInThread?: boolean;
   askUserQuestionInput?: unknown;
   approvalEngine?: EngineApprovalRequest["engine"];
+  /** Optional swarm/subagent worker name requesting the approval or question. */
+  approvalWorkerName?: string;
   /** Tool name/input of a regular (non-AskUserQuestion) approval, kept so the decision handler can re-render the card in place as resolved. */
   approvalToolName?: string;
   approvalToolInput?: unknown;

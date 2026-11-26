@@ -981,6 +981,17 @@ export class Bridge {
     return this.adapter.advertisedCommands?.() ?? [];
   }
 
+  hasReceivedAdvertisedCommands(): boolean {
+    return this.adapter.hasReceivedAdvertisedCommands?.() ?? false;
+  }
+
+  async stopBackgroundWork(input: { chatId: number; conversationKey: string; locale?: "en" | "zh" }): Promise<{ stopped: boolean; summary?: string }> {
+    if (!this.adapter.stopBackgroundWork || !this.sessionManager.getExistingSession) return { stopped: false };
+    const session = await this.sessionManager.getExistingSession(this.conversationScope(input));
+    if (!session) return { stopped: false };
+    return this.adapter.stopBackgroundWork(session.sessionId, { locale: input.locale });
+  }
+
   async listTasks(input: { chatId: number; conversationKey: string }): Promise<EngineTaskSnapshot> {
     if (!this.adapter.listTasks || !this.sessionManager.getExistingSession) return { supported: false, tasks: [] };
     const session = await this.sessionManager.getExistingSession(this.conversationScope(input));
