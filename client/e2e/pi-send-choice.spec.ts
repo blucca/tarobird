@@ -179,3 +179,55 @@ for (const navigate of [false, true]) test(`Pi editing during confirmed admissio
     await expect.poll(() => fixture.inputs).toEqual(['再次核对', '再次核对']);
   } finally { await page.close(); await fixture.close(); }
 });
+
+for (const platform of ['ios', 'android']) test(`${platform}: phone running turn omits inline summary text and keeps controls unclipped across 320-440px`, async ({ browser }) => {
+  const fixture = await piSendChoiceFixture();
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, serviceWorkers: 'block' });
+  const page = await context.newPage();
+  try {
+    await page.route('**/api/conversations/*/pi-session*', route => route.fulfill({
+      json: { supported: true, session: { token: 'worker', model: 'claude-sonnet-4-5', modelSource: 'native', thinking: 'medium', thinkingLevels: ['off', 'medium', 'high'], choices: [{ id: 'claude-sonnet-4-5', label: 'claude-sonnet-4-5', provider: 'anthropic' }], busy: true, bridge: 'connected', ui: { status: {}, widgets: {} }, commands: [] } },
+    }));
+    await open(page, fixture);
+    await page.evaluate(p => { document.documentElement.dataset.platform = p; }, platform);
+    for (const locale of ['zh', 'en']) {
+      if (locale === 'en') {
+        const { openSettings, closeSettings } = await import('./fixtures/settings.js');
+        await openSettings(page); await page.getByLabel('语言', { exact: true }).selectOption('en'); await closeSettings(page, true);
+        await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Message', exact: true }).click();
+        await page.locator('.mobile-home:visible .mh-row').filter({ hasText: fixture.chats[0]!.title }).click();
+        await page.evaluate(p => { document.documentElement.dataset.platform = p; }, platform);
+      }
+      const input = page.getByRole('textbox', { name: locale === 'zh' ? '消息' : 'Message', exact: true });
+      const choice = page.locator('.claude-send-choice');
+      const help = choice.locator('.send-choice-help');
+      await expect(page.locator('.send-choice-summary')).toHaveCount(0);
+      await expect(page.locator('.composer-accessories')).not.toContainText(locale === 'zh' ? '由 CLI 适时读入' : 'Read by the CLI');
+      await expect(help).toBeVisible();
+      for (const width of [320, 360, 390, 440]) {
+        await page.setViewportSize({ width, height: 844 });
+        await expect(choice).toBeVisible();
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+        const [chipRect, choiceRect] = await page.evaluate(() => ['.pi-session-controls', '.claude-send-choice'].map(selector => {
+          const r = document.querySelector(selector)!.getBoundingClientRect();
+          return { x: r.x, y: r.y, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+        }));
+        const sameRow = Math.abs(chipRect.y - choiceRect.y) < 16;
+        if (sameRow) expect(chipRect.right).toBeLessThanOrEqual(choiceRect.x + 1);
+        else expect(chipRect.bottom).toBeLessThanOrEqual(choiceRect.y + 1);
+        for (const control of [choice.locator('[data-mode=current]'), choice.locator('[data-mode=next]'), help, page.locator('.composer-stop')]) {
+          const box = (await control.boundingBox())!;
+          expect(box.height).toBeGreaterThanOrEqual(44);
+          expect(box.width).toBeGreaterThanOrEqual(44);
+          expect(await control.evaluate(n => n.scrollWidth <= n.clientWidth && n.scrollHeight <= n.clientHeight)).toBe(true);
+        }
+      }
+      await help.click();
+      const dialog = page.locator('.send-choice-explanation');
+      await expect(dialog).toBeVisible();
+      await dialog.getByRole('button', { name: locale === 'zh' ? '关闭发送方式说明' : 'Close send mode help', exact: true }).click();
+      await expect(help).toBeFocused();
+      await expect(input).toHaveValue('');
+    }
+  } finally { await context.close(); await fixture.close(); }
+});
