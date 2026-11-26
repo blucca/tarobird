@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Check, Cloud, Copy, LoaderCircle, Play, Plus, Square, Trash2 } from "lucide-react";
 import {
+  cloudflareOriginSchema,
   cloudflareViewSchema,
   HOST_CLOUDFLARE_PATH,
   HOST_CLOUDFLARE_QUICK_PATH,
@@ -12,9 +13,30 @@ import { MAX_CLOUDFLARE_ROUTES } from "../../src/client-protocol/routes.js";
 import type { HubConnection } from "./connection.js";
 import { writeClipboardText } from "./clipboard-write.js";
 import { ConnectionInviteCode } from "./ConnectionInviteCode.js";
-import { localCloudflareRoutes } from "./local-relay-routes.js";
+import { HubHttpError } from "./http-error.js";
 import { SettingsGroupHeading } from "./SettingsParts.js";
 import { t, useLocale } from "./i18n.js";
+
+function isUnsupportedHostError(cause: unknown): boolean {
+  if (cause instanceof HubHttpError) return cause.status === 404 || cause.code === "not_found";
+  return cause instanceof Error && (cause.message === "not_found" || cause.message === "404");
+}
+
+function saveErrorMessage(cause: unknown): string {
+  if (cause instanceof HubHttpError) {
+    if (cause.status === 401 || cause.status === 403) return t("当前设备没有修改 Cloudflare 隧道配置的权限，请重新连接后重试。");
+    if (cause.status === 404 || cause.code === "not_found") return t("此主机需要更新后才能设置 Cloudflare 隧道。");
+  }
+  return t("保存失败，请确认地址为公网 HTTPS 域名且未重复。");
+}
+
+function quickTunnelErrorMessage(cause: unknown): string {
+  const code = cause instanceof HubHttpError ? cause.code : cause instanceof Error ? cause.message : "";
+  if (code.includes("cloudflared_not_installed")) return t("未检测到 cloudflared，请先在主机安装 cloudflared（例如 brew install cloudflared）。");
+  if (code.includes("cloudflared_start_timeout")) return t("Quick Tunnel 启动超时，请检查网络连接或切换为 HTTP/2（--protocol http2）后重试。");
+  if (code.includes("cloudflared_stopped")) return t("Quick Tunnel 已停止。");
+  return t("Quick Tunnel 操作失败，请检查网络连接或切换为 HTTP/2（--protocol http2）后重试。");
+}
 
 /** First-class DIY Cloudflare Tunnel entry on the Host (zero hosted relay cost).
  * Lets the owner detect cloudflared, choose Quick vs Named Tunnel and HTTP/2 vs QUIC,
@@ -22,9 +44,10 @@ import { t, useLocale } from "./i18n.js";
 export function LocalCloudflareSettings({ connection, dirtyChange, busyChange }: { connection: HubConnection; dirtyChange: (dirty: boolean) => void; busyChange: (busy: boolean) => void }) {
   useLocale();
   const state = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);
-  const available = state.status === "online" && state.user?.role === "owner";
+  const available = state.status === "online" && state.cloudflareRoutesAvailable === true && state.user?.role === "owner";
   const [view, setView] = useState<CloudflareView>();
   const [loading, setLoading] = useState(true);
+  const [unsupported, setUnsupported] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [mode, setMode] = useState<CloudflareMode>("named");
   const [protocol, setProtocol] = useState<CloudflareProtocol>("http2");
@@ -48,15 +71,18 @@ export function LocalCloudflareSettings({ connection, dirtyChange, busyChange }:
   };
 
   useEffect(() => {
-    if (!available) { setLoading(false); return; }
+    if (!available) { setLoading(false); setError(""); setNotice(""); return; }
     let active = true;
     setLoading(true);
+    setUnsupported(false);
     setError("");
     void connection.http(HOST_CLOUDFLARE_PATH).then(raw => {
       if (!active) return;
       applyView(cloudflareViewSchema.parse(raw));
-    }).catch(() => {
-      if (active) setError(t("未能读取 Cloudflare 隧道配置，请重试。"));
+    }).catch((cause: unknown) => {
+      if (!active) return;
+      if (isUnsupportedHostError(cause)) setUnsupported(true);
+      else setError(t("未能读取 Cloudflare 隧道配置，请重试。"));
     }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [connection, available, attempt]);
@@ -71,39 +97,44 @@ export function LocalCloudflareSettings({ connection, dirtyChange, busyChange }:
     catch { setError(t("复制失败，请手动选中命令复制。")); }
   };
 
-  const syncAdvertisedCloudflare = async (nextOrigins: string[]) => {
-    if (!state.networkAvailable) return;
-    const fresh = await connection.refreshNetwork();
-    if (!fresh || fresh.host.publicKey !== connection.identity.hubPublicKey) return;
-    const merged = localCloudflareRoutes(fresh.host.routes, nextOrigins);
-    await connection.networkCommand({ operation: "routes", networkId: fresh.membership?.manifest.id ?? "", routes: merged });
-  };
-
   const save = async () => {
-    if (busy || !available) return;
-    setBusy(true); setError(""); setNotice("");
+    if (busy || !available || unsupported) return;
+    setError(""); setNotice("");
+    const cleaned = origins.map(item => item.trim()).filter(Boolean);
+    const normalized: string[] = [];
+    for (const rawOrigin of cleaned) {
+      const parsed = cloudflareOriginSchema.safeParse(rawOrigin);
+      if (!parsed.success) {
+        setError(t("Cloudflare Tunnel 必须使用公网 HTTPS 地址（不能使用 HTTP 或本机回环地址）。"));
+        return;
+      }
+      if (normalized.includes(parsed.data)) {
+        setError(t("保存失败，请确认地址为公网 HTTPS 域名且未重复。"));
+        return;
+      }
+      normalized.push(parsed.data);
+    }
+    setBusy(true);
     try {
-      const cleaned = origins.map(item => item.trim()).filter(Boolean);
       const raw = await connection.http(HOST_CLOUDFLARE_PATH, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, protocol, origins: cleaned }),
+        body: JSON.stringify({ mode, protocol, origins: normalized }),
       });
       if (!mounted.current) return;
       const updated = cloudflareViewSchema.parse(raw);
       applyView(updated);
-      const advertised = updated.activeUrl && !updated.origins.includes(updated.activeUrl)
-        ? [...updated.origins, updated.activeUrl] : updated.origins;
-      await syncAdvertisedCloudflare(advertised).catch(() => undefined);
-      if (!mounted.current) return;
       setNotice(t("Cloudflare 隧道配置已保存。已授权域名可在配对和远程访问时通过身份验证。"));
     } catch (cause) {
-      if (mounted.current) setError(cause instanceof Error && /[\u3400-\u9fff]/.test(cause.message) ? cause.message : t("保存失败，请确认地址为公网 HTTPS 域名且未重复。"));
+      if (mounted.current) {
+        if (isUnsupportedHostError(cause)) setUnsupported(true);
+        else setError(saveErrorMessage(cause));
+      }
     } finally { if (mounted.current) setBusy(false); }
   };
 
   const toggleQuick = async (action: "start" | "stop") => {
-    if (busy || !available) return;
+    if (busy || !available || unsupported) return;
     setBusy(true); setError(""); setNotice("");
     try {
       const raw = await connection.http(HOST_CLOUDFLARE_QUICK_PATH, {
@@ -113,23 +144,40 @@ export function LocalCloudflareSettings({ connection, dirtyChange, busyChange }:
       });
       if (!mounted.current) return;
       const updated = cloudflareViewSchema.parse(raw);
-      applyView(updated);
+      // Preserve unsaved domain edits while updating live runtime status and baseline.
+      setView(updated);
+      setBaseline(JSON.stringify({ mode: updated.mode, protocol: updated.protocol, origins: updated.origins }));
+      if (action === "start") {
+        setMode(updated.mode);
+        setProtocol(updated.protocol);
+      }
       setNotice(action === "start" ? t("Quick Tunnel 已启动，可使用下方临时 HTTPS 地址或二维码测试连接。") : t("Quick Tunnel 已停止。"));
     } catch (cause) {
-      if (mounted.current) setError(cause instanceof Error && cause.message.includes("cloudflared_not_installed")
-        ? t("未检测到 cloudflared，请先在主机安装 cloudflared（例如 brew install cloudflared）。")
-        : t("Quick Tunnel 操作失败，请检查网络连接或切换为 HTTP/2（--protocol http2）后重试。"));
+      if (mounted.current) {
+        if (isUnsupportedHostError(cause)) setUnsupported(true);
+        else setError(quickTunnelErrorMessage(cause));
+      }
     } finally { if (mounted.current) setBusy(false); }
   };
 
-  const recommendedCommand = view ? (mode === "named" ? view.commands.namedHttp2 : protocol === "http2" ? view.commands.quickHttp2 : view.commands.quickQuic) : "";
+  const recommendedCommand = view
+    ? (mode === "named"
+        ? (protocol === "http2" ? view.commands.namedHttp2 : view.commands.namedQuic)
+        : (protocol === "http2" ? view.commands.quickHttp2 : view.commands.quickQuic))
+    : "";
   const shareableUrls = view ? [...new Set([...(view.activeUrl ? [view.activeUrl] : []), ...view.origins])] : [];
 
   return <section className="local-cloudflare-settings" aria-label={t("自建 Cloudflare 隧道（DIY）")}>
     <SettingsGroupHeading>{t("自建 Cloudflare 隧道（DIY）")}</SettingsGroupHeading>
     <p className="settings-note">{t("使用你自己的 cloudflared 与 Cloudflare 免费隧道暴露本机，无需公网 IP 或自购 VPS；与局域网、Tailscale 和自建 VPS 可同时保留。")}</p>
 
-    {!available ? <p role="status">{state.status !== "online" ? t("请等待本机连接恢复后设置 Cloudflare 隧道。") : t("需要主机所有者权限才能设置 Cloudflare 隧道。")}</p>
+    {!available || unsupported ? <p role="status">{
+      state.status !== "online" ? t("请等待本机连接恢复后设置 Cloudflare 隧道。")
+      : !state.user ? t("正在读取主机管理权限…")
+      : state.user.role !== "owner" ? t("需要主机所有者权限才能设置 Cloudflare 隧道。")
+      : state.cloudflareRoutesAvailable === false || unsupported ? t("此主机需要更新后才能设置 Cloudflare 隧道。")
+      : t("正在读取 Cloudflare 隧道能力…")
+    }</p>
       : loading ? <p role="status"><LoaderCircle className="spin" size={15}/> {t("正在检测 cloudflared 状态…")}</p>
       : view ? <>
         <div className="cf-status-bar">
@@ -188,8 +236,8 @@ export function LocalCloudflareSettings({ connection, dirtyChange, busyChange }:
           {origins.map((origin, index) => <div className="direct-route-entry" key={index}>
             <input type="url" inputMode="url" autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={2048}
               aria-label={t("Cloudflare 域名 {0}", index + 1)} placeholder="https://hub.example.com"
-              value={origin} disabled={busy} onChange={e => setOrigins(origins.map((v, i) => i === index ? e.target.value : v))}/>
-            <button type="button" className="icon-button" disabled={busy} aria-label={t("移除 Cloudflare 域名 {0}", index + 1)} onClick={() => setOrigins(origins.filter((_, i) => i !== index))}><Trash2 size={16}/></button>
+              value={origin} disabled={busy} onChange={e => { setOrigins(origins.map((v, i) => i === index ? e.target.value : v)); setError(""); }}/>
+            <button type="button" className="icon-button" disabled={busy} aria-label={t("移除 Cloudflare 域名 {0}", index + 1)} onClick={() => { setOrigins(origins.filter((_, i) => i !== index)); setError(""); }}><Trash2 size={16}/></button>
           </div>)}
           <div className="route-save-bar">
             <button type="button" className="primary" disabled={busy || !dirty} onClick={() => void save()}>{busy ? t("正在保存…") : t("保存 Cloudflare 配置")}</button>
@@ -211,7 +259,7 @@ export function LocalCloudflareSettings({ connection, dirtyChange, busyChange }:
         <p className="cf-expectation-note">{t("延迟与场景说明：Cloudflare 免费线路经由境外 Anycast 节点（中国大陆通常增加约 150–350 ms 往返延迟），适合聊天、Bot 控制、通知和 CLI 工作流；高帧率远程屏幕控制建议优先使用局域网、Tailscale 直连或就近自建 VPS。")}</p>
       </> : null}
 
-    {error && <p role="alert" className="error-text">{error} <button type="button" onClick={() => setAttempt(v => v + 1)}>{t("重试")}</button></p>}
-    {notice && <p role="status" className="settings-feedback">{notice}</p>}
+    {available && !unsupported && error && <p role="alert" className="error-text">{error}{!view && <> <button type="button" onClick={() => setAttempt(v => v + 1)}>{t("重试")}</button></>}</p>}
+    {available && !unsupported && notice && <p role="status" className="settings-feedback">{notice}</p>}
   </section>;
 }

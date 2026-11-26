@@ -18,7 +18,9 @@ export const MAX_PAIRING_LINK_LENGTH = 8192;
  * authenticated host-routes capability after pairing, never in an invalid QR. */
 export function connectionPairingPayload(hubPublicKey: string, local: readonly Route[], deployment?: Deployment, activeUrl?: string): Extract<PairingPayload, { kind: "connect" }> {
   const direct = local.find(route => isDirectRoute(route) && route.url === activeUrl) ?? local.find(route => route.name === "Tailscale") ?? local.find(route => route.name === "Direct");
-  const routes = routesSchema.parse([...(direct ? [direct] : []), ...local.filter(isRelayRoute)]);
+  const relays = local.filter(isRelayRoute);
+  const orderedRelays = activeUrl ? [...relays.filter(route => route.url === activeUrl), ...relays.filter(route => route.url !== activeUrl)] : relays;
+  const routes = routesSchema.parse([...(direct ? [direct] : []), ...orderedRelays]);
   return { v: 1, kind: "connect", hubPublicKey, routes, ...(deployment && deploymentMatchesRoutes(deployment, routes) ? { deployment } : {}) };
 }
 

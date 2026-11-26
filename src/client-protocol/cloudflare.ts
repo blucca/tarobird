@@ -3,6 +3,7 @@ import { MAX_CLOUDFLARE_ROUTES } from "./routes.js";
 import { edgeOriginSchema } from "./tls-identity.js";
 import { isLoopbackOrUnspecified } from "./loopback-address.js";
 
+export const HOST_CLOUDFLARE_CAPABILITY = "host-routes.cloudflare.v1";
 export const HOST_CLOUDFLARE_PATH = "/api/host-routes/cloudflare";
 export const HOST_CLOUDFLARE_QUICK_PATH = "/api/host-routes/cloudflare/quick";
 
@@ -58,6 +59,7 @@ export const cloudflareViewSchema = z.object({
     quickHttp2: z.string(),
     quickQuic: z.string(),
     namedHttp2: z.string(),
+    namedQuic: z.string(),
   }).strict(),
 }).strict();
 export type CloudflareView = z.infer<typeof cloudflareViewSchema>;
@@ -69,5 +71,6 @@ export function cloudflareCommands(loopbackTarget: string): CloudflareView["comm
     quickHttp2: `cloudflared tunnel --protocol http2${extra} --url ${target}`,
     quickQuic: `cloudflared tunnel${extra} --url ${target}`,
     namedHttp2: `cloudflared tunnel --protocol http2 run${extra} --url ${target} <your-tunnel-name>`,
+    namedQuic: `cloudflared tunnel run${extra} --url ${target} <your-tunnel-name>`,
   };
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { HOST_ROUTES_PATH, hostRoutesViewSchema } from "../../src/client-protocol/host-routes.js";
 import { isLoopbackOrUnspecified } from "../../src/client-protocol/loopback-address.js";
-import { isDirectRoute, isRelayRoute, MAX_VPS_ROUTES } from "../../src/client-protocol/routes.js";
+import { isDirectRoute, isRelayRoute, legacyV1Routes, MAX_VPS_ROUTES } from "../../src/client-protocol/routes.js";
 import type { HubConnection } from "./connection.js";
 import type { Route } from "./storage.js";
 import { anySignal, timeoutSignal } from "./abort-signals.js";
@@ -48,9 +48,11 @@ export function DeviceInviteCode({ connection, localHost, busyChange }: { connec
   });
   const directs = routes.filter(isDirectRoute);
   // Keep QR v1's bounded relay list, preserving the connection in use first.
-  const relays = routes.filter(isRelayRoute).sort((a, b) => Number(b.url === state.route?.url) - Number(a.url === state.route?.url)).slice(0, MAX_VPS_ROUTES);
-  const vpsRelays = relays.filter(route => route.name === "VPS");
-  const cfRelays = relays.filter(route => route.name === "Cloudflare");
+  // Keep LAN/Tailscale/VPS QR invites free of Cloudflare routes so v1.6.0 Apps
+  // can still decode them, and emit distinct payloads for VPS vs Cloudflare.
+  const allRelays = routes.filter(isRelayRoute).sort((a, b) => Number(b.url === state.route?.url) - Number(a.url === state.route?.url));
+  const vpsRelays = legacyV1Routes(allRelays).slice(0, MAX_VPS_ROUTES);
+  const cfRelays = allRelays.filter(route => route.name === "Cloudflare").slice(0, MAX_VPS_ROUTES);
   const choices = [...directs, ...(vpsRelays.length ? [vpsRelays[0]!] : []), ...(cfRelays.length ? [cfRelays[0]!] : [])];
   const usable = choices.filter(route => prepared?.key === key && route.url === prepared.route.url || !(read?.key === key && read.unavailableNames?.includes(route.name)));
   const defaults = usable.length ? usable : choices;
@@ -64,7 +66,7 @@ export function DeviceInviteCode({ connection, localHost, busyChange }: { connec
     {!prepared && read?.key === key && read.selectionRequired && <p role="status" className="settings-note">{t("这台主机有多个局域网地址。请在主机电脑选择新设备所在的网络，再生成连接二维码。")}</p>}
     {loading ? <p role="status">{t("正在读取可用的连接二维码…")}</p> : failed ? <div role="alert"><p>{t("未能读取主机的连接信息，请重试。现有连接不会改变。")}</p><button type="button" onClick={() => setRetry(value => value + 1)}>{t("重试")}</button></div> : chosen ? <>
       <div className="device-invite-route">{choices.length > 1 ? <label>{t("新设备通过什么网络连接？")}<select value={chosen.url} onChange={event => setSelected(event.target.value)}>{choices.map(route => <option key={route.url} value={route.url}>{title(route)}{choices.filter(other => other.name === route.name).length > 1 ? ` · ${new URL(route.url).hostname}` : ""}</option>)}</select></label> : <strong>{title(chosen)}</strong>}{unavailableWarning}</div>
-      <ConnectionInviteCode connection={connection} payload={connectionPairingPayload(key, isRelayRoute(chosen) ? relays : [chosen, ...relays], connection.identity.deployment, chosen.url)}/>
+      <ConnectionInviteCode connection={connection} payload={connectionPairingPayload(key, chosen.name === "Cloudflare" ? cfRelays : chosen.name === "VPS" ? vpsRelays : [chosen, ...vpsRelays], connection.identity.deployment, chosen.url)}/>
       <p className="settings-note device-invite-note">{chosen.name === "Tailscale" ? t("新设备和主机都需开启 Tailscale，并允许互相访问。") : chosen.name === "Cloudflare" ? t("新设备联网即可通过你自建的 Cloudflare Tunnel 连接主机。") : chosen.name === "VPS" ? t("新设备联网即可通过已配置的中转连接主机。") : t("新设备与主机需连接同一 Wi-Fi 或局域网。")} {t("扫码后仍需核对 8 位配对码并确认，才会授权新设备。")}</p>
     </> : <>
       {unavailableWarning}

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isLoopbackOrUnspecified } from "./loopback-address.js";
 
 export const MAX_VPS_ROUTES = 8;
 export const MAX_CLOUDFLARE_ROUTES = 4;
@@ -21,7 +22,7 @@ export const isEdgeTlsRoute = (route: { name: string }): boolean => route.name =
 export const routeSchema = z.object({ name: routeNameSchema, url: routeUrlSchema, label: routeLabelSchema.optional(), certificateAuthority: z.string().min(100).max(4096).regex(/^[A-Za-z0-9+/]+={0,2}$/).optional() }).strict().superRefine((route, ctx) => {
   if (route.name === "Cloudflare") {
     const parsed = new URL(route.url);
-    if (parsed.protocol !== "https:" || ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname)) {
+    if (parsed.protocol !== "https:" || isLoopbackOrUnspecified(parsed.hostname)) {
       ctx.addIssue({ code: "custom", message: "Cloudflare route must use a public HTTPS origin" });
     }
     if (route.certificateAuthority !== undefined) {
@@ -42,7 +43,7 @@ export const localRoutesSchema = z.array(routeSchema).min(1).max(MAX_LOCAL_ROUTE
 export type Route = z.infer<typeof routeSchema>;
 /** Display order and tie-break only; prefer direct routes, then VPS, then Cloudflare. */
 export function orderedRoutes(routes: readonly Route[]): Route[] {
-  return [...routes.filter(isDirectRoute), ...routes.filter((r) => r.name === "VPS"), ...routes.filter((r) => r.name === "Cloudflare")];
+  return [...routes.filter((r) => !isRelayRoute(r)), ...routes.filter((r) => r.name === "VPS"), ...routes.filter((r) => r.name === "Cloudflare")];
 }
 /** Filter to v1-compatible route names for peers that predate Cloudflare routes. */
 export function legacyV1Routes(routes: readonly Route[]): Route[] {

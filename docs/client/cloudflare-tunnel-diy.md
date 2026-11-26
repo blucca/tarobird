@@ -13,8 +13,9 @@ Because Cloudflare Tunnel terminates outer TLS at Cloudflare's edge (serving a C
    - The Hub only serves `/api/edge-identity?nonce=<nonce>&origin=<origin>` to requests arriving on a **real loopback socket** (`127.0.0.1` / `::1`) and **only** for HTTPS origins explicitly authorized by the Host owner (saved in Host Cloudflare settings, active local Quick Tunnel, or `TAROBOT_CLOUDFLARE_ORIGINS`).
    - The Hub signs `["tarocub/edge-identity/v1", publicKey, nonce, origin]` with its Ed25519 identity key. An arbitrary third-party terminating proxy cannot obtain or replay a valid proof for another domain.
    - Every WebSocket session still performs full mutual Ed25519 challenge-response authentication (`serverProof` + `deviceProof`).
-3. **Loopback proxy source isolation**:
-   - Requests arriving over loopback with proxy headers (`CF-Ray`, `CF-Connecting-IP`, `X-Forwarded-For`, `Forwarded`) are never granted `"trusted"` loopback rate-limit buckets, and spoofable client IP headers are never trusted for authentication or rate-limit bypasses.
+3. **Loopback proxy source isolation & privileged endpoint fencing**:
+   - Requests arriving over loopback with proxy headers (`CF-Ray`, `CF-Connecting-IP`, `X-Forwarded-For`, `Forwarded`, etc.) or a non-loopback `Host` header are never granted `"trusted"` loopback rate-limit buckets, and spoofable client IP headers are never trusted for authentication or rate-limit bypasses.
+   - Loopback-only privileged endpoints (`/screen/v1/target`, `/screen/v1/target-media`, `/instance`, `/api/instance/*`, `/api/bot-messages/grant`, and `/api/bot-messages/local`) require a direct loopback connection without proxy headers and with a loopback `Host` header, so tunneling `cloudflared` to the Hub's loopback port never exposes them to the public internet.
 
 ## Phase 1: DIY `cloudflared` Setup
 

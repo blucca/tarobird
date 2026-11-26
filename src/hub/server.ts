@@ -459,11 +459,12 @@ export class HubServer {
     });
     server.on("upgrade", (req, socket, head) => {
       if (!this.stopping && this.originAllowed(req) && this.screenSockets.handles(req.url ?? "")) {
-        this.screenSockets.upgrade(req, socket, head, instance && !tls && isLoopback(req.socket.remoteAddress ?? ""), isLocalNetworkAddress(req.socket.remoteAddress ?? "")); return;
+        this.screenSockets.upgrade(req, socket, head, instance && !tls && this.isDirectLoopback(req), isLocalNetworkAddress(req.socket.remoteAddress ?? "")); return;
       }
-      // A relay arrives from loopback, so the socket address alone cannot
-      // distinguish an instance connection from an untrusted remote client.
-      if (this.stopping || !this.originAllowed(req) || !["/ws", "/instance"].includes(req.url ?? "") || (req.url === "/instance" && (!instance || !isLoopback(req.socket.remoteAddress ?? "")))) { socket.destroy(); return; }
+      // A relay or local tunnel (e.g. cloudflared) arrives from loopback, so the
+      // socket address alone cannot distinguish a local instance connection from
+      // an untrusted remote client.
+      if (this.stopping || !this.originAllowed(req) || !["/ws", "/instance"].includes(req.url ?? "") || (req.url === "/instance" && (!instance || !this.isDirectLoopback(req)))) { socket.destroy(); return; }
       this.sockets.handleUpgrade(req, socket, head, (ws) => req.url === "/instance" ? this.instanceSocket(ws) : this.clientSocket(ws, this.requestSource(req)));
     });
   }
@@ -665,11 +666,43 @@ export class HubServer {
     if (!origin) return true;
     return [...this.urls, ...NATIVE_ORIGINS, ...(this.options.origins ?? [])].includes(origin) || this.cloudflare.isOriginAllowed(origin);
   }
+  private hasProxyHeaders(req: IncomingMessage): boolean {
+    return Boolean(
+      req.headers["cf-ray"]
+      || req.headers["cf-connecting-ip"]
+      || req.headers["cf-visitor"]
+      || req.headers["cf-ipcountry"]
+      || req.headers["x-forwarded-for"]
+      || req.headers["x-forwarded-host"]
+      || req.headers["x-forwarded-proto"]
+      || req.headers["x-real-ip"]
+      || req.headers["true-client-ip"]
+      || req.headers["forwarded"]
+      || req.headers["via"],
+    );
+  }
+  private isLoopbackHostHeader(raw: string | undefined): boolean {
+    if (!raw || typeof raw !== "string" || /[\s/@\\?#]/.test(raw)) return false;
+    try {
+      const parsed = new URL(`http://${raw}`);
+      if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) return false;
+      const hostname = parsed.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+      return hostname === "localhost" || isLoopback(hostname);
+    } catch { return false; }
+  }
+  /** True only for a direct local loopback caller—never a relay tunnel or
+   * reverse-proxied request carrying proxy headers or a non-loopback Host. */
+  private isDirectLoopback(req: IncomingMessage): boolean {
+    if (!isLoopback(req.socket.remoteAddress ?? "")) return false;
+    if (!isLoopback(this.relaySources.source(req.socket))) return false;
+    if (this.hasProxyHeaders(req)) return false;
+    return this.isLoopbackHostHeader(req.headers.host);
+  }
   private requestSource(req: IncomingMessage): string {
     const raw = this.relaySources.source(req.socket);
     // Requests arriving via a local reverse proxy / cloudflared over loopback
     // must never inherit trusted loopback rate buckets or spoofable header IPs.
-    if (isLoopback(raw) && (req.headers["cf-ray"] || req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"] || req.headers["forwarded"])) {
+    if (isLoopback(raw) && (this.hasProxyHeaders(req) || !this.isLoopbackHostHeader(req.headers.host))) {
       return "edge-proxy";
     }
     return raw;
@@ -1600,7 +1633,14 @@ export class HubServer {
       this.networkRate(source, "enroll");
       this.json(res, 200, await this.network.enroll(await this.jsonBody(req, MAX_NETWORK_BYTES))); return;
     }
-    if (route.startsWith("/api/instance/")) { if (!instanceAllowed) throw new HubError("instance_unauthorized", 401); await this.instanceHttp(req, res, route); return; }
+    if (route.startsWith("/api/instance/")) {
+      if (!instanceAllowed) throw new HubError("instance_unauthorized", 401);
+      if (!this.isDirectLoopback(req)) throw new HubError("instance_loopback_only", 403);
+      await this.instanceHttp(req, res, route); return;
+    }
+    if ((route === "/api/bot-messages/grant" || route === "/api/bot-messages/local") && (!instanceAllowed || !this.isDirectLoopback(req))) {
+      throw new HubError("local_controller_required", 403);
+    }
     if (!route.startsWith("/api/")) { await this.staticFile(route, res); return; }
     const token = req.headers.authorization?.replace(/^Bearer /, "");
     const session = await this.auth.authorize(token, source);
@@ -1806,13 +1846,13 @@ export class HubServer {
         return;
       }
       if (route === "/api/bot-messages/grant" && req.method === "POST") {
-        if (!instanceAllowed || !isLoopback(req.socket.remoteAddress ?? "")) throw new HubError("local_controller_required", 403);
+        if (!instanceAllowed || !this.isDirectLoopback(req)) throw new HubError("local_controller_required", 403);
         messageControllerRequired = true; await requireOwner();
         const input = z.object({ command: z.record(z.string(), z.unknown()), proof: deviceActionProofSchema }).strict().parse(await this.jsonBody(req));
         await reply(200, await this.botMessages.grant(input.command, validateInQueue, () => this.auth.consumeBotMessageGrant(session, hashSecret(networkCanonical(input.command)), input.proof), session.deviceId)); return;
       }
       if (route === "/api/bot-messages/local" && req.method === "POST") {
-        if (!instanceAllowed || !isLoopback(req.socket.remoteAddress ?? "")) throw new HubError("local_controller_required", 403);
+        if (!instanceAllowed || !this.isDirectLoopback(req)) throw new HubError("local_controller_required", 403);
         messageControllerRequired = true; await requireOwner(); const input = botLocalRequestSchema.parse(await this.jsonBody(req, BOT_TRANSFER_BYTES));
         if (!input.sourceBot) throw new HubError("bot_message_source_required", 400);
         await reply(200, await this.botMessages.local(input, input.sourceBot, validateInQueue, true)); return;
@@ -2698,7 +2738,7 @@ export class HubServer {
     res.writeHead(200, { "Content-Type": mime, "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": `default-src 'self'; connect-src 'self' https: wss:${localConnect}; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src 'self' blob: data:; font-src 'self' data:; frame-ancestors 'none'` }); res.end(await readFile(file));
   }
   private async instanceHttp(req: IncomingMessage, res: ServerResponse, route: string): Promise<void> {
-    if (!isLoopback(req.socket.remoteAddress ?? "")) throw new HubError("instance_unauthorized", 401);
+    if (!this.isDirectLoopback(req)) throw new HubError("instance_loopback_only", 403);
     const credentials = req.headers.authorization?.match(/^Instance ([A-Za-z0-9_-]+):([A-Za-z0-9_-]{32,256})$/);
     const botId = credentials?.[1];
     const record = botId ? await this.store.db.serial(() => this.store.db.get<{ secret_hash: string }>("SELECT secret_hash FROM bots WHERE id=? AND deleted_at IS NULL", [botId])) : undefined;

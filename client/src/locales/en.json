@@ -5723,5 +5723,16 @@
   "移除 Cloudflare 域名 {0}": "Remove Cloudflare domain {0}",
   "保存 Cloudflare 配置": "Save Cloudflare settings",
   "Cloudflare Quick Tunnel": "Cloudflare Quick Tunnel",
-  "延迟与场景说明：Cloudflare 免费线路经由境外 Anycast 节点（中国大陆通常增加约 150–350 ms 往返延迟），适合聊天、Bot 控制、通知和 CLI 工作流；高帧率远程屏幕控制建议优先使用局域网、Tailscale 直连或就近自建 VPS。": "Latency & usage note: Free Cloudflare routes traverse overseas Anycast PoPs (typically adding ~150–350 ms RTT in mainland China). Great for chat, Bot control, notifications, and CLI workflows; for high-fps Remote Screen streaming, prefer LAN, Tailscale P2P, or a nearby self-hosted VPS."
+  "延迟与场景说明：Cloudflare 免费线路经由境外 Anycast 节点（中国大陆通常增加约 150–350 ms 往返延迟），适合聊天、Bot 控制、通知和 CLI 工作流；高帧率远程屏幕控制建议优先使用局域网、Tailscale 直连或就近自建 VPS。": "Latency & usage note: Free Cloudflare routes traverse overseas Anycast PoPs (typically adding ~150–350 ms RTT in mainland China). Great for chat, Bot control, notifications, and CLI workflows; for high-fps Remote Screen streaming, prefer LAN, Tailscale P2P, or a nearby self-hosted VPS.",
+  "正在读取主机管理权限…": "Checking host management permissions…",
+  "此主机需要更新后才能设置 Cloudflare 隧道。": "Update this Host before configuring Cloudflare Tunnel.",
+  "正在读取 Cloudflare 隧道能力…": "Checking Cloudflare Tunnel support…",
+  "Cloudflare Tunnel 必须使用公网 HTTPS 地址（不能使用 HTTP 或本机回环地址）。": "Cloudflare Tunnel requires a public HTTPS origin (HTTP and loopback addresses are not allowed).",
+  "当前设备没有修改 Cloudflare 隧道配置的权限，请重新连接后重试。": "This device does not have permission to change Cloudflare Tunnel settings. Reconnect and try again.",
+  "Quick Tunnel 启动超时，请检查网络连接或切换为 HTTP/2（--protocol http2）后重试。": "Quick Tunnel timed out while starting. Check your network or switch to HTTP/2 (--protocol http2) and try again.",
+  "VPS 中转 · Cloudflare Tunnel": "VPS relay · Cloudflare Tunnel",
+  "上移 Cloudflare 隧道 {0}": "Move Cloudflare Tunnel {0} up",
+  "下移 Cloudflare 隧道 {0}": "Move Cloudflare Tunnel {0} down",
+  "移除 Cloudflare 隧道 {0}": "Remove Cloudflare Tunnel {0}",
+  "Cloudflare 隧道 {0} 名称": "Cloudflare Tunnel {0} name"
 }

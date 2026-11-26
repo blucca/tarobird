@@ -81,3 +81,15 @@ it("renewed private pairing addresses preserve other paths, while public or trus
   expect(() => renewedPairingRoutes({ hubPublicKey, routes: [relay] }, payload(fresh))).toThrow("pairing_route_confirmation_required");
   expect(identity.routes).toEqual([lan, vpn, relay]);
 });
+
+it("converting a CA-pinned route to Cloudflare strips custom CA and invalid Cloudflare origins produce a dedicated error", () => {
+  const converted = multipathConfiguration(
+    [lan],
+    [{ name: "Cloudflare", url: relay.url, label: "CF" }],
+    [lan, relay],
+  );
+  expect(converted.routes).toEqual([lan, { name: "Cloudflare", url: relay.url, label: "CF" }]);
+  expect(converted.routes[1]?.certificateAuthority).toBeUndefined();
+  expect(() => multipathConfiguration([], [{ name: "Cloudflare", url: "http://127.0.0.1:8788" }], [])).toThrow(/Cloudflare Tunnel/);
+  expect(() => multipathConfiguration([], [{ name: "Cloudflare", url: "https://127.0.0.2" }], [])).toThrow(/Cloudflare Tunnel/);
+});

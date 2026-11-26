@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isLoopbackOrUnspecified } from "./loopback-address.js";
 
 // A nonce signature alone authenticates an identity but not the TLS endpoint:
 // a terminating proxy can forward that signature unchanged. Native transports
@@ -48,7 +49,7 @@ export const edgeOriginSchema = z.string().trim().max(2048).url().refine((value)
   try {
     const u = new URL(value);
     return u.protocol === "https:" && !u.username && !u.password && !u.search && !u.hash && u.pathname === "/"
-      && !["127.0.0.1", "localhost", "[::1]"].includes(u.hostname);
+      && !isLoopbackOrUnspecified(u.hostname);
   } catch { return false; }
 }, "Edge origin must be a public HTTPS origin").transform((value) => new URL(value).origin);
 

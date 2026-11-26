@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { routesSchema, routeSchema } from "./routes.js";
+import { isEdgeTlsRoute, MAX_CLOUDFLARE_ROUTES, routesSchema, routeSchema, type Route } from "./routes.js";
 import { hostNameSchema } from "./host-profile.js";
 import { deviceActionProofSchema, deviceActionStatementSchema } from "./device-actions.js";
 import { isLoopbackOrUnspecified } from "./loopback-address.js";
@@ -11,15 +11,25 @@ const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/).refine(value => 
 const nonce = z.string().length(43).regex(/^[A-Za-z0-9_-]{43}$/);
 const signature = z.string().length(88).regex(/^[A-Za-z0-9+/]{86}==$/);
 const deadline = z.number().int().positive().safe();
+/** Legacy v1/v2 wire-compatible shared routes. Excludes Cloudflare edge-TLS
+ * routes so v1.6.0 peers in the same network can always parse signed manifests. */
 export const sharedRoutesSchema = z.array(routeSchema).max(9).superRefine((routes, ctx) => {
+  if (routes.some(isEdgeTlsRoute)) ctx.addIssue({ code: "custom", message: "legacy_shared_routes_cannot_include_cloudflare" });
   if (routes.length && !routesSchema.safeParse(routes).success) ctx.addIssue({ code: "custom", message: "invalid_network_routes" });
   for (const route of routes) {
     const u = new URL(route.url);
     if (u.protocol !== "https:" || isLoopbackOrUnspecified(u.hostname)) ctx.addIssue({ code: "custom", message: "network_route_must_be_remote" });
   }
 });
-export const networkHostDescriptorSchema = z.object({ publicKey: key, name: hostNameSchema, routes: sharedRoutesSchema, protocol: z.literal(2).optional() }).strict();
+/** Additive optional edge-terminated routes (e.g. DIY Cloudflare Tunnel). Kept
+ * separate from legacy `routes` so v1.6.0 peers remain unaffected when omitted. */
+export const sharedEdgeRoutesSchema = z.array(routeSchema).max(MAX_CLOUDFLARE_ROUTES).superRefine((routes, ctx) => {
+  if (routes.some(route => !isEdgeTlsRoute(route))) ctx.addIssue({ code: "custom", message: "invalid_edge_routes" });
+  if (new Set(routes.map(route => route.url)).size !== routes.length) ctx.addIssue({ code: "custom", message: "duplicate_edge_route" });
+});
+export const networkHostDescriptorSchema = z.object({ publicKey: key, name: hostNameSchema, routes: sharedRoutesSchema, edgeRoutes: sharedEdgeRoutesSchema.optional(), protocol: z.literal(2).optional() }).strict();
 export type NetworkHostDescriptor = z.infer<typeof networkHostDescriptorSchema>;
+export const networkHostRoutes = (host: Pick<NetworkHostDescriptor, "routes" | "edgeRoutes">): Route[] => [...host.routes, ...(host.edgeRoutes ?? [])];
 export const networkHostSchema = networkHostDescriptorSchema.extend({ state: z.enum(["pending", "active"]), revoked: z.boolean(), proposalNonce: nonce.optional(), expiresAt: deadline.optional() }).strict()
   .superRefine((host, ctx) => { if (host.state === "pending" ? !host.proposalNonce || !host.expiresAt : host.proposalNonce !== undefined || host.expiresAt !== undefined) ctx.addIssue({ code: "custom", message: "invalid_network_host_state" }); });
 export type NetworkHost = z.infer<typeof networkHostSchema>;
@@ -52,7 +62,7 @@ export const networkManifestSchema = z.object({ v: z.union([z.literal(1), z.lite
     || m.hosts.filter(h => h.state === "active" && !h.revoked).length > 32 || active.length > 256
     || !m.hosts.some(h => h.publicKey === m.authorityKey && h.state === "active" && !h.revoked)
     || new Set(active.map(d => d.publicKey)).size !== active.length) invalid();
-  if (m.v === 1 && (m.devices.some(d => d.scope !== undefined) || m.hosts.some(h => h.protocol !== undefined))) invalid();
+  if (m.v === 1 && (m.devices.some(d => d.scope !== undefined) || m.hosts.some(h => h.protocol !== undefined || h.edgeRoutes !== undefined))) invalid();
   if (m.v === 2 && m.hosts.some(h => !h.revoked && h.state === "active" && h.protocol !== 2)) invalid();
   const scopes = new Map<string, string>();
   for (const d of m.devices) {
