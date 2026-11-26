@@ -142,7 +142,7 @@ public final class HubTransportPlugin: CAPPlugin, CAPBridgedPlugin {
                         if method == "document" { self.activeDocument = value["value"] as? String }
                         call.resolve(value)
                     case .failure(let error):
-                        call.reject((error as? HubNetworkError)?.code ?? "native_transport_failed")
+                        call.reject(HubNetworkError.classify(error))
                     }
                 }
             }

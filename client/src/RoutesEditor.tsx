@@ -1,6 +1,6 @@
 import { ExplanationList } from "./ExplanationList.js";
 import { deviceOperationError } from "./device-errors.js";
-import { connectionVerificationLabel } from "./connection-verification.js";
+import { routeHealthStatusLabel } from "./route-diagnostics.js";
 import { orderedRoutes } from "../../src/client-protocol/routes.js";
 import { DeploymentGuide } from "./DeploymentGuide.js";
 import { multipathConfiguration } from "./connection-routes.js";
@@ -46,10 +46,7 @@ export function RoutesEditor({ connection, dirtyChange, busyChange, localHost = 
   const routeState = (route: Route): { label: string; tone: string } | undefined => {
     if (online && state.route?.url === route.url) return { label: t("当前使用"), tone: "current" };
     const probe = state.routeHealth?.find((h) => h.url === route.url);
-    if (!probe) return undefined;
-    const verificationLabel = connectionVerificationLabel(probe.failure);
-    if (verificationLabel) return { label: verificationLabel, tone: "bad" };
-    return probe.status === "reachable" ? { label: t("可达 · 待连接验证"), tone: "ok" } : probe.status === "wrong-hub" ? { label: t("主机身份不匹配"), tone: "bad" } : probe.status === "cooldown" ? { label: t("连接失败，稍后重试"), tone: "warn" } : { label: t("暂不可用"), tone: "bad" };
+    return probe ? routeHealthStatusLabel(probe) : undefined;
   };
   return <div className="routes-settings">
     <div className="connection-summary" data-status={state.status}>

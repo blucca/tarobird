@@ -171,6 +171,13 @@ private final class SocketProbe: HubTaskHandler, @unchecked Sendable {
             try await managerChecks(peer, ca, token: ready["sessionToken"] as! String)
             let stats = try JSONSerialization.jsonObject(with: Data(peer.command("stats").utf8)) as! [String: Any]
             try check(stats["sensitive"] as? Int == 0, "zeroProxySensitiveRequests")
+            try check(HubNetworkError.classify(HubNetworkError("tls_identity_mismatch")) == "tls_identity_mismatch", "classifyPreservesHubCode")
+            try check(HubNetworkError.classify(URLError(.timedOut)) == "native_request_timeout", "classifyUrlTimeout")
+            try check(HubNetworkError.classify(URLError(.notConnectedToInternet)) == "native_network_offline", "classifyUrlOffline")
+            try check(HubNetworkError.classify(URLError(.cannotFindHost)) == "native_dns_failed", "classifyUrlDns")
+            try check(HubNetworkError.classify(NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNREFUSED))])) == "native_connection_refused", "classifyPosixRefused")
+            try check(HubNetworkError.classify(NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))])) == "local_network_permission_denied", "classifyPosixLocalNetworkDenied")
+            try check(HubNetworkError.classify(NSError(domain: "kCFErrorDomainDNSServiceDiscovery", code: -65555)) == "local_network_permission_denied", "classifyDnsServiceLocalNetworkDenied")
             results["proxy"] = stats; results["ok"] = true
         } catch { results["ok"] = false; results["error"] = String(describing: error); print("FAILED", error) }
         queue.sync { sessions.forEach { $0.cancelAll() } }

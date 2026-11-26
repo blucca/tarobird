@@ -20,7 +20,7 @@
 .pairing-options .deployment-guide { margin-top:12px; }
 .pairing-card .muted { color:var(--grey); }
 .pairing-card .vps-routes { text-align:left; }
-.pairing-card .error-text { margin-top:16px; overflow-wrap:anywhere; color:var(--red); }
+.pairing-card .error-text { margin-top:16px; padding:10px 12px; border-radius:10px; background:color-mix(in srgb,var(--red) 7%,var(--bg)); color:color-mix(in srgb,var(--red) 88%,var(--text)); font-size:13px; line-height:1.55; overflow-wrap:anywhere; }
 .pairing-card footer { display:flex; align-items:flex-start; gap:7px; margin-top:28px; font-size:12px; line-height:1.6; color:var(--muted); }
 .pairing-card footer svg { flex-shrink:0; margin-top:2px; }
 .pairing-card .pairing-host-cancel { justify-content:flex-start; padding:0; min-height:36px; margin:0 0 20px; font-size:13px; color:var(--grey); }

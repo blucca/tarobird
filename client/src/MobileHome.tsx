@@ -294,9 +294,10 @@ const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
 function HomeConnectionNotice({ host, manage }: { host?: MobileHost; manage: () => void }) {
   if (!host || host.viewingHistory || host.connection.state.status === 'online') return null;
   const connection = host.connection, blocked = connection.isReadOnly || connection.isClosed;
+  const reason = !blocked ? connection.state.routeDiagnosis?.message ?? (connection.state.error && connection.state.error !== t('暂时无法连接「{0}」，正在自动重试。', host.name) ? connection.state.error : undefined) : undefined;
   return <section className="mh-connection-notice" role="status" aria-label={t('主机连接状态')}>
     <WifiOff size={17} aria-hidden="true"/>
-    <div><strong>{blocked ? t('未连接到「{0}」', host.name) : t('正在连接「{0}」', host.name)}</strong><p>{blocked ? t('连接暂不可用，已缓存的记录仍保留。') : retainsOfflineNavigation(connection) ? t('正在自动重连，断线 5 分钟内保留对话列表。') : t('正在自动重连，对话记录仍保留。')}</p></div>
+    <div><strong>{blocked ? t('未连接到「{0}」', host.name) : t('正在连接「{0}」', host.name)}</strong><p>{blocked ? t('连接暂不可用，已缓存的记录仍保留。') : retainsOfflineNavigation(connection) ? t('正在自动重连，断线 5 分钟内保留对话列表。') : t('正在自动重连，对话记录仍保留。')}</p>{reason && <p className="mh-connection-reason">{reason}</p>}</div>
     {blocked ? <button type="button" onClick={manage}>{t('主机管理')}</button> : <button type="button" aria-label={t('重试连接')} disabled={connection.state.status === 'connecting'} onClick={() => connection.resume(true)}><RefreshCw size={15} aria-hidden="true"/>{t('重试')}</button>}
   </section>;
 }

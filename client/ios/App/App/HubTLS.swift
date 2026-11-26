@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Security
 import CryptoKit
 
@@ -6,6 +7,59 @@ struct HubNetworkError: LocalizedError {
     let code: String
     init(_ code: String) { self.code = code }
     var errorDescription: String? { code }
+
+    static func classify(_ error: Error, fallback: String = "native_transport_failed") -> String {
+        if let hub = error as? HubNetworkError { return hub.code }
+        var current: NSError? = error as NSError
+        var urlCode: URLError.Code?
+        var posixCode: Int?
+        var depth = 0
+        while let ns = current, depth < 8 {
+            if let pathObj = ns.userInfo["_NSURLErrorNWPathKey"] {
+                if #available(iOS 14.2, macOS 11.0, *),
+                   let path = pathObj as? OS_nw_path,
+                   nw_path_get_unsatisfied_reason(path) == nw_path_unsatisfied_reason_local_network_denied {
+                    return "local_network_permission_denied"
+                }
+                if String(describing: pathObj).localizedCaseInsensitiveContains("local network prohibited") {
+                    return "local_network_permission_denied"
+                }
+            }
+            if (ns.domain == NetService.errorDomain || ns.domain == "kCFErrorDomainDNSServiceDiscovery") && ns.code == -65555 {
+                return "local_network_permission_denied"
+            }
+            if ns.domain == NSPOSIXErrorDomain || ns.domain == (kCFErrorDomainPOSIX as String) {
+                posixCode = posixCode ?? ns.code
+                if ns.code == Int(EPERM) { return "local_network_permission_denied" }
+            }
+            if ns.domain == NSURLErrorDomain && urlCode == nil {
+                urlCode = URLError.Code(rawValue: ns.code)
+            }
+            current = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
+        }
+        if let posix = posixCode {
+            switch Int32(posix) {
+            case ECONNREFUSED: return "native_connection_refused"
+            case ETIMEDOUT: return "native_request_timeout"
+            case EHOSTUNREACH, ENETUNREACH, EHOSTDOWN, ENETDOWN: return "native_host_unreachable"
+            default: break
+            }
+        }
+        if let code = urlCode {
+            switch code {
+            case .timedOut: return "native_request_timeout"
+            case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff: return "native_network_offline"
+            case .networkConnectionLost: return "native_connection_reset"
+            case .cannotFindHost, .dnsLookupFailed: return "native_dns_failed"
+            case .cannotConnectToHost: return "native_host_unreachable"
+            case .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
+                 .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid: return "native_tls_untrusted"
+            default: break
+            }
+        }
+        return fallback
+    }
 }
 
 enum HubScreenRole: String { case control, media }

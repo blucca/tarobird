@@ -27,6 +27,7 @@ export function connectionErrorMessage(error: unknown): string {
   if (["device_key_unavailable", "device_key_invalid", "system_keychain_unavailable"].includes(code)) return t("无法读取此设备的配对密钥，请解锁系统钥匙串后重试；仍无法连接时，请重新配对。");
   if (["native_document_retired", "native_document_unavailable", "native_view_unavailable"].includes(code)) return t("连接组件已失效，请重新打开 TaroBird。配对信息和草稿仍保留。");
   if (["native_socket_timeout", "native_request_timeout", "connection_handshake_timeout"].includes(code)) return t("主机响应超时，正在自动重试。请确认主机仍在运行。");
+  if (code === "local_network_permission_denied") return t("TaroBird 没有获得“本地网络”权限，无法访问局域网主机。请在设备的「设置 → 隐私与安全性 → 本地网络」中允许 TaroBird，然后重试。");
   if (code && code.length < 240 && !/^[a-z_]+$/.test(code) && !code.startsWith("[")) return code;
   return t("连接中断，正在自动重试。请检查主机和网络状态。");
 }

@@ -313,7 +313,7 @@ final class HubTransport: @unchecked Sendable {
         guard owns(slot) else { return }
         if let error = error {
             let failure = slot.connection?.trustFailure ?? error
-            emit(slot, ["kind": "error", "error": (failure as? HubNetworkError)?.code ?? "native_socket_failed"])
+            emit(slot, ["kind": "error", "error": HubNetworkError.classify(failure, fallback: "native_socket_failed")])
             forget(slot); finish(slot, failure)
         }
         else { finish(slot, HubNetworkError("native_socket_closed_without_peer_receipt")) }
