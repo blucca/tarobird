@@ -42,6 +42,8 @@ import { GatewayAgentBusRuns, observeAgentBusRun } from "./agent-bus.js";
 import { deliveryLedgerEnabled } from "../state/delivery-obligation-store.js";
 import { redeliverRecoveredCoreObligations } from "../core/delivery-recovery.js";
 import { loadInstanceConfig, resolveInstanceWorkspacePath, type InstanceEngine } from "../state/instance-config.js";
+import { resolveConversationResume } from "../runtime/conversation-resume.js";
+import { SessionStore } from "../state/session-store.js";
 import { createAppPlatformTools } from "./app-tools.js";
 import { GatewayReceipts } from "./receipts.js";
 import { gatewayActiveWorkCount } from "./activity.js";
@@ -223,14 +225,33 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       // Capability hints are selected from the user's topic only, never from
       // other members' text. Peer material is appended once, to the turn's own
       // prompt; repair prompts in the same turn do not repeat it.
+      const groupSession = !discussionTurn ? channel.currentGroupSession() : undefined;
+      const groupSessionKey = groupSession ? buildCoreConversationKey(groupSession.sessionId) : undefined;
+      const sessionConversationKey = groupSessionKey ?? input.conversationKey;
+      const sessionChatId = groupSessionKey ? stableCoreNumericId(groupSessionKey) : input.chatId;
+      let effectiveWorkspace = input.workspaceOverride;
+      if (groupSession && groupSessionKey) {
+        const boundSession = await new SessionStore(path.join(options.stateDir, "session.json")).findByConversationKeySafe(groupSessionKey);
+        const boundResume = boundSession.warning ? undefined : resolveConversationResume(boundSession.record, config.resume);
+        effectiveWorkspace = boundResume?.workspacePath
+          ?? groupSession.workspacePath
+          ?? await channel.conversationWorkspace(groupSession.sessionId)
+          ?? resolveInstanceWorkspacePath(config)
+          ?? input.workspaceOverride;
+      }
+      const groupHistoryPrefix = groupSession?.contextMessages?.length
+        ? `[Group "${groupSession.groupTitle}" recent context]\n${groupSession.contextMessages.map((m) => `${m.authorName}: ${m.text}`).join("\n")}\n\n`
+        : "";
       const capabilityText = discussionTurn ? discussionTurn.topic : input.text;
-      const engineText = discussionTurn && isGroupDiscussionPrompt(input.text) ? `${input.text}\n\n${groupDiscussionReference(discussionTurn)}` : input.text;
+      const engineText = discussionTurn && isGroupDiscussionPrompt(input.text)
+        ? `${input.text}\n\n${groupDiscussionReference(discussionTurn)}`
+        : groupHistoryPrefix ? `${groupHistoryPrefix}${input.text}` : input.text;
       const lifetime = new AbortController();
       const delivered: AppDeliveryReceipt[] = [];
       const signal = input.abortSignal ? AbortSignal.any([input.abortSignal, lifetime.signal]) : lifetime.signal;
       const appPlatformTools = conversationId && input.conversationKey === buildCoreConversationKey(conversationId)
         ? createAppPlatformTools({ channel, stateDir: options.stateDir, conversationId, requestOutputDir: input.requestOutputDir,
-          workspaceOverride: input.workspaceOverride, options: instructionOptions, receipts: appReceipts, signal,
+          workspaceOverride: effectiveWorkspace, options: instructionOptions, receipts: appReceipts, signal,
           suppressDelivery: input.suppressAppDelivery,
           replyTo: input.appDeliveryReplyTo ?? channel.currentMessageId(),
           deliveryCache: input.appDeliveryCache,
@@ -243,7 +264,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
         // Persistent CLI workers can invoke these callbacks from an older
         // async context, even after this request returns. Bind App formatting
         // explicitly so late reports never fall back to Feishu card limits.
-        let response = await target.handleAuthorizedMessage({ ...input, text: engineText, appPlatformTools,
+        let response = await target.handleAuthorizedMessage({ ...input, conversationKey: sessionConversationKey, chatId: sessionChatId, workspaceOverride: effectiveWorkspace, text: engineText, appPlatformTools,
           onHistoryAnchor: input.historyInputMessageId && conversationId && channel.transport.capabilities.includes(CONVERSATION_HISTORY_CAPABILITY)
             ? async evidence => {
               const record = historyAnchorEvidenceSchema.parse({ ...evidence, conversationId });
@@ -287,7 +308,9 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     return typeof value === "function" ? value.bind(target) : value;
   } });
   channel.prepareConversation = async (conversationId) => {
-    const conversation = conversationSchema.parse(await channel.transport.request("conversation", { conversationId }));
+    const groupSession = channel.currentGroupSession();
+    const targetId = groupSession?.sessionId ?? conversationId;
+    const conversation = conversationSchema.parse(await channel.transport.request("conversation", { conversationId: targetId }));
     await prepareGatewaySessionBinding(options.stateDir, conversation);
   };
   channel.canSteerConversation = async (conversationId) => gatewaySessionBindingAllowsSteering(options.stateDir,
@@ -299,8 +322,20 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     // Only a Hub-dispatched run marker selects Agent Bus execution and observation.
     const agentBus = message.agentBus ? observeAgentBusRun({ transport: channel.transport, runs: agentBusRuns, botId: options.botId, messageId: message.messageId,
       dispatch: message.agentBus, runtime: messageRuntime, bridge, onWarning: options.onWarning }) : undefined;
+    const groupSession = !message.groupDiscussion ? channel.currentGroupSession() : undefined;
+    let sessionWorkspaceOverride: string | undefined;
+    if (groupSession) {
+      const cfg = await loadInstanceConfig(options.stateDir);
+      const boundSession = await new SessionStore(path.join(options.stateDir, "session.json")).findByConversationKeySafe(buildCoreConversationKey(groupSession.sessionId));
+      const boundResume = boundSession.warning ? undefined : resolveConversationResume(boundSession.record, cfg.resume);
+      sessionWorkspaceOverride = boundResume?.workspacePath
+        ?? message.workspaceOverride
+        ?? groupSession.workspacePath
+        ?? await channel.conversationWorkspace(groupSession.sessionId)
+        ?? resolveInstanceWorkspacePath(cfg);
+    }
     let failure: unknown;
-    try { await handleCoreMessage({ channel, bridge: agentBus?.bridge ?? bridge, runtime: agentBus?.runtime ?? messageRuntime, stateDir: options.stateDir, instanceName: options.botId, message, requireMentionInGroup: options.requireMentionInGroup ?? true }); }
+    try { await handleCoreMessage({ channel, bridge: agentBus?.bridge ?? bridge, runtime: agentBus?.runtime ?? messageRuntime, stateDir: options.stateDir, instanceName: options.botId, message, requireMentionInGroup: options.requireMentionInGroup ?? true, ...(sessionWorkspaceOverride ? { workspaceOverride: sessionWorkspaceOverride } : {}) }); }
     catch (error) {
       failure = error;
       if (!(error instanceof GatewaySessionBindingError)) throw error;

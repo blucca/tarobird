@@ -214,8 +214,16 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     仅管理主机尚未下发的消息；不改变正在执行的任务或对话历史顺序
   groups show GROUP                      查看群设置：模式、发言顺序、最多轮数与 revision
   groups update GROUP --from FILE         用完整设置 JSON 保存（title、botIds、expectedTitle、expectedBotIds，
-    可选 policy {mode: mentions|parallel|sequential|independent, botOrder, maxRounds} 与 expectedRevision）
-    parallel 为并行回复：不 @ 时全员各自回复用户，@ 时仅点名 Bot；保存后直接发消息即可
+    可选 policy {mode: designated|mentions|parallel|sequential|independent, botOrder, maxRounds} 与 expectedRevision）
+    parallel 为并行回复：不 @ 时全员各自回复用户，@ 时仅点名 Bot；designated 为指定 Bot 回复
+  groups members GROUP                    查看群的按会话与跨主机成员、旧会话与跨主机提问状态
+  groups add-member GROUP --bot BOT [--host HOST] [--session SESSION] [--history none|all|recent:N]
+    按会话添加本机或跨主机 Bot 成员；未指定 --session 时选择最近会话或自动新建
+  groups remove-member GROUP --member KEY 移出成员并回收会话访问权限（原会话历史保留）
+  groups switch-session GROUP --member KEY [--session SESSION | --new-session]
+    为成员切换到另一个或全新会话（旧会话归入 formerSessionIds）
+  groups room GROUP [--title TITLE]       新建讨论房间并为全体成员分配独立新会话
+  groups stop GROUP                       停止整群进行中的任务与讨论，并标记未回复跨主机提问
   groups status CONVERSATION              查看群或话题当前/最近一次讨论（只读）
   groups start CONVERSATION --text-file FILE --revision REV [--file FILE]... [--request-id ID]
     [--participants BOT,BOT] [--supersedes RUN_ID]
@@ -330,6 +338,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     "reply-to": { type: "string" }, ids: { type: "string" }, conversation: { type: "string" }, sort: { type: "string" }, text: { type: "string" }, "text-file": { type: "string" }, run: { type: "string" },
     coordinator: { type: "string" }, members: { type: "string" },
     participants: { type: "string" }, supersedes: { type: "string" }, then: { type: "string" }, "if-running": { type: "boolean" }, recover: { type: "boolean" },
+    member: { type: "string" }, history: { type: "string" }, "new-session": { type: "boolean" },
   } });
   const [command, sub, argument, ...extra] = p;
   const seenOptions = new Set<string>();
@@ -364,7 +373,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     side: ["bot", "text", "text-file", "file", "timeout", "request-id"],
     changes: ["bot", "path", "preview", "message", "operation"],
     bus: ["from", "revision", "text-file", "request-id", "run", "yes", "coordinator", "members", "abandon"],
-    groups: ["from", "revision", "text-file", "file", "run", "request-id", "reply-to", "participants", "supersedes", "then", "if-running"],
+    groups: ["from", "revision", "text-file", "file", "run", "request-id", "reply-to", "participants", "supersedes", "then", "if-running", "host", "bot", "session", "member", "history", "new-session", "title"],
   };
   for (const key of Object.keys(v)) if (!["state-dir", "json", "help", ...(allowed[command] ?? [])].includes(key)) throw new Error(`此命令不支持 --${key}。请执行 tarobot --help。`);
   let piSessionUpdate: Omit<PiSessionChange, "botId"> | undefined;
@@ -831,6 +840,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
       await output(await runGroupsCommand(management.client, sub, argument, {
         from: v.from, revision: v.revision, "text-file": v["text-file"], file: v.file, run: v.run, "request-id": v["request-id"], "reply-to": v["reply-to"],
         participants: v.participants, supersedes: v.supersedes, then: v.then, "if-running": v["if-running"],
+        host: v.host, bot: v.bot, session: v.session, member: v.member, history: v.history, "new-session": v["new-session"], title: v.title,
       }, id => console.error(`群讨论请求编号：${id}。断线或超时不会自动重发；请保留此编号和原参数核对结果。`)));
       return;
     }

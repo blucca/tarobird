@@ -25,6 +25,7 @@ import { isLoopback } from "../hub/network.js";
 import { botRuntimeStatusSchema } from "../client-protocol/instance.js";
 import { AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, agentBusDispatchSchema, type AgentBusDispatch } from "../client-protocol/agent-bus.js";
 import { GROUP_DISCUSSION_WORKER_CAPABILITY, groupDiscussionDispatchSchema, type GroupDiscussionDispatch } from "../client-protocol/group-discussion.js";
+import { groupLocalSessionDispatchSchema, type GroupLocalSessionDispatch } from "../client-protocol/group-members.js";
 
 const requestSchema = z.object({ v: z.literal(1), type: z.literal("instance.request"), id: idSchema, method: z.string(), params: jsonSchema });
 const journalSchema = z.object({ requests: z.array(requestSchema) });
@@ -36,7 +37,7 @@ const inboundSchema = z.discriminatedUnion("type", [
   z.object({ v: z.literal(1), type: z.literal("instance.ready"), capabilities: z.array(z.string()).optional(), quotaProofKey: z.string().regex(QUOTA_ACCOUNT_KEY_HEX).optional() }),
   z.object({ v: z.literal(1), type: z.literal("instance.queue"), conversationId: idSchema }),
   z.object({ v: z.literal(1), type: z.literal("instance.result"), id: idSchema, result: jsonSchema.optional(), error: z.string().optional() }),
-  z.object({ v: z.literal(1), type: z.literal("instance.message"), workbench: workbenchContextSchema.optional(), workbenchContextOmitted: workbenchContextOmittedSchema.optional(), message: messageSchema, conversation: conversationSchema, ticketNotice: z.boolean().optional(), agentBus: agentBusDispatchSchema.optional(), groupDiscussion: groupDiscussionDispatchSchema.optional() }),
+  z.object({ v: z.literal(1), type: z.literal("instance.message"), workbench: workbenchContextSchema.optional(), workbenchContextOmitted: workbenchContextOmittedSchema.optional(), message: messageSchema, conversation: conversationSchema, ticketNotice: z.boolean().optional(), agentBus: agentBusDispatchSchema.optional(), groupDiscussion: groupDiscussionDispatchSchema.optional(), groupSession: groupLocalSessionDispatchSchema.optional() }),
   z.object({ v: z.literal(1), type: z.literal("instance.call"), id: idSchema, method: z.string(), params: jsonSchema }),
   z.object({ v: z.literal(1), type: z.literal("pong") }),
 ]);
@@ -69,7 +70,7 @@ export class GatewayTransport {
   /** Includes admission/approval and publication persistence before runtime
    * activeRuns is populated, so an idle drain cannot cut off accepted work. */
   isBusy(): boolean { return this.receiving > 0 || this.pending.size > 0 || this.journal.length > 0 || this.bootPending || this.partialFrame; }
-  onMessage?: (message: Message, conversation: Conversation, agentBus?: AgentBusDispatch, groupDiscussion?: GroupDiscussionDispatch, workbench?: WorkbenchContext, workbenchContextOmitted?: WorkbenchContextOmitted, ticketNotice?: boolean) => Promise<void>;
+  onMessage?: (message: Message, conversation: Conversation, agentBus?: AgentBusDispatch, groupDiscussion?: GroupDiscussionDispatch, workbench?: WorkbenchContext, workbenchContextOmitted?: WorkbenchContextOmitted, ticketNotice?: boolean, groupSession?: GroupLocalSessionDispatch) => Promise<void>;
   onQueue?: (conversationId: string) => void;
   onCall?: (method: string, params: Json) => Promise<Json>;
   /** Once per process attachment, after old publications and before new input. */
@@ -223,7 +224,7 @@ export class GatewayTransport {
       // old callback cross the boot barrier after shutdown or reconnect.
       if (this.stopped || this.ws !== ws || ws?.readyState !== WebSocket.OPEN) return;
       if (frame.type === "instance.queue") { this.onQueue?.(frame.conversationId); return; }
-      await this.onMessage?.(frame.message, frame.conversation, frame.agentBus, frame.groupDiscussion, frame.workbench, frame.workbenchContextOmitted, frame.ticketNotice); return;
+      await this.onMessage?.(frame.message, frame.conversation, frame.agentBus, frame.groupDiscussion, frame.workbench, frame.workbenchContextOmitted, frame.ticketNotice, frame.groupSession); return;
     }
     if (frame.type === "instance.call") {
       try { const result = await this.onCall?.(frame.method, frame.params); if (!this.stopped && this.ws === ws) this.send({ v: 1, type: "instance.result", id: frame.id, result: result ?? null }); }
@@ -258,7 +259,7 @@ export class GatewayTransport {
   /** A pull is a live execution-slot reservation, never a durable command to
    * replay after that slot is gone. A lost claim is recovered as fenced input
    * on reattachment through GatewayReceipts, just like a lost push delivery. */
-  async takeQueued(conversationId: string): Promise<{ message: Message; conversation: Conversation; workbench?: WorkbenchContext; workbenchContextOmitted?: WorkbenchContextOmitted; ticketNotice?: boolean } | null> {
+  async takeQueued(conversationId: string): Promise<{ message: Message; conversation: Conversation; workbench?: WorkbenchContext; workbenchContextOmitted?: WorkbenchContextOmitted; ticketNotice?: boolean; groupSession?: GroupLocalSessionDispatch } | null> {
     this.throwIfStopped();
     if (!this.capabilities.includes(PROMPT_QUEUE_PULL_CAPABILITY)) throw new Error("queue_unsupported");
     const ws = this.ws;
@@ -267,7 +268,7 @@ export class GatewayTransport {
     const result = new Promise<Json>((resolve, reject) => { this.pending.set(id, { resolve, reject }); this.transient.add(id); });
     const timer = setTimeout(() => { this.pending.get(id)?.reject(new Error("gateway_queue_timeout")); this.pending.delete(id); this.transient.delete(id); ws.terminate(); }, 10_000); timer.unref();
     this.send({ v: 1, type: "instance.request", id, method: "queue.take", params: { conversationId } });
-    try { return z.object({ message: messageSchema, conversation: conversationSchema, workbench: workbenchContextSchema.optional(), workbenchContextOmitted: workbenchContextOmittedSchema.optional(), ticketNotice: z.boolean().optional() }).nullable().parse(await result); }
+    try { return z.object({ message: messageSchema, conversation: conversationSchema, workbench: workbenchContextSchema.optional(), workbenchContextOmitted: workbenchContextOmittedSchema.optional(), ticketNotice: z.boolean().optional(), groupSession: groupLocalSessionDispatchSchema.optional() }).nullable().parse(await result); }
     finally { clearTimeout(timer); }
   }
   /** Separates durable outbox acceptance from the Hub's response. Requests are

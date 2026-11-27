@@ -13,6 +13,7 @@ import type { SendTimingTrace } from "./send-timing.js";
 export type GroupReplyMode = {
   conversationId: string; mode: GroupDiscussionView["settings"]["policy"]["mode"]; revision: string;
   botOrder?: string[];
+  designatedName?: string;
   activeRun?: Pick<NonNullable<GroupDiscussionView["run"]>, "id" | "conversationId"> & Partial<Pick<NonNullable<GroupDiscussionView["run"]>, "revision" | "status" | "topic" | "pauseReason" | "actions" | "participants">>;
   delivery?: "guarded" | "legacy" | "unguarded";
 };
@@ -82,7 +83,7 @@ export async function sendGroupComposerMessage(connection: HubConnection, frame:
     const legacy = mode!.delivery === "legacy";
     const guarded = connection.state.groupReplyGuardAvailable || mode!.delivery === "guarded";
     if (!legacy && !guarded && connection.state.status !== "online") throw new Error(unavailableGroupReplyGuard());
-    const message = { ...frame, ...(legacy || guarded ? { groupReplyGuard: { mode: mode!.mode as "mentions" | "parallel", revision: legacy ? LEGACY_GROUP_REPLY_REVISION : mode!.revision } } : {}) };
+    const message = { ...frame, ...(legacy || guarded ? { groupReplyGuard: { mode: mode!.mode as "designated" | "mentions" | "parallel", revision: legacy ? LEGACY_GROUP_REPLY_REVISION : mode!.revision } } : {}) };
     timing?.setRoute("queue");
     timing?.setClientMsgId(frame.clientMsgId);
     if (designComments?.context.kind === "design") await connection.send(message, designComments); else await connection.send(message);
