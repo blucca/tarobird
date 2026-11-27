@@ -339,7 +339,7 @@ test("Replying row names the answered message, avoids duplicate queue rows, adva
 
 for (const locale of ["zh", "en"] as const) {
   test(`group discussion Replying row shows the topic instead of hardcoded Chinese scheduler input (${locale})`, async ({ browser }) => {
-    const { page, f, open, done } = await ready(browser, locale, 1440);
+    const { page, f, L, open, done } = await ready(browser, locale, 1440);
     try {
       const groupTitle = locale === "en" ? "Release group" : "发布群";
       const topicText = locale === "en" ? "Review staged rollout checklist before shipping" : "发布前核对灰度检查清单";
@@ -371,7 +371,7 @@ for (const locale of ["zh", "en"] as const) {
 
       await openConv(page, groupTitle);
       await open();
-      const live = rail(page).getByRole("region", { name: "现在在做", exact: true });
+      const live = rail(page).getByRole("region", { name: L("现在在做"), exact: true });
       await expect(live.locator(".workspace-replying-row")).toHaveCount(1);
       await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText([topicText]);
       await expect(live.locator(".workspace-replying-row .workspace-item-meta")).toContainText([
