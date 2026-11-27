@@ -9,7 +9,7 @@ export const GATEWAY_COMMAND_POLICIES: Readonly<Record<string, "shared" | "nativ
   help: "shared", status: "shared", usage: "shared", btw: "shared", ask: "shared",
   engine: "shared", model: "shared", effort: "shared", fast: "shared", yolo: "shared",
   config: "shared", stream: "shared", timeout: "shared", steer: "native", account: "native",
-  goal: "shared", resume: "shared", detach: "shared", reset: "shared", stop: "shared",
+  goal: "shared", resume: "shared", detach: "shared", reset: "shared", restart: "shared", stop: "shared",
   q: "shared", bg: "shared", continue: "shared", context: "shared",
   compact: "shared", ultrareview: "shared", cron: "shared", board: "shared", mini: "shared",
   fan: "shared", chain: "shared", verify: "shared", group: "native", invite: "native",
@@ -17,12 +17,16 @@ export const GATEWAY_COMMAND_POLICIES: Readonly<Record<string, "shared" | "nativ
   "approve-session": "shared", deny: "shared", meeting: "feishu",
 };
 
+/** Engines whose adapter can restart one conversation's process (`restartSession`). */
+const RESTARTABLE_ENGINES: ReadonlySet<string> = new Set(["claude", "antigravity", "pi"]);
+
 /** `engineCommands`: the live engine's own commands (Antigravity ACP). A Host command of the same name wins, since the Host handles it first. */
 export function gatewayCommands(engine: string, query = "", engineCommands: ReadonlyArray<{ name: string; description?: string }> = []) {
   const shared = CORE_SLASH_COMMANDS.filter(({ command }) =>
     (GATEWAY_COMMAND_POLICIES[command] === "shared" || command === "group")
     && (command !== "fast" || engine === "codex")
     && (command !== "ultrareview" || engine === "claude")
+    && (command !== "restart" || RESTARTABLE_ENGINES.has(engine))
     && command.startsWith(query.replace(/^\//, "").toLowerCase()))
     .map((definition) => definition.command !== "group" ? definition : {
       ...definition,

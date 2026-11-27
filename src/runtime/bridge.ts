@@ -339,6 +339,15 @@ export class Bridge {
     });
   }
 
+  /** /restart: end the engine process behind this conversation's session and
+   * keep the binding, so the next turn continues the same session afresh. */
+  async restartConversationSession(input: { chatId: number; messageThreadId?: number; conversationKey?: string }): Promise<"restarted" | "not_running" | "no_session" | "unsupported"> {
+    if (!this.adapter.restartSession || !this.sessionManager.getExistingSession) return "unsupported";
+    const session = await this.sessionManager.getExistingSession(this.conversationScope(input));
+    if (!session) return "no_session";
+    return (await this.adapter.restartSession(session.sessionId)).outcome;
+  }
+
   async checkAccess(input: BridgeAccessInput): Promise<BridgeAccessDecision> {
     if (this.authenticatedSurface) return { kind: "allow" };
     if (input.chatType === "bus") {

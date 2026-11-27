@@ -1086,6 +1086,10 @@ export function isCoreGoalControlCommand(text: string): boolean {
   return !!action && action.kind !== "set";
 }
 
+export function isRestartCommand(text: string): boolean {
+  return /^\/restart(?:\s|$)/i.test(text.trim());
+}
+
 export function isStopCommand(text: string): boolean {
   return /^\/stop(?:\s|$)/i.test(text.trim());
 }
@@ -1098,7 +1102,7 @@ function renderCoreHelpMessage(locale: Locale = "zh"): string {
       "Just message me to start — DMs work directly; in a group, @-mention me. You can also send files, images, or audio/video (short media uses local Qwen ASR; long media uses Aliyun Tingwu when configured). Most settings live in the interactive `/config` panel.",
       "",
       "**Session**",
-      "- `/status` current conversation · `/stop` stop the current task (cancel a queued task from its queue card) · `/reset` reset the session",
+      "- `/status` current conversation · `/stop` stop the current task (cancel a queued task from its queue card) · `/reset` reset the session · `/restart` restart the engine process, keeping the session",
       "- `/resume [n]` pick a Claude/Kimi/DeepSeek Harness/Antigravity/Pi session · Claude `/resume <full ID>` · Codex `/resume thread <id>` · Kimi/DeepSeek also support `/resume session <id>` · `/detach` unbind",
       "- `/goal […]` set a conversation goal · `/btw <q>` ask aside without touching the session · `/continue` resume a waiting archive analysis",
       "- `/q <message>` force a queued turn — while a Codex/DeepSeek turn is running, plain text steers INTO it; `/q` runs it afterwards instead",
@@ -1132,7 +1136,7 @@ function renderCoreHelpMessage(locale: Locale = "zh"): string {
     "直接发消息就能用 —— 私聊直接发，群里 @我 触发。也能发文件、图片、音视频（短音频走本地 Qwen ASR，长音频在已配置时走通义听悟）。大部分设置走 `/config` 交互面板。",
     "",
     "**会话**",
-    "- `/status` 当前会话 · `/stop` 停当前任务（排队任务在各自排队卡片上取消）· `/reset` 重置会话",
+    "- `/status` 当前会话 · `/stop` 停当前任务（排队任务在各自排队卡片上取消）· `/reset` 重置会话 · `/restart` 重启引擎进程（保留会话）",
     "- `/resume [编号]` 选 Claude/Kimi/DeepSeek Harness/Antigravity/Pi 会话 · Claude `/resume <完整 ID>` · Codex `/resume thread <id>` · Kimi/DeepSeek 也支持 `/resume session <id>` · `/detach` 解绑",
     "- `/goal […]` 设会话目标 · `/btw <问题>` 旁问不影响会话 · `/continue` 继续等待中的压缩包分析",
     "- `/q <消息>` 强制排队 — Codex/DeepSeek 任务运行中纯文本会注入当前任务，`/q` 则排在后面单独执行",

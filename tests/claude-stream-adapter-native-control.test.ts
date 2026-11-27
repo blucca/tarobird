@@ -618,6 +618,28 @@ describe("Claude unconfirmed stop recovery", () => {
     await unconfirmed;
   }
 
+  it("restarts only this session's worker, and the next turn resumes the same session in a new process", async () => {
+    const killSpy = spyKill();
+    vi.useFakeTimers();
+    const children: FakeChild[] = [], spawned: string[][] = [];
+    const adapter = new ClaudeStreamAdapter("claude", { spawnFn: ((_command: string, args: string[]) => { spawned.push(args); const child = new FakeChild(); children.push(child); return child; }) as never, taskNotificationStartGraceMs: 0 });
+    try {
+      await expect(adapter.restartSession(SESSION)).resolves.toEqual({ outcome: "not_running" });
+      const stop = new AbortController();
+      const { turn } = await liveTurn(adapter, children, "stuck", stop);
+      const ended = expect(turn).rejects.toThrow();
+      await expect(adapter.restartSession(SESSION)).resolves.toEqual({ outcome: "restarted" });
+      await ended;
+      expect(killSpy).toHaveBeenCalledTimes(1);
+      await expect(adapter.restartSession(SESSION)).resolves.toEqual({ outcome: "not_running" });
+      const next = adapter.sendUserMessage(SESSION, { text: "again", files: [] });
+      void next.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(children).toHaveLength(2);
+      for (const args of spawned) expect(args.slice(args.indexOf("-r"), args.indexOf("-r") + 2)).toEqual(["-r", SESSION]);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("offers a recovery token only for an unconfirmed stop and force-stops exactly that worker", async () => {
     const killSpy = spyKill();
     vi.useFakeTimers();

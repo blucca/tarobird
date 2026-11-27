@@ -21,7 +21,7 @@ import { isLogicalSessionId } from "../runtime/logical-session.js";
 import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
 import { cancelOwnedAntigravityQuotaReads, readOwnedAntigravityQuota, type AntigravityQuotaSpawn } from "./antigravity-account-quota.js";
 import { spawnEngine } from "../runtime/engine-process.js";
-import { appStopKillOptions } from "../runtime/turn-cancellation.js";
+import { APP_STOP_PROCESS_GRACE_MS, appStopKillOptions } from "../runtime/turn-cancellation.js";
 import { DEFAULT_APPROVAL_MODE, normalizeApprovalMode, type ApprovalMode } from "../state/approval-mode.js";
 import { ANTIGRAVITY_EFFORT_LEVELS, readValidatedConfigFile, resolveEngineOverride } from "../state/instance-config.js";
 import type {
@@ -36,6 +36,7 @@ import type {
   EngineStreamEvent,
   EngineTask,
   EngineTaskSnapshot,
+  EngineSessionRestartResult,
 } from "./adapter.js";
 import { EngineIncompleteResponseError, EngineSteeringRejectedError } from "./adapter.js";
 import { killProcessTree } from "./process-tree.js";
@@ -650,6 +651,14 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       blocks.push(...await attachmentBlocks(input.files));
     }
     return blocks;
+  }
+
+  /** session/close, then the `agy acp` process tree of this session only; the next turn loads the session again. */
+  async restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
+    const worker = this.workers.get(sessionId);
+    if (!worker || worker.removed) return { outcome: "not_running" };
+    await this.closeWorker(worker, new Error(STOPPED_BY_USER), { graceMs: APP_STOP_PROCESS_GRACE_MS });
+    return { outcome: "restarted" };
   }
 
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {

@@ -1308,6 +1308,54 @@ describe("core service shared rules (compatibility profile)", () => {
     }
   });
 
+  it("/restart stops the in-flight turn, then restarts the conversation's engine process", async () => {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), "core-shared-rules-"));
+    const runtime = createCoreServiceRuntime();
+    const channel = fakeChannel();
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const order: string[] = [];
+    const bridge = {
+      ...allowAllBridge(vi.fn(async ({ abortSignal }: { abortSignal?: AbortSignal }) => {
+        markStarted();
+        await new Promise<void>((_resolve, reject) => {
+          abortSignal?.addEventListener("abort", () => { order.push("aborted"); reject(new Error("Task was stopped by user")); }, { once: true });
+        });
+        return { text: "unreachable" };
+      })),
+      restartConversationSession: vi.fn(async () => { order.push("restart"); return "restarted" as const; }),
+    };
+    try {
+      const firstRun = handleCoreMessage({ channel, bridge, runtime, stateDir, message: fakeLarkMessage({ messageId: "om_first", content: "first" }) });
+      await started;
+      await handleCoreMessage({ channel, bridge, runtime, stateDir, message: fakeLarkMessage({ messageId: "om_restart", content: "/restart" }) });
+      await firstRun;
+      expect(order).toEqual(["aborted", "restart"]);
+      expect(bridge.restartConversationSession).toHaveBeenCalledOnce();
+      expect(bridge.restartConversationSession.mock.calls[0]![0]).toMatchObject({ conversationKey: expect.any(String) });
+      expect(sentPayloads(channel)).toContain("已停止当前任务。已重启这个对话的引擎进程，会话保留。");
+      const events = parseTimelineEvents(await readFile(path.join(stateDir, "timeline.log.jsonl"), "utf8"));
+      expect(events).toContainEqual(expect.objectContaining({ type: "command.handled", detail: "/restart", outcome: "success",
+        metadata: expect.objectContaining({ result: "restarted", stoppedTurn: true }) }));
+      expect(bridge.handleAuthorizedMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("/restart explains an engine without support and never queues a turn", async () => {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), "core-shared-rules-"));
+    const channel = fakeChannel();
+    const bridge = allowAllBridge();
+    try {
+      await handleCoreMessage({ channel, bridge, runtime: createCoreServiceRuntime(), stateDir, message: fakeLarkMessage({ messageId: "om_restart", content: "/restart" }) });
+      expect(sentPayloads(channel)).toContain("当前引擎暂不支持 /restart");
+      expect(bridge.handleAuthorizedMessage).not.toHaveBeenCalled();
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("passes the configured timeout override into engine turns", async () => {
     const stateDir = await mkdtemp(path.join(os.tmpdir(), "core-shared-rules-"));
     await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "codex", disableRuntimeTimeout: true }) + "\n", "utf8");

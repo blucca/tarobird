@@ -63,6 +63,7 @@ import type {
   CodexUserMessageInput,
   AppPlatformTools,
   SideCapability,
+  EngineSessionRestartResult,
 } from "./adapter.js";
 import {
   ClaudeSideChannelClosedError,
@@ -4146,6 +4147,10 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     if (!worker || !fence?.unconfirmed || !fence.recoveryToken || fence.recoveryToken !== input.token) return { outcome: "rejected", reason: "stale" };
     this.forceStopWorker(worker);
     return { outcome: "accepted" };
+  }
+
+  async restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
+    return { outcome: await this.forceStopSession(sessionId) ? "restarted" : "not_running" };
   }
 
   async forceStopSession(sessionId: string): Promise<boolean> {

@@ -539,6 +539,8 @@ export interface CodexUserMessageInput {
   engineOverride?: EngineOverride;
 }
 
+export interface EngineSessionRestartResult { outcome: "restarted" | "not_running" }
+
 export interface CodexAdapter {
   /** Account quota only: never starts a model turn. Private proof must not enter public replies. */
   getAccountQuota?(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult>;
@@ -644,5 +646,10 @@ export interface CodexAdapter {
     locale?: Locale;
     abortSignal?: AbortSignal;
   }): Promise<EngineSideSession>;
+  /** Ends the native process behind this session (and its background tasks)
+   * so the next turn starts a fresh one on the same session, keeping its
+   * context. `not_running`: no live process for this session. Absent: the
+   * engine cannot restart one session without affecting others. */
+  restartSession?(sessionId: string): Promise<EngineSessionRestartResult>;
   destroy?(): void | Promise<void>;
 }

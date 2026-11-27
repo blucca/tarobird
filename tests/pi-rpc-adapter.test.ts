@@ -248,6 +248,20 @@ describe("PiRpcAdapter sessions and process lifecycle", () => {
     expect(input.events[2]).toMatchObject({ delta: true });
   });
 
+  it("restartSession ends only that session's Pi process, and the next turn starts a new one on the same session", async () => {
+    const r = await rig();
+    const { sessionId } = await r.adapter.createSession(1);
+    await expect(r.adapter.restartSession(sessionId)).resolves.toEqual({ outcome: "not_running" });
+    await r.adapter.sendUserMessage(sessionId, message("hello"));
+    expect(r.spawner.processes).toHaveLength(1);
+    await expect(r.adapter.restartSession(sessionId)).resolves.toEqual({ outcome: "restarted" });
+    await expect(r.adapter.restartSession(sessionId)).resolves.toEqual({ outcome: "not_running" });
+    const response = await r.adapter.sendUserMessage(sessionId, message("again"));
+    expect(response).toMatchObject({ text: "ok", sessionId });
+    expect(r.spawner.processes).toHaveLength(2);
+    expect(r.spawner.last().args.join(" ")).toContain(sessionId);
+  });
+
   it("resumes an existing session file by absolute path and refuses one from another workspace", async () => {
     const r = await rig();
     const dir = path.join(r.stateDir, "pi", "sessions"); await mkdir(dir, { recursive: true });

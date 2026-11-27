@@ -191,6 +191,7 @@ export interface CoreBridgeLike {
     title?: string;
     updatedAt?: string;
   }>>;
+  restartConversationSession?(input: { chatId: number; messageThreadId?: number; conversationKey?: string }): Promise<"restarted" | "not_running" | "no_session" | "unsupported">;
   getContextUsage?(input: {
     chatId: number;
     messageThreadId?: number;

@@ -7,7 +7,7 @@ import path from "node:path";
 import {
   EngineIncompleteResponseError, EngineSteeringRejectedError, withFailedTurnUsage,
   type AppPlatformTools, type CodexAdapter, type CodexAdapterResponse, type CodexSessionHandle, type CodexUserMessageInput,
-  type EngineApprovalDecision, type EngineContextUsage, type EngineStreamEvent, type ExternalSessionInfo,
+  type EngineApprovalDecision, type EngineContextUsage, type EngineSessionRestartResult, type EngineStreamEvent, type ExternalSessionInfo,
   type NativeHistoryAnchor, type NativeHistoryRejection, type NativeHistoryResult, type NativeHistoryState,
 } from "./adapter.js";
 import { ENGINE_DEFAULT_INACTIVITY_TIMEOUT_MS, ENGINE_DEFAULT_TURN_TIMEOUT_MS } from "./engine-timeouts.js";
@@ -682,6 +682,15 @@ export class PiRpcAdapter implements CodexAdapter {
     const worker = await this.ensureWorker(sessionId, await this.resolveWorkspace(input.workspaceOverride));
     if (!worker.turn) worker.touchedBy = "a context usage read";
     return read(worker);
+  }
+
+  /** Ends this session's Pi process; the next turn starts a new one on the same session file. */
+  async restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
+    const worker = this.workers.get(sessionId);
+    if (!worker || worker.closed) return { outcome: "not_running" };
+    if (worker.turn && !worker.turn.done.settled) worker.turn.stopRequested = true;
+    await this.closeWorker(worker, { terminate: true });
+    return { outcome: "restarted" };
   }
 
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {

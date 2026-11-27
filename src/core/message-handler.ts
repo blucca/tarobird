@@ -81,6 +81,7 @@ import {
   isCoreGoalControlCommand,
   tryHandleCoreGoalControlBeforeQueue,
   isCoreLocalEngineCommand,
+  isRestartCommand,
   isStopCommand,
 } from "./commands.js";
 import {
@@ -539,6 +540,28 @@ async function runAcceptedCoreMessage(
       });
     return false;
   };
+
+  // /restart ends the engine process behind this conversation's session and
+  // keeps the binding, so the next turn continues the same context afresh.
+  // Pre-queue like /stop: a wedged turn must not block it.
+  if (isRestartCommand(commandText)) {
+    if (!(await checkPreQueueAccess("/restart"))) return true;
+    const stopped = await stopCoreConversation(input.runtime, normalized.conversationKey, input.stateDir);
+    const outcome = input.bridge.restartConversationSession
+      ? await input.bridge.restartConversationSession({ chatId: normalized.bridgeChatId, conversationKey: normalized.conversationKey })
+      : "unsupported";
+    await input.channel.send(normalized.chatId, { text: renderCoreRestart(outcome, !!stopped.active, messageLocale) }, {
+      replyTo: normalized.messageId,
+      replyInThread: Boolean(normalized.threadId),
+    });
+    await appendCoreTimelineEvent(input.stateDir, normalized, {
+      type: "command.handled",
+      outcome: outcome === "restarted" ? "success" : "noop",
+      detail: "/restart",
+      metadata: { result: outcome, stoppedTurn: !!stopped.active },
+    });
+    return true;
+  }
 
   // Codex goal controls must remain reachable while an ordinary turn runs.
   // Native Claude commands still execute through its serialized input stream.
@@ -4201,4 +4224,21 @@ function isVideoCoreAttachment(
 
 function isVideoCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
   return isVideoCoreAttachment(downloaded.attachment, downloaded.localPath);
+}
+
+function renderCoreRestart(outcome: "restarted" | "not_running" | "no_session" | "unsupported", stoppedTurn: boolean, locale: Locale): string {
+  const zh = locale === "zh";
+  const stopped = stoppedTurn ? (zh ? "已停止当前任务。" : "Stopped the current task. ") : "";
+  switch (outcome) {
+    case "restarted": return stopped + (zh
+      ? "已重启这个对话的引擎进程，会话保留。下一条消息会在新进程里接着原来的上下文继续。"
+      : "Restarted this chat's engine process and kept its session. Your next message continues the same context in a new process.");
+    case "not_running": return stopped + (zh
+      ? "这个对话现在没有在运行的引擎进程，不需要重启。下一条消息会直接起新进程，接着原来的会话。"
+      : "No engine process is running for this chat, so there is nothing to restart. Your next message starts a new one on the same session.");
+    case "no_session": return stopped + (zh ? "这个对话还没有会话，不需要重启。" : "This chat has no session yet, so there is nothing to restart.");
+    default: return stopped + (zh
+      ? "当前引擎暂不支持 /restart（它的进程由多个对话共用，或每轮都会新起进程）。想清空会话重新开始，可以用 /reset。"
+      : "This engine doesn't support /restart yet (its process is shared by several chats, or a new one starts for every turn). Use /reset for a fresh session.");
+  }
 }
