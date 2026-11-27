@@ -59,7 +59,9 @@ test("desktop sidebar Unread filter lists unread across bots, hosts, folders and
     await pair(page, a, "macmini");
     await pair(page, b, "studio-b", true);
 
-    // Open a read conversation first.
+    // Visit read conversations on both hosts so both workspaces are mounted with a read selection.
+    await sidebar(page).locator(`[data-conversation-id="${bRead[0]!.id}"]`).click();
+    await expect(workspace(page).getByRole("heading", { name: "B Read 1", exact: true })).toBeVisible();
     await sidebar(page).locator(`[data-conversation-id="${aRead[0]!.id}"]`).click();
     await expect(workspace(page).getByRole("heading", { name: "A Read 1", exact: true })).toBeVisible();
 
@@ -114,7 +116,7 @@ test("desktop sidebar Unread filter lists unread across bots, hosts, folders and
     expect(await sidebar(page).locator(".sidebar-unread-filter").evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
     await separator.dblclick();
 
-    // Open Gamma Unread (on studio-b): it marks read, total drops from 3 to 2, row stays visible while open!
+    // Open Gamma Unread (on previously visited studio-b): it marks read, total drops from 3 to 2, row stays visible while open!
     await sidebar(page).locator(`[data-conversation-id="${unreadB.id}"]`).click();
     await expect(workspace(page).getByRole("heading", { name: "Gamma Unread", exact: true })).toBeVisible();
     await expect(page).toHaveTitle("(2) TaroBird", { timeout: 20_000 });
@@ -122,6 +124,12 @@ test("desktop sidebar Unread filter lists unread across bots, hosts, folders and
     await expect(sidebar(page).locator(`[data-conversation-id="${unreadB.id}"]`)).toBeVisible();
     await expect(sidebar(page).locator(`[data-conversation-id="${unreadB.id}"]`)).toHaveAttribute("aria-current", "page");
     await expect(sidebar(page).locator(`[data-conversation-id="${unreadB.id}"] .unread-badge`)).toHaveCount(0);
+
+    // Re-clicking the open retained row or active Unread chip keeps it visible.
+    await sidebar(page).locator(`[data-conversation-id="${unreadB.id}"]`).click();
+    await expect(sidebar(page).locator(`[data-conversation-id="${unreadB.id}"]`)).toBeVisible();
+    await unreadChip.click();
+    await expect(sidebar(page).locator(`[data-conversation-id="${unreadB.id}"]`)).toBeVisible();
 
     // Navigate to Alpha Unread (on macmini): Gamma Unread leaves the list; Alpha Unread marks read, total drops to 0!
     await sidebar(page).locator(`[data-conversation-id="${unreadA.id}"]`).click();
@@ -144,6 +152,140 @@ test("desktop sidebar Unread filter lists unread across bots, hosts, folders and
     await openMobileHome(page);
     await expect(workspace(page).locator(".mobile-home .mh-filters")).toBeVisible();
     await expect(sidebar(page).locator(".sidebar-unread-filter")).toBeHidden();
+  } finally {
+    await page.close();
+    await a.close();
+    await b.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("single-host By Bot Unread view does not render empty state below globally pinned unread conversations", async ({ page }) => {
+  test.setTimeout(90_000);
+  const root = await mkdtemp(path.join(os.tmpdir(), "sidebar-unread-global-pin-"));
+  const hub = await HubServer.start({ stateDir: path.join(root, "a"), clientDir: path.resolve("dist") });
+  try {
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash,online) VALUES('alpha','Alpha Bot','fixture',1)");
+    const readChat = await hub.store.createConversation("owner", ["alpha"], "Alpha Read", "a_read");
+    const pinnedChat = await hub.store.createConversation("owner", ["alpha"], "Pinned Unread", "a_pinned");
+
+    await pair(page, hub, "macmini");
+    await sidebar(page).locator(`[data-conversation-id="${readChat.id}"]`).click();
+    await expect(workspace(page).getByRole("heading", { name: "Alpha Read", exact: true })).toBeVisible();
+
+    // Globally pin the second conversation via its context menu.
+    await sidebar(page).locator(`[data-conversation-id="${pinnedChat.id}"]`).click({ button: "right" });
+    await page.getByRole("menu", { name: "对话操作", exact: true }).getByRole("menuitem", { name: "全局置顶", exact: true }).click();
+    const globalRegion = sidebar(page).getByRole("region", { name: "已全局置顶", exact: true });
+    await expect(globalRegion.locator(`[data-conversation-id="${pinnedChat.id}"]`)).toBeVisible();
+
+    await hub.store.publishBotMessage("alpha", { conversationId: pinnedChat.id, blocks: [{ type: "text", text: "Pinned ping" }] });
+    await expect(page).toHaveTitle("(1) TaroBird", { timeout: 20_000 });
+
+    const filterGroup = sidebar(page).getByRole("group", { name: "筛选会话", exact: true });
+    const allChip = filterGroup.getByRole("button", { name: "全部", exact: true });
+    const unreadChip = filterGroup.getByRole("button", { name: /^未读/ });
+    await expect(unreadChip.locator(".sidebar-unread-total")).toHaveText("1");
+
+    // Default By Bot layout: globally pinned unread row renders with no empty-sidebar state beneath it.
+    await unreadChip.click();
+    await expect(unreadChip).toHaveAttribute("aria-pressed", "true");
+    await expect(globalRegion.locator(`[data-conversation-id="${pinnedChat.id}"]`)).toBeVisible();
+    await expect(sidebar(page).locator(".empty-sidebar")).toHaveCount(0);
+    await expect(sidebar(page).locator(".host-directory-section")).toHaveCount(0);
+
+    // By chat layout also shows the global pin without an empty state.
+    await sidebar(page).getByRole("button", { name: "按对话", exact: true }).click();
+    await expect(globalRegion.locator(`[data-conversation-id="${pinnedChat.id}"]`)).toBeVisible();
+    await expect(sidebar(page).locator(".empty-sidebar")).toHaveCount(0);
+
+    // Opening the pinned unread chat in By Bot layout marks it read and retains it cleanly.
+    await sidebar(page).getByRole("button", { name: "按 Bot", exact: true }).click();
+    await globalRegion.locator(`[data-conversation-id="${pinnedChat.id}"]`).click();
+    await expect(workspace(page).getByRole("heading", { name: "Pinned Unread", exact: true })).toBeVisible();
+    await expect(page).toHaveTitle("TaroBird", { timeout: 20_000 });
+    await expect(globalRegion.locator(`[data-conversation-id="${pinnedChat.id}"]`)).toBeVisible();
+    await expect(sidebar(page).locator(".empty-sidebar")).toHaveCount(0);
+
+    // Re-clicking the retained pinned row or active Unread chip keeps it visible without an empty state.
+    await globalRegion.locator(`[data-conversation-id="${pinnedChat.id}"]`).click();
+    await unreadChip.click();
+    await expect(globalRegion.locator(`[data-conversation-id="${pinnedChat.id}"]`)).toBeVisible();
+    await expect(sidebar(page).locator(".empty-sidebar")).toHaveCount(0);
+
+    // Toggling All -> Unread once read shows the single empty state.
+    await allChip.click();
+    await unreadChip.click();
+    await expect(globalRegion).toHaveCount(0);
+    await expect(sidebar(page).locator(".empty-sidebar")).toHaveCount(1);
+    await expect(sidebar(page).locator(".empty-sidebar")).toHaveText("没有未读会话");
+  } finally {
+    await page.close();
+    await hub.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Unread filter resets 0-unread host filter, preserves retained chat on re-click/Bot header, and clears retained chat when switching to an empty host", async ({ page }) => {
+  test.setTimeout(120_000);
+  const root = await mkdtemp(path.join(os.tmpdir(), "sidebar-unread-host-switch-"));
+  const a = await HubServer.start({ stateDir: path.join(root, "a"), clientDir: path.resolve("dist") });
+  const b = await HubServer.start({ stateDir: path.join(root, "b"), origins: [a.url] });
+  try {
+    await a.store.db.run("INSERT INTO bots(id,name,secret_hash,online) VALUES('alpha','Alpha Bot','fixture',1)");
+    const readA = await a.store.createConversation("owner", ["alpha"], "Alpha Read", "a_read");
+    const unreadA = await a.store.createConversation("owner", ["alpha"], "Alpha Unread", "a_unread");
+
+    await pair(page, a, "macmini");
+    await pair(page, b, "studio-empty", true);
+
+    await sidebar(page).locator(`[data-conversation-id="${readA.id}"]`).click();
+    await expect(workspace(page).getByRole("heading", { name: "Alpha Read", exact: true })).toBeVisible();
+
+    await a.store.publishBotMessage("alpha", { conversationId: unreadA.id, blocks: [{ type: "text", text: "Unread 1" }] });
+    await a.store.publishBotMessage("alpha", { conversationId: unreadA.id, blocks: [{ type: "text", text: "Unread 2" }] });
+
+    const filterGroup = sidebar(page).getByRole("group", { name: "筛选会话", exact: true });
+    const unreadChip = filterGroup.getByRole("button", { name: /^未读/ });
+    const hostSelect = sidebar(page).getByLabel("筛选运行主机", { exact: true });
+
+    await expect(page).toHaveTitle("(2) TaroBird", { timeout: 20_000 });
+    await expect(unreadChip.locator(".sidebar-unread-total")).toHaveText("2");
+
+    // Scope host dropdown to the 0-unread host while the other host has 2 unread messages.
+    await hostSelect.selectOption({ label: "studio-empty" });
+    await expect(workspace(page).getByRole("heading", { name: "欢迎回来", exact: true })).toBeVisible();
+    await expect(unreadChip.locator(".sidebar-unread-total")).toHaveText("2");
+
+    // Clicking Unread (2) resets the host filter so all unread chats appear in one click.
+    await unreadChip.click();
+    await expect(unreadChip).toHaveAttribute("aria-pressed", "true");
+    await expect(hostSelect).toHaveValue("");
+    await expect(sidebar(page).locator(`[data-conversation-id="${unreadA.id}"]`)).toBeVisible();
+    await expect(sidebar(page).locator(".empty-sidebar")).toHaveCount(0);
+
+    // Open Alpha Unread in By Bot layout -> marks read and stays retained.
+    await sidebar(page).locator(`[data-conversation-id="${unreadA.id}"]`).click();
+    await expect(workspace(page).getByRole("heading", { name: "Alpha Unread", exact: true })).toBeVisible();
+    await expect(page).toHaveTitle("TaroBird", { timeout: 20_000 });
+    await expect(sidebar(page).locator(`[data-conversation-id="${unreadA.id}"]`)).toBeVisible();
+    await expect(sidebar(page).locator(`[data-conversation-id="${unreadA.id}"] .unread-badge`)).toHaveCount(0);
+
+    // Re-clicking the open row, its Bot header, or the active Unread chip keeps it visible.
+    await sidebar(page).locator(`[data-conversation-id="${unreadA.id}"]`).click();
+    await expect(sidebar(page).locator(`[data-conversation-id="${unreadA.id}"]`)).toBeVisible();
+    await sidebar(page).locator('.bot-tree[data-bot-id="alpha"] .bot-identity').click();
+    await expect(sidebar(page).locator(`[data-conversation-id="${unreadA.id}"]`)).toBeVisible();
+    await unreadChip.click();
+    await expect(sidebar(page).locator(`[data-conversation-id="${unreadA.id}"]`)).toBeVisible();
+
+    // Switching to the host with 0 conversations clears retainedOpen so stale read rows do not linger.
+    await hostSelect.selectOption({ label: "studio-empty" });
+    await expect(workspace(page).getByRole("heading", { name: "欢迎回来", exact: true })).toBeVisible();
+    await hostSelect.selectOption("");
+    await expect(workspace(page).getByRole("heading", { name: "欢迎回来", exact: true })).toBeVisible();
+    await expect(sidebar(page).locator(`[data-conversation-id="${unreadA.id}"]`)).toHaveCount(0);
+    await expect(sidebar(page).locator(".empty-sidebar")).toHaveText("没有未读会话");
   } finally {
     await page.close();
     await a.close();

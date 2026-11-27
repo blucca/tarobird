@@ -312,6 +312,8 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
     return entry && dir?.registration === entry.host.registrationId ? dir : undefined;
   };
   const changeUnreadOnly = (next: boolean) => {
+    if (next && filter) setFilter("");
+    if (next === unreadOnly) return;
     setUnreadOnly(next);
     if (!next) { setRetainedOpen(undefined); return; }
     const convId = activeRef.current ? selected[activeRef.current] ?? "" : "";
@@ -325,12 +327,14 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   const command = (id: string, value: Omit<HostCommand, "serial">) => {
     selectHost(id);
     if (unreadOnly && value.kind === "select" && value.conversationId !== undefined) {
+      const conversationId = value.conversationId;
       const data = unreadDirectoryFor(id);
-      if (data && isUnreadSelectionTarget(data.conversations, data.activity, data.globalPins, value.conversationId, preferences.sidebarLayout)) {
-        setRetainedOpen({ hostId: id, conversationId: value.conversationId });
-      } else {
-        setRetainedOpen(undefined);
-      }
+      setRetainedOpen(previous => {
+        if (previous?.hostId === id && previous.conversationId === conversationId) return previous;
+        return data && isUnreadSelectionTarget(data.conversations, data.activity, data.globalPins, conversationId, preferences.sidebarLayout)
+          ? { hostId: id, conversationId }
+          : undefined;
+      });
     }
     setCommands((old) => ({ ...old, [id]: { ...value, serial: ++sequence.current } }));
   };
@@ -458,16 +462,17 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   const pendingSelectId = activeId && commands[activeId]?.kind === "select" ? commands[activeId]?.conversationId : undefined;
   useEffect(() => {
     if (!unreadOnly) return;
-    if (!activeId || !activeConversationId || pendingSelectId && pendingSelectId !== activeConversationId) return;
+    if (pendingSelectId !== undefined && pendingSelectId !== activeConversationId) return;
+    if (!activeId || !activeConversationId) { setRetainedOpen(undefined); return; }
     setRetainedOpen(previous => {
       if (previous && previous.hostId === activeId && previous.conversationId === activeConversationId) return previous;
-      const data = directories[activeId];
+      const data = unreadDirectoryFor(activeId);
       if (data && isUnreadSelectionTarget(data.conversations, data.activity, data.globalPins, activeConversationId, preferences.sidebarLayout)) {
         return { hostId: activeId, conversationId: activeConversationId };
       }
       return undefined;
     });
-  }, [unreadOnly, activeId, activeConversationId, pendingSelectId, directories, preferences.sidebarLayout]);
+  }, [unreadOnly, activeId, activeConversationId, pendingSelectId, directories, state.hosts, preferences.sidebarLayout]);
   const badgeRequest = useRef<{ count: number; pending: boolean; applied: boolean } | undefined>(undefined);
   useEffect(() => {
     document.title = unreadCount ? `(${unreadCount}) TaroBird` : "TaroBird";
@@ -598,7 +603,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
       const match = unreadMatchesByHost.get(row.hostId);
       return !match || match.matchingIds.has(row.conversation.id) || match.groupIds.has(row.conversation.id);
     });
-    const visibleEntries = unreadFilterActive && entries.length > 1
+    const visibleEntries = unreadFilterActive
       ? entries.filter(entry => {
         const data = dataFor(entry.host.id);
         const match = unreadMatchesByHost.get(entry.host.id);
@@ -610,7 +615,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
         );
       })
       : entries;
-    return bulkScope(<div className="host-directory-content">{globalRows.length > 0 && <GlobalPinSection>{globalRows.map(row => <div key={row.key}>{render(row.hostId, { kind: "conversation", id: row.conversation.id, ...(layout === "conversations" ? { inbox: row } : {}) }, entries.length > 1)}</div>)}</GlobalPinSection>}<div className="sidebar-directory-groups">{leadingSection}</div>{visibleEntries.map(entry => <section key={entry.host.id} data-host-id={entry.host.id} className="host-directory-section" aria-label={t("主机：{0}", entry.host.name)}>{entries.length > 1 && <div className="host-heading-row"><button className="host-heading" aria-label={t("{0}，{1}", entry.host.name, entry.connection?.state.status === "online" ? t("已连接") : t("离线"))} onClick={() => selectHost(entry.host.id)}><Monitor size={13}/><strong>{entry.host.name}</strong><i className={`status-dot ${entry.connection?.state.status === "online" ? "online" : ""}`}/></button></div>}{entry.connection && dataFor(entry.host.id) ? render(entry.host.id) : unavailable(entry)}</section>)}{unreadFilterActive && entries.length > 1 && !visibleEntries.length && !globalRows.length && <p className="empty-sidebar">{t("没有未读会话")}</p>}</div>);
+    return bulkScope(<div className="host-directory-content">{globalRows.length > 0 && <GlobalPinSection>{globalRows.map(row => <div key={row.key}>{render(row.hostId, { kind: "conversation", id: row.conversation.id, ...(layout === "conversations" ? { inbox: row } : {}) }, entries.length > 1)}</div>)}</GlobalPinSection>}<div className="sidebar-directory-groups">{leadingSection}</div>{visibleEntries.map(entry => <section key={entry.host.id} data-host-id={entry.host.id} className="host-directory-section" aria-label={t("主机：{0}", entry.host.name)}>{entries.length > 1 && <div className="host-heading-row"><button className="host-heading" aria-label={t("{0}，{1}", entry.host.name, entry.connection?.state.status === "online" ? t("已连接") : t("离线"))} onClick={() => selectHost(entry.host.id)}><Monitor size={13}/><strong>{entry.host.name}</strong><i className={`status-dot ${entry.connection?.state.status === "online" ? "online" : ""}`}/></button></div>}{entry.connection && dataFor(entry.host.id) ? render(entry.host.id) : unavailable(entry)}</section>)}{unreadFilterActive && !visibleEntries.length && !globalRows.length && <p className="empty-sidebar">{t("没有未读会话")}</p>}</div>);
   };
   const savePairing = async (identity: Identity, name: string) => {
     localControllerEpoch.current++;

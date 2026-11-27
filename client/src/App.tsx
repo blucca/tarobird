@@ -757,8 +757,8 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   useEffect(() => { if (selected && !pane) shell?.selection(selected); }, [selected]);
   useLayoutEffect(() => {
     const action = shell?.command; if (!action) return;
-    if (action.kind === "select" && action.conversationId !== undefined) { setFocusTarget(action.messageId ? { conversationId: action.conversationId, messageId: action.messageId } : undefined); if (!action.messageId) { followLatest.current = true; setShowLatest(false); } setSelected(action.conversationId); closeSearch(); setSidebar(false); }
-    else if (action.kind === "archive-selection") { const next = selectionAfterArchive(selected, action.conversationIds ?? [], conversations, navigationItems({ connection, bots: state.bots, conversations }, preferences.showDisconnectedBots).conversations, activity); if (next !== undefined) { setSelected(next); setFocusTarget(undefined); closeSearch(); } }
+    if (action.kind === "select" && action.conversationId !== undefined) { setFocusTarget(action.messageId ? { conversationId: action.conversationId, messageId: action.messageId } : undefined); if (!action.messageId) { followLatest.current = true; setShowLatest(false); } setSelected(action.conversationId); if (!pane) shell?.selection(action.conversationId); closeSearch(); setSidebar(false); }
+    else if (action.kind === "archive-selection") { const next = selectionAfterArchive(selected, action.conversationIds ?? [], conversations, navigationItems({ connection, bots: state.bots, conversations }, preferences.showDisconnectedBots).conversations, activity); if (next !== undefined) { setSelected(next); if (!pane) shell?.selection(next); setFocusTarget(undefined); closeSearch(); } }
     else if (action.kind === "connection-settings") { setSettingsSection("connection"); setSettings(true); }
     else if (action.kind === "bot-capabilities" && action.botId) { setDetailBot(action.botId); setCapabilities(true); }
     else if (action.kind === "bot-operations" && action.botId) { const bot = state.bots.find(bot => bot.id === action.botId); if (bot) { setOperationBot({ botId: bot.id, name: labels.get(bot.id) ?? bot.name, view: "dashboard" }); setOperations(true); } }
@@ -813,6 +813,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const localUnreadCount = useMemo(() => shell || pane ? 0 : conversationUnreadTotal(conversations, activity), [activity, conversations, shell, pane, showTickets]);
   useEffect(() => { if (shell || pane) return; document.title = localUnreadCount ? `(${localUnreadCount}) TaroBird` : "TaroBird"; void updateBadge(localUnreadCount).catch(() => undefined); }, [localUnreadCount, shell, pane]);
   const changeLocalUnreadOnly = (next: boolean) => {
+    if (next === localUnreadOnly) return;
     setLocalUnreadOnly(next);
     if (!next) { setLocalRetainedOpen(undefined); return; }
     if (selected && isUnreadSelectionTarget(conversations, activity, globalPins, selected, preferences.sidebarLayout)) {
