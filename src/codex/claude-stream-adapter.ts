@@ -2419,6 +2419,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       this.ensureReviewScope(worker, worker.pendingTaskNotification);
       worker.suppressNextTaskNotificationAssistant = true;
       worker.taskNotificationTurnActive = true;
+      worker.nativeTurnOpen = true;
       worker.taskNotificationAssistantText = "";
       worker.taskNotificationDeliveryText = "";
       return;
@@ -2712,6 +2713,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
         this.clearPendingTurnTimeout(pending);
         this.markWorkerActivity(worker);
         this.abandonUnfoldedSteers(worker, pending);
+        this.anchorQueuedTaskNotifications(worker, eventSeenAt);
         pending.reject(claudeNoResponseError(pending.locale));
         return;
       }
@@ -2729,6 +2731,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
         this.markWorkerActivity(worker);
         this.clearPendingTurnTimeout(pending);
         this.abandonUnfoldedSteers(worker, pending);
+        this.anchorQueuedTaskNotifications(worker, eventSeenAt);
         const renderedError = sanitizeClaudeUserVisibleText(
           renderClaudeStreamError(parsed, worker.stderrTail),
         );
@@ -2782,12 +2785,10 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       const turnUsage = earlier ? Promise.all([earlier.usage, segmentUsage]).then(([a, b]) => sumUsage(a, b)) : segmentUsage;
       worker.pendingTurn = null;
       this.markWorkerActivity(worker);
-      if (worker.pendingTaskNotification) {
-        // A review cannot start until this foreground turn closes. Measure its
-        // bounded start window from here, not from the earlier terminal frame.
-        // This also covers an older task that finished during a newer turn.
-        worker.pendingTaskNotification.lastSeenAt = eventSeenAt;
-      }
+      // A review cannot start until this foreground turn closes. Measure the
+      // bounded start window of pending and queued reviewTurn:false entries
+      // from here, not from their earlier pre-turn terminal frames.
+      this.anchorQueuedTaskNotifications(worker, eventSeenAt);
       if (missed.length > 0) {
         // Claude starts a steer that missed the fold as its own native turn
         // (~1 ms later; withdrawing it now is unreliable). That turn continues
@@ -2807,6 +2808,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       worker.taskNotificationTurnActive = false;
       worker.taskNotificationAssistantText = "";
       worker.taskNotificationDeliveryText = "";
+      this.anchorQueuedTaskNotifications(worker, eventSeenAt);
       this.resolveTaskNotificationWaiters(worker);
     }
   }
@@ -2840,6 +2842,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       worker.taskNotificationTurnActive = false;
       worker.taskNotificationAssistantText = "";
       worker.taskNotificationDeliveryText = "";
+      this.anchorQueuedTaskNotifications(worker, eventSeenAt);
       this.resolveTaskNotificationWaiters(worker);
     };
     if (collectedTaskId && worker.collectedBackgroundTaskIds.delete(collectedTaskId)) {
@@ -3250,6 +3253,19 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       && worker.pendingTaskNotification.taskId !== taskId;
   }
 
+  /** Anchor the start-grace window of unstarted task notifications to when the
+   *  blocking review or foreground turn actually ended, so a long blocking turn
+   *  does not expire queued notifications with 0ms grace while stale entries
+   *  still expire once grace elapses after turn release. */
+  private anchorQueuedTaskNotifications(worker: ClaudeWorker, now = Date.now()): void {
+    if (worker.pendingTaskNotification && !worker.taskNotificationTurnActive) {
+      worker.pendingTaskNotification.lastSeenAt = now;
+    }
+    for (const queued of worker.queuedTaskNotifications) {
+      if (!queued.reviewTurn) queued.entry.lastSeenAt = now;
+    }
+  }
+
   /** Install the next queued cross-turn notification once the slot is free.
    *  The finished banner already went out when the task completed; installing
    *  only restores the attribution/review bookkeeping the clobber used to
@@ -3270,7 +3286,6 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     if (next.reviewTurn) {
       this.ensureReviewScope(worker, worker.pendingTaskNotification);
       worker.taskNotificationTurnActive = true;
-      worker.nativeTurnOpen = true;
       worker.taskNotificationAssistantText = "";
       worker.taskNotificationDeliveryText = "";
     }
@@ -4186,6 +4201,9 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     const stopped = fence.turn;
     fence.turn = undefined;
     if (stopped) this.settleStoppedTurn(worker, stopped, worker.retired ? "unconfirmed" : fence.tooLate ? "too_late" : "stopped");
+    if (!worker.retired && !worker.pendingTurn && !worker.continuationTurn && !worker.taskNotificationTurnActive) {
+      this.anchorQueuedTaskNotifications(worker);
+    }
     fence.release();
   }
 
@@ -4888,8 +4906,12 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       worker.pendingTaskNotification = null;
       worker.suppressNextTaskNotificationAssistant = false;
       worker.taskNotificationTurnActive = false;
+      if (!worker.pendingTurn && !worker.continuationTurn) {
+        worker.nativeTurnOpen = false;
+      }
       worker.taskNotificationAssistantText = "";
       worker.taskNotificationDeliveryText = "";
+      this.anchorQueuedTaskNotifications(worker, now);
       this.resolveTaskNotificationWaiters(worker);
     }
   }

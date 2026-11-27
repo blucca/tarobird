@@ -57,6 +57,18 @@ export class CoreSideSessions {
   activeCount(conversationId?: string): number {
     return [...this.slots.values()].filter(s => (!conversationId || s.scope.conversationId === conversationId) && (s.view.phase === "thinking" || s.view.phase === "preparing" || s.view.phase === "stopping")).length;
   }
+  /** True while this conversation has any open side session (including idle) or
+   * an in-flight disposal whose native reader has not been released yet. */
+  hasOpenSession(conversationId: string): boolean {
+    this.sweep();
+    for (const slot of this.slots.values()) {
+      if (!slot.closed && slot.scope.conversationId === conversationId && slot.view.phase !== "error") return true;
+    }
+    for (const closing of this.closing.values()) {
+      if (!closing.finished && closing.scope.conversationId === conversationId) return true;
+    }
+    return false;
+  }
   private track(task: Promise<unknown>): void {
     this.pending.add(task);
     void task.then(() => this.pending.delete(task), () => this.pending.delete(task));

@@ -18,13 +18,15 @@ type Snapshot = {
   capability?: SideCapabilityView; shown: boolean; view?: SideView;
   draft: string; files: File[]; error: string; ended: boolean; sending: boolean;
   focusRequest: number; uploadProgress?: number; uploadRecovering: boolean;
+  /** Incremented after an explicit or automatic close finishes Host disposal. */
+  closingRevision: number;
 };
 type PendingAsk = { text: string; files: File[]; attachments: string[]; requestId: string };
 
 /** One memory-only controller per parent conversation. Navigation detaches the
  * view, not the native session; explicit Close still disposes it immediately. */
 class SideSession {
-  private snapshot: Snapshot = { shown: false, draft: "", files: [], error: "", ended: false, sending: false, focusRequest: 0, uploadRecovering: false };
+  private snapshot: Snapshot = { shown: false, draft: "", files: [], error: "", ended: false, sending: false, focusRequest: 0, uploadRecovering: false, closingRevision: 0 };
   private listeners = new Set<() => void>();
   private generation = 0;
   private disposal: Promise<unknown> = Promise.resolve();
@@ -127,13 +129,20 @@ class SideSession {
     this.patch({ capability: outcome.kind === "ok" ? outcome.value.ok ? outcome.value.capability : undefined : outcome.kind === "transient" ? previous : undefined });
   }
   close = () => {
+    const hadActive = this.snapshot.shown || !!this.disposeCurrent || !!this.pendingOpen;
     this.generation++; this.pollGeneration++; this.capabilityGeneration++;
     clearTimeout(this.timer); this.upload?.abort(); this.upload = undefined;
-    this.disposal = Promise.allSettled([this.disposal, this.disposeCurrent?.(), this.pendingOpen]);
+    const closing = Promise.allSettled([this.disposal, this.disposeCurrent?.(), this.pendingOpen]);
+    this.disposal = closing;
     this.disposeCurrent = undefined; this.uncertain = undefined; this.stopRequested = false;
     this.uploaded = new WeakMap(); this.sentFiles.clear(); this.scroll.top = 0; this.scroll.follow = true;
     this.patch({ shown: false, view: undefined, draft: "", files: [], error: "", ended: false, sending: false, uploadProgress: undefined, uploadRecovering: false });
-    return this.disposal;
+    if (hadActive) {
+      void closing.finally(() => {
+        if (this.disposal === closing) this.patch({ closingRevision: this.snapshot.closingRevision + 1 });
+      });
+    }
+    return closing;
   };
   open = async (seed = "", restart = false, files: File[] = []) => {
     if (!this.active || !this.online || !this.snapshot.capability?.supported) return;

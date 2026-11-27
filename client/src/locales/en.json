@@ -5408,7 +5408,7 @@
   "Bot 默认模型或 Pi 默认模型当前不可用。请选择可用模型，或检查提供商登录与 Bot 默认设置后重试。": "The Bot or Pi default model is unavailable right now. Choose an available model, or check provider sign-in and Bot defaults and retry.",
   "当前对话正在回复中，请等待结束后再操作。": "This conversation is currently replying. Wait for it to finish.",
   "后台任务正在运行中，请等待结束后再操作。": "A background task is running. Wait for it to finish.",
-  "侧边追问正在进行中，请等待结束后再操作。": "A side question is in progress. Wait for it to finish.",
+  "当前有打开的侧边对话，请等待回答结束或关闭后再操作。": "A side conversation is open. Wait for it to finish or close it before continuing.",
   "请先处理待执行消息。": "Resolve pending messages first.",
   "请先暂停当前目标。": "Pause the current goal first.",
   "此会话正被其他对话共用，暂不能修改历史。": "This session is shared with another conversation. History changes are unavailable.",

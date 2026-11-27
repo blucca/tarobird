@@ -52,7 +52,8 @@ export class ConversationHistoryController {
   private readonly known = new Map<string, HistoryCapabilities>();
   constructor(private readonly sessions: HistorySessionManager, private readonly adapter: NativeConversationHistoryAdapter,
     private readonly hasNativeReader: (sessionId: string) => boolean = () => false,
-    private readonly claim?: (sessionId: string) => (() => void) | undefined) {}
+    private readonly claim?: (sessionId: string) => (() => void) | undefined,
+    private readonly hasSideReader: (sessionId: string) => boolean = () => false) {}
 
   private supported(): boolean {
     return !!(this.adapter.getHistoryState && this.sessions.getHistoryBinding && this.sessions.reserveHistory && this.sessions.releaseHistory && this.sessions.finalizeHistory);
@@ -101,6 +102,7 @@ export class ConversationHistoryController {
       ...(current.record.historyFence ? { blocked: "outcome_unknown" as const, pendingOperation: current.record.historyFence.operationId }
         : binding.shared ? { blocked: "shared_session" as const }
         : this.hasNativeReader(binding.record.codexSessionId) ? { blocked: "busy" as const }
+        : this.hasSideReader(binding.record.codexSessionId) ? { blocked: "side_session" as const }
         : native.blocked ? { blocked: native.blocked } : {}),
     };
   }
@@ -118,8 +120,9 @@ export class ConversationHistoryController {
         const sessionId = binding.record.codexSessionId;
         return this.idleLock(sessionId, async () => {
           if (this.hasNativeReader(sessionId)) return reject("busy");
+          if (this.hasSideReader(sessionId)) return reject("side_session");
           const release = this.claim?.(sessionId);
-          if (this.claim && !release) return reject("busy");
+          if (this.claim && !release) return reject(this.hasSideReader(sessionId) ? "side_session" : "busy");
           try {
           const workspaceOverride = input.workspaceOverride ?? binding.record.resume?.workspacePath;
           const native = await this.adapter.getHistoryState!(sessionId, { workspaceOverride });
