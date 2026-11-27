@@ -180,4 +180,32 @@ describe("the lightweight Design opener", () => {
       expect(f.endpoint.contextSnapshot(existing)).toEqual(existing);
     } finally { f.endpoint.dispose(); }
   });
+  it("contextSnapshot omits openTarget while /targets retries after a WS-vs-HTTP race, then attaches once confirmed", async () => {
+    const f = fixture();
+    f.endpoint.dispose();
+    f.sent.length = 0;
+    f.connection.http.mockClear();
+    let targetPolls = 0;
+    const secondPollGate = deferred();
+    const originalHttp = f.connection.http.getMockImplementation()!;
+    f.connection.http.mockImplementation(async (url: string, options?: any) => {
+      if (url.endsWith("/targets")) {
+        targetPolls++;
+        if (targetPolls === 1) return [];
+        await secondPollGate.promise;
+      }
+      return originalHttp(url, options);
+    });
+    const endpoint = new WorkbenchDesignOpener(f.connection as unknown as HubConnection, "chat", { eligible: () => true, open: f.open });
+    try {
+      await vi.waitFor(() => expect(targetPolls).toBe(2));
+      expect(endpoint.contextSnapshot()).toBeUndefined();
+      expect(f.sent.filter(value => value.type === "workbench.register")).toHaveLength(1);
+      secondPollGate.resolve();
+      await vi.waitFor(() => expect(endpoint.contextSnapshot()).toEqual({
+        target: { deviceId: "phone", windowId: endpoint.windowId },
+        openTarget: { deviceId: "phone", windowId: endpoint.windowId },
+      }));
+    } finally { secondPollGate.resolve(); endpoint.dispose(); }
+  });
 });

@@ -74,6 +74,7 @@ export interface Cache extends DBSchema {
   syncMessages: { key: [string, string]; value: Extract<SnapshotFrame, { type: "snapshot.message" }> & { owner: string }; indexes: { owner: string } };
 }
 export type OutboxEntry = Cache["outbox"]["value"];
+export type AcknowledgeResult = { entry?: OutboxEntry; alreadyDeleted: boolean };
 const workbenchItemStores = { whiteboard: "workbenchBoards", markdown: "workbenchMarkdown", design: "workbenchDesign" } as const;
 const workbenchItemId = /^[A-Za-z0-9_-]{1,128}$/;
 function workbenchChange(value: unknown): { scope: string; ids: string[] } | undefined {
@@ -190,10 +191,11 @@ export class ClientCache {
   private releaseSnapshotLease?: () => void;
   private readonly messageCache = new ConversationMessageCache();
   private readonly messageEpochs = new Map<string, number>();
+  private epochSeq = 0;
   private globalMessageEpoch = 0;
   private messageChannel?: BroadcastChannel;
   private messageEpoch(conversationId: string): number {
-    return this.globalMessageEpoch + (this.messageEpochs.get(conversationId) ?? 0);
+    return Math.max(this.globalMessageEpoch, this.messageEpochs.get(conversationId) ?? 0);
   }
   private ensureMessageChannel(): void {
     if (this.closed || this.messageChannel || typeof BroadcastChannel === "undefined") return;
@@ -205,20 +207,30 @@ export class ClientCache {
   }
   private bumpMessageEpoch(conversationId?: string): void {
     if (conversationId === undefined) {
-      this.globalMessageEpoch++;
+      this.globalMessageEpoch = ++this.epochSeq;
       this.messageEpochs.clear();
       this.messageCache.invalidate();
       return;
     }
-    this.messageEpochs.set(conversationId, (this.messageEpochs.get(conversationId) ?? 0) + 1);
+    this.messageEpochs.set(conversationId, ++this.epochSeq);
     this.messageCache.invalidate(conversationId);
   }
-  private notifyMessageMutation(conversationId?: string, patched?: Message): void {
+  private notifyMessageMutation(
+    conversationId?: string,
+    patched?: { message: Message; expectedCursor: number; nextCursor: number; lineage?: string },
+  ): void {
     if (patched && conversationId !== undefined) {
       const expectedEpoch = this.messageEpoch(conversationId);
-      this.messageEpochs.set(conversationId, (this.messageEpochs.get(conversationId) ?? 0) + 1);
-      const nextEpoch = this.messageEpoch(conversationId);
-      this.messageCache.patchMessage(conversationId, patched, { expectedEpoch, nextEpoch });
+      const nextEpoch = ++this.epochSeq;
+      this.messageEpochs.set(conversationId, nextEpoch);
+      this.messageCache.patchMessage(conversationId, patched.message, {
+        expectedEpoch,
+        nextEpoch,
+        expectedRevision: patched.expectedCursor,
+        revision: patched.nextCursor,
+        expectedLineage: patched.lineage,
+        hasExpectedLineage: true,
+      });
     } else {
       this.bumpMessageEpoch(conversationId);
     }
@@ -291,7 +303,7 @@ export class ClientCache {
     // depend on mounting its ShareInbox. A closed app cleans up on next open.
     void this.identity().then(identity => identity ? this.pruneExpiredShareDrafts(identity) : undefined).catch(() => undefined);
   }
-  close(): void { this.closed = true; const siblings = siblingCaches.get(this.databaseName); siblings?.delete(this); if (siblings && !siblings.size) siblingCaches.delete(this.databaseName); this.messageChannel?.close(); this.messageChannel = undefined; this.messageCache.invalidate(); this.notifyDiffReviews(); this.diffReviewChannel?.close(); this.diffReviewChannel = undefined; this.workbenchChannel?.close(); this.workbenchChannel = undefined; this.designCommentChannel?.close(); this.designCommentChannel = undefined; this.releaseSnapshotLease?.(); void this.db.then((db) => db.close(), () => undefined); }
+  close(): void { this.closed = true; const siblings = siblingCaches.get(this.databaseName); siblings?.delete(this); if (siblings && !siblings.size) siblingCaches.delete(this.databaseName); this.messageChannel?.close(); this.messageChannel = undefined; this.bumpMessageEpoch(undefined); this.notifyDiffReviews(); this.diffReviewChannel?.close(); this.diffReviewChannel = undefined; this.workbenchChannel?.close(); this.workbenchChannel = undefined; this.designCommentChannel?.close(); this.designCommentChannel = undefined; this.releaseSnapshotLease?.(); void this.db.then((db) => db.close(), () => undefined); }
   private ownSnapshot(): Promise<void> {
     if (this.closed) return Promise.reject(new Error("local_cache_closed"));
     if (!navigator.locks) return Promise.resolve();
@@ -665,7 +677,7 @@ export class ClientCache {
     await settings.put(JSON.stringify({ ...(identity?.keyRef ? { keyRef: identity.keyRef } : {}) }), "pendingReset");
     await settings.put(crypto.randomUUID(), "cacheGeneration");
     await tx.done;
-    this.bumpMessageEpoch(undefined);
+    this.notifyMessageMutation(undefined);
     this.diffReviewsChanged();
     if (identity) clearNoteRecoveries(identity.deviceId);
     if (identity) this.clearSelectionHint(this.selectionHintKey(identity, await this.generation));
@@ -792,12 +804,12 @@ export class ClientCache {
     if (preferences) await tx.objectStore("settings").put(preferences, "preferences");
     if (generation) await tx.objectStore("settings").put(generation, "cacheGeneration");
     await tx.done;
+    this.notifyMessageMutation(undefined);
     // Large downloads live on disk, outside these stores; drop them with the rest.
     await clearAttachmentDiskCache();
     if (identity) { clearNoteRecoveries(identity.deviceId); this.clearSelectionHint(this.selectionHintKey(identity, generation as string | undefined)); }
     // Quota readings are saved per Host outside these stores (Bot ids, pool names, percentages); the forgotten Host's go too.
     if (identity?.hubPublicKey) forgetSavedQuotaHost(identity.hubPublicKey);
-    this.notifyMessageMutation(undefined);
     this.draftsChanged();
     this.diffReviewsChanged();
   }
@@ -1288,11 +1300,27 @@ export class ClientCache {
     const cached = this.closed ? undefined : this.messageCache.peek(conversationId, this.messageEpoch(conversationId));
     if (cached) return cached.messages.slice();
     const epoch = this.messageEpoch(conversationId);
-    const loaded = (await (await this.db).getAllFromIndex("messages", "conversation", conversationId))
+    const tx = (await this.db).transaction(["messages", "cursors", "settings"]);
+    const [rawMessages, rawCursor, rawLineage] = await Promise.all([
+      tx.objectStore("messages").index("conversation").getAll(conversationId),
+      tx.objectStore("cursors").get(conversationId),
+      tx.objectStore("settings").get(`syncLineage:${conversationId}`),
+      tx.done,
+    ]);
+    const cursor = rawCursor ?? 0;
+    const lineage = typeof rawLineage === "string" ? rawLineage : undefined;
+    const loaded = rawMessages
       .sort(compareMessages)
       .map(stripMessageMeta);
     if (!this.closed && this.messageEpoch(conversationId) === epoch) {
-      this.messageCache.set(conversationId, loaded, 0, { epoch, hasFullSnapshot: true });
+      const existing = this.messageCache.inspect(conversationId);
+      if (!existing || existing.epoch !== epoch) {
+        this.messageCache.set(conversationId, loaded, cursor, { epoch, hasFullSnapshot: true, lineage });
+      } else if (existing.lineage !== lineage) {
+        this.messageCache.invalidate(conversationId);
+      } else if (cursor > existing.revision) {
+        this.messageCache.set(conversationId, loaded, cursor, { epoch, hasFullSnapshot: true, lineage });
+      }
     }
     return loaded.slice();
   }
@@ -1429,7 +1457,7 @@ export class ClientCache {
           if (cursor !== state.after || lineage !== state.previousLineage) {
             // A different tab already committed this (or newer) history. Finish
             // our stream without overwriting it or starting a reconnect loop.
-            if (lineage === state.lineage && cursor >= state.seq) { await this.dropSnapshot(tx, this.snapshotOwner); await complete; return true; }
+            if (lineage === state.lineage && cursor >= state.seq) { await this.dropSnapshot(tx, this.snapshotOwner); await complete; this.bumpMessageEpoch(conversationId); return true; }
             throw new Error("snapshot_incomplete");
           }
           // No visible state changes until all frames are present. Replacing
@@ -1494,9 +1522,24 @@ export class ClientCache {
     // Observe transaction failure even when validation rejects before tx.done.
     const complete = tx.done; void complete.catch(() => undefined);
     try {
-      if (expected && await tx.objectStore("settings").get(`syncLineage:${event.conversationId}`) !== expected.lineage) throw new Error("sync_lineage_mismatch");
+      const rawLineage = await tx.objectStore("settings").get(`syncLineage:${event.conversationId}`);
+      const lineage = typeof rawLineage === "string" ? rawLineage : undefined;
+      if (expected && lineage !== expected.lineage) throw new Error("sync_lineage_mismatch");
       const last = await tx.objectStore("cursors").get(event.conversationId) ?? 0;
-      if (event.seq <= last) { await tx.done; return; }
+      if (event.seq <= last) {
+        await complete;
+        const cached = this.messageCache.inspect(event.conversationId);
+        if (
+          !cached
+          || !cached.hasFullSnapshot
+          || cached.epoch !== this.messageEpoch(event.conversationId)
+          || cached.revision !== last
+          || cached.lineage !== lineage
+        ) {
+          this.bumpMessageEpoch(event.conversationId);
+        }
+        return;
+      }
       if (event.seq !== last + 1) { tx.abort(); await tx.done.catch(() => undefined); throw new Error("sync_gap"); }
       let applied: Message | undefined, draftChanged = false;
       if (event.kind === "message.stream") {
@@ -1558,10 +1601,29 @@ export class ClientCache {
         if (activity) { const readSeq = event.payload.seq; activity.unread = Object.fromEntries(Object.entries(activity.unread).filter(([, seq]) => seq > readSeq)); await tx.objectStore("activity").put(activity, event.conversationId); }
       }
       await tx.objectStore("cursors").put(event.seq, event.conversationId); await complete;
+      const cached = this.messageCache.inspect(event.conversationId);
+      const cacheMatchesBase = cached !== undefined
+        && cached.hasFullSnapshot
+        && cached.epoch === this.messageEpoch(event.conversationId)
+        && cached.revision === last
+        && cached.lineage === lineage;
       if (applied) {
         const clean = stripMessageMeta(applied as Cache["messages"]["value"]);
-        this.notifyMessageMutation(event.conversationId, clean);
+        if (cacheMatchesBase) {
+          this.notifyMessageMutation(event.conversationId, {
+            message: clean,
+            expectedCursor: last,
+            nextCursor: event.seq,
+            lineage,
+          });
+        } else {
+          this.notifyMessageMutation(event.conversationId);
+        }
         applied = clean;
+      } else if (cacheMatchesBase) {
+        this.messageCache.setRevision(event.conversationId, event.seq, lineage);
+      } else {
+        this.bumpMessageEpoch(event.conversationId);
       }
       if (draftChanged) this.draftsChanged(); return applied;
     } catch (error) { try { tx.abort(); } catch { /* Already completed or aborted. */ } await complete.catch(() => undefined); throw error; }
@@ -1640,7 +1702,7 @@ export class ClientCache {
     const scope = await this.diffReviewReceiptScope(tx, id);
     await tx.done; if (scope) this.diffReviewsChanged(scope); return true;
   }
-  async discardFailed(id: string): Promise<OutboxEntry | undefined> { return this.removeOutbox(id, true); }
+  async discardFailed(id: string): Promise<OutboxEntry | undefined> { return (await this.removeOutbox(id, true)).entry; }
   private async diffReviewReceiptScope(tx: IDBPTransaction<Cache, StoreNames<Cache>[], "readwrite">, id: string): Promise<DiffReviewScope | undefined> {
     const raw = await tx.objectStore("settings").get(diffReviewReceiptKey(id));
     // Notification lookup must not change generic outbox error handling.
@@ -1671,15 +1733,27 @@ export class ClientCache {
     }
     await settings.delete(diffReviewReceiptKey(id)); return receipt.scope;
   }
-  private async removeOutbox(id: string, failedOnly = false, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<OutboxEntry | undefined> {
-    const tx = await this.write(["outbox", "workbenchDesign", "workbenchDesignMeta"]), store = tx.objectStore("outbox");
+  private async removeOutbox(id: string, failedOnly = false, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<AcknowledgeResult> {
+    const messageId = messageAccepted && acceptance?.messageId ? acceptance.messageId : undefined;
+    const tx = await this.write(["outbox", "workbenchDesign", "workbenchDesignMeta", ...(messageId ? ["messages" as const] : [])]), store = tx.objectStore("outbox");
     let attemptedCommentWrite = false;
     // Return the actual removed entry only after commit. Observe transaction
     // aborts alongside request failures, including reset/identity fences.
     try {
       const entry = await store.get(id);
-      if (failedOnly && !entry?.error) { await tx.done; return undefined; }
+      if (failedOnly && !entry?.error) { await tx.done; return { entry: undefined, alreadyDeleted: false }; }
       if (entry) await store.delete(id);
+      let alreadyDeleted = false;
+      if (messageId) {
+        const existing = await tx.objectStore("messages").get(messageId);
+        alreadyDeleted = existing?.status === "deleted"
+          && (!entry || !("conversationId" in entry.frame) || existing.conversationId === entry.frame.conversationId);
+      } else if (messageAccepted && entry && "conversationId" in entry.frame) {
+        const cached = this.messageCache.inspect(entry.frame.conversationId);
+        alreadyDeleted = !!(cached?.hasFullSnapshot
+          && cached.epoch === this.messageEpoch(entry.frame.conversationId)
+          && cached.messages.some(message => message.clientMsgId === id && message.status === "deleted"));
+      }
       // A non-message ACK is not acceptance. Keep the pending receipt so an
       // explicit uncertain retry can use its original immutable ID and frame.
       const scope = messageAccepted || failedOnly ? await this.settleDiffReview(tx, id, messageAccepted) : entry ? await this.diffReviewReceiptScope(tx, id) : undefined;
@@ -1700,7 +1774,7 @@ export class ClientCache {
           await settings.delete(key);
         }
       }
-      await tx.done; if (scope) this.diffReviewsChanged(scope); if(changed)this.designCommentsChanged(changed.scope,[changed.id]);return entry;
+      await tx.done; if (scope) this.diffReviewsChanged(scope); if(changed)this.designCommentsChanged(changed.scope,[changed.id]);return { entry, alreadyDeleted };
     } catch (error) {
       try { tx.abort(); } catch { /* Already completed. */ } await tx.done.catch(() => undefined);
       // Receipt metadata is optional. If storage is full, commit acceptance
@@ -1719,6 +1793,7 @@ export class ClientCache {
     }
     await tx.done; if (scope) this.diffReviewsChanged(scope);
   }
-  async acknowledge(id: string, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<OutboxEntry | undefined> { return this.removeOutbox(id, false, messageAccepted, acceptance); }
+  async acknowledge(id: string, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<OutboxEntry | undefined> { return (await this.removeOutbox(id, false, messageAccepted, acceptance)).entry; }
+  async acknowledgeReceipt(id: string, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<AcknowledgeResult> { return this.removeOutbox(id, false, messageAccepted, acceptance); }
 }
 export const cache = new ClientCache();

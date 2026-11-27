@@ -81,22 +81,52 @@ describe("ConversationMessageCache", () => {
     expect(cache.stats()).toEqual({ conversations: 0, totalMessages: 0 });
   });
 
-  it("enforces full-snapshot and epoch invariants and fails closed on mismatch", () => {
+  it("enforces full-snapshot, epoch, revision, and lineage invariants and fails closed on mismatch", () => {
     const cache = new ConversationMessageCache(4, 100);
     // Partial snapshot is refused
     expect(cache.set("c1", [msg("m1", "c1", 1)], 1, { epoch: 5, hasFullSnapshot: false })).toBe(false);
     expect(cache.peek("c1")).toBeUndefined();
 
-    // Full snapshot with epoch=5
-    expect(cache.set("c1", [msg("m1", "c1", 1)], 1, { epoch: 5, hasFullSnapshot: true })).toBe(true);
+    // Full snapshot with epoch=5, revision=1, lineage="lin-a"
+    expect(cache.set("c1", [msg("m1", "c1", 1)], 1, { epoch: 5, hasFullSnapshot: true, lineage: "lin-a" })).toBe(true);
     expect(cache.peek("c1", 5)?.messages.map((m) => m.id)).toEqual(["m1"]);
 
-    // Patch matching expectedEpoch advances epoch to nextEpoch
-    expect(cache.patchMessage("c1", msg("m2", "c1", 2), { expectedEpoch: 5, nextEpoch: 6 })).toBe(true);
+    // Patch matching expectedEpoch, expectedRevision, and expectedLineage advances epoch & revision
+    expect(cache.patchMessage("c1", msg("m2", "c1", 2), {
+      expectedEpoch: 5,
+      nextEpoch: 6,
+      expectedRevision: 1,
+      revision: 2,
+      expectedLineage: "lin-a",
+      hasExpectedLineage: true,
+    })).toBe(true);
+    expect(cache.peek("c1", 6)).toMatchObject({ revision: 2, lineage: "lin-a", epoch: 6 });
     expect(cache.peek("c1", 6)?.messages.map((m) => m.id)).toEqual(["m1", "m2"]);
 
+    // Revision mismatch on patchMessage invalidates and fails closed
+    expect(cache.patchMessage("c1", msg("m3", "c1", 3), {
+      expectedEpoch: 6,
+      nextEpoch: 7,
+      expectedRevision: 9,
+      revision: 10,
+    })).toBe(false);
+    expect(cache.peek("c1")).toBeUndefined();
+
+    // Lineage mismatch on patchMessage invalidates and fails closed
+    expect(cache.set("c1", [msg("m1", "c1", 1)], 1, { epoch: 7, lineage: "lin-a" })).toBe(true);
+    expect(cache.patchMessage("c1", msg("m2", "c1", 2), {
+      expectedEpoch: 7,
+      nextEpoch: 8,
+      expectedRevision: 1,
+      revision: 2,
+      expectedLineage: "lin-b",
+      hasExpectedLineage: true,
+    })).toBe(false);
+    expect(cache.peek("c1")).toBeUndefined();
+
     // Epoch mismatch on patchMessage invalidates and fails closed
-    expect(cache.patchMessage("c1", msg("m3", "c1", 3), { expectedEpoch: 5, nextEpoch: 7 })).toBe(false);
+    expect(cache.set("c1", [msg("m1", "c1", 1)], 1, { epoch: 8 })).toBe(true);
+    expect(cache.patchMessage("c1", msg("m3", "c1", 3), { expectedEpoch: 5, nextEpoch: 9 })).toBe(false);
     expect(cache.peek("c1")).toBeUndefined();
 
     // Epoch mismatch on peek invalidates and fails closed
@@ -125,5 +155,26 @@ describe("ConversationMessageCache", () => {
     const deleted: Message = { ...msg("msg_b", "c1", 100, "b", 2), status: "deleted" };
     expect(cache.patchMessage("c1", deleted)).toBe(true);
     expect(cache.peek("c1")!.messages[1]!.status).toBe("deleted");
+  });
+
+  it("tracks cursor revisions and lineage without disturbing LRU order on inspect/setRevision", () => {
+    const cache = new ConversationMessageCache(2, 100);
+    cache.set("c1", [msg("m1", "c1", 10)], 1, "lin-a");
+    cache.set("c2", [msg("m2", "c2", 20)], 2, "lin-b");
+
+    // inspect() and setRevision() must not promote c1 ahead of c2 in LRU order.
+    expect(cache.inspect("c1")).toMatchObject({ revision: 1, lineage: "lin-a" });
+    cache.setRevision("c1", 3, "lin-a");
+    expect(cache.inspect("c1")).toMatchObject({ revision: 3, lineage: "lin-a" });
+
+    // Adding c3 should still evict c1 (oldest touched), keeping c2.
+    cache.set("c3", [msg("m3", "c3", 30)], 1);
+    expect(cache.inspect("c1")).toBeUndefined();
+    expect(cache.inspect("c2")).toMatchObject({ revision: 2, lineage: "lin-b" });
+
+    // patchMessage() updates revision when supplied.
+    expect(cache.patchMessage("c2", msg("m4", "c2", 40), 4)).toBe(true);
+    expect(cache.inspect("c2")?.revision).toBe(4);
+    expect(cache.inspect("c2")?.lineage).toBe("lin-b");
   });
 });

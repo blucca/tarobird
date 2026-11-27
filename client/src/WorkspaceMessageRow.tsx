@@ -33,6 +33,7 @@ export type WorkspaceMessageRowProps = {
   measureRef: (node: HTMLElement | null) => void;
   connection: HubConnection;
   locale: "zh" | "en";
+  localDay: number;
   phone: boolean;
   compactTime: boolean;
   live: boolean;
@@ -50,6 +51,7 @@ export type WorkspaceMessageRowProps = {
   deletionSelected: boolean;
   renderDeletionCheck?: (id: string) => ReactNode;
   authorLabel: string;
+  botLabel?: string;
   botName?: string;
   scheduledName: string;
   original?: Message;
@@ -84,6 +86,7 @@ export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
   measureRef,
   connection,
   locale,
+  localDay,
   phone,
   compactTime,
   live,
@@ -101,6 +104,7 @@ export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
   deletionSelected,
   renderDeletionCheck,
   authorLabel,
+  botLabel,
   botName,
   scheduledName,
   original,
@@ -123,6 +127,8 @@ export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
   onDeletionToggle,
   onDeletionClose,
 }: WorkspaceMessageRowProps) {
+  // Invalidates memo once per calendar day so relative timestamps update across local midnight.
+  void localDay;
   if (isTicketNoticeRow) {
     return (
       <article
@@ -198,7 +204,7 @@ export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
         </div>
         <div className="message-body">
           <div className="message-meta">
-            <strong>{message.botSource?.botName ?? botName ?? authorLabel}</strong>
+            <strong>{message.botSource?.botName ?? botLabel ?? botName ?? authorLabel}</strong>
             <time>{formatMessageTime(message.createdAt, locale, compactTime)}</time>
             <HistoryExclusion message={message} />
             {message.authorType === "user" && <UserReplyStatus replies={userReplies} group={isGroup} labels={labels} />}

@@ -3,8 +3,25 @@ import type { Message } from "../../src/client-protocol/index.js";
 export type CachedConversationMessages = {
   messages: Message[];
   revision: number;
+  lineage?: string;
   epoch: number;
   hasFullSnapshot: boolean;
+};
+
+export type SetMessageCacheOptions = {
+  epoch?: number;
+  hasFullSnapshot?: boolean;
+  lineage?: string;
+};
+
+export type PatchMessageCacheOptions = {
+  expectedEpoch?: number;
+  nextEpoch?: number;
+  expectedRevision?: number;
+  revision?: number;
+  expectedLineage?: string;
+  hasExpectedLineage?: boolean;
+  lineage?: string;
 };
 
 export const DEFAULT_MESSAGE_CACHE_CONVERSATIONS = 16;
@@ -33,6 +50,10 @@ export class ConversationMessageCache {
     private readonly maxMessages = DEFAULT_MESSAGE_CACHE_MAX_MESSAGES,
   ) {}
 
+  inspect(conversationId: string): CachedConversationMessages | undefined {
+    return this.entries.get(conversationId);
+  }
+
   peek(conversationId: string, expectedEpoch?: number): CachedConversationMessages | undefined {
     const entry = this.entries.get(conversationId);
     if (!entry) return undefined;
@@ -49,8 +70,11 @@ export class ConversationMessageCache {
     conversationId: string,
     messages: Message[],
     revision = 0,
-    options?: { epoch?: number; hasFullSnapshot?: boolean },
+    optionsOrLineage?: string | SetMessageCacheOptions,
   ): boolean {
+    const options = typeof optionsOrLineage === "string"
+      ? { lineage: optionsOrLineage }
+      : optionsOrLineage;
     const hasFullSnapshot = options?.hasFullSnapshot ?? true;
     if (!hasFullSnapshot || messages.length > this.maxMessages) {
       this.invalidate(conversationId);
@@ -64,6 +88,7 @@ export class ConversationMessageCache {
     this.entries.set(conversationId, {
       messages,
       revision,
+      lineage: options?.lineage,
       epoch: options?.epoch ?? revision,
       hasFullSnapshot: true,
     });
@@ -72,14 +97,29 @@ export class ConversationMessageCache {
     return true;
   }
 
+  setRevision(conversationId: string, revision: number, lineage?: string): void {
+    const existing = this.entries.get(conversationId);
+    if (!existing) return;
+    existing.revision = revision;
+    existing.lineage = lineage;
+  }
+
   patchMessage(
     conversationId: string,
     message: Message,
-    options?: { expectedEpoch?: number; nextEpoch?: number; revision?: number },
+    optionsOrRevision?: number | PatchMessageCacheOptions,
   ): boolean {
+    const options = typeof optionsOrRevision === "number"
+      ? { revision: optionsOrRevision }
+      : optionsOrRevision;
     const existing = this.entries.get(conversationId);
-    if (!existing || !existing.hasFullSnapshot) return false;
-    if (options?.expectedEpoch !== undefined && existing.epoch !== options.expectedEpoch) {
+    if (!existing) return false;
+    if (
+      !existing.hasFullSnapshot
+      || (options?.expectedEpoch !== undefined && existing.epoch !== options.expectedEpoch)
+      || (options?.expectedRevision !== undefined && existing.revision !== options.expectedRevision)
+      || (options?.hasExpectedLineage && existing.lineage !== options.expectedLineage)
+    ) {
       this.invalidate(conversationId);
       return false;
     }
@@ -100,6 +140,7 @@ export class ConversationMessageCache {
       if (message.version < old.version) {
         if (options?.nextEpoch !== undefined) existing.epoch = options.nextEpoch;
         if (options?.revision !== undefined) existing.revision = options.revision;
+        if (options?.lineage !== undefined) existing.lineage = options.lineage;
         return true;
       }
       next = prev.slice();
@@ -131,6 +172,7 @@ export class ConversationMessageCache {
     existing.messages = next;
     if (options?.nextEpoch !== undefined) existing.epoch = options.nextEpoch;
     if (options?.revision !== undefined) existing.revision = options.revision;
+    if (options?.lineage !== undefined) existing.lineage = options.lineage;
     this.evict(conversationId);
     return true;
   }
