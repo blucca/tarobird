@@ -17,8 +17,16 @@ import en from "../src/locales/en.json" with { type: "json" };
 // uses `dist`. TAROBIRD_QUOTA_TEST_CLIENT_DIR still points the page tests at another client directory.
 const quotaUiClient = process.env.TAROBIRD_QUOTA_TEST_CLIENT_DIR;
 
-type RecordState = { revision: string; snapshot: QuotaSnapshot; reads: number; refreshes: number; hold?: Promise<void> };
-async function fixture(page: Page, english = false, oldHost = false) {
+type RecordState = {
+  revision: string;
+  snapshot: QuotaSnapshot;
+  reads: number;
+  refreshes: number;
+  hold?: Promise<void>;
+  onRefresh?: () => Promise<void> | void;
+  readSnapshot?: (refresh: boolean) => QuotaSnapshot;
+};
+async function fixture(page: Page, english = false, oldHost = false, extraBots: ReadonlyArray<readonly [string, string, "codex" | "claude" | "kimi"]> = []) {
   const text = (key: string) => english ? (en as Record<string, string>)[key] || key : key;
   const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-quota-ui-"));
   const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: quotaUiClient ?? path.resolve("dist") });
@@ -34,6 +42,9 @@ async function fixture(page: Page, english = false, oldHost = false) {
     writer: { revision: "writer_one", snapshot: unavailableQuota("claude", "no_passive_event"), reads: 0, refreshes: 0 },
     research: { revision: "research_one", snapshot: unavailableQuota("kimi", "not_adapted"), reads: 0, refreshes: 0 },
   };
+  for (const [id, , engine] of extraBots) {
+    records[id] = { revision: `${id}_one`, snapshot: unavailableQuota(engine, "not_loaded"), reads: 0, refreshes: 0 };
+  }
   const gateways = []; let turns = 0, quotaRequests = 0;
   page.on("request", request => { if (request.url().includes("/api/engine-quotas")) quotaRequests++; });
   if (oldHost) await page.routeWebSocket("**/ws", socket => {
@@ -44,13 +55,25 @@ async function fixture(page: Page, english = false, oldHost = false) {
       socket.send(JSON.stringify(frame));
     });
   });
-  for (const [id, name, engine] of [["coder", "Coding Bot", "codex"], ["reviewer", "Review Bot", "codex"], ["writer", "Writing Bot", "claude"], ["research", "Research Bot", "kimi"]] as const) {
+  const bots = [
+    ["coder", "Coding Bot", "codex"],
+    ["reviewer", "Review Bot", "codex"],
+    ["writer", "Writing Bot", "claude"],
+    ["research", "Research Bot", "kimi"],
+    ...extraBots,
+  ] as const;
+  for (const [id, name, engine] of bots) {
     const stateDir = path.join(root, id), secret = randomBytes(32).toString("base64url"); await mkdir(stateDir);
     await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine })); await writeFile(path.join(stateDir, "session.json"), "unchanged-session");
     await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES(?,?,?)", [id, name, hashSecret(secret)]);
     gateways.push(await attachGateway({ stateDir, url: hub.instanceUrl.replace("http", "ws") + "/instance", secret, botId: id, engine, runtime: createCoreServiceRuntime(), bridge: {
       handleAuthorizedMessage: async () => { turns++; throw new Error("quota_must_not_send_a_turn"); },
-      readAccountQuota: async options => { const record = records[id]!; record.reads++; if (options.refresh) { record.refreshes++; await record.hold; } return { revision: record.revision, snapshot: record.snapshot }; },
+      readAccountQuota: async options => {
+        const record = records[id]!;
+        record.reads++;
+        if (options.refresh) { record.refreshes++; await record.hold; await record.onRefresh?.(); }
+        return { revision: record.revision, snapshot: record.readSnapshot ? record.readSnapshot(options.refresh) : record.snapshot };
+      },
     } }));
   }
   await page.goto(hub.url); const invitation = await fixtureInvitation(hub);
@@ -238,7 +261,7 @@ test("closing and locking quota settings discard late responses and never replay
   } finally { release(); await f.close(); }
 });
 
-test("quota discovery keeps not-loaded, unsupported, offline and partial directories distinct", async ({ page }) => {
+test("quota discovery keeps not-loaded, unsupported, offline and partial directories distinct and auto-reads readable cards on open", async ({ page }) => {
   const f = await fixture(page);
   try {
     f.records.coder!.snapshot = unavailableQuota("codex", "not_loaded");
@@ -247,11 +270,163 @@ test("quota discovery keeps not-loaded, unsupported, offline and partial directo
       const response = await route.fetch(); await route.fulfill({ response, json: { ...await response.json(), truncated: true } });
     });
     await f.open(); const panel = page.locator(".engine-quota:visible"), coder = panel.getByRole("region", { name: "Coding Bot · Codex", exact: true });
-    await expect(panel).toContainText("只返回了部分 Bot"); await expect(coder).toContainText("尚未读取原生额度");
-    await expect(coder.getByRole("button", { name: "刷新", exact: true })).toBeEnabled(); await expect(coder.getByRole("meter")).toHaveCount(0);
+    await expect(panel).toContainText("只返回了部分 Bot");
+    // Readable active cards without data auto-refresh once on page open without manual clicking.
+    await expect.poll(() => f.records.coder!.refreshes).toBe(1);
+    await expect(coder).toContainText("尚未读取原生额度");
+    await expect(coder.getByRole("meter")).toHaveCount(0);
     await expect(panel.getByRole("region", { name: "Review Bot · Codex", exact: true })).toContainText("当前离线");
     for (const name of ["Review Bot · Codex", "Research Bot · Kimi"]) await expect(panel.getByRole("region", { name, exact: true }).getByRole("button")).toHaveCount(0);
-    for (const record of Object.values(f.records)) expect(record.refreshes).toBe(0);
+    expect(f.records.reviewer!.refreshes).toBe(0);
+    expect(f.records.research!.refreshes).toBe(0);
+  } finally { await f.close(); }
+});
+
+test("model quotas auto-read stale/empty cards on open and update automatically when a slow Claude answer arrives late", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    const now = Date.now(), stamp = (delta = 0) => new Date(now + delta).toISOString();
+    const readyCodex: QuotaSnapshot = {
+      authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "allowed", observedAt: stamp(),
+      pools: [{
+        id: "codex_pool", label: "Codex", sharing: "shared", availability: "allowed",
+        windows: [{ id: "secondary", label: "Secondary", metric: "percent", usedPercent: 18, availability: "allowed", observedAt: stamp(), expiresAt: stamp(60_000), resetsAt: stamp((3 * 24 + 17) * 3_600_000), periodSeconds: 604_800 }],
+        balances: [], constraints: [],
+      }], constraints: [],
+    };
+    const readyClaude: QuotaSnapshot = {
+      authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "allowed", observedAt: stamp(5_000),
+      pools: [{
+        id: "claude_pool", label: "Claude", sharing: "shared", availability: "allowed",
+        windows: [{ id: "seven_day", label: "7 days", metric: "percent", usedPercent: 26, availability: "allowed", observedAt: stamp(5_000), expiresAt: stamp(65_000), resetsAt: stamp((4 * 24 + 5) * 3_600_000), periodSeconds: 604_800 }],
+        balances: [], constraints: [],
+      }], constraints: [],
+    };
+    // Mirror real ClaudeStreamAdapter: refresh=true times out without caching "timeout", so subsequent
+    // refresh=false cache polls return "not_loaded" until the late answer arrives.
+    let claudeTimedOut = false, claudeAnswerReady = false, notLoadedPolls = 0;
+    f.records.coder!.readSnapshot = refresh => {
+      if (refresh) f.records.coder!.snapshot = readyCodex;
+      return f.records.coder!.snapshot;
+    };
+    f.records.coder!.snapshot = unavailableQuota("codex", "not_loaded");
+    f.records.writer!.readSnapshot = refresh => {
+      if (claudeAnswerReady) return readyClaude;
+      if (refresh) {
+        claudeTimedOut = true;
+        return { ...unavailableQuota("claude", "timeout"), capability: { mode: "active" }, authMode: "subscription" };
+      }
+      if (claudeTimedOut) notLoadedPolls++;
+      return { ...unavailableQuota("claude", "not_loaded"), capability: { mode: "active" }, authMode: "subscription" };
+    };
+
+    await f.open();
+    const panel = page.locator(".engine-quota:visible");
+    const coder = panel.getByRole("region", { name: "Coding Bot · Codex", exact: true });
+    const writer = panel.getByRole("region", { name: "Writing Bot · Claude Code", exact: true });
+
+    // Both cards started reading automatically on open without clicking Refresh.
+    await expect(coder).toContainText("剩余 82%");
+    await expect(coder).toContainText("3 天 17 小时");
+    await expect.poll(() => claudeTimedOut).toBe(true);
+    // Slow Claude stays in "正在读取…" across real "not_loaded" cache-only polls.
+    await expect.poll(() => notLoadedPolls, { timeout: 8_000 }).toBeGreaterThanOrEqual(1);
+    await expect(writer.locator(".quota-state")).toHaveText("正在读取…");
+    await expect(writer).not.toContainText("读取原生额度超时");
+
+    // Late answer arrives on the Host cache; the Settings card picks it up automatically.
+    claudeAnswerReady = true;
+    await expect(writer).toContainText("剩余 74%", { timeout: 10_000 });
+    await expect(writer).toContainText("4 天 5 小时");
+    await expect(writer.locator(".quota-state")).toHaveText("已读取");
+  } finally { await f.close(); }
+});
+
+test("slow Claude late-answer polling aborts on close and clears data on owner revocation", async ({ page }) => {
+  const f = await fixture(page);
+  let releasePoll = () => {};
+  try {
+    let claudeTimedOut = false;
+    f.records.writer!.readSnapshot = refresh => {
+      if (refresh) {
+        claudeTimedOut = true;
+        return { ...unavailableQuota("claude", "timeout"), capability: { mode: "active" }, authMode: "subscription" };
+      }
+      return { ...unavailableQuota("claude", "not_loaded"), capability: { mode: "active" }, authMode: "subscription" };
+    };
+    let pollStarted = false, pollAborted = false;
+    const pollGate = new Promise<void>(resolve => { releasePoll = resolve; });
+    page.on("requestfailed", req => {
+      if (new URL(req.url()).pathname === "/api/engine-quotas/writer" && !req.url().includes("refresh=1")) pollAborted = true;
+    });
+    await page.route("**/api/engine-quotas/writer", async route => {
+      pollStarted = true;
+      await pollGate;
+      await route.continue().catch(() => undefined);
+    });
+
+    await f.open();
+    const writer = page.locator(".engine-quota:visible").getByRole("region", { name: "Writing Bot · Claude Code", exact: true });
+    await expect.poll(() => claudeTimedOut).toBe(true);
+    await expect(writer.locator(".quota-state")).toHaveText("正在读取…");
+    await expect.poll(() => pollStarted, { timeout: 8_000 }).toBe(true);
+
+    // Closing Settings aborts the in-flight cache poll immediately.
+    await page.getByRole("button", { name: "关闭设置", exact: true }).click();
+    await expect.poll(() => pollAborted).toBe(true);
+    releasePoll();
+    await page.unroute("**/api/engine-quotas/writer");
+
+    // Reopen under a fresh revision, enter watchLateAnswer, and revoke owner permission.
+    claudeTimedOut = false;
+    f.records.writer!.revision = "writer_two";
+    await f.open();
+    await expect.poll(() => claudeTimedOut).toBe(true);
+    await expect(writer.locator(".quota-state")).toHaveText("正在读取…");
+    await f.hub.store.db.run("UPDATE users SET role='member' WHERE id='owner'");
+    await expect(page.locator(".engine-quota").getByRole("alert")).toContainText("额度查看权限已变化", { timeout: 8_000 });
+    await expect(page.locator(".quota-card")).toHaveCount(0);
+  } finally { releasePoll(); await f.close(); }
+});
+
+test("auto-refresh queues more than 8 readable cards with bounded concurrency and fills all of them", async ({ page }) => {
+  const extraBots = Array.from({ length: 8 }, (_, index) => [`worker_${index + 1}`, `Worker ${index + 1}`, "codex"] as const);
+  const f = await fixture(page, false, false, extraBots);
+  try {
+    const now = Date.now(), stamp = (delta = 0) => new Date(now + delta).toISOString();
+    const readyCodex = (used: number): QuotaSnapshot => ({
+      authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "allowed", observedAt: stamp(),
+      pools: [{
+        id: "codex_pool", label: "Codex", sharing: "shared", availability: "allowed",
+        windows: [{ id: "short", label: "5 hours", metric: "percent", usedPercent: used, availability: "allowed", observedAt: stamp(), expiresAt: stamp(60_000), resetsAt: stamp(2 * 3_600_000), periodSeconds: 18_000 }],
+        balances: [], constraints: [],
+      }], constraints: [],
+    });
+    const activeIds = ["coder", "reviewer", ...extraBots.map(([id]) => id)];
+    let inFlight = 0, maxInFlight = 0;
+    for (const [index, id] of activeIds.entries()) {
+      const record = f.records[id]!;
+      record.snapshot = unavailableQuota("codex", "not_loaded");
+      record.onRefresh = async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise(resolve => setTimeout(resolve, 120));
+        record.snapshot = readyCodex(10 + index);
+        inFlight--;
+      };
+    }
+
+    await f.open();
+    const panel = page.locator(".engine-quota:visible");
+    // All 10 readable cards refresh automatically without manual clicking.
+    await expect.poll(() => activeIds.every(id => f.records[id]!.refreshes === 1), { timeout: 15_000 }).toBe(true);
+    expect(maxInFlight).toBeLessThanOrEqual(8);
+    expect(maxInFlight).toBeGreaterThanOrEqual(2);
+    for (const [index, name] of ["Coding Bot", "Review Bot", ...extraBots.map(([, label]) => label)].entries()) {
+      const card = panel.getByRole("region", { name: `${name} · Codex`, exact: true });
+      await expect(card).toContainText(`剩余 ${90 - index}%`);
+      await expect(card.locator(".quota-state")).toHaveText("已读取");
+    }
   } finally { await f.close(); }
 });
 

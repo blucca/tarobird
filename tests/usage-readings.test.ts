@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { QuotaScope, QuotaWindow } from "../src/client-protocol/engine-quota.js";
-import { contextView, forgetSavedQuota, loadSavedQuota, mayAskEngine, nextHeldQuota, poolCoversModel, quotaView, quotaViewEndsAt, savedQuotaAfter, saveQuota, shortTokens, usageTone, QUOTA_SHOWN_FOR_MS, QUOTA_SIGN_IN_RETRY_MS } from "../client/src/usage-readings.js";
+import { contextView, forgetSavedQuota, formatTimeRemaining, loadSavedQuota, mayAskEngine, nextHeldQuota, poolCoversModel, quotaView, quotaViewEndsAt, savedQuotaAfter, saveQuota, shortTokens, usageTone, QUOTA_SHOWN_FOR_MS, QUOTA_SIGN_IN_RETRY_MS } from "../client/src/usage-readings.js";
 
 const now = Date.parse("2026-11-22T10:00:00Z");
 const iso = (minutes: number) => new Date(now + minutes * 60_000).toISOString();
@@ -212,5 +212,39 @@ describe("readings saved on the device", () => {
     // Adopted, it is then held like any reading; a newer answer replaces it.
     expect(nextHeldQuota(earlier, plain({}))).toBe(earlier);
     const newer = reading("alpha", 0); expect(nextHeldQuota(earlier, newer)).toBe(newer);
+  });
+});
+
+describe("accurate reset time countdown", () => {
+  it("computes remaining duration from reset timestamp rather than window length", () => {
+    const base = Date.parse("2026-11-24T08:00:00Z");
+    const in3d17h = new Date(base + (3 * 24 + 17) * 3_600_000).toISOString();
+    expect(formatTimeRemaining(in3d17h, base, "en")).toBe("3d 17h");
+    expect(formatTimeRemaining(in3d17h, base, "zh")).toBe("3 天 17 小时");
+
+    const in4d = new Date(base + 4 * 24 * 3_600_000).toISOString();
+    expect(formatTimeRemaining(in4d, base, "en")).toBe("4d");
+    expect(formatTimeRemaining(in4d, base, "zh")).toBe("4 天");
+
+    const in2h15m = new Date(base + (2 * 60 + 15) * 60_000).toISOString();
+    expect(formatTimeRemaining(in2h15m, base, "en")).toBe("2h 15m");
+    expect(formatTimeRemaining(in2h15m, base, "zh")).toBe("2 小时 15 分钟");
+
+    const in3h = new Date(base + 3 * 3_600_000).toISOString();
+    expect(formatTimeRemaining(in3h, base, "en")).toBe("3h");
+    expect(formatTimeRemaining(in3h, base, "zh")).toBe("3 小时");
+
+    const in12m = new Date(base + 12 * 60_000).toISOString();
+    expect(formatTimeRemaining(in12m, base, "en")).toBe("12m");
+    expect(formatTimeRemaining(in12m, base, "zh")).toBe("12 分钟");
+
+    const in15s = new Date(base + 15_000).toISOString();
+    expect(formatTimeRemaining(in15s, base, "en")).toBe("1m");
+    expect(formatTimeRemaining(in15s, base, "zh")).toBe("1 分钟");
+
+    expect(formatTimeRemaining(new Date(base).toISOString(), base, "en")).toBeNull();
+    expect(formatTimeRemaining(new Date(base - 1000).toISOString(), base, "en")).toBeNull();
+    expect(formatTimeRemaining(undefined, base, "en")).toBeNull();
+    expect(formatTimeRemaining("not-a-timestamp", base, "zh")).toBeNull();
   });
 });

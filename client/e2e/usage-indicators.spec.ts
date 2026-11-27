@@ -95,8 +95,9 @@ test("desktop: ring and battery sit left of the model controls, each only when r
     const context = panel.getByRole("region", { name: "上下文", exact: true }), limits = panel.getByRole("region", { name: "额度 · Codex", exact: true });
     await expect(context).toContainText("62%"); await expect(context).toContainText("已用 76k / 200k"); await expect(context).toContainText("用到约 84% 时自动压缩");
     await expect(limits.locator(".usage-window")).toHaveCount(2);
-    await expect(limits.locator(".usage-window").nth(0)).toContainText("5 小时"); await expect(limits.locator(".usage-window").nth(0)).toContainText("80%");
-    await expect(limits.locator(".usage-window").nth(1)).toContainText("7 天"); await expect(limits.locator(".usage-window").nth(1)).toContainText("90%");
+    await expect(limits.locator(".usage-window").nth(0)).toContainText("2 小时"); await expect(limits.locator(".usage-window").nth(0)).toContainText("80%");
+    await expect(limits.locator(".usage-window").nth(1)).toContainText("5 天"); await expect(limits.locator(".usage-window").nth(1)).toContainText("90%");
+    await expect(limits.locator(".usage-window").nth(1)).not.toContainText("7 天");
     await expect(limits.locator(".usage-window").nth(0)).toContainText(/\d{2}:\d{2} 重置/); await expect(limits.locator(".usage-window").nth(1)).toContainText(/\d+月\d+日 \d{2}:\d{2} 重置/);
     await expect(panel.getByRole("meter", { name: "上下文可用", exact: true })).toHaveAttribute("aria-valuenow", "62");
     await expect(panel).toContainText(/\d{2}:\d{2} 读取/);
@@ -227,7 +228,7 @@ test("phone: nothing beside the composer and no context; quota in the more sheet
     await row.click();
     const details = page.getByRole("dialog", { name: "额度", exact: true });
     await expect(details.getByRole("region", { name: "额度 · Codex", exact: true }).locator(".usage-window")).toHaveCount(2);
-    await expect(details).toContainText("5 小时"); await expect(details).toContainText("7 天"); await expect(details).not.toContainText("上下文");
+    await expect(details).toContainText("2 小时"); await expect(details).toContainText("5 天"); await expect(details).not.toContainText("7 天"); await expect(details).not.toContainText("上下文");
     expect(await details.innerText()).not.toContain("剩");
     await page.screenshot({ path: info.outputPath("phone-details.png"), animations: "disabled" });
     await details.getByRole("button", { name: "关闭额度", exact: true }).click(); await expect(details).toBeHidden();
