@@ -1,5 +1,5 @@
 import { memo, type ReactNode } from "react";
-import { Copy, Forward, MessageSquare, RotateCcw } from "lucide-react";
+import { Check, Copy, Forward, LoaderCircle, MessageSquare, RotateCcw } from "lucide-react";
 import type { Message } from "../../src/client-protocol/index.js";
 import type { HubConnection } from "./connection.js";
 import { Avatar } from "./Avatar.js";
@@ -30,6 +30,10 @@ const presence = (message: Message) =>
 
 export type WorkspaceMessageRowProps = {
   message: Message;
+  /** Stable row identity (`messageRowKey` or background group key); survives the pending to canonical ID change. */
+  rowKey: string;
+  /** Set while the row is an online outbox item rendered as a normal bubble. */
+  pending?: { sent: boolean; syncing: boolean };
   index: number;
   start: number;
   measureRef: (node: HTMLElement | null) => void;
@@ -83,6 +87,8 @@ export type WorkspaceMessageRowProps = {
  */
 export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
   message,
+  rowKey,
+  pending,
   index,
   start,
   measureRef,
@@ -137,6 +143,7 @@ export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
         ref={measureRef}
         data-index={index}
         data-message-id={message.id}
+        data-row-key={rowKey}
         className="message dispatch-notice-row"
         style={{ transform: `translateY(${start}px)` }}
       >
@@ -147,19 +154,23 @@ export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
 
   const scheduled = message.groupDiscussion?.role === "input";
   const hasBackgroundGroup = !!backgroundGroup;
+  // An outbox bubble is not a stored message yet: no selection, sheet, or actions.
+  const selecting = !pending && deletionActive;
 
   return (
     <article
       ref={measureRef}
       data-index={index}
       data-message-id={message.id}
+      data-row-key={rowKey}
       tabIndex={0}
-      role={deletionActive ? "checkbox" : undefined}
-      aria-checked={deletionActive ? deletionSelected : undefined}
-      aria-label={deletionActive ? t("选择消息：{0}", messageExcerpt(message).slice(0, 80) || authorLabel) : undefined}
-      aria-haspopup={phone && !deletionActive && !scheduled && !hasBackgroundGroup ? "dialog" : undefined}
-      aria-expanded={phone && !deletionActive && !scheduled && !hasBackgroundGroup ? sheetExpanded : undefined}
+      role={selecting ? "checkbox" : undefined}
+      aria-checked={selecting ? deletionSelected : undefined}
+      aria-label={selecting ? t("选择消息：{0}", messageExcerpt(message).slice(0, 80) || authorLabel) : undefined}
+      aria-haspopup={!pending && phone && !deletionActive && !scheduled && !hasBackgroundGroup ? "dialog" : undefined}
+      aria-expanded={!pending && phone && !deletionActive && !scheduled && !hasBackgroundGroup ? sheetExpanded : undefined}
       onKeyDown={(event) => {
+        if (pending) return;
         if (deletionActive) {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
@@ -184,6 +195,7 @@ export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
         }
       }}
       onClick={(event) => {
+        if (pending) return;
         if (deletionActive) {
           event.preventDefault();
           event.stopPropagation();
@@ -194,13 +206,13 @@ export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
           onOpenSheet(message, event.currentTarget);
         }
       }}
-      className={`message ${message.authorType} ${scheduled ? "is-discussion-input" : ""} ${
-        deletionActive ? `is-selecting ${deletionSelected ? "is-selected" : ""}` : ""
+      className={`message ${message.authorType}${pending ? " is-pending-outbox" : ""} ${scheduled ? "is-discussion-input" : ""} ${
+        selecting ? `is-selecting ${deletionSelected ? "is-selected" : ""}` : ""
       } ${focusedHere ? "focused-message" : ""}`}
       style={{ transform: `translateY(${start}px)` }}
     >
-      {deletionActive && renderDeletionCheck?.(message.id)}
-      <div className="message-selection-content" inert={deletionActive || undefined}>
+      {selecting && renderDeletionCheck?.(message.id)}
+      <div className="message-selection-content" inert={selecting || undefined}>
         <div className={`message-avatar ${message.authorType}${live ? presence(message) : ""}`}>
           <Avatar kind={message.authorType === "bot" ? "bot" : "user"} id={message.authorId} name={authorLabel} size={32} />
         </div>
@@ -209,13 +221,22 @@ export const WorkspaceMessageRow = memo(function WorkspaceMessageRow({
             <strong>{message.botSource?.botName ?? botLabel ?? botName ?? authorLabel}</strong>
             <time>{formatMessageTime(message.createdAt, locale, compactTime)}</time>
             <HistoryExclusion message={message} />
-            {message.authorType === "user" && <UserReplyStatus replies={userReplies} group={isGroup} labels={labels} />}
+            {pending ? (
+              <span className="user-reply-status message-send-status" role="status">
+                <span className={`user-reply-state${pending.sent ? " is-done" : " is-sending"}`}>
+                  {pending.sent ? <Check /> : <LoaderCircle className="reply-status-spinner" />}
+                  <span>{pending.sent ? t("已发送") : pending.syncing ? t("正在同步发送状态…") : t("发送中…")}</span>
+                </span>
+              </span>
+            ) : (
+              message.authorType === "user" && <UserReplyStatus replies={userReplies} group={isGroup} labels={labels} />
+            )}
             {phone && (
               <span className="message-action-status" aria-live="polite">
                 {copiedHere ? t("已复制") : ""}
               </span>
             )}
-            {!phone && !scheduled && !hasBackgroundGroup && (
+            {!pending && !phone && !scheduled && !hasBackgroundGroup && (
               <div className="message-actions">
                 <button
                   aria-label={t("复制消息")}

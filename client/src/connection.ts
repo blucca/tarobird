@@ -23,6 +23,7 @@ import { CONVERSATION_BATCH_CAPABILITY, conversationBatchResultSchema, type Conv
 import { groupReplyWireFrame, changedGroupReply } from "./group-reply-guard.js";
 import { rememberGroupReplyCapabilities } from "./group-reply-mode-cache.js";
 import { UNAVAILABLE_CARD_ACTION, outboxFailureBlocks } from "./outbox-failure.js";
+import { clearRememberedPendingPreviews } from "./pending-messages.js";
 import { markSendTimingByClientMsgId } from "./send-timing.js";
 import { clearMessagesPlanSchema, clearMessagesResultSchema, MESSAGE_CLEAR_CAPABILITY } from "../../src/client-protocol/message-clear.js";
 import { deleteMessagesSchema, deleteMessagesResultSchema, MESSAGE_DELETE_CAPABILITY } from "../../src/client-protocol/message-deletion.js";
@@ -1813,5 +1814,5 @@ export class HubConnection {
     this.close(true); this.update({ error: t("此设备已被吊销，请重新配对"), routeDiagnosis: undefined });
     await this.cache.markIdentityRevoked(this.identity).catch(() => console.warn("device_revocation_cache_failed"));
   }
-  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.livePinChanges.clear(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; this.globalCleanups.forEach(fn => fn()); this.globalCleanups = []; window.removeEventListener(NATIVE_ACTIVE_EVENT, this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
+  close(preserveDeparture = false): void { clearRememberedPendingPreviews(this); this.clearForegroundProbe(); this.livePinChanges.clear(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; this.globalCleanups.forEach(fn => fn()); this.globalCleanups = []; window.removeEventListener(NATIVE_ACTIVE_EVENT, this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
 }

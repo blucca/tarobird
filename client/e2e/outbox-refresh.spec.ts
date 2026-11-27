@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createServer } from "./fixtures/vite.js";
-import { showDisconnectedBots, selectConversation } from "./fixtures/mobile.js";
+import { showDisconnectedBots, selectConversation, waitForClientOnline } from "./fixtures/mobile.js";
 import { singleHostCacheName } from "./fixtures/cache.js";
 import { settleReadingLayout, readingAnchor, anchorTop } from "./fixtures/reading-position.js";
 import { HubServer } from "../../src/hub/server.js";
@@ -372,7 +372,8 @@ for (const width of [1360, 390]) test(`long conversation follows new queued rows
     for (let i = 0; i < 4; i++) {
       await page.getByLabel("消息", { exact: true }).fill(`PENDING_TAIL_${i}\n` + "待发送内容。".repeat(20));
       await page.getByRole("button", { name: "发送消息", exact: true }).click();
-      await expect(page.locator(".queued-message").filter({ hasText: `PENDING_TAIL_${i}` })).toBeInViewport();
+      await expect(page.locator(".message.user").filter({ hasText: `PENDING_TAIL_${i}` })).toBeInViewport();
+      await expect(page.locator(".queued-message")).toHaveCount(0);
     }
     const scroller = page.locator(".message-scroll");
     await scroller.evaluate(node => { node.dispatchEvent(new WheelEvent("wheel", { deltaY: -600, bubbles: true })); node.scrollTop -= 600; });
@@ -387,7 +388,7 @@ for (const width of [1360, 390]) test(`long conversation follows new queued rows
     const beforeDetails = await measure(), before = beforeDetails.scrollTop;
     await page.getByLabel("消息", { exact: true }).fill("PRESERVE_READING_POSITION");
     await page.getByRole("button", { name: "发送消息", exact: true }).click();
-    await expect(page.locator(".queued-message").filter({ hasText: "PRESERVE_READING_POSITION" })).toBeAttached();
+    await expect(page.locator(".message.user").filter({ hasText: "PRESERVE_READING_POSITION" })).toBeAttached();
     try {
       await settleReadingLayout(scroller);
       await expect.poll(() => scroller.evaluate(node => node.scrollTop)).toBeCloseTo(before, 0);
@@ -395,7 +396,7 @@ for (const width of [1360, 390]) test(`long conversation follows new queued rows
     }
     finally { await info.attach("reading-position", { body: JSON.stringify({ before: beforeDetails, after: await measure() }, null, 2), contentType: "application/json" }); }
     await page.getByRole("button", { name: "回到最新消息", exact: true }).click();
-    await expect(page.locator(".queued-message").filter({ hasText: "PRESERVE_READING_POSITION" })).toBeInViewport();
+    await expect(page.locator(".message.user").filter({ hasText: "PRESERVE_READING_POSITION" })).toBeInViewport();
     await page.screenshot({ path: info.outputPath(`long-outbox-${width}.png`) });
   } finally {
     await page.evaluate(() => (window as any).releaseTailHistory?.()).catch(() => undefined);
@@ -433,9 +434,11 @@ for (const width of [1360, 390]) test(`two actual pages sharing IDB bridge the s
     await page.getByRole("button", { name: "发送消息", exact: true }).click();
     await expect.poll(() => !!releaseSend).toBe(true);
     await peer.setViewportSize({ width, height: 844 }); await peer.goto(url);
+    await waitForClientOnline(peer);
     if (width <= 760) await selectConversation(peer, "两个窗口");
-    const pending = peer.locator(".queued-message").filter({ hasText: "SHARED_WINDOW_SEND" });
-    await expect(pending).toContainText("等待发送");
+    const pending = peer.locator(".message.user").filter({ hasText: "SHARED_WINDOW_SEND" });
+    await expect(pending).toContainText("发送中…");
+    await expect(peer.locator(".queued-message")).toHaveCount(0);
     await peer.evaluate(async () => {
       const { ClientCache } = await import("/src/storage.ts"), original = ClientCache.prototype.messages;
       let release!: () => void; const barrier = new Promise<void>(resolve => { release = resolve; });
@@ -446,14 +449,16 @@ for (const width of [1360, 390]) test(`two actual pages sharing IDB bridge the s
     await expect.poll(() => peer.evaluate(() => (window as any).sharedHistory.held)).toBe(true);
     releaseSend!();
     await expect(page.locator(".message.user").filter({ hasText: "SHARED_WINDOW_SEND" })).toBeVisible();
+    await expect(page.locator(".message.user.is-pending-outbox").filter({ hasText: "SHARED_WINDOW_SEND" })).toHaveCount(0);
     await expect(page.locator(".queued-message").filter({ hasText: "SHARED_WINDOW_SEND" })).toHaveCount(0);
     // Force a real event after the sender has removed the shared durable entry.
     await hub.store.publishBotMessage("bot", { conversationId: chat.id, blocks: [{ type: "text", text: "AFTER_SENDER_ACK" }] });
     await expect(pending).toContainText("正在同步发送状态…"); await expect(pending).toBeInViewport();
     await expect(pending.getByRole("button")).toHaveCount(0); expect(passiveAcks).toBe(0);
     await peer.evaluate(() => (window as any).sharedHistory.release());
-    await expect(peer.locator(".message.user").filter({ hasText: "SHARED_WINDOW_SEND" })).toBeVisible();
-    await expect(pending).toHaveCount(0);
+    await expect(peer.locator(".message.user").filter({ hasText: "SHARED_WINDOW_SEND" })).toHaveCount(1);
+    await expect(peer.locator(".message.user").filter({ hasText: "正在同步发送状态…" })).toHaveCount(0);
+    await expect(peer.locator(".queued-message")).toHaveCount(0);
     expect((await hub.store.snapshot("owner", chat.id)).messages.filter(item => item.clientMsgId === clientMsgId)).toHaveLength(1);
   } finally {
     await peer.evaluate(() => (window as any).sharedHistory?.release()).catch(() => undefined);
@@ -567,13 +572,15 @@ test("real Hub: deleted messages do not stick as sent after disconnect-before-AC
     }, { name: databaseName, messageId: noTombstoneMsg.id, conversationId: chat.id });
     await selectConversation(page, "备用对话");
     await selectConversation(page, "删除回归");
-    await expect(page.locator(".queued-message").filter({ hasText: "NO_TOMBSTONE_MSG" })).toContainText("等待发送");
+    // Online, the still-queued send is a normal pending bubble, not the dashed box.
+    await expect(page.locator(".message.user.is-pending-outbox").filter({ hasText: "NO_TOMBSTONE_MSG" })).toContainText("发送中…");
+    await expect(page.locator(".queued-message").filter({ hasText: "NO_TOMBSTONE_MSG" })).toHaveCount(0);
     releaseHeldAck!();
     await expect.poll(outboxIds).toEqual([]);
-    await expect(page.locator(".queued-message").filter({ hasText: "NO_TOMBSTONE_MSG" })).toHaveCount(0, { timeout: 6000 });
+    await expect(page.locator(".queued-message, .message.user").filter({ hasText: "NO_TOMBSTONE_MSG" })).toHaveCount(0, { timeout: 6000 });
     await selectConversation(page, "备用对话");
     await selectConversation(page, "删除回归");
-    await expect(page.locator(".queued-message").filter({ hasText: "NO_TOMBSTONE_MSG" })).toHaveCount(0);
+    await expect(page.locator(".queued-message, .message.user").filter({ hasText: "NO_TOMBSTONE_MSG" })).toHaveCount(0);
   } finally {
     blockReconnect = false;
     await page.close(); await vite.close(); await hub.close(); await rm(root, { recursive: true, force: true });

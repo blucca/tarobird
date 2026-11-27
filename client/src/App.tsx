@@ -94,6 +94,7 @@ import { VoiceMicButton } from "./VoiceMicButton.js";
 import { HoldToTalk } from "./HoldToTalk.js";
 import { useConversationDrafts } from "./conversation-drafts.js";
 import { useConversationOutbox } from "./conversation-outbox.js";
+import { forwardedAuthorName, messageRowKey, partitionOutboxItems, rememberForwardedMessage, rememberMessageAttachments } from "./pending-messages.js";
 import { useConversationMessages } from "./conversation-messages.js";
 import { DraftLinkPreview, selectedPreviewUrl } from "./LinkPreview.js";
 import { ComposerAttachmentButton, useAttachmentPicker } from "./AttachmentPicker.js";
@@ -317,7 +318,6 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const { messages, deletedClientMsgIds, readRevision: historyRevision, ready: messagesReady, failed: messageReadFailed, retry: retryMessageRead } = useConversationMessages(connection, selected, chatVisible, true);
   const [individualBackgroundRecords, setIndividualBackgroundRecords] = useState(false);
   const backgroundGroups = useMemo(() => groupBackgroundTasks(messages, state.runGroupsAvailable !== false && !individualBackgroundRecords), [messages, state.runGroupsAvailable, individualBackgroundRecords]);
-  const displayedMessages = backgroundGroups.messages;
   const replyStatuses = useMemo(() => userReplyStatuses(messages, selected, new Set(state.status === "online" ? state.bots.filter(bot => bot.online).map(bot => bot.id) : [])), [messages, selected, state.status, state.bots]);
   // A long-running reply can precede any number of follow-ups or deliveries.
   // Collect activity during the existing index pass, not from a truncated tail
@@ -358,6 +358,14 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const previewStyle = preferences.linkPreviewStyle;
   const [preferencesReady, setPreferencesReady] = useState(false);
   const queued = useConversationOutbox(connection, selected, chatVisible, historyRevision, messages, true, deletedClientMsgIds);
+  const { pendingMessages, pendingById, attentionQueued } = useMemo(
+    () => partitionOutboxItems(connection, queued, messages, state.status === "online", state.user?.id ?? "user"),
+    [connection, queued, messages, state.status, state.user?.id],
+  );
+  const displayedMessages = useMemo(
+    () => (pendingMessages.length ? [...backgroundGroups.messages, ...pendingMessages] : backgroundGroups.messages),
+    [backgroundGroups.messages, pendingMessages],
+  );
   const offlinePending = pane ? queued.filter(item => !item.sent && !item.syncing && !item.error).length : state.outbox;
   const [commands, setCommands] = useState<{ command: string; description: { i18n: { zh_cn: string; en_us?: string } } }[]>([]);
   const [piCommands, setPiCommands] = useState<{ scope: string; values: PiSessionCommand[] }>({ scope: "", values: [] });
@@ -683,9 +691,13 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   // Disconnect observers while the chat is hidden instead of caching zero
   // heights and clearing every measurement when it becomes visible again.
   const messageOverlays = useMessageOverlayRows();
-  const messageKey = useMemo(() => (index: number) => displayedMessages[index]!.id, [displayedMessages]);
+  const rowKey = useCallback((message: Message) => backgroundGroups.byAnchor.get(message.id)?.key ?? messageRowKey(message), [backgroundGroups.byAnchor]);
+  const messageKey = useMemo(() => (index: number) => rowKey(displayedMessages[index]!), [displayedMessages, rowKey]);
   const retainMessageOverlay = messageOverlays.retain;
-  const retainedMessageRows = new Set([...messageOverlays.rows.keys()].map(id => backgroundGroups.anchors.get(id) ?? id));
+  const retainedMessageRows = new Set([...messageOverlays.rows.keys()].map(id => {
+    const anchorId = backgroundGroups.anchors.get(id) ?? id;
+    return backgroundGroups.byAnchor.get(anchorId)?.key ?? anchorId;
+  }));
   const followingTail = chatVisible && followLatest.current && !focusTarget && !searchResults;
   const readingScroll = useMemo(() => createReadingScroll(() => historyRows.current), [connection]);
   useLayoutEffect(() => readingScroll.reset(), [readingScroll, selected, chatVisible]);
@@ -709,8 +721,8 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       // Keep that focused row until focus leaves; otherwise removing the overlay
       // immediately removes its trigger and sends keyboard focus to <body>.
       const focused = historyRows.current?.contains(document.activeElement)
-        ? document.activeElement?.closest<HTMLElement>("[data-message-id]")?.dataset.messageId : undefined;
-      displayedMessages.forEach((message, index) => { if ((retainedMessageRows.has(message.id) || message.id === focused) && !indexes.includes(index)) indexes.push(index); });
+        ? document.activeElement?.closest<HTMLElement>("[data-row-key]")?.dataset.rowKey : undefined;
+      displayedMessages.forEach((message, index) => { const key = rowKey(message); if ((retainedMessageRows.has(key) || key === focused) && !indexes.includes(index)) indexes.push(index); });
       return indexes.sort((a, b) => a - b);
     },
     // Keep React measurement updates out of WebKit's ResizeObserver delivery.
@@ -756,7 +768,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       // the reader starts a swipe. Measurements/our observer follow later growth.
       scroll.current.scrollTop = scroll.current.scrollHeight;
     }
-  }, [messages, selected, messageHeight, focusTarget, searchResults, virtualizer, chatVisible]);
+  }, [messages, displayedMessages.length, selected, messageHeight, focusTarget, searchResults, virtualizer, chatVisible]);
   const pendingBubbleRange = hasPendingBubbleTiming(selected, "main")
     ? virtualizer.getVirtualItems().map((item) => item.index).join(",")
     : "";
@@ -1605,10 +1617,17 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     const mentions = botRetry ? [message.authorId] : source.mentions;
     if (source.blocks.some((block) => block.type === "steering")) { changeDraft(blocksText(source.blocks)); setError(t("已放回输入框。请确认原任务的结果，再选择引导或普通发送。")); return; }
     if (source.forwardedFrom && botRetry) {
-      await connection.send({ v: 1, type: "message.forward", conversationId: source.conversationId, sourceMessageId: source.id, clientMsgId: newId("client"), mentions });
+      const clientMsgId = newId("client");
+      const sourceConversation = conversations.find((item) => item.id === source.conversationId);
+      const sourceTitle = sourceConversation?.parentId
+        ? `${conversations.find((parent) => parent.id === sourceConversation.parentId)?.title ?? ""} / ${sourceConversation.title}`
+        : sourceConversation?.title;
+      rememberForwardedMessage(connection, clientMsgId, source, sourceTitle, forwardedAuthorName(source, connection.state, botDirectory));
+      await connection.send({ v: 1, type: "message.forward", conversationId: source.conversationId, sourceMessageId: source.id, clientMsgId, mentions });
       return;
     }
     if (source.forwardedFrom) { forwardTrigger.current = composer.current; setForwarding(source); return; }
+    rememberMessageAttachments(connection, source.blocks);
     await connection.send({ v: 1, type: "message.send", conversationId: source.conversationId, clientMsgId: newId("client"), previewUrl: source.previewUrl, previewStyle: source.previewStyle, text: source.blocks.filter((b) => b.type === "text").map((b) => b.text).join("\n"), attachments: source.blocks.flatMap((b) => "attachmentId" in b ? [b.attachmentId] : []), ...(source.replyTo ? { replyTo: source.replyTo } : {}), ...(mentions ? { mentions } : {}) });
   };
   const searchParams = useMemo(() => {
@@ -2156,19 +2175,22 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
         // of a pull are still near it. Rejoin only on an intentional return.
         if ((scrollingTowardLatest.current || scrollbarOrigin.current !== undefined && node.scrollTop > scrollbarOrigin.current) && node.scrollHeight - node.scrollTop - node.clientHeight <= 2) { followLatest.current = true; setShowLatest(false); setFocusTarget(undefined); }
         syncRailPosition();
-      }}>{phone && <div className="conversation-intro"><ShieldCheck size={14}/>{t("仅已授权设备可访问")}</div>}{messagesReady && group && current && !messages.length && <div className="conversation-empty"><MessageSquare size={28}/><h2>{current.parentId ? t("从这个话题开始") : t("默认讨论")}</h2><p>{current.parentId ? t("这里的消息只属于「{0}」。", current.title) : t("日常交流留在这里，不同事项可以新建话题。")}</p>{!group.archived && !current.parentId && !conversations.some((c) => c.parentId === group.id) && <button onClick={() => setNewChat({ kind: "topic", group })}><Plus size={16}/>{t("创建第一个话题")}</button>}</div>}{messagesReady && current?.historyOrigin && <ConversationHistoryOrigin conversation={current} source={conversations.find(value => value.id === current.historyOrigin?.sourceConversationId)} open={selectChat}/>}{messagesReady && !group && current && !current.historyOrigin && !messages.length && !queued.length && <DirectEmpty botId={current.botIds[0] ?? "unknown"} name={labels.get(current.botIds[0] ?? "") ?? activeBot?.name ?? current.title} archived={!!current.archived} online={state.status === "online"} draftEmpty={!draft} commands={() => { if (draft) return; changeDraft("/"); composer.current?.focus(); }} attach={attachments.show} dispatcher={isDispatcher(activeBot)}/>}<div ref={historyRows} className="virtual-messages" style={{ height: Math.max(0, virtualizer.getTotalSize() - readingScroll.shift), transform: readingScroll.shift ? `translateY(${-readingScroll.shift}px)` : undefined }}><TurnStopContext.Provider value={turnStop.request}><MessageOverlayContext.Provider value={retainMessageOverlay}><ReplyWidthContext.Provider value={replyWidth}>{virtualizer.getVirtualItems().map((item) => {
+      }}>{phone && <div className="conversation-intro"><ShieldCheck size={14}/>{t("仅已授权设备可访问")}</div>}{messagesReady && group && current && !messages.length && !pendingMessages.length && !attentionQueued.length && <div className="conversation-empty"><MessageSquare size={28}/><h2>{current.parentId ? t("从这个话题开始") : t("默认讨论")}</h2><p>{current.parentId ? t("这里的消息只属于「{0}」。", current.title) : t("日常交流留在这里，不同事项可以新建话题。")}</p>{!group.archived && !current.parentId && !conversations.some((c) => c.parentId === group.id) && <button onClick={() => setNewChat({ kind: "topic", group })}><Plus size={16}/>{t("创建第一个话题")}</button>}</div>}{messagesReady && current?.historyOrigin && <ConversationHistoryOrigin conversation={current} source={conversations.find(value => value.id === current.historyOrigin?.sourceConversationId)} open={selectChat}/>}{messagesReady && !group && current && !current.historyOrigin && !messages.length && !pendingMessages.length && !attentionQueued.length && <DirectEmpty botId={current.botIds[0] ?? "unknown"} name={labels.get(current.botIds[0] ?? "") ?? activeBot?.name ?? current.title} archived={!!current.archived} online={state.status === "online"} draftEmpty={!draft} commands={() => { if (draft) return; changeDraft("/"); composer.current?.focus(); }} attach={attachments.show} dispatcher={isDispatcher(activeBot)}/>}<div ref={historyRows} className="virtual-messages" style={{ height: Math.max(0, virtualizer.getTotalSize() - readingScroll.shift), transform: readingScroll.shift ? `translateY(${-readingScroll.shift}px)` : undefined }}><TurnStopContext.Provider value={turnStop.request}><MessageOverlayContext.Provider value={retainMessageOverlay}><ReplyWidthContext.Provider value={replyWidth}>{virtualizer.getVirtualItems().map((item) => {
   const message = displayedMessages[item.index]!;
   const bot = botsById.get(message.authorId);
   const original = message.replyTo ? messagesById.get(message.replyTo) : undefined;
   const backgroundGroup = backgroundGroups.byAnchor.get(message.id);
-  const rowKey = backgroundGroup?.key ?? message.id;
+  const key = rowKey(message);
+  const pending = pendingById.get(message.id);
   const focusedHere = (backgroundGroups.anchors.get(focusTarget?.messageId ?? "") ?? focusTarget?.messageId) === message.id;
   const rowFocusRequest = focusTarget && (focusedHere || message.authorType === "user" && !!message.botSource && focusTarget.conversationId === message.conversationId) ? focusTarget : undefined;
   const botLabel = labels.get(message.authorId);
   const authorLabel = botLabel ?? (message.authorType === "user" ? t("我") : "TaroBird");
   const scheduledName = labels.get(message.groupDiscussion?.botId ?? "") ?? botsById.get(message.groupDiscussion?.botId ?? "")?.name ?? t("Bot");
   return <WorkspaceMessageRow
-    key={rowKey}
+    key={key}
+    rowKey={key}
+    pending={pending}
     message={message}
     index={item.index}
     start={item.start}
@@ -2203,7 +2225,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     userReplies={message.authorType === "user" ? replyStatuses.get(message.id) : undefined}
     labels={labels}
     widgetOwner={widgetOwner}
-    widgetActive={!message.historyContext && widgetAllowed(selected)}
+    widgetActive={!pending && !message.historyContext && widgetAllowed(selected)}
     widgetScope={`${connection.identity.hubPublicKey}:${state.user?.id ?? ""}:${message.conversationId}:${message.id}`}
     onLocate={locateMessage}
     onWidgetCompose={dispatchWidgetCompose}
@@ -2216,7 +2238,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     onDeletionToggle={onDeletionToggle}
     onDeletionClose={onDeletionClose}
   />;
-})}</ReplyWidthContext.Provider></MessageOverlayContext.Provider></TurnStopContext.Provider></div><div ref={queuedRows} style={{ display: "flow-root" }}>{queued.filter((q) => q.error || !messages.some((m) => m.clientMsgId === q.id)).map((q) => <div className="queued-message" key={q.id}><span><ReferencePreview text={q.text}/></span><small>{q.error ? q.expired ? q.error : t("发送失败：{0}", q.error) : q.sent ? t("已发送") : q.syncing ? t("正在同步发送状态…") : q.blocked ? t("等待前一条消息处理") : t("等待发送")}</small>{q.error && <>{current?.type === "group" && q.copyable && <button onClick={() => { clearTimeout(copiedTimer.current); setCopied(undefined); let write: Promise<void>; try { write = writeClipboardText(q.text); } catch (error) { write = Promise.reject(error); } write.then(() => { setCopied(q.id); copiedTimer.current = setTimeout(() => setCopied(undefined), 3000); }, () => setError(t("无法写入剪贴板，请检查权限后重试。"))); }}>{copied === q.id ? t("已复制") : t("复制文字")}</button>}{!q.expired && <button disabled={retryBlocked} title={retryBlocked ? t("对话已归档，恢复后可重新发送。") : undefined} onClick={() => { if (retryBlocked) return; report(connection.retryFailed(q.id)); }}>{t("重试")}</button>}<button onClick={() => report(connection.discardFailed(q.id))}>{t("移除待发送项")}</button></>}</div>)}</div>{pane && <span ref={readTail} aria-hidden="true" style={{ display: "block", height: 1 }}/>}</div>
+})}</ReplyWidthContext.Provider></MessageOverlayContext.Provider></TurnStopContext.Provider></div><div ref={queuedRows} style={{ display: "flow-root" }}>{attentionQueued.map((q) => <div className="queued-message" key={q.id}><span><ReferencePreview text={q.text}/></span><small>{q.error ? q.expired ? q.error : t("发送失败：{0}", q.error) : q.blocked ? t("等待前一条消息处理") : t("等待发送")}</small>{q.error && <>{current?.type === "group" && q.copyable && <button onClick={() => { clearTimeout(copiedTimer.current); setCopied(undefined); let write: Promise<void>; try { write = writeClipboardText(q.text); } catch (error) { write = Promise.reject(error); } write.then(() => { setCopied(q.id); copiedTimer.current = setTimeout(() => setCopied(undefined), 3000); }, () => setError(t("无法写入剪贴板，请检查权限后重试。"))); }}>{copied === q.id ? t("已复制") : t("复制文字")}</button>}{!q.expired && <button disabled={retryBlocked} title={retryBlocked ? t("对话已归档，恢复后可重新发送。") : undefined} onClick={() => { if (retryBlocked) return; report(connection.retryFailed(q.id)); }}>{t("重试")}</button>}<button onClick={() => report(connection.discardFailed(q.id))}>{t("移除待发送项")}</button></>}</div>)}</div>{pane && <span ref={readTail} aria-hidden="true" style={{ display: "block", height: 1 }}/>}</div>
     : <WelcomeHome pairDevice={["macos", "windows"].includes(nativePlatform()) && state.status === "online" && state.user?.role === "owner" ? () => { setSettingsSection("pairing"); setSettings(true); } : undefined} hasBots={state.status !== "online" || state.bots.length > 0} newChat={() => setNewChat({ kind: "direct", ...(choosableBot ? { botId: choosableBot.id } : {}) })} newBot={() => shell ? shell.create("bot") : setNewBot(true)} newGroup={() => setNewChat({ kind: "group", ...(choosableBot ? { botId: choosableBot.id } : {}) })}/>}
     {railEnabled && !searchResults && selected && railItems.length >= 2 && <MessageRail items={railItems} scrollRef={scroll} anchorIndex={railPosition.index} atBottom={railPosition.atBottom} onJump={jumpToRailItem} onWheelDirection={(deltaY) => { if (deltaY < 0) readHistory(); else if (deltaY > 0) readTowardLatest(); }}/>}
     {deletion.toolbar}
