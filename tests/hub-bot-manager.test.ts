@@ -63,6 +63,14 @@ describe("client-created TaroCub instances", () => {
     expect((await stat(ticketDir)).isDirectory()).toBe(true);
     await expect(manager.ticketWorkspace(dispatcher.id, "../escape")).rejects.toThrow();
   });
+  it("uses manual approval for a remote worker and refuses to reuse it after permission widens", async () => {
+    const worker = await manager.remoteDispatchWorker("source_host", "codex");
+    const stateDir = path.join(root, "bots", worker);
+    expect(await readValidatedConfigFile(path.join(stateDir, "config.json"))).toMatchObject({ approvalMode: "normal" });
+    expect(await manager.remoteDispatchWorker("source_host", "codex")).toBe(worker);
+    await updateInstanceConfig(stateDir, cfg => { cfg.approvalMode = "bypass"; });
+    await expect(manager.remoteDispatchWorker("source_host", "codex")).rejects.toThrow("dispatch_worker_permissions_unsafe");
+  });
   it("replaces a deleted dispatcher worker once while retaining its old history", async () => {
     const dispatcher = await manager.create("owner", { ...spec, requestId: "dispatcher", role: "dispatcher" });
     const worker = await manager.dispatchWorker(dispatcher.id, "codex");

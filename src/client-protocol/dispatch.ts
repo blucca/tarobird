@@ -14,6 +14,10 @@ export const dispatchEngineSelectionValid = (value: { engine: string; model?: st
 export const DISPATCH_CAPABILITY = "dispatch.v1";
 /** Cross-host Superagent dispatch, node load reporting, split planning & batch summary. */
 export const DISPATCH_CROSS_HOST_CAPABILITY = "dispatch.cross-host.v1";
+export function dispatchWireRoute(route: string, crossHostSupported?: boolean): string {
+  if (!crossHostSupported || !/^\/api\/(?:bots\/[^/]+\/(?:dispatcher|tickets)(?:[/?]|$)|tickets\/)/.test(route)) return route;
+  return `${route}${route.includes("?") ? "&" : "?"}crossHostDispatch=1`;
+}
 export const REMOTE_DISPATCH_TARGET_BOT = "__dispatch__" as const;
 
 /** `dispatcher` is chosen only when the Bot is created; an ordinary Bot has no
@@ -137,6 +141,7 @@ export const conversationTicketSchema = z.object({
 export type ConversationTicket = z.infer<typeof conversationTicketSchema>;
 
 export const createTicketSchema = z.object({
+  conversationId: id.optional(),
   requestId: id, title: z.string().trim().min(1).max(200), request: z.string().trim().min(1).max(20_000),
 }).strict();
 export const dispatchTicketRequestBaseSchema = z.object({
@@ -204,6 +209,19 @@ export const ticketOverviewListSchema = z.object({
 }).strict();
 export type TicketOverviewList = z.infer<typeof ticketOverviewListSchema>;
 
+/** Ticket wire projections for 1.6.0's strict full and nested validators. */
+export function legacyDispatchTicket(ticket: (DispatchTicket | TicketOverview) & { resultExcerpt?: string }) {
+  const { batchId, batchIndex, batchTotal, hostId, hostName, artifacts, resultExcerpt, ...base } = ticket;
+  return { ...base, attempts: ticket.attempts.map(attempt => {
+    const { hostId, hostName, remoteTicketId, remoteConversationId, remoteMessageId, remoteBotName, ...legacy } = attempt;
+    return legacy;
+  }) };
+}
+
+export function legacyDispatcherSettings({ settings: { nodes, ...settings }, revision }: { settings: DispatcherSettings; revision: string }) {
+  return { settings, revision };
+}
+
 /** Read-only Host load, capacity, and cached engine quota report (aligned with #88). */
 export const hostEngineCapacitySchema = z.object({
   engine: dispatchEngineSchema,
@@ -262,6 +280,7 @@ export const dispatchNodesResponseSchema = z.object({
 export type DispatchNodesResponse = z.infer<typeof dispatchNodesResponseSchema>;
 
 export const dispatchSplitPlanRequestSchema = z.object({
+  conversationId: id.optional(),
   requestId: id,
   title: z.string().trim().min(1).max(200).optional(),
   request: z.string().trim().min(1).max(20_000),

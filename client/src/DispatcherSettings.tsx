@@ -107,12 +107,14 @@ function DispatcherDialog({ connection, bot, online, close, returnFocus }: { con
   const [catalog, setCatalog] = useState<BotCatalog>(), [catalogFailed, setCatalogFailed] = useState(false), [catalogAttempt, setCatalogAttempt] = useState(0);
   const [nodesView, setNodesView] = useState<DispatchNodesResponse>();
   const [grantBusyHost, setGrantBusyHost] = useState(""), [grantError, setGrantError] = useState("");
+  const crossHostAvailable = connection.state.crossHostDispatchAvailable;
   const loadNodes = useCallback(async () => {
+    if (!crossHostAvailable) { setNodesView(undefined); return; }
     try {
       const value = dispatchNodesResponseSchema.parse(await connection.http(`/api/bots/${encodeURIComponent(bot.id)}/dispatch-nodes`));
       setNodesView(value);
     } catch { /* Optional cross-host capability; older Hubs return 404. */ }
-  }, [connection, bot.id]);
+  }, [connection, bot.id, crossHostAvailable]);
   const reloadAll = useCallback(() => {
     void load();
     if (online) void loadNodes();
@@ -171,7 +173,7 @@ function DispatcherDialog({ connection, bot, online, close, returnFocus }: { con
         <DispatcherSettingsFields value={draft} change={setDraft} engines={engines} loading={!catalog && !catalogFailed} failed={!catalog && catalogFailed} retry={() => setCatalogAttempt(value => value + 1)} disabled={busy || !online}/>
         {showNodes && nodesView && <fieldset className="dispatcher-nodes" disabled={busy || !online}>
           <legend>{t("跨主机协作节点")}</legend>
-          <p className="muted">{t("选择允许参与并发派工的组网主机，并设置调度偏好与每台上限。")}</p>
+          <p className="muted">{t("选择参与并发派工的组网主机。远程执行者使用接收主机的手动审批设置。")}</p>
           {grantError && <p role="alert" className="error-text">{grantError}</p>}
           <ul className="dispatcher-node-list">
             {nodesView.nodes.map(node => {

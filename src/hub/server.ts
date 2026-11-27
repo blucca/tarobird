@@ -110,7 +110,7 @@ import { pipeline } from "node:stream/promises";
 import { WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
 import { SERVER_CAPABILITIES, CHUNK_BYTES, MAX_FRAME_BYTES, blocksText, idSchema, messageSchema, pairingSchema, parseClientFrame, type Block, type CardElement, type ClientFrame, type Conversation, type HubEvent, type Json, type Message } from "../client-protocol/index.js";
-import { DISPATCH_CAPABILITY, REMOTE_DISPATCH_TARGET_BOT } from "../client-protocol/dispatch.js";
+import { DISPATCH_CAPABILITY, legacyDispatcherSettings, legacyDispatchTicket, REMOTE_DISPATCH_TARGET_BOT } from "../client-protocol/dispatch.js";
 import { HubDispatch } from "./dispatch.js";
 import { handleRemoteDispatchRequest, readCrossHostDispatchGrants, readLocalHostLoad, updateCrossHostDispatchGrants, type RemoteDispatchContext } from "./dispatch-remote.js";
 import { BOT_PASSPORT_TTL_MS, type BotPassport } from "../client-protocol/bot-messages.js";
@@ -2348,19 +2348,26 @@ export class HubServer {
         }
         return;
       }
+      const dispatchQuery = new URL(req.url ?? "/", "http://hub").searchParams;
+      const crossHostDispatch = dispatchQuery.get("crossHostDispatch") === "1";
+      const ticketForClient = (ticket: Parameters<typeof legacyDispatchTicket>[0]) => crossHostDispatch ? ticket : legacyDispatchTicket(ticket);
       const dispatcher = route.match(/^\/api\/bots\/([A-Za-z0-9_-]+)\/(dispatcher|tickets|tickets\/dispatch|tickets\/update|tickets\/plan|tickets\/bulk-action|dispatch-targets|dispatch-capabilities|dispatch-nodes)$/);
       if (dispatcher) {
         await requireOwner();
         const [, botId, kind] = dispatcher as unknown as [string, string, string], owner = { kind: "owner" as const, userId, validate: validateInQueue };
-        if (kind === "dispatcher" && req.method === "GET") { await reply(200, await this.dispatch.settings(userId, botId)); return; }
-        if (kind === "dispatcher" && req.method === "PUT") { const result = await this.dispatch.updateSettings(userId, botId, await this.jsonBody(req), validateInQueue); await this.store.audit("dispatch.settings_updated", session.deviceId, { botId }); await reply(200, result); return; }
-        if (kind === "tickets" && req.method === "GET") {
-          const query = new URL(req.url ?? "/", "http://hub").searchParams, options = { open: query.get("open") === "1", capabilities: query.get("capabilities") === "1", excerpts: query.get("excerpts") === "1" };
-          await reply(200, query.get("summary") === "1" ? await this.dispatch.overview(owner, botId, options) : await this.dispatch.list(owner, botId, options)); return;
+        if (kind === "dispatcher" && req.method === "GET") {
+          const result = await this.dispatch.settings(userId, botId);
+          await reply(200, crossHostDispatch ? result : legacyDispatcherSettings(result)); return;
         }
-        if (kind === "tickets" && req.method === "POST") { await reply(201, await this.dispatch.create(owner, botId, await this.jsonBody(req))); return; }
-        if (kind === "tickets/dispatch" && req.method === "POST") { await reply(200, await this.dispatch.dispatch(owner, botId, await this.jsonBody(req))); return; }
-        if (kind === "tickets/update" && req.method === "POST") { await reply(200, await this.dispatch.update(owner, botId, await this.jsonBody(req))); return; }
+        if (kind === "dispatcher" && req.method === "PUT") { const result = await this.dispatch.updateSettings(userId, botId, await this.jsonBody(req), validateInQueue, !crossHostDispatch); await this.store.audit("dispatch.settings_updated", session.deviceId, { botId }); await reply(200, crossHostDispatch ? result : legacyDispatcherSettings(result)); return; }
+        if (kind === "tickets" && req.method === "GET") {
+          const options = { open: dispatchQuery.get("open") === "1", capabilities: dispatchQuery.get("capabilities") === "1", excerpts: crossHostDispatch && dispatchQuery.get("excerpts") === "1" };
+          const list = dispatchQuery.get("summary") === "1" ? await this.dispatch.overview(owner, botId, options) : await this.dispatch.list(owner, botId, options);
+          await reply(200, crossHostDispatch ? list : { ...list, tickets: list.tickets.map(legacyDispatchTicket) }); return;
+        }
+        if (kind === "tickets" && req.method === "POST") { await reply(201, ticketForClient(await this.dispatch.create(owner, botId, await this.jsonBody(req)))); return; }
+        if (kind === "tickets/dispatch" && req.method === "POST") { await reply(200, ticketForClient(await this.dispatch.dispatch(owner, botId, await this.jsonBody(req)))); return; }
+        if (kind === "tickets/update" && req.method === "POST") { await reply(200, ticketForClient(await this.dispatch.update(owner, botId, await this.jsonBody(req)))); return; }
         if (kind === "tickets/plan" && req.method === "POST") { await reply(200, await this.dispatch.plan(owner, botId, await this.jsonBody(req))); return; }
         if (kind === "tickets/bulk-action" && req.method === "POST") { await reply(200, await this.dispatch.bulkAction(userId, botId, await this.jsonBody(req), validateInQueue)); return; }
         if (kind === "dispatch-nodes" && req.method === "GET") { await reply(200, await this.dispatch.nodes(owner, botId)); return; }
@@ -2392,9 +2399,9 @@ export class HubServer {
       const ticket = route.match(/^\/api\/tickets\/([A-Za-z0-9_-]+)(\/action|\/assists)?$/);
       if (ticket) {
         await requireOwner();
-        if (!ticket[2] && req.method === "GET") { await reply(200, await this.dispatch.show({ kind: "owner", userId }, ticket[1]!)); return; }
+        if (!ticket[2] && req.method === "GET") { await reply(200, ticketForClient(await this.dispatch.show({ kind: "owner", userId }, ticket[1]!))); return; }
         if (ticket[2] === "/assists" && req.method === "GET") { await reply(200, await this.dispatch.assists({ kind: "owner", userId }, ticket[1]!)); return; }
-        if (ticket[2] === "/action" && req.method === "POST") { await reply(200, await this.dispatch.action(userId, ticket[1]!, await this.jsonBody(req), validateInQueue)); return; }
+        if (ticket[2] === "/action" && req.method === "POST") { await reply(200, ticketForClient(await this.dispatch.action(userId, ticket[1]!, await this.jsonBody(req), validateInQueue))); return; }
       }
       const engineReset = route.match(/^\/api\/dispatch\/engines\/([a-z]+)\/reset$/);
       if (engineReset && req.method === "POST") { await requireOwner(); await reply(200, await this.dispatch.resetEngine(userId, engineReset[1], validateInQueue)); return; }

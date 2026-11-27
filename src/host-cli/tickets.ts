@@ -5,7 +5,7 @@ import { resolveBotTarget } from "../client-protocol/bot-messages.js";
 import { networkCanonical } from "../client-protocol/private-network.js";
 import { z } from "zod";
 import {
-  DISPATCH_ENGINES, dispatchEngineSchema, dispatchCapabilitiesRequestSchema, dispatcherSettingsSchema,
+  DISPATCH_CROSS_HOST_CAPABILITY, DISPATCH_ENGINES, dispatchWireRoute, dispatchEngineSchema, dispatchCapabilitiesRequestSchema, dispatcherSettingsSchema,
   crossHostDispatchGrantCommandSchema, dispatchSplitPlanRequestSchema, ticketBulkActionSchema,
   type DispatcherSettings,
 } from "../client-protocol/dispatch.js";
@@ -70,8 +70,14 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
   if (sub === "assist" || sub === "assist-status") throw new Error(`tickets ${sub} 只供正在执行工单的 Worker 使用；请从幕僚长对话安排任务，或用 tickets assists 工单ID 查看协助记录。`);
   const client = await LocalHostClient.connect(directory);
   try {
-    if (sub === "load") return client.request("/api/dispatch/load");
-    if (sub === "remote-grants") return client.request("/api/dispatch/cross-host-grants");
+    const crossHostSupported = client.supports(DISPATCH_CROSS_HOST_CAPABILITY);
+    if (!crossHostSupported && (options.host !== undefined || ["nodes", "plan", "bulk-action", "load", "remote-grants", "allow-remote", "revoke-remote"].includes(sub))) {
+      throw new HostCliError("dispatch_host_update_required");
+    }
+    const request = <T = unknown>(route: string, method?: string, body?: unknown) =>
+      client.request<T>(dispatchWireRoute(route, crossHostSupported), method, body);
+    if (sub === "load") return request("/api/dispatch/load");
+    if (sub === "remote-grants") return request("/api/dispatch/cross-host-grants");
     if (sub === "allow-remote" || sub === "revoke-remote") {
       const command = crossHostDispatchGrantCommandSchema.parse({
         operation: "cross-host-dispatch-grant",
@@ -80,7 +86,7 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
         allowed: sub === "allow-remote",
       });
       const proof = await client.deviceAction({ operation: "bot-message-grant", target: createHash("sha256").update(networkCanonical(command)).digest("hex") });
-      return client.request("/api/dispatch/cross-host-grants", "POST", { command, proof });
+      return request("/api/dispatch/cross-host-grants", "POST", { command, proof });
     }
     const dispatchers = client.ready.bots.filter(bot => bot.role === "dispatcher" && !bot.deletedAt);
     const dispatcher = () => {
@@ -89,19 +95,19 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
       throw new Error(dispatchers.length ? "有多个调度 Bot，请用 --bot 指定。" : "本机还没有调度 Bot。创建时使用 bots create --role dispatcher。");
     };
     const ticketRoute = (id: string) => `/api/tickets/${encodeURIComponent(id)}`;
-    if (sub === "engines") return { engines: (await client.request<{ engines: unknown[] }>(`/api/bots/${dispatcher().id}/tickets?open=1`)).engines };
+    if (sub === "engines") return { engines: (await request<{ engines: unknown[] }>(`/api/bots/${dispatcher().id}/tickets?open=1`)).engines };
     if (sub === "engine-reset") {
       const engine = required(argument, `缺少引擎名称：${DISPATCH_ENGINES.join("|")}。`);
-      return { engines: await client.request(`/api/dispatch/engines/${encodeURIComponent(engine)}/reset`, "POST", {}) };
+      return { engines: await request(`/api/dispatch/engines/${encodeURIComponent(engine)}/reset`, "POST", {}) };
     }
-    if (sub === "list") return client.request(`/api/bots/${dispatcher().id}/tickets${options.open ? "?open=1" : ""}`);
-    if (sub === "show") return client.request(ticketRoute(required(argument, "缺少工单 ID。")));
-    if (sub === "assists") return client.request(`${ticketRoute(required(argument, "缺少工单 ID。"))}/assists`);
-    if (sub === "targets") return client.request(`/api/bots/${dispatcher().id}/dispatch-targets`);
-    if (sub === "nodes") return client.request(`/api/bots/${dispatcher().id}/dispatch-nodes`);
+    if (sub === "list") return request(`/api/bots/${dispatcher().id}/tickets${options.open ? "?open=1" : ""}`);
+    if (sub === "show") return request(ticketRoute(required(argument, "缺少工单 ID。")));
+    if (sub === "assists") return request(`${ticketRoute(required(argument, "缺少工单 ID。"))}/assists`);
+    if (sub === "targets") return request(`/api/bots/${dispatcher().id}/dispatch-targets`);
+    if (sub === "nodes") return request(`/api/bots/${dispatcher().id}/dispatch-nodes`);
     if (capabilityQuery) {
       const query = new URLSearchParams({ engine: capabilityQuery.engine, offset: String(capabilityQuery.offset), ...(capabilityQuery.match !== undefined ? { match: capabilityQuery.match } : {}) });
-      return client.request(`/api/bots/${dispatcher().id}/dispatch-capabilities?${query}`);
+      return request(`/api/bots/${dispatcher().id}/dispatch-capabilities?${query}`);
     }
     if (sub === "bulk-action") {
       const requestId = options["request-id"] ?? randomUUID(); receipt(requestId);
@@ -111,14 +117,14 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
         ...(options.host !== undefined ? { hostId: options.host } : {}),
         ...(options.batch !== undefined ? { batchId: options.batch } : {}),
       });
-      return client.request(`/api/bots/${dispatcher().id}/tickets/bulk-action`, "POST", body);
+      return request(`/api/bots/${dispatcher().id}/tickets/bulk-action`, "POST", body);
     }
     if (["pause", "resume", "cancel", "accept", "remove"].includes(sub)) {
       const requestId = options["request-id"] ?? randomUUID(); receipt(requestId);
-      return client.request(`${ticketRoute(required(argument, "缺少工单 ID。"))}/action`, "POST", { requestId, action: sub });
+      return request(`${ticketRoute(required(argument, "缺少工单 ID。"))}/action`, "POST", { requestId, action: sub });
     }
     if (sub === "settings") {
-      const id = dispatcher().id, current = await client.request<{ settings: DispatcherSettings; revision: string }>(`/api/bots/${id}/dispatcher`);
+      const id = dispatcher().id, current = await request<{ settings: DispatcherSettings; revision: string }>(`/api/bots/${id}/dispatcher`);
       const allow = allowedEnginesOption(options.allow);
       if (options.host !== undefined) {
         const hostId = options.host.trim();
@@ -145,17 +151,17 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
           ...current.settings,
           nodes: [...existingNodes.filter(node => node.hostId !== hostId), nextNode],
         });
-        return client.request(`/api/bots/${id}/dispatcher`, "PUT", { settings, expectedRevision: options.revision ?? current.revision });
+        return request(`/api/bots/${id}/dispatcher`, "PUT", { settings, expectedRevision: options.revision ?? current.revision });
       }
       if (options["dispatch-mode"] === undefined && options["max-concurrent"] === undefined && allow === undefined) return current;
       const { allowedEngines: _all, ...rest } = current.settings;
       const settings = dispatcherSettingsSchema.parse({ ...(allow === "all" ? rest : current.settings), ...(Array.isArray(allow) ? { allowedEngines: allow } : {}),
         ...(options["dispatch-mode"] !== undefined ? { mode: options["dispatch-mode"] } : {}), ...(options["max-concurrent"] !== undefined ? { maxConcurrent: Number(options["max-concurrent"]) } : {}) });
-      return client.request(`/api/bots/${id}/dispatcher`, "PUT", { settings, expectedRevision: options.revision ?? current.revision });
+      return request(`/api/bots/${id}/dispatcher`, "PUT", { settings, expectedRevision: options.revision ?? current.revision });
     }
     const id = dispatcher().id;
     const body = await mutation(sub, argument, options, receipt);
-    return client.request(`/api/bots/${id}/tickets${sub === "create" ? "" : `/${sub}`}`, "POST", body);
+    return request(`/api/bots/${id}/tickets${sub === "create" ? "" : `/${sub}`}`, "POST", body);
   } finally { client.close(); }
 }
 

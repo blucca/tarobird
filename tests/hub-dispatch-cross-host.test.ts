@@ -264,7 +264,15 @@ it("enforces remote authorization, dispatches across 2 real TLS Hubs in parallel
   expect(postStudio).toMatchObject({ online: true, authorized: true, eligible: true });
 
   // 3. Plan & dispatch 4 items (2 per node -> 2 parallel tickets: 1 on macmini, 1 on studio-b).
-  const plan = await a.dispatch.plan(owner, "d", {
+  const defaultChat = (await a.store.conversations("owner")).find(c => c.botIds.includes("d"))!;
+  await a.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort) VALUES('other','Other','fixture','codex','','')");
+  const origin = await a.store.createConversation("owner", ["other"], "Batch group", "batch_group", { type: "group" });
+  // The integration branch's multiple-conversation support permits this membership.
+  await a.store.db.run("INSERT INTO conversation_members VALUES(?,'bot','d',0)", [origin.id]);
+  const turn = await a.store.sendMessage("owner", { conversationId: origin.id, clientMsgId: "batch-turn", text: "Plan a batch", attachments: [], mentions: ["d"] });
+  await a.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id='d'", [turn.message.id]);
+  const actor = { kind: "bot" as const, botId: "d", contextMessage: turn.message.id };
+  const plan = await a.dispatch.plan(actor, "d", {
     requestId: "parallel-4",
     title: "Generate batch",
     request: "写 4 个脚本，每台机器 2 个",
@@ -277,6 +285,7 @@ it("enforces remote authorization, dispatches across 2 real TLS Hubs in parallel
 
   expect(plan.batches).toHaveLength(2);
   expect(plan.tickets).toHaveLength(2);
+  expect(plan.tickets!.map(ticket => ticket.conversationId)).toEqual([origin.id, origin.id]);
   const byHost = new Map(plan.tickets!.map(t => [t.hostId!, t]));
   const localTicket = byHost.get(macId)!;
   const remoteTicket = byHost.get(studioId)!;
@@ -317,7 +326,8 @@ it("enforces remote authorization, dispatches across 2 real TLS Hubs in parallel
   });
   await b.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [remoteAttempt.inputMessageId, remoteAttempt.botId]);
 
-  // 5. Sweep on macmini settles both tickets, downloads remote attachment over TLS, and posts one consolidated summary.
+  // Both tickets settle while the originating group is archived. Delivery resumes there after unarchiving.
+  await a.store.updateConversation("owner", origin.id, { archived: true });
   await a.dispatch.sweep();
   const updatedLocal = await a.dispatch.show(owner, localTicket.id);
   const updatedRemote = await a.dispatch.show(owner, remoteTicket.id);
@@ -331,9 +341,15 @@ it("enforces remote authorization, dispatches across 2 real TLS Hubs in parallel
   const downloadedMeta = await a.attachments.download({ userId: "owner" }, updatedRemote.artifacts![0]!.localAttachmentId!);
   expect(downloadedMeta.row).toMatchObject({ name: "remote_script.js", size: payload.length, sha256 });
 
-  // Verify consolidated batch summary was published ONCE to Dispatcher's home conversation with the attachment.
-  const home = (await a.store.conversations("owner")).find(c => c.botIds.includes("d"))!;
-  const msgs1 = await a.store.db.all<{ id: string; blocks_json: string }>("SELECT id,blocks_json FROM messages WHERE conversation_id=? ORDER BY created_at,rowid", [home.id]);
+  expect(await a.store.db.get("SELECT 1 FROM dispatch_batch_summaries WHERE batch_id=?", [plan.batchId])).toBeUndefined();
+  expect(await a.store.db.get("SELECT 1 FROM messages WHERE conversation_id=? AND blocks_json LIKE '%Completed remote items 3-4 on studio-b.%'", [origin.id])).toBeUndefined();
+  await a.store.updateConversation("owner", origin.id, { archived: false });
+  await a.dispatch.sweep();
+
+  // The remote notice and the one summary belong to the originating group.
+  const msgs1 = await a.store.db.all<{ id: string; blocks_json: string }>("SELECT id,blocks_json FROM messages WHERE conversation_id=? ORDER BY created_at,rowid", [origin.id]);
+  expect(msgs1.some(message => message.blocks_json.includes("Completed remote items 3-4 on studio-b."))).toBe(true);
+  expect(await a.store.db.get("SELECT 1 FROM messages WHERE conversation_id=? AND blocks_json LIKE '%Completed remote items 3-4 on studio-b.%'", [defaultChat.id])).toBeUndefined();
   const summaryMsgs = msgs1.filter(m => m.blocks_json.includes("跨主机任务汇总"));
   expect(summaryMsgs).toHaveLength(1);
   expect(summaryMsgs[0]!.blocks_json).toContain("macmini");
@@ -342,8 +358,44 @@ it("enforces remote authorization, dispatches across 2 real TLS Hubs in parallel
 
   // Re-sweeping never duplicates the summary.
   await a.dispatch.sweep();
-  const msgs2 = await a.store.db.all<{ id: string }>("SELECT id FROM messages WHERE conversation_id=? AND blocks_json LIKE '%跨主机任务汇总%'", [home.id]);
+  const msgs2 = await a.store.db.all<{ id: string }>("SELECT id FROM messages WHERE conversation_id=? AND blocks_json LIKE '%跨主机任务汇总%'", [origin.id]);
   expect(msgs2).toHaveLength(1);
+});
+
+it("negotiates strict legacy ticket and settings payloads and preserves node settings on legacy writes", async () => {
+  const preview = await a.dispatch.plan(owner, "d", {
+    requestId: "legacy-plan", request: "Review one item", engine: "codex", create: true, hostIds: [macId],
+  });
+  const ticket = await a.dispatch.dispatch(owner, "d", {
+    requestId: "legacy-run", ticketId: preview.tickets![0]!.id, engine: "codex", hostId: macId,
+  });
+  const close = await startHubControl(aDir,
+    { running: true, pid: process.pid, url: a.url, instanceUrl: a.instanceUrl, publicKey: a.auth.publicKey },
+    () => {}, { enrollController: value => a.enrollLocalController(value) });
+  const client = await LocalHostClient.connect(aDir, { enroll: true });
+  try {
+    const legacy = await client.request<DispatchTicket>(`/api/tickets/${ticket.id}`);
+    expect(legacy).not.toHaveProperty("batchId");
+    expect(legacy).not.toHaveProperty("hostId");
+    expect(legacy.attempts[0]).not.toHaveProperty("hostId");
+    const modern = await client.request<DispatchTicket>(`/api/tickets/${ticket.id}?crossHostDispatch=1`);
+    expect(modern).toMatchObject({ batchId: ticket.batchId, hostId: macId, attempts: [{ hostId: macId }] });
+    for (const query of ["?open=1&summary=1", "?summary=1&capabilities=1"]) {
+      const overview = await client.request<{ tickets: DispatchTicket[] }>(`/api/bots/d/tickets${query}`);
+      expect(overview.tickets[0]?.attempts[0]).not.toHaveProperty("hostId");
+    }
+    const settings = await client.request<{ settings: ReturnType<typeof defaultDispatcherSettings>; revision: string }>("/api/bots/d/dispatcher");
+    expect(settings.settings).not.toHaveProperty("nodes");
+    const saved = await client.request<typeof settings>("/api/bots/d/dispatcher", "PUT", {
+      settings: { ...settings.settings, maxConcurrent: 3 }, expectedRevision: settings.revision,
+    });
+    expect(saved.settings).toEqual({ mode: "auto", maxConcurrent: 3 });
+    const current = await a.dispatch.settings("owner", "d");
+    expect(current.settings.nodes).toHaveLength(2);
+  } finally {
+    client.close();
+    await close();
+  }
 });
 
 it("preserves completed remote batches and reassigns unfinished batches when a remote Host goes offline", async () => {
@@ -880,6 +932,6 @@ it("fixes planner edge cases, plan idempotency, idle ask-mode probe suppression,
   expect(admitted).toBe(1);
   expect(afterRevoke.grants).toEqual([]);
 
-  // Database schema version is bumped to 27.
-  expect(await a.store.db.get("SELECT value FROM meta WHERE key='schema_version'")).toEqual({ value: "27" });
+  // Database schema version is bumped to 28.
+  expect(await a.store.db.get("SELECT value FROM meta WHERE key='schema_version'")).toEqual({ value: "28" });
 });

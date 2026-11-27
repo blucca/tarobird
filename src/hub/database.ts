@@ -50,15 +50,15 @@ export class HubDatabase {
       await result.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=8388608;");
       await result.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
       const version = await result.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'");
-      if (version && !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27"].includes(version.value)) throw new Error("unsupported_hub_schema_version");
+      if (version && !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28"].includes(version.value)) throw new Error("unsupported_hub_schema_version");
       await result.transaction(async () => {
         await result.exec(SCHEMA);
-        if (version && Number(version.value) < 21) {
-          // Extend the policy CHECK atomically; existing runs keep their mode.
-          await result.exec(`ALTER TABLE group_discussion_settings RENAME TO group_discussion_settings_v20;
+        if (version && Number(version.value) < 28) {
+          // Preserve designated mode from schema 27 and widen the CHECK for older stores.
+          await result.exec(`ALTER TABLE group_discussion_settings RENAME TO group_discussion_settings_previous;
             ${GROUP_SETTINGS_SCHEMA};
-            INSERT INTO group_discussion_settings SELECT * FROM group_discussion_settings_v20;
-            DROP TABLE group_discussion_settings_v20;`);
+            INSERT INTO group_discussion_settings SELECT * FROM group_discussion_settings_previous;
+            DROP TABLE group_discussion_settings_previous;`);
         }
         await retainPushReceipts(result);
         // A rolled-back Hub cannot remove optional rows when recalling a reply.
@@ -185,8 +185,9 @@ export class HubDatabase {
         // 25: per-message pause must survive restarts. Older Hosts would ignore
         // this bit and dispatch held inputs, so downgrades need a state backup.
         // 26: native history operations keep durable admission fences that old Hosts must not ignore.
-        // 27: cross-host Superagent dispatch writes per-node settings and remote attempt fields into strict JSON columns, plus durable remote stop intents.
-        await result.run("INSERT OR REPLACE INTO meta VALUES('schema_version','27')");
+        // 27: reserved for designated group replies and cross-host group sessions.
+        // 28: cross-host Superagent dispatch writes per-node settings and remote attempt fields into strict JSON columns, plus durable remote stop intents.
+        await result.run("INSERT OR REPLACE INTO meta VALUES('schema_version','28')");
       });
       return result;
     } catch (error) { await result.close().catch(() => undefined); throw error; }
@@ -224,7 +225,7 @@ export class HubDatabase {
   }
 }
 
-const GROUP_SETTINGS_SCHEMA = "CREATE TABLE IF NOT EXISTS group_discussion_settings (group_id TEXT PRIMARY KEY, mode TEXT NOT NULL CHECK(mode IN ('mentions','parallel','sequential','independent')), order_json TEXT NOT NULL, max_rounds INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL)";
+const GROUP_SETTINGS_SCHEMA = "CREATE TABLE IF NOT EXISTS group_discussion_settings (group_id TEXT PRIMARY KEY, mode TEXT NOT NULL CHECK(mode IN ('designated','mentions','parallel','sequential','independent')), order_json TEXT NOT NULL, max_rounds INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL)";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS run_journal (

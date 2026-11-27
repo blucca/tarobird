@@ -253,11 +253,20 @@ export class BotManager {
       if (!row) return undefined;
       return this.store.db.get<{ id: string; deleted_at: number | null }>("SELECT id,deleted_at FROM bots WHERE id=?", [row.value]);
     });
-    if (existing && existing.deleted_at === null) return existing.id;
+    const requireManual = async (botId: string) => {
+      const row = await this.store.db.serial(() => this.store.db.get<{ specification_json: string }>("SELECT specification_json FROM managed_bots WHERE bot_id=?", [botId]));
+      const spec = row && createBotSchema.parse(JSON.parse(row.specification_json));
+      const config = await readValidatedConfigFile(path.join(this.directory, "bots", botId, "config.json"), { forExecution: true });
+      if (spec?.permission !== "normal" || currentPermission(engine, config) !== "normal") {
+        throw new HubError("dispatch_worker_permissions_unsafe", 409);
+      }
+      return botId;
+    };
+    if (existing && existing.deleted_at === null) return requireManual(existing.id);
     const label = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi" }[engine];
     const workspace = path.join(this.directory, "remote-dispatch", sourceHostId);
     await mkdir(workspace, { recursive: true, mode: 0o700 });
-    const permission = defaultPermission(engine) === "bypass" ? "bypass" : "normal";
+    const permission = "normal";
     // Include any prior deleted worker's ID so replacements derive a new bot ID
     // instead of permanently colliding with the deleted tombstone (410).
     const generationSeed = existing ? `${sourceHostId}:${engine}:${existing.id}` : `${sourceHostId}:${engine}`;
@@ -267,7 +276,7 @@ export class BotManager {
       await validate?.();
       await this.store.db.run("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, bot.id]);
     });
-    return bot.id;
+    return requireManual(bot.id);
   }
   async remoteTicketWorkspace(sourceHostId: string, remoteTicketId: string): Promise<string> {
     const directory = path.join(this.directory, "remote-dispatch", idSchema.parse(sourceHostId), "tickets", idSchema.parse(remoteTicketId));

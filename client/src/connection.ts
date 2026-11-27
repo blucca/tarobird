@@ -8,7 +8,7 @@ import { DesignShareClient, type DesignShareTransport } from "./workbench-design
 import type { WorkbenchDraft } from "./workbench-draft.js";
 import type { DesignCommentAcceptance } from "./design-comment-delivery.js";
 import { WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY } from "../../src/client-protocol/workbench-design.js";
-import { DISPATCH_CAPABILITY, DISPATCH_CROSS_HOST_CAPABILITY, crossHostDispatchGrantCommandSchema, crossHostDispatchGrantsSnapshotSchema, type CrossHostDispatchGrantCommand } from "../../src/client-protocol/dispatch.js";
+import { DISPATCH_CAPABILITY, DISPATCH_CROSS_HOST_CAPABILITY, dispatchWireRoute, crossHostDispatchGrantCommandSchema, crossHostDispatchGrantsSnapshotSchema, type CrossHostDispatchGrantCommand } from "../../src/client-protocol/dispatch.js";
 import { ticketConversationsVisible } from "./dispatcher.js";
 import { screenStatusSchema, screenJoinSchema, screenConfigureSchema, screenConfigureText, screenPolicySchema, REMOTE_SCREEN_FLIGHT_CAPABILITY, REMOTE_SCREEN_QUALITY_CAPABILITY, type ScreenConfigure } from "../../src/client-protocol/remote-screen.js";
 import type { ScreenQuality } from "../../src/client-protocol/screen-quality.js";
@@ -1153,7 +1153,8 @@ export class HubConnection {
   async http<T = unknown>(route: string, init: RequestInit = {}): Promise<T> {
     if (init.method?.toUpperCase() === "POST" && ["/api/devices/approve", "/api/devices/revoke"].includes(route)) return this.duringMutation(() => this.deviceAction<T>(route, init));
     const epoch = this.httpEpoch, generation = this.generation;
-    const value = await this.httpRequest<T>(route, init);
+    const wireRoute = dispatchWireRoute(route, this.state.crossHostDispatchAvailable);
+    const value = await this.httpRequest<T>(wireRoute, init);
     if (route === "/api/host-profile" && ["GET", "PATCH"].includes(init.method?.toUpperCase() ?? "GET")) {
       const profile = hostProfileSchema.parse(value);
       // An older in-flight refresh must not undo a confirmed rename. Publish

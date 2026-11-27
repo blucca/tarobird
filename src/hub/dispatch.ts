@@ -54,6 +54,27 @@ function derivedRequestId(base: string, suffix: string): string {
   return `req_${createHash("sha256").update(`${base}:${suffix}`).digest("hex").slice(0, 32)}${cleanSuffix}`.slice(0, 128);
 }
 
+const PENDING_BATCH_SUMMARY_PREFIX = "dispatch:pending-batch-summary:";
+const PENDING_NOTICE_PREFIX = "dispatch:pending-notice:";
+const RECOVERABLE_NOTICE_ERRORS = new Set([
+  "conversation_archived",
+  "group_discussion_active",
+  "history_operation_pending",
+  "dispatcher_conversation_required",
+  "bot_forbidden",
+  "conversation_forbidden",
+  "conversation_not_found",
+]);
+type PendingNotice = {
+  key: string;
+  dispatcherBotId: string;
+  conversationId: string;
+  ticketId: string;
+  text: string;
+  from?: { botId: string; botName: string };
+  createdAt: number;
+};
+
 type TicketRow = { id: string; dispatcher_bot_id: string; conversation_id: string; request_id: string; title: string; request: string; status: string; paused: number; attempts_json: string; result: string | null; note: string | null; batch_id: string | null; batch_index: number | null; batch_total: number | null; host_id: string | null; host_name: string | null; artifacts_json: string | null; plan_json?: string | null; created_at: number; updated_at: number };
 type BotRow = { id: string; name: string; engine: string; model: string; effort: string; online: number; role: string };
 type Source = { hostId: string; hostName: string };
@@ -177,21 +198,67 @@ export class HubDispatch {
     if (!row) { const settings = defaultDispatcherSettings(); return { settings, revision: revisionOf(settings) }; }
     return { settings: dispatcherSettingsSchema.parse(JSON.parse(row.settings_json)), revision: row.revision };
   }
-  /** The dispatcher's single direct conversation, owned by the Host owner. */
+  /** Fallback conversation for a dispatcher when no specific conversation is supplied.
+   * Prefers the earliest non-archived owner direct conversation (upgrading existing
+   * single-conversation dispatchers cleanly), then any active owner conversation. */
   private async home(botId: string): Promise<{ id: string; ownerId: string }> {
-    const row = await this.db.get<{ id: string; owner_id: string }>("SELECT c.id,c.owner_id FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id AND m.member_type='bot' AND m.member_id=? WHERE c.type='direct' ORDER BY c.created_at LIMIT 1", [botId]);
+    const row = await this.db.get<{ id: string; owner_id: string }>(
+      `SELECT c.id,c.owner_id FROM conversations c
+       JOIN conversation_members m ON m.conversation_id=c.id AND m.member_type='bot' AND m.member_id=?
+       LEFT JOIN conversations p ON p.id=c.parent_id
+       WHERE c.hidden=0 AND c.archived=0 AND (p.id IS NULL OR p.archived=0) AND c.owner_id='owner'
+       ORDER BY CASE WHEN c.type='direct' THEN 0 ELSE 1 END, c.created_at LIMIT 1`,
+      [botId],
+    );
     if (!row) throw new HubError("dispatcher_conversation_required", 409);
     return { id: row.id, ownerId: row.owner_id };
   }
+  /** Resolve a specific non-hidden conversation that this dispatcher belongs to, including archive state. */
+  private async conversationStateOf(botId: string, conversationId: string): Promise<{ id: string; ownerId: string; archived: boolean } | undefined> {
+    const row = await this.db.get<{ id: string; owner_id: string; archived: number; parent_archived: number | null }>(
+      `SELECT c.id,c.owner_id,c.archived,p.archived AS parent_archived FROM conversations c
+       JOIN conversation_members m ON m.conversation_id=c.id AND m.member_type='bot' AND m.member_id=?
+       LEFT JOIN conversations p ON p.id=c.parent_id
+       WHERE c.id=? AND c.hidden=0`,
+      [botId, conversationId],
+    );
+    return row ? { id: row.id, ownerId: row.owner_id, archived: !!row.archived || !!row.parent_archived } : undefined;
+  }
+  /** Resolve a specific active (non-hidden, non-archived) conversation that this dispatcher belongs to. */
+  private async conversationOf(botId: string, conversationId: string): Promise<{ id: string; ownerId: string } | undefined> {
+    const state = await this.conversationStateOf(botId, conversationId);
+    return state && !state.archived ? { id: state.id, ownerId: state.ownerId } : undefined;
+  }
   /** Within db.serial: the actor may act on this dispatcher. */
-  private async authorize(actor: DispatchActor, dispatcherBotId: string, mutate: boolean): Promise<void> {
+  private async authorize(actor: DispatchActor, dispatcherBotId: string, mutate: boolean): Promise<{ conversationId?: string }> {
     await actor.validate?.();
-    if (actor.kind === "owner") { await this.store.requireOwner(actor.userId); await this.dispatcher(dispatcherBotId); return; }
+    if (actor.kind === "owner") { await this.store.requireOwner(actor.userId); await this.dispatcher(dispatcherBotId); return {}; }
     if (actor.botId !== dispatcherBotId) throw new HubError("dispatcher_forbidden", 403);
     await this.dispatcher(dispatcherBotId);
-    if (!mutate) return;
+    if (!mutate) return {};
     // Like Bot messages: writes happen only inside an active turn of the dispatcher.
-    if (!actor.contextMessage || !await this.db.get("SELECT 1 FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND d.bot_id=? AND d.status='pending' AND d.dispatched=1", [actor.contextMessage, dispatcherBotId])) throw new HubError("dispatch_context_not_active", 403);
+    const turn = actor.contextMessage
+      ? await this.db.get<{ conversation_id: string }>(
+          "SELECT m.conversation_id FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE m.id=? AND d.bot_id=? AND d.status='pending' AND d.dispatched=1",
+          [actor.contextMessage, dispatcherBotId],
+        )
+      : undefined;
+    if (!turn) throw new HubError("dispatch_context_not_active", 403);
+    if (await this.db.get("SELECT 1 FROM group_discussion_turns WHERE input_message_id=?", [actor.contextMessage!])) {
+      throw new HubError("group_discussion_dispatch_blocked", 403);
+    }
+    return { conversationId: turn.conversation_id };
+  }
+  private async originOf(dispatcherBotId: string, turnConversationId?: string, requestedConversationId?: string) {
+    if (turnConversationId && requestedConversationId && turnConversationId !== requestedConversationId) {
+      throw new HubError("dispatch_conversation_mismatch", 403);
+    }
+    const conversationId = turnConversationId ?? requestedConversationId;
+    if (!conversationId) return this.home(dispatcherBotId);
+    const target = await this.conversationStateOf(dispatcherBotId, conversationId);
+    if (!target) throw new HubError("conversation_not_found", 404);
+    if (target.archived) throw new HubError("conversation_archived", 409);
+    return target;
   }
   private async idempotent<T>(actorId: string, requestId: string, payload: unknown, work: () => Promise<T>): Promise<T> {
     const hash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
@@ -301,14 +368,15 @@ export class HubDispatch {
   settings(userId: string, botId: string): Promise<{ settings: DispatcherSettings; revision: string }> {
     return this.db.serial(async () => { await this.authorize({ kind: "owner", userId }, botId, false); return this.settingsRow(botId); });
   }
-  async updateSettings(userId: string, botId: string, raw: unknown, validate?: TransactionGuard): Promise<{ settings: DispatcherSettings; revision: string }> {
+  async updateSettings(userId: string, botId: string, raw: unknown, validate?: TransactionGuard, legacy = false): Promise<{ settings: DispatcherSettings; revision: string }> {
     const input = dispatcherSettingsUpdateSchema.parse(raw);
     const result = await this.db.transaction(async () => {
       await this.authorize({ kind: "owner", userId, validate }, botId, true);
       const current = await this.settingsRow(botId);
-      if (current.revision === revisionOf(input.settings)) return current;
+      const settings = legacy ? { ...input.settings, nodes: current.settings.nodes } : input.settings;
+      if (current.revision === revisionOf(settings)) return current;
       if (current.revision !== input.expectedRevision) throw new HubError("dispatcher_settings_conflict", 409);
-      return { settings: input.settings, revision: await saveDispatcherSettingsInTransaction(this.db, botId, input.settings) };
+      return { settings, revision: await saveDispatcherSettingsInTransaction(this.db, botId, settings) };
     });
     this.markAutoAdvanceDirty(botId);
     this.options.changed?.(botId); return result;
@@ -355,7 +423,7 @@ export class HubDispatch {
   }
   /** Engine CLIs on this Host as dispatch targets: installed, allowed, models and availability. */
   targets(actor: DispatchActor, dispatcherBotId: string): Promise<{ settings: DispatcherSettings; targets: DispatchTarget[]; defaults: string; evidence: string }> {
-    return this.targetsFor(dispatcherBotId, () => this.authorize(actor, dispatcherBotId, false));
+    return this.targetsFor(dispatcherBotId, async () => { await this.authorize(actor, dispatcherBotId, false); });
   }
   /** A worker reads its own active ticket's dispatch targets, never another ticket's. */
   async workerTargets(actor: DispatchActor): Promise<{ settings: DispatcherSettings; targets: DispatchTarget[]; defaults: string; evidence: string }> {
@@ -379,7 +447,7 @@ export class HubDispatch {
   /** Filesystem reads stay outside the shared database queue. Coalesce only
    * in-flight scans: a later query must observe changed/disabled configuration. */
   capabilities(actor: DispatchActor, dispatcherBotId: string, raw: unknown): Promise<DispatchCapabilities> {
-    return this.capabilitiesFor(dispatcherBotId, () => this.authorize(actor, dispatcherBotId, false), raw);
+    return this.capabilitiesFor(dispatcherBotId, async () => { await this.authorize(actor, dispatcherBotId, false); }, raw);
   }
   async workerCapabilities(actor: DispatchActor, raw: unknown): Promise<DispatchCapabilities> {
     dispatchCapabilitiesRequestSchema.parse(raw);
@@ -512,9 +580,10 @@ export class HubDispatch {
   async plan(actor: DispatchActor, dispatcherBotId: string, raw: unknown): Promise<DispatchSplitPlanResponse> {
     const input = dispatchSplitPlanRequestSchema.parse(raw);
     const shouldCreate = input.create || input.dispatch;
-    const { settings } = await this.db.serial(async () => {
-      await this.authorize(actor, dispatcherBotId, shouldCreate);
-      return this.settingsRow(dispatcherBotId);
+    const { settings, origin } = await this.db.serial(async () => {
+      const auth = await this.authorize(actor, dispatcherBotId, shouldCreate);
+      const origin = shouldCreate ? await this.originOf(dispatcherBotId, auth.conversationId, input.conversationId) : undefined;
+      return { ...await this.settingsRow(dispatcherBotId), origin };
     });
     if (input.dispatch && actor.kind === "bot" && settings.mode === "ask") {
       throw new HubError("dispatch_confirmation_required", 409);
@@ -546,6 +615,7 @@ export class HubDispatch {
 
     if (priorState?.rows.length) {
       const priorRows = priorState.rows;
+      if (priorRows.some(row => row.conversation_id !== origin?.id)) throw new HubError("idempotency_conflict", 409);
       const priorTickets = priorRows.map(r => this.ticket(r));
       const priorMeta = priorRows.map(r => parsePlannedBatchMeta(r.plan_json));
       const storedSummary = priorState.receipt
@@ -611,14 +681,19 @@ export class HubDispatch {
     if (!shouldCreate || !plan.batches.length) return plan;
 
     const createdTickets = await this.db.transaction(async () => {
-      await this.authorize(actor, dispatcherBotId, true);
+      const auth = await this.authorize(actor, dispatcherBotId, true);
+      const home = await this.originOf(dispatcherBotId, auth.conversationId, input.conversationId);
+      if (home.id !== origin?.id) throw new HubError("dispatch_conversation_mismatch", 403);
       const existingReceipt = await this.db.get<{ payload_hash: string }>("SELECT payload_hash FROM dispatch_requests WHERE actor_id=? AND request_id=?", [dispatcherBotId, planReceiptKey]);
       if (existingReceipt && existingReceipt.payload_hash !== planPayloadHash) throw new HubError("idempotency_conflict", 409);
-      const home = await this.home(dispatcherBotId), now = Date.now(), tickets: DispatchTicket[] = [];
+      const now = Date.now(), tickets: DispatchTicket[] = [];
       for (const batch of plan.batches) {
         const reqId = derivedRequestId(input.requestId, `_b${batch.batchIndex}`);
         const old = await this.db.get<TicketRow>("SELECT * FROM dispatch_tickets WHERE dispatcher_bot_id=? AND request_id=?", [dispatcherBotId, reqId]);
-        if (old) { tickets.push(this.ticket(old)); continue; }
+        if (old) {
+          if (old.batch_id !== batchId || old.conversation_id !== home.id) throw new HubError("idempotency_conflict", 409);
+          tickets.push(this.ticket(old)); continue;
+        }
         const id = newId("tk");
         const planMeta: PlannedBatchMeta = {
           engine: batch.engine,
@@ -674,10 +749,11 @@ export class HubDispatch {
   async create(actor: DispatchActor, dispatcherBotId: string, raw: unknown): Promise<DispatchTicket> {
     const input = createTicketSchema.parse(raw);
     const ticket = await this.db.transaction(async () => {
-      await this.authorize(actor, dispatcherBotId, true);
+      const auth = await this.authorize(actor, dispatcherBotId, true);
+      const home = await this.originOf(dispatcherBotId, auth.conversationId, input.conversationId);
       const old = await this.db.get<TicketRow>("SELECT * FROM dispatch_tickets WHERE dispatcher_bot_id=? AND request_id=?", [dispatcherBotId, input.requestId]);
-      if (old) { if (old.title !== input.title || old.request !== input.request) throw new HubError("idempotency_conflict", 409); return this.ticket(old); }
-      const home = await this.home(dispatcherBotId), now = Date.now(), id = newId("tk");
+      if (old) { if (old.title !== input.title || old.request !== input.request || old.conversation_id !== home.id) throw new HubError("idempotency_conflict", 409); return this.ticket(old); }
+      const now = Date.now(), id = newId("tk");
       await this.db.run("INSERT INTO dispatch_tickets(id,dispatcher_bot_id,conversation_id,request_id,title,request,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", [id, dispatcherBotId, home.id, input.requestId, input.title, input.request, "queued", now, now]);
       return this.ticket((await this.requireTicket(id))!);
     });
@@ -688,8 +764,9 @@ export class HubDispatch {
     const input = dispatchTicketRequestSchema.parse(raw);
     const source = await this.options.source();
     const { settings: allowed, receipt } = await this.db.serial(async () => {
-      await this.authorize(actor, dispatcherBotId, true);
+      const auth = await this.authorize(actor, dispatcherBotId, true);
       const current = this.ticket(await this.requireTicket(input.ticketId, dispatcherBotId));
+      if (auth.conversationId && auth.conversationId !== current.conversationId) throw new HubError("dispatch_conversation_mismatch", 403);
       const prior = await this.db.get<{ payload_hash: string; result_json: string }>("SELECT payload_hash,result_json FROM dispatch_requests WHERE actor_id=? AND request_id=?", [actor.kind === "owner" ? actor.userId : actor.botId, input.requestId]);
       const settings = await this.settingsRow(dispatcherBotId);
       if (prior && prior.payload_hash !== createHash("sha256").update(JSON.stringify(input)).digest("hex")) throw new HubError("idempotency_conflict", 409);
@@ -724,7 +801,7 @@ export class HubDispatch {
       const slotKey = `${dispatcherBotId}:${remoteHostId}`;
       let slotReserved = false;
       const prep = await this.db.serial(async () => {
-        await this.authorize(actor, dispatcherBotId, true);
+        const auth = await this.authorize(actor, dispatcherBotId, true);
         const { settings: latestSettings } = await this.settingsRow(dispatcherBotId);
         const nodeCfg = latestSettings.nodes?.find(n => n.hostId === remoteHostId);
         if (!nodeCfg?.enabled) throw new HubError("dispatch_node_disabled", 409);
@@ -733,6 +810,7 @@ export class HubDispatch {
         const nodeMax = nodeCfg.maxConcurrent ?? latestSettings.maxConcurrent;
         const dispatcher = await this.dispatcher(dispatcherBotId);
         const current = this.ticket(await this.requireTicket(input.ticketId, dispatcherBotId));
+        if (auth.conversationId && auth.conversationId !== current.conversationId) throw new HubError("dispatch_conversation_mismatch", 403);
         if (current.status === "done" || current.status === "cancelled") throw new HubError("ticket_closed", 409);
         if (current.paused) throw new HubError("ticket_paused", 409);
         if (current.status === "working") throw new HubError("ticket_already_working", 409);
@@ -765,7 +843,7 @@ export class HubDispatch {
 
         try {
           ticket = await this.db.transaction(async () => {
-            await this.authorize(actor, dispatcherBotId, true);
+            const auth = await this.authorize(actor, dispatcherBotId, true);
             return this.idempotent(actor.kind === "owner" ? actor.userId : actor.botId, input.requestId, input, async () => {
               const { settings: latestSettings } = await this.settingsRow(dispatcherBotId);
               const effNodeCfg = latestSettings.nodes?.find(n => n.hostId === remoteHostId);
@@ -774,6 +852,7 @@ export class HubDispatch {
               if (effAllowed && !effAllowed.includes(input.engine)) throw new HubError("dispatch_engine_not_allowed", 409);
               const effMax = effNodeCfg.maxConcurrent ?? latestSettings.maxConcurrent;
               const current = this.ticket(await this.requireTicket(input.ticketId, dispatcherBotId));
+              if (auth.conversationId && auth.conversationId !== current.conversationId) throw new HubError("dispatch_conversation_mismatch", 403);
               if (current.status === "done" || current.status === "cancelled") throw new HubError("ticket_closed", 409);
               if (current.paused) throw new HubError("ticket_paused", 409);
               if (current.status === "working") throw new HubError("ticket_already_working", 409);
@@ -843,14 +922,15 @@ export class HubDispatch {
       const localWorking = (await this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM dispatch_tickets WHERE dispatcher_bot_id=? AND status='working' AND (host_id IS NULL OR host_id=?)", [dispatcherBotId, source.hostId]))!.n;
       if (localWorking >= localMaxConcurrent) throw new HubError("dispatch_concurrency_limit", 429);
     });
-    const workerId = await this.requireWorkers().dispatchWorker(dispatcherBotId, input.engine, () => this.authorize(actor, dispatcherBotId, true));
+    const workerId = await this.requireWorkers().dispatchWorker(dispatcherBotId, input.engine, async () => { await this.authorize(actor, dispatcherBotId, true); });
     // Every attempt of a ticket works in the same directory, so another CLI can pick up its files.
     const workspace = await this.requireWorkers().ticketWorkspace(dispatcherBotId, input.ticketId);
     const created: Created = { ownerId: "", events: [] };
     const ticket = await this.db.transaction(async () => {
-      await this.authorize(actor, dispatcherBotId, true);
+      const auth = await this.authorize(actor, dispatcherBotId, true);
       return this.idempotent(actor.kind === "owner" ? actor.userId : actor.botId, input.requestId, input, async () => {
         const dispatcher = await this.dispatcher(dispatcherBotId), current = this.ticket(await this.requireTicket(input.ticketId, dispatcherBotId));
+        if (auth.conversationId && auth.conversationId !== current.conversationId) throw new HubError("dispatch_conversation_mismatch", 403);
         if (current.status === "done" || current.status === "cancelled") throw new HubError("ticket_closed", 409);
         if (current.paused) throw new HubError("ticket_paused", 409);
         if (current.status === "working") throw new HubError("ticket_already_working", 409);
@@ -896,26 +976,27 @@ export class HubDispatch {
   }
   /** Within the ledger transaction: one worker input in a continued or new hidden ticket conversation. */
   private async openAttempt(ticket: DispatchTicket, target: TicketTarget, input: { conversationId?: string; workspace?: string; text: string; from: { botId: string; botName: string; hops: number } }, source: Source, created: Created): Promise<TicketAttempt> {
-    const home = await this.home(ticket.dispatcherBotId), attemptId = newId("ta");
+    const ownerId = "owner", attemptId = newId("ta");
     let conversationId = input.conversationId;
     if (!conversationId) {
-      const conversation = await this.store.createConversationInTransaction(home.ownerId, [target.botId], ticket.title.slice(0, 256), `tk_${attemptId}`, { dispatchWorker: true });
+      const conversation = await this.store.createConversationInTransaction(ownerId, [target.botId], ticket.title.slice(0, 256), `tk_${attemptId}`, { dispatchWorker: true });
       const marker = { id: ticket.id, dispatcherBotId: ticket.dispatcherBotId, ...(target.model ? { model: target.model } : {}), ...(target.effort ? { effort: target.effort } : {}), ...(input.workspace ? { workspace: input.workspace } : {}) };
       await this.db.run("UPDATE conversations SET hidden=1,ticket_json=? WHERE id=?", [JSON.stringify(marker), conversation.id]);
       conversationId = conversation.id; created.conversation = await this.store.conversationInTransaction(conversation.id);
     }
-    const sent = await this.store.sendMessageInTransaction(home.ownerId, { conversationId, clientMsgId: `tk_${attemptId}`, text: input.text, attachments: [], mentions: [target.botId], previewUrl: null,
+    const sent = await this.store.sendMessageInTransaction(ownerId, { conversationId, clientMsgId: `tk_${attemptId}`, text: input.text, attachments: [], mentions: [target.botId], previewUrl: null,
       botSource: { hostId: source.hostId, hostName: source.hostName.slice(0, 256), botId: input.from.botId, botName: input.from.botName.slice(0, 256), requestId: attemptId, hops: input.from.hops } });
     if (sent.event) created.events.push(sent.event);
-    created.ownerId = home.ownerId;
+    created.ownerId = ownerId;
     return { id: attemptId, ...target, conversationId, inputMessageId: sent.message.id, startedAt: Date.now() };
   }
   async update(actor: DispatchActor, dispatcherBotId: string, raw: unknown): Promise<DispatchTicket> {
     const input = updateTicketSchema.parse(raw);
     const events: HubEvent[] = [];
     const ticket = await this.db.transaction(async () => {
-      await this.authorize(actor, dispatcherBotId, true);
+      const auth = await this.authorize(actor, dispatcherBotId, true);
       const current = this.ticket(await this.requireTicket(input.ticketId, dispatcherBotId));
+      if (auth.conversationId && auth.conversationId !== current.conversationId) throw new HubError("dispatch_conversation_mismatch", 403);
       if (current.status === "cancelled" || current.status === "done" && input.status !== "done") throw new HubError("ticket_closed", 409);
       let next: DispatchTicket = { ...current, ...(input.note !== undefined ? { note: input.note || undefined } : {}), updatedAt: Date.now() };
       if (input.status) {
@@ -1011,7 +1092,7 @@ export class HubDispatch {
           const current = this.ticket(await this.requireTicket(ticket.id)), last = current.attempts.at(-1);
           if (last?.id !== attempt.id || last.endedAt || !last.stopRequested) return undefined;
           const dispatcher = await this.dispatcher(ticket.dispatcherBotId);
-          const home = await this.home(ticket.dispatcherBotId);
+          const home = await this.conversationStateOf(ticket.dispatcherBotId, current.conversationId);
           return { current, last, dispatcher, home };
         });
         if (!info) return;
@@ -1057,7 +1138,7 @@ export class HubDispatch {
             return; // Transient read failure: retry on next sweep instead of dropping completed work.
           }
           const downloadedArtifacts = statusResp.status === "completed"
-            ? await this.downloadRemoteArtifacts(peer, info.dispatcher, info.current.conversationId, info.home.ownerId, info.last, statusResp.artifacts)
+            ? await this.downloadRemoteArtifacts(peer, info.dispatcher, info.current.conversationId, info.home?.ownerId ?? "owner", info.last, statusResp.artifacts)
             : [];
           const batchId = await this.db.transaction(async () => {
             const current = this.ticket(await this.requireTicket(ticket.id)), last = current.attempts.at(-1);
@@ -1107,7 +1188,7 @@ export class HubDispatch {
       const ownerId = await this.db.serial(async () => {
         const current = this.ticket(await this.requireTicket(ticket.id)), last = current.attempts.at(-1);
         if (last?.id !== attempt.id || last.endedAt || !last.stopRequested) return undefined;
-        return (await this.home(ticket.dispatcherBotId)).ownerId;
+        return (await this.db.get<{ owner_id: string }>("SELECT owner_id FROM conversations WHERE id=?", [attempt.conversationId]))?.owner_id;
       });
       if (ownerId) await this.options.stop(attempt.botId, attempt.conversationId, ownerId, attempt.inputMessageId);
     })().catch(() => undefined).finally(() => this.stoppingAttempts.delete(attempt.id));
@@ -1192,13 +1273,81 @@ export class HubDispatch {
     return this.db.transaction(async () => { await validate?.(); await this.store.requireOwner(userId); await this.markEngine(engine); return this.health(); });
   }
 
-  /** Within the ticket's transaction: a notice in the dispatcher's conversation,
-   * whose delivery wakes the dispatcher. Returns the event to emit after commit. */
-  private async noticeInTransaction(source: { hostId: string; hostName: string }, dispatcherBotId: string, key: string, ticketId: string, text: string, from?: { botId: string; botName: string }): Promise<HubEvent | undefined> {
-    const dispatcher = await this.dispatcher(dispatcherBotId), home = await this.home(dispatcherBotId);
-    const clientMsgId = `tn_${createHash("sha256").update(key).digest("hex").slice(0, 40)}`;
-    return (await this.store.sendMessageInTransaction(home.ownerId, { conversationId: home.id, clientMsgId, text, attachments: [], mentions: [dispatcher.id], previewUrl: null,
-      botSource: { hostId: source.hostId, hostName: source.hostName.slice(0, 256), botId: from?.botId ?? dispatcher.id, botName: (from?.botName ?? dispatcher.name).slice(0, 256), requestId: ticketId.slice(0, 128), hops: 1 } })).event;
+  private async noticeInTransaction(source: Source, dispatcherBotId: string, key: string, ticketId: string, text: string, from?: { botId: string; botName: string }): Promise<HubEvent | undefined> {
+    const ticket = await this.requireTicket(ticketId, dispatcherBotId);
+    return this.tryNoticeInTransaction(source, dispatcherBotId, key, ticketId, text, from, ticket.conversation_id);
+  }
+  private async deferNoticeInTransaction(notice: PendingNotice): Promise<void> {
+    await this.db.run("INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)", [`${PENDING_NOTICE_PREFIX}${notice.key}`, JSON.stringify(notice)]);
+  }
+  private async conversationNoticeBlocked(conversationId: string): Promise<boolean> {
+    if (await this.store.historyFencedInTransaction(conversationId)) return true;
+    return !!await this.db.get("SELECT 1 FROM group_discussions WHERE conversation_id=? AND status IN ('running','pausing','paused','ending')", [conversationId]);
+  }
+  /** Within a settlement transaction: deliver immediately when the ticket's
+   * originating conversation can accept notices; otherwise persist a deferred
+   * notice so settlement commits and releases its concurrency slot cleanly. */
+  private async tryNoticeInTransaction(source: Source, dispatcherBotId: string, key: string, ticketId: string, text: string, from: { botId: string; botName: string } | undefined, conversationId: string): Promise<HubEvent | undefined> {
+    const dispatcher = await this.db.get<BotRow>("SELECT id,name,engine,model,effort,online,role FROM bots WHERE id=? AND deleted_at IS NULL AND role='dispatcher'", [dispatcherBotId]);
+    if (!dispatcher) return undefined;
+    const pending: PendingNotice = { key, dispatcherBotId, conversationId, ticketId, text, ...(from ? { from } : {}), createdAt: Date.now() };
+    const target = await this.conversationOf(dispatcherBotId, conversationId);
+    if (!target || await this.conversationNoticeBlocked(target.id)) {
+      await this.deferNoticeInTransaction(pending);
+      return undefined;
+    }
+    try {
+      const clientMsgId = `tn_${createHash("sha256").update(key).digest("hex").slice(0, 40)}`;
+      return (await this.store.sendMessageInTransaction(target.ownerId, { conversationId: target.id, clientMsgId, text, attachments: [], mentions: [dispatcher.id], previewUrl: null,
+        botSource: { hostId: source.hostId, hostName: source.hostName.slice(0, 256), botId: from?.botId ?? dispatcher.id, botName: (from?.botName ?? dispatcher.name).slice(0, 256), requestId: ticketId.slice(0, 128), hops: 1 } })).event;
+    } catch (error) {
+      if (error instanceof HubError && RECOVERABLE_NOTICE_ERRORS.has(error.code)) {
+        await this.deferNoticeInTransaction(pending);
+        return undefined;
+      }
+      throw error;
+    }
+  }
+  /** Delivers deferred ticket notices once their originating conversation is
+   * unarchived, unfenced, and no longer inside an active group discussion. */
+  private async flushPendingNotices(source: Source): Promise<void> {
+    const rows = await this.db.serial(() => this.db.all<{ key: string; value: string }>("SELECT key,value FROM meta WHERE key LIKE ? ORDER BY key LIMIT 64", [`${PENDING_NOTICE_PREFIX}%`]));
+    for (const row of rows) {
+      const events: HubEvent[] = [];
+      await this.db.transaction(async () => {
+        const current = await this.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [row.key]);
+        if (!current) return;
+        let notice: PendingNotice;
+        try { notice = JSON.parse(current.value) as PendingNotice; }
+        catch { await this.db.run("DELETE FROM meta WHERE key=?", [row.key]); return; }
+        const dispatcher = await this.db.get<BotRow>("SELECT id,name,engine,model,effort,online,role FROM bots WHERE id=? AND deleted_at IS NULL AND role='dispatcher'", [notice.dispatcherBotId]);
+        if (!dispatcher) { await this.db.run("DELETE FROM meta WHERE key=?", [row.key]); return; }
+        const ticketRow = await this.db.get<TicketRow>("SELECT * FROM dispatch_tickets WHERE id=?", [notice.ticketId]);
+        if (!ticketRow) { await this.db.run("DELETE FROM meta WHERE key=?", [row.key]); return; }
+        if (notice.key.startsWith("waiting_")) {
+          const ticket = this.ticket(ticketRow), attempt = ticket.attempts.at(-1);
+          const liveKey = attempt?.waitingFor && ticket.status === "working" && !ticket.paused && !attempt.endedAt && !attempt.stopRequested
+            ? attempt.remoteTicketId
+              ? `waiting_remote_${attempt.id}_${attempt.waitingFor.messageId}`
+              : `waiting_${attempt.id}_${attempt.waitingFor.messageId}_${attempt.waitingFor.kind}`
+            : undefined;
+          if (liveKey !== notice.key) { await this.db.run("DELETE FROM meta WHERE key=?", [row.key]); return; }
+        }
+        const target = await this.conversationOf(notice.dispatcherBotId, notice.conversationId);
+        if (!target || await this.conversationNoticeBlocked(target.id)) return;
+        try {
+          const clientMsgId = `tn_${createHash("sha256").update(notice.key).digest("hex").slice(0, 40)}`;
+          const sent = await this.store.sendMessageInTransaction(target.ownerId, { conversationId: target.id, clientMsgId, text: notice.text, attachments: [], mentions: [dispatcher.id], previewUrl: null,
+            botSource: { hostId: source.hostId, hostName: source.hostName.slice(0, 256), botId: notice.from?.botId ?? dispatcher.id, botName: (notice.from?.botName ?? dispatcher.name).slice(0, 256), requestId: notice.ticketId.slice(0, 128), hops: 1 } });
+          if (sent.event) events.push(sent.event);
+          await this.db.run("DELETE FROM meta WHERE key=?", [row.key]);
+        } catch (error) {
+          if (error instanceof HubError && RECOVERABLE_NOTICE_ERRORS.has(error.code)) return;
+          throw error;
+        }
+      }).catch(() => undefined);
+      if (events.length) this.store.emitCommitted(events);
+    }
   }
   /** Settles finished worker attempts. Idempotent: a restart re-reads durable state. */
   sweep(): Promise<void> {
@@ -1214,6 +1363,11 @@ export class HubDispatch {
     });
     this.sweepCursor = rows.at(-1)?.id ?? "";
     const source = await this.options.source();
+    await this.flushPendingNotices(source);
+    const pendingSummaries = await this.db.serial(() => this.db.all<{ value: string }>(
+      "SELECT value FROM meta WHERE key LIKE ? ORDER BY key LIMIT 64", [`${PENDING_BATCH_SUMMARY_PREFIX}%`],
+    ));
+    for (const pending of pendingSummaries) await this.maybePublishBatchSummary(pending.value, source).catch(() => undefined);
     const localRows: TicketRow[] = [];
     const remoteRows: TicketRow[] = [];
     for (const row of rows) {
@@ -1249,7 +1403,7 @@ export class HubDispatch {
       const attempt = current.attempts.at(-1);
       if (current.status !== "working" || !attempt || attempt.endedAt || !attempt.remoteTicketId || !attempt.hostId) return undefined;
       const dispatcher = await this.dispatcher(current.dispatcherBotId);
-      const home = await this.home(current.dispatcherBotId);
+      const home = await this.conversationStateOf(current.dispatcherBotId, current.conversationId);
       const { settings } = await this.settingsRow(current.dispatcherBotId);
       return { current, attempt, dispatcher, home, settings };
     });
@@ -1366,7 +1520,7 @@ export class HubDispatch {
 
     // Terminal state: completed / failed / cancelled.
     const downloadedArtifacts = statusResp.status === "completed" && statusResp.artifacts.length && peer
-      ? await this.downloadRemoteArtifacts(peer, dispatcher, current.conversationId, home.ownerId, attempt, statusResp.artifacts)
+      ? await this.downloadRemoteArtifacts(peer, dispatcher, current.conversationId, home?.ownerId ?? "owner", attempt, statusResp.artifacts)
       : [];
 
     const events: HubEvent[] = [];
@@ -1519,7 +1673,9 @@ export class HubDispatch {
   }
   /** Publishes one consolidated summary message with bundled files when all tickets in a batch finish. */
   async maybePublishBatchSummary(batchId: string, source: Source): Promise<Message | undefined> {
-    const info = await this.db.serial(async () => {
+    const pendingKey = `${PENDING_BATCH_SUMMARY_PREFIX}${batchId}`;
+    const defer = () => this.db.run("INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)", [pendingKey, batchId]);
+    const info = await this.db.transaction(async () => {
       const existing = await this.db.get<{ message_id: string }>("SELECT message_id FROM dispatch_batch_summaries WHERE batch_id=?", [batchId]);
       if (existing) return undefined;
       const rows = await this.db.all<TicketRow>("SELECT * FROM dispatch_tickets WHERE batch_id=? ORDER BY batch_index ASC, created_at ASC", [batchId]);
@@ -1528,8 +1684,12 @@ export class HubDispatch {
       const stillPending = tickets.some(t => t.status === "working" || t.status === "needs_answer" || t.status === "queued" || t.status === "blocked");
       if (stillPending) return undefined;
       const first = tickets[0]!;
-      const conv = await this.db.get<{ owner_id: string }>("SELECT owner_id FROM conversations WHERE id=?", [first.conversationId]);
-      return { tickets, dispatcherBotId: first.dispatcherBotId, conversationId: first.conversationId, ownerId: conv?.owner_id ?? "owner" };
+      const conv = await this.conversationOf(first.dispatcherBotId, first.conversationId);
+      if (!conv || await this.conversationNoticeBlocked(conv.id)) {
+        await defer();
+        return undefined;
+      }
+      return { tickets, dispatcherBotId: first.dispatcherBotId, conversationId: first.conversationId, ownerId: conv.ownerId };
     });
     if (!info) return undefined;
     // Ensure every artifact referenced in the summary lives in the dispatcher's home conversation.
@@ -1572,6 +1732,11 @@ export class HubDispatch {
     const committed = await this.db.transaction(async () => {
       const existing = await this.db.get<{ message_id: string }>("SELECT message_id FROM dispatch_batch_summaries WHERE batch_id=?", [batchId]);
       if (existing) return undefined;
+      const conv = await this.conversationOf(info.dispatcherBotId, info.conversationId);
+      if (!conv || await this.conversationNoticeBlocked(conv.id)) {
+        await defer();
+        return undefined;
+      }
       const verifiedFiles: Extract<Block, { type: "file" }>[] = [];
       for (const file of candidateFiles) {
         const present = await this.db.get(
@@ -1590,6 +1755,7 @@ export class HubDispatch {
         "INSERT INTO dispatch_batch_summaries(batch_id,dispatcher_bot_id,conversation_id,message_id,created_at) VALUES(?,?,?,?,?)",
         [batchId, info.dispatcherBotId, info.conversationId, published.message.id, Date.now()],
       );
+      await this.db.run("DELETE FROM meta WHERE key=?", [pendingKey]);
       return { published, fileCount: verifiedFiles.length };
     });
     if (!committed) return undefined;

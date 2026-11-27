@@ -418,17 +418,14 @@ export async function handleRemoteDispatchRequest(
     }
 
     const remoteTicketId = newId("rtk");
-    let workerId: string;
-    if (ctx.workers?.remoteDispatchWorker) {
-      workerId = await ctx.workers.remoteDispatchWorker(source.hostId, input.engine);
-    } else {
-      const fallback = await ctx.store.db.serial(() => ctx.store.db.get<{ id: string }>(
-        "SELECT id FROM bots WHERE engine=? AND role='worker' AND deleted_at IS NULL ORDER BY id LIMIT 1",
-        [input.engine],
-      ));
-      if (!fallback) throw new HubError("dispatch_worker_unavailable", 409);
-      workerId = fallback.id;
-    }
+    if (!ctx.workers?.remoteDispatchWorker) throw new HubError("dispatch_worker_unavailable", 409);
+    const validate = async () => {
+      if (!await isRemoteDispatchAuthorizedInTransaction(ctx, sourceKey, source.botId, targetBot)) {
+        throw new HubError("bot_message_not_authorized", 403);
+      }
+      await localAdmission?.();
+    };
+    const workerId = await ctx.workers.remoteDispatchWorker(source.hostId, input.engine, validate);
     const workspace = ctx.workers?.remoteTicketWorkspace
       ? await ctx.workers.remoteTicketWorkspace(source.hostId, remoteTicketId)
       : undefined;
