@@ -183,7 +183,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
       ? t("会话进度已保留，约 {0} 秒后自动重试。可随时停止。", retrySeconds)
       : run.current?.status === "waiting" ? t("会话进度已保留，即将自动重试。可随时停止。")
         : t("正在续接原会话，已完成的工作仍然保留。可随时停止。")}</p>}
-    {thinking && <div className="run-thinking-preview"><span>{t("公开思考摘要")}</span><p>{(thinking.truncated ? "…" : "") + runReportExcerpt(thinking.text, true).replace(/^…/, thinking.truncated ? "" : "…")}</p></div>}
+    {thinking && <ThinkingPreview live={ticking && phase === "thinking"} text={(thinking.truncated ? "…" : "") + runReportExcerpt(thinking.text, true).replace(/^…/, thinking.truncated ? "" : "…")}/>}
     {planPreview && <RunPlanPanel
       runId={run.id}
       items={planPreview.items}
@@ -202,6 +202,26 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
     {!scoped && active && !interrupted && !disconnected && stopState === "unconfirmed" && <p className="run-notice" role="status">{t("尚未收到停止确认。请核对运行状态，需要时可再次停止。")}</p>}
     {readers}
   </section>;
+}
+
+/** The newest lines of the public thinking summary. A caret marks the live end only while thinking. */
+function ThinkingPreview({ text, live }: { text: string; live: boolean }) {
+  const tail = useRef<HTMLSpanElement>(null);
+  const [multiline, setMultiline] = useState(false);
+  useLayoutEffect(() => {
+    const node = tail.current;
+    if (!node) return;
+    const measure = () => setMultiline(node.offsetHeight > parseFloat(getComputedStyle(node).lineHeight) * 1.5);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [text, live]);
+  return <div className="run-thinking-preview" data-live={live || undefined}>
+    <div className="run-thinking-label"><span>{live ? t("思考中") : t("公开思考摘要")}</span>{live && <i className="run-thinking-dots" aria-hidden="true"><b/><b/><b/></i>}</div>
+    <p data-multiline={multiline || undefined}><span ref={tail}>{text}</span></p>
+  </div>;
 }
 
 function RunDetails({ goalTurnEnded, scoped, run, phase, observedNow, sync, message, connection, view, close, returnFocus, report }: { goalTurnEnded?: boolean; report?: () => void; scoped: boolean; run: RunSummary; phase: RunSummary["phase"]; observedNow: number; sync?: ScopedJournal; message: Message; connection: HubConnection; view: View; close: () => void; returnFocus: React.RefObject<HTMLButtonElement | null> }) {
