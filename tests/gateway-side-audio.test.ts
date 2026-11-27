@@ -185,3 +185,16 @@ it("rejects uploaded audio files on text-only side engines without triggering tr
   expect(f.engine.send).not.toHaveBeenCalled();
   await f.side.close();
 });
+
+it("never triggers side ASR for non-audio binary files even if recording is true", async () => {
+  const transcribe = vi.fn<SideTranscribe>(async () => "must not be called");
+  const f = fixture({ files: "any", transcribe }), sideId = await f.open();
+  const pdf = f.add("att_pdf", "report.pdf", "application/pdf", voice, true);
+  const clip = f.add("att_video", "clip.mp4", "video/mp4", voice, true);
+  await f.side.call("side.ask", { ...scope, sideId, requestId: "non-audio", text: "inspect", attachments: [pdf, clip] });
+  expect(await f.exchange(sideId, "non-audio")).toMatchObject({ status: "complete", answer: "answer" });
+  expect(transcribe).not.toHaveBeenCalled();
+  expect(f.sent[0]).toHaveLength(2);
+  expect(f.sent[0]!.every(item => item.kind === "binary")).toBe(true);
+  await f.side.close();
+});

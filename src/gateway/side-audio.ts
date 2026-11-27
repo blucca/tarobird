@@ -13,9 +13,9 @@ export type SideTranscribe = (file: string, options?: TranscribeMediaOptions) =>
 /** Audio recordings an engine could otherwise receive only as opaque bytes.
  * Uploaded audio files and video keep their existing binary delivery. */
 export function isSideAudio(file: EngineSideAttachment, ref: SideAttachmentRef): boolean {
-  if (file.kind !== "binary") return false;
+  if (file.kind !== "binary" || !/^audio\//i.test(ref.mime)) return false;
   if (ref.recording !== undefined) return ref.recording;
-  return /^audio\//i.test(ref.mime) && isGeneratedVoiceFilename(ref.name);
+  return isGeneratedVoiceFilename(ref.name);
 }
 
 /** Replaces verified private audio copies with host-ASR transcripts, through

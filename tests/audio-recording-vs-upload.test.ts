@@ -4,8 +4,10 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { WebSocket } from "ws";
 import { z } from "zod";
-import { blocksText, uploadSchema } from "../src/client-protocol/index.js";
+import { blocksText, uploadSchema, type Json } from "../src/client-protocol/index.js";
+import { sideAttachmentRefSchema } from "../src/client-protocol/side.js";
 import { isRecordedVoiceBlock } from "../src/client-protocol/voice-presentation.js";
 import { ClaudeStreamAdapter } from "../src/codex/claude-stream-adapter.js";
 import { PiRpcAdapter } from "../src/codex/pi-rpc-adapter.js";
@@ -14,7 +16,9 @@ import { handleCoreMessage } from "../src/core/message-handler.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import { createDefaultTranscribeVoice } from "../src/core/voice.js";
 import { attachGateway } from "../src/gateway/service.js";
+import { GatewayTransport } from "../src/gateway/transport.js";
 import type { GatewayChannel } from "../src/gateway/channel.js";
+import type { HubSideSessions } from "../src/hub/side-sessions.js";
 import { hashSecret } from "../src/hub/auth.js";
 import { HubServer } from "../src/hub/server.js";
 import { Bridge } from "../src/runtime/bridge.js";
@@ -346,17 +350,20 @@ describe("audio recording vs uploaded file distinction", () => {
       type: "audio/mpeg",
       readChunk: async () => new Blob([new Uint8Array([1, 2, 3])], { type: "audio/mpeg" }),
     };
+    const uploadedText = new File([new Uint8Array([1, 2, 3])], "notes.txt", { type: "text/plain" });
 
     const modern = makeConnection(true);
     await uploadFile(modern as never, "conv_1", recorded, () => undefined);
     await uploadFile(modern as never, "conv_1", uploadedPicker, () => undefined);
     await uploadFile(modern as never, "conv_1", uploadedShare, () => undefined);
-    expect(createPayloads.slice(0, 3).map((p) => p.recording)).toEqual([true, false, false]);
+    await uploadFile(modern as never, "conv_1", uploadedText, () => undefined);
+    expect(createPayloads.slice(0, 4).map((p) => p.recording)).toEqual([true, false, false, undefined]);
+    expect("recording" in createPayloads[3]!).toBe(false);
 
     const legacy = makeConnection(false);
     await uploadFile(legacy as never, "conv_1", recorded, () => undefined);
     await uploadFile(legacy as never, "conv_1", uploadedPicker, () => undefined);
-    for (const payload of createPayloads.slice(3)) {
+    for (const payload of createPayloads.slice(4)) {
       expect("recording" in payload).toBe(false);
       expect(() => oldUploadSchema.parse(payload)).not.toThrow();
     }
@@ -368,5 +375,239 @@ describe("audio recording vs uploaded file distinction", () => {
     expect(isRecordedVoiceBlock({ type: "audio", name: "voice-1791780593981.webm" })).toBe(true);
     expect(isRecordedVoiceBlock({ type: "audio", name: "song.mp3" })).toBe(false);
     expect(isRecordedVoiceBlock({ type: "file", name: "voice-1791780593981.m4a" })).toBe(false);
+  });
+
+  it("rejects recording: true on non-audio MIME in uploadSchema and defensively guards HubStore.sendMessage", async () => {
+    const base = { conversationId: "conv_1", size: 12, sha256: "a".repeat(64) };
+    expect(uploadSchema.safeParse({ ...base, name: "report.pdf", mime: "application/pdf", recording: true }).success).toBe(false);
+    expect(uploadSchema.safeParse({ ...base, name: "clip.mp4", mime: "video/mp4", recording: true }).success).toBe(false);
+    expect(uploadSchema.safeParse({ ...base, name: "photo.png", mime: "image/png", recording: true }).success).toBe(false);
+    expect(uploadSchema.safeParse({ ...base, name: "report.pdf", mime: "application/pdf", recording: false }).success).toBe(true);
+    expect(uploadSchema.safeParse({ ...base, name: "voice-1791780593981.m4a", mime: "Audio/mp4", recording: true }).success).toBe(true);
+
+    // Defensive DB guard: even if attachment_recording has 1 for a non-audio MIME, HubStore emits a file block.
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('guard_bot','Guard Bot','fixture')");
+    const conv = await hub.store.createConversation("owner", ["guard_bot"], "Guard", "guard-conv");
+    await hub.store.db.run("INSERT INTO attachments VALUES('att_pdf',?,'owner',?,12,'application/pdf','report.pdf','att_pdf.blob',1,?)", [conv.id, "a".repeat(64), Date.now()]);
+    await hub.store.db.run("INSERT INTO attachment_recording(attachment_id, recording) VALUES('att_pdf', 1)");
+    await hub.store.db.run("INSERT INTO attachments VALUES('att_vid',?,'owner',?,12,'video/mp4','clip.mp4','att_vid.blob',1,?)", [conv.id, "b".repeat(64), Date.now()]);
+    await hub.store.db.run("INSERT INTO attachment_recording(attachment_id, recording) VALUES('att_vid', 1)");
+    const sent = await hub.store.sendMessage("owner", { conversationId: conv.id, clientMsgId: "guard-msg", text: "", attachments: ["att_pdf", "att_vid"] });
+    expect(sent.message.blocks).toEqual([
+      { type: "file", attachmentId: "att_pdf", name: "report.pdf", size: 12, mime: "application/pdf" },
+      { type: "file", attachmentId: "att_vid", name: "clip.mp4", size: 12, mime: "video/mp4" },
+    ]);
+  });
+
+  it("handles mixed-case Audio/* MIME without misclassifying Audio/webm as video or breaking legacy voice fallback", async () => {
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('case_bot','Case Bot','fixture')");
+    const conv = await hub.store.createConversation("owner", ["case_bot"], "Case Audio", "case-audio");
+
+    const uploadedWebm = await sendAttachment(conv.id, "case-webm", "podcast.webm", "Audio/webm", "保留音频文件", false);
+    expect(uploadedWebm.message.blocks.some((b) => b.type === "file" && b.name === "podcast.webm" && b.mime === "Audio/webm")).toBe(true);
+
+    const legacyVoice = await sendAttachment(conv.id, "case-legacy", "voice-1700000000000.m4a", "Audio/mp4", "");
+    expect(legacyVoice.message.blocks).toEqual([{ type: "audio", attachmentId: expect.any(String), name: "voice-1700000000000.m4a" }]);
+
+    const stateDir = path.join(root, "case-gateway");
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "codex", locale: "en" }));
+    const transcribe = vi.fn(async () => "must not run");
+    const prepareVideo = vi.fn(async () => ({ durationSeconds: 5, framePaths: [], mode: "frames" as const }));
+    const engine = vi.fn(async () => ({ text: "handled" }));
+    const channel = {
+      profile: "gateway" as const,
+      send: vi.fn(async () => ({ messageId: "m_reply" })),
+      stream: vi.fn(async () => ({ messageId: "m_stream" })),
+      downloadResource: vi.fn(async () => Buffer.from("webm audio bytes")),
+    };
+
+    await withChannelProfile("gateway", async () => {
+      await handleCoreMessage({
+        channel,
+        bridge: { handleAuthorizedMessage: engine },
+        runtime: createCoreServiceRuntime({ transcribeMedia: transcribe, prepareVideoInput: prepareVideo }),
+        stateDir,
+        message: {
+          messageId: "msg_case_webm",
+          chatId: conv.id,
+          chatType: "p2p",
+          senderId: "gwuser_owner",
+          content: "inspect audio",
+          rawContentType: "text",
+          resources: [{ type: "file", fileKey: "att_case_webm", fileName: "podcast.webm", mime: "Audio/webm" }],
+          mentions: [],
+          mentionAll: false,
+          mentionedBot: true,
+          createTime: Date.now(),
+        },
+      });
+    });
+
+    expect(prepareVideo).not.toHaveBeenCalled();
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(engine).toHaveBeenCalledTimes(1);
+    expect((engine.mock.calls[0] as any[])[0].text).not.toContain("[Bridge video prepared]");
+  });
+
+  it("queued-message card reports attachment reading instead of media transcription for uploaded audio in App", async () => {
+    const stateDir = path.join(root, "queued-gateway");
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "codex", locale: "zh" }));
+
+    const runQueued = async (messageId: string, resource: { type: "file" | "audio"; fileKey: string; fileName: string; mime?: string; recording?: boolean }) => {
+      const updates: unknown[] = [];
+      const transcribe = vi.fn(async () => "转写内容");
+      const engine = vi.fn(async () => ({ text: "done" }));
+      const runtime = createCoreServiceRuntime({ transcribeMedia: transcribe });
+      runtime.queueCards.set(messageId, { messageId: `card_${messageId}` });
+      const channel = {
+        profile: "gateway" as const,
+        send: vi.fn(async () => ({ messageId: "m_reply" })),
+        stream: vi.fn(async () => ({ messageId: "m_stream" })),
+        updateCard: vi.fn(async (_id: string, card: unknown) => { updates.push(card); }),
+        downloadResource: vi.fn(async () => Buffer.from("audio-bytes")),
+      };
+      await withChannelProfile("gateway", async () => {
+        await handleCoreMessage({
+          channel,
+          bridge: { handleAuthorizedMessage: engine },
+          runtime,
+          stateDir,
+          message: {
+            messageId,
+            chatId: "conv_q",
+            chatType: "p2p",
+            senderId: "gwuser_owner",
+            content: "处理附件",
+            rawContentType: "text",
+            resources: [resource],
+            mentions: [],
+            mentionAll: false,
+            mentionedBot: true,
+            createTime: Date.now(),
+          },
+        });
+      });
+      return { startedCard: JSON.stringify(updates[0] ?? ""), transcribeCalls: transcribe.mock.calls.length, engineCalls: engine.mock.calls.length };
+    };
+
+    const uploaded = await runQueued("q_upload", { type: "file", fileKey: "fk_1", fileName: "meeting.m4a", mime: "audio/mp4" });
+    expect(uploaded.transcribeCalls).toBe(0);
+    expect(uploaded.engineCalls).toBe(1);
+    expect(uploaded.startedCard).toContain("正在读取附件");
+    expect(uploaded.startedCard).not.toContain("正在转写音视频");
+
+    const nonRecordingAudio = await runQueued("q_nonrec", { type: "audio", fileKey: "fk_2", fileName: "song.mp3", recording: false });
+    expect(nonRecordingAudio.transcribeCalls).toBe(0);
+    expect(nonRecordingAudio.engineCalls).toBe(1);
+    expect(nonRecordingAudio.startedCard).toContain("正在读取附件");
+    expect(nonRecordingAudio.startedCard).not.toContain("正在转写音视频");
+
+    const recording = await runQueued("q_rec", { type: "audio", fileKey: "fk_3", fileName: "voice-1791780593981.m4a", recording: true });
+    expect(recording.transcribeCalls).toBe(1);
+    expect(recording.engineCalls).toBe(1);
+    expect(recording.startedCard).toContain("正在转写音视频");
+  });
+
+  it("HubServer gates side.ask recording metadata by Gateway instance.hello capability", async () => {
+    const legacySecret = randomBytes(32).toString("base64url");
+    const modernSecret = randomBytes(32).toString("base64url");
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('legacy_side','Legacy Side',?)", [hashSecret(legacySecret)]);
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('modern_side','Modern Side',?)", [hashSecret(modernSecret)]);
+    await hub.store.db.run("INSERT INTO devices(id,user_id,name,platform,public_key,created_at,last_seen) VALUES('dev_side','owner','dev','web','fixture',0,0)");
+    const session = { deviceId: "dev_side", userId: "owner", expiresAt: Date.now() + 3_600_000 };
+    const legacyConv = await hub.store.createConversation("owner", ["legacy_side"], "Legacy Side", "legacy-side");
+    const modernConv = await hub.store.createConversation("owner", ["modern_side"], "Modern Side", "modern-side");
+
+    const upload = async (conversationId: string, name: string, mime: string, recording?: boolean) => {
+      const bytes = Buffer.from(`side-${conversationId}-${name}`);
+      const created = await hub.attachments.create("owner", {
+        conversationId, name, mime, size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+        ...(recording !== undefined ? { recording } : {}),
+      });
+      await hub.attachments.putChunk("owner", created.id, 0, bytes);
+      await hub.attachments.complete("owner", created.id);
+      return created.id;
+    };
+
+    const legacyTxt = await upload(legacyConv.id, "notes.txt", "text/plain", false);
+    const legacyAud = await upload(legacyConv.id, "voice-1791780593981.m4a", "audio/mp4", true);
+    const modernTxt = await upload(modernConv.id, "notes.txt", "text/plain", false);
+    const modernAud = await upload(modernConv.id, "voice-1791780593981.m4a", "audio/mp4", true);
+    const modernUploadAud = await upload(modernConv.id, "meeting.m4a", "audio/mp4", false);
+
+    const legacyAttachmentRefSchema = sideAttachmentRefSchema.omit({ recording: true }).strict();
+    const capability = { supported: true, concurrent: true, liveContext: false, tools: "read-only" as const };
+    const legacyAskRefs: unknown[] = [];
+    const modernAskRefs: unknown[] = [];
+
+    // 1. Simulated pre-PR #161 Gateway (does not advertise attachments.recording.v1 in instance.hello).
+    const legacyWs = new WebSocket(hub.instanceUrl.replace("http", "ws") + "/instance");
+    await new Promise<void>((resolve, reject) => {
+      legacyWs.once("open", () => {
+        legacyWs.send(JSON.stringify({ v: 1, type: "instance.hello", capabilities: [], botId: "legacy_side", secret: legacySecret, engine: "codex", model: "", effort: "" }));
+      });
+      legacyWs.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as { type: string; id?: string; method?: string; params?: Record<string, unknown> };
+        if (frame.type === "instance.ready") resolve();
+        if (frame.type === "instance.call" && frame.id) {
+          try {
+            if (frame.method === "side.open") {
+              legacyWs.send(JSON.stringify({ v: 1, type: "instance.result", id: frame.id, result: { ok: true, view: { id: "side_old", conversationId: legacyConv.id, revision: 0, openedAt: 0, phase: "idle", capability, exchanges: [], omitted: 0 } } }));
+            } else if (frame.method === "side.ask") {
+              const refs = frame.params!.attachments as unknown[];
+              for (const r of refs) legacyAttachmentRefSchema.parse(r);
+              legacyAskRefs.push(...refs);
+              legacyWs.send(JSON.stringify({ v: 1, type: "instance.result", id: frame.id, result: { ok: true, view: { id: "side_old", conversationId: legacyConv.id, revision: 1, openedAt: 0, phase: "idle", capability, exchanges: [], omitted: 0 } } }));
+            } else {
+              legacyWs.send(JSON.stringify({ v: 1, type: "instance.result", id: frame.id, result: { ok: true } }));
+            }
+          } catch {
+            legacyWs.send(JSON.stringify({ v: 1, type: "instance.result", id: frame.id, error: "gateway_call_failed" }));
+          }
+        }
+      });
+      legacyWs.once("error", reject);
+    });
+
+    // 2. Real modern GatewayTransport (advertises attachments.recording.v1 automatically).
+    const modernDir = path.join(root, "modern-side-dir");
+    await mkdir(modernDir, { recursive: true });
+    await writeFile(path.join(modernDir, "config.json"), JSON.stringify({ engine: "codex", locale: "zh" }));
+    const modernTransport = new GatewayTransport({
+      url: hub.instanceUrl.replace("http", "ws") + "/instance",
+      botId: "modern_side",
+      secret: modernSecret,
+      stateDir: modernDir,
+      engine: "codex",
+    });
+    modernTransport.onCall = async (method, params): Promise<Json> => {
+      if (method === "side.open") return { ok: true, view: { id: "side_new", conversationId: modernConv.id, revision: 0, openedAt: 0, phase: "idle", capability, exchanges: [], omitted: 0 } };
+      if (method === "side.ask") {
+        const refs = (params as { attachments: unknown[] }).attachments;
+        for (const r of refs) sideAttachmentRefSchema.parse(r);
+        modernAskRefs.push(...refs);
+        return { ok: true, view: { id: "side_new", conversationId: modernConv.id, revision: 1, openedAt: 0, phase: "idle", capability, exchanges: [], omitted: 0 } };
+      }
+      return { ok: true };
+    };
+    await modernTransport.connect();
+    await until(async () => (await hub.store.bots("owner")).some((b) => b.id === "modern_side" && b.online));
+
+    const sideSessions = (hub as unknown as { sideSessions: HubSideSessions }).sideSessions;
+    try {
+      expect(await sideSessions.request(session, legacyConv.id, "legacy_side", "side.open", { requestId: "open-old" })).toMatchObject({ ok: true });
+      expect(await sideSessions.request(session, legacyConv.id, "legacy_side", "side.ask", { sideId: "side_old", requestId: "ask-old", text: "check", attachments: [legacyTxt, legacyAud] })).toMatchObject({ ok: true });
+      expect(legacyAskRefs).toHaveLength(2);
+      expect(legacyAskRefs.every((r) => !("recording" in (r as Record<string, unknown>)))).toBe(true);
+
+      expect(await sideSessions.request(session, modernConv.id, "modern_side", "side.open", { requestId: "open-new" })).toMatchObject({ ok: true });
+      expect(await sideSessions.request(session, modernConv.id, "modern_side", "side.ask", { sideId: "side_new", requestId: "ask-new", text: "check", attachments: [modernTxt, modernAud, modernUploadAud] })).toMatchObject({ ok: true });
+      expect(modernAskRefs.map((r) => (r as { recording?: boolean }).recording)).toEqual([undefined, true, false]);
+    } finally {
+      legacyWs.close();
+      await modernTransport.disconnect();
+    }
   });
 });

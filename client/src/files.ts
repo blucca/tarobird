@@ -48,7 +48,8 @@ export async function uploadFile(connection: UploadConnection, conversationId: s
     };
     const hash = sha256.create();
     for (let start = 0; start < file.size; start += CHUNK_BYTES) { checkUpload(connection, options.signal); hash.update(new Uint8Array(await (await read(start, start + CHUNK_BYTES)).arrayBuffer())); }
-    const metadata = JSON.stringify({ conversationId, name: file.name, mime: file.type.split(";")[0] || "application/octet-stream", size: file.size, sha256: bytesToHex(hash.digest()), ...(connection.state.audioRecordingMarkerAvailable ? { recording: isRecordedVoiceFile(file) } : {}) });
+    const mime = (file.type.split(";")[0] || "application/octet-stream").trim();
+    const metadata = JSON.stringify({ conversationId, name: file.name, mime, size: file.size, sha256: bytesToHex(hash.digest()), ...(connection.state.audioRecordingMarkerAvailable && /^audio\//i.test(mime) ? { recording: isRecordedVoiceFile(file) } : {}) });
     let id: string | undefined, failedSince: number | undefined, confirmed = 0;
     for (;;) {
       checkUpload(connection, options.signal);

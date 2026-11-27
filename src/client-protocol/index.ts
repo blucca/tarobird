@@ -119,7 +119,8 @@ export function parseClientFrame(raw: string): { frame: ClientFrame } | { ignore
   return { frame: clientFrameSchema.parse(value) };
 }
 export const pairingSchema = z.object({ deviceId: idSchema, name: z.string().min(1).max(100), platform: z.enum(["web", "macos", "windows", "ios", "android"]), publicKey: z.string().min(32).max(256) }).strict();
-export const uploadSchema = z.object({ conversationId: idSchema, name: z.string().min(1).max(255).refine((s) => !/[\\/\x00-\x1f]/.test(s) && s !== "." && s !== "..", "Invalid filename"), size: fileSizeSchema, mime: z.string().max(128).regex(/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/), sha256: z.string().regex(/^[a-f0-9]{64}$/), recording: z.boolean().optional() }).strict();
+export const uploadFieldsSchema = z.object({ conversationId: idSchema, name: z.string().min(1).max(255).refine((s) => !/[\\/\x00-\x1f]/.test(s) && s !== "." && s !== "..", "Invalid filename"), size: fileSizeSchema, mime: z.string().max(128).regex(/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/), sha256: z.string().regex(/^[a-f0-9]{64}$/), recording: z.boolean().optional() }).strict();
+export const uploadSchema = uploadFieldsSchema.refine((u) => !u.recording || /^audio\//i.test(u.mime), "recording_requires_audio_mime");
 export type Upload = z.infer<typeof uploadSchema>;
 
 export function blocksText(blocks: Block[]): string {

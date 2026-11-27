@@ -480,10 +480,11 @@ export class HubStore {
     for (const id of input.attachments) {
       const file = await this.db.get<AttachmentRow & { recording: number | null }>("SELECT a.*, ar.recording AS recording FROM attachments a LEFT JOIN attachment_recording ar ON ar.attachment_id=a.id WHERE a.id=? AND a.complete=1 AND a.conversation_id=?", [id, conv.id]);
       if (!file) throw new HubError("attachment_not_found", 404);
-      const isRecording = file.recording === 1
-        || (file.recording == null && file.mime.startsWith("audio/") && isGeneratedVoiceFilename(file.name));
+      const isAudio = /^audio\//i.test(file.mime);
+      const isRecording = isAudio && (file.recording === 1
+        || (file.recording == null && isGeneratedVoiceFilename(file.name)));
       blocks.push(
-        file.mime.startsWith("image/") ? { type: "image", attachmentId: id, title: file.name }
+        /^image\//i.test(file.mime) ? { type: "image", attachmentId: id, title: file.name }
         : isRecording ? { type: "audio", attachmentId: id, name: file.name, ...(file.recording === 1 ? { recording: true } : {}) }
         : { type: "file", attachmentId: id, name: file.name, size: file.size, mime: file.mime },
       );

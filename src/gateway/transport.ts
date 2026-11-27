@@ -18,7 +18,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { WebSocket } from "ws";
 import { z } from "zod";
-import { MAX_FRAME_BYTES, conversationSchema, idSchema, jsonSchema, messageSchema, type Conversation, type Json, type Message } from "../client-protocol/index.js";
+import { AUDIO_RECORDING_CAPABILITY, MAX_FRAME_BYTES, conversationSchema, idSchema, jsonSchema, messageSchema, type Conversation, type Json, type Message } from "../client-protocol/index.js";
 import { JsonStore } from "../state/json-store.js";
 import { isLoopback } from "../hub/network.js";
 import { botRuntimeStatusSchema } from "../client-protocol/instance.js";
@@ -105,7 +105,7 @@ export class GatewayTransport {
         await this.readStatus();
         // Standalone/manual workers without a Host binding still use their own
         // environment; do not claim that the Host's voice settings apply.
-        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [ENGINE_QUOTA_CAPABILITY, CONTEXT_USAGE_CAPABILITY, CONVERSATION_HISTORY_CAPABILITY, ...(this.status.engine === "pi" ? [PI_SESSION_CAPABILITY] : []), ...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", ...(supportsBotMessageSteerEngine(this.status.engine) ? [BOT_MESSAGE_STEER_CAPABILITY] : []), AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
+        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [AUDIO_RECORDING_CAPABILITY, ENGINE_QUOTA_CAPABILITY, CONTEXT_USAGE_CAPABILITY, CONVERSATION_HISTORY_CAPABILITY, ...(this.status.engine === "pi" ? [PI_SESSION_CAPABILITY] : []), ...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", ...(supportsBotMessageSteerEngine(this.status.engine) ? [BOT_MESSAGE_STEER_CAPABILITY] : []), AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
       }).catch(() => undefined);
     });
     ws.on("message", (data) => {
