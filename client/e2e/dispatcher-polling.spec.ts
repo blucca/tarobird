@@ -17,7 +17,7 @@ async function pair(page: Page, hub: HubServer) {
   await page.getByLabel("配对码", { exact: true }).waitFor({ state: "hidden" });
 }
 // Older reads (no summary) still count, so each assertion isolates one behaviour.
-const isList = (url: string) => /\/api\/bots\/disp\/tickets(\?summary=1(&capabilities=1)?)?$/.test(url);
+const isList = (url: string) => /\/api\/bots\/disp\/tickets(\?summary=1(&capabilities=1)?(&excerpts=1)?)?$/.test(url);
 const isAvatar = (url: string) => /\/api\/bots\/disp\/tickets\?open=1(&summary=1)?$/.test(url);
 const avatar = (page: Page) => page.locator('.bot-tree[data-bot-id="disp"] .bot-identity > .avatar');
 
@@ -296,5 +296,42 @@ test("ticket removal retries the same request and survives a late list reply and
     await page.reload(); await waitForClientOnline(page); await openDispatcher(page);
     await expect(row).toHaveCount(0);
     expect((await hub.dispatch.list(owner, "disp")).tickets.map(t => t.id)).toEqual(["t_work"]);
+  });
+});
+
+test("collapsed polling omits excerpts, expanded polling includes excerpts, and remote ticket details refresh on updatedAt", async ({ page }) => {
+  test.setTimeout(90_000);
+  await dispatcher(page, async (hub, reads) => {
+    const owner = { kind: "owner" as const, userId: "owner" };
+    const remoteHostId = `hub_${"b".repeat(64)}`;
+    const remoteTicket = await hub.dispatch.create(owner, "disp", { requestId: "rem-detail", title: "远端详情工单", request: "Remote work" });
+    const t0 = Date.now();
+    await hub.store.db.run(
+      "UPDATE dispatch_tickets SET status='working',host_id=?,host_name='studio-b',result='initial output',updated_at=?,attempts_json=? WHERE id=?",
+      [remoteHostId, t0, JSON.stringify([{ id: "ta_r1", botId: "w_r", engine: "codex", model: "", effort: "", conversationId: "c_r", inputMessageId: "m_r", hostId: remoteHostId, hostName: "studio-b", remoteTicketId: "rtk_1", startedAt: t0 }]), remoteTicket.id],
+    );
+    await page.getByRole("button", { name: "打开 调度员", exact: true }).click();
+    const toggle = page.locator(".host-workspace:not([hidden]) .dispatch-tickets-trigger");
+    await expect(toggle).toBeVisible({ timeout: 10_000 });
+    // While collapsed, reads must NOT include excerpts=1.
+    expect(await toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(reads.some(r => r.url.includes("summary=1") && !r.url.includes("excerpts=1"))).toBe(true);
+    expect(reads.some(r => r.url.includes("excerpts=1"))).toBe(false);
+
+    // Expanding triggers an immediate poll WITH excerpts=1.
+    const expandedAt = Date.now();
+    await toggle.click();
+    await expect.poll(() => reads.some(r => r.at >= expandedAt && r.url.includes("excerpts=1")), { timeout: 10_000 }).toBe(true);
+
+    // Open remote ticket detail -> shows initial output; after Host updates result & updatedAt, detail refreshes automatically!
+    const row = page.locator(`.host-workspace:not([hidden]) [data-ticket-id="${remoteTicket.id}"]`);
+    await row.getByRole("button", { name: "查看结果", exact: true }).click();
+    await expect(row.locator(".dispatch-ticket-detail")).toContainText("initial output");
+    await hub.store.db.run(
+      "UPDATE dispatch_tickets SET status='needs_review',result='FINAL UPDATED RESULT',artifacts_json=?,updated_at=? WHERE id=?",
+      [JSON.stringify([{ id: "att_r", name: "report.md", size: 42, mime: "text/markdown" }]), t0 + 5_000, remoteTicket.id],
+    );
+    await expect(row.locator(".dispatch-ticket-detail")).toContainText("FINAL UPDATED RESULT", { timeout: 10_000 });
+    await expect(row.locator(".dispatch-ticket-detail")).toContainText("report.md");
   });
 });

@@ -5,6 +5,8 @@ import { botCapabilitiesSchema } from "./capabilities.js";
 
 const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
 const effort = z.enum(["", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+// Becomes a native CLI argument; never an option-like or shell-like value.
+const modelValue = z.string().trim().max(512).regex(/^(?!-)[A-Za-z0-9.%_:/@+~!'()*[\]-]*$/);
 export const dispatchEngineSelectionValid = (value: { engine: string; model?: string; effort?: string }) => value.engine === "deepseek"
   || ((!value.model || value.model.length <= 128 && /^(?!-)[A-Za-z0-9._:/@+[\]-]*$/.test(value.model)) && value.effort !== "off" && value.effort !== "minimal");
 
@@ -141,8 +143,7 @@ export const dispatchTicketRequestBaseSchema = z.object({
   requestId: id, ticketId: id, engine: dispatchEngineSchema,
   /** Target Host ID (`hub_...`) or `"auto"` for load-based selection; omitted uses local Host. */
   hostId: id.optional(),
-  // Becomes a native CLI argument; never an option-like or shell-like value.
-  model: z.string().trim().max(512).regex(/^(?!-)[A-Za-z0-9.%_:/@+~!'()*[\]-]*$/).optional(), effort: effort.optional(),
+  model: modelValue.optional(), effort: effort.optional(),
   /** Instruction for the worker; defaults to the ticket request. */
   text: z.string().trim().min(1).max(20_000).optional(),
   /** Dispatch even though the engine is cooling down or needs sign-in. */
@@ -265,7 +266,7 @@ export const dispatchSplitPlanRequestSchema = z.object({
   title: z.string().trim().min(1).max(200).optional(),
   request: z.string().trim().min(1).max(20_000),
   engine: dispatchEngineSchema.optional(),
-  model: z.string().trim().max(512).regex(/^(?!-)[A-Za-z0-9.%_:/@+~!'()*[\]-]*$/).optional(),
+  model: modelValue.optional(),
   effort: effort.optional(),
   totalItems: z.number().int().positive().max(10_000).optional(),
   perNode: z.number().int().positive().max(10_000).optional(),
@@ -274,8 +275,9 @@ export const dispatchSplitPlanRequestSchema = z.object({
   create: z.boolean().default(false),
   dispatch: z.boolean().default(false),
   force: z.boolean().default(false),
-}).strict();
+}).strict().refine(value => !value.engine || dispatchEngineSelectionValid({ engine: value.engine, model: value.model, effort: value.effort }), { message: "engine_selection_invalid" });
 export type DispatchSplitPlanRequest = z.infer<typeof dispatchSplitPlanRequestSchema>;
+export type DispatchSplitPlanInput = z.input<typeof dispatchSplitPlanRequestSchema>;
 
 export const dispatchSplitBatchSchema = z.object({
   batchIndex: z.number().int().nonnegative(),
@@ -334,10 +336,10 @@ export const remoteDispatchRunRequestSchema = z.object({
   title: z.string().trim().min(1).max(200),
   request: z.string().trim().min(1).max(20_000),
   engine: dispatchEngineSchema,
-  model: z.string().max(512).default(""),
+  model: modelValue.default(""),
   effort: effort.default(""),
   force: z.boolean().optional(),
-}).strict();
+}).strict().refine(dispatchEngineSelectionValid, { message: "engine_selection_invalid" });
 export type RemoteDispatchRunRequest = z.infer<typeof remoteDispatchRunRequestSchema>;
 
 export const remoteDispatchRunResponseSchema = z.object({

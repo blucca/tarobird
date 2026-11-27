@@ -120,6 +120,33 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
     if (sub === "settings") {
       const id = dispatcher().id, current = await client.request<{ settings: DispatcherSettings; revision: string }>(`/api/bots/${id}/dispatcher`);
       const allow = allowedEnginesOption(options.allow);
+      if (options.host !== undefined) {
+        const hostId = options.host.trim();
+        const enabledVal = options.allowed === undefined ? undefined
+          : ["1", "true", "on", "yes"].includes(options.allowed.trim().toLowerCase()) ? true
+            : ["0", "false", "off", "no"].includes(options.allowed.trim().toLowerCase()) ? false
+              : (() => { throw new Error("--allowed 仅支持 on|off|true|false。"); })();
+        if (enabledVal === undefined && options["max-concurrent"] === undefined && allow === undefined) return current;
+        const existingNodes = current.settings.nodes ?? [];
+        const prev = existingNodes.find(node => node.hostId === hostId) ?? {
+          hostId,
+          enabled: true,
+          maxConcurrent: current.settings.maxConcurrent,
+          preference: "normal" as const,
+        };
+        const { allowedEngines: _prevAllow, ...prevRest } = prev;
+        const nextNode = {
+          ...(allow === "all" ? prevRest : prev),
+          ...(Array.isArray(allow) ? { allowedEngines: allow } : {}),
+          ...(enabledVal !== undefined ? { enabled: enabledVal } : {}),
+          ...(options["max-concurrent"] !== undefined ? { maxConcurrent: Number(options["max-concurrent"]) } : {}),
+        };
+        const settings = dispatcherSettingsSchema.parse({
+          ...current.settings,
+          nodes: [...existingNodes.filter(node => node.hostId !== hostId), nextNode],
+        });
+        return client.request(`/api/bots/${id}/dispatcher`, "PUT", { settings, expectedRevision: options.revision ?? current.revision });
+      }
       if (options["dispatch-mode"] === undefined && options["max-concurrent"] === undefined && allow === undefined) return current;
       const { allowedEngines: _all, ...rest } = current.settings;
       const settings = dispatcherSettingsSchema.parse({ ...(allow === "all" ? rest : current.settings), ...(Array.isArray(allow) ? { allowedEngines: allow } : {}),
@@ -150,6 +177,7 @@ async function mutation(sub: string, argument: string | undefined, options: Tick
     const requestId = options["request-id"] ?? randomUUID();
     if (options.create || options.dispatch) receipt(requestId);
     const request = required(await textOf(options), "缺少 --text 或 --text-file（待拆分任务要求）。");
+    const hostIds = options.host !== undefined ? options.host.split(",").map(item => item.trim()).filter(Boolean) : undefined;
     return dispatchSplitPlanRequestSchema.parse({
       requestId,
       request,
@@ -159,6 +187,8 @@ async function mutation(sub: string, argument: string | undefined, options: Tick
       ...(options.effort !== undefined ? { effort: options.effort } : {}),
       ...(options.total !== undefined ? { totalItems: Number(options.total) } : {}),
       ...(options["per-node"] !== undefined ? { perNode: Number(options["per-node"]) } : {}),
+      ...(hostIds?.length ? { hostIds } : {}),
+      ...(options.force ? { force: true } : {}),
       ...(options.create ? { create: true } : {}),
       ...(options.dispatch ? { dispatch: true } : {}),
     });

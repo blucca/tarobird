@@ -86,10 +86,10 @@ export function DispatcherSettingsControl({ connection, bot, online, owner }: { 
     {open && owner && <DispatcherDialog connection={connection} bot={bot} online={online} close={() => setOpen(false)} returnFocus={trigger}/>}
   </>;
 }
-function nodeStatusLabel(node: DispatchNodeTarget): string {
+function nodeStatusLabel(node: DispatchNodeTarget, enabled: boolean): string {
   if (!node.online) return t("离线");
   if (!node.authorized) return t("未授权");
-  if (!node.enabled) return t("已停用");
+  if (!enabled) return t("已停用");
   return t("可用");
 }
 function quotaHint(node: DispatchNodeTarget): string | undefined {
@@ -113,38 +113,54 @@ function DispatcherDialog({ connection, bot, online, close, returnFocus }: { con
       setNodesView(value);
     } catch { /* Optional cross-host capability; older Hubs return 404. */ }
   }, [connection, bot.id]);
+  const reloadAll = useCallback(() => {
+    void load();
+    if (online) void loadNodes();
+  }, [load, loadNodes, online]);
   useEffect(() => { let alive = true; setCatalogFailed(false); void connection.http<BotCatalog>("/api/bots/catalog").then(value => { if (alive) setCatalog(value); }, () => { if (alive) setCatalogFailed(true); }); return () => { alive = false; }; }, [connection, catalogAttempt]);
   useEffect(() => { if (online) void loadNodes(); }, [online, loadNodes]);
+  useEffect(() => { if (online && saved) void loadNodes(); }, [online, saved, data?.revision, loadNodes]);
   const engines = useMemo(() => installedEngines(catalog), [catalog]);
   // The draft never waits for the catalog: the allowlist does not depend on it.
   useEffect(() => { if (data) setDraft(normalizedDispatcherSettings(data.settings)); }, [data]);
   const changed = !!data && !!draft && JSON.stringify(normalizedDispatcherSettings(draft)) !== JSON.stringify(normalizedDispatcherSettings(data.settings));
   const leave = () => { if (changed) setConfirm("close"); else close(); };
-  const updateNode = (node: DispatchNodeTarget, patch: Partial<DispatcherNodeSettings>) => {
+  const updateNode = (node: DispatchNodeTarget, patch: Partial<DispatcherNodeSettings> & { allowedEngines?: Engine[] | undefined }) => {
     if (!draft) return;
     const existing = draft.nodes ?? [];
-    const current = existing.find(item => item.hostId === node.hostId) ?? {
+    const savedEntry = existing.find(item => item.hostId === node.hostId);
+    const current: DispatcherNodeSettings = savedEntry ?? {
       hostId: node.hostId,
       enabled: node.enabled,
       maxConcurrent: node.maxConcurrent,
       preference: node.preference,
-      ...(node.allowedEngines ? { allowedEngines: node.allowedEngines } : {}),
     };
     const nextEntry: DispatcherNodeSettings = { ...current, ...patch };
+    if ("allowedEngines" in patch && patch.allowedEngines === undefined) delete nextEntry.allowedEngines;
     const others = existing.filter(item => item.hostId !== node.hostId);
     setDraft({ ...draft, nodes: [...others, nextEntry] });
   };
-  const authorizeRemote = async (node: DispatchNodeTarget) => {
+  const canManageRemoteGrant = (remoteEntry: (typeof hostEntries)[number] | undefined) => {
+    const remoteConn = remoteEntry?.connection;
+    return !!remoteEntry && !!remoteConn
+      && !remoteEntry.host.networkBlocked
+      && !remoteConn.isNetworkBlocked
+      && !remoteConn.isReadOnly
+      && remoteConn.state.status === "online"
+      && remoteConn.state.user?.role === "owner"
+      && !!remoteConn.state.crossHostDispatchAvailable;
+  };
+  const setRemoteGrant = async (node: DispatchNodeTarget, allowed: boolean) => {
     if (!nodesView?.ownHostId || grantBusyHost) return;
     const remoteEntry = hostEntries.find(entry => entry.host.publicKey && botMessageHostId(entry.host.publicKey) === node.hostId);
     const remoteConn = remoteEntry?.connection;
-    if (!remoteConn || remoteEntry.host.networkBlocked || remoteConn.isNetworkBlocked || remoteConn.state.status !== "online") return;
+    if (!canManageRemoteGrant(remoteEntry) || !remoteConn) return;
     setGrantBusyHost(node.hostId); setGrantError("");
     try {
-      await remoteConn.saveCrossHostDispatchGrants({ operation: "cross-host-dispatch-grant", sourceHost: nodesView.ownHostId, sourceBot: bot.id, allowed: true });
+      await remoteConn.saveCrossHostDispatchGrants({ operation: "cross-host-dispatch-grant", sourceHost: nodesView.ownHostId, sourceBot: bot.id, allowed });
       await loadNodes();
     } catch {
-      setGrantError(t("授权未能确认，请在远端主机确认后重试。"));
+      setGrantError(allowed ? t("授权未能确认，请在远端主机确认后重试。") : t("撤销授权未能确认，请在远端主机确认后重试。"));
     } finally { setGrantBusyHost(""); }
   };
   const showNodes = (nodesView?.nodes.length ?? 0) > 1 || (draft?.nodes?.length ?? 0) > 0;
@@ -163,8 +179,18 @@ function DispatcherDialog({ connection, bot, online, close, returnFocus }: { con
               const enabled = savedEntry?.enabled ?? node.enabled;
               const preference = savedEntry?.preference ?? node.preference;
               const maxConcurrent = savedEntry?.maxConcurrent ?? node.maxConcurrent;
+              const nodeInstalled = node.load.engines.filter(e => e.installed).map(e => e.engine);
+              const nodeChoices = DISPATCH_ENGINES.filter(id => nodeInstalled.includes(id) || !!savedEntry?.allowedEngines?.includes(id));
+              const effectiveNodeAllowed = savedEntry?.allowedEngines ?? draft.allowedEngines;
+              const nodeEngineAllowed = (id: Engine) => !effectiveNodeAllowed || effectiveNodeAllowed.includes(id);
+              const toggleNodeEngine = (engine: Engine, checked: boolean) => {
+                const base = savedEntry?.allowedEngines
+                  ?? (draft.allowedEngines ? DISPATCH_ENGINES.filter(id => draft.allowedEngines!.includes(id) && nodeChoices.includes(id)) : nodeChoices);
+                const next = DISPATCH_ENGINES.filter(id => id === engine ? checked : base.includes(id));
+                if (next.length) updateNode(node, { allowedEngines: next });
+              };
               const remoteEntry = !node.local ? hostEntries.find(entry => entry.host.publicKey && botMessageHostId(entry.host.publicKey) === node.hostId) : undefined;
-              const canAuthorizeHere = !node.local && !node.authorized && !!remoteEntry?.connection && !remoteEntry.host.networkBlocked && !remoteEntry.connection.isNetworkBlocked && remoteEntry.connection.state.status === "online";
+              const canManageHere = !node.local && canManageRemoteGrant(remoteEntry);
               const qHint = quotaHint(node);
               return <li key={node.hostId} className="dispatcher-node-row" data-online={node.online ? "1" : "0"} data-authorized={node.authorized ? "1" : "0"}>
                 <div className="dispatcher-node-head">
@@ -174,7 +200,7 @@ function DispatcherDialog({ connection, bot, online, close, returnFocus }: { con
                     <strong>{node.hostName}</strong>
                     {node.local && <span className="dispatch-node-pill">{t("本机")}</span>}
                   </label>
-                  <span className="dispatch-node-pill" data-state={node.online && node.authorized && enabled ? "ready" : "muted"}>{nodeStatusLabel(node)}</span>
+                  <span className="dispatch-node-pill" data-state={node.online && node.authorized && enabled ? "ready" : "muted"}>{nodeStatusLabel(node, enabled)}</span>
                 </div>
                 <div className="dispatcher-node-meta">
                   <span>{t("进行中 {0}/{1}", node.activeOnNode, maxConcurrent)}</span>
@@ -196,10 +222,35 @@ function DispatcherDialog({ connection, bot, online, close, returnFocus }: { con
                     </select>
                   </label>
                 </div>
+                {nodeChoices.length > 0 && <div className="dispatcher-node-engines">
+                  <span className="dispatcher-node-engines-label">{t("此机可用 CLI")}</span>
+                  <div className="dispatcher-node-engines-checks">
+                    {nodeChoices.map(engine => <label className="collaboration-check" key={engine}>
+                      <input type="checkbox" checked={nodeEngineAllowed(engine)} onChange={event => toggleNodeEngine(engine, event.target.checked)}/>
+                      {ENGINE_NAMES[engine] ?? engine}{!nodeInstalled.includes(engine) && t("（未安装）")}
+                    </label>)}
+                    <label className="collaboration-check">
+                      <input type="checkbox" checked={!savedEntry?.allowedEngines} onChange={event => {
+                        if (event.target.checked) {
+                          updateNode(node, { allowedEngines: undefined });
+                        } else {
+                          const pinned = draft.allowedEngines
+                            ? DISPATCH_ENGINES.filter(id => draft.allowedEngines!.includes(id) && nodeChoices.includes(id))
+                            : nodeChoices;
+                          if (pinned.length) updateNode(node, { allowedEngines: pinned });
+                        }
+                      }}/>
+                      {t("跟随全局 CLI 设置")}
+                    </label>
+                  </div>
+                </div>}
                 {!node.local && !node.authorized && <div className="dispatcher-node-auth">
-                  {canAuthorizeHere
-                    ? <button type="button" disabled={!!grantBusyHost || !online} onClick={() => void authorizeRemote(node)}>{grantBusyHost === node.hostId ? t("授权中…") : t("授权此主机接收派工")}</button>
+                  {canManageHere
+                    ? <button type="button" disabled={!!grantBusyHost || !online} onClick={() => void setRemoteGrant(node, true)}>{grantBusyHost === node.hostId ? t("授权中…") : t("授权此主机接收派工")}</button>
                     : <p className="muted">{t("尚未获得远端授权，请在对方主机的终端或已连客户端授权。")}</p>}
+                </div>}
+                {!node.local && node.authorized && canManageHere && <div className="dispatcher-node-auth">
+                  <button type="button" disabled={!!grantBusyHost || !online} onClick={() => void setRemoteGrant(node, false)}>{grantBusyHost === node.hostId ? t("撤销中…") : t("撤销此主机授权")}</button>
                 </div>}
               </li>;
             })}
@@ -207,15 +258,15 @@ function DispatcherDialog({ connection, bot, online, close, returnFocus }: { con
         </fieldset>}
         <p className="muted">{t("进行中的工单不受影响；之后派出的工单使用新设置。")}</p>
         <p role="status" className={changed || saved ? "dashboard-notice" : "muted"}>{saving ? t("保存中…") : error !== undefined ? t("保存结果尚未确认，请核对下方提示。") : changed ? t("修改尚未保存，点击「保存到此 Bot」后生效。") : saved ? t("幕僚长设置已保存。") : t("当前显示的是主机已保存的设置。")}</p>
-        <div className="effort-actions"><button type="button" disabled={busy || !online} onClick={() => changed ? setConfirm("reload") : void load()}>{t("重新读取")}</button><button type="submit" className="primary" disabled={busy || !online || !changed}>{saving ? t("保存中…") : t("保存到此 Bot")}</button></div>
+        <div className="effort-actions"><button type="button" disabled={busy || !online} onClick={() => changed ? setConfirm("reload") : reloadAll()}>{t("重新读取")}</button><button type="submit" className="primary" disabled={busy || !online || !changed}>{saving ? t("保存中…") : t("保存到此 Bot")}</button></div>
       </form>}
-      {!data && <button disabled={busy || !online} onClick={() => void load()}>{busy ? t("正在读取…") : t("重新读取")}</button>}
+      {!data && <button disabled={busy || !online} onClick={() => reloadAll()}>{busy ? t("正在读取…") : t("重新读取")}</button>}
       {!online && <p role="status">{t("连接恢复后即可操作")}</p>}
       {error !== undefined && <p role="alert" className="error-text">{errorText(error)}</p>}
     </div>
     {confirm && <CreationDialog title={t("有未保存的修改")} showHost={false} closeLabel={t("取消")} close={() => setConfirm(undefined)} initialFocus={continueEditing}>
       <p>{error !== undefined ? t("上次保存结果尚未确认。放弃本页修改不会撤销主机可能已保存的设置，请重新读取核对。") : confirm === "close" ? t("这些修改尚未保存。请返回编辑页保存，或放弃修改后退出。") : t("重新读取会丢弃本页未保存的修改，恢复主机已保存的设置。")}</p>
-      <div className="effort-actions"><button ref={continueEditing} type="button" className="primary" onClick={() => setConfirm(undefined)}>{t("继续编辑")}</button><button type="button" onClick={() => { const action = confirm; setConfirm(undefined); if (action === "close") close(); else void load(); }}>{t("放弃修改")}</button></div>
+      <div className="effort-actions"><button ref={continueEditing} type="button" className="primary" onClick={() => setConfirm(undefined)}>{t("继续编辑")}</button><button type="button" onClick={() => { const action = confirm; setConfirm(undefined); if (action === "close") close(); else reloadAll(); }}>{t("放弃修改")}</button></div>
     </CreationDialog>}
   </CreationDialog>;
 }

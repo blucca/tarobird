@@ -5706,5 +5706,10 @@
   "此机并发": "Host concurrency",
   "授权中…": "Authorizing…",
   "授权此主机接收派工": "Authorize this Host for dispatch",
-  "尚未获得远端授权，请在对方主机的终端或已连客户端授权。": "Not yet authorized by remote Host. Grant permission from that Host's terminal or connected App."
+  "尚未获得远端授权，请在对方主机的终端或已连客户端授权。": "Not yet authorized by remote Host. Grant permission from that Host's terminal or connected App.",
+  "撤销授权未能确认，请在远端主机确认后重试。": "Revocation unconfirmed. Check the remote Host and try again.",
+  "撤销中…": "Revoking…",
+  "撤销此主机授权": "Revoke Host authorization",
+  "此机可用 CLI": "Allowed CLIs on this Host",
+  "跟随全局 CLI 设置": "Follow global CLI list"
 }

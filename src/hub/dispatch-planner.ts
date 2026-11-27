@@ -2,7 +2,7 @@ import type {
   DispatchEngine,
   DispatchNodeTarget,
   DispatchSplitBatch,
-  DispatchSplitPlanRequest,
+  DispatchSplitPlanInput,
   DispatchSplitPlanResponse,
   DispatchTicket,
   DispatcherSettings,
@@ -20,13 +20,20 @@ export function parseSplitTaskSpec(
   explicit?: { totalItems?: number; perNode?: number; items?: readonly string[] },
 ): ParsedSplitTask {
   let perNode = explicit?.perNode;
+  let remaining = request;
   if (perNode === undefined) {
     const zhPer = /(?:每(?:台|个节点|台主机|台机器|台电脑|机)|平均每台)\s*(?:最多|至多|分配|不超过|写|跑|做|生成|处理|负责|限|上限)?\s*(\d{1,4})\s*(?:个|条|份|篇|项|脚本|文件|任务)?/u.exec(request);
     const enPer = /\b(\d{1,4})\s+(?:items?|scripts?|files?|tasks?|tests?)\s+(?:per|on\s+each)\s+(?:machine|host|node|computer)\b|\b(\d{1,4})\s+(?:per|each)\s+(?:machine|host|node|computer)\b/iu.exec(request);
+    const match = zhPer ?? enPer;
     const raw = zhPer?.[1] ?? enPer?.[1] ?? enPer?.[2];
     if (raw) {
       const n = Number(raw);
-      if (Number.isInteger(n) && n > 0 && n <= 10_000) perNode = n;
+      if (Number.isInteger(n) && n > 0 && n <= 10_000) {
+        perNode = n;
+        if (match && match.index !== undefined) {
+          remaining = `${request.slice(0, match.index)} ${request.slice(match.index + match[0].length)}`;
+        }
+      }
     }
   }
 
@@ -37,9 +44,9 @@ export function parseSplitTaskSpec(
     return { totalItems: explicit.totalItems, perNode };
   }
 
-  const zhTotal = /(?:共|一共|总共|编写|写|生成|处理|创建|测试|分析|跑)\s*(\d{1,4})\s*(?:个|条|份|篇|项|套|只|段)?\s*([^\s，。,.；;！？!?]{1,24})/u.exec(request);
-  const enTotal = /\b(?:write|create|generate|process|run|build|analyze|test|make|prepare)\s+(\d{1,4})\s+([a-z][a-z0-9_-]{1,24})/iu.exec(request)
-    ?? /\b(\d{1,4})\s+(scripts?|tasks?|items?|files?|tests?|jobs?|prompts?|modules?)\b/iu.exec(request);
+  const zhTotal = /(?:共|一共|总共|编写|写|生成|处理|创建|测试|分析|跑)\s*(\d{1,4})\s*(?:个|条|份|篇|项|套|只|段)?\s*([^\s，。,.；;！？!?]{1,24})/u.exec(remaining);
+  const enTotal = /\b(?:write|create|generate|process|run|build|analyze|test|make|prepare)\s+(\d{1,4})\s+([a-z][a-z0-9_-]{1,24})/iu.exec(remaining)
+    ?? /\b(\d{1,4})\s+(scripts?|tasks?|items?|files?|tests?|jobs?|prompts?|modules?)\b/iu.exec(remaining);
   const rawTotal = zhTotal?.[1] ?? enTotal?.[1];
   const unit = zhTotal?.[2] ?? enTotal?.[2];
   if (rawTotal) {
@@ -100,7 +107,7 @@ export function evaluateNodeForEngine(
   const freeSlots = Math.max(0, node.maxConcurrent - node.activeOnNode);
   const slotRatio = node.maxConcurrent > 0 ? freeSlots / node.maxConcurrent : 0;
   score += slotRatio * 25;
-  if (node.activeOnNode === 0 && (node.load.cpuLoadRatio ?? 0) < 0.7) {
+  if (node.activeOnNode === 0 && node.load.cpuLoadRatio !== undefined && node.load.cpuLoadRatio < 0.7) {
     reasons.push("least_busy");
   }
 
@@ -144,6 +151,7 @@ export function pickEngineForNodes(
   nodes: readonly DispatchNodeTarget[],
   preferredEngine?: DispatchEngine,
   allowedEngines?: readonly DispatchEngine[],
+  options: { force?: boolean; allowManualHostIds?: ReadonlySet<string> } = {},
 ): DispatchEngine | undefined {
   if (preferredEngine) return preferredEngine;
   const candidates = allowedEngines?.length ? allowedEngines : (["codex", "claude", "deepseek", "kimi", "antigravity"] as const);
@@ -153,7 +161,11 @@ export function pickEngineForNodes(
     let availableNodes = 0;
     let sumScore = 0;
     for (const node of nodes) {
-      const evalResult = evaluateNodeForEngine(node, engine, { checkCapacity: false });
+      const evalResult = evaluateNodeForEngine(node, engine, {
+        force: options.force,
+        checkCapacity: false,
+        allowManual: !!options.allowManualHostIds?.has(node.hostId),
+      });
       if (evalResult.eligible) {
         availableNodes++;
         sumScore += evalResult.score;
@@ -172,22 +184,27 @@ export function pickEngineForNodes(
 
 /** Plans parallel batches across eligible nodes for a multi-item or multi-part task. */
 export function planSplitBatches(
-  input: DispatchSplitPlanRequest,
+  input: DispatchSplitPlanInput,
   nodes: readonly DispatchNodeTarget[],
   settings: DispatcherSettings,
   batchId: string,
 ): DispatchSplitPlanResponse {
+  const force = input.force ?? false;
   const parsed = parseSplitTaskSpec(input.request, {
     totalItems: input.totalItems,
     perNode: input.perNode,
     items: input.items,
   });
 
-  const candidateNodes = input.hostIds?.length
-    ? nodes.filter(n => input.hostIds!.includes(n.hostId))
+  const explicitHostIds = input.hostIds?.length ? new Set(input.hostIds) : undefined;
+  const candidateNodes = explicitHostIds
+    ? nodes.filter(n => explicitHostIds.has(n.hostId))
     : nodes;
 
-  const engine = pickEngineForNodes(candidateNodes, input.engine, settings.allowedEngines);
+  const engine = pickEngineForNodes(candidateNodes, input.engine, settings.allowedEngines, {
+    force,
+    allowManualHostIds: explicitHostIds,
+  });
   const skippedNodes: DispatchSplitPlanResponse["skippedNodes"] = [];
   const eligible: { node: DispatchNodeTarget; evaluation: NodeEvaluation }[] = [];
 
@@ -197,9 +214,9 @@ export function planSplitBatches(
       continue;
     }
     const evalResult = evaluateNodeForEngine(node, engine, {
-      force: input.force,
+      force,
       checkCapacity: false,
-      allowManual: !!input.hostIds?.includes(node.hostId),
+      allowManual: !!explicitHostIds?.has(node.hostId),
     });
     if (!evalResult.eligible) {
       skippedNodes.push({ hostId: node.hostId, hostName: node.hostName, reason: evalResult.reason });
@@ -228,6 +245,7 @@ export function planSplitBatches(
   const baseTitle = (input.title ?? input.request.split(/\r?\n/, 1)[0]?.slice(0, 80) ?? "Task").trim();
   const batches: DispatchSplitBatch[] = [];
 
+  let plannedTotalItems = parsed.totalItems;
   if (input.items?.length) {
     const items = input.items;
     const batchCount = parsed.perNode
@@ -293,6 +311,31 @@ export function planSplitBatches(
         reason: picked.evaluation.reason,
       });
     }
+  } else if (parsed.perNode && parsed.perNode > 0) {
+    // Per-node-only prompt (e.g. "Write 10 scripts per machine"): allocate `perNode` items to each eligible node.
+    const count = Math.min(pool.length, 8);
+    const perNode = parsed.perNode;
+    plannedTotalItems = count * perNode;
+    for (let i = 0; i < count; i++) {
+      const picked = pool[i]!;
+      const start = i * perNode + 1;
+      const end = (i + 1) * perNode;
+      batches.push({
+        batchIndex: i,
+        batchTotal: count,
+        title: count > 1 ? `${baseTitle} (#${start}-#${end})`.slice(0, 200) : baseTitle.slice(0, 200),
+        request: `${input.request}\n\n[Batch ${i + 1}/${count} assigned to node ${picked.node.hostName}: complete items #${start} to #${end} (${perNode} items on this node). Write output files into the ticket workspace and summarize what you produced.]`.slice(0, 20_000),
+        hostId: picked.node.hostId,
+        hostName: picked.node.hostName,
+        engine,
+        model: input.model ?? "",
+        effort: input.effort ?? "",
+        itemStart: start,
+        itemEnd: end,
+        itemCount: perNode,
+        reason: picked.evaluation.reason,
+      });
+    }
   } else {
     // Generic multi-node split when count isn't numeric: one batch per selected node (up to candidate nodes).
     const count = Math.min(pool.length, 8);
@@ -317,7 +360,7 @@ export function planSplitBatches(
 
   return {
     batchId,
-    ...(parsed.totalItems ? { totalItems: parsed.totalItems } : {}),
+    ...(plannedTotalItems ? { totalItems: plannedTotalItems } : {}),
     ...(parsed.perNode ? { perNode: parsed.perNode } : {}),
     mode: settings.mode,
     requiresConfirmation: settings.mode === "ask",
@@ -336,25 +379,36 @@ function distributeCount(
   const weights = Array.from({ length: batchCount }, (_, i) => {
     const item = pool[i % pool.length]!;
     const prefFactor = item.node.preference === "prefer" ? 1.25 : item.node.preference === "less_often" ? 0.75 : 1;
-    return Math.max(1, prefFactor);
+    return Math.max(0.25, prefFactor);
   });
   const totalWeight = weights.reduce((a, b) => a + b, 0);
-  const sizes = weights.map(w => Math.max(1, Math.floor((total * w) / totalWeight)));
+  const exact = weights.map(w => (total * w) / totalWeight);
+  const sizes = exact.map(v => Math.max(1, Math.floor(v)));
   let assigned = sizes.reduce((a, b) => a + b, 0);
-  // Adjust down or up to match `total` exactly.
-  let idx = 0;
-  while (assigned < total) {
-    sizes[idx % sizes.length]! += 1;
-    assigned++;
-    idx++;
-  }
-  while (assigned > total) {
-    const pos = idx % sizes.length;
-    if (sizes[pos]! > 1) {
-      sizes[pos]! -= 1;
-      assigned--;
+  // Adjust using largest-remainder ordering so preference weights (prefer / less_often) stay proportional.
+  if (assigned < total) {
+    const order = exact
+      .map((v, i) => ({ i, rem: v - Math.floor(v), w: weights[i]! }))
+      .sort((a, b) => b.rem - a.rem || b.w - a.w || a.i - b.i);
+    let idx = 0;
+    while (assigned < total) {
+      sizes[order[idx % order.length]!.i]! += 1;
+      assigned++;
+      idx++;
     }
-    idx++;
+  } else if (assigned > total) {
+    const order = exact
+      .map((v, i) => ({ i, rem: v - Math.floor(v), w: weights[i]! }))
+      .sort((a, b) => a.rem - b.rem || a.w - b.w || b.i - a.i);
+    let idx = 0;
+    while (assigned > total) {
+      const pos = order[idx % order.length]!.i;
+      if (sizes[pos]! > 1) {
+        sizes[pos]! -= 1;
+        assigned--;
+      }
+      idx++;
+    }
   }
   return sizes;
 }

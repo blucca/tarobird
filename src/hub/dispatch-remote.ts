@@ -3,6 +3,7 @@ import { open } from "node:fs/promises";
 import os from "node:os";
 import { z } from "zod";
 import { blocksText, idSchema, type Block, type Conversation, type HubEvent } from "../client-protocol/index.js";
+import { isBotControl } from "../client-protocol/bot-messages.js";
 import {
   DISPATCH_ENGINES, REMOTE_DISPATCH_TARGET_BOT, crossHostDispatchGrantCommandSchema, crossHostDispatchGrantsSnapshotSchema,
   engineHealthSchema, hostLoadReportSchema, remoteDispatchRunRequestSchema, remoteDispatchRunResponseSchema,
@@ -13,6 +14,7 @@ import {
 import type { BotCatalog } from "../client-protocol/bots.js";
 import { anyRun, isRunActive, nativeRun, runSummarySchema } from "../client-protocol/run.js";
 import { renderedEngineFailure, renderedEngineResetHint } from "../core/errors.js";
+import { getEngineEffortValidationError } from "../state/instance-config.js";
 import type { QuotaScope } from "../client-protocol/engine-quota.js";
 import type { HubAuth } from "./auth.js";
 import type { HubAttachments } from "./attachments.js";
@@ -23,20 +25,22 @@ const activeRunPhases = runSummarySchema.shape.phase.options.filter(isRunActive)
 const activeRunPhaseParams = activeRunPhases.map(() => "?").join(",");
 const SWITCH_CATEGORIES = new Set(["engine-quota", "auth", "engine-rate-limit", "engine-backend", "engine-cli"]);
 const RESULT_CHARS = 4000;
+const REMOTE_DISPATCH_RATE_LIMIT = 20;
+const REMOTE_DISPATCH_RATE_WINDOW_MS = 60_000;
 
 type DispatchGrant = { sourceKey: string; sourceBot: string; revoked: boolean };
 type RemoteTicketRow = {
   id: string; source_key: string; source_host_id: string; source_bot_id: string; remote_request_id: string;
   title: string; request: string; engine: string; model: string; effort: string;
-  bot_id: string; conversation_id: string; input_message_id: string; status: string;
+  bot_id: string; conversation_id: string; input_message_id: string; status: string; stop_requested: string | null;
   created_at: number; updated_at: number;
 };
 
 const hostIdOfKey = (key: string) => `hub_${createHash("sha256").update(Buffer.from(key, "base64")).digest("hex")}`;
 const dispatchGrantKey = (sourceKey: string, sourceBot: string) =>
   `bot-messages:dispatch-grant:${createHash("sha256").update(JSON.stringify([sourceKey, sourceBot])).digest("hex")}`;
-const botGrantKey = (sourceKey: string, sourceBot: string, targetBot: string) =>
-  `bot-messages:grant:${createHash("sha256").update(JSON.stringify([sourceKey, sourceBot, targetBot])).digest("hex")}`;
+const dispatchRateKey = (sourceKey: string, sourceBot: string) =>
+  `bot-messages:dispatch-rate:${createHash("sha256").update(JSON.stringify([sourceKey, sourceBot])).digest("hex")}`;
 
 export interface RemoteDispatchWorkers {
   catalog(): Promise<BotCatalog>;
@@ -51,6 +55,7 @@ export interface RemoteDispatchContext {
   network: PrivateNetwork;
   attachments: HubAttachments;
   workers?: RemoteDispatchWorkers;
+  workerCapable?: (botId: string) => boolean | undefined;
   quotaScopes?: () => Promise<QuotaScope[]>;
   conversationCreated: (userId: string, conversation: Conversation) => void;
   stop: (botId: string, conversationId: string, userId: string, messageId: string) => Promise<unknown>;
@@ -84,8 +89,14 @@ export async function readLocalHostLoad(ctx: RemoteDispatchContext, health: read
   const hostId = hostIdOfKey(ctx.auth.publicKey);
   const hostName = view.host.name;
   const cpuCount = Math.max(1, os.cpus().length || 1);
-  const load1m = os.loadavg()[0];
-  const cpuLoadRatio = Number.isFinite(load1m) && load1m >= 0 ? Math.round((load1m / cpuCount) * 100) / 100 : undefined;
+  // Node.js os.loadavg() always returns [0, 0, 0] on Windows; omit cpuLoadRatio there.
+  let cpuLoadRatio: number | undefined;
+  if (process.platform !== "win32") {
+    const load1m = os.loadavg()[0];
+    if (Number.isFinite(load1m) && load1m >= 0) {
+      cpuLoadRatio = Math.round((load1m / cpuCount) * 100) / 100;
+    }
+  }
   const totalMem = os.totalmem();
   const freeMemoryRatio = totalMem > 0 ? Math.round((os.freemem() / totalMem) * 100) / 100 : undefined;
 
@@ -139,12 +150,15 @@ export async function readCrossHostDispatchGrants(ctx: RemoteDispatchContext, us
     await ctx.store.requireOwner(userId);
     const peers = (view.membership?.manifest.hosts ?? []).filter(h => h.publicKey !== ctx.auth.publicKey);
     const hosts: CrossHostDispatchGrantsSnapshot["hosts"] = [];
+    const seenHosts = new Set<string>();
     for (const peer of peers) {
       let available = false;
       if (peer.state === "active" && !peer.revoked) {
         try { await ctx.network.requireMessagePeerInTransaction(peer.publicKey); available = true; } catch { available = false; }
       }
-      hosts.push({ id: hostIdOfKey(peer.publicKey), name: peer.name, available });
+      const id = hostIdOfKey(peer.publicKey);
+      seenHosts.add(id);
+      hosts.push({ id, name: peer.name, available });
     }
     const rows = await ctx.store.db.all<{ key: string; value: string }>("SELECT key,value FROM meta WHERE key LIKE 'bot-messages:dispatch-grant:%' ORDER BY key");
     const grants: CrossHostDispatchGrantsSnapshot["grants"] = [];
@@ -152,7 +166,12 @@ export async function readCrossHostDispatchGrants(ctx: RemoteDispatchContext, us
       try {
         const grant = JSON.parse(row.value) as DispatchGrant;
         if (!grant.revoked && row.key === dispatchGrantKey(grant.sourceKey, grant.sourceBot)) {
-          grants.push({ sourceHost: hostIdOfKey(grant.sourceKey), sourceBot: grant.sourceBot });
+          const sourceHost = hostIdOfKey(grant.sourceKey);
+          grants.push({ sourceHost, sourceBot: grant.sourceBot });
+          if (!seenHosts.has(sourceHost) && grant.sourceKey !== ctx.auth.publicKey) {
+            seenHosts.add(sourceHost);
+            hosts.push({ id: sourceHost, name: sourceHost, available: false });
+          }
         }
       } catch { /* ignore malformed entry */ }
     }
@@ -173,30 +192,53 @@ export async function updateCrossHostDispatchGrants(
   await ctx.store.db.transaction(async () => {
     await guard();
     await ctx.store.requireOwner(userId);
-    await admit();
     const peer = view.membership?.manifest.hosts.find(h => hostIdOfKey(h.publicKey) === command.sourceHost);
-    if (!peer) throw new HubError("bot_message_host_not_found", 404);
-    if (peer.publicKey === ctx.auth.publicKey) throw new HubError("bot_message_grant_local_source", 400);
-    if (command.allowed) await ctx.network.requireMessagePeerInTransaction(peer.publicKey);
+    let sourceKey: string | undefined;
+    let residual = false;
+    if (peer) {
+      if (peer.publicKey === ctx.auth.publicKey) throw new HubError("bot_message_grant_local_source", 400);
+      if (command.allowed) await ctx.network.requireMessagePeerInTransaction(peer.publicKey);
+      sourceKey = peer.publicKey;
+    } else if (!command.allowed) {
+      // Allow revoking a residual stored grant for a departed/removed source Host by exact host ID.
+      const rows = await ctx.store.db.all<{ key: string; value: string }>("SELECT key,value FROM meta WHERE key LIKE 'bot-messages:dispatch-grant:%' ORDER BY key");
+      for (const row of rows) {
+        try {
+          const grant = JSON.parse(row.value) as DispatchGrant;
+          if (!grant.revoked && grant.sourceBot === command.sourceBot && hostIdOfKey(grant.sourceKey) === command.sourceHost
+            && row.key === dispatchGrantKey(grant.sourceKey, grant.sourceBot)) {
+            sourceKey = grant.sourceKey;
+            residual = true;
+            break;
+          }
+        } catch { /* ignore malformed entry */ }
+      }
+      if (!sourceKey) throw new HubError("bot_message_host_not_found", 404);
+    } else {
+      throw new HubError("bot_message_host_not_found", 404);
+    }
+    // Consume the one-use device proof only after peer/grant validation succeeds.
+    await admit();
     await ctx.store.db.run(
       "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-      [dispatchGrantKey(peer.publicKey, command.sourceBot), JSON.stringify({ sourceKey: peer.publicKey, sourceBot: command.sourceBot, revoked: !command.allowed } satisfies DispatchGrant)],
+      [dispatchGrantKey(sourceKey, command.sourceBot), JSON.stringify({ sourceKey, sourceBot: command.sourceBot, revoked: !command.allowed } satisfies DispatchGrant)],
     );
     await ctx.store.db.run(
       "INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)",
-      [Date.now(), actor, command.allowed ? "dispatch.cross-host-granted" : "dispatch.cross-host-revoked", JSON.stringify({ sourceHost: command.sourceHost, sourceBot: command.sourceBot })],
+      [Date.now(), actor, command.allowed ? "dispatch.cross-host-granted" : "dispatch.cross-host-revoked", JSON.stringify({ sourceHost: command.sourceHost, sourceBot: command.sourceBot, ...(residual ? { residual: true } : {}) })],
     );
   });
   return readCrossHostDispatchGrants(ctx, userId, guard);
 }
 
-/** Caller holds DB serial/transaction. True when `(sourceKey, sourceBot)` is authorized for remote dispatch. */
+/** Caller holds DB serial/transaction. True only when `(sourceKey, sourceBot)` has an explicit remote dispatch grant. */
 export async function isRemoteDispatchAuthorizedInTransaction(
   ctx: RemoteDispatchContext,
   sourceKey: string,
   sourceBot: string,
   targetBot: string = REMOTE_DISPATCH_TARGET_BOT,
 ): Promise<boolean> {
+  if (targetBot !== REMOTE_DISPATCH_TARGET_BOT) return false;
   await ctx.network.requireMessagePeerInTransaction(sourceKey);
   const dispatchRow = await ctx.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [dispatchGrantKey(sourceKey, sourceBot)]);
   if (dispatchRow) {
@@ -204,15 +246,6 @@ export async function isRemoteDispatchAuthorizedInTransaction(
       const grant = JSON.parse(dispatchRow.value) as DispatchGrant;
       if (!grant.revoked && grant.sourceKey === sourceKey && grant.sourceBot === sourceBot) return true;
     } catch { /* ignore */ }
-  }
-  if (targetBot !== REMOTE_DISPATCH_TARGET_BOT) {
-    const botRow = await ctx.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [botGrantKey(sourceKey, sourceBot, targetBot)]);
-    if (botRow) {
-      try {
-        const grant = JSON.parse(botRow.value) as { sourceKey: string; sourceBot: string; targetBot: string; revoked: boolean };
-        if (!grant.revoked && grant.sourceKey === sourceKey && grant.sourceBot === sourceBot && grant.targetBot === targetBot) return true;
-      } catch { /* ignore */ }
-    }
   }
   return false;
 }
@@ -234,55 +267,74 @@ async function inspectRemoteTicketState(ctx: RemoteDispatchContext, row: RemoteT
       AND (json_extract(b.value,'$.extra.nativeRun.phase') IN (${activeRunPhaseParams}) OR json_extract(b.value,'$.extra.scopedRun.phase') IN (${activeRunPhaseParams})))) LIMIT 1`,
   [row.input_message_id, row.bot_id, row.conversation_id, ...activeRunPhases, ...activeRunPhases]))?.active ?? 0;
 
-  const waiting = await ctx.store.db.get<{ id: string; phase: string }>(`SELECT m.id,COALESCE(json_extract(b.value,'$.extra.nativeRun.phase'),json_extract(b.value,'$.extra.scopedRun.phase')) AS phase
+  const waiting = !row.stop_requested ? await ctx.store.db.get<{ id: string; phase: string }>(`SELECT m.id,COALESCE(json_extract(b.value,'$.extra.nativeRun.phase'),json_extract(b.value,'$.extra.scopedRun.phase')) AS phase
     FROM messages m,json_each(m.blocks_json) b WHERE m.reply_to=? AND m.author_type='bot' AND m.author_id=? AND m.conversation_id=? AND m.status!='deleted'
     AND COALESCE(json_extract(b.value,'$.extra.nativeRun.phase'),json_extract(b.value,'$.extra.scopedRun.phase')) IN ('waiting_answer','waiting_approval') ORDER BY m.created_at DESC,m.id DESC LIMIT 1`,
-  [row.input_message_id, row.bot_id, row.conversation_id]);
+  [row.input_message_id, row.bot_id, row.conversation_id]) : undefined;
   const waitingFor = waiting ? { kind: (waiting.phase === "waiting_answer" ? "answer" : "approval") as "answer" | "approval", messageId: waiting.id } : undefined;
 
-  const replies = await ctx.store.db.all<{ id: string; blocks_json: string; status: string; created_at: number }>(
-    "SELECT id,blocks_json,status,created_at FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND reply_to=? AND status!='deleted' ORDER BY created_at,id LIMIT 200",
-    [row.conversation_id, row.bot_id, row.input_message_id],
-  );
   const files = await ctx.store.db.all<{ id: string; name: string; size: number; mime: string; sha256: string }>(
     `SELECT DISTINCT a.id,a.name,a.size,a.mime,a.sha256 FROM attachments a JOIN message_attachments ma ON ma.attachment_id=a.id JOIN messages m ON m.id=ma.message_id
      WHERE m.reply_to=? AND m.author_type='bot' AND m.author_id=? AND m.conversation_id=? AND m.status!='deleted' AND a.complete=1`,
     [row.input_message_id, row.bot_id, row.conversation_id],
   );
 
-  let error = false, incomplete = false, tail = "", length = 0, updatedAt = row.updated_at;
+  // Page replies in bounded batches instead of truncating at 200; inspect only
+  // foreground nativeRun phases so handled scopedRun errors do not fail the turn.
+  let after: { created_at: number; id: string } | undefined;
+  let error = false, incomplete = false, runs = 0, foregroundRuns = 0, allForegroundDone = true;
+  let tail = "", length = 0, updatedAt = row.updated_at;
   let category: NonNullable<ReturnType<typeof renderedEngineFailure>>["category"] | undefined, resetHint: string | undefined;
-  for (const r of replies) {
-    updatedAt = Math.max(updatedAt, r.created_at);
-    error ||= r.status === "error";
-    const blocks = JSON.parse(r.blocks_json) as Block[];
-    for (const block of blocks) {
-      const fg = block.type === "card" ? nativeRun(block) ?? anyRun(block) : undefined;
-      if (fg?.phase === "error") error = true;
-      if (fg && ["partial", "stopped", "interrupted"].includes(fg.phase)) incomplete = true;
+  const categories = [...SWITCH_CATEGORIES];
+  const priority = (value: string) => { const idx = categories.indexOf(value); return idx < 0 ? categories.length : idx; };
+  for (;;) {
+    const replies = await ctx.store.db.all<{ id: string; blocks_json: string; status: string; created_at: number }>(
+      `SELECT id,blocks_json,status,created_at FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND reply_to=? AND status!='deleted'
+       ${after ? "AND (created_at,id)>(?,?)" : ""} ORDER BY created_at,id LIMIT 32`,
+      [row.conversation_id, row.bot_id, row.input_message_id, ...(after ? [after.created_at, after.id] : [])],
+    );
+    for (const r of replies) {
+      updatedAt = Math.max(updatedAt, r.created_at);
+      error ||= r.status === "error";
+      const blocks = JSON.parse(r.blocks_json) as Block[];
+      for (const block of blocks) {
+        const run = block.type === "card" ? anyRun(block) : undefined;
+        if (run) runs++;
+        const fg = block.type === "card" ? nativeRun(block) : undefined;
+        if (fg) { foregroundRuns++; allForegroundDone &&= fg.phase === "done"; }
+        if (fg?.phase === "error") error = true;
+        if (fg && ["partial", "stopped", "interrupted"].includes(fg.phase)) incomplete = true;
+      }
+      const text = blocksText(blocks).trim();
+      if (text) {
+        const part = (length ? "\n\n" : "") + text;
+        tail = (tail + part).slice(-RESULT_CHARS);
+        length += part.length;
+        const f = renderedEngineFailure(text);
+        if (f && SWITCH_CATEGORIES.has(f.category) && (!category || priority(f.category) < priority(category))) category = f.category;
+        resetHint = renderedEngineResetHint(text) ?? resetHint;
+      }
     }
-    const text = blocksText(blocks).trim();
-    if (text) {
-      const part = (length ? "\n\n" : "") + text;
-      tail = (tail + part).slice(-RESULT_CHARS);
-      length += part.length;
-      const f = renderedEngineFailure(text);
-      if (f && SWITCH_CATEGORIES.has(f.category)) category = f.category;
-      resetHint ??= renderedEngineResetHint(text);
-    }
+    if (replies.length < 32) break;
+    after = replies.at(-1)!;
   }
 
   let status: RemoteDispatchStatusResponse["status"];
   let failure: TicketFailure | undefined;
-  if (row.status === "cancelled" || (!deleted && delivery?.status === "cancelled")) {
-    status = "cancelled";
-  } else if (deleted) {
+  if (deleted) {
     status = "failed";
     failure = { category: "bot-deleted", message: "Worker bot was deleted" };
   } else if (waitingFor) {
     status = "needs_answer";
+  } else if (!delivery && row.status === "cancelled") {
+    status = "cancelled";
   } else if (active > 0 || !delivery || delivery.status === "pending") {
     status = delivery?.dispatched || active > 0 ? "working" : "queued";
+  } else if (delivery.status === "cancelled") {
+    status = "cancelled";
+  } else if (row.stop_requested) {
+    const finished = delivery.status === "accepted" && !error && !incomplete && (runs === 0 || (foregroundRuns > 0 && allForegroundDone));
+    status = finished ? "completed" : "cancelled";
   } else if (delivery.status === "failed" || error || incomplete) {
     status = "failed";
     failure = { category: (!incomplete ? category : undefined) ?? "task", ...(resetHint ? { resetHint } : {}), ...(tail ? { message: tail.slice(-1000) } : {}) };
@@ -313,6 +365,7 @@ export async function handleRemoteDispatchRequest(
   data: Record<string, unknown>,
   localAdmission?: () => Promise<unknown>,
 ): Promise<unknown> {
+  if (targetBot !== REMOTE_DISPATCH_TARGET_BOT) throw new HubError("bot_message_operation_forbidden", 403);
   if (routePath === "/api/bot-messages/dispatch/probe") {
     const authorized = await ctx.store.db.serial(() => isRemoteDispatchAuthorizedInTransaction(ctx, sourceKey, source.botId, targetBot));
     if (!authorized) {
@@ -338,14 +391,18 @@ export async function handleRemoteDispatchRequest(
 
   if (routePath === "/api/bot-messages/dispatch/run") {
     const input = remoteDispatchRunRequestSchema.parse(data);
+    if (isBotControl(input.request)) throw new HubError("bot_message_control_forbidden", 400);
+    if ((input.model || input.effort) && getEngineEffortValidationError(input.engine, input.effort || undefined, input.model || undefined)) {
+      throw new HubError("dispatch_effort_incompatible", 409);
+    }
+    const matchesExisting = (row: RemoteTicketRow) =>
+      row.title === input.title && row.request === input.request && row.engine === input.engine && row.model === input.model && row.effort === input.effort;
     const existing = await ctx.store.db.serial(() => ctx.store.db.get<RemoteTicketRow>(
       "SELECT * FROM remote_dispatch_tickets WHERE source_key=? AND source_bot_id=? AND remote_request_id=?",
       [sourceKey, source.botId, input.remoteRequestId],
     ));
     if (existing) {
-      if (existing.title !== input.title || existing.request !== input.request || existing.engine !== input.engine) {
-        throw new HubError("idempotency_conflict", 409);
-      }
+      if (!matchesExisting(existing)) throw new HubError("idempotency_conflict", 409);
       const bot = await ctx.store.db.serial(() => ctx.store.db.get<{ name: string }>("SELECT name FROM bots WHERE id=?", [existing.bot_id]));
       return remoteDispatchRunResponseSchema.parse({
         remoteTicketId: existing.id,
@@ -362,15 +419,11 @@ export async function handleRemoteDispatchRequest(
 
     const remoteTicketId = newId("rtk");
     let workerId: string;
-    if (targetBot !== REMOTE_DISPATCH_TARGET_BOT) {
-      const bot = await ctx.store.db.serial(() => ctx.store.db.get<{ id: string }>("SELECT id FROM bots WHERE id=? AND deleted_at IS NULL", [targetBot]));
-      if (!bot) throw new HubError("bot_deleted", 410);
-      workerId = bot.id;
-    } else if (ctx.workers?.remoteDispatchWorker) {
+    if (ctx.workers?.remoteDispatchWorker) {
       workerId = await ctx.workers.remoteDispatchWorker(source.hostId, input.engine);
     } else {
       const fallback = await ctx.store.db.serial(() => ctx.store.db.get<{ id: string }>(
-        "SELECT id FROM bots WHERE engine=? AND deleted_at IS NULL ORDER BY CASE WHEN role='worker' THEN 0 ELSE 1 END, id LIMIT 1",
+        "SELECT id FROM bots WHERE engine=? AND role='worker' AND deleted_at IS NULL ORDER BY id LIMIT 1",
         [input.engine],
       ));
       if (!fallback) throw new HubError("dispatch_worker_unavailable", 409);
@@ -392,6 +445,7 @@ export async function handleRemoteDispatchRequest(
         [sourceKey, source.botId, input.remoteRequestId],
       );
       if (dup) {
+        if (!matchesExisting(dup)) throw new HubError("idempotency_conflict", 409);
         const bot = await ctx.store.db.get<{ name: string }>("SELECT name FROM bots WHERE id=?", [dup.bot_id]);
         return remoteDispatchRunResponseSchema.parse({
           remoteTicketId: dup.id,
@@ -406,13 +460,20 @@ export async function handleRemoteDispatchRequest(
         });
       }
       const bot = await ctx.store.db.get<{ id: string; name: string; role: string }>("SELECT id,name,role FROM bots WHERE id=? AND deleted_at IS NULL", [workerId]);
-      if (!bot) throw new HubError("dispatch_worker_unavailable", 409);
-      const isWorker = bot.role === "worker";
-      const conv = await ctx.store.createConversationInTransaction("owner", [bot.id], input.title.slice(0, 256), `rtk_${remoteTicketId}`, isWorker ? { dispatchWorker: true } : {});
-      if (isWorker) {
-        const marker = { id: remoteTicketId, dispatcherBotId: source.botId, ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}), ...(workspace ? { workspace } : {}) };
-        await ctx.store.db.run("UPDATE conversations SET hidden=1,ticket_json=? WHERE id=?", [JSON.stringify(marker), conv.id]);
-      }
+      if (!bot || bot.role !== "worker") throw new HubError("dispatch_worker_unavailable", 409);
+      if (ctx.workerCapable?.(bot.id) === false) throw new HubError("bot_message_worker_update_required", 409);
+      const now = Date.now();
+      const rateKey = dispatchRateKey(sourceKey, source.botId);
+      const rateRow = await ctx.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [rateKey]);
+      const times = (rateRow ? JSON.parse(rateRow.value) as number[] : []).filter(t => t > now - REMOTE_DISPATCH_RATE_WINDOW_MS);
+      if (times.length >= REMOTE_DISPATCH_RATE_LIMIT) throw new HubError("bot_message_rate_limit", 429);
+      await ctx.store.db.run(
+        "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [rateKey, JSON.stringify([...times, now])],
+      );
+      const conv = await ctx.store.createConversationInTransaction("owner", [bot.id], input.title.slice(0, 256), `rtk_${remoteTicketId}`, { dispatchWorker: true });
+      const marker = { id: remoteTicketId, dispatcherBotId: source.botId, ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}), ...(workspace ? { workspace } : {}) };
+      await ctx.store.db.run("UPDATE conversations SET hidden=1,ticket_json=? WHERE id=?", [JSON.stringify(marker), conv.id]);
       createdConversation = await ctx.store.conversationInTransaction(conv.id);
       const sent = await ctx.store.sendMessageInTransaction("owner", {
         conversationId: conv.id,
@@ -431,11 +492,10 @@ export async function handleRemoteDispatchRequest(
         },
       });
       if (sent.event) events.push(sent.event);
-      const now = Date.now();
       await ctx.store.db.run(
-        `INSERT INTO remote_dispatch_tickets(id,source_key,source_host_id,source_bot_id,remote_request_id,title,request,engine,model,effort,bot_id,conversation_id,input_message_id,status,created_at,updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [remoteTicketId, sourceKey, source.hostId, source.botId, input.remoteRequestId, input.title, input.request, input.engine, input.model, input.effort, bot.id, conv.id, sent.message.id, "working", now, now],
+        `INSERT INTO remote_dispatch_tickets(id,source_key,source_host_id,source_bot_id,remote_request_id,title,request,engine,model,effort,bot_id,conversation_id,input_message_id,status,stop_requested,created_at,updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [remoteTicketId, sourceKey, source.hostId, source.botId, input.remoteRequestId, input.title, input.request, input.engine, input.model, input.effort, bot.id, conv.id, sent.message.id, "working", null, now, now],
       );
       await ctx.store.db.run(
         "INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)",
@@ -453,7 +513,7 @@ export async function handleRemoteDispatchRequest(
         status: "working",
       });
     });
-    if (createdConversation && !createdConversation.hidden) ctx.conversationCreated("owner", createdConversation);
+    if (createdConversation) ctx.conversationCreated("owner", createdConversation);
     ctx.store.emitCommitted(events);
     return response;
   }
@@ -479,19 +539,27 @@ export async function handleRemoteDispatchRequest(
       if (!await isRemoteDispatchAuthorizedInTransaction(ctx, sourceKey, source.botId, targetBot)) throw new HubError("bot_message_not_authorized", 403);
       const row = await ctx.store.db.get<RemoteTicketRow>("SELECT * FROM remote_dispatch_tickets WHERE id=?", [input.remoteTicketId]);
       if (!row || row.source_key !== sourceKey || row.source_bot_id !== source.botId) throw new HubError("ticket_not_found", 404);
+      const before = await inspectRemoteTicketState(ctx, row);
+      if (before.status === "completed" || before.status === "failed" || before.status === "cancelled") {
+        if (before.status !== row.status) {
+          await ctx.store.db.run("UPDATE remote_dispatch_tickets SET status=?,updated_at=? WHERE id=?", [before.status, Date.now(), row.id]);
+        }
+        return { row, needRpc: false };
+      }
       const cancelled = await ctx.store.db.run(
         "UPDATE deliveries SET status='cancelled' WHERE message_id=? AND bot_id=? AND dispatched=0 AND status='pending'",
         [row.input_message_id, row.bot_id],
       );
+      const intent = row.stop_requested === "cancel" ? "cancel" : input.action;
       if (cancelled.changes) {
         events.push(await ctx.store.queueEventInTransaction(row.conversation_id, row.bot_id));
-        await ctx.store.db.run("UPDATE remote_dispatch_tickets SET status='cancelled',updated_at=? WHERE id=?", [Date.now(), row.id]);
-        return { row, needRpc: false, status: "cancelled" as const };
+        await ctx.store.db.run("UPDATE remote_dispatch_tickets SET status='cancelled',stop_requested=?,updated_at=? WHERE id=?", [intent, Date.now(), row.id]);
+        return { row, needRpc: false };
       }
-      if (input.action === "cancel") {
-        await ctx.store.db.run("UPDATE remote_dispatch_tickets SET status='cancelled',updated_at=? WHERE id=?", [Date.now(), row.id]);
-      }
-      return { row, needRpc: true, status: (await inspectRemoteTicketState(ctx, row)).status };
+      // Record durable stop intent without marking the running turn cancelled
+      // before worker execution settles; prompt-queue withholds reconnect replay.
+      await ctx.store.db.run("UPDATE remote_dispatch_tickets SET stop_requested=?,updated_at=? WHERE id=?", [intent, Date.now(), row.id]);
+      return { row, needRpc: true };
     });
     ctx.store.emitCommitted(events);
     if (prep.needRpc) {
@@ -499,7 +567,11 @@ export async function handleRemoteDispatchRequest(
     }
     const latest = await ctx.store.db.serial(async () => {
       const row = (await ctx.store.db.get<RemoteTicketRow>("SELECT * FROM remote_dispatch_tickets WHERE id=?", [input.remoteTicketId]))!;
-      return inspectRemoteTicketState(ctx, row);
+      const state = await inspectRemoteTicketState(ctx, row);
+      if (state.status !== row.status && ["completed", "failed", "cancelled"].includes(state.status)) {
+        await ctx.store.db.run("UPDATE remote_dispatch_tickets SET status=?,updated_at=? WHERE id=?", [state.status, Date.now(), row.id]);
+      }
+      return state;
     });
     return remoteDispatchStopResponseSchema.parse({
       remoteTicketId: input.remoteTicketId,

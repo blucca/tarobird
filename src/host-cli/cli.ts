@@ -146,7 +146,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   tickets capabilities --engine ENGINE [--match TEXT] [--offset N] [--bot DISPATCHER]
     按需读取用户级技能/MCP元数据，每页40项；不创建执行者、不验证运行权限或质量。
   tickets create --title T (--text T | --text-file F) [--context-message ID]
-  tickets plan (--text T | --text-file F) [--engine ENGINE] [--total N] [--per-node M] [--create] [--dispatch] [--context-message ID]
+  tickets plan (--text T | --text-file F) [--engine ENGINE] [--host HOST[,HOST]] [--total N] [--per-node M] [--force] [--create] [--dispatch] [--context-message ID]
     自动将多任务拆分到多台在线且已授权主机，支持按每台数量上限或负载/配额均衡分配；带 --create 创建整批工单，带 --dispatch 立即并发派工。
   tickets dispatch TICKET --engine codex|claude|kimi|deepseek|antigravity [--host HOST_ID|auto] [--model M] [--effort E] [--assist 0..2] [--text T | --text-file F] [--force] [--context-message ID]
     --assist 为本次派工链的协助次数；auto 默认 1，ask 默认 0。ask 模式需在计划中取得主人同意；限定单一模型时请设 0。--host 可指定跨主机节点或 auto。
@@ -162,7 +162,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   tickets allow-remote --from HOST_ID --bot REMOTE_BOT_ID | revoke-remote --from HOST_ID --bot REMOTE_BOT_ID  在本机授权或撤销远端幕僚长跨主机派工
   tickets remove TICKET                     移除已结束工单，保留执行对话和文件
   tickets engine-reset ENGINE                 清除某个引擎的冷却或“需要登录”标记
-  tickets settings [--bot DISPATCHER] [--dispatch-mode ask|auto] [--max-concurrent N] [--allow ENGINE,ENGINE|all]
+  tickets settings [--bot DISPATCHER] [--dispatch-mode ask|auto] [--max-concurrent N] [--allow ENGINE,ENGINE|all] [--host HOST_ID --allowed on|off]
   messages list CONVERSATION [--before ID]  查看自己的消息，每页 50 条
   messages delete CONVERSATION --ids ID,ID --yes  删除自己的记录并同步自己的设备
   messages clear CONVERSATION [--through ID --yes | --yes]   清理自己的 App 记录，保留模型会话；不加 --yes 仅预览

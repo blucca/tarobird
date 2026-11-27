@@ -45,7 +45,11 @@ function engineNotice(health: EngineHealth, locale: string) {
  * conversations stay hidden and open from here. */
 export function DispatchTickets({ connection, botId, active, online, open }: { connection: HubConnection; botId: string; active: boolean; online: boolean; open: (conversationId: string) => void }) {
   const locale = useLocale() === "en" ? "en" : "zh-CN";
-  const ownHostId = connection.identity.hubPublicKey ? botMessageHostId(connection.identity.hubPublicKey) : undefined;
+  const ownHostId = (() => {
+    const key = connection.identity?.hubPublicKey;
+    if (!key) return undefined;
+    try { return botMessageHostId(key); } catch { return undefined; }
+  })();
   const [list, setList] = useState<TicketOverviewList>(), [expanded, setExpanded] = useState(false);
   const [busy, setBusy] = useState(""), [confirming, setConfirming] = useState<{ id: string; action: "cancel" | "remove" }>(), [confirmBulkCancel, setConfirmBulkCancel] = useState(false), [error, setError] = useState(""), [refresh, setRefresh] = useState(0);
   const [detailId, setDetailId] = useState(""), [details, setDetails] = useState<Record<string, DispatchTicket>>({});
@@ -59,13 +63,14 @@ export function DispatchTickets({ connection, botId, active, online, open }: { c
   useEffect(() => {
     if (!active || !online) return;
     const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined, reading = false;
+    const query = expanded ? "summary=1&capabilities=1&excerpts=1" : "summary=1&capabilities=1";
     const load = async () => {
       clearTimeout(timer);
       // A hidden window skips reads until it is visible again.
       if (reading || controller.signal.aborted || document.visibilityState === "hidden") return;
       reading = true; const read = beginTicketRead(connection, botId), local = ++reads.current, request = queueRequest([controller.signal], 8000);
       try {
-        const value = ticketOverviewListSchema.parse(await request.wait(connection.http(`/api/bots/${encodeURIComponent(botId)}/tickets?summary=1&capabilities=1&excerpts=1`, { signal: request.signal })));
+        const value = ticketOverviewListSchema.parse(await request.wait(connection.http(`/api/bots/${encodeURIComponent(botId)}/tickets?${query}`, { signal: request.signal })));
         if (!controller.signal.aborted && local === reads.current) {
           // Only a read started after the action ended can show its effect.
           for (const [key, entry] of pending.current) {
@@ -80,7 +85,7 @@ export function DispatchTickets({ connection, botId, active, online, open }: { c
     const visible = () => { if (document.visibilityState === "visible") void load(); };
     document.addEventListener("visibilitychange", visible);
     void load(); return () => { controller.abort(); clearTimeout(timer); document.removeEventListener("visibilitychange", visible); };
-  }, [connection, botId, active, online, refresh]);
+  }, [connection, botId, active, online, expanded, refresh]);
   const act = async (ticket: TicketOverview, action: TicketAction) => {
     if (busy) return;
     // A retry after an unconfirmed result repeats the same request.
@@ -136,15 +141,26 @@ export function DispatchTickets({ connection, botId, active, online, open }: { c
       if (alive.current) setError(actionError(cause));
     } finally { request.dispose(); reads.current++; if (alive.current) { setBusy(""); setRefresh(value => value + 1); } }
   };
+  const fetchDetail = async (ticketId: string) => {
+    try {
+      const full = dispatchTicketSchema.parse(await connection.http(`/api/tickets/${encodeURIComponent(ticketId)}`));
+      if (alive.current) setDetails(prev => ({ ...prev, [ticketId]: full }));
+    } catch { /* Excerpt stays visible even if detail fetch fails. */ }
+  };
   const toggleDetail = async (ticket: TicketOverview) => {
     if (detailId === ticket.id) { setDetailId(""); return; }
     setDetailId(ticket.id);
-    if (details[ticket.id]) return;
-    try {
-      const full = dispatchTicketSchema.parse(await connection.http(`/api/tickets/${encodeURIComponent(ticket.id)}`));
-      if (alive.current) setDetails(prev => ({ ...prev, [ticket.id]: full }));
-    } catch { /* Excerpt stays visible even if detail fetch fails. */ }
+    const cached = details[ticket.id];
+    if (cached && cached.updatedAt >= ticket.updatedAt) return;
+    await fetchDetail(ticket.id);
   };
+  const openDetailUpdatedAt = detailId ? list?.tickets.find(item => item.id === detailId)?.updatedAt : undefined;
+  const cachedDetailUpdatedAt = detailId ? details[detailId]?.updatedAt : undefined;
+  useEffect(() => {
+    if (!detailId || !online || openDetailUpdatedAt === undefined) return;
+    if (cachedDetailUpdatedAt !== undefined && cachedDetailUpdatedAt >= openDetailUpdatedAt) return;
+    void fetchDetail(detailId);
+  }, [detailId, online, openDetailUpdatedAt, cachedDetailUpdatedAt]);
   const tickets = [...list?.tickets ?? []].sort((a, b) => Number(isOpen(b)) - Number(isOpen(a)) || b.updatedAt - a.updatedAt);
   const engines = (list?.engines ?? []).filter(health => health.state !== "ok");
   if (!tickets.length && !engines.length) return null;
@@ -165,7 +181,7 @@ export function DispatchTickets({ connection, botId, active, online, open }: { c
     }
     return [...groups.values()];
   })() : undefined;
-  const crossHostSupported = !!connection.state.crossHostDispatchAvailable;
+  const crossHostSupported = !!connection.state?.crossHostDispatchAvailable;
   const renderTicket = (ticket: TicketOverview) => {
     const attempt = ticket.attempts.at(-1), stopping = !!attempt?.stopRequested && !attempt.endedAt, open_ = isOpen(ticket), disabled = !online || !!busy;
     const ticketHostId = ticket.hostId ?? attempt?.hostId;

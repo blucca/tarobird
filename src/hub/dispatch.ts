@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { blocksText, type Block, type Conversation, type HubEvent, type Message } from "../client-protocol/index.js";
+import { blocksText, idSchema, type Block, type Conversation, type HubEvent, type Message } from "../client-protocol/index.js";
 import { anyRun, isRunActive, nativeRun, runSummarySchema } from "../client-protocol/run.js";
 import {
   DISPATCH_ENGINES, OPEN_TICKET_STATUSES, REMOTE_DISPATCH_TARGET_BOT, conversationTicketSchema, createTicketSchema, dispatchNodesResponseSchema, dispatchSplitPlanRequestSchema, dispatchSplitPlanResponseSchema, dispatchTicketRequestSchema, dispatchTicketSchema, dispatcherSettingsSchema, dispatcherSettingsUpdateSchema, dispatchCapabilitiesRequestSchema, dispatchCapabilitiesSchema,
@@ -26,11 +26,35 @@ const COOLDOWN_MS: Record<string, number> = { "engine-quota": 60 * 60_000, "engi
 const ENGINE_LABELS: Record<DispatchEngine, string> = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity" };
 const STATUS_LABELS: Record<TicketStatus, string> = { queued: "排队", working: "进行中", needs_answer: "待你回答", needs_review: "待你验收", blocked: "卡住", done: "完成", cancelled: "已取消" };
 const SWEEP_MS = 2_000;
+const AUTO_ADVANCE_PROBE_BACKOFF_MS = 10_000;
 const RESULT_CHARS = 4000;
 /** Assistance readback: helper reply tails for the newest rows only. */
 const ASSIST_RESULT_ROWS = 8, ASSIST_RESULT_CHARS = 800;
 
-type TicketRow = { id: string; dispatcher_bot_id: string; conversation_id: string; request_id: string; title: string; request: string; status: string; paused: number; attempts_json: string; result: string | null; note: string | null; batch_id: string | null; batch_index: number | null; batch_total: number | null; host_id: string | null; host_name: string | null; artifacts_json: string | null; created_at: number; updated_at: number };
+const plannedBatchMetaSchema = z.object({
+  engine: dispatchEngineSchema,
+  model: z.string().max(512).default(""),
+  effort: z.enum(["", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).default(""),
+  force: z.boolean().default(false),
+  hostIds: z.array(idSchema).min(1).max(32).optional(),
+  reason: z.string().max(128).optional(),
+}).strict();
+type PlannedBatchMeta = z.infer<typeof plannedBatchMetaSchema>;
+function parsePlannedBatchMeta(raw: string | null | undefined): PlannedBatchMeta | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = plannedBatchMetaSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : undefined;
+  } catch { return undefined; }
+}
+function derivedRequestId(base: string, suffix: string): string {
+  const plain = `${base}${suffix}`;
+  if (plain.length <= 128 && /^[A-Za-z0-9_-]+$/.test(plain)) return plain;
+  const cleanSuffix = suffix.replace(/[^A-Za-z0-9_-]/g, "_").slice(-32);
+  return `req_${createHash("sha256").update(`${base}:${suffix}`).digest("hex").slice(0, 32)}${cleanSuffix}`.slice(0, 128);
+}
+
+type TicketRow = { id: string; dispatcher_bot_id: string; conversation_id: string; request_id: string; title: string; request: string; status: string; paused: number; attempts_json: string; result: string | null; note: string | null; batch_id: string | null; batch_index: number | null; batch_total: number | null; host_id: string | null; host_name: string | null; artifacts_json: string | null; plan_json?: string | null; created_at: number; updated_at: number };
 type BotRow = { id: string; name: string; engine: string; model: string; effort: string; online: number; role: string };
 type Source = { hostId: string; hostName: string };
 /** Committed together with a ledger change: a new hidden conversation and queued inputs/notices. */
@@ -45,6 +69,7 @@ export interface DispatchOptions {
   source: () => Promise<{ hostId: string; hostName: string }>;
   conversationCreated: (userId: string, conversation: Conversation) => void;
   stop: (botId: string, conversationId: string, userId: string, messageId: string) => Promise<unknown>;
+  copyAttachment?: (attachmentId: string, targetConversationId: string, ownerId: string) => Promise<string>;
   changed?: (dispatcherBotId: string) => void;
 }
 
@@ -105,10 +130,16 @@ export class HubDispatch {
   private readonly capabilityReads = new Map<DispatchEngine, Promise<BotCapabilities>>();
   private readonly startingAssists = new Map<string, Promise<void>>();
   private readonly remoteMissedPolls = new Map<string, number>();
+  private readonly pendingRemoteSlots = new Map<string, number>();
+  private readonly autoAdvanceNextProbe = new Map<string, number>();
   private generation = 0;
   private sweepCursor = "";
   constructor(readonly store: HubStore, readonly options: DispatchOptions) {}
   private get db() { return this.store.db; }
+  private markAutoAdvanceDirty(dispatcherBotId?: string): void {
+    if (dispatcherBotId) this.autoAdvanceNextProbe.delete(dispatcherBotId);
+    else this.autoAdvanceNextProbe.clear();
+  }
   start(): void {
     if (this.timer) return;
     this.timer = setInterval(() => { void this.sweep().catch(() => undefined); }, SWEEP_MS);
@@ -279,6 +310,7 @@ export class HubDispatch {
       if (current.revision !== input.expectedRevision) throw new HubError("dispatcher_settings_conflict", 409);
       return { settings: input.settings, revision: await saveDispatcherSettingsInTransaction(this.db, botId, input.settings) };
     });
+    this.markAutoAdvanceDirty(botId);
     this.options.changed?.(botId); return result;
   }
   list(actor: DispatchActor, dispatcherBotId: string, options: { open?: boolean } = {}): Promise<TicketList> {
@@ -479,64 +511,137 @@ export class HubDispatch {
   /** Plans (and optionally creates/dispatches) a multi-part or N-item task across eligible Hosts. */
   async plan(actor: DispatchActor, dispatcherBotId: string, raw: unknown): Promise<DispatchSplitPlanResponse> {
     const input = dispatchSplitPlanRequestSchema.parse(raw);
+    const shouldCreate = input.create || input.dispatch;
     const { settings } = await this.db.serial(async () => {
-      await this.authorize(actor, dispatcherBotId, input.create || input.dispatch);
+      await this.authorize(actor, dispatcherBotId, shouldCreate);
       return this.settingsRow(dispatcherBotId);
     });
     if (input.dispatch && actor.kind === "bot" && settings.mode === "ask") {
       throw new HubError("dispatch_confirmation_required", 409);
     }
-    const priorPlan = input.create ? await this.db.serial(async () => {
-      const rows = await this.db.all<TicketRow>("SELECT * FROM dispatch_tickets WHERE dispatcher_bot_id=? AND batch_id=? ORDER BY batch_index,created_at", [dispatcherBotId, `batch_${createHash("sha256").update(`${dispatcherBotId}:${input.requestId}`).digest("hex").slice(0, 20)}`]);
-      return rows.length ? rows.map(r => this.ticket(r)) : undefined;
+    const batchId = `batch_${createHash("sha256").update(`${dispatcherBotId}:${input.requestId}`).digest("hex").slice(0, 20)}`;
+    const planReceiptKey = `plan_${batchId}`;
+    const planPayloadHash = createHash("sha256").update(JSON.stringify({
+      title: input.title,
+      request: input.request,
+      engine: input.engine,
+      model: input.model,
+      effort: input.effort,
+      totalItems: input.totalItems,
+      perNode: input.perNode,
+      items: input.items,
+      hostIds: input.hostIds,
+      force: input.force,
+    })).digest("hex");
+
+    const priorState = shouldCreate ? await this.db.serial(async () => {
+      const rows = await this.db.all<TicketRow>("SELECT * FROM dispatch_tickets WHERE dispatcher_bot_id=? AND batch_id=? ORDER BY batch_index,created_at", [dispatcherBotId, batchId]);
+      const receipt = await this.db.get<{ payload_hash: string; result_json: string }>("SELECT payload_hash,result_json FROM dispatch_requests WHERE actor_id=? AND request_id=?", [dispatcherBotId, planReceiptKey]);
+      return { rows, receipt };
     }) : undefined;
 
-    const batchId = `batch_${createHash("sha256").update(`${dispatcherBotId}:${input.requestId}`).digest("hex").slice(0, 20)}`;
-    if (priorPlan) {
-      return dispatchSplitPlanResponseSchema.parse({
-        batchId,
-        ...(input.totalItems ? { totalItems: input.totalItems } : {}),
-        ...(input.perNode ? { perNode: input.perNode } : {}),
-        mode: settings.mode,
-        requiresConfirmation: settings.mode === "ask",
-        batches: priorPlan.map((t, idx) => ({
+    if (priorState?.receipt && priorState.receipt.payload_hash !== planPayloadHash) {
+      throw new HubError("idempotency_conflict", 409);
+    }
+
+    if (priorState?.rows.length) {
+      const priorRows = priorState.rows;
+      const priorTickets = priorRows.map(r => this.ticket(r));
+      const priorMeta = priorRows.map(r => parsePlannedBatchMeta(r.plan_json));
+      const storedSummary = priorState.receipt
+        ? (() => { try { return JSON.parse(priorState.receipt!.result_json) as { totalItems?: number; perNode?: number }; } catch { return undefined; } })()
+        : undefined;
+      const priorBatches = priorTickets.map((t, idx) => {
+        const meta = priorMeta[idx];
+        return {
           batchIndex: t.batchIndex ?? idx,
-          batchTotal: t.batchTotal ?? priorPlan.length,
+          batchTotal: t.batchTotal ?? priorTickets.length,
           title: t.title,
           request: t.request,
           hostId: t.hostId ?? "local",
           hostName: t.hostName ?? "local",
-          engine: t.attempts[0]?.engine ?? input.engine ?? "codex",
-          model: t.attempts[0]?.model ?? input.model ?? "",
-          effort: t.attempts[0]?.effort ?? input.effort ?? "",
-          reason: t.note ?? "planned",
-        })),
+          engine: meta?.engine ?? t.attempts[0]?.engine ?? input.engine ?? "codex",
+          model: meta?.model ?? t.attempts[0]?.model ?? input.model ?? "",
+          effort: (meta?.effort ?? t.attempts[0]?.effort ?? input.effort ?? "") as TicketTarget["effort"],
+          reason: (meta?.reason ?? t.note ?? "planned").slice(0, 128),
+        };
+      });
+      let returnedTickets = priorTickets;
+      if (input.dispatch) {
+        const nodesSnapshot = await this.nodes(actor, dispatcherBotId);
+        const activeCounts = new Map<string, number>();
+        for (const node of nodesSnapshot.nodes) activeCounts.set(node.hostId, node.activeOnNode);
+        returnedTickets = await Promise.all(priorTickets.map(async (ticket, index) => {
+          if (ticket.status !== "queued" || ticket.paused || ticket.attempts.length > 0) return ticket;
+          const batch = priorBatches[index]!;
+          const meta = priorMeta[index];
+          const nodeCap = nodesSnapshot.nodes.find(n => n.hostId === batch.hostId)?.maxConcurrent ?? settings.maxConcurrent;
+          const used = activeCounts.get(batch.hostId) ?? 0;
+          if (used >= nodeCap) return ticket;
+          activeCounts.set(batch.hostId, used + 1);
+          try {
+            return await this.dispatch(actor, dispatcherBotId, {
+              requestId: derivedRequestId(input.requestId, `_go_${batch.batchIndex}`),
+              ticketId: ticket.id,
+              hostId: batch.hostId,
+              engine: batch.engine,
+              ...(batch.model ? { model: batch.model } : {}),
+              ...(batch.effort ? { effort: batch.effort } : {}),
+              ...(meta?.force || input.force ? { force: true } : {}),
+            });
+          } catch {
+            return await this.show(actor, ticket.id);
+          }
+        }));
+      }
+      return dispatchSplitPlanResponseSchema.parse({
+        batchId,
+        ...(storedSummary?.totalItems ?? input.totalItems ? { totalItems: storedSummary?.totalItems ?? input.totalItems } : {}),
+        ...(storedSummary?.perNode ?? input.perNode ? { perNode: storedSummary?.perNode ?? input.perNode } : {}),
+        mode: settings.mode,
+        requiresConfirmation: settings.mode === "ask",
+        batches: priorBatches,
         skippedNodes: [],
-        tickets: priorPlan,
+        tickets: returnedTickets,
       });
     }
 
     const nodesSnapshot = await this.nodes(actor, dispatcherBotId);
     const plan = planSplitBatches(input, nodesSnapshot.nodes, settings, batchId);
-    if (!input.create || !plan.batches.length) return plan;
+    if (!shouldCreate || !plan.batches.length) return plan;
 
     const createdTickets = await this.db.transaction(async () => {
       await this.authorize(actor, dispatcherBotId, true);
+      const existingReceipt = await this.db.get<{ payload_hash: string }>("SELECT payload_hash FROM dispatch_requests WHERE actor_id=? AND request_id=?", [dispatcherBotId, planReceiptKey]);
+      if (existingReceipt && existingReceipt.payload_hash !== planPayloadHash) throw new HubError("idempotency_conflict", 409);
       const home = await this.home(dispatcherBotId), now = Date.now(), tickets: DispatchTicket[] = [];
       for (const batch of plan.batches) {
-        const reqId = `${input.requestId}_b${batch.batchIndex}`;
+        const reqId = derivedRequestId(input.requestId, `_b${batch.batchIndex}`);
         const old = await this.db.get<TicketRow>("SELECT * FROM dispatch_tickets WHERE dispatcher_bot_id=? AND request_id=?", [dispatcherBotId, reqId]);
         if (old) { tickets.push(this.ticket(old)); continue; }
         const id = newId("tk");
+        const planMeta: PlannedBatchMeta = {
+          engine: batch.engine,
+          model: batch.model,
+          effort: batch.effort,
+          force: input.force,
+          ...(input.hostIds?.length ? { hostIds: input.hostIds } : {}),
+          reason: batch.reason.slice(0, 128),
+        };
         await this.db.run(
-          "INSERT INTO dispatch_tickets(id,dispatcher_bot_id,conversation_id,request_id,title,request,status,note,batch_id,batch_index,batch_total,host_id,host_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-          [id, dispatcherBotId, home.id, reqId, batch.title, batch.request, "queued", `${batch.engine} · ${batch.reason}`, batchId, batch.batchIndex, batch.batchTotal, batch.hostId, batch.hostName, now, now],
+          "INSERT INTO dispatch_tickets(id,dispatcher_bot_id,conversation_id,request_id,title,request,status,note,batch_id,batch_index,batch_total,host_id,host_name,plan_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          [id, dispatcherBotId, home.id, reqId, batch.title, batch.request, "queued", `${batch.engine} · ${batch.reason}`, batchId, batch.batchIndex, batch.batchTotal, batch.hostId, batch.hostName, JSON.stringify(planMeta), now, now],
         );
         tickets.push(this.ticket(await this.requireTicket(id)));
       }
+      await this.db.run(
+        "INSERT OR IGNORE INTO dispatch_requests VALUES(?,?,?,?)",
+        [dispatcherBotId, planReceiptKey, planPayloadHash, JSON.stringify({ batchId, ...(plan.totalItems ? { totalItems: plan.totalItems } : {}), ...(plan.perNode ? { perNode: plan.perNode } : {}) })],
+      );
       return tickets;
     });
     await this.store.audit("dispatch.batch_planned", actor.kind === "owner" ? actor.userId : actor.botId, { dispatcherBotId, batchId, count: createdTickets.length });
+    this.markAutoAdvanceDirty(dispatcherBotId);
     this.options.changed?.(dispatcherBotId);
 
     if (!input.dispatch) return { ...plan, tickets: createdTickets };
@@ -552,7 +657,7 @@ export class HubDispatch {
       activeCounts.set(batch.hostId, used + 1);
       try {
         return await this.dispatch(actor, dispatcherBotId, {
-          requestId: `${input.requestId}_go_${batch.batchIndex}`,
+          requestId: derivedRequestId(input.requestId, `_go_${batch.batchIndex}`),
           ticketId: ticket.id,
           hostId: batch.hostId,
           engine: batch.engine,
@@ -616,76 +721,111 @@ export class HubDispatch {
       const peers = await this.remote.networkPeers();
       const peer = peers.find(p => `hub_${createHash("sha256").update(Buffer.from(p.publicKey, "base64")).digest("hex")}` === remoteHostId);
       if (!peer) throw new HubError("dispatch_host_not_found", 404);
-      const nodeCfg = allowed.nodes?.find(n => n.hostId === remoteHostId);
-      const nodeAllowedEngines = nodeCfg?.allowedEngines ?? allowed.allowedEngines;
-      if (nodeAllowedEngines && !nodeAllowedEngines.includes(input.engine)) throw new HubError("dispatch_engine_not_allowed", 409);
-      const nodeMax = nodeCfg?.maxConcurrent ?? allowed.maxConcurrent;
-
+      const slotKey = `${dispatcherBotId}:${remoteHostId}`;
+      let slotReserved = false;
       const prep = await this.db.serial(async () => {
         await this.authorize(actor, dispatcherBotId, true);
+        const { settings: latestSettings } = await this.settingsRow(dispatcherBotId);
+        const nodeCfg = latestSettings.nodes?.find(n => n.hostId === remoteHostId);
+        if (!nodeCfg?.enabled) throw new HubError("dispatch_node_disabled", 409);
+        const nodeAllowedEngines = nodeCfg.allowedEngines ?? latestSettings.allowedEngines;
+        if (nodeAllowedEngines && !nodeAllowedEngines.includes(input.engine)) throw new HubError("dispatch_engine_not_allowed", 409);
+        const nodeMax = nodeCfg.maxConcurrent ?? latestSettings.maxConcurrent;
         const dispatcher = await this.dispatcher(dispatcherBotId);
         const current = this.ticket(await this.requireTicket(input.ticketId, dispatcherBotId));
         if (current.status === "done" || current.status === "cancelled") throw new HubError("ticket_closed", 409);
         if (current.paused) throw new HubError("ticket_paused", 409);
         if (current.status === "working") throw new HubError("ticket_already_working", 409);
         const workingOnNode = (await this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM dispatch_tickets WHERE dispatcher_bot_id=? AND status='working' AND host_id=?", [dispatcherBotId, remoteHostId]))!.n;
-        if (workingOnNode >= nodeMax) throw new HubError("dispatch_concurrency_limit", 429);
+        const pendingOnNode = this.pendingRemoteSlots.get(slotKey) ?? 0;
+        if (workingOnNode + pendingOnNode >= nodeMax) throw new HubError("dispatch_concurrency_limit", 429);
+        this.pendingRemoteSlots.set(slotKey, pendingOnNode + 1);
+        slotReserved = true;
         return { dispatcher, current };
       });
 
-      const remoteRequest = remoteDispatchRunRequestSchema.parse({
-        remoteRequestId: `${input.ticketId}_${input.requestId}`.slice(0, 128),
-        title: prep.current.title,
-        request: input.text ?? prep.current.request,
-        engine: input.engine,
-        model: input.model ?? "",
-        effort: input.effort ?? "",
-        ...(input.force ? { force: true } : {}),
-      });
-      const remoteReply = remoteDispatchRunResponseSchema.parse(await this.remote.callPeer(
-        peer,
-        { id: prep.dispatcher.id, name: prep.dispatcher.name },
-        "/api/bot-messages/dispatch/run",
-        remoteRequest,
-        remoteRequest.remoteRequestId,
-      ));
-
-      const ticket = await this.db.transaction(async () => {
-        await this.authorize(actor, dispatcherBotId, true);
-        return this.idempotent(actor.kind === "owner" ? actor.userId : actor.botId, input.requestId, input, async () => {
-          const current = this.ticket(await this.requireTicket(input.ticketId, dispatcherBotId));
-          if (current.status === "done" || current.status === "cancelled") throw new HubError("ticket_closed", 409);
-          if (current.paused) throw new HubError("ticket_paused", 409);
-          if (current.status === "working") throw new HubError("ticket_already_working", 409);
-          const attempt: TicketAttempt = {
-            id: newId("ta"),
-            botId: remoteReply.botId,
-            engine: input.engine,
-            model: input.model ?? "",
-            effort: (input.effort ?? "") as TicketTarget["effort"],
-            conversationId: remoteReply.conversationId,
-            inputMessageId: remoteReply.messageId,
-            hostId: remoteHostId,
-            hostName: peer.name,
-            remoteTicketId: remoteReply.remoteTicketId,
-            remoteConversationId: remoteReply.conversationId,
-            remoteMessageId: remoteReply.messageId,
-            remoteBotName: remoteReply.botName,
-            startedAt: Date.now(),
-          };
-          const next: DispatchTicket = {
-            ...current,
-            status: "working",
-            hostId: remoteHostId,
-            hostName: peer.name,
-            ...(selectionNote ? { note: selectionNote } : {}),
-            attempts: [...current.attempts, attempt].slice(-32),
-            updatedAt: Date.now(),
-          };
-          await this.save(next);
-          return next;
+      let ticket: DispatchTicket;
+      try {
+        const remoteRequest = remoteDispatchRunRequestSchema.parse({
+          remoteRequestId: derivedRequestId(input.ticketId, `_${input.requestId}`),
+          title: prep.current.title,
+          request: input.text ?? prep.current.request,
+          engine: input.engine,
+          model: input.model ?? "",
+          effort: input.effort ?? "",
+          ...(input.force ? { force: true } : {}),
         });
-      });
+        const remoteReply = remoteDispatchRunResponseSchema.parse(await this.remote.callPeer(
+          peer,
+          { id: prep.dispatcher.id, name: prep.dispatcher.name },
+          "/api/bot-messages/dispatch/run",
+          remoteRequest,
+          remoteRequest.remoteRequestId,
+        ));
+
+        try {
+          ticket = await this.db.transaction(async () => {
+            await this.authorize(actor, dispatcherBotId, true);
+            return this.idempotent(actor.kind === "owner" ? actor.userId : actor.botId, input.requestId, input, async () => {
+              const { settings: latestSettings } = await this.settingsRow(dispatcherBotId);
+              const effNodeCfg = latestSettings.nodes?.find(n => n.hostId === remoteHostId);
+              if (!effNodeCfg?.enabled) throw new HubError("dispatch_node_disabled", 409);
+              const effAllowed = effNodeCfg.allowedEngines ?? latestSettings.allowedEngines;
+              if (effAllowed && !effAllowed.includes(input.engine)) throw new HubError("dispatch_engine_not_allowed", 409);
+              const effMax = effNodeCfg.maxConcurrent ?? latestSettings.maxConcurrent;
+              const current = this.ticket(await this.requireTicket(input.ticketId, dispatcherBotId));
+              if (current.status === "done" || current.status === "cancelled") throw new HubError("ticket_closed", 409);
+              if (current.paused) throw new HubError("ticket_paused", 409);
+              if (current.status === "working") throw new HubError("ticket_already_working", 409);
+              const workingOnNode = (await this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM dispatch_tickets WHERE dispatcher_bot_id=? AND status='working' AND host_id=?", [dispatcherBotId, remoteHostId]))!.n;
+              if (workingOnNode >= effMax) throw new HubError("dispatch_concurrency_limit", 429);
+              const attempt: TicketAttempt = {
+                id: newId("ta"),
+                botId: remoteReply.botId,
+                engine: input.engine,
+                model: input.model ?? "",
+                effort: (input.effort ?? "") as TicketTarget["effort"],
+                conversationId: remoteReply.conversationId,
+                inputMessageId: remoteReply.messageId,
+                hostId: remoteHostId,
+                hostName: peer.name,
+                remoteTicketId: remoteReply.remoteTicketId,
+                remoteConversationId: remoteReply.conversationId,
+                remoteMessageId: remoteReply.messageId,
+                remoteBotName: remoteReply.botName,
+                startedAt: Date.now(),
+              };
+              const next: DispatchTicket = {
+                ...current,
+                status: "working",
+                hostId: remoteHostId,
+                hostName: peer.name,
+                ...(selectionNote ? { note: selectionNote } : {}),
+                attempts: [...current.attempts, attempt].slice(-32),
+                updatedAt: Date.now(),
+              };
+              await this.save(next);
+              return next;
+            });
+          });
+        } catch (error) {
+          // Local commit failed after the remote Host accepted the run: cancel the orphan turn.
+          await this.remote.callPeer(
+            peer,
+            { id: prep.dispatcher.id, name: prep.dispatcher.name },
+            "/api/bot-messages/dispatch/stop",
+            { remoteTicketId: remoteReply.remoteTicketId, action: "cancel" },
+            derivedRequestId("abort_", remoteReply.remoteTicketId),
+          ).catch(() => undefined);
+          throw error;
+        }
+      } finally {
+        if (slotReserved) {
+          const left = (this.pendingRemoteSlots.get(slotKey) ?? 1) - 1;
+          if (left <= 0) this.pendingRemoteSlots.delete(slotKey);
+          else this.pendingRemoteSlots.set(slotKey, left);
+        }
+      }
       await this.store.audit("dispatch.remote_ticket_dispatched", actor.kind === "owner" ? actor.userId : actor.botId, { ticketId: ticket.id, hostId: remoteHostId, engine: input.engine });
       this.options.changed?.(dispatcherBotId);
       return ticket;
@@ -693,6 +833,7 @@ export class HubDispatch {
 
     // Local Host dispatch path (backward compatible with single-host Superagent).
     const localNodeCfg = allowed.nodes?.find(n => n.hostId === source.hostId);
+    if (localNodeCfg?.enabled === false) throw new HubError("dispatch_node_disabled", 409);
     const localAllowedEngines = localNodeCfg?.allowedEngines ?? allowed.allowedEngines;
     const localMaxConcurrent = localNodeCfg?.maxConcurrent ?? allowed.maxConcurrent;
     if (localAllowedEngines && !localAllowedEngines.includes(input.engine)) throw new HubError("dispatch_engine_not_allowed", 409);
@@ -715,6 +856,7 @@ export class HubDispatch {
         if (current.status === "working") throw new HubError("ticket_already_working", 409);
         const { settings } = await this.settingsRow(dispatcherBotId), engine = input.engine;
         const effNodeCfg = settings.nodes?.find(n => n.hostId === source.hostId);
+        if (effNodeCfg?.enabled === false) throw new HubError("dispatch_node_disabled", 409);
         const effAllowed = effNodeCfg?.allowedEngines ?? settings.allowedEngines;
         const effMax = effNodeCfg?.maxConcurrent ?? settings.maxConcurrent;
         if (effAllowed && !effAllowed.includes(engine)) throw new HubError("dispatch_engine_not_allowed", 409);
@@ -733,12 +875,15 @@ export class HubDispatch {
         const helpers = new Set((await this.db.all<{ child_attempt_id: string }>("SELECT child_attempt_id FROM dispatch_assists WHERE ticket_id=? AND child_attempt_id IS NOT NULL", [current.id])).map(row => row.child_attempt_id));
         const previous = [...current.attempts].reverse().find(attempt => !helpers.has(attempt.id) && (!attempt.hostId || attempt.hostId === source.hostId));
         const conversationId = previous && previous.botId === target.id && previous.model === model && previous.effort === effort ? previous.conversationId : undefined;
-        const attempt = await this.openAttempt(current, { botId: target.id, engine, model, effort: effort as TicketTarget["effort"] }, { conversationId, workspace, text: input.text ?? current.request,
+        const localHostMeta = targetHostId || current.hostId || current.attempts.some(a => a.hostId)
+          ? { hostId: source.hostId, hostName: source.hostName }
+          : {};
+        const attempt = await this.openAttempt(current, { botId: target.id, engine, model, effort: effort as TicketTarget["effort"], ...localHostMeta }, { conversationId, workspace, text: input.text ?? current.request,
           from: { botId: dispatcher.id, botName: dispatcher.name, hops: 1 } }, source, created);
         // Assistance allowed until the next dispatch; the parent's continuations keep it.
         await this.db.run("INSERT INTO dispatch_assist_windows VALUES(?,?,?) ON CONFLICT(ticket_id) DO UPDATE SET attempt_id=excluded.attempt_id,remaining=excluded.remaining", [current.id, attempt.id, input.assist ?? defaultAssistAllowance(settings.mode)]);
         const next: DispatchTicket = { ...current, status: "working",
-          ...(targetHostId ? { hostId: source.hostId, hostName: source.hostName } : {}),
+          ...localHostMeta,
           ...(selectionNote ? { note: selectionNote } : {}),
           attempts: [...current.attempts, attempt].slice(-32), updatedAt: Date.now() };
         await this.save(next); return next;
@@ -781,7 +926,12 @@ export class HubDispatch {
     });
     this.store.emitCommitted(events);
     void this.notifyStop(ticket);
-    this.options.changed?.(dispatcherBotId); return ticket;
+    this.markAutoAdvanceDirty(dispatcherBotId);
+    this.options.changed?.(dispatcherBotId);
+    if (ticket.batchId && (ticket.status === "done" || ticket.status === "cancelled" || ticket.status === "needs_review")) {
+      void this.maybePublishBatchSummary(ticket.batchId, await this.options.source()).catch(() => undefined);
+    }
+    return ticket;
   }
   /** Claim and cancellation share the transaction: an undispatched input cannot
    * escape to a worker after the owner has paused/cancelled it. A handed-off
@@ -814,6 +964,40 @@ export class HubDispatch {
     }
     return { ...ticket, paused: true, status: "working", attempts: [...ticket.attempts.slice(0, -1), { ...last, stopRequested: intent }] };
   }
+  private async downloadRemoteArtifacts(
+    peer: NetworkHost,
+    dispatcher: { id: string; name: string },
+    conversationId: string,
+    ownerId: string,
+    attempt: TicketAttempt,
+    artifacts: readonly TicketArtifact[],
+  ): Promise<TicketArtifact[]> {
+    if (!this.remote || !attempt.remoteTicketId || !artifacts.length) return [];
+    const downloaded: TicketArtifact[] = [];
+    for (const file of artifacts) {
+      try {
+        const localAttachmentId = await this.remote.importAttachment(
+          conversationId,
+          ownerId,
+          file,
+          async offset => {
+            const res = await this.remote!.callPeer(
+              peer,
+              { id: dispatcher.id, name: dispatcher.name },
+              "/api/bot-messages/dispatch/download",
+              { remoteTicketId: attempt.remoteTicketId, attachmentId: file.id, offset },
+              derivedRequestId(`dl_${attempt.id}_`, `${file.id}_${offset}`),
+            ) as { bytes: string };
+            return Buffer.from(res.bytes, "base64");
+          },
+        );
+        downloaded.push({ ...file, localAttachmentId });
+      } catch {
+        downloaded.push(file);
+      }
+    }
+    return downloaded;
+  }
   /** Retry only the same, still-current attempt. Its exact message target keeps
    * delayed replies/duplicate controls from stopping a later worker turn. */
   private async notifyStop(ticket: DispatchTicket): Promise<void> {
@@ -827,7 +1011,8 @@ export class HubDispatch {
           const current = this.ticket(await this.requireTicket(ticket.id)), last = current.attempts.at(-1);
           if (last?.id !== attempt.id || last.endedAt || !last.stopRequested) return undefined;
           const dispatcher = await this.dispatcher(ticket.dispatcherBotId);
-          return { current, last, dispatcher };
+          const home = await this.home(ticket.dispatcherBotId);
+          return { current, last, dispatcher, home };
         });
         if (!info) return;
         const peers = await this.remote.networkPeers();
@@ -841,18 +1026,63 @@ export class HubDispatch {
               { id: info.dispatcher.id, name: info.dispatcher.name },
               "/api/bot-messages/dispatch/stop",
               { remoteTicketId: attempt.remoteTicketId, action: info.last.stopRequested! },
-              `stop_${attempt.id}_${info.last.stopRequested}`,
+              derivedRequestId(`stop_${attempt.id}_`, info.last.stopRequested!),
             ));
             stoppedRemote = reply.stopped || reply.status === "cancelled";
             remoteStatus = reply.status;
-          } catch {
-            // If peer is unreachable during cancel, settle below so owner isn't wedged.
-            if (info.last.stopRequested === "cancel") stoppedRemote = true;
+          } catch (error) {
+            // Keep retrying on transient transport failures so we never abandon a live remote turn.
+            // Only settle immediately when the remote Host definitively reports gone/forbidden.
+            if (error instanceof HubError && [403, 404, 410].includes(error.status) && info.last.stopRequested === "cancel") {
+              stoppedRemote = true;
+            } else {
+              return;
+            }
           }
         } else if (info.last.stopRequested === "cancel") {
           stoppedRemote = true;
         }
-        if (stoppedRemote || remoteStatus === "completed" || remoteStatus === "failed") {
+        if (remoteStatus === "completed" || remoteStatus === "failed") {
+          if (!peer) return;
+          let statusResp: ReturnType<typeof remoteDispatchStatusResponseSchema.parse>;
+          try {
+            statusResp = remoteDispatchStatusResponseSchema.parse(await this.remote.callPeer(
+              peer,
+              { id: info.dispatcher.id, name: info.dispatcher.name },
+              "/api/bot-messages/dispatch/status",
+              { remoteTicketId: attempt.remoteTicketId },
+              derivedRequestId(`st_${attempt.id}_`, `${Date.now()}`),
+            ));
+          } catch {
+            return; // Transient read failure: retry on next sweep instead of dropping completed work.
+          }
+          const downloadedArtifacts = statusResp.status === "completed"
+            ? await this.downloadRemoteArtifacts(peer, info.dispatcher, info.current.conversationId, info.home.ownerId, info.last, statusResp.artifacts)
+            : [];
+          const batchId = await this.db.transaction(async () => {
+            const current = this.ticket(await this.requireTicket(ticket.id)), last = current.attempts.at(-1);
+            if (last?.id !== attempt.id || last.endedAt || !last.stopRequested) return undefined;
+            const { waitingFor: _w, ...endedBase } = last;
+            const finished = statusResp.status === "completed";
+            const status: TicketStatus = last.stopRequested === "cancel" ? "cancelled" : finished ? "needs_review" : "queued";
+            const next: DispatchTicket = {
+              ...current,
+              status,
+              paused: last.stopRequested === "pause",
+              ...(statusResp.result ? { result: statusResp.result.slice(-RESULT_CHARS) } : {}),
+              ...(downloadedArtifacts.length ? { artifacts: downloadedArtifacts } : {}),
+              attempts: [...current.attempts.slice(0, -1), { ...endedBase, endedAt: Date.now(), outcome: finished ? "completed" : "cancelled" }],
+              updatedAt: Date.now(),
+            };
+            await this.save(next);
+            return next.batchId;
+          });
+          this.markAutoAdvanceDirty(ticket.dispatcherBotId);
+          this.options.changed?.(ticket.dispatcherBotId);
+          if (batchId) await this.maybePublishBatchSummary(batchId, await this.options.source());
+          return;
+        }
+        if (stoppedRemote) {
           const batchId = await this.db.transaction(async () => {
             const current = this.ticket(await this.requireTicket(ticket.id)), last = current.attempts.at(-1);
             if (last?.id !== attempt.id || last.endedAt || !last.stopRequested) return undefined;
@@ -868,6 +1098,7 @@ export class HubDispatch {
             await this.save(next);
             return next.batchId;
           });
+          this.markAutoAdvanceDirty(ticket.dispatcherBotId);
           this.options.changed?.(ticket.dispatcherBotId);
           if (batchId) await this.maybePublishBatchSummary(batchId, await this.options.source());
         }
@@ -924,6 +1155,7 @@ export class HubDispatch {
     this.store.emitCommitted(events);
     if (input.action !== "remove") void this.notifyStop(ticket);
     await this.store.audit("dispatch.ticket_action", userId, { ticketId, action: input.action });
+    this.markAutoAdvanceDirty(ticket.dispatcherBotId);
     this.options.changed?.(ticket.dispatcherBotId);
     if (ticket.batchId && (ticket.status === "done" || ticket.status === "cancelled")) {
       void this.maybePublishBatchSummary(ticket.batchId, source ?? await this.options.source()).catch(() => undefined);
@@ -1083,7 +1315,10 @@ export class HubDispatch {
         return next;
       });
       this.store.emitCommitted(events);
-      if (result) this.options.changed?.(result.dispatcherBotId);
+      if (result) {
+        this.markAutoAdvanceDirty(result.dispatcherBotId);
+        this.options.changed?.(result.dispatcherBotId);
+      }
       return;
     }
 
@@ -1113,34 +1348,26 @@ export class HubDispatch {
       return;
     }
 
-    if (statusResp.status === "queued" || statusResp.status === "working") return;
+    if (statusResp.status === "queued" || statusResp.status === "working") {
+      if (attempt.waitingFor) {
+        const cleared = await this.db.transaction(async () => {
+          const latest = this.ticket(await this.requireTicket(ticketId));
+          const last = latest.attempts.at(-1);
+          if (latest.status !== "working" || last?.id !== attempt.id || last.endedAt || !last.waitingFor) return false;
+          const { waitingFor: _old, ...base } = last;
+          const next = { ...latest, attempts: [...latest.attempts.slice(0, -1), base], updatedAt: Date.now() };
+          await this.save(next);
+          return true;
+        });
+        if (cleared) this.options.changed?.(current.dispatcherBotId);
+      }
+      return;
+    }
 
     // Terminal state: completed / failed / cancelled.
-    const downloadedArtifacts: TicketArtifact[] = [];
-    if (statusResp.status === "completed" && statusResp.artifacts.length && peer) {
-      for (const file of statusResp.artifacts) {
-        try {
-          const localAttachmentId = await this.remote.importAttachment(
-            current.conversationId,
-            home.ownerId,
-            file,
-            async offset => {
-              const res = await this.remote!.callPeer(
-                peer,
-                { id: dispatcher.id, name: dispatcher.name },
-                "/api/bot-messages/dispatch/download",
-                { remoteTicketId: attempt.remoteTicketId, attachmentId: file.id, offset },
-                `dl_${attempt.id}_${file.id}_${offset}`,
-              ) as { bytes: string };
-              return Buffer.from(res.bytes, "base64");
-            },
-          );
-          downloadedArtifacts.push({ ...file, localAttachmentId });
-        } catch {
-          downloadedArtifacts.push(file);
-        }
-      }
-    }
+    const downloadedArtifacts = statusResp.status === "completed" && statusResp.artifacts.length && peer
+      ? await this.downloadRemoteArtifacts(peer, dispatcher, current.conversationId, home.ownerId, attempt, statusResp.artifacts)
+      : [];
 
     const events: HubEvent[] = [];
     const settled = await this.db.transaction(async () => {
@@ -1180,6 +1407,7 @@ export class HubDispatch {
     });
     this.store.emitCommitted(events);
     if (settled) {
+      this.markAutoAdvanceDirty(settled.dispatcherBotId);
       this.options.changed?.(settled.dispatcherBotId);
       if (settled.batchId) await this.maybePublishBatchSummary(settled.batchId, source);
     }
@@ -1198,44 +1426,95 @@ export class HubDispatch {
       byDispatcher.set(row.dispatcher_bot_id, list);
     }
     for (const [dispatcherBotId, rows] of byDispatcher) {
-      const { settings } = await this.db.serial(() => this.settingsRow(dispatcherBotId));
+      if (generation !== this.generation) return;
+      // Filter eligible queued tickets BEFORE probing remote peers over TLS.
+      const { settings, eligible } = await this.db.serial(async () => {
+        const { settings } = await this.settingsRow(dispatcherBotId);
+        const batchStarted = new Map<string, boolean>();
+        const eligible: { row: TicketRow; ticket: DispatchTicket; wasOffline: boolean; planMeta?: PlannedBatchMeta }[] = [];
+        for (const row of rows) {
+          const ticket = this.ticket(row);
+          const wasOffline = ticket.attempts.at(-1)?.failure?.category === "host-offline";
+          if (ticket.attempts.length > 0 && !(settings.mode === "auto" && wasOffline)) continue;
+          if (ticket.attempts.length === 0 && settings.mode !== "auto") {
+            let started = batchStarted.get(ticket.batchId!);
+            if (started === undefined) {
+              started = !!await this.db.get("SELECT 1 FROM dispatch_tickets WHERE batch_id=? AND attempts_json!='[]' LIMIT 1", [ticket.batchId!]);
+              batchStarted.set(ticket.batchId!, started);
+            }
+            if (!started) continue;
+          }
+          eligible.push({ row, ticket, wasOffline, planMeta: parsePlannedBatchMeta(row.plan_json) });
+        }
+        return { settings, eligible };
+      });
+      if (!eligible.length) continue;
+      const nextProbeAt = this.autoAdvanceNextProbe.get(dispatcherBotId);
+      if (nextProbeAt !== undefined && Date.now() < nextProbeAt) continue;
+
       const actor: DispatchActor = { kind: "owner", userId: "owner" };
       const nodesSnapshot = await this.nodes(actor, dispatcherBotId).catch(() => undefined);
-      if (!nodesSnapshot) continue;
-      for (const row of rows) {
+      if (!nodesSnapshot) {
+        this.autoAdvanceNextProbe.set(dispatcherBotId, Date.now() + AUTO_ADVANCE_PROBE_BACKOFF_MS);
+        continue;
+      }
+      let dispatchedAny = false;
+      for (const { ticket, wasOffline, planMeta } of eligible) {
         if (generation !== this.generation) return;
-        const ticket = this.ticket(row);
-        const wasOffline = ticket.attempts.at(-1)?.failure?.category === "host-offline";
-        if (ticket.attempts.length > 0 && !(settings.mode === "auto" && wasOffline)) continue;
-        if (ticket.attempts.length === 0 && settings.mode !== "auto") {
-          // In ask mode, only auto-advance queued batches once at least one ticket in the batch was dispatched (owner approved the batch).
-          const started = await this.db.serial(() => this.db.get("SELECT 1 FROM dispatch_tickets WHERE batch_id=? AND attempts_json!='[]' LIMIT 1", [ticket.batchId!]));
-          if (!started) continue;
-        }
-        const preferredEngine = (ticket.note?.split(" · ", 1)[0] as DispatchEngine | undefined);
-        const engine: DispatchEngine = DISPATCH_ENGINES.includes(preferredEngine as DispatchEngine) ? preferredEngine! : (settings.allowedEngines?.[0] ?? "codex");
-        // Check if original hostId is still eligible; if offline/unavailable, pick best alternative node.
+        const lastAttempt = ticket.attempts.at(-1);
+        const noteEngine = ticket.note?.split(" · ", 1)[0] as DispatchEngine | undefined;
+        const engine: DispatchEngine = (wasOffline ? lastAttempt?.engine : undefined)
+          ?? planMeta?.engine
+          ?? lastAttempt?.engine
+          ?? (DISPATCH_ENGINES.includes(noteEngine as DispatchEngine) ? noteEngine! : (settings.allowedEngines?.[0] ?? "codex"));
+        const model = (wasOffline ? lastAttempt?.model : undefined) ?? planMeta?.model ?? lastAttempt?.model ?? "";
+        const effort = (wasOffline ? lastAttempt?.effort : undefined) ?? planMeta?.effort ?? lastAttempt?.effort ?? "";
+        const force = planMeta?.force ?? false;
+        const requestedHosts = planMeta?.hostIds?.length ? new Set(planMeta.hostIds) : undefined;
+
         const currentNode = ticket.hostId ? nodesSnapshot.nodes.find(n => n.hostId === ticket.hostId) : undefined;
         let chosenHostId = ticket.hostId;
-        if (!currentNode || !evaluateNodeForEngine(currentNode, engine, { checkCapacity: true }).eligible) {
+        const currentEligible = !!currentNode && evaluateNodeForEngine(currentNode, engine, {
+          force,
+          checkCapacity: true,
+          allowManual: !!requestedHosts?.has(currentNode.hostId),
+        }).eligible;
+        if (!currentEligible) {
           const exclude = new Set(ticket.attempts.filter(a => a.failure?.category === "host-offline" && a.hostId).map(a => a.hostId!));
-          const alt = selectBestNodeForEngine(nodesSnapshot.nodes, engine, { checkCapacity: true, excludeHostIds: exclude })
-            ?? selectBestNodeForEngine(nodesSnapshot.nodes, engine, { checkCapacity: true });
+          let alt: { node: DispatchNodeTarget } | undefined;
+          if (requestedHosts) {
+            for (const candidate of nodesSnapshot.nodes) {
+              if (!requestedHosts.has(candidate.hostId) || exclude.has(candidate.hostId)) continue;
+              if (evaluateNodeForEngine(candidate, engine, { force, checkCapacity: true, allowManual: true }).eligible) {
+                alt = { node: candidate };
+                break;
+              }
+            }
+          }
+          if (!alt && (!requestedHosts || wasOffline)) {
+            alt = selectBestNodeForEngine(nodesSnapshot.nodes, engine, { force, checkCapacity: true, excludeHostIds: exclude })
+              ?? selectBestNodeForEngine(nodesSnapshot.nodes, engine, { force, checkCapacity: true });
+          }
           if (!alt) continue;
           chosenHostId = alt.node.hostId;
         }
         try {
           await this.dispatch(actor, dispatcherBotId, {
-            requestId: `auto_${ticket.id}_${ticket.attempts.length}`,
+            requestId: derivedRequestId(`auto_${ticket.id}_`, `${ticket.attempts.length}`),
             ticketId: ticket.id,
             hostId: chosenHostId ?? source.hostId,
             engine,
+            ...(model ? { model } : {}),
+            ...(effort ? { effort } : {}),
+            ...(force ? { force: true } : {}),
           });
-          // Increment active count locally for remaining queued items in this loop.
+          dispatchedAny = true;
           const nodeRef = nodesSnapshot.nodes.find(n => n.hostId === (chosenHostId ?? source.hostId));
           if (nodeRef) nodeRef.activeOnNode += 1;
-        } catch { /* Capacity or transient error: retry next sweep. */ }
+        } catch { /* Capacity or transient error: retry after backoff or next capacity change. */ }
       }
+      if (dispatchedAny) this.autoAdvanceNextProbe.delete(dispatcherBotId);
+      else this.autoAdvanceNextProbe.set(dispatcherBotId, Date.now() + AUTO_ADVANCE_PROBE_BACKOFF_MS);
     }
   }
   /** Publishes one consolidated summary message with bundled files when all tickets in a batch finish. */
@@ -1246,28 +1525,62 @@ export class HubDispatch {
       const rows = await this.db.all<TicketRow>("SELECT * FROM dispatch_tickets WHERE batch_id=? ORDER BY batch_index ASC, created_at ASC", [batchId]);
       if (!rows.length) return undefined;
       const tickets = rows.map(r => this.ticket(r));
-      const stillPending = tickets.some(t => t.status === "working" || t.status === "needs_answer" || t.status === "queued");
+      const stillPending = tickets.some(t => t.status === "working" || t.status === "needs_answer" || t.status === "queued" || t.status === "blocked");
       if (stillPending) return undefined;
       const first = tickets[0]!;
       const conv = await this.db.get<{ owner_id: string }>("SELECT owner_id FROM conversations WHERE id=?", [first.conversationId]);
       return { tickets, dispatcherBotId: first.dispatcherBotId, conversationId: first.conversationId, ownerId: conv?.owner_id ?? "owner" };
     });
     if (!info) return undefined;
-    const summaryText = buildBatchSummaryText(batchId, info.tickets, source.hostName);
+    // Ensure every artifact referenced in the summary lives in the dispatcher's home conversation.
     const seenFiles = new Set<string>();
-    const fileBlocks: Extract<Block, { type: "file" }>[] = [];
+    const candidateFiles: Extract<Block, { type: "file" }>[] = [];
     for (const t of info.tickets) {
-      for (const a of t.artifacts ?? []) {
-        const attachmentId = a.localAttachmentId;
-        if (!attachmentId || seenFiles.has(attachmentId)) continue;
-        seenFiles.add(attachmentId);
-        fileBlocks.push({ type: "file", attachmentId, name: a.name, size: a.size, mime: a.mime });
+      if (!t.artifacts?.length) continue;
+      let artifactsChanged = false;
+      const updatedArtifacts: TicketArtifact[] = [];
+      for (const a of t.artifacts) {
+        let homeAttachmentId = a.localAttachmentId;
+        if (homeAttachmentId) {
+          const attId = homeAttachmentId;
+          const inHome = await this.db.serial(() => this.db.get(
+            "SELECT 1 FROM attachments a WHERE a.id=? AND a.conversation_id=? AND a.complete=1 AND NOT EXISTS(SELECT 1 FROM retired_attachments r WHERE r.attachment_id=a.id)",
+            [attId, info.conversationId],
+          ));
+          if (!inHome) homeAttachmentId = undefined;
+        }
+        if (!homeAttachmentId && this.options.copyAttachment) {
+          const sourceId = a.localAttachmentId ?? a.id;
+          try {
+            homeAttachmentId = await this.options.copyAttachment(sourceId, info.conversationId, info.ownerId);
+            if (homeAttachmentId !== a.localAttachmentId) artifactsChanged = true;
+          } catch { /* Remote-only or unavailable artifact: omit from home file blocks without failing the summary. */ }
+        }
+        updatedArtifacts.push(homeAttachmentId ? { ...a, localAttachmentId: homeAttachmentId } : a);
+        if (homeAttachmentId && !seenFiles.has(homeAttachmentId)) {
+          seenFiles.add(homeAttachmentId);
+          candidateFiles.push({ type: "file", attachmentId: homeAttachmentId, name: a.name, size: a.size, mime: a.mime });
+        }
+      }
+      if (artifactsChanged) {
+        await this.db.transaction(async () => {
+          await this.db.run("UPDATE dispatch_tickets SET artifacts_json=?,updated_at=? WHERE id=?", [JSON.stringify(updatedArtifacts), Date.now(), t.id]);
+        });
       }
     }
-    const blocks: Block[] = [{ type: "text", text: summaryText }, ...fileBlocks];
+    const summaryText = buildBatchSummaryText(batchId, info.tickets, source.hostName);
     const committed = await this.db.transaction(async () => {
       const existing = await this.db.get<{ message_id: string }>("SELECT message_id FROM dispatch_batch_summaries WHERE batch_id=?", [batchId]);
       if (existing) return undefined;
+      const verifiedFiles: Extract<Block, { type: "file" }>[] = [];
+      for (const file of candidateFiles) {
+        const present = await this.db.get(
+          "SELECT 1 FROM attachments a WHERE a.id=? AND a.conversation_id=? AND a.complete=1 AND NOT EXISTS(SELECT 1 FROM retired_attachments r WHERE r.attachment_id=a.id)",
+          [file.attachmentId, info.conversationId],
+        );
+        if (present) verifiedFiles.push(file);
+      }
+      const blocks: Block[] = [{ type: "text", text: summaryText }, ...verifiedFiles];
       const published = await this.store.publishBotMessageInTransaction(info.dispatcherBotId, {
         conversationId: info.conversationId,
         blocks,
@@ -1277,12 +1590,12 @@ export class HubDispatch {
         "INSERT INTO dispatch_batch_summaries(batch_id,dispatcher_bot_id,conversation_id,message_id,created_at) VALUES(?,?,?,?,?)",
         [batchId, info.dispatcherBotId, info.conversationId, published.message.id, Date.now()],
       );
-      return published;
+      return { published, fileCount: verifiedFiles.length };
     });
     if (!committed) return undefined;
-    if (committed.event) this.store.emitCommitted([committed.event]);
-    await this.store.audit("dispatch.batch_summarized", info.dispatcherBotId, { batchId, messageId: committed.message.id, files: fileBlocks.length });
-    return committed.message;
+    if (committed.published.event) this.store.emitCommitted([committed.published.event]);
+    await this.store.audit("dispatch.batch_summarized", info.dispatcherBotId, { batchId, messageId: committed.published.message.id, files: committed.fileCount });
+    return committed.published.message;
   }
   private async settle(ticketId: string, source: Source, generation: number): Promise<void> {
     const created: Created = { ownerId: "", events: [] };
@@ -1388,7 +1701,8 @@ export class HubDispatch {
           [attempt.inputMessageId, attempt.botId, attempt.conversationId],
         );
         if (files.length) {
-          localArtifacts = files.slice(0, 64).map(f => ({ id: f.id, name: f.name, size: f.size, mime: f.mime, sha256: f.sha256, localAttachmentId: f.id }));
+          // Worker attachments belong to attempt.conversationId; copy into ticket.conversationId after commit.
+          localArtifacts = files.slice(0, 64).map(f => ({ id: f.id, name: f.name, size: f.size, mime: f.mime, sha256: f.sha256 }));
         }
       }
       const next: DispatchTicket = { ...settledAttempts, status, ...(text ? { result: text.slice(-RESULT_CHARS) } : {}), ...(localArtifacts ? { artifacts: localArtifacts } : {}) };
@@ -1414,6 +1728,27 @@ export class HubDispatch {
     if (!settled) return;
     if (created.conversation) this.options.conversationCreated(created.ownerId, created.conversation);
     this.store.emitCommitted(created.events);
+    if (settled.ticket.artifacts?.length && this.options.copyAttachment) {
+      const ownerId = (await this.db.serial(() => this.db.get<{ owner_id: string }>("SELECT owner_id FROM conversations WHERE id=?", [settled.ticket.conversationId])))?.owner_id ?? "owner";
+      const copied: TicketArtifact[] = [];
+      let changed = false;
+      for (const a of settled.ticket.artifacts) {
+        if (a.localAttachmentId) { copied.push(a); continue; }
+        try {
+          const localAttachmentId = await this.options.copyAttachment(a.id, settled.ticket.conversationId, ownerId);
+          copied.push({ ...a, localAttachmentId });
+          changed = true;
+        } catch {
+          copied.push(a);
+        }
+      }
+      if (changed) {
+        await this.db.transaction(async () => {
+          await this.db.run("UPDATE dispatch_tickets SET artifacts_json=?,updated_at=? WHERE id=?", [JSON.stringify(copied), Date.now(), settled.ticket.id]);
+        });
+      }
+    }
+    this.markAutoAdvanceDirty(settled.ticket.dispatcherBotId);
     this.options.changed?.(settled.ticket.dispatcherBotId);
     if (settled.ticket.batchId) await this.maybePublishBatchSummary(settled.ticket.batchId, source);
     // A slow worker launch must not hold settlement of other tickets; a failed

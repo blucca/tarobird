@@ -247,19 +247,21 @@ export class BotManager {
   async remoteDispatchWorker(sourceHostId: string, engine: InstanceEngine, validate?: TransactionGuard): Promise<string> {
     idSchema.parse(sourceHostId);
     const key = `remote-dispatch-worker:${sourceHostId}:${engine}`;
-    const existingId = await this.store.db.serial(async () => {
+    const existing = await this.store.db.serial(async () => {
       await validate?.();
       const row = await this.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [key]);
       if (!row) return undefined;
-      const bot = await this.store.db.get<{ id: string }>("SELECT id FROM bots WHERE id=? AND deleted_at IS NULL", [row.value]);
-      return bot?.id;
+      return this.store.db.get<{ id: string; deleted_at: number | null }>("SELECT id,deleted_at FROM bots WHERE id=?", [row.value]);
     });
-    if (existingId) return existingId;
+    if (existing && existing.deleted_at === null) return existing.id;
     const label = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi" }[engine];
     const workspace = path.join(this.directory, "remote-dispatch", sourceHostId);
     await mkdir(workspace, { recursive: true, mode: 0o700 });
     const permission = defaultPermission(engine) === "bypass" ? "bypass" : "normal";
-    const requestId = `rdw_${createHash("sha256").update(`${sourceHostId}:${engine}`).digest("hex").slice(0, 20)}`;
+    // Include any prior deleted worker's ID so replacements derive a new bot ID
+    // instead of permanently colliding with the deleted tombstone (410).
+    const generationSeed = existing ? `${sourceHostId}:${engine}:${existing.id}` : `${sourceHostId}:${engine}`;
+    const requestId = `rdw_${createHash("sha256").update(generationSeed).digest("hex").slice(0, 24)}`;
     const bot = await this.create("owner", { requestId, name: `Remote · ${label}`, engine, model: "", effort: "", workspace, role: "worker", permission }, validate, { internal: true });
     await this.store.db.transaction(async () => {
       await validate?.();

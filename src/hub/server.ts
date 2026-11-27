@@ -376,6 +376,7 @@ export class HubServer {
       source: () => this.botMessages.ownSource(),
       conversationCreated: (userId, conversation) => conversationsCreated(userId, [conversation]),
       stop: (botId, conversationId, userId, messageId) => this.callBot(botId, "stop", { conversationId, userId, messageId }),
+      copyAttachment: (attachmentId, targetConversationId, ownerId) => attachments.copyToConversation(attachmentId, targetConversationId, ownerId),
     });
     const remoteDispatchCtx: RemoteDispatchContext = {
       store,
@@ -383,6 +384,7 @@ export class HubServer {
       network: this.network,
       attachments,
       get workers() { return server.botManager ?? server.dispatch.workers; },
+      workerCapable: botId => { const connection = this.bots.get(botId); return connection?.ready ? connection.botMessages : undefined; },
       quotaScopes: async () => {
         const quotas = hubEngineQuotas({
           bots: () => store.bots("owner"),
@@ -425,30 +427,39 @@ export class HubServer {
         return this.botMessages.exchange(peer, signed, body);
       },
       importAttachment: async (conversationId, ownerId, file, readChunk) => {
-        const hasher = createHash("sha256");
+        if (!file.sha256) throw new HubError("remote_attachment_sha256_required", 502);
+        if (!Number.isSafeInteger(file.size) || file.size <= 0) throw new HubError("remote_attachment_invalid_size", 502);
+        if (file.size > attachments.maxFileBytes) throw new HubError("file_too_large", 413);
         const created = await attachments.create(ownerId, {
           conversationId,
           name: file.name,
           size: file.size,
           mime: file.mime,
-          sha256: file.sha256 ?? createHash("sha256").update("").digest("hex"),
+          sha256: file.sha256,
         });
+        if ((await attachments.status(ownerId, created.id)).complete) return created.id;
+        const hasher = createHash("sha256");
         let offset = 0;
-        let index = 0;
-        let actualSha = file.sha256;
-        if (!file.sha256) {
-          // Read all chunks first if sha256 wasn't supplied? Remote always supplies sha256 from attachments table.
-          throw new HubError("remote_attachment_sha256_required", 502);
-        }
+        let chunkIndex = 0;
         while (offset < file.size) {
-          const chunk = await readChunk(offset);
-          if (!chunk.length) break;
-          hasher.update(chunk);
-          await attachments.putChunk(ownerId, created.id, index, chunk);
-          offset += chunk.length;
-          index++;
+          const expectedChunkSize = Math.min(CHUNK_BYTES, file.size - offset);
+          const parts: Buffer[] = [];
+          let collected = 0;
+          while (collected < expectedChunkSize) {
+            const slice = await readChunk(offset);
+            if (!slice.length) throw new HubError("remote_attachment_truncated", 502);
+            const remainingInChunk = expectedChunkSize - collected;
+            const piece = slice.length > remainingInChunk ? slice.subarray(0, remainingInChunk) : slice;
+            parts.push(piece);
+            hasher.update(piece);
+            collected += piece.length;
+            offset += piece.length;
+          }
+          const chunkBuf = parts.length === 1 ? parts[0]! : Buffer.concat(parts, expectedChunkSize);
+          await attachments.putChunk(ownerId, created.id, chunkIndex, chunkBuf);
+          chunkIndex++;
         }
-        if (offset !== file.size || hasher.digest("hex") !== actualSha) {
+        if (offset !== file.size || hasher.digest("hex") !== file.sha256) {
           throw new HubError("remote_attachment_integrity_failed", 502);
         }
         await attachments.complete(ownerId, created.id);

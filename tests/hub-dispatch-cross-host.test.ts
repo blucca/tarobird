@@ -1,13 +1,16 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { hashSecret } from "../src/hub/auth.js";
+import { BotManager } from "../src/hub/bot-manager.js";
 import { messageHostId } from "../src/hub/bot-messages.js";
 import { desktopTls } from "../src/hub/desktop-tls.js";
 import { buildBatchSummaryText, parseSplitTaskSpec, planSplitBatches } from "../src/hub/dispatch-planner.js";
+import { readLocalHostLoad, updateCrossHostDispatchGrants } from "../src/hub/dispatch-remote.js";
+import { HubPromptQueue } from "../src/hub/prompt-queue.js";
 import { networkId } from "../src/hub/private-network.js";
 import { HubServer } from "../src/hub/server.js";
 import { startHubControl } from "../src/hub/service.js";
@@ -15,9 +18,11 @@ import { loadHubTls } from "../src/hub/tls.js";
 import { LocalHostClient } from "../src/host-cli/client.js";
 import { initializeHost } from "../src/host-cli/setup.js";
 import { runTicketsCommand } from "../src/host-cli/tickets.js";
+import { BOT_PASSPORT_TTL_MS, type BotPassport } from "../src/client-protocol/bot-messages.js";
 import { networkCanonical, type NetworkManifest } from "../src/client-protocol/private-network.js";
 import {
-  crossHostDispatchGrantCommandSchema, defaultDispatcherSettings, dispatchNodesResponseSchema,
+  REMOTE_DISPATCH_TARGET_BOT, crossHostDispatchGrantCommandSchema, defaultDispatcherSettings, dispatchNodesResponseSchema,
+  remoteDispatchRunRequestSchema,
   type DispatchEngine, type DispatchNodeTarget, type DispatchTicket,
 } from "../src/client-protocol/dispatch.js";
 
@@ -122,9 +127,10 @@ beforeEach(async () => {
     );
   }
 
-  // Dispatcher + local worker on Hub A ("macmini").
+  // Dispatcher + local workers on Hub A ("macmini").
   await a.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role) VALUES('d','Chancellor',?,'claude','','','dispatcher')", [hashSecret("disp-secret")]);
   await a.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role) VALUES('w_local_codex','Chancellor · codex','fixture','codex','','','worker')");
+  await a.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role) VALUES('w_local_claude','Chancellor · claude','fixture','claude','','','worker')");
   await a.store.createConversation("owner", ["d"], "Chancellor", "home");
   await a.dispatch.updateSettings("owner", "d", {
     settings: {
@@ -139,20 +145,21 @@ beforeEach(async () => {
     expectedRevision: (await a.dispatch.settings("owner", "d")).revision,
   });
 
-  // Remote worker on Hub B ("studio-b").
+  // Remote workers on Hub B ("studio-b").
   await b.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role) VALUES('w_remote_codex','Remote · codex','fixture','codex','','','worker')");
+  await b.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role) VALUES('w_remote_claude','Remote · claude','fixture','claude','','','worker')");
 
   const catalogFor = () => ({ engines: ENGINES.map(id => ({ id, available: id !== "antigravity", models: [{ id: "", efforts: [""] }], defaultModel: "", defaultEffort: "" })) });
   a.dispatch.workers = {
     catalog: async () => catalogFor(),
-    dispatchWorker: async (_dispatcher, engine) => (engine === "codex" ? "w_local_codex" : "w_local_codex"),
-    ticketWorkspace: async (_dispatcher, ticketId) => path.join(aDir, "tickets", ticketId),
+    dispatchWorker: async (_dispatcher: string, engine: DispatchEngine) => (engine === "claude" ? "w_local_claude" : "w_local_codex"),
+    ticketWorkspace: async (_dispatcher: string, ticketId: string) => path.join(aDir, "tickets", ticketId),
   };
   (b.dispatch as { workers: unknown }).workers = {
     catalog: async () => catalogFor(),
-    dispatchWorker: async () => "w_remote_codex",
-    ticketWorkspace: async (_dispatcher, ticketId) => path.join(bDir, "tickets", ticketId),
-    remoteDispatchWorker: async () => "w_remote_codex",
+    dispatchWorker: async (_dispatcher: string, engine: DispatchEngine) => (engine === "claude" ? "w_remote_claude" : "w_remote_codex"),
+    ticketWorkspace: async (_dispatcher: string, ticketId: string) => path.join(bDir, "tickets", ticketId),
+    remoteDispatchWorker: async (_sourceHostId: string, engine: DispatchEngine) => (engine === "claude" ? "w_remote_claude" : "w_remote_codex"),
     remoteTicketWorkspace: async (_sourceHostId: string, remoteTicketId: string) => path.join(bDir, "remote-tickets", remoteTicketId),
   };
 });
@@ -443,10 +450,436 @@ it("guards ask-mode split plans, supports remote stop over TLS, and exposes CLI 
     (await LocalHostClient.connect(aDir, { enroll: true })).close();
     const cliNodes = await runTicketsCommand(aDir, "nodes", undefined, {}, () => {}) as { nodes: { hostName: string; authorized: boolean }[] };
     expect(cliNodes.nodes.map(n => [n.hostName, n.authorized])).toEqual(expect.arrayContaining([["macmini", true], ["studio-b", true]]));
-    const cliPlan = await runTicketsCommand(aDir, "plan", undefined, { text: "Write 6 scripts, 3 per machine", engine: "codex" }, () => {}) as { batches: unknown[]; mode: string };
+    const cliPlan = await runTicketsCommand(aDir, "plan", undefined, { text: "Write 6 scripts, 3 per machine", engine: "codex", force: true, host: `${macId},${studioId}` }, () => {}) as { batches: unknown[]; mode: string };
     expect(cliPlan.mode).toBe("ask");
     expect(cliPlan.batches).toHaveLength(2);
+
+    // Per-node settings via CLI `tickets settings --host`.
+    const updatedNodeSettings = await runTicketsCommand(aDir, "settings", undefined, { host: studioId, allow: "claude", allowed: "off", "max-concurrent": "1" }, () => {}) as { settings: { nodes?: Array<{ hostId: string; enabled: boolean; allowedEngines?: string[]; maxConcurrent: number }> } };
+    expect(updatedNodeSettings.settings.nodes?.find(n => n.hostId === studioId)).toMatchObject({ enabled: false, allowedEngines: ["claude"], maxConcurrent: 1 });
   } finally {
     await closeA();
   }
+});
+
+it("blocks ordinary Bot chat grants from escalating to remote dispatch, enforces isBotControl, model regex, effort checks, and rate limits", async () => {
+  await b.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role) VALUES('ordinary_b','Ordinary B','fixture','claude','','','')");
+  await b.botMessages.grant({ sourceHost: macId, sourceBot: "d", targetBot: "ordinary_b" }, async () => undefined);
+
+  const peers = (await a.network.view()).membership!.manifest.hosts.filter(h => h.publicKey !== a.auth.publicKey);
+  const peerB = peers[0]!;
+  const sendSigned = async (targetBot: string, routePath: string, data: Record<string, unknown>) => {
+    const body = Buffer.from(JSON.stringify(data));
+    const passport: BotPassport = {
+      v: 1,
+      sourceKey: a.auth.publicKey,
+      targetKey: peerB.publicKey,
+      source: { hostId: macId, hostName: "macmini", botId: "d", botName: "Chancellor", requestId: `sec_${randomUUID().slice(0, 12)}`, hops: 1 },
+      targetBot,
+      method: "POST",
+      path: routePath,
+      digest: createHash("sha256").update(body).digest("hex"),
+      expiresAt: Date.now() + BOT_PASSPORT_TTL_MS,
+      nonce: randomUUID(),
+    };
+    return a.botMessages.exchange(peerB, { passport, signature: a.auth.signBotPassport(passport) }, body);
+  };
+
+  // Ordinary chat grant cannot invoke dispatch probe or run on ordinary_b.
+  await expect(sendSigned("ordinary_b", "/api/bot-messages/dispatch/probe", {})).rejects.toThrow("bot_message_operation_forbidden");
+  await expect(sendSigned("ordinary_b", "/api/bot-messages/dispatch/run", {
+    remoteRequestId: "esc_1", title: "Escalate", request: "/model gpt-5", engine: "codex",
+  })).rejects.toThrow("bot_message_operation_forbidden");
+  expect((await b.store.conversations("owner")).some(c => c.botIds.includes("ordinary_b"))).toBe(false);
+
+  // Even after explicit dispatch grant, slash-command control inputs and option-like models / invalid efforts are rejected.
+  await authorizeStudioFromMac();
+  expect(() => remoteDispatchRunRequestSchema.parse({
+    remoteRequestId: "bad_model", title: "Bad", request: "Work", engine: "codex", model: "--dangerously-skip-permissions --foo=bar", effort: "",
+  })).toThrow();
+  await expect(sendSigned(REMOTE_DISPATCH_TARGET_BOT, "/api/bot-messages/dispatch/run", {
+    remoteRequestId: "bad_model_wire", title: "Bad", request: "Work", engine: "codex", model: "--dangerously-skip-permissions", effort: "",
+  })).rejects.toThrow();
+  await expect(sendSigned(REMOTE_DISPATCH_TARGET_BOT, "/api/bot-messages/dispatch/run", {
+    remoteRequestId: "bad_effort_wire", title: "Bad Effort", request: "Work", engine: "codex", model: "gpt-5", effort: "max",
+  })).rejects.toThrow("dispatch_effort_incompatible");
+  await expect(sendSigned(REMOTE_DISPATCH_TARGET_BOT, "/api/bot-messages/dispatch/run", {
+    remoteRequestId: "bad_ctrl", title: "Slash", request: "/model gpt-5", engine: "codex", model: "", effort: "",
+  })).rejects.toThrow("bot_message_control_forbidden");
+
+  // Rate limit blocks runaway dispatch bursts (20/min).
+  for (let i = 0; i < 20; i++) {
+    await sendSigned(REMOTE_DISPATCH_TARGET_BOT, "/api/bot-messages/dispatch/run", {
+      remoteRequestId: `rate_${i}`, title: `Rate ${i}`, request: `Task ${i}`, engine: "codex", model: "", effort: "",
+    });
+  }
+  await expect(sendSigned(REMOTE_DISPATCH_TARGET_BOT, "/api/bot-messages/dispatch/run", {
+    remoteRequestId: "rate_20", title: "Rate 20", request: "Task 20", engine: "codex", model: "", effort: "",
+  })).rejects.toThrow("bot_message_rate_limit");
+}, 30_000);
+
+it("copies local worker attachments into home conversation and downloads >1 MiB remote attachments cleanly for batch summary", async () => {
+  await authorizeStudioFromMac();
+  const plan = await a.dispatch.plan(owner, "d", {
+    requestId: "big-attachments",
+    title: "Artifacts batch",
+    request: "Write 4 items, 2 per machine",
+    engine: "codex",
+    totalItems: 4,
+    perNode: 2,
+    dispatch: true, // Also verifies dispatch: true implies create: true.
+  });
+  expect(plan.tickets).toHaveLength(2);
+  const byHost = new Map(plan.tickets!.map(t => [t.hostId!, t]));
+  const localTicket = byHost.get(macId)!;
+  const remoteTicket = byHost.get(studioId)!;
+
+  // Local worker attaches a file inside its hidden worker conversation.
+  const localAttempt = localTicket.attempts.at(-1)!;
+  const localBytes = Buffer.from("local-output");
+  const localSha = createHash("sha256").update(localBytes).digest("hex");
+  const localAtt = await a.attachments.create("owner", {
+    conversationId: localAttempt.conversationId, name: "local.txt", mime: "text/plain", size: localBytes.length, sha256: localSha,
+  });
+  await a.attachments.putChunk("owner", localAtt.id, 0, localBytes);
+  await a.attachments.complete("owner", localAtt.id);
+  await a.store.publishBotMessage(localAttempt.botId, {
+    conversationId: localAttempt.conversationId,
+    blocks: [{ type: "text", text: "Local done" }, { type: "file", attachmentId: localAtt.id, name: "local.txt", mime: "text/plain", size: localBytes.length }],
+    replyTo: localAttempt.inputMessageId, status: "complete",
+  });
+  await a.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [localAttempt.inputMessageId, localAttempt.botId]);
+
+  // Remote worker attaches a 1.5 MiB file (> 1 MiB slice size, requires reassembly into CHUNK_BYTES).
+  const remoteAttempt = remoteTicket.attempts.at(-1)!;
+  const remoteBytes = randomBytes(1_536_000);
+  const remoteSha = createHash("sha256").update(remoteBytes).digest("hex");
+  const remoteAtt = await b.attachments.create("owner", {
+    conversationId: remoteAttempt.conversationId, name: "large.bin", mime: "application/octet-stream", size: remoteBytes.length, sha256: remoteSha,
+  });
+  await b.attachments.putChunk("owner", remoteAtt.id, 0, remoteBytes);
+  await b.attachments.complete("owner", remoteAtt.id);
+  await b.store.publishBotMessage(remoteAttempt.botId, {
+    conversationId: remoteAttempt.conversationId,
+    blocks: [{ type: "text", text: "Remote 1.5 MiB done" }, { type: "file", attachmentId: remoteAtt.id, name: "large.bin", mime: "application/octet-stream", size: remoteBytes.length }],
+    replyTo: remoteAttempt.inputMessageId, status: "complete",
+  });
+  await b.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [remoteAttempt.inputMessageId, remoteAttempt.botId]);
+
+  await a.dispatch.sweep();
+
+  const settledLocal = await a.dispatch.show(owner, localTicket.id);
+  const settledRemote = await a.dispatch.show(owner, remoteTicket.id);
+  expect(settledLocal.artifacts?.[0]?.localAttachmentId).toBeTruthy();
+  expect(settledLocal.artifacts![0]!.localAttachmentId).not.toBe(localAtt.id);
+  expect(settledRemote.artifacts?.[0]?.localAttachmentId).toBeTruthy();
+
+  const dlRemote = await a.attachments.download({ userId: "owner" }, settledRemote.artifacts![0]!.localAttachmentId!);
+  expect(dlRemote.row).toMatchObject({ name: "large.bin", size: 1_536_000, sha256: remoteSha });
+
+  // Consolidated batch summary published with BOTH local and remote home-conversation attachments!
+  const summaryRow = await a.store.db.get<{ message_id: string }>("SELECT message_id FROM dispatch_batch_summaries WHERE batch_id=?", [plan.batchId]);
+  expect(summaryRow).toBeTruthy();
+  const summaryMsg = await a.store.messageForUser("owner", summaryRow!.message_id);
+  const attachedIds = summaryMsg.blocks.filter(bl => bl.type === "file").map(bl => bl.attachmentId);
+  expect(attachedIds).toEqual(expect.arrayContaining([settledLocal.artifacts![0]!.localAttachmentId!, settledRemote.artifacts![0]!.localAttachmentId!]));
+
+  // Duplicate importAttachment short-circuits cleanly without 409 upload_complete, and missing sha256 rejects before create().
+  const home = (await a.store.conversations("owner")).find(c => c.botIds.includes("d"))!;
+  const dupId = await a.dispatch.remote!.importAttachment(home.id, "owner", { id: "dup", name: "large.bin", size: remoteBytes.length, mime: "application/octet-stream", sha256: remoteSha }, async () => { throw new Error("should_not_read"); });
+  expect(dupId).toBe(settledRemote.artifacts![0]!.localAttachmentId);
+  const attCountBefore = (await a.store.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM attachments"))!.n;
+  await expect(a.dispatch.remote!.importAttachment(home.id, "owner", { id: "nosha", name: "x.txt", size: 5, mime: "text/plain" }, async () => Buffer.from("hello"))).rejects.toThrow("remote_attachment_sha256_required");
+  expect((await a.store.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM attachments"))!.n).toBe(attCountBefore);
+});
+
+it("preserves engine, model, effort, and force during offline failover and enforces node enabled / concurrency / orphan cleanup", async () => {
+  await authorizeStudioFromMac();
+
+  // Disabled node is rejected on both remote and local dispatch.
+  const cur = await a.dispatch.settings("owner", "d");
+  await a.dispatch.updateSettings("owner", "d", {
+    settings: { ...cur.settings, nodes: [{ hostId: macId, enabled: false, maxConcurrent: 2, preference: "normal" }, { hostId: studioId, enabled: false, maxConcurrent: 1, preference: "normal" }] },
+    expectedRevision: cur.revision,
+  });
+  const tDisabled = await a.dispatch.create(owner, "d", { requestId: "dis-1", title: "Disabled node", request: "Work" });
+  await expect(a.dispatch.dispatch(owner, "d", { requestId: "dis-r", ticketId: tDisabled.id, engine: "claude", hostId: studioId })).rejects.toThrow("dispatch_node_disabled");
+  await expect(a.dispatch.dispatch(owner, "d", { requestId: "dis-l", ticketId: tDisabled.id, engine: "claude" })).rejects.toThrow("dispatch_node_disabled");
+
+  // Re-enable both with studio maxConcurrent=1 to test concurrent dispatch limit & orphan stop cleanup.
+  const cur2 = await a.dispatch.settings("owner", "d");
+  await a.dispatch.updateSettings("owner", "d", {
+    settings: { ...cur2.settings, nodes: [{ hostId: macId, enabled: true, maxConcurrent: 2, preference: "normal" }, { hostId: studioId, enabled: true, maxConcurrent: 1, preference: "normal" }] },
+    expectedRevision: cur2.revision,
+  });
+  const c1 = await a.dispatch.create(owner, "d", { requestId: "conc-1", title: "Conc 1", request: "Work 1" });
+  const c2 = await a.dispatch.create(owner, "d", { requestId: "conc-2", title: "Conc 2", request: "Work 2" });
+  const [r1, r2] = await Promise.allSettled([
+    a.dispatch.dispatch(owner, "d", { requestId: "conc-d1", ticketId: c1.id, engine: "claude", hostId: studioId }),
+    a.dispatch.dispatch(owner, "d", { requestId: "conc-d2", ticketId: c2.id, engine: "claude", hostId: studioId }),
+  ]);
+  expect([r1.status, r2.status].sort()).toEqual(["fulfilled", "rejected"]);
+
+  // Re-dispatching a previously remote ticket locally without --host clears stale studio-b hostId/hostName.
+  const winner = r1.status === "fulfilled" ? r1.value : (r2 as PromiseFulfilledResult<DispatchTicket>).value;
+  const winRemoteAttempt = winner.attempts.at(-1)!;
+  await b.store.publishBotMessage(winRemoteAttempt.botId, { conversationId: winRemoteAttempt.conversationId, blocks: [{ type: "text", text: "Done on studio" }], replyTo: winRemoteAttempt.inputMessageId, status: "complete" });
+  await b.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [winRemoteAttempt.inputMessageId, winRemoteAttempt.botId]);
+  await a.dispatch.sweep();
+  const localFollowup = await a.dispatch.dispatch(owner, "d", { requestId: "local-followup", ticketId: winner.id, engine: "claude", text: "Continue locally" });
+  expect(localFollowup.hostId).toBe(macId);
+  expect(localFollowup.hostName).toBe("macmini");
+  expect(localFollowup.attempts.at(-1)?.hostId).toBe(macId);
+
+  // Post-RPC commit failure (e.g., ticket paused concurrently) sends compensating /stop so no orphan remote run remains.
+  const tOrphan = await a.dispatch.create(owner, "d", { requestId: "orphan-c", title: "Orphan check", request: "Pause mid-RPC" });
+  const origCallPeer = a.dispatch.remote!.callPeer;
+  let pausedDuringRpc = false;
+  const orphanSpy = vi.spyOn(a.dispatch.remote!, "callPeer").mockImplementation(async (host, sourceBot, routePath, data, requestId) => {
+    const res = await origCallPeer(host, sourceBot, routePath, data, requestId);
+    if (routePath === "/api/bot-messages/dispatch/run" && !pausedDuringRpc) {
+      pausedDuringRpc = true;
+      await a.dispatch.action("owner", tOrphan.id, { requestId: "orphan-pause", action: "pause" });
+    }
+    return res;
+  });
+  await expect(a.dispatch.dispatch(owner, "d", { requestId: "orphan-d", ticketId: tOrphan.id, engine: "claude", hostId: studioId })).rejects.toThrow("ticket_paused");
+  orphanSpy.mockRestore();
+  const orphanRow = await b.store.db.get<{ status: string }>("SELECT status FROM remote_dispatch_tickets WHERE title='Orphan check'");
+  expect(orphanRow?.status).toBe("cancelled");
+
+  // Offline auto-failover preserves engine="claude", model="claude-sonnet-4-6", effort="high", force=true.
+  const failoverPlan = await a.dispatch.plan(owner, "d", {
+    requestId: "failover-claude",
+    title: "Claude failover",
+    request: "Single remote task",
+    engine: "claude",
+    model: "claude-sonnet-4-6",
+    effort: "high",
+    force: true,
+    hostIds: [studioId],
+    create: true,
+    dispatch: true,
+  });
+  const fTicket = failoverPlan.tickets![0]!;
+  expect(fTicket.hostId).toBe(studioId);
+  await b.close();
+  a.dispatch.remoteOfflineThreshold = 0;
+  await a.dispatch.sweep();
+  const failedOver = await a.dispatch.show(owner, fTicket.id);
+  expect(failedOver.status).toBe("working");
+  expect(failedOver.hostId).toBe(macId);
+  expect(failedOver.attempts.at(-1)).toMatchObject({ engine: "claude", model: "claude-sonnet-4-6", effort: "high" });
+});
+
+it("handles remote stop races, prompt-queue stop replay withholding, waitingFor clear, scopedRun errors, >200 replies, and blocked batches", async () => {
+  await authorizeStudioFromMac();
+
+  // 1. Remote pause racing with completion preserves result and artifacts!
+  const tRace = await a.dispatch.create(owner, "d", { requestId: "race-c", title: "Race complete", request: "Finish fast" });
+  const runningRace = await a.dispatch.dispatch(owner, "d", { requestId: "race-d", ticketId: tRace.id, engine: "codex", hostId: studioId });
+  const raceAtt = runningRace.attempts.at(-1)!;
+  const raceBytes = Buffer.from("important-artifact");
+  const raceSha = createHash("sha256").update(raceBytes).digest("hex");
+  const raceFile = await b.attachments.create("owner", { conversationId: raceAtt.conversationId, name: "result.txt", mime: "text/plain", size: raceBytes.length, sha256: raceSha });
+  await b.attachments.putChunk("owner", raceFile.id, 0, raceBytes);
+  await b.attachments.complete("owner", raceFile.id);
+  await b.store.publishBotMessage(raceAtt.botId, {
+    conversationId: raceAtt.conversationId,
+    blocks: [{ type: "text", text: "IMPORTANT COMPLETED RESULT" }, { type: "file", attachmentId: raceFile.id, name: "result.txt", mime: "text/plain", size: raceBytes.length }],
+    replyTo: raceAtt.inputMessageId, status: "complete",
+  });
+  await b.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [raceAtt.inputMessageId, raceAtt.botId]);
+  await a.dispatch.action("owner", tRace.id, { requestId: "race-pause", action: "pause" });
+  await a.dispatch.sweep();
+  const afterRace = await a.dispatch.show(owner, tRace.id);
+  expect(afterRace).toMatchObject({ status: "needs_review", paused: true });
+  expect(afterRace.result).toContain("IMPORTANT COMPLETED RESULT");
+  expect(afterRace.attempts.at(-1)?.outcome).toBe("completed");
+  expect(afterRace.artifacts?.[0]?.localAttachmentId).toBeTruthy();
+
+  // 2. Remote cancel on a running (dispatched=1, pending) turn does NOT prematurely mark cancelled,
+  //    transient transport failures keep retrying instead of abandoning, and prompt-queue suppresses replay!
+  const tRun = await a.dispatch.create(owner, "d", { requestId: "runstop-c", title: "Running stop", request: "Still running" });
+  const runningStop = await a.dispatch.dispatch(owner, "d", { requestId: "runstop-d", ticketId: tRun.id, engine: "codex", hostId: studioId });
+  const stopAtt = runningStop.attempts.at(-1)!;
+  await b.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id=?", [stopAtt.inputMessageId, stopAtt.botId]);
+  const origPeerCall = a.dispatch.remote!.callPeer;
+  const transientSpy = vi.spyOn(a.dispatch.remote!, "callPeer").mockImplementationOnce(async () => { throw new Error("ECONNRESET"); });
+  await a.dispatch.action("owner", tRun.id, { requestId: "runstop-cancel", action: "cancel" });
+  expect((await a.dispatch.show(owner, tRun.id)).status).toBe("working");
+  transientSpy.mockRestore();
+  void origPeerCall;
+  await a.dispatch.sweep();
+  const remoteRowWhileRunning = await b.store.db.get<{ status: string; stop_requested: string | null }>("SELECT status,stop_requested FROM remote_dispatch_tickets WHERE id=?", [stopAtt.remoteTicketId!]);
+  expect(remoteRowWhileRunning).toEqual({ status: "working", stop_requested: "cancel" });
+  expect((await a.dispatch.show(owner, tRun.id)).status).toBe("working");
+  const queueB = new HubPromptQueue(b.store);
+  const replayed = await queueB.claim(stopAtt.botId, true, true);
+  expect(replayed.some(m => m.id === stopAtt.inputMessageId)).toBe(false);
+  // Once the remote delivery terminates, sweep settles it to cancelled!
+  await b.store.db.run("UPDATE deliveries SET status='cancelled' WHERE message_id=? AND bot_id=?", [stopAtt.inputMessageId, stopAtt.botId]);
+  await a.dispatch.sweep();
+  expect((await a.dispatch.show(owner, tRun.id)).status).toBe("cancelled");
+
+  // 2b. Receiving Host notifies live dispatch.v1 clients via conversationCreated for hidden remote worker chats.
+  const { handleRemoteDispatchRequest } = await import("../src/hub/dispatch-remote.js");
+  const createdConvs: Array<{ userId: string; hidden?: boolean }> = [];
+  await handleRemoteDispatchRequest(
+    {
+      store: b.store,
+      auth: b.auth,
+      network: b.network,
+      attachments: b.attachments,
+      workers: b.dispatch.workers as unknown as Parameters<typeof handleRemoteDispatchRequest>[0]["workers"],
+      conversationCreated: (userId, conv) => { createdConvs.push({ userId, hidden: conv.hidden }); },
+      stop: async () => undefined,
+    },
+    a.auth.publicKey,
+    { hostId: macId, hostName: "macmini", botId: "d", botName: "Chancellor", requestId: "conv_notify_1", hops: 1 },
+    REMOTE_DISPATCH_TARGET_BOT,
+    "/api/bot-messages/dispatch/run",
+    { remoteRequestId: "conv_notify_1", title: "Hidden notify", request: "Check live notify", engine: "codex", model: "", effort: "" },
+  );
+  expect(createdConvs).toEqual([{ userId: "owner", hidden: true }]);
+
+  // 3. waitingFor clears when remote resumes from needs_answer to working; handled scopedRun error + >200 replies succeed!
+  const tScope = await a.dispatch.create(owner, "d", { requestId: "scope-c", title: "Scoped + waiting", request: "Long turn" });
+  const runScope = await a.dispatch.dispatch(owner, "d", { requestId: "scope-d", ticketId: tScope.id, engine: "codex", hostId: studioId });
+  const scAtt = runScope.attempts.at(-1)!;
+  await b.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id=?", [scAtt.inputMessageId, scAtt.botId]);
+  const waitMsg = await b.store.publishBotMessage(scAtt.botId, {
+    conversationId: scAtt.conversationId, replyTo: scAtt.inputMessageId, status: "complete",
+    blocks: [{ type: "card", elements: [{ type: "markdown", text: "Need answer" }], extra: { nativeRun: { runId: "r1", engine: "codex", phase: "waiting_answer", revision: 1, startedAt: 1, updatedAt: 2 } } }],
+  });
+  await a.dispatch.sweep();
+  expect((await a.dispatch.show(owner, tScope.id)).attempts.at(-1)?.waitingFor).toEqual({ kind: "answer", messageId: waitMsg.id });
+  // Owner answers -> phase returns to running -> waitingFor must clear!
+  await b.store.publishBotMessage(scAtt.botId, {
+    id: waitMsg.id, conversationId: scAtt.conversationId, replyTo: scAtt.inputMessageId, status: "complete", version: 2,
+    blocks: [{ type: "card", elements: [{ type: "markdown", text: "Running again" }], extra: { nativeRun: { runId: "r1", engine: "codex", phase: "running", revision: 2, startedAt: 1, updatedAt: 3 } } }],
+  });
+  await a.dispatch.sweep();
+  expect((await a.dispatch.show(owner, tScope.id)).attempts.at(-1)?.waitingFor).toBeUndefined();
+  // Add a handled scopedRun error + 205 replies + final done nativeRun!
+  await b.store.publishBotMessage(scAtt.botId, {
+    conversationId: scAtt.conversationId, replyTo: scAtt.inputMessageId, status: "complete",
+    blocks: [{ type: "card", elements: [{ type: "markdown", text: "Subagent handled error" }], extra: { scopedRun: { runId: "sub1", engine: "codex", phase: "error", revision: 1, startedAt: 1, updatedAt: 4 } } }],
+  });
+  for (let i = 0; i < 205; i++) {
+    await b.store.publishBotMessage(scAtt.botId, {
+      conversationId: scAtt.conversationId, replyTo: scAtt.inputMessageId, status: "complete",
+      blocks: [{ type: "text", text: `chunk-${i}` }],
+    });
+  }
+  await b.store.publishBotMessage(scAtt.botId, {
+    id: waitMsg.id, conversationId: scAtt.conversationId, replyTo: scAtt.inputMessageId, status: "complete", version: 3,
+    blocks: [{ type: "card", elements: [{ type: "markdown", text: "Done" }], extra: { nativeRun: { runId: "r1", engine: "codex", phase: "done", revision: 3, startedAt: 1, updatedAt: 5, endedAt: 5 } } }],
+  });
+  await b.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=? AND bot_id=?", [scAtt.inputMessageId, scAtt.botId]);
+  await a.dispatch.sweep();
+  const afterScope = await a.dispatch.show(owner, tScope.id);
+  expect(afterScope.status).toBe("needs_review");
+  expect(afterScope.result).toContain("chunk-204");
+
+  // 4. maybePublishBatchSummary does NOT freeze while a batch ticket is blocked, and publishes once retried and completed.
+  const bPlan = await a.dispatch.plan(owner, "d", {
+    requestId: "blocked-batch", title: "Blocked test", request: "2 parts", engine: "codex", items: ["A", "B"], create: true, dispatch: false,
+  });
+  const [bt1, bt2] = bPlan.tickets!;
+  await a.dispatch.update(owner, "d", { ticketId: bt1!.id, status: "needs_review" });
+  await a.dispatch.update(owner, "d", { ticketId: bt2!.id, status: "blocked" });
+  expect(await a.store.db.get("SELECT 1 FROM dispatch_batch_summaries WHERE batch_id=?", [bPlan.batchId])).toBeUndefined();
+  await a.dispatch.update(owner, "d", { ticketId: bt2!.id, status: "needs_review" });
+  await expect.poll(async () => a.store.db.get("SELECT 1 FROM dispatch_batch_summaries WHERE batch_id=?", [bPlan.batchId])).toBeTruthy();
+}, 30_000);
+
+it("fixes planner edge cases, plan idempotency, idle ask-mode probe suppression, Windows loadavg, deleted remote workers, and departed-host revocation", async () => {
+  // Planner: per-node-only prompts do NOT collapse into 1 batch.
+  expect(parseSplitTaskSpec("每台机器写 10 个脚本")).toEqual({ perNode: 10 });
+  expect(parseSplitTaskSpec("Write 10 scripts per machine")).toEqual({ perNode: 10 });
+
+  const mac = makeNode(macId, "macmini", { preference: "normal", maxConcurrent: 2 });
+  const less = makeNode(studioId, "studio-b", { preference: "less_often", maxConcurrent: 2 });
+  const manual = makeNode(`hub_${"f".repeat(64)}`, "manual-box", { preference: "manual_only" });
+  const perNodePlan = planSplitBatches({ requestId: "pn1", request: "每台机器写 10 个脚本", engine: "codex", create: false, dispatch: false }, [mac, less], defaultDispatcherSettings(), "batch_pn");
+  expect(perNodePlan.batches).toHaveLength(2);
+  expect(perNodePlan.batches.map(b => b.itemCount)).toEqual([10, 10]);
+
+  // Planner: explicit manual_only hostIds without engine picks an available engine.
+  const manualPlan = planSplitBatches({ requestId: "man1", request: "Write 4 scripts", hostIds: [manual.hostId], create: false, dispatch: false }, [mac, manual], defaultDispatcherSettings(), "batch_man");
+  expect(manualPlan.batches.length).toBeGreaterThan(0);
+  expect(manualPlan.batches.every(b => b.hostId === manual.hostId)).toBe(true);
+
+  // Planner: less_often gets fewer items than normal (not clamped to 1).
+  const weighted = planSplitBatches({ requestId: "w1", request: "Write 10 scripts", engine: "codex", totalItems: 10, create: false, dispatch: false }, [mac, less], defaultDispatcherSettings(), "batch_w");
+  const macItems = weighted.batches.filter(b => b.hostId === mac.hostId).reduce((s, b) => s + (b.itemCount ?? 0), 0);
+  const lessItems = weighted.batches.filter(b => b.hostId === less.hostId).reduce((s, b) => s + (b.itemCount ?? 0), 0);
+  expect(macItems).toBeGreaterThan(lessItems);
+
+  // Plan idempotency conflict, long requestId/note handling, and ask-mode zero-probe idle sweep.
+  await authorizeStudioFromMac();
+  const s = await a.dispatch.settings("owner", "d");
+  await a.dispatch.updateSettings("owner", "d", { settings: { ...s.settings, mode: "ask" }, expectedRevision: s.revision });
+  const longReqId = `plan_${"x".repeat(120)}`;
+  const createdPlan = await a.dispatch.plan(owner, "d", { requestId: longReqId, request: "Write 4 scripts, 2 per machine", engine: "codex", create: true, dispatch: false });
+  expect(createdPlan.tickets).toHaveLength(2);
+  await a.dispatch.update(owner, "d", { ticketId: createdPlan.tickets![0]!.id, note: "n".repeat(400) });
+  await expect(a.dispatch.plan(owner, "d", { requestId: longReqId, request: "DIFFERENT request", engine: "codex", create: true, dispatch: false })).rejects.toThrow("idempotency_conflict");
+
+  // Unapproved ask-mode queued batch must NOT probe peer Hosts on sweep!
+  const callPeerSpy = vi.spyOn(a.dispatch.remote!, "callPeer");
+  await a.dispatch.sweep();
+  expect(callPeerSpy).not.toHaveBeenCalled();
+  callPeerSpy.mockRestore();
+
+  // Replaying same requestId with dispatch: true dispatches the queued tickets and truncates long reason safely.
+  const dispatchedPlan = await a.dispatch.plan(owner, "d", { requestId: longReqId, request: "Write 4 scripts, 2 per machine", engine: "codex", create: true, dispatch: true });
+  expect(dispatchedPlan.batches.every(bt => bt.reason.length <= 128)).toBe(true);
+  expect(dispatchedPlan.tickets!.every(tk => tk.status === "working")).toBe(true);
+
+  // readLocalHostLoad omits cpuLoadRatio on win32.
+  const origPlatform = process.platform;
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  try {
+    const winLoad = await readLocalHostLoad({ store: a.store, auth: a.auth, network: a.network, attachments: a.attachments, conversationCreated: () => {}, stop: async () => undefined }, []);
+    expect(winLoad.cpuLoadRatio).toBeUndefined();
+  } finally {
+    Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
+  }
+
+  // remoteDispatchWorker derives a new botId after deletion instead of failing with 410 bot_deleted.
+  const mgr = new BotManager(b.store, bDir, { entrypoint: path.resolve("tests/fixtures/managed-bot-worker.mjs"), env: { ...process.env, CODEX_EXECUTABLE: process.execPath } }, () => b.instanceUrl, async () => undefined);
+  try {
+    const w1 = await mgr.remoteDispatchWorker(macId, "codex");
+    await mgr.delete("owner", w1, "Remote · Codex");
+    const w2 = await mgr.remoteDispatchWorker(macId, "codex");
+    expect(w2).not.toBe(w1);
+  } finally {
+    await mgr.close();
+  }
+
+  // Departed-host dispatch grant revocation works and invalid requests do not consume the one-use proof.
+  let admitted = 0;
+  const admit = async () => { admitted++; };
+  await expect(updateCrossHostDispatchGrants(
+    { store: b.store, auth: b.auth, network: b.network, attachments: b.attachments, conversationCreated: () => {}, stop: async () => undefined },
+    "owner", "dev",
+    { operation: "cross-host-dispatch-grant", sourceHost: `hub_${"0".repeat(64)}`, sourceBot: "d", allowed: false },
+    async () => undefined, admit,
+  )).rejects.toThrow("bot_message_host_not_found");
+  expect(admitted).toBe(0);
+  // Remove macmini from Host B's manifest and verify residual grant can still be revoked!
+  await b.store.db.run("DELETE FROM meta WHERE key='private-network:v1'");
+  const afterRevoke = await updateCrossHostDispatchGrants(
+    { store: b.store, auth: b.auth, network: b.network, attachments: b.attachments, conversationCreated: () => {}, stop: async () => undefined },
+    "owner", "dev",
+    { operation: "cross-host-dispatch-grant", sourceHost: macId, sourceBot: "d", allowed: false },
+    async () => undefined, admit,
+  );
+  expect(admitted).toBe(1);
+  expect(afterRevoke.grants).toEqual([]);
+
+  // Database schema version is bumped to 27.
+  expect(await a.store.db.get("SELECT value FROM meta WHERE key='schema_version'")).toEqual({ value: "27" });
 });
