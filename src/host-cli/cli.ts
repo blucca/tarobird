@@ -247,9 +247,11 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   devices rename ID --name N           修改此主机上的设备名称
                                       本机桌面端共用主机名称，请用 name <名称>
                                       撤销已入网设备会同步全网，不会让主机退出组网
-  pair [--lan | --tailscale | --routes FILE] [--address IP] [--v1] [--out FILE] [--wait SECONDS]
+  pair [--lan | --tailscale | --routes FILE] [--address IP] [--v2] [--out FILE] [--wait SECONDS]
     需运行新版主机并登记 CLI 控制器（tarobot enroll）；生成 5 分钟有效、仅限一台新设备的邀请。
-    --lan 默认自动排序并将最多 4 条直连候选写入 v2 连接码；需要兼容旧版 App 时加 --v1。
+    默认生成只含一个直连地址的 v1 连接码，所有版本的 App 都能识别；电脑有多个地址时用 --address IP 选择。
+    --v2 仅用于高于 1.6.0 的 App：--lan 自动排序并写入最多 4 条直连候选和已共享的中转，新设备会同时尝试；
+    1.6.0 及更早的 App 无法识别 v2 连接码。
   network status | create --name N | routes --from FILE --yes
   network local [--tailscale] [--json] 只读查看本机局域网/Tailscale 线路与共享线路
   network select-lan --from FILE --yes 选择已监听的局域网线路，保留已共享的 Tailscale
@@ -314,7 +316,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     days: { type: "string" }, mode: { type: "string" }, adapter: { type: "string" }, "threshold-seconds": { type: "string" }, enabled: { type: "string" }, engine: { type: "string" }, model: { type: "string" }, effort: { type: "string" }, workspace: { type: "string" }, permission: { type: "string" },
     action: { type: "string" }, anchor: { type: "string" }, cursor: { type: "string" }, "request-id": { type: "string" }, "expected-name": { type: "string" }, yes: { type: "boolean" }, force: { type: "boolean" }, abandon: { type: "boolean" },
     wait: { type: "string" }, from: { type: "string" }, out: { type: "string" }, routes: { type: "string" },
-    lan: { type: "boolean" }, tailscale: { type: "boolean" }, address: { type: "string" }, v1: { type: "boolean" }, reset: { type: "boolean" },
+    lan: { type: "boolean" }, tailscale: { type: "boolean" }, address: { type: "string" }, v2: { type: "boolean" }, reset: { type: "boolean" },
     role: { type: "string" }, "dispatch-mode": { type: "string" }, "max-concurrent": { type: "string" }, allow: { type: "string" }, assist: { type: "string" }, status: { type: "string" }, note: { type: "string" }, open: { type: "boolean" }, match: { type: "string" }, offset: { type: "string" },
     folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
     "html-file": { type: "string" }, "report-file": { type: "string" }, title: { type: "string" }, summary: { type: "string" },
@@ -346,7 +348,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     integrations: ["yes", "request-id", "mode", "enabled", "adapter", "threshold-seconds", "revision"], directory: ["from"], init: ["name"], stop: ["wait", "force"], restart: ["wait", "force"], enroll: ["reset", "yes"], name: ["name"], drain: ["wait"],
     service: ["yes"], bots: ["name", "engine", "model", "effort", "workspace", "permission", "request-id", "expected-name", "yes", "revision", "enabled", "role", "dispatch-mode", "max-concurrent", "allow", "from"],
     tickets: ["bot", "conversation", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
-    devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "v1", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
+    devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "v2", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
     folders: ["enabled", "revision", "unfiled"],
     conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session"],
     widgets: ["html-file", "report-file", "title", "summary", "request-id", "enabled", "revision"],
@@ -695,7 +697,9 @@ export async function runHostCli(argv: string[]): Promise<void> {
       await startCompatible();
       let drainId: string | undefined, lease: ReturnType<typeof keepHostDrainLease> | undefined;
       let configured;
-      const requireSingleAddress = !!v.address || !!v.tailscale || !!v.v1;
+      // A v1 code holds one direct address, and Apps up to 1.6.0 read nothing
+      // else: several candidates are written only when --v2 asks for them.
+      const requireSingleAddress = !!v.address || !!v.tailscale || !v.v2;
       try {
         checkCancelled();
         configured = await desktopHost(v.tailscale ? "tailscale" : "network", directory, entrypoint, undefined, {
@@ -705,7 +709,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
               if (v.address) return v.address;
               const ipv4 = v.tailscale ? addresses.filter(isIPv4) : [];
               const selectionPool = ipv4.length ? ipv4 : addresses;
-              if (selectionPool.length > 1) throw new Error(`发现多个可用地址：${selectionPool.join("、")}。请用 --address IP 选择手机可达的地址。`);
+              if (selectionPool.length > 1) throw new Error(`发现多个可用地址：${selectionPool.join("、")}。请用 --address IP 选择手机可达的地址。${v.lan ? "新设备的 App 高于 1.6.0 时，也可改用 --v2 一次写入多个候选地址。" : ""}`);
               return selectionPool[0]!;
             },
           } : {}),
@@ -737,7 +741,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
         }
         routes = localRoutesSchema.parse(selectPairingInviteRoutes(configured.routes, [], { candidates }));
       }
-    } else if (v.routes) routes = (v.v1 ? routesSchema : localRoutesSchema).parse(await readJson(v.routes));
+    } else if (v.routes) routes = (v.v2 ? localRoutesSchema : routesSchema).parse(await readJson(v.routes));
     else {
       const client = await LocalHostClient.connect(directory);
       try { routes = (await new HostNetwork(client).view()).host.routes; } finally { client.close(); }
@@ -752,7 +756,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
         const sharedLan = view.host.routes.find(route => route.name === "Direct" && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(new URL(route.url).hostname));
         if (!sharedLan || sharedLan.url === routes[0]!.url && sharedLan.certificateAuthority === routes[0]!.certificateAuthority) await network.selectLan(routes[0]);
         else console.error("已生成所选地址的连接码；原共享局域网线路保持不变。如需替换，请使用 network routes 明确更新。");
-        if (!v.v1 && !v.address) {
+        if (v.v2 && !v.address) {
           const relays = view.host.routes.filter(route => route.name === "VPS");
           if (relays.length) routes = localRoutesSchema.parse(selectPairingInviteRoutes(routes, relays, { candidates }));
         }
@@ -762,7 +766,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
       if (error instanceof Error && error.message === "pairing_invites_full") throw new Error("有效邀请或待确认设备过多。请用 tarobot devices invites 查看，再用 tarobot devices revoke-invite ID 撤销未使用的邀请，或等待 5 分钟后重试。");
       throw error;
     });
-    const link = hostPairingLink(service.publicKey, routes, invitation.invite, { version: v.v1 ? 1 : undefined });
+    const link = hostPairingLink(service.publicKey, routes, invitation.invite, { version: v.v2 ? 2 : 1 });
     if (outputFile) { await outputFile.writeFile(link + "\n"); await outputFile.sync(); exported = true; }
     if (v.json) await output({ host: await readHostProfile(directory), publicKey: service.publicKey, routes, ...(candidates ? { candidates } : {}), ...(windowsFirewall?.supported ? { windowsFirewall } : {}), link, inviteId: invitation.id, expiresAt: invitation.expiresAt, serverTime: invitation.serverTime });
     else {

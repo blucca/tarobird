@@ -89,9 +89,10 @@ function compactV2ConnectPayload(payload: Omit<ConnectV2Payload, "invite">): z.i
   };
 }
 
-/** Build a connect QR payload. Keeps v1 when there is at most one direct route
- * or when compatibility mode (`version: 1`) is requested; upgrades to v2 when
- * multiple direct candidates are offered for concurrent racing on new Apps. */
+/** Build a connect QR payload. v1 (one direct route) unless `version: 2` is
+ * asked for: Apps up to 1.6.0 accept only v1 and report any other code as
+ * damaged. v2 carries several direct candidates for newer Apps to race, and is
+ * used only when there is more than one to carry. */
 export function connectionPairingPayload(
   hubPublicKey: string,
   local: readonly Route[],
@@ -108,7 +109,7 @@ export function connectionPairingPayload(
     : [];
   const relays = local.filter(route => route.name === "VPS").slice(0, MAX_VPS_ROUTES);
 
-  if (options?.version === 1 || orderedDirects.length <= 1) {
+  if (options?.version !== 2 || orderedDirects.length <= 1) {
     const direct = orderedDirects[0];
     const routes = routesSchema.parse([...(direct ? [direct] : []), ...relays]);
     return {

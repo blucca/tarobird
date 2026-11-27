@@ -53,7 +53,8 @@ describe("QR route repair", () => {
       relays[0]!,
     ];
     const saved = identity([{ name: "Direct", url: "https://192.168.1.99:23456", certificateAuthority: oldCa }, relays[0]!], "computer");
-    const v2Payload = parsePairingLink(pairingLink(connectionPairingPayload(hubPublicKey, scanned, "computer")));
+    const v2Payload = parsePairingLink(pairingLink(connectionPairingPayload(hubPublicKey, scanned, "computer", undefined, { version: 2 })));
+    expect(v2Payload.v).toBe(2);
     const repaired = repairRoutes(saved, v2Payload);
     expect(repaired?.routes.map(route => route.url)).toEqual(scanned.map(route => route.url));
     expect(repaired?.directs.map(route => route.url)).toEqual(scanned.slice(0, 3).map(route => route.url));

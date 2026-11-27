@@ -29,7 +29,9 @@ export function DesktopHostInvite({
   purpose?: "pairing" | "network";
 }) {
   useLocale();
-  const [legacyV1, setLegacyV1] = useState(false);
+  // Apps up to 1.6.0 read only a v1 code (one direct address) and call any
+  // other code damaged, so several candidates are the owner's explicit choice.
+  const [multiAddress, setMultiAddress] = useState(false);
   const {
     method,
     chooseMethod,
@@ -55,11 +57,11 @@ export function DesktopHostInvite({
     ? selectPairingInviteRoutes(routes, relays, {
         primaryUrl: selectedRoute.url,
         candidates,
-        version: legacyV1 ? 1 : 2,
+        version: multiAddress ? 2 : 1,
       })
     : [];
   const directInviteCount = inviteRoutes.filter(route => route.name !== "VPS").length;
-  const canToggleCompat = selectedRoute
+  const canOfferMultiAddress = selectedRoute
     ? selectPairingInviteRoutes(routes, relays, { primaryUrl: selectedRoute.url, candidates, version: 2 })
         .filter(route => route.name !== "VPS").length > 1
     : false;
@@ -97,10 +99,10 @@ export function DesktopHostInvite({
       {showInvitation && <>
         <ConnectionInviteCode
           connection={connection}
-          payload={connectionPairingPayload(hubKey, inviteRoutes, "computer", selectedRoute.url, { version: legacyV1 ? 1 : undefined })}
+          payload={connectionPairingPayload(hubKey, inviteRoutes, "computer", selectedRoute.url, { version: multiAddress ? 2 : 1 })}
         />
         {directInviteCount > 1 && <p className="settings-note pairing-multi-note" role="status">{t("二维码已包含 {0} 个可用候选地址{1}，新设备会同时尝试并选择最快的一条。", directInviteCount, relays.length ? t("和备用中转") : "")}</p>}
-        {canToggleCompat && <label className="pairing-qr-compat"><input type="checkbox" checked={legacyV1} onChange={(e) => setLegacyV1(e.target.checked)}/><span>{t("兼容旧版 App（仅包含当前所选的单个地址）")}</span></label>}
+        {canOfferMultiAddress && <label className="pairing-qr-compat"><input type="checkbox" checked={multiAddress} onChange={(e) => setMultiAddress(e.target.checked)}/><span>{t("加入多个候选地址（仅适用于高于 1.6.0 的 App）")}</span></label>}
       </>}
       {compact ? <details><summary>{t("连接地址")}</summary><input aria-label={t("连接地址")} readOnly value={selectedRoute.url}/></details> : <label>{t("连接地址")}<input readOnly value={selectedRoute.url} onFocus={event => event.currentTarget.select()}/></label>}
       {showInvitation ? <p>{t("在新设备打开 TaroBird，扫描此二维码。再回到这里，输入新设备上的 8 位配对码确认。")}</p> : !error && <p role="status">{!handsOffInvitation && publishedRoute === selectedRoute.url ? t("本机线路已共享，可以继续确认加入。") : t("正在等待本机重新连接并共享线路…")}</p>}

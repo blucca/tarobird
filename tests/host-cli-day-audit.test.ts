@@ -136,15 +136,33 @@ it("restores the existing certificate and leaves the host untouched when pre-res
   expect(await readFile(path.join(f.directory, "config.json"), "utf8")).toBe(config);
 });
 
-it("requires explicit --address in --v1 mode before configuring TLS, and supports multi-candidate --lan pairing", async () => {
+it("lists multiple interface addresses before configuring anything, accepts an explicit address, and writes several candidates only with --v2", async () => {
   const f = await pairingFixture(["172.17.0.1", "192.168.1.2"]), leaf = vi.mocked(tls.desktopTls);
-  await expect(runHostCli(["pair", "--lan", "--v1", ...f.args])).rejects.toThrow("172.17.0.1、192.168.1.2");
+  const codeVersion = (call: number) => JSON.parse(new URL(JSON.parse(f.output.mock.calls[call]![0]).link).searchParams.get("data")!).v;
+  // Default: a v1 code, the only kind Apps up to 1.6.0 read, holds one direct
+  // address, so the owner picks it. The refusal names both ways forward.
+  const refusal = await runHostCli(["pair", "--lan", ...f.args]).then(() => undefined, (error: Error) => error.message);
+  expect(refusal).toContain("172.17.0.1、192.168.1.2");
+  expect(refusal).toContain("--address IP");
+  expect(refusal).toContain("--v2");
   expect(leaf).not.toHaveBeenCalled(); expect(f.host).not.toHaveBeenCalled(); expect(f.connect).not.toHaveBeenCalled();
-  await runHostCli(["pair", "--lan", ...f.args]);
+  await runHostCli(["pair", "--lan", "--v2", ...f.args]);
   expect(JSON.parse(f.output.mock.calls[0]![0])).toMatchObject({ routes: [{ url: "https://172.17.0.1:8790" }, { url: "https://192.168.1.2:8790" }] });
+  expect(codeVersion(0)).toBe(2);
   await runHostCli(["pair", "--lan", "--address", "192.168.1.2", ...f.args]);
   expect(JSON.parse(f.output.mock.calls[1]![0])).toMatchObject({ routes: [{ url: "https://192.168.1.2:8790" }] });
+  expect(codeVersion(1)).toBe(1);
   expect(f.connect).toHaveBeenCalledTimes(2);
+});
+
+it("writes a v1 code for a single address with or without --v2", async () => {
+  const f = await pairingFixture();
+  for (const [call, flags] of [[], ["--v2"]].entries()) {
+    await runHostCli(["pair", "--lan", ...flags, ...f.args]);
+    const printed = JSON.parse(f.output.mock.calls[call]![0]);
+    expect(printed).toMatchObject({ routes: [{ url: "https://192.168.1.2:8790" }] });
+    expect(JSON.parse(new URL(printed.link).searchParams.get("data")!)).toMatchObject({ v: 1, routes: [{ name: "Direct", url: "https://192.168.1.2:8790" }] });
+  }
 });
 
 it("suppresses Private-profile Windows firewall warning in CLI output on Domain networks", async () => {

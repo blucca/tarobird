@@ -5,7 +5,8 @@ import { PairingCandidateRaceError, racePairingCandidates } from "../client/src/
 import { connectionPairingPayload, pairingLink, parsePairingLink } from "../client/src/pairing-link.js";
 import { diagnoseRouteFailures } from "../client/src/route-diagnostics.js";
 import { hostPairingLink } from "../src/host-cli/pairing.js";
-import type { Route } from "../src/client-protocol/routes.js";
+import { z } from "zod";
+import { deploymentSchema, routesSchema, type Route } from "../src/client-protocol/routes.js";
 
 const key = generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "der" }).toString("base64");
 const ca = "A".repeat(160);
@@ -180,8 +181,8 @@ describe("v1 and v2 pairing payload compatibility", () => {
     { name: "VPS", url: "https://relay.example:8443" },
   ];
 
-  it("emits compact v2 QR with shared CA hoisting and hydrates all routes on parse", () => {
-    const payload = connectionPairingPayload(key, routes, "computer", routes[0]!.url);
+  it("emits compact v2 QR with shared CA hoisting and hydrates all routes on parse when v2 is asked for", () => {
+    const payload = connectionPairingPayload(key, routes, "computer", routes[0]!.url, { version: 2 });
     expect(payload.v).toBe(2);
     const link = pairingLink({ ...payload, invite });
     // Shared CA is hoisted once instead of duplicated across 3 routes.
@@ -196,7 +197,7 @@ describe("v1 and v2 pairing payload compatibility", () => {
       invite,
     });
 
-    const cliLink = hostPairingLink(key, routes, invite);
+    const cliLink = hostPairingLink(key, routes, invite, { version: 2 });
     expect(parsePairingLink(cliLink)).toEqual({
       v: 2,
       kind: "connect",
@@ -210,6 +211,9 @@ describe("v1 and v2 pairing payload compatibility", () => {
     const single: Route[] = [{ name: "Direct", url: "https://192.168.1.10:23456", certificateAuthority: ca }, routes[3]!];
     const autoSingle = connectionPairingPayload(key, single, "computer");
     expect(autoSingle.v).toBe(1);
+    // One direct route is a v1 code even when v2 is asked for: nothing more to carry.
+    expect(connectionPairingPayload(key, single, "computer", undefined, { version: 2 }).v).toBe(1);
+    expect(parsePairingLink(hostPairingLink(key, single, invite, { version: 2 }))).toMatchObject({ v: 1, routes: single });
 
     const compat = connectionPairingPayload(key, routes, "computer", routes[1]!.url, { version: 1 });
     expect(compat.v).toBe(1);
@@ -220,13 +224,40 @@ describe("v1 and v2 pairing payload compatibility", () => {
     expect(parsePairingLink(validCliV1)).toMatchObject({ v: 1, kind: "connect", routes: single, invite });
   });
 
+  it("produces a code the released 1.6.0 App accepts unless v2 is asked for", () => {
+    // The connect payload rule of the 1.6.0 App: `v` is exactly 1, no unknown
+    // key, at most one direct route. Anything else is shown as "damaged".
+    const released = z.object({
+      v: z.literal(1),
+      kind: z.literal("connect"),
+      hubPublicKey: z.string().min(40).max(100),
+      routes: routesSchema,
+      deployment: deploymentSchema.optional(),
+    }).strict();
+    const dataOf = (link: string) => JSON.parse(new URL(link).searchParams.get("data")!) as unknown;
+
+    // A host with several plausible direct routes, no version given.
+    const appDefault = connectionPairingPayload(key, routes, "computer", routes[1]!.url);
+    expect(appDefault).toEqual({ v: 1, kind: "connect", hubPublicKey: key, routes: [routes[1]!, routes[3]!], deployment: "computer" });
+    expect(released.safeParse(dataOf(pairingLink({ ...appDefault, invite }))).success).toBe(true);
+
+    const single: Route[] = [routes[0]!, routes[3]!];
+    expect(released.safeParse(dataOf(hostPairingLink(key, single, invite))).success).toBe(true);
+    // The CLI never drops addresses silently: several direct routes need the explicit v2.
+    expect(() => hostPairingLink(key, routes, invite)).toThrow();
+
+    // The explicit choice is the one a 1.6.0 App cannot read.
+    expect(released.safeParse(dataOf(pairingLink({ ...connectionPairingPayload(key, routes, "computer", routes[1]!.url, { version: 2 }), invite }))).success).toBe(false);
+    expect(released.safeParse(dataOf(hostPairingLink(key, routes, invite, { version: 2 }))).success).toBe(false);
+  });
+
   it("does not hoist a shared CA onto system-CA direct or Tailscale routes in v2 payloads", () => {
     const mixed: Route[] = [
       { name: "Direct", url: "https://192.168.1.10:23456", certificateAuthority: ca },
       { name: "Direct", url: "https://192.168.2.10:23456", certificateAuthority: ca },
       { name: "Tailscale", url: "https://tailscale.example.test" },
     ];
-    const clientLink = pairingLink({ ...connectionPairingPayload(key, mixed, "computer", mixed[0]!.url), invite });
+    const clientLink = pairingLink({ ...connectionPairingPayload(key, mixed, "computer", mixed[0]!.url, { version: 2 }), invite });
     const clientDecoded = parsePairingLink(clientLink);
     expect(clientDecoded).toEqual({
       v: 2,
@@ -238,7 +269,7 @@ describe("v1 and v2 pairing payload compatibility", () => {
     });
     expect(clientDecoded.kind === "connect" && clientDecoded.routes[2]!.certificateAuthority).toBeUndefined();
 
-    const cliLink = hostPairingLink(key, mixed, invite);
+    const cliLink = hostPairingLink(key, mixed, invite, { version: 2 });
     const cliDecoded = parsePairingLink(cliLink);
     expect(cliDecoded).toEqual({
       v: 2,
@@ -256,7 +287,7 @@ describe("v1 and v2 pairing payload compatibility", () => {
       { name: "Direct", url: "https://192.168.2.10:23456", certificateAuthority: ca },
       { name: "Tailscale", url: "https://100.64.0.1:23456", certificateAuthority: distinctCa },
     ];
-    expect(parsePairingLink(pairingLink({ ...connectionPairingPayload(key, allPinned, "computer", allPinned[0]!.url), invite }))).toEqual({
+    expect(parsePairingLink(pairingLink({ ...connectionPairingPayload(key, allPinned, "computer", allPinned[0]!.url, { version: 2 }), invite }))).toEqual({
       v: 2,
       kind: "connect",
       hubPublicKey: key,
@@ -264,7 +295,7 @@ describe("v1 and v2 pairing payload compatibility", () => {
       deployment: "computer",
       invite,
     });
-    expect(parsePairingLink(hostPairingLink(key, allPinned, invite))).toEqual({
+    expect(parsePairingLink(hostPairingLink(key, allPinned, invite, { version: 2 }))).toEqual({
       v: 2,
       kind: "connect",
       hubPublicKey: key,

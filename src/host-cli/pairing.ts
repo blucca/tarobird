@@ -44,6 +44,8 @@ function compactHostV2Routes(routes: Route[]): { routes: Route[]; certificateAut
   };
 }
 
+/** v1 (at most one direct route) unless `version: 2` is asked for: Apps up to
+ * 1.6.0 accept only v1 and report any other code as damaged. */
 export function hostPairingLink(
   publicKey: string,
   routes: Route[],
@@ -54,7 +56,7 @@ export function hostPairingLink(
   // A phone cannot connect to the computer's loopback, even if both use localhost.
   for (const route of routes) sharedRoutesSchema.parse([route]);
   const directCount = routes.filter(route => route.name !== "VPS").length;
-  const payload = options.version !== 1 && directCount > 1
+  const payload = options.version === 2 && directCount > 1
     ? (() => {
         const parsed = localRoutesSchema.parse(routes);
         const compacted = compactHostV2Routes(parsed);

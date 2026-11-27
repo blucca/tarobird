@@ -127,17 +127,32 @@ test("every offered connection choice yields a decodable code for that network",
     expect(shareable(payload)).toBe(true);
     const direct = payload.routes.filter(route => route.name !== "VPS");
     if (direct[0]) {
-      expect(payload.v).toBe(2);
-      expect(direct[0].url).toBe(value);
-      expect(direct.length).toBe(2);
-      for (const route of direct) expect(route.certificateAuthority).toBe(ca);
+      // Unless the owner asks for more, the code is the single-direct v1 that
+      // Apps up to 1.6.0 can read.
+      expect(payload.v).toBe(1);
+      expect(direct.map(route => route.url)).toEqual([value]);
+      expect(direct[0].certificateAuthority).toBe(ca);
       directs.add(direct[0].url);
     } else relayOnly = payload;
   }
   expect([...directs].sort()).toEqual([tailnet, lan].sort());
-  // Legacy compatibility mode emits a single-direct v1 QR for the chosen route.
+  // The explicit choice for newer Apps emits a v2 QR: the chosen route first,
+  // then the host's other direct candidate.
   await choice.selectOption(lan);
-  await page.getByLabel("兼容旧版 App（仅包含当前所选的单个地址）").check();
+  const several = page.getByLabel("加入多个候选地址（仅适用于高于 1.6.0 的 App）");
+  await expect(several).not.toBeChecked();
+  await several.check();
+  await expect.poll(async () => {
+    const links = await page.evaluate(() => window.inviteFixture.decodeAll());
+    if (links.length !== 1) return false;
+    const p = parsePairingLink(links[0]!);
+    return p.kind === "connect" && p.v === 2 && p.routes.filter(r => r.name !== "VPS").length === 2;
+  }).toBe(true);
+  const multiPayload = await scanned(page);
+  expect(multiPayload.routes.filter(route => route.name !== "VPS").map(route => route.url)).toEqual([lan, tailnet]);
+  for (const route of multiPayload.routes.filter(route => route.name !== "VPS")) expect(route.certificateAuthority).toBe(ca);
+  // Unticking returns to the single-direct v1 QR for the chosen route.
+  await several.uncheck();
   await expect.poll(async () => {
     const links = await page.evaluate(() => window.inviteFixture.decodeAll());
     if (links.length !== 1) return false;
@@ -395,9 +410,18 @@ test("first-time compact pairing waits for the chosen LAN address before advanci
   await expect.poll(async () => (await calls(page)).busy).toBe(false);
   await selector.selectOption({ label: "局域网 · 192.168.10.20" });
   await expect(selector).toHaveCount(0);
+  // The handed-off code is the single-direct v1. The other prepared address
+  // joins it only when the owner asks for several candidates.
   const payload = await scanned(page);
-  expect(payload.v).toBe(2);
-  expect(payload.routes.map(route => route.url)).toEqual([lan, "https://192.168.50.2:8788"]);
+  expect(payload.v).toBe(1);
+  expect(payload.routes.map(route => route.url)).toEqual([lan]);
+  await page.getByLabel("加入多个候选地址（仅适用于高于 1.6.0 的 App）").check();
+  await expect.poll(async () => {
+    const links = await page.evaluate(() => window.inviteFixture.decodeAll());
+    if (links.length !== 1) return undefined;
+    const p = parsePairingLink(links[0]!);
+    return p.kind === "connect" ? { v: p.v, routes: p.routes.map(route => route.url) } : undefined;
+  }).toEqual({ v: 2, routes: [lan, "https://192.168.50.2:8788"] });
   await expect.poll(async () => (await calls(page)).busy).toBe(false);
 });
 
@@ -497,7 +521,8 @@ test("the waiting notice alone never mints a temporary code before the handoff",
   await page.evaluate(() => window.inviteFixture.release("L"));
   await expect(page.getByText("其他连接方式", { exact: true })).toBeVisible();
   const handedOff = await scanned(page);
-  expect(handedOff.v).toBe(2);
+  expect(handedOff.v).toBe(1);
+  expect(handedOff.routes).toHaveLength(1);
   expect(handedOff.routes[0]).toMatchObject({ name: "Direct", url: lan });
   expect((await calls(page)).http.filter(call => call.path === PAIRING_INVITES_PATH && call.method === "POST")).toHaveLength(1);
   expect((await calls(page)).http.filter(call => call.path === PAIRING_INVITE_REVOKE_PATH)).toEqual([]);

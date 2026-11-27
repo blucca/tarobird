@@ -47,13 +47,25 @@ test("explicit Tailscale choice creates a decodable, scoped HTTPS invite and exp
   }
 });
 
-test("a later Wi-Fi candidate remains selectable and offers v2 multi-candidate QR plus v1 compatibility", async ({ page }) => {
+test("a later Wi-Fi candidate remains selectable; its QR is v1 unless several candidates are asked for", async ({ page }) => {
   await page.evaluate(() => { window.tailscaleFixture.state.lanAddresses = ["192.168.50.2", "172.16.10.1", "172.16.11.1", "10.10.10.2", "192.168.10.20"]; });
   await page.getByRole("button", { name: "生成局域网二维码", exact: true }).click();
   const selector = page.getByRole("combobox", { name: /^选择电脑所在网络/ });
   await expect(selector.locator("option:not([disabled])")).toHaveCount(5);
   await selector.selectOption("4");
   await expect(page.getByLabel("连接地址", { exact: true })).toHaveValue("https://192.168.10.20:8788");
+  await expect(page.getByRole("img", { name: "连接二维码", exact: true })).toBeVisible();
+  // Default: only the selected address, in the v1 code Apps up to 1.6.0 can read.
+  await expect.poll(async () => parsePairingLink(await page.evaluate(() => window.tailscaleFixture.decode()))).toMatchObject({
+    v: 1,
+    kind: "connect",
+    routes: [{ name: "Direct", url: "https://192.168.10.20:8788", certificateAuthority }],
+  });
+  const payload = parsePairingLink(await page.evaluate(() => window.tailscaleFixture.decode()));
+  expect(payload.kind === "connect" && payload.routes.length).toBe(1);
+  const several = page.getByLabel("加入多个候选地址（仅适用于高于 1.6.0 的 App）");
+  await expect(several).not.toBeChecked();
+  await several.check();
   await expect(page.getByRole("img", { name: "连接二维码", exact: true })).toBeVisible();
   await expect.poll(async () => parsePairingLink(await page.evaluate(() => window.tailscaleFixture.decode()))).toMatchObject({
     v: 2,
@@ -65,15 +77,6 @@ test("a later Wi-Fi candidate remains selectable and offers v2 multi-candidate Q
       { name: "Direct", url: "https://172.16.11.1:8788", certificateAuthority },
     ],
   });
-  await page.getByLabel("兼容旧版 App（仅包含当前所选的单个地址）").check();
-  await expect(page.getByRole("img", { name: "连接二维码", exact: true })).toBeVisible();
-  await expect.poll(async () => parsePairingLink(await page.evaluate(() => window.tailscaleFixture.decode()))).toMatchObject({
-    v: 1,
-    kind: "connect",
-    routes: [{ name: "Direct", url: "https://192.168.10.20:8788", certificateAuthority }],
-  });
-  const payload = parsePairingLink(await page.evaluate(() => window.tailscaleFixture.decode()));
-  expect(payload.kind === "connect" && payload.routes.length).toBe(1);
   expect(await page.evaluate(() => window.tailscaleFixture.state.calls)).toEqual(["status", "network"]);
 });
 
@@ -383,7 +386,7 @@ test("a LAN choice can change while the host is reconnecting before publication 
   await page.evaluate(() => (window.tailscaleFixture as any).setNetworkStatus("online"));
   await expect.poll(() => page.evaluate(() => (window.tailscaleFixture as any).networkCalls.length)).toBe(1);
   await expect(page.getByRole("img", { name: "连接二维码", exact: true })).toBeVisible();
-  expect(parsePairingLink(await page.evaluate(() => window.tailscaleFixture.decode()))).toMatchObject({ v: 2, routes: [{ url: "https://192.168.10.20:8788" }, { url: "https://192.168.50.2:8788" }] });
+  expect(parsePairingLink(await page.evaluate(() => window.tailscaleFixture.decode()))).toMatchObject({ v: 1, routes: [{ url: "https://192.168.10.20:8788" }] });
 });
 
 test("a sole surviving LAN candidate is automatically selected even when other candidates failed", async ({ page }) => {

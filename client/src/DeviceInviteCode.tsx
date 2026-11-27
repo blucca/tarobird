@@ -27,7 +27,10 @@ export function DeviceInviteCode({ connection, localHost, busyChange }: { connec
   const [preparing, setPreparing] = useState(false);
   useEffect(() => { busyChange?.(preparing); return () => busyChange?.(false); }, [preparing, busyChange]);
   const [prepared, setPrepared] = useState<{ key: string; route: Route; allRoutes: Route[]; candidates: NetworkCandidateMeta[]; windowsFirewall?: WindowsFirewallStatus; unavailableRouteCount?: number }>();
-  const [retry, setRetry] = useState(0), [configure, setConfigure] = useState(false), [selected, setSelected] = useState(""), [legacyV1, setLegacyV1] = useState(false);
+  const [retry, setRetry] = useState(0), [configure, setConfigure] = useState(false), [selected, setSelected] = useState("");
+  // Apps up to 1.6.0 read only a v1 code (one direct address) and call any
+  // other code damaged, so several candidates are the owner's explicit choice.
+  const [multiAddress, setMultiAddress] = useState(false);
   const [targetMode, setTargetMode] = useState<"app" | "browser">("app");
   useEffect(() => {
     setRead(previous => previous?.key === key && !previous.failed ? previous : undefined);
@@ -103,11 +106,11 @@ export function DeviceInviteCode({ connection, localHost, busyChange }: { connec
         : selectPairingInviteRoutes(directs, relays, {
             primaryUrl: chosen.url,
             candidates: prepared?.key === key ? prepared.candidates : undefined,
-            version: legacyV1 ? 1 : 2,
+            version: multiAddress ? 2 : 1,
           })
     : [];
   const directInviteCount = inviteRoutes.filter(route => route.name !== "VPS").length;
-  const canToggleCompat = targetMode === "app" && !!chosen && chosen.name !== "VPS" && selectPairingInviteRoutes(directs, relays, {
+  const canOfferMultiAddress = targetMode === "app" && !!chosen && chosen.name !== "VPS" && selectPairingInviteRoutes(directs, relays, {
     primaryUrl: chosen.url,
     candidates: prepared?.key === key ? prepared.candidates : undefined,
     version: 2,
@@ -132,9 +135,9 @@ export function DeviceInviteCode({ connection, localHost, busyChange }: { connec
       {targetMode === "browser" && !browserTrusted ? <div role="status" className="settings-warning device-invite-browser-cert">
         <p>{chosen.name === "Tailscale" ? t("这条 Tailscale 线路使用主机自签名证书（或私有 IP），浏览器不会信任它。请勿绕过浏览器的证书安全警告。") : chosen.name === "VPS" ? t("这条中转线路使用私有证书或非公网受信任地址，浏览器不会信任它。请勿绕过浏览器的证书安全警告。") : t("这条局域网线路使用主机自签名证书，浏览器不会信任它。请勿绕过浏览器的证书安全警告。")}</p>
         <p>{localLoopback ? t("要从其他设备的浏览器打开，请切换到具备受信任 HTTPS 证书的线路（如 VPS 中转、Tailscale HTTPS），或在本机直接选择「本机浏览器」。") : t("要从浏览器打开，请切换到具备受信任 HTTPS 证书的线路（如 VPS 中转或 Tailscale HTTPS 域名），或使用原生 TaroBird App。")}</p>
-      </div> : <ConnectionInviteCode connection={connection} browserUrl={targetMode === "browser" ? chosen.url : undefined} hideQr={targetMode === "browser" && chosenIsLoopback} payload={connectionPairingPayload(key, inviteRoutes, connection.identity.deployment, chosen.url, { version: legacyV1 ? 1 : undefined })}/>}
+      </div> : <ConnectionInviteCode connection={connection} browserUrl={targetMode === "browser" ? chosen.url : undefined} hideQr={targetMode === "browser" && chosenIsLoopback} payload={connectionPairingPayload(key, inviteRoutes, connection.identity.deployment, chosen.url, { version: multiAddress && targetMode === "app" ? 2 : 1 })}/>}
       {directInviteCount > 1 && <p className="settings-note pairing-multi-note" role="status">{t("二维码已包含 {0} 个可用候选地址{1}，新设备会同时尝试并选择最快的一条。", directInviteCount, relays.length ? t("和备用中转") : "")}</p>}
-      {canToggleCompat && <label className="pairing-qr-compat"><input type="checkbox" checked={legacyV1} onChange={(e) => setLegacyV1(e.target.checked)}/><span>{t("兼容旧版 App（仅包含当前所选的单个地址）")}</span></label>}
+      {canOfferMultiAddress && <label className="pairing-qr-compat"><input type="checkbox" checked={multiAddress} onChange={(e) => setMultiAddress(e.target.checked)}/><span>{t("加入多个候选地址（仅适用于高于 1.6.0 的 App）")}</span></label>}
       {prepared?.key === key && <WindowsFirewallNotice status={prepared.windowsFirewall} hasFallback={relays.length > 0 || directs.some(route => route.name === "Tailscale")}/>}
       {!(targetMode === "browser" && !browserTrusted) && <p className="settings-note device-invite-note">{targetMode === "browser" ? chosenIsLoopback ? t("复制上方一次性链接并在这台电脑的浏览器中打开（仅限本机访问，无法用手机扫码），再在已配对设备核对 8 位配对码确认。浏览器会出现在设备列表中，可随时吊销。") : t("用桌面或手机浏览器打开一次性链接（或直接用系统相机扫码），再在已配对设备核对 8 位配对码确认。浏览器会出现在设备列表中，可随时吊销。") : chosen.name === "Tailscale" ? t("新设备和主机都需开启 Tailscale，并允许互相访问。") : chosen.name === "VPS" ? t("新设备联网即可通过已配置的中转连接主机。") : t("新设备与主机需连接同一 Wi-Fi 或局域网。")} {targetMode === "app" && t("扫码后仍需核对 8 位配对码并确认，才会授权新设备。")}</p>}
     </> : <>

@@ -1596,6 +1596,70 @@
           "fingerprint": "94424f22c21cb2aa20f3ce0a90556555901c009da066016d24a48fc869a4a2b6"
         }
       ]
+    },
+    {
+      "path": "client/e2e/device-invite.spec.ts",
+      "sha256": "8ab85aabf29a7ecc98e5ab7012c3f8755c6697f4f1a7bad2c7320cd7d75007fc",
+      "reviewer": "claude",
+      "note": "Re-reviewed the unchanged synthetic CGNAT Tailscale test address after the test was adjusted to the v1 default pairing code (review of PR #166); no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/tailscale-pairing.spec.ts",
+      "sha256": "5b961993f294aa55deea3d999916da60d6abd149b68d94ebb2e44969709a125c",
+      "reviewer": "claude",
+      "note": "Re-reviewed the unchanged synthetic CGNAT Tailscale test address after the test was adjusted to the v1 default pairing code (review of PR #166); no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "tests/client-multipath-routes.test.ts",
+      "sha256": "b90b243d99865f6784d4a34f01f8e5c90f8257b6aa7f76ec72d8a19edeb56702",
+      "reviewer": "claude",
+      "note": "Re-reviewed the unchanged synthetic CGNAT Tailscale test addresses after the test was adjusted to the v1 default pairing code (review of PR #166); no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "8308f3a233cf4bd3987f20880945ac60b08eacaa9e85391fd66c5919780196e3"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "63246b8fde0d7ce1f3ac7fdbf4b6c5e9aa9bd23d2d8156036cd57e4ce9308edb"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "258cca7a8e42d54d201f4528b4c562bef41b6ce9022a600d1d7639364a92abeb"
+        }
+      ]
+    },
+    {
+      "path": "tests/host-cli-day-audit.test.ts",
+      "sha256": "04007fd2c8c40890f5d0b086b0d082338a01336ec49627730e6e0d0724cda7cb",
+      "reviewer": "claude",
+      "note": "Re-reviewed the unchanged synthetic CGNAT Tailscale test addresses after the CLI pairing test was adjusted to the v1 default and the --v2 option (review of PR #166); no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "b561751746c6b986134f7802acf540666c18c1f35cbcb132a55f9a98e1a4a23a"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "94424f22c21cb2aa20f3ce0a90556555901c009da066016d24a48fc869a4a2b6"
+        }
+      ]
     }
   ]
 }

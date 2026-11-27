@@ -51,7 +51,7 @@ it("QR repair preserves a custom public Direct route and ambiguous existing LAN 
 });
 
 
-it("a multi-route identity produces v2 and legacy v1 QRs with scoped trust and without changing its local routes", async () => {
+it("a multi-route identity produces a v1 QR by default and a v2 QR on request, with scoped trust and without changing its local routes", async () => {
   const { connectionPairingPayload, pairingLink, parsePairingLink } = await import("../client/src/pairing-link.js");
   const local = [
     { name: "Direct" as const, url: "https://192.168.10.5:8788", certificateAuthority: "A".repeat(120) },
@@ -59,16 +59,24 @@ it("a multi-route identity produces v2 and legacy v1 QRs with scoped trust and w
     { name: "VPS" as const, url: "https://relay.example" },
   ];
   const copy = structuredClone(local);
+  // No version given: the single-direct v1 code that Apps up to 1.6.0 can read.
   const payload = connectionPairingPayload("h".repeat(44), local, "computer");
-  expect(parsePairingLink(pairingLink(payload))).toEqual({ v: 2, kind: "connect", hubPublicKey: "h".repeat(44), routes: [local[1], local[0], local[2]], deployment: "computer" });
+  expect(parsePairingLink(pairingLink(payload))).toEqual({ v: 1, kind: "connect", hubPublicKey: "h".repeat(44), routes: [local[1], local[2]], deployment: "computer" });
   expect(local).toEqual(copy);
   const legacyPayload = connectionPairingPayload("h".repeat(44), local, "computer", undefined, { version: 1 });
-  expect(parsePairingLink(pairingLink(legacyPayload))).toEqual({ v: 1, kind: "connect", hubPublicKey: "h".repeat(44), routes: [local[1], local[2]], deployment: "computer" });
+  expect(legacyPayload).toEqual(payload);
   const activeLan = connectionPairingPayload("h".repeat(44), local, "computer", local[0]!.url);
-  expect(parsePairingLink(pairingLink(activeLan))).toEqual({ v: 2, kind: "connect", hubPublicKey: "h".repeat(44), routes: [local[0], local[1], local[2]], deployment: "computer" });
+  expect(parsePairingLink(pairingLink(activeLan))).toEqual({ v: 1, kind: "connect", hubPublicKey: "h".repeat(44), routes: [local[0], local[2]], deployment: "computer" });
   const activeLanV1 = connectionPairingPayload("h".repeat(44), local, "computer", local[0]!.url, { version: 1 });
-  expect(parsePairingLink(pairingLink(activeLanV1))).toEqual({ v: 1, kind: "connect", hubPublicKey: "h".repeat(44), routes: [local[0], local[2]], deployment: "computer" });
-  expect(connectionPairingPayload("h".repeat(44), local, undefined, "https://not-saved.example")).toMatchObject({ v: 2, routes: [local[1], local[0], local[2]] });
+  expect(activeLanV1).toEqual(activeLan);
+  expect(connectionPairingPayload("h".repeat(44), local, undefined, "https://not-saved.example")).toMatchObject({ v: 1, routes: [local[1], local[2]] });
+  // v2 on request: every direct candidate, the chosen one first.
+  const multi = connectionPairingPayload("h".repeat(44), local, "computer", undefined, { version: 2 });
+  expect(parsePairingLink(pairingLink(multi))).toEqual({ v: 2, kind: "connect", hubPublicKey: "h".repeat(44), routes: [local[1], local[0], local[2]], deployment: "computer" });
+  const activeLanMulti = connectionPairingPayload("h".repeat(44), local, "computer", local[0]!.url, { version: 2 });
+  expect(parsePairingLink(pairingLink(activeLanMulti))).toEqual({ v: 2, kind: "connect", hubPublicKey: "h".repeat(44), routes: [local[0], local[1], local[2]], deployment: "computer" });
+  expect(connectionPairingPayload("h".repeat(44), local, undefined, "https://not-saved.example", { version: 2 })).toMatchObject({ v: 2, routes: [local[1], local[0], local[2]] });
+  expect(local).toEqual(copy);
 });
 
 
