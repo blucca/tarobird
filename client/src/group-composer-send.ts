@@ -12,6 +12,7 @@ import { LEGACY_GROUP_REPLY_REVISION, unknownGroupReplyMode, unavailableGroupRep
 export type GroupReplyMode = {
   conversationId: string; mode: GroupDiscussionView["settings"]["policy"]["mode"]; revision: string;
   botOrder?: string[];
+  designatedName?: string;
   activeRun?: Pick<NonNullable<GroupDiscussionView["run"]>, "id" | "conversationId"> & Partial<Pick<NonNullable<GroupDiscussionView["run"]>, "revision" | "status" | "topic" | "pauseReason" | "actions" | "participants">>;
   delivery?: "guarded" | "legacy" | "unguarded";
 };

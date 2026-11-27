@@ -180,8 +180,17 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       // Capability hints are selected from the user's topic only, never from
       // other members' text. Peer material is appended once, to the turn's own
       // prompt; repair prompts in the same turn do not repeat it.
+      const groupSession = !discussionTurn ? channel.currentGroupSession() : undefined;
+      const groupSessionKey = groupSession ? buildCoreConversationKey(groupSession.sessionId) : undefined;
+      const sessionConversationKey = groupSessionKey ?? input.conversationKey;
+      const sessionChatId = groupSessionKey ? stableCoreNumericId(groupSessionKey) : input.chatId;
+      const groupHistoryPrefix = groupSession?.contextMessages?.length
+        ? `[Group "${groupSession.groupTitle}" recent context]\n${groupSession.contextMessages.map((m) => `${m.authorName}: ${m.text}`).join("\n")}\n\n`
+        : "";
       const capabilityText = discussionTurn ? discussionTurn.topic : input.text;
-      const engineText = discussionTurn && isGroupDiscussionPrompt(input.text) ? `${input.text}\n\n${groupDiscussionReference(discussionTurn)}` : input.text;
+      const engineText = discussionTurn && isGroupDiscussionPrompt(input.text)
+        ? `${input.text}\n\n${groupDiscussionReference(discussionTurn)}`
+        : groupHistoryPrefix ? `${groupHistoryPrefix}${input.text}` : input.text;
       const lifetime = new AbortController();
       const delivered: AppDeliveryReceipt[] = [];
       const signal = input.abortSignal ? AbortSignal.any([input.abortSignal, lifetime.signal]) : lifetime.signal;
@@ -200,7 +209,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
         // Persistent CLI workers can invoke these callbacks from an older
         // async context, even after this request returns. Bind App formatting
         // explicitly so late reports never fall back to Feishu card limits.
-        let response = await target.handleAuthorizedMessage({ ...input, text: engineText, appPlatformTools,
+        let response = await target.handleAuthorizedMessage({ ...input, conversationKey: sessionConversationKey, chatId: sessionChatId, text: engineText, appPlatformTools,
           onHistoryAnchor: input.historyInputMessageId && conversationId && channel.transport.capabilities.includes(CONVERSATION_HISTORY_CAPABILITY)
             ? async evidence => {
               const record = historyAnchorEvidenceSchema.parse({ ...evidence, conversationId });
@@ -244,7 +253,9 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     return typeof value === "function" ? value.bind(target) : value;
   } });
   channel.prepareConversation = async (conversationId) => {
-    const conversation = conversationSchema.parse(await channel.transport.request("conversation", { conversationId }));
+    const groupSession = channel.currentGroupSession();
+    const targetId = groupSession?.sessionId ?? conversationId;
+    const conversation = conversationSchema.parse(await channel.transport.request("conversation", { conversationId: targetId }));
     await prepareGatewaySessionBinding(options.stateDir, conversation);
   };
   channel.canSteerConversation = async (conversationId) => gatewaySessionBindingAllowsSteering(options.stateDir,

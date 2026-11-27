@@ -154,6 +154,19 @@ export const groupMailReplySchema = z.object({
 }).strict();
 export type GroupMailReply = z.infer<typeof groupMailReplySchema>;
 
+export const groupLocalSessionDispatchSchema = z.object({
+  sessionId: id,
+  sessionTitle: z.string().max(256),
+  groupTitle: z.string().max(256),
+  contextMessages: z.array(z.object({
+    seq: z.number().int().nonnegative(),
+    authorName: z.string().max(256),
+    text: z.string().max(32_000),
+    createdAt: z.number().int(),
+  }).strict()).max(200).optional(),
+}).strict();
+export type GroupLocalSessionDispatch = z.infer<typeof groupLocalSessionDispatchSchema>;
+
 export function makeGroupMemberKey(kind: "local" | "remote", hostId: string, botId: string): string {
   return kind === "local" ? `local:${botId}` : `remote:${hostId}:${botId}`;
 }

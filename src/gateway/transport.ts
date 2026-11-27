@@ -24,6 +24,7 @@ import { isLoopback } from "../hub/network.js";
 import { botRuntimeStatusSchema } from "../client-protocol/instance.js";
 import { AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, agentBusDispatchSchema, type AgentBusDispatch } from "../client-protocol/agent-bus.js";
 import { GROUP_DISCUSSION_WORKER_CAPABILITY, groupDiscussionDispatchSchema, type GroupDiscussionDispatch } from "../client-protocol/group-discussion.js";
+import { groupLocalSessionDispatchSchema, type GroupLocalSessionDispatch } from "../client-protocol/group-members.js";
 
 const requestSchema = z.object({ v: z.literal(1), type: z.literal("instance.request"), id: idSchema, method: z.string(), params: jsonSchema });
 const journalSchema = z.object({ requests: z.array(requestSchema) });
@@ -35,7 +36,7 @@ const inboundSchema = z.discriminatedUnion("type", [
   z.object({ v: z.literal(1), type: z.literal("instance.ready"), capabilities: z.array(z.string()).optional() }),
   z.object({ v: z.literal(1), type: z.literal("instance.queue"), conversationId: idSchema }),
   z.object({ v: z.literal(1), type: z.literal("instance.result"), id: idSchema, result: jsonSchema.optional(), error: z.string().optional() }),
-  z.object({ v: z.literal(1), type: z.literal("instance.message"), workbench: workbenchContextSchema.optional(), workbenchContextOmitted: workbenchContextOmittedSchema.optional(), message: messageSchema, conversation: conversationSchema, agentBus: agentBusDispatchSchema.optional(), groupDiscussion: groupDiscussionDispatchSchema.optional() }),
+  z.object({ v: z.literal(1), type: z.literal("instance.message"), workbench: workbenchContextSchema.optional(), workbenchContextOmitted: workbenchContextOmittedSchema.optional(), message: messageSchema, conversation: conversationSchema, agentBus: agentBusDispatchSchema.optional(), groupDiscussion: groupDiscussionDispatchSchema.optional(), groupSession: groupLocalSessionDispatchSchema.optional() }),
   z.object({ v: z.literal(1), type: z.literal("instance.call"), id: idSchema, method: z.string(), params: jsonSchema }),
   z.object({ v: z.literal(1), type: z.literal("pong") }),
 ]);
@@ -67,7 +68,7 @@ export class GatewayTransport {
   /** Includes admission/approval and publication persistence before runtime
    * activeRuns is populated, so an idle drain cannot cut off accepted work. */
   isBusy(): boolean { return this.receiving > 0 || this.pending.size > 0 || this.journal.length > 0 || this.bootPending || this.partialFrame; }
-  onMessage?: (message: Message, conversation: Conversation, agentBus?: AgentBusDispatch, groupDiscussion?: GroupDiscussionDispatch, workbench?: WorkbenchContext, workbenchContextOmitted?: WorkbenchContextOmitted) => Promise<void>;
+  onMessage?: (message: Message, conversation: Conversation, agentBus?: AgentBusDispatch, groupDiscussion?: GroupDiscussionDispatch, workbench?: WorkbenchContext, workbenchContextOmitted?: WorkbenchContextOmitted, groupSession?: GroupLocalSessionDispatch) => Promise<void>;
   onQueue?: (conversationId: string) => void;
   onCall?: (method: string, params: Json) => Promise<Json>;
   /** Once per process attachment, after old publications and before new input. */
@@ -218,7 +219,7 @@ export class GatewayTransport {
       // old callback cross the boot barrier after shutdown or reconnect.
       if (this.stopped || this.ws !== ws || ws?.readyState !== WebSocket.OPEN) return;
       if (frame.type === "instance.queue") { this.onQueue?.(frame.conversationId); return; }
-      await this.onMessage?.(frame.message, frame.conversation, frame.agentBus, frame.groupDiscussion, frame.workbench, frame.workbenchContextOmitted); return;
+      await this.onMessage?.(frame.message, frame.conversation, frame.agentBus, frame.groupDiscussion, frame.workbench, frame.workbenchContextOmitted, frame.groupSession); return;
     }
     if (frame.type === "instance.call") {
       try { const result = await this.onCall?.(frame.method, frame.params); if (!this.stopped && this.ws === ws) this.send({ v: 1, type: "instance.result", id: frame.id, result: result ?? null }); }

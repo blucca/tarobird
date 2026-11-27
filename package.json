@@ -30,7 +30,7 @@
   "tarobotHostUpdate": {
     "format": 1,
     "minHubSchema": 1,
-    "maxHubSchema": 26
+    "maxHubSchema": 27
   },
   "engines": {
     "node": ">=22.12.0"
@@ -174,7 +174,7 @@
     "skills/baoyu-ppt/references/styles.md",
     "skills/baoyu-ppt/references/view-state.md"
   ],
-  "tarobotHubSchema": 26,
+  "tarobotHubSchema": 27,
   "tarobotHostCapabilities": [
     "service-extra-environment-v1",
     "pi-state-v1",

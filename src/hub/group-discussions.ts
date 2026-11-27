@@ -343,6 +343,18 @@ export class HubGroupDiscussions {
     });
     this.after(result);
   }
+  /** Ends any active discussion run in this group (used by whole-group Stop). */
+  async endActiveForGroup(groupId: string, userId: string): Promise<boolean> {
+    const result = await this.db.transaction(async (): Promise<Work & { ended: boolean }> => {
+      const run = await this.db.get<RunRow>(`SELECT * FROM group_discussions WHERE group_id=? AND status IN ${ACTIVE_SQL}`, [groupId]);
+      if (!run || await this.alreadyDone(run, "end")) return { ended: false, events: [], stops: [] };
+      const work: Work = { events: [], stops: [] };
+      await this.apply(run, userId, "end", work);
+      return { ended: true, ...work };
+    });
+    this.after(result);
+    return result.ended;
+  }
   /** Caller holds the claim transaction. A worker without the discussion
    * capability would answer the bare input as chat; withhold it instead. */
   async rejectForWorkerInTransaction(botId: string, messageIds: string[]): Promise<HubEvent[]> {

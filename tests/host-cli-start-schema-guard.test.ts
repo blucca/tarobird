@@ -20,7 +20,7 @@ async function hostAtSchema(schema: number) {
   vi.spyOn(console, "log").mockImplementation(() => undefined);
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   vi.spyOn(setup, "requireInitialized").mockResolvedValue(undefined as never);
-  // The repository package.json declares the runtime's schema range (1-26).
+  // The repository package.json declares the runtime's schema range (1-27).
   vi.spyOn(runtime, "resolveHostRuntime").mockResolvedValue({ entrypoint: path.resolve("dist/src/index.js"), executable: process.execPath } as never);
   vi.spyOn(LocalHostClient, "connect").mockResolvedValue({ deviceId: "cli_fixture", publicKey: "same-host", close: vi.fn() } as never);
   vi.spyOn(manager, "managedServiceStatus").mockResolvedValue({ configured: false } as never);
@@ -30,23 +30,23 @@ async function hostAtSchema(schema: number) {
 afterEach(async () => { vi.restoreAllMocks(); for (const directory of roots.splice(0)) await rm(directory, { recursive: true, force: true }); });
 
 it("start explains a database from a newer version before starting anything", async () => {
-  const f = await hostAtSchema(27);
+  const f = await hostAtSchema(28);
   const failure = runHostCli(["start", "--state-dir", f.directory]);
   await expect(failure).rejects.toThrow("来自更新版本的 TaroBird");
   await expect(failure).rejects.toThrow("数据库未修改");
   expect(f.host.mock.calls.map(call => call[0])).toEqual(["status"]);
   expect(LocalHostClient.connect).not.toHaveBeenCalled();
-  expect(await readHostSchema(f.directory)).toBe(27);
+  expect(await readHostSchema(f.directory)).toBe(28);
 });
 
 it("restart explains a database from a newer version and does not stop the host", async () => {
-  const f = await hostAtSchema(27);
+  const f = await hostAtSchema(28);
   await expect(runHostCli(["restart", "--force", "--state-dir", f.directory])).rejects.toThrow("来自更新版本的 TaroBird");
   expect(f.host).not.toHaveBeenCalled();
 });
 
 it("restart of a desktop-managed host on an older database is admitted like start", async () => {
-  const f = await hostAtSchema(25);
+  const f = await hostAtSchema(26);
   await runHostCli(["restart", "--force", "--state-dir", f.directory]);
   expect(f.host.mock.calls.map(call => call[0])).toEqual(["stop", "status", "start"]);
 });

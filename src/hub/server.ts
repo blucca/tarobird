@@ -394,16 +394,28 @@ export class HubServer {
         const hosts = view?.membership?.manifest?.hosts ?? [];
         return hosts
           .filter((h) => !h.revoked && h.state === "active" && h.publicKey !== this.auth.publicKey && h.routes.length > 0)
-          .map((h) => ({ hostId: `host_${createHash("sha256").update(h.publicKey).digest("hex").slice(0, 12)}`, hostName: h.name, publicKey: h.publicKey, url: h.routes[0]!.url }));
+          .map((h) => ({
+            hostId: `host_${createHash("sha256").update(h.publicKey).digest("hex").slice(0, 12)}`,
+            hostName: h.name,
+            publicKey: h.publicKey,
+            url: h.routes[0]!.url,
+            routes: h.routes,
+          }));
       },
-      onGroupStopLocal: async (groupId) => {
-        const conv = await this.store.db.all<{ id: string }>("SELECT id FROM conversations WHERE id=? OR parent_id=?", [groupId, groupId]);
-        for (const row of conv) {
-          const bots = await this.store.db.all<{ member_id: string }>("SELECT member_id FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [row.id]);
-          for (const b of bots) {
-            await this.callBot(b.member_id, "stop", { conversationId: row.id }).catch(() => undefined);
+      requireNetworkPeerInTransaction: (publicKey) => this.network.requireMessagePeerInTransaction(publicKey),
+      onConversationsChanged: (userId, conversations) => conversationsCreated(userId, conversations),
+      onGroupStopLocal: async (groupId, userId) => {
+        await this.groupDiscussions.endActiveForGroup(groupId, userId).catch(() => options.onWarning?.("group_discussion_settle_failed"));
+        const targets = await this.store.db.serial(async () => {
+          const convs = await this.store.db.all<{ id: string }>("SELECT id FROM conversations WHERE id=? OR parent_id=?", [groupId, groupId]);
+          const pairs: Array<{ conversationId: string; botId: string }> = [];
+          for (const row of convs) {
+            const bots = await this.store.db.all<{ member_id: string }>("SELECT member_id FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [row.id]);
+            for (const b of bots) pairs.push({ conversationId: row.id, botId: b.member_id });
           }
-        }
+          return pairs;
+        });
+        await Promise.allSettled(targets.map((t) => this.callBot(t.botId, "stop", { conversationId: t.conversationId }).catch(() => undefined)));
       },
     });
     this.conversationFolders = new ConversationFolders(store.db);
@@ -439,6 +451,9 @@ export class HubServer {
       if (event.kind === "message.created" && typeof event.payload === "object" && event.payload !== null && !Array.isArray(event.payload) && event.payload.authorType === "user") {
         this.trackTask(this.dispatchPending().catch(() => options.onWarning?.("queue_dispatch_failed")));
       }
+    }));
+    this.disposers.push(store.onRemoteDispatch((dispatch) => {
+      this.trackTask(this.crossHostGroups.deliverQueuedQuestions(dispatch).catch(() => options.onWarning?.("cross_host_group_dispatch_failed")));
     }));
     this.disposers.push(auth.onRevoke((deviceId) => { for (const c of this.clients) if (c.session?.deviceId === deviceId) this.endClientSession(c, "device_revoked"); }));
     this.disposers.push(auth.onRevoke((deviceId) => {
@@ -671,6 +686,7 @@ export class HubServer {
       catch (error) { controller.abort(error); }
     }
     for (const botId of this.bots.keys()) void this.dispatchActions(botId).catch(() => this.options.onWarning?.("action_dispatch_failed"));
+    this.trackTask(this.crossHostGroups.flushPendingReplies().catch(() => this.options.onWarning?.("cross_host_reply_retry_failed")));
     if (Date.now() >= this.historyReleaseCheckAt) {
       this.historyReleaseCheckAt = Date.now() + 10_000;
       this.trackTask(this.conversationHistory.releaseExpired().catch(() => this.options.onWarning?.("history_release_failed")));
@@ -1228,12 +1244,20 @@ export class HubServer {
             throw error;
           }
           if (!active()) { connection.replayQueue = true; break; }
+          const localBinding = await this.crossHostGroups.localDispatchBinding(id, message, conversation);
+          if (localBinding.blocked) {
+            if (await queue.settleInaccessible(id, message.id)) continue;
+          }
           const agentBus = connection.agentBus ? await this.agentBuses.dispatch(id, message.id) : undefined;
           // Trusted turn metadata comes only from the Hub's own turn record.
           const groupDiscussion = connection.groupDiscussion ? await this.groupDiscussions.dispatch(id, message.id) : undefined;
           if (!active()) { connection.replayQueue = true; break; }
           const workbenchMetadata = gatewayWorkbenchMetadata(await this.store.db.serial(() => readWorkbenchTurnMetadata(this.store.db, message.id)), connection.designOpen);
-          await this.send(connection.ws, { v: 1, type: "instance.message", message, conversation, ...workbenchMetadata, ...(agentBus ? { agentBus } : {}), ...(groupDiscussion ? { groupDiscussion } : {}) });
+          await this.send(connection.ws, { v: 1, type: "instance.message", message, conversation, ...workbenchMetadata, ...(agentBus ? { agentBus } : {}), ...(groupDiscussion ? { groupDiscussion } : {}), ...(localBinding.blocked === false && localBinding.groupSession ? { groupSession: localBinding.groupSession } : {}) });
+          if (localBinding.blocked === false && localBinding.historyIncluded) {
+            const { scopeConversationId, memberKey, sessionId } = localBinding.historyIncluded;
+            this.trackTask(this.crossHostGroups.markLocalHistoryBackfilled(scopeConversationId, memberKey, sessionId).catch(() => undefined));
+          }
           // Readers see "speaking" instead of "waiting" without polling.
           if (groupDiscussion) this.trackTask(this.groupDiscussions.markDispatched(id, message.id).catch(() => this.options.onWarning?.("group_discussion_settle_failed")));
         }
@@ -1501,6 +1525,7 @@ export class HubServer {
       const message = await this.store.publishBotMessage(botId, botPublishSchema.parse(params), (blocks, previous) => { if (blocks.some(block => block.type === "card" && block.extra?.widget !== undefined && !previous.some(old => JSON.stringify(old) === JSON.stringify(block)))) this.widgetSettings.assertEnabled(); });
       // A receipt may precede the final run-card publication; settle again here.
       await this.settleDiscussion(() => this.groupDiscussions.published(botId, message));
+      this.trackTask(this.crossHostGroups.onBotMessagePublished(botId, message).catch(() => this.options.onWarning?.("cross_host_reply_forward_failed")));
       return message;
     }
     if (method === "fetch") return this.store.messageForBot(botId, z.object({ messageId: idSchema }).parse(params).messageId);
@@ -1510,9 +1535,10 @@ export class HubServer {
       await this.store.acknowledgeDelivery(botId, messageId); await new HubPromptQueue(this.store).settled(botId, messageId);
       await this.agentBuses.settleDelivery(botId, messageId);
       await this.settleDiscussion(() => this.groupDiscussions.settleInput(botId, messageId));
+      this.trackTask(this.crossHostGroups.onBotTurnSettled(botId, messageId).catch(() => this.options.onWarning?.("cross_host_reply_forward_failed")));
       this.scheduleDispatch(botId); return null;
     }
-    if (method === "delivery.fail") { const p = z.object({ messageId: idSchema, reason: z.enum(["interrupted", "failed"]) }).parse(params); await this.store.failDelivery(botId, p.messageId, p.reason); await new HubPromptQueue(this.store).settled(botId, p.messageId); await this.agentBuses.settleDelivery(botId, p.messageId); await this.settleDiscussion(() => this.groupDiscussions.settleInput(botId, p.messageId, p.reason)); this.scheduleDispatch(botId); return null; }
+    if (method === "delivery.fail") { const p = z.object({ messageId: idSchema, reason: z.enum(["interrupted", "failed"]) }).parse(params); await this.store.failDelivery(botId, p.messageId, p.reason); await new HubPromptQueue(this.store).settled(botId, p.messageId); await this.agentBuses.settleDelivery(botId, p.messageId); await this.settleDiscussion(() => this.groupDiscussions.settleInput(botId, p.messageId, p.reason)); this.trackTask(this.crossHostGroups.onBotTurnSettled(botId, p.messageId).catch(() => this.options.onWarning?.("cross_host_reply_forward_failed"))); this.scheduleDispatch(botId); return null; }
     if (method === "agentBus.event") { await this.agentBuses.event(botId, params); return null; }
     if (method === "groupDiscussion.report") { await this.groupDiscussions.report(botId, params); return null; }
     if (method === "reaction" || method === "turn.state") { const p = z.object({ conversationId: idSchema, payload: z.json() }).parse(params); await this.store.appendBotEvent(botId, p.conversationId, method, p.payload); return null; }
@@ -1600,27 +1626,32 @@ export class HubServer {
       this.json(res, 200, await this.network.enroll(await this.jsonBody(req, MAX_NETWORK_BYTES))); return;
     }
     if (route.startsWith("/api/group-mail/")) {
+      this.networkRate(source, "bot-message");
       const method = req.method === "POST" ? "POST" : req.method === "GET" ? "GET" : undefined;
       if (!method) throw new HubError("method_not_allowed", 405);
       const rawBuf = method === "POST" ? await this.body(req, 2 * MAX_FRAME_BYTES) : Buffer.alloc(0);
       const bodyText = rawBuf.toString("utf8");
       const peer = await this.crossHostGroups.verifyPeerRequest(method, route, req.headers, bodyText);
+      const parsePeerJson = (): unknown => {
+        try { return JSON.parse(bodyText); }
+        catch { throw new HubError("invalid_json", 400); }
+      };
       if (route === "/api/group-mail/directory" && method === "GET") {
-        this.json(res, 200, await this.crossHostGroups.handlePeerDirectory()); return;
+        this.json(res, 200, await this.crossHostGroups.handlePeerDirectory(peer)); return;
       }
       if (route === "/api/group-mail/sessions" && method === "POST") {
-        const parsed = z.object({ botId: idSchema, title: z.string().trim().min(1).max(256) }).strict().parse(JSON.parse(bodyText));
-        this.json(res, 200, await this.crossHostGroups.handlePeerEnsureSession(parsed)); return;
+        const parsed = z.object({ botId: idSchema, title: z.string().trim().min(1).max(256), requestId: idSchema.optional() }).strict().parse(parsePeerJson());
+        this.json(res, 200, await this.crossHostGroups.handlePeerEnsureSession(peer, parsed)); return;
       }
       if (route === "/api/group-mail/deliver" && method === "POST") {
-        this.json(res, 200, await this.crossHostGroups.handlePeerDeliver(peer, JSON.parse(bodyText))); return;
+        this.json(res, 200, await this.crossHostGroups.handlePeerDeliver(peer, parsePeerJson())); return;
       }
       if (route === "/api/group-mail/reply" && method === "POST") {
-        this.json(res, 200, await this.crossHostGroups.handlePeerReply(peer, JSON.parse(bodyText))); return;
+        this.json(res, 200, await this.crossHostGroups.handlePeerReply(peer, parsePeerJson())); return;
       }
       const statusRoute = route.match(/^\/api\/group-mail\/status\/([A-Za-z0-9_-]+)$/);
       if (statusRoute && method === "GET") {
-        this.json(res, 200, await this.crossHostGroups.handlePeerStatus(statusRoute[1]!)); return;
+        this.json(res, 200, await this.crossHostGroups.handlePeerStatus(peer, statusRoute[1]!)); return;
       }
       throw new HubError("not_found", 404);
     }
@@ -2194,21 +2225,25 @@ export class HubServer {
       const groupMembersRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/members(?:\/([A-Za-z0-9_.:%-]+)(?:\/(session))?)?$/);
       if (groupMembersRoute) {
         const groupId = groupMembersRoute[1]!;
-        const memberKeyParam = groupMembersRoute[2] ? decodeURIComponent(groupMembersRoute[2]) : undefined;
+        let memberKeyParam: string | undefined;
+        if (groupMembersRoute[2]) {
+          try { memberKeyParam = decodeURIComponent(groupMembersRoute[2]); }
+          catch { throw new HubError("invalid_request", 400); }
+        }
         const sub = groupMembersRoute[3];
-        if (!memberKeyParam && req.method === "GET") { await reply(200, await this.crossHostGroups.getState(userId, groupId, url.searchParams.get("directory") !== "0")); return; }
-        if (!memberKeyParam && req.method === "POST") { await reply(200, await this.crossHostGroups.addMember(userId, groupId, await this.jsonBody(req))); return; }
-        if (memberKeyParam && sub === "session" && req.method === "PATCH") { await reply(200, await this.crossHostGroups.switchMemberSession(userId, groupId, memberKeyParam, await this.jsonBody(req))); return; }
-        if (memberKeyParam && !sub && req.method === "DELETE") { await reply(200, await this.crossHostGroups.removeMember(userId, groupId, memberKeyParam)); return; }
+        if (!memberKeyParam && req.method === "GET") { await reply(200, await this.crossHostGroups.getState(userId, groupId, url.searchParams.get("directory") !== "0", validateInQueue)); return; }
+        if (!memberKeyParam && req.method === "POST") { await reply(200, await this.crossHostGroups.addMember(userId, groupId, await this.jsonBody(req), validateInQueue)); return; }
+        if (memberKeyParam && sub === "session" && req.method === "PATCH") { await reply(200, await this.crossHostGroups.switchMemberSession(userId, groupId, memberKeyParam, await this.jsonBody(req), validateInQueue)); return; }
+        if (memberKeyParam && !sub && req.method === "DELETE") { await reply(200, await this.crossHostGroups.removeMember(userId, groupId, memberKeyParam, validateInQueue)); return; }
       }
       const groupDesignatedRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/designated$/);
-      if (groupDesignatedRoute && req.method === "PUT") { await reply(200, await this.crossHostGroups.setDesignatedMember(userId, groupDesignatedRoute[1]!, await this.jsonBody(req))); return; }
+      if (groupDesignatedRoute && req.method === "PUT") { await reply(200, await this.crossHostGroups.setDesignatedMember(userId, groupDesignatedRoute[1]!, await this.jsonBody(req), validateInQueue)); return; }
       const groupRoomsRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/rooms$/);
-      if (groupRoomsRoute && req.method === "POST") { await reply(201, await this.crossHostGroups.createRoom(userId, groupRoomsRoute[1]!, await this.jsonBody(req))); return; }
+      if (groupRoomsRoute && req.method === "POST") { await reply(201, await this.crossHostGroups.createRoom(userId, groupRoomsRoute[1]!, await this.jsonBody(req), validateInQueue)); return; }
       const groupStopRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/stop$/);
-      if (groupStopRoute && req.method === "POST") { await reply(200, await this.crossHostGroups.stopGroup(userId, groupStopRoute[1]!)); return; }
+      if (groupStopRoute && req.method === "POST") { await reply(200, await this.crossHostGroups.stopGroup(userId, groupStopRoute[1]!, validateInQueue)); return; }
       const groupQuestionRetryRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/questions\/([A-Za-z0-9_-]+)\/retry$/);
-      if (groupQuestionRetryRoute && req.method === "POST") { await reply(200, await this.crossHostGroups.reconcileOrRetryQuestion(userId, groupQuestionRetryRoute[1]!, groupQuestionRetryRoute[2]!)); return; }
+      if (groupQuestionRetryRoute && req.method === "POST") { await reply(200, await this.crossHostGroups.reconcileOrRetryQuestion(userId, groupQuestionRetryRoute[1]!, groupQuestionRetryRoute[2]!, validateInQueue)); return; }
       const discussionRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/discussion(?:\/([A-Za-z0-9_-]+)\/(control|notes|steps\/([A-Za-z0-9_-]+)))?$/);
       if (discussionRoute && (req.method === "POST" ? !discussionRoute[3] || discussionRoute[3] === "control" || discussionRoute[3] === "notes" : req.method === "GET" && (!discussionRoute[2] || !!discussionRoute[4]))) {
         const conversationId = discussionRoute[1]!, runId = discussionRoute[2];

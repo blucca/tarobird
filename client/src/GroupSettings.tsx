@@ -48,27 +48,60 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
   const [addSessionId, setAddSessionId] = useState("");
   const [addHistory, setAddHistory] = useState<"none" | "recent:20" | "all">("recent:20");
   const [memberBusy, setMemberBusy] = useState(false);
-  const saving = useRef(false), alive = useRef(false), titleInput = useRef<HTMLInputElement>(null), members = useRef<HTMLFieldSetElement>(null);
+  const saving = useRef(false), alive = useRef(false), pickerInitialized = useRef(false), titleInput = useRef<HTMLInputElement>(null), members = useRef<HTMLFieldSetElement>(null);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   const allowed = state.status === "online" && state.user?.id === group.ownerId && !group.archived;
   const dirty = title.trim() !== baseline.title || chosen.length !== baseline.botIds.length || chosen.some(id => !baseline.botIds.includes(id)) || !!state.groupDiscussionAvailable && JSON.stringify(policy) !== JSON.stringify(baselinePolicy);
-  const validPolicy = !state.groupDiscussionAvailable || (policyRevision && (policy.mode !== "parallel" || state.groupParallelAvailable) && (!automaticGroupDiscussion(policy.mode) || chosen.length >= 2 && chosen.length <= GROUP_DISCUSSION_MAX_MEMBERS));
+  const validPolicy = !state.groupDiscussionAvailable || (policyRevision && (policy.mode !== "parallel" || state.groupParallelAvailable) && (policy.mode !== "designated" || state.crossHostGroupsAvailable) && (!automaticGroupDiscussion(policy.mode) || chosen.length >= 2 && chosen.length <= GROUP_DISCUSSION_MAX_MEMBERS));
 
   const loadMemberState = useCallback(async () => {
+    if (!state.crossHostGroupsAvailable) return;
     try {
       const raw = await connection.http(`/api/groups/${group.id}/members`, { signal: timeoutSignal(15_000) });
       const parsed = groupMembersStateSchema.parse(raw);
       if (alive.current) {
         setMemberState(parsed);
-        const firstPeer = parsed.directory?.find((b) => b.hostId !== "local") ?? parsed.directory?.[0];
-        if (firstPeer && !addBotId) {
-          setAddHostId(firstPeer.hostId);
-          setAddBotId(firstPeer.botId);
-          setAddSessionId(firstPeer.sessions[0]?.sessionId ?? "");
+        if (!pickerInitialized.current) {
+          const firstPeer = parsed.directory?.find((b) => b.hostId !== "local") ?? parsed.directory?.[0];
+          if (firstPeer) {
+            pickerInitialized.current = true;
+            setAddHostId(firstPeer.hostId);
+            setAddBotId(firstPeer.botId);
+            setAddSessionId(firstPeer.sessions[0]?.sessionId ?? "");
+          }
         }
       }
     } catch { /* older Host without cross-host group sessions */ }
-  }, [connection, group.id, addBotId]);
+  }, [connection, group.id, state.crossHostGroupsAvailable]);
+
+  const syncSettingsBaseline = useCallback(async () => {
+    if (!state.groupDiscussionAvailable) return;
+    try {
+      const raw = await connection.http(`/api/groups/${group.id}/settings`, { signal: timeoutSignal(15_000) });
+      const latest = groupSettingsSnapshotSchema.parse(raw);
+      if (!alive.current) return;
+      setBaseline(prevBaseline => {
+        setTitle(prevTitle => prevTitle === prevBaseline.title ? latest.group.title : prevTitle);
+        return latest.group;
+      });
+      setChosen(latest.group.botIds);
+      setBaselinePolicy(prevBaselinePolicy => {
+        setPolicy(prevPolicy => {
+          const botOrder = [
+            ...prevPolicy.botOrder.filter(id => latest.group.botIds.includes(id)),
+            ...latest.group.botIds.filter(id => !prevPolicy.botOrder.includes(id)),
+          ];
+          return {
+            mode: prevPolicy.mode === prevBaselinePolicy.mode ? latest.policy.mode : prevPolicy.mode,
+            maxRounds: prevPolicy.maxRounds === prevBaselinePolicy.maxRounds ? latest.policy.maxRounds : prevPolicy.maxRounds,
+            botOrder,
+          };
+        });
+        return latest.policy;
+      });
+      setPolicyRevision(latest.revision);
+    } catch { /* ignore transient refresh errors; save will still guard by revision */ }
+  }, [connection, group.id, state.groupDiscussionAvailable]);
 
   useEffect(() => {
     if (!state.groupDiscussionAvailable) return;
@@ -82,9 +115,13 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
       })
       .catch(() => { if (active) setError(t("未能读取最新群组设置，请稍后重试。")); })
       .finally(() => { if (active) setLoadingPolicy(false); });
-    void loadMemberState();
     return () => { active = false; abort.abort(); };
-  }, [connection, group.id, state.groupDiscussionAvailable, loadMemberState]);
+  }, [connection, group.id, state.groupDiscussionAvailable]);
+
+  useEffect(() => {
+    pickerInitialized.current = false;
+    void loadMemberState();
+  }, [loadMemberState]);
 
   const hostsInDirectory = useMemo(() => {
     const map = new Map<string, string>();
@@ -118,6 +155,7 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
         }),
       });
       await loadMemberState();
+      await syncSettingsBaseline();
       if (alive.current) setMemberFeedback(t("已按会话添加成员「{0}」", selectedCandidateBot.name));
     } catch {
       if (alive.current) setError(t("添加会话成员失败，请确认目标主机在线后重试。"));
@@ -153,6 +191,7 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
         signal: timeoutSignal(20_000),
       });
       await loadMemberState();
+      await syncSettingsBaseline();
       if (alive.current) setMemberFeedback(t("已移出成员并回收访问权限，原会话历史保留。"));
     } catch {
       if (alive.current) setError(t("移出成员失败，请稍后重试。"));
@@ -163,7 +202,7 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
 
   const handleSetDesignated = async (memberKey: string) => {
     if (memberBusy || !allowed) return;
-    setMemberBusy(true);
+    setMemberBusy(true); setError("");
     try {
       await connection.http(`/api/groups/${group.id}/designated`, {
         method: "PUT",
@@ -171,6 +210,25 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
         body: JSON.stringify({ memberKey: memberKey || null }),
       });
       await loadMemberState();
+    } catch {
+      if (alive.current) setError(t("设置默认回复成员失败，请稍后重试。"));
+    } finally {
+      if (alive.current) setMemberBusy(false);
+    }
+  };
+
+  const handleRetryQuestion = async (questionId: string) => {
+    if (memberBusy || !allowed) return;
+    setMemberBusy(true); setMemberFeedback(""); setError("");
+    try {
+      await connection.http(`/api/groups/${group.id}/questions/${questionId}/retry`, {
+        method: "POST",
+        signal: timeoutSignal(20_000),
+        body: "{}",
+      });
+      await loadMemberState();
+    } catch {
+      if (alive.current) setError(t("核对或重试提问失败，请稍后重试。"));
     } finally {
       if (alive.current) setMemberBusy(false);
     }
@@ -255,11 +313,12 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
     <AvatarEditor kind="group" id={group.id} name={group.title} ownerId={group.ownerId} label={t("群头像")}/>
     <form onSubmit={event => { event.preventDefault(); void save(); }}>
       <label>{t("群组名称")}<input ref={titleInput} value={title} maxLength={256} required disabled={busy || loadingPolicy || !allowed} onChange={event => setTitle(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)) event.preventDefault(); }}/></label>
-      {state.groupDiscussionAvailable ? <GroupDiscussionOptions value={policy} change={setPolicy} bots={bots} parallelAvailable={!!state.groupParallelAvailable} disabled={busy || loadingPolicy || !policyRevision || !allowed}/> : <p className="creation-help">{t("更新主机后，可设置轮流讨论和独立评议。")}</p>}
+      {state.groupDiscussionAvailable ? <GroupDiscussionOptions value={policy} change={setPolicy} bots={bots} parallelAvailable={!!state.groupParallelAvailable} crossHostAvailable={!!state.crossHostGroupsAvailable} disabled={busy || loadingPolicy || !policyRevision || !allowed}/> : <p className="creation-help">{t("更新主机后，可设置轮流讨论和独立评议。")}</p>}
       {policy.mode === "designated" && memberState && memberState.members.length > 0 && (
         <label className="group-designated-picker">
           <span>{t("指定默认回复成员")}</span>
-          <select disabled={!allowed || memberBusy} value={memberState.designatedMemberKey ?? memberState.members[0]!.memberKey} onChange={e => void handleSetDesignated(e.target.value)}>
+          <select disabled={!allowed || memberBusy} value={memberState.designatedMemberKey ?? ""} onChange={e => void handleSetDesignated(e.target.value)}>
+            <option value="">{t("未指定（仅 @ 时回复）")}</option>
             {memberState.members.map(m => (
               <option key={m.memberKey} value={m.memberKey}>{m.nameSnapshot} · {m.hostName}</option>
             ))}
@@ -360,11 +419,7 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
                     <span><strong>{q.botNameSnapshot}</strong> · {q.hostName}</span>
                     <span className="group-question-status">{questionStatusLabel(q.status)}{q.stoppedUnanswered ? ` · ${t("停止时尚未回复")}` : ""}</span>
                     {(q.status === "failed" || q.status === "uncertain") && (
-                      <button type="button" className="secondary" disabled={!allowed || memberBusy} onClick={async () => {
-                        setMemberBusy(true);
-                        try { await connection.http(`/api/groups/${group.id}/questions/${q.id}/retry`, { method: "POST", body: "{}" }); await loadMemberState(); }
-                        finally { if (alive.current) setMemberBusy(false); }
-                      }}>{t("核对 / 重试")}</button>
+                      <button type="button" className="secondary" disabled={!allowed || memberBusy} onClick={() => void handleRetryQuestion(q.id)}>{t("核对 / 重试")}</button>
                     )}
                   </li>
                 ))}

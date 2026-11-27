@@ -6,7 +6,7 @@ import { z } from "zod";
 import { CHUNK_BYTES, conversationSchema, idSchema } from "../client-protocol/index.js";
 import { attachmentMime } from "../client-protocol/attachment-mime.js";
 import { groupSettingsSchema } from "../client-protocol/groups.js";
-import { groupMembersStateSchema, type GroupHistoryVisibility } from "../client-protocol/group-members.js";
+import { CROSS_HOST_GROUPS_CAPABILITY, groupMembersStateSchema, type GroupHistoryVisibility } from "../client-protocol/group-members.js";
 import {
   GROUP_DISCUSSION_CAPABILITY, GROUP_DISCUSSION_COMPOSER_CAPABILITY, GROUP_DISCUSSION_RECOVERY_CAPABILITY, GROUP_PARALLEL_CAPABILITY, GROUP_DISCUSSION_TEXT_LIMIT, groupDiscussionActionSchema, groupDiscussionControlSchema, groupDiscussionStartSchema, groupDiscussionNoteSchema,
   groupDiscussionViewSchema, groupSettingsSnapshotSchema,
@@ -47,14 +47,20 @@ export async function runGroupsCommand(client: Client, command: string | undefin
   };
   if (!command || !Object.hasOwn(allowed, command)) throw new Error("用法：tarobot groups show|update|members|add-member|remove-member|switch-session|room|stop|status|start|note|pause|resume|end|retry；请执行 tarobot --help。");
   for (const [key, value] of Object.entries(options)) if (value !== undefined && !allowed[command]!.includes(key)) throw new Error(`groups ${command} 不支持 --${key}。`);
-  if (!client.ready.serverCapabilities.includes(GROUP_DISCUSSION_CAPABILITY)) throw new Error("主机尚不支持群讨论模式，请先更新主机。");
-  const target = idSchema.parse(required(id, ["show", "update", "members", "add-member", "remove-member", "switch-session", "room", "stop"].includes(command) ? "缺少群 ID。" : "缺少群或话题对话 ID。"));
+  const crossHostCommands = ["members", "add-member", "remove-member", "switch-session", "room", "stop"];
+  if (crossHostCommands.includes(command)) {
+    if (!client.ready.serverCapabilities.includes(CROSS_HOST_GROUPS_CAPABILITY)) throw new Error("主机尚不支持跨主机与按会话群成员管理，请先更新主机。");
+  } else if (!client.ready.serverCapabilities.includes(GROUP_DISCUSSION_CAPABILITY)) {
+    throw new Error("主机尚不支持群讨论模式，请先更新主机。");
+  }
+  const target = idSchema.parse(required(id, ["show", "update", ...crossHostCommands].includes(command) ? "缺少群 ID。" : "缺少群或话题对话 ID。"));
   if (command === "members") return groupMembersStateSchema.parse(await client.request(`/api/groups/${target}/members`));
   if (command === "add-member") {
     const botId = idSchema.parse(required(options.bot, "缺少 --bot ID。"));
+    const hostId = options.host ? idSchema.parse(options.host) : undefined;
     const historyVisibility = parseHistoryVisibility(options.history);
     return client.request(`/api/groups/${target}/members`, "POST", {
-      ...(options.host ? { hostId: options.host } : {}),
+      ...(hostId ? { hostId } : {}),
       botId,
       ...(options.session ? { sessionId: idSchema.parse(options.session) } : {}),
       ...(historyVisibility ? { historyVisibility } : {}),
@@ -83,6 +89,7 @@ export async function runGroupsCommand(client: Client, command: string | undefin
     // present, the policy revision. Never fetch-and-overwrite a newer edit.
     const input = groupSettingsSchema.parse(JSON.parse(await readText(required(options.from, "缺少 --from 设置 JSON 文件；可先 groups show 取得当前值和 revision。"), 64 * 1024)));
     if (input.policy?.mode === "parallel" && !client.ready.serverCapabilities.includes(GROUP_PARALLEL_CAPABILITY)) throw new Error("主机尚不支持并行回复，请先更新主机。");
+    if (input.policy?.mode === "designated" && !client.ready.serverCapabilities.includes(CROSS_HOST_GROUPS_CAPABILITY)) throw new Error("主机尚不支持指定 Bot 回复，请先更新主机。");
     const conversations = z.array(conversationSchema).parse(await client.request(`/api/groups/${target}/settings`, "PUT", input));
     return { conversations, settings: groupSettingsSnapshotSchema.parse(await client.request(`/api/groups/${target}/settings`)) };
   }
