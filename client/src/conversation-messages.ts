@@ -118,12 +118,18 @@ export function useConversationMessages(connection: HubConnection, conversationI
           const cachedInMemory = !immediate && Boolean(peekCachedMessages(connection, conversationId));
           const gap = Math.min(MAX_HISTORY_READ_GAP_MS, Math.max(MIN_HISTORY_READ_GAP_MS, lastCost));
           const wait = lastEnd !== undefined && !immediate && !cachedInMemory ? lastEnd + gap - performance.now() : 0;
+          // The send timing probe reports the time spent in this wait, not the
+          // planned one: an urgent revision or an explicit retry ends it early,
+          // and a skipped wait counts as zero.
+          let gapWaitedMs = 0;
           if (wait > 0) {
+            const waitStarted = performance.now();
             await new Promise<void>(resolve => {
               const timer = setTimeout(resolve, wait);
               wake = () => { clearTimeout(timer); resolve(); };
             });
             wake = undefined;
+            gapWaitedMs = performance.now() - waitStarted;
             if (disposed) break;
           }
           immediate = false;
@@ -141,7 +147,7 @@ export function useConversationMessages(connection: HubConnection, conversationI
             const { visible: visibleMessages, deletedClientMsgIds } = filterRawHistory(messages);
             if (!disposed) {
               const readEndAt = performance.now();
-              markSendTimingHistoryRead(conversationId, visibleMessages, readEndAt, wait > 0 ? wait : 0, readEndAt - started);
+              markSendTimingHistoryRead(conversationId, visibleMessages, readEndAt, gapWaitedMs, readEndAt - started);
               setView(previous => {
                 const sameScope = previous?.connection === connection && previous.conversationId === conversationId;
                 const shared = sameScope ? shareMessages(previous.messages, visibleMessages) : visibleMessages;

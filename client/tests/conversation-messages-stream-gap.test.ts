@@ -16,6 +16,7 @@ vi.mock("../src/share-inbox.js", () => ({ syncShareUploadLimit: async () => {} }
 
 import { HubConnection } from "../src/connection.js";
 import { MIN_HISTORY_READ_GAP_MS, useConversationMessages } from "../src/conversation-messages.js";
+import { beginSendTiming, clearSendTimingRecords, getSendTimingRecords, setSendTimingTestHook } from "../src/send-timing.js";
 
 function setupDom() {
   const dom = parseHTML("<!doctype html><html><body><div id='root'></div></body></html>");
@@ -226,5 +227,94 @@ describe("stream-gap bypass and fail-closed connection invalidation", () => {
 
     await connection.confirmHistoryClear("c1", 10);
     expect(invalidateMessages).toHaveBeenLastCalledWith("c1");
+  });
+});
+
+describe("send timing probe around the history read gap", () => {
+  let root: Root | undefined;
+  const botMessage = (seq: number, version: number, extra: Partial<Message> = {}) => ({
+    type: "event", conversationId: "c1", seq, kind: version === 1 ? "message.created" : "message.updated", at: 100 + seq,
+    payload: { id: "bot_1", conversationId: "c1", authorId: "bot", authorType: "bot", blocks: [{ type: "text", text: `chunk ${version}` }], status: "streaming", version, createdAt: 100, ...extra },
+  });
+  const userMessage = (seq: number) => ({
+    type: "event", conversationId: "c1", seq, kind: "message.created", at: 100 + seq,
+    payload: { id: "user_1", conversationId: "c1", authorId: "owner", authorType: "user", clientMsgId: "cm_1", blocks: [{ type: "text", text: "sent while streaming" }], status: "complete", version: 1, createdAt: 120 },
+  });
+  async function mount(withPeek: boolean) {
+    const container = setupDom();
+    const setup = await setupConnection({ withPeek });
+    function Harness() {
+      useConversationMessages(setup.connection, "c1", true, true);
+      return null;
+    }
+    await act(async () => {
+      root = createRoot(container);
+      root.render(createElement(Harness));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // The first read is far enough back that the next one starts without a wait.
+    await act(async () => { await vi.advanceTimersByTimeAsync(MIN_HISTORY_READ_GAP_MS + 20); });
+    await act(async () => { await setup.receive(botMessage(1, 1)); });
+    expect(setup.messagesRead).toHaveBeenCalledTimes(2);
+    setSendTimingTestHook(true);
+    return setup;
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.useFakeTimers();
+    io.notify.mockResolvedValue(undefined);
+  });
+
+  afterEach(async () => {
+    if (root) {
+      await act(async () => { root?.unmount(); });
+      root = undefined;
+    }
+    setSendTimingTestHook(false);
+    clearSendTimingRecords();
+    delete (globalThis as { __tarobirdSendTiming?: unknown }).__tarobirdSendTiming;
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("records the time spent in a wait that a user send ends early, not the planned gap", async () => {
+    const { messagesRead, receive } = await mount(false);
+    beginSendTiming({ conversationId: "c1", kind: "direct", messageLength: 20, clientMsgId: "cm_1" });
+    // A Bot update right after a read plans the full gap before the next one.
+    await act(async () => { await receive(botMessage(2, 2)); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+    expect(messagesRead).toHaveBeenCalledTimes(2);
+    // The user's own message ends that wait after 10 ms of the planned 80 ms.
+    await act(async () => { await receive(userMessage(3)); });
+    expect(messagesRead).toHaveBeenCalledTimes(3);
+    const record = getSendTimingRecords().at(-1)!;
+    expect(record.historyReadDoneAt).toBeDefined();
+    expect(record.historyReadGapWaitMs).toBe(10);
+  });
+
+  it("records zero when the in-memory copy lets the read skip the wait", async () => {
+    const { messagesRead, receive } = await mount(true);
+    beginSendTiming({ conversationId: "c1", kind: "direct", messageLength: 20, clientMsgId: "cm_1" });
+    await act(async () => { await receive(botMessage(2, 2)); });
+    await act(async () => { await receive(userMessage(3)); });
+    expect(messagesRead).toHaveBeenCalledTimes(4);
+    const record = getSendTimingRecords().at(-1)!;
+    expect(record.historyReadDoneAt).toBeDefined();
+    expect(record.historyReadGapWaitMs).toBe(0);
+  });
+
+  it("records a wait that runs its course in full", async () => {
+    const { messagesRead, receive } = await mount(false);
+    beginSendTiming({ conversationId: "c1", kind: "direct", messageLength: 20, clientMsgId: "cm_1" });
+    // Only a non-urgent event can sit out the whole gap, so the traced message
+    // is given to a Bot update here; a user-authored event would end the wait.
+    await act(async () => { await receive(botMessage(2, 2, { clientMsgId: "cm_1" })); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(MIN_HISTORY_READ_GAP_MS - 1); });
+    expect(messagesRead).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(messagesRead).toHaveBeenCalledTimes(3);
+    expect(getSendTimingRecords().at(-1)!.historyReadGapWaitMs).toBe(MIN_HISTORY_READ_GAP_MS);
   });
 });
