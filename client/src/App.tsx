@@ -2025,7 +2025,15 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     addFiles, reason => setAttachmentDropError(reason === "directory" ? t("暂不支持拖入文件夹，请选择其中的文件。") : dropDisabledMessage),
     { windowFallback: !pane, label: current?.title, disabledMessage: dropDisabledMessage });
   const workbenchButton = !pane && workbenchEligible && <button ref={workbenchTrigger} className="icon-button workbench-trigger" aria-label={t("工作台")} title={t("工作台")} aria-expanded={workbenchVisible} aria-controls={workbenchId} onClick={() => { if (workbenchVisible) { designOpener.revoke(); setRightMode("side"); } else void openWorkbench().catch(reportWorkbenchOpenError); }}><Monitor size={18}/></button>;
-  const filesButton = filesEligible && <button ref={filesTrigger} className="icon-button files-trigger" aria-label={t("文件")} title={t("工作区文件")} aria-expanded={filesVisible} aria-controls={filesId} onClick={() => { if (filesVisible) { setRightMode("side"); } else { designOpener.revoke(); setSettings(false); setDetails(false); closeSearch(); setSidebar(false); setRightMode("files"); } }}><FolderTree size={18}/></button>;
+  const openFiles = () => {
+    designOpener.revoke();
+    setSettings(false);
+    setDetails(false);
+    closeSearch();
+    setSidebar(false);
+    setRightMode("files");
+  };
+  const filesButton = filesEligible && <button ref={filesTrigger} className="icon-button files-trigger" aria-label={t("文件")} title={t("工作区文件")} aria-expanded={filesVisible} aria-controls={filesId} onClick={() => { if (filesVisible) setRightMode("side"); else openFiles(); }}><FolderTree size={18}/></button>;
   const rightPanelSwitcher = (workbenchButton && filesButton)
     ? <div className="right-panel-switcher" role="group" aria-label={t("右侧面板")}>{workbenchButton}{filesButton}</div>
     : <>{workbenchButton}{filesButton}</>;
@@ -2412,6 +2420,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       <button onClick={() => { setChatActions(false); setNewChat({ kind: "direct", ...(activeBot ? { botId: activeBot.id } : {}) }); }}><Plus size={20}/>{t("新对话")}</button>
     </div>
     <div className="mobile-chat-action-list">
+      {filesEligible && <button onClick={() => { setChatActions(false); openFiles(); }}><FolderTree size={20}/><span className="action-label">{t("工作区文件")}</span><ChevronRight className="action-chevron" size={18}/></button>}
       {!pane&&isMobileScreenApp()&&<button onClick={()=>{setChatActions(false);openScreen();}}><MonitorPlay size={20}/><span className="action-label">{t("查看屏幕")}</span><ChevronRight className="action-chevron" size={18}/></button>}
       {!pane&&isMobileScreenApp()&&<button onClick={()=>{setChatActions(false);setSettingsFromMenu(true);setSettingsSection("screen");setSettings(true);}}><MonitorCog size={20}/><span className="action-label">{t("屏幕控制设置")}</span><ChevronRight className="action-chevron" size={18}/></button>}
       {phone && usage.quota && <button aria-label={t("额度")} aria-describedby={`${chatActionNote}-quota`} onClick={openQuotaDetails}><QuotaBattery left={usage.quota.left} stale={usage.quota.stale}/><span className="action-label">{t("额度")}</span><span id={`${chatActionNote}-quota`} className="action-value" data-tone={usage.quota.stale ? undefined : usageTone(usage.quota.left)} data-stale={usage.quota.stale ? "true" : undefined}>{usage.quota.left}%</span><ChevronRight className="action-chevron" size={18}/></button>}

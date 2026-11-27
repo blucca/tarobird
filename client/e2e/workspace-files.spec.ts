@@ -255,8 +255,13 @@ test("phone Files panel stays non-blocking when hidden, uses horizontal safe-are
     const filesPanel = page.locator("aside.workspace-files-panel.workspace-files-phone");
     await expect(filesPanel).toBeHidden();
 
-    // Open Files panel on phone.
-    await page.getByRole("button", { name: "文件", exact: true }).click();
+    // The phone header leaves room for the title. Open workspace files from chat actions.
+    const header = page.locator(".conversation-header:visible");
+    await expect(header.getByRole("button", { name: "文件", exact: true })).toHaveCount(0);
+    await header.getByRole("button", { name: "更多聊天操作", exact: true }).click();
+    const actions = page.getByRole("dialog", { name: "聊天操作", exact: true });
+    await actions.getByRole("button", { name: "工作区文件", exact: true }).click();
+    await expect(actions).toBeHidden();
     await expect(filesPanel).toBeVisible();
     await expect(filesPanel.getByText("README.md", { exact: true })).toBeVisible();
 
