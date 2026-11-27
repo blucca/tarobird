@@ -12,6 +12,7 @@
   <a href="https://github.com/cloveric/tarobird/releases/latest"><b>Download</b></a> &nbsp;·&nbsp;
   <a href="https://apps.apple.com/app/tarobird/id6828071641"><b>iOS App Store</b></a> &nbsp;·&nbsp;
   <a href="https://testflight.apple.com/join/ByFWEfFW"><b>iOS TestFlight beta</b></a> &nbsp;·&nbsp;
+  <a href="docs/client/web-client.md"><b>Web</b></a> &nbsp;·&nbsp;
   <a href="#quick-start"><b>Quick start</b></a> &nbsp;·&nbsp;
   <a href="#connection-options">Connection options</a> &nbsp;·&nbsp;
   <a href="docs/details.md">Details</a> &nbsp;·&nbsp;

@@ -4,7 +4,8 @@ import { defaultDeviceName } from "./device-presentation.js";
 import { rememberRouteTrust } from "./route-trust.js";
 import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import { ArrowLeft, ChevronLeft, ClipboardPaste, ImagePlus, LoaderCircle, Monitor, QrCode, ShieldCheck, Smartphone } from "lucide-react";
-import type { PairingProps } from "./HostApp.js";
+import type { BrowserPairingImport, PairingProps } from "./HostApp.js";
+import type { HubConnection } from "./connection.js";
 import { BrandMark, PairingIntro } from "./BrandScenes.js";
 import { connectionConfiguration } from "./connection-routes.js";
 import { orderedRoutes, type Deployment } from "../../src/client-protocol/routes.js";
@@ -15,6 +16,7 @@ import { t, useLocale } from "./i18n.js";
 import { hubFetch, usesPinnedTransport } from "./transport.js";
 import { connectionVerificationFailure, connectionVerificationMessage, preferredVerificationFailure, validHubPublicKey } from "./connection-verification.js";
 import { pairingInviteError } from "./pairing-invite-errors.js";
+import { inspectBrowserPairingHash, stripBrowserPairingHash, type ConnectPayload } from "./web-browser.js";
 
 const PairingCode = lazy(() => import("./PairingCode.js").then(module => ({ default: module.PairingCode })));
 const PairingScanner = lazy(() => import("./PairingCode.js").then(module => ({ default: module.PairingScanner })));
@@ -25,7 +27,7 @@ const RepairHostRoute = lazy(() => import("./RepairHostRoute.js").then(module =>
 class PairingRequestError extends Error { constructor(readonly code: string, message: string) { super(message); } }
 const idle = { status: "offline" as const, error: undefined as string | undefined, awaitingApproval: false };
 const noopSubscribe = () => () => undefined;
-export function Pairing({ connected, save, beforePair, discard, cancel, pendingConnection, manage, localHostReady = false }: PairingProps) {
+export function Pairing({ connected, save, beforePair, discard, cancel, pendingConnection, manage, manageConnections, existingHostStatus, browserImport, consumeBrowserImport, localHostReady = false }: PairingProps) {
   useLocale();
   const [preparedLocal, setPreparedLocal] = useState<Identity>();
   const saveLocal = async (identity: Identity, name: string) => { if (save) await save(identity, name); else await cache.saveIdentity(identity); setPreparedLocal(identity); setName(name); };
@@ -39,7 +41,9 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   const [deployment, setDeployment] = useState<Deployment>(), [legacyDirect, setLegacyDirect] = useState<Route>();
   const [address, setAddress] = useState(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""), [relays, setRelays] = useState<Route[]>([]);
   const [name, setName] = useState(() => defaultDeviceName(platform));
+  const [fromBrowserLink, setFromBrowserLink] = useState(false);
   const pairButton = useRef<HTMLButtonElement>(null), imported = useRef(false), failure = useRef<HTMLParagraphElement>(null);
+  const handledBrowserImport = useRef(0);
   useEffect(() => {
     if (scan || !imported.current) return;
     imported.current = false;
@@ -50,7 +54,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       pairButton.current?.scrollIntoView({ block: "nearest", behavior: "instant" });
     });
     return () => cancelAnimationFrame(frame);
-  }, [scan]);
+  }, [scan, expectedKey, invite, fromBrowserLink]);
   const [createdIdentity, setIdentity] = useState<Identity>(), [error, setError] = useState(""), [busy, setBusy] = useState(false);
   // On a short phone screen the action sits at the bottom edge, so a refusal
   // below it would look like nothing happened. Reveal it; focus stays put.
@@ -67,12 +71,90 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   // Derived only; the user still starts pairing and approves it elsewhere.
   const reviewing = phone && !!expectedKey && !pending;
   const directHost = (() => { try { return address ? new URL(address).hostname : ""; } catch { return ""; } })();
+  const routeHosts = [
+    ...(address ? [directHost || address] : []),
+    ...relays.map((route) => { try { return new URL(route.url).hostname || route.url; } catch { return route.url; } }).filter(Boolean),
+  ].filter((host, index, all) => all.indexOf(host) === index);
+  const routeSummary = routeHosts.length ? routeHosts.join(" · ") : t("VPS 中转");
+  const existingStatus = expectedKey && !pending ? existingHostStatus?.(expectedKey) : undefined;
   const tailscaleRoute = legacyDirect?.name === "Tailscale" || directHost.endsWith(".ts.net") || /^100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./.test(directHost);
   const lanRoute = /^(?:192\.168\.|10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)/.test(directHost);
   const status = useSyncExternalStore(connection ? (notify) => connection.subscribe(notify) : noopSubscribe, () => connection?.state ?? idle);
   const [now, setNow] = useState(Date.now), completing = useRef(false), admission = useRef(false);
   const remaining = pending ? pairingRemaining(pending.expiresAt, now, pending.serverTimeOffset) : 0;
   useEffect(() => { if (!pending) return; const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, [pending]);
+  const renewPendingConnection = (targetConnection: HubConnection, targetPending: PendingPairing, payload: ConnectPayload) => {
+    if (payload.hubPublicKey !== targetConnection.identity.hubPublicKey) throw new Error(t("这不是当前主机的二维码。请扫描此主机显示的连接二维码。"));
+    if (admission.current) throw new Error(t("正在核对上一份申请，请稍候。"));
+    admission.current = true; setBusy(true); setError(""); setRequestError(undefined);
+    const next: PendingPairing = { code: "", expiresAt: 0, request: { invite: payload.invite!, requestId: randomNonce() } };
+    void (async () => {
+      const snapshot = { ...targetConnection.identity };
+      const direct = payload.routes.find(route => route.name !== "VPS");
+      const unchanged = !direct || snapshot.routes.some(route => route.url === direct.url && route.certificateAuthority === direct.certificateAuthority);
+      let repair;
+      if (!unchanged) {
+        const { renewedPairingRoutes } = await import("./RepairHostRoute.js");
+        repair = renewedPairingRoutes(snapshot, payload);
+      }
+      await targetConnection.updateRoutes(repair?.routes ?? snapshot.routes, {
+        expected: snapshot.routes, deployment: repair ? repair.deployment : snapshot.deployment, reason: "user",
+        pairing: { next, expected: { code: targetPending.code, requestId: targetPending.request?.requestId } },
+      });
+    })()
+      .then(() => { setAnother(false); setFromBrowserLink(false); setIdentity(targetConnection.identity); setNow(Date.now()); targetConnection.refreshCache(); })
+      .catch(cause => setError(cause instanceof Error && cause.message === "pairing_route_confirmation_required" ? t("新连接码包含不同的公网地址或证书。请先通过「更新主机地址」核对并保存，再扫描此连接码。") : t("配对状态已变化，请重新检查连接。")))
+      .finally(() => { admission.current = false; setBusy(false); });
+  };
+  const applyBrowserImport = (item: BrowserPairingImport) => {
+    if (item.error) { setError(item.error); return; }
+    const payload = item.payload;
+    if (!payload) return;
+    const activePendingConnection = connection?.identity.pendingPairing ? connection : pendingConnection?.identity.pendingPairing ? pendingConnection : undefined;
+    if (activePendingConnection?.identity.pendingPairing) {
+      if (payload.hubPublicKey === activePendingConnection.identity.hubPublicKey) {
+        try { renewPendingConnection(activePendingConnection, activePendingConnection.identity.pendingPairing, payload); }
+        catch (e) { setError(e instanceof Error ? e.message : t("连接失败")); }
+        return;
+      }
+      // Switch cleanly to the new-host flow without wiping the imported payload.
+      setAnother(true); setIdentity(undefined); setRequestError(undefined);
+    }
+    imported.current = true;
+    setFromBrowserLink(true);
+    setInvite(payload.invite);
+    setDeployment(payload.deployment);
+    const direct = payload.routes.find((r) => r.name !== "VPS");
+    setLegacyDirect(direct);
+    setAddress(direct?.url ?? "");
+    setRelays(payload.routes.filter((r) => r.name === "VPS"));
+    setExpectedKey(payload.hubPublicKey);
+    setManual(false);
+    setOptionsOpen(false);
+    setError("");
+  };
+  const applyBrowserImportRef = useRef(applyBrowserImport);
+  applyBrowserImportRef.current = applyBrowserImport;
+  useEffect(() => {
+    if (!browserImport || handledBrowserImport.current === browserImport.serial) return;
+    handledBrowserImport.current = browserImport.serial;
+    consumeBrowserImport?.(browserImport.serial);
+    applyBrowserImportRef.current(browserImport);
+  }, [browserImport, consumeBrowserImport]);
+  useEffect(() => {
+    if (platform !== "web" || consumeBrowserImport) return;
+    const capture = () => {
+      const result = inspectBrowserPairingHash(window.location.hash, window.location.origin);
+      if (result.kind === "none") return;
+      stripBrowserPairingHash();
+      if (result.kind === "valid") applyBrowserImportRef.current({ serial: 0, payload: result.payload });
+      else if (result.kind === "origin_mismatch") applyBrowserImportRef.current({ serial: 0, error: t("此浏览器配对链接与当前访问地址不匹配，请使用目标主机生成的链接。") });
+      else applyBrowserImportRef.current({ serial: 0, error: t("浏览器配对链接无效或不完整，请在已配对设备重新生成并打开。") });
+    };
+    capture();
+    window.addEventListener("hashchange", capture);
+    return () => window.removeEventListener("hashchange", capture);
+  }, [platform, consumeBrowserImport]);
   // Actual authenticated readiness is the only success signal. Keep the code
   // durable across backgrounding/reload, and never enter a disconnected chat.
   useEffect(() => {
@@ -106,14 +188,34 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       if (usesPinnedTransport() && routes.some((route) => route.url.startsWith("https:")) && !trustedKey) throw new Error(t("请扫描可信设备上的 Hub 二维码，或填写主机身份公钥。"));
       if (usesPinnedTransport() && trustedKey && !validHubPublicKey(trustedKey)) throw new Error("invalid_hub_key");
       rememberRouteTrust(routes, trustedKey);
-      const probes = await Promise.allSettled(orderedRoutes(routes).map(async (route) => {
+      const pageOrigin = platform === "web" && location.origin.startsWith("http") ? location.origin : undefined;
+      const ordered = orderedRoutes(routes);
+      const pageOriginIndex = pageOrigin ? ordered.findIndex((route) => {
+        try { return new URL(route.url).origin === pageOrigin; } catch { return false; }
+      }) : -1;
+      if (fromBrowserLink && (!pageOrigin || pageOriginIndex < 0)) {
+        throw new Error(t("此浏览器配对链接与当前访问地址不匹配，请使用目标主机生成的链接。"));
+      }
+      const probes = await Promise.allSettled(ordered.map(async (route) => {
         const response = await hubFetch(route.url, "/health", trustedKey, { signal: timeoutSignal(usesPinnedTransport() ? 6000 : 2000), cache: "no-store" });
         const health = await response.json() as { ok?: boolean; publicKey?: string; pairingInvites?: number };
         if (!response.ok || health.ok !== true || typeof health.publicKey !== "string") throw new Error("hub_unavailable");
         if (trustedKey && health.publicKey !== trustedKey) throw new Error("tls_identity_mismatch");
         return { route, publicKey: health.publicKey, supportsInvites: health.pairingInvites === 1 };
       }));
-      const available = probes.find((result) => result.status === "fulfilled");
+      if (pageOrigin && pageOriginIndex >= 0) {
+        const pageProbe = probes[pageOriginIndex];
+        if (!pageProbe || pageProbe.status !== "fulfilled") {
+          const failure = pageProbe?.status === "rejected" ? connectionVerificationFailure(pageProbe.reason) : undefined;
+          throw new Error(connectionVerificationMessage(failure) ?? t("当前页面的主机地址不可用或身份不匹配，已阻止切换到其他地址。"));
+        }
+      }
+      if (fromBrowserLink) {
+        const mismatch = probes.find((result) => result.status === "rejected" && connectionVerificationFailure(result.reason) === "identity-mismatch");
+        if (mismatch && mismatch.status === "rejected") throw mismatch.reason;
+      }
+      const available = (pageOriginIndex >= 0 && probes[pageOriginIndex]?.status === "fulfilled" ? probes[pageOriginIndex] : undefined)
+        ?? probes.find((result) => result.status === "fulfilled");
       if (!available || available.status !== "fulfilled") {
         const failure = preferredVerificationFailure(probes.map((result) => result.status === "rejected" ? connectionVerificationFailure(result.reason) : undefined));
         throw new Error(connectionVerificationMessage(failure) ?? t("没有可用且身份匹配的线路，请检查地址后重试。"));
@@ -175,6 +277,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   // (its invite, address and key) must not be submitted for another host.
   const startAnother = () => {
     setAnother(true); setIdentity(undefined); setError(""); setRequestError(undefined);
+    setFromBrowserLink(false);
     setInvite(undefined); setExpectedKey(undefined); setManualKey(""); setDeployment(undefined); setLegacyDirect(undefined); setRelays([]);
     setAddress(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""); setManual(platform === "web"); setOptionsOpen(false); setHostName(t("我的主机"));
   };
@@ -213,7 +316,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       {connection && <details className="pairing-options"><summary>{t("无法连接？更新主机地址")}</summary><Suspense fallback={null}><RepairHostRoute connection={connection} online={status.status === "online"} busyChange={setBusy}/></Suspense>{manage && <button type="button" disabled={busy} onClick={manage}>{t("设备与网络")}</button>}</details>}
     </section> : <>
       {/* New users look for the QR code here; say where it comes from in the eye line, not only in the side guide. */}
-      {!reviewing && <div className="pairing-qr-source" role="note"><Smartphone size={20} aria-hidden="true"/><div>
+      {!reviewing && !fromBrowserLink && <div className="pairing-qr-source" role="note"><Smartphone size={20} aria-hidden="true"/><div>
         <strong>{t("先在已连接的手机或电脑上打开「设备与网络 → 添加设备」")}</strong>
         <p>{t("那里会显示连接二维码，用下方「扫描连接二维码」扫它；也可以复制那里的连接信息，点「粘贴连接信息」。")}</p>
       </div></div>}
@@ -222,18 +325,19 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       <form className={reviewing ? "pairing-review" : undefined} onSubmit={(e) => { void pair(e).then(revealFailure); }}>
         {/* Phone review step: the entry points give way to the summary below;
             "Change connection details" reopens the same scanner dialog. */}
-        {!reviewing && <div className="pairing-import-actions">
+        {!reviewing && !fromBrowserLink && <div className="pairing-import-actions">
         <button type="button" className="primary full" disabled={busy} onClick={() => { setInputMode("text"); setScan(true); }}><ClipboardPaste size={18}/>{t("粘贴连接信息")}</button>
         <button type="button" className="pairing-scan full" disabled={busy} onClick={() => { setInputMode("image"); setScan(true); }}><ImagePlus size={18}/>{t("导入二维码图片")}</button>
         <button type="button" className="pairing-scan full" disabled={busy} onClick={(event) => { event.currentTarget.focus(); setInputMode("scan"); setScan(true); }}><QrCode size={20} aria-hidden="true"/>{t("扫描连接二维码")}</button>
         </div>}
-        {expectedKey && <div className="pairing-import" role="status"><Monitor size={18}/><div><strong>{t("已读取主机信息")}</strong><p className="muted">{address ? directHost || address : t("VPS 中转")}</p>{reviewing && <p className="pairing-import-state">{t("尚未连接，请继续完成下方配对。")}</p>}</div><button type="button" disabled={busy} onClick={() => { setInputMode("text"); setScan(true); }}>{t("更换连接信息")}</button></div>}
+        {expectedKey && <div className="pairing-import" role="status"><Monitor size={18}/><div><strong>{fromBrowserLink ? t("已读取浏览器配对链接") : t("已读取主机信息")}</strong><p className="muted">{routeSummary}</p>{(reviewing || fromBrowserLink) && <p className="pairing-import-state">{fromBrowserLink ? t("点击下方「配对此设备」，再在已配对设备上确认 8 位配对码。") : t("尚未连接，请继续完成下方配对。")}</p>}</div><button type="button" disabled={busy} onClick={() => { setInputMode("text"); setScan(true); }}>{t("更换连接信息")}</button></div>}
+        {existingStatus && <div className="pairing-existing-host" role="status"><p>{existingStatus === "revoked" ? t("此浏览器在该主机上的旧授权已失效。请先在「此设备的连接」中移除旧连接，再点击下方「配对此设备」。") : t("此浏览器已配对这台主机。如需重新配对，请先在「此设备的连接」中移除旧连接，或返回会话继续使用。")}</p>{manageConnections && <button type="button" className="secondary" disabled={busy} onClick={manageConnections}>{t("打开此设备的连接")}</button>}</div>}
         {!reviewing && routeHint}
         {(manual || expectedKey) && <>
           <label>{t("设备名称")}<input value={name} required maxLength={100} disabled={busy} aria-describedby="pairing-device-name-help" onChange={(e) => setName(e.target.value)}/></label><p id="pairing-device-name-help" className="settings-note muted">{t("确认一个其他设备也能认出的名称，例如 MacBook Pro 或 vivo 手机。")}</p>
           <details className="pairing-options" open={manual} onToggle={(e) => setManual(e.currentTarget.open)}><summary>{t("手动连接与高级选项")}</summary>
             {save && <label>{t("主机名称")}<input value={hostName} required maxLength={100} disabled={busy} onChange={(e) => setHostName(e.target.value)}/></label>}
-            <label>{t("Hub 地址")}<input type="url" inputMode="url" autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy} value={address} placeholder="https://192.168.1.100:8788" onChange={(e) => setAddress(e.target.value)}/></label>
+            <label>{t("Hub 地址")}<input type="url" inputMode="url" autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy} value={address} placeholder="https://192.168.1.100:8788" onChange={(e) => { setFromBrowserLink(false); setAddress(e.target.value); }}/></label>
             {usesPinnedTransport() && !expectedKey && <label>{t("主机身份公钥")}<input disabled={busy} value={manualKey} maxLength={120} autoCapitalize="none" autoCorrect="off" spellCheck={false} onChange={(e) => setManualKey(e.target.value)} placeholder="MCowBQYDK2VwAyEA…"/></label>}
             <details className="pairing-options" open={optionsOpen} onToggle={(e) => setOptionsOpen(e.currentTarget.open)}><summary>{t("连接选项与备用中转（可选）")}</summary>{optionsOpen && <Suspense fallback={null}><PairingRouteOptions relays={relays} busy={busy} setRelays={setRelays}/></Suspense>}</details>
           </details>
@@ -252,30 +356,11 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     if (!payload.invite) throw new Error(pairingInviteError("invite_required"));
     const pendingConnection = connection;
     if (pending && identity && pendingConnection) {
-      if (payload.hubPublicKey !== identity.hubPublicKey) throw new Error(t("这不是当前主机的二维码。请扫描此主机显示的连接二维码。"));
-      if (admission.current) throw new Error(t("正在核对上一份申请，请稍候。"));
-      admission.current = true; setBusy(true); setError("");
-      const next: PendingPairing = { code: "", expiresAt: 0, request: { invite: payload.invite, requestId: randomNonce() } };
-      void (async () => {
-        const snapshot = { ...pendingConnection.identity };
-        const direct = payload.routes.find(route => route.name !== "VPS");
-        const unchanged = !direct || snapshot.routes.some(route => route.url === direct.url && route.certificateAuthority === direct.certificateAuthority);
-        let repair;
-        if (!unchanged) {
-          const { renewedPairingRoutes } = await import("./RepairHostRoute.js");
-          repair = renewedPairingRoutes(snapshot, payload);
-        }
-        await pendingConnection.updateRoutes(repair?.routes ?? snapshot.routes, {
-          expected: snapshot.routes, deployment: repair ? repair.deployment : snapshot.deployment, reason: "user",
-          pairing: { next, expected: { code: pending.code, requestId: pending.request?.requestId } },
-        });
-      })()
-        .then(() => { setIdentity(pendingConnection.identity); setNow(Date.now()); pendingConnection.refreshCache(); })
-        .catch(cause => setError(cause instanceof Error && cause.message === "pairing_route_confirmation_required" ? t("新连接码包含不同的公网地址或证书。请先通过「更新主机地址」核对并保存，再扫描此连接码。") : t("配对状态已变化，请重新检查连接。")))
-        .finally(() => { admission.current = false; setBusy(false); });
+      renewPendingConnection(pendingConnection, pending, payload);
       return;
     }
     imported.current = true;
+    setFromBrowserLink(false);
     setInvite(payload.invite);
     setDeployment(payload.deployment); setLegacyDirect(payload.routes.find((r) => r.name !== "VPS")); setAddress(payload.routes.find((r) => r.name !== "VPS")?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError("");
   }}/></Suspense>}</main>;
