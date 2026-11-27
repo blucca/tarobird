@@ -76,6 +76,7 @@ import { ComposerSuggestions } from "./ComposerSuggestions.js";
 import { useBackAction } from "./back-navigation.js";
 import { steerReason } from "./Steering.js";
 import { sendSteering, SteeringNotDeliveredError } from "./steering-request.js";
+import { beginSendTiming, hasPendingBubbleTiming, hasPendingComposerTiming, markSendTimingBubbleVisible, markSendTimingComposerCleared, type SendTimingTrace } from "./send-timing.js";
 import { applyAppearance } from "./appearance.js";
 import { isDispatcher, isTicketNotice, listedConversations, setTicketConversationsVisible, useTicketConversationsVisible } from "./dispatcher.js";
 import { routeTitle } from "./RouteFields.js";
@@ -736,6 +737,23 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       scroll.current.scrollTop = scroll.current.scrollHeight;
     }
   }, [messages, selected, messageHeight, focusTarget, searchResults, virtualizer, chatVisible]);
+  const pendingBubbleRange = hasPendingBubbleTiming(selected, "main")
+    ? virtualizer.getVirtualItems().map((item) => item.index).join(",")
+    : "";
+  useLayoutEffect(() => {
+    if (!hasPendingBubbleTiming(selected, "main") || !displayedMessages.length) return;
+    markSendTimingBubbleVisible(selected, displayedMessages, (id) => {
+      const children = historyRows.current?.children;
+      if (!children) return false;
+      for (let i = children.length - 1; i >= 0; i--) {
+        if ((children[i] as HTMLElement).dataset?.messageId === id) return true;
+      }
+      return false;
+    });
+  }, [displayedMessages, selected, messagesReady, pendingBubbleRange]);
+  useLayoutEffect(() => {
+    if (!draft && hasPendingComposerTiming(selected, "main")) markSendTimingComposerCleared(selected, "main");
+  }, [draft, selected]);
   useEffect(() => { let active = true; if (!shell && !pane) { void cache.preferences().then((saved) => { if (active) { setPreferences(saved); setPreferencesReady(true); } }).catch(() => { if (active) setPreferencesReady(true); }); void connection.start().catch(() => undefined); } return () => { active = false; if (!shell && !pane) connection.close(); }; }, [connection]);
   useEffect(() => {
     if (shell || pane) return;
@@ -1188,8 +1206,17 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const conversationReturn = useMemo(() => ({ get current() { return conversationFocus(); } }), []);
   const forwardReturn = useMemo(() => ({ get current() { const origin = forwardOrigin.current; return origin ? messageFocus(origin.conversationId, origin.messageId, forwardTrigger.current) : forwardTrigger.current; } }), []);
   const composerContent = useRef({ files, reply }); composerContent.current = { files, reply };
-  const steer = async (ordinarySend = false, immediately = false, origin?: { context?: WorkbenchContext }, expectedTargetId?: string, queueIfRejected = false) => {
-    if (!current || !richDraftReady || sendBusy.current) return;
+  const steer = async (ordinarySend = false, immediately = false, origin?: { context?: WorkbenchContext }, expectedTargetId?: string, queueIfRejected = false, parentTiming?: SendTimingTrace) => {
+    if (!current || !richDraftReady || sendBusy.current) { parentTiming?.fail("aborted"); return; }
+    const timing = parentTiming ?? beginSendTiming({
+      conversationId: current.id,
+      kind: current.type === "group" ? "group" : "direct",
+      engine: current.type === "group" ? "group" : activeBot?.engine,
+      messageLength: draft.length,
+      historyCount: messages.length,
+      matchText: draft,
+    });
+    try {
     history.assertCanSend();
     assertMessageTextSize(draft);
     setError("");
@@ -1205,13 +1232,15 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       // Ordinary sending already captured this once. Reuse even an absent
       // optional context: a failed opener must not add a second wait to chat.
       const openContext = origin ? origin.context : await designOpener.context();
-      if (currentSelection.current !== conversationId) return;
+      if (!origin) timing?.mark("workbenchDoneAt");
+      if (currentSelection.current !== conversationId) { timing?.fail("conversation_changed"); return; }
       const boundTarget = expectedTargetId ?? (codexDirect ? steeringCapability.targetId : undefined);
-      const receipt = await sendSteering(connection, conversationId, targets[0]!, text, () => currentSelection.current === conversationId, ordinarySend, immediately, openContext, boundTarget);
-      if (!receipt) return;
+      const receipt = await sendSteering(connection, conversationId, targets[0]!, text, () => currentSelection.current === conversationId, ordinarySend, immediately, openContext, boundTarget, timing);
+      if (!receipt) { timing?.fail("conversation_changed"); return; }
       const result = receipt.blocks.find((block) => block.type === "steering");
       if (result?.outcome === "rejected") throw new SteeringNotDeliveredError(result.reason, ordinarySend);
       if (result?.outcome !== "accepted") throw new Error(ordinarySend ? nativeInputReason(result?.reason) : steerReason(result?.reason));
+      timing?.mark("steeringStateDoneAt");
       const latestEdit = lastDraftEdits.current.get(conversationId);
       if (result.mode === "message") {
         // Settle the originating draft even after navigation. A confirmed send
@@ -1221,20 +1250,23 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
           await clearSentDraft(conversationId, text);
           if ((draftVersions.current.get(conversationId) ?? 0) === textVersion) {
             clearSentRichDraft(true);
-            if (currentSelection.current === conversationId) setDraft("");
-          }
-        }
+            if (currentSelection.current === conversationId) { if (text) timing?.expectComposerClear(); setDraft(""); }
+            else timing?.skipComposerClear();
+          } else timing?.skipComposerClear();
+        } else timing?.skipComposerClear();
         if (receipt.clientMsgId) await clearNativeInputDraft(connection, conversationId, targets[0]!, receipt.clientMsgId);
       } else if (currentSelection.current === conversationId && draftRevision.current === revision) {
+        if (text) timing?.expectComposerClear();
         setDraft(""); clearSentRichDraft(true); await clearSentDraft(conversationId, text);
         if (receipt.clientMsgId) await clearSteeringDraft(connection, conversationId, targets[0]!, receipt.clientMsgId);
       } else if (piDirect && receipt.clientMsgId && latestEdit && latestEdit.version === draftVersions.current.get(conversationId) && latestEdit.version > textVersion && latestEdit.text !== text) {
+        timing?.skipComposerClear();
         // Admission is confirmed and the originating draft has been edited.
         // Use its own version/text, even after navigation; never the new chat.
         // Keep that draft, but retire only this receipt so a later intentional
         // repeat is a new send. An uncertain attempt never reaches this branch.
         await clearSteeringDraft(connection, conversationId, targets[0]!, receipt.clientMsgId);
-      }
+      } else timing?.skipComposerClear();
       if (immediately && result.mode === "message") {
         const control = await controlNativeInput(connection, conversationId, receipt.id, "send-now");
         if (control.outcome === "unknown") throw new Error(t("消息已投递，但立即发送结果待确认。请在消息下方核对，勿重复发送。"));
@@ -1251,17 +1283,33 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
         // Only a fresh native status explicitly reporting idle permits the
         // terminal's idle Ctrl+Enter behavior. Missing capability or failed
         // probes never silently become an ordinary in-flight send.
-        if (immediately && error.reason === "idle" && unchanged) return "idle" as const;
-        if (!immediately && error.canQueue && unchanged) return "queue" as const;
+        if (immediately && error.reason === "idle" && unchanged) { timing?.resetForFallback(); return "idle" as const; }
+        if (!immediately && error.canQueue && unchanged) { timing?.resetForFallback(); return "queue" as const; }
         if (immediately) throw new Error(t("当前 CLI 或任务状态不支持立即发送，消息已保留。"));
       }
       throw error;
     } finally { sendBusy.current = false; setSteeringBusy(false); }
+    } catch (error) { if (!parentTiming) timing?.fail(error); throw error; }
   };
   const sendImmediately = async () => {
-    // Commands retain their existing local/durable handling, never native text injection.
-    if (draft.trimStart().startsWith("/") || workbenchVisible || workbenchDraft) { await send(); return; }
-    if (await steer(true, true) === "idle") await send();
+    const useOrdinarySend = draft.trimStart().startsWith("/") || workbenchVisible || !!workbenchDraft;
+    if (useOrdinarySend
+      ? (!selected || !richDraftReady || recording || (!draft.trim() && !files.length) || sendBusy.current)
+      : (!selected || !current || !richDraftReady || sendBusy.current)) return;
+    const timing = beginSendTiming({
+      conversationId: selected,
+      kind: current?.type === "group" ? "group" : "direct",
+      engine: current?.type === "group" ? "group" : activeBot?.engine,
+      messageLength: draft.length,
+      historyCount: messages.length,
+      matchText: draft,
+      existingMessages: current?.type === "group" ? messages : undefined,
+    });
+    try {
+      // Commands retain their existing local/durable handling, never native text injection.
+      if (useOrdinarySend) { await send(false, false, timing); return; }
+      if (await steer(true, true, undefined, undefined, false, timing) === "idle") await send(false, false, timing);
+    } catch (error) { timing?.fail(error); throw error; }
   };
   const startHeldVoice = () => {
     setError("");
@@ -1356,8 +1404,18 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     if (queuedRows.current) observer.observe(queuedRows.current);
     return () => { observer.disconnect(); cancelAnimationFrame(fitFrame); };
   }, [chatVisible, selected, focusTarget, searchResults, tailElement, tailMessageId, followingTail, showLatest, messagesReady, displayedMessages.length]);
-  const send = async (nextTurn = false, literalUnknown = false) => {
-    if (!selected || !richDraftReady || recording || (!draft.trim() && !files.length) || sendBusy.current) return;
+  const send = async (nextTurn = false, literalUnknown = false, parentTiming?: SendTimingTrace) => {
+    if (!selected || !richDraftReady || recording || (!draft.trim() && !files.length) || sendBusy.current) { parentTiming?.fail("aborted"); return; }
+    const timing = parentTiming ?? beginSendTiming({
+      conversationId: selected,
+      kind: current?.type === "group" ? "group" : "direct",
+      engine: current?.type === "group" ? "group" : activeBot?.engine,
+      messageLength: draft.length,
+      historyCount: messages.length,
+      matchText: draft,
+      existingMessages: current?.type === "group" ? messages : undefined,
+    });
+    try {
     history.assertCanSend();
     const workbenchSendOrigin = selected, workbenchSendRevision = draftRevision.current;
     let imageDraft;
@@ -1367,11 +1425,12 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     }
     const activeWorkbenchContext = imageDraft?.context ?? await workbench.context();
     let workbenchContext = await designOpener.context(activeWorkbenchContext);
-    if (sendBusy.current || currentSelection.current !== workbenchSendOrigin) return;
+    timing?.mark("workbenchDoneAt");
+    if (sendBusy.current || currentSelection.current !== workbenchSendOrigin) { timing?.fail("aborted"); return; }
     if (draftRevision.current !== workbenchSendRevision) throw new Error(t("发送时内容已修改，未发送。请确认后再次发送。"));
     if (discussionTransitioning) throw new Error(t("请等待本次讨论停止或暂停完成，内容已保留。"));
     if (discussionPaused && !discussionControlAllowed) throw new Error(t("只有讨论发起人或群主可以控制这次讨论。"));
-    if (draft.trim() === "/tasks" && !files.length && !reply && current?.botIds.length === 1 && state.engineTasksAvailable) { setTaskListRequest({ conversationId: selected, id: Date.now() }); changeDraft(""); return; }
+    if (draft.trim() === "/tasks" && !files.length && !reply && current?.botIds.length === 1 && state.engineTasksAvailable) { timing?.fail("local_command"); setTaskListRequest({ conversationId: selected, id: Date.now() }); changeDraft(""); return; }
     const sideCommand = /^\/side(?:\s+([\s\S]*))?$/.exec(draft.trim());
     if (sideCommand) {
       if (state.status !== "online" || !activeBot?.online) throw new Error(t("侧边对话需要 Bot 在线连接。"));
@@ -1379,12 +1438,13 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       if (reply) throw new Error(t("请先取消主对话引用，再打开侧边对话。"));
       if (files.length && !side.capability?.attachments) throw new Error(t("当前主机或引擎暂不支持侧边附件，请升级后重试。"));
       const fileError = side.checkFiles(files); if (fileError) throw new Error(fileError);
+      timing?.fail("local_command");
       setRightMode("side"); const opening = side.open(sideCommand[1]?.trim() ?? "", false, files); changeDraft(""); setFiles([]); setDetails(false); await opening; return;
     }
     if (nextTurn && current?.type === "direct" && activeBot?.engine === "claude") {
       const origin = selected, revision = draftRevision.current;
       const hasAttempt = await hasNativeInputDraft(connection, origin, current.botIds[0]!, draft);
-      if (currentSelection.current !== origin || sendBusy.current) return;
+      if (currentSelection.current !== origin || sendBusy.current) { timing?.fail("aborted"); return; }
       if (draftRevision.current !== revision) throw new Error(t("发送时内容已修改，未发送。请确认后再次发送。"));
       if (hasAttempt) throw new Error(t("这段文字已有原生发送记录，本次未重复排队。请先查看原消息的状态；如需发送另一条消息，请修改内容。"));
     }
@@ -1394,14 +1454,14 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     if (codexDirect || piDirect) {
       const origin = selected, revision = draftRevision.current;
       const hasAttempt = await hasSteeringDraft(connection, origin, current!.botIds[0]!, draft);
-      if (currentSelection.current !== origin || sendBusy.current) return;
+      if (currentSelection.current !== origin || sendBusy.current) { timing?.fail("aborted"); return; }
       if (draftRevision.current !== revision) throw new Error(t("发送时内容已修改，未发送。请确认后再次发送。"));
       if (hasAttempt && (nextTurn || !retainedSupplement)) {
         sendBusy.current = true; setSteeringBusy(true);
         let recovered;
         try { recovered = await recoverSteeringDraft(connection, origin, current!.botIds[0]!, draft, () => currentSelection.current === origin && draftRevision.current === revision); }
         finally { sendBusy.current = false; setSteeringBusy(false); }
-        if (currentSelection.current !== origin || sendBusy.current) return;
+        if (currentSelection.current !== origin || sendBusy.current) { timing?.fail("aborted"); return; }
         if (draftRevision.current !== revision) throw new Error(t("发送时内容已修改，未发送。请确认后再次发送。"));
         if (recovered === "accepted") throw new Error(t("这段文字已作为补充发送，本次未重复排队。如需发送新消息，请修改内容。"));
         if (recovered === "pending") throw new Error(t("这段文字已有引导发送记录，本次未重复排队。请先核对回执；如需发送新消息，请修改内容。"));
@@ -1409,7 +1469,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       if (!nextTurn && retainedSupplement) {
         // Keep Pi's durable run-bound receipt. Only a definite refusal with
         // an unchanged draft may fall back to the visible Host queue.
-        const outcome = await steer(false, false, { context: workbenchContext }, codexDirect ? codexSendChoice.targetId : steeringCapability.targetId, piDirect);
+        const outcome = await steer(false, false, { context: workbenchContext }, codexDirect ? codexSendChoice.targetId : steeringCapability.targetId, piDirect, timing);
         if (outcome !== "queue") return;
       }
     }
@@ -1417,11 +1477,12 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       const origin = selected, revision = draftRevision.current;
       const claude = current?.type === "direct" && state.bots.find(bot => bot.id === current.botIds[0])?.engine === "claude";
       const retryNative = claude && await hasNativeInputDraft(connection, origin, current!.botIds[0]!, draft);
-      if (currentSelection.current !== origin || sendBusy.current) return;
+      if (currentSelection.current !== origin || sendBusy.current) { timing?.fail("aborted"); return; }
       if (draftRevision.current !== revision) throw new Error(t("发送时内容已修改，未发送。请确认后再次发送。"));
       const ordinaryNative = claude && !!activeBot?.online && state.status === "online" && !files.length && !reply && !draft.trimStart().startsWith("/");
-      if (!activeWorkbenchContext && (retryNative || ordinaryNative || !claude && !piDirect && continueCurrent) && await steer(true, false, { context: workbenchContext }) !== "queue") return;
+      if (!activeWorkbenchContext && (retryNative || ordinaryNative || !claude && !piDirect && continueCurrent) && await steer(true, false, { context: workbenchContext }, undefined, false, timing) !== "queue") return;
     }
+    timing?.mark("steeringStateDoneAt");
     assertMessageTextSize(draft);
     if (!replyReady) throw new Error(t("原消息已删除或当前不可访问"));
     if (current?.archived || group?.archived) throw new Error(t("对话已归档，恢复后可发送消息。"));
@@ -1452,18 +1513,24 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       // annotation resolution must not dispatch the abandoned conversation.
       if (controller.signal.aborted || currentSelection.current !== selected) throw new Error(t("上传已取消，已完成的分块会保留。"));
       const frame = { v: 1 as const, type: "message.send" as const, conversationId: selected, clientMsgId: newId("client"), text, attachments, ...(workbenchContext ? {workbench:workbenchContext} : {}), previewUrl: selectedPreviewUrl(text, previewChoice), previewStyle, ...(reply ? { replyTo: reply.id } : {}), ...(mentions?.length ? { mentions } : {}) };
-      const finishDiscussionSend = current?.type === "group"
-        ? await sendGroupComposerMessage(connection, frame, replyMode, controller.signal, value => { if (currentSelection.current === selected) setGroupReplyMode(value); }, () => groupReplyModeRef.current, intent, imageDraft)
-        : (await connection.send(frame, imageDraft?.context.kind === "design" ? imageDraft : undefined), undefined);
+      let finishDiscussionSend: (() => Promise<void>) | undefined;
+      if (current?.type === "group") {
+        finishDiscussionSend = await sendGroupComposerMessage(connection, frame, replyMode, controller.signal, value => { if (currentSelection.current === selected) setGroupReplyMode(value); }, () => groupReplyModeRef.current, intent, imageDraft, timing);
+      } else {
+        timing?.setRoute("queue");
+        timing?.setClientMsgId(frame.clientMsgId);
+        await connection.send(frame, imageDraft?.context.kind === "design" ? imageDraft : undefined);
+      }
       void nativeHaptic().catch(() => undefined);
       const unchangedText = (draftVersions.current.get(selected) ?? 0) === version && (!intent || groupDraft(selected).intent?.id === intent.id);
       try {
         clearSentRichDraft(unchangedText);
-        if (unchangedText) { await clearSentDraft(selected, text, intent); if (currentSelection.current === selected && (draftVersions.current.get(selected) ?? 0) === version && (!intent || groupDraft(selected).intent?.empty)) setDraft(""); }
+        if (unchangedText) { await clearSentDraft(selected, text, intent); if (currentSelection.current === selected && (draftVersions.current.get(selected) ?? 0) === version && (!intent || groupDraft(selected).intent?.empty)) { if (text) timing?.expectComposerClear(); else timing?.skipComposerClear(); setDraft(""); } else timing?.skipComposerClear(); } else timing?.skipComposerClear();
         if (finishDiscussionSend) { await flushRichDraft(); await finishDiscussionSend(); }
-      } catch { setError(t("消息已发送，但本机草稿清理未完成。请先核对聊天记录，避免重复发送。")); }
+      } catch { timing?.skipComposerClear(); setError(t("消息已发送，但本机草稿清理未完成。请先核对聊天记录，避免重复发送。")); }
       if (retainComposerFocus && currentSelection.current === selected && composer.current === sentFrom && sentFrom?.isConnected && sentFrom.getClientRects().length) sentFrom.focus({ preventScroll: true });
     } finally { document.removeEventListener("focusin", leaveComposer, true); document.removeEventListener("pointerdown", leaveComposer, true); sendBusy.current = false; setSending(false); if (uploadController.current === controller) uploadController.current = null; setUploadProgress(undefined); setUploadRecovering(false); }
+    } catch (error) { timing?.fail(error); throw error; }
   };
   const checkReplySource = async () => {
     if (reply && !(await cache.messages(selected)).some(message => message.id === reply.id && message.status !== "deleted")) {

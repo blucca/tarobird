@@ -4,6 +4,7 @@ import type { Message } from "../../src/client-protocol/index.js";
 import type { HubConnection, OutboxSettlement } from "./connection.js";
 import type { OutboxEntry } from "./storage.js";
 import { t } from "./i18n.js";
+import { markSendTimingOutboxReload } from "./send-timing.js";
 
 type Receipt = OutboxSettlement & { reconciling?: boolean };
 type View = { connection: HubConnection; conversationId: string; entries: OutboxEntry[]; readRevision: number };
@@ -92,6 +93,7 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
           reconcile = true;
         }
         const updated = { ...current, entries: next, readRevision };
+        markSendTimingOutboxReload(conversationId, next, settled);
         views.set(conversationId, updated); setView(updated);
         // Confirmation needs a fresh read of this conversation only.
         if (reconcile) { receiptChanged(); connection.refreshConversation(conversationId); }
