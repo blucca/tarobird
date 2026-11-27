@@ -438,8 +438,14 @@ export class HubConnection {
     const configuredRoutes = this.identity.routes, routes = orderedRoutes(configuredRoutes);
     // Probe the last working path first. At most four requests per host enter
     // the shared transport queue, so a large route list cannot monopolize it.
+    // Reserve the 4th initial slot for the first VPS relay when 4+ direct routes
+    // would otherwise starve relay fallback behind unreachable LAN candidates.
     const last = routes.findIndex(route => route.url === this.lastConnectedUrl);
     if (last > 0) routes.unshift(...routes.splice(last, 1));
+    if (routes.length > 4 && !routes.slice(0, 4).some(route => route.name === "VPS")) {
+      const firstRelay = routes.findIndex(route => route.name === "VPS");
+      if (firstRelay >= 4) routes.splice(3, 0, ...routes.splice(firstRelay, 1));
+    }
     const batch = ++this.probeBatch;
     const current = () => !this.closed && generation === this.generation && configuredRoutes === this.identity.routes && batch === this.probeBatch;
     // Drain canceled work before another batch enters the queue. Cold-start
