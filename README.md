@@ -137,15 +137,7 @@ This is a foundation for a coordinating Bot or a network of collaborating peers.
 
 <a id="workbench"></a>
 <h3 align="center">Workbench · Keep references and creative work beside the chat</h3>
-<p align="center">Web browsing, canvas, whiteboard, Markdown notes and PPT in one workspace.<br>Each conversation keeps its own Workbench, in the side panel or expanded into the main area.</p>
-
-<h3 align="center">Canvas · Turn an idea into something you can edit</h3>
-<p align="center">Create pages, posters and visual drafts with your Bot.<br>Double-click text to edit and refine the result as you go.</p>
-
-<p align="center">
-  <a href="assets/product/workbench-canvas-en.png"><img src="assets/product/canvas-demo-en.gif" width="100%" alt="Canvas demo: open a warm studio launch page, double-click and edit its headline, then review the updated canvas"></a>
-</p>
-<p align="center"><sub>Recorded from the real interface with demonstration content · <a href="assets/product/workbench-canvas-en.png">Full-size view</a> · <a href="docs/client/workbench-design.md">Canvas guide</a></sub></p>
+<p align="center">Web browsing, whiteboard, Markdown notes and presentations in one workspace.<br>Each conversation keeps its own Workbench, in the side panel or expanded into the main area.</p>
 
 <a id="workbench-browser"></a>
 <h3 align="center">Browser · Web pages inside the App</h3>
