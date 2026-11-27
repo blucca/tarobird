@@ -2413,8 +2413,8 @@ async function runNormalizedCoreMessage(
         // Only waits worth explaining; most turns get the lock at once.
         if (event.waitedMs < 1_000) return;
         await appendCoreTimelineEvent(input.stateDir, normalized, {
-          type: "engine.lock.acquired",
-          detail: "acquired shared engine session lock",
+          type: "engine.event",
+          detail: "engine.lock.acquired",
           metadata: { waitedMs: event.waitedMs },
         });
       };

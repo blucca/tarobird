@@ -1,7 +1,7 @@
 import { z } from "zod";
 import path from "node:path";
 import { idSchema, type Json } from "../client-protocol/index.js";
-import { CONVERSATION_HISTORY_CAPABILITY, historyActionSchema, historyInternalSnapshotSchema, historyNativeResultSchema, type HistoryAction, type HistoryInternalSnapshot, type HistoryNativeResult } from "../client-protocol/conversation-history.js";
+import { CONVERSATION_HISTORY_CAPABILITY, historyActionSchema, historyInternalSnapshotSchema, historyNativeResultSchema, type HistoryAction, type HistoryNativeResult } from "../client-protocol/conversation-history.js";
 import { buildCoreConversationKey, stableCoreNumericId } from "../core/message-normalizer.js";
 import type { CoreServiceRuntime } from "../core/runtime.js";
 import type { CoreBridgeLike } from "../core/types.js";
@@ -13,10 +13,10 @@ import { appendTimelineEventBestEffort } from "../runtime/timeline-events.js";
 
 type Scope = { chatId: number; conversationKey: string; workspaceOverride?: string; isCurrentSession: () => Promise<boolean> };
 type HistoryBridge = CoreBridgeLike & {
-  getConversationHistory?(input: Scope, options?: { turnPending?: boolean }): Promise<HistoryInternalSnapshot>;
   applyConversationHistory?(input: Scope & { operationId: string; expectedRevision: string; action: HistoryAction; nativeAnchor?: Json }): Promise<HistoryNativeResult>;
   finalizeConversationHistory?(input: Scope & { operationId: string; expectedRevision: string; action: HistoryAction; result: HistoryNativeResult; destination?: { conversationId: string; chatId: number; conversationKey: string } }): Promise<{ revision: string }>;
 };
+const snapshotReadSchema = historyInternalSnapshotSchema.extend({ cachedWhilePending: z.literal(true).optional() });
 const readSchema = z.object({ userId: idSchema, botId: idSchema, conversationId: idSchema }).strict();
 const applySchema = readSchema.extend({ operationId: idSchema, expectedRevision: idSchema, action: historyActionSchema,
   nativeAnchor: z.json().optional(), anchorGeneration: idSchema.optional(), anchorSessionId: z.string().min(1).max(4096).optional(),
@@ -30,6 +30,7 @@ const toolsSchema = z.object({ sourceSessionId: z.string().min(1).max(4096), too
 
 export function gatewayConversationHistory(bridge: HistoryBridge, channel: GatewayChannel, runtime: CoreServiceRuntime, stateDir: string, botId: string, sideBusy: (conversationId: string) => boolean = () => false) {
   const receipts = new GatewayReceipts(stateDir);
+  const idleReads = new Map<string, Promise<z.infer<typeof snapshotReadSchema>>>();
   const readConfig = () => readValidatedConfigFile(path.join(stateDir, "config.json"), { forExecution: true });
   return async (method: string, raw: unknown): Promise<Json> => {
     const p = method === "history.snapshot" ? readSchema.parse(raw) : method === "history.finalize" ? finalizeSchema.parse(raw) : applySchema.parse(raw);
@@ -47,27 +48,52 @@ export function gatewayConversationHistory(bridge: HistoryBridge, channel: Gatew
       || [...runtime.pendingApprovals.values()].some(approval => approval.conversationKey === conversationKey || approval.chatId === p.conversationId)
       || channel.isConversationProcessing(p.conversationId);
     if (method === "history.snapshot") {
-      if (!bridge.getConversationHistory) return { supported: false };
+      const getHistory = bridge.getConversationHistory?.bind(bridge);
+      if (!getHistory) return { supported: false };
       const config = await readConfig();
       // A legacy global resume belongs to one conversation only. Its scoped
       // fallback is resolved by the controller, not copied into every request.
       const workspaceOverride = (await channel.conversationWorkspace?.(p.conversationId))?.trim() || config.workspacePath?.trim();
       if (workspaceOverride) scope.workspaceOverride = workspaceOverride;
-      // A turn already queued or running here takes the same conversation lock
-      // and would wait behind a native read for its whole length; on a large
-      // Claude session under load that is over a minute. Answer busy from what
-      // is known instead. The client reads again once the conversation is idle.
-      const turnPending = busy(), startedAt = Date.now();
-      const result = historyInternalSnapshotSchema.parse(await (turnPending ? bridge.getConversationHistory(scope, { turnPending }) : bridge.getConversationHistory(scope)));
-      const durationMs = Date.now() - startedAt;
-      if (turnPending || durationMs >= HISTORY_READ_LOG_AFTER_MS) {
-        await appendTimelineEventBestEffort(stateDir, { type: "history.read", channel: "gateway", conversationKey, chatId: scope.chatId,
-          outcome: result.revision ? "read" : result.blocked ?? "unavailable", detail: "history.snapshot",
-          metadata: { source: "gateway.history", turnPending, durationMs } }, "history timeline event");
-      }
+      const readSnapshot = async (turnPending: boolean) => {
+        const startedAt = performance.now();
+        let outcome: string | undefined;
+        try {
+          const read = snapshotReadSchema.parse(await (turnPending ? getHistory(scope, { turnPending }) : getHistory(scope)));
+          outcome = read.revision ? "read" : read.blocked ?? "unavailable";
+          return read;
+        } finally {
+          const elapsed = performance.now() - startedAt;
+          if (turnPending || elapsed >= HISTORY_READ_LOG_AFTER_MS) {
+            // Use an event type understood by 1.6.0 when it reopens this log.
+            await appendTimelineEventBestEffort(stateDir, { type: "engine.event", channel: "gateway", conversationKey, chatId: scope.chatId,
+              outcome: outcome ?? "error", detail: "history.snapshot", metadata: { source: "gateway.history", turnPending,
+                durationMs: Math.round(elapsed), ...(outcome === undefined ? { failureCategory: "snapshot_read_failed" } : {}) } }, "history timeline event");
+          }
+        }
+      };
+      // A menu-open read and an activity-driven refresh may arrive together.
+      // Share only the in-flight idle read, scoped to the owner and workspace.
+      const readIdle = () => {
+        const key = JSON.stringify([p.userId, conversationKey, workspaceOverride]);
+        const existing = idleReads.get(key);
+        if (existing) return existing;
+        const read = readSnapshot(false).finally(() => idleReads.delete(key));
+        idleReads.set(key, read);
+        return read;
+      };
+      // Cached answers while a turn is queued or running avoid the turn lock.
+      // If it drained during the read, finish this request with one idle read.
+      // The App may already have received its final activity update.
+      let read = await (busy() ? readSnapshot(true) : readIdle());
       if (!await authorized()) throw new Error("history_forbidden");
-      if (busy()) result.blocked = "busy"; else if (sideBusy(p.conversationId)) result.blocked = "side_session";
-      return z.json().parse(result);
+      if (read.cachedWhilePending && !busy() && !sideBusy(p.conversationId)) {
+        read = await readIdle();
+        if (!await authorized()) throw new Error("history_forbidden");
+      }
+      const { cachedWhilePending: _cached, ...result } = read;
+      const blocked = busy() ? "busy" : sideBusy(p.conversationId) ? "side_session" : result.blocked;
+      return z.json().parse({ ...result, ...(blocked ? { blocked } : {}) });
     }
     const command = applySchema.strip().parse(p), key = `history:${command.userId}:${command.operationId}`;
     const identity = JSON.stringify(command);

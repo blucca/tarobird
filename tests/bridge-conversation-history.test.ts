@@ -201,7 +201,7 @@ describe("conversation history reads without the native step", () => {
     const generation = (await f.store.inspectHistory(scope.conversationKey))!.record.historyGeneration;
     // A turn for this conversation is queued: the Gateway asks without the native step,
     // so the turn never waits behind a slow transcript read.
-    expect(await f.controller.get(scope, { turnPending: true })).toEqual({ supported: true, blocked: "busy",
+    expect(await f.controller.get(scope, { turnPending: true })).toEqual({ supported: true, blocked: "busy", cachedWhilePending: true,
       capabilities: { rewind: true, fork: true, anchoredFork: true }, sourceSessionId: anchor.sessionId, bindingGeneration: generation });
     expect(f.adapter.getHistoryState).not.toHaveBeenCalled();
     // An ordinary read still reads natively afterwards.

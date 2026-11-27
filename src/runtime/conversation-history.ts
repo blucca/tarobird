@@ -11,6 +11,8 @@ export interface ConversationHistoryScope {
   chatId: number; conversationKey: string; workspaceOverride?: string;
   isCurrentSession?: () => Promise<boolean>;
 }
+/** Bridge-only provenance, stripped before the Gateway sends the snapshot. */
+export type ConversationHistoryRead = HistoryInternalSnapshot & { cachedWhilePending?: true };
 export interface ConversationHistoryApply extends ConversationHistoryScope {
   operationId: string; expectedRevision: string; action: HistoryAction; nativeAnchor?: Json;
 }
@@ -63,9 +65,11 @@ export class ConversationHistoryController {
    * as when busy, from the binding and the capabilities last read, without the
    * turn lock or a native read, so a slow read cannot delay that turn. Before
    * anything is known in this process, read once as usual. */
-  async get(input: ConversationHistoryScope, options: { turnPending?: boolean } = {}): Promise<HistoryInternalSnapshot> {
+  async get(input: ConversationHistoryScope, options: { turnPending?: boolean } = {}): Promise<ConversationHistoryRead> {
     if (!this.supported()) return { supported: false };
-    if (options.turnPending && this.known.has(input.conversationKey)) return await this.busySnapshot(input);
+    if (options.turnPending && this.known.has(input.conversationKey)) {
+      return { ...await this.busySnapshot(input), cachedWhilePending: true };
+    }
     try {
       const snapshot = await this.idleLock(input, () => this.inspect(input));
       this.known.delete(input.conversationKey);

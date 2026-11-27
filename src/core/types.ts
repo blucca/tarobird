@@ -106,7 +106,7 @@ export interface CoreRuntimeChannelLike extends CoreChannelLike {
 }
 
 export interface CoreBridgeLike {
-  getConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryScope, options?: { turnPending?: boolean }): Promise<import("../client-protocol/conversation-history.js").HistoryInternalSnapshot>;
+  getConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryScope, options?: { turnPending?: boolean }): Promise<import("../runtime/conversation-history.js").ConversationHistoryRead>;
   applyConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryApply): Promise<import("../client-protocol/conversation-history.js").HistoryNativeResult>;
   finalizeConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryFinalize): Promise<{ revision: string }>;
   readAccountQuota?(options: import("../codex/adapter.js").EngineQuotaReadOptions): Promise<import("../codex/adapter.js").EngineQuotaReadResult | undefined>;

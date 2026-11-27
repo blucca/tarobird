@@ -3,10 +3,11 @@ import path from "node:path";
 import os from "node:os";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { gatewayConversationHistory } from "../src/gateway/conversation-history.js";
-import { CONVERSATION_HISTORY_CAPABILITY } from "../src/client-protocol/conversation-history.js";
+import { CONVERSATION_HISTORY_CAPABILITY, historyInternalSnapshotSchema } from "../src/client-protocol/conversation-history.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import { buildCoreConversationKey } from "../src/core/message-normalizer.js";
 import type { GatewayChannel } from "../src/gateway/channel.js";
+import { ConversationHistoryController, type NativeConversationHistoryAdapter } from "../src/runtime/conversation-history.js";
 
 let directory: string, run: ReturnType<typeof gatewayConversationHistory>, runtime: ReturnType<typeof createCoreServiceRuntime>;
 const input = { userId: "owner", botId: "bot", conversationId: "chat", operationId: "operation", expectedRevision: "revision", action: { kind: "fork" as const, scope: "whole" as const } };
@@ -96,7 +97,7 @@ it("answers a snapshot without a native read while a turn is queued, and records
   expect((bridge.getConversationHistory.mock.calls[0] as unknown[])[1]).toEqual({ turnPending: true });
   release(); await queue;
   const events = (await readFile(path.join(directory, "timeline.log.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
-  expect(events.map(event => [event.type, event.detail, event.outcome, event.metadata.turnPending])).toEqual([["history.read", "history.snapshot", "busy", true]]);
+  expect(events.map(event => [event.type, event.detail, event.outcome, event.metadata.turnPending])).toEqual([["engine.event", "history.snapshot", "busy", true]]);
 });
 
 it("reads natively when idle and records only slow reads", async () => {
@@ -108,6 +109,126 @@ it("reads natively when idle and records only slow reads", async () => {
   await run("history.snapshot", read);
   const events = (await readFile(path.join(directory, "timeline.log.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
   expect(events).toHaveLength(1);
-  expect(events[0]).toMatchObject({ type: "history.read", detail: "history.snapshot", outcome: "read", metadata: { source: "gateway.history", turnPending: false } });
+  expect(events[0]).toMatchObject({ type: "engine.event", detail: "history.snapshot", outcome: "read", metadata: { source: "gateway.history", turnPending: false } });
   expect(events[0].metadata.durationMs).toBeGreaterThanOrEqual(1_000);
+});
+
+const snapshotInput = { userId: "owner", botId: "bot", conversationId: "chat" };
+const pendingKey = buildCoreConversationKey(snapshotInput.conversationId);
+
+function nativeHistoryGateway() {
+  const getHistoryBinding = vi.fn(async () => ({ record: {
+    telegramChatId: 7, codexSessionId: "fixture-session", status: "idle" as const,
+    updatedAt: "2026-01-01T00:00:00.000Z", historyGeneration: "generation", historyRevision: "revision",
+  }, shared: false }));
+  const getHistoryState = vi.fn<NonNullable<NativeConversationHistoryAdapter["getHistoryState"]>>(async () => ({
+    head: "head", rewind: true, fork: { whole: true, anchored: true },
+  }));
+  const controller = new ConversationHistoryController({
+    getLockNamespace: async () => directory, getHistoryBinding,
+    reserveHistory: vi.fn(), releaseHistory: vi.fn(), finalizeHistory: vi.fn(),
+  }, { getHistoryState });
+  const getConversationHistory = vi.fn(controller.get.bind(controller));
+  const call = gatewayConversationHistory({ ...bridge, getConversationHistory }, channel, runtime, directory, "bot");
+  const snapshot = () => call("history.snapshot", snapshotInput);
+  return { getHistoryBinding, getHistoryState, getConversationHistory, snapshot };
+}
+
+it("returns a revision in the same request when the queue drains during the cached binding read", async () => {
+  const f = nativeHistoryGateway();
+  const before = historyInternalSnapshotSchema.parse(await f.snapshot());
+  const readBinding = f.getHistoryBinding.getMockImplementation()!;
+  let release!: () => void;
+  const queue = runtime.chatQueue.enqueue(pendingKey, () => new Promise<void>(resolve => { release = resolve; }));
+  await Promise.resolve();
+  f.getHistoryBinding.mockImplementationOnce(async () => {
+    release();
+    await queue;
+    return readBinding();
+  });
+  f.getHistoryState.mockResolvedValueOnce({ head: "new-head", fork: { whole: true, anchored: true } });
+
+  const after = await f.snapshot();
+  expect(after).toMatchObject({ supported: true, revision: expect.any(String) });
+  expect(after).not.toHaveProperty("blocked");
+  expect(after).not.toHaveProperty("cachedWhilePending");
+  expect(after).not.toHaveProperty("revision", before.revision);
+  expect(f.getHistoryState).toHaveBeenCalledTimes(2);
+});
+
+it("keeps a slow native read failure private and propagates the same error", async () => {
+  const f = nativeHistoryGateway();
+  const failure = new Error("synthetic private transcript excerpt");
+  f.getHistoryState.mockImplementationOnce(async () => {
+    await new Promise(resolve => setTimeout(resolve, 1_050));
+    throw failure;
+  });
+
+  await expect(f.snapshot()).rejects.toBe(failure);
+  const line = await readFile(path.join(directory, "timeline.log.jsonl"), "utf8");
+  expect(line).not.toContain(failure.message);
+  const event = JSON.parse(line);
+  expect(event).toMatchObject({
+    type: "engine.event", detail: "history.snapshot", outcome: "error",
+    metadata: { source: "gateway.history", turnPending: false, failureCategory: "snapshot_read_failed" },
+  });
+  expect(event.metadata.durationMs).toBeGreaterThanOrEqual(1_000);
+});
+
+
+it("shares a native read when simultaneous cached snapshots see the same queue drain", async () => {
+  const f = nativeHistoryGateway();
+  await f.snapshot();
+  const readBinding = f.getHistoryBinding.getMockImplementation()!;
+  let releaseBindings!: () => void, releaseNative!: () => void;
+  const bindingsHeld = new Promise<void>(resolve => { releaseBindings = resolve; });
+  const nativeHeld = new Promise<void>(resolve => { releaseNative = resolve; });
+  const holdBinding = async () => { await bindingsHeld; return readBinding(); };
+  f.getHistoryBinding.mockClear().mockImplementationOnce(holdBinding).mockImplementationOnce(holdBinding);
+  const readNative = f.getHistoryState.getMockImplementation()!;
+  f.getHistoryState.mockClear().mockImplementationOnce(async () => { await nativeHeld; return readNative("fixture-session", {}); });
+  requestLive.mockClear();
+  runtime.activeRuns.set(pendingKey, {} as never);
+  const first = f.snapshot(), second = f.snapshot();
+  try {
+    await vi.waitFor(() => expect(f.getHistoryBinding).toHaveBeenCalledTimes(2));
+    runtime.activeRuns.delete(pendingKey);
+    releaseBindings();
+    await vi.waitFor(() => expect(requestLive.mock.calls.length).toBeGreaterThanOrEqual(5));
+  } finally {
+    releaseBindings();
+    releaseNative();
+  }
+  const results = await Promise.all([first, second]);
+  expect(results[0]).toMatchObject({ revision: expect.any(String) });
+  expect(results[1]).toEqual(results[0]);
+  expect(f.getHistoryState).toHaveBeenCalledTimes(1);
+  await f.snapshot();
+  expect(f.getHistoryState).toHaveBeenCalledTimes(2);
+});
+
+it("rechecks for a new turn during recovery and does not retry a native busy result", async () => {
+  const f = nativeHistoryGateway();
+  await f.snapshot();
+  const readBinding = f.getHistoryBinding.getMockImplementation()!;
+  runtime.activeRuns.set(pendingKey, {} as never);
+  f.getHistoryBinding.mockImplementationOnce(async () => {
+    runtime.activeRuns.delete(pendingKey);
+    return readBinding();
+  });
+  f.getHistoryState.mockImplementationOnce(async () => {
+    runtime.activeRuns.set(pendingKey, {} as never);
+    return { head: null, blocked: "busy" };
+  });
+  expect(await f.snapshot()).toMatchObject({ supported: true, blocked: "busy" });
+  expect(f.getHistoryState).toHaveBeenCalledTimes(2);
+
+  // A cold read can report a busy native adapter without using the cache.
+  const cold = nativeHistoryGateway();
+  cold.getHistoryState.mockImplementationOnce(async () => {
+    runtime.activeRuns.delete(pendingKey);
+    return { head: null, blocked: "busy" };
+  });
+  expect(await cold.snapshot()).toMatchObject({ supported: true, blocked: "busy" });
+  expect(cold.getHistoryState).toHaveBeenCalledOnce();
 });
