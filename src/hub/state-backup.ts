@@ -49,7 +49,7 @@ function transient(relative: string): boolean {
   const parts = relative.split("/"), name = parts.at(-1)!;
   // Workspace files are user data, even when named *.lock or *.log.
   if (parts[0] === "bots" && parts[2] === "workspace") return false;
-  return ["backups", "host-service", "cli", "runtimes", "media-transcripts"].includes(parts[0]!) || ["host-runtime.json", "update-in-progress.json", "last-exit.json", "host-service.json", "host-service-refresh.json", "hub-control.key"].includes(relative) || name === "instance.lock.json" || name.endsWith(".lock") || name.endsWith(".sock") ||
+  return ["backups", "host-service", "cli", "runtimes", "media-transcripts"].includes(parts[0]!) || ["host-runtime.json", "update-in-progress.json", "last-exit.json", "host-service.json", "host-service-refresh.json", "hub-control.key", "engine-discovery-cache.json"].includes(relative) || name === "instance.lock.json" || name.endsWith(".lock") || name.endsWith(".sock") ||
     relative === "hub.sqlite-wal" || relative === "hub.sqlite-shm" || isHubLogFile(relative) || relative === "restore.incomplete.json";
 }
 

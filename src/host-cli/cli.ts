@@ -587,7 +587,35 @@ export async function runHostCli(argv: string[]): Promise<void> {
       if (report.database) console.log(`Bot：${report.database.bots}\n网络：${report.database.network?.name ?? "独立主机"}`);
       if (report.manager.error) console.log(`后台服务需检查：${report.manager.error}`);
       if (command === "doctor") {
-        for (const engine of report.engines) { const live = report.liveEngines?.find(item => item.id === engine.engine); console.log(`${engine.engine}: ${engine.installed ? engine.executable : "当前终端未找到"}；后台服务：${live ? live.available ? "可找到" : "未找到" : "未验证"}；登录状态待验证`); }
+        const ruleLabels: Record<string, string> = {
+          setting: "手动指定",
+          environment: "主机环境变量",
+          "auto-discovered": "自动发现（已记住）",
+          "login-shell": "登录 Shell PATH",
+          "package-manager": "包管理器全局目录",
+          "windows-registry": "Windows 注册表 PATH",
+          path: "主机 PATH",
+          "known-directory": "常见安装目录",
+        };
+        for (const engine of report.engines) {
+          const live = report.liveEngines?.find(item => item.id === engine.engine);
+          const meta: string[] = [];
+          if (engine.version) meta.push(`版本 ${engine.version}`);
+          if (engine.rule) meta.push(`规则：${ruleLabels[engine.rule] ?? engine.rule}`);
+          const foundText = engine.installed
+            ? `${engine.executable}${meta.length ? `（${meta.join("，")}）` : ""}`
+            : "当前未找到";
+          console.log(`${engine.engine}: ${foundText}；后台服务：${live ? live.available ? "可找到" : "未找到" : "未验证"}；登录状态待验证`);
+          for (const link of engine.danglingLinks ?? []) {
+            console.log(`  失效软链接：${link.linkPath} 指向的 ${link.targetPath} 已不存在`);
+          }
+          if (engine.terminalExecutable) {
+            console.log(`  终端与主机差异：终端可找到 ${engine.terminalExecutable}，可在引擎设置中确认采用`);
+          }
+          if (!engine.installed && engine.searchedDirectories?.length) {
+            console.log(`  已搜索目录：${engine.searchedDirectories.join(process.platform === "win32" ? "; " : ":")}`);
+          }
+        }
         if (report.liveCheck) console.log(`后台引擎检查未完成：${report.liveCheck}`);
         if (report.serviceEnvironmentDifferences.length) console.log(`终端与后台服务的配置不同：${report.serviceEnvironmentDifferences.join("、")}。如需更新，停止主机后重新 service install。`);
         if (report.serviceEnvironmentCheck) console.log(`后台环境检查未完成：${report.serviceEnvironmentCheck}`);

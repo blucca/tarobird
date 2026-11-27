@@ -61,6 +61,13 @@ vi.mock("node:child_process", async original => {
   return { ...actual, fork, default: { ...actual, fork } };
 });
 
+// The opportunistic discovery cache writes through the real fs/promises; with the
+// synthetic C:\ state directory that would create files in the working directory.
+vi.mock("../src/runtime/host-engine-settings.js", async original => {
+  const actual = await original<typeof import("../src/runtime/host-engine-settings.js")>();
+  return { ...actual, writeEngineDiscoveryCache: vi.fn(async () => undefined) };
+});
+
 vi.mock("../src/codex/antigravity-acp-support.js", () => ({
   antigravitySupportsAcp: vi.fn(async () => true),
 }));

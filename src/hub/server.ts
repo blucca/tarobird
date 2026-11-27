@@ -716,7 +716,7 @@ export class HubServer {
       }, 30_000); retryListeners.unref(); hub.disposers.push(() => clearInterval(retryListeners));
       if (options.managedBots) {
         const running = hub;
-        hub.botManager = new BotManager(store, options.stateDir, options.managedBots, () => running.instanceUrl, (id) => running.broadcastBotStatus(id));
+        hub.botManager = new BotManager(store, options.stateDir, { ...options.managedBots, engineSettings: hub.engineSettings }, () => running.instanceUrl, (id) => running.broadcastBotStatus(id));
         hub.dispatch.workers = hub.botManager;
         await hub.botManager.restore();
       }
@@ -2011,7 +2011,11 @@ export class HubServer {
           }));
         } else {
           await this.engineSettings.refresh();
-          view = this.engineSettings.status(idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined));
+          view = await this.engineSettings.statusAsync(
+            idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined),
+            // refresh() above already force-read the registry PATH; discovery reuses it.
+            { forceRefresh: url.searchParams.get("refresh") === "1", registryRefreshed: true },
+          );
         }
         // Existing clients validate a closed engine enum (five pre-Pi, six in v1.6.0).
         // Gate Pi on includePi=1 and omp on includeOmp=1 so older clients stay compatible.
