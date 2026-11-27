@@ -369,7 +369,8 @@ it("reports stop confirmation instead of silently dropping it when stop races wi
   const ids: string[] = [];
   for (const name of ["first.webm", "second.webm"]) {
     const bytes = Buffer.from(`fixture ${name}`);
-    const upload = await hub.attachments.create("owner", { conversationId: c.id, name, mime: "audio/webm", size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
+    // Microphone recordings: since the recording marker, only these are transcribed (an uploaded audio file is a file).
+    const upload = await hub.attachments.create("owner", { conversationId: c.id, name, mime: "audio/webm", size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), recording: true });
     await hub.attachments.putChunk("owner", upload.id, 0, bytes);
     await hub.attachments.complete("owner", upload.id);
     ids.push(upload.id);
