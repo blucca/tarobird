@@ -269,3 +269,130 @@ it.each([
   expect(engine).toHaveBeenCalledTimes(1);
   expect(engine.mock.calls[0]![0].text).toContain("no transcription");
 });
+
+it("recovers active transcription cards after worker disconnect mid-transcription and unblocks clearMessages", async () => {
+  let entered = false;
+  await attach(
+    async (_file, options) => new Promise((_resolve, reject) => {
+      entered = true;
+      options?.abortSignal?.addEventListener("abort", () => reject(new Error("aborted on disconnect")), { once: true });
+    }),
+    { handleAuthorizedMessage: vi.fn(async () => ({ text: "must not run" })) },
+  );
+  const c = await hub.store.createConversation("owner", ["alpha"], "Disconnect recovery", "disconnect-recovery");
+  await send(c.id, "voice-disconnect");
+  await until(async () => entered);
+  const progress = (await hub.store.snapshot("owner", c.id)).messages.find(m => m.authorType === "bot" && isActiveTranscriptionMessage(m));
+  expect(progress).toBeDefined();
+
+  // Disconnect mid-transcription: terminal updateCard cannot land on the stopped transport.
+  await gateway!.disconnect();
+  gateway = undefined;
+
+  // Reattach a new worker; recovery must settle the orphaned transcription card without rerunning it.
+  const nextEngine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>().mockResolvedValue({ text: "recovered follow-up" });
+  const nextTranscribe = vi.fn(async () => "should not rerun");
+  await attach(nextTranscribe, { handleAuthorizedMessage: nextEngine });
+  await drained();
+  await until(async () => !isActiveTranscriptionMessage(await hub.store.messageForUser("owner", progress!.id)));
+
+  const settled = await hub.store.messageForUser("owner", progress!.id);
+  expect(settled.status).toBe("complete");
+  expect(isActiveTranscriptionMessage(settled)).toBe(false);
+  expect(blocksText(settled.blocks)).toContain("转写已中断");
+  expect(nextTranscribe).not.toHaveBeenCalled();
+
+  const plan = await hub.store.planClearMessages("owner", c.id);
+  expect(plan.throughId).toBeDefined();
+  await expect(hub.store.clearMessages("owner", c.id, { throughId: plan.throughId! })).resolves.toMatchObject({ remaining: 0 });
+});
+
+it("settles an orphaned active transcription card even when a cached complete receipt exists", async () => {
+  const c = await hub.store.createConversation("owner", ["alpha"], "Cached receipt orphan", "cached-orphan");
+  const sent = await send(c.id, "voice-cached");
+  const progress = await hub.store.publishBotMessage("alpha", {
+    conversationId: c.id,
+    replyTo: sent.message.id,
+    status: "streaming",
+    blocks: [{ type: "card", elements: [{ type: "markdown", text: "**正在转写音频…**" }], extra: { appTranscription: { version: 1, active: true, at: Date.now() - 100 } } }],
+  });
+  await mkdir(path.join(stateDir, "gateway-receipts"), { recursive: true });
+  await writeFile(
+    path.join(stateDir, "gateway-receipts", createHash("sha256").update(`message:${sent.message.id}`).digest("hex") + ".json"),
+    JSON.stringify({ state: "complete", result: { ok: true, result: null } }),
+  );
+
+  await attach(async () => "must not rerun", { handleAuthorizedMessage: vi.fn(async () => ({ text: "must not run" })) });
+  await drained();
+  await until(async () => !isActiveTranscriptionMessage(await hub.store.messageForUser("owner", progress.id)));
+
+  const settled = await hub.store.messageForUser("owner", progress.id);
+  expect(settled.status).toBe("complete");
+  expect(isActiveTranscriptionMessage(settled)).toBe(false);
+  expect(blocksText(settled.blocks)).toContain("转写已中断");
+  const plan = await hub.store.planClearMessages("owner", c.id);
+  await expect(hub.store.clearMessages("owner", c.id, { throughId: plan.throughId! })).resolves.toMatchObject({ remaining: 0 });
+});
+
+it("reports stop confirmation instead of silently dropping it when stop races with transcription completion updateCard on multi-audio messages", async () => {
+  const engine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>().mockResolvedValue({ text: "must not run" });
+  const transcribe = vi.fn(async (file: string) => `transcript for ${path.basename(file)}`);
+  const runtime = await attach(transcribe, { handleAuthorizedMessage: engine });
+  const c = await hub.store.createConversation("owner", ["alpha"], "Multi audio race", "multi-race");
+
+  // Intercept the completion updateCard of the first audio attachment and trigger stop mid-RPC.
+  const originalUpdateCard = gateway!.updateCard.bind(gateway!);
+  let intercepted = false;
+  vi.spyOn(gateway!, "updateCard").mockImplementation(async (messageId, card) => {
+    if (!intercepted && JSON.stringify(card).includes("音频转写完成")) {
+      intercepted = true;
+      await gateway!.onCall!("stop", { conversationId: c.id });
+    }
+    return originalUpdateCard(messageId, card);
+  });
+
+  const ids: string[] = [];
+  for (const name of ["first.webm", "second.webm"]) {
+    const bytes = Buffer.from(`fixture ${name}`);
+    const upload = await hub.attachments.create("owner", { conversationId: c.id, name, mime: "audio/webm", size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
+    await hub.attachments.putChunk("owner", upload.id, 0, bytes);
+    await hub.attachments.complete("owner", upload.id);
+    ids.push(upload.id);
+  }
+  await hub.store.sendMessage("owner", { conversationId: c.id, clientMsgId: "two-audio", text: "", attachments: ids });
+  await drained();
+  await until(async () => !runtime.chatQueue.isBusy(`lark:${c.id}`));
+
+  expect(intercepted).toBe(true);
+  expect(transcribe).toHaveBeenCalledTimes(1);
+  expect(engine).not.toHaveBeenCalled();
+  const messages = (await hub.store.snapshot("owner", c.id)).messages.filter(m => m.authorType === "bot");
+  expect(messages.some(m => blocksText(m.blocks).includes("音频转写完成"))).toBe(true);
+  expect(messages.some(m => blocksText(m.blocks) === "已停止。")).toBe(true);
+});
+
+it("aborts cleanly before engine run when stop races with single-audio completion updateCard", async () => {
+  const engine = vi.fn<CoreBridgeLike["handleAuthorizedMessage"]>().mockResolvedValue({ text: "must not run" });
+  const runtime = await attach(async () => "single transcript", { handleAuthorizedMessage: engine });
+  const c = await hub.store.createConversation("owner", ["alpha"], "Single audio race", "single-race");
+
+  const originalUpdateCard = gateway!.updateCard.bind(gateway!);
+  let intercepted = false;
+  vi.spyOn(gateway!, "updateCard").mockImplementation(async (messageId, card) => {
+    if (!intercepted && JSON.stringify(card).includes("音频转写完成")) {
+      intercepted = true;
+      await gateway!.onCall!("stop", { conversationId: c.id });
+    }
+    return originalUpdateCard(messageId, card);
+  });
+
+  await send(c.id, "single-race-msg", "voice-1791780593982.webm", "audio/webm", "");
+  await drained();
+  await until(async () => !runtime.chatQueue.isBusy(`lark:${c.id}`));
+
+  expect(intercepted).toBe(true);
+  expect(engine).not.toHaveBeenCalled();
+  const messages = (await hub.store.snapshot("owner", c.id)).messages.filter(m => m.authorType === "bot");
+  expect(messages.some(m => blocksText(m.blocks).includes("音频转写完成"))).toBe(true);
+  expect(messages.some(m => blocksText(m.blocks) === "已停止。")).toBe(true);
+});

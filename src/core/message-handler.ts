@@ -1973,6 +1973,7 @@ async function runNormalizedCoreMessage(
       ])];
       // A discussion turn always reaches the engine: an archive summary card or
       // an "archive continue" match would replace the speaker's answer.
+      runController.signal.throwIfAborted();
       const workflowResult = normalized.groupDiscussion ? null : await prepareCoreFileWorkflow({
         stateDir: input.stateDir,
         normalized: { ...normalized, text: requestText },
@@ -2073,6 +2074,7 @@ async function runNormalizedCoreMessage(
       }
       requestOutputDir = path.join(workspaceArtifactRoot(input.stateDir, "output"), safeSegment(normalized.messageId));
       await mkdir(requestOutputDir, { recursive: true });
+      runController.signal.throwIfAborted();
     } catch (error) {
       if (isCloudAsrCancelledError(error) || runController.signal.aborted) {
         await appendCoreTimelineEvent(input.stateDir, normalized, {
@@ -2147,6 +2149,7 @@ async function runNormalizedCoreMessage(
     // until every requested upload has a definite platform acknowledgement.
     let answerVisibleToUser = false;
     try {
+      runController.signal.throwIfAborted();
       // If a "queued" card was already shown for this conversation, take it over
       // as the run card so it transitions in place instead of being orphaned: a
       // CardKit-managed queue card is updated by card_id (seamless, survives the

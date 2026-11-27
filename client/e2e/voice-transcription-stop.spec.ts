@@ -10,6 +10,7 @@ import type { GatewayChannel } from "../../src/gateway/channel.js";
 import { createCoreServiceRuntime } from "../../src/core/runtime.js";
 import { preparePairing } from "./fixtures/pairing-invite.js";
 import { enterMobileChat, waitForClientOnline } from "./fixtures/mobile.js";
+import { microphone } from "./fixtures/microphone.js";
 
 async function pair(page: Page, hub: HubServer) {
   await page.goto(hub.url);
@@ -137,3 +138,83 @@ for (const formFactor of ["desktop", "phone"] as const) {
     }
   });
 }
+
+test("phone HoldToTalk voice mode shows composer stop right after sending a voice clip and aborts transcription", async ({ browser }) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-stop-hold-to-talk-"));
+  const stateDir = path.join(root, "instance");
+  await mkdir(stateDir);
+  await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "codex", locale: "zh" }));
+  const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: path.resolve("dist") });
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  const page = await context.newPage();
+  let gateway: GatewayChannel | undefined;
+  try {
+    const secret = randomBytes(32).toString("base64url");
+    await hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash) VALUES('alpha','语音测试助手','codex',?)", [hashSecret(secret)]);
+    const chat = await hub.store.createConversation("owner", ["alpha"], "按住说话转写停止", "direct");
+
+    let transcriptionEntered = false;
+    let transcriptionAborted = false;
+    const engineCalls: string[] = [];
+    const runtime = createCoreServiceRuntime({
+      transcribeMedia: async (_file, options) => new Promise((_resolve, reject) => {
+        transcriptionEntered = true;
+        options?.abortSignal?.addEventListener("abort", () => {
+          transcriptionAborted = true;
+          reject(new Error("transcription aborted by hold-to-talk test"));
+        }, { once: true });
+      }),
+    });
+    gateway = await attachGateway({
+      stateDir,
+      url: hub.instanceUrl.replace("http", "ws") + "/instance",
+      secret,
+      botId: "alpha",
+      engine: "codex",
+      runtime,
+      bridge: {
+        handleAuthorizedMessage: async (input) => {
+          engineCalls.push(input.text);
+          return { text: `已收到：${input.text}` };
+        },
+      },
+    });
+
+    await microphone(page);
+    await pair(page, hub);
+    await enterMobileChat(page, chat.title);
+
+    // Tap the mic shortcut to enter HoldToTalk voice mode, record and send a clip.
+    await page.getByRole("button", { name: "录制语音", exact: true }).click();
+    const holdButton = page.getByRole("button", { name: "按住说话", exact: true });
+    await expect(holdButton).toBeVisible();
+    await holdButton.focus();
+    await page.keyboard.down("Space");
+    await expect(page.getByText("正在录音", { exact: true })).toBeVisible();
+    await expect(page.getByLabel("录音时长", { exact: true })).not.toHaveText("00:00");
+    await page.keyboard.up("Space");
+
+    await expect.poll(() => transcriptionEntered).toBe(true);
+    await expect(page.locator(".rich-card").first()).toContainText("正在转写音频…");
+
+    // Still in HoldToTalk voice mode, the live stop button must be immediately visible beside HoldToTalk.
+    await expect(holdButton).toBeVisible();
+    const stopButton = page.locator(".hold-voice .composer-stop.is-live");
+    await expect(stopButton).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+
+    // Clicking stop aborts transcription cleanly without leaking errors.
+    await stopButton.click();
+    await expect.poll(() => transcriptionAborted).toBe(true);
+    await expect(page.locator(".rich-card").first()).toContainText("已停止转写");
+    await expect(page.locator(".virtual-messages")).not.toContainText("准备飞书消息时失败");
+    await expect(page.locator(".virtual-messages").getByText("已停止。", { exact: true })).toHaveCount(0);
+    await expect(stopButton).toHaveCount(0);
+    expect(engineCalls).toEqual([]);
+  } finally {
+    await context.close();
+    await gateway?.disconnect();
+    await hub.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

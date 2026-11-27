@@ -13,10 +13,10 @@ export type AgentState = "idle" | "working" | "done" | "failed" | "ask";
 export type AgentSignal = { state: AgentState; at: number };
 export const IDLE_AGENT: AgentSignal = Object.freeze({ state: "idle", at: 0 });
 
-/** Keep only the newest reply per Bot. Forwarded copies and mirrored Agent Bus
- * records are not this conversation's own turn. */
+/** Keep only the newest reply per Bot. Forwarded copies, mirrored Agent Bus
+ * records and Host transcription cards are not this conversation's own turn. */
 export function projectReply(activity: ReplyActivity, message: Message, at: number): void {
-  if (message.authorType !== "bot" || message.forwardedFrom || isAgentBusRecord(message)) return;
+  if (message.authorType !== "bot" || message.forwardedFrom || isAgentBusRecord(message) || isTranscriptionMessage(message)) return;
   projectWorkingReply(activity, message, at);
   const replies = activity.replies ??= {}, current = replies[message.authorId];
   if (message.status === "deleted") {
