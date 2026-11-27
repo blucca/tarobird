@@ -190,7 +190,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const compactTime = !!pane || tightDesktop;
   // Message timestamps and the phone sheet line are worded relative to today,
   // so they are rendered again when the local day changes.
-  useLocalDay();
+  const localDay = useLocalDay();
   const compactComposerTools = phone || !["ios", "android"].includes(nativePlatform());
   const cache = connection.cache;
   useEffect(() => { if (!shell && !pane) return startDesktopUpdateChecks(); }, []);
@@ -299,7 +299,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const closeMenu = () => setMenu(undefined), toggleMenu = (kind: NonNullable<typeof menu>) => setMenu((open) => open === kind ? undefined : kind);
   const menuId = useId(), createTrigger = useRef<HTMLButtonElement>(null), workspaceTrigger = useRef<HTMLButtonElement>(null), recipientTrigger = useRef<HTMLButtonElement>(null);
   const chatVisible = visible && (!phone || !sidebar); const [scheduledTasks, setScheduledTasks] = useState<"create" | "list">(); const [newBot, setNewBot] = useState(false); const [newChat, setNewChat] = useState<ConversationCreation>();
-  const { messages, readRevision: historyRevision, ready: messagesReady, failed: messageReadFailed, retry: retryMessageRead } = useConversationMessages(connection, selected, chatVisible, true);
+  const { messages, deletedClientMsgIds, readRevision: historyRevision, ready: messagesReady, failed: messageReadFailed, retry: retryMessageRead } = useConversationMessages(connection, selected, chatVisible, true);
   const [individualBackgroundRecords, setIndividualBackgroundRecords] = useState(false);
   const backgroundGroups = useMemo(() => groupBackgroundTasks(messages, state.runGroupsAvailable !== false && !individualBackgroundRecords), [messages, state.runGroupsAvailable, individualBackgroundRecords]);
   const displayedMessages = backgroundGroups.messages;
@@ -340,7 +340,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   // Sending follows the device setting; legacy per-draft style is retained only for compatibility.
   const previewStyle = preferences.linkPreviewStyle;
   const [preferencesReady, setPreferencesReady] = useState(false);
-  const queued = useConversationOutbox(connection, selected, chatVisible, historyRevision, messages, true);
+  const queued = useConversationOutbox(connection, selected, chatVisible, historyRevision, messages, true, deletedClientMsgIds);
   const offlinePending = pane ? queued.filter(item => !item.sent && !item.syncing && !item.error).length : state.outbox;
   const [commands, setCommands] = useState<{ command: string; description: { i18n: { zh_cn: string; en_us?: string } } }[]>([]);
   const [piCommands, setPiCommands] = useState<{ scope: string; values: PiSessionCommand[] }>({ scope: "", values: [] });
@@ -1759,6 +1759,9 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     setNewChat,
     labels,
     bots: state.bots,
+    preferences,
+    setPreferences,
+    hasExternalPreferences: !!(shell?.updatePreferences ?? pane?.updatePreferences),
   });
   rowActionsRef.current = {
     copyReadableMessage,
@@ -1779,6 +1782,9 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     setNewChat,
     labels,
     bots: state.bots,
+    preferences,
+    setPreferences,
+    hasExternalPreferences: !!(shell?.updatePreferences ?? pane?.updatePreferences),
   };
   const onPreparePlainText = useCallback((message: Message) => { if (copiesReadableMessages()) prepareMessagePlainText(message.blocks); }, []);
   const onCopyRow = useCallback((message: Message) => {
@@ -1816,8 +1822,16 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     const bot = actions.bots.find(item => item.id === botId);
     if (bot) { actions.setOperationBot({ botId, name: actions.labels.get(botId) ?? bot.name, view: "dashboard" }); actions.setOperations(true); }
   }, []);
+  const setStandaloneDisconnectedBots = useCallback((showDisconnectedBots: boolean) => {
+    const actions = rowActionsRef.current;
+    if (!actions.hasExternalPreferences) {
+      setLocalPreferences(old => ({ ...old, showDisconnectedBots }));
+      return;
+    }
+    actions.setPreferences({ ...actions.preferences, showDisconnectedBots });
+  }, []);
   const standaloneSidebarHosts = useMemo(() => [{ id: "local", name: hostName ?? "", connection }], [hostName, connection]);
-  const standaloneSidebarOptions = useMemo(() => <DisconnectedBotsSwitch menu checked={preferences.showDisconnectedBots} change={showDisconnectedBots => setPreferences({ ...preferences, showDisconnectedBots })}/>, [preferences.showDisconnectedBots]);
+  const standaloneSidebarOptions = useMemo(() => <DisconnectedBotsSwitch menu checked={preferences.showDisconnectedBots} change={setStandaloneDisconnectedBots}/>, [preferences.showDisconnectedBots, locale, setStandaloneDisconnectedBots]);
   const phoneTurnActions = chatActions && (
     <div className="mobile-chat-action-list">
       {current?.botIds.length === 1 && !current.archived && !group?.archived && searchResults === undefined && state.engineTasksAvailable && <button onClick={() => { setChatActions(false); setTaskListRequest({ conversationId: selected, id: Date.now() }); }}><ListOrdered size={20}/><span>{t("子代理与后台任务")}</span></button>}
@@ -1927,7 +1941,8 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const rowKey = backgroundGroup?.key ?? message.id;
   const focusedHere = (backgroundGroups.anchors.get(focusTarget?.messageId ?? "") ?? focusTarget?.messageId) === message.id;
   const rowFocusRequest = focusTarget && (focusedHere || message.authorType === "user" && !!message.botSource && focusTarget.conversationId === message.conversationId) ? focusTarget : undefined;
-  const authorLabel = labels.get(message.authorId) ?? (message.authorType === "user" ? t("我") : "TaroBird");
+  const botLabel = labels.get(message.authorId);
+  const authorLabel = botLabel ?? (message.authorType === "user" ? t("我") : "TaroBird");
   const scheduledName = labels.get(message.groupDiscussion?.botId ?? "") ?? botsById.get(message.groupDiscussion?.botId ?? "")?.name ?? t("Bot");
   return <WorkspaceMessageRow
     key={rowKey}
@@ -1937,6 +1952,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     measureRef={message.id === tailMessageId ? measureTail : virtualizer.measureElement}
     connection={connection}
     locale={locale}
+    localDay={localDay}
     phone={phone}
     compactTime={compactTime}
     live={live}
@@ -1954,6 +1970,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     deletionSelected={deletion.active ? deletion.selected.has(message.id) : false}
     renderDeletionCheck={deletion.active ? renderDeletionCheck : undefined}
     authorLabel={authorLabel}
+    botLabel={botLabel}
     botName={bot?.name}
     scheduledName={scheduledName}
     original={original}

@@ -80,4 +80,25 @@ describe("ConversationMessageCache", () => {
     cache.invalidate();
     expect(cache.stats()).toEqual({ conversations: 0, totalMessages: 0 });
   });
+
+  it("tracks cursor revisions and lineage without disturbing LRU order on inspect/setRevision", () => {
+    const cache = new ConversationMessageCache(2, 100);
+    cache.set("c1", [msg("m1", "c1", 10)], 1, "lin-a");
+    cache.set("c2", [msg("m2", "c2", 20)], 2, "lin-b");
+
+    // inspect() and setRevision() must not promote c1 ahead of c2 in LRU order.
+    expect(cache.inspect("c1")).toMatchObject({ revision: 1, lineage: "lin-a" });
+    cache.setRevision("c1", 3, "lin-a");
+    expect(cache.inspect("c1")).toMatchObject({ revision: 3, lineage: "lin-a" });
+
+    // Adding c3 should still evict c1 (oldest touched), keeping c2.
+    cache.set("c3", [msg("m3", "c3", 30)], 1);
+    expect(cache.inspect("c1")).toBeUndefined();
+    expect(cache.inspect("c2")).toMatchObject({ revision: 2, lineage: "lin-b" });
+
+    // patchMessage() updates revision when supplied.
+    expect(cache.patchMessage("c2", msg("m4", "c2", 40), 4)).toBe(true);
+    expect(cache.inspect("c2")?.revision).toBe(4);
+    expect(cache.inspect("c2")?.lineage).toBe("lin-b");
+  });
 });

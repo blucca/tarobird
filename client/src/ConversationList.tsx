@@ -10,7 +10,7 @@ import { botAgentSignal, buildBotRows, buildConversationRows, navigationItems, f
 import { useLocalDay } from "./local-day.js";
 import { agentSignal } from "./agent-state.js";
 import { AgentAvatar } from "./AgentAvatar.js";
-import { isDispatcher, listedConversations } from "./dispatcher.js";
+import { isDispatcher, listedConversations, useTicketConversationsVisible } from "./dispatcher.js";
 import { HostSourceBadge } from "./HostSourceBadge.js";
 import { BotName } from "./BotName.js";
 import { ConversationAvatarDialog } from "./ConversationAvatarDialog.js";
@@ -46,8 +46,16 @@ export const ConversationList = memo(function ConversationList({ connection, hos
   const locale = useLocale(); const labels = useBotLabels(); const prefix = useId();
   // Row times are worded relative to today; render them again when the local day changes.
   useLocalDay();
-  const state = useConnectionSelection(connection, current => ({ status: current.state.status, user: current.state.user,
-    foldersAvailable: current.state.foldersAvailable, conversationAvatarsAvailable: current.state.conversationAvatarsAvailable }));
+  const showTickets = useTicketConversationsVisible();
+  const state = useConnectionSelection(connection, current => ({
+    status: current.state.status,
+    user: current.state.user,
+    foldersAvailable: current.state.foldersAvailable,
+    conversationAvatarsAvailable: current.state.conversationAvatarsAvailable,
+    navigationGraceUntil: current.state.navigationGraceUntil,
+    readOnly: current.isReadOnly,
+    closed: current.isClosed,
+  }));
   const foldScope = connection.identity.hubPublicKey ? JSON.stringify([connection.identity.hubPublicKey, connection.identity.publicKey]) : undefined;
   const botFolds = useBotConversationFolds(foldScope);
   const topicFolds = useGroupTopicFolds(foldScope);
@@ -128,7 +136,10 @@ export const ConversationList = memo(function ConversationList({ connection, hos
   const parent = conversationsById.get(selected)?.parentId;
   // A selected topic may remain in a manually folded group. Mode changes and
   // mounted hidden sidebars must not overwrite the owner's disclosure choice.
-  const listed = useMemo(() => navigationItems({ connection, bots, conversations }, showDisconnectedBots, selection?.selected), [connection, bots, conversations, showDisconnectedBots, selection?.selected]);
+  const listed = useMemo(
+    () => navigationItems({ connection, bots, conversations }, showDisconnectedBots, selection?.selected),
+    [connection, bots, conversations, showDisconnectedBots, selection?.selected, showTickets, state.status, state.navigationGraceUntil, state.readOnly, state.closed],
+  );
   const hiddenBots = listed.bots.length < bots.length;
   const listedIds = useMemo(() => new Set(listed.conversations.map(chat => chat.id)), [listed.conversations]);
   const hiddenConversations = listedConversations(conversations).some(chat => !chat.archived && !chat.parentId && !listedIds.has(chat.id));
@@ -192,12 +203,17 @@ export const ConversationList = memo(function ConversationList({ connection, hos
     const expanded = filtered || !!selection?.topics.expanded(c.id);
     return <div className="adhd-group-topics" key={c.id}>{row(c, false, item)}<button className="adhd-topic-toggle" disabled={filtered} aria-expanded={expanded} aria-controls={`${prefix}_topics_${c.id}`} onClick={() => selection?.topics.setExpanded(c.id, !expanded)}>{expanded ? <ChevronDown size={12} aria-hidden="true"/> : <ChevronRight size={12} aria-hidden="true"/>}<span>{t("{0} 个话题", children.length)}</span></button><div id={`${prefix}_topics_${c.id}`} hidden={!expanded}>{children.map(child => row(child, true))}</div></div>;
   };
-  const botIds = useMemo(() => buildBotRows([{ id: "local", ...listed, activity }]).map(bot => bot.id), [listed, activity]);
+  const botIds = useMemo(() => buildBotRows([{ id: "local", ...listed, activity }]).map(bot => bot.id), [listed, activity, showTickets]);
   // Cached or historical conversations may have no remaining Bot member. Keep
   // them readable without inventing an undefined Bot or enabling its actions.
   const unassigned = ordinary.filter((c) => c.type === "direct" && !c.botIds.length);
   const groups = ordinary.filter((c) => c.type === "group" && !c.parentId);
-  const inbox = useMemo(() => layout === "conversations" && (!slice || slice.kind === "folders" || slice.kind === "folder") ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }]) : undefined, [layout, slice, hostName, connection, listed.conversations, bots, pins, globalPins, activity]);
+  const inbox = useMemo(
+    () => layout === "conversations" && (!slice || slice.kind === "folders" || slice.kind === "folder")
+      ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }])
+      : undefined,
+    [layout, slice, hostName, connection, listed.conversations, bots, pins, globalPins, activity, showTickets, state.status, state.navigationGraceUntil, state.readOnly, state.closed],
+  );
   const botRow = (id: string) => {
       const bot = botsById.get(id), name = labels.get(id) ?? bot?.name ?? id;
       const chats = directByBot.get(id) ?? [];

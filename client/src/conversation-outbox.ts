@@ -5,16 +5,18 @@ import type { HubConnection, OutboxSettlement } from "./connection.js";
 import type { OutboxEntry } from "./storage.js";
 import { t } from "./i18n.js";
 
-type Receipt = Omit<OutboxSettlement, "queueRevision"> & { queueRevision?: number; reconciling?: boolean };
+export const ACCEPTED_RECEIPT_RECONCILE_MS = 1500;
+type Receipt = Omit<OutboxSettlement, "queueRevision"> & { queueRevision?: number; reconciling?: boolean; settledAt?: number };
 type View = { connection: HubConnection; conversationId: string; entries: OutboxEntry[]; readRevision: number; readQueueRevision: number };
 const initial = (connection: HubConnection, conversationId: string): View => ({ connection, conversationId, entries: [], readRevision: -1, readQueueRevision: -1 });
 const belongs = (entry: OutboxEntry, conversationId: string) => "conversationId" in entry.frame && entry.frame.conversationId === conversationId;
-const waitingForHistory = (receipt: Receipt, historyRevision: number, messages: Message[]) => (receipt.messageAccepted || receipt.reconciling)
+const waitingForHistory = (receipt: Receipt, historyRevision: number, messages: Message[], deletedClientMsgIds?: ReadonlySet<string>) => (receipt.messageAccepted || receipt.reconciling)
   && (receipt.entry.frame.type === "message.send" || receipt.entry.frame.type === "message.forward")
-  && historyRevision <= receipt.revision && !messages.some(message => message.clientMsgId === receipt.entry.id);
+  && historyRevision <= receipt.revision && !messages.some(message => message.clientMsgId === receipt.entry.id)
+  && !deletedClientMsgIds?.has(receipt.entry.id);
 
 /** Fast pending feedback, with committed ACK receipts bridging slow history reads. */
-export function useConversationOutbox(connection: HubConnection, conversationId: string, visible: boolean, historyRevision: number, messages: Message[], scoped = false) {
+export function useConversationOutbox(connection: HubConnection, conversationId: string, visible: boolean, historyRevision: number, messages: Message[], scoped = false, deletedClientMsgIds?: ReadonlySet<string>) {
   const [view, setView] = useState<View>();
   const observations = useRef(new WeakMap<HubConnection, Map<string, View>>());
   const registry = useRef(new WeakMap<HubConnection, Map<string, Map<string, Receipt>>>());
@@ -51,7 +53,7 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
       // including an ACK that beats its first IDB read. Background share sends
       // never seen here belong to the next history read, not a pile of receipts.
       if (target && (showing(cid) || locallyQueued || target.has(id) || views.get(cid)?.entries.some(entry => entry.id === id))) {
-        target.set(id, receipt); receiptChanged();
+        target.set(id, { ...receipt, settledAt: Date.now() }); receiptChanged();
       }
     });
     return () => { unqueue(); unsettle(); };
@@ -115,6 +117,7 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
     return () => { disposed = true; unsubscribe(); };
   }, [connection, conversationId, visible, scoped, settled, views, tracked]);
 
+  const online = connection.state.status === "online";
   useEffect(() => {
     if (!visible || view?.connection !== connection || view.conversationId !== conversationId) return;
     const local = tracked.get(conversationId);
@@ -122,6 +125,8 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
       if (intent.missingRevision !== undefined && historyRevision > intent.missingRevision) local.delete(id);
     }
     let removed = false;
+    let reconcileAt: number | undefined;
+    const targetRevision = scoped ? connection.conversationRevision(conversationId) : connection.state.cacheRevision;
     for (const [id, receipt] of settled) {
       const queued = view.entries.find(entry => entry.id === id);
       // Re-enqueuing an acknowledged ID creates a new outbox order. It is a
@@ -130,12 +135,38 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
       // after settlement confirms removal and history no longer needs the bridge.
       const settledRead = view.readRevision > receipt.revision
         || receipt.queueRevision !== undefined && view.readQueueRevision > receipt.queueRevision;
-      if (queued && queued.order > receipt.entry.order || !queued && settledRead && !waitingForHistory(receipt, historyRevision, messages)) {
+      const waiting = waitingForHistory(receipt, historyRevision, messages, deletedClientMsgIds);
+      if (queued && queued.order > receipt.entry.order || !queued && settledRead && !waiting) {
         settled.delete(id); removed = true;
+      } else if (online && !queued && settledRead && waiting && receipt.messageAccepted && !receipt.reconciling
+        && historyRevision >= 0 && historyRevision >= targetRevision && targetRevision <= receipt.revision) {
+        // Fallback when an idempotent duplicate ACK arrives for a message with
+        // no local tombstone (e.g. omitted by a snapshot) and no subsequent
+        // message event will advance conversationRevision.
+        const deadline = (receipt.settledAt ?? Date.now()) + ACCEPTED_RECEIPT_RECONCILE_MS;
+        reconcileAt = reconcileAt === undefined ? deadline : Math.max(reconcileAt, deadline);
       }
     }
     if (removed) receiptChanged();
-  }, [connection, conversationId, visible, historyRevision, messages, view, settled, receiptVersion, tracked]);
+    if (reconcileAt === undefined) return;
+    const delay = Math.max(0, reconcileAt - Date.now());
+    const timer = setTimeout(() => {
+      if (connection.state.status !== "online") return;
+      const currentTarget = scoped ? connection.conversationRevision(conversationId) : connection.state.cacheRevision;
+      if (historyRevision < currentTarget) return;
+      let needsRefresh = false;
+      for (const [id, receipt] of settled) {
+        if (!receipt.messageAccepted || receipt.reconciling) continue;
+        if (view.entries.some(entry => entry.id === id)) continue;
+        const settledRead = view.readRevision > receipt.revision
+          || receipt.queueRevision !== undefined && view.readQueueRevision > receipt.queueRevision;
+        if (!settledRead || currentTarget > receipt.revision) continue;
+        if (waitingForHistory(receipt, historyRevision, messages, deletedClientMsgIds)) { needsRefresh = true; break; }
+      }
+      if (needsRefresh) connection.refreshConversation(conversationId);
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [connection, conversationId, visible, scoped, online, historyRevision, messages, deletedClientMsgIds, view, settled, receiptVersion, tracked]);
 
   if (!visible) return [];
   const current = view?.connection === connection && view.conversationId === conversationId ? view : views.get(conversationId) ?? initial(connection, conversationId);
@@ -144,7 +175,7 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
     if ((entries.get(id)?.entry.order ?? -1) > receipt.entry.order) continue;
     // Discard/card receipts mask older outbox snapshots immediately. A message
     // ACK additionally supplies its content even if the fast read never saw it.
-    if (waitingForHistory(receipt, historyRevision, messages)) entries.set(id, { entry: receipt.entry, sent: receipt.messageAccepted, syncing: !!receipt.reconciling });
+    if (waitingForHistory(receipt, historyRevision, messages, deletedClientMsgIds)) entries.set(id, { entry: receipt.entry, sent: receipt.messageAccepted, syncing: !!receipt.reconciling });
     else entries.delete(id);
   }
   const ordered = [...entries.values()].sort((a, b) => a.entry.order - b.entry.order);
