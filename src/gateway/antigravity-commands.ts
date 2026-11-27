@@ -5,6 +5,14 @@ function command(name: string, en: string, zh: string): CoreSlashCommandDefiniti
 }
 
 /**
+ * Antigravity CLI/Desktop commands intentionally excluded from the TaroBird App
+ * picker even if advertised dynamically over ACP `available_commands_update`.
+ */
+export const ANTIGRAVITY_EXCLUDED_COMMANDS: ReadonlySet<string> = new Set([
+  "remote-control",
+]);
+
+/**
  * Curated Antigravity built-in slash commands for the TaroBird App picker.
  * Surfaced immediately for Antigravity Bots (before the first ACP session emits
  * `available_commands_update`) with bilingual descriptions, ahead of generic

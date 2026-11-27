@@ -1,5 +1,5 @@
 import { CORE_SLASH_COMMANDS } from "../core/slash-command-registry.js";
-import { ANTIGRAVITY_APP_COMMANDS } from "./antigravity-commands.js";
+import { ANTIGRAVITY_APP_COMMANDS, ANTIGRAVITY_EXCLUDED_COMMANDS } from "./antigravity-commands.js";
 import { GatewayGroupModeStore, gatewayRequiresMention } from "./group-mode.js";
 import { PI_APP_COMMANDS } from "./pi-commands.js";
 
@@ -46,7 +46,7 @@ export function gatewayCommands(engine: string, query = "", engineCommands: Read
     });
     const agy = engineCommands.flatMap(({ name, description }) => {
       const command = name.toLowerCase();
-      if (taken.has(command) || seen.has(command) || !command.startsWith(prefix)) return [];
+      if (taken.has(command) || seen.has(command) || ANTIGRAVITY_EXCLUDED_COMMANDS.has(command) || !command.startsWith(prefix)) return [];
       seen.add(command);
       const text = description?.trim() || name;
       return [{ command: name, description: { defaultValue: text, i18n: { en_us: text, zh_cn: text } } }];

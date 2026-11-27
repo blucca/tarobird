@@ -43,12 +43,15 @@ describe("Antigravity slash commands adaptation (#187)", () => {
     }
 
     // Antigravity menu works immediately before ACP advertises anything and orders curated commands before generic skills.
+    // Excluded commands like /remote-control stay hidden even if advertised dynamically over ACP.
     const live = [
       { name: "zzz-custom-skill", description: "Custom skill" },
       { name: "swarm", description: "Raw English swarm description" },
+      { name: "remote-control", description: "Remote control over QR" },
     ];
     const menu = gatewayCommands("antigravity", "", live);
     expect(menu.filter((c) => c.command === "swarm")).toHaveLength(1);
+    expect(menu.some((c) => c.command.toLowerCase() === "remote-control")).toBe(false);
     expect(menu.findIndex((c) => c.command === "swarm")).toBeLessThan(menu.findIndex((c) => c.command === "zzz-custom-skill"));
     expect(renderGatewayHelp("antigravity", "zh")).toContain("/swarm");
     expect(renderGatewayHelp("antigravity", "zh")).toContain("/run-workflow");
