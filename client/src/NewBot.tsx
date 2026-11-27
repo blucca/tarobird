@@ -138,8 +138,8 @@ export function NewBot({ hostName, localHost = false, connection, close, chat, s
     {(dispatcherAvailable || options?.permissions) && <div className="new-bot-block" role="group" aria-labelledby={`${cliHelp}-role`}>
       <h3 id={`${cliHelp}-role`} className="new-bot-heading">{dispatcherAvailable && options?.permissions ? t("角色与权限") : dispatcherAvailable ? t("角色") : t("权限")}</h3>
       {dispatcherAvailable && <div className="new-bot-role" data-checked={dispatcher || undefined}>
-        <div className="dispatcher-role-row"><label className="collaboration-check"><input type="checkbox" aria-describedby={`${cliHelp}-dispatcher`} checked={dispatcher} onChange={(e) => setDispatcher(e.target.checked)}/>{t("作为幕僚长")}</label><DispatcherRoutingHelp/></div>
-        <p id={`${cliHelp}-dispatcher`} className="new-bot-hint">{t("你只说目标，它会拆分任务，并调用这台主机上已安装的 CLI 去做。只能在创建时选择。")}<strong className="new-bot-role-advice">{t("刚开始建议先建普通 Bot，这里不勾选。")}</strong></p>
+        <div className="dispatcher-role-row"><label className="collaboration-check"><input type="checkbox" aria-describedby={`${cliHelp}-dispatcher`} checked={dispatcher} onChange={(e) => setDispatcher(e.target.checked)}/>{t("作为幕僚长")}</label><span className="dispatcher-role-meta"><span className="new-bot-experimental-badge">{t("实验功能")}</span><DispatcherRoutingHelp/></span></div>
+        <p id={`${cliHelp}-dispatcher`} className="new-bot-hint">{t("superagent：你只说目标，它拆分任务，调用本机已装的 CLI 去做。只能在创建时选择。")}<strong className="new-bot-role-advice">{t("刚开始建议先建普通 Bot，这里不勾选。")}</strong></p>
         {dispatcher && <div className="new-bot-role-details"><p className="new-bot-hint">{t("不需要另外建 Bot；过程不占对话列表，只在需要你决定或验收时提醒你。")}</p><p className="new-bot-hint">{t("上面的引擎、模型和推理强度是它自己思考用的；派出去的每张工单可以各自选择。")}</p><details><summary>{t("幕僚长设置")}</summary><DispatcherSettingsFields value={dispatch} change={setDispatch} engines={targets} loading={!catalog}/></details></div>}
       </div>}
       {permissions && <PermissionSelect value={permission} choices={permissions.choices} defaultChoice={permissions.defaultChoice} change={setPermission}/>}

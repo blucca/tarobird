@@ -2262,7 +2262,7 @@ async function handleCoreEngineCommand(
 
   const selectedEngine = engine as InstanceEngine;
   if (selectedEngine === "pi" && cfg.role === "dispatcher") {
-    return locale === "en" ? "Pi is available for ordinary Bots, not Chief of Staff Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
+    return locale === "en" ? "Pi is available for ordinary Bots, not Superagent Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
   }
   const engineChanged = cfg.engine !== selectedEngine;
   let resetSessionBindings = false;

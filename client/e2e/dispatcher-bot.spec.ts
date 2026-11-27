@@ -1,9 +1,11 @@
-import { preparePairing } from "./fixtures/pairing-invite.js";
+import { fixtureInvitation, preparePairing } from "./fixtures/pairing-invite.js";
 import { test, expect, type Locator, type Page } from "@playwright/test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { HubServer } from "../../src/hub/server.js";
+import type { BotCatalog } from "../../src/client-protocol/bots.js";
+import { pairingLink } from "../src/pairing-link.js";
 import { clickAppAction } from "./fixtures/desktop-actions.js";
 import { openSettings, closeSettings } from "./fixtures/settings.js";
 import { mobileHome, showDisconnectedBots, waitForClientOnline } from "./fixtures/mobile.js";
@@ -265,4 +267,75 @@ for (const [width, platform] of [[1360, "web"], [390, "ios"], [412, "android"]] 
       await expectStar(page.locator('.bot-tree[data-bot-id="disp"] .bot-identity > .avatar'));
     }
   } finally { await context.close(); await hub.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("English New Bot Superagent row fits without overflow on narrow phones (320px/344px/360px/390px)", async ({ browser }, info) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dispatcher-narrow-en-"));
+  const hub = await HubServer.start({ stateDir: root, clientDir: clientDir() });
+  await hub.profile.update({ name: "macmini", revision: (await hub.profile.read()).revision });
+  const catalog: BotCatalog = {
+    engines: [{ id: "codex", available: true, models: [{ id: "", efforts: [""] }], defaultModel: "", defaultEffort: "" }],
+  };
+  try {
+    for (const [width, height] of [[320, 568], [344, 740], [360, 740], [390, 844]] as const) {
+      const context = await browser.newContext({ viewport: { width, height }, isMobile: true, hasTouch: true, locale: "en-US", serviceWorkers: "block" });
+      const page = await context.newPage();
+      try {
+        await page.goto(hub.url);
+        const invitation = await fixtureInvitation(hub);
+        await page.getByRole("button", { name: "Paste connection details", exact: true }).click();
+        await page.getByLabel("Pairing information", { exact: true }).fill(pairingLink({ v: 1, kind: "connect", hubPublicKey: hub.auth.publicKey, invite: invitation.invite, routes: [{ name: "Direct", url: hub.url }] }));
+        await page.getByRole("button", { name: "Use pairing information", exact: true }).click();
+        await page.getByRole("button", { name: "Pair this device", exact: true }).click();
+        await hub.auth.approve(await page.getByLabel("Pairing code", { exact: true }).innerText(), "local-owner");
+        await page.getByLabel("Pairing code", { exact: true }).waitFor({ state: "hidden" });
+        await page.route("**/api/bots/catalog*", route => route.fulfill({ json: catalog }));
+        await page.getByRole("button", { name: "New", exact: true }).filter({ visible: true }).click();
+        await page.getByRole("menuitem", { name: "New Bot", exact: true }).or(page.getByRole("button", { name: "New Bot", exact: true })).filter({ visible: true }).click();
+        const dialog = page.getByRole("dialog", { name: "New Bot", exact: true });
+        const roleBox = dialog.locator(".new-bot-role");
+        const row = roleBox.locator(".dispatcher-role-row");
+        const label = row.locator(".collaboration-check");
+        const badge = row.locator(".new-bot-experimental-badge");
+        const help = row.locator(".dispatcher-routing-help");
+        await expect(label).toContainText("Make it a Superagent");
+        await expect(badge).toHaveText("Experimental");
+        await expect(help).toBeVisible();
+        await roleBox.scrollIntoViewIfNeeded();
+        await page.evaluate(() => document.fonts.ready);
+        const metrics = await dialog.evaluate(el => {
+          const form = el.querySelector<HTMLElement>(".new-bot-form")!;
+          const role = el.querySelector<HTMLElement>(".new-bot-role")!;
+          const roleRow = el.querySelector<HTMLElement>(".dispatcher-role-row")!;
+          const check = roleRow.querySelector<HTMLElement>(".collaboration-check")!;
+          const pill = roleRow.querySelector<HTMLElement>(".new-bot-experimental-badge")!;
+          const helpBtn = roleRow.querySelector<HTMLElement>(".dispatcher-routing-help")!;
+          return {
+            formScrollW: form.scrollWidth,
+            formClientW: form.clientWidth,
+            roleScrollW: role.scrollWidth,
+            roleClientW: role.clientWidth,
+            rowScrollW: roleRow.scrollWidth,
+            rowClientW: roleRow.clientWidth,
+            roleRight: role.getBoundingClientRect().right,
+            helpRight: helpBtn.getBoundingClientRect().right,
+            badgeRight: pill.getBoundingClientRect().right,
+            labelTop: check.getBoundingClientRect().top,
+            badgeTop: pill.getBoundingClientRect().top,
+            helpTop: helpBtn.getBoundingClientRect().top,
+          };
+        });
+        expect(metrics.formScrollW, `${width}px form overflow`).toBeLessThanOrEqual(metrics.formClientW);
+        expect(metrics.roleScrollW, `${width}px role overflow`).toBeLessThanOrEqual(metrics.roleClientW);
+        expect(metrics.rowScrollW, `${width}px row overflow`).toBeLessThanOrEqual(metrics.rowClientW);
+        expect(metrics.helpRight, `${width}px help button right`).toBeLessThanOrEqual(metrics.roleRight);
+        expect(metrics.badgeRight, `${width}px badge right`).toBeLessThanOrEqual(metrics.roleRight);
+        if (width >= 360) {
+          expect(Math.abs(metrics.helpTop - metrics.labelTop), `${width}px single-line layout`).toBeLessThanOrEqual(8);
+          expect(Math.abs(metrics.badgeTop - metrics.labelTop), `${width}px single-line badge`).toBeLessThanOrEqual(12);
+        }
+        await dialog.screenshot({ path: info.outputPath(`new-bot-en-${width}.png`), animations: "disabled" });
+      } finally { await context.close(); }
+    }
+  } finally { await hub.close(); await rm(root, { recursive: true, force: true }); }
 });
