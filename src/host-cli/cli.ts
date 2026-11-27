@@ -147,12 +147,14 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     主人专用：不带 --conversation 时按对话汇总附件占用；带上则列出该对话的附件，每页 100 项
   attachments delete (--ids ID,ID | --conversation ID) --yes
     删除主机上的附件文件并立即释放空间；消息保留原文，附件处显示「附件已删除」。Bot 尚未处理完的消息里的附件会被拒绝
-  tickets list [--bot DISPATCHER] [--conversation CONVERSATION] [--open] | show TICKET | targets | engines
+  tickets list [--bot DISPATCHER] [--conversation CONVERSATION] [--open] | show TICKET | targets | nodes | load | engines
   tickets capabilities --engine ENGINE [--match TEXT] [--offset N] [--bot DISPATCHER]
     按需读取用户级技能/MCP元数据，每页40项；不创建执行者、不验证运行权限或质量。
   tickets create --title T (--text T | --text-file F) [--conversation CONVERSATION] [--context-message ID]
-  tickets dispatch TICKET --engine codex|claude|kimi|deepseek|antigravity [--model M] [--effort E] [--assist 0..2] [--text T | --text-file F] [--force] [--context-message ID]
-    --assist 为本次派工链的协助次数；auto 默认 1，ask 默认 0。ask 模式需在计划中取得主人同意；限定单一模型时请设 0。
+  tickets plan (--text T | --text-file F) [--engine ENGINE] [--host HOST[,HOST]] [--total N] [--per-node M] [--force] [--create] [--dispatch] [--conversation CONVERSATION] [--context-message ID]
+    自动将多任务拆分到多台在线且已授权主机，支持按每台数量上限或负载/配额均衡分配；带 --create 创建整批工单，带 --dispatch 立即并发派工。
+  tickets dispatch TICKET --engine codex|claude|kimi|deepseek|antigravity [--host HOST_ID|auto] [--model M] [--effort E] [--assist 0..2] [--text T | --text-file F] [--force] [--context-message ID]
+    --assist 为本次派工链的协助次数；auto 默认 1，ask 默认 0。ask 模式需在计划中取得主人同意；限定单一模型时请设 0。--host 可指定跨主机节点或 auto。
   tickets update TICKET [--status queued|needs_answer|needs_review|blocked|done|cancelled] [--note N] [--context-message ID]
   tickets assist --engine ENGINE [--model M] [--effort E] --text-file FILE --note REASON --request-id ID --context-message MESSAGE
     工单执行者请求一个协助任务；主机绑定当前工单与轮次。成功仅表示已记录，保存进度并结束本轮，等待结果回传后继续。
@@ -161,9 +163,11 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     幕僚长写工单须显式携带本轮指引中的 --context-message ID；不要依赖持久会话的环境变量或沿用旧 ID。本机主人操作不需要此参数。
     dispatch_context_not_active 表示轮次上下文缺失或失效，不是接口未启用；不可绕过工单直接启动引擎 CLI。
   tickets pause|resume|cancel|accept TICKET   主人控制工单（暂停、继续、取消、验收）
+  tickets bulk-action --action pause|resume|cancel [--host HOST_ID] [--batch BATCH_ID]  批量暂停/恢复/取消多机工单
+  tickets allow-remote --from HOST_ID --bot REMOTE_BOT_ID | revoke-remote --from HOST_ID --bot REMOTE_BOT_ID  在本机授权或撤销远端幕僚长跨主机派工
   tickets remove TICKET                     移除已结束工单，保留执行对话和文件
   tickets engine-reset ENGINE                 清除某个引擎的冷却或“需要登录”标记
-  tickets settings [--bot DISPATCHER] [--dispatch-mode ask|auto] [--max-concurrent N] [--allow ENGINE,ENGINE|all]
+  tickets settings [--bot DISPATCHER] [--dispatch-mode ask|auto] [--max-concurrent N] [--allow ENGINE,ENGINE|all] [--host HOST_ID --allowed on|off]
   messages list CONVERSATION [--before ID]  查看自己的消息，每页 50 条
   messages delete CONVERSATION --ids ID,ID --yes  删除自己的记录并同步自己的设备
   messages clear CONVERSATION [--through ID --yes | --yes]   清理自己的 App 记录，保留模型会话；不加 --yes 仅预览
@@ -337,6 +341,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     lan: { type: "boolean" }, tailscale: { type: "boolean" }, cloudflare: { type: "boolean" }, address: { type: "string" }, v2: { type: "boolean" }, reset: { type: "boolean" },
     protocol: { type: "string" }, origins: { type: "string" }, "clear-origins": { type: "boolean" },
     role: { type: "string" }, "dispatch-mode": { type: "string" }, "max-concurrent": { type: "string" }, allow: { type: "string" }, assist: { type: "string" }, status: { type: "string" }, note: { type: "string" }, open: { type: "boolean" }, match: { type: "string" }, offset: { type: "string" },
+    total: { type: "string" }, "per-node": { type: "string" }, create: { type: "boolean" }, dispatch: { type: "boolean" }, batch: { type: "string" }, allowed: { type: "string" },
     folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, global: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
     "html-file": { type: "string" }, "report-file": { type: "string" }, title: { type: "string" }, summary: { type: "string" },
     token: { type: "string" }, session: { type: "string" }, thinking: { type: "string" }, target: { type: "string" }, task: { type: "string" }, bot: { type: "string" }, message: { type: "string" }, before: { type: "string" }, through: { type: "string" }, last: { type: "boolean" },
@@ -368,7 +373,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     backups: ["days", "revision", "request-id"],
     integrations: ["yes", "request-id", "mode", "enabled", "adapter", "threshold-seconds", "revision"], directory: ["from"], init: ["name"], stop: ["wait", "force"], restart: ["wait", "force"], enroll: ["reset", "yes"], name: ["name"], drain: ["wait"],
     service: ["yes"], bots: ["name", "engine", "model", "effort", "workspace", "permission", "request-id", "expected-name", "yes", "revision", "enabled", "role", "dispatch-mode", "max-concurrent", "allow", "from"],
-    tickets: ["bot", "conversation", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
+    tickets: ["bot", "conversation", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision", "host", "total", "per-node", "create", "dispatch", "action", "batch", "from", "allowed"],
     devices: ["yes", "name"], pair: ["lan", "tailscale", "cloudflare", "address", "v2", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale", "recover"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
     folders: ["enabled", "revision", "unfiled"],
     conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session", "enabled", "global", "engine", "title", "workspace"],
@@ -868,6 +873,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     await output(await runTicketsCommand(directory, sub, argument, {
       bot: v.bot, conversation: v.conversation, match: v.match, offset: v.offset, assist: v.assist, engine: v.engine, title: v.title, text: v.text, "text-file": v["text-file"], model: v.model, effort: v.effort, force: v.force, status: v.status, note: v.note, open: v.open,
       "request-id": v["request-id"], "context-message": v["context-message"], "dispatch-mode": v["dispatch-mode"], "max-concurrent": v["max-concurrent"], allow: v.allow, revision: v.revision,
+      host: v.host, total: v.total, "per-node": v["per-node"], create: v.create, dispatch: v.dispatch, action: v.action, batch: v.batch, from: v.from, allowed: v.allowed,
     }, id => console.error(`工单操作编号：${id}。结果未确认时保留原参数并用 --request-id ${id} 核对，不会自动重发。`))); return;
   }
   if (command === "workbench") { await output(await runWorkbenchCommand(directory, sub, argument, { from: v.from, requestId: v["request-id"], contextMessageId: v["context-message"], file: v.file })); return; }

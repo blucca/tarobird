@@ -276,7 +276,7 @@ for (const [width, platform] of [[1360, "web"], [390, "ios"], [412, "android"]] 
     await openSettings(page);
     const toggle = page.getByRole("switch", { name: "在列表里显示工单对话", exact: true });
     await expect(toggle).not.toBeChecked(); await toggle.click(); await expect(toggle).toBeChecked();
-    await expect(page.getByText("调试用：显示幕僚长派活时开的内部对话。", { exact: true })).toBeVisible();
+    await expect(page.getByText("在接收主机开启此选项，然后从会话列表打开同名工单，在互动卡片上处理审批或回答问题。", { exact: true })).toBeVisible();
     // The star is not motion: it stays with animated avatars switched off.
     await page.getByRole("switch", { name: "动态头像", exact: true }).click();
     await closeSettings(page);

@@ -18,6 +18,7 @@ import { hasPendingCardAction } from "../client-protocol/message-clear.js";
 import { BOT_COMMS_LIMIT, botCommDeliverySchema, botCommItemSchema, conversationBotCommsSchema, type BotCommDelivery, type BotCommItem, type BotCommPendingApproval, type BotCommStatus, type ConversationBotComms } from "../client-protocol/workspace-comms.js";
 import type { Message } from "../client-protocol/index.js";
 import { STEER_EDGE_LIMIT, STEER_EDGE_WINDOW_MS, STEER_TURN_LIMIT, offlineSteering, steerFallbackNotice, steeringDisabledKey, type BotMessageSteeringHooks, type IncomingMemo } from "./bot-message-steering.js";
+import { REMOTE_DISPATCH_TARGET_BOT } from "../client-protocol/dispatch.js";
 
 export const messageHostId = (key: string) => `hub_${createHash("sha256").update(Buffer.from(key, "base64")).digest("hex")}`;
 const digest = (b: Buffer) => createHash("sha256").update(b).digest("hex");
@@ -131,6 +132,8 @@ export class BotMessages {
     readonly conversationCreated: (userId: string, conversation: Conversation) => void = () => undefined,
     /** Hub → Gateway calls for steered delivery (issue #62); HubServer owns them. */
     public steering: BotMessageSteeringHooks = offlineSteering) {}
+  /** Cross-host Superagent dispatch handler (issue #86); HubServer wires it. */
+  public remoteDispatch?: (passport: BotPassport, routePath: string, data: Record<string, unknown>, localAdmission?: Guard) => Promise<unknown>;
   /** Steer records whose Gateway call this process is still awaiting: they are
    * reconciled only after that call has returned or been lost. */
   private readonly steersInFlight = new Set<string>();
@@ -430,9 +433,16 @@ export class BotMessages {
           || p.source.hostId !== messageHostId(p.sourceKey) || !verify(null, Buffer.from(botPassportProof(p)), parsePublicKey(p.sourceKey), Buffer.from(signed.signature, "base64"))) throw new Error("signature");
       } catch { throw new HubError("bot_message_signature_invalid", 403); }
       const passport = signed.passport;
-      const allowedRoute = method === "POST" && (/^\/api\/bot-messages\/(conversations|resolve|send|wait|download|capabilities)$/.test(path) || path === "/api/uploads" || /^\/api\/uploads\/[\w-]+\/complete$/.test(path))
+      const isRemoteDispatch = method === "POST" && /^\/api\/bot-messages\/dispatch\/(probe|run|status|stop|download)$/.test(path) && !!this.remoteDispatch;
+      const allowedRoute = isRemoteDispatch || method === "POST" && (/^\/api\/bot-messages\/(conversations|resolve|send|wait|download|capabilities)$/.test(path) || path === "/api/uploads" || /^\/api\/uploads\/[\w-]+\/complete$/.test(path))
         || method === "PUT" && /^\/api\/uploads\/[\w-]+\/\d+$/.test(path);
       if (!allowedRoute) throw new HubError("bot_message_operation_forbidden", 403);
+      if (isRemoteDispatch) {
+        if (passport.targetBot !== REMOTE_DISPATCH_TARGET_BOT) throw new HubError("bot_message_operation_forbidden", 403);
+        if (passport.expiresAt <= Date.now() - BOT_PASSPORT_CLOCK_SKEW_MS || passport.expiresAt > Date.now() + BOT_PASSPORT_TTL_MS + BOT_PASSPORT_CLOCK_SKEW_MS) throw new HubError("bot_message_passport_expired", 401);
+        await this.store.db.serial(() => this.network.requireMessagePeerInTransaction(passport.sourceKey));
+        return { signed, bot: { id: REMOTE_DISPATCH_TARGET_BOT, name: "Dispatch" } };
+      }
       const bots = await this.store.db.serial(async () => {
         await this.network.requireMessagePeerInTransaction(passport.sourceKey);
         const rows = await this.store.db.all<{ id: string; name: string }>("SELECT id,name FROM bots WHERE deleted_at IS NULL ORDER BY name,id");
@@ -453,9 +463,12 @@ export class BotMessages {
       p = signed.passport;
       if (p.digest !== digest(body)) throw new HubError("bot_message_signature_invalid", 403);
       const passport = p;
+      const data = method === "PUT" ? {} : z.record(z.string(), z.unknown()).parse(JSON.parse(body.toString("utf8")));
+      if (method === "POST" && /^\/api\/bot-messages\/dispatch\/(probe|run|status|stop|download)$/.test(path) && passport.targetBot === REMOTE_DISPATCH_TARGET_BOT && this.remoteDispatch) {
+        return await this.remoteDispatch(passport, path, data, localAdmission);
+      }
       const guard = () => this.allowed(passport, bot.id), validate = () => this.store.db.serial(guard);
       await validate();
-      const data = method === "PUT" ? {} : z.record(z.string(), z.unknown()).parse(JSON.parse(body.toString("utf8")));
       const conversations = () => this.store.db.serial(async () => {
         await guard(); return this.store.db.all<{ id: string; name: string; lastActivityAt: number }>(`SELECT c.id,c.title AS name,COALESCE(MAX(m.created_at),c.created_at) AS lastActivityAt FROM conversations c
           JOIN conversation_members b ON b.conversation_id=c.id AND b.member_type='bot' AND b.member_id=?

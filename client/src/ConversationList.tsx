@@ -6,7 +6,7 @@ import { useBotConversationFolds, useGroupTopicFolds } from "./bot-conversation-
 import "./bot-conversation-folds.css";
 import { DraftPreviewText, listDraftPreview, useDraftPreviews } from "./DraftPreview.js";
 import { FolderSections, MoveToFolder, type CrossHostFolderActionsContext } from "./ConversationFolders.js";
-import { botAgentSignal, buildBotRows, buildConversationRows, navigationItems, formatRowTime, type InboxRow } from "./conversation-inbox.js";
+import { botAgentSignal, buildBotRows, buildConversationRows, isTicketConversation, navigationItems, formatRowTime, type InboxRow } from "./conversation-inbox.js";
 import { filterUnreadHostItems } from "./conversation-unread.js";
 import { useLocalDay } from "./local-day.js";
 import { agentSignal } from "./agent-state.js";
@@ -224,7 +224,7 @@ export const ConversationList = memo(function ConversationList({ connection, hos
   const botIds = useMemo(() => buildBotRows([{ id: "local", ...listed, activity }]).map(bot => bot.id).filter(id => !unreadMatch || unreadMatch.botIds.has(id)), [listed, activity, showTickets, unreadMatch]);
   // Cached or historical conversations may have no remaining Bot member. Keep
   // them readable without inventing an undefined Bot or enabling its actions.
-  const unassigned = ordinary.filter((c) => c.type === "direct" && !c.botIds.length && (!unreadMatch || unreadMatch.matchingIds.has(c.id)));
+  const unassigned = ordinary.filter((c) => c.type === "direct" && (!c.botIds.length || isTicketConversation(c)) && (!unreadMatch || unreadMatch.matchingIds.has(c.id)));
   const groups = ordinary.filter((c) => c.type === "group" && !c.parentId && (!unreadMatch || unreadMatch.groupIds.has(c.id)));
   const inbox = useMemo(
     () => layout === "conversations" && (!slice || slice.kind === "folders" || slice.kind === "folder")

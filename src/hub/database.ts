@@ -50,7 +50,7 @@ export class HubDatabase {
       await result.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=8388608;");
       await result.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
       const version = await result.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'");
-      if (version && !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27"].includes(version.value)) throw new Error("unsupported_hub_schema_version");
+      if (version && !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28"].includes(version.value)) throw new Error("unsupported_hub_schema_version");
       await result.transaction(async () => {
         await result.exec(SCHEMA);
         if (version && Number(version.value) < 27) {
@@ -135,6 +135,18 @@ export class HubDatabase {
         if (!conversationColumns.some((c) => c.name === "hidden")) await result.exec("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0");
         if (!conversationColumns.some((c) => c.name === "ticket_json")) await result.exec("ALTER TABLE conversations ADD COLUMN ticket_json TEXT");
         if (!conversationColumns.some((c) => c.name === "workspace_path")) await result.exec("ALTER TABLE conversations ADD COLUMN workspace_path TEXT");
+        const ticketColumns = await result.all<{ name: string }>("PRAGMA table_info(dispatch_tickets)");
+        if (!ticketColumns.some((c) => c.name === "batch_id")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN batch_id TEXT");
+        if (!ticketColumns.some((c) => c.name === "batch_index")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN batch_index INTEGER");
+        if (!ticketColumns.some((c) => c.name === "batch_total")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN batch_total INTEGER");
+        if (!ticketColumns.some((c) => c.name === "host_id")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN host_id TEXT");
+        if (!ticketColumns.some((c) => c.name === "host_name")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN host_name TEXT");
+        if (!ticketColumns.some((c) => c.name === "artifacts_json")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN artifacts_json TEXT");
+        if (!ticketColumns.some((c) => c.name === "plan_json")) await result.exec("ALTER TABLE dispatch_tickets ADD COLUMN plan_json TEXT");
+        await result.exec("CREATE INDEX IF NOT EXISTS dispatch_tickets_batch ON dispatch_tickets(batch_id,batch_index) WHERE batch_id IS NOT NULL");
+        const remoteTicketColumns = await result.all<{ name: string }>("PRAGMA table_info(remote_dispatch_tickets)");
+        if (!remoteTicketColumns.some((c) => c.name === "stop_requested")) await result.exec("ALTER TABLE remote_dispatch_tickets ADD COLUMN stop_requested TEXT");
+        await result.exec("CREATE INDEX IF NOT EXISTS remote_dispatch_tickets_conversation ON remote_dispatch_tickets(conversation_id,input_message_id,bot_id)");
         if (version && Number(version.value) < 11) {
           // Old tombstones have empty blocks. Read their own retained events
           // in small pages, using the protocol's attachment traversal so button
@@ -211,7 +223,8 @@ export class HubDatabase {
         // this bit and dispatch held inputs, so downgrades need a state backup.
         // 26: native history operations keep durable admission fences that old Hosts must not ignore.
         // 27: designated group reply mode and cross-host per-session group tables.
-        await result.run("INSERT OR REPLACE INTO meta VALUES('schema_version','27')");
+        // 28: cross-host Superagent dispatch writes per-node settings and remote attempt fields into strict JSON columns, plus durable remote stop intents.
+        await result.run("INSERT OR REPLACE INTO meta VALUES('schema_version','28')");
       });
       return result;
     } catch (error) { await result.close().catch(() => undefined); throw error; }
@@ -485,6 +498,11 @@ CREATE INDEX IF NOT EXISTS dispatch_assists_continuation ON dispatch_assists(con
 CREATE TABLE IF NOT EXISTS dispatch_assist_windows (ticket_id TEXT PRIMARY KEY REFERENCES dispatch_tickets(id), attempt_id TEXT NOT NULL, remaining INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS saved_workspaces (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL, path TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL, UNIQUE(owner_id,path));
 CREATE INDEX IF NOT EXISTS saved_workspaces_owner ON saved_workspaces(owner_id,last_used_at DESC,created_at DESC);
+-- Cross-host remote execution ledger on receiving Hosts and idempotent batch summaries.
+CREATE TABLE IF NOT EXISTS remote_dispatch_tickets (id TEXT PRIMARY KEY, source_key TEXT NOT NULL, source_host_id TEXT NOT NULL, source_bot_id TEXT NOT NULL, remote_request_id TEXT NOT NULL, title TEXT NOT NULL, request TEXT NOT NULL, engine TEXT NOT NULL, model TEXT NOT NULL, effort TEXT NOT NULL, bot_id TEXT NOT NULL, conversation_id TEXT NOT NULL, input_message_id TEXT NOT NULL, status TEXT NOT NULL, stop_requested TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(source_key,source_bot_id,remote_request_id));
+CREATE INDEX IF NOT EXISTS remote_dispatch_tickets_status ON remote_dispatch_tickets(status);
+CREATE INDEX IF NOT EXISTS remote_dispatch_tickets_conversation ON remote_dispatch_tickets(conversation_id,input_message_id,bot_id);
+CREATE TABLE IF NOT EXISTS dispatch_batch_summaries (batch_id TEXT PRIMARY KEY, dispatcher_bot_id TEXT NOT NULL, conversation_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL);
 ${MESSAGE_ACTIVITY_SCHEMA}
 ${EVENT_HISTORY_SCHEMA}
 `;

@@ -4,8 +4,8 @@ import type { Conversation, Message } from "../../src/client-protocol/index.js";
 /** dispatch.v1: chosen only at creation. Other or unknown roles display as ordinary Bots. */
 export const isDispatcher = (bot?: { role?: string }) => bot?.role === "dispatcher";
 
-// Device-local debug preference shared by every host list, like the avatar
-// motion switch. Off by default: worker conversations stay out of lists.
+// Device-local preference shared by every host list. Hidden ticket conversations
+// stay out of lists until the owner opts in to see and handle them.
 let visible = false;
 const listeners = new Set<() => void>();
 const subscribe = (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; };

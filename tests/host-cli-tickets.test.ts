@@ -146,7 +146,13 @@ it("supports --conversation on tickets create and tickets list for both owner an
   expect(((await runTicketsCommand(root, "list", undefined, { conversation: first.id }, receipt)) as any).tickets.map((t: any) => t.id)).toEqual([createdA.id]);
   expect(((await runTicketsCommand(root, "list", undefined, { conversation: second.id }, receipt)) as any).tickets.map((t: any) => t.id)).toEqual([createdB.id]);
 
-  // Verify real CLI entrypoint accepts --conversation on tickets list and tickets create.
+  // Exercise the real CLI against a legacy Host that accepts the request but ignores its filter.
+  const list = hub.dispatch.list.bind(hub.dispatch);
+  const legacyList = vi.spyOn(hub.dispatch, "list").mockImplementation((actor, botId, options) =>
+    list(actor, botId, { open: options?.open }));
+  expect(await runTicketsCommand(root, "list", undefined, {}, receipt)).toMatchObject({
+    tickets: expect.arrayContaining([expect.objectContaining({ id: createdA.id }), expect.objectContaining({ id: createdB.id })]),
+  });
   const output = vi.spyOn(console, "log").mockImplementation(() => undefined);
   try {
     await runHostCli(["tickets", "list", "--conversation", second.id, "--state-dir", root, "--json"]);
@@ -160,5 +166,6 @@ it("supports --conversation on tickets create and tickets list for both owner an
   await writeFile(path.join(state, "gateway.key"), secret, { mode: 0o600 }); await chmod(path.join(state, "gateway.key"), 0o600);
   vi.stubEnv("TAROBOT_ACTIVE_INSTANCE", "planner"); vi.stubEnv("TAROBOT_ACTIVE_STATE_DIR", state);
   expect(((await runTicketsCommand(root, "list", undefined, { conversation: second.id }, receipt)) as any).tickets.map((t: any) => t.id)).toEqual([createdB.id]);
+  legacyList.mockRestore();
   await expect(runTicketsCommand(root, "show", createdB.id, { conversation: second.id }, receipt)).rejects.toThrow("--conversation");
 });

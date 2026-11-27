@@ -73,7 +73,7 @@ export class BotManager {
   private catalogCache?: ModelCatalogCache;
   private readonly engineSettings: HubEngineSettings;
   private get catalogs(): ModelCatalogCache { return this.catalogCache ??= new ModelCatalogCache({ deepseekCatalogHome: deepseekCatalogHome(this.directory) }); }
-  constructor(readonly store: HubStore, readonly directory: string, readonly options: BotManagerOptions, readonly instanceUrl: () => string, readonly changed: (id: string) => Promise<void>) {
+  constructor(readonly store: HubStore, readonly directory: string, readonly options: BotManagerOptions, readonly instanceUrl: () => string, readonly changed: (id: string) => Promise<void>, readonly warn?: (line: string) => void) {
     this.engineSettings = options.engineSettings ?? new HubEngineSettings(directory, () => options.env ?? process.env);
   }
   private get baseEnv(): NodeJS.ProcessEnv { return this.options.env ?? process.env; }
@@ -291,6 +291,57 @@ export class BotManager {
   async ticketWorkspace(dispatcherId: string, ticketId: string): Promise<string> {
     const root = resolveInstanceWorkspacePath(await loadInstanceConfig(path.join(this.directory, "bots", idSchema.parse(dispatcherId)))) ?? path.join(this.directory, "bots", dispatcherId, "workspace");
     const directory = path.join(root, "tickets", idSchema.parse(ticketId));
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    return directory;
+  }
+  /** Hidden worker Bot on a receiving Host for cross-host Superagent tickets. */
+  async remoteDispatchWorker(sourceHostId: string, engine: InstanceEngine, validate?: TransactionGuard): Promise<string> {
+    idSchema.parse(sourceHostId);
+    const key = `remote-dispatch-worker:${sourceHostId}:${engine}`;
+    const existing = await this.store.db.serial(async () => {
+      await validate?.();
+      const row = await this.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [key]);
+      if (!row) return undefined;
+      return this.store.db.get<{ id: string; name: string; deleted_at: number | null }>("SELECT id,name,deleted_at FROM bots WHERE id=?", [row.value]);
+    });
+    const requireManual = async ({ id: botId, name }: { id: string; name: string }) => {
+      const row = await this.store.db.serial(() => this.store.db.get<{ specification_json: string }>("SELECT specification_json FROM managed_bots WHERE bot_id=?", [botId]));
+      const spec = row && createBotSchema.parse(JSON.parse(row.specification_json));
+      const config = await readValidatedConfigFile(path.join(this.directory, "bots", botId, "config.json"), { forExecution: true });
+      if (spec?.permission !== "normal" || currentPermission(engine, config) !== "normal") {
+        const command = `tarobot bots delete ${idSchema.parse(botId)} --expected-name=`;
+        const hasControl = /[\p{C}\p{Zl}\p{Zp}]/u;
+        const escapedName = [...name].map(char => hasControl.test(char)
+          ? `\\u${char.codePointAt(0)!.toString(16).padStart(4, "0")}`
+          : char).join("");
+        const quotedName = hasControl.test(name)
+          ? `NAME --yes (replace NAME with the shell-quoted exact Bot name: ${JSON.stringify(escapedName)})`
+          : process.platform === "win32"
+            ? `'${name.replaceAll("'", "''")}' --yes (PowerShell)`
+            : `'${name.replaceAll("'", "'\"'\"'")}' --yes`;
+        this.warn?.(`dispatch_worker_permissions_unsafe: Finish or stop active work, then run on this receiving Host as its owner, and retry dispatch afterward: ${command}${quotedName}`);
+        throw new HubError("dispatch_worker_permissions_unsafe", 409);
+      }
+      return botId;
+    };
+    if (existing && existing.deleted_at === null) return requireManual(existing);
+    const label = { codex: "Codex", claude: "Claude", kimi: "Kimi", deepseek: "DeepSeek", antigravity: "Antigravity", pi: "Pi", omp: "Oh My Pi" }[engine];
+    const workspace = path.join(this.directory, "remote-dispatch", sourceHostId);
+    await mkdir(workspace, { recursive: true, mode: 0o700 });
+    const permission = "normal";
+    // Include any prior deleted worker's ID so replacements derive a new bot ID
+    // instead of permanently colliding with the deleted tombstone (410).
+    const generationSeed = existing ? `${sourceHostId}:${engine}:${existing.id}` : `${sourceHostId}:${engine}`;
+    const requestId = `rdw_${createHash("sha256").update(generationSeed).digest("hex").slice(0, 24)}`;
+    const bot = await this.create("owner", { requestId, name: `Remote · ${label}`, engine, model: "", effort: "", workspace, role: "worker", permission }, validate, { internal: true });
+    await this.store.db.transaction(async () => {
+      await validate?.();
+      await this.store.db.run("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, bot.id]);
+    });
+    return requireManual(bot);
+  }
+  async remoteTicketWorkspace(sourceHostId: string, remoteTicketId: string): Promise<string> {
+    const directory = path.join(this.directory, "remote-dispatch", idSchema.parse(sourceHostId), "tickets", idSchema.parse(remoteTicketId));
     await mkdir(directory, { recursive: true, mode: 0o700 });
     return directory;
   }

@@ -1,7 +1,7 @@
 import { GlobalPinSection } from "./GlobalPinSection.js";
 import { Fragment, type ReactNode } from "react";
 import { SidebarListHeading } from "./SidebarListOptions.js";
-import { buildBotRows, buildConversationRows, navigationItems, folderSectionHosts, type InboxHost } from "./conversation-inbox.js";
+import { buildBotRows, buildConversationRows, isTicketConversation, navigationItems, folderSectionHosts, type InboxHost } from "./conversation-inbox.js";
 import { filterUnreadHostItems, type UnreadHostMatch } from "./conversation-unread.js";
 import { resolveCrossHostFolderOrder, visibleCrossHostFolders } from "./cross-host-folder-order.js";
 import { buildCrossHostFolderSources, buildHostFolderRowCounts, useCrossHostFolderOrder, useHostFolderUpdates } from "./use-cross-host-folder-order.js";
@@ -70,7 +70,7 @@ export function CombinedSidebar({ hosts, layout, showDisconnectedBots = false, f
     </nav>;
   }
   const bots = buildBotRows(listed).filter(bot => !unreadOnly || matchByHost.get(bot.hostId)!.botIds.has(bot.id));
-  const unassigned = rows.filter(row => row.conversation.type === "direct" && !row.conversation.botIds.length);
+  const unassigned = rows.filter(row => row.conversation.type === "direct" && (!row.conversation.botIds.length || isTicketConversation(row.conversation)));
   const groups = rows.filter(row => row.conversation.type === "group");
   return <nav className="conversation-list combined-sidebar">
     {globalSection}{leadingSection}

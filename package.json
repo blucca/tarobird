@@ -30,7 +30,7 @@
   "tarobotHostUpdate": {
     "format": 1,
     "minHubSchema": 1,
-    "maxHubSchema": 27
+    "maxHubSchema": 28
   },
   "engines": {
     "node": ">=22.12.0"
@@ -140,7 +140,7 @@
     "deepseek-harness-plugin/LICENSE",
     "scripts/install-skills.sh"
   ],
-  "tarobotHubSchema": 27,
+  "tarobotHubSchema": 28,
   "tarobotHostCapabilities": [
     "service-extra-environment-v1",
     "pi-state-v1",

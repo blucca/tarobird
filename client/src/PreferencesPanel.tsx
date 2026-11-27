@@ -499,7 +499,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
           <p id="link-preview-style-note" className="settings-note muted">{t("卡片显示标题、摘要和封面（网页提供时）；标题仅显示标题和域名。")}</p>
           <p id="link-preview-style-scope" className="settings-note muted">{t("用于此设备新发送的链接，已发送消息保持原样。")}</p>
           {state.dispatchAvailable && <><div className="settings-group"><div className="settings-row"><span id="ticket-conversations-setting">{t("在列表里显示工单对话")}</span><button type="button" className="model-brand-toggle" role="switch" aria-labelledby="ticket-conversations-setting" aria-describedby="ticket-conversations-note" aria-checked={preferences.showTicketConversations === true} onClick={() => update({ ...preferences, showTicketConversations: preferences.showTicketConversations !== true })}><span className="model-brand-toggle-track" aria-hidden="true"/></button></div></div>
-          <p id="ticket-conversations-note" className="settings-note muted">{t("调试用：显示幕僚长派活时开的内部对话。")}</p></>}
+          <p id="ticket-conversations-note" className="settings-note muted">{t("在接收主机开启此选项，然后从会话列表打开同名工单，在互动卡片上处理审批或回答问题。")}</p></>}
           <SettingsGroupHeading scope="device">{t("外观")}</SettingsGroupHeading>
           <div className="settings-group">
             {preferences.palette === "cli" ? <div className="settings-row"><span>{t("主题")}</span><span>{t("深色")}</span></div> : <div className="settings-row"><label htmlFor="theme">{t("主题")}</label><select id="theme" value={preferences.theme} onChange={(e) => update({ ...preferences, theme: e.target.value as Preferences["theme"] })}><option value="system">{t("跟随系统")}</option><option value="light">{t("浅色")}</option><option value="dark">{t("深色")}</option></select></div>}
