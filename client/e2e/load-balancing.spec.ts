@@ -100,7 +100,7 @@ test("multi-host load balancing settings, 3-host selection, quota/telemetry excl
       }
     });
 
-    await page.route("**/api/engine-quotas", async (route) => {
+    await page.route(url => url.pathname === "/api/engine-quotas", async (route) => {
       const url = route.request().url();
       const now = new Date().toISOString();
       if (telemetryMode === "quota_block_bc" && url.startsWith(bUrl)) {
