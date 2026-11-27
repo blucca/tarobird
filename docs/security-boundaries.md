@@ -1205,9 +1205,12 @@ leaf-pinned routes and are fenced as follows:
   falling back to `edge-proxy:shared`, never treated as loopback/trusted).
   Unauthorized origins allocate no buckets. Anonymous `/api/edge-identity`
   buckets are isolated per `(source, origin)` in a dedicated bounded 4,096-entry
-  edge table (separate from direct/relay anonymous limits), while known or
-  authenticated devices use reserved 4,096-entry known-device capacity so an
-  external caller knowing the tunnel domain cannot lock out legitimate clients.
+  edge table (separate from direct/relay anonymous limits). Per-source limits
+  apply to tracked sources; when the edge table is full, further callers are
+  served untracked so nobody is locked out (the proof is a public signature over
+  an allowed origin with nothing to brute-force). A caller presenting a session
+  or an enrolled device id is counted in the device table instead; current
+  clients do not do this yet.
 - **Configuration & Quick Tunnel authorization**: Reading Cloudflare status
   (`GET /api/host-routes/cloudflare`) is owner-scoped. Modifying authorized
   origins/settings (`PUT /api/host-routes/cloudflare`) or starting/stopping a

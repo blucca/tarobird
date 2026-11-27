@@ -115,8 +115,17 @@ export class HubAuth {
     // anonymous limits; owner approvals and actual local callers use one remote
     // input can never fill. Relay/edge metadata is namespaced and can never
     // claim to be a local socket.
+    // Per-source limits apply to tracked sources. When the `edge` table is full,
+    // further callers are served untracked instead of rejected: the edge-identity
+    // proof is a cheap public signature over an allowed origin with nothing to
+    // brute-force, and current clients present no device id, so every real client
+    // shares this table and ~4096 distinct addresses could otherwise lock all of
+    // them out. The other tables still reject new keys when full.
     const limits = table === "trusted" ? this.trustedLimits : table === "device" ? this.knownLimits : table === "edge" ? this.edgeLimits : this.limits;
-    if (!limits.has(key) && limits.size >= 4096) throw new HubError("rate_limited", 429);
+    if (!limits.has(key) && limits.size >= 4096) {
+      if (table === "edge") return;
+      throw new HubError("rate_limited", 429);
+    }
     const old = limits.get(key) ?? { count: 0, until: this.now() + PAIRING_MS };
     if (old.until < this.nextLimitExpiry) this.nextLimitExpiry = old.until;
     old.count = Math.min(old.count + 1, maximum + 1); limits.set(key, old);
@@ -426,8 +435,9 @@ export class HubAuth {
   /** Signed proof for an explicitly authorized edge-terminated HTTPS route
    * (e.g. DIY Cloudflare Tunnel). Never granted loopback trusted quota:
    * unauthenticated callers are bucketed per (source, origin) in a dedicated
-   * bounded edge table, while known/authenticated devices use reserved
-   * known-device capacity so external callers cannot lock them out. */
+   * bounded edge table; when it is full, further callers are served untracked.
+   * A caller presenting a session or an enrolled device id is counted in the
+   * device table instead (current clients do not send one yet). */
   edgeIdentity(nonce: string, rawOrigin: string, source: string, knownDeviceId?: string): EdgeIdentity {
     const canonicalOrigin = edgeOriginSchema.safeParse(rawOrigin).data ?? "invalid";
     if (knownDeviceId) {

@@ -274,6 +274,26 @@ describe("Edge-terminated Hub Ed25519 identity proof, dedicated edge-proxy liste
     expect(() => verifyEdgeIdentity({ ...proof, signature: "A".repeat(86) + "==" }, { publicKey: hub.auth.publicKey, nonce, origin: targetOrigin }, verifySignature)).toThrow("tls_identity_mismatch");
   });
 
+  it("serves new edge-identity callers untracked when the edge table is full, but the anonymous table still rejects", async () => {
+    const hub = await startHub();
+    const origin = "https://full-table.example.com";
+    await hub.cloudflare.update({ mode: "named", protocol: "http2", origins: [origin] });
+    const nonce = () => randomBytes(32).toString("base64url");
+    // A source tracked before the table fills keeps its own per-source limit.
+    const tracked = "edge-proxy:198.51.100.7";
+    for (let i = 0; i < 60; i++) hub.auth.edgeIdentity(nonce(), origin, tracked);
+    for (let i = 0; i < 4095; i++) hub.auth.edgeIdentity(nonce(), origin, `edge-proxy:2001:db8:${i.toString(16)}::1`);
+    // Table is now full (4,096 keys): a new source still gets a valid proof.
+    const proof = hub.auth.edgeIdentity(nonce(), origin, "edge-proxy:192.0.2.77");
+    expect(proof.origin).toBe(origin);
+    expect(hub.auth.edgeIdentity(nonce(), origin, "edge-proxy:192.0.2.78").signature).toBeTruthy();
+    // The already-tracked source over its limit is still refused.
+    expect(() => hub.auth.edgeIdentity(nonce(), origin, tracked)).toThrow("rate_limited");
+    // The same fill on the anonymous table still rejects new keys.
+    for (let i = 0; i < 4096; i++) hub.auth.tlsIdentity(nonce(), Buffer.from("leaf"), `2001:db8:${i.toString(16)}::1`);
+    expect(() => hub.auth.tlsIdentity(nonce(), Buffer.from("leaf"), "192.0.2.79")).toThrow("rate_limited");
+  });
+
   it("isolates /api/edge-identity rate limits per client IP and reserves known/authenticated device capacity against external DoS", async () => {
     const hub = await startHub();
     const targetOrigin = "https://rate-test.example.com";
@@ -328,18 +348,15 @@ describe("Edge-terminated Hub Ed25519 identity proof, dedicated edge-proxy liste
     });
     expect(unknownOnSameIp.status).toBe(429);
 
-    // 5. Filling the entire 4,096-entry anonymous edge table does NOT starve known devices, direct anonymous TLS proofs, or loopback trusted operations.
+    // 5. Filling the entire 4,096-entry anonymous edge table does NOT starve new anonymous callers (served untracked),
+    // known devices, direct anonymous TLS proofs, or loopback trusted operations.
     for (let i = 0; i < 4200; i++) {
-      try {
-        hub.auth.edgeIdentity(randomBytes(32).toString("base64url"), targetOrigin, `edge-proxy:2001:db8:${i.toString(16)}::1`);
-      } catch (error) {
-        expect((error as Error).message).toBe("rate_limited");
-      }
+      hub.auth.edgeIdentity(randomBytes(32).toString("base64url"), targetOrigin, `edge-proxy:2001:db8:${i.toString(16)}::1`);
     }
     const newAnon = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}`, {
       headers: { "CF-Connecting-IP": "192.0.2.250" },
     });
-    expect(newAnon.status).toBe(429);
+    expect(newAnon.status).toBe(200);
     const knownDuringFlood = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}&deviceId=${encodeURIComponent(known.deviceId)}`, {
       headers: { "CF-Connecting-IP": "192.0.2.250" },
     });
