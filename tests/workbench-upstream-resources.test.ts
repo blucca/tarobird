@@ -22,4 +22,11 @@ describe("Workbench editor and authoring resource provenance", () => {
       expect(digest).toBe(expected);
     }
   });
+
+  it("keeps the pinned bundle out of Git's line-ending conversion, so its hashes hold on a Windows checkout", () => {
+    // With `* text=auto` alone, core.autocrlf=true rewrites the bundle's JS, CSS, HTML, LICENSE and NOTICE on
+    // checkout, and the build then stops at design_upstream_changed.
+    const rule = readFileSync(".gitattributes", "utf8").split(/\r?\n/).find(line => line.startsWith("client/vendor/workbench-slides/** "));
+    expect(rule?.split(/\s+/)).toContain("-text");
+  });
 });
