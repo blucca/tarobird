@@ -32,7 +32,8 @@ for (const phone of [false, true]) test(`offline cold starts retain group recipi
     await hub.close(); hub = undefined;
     await page.reload({ waitUntil: "domcontentloaded" });
     await selectConversation(page, group.title);
-    await expect(page.locator(".offline-banner").filter({ visible: true })).toBeVisible();
+    const offlineNotice = page.locator(phone ? ".phone-connection-notice" : ".offline-banner").filter({ visible: true });
+    await expect(offlineNotice).toBeVisible();
     await revealReplyBots(page);
     await expect(page.getByRole("checkbox", { name: "助手甲", exact: true })).toHaveAttribute("aria-checked", "true");
     await expect(page.getByRole("checkbox", { name: "助手乙", exact: true })).toBeVisible();
@@ -79,7 +80,8 @@ for (const phone of [false, true]) test(`offline cold starts retain group recipi
     await page.reload({ waitUntil: "domcontentloaded" });
     await selectConversation(page, group.title);
     await expect(page.locator(".queued-message")).toHaveCount(3);
-    await expect(page.locator(".offline-banner").filter({ visible: true })).toContainText("3 条消息将在重连后发送。");
+    if (phone) await offlineNotice.locator("summary").click();
+    await expect(offlineNotice.getByText("3 条消息将在重连后发送。")).toBeVisible();
     hub = await HubServer.start({ stateDir: root, port, clientDir: path.resolve("dist") });
     await waitForClientOnline(page);
     await expect(page.locator(".queued-message")).toHaveCount(0);
