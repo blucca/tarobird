@@ -40,6 +40,7 @@ import type {
 } from "./adapter.js";
 import { EngineIncompleteResponseError, EngineSteeringRejectedError } from "./adapter.js";
 import { killProcessTree } from "./process-tree.js";
+import { EngineSessionRestarts, observeEngineProcessExit } from "./engine-session-restart.js";
 import { extractAntigravityTaskPlan, parseAcpPlanSummary, type AntigravityTodoItem } from "./antigravity-task-plan.js";
 import { renderPrivateTurnInstructions } from "./turn-instructions.js";
 
@@ -66,11 +67,13 @@ type AgyWritable = {
 
 export type AgyAcpChildProcess = {
   pid?: number;
+  exitCode?: number | null;
+  signalCode?: NodeJS.Signals | null;
   stdin?: AgyWritable;
   stdout?: AgyReadable;
   stderr?: AgyReadable;
   once(event: "error", listener: (error: Error) => void): void;
-  once(event: "close", listener: (code: number | null, signal?: NodeJS.Signals | null) => void): void;
+  once(event: "exit" | "close", listener: (code: number | null, signal?: NodeJS.Signals | null) => void): void;
 };
 
 export type SpawnAgyAcp = (command: string, args: string[], options: SpawnOptions) => AgyAcpChildProcess;
@@ -477,6 +480,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private readonly spawnFn: SpawnAgyAcp;
   private readonly killProcessTreeFn: (pid: number | undefined, options?: { graceMs: number }) => void;
   private readonly workers = new Map<string, Worker>();
+  private readonly sessionRestarts = new EngineSessionRestarts();
   private readonly pendingWorkers = new Map<string, Promise<Worker>>();
   private readonly initializeTimeoutMs: number;
   private readonly closeTimeoutMs: number;
@@ -654,11 +658,18 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   /** session/close, then the `agy acp` process tree of this session only; the next turn loads the session again. */
-  async restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
+  restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
     const worker = this.workers.get(sessionId);
-    if (!worker || worker.removed) return { outcome: "not_running" };
-    await this.closeWorker(worker, new Error(STOPPED_BY_USER), { graceMs: APP_STOP_PROCESS_GRACE_MS });
-    return { outcome: "restarted" };
+    return this.sessionRestarts.close(sessionId, worker && !worker.removed && !this.sessionRestartPending(sessionId) ? {
+      exited: worker.exited ? Promise.resolve() : observeEngineProcessExit(worker.child),
+      stop: () => worker.exited ? undefined : worker.removed
+        ? this.killProcessTreeFn(worker.child.pid, { graceMs: APP_STOP_PROCESS_GRACE_MS })
+        : this.closeWorker(worker, new Error(STOPPED_BY_USER), { graceMs: APP_STOP_PROCESS_GRACE_MS }),
+    } : undefined);
+  }
+
+  sessionRestartPending(sessionId: string): Promise<void> | undefined {
+    return this.sessionRestarts.exiting(sessionId);
   }
 
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
@@ -714,6 +725,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   private async getOrCreateWorker(requestedId: string, workspace: string, launchKey: string, approvalMode: ApprovalMode): Promise<Worker> {
+    if (this.sessionRestartPending(requestedId)) throw new Error("Antigravity's old process is still exiting");
     let sessionId = requestedId;
     const existing = this.liveWorker(sessionId);
     if (existing) {

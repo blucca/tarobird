@@ -16,7 +16,7 @@ import type {
   EngineContextUsage,
   EngineStreamEvent,
 } from "../codex/adapter.js";
-import type { BridgeAccessDecision } from "../runtime/bridge.js";
+import type { BridgeAccessDecision, BridgeConversationRestartInput, BridgeConversationRestartOutcome } from "../runtime/bridge.js";
 import type { EngineTaskSnapshot, EngineTaskControlResult } from "../client-protocol/engine-tasks.js";
 import type { PiSessionSnapshot, PiSessionResult, PiSessionChange } from "../client-protocol/pi-session.js";
 import type { BridgeTurnLockWaitEvent } from "../runtime/turn-lock.js";
@@ -191,7 +191,8 @@ export interface CoreBridgeLike {
     title?: string;
     updatedAt?: string;
   }>>;
-  restartConversationSession?(input: { chatId: number; messageThreadId?: number; conversationKey?: string }): Promise<"restarted" | "not_running" | "no_session" | "unsupported">;
+  supportsConversationRestart?(): boolean;
+  restartConversationSession?(input: BridgeConversationRestartInput): Promise<BridgeConversationRestartOutcome>;
   getContextUsage?(input: {
     chatId: number;
     messageThreadId?: number;

@@ -635,8 +635,11 @@ describe("AntigravityAcpAdapter cleanup", () => {
     harness.children[0]!.server.text("a");
     harness.children[0]!.server.respondPrompt();
     await settleWithin(first);
-    await expect(adapter.restartSession(SESSION_A)).resolves.toEqual({ outcome: "restarted" });
+    const closing = adapter.restartSession(SESSION_A);
+    await waitFor(() => harness.log.includes("kill:900"));
     expect(harness.log).toEqual([`close:${SESSION_A}`, "stdin-end:900", "kill:900"]);
+    await expect(closing).resolves.toEqual({ outcome: "closed" });
+    expect(harness.children).toHaveLength(1);
     await expect(adapter.restartSession(SESSION_A)).resolves.toEqual({ outcome: "not_running" });
     const next = adapter.sendUserMessage(SESSION_A, { text: "b", files: [] });
     await waitFor(() => harness.children[1]?.server.prompts.length === 1);

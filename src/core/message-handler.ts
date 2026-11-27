@@ -1,3 +1,4 @@
+import { handleCoreRestart } from "./restart-command.js";
 import { isBotControl } from "../client-protocol/bot-messages.js";
 import { isGeneratedVoiceFilename } from "../client-protocol/voice-presentation.js";
 import { backgroundTaskBody, backgroundTaskContext, backgroundTaskReplyTo } from "./background-task-notice.js";
@@ -541,25 +542,9 @@ async function runAcceptedCoreMessage(
     return false;
   };
 
-  // /restart ends the engine process behind this conversation's session and
-  // keeps the binding, so the next turn continues the same context afresh.
-  // Pre-queue like /stop: a wedged turn must not block it.
   if (isRestartCommand(commandText)) {
     if (!(await checkPreQueueAccess("/restart"))) return true;
-    const stopped = await stopCoreConversation(input.runtime, normalized.conversationKey, input.stateDir);
-    const outcome = input.bridge.restartConversationSession
-      ? await input.bridge.restartConversationSession({ chatId: normalized.bridgeChatId, conversationKey: normalized.conversationKey })
-      : "unsupported";
-    await input.channel.send(normalized.chatId, { text: renderCoreRestart(outcome, !!stopped.active, messageLocale) }, {
-      replyTo: normalized.messageId,
-      replyInThread: Boolean(normalized.threadId),
-    });
-    await appendCoreTimelineEvent(input.stateDir, normalized, {
-      type: "command.handled",
-      outcome: outcome === "restarted" ? "success" : "noop",
-      detail: "/restart",
-      metadata: { result: outcome, stoppedTurn: !!stopped.active },
-    });
+    await handleCoreRestart(input, normalized, messageLocale);
     return true;
   }
 
@@ -1150,7 +1135,7 @@ async function preemptActiveCoreTurnIfEnabled(
   commandText: string,
   locale: Locale,
 ): Promise<void> {
-  if (!input.runtime.queuePolicy.preempt || isSlashCommand(commandText)) {
+  if (!input.runtime.queuePolicy.preempt || isSlashCommand(commandText) || input.runtime.chatQueue.pausedUntil(normalized.conversationKey)) {
     return;
   }
   const active = input.runtime.activeRuns.get(normalized.conversationKey);
@@ -1173,7 +1158,7 @@ async function preemptActiveCoreTurnIfEnabled(
       locale,
     })
     : { kind: "allow" as const };
-  if (accessDecision.kind !== "allow") {
+  if (accessDecision.kind !== "allow" || input.runtime.chatQueue.pausedUntil(normalized.conversationKey)) {
     return;
   }
   if (active?.goalWatch) {
@@ -1255,7 +1240,7 @@ async function trySteerActiveCoreTurn(
   locale: Locale,
 ): Promise<boolean> {
   // App users choose steering explicitly; ordinary sends always use the queue.
-  if (input.channel.profile === "gateway") return false;
+  if (input.channel.profile === "gateway" || input.runtime.chatQueue.pausedUntil(normalized.conversationKey)) return false;
   if (typeof input.bridge.steerActiveTurn !== "function") {
     return false;
   }
@@ -1347,7 +1332,8 @@ async function trySteerActiveCoreTurn(
   try {
     if (input.channel.canSteerConversation && !await input.channel.canSteerConversation(normalized.chatId)) return false;
   } catch { return false; }
-  const isCurrentTurn = () => input.runtime.activeRuns.get(normalized.conversationKey) === activeRun
+  const isCurrentTurn = () => !input.runtime.chatQueue.pausedUntil(normalized.conversationKey)
+    && input.runtime.activeRuns.get(normalized.conversationKey) === activeRun
     && !steerTarget.abortController.signal.aborted
     && (!attachedTurn || (activeRun.abortController instanceof CoreGoalRunController
       && activeRun.abortController.liveConcurrentTurn() === attachedTurn));
@@ -1728,6 +1714,7 @@ async function runNormalizedCoreMessage(
     });
     cfg.resume = undefined;
   }
+  for (let pause; (pause = input.runtime.chatQueue.pausedUntil(normalized.conversationKey));) await pause;
   try { await input.channel.prepareConversation?.(normalized.chatId); }
   catch (error) {
     await appendCoreTimelineEvent(input.stateDir, normalized, { type: "turn.completed", outcome: "error", detail: redactCoreErrorDetail(error), metadata: { phase: "conversation-prepare" } });
@@ -1751,6 +1738,7 @@ async function runNormalizedCoreMessage(
   cfg.resume = conversationResume;
   const workspaceOverride = input.workspaceOverride ?? conversationResume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
 
+  for (let pause; (pause = input.runtime.chatQueue.pausedUntil(normalized.conversationKey));) await pause;
   const commandText = extractCoreMessageBody(normalized.text);
 
   // Claim the conversation's activeRuns slot — or, when a live /goal pursuit
@@ -4224,21 +4212,4 @@ function isVideoCoreAttachment(
 
 function isVideoCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
   return isVideoCoreAttachment(downloaded.attachment, downloaded.localPath);
-}
-
-function renderCoreRestart(outcome: "restarted" | "not_running" | "no_session" | "unsupported", stoppedTurn: boolean, locale: Locale): string {
-  const zh = locale === "zh";
-  const stopped = stoppedTurn ? (zh ? "已停止当前任务。" : "Stopped the current task. ") : "";
-  switch (outcome) {
-    case "restarted": return stopped + (zh
-      ? "已重启这个对话的引擎进程，会话保留。下一条消息会在新进程里接着原来的上下文继续。"
-      : "Restarted this chat's engine process and kept its session. Your next message continues the same context in a new process.");
-    case "not_running": return stopped + (zh
-      ? "这个对话现在没有在运行的引擎进程，不需要重启。下一条消息会直接起新进程，接着原来的会话。"
-      : "No engine process is running for this chat, so there is nothing to restart. Your next message starts a new one on the same session.");
-    case "no_session": return stopped + (zh ? "这个对话还没有会话，不需要重启。" : "This chat has no session yet, so there is nothing to restart.");
-    default: return stopped + (zh
-      ? "当前引擎暂不支持 /restart（它的进程由多个对话共用，或每轮都会新起进程）。想清空会话重新开始，可以用 /reset。"
-      : "This engine doesn't support /restart yet (its process is shared by several chats, or a new one starts for every turn). Use /reset for a fresh session.");
-  }
 }

@@ -18,6 +18,7 @@ import { ENGINE_DEFAULT_INACTIVITY_TIMEOUT_MS } from "./engine-timeouts.js";
 // than a local SIGTERM-only copy, so a Claude CLI (and its MCP/sandbox children)
 // that ignores SIGTERM is still force-killed — matching the other adapters.
 import { killProcessTree } from "./process-tree.js";
+import { EngineSessionRestarts, observeEngineProcessExit } from "./engine-session-restart.js";
 import { APP_STOP_PROCESS_GRACE_MS, APP_USER_STOP_REASON, appStopKillOptions } from "../runtime/turn-cancellation.js";
 import { sideAttachmentPrompt } from "./side-attachments.js";
 import { prependPrivateTurnInstructions, renderPrivateTurnInstructions } from "./turn-instructions.js";
@@ -1162,6 +1163,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   private readonly platform: NodeJS.Platform;
   private readonly idleSweepTimer: ReturnType<typeof setInterval> | undefined;
   private readonly workers = new Map<string, ClaudeWorker>();
+  private readonly sessionRestarts = new EngineSessionRestarts();
   private readonly historyHelper: ClaudeHistoryHelper | undefined;
   /** History helper calls in flight. They belong to no worker, so nothing else would wait for or end them. */
   private readonly historyRuns = new Set<Promise<unknown>>();
@@ -1900,6 +1902,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     if (this.destroyPromise) {
       throw new Error("Adapter destroyed");
     }
+    if (this.sessionRestartPending(sessionId)) throw new Error("Claude's old process is still exiting");
     const combinedKey = combineInstructions(agentInstructions, bridgeInstructions);
     const permissionMode = approvalMode === "normal" ? engineOptions?.permissionMode ?? "manual" : "bypassPermissions";
     const chromeIntegration = engineOptions?.chrome ?? this.enableChromeIntegration;
@@ -4083,7 +4086,9 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       return owner;
     };
     const liveIds = new Set(live.map((task) => task.taskId));
-    for (const [token, taskId] of worker.taskTokens) if (!all.has(taskId)) { worker.taskTokens.delete(token); worker.tokenByTask.delete(taskId); }
+    for (const [token, taskId] of worker.taskTokens) if (!all.has(taskId) && !worker.backgroundTasks.has(taskId)) {
+      worker.taskTokens.delete(token); worker.tokenByTask.delete(taskId);
+    }
     const view = (task: ClaudeNativeTask | ClaudeEndedTask): ClaudeEngineTask => {
       const running = liveIds.has(task.taskId);
       const parent = task.parentTaskId && all.has(task.parentTaskId) ? this.taskToken(worker, task.parentTaskId) : undefined;
@@ -4110,6 +4115,25 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       foregroundStopScope: this.softStopReady(worker) ? "subagents" : "all",
       ...(fence?.unconfirmed && fence.recoveryToken ? { recovery: { token: fence.recoveryToken, reason: "stop_unconfirmed" as const } } : {}),
     };
+  }
+
+  async listRestartTasks(sessionId: string): Promise<ClaudeEngineTask[]> {
+    const worker = this.workers.get(sessionId);
+    const { tasks } = await this.listTasks(sessionId);
+    const impact = tasks.filter(task => task.mode === "background" && task.status === "running");
+    if (!worker || worker.retired || this.workers.get(sessionId) !== worker) return impact;
+    const reported = new Map(tasks.map(task => [worker.taskTokens.get(task.id), task]));
+    for (const [taskId, task] of worker.backgroundTasks) {
+      const native = reported.get(taskId);
+      if (worker.finishedBackgroundTaskIds.has(taskId) || native && (native.status !== "running" || native.mode === "background")) continue;
+      // Older task_started receipts can be classified as foreground by the
+      // native list, even though the adapter already tracked them as background.
+      impact.push({
+        id: this.taskToken(worker, taskId), label: (task.summary?.trim() || native?.label || "Claude background task").slice(0, 500),
+        kind: native?.kind ?? "unknown", mode: "background", status: "running", canStop: false, updatedAt: task.lastSeenAt,
+      });
+    }
+    return impact;
   }
 
   /** Native `stop_task` for one task token of this session's current worker.
@@ -4149,8 +4173,18 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     return { outcome: "accepted" };
   }
 
-  async restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
-    return { outcome: await this.forceStopSession(sessionId) ? "restarted" : "not_running" };
+  restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
+    const worker = this.workers.get(sessionId);
+    return this.sessionRestarts.close(sessionId, worker && !worker.retired && !this.sessionRestartPending(sessionId) ? {
+      exited: observeEngineProcessExit(worker.child),
+      stop: () => worker.retired
+        ? killProcessTree(worker.child.pid, { graceMs: APP_STOP_PROCESS_GRACE_MS })
+        : this.forceStopWorker(worker),
+    } : undefined);
+  }
+
+  sessionRestartPending(sessionId: string): Promise<void> | undefined {
+    return this.sessionRestarts.exiting(sessionId);
   }
 
   async forceStopSession(sessionId: string): Promise<boolean> {
@@ -4331,11 +4365,12 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     );
   }
 
-  private forceStopWorker(worker: ClaudeWorker): void {
+  private forceStopWorker(worker: ClaudeWorker): Promise<void> | undefined {
     if (worker.retired) return;
-    killProcessTree(worker.child.pid, { graceMs: APP_STOP_PROCESS_GRACE_MS });
+    const stopped = killProcessTree(worker.child.pid, { graceMs: APP_STOP_PROCESS_GRACE_MS });
     this.failWorker(worker, new Error("Task was stopped by user"));
     this.removeWorker(worker);
+    return stopped;
   }
 
   /** Settled: its progress is final, so no control or later evidence needs it. */

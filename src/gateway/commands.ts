@@ -17,16 +17,13 @@ export const GATEWAY_COMMAND_POLICIES: Readonly<Record<string, "shared" | "nativ
   "approve-session": "shared", deny: "shared", meeting: "feishu",
 };
 
-/** Engines whose adapter can restart one conversation's process (`restartSession`). */
-const RESTARTABLE_ENGINES: ReadonlySet<string> = new Set(["claude", "antigravity", "pi"]);
-
 /** `engineCommands`: the live engine's own commands (Antigravity ACP). A Host command of the same name wins, since the Host handles it first. */
-export function gatewayCommands(engine: string, query = "", engineCommands: ReadonlyArray<{ name: string; description?: string }> = []) {
+export function gatewayCommands(engine: string, query = "", engineCommands: ReadonlyArray<{ name: string; description?: string }> = [], supportsRestart = engine === "claude" || engine === "pi") {
   const shared = CORE_SLASH_COMMANDS.filter(({ command }) =>
     (GATEWAY_COMMAND_POLICIES[command] === "shared" || command === "group")
     && (command !== "fast" || engine === "codex")
     && (command !== "ultrareview" || engine === "claude")
-    && (command !== "restart" || RESTARTABLE_ENGINES.has(engine))
+    && (command !== "restart" || supportsRestart)
     && command.startsWith(query.replace(/^\//, "").toLowerCase()))
     .map((definition) => definition.command !== "group" ? definition : {
       ...definition,
@@ -107,7 +104,7 @@ export function gatewayNativeCommandHelp(command: string, locale: "en" | "zh"): 
     : "App 通过你的 Hub 连接。在「设置 → 设备管理」中配对或吊销自己的设备。配对会授予你的账号权限，不能当作受限访客邀请。";
 }
 
-export function renderGatewayHelp(engine: string, locale: "en" | "zh"): string {
+export function renderGatewayHelp(engine: string, locale: "en" | "zh", supportsRestart?: boolean): string {
   const english = locale === "en";
   return [
     english ? "**TaroBird App help**" : "**TaroBird App 使用帮助**",
@@ -117,7 +114,7 @@ export function renderGatewayHelp(engine: string, locale: "en" | "zh"): string {
     english
       ? "Messages, files, replies and card actions sync across paired devices. Add text to pictures, files or voice recordings before sending. Quote and forward from the message menu."
       : "消息、文件、回复和卡片操作会同步到已配对设备。图片、文件和录音都可附文字一起发送；消息菜单支持引用和转发。",
-    ...gatewayCommands(engine).map(({ command, description }) => `- \`/${command}\` — ${english ? description.defaultValue : description.i18n.zh_cn}`),
+    ...gatewayCommands(engine, "", [], supportsRestart).map(({ command, description }) => `- \`/${command}\` — ${english ? description.defaultValue : description.i18n.zh_cn}`),
     engine === "pi" ? english
       ? "Pi model and thinking commands apply to the current conversation; Bot defaults remain separate. While Pi is replying, plain-text Send supplements that task; choose Next turn to use the Host queue. If the task can no longer receive input and delivery is definitely rejected, the unchanged message goes to the next turn; uncertain delivery is never resent automatically. Extension commands wait for their own turn; templates and skills can supplement the current task. Use Pi conversation settings to adjust the live model. Login, logout and terminal-only actions explain their native terminal route."
       : "Pi 的模型和思考强度命令只调整当前对话，Bot 默认设置另行管理。回复中发送纯文字会补充当前任务；选择「下一轮」进入主机队列。任务已不能接收补充且确认未送达时，未改动的消息会转到下一轮；结果待确认时不会自动重发。扩展命令会单独排队执行；模板和技能可补充当前任务。「Pi 对话设置」可调整运行中的模型。登录、退出登录和终端专属操作会说明原生终端入口。"

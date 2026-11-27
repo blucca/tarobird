@@ -254,12 +254,30 @@ describe("PiRpcAdapter sessions and process lifecycle", () => {
     await expect(r.adapter.restartSession(sessionId)).resolves.toEqual({ outcome: "not_running" });
     await r.adapter.sendUserMessage(sessionId, message("hello"));
     expect(r.spawner.processes).toHaveLength(1);
-    await expect(r.adapter.restartSession(sessionId)).resolves.toEqual({ outcome: "restarted" });
+    await expect(r.adapter.restartSession(sessionId)).resolves.toEqual({ outcome: "closed" });
     await expect(r.adapter.restartSession(sessionId)).resolves.toEqual({ outcome: "not_running" });
     const response = await r.adapter.sendUserMessage(sessionId, message("again"));
     expect(response).toMatchObject({ text: "ok", sessionId });
     expect(r.spawner.processes).toHaveLength(2);
     expect(r.spawner.last().args.join(" ")).toContain(sessionId);
+  });
+
+  it("retires a process still opening the same Pi session without letting it take the first prompt", async () => {
+    let stuck = false;
+    const r = await rig({ pi: { onCommand: command => {
+      if (command.type !== "get_state" || stuck) return false;
+      stuck = true;
+      return true;
+    } } });
+    const { sessionId } = await r.adapter.createSession(1);
+    const first = failure(r.adapter.sendUserMessage(sessionId, message("first")));
+    await waitFor(() => stuck);
+    const original = r.spawner.last();
+    await expect(r.adapter.restartSession(sessionId)).resolves.toEqual({ outcome: "closed" });
+    expect(await first).toMatchObject({ name: "AbortError" });
+    expect(commands(original, "prompt")).toHaveLength(0);
+    await expect(r.adapter.sendUserMessage(sessionId, message("next"))).resolves.toMatchObject({ sessionId });
+    expect(r.spawner.processes).toHaveLength(2);
   });
 
   it("resumes an existing session file by absolute path and refuses one from another workspace", async () => {

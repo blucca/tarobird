@@ -1323,20 +1323,24 @@ describe("core service shared rules (compatibility profile)", () => {
         });
         return { text: "unreachable" };
       })),
-      restartConversationSession: vi.fn(async () => { order.push("restart"); return "restarted" as const; }),
+      restartConversationSession: vi.fn(async (request: import("../src/runtime/bridge.js").BridgeConversationRestartInput) => {
+        request.onStopping();
+        order.push("close");
+        return "closed" as const;
+      }),
     };
     try {
       const firstRun = handleCoreMessage({ channel, bridge, runtime, stateDir, message: fakeLarkMessage({ messageId: "om_first", content: "first" }) });
       await started;
       await handleCoreMessage({ channel, bridge, runtime, stateDir, message: fakeLarkMessage({ messageId: "om_restart", content: "/restart" }) });
       await firstRun;
-      expect(order).toEqual(["aborted", "restart"]);
+      expect(order).toEqual(["aborted", "close"]);
       expect(bridge.restartConversationSession).toHaveBeenCalledOnce();
       expect(bridge.restartConversationSession.mock.calls[0]![0]).toMatchObject({ conversationKey: expect.any(String) });
-      expect(sentPayloads(channel)).toContain("已停止当前任务。已重启这个对话的引擎进程，会话保留。");
+      expect(sentPayloads(channel)).toContain("旧进程已结束，会话已保留，下次发消息时启动。");
       const events = parseTimelineEvents(await readFile(path.join(stateDir, "timeline.log.jsonl"), "utf8"));
       expect(events).toContainEqual(expect.objectContaining({ type: "command.handled", detail: "/restart", outcome: "success",
-        metadata: expect.objectContaining({ result: "restarted", stoppedTurn: true }) }));
+        metadata: expect.objectContaining({ result: "closed", stopRequested: true }) }));
       expect(bridge.handleAuthorizedMessage).toHaveBeenCalledTimes(1);
     } finally {
       await rm(stateDir, { recursive: true, force: true });
@@ -1349,7 +1353,7 @@ describe("core service shared rules (compatibility profile)", () => {
     const bridge = allowAllBridge();
     try {
       await handleCoreMessage({ channel, bridge, runtime: createCoreServiceRuntime(), stateDir, message: fakeLarkMessage({ messageId: "om_restart", content: "/restart" }) });
-      expect(sentPayloads(channel)).toContain("当前引擎暂不支持 /restart");
+      expect(sentPayloads(channel)).toContain("当前引擎或运行模式暂不支持 /restart");
       expect(bridge.handleAuthorizedMessage).not.toHaveBeenCalled();
     } finally {
       await rm(stateDir, { recursive: true, force: true });

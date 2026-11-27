@@ -3,6 +3,8 @@ import { constants as fsConstants } from "node:fs";
 import { copyFile, lstat, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { EngineSessionRestarts } from "./engine-session-restart.js";
+import { APP_STOP_PROCESS_GRACE_MS } from "../runtime/turn-cancellation.js";
 
 import {
   EngineIncompleteResponseError, EngineSteeringRejectedError, withFailedTurnUsage,
@@ -254,7 +256,8 @@ export class PiRpcAdapter implements CodexAdapter {
 
   private readonly store: PiSessionStore;
   private readonly workers = new Map<string, Worker>();
-  private readonly starting = new Map<string, Promise<Worker>>();
+  private readonly starting = new Map<string, { controller: AbortController; work: Promise<Worker>; client?: PiRpcClient }>();
+  private readonly sessionRestarts = new EngineSessionRestarts();
   /**
    * Second processes making a fork, from before they are spawned until they
    * have exited. They belong to no session of this adapter, so nothing else
@@ -687,10 +690,26 @@ export class PiRpcAdapter implements CodexAdapter {
   /** Ends this session's Pi process; the next turn starts a new one on the same session file. */
   async restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
     const worker = this.workers.get(sessionId);
-    if (!worker || worker.closed) return { outcome: "not_running" };
-    if (worker.turn && !worker.turn.done.settled) worker.turn.stopRequested = true;
-    await this.closeWorker(worker, { terminate: true });
-    return { outcome: "restarted" };
+    const startup = this.starting.get(sessionId);
+    const client = worker?.client ?? startup?.client;
+    const closing = this.sessionRestarts.close(sessionId, client?.isAlive && !this.sessionRestartPending(sessionId) ? {
+      exited: client.exited,
+      stop: async () => {
+        if (worker && !worker.closed) {
+          if (worker.turn && !worker.turn.done.settled) worker.turn.stopRequested = true;
+          await this.closeWorker(worker, { graceMs: APP_STOP_PROCESS_GRACE_MS });
+        } else if (client.isAlive) {
+          client.terminate();
+        }
+      },
+    } : undefined);
+    startup?.controller.abort();
+    await startup?.work.catch(() => undefined);
+    return closing;
+  }
+
+  sessionRestartPending(sessionId: string): Promise<void> | undefined {
+    return this.sessionRestarts.exiting(sessionId);
   }
 
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
@@ -783,7 +802,7 @@ export class PiRpcAdapter implements CodexAdapter {
     this.retiring.abort();
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     // A start in flight sees `destroyed` and closes what it created; wait so no process outlives the adapter.
-    await Promise.allSettled([...this.starting.values()]);
+    await Promise.allSettled([...this.starting.values()].map(start => start.work));
     // A fork in a second process is cut short: its caller reports an unknown outcome and writes nothing more.
     // One still starting is cancelled; one that started is ended the way a worker is.
     for (const starting of this.historyHelpers.keys()) starting.abort(new Error("Pi adapter has been destroyed"));
@@ -1899,6 +1918,7 @@ export class PiRpcAdapter implements CodexAdapter {
   private ensureWorker(sessionId: string, cwd: string, signal?: AbortSignal): Promise<Worker> {
     if (this.destroyed) return Promise.reject(new Error("Pi adapter has been destroyed"));
     if (!isSafePiSessionId(sessionId)) return Promise.reject(new Error("Invalid Pi session id"));
+    if (this.sessionRestartPending(sessionId)) return Promise.reject(new Error("Pi's old process is still exiting"));
     const live = this.workers.get(sessionId);
     if (live && !live.closed && live.client.isAlive) {
       if (!samePiWorkspace(live.cwd, cwd)) return Promise.reject(new Error(`Pi session ${sessionId} is open in another workspace`));
@@ -1906,16 +1926,26 @@ export class PiRpcAdapter implements CodexAdapter {
       return Promise.resolve(live);
     }
     const pending = this.starting.get(sessionId);
-    if (pending) return pending.then(worker => {
+    if (pending) return pending.work.then(worker => {
       if (!samePiWorkspace(worker.cwd, cwd)) throw new Error(`Pi session ${sessionId} is open in another workspace`);
       return worker;
     });
-    const starting = this.startWorker(sessionId, cwd, signal).finally(() => { this.starting.delete(sessionId); });
-    this.starting.set(sessionId, starting);
-    return starting;
+    const controller = new AbortController();
+    const startup: { controller: AbortController; work: Promise<Worker>; client?: PiRpcClient } = {
+      controller,
+      work: this.startWorker(sessionId, cwd, signal, controller.signal,
+        client => { startup.client = client; }).finally(() => {
+        if (this.starting.get(sessionId) === startup) this.starting.delete(sessionId);
+      }),
+    };
+    this.starting.set(sessionId, startup);
+    return startup.work;
   }
 
-  private async startWorker(sessionId: string, cwd: string, signal?: AbortSignal): Promise<Worker> {
+  private async startWorker(sessionId: string, cwd: string, signal: AbortSignal | undefined, restartSignal: AbortSignal, onSpawned: (client: PiRpcClient) => void): Promise<Worker> {
+    // An ordinary turn stop can leave a handshaken worker for future input.
+    // Explicit restart or destruction instead retires it at any setup stage.
+    const startupSignal = AbortSignal.any([restartSignal, this.retiring.signal]);
     await this.store.ensureDirs();
     await mkdir(cwd, { recursive: true });
     cwd = piWorkspaceCwd(cwd);
@@ -1951,7 +1981,7 @@ export class PiRpcAdapter implements CodexAdapter {
       if (this.destroyed) throw new Error("Pi adapter has been destroyed");
       client = await PiRpcClient.start({
         launch: this.options.launch, cwd, args, env: { ...this.options.childEnv, ...(endpoint?.env ?? {}) },
-        signal: signal ? AbortSignal.any([signal, this.retiring.signal]) : this.retiring.signal,
+        signal: signal ? AbortSignal.any([signal, startupSignal]) : startupSignal, onSpawned,
         // Nobody can answer a dialog an extension opens while Pi is still starting; notices are kept for the first turn.
         onExtensionUi: (request, peer) => {
           if (worker) return;
@@ -1976,10 +2006,10 @@ export class PiRpcAdapter implements CodexAdapter {
       throw error instanceof PiStartupError ? new PiStartupError(this.startupMessage(error), error.reason, error.exit) : error;
     }
     if (endpoint) {
-      try { bridge = await untilAborted(endpoint.connection, this.retiring.signal); } catch { bridge = undefined; await endpoint.dispose(); }
+      try { bridge = await untilAborted(endpoint.connection, startupSignal); } catch { bridge = undefined; await endpoint.dispose(); }
     }
     try {
-      const state = await untilAborted(client.request({ type: "get_state" }), this.retiring.signal);
+      const state = await untilAborted(client.request({ type: "get_state" }), startupSignal);
       if (state.sessionId !== sessionId) throw new Error("Pi opened a different session than requested");
       // The adapter may have been retired, or the caller may have given up, while Pi was starting.
       if (this.destroyed) throw new Error("Pi adapter has been destroyed");
@@ -2007,13 +2037,14 @@ export class PiRpcAdapter implements CodexAdapter {
     void bridge?.closed.then(() => { if (!current.closed) { current.bridge = undefined; current.managedSearchPrefix = undefined; this.publishState(current); } });
     if (bridge?.isOpen && managedSearch) {
       try {
-        const registered = await untilAborted(bridge.setMcpServers([{ name: managedSearch.name, config: managedSearch.config }]), this.retiring.signal);
+        const registered = await untilAborted(bridge.setMcpServers([{ name: managedSearch.name, config: managedSearch.config }]), startupSignal);
         if (registered.includes(managedSearch.name)) current.managedSearchPrefix = managedSearch.toolPrefix;
       } catch { /* search is an extra; the session works without it */ }
     }
     // That registration waited on Pi. The adapter may have been retired meanwhile, or the process may
     // have ended: neither is handed out, or filed, as this session's live process.
     if (this.destroyed) { await discard(); throw new Error("Pi adapter has been destroyed"); }
+    if (restartSignal.aborted) { await discard(); throw abortError(); }
     if (current.closed) {
       const failed = new PiStartupError("Pi exited during startup", "exit", await client.exited);
       throw new PiStartupError(this.startupMessage(failed), failed.reason, failed.exit);

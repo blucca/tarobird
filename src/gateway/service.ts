@@ -68,6 +68,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   const activeWorkCount = () => Math.max(gatewayActiveWorkCount(options.runtime), options.getActiveWorkCount?.() ?? 0) + (sideSessions?.activeCount() ?? 0);
   channel.beforeDisconnect = async () => {
     disconnecting = true; for (const timer of blockedPulls.values()) clearTimeout(timer); blockedPulls.clear();
+    options.runtime.chatQueue.abortPauses(key => typeof key === "string" && key.startsWith("lark:gw_"));
     for (const [key, run] of options.runtime.activeRuns) if (key.startsWith("lark:gw_")) run.abortController.abort();
     for (const [key, runs] of options.runtime.concurrentRuns) if (key.startsWith("lark:gw_")) for (const run of runs) run.abortController.abort();
     for (const pending of options.runtime.pendingApprovals.values()) if (pending.asyncQuestion && pending.conversationKey?.startsWith("lark:gw_")) pending.abortHandler?.();
@@ -337,7 +338,8 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     if (method === "commands") {
       const { query } = z.object({ query: z.string() }).parse(raw);
       const config = await loadInstanceConfig(options.stateDir);
-      return gatewayCommands(config.engine, query, config.engine === "antigravity" ? bridge.advertisedCommands?.() : undefined).map((c) => ({ command: c.command, description: c.description }));
+      return gatewayCommands(config.engine, query, config.engine === "antigravity" ? bridge.advertisedCommands?.() : undefined,
+        bridge.supportsConversationRestart?.() ?? false).map((c) => ({ command: c.command, description: c.description }));
     }
     // Local authenticated Hub only; client HTTP never accepts state paths.
     if (method === "diagnostics") return z.json().parse(await readBotDiagnostics(options.stateDir, raw));

@@ -176,6 +176,7 @@ it("adds curated and advertised Antigravity native commands to the App menu with
 });
 
 it("offers /restart only for engines that can restart one conversation's process", () => {
-  for (const engine of ["claude", "antigravity", "pi"]) expect(gatewayCommands(engine).map((c) => c.command)).toContain("restart");
-  for (const engine of ["codex", "kimi", "deepseek"]) expect(gatewayCommands(engine).map((c) => c.command)).not.toContain("restart");
+  for (const engine of ["claude", "pi"]) expect(gatewayCommands(engine).map((c) => c.command)).toContain("restart");
+  for (const engine of ["codex", "kimi", "deepseek", "antigravity"]) expect(gatewayCommands(engine).map((c) => c.command)).not.toContain("restart");
+  expect(gatewayCommands("antigravity", "", [], true).map(c => c.command)).toContain("restart");
 });

@@ -60,6 +60,41 @@ async function sharedSession(bound: Record<string, string>) {
 }
 
 describe("Bridge native turn ownership for a shared session", () => {
+  it("cannot restart a process shared by two conversations", async () => {
+    const session = `shared-${randomUUID()}`;
+    const fixture = await sharedSession({ [A]: session, [B]: session });
+    void fixture.turn(A, "Keep running");
+    const child = await fixture.child();
+    const stop = vi.spyOn(fixture.adapter, "restartSession");
+    const onStopping = vi.fn();
+    await expect(fixture.bridge.createAuthenticatedSurface().restartConversationSession({
+      ...scope(B), signal: new AbortController().signal, isCurrentBinding: async () => true, confirm: async () => true, onStopping,
+    })).resolves.toBe("shared_session");
+    expect(stop).not.toHaveBeenCalled();
+    expect(onStopping).not.toHaveBeenCalled();
+    expect(child.prompts()).toHaveLength(1);
+  });
+
+  it("does not close a worker after the selected binding changes during confirmation", async () => {
+    const session = `restart-${randomUUID()}`;
+    const fixture = await sharedSession({ [A]: session });
+    const stop = vi.spyOn(fixture.adapter, "restartSession");
+    const onStopping = vi.fn();
+    vi.spyOn(fixture.adapter, "listTasks").mockResolvedValue({ supported: true, tasks: [{
+      id: "draft", label: "Draft review", kind: "subagent", mode: "background", status: "running", canStop: true, updatedAt: 1,
+    }] });
+    const confirm = vi.fn(async () => {
+      await fixture.bind(A, "new-binding");
+      return true;
+    });
+    await expect(fixture.bridge.restartConversationSession({
+      ...scope(A), signal: new AbortController().signal, isCurrentBinding: async () => true, confirm, onStopping,
+    })).resolves.toBe("binding_changed");
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(stop).not.toHaveBeenCalled();
+    expect(onStopping).not.toHaveBeenCalled();
+  });
+
   it("queues the waiting conversation's input and keeps the running conversation's native input", async () => {
     const SESSION = `shared-${randomUUID()}`;
     const f = await sharedSession({ [A]: SESSION, [B]: SESSION });

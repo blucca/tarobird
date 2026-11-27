@@ -824,9 +824,8 @@ export function renderCoreDroppedBurstNotice(count: number, locale: Locale): str
     : `已同时取消 ${count} 条尚未合并成任务的待发送消息。`;
 }
 
-/** Shared by /stop, the run card and Gateway's composer stop control.
- * Call only after surface authorization. Queued turns are intentionally kept. */
-export async function stopCoreConversation(runtime: CoreServiceRuntime, conversationKey: string, stateDir?: string) {
+/** Interrupt current work and its outstanding questions while retaining all pending inputs. */
+export function abortCoreConversation(runtime: CoreServiceRuntime, conversationKey: string) {
   const active = runtime.activeRuns.get(conversationKey);
   const reason = channelProfile() === "gateway" ? APP_USER_STOP_REASON : undefined;
   // Let a goal route stop to its live ordinary turns before they are aborted;
@@ -840,13 +839,20 @@ export async function stopCoreConversation(runtime: CoreServiceRuntime, conversa
   const cancelledQuestions = [...runtime.pendingApprovals.values()].filter(p => p.asyncQuestion && p.conversationKey === conversationKey
     && (!survivingGoal || p.abortSignal !== survivingGoal));
   for (const pending of cancelledQuestions) pending.abortHandler?.();
+  return { active, cancelledQuestions: cancelledQuestions.length };
+}
+
+/** Shared by /stop, the run card and Gateway's composer stop control.
+ * Call only after surface authorization. Queued turns are intentionally kept. */
+export async function stopCoreConversation(runtime: CoreServiceRuntime, conversationKey: string, stateDir?: string) {
+  const stopped = abortCoreConversation(runtime, conversationKey);
   const droppedBurst = dropPendingCoreAttachmentBurst(runtime, conversationKey);
   if (droppedBurst && stateDir) {
     await Promise.allSettled(droppedBurst.members.map((member) => appendCoreTimelineEvent(stateDir, member, {
       type: "command.handled", outcome: "noop", detail: "batch-cancelled",
     })));
   }
-  return { active, droppedBurst, cancelledQuestions: cancelledQuestions.length };
+  return { ...stopped, droppedBurst };
 }
 
 /** Stops only the run executing one queued input, never another turn of the

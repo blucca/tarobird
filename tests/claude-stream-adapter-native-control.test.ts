@@ -628,9 +628,13 @@ describe("Claude unconfirmed stop recovery", () => {
       const stop = new AbortController();
       const { turn } = await liveTurn(adapter, children, "stuck", stop);
       const ended = expect(turn).rejects.toThrow();
-      await expect(adapter.restartSession(SESSION)).resolves.toEqual({ outcome: "restarted" });
+      const closing = adapter.restartSession(SESSION);
       await ended;
       expect(killSpy).toHaveBeenCalledTimes(1);
+      expect(adapter.sessionRestartPending(SESSION)).toBeInstanceOf(Promise);
+      await expect(adapter.sendUserMessage(SESSION, { text: "too early", files: [] })).rejects.toThrow("still exiting");
+      children[0]!.close(0);
+      await expect(closing).resolves.toEqual({ outcome: "closed" });
       await expect(adapter.restartSession(SESSION)).resolves.toEqual({ outcome: "not_running" });
       const next = adapter.sendUserMessage(SESSION, { text: "again", files: [] });
       void next.catch(() => undefined);
@@ -638,6 +642,20 @@ describe("Claude unconfirmed stop recovery", () => {
       expect(children).toHaveLength(2);
       for (const args of spawned) expect(args.slice(args.indexOf("-r"), args.indexOf("-r") + 2)).toEqual(["-r", SESSION]);
     } finally { vi.useRealTimers(); }
+  });
+
+  it("includes a tracked legacy background receipt in restart impact with a stable task handle", async () => {
+    const { adapter, children } = setup();
+    try {
+      const { child, turn } = await startTurn(adapter, children, { text: "Review" });
+      void turn.catch(() => undefined);
+      emit(child, { type: "system", subtype: "task_started", task_id: "legacy_task", summary: "Draft review" });
+      const tasks = await adapter.listRestartTasks(SESSION);
+      expect(tasks).toContainEqual(expect.objectContaining({ label: "Draft review", mode: "background", status: "running" }));
+      expect(await adapter.listRestartTasks(SESSION)).toEqual(tasks);
+    } finally {
+      await adapter.destroy();
+    }
   });
 
   it("offers a recovery token only for an unconfirmed stop and force-stops exactly that worker", async () => {
