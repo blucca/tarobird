@@ -30,7 +30,7 @@
     display:flex; flex-wrap:wrap; align-items:center; gap:0 8px; padding-bottom:4px;
   }
   :root:is([data-platform=ios],[data-platform=android]) .composer-accessories.is-phone:has(> .claude-send-choice):not(:has(.conversation-task-bar)) > .prompt-queue {
-    flex:1 1 115px; height:auto; min-height:44px; margin:0; min-width:0; max-width:100%;
+    order:0; flex:1 1 115px; height:auto; min-height:44px; margin:0; min-width:0; max-width:100%;
   }
   :root:is([data-platform=ios],[data-platform=android]) .composer-accessories.is-phone:has(> .claude-send-choice):not(:has(.conversation-task-bar)) > .prompt-queue[data-state] { flex-basis:max-content; }
   :root:is([data-platform=ios],[data-platform=android]) .composer-accessories.is-phone:has(> .claude-send-choice):not(:has(.conversation-task-bar)) .prompt-queue[data-state=paused] .prompt-queue-next { flex:none; overflow:visible; }
@@ -168,10 +168,13 @@
 .composer-accessories.is-compact:has(> .claude-send-choice):not(:has(.has-dock)) { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; column-gap:6px; flex:none; min-width:0; }
 .composer-accessories.is-compact:has(> .claude-send-choice):not(:has(.has-dock)) > .engine-tasks { display:contents; }
 .composer-accessories.is-compact:has(> .claude-send-choice):not(:has(.has-dock)) .conversation-task-bar { grid-column:1; grid-row:2; min-width:0; margin:0; border:0; background:transparent; }
-.composer-accessories.is-compact:has(> .claude-send-choice):not(:has(.has-dock)):not(:has(.conversation-task-bar)) > .pi-session-controls { grid-column:1; grid-row:2; min-width:0; }
 .composer-accessories.is-compact:has(> .claude-send-choice):not(:has(.has-dock)) > .claude-send-choice { grid-column:2; grid-row:2; margin:0; }
 .composer-accessories.is-compact:has(> .claude-send-choice):not(:has(.has-dock)) > .prompt-queue { grid-column:1 / -1; grid-row:1; }
 .composer-accessories.is-compact:has(> .claude-send-choice):not(:has(.has-dock)) .engine-tasks-trigger:not(.is-compact) { min-height:32px; padding:0 4px; gap:4px; min-width:0; }
+.composer-accessories.is-compact:has(> .claude-send-choice):has(> .pi-session-controls):where(:not(:has(.has-dock)):not(:has(.conversation-task-bar))) { display:flex; flex-wrap:wrap; align-items:center; gap:0 6px; flex:none; min-width:0; }
+.composer-accessories.is-compact:has(> .claude-send-choice):has(> .pi-session-controls):where(:not(:has(.has-dock)):not(:has(.conversation-task-bar))) > .prompt-queue { order:-1; flex:0 0 100%; margin-inline:0; }
+.composer-accessories.is-compact:has(> .claude-send-choice):has(> .pi-session-controls):where(:not(:has(.has-dock)):not(:has(.conversation-task-bar))) > .pi-session-controls { flex:1 1 8em; min-width:0; }
+.composer-accessories.is-compact:has(> .claude-send-choice):has(> .pi-session-controls):where(:not(:has(.has-dock)):not(:has(.conversation-task-bar))) > .claude-send-choice { flex:0 1 auto; max-width:100%; margin:0 0 0 auto; }
 
 @media(max-width:760px) {
   .composer-accessories.is-compact:has(> .claude-send-choice):not(:has(.has-dock)) .engine-tasks-trigger:not(.is-compact) { min-height:44px; }
