@@ -16,6 +16,7 @@ import {
   quotaScopeSchema,
 } from "../src/client-protocol/engine-quota.js";
 import { bootstrapTrusted } from "./helpers/pairing-invite.js";
+import { quotaDirectorySchema as releasedDirectorySchema, quotaScopeSchema as releasedScopeSchema } from "./helpers/quota-schema-1.6.0.js";
 import { engineQuotaCommand } from "../src/host-cli/engine-quota.js";
 
 let root: string, hub: HubServer, token: string, transport: GatewayTransport;
@@ -212,6 +213,74 @@ it("gates currency balances behind engines.quota.currency.v1 so v1.6.0 clients s
 
     const v2Scope = quotaScopeSchema.parse(await (await request("/api/engine-quotas/deepseek_bot?balances=currency")).json());
     expect(v2Scope.pools[0]?.balances[0]).toMatchObject({ id: "recharge_cny", kind: "currency", amount: "42.00", unit: "CNY" });
+  } finally {
+    await dshTransport.disconnect();
+  }
+});
+
+// #111 (Kimi top-up) and #112 (DeepSeek wallet) share one negotiation, one schema and one projection.
+it("one Hub reply carries the Kimi and the DeepSeek balance for ?balances=currency, and a 1.6.0 client can parse what it gets without it", async () => {
+  const now = Date.now(), observedAt = new Date(now).toISOString(), expiresAt = new Date(now + 60_000).toISOString();
+  // The fixture Bot answers with a Kimi-shaped pool: a plan window, a credits balance and the top-up pack.
+  read.mockImplementation(async () => ({
+    revision: "revision_kimi",
+    snapshot: {
+      authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "unknown", observedAt, lastAttemptAt: observedAt, constraints: [], help: "kimi_usage",
+      pools: [{ id: "kimi", label: "Kimi Code", sharing: "shared", availability: "unknown", constraints: [],
+        windows: [{ id: "five_hour", label: "5 hours", metric: "percent", usedPercent: 10, availability: "unknown", observedAt, expiresAt }],
+        balances: [
+          { id: "credits", kind: "credits", amount: "5.00", unit: "credits", observedAt, expiresAt },
+          { id: "top_up", kind: "currency", amount: "45.50", unit: "CNY", observedAt, expiresAt },
+        ] }],
+    },
+  }));
+  // A second Bot answers with DeepSeek's wallet: currency balances and nothing else.
+  const dshSecret = randomBytes(32).toString("base64url");
+  await hub.store.db.run("INSERT INTO bots(id,name,secret_hash,engine) VALUES('deepseek_bot','DeepSeek Bot',?,'deepseek')", [hashSecret(dshSecret)]);
+  const dshTransport = new GatewayTransport({ stateDir: path.join(root, "gateway-dsh"), url: hub.instanceUrl.replace("http", "ws") + "/instance", botId: "deepseek_bot", secret: dshSecret, engine: "deepseek" });
+  const dshHandle = gatewayEngineQuota({ botId: "deepseek_bot", engine: "deepseek", read: async () => ({
+    revision: "dsh_rev",
+    snapshot: {
+      authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "unknown", observedAt, lastAttemptAt: observedAt, constraints: [], help: "deepseek_balance",
+      pools: [{ id: "deepseek_wallet", label: "DeepSeek", sharing: "shared", availability: "unknown", windows: [], constraints: [],
+        balances: [
+          { id: "recharge_cny", kind: "currency", amount: "42.00", unit: "CNY", observedAt, expiresAt },
+          { id: "bonus_cny", kind: "currency", amount: "5.25", unit: "CNY", observedAt, expiresAt },
+        ] }],
+    },
+  }) });
+  dshTransport.onCall = (method, params) => { if (method !== "quota.get") throw new Error("unexpected_method"); return dshHandle(params); };
+  let attached!: () => void;
+  const ready = new Promise<void>(resolve => { attached = resolve; });
+  dshTransport.onBoot = async () => attached();
+  await dshTransport.connect();
+  await ready;
+  const json = async (route: string) => { const response = await request(route); expect(response.status).toBe(200); return response.json() as Promise<unknown>; };
+  try {
+    // An updated App or CLI: both balances, in one schema.
+    const full = quotaDirectorySchema.parse(await json("/api/engine-quotas?balances=currency"));
+    const balances = (id: string) => full.scopes.find(scope => scope.id === id)!.pools.flatMap(pool => pool.balances.map(balance => [balance.id, balance.kind, balance.amount, balance.unit]));
+    expect(balances("quota_bot")).toEqual([["credits", "credits", "5.00", "credits"], ["top_up", "currency", "45.50", "CNY"]]);
+    expect(balances("deepseek_bot")).toEqual([["recharge_cny", "currency", "42.00", "CNY"], ["bonus_cny", "currency", "5.25", "CNY"]]);
+    expect(quotaScopeSchema.parse(await json("/api/engine-quotas/quota_bot?balances=currency")).pools[0]!.balances.map(balance => balance.id)).toEqual(["credits", "top_up"]);
+    expect(quotaScopeSchema.parse(await json("/api/engine-quotas/deepseek_bot?refresh=1&revision=dsh_rev&balances=currency")).pools[0]!.balances.map(balance => balance.id)).toEqual(["recharge_cny", "bonus_cny"]);
+    // That reply is not one a 1.6.0 client could read: the gate is what keeps it working.
+    expect(releasedDirectorySchema.safeParse(await json("/api/engine-quotas?balances=currency")).success).toBe(false);
+
+    // A 1.6.0 App or CLI asks without the parameter. Its closed schema accepts the directory, a single scope
+    // and an explicit refresh; the Kimi windows stay, and the wallet-only reading is "no data", not an empty "read".
+    const released = releasedDirectorySchema.parse(await json("/api/engine-quotas"));
+    const kimi = released.scopes.find(scope => scope.id === "quota_bot")!, deepseek = released.scopes.find(scope => scope.id === "deepseek_bot")!;
+    expect(kimi).toMatchObject({ state: "ready", observedAt, pools: [{ id: "kimi", windows: [{ id: "five_hour" }], balances: [{ id: "credits", kind: "credits", unit: "credits" }] }] });
+    expect(deepseek).toMatchObject({ state: "unknown", pools: [], help: "deepseek_balance" });
+    expect(deepseek.observedAt).toBeUndefined();
+    expect(releasedScopeSchema.parse(await json("/api/engine-quotas/quota_bot")).pools[0]!.balances.map(balance => balance.id)).toEqual(["credits"]);
+    expect(releasedScopeSchema.parse(await json("/api/engine-quotas/deepseek_bot")).pools).toEqual([]);
+    expect(releasedScopeSchema.parse(await json("/api/engine-quotas/quota_bot?refresh=1&revision=revision_kimi")).pools[0]!.balances.map(balance => balance.id)).toEqual(["credits"]);
+    expect(releasedScopeSchema.parse(await json("/api/engine-quotas/deepseek_bot?refresh=1&revision=dsh_rev"))).toMatchObject({ state: "unknown", pools: [] });
+    // No request header takes part: the App's native transports allow only a fixed short list.
+    const preflight = await fetch(hub.url + "/api/engine-quotas", { method: "OPTIONS" });
+    expect(preflight.headers.get("access-control-allow-headers")).toBe("Authorization, Content-Type, Range, If-Range");
   } finally {
     await dshTransport.disconnect();
   }

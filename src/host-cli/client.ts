@@ -176,24 +176,24 @@ export class LocalHostClient {
   supports(capability: string): boolean { return this.ready.serverCapabilities.includes(capability); }
   get bots(): Bot[] { return this.ready.bots.filter(bot => !bot.deletedAt) as Bot[]; }
   close(): void { this.closed = true; }
-  async request<T = unknown>(route: string, method = "GET", body?: unknown, headers?: Record<string, string>): Promise<T> {
+  async request<T = unknown>(route: string, method = "GET", body?: unknown): Promise<T> {
     const payload = body === undefined ? undefined : JSON.stringify(body);
     if (payload && Buffer.byteLength(payload) > (route === "/api/bot-messages/local" ? 12 * 1024 * 1024 : MAX_REPLY_BYTES)) throw new HostCliError("cli_request_too_large");
-    return this.exchange<T>(route, method, payload === undefined ? undefined : Buffer.from(payload), "application/json", headers);
+    return this.exchange<T>(route, method, payload === undefined ? undefined : Buffer.from(payload), "application/json");
   }
   /** One upload chunk to the same authenticated upload API the App uses. */
   async putChunk<T = unknown>(route: string, bytes: Buffer): Promise<T> {
     if (!/^\/api\/uploads\/[A-Za-z0-9_-]+\/\d+$/.test(route) || bytes.length > CHUNK_BYTES) throw new HostCliError("cli_request_too_large");
     return this.exchange<T>(route, "PUT", bytes, "application/octet-stream");
   }
-  private async exchange<T>(route: string, method: string, payload: Buffer | undefined, contentType: string, extraHeaders?: Record<string, string>): Promise<T> {
+  private async exchange<T>(route: string, method: string, payload: Buffer | undefined, contentType: string): Promise<T> {
     if (this.closed) throw new HostCliError("cli_client_closed");
     if (Date.now() >= this.ready.expiresAt) throw new HostCliError("session_expired");
     if (!/^\/api\/[A-Za-z0-9_/?=&.%+-]+$/.test(route) || route.includes("..")) throw new HostCliError("cli_invalid_api_path");
     const replyLimit = method === "GET" && /^\/api\/conversations\/[A-Za-z0-9_-]+\/messages(?:\?|$)/.test(route) ? MAX_MESSAGE_PAGE_REPLY_BYTES : MAX_REPLY_BYTES;
     return new Promise<T>((resolve, reject) => {
       const request = httpRequest(this.url + route, {
-        method, headers: { ...extraHeaders, Authorization: `Bearer ${this.#token}`, ...(payload ? { "Content-Type": contentType, "Content-Length": payload.length } : {}) },
+        method, headers: { Authorization: `Bearer ${this.#token}`, ...(payload ? { "Content-Type": contentType, "Content-Length": payload.length } : {}) },
       }, response => {
         let bytes = 0; const chunks: Buffer[] = [];
         response.on("data", (chunk: Buffer) => { bytes += chunk.length; if (bytes > replyLimit) request.destroy(new HostCliError("cli_response_too_large")); else chunks.push(chunk); });
