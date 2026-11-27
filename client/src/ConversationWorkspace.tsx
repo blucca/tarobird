@@ -27,6 +27,7 @@ import { nativeRun } from "../../src/client-protocol/run.js";
 import { runChangesSummarySchema } from "../../src/client-protocol/run-changes.js";
 import type { Bot, HubConnection } from "./connection.js";
 import { WorkspaceRunChanges } from "./WorkspaceRunChanges.js";
+import { engineTaskStatus } from "./EngineTasks.js";
 import { listWorkbenchLibrary, type WorkbenchLibraryEntry } from "./workbench-library.js";
 import type { WorkbenchFileTarget } from "./workbench-library-context.js";
 import { t, useLocale } from "./i18n.js";
@@ -709,21 +710,23 @@ export function ConversationWorkspace({
                   </button>
                 )}
               </div>
-              {swarmSnapshot && (
-                <div className="workspace-item-row">
-                  <span className="workspace-item-icon"><span className={`status-dot${swarmSnapshot.active ? " online" : ""}`}/></span>
-                  <span className="workspace-item-main">
-                    <span className="workspace-item-title">{swarmSnapshot.title || "Swarm"}</span>
-                    <span className="workspace-item-meta">
-                      {swarmSnapshot.active
-                        ? t("Swarm 进行中 · {0} 位活跃成员，{1} 条看板动态", swarmSnapshot.members.filter(m => m.state === "working" || m.state === "waiting" || m.state === "paused").length, swarmSnapshot.posts.length)
-                        : t("Swarm 已结束 · {0} 位成员，{1} 条看板动态", swarmSnapshot.members.length, swarmSnapshot.posts.length)}
-                    </span>
-                  </span>
-                </div>
-              )}
               {activeTasks.length > 0 || queuedItems.length > 0 || streamingBots.length > 0 || swarmSnapshot ? (
                 <div className="workspace-list">
+                  {swarmSnapshot && (
+                    <div className="workspace-item-row">
+                      <span className="workspace-item-icon"><span className={`status-dot${swarmSnapshot.active ? " online" : ""}`}/></span>
+                      <span className="workspace-item-main">
+                        <span className="workspace-item-title">{swarmSnapshot.title || "Swarm"}</span>
+                        <span className="workspace-item-meta">
+                          {swarmSnapshot.active
+                            ? t("Swarm 进行中 · {0} 位活跃成员，{1} 条看板动态", swarmSnapshot.members.filter(m => m.state === "working" || m.state === "waiting" || m.state === "paused").length, swarmSnapshot.posts.length)
+                            : swarmSnapshot.statusText === "Stopped by user"
+                              ? t("Swarm 已停止 · {0} 位成员，{1} 条看板动态", swarmSnapshot.members.length, swarmSnapshot.posts.length)
+                              : t("Swarm 已结束 · {0} 位成员，{1} 条看板动态", swarmSnapshot.members.length, swarmSnapshot.posts.length)}
+                        </span>
+                      </span>
+                    </div>
+                  )}
                   {streamingBots.length > 0 && activeTasks.length === 0 && (
                     <div className="workspace-item-row">
                       <span className="workspace-item-icon"><span className="status-dot online"/></span>
@@ -738,7 +741,7 @@ export function ConversationWorkspace({
                       <span className="workspace-item-icon"><span className="status-dot online"/></span>
                       <span className="workspace-item-main">
                         <span className="workspace-item-title">{task.label || task.id}</span>
-                        <span className="workspace-item-meta">{task.swarmState ? `${t("Swarm Worker")} · ${task.swarmState}` : task.kind === "subagent" ? t("子代理") : task.kind === "shell" ? t("后台命令") : t("后台任务")}</span>
+                        <span className="workspace-item-meta">{task.swarmState ? `${t("Swarm Worker")} · ${engineTaskStatus(task)}` : task.kind === "subagent" ? t("子代理") : task.kind === "shell" ? t("后台命令") : t("后台任务")}</span>
                       </span>
                     </div>
                   ))}

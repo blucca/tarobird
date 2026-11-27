@@ -13,17 +13,19 @@ import "./engine-tasks.css";
 type StopReceipt = { requestId: string; state: "waiting" | "accepted" | "unknown" | "rejected"; retryable?: boolean };
 const receipts = new WeakMap<HubConnection, Map<string, StopReceipt>>();
 function requestStore(connection: HubConnection) { let values = receipts.get(connection); if (!values) { values = new Map(); receipts.set(connection, values); } return values; }
-export function engineTaskStatus(task: EngineTask) {
-  if (task.swarmState) {
-    switch (task.swarmState) {
-      case "working": return t("工作中");
-      case "waiting": return t("等待中");
-      case "killed": return t("已终止");
-      case "done": return t("已完成");
-      case "paused": return t("受配额暂停");
-      case "unknown": return t("状态待确认");
-    }
+export function swarmMemberStateLabel(state: SwarmMemberState): string {
+  switch (state) {
+    case "working": return t("工作中");
+    case "waiting": return t("等待中");
+    case "killed": return t("已终止");
+    case "done": return t("已完成");
+    case "paused": return t("受配额暂停");
+    case "unknown": return t("状态待确认");
   }
+}
+
+export function engineTaskStatus(task: EngineTask) {
+  if (task.swarmState) return swarmMemberStateLabel(task.swarmState);
   return t(task.status === "running" ? "执行中" : task.status === "done" ? "已完成" : task.status === "stopped" ? "已停止" : task.status === "error" ? "失败" : "状态待确认");
 }
 
@@ -59,10 +61,24 @@ export function EngineTasks({ connection, conversationId, botId, active, online,
   const [stale, setStale] = useState(false), [error, setError] = useState(""), [revision, setRevision] = useState(0), [bulk, setBulk] = useState(false);
   const [tab, setTab] = useState<"tasks" | "board">("tasks");
   const [workerFilter, setWorkerFilter] = useState<string>("all");
-  const trigger = useRef<HTMLButtonElement>(null), alive = useRef(true), busy = useRef(new Set<string>());
+  const trigger = useRef<HTMLButtonElement>(null), alive = useRef(true), busy = useRef(new Set<string>()), pendingMention = useRef<string | undefined>(undefined);
   const route = `/api/conversations/${conversationId}/tasks`, stops = requestStore(connection), receiptKey = (id: string) => `${conversationId}:${botId}:${id}`;
   useEffect(() => { alive.current = true; return () => { alive.current = false; onSwarmMembersChange?.([]); }; }, [onSwarmMembersChange]);
   useEffect(() => { if (!active) setOpened(false); }, [active]);
+  // Deliver @worker mention after CreationDialog's useLayoutEffect unmount
+  // cleanup finishes restoring modal focus, so composer focus is not stolen back.
+  useEffect(() => {
+    if (!opened && pendingMention.current) {
+      const name = pendingMention.current;
+      pendingMention.current = undefined;
+      onMentionWorker?.(name);
+    }
+  }, [opened, onMentionWorker]);
+  const triggerMentionWorker = (name: string) => {
+    if (!onMentionWorker) return;
+    pendingMention.current = name;
+    setOpened(false);
+  };
   // Opening is a one-shot UI request. Retaining it in App would reopen a closed
   // dialog when this keyed conversation remounts after navigation or search.
   useEffect(() => {
@@ -104,8 +120,8 @@ export function EngineTasks({ connection, conversationId, botId, active, online,
 
   const swarm = snapshot?.swarm;
   useEffect(() => {
-    if (!swarm && tab === "board") setTab("tasks");
-  }, [swarm, tab]);
+    if (snapshot && !swarm && tab === "board") setTab("tasks");
+  }, [snapshot, swarm, tab]);
 
   const stop = async (task: EngineTask, retry = false) => {
     if (!online || !active || stale || !task.canStop || task.status !== "running" || busy.current.has(task.id)) return;
@@ -147,7 +163,12 @@ export function EngineTasks({ connection, conversationId, botId, active, online,
   const helperTasks = useMemo(() => sortTasksForView(tasks.filter(task => !!task.helper)), [tasks]);
   const swarmWorkersRunning = tasks.filter(task => task.kind === "subagent" && task.status === "running").length;
   const affected = activity ? affectedBackgroundTasks(snapshot) : [];
-  const stopNotice = affected.length ? t("停止当前轮次也会结束 {0} 个后台{1}；可在任务列表单独停止。", affected.length, t(snapshot?.foregroundStopScope === "all" ? "任务" : "子代理")) : "";
+  const canStopIndividually = affected.some(task => task.canStop);
+  const stopNotice = affected.length
+    ? canStopIndividually
+      ? t("停止当前轮次也会结束 {0} 个后台{1}；可在任务列表单独停止。", affected.length, t(snapshot?.foregroundStopScope === "all" ? "任务" : "子代理"))
+      : t("停止当前轮次也会结束 {0} 个后台{1}。", affected.length, t(snapshot?.foregroundStopScope === "all" ? "任务" : "子代理"))
+    : "";
   const stopBackground = async () => {
     // Capture this explicit selection. Tasks started after the click are not
     // implicitly added to a destructive operation or its retry.
@@ -217,8 +238,8 @@ export function EngineTasks({ connection, conversationId, botId, active, online,
       </div>
       {parent && <p className="engine-task-parent">{t("所属任务：{0}", parent.label)}</p>}
       {task.progress && <details className="engine-task-progress" open={Boolean(swarm)}><summary>{t("最近进展")}</summary><p>{task.progress}</p></details>}
-      {swarm?.active && onMentionWorker && task.kind === "subagent" && !task.parentId && !task.helper && (
-        <button type="button" className="engine-task-mention" onClick={() => { onMentionWorker(task.label); setOpened(false); }}>
+      {swarm?.active && onMentionWorker && task.kind === "subagent" && task.status === "running" && !task.parentId && !task.helper && (
+        <button type="button" className="engine-task-mention" onClick={() => triggerMentionWorker(task.label)}>
           <AtSign size={12}/>{t("向 @{0} 发消息", task.label)}
         </button>
       )}
@@ -302,6 +323,8 @@ export function EngineTasks({ connection, conversationId, botId, active, online,
                   </section>
                 )}
               </div>
+      ) : !snapshot ? (
+        <p className="engine-tasks-empty">{t("正在加载…")}</p>
       ) : swarm ? (
         <div className="swarm-board-view">
           <div className="swarm-board-meta">
@@ -331,6 +354,14 @@ export function EngineTasks({ connection, conversationId, botId, active, online,
             <div className="swarm-board-posts">
               {filteredPosts.map(post => {
                 const member = swarm.members.find(m => m.name.toLowerCase() === post.author.toLowerCase());
+                const canMentionAuthor = Boolean(
+                  swarm.active
+                  && onMentionWorker
+                  && post.author.toLowerCase() !== "system"
+                  && member
+                  && !member.helper
+                  && (member.state === "working" || member.state === "waiting" || member.state === "paused"),
+                );
                 return (
                   <article className="swarm-post-card" key={post.id} aria-label={`${post.author}`}>
                     <header className="swarm-post-header">
@@ -343,14 +374,14 @@ export function EngineTasks({ connection, conversationId, botId, active, online,
                     </header>
                     {post.title && <div className="swarm-post-title">{post.title}</div>}
                     <p className="swarm-post-content">{post.content}</p>
-                    {((post.mentions ?? []).length > 0 || (swarm.active && onMentionWorker && post.author.toLowerCase() !== "system")) && (
+                    {((post.mentions ?? []).length > 0 || canMentionAuthor) && (
                       <footer className="swarm-post-footer">
                         <div className="swarm-post-mentions">
                           {(post.mentions ?? []).map(m => <span key={m} className="engine-task-chip">@{m}</span>)}
                         </div>
-                        {swarm.active && onMentionWorker && post.author.toLowerCase() !== "system" && (
-                          <button type="button" className="engine-task-mention" onClick={() => { onMentionWorker(post.author); setOpened(false); }}>
-                            <AtSign size={12}/>{t("向 @{0} 发消息", post.author)}
+                        {canMentionAuthor && member && (
+                          <button type="button" className="engine-task-mention" onClick={() => triggerMentionWorker(member.name)}>
+                            <AtSign size={12}/>{t("向 @{0} 发消息", member.name)}
                           </button>
                         )}
                       </footer>

@@ -5682,7 +5682,6 @@
   "Swarm 已结束": "Swarm finished",
   "Swarm 已停止": "Swarm stopped",
   "停止 Swarm": "Stop Swarm",
-  "正在停止…": "Stopping…",
   "工作中": "Working",
   "等待中": "Waiting",
   "已终止": "Killed",
@@ -5702,7 +5701,9 @@
   "来源：ACP + 本地看板": "Source: ACP + local board",
   "选择 Swarm 成员": "Select Swarm member",
   "Swarm 进行中 · {0} 位活跃成员，{1} 条看板动态": "Swarm active · {0} active workers, {1} board posts",
+  "Swarm 已停止 · {0} 位成员，{1} 条看板动态": "Swarm stopped · {0} workers, {1} board posts",
   "Swarm 已结束 · {0} 位成员，{1} 条看板动态": "Swarm finished · {0} workers, {1} board posts",
+  "停止当前轮次也会结束 {0} 个后台{1}。": "Stopping this turn will also stop {0} background {1}.",
   "查看看板": "Open Board",
   "Swarm Worker": "Swarm Worker"
 }

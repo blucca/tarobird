@@ -1,6 +1,28 @@
+import { existsSync } from "node:fs";
+import path from "node:path";
 import { spawnEngine } from "../runtime/engine-process.js";
 
 const VERSION_PROBE_TIMEOUT_MS = 3_000;
+
+/** Resolves the configured `agy` executable from `ANTIGRAVITY_EXECUTABLE` (stripping surrounding quotes) or default locations. */
+export function resolveAntigravityExecutable(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.ANTIGRAVITY_EXECUTABLE?.trim();
+  if (configured) {
+    return configured.length >= 2 && configured.startsWith("\"") && configured.endsWith("\"")
+      ? configured.slice(1, -1)
+      : configured;
+  }
+  if (process.platform === "win32") {
+    const appData = env.APPDATA ?? (env.USERPROFILE ? path.join(env.USERPROFILE, "AppData", "Roaming") : undefined);
+    if (appData) {
+      const cmd = path.join(appData, "npm", "agy.cmd");
+      if (existsSync(cmd)) return cmd;
+      const ps1 = path.join(appData, "npm", "agy.ps1");
+      if (existsSync(ps1)) return ps1;
+    }
+  }
+  return "agy";
+}
 
 function parseAntigravityVersion(versionOutput: string): { major: number; minor: number; patch: number } | undefined {
   const match = versionOutput.trim().match(/\bv?(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]*)?\b/);

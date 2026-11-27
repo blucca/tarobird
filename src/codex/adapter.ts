@@ -571,7 +571,7 @@ export interface CodexAdapter {
   /** Whether an authoritative advertised-commands snapshot has arrived. */
   hasReceivedAdvertisedCommands?(): boolean;
   /** Stop background native work (such as an active swarm) after its initiating turn ended. */
-  stopBackgroundWork?(sessionId: string, input?: { locale?: "en" | "zh" }): Promise<{ stopped: boolean; summary?: string }>;
+  stopBackgroundWork?(sessionId: string, input?: { locale?: "en" | "zh"; scope?: "swarm" | "all" }): Promise<{ stopped: boolean; summary?: string }>;
   /** Native live tasks; absent means unsupported. Handles must be worker-scoped. */
   listTasks?(sessionId: string): Promise<EngineTaskSnapshot>;
   stopTask?(sessionId: string, input: { taskId: string }): Promise<EngineTaskControlResult>;

@@ -52,14 +52,50 @@ import { mergeTurnInstructions } from "../core/agent-instructions.js";
 import { stripAlreadyDeliveredAppArtifacts, type AppDeliveryReceipt } from "./app-delivery.js";
 import { boundedReportText, groupDiscussionInstructions, groupDiscussionReference, isGroupDiscussionPrompt, parseGroupStance } from "./group-discussion.js";
 import { createGroupDiscussionEventHandler } from "./group-discussion-output.js";
-import { antigravitySupportsSwarm } from "../codex/antigravity-acp-support.js";
+import { antigravitySupportsSwarm, resolveAntigravityExecutable } from "../codex/antigravity-acp-support.js";
 
 export interface GatewayServiceOptions extends GatewayTransportOptions { bridge: CoreBridgeLike; recoverDeliveries?: boolean; notifyRouteAlert?: (alert: RouteAlert) => Promise<void>; requireMentionInGroup?: boolean; runtime: CoreServiceRuntime; getActiveWorkCount?: () => number }
 /** A surface adapter, not another engine/runtime. All maps, the queue, session
  * store, usage ledger, cron runtime and native session lock stay shared. */
+const SWARM_PROBE_NEGATIVE_TTL_MS = 60_000;
+const SWARM_COMMANDS_RACE_MS = 250;
+
 export async function attachGateway(options: GatewayServiceOptions): Promise<GatewayChannel> {
   const attachedAt = Date.now();
-  let swarmVersionSupported: Promise<boolean> | undefined;
+  let swarmProbe: { executable: string; promise: Promise<boolean>; settled: boolean; result?: boolean; expiresAt?: number } | undefined;
+  const startSwarmProbe = () => {
+    const executable = resolveAntigravityExecutable(process.env);
+    const now = Date.now();
+    if (
+      swarmProbe
+      && swarmProbe.executable === executable
+      && (!swarmProbe.settled || swarmProbe.result === true || (swarmProbe.expiresAt !== undefined && swarmProbe.expiresAt > now))
+    ) {
+      return swarmProbe;
+    }
+    const entry: { executable: string; promise: Promise<boolean>; settled: boolean; result?: boolean; expiresAt?: number } = {
+      executable,
+      promise: Promise.resolve(false),
+      settled: false,
+    };
+    entry.promise = antigravitySupportsSwarm(executable, process.env)
+      .catch(() => false)
+      .then((supported) => {
+        entry.settled = true;
+        entry.result = supported;
+        if (!supported) entry.expiresAt = Date.now() + SWARM_PROBE_NEGATIVE_TTL_MS;
+        return supported;
+      });
+    swarmProbe = entry;
+    return entry;
+  };
+  if (options.engine === "antigravity") {
+    void loadInstanceConfig(options.stateDir)
+      .then((cfg) => {
+        if (cfg.engine === "antigravity" && cfg.antigravityRuntime === "acp") void startSwarmProbe();
+      })
+      .catch(() => undefined);
+  }
   const channel = new GatewayChannel(new GatewayTransport(options));
   let disconnecting = false;
   const blockedPulls = new Map<string, ReturnType<typeof setTimeout>>();
@@ -333,12 +369,22 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       const config = await loadInstanceConfig(options.stateDir);
       let engineCommands = config.engine === "antigravity" ? (bridge.advertisedCommands?.() ?? []) : undefined;
       if (config.engine === "antigravity" && config.antigravityRuntime === "acp" && !bridge.hasReceivedAdvertisedCommands?.() && (!engineCommands || engineCommands.length === 0)) {
-        const executable = process.env.ANTIGRAVITY_CMD?.trim() || "agy";
-        swarmVersionSupported ??= antigravitySupportsSwarm(executable, process.env);
-        if (await swarmVersionSupported) {
-          engineCommands = [{ name: "swarm", description: "Start a multi-agent swarm (Preview & Quota Heavy)" }];
+        const probe = startSwarmProbe();
+        let supported: boolean;
+        if (probe.settled) {
+          supported = Boolean(probe.result);
         } else {
-          swarmVersionSupported = undefined;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          supported = await Promise.race([
+            probe.promise,
+            new Promise<boolean>((resolve) => {
+              timer = setTimeout(() => resolve(false), SWARM_COMMANDS_RACE_MS);
+              timer.unref?.();
+            }),
+          ]).finally(() => { if (timer) clearTimeout(timer); });
+        }
+        if (supported) {
+          engineCommands = [{ name: "swarm", description: "Start a multi-agent swarm (Preview & Quota Heavy)" }];
         }
       }
       return gatewayCommands(config.engine, query, engineCommands).map((c) => ({ command: c.command, description: c.description }));

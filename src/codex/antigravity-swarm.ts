@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { open, readFile } from "node:fs/promises";
+import { closeSync, openSync, readSync, statSync, type Stats } from "node:fs";
+import { open } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -10,9 +11,25 @@ const MAX_BOARD_READ_BYTES = 2 * 1024 * 1024;
 const MAX_SWARM_MEMBERS = 64;
 const MAX_SWARM_POSTS = 200;
 
+export type SwarmFileSignature = {
+  mtimeMs: number;
+  size: number;
+  hash: string;
+};
+
+export type SwarmBoardFileCache = {
+  membersMtimeMs: number;
+  membersSize: number;
+  boardMtimeMs: number;
+  boardSize: number;
+  parsed: ParsedSwarmFiles;
+};
+
 export type AcpSwarmMember = SwarmMember & {
   startedAt?: number;
   conversationId?: string;
+  /** True when the member's state was inferred solely from a generic tool call rather than explicit swarm state. */
+  inferredState?: boolean;
 };
 
 export type AcpSwarmState = {
@@ -21,6 +38,8 @@ export type AcpSwarmState = {
   title?: string;
   startedAt: number;
   updatedAt: number;
+  /** Snapshot of any pre-existing members.json file when this swarm started, to ignore stale files from earlier swarms. */
+  baselineMembersSig?: SwarmFileSignature;
   members: Map<string, AcpSwarmMember>;
   posts: SwarmPost[];
 };
@@ -29,11 +48,27 @@ export type ParsedSwarmFiles = {
   found: boolean;
   formatUnknown: boolean;
   active: boolean;
+  explicitlyStopped?: boolean;
   title?: string;
   members: AcpSwarmMember[];
   posts: SwarmPost[];
   updatedAt: number;
+  fileMtimeMs?: number;
+  membersMtimeMs?: number;
+  membersSize?: number;
+  membersHash?: string;
 };
+
+export function emptyParsedSwarmFiles(now = Date.now()): ParsedSwarmFiles {
+  return { found: false, formatUnknown: false, active: false, members: [], posts: [], updatedAt: now };
+}
+
+/** Matches only exact Antigravity swarm management tool names (never broad /board/i tools like whiteboard/clipboard/dashboard). */
+export function isSwarmToolName(name: unknown): boolean {
+  if (typeof name !== "string") return false;
+  const trimmed = name.trim().toLowerCase();
+  return trimmed === "swarm" || /^swarm[_.:/-]/.test(trimmed);
+}
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -119,7 +154,15 @@ function resolveSwarmDir(brainDir: string, sessionId: string): string | null {
   return target;
 }
 
-async function readBoundedText(filePath: string, maxBytes: number, fromTail = false): Promise<{ text: string; truncated: boolean } | null> {
+type BoundedFileRead = {
+  text: string;
+  truncated: boolean;
+  mtimeMs: number;
+  size: number;
+  hash: string;
+};
+
+async function readBoundedText(filePath: string, maxBytes: number, fromTail = false, includeHash = false): Promise<BoundedFileRead | null> {
   let handle;
   try {
     handle = await open(filePath, "r");
@@ -129,20 +172,91 @@ async function readBoundedText(filePath: string, maxBytes: number, fromTail = fa
   try {
     const info = await handle.stat();
     if (!info.isFile()) return null;
-    if (info.size === 0) return { text: "", truncated: false };
+    if (info.size === 0) {
+      return {
+        text: "",
+        truncated: false,
+        mtimeMs: info.mtimeMs,
+        size: 0,
+        hash: includeHash ? createHash("sha256").update("").digest("hex") : "",
+      };
+    }
     const length = Math.min(info.size, maxBytes);
     const offset = fromTail ? Math.max(0, info.size - length) : 0;
     const buffer = Buffer.alloc(length);
     const result = await handle.read(buffer, 0, length, offset);
+    const slice = buffer.subarray(0, result.bytesRead);
     return {
-      text: buffer.subarray(0, result.bytesRead).toString("utf8"),
+      text: slice.toString("utf8"),
       truncated: info.size > maxBytes,
+      mtimeMs: info.mtimeMs,
+      size: info.size,
+      hash: includeHash ? createHash("sha256").update(slice).digest("hex") : "",
     };
   } catch {
     return null;
   } finally {
     await handle.close().catch(() => undefined);
   }
+}
+
+function readBoundedTextSync(filePath: string, maxBytes: number, fromTail = false, includeHash = false): BoundedFileRead | null {
+  let fd: number | undefined;
+  try {
+    const info = statSync(filePath);
+    if (!info.isFile()) return null;
+    if (info.size === 0) {
+      return {
+        text: "",
+        truncated: false,
+        mtimeMs: info.mtimeMs,
+        size: 0,
+        hash: includeHash ? createHash("sha256").update("").digest("hex") : "",
+      };
+    }
+    fd = openSync(filePath, "r");
+    const length = Math.min(info.size, maxBytes);
+    const offset = fromTail ? Math.max(0, info.size - length) : 0;
+    const buffer = Buffer.alloc(length);
+    const bytesRead = readSync(fd, buffer, 0, length, offset);
+    const slice = buffer.subarray(0, bytesRead);
+    return {
+      text: slice.toString("utf8"),
+      truncated: info.size > maxBytes,
+      mtimeMs: info.mtimeMs,
+      size: info.size,
+      hash: includeHash ? createHash("sha256").update(slice).digest("hex") : "",
+    };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+function hasMemberFields(record: Record<string, unknown>): boolean {
+  return record.state !== undefined
+    || record.status !== undefined
+    || record.role !== undefined
+    || record.model !== undefined
+    || record.modelId !== undefined
+    || record.latestActivity !== undefined
+    || record.activity !== undefined
+    || record.lastActivity !== undefined
+    || record.statusText !== undefined
+    || record.lastMessage !== undefined
+    || record.conversationId !== undefined
+    || record.sessionId !== undefined;
+}
+
+export function snapshotSwarmMembersFileSync(brainDir: string, sessionId: string): SwarmFileSignature | undefined {
+  const swarmDir = resolveSwarmDir(brainDir, sessionId);
+  if (!swarmDir) return undefined;
+  const raw = readBoundedTextSync(path.join(swarmDir, "members.json"), MAX_MEMBERS_FILE_BYTES, false, true);
+  if (!raw) return undefined;
+  return { mtimeMs: raw.mtimeMs, size: raw.size, hash: raw.hash };
 }
 
 function normalizeMemberName(raw: string): string {
@@ -243,30 +357,23 @@ function normalizePostEntry(raw: unknown, index: number, fallbackTime: number): 
   };
 }
 
-export async function readSwarmBoardFiles(brainDir: string, sessionId: string): Promise<ParsedSwarmFiles> {
-  const now = Date.now();
-  const empty: ParsedSwarmFiles = { found: false, formatUnknown: false, active: false, members: [], posts: [], updatedAt: now };
-  const swarmDir = resolveSwarmDir(brainDir, sessionId);
-  if (!swarmDir) return empty;
-
-  const [membersRaw, boardRaw] = await Promise.all([
-    readBoundedText(path.join(swarmDir, "members.json"), MAX_MEMBERS_FILE_BYTES, false),
-    readBoundedText(path.join(swarmDir, "board.jsonl"), MAX_BOARD_READ_BYTES, true),
-  ]);
-  if (!membersRaw && !boardRaw) return empty;
+function parseSwarmBoardContents(membersRaw: BoundedFileRead | null, boardRaw: BoundedFileRead | null, now = Date.now()): ParsedSwarmFiles {
+  if (!membersRaw && !boardRaw) return emptyParsedSwarmFiles(now);
 
   let formatUnknown = false;
   let title: string | undefined;
   let explicitStatus: string | undefined;
   const members: AcpSwarmMember[] = [];
   let maxTimestamp = 0;
+  const memberFallbackTime = membersRaw?.mtimeMs ? Math.round(membersRaw.mtimeMs) : now;
+  const boardFallbackTime = boardRaw?.mtimeMs ? Math.round(boardRaw.mtimeMs) : now;
 
   if (membersRaw && membersRaw.text.trim()) {
     try {
       const parsed = JSON.parse(membersRaw.text) as unknown;
       if (Array.isArray(parsed)) {
         for (const item of parsed) {
-          const member = normalizeMemberEntry(item, undefined, now);
+          const member = normalizeMemberEntry(item, undefined, memberFallbackTime);
           if (member) members.push(member);
         }
         if (parsed.length > 0 && members.length === 0) formatUnknown = true;
@@ -283,22 +390,31 @@ export async function readSwarmBoardFiles(brainDir: string, sessionId: string): 
                 : undefined;
           if (list) {
             for (const item of list) {
-              const member = normalizeMemberEntry(item, undefined, now);
+              const member = normalizeMemberEntry(item, undefined, memberFallbackTime);
               if (member) members.push(member);
             }
             if (list.length > 0 && members.length === 0) formatUnknown = true;
           } else {
-            const mapObj = asRecord(record.members) ?? asRecord(record.workers) ?? asRecord(record.roster) ?? record;
-            let sawCandidate = false;
-            for (const [key, value] of Object.entries(mapObj)) {
-              if (["title", "goal", "topic", "status", "state", "updatedAt", "createdAt"].includes(key)) continue;
-              if (value && typeof value === "object" && !Array.isArray(value)) {
-                sawCandidate = true;
-                const member = normalizeMemberEntry(value, key, now);
+            const explicitMap = asRecord(record.members) ?? asRecord(record.workers) ?? asRecord(record.roster);
+            if (explicitMap) {
+              for (const [key, value] of Object.entries(explicitMap)) {
+                const entryRecord = asRecord(value);
+                if (!entryRecord) continue;
+                const member = normalizeMemberEntry(entryRecord, key, memberFallbackTime);
                 if (member) members.push(member);
               }
+              if (Object.keys(explicitMap).length > 0 && members.length === 0) formatUnknown = true;
+            } else {
+              for (const [key, value] of Object.entries(record)) {
+                if (["title", "goal", "topic", "status", "state", "updatedAt", "createdAt", "updated_at", "created_at"].includes(key)) continue;
+                const entryRecord = asRecord(value);
+                if (entryRecord && hasMemberFields(entryRecord)) {
+                  const member = normalizeMemberEntry(entryRecord, key, memberFallbackTime);
+                  if (member) members.push(member);
+                }
+              }
+              if (Object.keys(record).length > 0 && members.length === 0) formatUnknown = true;
             }
-            if (sawCandidate && members.length === 0) formatUnknown = true;
           }
         }
       }
@@ -322,7 +438,7 @@ export async function readSwarmBoardFiles(brainDir: string, sessionId: string): 
         if (record && !title) {
           title = nonEmptyString(record.swarmTitle, 300) ?? nonEmptyString(record.goal, 300);
         }
-        const post = normalizePostEntry(parsed, posts.length, now);
+        const post = normalizePostEntry(parsed, posts.length, boardFallbackTime);
         if (post) {
           posts.push(post);
           if (post.createdAt > maxTimestamp) maxTimestamp = post.createdAt;
@@ -353,15 +469,77 @@ export async function readSwarmBoardFiles(brainDir: string, sessionId: string): 
   const explicitlyStopped = explicitStatus !== undefined && ["done", "completed", "stopped", "killed", "finished"].includes(explicitStatus);
   const explicitlyActive = explicitStatus !== undefined && ["running", "active", "working"].includes(explicitStatus);
   const active = explicitlyStopped ? false : (hasLiveMember || (explicitlyActive && members.length === 0));
+  const fileMtimeMs = Math.max(membersRaw?.mtimeMs ?? 0, boardRaw?.mtimeMs ?? 0) || undefined;
 
   return {
-    found: Boolean(membersRaw || boardRaw),
+    found: true,
     formatUnknown,
     active,
+    ...(explicitlyStopped ? { explicitlyStopped: true } : {}),
     ...(title ? { title } : {}),
     members: members.slice(0, MAX_SWARM_MEMBERS),
     posts: posts.slice(-MAX_SWARM_POSTS),
-    updatedAt: maxTimestamp || now,
+    updatedAt: maxTimestamp || (fileMtimeMs ? Math.round(fileMtimeMs) : now),
+    ...(fileMtimeMs !== undefined ? { fileMtimeMs } : {}),
+    ...(membersRaw ? { membersMtimeMs: membersRaw.mtimeMs, membersSize: membersRaw.size, membersHash: membersRaw.hash } : {}),
+  };
+}
+
+export async function readSwarmBoardFiles(brainDir: string, sessionId: string): Promise<ParsedSwarmFiles> {
+  const now = Date.now();
+  const swarmDir = resolveSwarmDir(brainDir, sessionId);
+  if (!swarmDir) return emptyParsedSwarmFiles(now);
+
+  const [membersRaw, boardRaw] = await Promise.all([
+    readBoundedText(path.join(swarmDir, "members.json"), MAX_MEMBERS_FILE_BYTES, false, true),
+    readBoundedText(path.join(swarmDir, "board.jsonl"), MAX_BOARD_READ_BYTES, true, false),
+  ]);
+  return parseSwarmBoardContents(membersRaw, boardRaw, now);
+}
+
+/**
+ * Synchronous mtime/size-cached board file reader for synchronous lifecycle checks
+ * (`hasPendingNativeWork`, `requestStop`, and resumed session initialization).
+ */
+export function readSwarmBoardFilesSync(
+  brainDir: string,
+  sessionId: string,
+  previousCache?: SwarmBoardFileCache,
+): { cache: SwarmBoardFileCache | undefined; parsed: ParsedSwarmFiles } {
+  const now = Date.now();
+  const swarmDir = resolveSwarmDir(brainDir, sessionId);
+  if (!swarmDir) return { cache: undefined, parsed: emptyParsedSwarmFiles(now) };
+
+  const membersPath = path.join(swarmDir, "members.json");
+  const boardPath = path.join(swarmDir, "board.jsonl");
+  let membersStat: Stats | undefined;
+  let boardStat: Stats | undefined;
+  try { membersStat = statSync(membersPath); } catch { /* missing */ }
+  try { boardStat = statSync(boardPath); } catch { /* missing */ }
+  const hasMembers = Boolean(membersStat?.isFile());
+  const hasBoard = Boolean(boardStat?.isFile());
+  if (!hasMembers && !hasBoard) return { cache: undefined, parsed: emptyParsedSwarmFiles(now) };
+
+  const membersMtimeMs = hasMembers ? membersStat!.mtimeMs : -1;
+  const membersSize = hasMembers ? membersStat!.size : -1;
+  const boardMtimeMs = hasBoard ? boardStat!.mtimeMs : -1;
+  const boardSize = hasBoard ? boardStat!.size : -1;
+  if (
+    previousCache
+    && previousCache.membersMtimeMs === membersMtimeMs
+    && previousCache.membersSize === membersSize
+    && previousCache.boardMtimeMs === boardMtimeMs
+    && previousCache.boardSize === boardSize
+  ) {
+    return { cache: previousCache, parsed: previousCache.parsed };
+  }
+
+  const membersRaw = hasMembers ? readBoundedTextSync(membersPath, MAX_MEMBERS_FILE_BYTES, false, true) : null;
+  const boardRaw = hasBoard ? readBoundedTextSync(boardPath, MAX_BOARD_READ_BYTES, true, false) : null;
+  const parsed = parseSwarmBoardContents(membersRaw, boardRaw, now);
+  return {
+    cache: parsed.found ? { membersMtimeMs, membersSize, boardMtimeMs, boardSize, parsed } : undefined,
+    parsed,
   };
 }
 
@@ -385,14 +563,16 @@ export function mergeSwarmSnapshots(
       } else {
         const memberUpdated = member.updatedAt ?? 0;
         const existingUpdated = existing.updatedAt ?? 0;
-        const acpNewer = memberUpdated >= existingUpdated;
+        const acpNewer = memberUpdated > existingUpdated;
         byName.set(key, {
           name: existing.name || member.name,
           role: (acpNewer ? member.role : existing.role) ?? member.role ?? existing.role,
           ...(existing.helper || member.helper ? { helper: true } : {}),
           state: acpSwarm.stoppedByUser && isSwarmMemberActive(existing.state)
             ? "killed"
-            : (acpNewer && member.state !== "unknown" ? member.state : existing.state !== "unknown" ? existing.state : member.state),
+            : member.inferredState && existing.state !== "unknown"
+              ? existing.state
+              : (acpNewer && member.state !== "unknown" ? member.state : existing.state !== "unknown" ? existing.state : member.state),
           model: (acpNewer ? member.model : existing.model) ?? member.model ?? existing.model,
           latestActivity: (acpNewer ? member.latestActivity : existing.latestActivity) ?? member.latestActivity ?? existing.latestActivity,
           startedAt: existing.startedAt ?? member.startedAt,
@@ -503,7 +683,12 @@ export function extractWorkerAttribution(params: unknown, trackedWorkerName?: st
   return undefined;
 }
 
-export function applySwarmAcpUpdate(swarm: AcpSwarmState, update: Record<string, unknown>, now = Date.now()): void {
+export function applySwarmAcpUpdate(
+  swarm: AcpSwarmState,
+  update: Record<string, unknown>,
+  now = Date.now(),
+  options: { hasOtherOpenWorkerTools?: boolean } = {},
+): void {
   const kind = typeof update.sessionUpdate === "string" ? update.sessionUpdate : "";
   const meta = asRecord(update._meta);
   const rawInput = asRecord(update.rawInput);
@@ -516,17 +701,26 @@ export function applySwarmAcpUpdate(swarm: AcpSwarmState, update: Record<string,
     const title = nonEmptyString(update.title, 300) ?? nonEmptyString(update.goal, 300);
     if (title) swarm.title = title;
     const status = nonEmptyString(update.status, 64)?.toLowerCase();
+    const hasExplicitStatus = Boolean(status);
     if (status && ["done", "completed", "stopped", "killed", "finished"].includes(status)) swarm.active = false;
     else if (status && ["running", "active", "working"].includes(status)) swarm.active = true;
 
+    let updatedMembers = false;
     if (Array.isArray(update.members)) {
+      updatedMembers = true;
       for (const item of update.members) {
         const m = normalizeMemberEntry(item, undefined, now);
-        if (m) swarm.members.set(m.name.toLowerCase(), m);
+        if (m) swarm.members.set(m.name.toLowerCase(), { ...m, inferredState: false });
       }
     }
     const singleMember = normalizeMemberEntry(update.member ?? (update.name && (update.state || update.status) ? update : undefined), undefined, now);
-    if (singleMember) swarm.members.set(singleMember.name.toLowerCase(), singleMember);
+    if (singleMember) {
+      updatedMembers = true;
+      swarm.members.set(singleMember.name.toLowerCase(), { ...singleMember, inferredState: false });
+    }
+    if (updatedMembers && !hasExplicitStatus && swarm.members.size > 0) {
+      swarm.active = [...swarm.members.values()].some((m) => isSwarmMemberActive(m.state));
+    }
 
     const post = normalizePostEntry(update.post ?? (update.content && update.author ? update : undefined), swarm.posts.length, now);
     if (post && !swarm.posts.some((existing) => existing.id === post.id)) {
@@ -536,29 +730,18 @@ export function applySwarmAcpUpdate(swarm: AcpSwarmState, update: Record<string,
     return;
   }
 
-  // Tool call or metadata hints from ACP.
-  const workerName = extractWorkerAttribution({ _meta: meta, toolCall: update });
-  if (workerName) {
-    const existing = swarm.members.get(workerName.toLowerCase());
-    const model = nonEmptyString(meta?.model, 160) ?? nonEmptyString(rawInput?.model, 160) ?? existing?.model;
-    const role = nonEmptyString(meta?.role, 64) ?? nonEmptyString(rawInput?.role, 64) ?? existing?.role;
-    const state = meta?.state ? normalizeSwarmMemberState(meta.state) : (existing?.state ?? "working");
-    const activity = nonEmptyString(update.title, 500) ?? nonEmptyString(rawInput?.CommandLine, 500) ?? existing?.latestActivity;
-    swarm.members.set(workerName.toLowerCase(), {
-      name: existing?.name ?? workerName,
-      ...(role ? { role } : {}),
-      ...(isSwarmHelperRole(role, workerName) ? { helper: true } : {}),
-      state,
-      ...(model ? { model } : {}),
-      ...(activity ? { latestActivity: activity } : {}),
-      startedAt: existing?.startedAt ?? now,
-      updatedAt: now,
-    });
-    swarm.updatedAt = now;
-  }
+  const toolFinished = update.status === "completed" || update.status === "failed";
 
-  if (toolName.includes("swarm") || toolName.includes("board")) {
+  // Explicit swarm management tool calls (never broad /board/i matches).
+  if (isSwarmToolName(toolName)) {
     swarm.updatedAt = now;
+    const action = nonEmptyString(rawInput?.action, 64)?.toLowerCase();
+    if (action === "title") {
+      const title = nonEmptyString(rawInput?.title, 300);
+      if (title) swarm.title = title;
+      return;
+    }
+    if (action === "status" || action === "models") return;
     const candidateName = nonEmptyString(rawInput?.name, 128) ?? nonEmptyString(rawInput?.worker, 128) ?? nonEmptyString(rawInput?.member, 128);
     if (candidateName) {
       const clean = normalizeMemberName(candidateName);
@@ -566,22 +749,72 @@ export function applySwarmAcpUpdate(swarm: AcpSwarmState, update: Record<string,
         const existing = swarm.members.get(clean.toLowerCase());
         const role = nonEmptyString(rawInput?.role, 64) ?? existing?.role;
         const model = nonEmptyString(rawInput?.model, 160) ?? existing?.model;
-        const state = toolName.includes("kill") || toolName.includes("stop")
+        const isKill = action === "kill" || toolName.includes("kill") || toolName.includes("stop");
+        const explicitState = rawInput?.state ?? rawOutput?.state;
+        const state = isKill
           ? "killed"
-          : normalizeSwarmMemberState(rawInput?.state ?? rawOutput?.state ?? existing?.state ?? "working");
-        const activity = nonEmptyString(rawInput?.task, 500) ?? nonEmptyString(rawInput?.prompt, 500) ?? nonEmptyString(update.title, 500) ?? existing?.latestActivity;
+          : explicitState !== undefined
+            ? normalizeSwarmMemberState(explicitState)
+            : update.status === "failed" && !existing
+              ? "done"
+              : (existing?.state ?? "working");
+        const activity = nonEmptyString(rawInput?.brief, 500) ?? nonEmptyString(rawInput?.task, 500) ?? nonEmptyString(rawInput?.prompt, 500) ?? nonEmptyString(update.title, 500) ?? existing?.latestActivity;
         swarm.members.set(clean.toLowerCase(), {
           name: existing?.name ?? clean,
           ...(role ? { role } : {}),
           ...(isSwarmHelperRole(role, clean) ? { helper: true } : {}),
           state,
+          inferredState: false,
           ...(model ? { model } : {}),
           ...(activity ? { latestActivity: activity } : {}),
           startedAt: existing?.startedAt ?? now,
           updatedAt: now,
         });
+        if (isKill && swarm.members.size > 0 && ![...swarm.members.values()].some((m) => isSwarmMemberActive(m.state))) {
+          swarm.active = false;
+        }
       }
     }
+    return;
+  }
+
+  // Tool call or metadata hints from ACP when a swarm already exists.
+  const workerName = extractWorkerAttribution({ _meta: meta, toolCall: update });
+  if (workerName) {
+    const existing = swarm.members.get(workerName.toLowerCase());
+    const model = nonEmptyString(meta?.model, 160) ?? nonEmptyString(rawInput?.model, 160) ?? existing?.model;
+    const role = nonEmptyString(meta?.role, 64) ?? nonEmptyString(rawInput?.role, 64) ?? existing?.role;
+    const explicitState = meta?.state ?? rawOutput?.state;
+    let state: SwarmMemberState;
+    let inferredState: boolean;
+    if (explicitState !== undefined) {
+      state = normalizeSwarmMemberState(explicitState);
+      inferredState = false;
+    } else if (toolFinished) {
+      if (!options.hasOtherOpenWorkerTools && (!existing || existing.inferredState)) {
+        state = "done";
+        inferredState = true;
+      } else {
+        state = existing?.state ?? "working";
+        inferredState = existing?.inferredState ?? true;
+      }
+    } else {
+      state = !existing || existing.inferredState ? "working" : existing.state;
+      inferredState = !existing || Boolean(existing.inferredState);
+    }
+    const activity = nonEmptyString(update.title, 500) ?? nonEmptyString(rawInput?.CommandLine, 500) ?? existing?.latestActivity;
+    swarm.members.set(workerName.toLowerCase(), {
+      name: existing?.name ?? workerName,
+      ...(role ? { role } : {}),
+      ...(isSwarmHelperRole(role, workerName) ? { helper: true } : {}),
+      state,
+      inferredState,
+      ...(model ? { model } : {}),
+      ...(activity ? { latestActivity: activity } : {}),
+      startedAt: existing?.startedAt ?? now,
+      updatedAt: now,
+    });
+    swarm.updatedAt = now;
   }
 }
 

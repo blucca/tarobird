@@ -48,6 +48,7 @@ export function gatewayEngineTasks(bridge: CoreBridgeLike, channel: GatewayChann
           chatId: stableCoreNumericId(conversationKey),
           conversationKey,
           locale,
+          scope: "swarm",
         });
         if (bg.stopped && bg.summary) {
           await channel.inConversation(p.conversationId, () => channel.send(p.conversationId, { text: bg.summary! })).catch(() => undefined);

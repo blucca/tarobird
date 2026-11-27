@@ -12,6 +12,7 @@ import {
   type ContentBlock,
   type CreateElicitationRequest,
   type CreateElicitationResponse,
+  type ElicitationContentValue,
   type ElicitationPropertySchema,
   type InitializeResponse,
   type PromptResponse,
@@ -27,12 +28,19 @@ import { cancelOwnedAntigravityQuotaReads, readOwnedAntigravityQuota, type Antig
 import { antigravitySupportsSwarm } from "./antigravity-acp-support.js";
 import {
   applySwarmAcpUpdate,
+  emptyParsedSwarmFiles,
   extractWorkerAttribution,
+  isSwarmMemberActive,
+  isSwarmToolName,
   mergeSwarmSnapshots,
   readSwarmBoardFiles,
+  readSwarmBoardFilesSync,
   resolveAntigravityBrainDir,
+  snapshotSwarmMembersFileSync,
   swarmMembersToEngineTasks,
   type AcpSwarmState,
+  type ParsedSwarmFiles,
+  type SwarmBoardFileCache,
 } from "./antigravity-swarm.js";
 import { spawnEngine } from "../runtime/engine-process.js";
 import { appStopKillOptions } from "../runtime/turn-cancellation.js";
@@ -108,6 +116,8 @@ export type AntigravityAcpAdapterOptions = {
   wakeQuietMs?: number;
   /** How long a steer waits for agy to take it over before it is reported as uncertain. */
   steerAdmissionTimeoutMs?: number;
+  /** How long a first-turn `/swarm` waits for initial `available_commands_update` before continuing. */
+  commandsAdvertiseTimeoutMs?: number;
   idleWorkerTtlMs?: number;
   idleSweepIntervalMs?: number;
   turnTimeoutMs?: number | null;
@@ -218,10 +228,16 @@ type Worker = {
   lastTurnHandler?: CodexUserMessageInput["onEngineEvent"];
   /** Preserved approval handler for post-coordinator swarm/background worker requests. */
   lastApprovalHandler?: CodexUserMessageInput["onApprovalRequest"];
+  /** Preserved locale from the latest turn for post-turn elicitation prompts. */
+  lastLocale?: "en" | "zh";
   /** Aborted when the worker is closed or the user stops the swarm. */
   backgroundApprovals: AbortController;
   /** Active/recent swarm state observed over ACP for this session. */
   swarm?: AcpSwarmState & { ownerTurn?: Turn };
+  /** Cached stat/parse result for synchronous board-file checks. */
+  swarmFileCache?: SwarmBoardFileCache;
+  /** Waiters unblocked if this worker closes while waiting for available_commands_update. */
+  commandCloseWaiters: Set<() => void>;
   wake: Wake | null;
   promptSeq: number;
   tools: Map<string, ToolState>;
@@ -252,6 +268,7 @@ export const ANTIGRAVITY_ACP_TURN_TIMEOUT_MS = 6 * 60 * 60_000;
 export const ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS = 30 * 60_000;
 const STOPPED_BY_USER = "Task was stopped by user";
 const DEFAULT_STEER_ADMISSION_TIMEOUT_MS = 10_000;
+const DEFAULT_COMMANDS_ADVERTISE_TIMEOUT_MS = 750;
 const MAX_NATIVE_COMMANDS = 500;
 const NATIVE_COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const ANTIGRAVITY_EFFORTS: ReadonlySet<string> = new Set(ANTIGRAVITY_EFFORT_LEVELS);
@@ -423,12 +440,107 @@ function parseSwarmCommand(text: string): { subcommand: string; task: string } |
   return { subcommand: firstWord, task: rest };
 }
 
-function isSwarmWorkerMention(text: string, swarm?: AcpSwarmState): boolean {
-  if (!swarm?.active) return false;
+function extractLeadingMention(text: string): string | undefined {
   const match = text.trimStart().match(/^@([A-Za-z0-9._-]{1,64})(?:\s|$)/);
-  if (!match?.[1]) return false;
-  if (swarm.members.size === 0) return true;
-  return swarm.members.has(match[1].toLowerCase());
+  return match?.[1]?.toLowerCase();
+}
+
+type ElicitationOption = { label: string; value: string; description?: string };
+
+function parseBooleanElicitationAnswer(raw: unknown): boolean | undefined {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw !== "string") return undefined;
+  const normalized = raw.trim().toLowerCase();
+  if (["true", "yes", "y", "1", "是"].includes(normalized)) return true;
+  if (["false", "no", "n", "0", "否"].includes(normalized)) return false;
+  return undefined;
+}
+
+function parseNumberElicitationAnswer(raw: unknown, integer: boolean, minimum?: number, maximum?: number): number | undefined {
+  let parsed: number;
+  if (typeof raw === "number") {
+    parsed = raw;
+  } else if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
+    parsed = Number(trimmed);
+  } else {
+    return undefined;
+  }
+  if (!Number.isFinite(parsed)) return undefined;
+  if (integer && !Number.isInteger(parsed)) return undefined;
+  if (typeof minimum === "number" && parsed < minimum) return undefined;
+  if (typeof maximum === "number" && parsed > maximum) return undefined;
+  return parsed;
+}
+
+function matchElicitationOption(options: ElicitationOption[], raw: string): ElicitationOption | undefined {
+  const trimmed = raw.trim();
+  const lower = trimmed.toLowerCase();
+  return options.find((opt) => opt.label.toLowerCase() === lower)
+    ?? options.find((opt) => opt.value.toLowerCase() === lower);
+}
+
+function parseMultiSelectElicitationAnswer(raw: unknown, options: ElicitationOption[]): string[] | undefined {
+  const mapEntry = (entry: string): string | undefined => {
+    const trimmed = entry.trim();
+    if (!trimmed) return undefined;
+    if (!options.length) return trimmed;
+    return matchElicitationOption(options, trimmed)?.value;
+  };
+  if (Array.isArray(raw)) {
+    const mapped: string[] = [];
+    for (const item of raw) {
+      if (typeof item !== "string") return undefined;
+      const value = mapEntry(item);
+      if (value === undefined) return undefined;
+      mapped.push(value);
+    }
+    return mapped;
+  }
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  if (options.length) {
+    // Match labels greedily from left to right so option labels containing commas still parse cleanly.
+    const memo = new Map<number, string[] | undefined>();
+    const visit = (offset: number): string[] | undefined => {
+      if (offset === trimmed.length) return [];
+      if (memo.has(offset)) return memo.get(offset);
+      for (const opt of options) {
+        for (const candidateText of [opt.label, opt.value]) {
+          if (trimmed.slice(offset, offset + candidateText.length).toLowerCase() !== candidateText.toLowerCase()) continue;
+          const end = offset + candidateText.length;
+          if (end === trimmed.length) {
+            const res = [opt.value];
+            memo.set(offset, res);
+            return res;
+          }
+          const sep = trimmed.slice(end).match(/^,\s*/);
+          if (sep) {
+            const tail = visit(end + sep[0].length);
+            if (tail) {
+              const res = [opt.value, ...tail];
+              memo.set(offset, res);
+              return res;
+            }
+          }
+        }
+      }
+      memo.set(offset, undefined);
+      return undefined;
+    };
+    const exact = visit(0);
+    if (exact) return exact;
+  }
+  const parts = trimmed.split(",").map((s) => s.trim()).filter(Boolean);
+  const mapped: string[] = [];
+  for (const part of parts) {
+    const value = mapEntry(part);
+    if (value === undefined) return undefined;
+    mapped.push(value);
+  }
+  return mapped;
 }
 
 function renderSwarmUnavailableMessage(reason: "version" | "not_advertised", locale?: CodexUserMessageInput["locale"]): string {
@@ -507,6 +619,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private readonly cancelGraceMs: number;
   protected readonly wakeQuietMs: number;
   private readonly steerAdmissionTimeoutMs: number;
+  private readonly commandsAdvertiseTimeoutMs: number;
   private readonly idleWorkerTtlMs: number;
   private readonly turnTimeoutMs: number | null;
   private readonly inactivityTimeoutMs: number | null;
@@ -517,6 +630,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   /** The newest available_commands_update; every session of this Bot shares the CLI and workspace. */
   private commands: Array<{ name: string; description: string }> = [];
   private commandsReceived = false;
+  private readonly commandWaiters = new Set<() => void>();
   private swarmVersionSupported: Promise<boolean> | undefined;
   /** Sessions whose active swarm was stopped by user, surviving worker close so listTasks reflects killed state over stale files. */
   private readonly stoppedSwarmSessions = new Set<string>();
@@ -536,6 +650,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     this.cancelGraceMs = options.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS;
     this.wakeQuietMs = options.wakeQuietMs ?? DEFAULT_WAKE_QUIET_MS;
     this.steerAdmissionTimeoutMs = options.steerAdmissionTimeoutMs ?? DEFAULT_STEER_ADMISSION_TIMEOUT_MS;
+    this.commandsAdvertiseTimeoutMs = options.commandsAdvertiseTimeoutMs ?? DEFAULT_COMMANDS_ADVERTISE_TIMEOUT_MS;
     this.idleWorkerTtlMs = options.idleWorkerTtlMs ?? DEFAULT_IDLE_WORKER_TTL_MS;
     this.turnTimeoutMs = options.turnTimeoutMs === undefined ? ANTIGRAVITY_ACP_TURN_TIMEOUT_MS : options.turnTimeoutMs;
     this.inactivityTimeoutMs = options.inactivityTimeoutMs === undefined ? ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS : options.inactivityTimeoutMs;
@@ -619,6 +734,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     for (const worker of new Set(this.workers.values())) {
       if (worker.removed || worker.closing) continue;
       if (worker.turn || worker.reserved || worker.pendingPermissions > 0 || worker.wake) return true;
+      this.syncSwarmFromFilesSync(worker);
       if (worker.swarm?.active && !worker.swarm.stoppedByUser) return true;
       for (const tool of worker.tools.values()) {
         if (tool.background && (tool.status === "pending" || tool.status === "in_progress")) return true;
@@ -646,11 +762,15 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const effectiveSessionId = worker?.sessionId ?? (!isLogicalSessionId(sessionId) ? sessionId : undefined);
     if (!effectiveSessionId) return { supported: true, tasks: [] };
 
-    const fileSwarm = await readSwarmBoardFiles(this.brainDir, effectiveSessionId);
+    const rawFileSwarm = await readSwarmBoardFiles(this.brainDir, effectiveSessionId);
+    const fileSwarm = worker ? this.syncSwarmFromFileResult(worker, rawFileSwarm) : rawFileSwarm;
     const stoppedFallback: AcpSwarmState | undefined = !worker?.swarm && (this.stoppedSwarmSessions.has(effectiveSessionId) || this.stoppedSwarmSessions.has(sessionId))
       ? { active: false, stoppedByUser: true, startedAt: fileSwarm.updatedAt, updatedAt: Date.now(), members: new Map(), posts: [] }
       : undefined;
     const swarm = mergeSwarmSnapshots(worker?.swarm ?? stoppedFallback, fileSwarm, { sessionId: effectiveSessionId });
+    if (worker?.swarm && !worker.swarm.stoppedByUser && swarm) {
+      worker.swarm.active = swarm.active;
+    }
     const tasks: EngineTask[] = swarmMembersToEngineTasks(effectiveSessionId, swarm, worker?.swarm?.startedAt);
 
     if (worker) {
@@ -674,22 +794,31 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     };
   }
 
-  async stopBackgroundWork(sessionId: string, input?: { locale?: "en" | "zh" }): Promise<{ stopped: boolean; summary?: string }> {
+  async stopBackgroundWork(sessionId: string, input?: { locale?: "en" | "zh"; scope?: "swarm" | "all" }): Promise<{ stopped: boolean; summary?: string }> {
     const worker = this.liveWorker(sessionId);
     if (!worker || worker.closing) return { stopped: false };
+    const swarmOnly = input?.scope !== "all";
     const swarmActive = await this.isSwarmActive(worker);
-    const hasTools = this.hasOpenBackgroundTools(worker);
-    if (!swarmActive && !hasTools && worker.pendingPermissions === 0) return { stopped: false };
-
-    if (worker.swarm) {
-      this.markSwarmStopped(worker.swarm, worker.sessionId);
-    } else if (swarmActive) {
-      worker.swarm = {
-        active: false, stoppedByUser: true, startedAt: Date.now(), updatedAt: Date.now(), members: new Map(), posts: [],
-      };
-      if (worker.sessionId) this.stoppedSwarmSessions.add(worker.sessionId);
+    if (swarmOnly) {
+      if (!swarmActive) return { stopped: false };
+    } else {
+      // Do not bypass session/cancel grace for an active non-swarm foreground turn.
+      if (worker.turn && !worker.turn.done && !swarmActive) return { stopped: false };
+      const hasTools = this.hasOpenBackgroundTools(worker);
+      if (!swarmActive && !hasTools && worker.pendingPermissions === 0) return { stopped: false };
     }
-    this.stoppedSwarmSessions.add(sessionId);
+
+    if (swarmActive) {
+      if (worker.swarm) {
+        this.markSwarmStopped(worker.swarm, worker.sessionId);
+      } else {
+        worker.swarm = {
+          active: false, stoppedByUser: true, startedAt: Date.now(), updatedAt: Date.now(), members: new Map(), posts: [],
+        };
+        if (worker.sessionId) this.stoppedSwarmSessions.add(worker.sessionId);
+      }
+      this.stoppedSwarmSessions.add(sessionId);
+    }
     if (worker.wake?.timer) clearTimeout(worker.wake.timer);
     worker.wake = null;
     worker.backgroundApprovals.abort();
@@ -771,25 +900,30 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const workspace = path.resolve(input.workspaceOverride ?? this.options.workspacePath);
     const launchKey = JSON.stringify({ workspace, flags: permissionFlags(config.approvalMode) });
     const worker = await this.startedWorker(sessionId, workspace, launchKey, config.approvalMode, input.abortSignal);
-    if (swarmCmd) {
-      await Promise.resolve();
-      if (this.commandsReceived && !this.commands.some((command) => command.name.toLowerCase() === "swarm")) {
-        return { text: renderSwarmUnavailableMessage("not_advertised", input.locale), sessionId: worker.sessionId! };
-      }
-    }
-    const unwrapMention = isSwarmWorkerMention(input.text, worker.swarm)
-      || (!worker.swarm && /^@[A-Za-z0-9._-]{1,64}(?:\s|$)/.test(input.text.trimStart()) && await this.isSwarmActive(worker));
-    const prompt = await this.buildPrompt(input, unwrapMention);
     if (worker.turn || worker.reserved) throw new Error("Antigravity session already has an in-flight turn");
     worker.reserved = true;
+    let prompt: ContentBlock[];
     try {
-      await this.applySessionConfig(worker, config);
-    } catch (error) {
-      // A new conversation's process is reachable by nobody once this message fails (the Host never
-      // learned its session id), and after an unanswered write the session's model or mode is unknown
-      // and may still change: either way the process is ended; a later message resumes the session.
-      if (worker.announceSession || error instanceof AcpTimeoutError) await this.closeWorker(worker, error instanceof Error ? error : undefined);
-      throw error;
+      if (swarmCmd) {
+        if (!this.commandsReceived) {
+          await this.waitForAdvertisedCommands(worker, input.abortSignal);
+        }
+        if (worker.removed) throw worker.failure ?? new Error("Antigravity ACP worker is no longer available");
+        if (this.commandsReceived && !this.commands.some((command) => command.name.toLowerCase() === "swarm")) {
+          return { text: renderSwarmUnavailableMessage("not_advertised", input.locale), sessionId: worker.sessionId! };
+        }
+      }
+      const unwrapMention = await this.shouldUnwrapSwarmMention(worker, input.text);
+      prompt = await this.buildPrompt(input, unwrapMention);
+      try {
+        await this.applySessionConfig(worker, config);
+      } catch (error) {
+        // A new conversation's process is reachable by nobody once this message fails (the Host never
+        // learned its session id), and after an unanswered write the session's model or mode is unknown
+        // and may still change: either way the process is ended; a later message resumes the session.
+        if (worker.announceSession || error instanceof AcpTimeoutError) await this.closeWorker(worker, error instanceof Error ? error : undefined);
+        throw error;
+      }
     } finally {
       worker.reserved = false;
     }
@@ -864,7 +998,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       .connect(stream);
     worker = {
       child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, reserved: false,
-      backgroundApprovals: new AbortController(), wake: null, promptSeq: 0,
+      backgroundApprovals: new AbortController(), commandCloseWaiters: new Set(), wake: null, promptSeq: 0,
       tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), removed: false, exited: false,
     };
     this.workers.set(requestedId, worker);
@@ -913,6 +1047,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       if (worker.removed) throw worker.failure ?? new Error("Antigravity ACP worker is no longer available");
       worker.rejectStart = undefined;
       this.rekey(worker, worker.sessionId);
+      if (!worker.announceSession) this.syncSwarmFromFilesSync(worker);
       return worker;
     } catch (error) {
       worker.rejectStart = undefined;
@@ -994,6 +1129,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       this.flushWake(worker);
       worker.turn = turn;
       worker.lastTurnHandler = input.onEngineEvent;
+      if (input.locale) worker.lastLocale = input.locale;
       if (input.onApprovalRequest) {
         worker.lastApprovalHandler = input.onApprovalRequest;
         if (worker.backgroundApprovals.signal.aborted) worker.backgroundApprovals = new AbortController();
@@ -1001,6 +1137,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       const swarmCmd = parseSwarmCommand(input.text);
       if (swarmCmd?.task) {
         if (worker.sessionId) this.stoppedSwarmSessions.delete(worker.sessionId);
+        worker.swarmFileCache = undefined;
+        const baselineMembersSig = worker.sessionId ? snapshotSwarmMembersFileSync(this.brainDir, worker.sessionId) : undefined;
         const now = Date.now();
         worker.swarm = {
           active: true,
@@ -1008,6 +1146,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
           title: swarmCmd.task.slice(0, 300),
           startedAt: now,
           updatedAt: now,
+          ...(baselineMembersSig ? { baselineMembersSig } : {}),
           ownerTurn: turn,
           members: new Map(),
           posts: [],
@@ -1143,21 +1282,119 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     return false;
   }
 
-  private async isSwarmActive(worker: Worker): Promise<boolean> {
-    if (worker.swarm?.stoppedByUser) return false;
-    if (worker.swarm?.active) {
-      if (worker.sessionId) {
-        const fileSwarm = await readSwarmBoardFiles(this.brainDir, worker.sessionId);
-        if (fileSwarm.found && fileSwarm.members.length > 0 && !fileSwarm.active) {
-          worker.swarm.active = false;
-          return false;
-        }
-      }
+  private isStaleInactiveFileSwarm(swarm: AcpSwarmState, fileSwarm: ParsedSwarmFiles): boolean {
+    if (!swarm.active || swarm.stoppedByUser || !fileSwarm.found || fileSwarm.active) return false;
+    if (fileSwarm.membersMtimeMs !== undefined && fileSwarm.membersMtimeMs < swarm.startedAt) return true;
+    if (fileSwarm.updatedAt > 0 && fileSwarm.updatedAt < swarm.startedAt) return true;
+    if (
+      swarm.baselineMembersSig
+      && fileSwarm.membersMtimeMs === swarm.baselineMembersSig.mtimeMs
+      && fileSwarm.membersSize === swarm.baselineMembersSig.size
+      && fileSwarm.membersHash === swarm.baselineMembersSig.hash
+    ) {
       return true;
     }
-    if (!worker.sessionId) return false;
-    const fileSwarm = await readSwarmBoardFiles(this.brainDir, worker.sessionId);
-    return fileSwarm.active;
+    return false;
+  }
+
+  private syncSwarmFromFileResult(worker: Worker, fileSwarm: ParsedSwarmFiles): ParsedSwarmFiles {
+    if (worker.swarm && this.isStaleInactiveFileSwarm(worker.swarm, fileSwarm)) {
+      return emptyParsedSwarmFiles();
+    }
+    if (!fileSwarm.found) return fileSwarm;
+    if (worker.swarm) {
+      if (!worker.swarm.stoppedByUser) {
+        if (fileSwarm.active) {
+          worker.swarm.active = true;
+          if (fileSwarm.title && !worker.swarm.title) worker.swarm.title = fileSwarm.title;
+        } else if (fileSwarm.members.length > 0 || fileSwarm.explicitlyStopped) {
+          const merged = mergeSwarmSnapshots(worker.swarm, fileSwarm, { sessionId: worker.sessionId ?? undefined });
+          if (merged && !merged.active) {
+            worker.swarm.active = false;
+            for (const fileMember of fileSwarm.members) {
+              const key = fileMember.name.toLowerCase();
+              const existing = worker.swarm.members.get(key);
+              if (existing && (existing.inferredState || (fileMember.updatedAt ?? 0) >= (existing.updatedAt ?? 0))) {
+                worker.swarm.members.set(key, { ...existing, state: fileMember.state, updatedAt: Math.max(existing.updatedAt ?? 0, fileMember.updatedAt ?? 0) });
+              }
+            }
+          }
+        }
+      }
+    } else if (fileSwarm.active && worker.sessionId && !this.stoppedSwarmSessions.has(worker.sessionId)) {
+      const ts = fileSwarm.updatedAt || Date.now();
+      worker.swarm = {
+        active: true,
+        stoppedByUser: false,
+        ...(fileSwarm.title ? { title: fileSwarm.title } : {}),
+        startedAt: ts,
+        updatedAt: ts,
+        members: new Map(fileSwarm.members.map((m) => [m.name.toLowerCase(), { ...m }])),
+        posts: [...fileSwarm.posts],
+      };
+    }
+    return fileSwarm;
+  }
+
+  private syncSwarmFromFilesSync(worker: Worker): ParsedSwarmFiles {
+    if (!worker.sessionId) return emptyParsedSwarmFiles();
+    const { cache, parsed } = readSwarmBoardFilesSync(this.brainDir, worker.sessionId, worker.swarmFileCache);
+    worker.swarmFileCache = cache;
+    return this.syncSwarmFromFileResult(worker, parsed);
+  }
+
+  private async waitForAdvertisedCommands(worker: Worker, signal?: AbortSignal): Promise<void> {
+    if (this.commandsReceived || worker.removed || worker.closing || worker.exited || this.commandsAdvertiseTimeoutMs <= 0) return;
+    if (signal?.aborted) throw new Error(STOPPED_BY_USER);
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.commandWaiters.delete(onCommands);
+        worker.commandCloseWaiters.delete(onWorkerClose);
+        if (onAbort && signal) signal.removeEventListener("abort", onAbort);
+      };
+      const finish = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve();
+      };
+      const onCommands = () => finish();
+      const onWorkerClose = () => finish();
+      const onAbort = signal ? () => finish(new Error(STOPPED_BY_USER)) : undefined;
+      const timer = setTimeout(() => finish(), this.commandsAdvertiseTimeoutMs);
+      timer.unref?.();
+      this.commandWaiters.add(onCommands);
+      worker.commandCloseWaiters.add(onWorkerClose);
+      if (onAbort && signal) signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  private async shouldUnwrapSwarmMention(worker: Worker, text: string): Promise<boolean> {
+    const target = extractLeadingMention(text);
+    if (!target || worker.swarm?.stoppedByUser) return false;
+    const rawFileSwarm = worker.sessionId ? await readSwarmBoardFiles(this.brainDir, worker.sessionId) : emptyParsedSwarmFiles();
+    const fileSwarm = this.syncSwarmFromFileResult(worker, rawFileSwarm);
+    const merged = mergeSwarmSnapshots(worker.swarm, fileSwarm, { sessionId: worker.sessionId ?? undefined });
+    if (worker.swarm && !worker.swarm.stoppedByUser && merged) {
+      worker.swarm.active = merged.active;
+    }
+    if (!merged?.active) return false;
+    if (merged.members.length === 0) return true;
+    return merged.members.some((m) => m.name.toLowerCase() === target && (isSwarmMemberActive(m.state) || m.state === "unknown"));
+  }
+
+  private async isSwarmActive(worker: Worker): Promise<boolean> {
+    if (worker.swarm?.stoppedByUser) return false;
+    const rawFileSwarm = worker.sessionId ? await readSwarmBoardFiles(this.brainDir, worker.sessionId) : emptyParsedSwarmFiles();
+    const fileSwarm = this.syncSwarmFromFileResult(worker, rawFileSwarm);
+    const merged = mergeSwarmSnapshots(worker.swarm, fileSwarm, { sessionId: worker.sessionId ?? undefined });
+    if (worker.swarm && !worker.swarm.stoppedByUser && merged) {
+      worker.swarm.active = merged.active;
+    }
+    return Boolean(merged?.active);
   }
 
   private requestStop(turn: Turn, killOptions?: { graceMs: number }): void {
@@ -1166,6 +1403,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     turn.stopKillOptions = killOptions;
     turn.approvals.abort();
     const worker = turn.worker;
+    this.syncSwarmFromFilesSync(worker);
     const swarmKnownActive = Boolean(worker.swarm?.active && !worker.swarm.stoppedByUser);
     if (swarmKnownActive && worker.swarm) {
       this.markSwarmStopped(worker.swarm, worker.sessionId);
@@ -1194,8 +1432,9 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   private async checkAndCloseSwarmOnStop(worker: Worker, turn: Turn, killOptions?: { graceMs: number }): Promise<void> {
-    if (worker.removed || worker.closing || !worker.sessionId) return;
-    const fileSwarm = await readSwarmBoardFiles(this.brainDir, worker.sessionId);
+    if (worker.removed || worker.closing || !worker.sessionId || worker.swarm?.stoppedByUser) return;
+    const rawFileSwarm = await readSwarmBoardFiles(this.brainDir, worker.sessionId);
+    const fileSwarm = this.syncSwarmFromFileResult(worker, rawFileSwarm);
     if (!fileSwarm.active || worker.removed || worker.closing || !turn.stopRequested) return;
     if (worker.sessionId) this.stoppedSwarmSessions.add(worker.sessionId);
     worker.swarm = {
@@ -1292,15 +1531,19 @@ export class AntigravityAcpAdapter implements CodexAdapter {
         if (!command || typeof command.name !== "string" || !NATIVE_COMMAND_NAME.test(command.name)) return [];
         return [{ name: command.name, description: typeof command.description === "string" ? command.description.slice(0, 300) : "" }];
       }).slice(0, MAX_NATIVE_COMMANDS);
+      for (const notify of this.commandWaiters) notify();
+      this.commandWaiters.clear();
     }
     const turn = worker.turn;
-    const isSwarmUpdate = (typeof kind === "string" && kind.startsWith("swarm"))
-      || Boolean(extractWorkerAttribution({ _meta: update._meta, toolCall: update }))
-      || (typeof update.name === "string" && /swarm|board/i.test(update.name));
-    if (isSwarmUpdate && !worker.swarm?.stoppedByUser) {
+    if (kind === "tool_call" || kind === "tool_call_update") this.trackTool(worker, update, turn);
+    const isExplicitSwarmUpdate = (typeof kind === "string" && kind.startsWith("swarm"))
+      || isSwarmToolName(update.name);
+    if (isExplicitSwarmUpdate && !worker.swarm?.stoppedByUser) {
       const now = Date.now();
+      const rawStatus = typeof update.status === "string" ? update.status.trim().toLowerCase() : "";
+      const initialActive = !(typeof kind === "string" && kind.startsWith("swarm") && ["done", "completed", "stopped", "killed", "finished"].includes(rawStatus));
       worker.swarm ??= {
-        active: true,
+        active: initialActive,
         stoppedByUser: false,
         startedAt: now,
         updatedAt: now,
@@ -1309,8 +1552,23 @@ export class AntigravityAcpAdapter implements CodexAdapter {
         posts: [],
       };
       applySwarmAcpUpdate(worker.swarm, update, now);
+    } else if (worker.swarm?.active && !worker.swarm.stoppedByUser) {
+      const toolCallId = typeof update.toolCallId === "string" ? update.toolCallId : undefined;
+      const trackedWorker = toolCallId ? worker.tools.get(toolCallId)?.workerName : undefined;
+      const attributed = extractWorkerAttribution({ _meta: update._meta, toolCall: update }, trackedWorker);
+      if (attributed) {
+        const key = attributed.toLowerCase();
+        const hasOtherOpenWorkerTools = [...worker.tools.values()].some((tool) =>
+          tool.id !== toolCallId
+          && tool.workerName?.toLowerCase() === key
+          && (tool.status === "pending" || tool.status === "in_progress"),
+        );
+        const updateWithWorker = trackedWorker && !extractWorkerAttribution({ _meta: update._meta, toolCall: update })
+          ? { ...update, _meta: { ...asRecord(update._meta), workerName: trackedWorker } }
+          : update;
+        applySwarmAcpUpdate(worker.swarm, updateWithWorker, Date.now(), { hasOtherOpenWorkerTools });
+      }
     }
-    if (kind === "tool_call" || kind === "tool_call_update") this.trackTool(worker, update, turn);
     if (kind === "usage_update") {
       // A model call after a still-running tool means the model left it running in the background.
       for (const tool of worker.tools.values()) if (tool.status === "pending" || tool.status === "in_progress") tool.background = true;
@@ -1520,33 +1778,109 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const entries = Object.entries(properties);
     if (!entries.length) return { action: "decline" };
     const required = new Set(request.requestedSchema.required ?? []);
-    const fieldMap: Array<{ key: string; answerKey: string; multiSelect: boolean; options: Array<{ label: string; value: string }> }> = [];
-    const questions = entries.map(([key, schema]: [string, ElicitationPropertySchema], index) => {
+    const isZh = (ctx.turn?.locale ?? worker.lastLocale) === "zh";
+    const answerKeys = new Set<string>();
+    const fieldMap: Array<{
+      key: string;
+      answerKey: string;
+      type: "string" | "number" | "integer" | "boolean" | "array";
+      required: boolean;
+      constrained: boolean;
+      minimum?: number;
+      maximum?: number;
+      minItems?: number;
+      maxItems?: number;
+      options: ElicitationOption[];
+    }> = [];
+    const questions: Array<{
+      question: string;
+      header: string;
+      multi_select: boolean;
+      required: boolean;
+      allowFreeText: boolean;
+      min_selections?: number;
+      max_selections?: number;
+      options: Array<{ label: string; description?: string }>;
+    }> = [];
+    for (let index = 0; index < entries.length; index++) {
+      const [key, schema] = entries[index]! as [string, ElicitationPropertySchema];
+      if (!schema || typeof schema !== "object") return { action: "decline" };
+      const schemaType = (schema as { type?: unknown }).type;
+      if (schemaType !== "string" && schemaType !== "number" && schemaType !== "integer" && schemaType !== "boolean" && schemaType !== "array") {
+        return { action: "decline" };
+      }
       const header = (typeof schema.title === "string" && schema.title.trim()) || request.requestedSchema.title?.trim() || `Question ${index + 1}`;
-      const questionText = (typeof schema.description === "string" && schema.description.trim()) || (entries.length === 1 ? request.message.trim() : "") || header;
-      const options: Array<{ label: string; value: string; description?: string }> = [];
-      if (schema.type === "string" && Array.isArray(schema.oneOf)) {
-        for (const opt of schema.oneOf) options.push({ label: opt.title.trim() || opt.const, value: opt.const, ...(opt.description?.trim() ? { description: opt.description.trim() } : {}) });
-      } else if (schema.type === "string" && Array.isArray(schema.enum)) {
-        for (const v of schema.enum) options.push({ label: v, value: v });
-      } else if (schema.type === "array" && schema.items && typeof schema.items === "object") {
+      const baseQuestion = (typeof schema.description === "string" && schema.description.trim()) || (entries.length === 1 ? request.message.trim() : "") || header;
+      let answerKey = baseQuestion;
+      if (answerKeys.has(answerKey)) {
+        answerKey = `${baseQuestion} (${index + 1})`;
+      }
+      while (answerKeys.has(answerKey)) {
+        answerKey = `${answerKey} (${key})`;
+      }
+      answerKeys.add(answerKey);
+
+      const options: ElicitationOption[] = [];
+      let constrained = false;
+      let minimum: number | undefined;
+      let maximum: number | undefined;
+      let minItems: number | undefined;
+      let maxItems: number | undefined;
+      if (schema.type === "string") {
+        if (Array.isArray(schema.oneOf)) {
+          constrained = true;
+          for (const opt of schema.oneOf) options.push({ label: opt.title.trim() || opt.const, value: opt.const, ...(opt.description?.trim() ? { description: opt.description.trim() } : {}) });
+        } else if (Array.isArray(schema.enum)) {
+          constrained = true;
+          for (const v of schema.enum) options.push({ label: v, value: v });
+        }
+      } else if (schema.type === "boolean") {
+        constrained = true;
+        options.push(
+          { label: isZh ? "是" : "Yes", value: "true" },
+          { label: isZh ? "否" : "No", value: "false" },
+        );
+      } else if (schema.type === "number" || schema.type === "integer") {
+        if (typeof schema.minimum === "number" && Number.isFinite(schema.minimum)) minimum = schema.minimum;
+        if (typeof schema.maximum === "number" && Number.isFinite(schema.maximum)) maximum = schema.maximum;
+      } else if (schema.type === "array") {
+        if (!schema.items || typeof schema.items !== "object") return { action: "decline" };
         if ("anyOf" in schema.items && Array.isArray(schema.items.anyOf)) {
+          constrained = true;
           for (const opt of schema.items.anyOf) options.push({ label: opt.title.trim() || opt.const, value: opt.const, ...(opt.description?.trim() ? { description: opt.description.trim() } : {}) });
         } else if ("enum" in schema.items && Array.isArray(schema.items.enum)) {
+          constrained = true;
           for (const v of schema.items.enum) options.push({ label: v, value: v });
+        } else {
+          return { action: "decline" };
         }
+        if (typeof schema.minItems === "number" && Number.isFinite(schema.minItems)) minItems = schema.minItems;
+        if (typeof schema.maxItems === "number" && Number.isFinite(schema.maxItems)) maxItems = schema.maxItems;
       }
-      const multiSelect = schema.type === "array";
-      fieldMap.push({ key, answerKey: questionText, multiSelect, options });
-      return {
-        question: questionText,
+      const multiSelect = schemaType === "array";
+      fieldMap.push({
+        key,
+        answerKey,
+        type: schemaType,
+        required: required.has(key),
+        constrained,
+        ...(minimum !== undefined ? { minimum } : {}),
+        ...(maximum !== undefined ? { maximum } : {}),
+        ...(minItems !== undefined ? { minItems } : {}),
+        ...(maxItems !== undefined ? { maxItems } : {}),
+        options,
+      });
+      questions.push({
+        question: answerKey,
         header,
         multi_select: multiSelect,
         required: required.has(key),
-        allowFreeText: true,
+        allowFreeText: !constrained,
+        ...(multiSelect && minItems !== undefined ? { min_selections: minItems } : {}),
+        ...(multiSelect && maxItems !== undefined ? { max_selections: maxItems } : {}),
         options: options.map(({ label, description }) => ({ label, ...(description ? { description } : {}) })),
-      };
-    });
+      });
+    }
 
     const approval: EngineApprovalRequest = {
       engine: "antigravity",
@@ -1569,15 +1903,39 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (ctx.signal.aborted || (ctx.turn && ctx.turn.done) || worker.removed || worker.closing) return { action: "cancel" };
     if (decision.behavior !== "allow") return { action: "decline" };
     const answers = asRecord(asRecord(decision.updatedInput)?.answers) ?? {};
-    const content: Record<string, string | string[]> = {};
+    const content: Record<string, ElicitationContentValue> = {};
     for (const field of fieldMap) {
       const raw = answers[field.answerKey] ?? answers[field.key];
-      if (typeof raw !== "string" || !raw.trim()) continue;
-      if (field.multiSelect) {
-        const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
-        content[field.key] = parts.map((part) => field.options.find((o) => o.label === part)?.value ?? part);
+      const missing = raw === undefined || raw === null || (typeof raw === "string" && !raw.trim());
+      if (missing) {
+        if (field.required) return { action: "decline" };
+        continue;
+      }
+      if (field.type === "boolean") {
+        const parsed = parseBooleanElicitationAnswer(raw);
+        if (parsed === undefined) return { action: "decline" };
+        content[field.key] = parsed;
+      } else if (field.type === "number" || field.type === "integer") {
+        const parsed = parseNumberElicitationAnswer(raw, field.type === "integer", field.minimum, field.maximum);
+        if (parsed === undefined) return { action: "decline" };
+        content[field.key] = parsed;
+      } else if (field.type === "array") {
+        const parsed = parseMultiSelectElicitationAnswer(raw, field.options);
+        if (!parsed) return { action: "decline" };
+        if (field.required && parsed.length === 0) return { action: "decline" };
+        if (field.minItems !== undefined && parsed.length < field.minItems) return { action: "decline" };
+        if (field.maxItems !== undefined && parsed.length > field.maxItems) return { action: "decline" };
+        content[field.key] = parsed;
       } else {
-        content[field.key] = field.options.find((o) => o.label === raw.trim())?.value ?? raw.trim();
+        if (typeof raw !== "string") return { action: "decline" };
+        const trimmed = raw.trim();
+        if (field.constrained) {
+          const matched = matchElicitationOption(field.options, trimmed);
+          if (!matched) return { action: "decline" };
+          content[field.key] = matched.value;
+        } else {
+          content[field.key] = trimmed;
+        }
       }
     }
     return { action: "accept", content };
@@ -1607,6 +1965,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private removeWorker(worker: Worker): void {
     worker.removed = true;
     worker.backgroundApprovals.abort();
+    for (const notify of worker.commandCloseWaiters) notify();
+    worker.commandCloseWaiters.clear();
     worker.rejectStart?.(worker.failure ?? new Error("Antigravity ACP worker is no longer available"));
     for (const [key, candidate] of this.workers) if (candidate === worker) this.workers.delete(key);
   }

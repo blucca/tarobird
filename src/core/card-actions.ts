@@ -849,11 +849,13 @@ export async function stopCoreConversation(
   locale?: Locale,
 ) {
   const active = runtime.activeRuns.get(conversationKey);
+  const concurrent = [...(runtime.concurrentRuns.get(conversationKey) ?? [])];
+  const hasForegroundRun = Boolean(active) || concurrent.length > 0;
   const reason = channelProfile() === "gateway" ? APP_USER_STOP_REASON : undefined;
   // Let a goal route stop to its live ordinary turns before they are aborted;
   // otherwise it mistakes this same stop request for a second goal-level stop.
   active?.abortController.abort(reason);
-  for (const run of runtime.concurrentRuns.get(conversationKey) ?? []) run.abortController.abort(reason);
+  for (const run of concurrent) run.abortController.abort(reason);
   // A goal's own question closes with the goal's signal. When this stop was
   // routed to an attached ordinary turn, the surviving pursuit keeps it.
   const survivingGoal = active?.abortController instanceof CoreGoalRunController && !active.abortController.signal.aborted
@@ -861,10 +863,15 @@ export async function stopCoreConversation(
   const cancelledQuestions = [...runtime.pendingApprovals.values()].filter(p => p.asyncQuestion && p.conversationKey === conversationKey
     && (!survivingGoal || p.abortSignal !== survivingGoal));
   for (const pending of cancelledQuestions) pending.abortHandler?.();
-  const background: { stopped: boolean; summary?: string } = bridge?.stopBackgroundWork
+  // When an active foreground turn (or surviving goal) already owns this stop,
+  // its abort handler manages cancellation cleanly (preserving session/cancel
+  // grace for ordinary ACP turns while still stopping active swarms). Only stop
+  // post-turn background swarms here when no foreground run owns the stop.
+  const background: { stopped: boolean; summary?: string } = !hasForegroundRun && !survivingGoal && bridge?.stopBackgroundWork
     ? await bridge.stopBackgroundWork({
       chatId: stableCoreNumericId(conversationKey),
       conversationKey,
+      scope: "swarm",
       ...(locale ? { locale } : {}),
     }).catch(() => ({ stopped: false }))
     : { stopped: false };

@@ -210,7 +210,7 @@ export interface CoreBridgeLike {
   /** Whether the engine has delivered an authoritative advertised-command snapshot yet. */
   hasReceivedAdvertisedCommands?(): boolean;
   /** Stop background native work (such as an active Antigravity swarm) after its initiating turn ended. */
-  stopBackgroundWork?(input: { chatId: number; conversationKey: string; locale?: "en" | "zh" }): Promise<{ stopped: boolean; summary?: string }>;
+  stopBackgroundWork?(input: { chatId: number; conversationKey: string; locale?: "en" | "zh"; scope?: "swarm" | "all" }): Promise<{ stopped: boolean; summary?: string }>;
   getPiSession?(input: { chatId: number; conversationKey: string; isCurrentSession?: () => Promise<boolean> }): Promise<PiSessionSnapshot>;
   changePiSession?(input: { chatId: number; conversationKey: string; isCurrentSession?: () => Promise<boolean> } & Pick<PiSessionChange, "expectedSession" | "action" | "value">): Promise<PiSessionResult>;
   stopTask?(input: { chatId: number; conversationKey: string; taskId: string; isCurrentSession?: () => Promise<boolean> }): Promise<EngineTaskControlResult>;

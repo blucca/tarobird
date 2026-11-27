@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -12,7 +12,7 @@ import {
   type AgyAcpChildProcess,
   type SpawnAgyAcp,
 } from "../src/codex/antigravity-acp-adapter.js";
-import { antigravityVersionSupportsSwarm } from "../src/codex/antigravity-acp-support.js";
+import { antigravityVersionSupportsSwarm, resolveAntigravityExecutable } from "../src/codex/antigravity-acp-support.js";
 import {
   extractWorkerAttribution,
   mergeSwarmSnapshots,
@@ -21,7 +21,7 @@ import {
   swarmMembersToEngineTasks,
 } from "../src/codex/antigravity-swarm.js";
 import { renderCoreApprovalCard } from "../src/core/card-renderer.js";
-import { requestCoreApproval } from "../src/core/card-actions.js";
+import { requestCoreApproval, stopCoreConversation } from "../src/core/card-actions.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import { attachGateway } from "../src/gateway/service.js";
 import { hashSecret } from "../src/hub/auth.js";
@@ -71,6 +71,8 @@ class FakeSwarmAgyServer {
     { name: "compact", description: "Compact conversation" },
     { name: "swarm", description: "Start a multi-agent swarm (Preview & Quota Heavy)" },
   ];
+  /** Optional delay (ms) after session/new or session/resume to emit available_commands_update automatically. */
+  autoAdvertiseDelayMs?: number;
   private inputBuffer = "";
   private nextRequestId = 1;
 
@@ -123,7 +125,11 @@ class FakeSwarmAgyServer {
     return id;
   }
 
-  requestElicitation(opts: { workerName?: string; message?: string } = {}): string {
+  requestElicitation(opts: {
+    workerName?: string;
+    message?: string;
+    requestedSchema?: Record<string, unknown>;
+  } = {}): string {
     const id = String(this.nextRequestId++);
     this.send({
       jsonrpc: "2.0",
@@ -133,7 +139,7 @@ class FakeSwarmAgyServer {
         sessionId: this.sessionId,
         mode: "form",
         message: opts.message ?? "Pick a database engine for auth",
-        requestedSchema: {
+        requestedSchema: opts.requestedSchema ?? {
           type: "object",
           required: ["db"],
           properties: {
@@ -189,6 +195,22 @@ class FakeSwarmAgyServer {
         id: message.id,
         result: { sessionId: this.sessionId, modes: { currentModeId: "default", availableModes: [] }, configOptions: [] },
       });
+      if (this.autoAdvertiseDelayMs !== undefined) {
+        setTimeout(() => this.advertiseCommands(), this.autoAdvertiseDelayMs);
+      }
+      return;
+    }
+    if (message.method === "session/resume") {
+      const requested = typeof message.params?.sessionId === "string" ? message.params.sessionId : this.sessionId;
+      this.sessionId = requested;
+      this.send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { modes: { currentModeId: "default", availableModes: [] }, configOptions: [] },
+      });
+      if (this.autoAdvertiseDelayMs !== undefined) {
+        setTimeout(() => this.advertiseCommands(), this.autoAdvertiseDelayMs);
+      }
       return;
     }
     if (message.method === "session/prompt") {
@@ -221,7 +243,7 @@ function createSwarmHarness(configure?: (server: FakeSwarmAgyServer) => void) {
   const spawnFn: SpawnAgyAcp = (() => {
     const stdout = new FakeReadable();
     const stderr = new FakeReadable();
-    const child = new EventEmitter() as EventEmitter & AgyAcpChildProcess & { pid: number };
+    const child = new EventEmitter() as EventEmitter & AgyAcpChildProcess & { pid: number; killed: boolean; kill: () => boolean };
     child.pid = nextPid++;
     const server = new FakeSwarmAgyServer(stdout, "swarm-sess-1", log);
     configure?.(server);
@@ -579,6 +601,520 @@ describe("AntigravityAcpAdapter /swarm lifecycle", () => {
       const snap = await hub.store.snapshot("owner", conv.id);
       expect(snap.messages.some((m) => JSON.stringify(m.blocks).includes("Stopped the active swarm"))).toBe(true);
     } finally {
+      await channel.disconnect();
+      await hub.close();
+    }
+  }, 20_000);
+
+  it("preserves ordinary ACP sessions and background shell commands on /stop and never poisons stoppedSwarmSessions (Bug 1)", async () => {
+    const env = await setupEnv();
+    const harness = createSwarmHarness();
+    const adapter = new AntigravityAcpAdapter("agy", {
+      ...env,
+      spawnFn: harness.spawnFn,
+      killProcessTreeFn: harness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+      cancelGraceMs: 200,
+    });
+    adapters.push(adapter);
+
+    // First turn starts a background shell command and finishes.
+    const first = adapter.sendUserMessage("tarobot-1", {
+      text: "start watcher",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "shell_bg_1",
+      name: "run_command",
+      kind: "execute",
+      status: "in_progress",
+      title: "npm run dev",
+      rawInput: { CommandLine: "npm run dev" },
+    });
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 100, size: 10_000 });
+    server.text("Watcher started.");
+    server.respondPrompt();
+    await first;
+
+    // Default swarm-scoped stopBackgroundWork must NOT kill a non-swarm session with a background shell command.
+    const noopStop = await adapter.stopBackgroundWork("swarm-sess-1", { locale: "en" });
+    expect(noopStop.stopped).toBe(false);
+    expect(harness.log.some((entry) => entry.startsWith("close:"))).toBe(false);
+
+    // Ordinary foreground turn awaiting approval: stopCoreConversation must cancel via session/cancel, NOT call stopBackgroundWork or kill worker.
+    const runtime = createCoreServiceRuntime();
+    const ac = new AbortController();
+    runtime.activeRuns.set("lark:c1", { abortController: ac, hasRunCard: false } as never);
+    const stopBgSpy = vi.fn(async () => adapter.stopBackgroundWork("swarm-sess-1", { locale: "en", scope: "swarm" }));
+
+    let releasePerm!: () => void;
+    const second = adapter.sendUserMessage("swarm-sess-1", {
+      text: "run check",
+      files: [],
+      abortSignal: ac.signal,
+      onApprovalRequest: async (req) => {
+        await new Promise<void>((resolve) => {
+          releasePerm = resolve;
+          req.abortSignal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return { behavior: "deny" };
+      },
+    });
+    await waitFor(() => server.prompts.length === 2);
+    server.requestPermission({ toolCallId: "perm_fg", command: "npm test" });
+    await waitFor(() => releasePerm !== undefined);
+
+    const stopRes = await stopCoreConversation(runtime, "lark:c1", undefined, { stopBackgroundWork: stopBgSpy }, "en");
+    expect(stopRes.active).toBeDefined();
+    expect(stopRes.backgroundStopped).toBe(false);
+    expect(stopBgSpy).not.toHaveBeenCalled();
+    await expect(second).rejects.toThrow("Task was stopped by user");
+    // Session stayed alive (only session/cancel, never session/close or kill).
+    expect(harness.log).toEqual(["cancel:swarm-sess-1"]);
+    expect(harness.children).toHaveLength(1);
+
+    // Follow-up turn still reuses the exact same live ACP worker!
+    const third = adapter.sendUserMessage("swarm-sess-1", {
+      text: "still alive?",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => server.prompts.length === 3);
+    server.text("yes");
+    server.respondPrompt();
+    await expect(third).resolves.toMatchObject({ text: "yes" });
+    expect(harness.children).toHaveLength(1);
+  });
+
+  it("ignores non-swarm board/prefixed/subagent tool updates so ordinary conversations keep timeouts, reaping, and drain (Bug 2)", async () => {
+    const env = await setupEnv();
+    const harness = createSwarmHarness();
+    const adapter = new AntigravityAcpAdapter("agy", {
+      ...env,
+      spawnFn: harness.spawnFn,
+      killProcessTreeFn: harness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+      idleWorkerTtlMs: 30,
+      idleSweepIntervalMs: 10,
+      inactivityTimeoutMs: 60,
+      cancelGraceMs: 200,
+    });
+    adapters.push(adapter);
+
+    const reply = adapter.sendUserMessage("tarobot-1", {
+      text: "update whiteboard and check git",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+
+    // Emit updates that previously triggered false-positive swarm activation.
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "t1", name: "whiteboard_draw", status: "in_progress", title: "Draw box" });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t1", name: "whiteboard_draw", status: "completed" });
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "t2", name: "clipboard_read", status: "in_progress", title: "[git] status" });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t2", name: "clipboard_read", status: "completed" });
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "t3", name: "dashboard_query", status: "in_progress", _meta: { agentName: "helper-bot", subagentName: "sub1" }, title: "@scope: query" });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t3", name: "dashboard_query", status: "completed" });
+    server.text("Done.");
+    server.respondPrompt();
+    await reply;
+
+    const snap = await adapter.listTasks("swarm-sess-1");
+    expect(snap.swarm).toBeUndefined();
+    expect(adapter.hasPendingNativeWork()).toBe(false);
+
+    // Idle reaper must still reap this ordinary idle worker!
+    await waitFor(() => harness.log.includes("close:swarm-sess-1"), 1_500);
+    expect(harness.log).toContain("close:swarm-sess-1");
+  });
+
+  it("synchronizes worker.swarm.active across natural completion, second /swarm over stale files, and resumed file-only swarms (Bug 3)", async () => {
+    const env = await setupEnv();
+    const harness = createSwarmHarness();
+    const adapter = new AntigravityAcpAdapter("agy", {
+      ...env,
+      spawnFn: harness.spawnFn,
+      killProcessTreeFn: harness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+      commandsAdvertiseTimeoutMs: 20,
+      cancelGraceMs: 200,
+    });
+    adapters.push(adapter);
+
+    // 1. Start first /swarm.
+    const firstSwarm = adapter.sendUserMessage("tarobot-1", {
+      text: "/swarm first audit",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.advertiseCommands();
+    await writeSwarmFiles(env.brainDir, "swarm-sess-1", {
+      members: { title: "First", members: [{ name: "w1", state: "working" }] },
+    });
+    server.text("Started swarm 1.");
+    server.respondPrompt();
+    await firstSwarm;
+    expect(adapter.hasPendingNativeWork()).toBe(true);
+
+    // 2. Swarm 1 finishes naturally in members.json.
+    const finishedAt = Date.now() + 10;
+    await writeSwarmFiles(env.brainDir, "swarm-sess-1", {
+      members: { title: "First", members: [{ name: "w1", state: "done", updatedAt: finishedAt }] },
+    });
+    // hasPendingNativeWork must immediately see completion without waiting for idle reaper!
+    expect(adapter.hasPendingNativeWork()).toBe(false);
+    const afterDoneSnap = await adapter.listTasks("swarm-sess-1");
+    expect(afterDoneSnap.swarm?.active).toBe(false);
+
+    // Ordinary turn + /stop after completion must NOT kill the live ACP worker.
+    const ac = new AbortController();
+    const ordinary = adapter.sendUserMessage("swarm-sess-1", {
+      text: "@someone ordinary message",
+      files: [],
+      instructions: "Platform rules",
+      abortSignal: ac.signal,
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => server.prompts.length === 2);
+    // After swarm ended, @someone must stay wrapped inside <user_message>, not unwrapped!
+    const ordinaryBlocks = server.prompts[1]!.params!.prompt as Array<{ text: string }>;
+    expect(ordinaryBlocks[0]!.text).toContain("<private_bridge_instructions>");
+    expect(ordinaryBlocks[1]!.text).toBe("<user_message>\n@someone ordinary message\n</user_message>");
+    ac.abort();
+    await expect(ordinary).rejects.toThrow("Task was stopped by user");
+    expect(harness.log).toEqual(["cancel:swarm-sess-1"]);
+
+    // 3. Backdate old members.json slightly and start a SECOND /swarm in the same session.
+    const oldTime = new Date(Date.now() - 5_000);
+    const membersPath = path.join(env.brainDir, "swarm-sess-1", ".system_generated", "swarm", "members.json");
+    await utimes(membersPath, oldTime, oldTime);
+
+    const secondSwarm = adapter.sendUserMessage("swarm-sess-1", {
+      text: "/swarm second audit",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => server.prompts.length === 3);
+    server.text("Started swarm 2.");
+    server.respondPrompt();
+    await secondSwarm;
+
+    // Stale finished members.json from swarm 1 MUST NOT deactivate swarm 2!
+    expect(adapter.hasPendingNativeWork()).toBe(true);
+    const secondSnap = await adapter.listTasks("swarm-sess-1");
+    expect(secondSnap.swarm?.active).toBe(true);
+
+    // 4. Resumed session with file-only active swarm protects Gateway drain immediately.
+    await writeSwarmFiles(env.brainDir, "resumed-file-swarm", {
+      members: { title: "Resumed swarm", members: [{ name: "worker-a", state: "working" }] },
+    });
+    const resumedTurn = adapter.sendUserMessage("resumed-file-swarm", {
+      text: "check status",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => harness.children[1]?.server.prompts.length === 1);
+    const resumedServer = harness.children[1]!.server;
+    resumedServer.text("Still running.");
+    resumedServer.respondPrompt();
+    await resumedTurn;
+    expect(adapter.hasPendingNativeWork()).toBe(true);
+  });
+
+  it("blocks first-turn /swarm when available_commands_update arrives asynchronously without swarm (Bug 5)", async () => {
+    const env = await setupEnv();
+    const unadvertisedHarness = createSwarmHarness((server) => {
+      server.availableCommands = [{ name: "compact", description: "Compact" }];
+      server.autoAdvertiseDelayMs = 25;
+    });
+    const adapter = new AntigravityAcpAdapter("agy", {
+      ...env,
+      spawnFn: unadvertisedHarness.spawnFn,
+      killProcessTreeFn: unadvertisedHarness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+      commandsAdvertiseTimeoutMs: 500,
+    });
+    adapters.push(adapter);
+
+    // Send /swarm as the VERY FIRST message on a fresh Bot.
+    const reply = await adapter.sendUserMessage("tarobot-1", {
+      text: "/swarm parallel check",
+      files: [],
+      locale: "zh",
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    expect(reply.text).toContain("未开放 `/swarm`");
+    expect(unadvertisedHarness.children[0]!.server.prompts).toHaveLength(0);
+  });
+
+  it("unwraps @worker when worker.swarm.members has partial ACP membership while target exists only in members.json (Bug 6)", async () => {
+    const env = await setupEnv();
+    const harness = createSwarmHarness((server) => { server.autoAdvertiseDelayMs = 5; });
+    const adapter = new AntigravityAcpAdapter("agy", {
+      ...env,
+      spawnFn: harness.spawnFn,
+      killProcessTreeFn: harness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+    });
+    adapters.push(adapter);
+
+    const start = adapter.sendUserMessage("tarobot-1", {
+      text: "/swarm fix auth and verify",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    // ACP update populates only auth-fix, while members.json has both auth-fix and verifier.
+    server.sendUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "sw_add_1",
+      name: "swarm",
+      title: "swarm add auth-fix",
+      status: "completed",
+      rawInput: { action: "add", name: "auth-fix", brief: "Fix auth" },
+    });
+    await waitFor(() => true);
+    // Tool-derived worker updates inside an existing swarm cleanly transition out of "working" on completion.
+    server.sendUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "worker_cmd_1",
+      name: "run_command",
+      title: "npm test",
+      status: "in_progress",
+      _meta: { workerName: "temp-runner" },
+    });
+    const midSnap = await adapter.listTasks("swarm-sess-1");
+    expect(midSnap.swarm?.members.find((m) => m.name === "temp-runner")?.state).toBe("working");
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "worker_cmd_1",
+      name: "run_command",
+      title: "npm test",
+      status: "completed",
+      _meta: { workerName: "temp-runner" },
+    });
+    const afterToolSnap = await adapter.listTasks("swarm-sess-1");
+    expect(afterToolSnap.swarm?.members.find((m) => m.name === "temp-runner")?.state).toBe("done");
+
+    await writeSwarmFiles(env.brainDir, "swarm-sess-1", {
+      members: {
+        members: [
+          { name: "auth-fix", state: "working" },
+          { name: "verifier", state: "waiting" },
+        ],
+      },
+    });
+    server.text("Swarm launched.");
+    server.respondPrompt();
+    await start;
+
+    const mention = adapter.sendUserMessage("swarm-sess-1", {
+      text: "@verifier run the full auth suite",
+      files: [],
+      instructions: "Platform rules",
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => server.prompts.length === 2);
+    const blocks = server.prompts[1]!.params!.prompt as Array<{ text: string }>;
+    expect(blocks[0]!.text).toBe("@verifier run the full auth suite");
+    server.text("Routed to verifier.");
+    server.respondPrompt();
+    await mention;
+  });
+
+  it("coerces boolean/number/integer elicitation fields, deduplicates duplicate question keys, and declines invalid values (Bug 7)", async () => {
+    const env = await setupEnv();
+    const harness = createSwarmHarness();
+    const adapter = new AntigravityAcpAdapter("agy", {
+      ...env,
+      spawnFn: harness.spawnFn,
+      killProcessTreeFn: harness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+    });
+    adapters.push(adapter);
+
+    const seen: EngineApprovalRequest[] = [];
+    let nextAnswers: Record<string, unknown> = {};
+    const turn = adapter.sendUserMessage("tarobot-1", {
+      text: "configure",
+      files: [],
+      locale: "en",
+      onApprovalRequest: async (req) => {
+        seen.push(req);
+        return { behavior: "allow", updatedInput: { answers: nextAnswers } };
+      },
+    });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+
+    // Duplicate fallback titles/descriptions (both omit title/description while requestedSchema.title is shared) + boolean/number/integer.
+    nextAnswers = {
+      "Deploy Options": "Yes",
+      "Deploy Options (2)": "4",
+      "Threshold": "0.75",
+    };
+    const elicitOk = server.requestElicitation({
+      message: "Configure rollout",
+      requestedSchema: {
+        type: "object",
+        title: "Deploy Options",
+        required: ["confirm", "replicas", "threshold"],
+        properties: {
+          confirm: { type: "boolean" },
+          replicas: { type: "integer", minimum: 1, maximum: 10 },
+          threshold: { type: "number", title: "Threshold" },
+        },
+      },
+    });
+    await waitFor(() => server.clientResponses.has(elicitOk));
+    const askQuestions = (seen.at(-1)?.toolInput as { questions: Array<{ question: string; options: Array<{ label: string }> }> }).questions;
+    expect(askQuestions.map((q) => q.question)).toEqual(["Deploy Options", "Deploy Options (2)", "Threshold"]);
+    expect(askQuestions[0]!.options.map((o) => o.label)).toEqual(["Yes", "No"]);
+    expect(server.clientResponses.get(elicitOk)?.result).toEqual({
+      action: "accept",
+      content: { confirm: true, replicas: 4, threshold: 0.75 },
+    });
+
+    // Non-integer value for integer field must decline rather than send a corrupt string.
+    nextAnswers = { "Replicas": "3.5" };
+    const elicitBad = server.requestElicitation({
+      requestedSchema: {
+        type: "object",
+        required: ["replicas"],
+        properties: {
+          replicas: { type: "integer", title: "Replicas" },
+        },
+      },
+    });
+    await waitFor(() => server.clientResponses.has(elicitBad));
+    expect(server.clientResponses.get(elicitBad)?.result).toEqual({ action: "decline" });
+
+    server.text("Configured.");
+    server.respondPrompt();
+    await turn;
+  });
+
+  it("rejects unrelated nested objects and unrecognized container schemas in members.json (Bug 8)", async () => {
+    const { brainDir } = await setupEnv();
+    await writeSwarmFiles(brainDir, "sess-meta", {
+      members: { version: 2, metadata: { owner: "agy" }, settings: { max: 4 } },
+    });
+    const metaParsed = await readSwarmBoardFiles(brainDir, "sess-meta");
+    expect(metaParsed.found).toBe(true);
+    expect(metaParsed.members).toEqual([]);
+    expect(metaParsed.formatUnknown).toBe(true);
+
+    await writeSwarmFiles(brainDir, "sess-entries", {
+      members: { entries: [{ name: "a", state: "working" }] },
+    });
+    const entriesParsed = await readSwarmBoardFiles(brainDir, "sess-entries");
+    expect(entriesParsed.found).toBe(true);
+    expect(entriesParsed.members).toEqual([]);
+    expect(entriesParsed.formatUnknown).toBe(true);
+
+    await writeSwarmFiles(brainDir, "sess-map", {
+      members: { "auth-fix": { state: "working", model: "gemini-4-neon" } },
+    });
+    const mapParsed = await readSwarmBoardFiles(brainDir, "sess-map");
+    expect(mapParsed.formatUnknown).toBe(false);
+    expect(mapParsed.members).toHaveLength(1);
+    expect(mapParsed.members[0]?.name).toBe("auth-fix");
+
+    await writeSwarmFiles(brainDir, "sess-empty-roster", {
+      members: { members: [] },
+    });
+    const emptyRoster = await readSwarmBoardFiles(brainDir, "sess-empty-roster");
+    expect(emptyRoster.formatUnknown).toBe(false);
+    expect(emptyRoster.members).toEqual([]);
+  });
+
+  it("uses ANTIGRAVITY_EXECUTABLE and keeps gateway commands RPC non-blocking with negative TTL cache (Bug 4)", async () => {
+    expect(resolveAntigravityExecutable({ ANTIGRAVITY_EXECUTABLE: "\"/custom/bin/agy\"", ANTIGRAVITY_CMD: "/wrong/agy" })).toBe("/custom/bin/agy");
+
+    const root = await mkdtemp(path.join(os.tmpdir(), "agy-gw-cmd-"));
+    tempRoots.push(root);
+    const stateDir = path.join(root, "bot");
+    await mkdir(stateDir);
+    await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "antigravity", antigravityRuntime: "acp", locale: "en" }));
+
+    const fakeAgy = path.join(root, "fake-agy.sh");
+    await writeFile(fakeAgy, "#!/bin/sh\necho 'antigravity 1.5.17'\n");
+    await chmod(fakeAgy, 0o755);
+
+    const prevExec = process.env.ANTIGRAVITY_EXECUTABLE;
+    const prevCmd = process.env.ANTIGRAVITY_CMD;
+    process.env.ANTIGRAVITY_EXECUTABLE = fakeAgy;
+    process.env.ANTIGRAVITY_CMD = "/nonexistent/agy-cmd";
+
+    const hub = await HubServer.start({ stateDir: path.join(root, "hub") });
+    const secret = randomBytes(32).toString("base64url");
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('agy-cmd-bot','AGY Cmd Bot',?)", [hashSecret(secret)]);
+    const channel = await attachGateway({
+      stateDir,
+      url: hub.url.replace("http", "ws") + "/instance",
+      botId: "agy-cmd-bot",
+      secret,
+      engine: "antigravity",
+      bridge: {
+        handleAuthorizedMessage: vi.fn(async () => ({ text: "ok" })),
+        advertisedCommands: () => [],
+        hasReceivedAdvertisedCommands: () => false,
+      },
+      runtime: createCoreServiceRuntime(),
+    });
+    try {
+      // Wait for the eager background probe (or bounded race) to settle and include /swarm from ANTIGRAVITY_EXECUTABLE.
+      let foundSwarm = false;
+      const deadline = Date.now() + 2_500;
+      while (Date.now() < deadline && !foundSwarm) {
+        const commands = await channel.onCall!("commands", { query: "sw" }) as Array<{ command: string }>;
+        if (commands.some((c) => c.command === "swarm")) {
+          foundSwarm = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      expect(foundSwarm).toBe(true);
+
+      // Slow executable must NOT block commands RPC beyond ~250ms race budget.
+      const slowAgy = path.join(root, "slow-agy.sh");
+      await writeFile(slowAgy, "#!/bin/sh\nsleep 2\necho 'antigravity 1.5.17'\n");
+      await chmod(slowAgy, 0o755);
+      process.env.ANTIGRAVITY_EXECUTABLE = slowAgy;
+
+      const t0 = Date.now();
+      const fastResult = await channel.onCall!("commands", { query: "" }) as Array<{ command: string }>;
+      const elapsed = Date.now() - t0;
+      expect(elapsed).toBeLessThan(800);
+      expect(fastResult.length).toBeGreaterThan(0);
+
+      // Failing probe caches negative result (bounded TTL) instead of re-spawning on every keystroke.
+      const countFile = path.join(root, "fail-count.txt");
+      const failAgy = path.join(root, "fail-agy.sh");
+      await writeFile(failAgy, `#!/bin/sh\necho x >> "${countFile}"\nexit 1\n`);
+      await chmod(failAgy, 0o755);
+      process.env.ANTIGRAVITY_EXECUTABLE = failAgy;
+
+      await channel.onCall!("commands", { query: "s" });
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      await channel.onCall!("commands", { query: "sw" });
+      await channel.onCall!("commands", { query: "swa" });
+      const { readFile: readFileAsync } = await import("node:fs/promises");
+      const spawns = (await readFileAsync(countFile, "utf8")).trim().split("\n").filter(Boolean);
+      expect(spawns).toHaveLength(1);
+    } finally {
+      if (prevExec === undefined) delete process.env.ANTIGRAVITY_EXECUTABLE;
+      else process.env.ANTIGRAVITY_EXECUTABLE = prevExec;
+      if (prevCmd === undefined) delete process.env.ANTIGRAVITY_CMD;
+      else process.env.ANTIGRAVITY_CMD = prevCmd;
       await channel.disconnect();
       await hub.close();
     }
