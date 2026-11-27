@@ -1050,10 +1050,15 @@ export class HubConnection {
     this.settleOutbox(removed, false); if (removed) this.outboxChanged(); await this.flush();
   }
   private async ack(id: string, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<void> {
-    const removed = await this.cache.acknowledge(id, messageAccepted, acceptance);
+    const settled = typeof this.cache.acknowledgeReceipt === "function"
+      ? await this.cache.acknowledgeReceipt(id, messageAccepted, acceptance)
+      : { entry: await this.cache.acknowledge(id, messageAccepted, acceptance), alreadyDeleted: false };
     // Another window sharing this cache may have committed the deletion first.
     // Our own sent entry still proves what this authenticated ACK confirms.
-    this.settleOutbox(removed ?? (messageAccepted && this.inflightEntry?.id === id ? this.inflightEntry : undefined), messageAccepted);
+    // An already-committed deletion tombstone retires immediately without
+    // bridging a phantom "sent" row into the outbox UI.
+    const entry = settled.entry ?? (messageAccepted && this.inflightEntry?.id === id ? this.inflightEntry : undefined);
+    this.settleOutbox(entry, messageAccepted && !settled.alreadyDeleted);
     this.outboxChanged();
     if (this.inflightEntry?.id === id) this.inflightEntry = undefined;
     if (this.inflight === id) this.inflight = undefined;

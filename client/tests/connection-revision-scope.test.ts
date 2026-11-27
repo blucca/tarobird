@@ -38,6 +38,7 @@ async function connected({ independent = true, complete = true } = {}) {
     outbox: vi.fn(async () => outbox.map(entry => ({ ...entry }))),
     enqueue: vi.fn(async (frame: ClientFrame) => { outbox.push({ id: frameId(frame), order: ++order, frame } as OutboxEntry); }),
     acknowledge: vi.fn(async (id: string) => { const index = outbox.findIndex(entry => entry.id === id); return index < 0 ? undefined : outbox.splice(index, 1)[0]; }),
+    acknowledgeReceipt: vi.fn(async (id: string) => { const index = outbox.findIndex(entry => entry.id === id); return { entry: index < 0 ? undefined : outbox.splice(index, 1)[0], alreadyDeleted: false }; }),
     discardFailed: vi.fn(async (id: string) => { const index = outbox.findIndex(entry => entry.id === id && entry.error); return index < 0 ? undefined : outbox.splice(index, 1)[0]; }),
     retryFailed: vi.fn(async (id: string) => { const entry = outbox.find(item => item.id === id && item.error); if (!entry) return false; delete entry.error; return true; }),
     fail: vi.fn(async (id: string, error: string) => { const entry = outbox.find(item => item.id === id); if (entry) entry.error = error; }),
@@ -234,4 +235,43 @@ it.each(["message.created", "message.updated"])("publishes a deletion invalidati
   await receive({ type: "event", conversationId: "live", seq: 1, kind, at: Date.now(),
     payload: { id: "deleted-in-other-window", conversationId: "live", authorId: "bot", authorType: "bot", blocks: [], status: "deleted", version: 2, createdAt: Date.now() } });
   expect(connection.groupDiscussionRevision).toBe(before + 1);
+});
+
+it("retires an already-deleted message ACK without bridging a phantom sent receipt or invalidating history", async () => {
+  const { connection, cache, outbox, receive, revisions } = await connected();
+  const before = revisions(), cacheBefore = connection.state.cacheRevision, queueBefore = connection.outboxRevision;
+  await connection.send(send("live", "client_deleted_1"));
+  expect(connection.outboxRevision).toBe(queueBefore + 1);
+
+  cache.acknowledgeReceipt.mockImplementationOnce(async (id: string) => {
+    const index = outbox.findIndex(entry => entry.id === id);
+    return { entry: index < 0 ? undefined : outbox.splice(index, 1)[0], alreadyDeleted: true };
+  });
+  const receipts: { entry: OutboxEntry; revision: number; queueRevision: number; messageAccepted: boolean }[] = [];
+  connection.subscribeOutboxSettlement(receipt => receipts.push(receipt));
+
+  await receive({ type: "message.ack", clientMsgId: "client_deleted_1", messageId: "msg_deleted_1" });
+  expect(cache.acknowledgeReceipt).toHaveBeenCalledWith("client_deleted_1", true, { messageId: "msg_deleted_1" });
+  expect(connection.state.cacheRevision).toBe(cacheBefore);
+  expect(connection.state.outbox).toBe(0);
+  expect(connection.outboxRevision).toBe(queueBefore + 2);
+  expect(revisions()).toEqual(before);
+  expect(receipts).toEqual([expect.objectContaining({
+    entry: expect.objectContaining({ id: "client_deleted_1" }),
+    revision: cacheBefore,
+    queueRevision: queueBefore + 1,
+    messageAccepted: false,
+  })]);
+
+  // Same when another window already removed the outbox entry while inflightEntry matches.
+  await connection.send(send("live", "client_deleted_2"));
+  outbox.length = 0;
+  cache.acknowledgeReceipt.mockResolvedValueOnce({ entry: undefined, alreadyDeleted: true });
+  await receive({ type: "message.ack", clientMsgId: "client_deleted_2", messageId: "msg_deleted_2" });
+  expect(connection.state.cacheRevision).toBe(cacheBefore);
+  expect(revisions()).toEqual(before);
+  expect(receipts.at(-1)).toEqual(expect.objectContaining({
+    entry: expect.objectContaining({ id: "client_deleted_2" }),
+    messageAccepted: false,
+  }));
 });

@@ -74,6 +74,7 @@ export interface Cache extends DBSchema {
   syncMessages: { key: [string, string]; value: Extract<SnapshotFrame, { type: "snapshot.message" }> & { owner: string }; indexes: { owner: string } };
 }
 export type OutboxEntry = Cache["outbox"]["value"];
+export type AcknowledgeResult = { entry?: OutboxEntry; alreadyDeleted: boolean };
 const workbenchItemStores = { whiteboard: "workbenchBoards", markdown: "workbenchMarkdown", design: "workbenchDesign" } as const;
 const workbenchItemId = /^[A-Za-z0-9_-]{1,128}$/;
 function workbenchChange(value: unknown): { scope: string; ids: string[] } | undefined {
@@ -1665,7 +1666,7 @@ export class ClientCache {
     const scope = await this.diffReviewReceiptScope(tx, id);
     await tx.done; if (scope) this.diffReviewsChanged(scope); return true;
   }
-  async discardFailed(id: string): Promise<OutboxEntry | undefined> { return this.removeOutbox(id, true); }
+  async discardFailed(id: string): Promise<OutboxEntry | undefined> { return (await this.removeOutbox(id, true)).entry; }
   private async diffReviewReceiptScope(tx: IDBPTransaction<Cache, StoreNames<Cache>[], "readwrite">, id: string): Promise<DiffReviewScope | undefined> {
     const raw = await tx.objectStore("settings").get(diffReviewReceiptKey(id));
     // Notification lookup must not change generic outbox error handling.
@@ -1696,15 +1697,25 @@ export class ClientCache {
     }
     await settings.delete(diffReviewReceiptKey(id)); return receipt.scope;
   }
-  private async removeOutbox(id: string, failedOnly = false, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<OutboxEntry | undefined> {
-    const tx = await this.write(["outbox", "workbenchDesign", "workbenchDesignMeta"]), store = tx.objectStore("outbox");
+  private async removeOutbox(id: string, failedOnly = false, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<AcknowledgeResult> {
+    const messageId = messageAccepted && acceptance?.messageId ? acceptance.messageId : undefined;
+    const tx = await this.write(["outbox", "workbenchDesign", "workbenchDesignMeta", ...(messageId ? ["messages" as const] : [])]), store = tx.objectStore("outbox");
     let attemptedCommentWrite = false;
     // Return the actual removed entry only after commit. Observe transaction
     // aborts alongside request failures, including reset/identity fences.
     try {
       const entry = await store.get(id);
-      if (failedOnly && !entry?.error) { await tx.done; return undefined; }
+      if (failedOnly && !entry?.error) { await tx.done; return { entry: undefined, alreadyDeleted: false }; }
       if (entry) await store.delete(id);
+      let alreadyDeleted = false;
+      if (messageId) {
+        const existing = await tx.objectStore("messages").get(messageId);
+        alreadyDeleted = existing?.status === "deleted"
+          && (!entry || !("conversationId" in entry.frame) || existing.conversationId === entry.frame.conversationId);
+      } else if (messageAccepted && entry && "conversationId" in entry.frame) {
+        const cached = this.messageCache.inspect(entry.frame.conversationId);
+        alreadyDeleted = !!cached?.messages.some(message => message.clientMsgId === id && message.status === "deleted");
+      }
       // A non-message ACK is not acceptance. Keep the pending receipt so an
       // explicit uncertain retry can use its original immutable ID and frame.
       const scope = messageAccepted || failedOnly ? await this.settleDiffReview(tx, id, messageAccepted) : entry ? await this.diffReviewReceiptScope(tx, id) : undefined;
@@ -1725,7 +1736,7 @@ export class ClientCache {
           await settings.delete(key);
         }
       }
-      await tx.done; if (scope) this.diffReviewsChanged(scope); if(changed)this.designCommentsChanged(changed.scope,[changed.id]);return entry;
+      await tx.done; if (scope) this.diffReviewsChanged(scope); if(changed)this.designCommentsChanged(changed.scope,[changed.id]);return { entry, alreadyDeleted };
     } catch (error) {
       try { tx.abort(); } catch { /* Already completed. */ } await tx.done.catch(() => undefined);
       // Receipt metadata is optional. If storage is full, commit acceptance
@@ -1744,6 +1755,7 @@ export class ClientCache {
     }
     await tx.done; if (scope) this.diffReviewsChanged(scope);
   }
-  async acknowledge(id: string, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<OutboxEntry | undefined> { return this.removeOutbox(id, false, messageAccepted, acceptance); }
+  async acknowledge(id: string, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<OutboxEntry | undefined> { return (await this.removeOutbox(id, false, messageAccepted, acceptance)).entry; }
+  async acknowledgeReceipt(id: string, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<AcknowledgeResult> { return this.removeOutbox(id, false, messageAccepted, acceptance); }
 }
 export const cache = new ClientCache();
