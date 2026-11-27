@@ -3,9 +3,14 @@ import { addGlobalListener, getGlobalListenerStats, subscribeMediaQuery } from "
 
 function createFakeTarget() {
   const native = new Map<string, Set<EventListener>>();
+  const attachments: Array<{ type: string; options?: boolean | AddEventListenerOptions }> = [];
+  const detachments: Array<{ type: string; options?: boolean | EventListenerOptions }> = [];
   return {
     native,
+    attachments,
+    detachments,
     addEventListener(type: string, listener: EventListener, options?: boolean | AddEventListenerOptions) {
+      attachments.push({ type, options });
       const capture = typeof options === "boolean" ? options : !!options?.capture;
       const key = `${type}:${capture ? "1" : "0"}`;
       let set = native.get(key);
@@ -13,6 +18,7 @@ function createFakeTarget() {
       set.add(listener);
     },
     removeEventListener(type: string, listener: EventListener, options?: boolean | EventListenerOptions) {
+      detachments.push({ type, options });
       const capture = typeof options === "boolean" ? options : !!options?.capture;
       const key = `${type}:${capture ? "1" : "0"}`;
       native.get(key)?.delete(listener);
@@ -117,5 +123,35 @@ describe("global-event-hub", () => {
     expect(mqlListeners.size).toBe(1);
     off2();
     expect(mqlListeners.size).toBe(0);
+  });
+
+  it("passes explicit passive: false on direct active registration and passive-to-active upgrade", () => {
+    const fake = createFakeTarget();
+    const target = fake as unknown as Window;
+
+    const offTouch = addGlobalListener(target, "touchstart", () => {}, { passive: false });
+    expect(fake.attachments).toEqual([{ type: "touchstart", options: { capture: false, passive: false } }]);
+    offTouch();
+    expect(fake.detachments).toEqual([{ type: "touchstart", options: undefined }]);
+
+    fake.attachments.length = 0;
+    fake.detachments.length = 0;
+
+    const offPassive = addGlobalListener(target, "wheel", () => {}, { capture: true, passive: true });
+    expect(fake.attachments).toEqual([{ type: "wheel", options: { capture: true, passive: true } }]);
+
+    const offActive = addGlobalListener(target, "wheel", () => {}, { capture: true, passive: false });
+    expect(fake.detachments).toEqual([{ type: "wheel", options: { capture: true } }]);
+    expect(fake.attachments).toEqual([
+      { type: "wheel", options: { capture: true, passive: true } },
+      { type: "wheel", options: { capture: true, passive: false } },
+    ]);
+
+    // Removing the active subscriber downgrades the shared bucket back to passive.
+    offActive();
+    expect(fake.attachments.at(-1)).toEqual({ type: "wheel", options: { capture: true, passive: true } });
+
+    offPassive();
+    expect(fake.native.get("wheel:1")?.size).toBe(0);
   });
 });
