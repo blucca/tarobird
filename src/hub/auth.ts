@@ -32,7 +32,7 @@ export function parsePublicKey(value: string): KeyObject {
     return key;
   } catch { throw new HubError("invalid_device_key"); }
 }
-export type AuthSession = { deviceId: string; userId: string; expiresAt: number };
+export type AuthSession = { deviceId: string; userId: string; expiresAt: number; capabilities?: readonly string[] };
 type Challenge = { deviceId: string; nonce: string; clientNonce: string; expiresAt: number; source: string };
 type PairingRow = { device_id: string; name: string; platform: string; public_key: string; expires_at: number; status: string };
 /** Rate-limit key for a caller; never an authorization input. Addresses are
@@ -406,7 +406,7 @@ export class HubAuth {
     this.challenges.set(connectionId, { nonce, deviceId, clientNonce, expiresAt: this.now() + CHALLENGE_MS, source });
     return { nonce, publicKey: this.publicKey, signature: sign(null, serverProof(deviceId, nonce, clientNonce), this.privateKey).toString("base64") };
   }
-  async authenticate(connectionId: string, signature: string): Promise<AuthSession & { token: string }> {
+  async authenticate(connectionId: string, signature: string, capabilities?: readonly string[]): Promise<AuthSession & { token: string }> {
     const challenge = this.challenges.get(connectionId);
     this.challenges.delete(connectionId); // Consume even on a failed signature.
     if (!challenge || challenge.expiresAt <= this.now()) { await this.store.audit("auth.rejected", challenge?.deviceId ?? null, { reason: "challenge_expired" }); throw new HubError("challenge_expired", 401); }
@@ -417,7 +417,7 @@ export class HubAuth {
     if (!valid || !device) { this.rate(`auth-failed:${JSON.stringify([rateSource(source), deviceId])}`, 5, isLoopback(source) ? "trusted" : "device"); await this.store.audit("auth.rejected", deviceId, { reason: "signature_invalid", source }); throw new HubError("signature_invalid", 401); }
     // A correct proof must not be locked out by another caller's bad signatures.
     const token = randomBytes(32).toString("base64url");
-    const session = { deviceId, userId: device.user_id, expiresAt: this.now() + TOKEN_MS };
+    const session: AuthSession = { deviceId, userId: device.user_id, expiresAt: this.now() + TOKEN_MS, ...(capabilities ? { capabilities: [...capabilities] } : {}) };
     await this.store.db.transaction(async () => {
       await this.validateSessionInTransaction(session);
       await this.store.db.run("UPDATE devices SET last_seen=? WHERE id=?", [this.now(), deviceId]);

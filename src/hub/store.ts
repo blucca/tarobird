@@ -51,8 +51,20 @@ export type TransactionGuard = () => Promise<unknown>;
 /** Frozen-context digest, plus (on a run source) later inputs that may have reached that run. */
 type SteeringInputReceipt = Partial<WorkbenchContextReceipt> & { inputs?: string[]; inputsTruncated?: true };
 const MAX_RUN_INPUTS = 8;
-export type SendMessageInput = { workbench?: WorkbenchContext; groupReplyGuard?: import("../client-protocol/index.js").GroupReplyGuard; parallelCapable?: boolean; groupDiscussion?: Message["groupDiscussion"]; botSource?: Message["botSource"]; conversationId: string; clientMsgId: string; text: string; attachments: string[]; replyTo?: string; mentions?: string[]; previewUrl?: string | null; previewStyle?: LinkPreviewStyle };
+export type SendMessageInput = { workbench?: WorkbenchContext; groupReplyGuard?: import("../client-protocol/index.js").GroupReplyGuard; parallelCapable?: boolean; designatedCapable?: boolean; groupDiscussion?: Message["groupDiscussion"]; botSource?: Message["botSource"]; conversationId: string; clientMsgId: string; text: string; attachments: string[]; replyTo?: string; mentions?: string[]; previewUrl?: string | null; previewStyle?: LinkPreviewStyle };
 export type RemoteGroupDispatch = { userId: string; groupId: string; conversationId: string; message: Message; questionIds: string[] };
+/** Downgraded settings revision returned to pre-1.7 (1.6.0) clients that do not
+ * understand `mode: "designated"` and parse discussion modes with a closed enum. */
+export function groupSettingsCompatRevision(revision: string): string {
+  return `${revision}_compat`;
+}
+/** Projects `designated` as `mentions` with a distinct compat revision for clients
+ * without `groups.cross-host.v1`, keeping their strict Zod parsers & composer usable
+ * for explicit @-mentions while preventing unmentioned sends or silent policy overwrites. */
+export function compatGroupSettings(settings: GroupSettingsSnapshot, designatedCapable: boolean): GroupSettingsSnapshot {
+  if (designatedCapable || settings.policy.mode !== "designated") return settings;
+  return { ...settings, policy: { ...settings.policy, mode: "mentions" }, revision: groupSettingsCompatRevision(settings.revision) };
+}
 export type BotPublishInput = { id?: string; conversationId: string; blocks: Block[]; status?: Message["status"]; replyTo?: string; version?: number };
 export function newId(prefix: string): string { return `${prefix}_${randomUUID().replaceAll("-", "")}`; }
 const historyCursorSchema = z.object({ v: z.literal(1), scope: z.string().regex(/^[a-f0-9]{64}$/), at: z.number().int().safe(), id: z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/) }).strict();
@@ -312,8 +324,8 @@ export class HubStore {
     const revision = `gs_${createHash("sha256").update(JSON.stringify([group.title, [...group.botIds].sort(), policy.mode, policy.botOrder, policy.maxRounds])).digest("hex").slice(0, 40)}`;
     return { group, policy, revision };
   }
-  groupSettings(userId: string, groupId: string, validate?: TransactionGuard): Promise<GroupSettingsSnapshot> {
-    return this.db.serial(async () => { await validate?.(); await this.requireMember(userId, groupId); return this.groupSettingsInTransaction(groupId); });
+  groupSettings(userId: string, groupId: string, validate?: TransactionGuard, options: { designatedCapable?: boolean } = {}): Promise<GroupSettingsSnapshot> {
+    return this.db.serial(async () => { await validate?.(); await this.requireMember(userId, groupId); return compatGroupSettings(await this.groupSettingsInTransaction(groupId), options.designatedCapable ?? true); });
   }
   async updateGroup(userId: string, id: string, input: GroupSettingsInput, validate?: TransactionGuard): Promise<Conversation[]> {
     const change = groupSettingsSchema.parse(input);
@@ -334,6 +346,7 @@ export class HubStore {
       // Requests without a policy keep the original title/member comparison and
       // can never reset a saved discussion mode. A policy edit compares the full
       // settings revision, so a stale mode/order/round view cannot overwrite.
+      if (change.policy && settings.policy.mode === "designated" && change.expectedRevision === groupSettingsCompatRevision(settings.revision)) throw new HubError("group_designated_client_update_required", 409);
       if (current.title !== change.expectedTitle || !same(current.botIds, change.expectedBotIds) || change.policy && change.expectedRevision !== settings.revision) throw new HubError("group_settings_conflict", 409);
       if (change.policy) {
         if (change.policy.botOrder.length !== change.botIds.length || !same(change.policy.botOrder, change.botIds)) throw new HubError("group_discussion_order_invalid");
@@ -494,8 +507,16 @@ export class HubStore {
     if (input.groupReplyGuard) {
       if (conv.type !== "group" || input.botSource || input.groupDiscussion) throw new HubError("group_reply_mode_changed", 409);
       const settings = await this.groupSettingsInTransaction(rootGroup!.id);
-      if (settings.revision !== input.groupReplyGuard.revision || settings.policy.mode !== input.groupReplyGuard.mode
-        || await this.db.get("SELECT 1 FROM group_discussions WHERE group_id=? AND status IN ('running','pausing','paused','ending')", [settings.group.id])) {
+      if (await this.db.get("SELECT 1 FROM group_discussions WHERE group_id=? AND status IN ('running','pausing','paused','ending')", [settings.group.id])) {
+        throw new HubError("group_reply_mode_changed", 409);
+      }
+      const designatedCompatGuard = settings.policy.mode === "designated"
+        && input.designatedCapable === false
+        && input.groupReplyGuard.mode === "mentions"
+        && input.groupReplyGuard.revision === groupSettingsCompatRevision(settings.revision);
+      if (designatedCompatGuard) {
+        if (!input.mentions?.length) throw new HubError("group_designated_client_update_required", 409);
+      } else if (settings.revision !== input.groupReplyGuard.revision || settings.policy.mode !== input.groupReplyGuard.mode) {
         throw new HubError("group_reply_mode_changed", 409);
       }
     }
@@ -550,6 +571,7 @@ export class HubStore {
       remoteTargets = await loadActiveRemoteMembers();
       mentions = [...new Set([...targets, ...remoteTargets.map(r => r.bot_id)])];
     } else if (ordinaryHumanGroup && !activeDiscussion && policy?.mode === "designated" && rootGroup) {
+      if (input.designatedCapable === false) throw new HubError("group_designated_client_update_required", 409);
       const designated = await this.db.get<{ member_key: string }>("SELECT member_key FROM group_designated_member WHERE group_id=?", [rootGroup.id]);
       if (designated?.member_key.startsWith("local:")) {
         const botId = designated.member_key.slice("local:".length);

@@ -40,6 +40,7 @@ import { BOT_MESSAGE_STEER_CAPABILITY, botMessageSteeringCommandSchema } from ".
 import { HubAgentBuses } from "./agent-bus.js";
 import { HubGroupDiscussions } from "./group-discussions.js";
 import { HubCrossHostGroups } from "./group-cross-host.js";
+import { CROSS_HOST_GROUPS_CAPABILITY } from "../client-protocol/group-members.js";
 import { GROUP_DISCUSSION_WORKER_CAPABILITY, GROUP_PARALLEL_CAPABILITY } from "../client-protocol/group-discussion.js";
 import { AGENT_BUS_WORKER_CAPABILITY } from "../client-protocol/agent-bus.js";
 import { BOT_TRANSFER_BYTES } from "./bot-message-transport.js";
@@ -387,8 +388,9 @@ export class HubServer {
       stop: (botId, conversationId, messageId) => this.callBot(botId, "stop", { conversationId, messageId }),
     });
     this.crossHostGroups = new HubCrossHostGroups(store, this.auth, {
-      localUrl: () => this.url,
+      localUrl: () => this.http.listening ? this.url : undefined,
       localHostName: async () => (await this.profile.read()).name,
+      stopping: () => this.stopping,
       networkPeers: async () => {
         const view = await this.network.view().catch(() => undefined);
         const hosts = view?.membership?.manifest?.hosts ?? [];
@@ -587,8 +589,9 @@ export class HubServer {
       await hub.agentBuses.reconcile();
       // Discussion turns settled while stopped advance once; uncertain ones pause.
       await hub.groupDiscussions.reconcile();
-      await hub.crossHostGroups.init();
       for (const listener of hub.listeners) await hub.bindListener(listener);
+      // Recover persisted `sending` cross-host questions after listeners bind so callbackUrl/reply routes are live.
+      await hub.crossHostGroups.init();
       const runningHub = hub;
       const retryListeners = setInterval(() => {
         if (runningHub.stopping) return;
@@ -687,6 +690,7 @@ export class HubServer {
     }
     for (const botId of this.bots.keys()) void this.dispatchActions(botId).catch(() => this.options.onWarning?.("action_dispatch_failed"));
     this.trackTask(this.crossHostGroups.flushPendingReplies().catch(() => this.options.onWarning?.("cross_host_reply_retry_failed")));
+    this.trackTask(this.crossHostGroups.recoverPendingQuestions().catch(() => this.options.onWarning?.("cross_host_question_recovery_failed")));
     if (Date.now() >= this.historyReleaseCheckAt) {
       this.historyReleaseCheckAt = Date.now() + 10_000;
       this.trackTask(this.conversationHistory.releaseExpired().catch(() => this.options.onWarning?.("history_release_failed")));
@@ -707,7 +711,10 @@ export class HubServer {
     });
     return work;
   }
-  private errorFrame(ws: WebSocket, error: unknown, requestId?: string, conversationId?: string, title?: string): Promise<void> { return this.send(ws, { v: 1, type: "error", requestId, conversationId, code: error instanceof HubError ? error.code : error instanceof z.ZodError ? "invalid_request" : "internal_error", message: error instanceof HubError ? error.code === "client_update_required_after_restore" ? "主机已从备份恢复，请更新客户端以重新同步完整聊天记录。" : error.code === "history_metadata_unavailable" ? `${title ? `对话「${title.slice(0,80)}」` : "该对话"}的同步索引不完整，请联系主机管理员检查或从可信备份恢复；聊天原文仍保留，修复后重新连接。` : error.code : "Request failed", retryable: error instanceof HubError ? (error.status >= 500 || error.code === "session_expired") : !(error instanceof z.ZodError) }); }
+  private sessionDesignatedCapable(session: AuthSession): boolean {
+    return session.capabilities?.includes(CROSS_HOST_GROUPS_CAPABILITY) ?? false;
+  }
+  private errorFrame(ws: WebSocket, error: unknown, requestId?: string, conversationId?: string, title?: string): Promise<void> { return this.send(ws, { v: 1, type: "error", requestId, conversationId, code: error instanceof HubError ? error.code : error instanceof z.ZodError ? "invalid_request" : "internal_error", message: error instanceof HubError ? error.code === "client_update_required_after_restore" ? "主机已从备份恢复，请更新客户端以重新同步完整聊天记录。" : error.code === "history_metadata_unavailable" ? `${title ? `对话「${title.slice(0,80)}」` : "该对话"}的同步索引不完整，请联系主机管理员检查或从可信备份恢复；聊天原文仍保留，修复后重新连接。` : error.code === "group_designated_client_update_required" ? "此群已开启指定 Bot 回复，请更新 App 后发送，或先 @ 指定回复的 Bot。" : error.code : "Request failed", retryable: error instanceof HubError ? (error.status >= 500 || error.code === "session_expired") : !(error instanceof z.ZodError) }); }
   private endClientSession(client: Client, code: "device_revoked" | "session_expired"): void {
     if (client.rejected) return;
     client.rejected = code;
@@ -1024,7 +1031,7 @@ export class HubServer {
         }
         if (frame.type === "auth") {
           if (!hello || client.session) throw new HubError("unexpected_auth");
-          const session = await this.auth.authenticate(id, frame.signature); client.session = session; clearTimeout(timeout);
+          const session = await this.auth.authenticate(id, frame.signature, client.capabilities); client.session = session; clearTimeout(timeout);
           // A short-lived host management client needs the owner APIs, not a
           // copy of every conversation/avatar/history merely to list Bots.
           // Authentication and all subsequent HTTP authorization are unchanged.
@@ -1139,7 +1146,7 @@ export class HubServer {
           await this.workbench.validateContext(userId, frame.conversationId, frame.workbench, client.session!.deviceId);
         }
         const guarded = async () => { await validate(); if (frame.type === "message.send" && frame.workbench && !priorWorkbenchMessage) this.workbench.assertContextActive(userId, frame.conversationId, frame.workbench); };
-        const result = frame.type === "message.forward" ? await this.attachments.forward(userId, frame, validate) : await this.store.sendMessage(userId, { ...frame, parallelCapable: client.capabilities.includes(GROUP_PARALLEL_CAPABILITY) }, guarded);
+        const result = frame.type === "message.forward" ? await this.attachments.forward(userId, frame, validate) : await this.store.sendMessage(userId, { ...frame, parallelCapable: client.capabilities.includes(GROUP_PARALLEL_CAPABILITY), designatedCapable: client.capabilities.includes(CROSS_HOST_GROUPS_CAPABILITY) }, guarded);
         const workbenchContextOmitted = "workbenchContextOmitted" in result ? result.workbenchContextOmitted : undefined;
         await this.sendClient(client, { v: 1, type: "message.ack", clientMsgId: frame.clientMsgId, messageId: result.message.id, ...(workbenchContextOmitted ? { workbenchContextOmitted } : {}) });
         break;
@@ -2215,7 +2222,7 @@ export class HubServer {
         return;
       }
       const groupSettingsRoute = route.match(/^\/api\/groups\/([A-Za-z0-9_-]+)\/settings$/);
-      if (groupSettingsRoute && req.method === "GET") { await reply(200, await this.store.groupSettings(userId, groupSettingsRoute[1]!, validateInQueue)); return; }
+      if (groupSettingsRoute && req.method === "GET") { await reply(200, await this.store.groupSettings(userId, groupSettingsRoute[1]!, validateInQueue, { designatedCapable: this.sessionDesignatedCapable(session) })); return; }
       if (groupSettingsRoute && req.method === "PUT") {
         const { groupSettingsSchema } = await import("../client-protocol/groups.js");
         const changed = await this.store.updateGroup(userId, groupSettingsRoute[1]!, groupSettingsSchema.parse(await this.jsonBody(req)), validateInQueue);
@@ -2247,16 +2254,17 @@ export class HubServer {
       const discussionRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/discussion(?:\/([A-Za-z0-9_-]+)\/(control|notes|steps\/([A-Za-z0-9_-]+)))?$/);
       if (discussionRoute && (req.method === "POST" ? !discussionRoute[3] || discussionRoute[3] === "control" || discussionRoute[3] === "notes" : req.method === "GET" && (!discussionRoute[2] || !!discussionRoute[4]))) {
         const conversationId = discussionRoute[1]!, runId = discussionRoute[2];
+        const designatedCapable = this.sessionDesignatedCapable(session);
         // Reads never settle or advance a run; only receipts and controls do.
         if (req.method === "GET" && discussionRoute[4]) await reply(200, await this.groupDiscussions.step(userId, conversationId, runId!, discussionRoute[4], validateInQueue));
         else if (req.method === "GET") {
           const query = z.object({ brief: z.literal("1").optional(), known: z.string().max(260).optional() }).strict().parse(Object.fromEntries(url.searchParams));
-          await reply(200, await this.groupDiscussions.read(userId, conversationId, validateInQueue, { brief: query.brief === "1", ...(query.known !== undefined ? { known: query.known } : {}) }));
+          await reply(200, await this.groupDiscussions.read(userId, conversationId, validateInQueue, { brief: query.brief === "1", ...(query.known !== undefined ? { known: query.known } : {}), designatedCapable }));
         }
-        else if (!runId) await reply(200, await this.groupDiscussions.start(userId, conversationId, await this.jsonBody(req), validateInQueue));
-        else if (discussionRoute[3] === "notes") await reply(200, await this.groupDiscussions.note(userId, conversationId, runId, await this.jsonBody(req), validateInQueue));
+        else if (!runId) await reply(200, await this.groupDiscussions.start(userId, conversationId, await this.jsonBody(req), validateInQueue, { designatedCapable }));
+        else if (discussionRoute[3] === "notes") await reply(200, await this.groupDiscussions.note(userId, conversationId, runId, await this.jsonBody(req), validateInQueue, { designatedCapable }));
         else {
-          await reply(200, await this.groupDiscussions.control(userId, conversationId, runId, await this.jsonBody(req), validateInQueue));
+          await reply(200, await this.groupDiscussions.control(userId, conversationId, runId, await this.jsonBody(req), validateInQueue, { designatedCapable }));
           // A resumed run may release a held input; let every Bot claim now.
           this.trackTask(this.dispatchPending().catch(() => this.options.onWarning?.("queue_dispatch_failed")));
         }

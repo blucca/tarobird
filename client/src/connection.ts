@@ -1020,6 +1020,7 @@ export class HubConnection {
       : frame.code === "group_discussion_start_required" ? t("此群按顺序讨论。请在输入框发起讨论，转发时只能选择一位 Bot 回复。")
       : frame.code === "group_reply_mode_changed" ? changedGroupReply()
       : frame.code === "group_parallel_client_update_required" ? t("此群已开启并行回复，请更新 App 后发送，或先指定回复的 Bot。")
+      : frame.code === "group_designated_client_update_required" ? t("此群已开启指定 Bot 回复，请更新 App 后发送，或先 @ 指定回复的 Bot。")
       : frame.code === "attachment_unavailable" ? t("原附件已丢失或损坏，请重新上传后发送。")
       : frame.code === "binding_conflict" ? t("另一台设备已更改会话选择，请确认最新状态后重试。")
       : frame.retryable !== false && typeof frame.requestId === "string" ? t("暂时未能确认操作，正在稍后重试。")

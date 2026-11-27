@@ -94,6 +94,7 @@ export class HubDatabase {
           await result.exec("ALTER TABLE group_mail_inbox ADD COLUMN reply_forwarded INTEGER NOT NULL DEFAULT 0; ALTER TABLE group_mail_inbox ADD COLUMN reply_attempts INTEGER NOT NULL DEFAULT 0; ALTER TABLE group_mail_inbox ADD COLUMN reply_next_at INTEGER NOT NULL DEFAULT 0;");
         }
         await result.exec("CREATE INDEX IF NOT EXISTS group_mail_inbox_retry ON group_mail_inbox(status, reply_forwarded, reply_next_at)");
+        await result.exec("CREATE INDEX IF NOT EXISTS group_remote_questions_sending ON group_remote_questions(created_at) WHERE status='sending' AND answer_message_id IS NULL");
         await retainPushReceipts(result);
         // A rolled-back Hub cannot remove optional rows when recalling a reply.
         // Reconcile its tombstones when returning to a scopes-aware host.
@@ -314,6 +315,7 @@ CREATE TABLE IF NOT EXISTS group_remote_questions (
 );
 CREATE INDEX IF NOT EXISTS group_remote_questions_group ON group_remote_questions(group_id, created_at);
 CREATE INDEX IF NOT EXISTS group_remote_questions_source ON group_remote_questions(conversation_id, source_message_id, member_key);
+CREATE INDEX IF NOT EXISTS group_remote_questions_sending ON group_remote_questions(created_at) WHERE status='sending' AND answer_message_id IS NULL;
 CREATE TABLE IF NOT EXISTS group_mail_inbox (
   request_id TEXT PRIMARY KEY,
   group_id TEXT NOT NULL,

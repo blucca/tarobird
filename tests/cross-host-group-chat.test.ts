@@ -4,14 +4,18 @@ import os from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
-import { groupMembersStateSchema } from "../src/client-protocol/group-members.js";
+import { z } from "zod";
+import { conversationSchema, idSchema } from "../src/client-protocol/index.js";
+import { groupDiscussionRunSchema } from "../src/client-protocol/group-discussion.js";
+import { CROSS_HOST_GROUPS_CAPABILITY, groupMembersStateSchema } from "../src/client-protocol/group-members.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import type { CoreBridgeLike } from "../src/core/types.js";
 import { attachGateway } from "../src/gateway/service.js";
-import { deviceProof, hashSecret } from "../src/hub/auth.js";
+import { deviceProof, hashSecret, HubAuth } from "../src/hub/auth.js";
 import { desktopTls } from "../src/hub/desktop-tls.js";
-import { groupMailSignaturePayload } from "../src/hub/group-cross-host.js";
+import { groupMailSignaturePayload, HubCrossHostGroups } from "../src/hub/group-cross-host.js";
 import { HubServer } from "../src/hub/server.js";
+import { HubStore } from "../src/hub/store.js";
 import { bootstrapTrusted } from "./helpers/pairing-invite.js";
 
 async function waitFor<T>(fn: () => Promise<T> | T, predicate: (value: T) => boolean, timeoutMs = 8000): Promise<T> {
@@ -25,7 +29,11 @@ async function waitFor<T>(fn: () => Promise<T> | T, predicate: (value: T) => boo
   throw new Error(`waitFor timed out; last=${JSON.stringify(last)}`);
 }
 
-async function openOwnerSession(hub: HubServer, deviceId = "dev_owner"): Promise<{
+async function openOwnerSession(
+  hub: HubServer,
+  deviceId = "dev_owner",
+  capabilities: string[] = [CROSS_HOST_GROUPS_CAPABILITY],
+): Promise<{
   token: string;
   ws: WebSocket;
   frames: Record<string, unknown>[];
@@ -42,7 +50,7 @@ async function openOwnerSession(hub: HubServer, deviceId = "dev_owner"): Promise
   ws.on("message", (raw) => frames.push(JSON.parse(raw.toString())));
   const next = async (type: string) => waitFor(() => frames.find((f) => f.type === type), (f) => !!f);
   const nonce = randomBytes(32).toString("base64url");
-  ws.send(JSON.stringify({ v: 1, type: "hello", deviceId, nonce, protocolVersions: [1], capabilities: ["groups.cross-host.v1"], cursors: {} }));
+  ws.send(JSON.stringify({ v: 1, type: "hello", deviceId, nonce, protocolVersions: [1], capabilities, cursors: {} }));
   const challenge = await next("challenge");
   ws.send(JSON.stringify({ v: 1, type: "auth", signature: sign(null, deviceProof(deviceId, challenge!.nonce as string, nonce), kp.privateKey).toString("base64") }));
   const ready = await next("ready");
@@ -868,4 +876,403 @@ describe("Cross-host group chat, session-based members & Orca-style group settin
     await expect(a.hub.crossHostGroups.addMember("owner", histGroup.id, { botId: "b2", historyVisibility: { kind: "none" } })).rejects.toThrow("conversation_archived");
     expect(histRemote.sessionId).toBeTruthy();
   });
+
+  it("preserves 1.6.0 strict schema compatibility for designated mode across discussion/settings reads, sends, topics, and updates", async () => {
+    // Exact 1.6.0 strict Zod schemas (closed 4-mode enum without "designated").
+    const v160PolicySchema = z.object({
+      mode: z.enum(["mentions", "parallel", "sequential", "independent"]),
+      botOrder: z.array(idSchema).max(32).refine((ids) => new Set(ids).size === ids.length),
+      maxRounds: z.number().int().min(1).max(5),
+    }).strict();
+    const v160SettingsSnapshotSchema = z.object({
+      group: conversationSchema,
+      policy: v160PolicySchema,
+      revision: z.string().min(1).max(128),
+    });
+    const v160DiscussionViewSchema = z.object({
+      settings: v160SettingsSnapshotSchema,
+      run: groupDiscussionRunSchema.nullable(),
+      viewRevision: z.string().min(1).max(260).optional(),
+    });
+
+    const { hub } = await startHub("macmini");
+    await hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('alpha','Alpha','codex','h',1),('beta','Beta','claude','h',1)");
+    const group = await hub.store.createConversation("owner", ["alpha", "beta"], "Compat Group", "g_compat", { type: "group" });
+    const topic = await hub.store.createConversation("owner", [], "Compat Topic", "t_compat", { parentId: group.id });
+
+    const initial = await hub.store.groupSettings("owner", group.id);
+    await hub.store.updateGroup("owner", group.id, {
+      title: group.title,
+      expectedTitle: group.title,
+      botIds: group.botIds,
+      expectedBotIds: group.botIds,
+      policy: { ...initial.policy, mode: "designated" },
+      expectedRevision: initial.revision,
+    });
+    await hub.crossHostGroups.setDesignatedMember("owner", group.id, { memberKey: "local:beta" });
+    const realSettings = await hub.store.groupSettings("owner", group.id);
+    expect(realSettings.policy.mode).toBe("designated");
+
+    // 1. Direct HubStore contract mirrors parallelCapable: false
+    await expect(hub.store.sendMessage("owner", {
+      conversationId: group.id,
+      clientMsgId: "store_old_unmentioned",
+      text: "no mention",
+      attachments: [],
+      designatedCapable: false,
+    })).rejects.toThrow("group_designated_client_update_required");
+    const storeExplicit = await hub.store.sendMessage("owner", {
+      conversationId: group.id,
+      clientMsgId: "store_old_named",
+      text: "@alpha please",
+      attachments: [],
+      mentions: ["alpha"],
+      designatedCapable: false,
+    });
+    expect(await hub.store.db.all("SELECT bot_id FROM deliveries WHERE message_id=?", [storeExplicit.message.id])).toEqual([{ bot_id: "alpha" }]);
+
+    // 2. Simulated 1.6.0 client (advertises 1.6.0 capabilities, NOT groups.cross-host.v1)
+    const legacy = await openOwnerSession(hub, "dev_v160", ["cards.v1", "groups.discussion.v1", "groups.reply-guard.v1", "groups.parallel.v1"]);
+    sockets.push(legacy.ws);
+    const legacyHeaders = { Authorization: `Bearer ${legacy.token}`, "Content-Type": "application/json" };
+
+    // GET /api/conversations/:id/discussion?brief=1 parses cleanly against 1.6.0 strict schema!
+    const discRes = await fetch(`${hub.url}/api/conversations/${group.id}/discussion?brief=1`, { headers: legacyHeaders });
+    expect(discRes.status).toBe(200);
+    const parsedView = v160DiscussionViewSchema.parse(await discRes.json());
+    expect(parsedView.settings.policy.mode).toBe("mentions");
+    expect(parsedView.settings.revision).toBe(`${realSettings.revision}_compat`);
+    expect(parsedView.viewRevision).toBeTruthy();
+
+    // Conditional known= polling matches the downgraded viewRevision
+    const unchangedRes = await fetch(
+      `${hub.url}/api/conversations/${group.id}/discussion?brief=1&known=${encodeURIComponent(parsedView.viewRevision!)}`,
+      { headers: legacyHeaders },
+    );
+    expect(await unchangedRes.json()).toEqual({ unchanged: true });
+
+    // Topic discussion view ALSO downgrades cleanly for 1.6.0 clients
+    const topicDiscRes = await fetch(`${hub.url}/api/conversations/${topic.id}/discussion?brief=1`, { headers: legacyHeaders });
+    const parsedTopicView = v160DiscussionViewSchema.parse(await topicDiscRes.json());
+    expect(parsedTopicView.settings.policy.mode).toBe("mentions");
+    expect(parsedTopicView.settings.revision).toBe(`${realSettings.revision}_compat`);
+
+    // GET /api/groups/:id/settings parses cleanly against 1.6.0 strict schema!
+    const settingsRes = await fetch(`${hub.url}/api/groups/${group.id}/settings`, { headers: legacyHeaders });
+    expect(settingsRes.status).toBe(200);
+    const parsedSettings = v160SettingsSnapshotSchema.parse(await settingsRes.json());
+    expect(parsedSettings.policy.mode).toBe("mentions");
+    expect(parsedSettings.revision).toBe(`${realSettings.revision}_compat`);
+
+    // PUT /api/groups/:id/settings from 1.6.0 echoing downgraded policy is rejected (cannot silently clobber designated!)
+    const clobberRes = await fetch(`${hub.url}/api/groups/${group.id}/settings`, {
+      method: "PUT",
+      headers: legacyHeaders,
+      body: JSON.stringify({
+        title: "Renamed by 1.6.0",
+        expectedTitle: group.title,
+        botIds: group.botIds,
+        expectedBotIds: group.botIds,
+        policy: parsedSettings.policy,
+        expectedRevision: parsedSettings.revision,
+      }),
+    });
+    expect(clobberRes.status).toBe(409);
+    expect((await clobberRes.json() as { error: string }).error).toBe("group_designated_client_update_required");
+    expect((await hub.store.groupSettings("owner", group.id)).policy.mode).toBe("designated");
+
+    // 1.6.0 WS send WITHOUT mentions (with 1.6.0 reply guard) -> rejected with update-required & human-readable message!
+    legacy.ws.send(JSON.stringify({
+      v: 1,
+      type: "message.send",
+      conversationId: group.id,
+      clientMsgId: "v160_unmentioned",
+      text: "unmentioned from 1.6.0",
+      attachments: [],
+      groupReplyGuard: { mode: "mentions", revision: parsedView.settings.revision },
+    }));
+    const errFrame = await waitFor(
+      () => legacy.frames.find((f) => f.type === "error" && f.requestId === "v160_unmentioned"),
+      (f) => !!f,
+    );
+    expect(errFrame).toMatchObject({
+      code: "group_designated_client_update_required",
+      retryable: false,
+    });
+    expect(String(errFrame!.message)).toContain("更新 App");
+    expect(await hub.store.db.get("SELECT COUNT(*) AS n FROM messages WHERE client_msg_id='v160_unmentioned'")).toEqual({ n: 0 });
+
+    // 1.6.0 WS send WITH explicit @alpha (with 1.6.0 reply guard) -> succeeds on both root group and topic!
+    legacy.ws.send(JSON.stringify({
+      v: 1,
+      type: "message.send",
+      conversationId: topic.id,
+      clientMsgId: "v160_topic_named",
+      text: "@alpha in topic",
+      attachments: [],
+      mentions: ["alpha"],
+      groupReplyGuard: { mode: "mentions", revision: parsedTopicView.settings.revision },
+    }));
+    const topicAck = await waitFor(
+      () => legacy.frames.find((f) => f.type === "message.ack" && f.clientMsgId === "v160_topic_named"),
+      (f) => !!f,
+    );
+    expect(await hub.store.db.all("SELECT bot_id FROM deliveries WHERE message_id=?", [topicAck!.messageId as string])).toEqual([{ bot_id: "alpha" }]);
+
+    // Stale revision from 1.6.0 still triggers group_reply_mode_changed
+    legacy.ws.send(JSON.stringify({
+      v: 1,
+      type: "message.send",
+      conversationId: group.id,
+      clientMsgId: "v160_stale",
+      text: "@alpha stale",
+      attachments: [],
+      mentions: ["alpha"],
+      groupReplyGuard: { mode: "mentions", revision: `${initial.revision}_compat` },
+    }));
+    const staleErr = await waitFor(
+      () => legacy.frames.find((f) => f.type === "error" && f.requestId === "v160_stale"),
+      (f) => !!f,
+    );
+    expect(staleErr).toMatchObject({ code: "group_reply_mode_changed", retryable: false });
+
+    // 3. Modern client (with groups.cross-host.v1) receives raw "designated" and real revision
+    const modern = await openOwnerSession(hub, "dev_modern", ["cards.v1", "groups.discussion.v1", "groups.reply-guard.v1", "groups.parallel.v1", CROSS_HOST_GROUPS_CAPABILITY]);
+    sockets.push(modern.ws);
+    const modernHeaders = { Authorization: `Bearer ${modern.token}`, "Content-Type": "application/json" };
+    const modernView = await (await fetch(`${hub.url}/api/conversations/${group.id}/discussion?brief=1`, { headers: modernHeaders })).json() as { settings: { policy: { mode: string }; revision: string } };
+    expect(modernView.settings.policy.mode).toBe("designated");
+    expect(modernView.settings.revision).toBe(realSettings.revision);
+
+    modern.ws.send(JSON.stringify({
+      v: 1,
+      type: "message.send",
+      conversationId: group.id,
+      clientMsgId: "modern_designated_send",
+      text: "route to beta",
+      attachments: [],
+      groupReplyGuard: { mode: "designated", revision: modernView.settings.revision },
+    }));
+    const modernAck = await waitFor(
+      () => modern.frames.find((f) => f.type === "message.ack" && f.clientMsgId === "modern_designated_send"),
+      (f) => !!f,
+    );
+    expect(await hub.store.db.all("SELECT bot_id FROM deliveries WHERE message_id=?", [modernAck!.messageId as string])).toEqual([{ bot_id: "beta" }]);
+  });
+
+  it("recovers interrupted 'sending' cross-host group questions on startup init() and periodic sweep idempotently without duplicates", async () => {
+    const a = await startHub("macmini");
+    const b = await startHub("studio-b");
+    a.hub.crossHostGroups.registerPeer({ hostId: "peer_b", hostName: "studio-b", publicKey: b.hub.auth.publicKey, url: b.hub.url });
+    b.hub.crossHostGroups.registerPeer({ hostId: "peer_a", hostName: "macmini", publicKey: a.hub.auth.publicKey, url: a.hub.url });
+
+    await a.hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_local','Local','codex','h',1)");
+    await b.hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_remote','Remote','claude','h',1)");
+    await b.hub.crossHostGroups.grantPeerBot(a.hub.auth.publicKey, "bot_remote");
+
+    const group = await a.hub.store.createConversation("owner", ["bot_local"], "Restart Recovery Group", "g_recover", { type: "group" });
+    await a.hub.store.sendMessage("owner", { conversationId: group.id, clientMsgId: "pre_join_ctx", text: "PRE_JOIN_RECOVERY_CTX", attachments: [] });
+    const remoteMember = await a.hub.crossHostGroups.addMember("owner", group.id, {
+      hostId: "peer_b",
+      botId: "bot_remote",
+      historyVisibility: { kind: "recent", count: 5 },
+    });
+
+    // Switch to parallel so store.sendMessage creates durable `sending` rows atomically
+    const cur = await a.hub.store.groupSettings("owner", group.id);
+    await a.hub.store.updateGroup("owner", group.id, {
+      title: group.title,
+      expectedTitle: group.title,
+      botIds: group.botIds,
+      expectedBotIds: group.botIds,
+      policy: { ...cur.policy, mode: "parallel" },
+      expectedRevision: cur.revision,
+    });
+
+    // Case 1: Simulate Host A crashing mid-`sending` BEFORE delivery reached Hub B,
+    // AND Case 2: Simulate Host A crashing mid-`sending` AFTER Hub B already accepted & answered `requestId`!
+    const msgBeforeDeliver = await a.hub.store.sendMessage("owner", {
+      conversationId: group.id,
+      clientMsgId: "crash_before_deliver_src",
+      text: "Recover me across restart",
+      attachments: [],
+      mentions: ["bot_local"], // avoid auto-dispatching remote so we can seed exact pre-crash DB state
+    });
+    const reqBefore = "greq_restart_before_01";
+    const qidBefore = "gq_restart_before_01";
+    const now = Date.now();
+    await a.hub.store.db.run(
+      `INSERT INTO group_remote_questions(
+        id, group_id, conversation_id, member_key, host_id, host_name, host_public_key, bot_id, session_id,
+        bot_name_snapshot, source_message_id, request_id, status, stopped_unanswered, error, created_at, updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'sending',0,NULL,?,?)`,
+      [qidBefore, group.id, group.id, remoteMember.memberKey, "peer_b", "studio-b", b.hub.auth.publicKey, "bot_remote", remoteMember.sessionId, "Remote", msgBeforeDeliver.message.id, reqBefore, now - 5_000, now - 5_000],
+    );
+
+    // Seed Case 2: Hub B already accepted & answered `reqAfter`, while Hub A's DB row was still stuck in `sending` at crash!
+    const msgAfterAccept = await a.hub.store.sendMessage("owner", {
+      conversationId: group.id,
+      clientMsgId: "crash_after_accept_src",
+      text: "Already accepted on Hub B before Hub A crashed",
+      attachments: [],
+      mentions: ["bot_local"],
+    });
+    const reqAfter = "greq_restart_after_02";
+    const qidAfter = "gq_restart_after_02";
+    await a.hub.store.db.run(
+      `INSERT INTO group_remote_questions(
+        id, group_id, conversation_id, member_key, host_id, host_name, host_public_key, bot_id, session_id,
+        bot_name_snapshot, source_message_id, request_id, status, stopped_unanswered, error, created_at, updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'sending',0,NULL,?,?)`,
+      [qidAfter, group.id, group.id, remoteMember.memberKey, "peer_b", "studio-b", b.hub.auth.publicKey, "bot_remote", remoteMember.sessionId, "Remote", msgAfterAccept.message.id, reqAfter, now - 4_000, now - 4_000],
+    );
+    await b.hub.crossHostGroups.handlePeerDeliver(
+      { hostId: "peer_a", hostName: "macmini", publicKey: a.hub.auth.publicKey, url: a.hub.url, allowLoopback: true, manualPeer: true },
+      {
+        requestId: reqAfter,
+        groupId: group.id,
+        groupTitle: group.title,
+        conversationId: group.id,
+        sourceHostId: "origin",
+        sourceHostName: "macmini",
+        sourceMessageId: msgAfterAccept.message.id,
+        botId: "bot_remote",
+        sessionId: remoteMember.sessionId,
+        text: "Already accepted on Hub B before Hub A crashed",
+        contextMessages: [],
+      },
+    );
+    // Mark answered on Hub B without forwarding yet (Hub A was down!)
+    await b.hub.store.db.run(
+      "UPDATE group_mail_inbox SET reply_message_id='b_ans_2', reply_text='Recovered reply from Hub B', status='answered', answered_at=?, reply_forwarded=0, reply_next_at=? WHERE request_id=?",
+      [now, now + 60_000, reqAfter],
+    );
+
+    // Shut down Hub A cleanly (simulating restart) and reopen store + auth + fresh HubCrossHostGroups on the SAME stateDir!
+    const stateDirA = a.stateDir;
+    await a.hub.close();
+    hubs.splice(hubs.indexOf(a.hub), 1);
+
+    const reopenedStore = await HubStore.open(stateDirA);
+    try {
+      const reopenedAuth = await HubAuth.open(reopenedStore, stateDirA);
+      const reopenedGroups = new HubCrossHostGroups(reopenedStore, reopenedAuth, {
+        localHostName: async () => "macmini",
+      });
+      reopenedGroups.registerPeer({ hostId: "peer_b", hostName: "studio-b", publicKey: b.hub.auth.publicKey, url: b.hub.url });
+      // Startup init() MUST automatically recover BOTH persisted `sending` rows!
+      await reopenedGroups.init();
+
+      const recoveredBefore = await reopenedStore.db.get<{ status: string; error: string | null }>(
+        "SELECT status, error FROM group_remote_questions WHERE id=?",
+        [qidBefore],
+      );
+      expect(recoveredBefore).toEqual({ status: "delivered", error: null });
+
+      const recoveredAfter = await reopenedStore.db.get<{ status: string; error: string | null; answer_message_id: string | null }>(
+        "SELECT status, error, answer_message_id FROM group_remote_questions WHERE id=?",
+        [qidAfter],
+      );
+      expect(recoveredAfter?.status).toBe("delivered");
+      expect(recoveredAfter?.error).toBeNull();
+      expect(recoveredAfter?.answer_message_id).toBeTruthy();
+
+      // Verify Hub B received `reqBefore` WITH join-time context, and `reqAfter` was NOT duplicated!
+      const bSessionMsgs = await b.hub.store.db.all<{ client_msg_id: string | null; blocks_json: string }>(
+        "SELECT client_msg_id, blocks_json FROM messages WHERE conversation_id=?",
+        [remoteMember.sessionId],
+      );
+      const beforeDelivered = bSessionMsgs.filter((m) => m.client_msg_id === `gmail_${reqBefore}`);
+      expect(beforeDelivered).toHaveLength(1);
+      expect(JSON.parse(beforeDelivered[0]!.blocks_json)[0].text).toContain("PRE_JOIN_RECOVERY_CTX");
+      expect(bSessionMsgs.filter((m) => m.client_msg_id === `gmail_${reqAfter}`)).toHaveLength(1);
+
+      // Verify Hub A's group chat received the recovered answer for `reqAfter`
+      const aGroupMsgs = await reopenedStore.db.all<{ blocks_json: string }>(
+        "SELECT blocks_json FROM messages WHERE conversation_id=? AND bot_source_json IS NOT NULL",
+        [group.id],
+      );
+      expect(aGroupMsgs.some((m) => JSON.parse(m.blocks_json)[0]?.text === "Recovered reply from Hub B")).toBe(true);
+
+      // Verify history_backfilled was set to 1
+      const memberRow = await reopenedStore.db.get<{ history_backfilled: number }>(
+        "SELECT history_backfilled FROM group_session_members WHERE conversation_id=? AND member_key=? AND active=1",
+        [group.id, remoteMember.memberKey],
+      );
+      expect(memberRow?.history_backfilled).toBe(1);
+    } finally {
+      await reopenedStore.db.close();
+    }
+
+    // Case 3: Real HubServer.start() restart when peer is offline/unavailable transitions persisted `sending` -> `failed` (never stuck!),
+    // and live HubServer sweep recovers an orphaned `sending` row once peer is registered, with concurrent deduplication!
+    const reopenedHub = await startHub("macmini", stateDirA);
+    reopenedHub.hub.crossHostGroups.registerPeer({ hostId: "peer_b", hostName: "studio-b", publicKey: b.hub.auth.publicKey, url: b.hub.url });
+    b.hub.crossHostGroups.registerPeer({ hostId: "peer_a", hostName: "macmini", publicKey: reopenedHub.hub.auth.publicKey, url: reopenedHub.hub.url });
+
+    // Seed an orphaned `sending` row older than sweep grace period (as if in-memory listener was missed)
+    const msgSweep = await reopenedHub.hub.store.sendMessage("owner", {
+      conversationId: group.id,
+      clientMsgId: "sweep_orphan_src",
+      text: "Orphaned sending row for sweep",
+      attachments: [],
+      mentions: ["bot_local"],
+    });
+    const reqSweep = "greq_sweep_orphan_03";
+    const qidSweep = "gq_sweep_orphan_03";
+    await reopenedHub.hub.store.db.run(
+      `INSERT INTO group_remote_questions(
+        id, group_id, conversation_id, member_key, host_id, host_name, host_public_key, bot_id, session_id,
+        bot_name_snapshot, source_message_id, request_id, status, stopped_unanswered, error, created_at, updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'sending',0,NULL,?,?)`,
+      [qidSweep, group.id, group.id, remoteMember.memberKey, "peer_b", "studio-b", b.hub.auth.publicKey, "bot_remote", remoteMember.sessionId, "Remote", msgSweep.message.id, reqSweep, Date.now() - 5_000, Date.now() - 5_000],
+    );
+
+    // Wait for HubServer's periodic sweep() to recover the orphaned `sending` row automatically!
+    const sweptRow = await waitFor(
+      async () => reopenedHub.hub.store.db.get<{ status: string }>(
+        "SELECT status FROM group_remote_questions WHERE id=?",
+        [qidSweep],
+      ),
+      (row) => row?.status === "delivered",
+    );
+    expect(sweptRow?.status).toBe("delivered");
+    const sweepInboxRows = await b.hub.store.db.all<{ request_id: string }>(
+      "SELECT request_id FROM group_mail_inbox WHERE request_id=?",
+      [reqSweep],
+    );
+    expect(sweepInboxRows).toHaveLength(1);
+
+    // Case 4: Real HubServer.start() restart while peer is offline/unregistered moves `sending` -> `failed` (retryable, never stuck)
+    const msgOffline = await reopenedHub.hub.store.sendMessage("owner", {
+      conversationId: group.id,
+      clientMsgId: "restart_offline_src",
+      text: "Restart while peer unreachable",
+      attachments: [],
+      mentions: ["bot_local"],
+    });
+    const reqOffline = "greq_restart_offline_04";
+    const qidOffline = "gq_restart_offline_04";
+    await reopenedHub.hub.store.db.run(
+      `INSERT INTO group_remote_questions(
+        id, group_id, conversation_id, member_key, host_id, host_name, host_public_key, bot_id, session_id,
+        bot_name_snapshot, source_message_id, request_id, status, stopped_unanswered, error, created_at, updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'sending',0,NULL,?,?)`,
+      [qidOffline, group.id, group.id, remoteMember.memberKey, "peer_b", "studio-b", b.hub.auth.publicKey, "bot_remote", remoteMember.sessionId, "Remote", msgOffline.message.id, reqOffline, Date.now() - 5_000, Date.now() - 5_000],
+    );
+    await reopenedHub.hub.close();
+    hubs.splice(hubs.indexOf(reopenedHub.hub), 1);
+
+    const restartedOffline = await startHub("macmini", stateDirA);
+    const offlineRow = await restartedOffline.hub.store.db.get<{ status: string; error: string | null }>(
+      "SELECT status, error FROM group_remote_questions WHERE id=?",
+      [qidOffline],
+    );
+    expect(offlineRow?.status).toBe("failed");
+    expect(offlineRow?.error).toContain("studio-b");
+    // Once peer is registered again, retry succeeds!
+    restartedOffline.hub.crossHostGroups.registerPeer({ hostId: "peer_b", hostName: "studio-b", publicKey: b.hub.auth.publicKey, url: b.hub.url });
+    const retried = await restartedOffline.hub.crossHostGroups.reconcileOrRetryQuestion("owner", group.id, qidOffline);
+    expect(retried.status).toBe("delivered");
+  }, 20_000);
 });

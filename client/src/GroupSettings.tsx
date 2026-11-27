@@ -291,6 +291,7 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
         : e instanceof HubHttpError && e.message === "group_bot_busy" ? t("要移除的 Bot 仍有排队或进行中的任务，请完成或停止任务后再试。")
         : e instanceof HubHttpError && e.message === "group_discussion_active" ? t("讨论尚未结束，暂时不能移除参与成员。")
         : e instanceof HubHttpError && e.message === "group_parallel_discussion_active" ? t("请先结束群内讨论，再切换为并行回复。")
+        : e instanceof HubHttpError && e.message === "group_designated_client_update_required" ? t("此群已开启指定 Bot 回复，请更新 App 后再修改群组设置。")
         : e instanceof HubHttpError && e.status === 403 ? t("当前账号无权修改此群组或添加所选 Bot。")
         : e instanceof HubHttpError && e.status === 404 ? t("群组或 Bot 不可用，请检查主机已更新并重新读取。")
         : t("未能确认操作结果，请核对最新状态后再试。"));

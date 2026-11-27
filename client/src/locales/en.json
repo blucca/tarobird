@@ -1,6 +1,8 @@
 {
   "额度": "Quota",
   "指定 Bot 回复": "Designated Bot",
+  "此群已开启指定 Bot 回复，请更新 App 后发送，或先 @ 指定回复的 Bot。": "This group uses Designated Bot replies. Update the App before sending, or @-mention the Bot to reply.",
+  "此群已开启指定 Bot 回复，请更新 App 后再修改群组设置。": "This group uses Designated Bot replies. Update the App before changing group settings.",
   "默认由一位指定成员回复，@ 其他成员时由对方回应。": "One designated member replies by default; @-mentioning another wakes that member.",
   "更新主机后可使用指定 Bot 回复。": "Update the host to use Designated Bot replies.",
   "默认 {0} 回复 · @ 可切换": "Default: {0} · @ to switch",

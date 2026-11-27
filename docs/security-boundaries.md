@@ -772,6 +772,12 @@ The [Bot message MVP](client/cross-host-bot-messages-2026-10-17.md) does not wid
 
 Short-lived Hub-signed passports bind the target identity, source Bot, hop count, method/path and body digest. Normal TLS validation, a proof bound to the observed TLS leaf, and a signed recipient challenge precede private transfer. Subsequent TLS handshakes check the proved certificate before sending headers or bodies. A cached certificate mismatch permits one fresh proof, not replay of an ambiguously delivered POST. Target-side writer guards and response guards recheck membership, grant and Bot revocation. Responses/files are limited to the sending Bot's own correlated request, not arbitrary conversation history. Uploads use existing HubAttachments APIs with additional source/conversation binding. Lost POST responses are never automatically retried on another route. Request digests, rate limits and queue admission are durable; botSource inputs never enter question/approval/control handlers. The same-OS-user trust limitation remains unchanged.
 
+### Cross-host group chat and `designated` reply mode
+
+Cross-host group requests (`/api/group-mail/*`) reuse the recipient-local per-Bot grant ledger (`bot-messages:grant:*`), TLS leaf pinning, non-loopback route checks for network peers, and Ed25519 request signatures (`tarobot/group-mail/v2`) bound to source key, target key, method, path, timestamp, durable replay nonce, and SHA-256 body digest. Target Hubs reject ungranted Bots, dispatcher/worker Bots, archived/hidden/non-direct sessions, cross-peer reply spoofing, and cross-peer status reads. Persisted `sending` cross-host questions are recovered on startup (`init()`) and periodic sweeps by checking peer status and re-delivering idempotently under the original `requestId`, transitioning unreachable rows to `failed`/`uncertain` so no question is stranded without retry.
+
+For 1.6.0 client compatibility, clients advertise `groups.cross-host.v1` in their WebSocket `hello` capabilities (within the 64-entry limit). Clients without `groups.cross-host.v1` receive `designated` group settings/discussion views downgraded to `mentions` with a distinct `_compat` revision so 1.6.0's strict discussion-mode schema continues to parse and explicit `@Bot` sends remain usable, while unmentioned sends and stale settings saves are rejected with `group_designated_client_update_required` rather than routing unexpectedly or silently overwriting `designated` mode.
+
 
 ### Engine approval ownership (2026-10-19)
 
