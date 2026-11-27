@@ -25,7 +25,7 @@ import { forgetSavedQuotaHost } from "./usage-readings.js";
 import type { NamedBot } from "./bot-references.js";
 import { profileCacheSchema, type ProfileCache } from "../../src/client-protocol/avatars.js";
 import { openDB, type DBSchema, type StoreNames, type IDBPTransaction, type IDBPDatabase } from "idb";
-import { ConversationMessageCache } from "./message-lru-cache.js";
+import { compareMessages, ConversationMessageCache } from "./message-lru-cache.js";
 import { activeQuestionDrafts, questionDraftPrefix, questionDraftSchema, type QuestionDraft } from "./question-draft.js";
 import { messageAttention, type MessageAttention } from "./attention.js";
 import { projectReply, projectWorkingReply, type BotReply } from "./agent-state.js";
@@ -280,10 +280,22 @@ export class ClientCache {
     this.messageEpochs.set(conversationId, ++this.epochSeq);
     this.messageCache.invalidate(conversationId);
   }
-  private notifyMessageMutation(conversationId?: string, patched?: Message, cursor?: number): void {
+  private notifyMessageMutation(
+    conversationId?: string,
+    patched?: { message: Message; expectedCursor: number; nextCursor: number; lineage?: string },
+  ): void {
     if (patched && conversationId !== undefined) {
-      this.messageEpochs.set(conversationId, ++this.epochSeq);
-      this.messageCache.patchMessage(conversationId, patched, cursor);
+      const expectedEpoch = this.messageEpoch(conversationId);
+      const nextEpoch = ++this.epochSeq;
+      this.messageEpochs.set(conversationId, nextEpoch);
+      this.messageCache.patchMessage(conversationId, patched.message, {
+        expectedEpoch,
+        nextEpoch,
+        expectedRevision: patched.expectedCursor,
+        revision: patched.nextCursor,
+        expectedLineage: patched.lineage,
+        hasExpectedLineage: true,
+      });
     } else {
       this.bumpMessageEpoch(conversationId);
     }
@@ -298,6 +310,10 @@ export class ClientCache {
       channel.postMessage({ v: 1, ...(conversationId !== undefined ? { conversationId } : {}) });
       if (channel !== this.messageChannel) channel.close();
     }
+  }
+  /** Drop cached history for one or all conversations so the next read fails closed to IDB. */
+  invalidateMessages(conversationId?: string): void {
+    this.bumpMessageEpoch(conversationId);
   }
   // A cache's namespace never changes when the user selects another host.
   // Delayed requests retain the cache belonging to their original connection.
@@ -853,12 +869,12 @@ export class ClientCache {
     if (preferences) await tx.objectStore("settings").put(preferences, "preferences");
     if (generation) await tx.objectStore("settings").put(generation, "cacheGeneration");
     await tx.done;
+    this.notifyMessageMutation(undefined);
     // Large downloads live on disk, outside these stores; drop them with the rest.
     await clearAttachmentDiskCache();
     if (identity) { clearNoteRecoveries(identity.deviceId); this.clearSelectionHint(this.selectionHintKey(identity, generation as string | undefined)); }
     // Quota readings are saved per Host outside these stores (Bot ids, pool names, percentages); the forgotten Host's go too.
     if (identity?.hubPublicKey) forgetSavedQuotaHost(identity.hubPublicKey);
-    this.notifyMessageMutation(undefined);
     this.draftsChanged();
     this.diffReviewsChanged();
   }
@@ -1522,12 +1538,13 @@ export class ClientCache {
     await tx.done; return current ?? value;
   }
   peekMessages(conversationId: string): readonly Message[] | undefined {
+    if (this.closed) return undefined;
     this.ensureMessageChannel();
-    return this.messageCache.peek(conversationId)?.messages;
+    return this.messageCache.peek(conversationId, this.messageEpoch(conversationId))?.messages;
   }
   async messages(conversationId: string): Promise<Message[]> {
     this.ensureMessageChannel();
-    const cached = this.messageCache.peek(conversationId);
+    const cached = this.closed ? undefined : this.messageCache.peek(conversationId, this.messageEpoch(conversationId));
     if (cached) return cached.messages.slice();
     const epoch = this.messageEpoch(conversationId);
     const tx = (await this.db).transaction(["messages", "cursors", "settings"]);
@@ -1540,12 +1557,16 @@ export class ClientCache {
     const cursor = rawCursor ?? 0;
     const lineage = typeof rawLineage === "string" ? rawLineage : undefined;
     const loaded = rawMessages
-      .sort((a, b) => a.createdAt - b.createdAt)
+      .sort(compareMessages)
       .map(stripMessageMeta);
     if (!this.closed && this.messageEpoch(conversationId) === epoch) {
       const existing = this.messageCache.inspect(conversationId);
-      if (!existing || existing.lineage !== lineage || cursor >= existing.revision) {
-        this.messageCache.set(conversationId, loaded, cursor, lineage);
+      if (!existing || existing.epoch !== epoch) {
+        this.messageCache.set(conversationId, loaded, cursor, { epoch, hasFullSnapshot: true, lineage });
+      } else if (existing.lineage !== lineage) {
+        this.messageCache.invalidate(conversationId);
+      } else if (cursor > existing.revision) {
+        this.messageCache.set(conversationId, loaded, cursor, { epoch, hasFullSnapshot: true, lineage });
       }
     }
     return loaded.slice();
@@ -1755,7 +1776,13 @@ export class ClientCache {
       if (event.seq <= last) {
         await complete;
         const cached = this.messageCache.inspect(event.conversationId);
-        if (!cached || cached.revision !== last || cached.lineage !== lineage) {
+        if (
+          !cached
+          || !cached.hasFullSnapshot
+          || cached.epoch !== this.messageEpoch(event.conversationId)
+          || cached.revision !== last
+          || cached.lineage !== lineage
+        ) {
           this.bumpMessageEpoch(event.conversationId);
         }
         return;
@@ -1822,11 +1849,20 @@ export class ClientCache {
       }
       await tx.objectStore("cursors").put(event.seq, event.conversationId); await complete;
       const cached = this.messageCache.inspect(event.conversationId);
-      const cacheMatchesBase = cached !== undefined && cached.revision === last && cached.lineage === lineage;
+      const cacheMatchesBase = cached !== undefined
+        && cached.hasFullSnapshot
+        && cached.epoch === this.messageEpoch(event.conversationId)
+        && cached.revision === last
+        && cached.lineage === lineage;
       if (applied) {
         const clean = stripMessageMeta(applied as Cache["messages"]["value"]);
         if (cacheMatchesBase) {
-          this.notifyMessageMutation(event.conversationId, clean, event.seq);
+          this.notifyMessageMutation(event.conversationId, {
+            message: clean,
+            expectedCursor: last,
+            nextCursor: event.seq,
+            lineage,
+          });
         } else {
           this.notifyMessageMutation(event.conversationId);
         }
@@ -1961,7 +1997,9 @@ export class ClientCache {
           && (!entry || !("conversationId" in entry.frame) || existing.conversationId === entry.frame.conversationId);
       } else if (messageAccepted && entry && "conversationId" in entry.frame) {
         const cached = this.messageCache.inspect(entry.frame.conversationId);
-        alreadyDeleted = !!cached?.messages.some(message => message.clientMsgId === id && message.status === "deleted");
+        alreadyDeleted = !!(cached?.hasFullSnapshot
+          && cached.epoch === this.messageEpoch(entry.frame.conversationId)
+          && cached.messages.some(message => message.clientMsgId === id && message.status === "deleted"));
       }
       // A non-message ACK is not acceptance. Keep the pending receipt so an
       // explicit uncertain retry can use its original immutable ID and frame.

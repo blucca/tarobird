@@ -41,6 +41,14 @@ function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   return true;
 }
 
+function peekCachedMessages(connection: HubConnection, conversationId: string): readonly Message[] | undefined {
+  return (connection.cache as { peekMessages?: (id: string) => readonly Message[] | undefined }).peekMessages?.(conversationId);
+}
+
+function immediateRevision(connection: HubConnection, conversationId: string): number {
+  return (connection as { conversationImmediateRevision?: (id: string) => number }).conversationImmediateRevision?.(conversationId) ?? 0;
+}
+
 function rememberReadRevision(connection: HubConnection, conversationId: string, revision: number): void {
   let map = lastReadRevisions.get(connection);
   if (!map) {
@@ -85,9 +93,11 @@ export function useConversationMessages(connection: HubConnection, conversationI
     let reads = pending.current.get(connection);
     if (!reads) { reads = new Map(); pending.current.set(connection, reads); }
     const inFlight = reads;
-    let disposed = false, running = false, dirty = false, immediate = false, lastEnd = 0, lastCost = 0;
+    let disposed = false, running = false, dirty = false, immediate = false, lastCost = 0;
+    let lastEnd: number | undefined;
     let wake: (() => void) | undefined;
     let revision = scoped ? connection.conversationRevision(conversationId) : connection.state.cacheRevision;
+    let urgentRevision = immediateRevision(connection, conversationId);
     const refresh = (explicit = false) => {
       if (disposed) return;
       dirty = true;
@@ -102,11 +112,12 @@ export function useConversationMessages(connection: HubConnection, conversationI
           const previous = inFlight.get(conversationId);
           if (previous) await previous.catch(() => undefined);
           if (disposed) break;
-          // The first read is immediate; later ones leave the main thread idle
-          // for a bounded duration based on its cost. A user-requested retry
-          // skips the gap, including one already being awaited.
+          // The first read is immediate; later IDB reads leave the main thread
+          // idle for a bounded duration based on cost. Authoritative in-memory
+          // cache hits (zero IDB read) and urgent user-send arrivals skip the gap.
+          const cachedInMemory = !immediate && Boolean(peekCachedMessages(connection, conversationId));
           const gap = Math.min(MAX_HISTORY_READ_GAP_MS, Math.max(MIN_HISTORY_READ_GAP_MS, lastCost));
-          const wait = lastEnd && !immediate ? lastEnd + gap - performance.now() : 0;
+          const wait = lastEnd !== undefined && !immediate && !cachedInMemory ? lastEnd + gap - performance.now() : 0;
           if (wait > 0) {
             await new Promise<void>(resolve => {
               const timer = setTimeout(resolve, wait);
@@ -159,9 +170,12 @@ export function useConversationMessages(connection: HubConnection, conversationI
     };
     const unsubscribe = connection.subscribe(() => {
       const next = scoped ? connection.conversationRevision(conversationId) : connection.state.cacheRevision;
-      if (next === revision) return;
+      const nextUrgent = immediateRevision(connection, conversationId);
+      if (next === revision && nextUrgent === urgentRevision) return;
+      const urgent = nextUrgent !== urgentRevision;
       revision = next;
-      refresh();
+      urgentRevision = nextUrgent;
+      refresh(urgent);
     });
     request.current = () => refresh(true);
     refresh();
@@ -171,7 +185,7 @@ export function useConversationMessages(connection: HubConnection, conversationI
   // never render the previous conversation's messages while its read is pending.
   let current = view?.connection === connection && view.conversationId === conversationId ? view : undefined;
   if (!current && visible && conversationId) {
-    const peeked = (connection.cache as { peekMessages?: (id: string) => readonly Message[] | undefined }).peekMessages?.(conversationId);
+    const peeked = peekCachedMessages(connection, conversationId);
     if (peeked) {
       const readRevision = lastReadRevisions.get(connection)?.get(conversationId) ?? connection.state.cacheRevision;
       const { visible: visibleMessages, deletedClientMsgIds } = filterRawHistory(peeked);
