@@ -59,7 +59,8 @@ export interface GatewayServiceOptions extends GatewayTransportOptions { bridge:
  * store, usage ledger, cron runtime and native session lock stay shared. */
 export async function attachGateway(options: GatewayServiceOptions): Promise<GatewayChannel> {
   const attachedAt = Date.now();
-  const channel = new GatewayChannel(new GatewayTransport(options));
+  const quotaEngine = quotaEngineSchema.safeParse(options.engine);
+  const channel = new GatewayChannel(new GatewayTransport({ ...options, engineQuotaAccountMatch: quotaEngine.success }));
   let disconnecting = false;
   const blockedPulls = new Map<string, ReturnType<typeof setTimeout>>();
   const activePulls = new Set<Promise<void>>();
@@ -278,11 +279,11 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   // Side audio uses the main transcriber and cloud policy, without its chat progress cards.
   sideSessions = gatewaySideSessions(surface, options.stateDir, options.botId, conversationId => channel.canSteerConversation!(conversationId), instanceAttachmentDownload(channel.transport), runtime.transcribeMedia ?? createDefaultTranscribeVoice(), channel);
   const schedules = gatewaySchedules(options, channel);
-  const quotaEngine = quotaEngineSchema.safeParse(options.engine);
-  const quotas = quotaEngine.success ? gatewayEngineQuota({ botId: options.botId, engine: quotaEngine.data, read: bridge.readAccountQuota?.bind(bridge) }) : undefined;
+  const quotas = quotaEngine.success ? gatewayEngineQuota({ botId: options.botId, engine: quotaEngine.data, read: bridge.readAccountQuota?.bind(bridge), getAccountProofKey: () => channel.transport.quotaProofKey }) : undefined;
   channel.onCall = async (method, raw): Promise<Json> => withChannelProfile("gateway", async () => {
     if (method.startsWith("history.")) return history(method, raw);
     if (method === "quota.get") { if (!quotas) throw new Error("quota_engine_unavailable"); return z.json().parse(await quotas(raw)); }
+    if (method === "quota.accountProof") { if (!quotas) throw new Error("quota_engine_unavailable"); return z.json().parse(quotas.accountProof(raw)); }
     if (method === "tasks.list" || method === "tasks.stop" || method === "tasks.recover") return z.json().parse(await engineTasks(method, raw));
     if (method === "context.usage") return z.json().parse(await contextUsage(raw));
     if (method === "pi.session.get" || method === "pi.session.set") return z.json().parse(await piSession(method, raw));

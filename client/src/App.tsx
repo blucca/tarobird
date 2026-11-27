@@ -62,6 +62,7 @@ import { useSearchMessageHighlight } from "./search-message-highlight.js";
 import { BotSettings } from "./BotSettings.js";
 import { ComposerModelControls } from "./ComposerModelControls.js";
 import { QuotaBattery, QuotaMark, quotaMarkLabel, UsageDetails, UsageIndicators } from "./UsageIndicators.js";
+import { clearStoredQuotaHost } from "./quota-store.js";
 import { useUsageReadings } from "./use-usage-readings.js";
 import { usageTone } from "./usage-readings.js";
 import { PiSessionControls } from "./PiSessionControls.js";
@@ -1739,16 +1740,28 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   } });
   const piSessionControls = visible && chatVisible && current?.type === "direct" && composerBot?.engine === "pi" && !composerBot.deletedAt && state.piSessionAvailable && <PiSessionControls key={`pi:${connection.identity.hubPublicKey}:${current.id}:${composerBot.id}`} connection={connection} conversationId={current.id} bot={composerBot} onCommands={receivePiCommands} active={visible && chatVisible} activity={replying} online={state.status === "online" && !!composerBot.online && !connection.isReadOnly} owner={state.user?.role === "owner" && !connection.isReadOnly}/>;
   const composerModelControls = !phone && !pane && visible && chatVisible && composerBot && !composerBot.deletedAt && (piSessionControls || <ComposerModelControls key={`${connection.identity.hubPublicKey}:${current?.id}:${composerBot.id}`} connection={connection} bot={composerBot} online={state.status === "online" && !!composerBot.online && !connection.isReadOnly} owner={state.user?.role === "owner" && !connection.isReadOnly}/>);
-  // Context and quota (issue 68): one conversation's own view only, never a board pane.
-  const usageBot = !pane && visible && chatVisible && current && composerBot && !composerBot.deletedAt ? composerBot : undefined;
+  // Evict device-saved quota readings if this Host confirms the user is no longer the owner.
+  useEffect(() => {
+    if (state.status === "online" && state.user && state.user.role !== "owner") clearStoredQuotaHost(connection);
+  }, [connection, state.status, state.user?.role]);
+  // Context and quota (issue 68 & 137): one conversation's own view only, never a board pane.
+  // Fall back to cached navigationBots before WS ready arrives so device-saved quota appears immediately on cold start.
+  const usageCandidate = discussionComposer ? undefined : current?.type === "direct"
+    ? (activeBot ?? navigationBots.find(bot => bot.id === current.botIds[0]))
+    : composerRecipients.length === 1
+      ? (composerBot ?? navigationBots.find(bot => bot.id === composerRecipients[0] && current?.botIds.includes(bot.id)))
+      : undefined;
+  const usageBot = !pane && visible && chatVisible && current && usageCandidate && !usageCandidate.deletedAt ? usageCandidate : undefined;
+  const quotaAllowed = !!usageBot && state.user?.role === "owner" && !connection.isReadOnly && state.engineQuotaAvailable !== false;
   const usage = useUsageReadings(connection, { conversationId: usageBot ? current?.id : undefined, botId: usageBot?.id, model: usageBot?.model ?? "",
-    quota: !!usageBot && state.user?.role === "owner" && !connection.isReadOnly && state.engineQuotaAvailable === true,
+    quota: quotaAllowed,
+    quotaLive: quotaAllowed && state.status === "online" && state.engineQuotaAvailable === true,
     // The phone shows no context anywhere, so it does not ask for it.
     context: !!usageBot && !phone && state.contextUsageAvailable === true, turn: messagesReady ? lastBotReply : undefined });
   const [quotaDetails, setQuotaDetails] = useState(false);
   useEffect(() => { setQuotaDetails(false); }, [current?.id]);
   const openQuotaDetails = () => { setChatActions(false); usage.readForDetails(); setQuotaDetails(true); };
-  const usageIndicators = !phone && usageBot && <UsageIndicators key={`usage:${connection.identity.hubPublicKey}:${current?.id}:${usageBot.id}`} context={usage.context} quota={usage.quota} onOpen={usage.readForDetails}/>;
+  const usageIndicators = !phone && usageBot && <UsageIndicators key={`usage:${connection.identity.hubPublicKey}:${current?.id}:${usageBot.id}`} context={usage.context} quota={usage.quota} serverTimeOffset={state.serverTimeOffset} onOpen={usage.readForDetails}/>;
   // Phone: nothing beside the composer. The battery alone, without a number, sits in the header whenever the
   // quota can be read: under the computer's name when several are paired, by itself otherwise.
   const phoneQuota = phone ? usage.quota : undefined;
@@ -1980,8 +1993,8 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       {current?.workspacePath && <span className="header-workspace-name" title={current.workspacePath}><Folder size={12} aria-hidden="true"/><span>{workspaceDisplayName(current.workspacePath)}</span></span>}
       {current && <ReplyActivity group={!!group} names={streamingBots} offline={live && !!directBotId && state.bots.some(bot => bot.id === directBotId && !bot.online)}/>}
     </div>
-  </div>{shell?.multiHost && phoneQuota ? <button type="button" className="header-host-source header-host-usage" aria-label={`${t("运行于 {0}", shell.host.name)}${t("，")}${quotaMarkLabel(phoneQuota.left)}`} onClick={openQuotaDetails}><HostSourceBadge name={shell.host.name} header/><QuotaBattery left={phoneQuota.left} height={11}/></button>
-    : shell?.multiHost ? <HostSourceBadge name={shell.host.name} header/> : phoneQuota ? <QuotaMark left={phoneQuota.left} onOpen={openQuotaDetails}/> : null}{!phone && visible && searchResults === undefined && group && current && <TopicSwitcher compact={!!pane} connection={connection} key={`topic:${current.id}`} group={group} current={current} conversations={conversations} activity={activity} select={selectChat} create={() => setNewChat({ kind: "topic", group })}/>}{sideButton}{rightPanelSwitcher}{screenButton}{workspaceButton}{!phone && current && <button ref={conversationSearchTrigger} className="icon-button conversation-search-trigger" aria-label={t("搜索当前对话")} title={t("搜索当前对话") + " (⌘F / Ctrl+F)"} aria-keyshortcuts="Meta+F Control+F" onClick={searchCurrentConversation}><Search size={18}/></button>}<button className={`connection-pill ${state.status}`} title={state.route?.url} aria-label={t("打开连接设置")} onClick={(event) => { event.currentTarget.focus(); setSettingsFromMenu(false); setSettingsSection("connection"); setSettings(true); }}>{state.status === "online" ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{connectionSummary}</span></button>{(phone || current) && <button ref={chatMoreTrigger} className="icon-button mobile-chat-more" aria-label={t("更多聊天操作")} aria-expanded={phone ? undefined : menu === "chat"} aria-controls={!phone && menu === "chat" ? `${menuId}-chat` : undefined} onClick={(event) => { event.currentTarget.focus(); history.refresh(); if (phone) setChatActions(true); else toggleMenu("chat"); }}><MoreHorizontal size={phone ? 24 : 18}/></button>}
+  </div>{shell?.multiHost && phoneQuota ? <button type="button" className="header-host-source header-host-usage" aria-label={`${t("运行于 {0}", shell.host.name)}${t("，")}${quotaMarkLabel(phoneQuota.left, phoneQuota.stale, phoneQuota.observedAt, locale)}`} onClick={openQuotaDetails}><HostSourceBadge name={shell.host.name} header/><QuotaBattery left={phoneQuota.left} stale={phoneQuota.stale} height={11}/></button>
+    : shell?.multiHost ? <HostSourceBadge name={shell.host.name} header/> : phoneQuota ? <QuotaMark left={phoneQuota.left} stale={phoneQuota.stale} observedAt={phoneQuota.observedAt} onOpen={openQuotaDetails}/> : null}{!phone && visible && searchResults === undefined && group && current && <TopicSwitcher compact={!!pane} connection={connection} key={`topic:${current.id}`} group={group} current={current} conversations={conversations} activity={activity} select={selectChat} create={() => setNewChat({ kind: "topic", group })}/>}{sideButton}{rightPanelSwitcher}{screenButton}{workspaceButton}{!phone && current && <button ref={conversationSearchTrigger} className="icon-button conversation-search-trigger" aria-label={t("搜索当前对话")} title={t("搜索当前对话") + " (⌘F / Ctrl+F)"} aria-keyshortcuts="Meta+F Control+F" onClick={searchCurrentConversation}><Search size={18}/></button>}<button className={`connection-pill ${state.status}`} title={state.route?.url} aria-label={t("打开连接设置")} onClick={(event) => { event.currentTarget.focus(); setSettingsFromMenu(false); setSettingsSection("connection"); setSettings(true); }}>{state.status === "online" ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{connectionSummary}</span></button>{(phone || current) && <button ref={chatMoreTrigger} className="icon-button mobile-chat-more" aria-label={t("更多聊天操作")} aria-expanded={phone ? undefined : menu === "chat"} aria-controls={!phone && menu === "chat" ? `${menuId}-chat` : undefined} onClick={(event) => { event.currentTarget.focus(); history.refresh(); if (phone) setChatActions(true); else toggleMenu("chat"); }}><MoreHorizontal size={phone ? 24 : 18}/></button>}
       {pane?.headerTrailing}{!phone && current && <DesktopMenu id={`${menuId}-chat`} label={t("聊天操作")} open={menu === "chat"} close={closeMenu} trigger={chatMoreTrigger} placement="down-end" className="chat-menu">
         {!pane&&isMobileScreenApp()&&<button className="screen-mobile-entry" onClick={()=>{closeMenu();openScreen();}}><MonitorPlay size={16}/><span className="desktop-menu-label">{t("查看屏幕")}</span></button>}
         {!pane&&isMobileScreenApp()&&<button className="screen-mobile-entry" onClick={()=>{closeMenu();setSettingsFromMenu(true);setSettingsSection("screen");setSettings(true);}}><MonitorCog size={16}/><span className="desktop-menu-label">{t("屏幕控制设置")}</span></button>}
@@ -2132,7 +2145,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   {turnStop.dialog}
   <ConversationHistoryDialog history={history}/>
   {quotaDetails && <CreationDialog title={t("额度")} closeLabel={t("关闭额度")} returnFocus={chatMoreTrigger} close={() => setQuotaDetails(false)}>
-    <div className="usage-sheet">{usage.quota ? <UsageDetails quota={usage.quota}/> : <p className="usage-note" role="status">{t("现在读不到额度")}</p>}</div>
+    <div className="usage-sheet">{usage.quota ? <UsageDetails quota={usage.quota} serverTimeOffset={state.serverTimeOffset}/> : <p className="usage-note" role="status">{t("现在读不到额度")}</p>}</div>
   </CreationDialog>}
   {chatActions && <CreationDialog title={t("聊天操作")} closeLabel={t("关闭聊天操作")} returnFocus={chatMoreTrigger} close={() => setChatActions(false)}>
     {canStopActive && phoneTurnActions}
@@ -2150,7 +2163,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     <div className="mobile-chat-action-list">
       {!pane&&isMobileScreenApp()&&<button onClick={()=>{setChatActions(false);openScreen();}}><MonitorPlay size={20}/><span className="action-label">{t("查看屏幕")}</span><ChevronRight className="action-chevron" size={18}/></button>}
       {!pane&&isMobileScreenApp()&&<button onClick={()=>{setChatActions(false);setSettingsFromMenu(true);setSettingsSection("screen");setSettings(true);}}><MonitorCog size={20}/><span className="action-label">{t("屏幕控制设置")}</span><ChevronRight className="action-chevron" size={18}/></button>}
-      {phone && usage.quota && <button aria-label={t("额度")} aria-describedby={`${chatActionNote}-quota`} onClick={openQuotaDetails}><QuotaBattery left={usage.quota.left}/><span className="action-label">{t("额度")}</span><span id={`${chatActionNote}-quota`} className="action-value" data-tone={usageTone(usage.quota.left)}>{usage.quota.left}%</span><ChevronRight className="action-chevron" size={18}/></button>}
+      {phone && usage.quota && <button aria-label={t("额度")} aria-describedby={`${chatActionNote}-quota`} onClick={openQuotaDetails}><QuotaBattery left={usage.quota.left} stale={usage.quota.stale}/><span className="action-label">{t("额度")}</span><span id={`${chatActionNote}-quota`} className="action-value" data-tone={usage.quota.stale ? undefined : usageTone(usage.quota.left)} data-stale={usage.quota.stale ? "true" : undefined}>{usage.quota.left}%</span><ChevronRight className="action-chevron" size={18}/></button>}
       <button aria-label={t("打开连接设置")} aria-describedby={`${chatActionNote}-connection`} onClick={() => { setChatActions(false); setSettingsFromMenu(true); setSettingsSection("connection"); setSettings(true); }}>{state.status === "online" ? <Wifi size={20}/> : <WifiOff size={20}/>}<span className="action-label">{t("连接状态与线路")}</span><span id={`${chatActionNote}-connection`} className="action-value">{connectionSummary}</span><ChevronRight className="action-chevron" size={18}/></button>
       <button onClick={() => { setChatActions(false); setArchives(true); }}><Archive size={20}/><span className="action-label">{t("已归档对话")}</span>{archivedChats.length > 0 && <span className="action-value">{archivedChats.length}</span>}<ChevronRight className="action-chevron" size={18}/></button>
     </div>
