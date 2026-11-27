@@ -1,4 +1,3 @@
-import { isDispatcher } from "./dispatcher.js";
 import { anySignal, timeoutSignal } from "./abort-signals.js";
 import { BotName } from "./BotName.js";
 import { useEffect, useRef, useState, useSyncExternalStore, type RefObject } from "react";
@@ -47,8 +46,7 @@ export function GroupSettings({ connection, group, bots, close, returnFocus, mem
     setChosen(next);
     setPolicy(old => ({ ...old, botOrder: [...old.botOrder.filter(id => next.includes(id)), ...next.filter(id => !old.botOrder.includes(id))] }));
   };
-  // A dispatcher Bot cannot join groups (the Host rejects it); keep only existing members listed.
-  const directory = [...bots.filter(bot => !isDispatcher(bot) || chosen.includes(bot.id)), ...chosen.filter(id => !bots.some(bot => bot.id === id)).map(id => ({ id, name: labels.get(id) ?? id }))];
+  const directory = [...bots, ...chosen.filter(id => !bots.some(bot => bot.id === id)).map(id => ({ id, name: labels.get(id) ?? id }))];
   const requestClose = () => { if (dirty) setConfirmClose(true); else close(); };
   const save = async () => {
     if (saving.current || loadingPolicy || !allowed || !title.trim() || !chosen.length || !validPolicy) return;

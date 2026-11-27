@@ -30,11 +30,13 @@ export class HubAttachments {
       await validateInTransaction?.();
       await this.store.requireMember(userId, input.conversationId);
       this.checkSize(input.size);
-      // Repeating upload-init is resumable by (owner, conversation, hash, size).
-      const old = await this.store.db.get<AttachmentRow>("SELECT * FROM attachments a WHERE owner_id=? AND conversation_id=? AND sha256=? AND size=? AND name=? AND NOT EXISTS(SELECT 1 FROM retired_attachments r WHERE r.attachment_id=a.id)", [userId, input.conversationId, input.sha256, input.size, input.name]);
+      // Repeating upload-init is resumable by (owner, conversation, hash, size, recording).
+      const expectedRecording = input.recording === undefined ? null : input.recording ? 1 : 0;
+      const old = await this.store.db.get<AttachmentRow & { recording: number | null }>("SELECT a.*, ar.recording AS recording FROM attachments a LEFT JOIN attachment_recording ar ON ar.attachment_id=a.id WHERE a.owner_id=? AND a.conversation_id=? AND a.sha256=? AND a.size=? AND a.name=? AND ar.recording IS ? AND NOT EXISTS(SELECT 1 FROM retired_attachments r WHERE r.attachment_id=a.id)", [userId, input.conversationId, input.sha256, input.size, input.name, expectedRecording]);
       if (old) return { id: old.id, chunkBytes: CHUNK_BYTES };
       const id = newId("att");
       await this.store.db.run("INSERT INTO attachments VALUES(?,?,?,?,?,?,?,?,0,?)", [id, input.conversationId, userId, input.sha256, input.size, input.mime, input.name, `${id}.blob`, Date.now()]);
+      if (expectedRecording !== null) await this.store.db.run("INSERT INTO attachment_recording(attachment_id, recording) VALUES(?, ?)", [id, expectedRecording]);
       return { id, chunkBytes: CHUNK_BYTES };
     });
   }

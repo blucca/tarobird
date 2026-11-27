@@ -6,6 +6,7 @@ import { withFileMutex } from "../state/file-mutex.js";
 import { resolveEngineExecutable } from "../runtime/engine-process.js";
 import { deepseekExecutableOverride, resolveDeepSeekExecutable } from "../runtime/deepseek-executable.js";
 import { EngineSettingsReadError, ENGINE_COMMANDS, ENGINE_ENV_KEYS, engineSettingsFile, hostEngineEnvironment, readHostEngineSettings, type StoredEngineSettings } from "../runtime/host-engine-settings.js";
+import { refreshWindowsRegistryPath } from "../runtime/windows-registry-path.js";
 import { engineSettingsUpdateSchema, hostEngineSchema, type EngineSettingsState, type EngineSettingsUpdate } from "../client-protocol/engine-settings.js";
 import { HubError } from "./store.js";
 
@@ -14,6 +15,9 @@ export class HubEngineSettings {
   private read(): StoredEngineSettings {
     try { return readHostEngineSettings(this.directory); }
     catch (error) { if (error instanceof EngineSettingsReadError) throw new HubError(error.message, 503); throw error; }
+  }
+  async refresh(force = true): Promise<void> {
+    await refreshWindowsRegistryPath(this.base(), { force });
   }
   status(requestId?: string): EngineSettingsState {
     const settings = this.read(), base = this.base(), env = hostEngineEnvironment(this.directory, base, settings);

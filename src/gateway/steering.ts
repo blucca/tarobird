@@ -50,7 +50,7 @@ export function gatewaySteering(bridge: ReviewTargetBridge, runtime: CoreService
     const run = runtime.activeRuns.get(buildCoreConversationKey(conversationId));
     const attached = run?.abortController instanceof CoreGoalRunController ? run.abortController.liveConcurrentTurn() : null;
     const target = attached ?? (run?.goalWatch ? undefined : run);
-    return target?.abortController.signal.aborted ? undefined : target;
+    return target && !target.abortController.signal.aborted && !target.preparingMedia ? target : undefined;
   };
   const token = (run: CoreActiveRun) => { let id = ids.get(run); if (!id) { id = randomUUID(); ids.set(run, id); } return id; };
   // A turn started from a review target may still wait in Claude's queue, or

@@ -219,6 +219,67 @@ final class HubTls implements AutoCloseable {
             if(error instanceof javax.net.ssl.SSLHandshakeException || error instanceof javax.net.ssl.SSLPeerUnverifiedException || error instanceof CertificateException) return true;
         return false;
     }
+    private static final java.util.regex.Pattern HUB_ERROR_CODE = java.util.regex.Pattern.compile("^[a-z][a-z0-9]*_[a-z0-9_]{1,62}$");
+    static String classifyError(Throwable error) { return classifyError(error, "native_transport_failed"); }
+    static String classifyError(Throwable error, String fallback) {
+        if (error == null) return fallback;
+        String preservedCode = null;
+        boolean tlsIdentityMismatch = false, tlsUntrusted = false, connectionRefused = false;
+        boolean dnsFailed = false, timedOut = false, hostUnreachable = false, connectionReset = false;
+        java.util.ArrayDeque<Throwable> queue = new java.util.ArrayDeque<>();
+        java.util.IdentityHashMap<Throwable, Boolean> seen = new java.util.IdentityHashMap<>();
+        queue.add(error);
+        int visited = 0;
+        while (!queue.isEmpty() && visited < 24) {
+            Throwable current = queue.poll();
+            if (current == null || seen.put(current, Boolean.TRUE) != null) continue;
+            visited++;
+            String message = current.getMessage();
+            String trimmed = message == null ? "" : message.trim();
+            String lower = trimmed.toLowerCase(Locale.ROOT);
+            if ("tls_identity_mismatch".equals(trimmed)) tlsIdentityMismatch = true;
+            if (preservedCode == null && current.getClass() == IOException.class && HUB_ERROR_CODE.matcher(trimmed).matches()) {
+                preservedCode = trimmed;
+            }
+            if (current instanceof javax.net.ssl.SSLHandshakeException
+                || current instanceof javax.net.ssl.SSLPeerUnverifiedException
+                || current instanceof CertificateException
+                || current instanceof java.security.cert.CertPathValidatorException) {
+                tlsUntrusted = true;
+            }
+            if (current instanceof java.net.SocketTimeoutException
+                || (current instanceof java.io.InterruptedIOException && (lower.contains("timeout") || lower.contains("timed out")))) {
+                timedOut = true;
+            }
+            if (current instanceof java.net.UnknownHostException) dnsFailed = true;
+            if (current instanceof java.net.NoRouteToHostException) hostUnreachable = true;
+            if (lower.contains("econnrefused") || lower.contains("connection refused")) {
+                connectionRefused = true;
+            } else if (lower.contains("ehostunreach") || lower.contains("enetunreach")
+                || lower.contains("ehostdown") || lower.contains("enetdown")
+                || lower.contains("no route to host") || lower.contains("network is unreachable")
+                || lower.contains("host is unreachable")) {
+                hostUnreachable = true;
+            } else if (lower.contains("etimedout") || lower.contains("timed out")) {
+                timedOut = true;
+            } else if (lower.contains("connection reset") || lower.contains("unexpected end of stream")) {
+                connectionReset = true;
+            } else if (current instanceof java.net.ConnectException) {
+                hostUnreachable = true;
+            }
+            if (current.getCause() != null) queue.add(current.getCause());
+            for (Throwable suppressed : current.getSuppressed()) if (suppressed != null) queue.add(suppressed);
+        }
+        if (tlsIdentityMismatch) return "tls_identity_mismatch";
+        if (preservedCode != null) return preservedCode;
+        if (tlsUntrusted) return "native_tls_untrusted";
+        if (connectionRefused) return "native_connection_refused";
+        if (dnsFailed) return "native_dns_failed";
+        if (timedOut) return "native_request_timeout";
+        if (hostUnreachable) return "native_host_unreachable";
+        if (connectionReset) return "native_connection_reset";
+        return fallback;
+    }
     void forget(String origin, String key, Route failed) {
         if(failed==null) return;
         synchronized(authorities) { for(HubTls scoped:authorities.values()) scoped.forget(origin,key,failed); }

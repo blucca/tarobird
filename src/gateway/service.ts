@@ -47,6 +47,7 @@ import { GatewayReceipts } from "./receipts.js";
 import { gatewayActiveWorkCount } from "./activity.js";
 import { effortSettings } from "../runtime/effort-settings.js";
 import { modelSettings } from "../runtime/model-settings.js";
+import { workspaceSettings } from "../runtime/workspace-settings.js";
 import { appTurnInstructions, botMessageQuestionInstructions, dispatcherExecutionInstructions, dispatcherInstructions, workerExecutionInstructions, type AppInstructionOptions } from "./agent-instructions.js";
 import { mergeTurnInstructions } from "../core/agent-instructions.js";
 import { stripAlreadyDeliveredAppArtifacts, type AppDeliveryReceipt } from "./app-delivery.js";
@@ -58,7 +59,8 @@ export interface GatewayServiceOptions extends GatewayTransportOptions { bridge:
  * store, usage ledger, cron runtime and native session lock stay shared. */
 export async function attachGateway(options: GatewayServiceOptions): Promise<GatewayChannel> {
   const attachedAt = Date.now();
-  const channel = new GatewayChannel(new GatewayTransport(options));
+  const quotaEngine = quotaEngineSchema.safeParse(options.engine);
+  const channel = new GatewayChannel(new GatewayTransport({ ...options, engineQuotaAccountMatch: quotaEngine.success }));
   let disconnecting = false;
   const blockedPulls = new Map<string, ReturnType<typeof setTimeout>>();
   const activePulls = new Set<Promise<void>>();
@@ -155,13 +157,16 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       const instructionOptions: AppInstructionOptions = { engine: config.engine, claudeChrome: config.claudeChrome, timezone: config.timezone,
         context: discussionTurn ? "discussion" : input.instructions?.includes("This scheduled run must not") ? "cron" : "chat" };
       const source = channel.currentBotSource();
-      const dispatcherContext = { scheduled: instructionOptions.context === "cron", delegated: !!source };
+      // Host ticket notices are explicitly verified by the Hub (clientMsgId `tn_*` + own hostId).
+      // Preserve the dispatcher's owner-facing flow only for verified Host notices, while treating
+      // genuine Bot-to-Bot messages (even with a caller-supplied `tk_*` requestId) as delegated Bot turns.
+      const ticketNotice = config.role === "dispatcher" && !!source && channel.currentTicketNotice();
+      const dispatcherContext = { scheduled: instructionOptions.context === "cron", delegated: !!source && !ticketNotice, ...(conversationId ? { conversationId } : {}) };
       const workerInstructions = channel.currentTicket() && conversationId && input.conversationKey === buildCoreConversationKey(conversationId) && !discussionTurn && instructionOptions.context !== "cron"
         ? workerExecutionInstructions(channel.currentMessageId()) : undefined;
       instructionOptions.ticketWorker = !!workerInstructions;
-      // Ticket notices also carry botSource; preserve the dispatcher's owner-facing flow.
       // Turn-local provenance only: owner text/history must not disable questions.
-      instructionOptions.botMessageTask = !!source && !workerInstructions && !discussionTurn && config.role !== "dispatcher";
+      instructionOptions.botMessageTask = !!source && !ticketNotice && !workerInstructions && !discussionTurn;
       const ordinaryGroup = !discussionTurn && conversationId && await channel.getChatMode(conversationId) === "group";
       // A discussion turn gets no cross-Bot CLI context: the Hub rejects it too.
       const frozenWorkbench = conversationId && channel.currentMessageId() ? await channel.workbenchContext().catch(() => undefined) : undefined;
@@ -270,19 +275,23 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   const engineTasks = gatewayEngineTasks(bridge, channel, options.stateDir);
   const contextUsage = gatewayContextUsage(bridge, channel);
   const piSession = gatewayPiSession(bridge, channel, options.stateDir, options.botId);
-  const history = gatewayConversationHistory(bridge, channel, runtime, options.stateDir, options.botId, () => (sideSessions?.activeCount() ?? 0) > 0);
+  const history = gatewayConversationHistory(bridge, channel, runtime, options.stateDir, options.botId, (conversationId) => sideSessions?.hasOpenSession(conversationId) ?? false);
   // Side audio uses the main transcriber and cloud policy, without its chat progress cards.
   sideSessions = gatewaySideSessions(surface, options.stateDir, options.botId, conversationId => channel.canSteerConversation!(conversationId), instanceAttachmentDownload(channel.transport), runtime.transcribeMedia ?? createDefaultTranscribeVoice(), channel);
   const schedules = gatewaySchedules(options, channel);
-  const quotaEngine = quotaEngineSchema.safeParse(options.engine);
-  const quotas = quotaEngine.success ? gatewayEngineQuota({ botId: options.botId, engine: quotaEngine.data, read: bridge.readAccountQuota?.bind(bridge) }) : undefined;
+  const quotas = quotaEngine.success ? gatewayEngineQuota({ botId: options.botId, engine: quotaEngine.data, read: bridge.readAccountQuota?.bind(bridge), getAccountProofKey: () => channel.transport.quotaProofKey }) : undefined;
   channel.onCall = async (method, raw): Promise<Json> => withChannelProfile("gateway", async () => {
     if (method.startsWith("history.")) return history(method, raw);
     if (method === "quota.get") { if (!quotas) throw new Error("quota_engine_unavailable"); return z.json().parse(await quotas(raw)); }
+    if (method === "quota.accountProof") { if (!quotas) throw new Error("quota_engine_unavailable"); return z.json().parse(quotas.accountProof(raw)); }
     if (method === "tasks.list" || method === "tasks.stop" || method === "tasks.recover") return z.json().parse(await engineTasks(method, raw));
     if (method === "context.usage") return z.json().parse(await contextUsage(raw));
     if (method === "pi.session.get" || method === "pi.session.set") return z.json().parse(await piSession(method, raw));
     if (["side.status", "side.open", "side.read", "side.ask", "side.stop", "side.close"].includes(method)) return z.json().parse(await sideSessions!.call(method, raw));
+    if (method === "workspace.get" || method === "workspace.set") {
+      if (method === "workspace.get") z.object({}).strict().parse(raw);
+      return z.json().parse(await workspaceSettings(options.stateDir, activeWorkCount, method === "workspace.set" ? raw : undefined));
+    }
     if (method === "persona.get" || method === "persona.set") {
       if (method === "persona.get") z.object({}).strict().parse(raw);
       return z.json().parse(await personaSettings(options.stateDir, activeWorkCount, method === "persona.set" ? raw : undefined));
@@ -337,7 +346,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     if (["sessions", "status", "service.status", "restart"].includes(method)) return gatewayOperation(method, options);
     throw new Error("unknown_gateway_call");
   });
-  const executeCron = buildCoreCronExecutor({ channel, bridge, runtime, stateDir: options.stateDir, deliverResponse: deliverCoreResponse, createRunCard: createCoreRunCardController, requestApproval: requestCoreApproval });
+  const executeCron = buildCoreCronExecutor({ channel, bridge, runtime, stateDir: options.stateDir, instanceName: options.botId, deliverResponse: deliverCoreResponse, createRunCard: createCoreRunCardController, requestApproval: requestCoreApproval });
   channel.runCron = (job, signal, lifecycle) => channel.inConversation(job.larkChatId ?? "", () => executeCron(job, signal, lifecycle));
   await channel.connect(); return channel;
 }

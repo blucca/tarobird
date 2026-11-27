@@ -38,6 +38,8 @@ export interface CoreActiveRun {
   startedAt?: number;
   /** The queued input this run executes, for an exactly targeted Stop. */
   sourceMessageId?: string;
+  /** True while preparing attachments / transcribing audio before any engine turn starts. */
+  preparingMedia?: boolean;
 }
 
 export interface CoreQueuePolicy {

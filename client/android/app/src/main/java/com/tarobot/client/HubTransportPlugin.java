@@ -68,7 +68,7 @@ public class HubTransportPlugin extends Plugin {
     }
     // Control receipts cannot wait behind 32 blocked HTTP reads. These operations
     // only update bounded state / enqueue a socket frame, never wait for network IO.
-    private void complete(PluginCall call,Operation operation) { try { if(transport==null) throw new IOException("native_transport_unavailable"); call.resolve(operation.run()); } catch(Exception error) { call.reject(error instanceof IOException?error.getMessage():"native_transport_failed"); } }
+    private void complete(PluginCall call,Operation operation) { try { if(transport==null) throw new IOException("native_transport_unavailable"); call.resolve(operation.run()); } catch(Exception error) { call.reject(HubTls.classifyError(error)); } }
     private static JSObject value(Object value) { JSObject result=new JSObject(); result.put("value",value); return result; }
     private static String text(PluginCall call, String name) throws IOException { String value=call.getString(name); if(value==null) throw new IOException("invalid_native_input"); return value; }
     // Claim synchronously on the ordered bridge thread before later operations.
@@ -91,7 +91,7 @@ public class HubTransportPlugin extends Plugin {
             JSObject result=operation.run();
             if(epoch.get()!=generation||transport==null||!closing&&!transport.screenCurrent(text(call,"id"))) throw new IOException("native_document_retired");
             call.resolve(result);
-        } catch(Exception error) { call.reject(error instanceof IOException?error.getMessage():"native_transport_failed"); } };
+        } catch(Exception error) { call.reject(HubTls.classifyError(error)); } };
         if(!asynchronous) { run.run(); return; }
         try { io.execute(run); } catch(RejectedExecutionException error) { call.reject("native_transport_busy"); }
     }

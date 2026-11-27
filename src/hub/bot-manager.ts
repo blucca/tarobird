@@ -1,5 +1,6 @@
 import { resolvePiExecutable } from "../runtime/pi-executable.js";
 import { EngineSettingsReadError, hostEngineEnvironment } from "../runtime/host-engine-settings.js";
+import { refreshWindowsRegistryPath } from "../runtime/windows-registry-path.js";
 import { assignNewBotAvatar } from "./bot-avatar-default.js";
 import { publishExclusive } from "../state/publish-exclusive.js";
 import { resolveEngineExecutable } from "../runtime/engine-process.js";
@@ -71,11 +72,13 @@ export class BotManager {
   private catalogCache?: ModelCatalogCache;
   private get catalogs(): ModelCatalogCache { return this.catalogCache ??= new ModelCatalogCache({ deepseekCatalogHome: deepseekCatalogHome(this.directory) }); }
   constructor(readonly store: HubStore, readonly directory: string, readonly options: BotManagerOptions, readonly instanceUrl: () => string, readonly changed: (id: string) => Promise<void>) {}
+  private get baseEnv(): NodeJS.ProcessEnv { return this.options.env ?? process.env; }
   private get env(): NodeJS.ProcessEnv {
-    try { return hostEngineEnvironment(this.directory, this.options.env ?? process.env); }
+    try { return hostEngineEnvironment(this.directory, this.baseEnv); }
     catch (error) { if (error instanceof EngineSettingsReadError) throw new HubError(error.message, 503); throw error; }
   }
-  capabilities(engine: InstanceEngine) { return readEngineCapabilities(engine, { env: this.env }); }
+  private refreshEnvironment(force = false): Promise<string[]> { return refreshWindowsRegistryPath(this.baseEnv, { force }); }
+  async capabilities(engine: InstanceEngine) { await this.refreshEnvironment(); return readEngineCapabilities(engine, { env: this.env }); }
   private engineBinaries(env = this.env): Record<InstanceEngine, string> {
     return { codex: env.CODEX_EXECUTABLE || "codex", claude: env.CLAUDE_EXECUTABLE || "claude", kimi: env.KIMI_EXECUTABLE || "kimi", deepseek: resolveDeepSeekExecutable(env), antigravity: env.ANTIGRAVITY_EXECUTABLE || "agy", pi: resolvePiExecutable(env) };
   }
@@ -84,9 +87,9 @@ export class BotManager {
   /** Whether a Bot created now runs Antigravity through `agy acp`: the installed CLI must be new enough.
    * Read at most once a minute; the catalog asks every time the creation dialog opens. */
   private antigravityAcp(env = this.env): Promise<boolean> {
-    const executable = this.engineBinaries(env).antigravity, now = Date.now();
-    if (!resolveEngineExecutable(executable, env)) return Promise.resolve(false);
-    if (this.agyAcp?.executable !== executable || now - this.agyAcp.at >= 60_000) this.agyAcp = { executable, at: now, supported: antigravitySupportsAcp(executable, env) };
+    const resolved = resolveEngineExecutable(this.engineBinaries(env).antigravity, env), now = Date.now();
+    if (!resolved) return Promise.resolve(false);
+    if (this.agyAcp?.executable !== resolved || now - this.agyAcp.at >= 60_000) this.agyAcp = { executable: resolved, at: now, supported: antigravitySupportsAcp(resolved, env) };
     return this.agyAcp.supported;
   }
   private engineEntry(id: InstanceEngine, available: boolean, catalog: Pick<ModelCatalogRead, "choices" | "status">, runtime?: "acp"): CatalogEngine {
@@ -97,6 +100,7 @@ export class BotManager {
   }
   /** One engine's catalog entry, read through the Hub cache. */
   async engineCatalog(id: InstanceEngine, workspace?: string, request: ModelCatalogRequest = {}): Promise<EngineRead> {
+    await this.refreshEnvironment(!!request.refresh);
     const env = this.env, bins = this.engineBinaries(env), available = !!resolveEngineExecutable(bins[id], env);
     const placeholder: Pick<ModelCatalogRead, "choices"> = { choices: [{ id: "", efforts: [""] }] }, now = Date.now();
     if (id === "pi" && workspace && !(path.isAbsolute(workspace) && await stat(workspace).then(s => s.isDirectory(), () => false))) return { ...this.engineEntry(id, available, { ...placeholder, status: "unavailable" }), readAt: now };
@@ -109,7 +113,8 @@ export class BotManager {
     return { ...this.engineEntry(id, available, result, runtime), readAt: result.readAt, ...(result.stale ? { stale: true as const } : {}) };
   }
   /** The complete catalog the App, the CLI and dispatch read: every engine. */
-  async catalog(workspace?: string, freshEngine?: InstanceEngine): Promise<BotCatalog> {
+  async catalog(workspace?: string, freshEngine?: InstanceEngine, options: { forceRefresh?: boolean } = {}): Promise<BotCatalog> {
+    await this.refreshEnvironment(!!freshEngine || !!options.forceRefresh);
     const ids = Object.keys(this.engineBinaries()) as InstanceEngine[];
     return { engines: await Promise.all(ids.map(async id => {
       const { readAt: _readAt, stale: _stale, ...entry } = await this.engineCatalog(id, workspace, { refresh: freshEngine === id });
@@ -117,8 +122,18 @@ export class BotManager {
     })) };
   }
   async restore(): Promise<void> {
+    await this.refreshEnvironment();
     const rows = await this.store.db.serial(() => this.store.db.all<Managed>("SELECT m.* FROM managed_bots m JOIN bots b ON b.id=m.bot_id WHERE b.deleted_at IS NULL"));
-    for (const row of rows) { try { await this.prepare(row); this.launch(row.bot_id); } catch { await this.store.audit("bot.start_failed", null, { botId: row.bot_id }); } }
+    for (const row of rows) {
+      try {
+        await this.prepare(row);
+        const stateDir = path.join(this.directory, "bots", row.bot_id);
+        const cfg = await loadInstanceConfig(stateDir).catch(() => undefined);
+        const ws = cfg ? resolveInstanceWorkspacePath(cfg) ?? path.resolve(path.join(stateDir, "workspace")) : undefined;
+        if (ws) await this.store.botStatus(row.bot_id, { workspacePath: path.resolve(ws) }).catch(() => undefined);
+        this.launch(row.bot_id);
+      } catch { await this.store.audit("bot.start_failed", null, { botId: row.bot_id }); }
+    }
   }
   create(userId: string, input: CreateBotInput, validate?: TransactionGuard, options: { internal?: true; dispatcherId?: string } = {}) {
     const authorize = async () => { await validate?.(); await this.store.requireOwner(userId); };
@@ -136,6 +151,7 @@ export class BotManager {
       let row = await this.store.db.serial(() => this.store.db.get<Managed>("SELECT * FROM managed_bots WHERE bot_id=?", [botId]));
       if (row && row.specification_json !== JSON.stringify(spec)) throw new HubError("idempotency_conflict", 409);
       const creating = !row;
+      await this.refreshEnvironment();
       if (!row) {
         if (spec.workspace && (!path.isAbsolute(spec.workspace) || !await stat(spec.workspace).then((s) => s.isDirectory(), () => false))) throw new HubError("bot_workspace_unavailable");
         if (!this.engineAvailable(spec.engine)) throw new HubError("bot_engine_unavailable", 409);
@@ -165,9 +181,10 @@ export class BotManager {
         await this.store.db.serial(authorize);
         row = { bot_id: botId, owner_id: userId, request_id: spec.requestId, specification_json: JSON.stringify(spec) };
         const secret = await this.prepare(row);
+        const initialWorkspace = path.resolve(spec.workspace || path.join(this.directory, "bots", botId, "workspace"));
         await this.store.db.transaction(async () => {
           await authorize();
-          await this.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role) VALUES(?,?,?,?,?,?,?)", [botId, spec.name, hashSecret(secret), spec.engine, spec.model, spec.effort, spec.role ?? ""]);
+          await this.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort,role,workspace_path) VALUES(?,?,?,?,?,?,?,?)", [botId, spec.name, hashSecret(secret), spec.engine, spec.model, spec.effort, spec.role ?? "", initialWorkspace]);
           if (spec.role === "dispatcher") await saveDispatcherSettingsInTransaction(this.store.db, botId, spec.dispatcher ?? defaultDispatcherSettings());
           await this.store.db.run("INSERT INTO managed_bots VALUES(?,?,?,?)", [botId, userId, spec.requestId, row!.specification_json]);
           if (options.internal && options.dispatcherId && spec.role === "worker") await this.store.db.run("INSERT INTO dispatch_workers VALUES(?,?,?) ON CONFLICT(dispatcher_bot_id,engine) DO UPDATE SET bot_id=excluded.bot_id", [options.dispatcherId, spec.engine, botId]);
@@ -374,6 +391,9 @@ export class BotManager {
         catch { finish({ ok: false, error: "restart_send_failed" }); }
       });
     }
+    await this.refreshEnvironment();
+    if (this.deleted.has(botId) || !await this.owns(botId)) throw new HubError("bot_deleted", 410);
+    if (this.stopping) return { ok: false, error: "hub_stopping" };
     const timer = this.timers.get(botId); if (timer) clearTimeout(timer); this.timers.delete(botId); this.failures.delete(botId);
     const launched = this.launch(botId);
     // launch() already logged the reason and re-armed its retry. A damaged

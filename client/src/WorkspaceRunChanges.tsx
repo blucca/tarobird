@@ -3,6 +3,7 @@ import { FileDiff } from "lucide-react";
 import type { Message } from "../../src/client-protocol/index.js";
 import { runChangesSchema, type RunChanges } from "../../src/client-protocol/run-changes.js";
 import type { HubConnection } from "./connection.js";
+import { DiffCounts } from "./DiffCounts.js";
 import { DiffViewerTrigger, recordedRunChanges } from "./DiffViewerTrigger.js";
 import { readRunEvidence } from "./run-changes-read.js";
 import { t } from "./i18n.js";
@@ -10,10 +11,6 @@ import { t } from "./i18n.js";
 /** A narrow rail: three names say what a turn touched; the rest is a count. */
 const NAMED = 3;
 const fileName = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
-
-function Counts({ value }: { value: { additions: number | null; deletions: number | null } }) {
-  return <span className="workspace-diff-counts"><span>+{value.additions ?? "—"}</span><span>−{value.deletions ?? "—"}</span></span>;
-}
 
 /** One reply's recorded changes in the workspace rail: its files by name, each with what was added and removed.
  *  The names are the Hub's record of that run. Until they arrive, or when they cannot be read (offline, an older
@@ -41,8 +38,8 @@ export function WorkspaceRunChanges({ connection, message }: { connection: HubCo
   const note = [more > 0 ? t("还有 {0} 个文件", more) : "", partial ? t("部分记录") : ""].filter(Boolean).join(" · ");
   return <div className="workspace-diff-row"><DiffViewerTrigger connection={connection} message={message}>
     <span className="workspace-diff-files">
-      {named ? named.map(file => <span key={file.key} className="workspace-diff-file"><FileDiff size={14} aria-hidden="true"/><span className="workspace-diff-name" title={file.path}>{fileName(file.path)}</span><Counts value={file}/></span>)
-        : <span className="workspace-diff-file"><FileDiff size={14} aria-hidden="true"/><span className="workspace-diff-name">{t("改动 {0} 个文件", summary.files)}</span><Counts value={summary}/></span>}
+      {named ? named.map(file => <span key={file.key} className="workspace-diff-file"><FileDiff size={14} aria-hidden="true"/><span className="workspace-diff-name" title={file.path}>{fileName(file.path)}</span><DiffCounts additions={file.additions} deletions={file.deletions} className="workspace-diff-counts"/></span>)
+        : <span className="workspace-diff-file"><FileDiff size={14} aria-hidden="true"/><span className="workspace-diff-name">{t("改动 {0} 个文件", summary.files)}</span><DiffCounts additions={summary.additions} deletions={summary.deletions} className="workspace-diff-counts"/></span>}
       {note && <span className="workspace-diff-note">{note}</span>}
     </span>
   </DiffViewerTrigger></div>;

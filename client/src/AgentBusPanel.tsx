@@ -86,7 +86,7 @@ export function AgentBusPanel({ host, hosts, workspaceId, visible, close, select
   const ownsDraft = !connection.isReadOnly && state.user?.role === "owner" && !host.blocked;
   const online = state.status === "online" && ownsDraft;
   const allBots = host.directory?.bots ?? state.bots;
-  // A dispatcher keeps one conversation, so it cannot take a dedicated Bus chat.
+  // A dispatcher manages its own ticket workers and stays excluded from Agent Bus slots.
   const botList = allBots.filter(bot => bot.managed && !bot.deletedAt && !isDispatcher(bot));
   const label = (id: string) => allBots.some(bot => bot.id === id) ? busBotLabel(allBots, id) : t("成员已不可用");
   const memberIds = config.members.map(member => member.botId).filter(Boolean);

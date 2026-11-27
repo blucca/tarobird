@@ -201,7 +201,7 @@ export async function handleLocalEngineCoreCommand(input: {
       engineMessage = locale === "zh" ? ENGINE_USAGE_ZH : ENGINE_USAGE_EN;
       await context.api.sendMessage(normalized.chatId, engineMessage);
     } else if (engineCmd.engine === "pi" && cfg.role === "dispatcher") {
-      engineMessage = locale === "zh" ? "Pi 仅用于普通 Bot，不支持幕僚长。" : "Pi is available for ordinary Bots, not Chief of Staff Bots.";
+      engineMessage = locale === "zh" ? "Pi 仅用于普通 Bot，不支持幕僚长。" : "Pi is available for ordinary Bots, not Superagent Bots.";
       await context.api.sendMessage(normalized.chatId, engineMessage);
     } else {
       const selectedEngine = engineCmd.engine as InstanceEngine;
@@ -280,7 +280,7 @@ export async function handleLocalEngineCoreCommand(input: {
         locale,
         text: "/compact",
         files: [],
-        workspaceOverride: cfg.resume?.workspacePath,
+        workspaceOverride: cfg.resume?.workspacePath ?? cfg.workspacePath,
         disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
         abortSignal: context.abortSignal,
       });
@@ -346,7 +346,7 @@ export async function handleLocalEngineCoreCommand(input: {
       locale,
       text: "/ultrareview",
       files: [],
-      workspaceOverride: cfg.resume?.workspacePath,
+      workspaceOverride: cfg.resume?.workspacePath ?? cfg.workspacePath,
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
       abortSignal: context.abortSignal,
     });
@@ -371,7 +371,7 @@ export async function handleLocalEngineCoreCommand(input: {
         chatId: normalized.chatId,
         messageThreadId: normalized.messageThreadId,
         conversationKey: normalized.conversationKey,
-        workspaceOverride: cfg.engine === "pi" ? cfg.workspacePath ?? cfg.resume?.workspacePath : cfg.resume?.workspacePath,
+        workspaceOverride: cfg.engine === "pi" ? cfg.workspacePath ?? cfg.resume?.workspacePath : cfg.resume?.workspacePath ?? cfg.workspacePath,
       }) ?? null;
       const msg = renderContextUsage(usage, locale, cfg.engine === "pi" ? "Pi" : cfg.engine === "antigravity" ? "Antigravity" : "DeepSeek Harness");
       await context.api.sendMessage(normalized.chatId, msg);
@@ -406,7 +406,7 @@ export async function handleLocalEngineCoreCommand(input: {
       locale,
       text: "/context",
       files: [],
-      workspaceOverride: cfg.resume?.workspacePath,
+      workspaceOverride: cfg.resume?.workspacePath ?? cfg.workspacePath,
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
       abortSignal: context.abortSignal,
     });
