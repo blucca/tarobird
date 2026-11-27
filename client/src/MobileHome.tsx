@@ -352,7 +352,8 @@ function MessagesPane({
   const hasVisibleRows = (host: MobileHost) => ordinary.some(row => row.hostId === host.id) || !filtered && !!host.connection.state.conversationFolders?.folders.length;
   const renderRow = (row: MobileConversationRow, showHost: boolean) => {
     const host = hostById.get(row.hostId); if (!host) return null;
-    return <AvatarProvider connection={host.connection} conversations={host.conversations} directory={host.bots}><BotReferences bots={host.bots}><ConversationRow row={row} connection={host.connection} conversations={host.conversations} dispatcher={row.conversation.type === 'direct' && !row.conversation.parentId && isDispatcher(host.bots.find(bot => bot.id === row.conversation.botIds[0]))} multiHost={showHost} locale={locale} attentionOnly={filter === 'attention'} onSelect={select} onActions={openActions}/></BotReferences></AvatarProvider>;
+    const dispatcherBotIds = row.conversation.botIds.filter(id => isDispatcher(host.bots.find(bot => bot.id === id)));
+    return <AvatarProvider connection={host.connection} conversations={host.conversations} directory={host.bots}><BotReferences bots={host.bots}><ConversationRow row={row} connection={host.connection} conversations={host.conversations} dispatcher={row.conversation.type === 'direct' && !row.conversation.parentId && dispatcherBotIds.length > 0} dispatcherBotIds={dispatcherBotIds} multiHost={showHost} locale={locale} attentionOnly={filter === 'attention'} onSelect={select} onActions={openActions}/></BotReferences></AvatarProvider>;
   };
   const renderFolders = (host: MobileHost, showHostBadge: boolean) => <FolderSections connection={host.connection} hostId={host.id} hostName={host.name} showHostBadge={showHostBadge} visible={paneVisible} holdActions rows={ordinary.filter(row => row.hostId === host.id)} filtered={!!needle || filter !== 'all' || !!botScope} renderRow={row => renderRow(row, false)}/>;
   const renderList = (items: MobileConversationRow[], showHost: boolean) => <ul className="mh-list">{items.map(row => <li key={row.key}>{renderRow(row, showHost)}</li>)}</ul>;
@@ -442,11 +443,12 @@ function MessagesPane({
   );
 }
 
-function ConversationRow({ row, connection, conversations, dispatcher, multiHost, locale, attentionOnly, onSelect, onActions }: {
+function ConversationRow({ row, connection, conversations, dispatcher, dispatcherBotIds, multiHost, locale, attentionOnly, onSelect, onActions }: {
   row: MobileConversationRow;
   connection: HubConnection;
   conversations: Conversation[];
   dispatcher: boolean;
+  dispatcherBotIds: readonly string[];
   multiHost: boolean;
   locale: Locale;
   attentionOnly: boolean;
@@ -492,7 +494,7 @@ function ConversationRow({ row, connection, conversations, dispatcher, multiHost
       onKeyDown={event => { if (event.key === 'ContextMenu' || event.key === 'F10' && event.shiftKey) { event.preventDefault(); onActions(event.currentTarget); } }}
       onClick={() => bulk?.active ? bulk.toggle(connection, conversation) : onSelect(row.hostId, target?.conversationId ?? conversation.id, target?.messageId)}
     >
-      <AgentAvatar signal={row.agent} size={avatarSize} className="mh-avatar" dispatcher={dispatcher} tickets={dispatcher ? { connection, botId: conversation.botIds[0]! } : undefined}>
+      <AgentAvatar signal={row.agent} size={avatarSize} className="mh-avatar" dispatcher={dispatcher} tickets={dispatcherBotIds.length ? { connection, botIds: dispatcherBotIds, conversationIds: isGroup ? [conversation.id, ...conversations.filter(child => child.parentId === conversation.id && !child.archived).map(child => child.id)] : [conversation.id] } : undefined}>
         <ConversationAvatar conversation={conversation} size={avatarSize}/>
         {row.unread > 0 && <span className="mh-badge"><span aria-hidden="true">{badgeText(row.unread)}</span></span>}
         {bulk?.active && <ConversationBulkCheck checked={bulk.checked(connection, conversation)}/>}

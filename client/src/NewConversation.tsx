@@ -24,7 +24,7 @@ export function NewConversation({ hostName, connection, bots, request, created, 
     try { created(await connection.createConversation(submitted.current)); }
     catch (error) {
       if (error instanceof HubHttpError && error.status >= 400 && error.status < 500) {
-        submitted.current = undefined; setError(error.status === 403 ? t("当前账号没有创建此对话的权限。") : error.message === "conversation_archived" ? t("这个群组已归档，请先恢复群组。") : error.message === "dispatcher_single_conversation" ? t("幕僚长只有一个对话，请回到它现有的对话。") : error.message === "dispatcher_group_forbidden" ? t("幕僚长不能加入群组。") : t("无法创建，请检查选择的 Bot 和名称。"));
+        submitted.current = undefined; setError(error.status === 403 ? t("当前账号没有创建此对话的权限。") : error.message === "conversation_archived" ? t("这个群组已归档，请先恢复群组。") : error.message === "dispatcher_single_conversation" ? t("此主机版本尚不支持为幕僚长新建对话，请更新主机后重试。") : error.message === "dispatcher_group_forbidden" ? t("此主机版本尚不支持将幕僚长加入群组，请更新主机后重试。") : t("无法创建，请检查选择的 Bot 和名称。"));
       } else setError(t("暂未收到创建结果，请重试。重试会继续同一次创建。"));
     }
     finally { setBusy(false); }

@@ -142,10 +142,10 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     主人专用：不带 --conversation 时按对话汇总附件占用；带上则列出该对话的附件，每页 100 项
   attachments delete (--ids ID,ID | --conversation ID) --yes
     删除主机上的附件文件并立即释放空间；消息保留原文，附件处显示「附件已删除」。Bot 尚未处理完的消息里的附件会被拒绝
-  tickets list [--bot DISPATCHER] [--open] | show TICKET | targets | engines
+  tickets list [--bot DISPATCHER] [--conversation CONVERSATION] [--open] | show TICKET | targets | engines
   tickets capabilities --engine ENGINE [--match TEXT] [--offset N] [--bot DISPATCHER]
     按需读取用户级技能/MCP元数据，每页40项；不创建执行者、不验证运行权限或质量。
-  tickets create --title T (--text T | --text-file F) [--context-message ID]
+  tickets create --title T (--text T | --text-file F) [--conversation CONVERSATION] [--context-message ID]
   tickets dispatch TICKET --engine codex|claude|kimi|deepseek|antigravity [--model M] [--effort E] [--assist 0..2] [--text T | --text-file F] [--force] [--context-message ID]
     --assist 为本次派工链的协助次数；auto 默认 1，ask 默认 0。ask 模式需在计划中取得主人同意；限定单一模型时请设 0。
   tickets update TICKET [--status queued|needs_answer|needs_review|blocked|done|cancelled] [--note N] [--context-message ID]
@@ -343,7 +343,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     backups: ["days", "revision", "request-id"],
     integrations: ["yes", "request-id", "mode", "enabled", "adapter", "threshold-seconds", "revision"], directory: ["from"], init: ["name"], stop: ["wait", "force"], restart: ["wait", "force"], enroll: ["reset", "yes"], name: ["name"], drain: ["wait"],
     service: ["yes"], bots: ["name", "engine", "model", "effort", "workspace", "permission", "request-id", "expected-name", "yes", "revision", "enabled", "role", "dispatch-mode", "max-concurrent", "allow", "from"],
-    tickets: ["bot", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
+    tickets: ["bot", "conversation", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
     devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
     folders: ["enabled", "revision", "unfiled"],
     conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session"],
@@ -764,7 +764,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
   if (command === "attachments") { await output(await runAttachmentsCommand(directory, sub, { conversation: v.conversation, ids: v.ids, sort: v.sort, offset: v.offset, yes: v.yes })); return; }
   if (command === "tickets") {
     await output(await runTicketsCommand(directory, sub, argument, {
-      bot: v.bot, match: v.match, offset: v.offset, assist: v.assist, engine: v.engine, title: v.title, text: v.text, "text-file": v["text-file"], model: v.model, effort: v.effort, force: v.force, status: v.status, note: v.note, open: v.open,
+      bot: v.bot, conversation: v.conversation, match: v.match, offset: v.offset, assist: v.assist, engine: v.engine, title: v.title, text: v.text, "text-file": v["text-file"], model: v.model, effort: v.effort, force: v.force, status: v.status, note: v.note, open: v.open,
       "request-id": v["request-id"], "context-message": v["context-message"], "dispatch-mode": v["dispatch-mode"], "max-concurrent": v["max-concurrent"], allow: v.allow, revision: v.revision,
     }, id => console.error(`工单操作编号：${id}。结果未确认时保留原参数并用 --request-id ${id} 核对，不会自动重发。`))); return;
   }

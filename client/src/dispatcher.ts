@@ -25,8 +25,9 @@ export function listedConversations<T extends Pick<Conversation, "hidden">>(conv
 }
 
 /** A Host notice in a dispatcher's conversation (a ticket settled or resumed).
- * Only these carry a ticket ID as their Bot-message request ID there. */
-export const isTicketNotice = (message: Pick<Message, "authorType" | "botSource">, dispatcherChat: boolean) =>
-  dispatcherChat && message.authorType === "user" && !!message.botSource && /^tk_/.test(message.botSource.requestId);
+ * Only Hub-stamped Host notices carry both a `tn_*` clientMsgId and a `tk_*`
+ * request ID; Bot-to-Bot messages always receive `bm_*` and never collapse here. */
+export const isTicketNotice = (message: Pick<Message, "authorType" | "botSource" | "clientMsgId">, dispatcherChat: boolean) =>
+  dispatcherChat && message.authorType === "user" && !!message.botSource && !!message.clientMsgId?.startsWith("tn_") && /^tk_/.test(message.botSource.requestId);
 /** The notice's first line without the ticket ID, e.g. 【工单完成】「写周报」由 Codex（…）完成，等待验收。 */
 export const ticketNoticeSummary = (text: string) => (text.split("\n", 1)[0] ?? "").replace(/（tk_[A-Za-z0-9_-]+）/u, "").trim();

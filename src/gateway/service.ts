@@ -155,10 +155,11 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       const instructionOptions: AppInstructionOptions = { engine: config.engine, claudeChrome: config.claudeChrome, timezone: config.timezone,
         context: discussionTurn ? "discussion" : input.instructions?.includes("This scheduled run must not") ? "cron" : "chat" };
       const source = channel.currentBotSource();
-      // Host ticket notices also carry botSource (requestId tk_*); preserve the dispatcher's owner-facing flow for those,
-      // while treating genuine Bot-to-Bot messages to a dispatcher just like ordinary Bot collaboration turns.
-      const ticketNotice = config.role === "dispatcher" && !!source && /^tk_/.test(source.requestId);
-      const dispatcherContext = { scheduled: instructionOptions.context === "cron", delegated: !!source && !ticketNotice };
+      // Host ticket notices are explicitly verified by the Hub (clientMsgId `tn_*` + own hostId).
+      // Preserve the dispatcher's owner-facing flow only for verified Host notices, while treating
+      // genuine Bot-to-Bot messages (even with a caller-supplied `tk_*` requestId) as delegated Bot turns.
+      const ticketNotice = config.role === "dispatcher" && !!source && channel.currentTicketNotice();
+      const dispatcherContext = { scheduled: instructionOptions.context === "cron", delegated: !!source && !ticketNotice, ...(conversationId ? { conversationId } : {}) };
       const workerInstructions = channel.currentTicket() && conversationId && input.conversationKey === buildCoreConversationKey(conversationId) && !discussionTurn && instructionOptions.context !== "cron"
         ? workerExecutionInstructions(channel.currentMessageId()) : undefined;
       instructionOptions.ticketWorker = !!workerInstructions;

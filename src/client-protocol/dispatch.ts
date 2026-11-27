@@ -158,5 +158,6 @@ export type TicketOverview = z.infer<typeof ticketOverviewSchema>;
 export const ticketOverviewListSchema = z.object({
   tickets: z.array(ticketOverviewSchema), engines: z.array(engineHealthSchema),
   capabilities: z.object({ remove: z.boolean() }).strict().optional(),
+  otherCount: z.number().int().nonnegative().optional(),
 }).strict();
 export type TicketOverviewList = z.infer<typeof ticketOverviewListSchema>;

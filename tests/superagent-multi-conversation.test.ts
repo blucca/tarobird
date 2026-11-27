@@ -145,4 +145,176 @@ describe("Superagent multiple conversations, groups, and Bot messages (#122)", (
     const notices = await hub.store.db.all<{ blocks_json: string }>("SELECT blocks_json FROM messages WHERE conversation_id=? AND bot_source_json IS NOT NULL", [firstChat.id]);
     expect(notices).toHaveLength(1);
   });
+
+  it("rejects archived targets, skips archived home chats, and settles tickets without wedging concurrency slots or leaking notices", async () => {
+    const secondChat = await hub.store.createConversation("owner", ["super"], "Project Beta", "beta");
+    const group = await hub.store.createConversation("owner", ["super", "helper"], "Squad", "squad", { type: "group" });
+    const topic = await hub.store.createConversation("owner", ["super", "helper"], "Topic 1", "topic-1", { parentId: group.id });
+    const settings = await hub.dispatch.settings("owner", "super");
+    await hub.dispatch.updateSettings("owner", "super", { settings: { mode: "auto", maxConcurrent: 1 }, expectedRevision: settings.revision });
+
+    // Create and dispatch a ticket in firstChat, then archive firstChat while it is still working.
+    const ticketA = await hub.dispatch.create(owner, "super", { requestId: "arch-a", title: "Archived Work", request: "Run in Alpha", conversationId: firstChat.id });
+    const workingA = await hub.dispatch.dispatch(owner, "super", { requestId: "arch-go-a", ticketId: ticketA.id, engine: "codex" });
+    await hub.store.updateConversation("owner", firstChat.id, { archived: true });
+
+    // Creating a ticket targeting an archived chat or a topic under an archived parent group is rejected.
+    await expect(hub.dispatch.create(owner, "super", { requestId: "arch-reject-direct", title: "Bad", request: "No", conversationId: firstChat.id })).rejects.toThrow("conversation_archived");
+    await hub.store.updateConversation("owner", group.id, { archived: true });
+    await expect(hub.dispatch.create(owner, "super", { requestId: "arch-reject-topic", title: "Bad Topic", request: "No", conversationId: topic.id })).rejects.toThrow("conversation_archived");
+
+    // Fallback home() skips archived firstChat and picks active secondChat.
+    const fallbackTicket = await hub.dispatch.create(owner, "super", { requestId: "arch-fallback", title: "Fallback", request: "Run in Beta" });
+    expect(fallbackTicket.conversationId).toBe(secondChat.id);
+
+    // Worker finishes while firstChat is archived: settlement commits cleanly, releases maxConcurrent,
+    // and never leaks firstChat's notice into secondChat.
+    const settledA = await settleTicket(workingA, "Finished while archived.");
+    expect(settledA.status).toBe("needs_review");
+    expect(settledA.result).toBe("Finished while archived.");
+    const leaked = await hub.store.db.all("SELECT id FROM messages WHERE conversation_id=? AND bot_source_json IS NOT NULL", [secondChat.id]);
+    expect(leaked).toHaveLength(0);
+
+    // Concurrency slot (maxConcurrent=1) is released: fallbackTicket can dispatch immediately!
+    const workingB = await hub.dispatch.dispatch(owner, "super", { requestId: "arch-go-b", ticketId: fallbackTicket.id, engine: "codex" });
+    expect(workingB.status).toBe("working");
+
+    // Unarchiving firstChat allows the next sweep to deliver the deferred notice into firstChat.
+    await hub.store.updateConversation("owner", firstChat.id, { archived: false });
+    await hub.dispatch.sweep();
+    const noticesA = await hub.store.db.all<{ blocks_json: string; client_msg_id: string }>("SELECT blocks_json,client_msg_id FROM messages WHERE conversation_id=? AND bot_source_json IS NOT NULL", [firstChat.id]);
+    expect(noticesA).toHaveLength(1);
+    expect(noticesA[0]!.blocks_json).toContain("Archived Work");
+    expect(noticesA[0]!.client_msg_id).toMatch(/^tn_/);
+  });
+
+  it("settles group tickets cleanly during active/paused group discussions and blocks removing a busy dispatcher from the group", async () => {
+    const group = await hub.store.createConversation("owner", ["super", "helper"], "Release Squad", "grp-disc", { type: "group" });
+    const topic = await hub.store.createConversation("owner", ["super", "helper"], "Release Topic", "grp-topic", { parentId: group.id });
+    const settings = await hub.dispatch.settings("owner", "super");
+    await hub.dispatch.updateSettings("owner", "super", { settings: { mode: "auto", maxConcurrent: 1 }, expectedRevision: settings.revision });
+
+    const ticket = await hub.dispatch.create(owner, "super", { requestId: "disc-tk", title: "Topic Build", request: "Build", conversationId: topic.id });
+    const working = await hub.dispatch.dispatch(owner, "super", { requestId: "disc-go", ticketId: ticket.id, engine: "codex" });
+
+    // Removing the dispatcher from the root group while it has a working ticket in a topic is blocked.
+    await expect(hub.store.updateGroup("owner", group.id, {
+      title: group.title,
+      expectedTitle: group.title,
+      botIds: ["helper"],
+      expectedBotIds: ["helper", "super"],
+    })).rejects.toThrow("group_bot_busy");
+
+    // Simulate an active (and paused) group discussion on topic.id while the ticket finishes.
+    const now = Date.now();
+    await hub.store.db.run(
+      `INSERT INTO group_discussions(id,group_id,conversation_id,topic_message_id,created_by,settings_revision,mode,participants_json,max_rounds,stage,round,status,revision,created_at,updated_at)
+       VALUES('gd_active',?,?,?,'owner','rev','sequential','[]',2,'discussion',1,'paused',1,?,?)`,
+      [group.id, topic.id, "msg_topic_seed", now, now],
+    );
+
+    const settled = await settleTicket(working, "Topic build ready.");
+    expect(settled.status).toBe("needs_review");
+    // Notice is deferred rather than violating the active/paused discussion boundary.
+    expect(await hub.store.db.all("SELECT id FROM messages WHERE conversation_id=? AND bot_source_json IS NOT NULL", [topic.id])).toHaveLength(0);
+
+    // Concurrency slot is freed even while the discussion is paused.
+    const directTicket = await hub.dispatch.create(owner, "super", { requestId: "after-disc", title: "Direct", request: "Work", conversationId: firstChat.id });
+    expect((await hub.dispatch.dispatch(owner, "super", { requestId: "after-disc-go", ticketId: directTicket.id, engine: "codex" })).status).toBe("working");
+
+    // Once the discussion ends, the next sweep delivers the deferred notice into the topic.
+    await hub.store.db.run("UPDATE group_discussions SET status='ended' WHERE id='gd_active'");
+    await hub.dispatch.sweep();
+    const delivered = await hub.store.db.all<{ blocks_json: string }>("SELECT blocks_json FROM messages WHERE conversation_id=? AND bot_source_json IS NOT NULL", [topic.id]);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.blocks_json).toContain("Topic Build");
+
+    // Now that no working ticket remains in the group/topic (and pending notice delivery is settled), removing the dispatcher succeeds.
+    await hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE bot_id='super'");
+    const [updated] = await hub.store.updateGroup("owner", group.id, {
+      title: group.title,
+      expectedTitle: group.title,
+      botIds: ["helper"],
+      expectedBotIds: ["helper", "super"],
+    });
+    expect(updated!.botIds).toEqual(["helper"]);
+  });
+
+  it("enforces conversationId idempotency, Bot conversation scope, and group-discussion mutation blocks", async () => {
+    const secondChat = await hub.store.createConversation("owner", ["super"], "Project Beta", "beta-scope");
+    const turnA = await activeBotTurn(firstChat.id, "Work A", "scope-a");
+    const turnB = await activeBotTurn(secondChat.id, "Work B", "scope-b");
+
+    const ticketA = await hub.dispatch.create(turnA, "super", { requestId: "shared-req", title: "Same Title", request: "Same Body" });
+    // Reusing the same requestId with identical title/request from another conversation must conflict.
+    await expect(hub.dispatch.create(turnB, "super", { requestId: "shared-req", title: "Same Title", request: "Same Body" })).rejects.toThrow("idempotency_conflict");
+    await expect(hub.dispatch.create(owner, "super", { requestId: "shared-req", title: "Same Title", request: "Same Body", conversationId: secondChat.id })).rejects.toThrow("idempotency_conflict");
+    // Same conversation idempotent retry still returns the existing ticket.
+    expect((await hub.dispatch.create(turnA, "super", { requestId: "shared-req", title: "Same Title", request: "Same Body" })).id).toBe(ticketA.id);
+
+    // Bot turn in Chat B cannot create into Chat A, nor dispatch/update Chat A's ticket.
+    await expect(hub.dispatch.create(turnB, "super", { requestId: "cross-create", title: "Cross", request: "Body", conversationId: firstChat.id })).rejects.toThrow("dispatch_conversation_mismatch");
+    await expect(hub.dispatch.dispatch(turnB, "super", { requestId: "cross-dispatch", ticketId: ticketA.id, engine: "codex" })).rejects.toThrow("dispatch_conversation_mismatch");
+    await expect(hub.dispatch.update(turnB, "super", { ticketId: ticketA.id, status: "blocked" })).rejects.toThrow("dispatch_conversation_mismatch");
+
+    // A sealed group discussion turn cannot create/dispatch/update tickets.
+    const now = Date.now();
+    await hub.store.db.run(
+      `INSERT INTO group_discussion_turns(id,discussion_id,seq,round,position,attempt,bot_id,blind,input_message_id,context_json,state,created_at)
+       VALUES('gdt_1','gd_1',1,1,0,1,'super',1,?,'{}','active',?)`,
+      [turnB.contextMessage, now],
+    );
+    await expect(hub.dispatch.create(turnB, "super", { requestId: "disc-blocked", title: "Blocked", request: "No" })).rejects.toThrow("group_discussion_dispatch_blocked");
+  });
+
+  it("keeps current-conversation tickets visible past global LIMIT 200 and preserves strict unfiltered overview shape", async () => {
+    const secondChat = await hub.store.createConversation("owner", ["super"], "Project Beta", "beta-limit");
+    const now = Date.now();
+    for (let i = 0; i < 205; i++) {
+      await hub.store.db.run(
+        "INSERT INTO dispatch_tickets(id,dispatcher_bot_id,conversation_id,request_id,title,request,status,paused,attempts_json,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',0,'[]',?,?)",
+        [`tk_bulk_${String(i).padStart(3, "0")}`, "super", firstChat.id, `req_bulk_${i}`, `Bulk ${i}`, "Work", now + i, now + i],
+      );
+    }
+    const target = await hub.dispatch.create(owner, "super", { requestId: "beta-older", title: "Beta Ticket", request: "Do Beta", conversationId: secondChat.id });
+    // Push Beta Ticket's timestamp older than all 205 bulk tickets in firstChat.
+    await hub.store.db.run("UPDATE dispatch_tickets SET created_at=?,updated_at=? WHERE id=?", [now - 10_000, now - 10_000, target.id]);
+
+    const scoped = await hub.dispatch.overview(owner, "super", { conversationId: secondChat.id, capabilities: true });
+    expect(scoped.tickets.map(t => t.id)).toEqual([target.id]);
+    expect(scoped.otherCount).toBe(205);
+    expect(scoped.capabilities).toEqual({ remove: true });
+
+    const unfiltered = await hub.dispatch.overview(owner, "super");
+    expect(unfiltered).not.toHaveProperty("otherCount");
+    expect(unfiltered.tickets).toHaveLength(200);
+  });
+
+  it("keeps dispatchers owner-only for non-owner members and protects home() and openAttempt()", async () => {
+    await hub.store.db.run("INSERT INTO users(id,name,role) VALUES('member','Member','member')");
+    await hub.store.db.run("INSERT INTO bot_grants(user_id,bot_id) VALUES('member','helper'),('member','super')");
+
+    // Non-owner members never see dispatchers or workers in bots() and cannot create/add them in chats/groups.
+    expect((await hub.store.bots("member")).map(b => b.id)).toEqual(["helper"]);
+    await expect(hub.store.createConversation("member", ["super"], "Member Super", "mem-super")).rejects.toThrow("bot_forbidden");
+    const memberGroup = await hub.store.createConversation("member", ["helper"], "Member Group", "mem-grp", { type: "group" });
+    await expect(hub.store.updateGroup("member", memberGroup.id, {
+      title: memberGroup.title,
+      expectedTitle: memberGroup.title,
+      botIds: ["helper", "super"],
+      expectedBotIds: ["helper"],
+    })).rejects.toThrow("bot_forbidden");
+
+    // Even if a legacy DB has an earlier member-owned chat row with the dispatcher, home() ignores it and picks owner's chat.
+    await hub.store.db.run("INSERT INTO conversations(id,type,title,owner_id,archived,created_at) VALUES('gw_legacy_member','direct','Legacy Member','member',0,1)");
+    await hub.store.db.run("INSERT INTO conversation_members VALUES('gw_legacy_member','user','member',0),('gw_legacy_member','bot','super',0)");
+    const ticket = await hub.dispatch.create(owner, "super", { requestId: "owner-home", title: "Owner Home", request: "Use owner chat" });
+    expect(ticket.conversationId).toBe(firstChat.id);
+    // And even if a ticket were bound to a legacy member conversation, openAttempt creates its hidden worker chat under 'owner'.
+    const legacyTicket = await hub.dispatch.create(owner, "super", { requestId: "legacy-mem-tk", title: "Legacy Member Ticket", request: "Run", conversationId: "gw_legacy_member" });
+    const dispatched = await hub.dispatch.dispatch(owner, "super", { requestId: "legacy-mem-go", ticketId: legacyTicket.id, engine: "codex" });
+    expect(dispatched.status).toBe("working");
+    const workerRow = await hub.store.db.get<{ owner_id: string }>("SELECT owner_id FROM conversations WHERE id=?", [dispatched.attempts[0]!.conversationId]);
+    expect(workerRow?.owner_id).toBe("owner");
+  });
 });

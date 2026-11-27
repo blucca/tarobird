@@ -44,7 +44,7 @@ function engineNotice(health: EngineHealth, locale: string) {
  * conversations stay hidden and open from here. */
 export function DispatchTickets({ connection, botId, conversationId, botLabel, conversationTitles, active, online, open }: { connection: HubConnection; botId: string; conversationId: string; botLabel?: string; conversationTitles?: ReadonlyMap<string, string>; active: boolean; online: boolean; open: (conversationId: string) => void }) {
   const locale = useLocale() === "en" ? "en" : "zh-CN";
-  const [list, setList] = useState<TicketOverviewList>(), [expanded, setExpanded] = useState(false);
+  const [fetched, setFetched] = useState<{ scope: "conversation" | "all"; data: TicketOverviewList }>(), [expanded, setExpanded] = useState(false);
   const [scope, setScope] = useState<"conversation" | "all">("conversation");
   const [busy, setBusy] = useState(""), [confirming, setConfirming] = useState<{ id: string; action: "cancel" | "remove" }>(), [error, setError] = useState(""), [refresh, setRefresh] = useState(0);
   // An unconfirmed action keeps its request ID until a later read shows its
@@ -63,14 +63,22 @@ export function DispatchTickets({ connection, botId, conversationId, botLabel, c
       if (reading || controller.signal.aborted || document.visibilityState === "hidden") return;
       reading = true; const read = beginTicketRead(connection, botId), local = ++reads.current, request = queueRequest([controller.signal], 8000);
       try {
-        const value = ticketOverviewListSchema.parse(await request.wait(connection.http(`/api/bots/${encodeURIComponent(botId)}/tickets?summary=1&capabilities=1`, { signal: request.signal })));
+        const query = scope === "conversation"
+          ? `summary=1&capabilities=1&conversationId=${encodeURIComponent(conversationId)}`
+          : "summary=1&capabilities=1";
+        const value = ticketOverviewListSchema.parse(await request.wait(connection.http(`/api/bots/${encodeURIComponent(botId)}/tickets?${query}`, { signal: request.signal })));
         if (!controller.signal.aborted && local === reads.current) {
           // Only a read started after the action ended can show its effect.
           for (const [key, entry] of pending.current) {
             const [id, action] = key.split(":") as [string, TicketAction], ticket = value.tickets.find(item => item.id === id);
             if (entry.after !== undefined && local > entry.after && ticket && applied(ticket, action)) pending.current.delete(key);
           }
-          setList(value); publishTicketSignal(connection, botId, read, value.tickets, true);
+          setFetched({ scope, data: value });
+          if (scope === "conversation" && value.otherCount !== undefined && value.otherCount > 0) {
+            publishTicketSignal(connection, botId, read, value.tickets, false, conversationId);
+          } else {
+            publishTicketSignal(connection, botId, read, value.tickets, true);
+          }
         }
       } catch { /* Keep the last list; the next poll retries. */ }
       finally { request.dispose(); reading = false; if (!controller.signal.aborted) timer = setTimeout(() => void load(), 4000); }
@@ -78,7 +86,7 @@ export function DispatchTickets({ connection, botId, conversationId, botLabel, c
     const visible = () => { if (document.visibilityState === "visible") void load(); };
     document.addEventListener("visibilitychange", visible);
     void load(); return () => { controller.abort(); clearTimeout(timer); document.removeEventListener("visibilitychange", visible); };
-  }, [connection, botId, active, online, refresh]);
+  }, [connection, botId, conversationId, scope, active, online, refresh]);
   const act = async (ticket: TicketOverview, action: TicketAction) => {
     if (busy) return;
     // A retry after an unconfirmed result repeats the same request.
@@ -92,7 +100,7 @@ export function DispatchTickets({ connection, botId, conversationId, botLabel, c
       const next = dispatchTicketSchema.parse(await request.wait(connection.http(`/api/tickets/${ticket.id}/action`, { method: "POST", body: JSON.stringify({ requestId, action }), signal: request.signal })));
       // A confirmed action supersedes every earlier unconfirmed one on this ticket.
       for (const other of [...pending.current.keys()]) if (other.startsWith(`${ticket.id}:`)) pending.current.delete(other);
-      if (alive.current) setList(value => value && { ...value, tickets: action === "remove" ? value.tickets.filter(item => item.id !== next.id) : value.tickets.map(item => item.id === next.id ? next : item) });
+      if (alive.current) setFetched(value => value && { ...value, data: { ...value.data, tickets: action === "remove" ? value.data.tickets.filter(item => item.id !== next.id) : value.data.tickets.map(item => item.id === next.id ? next : item) } });
     } catch (cause) {
       if (cause instanceof HubHttpError && cause.status >= 400 && cause.status < 500) pending.current.delete(key);
       else pending.current.set(key, { requestId, after: reads.current });
@@ -102,28 +110,31 @@ export function DispatchTickets({ connection, botId, conversationId, botLabel, c
   const reset = async (engine: string) => {
     if (busy) return; setBusy(engine); setError("");
     const request = queueRequest([], 20_000);
-    try { const engines = engineHealthSchema.array().parse(await request.wait(connection.http(`/api/dispatch/engines/${engine}/reset`, { method: "POST", signal: request.signal }))); if (alive.current) setList(value => value && { ...value, engines }); }
+    try { const engines = engineHealthSchema.array().parse(await request.wait(connection.http(`/api/dispatch/engines/${engine}/reset`, { method: "POST", signal: request.signal }))); if (alive.current) setFetched(value => value && { ...value, data: { ...value.data, engines } }); }
     catch (cause) { if (alive.current) setError(actionError(cause)); }
     finally { request.dispose(); if (alive.current) setBusy(""); }
   };
-  const allTickets = [...list?.tickets ?? []].sort((a, b) => Number(isOpen(b)) - Number(isOpen(a)) || b.updatedAt - a.updatedAt);
-  const chatTickets = allTickets.filter(ticket => ticket.conversationId === conversationId);
-  const otherTicketsCount = allTickets.length - chatTickets.length;
-  const tickets = scope === "all" ? allTickets : chatTickets;
+  const list = fetched?.data;
+  const sorted = [...list?.tickets ?? []].sort((a, b) => Number(isOpen(b)) - Number(isOpen(a)) || b.updatedAt - a.updatedAt);
+  const chatTickets = sorted.filter(ticket => ticket.conversationId === conversationId);
+  const otherTicketsCount = fetched?.scope === "conversation" && list?.otherCount !== undefined ? list.otherCount : sorted.length - chatTickets.length;
+  const totalTicketsCount = chatTickets.length + otherTicketsCount;
+  const tickets = scope === "all" ? sorted : chatTickets;
   const engines = (list?.engines ?? []).filter(health => health.state !== "ok");
-  if (!allTickets.length && !engines.length) return null;
+  if (!totalTicketsCount && !engines.length) return null;
   const openTickets = tickets.filter(isOpen), shown = expanded, now = Date.now();
   const counts = (["needs_answer", "needs_review", "blocked", "working", "queued"] as const).map(status => [status, openTickets.filter(ticket => displayStatus(ticket) === status).length] as const).filter(([, count]) => count);
-  const summary = counts.length ? counts.map(([status, count]) => `${count} ${statusLabel(status)}`).join(" · ") : scope === "conversation" && !chatTickets.length && otherTicketsCount > 0 ? t("其他对话有 {0} 张工单", otherTicketsCount) : t("没有进行中的工单");
+  const summary = counts.length ? counts.map(([status, count]) => `${count} ${statusLabel(status)}`).join(" · ") : scope === "conversation" && !chatTickets.length && otherTicketsCount > 0 ? (otherTicketsCount === 1 ? t("其他对话有 1 张工单") : t("其他对话有 {0} 张工单", otherTicketsCount)) : t("没有进行中的工单");
   const triggerPrefix = botLabel ? `${botLabel} · ` : "";
+  const triggerCount = scope === "all" ? totalTicketsCount : chatTickets.length;
   return <section className="dispatch-tickets" aria-label={t("工单")}>
-    {allTickets.length > 0 && <button type="button" className="dispatch-tickets-trigger" aria-label={`${triggerPrefix}${t("工单 {0}", tickets.length)} · ${summary}`} aria-expanded={shown} onClick={() => setExpanded(!shown)}><ListChecks size={15}/><span>{triggerPrefix}{t("工单 {0}", tickets.length)}</span><small>{counts.length ? counts.map(([status, count], index) => <Fragment key={status}>{index > 0 && " · "}<span className={status === "needs_review" ? "dispatch-ticket-review" : undefined}>{count} {statusLabel(status)}</span></Fragment>) : summary}</small><ChevronRight size={14}/></button>}
+    {totalTicketsCount > 0 && <button type="button" className="dispatch-tickets-trigger" aria-label={`${triggerPrefix}${t("工单 {0}", triggerCount)} · ${summary}`} aria-expanded={shown} onClick={() => setExpanded(!shown)}><ListChecks size={15}/><span>{triggerPrefix}{t("工单 {0}", triggerCount)}</span><small>{counts.length ? counts.map(([status, count], index) => <Fragment key={status}>{index > 0 && " · "}<span className={status === "needs_review" ? "dispatch-ticket-review" : undefined}>{count} {statusLabel(status)}</span></Fragment>) : summary}</small><ChevronRight size={14}/></button>}
     {engines.length > 0 && <p className="dispatch-engines">{engines.map(health => <span key={health.engine} title={health.reason}>{engineNotice(health, locale)}<button type="button" disabled={!online || !!busy} onClick={() => void reset(health.engine)}>{t("清除")}</button></span>)}</p>}
     {error && <p className="dispatch-tickets-error" role="alert">{error}</p>}
-    {shown && allTickets.length > 0 && <>
-      {otherTicketsCount > 0 && <div className="dispatch-ticket-scope" role="tablist" aria-label={t("工单范围")}>
-        <button type="button" role="tab" aria-selected={scope === "conversation"} onClick={() => setScope("conversation")}>{t("当前对话")} ({chatTickets.length})</button>
-        <button type="button" role="tab" aria-selected={scope === "all"} onClick={() => setScope("all")}>{t("全部")} ({allTickets.length})</button>
+    {shown && totalTicketsCount > 0 && <>
+      {otherTicketsCount > 0 && <div className="dispatch-ticket-scope" role="group" aria-label={t("工单范围")}>
+        <button type="button" aria-pressed={scope === "conversation"} onClick={() => setScope("conversation")}>{t("当前对话")} ({chatTickets.length})</button>
+        <button type="button" aria-pressed={scope === "all"} onClick={() => setScope("all")}>{t("全部")} ({totalTicketsCount})</button>
       </div>}
       {tickets.length === 0 ? <p className="dispatch-ticket-empty">{t("当前对话暂无工单，可切换到「全部」查看其他对话的工单。")}</p>
         : <ul className="dispatch-ticket-list">{tickets.map(ticket => {
