@@ -1,9 +1,7 @@
 import type { HOST_EN } from "./host-en.js";
 
 /** Japanese Host/Gateway/Core message catalog (Chinese source key -> Japanese text). */
-// Partial until the entries for strings added on main after #173 are translated;
-// tests/i18n-catalogs.test.ts and scripts/check-translations.mjs report the gaps.
-export const HOST_JA: Partial<Record<keyof typeof HOST_EN, string>> = {
+export const HOST_JA: Record<keyof typeof HOST_EN, string> = {
   // src/core/locale.ts
   "已停止。": "停止しました。",
   "当前没有正在运行的任务。": "実行中のタスクはありません。",
@@ -1200,4 +1198,32 @@ export const HOST_JA: Partial<Record<keyof typeof HOST_EN, string>> = {
   "当前聊天的会话已重置。": "このチャットのセッションをリセットしました。",
   "错误：会话状态当前不可读，运维需要修复会话状态后重试。": "エラー：現在セッション状態を読み取れません。管理者がセッション状態を修復してから再試行する必要があります。",
   "错误：会话状态当前不可用，运维需要恢复读取权限后重试。": "エラー：現在セッション状態を利用できません。管理者が読み取り権限を復元してから再試行する必要があります。",
+  "omp 会记录提供商返回的用量和费用，费用可能为估算值；主机预算检查不等于原生单轮费用上限。": "omp はプロバイダーが返した使用量と費用を記録します。費用は推定値の場合があります。Host の予算チェックは、ネイティブの 1 ターンあたりの費用上限と同じではありません。",
+  "当前模型: {0}\n用 /model <provider/model> 选择 oh-my-pi (omp) 提供的模型。\n/model off\nomp 会通过 RPC 会话模型 API 校验该选择。": "現在のモデル：{0}\n/model <provider/model> で oh-my-pi (omp) が提供するモデルを選択できます。\n/model off\nomp は RPC セッションモデル API でこの選択を検証します。",
+  "用法: /engine [claude|codex|kimi|deepseek|antigravity|pi|omp]": "使い方：/engine [claude|codex|kimi|deepseek|antigravity|pi|omp]",
+  "omp 不提供带沙箱的 full-auto，权限未更改。工具审批请用 /yolo off；原生访问请用 /yolo unsafe，这不会提供 OS 沙箱。": "omp はサンドボックス付き full-auto に対応していません。権限は変更されていません。ツール承認には /yolo off、OS サンドボックスなしのネイティブアクセスには /yolo unsafe を使用してください。",
+  "错误：此 omp 会话已达到费用上限（当前预算使用额度已用完）。请在 omp 中调整或清除上限，或新开对话。": "エラー：この omp セッションは費用上限に達しました（この予算の利用枠を使い切りました）。omp で上限を調整または解除するか、新しい会話を開始してください。",
+  "omp 提供商凭据缺失或已失效。请在运行 Bot 的主机上运行 `omp` 并执行 `/login`（或更新提供商凭据）后重试；原会话已保留。": "omp のプロバイダー認証情報がないか、無効になっています。Bot を実行している Host で `omp` を起動して `/login` を実行して（またはプロバイダー認証情報を更新して）、再試行してください。元のセッションは保持されています。",
+  "错误：模型服务拒绝了本轮 omp 请求（{0}）。请检查所选模型、思考强度和附件后重试；重启实例无效。原会话已保留，未自动重发请求。": "エラー：モデルサービスが今回の omp リクエストを拒否しました（{0}）。選択したモデル・思考強度・添付ファイルを確認して再試行してください（インスタンスを再起動しても解消しません）。元のセッションは保持されており、リクエストは自動再送されていません。",
+  "错误：模型服务拒绝了本轮 omp 请求。请检查所选模型、思考强度和附件后重试；重启实例无效。原会话已保留，未自动重发请求。": "エラー：モデルサービスが今回の omp リクエストを拒否しました。選択したモデル・思考強度・添付ファイルを確認して再試行してください（インスタンスを再起動しても解消しません）。元のセッションは保持されており、リクエストは自動再送されていません。",
+  "（来自 @{0}）": "（@{0} より）",
+  "需要审批{0}：{1}\n\n{2}\n\n请回复 {3}。": "承認が必要です{0}：{1}\n\n{2}\n\n{3} と返信してください。",
+  "恢复 oh-my-pi 会话": "oh-my-pi セッションを再開",
+  "没有找到 oh-my-pi 会话。": "oh-my-pi セッションが見つかりません。",
+  "当前 omp session：{0}": "現在の omp セッション：{0}",
+  "已断开当前 Pi session，并恢复到 /resume 之前的对话。": "現在の Pi セッションを切り離し、/resume の前の会話に戻しました。",
+  "已断开当前 omp session，并恢复到 /resume 之前的对话。": "現在の omp セッションを切り離し、/resume の前の会話に戻しました。",
+  "Antigravity Bot 支持在对话中直接使用原生工作流命令（`/swarm`、`/swarm board`、`/grill-me`、`/plan`、`/teamwork`、`/run-workflow`、`/browser`、`/goal`、`/learn`、`/schedule`、`/boost`）以及 Antigravity ACP 动态广播的工作区 Skill。侧边追问继续使用 TaroBird 侧边对话或 `/btw`；桌面端专属命令 `/automation` 会指引使用 TaroBird `/cron` 或 `/schedule`。": "Antigravity Bot は、会話内でネイティブのワークフローコマンド（`/swarm`、`/swarm board`、`/grill-me`、`/plan`、`/teamwork`、`/run-workflow`、`/browser`、`/goal`、`/learn`、`/schedule`、`/boost`）を直接使用でき、Antigravity ACP が動的に通知するワークスペースの Skill も利用できます。サイド質問は引き続き TaroBird のサイド会話または `/btw` を使用してください。デスクトップ専用の `/automation` は、TaroBird の `/cron` または `/schedule` の使用を案内します。",
+  "omp：主机工具审批；无 OS 沙箱": "omp：Host ツール承認（OS サンドボックスなし）",
+  "omp 原生访问；无 OS 沙箱": "omp ネイティブアクセス（OS サンドボックスなし）",
+  "🔔 模式：仅发送提醒卡片，不会运行 Bot": "🔔 モード：リマインダーカードのみ送信し、Bot は実行しません",
+  "🤖 模式：到点自动运行 Bot 执行此任务": "🤖 モード：時刻になると Bot がこのタスクを自動実行します",
+  "✓ 已添加定时任务  ID  {0}\n⏰ {1}{2}\n{3}\n📝 {4}": "✓ 定期タスクを追加しました  ID  {0}\n⏰ {1}{2}\n{3}\n📝 {4}",
+  "omp 尚无可用模型。请在运行 Bot 的主机上运行 `omp` 并执行 `/login`（或配置提供商凭据），然后重新读取模型列表并重试。": "omp に利用可能なモデルがありません。Bot を実行している Host で `omp` を起動して `/login` を実行して（またはプロバイダー認証情報を設定して）、モデル一覧を再読み込みして再試行してください。",
+  "此 omp 运行时未启用 RPC 目标自动续接，目标模式无法自动推进。请检查主机上的 omp 配置或更新 omp 后重试。": "この omp ランタイムでは RPC ゴールの自動継続が有効になっていないため、ゴールモードを自動で進められません。Host 上の omp の設定を確認するか、omp を更新して再試行してください。",
+  "所选模型在 omp 中不可用。请检查模型名称和供应商登录状态，或选择可用模型后重试。": "選択したモデルは omp で利用できません。モデル名とプロバイダーのログイン状態を確認するか、利用可能なモデルを選択して再試行してください。",
+  "所选模型不支持此思考强度。请在 Bot 的思考强度设置中调整，或选择跟随默认；无需重启。": "選択したモデルはこの思考強度に対応していません。Bot の思考強度設定で変更するか、既定に従う設定にしてください（再起動は不要です）。",
+  "已断开当前 omp 会话。下一条消息会新建会话。": "現在の omp セッションを切り離しました。次のメッセージで新しいセッションが作成されます。",
+  "当前没有绑定的 omp 会话。": "紐付けられている omp セッションはありません。",
+  "omp 不提供带沙箱的 full-auto，权限未更改；请选择普通审批或 unsafe bypass。": "omp はサンドボックス付き full-auto に対応していません。権限は変更されていません。通常承認または unsafe bypass を選択してください。",
 };
