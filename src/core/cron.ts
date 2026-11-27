@@ -2,6 +2,8 @@ import { deliverEngineQuestion } from "./engine-question.js";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { channelProfile, isGatewayChannel } from "./channel-profile.js";
+import { normalizeLocale } from "../runtime/locale.js";
+import { hostT } from "../locales/index.js";
 import { workspaceArtifactRoot } from "./artifact-paths.js";
 import { createScopedRunPresentation, finishScopedRunPresentation } from "./scoped-run-presentation.js";
 import { deliverBackgroundTaskResponse } from "./background-task-delivery.js";
@@ -101,7 +103,7 @@ export function buildCoreCronExecutor(input: {
       await startExecution?.();
       abortSignal?.throwIfAborted();
       if (!job.mute) {
-        const locale = job.locale === "en" ? "en" : "zh";
+        const locale = normalizeLocale(job.locale, "zh");
         // Reminder card — each fire sends its own card, so it is still a separate
         // push (never batched). Falls back to the plain "⏰ 提醒" text if the card
         // can't be sent, so a reminder is never silently dropped.
@@ -146,7 +148,7 @@ export function buildCoreCronExecutor(input: {
         const requestOutputDir = path.join(workspaceArtifactRoot(input.stateDir, "output"), `cron-${job.id}`);
         await mkdir(requestOutputDir, { recursive: true });
         const replyFields = coreCronReplyFields(job);
-        const locale = job.locale === "en" ? "en" : "zh";
+        const locale = normalizeLocale(job.locale, "zh");
         const cfg = await loadInstanceConfig(input.stateDir);
         await applyConversationResumeScope(input.stateDir, conversationKey, cfg);
         const workspaceOverride = input.workspaceOverride
@@ -269,7 +271,7 @@ export function buildCoreCronExecutor(input: {
             if (controller.signal.aborted) {
               await runCard.interrupt().catch(() => {});
             } else {
-              await runCard.fail(job.locale === "en" ? "Scheduled task failed." : "定时任务执行失败。").catch(() => {});
+              await runCard.fail(hostT(locale, "定时任务执行失败。")).catch(() => {});
             }
           }
           throw error;
@@ -359,9 +361,7 @@ export function buildCoreCronExecutor(input: {
         } catch (error) {
           await runCard?.failDelivery(
             finalText,
-            locale === "en"
-              ? "The scheduled result was generated, but its delivery did not finish."
-              : "定时任务结果已生成，但交付未完成。",
+            hostT(locale, "定时任务结果已生成，但交付未完成。"),
           ).catch(() => undefined);
           throw error;
         }
@@ -399,18 +399,15 @@ export async function sendCoreCronFailureNotification(
 }
 
 function buildCoreCronFailureMessage(job: CronJobRecord, detail: string): string {
+  const locale = normalizeLocale(job.locale, "zh");
   const prompt = truncateCoreCronText(
     job.prompt,
     LARK_CRON_FAILURE_PROMPT_LIMIT,
-    job.locale === "en" ? "..." : "…",
+    locale === "en" ? "..." : "…",
   );
-  const prefix = job.locale === "en"
-    ? `⚠️ Scheduled task failed\nID  ${job.id}\n📝 ${prompt}\nError: `
-    : `⚠️ 定时任务执行失败\nID  ${job.id}\n📝 ${prompt}\n错误：`;
+  const prefix = hostT(locale, "⚠️ 定时任务执行失败\nID  {0}\n📝 {1}\n错误：", job.id, prompt);
   const remaining = Math.max(0, LARK_CRON_TEXT_LIMIT - prefix.length);
-  const truncationNotice = job.locale === "en"
-    ? "\n... (error detail truncated; see service logs or timeline.)"
-    : "\n…（错误详情过长，已截断；完整详情见服务日志或 timeline。）";
+  const truncationNotice = hostT(locale, "\n…（错误详情过长，已截断；完整详情见服务日志或 timeline。）");
   return `${prefix}${truncateCoreCronText(detail, remaining, truncationNotice)}`;
 }
 
@@ -458,15 +455,14 @@ function coreReminderBody(job: CronJobRecord): string {
 }
 
 function renderCoreCronNotification(job: CronJobRecord): string {
-  const prefix = job.locale === "en" ? "⏰ Reminder\n" : "⏰ 提醒\n";
-  const truncationNotice = job.locale === "en"
-    ? "\n... (reminder text truncated.)"
-    : "\n…（提醒内容过长，已截断。）";
+  const locale = normalizeLocale(job.locale, "zh");
+  const prefix = hostT(locale, "⏰ 提醒\n");
+  const truncationNotice = hostT(locale, "\n…（提醒内容过长，已截断。）");
   return `${prefix}${truncateCoreCronText(coreReminderBody(job), LARK_CRON_TEXT_LIMIT - prefix.length, truncationNotice)}`;
 }
 
 function renderCoreEmptyCronAgentReply(job: CronJobRecord): string {
-  return job.locale === "en" ? "(empty reply)" : "（空回复）";
+  return hostT(normalizeLocale(job.locale, "zh"), "（空回复）");
 }
 
 function coreCronReplyOptions(job: CronJobRecord): CoreSendOptions | undefined {

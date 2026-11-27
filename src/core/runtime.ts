@@ -1,4 +1,5 @@
 import type { EngineApprovalDecision, EngineApprovalRequest } from "../codex/adapter.js";
+import type { Locale } from "../runtime/locale.js";
 import { delegateToInstance as defaultDelegateToInstance } from "../bus/bus-client.js";
 import { loadBusConfig as defaultLoadBusConfig } from "../bus/bus-config.js";
 import type { TranscribeMediaOptions } from "../runtime/asr-cloud.js";
@@ -195,7 +196,7 @@ export interface CoreServiceRuntime {
   cronRuntime?: CoreCronRuntime;
   /** VC bot-meeting support; present ONLY when config.meeting.enabled (gated). */
   meetingSupport?: {
-    handleMeetingCommand(text: string, locale: "en" | "zh", context?: { mentionOpenIds?: readonly string[] }): Promise<string | null>;
+    handleMeetingCommand(text: string, locale: Locale, context?: { mentionOpenIds?: readonly string[] }): Promise<string | null>;
     dispose(): Promise<void>;
   };
   busRuntime?: CoreBusRuntime;
@@ -216,7 +217,7 @@ export function createCoreServiceRuntime(options: {
   cronRuntime?: CoreCronRuntime;
   /** VC bot-meeting support; present ONLY when config.meeting.enabled (gated). */
   meetingSupport?: {
-    handleMeetingCommand(text: string, locale: "en" | "zh", context?: { mentionOpenIds?: readonly string[] }): Promise<string | null>;
+    handleMeetingCommand(text: string, locale: Locale, context?: { mentionOpenIds?: readonly string[] }): Promise<string | null>;
     dispose(): Promise<void>;
   };
   busRuntime?: CoreBusRuntime;

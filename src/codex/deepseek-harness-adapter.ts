@@ -5,6 +5,7 @@ import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } fr
 import { homedir } from "node:os";
 import { EngineCancellationUnconfirmedError, EngineStopTooLateError, EngineSteeringRejectedError } from "./adapter.js";
 import { EngineRetryableError, type EngineRetryReason } from "./turn-retry.js";
+import { hostT } from "../locales/index.js";
 import { deepseekGoalUsageSchema } from "./deepseek-goal-usage.js";
 import { parseDeepSeekAccountBalance } from "./deepseek-account-quota.js";
 import { QUOTA_TTL_MS, QuotaReadError, unavailableQuota } from "./account-quota.js";
@@ -448,7 +449,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
           } catch { if (pending.abortController.signal.aborted) throw abortError(); }
           pending.abortController.signal.throwIfAborted();
           if (nativeAppTools) turnInput = { ...input, instructions: input.appPlatformTools.instructions, turnInstructions: input.appPlatformTools.turnInstructions };
-          else await this.emit(pending, { type: "assistant_text", text: input.locale === "en" ? "Native App tools are unavailable in this Harness instance; compatible delivery is active for this turn." : "当前 Harness 实例的原生 App 工具不可用，本轮使用兼容交付。", sessionId });
+          else await this.emit(pending, { type: "assistant_text", text: hostT(input.locale, "当前 Harness 实例的原生 App 工具不可用，本轮使用兼容交付。"), sessionId });
         }
         const content = await this.buildPromptContent(turnInput);
         pending.abortController.signal.throwIfAborted();

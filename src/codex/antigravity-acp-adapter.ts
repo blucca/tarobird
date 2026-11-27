@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { hostT } from "../locales/index.js";
 
 import {
   client as acpClient,
@@ -64,6 +65,7 @@ import { EngineIncompleteResponseError, EngineSteeringRejectedError } from "./ad
 import { killProcessTree } from "./process-tree.js";
 import { extractAntigravityTaskPlan, parseAcpPlanSummary, type AntigravityTodoItem } from "./antigravity-task-plan.js";
 import { renderPrivateTurnInstructions } from "./turn-instructions.js";
+import { isChineseLocale } from "../runtime/locale.js";
 
 type SpawnOptions = {
   stdio: ["pipe", "pipe", "pipe"];
@@ -573,11 +575,11 @@ function parseMultiSelectElicitationAnswer(raw: unknown, options: ElicitationOpt
 
 function renderSwarmUnavailableMessage(reason: "version" | "not_advertised", locale?: CodexUserMessageInput["locale"]): string {
   if (reason === "version") {
-    return locale === "en"
+    return !isChineseLocale(locale)
       ? "`/swarm` is not available because the installed `agy` CLI version is older than 1.5.5. Update `agy` to 1.5.10+ to use `/swarm` on the ACP runtime. Nothing was sent to the model."
       : "当前安装的 `agy` 版本低于 1.5.5，不支持 `/swarm`。请升级 `agy` 到 1.5.10 及以上后再在 ACP 运行时使用 `/swarm`；本次未向模型发送任何内容。";
   }
-  return locale === "en"
+  return !isChineseLocale(locale)
     ? "`/swarm` is not available in this Antigravity CLI session (`agy acp` did not advertise `/swarm`, for example due to an older CLI version or account/plan policy). Nothing was sent to the model."
     : "当前 Antigravity CLI 会话未开放 `/swarm` 命令（`agy acp` 未返回 `/swarm`，可能是 CLI 版本或账号/套餐限制）。本次未向模型发送任何内容。";
 }
@@ -1300,7 +1302,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       // agy often ends the turn without more text once an action is declined.
       // That is the owner's choice, not a failure: say so plainly, after any
       // text the model wrote before the declined action.
-      const note = turn.locale === "zh" ? "已拒绝执行该操作，Antigravity 已停止本轮。" : "The action was declined, so Antigravity stopped this turn.";
+      const note = hostT(turn.locale ?? "en", "已拒绝执行该操作，Antigravity 已停止本轮。");
       const before = turn.text.trim();
       this.settleTurn(turn, undefined, before ? `${before}\n\n${note}` : note);
       return;

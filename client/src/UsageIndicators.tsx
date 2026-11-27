@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { DesktopMenu, DesktopMenuPortalContext } from "./DesktopMenu.js";
-import { t, useLocale, type Locale } from "./i18n.js";
+import { localeIntlTag, t, useLocale, type Locale } from "./i18n.js";
 import { formatQuotaWindowLabel, formatResetCountdown } from "./quota-ui.js";
 import { quotaReadingAgeLabel, shortTokens, usageTone, type ContextView, type QuotaBlock, type QuotaView } from "./usage-readings.js";
 import "./usage-indicators.css";
@@ -25,8 +25,9 @@ export function QuotaBattery({ left, height = 16, stale = false }: { left: numbe
 
 function clock(value: string, locale: Locale, now = new Date()): string {
   const date = new Date(value), sameDay = date.toDateString() === now.toDateString();
-  const time: Intl.DateTimeFormatOptions = locale === "zh" ? { hour: "2-digit", minute: "2-digit", hour12: false } : { hour: "numeric", minute: "2-digit" };
-  return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en", sameDay ? time : { month: locale === "zh" ? "long" : "short", day: "numeric", ...time }).format(date);
+  const cjk = locale === "zh" || locale === "ja";
+  const time: Intl.DateTimeFormatOptions = cjk ? { hour: "2-digit", minute: "2-digit", hour12: false } : { hour: "numeric", minute: "2-digit" };
+  return new Intl.DateTimeFormat(localeIntlTag(locale), sameDay ? time : { month: cjk ? "long" : "short", day: "numeric", ...time }).format(date);
 }
 // The same wording as the quota page uses for these engine limits.
 function blockText(code: QuotaBlock): string {

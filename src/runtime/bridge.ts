@@ -1021,7 +1021,7 @@ export class Bridge {
   }
 
   /** A side session borrows context, never the parent's binding or turn lock. */
-  async openSideSession(input: { chatId: number; userId: number; chatType: string; conversationKey: string; workspaceOverride?: string; tools?: "inherited"; locale?: "en" | "zh"; abortSignal?: AbortSignal }): Promise<import("../codex/adapter.js").EngineSideSession> {
+  async openSideSession(input: { chatId: number; userId: number; chatType: string; conversationKey: string; workspaceOverride?: string; tools?: "inherited"; locale?: Locale; abortSignal?: AbortSignal }): Promise<import("../codex/adapter.js").EngineSideSession> {
     if (!this.adapter.openSideSession || !this.sessionManager.getExistingSession) throw new Error("unsupported");
     if ((await this.checkAccess(input)).kind !== "allow") throw new Error("unsupported");
     const scope = this.conversationScope(input);

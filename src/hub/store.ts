@@ -1,3 +1,4 @@
+import { hostT } from "../locales/index.js";
 import { workbenchContextSchema, type WorkbenchContext } from "../client-protocol/workbench.js";
 import { reserveWorkbenchHistory, workbenchContextDigest, type WorkbenchContextReceipt } from "./workbench-history.js";
 import { BOT_AVATAR_DEFAULT_PREFIX } from "./bot-avatar-default.js";
@@ -1274,8 +1275,8 @@ export class HubStore {
         };
       }
       if (block.type === "card" && answer && activeAnswerFollowup(answer)) {
-        const text = answer.locale === "en" ? "Follow-up interrupted. Your answer is kept here; check the conversation before retrying." : "后续处理已中断，你的答案保留在此，请查看对话后再决定是否重试。";
-        return { ...block, title: answer.locale === "en" ? "Answer follow-up interrupted" : "补答处理已中断", extra: { ...block.extra, answerFollowup: { ...answer, phase: "interrupted" } },
+        const text = hostT(answer.locale, "后续处理已中断，你的答案保留在此，请查看对话后再决定是否重试。");
+        return { ...block, title: hostT(answer.locale, "补答处理已中断"), extra: { ...block.extra, answerFollowup: { ...answer, phase: "interrupted" } },
           elements: block.elements.filter(element => element.type !== "button").map(element => element.id === "answer_followup_status" ? { ...element, text } : element) };
       }
       return block.type === "card" ? { ...block,

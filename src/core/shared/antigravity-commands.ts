@@ -1,4 +1,5 @@
 import type { Locale } from "../../runtime/message-renderer.js";
+import { isChineseLocale } from "../../runtime/locale.js";
 
 export type AntigravitySlashCommandAction =
   | { kind: "automation"; request: string };
@@ -24,7 +25,7 @@ export async function renderAntigravityLocalCommandReply(
   action: AntigravitySlashCommandAction,
   locale: Locale,
 ): Promise<{ commandLabel: string; markdown: string }> {
-  const english = locale === "en";
+  const english = !isChineseLocale(locale);
   const samplePrompt = action.request || (english ? "Summarize unread updates" : "汇总今日待办与进展");
   return {
     commandLabel: "/automation",

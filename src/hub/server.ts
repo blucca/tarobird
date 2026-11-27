@@ -1,4 +1,5 @@
 import { HISTORY_RELEASE_AFTER_MS, HubConversationHistory } from "./conversation-history.js";
+import { LocaleSchema } from "../runtime/locale.js";
 import { CONVERSATION_HISTORY_CAPABILITY, HISTORY_SIDE_REASON_QUERY, compatHistoryReason, historyChangeSchema } from "../client-protocol/conversation-history.js";
 import { hubEngineQuotas, type HubQuotaProofEntry } from "./engine-quota.js";
 import { ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_HUB_REFRESH_MS } from "../client-protocol/engine-quota.js";
@@ -2809,7 +2810,7 @@ export class HubServer {
           const allowed = new Set((await this.store.conversations(userId)).filter(c => c.botIds.includes(botId)).map(c => c.id));
           await reply(200, { ...result.data, jobs: result.data.jobs.filter(job => allowed.has(job.conversationId)) });
         } else {
-          const input = z.object({ mutation: scheduleMutationSchema, locale: z.enum(["zh", "en"]) }).strict().parse(await this.jsonBody(req));
+          const input = z.object({ mutation: scheduleMutationSchema, locale: LocaleSchema }).strict().parse(await this.jsonBody(req));
           const conversations = await this.store.conversations(userId);
           const conversation = conversations.find(c => c.id === input.mutation.conversationId && c.botIds.includes(botId));
           if (!conversation) throw new HubError("conversation_forbidden", 403);

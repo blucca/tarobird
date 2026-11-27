@@ -14,6 +14,8 @@ import {
 } from "../../runtime/session-scanner.js";
 import type { InstanceEngine, ResumeState } from "../../state/instance-config.js";
 import { renderSessionResetMessage, type Locale } from "../../runtime/message-renderer.js";
+import { normalizeLocale } from "../../runtime/locale.js";
+import { hostT } from "../../locales/index.js";
 import {
   appendCommandSuccessAuditEventBestEffort,
   type CoreTurnContext,
@@ -317,9 +319,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       const scanRecentHarnessSessions = cfg.engine === "omp" ? scanRecentOmpSessions : cfg.engine === "pi" ? scanRecentPiSessions : isDeepSeek ? scanRecentDeepSeekSessions : scanRecentKimiSessions;
       if (resumeCmd.kind === "scan") {
         if (!scanRecentHarnessSessions) {
-          const msg = locale === "zh"
-            ? `当前 ${engineName} runtime 未提供 session 列表。`
-            : `This ${engineName} runtime does not provide session listing.`;
+          const msg = hostT(locale, "当前 {0} runtime 未提供 session 列表。", engineName);
           await context.api.sendMessage(normalized.chatId, msg);
           await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
             startedAt,
@@ -337,11 +337,11 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         }
         const msg = sessions.length > 0
           ? [
-              locale === "zh" ? `${engineName} sessions：` : `${engineName} sessions:`,
+              hostT(locale, "{0} sessions：", engineName),
               ...sessions.map((session, index) => `${index + 1}. [${session.displayName}] ${session.sessionId}`),
-              locale === "zh" ? "\n回复 /resume <编号> 继续。" : "\nReply /resume <number> to continue.",
+              hostT(locale, "\n回复 /resume <编号> 继续。"),
             ].join("\n")
-          : (locale === "zh" ? `没有找到 ${engineName} session。` : `No ${engineName} sessions found.`);
+          : hostT(locale, "没有找到 {0} session。", engineName);
         if (sendResumeScanResult) {
           await sendResumeScanResult({ kind: scanKind, sessions, visibleSessions: sessions, locale });
         } else {
@@ -361,9 +361,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       if (resumeCmd.kind === "pick") {
         const cached = getPendingResumeScan(conversationKey, scanKind);
         if (!cached || resumeCmd.pick < 1 || resumeCmd.pick > cached.length) {
-          const msg = locale === "zh"
-            ? `无效选择，请先发 /resume 扫描 ${engineName} session。`
-            : `Invalid selection. Send /resume first to scan ${engineName} sessions.`;
+          const msg = hostT(locale, "无效选择，请先发 /resume 扫描 {0} session。", engineName);
           await context.api.sendMessage(normalized.chatId, msg);
           await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
             startedAt,
@@ -379,9 +377,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       } else if (resumeCmd.kind === "session") {
         sessionId = resumeCmd.sessionId;
       } else {
-        const msg = locale === "zh"
-          ? "用法: /resume、/resume <编号> 或 /resume session <session-id>"
-          : "Usage: /resume, /resume <number>, or /resume session <session-id>";
+        const msg = hostT(locale, "用法: /resume、/resume <编号> 或 /resume session <session-id>");
         await context.api.sendMessage(normalized.chatId, msg);
         await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
           startedAt,
@@ -414,8 +410,8 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         const detail = error instanceof Error ? error.message : String(error);
         const unsupported = /validation unsupported|listing unsupported/i.test(detail);
         const msg = unsupported
-          ? (locale === "zh" ? `当前 ${engineName} runtime 无法验证 session id。` : `This ${engineName} runtime cannot validate session IDs.`)
-          : (locale === "zh" ? `无法加载 ${engineName} session：${sessionId}` : `Could not load ${engineName} session: ${sessionId}`);
+          ? hostT(locale, "当前 {0} runtime 无法验证 session id。", engineName)
+          : hostT(locale, "无法加载 {0} session：{1}", engineName, sessionId);
         await context.api.sendMessage(normalized.chatId, msg);
         await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
           startedAt,
@@ -449,9 +445,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       });
       await updateInstanceConfig((c) => { delete c.resume; });
 
-      const msg = locale === "zh"
-        ? `已绑定 ${engineName} session：${sessionId}\n工作区：${workspacePath}\n\n发送消息继续对话，完成后发 /detach 断开。`
-        : `Attached ${engineName} session: ${sessionId}\nWorkspace: ${workspacePath}\n\nSend a message to continue. Use /detach when done.`;
+      const msg = hostT(locale, "已绑定 {0} session：{1}\n工作区：{2}\n\n发送消息继续对话，完成后发 /detach 断开。", engineName, sessionId, workspacePath);
       await context.api.sendMessage(normalized.chatId, msg);
       await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
         startedAt,
@@ -499,9 +493,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       if (resumeCmd.kind === "pick") {
         const cached = getPendingResumeScan(conversationKey, "antigravity");
         if (!cached || resumeCmd.pick < 1 || resumeCmd.pick > cached.length) {
-          const msg = locale === "zh"
-            ? "无效选择，请先发 /resume 扫描 Antigravity conversation。"
-            : "Invalid selection. Send /resume first to scan Antigravity conversations.";
+          const msg = hostT(locale, "无效选择，请先发 /resume 扫描 Antigravity conversation。");
           await context.api.sendMessage(normalized.chatId, msg);
           await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
             startedAt,
@@ -516,9 +508,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       }
 
       if (resumeCmd.kind !== "conversation" && resumeCmd.kind !== "pick") {
-        const msg = locale === "zh"
-          ? "用法: /resume、/resume <编号> 或 /resume conversation <conversation-id>。"
-          : "Usage: /resume, /resume <number>, or /resume conversation <conversation-id>.";
+        const msg = hostT(locale, "用法: /resume、/resume <编号> 或 /resume conversation <conversation-id>。");
         await context.api.sendMessage(normalized.chatId, msg);
         await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
           startedAt,
@@ -534,9 +524,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         return true;
       }
       if (!isAntigravityConversationId(conversationId)) {
-        const msg = locale === "zh"
-          ? "Antigravity conversation id 无效。请使用 /resume 扫描最近 conversation，或发送 /resume conversation <uuid>。"
-          : "Invalid Antigravity conversation id. Use /resume to scan recent conversations or /resume conversation <uuid>.";
+        const msg = hostT(locale, "Antigravity conversation id 无效。请使用 /resume 扫描最近 conversation，或发送 /resume conversation <uuid>。");
         await context.api.sendMessage(normalized.chatId, msg);
         await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
           startedAt,
@@ -561,9 +549,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       });
       await updateInstanceConfig((c) => { delete c.resume; });
 
-      const msg = locale === "zh"
-        ? `已绑定 Antigravity conversation：${conversationId}\n\n发送消息继续对话，完成后发 /detach 断开。`
-        : `Attached Antigravity conversation: ${conversationId}\n\nSend a message to continue. Use /detach when done.`;
+      const msg = hostT(locale, "已绑定 Antigravity conversation：{0}\n\n发送消息继续对话，完成后发 /detach 断开。", conversationId);
       await context.api.sendMessage(normalized.chatId, msg);
       await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
         startedAt,
@@ -576,9 +562,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
 
     if (cfg.engine === "codex") {
       if (resumeCmd.kind !== "thread") {
-        const msg = locale === "zh"
-          ? "Codex 请使用 /resume thread <thread-id>。普通 /resume 扫描仅适用于 Claude。"
-          : "For Codex, use /resume thread <thread-id>. Plain /resume scan is Claude-only.";
+        const msg = hostT(locale, "Codex 请使用 /resume thread <thread-id>。普通 /resume 扫描仅适用于 Claude。");
         await context.api.sendMessage(normalized.chatId, msg);
         await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
           startedAt,
@@ -604,21 +588,16 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         const isUnsupported = /validation unsupported/i.test(detail);
         const isActiveWriter = /already has an active writer/i.test(detail);
         const activeWriterDiagnosis = detail.split(/\n\s*\n/).slice(1).join("\n\n").trim();
+        const activeWriterBody = normalizeLocale(locale, "en") === "zh" && activeWriterDiagnosis
+          ? activeWriterDiagnosis
+          : hostT(locale, "该会话正被另一个 Codex 进程占用。结束占用方后重试；重启本 bot 无效。");
         const msg = isActiveWriter
-          ? (locale === "zh"
-            ? `Codex thread 正被占用：${resumeCmd.threadId}\n\n${activeWriterDiagnosis || "该会话正被另一个 Codex 进程占用。结束占用方后重试；重启本 bot 无效。"}`
-            : `Codex thread is in use: ${resumeCmd.threadId}\n\nAnother Codex or ChatGPT process currently owns this thread. Close that application or finish its task, then retry; restarting this bot will not release the thread.`)
+          ? hostT(locale, "Codex thread 正被占用：{0}\n\n{1}", resumeCmd.threadId, activeWriterBody)
           : isNotFound
-          ? (locale === "zh"
-            ? `未找到 Codex thread：${resumeCmd.threadId}\n\n请检查 thread id 后重试。`
-            : `Codex thread not found: ${resumeCmd.threadId}\n\nCheck the thread ID and try again.`)
-          : isUnsupported
-            ? (locale === "zh"
-              ? "当前 Codex runtime 无法为 /resume thread 验证外部 thread id。"
-              : "This Codex runtime cannot validate external thread IDs for /resume thread.")
-            : (locale === "zh"
-              ? `验证 Codex thread 失败：${resumeCmd.threadId}`
-              : `Could not validate Codex thread: ${resumeCmd.threadId}`);
+            ? hostT(locale, "未找到 Codex thread：{0}\n\n请检查 thread id 后重试。", resumeCmd.threadId)
+            : isUnsupported
+              ? hostT(locale, "当前 Codex runtime 无法为 /resume thread 验证外部 thread id。")
+              : hostT(locale, "验证 Codex thread 失败：{0}", resumeCmd.threadId);
         await context.api.sendMessage(normalized.chatId, msg);
         await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
           startedAt,
@@ -650,9 +629,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       });
       await updateInstanceConfig((c) => { delete c.resume; });
 
-      const msg = locale === "zh"
-        ? `已绑定 Codex thread：${resumeCmd.threadId}\n\n发送消息继续对话，完成后发 /detach 断开。`
-        : `Attached Codex thread: ${resumeCmd.threadId}\n\nSend a message to continue. Use /detach when done.`;
+      const msg = hostT(locale, "已绑定 Codex thread：{0}\n\n发送消息继续对话，完成后发 /detach 断开。", resumeCmd.threadId);
       await context.api.sendMessage(normalized.chatId, msg);
       await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
         startedAt,
@@ -664,9 +641,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
     }
 
     if (resumeCmd.kind === "invalid" || resumeCmd.kind === "thread" || resumeCmd.kind === "conversation" || resumeCmd.kind === "session" && !CLAUDE_SESSION_ID.test(resumeCmd.sessionId)) {
-      const msg = locale === "zh"
-        ? "用法：/resume 扫描后按编号选择，或 /resume <完整 session ID> 直接绑定本机 Claude 会话。"
-        : "Use /resume to scan and pick a number, or /resume <full session ID> to attach a local Claude session.";
+      const msg = hostT(locale, "用法：/resume 扫描后按编号选择，或 /resume <完整 session ID> 直接绑定本机 Claude 会话。");
       await context.api.sendMessage(normalized.chatId, msg);
       await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
         startedAt,
@@ -682,9 +657,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       const sessions = await scanRecentSessions(1);
       if (sessions.length === 0) {
         pendingResumeScans.delete(conversationKey);
-        resumeAuditText = locale === "zh"
-          ? "最近 1 小时内没有找到本地 session。"
-          : "No local sessions found in the last hour.";
+        resumeAuditText = hostT(locale, "最近 1 小时内没有找到本地 session。");
         if (sendResumeScanResult) {
           await sendResumeScanResult({
             kind: "claude",
@@ -723,24 +696,18 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       } else if (cached) picked = cached[resumeCmd.pick - 1];
       if (!picked) {
         if (resumeCmd.kind !== "session") {
-          resumeAuditText = locale === "zh" ? "无效选择，请先发 /resume 扫描。" : "Invalid selection. Send /resume first to scan.";
+          resumeAuditText = hostT(locale, "无效选择，请先发 /resume 扫描。");
         } else if (lookupError) {
-          resumeAuditText = locale === "zh"
-            ? "无法安全读取此 Claude 会话，请检查主机文件访问权限及是否存在重复 ID。当前对话未改变。"
-            : "Could not safely read this Claude session. Check host file access and duplicate IDs. The current conversation is unchanged.";
+          resumeAuditText = hostT(locale, "无法安全读取此 Claude 会话，请检查主机文件访问权限及是否存在重复 ID。当前对话未改变。");
         } else {
-          resumeAuditText = locale === "zh"
-            ? "此主机未找到该 Claude session ID。请核对 ID 及运行 Bot 的主机；当前对话未改变。"
-            : "Claude session ID not found on this host. Check the ID and Bot host; the current conversation is unchanged.";
+          resumeAuditText = hostT(locale, "此主机未找到该 Claude session ID。请核对 ID 及运行 Bot 的主机；当前对话未改变。");
         }
         await context.api.sendMessage(normalized.chatId, resumeAuditText);
       } else {
         pendingResumeScans.delete(conversationKey);
 
         if (!picked.workspacePath) {
-          resumeAuditText = locale === "zh"
-            ? `无法从 session 元数据确认工作区路径（${picked.dirName}），当前对话未改变。请先在主机 Claude CLI 中打开此会话后重试。`
-            : `Cannot confirm the workspace from session metadata (${picked.dirName}). The current conversation is unchanged; open it in the host Claude CLI and retry.`;
+          resumeAuditText = hostT(locale, "无法从 session 元数据确认工作区路径（{0}），当前对话未改变。请先在主机 Claude CLI 中打开此会话后重试。", picked.dirName);
           await context.api.sendMessage(normalized.chatId, resumeAuditText);
         } else {
           const existing = await findSessionForConversation(sessionStore, normalized);
@@ -763,9 +730,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
           });
           await updateInstanceConfig((c) => { delete c.resume; });
 
-          resumeAuditText = locale === "zh"
-            ? `已绑定 session：${picked.sessionId}\n工作区：${picked.workspacePath}\n\n发送下一条消息时由 Claude 加载并继续；大会话可能需要较长时间。完成后发 /detach 返回之前的对话。`
-            : `Attached session: ${picked.sessionId}\nWorkspace: ${picked.workspacePath}\n\nClaude will load and continue it on your next message; large sessions may take longer. Use /detach to return to the previous conversation.`;
+          resumeAuditText = hostT(locale, "已绑定 session：{0}\n工作区：{1}\n\n发送下一条消息时由 Claude 加载并继续；大会话可能需要较长时间。完成后发 /detach 返回之前的对话。", picked.sessionId, picked.workspacePath);
           await context.api.sendMessage(normalized.chatId, resumeAuditText);
         }
       }
@@ -803,33 +768,22 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
 
       await updateInstanceConfig((c) => { delete c.resume; });
 
-      detachMessage = cfg.engine === "codex"
-        ? (locale === "zh"
+      detachMessage = hostT(
+        locale,
+        cfg.engine === "codex"
           ? "已断开当前 Codex thread，并恢复到 /resume 之前的对话。"
-          : "Detached from the current Codex thread and restored the previous conversation.")
-        : cfg.engine === "antigravity"
-          ? (locale === "zh"
+          : cfg.engine === "antigravity"
             ? "已断开当前 Antigravity conversation，并恢复到 /resume 之前的对话。"
-            : "Detached from the current Antigravity conversation and restored the previous conversation.")
-          : cfg.engine === "kimi"
-            ? (locale === "zh"
+            : cfg.engine === "kimi"
               ? "已断开当前 Kimi session，并恢复到 /resume 之前的对话。"
-              : "Detached from the current Kimi session and restored the previous conversation.")
-            : cfg.engine === "deepseek"
-              ? (locale === "zh"
+              : cfg.engine === "deepseek"
                 ? "已断开当前 DeepSeek Harness session，并恢复到 /resume 之前的对话。"
-                : "Detached from the current DeepSeek Harness session and restored the previous conversation.")
-              : cfg.engine === "pi"
-                ? (locale === "zh"
+                : cfg.engine === "pi"
                   ? "已断开当前 Pi session，并恢复到 /resume 之前的对话。"
-                  : "Detached from the current Pi session and restored the previous conversation.")
-                : cfg.engine === "omp"
-                  ? (locale === "zh"
+                  : cfg.engine === "omp"
                     ? "已断开当前 omp session，并恢复到 /resume 之前的对话。"
-                    : "Detached from the current omp session and restored the previous conversation.")
-                  : (locale === "zh"
-                    ? "已断开恢复的 session，并恢复到 /resume 之前的对话。"
-                    : "Detached from resumed session and restored the previous conversation.");
+                    : "已断开恢复的 session，并恢复到 /resume 之前的对话。",
+      );
       await context.api.sendMessage(normalized.chatId, detachMessage);
     } else if (currentResume) {
       if (currentResume.symlinkPath) {
@@ -844,54 +798,26 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
       await removeSessionForConversation(sessionStore, normalized);
       await updateInstanceConfig((c) => { delete c.resume; });
 
-      detachMessage = locale === "zh"
-        ? "已断开恢复的 session，回到 bot 默认工作区。"
-        : "Detached from resumed session. Back to default workspace.";
+      detachMessage = hostT(locale, "已断开恢复的 session，回到 bot 默认工作区。");
       await context.api.sendMessage(normalized.chatId, detachMessage);
     } else if (cfg.engine === "codex" || cfg.engine === "antigravity" || cfg.engine === "kimi" || cfg.engine === "deepseek" || cfg.engine === "pi" || cfg.engine === "omp") {
       const removed = await removeSessionForConversation(sessionStore, normalized);
       if (cfg.engine === "codex") {
-        detachMessage = removed
-          ? (locale === "zh"
-            ? "已断开当前 Codex thread。下一条消息会新建 thread。"
-            : "Detached from the current Codex thread. Next message will start a fresh thread.")
-          : (locale === "zh"
-            ? "当前没有绑定的 Codex thread。"
-            : "No active Codex thread.");
+        detachMessage = hostT(locale, removed ? "已断开当前 Codex thread。下一条消息会新建 thread。" : "当前没有绑定的 Codex thread。");
       } else if (cfg.engine === "antigravity") {
-        detachMessage = removed
-          ? (locale === "zh"
-            ? "已断开当前 Antigravity conversation。下一条消息会新建 conversation。"
-            : "Detached from the current Antigravity conversation. Next message will start a fresh conversation.")
-          : (locale === "zh"
-            ? "当前没有绑定的 Antigravity conversation。"
-            : "No active Antigravity conversation.");
+        detachMessage = hostT(locale, removed ? "已断开当前 Antigravity conversation。下一条消息会新建 conversation。" : "当前没有绑定的 Antigravity conversation。");
       } else if (cfg.engine === "kimi") {
-        detachMessage = removed
-          ? (locale === "zh"
-            ? "已断开当前 Kimi session。下一条消息会新建 session。"
-            : "Detached from the current Kimi session. Next message will start a fresh session.")
-          : (locale === "zh"
-            ? "当前没有绑定的 Kimi session。"
-            : "No active Kimi session.");
+        detachMessage = hostT(locale, removed ? "已断开当前 Kimi session。下一条消息会新建 session。" : "当前没有绑定的 Kimi session。");
       } else if (cfg.engine === "pi") {
-        detachMessage = removed ? (locale === "zh" ? "已断开当前 Pi 会话。下一条消息会新建会话。" : "Detached from the current Pi session. The next message starts a fresh session.") : (locale === "zh" ? "当前没有绑定的 Pi 会话。" : "No active Pi session.");
+        detachMessage = hostT(locale, removed ? "已断开当前 Pi 会话。下一条消息会新建会话。" : "当前没有绑定的 Pi 会话。");
       } else if (cfg.engine === "omp") {
-        detachMessage = removed ? (locale === "zh" ? "已断开当前 omp 会话。下一条消息会新建会话。" : "Detached from the current omp session. The next message starts a fresh session.") : (locale === "zh" ? "当前没有绑定的 omp 会话。" : "No active omp session.");
+        detachMessage = hostT(locale, removed ? "已断开当前 omp 会话。下一条消息会新建会话。" : "当前没有绑定的 omp 会话。");
       } else {
-        detachMessage = removed
-          ? (locale === "zh"
-            ? "已断开当前 DeepSeek Harness session。下一条消息会新建 session。"
-            : "Detached from the current DeepSeek Harness session. Next message will start a fresh session.")
-          : (locale === "zh"
-            ? "当前没有绑定的 DeepSeek Harness session。"
-            : "No active DeepSeek Harness session.");
+        detachMessage = hostT(locale, removed ? "已断开当前 DeepSeek Harness session。下一条消息会新建 session。" : "当前没有绑定的 DeepSeek Harness session。");
       }
       await context.api.sendMessage(normalized.chatId, detachMessage);
     } else {
-      detachMessage = locale === "zh"
-        ? "当前没有恢复的 session。"
-        : "No resumed session active.";
+      detachMessage = hostT(locale, "当前没有恢复的 session。");
       await context.api.sendMessage(normalized.chatId, detachMessage);
     }
 

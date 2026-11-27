@@ -1,4 +1,5 @@
 import type { ContextUsage } from "../../src/client-protocol/context-usage.js";
+import type { Locale } from "../../src/runtime/locale.js";
 import { quotaScopeSchema, type QuotaConstraint, type QuotaScope } from "../../src/client-protocol/engine-quota.js";
 
 /** How long a quota reading is considered fresh. Older readings stay visible
@@ -220,7 +221,7 @@ export function quotaViewNextChangeAt(view: QuotaView): number {
 }
 
 /** Compact relative age string for old readings ("just now", "12 min ago", "2 hr ago", "1 day ago"). */
-export function quotaReadingAgeLabel(observedAt: string, now: number, locale: "zh" | "en"): string {
+export function quotaReadingAgeLabel(observedAt: string, now: number, locale: Locale): string {
   const ageMs = Math.max(0, now - Date.parse(observedAt));
   const mins = Math.floor(ageMs / 60_000);
   if (mins < 1) return locale === "zh" ? "刚刚" : "just now";
@@ -240,7 +241,7 @@ export function shortTokens(value: number): string {
 
 /** Accurate time remaining computed from a provider's reset timestamp (not the window length).
  * Returns null once the reset timestamp has passed. */
-export function formatTimeRemaining(resetsAt: string | undefined, now: number, locale: "zh" | "en"): string | null {
+export function formatTimeRemaining(resetsAt: string | undefined, now: number, locale: Locale): string | null {
   if (!resetsAt) return null;
   const ms = Date.parse(resetsAt) - now;
   if (!Number.isFinite(ms) || ms <= 0) return null;
@@ -248,7 +249,7 @@ export function formatTimeRemaining(resetsAt: string | undefined, now: number, l
   const days = Math.floor(totalMinutes / 1440);
   const hours = Math.floor((totalMinutes % 1440) / 60);
   const minutes = totalMinutes % 60;
-  if (locale === "en") {
+  if (locale !== "zh") {
     if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
     if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
     return `${minutes}m`;

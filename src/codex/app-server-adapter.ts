@@ -3,6 +3,8 @@ import { SIDE_TOOL_INSTRUCTIONS } from "./side-instructions.js";
 import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
 import { readCodexAccountQuota } from "./codex-account-quota.js";
 import { cancelOwnedQuotaReads, readOwnedCodexQuota } from "./codex-quota-process.js";
+import { hostT } from "../locales/index.js";
+import { normalizeLocale, type Locale } from "../runtime/locale.js";
 import { isLogicalSessionId } from "../runtime/logical-session.js";
 import { wholeFilePatch } from "../core/recorded-diff.js";
 import { spawnEngine } from "../runtime/engine-process.js";
@@ -2629,7 +2631,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
       sessionId: input.threadId,
       mode: "continue",
       reason,
-      ...(turnId && ownedIds.size ? { releaseTools, reconcileTools: async (requestedIds: readonly string[], signal?: AbortSignal, locale?: "en" | "zh") => {
+      ...(turnId && ownedIds.size ? { releaseTools, reconcileTools: async (requestedIds: readonly string[], signal?: AbortSignal, locale?: Locale) => {
         if (claimed || !this.retryToolLeases.has(releaseTools)) return;
         claimed = true;
         if (leaseTimer) clearTimeout(leaseTimer);
@@ -2646,9 +2648,13 @@ export class CodexAppServerAdapter implements CodexAdapter {
               const tool = extractCodexToolItem(item);
               // Persisted records sometimes omit stdout. Append a clearly
               // labelled terminal status without erasing earlier streamed logs.
-              const status = locale === "zh"
-                ? `[TaroBird] 已确认命令状态：${item.status === "declined" ? "已拒绝" : item.status === "failed" ? "执行失败" : "已结束"}${tool?.exitCode !== undefined ? `，退出码 ${tool.exitCode}` : ""}。`
-                : `[TaroBird] Confirmed command status: ${item.status}${tool?.exitCode !== undefined ? `; exit code ${tool.exitCode}` : ""}.`;
+              const loc = locale ?? "en";
+              const exitSuffix = tool?.exitCode !== undefined ? hostT(loc, "，退出码 {0}", tool.exitCode) : "";
+              const status = item.status === "declined"
+                ? hostT(loc, "[TaroBird] 已确认命令状态：已拒绝{0}。", exitSuffix)
+                : item.status === "failed"
+                  ? hostT(loc, "[TaroBird] 已确认命令状态：执行失败{0}。", exitSuffix)
+                  : hostT(loc, "[TaroBird] 已确认命令状态：已结束{0}。", exitSuffix);
               if (tool) {
                 if (tool.output === undefined && tool.toolUseId) await input.pending.onEngineEvent?.({ type: "tool_progress", toolUseId: tool.toolUseId,
                   text: status, delta: false, sessionId: input.threadId });
@@ -2658,8 +2664,7 @@ export class CodexAppServerAdapter implements CodexAdapter {
             },
             waiting: async ids => {
               for (const id of ids) await input.pending.onEngineEvent?.({ type: "tool_progress", toolUseId: id,
-                text: locale === "zh" ? "[TaroBird] 模型服务暂时中断，正在等待已启动的命令完成，随后自动继续。"
-                  : "[TaroBird] The model service was interrupted. Waiting for the already-started command to finish, then continuing automatically.", delta: false, sessionId: input.threadId });
+                text: hostT(locale ?? "en", "[TaroBird] 模型服务暂时中断，正在等待已启动的命令完成，随后自动继续。"), delta: false, sessionId: input.threadId });
             },
           });
         } finally { releaseTools(); }

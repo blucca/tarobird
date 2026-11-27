@@ -7,7 +7,7 @@ import { SettingsGroupHeading } from "./SettingsParts.js";
 import { MAX_CONCURRENT_QUOTA_REFRESH, useEngineQuota } from "./use-engine-quota.js";
 import { formatQuotaWindowLabel, formatResetCountdown, groupQuotaScopesByAccount, shouldShowQuotaPoolHeading } from "./quota-ui.js";
 import { QUOTA_SHOWN_FOR_MS, quotaReadingAgeLabel, usageTone } from "./usage-readings.js";
-import { t, useLocale } from "./i18n.js";
+import { localeIntlTag, t, useLocale } from "./i18n.js";
 import "./engine-quota.css";
 
 const engines: Record<QuotaEngine, string> = {
@@ -150,8 +150,8 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
   }, [active, quota.visible]);
 
   const now = clock + (state.serverTimeOffset ?? 0);
-  const formatTime = (value: string) => new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
-  const formatNumber = (value: number) => new Intl.NumberFormat(locale === "zh" ? "zh-CN" : "en", { maximumFractionDigits: 2 }).format(value);
+  const formatTime = (value: string) => new Intl.DateTimeFormat(localeIntlTag(locale), { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+  const formatNumber = (value: number) => new Intl.NumberFormat(localeIntlTag(locale), { maximumFractionDigits: 2 }).format(value);
   if (!owner) return null;
 
   const botLabels = new Map(state.bots.map(bot => [bot.id, bot.name]));

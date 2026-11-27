@@ -16,7 +16,7 @@ import { formatMessageTime } from "./conversation-inbox.js";
 import { messageExcerpt } from "./MessageReference.js";
 import { isAgentBusRecord } from "./agent-bus-record.js";
 import { isTranscriptionMessage } from "../../src/client-protocol/voice-presentation.js";
-import { t } from "./i18n.js";
+import { t, type Locale } from "./i18n.js";
 
 // Host audio transcription is not a Bot reply, so it never shows Bot typing dots.
 const presence = (message: Message) =>
@@ -38,7 +38,7 @@ export type WorkspaceMessageRowProps = {
   start: number;
   measureRef: (node: HTMLElement | null) => void;
   connection: HubConnection;
-  locale: "zh" | "en";
+  locale: Locale;
   localDay: number;
   phone: boolean;
   compactTime: boolean;

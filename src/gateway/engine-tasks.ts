@@ -3,6 +3,7 @@ import { idSchema } from "../client-protocol/index.js";
 import { SWARM_TASKS_CAPABILITY, stripSwarmTaskFields, engineSessionRecoverySchema, engineTaskSnapshotSchema, engineTaskStopSchema, engineTaskControlResultSchema } from "../client-protocol/engine-tasks.js";
 import { buildCoreConversationKey, stableCoreNumericId } from "../core/message-normalizer.js";
 import { resolveCoreLocale } from "../core/locale.js";
+import { isChineseLocale } from "../runtime/locale.js";
 import type { CoreBridgeLike } from "../core/types.js";
 import type { GatewayChannel } from "./channel.js";
 import { GatewayReceipts } from "./receipts.js";
@@ -49,7 +50,7 @@ export function gatewayEngineTasks(bridge: CoreBridgeLike, channel: GatewayChann
         const bg = await bridge.stopBackgroundWork({
           chatId: stableCoreNumericId(conversationKey),
           conversationKey,
-          locale,
+          locale: isChineseLocale(locale) ? "zh" : "en",
           scope: "swarm",
         });
         if (bg.stopped && bg.summary) {

@@ -126,6 +126,10 @@
   --shadow:0 0 0 1px var(--cli-line);
   --shadow-lg:0 0 0 1px var(--cli-line);
 }
+:root[lang^="ja"][data-palette=cli]{
+  --font-sans:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono","Hiragino Kaku Gothic ProN","BIZ UDGothic","Yu Gothic","MS Gothic","Noto Sans Mono CJK JP",monospace;
+  --font-mono:var(--font-sans);
+}
 /* Monospace is never tracked; selected text takes the highlight bar. */
 :root[data-palette=cli] :not(.palette-preview,.palette-preview *){letter-spacing:0}
 :root[data-palette=cli] ::selection,

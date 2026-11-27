@@ -10,7 +10,7 @@ import { settleCollaborationRestarts } from "./collaboration-task.js";
 import { agentBusPeerIds, agentBusCollaborationIssues, prepareAgentBusCollaboration } from "../../src/client-protocol/collaboration-prepare.js";
 import { BUS_GOAL_CHARS, busBotLabel, busComparableConfig, busConfigIssue, busCoordinatorExecutes, busCreateRejected, busDraftSaved, busRecoverCreatedConfig, busErrorText, busPreparationErrorText, busReadErrorText, busRunErrorText, busMemberStatus, busModeDescription, busModeName, busModes, busRoleName, busStatusName, busStartRunId } from "./agent-bus-view.js";
 import { refreshAgentBuses } from "./AgentBusList.js";
-import { t, useLocale, formatList } from "./i18n.js";
+import { localeIntlTag, t, useLocale, formatList } from "./i18n.js";
 import { AgentBusFlow } from "./AgentBusFlow.js";
 import { AgentBusDivision, AgentBusSlots, revealInBusPanel } from "./AgentBusSlots.js";
 import "./agent-bus.css";
@@ -364,7 +364,7 @@ export function AgentBusPanel({ host, hosts, workspaceId, visible, close, select
         {runMember && <div className="agent-bus-record-link"><span><strong>{label(runMember.botId)} · {conversationLabel(runMember.conversationId)}</strong><small>{busMemberStatus(executionWorkspace, latest, runMember)}</small></span><button onClick={() => focusMember(runMember.conversationId)}>{t("查看记录对话")}<ArrowUp size={13}/></button></div>}
         <button className="agent-bus-reveal" onClick={() => reveal(executionWorkspace)}>{t("在面板中显示成员对话")}</button>
         {changedSinceRun && <div className="agent-bus-next-config" role="status"><span>{t("上方为最近一次运行；下次启动将使用新配置。")}</span><strong>{busModeName(workspace.mode)} · {label(workspace.coordinator.botId)} · {formatList(workspace.members.map(member => label(member.botId)))}</strong></div>}
-        {!!detail?.runs.length && <details className="agent-bus-run-history"><summary data-disclosure-icon>{t("最近运行")}<span>{detail.runs.length}</span><ChevronDown size={13} aria-hidden="true"/></summary>{detail.runs.map(run => <article key={run.id}><div><span>{busStatusName(run.status)}</span><time>{new Date(run.createdAt).toLocaleString(locale === "zh" ? "zh-CN" : "en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time></div><p>{run.text}</p><small>{t("{0} 个已记录步骤", run.stages.length)}</small></article>)}</details>}
+        {!!detail?.runs.length && <details className="agent-bus-run-history"><summary data-disclosure-icon>{t("最近运行")}<span>{detail.runs.length}</span><ChevronDown size={13} aria-hidden="true"/></summary>{detail.runs.map(run => <article key={run.id}><div><span>{busStatusName(run.status)}</span><time>{new Date(run.createdAt).toLocaleString(localeIntlTag(locale), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time></div><p>{run.text}</p><small>{t("{0} 个已记录步骤", run.stages.length)}</small></article>)}</details>}
       </div>}
       {readError && <div className="agent-bus-notice" role="status">{readError}</div>}
       {error && !runError && !permissionReview && !deleting && !stopping && !gone && <div className="agent-bus-error" role="alert">{error}</div>}

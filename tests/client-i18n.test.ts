@@ -5,6 +5,7 @@ afterEach(() => { setLocale("zh"); vi.unstubAllGlobals(); });
 it.each([
   ["zh", "Claude 助手、Codex、Kimi"],
   ["en", "Claude 助手, Codex, Kimi"],
+  ["ja", "Claude 助手、Codex、Kimi"],
 ] as const)("keeps names visibly separated in %s application lists", (locale, expected) => {
   vi.stubGlobal("document", { documentElement: { lang: "zh-CN" } });
   setLocale(locale);

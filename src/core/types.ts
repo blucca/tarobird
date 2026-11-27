@@ -18,6 +18,7 @@ import type {
 } from "../codex/adapter.js";
 import type { BridgeAccessDecision } from "../runtime/bridge.js";
 import type { EngineTaskSnapshot, EngineTaskControlResult } from "../client-protocol/engine-tasks.js";
+import type { Locale } from "../runtime/locale.js";
 import type { PiSessionSnapshot, PiSessionResult, PiSessionChange } from "../client-protocol/pi-session.js";
 import type { BridgeTurnLockWaitEvent } from "../runtime/turn-lock.js";
 import type { TurnPoolWaitEvent } from "../runtime/turn-pool.js";
@@ -111,7 +112,7 @@ export interface CoreBridgeLike {
   finalizeConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryFinalize): Promise<{ revision: string }>;
   readAccountQuota?(options: import("../codex/adapter.js").EngineQuotaReadOptions): Promise<import("../codex/adapter.js").EngineQuotaReadResult | undefined>;
   sideCapability?(input?: { workspaceOverride?: string; tools?: "inherited" }): import("../codex/adapter.js").SideCapability;
-  openSideSession?(input: { chatId: number; userId: number; chatType: string; conversationKey: string; workspaceOverride?: string; tools?: "inherited"; locale?: "en" | "zh"; abortSignal?: AbortSignal }): Promise<import("../codex/adapter.js").EngineSideSession>;
+  openSideSession?(input: { chatId: number; userId: number; chatType: string; conversationKey: string; workspaceOverride?: string; tools?: "inherited"; locale?: Locale; abortSignal?: AbortSignal }): Promise<import("../codex/adapter.js").EngineSideSession>;
   /** Shares the underlying engine/session state for an independently authenticated transport. */
   createAuthenticatedSurface?(): CoreBridgeLike;
   /** Native background work/reviews still owned by this worker, without polling the engine. */
@@ -124,7 +125,7 @@ export interface CoreBridgeLike {
     chatType: string;
     messageThreadId?: number;
     conversationKey?: string;
-    locale?: "en" | "zh";
+    locale?: Locale;
   }): Promise<BridgeAccessDecision>;
   checkUserAuthorization?(input: {
     chatId: number;
@@ -132,14 +133,14 @@ export interface CoreBridgeLike {
     chatType: string;
     messageThreadId?: number;
     conversationKey?: string;
-    locale?: "en" | "zh";
+    locale?: Locale;
   }): Promise<BridgeAccessDecision>;
   handleAuthorizedMessage(input: {
     chatId: number;
     userId: number;
     chatType: string;
     messageThreadId?: number;
-    locale?: "en" | "zh";
+    locale?: Locale;
     text: string;
     /** The owner's own typed text for this turn; see `CodexUserMessageInput.authoredText`. */
     authoredText?: string;

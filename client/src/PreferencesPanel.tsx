@@ -42,7 +42,7 @@ import { PlatformIcon, SettingsGroupHeading, SettingsScope, platformName } from 
 import { deviceOperationError } from "./device-errors.js";
 import { HubHttpError } from "./http-error.js";
 import type { HubConnection } from "./connection.js";
-import { t, useLocale } from "./i18n.js";
+import { localeIntlTag, SUPPORTED_LANGUAGES, t, useLocale } from "./i18n.js";
 import type { Preferences } from "./storage.js";
 import { ambiguousDeviceName, deviceDisplayName, deviceRevokeScope } from "./device-presentation.js";
 import "./device-settings.css";
@@ -114,7 +114,7 @@ function FlowDialog({ title, closeLabel, busy, back, close, returnFocus, classNa
 }
 
 export function PreferencesPanel({ connection, preferences, update, close, forget, manageNetwork, manageConnections, openWorkbenchFile, returnFocus, initialSection = "general", backLabel, initialPairingStep, singleSection = false }: { openWorkbenchFile?: (file: WorkbenchFileTarget) => Promise<void>; initialPairingStep?: 0 | 1; singleSection?: boolean; returnFocus?: RefObject<HTMLElement | null>; initialSection?: Section; backLabel?: string; connection: HubConnection; preferences: Preferences; update: (next: Preferences) => void; close: () => void; forget: () => Promise<void>; manageNetwork?: OpenNetwork; manageConnections?: OpenNetwork }) {
-  useLocale(); const hostName = useContext(RuntimeHostContext);
+  const activeLocale = useLocale(); const hostName = useContext(RuntimeHostContext);
   const state = useSyncExternalStore((notify) => connection.subscribe(notify), () => connection.state);
   const intentionalClose = useRef(false);
   const dialog = useRef<HTMLDialogElement>(null), content = useRef<HTMLDivElement>(null), heading = useRef<HTMLHeadingElement>(null), header = useRef<HTMLElement>(null);
@@ -160,7 +160,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   // `reveal` lands on it once, after the flow closes and the list contains it.
   const [wizard, setWizard] = useState(initialPairingStep !== undefined), [step, setStep] = useState<number>(initialPairingStep ?? 0), [approvedHere, setApprovedHere] = useState(false), [added, setAdded] = useState<string>();
   const addButton = useRef<HTMLButtonElement>(null), stepHeading = useRef<HTMLHeadingElement>(null), deviceList = useRef<HTMLDivElement>(null), reveal = useRef(false);
-  const locale = preferences.locale === "en" ? "en" : "zh-CN";
+  const locale = localeIntlTag(activeLocale);
 
   // The owner only; a build can leave it out (engine-quota-feature.ts): then no entry, no page, no quota reads.
   const quotaPage = engineQuotaPageVisible(state.user?.role);
@@ -485,7 +485,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
           <div className="settings-group">
             <div className="settings-row">
               <div className="settings-row-text"><label htmlFor="language">{t("语言")}</label><small id="language-scope">{t("应用界面文字")}</small></div>
-              <select id="language" aria-describedby="language-scope language-note" value={preferences.locale} onChange={(e) => update({ ...preferences, locale: e.target.value as Preferences["locale"] })}><option value="zh" lang="zh-CN">中文</option><option value="en" lang="en">English</option></select>
+              <select id="language" aria-describedby="language-scope language-note" value={preferences.locale} onChange={(e) => update({ ...preferences, locale: e.target.value as Preferences["locale"] })}><option value="system">{t("跟随系统")}</option>{SUPPORTED_LANGUAGES.map((item) => <option key={item.code} value={item.code} lang={item.bcp47}>{item.nativeName}</option>)}</select>
             </div>
           </div>
           <p id="language-note" className="settings-note muted">{t("切换后立即生效，草稿和当前页面都会保留。只翻译应用界面，Bot 回复和你写的内容保持原文。")}</p>
