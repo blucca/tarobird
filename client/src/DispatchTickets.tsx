@@ -211,7 +211,7 @@ export function DispatchTickets({ connection, botId, conversationId, botLabel, c
     const artifactsCount = ticket.artifacts?.length ?? 0;
     return <li key={ticket.id} className="dispatch-ticket" data-status={ticket.status} data-ticket-id={ticket.id}>
       <div className="dispatch-ticket-heading"><strong title={ticket.title}>{ticket.title}</strong>{foreignTitle && <button type="button" className="dispatch-ticket-origin" title={t("前往来源对话：{0}", foreignTitle)} onClick={() => open(ticket.conversationId)}>{foreignTitle}</button>}{ticket.batchIndex !== undefined && ticket.batchTotal !== undefined && <span className="dispatch-ticket-batch">{t("批次 {0}/{1}", ticket.batchIndex + 1, ticket.batchTotal)}</span>}{!nodeGroups && ticketHostName && <span className="dispatch-ticket-host">{ticketHostName}</span>}{ticket.paused && open_ && !stopping && <span className="dispatch-ticket-paused">{t("已暂停")}</span>}<span className="dispatch-ticket-status">{stopping ? t(attempt.stopRequested === "cancel" ? "正在取消" : "正在暂停") : statusLabel(displayStatus(ticket))}</span></div>
-      {attempt?.waitingFor && !attempt.endedAt && !stopping && <p role="status">{isRemote ? t("请在接收主机的「设置 → 通用 → 消息」开启「在列表里显示工单对话」，打开与工单同名的对话处理审批或问题。") : t("打开执行会话，处理问题或权限审批。")}</p>}
+      {attempt?.waitingFor && !attempt.endedAt && !stopping && <p role="status">{isRemote ? t("接收主机的主人会收到通知。请在接收主机的对话列表里打开与工单同名的对话，处理审批或问题。") : t("打开执行会话，处理问题或权限审批。")}</p>}
       {stopping && <p role="status">{t("正在等待执行停止，确认结束后才能继续。")}</p>}
       {attempt?.failure && !stopping && <p className="dispatch-ticket-failure" role="status">{attempt.failure.message || attempt.failure.category}</p>}
       {ticket.resultExcerpt && <p className="dispatch-ticket-excerpt">{ticket.resultExcerpt}</p>}

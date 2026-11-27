@@ -1529,7 +1529,7 @@ export class HubDispatch {
           if (statusResp!.waitingFor) {
             const ev = await this.noticeInTransaction(
               source, next.dispatcherBotId, `waiting_remote_${attempt.id}_${statusResp!.waitingFor.messageId}`, next.id,
-              `【工单需要处理】「${next.title}」（${next.id}）在节点 ${attempt.hostName ?? attempt.hostId} 上${statusResp!.waitingFor.kind === "approval" ? "正在等待权限审批" : "有问题需要回答"}。请在接收主机的「设置 → 通用 → 消息」开启「在列表里显示工单对话」，打开与工单同名的对话处理审批或问题。`,
+              `【工单需要处理】「${next.title}」（${next.id}）在节点 ${attempt.hostName ?? attempt.hostId} 上${statusResp!.waitingFor.kind === "approval" ? "正在等待权限审批" : "有问题需要回答"}。接收主机的主人会收到通知；请在接收主机的对话列表里打开与工单同名的对话，处理审批或问题。`,
             );
             if (ev) events.push(ev);
           }

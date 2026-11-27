@@ -7035,7 +7035,7 @@
   "撤销此主机授权": "Revoke Host authorization",
   "此机可用 CLI": "Allowed CLIs on this Host",
   "跟随全局 CLI 设置": "Follow global CLI list",
-  "请在接收主机的「设置 → 通用 → 消息」开启「在列表里显示工单对话」，打开与工单同名的对话处理审批或问题。": "On the receiving host, open Settings → General → Messages, enable “Show ticket conversations in the list”, and open the conversation with the ticket title to approve or answer.",
+  "接收主机的主人会收到通知。请在接收主机的对话列表里打开与工单同名的对话，处理审批或问题。": "The receiving host's owner is notified. Open the conversation with the ticket title there to approve or answer.",
   "接收主机上的旧执行 Bot 权限过宽。请接收方主人运行 tarobot logs，按其中的指引删除该执行 Bot，再重新派发。": "The old worker on the receiving host has overly broad permissions. Ask its owner to run tarobot logs, follow the instructions to delete that worker, and retry dispatch.",
   "在接收主机开启此选项，然后从会话列表打开同名工单，在互动卡片上处理审批或回答问题。": "Enable this on the receiving host, open the conversation with the ticket title, and use its card to approve or answer.",
   "删除这个演示文稿": "Delete this presentation",
