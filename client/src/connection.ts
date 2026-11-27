@@ -26,6 +26,7 @@ import { markSendTimingByClientMsgId } from "./send-timing.js";
 import { clearMessagesPlanSchema, clearMessagesResultSchema, MESSAGE_CLEAR_CAPABILITY } from "../../src/client-protocol/message-clear.js";
 import { deleteMessagesSchema, deleteMessagesResultSchema, MESSAGE_DELETE_CAPABILITY } from "../../src/client-protocol/message-deletion.js";
 import { timeoutSignal, anySignal } from "./abort-signals.js";
+import { addGlobalListener } from "./global-event-hub.js";
 import { conversationFoldersSchema, emptyConversationFolders, type ConversationFoldersState, type FolderEdit } from "../../src/client-protocol/conversation-folders.js";
 import { CONVERSATION_PINS_CAPABILITY, conversationPinsSchema, emptyConversationPins, type ConversationPinsState, type PinScope } from "../../src/client-protocol/conversation-pins.js";
 import { CROSS_HOST_FOLDER_ORDER_CAPABILITY, crossHostFolderOrderSchema, type CrossHostFolderOrderState } from "../../src/client-protocol/cross-host-folder-order.js";
@@ -156,6 +157,7 @@ export class HubConnection {
     },
   );
   private listeners = new Set<() => void>(); private ws?: HubSocket; private closed = false; private generation = 0; private stopFailures = 0;
+  private globalCleanups: (() => void)[] = [];
   private signing?: Promise<string>;
   private closingReceive?: { generation: number; resume: boolean };
   private userId?: string; private notificationRequest = 0;
@@ -339,7 +341,14 @@ export class HubConnection {
     if (this.started) return this.starting ?? Promise.resolve();
     this.started = true; this.closed = false; const lifecycle = ++this.lifecycle;
     if (this.httpEpoch.signal.aborted) this.httpEpoch = new AbortController();
-    window.addEventListener("online", this.networkOnline); document.addEventListener("visibilitychange", this.presence); window.addEventListener("focus", this.presence); window.addEventListener("blur", this.presence); window.addEventListener(NATIVE_ACTIVE_EVENT, this.presence);
+    this.globalCleanups.forEach(fn => fn());
+    this.globalCleanups = [
+      addGlobalListener(window, "online", this.networkOnline),
+      addGlobalListener(document, "visibilitychange", this.presence),
+      addGlobalListener(window, "focus", this.presence),
+      addGlobalListener(window, "blur", this.presence),
+    ];
+    window.addEventListener(NATIVE_ACTIVE_EVENT, this.presence);
     const work = (async () => {
       const [active, profiles, revoked, stored, outbox, conversationFolders, conversationPins, crossHostFolderOrder, membership] = await Promise.all([this.cache.activeMessages(), this.cache.profiles(), this.cache.identityRevoked(this.identity), this.cache.identity(), this.cache.outbox(), this.cache.conversationFolders(), this.cache.conversationPins?.(), this.cache.crossHostFolderOrder?.(), this.cache.networkMembership()]);
       if (this.closed || lifecycle !== this.lifecycle) return;
@@ -1781,5 +1790,5 @@ export class HubConnection {
     this.close(true); this.update({ error: t("此设备已被吊销，请重新配对"), routeDiagnosis: undefined });
     await this.cache.markIdentityRevoked(this.identity).catch(() => console.warn("device_revocation_cache_failed"));
   }
-  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.livePinChanges.clear(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); window.removeEventListener(NATIVE_ACTIVE_EVENT, this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
+  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.livePinChanges.clear(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; this.globalCleanups.forEach(fn => fn()); this.globalCleanups = []; window.removeEventListener(NATIVE_ACTIVE_EVENT, this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
 }

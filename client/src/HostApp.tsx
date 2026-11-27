@@ -24,6 +24,7 @@ import { clearWorkbenchBrowserData } from "./workbench-reset.js";
 import { maintainSystemPush } from "./system-push.js";
 import { maintainUnifiedPush, unregisterHostNotifications, migrateLegacyUnifiedPush } from "./unifiedpush.js";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, useSyncExternalStore, type ComponentType, type ReactNode, type RefObject } from "react";
+import { addGlobalListener } from "./global-event-hub.js";
 import { LoaderCircle, Monitor, Plus } from "lucide-react";
 import { HostRegistry, type RuntimeHost } from "./host-registry.js";
 import { HostConnections, networkHostBlocked, type ConnectedHost } from "./host-connections.js";
@@ -169,8 +170,13 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   useLocale();
   const [registry] = useState(() => new HostRegistry());
   const subscribeBoardWindow = useCallback((notify: () => void) => {
-    window.addEventListener("resize", notify);
-    return () => window.removeEventListener("resize", notify);
+    let frame = 0;
+    const schedule = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => { frame = 0; notify(); });
+    };
+    const off = addGlobalListener(window, "resize", schedule);
+    return () => { cancelAnimationFrame(frame); off(); };
   }, []);
   // Agent Bus stays desktop-only; the ADHD board also opens on a wide iPad or unfolded iPhone.
   const desktopBoard = useSyncExternalStore(subscribeBoardWindow, () => adhdSupported(nativePlatform(), innerWidth));

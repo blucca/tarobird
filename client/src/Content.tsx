@@ -1,3 +1,4 @@
+import { subscribeMediaQuery } from "./global-event-hub.js";
 import { useAndroidPackageOpen } from "./android-package-actions.js";
 import { steerFallbackReason, steerFallbackText } from "./bot-steer-delivery.js";
 import { InlineAudioControls } from "./InlineAudioControls.js";
@@ -136,7 +137,7 @@ function FileStatus({ allowPackageOpen, phase, cancel, retry, saved, openSaved, 
   </div>;
 }
 const phoneQuery = () => matchMedia("(max-width:760px)");
-const subscribePhone = (notify: () => void) => { const query = phoneQuery(); query.addEventListener("change", notify); return () => query.removeEventListener("change", notify); };
+const subscribePhone = (notify: () => void) => subscribeMediaQuery("(max-width:760px)", notify);
 const snapshotPhone = () => phoneQuery().matches;
 export function AttachmentFile({ connection, block, list = false }: { connection: HubConnection; block: Extract<Block, { type: "file" }>; list?: boolean }) {
   useLocale();

@@ -1,3 +1,4 @@
+import { subscribeMediaQuery } from "./global-event-hub.js";
 import { WorkbenchLibrary } from "./WorkbenchLibrary.js";
 import type { WorkbenchFileTarget } from "./workbench-library-context.js";
 import { useDialogDrag } from "./dialog-drag.js";
@@ -56,7 +57,7 @@ type Feedback = { area: "pair" | "devices" | "danger"; text: string | (() => str
 type Operation = { kind: "approve"; code: string } | { kind: "revoke"; id: string; label: string } | { kind: "rename" };
 const loopback = (url: string) => { try { const host = new URL(url).hostname; return host === "localhost" || host === "[::1]" || host.startsWith("127."); } catch { return false; } };
 const phoneQuery = "(max-width:760px),(hover:none) and (pointer:coarse)";
-const subscribePhone = (notify: () => void) => { const query = matchMedia(phoneQuery); query.addEventListener("change", notify); return () => query.removeEventListener("change", notify); };
+const subscribePhone = (notify: () => void) => subscribeMediaQuery(phoneQuery, notify);
 const phoneLayout = () => matchMedia(phoneQuery).matches;
 const pairingCode = /^[0-9]{8}$/;
 const spacedCode = (code: string) => `${code.slice(0, 4)} ${code.slice(4)}`;

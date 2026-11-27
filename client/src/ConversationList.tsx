@@ -11,12 +11,12 @@ import { filterUnreadHostItems } from "./conversation-unread.js";
 import { useLocalDay } from "./local-day.js";
 import { agentSignal } from "./agent-state.js";
 import { AgentAvatar } from "./AgentAvatar.js";
-import { isDispatcher, listedConversations } from "./dispatcher.js";
+import { isDispatcher, listedConversations, useTicketConversationsVisible } from "./dispatcher.js";
 import { HostSourceBadge } from "./HostSourceBadge.js";
 import { BotName } from "./BotName.js";
 import { ConversationAvatarDialog } from "./ConversationAvatarDialog.js";
 import { Avatar, ConversationAvatar, canEditConversationAvatar } from "./Avatar.js";
-import { useEffect, useLayoutEffect, useId, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useLayoutEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useConnectionSelection } from "./connection-selection.js";
 import { createPortal } from "react-dom";
 import { t, useLocale } from "./i18n.js";
@@ -40,15 +40,23 @@ export type ConversationSelection = {
   disabled: (id: string) => boolean; reason?: (id: string) => string | undefined; toggle: (id: string) => void;
 };
 
-export function ConversationList({ connection, hostId, hostName, slice, showHostBadge = false, showDisconnectedBots = false, visible = true, layout = "bots", selection, filtered = false, unreadOnly = false, retainedConversationId, conversations, bots, selected, pins, globalPins = [], showGlobalPins = true, activity, select, newChat, openBot }: { connection: HubConnection; hostId?: string; hostName?: string; slice?: SidebarSlice; showHostBadge?: boolean; showDisconnectedBots?: boolean; visible?: boolean; layout?: SidebarLayout; selection?: ConversationSelection; filtered?: boolean; unreadOnly?: boolean; retainedConversationId?: string; conversations: Conversation[]; bots: Bot[]; selected: string; pins: string[]; globalPins?: string[]; showGlobalPins?: boolean; activity: Record<string, ConversationActivity>; select: (id: string) => void; newChat: (botId: string) => void; openBot: (botId: string, destination: "capabilities" | "operations") => void }) {
+export const ConversationList = memo(function ConversationList({ connection, hostId, hostName, slice, showHostBadge = false, showDisconnectedBots = false, visible = true, layout = "bots", selection, filtered = false, unreadOnly = false, retainedConversationId, conversations, bots, selected, pins, globalPins = [], showGlobalPins = true, activity, select, newChat, openBot }: { connection: HubConnection; hostId?: string; hostName?: string; slice?: SidebarSlice; showHostBadge?: boolean; showDisconnectedBots?: boolean; visible?: boolean; layout?: SidebarLayout; selection?: ConversationSelection; filtered?: boolean; unreadOnly?: boolean; retainedConversationId?: string; conversations: Conversation[]; bots: Bot[]; selected: string; pins: string[]; globalPins?: string[]; showGlobalPins?: boolean; activity: Record<string, ConversationActivity>; select: (id: string) => void; newChat: (botId: string) => void; openBot: (botId: string, destination: "capabilities" | "operations") => void }) {
   const drafts = useDraftPreviews(connection.cache);
   const sourceHost = showHostBadge && hostName ? <HostSourceBadge name={hostName}/> : null;
   const bulk = useConversationBulk();
   const locale = useLocale(); const labels = useBotLabels(); const prefix = useId();
   // Row times are worded relative to today; render them again when the local day changes.
   useLocalDay();
-  const state = useConnectionSelection(connection, current => ({ status: current.state.status, user: current.state.user,
-    foldersAvailable: current.state.foldersAvailable, conversationAvatarsAvailable: current.state.conversationAvatarsAvailable }));
+  const showTickets = useTicketConversationsVisible();
+  const state = useConnectionSelection(connection, current => ({
+    status: current.state.status,
+    user: current.state.user,
+    foldersAvailable: current.state.foldersAvailable,
+    conversationAvatarsAvailable: current.state.conversationAvatarsAvailable,
+    navigationGraceUntil: current.state.navigationGraceUntil,
+    readOnly: current.isReadOnly,
+    closed: current.isClosed,
+  }));
   const foldScope = connection.identity.hubPublicKey ? JSON.stringify([connection.identity.hubPublicKey, connection.identity.publicKey]) : undefined;
   const botFolds = useBotConversationFolds(foldScope);
   const topicFolds = useGroupTopicFolds(foldScope);
@@ -122,30 +130,61 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
       return find(".folder-heading", node => node.dataset.renameFolderId === folder);
     });
   }, [foldScope, pins, globalPins, menu, layout, conversations, connection]);
-  const parent = conversations.find((c) => c.id === selected)?.parentId;
+  const botsById = useMemo(() => new Map(bots.map(bot => [bot.id, bot])), [bots]);
+  const conversationsById = useMemo(() => new Map(conversations.map(c => [c.id, c])), [conversations]);
+  const pinSet = useMemo(() => new Set(pins), [pins]);
+  const globalPinSet = useMemo(() => new Set(globalPins), [globalPins]);
+  const parent = conversationsById.get(selected)?.parentId;
   const effectiveFiltered = filtered || unreadOnly;
-  const unreadMatch = unreadOnly ? filterUnreadHostItems(conversations, activity, globalPins, retainedConversationId) : undefined;
-  const retainedIds = unreadMatch ? (selection?.selected ? new Set([...selection.selected, ...unreadMatch.matchingIds]) : unreadMatch.matchingIds) : selection?.selected;
+  const unreadMatch = useMemo(
+    () => unreadOnly ? filterUnreadHostItems(conversations, activity, globalPins, retainedConversationId) : undefined,
+    [unreadOnly, conversations, activity, globalPins, retainedConversationId, showTickets],
+  );
+  const retainedIds = useMemo(
+    () => unreadMatch ? (selection?.selected ? new Set([...selection.selected, ...unreadMatch.matchingIds]) : unreadMatch.matchingIds) : selection?.selected,
+    [unreadMatch, selection?.selected],
+  );
   // A selected topic may remain in a manually folded group. Mode changes and
   // mounted hidden sidebars must not overwrite the owner's disclosure choice.
-  const listed = navigationItems({ connection, bots, conversations: unreadMatch ? unreadMatch.conversations : conversations }, showDisconnectedBots, retainedIds);
+  const listed = useMemo(
+    () => navigationItems({ connection, bots, conversations: unreadMatch ? unreadMatch.conversations : conversations }, showDisconnectedBots, retainedIds),
+    [connection, bots, conversations, unreadMatch, showDisconnectedBots, retainedIds, showTickets, state.status, state.navigationGraceUntil, state.readOnly, state.closed],
+  );
   const hiddenBots = listed.bots.length < bots.length;
-  const listedIds = new Set(listed.conversations.map(chat => chat.id));
+  const listedIds = useMemo(() => new Set(listed.conversations.map(chat => chat.id)), [listed.conversations]);
   const hiddenConversations = listedConversations(conversations).some(chat => !chat.archived && !chat.parentId && !listedIds.has(chat.id));
-  const available = listed.conversations.filter((c) => !c.archived && (!c.parentId || !conversations.find((p) => p.id === c.parentId)?.archived));
-  const updated = new Map(available.map((c) => [c.id, activity[c.id]?.at ?? c.createdAt]));
-  for (const c of available) if (c.parentId) updated.set(c.parentId, Math.max(updated.get(c.parentId) ?? 0, updated.get(c.id) ?? 0));
-  const active = available.sort((a, b) => (updated.get(b.id) ?? 0) - (updated.get(a.id) ?? 0));
-  const ordinary = active.filter(c => !globalPins.includes(c.id)).sort((a, b) => Number(pins.includes(b.id)) - Number(pins.includes(a.id)));
+  const { active, ordinary, childrenByParent, directByBot } = useMemo(() => {
+    const available = listed.conversations.filter((c) => !c.archived && (!c.parentId || !conversationsById.get(c.parentId)?.archived));
+    const updated = new Map(available.map((c) => [c.id, activity[c.id]?.at ?? c.createdAt]));
+    for (const c of available) if (c.parentId) updated.set(c.parentId, Math.max(updated.get(c.parentId) ?? 0, updated.get(c.id) ?? 0));
+    const active = available.sort((a, b) => (updated.get(b.id) ?? 0) - (updated.get(a.id) ?? 0));
+    const ordinary = active.filter(c => !globalPinSet.has(c.id)).sort((a, b) => Number(pinSet.has(b.id)) - Number(pinSet.has(a.id)));
+    const childrenByParent = new Map<string, Conversation[]>();
+    const directByBot = new Map<string, Conversation[]>();
+    for (const c of ordinary) {
+      if (c.parentId) {
+        let groupChildren = childrenByParent.get(c.parentId);
+        if (!groupChildren) childrenByParent.set(c.parentId, groupChildren = []);
+        groupChildren.push(c);
+      }
+      if (c.type === "direct" && c.botIds[0]) {
+        let botChats = directByBot.get(c.botIds[0]);
+        if (!botChats) directByBot.set(c.botIds[0], botChats = []);
+        botChats.push(c);
+      }
+    }
+    return { active, ordinary, childrenByParent, directByBot };
+  }, [listed.conversations, conversationsById, activity, globalPinSet, pinSet]);
   // Nested rows sit on their parent's guide line: the Bot or group avatar above
   // already identifies them, so chats show text only and topics a "#".
   const row = (c: Conversation, nested = false, inbox?: InboxRow) => {
-    const current = selected === c.id || c.id === parent && !globalPins.includes(selected) && (!!inbox || !effectiveFiltered && topicFolds.collapsed.has(c.id));
-    const bot = bots.find((b) => b.id === c.botIds[0]);
-    const online = state.status === "online" && bots.some((b) => c.botIds.includes(b.id) && b.online);
-    const children = ordinary.filter((child) => child.parentId === c.id && (!unreadMatch || unreadMatch.matchingIds.has(child.id)));
+    const current = selected === c.id || c.id === parent && !globalPinSet.has(selected) && (!!inbox || !effectiveFiltered && topicFolds.collapsed.has(c.id));
+    const bot = c.botIds[0] ? botsById.get(c.botIds[0]) : undefined;
+    const online = state.status === "online" && c.botIds.some((id) => !!botsById.get(id)?.online);
+    const groupChildren = childrenByParent.get(c.id) ?? [];
+    const children = unreadMatch ? groupChildren.filter((child) => unreadMatch.matchingIds.has(child.id)) : groupChildren;
     const unread = inbox?.unread ?? (Object.keys(activity[c.id]?.unread ?? {}).length + (!effectiveFiltered && topicFolds.collapsed.has(c.id) ? children.reduce((sum, child) => sum + Object.keys(activity[child.id]?.unread ?? {}).length, 0) : 0));
-    const parentName = c.parentId && (pins.includes(c.id) || globalPins.includes(c.id)) ? conversations.find((p) => p.id === c.parentId)?.title : undefined;
+    const parentName = c.parentId && (pinSet.has(c.id) || globalPinSet.has(c.id)) ? conversationsById.get(c.parentId)?.title : undefined;
     // Nested rows show a preview only when there is one: the parent row already
     // carries the Bot's model/engine, so children do not repeat it (or "独立话题").
     const draftPreview = listDraftPreview(c, conversations, drafts, !!inbox || !effectiveFiltered && !!topicFolds.collapsed.has(c.id));
@@ -160,7 +199,7 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
       : Object.values(activity[c.id]?.attention ?? {}).sort((a, b) => a.at - b.at)[0];
     const rowDispatchers = c.botIds.filter(id => isDispatcher(bots.find(b => b.id === id)));
     const rowTicketConversations = c.type === "group" && !c.parentId ? [c.id, ...children.map(child => child.id)] : [c.id];
-    const content = <button role={bulk?.active ? "checkbox" : undefined} aria-checked={bulk?.active ? bulk.checked(connection, c) : undefined} title={bulk?.active ? bulk.reason(connection, c) : undefined} disabled={bulk?.active ? !!bulk.reason(connection, c) : selection && !selection.ready} aria-label={bulk?.active ? t("选择对话：{0}", c.title) : selection ? [t("在面板中查看 {0}", c.title), attention ? attention.kind === "question" ? t("待回答") : t("待批准") : "", unread ? t("{0} 条新消息", unread) : ""].filter(Boolean).join(" · ") : undefined} ref={node => { if (node) rows.current.set(c.id, node); else rows.current.delete(c.id); }} data-conversation-id={c.id} className={`conversation-row ${unread > 0 ? "has-unread" : ""} ${bulk?.active ? "conversation-bulk-row" : ""} ${selection && !bulk?.active ? "adhd-picker-target" : ""} ${c.parentId ? "topic-row" : ""} ${!bulk?.active && current ? "selected" : ""}`} key={c.id} aria-current={!bulk?.active && current ? "page" : undefined} aria-haspopup={bulk?.active ? undefined : "menu"} aria-expanded={bulk?.active ? undefined : menu?.conversation.id === c.id} aria-controls={menu?.conversation.id === c.id ? `${prefix}_actions` : undefined} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); openConversationMenu(c, event.currentTarget, event.clientX || event.clientY ? { x: event.clientX, y: event.clientY } : undefined); }} onKeyDown={event => { if (!bulk?.active && event.key === "F2" && canEdit(c)) { event.preventDefault(); setBotMenu(undefined); setActionError(""); trigger.current = event.currentTarget; setRenaming(c); } else if (event.key === "ContextMenu" || event.key === "F10" && event.shiftKey) { event.preventDefault(); openConversationMenu(c, event.currentTarget); } }} onClick={() => { setMenu(undefined); setBotMenu(undefined); if (bulk?.active) bulk.toggle(connection, c); else select(c.id); }}>{bulk?.active && <ConversationBulkCheck checked={bulk.checked(connection, c)}/>} {nested ? c.parentId && <span className="row-glyph" aria-hidden="true"><Hash size={14}/></span> : <AgentAvatar signal={inbox?.agent ?? agentSignal([activity[c.id], ...children.map(child => activity[child.id])])} size={inbox ? 36 : 40} className={`avatar ${c.parentId ? "topic" : c.type}`} dispatcher={!c.parentId && c.type === "direct" && isDispatcher(bot)} tickets={rowDispatchers.length ? { connection, botIds: rowDispatchers, conversationIds: rowTicketConversations } : undefined}>{layout === "conversations" ? <ConversationAvatar conversation={c} size={inbox ? 36 : 40}/> : <Avatar kind={c.type === "group" ? "group" : "bot"} id={c.parentId ?? (c.type === "group" ? c.id : c.botIds[0] ?? c.id)} name={c.type === "group" ? conversations.find((p) => p.id === c.parentId)?.title ?? c.title : labels.get(c.botIds[0]!) ?? c.title} size={inbox ? 36 : 40} fallback={c.parentId ? <Hash size={15}/> : c.type === "direct" && !c.botIds.length ? <MessageSquare size={15}/> : undefined}/>}<i className={online ? "online" : ""}/></AgentAvatar>}<span className="row-text">{inbox ? <span className="inbox-row-title"><strong title={c.title}>{c.title}</strong>{c.type === "direct" && bot && <span className="inbox-row-bot" title={selection ? labels.get(bot.id) ?? bot.name : undefined}><BotName id={bot.id} name={labels.get(bot.id) ?? bot.name} bot={bot} compact/></span>}{(inbox.pinned || inbox.globallyPinned) && <Pin size={11} aria-label={inbox.globallyPinned ? t("已全局置顶") : t("已分组置顶")}/>}</span> : <strong>{c.title}{(globalPins.includes(c.id) || pins.includes(c.id)) && <Pin className="conversation-pin-mark" size={11} aria-label={globalPins.includes(c.id) ? t("已全局置顶") : t("已分组置顶")}/>}</strong>}{inbox && sourceHost ? <span className="inbox-row-detail">{preview}{sourceHost}</span> : preview}</span>{selection && attention && <span className="adhd-picker-attention" title={attention.kind === "question" ? t("待回答") : t("待批准")}>{attention.kind === "question" ? t("待回答") : t("待批准")}</span>}{inbox ? <span className="inbox-row-meta"><time dateTime={inbox.activityAt ? new Date(inbox.activityAt).toISOString() : undefined}>{formatRowTime(inbox.activityAt, locale)}</time>{unread > 0 && <b className={`unread-badge ${selection ? "adhd-picker-unread" : ""}`} role="img" aria-label={t("{0} 条新消息", unread)} title={t("{0} 条新消息", unread)}>{unread}</b>}</span> : <span className="row-source-meta">{!nested && sourceHost}{unread > 0 && <b className={`unread-badge ${selection ? "adhd-picker-unread" : ""}`} role="img" aria-label={t("{0} 条新消息", unread)} title={t("{0} 条新消息", unread)}>{unread}</b>}</span>}</button>;
+    const content = <button role={bulk?.active ? "checkbox" : undefined} aria-checked={bulk?.active ? bulk.checked(connection, c) : undefined} title={bulk?.active ? bulk.reason(connection, c) : undefined} disabled={bulk?.active ? !!bulk.reason(connection, c) : selection && !selection.ready} aria-label={bulk?.active ? t("选择对话：{0}", c.title) : selection ? [t("在面板中查看 {0}", c.title), attention ? attention.kind === "question" ? t("待回答") : t("待批准") : "", unread ? t("{0} 条新消息", unread) : ""].filter(Boolean).join(" · ") : undefined} ref={node => { if (node) rows.current.set(c.id, node); else rows.current.delete(c.id); }} data-conversation-id={c.id} className={`conversation-row ${unread > 0 ? "has-unread" : ""} ${bulk?.active ? "conversation-bulk-row" : ""} ${selection && !bulk?.active ? "adhd-picker-target" : ""} ${c.parentId ? "topic-row" : ""} ${!bulk?.active && current ? "selected" : ""}`} key={c.id} aria-current={!bulk?.active && current ? "page" : undefined} aria-haspopup={bulk?.active ? undefined : "menu"} aria-expanded={bulk?.active ? undefined : menu?.conversation.id === c.id} aria-controls={menu?.conversation.id === c.id ? `${prefix}_actions` : undefined} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); openConversationMenu(c, event.currentTarget, event.clientX || event.clientY ? { x: event.clientX, y: event.clientY } : undefined); }} onKeyDown={event => { if (!bulk?.active && event.key === "F2" && canEdit(c)) { event.preventDefault(); setBotMenu(undefined); setActionError(""); trigger.current = event.currentTarget; setRenaming(c); } else if (event.key === "ContextMenu" || event.key === "F10" && event.shiftKey) { event.preventDefault(); openConversationMenu(c, event.currentTarget); } }} onClick={() => { setMenu(undefined); setBotMenu(undefined); if (bulk?.active) bulk.toggle(connection, c); else select(c.id); }}>{bulk?.active && <ConversationBulkCheck checked={bulk.checked(connection, c)}/>} {nested ? c.parentId && <span className="row-glyph" aria-hidden="true"><Hash size={14}/></span> : <AgentAvatar signal={inbox?.agent ?? agentSignal([activity[c.id], ...children.map(child => activity[child.id])])} size={inbox ? 36 : 40} className={`avatar ${c.parentId ? "topic" : c.type}`} dispatcher={!c.parentId && c.type === "direct" && isDispatcher(bot)} tickets={rowDispatchers.length ? { connection, botIds: rowDispatchers, conversationIds: rowTicketConversations } : undefined}>{layout === "conversations" ? <ConversationAvatar conversation={c} size={inbox ? 36 : 40}/> : <Avatar kind={c.type === "group" ? "group" : "bot"} id={c.parentId ?? (c.type === "group" ? c.id : c.botIds[0] ?? c.id)} name={c.type === "group" ? (c.parentId ? conversationsById.get(c.parentId)?.title : undefined) ?? c.title : labels.get(c.botIds[0]!) ?? c.title} size={inbox ? 36 : 40} fallback={c.parentId ? <Hash size={15}/> : c.type === "direct" && !c.botIds.length ? <MessageSquare size={15}/> : undefined}/>}<i className={online ? "online" : ""}/></AgentAvatar>}<span className="row-text">{inbox ? <span className="inbox-row-title"><strong title={c.title}>{c.title}</strong>{c.type === "direct" && bot && <span className="inbox-row-bot" title={selection ? labels.get(bot.id) ?? bot.name : undefined}><BotName id={bot.id} name={labels.get(bot.id) ?? bot.name} bot={bot} compact/></span>}{(inbox.pinned || inbox.globallyPinned) && <Pin size={11} aria-label={inbox.globallyPinned ? t("已全局置顶") : t("已分组置顶")}/>}</span> : <strong>{c.title}{(globalPinSet.has(c.id) || pinSet.has(c.id)) && <Pin className="conversation-pin-mark" size={11} aria-label={globalPinSet.has(c.id) ? t("已全局置顶") : t("已分组置顶")}/>}</strong>}{inbox && sourceHost ? <span className="inbox-row-detail">{preview}{sourceHost}</span> : preview}</span>{selection && attention && <span className="adhd-picker-attention" title={attention.kind === "question" ? t("待回答") : t("待批准")}>{attention.kind === "question" ? t("待回答") : t("待批准")}</span>}{inbox ? <span className="inbox-row-meta"><time dateTime={inbox.activityAt ? new Date(inbox.activityAt).toISOString() : undefined}>{formatRowTime(inbox.activityAt, locale)}</time>{unread > 0 && <b className={`unread-badge ${selection ? "adhd-picker-unread" : ""}`} role="img" aria-label={t("{0} 条新消息", unread)} title={t("{0} 条新消息", unread)}>{unread}</b>}</span> : <span className="row-source-meta">{!nested && sourceHost}{unread > 0 && <b className={`unread-badge ${selection ? "adhd-picker-unread" : ""}`} role="img" aria-label={t("{0} 条新消息", unread)} title={t("{0} 条新消息", unread)}>{unread}</b>}</span>}</button>;
     if (!selection || bulk?.active) return content;
     const checked = selection.selected.has(c.id);
     return <div key={c.id} className={`adhd-picker-row ${checked ? "is-added" : ""} ${selected === c.id ? "is-focused" : ""}`}>
@@ -168,7 +207,8 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
     </div>;
   };
   const groupRow = (c: Conversation) => {
-    const topics = ordinary.filter((topic) => topic.parentId === c.id && (!unreadMatch || unreadMatch.matchingIds.has(topic.id)));
+    const groupTopics = childrenByParent.get(c.id) ?? [];
+    const topics = unreadMatch ? groupTopics.filter((topic) => unreadMatch.matchingIds.has(topic.id)) : groupTopics;
     const topicsFolded = !effectiveFiltered && topicFolds.collapsed.has(c.id);
     return <div className="group-tree" key={c.id}><div className="group-tree-heading" onContextMenu={event => { event.preventDefault(); event.stopPropagation(); openConversationMenu(c, rows.current.get(c.id) ?? event.currentTarget, { x: event.clientX, y: event.clientY }); }}>{row(c)}<button className="group-toggle" disabled={effectiveFiltered} onKeyDown={event => { if (event.key === "ContextMenu" || event.key === "F10" && event.shiftKey) { event.preventDefault(); event.stopPropagation(); openConversationMenu(c, event.currentTarget); } }} aria-expanded={!topicsFolded} aria-controls={`${prefix}_topics_${c.id}`} aria-label={topicsFolded ? t("展开「{0}」的话题", c.title) : t("收起「{0}」的话题", c.title)} onClick={() => topicFolds.set(c.id, !topicsFolded)}>{topicsFolded ? <ChevronRight size={16}/> : <ChevronDown size={16}/>}</button></div><div id={`${prefix}_topics_${c.id}`} className="group-tree-topics">{!topicsFolded && topics.map((topic) => row(topic, true))}</div></div>;
   };
@@ -176,20 +216,25 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
     const c = item.conversation;
     // The ADHD inbox has no separate pinned-topic section. Keep every topic
     // reachable here, including topics pinned in the ordinary Bot tree.
-    const children = selection && isGroup(c) ? ordinary.filter(child => child.parentId === c.id) : [];
+    const children = selection && isGroup(c) ? childrenByParent.get(c.id) ?? [] : [];
     if (!children.length) return row(c, false, item);
     const expanded = effectiveFiltered || !!selection?.topics.expanded(c.id);
     return <div className="adhd-group-topics" key={c.id}>{row(c, false, item)}<button className="adhd-topic-toggle" disabled={effectiveFiltered} aria-expanded={expanded} aria-controls={`${prefix}_topics_${c.id}`} onClick={() => selection?.topics.setExpanded(c.id, !expanded)}>{expanded ? <ChevronDown size={12} aria-hidden="true"/> : <ChevronRight size={12} aria-hidden="true"/>}<span>{t("{0} 个话题", children.length)}</span></button><div id={`${prefix}_topics_${c.id}`} hidden={!expanded}>{children.map(child => row(child, true))}</div></div>;
   };
-  const botIds = buildBotRows([{ id: "local", ...listed, activity }]).map(bot => bot.id).filter(id => !unreadMatch || unreadMatch.botIds.has(id));
+  const botIds = useMemo(() => buildBotRows([{ id: "local", ...listed, activity }]).map(bot => bot.id).filter(id => !unreadMatch || unreadMatch.botIds.has(id)), [listed, activity, showTickets, unreadMatch]);
   // Cached or historical conversations may have no remaining Bot member. Keep
   // them readable without inventing an undefined Bot or enabling its actions.
   const unassigned = ordinary.filter((c) => c.type === "direct" && !c.botIds.length && (!unreadMatch || unreadMatch.matchingIds.has(c.id)));
   const groups = ordinary.filter((c) => c.type === "group" && !c.parentId && (!unreadMatch || unreadMatch.groupIds.has(c.id)));
-  const inbox = layout === "conversations" && (!slice || slice.kind === "folders" || slice.kind === "folder") ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }]).filter(item => !unreadMatch || unreadMatch.matchingIds.has(item.conversation.id) || unreadMatch.groupIds.has(item.conversation.id)) : undefined;
+  const inbox = useMemo(
+    () => layout === "conversations" && (!slice || slice.kind === "folders" || slice.kind === "folder")
+      ? buildConversationRows([{ id: "local", name: hostName ?? "", connection, conversations: listed.conversations, bots, pins, globalPins, activity }]).filter(item => !unreadMatch || unreadMatch.matchingIds.has(item.conversation.id) || unreadMatch.groupIds.has(item.conversation.id))
+      : undefined,
+    [layout, slice, hostName, connection, listed.conversations, bots, pins, globalPins, activity, unreadMatch, showTickets, state.status, state.navigationGraceUntil, state.readOnly, state.closed],
+  );
   const botRow = (id: string) => {
-      const bot = bots.find((b) => b.id === id), name = labels.get(id) ?? bot?.name ?? id;
-      const chats = ordinary.filter((c) => c.type === "direct" && c.botIds[0] === id);
+      const bot = botsById.get(id), name = labels.get(id) ?? bot?.name ?? id;
+      const chats = directByBot.get(id) ?? [];
       const current = chats.find((c) => c.id === selected) ?? chats[0];
       const children = chats;
       const folded = !effectiveFiltered && children.length > 0 && botFolds.collapsed.has(id);
@@ -267,4 +312,4 @@ export function ConversationList({ connection, hostId, hostName, slice, showHost
     {visible && renaming && <RuntimeHostContext.Provider value={hostName}><RenameConversation key={renaming.id} connection={connection} conversation={renaming} returnFocus={trigger} close={() => setRenaming(undefined)}/></RuntimeHostContext.Provider>}
     </>, document.body)}
   </Container>;
-}
+});
