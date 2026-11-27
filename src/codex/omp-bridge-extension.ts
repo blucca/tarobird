@@ -24,9 +24,13 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 type Json = Record<string, unknown>;
 type CallFailure = "closed" | "error" | "aborted" | "timeout" | "too-large";
 type CallResult = { ok: true; result: unknown } | { ok: false; reason: CallFailure };
+type SourceInfo = { path?: unknown; source?: unknown };
+/** builtin: implemented by omp itself under its canonical builtin:<name> path; other: anything else. */
+export type OmpBridgeToolOrigin = "builtin" | "other";
 
 interface OmpExtensionApi {
   on(event: string, handler: (event: any, ctx: any) => unknown): unknown;
+  getAllTools?(): Array<{ name?: unknown; description?: unknown; sourceInfo?: SourceInfo }>;
 }
 
 interface Bridge {
@@ -191,6 +195,29 @@ function acquireBridge(): Bridge | undefined {
   return (store[key] = openBridge(endpoint, token));
 }
 
+/**
+ * Determine who implements the tool that would run under `toolName`, matching Pi's
+ * fail-closed provenance check. A name alone proves nothing: an extension may
+ * register its own `read` or `grep` override, and MCP tools carry `builtin:mcp`.
+ * Only a unique registry entry with `sourceInfo.source === "builtin"` and exact
+ * `sourceInfo.path === "builtin:<toolName>"` counts as `"builtin"`.
+ */
+function toolOrigin(pi: OmpExtensionApi | undefined, toolName: string): OmpBridgeToolOrigin {
+  let info: SourceInfo | undefined;
+  try {
+    const entries = (pi?.getAllTools?.() ?? []).filter(tool => isRecord(tool) && tool.name === toolName);
+    if (entries.length !== 1) return "other";
+    info = entries[0]!.sourceInfo;
+  } catch {
+    return "other";
+  }
+  if (!isRecord(info) || typeof info.path !== "string" || typeof info.source !== "string") return "other";
+  if (info.source === "builtin") {
+    return info.path === `builtin:${toolName}` ? "builtin" : "other";
+  }
+  return "other";
+}
+
 export default async function tarobirdOmpBridge(pi: OmpExtensionApi): Promise<void> {
   const bridge = acquireBridge();
   if (!bridge) return;
@@ -200,9 +227,10 @@ export default async function tarobirdOmpBridge(pi: OmpExtensionApi): Promise<vo
     const toolName = String(event?.toolName ?? "");
     if (!bridge.gate) return undefined;
     if (bridge.hostTools.has(toolName)) return undefined;
+    const origin = toolOrigin(pi, toolName);
     const reply = await bridge.call(
       "approve",
-      { toolName, toolCallId: String(event?.toolCallId ?? ""), ...boundedInput(event?.input) },
+      { toolName, toolCallId: String(event?.toolCallId ?? ""), origin, ...boundedInput(event?.input) },
       { signal: ctx?.signal },
     );
     if (reply.ok && isRecord(reply.result) && reply.result.allow === true) return undefined;

@@ -8,8 +8,11 @@ export function hubEngineQuotas(options: {
   connection: (botId: string) => { key: object; supported: boolean; ready: boolean } | undefined;
   call: (botId: string, request: { scopeId: string; refresh: boolean; expectedRevision?: string }) => Promise<unknown>;
   validate: () => Promise<void>;
+  /** Opt-in flag for clients that accept `"omp"` in `quotaEngineSchema`; 1.6.0 clients validate a closed 6-engine enum. */
+  includeOmp?: boolean;
 }) {
-  const list = async () => (await options.bots()).filter(bot => !bot.deletedAt && bot.role !== "worker" && quotaEngineSchema.safeParse(bot.engine).success);
+  const allowedEngine = (engine: string) => (engine !== "omp" || options.includeOmp === true) && quotaEngineSchema.safeParse(engine).success;
+  const list = async () => (await options.bots()).filter(bot => !bot.deletedAt && bot.role !== "worker" && allowedEngine(bot.engine));
   const origins = new WeakMap<QuotaScope, object>();
   const fallback = (bot: Bot, reason: "offline" | "host_upgrade_required" | "timeout" | "invalid_response"): QuotaScope => {
     const engine = quotaEngineSchema.parse(bot.engine);

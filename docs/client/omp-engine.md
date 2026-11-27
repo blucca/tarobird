@@ -36,8 +36,9 @@ Every capability `omp` natively exposes is wired to TaroBird's shared `CodexAdap
 | Usage & cost accounting | Aligned | `message_end.message.usage` → `AdapterUsage` (`inputTokens`, `outputTokens`, `cachedTokens`, `costUsd`) + `withFailedTurnUsage` |
 | Context usage & compaction | Aligned | `getContextUsage` (passive cached read + active `get_session_stats`) + `manual_compaction_*` / `auto_compaction_*` |
 | Retry visibility & slash commands | Aligned | `auto_retry_start` / `auto_retry_end` → `engine_retry`; `get_available_commands` / `available_commands_update` → `advertisedCommands()` |
-| Interactive dialogs (`rpc-ui`) | Aligned | `confirm`, `ask`, `select` → TaroBird approval / `AskUserQuestion` cards; unsupported `form` explicitly cancelled so `ask` never hangs |
-| Account quota | Not natively exposed by `omp` | Reports `state: "unsupported"`, `reason: "not_adapted"` cleanly on Model Quotas page |
+| Interactive dialogs (`rpc-ui`) | Aligned | `confirm`, `ask`, `select`, `input`, `editor`, `form`, `cancel` → TaroBird approval / `AskUserQuestion` cards |
+| Tool approval bridge (`normal` mode) | Aligned | Fail-closed local socket extension (`omp-bridge-extension`); read-only auto-approval requires verified built-in `sourceInfo` (`origin: "builtin"`), never name-only matching |
+| Account quota | Not natively exposed by `omp` | Reports `state: "unsupported"`, `reason: "not_adapted"` on Model Quotas page; `/api/engine-quotas` gates `omp` behind `includeOmp=1` for v1.6.0 client compatibility |
 
 ## Protocol Excerpts & Negotiation Contract
 

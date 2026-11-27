@@ -1599,8 +1599,9 @@ export class HubServer {
       if (quotaRoute && req.method === "GET") {
         await requireOwner();
         const url = new URL(req.url ?? "/", "http://hub"), refresh = url.searchParams.get("refresh") === "1", revision = url.searchParams.get("revision") ?? undefined;
+        const includeOmp = url.searchParams.get("includeOmp") === "1";
         if (revision && (revision.length > 128 || !/^[a-zA-Z0-9_.:-]+$/.test(revision)) || refresh && !quotaRoute[1]) throw new HubError("quota_request_invalid", 400);
-        const quotas = hubEngineQuotas({ bots: () => this.store.bots(userId), validate,
+        const quotas = hubEngineQuotas({ bots: () => this.store.bots(userId), validate, includeOmp,
           connection: id => { const connection = this.bots.get(id); return connection ? { key: connection, supported: connection.engineQuota, ready: connection.ready } : undefined; },
           call: (id, request) => this.callBot(id, "quota.get", request, request.refresh ? ENGINE_QUOTA_HUB_REFRESH_MS : 2_500),
         });

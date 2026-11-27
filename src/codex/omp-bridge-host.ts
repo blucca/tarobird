@@ -7,14 +7,15 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { NativeAppPipe } from "./native-app-pipe.js";
 import {
-  OMP_BRIDGE_ENDPOINT_ENV, OMP_BRIDGE_PROTOCOL, OMP_BRIDGE_TOKEN_ENV,
+  OMP_BRIDGE_ENDPOINT_ENV, OMP_BRIDGE_PROTOCOL, OMP_BRIDGE_TOKEN_ENV, type OmpBridgeToolOrigin,
 } from "./omp-bridge-extension.js";
 
-export { OMP_BRIDGE_ENDPOINT_ENV, OMP_BRIDGE_TOKEN_ENV } from "./omp-bridge-extension.js";
+export { OMP_BRIDGE_ENDPOINT_ENV, OMP_BRIDGE_TOKEN_ENV, type OmpBridgeToolOrigin } from "./omp-bridge-extension.js";
 
 export interface OmpBridgeApproveRequest {
   toolName: string;
   toolCallId: string;
+  origin: OmpBridgeToolOrigin;
   input: unknown;
   inputTruncated?: boolean;
 }
@@ -55,9 +56,12 @@ const helloSchema = z.object({
   payload: z.object({ token: z.string().min(1).max(256), protocol: z.literal(OMP_BRIDGE_PROTOCOL) }).strict(),
 }).strict();
 
+const originSchema = z.enum(["builtin", "other"]);
+
 const approveSchema = z.object({
   toolName: z.string().max(256),
   toolCallId: z.string().max(512),
+  origin: originSchema,
   input: z.unknown(),
   inputTruncated: z.literal(true).optional(),
 }).strict();

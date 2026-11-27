@@ -243,7 +243,7 @@ test("quota discovery keeps not-loaded, unsupported, offline and partial directo
   try {
     f.records.coder!.snapshot = unavailableQuota("codex", "not_loaded");
     f.records.reviewer!.snapshot = unavailableQuota("codex", "offline");
-    await page.route("**/api/engine-quotas", async route => {
+    await page.route(/\/api\/engine-quotas(?:\?|$)/, async route => {
       const response = await route.fetch(); await route.fulfill({ response, json: { ...await response.json(), truncated: true } });
     });
     await f.open(); const panel = page.locator(".engine-quota:visible"), coder = panel.getByRole("region", { name: "Coding Bot · Codex", exact: true });

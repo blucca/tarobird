@@ -165,8 +165,24 @@ function abortError(message = "omp turn was aborted"): Error {
   return err;
 }
 
+function destroyedError(): Error {
+  return new Error("omp adapter is destroyed");
+}
+
 function throwIfAborted(signal: AbortSignal | undefined, message?: string): void {
   if (signal?.aborted) throw abortError(message);
+}
+
+/** Resolve with `work`, or reject with AbortError as soon as `signal` aborts. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return work;
+  work.catch(() => {});
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const quit = () => reject(abortError());
+    signal.addEventListener("abort", quit, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener("abort", quit));
+  });
 }
 
 function minutesLabel(ms: number): string {
@@ -434,6 +450,9 @@ export class OmpRpcAdapter implements CodexAdapter {
   private readonly sweepTimer: ReturnType<typeof setInterval> | undefined;
   private cachedCommands: Array<{ name: string; description: string; aliases?: string[] }> = [];
   private destroyed = false;
+  /** Aborted by `destroy()`: any in-flight worker startup stops waiting and tears down immediately. */
+  private readonly retiring = new AbortController();
+  private destroying?: Promise<void>;
 
   constructor(private readonly options: OmpRpcAdapterOptions) {
     this.store = new OmpSessionStore({ stateDir: options.stateDir, childEnv: options.childEnv });
@@ -494,10 +513,45 @@ export class OmpRpcAdapter implements CodexAdapter {
     );
   }
 
+  private async closeWorker(worker: OmpWorker, closeError?: Error): Promise<void> {
+    if (worker.closed && !worker.client.alive) {
+      worker.endpoint?.dispose();
+      return;
+    }
+    worker.closed = true;
+    if (this.workers.get(worker.sessionKey) === worker) this.workers.delete(worker.sessionKey);
+    for (const [, ac] of worker.hostToolCalls) ac.abort();
+    worker.hostToolCalls.clear();
+    for (const [, ac] of worker.pendingUi) ac.abort();
+    worker.pendingUi.clear();
+    if (worker.activeTurn && !worker.activeTurn.settled) {
+      const turn = worker.activeTurn;
+      this.settlePendingSteers(turn, "dropped", "engine_exit");
+      this.clearTurnTimers(turn);
+      turn.abortScope.abort();
+      turn.settled = true;
+      worker.activeTurn = undefined;
+      turn.reject(withFailedTurnUsage(closeError ?? new Error("omp worker closed before turn settled"), this.turnUsage(turn)));
+    }
+    if (worker.goalWatcher && !worker.goalWatcher.settled) {
+      const watcher = worker.goalWatcher;
+      watcher.settled = true;
+      worker.goalWatcher = undefined;
+      watcher.reject(closeError ?? new Error("omp worker closed while watching goal"));
+    }
+    for (const [id, waiter] of worker.activeBtw) {
+      worker.activeBtw.delete(id);
+      waiter.reject(closeError ?? new Error("omp worker closed during side question"));
+    }
+    worker.bufferedBtwDeltas.clear();
+    worker.endpoint?.dispose();
+    await worker.client.close().catch(() => { worker.client.terminate(); });
+  }
+
   private async sweepIdleWorkers(): Promise<void> {
     if (this.destroyed || this.idleWorkerTtlMs <= 0) return;
     const now = Date.now();
-    for (const [key, worker] of this.workers) {
+    for (const [, worker] of [...this.workers]) {
       if (worker.closed) continue;
       if (worker.activeTurn || worker.goalWatcher || worker.activeBtw.size > 0 || worker.pendingUi.size > 0) continue;
       let runningSub = false;
@@ -506,10 +560,7 @@ export class OmpRpcAdapter implements CodexAdapter {
       }
       if (runningSub) continue;
       if (now - worker.lastUsedAt < this.idleWorkerTtlMs) continue;
-      this.workers.delete(key);
-      worker.closed = true;
-      worker.endpoint?.dispose();
-      await worker.client.close().catch(() => undefined);
+      await this.closeWorker(worker);
     }
   }
 
@@ -522,52 +573,94 @@ export class OmpRpcAdapter implements CodexAdapter {
     const existing = this.workers.get(sessionId);
     if (existing && !existing.closed && existing.client.alive) return existing;
     const persisted = await this.store.resolvePersistedSessionFile(sessionId);
-    if (!persisted) return undefined;
+    if (this.destroyed || !persisted) return undefined;
     return this.getOrStartWorker(sessionId, workspaceOverride, signal);
   }
 
   private async getOrStartWorker(sessionKey: string, workspaceOverride?: string, signal?: AbortSignal): Promise<OmpWorker> {
-    if (this.destroyed) throw new Error("omp adapter is destroyed");
+    if (this.destroyed) throw destroyedError();
     throwIfAborted(signal);
     const existing = this.workers.get(sessionKey);
     if (existing && !existing.closed && existing.client.alive) return existing;
+    const waitSignal = signal ? AbortSignal.any([signal, this.retiring.signal]) : this.retiring.signal;
     const inflight = this.starting.get(sessionKey);
-    if (inflight) return inflight;
+    if (inflight) {
+      let worker: OmpWorker;
+      try {
+        worker = await untilAborted(inflight, waitSignal);
+      } catch (error) {
+        if (this.destroyed) throw destroyedError();
+        if (signal?.aborted) throw abortError();
+        throw error;
+      }
+      if (this.destroyed || worker.closed) throw destroyedError();
+      throwIfAborted(signal);
+      return worker;
+    }
 
     const work = (async (): Promise<OmpWorker> => {
-      const cwd = workspaceOverride || this.options.workspacePath;
-      const sessionDir = this.store.sessionDirFor(sessionKey);
-      await mkdir(sessionDir, { recursive: true });
-
+      const startSignal = waitSignal;
       let workerRef: OmpWorker | undefined;
       let endpoint: OmpBridgeEndpoint | undefined;
-      const extraArgs: string[] = [];
-      let env: NodeJS.ProcessEnv = { ...this.options.childEnv };
+      let client: OmpRpcClient | undefined;
+      let registered = false;
 
-      if (this.bridgeExtensionPath !== null || this.options.openBridgeFn) {
-        const openBridge = this.options.openBridgeFn ?? openOmpBridgeEndpoint;
-        try {
-          endpoint = await openBridge({
-            stateDir: this.options.stateDir,
-            initial: { gate: true },
-            handler: {
-              approve: async (req, reqSignal) => {
-                if (!workerRef) return { allow: false, reason: "The omp session is still starting." };
-                return this.requestToolApproval(workerRef, req, reqSignal);
-              },
-            },
-          });
-          env = { ...env, ...endpoint.env };
-          if (this.bridgeExtensionPath) extraArgs.push("--extension", this.bridgeExtensionPath);
-        } catch {
-          // If bridge socket cannot open, worker starts without bridge; normal mode will fail closed in applyGate.
-          endpoint?.dispose();
-          endpoint = undefined;
+      const assertRunning = () => {
+        if (this.destroyed) throw destroyedError();
+        throwIfAborted(signal);
+      };
+
+      const discard = async () => {
+        if (workerRef) workerRef.closed = true;
+        endpoint?.dispose();
+        endpoint = undefined;
+        if (client) {
+          const toClose = client;
+          client = undefined;
+          await toClose.close().catch(() => { toClose.terminate(); });
         }
-      }
+      };
 
-      let client: OmpRpcClient;
       try {
+        assertRunning();
+        const cwd = workspaceOverride || this.options.workspacePath;
+        const sessionDir = this.store.sessionDirFor(sessionKey);
+        await untilAborted(mkdir(sessionDir, { recursive: true }), startSignal);
+        assertRunning();
+
+        const extraArgs: string[] = [];
+        let env: NodeJS.ProcessEnv = { ...this.options.childEnv };
+
+        if (this.bridgeExtensionPath !== null || this.options.openBridgeFn) {
+          const openBridge = this.options.openBridgeFn ?? openOmpBridgeEndpoint;
+          let bridgeAbandoned = false;
+          try {
+            const bridgePromise = openBridge({
+              stateDir: this.options.stateDir,
+              initial: { gate: true },
+              handler: {
+                approve: async (req, reqSignal) => {
+                  if (!workerRef) return { allow: false, reason: "The omp session is still starting." };
+                  return this.requestToolApproval(workerRef, req, reqSignal);
+                },
+              },
+            });
+            // If openBridge resolves after startSignal aborted or failed, dispose immediately so no socket leaks.
+            void bridgePromise.then(ep => { if (bridgeAbandoned) ep.dispose(); }, () => {});
+            const openedEndpoint = await untilAborted(bridgePromise, startSignal);
+            endpoint = openedEndpoint;
+            env = { ...env, ...endpoint.env };
+            if (this.bridgeExtensionPath) extraArgs.push("--extension", this.bridgeExtensionPath);
+          } catch (bridgeError) {
+            bridgeAbandoned = true;
+            endpoint?.dispose();
+            endpoint = undefined;
+            if (this.destroyed || signal?.aborted) throw bridgeError;
+            // If bridge socket cannot open, worker starts without bridge; normal mode will fail closed in applyGate.
+          }
+        }
+        assertRunning();
+
         client = await OmpRpcClient.start({
           launch: this.options.launch,
           cwd,
@@ -575,127 +668,156 @@ export class OmpRpcAdapter implements CodexAdapter {
           mode: "rpc-ui",
           ...(extraArgs.length ? { args: extraArgs } : {}),
           startupTimeoutMs: this.options.startupTimeoutMs,
-          signal,
+          signal: startSignal,
           ...(this.options.spawnFn ? { spawnFn: this.options.spawnFn } : {}),
           ...(this.options.killProcessTreeFn ? { killProcessTreeFn: this.options.killProcessTreeFn } : {}),
         });
+        assertRunning();
+
+        const initialState = await untilAborted(client.getState(), startSignal);
+        assertRunning();
+
+        const worker: OmpWorker = {
+          sessionKey,
+          sessionDir,
+          cwd,
+          client,
+          ...(endpoint ? { endpoint } : {}),
+          state: initialState,
+          appliedModelOverride: false,
+          appliedEffortOverride: false,
+          queue: { steering: [], followUp: [] },
+          subagents: new Map(),
+          activeBtw: new Map(),
+          bufferedBtwDeltas: new Map(),
+          completedBtw: new Map(),
+          hostToolCalls: new Map(),
+          pendingUi: new Map(),
+          lastUsedAt: Date.now(),
+          closed: false,
+        };
+        workerRef = worker;
+        if (endpoint) {
+          worker.bridgePromise = endpoint.connection.then(conn => {
+            worker.bridge = conn;
+            return conn;
+          });
+          worker.bridgePromise.catch(() => {});
+        }
+
+        // Subscribe to native OMP subagents and enable structured ask dialogs.
+        await untilAborted(client.setSubagentSubscription("events").catch(() => undefined), startSignal);
+        assertRunning();
+        await untilAborted(client.setAskDialog(true).catch(() => undefined), startSignal);
+        assertRunning();
+
+        // Bind persistent session file (if forked/resumed/persisted) or conversation directory.
+        const boundPath = await untilAborted(this.store.resolvePersistedSessionFile(sessionKey), startSignal);
+        assertRunning();
+        if (boundPath) {
+          const switched = await untilAborted(client.switchSession(boundPath).then(() => true, () => false), startSignal);
+          assertRunning();
+          if (!switched) {
+            const opened = await untilAborted(client.openSession(sessionDir).catch(() => undefined), startSignal);
+            assertRunning();
+            if (opened?.sessionFile) {
+              await untilAborted(this.store.setRecord(sessionKey, { sessionFile: opened.sessionFile, cwd }).catch(() => undefined), startSignal);
+              assertRunning();
+            }
+          }
+        } else {
+          const opened = await untilAborted(client.openSession(sessionDir).catch(() => undefined), startSignal);
+          assertRunning();
+          if (opened?.sessionFile) {
+            await untilAborted(this.store.setRecord(sessionKey, { sessionFile: opened.sessionFile, cwd }).catch(() => undefined), startSignal);
+            assertRunning();
+          }
+        }
+
+        worker.state = await untilAborted(client.getState().catch(() => worker.state), startSignal);
+        assertRunning();
+        if (worker.state.sessionFile) {
+          await untilAborted(this.store.setRecord(sessionKey, { sessionFile: worker.state.sessionFile, cwd }).catch(() => undefined), startSignal);
+          assertRunning();
+        }
+        if (!client.alive) {
+          throw new Error("omp process exited during startup");
+        }
+        if (worker.state.model?.provider && worker.state.model?.id) {
+          worker.initialModel = { provider: worker.state.model.provider, modelId: worker.state.model.id };
+        }
+        if (typeof worker.state.thinkingLevel === "string" && worker.state.thinkingLevel) {
+          worker.initialThinkingLevel = worker.state.thinkingLevel;
+        }
+        if (worker.state.goal !== undefined) {
+          worker.lastGoal = unwrapOmpGoal(worker.state.goal).record;
+        }
+
+        client.onEvent((event) => this.handleEvent(worker, event));
+        client.onPromptResult((frame) => this.handlePromptResult(worker, frame));
+        client.onSessionSettled(() => this.handleSessionSettled(worker));
+        client.onQueueUpdate((frame) => {
+          worker.queue = { steering: [...(frame.steering ?? [])], followUp: [...(frame.followUp ?? [])] };
+          if (worker.activeTurn) this.noteActivity(worker, worker.activeTurn);
+        });
+        client.onSubagentLifecycle((frame) => this.handleSubagentLifecycle(worker, frame));
+        client.onSubagentProgress((frame) => this.handleSubagentProgress(worker, frame));
+        client.onSubagentEvent((frame) => this.handleSubagentEvent(worker, frame));
+        client.onBtwRecord((frame) => this.handleBtwRecord(worker, frame.record));
+        client.onBtwDelta((frame) => this.handleBtwDelta(worker, frame.recordId, frame.delta));
+        client.onExtensionUi((request) => { void this.handleExtensionUi(worker, request); });
+        client.onCommandsUpdate((frame) => this.updateAdvertisedCommands(frame.commands));
+        client.onHostToolCall((frame) => { void this.handleHostToolCall(worker, frame); });
+        client.onHostToolCancel((frame) => this.handleHostToolCancel(worker, frame));
+        client.onGoalUpdated((frame) => this.handleGoalUpdated(worker, frame));
+
+        void client.exited.then((exit) => {
+          worker.closed = true;
+          worker.endpoint?.dispose();
+          if (this.workers.get(sessionKey) === worker) this.workers.delete(sessionKey);
+          for (const [, ac] of worker.hostToolCalls) ac.abort();
+          worker.hostToolCalls.clear();
+          for (const [, ac] of worker.pendingUi) ac.abort();
+          worker.pendingUi.clear();
+          if (worker.activeTurn && !worker.activeTurn.settled) {
+            const turn = worker.activeTurn;
+            this.settlePendingSteers(turn, "dropped", "engine_exit");
+            this.clearTurnTimers(turn);
+            turn.abortScope.abort();
+            turn.settled = true;
+            worker.activeTurn = undefined;
+            const err = exit.fatalError ?? new Error("omp process exited unexpectedly before turn settled");
+            turn.reject(withFailedTurnUsage(err, this.turnUsage(turn)));
+          }
+          if (worker.goalWatcher && !worker.goalWatcher.settled) {
+            const watcher = worker.goalWatcher;
+            watcher.settled = true;
+            worker.goalWatcher = undefined;
+            watcher.reject(exit.fatalError ?? new Error("omp process exited while watching goal"));
+          }
+          for (const [id, waiter] of worker.activeBtw) {
+            worker.activeBtw.delete(id);
+            waiter.reject(exit.fatalError ?? new Error("omp process exited during side question"));
+          }
+          worker.bufferedBtwDeltas.clear();
+        });
+
+        // Final synchronous check right before registering so destroy() can never race past registration.
+        assertRunning();
+        this.workers.set(sessionKey, worker);
+        registered = true;
+        void client.getAvailableCommands().then(res => {
+          if (!this.destroyed && !worker.closed) this.updateAdvertisedCommands(res.commands);
+        }).catch(() => undefined);
+        return worker;
       } catch (error) {
-        endpoint?.dispose();
+        if (!registered) {
+          await discard();
+        }
+        if (this.destroyed) throw destroyedError();
+        if (signal?.aborted) throw abortError();
         throw error;
       }
-
-      const initialState = await client.getState();
-      const worker: OmpWorker = {
-        sessionKey,
-        sessionDir,
-        cwd,
-        client,
-        ...(endpoint ? { endpoint } : {}),
-        state: initialState,
-        appliedModelOverride: false,
-        appliedEffortOverride: false,
-        queue: { steering: [], followUp: [] },
-        subagents: new Map(),
-        activeBtw: new Map(),
-        bufferedBtwDeltas: new Map(),
-        completedBtw: new Map(),
-        hostToolCalls: new Map(),
-        pendingUi: new Map(),
-        lastUsedAt: Date.now(),
-        closed: false,
-      };
-      workerRef = worker;
-      if (endpoint) {
-        worker.bridgePromise = endpoint.connection.then(conn => {
-          worker.bridge = conn;
-          return conn;
-        });
-        worker.bridgePromise.catch(() => {});
-      }
-
-      // Subscribe to native OMP subagents and enable structured ask dialogs.
-      await client.setSubagentSubscription("events").catch(() => undefined);
-      await client.setAskDialog(true).catch(() => undefined);
-      void client.getAvailableCommands().then(res => this.updateAdvertisedCommands(res.commands)).catch(() => undefined);
-
-      // Bind persistent session file (if forked/resumed/persisted) or conversation directory.
-      const boundPath = await this.store.resolvePersistedSessionFile(sessionKey);
-      if (boundPath) {
-        const switched = await client.switchSession(boundPath).then(() => true, () => false);
-        if (!switched) {
-          const opened = await client.openSession(sessionDir).catch(() => undefined);
-          if (opened?.sessionFile) await this.store.setRecord(sessionKey, { sessionFile: opened.sessionFile, cwd }).catch(() => undefined);
-        }
-      } else {
-        const opened = await client.openSession(sessionDir).catch(() => undefined);
-        if (opened?.sessionFile) await this.store.setRecord(sessionKey, { sessionFile: opened.sessionFile, cwd }).catch(() => undefined);
-      }
-
-      worker.state = await client.getState().catch(() => worker.state);
-      if (worker.state.sessionFile) {
-        await this.store.setRecord(sessionKey, { sessionFile: worker.state.sessionFile, cwd }).catch(() => undefined);
-      }
-      if (worker.state.model?.provider && worker.state.model?.id) {
-        worker.initialModel = { provider: worker.state.model.provider, modelId: worker.state.model.id };
-      }
-      if (typeof worker.state.thinkingLevel === "string" && worker.state.thinkingLevel) {
-        worker.initialThinkingLevel = worker.state.thinkingLevel;
-      }
-      if (worker.state.goal !== undefined) {
-        worker.lastGoal = unwrapOmpGoal(worker.state.goal).record;
-      }
-
-      client.onEvent((event) => this.handleEvent(worker, event));
-      client.onPromptResult((frame) => this.handlePromptResult(worker, frame));
-      client.onSessionSettled(() => this.handleSessionSettled(worker));
-      client.onQueueUpdate((frame) => {
-        worker.queue = { steering: [...(frame.steering ?? [])], followUp: [...(frame.followUp ?? [])] };
-        if (worker.activeTurn) this.noteActivity(worker, worker.activeTurn);
-      });
-      client.onSubagentLifecycle((frame) => this.handleSubagentLifecycle(worker, frame));
-      client.onSubagentProgress((frame) => this.handleSubagentProgress(worker, frame));
-      client.onSubagentEvent((frame) => this.handleSubagentEvent(worker, frame));
-      client.onBtwRecord((frame) => this.handleBtwRecord(worker, frame.record));
-      client.onBtwDelta((frame) => this.handleBtwDelta(worker, frame.recordId, frame.delta));
-      client.onExtensionUi((request) => { void this.handleExtensionUi(worker, request); });
-      client.onCommandsUpdate((frame) => this.updateAdvertisedCommands(frame.commands));
-      client.onHostToolCall((frame) => { void this.handleHostToolCall(worker, frame); });
-      client.onHostToolCancel((frame) => this.handleHostToolCancel(worker, frame));
-      client.onGoalUpdated((frame) => this.handleGoalUpdated(worker, frame));
-
-      void client.exited.then((exit) => {
-        worker.closed = true;
-        worker.endpoint?.dispose();
-        if (this.workers.get(sessionKey) === worker) this.workers.delete(sessionKey);
-        for (const [, ac] of worker.hostToolCalls) ac.abort();
-        worker.hostToolCalls.clear();
-        for (const [, ac] of worker.pendingUi) ac.abort();
-        worker.pendingUi.clear();
-        if (worker.activeTurn && !worker.activeTurn.settled) {
-          const turn = worker.activeTurn;
-          this.settlePendingSteers(turn, "dropped", "engine_exit");
-          this.clearTurnTimers(turn);
-          turn.abortScope.abort();
-          turn.settled = true;
-          worker.activeTurn = undefined;
-          const err = exit.fatalError ?? new Error("omp process exited unexpectedly before turn settled");
-          turn.reject(withFailedTurnUsage(err, this.turnUsage(turn)));
-        }
-        if (worker.goalWatcher && !worker.goalWatcher.settled) {
-          const watcher = worker.goalWatcher;
-          watcher.settled = true;
-          worker.goalWatcher = undefined;
-          watcher.reject(exit.fatalError ?? new Error("omp process exited while watching goal"));
-        }
-        for (const [id, waiter] of worker.activeBtw) {
-          worker.activeBtw.delete(id);
-          waiter.reject(exit.fatalError ?? new Error("omp process exited during side question"));
-        }
-        worker.bufferedBtwDeltas.clear();
-      });
-
-      this.workers.set(sessionKey, worker);
-      return worker;
     })();
 
     this.starting.set(sessionKey, work);
@@ -730,11 +852,23 @@ export class OmpRpcAdapter implements CodexAdapter {
 
   private async applyGate(worker: OmpWorker, gate: boolean, hostToolNames: string[]): Promise<void> {
     if (gate && !worker.bridge?.isOpen && worker.bridgePromise) {
-      await Promise.race([
-        worker.bridgePromise.catch(() => undefined),
-        new Promise<void>(resolve => { const t = setTimeout(resolve, 2_000); t.unref?.(); }),
-      ]);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await untilAborted(
+          Promise.race([
+            worker.bridgePromise.catch(() => undefined),
+            new Promise<void>(resolve => { timer = setTimeout(resolve, 2_000); timer.unref?.(); }),
+          ]),
+          this.retiring.signal,
+        );
+      } catch (error) {
+        if (this.destroyed || worker.closed) throw destroyedError();
+        throw error;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     }
+    if (this.destroyed || worker.closed) throw destroyedError();
     if (gate && !worker.bridge?.isOpen) {
       throw new Error(
         "omp tool approval is unavailable for this session (the TaroBird approval bridge did not connect), so the turn was not started. Start a new conversation or restart the Bot to connect it again. Native access (bypass) also starts the turn, but then omp runs tools without asking.",
@@ -745,6 +879,7 @@ export class OmpRpcAdapter implements CodexAdapter {
     if (worker.bridge?.isOpen) {
       await worker.bridge.setPolicy(gate, hostToolNames);
     }
+    if (this.destroyed || worker.closed) throw destroyedError();
     worker.gate = gate;
     worker.bridgeHostToolsKey = hostKey;
   }
@@ -755,10 +890,15 @@ export class OmpRpcAdapter implements CodexAdapter {
     signal: AbortSignal,
   ): Promise<{ allow: boolean; reason?: string }> {
     const name = req.toolName;
-    if (AUTO_ALLOWED_TOOLS.has(name)) return { allow: true };
+    const origin = req.origin ?? "other";
+    // A name alone proves nothing: an extension may register its own `read` or `grep`.
+    // Only verified built-in tools pass auto-approval unasked (matching Pi adapter).
+    if (origin === "builtin" && AUTO_ALLOWED_TOOLS.has(name)) return { allow: true };
     if (worker.activeAppTools?.definitions.some(def => def.name === name)) return { allow: true };
     const grants = this.grants.get(worker.sessionKey);
-    if (grants?.has(name)) return { allow: true };
+    // A session grant covers the tool origin it was granted for, not a look-alike from another source.
+    const grantKey = `${origin}:${name}`;
+    if (grants?.has(grantKey)) return { allow: true };
 
     const turn = worker.activeTurn && !worker.activeTurn.settled ? worker.activeTurn : undefined;
     const ask = turn?.input.onApprovalRequest ?? (worker.goalWatcher && !worker.goalWatcher.settled ? worker.goalWatcher.onApprovalRequest : undefined);
@@ -797,7 +937,7 @@ export class OmpRpcAdapter implements CodexAdapter {
     if (decision.scope === "session") {
       const set = grants ?? new Set<string>();
       this.grants.set(worker.sessionKey, set);
-      set.add(name);
+      set.add(grantKey);
       while (set.size > SESSION_GRANT_LIMIT) set.delete(set.values().next().value!);
     }
     return { allow: true };
@@ -1003,22 +1143,27 @@ export class OmpRpcAdapter implements CodexAdapter {
   }
 
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
-    if (this.destroyed) throw new Error("omp adapter is destroyed");
+    if (this.destroyed) throw destroyedError();
     throwIfAborted(input.abortSignal);
     const runtime = await this.loadRuntimeConfig(input.engineOverride);
+    if (this.destroyed) throw destroyedError();
     throwIfAborted(input.abortSignal);
 
     const worker = await this.getOrStartWorker(sessionId, input.workspaceOverride, input.abortSignal);
+    if (this.destroyed || worker.closed) throw destroyedError();
     throwIfAborted(input.abortSignal);
     if (worker.activeTurn) {
       throw new Error("omp session already has an in-flight turn");
     }
 
     await this.syncConfigToWorker(worker, runtime);
+    if (this.destroyed || worker.closed) throw destroyedError();
     throwIfAborted(input.abortSignal);
     const { registered: hostToolsRegistered, toolNames } = await this.syncHostTools(worker, sessionId, input.appPlatformTools);
+    if (this.destroyed || worker.closed) throw destroyedError();
     throwIfAborted(input.abortSignal);
     await this.applyGate(worker, runtime.gate, toolNames);
+    if (this.destroyed || worker.closed) throw destroyedError();
     throwIfAborted(input.abortSignal);
 
     // Check authorized owner-typed slash commands (never from Bot messages, cron, or turns with files).
@@ -1031,6 +1176,7 @@ export class OmpRpcAdapter implements CodexAdapter {
 
     const modelAcceptsImages = Boolean(worker.state.model?.input?.includes("image"));
     const { images, extraFiles, skippedImages } = await prepareAttachments(input.files ?? [], modelAcceptsImages);
+    if (this.destroyed || worker.closed) throw destroyedError();
     throwIfAborted(input.abortSignal);
 
     if (skippedImages.length > 0 && input.onEngineEvent) {
@@ -1039,6 +1185,7 @@ export class OmpRpcAdapter implements CodexAdapter {
         await input.onEngineEvent({ type: "assistant_text", text: `[omp] ${notice}`, sessionId });
       }
     }
+    if (this.destroyed || worker.closed) throw destroyedError();
 
     let promptText: string;
     if (isAuthorizedOmpSlash) {
@@ -1060,6 +1207,7 @@ export class OmpRpcAdapter implements CodexAdapter {
       }
     }
 
+    if (this.destroyed || worker.closed) throw destroyedError();
     throwIfAborted(input.abortSignal);
     if (worker.activeTurn) {
       throw new Error("omp session already has an in-flight turn");
@@ -1414,35 +1562,95 @@ export class OmpRpcAdapter implements CodexAdapter {
       if (input.signal?.aborted) return rejected("cancelled");
 
       const originalSessionFile = stateBefore.sessionFile;
-      const forkResult = await worker.client.fork(forkEntryId);
-      if (forkResult.cancelled) return rejected("cancelled", "omp cancelled the fork");
+      let forkCompleted = false;
+      let forkedSessionFile: string | undefined;
+      let candidateSessionId: string | undefined;
+      try {
+        const forkResult = await worker.client.fork(forkEntryId);
+        if (forkResult.cancelled) return rejected("cancelled", "omp cancelled the fork");
+        forkCompleted = true;
 
-      const forkedState = await worker.client.getState();
-      const forkedEntries = await worker.client.getEntries();
-      const newSessionId = `omp_${randomUUID()}`;
+        const forkedState = await worker.client.getState();
+        const forkedEntries = await worker.client.getEntries();
+        const newSessionId = `omp_${randomUUID()}`;
+        candidateSessionId = newSessionId;
+        forkedSessionFile = forkedState.sessionFile;
 
-      // Restore the source worker to its original session file BEFORE relocating the fork file!
-      if (originalSessionFile && originalSessionFile !== forkedState.sessionFile) {
-        await worker.client.switchSession(originalSessionFile).catch(() => undefined);
-        worker.state = await worker.client.getState().catch(() => stateBefore);
-        await this.store.setRecord(sessionId, { sessionFile: originalSessionFile, cwd: worker.cwd }).catch(() => undefined);
+        // Restore the source worker to its original session file BEFORE relocating the fork file!
+        const needsSwitchBack = Boolean(
+          originalSessionFile
+          && forkedSessionFile
+          && path.resolve(originalSessionFile) !== path.resolve(forkedSessionFile),
+        );
+        if (needsSwitchBack && originalSessionFile) {
+          let restoreError: string | undefined;
+          try {
+            const switched = await worker.client.switchSession(originalSessionFile);
+            if (switched.cancelled) {
+              restoreError = "omp cancelled switching back to the source session after fork";
+            } else {
+              const restoredState = await worker.client.getState();
+              if (restoredState.sessionFile && path.resolve(restoredState.sessionFile) !== path.resolve(originalSessionFile)) {
+                restoreError = "omp remained on the forked session instead of restoring the source session";
+              } else {
+                worker.state = restoredState;
+              }
+            }
+          } catch (error) {
+            restoreError = `Failed to restore source omp session after fork: ${error instanceof Error ? error.message : String(error)}`;
+          }
+          if (restoreError) {
+            // Never leave the source worker attached to the forked session file:
+            // pin the source record, evict/close the worker, and relocate the fork file out of the source dir.
+            await this.store.setRecord(sessionId, { sessionFile: originalSessionFile, cwd: worker.cwd }).catch(() => undefined);
+            await this.closeWorker(worker);
+            if (forkedSessionFile) {
+              const relocated = await this.store.relocateForkedFile(forkedSessionFile, worker.sessionDir, newSessionId).catch(() => forkedSessionFile!);
+              await this.store.setRecord(newSessionId, { sessionFile: relocated, cwd: worker.cwd }).catch(() => undefined);
+            }
+            return {
+              outcome: "unknown",
+              detail: restoreError,
+              candidateSessionId: newSessionId,
+            };
+          }
+          await this.store.setRecord(sessionId, { sessionFile: originalSessionFile, cwd: worker.cwd }).catch(() => undefined);
+        }
+
+        if (forkedSessionFile) {
+          const relocated = await this.store.relocateForkedFile(forkedSessionFile, worker.sessionDir, newSessionId);
+          await this.store.setRecord(newSessionId, { sessionFile: relocated, cwd: worker.cwd }).catch(() => undefined);
+        }
+        worker.lastUsedAt = Date.now();
+
+        return {
+          outcome: "applied",
+          sessionId: newSessionId,
+          head: forkedEntries.leafId,
+          boundary,
+        };
+      } catch (error) {
+        if (forkCompleted) {
+          if (originalSessionFile) {
+            await this.store.setRecord(sessionId, { sessionFile: originalSessionFile, cwd: worker.cwd }).catch(() => undefined);
+          }
+          await this.closeWorker(worker);
+          if (forkedSessionFile && candidateSessionId) {
+            const relocated = await this.store.relocateForkedFile(forkedSessionFile, worker.sessionDir, candidateSessionId).catch(() => forkedSessionFile!);
+            await this.store.setRecord(candidateSessionId, { sessionFile: relocated, cwd: worker.cwd }).catch(() => undefined);
+          }
+          return {
+            outcome: "unknown",
+            detail: error instanceof Error ? error.message : String(error),
+            ...(candidateSessionId ? { candidateSessionId } : {}),
+          };
+        }
+        throw error;
       }
-
-      if (forkedState.sessionFile) {
-        const relocated = await this.store.relocateForkedFile(forkedState.sessionFile, worker.sessionDir, newSessionId);
-        await this.store.setRecord(newSessionId, { sessionFile: relocated, cwd: worker.cwd }).catch(() => undefined);
-      }
-      worker.lastUsedAt = Date.now();
-
-      return {
-        outcome: "applied",
-        sessionId: newSessionId,
-        head: forkedEntries.leafId,
-        boundary,
-      };
     } catch (error) {
       const code = (error as { code?: string })?.code;
       if (code === "session_busy") return rejected("busy");
+      if (code === "entry_not_found") return rejected("anchor_unavailable");
       return rejected("not_ready", error instanceof Error ? error.message : String(error));
     }
   }
@@ -1567,12 +1775,17 @@ export class OmpRpcAdapter implements CodexAdapter {
     onApprovalRequest?: CodexUserMessageInput["onApprovalRequest"];
     abortSignal?: AbortSignal;
   }): Promise<CodexThreadGoalResponse> {
+    if (this.destroyed) throw destroyedError();
     throwIfAborted(input.abortSignal, "Goal watch aborted");
     const worker = await this.getOrStartWorker(sessionId, input.workspaceOverride, input.abortSignal);
+    if (this.destroyed || worker.closed) throw destroyedError();
     throwIfAborted(input.abortSignal, "Goal watch aborted");
     const runtime = await this.loadRuntimeConfig();
+    if (this.destroyed || worker.closed) throw destroyedError();
     await this.syncConfigToWorker(worker, runtime);
+    if (this.destroyed || worker.closed) throw destroyedError();
     await this.applyGate(worker, runtime.gate, []);
+    if (this.destroyed || worker.closed) throw destroyedError();
     throwIfAborted(input.abortSignal, "Goal watch aborted");
 
     if (input.mode === "replace" || input.mode === undefined) {
@@ -2498,15 +2711,25 @@ export class OmpRpcAdapter implements CodexAdapter {
     }
   }
 
-  async destroy(): Promise<void> {
+  destroy(): Promise<void> {
+    if (this.destroying) return this.destroying;
     this.destroyed = true;
+    this.retiring.abort(destroyedError());
     if (this.sweepTimer) clearInterval(this.sweepTimer);
-    const workers = [...this.workers.values()];
-    this.workers.clear();
-    for (const w of workers) {
-      w.closed = true;
-      w.endpoint?.dispose();
-    }
-    await Promise.all(workers.map(w => w.client.close().catch(() => undefined)));
+    this.destroying = (async () => {
+      const closeRegistered = async () => {
+        const workers = [...this.workers.values()];
+        this.workers.clear();
+        await Promise.all(workers.map(w => this.closeWorker(w, destroyedError())));
+      };
+      // Close live workers and wait for all in-flight startups to abort and clean up
+      // so no spawned omp process or bridge socket outlives destroy().
+      await Promise.all([
+        closeRegistered(),
+        Promise.allSettled([...this.starting.values()]),
+      ]);
+      await closeRegistered();
+    })();
+    return this.destroying;
   }
 }

@@ -88,3 +88,33 @@ it("uses the same authenticated HTTP quota contract from the headless CLI", asyn
   expect(read.mock.calls.filter(args => args[0].refresh)).toHaveLength(1);
   expect(await hub.store.db.get("SELECT COUNT(*) AS count FROM messages")).toEqual({ count: 0 });
 });
+
+it("excludes omp Bots from /api/engine-quotas unless includeOmp=1 is requested (1.6.0 client compatibility)", async () => {
+  const ompSecret = randomBytes(32).toString("base64url");
+  await hub.store.db.run("INSERT INTO bots(id,name,secret_hash,engine) VALUES('omp_bot','OMP Bot',?,'omp')", [hashSecret(ompSecret)]);
+
+  // 1.6.0 client requests /api/engine-quotas without includeOmp=1 and parses with a closed 6-engine enum.
+  const legacyDirRes = await request("/api/engine-quotas");
+  expect(legacyDirRes.status).toBe(200);
+  const legacyDir = quotaDirectorySchema.parse(await legacyDirRes.json());
+  expect(legacyDir.scopes.map(s => s.id)).toEqual(["quota_bot"]);
+  expect(legacyDir.scopes.every(s => s.engine !== "omp")).toBe(true);
+  expect((await request("/api/engine-quotas/omp_bot")).status).toBe(404);
+
+  // New client & Host CLI pass includeOmp=1 and see omp Bots cleanly.
+  const modernDirRes = await request("/api/engine-quotas?includeOmp=1");
+  expect(modernDirRes.status).toBe(200);
+  const modernDir = quotaDirectorySchema.parse(await modernDirRes.json());
+  expect(modernDir.scopes.map(s => [s.id, s.engine]).sort()).toEqual([["omp_bot", "omp"], ["quota_bot", "codex"]]);
+
+  const modernScopeRes = await request("/api/engine-quotas/omp_bot?includeOmp=1");
+  expect(modernScopeRes.status).toBe(200);
+  expect(quotaScopeSchema.parse(await modernScopeRes.json())).toMatchObject({ id: "omp_bot", engine: "omp", state: "offline" });
+
+  // Headless Host CLI passes includeOmp=1 automatically.
+  const cliClient = { ready: { serverCapabilities: [ENGINE_QUOTA_CAPABILITY] }, request: async (route: string) => {
+    const response = await request(route); if (!response.ok) throw new Error(`HTTP ${response.status}`); return response.json();
+  } };
+  const cliDir = quotaDirectorySchema.parse(await engineQuotaCommand(cliClient as any, {}));
+  expect(cliDir.scopes.map(s => s.id).sort()).toEqual(["omp_bot", "quota_bot"]);
+});

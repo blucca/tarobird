@@ -241,12 +241,26 @@ export class OmpRpcClient {
         );
       });
       clearTimeout(timer);
+      if (options.signal?.aborted) {
+        throw new OmpStartupError("omp startup aborted", "exit");
+      }
       client.readyFrame = ready;
       // Strict protocol version check — throws OmpProtocolVersionError on unsupported versions!
       const negotiated = selectOmpProtocolVersion(ready);
       client.decoder.setMaxReassembledBytes(negotiated.maxReassembledFrameBytes);
       if (negotiated.needsNegotiation) {
-        await client.command({ type: "negotiate_protocol", protocolVersion: 2 }, startupTimeoutMs);
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = () => reject(new OmpStartupError("omp startup aborted", "exit"));
+          if (options.signal?.aborted) { onAbort(); return; }
+          options.signal?.addEventListener("abort", onAbort, { once: true });
+          client.command({ type: "negotiate_protocol", protocolVersion: 2 }, startupTimeoutMs).then(
+            () => { options.signal?.removeEventListener("abort", onAbort); resolve(); },
+            (err) => { options.signal?.removeEventListener("abort", onAbort); reject(err); },
+          );
+        });
+      }
+      if (options.signal?.aborted) {
+        throw new OmpStartupError("omp startup aborted", "exit");
       }
       client.protocolVersion = negotiated.targetVersion;
       return client;

@@ -6,11 +6,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EngineSteeringRejectedError, type EngineStreamEvent } from "../src/codex/adapter.js";
 import { OmpRpcAdapter } from "../src/codex/omp-rpc-adapter.js";
-import activateExtension from "../src/codex/omp-bridge-extension.js";
+import activateExtension, { OMP_BRIDGE_GLOBAL_KEY } from "../src/codex/omp-bridge-extension.js";
 import { openOmpBridgeEndpoint } from "../src/codex/omp-bridge-host.js";
 import { parseOmpFormRequest } from "../src/codex/omp-form.js";
 import { OmpRpcCommandError } from "../src/codex/omp-rpc-client.js";
 import { OmpFrameError, OmpProtocolVersionError } from "../src/codex/omp-rpc-protocol.js";
+import { OmpSessionStore } from "../src/codex/omp-session-store.js";
 import { resolveOmpExecutable } from "../src/runtime/omp-executable.js";
 import type { SteeringApplication } from "../src/client-protocol/steering-outcome.js";
 
@@ -96,6 +97,10 @@ function defaultState() {
 describe("Issue #83: oh-my-pi (omp) RPC engine integration", () => {
   const dirs: string[] = [];
   afterEach(async () => {
+    const store = globalThis as unknown as Record<symbol, { socket?: { destroy?: () => void } } | undefined>;
+    const key = Symbol.for(OMP_BRIDGE_GLOBAL_KEY);
+    store[key]?.socket?.destroy?.();
+    delete store[key];
     while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
   });
 
@@ -209,7 +214,7 @@ describe("Issue #83: oh-my-pi (omp) RPC engine integration", () => {
       abortSignal: controller.signal,
       onEngineEvent: () => undefined,
     });
-    await new Promise(r => setTimeout(r, 30));
+    await vi.waitFor(() => expect(activePromptId).toBeDefined());
     controller.abort("user_stop");
     await expect(turnPromise).rejects.toThrow(/aborted|stopped/i);
     expect(abortedCmd).toBe(true);
@@ -274,7 +279,7 @@ describe("Issue #83: oh-my-pi (omp) RPC engine integration", () => {
       files: [],
       onEngineEvent: () => undefined,
     });
-    await new Promise(r => setTimeout(r, 30));
+    await vi.waitFor(() => expect(activePromptId).toBeDefined());
 
     await adapter.steerSession("conv-q", "Change focus");
     await adapter.followUpSession("conv-q", "Also add tests");
@@ -293,6 +298,8 @@ describe("Issue #83: oh-my-pi (omp) RPC engine integration", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "omp-subagent-"));
     dirs.push(dir);
     let cancelledId: string | undefined;
+    let finishSubagent!: () => void;
+    const subagentGate = new Promise<void>(r => { finishSubagent = r; });
     let proc!: FakeOmpProcess;
     const adapter = new OmpRpcAdapter({
       launch: { command: "omp", args: [] },
@@ -319,12 +326,12 @@ describe("Issue #83: oh-my-pi (omp) RPC engine integration", () => {
             p.send({ type: "agent_start" });
             p.send({ type: "subagent_lifecycle", payload: { id: "sub-1", index: 0, agent: "explore", description: "Explore codebase", status: "started" } });
             p.send({ type: "subagent_progress", payload: { index: 0, agent: "explore", status: "running", currentTool: "grep", currentToolArgs: "src/" } });
-            setTimeout(() => {
+            void subagentGate.then(() => {
               p.send({ type: "subagent_lifecycle", payload: { id: "sub-1", index: 0, agent: "explore", description: "Explore codebase", status: "completed" } });
               p.send({ type: "message_end", messageId: "m-s", message: { role: "assistant", content: [{ type: "text", text: "Subagent finished." }], stopReason: "stop" } });
               p.send({ type: "prompt_result", id, agentInvoked: true, status: "completed", sessionSettled: true });
               p.send({ type: "session_settled" });
-            }, 40);
+            });
           }
         });
         queueMicrotask(() => proc.send({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2], maxFrameBytes: 1048576, maxReassembledFrameBytes: 67108864 }));
@@ -338,12 +345,15 @@ describe("Issue #83: oh-my-pi (omp) RPC engine integration", () => {
       files: [],
       onEngineEvent: (ev) => { events.push(ev); },
     });
-    await new Promise(r => setTimeout(r, 15));
-    const liveTasks = await adapter.listTasks("conv-sub");
-    expect(liveTasks.tasks.some(t => t.kind === "subagent" && t.label === "Explore codebase" && t.status === "running")).toBe(true);
+    let liveTasks = await adapter.listTasks("conv-sub");
+    await vi.waitFor(async () => {
+      liveTasks = await adapter.listTasks("conv-sub");
+      expect(liveTasks.tasks.some(t => t.kind === "subagent" && t.label === "Explore codebase" && t.status === "running")).toBe(true);
+    });
     const stopResult = await adapter.stopTask("conv-sub", { taskId: liveTasks.tasks[0]!.id });
     expect(stopResult.outcome).toBe("accepted");
     expect(cancelledId).toBe("sub-1");
+    finishSubagent();
 
     await turnPromise;
     expect(events.some(e => e.type === "scoped" && e.scope.kind === "subagent")).toBe(true);
@@ -688,6 +698,10 @@ describe("Issue #83: oh-my-pi (omp) RPC engine integration", () => {
             if (event === "tool_call") extHandler = handler as typeof extHandler;
             if (event === "session_shutdown") closeBridgeExt = handler as () => void;
           },
+          getAllTools: () => [
+            { name: "read", sourceInfo: { path: "builtin:read", source: "builtin" } },
+            { name: "bash", sourceInfo: { path: "builtin:bash", source: "builtin" } },
+          ],
         });
         if (prevEp === undefined) delete process.env.TAROBIRD_OMP_BRIDGE_ENDPOINT; else process.env.TAROBIRD_OMP_BRIDGE_ENDPOINT = prevEp;
         if (prevTok === undefined) delete process.env.TAROBIRD_OMP_BRIDGE_TOKEN; else process.env.TAROBIRD_OMP_BRIDGE_TOKEN = prevTok;
@@ -1152,6 +1166,470 @@ describe("Issue #83: oh-my-pi (omp) RPC engine integration", () => {
       },
     });
     await expect(adapter.sendUserMessage("conv-frame", { text: "boom", files: [] })).rejects.toThrow(OmpFrameError);
+    await adapter.destroy();
+  });
+
+  it("Fable 5 #2: destroy() aborts and awaits in-flight startup (getState, ready, and openBridge) with zero process/socket leak", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-destroy-race-"));
+    dirs.push(dir);
+    const configPath = path.join(dir, "config.json");
+    await writeFile(configPath, JSON.stringify({ engine: "omp", approvalMode: "bypass" }));
+
+    // Case A: destroy() while client.getState() is pending after ready
+    let spawnedProc!: FakeOmpProcess;
+    let promptCalled = false;
+    let bridgeDisposed = false;
+    let resolveGetStateSeen!: () => void;
+    const getStateSeen = new Promise<void>(r => { resolveGetStateSeen = r; });
+
+    const adapterA = new OmpRpcAdapter({
+      launch: { command: "omp", args: [] },
+      workspacePath: dir,
+      stateDir: dir,
+      childEnv: {},
+      configPath,
+      bridgeExtensionPath: "/synthetic/omp-bridge-extension.js",
+      openBridgeFn: async () => ({
+        env: { TAROBIRD_OMP_BRIDGE_ENDPOINT: "/synthetic/s", TAROBIRD_OMP_BRIDGE_TOKEN: "tok" },
+        connection: new Promise(() => {}),
+        dispose: () => { bridgeDisposed = true; },
+      }),
+      spawnFn: () => {
+        spawnedProc = new FakeOmpProcess((cmd, p) => {
+          const id = cmd.id as string | undefined;
+          if (cmd.type === "negotiate_protocol") {
+            p.send({ id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+            return;
+          }
+          if (cmd.type === "get_state") {
+            // Hold get_state open so destroy() races mid-startup!
+            resolveGetStateSeen();
+            return;
+          }
+          if (cmd.type === "prompt") {
+            promptCalled = true;
+          }
+        });
+        queueMicrotask(() => spawnedProc.send({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2], maxFrameBytes: 1048576 }));
+        return spawnedProc as never;
+      },
+    });
+
+    const turnA = adapterA.sendUserMessage("conv-destroy-a", { text: "hello", files: [] });
+    await getStateSeen;
+    await adapterA.destroy();
+    await expect(turnA).rejects.toThrow(/destroyed/i);
+    expect(spawnedProc.killed).toBe(true);
+    expect(bridgeDisposed).toBe(true);
+    expect(promptCalled).toBe(false);
+    expect(adapterA.hasPendingNativeWork()).toBe(false);
+    await expect(adapterA.sendUserMessage("conv-destroy-a", { text: "after destroy", files: [] })).rejects.toThrow(/destroyed/i);
+
+    // Case B: destroy() while OmpRpcClient.start is waiting for ready
+    let procB!: FakeOmpProcess;
+    let disposedB = false;
+    let resolveSpawnedB!: () => void;
+    const spawnedB = new Promise<void>(r => { resolveSpawnedB = r; });
+    const adapterB = new OmpRpcAdapter({
+      launch: { command: "omp", args: [] },
+      workspacePath: dir,
+      stateDir: dir,
+      childEnv: {},
+      configPath,
+      bridgeExtensionPath: "/synthetic/omp-bridge-extension.js",
+      openBridgeFn: async () => ({
+        env: { TAROBIRD_OMP_BRIDGE_ENDPOINT: "/synthetic/s2", TAROBIRD_OMP_BRIDGE_TOKEN: "tok2" },
+        connection: new Promise(() => {}),
+        dispose: () => { disposedB = true; },
+      }),
+      spawnFn: () => {
+        procB = new FakeOmpProcess(() => {});
+        resolveSpawnedB();
+        return procB as never;
+      },
+    });
+    const turnB = adapterB.sendUserMessage("conv-destroy-b", { text: "hello", files: [] });
+    await spawnedB;
+    await adapterB.destroy();
+    await expect(turnB).rejects.toThrow(/destroyed/i);
+    expect(procB.killed).toBe(true);
+    expect(disposedB).toBe(true);
+
+    // Case C: destroy() while openBridgeFn is still pending; late-resolving endpoint is disposed immediately
+    let lateDisposed = false;
+    let spawnCalledC = false;
+    let resolveLateBridge!: (ep: { env: Record<string, string>; connection: Promise<never>; dispose: () => void }) => void;
+    const adapterC = new OmpRpcAdapter({
+      launch: { command: "omp", args: [] },
+      workspacePath: dir,
+      stateDir: dir,
+      childEnv: {},
+      configPath,
+      bridgeExtensionPath: "/synthetic/omp-bridge-extension.js",
+      openBridgeFn: () => new Promise(resolve => { resolveLateBridge = resolve as never; }),
+      spawnFn: () => {
+        spawnCalledC = true;
+        return new FakeOmpProcess(() => {}) as never;
+      },
+    });
+    const turnC = adapterC.sendUserMessage("conv-destroy-c", { text: "hello", files: [] });
+    await vi.waitFor(() => expect(resolveLateBridge).toBeDefined());
+    await adapterC.destroy();
+    await expect(turnC).rejects.toThrow(/destroyed/i);
+    resolveLateBridge({
+      env: {},
+      connection: new Promise(() => {}),
+      dispose: () => { lateDisposed = true; },
+    });
+    await vi.waitFor(() => expect(lateDisposed).toBe(true));
+    expect(spawnCalledC).toBe(false);
+  });
+
+  it("Fable 5 #3: cleans up spawned process and bridge socket when getState() or resolvePersistedSessionFile() fails during startup", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-startup-leak-"));
+    dirs.push(dir);
+    const configPath = path.join(dir, "config.json");
+    await writeFile(configPath, JSON.stringify({ engine: "omp", approvalMode: "bypass" }));
+
+    // Case A: client.getState() rejects immediately after spawn
+    let procA!: FakeOmpProcess;
+    let disposedA = false;
+    const adapterA = new OmpRpcAdapter({
+      launch: { command: "omp", args: [] },
+      workspacePath: dir,
+      stateDir: dir,
+      childEnv: {},
+      configPath,
+      bridgeExtensionPath: "/synthetic/omp-bridge-extension.js",
+      openBridgeFn: async () => ({
+        env: { TAROBIRD_OMP_BRIDGE_ENDPOINT: "/synthetic/s-a", TAROBIRD_OMP_BRIDGE_TOKEN: "tok-a" },
+        connection: new Promise(() => {}),
+        dispose: () => { disposedA = true; },
+      }),
+      spawnFn: () => {
+        procA = new FakeOmpProcess((cmd, p) => {
+          const id = cmd.id as string | undefined;
+          if (cmd.type === "negotiate_protocol") {
+            p.send({ id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+            return;
+          }
+          if (cmd.type === "get_state") {
+            p.send({ id, type: "response", command: "get_state", success: false, error: "get_state exploded", code: "internal_error" });
+          }
+        });
+        queueMicrotask(() => procA.send({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2], maxFrameBytes: 1048576 }));
+        return procA as never;
+      },
+    });
+    await expect(adapterA.sendUserMessage("conv-leak-a", { text: "hi", files: [] })).rejects.toThrow(/get_state exploded/i);
+    expect(procA.killed).toBe(true);
+    expect(disposedA).toBe(true);
+    expect(adapterA.hasPendingNativeWork()).toBe(false);
+    await adapterA.destroy();
+
+    // Case B: store.resolvePersistedSessionFile() rejects right after spawn + getState
+    let procB!: FakeOmpProcess;
+    let disposedB = false;
+    const resolveSpy = vi.spyOn(OmpSessionStore.prototype, "resolvePersistedSessionFile").mockRejectedValueOnce(new Error("corrupt omp state store"));
+    try {
+      const adapterB = new OmpRpcAdapter({
+        launch: { command: "omp", args: [] },
+        workspacePath: dir,
+        stateDir: dir,
+        childEnv: {},
+        configPath,
+        bridgeExtensionPath: "/synthetic/omp-bridge-extension.js",
+        openBridgeFn: async () => ({
+          env: { TAROBIRD_OMP_BRIDGE_ENDPOINT: "/synthetic/s-b", TAROBIRD_OMP_BRIDGE_TOKEN: "tok-b" },
+          connection: new Promise(() => {}),
+          dispose: () => { disposedB = true; },
+        }),
+        spawnFn: () => {
+          procB = new FakeOmpProcess((cmd, p) => {
+            const id = cmd.id as string | undefined;
+            if (cmd.type === "negotiate_protocol" || cmd.type === "set_subagent_subscription" || cmd.type === "set_ask_dialog") {
+              p.send({ id, type: "response", command: cmd.type, success: true, data: {} });
+              return;
+            }
+            if (cmd.type === "get_state") {
+              p.send({ id, type: "response", command: "get_state", success: true, data: defaultState() });
+            }
+          });
+          queueMicrotask(() => procB.send({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2], maxFrameBytes: 1048576 }));
+          return procB as never;
+        },
+      });
+      await expect(adapterB.sendUserMessage("conv-leak-b", { text: "hi", files: [] })).rejects.toThrow(/corrupt omp state store/i);
+      expect(procB.killed).toBe(true);
+      expect(disposedB).toBe(true);
+      expect(adapterB.hasPendingNativeWork()).toBe(false);
+      await adapterB.destroy();
+    } finally {
+      resolveSpy.mockRestore();
+    }
+  });
+
+  it("Fable 5 #5a: requires verified built-in tool provenance for auto-approval and scopes session grants by origin", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-origin-"));
+    dirs.push(dir);
+    const configPath = path.join(dir, "config.json");
+    await writeFile(configPath, JSON.stringify({ engine: "omp", approvalMode: "normal" }));
+
+    let toolRegistry: Array<{ name: string; sourceInfo?: { path?: unknown; source?: unknown } }> = [
+      { name: "read", sourceInfo: { path: "builtin:read", source: "builtin" } },
+      { name: "grep", sourceInfo: { path: "builtin:mcp", source: "builtin" } },
+      { name: "find", sourceInfo: { path: "builtin:find", source: "builtin" } },
+      { name: "find", sourceInfo: { path: "builtin:find", source: "builtin" } }, // duplicate -> fail closed
+      { name: "ls" }, // missing sourceInfo -> fail closed
+      { name: "bash", sourceInfo: { path: "builtin:bash", source: "builtin" } },
+    ];
+    let throwOnGetAllTools = false;
+    let extHandler: ((ev: { toolName: string; input?: unknown }) => Promise<{ block?: boolean; reason?: string } | undefined>) | undefined;
+    const prompted: string[] = [];
+
+    const adapter = new OmpRpcAdapter({
+      launch: { command: "omp", args: [] },
+      workspacePath: dir,
+      stateDir: dir,
+      childEnv: {},
+      configPath,
+      bridgeExtensionPath: "/synthetic/omp-bridge-extension.js",
+      openBridgeFn: async (opts) => {
+        const ep = await openOmpBridgeEndpoint(opts);
+        const prevEp = process.env.TAROBIRD_OMP_BRIDGE_ENDPOINT;
+        const prevTok = process.env.TAROBIRD_OMP_BRIDGE_TOKEN;
+        process.env.TAROBIRD_OMP_BRIDGE_ENDPOINT = ep.env.TAROBIRD_OMP_BRIDGE_ENDPOINT;
+        process.env.TAROBIRD_OMP_BRIDGE_TOKEN = ep.env.TAROBIRD_OMP_BRIDGE_TOKEN;
+        await activateExtension({
+          on: (event: string, handler: (...args: any[]) => unknown) => {
+            if (event === "tool_call") extHandler = handler as typeof extHandler;
+          },
+          getAllTools: () => {
+            if (throwOnGetAllTools) throw new Error("registry unavailable");
+            return toolRegistry;
+          },
+        });
+        if (prevEp === undefined) delete process.env.TAROBIRD_OMP_BRIDGE_ENDPOINT; else process.env.TAROBIRD_OMP_BRIDGE_ENDPOINT = prevEp;
+        if (prevTok === undefined) delete process.env.TAROBIRD_OMP_BRIDGE_TOKEN; else process.env.TAROBIRD_OMP_BRIDGE_TOKEN = prevTok;
+        return ep;
+      },
+      spawnFn: () => {
+        const proc = new FakeOmpProcess((cmd, p) => {
+          const id = cmd.id as string | undefined;
+          if (cmd.type === "negotiate_protocol" || cmd.type === "set_subagent_subscription" || cmd.type === "set_ask_dialog") {
+            p.send({ id, type: "response", command: cmd.type, success: true, data: {} });
+            return;
+          }
+          if (cmd.type === "get_state") { p.send({ id, type: "response", command: "get_state", success: true, data: defaultState() }); return; }
+          if (cmd.type === "open_session") { p.send({ id, type: "response", command: "open_session", success: true, data: { cancelled: false, resumed: false, sessionId: "s-orig" } }); return; }
+          if (cmd.type === "prompt") {
+            p.send({ id, type: "response", command: "prompt", success: true });
+            void (async () => {
+              // 1. Genuine built-in `read` -> auto-allowed (no prompt)
+              const builtinRead = await extHandler!({ toolName: "read", input: { path: "a.txt" } });
+              // 2. MCP tool named `grep` (path: builtin:mcp) -> NOT auto-allowed -> prompts & denied
+              const mcpGrep = await extHandler!({ toolName: "grep", input: { pattern: "x" } });
+              // 3. Duplicate `find` entry -> fail closed -> prompts & denied
+              const dupFind = await extHandler!({ toolName: "find", input: {} });
+              // 4. Missing sourceInfo on `ls` -> fail closed -> prompts & denied
+              const noSourceLs = await extHandler!({ toolName: "ls", input: {} });
+              // 5. Extension overrides `read` -> NOT auto-allowed -> prompts & denied
+              toolRegistry = [
+                { name: "read", sourceInfo: { path: "/srv/ext/override-read.ts", source: "extension" } },
+                { name: "bash", sourceInfo: { path: "builtin:bash", source: "builtin" } },
+              ];
+              const overriddenRead = await extHandler!({ toolName: "read", input: { path: "secret.txt" } });
+              // 6. getAllTools throws -> fail closed -> prompts & denied
+              throwOnGetAllTools = true;
+              const threwRead = await extHandler!({ toolName: "read", input: { path: "x.txt" } });
+              throwOnGetAllTools = false;
+              // 7. Grant session scope to built-in `bash`: second built-in `bash` passes unasked,
+              //    but an extension-overridden `bash` (origin: "other") MUST prompt again!
+              const builtinBash1 = await extHandler!({ toolName: "bash", input: { command: "echo 1" } });
+              const builtinBash2 = await extHandler!({ toolName: "bash", input: { command: "echo 2" } });
+              toolRegistry = [{ name: "bash", sourceInfo: { path: "/srv/ext/override-bash.ts", source: "extension" } }];
+              const overriddenBash = await extHandler!({ toolName: "bash", input: { command: "echo 3" } });
+
+              const summary = JSON.stringify({
+                builtinReadBlocked: !!builtinRead?.block,
+                mcpGrepBlocked: !!mcpGrep?.block,
+                dupFindBlocked: !!dupFind?.block,
+                noSourceLsBlocked: !!noSourceLs?.block,
+                overriddenReadBlocked: !!overriddenRead?.block,
+                threwReadBlocked: !!threwRead?.block,
+                builtinBash1Blocked: !!builtinBash1?.block,
+                builtinBash2Blocked: !!builtinBash2?.block,
+                overriddenBashBlocked: !!overriddenBash?.block,
+              });
+              p.send({ type: "message_end", messageId: "m-o", message: { role: "assistant", content: [{ type: "text", text: summary }], stopReason: "stop" } });
+              p.send({ type: "prompt_result", id, agentInvoked: true, status: "completed", sessionSettled: true });
+              p.send({ type: "session_settled" });
+            })();
+          }
+        });
+        queueMicrotask(() => proc.send({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2], maxFrameBytes: 1048576 }));
+        return proc as never;
+      },
+    });
+
+    const res = await adapter.sendUserMessage("conv-origin", {
+      text: "check origins",
+      files: [],
+      onApprovalRequest: async (req) => {
+        prompted.push(req.toolName);
+        if (req.toolName === "bash" && prompted.filter(n => n === "bash").length === 1) {
+          return { behavior: "allow", scope: "session" };
+        }
+        return { behavior: "deny" };
+      },
+    });
+    expect(JSON.parse(res.text)).toEqual({
+      builtinReadBlocked: false,
+      mcpGrepBlocked: true,
+      dupFindBlocked: true,
+      noSourceLsBlocked: true,
+      overriddenReadBlocked: true,
+      threwReadBlocked: true,
+      builtinBash1Blocked: false,
+      builtinBash2Blocked: false,
+      overriddenBashBlocked: true,
+    });
+    // Genuine built-in read and 2nd built-in bash never prompted; every non-builtin/override did!
+    expect(prompted).toEqual(["grep", "find", "ls", "read", "read", "bash", "bash"]);
+    await adapter.destroy();
+  });
+
+  it("Fable 5 #5b: forkHistory surfaces switch-back failure cleanly and evicts the worker instead of silently corrupting the source session", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "omp-fork-restore-"));
+    dirs.push(dir);
+    const srcDir = path.join(dir, "omp", "sessions", "conv-fork-fail");
+    await mkdir(srcDir, { recursive: true });
+    const srcFile = path.join(srcDir, "main.jsonl");
+    const forkFile = path.join(srcDir, "fork-1.jsonl");
+    await writeFile(srcFile, `${JSON.stringify({ type: "session", id: "src", cwd: dir })}\n`);
+
+    type SwitchMode = "reject" | "cancel" | "mismatch" | "ok";
+    let switchMode: SwitchMode = "reject";
+    let spawnCount = 0;
+    const spawnedProcs: FakeOmpProcess[] = [];
+    const switchedTargets: string[] = [];
+
+    const adapter = new OmpRpcAdapter({
+      launch: { command: "omp", args: [] },
+      workspacePath: dir,
+      stateDir: dir,
+      childEnv: {},
+      spawnFn: () => {
+        spawnCount++;
+        let activeFile = srcFile;
+        const proc = new FakeOmpProcess((cmd, p) => {
+          const id = cmd.id as string | undefined;
+          if (cmd.type === "negotiate_protocol" || cmd.type === "set_subagent_subscription" || cmd.type === "set_ask_dialog") {
+            p.send({ id, type: "response", command: cmd.type, success: true, data: {} });
+            return;
+          }
+          if (cmd.type === "open_session") {
+            p.send({ id, type: "response", command: "open_session", success: true, data: { cancelled: false, resumed: true, sessionId: "src", sessionFile: activeFile } });
+            return;
+          }
+          if (cmd.type === "switch_session") {
+            const target = String(cmd.sessionPath);
+            switchedTargets.push(target);
+            if (switchMode === "reject") {
+              p.send({ id, type: "response", command: "switch_session", success: false, error: "source session file locked", code: "io_error" });
+              return;
+            }
+            if (switchMode === "cancel") {
+              p.send({ id, type: "response", command: "switch_session", success: true, data: { cancelled: true } });
+              return;
+            }
+            if (switchMode === "mismatch") {
+              // Claims success without changing activeFile away from forkFile!
+              p.send({ id, type: "response", command: "switch_session", success: true, data: { cancelled: false } });
+              return;
+            }
+            activeFile = target;
+            p.send({ id, type: "response", command: "switch_session", success: true, data: { cancelled: false } });
+            return;
+          }
+          if (cmd.type === "get_state") {
+            p.send({ id, type: "response", command: "get_state", success: true, data: { ...defaultState(), sessionFile: activeFile } });
+            return;
+          }
+          if (cmd.type === "get_entries") {
+            p.send({
+              id,
+              type: "response",
+              command: "get_entries",
+              success: true,
+              data: { entries: [{ id: "u1", parentId: null, type: "message", message: { role: "user", content: "hi" } }], leafId: "u1" },
+            });
+            return;
+          }
+          if (cmd.type === "fork") {
+            void writeFile(forkFile, `${JSON.stringify({ type: "session", id: "fork", cwd: dir })}\n`).then(() => {
+              activeFile = forkFile;
+              p.send({ id, type: "response", command: "fork", success: true, data: { cancelled: false } });
+            });
+            return;
+          }
+          if (cmd.type === "prompt") {
+            p.send({ id, type: "response", command: "prompt", success: true });
+            p.send({ type: "message_end", messageId: "m1", message: { role: "assistant", content: [{ type: "text", text: `active:${path.basename(activeFile)}` }], stopReason: "stop" } });
+            p.send({ type: "prompt_result", id, agentInvoked: true, status: "completed", sessionSettled: true });
+            p.send({ type: "session_settled" });
+          }
+        });
+        spawnedProcs.push(proc);
+        queueMicrotask(() => proc.send({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2], maxFrameBytes: 1048576 }));
+        return proc as never;
+      },
+    });
+
+    // Establish initial live worker on main.jsonl
+    switchMode = "ok";
+    const firstTurn = await adapter.sendUserMessage("conv-fork-fail", { text: "turn 1", files: [] });
+    expect(firstTurn.text).toBe("active:main.jsonl");
+    expect(spawnCount).toBe(1);
+
+    // 1. switch_session rejects during fork restore -> outcome: "unknown" + worker evicted/closed
+    switchMode = "reject";
+    const fail1 = await adapter.forkHistory("conv-fork-fail");
+    expect(fail1).toMatchObject({
+      outcome: "unknown",
+      detail: expect.stringMatching(/source session file locked/i),
+      candidateSessionId: expect.stringMatching(/^omp_/),
+    });
+    expect(spawnedProcs[0]!.killed).toBe(true);
+
+    // Next turn on source conversation spawns a fresh worker bound to main.jsonl (NOT fork-1.jsonl!)
+    switchMode = "ok";
+    const afterFail1 = await adapter.sendUserMessage("conv-fork-fail", { text: "turn 2", files: [] });
+    expect(spawnCount).toBe(2);
+    expect(afterFail1.text).toBe("active:main.jsonl");
+    expect(switchedTargets.at(-1)).toBe(srcFile);
+
+    // 2. switch_session returns { cancelled: true } -> outcome: "unknown" + worker evicted
+    switchMode = "cancel";
+    const fail2 = await adapter.forkHistory("conv-fork-fail");
+    expect(fail2).toMatchObject({
+      outcome: "unknown",
+      detail: expect.stringMatching(/cancelled switching back/i),
+    });
+    expect(spawnedProcs[1]!.killed).toBe(true);
+
+    // 3. switch_session succeeds but getState still reports fork file -> outcome: "unknown" + worker evicted
+    switchMode = "ok";
+    await adapter.sendUserMessage("conv-fork-fail", { text: "turn 3", files: [] });
+    expect(spawnCount).toBe(3);
+    switchMode = "mismatch";
+    const fail3 = await adapter.forkHistory("conv-fork-fail");
+    expect(fail3).toMatchObject({
+      outcome: "unknown",
+      detail: expect.stringMatching(/remained on the forked session/i),
+    });
+    expect(spawnedProcs[2]!.killed).toBe(true);
+
     await adapter.destroy();
   });
 });

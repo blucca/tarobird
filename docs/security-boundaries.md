@@ -1032,3 +1032,20 @@ model write followed by a failed state read, a timed-out write, or a lost sessio
 guard remains uncertain; do not automatically replay it. Workspace equivalence
 uses physical identity and Windows case comparison, while Windows launch cwd
 keeps its logical junction path and its native ancestor-resource semantics.
+
+## oh-my-pi (`omp`) approval bridge and compatibility gating
+
+In `normal` approval mode, `omp` runs with the TaroBird approval bridge extension
+over a private single-accept local socket authenticated by a one-time token (same
+transport pattern as Pi). The turn fails closed before sending a prompt if the
+bridge did not connect. Read-only auto-approval (`read`, `grep`, `find`, `ls`,
+`glob`, `ask`) requires verified built-in provenance (`sourceInfo.source === "builtin"`
+and `sourceInfo.path === "builtin:<toolName>"`), never name-only matching, and
+session-scoped approval grants are keyed by `origin:toolName` so an extension
+override cannot inherit a built-in grant.
+
+Host HTTP endpoints with closed engine enums in v1.6.0 clients (`/api/bots/catalog`,
+`/api/settings/engines`, and `/api/engine-quotas`) exclude `omp` entries unless the
+caller opts in with `includeOmp=1`. Destroying the `omp` adapter aborts and awaits
+in-flight worker startups, and startup failures always close the child process and
+dispose the bridge socket so no orphan process or socket leaks.
