@@ -158,8 +158,9 @@ A listed product remains in this category even if distributed through npm.
 Other npm/Gradle/Cargo libraries, AndroidX, Firebase, OkHttp, frameworks and build
 tools are **ordinary dependencies**, not this release gate.
 
-**Baoyu Design/PPT exception (2026-11-15):** the canvas/PPT integrations and
-their adapted skills are not mandatory pre-release upstream checks or upgrades.
+**Baoyu PPT exception (2026-11-15; it also covered the Baoyu Design canvas,
+which was removed with its skill in #89):** the PPT integration and its adapted
+skill are not mandatory pre-release upstream checks or upgrades.
 Keep verified pins unless the owner scopes an update or a specific needed fix;
 an available new upstream version or an unavailable upstream lookup does not
 block a release that retains those pins. For an actual change, review bound
@@ -176,7 +177,7 @@ Before freezing a full release, complete the following for the listed products:
   skill/editor pins aligned; adapt upstream guidance to the App protocol rather
   than copying standalone server instructions. Verify skill resources in the
   standalone/App host package and selected global install locations. Baoyu
-  Design/PPT routing checks belong to an actual change to that integration;
+  PPT routing checks belong to an actual change to that integration;
   preserve default skills for ordinary PPT requests.
 - Check each official upstream repository/release feed against the version or
   commit actually bundled. Use the latest stable release; for commit-pinned

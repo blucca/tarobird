@@ -5100,8 +5100,8 @@ Right-side opening shares `useSideWindowExpansion`, `SidePanelResize` and the
 name appears below the icon in its empty state. The top bar keeps tabs and
 actions together in one row; roomy docked headers retain smaller tabs.
 See [empty-state title placement](client/workbench-empty-title-2026-10-31.md).
-Empty-state creation actions wrap inside narrow panels; product labels use
-画布 / Canvas and PPT, with upstream skill routing unchanged. See
+Empty-state creation actions wrap inside narrow panels; the product label is
+PPT (画布 / Canvas was removed in #89), with upstream skill routing unchanged. See
 [neutral names and narrow-layout validation](client/workbench-labels-width-2026-11-04.md).
 New content sits immediately after the tabs; only the tab list scrolls, while
 the plus button stays visible. Its menu anchors below the tab group. See
@@ -5286,19 +5286,33 @@ authorized Design/PPT release scope, CLI parity and fresh upstream inventory.
 [The responsiveness audit](client/workbench-efficiency-2026-11-10.md) documents
 the canvas reveal handshake, bounded registration coalescing, shared whiteboard
 reads and native browser overlay tracking. Cover `workbench-controller`,
-`workbench-registration`, `workbench-design-frame-reveal` and
-`workbench-browser-layout`; actual editor entrypoints also assert the upstream
-reveal mark. These scheduling changes retain save and scope fences.
+`workbench-registration` and `workbench-browser-layout`; actual editor
+entrypoints also assert the upstream reveal mark. The dedicated
+`workbench-design-frame-reveal` spec used canvas fixtures and was deleted with
+the canvas (#89). These scheduling changes retain save and scope fences.
 
 ### Baoyu Design / Baoyu PPT skills (2026-11-03)
+
+**Canvas removed (#89, 2026-11-27).** `client/vendor/baoyu-design`,
+`skills/baoyu-design` and the canvas editor are gone. Hub, Gateway, CLI and App
+refuse canvas create/open/read/publish/share/import with `design_canvas_removed`
+(`workbenchDesignError` in `src/client-protocol/workbench-design.ts`); PPT
+(`format:slides`) is unchanged and `workbench.design.v1` stays advertised for
+1.6.0 peers. A canvas project kept on a device is never opened: its tab and its
+row in Settings → Workbench files only offer export of the stored project as a
+`.tarobot-design.json` backup (`exportStoredDesign` in `workbench-library.ts`,
+`WorkbenchController.exportRemovedCanvas`) and deletion. Cover
+`tests/remove-baoyu-canvas.test.ts`. Canvas statements in the two sections
+below describe earlier versions.
 
 [The 2026-11-10 upstream refresh](client/workbench-upstream-2026-11-10.md) pins
 both editors and adapted skills to 2.12.2, keeps offline authoring and native PPT
 routing, and records editor/browser acceptance separately from installed Apps.
 
-`skills/baoyu-design` and `skills/baoyu-ppt` are TaroBot adapters, with pinned
-upstream authoring references, not upstream's local-server workflow. Use them
-for explicit Baoyu requests or an unambiguous continuation of the selected Baoyu
+`skills/baoyu-ppt` is a TaroBot adapter (`skills/baoyu-design` was its canvas
+counterpart until #89), with pinned
+upstream authoring references, not upstream's local-server workflow. Use it
+for explicit Baoyu PPT requests or an unambiguous continuation of the selected Baoyu
 project; ordinary PPT/design requests retain native engine skills. In particular,
 “用 Design 做 PPT” uses the engine's native presentation skill, even with a Baoyu
 tab selected. See [PPT selection and validation](client/baoyu-ppt-routing-2026-11-03.md).
@@ -5309,8 +5323,8 @@ skill and distinguishes that from binary PPTX import. New tool contract v13 uses
 neutral labels; old schema digests remain exact and receive the corrected guide.
 `install-skills.sh --skill ...` copies
 references as well as SKILL.md; the Host package includes the same allowlisted
-resources. When this integration is updated, review both skills and editor assets.
-Baoyu Design/PPT updates are not a mandatory pre-release item; see the
+resources. When this integration is updated, review the skill and editor assets.
+Baoyu PPT updates are not a mandatory pre-release item; see the
 2026-11-15 amendment in [the release checklist](release-checklist.md#full-release-upstream-gate).
 
 PPT reuses `design.*` and storage but has `format:slides`, `designFormat:slides`,
@@ -5348,8 +5362,10 @@ on navigation/hide/close invalidates old source requests. Content controllers an
 other Workbench commands remain separate. See [automatic opening and acceptance
 boundaries](client/design-auto-open-2026-11-01.md).
 
-`Workbench.tsx` / `WorkbenchDesign.tsx` add the baoyu-design canvas editor as a
-`design` tab. See [scope, lifecycle and validation](client/workbench-design.md).
+`Workbench.tsx` / `WorkbenchDesign.tsx` added the baoyu-design canvas editor as a
+`design` tab. Since #89 a `design` tab is a PPT (`designFormat:slides`); a tab
+kept from a canvas loads no editor and shows only its export action.
+See [scope, lifecycle and validation](client/workbench-design.md).
 `client/design-assets.ts` verifies pristine vendor hashes and builds the offline
 opaque-origin editor; `design-frame.ts` owns DOM lifetime/flush and `design-runtime.js`
 provides a per-tab file/comment/event bridge. Never serve project code at the App origin or
@@ -5359,8 +5375,8 @@ rendering. Cover multi-page Unicode publishes, reopen and Electron rendering; se
 [the silent artboard filtering defect](client/design-unicode-artboards-2026-11-03.md).
 The trusted loader contains no project data or message handler before its
 data-origin navigation.
-`design-wheel.ts` supplies bounded viewport wheel input to both the canvas and
-PPT build adapters, including nested artboard forwarding. Native scroll, touch
+`design-wheel.ts` supplies bounded viewport wheel input to the PPT build adapter
+(and did to the canvas one until #89), including nested artboard forwarding. Native scroll, touch
 and fit boundaries stay upstream-owned. Cover `workbench-wheel.spec.ts` when
 upgrading either bundle; see [wheel navigation](client/baoyu-wheel-2026-11-03.md).
 
