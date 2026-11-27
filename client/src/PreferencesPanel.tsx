@@ -20,7 +20,7 @@ import { FontSizeSlider } from "./FontSizeSlider.js";
 import { LayoutDensityPicker } from "./LayoutDensityPicker.js";
 import { useBackAction } from "./back-navigation.js";
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject } from "react";
-import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Link, Monitor, MonitorCog, Plus, QrCode, ScanLine, Settings2, ShieldCheck, Gauge, X } from "lucide-react";
+import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRight, Globe, Info, Link, Monitor, MonitorCog, Plus, QrCode, ScanLine, Settings2, ShieldCheck, Gauge, X } from "lucide-react";
 import { ConnectionPanel } from "./ConnectionPanel.js";
 import { ScreenControlPanel } from "./ScreenControlPanel.js";
 import { hasScreenViewer } from "./mobile-screen-viewer-transport.js";
@@ -45,8 +45,9 @@ import type { Preferences } from "./storage.js";
 import { ambiguousDeviceName, deviceDisplayName, deviceRevokeScope } from "./device-presentation.js";
 import "./device-settings.css";
 import { BotMessageGrants } from "./BotMessageGrants.js";
+import { AboutSettings, type AboutNavigationState } from "./AboutSettings.js";
 
-type Section = "workbench" | "backups" | "general" | "network" | "notifications" | "devices" | "botMessages" | "voice" | "engines" | "quota";
+type Section = "workbench" | "backups" | "general" | "network" | "notifications" | "devices" | "botMessages" | "voice" | "engines" | "quota" | "about";
 /** `created_at`/`last_seen` come from the host; 0 or missing means never recorded. */
 type Device = { id: string; name: string; nameSource?: "host"; platform: string; revoked: number; created_at?: number | string | null; last_seen?: number | string | null };
 /** Messages appear beside the control that produced them, not at the page end. */
@@ -119,6 +120,8 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   // A request for a category this build hides (Model quotas) opens the default one.
   const startSection: Section = startingSettingsSection(initialSection);
   const [section, setSection] = useState<Section>(startSection), [overview, setOverview] = useState(startSection === "general");
+  const aboutBackRef = useRef<(() => boolean) | undefined>(undefined);
+  const [aboutNav, setAboutNav] = useState<AboutNavigationState>({ inSubView: false });
   const [connectionOpen, setConnectionOpen] = useState(false), [screenOpen, setScreenOpen] = useState(false);
   useSceneMotion(dialog, `${overview}:${section}`, phone, overview ? -1 : 1, overview ? ".settings-navigation" : ".settings-content");
   // A category opened directly (Devices from the phone home) is the first phone page:
@@ -168,6 +171,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
     { id: "notifications" as const, title: t("通知"), detail: t("此设备的提醒与勿扰时段"), icon: Bell },
     { id: "devices" as const, title: t("设备与安全"), detail: t("查看设备、修改名称与撤销授权"), icon: ShieldCheck },
     { id: "botMessages" as const, title: t("Bot 消息授权"), detail: t("管理本机与跨主机 Bot 的直接消息权限"), icon: Link },
+    { id: "about" as const, title: t("关于"), detail: t("版本、协议与开源致谢"), icon: Info },
   ];
   useEffect(() => { if (section === "quota" && !quotaPage) { setSection("general"); setOverview(true); } }, [section, quotaPage]);
   const requestClose = () => {
@@ -196,8 +200,17 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   // about unsaved settings. Desktop keeps its sidebar and closes from any page.
   const page = phone && !overview, upToCategories = page && !direct;
   const pageTitle = sections.find(({ id }) => id === section)?.title;
+  const aboutActive = section === "about" && (!phone || !overview);
+  const aboutSubActive = aboutActive && aboutNav.inSubView;
+  const headerBackLabel = phone && aboutSubActive && aboutNav.backLabel
+    ? aboutNav.backLabel
+    : upToCategories ? t("返回设置分类") : backLabel ?? t("关闭设置");
+  const headerTitle = phone && aboutSubActive && aboutNav.title
+    ? aboutNav.title
+    : (page || backLabel && !overview ? pageTitle : t("设置"));
   const goBack = () => {
     if (settingsBusy || busy) return;
+    if (aboutActive && aboutBackRef.current?.()) return;
     if (upToCategories) setOverview(true);
     else requestClose();
   };
@@ -397,6 +410,11 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   };
   return <>{initialPairingStep === undefined && <dialog ref={dialog} className={`preferences-dialog is-movable ${overview ? "settings-overview" : "settings-detail"}${singleSection ? " preferences-single-section" : ""}`} aria-label={backLabel && !overview ? pageTitle : t("设置")} onClose={(event) => {
     if (event.target !== event.currentTarget || intentionalClose.current || event.currentTarget.open) return;
+    // A repeated Escape can close a dialog without firing cancel; unwind sub-views first.
+    if (aboutActive && aboutBackRef.current?.()) {
+      event.currentTarget.showModal();
+      return;
+    }
     if (dirty || settingsBusy || busy) {
       event.currentTarget.showModal();
       if (dirty && !settingsBusy && !busy) { setConfirmationKey((value) => value + 1); setConfirmation({ kind: "discard" }); }
@@ -406,7 +424,7 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
     event.preventDefault(); if (scan) setScan(false); else goBack();
   }}>
     {/* Keep one button mounted across rotation; CSS places desktop Close last. */}
-    <header ref={header} className="preferences-header"><button className={`icon-button${phone ? " settings-back" : ""}`} aria-label={upToCategories ? t("返回设置分类") : backLabel ?? t("关闭设置")} disabled={busy || settingsBusy} onClick={goBack}>{phone || backLabel ? <ChevronLeft size={24}/> : <X size={20}/>}</button><h2 ref={heading}>{page || backLabel && !overview ? pageTitle : t("设置")}</h2></header>
+    <header ref={header} className="preferences-header"><button className={`icon-button${phone ? " settings-back" : ""}`} aria-label={headerBackLabel} disabled={busy || settingsBusy} onClick={phone ? goBack : requestClose}>{phone || backLabel ? <ChevronLeft size={24}/> : <X size={20}/>}</button><h2 ref={heading}>{headerTitle}</h2></header>
     <div className="preferences-body">
       {!singleSection && <nav className="settings-navigation" aria-label={t("设置分类")}>
         {sections.map(({ id, title, detail, icon: Icon }) => <button key={id} type="button" data-section={id} disabled={busy || settingsBusy} aria-current={!phone && section === id ? "page" : undefined} onClick={() => select(id)}><Icon size={20}/><span><strong>{title}</strong><small>{detail}</small></span>{((id === "notifications" && notificationDirty) || (id === "devices" && deviceDirty) || (id === "botMessages" && messageGrantsDirty) || (id === "voice" && voiceDirty) || (id === "backups" && backupDirty) || (id === "engines" && engineDirty)) && <span role="img" className="settings-unsaved-dot" aria-label={t("有未保存的修改")}/>}<ChevronRight className="settings-chevron" size={17}/></button>)}
@@ -446,6 +464,15 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
           <h3>{t("Bot 消息授权")}</h3>
           {hostName && <p className="device-host-scope">{t("管理主机：{0}", hostName)}</p>}
           <BotMessageGrants key={connection.identity.hubPublicKey} connection={connection} active={section === "botMessages" && (!phone || !overview)} online={online} onDirty={setMessageGrantsDirty} onBusy={setMessageGrantsBusy}/>
+        </section>
+        <section hidden={section !== "about"} aria-label={t("关于")}>
+          <h3 hidden={aboutSubActive}>{t("关于")}</h3>
+          <AboutSettings
+            active={aboutActive}
+            phone={phone}
+            backActionRef={aboutBackRef}
+            onNavigationChange={setAboutNav}
+          />
         </section>
         <section hidden={section !== "general"} aria-label={t("通用")}>
           <h3>{t("通用")}</h3>

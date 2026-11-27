@@ -52,6 +52,8 @@
     "privacy:setup": "node scripts/setup-privacy-hooks.mjs",
     "privacy:staged": "node scripts/check-git-identity.mjs && node scripts/check-upload-privacy.mjs staged && node scripts/check-secrets.mjs staged",
     "privacy:test": "node --test scripts/privacy-guards.node-test.mjs scripts/check-upload-privacy.test.mjs",
+    "acknowledgements:generate": "node scripts/acknowledgements.mjs generate",
+    "acknowledgements:check": "node scripts/acknowledgements.mjs check",
     "version:check": "node scripts/release-version.mjs check",
     "version:sync": "node scripts/release-version.mjs sync",
     "version:bump": "node scripts/release-version.mjs bump"
