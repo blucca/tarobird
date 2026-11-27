@@ -129,7 +129,9 @@ it.each(["confirm", "cancel", "unsupported"] as const)("honors restart decision 
   const sessionId = "restart-fixture";
   const seen: string[] = [];
   let interrupted = false, finishFirst = () => {}, observeExit = () => {};
-  const restart = vi.fn(async () => {
+  const restart = vi.fn(async (_sessionId: string, options?: { beforeStop?: () => unknown }) => {
+    // As the real adapters do: the running work is stopped before the process is signalled.
+    await options?.beforeStop?.();
     await new Promise<void>(resolve => { observeExit = resolve; });
     return { outcome: "closed" as const };
   });

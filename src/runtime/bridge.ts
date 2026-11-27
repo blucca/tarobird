@@ -105,7 +105,8 @@ export interface BridgeConversationRestartInput extends BridgeConversationScope 
   signal: AbortSignal;
   isCurrentBinding(): Promise<boolean>;
   confirm(tasks: readonly EngineTask[]): Promise<boolean>;
-  onStopping(): void;
+  /** Stops the running work; the restart waits for it (bounded) before closing the process. */
+  onStopping(): void | Promise<unknown>;
 }
 
 export type BridgeConversationRestartOutcome = EngineSessionRestartResult["outcome"]
@@ -408,9 +409,10 @@ export class Bridge {
         if (inUse()) return "busy";
         // The adapter captures the exact old worker synchronously, before the
         // turn's abort handler can remove that worker from its lookup table.
+        // It then runs onStopping (the /stop path, swarms included) to completion
+        // while that worker can still answer, and only then signals the process.
         const retryingExit = this.adapter.sessionRestartPending?.(sessionId);
-        const closing = this.adapter.restartSession!(sessionId);
-        if (!retryingExit) input.onStopping();
+        const closing = this.adapter.restartSession!(sessionId, retryingExit ? undefined : { beforeStop: () => input.onStopping() });
         return (await closing).outcome;
       }
     } finally {

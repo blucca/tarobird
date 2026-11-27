@@ -542,6 +542,9 @@ export interface CodexUserMessageInput {
 }
 
 export interface EngineSessionRestartResult { outcome: "closed" | "not_running" | "exit_unconfirmed" }
+/** `beforeStop`: stops the session's running work (the Host's /stop path) after the
+ * adapter captured the old process and before it signals that process. */
+export interface EngineSessionRestartOptions { beforeStop?: () => unknown }
 
 export interface CodexAdapter {
   /** Account quota only: never starts a model turn. Private proof must not enter public replies. */
@@ -654,7 +657,7 @@ export interface CodexAdapter {
   }): Promise<EngineSideSession>;
   /** Request process termination and acknowledge only an observed exit.
    * Future input lazily reopens the retained native session. */
-  restartSession?(sessionId: string): Promise<EngineSessionRestartResult>;
+  restartSession?(sessionId: string, options?: EngineSessionRestartOptions): Promise<EngineSessionRestartResult>;
   /** While an old process has an outstanding termination, input may wait on its exact exit. */
   sessionRestartPending?(sessionId: string): Promise<void> | undefined;
   /** Restart may also interrupt work known from lifecycle receipts outside the task panel. */

@@ -21,7 +21,6 @@ export async function handleCoreRestart(
   const pause = supported ? runtime.chatQueue.pause(conversationKey) : undefined;
   let result: BridgeConversationRestartOutcome = supported ? "busy" : "unsupported";
   let stopRequested = false;
-  let backgroundStop: Promise<unknown> | undefined;
   try {
     if (pause) {
       channel.releaseMessageAdmission?.();
@@ -30,16 +29,16 @@ export async function handleCoreRestart(
           chatId: message.bridgeChatId, conversationKey, signal: pause.signal,
           isCurrentBinding: async () => (await channel.canSteerConversation?.(chatId)) !== false,
           confirm: tasks => confirmRestart(input, message, tasks, locale, pause.signal),
+          // The same stop /stop uses, swarms included; attachment bursts are kept.
+          // The adapter waits for it before it closes the engine process.
           onStopping: () => {
             stopRequested = true;
-            // The same stop /stop uses, swarms included; attachment bursts are kept.
-            backgroundStop = abortCoreConversation(runtime, conversationKey, bridge, locale).backgroundStop;
+            return abortCoreConversation(runtime, conversationKey, bridge, locale).backgroundStop;
           },
         });
       } catch {
         result = pause.signal.aborted && !stopRequested ? "cancelled" : "failed";
       }
-      await backgroundStop?.catch(() => undefined);
     }
     await channel.send(chatId, { text: restartReply(result, locale, stopRequested) }, reply);
     await appendCoreTimelineEvent(stateDir, message, {

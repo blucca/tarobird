@@ -21,7 +21,7 @@ import {
   swarmMembersToEngineTasks,
 } from "../src/codex/antigravity-swarm.js";
 import { renderCoreApprovalCard } from "../src/core/card-renderer.js";
-import { requestCoreApproval, stopCoreConversation } from "../src/core/card-actions.js";
+import { abortCoreConversation, requestCoreApproval, stopCoreConversation } from "../src/core/card-actions.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import { attachGateway } from "../src/gateway/service.js";
 import { hashSecret } from "../src/hub/auth.js";
@@ -542,6 +542,62 @@ describe("AntigravityAcpAdapter /swarm lifecycle", () => {
     const afterStop = await adapter.listTasks("swarm-sess-1");
     expect(afterStop.swarm?.active).toBe(false);
     expect(afterStop.swarm?.members.find((m) => m.name === "auth-audit")?.state).toBe("killed");
+  });
+
+  it("/restart stops an active swarm through the /stop path before it closes the process, and reports closed only after the exit", async () => {
+    const env = await setupEnv();
+    const harness = createSwarmHarness();
+    const spawned: Array<EventEmitter> = [];
+    const order: string[] = [];
+    const adapter = new AntigravityAcpAdapter("agy", {
+      ...env,
+      spawnFn: ((...args: Parameters<SpawnAgyAcp>) => { const child = harness.spawnFn(...args); spawned.push(child as never); return child; }) as SpawnAgyAcp,
+      killProcessTreeFn: (pid) => { order.push("kill"); harness.killProcessTreeFn(pid); },
+      supportsSwarmFn: async () => true,
+      idleSweepIntervalMs: 0,
+      turnTimeoutMs: 2_000,
+      swarmMaxDurationMs: 5_000,
+      closeTimeoutMs: 50,
+      cancelGraceMs: 50,
+    });
+    adapters.push(adapter);
+    const turn = adapter.sendUserMessage("tarobot-1", { text: "/swarm parallel audit", files: [], locale: "en", onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }) });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.advertiseCommands();
+    await writeSwarmFiles(env.brainDir, "swarm-sess-1", {
+      members: { title: "Parallel security audit", members: [{ name: "auth-audit", role: "worker", state: "working" }] },
+      boardLines: [],
+    });
+    server.text("Coordinator kicked off workers.");
+    server.respondPrompt();
+    await turn;
+    expect((await adapter.listTasks("swarm-sess-1")).swarm?.active).toBe(true);
+
+    const runtime = createCoreServiceRuntime();
+    const bridge = { stopBackgroundWork: vi.fn(async (input: { locale?: "en" | "zh"; scope?: "swarm" | "all" }) => {
+      const result = await adapter.stopBackgroundWork("swarm-sess-1", input);
+      order.push(`swarm:${result.stopped}`);
+      return result;
+    }) };
+    let settled = false;
+    const closing = adapter.restartSession("swarm-sess-1", {
+      beforeStop: () => abortCoreConversation(runtime, "lark:c1", bridge, "en").backgroundStop,
+    }).finally(() => { settled = true; });
+    await waitFor(() => order.length === 3);
+    // The swarm stop ran first with the worker alive (it closes that worker itself);
+    // the restart signals the same process only after the swarm stop finished.
+    expect(order).toEqual(["kill", "swarm:true", "kill"]);
+    expect(harness.log).toContain("close:swarm-sess-1");
+    expect(bridge.stopBackgroundWork).toHaveBeenCalledWith(expect.objectContaining({ scope: "swarm", locale: "en" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled).toBe(false);
+    spawned[0]!.emit("close", null, "SIGKILL");
+    await expect(closing).resolves.toEqual({ outcome: "closed" });
+    // Same recorded state as after /stop.
+    const afterRestart = await adapter.listTasks("swarm-sess-1");
+    expect(afterRestart.swarm?.active).toBe(false);
+    expect(afterRestart.swarm?.members.find((m) => m.name === "auth-audit")?.state).toBe("killed");
   });
 
   it("enforces hard total turn timeout and background swarm ceiling even while swarm workers stay working", async () => {

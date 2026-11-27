@@ -1347,7 +1347,7 @@ describe("core service shared rules (compatibility profile)", () => {
     }
   });
 
-  it("/restart with no running turn stops background swarms the way /stop does, before its reply", async () => {
+  it("/restart with no running turn stops background swarms the way /stop does, before the close and the reply", async () => {
     const stateDir = await mkdtemp(path.join(os.tmpdir(), "core-shared-rules-"));
     const channel = fakeChannel();
     const order: string[] = [];
@@ -1358,8 +1358,9 @@ describe("core service shared rules (compatibility profile)", () => {
         order.push(`swarm:${request.scope}:${request.locale}`);
         return { stopped: true, summary: "stopped" };
       }),
+      // Like Bridge + adapter: wait for onStopping, then close the process.
       restartConversationSession: vi.fn(async (request: import("../src/runtime/bridge.js").BridgeConversationRestartInput) => {
-        request.onStopping();
+        await request.onStopping();
         order.push("close");
         return "closed" as const;
       }),
@@ -1368,7 +1369,7 @@ describe("core service shared rules (compatibility profile)", () => {
     channel.send = vi.fn(async (...args: Parameters<typeof send>) => { order.push("reply"); return await send(...args); }) as typeof send;
     try {
       await handleCoreMessage({ channel, bridge, runtime: createCoreServiceRuntime(), stateDir, message: fakeLarkMessage({ messageId: "om_restart", content: "/restart" }) });
-      expect(order).toEqual(["close", "swarm:swarm:zh", "reply"]);
+      expect(order).toEqual(["swarm:swarm:zh", "close", "reply"]);
       expect(sentPayloads(channel)).toContain("旧进程已结束，会话已保留，下次发消息时启动。");
     } finally {
       await rm(stateDir, { recursive: true, force: true });

@@ -10,7 +10,7 @@ import { APP_STOP_PROCESS_GRACE_MS } from "../runtime/turn-cancellation.js";
 import {
   EngineIncompleteResponseError, EngineSteeringRejectedError, withFailedTurnUsage,
   type AppPlatformTools, type CodexAdapter, type CodexAdapterResponse, type CodexSessionHandle, type CodexUserMessageInput,
-  type EngineApprovalDecision, type EngineContextUsage, type EngineSessionRestartResult, type EngineStreamEvent, type ExternalSessionInfo,
+  type EngineApprovalDecision, type EngineContextUsage, type EngineSessionRestartOptions, type EngineSessionRestartResult, type EngineStreamEvent, type ExternalSessionInfo,
   type NativeHistoryAnchor, type NativeHistoryRejection, type NativeHistoryResult, type NativeHistoryState,
 } from "./adapter.js";
 import { ENGINE_DEFAULT_INACTIVITY_TIMEOUT_MS, ENGINE_DEFAULT_TURN_TIMEOUT_MS } from "./engine-timeouts.js";
@@ -690,7 +690,7 @@ export class PiRpcAdapter implements CodexAdapter {
   }
 
   /** Ends this session's Pi process; the next turn starts a new one on the same session file. */
-  async restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
+  async restartSession(sessionId: string, options?: EngineSessionRestartOptions): Promise<EngineSessionRestartResult> {
     const worker = this.workers.get(sessionId);
     const startup = this.starting.get(sessionId);
     const client = worker?.client ?? startup?.client;
@@ -704,7 +704,7 @@ export class PiRpcAdapter implements CodexAdapter {
           client.terminate();
         }
       },
-    } : undefined);
+    } : undefined, options?.beforeStop);
     startup?.controller.abort();
     await startup?.work.catch(() => undefined);
     return closing;

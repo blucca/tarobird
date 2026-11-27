@@ -66,6 +66,7 @@ import type {
   CodexUserMessageInput,
   AppPlatformTools,
   SideCapability,
+  EngineSessionRestartOptions,
   EngineSessionRestartResult,
 } from "./adapter.js";
 import {
@@ -4171,14 +4172,14 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     return { outcome: "accepted" };
   }
 
-  restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
+  restartSession(sessionId: string, options?: EngineSessionRestartOptions): Promise<EngineSessionRestartResult> {
     const worker = this.workers.get(sessionId);
     return this.sessionRestarts.close(sessionId, worker && !worker.retired && !this.sessionRestartPending(sessionId) ? {
       exited: observeEngineProcessExit(worker.child),
       stop: () => worker.retired
         ? killProcessTree(worker.child.pid, { graceMs: APP_STOP_PROCESS_GRACE_MS })
         : this.forceStopWorker(worker),
-    } : undefined);
+    } : undefined, options?.beforeStop);
   }
 
   sessionRestartPending(sessionId: string): Promise<void> | undefined {

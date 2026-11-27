@@ -60,6 +60,7 @@ import type {
   EngineStreamEvent,
   EngineTask,
   EngineTaskSnapshot,
+  EngineSessionRestartOptions,
   EngineSessionRestartResult,
 } from "./adapter.js";
 import { EngineIncompleteResponseError, EngineSteeringRejectedError } from "./adapter.js";
@@ -947,14 +948,14 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   /** session/close, then the `agy acp` process tree of this session only; the next turn loads the session again. */
-  restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
+  restartSession(sessionId: string, options?: EngineSessionRestartOptions): Promise<EngineSessionRestartResult> {
     const worker = this.workers.get(sessionId);
     return this.sessionRestarts.close(sessionId, worker && !worker.removed && !this.sessionRestartPending(sessionId) ? {
       exited: worker.exited ? Promise.resolve() : observeEngineProcessExit(worker.child),
       stop: () => worker.exited ? undefined : worker.removed
         ? this.killProcessTreeFn(worker.child.pid, { graceMs: APP_STOP_PROCESS_GRACE_MS })
         : this.closeWorker(worker, new Error(STOPPED_BY_USER), { graceMs: APP_STOP_PROCESS_GRACE_MS }),
-    } : undefined);
+    } : undefined, options?.beforeStop);
   }
 
   sessionRestartPending(sessionId: string): Promise<void> | undefined {

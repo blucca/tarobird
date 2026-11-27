@@ -23,10 +23,13 @@ export class EngineSessionRestarts {
     return this.pending.get(sessionId)?.exited;
   }
 
-  close(sessionId: string, process?: RestartProcess): Promise<EngineSessionRestartResult> {
+  /** `beforeStop` (the caller's stop of the running work) runs after the
+   * process was captured and before it is signalled, bounded by
+   * EXIT_CONFIRMATION_MS; a failure or timeout does not block the restart. */
+  close(sessionId: string, process?: RestartProcess, beforeStop?: () => unknown): Promise<EngineSessionRestartResult> {
     let pending = this.pending.get(sessionId);
     if (!pending) {
-      if (!process) return Promise.resolve({ outcome: "not_running" });
+      if (!process) return boundedStep(beforeStop).then(() => ({ outcome: "not_running" as const }));
       const record: PendingRestart = { process, observed: false, exited: process.exited.then(() => {
         record.observed = true;
         if (this.pending.get(sessionId) === record) this.pending.delete(sessionId);
@@ -35,11 +38,13 @@ export class EngineSessionRestarts {
       pending = record;
     }
     const record = pending;
-    record.attempt ??= this.terminate(record).finally(() => { record.attempt = undefined; });
+    record.attempt ??= this.terminate(record, beforeStop).finally(() => { record.attempt = undefined; });
     return record.attempt;
   }
 
-  private async terminate(record: PendingRestart): Promise<EngineSessionRestartResult> {
+  private async terminate(record: PendingRestart, beforeStop?: () => unknown): Promise<EngineSessionRestartResult> {
+    // The exact process is already captured; let the caller stop its work while it can still answer.
+    await boundedStep(beforeStop);
     let timer!: ReturnType<typeof setTimeout>;
     const timeout = new Promise<EngineSessionRestartResult>(resolve => {
       timer = setTimeout(() => resolve({ outcome: "exit_unconfirmed" }), EXIT_CONFIRMATION_MS);
@@ -56,6 +61,17 @@ export class EngineSessionRestarts {
     } finally {
       clearTimeout(timer);
     }
+  }
+}
+
+async function boundedStep(step?: () => unknown): Promise<void> {
+  if (!step) return;
+  let timer!: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<void>(resolve => { timer = setTimeout(resolve, EXIT_CONFIRMATION_MS); });
+  try {
+    await Promise.race([Promise.resolve().then(step).catch(() => undefined), timeout]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
