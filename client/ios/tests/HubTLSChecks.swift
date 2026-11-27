@@ -111,6 +111,80 @@ private final class SocketProbe: HubTaskHandler, @unchecked Sendable {
               let value = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { throw HubNetworkError("invalid_socket_message") }
         return value
     }
+    @inline(never)
+    static func checkClassify(_ error: Error, host: String? = nil, _ expected: String, _ name: String) throws {
+        try check(HubNetworkError.classify(error, host: host) == expected, name)
+    }
+    static func classifyErrorChecks() throws {
+        try checkClassify(HubNetworkError("tls_identity_mismatch"), "tls_identity_mismatch", "classifyPreservesHubCode")
+        try checkClassify(URLError(.timedOut), "native_request_timeout", "classifyUrlTimeout")
+        try checkClassify(URLError(.notConnectedToInternet), "native_network_offline", "classifyUrlOffline")
+        let enetdown = NSError(domain: NSPOSIXErrorDomain, code: Int(ENETDOWN))
+        let offlineWithPosix = NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet, userInfo: [NSUnderlyingErrorKey: enetdown])
+        try checkClassify(offlineWithPosix, "native_network_offline", "classifyOfflineBeforePosixEnetdown")
+        let econnreset = NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNRESET))
+        let tlsWithPosix = NSError(domain: NSURLErrorDomain, code: NSURLErrorServerCertificateUntrusted, userInfo: [NSUnderlyingErrorKey: econnreset])
+        try checkClassify(tlsWithPosix, "native_tls_untrusted", "classifyTlsBeforePosix")
+        try checkClassify(URLError(.cannotFindHost), "native_dns_failed", "classifyUrlDns")
+        let econnrefused = NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNREFUSED))
+        let refusedErr = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: [NSUnderlyingErrorKey: econnrefused])
+        try checkClassify(refusedErr, "native_connection_refused", "classifyPosixRefused")
+        try checkClassify(NSError(domain: "kNWErrorDomainPOSIX", code: Int(ECONNREFUSED)), "native_connection_refused", "classifyNwPosixRefused")
+        try checkClassify(NSError(domain: "kNWErrorDomainDNS", code: -65555), "local_network_permission_denied", "classifyNwDnsLocalNetworkDenied")
+        try checkClassify(NSError(domain: "kNWErrorDomainDNS", code: -65554), "native_dns_failed", "classifyNwDnsFailed")
+        let eperm = NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))
+        let epermError = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: [NSUnderlyingErrorKey: eperm])
+        try checkClassify(epermError, host: "192.168.1.100", "local_network_permission_denied", "classifyPosixLocalNetworkDeniedOnLan")
+        let lanUrl = URL(string: "https://192.168.1.100:8788")!
+        let epermWithLanUrl = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: [NSURLErrorFailingURLErrorKey: lanUrl, NSUnderlyingErrorKey: eperm])
+        try checkClassify(epermWithLanUrl, "local_network_permission_denied", "classifyPosixLocalNetworkDeniedFromUrl")
+        try checkClassify(epermError, host: "100.64.0.1", "native_host_unreachable", "classifyPosixEpermNotLocalNetworkOnTailscale")
+        try checkClassify(epermError, "native_host_unreachable", "classifyPosixEpermWithoutHostNotLocalNetwork")
+        try checkClassify(NSError(domain: "kCFErrorDomainDNSServiceDiscovery", code: -65555), "local_network_permission_denied", "classifyDnsServiceLocalNetworkDenied")
+    }
+    static func openSilentLoopbackListener() throws -> (Int32, Int) {
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw HubNetworkError("silentListenerSocket") }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_port = 0
+        let addrSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound: Int32 = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, addrSize) }
+        }
+        guard bound == 0 && Darwin.listen(fd, 4) == 0 else {
+            Darwin.close(fd)
+            throw HubNetworkError("silentListenerBound")
+        }
+        var actualAddr = sockaddr_in()
+        var actualLen = addrSize
+        _ = withUnsafeMutablePointer(to: &actualAddr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.getsockname(fd, $0, &actualLen) }
+        }
+        return (fd, Int(UInt16(bigEndian: actualAddr.sin_port)))
+    }
+    static func prepareTimeoutCheck(key: String, ca: SecCertificate) async throws {
+        // Verify HubTLSSession.prepare deadline surfaces native_request_timeout rather than URLError.cancelled.
+        let (silentFd, silentPort) = try openSilentLoopbackListener()
+        defer { Darwin.close(silentFd) }
+        var prepareTimeoutCode = ""
+        do {
+            _ = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<HubTLSSession, Error>) in
+                queue.async {
+                    do {
+                        _ = try HubTLSSession.prepare(origin: "https://127.0.0.1:\(silentPort)", publicKey: key, queue: queue, anchors: [ca], timeout: 0.25) {
+                            continuation.resume(with: $0)
+                        }
+                    } catch { continuation.resume(throwing: error) }
+                }
+            }
+        } catch {
+            prepareTimeoutCode = HubNetworkError.classify(error)
+        }
+        try check(prepareTimeoutCode == "native_request_timeout", "prepareDeadlineReportsTimeout")
+    }
     static func main() async {
         setbuf(stdout, nil)
         let repo = CommandLine.arguments[1], scratch = CommandLine.arguments[2], receipt = CommandLine.arguments[3]
@@ -171,13 +245,8 @@ private final class SocketProbe: HubTaskHandler, @unchecked Sendable {
             try await managerChecks(peer, ca, token: ready["sessionToken"] as! String)
             let stats = try JSONSerialization.jsonObject(with: Data(peer.command("stats").utf8)) as! [String: Any]
             try check(stats["sensitive"] as? Int == 0, "zeroProxySensitiveRequests")
-            try check(HubNetworkError.classify(HubNetworkError("tls_identity_mismatch")) == "tls_identity_mismatch", "classifyPreservesHubCode")
-            try check(HubNetworkError.classify(URLError(.timedOut)) == "native_request_timeout", "classifyUrlTimeout")
-            try check(HubNetworkError.classify(URLError(.notConnectedToInternet)) == "native_network_offline", "classifyUrlOffline")
-            try check(HubNetworkError.classify(URLError(.cannotFindHost)) == "native_dns_failed", "classifyUrlDns")
-            try check(HubNetworkError.classify(NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNREFUSED))])) == "native_connection_refused", "classifyPosixRefused")
-            try check(HubNetworkError.classify(NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM))])) == "local_network_permission_denied", "classifyPosixLocalNetworkDenied")
-            try check(HubNetworkError.classify(NSError(domain: "kCFErrorDomainDNSServiceDiscovery", code: -65555)) == "local_network_permission_denied", "classifyDnsServiceLocalNetworkDenied")
+            try classifyErrorChecks()
+            try await prepareTimeoutCheck(key: key, ca: ca)
             results["proxy"] = stats; results["ok"] = true
         } catch { results["ok"] = false; results["error"] = String(describing: error); print("FAILED", error) }
         queue.sync { sessions.forEach { $0.cancelAll() } }

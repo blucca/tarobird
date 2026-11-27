@@ -8,13 +8,23 @@ struct HubNetworkError: LocalizedError {
     init(_ code: String) { self.code = code }
     var errorDescription: String? { code }
 
-    static func classify(_ error: Error, fallback: String = "native_transport_failed") -> String {
+    static func classify(_ error: Error, fallback: String = "native_transport_failed", host: String? = nil) -> String {
         if let hub = error as? HubNetworkError { return hub.code }
         var current: NSError? = error as NSError
         var urlCode: URLError.Code?
         var posixCode: Int?
+        var nwDnsError = false
+        var effectiveHost: String? = host.flatMap { $0.isEmpty ? nil : $0 }
         var depth = 0
         while let ns = current, depth < 8 {
+            if effectiveHost == nil {
+                if let failingUrl = ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL, let target = failingUrl.host, !target.isEmpty {
+                    effectiveHost = target
+                } else if let failingString = ns.userInfo[NSURLErrorFailingURLStringErrorKey] as? String,
+                          let failingUrl = URL(string: failingString), let target = failingUrl.host, !target.isEmpty {
+                    effectiveHost = target
+                }
+            }
             if let pathObj = ns.userInfo["_NSURLErrorNWPathKey"] {
                 if #available(iOS 14.2, macOS 11.0, *),
                    let path = pathObj as? OS_nw_path,
@@ -25,12 +35,14 @@ struct HubNetworkError: LocalizedError {
                     return "local_network_permission_denied"
                 }
             }
-            if (ns.domain == NetService.errorDomain || ns.domain == "kCFErrorDomainDNSServiceDiscovery") && ns.code == -65555 {
+            if (ns.domain == NetService.errorDomain || ns.domain == "kCFErrorDomainDNSServiceDiscovery" || ns.domain == "kNWErrorDomainDNS") && ns.code == -65555 {
                 return "local_network_permission_denied"
             }
-            if ns.domain == NSPOSIXErrorDomain || ns.domain == (kCFErrorDomainPOSIX as String) {
+            if ns.domain == "kNWErrorDomainDNS" {
+                nwDnsError = true
+            }
+            if ns.domain == NSPOSIXErrorDomain || ns.domain == (kCFErrorDomainPOSIX as String) || ns.domain == "kNWErrorDomainPOSIX" {
                 posixCode = posixCode ?? ns.code
-                if ns.code == Int(EPERM) { return "local_network_permission_denied" }
             }
             if ns.domain == NSURLErrorDomain && urlCode == nil {
                 urlCode = URLError.Code(rawValue: ns.code)
@@ -38,8 +50,22 @@ struct HubNetworkError: LocalizedError {
             current = ns.userInfo[NSUnderlyingErrorKey] as? NSError
             depth += 1
         }
+        if let code = urlCode {
+            switch code {
+            case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff: return "native_network_offline"
+            case .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
+                 .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid: return "native_tls_untrusted"
+            case .cannotFindHost, .dnsLookupFailed: return "native_dns_failed"
+            default: break
+            }
+        }
         if let posix = posixCode {
             switch Int32(posix) {
+            case EPERM:
+                if let target = effectiveHost, HubTLS.isLocalNetworkHost(target) {
+                    return "local_network_permission_denied"
+                }
+                return "native_host_unreachable"
             case ECONNREFUSED: return "native_connection_refused"
             case ETIMEDOUT: return "native_request_timeout"
             case EHOSTUNREACH, ENETUNREACH, EHOSTDOWN, ENETDOWN: return "native_host_unreachable"
@@ -49,15 +75,12 @@ struct HubNetworkError: LocalizedError {
         if let code = urlCode {
             switch code {
             case .timedOut: return "native_request_timeout"
-            case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff: return "native_network_offline"
             case .networkConnectionLost: return "native_connection_reset"
-            case .cannotFindHost, .dnsLookupFailed: return "native_dns_failed"
             case .cannotConnectToHost: return "native_host_unreachable"
-            case .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
-                 .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid: return "native_tls_untrusted"
             default: break
             }
         }
+        if nwDnsError { return "native_dns_failed" }
         return fallback
     }
 }
@@ -90,6 +113,31 @@ enum HubTLS {
 
     static func hostname(_ url: URL) -> String {
         (url.host ?? "").lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+    }
+
+    static func isLocalNetworkHost(_ raw: String) -> Bool {
+        var host = raw.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if host.hasSuffix(".") { host.removeLast() }
+        if host.isEmpty { return false }
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        if parts.count == 4 {
+            let octets = parts.compactMap { Int($0) }
+            if octets.count == 4 && octets.allSatisfy({ (0...255).contains($0) }) {
+                return octets[0] == 10
+                    || (octets[0] == 192 && octets[1] == 168)
+                    || (octets[0] == 172 && (16...31).contains(octets[1]))
+                    || (octets[0] == 169 && octets[1] == 254)
+            }
+        }
+        if host.contains(":") {
+            if host.hasPrefix("fd7a:115c:a1e0:") { return false }
+            if host.hasPrefix("fe80:") { return true }
+            if host.hasPrefix("fc") || host.hasPrefix("fd") {
+                let first = host.split(separator: ":").first ?? ""
+                if first.count == 4, UInt16(first, radix: 16) != nil { return true }
+            }
+        }
+        return host.hasSuffix(".local") || host.hasSuffix(".lan")
     }
 
     static func target(_ base: URL, _ path: String) throws -> URL {
@@ -203,6 +251,7 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
     /// QR-provided roots are scoped to this origin and Hub identity. Hostname,
     /// certificate validity, identity proof and exact-leaf pinning still apply.
     static func prepare(origin: String, publicKey: String, queue: DispatchQueue, anchors: [SecCertificate]? = nil,
+                        timeout: TimeInterval = 5,
                         completion: @escaping (Result<HubTLSSession, Error>) -> Void) throws -> HubTLSSession {
         dispatchPrecondition(condition: .onQueue(queue))
         let base = try HubTLS.origin(origin)
@@ -211,12 +260,15 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
         let connection = HubTLSSession(base: base, queue: queue, anchors: anchors)
         let probe = HubProofHandler(connection: connection, publicKey: publicKey, nonce: nonce, completion: completion)
         var request = URLRequest(url: try HubTLS.target(base, "/api/tls-identity?nonce=" + nonce))
-        request.timeoutInterval = 5
+        request.timeoutInterval = timeout
         let task = connection.session.dataTask(with: request)
         connection.handlers[task.taskIdentifier] = probe
-        let deadline = DispatchWorkItem { task.cancel() }
+        let deadline = DispatchWorkItem { [weak probe] in
+            probe?.markTimeout()
+            task.cancel()
+        }
         probe.deadline = deadline
-        queue.asyncAfter(deadline: .now() + 5, execute: deadline)
+        queue.asyncAfter(deadline: .now() + timeout, execute: deadline)
         task.resume()
         return connection
     }
@@ -457,10 +509,13 @@ private final class HubProofHandler: HubTaskHandler {
         }
         bytes.append(data)
     }
+    func markTimeout() {
+        if failure == nil { failure = HubNetworkError("native_request_timeout") }
+    }
     override func completed(_ error: Error?) {
         deadline?.cancel(); deadline = nil
         do {
-            if let error = failure ?? error { throw error }
+            if let error = connection.trustFailure ?? failure ?? error { throw error }
             try connection.bindProof(bytes, key: key, nonce: nonce)
             completion(.success(connection))
         } catch { connection.cancelAll(); completion(.failure(error)) }

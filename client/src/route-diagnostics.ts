@@ -22,10 +22,21 @@ export type RouteDiagnosisCode =
   | "tls-untrusted"
   | "multi-route-unreachable";
 
+export type RouteDiagnosisSnapshot = {
+  context: "pairing" | "paired";
+  hostName?: string;
+  online: boolean;
+  verificationFailure?: ConnectionVerificationFailure;
+  attempts: ReadonlyArray<{ kind: RouteKind; reason: RouteTransportFailure }>;
+  unprobedTailscale: boolean;
+  unprobedVps: boolean;
+};
+
 export type RouteDiagnosis = {
   code: RouteDiagnosisCode;
   message: string;
   actionRequired: boolean;
+  snapshot?: RouteDiagnosisSnapshot;
 };
 
 export type RouteFailureAttempt = {
@@ -79,7 +90,7 @@ export function classifyRouteKind(route: Pick<Route, "name" | "url">): RouteKind
 }
 
 /** Classify a transport/network failure without assuming unchecked causes. */
-export function classifyRouteTransportFailure(error: unknown): RouteTransportFailure {
+export function classifyRouteTransportFailure(error: unknown, route?: Pick<Route, "name" | "url">): RouteTransportFailure {
   const name = error instanceof Error ? error.name : "";
   const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
   const code = message.trim();
@@ -88,7 +99,7 @@ export function classifyRouteTransportFailure(error: unknown): RouteTransportFai
     code === "local_network_permission_denied"
     || /local network (?:prohibited|permission denied)|nslocalnetwork|kdnsserviceerr_policydenied|-65555/i.test(code)
   ) {
-    return "local-network-denied";
+    return route && classifyRouteKind(route) !== "lan" ? "host-unreachable" : "local-network-denied";
   }
   if (
     code === "native_network_offline"
@@ -213,37 +224,23 @@ function lanUnreachableMessage(
     : t("无法通过局域网连接「{0}」，正在自动重试。你似乎已离开该 Wi-Fi / 局域网，或主机处于休眠、未运行 TaroBird。外出使用可在主机开启 Tailscale 后扫码添加，或在「编辑线路」中配置 VPS 中转。", hostName);
 }
 
-/** Produce an actionable, evidence-based failure reason from the actually
- * attempted routes and their observed errors. Never blames an unchecked cause. */
-export function diagnoseRouteFailures(
-  attempts: readonly RouteFailureAttempt[],
-  options: {
-    context: "pairing" | "paired";
-    hostName?: string;
-    configuredRoutes?: readonly Pick<Route, "name" | "url">[];
-    online?: boolean;
-  },
-): RouteDiagnosis {
-  const hostName = options.hostName?.trim() || t("此主机");
-  const context = options.context;
-  const online = options.online ?? (typeof navigator === "undefined" ? true : navigator.onLine);
+function resolveRouteDiagnosis(
+  snapshot: RouteDiagnosisSnapshot,
+  hostNameOverride?: string,
+): { code: RouteDiagnosisCode; message: string; actionRequired: boolean } {
+  const hostName = hostNameOverride?.trim() || snapshot.hostName?.trim() || t("此主机");
+  const context = snapshot.context;
+  const parsed = snapshot.attempts;
 
-  const verificationFailure = preferredVerificationFailure(attempts.map((attempt) => connectionVerificationFailure(attempt.error)));
-  if (verificationFailure) {
+  if (snapshot.verificationFailure) {
     return {
-      code: verificationFailure,
-      message: connectionVerificationMessage(verificationFailure, context)!,
+      code: snapshot.verificationFailure,
+      message: connectionVerificationMessage(snapshot.verificationFailure, context)!,
       actionRequired: true,
     };
   }
 
-  const parsed = attempts.map((attempt) => ({
-    route: attempt.route,
-    kind: classifyRouteKind(attempt.route),
-    reason: classifyRouteTransportFailure(attempt.error),
-  }));
-
-  if (parsed.some((entry) => entry.reason === "local-network-denied")) {
+  if (parsed.some((entry) => entry.reason === "local-network-denied" && entry.kind === "lan")) {
     const hasNonLan = parsed.some((entry) => entry.kind !== "lan" && entry.kind !== "loopback");
     return {
       code: "local-network-denied",
@@ -251,17 +248,6 @@ export function diagnoseRouteFailures(
         ? t("TaroBird 没有获得“本地网络”权限，无法访问局域网主机，且其他已尝试线路也未连接成功。请在设备的「设置 → 隐私与安全性 → 本地网络」中允许 TaroBird，或检查远程线路与主机状态。")
         : t("TaroBird 没有获得“本地网络”权限，无法访问局域网主机。请在设备的「设置 → 隐私与安全性 → 本地网络」中允许 TaroBird，然后重试。"),
       actionRequired: true,
-    };
-  }
-
-  const allLoopback = parsed.length > 0 && parsed.every((entry) => entry.kind === "loopback");
-  if (!allLoopback && (!online || (parsed.length > 0 && parsed.every((entry) => entry.reason === "client-offline")))) {
-    return {
-      code: "client-offline",
-      message: context === "pairing"
-        ? t("当前设备未连接到网络（Wi-Fi 或蜂窝网络未开启）。请先联网后再试。")
-        : t("当前设备未连接到网络，暂时无法连接「{0}」。请检查 Wi-Fi 或蜂窝网络后重试。", hostName),
-      actionRequired: false,
     };
   }
 
@@ -277,6 +263,18 @@ export function diagnoseRouteFailures(
   if (refused) {
     const result = refusedMessage(refused.kind, context, hostName);
     return { ...result, actionRequired: false };
+  }
+
+  const allLoopback = parsed.length > 0 && parsed.every((entry) => entry.kind === "loopback");
+  const hasPeerEvidence = parsed.some((entry) => entry.reason === "tls-untrusted" || entry.reason === "connection-refused");
+  if (!allLoopback && !hasPeerEvidence && (!snapshot.online || (parsed.length > 0 && parsed.every((entry) => entry.reason === "client-offline")))) {
+    return {
+      code: "client-offline",
+      message: context === "pairing"
+        ? t("当前设备未连接到网络（Wi-Fi 或蜂窝网络未开启）。请先联网后再试。")
+        : t("当前设备未连接到网络，暂时无法连接「{0}」。请检查 Wi-Fi 或蜂窝网络后重试。", hostName),
+      actionRequired: false,
+    };
   }
 
   if (parsed.length > 0 && parsed.every((entry) => entry.reason === "dns-failed")) {
@@ -318,15 +316,13 @@ export function diagnoseRouteFailures(
   }
 
   if (hasLan && !hasTailscale && !hasRemote) {
-    const attemptedUrls = new Set(parsed.map((entry) => entry.route.url));
-    const unprobed = (options.configuredRoutes ?? []).filter((route) => !attemptedUrls.has(route.url));
     return {
       code: "lan-unreachable",
       message: lanUnreachableMessage(
         context,
         hostName,
-        unprobed.some((route) => classifyRouteKind(route) === "tailscale"),
-        unprobed.some((route) => classifyRouteKind(route) === "vps"),
+        snapshot.unprobedTailscale,
+        snapshot.unprobedVps,
       ),
       actionRequired: false,
     };
@@ -369,4 +365,41 @@ export function diagnoseRouteFailures(
       : t("已尝试的所有线路均无法连接「{0}」，正在自动重试。请确认主机未休眠、TaroBird 正在运行，并检查 Tailscale 或中转服务状态。", hostName),
     actionRequired: false,
   };
+}
+
+/** Format a stored route diagnosis in the active UI locale. */
+export function routeDiagnosisMessage(diagnosis: RouteDiagnosis | undefined, hostName?: string): string | undefined {
+  if (!diagnosis) return undefined;
+  return diagnosis.snapshot ? resolveRouteDiagnosis(diagnosis.snapshot, hostName).message : diagnosis.message;
+}
+
+/** Produce an actionable, evidence-based failure reason from the actually
+ * attempted routes and their observed errors. Never blames an unchecked cause. */
+export function diagnoseRouteFailures(
+  attempts: readonly RouteFailureAttempt[],
+  options: {
+    context: "pairing" | "paired";
+    hostName?: string;
+    configuredRoutes?: readonly Pick<Route, "name" | "url">[];
+    online?: boolean;
+  },
+): RouteDiagnosis {
+  const online = options.online ?? (typeof navigator === "undefined" ? true : navigator.onLine);
+  const verificationFailure = preferredVerificationFailure(attempts.map((attempt) => connectionVerificationFailure(attempt.error)));
+  const parsed = attempts.map((attempt) => ({
+    kind: classifyRouteKind(attempt.route),
+    reason: classifyRouteTransportFailure(attempt.error, attempt.route),
+  }));
+  const attemptedUrls = new Set(attempts.map((attempt) => attempt.route.url));
+  const unprobed = (options.configuredRoutes ?? []).filter((route) => !attemptedUrls.has(route.url));
+  const snapshot: RouteDiagnosisSnapshot = {
+    context: options.context,
+    hostName: options.hostName?.trim() || undefined,
+    online,
+    verificationFailure,
+    attempts: parsed,
+    unprobedTailscale: unprobed.some((route) => classifyRouteKind(route) === "tailscale"),
+    unprobedVps: unprobed.some((route) => classifyRouteKind(route) === "vps"),
+  };
+  return { ...resolveRouteDiagnosis(snapshot), snapshot };
 }

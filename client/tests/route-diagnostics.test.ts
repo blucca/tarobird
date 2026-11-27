@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientCache, Identity } from "../src/storage.js";
 import { setLocale } from "../src/i18n.js";
-import { connectionErrorMessage } from "../src/connection-verification.js";
+import { connectionErrorMessage, nativeLifecycleErrorCode } from "../src/connection-verification.js";
 import { pairingInviteError } from "../src/pairing-invite-errors.js";
-import { classifyRouteKind, classifyRouteTransportFailure, diagnoseRouteFailures, routeHealthStatusLabel } from "../src/route-diagnostics.js";
+import { classifyRouteKind, classifyRouteTransportFailure, diagnoseRouteFailures, routeDiagnosisMessage, routeHealthStatusLabel } from "../src/route-diagnostics.js";
 
 const io = vi.hoisted(() => ({ socket: vi.fn(), fetch: vi.fn() }));
 vi.mock("../src/storage.js", () => ({ cache: {}, ClientCache: class {}, defaultPreferences: {} }));
@@ -130,6 +130,38 @@ describe("route-diagnostics", () => {
     expect(routeHealthStatusLabel({ url: tailscale.url, status: "unreachable", reason: "local-network-denied" }).label).toBe("Local network permission denied");
     expect(routeHealthStatusLabel({ url: tailscale.url, status: "unreachable", reason: "connection-refused" }).label).toBe("Host refused connection");
   });
+
+  it("never blames iOS local network permission for non-LAN routes and prioritizes positive network evidence over navigator.onLine === false", () => {
+    const tailscale = { name: "Tailscale" as const, url: "https://100.64.0.1:8788" };
+    const lan = { name: "Direct" as const, url: "https://192.168.1.100:8788" };
+
+    setLocale("zh");
+    expect(classifyRouteTransportFailure("local_network_permission_denied", tailscale)).toBe("host-unreachable");
+    expect(classifyRouteTransportFailure("local_network_permission_denied", lan)).toBe("local-network-denied");
+    const tsEperm = diagnoseRouteFailures([{ route: tailscale, error: "local_network_permission_denied" }], { context: "pairing", online: true });
+    expect(tsEperm.code).toBe("tailscale-unreachable");
+    expect(tsEperm.actionRequired).toBe(false);
+    expect(tsEperm.message).not.toMatch(/本地网络|Local Network permission/);
+
+    const refusedOffline = diagnoseRouteFailures([{ route: lan, error: "native_connection_refused" }], { context: "pairing", online: false });
+    expect(refusedOffline.code).toBe("lan-refused");
+    expect(refusedOffline.message).not.toMatch(/未连接到网络/);
+
+    const untrustedOffline = diagnoseRouteFailures([{ route: lan, error: "native_tls_untrusted" }], { context: "pairing", online: false });
+    expect(untrustedOffline.code).toBe("tls-untrusted");
+    expect(untrustedOffline.actionRequired).toBe(true);
+
+    // Re-translating a stored diagnosis updates both message text and default host fallback.
+    const unnamed = diagnoseRouteFailures([{ route: tailscale, error: "native_request_timeout" }], { context: "paired", online: true });
+    expect(routeDiagnosisMessage(unnamed)).toContain("此主机");
+    setLocale("en");
+    expect(routeDiagnosisMessage(unnamed)).toContain("this host");
+    expect(routeDiagnosisMessage(unnamed)).toMatch(/Cannot reach .* over Tailscale/);
+    expect(routeDiagnosisMessage(unnamed, "macmini")).toContain("macmini");
+
+    expect(nativeLifecycleErrorCode("native_transport_unavailable")).toBe("native_transport_unavailable");
+    expect(connectionErrorMessage("native_transport_unavailable")).toMatch(/reopen TaroBird/i);
+  });
 });
 
 describe("HubConnection route diagnostics", () => {
@@ -176,11 +208,26 @@ describe("HubConnection route diagnostics", () => {
     lanConn.close();
   });
 
-  it("keeps working fallback routes unchanged and clears prior routeDiagnosis when a probe succeeds", async () => {
+  it("keeps working fallback routes unchanged, clears prior routeDiagnosis when a probe succeeds, and preserves subsequent WS errors", async () => {
     const lan = { name: "Direct" as const, url: "https://192.168.1.100:8788" };
     const tailscale = { name: "Tailscale" as const, url: "https://100.64.0.1:8788" };
     const conn = makeConnection([lan, tailscale]);
-    io.socket.mockReturnValue({ readyState: 1, send: vi.fn(), close: vi.fn() });
+
+    // First probe fails all routes and sets routeDiagnosis.
+    io.fetch.mockRejectedValue(new Error("native_request_timeout"));
+    await (Reflect.get(conn, "connect") as () => Promise<void>).call(conn);
+    expect(conn.state.routeDiagnosis?.code).toBe("lan-and-tailscale-unreachable");
+    expect(conn.state.error).toContain("macmini");
+
+    // Re-translating stored routeDiagnosis reflects locale switches immediately.
+    setLocale("en");
+    expect(routeDiagnosisMessage(conn.state.routeDiagnosis)).toContain("macmini");
+    expect(routeDiagnosisMessage(conn.state.routeDiagnosis)).toMatch(/Neither the local network nor the Tailscale route/);
+    setLocale("zh");
+
+    // Subsequent probe succeeds on Tailscale: clears routeDiagnosis and its error BEFORE ready.
+    const socket = { readyState: 1, send: vi.fn(), close: vi.fn(), onmessage: null as ((event: { data: string }) => void) | null };
+    io.socket.mockReturnValue(socket);
     io.fetch.mockImplementation(async (url: string) => {
       if (url === lan.url) throw new Error("native_request_timeout");
       return Response.json({ ok: true, publicKey: "trusted" });
@@ -190,7 +237,21 @@ describe("HubConnection route diagnostics", () => {
     await pending;
     expect(conn.state.route?.url).toBe(tailscale.url);
     expect(conn.state.routeDiagnosis).toBeUndefined();
+    expect(conn.state.error).toBeUndefined();
     expect(io.socket).toHaveBeenCalledWith(tailscale.url, "trusted");
+
+    // A subsequent WS error (e.g. rate_limited) must surface without stale routeDiagnosis hiding it.
+    socket.onmessage?.({ data: JSON.stringify({ v: 1, type: "error", code: "rate_limited" }) });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(conn.state.routeDiagnosis).toBeUndefined();
+    expect(conn.state.error).toContain("连接尝试过于频繁");
+
+    // Updating routes also clears any prior routeDiagnosis immediately.
+    io.fetch.mockRejectedValue(new Error("native_request_timeout"));
+    await (Reflect.get(conn, "connect") as () => Promise<void>).call(conn);
+    expect(conn.state.routeDiagnosis?.code).toBe("lan-and-tailscale-unreachable");
+    await conn.updateRoutes([tailscale]);
+    expect(conn.state.routeDiagnosis).toBeUndefined();
     conn.close();
   });
 });

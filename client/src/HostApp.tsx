@@ -318,7 +318,7 @@ function HostAppSession({ Workspace, Pairing }: HostAppProps) {
   useEffect(() => {
     let alive = true;
     void (async () => {
-      const prefs = await registry.preferences(); if (!alive) return; setPreferences(prefs);
+      const prefs = await registry.preferences(); if (!alive) return; setLocale(prefs.locale); setPreferences(prefs);
       // Complete old single-host cleanup before importing its database. It is
       // never reused as the multi-host removal path.
       if (await cache.pendingReset() && !(await registry.list()).length) { setLegacyReset(true); return; }

@@ -322,11 +322,11 @@ impl Transport {
             }
             let response = match request.send().await {
                 Ok(value) => value,
-                Err(_) => {
+                Err(err) => {
                     self.network
                         .forget(&input.origin, input.hub_key.as_deref())
                         .await;
-                    return Err("native_request_failed".into());
+                    return Err(pinned::classify_reqwest_error(&err, "native_request_failed").into());
                 }
             };
             let head = HttpHead {

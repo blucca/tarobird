@@ -26,7 +26,7 @@ import { conversationFoldersSchema, emptyConversationFolders, type ConversationF
 import { connectionTiming } from "./connection-timing.js";
 import { RoutePerformance, ROUTE_OBSERVATION_MS, ROUTE_DWELL_MS, ROUTE_STABLE_PROBE_MS, ROUTE_CANDIDATE_PROBE_MS } from "./route-performance.js";
 import { rememberRouteTrust } from "./route-trust.js";
-import { connectionErrorMessage, connectionVerificationFailure } from "./connection-verification.js";
+import { connectionErrorMessage, connectionVerificationFailure, nativeLifecycleErrorCode } from "./connection-verification.js";
 import { classifyRouteTransportFailure, diagnoseRouteFailures, type RouteDiagnosis } from "./route-diagnostics.js";
 import { runtimeHostId } from "./host-registry.js";
 import { orderedRoutes, localRoutesSchema, deploymentSchema, deploymentMatchesRoutes, type Deployment, type RouteHealth } from "../../src/client-protocol/routes.js";
@@ -307,7 +307,7 @@ export class HubConnection {
       }
       this.activeMessages = new Set(active); this.update({ ...profiles, conversationFolders, outbox: outbox.length, ...(cachedNetwork ? { network: cachedNetwork } : {}) }, true);
       if (this.networkBlocked) { this.suspendNetwork(); return; }
-      if (revoked) { this.deviceRevoked = true; if (this.networkPin) this.networkBlocked = true; this.close(); this.update({ error: t("此设备已被吊销，请重新配对") }); return; }
+      if (revoked) { this.deviceRevoked = true; if (this.networkPin) this.networkBlocked = true; this.close(); this.update({ error: t("此设备已被吊销，请重新配对"), routeDiagnosis: undefined }); return; }
       void this.downloadCheckpoints.sweep().catch(() => undefined);
       void sweepTemporaryDownloads().catch(() => undefined);
       await this.connect();
@@ -315,7 +315,7 @@ export class HubConnection {
     this.starting = work.catch((error: unknown) => {
       if (lifecycle === this.lifecycle) {
         if (this.cache.isClosed) { this.cacheUnavailable(); throw new Error(connectionErrorMessage("local_cache_unavailable")); }
-        else { this.close(); this.update({ error: error instanceof Error ? error.message : t("连接失败") }); }
+        else { this.close(); this.update({ error: error instanceof Error ? error.message : t("连接失败"), routeDiagnosis: undefined }); }
       }
       throw error;
     }).finally(() => { if (lifecycle === this.lifecycle) this.starting = undefined; });
@@ -383,7 +383,7 @@ export class HubConnection {
   private cacheUnavailable(): void {
     if (this.closed) return;
     this.close(true);
-    this.update({ error: connectionErrorMessage("local_cache_unavailable") });
+    this.update({ error: connectionErrorMessage("local_cache_unavailable"), routeDiagnosis: undefined });
   }
   private async selectRoute(allowCooldown = false, generation = this.generation): Promise<{ route: Route; latency: number }> {
     rememberRouteTrust(this.identity.routes, this.identity.hubPublicKey);
@@ -417,10 +417,10 @@ export class HubConnection {
         return { url: route.url, status: (this.failedRoutes.get(route.url)?.until ?? 0) > Date.now() ? "cooldown" : "reachable", latency: Math.round(performance.now() - started) };
       } catch (error) {
         attemptErrors.set(route.url, error);
-        const code = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-        if (["native_document_retired", "native_document_unavailable", "native_view_unavailable"].includes(code)) localFailure = connectionErrorMessage(code);
+        const localCode = nativeLifecycleErrorCode(error);
+        if (localCode) localFailure = connectionErrorMessage(localCode);
         const failure = connectionVerificationFailure(error);
-        const reason = failure ? undefined : classifyRouteTransportFailure(error);
+        const reason = failure ? undefined : classifyRouteTransportFailure(error, route);
         return { url: route.url, status: failure === "identity-mismatch" ? "wrong-hub" : "unreachable", ...(failure ? { failure } : {}), ...(reason ? { reason } : {}) };
       }
     };
@@ -447,7 +447,7 @@ export class HubConnection {
         .sort((a, b) => (this.failedRoutes.get(a.url)?.until ?? 0) - (this.failedRoutes.get(b.url)?.until ?? 0))[0] : undefined);
     if (!candidate) {
       if (localFailure) throw new Error(localFailure);
-      const name = this.hostName?.()?.trim() || this.state.hostProfile?.name || this.state.network?.host.name || t("此主机");
+      const name = this.hostName?.()?.trim() || this.state.hostProfile?.name || this.state.network?.host.name || undefined;
       const diagnosis = diagnoseRouteFailures(
         probes.map(probe => ({ route: routes.find(route => route.url === probe.url)!, error: attemptErrors.get(probe.url) ?? probe.failure ?? probe.reason ?? "unreachable" })),
         { context: "paired", hostName: name, configuredRoutes },
@@ -472,7 +472,7 @@ export class HubConnection {
       // A system credential prompt can outlive its socket. Wait for that one
       // operation instead of issuing another native read on every reconnect.
       if (this.signing) {
-        this.update({ error: connectionErrorMessage("device_signature_pending") });
+        this.update({ error: connectionErrorMessage("device_signature_pending"), routeDiagnosis: undefined });
         await this.signing.catch(() => undefined);
         if (generation !== this.generation || this.closed) return;
       }
@@ -485,12 +485,12 @@ export class HubConnection {
         ? { route: handoff.route, latency: handoff.latency } : await this.selectRoute(true, generation);
       if (generation !== this.generation || this.closed) return;
       const handshakeStarted = performance.now();
-      this.update(chosen); const ws = hubSocket(chosen.route.url, this.identity.hubPublicKey); this.ws = ws;
+      this.update({ ...chosen, routeDiagnosis: undefined, ...(this.state.routeDiagnosis ? { error: undefined } : {}) }); const ws = hubSocket(chosen.route.url, this.identity.hubPublicKey); this.ws = ws;
       let preparation: "socket" | "cache" | "host" | "signature" = "socket";
       this.handshake = setTimeout(() => {
         if (generation !== this.generation || this.closed) return;
         if (this.cache.isClosed) { this.cacheUnavailable(); return; }
-        this.update({ error: connectionErrorMessage(preparation === "signature" ? "device_signature_pending" : preparation === "cache" ? "local_cache_preparation_timeout" : "connection_handshake_timeout") });
+        this.update({ error: connectionErrorMessage(preparation === "signature" ? "device_signature_pending" : preparation === "cache" ? "local_cache_preparation_timeout" : "connection_handshake_timeout"), routeDiagnosis: undefined });
         this.abandon(ws, generation, preparation !== "signature" && preparation !== "cache");
       }, connectionTiming(chosen.route, usesPinnedTransport()).handshakeMs);
       const nonce = randomNonce(); let chain = Promise.resolve(), renewing = false, receiveFailed = false, localFailure = false, signingWait = 0, pendingFrames = 0;
@@ -510,7 +510,7 @@ export class HubConnection {
         // Cache preparation can fail before hello is sent. Surface that failure
         // instead of presenting an endless, unexplained network reconnect.
         this.cacheFull = error instanceof Error && error.name === "QuotaExceededError";
-        this.update({ error: connectionErrorMessage(error) });
+        this.update({ error: connectionErrorMessage(error), routeDiagnosis: undefined });
         this.abandon(ws, generation, preparation !== "cache");
       }); };
       ws.onmessage = (event) => {
@@ -727,13 +727,13 @@ export class HubConnection {
             // This is a local installation boundary, not a signed Host revocation
             // or network outage. Keep cached drafts/history, stop automatic retry
             // and never drain this identity's outbox into a fresh pairing.
-            this.pairingRequired = true; this.close(); this.update({ error: connectionErrorMessage(error) }); return;
+            this.pairingRequired = true; this.close(); this.update({ error: connectionErrorMessage(error), routeDiagnosis: undefined }); return;
           }
           if (this.cache.isClosed) { this.cacheUnavailable(); return; }
           this.cacheFull = error instanceof Error && error.name === "QuotaExceededError";
           localFailure = this.cacheFull || error instanceof Error && ["local_reset_in_progress", "sync_lineage_mismatch", "snapshot_lineage_mismatch"].includes(error.message)
             || preparation === "signature";
-          this.update({ error: connectionErrorMessage(error) });
+          this.update({ error: connectionErrorMessage(error), routeDiagnosis: undefined });
         }
         ws.close();
       }).finally(() => { pendingFrames--; }); };
@@ -1131,7 +1131,7 @@ export class HubConnection {
       for (const url of this.failedRoutes.keys()) if (!routes.some(route => route.url === url)) this.failedRoutes.delete(url);
       this.preferredProbeAt = 0;
       const current = routes.find(route => route.url === this.state.route?.url);
-      this.update({ routeSync: undefined, route: current ?? this.state.route, routeHealth: this.state.routeHealth?.filter(health => routes.some(route => route.url === health.url)) });
+      this.update({ routeSync: undefined, route: current ?? this.state.route, routeHealth: this.state.routeHealth?.filter(health => routes.some(route => route.url === health.url)), routeDiagnosis: undefined, ...(this.state.routeDiagnosis ? { error: undefined } : {}) });
       if (this.state.status !== "online" || !current) this.resume(true);
       else void this.pollPreferredRoute(this.generation, true);
     });
@@ -1494,7 +1494,7 @@ export class HubConnection {
   private async acceptRevocation(): Promise<void> {
     this.deviceRevoked = true;
     if (this.networkPin) this.networkBlocked = true;
-    this.close(true); this.update({ error: t("此设备已被吊销，请重新配对") });
+    this.close(true); this.update({ error: t("此设备已被吊销，请重新配对"), routeDiagnosis: undefined });
     await this.cache.markIdentityRevoked(this.identity).catch(() => console.warn("device_revocation_cache_failed"));
   }
   close(preserveDeparture = false): void { this.clearForegroundProbe(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }

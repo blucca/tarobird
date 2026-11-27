@@ -13,8 +13,8 @@ import { cache, type Route, type Identity, type PendingPairing } from "./storage
 import { nativePlatform, deleteNativeIdentity } from "./native.js";
 import { t, useLocale } from "./i18n.js";
 import { hubFetch, usesPinnedTransport } from "./transport.js";
-import { connectionVerificationFailure, connectionVerificationMessage, validHubPublicKey } from "./connection-verification.js";
-import { classifyRouteKind, diagnoseRouteFailures, type RouteFailureAttempt } from "./route-diagnostics.js";
+import { connectionErrorMessage, connectionVerificationFailure, connectionVerificationMessage, nativeLifecycleErrorCode, validHubPublicKey } from "./connection-verification.js";
+import { classifyRouteKind, diagnoseRouteFailures, routeDiagnosisMessage, type RouteDiagnosis, type RouteFailureAttempt } from "./route-diagnostics.js";
 import { pairingInviteError } from "./pairing-invite-errors.js";
 
 const PairingCode = lazy(() => import("./PairingCode.js").then(module => ({ default: module.PairingCode })));
@@ -24,7 +24,7 @@ const DesktopWelcome = lazy(() => import("./DesktopWelcome.js").then(module => (
 const RepairHostRoute = lazy(() => import("./RepairHostRoute.js").then(module => ({ default: module.RepairHostRoute })));
 
 class PairingRequestError extends Error { constructor(readonly code: string, message: string) { super(message); } }
-const idle = { status: "offline" as const, error: undefined as string | undefined, awaitingApproval: false };
+const idle = { status: "offline" as const, error: undefined as string | undefined, routeDiagnosis: undefined as RouteDiagnosis | undefined, awaitingApproval: false };
 const noopSubscribe = () => () => undefined;
 export function Pairing({ connected, save, beforePair, discard, cancel, pendingConnection, manage, localHostReady = false }: PairingProps) {
   useLocale();
@@ -52,9 +52,9 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     });
     return () => cancelAnimationFrame(frame);
   }, [scan]);
-  const [createdIdentity, setIdentity] = useState<Identity>(), [error, setError] = useState(""), [routeFailure, setRouteFailure] = useState<{ attempts: RouteFailureAttempt[]; context: "pairing" | "paired"; hostName?: string; configuredRoutes: Route[]; prefix?: string }>(), [busy, setBusy] = useState(false);
+  const [createdIdentity, setIdentity] = useState<Identity>(), [error, setError] = useState(""), [routeFailure, setRouteFailure] = useState<{ attempts: RouteFailureAttempt[]; configuredRoutes: Route[]; online: boolean; pendingConfirm?: boolean }>(), [busy, setBusy] = useState(false);
   const displayedError = routeFailure
-    ? `${routeFailure.prefix ?? ""}${diagnoseRouteFailures(routeFailure.attempts, { context: routeFailure.context, hostName: routeFailure.hostName, configuredRoutes: routeFailure.configuredRoutes }).message}`
+    ? `${routeFailure.pendingConfirm ? `${t("配对申请结果待确认，请核对上次申请，不要重复创建设备。")} ` : ""}${diagnoseRouteFailures(routeFailure.attempts, { context: "pairing", configuredRoutes: routeFailure.configuredRoutes, online: routeFailure.online }).message}`
     : error;
   // On a short phone screen or desktop viewport the action sits near the bottom edge,
   // so a refusal below it would look like nothing happened. Reveal it; focus stays put.
@@ -70,11 +70,15 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   // Native phones: connection details were read, nothing is connected yet.
   // Derived only; the user still starts pairing and approves it elsewhere.
   const reviewing = phone && !!expectedKey && !pending;
-  const directHost = (() => { try { return address ? new URL(address).hostname : ""; } catch { return ""; } })();
-  const directRouteKind = address ? classifyRouteKind({ name: legacyDirect?.name ?? "Direct", url: address }) : undefined;
-  const tailscaleRoute = legacyDirect?.name === "Tailscale" || directRouteKind === "tailscale";
+  const trimmedAddress = address.trim();
+  const parsedAddress = (() => { try { return trimmedAddress ? new URL(trimmedAddress) : undefined; } catch { return undefined; } })();
+  const matchedLegacyDirect = legacyDirect && parsedAddress && legacyDirect.url === parsedAddress.origin ? legacyDirect : undefined;
+  const directHost = parsedAddress?.hostname ?? "";
+  const directRouteKind = trimmedAddress ? classifyRouteKind({ name: matchedLegacyDirect?.name ?? "Direct", url: trimmedAddress }) : undefined;
+  const tailscaleRoute = matchedLegacyDirect?.name === "Tailscale" || directRouteKind === "tailscale";
   const lanRoute = directRouteKind === "lan";
   const status = useSyncExternalStore(connection ? (notify) => connection.subscribe(notify) : noopSubscribe, () => connection?.state ?? idle);
+  const statusError = routeDiagnosisMessage(status.routeDiagnosis) ?? status.error;
   const [now, setNow] = useState(Date.now), completing = useRef(false), admission = useRef(false);
   const remaining = pending ? pairingRemaining(pending.expiresAt, now, pending.serverTimeOffset) : 0;
   useEffect(() => { if (!pending) return; const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, [pending]);
@@ -125,8 +129,11 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
           route,
           error: probes[index]?.status === "rejected" ? probes[index].reason : "hub_unavailable",
         }));
-        const diagnosis = diagnoseRouteFailures(attempts, { context: "pairing", configuredRoutes: routes });
-        setRouteFailure({ attempts, context: "pairing", configuredRoutes: routes });
+        const localCode = attempts.map((attempt) => nativeLifecycleErrorCode(attempt.error)).find(Boolean);
+        if (localCode) throw new Error(connectionErrorMessage(localCode));
+        const online = typeof navigator === "undefined" ? true : navigator.onLine;
+        const diagnosis = diagnoseRouteFailures(attempts, { context: "pairing", configuredRoutes: routes, online });
+        setRouteFailure({ attempts, configuredRoutes: routes, online });
         throw new Error(diagnosis.message);
       }
       if (!available.value.supportsInvites) throw new Error(t("请先更新此主机，才能使用限时连接码配对新设备。"));
@@ -176,10 +183,15 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
         if (verification) setError(verification);
         else if (e instanceof PairingRequestError) setError(e.message);
         else if (failedAttempts.length) {
-          const prefix = `${t("配对申请结果待确认，请核对上次申请，不要重复创建设备。")} `;
-          const diagnosis = diagnoseRouteFailures(failedAttempts, { context: "paired", hostName: identity.name, configuredRoutes: identity.routes });
-          setRouteFailure({ attempts: failedAttempts, context: "paired", hostName: identity.name, configuredRoutes: identity.routes, prefix });
-          setError(`${prefix}${diagnosis.message}`);
+          const localCode = failedAttempts.map((attempt) => nativeLifecycleErrorCode(attempt.error)).find(Boolean);
+          if (localCode) {
+            setError(connectionErrorMessage(localCode));
+          } else {
+            const online = typeof navigator === "undefined" ? true : navigator.onLine;
+            const diagnosis = diagnoseRouteFailures(failedAttempts, { context: "pairing", configuredRoutes: identity.routes, online });
+            setRouteFailure({ attempts: failedAttempts, configuredRoutes: identity.routes, online, pendingConfirm: true });
+            setError(`${t("配对申请结果待确认，请核对上次申请，不要重复创建设备。")} ${diagnosis.message}`);
+          }
         } else {
           setError(t("配对申请结果待确认，请核对上次申请，不要重复创建设备。"));
         }
@@ -216,7 +228,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       {pending.code && <><div className="pair-code" aria-label={t("配对码")}>{pending.code}</div>
       <p className="pairing-countdown">{remaining ? t("有效时间 {0}:{1}", Math.floor(remaining / 60), String(remaining % 60).padStart(2, "0")) : t("配对码已过期，请扫描新的限时连接码。")}</p></>}
       <div role="status" className="pairing-connection-status">{remaining > 0 && <LoaderCircle className="spin" size={18}/>}<span>{status.status === "online" ? joiningDesktop ? t("已连接，正在继续加入网络…") : t("已连接，正在打开聊天…") : !pending.code ? busy ? t("正在核对申请…") : ["pairing_invite_invalid", "pairing_invite_expired", "pairing_invite_used", "pairing_invite_required"].includes(requestError ?? "") ? t("连接码无效或已过期，请重新获取。") : t("配对申请结果待确认，请核对上次申请。") : !remaining ? t("配对码已过期，请扫描新的限时连接码。") : status.awaitingApproval ? t("等待已配对设备确认…") : t("正在连接主机…")}</span></div>
-      {status.error && <p className="error-text" role="alert">{status.error}</p>}
+      {statusError && <p className="error-text" role="alert">{statusError}</p>}
       {displayedError && <p ref={failure} role="alert" className="error-text">{displayedError}</p>}
       <button className="secondary full" disabled={busy || status.status === "connecting"} onClick={() => { setError(""); setRouteFailure(undefined); completing.current = false; connection?.resume(true); }}>{t("重新检查连接")}</button>
       {!pending.code && pending.request && <button className="primary full" disabled={busy} onClick={() => void submitPending()}>{busy ? t("正在核对申请…") : t("核对上次申请")}</button>}

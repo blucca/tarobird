@@ -188,7 +188,10 @@ final class HubTransport: @unchecked Sendable {
                 self.queue.async {
                     guard self.owns(slot), let callback = slot.sends.removeValue(forKey: send) else { return }
                     slot.outgoingBytes -= bytes; self.outgoingBytes -= bytes
-                    if let error = error { callback(.failure(error)); self.finish(slot, error) }
+                    if let error = error {
+                        let classified = HubNetworkError(HubNetworkError.classify(error, host: slot.host))
+                        callback(.failure(classified)); self.finish(slot, classified)
+                    }
                     else { callback(.success([:])) }
                 }
             }
@@ -270,6 +273,7 @@ final class HubTransport: @unchecked Sendable {
     private func prepare(_ slot: HubSlot, _ origin: String, _ key: String, authority: String? = nil, _ ready: @escaping (HubTLSSession) throws -> Void) {
         do {
             let base = try HubTLS.origin(origin); _ = try HubTLS.publicKey(key)
+            slot.host = HubTLS.hostname(base)
             var scopedAnchors = anchors
             if let authority = authority {
                 guard authority.utf8.count <= 4096, let der = Data(base64Encoded: authority),
@@ -313,7 +317,7 @@ final class HubTransport: @unchecked Sendable {
         guard owns(slot) else { return }
         if let error = error {
             let failure = slot.connection?.trustFailure ?? error
-            emit(slot, ["kind": "error", "error": HubNetworkError.classify(failure, fallback: "native_socket_failed")])
+            emit(slot, ["kind": "error", "error": HubNetworkError.classify(failure, fallback: "native_socket_failed", host: slot.host)])
             forget(slot); finish(slot, failure)
         }
         else { finish(slot, HubNetworkError("native_socket_closed_without_peer_receipt")) }
@@ -381,7 +385,7 @@ final class HubTransport: @unchecked Sendable {
         slot.screen?.retire(); slot.screen = nil
         slot.deadline?.cancel(); slot.closeDeadline?.cancel()
         slot.openingTask?.cancel(); slot.readingTask?.cancel(); slot.task?.cancel(); slot.handler = nil; slot.stream = nil; slot.connection = nil
-        let failure = error ?? HubNetworkError("native_request_cancelled")
+        let failure: Error = error.map { HubNetworkError(HubNetworkError.classify($0, host: slot.host)) } ?? HubNetworkError("native_request_cancelled")
         let open = slot.openReply, read = slot.readReply, sends = Array(slot.sends.values)
         slot.openReply = nil; slot.readReply = nil; slot.sends.removeAll()
         open?(.failure(failure)); read?(.failure(failure)); sends.forEach { $0(.failure(failure)) }
@@ -399,7 +403,7 @@ private final class HubRouteFlight {
 fileprivate final class HubSlot: @unchecked Sendable {
     let id = UUID().uuidString, document: String, kind: String
     var started = false, head = false, open = false, closing = false, paused = false, receiving = false
-    var route: String?, task: URLSessionTask?, handler: HubTaskHandler?
+    var route: String?, host: String?, task: URLSessionTask?, handler: HubTaskHandler?
     var screen: HubScreenSession?, screenToken: UInt64?
     var connection: HubTLSSession?
     var deadline: DispatchWorkItem?, closeDeadline: DispatchWorkItem?
