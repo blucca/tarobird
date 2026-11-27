@@ -5,12 +5,14 @@ import path from "node:path";
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HubServer } from "../../src/hub/server.js";
+import { CrossHostFolderOrder } from "../../src/hub/cross-host-folder-order.js";
 import { deviceProof } from "../../src/hub/auth.js";
 
 const idbState = vi.hoisted(() => ({ dbs: new Map<string, Map<string, Map<string, unknown>>>() }));
 const transportState = vi.hoisted(() => ({
   blockHttp: new Set<string>(),
   sockets: new Set<WebSocket>(),
+  httpInterceptor: undefined as undefined | ((origin: string, reqPath: string, init: RequestInit, next: () => Promise<Response>) => Promise<Response>),
 }));
 
 vi.mock("idb", () => {
@@ -130,7 +132,8 @@ vi.mock("../src/transport.js", () => ({
   },
   hubFetch: async (origin: string, reqPath: string, _hubKey?: string, init: RequestInit = {}) => {
     if (transportState.blockHttp.has(origin)) throw new TypeError("offline");
-    return fetch(origin + reqPath, init);
+    const run = () => fetch(origin + reqPath, init);
+    return transportState.httpInterceptor ? transportState.httpInterceptor(origin, reqPath, init, run) : run();
   },
 }));
 
@@ -147,6 +150,7 @@ import {
   flushCrossHostFolderOrderPersistence,
   readCrossHostFolderOrder,
   readyCrossHostFolderOrder,
+  removeCrossHostFolderOrderHost,
   resetCrossHostFolderOrderCache,
   writeCrossHostFolderOrder,
 } from "../src/cross-host-folder-order.js";
@@ -219,11 +223,13 @@ describe("client cross-host folder order multi-Hub sync", () => {
   beforeEach(() => {
     idbState.dbs.clear();
     transportState.blockHttp.clear();
+    transportState.httpInterceptor = undefined;
     resetCrossHostFolderOrderCache();
     installBrowserGlobals();
   });
 
   afterEach(async () => {
+    transportState.httpInterceptor = undefined;
     for (const coord of coordinators.splice(0)) coord.dispose();
     for (const c of connections.splice(0)) c.close();
     for (const ws of transportState.sockets) ws.terminate();
@@ -494,5 +500,220 @@ describe("client cross-host folder order multi-Hub sync", () => {
     expect(recovered.ordinary[0]).toBe(k("keyB", "b1"));
     expect(recovered.updatedAt).toBe(saved.updatedAt);
     expect(JSON.parse(localStorage.getItem(CROSS_HOST_FOLDER_ORDER_KEY)!)).toEqual(saved);
+  });
+
+  it("converges finitely with bounded PATCH count when two owner Hubs have clocks >60s apart", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-cross-order-skew-"));
+    const hubA = await HubServer.start({ stateDir: path.join(root, "a") });
+    const hubB = await HubServer.start({ stateDir: path.join(root, "b") });
+    hubs.push(hubA, hubB);
+
+    // Hub A clock is 180s ahead of Hub B (> 60s FUTURE_CLOCK_TOLERANCE_MS).
+    const skewedStoreA = new CrossHostFolderOrder(hubA.store.db, () => Date.now() + 180_000);
+    Reflect.set(hubA, "crossHostFolderOrder", skewedStoreA);
+    const keyA = hubA.auth.publicKey;
+    const keyB = hubB.auth.publicKey;
+    const initialOrder = [k(keyB, "f2"), k(keyA, "f1"), k(keyA, null), k(keyB, null)];
+    const futureTs = Date.now() + 180_000;
+    await skewedStoreA.change("owner", {
+      revision: 0,
+      updatedAt: futureTs,
+      pinned: [],
+      ordinary: initialOrder,
+    });
+
+    const devA = await createPairedDevice(hubA, "dev-a", "db-skew-a");
+    const devB = await createPairedDevice(hubB, "dev-b", "db-skew-b");
+    const connA = new HubConnection(devA.identity, devA.cache);
+    const connB = new HubConnection(devB.identity, devB.cache);
+    connections.push(connA, connB);
+
+    await Promise.all([connA.start(), connB.start()]);
+    await vi.waitFor(() => {
+      expect(connA.state.status).toBe("online");
+      expect(connB.state.status).toBe("online");
+    });
+
+    const spyA = vi.spyOn(connA, "saveCrossHostFolderOrder");
+    const spyB = vi.spyOn(connB, "saveCrossHostFolderOrder");
+
+    const sync = new CrossHostFolderOrderSync(makeSource([connA, connB]));
+    coordinators.push(sync);
+    await sync.syncNow();
+    await new Promise(resolve => setTimeout(resolve, 40));
+
+    expect(connA.state.crossHostFolderOrder?.ordinary).toEqual(initialOrder);
+    expect(connB.state.crossHostFolderOrder?.ordinary).toEqual(initialOrder);
+    expect(readCrossHostFolderOrder().ordinary).toEqual(initialOrder);
+    expect(readCrossHostFolderOrder().updatedAt).toBe(futureTs);
+    // Hub B was clamped once and NOT hammered in an infinite loop.
+    expect(spyA).toHaveBeenCalledTimes(0);
+    expect(spyB).toHaveBeenCalledTimes(1);
+
+    // Subsequent genuine user reorder still propagates to both Hubs cleanly.
+    const nextOrder = [k(keyA, "f1"), k(keyB, "f2"), k(keyA, null), k(keyB, null)];
+    writeCrossHostFolderOrder({ version: 1, pinned: [], ordinary: nextOrder });
+    await sync.syncNow();
+    await new Promise(resolve => setTimeout(resolve, 40));
+
+    expect(connA.state.crossHostFolderOrder?.ordinary).toEqual(nextOrder);
+    expect(connB.state.crossHostFolderOrder?.ordinary).toEqual(nextOrder);
+    expect(spyA).toHaveBeenCalledTimes(1);
+    expect(spyB).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not overwrite a concurrent local reorder when an in-flight PATCH returns a clamped timestamp", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-cross-order-race-"));
+    const hub = await HubServer.start({ stateDir: path.join(root, "a") });
+    hubs.push(hub);
+    const keyA = hub.auth.publicKey;
+
+    const dev = await createPairedDevice(hub, "dev-a", "db-race-a");
+    const conn = new HubConnection(dev.identity, dev.cache);
+    connections.push(conn);
+    await conn.start();
+    await vi.waitFor(() => expect(conn.state.status).toBe("online"));
+
+    const order1 = [k(keyA, "f1"), k(keyA, "f2")];
+    const order2 = [k(keyA, "f2"), k(keyA, "f1")];
+    const farFutureTs = Date.now() + 300_000;
+    writeCrossHostFolderOrder({ version: 1, pinned: [], ordinary: order1 }, { updatedAt: farFutureTs });
+
+    let injectedConcurrentEdit = false;
+    transportState.httpInterceptor = async (_origin, reqPath, init, next) => {
+      const response = await next();
+      if (!injectedConcurrentEdit && reqPath === "/api/cross-host-folder-order" && init.method === "PATCH") {
+        injectedConcurrentEdit = true;
+        // User performs a newer local reorder while the clamped PATCH response is in flight.
+        writeCrossHostFolderOrder({ version: 1, pinned: [], ordinary: order2 }, { updatedAt: farFutureTs + 1 });
+      }
+      return response;
+    };
+
+    const sync = new CrossHostFolderOrderSync(makeSource([conn]));
+    coordinators.push(sync);
+    await sync.syncNow();
+
+    expect(injectedConcurrentEdit).toBe(true);
+    expect(readCrossHostFolderOrder().ordinary).toEqual(order2);
+    expect(conn.state.crossHostFolderOrder?.ordinary).toEqual(order2);
+  });
+
+  it("does not regress a newer WebSocket cross-host order when a delayed HTTP PATCH response resolves", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-cross-order-delay-"));
+    const hub = await HubServer.start({ stateDir: path.join(root, "a") });
+    hubs.push(hub);
+    const keyA = hub.auth.publicKey;
+
+    const devA = await createPairedDevice(hub, "dev-a", "db-delay-a");
+    const devB = await createPairedDevice(hub, "dev-b", "db-delay-b");
+    const connA = new HubConnection(devA.identity, devA.cache);
+    const connB = new HubConnection(devB.identity, devB.cache);
+    connections.push(connA, connB);
+
+    await Promise.all([connA.start(), connB.start()]);
+    await vi.waitFor(() => {
+      expect(connA.state.status).toBe("online");
+      expect(connB.state.status).toBe("online");
+    });
+
+    const order1 = [k(keyA, "f1"), k(keyA, "f2")];
+    const order2 = [k(keyA, "f2"), k(keyA, "f1")];
+    const t1 = Date.now();
+    let releaseFirstPatch!: () => void;
+    let firstPatchSent!: () => void;
+    const firstPatchSentPromise = new Promise<void>(resolve => { firstPatchSent = resolve; });
+    const firstPatchGate = new Promise<void>(resolve => { releaseFirstPatch = resolve; });
+    let intercepted = false;
+
+    transportState.httpInterceptor = async (_origin, reqPath, init, next) => {
+      const response = await next();
+      if (!intercepted && reqPath === "/api/cross-host-folder-order" && init.method === "PATCH") {
+        intercepted = true;
+        firstPatchSent();
+        await firstPatchGate;
+      }
+      return response;
+    };
+
+    const patchA = connA.saveCrossHostFolderOrder({ updatedAt: t1, pinned: [], ordinary: order1 }, 0);
+    await firstPatchSentPromise;
+
+    // Device B commits revision 2 and Device A receives the WS broadcast before Device A's HTTP rev 1 resolves.
+    await vi.waitFor(() => expect(connB.state.crossHostFolderOrder?.revision).toBe(1));
+    await connB.saveCrossHostFolderOrder({ updatedAt: t1 + 1000, pinned: [], ordinary: order2 }, 1);
+    await vi.waitFor(() => expect(connA.state.crossHostFolderOrder?.revision).toBe(2));
+
+    releaseFirstPatch();
+    await patchA;
+
+    expect(connA.state.crossHostFolderOrder?.revision).toBe(2);
+    expect(connA.state.crossHostFolderOrder?.ordinary).toEqual(order2);
+    expect((await devA.cache.crossHostFolderOrder())?.revision).toBe(2);
+    expect((await devA.cache.crossHostFolderOrder())?.ordinary).toEqual(order2);
+  });
+
+  it("keeps device-local host removal from wiping that host's folder positions on remaining Hubs and other devices", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-cross-order-unpair-"));
+    const hubA = await HubServer.start({ stateDir: path.join(root, "a") });
+    const hubB = await HubServer.start({ stateDir: path.join(root, "b") });
+    hubs.push(hubA, hubB);
+
+    const keyA = hubA.auth.publicKey;
+    const keyB = hubB.auth.publicKey;
+    // Include both a lexicographically smaller and larger third host key to cover both tie-break directions.
+    const keyCLow = "0000_host_c_low";
+    const keyCHigh = "zzzz_host_c_high";
+
+    const dev1A = await createPairedDevice(hubA, "dev1-a", "db-unpair-1a");
+    const dev1B = await createPairedDevice(hubB, "dev1-b", "db-unpair-1b");
+    const dev2A = await createPairedDevice(hubA, "dev2-a", "db-unpair-2a");
+    const conn1A = new HubConnection(dev1A.identity, dev1A.cache);
+    const conn1B = new HubConnection(dev1B.identity, dev1B.cache);
+    const conn2A = new HubConnection(dev2A.identity, dev2A.cache);
+    connections.push(conn1A, conn1B, conn2A);
+
+    await Promise.all([conn1A.start(), conn1B.start(), conn2A.start()]);
+    await vi.waitFor(() => {
+      expect(conn1A.state.status).toBe("online");
+      expect(conn1B.state.status).toBe("online");
+      expect(conn2A.state.status).toBe("online");
+    });
+
+    const sync1 = new CrossHostFolderOrderSync(makeSource([conn1A, conn1B]));
+    coordinators.push(sync1);
+
+    const sharedOrder = [k(keyA, "f1"), k(keyCLow, "fc1"), k(keyCHigh, "fc2"), k(keyB, "f2")];
+    writeCrossHostFolderOrder({ version: 1, pinned: [k(keyCLow, "p1")], ordinary: sharedOrder });
+    await sync1.syncNow();
+    await vi.waitFor(() => {
+      expect(conn1A.state.crossHostFolderOrder?.revision).toBe(1);
+      expect(conn1B.state.crossHostFolderOrder?.revision).toBe(1);
+      expect(conn2A.state.crossHostFolderOrder?.revision).toBe(1);
+    });
+
+    const spyA = vi.spyOn(conn1A, "saveCrossHostFolderOrder");
+    const spyB = vi.spyOn(conn1B, "saveCrossHostFolderOrder");
+
+    // Device 1 removes both host C variants locally ("从此设备移除").
+    removeCrossHostFolderOrderHost(keyCLow);
+    removeCrossHostFolderOrderHost(keyCHigh);
+    await sync1.syncNow();
+    await new Promise(resolve => setTimeout(resolve, 40));
+
+    // Remaining Hubs and Device 2 keep host C's positions untouched with zero PATCHes.
+    expect(spyA).toHaveBeenCalledTimes(0);
+    expect(spyB).toHaveBeenCalledTimes(0);
+    expect(conn1A.state.crossHostFolderOrder?.revision).toBe(1);
+    expect(conn1B.state.crossHostFolderOrder?.revision).toBe(1);
+    expect(conn2A.state.crossHostFolderOrder?.ordinary).toEqual(sharedOrder);
+    expect(conn2A.state.crossHostFolderOrder?.pinned).toEqual([k(keyCLow, "p1")]);
+
+    // Device 1's own localStorage no longer contains the removed hosts.
+    const localAfter = readCrossHostFolderOrder();
+    expect(localAfter.ordinary).toEqual([k(keyA, "f1"), k(keyB, "f2")]);
+    expect(localAfter.pinned).toEqual([]);
+    expect(localStorage.getItem(CROSS_HOST_FOLDER_ORDER_KEY) ?? "").not.toContain(keyCLow);
+    expect(localStorage.getItem(CROSS_HOST_FOLDER_ORDER_KEY) ?? "").not.toContain(keyCHigh);
   });
 });

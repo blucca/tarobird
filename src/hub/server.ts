@@ -996,8 +996,10 @@ export class HubServer {
           // copy of every conversation/avatar/history merely to list Bots.
           // Authentication and all subsequent HTTP authorization are unchanged.
           if (client.capabilities.includes("management.v1")) {
+            const user = await this.store.user(session.userId);
+            const bots = listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities);
             await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES,
-              uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations: [], avatars: [] });
+              uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user, bots, conversations: [], avatars: [] });
             client.readySent = true; client.syncing = false;
             client.pendingPublications.length = 0; client.pendingSync.clear();
             await this.sendClient(client, { v: 1, type: "sync.complete" }); return;
@@ -1018,7 +1020,10 @@ export class HubServer {
             this.options.onWarning?.("cross_host_folder_order_unavailable");
             return undefined;
           });
-          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations, ...(conversationFolders ? { conversationFolders } : {}), ...(conversationPins ? { conversationPins } : {}), ...(crossHostFolderOrder ? { crossHostFolderOrder } : {}), avatars: await this.avatars.list(session.userId, session) });
+          const user = await this.store.user(session.userId);
+          const bots = listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities);
+          const avatars = await this.avatars.list(session.userId, session);
+          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user, bots, conversations, ...(conversationFolders ? { conversationFolders } : {}), ...(conversationPins ? { conversationPins } : {}), ...(crossHostFolderOrder ? { crossHostFolderOrder } : {}), avatars });
           while (client.pendingPublications.length) await this.sendClient(client, client.pendingPublications.shift());
           client.readySent = true;
           if (client.capabilities.includes(CONVERSATION_SYNC_CAPABILITY)) {

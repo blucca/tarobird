@@ -23,7 +23,7 @@ import { clearMessagesPlanSchema, clearMessagesResultSchema, MESSAGE_CLEAR_CAPAB
 import { deleteMessagesSchema, deleteMessagesResultSchema, MESSAGE_DELETE_CAPABILITY } from "../../src/client-protocol/message-deletion.js";
 import { timeoutSignal, anySignal } from "./abort-signals.js";
 import { conversationFoldersSchema, emptyConversationFolders, type ConversationFoldersState, type FolderEdit } from "../../src/client-protocol/conversation-folders.js";
-import { CONVERSATION_PINS_CAPABILITY, conversationPinsSchema, emptyConversationPins, type ConversationPinsState, type PinReconcileItem, type PinScope } from "../../src/client-protocol/conversation-pins.js";
+import { CONVERSATION_PINS_CAPABILITY, conversationPinsSchema, emptyConversationPins, type ConversationPinsState, type PinScope } from "../../src/client-protocol/conversation-pins.js";
 import { CROSS_HOST_FOLDER_ORDER_CAPABILITY, crossHostFolderOrderSchema, type CrossHostFolderOrderState } from "../../src/client-protocol/cross-host-folder-order.js";
 import { connectionTiming } from "./connection-timing.js";
 import { RoutePerformance, ROUTE_OBSERVATION_MS, ROUTE_DWELL_MS, ROUTE_STABLE_PROBE_MS, ROUTE_CANDIDATE_PROBE_MS } from "./route-performance.js";
@@ -53,7 +53,7 @@ import { verifyNetworkMembership } from "./network-identity.js";
 import { z } from "zod";
 import { CAPABILITIES, MAX_FRAME_BYTES, MAX_FILE_BYTES, uploadLimitsSchema, clientFrameSchema, conversationSchema, eventSchema, type ClientFrame, type Conversation, type Json } from "../../src/client-protocol/index.js";
 import { CONVERSATION_SYNC_CAPABILITY, SNAPSHOT_ACTIVITY_CAPABILITY, SYNC_LINEAGE_CAPABILITY, snapshotFrameSchema } from "../../src/client-protocol/snapshot.js";
-import { cache as legacyCache, type ClientCache, type OutboxEntry, type Identity, type Route, type PendingPairing } from "./storage.js";
+import { cache as legacyCache, type ClientCache, type OutboxEntry, type Identity, type Route, type PendingPairing, type PendingPinChange } from "./storage.js";
 import { randomNonce, signChallenge, signDeviceAction, verifyHub, verifyRevocation } from "./identity.js";
 import { boundDeviceActionStatement, deviceActionSchema } from "../../src/client-protocol/device-actions.js";
 import { botMessageGrantsCommandSchema, botMessageGrantsSnapshotSchema, type BotMessageGrantsCommand, crossHostMessageGrantsCommandSchema, crossHostMessageGrantsSnapshotSchema, type CrossHostMessageGrantsCommand } from "../../src/client-protocol/bot-message-grants.js";
@@ -79,6 +79,15 @@ export type RouteSyncSource = "host" | "network";
 export type RouteSyncResult = { limited: boolean };
 export type ConnectionState = ProfileCache & { dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ flight })` and an `ack` with `heldMs`. */ screenFlightAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; botCommsAvailable?: boolean; historyAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; engineQuotaAvailable?: boolean; /** Host serves a conversation's context usage. */ contextUsageAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; conversationPins?: ConversationPinsState; pinsAvailable?: boolean; crossHostFolderOrder?: CrossHostFolderOrderState; crossHostFolderOrderAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
 export type OutboxSettlement = { entry: OutboxEntry; revision: number; messageAccepted: boolean };
+function isPermanentPinRejection(error: unknown): boolean {
+  if (!(error instanceof HubHttpError)) return false;
+  if (error.status === 400 && (error.code === "invalid_request" || error.code === "invalid_json")) return true;
+  if (error.status === 404 && error.code === "conversation_not_available") return true;
+  if (error.status === 409 && error.code === "pin_limit") return true;
+  if (error.status === 413 && error.code === "body_too_large") return true;
+  return false;
+}
+
 export class HubConnection {
   state: ConnectionState = { cacheRevision: 0, status: "offline", bots: [], outbox: 0, avatars: [] };
   private navigationGraceTimer?: ReturnType<typeof setTimeout>;
@@ -90,10 +99,18 @@ export class HubConnection {
   refreshCache(): void { this.update({}, true); }
   async pinConversation(id: string, pinned: boolean, scope: PinScope = "group"): Promise<void> {
     const synced = await this.cache.conversationPins?.();
-    const queuePending = !!synced || (this.state.status === "online" && !!this.state.pinsAvailable);
+    const isOnline = this.state.status === "online" && !!this.state.pinsAvailable && !this.closed;
+    const queuePending = !!synced || isOnline;
+    const liveEpoch = isOnline ? this.authenticatedSessionEpoch : undefined;
     const offset = this.state.serverTimeOffset ?? await this.cache.serverTimeOffset?.() ?? 0;
     const at = Math.max(0, Math.round(Date.now() + offset));
-    await this.cache.setPinned(id, pinned, scope, queuePending ? { at, identity: this.identity, queuePending: true } : undefined);
+    const seq = await this.cache.setPinned(id, pinned, scope, queuePending ? { at, identity: this.identity, queuePending: true } : undefined);
+    const key = `${scope}:${id}`;
+    if (typeof seq === "number" && liveEpoch !== undefined && !this.closed && this.state.status === "online" && this.state.pinsAvailable && this.authenticatedSessionEpoch === liveEpoch) {
+      this.livePinChanges.set(key, { seq, epoch: liveEpoch });
+    } else {
+      this.livePinChanges.delete(key);
+    }
     this.refreshCache();
     if (this.state.status === "online" && this.state.pinsAvailable && !this.closed) {
       void this.syncPinsWithHost(this.generation);
@@ -169,6 +186,8 @@ export class HubConnection {
   private pinVersion = 0;
   private pinSyncQueue: Promise<void> = Promise.resolve();
   private pinSyncPending = false;
+  private pinSyncTargetGeneration = -1;
+  private readonly livePinChanges = new Map<string, { seq: number; epoch: number }>();
   private crossHostFolderOrderUpdates: Promise<void> = Promise.resolve();
   private crossHostFolderOrderVersion = 0;
   networkKnown?: SignedNetworkManifest;
@@ -522,6 +541,7 @@ export class HubConnection {
         if (generation !== this.generation) return;
         // Incoming traffic is observed before IndexedDB/render work; a busy
         // catch-up queue must not be mistaken for a blackholed transport.
+        const receivedAt = Date.now();
         this.lastPong = performance.now();
         this.awaitingForegroundProbe = false;
         this.clearForegroundProbe();
@@ -564,11 +584,12 @@ export class HubConnection {
           // Identity metadata is also needed while draining received read events
           // after a close; only transport activation waits for the cache writes.
           this.userId = ready.user.id; await this.cache.saveConversations(ready.conversations);
+          const serverTimeOffset = ready.serverTime !== undefined ? ready.serverTime - receivedAt : 0;
           if (ready.conversationFolders) await this.acceptConversationFolders(ready.conversationFolders, generation, true);
           if (ready.conversationPins) await this.acceptConversationPins(ready.conversationPins, generation, true);
           if (ready.crossHostFolderOrder) await this.acceptCrossHostFolderOrder(ready.crossHostFolderOrder, generation, true);
           if (ready.serverTime !== undefined && this.cache.saveServerTimeOffset) {
-            void this.cache.saveServerTimeOffset(ready.serverTime - Date.now(), this.identity).catch(() => undefined);
+            void this.cache.saveServerTimeOffset(serverTimeOffset, this.identity).catch(() => undefined);
           }
           await this.cache.saveProfiles({ user: ready.user, avatars: ready.avatars }, this.identity);
           // Close can race either cache write. Draining accepted frames must not
@@ -580,7 +601,7 @@ export class HubConnection {
           if (this.lastConnectedUrl !== chosen.route.url) this.lastRouteChange = Date.now();
           this.lastConnectedUrl = chosen.route.url;
           this.update({ routeSelection: { reason, changedAt: Date.now() } });
-          this.update({ dispatchAvailable: ready.serverCapabilities.includes(DISPATCH_CAPABILITY), screenAvailable: ready.serverCapabilities.includes("desktop.screen.v1"), pairingInvitesAvailable: ready.serverCapabilities.includes(PAIRING_INVITES_CAPABILITY), conversationBatchAvailable: ready.serverCapabilities.includes(CONVERSATION_BATCH_CAPABILITY), groupReplyGuardAvailable: ready.serverCapabilities.includes("groups.reply-guard.v1"), groupDiscussionAvailable: ready.serverCapabilities.includes("groups.discussion.v1"), groupDiscussionComposerAvailable: ready.serverCapabilities.includes("groups.discussion.composer.v1"), groupDiscussionRecoveryAvailable: ready.serverCapabilities.includes("groups.discussion.recovery.v1"), groupParallelAvailable: ready.serverCapabilities.includes("groups.parallel.v1"), voiceSettingsAvailable: ready.serverCapabilities.includes("integrations.voice.v2"), widgetSettingsAvailable: ready.serverCapabilities.includes("widgets.settings.v1"), engineSettingsAvailable: ready.serverCapabilities.includes("engines.settings.v1"), engineQuotaAvailable: ready.serverCapabilities.includes(ENGINE_QUOTA_CAPABILITY), contextUsageAvailable: ready.serverCapabilities.includes(CONTEXT_USAGE_CAPABILITY), backupSettingsAvailable: ready.serverCapabilities.includes("backups.settings.v1"), hostRoutesAvailable: ready.serverCapabilities.includes("host-routes.v1"), hostLanSelectionAvailable: ready.serverCapabilities.includes("host-routes.select-lan.v1"), attachmentAdminAvailable: ready.serverCapabilities.includes("attachments.admin.v1"), asrSetupAvailable: ready.serverCapabilities.includes("integrations.asr.v1"), workspaceDiffAvailable: ready.serverCapabilities.includes("workspace.diff.v1"), runChangesAvailable: ready.serverCapabilities.includes("runs.changes.v1"), runScopesAvailable: ready.serverCapabilities.includes(RUN_SCOPES_CAPABILITY), runGroupsAvailable: ready.serverCapabilities.includes(BACKGROUND_TASK_GROUP_CAPABILITY), runTailAvailable: ready.serverCapabilities.includes(RUN_TAIL_CAPABILITY), serverTimeOffset: (ready.serverTime ?? Date.now()) - Date.now(), networkAvailable: ready.serverCapabilities.includes(PRIVATE_NETWORK_CAPABILITY), folderReorderAvailable: ready.serverCapabilities.includes("conversation-folders.reorder.v1"), folderPinAvailable: ready.serverCapabilities.includes("conversation-folders.pin.v1"), conversationAvatarsAvailable: ready.serverCapabilities.includes("conversation-avatars.v1"), foldersAvailable: !!ready.conversationFolders, pinsAvailable: ready.serverCapabilities.includes(CONVERSATION_PINS_CAPABILITY) && !!ready.conversationPins, crossHostFolderOrderAvailable: ready.serverCapabilities.includes(CROSS_HOST_FOLDER_ORDER_CAPABILITY) && !!ready.crossHostFolderOrder, user: ready.user, avatars: ready.avatars, status: "online", bots: ready.bots.filter(bot => !bot.deletedAt && bot.role !== "worker"), deletedBots: ready.bots.filter(bot => !!bot.deletedAt && bot.role !== "worker"), dispatchWorkers: ready.bots.filter(bot => !bot.deletedAt && bot.role === "worker"), botDeletionAvailable: ready.serverCapabilities.includes("bots.delete.v1"), promptQueueAvailable: ready.serverCapabilities.includes("prompt-queue.v1"), messageDeletionAvailable: ready.serverCapabilities.includes(MESSAGE_DELETE_CAPABILITY), messageClearAvailable: ready.serverCapabilities.includes(MESSAGE_CLEAR_CAPABILITY), maxFileBytes: ready.uploadLimits?.maxFileBytes ?? MAX_FILE_BYTES, error: undefined }, true); void rememberGroupReplyCapabilities(this).catch(() => undefined); void syncShareUploadLimit(this.state.maxFileBytes ?? MAX_FILE_BYTES).catch(() => console.warn("share_limit_cache_failed")); this.lastPong = performance.now(); this.presence(); void this.refreshNotificationPreferences().catch(() => undefined);
+          this.update({ dispatchAvailable: ready.serverCapabilities.includes(DISPATCH_CAPABILITY), screenAvailable: ready.serverCapabilities.includes("desktop.screen.v1"), pairingInvitesAvailable: ready.serverCapabilities.includes(PAIRING_INVITES_CAPABILITY), conversationBatchAvailable: ready.serverCapabilities.includes(CONVERSATION_BATCH_CAPABILITY), groupReplyGuardAvailable: ready.serverCapabilities.includes("groups.reply-guard.v1"), groupDiscussionAvailable: ready.serverCapabilities.includes("groups.discussion.v1"), groupDiscussionComposerAvailable: ready.serverCapabilities.includes("groups.discussion.composer.v1"), groupDiscussionRecoveryAvailable: ready.serverCapabilities.includes("groups.discussion.recovery.v1"), groupParallelAvailable: ready.serverCapabilities.includes("groups.parallel.v1"), voiceSettingsAvailable: ready.serverCapabilities.includes("integrations.voice.v2"), widgetSettingsAvailable: ready.serverCapabilities.includes("widgets.settings.v1"), engineSettingsAvailable: ready.serverCapabilities.includes("engines.settings.v1"), engineQuotaAvailable: ready.serverCapabilities.includes(ENGINE_QUOTA_CAPABILITY), contextUsageAvailable: ready.serverCapabilities.includes(CONTEXT_USAGE_CAPABILITY), backupSettingsAvailable: ready.serverCapabilities.includes("backups.settings.v1"), hostRoutesAvailable: ready.serverCapabilities.includes("host-routes.v1"), hostLanSelectionAvailable: ready.serverCapabilities.includes("host-routes.select-lan.v1"), attachmentAdminAvailable: ready.serverCapabilities.includes("attachments.admin.v1"), asrSetupAvailable: ready.serverCapabilities.includes("integrations.asr.v1"), workspaceDiffAvailable: ready.serverCapabilities.includes("workspace.diff.v1"), runChangesAvailable: ready.serverCapabilities.includes("runs.changes.v1"), runScopesAvailable: ready.serverCapabilities.includes(RUN_SCOPES_CAPABILITY), runGroupsAvailable: ready.serverCapabilities.includes(BACKGROUND_TASK_GROUP_CAPABILITY), runTailAvailable: ready.serverCapabilities.includes(RUN_TAIL_CAPABILITY), serverTimeOffset, networkAvailable: ready.serverCapabilities.includes(PRIVATE_NETWORK_CAPABILITY), folderReorderAvailable: ready.serverCapabilities.includes("conversation-folders.reorder.v1"), folderPinAvailable: ready.serverCapabilities.includes("conversation-folders.pin.v1"), conversationAvatarsAvailable: ready.serverCapabilities.includes("conversation-avatars.v1"), foldersAvailable: !!ready.conversationFolders, pinsAvailable: ready.serverCapabilities.includes(CONVERSATION_PINS_CAPABILITY) && !!ready.conversationPins, crossHostFolderOrderAvailable: ready.serverCapabilities.includes(CROSS_HOST_FOLDER_ORDER_CAPABILITY) && !!ready.crossHostFolderOrder, user: ready.user, avatars: ready.avatars, status: "online", bots: ready.bots.filter(bot => !bot.deletedAt && bot.role !== "worker"), deletedBots: ready.bots.filter(bot => !!bot.deletedAt && bot.role !== "worker"), dispatchWorkers: ready.bots.filter(bot => !bot.deletedAt && bot.role === "worker"), botDeletionAvailable: ready.serverCapabilities.includes("bots.delete.v1"), promptQueueAvailable: ready.serverCapabilities.includes("prompt-queue.v1"), messageDeletionAvailable: ready.serverCapabilities.includes(MESSAGE_DELETE_CAPABILITY), messageClearAvailable: ready.serverCapabilities.includes(MESSAGE_CLEAR_CAPABILITY), maxFileBytes: ready.uploadLimits?.maxFileBytes ?? MAX_FILE_BYTES, error: undefined }, true); void rememberGroupReplyCapabilities(this).catch(() => undefined); void syncShareUploadLimit(this.state.maxFileBytes ?? MAX_FILE_BYTES).catch(() => console.warn("share_limit_cache_failed")); this.lastPong = performance.now(); this.presence(); void this.refreshNotificationPreferences().catch(() => undefined);
           if (ready.conversationPins && ready.serverCapabilities.includes(CONVERSATION_PINS_CAPABILITY)) void this.syncPinsWithHost(generation);
           const timing = connectionTiming(chosen.route, usesPinnedTransport());
           let heartbeatAt = performance.now();
@@ -781,6 +802,7 @@ export class HubConnection {
   private offline(scheduleReconnect = true, preserveHttp = false): void {
     this.awaitingForegroundProbe = false;
     this.clearForegroundProbe();
+    this.livePinChanges.clear();
     if (this.reconnect) clearTimeout(this.reconnect); this.reconnect = undefined;
     if (this.outboxRetry) clearTimeout(this.outboxRetry);
     if (!preserveHttp) { this.httpEpoch.abort(); this.httpEpoch = new AbortController(); }
@@ -882,7 +904,7 @@ export class HubConnection {
         }),
         signal: timeoutSignal(20_000),
       }));
-      await this.acceptCrossHostFolderOrder(next, generation, true);
+      await this.acceptCrossHostFolderOrder(next, generation);
       return next;
     } catch (error) {
       if (error instanceof HubHttpError && error.code === "cross_host_folder_order_changed" && !this.closed && generation === this.generation) {
@@ -900,7 +922,7 @@ export class HubConnection {
     generation: number,
     authoritative = false,
     observedVersion?: number,
-    options?: { markMigrated?: boolean; clearPending?: readonly PinReconcileItem[] },
+    options?: { markMigrated?: boolean; clearPending?: readonly PendingPinChange[] },
   ): Promise<void> {
     const work = this.pinUpdates.then(async () => {
       if (this.closed || generation !== this.generation || !this.cache.acceptConversationPins) return;
@@ -911,45 +933,65 @@ export class HubConnection {
       if (outcome.accepted) {
         this.pinVersion++;
         this.update({ conversationPins: value }, true);
+      } else if (outcome.cacheChanged) {
+        this.update({}, true);
       }
     });
     this.pinUpdates = work.catch(() => undefined);
     return work;
   }
   private syncPinsWithHost(generation: number): Promise<void> {
+    if (generation !== this.generation) return this.pinSyncQueue;
+    if (generation > this.pinSyncTargetGeneration) this.pinSyncTargetGeneration = generation;
     if (this.pinSyncPending) return this.pinSyncQueue;
     this.pinSyncPending = true;
     const work = this.pinSyncQueue.then(async () => {
       this.pinSyncPending = false;
-      await this.runPinSync(generation);
+      const targetGeneration = this.pinSyncTargetGeneration;
+      await this.runPinSync(targetGeneration);
     });
     this.pinSyncQueue = work.catch(() => { this.pinSyncPending = false; });
     return work;
   }
   private async runPinSync(generation: number): Promise<void> {
     if (!this.cache.conversationPins || !this.cache.pendingPinChanges || !this.cache.acceptConversationPins) return;
-    for (let attempt = 0; attempt < 8; attempt++) {
+    let conflicts = 0;
+    let triedTrimmedMerge = false;
+    let trimmedMergePayload: { pins: string[]; globalPins: string[] } | undefined;
+    for (let step = 0; step < 256; step++) {
       if (this.closed || generation !== this.generation || this.state.status !== "online" || !this.state.pinsAvailable || !this.token) return;
       await this.pinUpdates;
       if (this.closed || generation !== this.generation || this.state.status !== "online" || !this.state.pinsAvailable || !this.token) return;
-      const [synced, pending] = await Promise.all([this.cache.conversationPins(), this.cache.pendingPinChanges()]);
-      if (!synced) {
-        const [localPins, localGlobalPins] = await Promise.all([this.cache.pins("group"), this.cache.pins("global")]);
-        const base = this.state.conversationPins ?? emptyConversationPins();
-        if (!localPins.length && !localGlobalPins.length) {
-          await this.acceptConversationPins(base, generation, true, undefined, { markMigrated: true });
+      const [synced, preUpgrade, pending] = await Promise.all([
+        this.cache.conversationPins(),
+        this.cache.preUpgradePins?.() ?? Promise.resolve(undefined),
+        this.cache.pendingPinChanges(),
+      ]);
+      if (!synced || preUpgrade) {
+        const base = synced ?? this.state.conversationPins ?? emptyConversationPins();
+        const mergeSource = trimmedMergePayload ?? preUpgrade ?? {
+          pins: await this.cache.pins("group"),
+          globalPins: await this.cache.pins("global"),
+        };
+        if (!mergeSource.pins.length && !mergeSource.globalPins.length) {
+          await this.acceptConversationPins(base, generation, false, undefined, { markMigrated: true });
+          trimmedMergePayload = undefined;
+          conflicts = 0;
           continue;
         }
         try {
           const next = conversationPinsSchema.parse(await this.http("/api/conversation-pins", {
             method: "PATCH",
-            body: JSON.stringify({ type: "merge", revision: base.revision, pins: localPins, globalPins: localGlobalPins }),
+            body: JSON.stringify({ type: "merge", revision: base.revision, pins: mergeSource.pins, globalPins: mergeSource.globalPins }),
             signal: timeoutSignal(20_000),
           }));
-          await this.acceptConversationPins(next, generation, true, undefined, { markMigrated: true });
+          await this.acceptConversationPins(next, generation, false, undefined, { markMigrated: true });
+          trimmedMergePayload = undefined;
+          conflicts = 0;
           continue;
         } catch (error) {
           if (error instanceof HubHttpError && error.code === "pins_changed" && !this.closed && generation === this.generation) {
+            if (++conflicts > 8) return;
             const observedVersion = this.pinVersion;
             try {
               const latest = conversationPinsSchema.parse(await this.http("/api/conversation-pins", { signal: timeoutSignal(20_000) }));
@@ -957,19 +999,65 @@ export class HubConnection {
               continue;
             } catch { return; }
           }
+          if (isPermanentPinRejection(error) && !this.closed && generation === this.generation) {
+            const observedVersion = this.pinVersion;
+            let latest: ConversationPinsState | undefined;
+            try {
+              latest = conversationPinsSchema.parse(await this.http("/api/conversation-pins", { signal: timeoutSignal(20_000) }));
+            } catch { /* fallback to base */ }
+            if (error instanceof HubHttpError && error.code === "pin_limit" && !triedTrimmedMerge && latest) {
+              triedTrimmedMerge = true;
+              await this.acceptConversationPins(latest, generation, true, observedVersion);
+              const existingPins = new Set(latest.pins);
+              const existingGlobal = new Set(latest.globalPins);
+              const trimmedPins = mergeSource.pins.filter(id => !existingPins.has(id)).slice(0, Math.max(0, 2048 - latest.pins.length));
+              const trimmedGlobal = mergeSource.globalPins.filter(id => !existingGlobal.has(id)).slice(0, Math.max(0, 2048 - latest.globalPins.length));
+              if (trimmedPins.length || trimmedGlobal.length) {
+                trimmedMergePayload = { pins: trimmedPins, globalPins: trimmedGlobal };
+                continue;
+              }
+            }
+            if (latest) {
+              await this.acceptConversationPins(latest, generation, true, observedVersion, { markMigrated: true });
+            } else {
+              await this.acceptConversationPins(base, generation, false, undefined, { markMigrated: true });
+            }
+            trimmedMergePayload = undefined;
+            conflicts = 0;
+            continue;
+          }
           return;
         }
       }
       if (!pending.length) return;
+      const epoch = this.authenticatedSessionEpoch;
+      const isLiveItem = (item: PendingPinChange): boolean => {
+        if (item.seq === undefined) return false;
+        const live = this.livePinChanges.get(`${item.scope}:${item.conversationId}`);
+        return !!live && live.seq === item.seq && live.epoch === epoch;
+      };
+      const offlineItems = pending.filter(item => !isLiveItem(item));
+      const liveItems = pending.filter(isLiveItem);
+      const batch: PendingPinChange[] = offlineItems.length ? offlineItems : [liveItems[0]!];
+      const singleLive = !offlineItems.length ? liveItems[0]! : undefined;
       try {
+        const body = singleLive
+          ? { type: "set" as const, revision: synced.revision, scope: singleLive.scope, conversationId: singleLive.conversationId, pinned: singleLive.pinned }
+          : { type: "reconcile" as const, revision: synced.revision, changes: offlineItems.map(({ scope, conversationId, pinned, at }) => ({ scope, conversationId, pinned, at })) };
         const next = conversationPinsSchema.parse(await this.http("/api/conversation-pins", {
           method: "PATCH",
-          body: JSON.stringify({ type: "reconcile", revision: synced.revision, changes: pending }),
+          body: JSON.stringify(body),
           signal: timeoutSignal(20_000),
         }));
-        await this.acceptConversationPins(next, generation, true, undefined, { clearPending: pending });
+        if (singleLive) {
+          const key = `${singleLive.scope}:${singleLive.conversationId}`;
+          if (this.livePinChanges.get(key)?.seq === singleLive.seq) this.livePinChanges.delete(key);
+        }
+        await this.acceptConversationPins(next, generation, false, undefined, { clearPending: batch });
+        conflicts = 0;
       } catch (error) {
         if (error instanceof HubHttpError && error.code === "pins_changed" && !this.closed && generation === this.generation) {
+          if (++conflicts > 8) return;
           const observedVersion = this.pinVersion;
           try {
             const latest = conversationPinsSchema.parse(await this.http("/api/conversation-pins", { signal: timeoutSignal(20_000) }));
@@ -977,13 +1065,19 @@ export class HubConnection {
             continue;
           } catch { return; }
         }
-        if (error instanceof HubHttpError && error.status >= 400 && error.status < 500) {
-          await this.acceptConversationPins(synced, generation, true, undefined, { clearPending: pending });
+        if (isPermanentPinRejection(error) && !this.closed && generation === this.generation) {
+          if (singleLive) {
+            const key = `${singleLive.scope}:${singleLive.conversationId}`;
+            if (this.livePinChanges.get(key)?.seq === singleLive.seq) this.livePinChanges.delete(key);
+          }
+          await this.acceptConversationPins(synced, generation, false, undefined, { clearPending: batch });
           try {
             const observedVersion = this.pinVersion;
             const latest = conversationPinsSchema.parse(await this.http("/api/conversation-pins", { signal: timeoutSignal(20_000) }));
             await this.acceptConversationPins(latest, generation, true, observedVersion);
           } catch { /* keep synced snapshot */ }
+          conflicts = 0;
+          continue;
         }
         return;
       }
@@ -1652,5 +1746,5 @@ export class HubConnection {
     this.close(true); this.update({ error: t("此设备已被吊销，请重新配对") });
     await this.cache.markIdentityRevoked(this.identity).catch(() => console.warn("device_revocation_cache_failed"));
   }
-  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
+  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.livePinChanges.clear(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
 }

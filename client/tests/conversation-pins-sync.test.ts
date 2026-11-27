@@ -11,6 +11,7 @@ const idbState = vi.hoisted(() => ({ dbs: new Map<string, Map<string, Map<string
 const transportState = vi.hoisted(() => ({
   blockHttp: new Set<string>(),
   sockets: new Set<WebSocket>(),
+  httpInterceptor: undefined as undefined | ((origin: string, reqPath: string, init: RequestInit, next: () => Promise<Response>) => Promise<Response>),
 }));
 
 vi.mock("idb", () => {
@@ -131,7 +132,8 @@ vi.mock("../src/transport.js", () => ({
     if (transportState.blockHttp.has(origin)) {
       throw new TypeError("offline");
     }
-    return fetch(origin + reqPath, init);
+    const run = () => fetch(origin + reqPath, init);
+    return transportState.httpInterceptor ? transportState.httpInterceptor(origin, reqPath, init, run) : run();
   },
 }));
 
@@ -181,10 +183,12 @@ describe("client HubConnection conversation pin sync", () => {
   beforeEach(() => {
     idbState.dbs.clear();
     transportState.blockHttp.clear();
+    transportState.httpInterceptor = undefined;
     installBrowserGlobals();
   });
 
   afterEach(async () => {
+    transportState.httpInterceptor = undefined;
     for (const c of connections.splice(0)) c.close();
     for (const ws of transportState.sockets) ws.terminate();
     transportState.sockets.clear();
@@ -395,5 +399,397 @@ describe("client HubConnection conversation pin sync", () => {
     expect(await oldCache.pins("global")).toEqual(["same"]);
     expect(await oldCache.pins("group")).toEqual(["same"]);
     expect(await oldCache.pendingPinChanges()).toEqual([]);
+  });
+
+  it("does not regress newer WebSocket pin updates when a delayed HTTP PATCH response resolves", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-pins-delay-"));
+    const hub = await HubServer.start({ stateDir: root });
+    hubs.push(hub);
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('bot','Bot','fixture')");
+    const c1 = (await hub.store.createConversation("owner", ["bot"], "Chat 1", "c1")).id;
+    const c2 = (await hub.store.createConversation("owner", ["bot"], "Chat 2", "c2")).id;
+
+    const devA = await createPairedDevice(hub, "dev-a", "db-delay-a");
+    const devB = await createPairedDevice(hub, "dev-b", "db-delay-b");
+    const connA = new HubConnection(devA.identity, devA.cache);
+    const connB = new HubConnection(devB.identity, devB.cache);
+    connections.push(connA, connB);
+
+    await Promise.all([connA.start(), connB.start()]);
+    await vi.waitFor(() => {
+      expect(connA.state.status).toBe("online");
+      expect(connB.state.status).toBe("online");
+    });
+
+    let patchStarted!: () => void;
+    let releasePatch!: () => void;
+    const patchStartedPromise = new Promise<void>(resolve => { patchStarted = resolve; });
+    const patchGate = new Promise<void>(resolve => { releasePatch = resolve; });
+    let intercepted = false;
+
+    transportState.httpInterceptor = async (_origin, reqPath, init, next) => {
+      const response = await next();
+      if (!intercepted && reqPath === "/api/conversation-pins" && init.method === "PATCH") {
+        intercepted = true;
+        patchStarted();
+        await patchGate;
+      }
+      return response;
+    };
+
+    await connA.pinConversation(c1, true, "group");
+    await patchStartedPromise;
+
+    // Device B receives rev 1, then commits rev 2 (unpin c1, pin c2) before Device A's rev 1 HTTP response resolves.
+    await vi.waitFor(() => expect(connB.state.conversationPins?.revision).toBe(1));
+    await connB.pinConversation(c1, false, "group");
+    await connB.pinConversation(c2, true, "group");
+    await connB.syncPins();
+    await vi.waitFor(() => expect(connA.state.conversationPins?.revision).toBe(3));
+
+    releasePatch();
+    await connA.syncPins();
+
+    expect(connA.state.conversationPins?.revision).toBe(3);
+    expect((await devA.cache.conversationPins())?.revision).toBe(3);
+    expect(await devA.cache.pendingPinChanges()).toEqual([]);
+    expect(await devA.cache.pins("group")).toEqual([c2]);
+  });
+
+  it("preserves offline pendingPinChanges on transient 401/408/429 errors and retries after recovery", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-pins-transient-"));
+    const hub = await HubServer.start({ stateDir: root });
+    hubs.push(hub);
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('bot','Bot','fixture')");
+    const c1 = (await hub.store.createConversation("owner", ["bot"], "Chat 1", "c1")).id;
+
+    const devA = await createPairedDevice(hub, "dev-a", "db-trans-a");
+    const devB = await createPairedDevice(hub, "dev-b", "db-trans-b");
+    const connA = new HubConnection(devA.identity, devA.cache);
+    const connB = new HubConnection(devB.identity, devB.cache);
+    connections.push(connA, connB);
+
+    await Promise.all([connA.start(), connB.start()]);
+    await vi.waitFor(() => {
+      expect(connA.state.status).toBe("online");
+      expect(connB.state.status).toBe("online");
+    });
+
+    // Disconnect Device A and queue an offline pin change.
+    connA.close();
+    const connA2 = new HubConnection(devA.identity, devA.cache);
+    connections.push(connA2);
+    await connA2.pinConversation(c1, true, "global");
+    expect((await devA.cache.pendingPinChanges()).length).toBe(1);
+
+    // Inject transient 401, 403, 408, and 429 rejections on PATCH /api/conversation-pins.
+    const transientErrors = [
+      { status: 401, code: "session_expired" },
+      { status: 403, code: "forbidden" },
+      { status: 408, code: "request_timeout" },
+      { status: 429, code: "rate_limited" },
+    ];
+    let errorIdx = 0;
+    transportState.httpInterceptor = async (_origin, reqPath, init, next) => {
+      if (reqPath === "/api/conversation-pins" && init.method === "PATCH" && errorIdx < transientErrors.length) {
+        const failure = transientErrors[errorIdx++]!;
+        return new Response(JSON.stringify({ error: failure.code }), {
+          status: failure.status,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return next();
+    };
+
+    await connA2.start();
+    // Ready triggers the first sync (hits 401); pending must remain intact across every transient 4xx.
+    await vi.waitFor(() => expect(connA2.state.status).toBe("online"));
+    await vi.waitFor(() => expect(errorIdx).toBeGreaterThanOrEqual(1));
+    await vi.waitFor(() => expect(connA2.state.status).toBe("online"));
+    expect((await devA.cache.pendingPinChanges()).length).toBe(1);
+    expect(await devA.cache.pins("global")).toEqual([c1]);
+
+    while (errorIdx < transientErrors.length) {
+      const before = errorIdx;
+      await connA2.syncPins();
+      expect(errorIdx).toBeGreaterThanOrEqual(before + 1);
+      expect((await devA.cache.pendingPinChanges()).length).toBe(1);
+      expect(await devA.cache.pins("global")).toEqual([c1]);
+    }
+
+    // Once transient errors clear, retry succeeds and syncs to Device B.
+    await connA2.syncPins();
+    await vi.waitFor(async () => {
+      expect(await devA.cache.pendingPinChanges()).toEqual([]);
+      expect(await devA.cache.pins("global")).toEqual([c1]);
+      expect(await devB.cache.pins("global")).toEqual([c1]);
+    });
+  });
+
+  it("never drops an in-flight pin toggle with equal or lower timestamp when clearPending runs", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-pins-inflight-"));
+    const hub = await HubServer.start({ stateDir: root });
+    hubs.push(hub);
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('bot','Bot','fixture')");
+    const c1 = (await hub.store.createConversation("owner", ["bot"], "Chat 1", "c1")).id;
+
+    const devA = await createPairedDevice(hub, "dev-a", "db-inflight-a");
+    const devB = await createPairedDevice(hub, "dev-b", "db-inflight-b");
+
+    // Unit-level cache check: backward timestamp still produces strictly higher at & seq.
+    const seq1 = await devA.cache.setPinned(c1, true, "group", { at: 5000, identity: devA.identity, queuePending: true });
+    const firstPending = await devA.cache.pendingPinChanges();
+    const seq2 = await devA.cache.setPinned(c1, false, "group", { at: 4000, identity: devA.identity, queuePending: true });
+    expect(seq2!).toBeGreaterThan(seq1!);
+    const secondPending = await devA.cache.pendingPinChanges();
+    expect(secondPending[0]!.at).toBeGreaterThan(firstPending[0]!.at);
+    await devA.cache.acceptConversationPins({ revision: 1, pins: [c1], globalPins: [] }, devA.identity, false, { clearPending: firstPending });
+    expect(await devA.cache.pendingPinChanges()).toEqual(secondPending);
+    expect(await devA.cache.pins("group")).toEqual([]);
+    // Clear for live connection check below.
+    await devA.cache.acceptConversationPins({ revision: 1, pins: [], globalPins: [] }, devA.identity, true, { clearPending: secondPending });
+
+    const connA = new HubConnection(devA.identity, devA.cache);
+    const connB = new HubConnection(devB.identity, devB.cache);
+    connections.push(connA, connB);
+    await Promise.all([connA.start(), connB.start()]);
+    await vi.waitFor(() => {
+      expect(connA.state.status).toBe("online");
+      expect(connB.state.status).toBe("online");
+    });
+
+    let firstSent!: () => void;
+    let releaseFirst!: () => void;
+    const firstSentPromise = new Promise<void>(resolve => { firstSent = resolve; });
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let blockedFirst = false;
+
+    transportState.httpInterceptor = async (_origin, reqPath, init, next) => {
+      const response = await next();
+      if (!blockedFirst && reqPath === "/api/conversation-pins" && init.method === "PATCH") {
+        blockedFirst = true;
+        firstSent();
+        await firstGate;
+      }
+      return response;
+    };
+
+    const frozenNow = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(frozenNow);
+    try {
+      await connA.pinConversation(c1, true, "group");
+      await firstSentPromise;
+      // Backward clock step while first PATCH is still in flight.
+      nowSpy.mockReturnValue(frozenNow - 10_000);
+      await connA.pinConversation(c1, false, "group");
+      releaseFirst();
+      await connA.syncPins();
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    await vi.waitFor(async () => {
+      expect(await devA.cache.pendingPinChanges()).toEqual([]);
+      expect(await devA.cache.pins("group")).toEqual([]);
+      expect(await devB.cache.pins("group")).toEqual([]);
+    });
+  });
+
+  it("uses authoritative set for live online pin toggles even when client clock lags behind Hub timestamps", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-pins-live-set-"));
+    const hub = await HubServer.start({ stateDir: root });
+    hubs.push(hub);
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('bot','Bot','fixture')");
+    const c1 = (await hub.store.createConversation("owner", ["bot"], "Chat 1", "c1")).id;
+
+    const devA = await createPairedDevice(hub, "dev-a", "db-set-a");
+    const devB = await createPairedDevice(hub, "dev-b", "db-set-b");
+    const connA = new HubConnection(devA.identity, devA.cache);
+    const connB = new HubConnection(devB.identity, devB.cache);
+    connections.push(connA, connB);
+
+    await Promise.all([connA.start(), connB.start()]);
+    await vi.waitFor(() => {
+      expect(connA.state.status).toBe("online");
+      expect(connB.state.status).toBe("online");
+    });
+
+    // Seed Hub with a future-clamped timestamp (+30s ahead of real time) via offline reconcile.
+    await Reflect.get(connB, "http").call(connB, "/api/conversation-pins", {
+      method: "PATCH",
+      body: JSON.stringify({
+        type: "reconcile",
+        revision: 0,
+        changes: [{ scope: "group", conversationId: c1, pinned: true, at: Date.now() + 30_000 }],
+      }),
+    });
+    await vi.waitFor(async () => expect(await devA.cache.pins("group")).toEqual([c1]));
+
+    // Simulate a lagging client serverTimeOffset (-15s).
+    connA.state = { ...connA.state, serverTimeOffset: -15_000 };
+
+    const patchTypes: string[] = [];
+    transportState.httpInterceptor = async (_origin, reqPath, init, next) => {
+      if (reqPath === "/api/conversation-pins" && init.method === "PATCH" && typeof init.body === "string") {
+        patchTypes.push(JSON.parse(init.body).type);
+      }
+      return next();
+    };
+
+    await connA.pinConversation(c1, false, "group");
+    await connA.syncPins();
+
+    expect(patchTypes).toEqual(["set"]);
+    await vi.waitFor(async () => {
+      expect(await devA.cache.pins("group")).toEqual([]);
+      expect(await devB.cache.pins("group")).toEqual([]);
+      expect(await devA.cache.pendingPinChanges()).toEqual([]);
+    });
+  });
+
+  it("keeps pre-upgrade merge unpolluted by remote Hub pins on conflict retry and never wedges on permanent merge errors", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-pins-preupg-"));
+    const hub = await HubServer.start({ stateDir: root });
+    hubs.push(hub);
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('bot','Bot','fixture')");
+    const cRemote = (await hub.store.createConversation("owner", ["bot"], "Remote", "cr")).id;
+    const cLocal = (await hub.store.createConversation("owner", ["bot"], "Local", "cl")).id;
+    const cAfter = (await hub.store.createConversation("owner", ["bot"], "After", "ca")).id;
+
+    // Device B is already upgraded and pins cRemote on Hub (rev 1).
+    const devB = await createPairedDevice(hub, "dev-b", "db-preupg-b");
+    const connB = new HubConnection(devB.identity, devB.cache);
+    connections.push(connB);
+    await connB.start();
+    await vi.waitFor(() => expect(connB.state.status).toBe("online"));
+    await connB.pinConversation(cRemote, true, "group");
+    await connB.syncPins();
+    await vi.waitFor(() => expect(connB.state.conversationPins?.revision).toBe(1));
+
+    // Device A is pre-upgrade with local pin cLocal plus a malformed legacy ID.
+    const devA = await createPairedDevice(hub, "dev-a", "db-preupg-a");
+    await (await (devA.cache as any).db).put("settings", JSON.stringify([cLocal, "invalid:id!"]), "pins");
+
+    // On Device A's first merge attempt, Device B unpins cRemote (bumping Hub to rev 2) before A's rev-1 merge executes,
+    // causing 409 pins_changed -> retry must ONLY send [cLocal], NEVER cRemote!
+    const mergePayloads: Array<{ pins: string[]; globalPins: string[] }> = [];
+    let causedConflict = false;
+    transportState.httpInterceptor = async (_origin, reqPath, init, next) => {
+      if (reqPath === "/api/conversation-pins" && init.method === "PATCH" && typeof init.body === "string") {
+        const parsed = JSON.parse(init.body);
+        if (parsed.type === "merge") {
+          mergePayloads.push({ pins: parsed.pins, globalPins: parsed.globalPins });
+          if (!causedConflict) {
+            causedConflict = true;
+            await connB.pinConversation(cRemote, false, "group");
+            await connB.syncPins();
+            await vi.waitFor(() => expect(connB.state.conversationPins?.revision).toBe(2));
+          }
+        }
+      }
+      return next();
+    };
+
+    const connA = new HubConnection(devA.identity, devA.cache);
+    connections.push(connA);
+    await connA.start();
+    await vi.waitFor(async () => {
+      expect(connA.state.status).toBe("online");
+      expect(await devA.cache.preUpgradePins()).toBeUndefined();
+      expect(await devA.cache.pins("group")).toEqual([cLocal]);
+      expect(await devB.cache.pins("group")).toEqual([cLocal]);
+    });
+    expect(mergePayloads.length).toBeGreaterThanOrEqual(2);
+    for (const payload of mergePayloads) {
+      expect(payload.pins).toEqual([cLocal]);
+      expect(payload.pins).not.toContain(cRemote);
+    }
+
+    // Second pre-upgrade device: permanent 400 invalid_request on merge must mark migrated instead of wedging forever.
+    const devC = await createPairedDevice(hub, "dev-c", "db-preupg-c");
+    await devC.cache.setPinned(cAfter, true, "global");
+    let failMergeOnce = true;
+    transportState.httpInterceptor = async (_origin, reqPath, init, next) => {
+      if (failMergeOnce && reqPath === "/api/conversation-pins" && init.method === "PATCH" && typeof init.body === "string") {
+        const parsed = JSON.parse(init.body);
+        if (parsed.type === "merge") {
+          failMergeOnce = false;
+          return new Response(JSON.stringify({ error: "invalid_request" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return next();
+    };
+    const connC = new HubConnection(devC.identity, devC.cache);
+    connections.push(connC);
+    await connC.start();
+    await vi.waitFor(async () => {
+      expect(connC.state.status).toBe("online");
+      expect(await devC.cache.preUpgradePins()).toBeUndefined();
+      expect(await devC.cache.conversationPins()).toBeDefined();
+    });
+    // Device C is NOT wedged and future pins sync normally!
+    await connC.pinConversation(cAfter, true, "global");
+    await connC.syncPins();
+    await vi.waitFor(async () => expect(await devB.cache.pins("global")).toEqual([cAfter]));
+  });
+
+  it("does not drop reconnect pin sync when a stale generation's pinSyncPending flag is still set", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "client-pins-gen-"));
+    const hub = await HubServer.start({ stateDir: root });
+    hubs.push(hub);
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('bot','Bot','fixture')");
+    const c1 = (await hub.store.createConversation("owner", ["bot"], "Chat 1", "c1")).id;
+    const c2 = (await hub.store.createConversation("owner", ["bot"], "Chat 2", "c2")).id;
+
+    const devA = await createPairedDevice(hub, "dev-a", "db-gen-a");
+    const devB = await createPairedDevice(hub, "dev-b", "db-gen-b");
+    const connA = new HubConnection(devA.identity, devA.cache);
+    const connB = new HubConnection(devB.identity, devB.cache);
+    connections.push(connA, connB);
+
+    await Promise.all([connA.start(), connB.start()]);
+    await vi.waitFor(() => {
+      expect(connA.state.status).toBe("online");
+      expect(connB.state.status).toBe("online");
+    });
+
+    let firstStarted!: () => void;
+    let releaseFirst!: () => void;
+    const firstStartedPromise = new Promise<void>(resolve => { firstStarted = resolve; });
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let holdFirst = true;
+
+    transportState.httpInterceptor = async (_origin, reqPath, init, next) => {
+      if (holdFirst && reqPath === "/api/conversation-pins" && init.method === "PATCH") {
+        holdFirst = false;
+        firstStarted();
+        await firstGate;
+        // Simulate generation 1's request aborting right after reconnect bumped generation.
+        throw new DOMException("Aborted", "AbortError");
+      }
+      return next();
+    };
+
+    // Start gen-1 in-flight PATCH and queue a second gen-1 pin change so pinSyncPending is true.
+    const gen1 = Reflect.get(connA, "generation") as number;
+    await connA.pinConversation(c1, true, "group");
+    await firstStartedPromise;
+    await connA.pinConversation(c2, true, "group");
+    expect(Reflect.get(connA, "pinSyncPending")).toBe(true);
+
+    // Simulate fast reconnect advancing generation while gen-1's pinSyncPending is still true.
+    Reflect.set(connA, "generation", gen1 + 1);
+    const gen2Sync = Reflect.get(connA, "syncPinsWithHost").call(connA, gen1 + 1);
+    releaseFirst();
+    await gen2Sync;
+
+    await vi.waitFor(async () => {
+      expect(await devA.cache.pendingPinChanges()).toEqual([]);
+      expect(await devA.cache.pins("group")).toEqual(expect.arrayContaining([c1, c2]));
+      expect(await devB.cache.pins("group")).toEqual(expect.arrayContaining([c1, c2]));
+    });
   });
 });

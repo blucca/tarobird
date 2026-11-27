@@ -53,28 +53,59 @@ export const DRAFT_CONVERSATION_BYTES = 64 * 1024 * 1024;
 export const DRAFT_TOTAL_BYTES = 128 * 1024 * 1024;
 export const SHARE_DRAFT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const draftOwner = (identity: Identity) => JSON.stringify([identity.deviceId, identity.hubPublicKey, identity.publicKey]);
+const pinConversationId = /^[A-Za-z0-9_-]{1,128}$/;
+const MAX_PIN_LIST = 2048;
+export type PendingPinChange = PinReconcileItem & { seq?: number };
+export type PreUpgradePins = { pins: string[]; globalPins: string[] };
 function parsePinList(raw: unknown): string[] {
   try {
     const value: unknown = JSON.parse(typeof raw === "string" ? raw : "[]");
-    return Array.isArray(value) ? [...new Set(value.filter((id): id is string => typeof id === "string"))] : [];
+    if (!Array.isArray(value)) return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const id of value) {
+      if (typeof id !== "string" || !pinConversationId.test(id) || seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+      if (out.length >= MAX_PIN_LIST) break;
+    }
+    return out;
   } catch { return []; }
 }
-function parsePendingPinChanges(raw: unknown): PinReconcileItem[] {
+function parsePreUpgradePins(raw: unknown): PreUpgradePins | undefined {
+  if (typeof raw !== "string") return undefined;
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    const pins = parsePinList(JSON.stringify(Array.isArray(record.pins) ? record.pins : []));
+    const globalPins = parsePinList(JSON.stringify(Array.isArray(record.globalPins) ? record.globalPins : []));
+    if (!pins.length && !globalPins.length) return undefined;
+    return { pins, globalPins };
+  } catch { return undefined; }
+}
+function parsePendingPinChanges(raw: unknown): PendingPinChange[] {
   try {
     const value: unknown = JSON.parse(typeof raw === "string" ? raw : "[]");
     if (!Array.isArray(value)) return [];
-    const byKey = new Map<string, PinReconcileItem>();
+    const byKey = new Map<string, PendingPinChange>();
     for (const item of value) {
-      const parsed = pinReconcileItemSchema.safeParse(item);
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const { seq, ...rest } = item as Record<string, unknown>;
+      const parsed = pinReconcileItemSchema.safeParse(rest);
       if (!parsed.success) continue;
-      const key = `${parsed.data.scope}:${parsed.data.conversationId}`;
+      const validSeq = typeof seq === "number" && Number.isSafeInteger(seq) && seq > 0 ? seq : undefined;
+      const entry: PendingPinChange = validSeq !== undefined ? { ...parsed.data, seq: validSeq } : parsed.data;
+      const key = `${entry.scope}:${entry.conversationId}`;
       const existing = byKey.get(key);
-      if (!existing || parsed.data.at >= existing.at) byKey.set(key, parsed.data);
+      const newer = !existing
+        || (entry.seq !== undefined && existing.seq !== undefined ? entry.seq >= existing.seq : entry.at >= existing.at);
+      if (newer) byKey.set(key, entry);
     }
     return [...byKey.values()];
   } catch { return []; }
 }
-function applyPendingPins(base: readonly string[], pending: readonly PinReconcileItem[], scope: PinScope): string[] {
+function applyPendingPins(base: readonly string[], pending: readonly PendingPinChange[], scope: PinScope): string[] {
   const result = new Set(base);
   for (const item of pending) {
     if (item.scope !== scope) continue;
@@ -873,22 +904,39 @@ export class ClientCache {
   }
   async savePins(pins: string[]): Promise<void> { const tx = await this.write(["settings"]); await tx.objectStore("settings").put(JSON.stringify(pins), "pins"); await tx.done; }
   /** Update one local pin atomically, so concurrent rows cannot overwrite each other. */
-  async setPinned(id: string, pinned: boolean, scope: PinScope = "group", sync?: { at: number; identity: Identity; queuePending: boolean }): Promise<void> {
+  async setPinned(id: string, pinned: boolean, scope: PinScope = "group", sync?: { at: number; identity: Identity; queuePending: boolean }): Promise<number | undefined> {
+    if (!pinConversationId.test(id)) return undefined;
     const key = scope === "global" ? "globalPins" : "pins";
     const tx = await this.write(["settings"]), settings = tx.objectStore("settings");
     const pins = parsePinList(await settings.get(key));
-    await settings.put(JSON.stringify(pinned ? [...new Set([...pins, id])] : pins.filter(value => value !== id)), key);
+    const nextPins = pinned
+      ? [...new Set([...pins, id])].slice(0, MAX_PIN_LIST)
+      : pins.filter(value => value !== id);
+    await settings.put(JSON.stringify(nextPins), key);
+    let assignedSeq: number | undefined;
     if (sync?.queuePending) {
       const current = await settings.get("identity") as Identity | undefined;
       if (current?.deviceId === sync.identity.deviceId && current.hubPublicKey === sync.identity.hubPublicKey) {
         const pending = parsePendingPinChanges(await settings.get("pendingPinChanges"));
+        const savedSeqRaw = await settings.get("pendingPinSeq");
+        const savedSeq = typeof savedSeqRaw === "string" && /^\d+$/.test(savedSeqRaw) ? Number(savedSeqRaw) : 0;
+        const maxPendingSeq = pending.reduce((max, item) => Math.max(max, item.seq ?? 0), 0);
+        const seq = Math.max(Number.isSafeInteger(savedSeq) ? savedSeq : 0, maxPendingSeq) + 1;
         const existing = pending.find(item => item.scope === scope && item.conversationId === id);
-        const at = Math.max(sync.at, existing?.at ?? 0);
-        const next = [...pending.filter(item => !(item.scope === scope && item.conversationId === id)), { scope, conversationId: id, pinned, at }];
+        // Strictly advance timestamp over any queued entry for the same key so
+        // rapid toggles or backward clock adjustments cannot be dropped by clearPending.
+        const at = existing ? Math.max(sync.at, existing.at + 1) : sync.at;
+        const next: PendingPinChange[] = [
+          ...pending.filter(item => !(item.scope === scope && item.conversationId === id)),
+          { scope, conversationId: id, pinned, at, seq },
+        ];
+        await settings.put(String(seq), "pendingPinSeq");
         await settings.put(JSON.stringify(next), "pendingPinChanges");
+        assignedSeq = seq;
       }
     }
     await tx.done;
+    return assignedSeq;
   }
   async conversationPins(): Promise<ConversationPinsState | undefined> {
     try {
@@ -898,7 +946,10 @@ export class ClientCache {
       return parsed.success ? parsed.data : undefined;
     } catch { return undefined; }
   }
-  async pendingPinChanges(): Promise<PinReconcileItem[]> {
+  async preUpgradePins(): Promise<PreUpgradePins | undefined> {
+    return parsePreUpgradePins(await (await this.db).get("settings", "preUpgradePins"));
+  }
+  async pendingPinChanges(): Promise<PendingPinChange[]> {
     return parsePendingPinChanges(await (await this.db).get("settings", "pendingPinChanges"));
   }
   async serverTimeOffset(): Promise<number> {
@@ -922,13 +973,13 @@ export class ClientCache {
     value: ConversationPinsState,
     identity: Identity,
     authoritative = false,
-    options?: { markMigrated?: boolean; clearPending?: readonly PinReconcileItem[] },
-  ): Promise<{ migrated: boolean; preUpgradePins: { pins: string[]; globalPins: string[] }; pending: PinReconcileItem[]; accepted: boolean }> {
+    options?: { markMigrated?: boolean; clearPending?: readonly PendingPinChange[] },
+  ): Promise<{ migrated: boolean; preUpgradePins: PreUpgradePins; pending: PendingPinChange[]; accepted: boolean; cacheChanged: boolean }> {
     const tx = await this.write(["settings"]), settings = tx.objectStore("settings");
     const current = await settings.get("identity") as Identity | undefined;
     if (current?.deviceId !== identity.deviceId || current.hubPublicKey !== identity.hubPublicKey) {
       await tx.done;
-      return { migrated: false, preUpgradePins: { pins: [], globalPins: [] }, pending: [], accepted: false };
+      return { migrated: false, preUpgradePins: { pins: [], globalPins: [] }, pending: [], accepted: false, cacheChanged: false };
     }
     const oldRaw = await settings.get("conversationPins") as string | undefined;
     let existingSynced: ConversationPinsState | undefined;
@@ -936,40 +987,83 @@ export class ClientCache {
       const parsed = oldRaw ? conversationPinsSchema.safeParse(JSON.parse(oldRaw)) : undefined;
       if (parsed?.success) existingSynced = parsed.data;
     } catch { /* Replace an unreadable cache with the confirmed Hub snapshot. */ }
+    const existingPreUpgrade = parsePreUpgradePins(await settings.get("preUpgradePins"));
     const localPins = parsePinList(await settings.get("pins"));
     const localGlobalPins = parsePinList(await settings.get("globalPins"));
     let pending = parsePendingPinChanges(await settings.get("pendingPinChanges"));
+    let pendingCleared = false;
     if (options?.clearPending?.length) {
-      const cleared = new Map<string, number>();
+      const cleared = new Map<string, { at: number; seq?: number }>();
       for (const item of options.clearPending) {
         const key = `${item.scope}:${item.conversationId}`;
-        cleared.set(key, Math.max(cleared.get(key) ?? 0, item.at));
+        const prev = cleared.get(key);
+        const at = Math.max(prev?.at ?? 0, item.at);
+        const seq = prev?.seq !== undefined || item.seq !== undefined
+          ? Math.max(prev?.seq ?? 0, item.seq ?? 0)
+          : undefined;
+        cleared.set(key, { at, seq });
       }
-      pending = pending.filter(item => {
-        const clearedAt = cleared.get(`${item.scope}:${item.conversationId}`);
-        return clearedAt === undefined || item.at > clearedAt;
+      const nextPending = pending.filter(item => {
+        const entry = cleared.get(`${item.scope}:${item.conversationId}`);
+        if (!entry) return true;
+        if (item.seq !== undefined && entry.seq !== undefined) return item.seq > entry.seq;
+        return item.at > entry.at;
       });
-      if (pending.length) await settings.put(JSON.stringify(pending), "pendingPinChanges");
-      else await settings.delete("pendingPinChanges");
+      if (nextPending.length !== pending.length) {
+        pending = nextPending;
+        pendingCleared = true;
+        if (pending.length) await settings.put(JSON.stringify(pending), "pendingPinChanges");
+        else await settings.delete("pendingPinChanges");
+      }
     }
+    let activePreUpgrade: PreUpgradePins | undefined;
+    let migrationCleared = false;
+    if (options?.markMigrated) {
+      if (existingPreUpgrade) {
+        await settings.delete("preUpgradePins");
+        migrationCleared = true;
+      }
+      activePreUpgrade = undefined;
+    } else if (existingPreUpgrade) {
+      activePreUpgrade = existingPreUpgrade;
+    } else if (!existingSynced && (localPins.length > 0 || localGlobalPins.length > 0)) {
+      // Preserve original pre-upgrade device-local pins in their own key so
+      // remote Hub pins are never mixed into retried merge payloads.
+      activePreUpgrade = { pins: localPins, globalPins: localGlobalPins };
+      await settings.put(JSON.stringify(activePreUpgrade), "preUpgradePins");
+    }
+
     if (!authoritative && existingSynced && value.revision < existingSynced.revision) {
+      const cacheChanged = pendingCleared || migrationCleared;
+      if (cacheChanged) {
+        const basePins = activePreUpgrade ? [...new Set([...existingSynced.pins, ...activePreUpgrade.pins])] : existingSynced.pins;
+        const baseGlobalPins = activePreUpgrade ? [...new Set([...existingSynced.globalPins, ...activePreUpgrade.globalPins])] : existingSynced.globalPins;
+        await settings.put(JSON.stringify(applyPendingPins(basePins, pending, "group")), "pins");
+        await settings.put(JSON.stringify(applyPendingPins(baseGlobalPins, pending, "global")), "globalPins");
+      }
       await tx.done;
-      return { migrated: true, preUpgradePins: { pins: [], globalPins: [] }, pending, accepted: false };
+      return {
+        migrated: !activePreUpgrade,
+        preUpgradePins: activePreUpgrade ?? { pins: [], globalPins: [] },
+        pending,
+        accepted: false,
+        cacheChanged,
+      };
     }
-    const hasLocalPreUpgrade = !existingSynced && !options?.markMigrated && (localPins.length > 0 || localGlobalPins.length > 0);
-    if (!hasLocalPreUpgrade) {
-      await settings.put(JSON.stringify(value), "conversationPins");
-      await settings.put(JSON.stringify(applyPendingPins(value.pins, pending, "group")), "pins");
-      await settings.put(JSON.stringify(applyPendingPins(value.globalPins, pending, "global")), "globalPins");
-      await tx.done;
-      return { migrated: true, preUpgradePins: { pins: [], globalPins: [] }, pending, accepted: true };
-    }
-    const mergedLocalPins = [...new Set([...value.pins, ...localPins])];
-    const mergedLocalGlobalPins = [...new Set([...value.globalPins, ...localGlobalPins])];
-    await settings.put(JSON.stringify(applyPendingPins(mergedLocalPins, pending, "group")), "pins");
-    await settings.put(JSON.stringify(applyPendingPins(mergedLocalGlobalPins, pending, "global")), "globalPins");
+
+    await settings.put(JSON.stringify(value), "conversationPins");
+    const basePins = activePreUpgrade ? [...new Set([...value.pins, ...activePreUpgrade.pins])] : value.pins;
+    const baseGlobalPins = activePreUpgrade ? [...new Set([...value.globalPins, ...activePreUpgrade.globalPins])] : value.globalPins;
+    await settings.put(JSON.stringify(applyPendingPins(basePins, pending, "group")), "pins");
+    await settings.put(JSON.stringify(applyPendingPins(baseGlobalPins, pending, "global")), "globalPins");
     await tx.done;
-    return { migrated: false, preUpgradePins: { pins: localPins, globalPins: localGlobalPins }, pending, accepted: true };
+    return {
+      migrated: !activePreUpgrade,
+      preUpgradePins: activePreUpgrade ?? { pins: [], globalPins: [] },
+      pending,
+      accepted: true,
+      cacheChanged: true,
+    };
   }
   private selectionHintKey(identity: Identity, generation: string | undefined): string {
     return `tarocub-selection:${JSON.stringify([this.databaseName, generation ?? null, draftOwner(identity)])}`;

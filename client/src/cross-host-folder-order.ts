@@ -672,7 +672,9 @@ export function subscribeCrossHostFolderOrder(listener: () => void): () => void 
 export function removeCrossHostFolderOrderHost(hostKey: string): void {
   const current = readCrossHostFolderOrder();
   const next = pruneCrossHostFolderOrderHost(current, hostKey);
-  if (next !== current) writeCrossHostFolderOrder(next);
+  // Device-local unpairing ("从此设备移除") must not bump updatedAt or broadcast
+  // a destructive global deletion to other devices still paired with this host.
+  if (next !== current) writeCrossHostFolderOrder(next, { fromSync: true });
 }
 
 export function saveCrossHostFolderOrder(

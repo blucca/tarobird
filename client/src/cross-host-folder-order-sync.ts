@@ -2,6 +2,7 @@ import type { HubConnection } from './connection.js';
 import { HubHttpError } from './http-error.js';
 import {
   nextCrossHostFolderUpdatedAt,
+  parseCrossHostFolderKey,
   readCrossHostFolderOrder,
   readyCrossHostFolderOrder,
   setCrossHostServerTimeOffset,
@@ -20,10 +21,58 @@ type OrderValue = {
   ordinary: readonly string[];
 };
 
+type ClampedTarget = {
+  canonical: string;
+  targetTs: number;
+  revision: number;
+  updatedAt: number;
+};
+
 const MAX_CONFLICT_PASSES = 6;
 
 function canonicalOrder(order: Pick<OrderValue, 'pinned' | 'ordinary'>): string {
   return JSON.stringify([order.pinned, order.ordinary]);
+}
+
+function hostKeysOf(order: Pick<OrderValue, 'pinned' | 'ordinary'>): Set<string> {
+  const hosts = new Set<string>();
+  for (const key of order.pinned) {
+    const parsed = parseCrossHostFolderKey(key);
+    if (parsed) hosts.add(parsed.hostKey);
+  }
+  for (const key of order.ordinary) {
+    const parsed = parseCrossHostFolderKey(key);
+    if (parsed) hosts.add(parsed.hostKey);
+  }
+  return hosts;
+}
+
+/** True when `local` is at the exact same positive timestamp as `remote` and
+ * matches `remote` with one or more hosts removed locally (e.g. device-local
+ * unpairing). Neither side should overwrite the other in this state. */
+function isHostPrunedMatch(local: OrderValue, remote: OrderValue): boolean {
+  const localTs = local.updatedAt ?? 0;
+  const remoteTs = remote.updatedAt ?? 0;
+  if (localTs === 0 || localTs !== remoteTs) return false;
+  if (canonicalOrder(local) === canonicalOrder(remote)) return false;
+  const localHosts = hostKeysOf(local);
+  const remoteHosts = hostKeysOf(remote);
+  let hasMissingHost = false;
+  for (const host of remoteHosts) {
+    if (!localHosts.has(host)) hasMissingHost = true;
+  }
+  if (!hasMissingHost) return false;
+  for (const host of localHosts) {
+    if (!remoteHosts.has(host)) return false;
+  }
+  const keep = (key: string) => {
+    const parsed = parseCrossHostFolderKey(key);
+    return !!parsed && localHosts.has(parsed.hostKey);
+  };
+  return canonicalOrder({
+    pinned: remote.pinned.filter(keep),
+    ordinary: remote.ordinary.filter(keep),
+  }) === canonicalOrder(local);
 }
 
 function isNewerOrder(candidate: OrderValue, current: OrderValue): boolean {
@@ -80,6 +129,7 @@ function sameSnapshot(a: ObservedConnectionState | undefined, b: ObservedConnect
  * one-time pre-upgrade migration upload, and offline reconnect catch-up. */
 export class CrossHostFolderOrderSync {
   private readonly subscriptions = new Map<HubConnection, { stop: () => void; snapshot: ObservedConnectionState }>();
+  private readonly clampedTargets = new Map<HubConnection, ClampedTarget>();
   private readonly unsubSource: () => void;
   private readonly unsubOrder: () => void;
   private disposed = false;
@@ -95,7 +145,10 @@ export class CrossHostFolderOrderSync {
       this.schedule();
     });
     this.unsubOrder = subscribeCrossHostFolderOrder(() => {
-      if (!this.suppressLocalEvent) this.schedule();
+      if (!this.suppressLocalEvent) {
+        this.conflictPasses = 0;
+        this.schedule();
+      }
     });
     this.refreshConnections();
     this.schedule();
@@ -108,6 +161,7 @@ export class CrossHostFolderOrderSync {
       if (!active.has(connection)) {
         entry.stop();
         this.subscriptions.delete(connection);
+        this.clampedTargets.delete(connection);
       }
     }
     for (const connection of active) {
@@ -167,7 +221,8 @@ export class CrossHostFolderOrderSync {
     }
 
     let local = readCrossHostFolderOrder();
-    if (isNewerOrder(bestRemote, local)) {
+    const localPrunedFromRemote = isHostPrunedMatch(local, bestRemote);
+    if (!localPrunedFromRemote && isNewerOrder(bestRemote, local)) {
       this.suppressLocalEvent = true;
       try {
         writeCrossHostFolderOrder({
@@ -197,9 +252,11 @@ export class CrossHostFolderOrderSync {
       local = readCrossHostFolderOrder();
     }
 
-    const target = local;
+    const target: OrderValue = localPrunedFromRemote ? bestRemote : local;
+    const localMatchesTarget = !localPrunedFromRemote;
     const targetTs = target.updatedAt ?? 0;
     if (targetTs === 0) return;
+    const targetCanonical = canonicalOrder(target);
 
     let sawConflict = false;
     let sawClampedOrNewer = false;
@@ -207,44 +264,84 @@ export class CrossHostFolderOrderSync {
       if (this.disposed) return;
       const remote = connection.state.crossHostFolderOrder;
       if (!remote || !isNewerOrder(target, remote)) continue;
+      const clamped = this.clampedTargets.get(connection);
+      if (
+        clamped
+        && clamped.canonical === targetCanonical
+        && clamped.revision === remote.revision
+        && clamped.updatedAt === remote.updatedAt
+        && canonicalOrder(remote) === clamped.canonical
+        && targetTs <= clamped.targetTs
+      ) {
+        continue;
+      }
       try {
         const saved = await connection.saveCrossHostFolderOrder(
           { updatedAt: targetTs, pinned: target.pinned, ordinary: target.ordinary },
           remote.revision,
         );
         if (this.disposed) return;
-        if (isNewerOrder(saved, target)) {
-          sawClampedOrNewer = true;
-        } else if (saved.updatedAt < targetTs && canonicalOrder(saved) === canonicalOrder(target)) {
-          // Server clamped a far-future offline clock; align local timestamp so
-          // other Hubs converge without repeating PATCHes.
-          this.suppressLocalEvent = true;
-          try {
-            writeCrossHostFolderOrder({
-              version: 1,
-              updatedAt: saved.updatedAt,
-              pinned: saved.pinned,
-              ordinary: saved.ordinary,
-            }, { fromSync: true });
-          } finally {
-            this.suppressLocalEvent = false;
+        const latestLocal = readCrossHostFolderOrder();
+        const localDiverged = localMatchesTarget
+          && ((latestLocal.updatedAt ?? 0) !== targetTs || canonicalOrder(latestLocal) !== targetCanonical);
+        if (saved.updatedAt < targetTs && canonicalOrder(saved) === targetCanonical) {
+          this.clampedTargets.set(connection, {
+            canonical: targetCanonical,
+            targetTs,
+            revision: saved.revision,
+            updatedAt: saved.updatedAt,
+          });
+          if (localDiverged) {
+            this.dirty = true;
+            break;
           }
-          sawClampedOrNewer = true;
+          // Only re-align local updatedAt downward when no connected owner Hub
+          // already holds a higher timestamp for the exact same order.
+          const higherRemoteExists = this.source.getConnections().some(c => {
+            if (!isEligibleConnection(c)) return false;
+            const r = c.state.crossHostFolderOrder;
+            return !!r && r.updatedAt > saved.updatedAt && canonicalOrder(r) === targetCanonical;
+          });
+          if (localMatchesTarget && !higherRemoteExists) {
+            // Server clamped a far-future offline clock; align local timestamp
+            // so remaining Hubs converge without repeating PATCHes.
+            this.suppressLocalEvent = true;
+            try {
+              writeCrossHostFolderOrder({
+                version: 1,
+                updatedAt: saved.updatedAt,
+                pinned: saved.pinned,
+                ordinary: saved.ordinary,
+              }, { fromSync: true });
+            } finally {
+              this.suppressLocalEvent = false;
+            }
+            sawClampedOrNewer = true;
+            break;
+          }
+        } else {
+          this.clampedTargets.delete(connection);
+          if (localDiverged) {
+            this.dirty = true;
+            break;
+          }
+          if (isNewerOrder(saved, target)) {
+            sawClampedOrNewer = true;
+          }
         }
       } catch (error) {
         if (error instanceof HubHttpError && error.code === 'cross_host_folder_order_changed') {
+          this.clampedTargets.delete(connection);
           sawConflict = true;
         }
       }
     }
 
-    if (sawClampedOrNewer) {
-      this.dirty = true;
-    }
-    if (sawConflict && this.conflictPasses < MAX_CONFLICT_PASSES) {
+    const needsRetry = sawConflict || sawClampedOrNewer;
+    if (needsRetry && this.conflictPasses < MAX_CONFLICT_PASSES) {
       this.conflictPasses++;
       this.dirty = true;
-    } else if (!sawConflict) {
+    } else if (!needsRetry) {
       this.conflictPasses = 0;
     }
   }
@@ -255,5 +352,6 @@ export class CrossHostFolderOrderSync {
     this.unsubOrder();
     for (const entry of this.subscriptions.values()) entry.stop();
     this.subscriptions.clear();
+    this.clampedTargets.clear();
   }
 }
