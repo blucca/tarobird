@@ -46,7 +46,7 @@ import { BACKGROUND_TASK_GROUP_CAPABILITY } from "../../src/client-protocol/back
 import { RUN_SCOPES_CAPABILITY, RUN_TAIL_CAPABILITY } from "../../src/client-protocol/run.js";
 import { desktopNotice } from "./message-notification.js";
 import { desktopNotification, type NotificationState } from "./notifications.js";
-import { nativePlatform } from "./native.js";
+import { isNativeAppActive, NATIVE_ACTIVE_EVENT, nativePlatform } from "./native.js";
 import { PRIVATE_NETWORK_CAPABILITY, networkCanonical, networkCommandSchema, networkCommandResultSchema, networkViewSchema, type NetworkCommandInput, type NetworkView, type SignedNetworkManifest, type SignedNetworkProposal } from "../../src/client-protocol/private-network.js";
 import { hostProfileSchema, type HostProfileState } from "../../src/client-protocol/host-profile.js";
 import { verifyNetworkMembership } from "./network-identity.js";
@@ -168,12 +168,13 @@ export class HubConnection {
   get isClosed(): boolean { return this.closed; }
   beginFileTransfer(): () => void { this.fileTransfers++; let released = false; return () => { if (!released) { released = true; this.fileTransfers--; this.lastTraffic = Date.now(); } }; }
   private readonly presence = (event?: Event) => {
-    void this.send({ v: 1, type: "presence", foreground: document.visibilityState === "visible" && document.hasFocus() }).catch(() => undefined);
-    if (document.hidden) {
+    const active = isNativeAppActive();
+    void this.send({ v: 1, type: "presence", foreground: document.visibilityState === "visible" && document.hasFocus() && active }).catch(() => undefined);
+    if (document.hidden || !active) {
       this.preferred = undefined;
       // A new foreground after a real background transition gets a fresh probe;
       // an earlier wake's timer must not consume that opportunity to answer.
-      if (nativePlatform() === "ios") { this.clearForegroundProbe(); this.awaitingForegroundProbe = false; }
+      if (nativePlatform() === "ios" || nativePlatform() === "android") { this.clearForegroundProbe(); this.awaitingForegroundProbe = false; }
     }
     else if (event?.type === "visibilitychange" || event?.type === "focus") this.resume();
   };
@@ -289,7 +290,7 @@ export class HubConnection {
     if (this.started) return this.starting ?? Promise.resolve();
     this.started = true; this.closed = false; const lifecycle = ++this.lifecycle;
     if (this.httpEpoch.signal.aborted) this.httpEpoch = new AbortController();
-    window.addEventListener("online", this.networkOnline); document.addEventListener("visibilitychange", this.presence); window.addEventListener("focus", this.presence); window.addEventListener("blur", this.presence);
+    window.addEventListener("online", this.networkOnline); document.addEventListener("visibilitychange", this.presence); window.addEventListener("focus", this.presence); window.addEventListener("blur", this.presence); window.addEventListener(NATIVE_ACTIVE_EVENT, this.presence);
     const work = (async () => {
       const [active, profiles, revoked, stored, outbox, conversationFolders, membership] = await Promise.all([this.cache.activeMessages(), this.cache.profiles(), this.cache.identityRevoked(this.identity), this.cache.identity(), this.cache.outbox(), this.cache.conversationFolders(), this.cache.networkMembership()]);
       if (this.closed || lifecycle !== this.lifecycle) return;
@@ -345,7 +346,7 @@ export class HubConnection {
       // foreground/online signal. Only incoming traffic proves this link alive.
       if (!this.awaitingForegroundProbe) {
         this.lastPong = performance.now(); this.awaitingForegroundProbe = true;
-        if (nativePlatform() === "ios") {
+        if (nativePlatform() === "ios" || nativePlatform() === "android") {
           const ws = this.ws, generation = this.generation, started = performance.now();
           const probe = setTimeout(() => {
             if (this.foregroundProbe !== probe) return;
@@ -1479,5 +1480,5 @@ export class HubConnection {
     this.close(true); this.update({ error: t("此设备已被吊销，请重新配对") });
     await this.cache.markIdentityRevoked(this.identity).catch(() => console.warn("device_revocation_cache_failed"));
   }
-  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
+  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); window.removeEventListener(NATIVE_ACTIVE_EVENT, this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
 }
