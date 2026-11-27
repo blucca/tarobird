@@ -320,7 +320,7 @@ export class HubAuth {
   }
   /** Caller holds the DB queue so the subject cannot change during verification. */
   private async actionTargetDigest(action: DeviceAction): Promise<string> {
-    if (action.operation === "network" || action.operation === "bot-message-grant" || action.operation === "screen-grant") return action.target;
+    if (action.operation === "network" || action.operation === "bot-message-grant" || action.operation === "screen-grant" || action.operation === "terminal-grant") return action.target;
     if (action.operation === "approve") {
       const row = await this.store.db.get<PairingRow>("SELECT * FROM pairing_requests WHERE code_hash=? AND status='pending'", [hashSecret(action.target)]);
       if (!row || row.expires_at <= this.now()) throw new HubError("pairing_expired_or_invalid", 403);
@@ -361,6 +361,12 @@ export class HubAuth {
     await this.validateSessionInTransaction(session); await this.store.requireOwner(session.userId);
     if (!(await this.localDesktopControllersInTransaction()).has(session.deviceId)) throw new HubError("local_controller_required", 403);
     await this.consumeDeviceAction(session, { operation: "screen-grant", target }, proof);
+  }
+  /** Host terminal configuration has its own signed domain and requires a local desktop controller. */
+  async consumeTerminalGrant(session: AuthSession, target: string, proof?: DeviceActionProof): Promise<void> {
+    await this.validateSessionInTransaction(session); await this.store.requireOwner(session.userId);
+    if (!(await this.localDesktopControllersInTransaction()).has(session.deviceId)) throw new HubError("local_controller_required", 403);
+    await this.consumeDeviceAction(session, { operation: "terminal-grant", target }, proof);
   }
   /** Called only inside the mutation transaction, after current owner/trust checks. */
   private async consumeDeviceAction(session: AuthSession | undefined, action: DeviceAction, proof?: DeviceActionProof, admit?: () => void): Promise<DeviceActionStatement> {

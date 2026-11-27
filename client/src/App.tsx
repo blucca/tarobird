@@ -451,14 +451,40 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       return next;
     });
   }, [rightModeScope]);
-  const [terminalAllowed, setTerminalAllowed] = useState(false);
+  const desktopDevice = !["ios", "android"].includes(nativePlatform())
+    && !/Android|iPhone|iPad|iPod/.test(navigator.userAgent)
+    && !(navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const [terminalAccess, setTerminalAccess] = useState<{ connection: HubConnection; allowed: boolean }>(() => ({ connection, allowed: false }));
   useEffect(() => {
+    if (!desktopDevice || phone || !!pane || state.status !== "online" || !state.hostTerminalAvailable) {
+      setTerminalAccess({ connection, allowed: false });
+      return;
+    }
     let active = true;
-    if (phone || !!pane || state.status !== "online" || !state.hostTerminalAvailable) { setTerminalAllowed(false); return; }
-    void connection.terminalStatus().then((s) => { if (active) setTerminalAllowed(s.allowed); }).catch(() => { if (active) setTerminalAllowed(false); });
-    return () => { active = false; };
-  }, [connection, phone, pane, state.status, state.hostTerminalAvailable, settings]);
-  const terminalEligible = !phone && !pane && terminalAllowed && !!selected && !connection.isReadOnly && !current?.archived;
+    let controller: AbortController | undefined;
+    const refresh = () => {
+      if (!active || document.visibilityState === "hidden") return;
+      controller?.abort();
+      const nextController = new AbortController();
+      controller = nextController;
+      void connection.terminalStatus(nextController.signal)
+        .then((s) => { if (active && !nextController.signal.aborted) setTerminalAccess({ connection, allowed: s.allowed }); })
+        .catch(() => { if (active && !nextController.signal.aborted) setTerminalAccess({ connection, allowed: false }); });
+    };
+    refresh();
+    const onFocus = () => { if (visible) refresh(); };
+    const onVisibility = () => { if (visible && document.visibilityState === "visible") refresh(); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      active = false;
+      controller?.abort();
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [connection, desktopDevice, phone, pane, state.status, state.hostTerminalAvailable, settings, visible]);
+  const terminalAllowed = desktopDevice && !phone && !pane && state.status === "online" && !!state.hostTerminalAvailable && terminalAccess.connection === connection && terminalAccess.allowed;
+  const terminalEligible = terminalAllowed && !!selected && !connection.isReadOnly && !current?.archived && !(current?.parentId && conversations.find((c) => c.id === current.parentId)?.archived);
   const terminalVisible = terminalEligible && rightMode === "terminal" && visible && !details && searchResults === undefined && !settings;
   const [screenOpened, setScreenOpened] = useState(false);
   const screenVisible = screenOpened && rightMode === "screen" && visible && (!phone || isMobileScreenApp()) && (!pane || !isMobileScreenApp() && pane.expanded) && !details && searchResults === undefined && !settings;
@@ -551,7 +577,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     openImage: async (file: File, attachmentId?: string) => { const controller = await openWorkbench(); await controller.openImage(file, {attachmentId}); },
   } : undefined, [workbenchEligible, openWorkbench]);
   const sideTrigger = useRef<HTMLButtonElement>(null);
-  const sideEligible = visible && !pane && !["ios", "android"].includes(nativePlatform()) && !/Android|iPhone|iPad|iPod/.test(navigator.userAgent) && !(navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1) && !!state.sideAvailable && !connection.isReadOnly && current?.type === "direct" && !current.parentId && current.botIds.length === 1 && !current.archived;
+  const sideEligible = visible && !pane && desktopDevice && !!state.sideAvailable && !connection.isReadOnly && current?.type === "direct" && !current.parentId && current.botIds.length === 1 && !current.archived;
   const side = useSideConversation(connection, selected, activeBot?.id ?? "", !!sideEligible, state.status === "online" && !!activeBot?.online, JSON.stringify([activeBot?.engine, activeBot?.model, activeBot?.effort]), conversations);
   const previousSideSelection = useRef(selected);
   useLayoutEffect(() => {
@@ -573,31 +599,40 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     try { localStorage.setItem("tarobird.workspaceRailOpen", next ? "1" : "0"); } catch { /* ignore */ }
   }, []);
   const workspaceEligible = !pane && !phone && !!current && visible && searchResults === undefined;
-  const workspaceVisible = workspaceEligible && workspaceOpen && !details && !sideVisible && !workbenchVisible && !screenVisible;
+  const workspaceVisible = workspaceEligible && workspaceOpen && !details && !sideVisible && !workbenchVisible && !screenVisible && !terminalVisible;
   const workspaceComms = useConversationBotComms(connection, selected, workspaceEligible, workspaceVisible, messagesReady ? lastBotReply : "");
   const workspaceNeedsApproval = workspaceComms.data?.summary.needsApproval ?? 0;
   const workspaceActiveComms = workspaceComms.data?.summary.active ?? 0;
   // What the rail was put in front of, per conversation, so closing the rail shows that panel again.
-  const workspaceCovers = useRef(new Map<string, "side" | "workbench" | "screen">());
+  const workspaceCovers = useRef(new Map<string, "side" | "workbench" | "screen" | "terminal">());
   const closeWorkspace = useCallback(() => {
     setDesktopWorkspaceOpen(false);
     // Whatever the rail was in front of shows again.
     const covered = workspaceCovers.current.get(rightModeScope); workspaceCovers.current.delete(rightModeScope);
-    if (rightMode === "workspace") setRightMode(covered === "screen" && !screenOpened ? "side" : covered ?? "side");
-  }, [rightMode, rightModeScope, screenOpened, setRightMode, setDesktopWorkspaceOpen]);
+    if (rightMode === "workspace") {
+      setRightMode(
+        covered === "screen" && !screenOpened ? "side"
+          : covered === "terminal" && !terminalEligible ? "side"
+            : covered ?? "side",
+      );
+    }
+  }, [rightMode, rightModeScope, screenOpened, terminalEligible, setRightMode, setDesktopWorkspaceOpen]);
   const toggleWorkspace = useCallback(() => {
     if (workspaceVisible) { closeWorkspace(); return; }
     if (details) setDetails(false);
     // Another panel is showing: the rail goes in front of it and closes nothing. A side conversation keeps its
-    // session, draft and attachments, and the remote screen stays connected.
+    // session, draft and attachments, and the remote screen and terminal stay connected.
     if (workbenchVisible) designOpener.revoke();
-    if (workbenchVisible || sideVisible || screenVisible) {
-      workspaceCovers.current.set(rightModeScope, workbenchVisible ? "workbench" : screenVisible ? "screen" : "side");
+    if (workbenchVisible || sideVisible || screenVisible || terminalVisible) {
+      workspaceCovers.current.set(
+        rightModeScope,
+        workbenchVisible ? "workbench" : screenVisible ? "screen" : terminalVisible ? "terminal" : "side",
+      );
       setRightMode("workspace");
     }
     workspaceTakesFocus.current = true;
     setDesktopWorkspaceOpen(true);
-  }, [workspaceVisible, workbenchVisible, sideVisible, screenVisible, details, designOpener, rightModeScope, setRightMode, closeWorkspace, setDesktopWorkspaceOpen]);
+  }, [workspaceVisible, workbenchVisible, sideVisible, screenVisible, terminalVisible, details, designOpener, rightModeScope, setRightMode, closeWorkspace, setDesktopWorkspaceOpen]);
   const toggleSide = useCallback(() => {
     if (sideVisible) { void side.close(); sideTrigger.current?.focus(); }
     else { setRightMode("side"); setDetails(false); closeSearch(); void side.open(); }
@@ -1232,7 +1267,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const recording = voice.busy;
   const backRoot = useRef<HTMLDivElement>(null);
   // ADHD expands only its owning card, never the shared native window.
-  const sideWindowLayout = useSideWindowExpansion(backRoot, !pane && (sideVisible || screenVisible || workbenchVisible && !phone));
+  const sideWindowLayout = useSideWindowExpansion(backRoot, !pane && (sideVisible || screenVisible || terminalVisible || workbenchVisible && !phone));
   // Native expansion can finish before IndexedDB or the lazy Workbench chunk.
   // Reserve the same column in both stages; late loading after Close stays hidden.
   const workbenchLoading = workbenchVisible ? <aside className={`workbench-loading ${!phone && !pane ? "conversation-side-panel" : ""}`} hidden={!phone && sideWindowLayout === "pending"} aria-label={t("工作台")}>
@@ -1873,7 +1908,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       }}/>{current?.type === "group" && draftSaveFailed && <button type="button" className="text-button" onClick={() => queueDraftText(selected, draft)}>{t("重试保存")}</button>}{current?.type === "group" && (error.includes(t("群聊回复方式已变化，草稿已保留。请确认后按当前群聊方式发送。")) || error.includes(t("原讨论已结束，补充内容已保留。请确认后按当前群聊方式发送。")) || error.includes(t("群内已有进行中的讨论，原问题已保留。请明确选择作为补充发送。")) || error.includes(t("上次发送结果无法确认，草稿已保留。请先核对聊天记录，避免重复发送。"))) && <button type="button" className="text-button" onClick={() => report(rebindGroupDraft(error.includes(t("上次发送结果无法确认，草稿已保留。请先核对聊天记录，避免重复发送。"))))}>{error.includes(t("上次发送结果无法确认，草稿已保留。请先核对聊天记录，避免重复发送。")) ? t("核对后重新发送") : replyMode?.activeRun ? t("作为补充") : automaticComposer(replyMode) ? t("作为新讨论") : t("按当前方式")}</button>}{richDraftError && <div className="error draft-save-error" role="alert">{richDraftError === "draft_capacity_exceeded" ? <><p>{t("草稿未自动保存，仍可直接发送。请保持此页打开，或移除附件后重试。")}</p><details className="draft-save-limits"><summary>{t("本地草稿保存上限")}</summary><p>{t("每个对话最多 32 个附件、64 MB；本机每个主机共 128 MB。此限制不影响直接发送。")}</p></details></> : richDraftError === "draft_metadata_too_large" ? t("引用或附件信息过大，完整草稿尚未自动保存。仍可直接发送，或取消引用、减少附件后重试。") : richDraftError === "draft_record_limit" ? t("本机已达到 1,000 个活跃对话草稿上限。当前内容仍可直接发送，但尚未保存。") : richDraftError === "draft_identity_revoked" ? t("设备授权已失效，新的草稿修改无法保存。请先备份当前内容，再重新配对。") : richDraftError === "draft_changed_elsewhere" ? t("另一窗口已更新此草稿。当前内容仍在此页，请备份后重新打开客户端。") : t("完整草稿未保存，请保持此页打开并重试。") }<button onClick={retryRichDraft}>{t("重试")}</button></div>}<div className="composer-toolbar">{phone && !voiceMode && <button ref={attachments.trigger} className="composer-add" aria-label={t("添加附件")} aria-haspopup="dialog" aria-expanded={attachments.expanded} disabled={connection.isReadOnly || groupSending || uploadProgress !== undefined} onClick={attachments.show}><Plus size={20}/></button>}{!phone && <ComposerAttachmentButton picker={attachments} disabled={connection.isReadOnly || groupSending || uploadProgress !== undefined}/>}{phone ? <VoiceMicButton key={`${voiceKey}:${visible}`} voice={voice} disabled={connection.isReadOnly || !richDraftReady || steeringBusy || uploadProgress !== undefined} start={startHeldVoice} open={() => { setError(""); composer.current?.blur(); setVoiceMode(true); }}/> : <ComposerVoiceButton busy={recording} disabled={connection.isReadOnly || groupSending || uploadProgress !== undefined || !!pane?.microphoneBusy || sideRecording} start={() => { if (pane && !pane.claimMicrophone()) return; setError(""); void voice.start(); }}/>}<>{uploadProgress !== undefined && <button className="composer-cancel-upload" onClick={() => uploadController.current?.abort()} aria-label={t("取消上传")}>{t("取消上传")}</button>}</>{!phone && <button className="icon-button composer-collaborate" title={t("发起 Bot 协作")} aria-label={t("发起 Bot 协作")} disabled={connection.isReadOnly || !richDraftReady || uploadProgress !== undefined || recording || !!files.length || !!reply || state.status !== "online"} onClick={() => setDelegation("ask")}><BotIcon size={18}/><span>{t("协作")}</span></button>}{!phone && current?.type === "group" && discussionComposer && <DiscussionParticipants key={`${connection.identity.hubPublicKey}:${selected}`} members={conversationBots.map(bot => ({ id: bot.id, name: labels.get(bot.id) ?? bot.name }))} selected={discussionMentionIds} change={ids => { discussionParticipants.change(ids); changeDraft(draft); }} locked={!!replyMode?.activeRun && !discussionNewTopic} disabled={!discussionParticipants.ready || sending || uploadProgress !== undefined}/>}{!phone && current?.type === "group" && !discussionComposer && <><button ref={recipientTrigger} type="button" className={`composer-recipients${recipients.length || defaultAllReplies ? "" : " is-empty"}`} aria-label={t("让谁回复：{0}", recipientSummary)} title={t("回复的 Bot")} aria-expanded={menu === "recipients"} aria-controls={menu === "recipients" ? `${menuId}-recipients` : undefined} onClick={() => toggleMenu("recipients")}><AtSign size={14}/><span>{recipientSummary}</span><ChevronDown size={12}/></button>
         <DesktopMenu id={`${menuId}-recipients`} label={t("回复的 Bot")} open={menu === "recipients"} close={closeMenu} trigger={recipientTrigger} placement="up-start" className="recipient-menu"><p className="desktop-menu-heading"><span>{t("让谁回复")}</span></p>{conversationBots.map((b) => <button key={b.id} role="checkbox" aria-checked={recipients.includes(b.id)} aria-label={labels.get(b.id) ?? b.name} data-menu-keep="" onClick={() => setRecipients((old) => old.includes(b.id) ? old.filter((id) => id !== b.id) : [...old, b.id])}><span className="recipient-check" aria-hidden="true">{recipients.includes(b.id) && <Check size={13}/>}</span><Avatar kind="bot" id={b.id} name={labels.get(b.id) ?? b.name} size={20}/><span className="desktop-menu-label">{labels.get(b.id) ?? b.name}</span></button>)}</DesktopMenu></>}<span className="draft-save-status" hidden={recording || uploadProgress !== undefined || !!replying} role={draft || draftSaving || draftSaveFailed || richDraftSaving || richDraftError || richDraftContent ? "status" : undefined} aria-label={t("草稿状态")} aria-live={draftSaveNeedsAttention ? "polite" : "off"}>{draftStatusText && <span className={!draftSaveNeedsAttention ? "screen-reader-only" : undefined}>{draftStatusText}</span>}</span><span className={`composer-hint${uploadProgress === undefined && !recording ? replying ? " is-queue" : " is-tip" : ""}`}>{uploadProgress !== undefined ? uploadRecovering ? t("连接中断，等待恢复…") : t("上传 {0}%", Math.round(uploadProgress * 100)) : recording ? t("正在录音…") : current?.type === "group" && sending ? t("正在发送…") : discussionComposer ? discussionSendHint : (piDirect || agyChoice) && composerQueues ? t("等待当前任务结束后再处理") : codexSupplement ? t("发送可补充当前任务") : continueCurrent ? nativeInput ? queueChosen ? t("等待当前任务结束后再处理") : t("发送后由 CLI 适时读入") : t("发送可补充当前任务") : nativeInput && (files.length || reply) ? t("附件和引用将在当前任务结束后处理") : replying ? t("普通发送将排队") : macKeyboard ? t("Shift / ⌘ + Enter 换行") : t("Shift / Alt + Enter 换行")}</span>{!phone && !!replying && <>{steeringAvailable && !nativeInput && !continueCurrent && !showSendChoice && !(piDirect && draft.trimStart().startsWith("/") && !isPiLiveCommand(draft, nativePiCommands)) && <button className="composer-steer" aria-label={t("引导当前任务")} title={t("补充到当前任务，不改变待执行顺序")} disabled={connection.isReadOnly || !richDraftReady || steeringBusy || uploadProgress !== undefined || recording} onClick={() => report(steer())}>{steeringBusy ? <LoaderCircle size={16} className="spin"/> : <Compass size={16}/>}<span>{t("引导")}</span></button>}<button className={`icon-button composer-stop${replying ? " is-live" : ""}`} title={discussionComposer && composerDiscussionRun ? t("停止本次讨论") : t("停止当前轮次")} aria-label={discussionComposer && composerDiscussionRun ? t("停止本次讨论") : t("停止当前轮次")} disabled={discussionStopping} onClick={() => report(requestComposerStop())}><CircleStop size={19}/></button></>}{usageIndicators}{composerModelControls}{phoneStop ? <button key="stop" className="icon-button composer-stop is-live" title={discussionComposer && composerDiscussionRun ? t("停止本次讨论") : t("停止当前轮次")} aria-label={discussionComposer && composerDiscussionRun ? t("停止本次讨论") : t("停止当前轮次")} disabled={discussionStopping} onClick={() => report(requestComposerStop())}><CircleStop size={19}/></button> : <button aria-busy={groupSending || undefined} key="send" className={`send-button${discussionPaused ? " has-discussion-action" : ""}`} aria-label={pane ? t("发送到 {0} · {1}", pane.host.name, current?.title ?? selected) : t("发送消息")} title={groupSending ? t("正在发送…") : composerQueues ? t("等待当前任务结束后再处理") : discussionComposer ? discussionSendHint : codexSupplement ? t("补充到当前任务，不改变待执行顺序") : continueCurrent ? nativeInput ? nativeInput.sendNow ? t("普通发送，不打断当前任务；Ctrl+Enter 立即发送") : t("普通发送，不打断当前任务") : t("补充当前任务，不停止子代理") : replying ? t("发送消息，任务执行中会排队") : t("发送消息")} disabled={connection.isReadOnly || history.sendBlocked || !richDraftReady || !replyReady || sending || steeringBusy || recording || discussionTransitioning || !discussionSendActionAllowed || (!draft.trim() && !files.length) || uploadProgress !== undefined} onClick={() => report(sendFromComposer())}>{discussionPaused && <span>{discussionSendHint}</span>}{groupSending ? <Hourglass size={18} aria-hidden="true"/> : composerQueues ? <ListOrdered size={18} aria-hidden="true"/> : preferences.palette === "cli" ? <CornerDownLeft size={18} aria-hidden="true"/> : <ArrowUp size={18} aria-hidden="true"/>}</button>}</div></div>}</div></div>}
   </main>
-  {terminalEligible && <TerminalPanel connection={connection} conversationId={selected} hostName={hostName} visible={terminalVisible} close={() => setRightMode("side")}/>}
+  {terminalEligible && <TerminalPanel connection={connection} conversationId={selected} hostName={hostName} visible={terminalVisible && sideWindowLayout !== "pending"} close={() => setRightMode("side")} onUnauthorized={() => setTerminalAccess({ connection, allowed: false })}/>}
   {screenOpened && <RemoteScreenPanel connection={connection} hostName={hostName} visible={screenVisible && (!!pane || sideWindowLayout !== "pending")} close={closeScreen} openSettings={() => { setSettingsFromMenu(false); setSettingsSection("screen"); setSettings(true); }}/> }
   {workbench.controller ? <Suspense fallback={workbenchLoading}><Workbench id={workbenchId} compact={!!pane && paneWorkbenchCompact} controller={workbench.controller} visible={workbenchVisible && (phone || sideWindowLayout !== "pending")} phone={phone} onManageFiles={() => { setSettingsFromMenu(false); setSettingsSection("workbench"); setSettings(true); }} onAnnotate={annotateWorkbench} onDesignCompose={composeDesign} onCompose={dispatchWidgetCompose} onClose={() => { designOpener.revoke(); setRightMode("side"); workbenchTrigger.current?.focus({preventScroll:true}); }}/></Suspense> : !phone && !pane ? workbenchLoading : null}
   {side.shown && sideEligible && <SideConversation key={side.scope} side={side} appearance={`${preferences.palette}:${preferences.fontSize}`} mainRecording={recording} recordingChanged={setSideRecording} online={state.status === "online" && !!activeBot?.online} visible={sideVisible && sideWindowLayout !== "pending"} trigger={sideTrigger} close={() => { void side.close(); }} returnToComposer={() => composer.current?.focus({ preventScroll: true })} insert={text => { changeDraft(`${draft}${draft ? "\n\n" : ""}${text.split("\n").map(line => `> ${line}`).join("\n")}`); composer.current?.focus({ preventScroll: true }); }}/>}

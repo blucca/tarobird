@@ -1290,15 +1290,15 @@ export class HubConnection {
    * Host shows one only to such a request (an App from before Windows targets
    * parses the reply as a Mac's and would fail on all of it); a Host from
    * before Windows targets ignores the query. */
-  async terminalStatus() {
-    return terminalStatusSchema.parse(await this.httpRequest(HOST_TERMINAL_STATUS_PATH, {}, { ms: 10_000, code: "terminal_request_timeout" }));
+  async terminalStatus(signal?: AbortSignal) {
+    return terminalStatusSchema.parse(await this.httpRequest(HOST_TERMINAL_STATUS_PATH, { signal }, { ms: 10_000, code: "terminal_request_timeout" }));
   }
   async terminalConfigure(raw: TerminalConfigure) {
     return this.duringMutation(async () => {
       const command = terminalConfigureSchema.parse(raw), token = this.token, epoch = this.httpEpoch;
       const current = () => { if (!token || this.closed || this.token !== token || this.httpEpoch !== epoch || epoch.signal.aborted) throw new HubHttpError(409, "device_action_cancelled"); };
       current();
-      const action = deviceActionSchema.parse({ operation: "bot-message-grant", target: bytesToHex(sha256(new TextEncoder().encode(terminalConfigureText(command)))) });
+      const action = deviceActionSchema.parse({ operation: "terminal-grant", target: bytesToHex(sha256(new TextEncoder().encode(terminalConfigureText(command)))) });
       const statement = boundDeviceActionStatement(await this.httpRequest("/api/devices/challenge", { method: "POST", body: JSON.stringify(action) }),
         { action, hubPublicKey: this.identity.hubPublicKey ?? "", deviceId: this.identity.deviceId, sessionHash: bytesToHex(sha256(new TextEncoder().encode(token!))) });
       current(); const signature = await signDeviceAction(this.identity, statement); current();
@@ -1306,17 +1306,17 @@ export class HubConnection {
       current(); return terminalPolicySchema.parse(result);
     });
   }
-  async terminalList(conversationId: string) {
-    const res = await this.httpRequest<{ sessions: unknown[] }>(`${HOST_TERMINALS_PATH}?conversationId=${encodeURIComponent(conversationId)}`, {}, { ms: 10_000, code: "terminal_request_timeout" });
+  async terminalList(conversationId: string, signal?: AbortSignal) {
+    const res = await this.httpRequest<{ sessions: unknown[] }>(`${HOST_TERMINALS_PATH}?conversationId=${encodeURIComponent(conversationId)}`, { signal }, { ms: 10_000, code: "terminal_request_timeout" });
     return z.array(terminalSessionInfoSchema).parse(res.sessions);
   }
-  async terminalCreate(input: TerminalCreate) {
+  async terminalCreate(input: TerminalCreate, signal?: AbortSignal) {
     const body = JSON.stringify(terminalCreateSchema.parse(input));
-    const res = await this.httpRequest<{ terminal: unknown }>(HOST_TERMINALS_PATH, { method: "POST", body }, { ms: 15_000, code: "terminal_request_timeout" });
+    const res = await this.httpRequest<{ terminal: unknown }>(HOST_TERMINALS_PATH, { method: "POST", body, signal }, { ms: 15_000, code: "terminal_request_timeout" });
     return terminalSessionInfoSchema.parse(res.terminal);
   }
-  async terminalReadOutput(id: string, after: number, wait = 0) {
-    const res = await this.httpRequest(`${HOST_TERMINALS_PATH}/${encodeURIComponent(id)}/output?after=${after}&wait=${wait}`, {}, { ms: wait + 10_000, code: "terminal_request_timeout" });
+  async terminalReadOutput(id: string, after: number, wait = 0, signal?: AbortSignal) {
+    const res = await this.httpRequest(`${HOST_TERMINALS_PATH}/${encodeURIComponent(id)}/output?after=${after}&wait=${wait}`, { signal }, { ms: wait + 10_000, code: "terminal_request_timeout" });
     return terminalOutputSchema.parse(res);
   }
   async terminalWriteInput(id: string, data: string) {

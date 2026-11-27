@@ -346,10 +346,25 @@ export class HubServer {
       auth,
       stateDir: options.stateDir,
       defaultWorkspace: options.hostTerminalDefaultWorkspace,
+      resolveBotStateDir: async (botId) => {
+        if (this.botManager && await this.botManager.owns(botId)) {
+          return path.join(options.stateDir, "bots", botId);
+        }
+        if (this.bots.get(botId)?.ready) {
+          try {
+            return z.object({ stateDir: z.string().refine(path.isAbsolute) }).parse(await this.callBot(botId, "files.root", {}, 5_000)).stateDir;
+          } catch { /* fall through */ }
+        }
+        if (!this.botManager) {
+          const localDir = path.join(options.stateDir, "bots", botId);
+          if (await stat(localDir).then((s) => s.isDirectory(), () => false)) return localDir;
+        }
+        return undefined;
+      },
       spawnProcess: options.hostTerminalSpawner,
     });
     this.screenSockets = new RemoteScreenSockets(this.remoteScreen);
-    this.disposers.push(() => { this.remoteScreen.dispose(); this.screenSockets.dispose(); void this.hostTerminal.dispose(); });
+    this.disposers.push(() => { this.remoteScreen.dispose(); this.screenSockets.dispose(); });
     const screenTick = setInterval(() => this.remoteScreen.tick(), 250); screenTick.unref(); this.disposers.push(() => clearInterval(screenTick));
     this.workbench = new WorkbenchBroker(store);
     this.designSharing = new DesignShareBroker({repository:metaDesignShareRepository(store.db),requireMember:(userId,conversationId)=>store.db.serial(()=>store.requireMember(userId,conversationId)),userName:async userId=>(await store.user(userId))?.name});
@@ -428,7 +443,7 @@ export class HubServer {
         this.trackTask(this.dispatchPending().catch(() => options.onWarning?.("queue_dispatch_failed")));
       }
     }));
-    this.disposers.push(auth.onRevoke((deviceId) => { void this.hostTerminal.revokeDevice(deviceId); for (const c of this.clients) if (c.session?.deviceId === deviceId) this.endClientSession(c, "device_revoked"); }));
+    this.disposers.push(auth.onRevoke((deviceId) => { this.trackTask(this.hostTerminal.revokeDevice(deviceId)); for (const c of this.clients) if (c.session?.deviceId === deviceId) this.endClientSession(c, "device_revoked"); }));
     this.disposers.push(auth.onRevoke((deviceId) => {
       this.sideSessions.revoke(deviceId);
       for (const [controller, session] of this.downloads) if (session.deviceId === deviceId) controller.abort(new HubError("device_revoked", 401));
@@ -588,6 +603,7 @@ export class HubServer {
   beginShutdown(): void {
     this.stopping = true;
     this.workbench.close(); this.designSharing.close();
+    this.hostTerminal.beginShutdown();
     if (this.hostDrainLease) clearTimeout(this.hostDrainLease.timer);
     this.hostDrainLease = undefined;
     this.botManager?.beginShutdown();
@@ -613,6 +629,7 @@ export class HubServer {
     await errors.run("workspace-diff.cancel", () => this.workspaceDiff.close());
     await errors.run("previews.stop", () => this.linkPreviews.stop());
     await errors.run("workers.close", () => this.botManager?.close());
+    await errors.run("host-terminal.close", () => this.hostTerminal.dispose());
     await errors.run("dispatch.stop", () => this.dispatch.stop());
     await errors.run("push.stop", () => this.pushWorker.stop());
     for (const dispose of this.disposers.splice(0)) await errors.run("subscription.close", dispose);
@@ -636,6 +653,7 @@ export class HubServer {
     // Accepted socket work can enqueue its final publication while settling.
     // Admission is frozen; drain the complete set before closing SQLite.
     while (this.httpTasks.size) await Promise.allSettled([...this.httpTasks]);
+    await errors.run("host-terminal.drain", () => this.hostTerminal.dispose());
     await errors.run("controller.finish", () => this.controllerEnrollment);
     await errors.run("drain.finish", () => this.hostDrainControl);
     await errors.run("audit.flush", () => this.store.flushAudit());
@@ -649,6 +667,7 @@ export class HubServer {
   }
   private async sweep(): Promise<void> {
     await this.remoteScreen.sweep();
+    await this.hostTerminal.sweep();
     for (const client of this.clients) if (client.session) {
       try { await this.auth.validateSession(client.session); }
       catch (error) { this.endClientSession(client, error instanceof HubError && error.code === "device_revoked" ? "device_revoked" : "session_expired"); }
@@ -1847,7 +1866,19 @@ export class HubServer {
         if (sub === "output" && req.method === "GET") {
           const after = z.coerce.number().int().min(0).default(0).parse(url.searchParams.get("after") ?? "0");
           const wait = z.coerce.number().int().min(0).max(8000).default(0).parse(url.searchParams.get("wait") ?? "0");
-          await reply(200, await this.hostTerminal.readOutput(session, termId, after, wait));
+          const controller = new AbortController();
+          this.downloads.set(controller, session);
+          const cancel = () => controller.abort(new HubError("request_aborted", 499));
+          res.once("close", cancel);
+          if (res.destroyed) cancel();
+          try {
+            const output = await this.hostTerminal.readOutput(session, termId, after, wait, controller.signal);
+            if (controller.signal.aborted) throw controller.signal.reason instanceof Error ? controller.signal.reason : new HubError("request_aborted", 499);
+            await reply(200, output);
+          } finally {
+            res.off("close", cancel);
+            this.downloads.delete(controller);
+          }
           return;
         }
         if (sub === "input" && req.method === "POST") {

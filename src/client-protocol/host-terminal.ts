@@ -18,23 +18,26 @@ export const terminalPolicySchema = z.object({
   revision: z.number().int().nonnegative(),
   enabled: z.boolean(),
   grants: z.array(terminalGrantSchema).max(64),
-}).strict();
+}).strict()
+  .refine((value) => new Set(value.grants.map((g) => g.deviceId)).size === value.grants.length, "duplicate_terminal_device");
 export type TerminalPolicy = z.infer<typeof terminalPolicySchema>;
 
 export const terminalConfigureSchema = z.object({
   expectedRevision: z.number().int().nonnegative(),
   enabled: z.boolean(),
   grants: z.array(terminalGrantSchema).max(64),
-}).strict();
+  requestId: idSchema,
+}).strict()
+  .refine((value) => new Set(value.grants.map((g) => g.deviceId)).size === value.grants.length, "duplicate_terminal_device");
 export type TerminalConfigure = z.infer<typeof terminalConfigureSchema>;
 
-/** Domain-separated canonical text signed by the owner device when updating terminal grants. */
+/** Domain-separated canonical text signed by the local owner controller when updating terminal grants. */
 export function terminalConfigureText(command: TerminalConfigure): string {
   const parsed = terminalConfigureSchema.parse(command);
   const grants = [...parsed.grants]
-    .sort((a, b) => a.deviceId.localeCompare(b.deviceId) || a.publicKey.localeCompare(b.publicKey))
+    .sort((a, b) => (a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : a.publicKey < b.publicKey ? -1 : a.publicKey > b.publicKey ? 1 : 0))
     .map((g) => [g.deviceId, g.publicKey]);
-  return JSON.stringify(["tarobot/terminal-policy/v1", parsed.expectedRevision, parsed.enabled, grants]);
+  return JSON.stringify(["tarobot/terminal-policy/v1", parsed.expectedRevision, parsed.enabled, grants, parsed.requestId]);
 }
 
 export const terminalSessionInfoSchema = z.object({
