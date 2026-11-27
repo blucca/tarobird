@@ -3,6 +3,7 @@ import { access, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { discoverEngineDirectories } from "./engine-discovery.js";
+import { isLiveHostEnvironment, markLiveHostEnvironment } from "../runtime/windows-registry-path.js";
 import { deepseekExecutableOverride } from "../runtime/deepseek-executable.js";
 
 export const HOST_ENGINE_EXECUTABLE_KEYS = ["CODEX_EXECUTABLE", "CLAUDE_EXECUTABLE", "ANTIGRAVITY_EXECUTABLE", "KIMI_EXECUTABLE", "DSH_EXECUTABLE", "PI_EXECUTABLE"] as const;
@@ -28,7 +29,7 @@ export function hostProcessEnvironment(options: HostEnvironmentOptions = {}): No
   const result = { ...env };
   if (windows) for (const key of Object.keys(result)) if (key.toUpperCase() === "PATH") delete result[key];
   result.PATH = search;
-  return result;
+  return isLiveHostEnvironment(env) ? markLiveHostEnvironment(result) : result;
 }
 /** Native desktop_host.rs bootstraps Node; the shared Host adds manager fallbacks.
  * Only explicit engine paths,

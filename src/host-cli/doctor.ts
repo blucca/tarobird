@@ -1,3 +1,4 @@
+import { isLiveHostEnvironment, markLiveHostEnvironment } from "../runtime/windows-registry-path.js";
 import { resolvePiExecutable } from "../runtime/pi-executable.js";
 import { ENGINE_SETTINGS_REPAIR_HINT, type EngineDiscoveryRule } from "../client-protocol/engine-settings.js";
 import path from "node:path";
@@ -92,7 +93,7 @@ export function mergeDiscoveryMetadata(
     const raw = lookupEnvCaseInsensitive(callerEnv, key, platform);
     if (raw && !/[\x00-\x1f\x7f]/.test(raw)) merged[key] = raw;
   }
-  return merged;
+  return isLiveHostEnvironment(callerEnv) ? markLiveHostEnvironment(merged) : merged;
 }
 
 export type InspectedEngine = {

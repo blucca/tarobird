@@ -28,6 +28,7 @@ import {
   type EngineSettingsUpdate,
 } from "../client-protocol/engine-settings.js";
 import {
+  cachedExecutableVersion,
   diagnoseExecutableCandidates,
   discoverEngineDirectories,
   lookupEnvCaseInsensitive,
@@ -51,6 +52,9 @@ export type EngineDiscoveryOptions = {
 export class HubEngineSettings {
   private liveDiscovery?: LiveEngineDiscovery;
   private warmInFlight?: Promise<LiveEngineDiscovery>;
+  private discoverySequence = 0;
+  private publishedDiscoverySequence = 0;
+  get hasDiscoverySnapshot(): boolean { return this.liveDiscovery !== undefined; }
   constructor(readonly directory: string, readonly base: () => NodeJS.ProcessEnv) {}
   private read(): StoredEngineSettings {
     try { return readHostEngineSettings(this.directory); }
@@ -74,13 +78,24 @@ export class HubEngineSettings {
     return mergeTaggedDirectories([baseDirs, knownDirs, envDirs], platform);
   }
 
-  /** Run environment discovery (login shell, package managers, and fresh Windows
+  private async publishDiscovery(snapshot: LiveEngineDiscovery, sequence: number, platform: NodeJS.Platform): Promise<void> {
+    if (sequence < this.publishedDiscoverySequence) return;
+    this.publishedDiscoverySequence = sequence;
+    this.liveDiscovery = snapshot;
+    await writeEngineDiscoveryCache(this.directory, {
+      paths: snapshot.paths ?? {},
+      searchDirs: snapshot.dirs,
+    }, platform);
+  }
+
+  /** Run environment discovery (login shell, package managers, and cached Windows
    * registry PATH) without executing engine `--version` commands, hydrating the
    * shared live discovery snapshot and opportunistic discovery cache. */
   async warmDiscovery(options: Pick<EngineDiscoveryOptions, "forceRefresh" | "probeShell" | "runner" | "timeoutMs"> = {}): Promise<LiveEngineDiscovery> {
     if (!options.forceRefresh && !options.runner && this.warmInFlight) {
       return this.warmInFlight;
     }
+    const sequence = ++this.discoverySequence;
     const work = (async (): Promise<LiveEngineDiscovery> => {
       const base = this.base();
       const platform = process.platform, windows = platform === "win32";
@@ -115,11 +130,7 @@ export class HubEngineSettings {
         dirs: resolved.discoveredDirs,
         paths: resolved.discoveredPaths,
       };
-      this.liveDiscovery = snapshot;
-      await writeEngineDiscoveryCache(this.directory, {
-        paths: resolved.discoveredPaths,
-        searchDirs: resolved.discoveredDirs,
-      }, platform);
+      await this.publishDiscovery(snapshot, sequence, platform);
       return snapshot;
     })();
 
@@ -205,8 +216,8 @@ export class HubEngineSettings {
   }
 
   async statusAsync(requestId?: string, options: EngineDiscoveryOptions = {}): Promise<EngineSettingsState> {
-    const settings = this.read(), base = this.base();
-    const receipt = requestId ? settings.receipts.find(item => item.requestId === requestId) : settings.receipts.at(-1);
+    this.read();
+    const base = this.base(), sequence = ++this.discoverySequence;
     const platform = process.platform, windows = platform === "win32";
     const home = windows
       ? lookupEnvCaseInsensitive(base, "USERPROFILE", "win32") ?? lookupEnvCaseInsensitive(base, "HOME", "win32") ?? os.homedir()
@@ -225,6 +236,8 @@ export class HubEngineSettings {
       })
       : { at: Date.now(), shell: { ok: false, status: "skipped" as const, pathDirs: [], resolvedCommands: {} }, packageManagerDirs: [], windowsRegistryDirs: [] };
 
+    const settings = this.read();
+    const receipt = requestId ? settings.receipts.find(item => item.requestId === requestId) : settings.receipts.at(-1);
     const cache = readEngineDiscoveryCache(this.directory, platform);
     const resolved = resolveDiscoveredEngines({
       directory: this.directory,
@@ -235,10 +248,15 @@ export class HubEngineSettings {
       platform,
     });
 
+    await this.publishDiscovery({ dirs: resolved.discoveredDirs, paths: resolved.discoveredPaths }, sequence, platform);
+
     const engineRows = await Promise.all(resolved.engines.map(async (row) => {
-      const version = row.executable && options.probeVersions !== false
-        ? await probeExecutableVersion(row.executable, resolved.enhancedEnv, options.runner, { forceRefresh: options.forceRefresh })
-        : null;
+      let version: string | null = null;
+      if (row.executable && options.probeVersions !== false) {
+        version = options.probeVersions || options.forceRefresh
+          ? await probeExecutableVersion(row.executable, resolved.enhancedEnv, options.runner, { forceRefresh: options.forceRefresh })
+          : cachedExecutableVersion(row.executable);
+      }
 
       return {
         id: row.id,
@@ -253,15 +271,6 @@ export class HubEngineSettings {
         ...(row.showTerminalDiff && row.terminalExecutable ? { terminalExecutable: row.terminalExecutable } : {}),
       };
     }));
-
-    this.liveDiscovery = {
-      dirs: resolved.discoveredDirs,
-      paths: resolved.discoveredPaths,
-    };
-    await writeEngineDiscoveryCache(this.directory, {
-      paths: resolved.discoveredPaths,
-      searchDirs: resolved.discoveredDirs,
-    }, platform);
 
     return {
       revision: settings.revision,

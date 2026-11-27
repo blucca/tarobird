@@ -77,8 +77,10 @@ export class BotManager {
   private get env(): NodeJS.ProcessEnv {
     return this.engineSettings.environment();
   }
-  async ensureDiscovery(options: { timeoutMs?: number; forceRefresh?: boolean; boundedMs?: number } = {}): Promise<void> {
+  async ensureDiscovery(options: { timeoutMs?: number; forceRefresh?: boolean; boundedMs?: number; allowStale?: boolean } = {}): Promise<void> {
     const work = this.engineSettings.warmDiscovery({ timeoutMs: options.timeoutMs, forceRefresh: options.forceRefresh }).catch(() => undefined);
+    // Keep serving the last snapshot while routine requests refresh it.
+    if (options.allowStale && !options.forceRefresh && this.engineSettings.hasDiscoverySnapshot) return;
     if (options.boundedMs && options.boundedMs > 0) {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -119,7 +121,7 @@ export class BotManager {
   /** One engine's catalog entry, read through the Hub cache. */
   async engineCatalog(id: InstanceEngine, workspace?: string, request: ModelCatalogRequest = {}, discoveryReady = false): Promise<EngineRead> {
     void this.env;
-    if (!discoveryReady) await this.ensureDiscovery();
+    if (!discoveryReady) await this.ensureDiscovery({ allowStale: true });
     const env = this.env, bins = this.engineBinaries(env), available = !!resolveEngineExecutable(bins[id], env);
     const placeholder: Pick<ModelCatalogRead, "choices"> = { choices: [{ id: "", efforts: [""] }] }, now = Date.now();
     if (id === "pi" && workspace && !(path.isAbsolute(workspace) && await stat(workspace).then(s => s.isDirectory(), () => false))) return { ...this.engineEntry(id, available, { ...placeholder, status: "unavailable" }), readAt: now };
@@ -134,7 +136,7 @@ export class BotManager {
   /** The complete catalog the App, the CLI and dispatch read: every engine. */
   async catalog(workspace?: string, freshEngine?: InstanceEngine): Promise<BotCatalog> {
     void this.env;
-    await this.ensureDiscovery({ forceRefresh: !!freshEngine });
+    await this.ensureDiscovery({ forceRefresh: !!freshEngine, allowStale: true });
     const ids = Object.keys(this.engineBinaries()) as InstanceEngine[];
     return { engines: await Promise.all(ids.map(async id => {
       const { readAt: _readAt, stale: _stale, ...entry } = await this.engineCatalog(id, workspace, { refresh: freshEngine === id }, true);
@@ -165,7 +167,7 @@ export class BotManager {
       if (!row) {
         if (spec.workspace && (!path.isAbsolute(spec.workspace) || !await stat(spec.workspace).then((s) => s.isDirectory(), () => false))) throw new HubError("bot_workspace_unavailable");
         void this.env;
-        await this.ensureDiscovery();
+        await this.ensureDiscovery({ allowStale: this.engineAvailable(spec.engine) });
         if (!this.engineAvailable(spec.engine)) throw new HubError("bot_engine_unavailable", 409);
         // Only the chosen engine's list, and only when a check below reads it:
         // other CLIs are never started to create a Bot.

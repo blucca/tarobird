@@ -2,6 +2,7 @@ import { accessSync, closeSync, constants, lstatSync, openSync, readFileSync, re
 import os from "node:os";
 import path from "node:path";
 import { spawnEngine } from "../runtime/engine-process.js";
+import { refreshWindowsRegistryPath } from "../runtime/windows-registry-path.js";
 
 export type DiscoveryRule =
   | "setting"
@@ -15,7 +16,7 @@ export type DiscoveryRule =
 
 export type TaggedDirectory = {
   dir: string;
-  rule: Exclude<DiscoveryRule, "setting" | "environment" | "auto-discovered">;
+  rule: Exclude<DiscoveryRule, "setting" | "environment">;
 };
 
 export type DanglingLinkInfo = {
@@ -252,63 +253,6 @@ export function discoverEngineDirectories(
     nvmDefault(root("NVM_DIR", path.join(home, ".nvm"))),
   ];
   return candidates.filter((directory): directory is string => !!directory && !/[\x00-\x1f\x7f:]/.test(directory) && existsCheck(directory));
-}
-
-/** Parse `reg.exe query <key> /v Path` output into individual PATH entries. */
-export function parseWindowsRegistryPathOutput(stdout: string, env: NodeJS.ProcessEnv = process.env): string[] {
-  const lines = stdout.split(/\r?\n/);
-  for (const line of lines) {
-    const match = /^\s*Path\s+REG_(?:EXPAND_)?SZ\s+(.+)$/i.exec(line);
-    if (!match) continue;
-    const raw = match[1]!.trim();
-    const expanded = raw.replace(/%([^%]+)%/g, (full, varName: string) => {
-      const value = lookupEnvCaseInsensitive(env, varName, "win32");
-      return value !== undefined ? value : full;
-    });
-    return expanded
-      .split(";")
-      .map(entry => entry.trim().replace(/^"(.*)"$/, "$1"))
-      .filter(entry => !!entry && !/[\x00-\x1f\x7f]/.test(entry));
-  }
-  return [];
-}
-
-/** Read latest system and user PATH directly from Windows Registry (HKLM then HKCU,
- * matching how Windows constructs terminal PATH). */
-export async function readWindowsRegistryPath(options: {
-  env?: NodeJS.ProcessEnv;
-  platform?: NodeJS.Platform;
-  timeoutMs?: number;
-  runner?: CommandRunner;
-} = {}): Promise<string[]> {
-  const platform = options.platform ?? process.platform;
-  if (platform !== "win32") return [];
-  const env = options.env ?? process.env;
-  const runner = options.runner ?? defaultRunner;
-  const timeout = options.timeoutMs ?? 2500;
-  const keys = [
-    "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
-    "HKCU\\Environment",
-  ];
-  const results = await Promise.all(keys.map(async (key) => {
-    try {
-      const { stdout } = await runner("reg.exe", ["query", key, "/v", "Path"], { timeout, env, windowsHide: true });
-      return parseWindowsRegistryPathOutput(stdout, env);
-    } catch {
-      return [];
-    }
-  }));
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const list of results) {
-    for (const dir of list) {
-      const norm = dir.toLowerCase();
-      if (seen.has(norm)) continue;
-      seen.add(norm);
-      out.push(dir);
-    }
-  }
-  return out;
 }
 
 const SHELL_PATH_BEGIN = "__TAROBIRD_SHELL_PATH_BEGIN__";
@@ -652,10 +596,12 @@ type CachedProbeEntry = {
 
 const PROBE_CACHE_TTL_MS = 60_000;
 let probeCache: CachedProbeEntry | undefined;
+let probeGeneration = 0;
 let inFlightProbe: { key: string; runner?: CommandRunner; promise: Promise<EnvironmentDiscoveryResult> } | undefined;
 const versionCache = new Map<string, { mtimeMs: number; version: string | null }>();
 
 export function clearDiscoveryCaches(): void {
+  ++probeGeneration;
   probeCache = undefined;
   inFlightProbe = undefined;
   versionCache.clear();
@@ -675,9 +621,9 @@ export async function runEnvironmentDiscovery(options: {
   const basePath = lookupEnvCaseInsensitive(options.baseEnv, "PATH", platform) ?? "";
   const cacheKey = `${platform}|${home}|${options.baseEnv.SHELL ?? ""}|${options.baseEnv.ZDOTDIR ?? ""}|${options.baseEnv[SHELL_ENV_PROBE_FLAG] ?? ""}|${options.commands.join(",")}|${basePath}`;
 
-  // On Windows, always read fresh Registry PATH on every call (never stale-cached for 60s).
+  // Registry PATH has its own shorter refresh interval than package-manager discovery.
   if (platform === "win32") {
-    const windowsRegistryDirs = await readWindowsRegistryPath({ env: options.baseEnv, platform, runner: options.runner });
+    const windowsRegistryDirs = await refreshWindowsRegistryPath(options.baseEnv, { platform, force: options.forceRefresh });
     const windowsRegistryKey = windowsRegistryDirs.map(dir => dir.toLowerCase()).join(";");
     if (
       !options.forceRefresh
@@ -696,7 +642,8 @@ export async function runEnvironmentDiscovery(options: {
     }
     const baseDirs = basePath.split(";").filter(Boolean);
     const knownDirs = discoverEngineDirectories(home, options.baseEnv, platform);
-    const combinedForPm = [...new Set([...windowsRegistryDirs, ...baseDirs, ...knownDirs])];
+    const combinedForPm = [...new Set([...baseDirs, ...knownDirs, ...windowsRegistryDirs])];
+    const generation = ++probeGeneration;
     const packageManagerDirs = await probePackageManagerBinDirectories({
       searchDirs: combinedForPm,
       env: { ...options.baseEnv, PATH: combinedForPm.join(";") },
@@ -705,7 +652,7 @@ export async function runEnvironmentDiscovery(options: {
     });
     const shell: ShellProbeResult = { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
     const at = Date.now();
-    probeCache = { key: cacheKey, runner: options.runner, windowsRegistryKey, value: { at, shell, packageManagerDirs } };
+    if (generation === probeGeneration) probeCache = { key: cacheKey, runner: options.runner, windowsRegistryKey, value: { at, shell, packageManagerDirs } };
     return { at, shell, packageManagerDirs, windowsRegistryDirs };
   }
 
@@ -728,6 +675,7 @@ export async function runEnvironmentDiscovery(options: {
     return inFlightProbe.promise;
   }
 
+  const generation = ++probeGeneration;
   const work = (async (): Promise<EnvironmentDiscoveryResult> => {
     const shell = await probeLoginShellEnvironment({
       commands: options.commands,
@@ -748,7 +696,7 @@ export async function runEnvironmentDiscovery(options: {
     });
 
     const at = Date.now();
-    probeCache = { key: cacheKey, runner: options.runner, windowsRegistryKey: "", value: { at, shell, packageManagerDirs } };
+    if (generation === probeGeneration) probeCache = { key: cacheKey, runner: options.runner, windowsRegistryKey: "", value: { at, shell, packageManagerDirs } };
     return { at, shell, packageManagerDirs, windowsRegistryDirs: [] };
   })();
 
@@ -783,6 +731,16 @@ function looksLikeUnixExecutable(file: string): boolean {
     if (fd !== undefined) {
       try { closeSync(fd); } catch { /* ignore */ }
     }
+  }
+}
+
+export function cachedExecutableVersion(executable: string): string | null {
+  const cached = versionCache.get(executable);
+  if (!cached) return null;
+  try {
+    return statSync(executable).mtimeMs === cached.mtimeMs ? cached.version : null;
+  } catch {
+    return null;
   }
 }
 

@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants, openSync, closeSync, fstatSync, lstatSync, readSync } from "node:fs";
 import { open, rename, unlink } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import {
@@ -53,6 +52,7 @@ export type HostEngineEnvironmentOptions = {
   discoveryCache?: EngineDiscoveryCache;
   skipDiscoveryCache?: boolean;
   liveDiscovery?: LiveEngineDiscovery;
+  platform?: NodeJS.Platform;
 };
 
 export class EngineSettingsReadError extends Error {
@@ -208,7 +208,7 @@ export function hostEngineEnvironment(
 ): NodeJS.ProcessEnv {
   // The entrypoint already built the baseline PATH. Do not prepend the desktop
   // defaults again: callers can deliberately supply an isolated environment.
-  const env = { ...base }, platform = process.platform, windows = platform === "win32", p = windows ? path.win32 : path.posix;
+  const env = { ...base }, platform = options.platform ?? process.platform, windows = platform === "win32", p = windows ? path.win32 : path.posix;
   const home = windows ? lookupEnvCaseInsensitive(base, "USERPROFILE", "win32") ?? lookupEnvCaseInsensitive(base, "HOME", "win32") : base.HOME ?? base.USERPROFILE;
   if (windows) {
     // Canonicalize only a real inherited override, never an auto-discovered
@@ -219,14 +219,15 @@ export function hostEngineEnvironment(
   }
 
   const basePath = lookupEnvCaseInsensitive(base, "PATH", platform) ?? "";
-  const basePathDirs = basePath.split(path.delimiter).filter(Boolean);
+  const delimiter = windows ? ";" : ":";
+  const basePathDirs = basePath.split(delimiter).filter(Boolean);
   const knownDirs = home ? discoverEngineDirectories(home, base, platform) : [];
   const baselineDirs = dedupDirs([...basePathDirs, ...knownDirs], windows);
 
   const baselineEnv: NodeJS.ProcessEnv = { ...env };
   if (home) {
     if (windows) for (const key of Object.keys(baselineEnv)) if (key.toUpperCase() === "PATH") delete baselineEnv[key];
-    baselineEnv.PATH = baselineDirs.join(path.delimiter);
+    baselineEnv.PATH = baselineDirs.join(delimiter);
   }
 
   const cache = options.skipDiscoveryCache
@@ -239,7 +240,7 @@ export function hostEngineEnvironment(
   const probeEnv: NodeJS.ProcessEnv = { ...baselineEnv };
   if (home || discoveredDirs.length > 0) {
     if (windows) for (const key of Object.keys(probeEnv)) if (key.toUpperCase() === "PATH") delete probeEnv[key];
-    probeEnv.PATH = dedupDirs([...baselineDirs, ...discoveredDirs], windows).join(path.delimiter);
+    probeEnv.PATH = dedupDirs([...baselineDirs, ...discoveredDirs], windows).join(delimiter);
   }
 
   const extraBinDirs: string[] = [];
@@ -276,7 +277,7 @@ export function hostEngineEnvironment(
   if (home || discoveredDirs.length > 0 || extraBinDirs.length > 0) {
     const finalDirs = dedupDirs([...baselineDirs, ...discoveredDirs, ...extraBinDirs], windows);
     if (windows) for (const key of Object.keys(env)) if (key.toUpperCase() === "PATH") delete env[key];
-    env.PATH = finalDirs.join(path.delimiter);
+    env.PATH = finalDirs.join(delimiter);
   }
   return env;
 }
@@ -329,23 +330,26 @@ export function resolveDiscoveredEngines(options: {
   const platform = options.platform ?? process.platform;
   const windows = platform === "win32", sep = windows ? ";" : ":", p = windows ? path.win32 : path.posix;
   const home = windows
-    ? lookupEnvCaseInsensitive(base, "USERPROFILE", "win32") ?? lookupEnvCaseInsensitive(base, "HOME", "win32") ?? os.homedir()
-    : base.HOME ?? base.USERPROFILE ?? os.homedir();
+    ? lookupEnvCaseInsensitive(base, "USERPROFILE", "win32") ?? lookupEnvCaseInsensitive(base, "HOME", "win32")
+    : base.HOME ?? base.USERPROFILE;
 
   // Baseline env excludes cached discovered paths so fresh discovery always outranks stale cache.
-  const baselineEnv = hostEngineEnvironment(directory, base, settings, { skipDiscoveryCache: true });
+  const baselineEnv = hostEngineEnvironment(directory, base, settings, { skipDiscoveryCache: true, platform });
   const baseDirs = (lookupEnvCaseInsensitive(base, "PATH", platform) ?? "").split(sep).filter(Boolean).map((dir): TaggedDirectory => ({ dir, rule: "path" }));
   const knownDirs = home ? discoverEngineDirectories(home, base, platform).map((dir): TaggedDirectory => ({ dir, rule: "known-directory" })) : [];
   const envDirs = (lookupEnvCaseInsensitive(baselineEnv, "PATH", platform) ?? "").split(sep).filter(Boolean).map((dir): TaggedDirectory => ({ dir, rule: "path" }));
-  const hostTaggedDirs = mergeTaggedDirectories([baseDirs, knownDirs, envDirs], platform);
+  const hostTaggedDirs = mergeTaggedDirectories([baseDirs, knownDirs], platform);
 
   const discoveredTaggedDirs = mergeTaggedDirectories([
     probe.shell.pathDirs.map((dir): TaggedDirectory => ({ dir, rule: "login-shell" })),
     probe.windowsRegistryDirs.map((dir): TaggedDirectory => ({ dir, rule: "windows-registry" })),
     probe.packageManagerDirs.map((dir): TaggedDirectory => ({ dir, rule: "package-manager" })),
-  ], platform);
+  ], platform).filter(({ dir }) => isSafeAbsoluteDir(dir, platform));
   const discoveredDirs = discoveredTaggedDirs.map(item => item.dir);
-  const mergedDirs = mergeTaggedDirectories([discoveredTaggedDirs, hostTaggedDirs], platform);
+  const fallbackDirs = (cache.searchDirs ?? []).filter(dir => isSafeAbsoluteDir(dir, platform)).map((dir): TaggedDirectory => ({ dir, rule: "auto-discovered" }));
+  const mergedDirs = mergeTaggedDirectories([
+    hostTaggedDirs, discoveredDirs.length ? discoveredTaggedDirs : fallbackDirs, envDirs,
+  ], platform);
 
   const enhancedEnv: NodeJS.ProcessEnv = { ...baselineEnv };
   if (windows) for (const key of Object.keys(enhancedEnv)) if (key.toUpperCase() === "PATH") delete enhancedEnv[key];
@@ -363,13 +367,12 @@ export function resolveDiscoveredEngines(options: {
 
     let hostBaselineExecutable: string | null = null;
     if (!hasManual && !explicit) {
-      const baseDiag = diagnoseExecutableCandidates(defaultCmd, hostTaggedDirs, baselineEnv, platform);
-      hostBaselineExecutable = baseDiag.executable
-        ?? (id === "pi"
-          ? resolveEngineExecutable(resolvePiExecutable(baselineEnv, platform), baselineEnv, platform) ?? null
-          : id === "deepseek"
-            ? resolveEngineExecutable(resolveDeepSeekExecutable(baselineEnv, platform), baselineEnv, platform) ?? null
-            : null);
+      const baselineCommand = id === "pi"
+        ? resolvePiExecutable(baselineEnv, platform)
+        : id === "deepseek"
+          ? resolveDeepSeekExecutable(baselineEnv, platform)
+          : defaultCmd;
+      hostBaselineExecutable = resolveEngineExecutable(baselineCommand, baselineEnv, platform) ?? null;
     }
 
     const shellCmdHit = probe.shell.resolvedCommands[defaultCmd];
