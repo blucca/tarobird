@@ -188,7 +188,8 @@ foreach ($rule in $rules) {
     }
   }
 }
-$privateFirewallEnabled = [bool](Get-NetFirewallProfile -PolicyStore ActiveStore -Name Private).Enabled
+$privateProfile = Get-NetFirewallProfile -PolicyStore ActiveStore -Name Private | Select-Object -First 1
+$privateFirewallEnabled = ($null -ne $privateProfile) -and ([string]$privateProfile.Enabled -eq 'True')
 $localAddress = $null
 $localPrefixLength = $null
 $networkCategory = 'Unknown'${addressLookup}

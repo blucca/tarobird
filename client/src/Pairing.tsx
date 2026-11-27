@@ -37,7 +37,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   const [invite, setInvite] = useState<string>();
   const [requestError, setRequestError] = useState<string>();
   const [manualKey, setManualKey] = useState(""); const trustedKey = expectedKey ?? (manualKey.replace(/\s/g, "") || undefined);
-  const [deployment, setDeployment] = useState<Deployment>(), [legacyDirect, setLegacyDirect] = useState<Route>(), [importedDirects, setImportedDirects] = useState<Route[]>([]);
+  const [deployment, setDeployment] = useState<Deployment>(), [legacyDirect, setLegacyDirect] = useState<Route>(), [importedDirects, setImportedDirects] = useState<Route[]>([]), [importedRoutes, setImportedRoutes] = useState<Route[]>([]);
   const [address, setAddress] = useState(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""), [relays, setRelays] = useState<Route[]>([]);
   const [name, setName] = useState(() => defaultDeviceName(platform));
   const pairButton = useRef<HTMLButtonElement>(null), imported = useRef(false), failure = useRef<HTMLParagraphElement>(null);
@@ -117,7 +117,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
         && address.trim() === (legacyDirect?.url ?? "")
         && deployment !== "vps-relay";
       const { routes, deployment: routeDeployment } = keepImportedDirects
-        ? multipathConfiguration(importedDirects, relays, importedDirects, deployment)
+        ? multipathConfiguration(importedDirects, relays, importedRoutes, deployment)
         : connectionConfiguration(address, relays, deployment, legacyDirect);
       if (usesPinnedTransport() && routes.some((route) => route.url.startsWith("https:")) && !trustedKey) throw new Error(t("请扫描可信设备上的 Hub 二维码，或填写主机身份公钥。"));
       if (usesPinnedTransport() && trustedKey && !validHubPublicKey(trustedKey)) throw new Error("invalid_hub_key");
@@ -210,7 +210,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   // (its invite, address and key) must not be submitted for another host.
   const startAnother = () => {
     setAnother(true); setIdentity(undefined); setError(""); setRequestError(undefined);
-    setInvite(undefined); setExpectedKey(undefined); setManualKey(""); setDeployment(undefined); setLegacyDirect(undefined); setImportedDirects([]); setRelays([]);
+    setInvite(undefined); setExpectedKey(undefined); setManualKey(""); setDeployment(undefined); setLegacyDirect(undefined); setImportedDirects([]); setImportedRoutes([]); setRelays([]);
     setAddress(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""); setManual(platform === "web"); setOptionsOpen(false); setHostName(t("我的主机"));
   };
   const routeHint = expectedKey && (tailscaleRoute || lanRoute) && <p className="pairing-route-hint">{tailscaleRoute ? t("此连接使用 Tailscale。这台设备也需连接同一 Tailscale 网络，并允许访问目标主机；仅复制地址不会自动建立连接。") : t("此连接包含局域网地址。人在外面时需有可用的 Tailscale 或 VPS 线路；家里的 Wi-Fi 地址通常无法从外部直接访问。")}</p>;
@@ -293,8 +293,10 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       const next: PendingPairing = { code: "", expiresAt: 0, request: { invite: payload.invite, requestId: randomNonce() } };
       void (async () => {
         const snapshot = { ...pendingConnection.identity };
-        const direct = payload.routes.find(route => route.name !== "VPS");
-        const unchanged = !direct || snapshot.routes.some(route => route.url === direct.url && route.certificateAuthority === direct.certificateAuthority);
+        const scannedDirects = payload.routes.filter(route => route.name !== "VPS");
+        const unchanged = !scannedDirects.length || scannedDirects.every(direct =>
+          snapshot.routes.some(route => route.name !== "VPS" && route.url === direct.url && route.certificateAuthority === direct.certificateAuthority)
+        );
         let repair;
         if (!unchanged) {
           const { renewedPairingRoutes } = await import("./RepairHostRoute.js");
@@ -313,6 +315,6 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     imported.current = true;
     const directRoutes = payload.routes.filter((r) => r.name !== "VPS");
     setInvite(payload.invite);
-    setDeployment(payload.deployment); setImportedDirects(directRoutes); setLegacyDirect(directRoutes[0]); setAddress(directRoutes[0]?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError("");
+    setDeployment(payload.deployment); setImportedRoutes(payload.routes); setImportedDirects(directRoutes); setLegacyDirect(directRoutes[0]); setAddress(directRoutes[0]?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError("");
   }}/></Suspense>}</main>;
 }

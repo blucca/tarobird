@@ -348,7 +348,11 @@ test("connection settings auto-select a plausible candidate and require consent 
 });
 
 test("a partial readiness warning persists through publication and clears on a healthy retry", async ({ page }) => {
-  await page.evaluate(() => { window.tailscaleFixture.state.unavailableRouteCount = 2; });
+  await page.evaluate(() => {
+    const state = window.tailscaleFixture.state as any;
+    state.unavailableRouteCount = 2;
+    state.candidates = [{ url: "https://192.168.10.20:8788", address: "192.168.10.20", interfaceName: "en0", adapterKind: "wifi", hasDefaultRoute: true }];
+  });
   await page.getByRole("button", { name: "生成局域网二维码", exact: true }).click();
   await expect(page.getByRole("img", { name: "连接二维码", exact: true })).toBeVisible();
   await expect(page.getByText("2 个地址暂未就绪，已显示可用地址。", { exact: true })).toBeVisible();
@@ -386,6 +390,7 @@ test("a sole surviving LAN candidate is automatically selected even when other c
   await page.evaluate(() => {
     const fixture = window.tailscaleFixture as any;
     fixture.state.unavailableRouteCount = 1;
+    fixture.state.candidates = [{ url: "https://192.168.10.20:8788", address: "192.168.10.20", interfaceName: "en0", adapterKind: "wifi", hasDefaultRoute: true }];
     fixture.renderNetwork("pairing");
   });
   await page.getByRole("button", { name: "生成局域网二维码", exact: true }).click();
@@ -441,4 +446,78 @@ test("an older host with Tailscale explains manual pairing instead of repeating 
   await expect(page.getByRole("button", { name: "选择连接地址", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "重新准备线路", exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => (window.tailscaleFixture as any).networkCalls)).toEqual([]);
+});
+
+test("WindowsFirewallNotice stacks vertically inside LocalConnectionSettings and invokes desktop_network_settings with fallback", async ({ page }) => {
+  await page.evaluate(() => {
+    Object.assign(window, { isTauri: true });
+    const f = window.tailscaleFixture as any;
+    f.state.local.lan = { enabled: false, listening: false };
+    f.state.candidates = [{ url: "https://192.168.10.20:8788", address: "192.168.10.20", interfaceName: "Wi-Fi", adapterKind: "wifi", hasDefaultRoute: true }];
+    f.state.windowsFirewall = {
+      supported: true,
+      port: 8788,
+      networkCategory: "public",
+      privateFirewallEnabled: true,
+      ruleAllowed: false,
+      blockingRuleDetected: false,
+      inspectionAvailable: true,
+    };
+    f.renderSettings();
+  });
+  await page.getByRole("button", { name: "开启局域网访问", exact: true }).click();
+  const notice = page.locator(".local-access-body .windows-firewall-notice");
+  await expect(notice).toBeVisible();
+  const layout = await notice.evaluate(el => {
+    const head = el.querySelector(".windows-firewall-notice-head")!.getBoundingClientRect();
+    const paragraph = el.querySelector("p")!.getBoundingClientRect();
+    const button = el.querySelector("button")!.getBoundingClientRect();
+    return {
+      display: getComputedStyle(el).display,
+      headBottom: head.bottom,
+      paragraphTop: paragraph.top,
+      paragraphBottom: paragraph.bottom,
+      buttonTop: button.top,
+    };
+  });
+  expect(layout.display).toBe("grid");
+  expect(layout.headBottom).toBeLessThanOrEqual(layout.paragraphTop + 1);
+  expect(layout.paragraphBottom).toBeLessThanOrEqual(layout.buttonTop + 1);
+
+  const openButton = notice.getByRole("button", { name: "打开 Windows 网络设置", exact: true });
+  await openButton.click();
+  await expect.poll(() => page.evaluate(() => (window.tailscaleFixture.state as any).networkSettingsCalls)).toBe(1);
+  await expect(notice.getByRole("alert")).toHaveCount(0);
+
+  await page.evaluate(() => { (window.tailscaleFixture.state as any).networkSettingsFail = true; });
+  await openButton.click();
+  await expect.poll(() => page.evaluate(() => (window.tailscaleFixture.state as any).networkSettingsCalls)).toBe(2);
+  await expect(notice.getByRole("alert")).toContainText("无法自动打开设置");
+
+  // Private network needing an inbound rule also renders as a stacked vertical grid with command row.
+  await page.evaluate(() => {
+    const f = window.tailscaleFixture as any;
+    f.state.windowsFirewall = {
+      supported: true,
+      port: 8788,
+      networkCategory: "private",
+      privateFirewallEnabled: true,
+      ruleAllowed: false,
+      blockingRuleDetected: false,
+      inspectionAvailable: true,
+    };
+  });
+  await page.getByText("连接说明与排查", { exact: true }).click();
+  await page.getByRole("button", { name: "重新准备线路", exact: true }).click();
+  const commandBox = notice.locator(".windows-firewall-command");
+  await expect(commandBox).toBeVisible();
+  const privateLayout = await notice.evaluate(el => {
+    const head = el.querySelector(".windows-firewall-notice-head")!.getBoundingClientRect();
+    const paragraph = el.querySelector("p")!.getBoundingClientRect();
+    const cmd = el.querySelector(".windows-firewall-command")!.getBoundingClientRect();
+    return { display: getComputedStyle(el).display, headBottom: head.bottom, paragraphTop: paragraph.top, paragraphBottom: paragraph.bottom, cmdTop: cmd.top };
+  });
+  expect(privateLayout.display).toBe("grid");
+  expect(privateLayout.headBottom).toBeLessThanOrEqual(privateLayout.paragraphTop + 1);
+  expect(privateLayout.paragraphBottom).toBeLessThanOrEqual(privateLayout.cmdTop + 1);
 });

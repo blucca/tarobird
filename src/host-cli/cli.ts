@@ -766,7 +766,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     if (outputFile) { await outputFile.writeFile(link + "\n"); await outputFile.sync(); exported = true; }
     if (v.json) await output({ host: await readHostProfile(directory), publicKey: service.publicKey, routes, ...(candidates ? { candidates } : {}), ...(windowsFirewall?.supported ? { windowsFirewall } : {}), link, inviteId: invitation.id, expiresAt: invitation.expiresAt, serverTime: invitation.serverTime });
     else {
-      if (windowsFirewall?.supported) {
+      if (windowsFirewall?.supported && windowsFirewall.networkCategory !== "domain") {
         if (windowsFirewall.networkCategory === "public") {
           console.error("提示：Windows 当前将此网络标记为「公用网络」，可能阻止手机连接。请在 Windows「网络和 Internet」设置中将此网络改为「专用网络」。");
         } else if (windowsFirewall.blockingRuleDetected || (windowsFirewall.privateFirewallEnabled && !windowsFirewall.ruleAllowed)) {

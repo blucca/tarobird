@@ -149,6 +149,11 @@ export function useDesktopHostAccess({
 
       if (method === "tailscale") {
         setSelected(0);
+      } else if (parsedCandidates.length === 0 && (readyRoutes.length > 1 || omitted > 0)) {
+        // Older host runtime without adapter classification/ranking metadata:
+        // OS enumeration order does not identify the phone's network. Opening
+        // LAN access is not consent to publish an arbitrary first interface.
+        setSelected(-1);
       } else {
         const remembered = loadPreferredPairingAddress(hubKey);
         const primary = selectPrimaryPairingRoute(readyRoutes, parsedCandidates, remembered);

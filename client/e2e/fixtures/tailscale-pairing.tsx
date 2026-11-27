@@ -25,8 +25,13 @@ const invites = inviteApiFixture();
 const inviteConnection = { identity: { deviceId: "tailscale-fixture", hubPublicKey: key },
   state: { status: "online", user: { role: "owner" }, pairingInvitesAvailable: true, networkAvailable: false },
   subscribe: () => () => {}, http: invites.http } as unknown as HubConnection;
-const state = { calls: [] as string[], lanAddresses: ["192.168.10.20"], selectedLanUrl: "https://192.168.10.20:8788", candidates: undefined as undefined | Record<string, unknown>[], windowsFirewall: undefined as undefined | Record<string, unknown>, unavailableRouteCount: 0, networkStatus: "online" as "online" | "connecting", fail: false, unpublished: false, wrongHost: false, statusFail: false, statusWrongHost: false, legacy: false, reads: 0, lanSelectionRequired: false, selectionAvailable: true, local: { lan: { enabled: true, listening: true }, tailscale: { enabled: false, listening: false } }, certificateAuthority: "", hold: undefined as undefined | (() => void) };
+const state = { calls: [] as string[], networkSettingsCalls: 0, networkSettingsFail: false, lanAddresses: ["192.168.10.20"], selectedLanUrl: "https://192.168.10.20:8788", candidates: undefined as undefined | Record<string, unknown>[], windowsFirewall: undefined as undefined | Record<string, unknown>, unavailableRouteCount: 0, networkStatus: "online" as "online" | "connecting", fail: false, unpublished: false, wrongHost: false, statusFail: false, statusWrongHost: false, legacy: false, reads: 0, lanSelectionRequired: false, selectionAvailable: true, local: { lan: { enabled: true, listening: true }, tailscale: { enabled: false, listening: false } }, certificateAuthority: "", hold: undefined as undefined | (() => void) };
 mockIPC(async (command, args) => {
+  if (command === "desktop_network_settings") {
+    state.networkSettingsCalls++;
+    if (state.networkSettingsFail) throw Error("network_settings_unavailable");
+    return null;
+  }
   if (command !== "desktop_host") throw Error("unexpected_command");
   const action = String(args?.action); state.calls.push(action);
   if (action === "status") return { running: true, publicKey: state.wrongHost ? "wrong-host" : key };

@@ -15,7 +15,13 @@ export function pairingSharedRoutes(existing: Route[], selected: Route): Route[]
   return sharedRoutesSchema.parse([incoming, ...current.filter(route => route.url !== incoming.url)]);
 }
 
-function compactHostV2Routes(routes: Route[]): { routes: Omit<Route, "certificateAuthority">[] & Partial<Route>[]; certificateAuthority?: string } {
+function compactHostV2Routes(routes: Route[]): { routes: Route[]; certificateAuthority?: string } {
+  // Never hoist a shared CA when any non-VPS route intentionally omits a custom
+  // CA (system root trust), because v2 decode applies the hoisted CA to all
+  // non-VPS routes without their own certificateAuthority.
+  if (routes.some(route => route.name !== "VPS" && !route.certificateAuthority)) {
+    return { routes };
+  }
   const counts = new Map<string, number>();
   for (const route of routes) {
     if (route.name !== "VPS" && route.certificateAuthority) {

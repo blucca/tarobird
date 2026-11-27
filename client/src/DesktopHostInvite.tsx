@@ -92,7 +92,7 @@ export function DesktopHostInvite({
     })()}
     {!routes.length ? <button type="button" className="primary" disabled={busy || publishingRoute || disabled} onClick={() => void prepare()}>{busy ? <LoaderCircle className="spin" size={16}/> : <Smartphone size={16}/>}{busy ? t("正在准备连接…") : purpose === "network" ? method === "tailscale" ? t("准备 Tailscale 线路") : t("准备局域网线路") : method === "tailscale" ? t("生成 Tailscale 二维码") : t("生成局域网二维码")}</button> : <>
       {(routes.length > 1 || !selectedRoute) && <label className="pairing-adapter-select">{method === "tailscale" ? t("选择 Tailscale 地址") : t("选择电脑所在网络")}<select disabled={busy || publishingRoute || disabled} value={selected} onChange={(e) => setSelected(Number(e.target.value))}>{selected < 0 && <option value={-1} disabled>{t("请选择连接地址")}</option>}{routes.map((route, i) => <option key={route.url} value={i}>{describeNetworkCandidate(route, candidateByUrl.get(route.url), { recommended: routes.length > 1 && route.url === recommendedUrl })}</option>)}</select></label>}
-      {!selectedRoute && <p className="settings-note" role="status">{t("仅检测到虚拟网桥或代理地址，请手动选择与另一台设备在同一网络的地址。")}</p>}
+      {!selectedRoute && <p className="settings-note" role="status">{candidates.length > 0 ? t("仅检测到虚拟网桥或代理地址，请手动选择与另一台设备在同一网络的地址。") : t("检测到多个地址，请选择与另一台设备在同一网络的地址。")}</p>}
       {selectedRoute && <>
       {showInvitation && <>
         <ConnectionInviteCode

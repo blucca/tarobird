@@ -60,6 +60,12 @@ export const MAX_PAIRING_LINK_LENGTH = 8192;
 /** Deduplicate identical route CAs in v2 QR payloads so up to 4 LAN routes fit
  * comfortably within a phone-scannable QR code. */
 function compactV2ConnectPayload(payload: Omit<ConnectV2Payload, "invite">): z.input<typeof connectV2Schema> {
+  // Never hoist a shared CA if any non-VPS route relies on the system root CA:
+  // on decode, top-level certificateAuthority hydrates every non-VPS route that
+  // omits its own CA, which would corrupt system-CA routes.
+  if (payload.routes.some(route => route.name !== "VPS" && !route.certificateAuthority)) {
+    return payload;
+  }
   const counts = new Map<string, number>();
   for (const route of payload.routes) {
     if (route.name !== "VPS" && route.certificateAuthority) {

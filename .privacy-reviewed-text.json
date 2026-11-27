@@ -1508,6 +1508,94 @@
           "fingerprint": "94424f22c21cb2aa20f3ce0a90556555901c009da066016d24a48fc869a4a2b6"
         }
       ]
+    },
+    {
+      "path": "client/e2e/device-invite.spec.ts",
+      "sha256": "d26e4fbe5c6c0f9864a775c2957828d206bcb795e39d430957261ab0b6e83751",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale test address after PR #166 v2 invite and legacy fallback test updates; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/fixtures/tailscale-pairing.tsx",
+      "sha256": "4b112f81ff74da328171edf5ff9ca59922506830af320859707a93d95d812034",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale test address after PR #166 desktop_network_settings fixture update; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/pairing-route-repair.spec.ts",
+      "sha256": "c9c739679db371630292aa49e179607b14083d08fc97ebdb1032330cc92f598f",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale test address after adding PR #166 v2 repair confirmation test; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/tailscale-pairing.spec.ts",
+      "sha256": "4e91d44c20529333b916fb22e7bdfb66b664e20eb33334841b4e0bcd7240ca50",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale test address after PR #166 WindowsFirewallNotice layout and IPC test updates; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "tests/client-multipath-routes.test.ts",
+      "sha256": "32cc190582dcd70751ec4140757f49a54e8ad120f9d7654eda41d49dbf2d8fd5",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale test addresses after PR #166 v2/v1 pairing payload test updates; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "8308f3a233cf4bd3987f20880945ac60b08eacaa9e85391fd66c5919780196e3"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "63246b8fde0d7ce1f3ac7fdbf4b6c5e9aa9bd23d2d8156036cd57e4ce9308edb"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "258cca7a8e42d54d201f4528b4c562bef41b6ce9022a600d1d7639364a92abeb"
+        }
+      ]
+    },
+    {
+      "path": "tests/host-cli-day-audit.test.ts",
+      "sha256": "9a5706a9f6a292a33d24df90db8a24c0409bb7c95b99fc1b246aff0607bae29f",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale test addresses after adding PR #166 CLI Domain-network firewall warning test; no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "b561751746c6b986134f7802acf540666c18c1f35cbcb132a55f9a98e1a4a23a"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "94424f22c21cb2aa20f3ce0a90556555901c009da066016d24a48fc869a4a2b6"
+        }
+      ]
     }
   ]
 }

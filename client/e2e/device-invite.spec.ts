@@ -126,11 +126,26 @@ test("every offered connection choice yields a decodable code for that network",
     expect(payload.hubPublicKey).toBe(keyA);
     expect(shareable(payload)).toBe(true);
     const direct = payload.routes.filter(route => route.name !== "VPS");
-    expect(direct.length).toBeLessThanOrEqual(1);
-    if (direct[0]) { directs.add(direct[0].url); expect(direct[0].certificateAuthority).toBe(ca); }
-    else relayOnly = payload;
+    if (direct[0]) {
+      expect(payload.v).toBe(2);
+      expect(direct[0].url).toBe(value);
+      expect(direct.length).toBe(2);
+      for (const route of direct) expect(route.certificateAuthority).toBe(ca);
+      directs.add(direct[0].url);
+    } else relayOnly = payload;
   }
   expect([...directs].sort()).toEqual([tailnet, lan].sort());
+  // Legacy compatibility mode emits a single-direct v1 QR for the chosen route.
+  await choice.selectOption(lan);
+  await page.getByLabel("兼容旧版 App（仅包含当前所选的单个地址）").check();
+  await expect.poll(async () => {
+    const links = await page.evaluate(() => window.inviteFixture.decodeAll());
+    if (links.length !== 1) return false;
+    const p = parsePairingLink(links[0]!);
+    return p.kind === "connect" && p.v === 1 && p.routes.filter(r => r.name !== "VPS").length === 1;
+  }).toBe(true);
+  const legacyPayload = await scanned(page);
+  expect(legacyPayload.routes.filter(route => route.name !== "VPS").map(route => route.url)).toEqual([lan]);
   // A relay-only code still carries every relay the host shares.
   expect(relayOnly?.routes.map(route => route.url).sort()).toEqual([relay, relay2].sort());
   await onlyRead(page, "A");
@@ -378,9 +393,11 @@ test("first-time compact pairing waits for the chosen LAN address before advanci
   expect((await calls(page)).network).toEqual([]);
   expect((await calls(page)).http.filter(call => call.method === "POST")).toEqual([]);
   await expect.poll(async () => (await calls(page)).busy).toBe(false);
-  await selector.selectOption({ label: "192.168.10.20" });
+  await selector.selectOption({ label: "局域网 · 192.168.10.20" });
   await expect(selector).toHaveCount(0);
-  expect(await scanned(page)).toMatchObject({ routes: [{ url: lan }] });
+  const payload = await scanned(page);
+  expect(payload.v).toBe(2);
+  expect(payload.routes.map(route => route.url)).toEqual([lan, "https://192.168.50.2:8788"]);
   await expect.poll(async () => (await calls(page)).busy).toBe(false);
 });
 
@@ -470,7 +487,7 @@ test("the waiting notice alone never mints a temporary code before the handoff",
   await add(page, "L", { key: keyA, holdNetwork: true, identityRoutes: [{ name: "Direct", url: "http://127.0.0.1:8787" }], view: { routes: [] } });
   await show(page, "L", true);
   await page.getByRole("button", { name: "生成局域网二维码", exact: true }).click();
-  await page.getByRole("combobox", { name: /^选择电脑所在网络/ }).selectOption({ label: "192.168.10.20" });
+  await page.getByRole("combobox", { name: /^选择电脑所在网络/ }).selectOption({ label: "局域网 · 192.168.10.20" });
   await expect(page.getByText("正在等待本机重新连接并共享线路…", { exact: true })).toBeVisible();
   await page.clock.fastForward(21_000);
   // Publication is late, not rejected: it may still succeed and hand off.
@@ -479,7 +496,9 @@ test("the waiting notice alone never mints a temporary code before the handoff",
   expect((await calls(page)).http.filter(call => call.path === PAIRING_INVITES_PATH && call.method === "POST")).toEqual([]);
   await page.evaluate(() => window.inviteFixture.release("L"));
   await expect(page.getByText("其他连接方式", { exact: true })).toBeVisible();
-  expect(await scanned(page)).toMatchObject({ routes: [{ name: "Direct", url: lan }] });
+  const handedOff = await scanned(page);
+  expect(handedOff.v).toBe(2);
+  expect(handedOff.routes[0]).toMatchObject({ name: "Direct", url: lan });
   expect((await calls(page)).http.filter(call => call.path === PAIRING_INVITES_PATH && call.method === "POST")).toHaveLength(1);
   expect((await calls(page)).http.filter(call => call.path === PAIRING_INVITE_REVOKE_PATH)).toEqual([]);
 });

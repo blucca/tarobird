@@ -92,7 +92,7 @@ export function LocalConnectionSettings({ connection, busyChange }: { connection
       {view && result?.checkedAt && <p className="local-access-refreshed" role="status">{t("状态已刷新 · {0}", new Date(result.checkedAt).toLocaleTimeString())}<small>{t("本机入口状态，不代表其他设备已连接。")}</small></p>}
       {access.error && <p className="error-text" role="alert">{access.error}</p>}
       {access.unavailableRouteCount > 0 && <p className="settings-note" role="status">{t("{0} 个地址暂未就绪，已显示可用地址。", access.unavailableRouteCount)}</p>}
-      {access.routes.length > 0 && access.selected < 0 && <p className="settings-note" role="status">{t("仅检测到虚拟网桥或代理地址，请手动选择与另一台设备在同一网络的地址。")}</p>}
+      {access.routes.length > 0 && access.selected < 0 && <p className="settings-note" role="status">{access.candidates.length > 0 ? t("仅检测到虚拟网桥或代理地址，请手动选择与另一台设备在同一网络的地址。") : t("检测到多个地址，请选择与另一台设备在同一网络的地址。")}</p>}
       {access.routes.length > 0 && (access.routes.length > 1 || access.selected < 0) && (() => {
         const candidateByUrl = new Map(access.candidates.map(item => [item.url, item]));
         const recommendedUrl = access.candidates.find(item => !item.demoted && !item.virtualBridge)?.url;

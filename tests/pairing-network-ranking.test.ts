@@ -1,3 +1,4 @@
+import type { NetworkInterfaceInfo } from "node:os";
 import { describe, expect, it } from "vitest";
 import {
   classifyNetworkInterface,
@@ -10,19 +11,32 @@ import {
 import type { Route } from "../src/client-protocol/routes.js";
 import { annotateAndRankRoutes, discoverInterfacesSnapshot, parseMacHardwarePorts } from "../src/hub/network-discovery.js";
 import {
+  buildWindowsFirewallInspectionScript,
   getWindowsDefaultRouteInterfaceNames,
   hasSufficientWindowsFirewallRemoteScope,
   inspectWindowsMobileFirewall,
 } from "../src/hub/windows-network-check.js";
 
-const addr = (address: string, family: "IPv4" | "IPv6" = "IPv4", internal = false) => ({
-  address,
-  family,
-  internal,
-  netmask: "",
-  mac: "02:00:00:00:00:01",
-  cidr: null,
-});
+const addr = (address: string, family: "IPv4" | "IPv6" = "IPv4", internal = false): NetworkInterfaceInfo => (
+  family === "IPv6"
+    ? {
+        address,
+        family: "IPv6",
+        internal,
+        netmask: "",
+        mac: "02:00:00:00:00:01",
+        cidr: null,
+        scopeid: 0,
+      }
+    : {
+        address,
+        family: "IPv4",
+        internal,
+        netmask: "",
+        mac: "02:00:00:00:00:01",
+        cidr: null,
+      }
+);
 
 // Construct RFC 2544 TUN fake-IP strings dynamically so privacy scans do not flag literal public IPs.
 const fakeIpA = [198, 18, 0, 1].join(".");
@@ -235,6 +249,31 @@ describe("Windows network category and firewall inspection", () => {
     expect(hasSufficientWindowsFirewallRemoteScope([{ remoteAddresses: ["192.168.99.0/24"] }], "192.168.1.10", 24)).toBe(false);
     expect(hasSufficientWindowsFirewallRemoteScope([{ remoteAddresses: ["192.168.1.0/24"] }], "192.168.1.10", 24)).toBe(true);
     expect(hasSufficientWindowsFirewallRemoteScope([{ remoteAddresses: ["LocalSubnet"] }], "192.168.1.10", 24)).toBe(true);
+  });
+
+  it("compares Private firewall GpoBoolean state as a string instead of casting enum to [bool]", async () => {
+    const script = buildWindowsFirewallInspectionScript(23456, "C:\\Program Files\\TaroBird\\node.exe", "192.168.1.10");
+    expect(script).not.toContain("[bool](Get-NetFirewallProfile");
+    expect(script).toContain("[string]$privateProfile.Enabled -eq 'True'");
+    expect(script).toContain("$null -ne $privateProfile");
+
+    const disabledFirewall = await inspectWindowsMobileFirewall(23456, "192.168.1.10", {
+      platform: "win32",
+      runPowerShell: async () => JSON.stringify({
+        matchingRuleScopes: [],
+        blockingRuleDetected: false,
+        localAddress: "192.168.1.10",
+        localPrefixLength: 24,
+        privateFirewallEnabled: false,
+        networkCategory: "Private",
+      }),
+    });
+    expect(disabledFirewall).toMatchObject({
+      supported: true,
+      networkCategory: "private",
+      privateFirewallEnabled: false,
+      ruleAllowed: false,
+    });
   });
 
   it("returns unsupported on non-Windows and degrades safely when PowerShell inspection fails", async () => {

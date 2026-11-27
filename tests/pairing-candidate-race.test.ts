@@ -1,8 +1,8 @@
 import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import { multipathConfiguration } from "../client/src/connection-routes.js";
 import { PairingCandidateRaceError, racePairingCandidates } from "../client/src/pairing-candidate-race.js";
 import { connectionPairingPayload, pairingLink, parsePairingLink } from "../client/src/pairing-link.js";
-import { repairRoutes } from "../client/src/RepairHostRoute.js";
 import { hostPairingLink } from "../src/host-cli/pairing.js";
 import type { Route } from "../src/client-protocol/routes.js";
 
@@ -168,20 +168,79 @@ describe("v1 and v2 pairing payload compatibility", () => {
     expect(parsePairingLink(validCliV1)).toMatchObject({ v: 1, kind: "connect", routes: single, invite });
   });
 
-  it("supports repairing saved routes from a v2 multi-candidate QR while checking host identity", () => {
-    const identity = {
+  it("does not hoist a shared CA onto system-CA direct or Tailscale routes in v2 payloads", () => {
+    const mixed: Route[] = [
+      { name: "Direct", url: "https://192.168.1.10:23456", certificateAuthority: ca },
+      { name: "Direct", url: "https://192.168.2.10:23456", certificateAuthority: ca },
+      { name: "Tailscale", url: "https://tailscale.example.test" },
+    ];
+    const clientLink = pairingLink({ ...connectionPairingPayload(key, mixed, "computer", mixed[0]!.url), invite });
+    const clientDecoded = parsePairingLink(clientLink);
+    expect(clientDecoded).toEqual({
+      v: 2,
+      kind: "connect",
       hubPublicKey: key,
-      deployment: "computer" as const,
-      routes: [{ name: "Direct" as const, url: "https://192.168.1.99:23456", certificateAuthority: ca }, routes[3]!],
-    };
-    const v2Payload = parsePairingLink(pairingLink({
-      ...connectionPairingPayload(key, routes, "computer"),
+      routes: mixed,
+      deployment: "computer",
       invite,
-    }));
-    const repaired = repairRoutes(identity, v2Payload);
-    expect(repaired?.routes.map(r => r.url)).toEqual(routes.map(r => r.url));
-    expect(repaired?.relays).toBe(1);
+    });
+    expect(clientDecoded.kind === "connect" && clientDecoded.routes[2]!.certificateAuthority).toBeUndefined();
 
-    expect(() => repairRoutes({ ...identity, hubPublicKey: `MCowBQYDK2VwAyEA${"z".repeat(44)}` }, v2Payload)).toThrow();
+    const cliLink = hostPairingLink(key, mixed, invite);
+    const cliDecoded = parsePairingLink(cliLink);
+    expect(cliDecoded).toEqual({
+      v: 2,
+      kind: "connect",
+      hubPublicKey: key,
+      routes: mixed,
+      invite,
+    });
+    expect(cliDecoded.kind === "connect" && cliDecoded.routes[2]!.certificateAuthority).toBeUndefined();
+
+    // When every non-VPS route has its own CA (with two sharing ca), hoisting still preserves a distinct CA.
+    const distinctCa = "B".repeat(160);
+    const allPinned: Route[] = [
+      { name: "Direct", url: "https://192.168.1.10:23456", certificateAuthority: ca },
+      { name: "Direct", url: "https://192.168.2.10:23456", certificateAuthority: ca },
+      { name: "Tailscale", url: "https://100.64.0.1:23456", certificateAuthority: distinctCa },
+    ];
+    expect(parsePairingLink(pairingLink({ ...connectionPairingPayload(key, allPinned, "computer", allPinned[0]!.url), invite }))).toEqual({
+      v: 2,
+      kind: "connect",
+      hubPublicKey: key,
+      routes: allPinned,
+      deployment: "computer",
+      invite,
+    });
+    expect(parsePairingLink(hostPairingLink(key, allPinned, invite))).toEqual({
+      v: 2,
+      kind: "connect",
+      hubPublicKey: key,
+      routes: allPinned,
+      invite,
+    });
+  });
+
+  it("preserves private-CA VPS relays during v2 multipath configuration while stripping CA on edited relay URLs", () => {
+    const relayCa = "C".repeat(160);
+    const importedDirects: Route[] = [
+      { name: "Direct", url: "https://192.168.1.10:23456", certificateAuthority: ca },
+      { name: "Direct", url: "https://192.168.1.20:23456", certificateAuthority: ca },
+    ];
+    const importedRelays: Route[] = [
+      { name: "VPS", url: "https://relay.example:8443", certificateAuthority: relayCa },
+    ];
+    const importedRoutes = [...importedDirects, ...importedRelays];
+
+    const kept = multipathConfiguration(importedDirects, importedRelays, importedRoutes, "computer");
+    expect(kept.routes).toEqual(importedRoutes);
+
+    const edited = multipathConfiguration(
+      importedDirects,
+      [{ ...importedRelays[0]!, url: "https://other-relay.example:8443" }],
+      importedRoutes,
+      "computer",
+    );
+    expect(edited.routes[2]).toEqual({ name: "VPS", url: "https://other-relay.example:8443" });
   });
 });

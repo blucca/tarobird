@@ -2,7 +2,7 @@ import { useState } from "react";
 import { AlertTriangle, Check, Copy, ExternalLink } from "lucide-react";
 import type { WindowsFirewallStatus } from "../../src/client-protocol/network-candidates.js";
 import { writeClipboardText } from "./clipboard-write.js";
-import { isDesktop, openDesktopUrl } from "./desktop-bridge.js";
+import { isDesktop, openWindowsNetworkSettings } from "./desktop-bridge.js";
 import { t, useLocale } from "./i18n.js";
 
 export function WindowsFirewallNotice({
@@ -14,6 +14,8 @@ export function WindowsFirewallNotice({
 }) {
   useLocale();
   const [copied, setCopied] = useState(false);
+  const [openingSettings, setOpeningSettings] = useState(false);
+  const [openFailed, setOpenFailed] = useState(false);
 
   if (!status?.supported) return null;
   if (status.networkCategory === "domain") return null;
@@ -33,6 +35,19 @@ export function WindowsFirewallNotice({
       setTimeout(() => setCopied(false), 2500);
     } catch {
       setCopied(false);
+    }
+  };
+
+  const openNetworkSettings = async () => {
+    if (openingSettings) return;
+    setOpeningSettings(true);
+    setOpenFailed(false);
+    try {
+      await openWindowsNetworkSettings();
+    } catch {
+      setOpenFailed(true);
+    } finally {
+      setOpeningSettings(false);
     }
   };
 
@@ -62,14 +77,22 @@ export function WindowsFirewallNotice({
       )}
       {isPublic ? (
         isDesktop() && (
-          <button
-            type="button"
-            className="secondary"
-            onClick={() => void openDesktopUrl("ms-settings:network-status").catch(() => undefined)}
-          >
-            <ExternalLink size={14} aria-hidden="true" />
-            {t("打开 Windows 网络设置")}
-          </button>
+          <>
+            <button
+              type="button"
+              className="secondary"
+              disabled={openingSettings}
+              onClick={() => void openNetworkSettings()}
+            >
+              <ExternalLink size={14} aria-hidden="true" />
+              {openingSettings ? t("正在打开…") : t("打开 Windows 网络设置")}
+            </button>
+            {openFailed && (
+              <p className="muted" role="alert">
+                {t("无法自动打开设置，请手动打开 Windows「设置 → 网络和 Internet」并将当前网络改为「专用网络」。")}
+              </p>
+            )}
+          </>
         )
       ) : (
         <div className="windows-firewall-command">

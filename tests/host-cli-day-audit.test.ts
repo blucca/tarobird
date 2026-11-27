@@ -13,6 +13,7 @@ import * as manager from "../src/host-cli/service-manager.js";
 import * as service from "../src/hub/service.js";
 import * as tls from "../src/hub/desktop-tls.js";
 import * as network from "../src/hub/desktop-network.js";
+import * as windowsNetworkCheck from "../src/hub/windows-network-check.js";
 import * as lifecycle from "../src/host-cli/lifecycle.js";
 import * as recovery from "../src/host-cli/update-recovery.js";
 import * as files from "node:fs/promises";
@@ -144,6 +145,37 @@ it("requires explicit --address in --v1 mode before configuring TLS, and support
   await runHostCli(["pair", "--lan", "--address", "192.168.1.2", ...f.args]);
   expect(JSON.parse(f.output.mock.calls[1]![0])).toMatchObject({ routes: [{ url: "https://192.168.1.2:8790" }] });
   expect(f.connect).toHaveBeenCalledTimes(2);
+});
+
+it("suppresses Private-profile Windows firewall warning in CLI output on Domain networks", async () => {
+  const f = await pairingFixture();
+  const warnings = vi.spyOn(console, "error").mockImplementation(() => {});
+  vi.spyOn(windowsNetworkCheck, "inspectWindowsMobileFirewall").mockResolvedValueOnce({
+    supported: true,
+    port: 8790,
+    networkCategory: "domain",
+    privateFirewallEnabled: true,
+    ruleAllowed: false,
+    blockingRuleDetected: false,
+    inspectionAvailable: true,
+    recommendedCommand: "New-NetFirewallRule -Profile Private",
+  });
+  await runHostCli(["pair", "--lan", "--state-dir", f.directory]);
+  expect(warnings.mock.calls.flat().join("\n")).not.toContain("Windows 防火墙");
+  expect(warnings.mock.calls.flat().join("\n")).not.toContain("公用网络");
+
+  vi.spyOn(windowsNetworkCheck, "inspectWindowsMobileFirewall").mockResolvedValueOnce({
+    supported: true,
+    port: 8790,
+    networkCategory: "private",
+    privateFirewallEnabled: true,
+    ruleAllowed: false,
+    blockingRuleDetected: false,
+    inspectionAvailable: true,
+    recommendedCommand: "New-NetFirewallRule -Profile Private",
+  });
+  await runHostCli(["pair", "--lan", "--state-dir", f.directory]);
+  expect(warnings.mock.calls.flat().join("\n")).toContain("New-NetFirewallRule -Profile Private");
 });
 
 it("pairs a dual-stack Tailscale interface through its unique IPv4 by default and honors explicit IPv6", async () => {
