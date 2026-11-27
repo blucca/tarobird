@@ -27,6 +27,8 @@ import { clearMessagesPlanSchema, clearMessagesResultSchema, MESSAGE_CLEAR_CAPAB
 import { deleteMessagesSchema, deleteMessagesResultSchema, MESSAGE_DELETE_CAPABILITY } from "../../src/client-protocol/message-deletion.js";
 import { timeoutSignal, anySignal } from "./abort-signals.js";
 import { conversationFoldersSchema, emptyConversationFolders, type ConversationFoldersState, type FolderEdit } from "../../src/client-protocol/conversation-folders.js";
+import { CONVERSATION_PINS_CAPABILITY, conversationPinsSchema, emptyConversationPins, type ConversationPinsState, type PinScope } from "../../src/client-protocol/conversation-pins.js";
+import { CROSS_HOST_FOLDER_ORDER_CAPABILITY, crossHostFolderOrderSchema, type CrossHostFolderOrderState } from "../../src/client-protocol/cross-host-folder-order.js";
 import { connectionTiming } from "./connection-timing.js";
 import { RoutePerformance, ROUTE_OBSERVATION_MS, ROUTE_DWELL_MS, ROUTE_STABLE_PROBE_MS, ROUTE_CANDIDATE_PROBE_MS } from "./route-performance.js";
 import { rememberRouteTrust } from "./route-trust.js";
@@ -56,7 +58,7 @@ import { verifyNetworkMembership } from "./network-identity.js";
 import { z } from "zod";
 import { CAPABILITIES, MAX_FRAME_BYTES, MAX_FILE_BYTES, uploadLimitsSchema, clientFrameSchema, conversationSchema, eventSchema, type ClientFrame, type Conversation, type Json } from "../../src/client-protocol/index.js";
 import { CONVERSATION_SYNC_CAPABILITY, SNAPSHOT_ACTIVITY_CAPABILITY, SYNC_LINEAGE_CAPABILITY, snapshotFrameSchema } from "../../src/client-protocol/snapshot.js";
-import { cache as legacyCache, type ClientCache, type OutboxEntry, type Identity, type Route, type PendingPairing } from "./storage.js";
+import { cache as legacyCache, type ClientCache, type OutboxEntry, type Identity, type Route, type PendingPairing, type PendingPinChange } from "./storage.js";
 import { randomNonce, signChallenge, signDeviceAction, verifyHub, verifyRevocation } from "./identity.js";
 import { boundDeviceActionStatement, deviceActionSchema } from "../../src/client-protocol/device-actions.js";
 import { botMessageGrantsCommandSchema, botMessageGrantsSnapshotSchema, type BotMessageGrantsCommand, crossHostMessageGrantsCommandSchema, crossHostMessageGrantsSnapshotSchema, type CrossHostMessageGrantsCommand } from "../../src/client-protocol/bot-message-grants.js";
@@ -75,18 +77,27 @@ import { DISK_CACHE_MIN_BYTES, diskCacheKey, forgetCachedAttachments, readCached
 export type Bot = { id: string; name: string; engine: string; model: string; effort: string; online: number; managed?: number; deletedAt?: number; defaultAvatar?: string; role?: string; workspacePath?: string };
 // `role` is open-ended so a newer Host role cannot reject the whole directory; only "dispatcher" has meaning here.
 const botSchema = z.object({ id: z.string(), name: z.string(), engine: z.string(), model: z.string(), effort: z.string(), online: z.number(), managed: z.number().optional(), deletedAt: z.number().optional(), defaultAvatar: z.string().max(64).optional(), role: z.string().max(32).optional(), workspacePath: z.string().max(4096).optional() });
-const readySchema = z.object({ serverCapabilities: z.array(z.string()).default([]), conversationFolders: conversationFoldersSchema.optional(), uploadLimits: uploadLimitsSchema.optional(), user: profileUserSchema, avatars: z.array(avatarSchema).default([]), sessionToken: z.string(), expiresAt: z.number(), serverTime: z.number().optional(), bots: z.array(botSchema), conversations: z.array(conversationSchema) });
+const readySchema = z.object({ serverCapabilities: z.array(z.string()).default([]), conversationFolders: conversationFoldersSchema.optional(), conversationPins: conversationPinsSchema.optional(), crossHostFolderOrder: crossHostFolderOrderSchema.optional(), uploadLimits: uploadLimitsSchema.optional(), user: profileUserSchema, avatars: z.array(avatarSchema).default([]), sessionToken: z.string(), expiresAt: z.number(), serverTime: z.number().optional(), bots: z.array(botSchema), conversations: z.array(conversationSchema) });
 /** Queued frames refresh only their own conversation; creation has no existing scope. */
 const frameConversation = (frame: ClientFrame): string | undefined => "conversationId" in frame ? frame.conversationId : "groupId" in frame ? frame.groupId : undefined;
 export type RouteSyncSource = "host" | "network";
 export type RouteSyncResult = { limited: boolean };
-export type ConnectionState = ProfileCache & { savedWorkspacesAvailable?: boolean; dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ flight })` and an `ack` with `heldMs`. */ screenFlightAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; /** Host accepts `screenConfigure({ udpBoost })` and `includeUdpStatus=1`. */ screenUdpBoostAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; botCommsAvailable?: boolean; historyAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; engineQuotaAvailable?: boolean; /** Host serves a conversation's context usage. */ contextUsageAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; workspaceFilesAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; routeDiagnosis?: RouteDiagnosis; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
+export type ConnectionState = ProfileCache & { savedWorkspacesAvailable?: boolean; dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ flight })` and an `ack` with `heldMs`. */ screenFlightAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; /** Host accepts `screenConfigure({ udpBoost })` and `includeUdpStatus=1`. */ screenUdpBoostAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; botCommsAvailable?: boolean; historyAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; engineQuotaAvailable?: boolean; /** Host serves a conversation's context usage. */ contextUsageAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; workspaceFilesAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; conversationPins?: ConversationPinsState; pinsAvailable?: boolean; crossHostFolderOrder?: CrossHostFolderOrderState; crossHostFolderOrderAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; routeDiagnosis?: RouteDiagnosis; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
 class RouteDiagnosisError extends Error {
   constructor(readonly diagnosis: RouteDiagnosis) {
     super(diagnosis.message);
   }
 }
 export type OutboxSettlement = { entry: OutboxEntry; revision: number; messageAccepted: boolean };
+function isPermanentPinRejection(error: unknown): boolean {
+  if (!(error instanceof HubHttpError)) return false;
+  if (error.status === 400 && (error.code === "invalid_request" || error.code === "invalid_json")) return true;
+  if (error.status === 404 && error.code === "conversation_not_available") return true;
+  if (error.status === 409 && error.code === "pin_limit") return true;
+  if (error.status === 413 && error.code === "body_too_large") return true;
+  return false;
+}
+
 export class HubConnection {
   state: ConnectionState = { cacheRevision: 0, status: "offline", bots: [], outbox: 0, avatars: [] };
   private navigationGraceTimer?: ReturnType<typeof setTimeout>;
@@ -96,9 +107,31 @@ export class HubConnection {
   get outboxRevision(): number { return this.outboxVersion; }
   /** Request fresh local views without reconnecting or sending application data. */
   refreshCache(): void { this.update({}, true); }
-  async pinConversation(id: string, pinned: boolean, scope: "group" | "global" = "group"): Promise<void> {
-    await this.cache.setPinned(id, pinned, scope);
+  async pinConversation(id: string, pinned: boolean, scope: PinScope = "group"): Promise<void> {
+    const synced = await this.cache.conversationPins?.();
+    const isOnline = this.state.status === "online" && !!this.state.pinsAvailable && !this.closed;
+    const queuePending = !!synced || isOnline;
+    const liveEpoch = isOnline ? this.authenticatedSessionEpoch : undefined;
+    const offset = this.state.serverTimeOffset ?? await this.cache.serverTimeOffset?.() ?? 0;
+    const at = Math.max(0, Math.round(Date.now() + offset));
+    const seq = await this.cache.setPinned(id, pinned, scope, queuePending ? { at, identity: this.identity, queuePending: true } : undefined);
+    const key = `${scope}:${id}`;
+    if (typeof seq === "number" && liveEpoch !== undefined && !this.closed && this.state.status === "online" && this.state.pinsAvailable && this.authenticatedSessionEpoch === liveEpoch) {
+      this.livePinChanges.set(key, { seq, epoch: liveEpoch });
+    } else {
+      this.livePinChanges.delete(key);
+    }
     this.refreshCache();
+    if (this.state.status === "online" && this.state.pinsAvailable && !this.closed) {
+      void this.syncPinsWithHost(this.generation);
+    }
+  }
+  async syncPins(): Promise<void> {
+    if (this.state.status === "online" && this.state.pinsAvailable && !this.closed) {
+      await this.syncPinsWithHost(this.generation);
+    } else {
+      await this.pinSyncQueue;
+    }
   }
   /** Request fresh local views of one conversation (pending rows, history fences). */
   refreshConversation(id: string): void { this.changedConversations.add(id); this.update({}, true, true); }
@@ -159,6 +192,14 @@ export class HubConnection {
   private lifecycle = 0;
   private folderUpdates: Promise<void> = Promise.resolve();
   private folderVersion = 0;
+  private pinUpdates: Promise<void> = Promise.resolve();
+  private pinVersion = 0;
+  private pinSyncQueue: Promise<void> = Promise.resolve();
+  private pinSyncPending = false;
+  private pinSyncTargetGeneration = -1;
+  private readonly livePinChanges = new Map<string, { seq: number; epoch: number }>();
+  private crossHostFolderOrderUpdates: Promise<void> = Promise.resolve();
+  private crossHostFolderOrderVersion = 0;
   networkKnown?: SignedNetworkManifest;
   networkRemote?: SignedNetworkManifest;
   networkDeparture?: SignedNetworkManifest;
@@ -300,7 +341,7 @@ export class HubConnection {
     if (this.httpEpoch.signal.aborted) this.httpEpoch = new AbortController();
     window.addEventListener("online", this.networkOnline); document.addEventListener("visibilitychange", this.presence); window.addEventListener("focus", this.presence); window.addEventListener("blur", this.presence); window.addEventListener(NATIVE_ACTIVE_EVENT, this.presence);
     const work = (async () => {
-      const [active, profiles, revoked, stored, outbox, conversationFolders, membership] = await Promise.all([this.cache.activeMessages(), this.cache.profiles(), this.cache.identityRevoked(this.identity), this.cache.identity(), this.cache.outbox(), this.cache.conversationFolders(), this.cache.networkMembership()]);
+      const [active, profiles, revoked, stored, outbox, conversationFolders, conversationPins, crossHostFolderOrder, membership] = await Promise.all([this.cache.activeMessages(), this.cache.profiles(), this.cache.identityRevoked(this.identity), this.cache.identity(), this.cache.outbox(), this.cache.conversationFolders(), this.cache.conversationPins?.(), this.cache.crossHostFolderOrder?.(), this.cache.networkMembership()]);
       if (this.closed || lifecycle !== this.lifecycle) return;
       if (!stored || stored.deviceId !== this.identity.deviceId || stored.hubPublicKey !== this.identity.hubPublicKey) throw new Error("host_cache_identity_mismatch");
       if (await this.cache.pendingReset()) throw new Error("local_reset_in_progress");
@@ -311,7 +352,7 @@ export class HubConnection {
         const host = membership.manifest.hosts.find(value => value.publicKey === this.identity.hubPublicKey)!;
         cachedNetwork = { host, membership, sync: host.revoked ? "removed" : "waiting", lastSyncedAt: 0 };
       }
-      this.activeMessages = new Set(active); this.update({ ...profiles, conversationFolders, outbox: outbox.length, ...(cachedNetwork ? { network: cachedNetwork } : {}) }, true);
+      this.activeMessages = new Set(active); this.update({ ...profiles, conversationFolders, conversationPins, crossHostFolderOrder, outbox: outbox.length, ...(cachedNetwork ? { network: cachedNetwork } : {}) }, true);
       if (this.networkBlocked) { this.suspendNetwork(); return; }
       if (revoked) { this.deviceRevoked = true; if (this.networkPin) this.networkBlocked = true; this.close(); this.update({ error: t("此设备已被吊销，请重新配对"), routeDiagnosis: undefined }); return; }
       void this.downloadCheckpoints.sweep().catch(() => undefined);
@@ -523,6 +564,7 @@ export class HubConnection {
         if (generation !== this.generation) return;
         // Incoming traffic is observed before IndexedDB/render work; a busy
         // catch-up queue must not be mistaken for a blackholed transport.
+        const receivedAt = Date.now();
         this.lastPong = performance.now();
         this.awaitingForegroundProbe = false;
         this.clearForegroundProbe();
@@ -565,7 +607,13 @@ export class HubConnection {
           // Identity metadata is also needed while draining received read events
           // after a close; only transport activation waits for the cache writes.
           this.userId = ready.user.id; await this.cache.saveConversations(ready.conversations);
+          const serverTimeOffset = ready.serverTime !== undefined ? ready.serverTime - receivedAt : 0;
           if (ready.conversationFolders) await this.acceptConversationFolders(ready.conversationFolders, generation, true);
+          if (ready.conversationPins) await this.acceptConversationPins(ready.conversationPins, generation, true);
+          if (ready.crossHostFolderOrder) await this.acceptCrossHostFolderOrder(ready.crossHostFolderOrder, generation, true);
+          if (ready.serverTime !== undefined && this.cache.saveServerTimeOffset) {
+            void this.cache.saveServerTimeOffset(serverTimeOffset, this.identity).catch(() => undefined);
+          }
           await this.cache.saveProfiles({ user: ready.user, avatars: ready.avatars }, this.identity);
           // Close can race either cache write. Draining accepted frames must not
           // restore a dead socket's token, timers, route health or online state.
@@ -576,7 +624,8 @@ export class HubConnection {
           if (this.lastConnectedUrl !== chosen.route.url) this.lastRouteChange = Date.now();
           this.lastConnectedUrl = chosen.route.url;
           this.update({ routeSelection: { reason, changedAt: Date.now() } });
-          this.update({ dispatchAvailable: ready.serverCapabilities.includes(DISPATCH_CAPABILITY), screenAvailable: ready.serverCapabilities.includes("desktop.screen.v1"), pairingInvitesAvailable: ready.serverCapabilities.includes(PAIRING_INVITES_CAPABILITY), conversationBatchAvailable: ready.serverCapabilities.includes(CONVERSATION_BATCH_CAPABILITY), groupReplyGuardAvailable: ready.serverCapabilities.includes("groups.reply-guard.v1"), groupDiscussionAvailable: ready.serverCapabilities.includes("groups.discussion.v1"), groupDiscussionComposerAvailable: ready.serverCapabilities.includes("groups.discussion.composer.v1"), groupDiscussionRecoveryAvailable: ready.serverCapabilities.includes("groups.discussion.recovery.v1"), groupParallelAvailable: ready.serverCapabilities.includes("groups.parallel.v1"), voiceSettingsAvailable: ready.serverCapabilities.includes("integrations.voice.v2"), widgetSettingsAvailable: ready.serverCapabilities.includes("widgets.settings.v1"), engineSettingsAvailable: ready.serverCapabilities.includes("engines.settings.v1"), engineQuotaAvailable: ready.serverCapabilities.includes(ENGINE_QUOTA_CAPABILITY), contextUsageAvailable: ready.serverCapabilities.includes(CONTEXT_USAGE_CAPABILITY), backupSettingsAvailable: ready.serverCapabilities.includes("backups.settings.v1"), hostRoutesAvailable: ready.serverCapabilities.includes("host-routes.v1"), hostLanSelectionAvailable: ready.serverCapabilities.includes("host-routes.select-lan.v1"), attachmentAdminAvailable: ready.serverCapabilities.includes("attachments.admin.v1"), asrSetupAvailable: ready.serverCapabilities.includes("integrations.asr.v1"), workspaceDiffAvailable: ready.serverCapabilities.includes("workspace.diff.v1"), workspaceFilesAvailable: ready.serverCapabilities.includes(WORKSPACE_FILES_CAPABILITY), runChangesAvailable: ready.serverCapabilities.includes("runs.changes.v1"), runScopesAvailable: ready.serverCapabilities.includes(RUN_SCOPES_CAPABILITY), runGroupsAvailable: ready.serverCapabilities.includes(BACKGROUND_TASK_GROUP_CAPABILITY), runTailAvailable: ready.serverCapabilities.includes(RUN_TAIL_CAPABILITY), serverTimeOffset: (ready.serverTime ?? Date.now()) - Date.now(), networkAvailable: ready.serverCapabilities.includes(PRIVATE_NETWORK_CAPABILITY), folderReorderAvailable: ready.serverCapabilities.includes("conversation-folders.reorder.v1"), folderPinAvailable: ready.serverCapabilities.includes("conversation-folders.pin.v1"), conversationAvatarsAvailable: ready.serverCapabilities.includes("conversation-avatars.v1"), foldersAvailable: !!ready.conversationFolders, user: ready.user, avatars: ready.avatars, status: "online", bots: ready.bots.filter(bot => !bot.deletedAt && bot.role !== "worker"), deletedBots: ready.bots.filter(bot => !!bot.deletedAt && bot.role !== "worker"), dispatchWorkers: ready.bots.filter(bot => !bot.deletedAt && bot.role === "worker"), botDeletionAvailable: ready.serverCapabilities.includes("bots.delete.v1"), promptQueueAvailable: ready.serverCapabilities.includes("prompt-queue.v1"), messageDeletionAvailable: ready.serverCapabilities.includes(MESSAGE_DELETE_CAPABILITY), messageClearAvailable: ready.serverCapabilities.includes(MESSAGE_CLEAR_CAPABILITY), maxFileBytes: ready.uploadLimits?.maxFileBytes ?? MAX_FILE_BYTES, error: undefined, routeDiagnosis: undefined }, true); void rememberGroupReplyCapabilities(this).catch(() => undefined); void syncShareUploadLimit(this.state.maxFileBytes ?? MAX_FILE_BYTES).catch(() => console.warn("share_limit_cache_failed")); this.lastPong = performance.now(); this.presence(); void this.refreshNotificationPreferences().catch(() => undefined);
+          this.update({ dispatchAvailable: ready.serverCapabilities.includes(DISPATCH_CAPABILITY), screenAvailable: ready.serverCapabilities.includes("desktop.screen.v1"), pairingInvitesAvailable: ready.serverCapabilities.includes(PAIRING_INVITES_CAPABILITY), conversationBatchAvailable: ready.serverCapabilities.includes(CONVERSATION_BATCH_CAPABILITY), groupReplyGuardAvailable: ready.serverCapabilities.includes("groups.reply-guard.v1"), groupDiscussionAvailable: ready.serverCapabilities.includes("groups.discussion.v1"), groupDiscussionComposerAvailable: ready.serverCapabilities.includes("groups.discussion.composer.v1"), groupDiscussionRecoveryAvailable: ready.serverCapabilities.includes("groups.discussion.recovery.v1"), groupParallelAvailable: ready.serverCapabilities.includes("groups.parallel.v1"), voiceSettingsAvailable: ready.serverCapabilities.includes("integrations.voice.v2"), widgetSettingsAvailable: ready.serverCapabilities.includes("widgets.settings.v1"), engineSettingsAvailable: ready.serverCapabilities.includes("engines.settings.v1"), engineQuotaAvailable: ready.serverCapabilities.includes(ENGINE_QUOTA_CAPABILITY), contextUsageAvailable: ready.serverCapabilities.includes(CONTEXT_USAGE_CAPABILITY), backupSettingsAvailable: ready.serverCapabilities.includes("backups.settings.v1"), hostRoutesAvailable: ready.serverCapabilities.includes("host-routes.v1"), hostLanSelectionAvailable: ready.serverCapabilities.includes("host-routes.select-lan.v1"), attachmentAdminAvailable: ready.serverCapabilities.includes("attachments.admin.v1"), asrSetupAvailable: ready.serverCapabilities.includes("integrations.asr.v1"), workspaceDiffAvailable: ready.serverCapabilities.includes("workspace.diff.v1"), workspaceFilesAvailable: ready.serverCapabilities.includes(WORKSPACE_FILES_CAPABILITY), runChangesAvailable: ready.serverCapabilities.includes("runs.changes.v1"), runScopesAvailable: ready.serverCapabilities.includes(RUN_SCOPES_CAPABILITY), runGroupsAvailable: ready.serverCapabilities.includes(BACKGROUND_TASK_GROUP_CAPABILITY), runTailAvailable: ready.serverCapabilities.includes(RUN_TAIL_CAPABILITY), serverTimeOffset, networkAvailable: ready.serverCapabilities.includes(PRIVATE_NETWORK_CAPABILITY), folderReorderAvailable: ready.serverCapabilities.includes("conversation-folders.reorder.v1"), folderPinAvailable: ready.serverCapabilities.includes("conversation-folders.pin.v1"), conversationAvatarsAvailable: ready.serverCapabilities.includes("conversation-avatars.v1"), foldersAvailable: !!ready.conversationFolders, pinsAvailable: ready.serverCapabilities.includes(CONVERSATION_PINS_CAPABILITY) && !!ready.conversationPins, crossHostFolderOrderAvailable: ready.serverCapabilities.includes(CROSS_HOST_FOLDER_ORDER_CAPABILITY) && !!ready.crossHostFolderOrder, user: ready.user, avatars: ready.avatars, status: "online", bots: ready.bots.filter(bot => !bot.deletedAt && bot.role !== "worker"), deletedBots: ready.bots.filter(bot => !!bot.deletedAt && bot.role !== "worker"), dispatchWorkers: ready.bots.filter(bot => !bot.deletedAt && bot.role === "worker"), botDeletionAvailable: ready.serverCapabilities.includes("bots.delete.v1"), promptQueueAvailable: ready.serverCapabilities.includes("prompt-queue.v1"), messageDeletionAvailable: ready.serverCapabilities.includes(MESSAGE_DELETE_CAPABILITY), messageClearAvailable: ready.serverCapabilities.includes(MESSAGE_CLEAR_CAPABILITY), maxFileBytes: ready.uploadLimits?.maxFileBytes ?? MAX_FILE_BYTES, error: undefined, routeDiagnosis: undefined }, true); void rememberGroupReplyCapabilities(this).catch(() => undefined); void syncShareUploadLimit(this.state.maxFileBytes ?? MAX_FILE_BYTES).catch(() => console.warn("share_limit_cache_failed")); this.lastPong = performance.now(); this.presence(); void this.refreshNotificationPreferences().catch(() => undefined);
+          if (ready.conversationPins && ready.serverCapabilities.includes(CONVERSATION_PINS_CAPABILITY)) void this.syncPinsWithHost(generation);
           const timing = connectionTiming(chosen.route, usesPinnedTransport());
           let heartbeatAt = performance.now();
           this.heartbeat = setInterval(() => {
@@ -687,6 +736,8 @@ export class HubConnection {
         }
         if (frame.type === "sync.complete") { if (receiveFailed) return; this.syncing = false; this.pendingSync.clear(); this.update({ syncProgress: undefined }, false, true); await this.flush(); return; }
         if (frame.type === "conversation-folders.updated") { await this.acceptConversationFolders(conversationFoldersSchema.parse(frame.folders), generation); return; }
+        if (frame.type === "conversation-pins.updated") { await this.acceptConversationPins(conversationPinsSchema.parse(frame.pins), generation); return; }
+        if (frame.type === "cross-host-folder-order.updated") { await this.acceptCrossHostFolderOrder(crossHostFolderOrderSchema.parse(frame.order), generation); return; }
         if (frame.type === "conversation.updated") { this.groupDiscussionRevision++; await this.cache.saveConversations([conversationSchema.parse(frame.conversation)]); if (typeof frame.clientActionId === "string") await this.ack(frame.clientActionId); this.update({}, true); return; }
         if (frame.type === "message.ack" && typeof frame.clientMsgId === "string") {
           // An earlier event/parse/cache failure invalidates the local-history
@@ -779,6 +830,7 @@ export class HubConnection {
   private offline(scheduleReconnect = true, preserveHttp = false): void {
     this.awaitingForegroundProbe = false;
     this.clearForegroundProbe();
+    this.livePinChanges.clear();
     if (this.reconnect) clearTimeout(this.reconnect); this.reconnect = undefined;
     if (this.outboxRetry) clearTimeout(this.outboxRetry);
     if (!preserveHttp) { this.httpEpoch.abort(); this.httpEpoch = new AbortController(); }
@@ -839,6 +891,225 @@ export class HubConnection {
     });
     this.folderUpdates = work.catch(() => undefined);
     return work;
+  }
+  private acceptCrossHostFolderOrder(
+    value: CrossHostFolderOrderState,
+    generation: number,
+    authoritative = false,
+    observedVersion?: number,
+  ): Promise<void> {
+    const work = this.crossHostFolderOrderUpdates.then(async () => {
+      if (this.closed || generation !== this.generation) return;
+      const replace = authoritative && (observedVersion === undefined || observedVersion === this.crossHostFolderOrderVersion);
+      if (!replace && value.revision < (this.state.crossHostFolderOrder?.revision ?? 0)) return;
+      if (this.cache.saveCrossHostFolderOrder) {
+        const accepted = await this.cache.saveCrossHostFolderOrder(value, this.identity, replace);
+        if (!accepted || this.closed || generation !== this.generation) return;
+      }
+      this.crossHostFolderOrderVersion++;
+      this.update({ crossHostFolderOrder: value }, true);
+    });
+    this.crossHostFolderOrderUpdates = work.catch(() => undefined);
+    return work;
+  }
+  async saveCrossHostFolderOrder(
+    order: { updatedAt: number; pinned: readonly string[]; ordinary: readonly string[] },
+    expectedRevision?: number,
+  ): Promise<CrossHostFolderOrderState> {
+    if (this.state.status !== "online" || !this.state.crossHostFolderOrderAvailable) {
+      throw new Error("cross_host_folder_order_unavailable");
+    }
+    const generation = this.generation;
+    const revision = expectedRevision ?? this.state.crossHostFolderOrder?.revision ?? 0;
+    try {
+      const next = crossHostFolderOrderSchema.parse(await this.http("/api/cross-host-folder-order", {
+        method: "PATCH",
+        body: JSON.stringify({
+          revision,
+          updatedAt: order.updatedAt,
+          pinned: [...order.pinned],
+          ordinary: [...order.ordinary],
+        }),
+        signal: timeoutSignal(20_000),
+      }));
+      await this.acceptCrossHostFolderOrder(next, generation);
+      return next;
+    } catch (error) {
+      if (error instanceof HubHttpError && error.code === "cross_host_folder_order_changed" && !this.closed && generation === this.generation) {
+        const observedVersion = this.crossHostFolderOrderVersion;
+        try {
+          const latest = crossHostFolderOrderSchema.parse(await this.http("/api/cross-host-folder-order", { signal: timeoutSignal(20_000) }));
+          await this.acceptCrossHostFolderOrder(latest, generation, true, observedVersion);
+        } catch { /* keep last confirmed view */ }
+      }
+      throw error;
+    }
+  }
+  private acceptConversationPins(
+    value: ConversationPinsState,
+    generation: number,
+    authoritative = false,
+    observedVersion?: number,
+    options?: { markMigrated?: boolean; clearPending?: readonly PendingPinChange[] },
+  ): Promise<void> {
+    const work = this.pinUpdates.then(async () => {
+      if (this.closed || generation !== this.generation || !this.cache.acceptConversationPins) return;
+      const replace = authoritative && (observedVersion === undefined || observedVersion === this.pinVersion);
+      if (!replace && !options?.markMigrated && !options?.clearPending?.length && value.revision < (this.state.conversationPins?.revision ?? 0)) return;
+      const outcome = await this.cache.acceptConversationPins(value, this.identity, replace, options);
+      if (this.closed || generation !== this.generation) return;
+      if (outcome.accepted) {
+        this.pinVersion++;
+        this.update({ conversationPins: value }, true);
+      } else if (outcome.cacheChanged) {
+        this.update({}, true);
+      }
+    });
+    this.pinUpdates = work.catch(() => undefined);
+    return work;
+  }
+  private syncPinsWithHost(generation: number): Promise<void> {
+    if (generation !== this.generation) return this.pinSyncQueue;
+    if (generation > this.pinSyncTargetGeneration) this.pinSyncTargetGeneration = generation;
+    if (this.pinSyncPending) return this.pinSyncQueue;
+    this.pinSyncPending = true;
+    const work = this.pinSyncQueue.then(async () => {
+      this.pinSyncPending = false;
+      const targetGeneration = this.pinSyncTargetGeneration;
+      await this.runPinSync(targetGeneration);
+    });
+    this.pinSyncQueue = work.catch(() => { this.pinSyncPending = false; });
+    return work;
+  }
+  private async runPinSync(generation: number): Promise<void> {
+    if (!this.cache.conversationPins || !this.cache.pendingPinChanges || !this.cache.acceptConversationPins) return;
+    let conflicts = 0;
+    let triedTrimmedMerge = false;
+    let trimmedMergePayload: { pins: string[]; globalPins: string[] } | undefined;
+    for (let step = 0; step < 256; step++) {
+      if (this.closed || generation !== this.generation || this.state.status !== "online" || !this.state.pinsAvailable || !this.token) return;
+      await this.pinUpdates;
+      if (this.closed || generation !== this.generation || this.state.status !== "online" || !this.state.pinsAvailable || !this.token) return;
+      const [synced, preUpgrade, pending] = await Promise.all([
+        this.cache.conversationPins(),
+        this.cache.preUpgradePins?.() ?? Promise.resolve(undefined),
+        this.cache.pendingPinChanges(),
+      ]);
+      if (!synced || preUpgrade) {
+        const base = synced ?? this.state.conversationPins ?? emptyConversationPins();
+        const mergeSource = trimmedMergePayload ?? preUpgrade ?? {
+          pins: await this.cache.pins("group"),
+          globalPins: await this.cache.pins("global"),
+        };
+        if (!mergeSource.pins.length && !mergeSource.globalPins.length) {
+          await this.acceptConversationPins(base, generation, false, undefined, { markMigrated: true });
+          trimmedMergePayload = undefined;
+          conflicts = 0;
+          continue;
+        }
+        try {
+          const next = conversationPinsSchema.parse(await this.http("/api/conversation-pins", {
+            method: "PATCH",
+            body: JSON.stringify({ type: "merge", revision: base.revision, pins: mergeSource.pins, globalPins: mergeSource.globalPins }),
+            signal: timeoutSignal(20_000),
+          }));
+          await this.acceptConversationPins(next, generation, false, undefined, { markMigrated: true });
+          trimmedMergePayload = undefined;
+          conflicts = 0;
+          continue;
+        } catch (error) {
+          if (error instanceof HubHttpError && error.code === "pins_changed" && !this.closed && generation === this.generation) {
+            if (++conflicts > 8) return;
+            const observedVersion = this.pinVersion;
+            try {
+              const latest = conversationPinsSchema.parse(await this.http("/api/conversation-pins", { signal: timeoutSignal(20_000) }));
+              await this.acceptConversationPins(latest, generation, true, observedVersion);
+              continue;
+            } catch { return; }
+          }
+          if (isPermanentPinRejection(error) && !this.closed && generation === this.generation) {
+            const observedVersion = this.pinVersion;
+            let latest: ConversationPinsState | undefined;
+            try {
+              latest = conversationPinsSchema.parse(await this.http("/api/conversation-pins", { signal: timeoutSignal(20_000) }));
+            } catch { /* fallback to base */ }
+            if (error instanceof HubHttpError && error.code === "pin_limit" && !triedTrimmedMerge && latest) {
+              triedTrimmedMerge = true;
+              await this.acceptConversationPins(latest, generation, true, observedVersion);
+              const existingPins = new Set(latest.pins);
+              const existingGlobal = new Set(latest.globalPins);
+              const trimmedPins = mergeSource.pins.filter(id => !existingPins.has(id)).slice(0, Math.max(0, 2048 - latest.pins.length));
+              const trimmedGlobal = mergeSource.globalPins.filter(id => !existingGlobal.has(id)).slice(0, Math.max(0, 2048 - latest.globalPins.length));
+              if (trimmedPins.length || trimmedGlobal.length) {
+                trimmedMergePayload = { pins: trimmedPins, globalPins: trimmedGlobal };
+                continue;
+              }
+            }
+            if (latest) {
+              await this.acceptConversationPins(latest, generation, true, observedVersion, { markMigrated: true });
+            } else {
+              await this.acceptConversationPins(base, generation, false, undefined, { markMigrated: true });
+            }
+            trimmedMergePayload = undefined;
+            conflicts = 0;
+            continue;
+          }
+          return;
+        }
+      }
+      if (!pending.length) return;
+      const epoch = this.authenticatedSessionEpoch;
+      const isLiveItem = (item: PendingPinChange): boolean => {
+        if (item.seq === undefined) return false;
+        const live = this.livePinChanges.get(`${item.scope}:${item.conversationId}`);
+        return !!live && live.seq === item.seq && live.epoch === epoch;
+      };
+      const offlineItems = pending.filter(item => !isLiveItem(item));
+      const liveItems = pending.filter(isLiveItem);
+      const batch: PendingPinChange[] = offlineItems.length ? offlineItems : [liveItems[0]!];
+      const singleLive = !offlineItems.length ? liveItems[0]! : undefined;
+      try {
+        const body = singleLive
+          ? { type: "set" as const, revision: synced.revision, scope: singleLive.scope, conversationId: singleLive.conversationId, pinned: singleLive.pinned }
+          : { type: "reconcile" as const, revision: synced.revision, changes: offlineItems.map(({ scope, conversationId, pinned, at }) => ({ scope, conversationId, pinned, at })) };
+        const next = conversationPinsSchema.parse(await this.http("/api/conversation-pins", {
+          method: "PATCH",
+          body: JSON.stringify(body),
+          signal: timeoutSignal(20_000),
+        }));
+        if (singleLive) {
+          const key = `${singleLive.scope}:${singleLive.conversationId}`;
+          if (this.livePinChanges.get(key)?.seq === singleLive.seq) this.livePinChanges.delete(key);
+        }
+        await this.acceptConversationPins(next, generation, false, undefined, { clearPending: batch });
+        conflicts = 0;
+      } catch (error) {
+        if (error instanceof HubHttpError && error.code === "pins_changed" && !this.closed && generation === this.generation) {
+          if (++conflicts > 8) return;
+          const observedVersion = this.pinVersion;
+          try {
+            const latest = conversationPinsSchema.parse(await this.http("/api/conversation-pins", { signal: timeoutSignal(20_000) }));
+            await this.acceptConversationPins(latest, generation, true, observedVersion);
+            continue;
+          } catch { return; }
+        }
+        if (isPermanentPinRejection(error) && !this.closed && generation === this.generation) {
+          if (singleLive) {
+            const key = `${singleLive.scope}:${singleLive.conversationId}`;
+            if (this.livePinChanges.get(key)?.seq === singleLive.seq) this.livePinChanges.delete(key);
+          }
+          await this.acceptConversationPins(synced, generation, false, undefined, { clearPending: batch });
+          try {
+            const observedVersion = this.pinVersion;
+            const latest = conversationPinsSchema.parse(await this.http("/api/conversation-pins", { signal: timeoutSignal(20_000) }));
+            await this.acceptConversationPins(latest, generation, true, observedVersion);
+          } catch { /* keep synced snapshot */ }
+          conflicts = 0;
+          continue;
+        }
+        return;
+      }
+    }
   }
   async batchConversations(input: ConversationBatch) {
     if (this.state.status !== 'online' || !this.state.conversationBatchAvailable) throw new Error(t('连接恢复并升级此主机后可批量整理对话。'));
@@ -1510,5 +1781,5 @@ export class HubConnection {
     this.close(true); this.update({ error: t("此设备已被吊销，请重新配对"), routeDiagnosis: undefined });
     await this.cache.markIdentityRevoked(this.identity).catch(() => console.warn("device_revocation_cache_failed"));
   }
-  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); window.removeEventListener(NATIVE_ACTIVE_EVENT, this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
+  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.livePinChanges.clear(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); window.removeEventListener(NATIVE_ACTIVE_EVENT, this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
 }

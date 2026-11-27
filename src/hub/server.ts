@@ -54,6 +54,8 @@ import { RUN_CHANGES_CAPABILITY, runChangesQuerySchema, runChangeFileQuerySchema
 import { RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY } from "../client-protocol/run.js";
 import { BACKGROUND_TASK_GROUP_CAPABILITY } from "../client-protocol/background-task-group.js";
 import { ConversationFolders } from "./conversation-folders.js";
+import { ConversationPins } from "./conversation-pins.js";
+import { CrossHostFolderOrder } from "./cross-host-folder-order.js";
 import { HostProfile } from "./host-profile.js";
 import { hostNameSchema } from "../client-protocol/host-profile.js";
 import { PrivateNetwork } from "./private-network.js";
@@ -340,6 +342,8 @@ export class HubServer {
   private disposers: (() => void)[] = [];
   private syncLineage?: string;
   private readonly conversationFolders: ConversationFolders;
+  private readonly conversationPins: ConversationPins;
+  private readonly crossHostFolderOrder: CrossHostFolderOrder;
   private readonly avatars: HubAvatars;
   private constructor(readonly store: HubStore, readonly auth: HubAuth, readonly attachments: HubAttachments, readonly options: HubServerOptions) {
     this.conversationHistory = new HubConversationHistory(store, {
@@ -406,6 +410,8 @@ export class HubServer {
       stop: (botId, conversationId, messageId) => this.callBot(botId, "stop", { conversationId, messageId }),
     });
     this.conversationFolders = new ConversationFolders(store.db);
+    this.conversationPins = new ConversationPins(store.db);
+    this.crossHostFolderOrder = new CrossHostFolderOrder(store.db);
     this.avatars = new HubAvatars(store);
     this.linkPreviews = new HubLinkPreviews(store, attachments);
     this.savedWorkspaces = new SavedWorkspaces(store);
@@ -1033,8 +1039,10 @@ export class HubServer {
           // copy of every conversation/avatar/history merely to list Bots.
           // Authentication and all subsequent HTTP authorization are unchanged.
           if (client.capabilities.includes("management.v1")) {
+            const user = await this.store.user(session.userId);
+            const bots = listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities);
             await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES,
-              uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations: [], avatars: [] });
+              uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user, bots, conversations: [], avatars: [] });
             client.readySent = true; client.syncing = false;
             client.pendingPublications.length = 0; client.pendingSync.clear();
             await this.sendClient(client, { v: 1, type: "sync.complete" }); return;
@@ -1047,7 +1055,18 @@ export class HubServer {
             this.options.onWarning?.("conversation_folders_unavailable");
             return undefined;
           });
-          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user: await this.store.user(session.userId), bots: listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities), conversations, ...(conversationFolders ? { conversationFolders } : {}), avatars: await this.avatars.list(session.userId, session) });
+          const conversationPins = await this.conversationPins.read(session.userId).catch(() => {
+            this.options.onWarning?.("conversation_pins_unavailable");
+            return undefined;
+          });
+          const crossHostFolderOrder = await this.crossHostFolderOrder.read(session.userId).catch(() => {
+            this.options.onWarning?.("cross_host_folder_order_unavailable");
+            return undefined;
+          });
+          const user = await this.store.user(session.userId);
+          const bots = listedBots(await this.store.bots(session.userId, client.capabilities.includes("bots.delete.v1")), client.capabilities);
+          const avatars = await this.avatars.list(session.userId, session);
+          await this.sendClient(client, { v: 1, type: "ready", sessionToken: session.token, expiresAt: session.expiresAt, serverTime: Date.now(), serverCapabilities: SERVER_CAPABILITIES, uploadLimits: { maxFileBytes: this.attachments.maxFileBytes, chunkBytes: CHUNK_BYTES }, user, bots, conversations, ...(conversationFolders ? { conversationFolders } : {}), ...(conversationPins ? { conversationPins } : {}), ...(crossHostFolderOrder ? { crossHostFolderOrder } : {}), avatars });
           while (client.pendingPublications.length) await this.sendClient(client, client.pendingPublications.shift());
           client.readySent = true;
           if (client.capabilities.includes(CONVERSATION_SYNC_CAPABILITY)) {
@@ -1990,6 +2009,28 @@ export class HubServer {
           const folders = await this.conversationFolders.change(userId, await this.jsonBody(req), validateInQueue);
           for (const client of this.clients) if (client.session?.userId === userId) this.publishClient(client, { v: 1, type: "conversation-folders.updated", folders });
           await reply(200, folders);
+        }
+        return;
+      }
+      if (route === "/api/conversation-pins" && (req.method === "GET" || req.method === "PATCH")) {
+        if (req.method === "GET") await reply(200, await this.conversationPins.read(userId, validateInQueue));
+        else {
+          const result = await this.conversationPins.change(userId, await this.jsonBody(req), validateInQueue);
+          if (result.changed) {
+            for (const client of this.clients) if (client.session?.userId === userId) this.publishClient(client, { v: 1, type: "conversation-pins.updated", pins: result.state });
+          }
+          await reply(200, result.state);
+        }
+        return;
+      }
+      if (route === "/api/cross-host-folder-order" && (req.method === "GET" || req.method === "PATCH")) {
+        if (req.method === "GET") await reply(200, await this.crossHostFolderOrder.read(userId, validateInQueue));
+        else {
+          const result = await this.crossHostFolderOrder.change(userId, await this.jsonBody(req), validateInQueue);
+          if (result.changed) {
+            for (const client of this.clients) if (client.session?.userId === userId) this.publishClient(client, { v: 1, type: "cross-host-folder-order.updated", order: result.state });
+          }
+          await reply(200, result.state);
         }
         return;
       }

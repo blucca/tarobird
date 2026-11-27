@@ -65,6 +65,8 @@ export type MobileHomeProps = {
   changeGroupByHost?: (value: boolean) => void;
   notice?: ReactNode;
   hosts: MobileHost[];
+  /** Total registered non-blocked hosts (keeps combined cross-host mode stable while another host transitions). */
+  registeredHostCount?: number;
   activeHostId: string;
   tab: MobileTab;
   setTab: (value: MobileTab) => void;
@@ -148,7 +150,8 @@ export const MobileHome = memo(function MobileHome(props: MobileHomeProps) {
 }, (previous, next) => previous.visible === false && next.visible === false);
 
 const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
-  const { hosts, activeHostId, tab, setTab, create } = props;
+  const { hosts, registeredHostCount, activeHostId, tab, setTab, create } = props;
+  const totalHosts = Math.max(hosts.length, registeredHostCount ?? 0);
   const locale = useLocale();
   const [localInbox, setLocalInbox] = useState<MobileInboxState>({ query: '', filter: 'all' });
   // The inbox lists every host, so its filters belong to the device shell,
@@ -268,7 +271,7 @@ const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
         </div>
         {searching && <SearchField key={tab} inputRef={searchInput} value={query} onChange={setQuery} close={closeSearch} scoped={tab === 'messages' && !!botScope} />}
         {tab === 'messages' && <div className="mh-filter-toolbar"><FilterBar value={filter} onChange={setFilter}/><MobileListOptions
-          hosts={hosts} activeHostId={activeHostId} scopedHostId={botScope?.hostId} visible={visible} disabled={!!bulk?.active}
+          hosts={hosts} registeredHostCount={totalHosts} activeHostId={activeHostId} scopedHostId={botScope?.hostId} visible={visible} disabled={!!bulk?.active}
           groupByHost={props.groupByHost ?? false} changeGroupByHost={props.changeGroupByHost}
           showDisconnectedBots={props.showDisconnectedBots ?? false} changeShowDisconnectedBots={props.changeShowDisconnectedBots}
         /></div>}
@@ -320,14 +323,14 @@ type PaneProps = MobileHomeProps & {
 };
 
 function MessagesPane({
-  hosts, rows, hiddenConversations, activeHost, needle, query, filter, locale, select, newChat, settingsBot, create, open, searchHistory, botScope, botCounts, browseBot, openActions, groupByHost = false, showDisconnectedBots = false, visible: paneVisible = true,
+  hosts, registeredHostCount, rows, hiddenConversations, activeHost, needle, query, filter, locale, select, newChat, settingsBot, create, open, searchHistory, botScope, botCounts, browseBot, openActions, groupByHost = false, showDisconnectedBots = false, visible: paneVisible = true,
 }: PaneProps) {
   useHostFolderUpdates(hosts);
   const crossHostOrder = useCrossHostFolderOrder();
   if (hosts.length === 0) {
     return <EmptyState text={t('还没有可用的主机')} action={{ label: t('主机管理'), onClick: () => open('hosts') }} />;
   }
-  const multiHost = hosts.length > 1;
+  const multiHost = Math.max(hosts.length, registeredHostCount ?? 0) > 1;
   const grouped = multiHost && groupByHost && !botScope;
   const connectedBotAvailable = hosts.some(host => (!botScope || host.id === botScope.hostId)
     && host.connection.state.status === 'online' && host.bots.some(bot => bot.online && (!botScope || bot.id === botScope.botId)));

@@ -2,7 +2,48 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { conversationSchema } from '../client-protocol/index.js';
 import { CONVERSATION_BATCH_CAPABILITY, CONVERSATION_RESTORE_CAPABILITY, conversationBatchSchema, conversationBatchResultSchema } from '../client-protocol/conversation-batch.js';
+import { CONVERSATION_PINS_CAPABILITY, conversationPinsSchema, pinChangeSchema } from '../client-protocol/conversation-pins.js';
 import { HostCliError, type LocalHostClient } from './client.js';
+
+export async function runConversationPinsCommand(
+  client: Pick<LocalHostClient, 'request' | 'ready'>,
+  action: 'pins' | 'pin',
+  id: string | undefined,
+  flags: { global?: boolean; enabled?: string; revision?: string },
+) {
+  const route = '/api/conversation-pins';
+  if (!client.ready.serverCapabilities.includes(CONVERSATION_PINS_CAPABILITY)) throw new Error('请更新主机后使用同步置顶。');
+  if (action === 'pins') {
+    if (id !== undefined || flags.global !== undefined || flags.enabled !== undefined || flags.revision !== undefined) {
+      throw new Error('conversations pins 不接受修改参数。');
+    }
+    return conversationPinsSchema.parse(await client.request(route));
+  }
+  if (!id) throw new Error('请指定对话 ID。');
+  if (!['on', 'off'].includes(flags.enabled ?? '') || !/^\d+$/.test(flags.revision ?? '')) {
+    throw new Error('先用 conversations pins 读取 revision，再用 --enabled on|off --revision N 提交。');
+  }
+  const command = pinChangeSchema.parse({
+    type: 'set',
+    scope: flags.global ? 'global' : 'group',
+    conversationId: id,
+    pinned: flags.enabled === 'on',
+    revision: Number(flags.revision),
+  });
+  try {
+    return conversationPinsSchema.parse(await client.request(route, 'PATCH', command));
+  } catch (error) {
+    if (error instanceof HostCliError) {
+      const hints: Record<string, string> = {
+        pins_changed: '置顶状态已在其他设备更新，先运行 conversations pins 读取最新 revision 再重试。',
+        conversation_not_available: '对话已归档、不可用或无权访问，请用 conversations local 核对可用 ID。',
+        pin_limit: '置顶对话数量已达上限。',
+      };
+      if (hints[error.code]) error.message = `${error.code}：${hints[error.code]}`;
+    }
+    throw error;
+  }
+}
 
 export async function runConversationsCommand(client: Pick<LocalHostClient, 'request' | 'ready'>, action: string | undefined,
   flags: { ids?: string; yes?: boolean; folder?: string; unfiled?: boolean; newFolder?: string; revision?: string; requestId?: string },
