@@ -142,7 +142,7 @@ const BOT_RPC_TIMEOUT_MS = 10_000;
  * successful refresh is not reported as an unconfirmed save. */
 export const BOT_MODEL_SETTINGS_RPC_TIMEOUT_MS = 15_000;
 type SnapshotTransfer = { id: string; sent: number; received: number; bytes: number; pending: { count: number; bytes: number }[]; changed?: () => void };
-type Client = { foreground: boolean; ws: WebSocket; session?: AuthSession; rejected?: "device_revoked" | "session_expired"; capabilities: string[]; cursors: Record<string, number>; syncLineages: Record<string, string>; conversationIds: Set<string>; readySent: boolean; pendingPublications: unknown[]; syncing: boolean; pendingSync: Set<string>; syncingConversations: Set<string>; syncFailures: Set<string>; streams: Map<string, Message>; snapshot?: SnapshotTransfer };
+type Client = { foreground: boolean; lastSeenAt: number; ws: WebSocket; session?: AuthSession; rejected?: "device_revoked" | "session_expired"; capabilities: string[]; cursors: Record<string, number>; syncLineages: Record<string, string>; conversationIds: Set<string>; readySent: boolean; pendingPublications: unknown[]; syncing: boolean; pendingSync: Set<string>; syncingConversations: Set<string>; syncFailures: Set<string>; streams: Map<string, Message>; snapshot?: SnapshotTransfer };
 /** Older gateways parse turn metadata strictly and predate design.open: give
  * them the context exactly as an older App would have frozen it. */
 function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(metadata: T, designOpen: boolean): T {
@@ -153,7 +153,7 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
 type BotConnection = { botSteer: boolean; engineQuota: boolean; contextUsage: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
-export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
+export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; /** Max silence before a foreground client socket stops suppressing pushes. */ foregroundTimeoutMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
 export class HubServer {
   private readonly relaySources: RelaySources;
   private readonly fragmentSockets = new WeakSet<WebSocket>();
@@ -405,7 +405,11 @@ export class HubServer {
       return result;
     });
     const pushSender = createPushSender(options.push ?? {}), pushHostId = `hub_${createHash("sha256").update(Buffer.from(this.auth.publicKey, "base64")).digest("hex")}`;
-    this.pushWorker = new PushWorker(store, (subscription, payload) => pushSender(subscription, { ...payload, hostId: pushHostId }), (deviceId) => [...this.clients].some((c) => c.session?.deviceId === deviceId && c.foreground && c.ws.readyState === WebSocket.OPEN));
+    const foregroundTimeoutMs = options.foregroundTimeoutMs ?? 20_000;
+    this.pushWorker = new PushWorker(store, (subscription, payload) => pushSender(subscription, { ...payload, hostId: pushHostId }), (deviceId) => {
+      const now = Date.now();
+      return [...this.clients].some((c) => c.session?.deviceId === deviceId && c.foreground && c.ws.readyState === WebSocket.OPEN && now - c.lastSeenAt <= foregroundTimeoutMs);
+    });
     this.http = options.tls ? createTlsServer(options.tls) : createServer();
     this.attachListener(this.http, options.host ?? "127.0.0.1", options.port ?? 0, !!options.tls, !options.tls, options.exposure);
     if (options.tls) this.attachListener(createServer(), "127.0.0.1", options.instancePort ?? 0, false, true);
@@ -894,7 +898,7 @@ export class HubServer {
   }
   private clientSocket(ws: WebSocket, source: string): void {
     const id = newId("connection");
-    const client: Client = { foreground: false, ws, capabilities: [], cursors: {}, syncLineages: {}, conversationIds: new Set(), readySent: false, pendingPublications: [], syncing: true, pendingSync: new Set(), syncingConversations: new Set(), syncFailures: new Set(), streams: new Map() };
+    const client: Client = { foreground: false, lastSeenAt: Date.now(), ws, capabilities: [], cursors: {}, syncLineages: {}, conversationIds: new Set(), readySent: false, pendingPublications: [], syncing: true, pendingSync: new Set(), syncingConversations: new Set(), syncFailures: new Set(), streams: new Map() };
     this.clients.add(client);
     const timeout = setTimeout(() => { if (!client.session) ws.close(4001, "auth_timeout"); }, 30_000); timeout.unref();
     let hello: Extract<ClientFrame, { type: "hello" }> | undefined;
@@ -929,6 +933,7 @@ export class HubServer {
     };
     ws.on("message", (data, binary) => {
       if (this.stopping) return;
+      client.lastSeenAt = Date.now();
       // Authentication catch-up can span many frames. Keep liveness probes out
       // of its request queue, or healthy large syncs look like broken routes.
       if (client.session && !binary && data.toString().length < 512) {
