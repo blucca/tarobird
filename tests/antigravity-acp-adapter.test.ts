@@ -1533,4 +1533,22 @@ describe("AntigravityAcpAdapter inactivity watchdog", () => {
     await expect(settleWithin(reply, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
     expect(harness.log).toContain("kill:900");
   });
+  it("preserves user-initiated /plan mode across follow-up clarifications until agy returns to default", async () => {
+    const first = adapter.sendUserMessage("tarobot-1", { text: "/plan refactor auth", files: [] });
+    expect(promptBlocks(server, 0)[0]).toEqual({ type: "text", text: "/plan refactor auth" });
+    server.sendUpdate({ sessionUpdate: "current_mode_update", currentModeId: "plan" });
+    server.text("Question 1: OAuth or JWT?");
+    // Follow-up reply during active /plan must NOT reset mode back to default prematurely.
+    const second = adapter.sendUserMessage(SESSION_A, { text: "Use JWT", files: [] });
+    expect(server.requests("session/set_mode")).toHaveLength(0);
+    server.sendUpdate({ sessionUpdate: "current_mode_update", currentModeId: "default" });
+    server.text("Plan approved and executed.");
+    await settleWithin(second);
+    // Once agy returned to default, an unexpected non-default mode on a later turn is reset again.
+    server.sendUpdate({ sessionUpdate: "current_mode_update", currentModeId: "plan" });
+    const third = adapter.sendUserMessage(SESSION_A, { text: "ordinary follow-up", files: [] });
+    await waitFor(() => server.prompts.length === 3);
+    expect(server.requests("session/set_mode").map((m) => m.params)).toEqual([{ sessionId: SESSION_A, modeId: "default" }]);
+    server.text("done");
+    await settleWithin(third);
 });

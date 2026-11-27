@@ -37,6 +37,7 @@ import { FileWorkflowStore, type FileWorkflowStatus } from "../state/file-workfl
 import { SessionStore } from "../state/session-store.js";
 import { UsageStore } from "../state/usage-store.js";
 import { handleCronCommand, isCronCommand } from "./shared/cron-commands.js";
+import { parseAntigravityLocalCommand, renderAntigravityLocalCommandReply } from "./shared/antigravity-commands.js";
 import { handleLocalEngineCoreCommand } from "./shared/engine-commands.js";
 import {
   ANTIGRAVITY_EFFORT_LEVELS,
@@ -174,6 +175,16 @@ export async function handleCoreSimpleCommand(
 
   if (await handleCoreLocalEngineCommand(input, normalized, commandText, commandLocale)) {
     return true;
+  }
+
+  const agyLocalAction = parseAntigravityLocalCommand(commandText);
+  if (agyLocalAction) {
+    const cfg = await loadInstanceConfig(input.stateDir);
+    if (cfg.engine === "antigravity") {
+      const { commandLabel, markdown } = await renderAntigravityLocalCommandReply(agyLocalAction, commandLocale);
+      await sendCoreCommandMarkdown(input, normalized, commandLabel, markdown);
+      return true;
+    }
   }
 
   const goalCfg = /^\/goal(?:\s|$)/i.test(commandText.trim()) ? await loadInstanceConfig(input.stateDir) : undefined;
@@ -1041,7 +1052,7 @@ function parseCoreGoalCommand(text: string, engine: InstanceEngine): CoreGoalCom
   if (!match) return null;
   const rest = match[1]?.trim() ?? "";
   if (!rest || /^status$/i.test(rest)) return { kind: "status" };
-  if (/^(clear|off|reset)$/i.test(rest) || (engine === "claude" && /^(stop|cancel|none)$/i.test(rest))) return { kind: "clear" };
+  if (/^(clear|off|reset)$/i.test(rest) || ((engine === "claude" || engine === "antigravity") && /^(stop|cancel|none)$/i.test(rest))) return { kind: "clear" };
   if (engine === "codex") {
     if (/^(pause|resume)$/i.test(rest)) return { kind: rest.toLowerCase() as "pause" | "resume" };
     if (/^(pause|resume)\s/i.test(rest)) return { kind: "invalid", reason: "invalid_control" };
@@ -2407,8 +2418,8 @@ function toNativeCoreGoalCommandText(
   commandText: string,
   engine: "claude" | "antigravity",
 ): string | null {
-  if (engine === "claude" && action.kind === "status") return "/goal";
-  if (engine === "claude" && action.kind === "clear") return "/goal clear";
+  if ((engine === "claude" || engine === "antigravity") && action.kind === "status") return "/goal";
+  if ((engine === "claude" || engine === "antigravity") && action.kind === "clear") return "/goal clear";
   if (action.kind !== "set") return commandText.trim();
   if (action.tokenBudget === null) {
     return `/goal ${action.objective}`;
