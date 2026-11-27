@@ -292,6 +292,44 @@ describe("KimiAcpAdapter account quota lifecycle (#76)", () => {
     }
   });
 
+  it("resolves the Kimi home and KIMI_* variables the Windows way on win32, like the other engines (#168)", async () => {
+    const f = await kimiFixture();
+    const winProfile = path.join(f.root, "win-profile"), msysHome = path.join(f.root, "msys-home"), emptyProfile = path.join(f.root, "empty-profile");
+    const tokenFile = path.join(winProfile, ".kimi-code", "credentials", "kimi-code.json");
+    await mkdir(path.dirname(tokenFile), { recursive: true });
+    await mkdir(msysHome, { recursive: true });
+    await mkdir(emptyProfile, { recursive: true });
+    await writeFile(tokenFile, '{"access_token":"acct-a"}');
+
+    // Git for Windows / MSYS may set HOME elsewhere; the login under USERPROFILE is the one Kimi uses.
+    const win = new AdapterQuotaCache("kimi", "kimi", { HOME: msysHome, UserProfile: winProfile, KIMI_API_KEY: "sk-synthetic-only" }, f.root, undefined, "win32");
+    const first = win.capture("process");
+    expect(first).toMatchObject({ verifiable: true, authMode: "subscription" });
+    await writeFile(tokenFile, '{"access_token":"acct-b"}');
+    const bumped = new Date(Date.now() + 2000);
+    await utimes(tokenFile, bumped, bumped);
+    expect(win.capture("process").revision).not.toBe(first.revision);
+    // The same environment read the POSIX way finds no login under HOME: an API key alone.
+    expect(new AdapterQuotaCache("kimi", "kimi", { HOME: msysHome, USERPROFILE: winProfile, KIMI_API_KEY: "sk-synthetic-only" }, f.root, undefined, "linux").capture("process").authMode).toBe("api_key");
+
+    // Windows environment names are case-insensitive.
+    expect(new AdapterQuotaCache("kimi", "kimi", { USERPROFILE: emptyProfile, Kimi_Api_Key: "sk-synthetic-only" }, f.root, undefined, "win32").capture("process").authMode).toBe("api_key");
+    expect(new AdapterQuotaCache("kimi", "kimi", { HOME: emptyProfile, Kimi_Api_Key: "sk-synthetic-only" }, f.root, undefined, "linux").capture("process").authMode).toBe("subscription");
+    expect(new AdapterQuotaCache("kimi", "kimi", { USERPROFILE: emptyProfile, Kimi_Code_Home: path.join(winProfile, ".kimi-code"), KIMI_API_KEY: "sk-synthetic-only" }, f.root, undefined, "win32").capture("process").authMode).toBe("subscription");
+    // One cache (one key), one environment object changed in place: only then do two revisions compare.
+    const winEnv: NodeJS.ProcessEnv = { USERPROFILE: emptyProfile, Kimi_Code_Base_Url: "https://a.example" };
+    const winCache = new AdapterQuotaCache("kimi", "kimi", winEnv, f.root, undefined, "win32");
+    const winBefore = winCache.capture("process").revision;
+    expect(winCache.capture("process").revision).toBe(winBefore);
+    winEnv.Kimi_Code_Base_Url = "https://b.example";
+    expect(winCache.capture("process").revision).not.toBe(winBefore);
+    const posixEnv: NodeJS.ProcessEnv = { HOME: emptyProfile, Kimi_Code_Base_Url: "https://a.example" };
+    const posixCache = new AdapterQuotaCache("kimi", "kimi", posixEnv, f.root, undefined, "linux");
+    const posixBefore = posixCache.capture("process").revision;
+    posixEnv.Kimi_Code_Base_Url = "https://b.example";
+    expect(posixCache.capture("process").revision).toBe(posixBefore);
+  });
+
   it("clears cached pools when a revoked token returns a statusless OAuthUnauthorizedError", async () => {
     const f = await kimiFixture();
     let mode: "ok" | "revoked" = "ok";

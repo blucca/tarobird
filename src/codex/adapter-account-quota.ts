@@ -162,7 +162,7 @@ export class AdapterQuotaCache {
       : this.engine === "claude"
         ? readPlatformEnv(this.env, "CLAUDE_CONFIG_DIR", this.platform)?.trim() || path.join(home, ".claude")
         : this.engine === "kimi"
-          ? this.env.KIMI_CODE_HOME || path.join(home, ".kimi-code")
+          ? readPlatformEnv(this.env, "KIMI_CODE_HOME", this.platform) || path.join(home, ".kimi-code")
           : path.join(home, ".gemini", "antigravity-cli");
     let authMode: QuotaAuthMode = "unknown", verifiable = false;
     let material: unknown;
@@ -223,16 +223,18 @@ export class AdapterQuotaCache {
           || metaFiles[3] !== "missing"
           || metaFiles[6] !== "missing"
           || metaFiles[7] !== "missing";
-        const hasApiKeyOnly = Boolean(this.env.KIMI_API_KEY) && !hasCredentialFiles;
+        // Windows environment names are case-insensitive; the same lookup as the other engines (#168).
+        const kimiEnv = (key: string) => readPlatformEnv(this.env, key, this.platform);
+        const hasApiKeyOnly = Boolean(kimiEnv("KIMI_API_KEY")) && !hasCredentialFiles;
         const envFlags = [
-          Boolean(this.env.KIMI_API_KEY),
-          this.env.KIMI_CODE_HOME ?? "",
-          this.env.KIMI_BASE_URL ?? "",
-          this.env.KIMI_CODE_BASE_URL ?? "",
-          this.env.KIMI_CODE_OAUTH_HOST ?? "",
-          this.env.KIMI_OAUTH_HOST ?? "",
-          this.env.KIMI_CODE_REGION ?? "",
-          this.env.KIMI_REGION ?? "",
+          Boolean(kimiEnv("KIMI_API_KEY")),
+          kimiEnv("KIMI_CODE_HOME") ?? "",
+          kimiEnv("KIMI_BASE_URL") ?? "",
+          kimiEnv("KIMI_CODE_BASE_URL") ?? "",
+          kimiEnv("KIMI_CODE_OAUTH_HOST") ?? "",
+          kimiEnv("KIMI_OAUTH_HOST") ?? "",
+          kimiEnv("KIMI_CODE_REGION") ?? "",
+          kimiEnv("KIMI_REGION") ?? "",
         ];
         authMode = hasApiKeyOnly ? "api_key" : "subscription";
         verifiable = true;
