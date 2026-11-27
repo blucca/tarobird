@@ -15,6 +15,7 @@ import { z } from "zod";
 import { PI_SESSION_CAPABILITY } from "./pi-session.js";
 import { PAIRING_INVITES_CAPABILITY } from "./pairing-invites.js";
 import { ATTACHMENT_ADMIN_CAPABILITY } from "./attachment-admin.js";
+import { SAVED_WORKSPACES_CAPABILITY } from "./saved-workspaces.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -27,7 +28,7 @@ export const fileSizeSchema = z.number().int().positive().max(Number.MAX_SAFE_IN
 export const uploadLimitsSchema = z.object({ maxFileBytes: fileSizeSchema, chunkBytes: z.literal(CHUNK_BYTES) });
 export const CAPABILITIES = [ ATTACHMENT_ADMIN_CAPABILITY, WORKBENCH_DESIGN_SHARE_CAPABILITY, DESIGN_SHARE_CLIENT_CAPABILITY,"desktop.screen.v1", "desktop.screen.quality.v1", DISPATCH_CAPABILITY,WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, PAIRING_INVITES_CAPABILITY, "markdown", "katex", "cards.v1", "runs.v1", "runs.scopes.v1", "runs.tail.v1", "runs.scope-groups.v1", "forms.v1", "streaming.v1", "streaming.card-extra.v1", "snapshot.v1", "snapshot.delta.v1", "sync.conversations.v1", "sync.lineage.v1", "fragments.v1", "auth-status.v1", "conversation-folders.reorder.v1", "conversation-folders.pin.v1", "conversations.batch.v1", "conversations.restore.v1", "conversation-avatars.v1", "bots.delete.v1", "messages.delete.v1", "messages.clear.v1", "prompt-queue.v1", "workspace.diff.v1", "runs.changes.v1", "integrations.asr.v1", "integrations.voice.v2", "widgets.settings.v1", "engines.settings.v1", "backups.settings.v1", "bot-messages.v1", "groups.discussion.v1", "groups.discussion.composer.v1", "groups.discussion.recovery.v1", "groups.reply-guard.v1", "groups.parallel.v1", "conversations.side.v1", "conversations.tasks.v1", "claude.native-input.v1", "private-network.v2", "host-routes.v1", "host-routes.select-lan.v1", "voice", "push.apns", "push.fcm", "push.webpush", "push.unifiedpush"] as const;
 /** Host-only features need no client hello advertisement (legacy hosts cap it at 64). */
-export const SERVER_CAPABILITIES = [...CAPABILITIES, ENGINE_QUOTA_CAPABILITY, PI_SESSION_CAPABILITY, CONVERSATION_HISTORY_CAPABILITY, CONTEXT_USAGE_CAPABILITY, CONVERSATION_BOT_COMMS_CAPABILITY, "desktop.screen.flight.v1"] as const;
+export const SERVER_CAPABILITIES = [...CAPABILITIES, ENGINE_QUOTA_CAPABILITY, PI_SESSION_CAPABILITY, CONVERSATION_HISTORY_CAPABILITY, CONTEXT_USAGE_CAPABILITY, CONVERSATION_BOT_COMMS_CAPABILITY, SAVED_WORKSPACES_CAPABILITY, "desktop.screen.flight.v1"] as const;
 export const idSchema = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
 export const textSchema = z.string().refine((s) => new TextEncoder().encode(s).length <= MAX_TEXT_BYTES, "Text exceeds 200 KiB");
 export const jsonSchema = z.json();
@@ -77,7 +78,7 @@ export const groupDiscussionMessageSchema = z.object({
 }).strict();
 export const messageSchema = z.object({ historyContext: historyContextSchema.optional(), groupDiscussion: groupDiscussionMessageSchema.optional(), botSource: botSourceSchema.optional(), id: idSchema, conversationId: idSchema, authorId: idSchema, authorType: z.enum(["user", "bot", "system"]), mentions: z.array(idSchema).max(64).optional(), blocks: z.array(blockSchema), status: z.enum(["pending", "streaming", "complete", "error", "deleted"]), version: z.number().int().nonnegative(), clientMsgId: idSchema.optional(), replyTo: idSchema.optional(), forwardedFrom: forwardingSchema.optional(), previewUrl: linkUrlSchema.nullable().optional(), previewStyle: linkPreviewStyleSchema.optional(), linkPreview: linkPreviewSchema.optional(), createdAt: z.number().int() });
 export type Message = z.infer<typeof messageSchema>;
-export const conversationSchema = z.object({ historyOrigin: historyOriginSchema.optional(), id: idSchema, type: z.enum(["direct", "group"]), title: z.string().max(256), ownerId: idSchema, parentId: idSchema.optional(), botIds: z.array(idSchema), archived: z.boolean(), sessionId: z.string().optional(), bindingId: idSchema.optional(), createdAt: z.number().int(),
+export const conversationSchema = z.object({ historyOrigin: historyOriginSchema.optional(), id: idSchema, type: z.enum(["direct", "group"]), title: z.string().max(256), ownerId: idSchema, parentId: idSchema.optional(), botIds: z.array(idSchema), archived: z.boolean(), sessionId: z.string().optional(), bindingId: idSchema.optional(), workspacePath: z.string().max(4096).optional(), createdAt: z.number().int(),
   /** dispatch.v1: a dispatcher ticket's worker conversation, kept out of lists. */
   hidden: z.literal(true).optional(), ticket: conversationTicketSchema.optional() });
 export type Conversation = z.infer<typeof conversationSchema>;
@@ -99,7 +100,7 @@ export const clientFrameSchema = z.discriminatedUnion("type", [
   z.object({ ...envelope, type: z.literal("turn.stop"), conversationId: idSchema, botId: idSchema.optional() }),
   z.object({ ...envelope, type: z.literal("read.mark"), conversationId: idSchema, seq: z.number().int().nonnegative() }),
   z.object({ ...envelope, type: z.literal("typing"), conversationId: idSchema }),
-  z.object({ ...envelope, type: z.literal("conversation.create"), clientActionId: idSchema, botIds: z.array(idSchema).min(1).max(32), title: z.string().min(1).max(256), conversationType: z.enum(["direct", "group"]).optional() }),
+  z.object({ ...envelope, type: z.literal("conversation.create"), clientActionId: idSchema, botIds: z.array(idSchema).min(1).max(32), title: z.string().min(1).max(256), conversationType: z.enum(["direct", "group"]).optional(), workspacePath: z.string().trim().min(1).max(4096).optional() }),
   z.object({ ...envelope, type: z.literal("topic.create"), clientActionId: idSchema, groupId: idSchema, title: z.string().trim().min(1).max(256) }),
   z.object({ ...envelope, type: z.literal("conversation.rename"), conversationId: idSchema, title: z.string().min(1).max(256) }),
   z.object({ ...envelope, type: z.literal("conversation.archive"), conversationId: idSchema, archived: z.boolean() }),

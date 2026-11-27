@@ -469,7 +469,7 @@ async function handleCoreLocalEngineCommand(
       role: cfg.role,
       model: cfg.model,
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
-      workspacePath: cfg.workspacePath,
+      workspacePath: input.workspaceOverride ?? normalized.workspaceOverride ?? cfg.workspacePath,
       resume: cfg.resume,
       ...(cfg.antigravityRuntime ? { antigravityRuntime: cfg.antigravityRuntime } : {}),
     },
@@ -505,6 +505,7 @@ async function handleCoreSessionCommand(
       cfg.resume,
     )
     : input.conversationResume ?? undefined;
+  const effectiveWorkspace = input.workspaceOverride ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
   return await handleLocalSessionCoreCommand({
     stateDir: input.stateDir,
     startedAt: Date.now(),
@@ -513,6 +514,7 @@ async function handleCoreSessionCommand(
       engine: cfg.engine,
       resume: cfg.resume,
     },
+    workspaceOverride: effectiveWorkspace,
     normalized: toSessionCommandMessage(normalized, commandText),
     context: {
       api: {
@@ -530,7 +532,7 @@ async function handleCoreSessionCommand(
     scanRecentSessions: input.runtime.sessionRuntime?.scanRecentSessions,
     scanRecentAntigravitySessions: input.runtime.sessionRuntime?.scanRecentAntigravitySessions,
     scanRecentKimiSessions: input.bridge.listExternalSessions
-      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+      ? async () => (await input.bridge.listExternalSessions!({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
           const modifiedAt = new Date(session.updatedAt ?? 0);
           return {
             sessionId: session.sessionId,
@@ -542,7 +544,7 @@ async function handleCoreSessionCommand(
         })
       : undefined,
     scanRecentDeepSeekSessions: input.bridge.listExternalSessions
-      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+      ? async () => (await input.bridge.listExternalSessions!({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
           const modifiedAt = new Date(session.updatedAt ?? 0);
           return {
             sessionId: session.sessionId,
@@ -554,7 +556,7 @@ async function handleCoreSessionCommand(
         })
       : undefined,
     scanRecentPiSessions: input.bridge.listExternalSessions
-      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+      ? async () => (await input.bridge.listExternalSessions!({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
           const modifiedAt = new Date(session.updatedAt ?? 0);
           return {
             sessionId: session.sessionId,
@@ -2434,7 +2436,7 @@ export async function tryHandleCoreGoalControlBeforeQueue(input: CoreCommandInpu
     cfg.resume = warning ? undefined : resolveConversationResume(record, cfg.resume);
     if (!await current()) return false;
     const handled = await applyCoreGoalCommand({ ...input,
-      workspaceOverride: input.workspaceOverride ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
+      workspaceOverride: input.workspaceOverride ?? cfg.resume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
       isCurrentGoalSession: current,
     }, normalized, cfg, action, text, await resolveCoreLocale(input.stateDir));
     return handled ?? false;
@@ -2513,7 +2515,7 @@ async function applyCoreGoalCommand(
     userId: normalized.bridgeUserId,
     chatType: normalized.bridgeChatType,
     conversationKey: normalized.conversationKey,
-    workspaceOverride: input.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
+    workspaceOverride: input.workspaceOverride ?? cfg.resume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
     ...(input.isCurrentGoalSession ? { isCurrentSession: input.isCurrentGoalSession } : {}),
   };
   // activeRuns key for this conversation — shared by the live watcher (which claims

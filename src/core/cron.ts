@@ -146,7 +146,10 @@ export function buildCoreCronExecutor(input: {
         const locale = job.locale === "en" ? "en" : "zh";
         const cfg = await loadInstanceConfig(input.stateDir);
         await applyConversationResumeScope(input.stateDir, conversationKey, cfg);
-        const workspaceOverride = input.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
+        const workspaceOverride = input.workspaceOverride
+          ?? cfg.resume?.workspacePath
+          ?? (await input.channel.conversationWorkspace?.(job.larkChatId!))
+          ?? resolveInstanceWorkspacePath(cfg);
         const budgetExhausted = await checkBudgetAvailability(input.stateDir, cfg.budgetUsd, locale);
         if (budgetExhausted) {
           if (!job.mute) {

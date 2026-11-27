@@ -50,6 +50,16 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
   private readonly conversations = new Map<string, Conversation>();
   private readonly processing = new Set<string>();
   private readonly processingConversations = new Map<string, string>();
+  async conversationWorkspace(conversationId: string): Promise<string | undefined> {
+    const cached = this.conversations.get(conversationId);
+    const known = cached?.ticket?.workspace ?? cached?.workspacePath;
+    if (known) return known;
+    try {
+      const fetched = conversationSchema.parse(await this.transport.request("conversation", { conversationId }));
+      this.conversations.set(fetched.id, fetched);
+      return fetched.ticket?.workspace ?? fetched.workspacePath;
+    } catch { return undefined; }
+  }
   isConversationProcessing(conversationId: string): boolean { return [...this.processingConversations.values()].includes(conversationId); }
   private readonly processingAgentBus = new Map<string, string>();
   private readonly admissions = new Map<string, Promise<void>>();
@@ -304,8 +314,8 @@ export class GatewayChannel implements CoreRuntimeChannelLike {
     // Bot delegation, card label, filename or any other presentation envelope.
     const asrRoutingText = message.authorType === "user" && !message.forwardedFrom && !message.botSource
       ? message.blocks.flatMap(block => block.type === "text" ? [block.text] : []).join("\n") : "";
-    // Hub-owned ticket marker: the worker Bot's config.json stays unchanged.
-    const model = conversation.ticket?.model?.trim(), effort = conversation.ticket?.effort || undefined, workspace = conversation.ticket?.workspace;
+    // Hub-owned ticket marker and conversation-pinned folder: the worker Bot's config.json stays unchanged.
+    const model = conversation.ticket?.model?.trim(), effort = conversation.ticket?.effort || undefined, workspace = conversation.ticket?.workspace ?? conversation.workspacePath;
     return { ...(message.botSource ? { botSource: message.botSource } : {}), ...(model || effort ? { engineOverride: { ...(model ? { model } : {}), ...(effort ? { effort } : {}) } } : {}), ...(workspace ? { workspaceOverride: workspace } : {}), messageId: message.id, chatId: message.conversationId, chatType: conversation.type === "direct" ? "p2p" : "group", senderId: `gwuser_${message.authorId}`, content: prefix + content, asrRoutingText, rawContentType: "text", resources, mentions: [], mentionedBot: conversation.type === "direct" || !!message.mentions?.includes(this.transport.options.botId), mentionAll: false, ...(message.replyTo ? { replyToMessageId: message.replyTo } : {}), createTime: message.createdAt };
   }
   private forgetMessage(id: string): void {

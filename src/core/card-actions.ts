@@ -1269,10 +1269,12 @@ export async function handleCoreCardAction(input: {
         : cfg.engine === "deepseek"
           ? "deepseek"
           : "claude";
+    const conversationWorkspace = await input.channel.conversationWorkspace?.(input.event.chatId);
+    const effectiveWorkspace = conversationWorkspace ?? resolveInstanceWorkspacePath(cfg);
     const sessions = kind === "antigravity"
       ? await scanRecentAntigravityConversations(24)
       : (kind === "kimi" || kind === "deepseek" || kind === "pi") && input.bridge?.listExternalSessions
-        ? (await input.bridge.listExternalSessions({ limit: 20 })).map((session) => {
+        ? (await input.bridge.listExternalSessions({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
             const modifiedAt = new Date(session.updatedAt ?? 0);
             return {
               sessionId: session.sessionId,
@@ -1345,7 +1347,10 @@ export async function handleCoreCardAction(input: {
         return true;
       }
       try {
-        const validated = await validateHarnessSession(value.sessionId);
+        const conversationWorkspace = (await input.channel.conversationWorkspace?.(input.event.chatId)) ?? resolveInstanceWorkspacePath(currentConfig);
+        const validated = conversationWorkspace
+          ? await validateHarnessSession(value.sessionId, { workspaceOverride: conversationWorkspace })
+          : await validateHarnessSession(value.sessionId);
         if (!validated?.cwd) {
           throw new Error(`${engineName} session workspace is unavailable`);
         }
@@ -2543,7 +2548,9 @@ async function runCoreCardChoice(input: {
     // Card-driven turns must see the CONVERSATION's resumed workspace, not the
     // raw instance config — see applyConversationResumeScope.
     await applyConversationResumeScope(input.stateDir, input.conversationKey, cfg);
-    const workspaceOverride = resolveInstanceWorkspacePath(cfg);
+    const workspaceOverride = cfg.resume?.workspacePath
+      ?? (await input.channel.conversationWorkspace?.(input.chatId))
+      ?? resolveInstanceWorkspacePath(cfg);
     // Enforce the spend budget before running the engine (parity with the
     // message-turn and bus entry points).
     const budgetExhausted = await checkBudgetAvailability(input.stateDir, cfg.budgetUsd, locale);
@@ -2817,7 +2824,9 @@ async function runCoreArchiveContinueCardAction(input: {
     // Card-driven turns must see the CONVERSATION's resumed workspace, not the
     // raw instance config — see applyConversationResumeScope.
     await applyConversationResumeScope(input.stateDir, input.conversationKey, cfg);
-    const workspaceOverride = resolveInstanceWorkspacePath(cfg);
+    const workspaceOverride = cfg.resume?.workspacePath
+      ?? (await input.channel.conversationWorkspace?.(input.chatId))
+      ?? resolveInstanceWorkspacePath(cfg);
     // Enforce the spend budget before running the engine (parity with the
     // message-turn and bus entry points).
     const budgetExhausted = await checkBudgetAvailability(input.stateDir, cfg.budgetUsd, locale);

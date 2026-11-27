@@ -142,8 +142,10 @@ export class GatewayTransport {
       const file = path.join(this.options.stateDir, "config.json");
       const reading = (async () => {
         if ((await stat(file)).size > 256 * 1024) return;
-        const config = z.object({ engine: z.string().max(64).optional(), model: z.string().max(512).optional(), effort: z.string().max(32).optional() }).refine(value => value.engine === "pi" || value.engine === "deepseek" || !value.model || value.model.length <= 128).parse(JSON.parse(await readFile(file, { encoding: "utf8", signal: controller.signal })));
-        return botRuntimeStatusSchema.parse({ engine: config.engine ?? this.options.engine ?? "", model: config.model ?? "", effort: config.effort ?? "" });
+        const config = z.object({ engine: z.string().max(64).optional(), model: z.string().max(512).optional(), effort: z.string().max(32).optional(), workspacePath: z.string().max(4096).optional() }).refine(value => value.engine === "pi" || value.engine === "deepseek" || !value.model || value.model.length <= 128).parse(JSON.parse(await readFile(file, { encoding: "utf8", signal: controller.signal })));
+        const rawWorkspace = config.workspacePath?.trim();
+        const workspacePath = rawWorkspace ? path.resolve(rawWorkspace) : path.resolve(path.join(this.options.stateDir, "workspace"));
+        return botRuntimeStatusSchema.parse({ engine: config.engine ?? this.options.engine ?? "", model: config.model ?? "", effort: config.effort ?? "", workspacePath });
       })();
       const timeout = new Promise<undefined>(resolve => { timer = setTimeout(() => { controller.abort(); this.options.onWarning?.("gateway_metadata_read_timeout"); resolve(undefined); }, 2000); timer.unref(); });
       const status = await Promise.race([reading, timeout]);

@@ -51,6 +51,7 @@ export interface CoreChannelLike {
   /** Optional authenticated-surface preparation, executed inside the conversation queue. */
   prepareConversation?(chatId: string): Promise<void>;
   canSteerConversation?(chatId: string): Promise<boolean>;
+  conversationWorkspace?(conversationId: string): Promise<string | undefined>;
   profile?: import("./channel-profile.js").ChannelProfile;
   send(to: string, input: unknown, opts?: CoreSendOptions): Promise<{ messageId: string }>;
   stream(to: string, input: {

@@ -34,8 +34,8 @@ export { HubError } from "./errors.js";
 export type User = { id: string; name: string; role: "owner" | "member" };
 export type Device = { id: string; user_id: string; name: string; platform: string; public_key: string; revoked: number; created_at: number; last_seen: number };
 export type DeviceSummary = Omit<Device, "public_key"> & { nameSource?: "host" };
-export type Bot = { id: string; name: string; engine: string; model: string; effort: string; online: number; managed?: number; deletedAt?: number; defaultAvatar?: string; role?: BotRole };
-type ConversationRow = { history_origin_json?: string | null; id: string; type: "direct" | "group"; title: string; owner_id: string; parent_id: string | null; session_id: string | null; binding_id: string | null; archived: number; created_at: number; hidden: number; ticket_json: string | null };
+export type Bot = { id: string; name: string; engine: string; model: string; effort: string; online: number; managed?: number; deletedAt?: number; defaultAvatar?: string; role?: BotRole; workspacePath?: string };
+type ConversationRow = { history_origin_json?: string | null; id: string; type: "direct" | "group"; title: string; owner_id: string; parent_id: string | null; session_id: string | null; binding_id: string | null; workspace_path?: string | null; archived: number; created_at: number; hidden: number; ticket_json: string | null };
 type MessageRow = { history_json?: string | null; workbench_receipt_json?: string | null; discussion_json?: string | null; bot_source_json?: string | null; preview_style: string | null; preview_url: string | null; link_preview_json: string | null; forwarded_json: string | null; mentions_json: string; id: string; conversation_id: string; author_id: string; author_type: "user" | "bot" | "system"; blocks_json: string; status: Message["status"]; version: number; client_msg_id: string | null; reply_to: string | null; created_at: number };
 type MessageHeader = Pick<MessageRow, "id" | "conversation_id" | "author_id" | "author_type" | "created_at" | "version" | "client_msg_id">;
 function deletedMessageRow(row: MessageHeader): Message {
@@ -104,8 +104,12 @@ export class HubStore {
     if (!await this.db.get("SELECT 1 FROM conversation_members WHERE conversation_id=? AND member_type='bot' AND member_id=?", [conversationId, botId])) throw new HubError("bot_forbidden", 403);
   }
   async requireOwner(userId: string): Promise<void> {
-    if ((await this.db.get<User>("SELECT * FROM users WHERE id=?", [userId]))?.role !== "owner") throw new HubError("owner_required", 403);
+    if (!await this.isOwnerInTransaction(userId)) throw new HubError("owner_required", 403);
   }
+  private async isOwnerInTransaction(userId: string): Promise<boolean> {
+    return (await this.db.get<Pick<User, "role">>("SELECT role FROM users WHERE id=?", [userId]))?.role === "owner";
+  }
+  isOwner(userId: string): Promise<boolean> { return this.db.serial(() => this.isOwnerInTransaction(userId)); }
   user(userId: string): Promise<User | undefined> { return this.db.serial(() => this.db.get<User>("SELECT * FROM users WHERE id=?", [userId])); }
   device(deviceId: string): Promise<Device | undefined> { return this.db.serial(() => this.db.get<Device>("SELECT * FROM devices WHERE id=?", [deviceId])); }
   devices(userId: string): Promise<DeviceSummary[]> {
@@ -118,15 +122,21 @@ export class HubStore {
   }
   bots(userId: string, includeDeleted = false): Promise<Bot[]> {
     return this.db.serial(async () => {
-      const rows = await this.db.all<Omit<Bot, "role"> & { role: string; deleted_at: number | null; assigned_avatar: string | null }>(`SELECT id,name,engine,model,effort,online,role,deleted_at,(SELECT value FROM meta WHERE key=?||bots.id) AS assigned_avatar,EXISTS(SELECT 1 FROM managed_bots m WHERE m.bot_id=bots.id) AS managed FROM bots WHERE (? OR deleted_at IS NULL) AND (EXISTS(SELECT 1 FROM users WHERE id=? AND role='owner') OR id IN (SELECT bot_id FROM bot_grants WHERE user_id=?)) ORDER BY id`, [BOT_AVATAR_DEFAULT_PREFIX, Number(includeDeleted), userId, userId]);
-      return rows.map(({ deleted_at, assigned_avatar, role, ...bot }) => {
+      const owner = await this.isOwnerInTransaction(userId);
+      const rows = await this.db.all<Omit<Bot, "role" | "workspacePath"> & { role: string; deleted_at: number | null; assigned_avatar: string | null; workspace_path: string | null }>(`SELECT id,name,engine,model,effort,online,role,deleted_at,workspace_path,(SELECT value FROM meta WHERE key=?||bots.id) AS assigned_avatar,EXISTS(SELECT 1 FROM managed_bots m WHERE m.bot_id=bots.id) AS managed FROM bots WHERE (? OR deleted_at IS NULL) AND (EXISTS(SELECT 1 FROM users WHERE id=? AND role='owner') OR id IN (SELECT bot_id FROM bot_grants WHERE user_id=?)) ORDER BY id`, [BOT_AVATAR_DEFAULT_PREFIX, Number(includeDeleted), userId, userId]);
+      return rows.map(({ deleted_at, assigned_avatar, role, workspace_path, ...bot }) => {
         const assigned = botAvatarById(assigned_avatar), known = botRoleSchema.safeParse(role);
-        return { ...bot, ...(known.success ? { role: known.data } : {}), ...(assigned ? { defaultAvatar: assigned.id } : {}), ...(deleted_at ? { online: 0, managed: 0, deletedAt: deleted_at } : {}) };
+        return { ...bot, ...(known.success ? { role: known.data } : {}), ...(owner && workspace_path ? { workspacePath: workspace_path } : {}), ...(assigned ? { defaultAvatar: assigned.id } : {}), ...(deleted_at ? { online: 0, managed: 0, deletedAt: deleted_at } : {}) };
       });
     });
   }
-  async botStatus(id: string, status: Partial<Pick<Bot, "engine" | "model" | "effort" | "online">>): Promise<void> {
-    await this.db.serial(async () => { if (!await this.db.get("SELECT 1 FROM bots WHERE id=? AND deleted_at IS NULL", [id])) throw new HubError("bot_deleted", 410); for (const field of ["engine", "model", "effort", "online"] as const) if (status[field] !== undefined) await this.db.run(`UPDATE bots SET ${field}=? WHERE id=?`, [status[field]!, id]); });
+  async botStatus(id: string, status: Partial<Pick<Bot, "engine" | "model" | "effort" | "online" | "workspacePath">>, validate?: TransactionGuard): Promise<void> {
+    await this.db.serial(async () => {
+      await validate?.();
+      if (!await this.db.get("SELECT 1 FROM bots WHERE id=? AND deleted_at IS NULL", [id])) throw new HubError("bot_deleted", 410);
+      for (const field of ["engine", "model", "effort", "online"] as const) if (status[field] !== undefined) await this.db.run(`UPDATE bots SET ${field}=? WHERE id=?`, [status[field]!, id]);
+      if (status.workspacePath !== undefined) await this.db.run("UPDATE bots SET workspace_path=? WHERE id=?", [status.workspacePath || null, id]);
+    });
   }
   botName(userId: string, id: string): Promise<{ name: string }> {
     return this.db.serial(async () => {
@@ -198,30 +208,60 @@ export class HubStore {
     for (const event of result.events) this.emit(event);
     return result.conversations;
   }
-  private async conversationRow(id: string): Promise<Conversation> {
+  private async conversationRow(id: string, includeWorkspace = true): Promise<Conversation> {
     const row = await this.db.get<ConversationRow>("SELECT * FROM conversations WHERE id=?", [id]);
     if (!row) throw new HubError("conversation_not_found", 404);
     const bots = await this.db.all<{ member_id: string }>("SELECT member_id FROM conversation_members WHERE conversation_id=? AND member_type='bot' ORDER BY member_id", [id]);
-    return conversationSchema.parse({ ...(row.history_origin_json ? { historyOrigin: JSON.parse(row.history_origin_json) } : {}), id: row.id, type: row.type, title: row.title, ownerId: row.owner_id, ...(row.parent_id ? { parentId: row.parent_id } : {}), botIds: bots.map((b) => b.member_id), archived: !!row.archived, ...(row.session_id ? { sessionId: row.session_id } : {}), ...(row.binding_id ? { bindingId: row.binding_id } : {}), createdAt: row.created_at,
+    return conversationSchema.parse({ ...(row.history_origin_json ? { historyOrigin: JSON.parse(row.history_origin_json) } : {}), id: row.id, type: row.type, title: row.title, ownerId: row.owner_id, ...(row.parent_id ? { parentId: row.parent_id } : {}), botIds: bots.map((b) => b.member_id), archived: !!row.archived, ...(row.session_id ? { sessionId: row.session_id } : {}), ...(row.binding_id ? { bindingId: row.binding_id } : {}), ...(includeWorkspace && row.workspace_path ? { workspacePath: row.workspace_path } : {}), createdAt: row.created_at,
       ...(row.hidden ? { hidden: true } : {}), ...(row.ticket_json ? { ticket: conversationTicketSchema.parse(JSON.parse(row.ticket_json)) } : {}) });
+  }
+  conversationWorkspacePath(conversationId: string): Promise<string | undefined> {
+    return this.db.serial(async () => {
+      const row = await this.db.get<{ workspace_path: string | null; ticket_json: string | null }>("SELECT workspace_path,ticket_json FROM conversations WHERE id=?", [conversationId]);
+      if (!row) return undefined;
+      if (row.ticket_json) {
+        const ticket = conversationTicketSchema.safeParse(JSON.parse(row.ticket_json));
+        if (ticket.success && ticket.data.workspace) return ticket.data.workspace;
+      }
+      return row.workspace_path?.trim() || undefined;
+    });
+  }
+  /** Pin legacy single-Bot conversations (direct chats and 1-Bot groups/topics)
+   * that have no explicit workspace yet before changing the Bot's default workspace,
+   * so they remain in their original folder. */
+  pinUnassignedBotConversations(botId: string, workspacePath: string, validate?: TransactionGuard): Promise<Conversation[]> {
+    return this.db.transaction(async () => {
+      await validate?.();
+      const rows = await this.db.all<{ id: string }>(
+        `SELECT c.id FROM conversations c
+         JOIN conversation_members m ON m.conversation_id=c.id AND m.member_type='bot' AND m.member_id=?
+         WHERE c.workspace_path IS NULL AND c.hidden=0
+           AND (c.type='direct' OR (SELECT COUNT(*) FROM conversation_members cm WHERE cm.conversation_id=c.id AND cm.member_type='bot')=1)`,
+        [botId],
+      );
+      if (!rows.length) return [];
+      for (const row of rows) await this.db.run("UPDATE conversations SET workspace_path=? WHERE id=? AND workspace_path IS NULL", [workspacePath, row.id]);
+      return Promise.all(rows.map(row => this.conversationRow(row.id)));
+    });
   }
   /** Pass `hidden: false` where a listing reaches a client without dispatch.v1:
    * it would show dispatcher worker conversations as ordinary chats. */
   conversations(userId: string, options: { hidden?: boolean } = {}): Promise<Conversation[]> {
     return this.db.serial(async () => {
+      const owner = await this.isOwnerInTransaction(userId);
       const rows = await this.db.all<{ id: string }>(`SELECT c.id FROM conversations c JOIN conversation_members m ON c.id=m.conversation_id WHERE m.member_type='user' AND m.member_id=? AND NOT EXISTS(SELECT 1 FROM history_operations h WHERE h.destination_conversation_id=c.id AND h.state!='applied')${options.hidden === false ? " AND c.hidden=0" : ""} ORDER BY c.created_at`, [userId]);
-      return Promise.all(rows.map((r) => this.conversationRow(r.id)));
+      return Promise.all(rows.map((r) => this.conversationRow(r.id, owner)));
     });
   }
   conversationForBot(botId: string, conversationId: string): Promise<Conversation> { return this.db.serial(async () => { await this.requireBot(botId, conversationId); return this.conversationRow(conversationId); }); }
-  async createConversation(userId: string, botIds: string[], title: string, clientActionId: string, options: { type?: "direct" | "group"; parentId?: string; dispatchWorker?: true } = {}, validate?: TransactionGuard): Promise<Conversation> {
+  async createConversation(userId: string, botIds: string[], title: string, clientActionId: string, options: { type?: "direct" | "group"; parentId?: string; dispatchWorker?: true; workspacePath?: string } = {}, validate?: TransactionGuard): Promise<Conversation> {
     return this.db.transaction(async () => {
       await validate?.();
       return this.createConversationInTransaction(userId, botIds, title, clientActionId, options);
     });
   }
   /** Caller holds db.transaction; Agent Bus creates its dedicated chats atomically with the workspace. */
-  async createConversationInTransaction(userId: string, botIds: string[], title: string, clientActionId: string, options: { type?: "direct" | "group"; parentId?: string; dispatchWorker?: true } = {}): Promise<Conversation> {
+  async createConversationInTransaction(userId: string, botIds: string[], title: string, clientActionId: string, options: { type?: "direct" | "group"; parentId?: string; dispatchWorker?: true; workspacePath?: string } = {}): Promise<Conversation> {
     const existing = await this.db.get<{ id: string }>("SELECT id FROM conversations WHERE owner_id=? AND client_action_id=?", [userId, clientActionId]);
     if (existing) {
       const conversation = await this.conversationRow(existing.id);
@@ -253,7 +293,8 @@ export class HubStore {
     // A dispatcher works through exactly one conversation and is never a group member.
     if (dispatcher && type === "group") throw new HubError("dispatcher_group_forbidden", 409);
     if (dispatcher && await this.db.get("SELECT 1 FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id WHERE m.member_type='bot' AND m.member_id=? AND c.type='direct'", [ids[0]!])) throw new HubError("dispatcher_single_conversation", 409);
-    await this.db.run("INSERT INTO conversations(id,type,title,owner_id,created_at,client_action_id,parent_id) VALUES(?,?,?,?,?,?,?)", [id, type, title, userId, Date.now(), clientActionId, parent?.id ?? null]);
+    const workspacePath = options.workspacePath?.trim() || parent?.workspacePath || null;
+    await this.db.run("INSERT INTO conversations(id,type,title,owner_id,created_at,client_action_id,parent_id,workspace_path) VALUES(?,?,?,?,?,?,?,?)", [id, type, title, userId, Date.now(), clientActionId, parent?.id ?? null, workspacePath]);
     if (parent) await this.db.run("INSERT INTO conversation_members SELECT ?,'user',member_id,0 FROM conversation_members WHERE conversation_id=? AND member_type='user'", [id, parent.id]);
     else await this.db.run("INSERT INTO conversation_members VALUES(?,'user',?,0)", [id, userId]);
     for (const bot of ids) await this.db.run("INSERT INTO conversation_members VALUES(?,'bot',?,0)", [id, bot]);
@@ -294,7 +335,15 @@ export class HubStore {
     return { group, policy, revision };
   }
   groupSettings(userId: string, groupId: string, validate?: TransactionGuard): Promise<GroupSettingsSnapshot> {
-    return this.db.serial(async () => { await validate?.(); await this.requireMember(userId, groupId); return this.groupSettingsInTransaction(groupId); });
+    return this.db.serial(async () => {
+      await validate?.(); await this.requireMember(userId, groupId);
+      const settings = await this.groupSettingsInTransaction(groupId);
+      if (settings.group.workspacePath && !await this.isOwnerInTransaction(userId)) {
+        const { workspacePath: _workspacePath, ...group } = settings.group;
+        return { ...settings, group };
+      }
+      return settings;
+    });
   }
   async updateGroup(userId: string, id: string, input: GroupSettingsInput, validate?: TransactionGuard): Promise<Conversation[]> {
     const change = groupSettingsSchema.parse(input);
@@ -1233,10 +1282,11 @@ export class HubStore {
   snapshot(userId: string, conversationId: string): Promise<{ conversation: Conversation; messages: Message[]; seq: number }> {
     return this.db.serial(async () => {
       await this.requireMember(userId, conversationId);
+      const owner = await this.isOwnerInTransaction(userId);
       const messages = (await this.db.all<MessageRow>("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at,rowid", [conversationId])).map((r) => this.decodeMessage(r));
       const seq = (await this.db.get<{ seq: number }>("SELECT COALESCE(MAX(seq),0) AS seq FROM events WHERE conversation_id=?", [conversationId]))!.seq;
       const hidden = await this.hiddenMessages(userId, conversationId);
-      return { conversation: await this.conversationRow(conversationId), messages: messages.map(message => hidden.has(message.id) ? deletedMessage(message) : message), seq };
+      return { conversation: await this.conversationRow(conversationId, owner), messages: messages.map(message => hidden.has(message.id) ? deletedMessage(message) : message), seq };
     });
   }
   syncHead(userId: string, conversationId: string): Promise<{ seq: number; firstSeq: number }> {
@@ -1283,7 +1333,8 @@ export class HubStore {
     const db = await HubDatabase.snapshot(this.db.file), view = new HubStore(db), id = newId("snapshot");
     try {
       await db.exec("BEGIN"); await view.requireMember(userId, conversationId);
-      const conversation = await view.conversationRow(conversationId);
+      const owner = await view.isOwnerInTransaction(userId);
+      const conversation = await view.conversationRow(conversationId, owner);
       const { seq, firstSeq } = (await db.get<{ seq: number; firstSeq: number }>(replayHeadSql, [conversationId]))!;
       const readSeq = (await db.get<{ seq: number }>("SELECT seq FROM reads WHERE user_id=? AND conversation_id=?", [userId, conversationId]))?.seq ?? 0;
       // Completion transitions match ClientCache.apply; editing an already-complete

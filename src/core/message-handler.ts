@@ -1725,7 +1725,7 @@ async function runNormalizedCoreMessage(
     });
   }
   cfg.resume = conversationResume;
-  const workspaceOverride = input.workspaceOverride ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
+  const workspaceOverride = input.workspaceOverride ?? conversationResume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
 
   const commandText = extractCoreMessageBody(normalized.text);
 
