@@ -344,9 +344,9 @@ flowchart TB
 感谢 [LINUX DO](https://linux.do/) 社区对 TaroBird 的支持。
 
 工作台使用 [Excalidraw](https://github.com/excalidraw/excalidraw) 提供白板、
-[Vditor](https://github.com/Vanessa219/vditor) 提供 Markdown 笔记，并集成
-[宝玉 Jim Liu 的 baoyu-design](https://github.com/JimLiu/baoyu-design) 提供幻灯片编辑器及相应适配技能。
-感谢这些项目的作者与贡献者。Excalidraw 和 Vditor 使用 MIT；baoyu-design 使用[分范围许可声明](client/vendor/baoyu-slides/NOTICE.md)，重建编辑器不在其 MIT 授权内。我们保留原始版权、授权范围及依赖许可说明，
+[Vditor](https://github.com/Vanessa219/vditor) 提供 Markdown 笔记，并使用
+[Open Artifact](https://github.com/JimLiu/open-artifact)（`@open-artifact/slides-editor`，Apache-2.0）作为演示文稿编辑器核心。
+感谢这些项目的作者与贡献者。Excalidraw 和 Vditor 使用 MIT；Open Artifact 使用 Apache-2.0（`client/vendor/workbench-slides/` 保留完整 LICENSE 与 NOTICE）。我们保留原始版权、授权范围及依赖许可说明，
 详见[第三方许可](LICENSING.md)和[设计功能说明](docs/client/workbench-design.md)。
 
 ## 许可证

@@ -36,22 +36,17 @@ skill (MIT); the tool-routing section is TaroBot-specific.
 Temporary App storage and safe post-publication retirement. Install through the
 same script above; see [the operator guide](../docs/macos-artifact-retention.md).
 
-## Baoyu PPT
+## Workbench presentations
 
-This is the TaroBot adapter for the pinned slides editor (`claude-slides`). It
-operates App projects with `app_workbench` / `tarobot workbench run`; it does
-not run the upstream filesystem server. Explicit Baoyu/宝玉 PPT requests select
-it; ordinary PPT requests retain each engine's usual presentation skills. (The
-former Baoyu Design canvas editor and `baoyu-design` skill were removed in #89.
-Canvas projects kept from earlier versions can only be exported in the App.)
+Workbench presentations need no skill. Bots use TaroBird's built-in slide format
+directly through `app_workbench` / `tarobot workbench run`; shared App/CLI
+capability guidance describes it to supported engines without relying on global
+skill discovery. Both former Baoyu adapters are gone: `baoyu-design` with its
+canvas editor (#89; canvas projects kept from earlier versions can only be
+exported in the App) and `baoyu-ppt` with the Baoyu slides editor (#90). The
+installer does not remove copies of them that a user installed earlier.
 
-```bash
-bash scripts/install-skills.sh --skill baoyu-ppt
-```
-
-To use an engine-specific skill location, pass `--destination /path/to/skills`
-(repeat for multiple locations). Existing sessions may cache their catalog; do not
-reset user conversations just to refresh metadata. Shared App/CLI capability guidance
-also exposes the route to supported engines without relying on global skill discovery.
-Standalone/App Host packages carry this adapter and its references. Check
-`UPSTREAM.json`, the upstream skill and the slides editor at every release.
+To install into an engine-specific skill location, pass
+`--destination /path/to/skills` to `scripts/install-skills.sh` (repeat for
+multiple locations). Existing sessions may cache their catalog; do not reset user
+conversations just to refresh metadata.

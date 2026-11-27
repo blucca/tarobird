@@ -68,9 +68,9 @@ test("PPT comments create a durable exact-slide chat draft",async({page},info)=>
   const target={...made.target,tabId:(made.result as {tabId:string}).tabId};const editor=page.frameLocator(".workbench-design-frame:visible");
   const heading=editor.getByText(title,{exact:true}).first();await expect(heading).toBeVisible({timeout:45000});
   await editor.getByRole("button",{name:"Comments",exact:true}).click();
-  const bounds=await heading.boundingBox();expect(bounds).not.toBeNull();await page.mouse.click(bounds!.x+bounds!.width/2,bounds!.y+bounds!.height/2);
+  const bounds=await heading.boundingBox();expect(bounds).not.toBeNull();await page.mouse.click(bounds!.x+Math.min(40,bounds!.width/2),bounds!.y+bounds!.height/2);
   await expect(editor.getByRole("textbox",{name:"Comment",exact:true})).toBeVisible();
-  await editor.getByRole("textbox",{name:"Comment",exact:true}).fill(note);await editor.getByRole("checkbox",{name:"Send to Agent",exact:true}).check();await editor.getByRole("button",{name:"Send",exact:true}).click();
+  await editor.getByRole("textbox",{name:"Comment",exact:true}).fill(note);await editor.getByRole("checkbox",{name:/^Send to (?:Agent|Bot)$/}).check();await editor.getByRole("button",{name:"Send",exact:true}).click();
   const composer=page.getByRole("textbox",{name:"消息",exact:true});await expect(composer).toHaveValue(/Keep the English figures/,{timeout:15000});
   const draft=await composer.inputValue();expect(draft).toContain(note);expect(draft).toContain("project/slides/cover.html");
   const comments=await f.command({requestId:"ppt-comment-read",operation:"design.comments.read",target,payload:{}});expect(comments.status).toBe("success");expect((comments.result as {threads:{file:string}[]}).threads[0].file).toBe("project/slides/cover.html");

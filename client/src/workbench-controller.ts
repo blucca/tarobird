@@ -4,6 +4,7 @@ import { designHistorySchema } from "./workbench-design-history.js";
 import { DesignSession } from "./workbench-design-session.js";
 import { existingDesignShareManager } from "./workbench-design-collaboration.js";
 import { emptyDesignDocument, validateDesignDocument, type DesignDocument } from "./workbench-design.js";
+import { importPptxToSlides } from "./workbench-slides-pptx-import.js";
 import { designCreateSchema, designFormatSchema, designFormatTitle, DESIGN_DOCUMENT_BYTES, type DesignFormat } from "../../src/client-protocol/workbench-design.js";
 import { readBrowserDevicePreview } from "./workbench-browser-tools.js";
 import { noteRecoveryKey, readNoteRecovery, rememberNoteRecovery } from "./workbench-note-recovery.js";
@@ -468,6 +469,15 @@ export class WorkbenchController {
     const format = designFormatSchema.parse(value.document.format ?? "canvas");
     if (format !== "slides") throw new Error("design_canvas_removed");
     return this.createDesign(value.title,undefined,undefined,value.document,"slides",value);
+  }
+  async importPptx(file: File): Promise<string> {
+    if (!/\.pptx$/i.test(file.name) || file.size > DESIGN_DOCUMENT_BYTES) throw new Error("slides_invalid_pptx_import");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    this.check();
+    const id = stableId("import");
+    const title = file.name.replace(/\.pptx$/i, "").trim().slice(0, 128) || "Presentation";
+    const document = importPptxToSlides(bytes, { id, title });
+    return this.createDesign(title, undefined, undefined, document, "slides");
   }
   async deleteDesign(id: string): Promise<void> {
     await this.serial(async () => {

@@ -29,11 +29,14 @@ describe("portable design system provenance and assets", () => {
     source.files["project/Logo.dc.html"] = designTextFile(`<img src="/_blob/${id}"><img src="./_blob/${id}">`, "text/html");
     source.files["project/theme.css"] = designTextFile(`.logo{background-image:url(_blob/${id})}`, "text/css");
     const target = emptyDesignDocument("target", "Target", "slides"), installed = applyDesignFiles(target, designSystemInstall(target, source, identity));
-    const expected = `/project/ds/system-brand/assets/${id}`;
+    // A deck gets the form the presentation editor's compiler accepts (#90): a project
+    // path without a leading slash, which that editor resolves from the document root
+    // and never from the nested file's own directory. 1.6.0 wrote "/project/ds/…" here.
+    const expected = `project/ds/system-brand/assets/${id}`;
     expect(read(installed.files["project/ds/system-brand/Logo.dc.html"]!)).toBe(`<img src="${expected}"><img src="${expected}">`);
     expect(read(installed.files["project/ds/system-brand/theme.css"]!)).toContain(`url(${expected})`);
-    expect(new URL(expected, "https://design.invalid/project/ds/system-brand/Logo.dc.html").pathname).toBe(expected);
-    expect(installed.files[expected.slice(1)]).toEqual(asset);
+    expect(new URL(expected, "https://design.invalid/").pathname).toBe(`/${expected}`);
+    expect(installed.files[expected]).toEqual(asset);
   });
 
   it("migrates a matching legacy copy on sync without accepting another source or losing local edits", () => {

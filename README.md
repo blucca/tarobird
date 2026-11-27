@@ -345,8 +345,8 @@ Thank you to the [LINUX DO](https://linux.do/) community for supporting TaroBird
 
 Workbench builds on [Excalidraw](https://github.com/excalidraw/excalidraw) for whiteboards,
 [Vditor](https://github.com/Vanessa219/vditor) for Markdown notes, and
-[Jim Liu's baoyu-design](https://github.com/JimLiu/baoyu-design) for the slide editor and its adapted authoring skill.
-Thank you to their authors and contributors. Excalidraw and Vditor use MIT. baoyu-design has [mixed licensing](client/vendor/baoyu-slides/NOTICE.md), with the reconstructed editor outside its MIT grant. Original copyright, scope notices and bundled
+[Open Artifact](https://github.com/JimLiu/open-artifact) (`@open-artifact/slides-editor`, Apache-2.0) for Workbench presentations.
+Thank you to their authors and contributors. Excalidraw and Vditor use MIT; Open Artifact uses Apache-2.0 (LICENSE and NOTICE retained in `client/vendor/workbench-slides/`). Original copyright, scope notices and bundled
 dependency notices are retained; see [third-party notices](LICENSING.md) and the
 [Design integration guide](docs/client/workbench-design.md).
 

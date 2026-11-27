@@ -202,10 +202,10 @@ export function appTurnInstructions(text: string, options: AppInstructionOptions
   const topics: AppCapability[] = [];
   options = { ...options, widgetsEnabled: options.widgetsEnabled ?? widgetsEnabled() };
   const guidance: string[] = options.widgetsEnabled ? [] : ["Interactive widgets are disabled on this host. Use text or Markdown tables."];
-  // This adds a selection rule, not a keyword-driven tool choice or permission.
-  // In particular it corrects old persistent tool descriptions that equate Design with Baoyu.
-  if (/\b(?:pptx?|powerpoint|presentations?|slides?|decks?|keynote)\b|幻[灯燈]片|投影片|演示|汇报材料|匯報材料|[简簡][报報]/iu.test(text)) guidance.push(workbenchPptRouting);
-  else if (/\bbaoyu[- ]?(?:design|canvas)\b|宝[玉育]\s*(?:design|设计|設計|[画畫]布)|(?:workbench|工作台).{0,16}(?:\bcanvas\b|[画畫]布)|(?:\bcanvas\b|[画畫]布).{0,16}(?:workbench|工作台)|\bdesign\b.{0,16}\bcanvas\b|\bcanvas\b.{0,16}\bdesign\b|\bdesign\b.{0,12}[画畫]布|[画畫]布.{0,12}\bdesign\b/iu.test(text)) guidance.push(workbenchCanvasRemovedGuidance);
+  // A canvas request without presentation keywords learns that the Baoyu Design
+  // canvas was removed (#89). Presentation turns carry no per-turn routing note (#90).
+  if (!/\b(?:pptx?|powerpoint|presentations?|slides?|decks?|keynote)\b|幻[灯燈]片|投影片|演示|汇报材料|匯報材料|[简簡][报報]/iu.test(text)
+    && /\bbaoyu[- ]?(?:design|canvas)\b|宝[玉育]\s*(?:design|设计|設計|[画畫]布)|(?:workbench|工作台).{0,16}(?:\bcanvas\b|[画畫]布)|(?:\bcanvas\b|[画畫]布).{0,16}(?:workbench|工作台)|\bdesign\b.{0,16}\bcanvas\b|\bcanvas\b.{0,16}\bdesign\b|\bdesign\b.{0,12}[画畫]布|[画畫]布.{0,12}\bdesign\b/iu.test(text)) guidance.push(workbenchCanvasRemovedGuidance);
   // A discussion turn never delegates; callers pass only the user's topic here.
   const discussion = options.context === "discussion";
   if (!discussion && !options.ticketWorker && /(?:跨.?主机|跨.?[Bb]ot|另.{0,8}[Bb]ot|[Bb]ot.{0,8}协作|委托|转交|发给.{0,12}[Bb]ot|collaborat|messages (?:send|wait)|send.{0,12}bot)/iu.test(text)) guidance.push(botCollaborationInstructions());
@@ -259,7 +259,7 @@ export function workbenchInstructions(conversationId: string, messageId: string,
   if (frozen && workbenchOpenerOnly(frozen)) return [
     `Workbench for THIS user turn: ${JSON.stringify({conversationId, contextMessageId: messageId, context: {openTarget: frozen.openTarget, panelClosed: true}})}. No Workbench target is frozen; the panel was closed.`,
     workbenchPptRouting,
-    `Only for an explicit request to put a PPT in Workbench, an explicit Baoyu/宝玉 PPT task, or an unambiguous continuation of the selected PPT project (not mere mentions or ordinary PPT requests without a Workbench destination), call app_workbench {requestId,operation:'design.open',payload:{format:'slides'}} without target (this does not select an authoring skill): it opens the PPT editor on the App that sent the latest adopted input, and its result.target is the PPT project to read/publish. Once per explicit request; a later adopted explicit request may open again with a new requestId. Read app_capability topic=${topic} before other Workbench actions.`,
+    `Only for an explicit request to put a presentation/PPT in the Workbench, or an unambiguous continuation of the selected presentation project (not mere mentions or ordinary standalone PPT requests without a Workbench destination), call app_workbench {requestId,operation:'design.open',payload:{format:'slides'}} without target: it opens the presentation editor on the App that sent the latest adopted input, and its result.target is the tab to read/publish. Once per explicit request; a later adopted explicit request may open again with a new requestId. Read app_capability topic=${topic} before other Workbench actions.`,
     `If app_workbench is unavailable or its older schema lacks design.open (never reset the session or start a new conversation), write {"operation":"design.open","payload":{"format":"slides"}} to a file and run: tarobot workbench run ${conversationId} --from /absolute/request.json --request-id ID --context-message ${messageId} --json.`,
   ].join("\n");
   const selection = frozen?.selection;

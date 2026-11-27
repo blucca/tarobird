@@ -52,11 +52,11 @@ describe("Remove Baoyu Design canvas from Workbench (#89)", () => {
     expect(CAPABILITIES.length).toBeLessThanOrEqual(63);
   });
 
-  it("removes baoyu-design vendor, skill and package.json files entries while keeping baoyu-slides and baoyu-ppt", () => {
+  it("removes baoyu-design vendor, skill and package.json files entries while keeping the presentation editor", () => {
     expect(existsSync(path.resolve("client/vendor/baoyu-design"))).toBe(false);
     expect(existsSync(path.resolve("skills/baoyu-design"))).toBe(false);
-    expect(existsSync(path.resolve("client/vendor/baoyu-slides/UPSTREAM.json"))).toBe(true);
-    expect(existsSync(path.resolve("skills/baoyu-ppt/SKILL.md"))).toBe(true);
+    // #90 replaced the Baoyu slides editor and its skill; the presentation editor that survives is workbench-slides.
+    expect(existsSync(path.resolve("client/vendor/workbench-slides/UPSTREAM.json"))).toBe(true);
     const pkg = JSON.parse(readFileSync(path.resolve("package.json"), "utf8")) as { files: string[] };
     const skillFiles = pkg.files.filter(entry => entry.startsWith("skills/"));
     expect(skillFiles.some(entry => entry.startsWith("skills/baoyu-design/"))).toBe(false);
@@ -66,7 +66,7 @@ describe("Remove Baoyu Design canvas from Workbench (#89)", () => {
   it("builds only the slides sandbox and refuses canvas", () => {
     expect(() => buildDesignSandbox("canvas" as never)).toThrow(/design_canvas_removed/);
     const html = buildDesignSandbox("slides");
-    expect(html).toContain("<title>PPT</title>");
+    expect(html).toContain("<title>Presentation</title>");
   });
 
   it("injects canvas-removal Bot guidance on canvas-only prompts and keeps PPT guidance intact", () => {

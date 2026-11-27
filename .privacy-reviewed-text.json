@@ -1452,6 +1452,18 @@
           "fingerprint": "ffe27392eb3e6ac8cca1fed5637a4c727bca806b99147ec8cf5913c3f82efc98"
         }
       ]
+    },
+    {
+      "path": "client/vendor/workbench-slides/editor/assets/index-DaF3puIc.js",
+      "sha256": "2c4af5c5e5d54b58c191bef23b6c5f97f6c0dc2336cff8b759994efa6c6b0968",
+      "reviewer": "antigravity",
+      "note": "Reviewed Lucide SVG path coordinates bundled in Apache-2.0 @open-artifact/slides-editor v0.14.6; dotted numeric graphics syntax is not an IP address, no private data.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "336f8bdbd0706531cd5101c4d599b46522be75cf6d81edddb9e8b20b1d878f51"
+        }
+      ]
     }
   ]
 }
