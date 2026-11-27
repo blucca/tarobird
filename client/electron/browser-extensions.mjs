@@ -8,7 +8,7 @@ import { verifyCrx3 } from './crx3.mjs';
 import { ARCHIVE_LIMITS, stageFolder, stageZip } from './extension-archive.mjs';
 import { ExtensionBridge } from './extension-bridge.mjs';
 import { OPTIONS_LIMITS, OptionsWindows, optionsPath, optionsURL } from './extension-options.mjs';
-import { resolveElectronLocale, pickElectronCopy } from './locale.mjs';
+import { normalizeElectronLocale, resolveElectronLocale, pickElectronCopy } from './locale.mjs';
 
 // The person's Chrome extensions for workbench pages. Electron loads unpacked
 // extensions per session and forgets them on exit, so main keeps its own copies
@@ -475,7 +475,8 @@ chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: rules.map(rule 
     const checked = EXTENSION_ACTION.safeParse(input);
     if (!checked.success) throw new Error('invalid_extension_args');
     const args = checked.data;
-    const loc = resolveElectronLocale({ locale: args.locale ?? locale, english: args.english ?? english });
+    const loc = normalizeElectronLocale(args.locale)
+      ?? (typeof args.english === 'boolean' ? (args.english ? 'en' : 'zh') : resolveElectronLocale({ locale, english }));
     switch (args.action) {
       case 'list': return this.#serial(async () => ({ status: 'ok', extensions: await Promise.all((await this.#read()).extensions.map(entry => this.#summary(entry))) }));
       case 'install': prepare(PERSONAL_BROWSER_SCOPE); return this.#install(args, window, loc);

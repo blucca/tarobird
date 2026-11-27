@@ -2865,7 +2865,7 @@ exports[`Gateway card translation > translates actual config, board, status, res
         {
           "children": [
             {
-              "text": "**语言区块**",
+              "text": "**语言**",
               "type": "markdown",
             },
             {

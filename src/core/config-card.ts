@@ -18,7 +18,7 @@ import {
   type InstanceConfig,
   type InstanceEngine,
 } from "../state/instance-config.js";
-import { isSupportedLocale, type Locale } from "../runtime/locale.js";
+import { isSupportedLocale, normalizeLocale, type Locale } from "../runtime/locale.js";
 import { hostT } from "../locales/index.js";
 import { CoreGroupModeStore } from "./group-mode-store.js";
 import { checkGroupMsgScope, renderGroupMsgScopeWarning } from "./group-scope-check.js";
@@ -115,6 +115,7 @@ export async function renderCoreConfigCard(input: CoreConfigCardContext): Promis
       : `- ${labels.group}: ${labels.privateChat}`,
   ].filter((line): line is string => line !== undefined);
 
+  const normalizedLocale = normalizeLocale(input.locale, "en");
   const elements: unknown[] = [
     markdownElement(summaryLines.join("\n")),
     configFormSection(input, cfg, resolvedApprovalMode),
@@ -136,9 +137,9 @@ export async function renderCoreConfigCard(input: CoreConfigCardContext): Promis
       button(optionLabel(labels.yoloUnsafe, resolvedApprovalMode === "bypass", labels), "yolo", "unsafe", input, resolvedApprovalMode === "bypass" ? "danger" : "default"),
     ]),
     section(labels.localeSection, [
-      button(optionLabel("中文", input.locale === "zh", labels), "locale", "zh", input, input.locale === "zh" ? "primary" : "default"),
-      button(optionLabel("English", input.locale === "en", labels), "locale", "en", input, input.locale === "en" ? "primary" : "default"),
-      button(optionLabel("日本語", input.locale === "ja", labels), "locale", "ja", input, input.locale === "ja" ? "primary" : "default"),
+      button(optionLabel("中文", normalizedLocale === "zh", labels), "locale", "zh", input, normalizedLocale === "zh" ? "primary" : "default"),
+      button(optionLabel("English", normalizedLocale === "en", labels), "locale", "en", input, normalizedLocale === "en" ? "primary" : "default"),
+      button(optionLabel("日本語", normalizedLocale === "ja", labels), "locale", "ja", input, normalizedLocale === "ja" ? "primary" : "default"),
     ]),
     markdownElement(channelProfile() === "gateway"
       ? hostT(input.locale, "设备权限在「设置 → 设备管理」中设置。")
@@ -255,7 +256,8 @@ async function applySubmitAction(
 
   // There are at most five compact notices. Keep all of them so the group-scope
   // warning cannot be truncated when the form submits every field at once.
-  const compact = notices.filter(Boolean).join(noticeLocale === "en" ? "; " : noticeLocale === "ja" ? "、" : "；");
+  const normalizedNoticeLocale = normalizeLocale(noticeLocale, "en");
+  const compact = notices.filter(Boolean).join(normalizedNoticeLocale === "en" ? "; " : normalizedNoticeLocale === "ja" ? "、" : "；");
   return compact ? hostT(noticeLocale, "已保存。{0}", compact) : hostT(noticeLocale, "已保存。");
 }
 
@@ -295,8 +297,9 @@ async function applyEngineAction(stateDir: string, value: string | undefined, lo
     resetSessionBindings ? hostT(locale, "已重置会话绑定") : undefined,
     enabledFullAuto ? hostT(locale, "Antigravity 已开启 YOLO/full-auto") : undefined,
   ].filter((detail): detail is string => Boolean(detail));
+  const normalized = normalizeLocale(locale, "en");
   const detailText = details.length
-    ? (locale === "en" ? ` (${details.join("; ")})` : locale === "ja" ? `（${details.join("、")}）` : `（${details.join("；")}）`)
+    ? (normalized === "en" ? ` (${details.join("; ")})` : normalized === "ja" ? `（${details.join("、")}）` : `（${details.join("；")}）`)
     : "";
   const restartHint = channelProfile() === "gateway"
     ? hostT(locale, "请在「运行状态」安排此 Bot 空闲后重启以生效。")
@@ -499,7 +502,7 @@ function configFormSection(
       ["off", hostT(locale, "YOLO 关")],
       ["unsafe", "Unsafe bypass"],
     ]),
-    selectStatic("locale", locale, [
+    selectStatic("locale", normalizeLocale(locale, "en"), [
       ["zh", "中文"],
       ["en", "English"],
       ["ja", "日本語"],

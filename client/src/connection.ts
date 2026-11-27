@@ -36,13 +36,13 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { FrameReader } from "../../src/client-protocol/fragments.js";
 import { messageStreamSchema } from "../../src/client-protocol/stream.js";
 import { syncShareUploadLimit } from "./share-inbox.js";
-import { t } from "./i18n.js";
+import { getLocale, t } from "./i18n.js";
 import type { DiffReviewScope } from "./diff-review-draft.js";
 import { assertMessageTextSize } from "./message-validation.js";
 import { quietNow } from "../../src/client-protocol/push.js";
 import { BACKGROUND_TASK_GROUP_CAPABILITY } from "../../src/client-protocol/background-task-group.js";
 import { RUN_SCOPES_CAPABILITY, RUN_TAIL_CAPABILITY } from "../../src/client-protocol/run.js";
-import { desktopNotice } from "./message-notification.js";
+import { desktopNotice, desktopNotificationLocale } from "./message-notification.js";
 import { desktopNotification, type NotificationState } from "./notifications.js";
 import { nativePlatform } from "./native.js";
 import { PRIVATE_NETWORK_CAPABILITY, networkCanonical, networkCommandSchema, networkCommandResultSchema, networkViewSchema, type NetworkCommandInput, type NetworkView, type SignedNetworkManifest, type SignedNetworkProposal } from "../../src/client-protocol/private-network.js";
@@ -605,7 +605,7 @@ export class HubConnection {
                 // enabled while it waits, matching already-redacted phone pushes.
                 const latest = desktopNotice(message, { ...current.preferences, showPreview: notice.preview && current.preferences.showPreview !== false });
                 if (!latest) return;
-                const body = latest.body({ title, botName: this.state.bots.find(bot => bot.id === message.authorId)?.name, locale: document.documentElement?.lang?.startsWith("en") ? "en" : "zh" });
+                const body = latest.body({ title, botName: this.state.bots.find(bot => bot.id === message.authorId)?.name, locale: desktopNotificationLocale(document.documentElement?.lang, getLocale()) });
                 return { hostId: runtimeHostId(this.identity.hubPublicKey!), id: message.id, title: "TaroCub" as const, body, conversationId: message.conversationId, messageId: message.id, kind: latest.kind, at: Date.now() };
               };
               const payload = resolve();

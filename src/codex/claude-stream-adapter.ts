@@ -660,13 +660,13 @@ function sumUsage(a: AdapterUsage | undefined, b: AdapterUsage | undefined): Ada
  * as shown; this says why it ends mid-way. */
 function withSendNowCutNotice(text: string, locale: Locale | undefined): string {
   if (!text.trim()) return text;
-  return `${text}\n\n${hostT(locale ?? "en", "（Claude 为立即发送的消息中断了以上回答。）")}`;
+  return `${text}\n\n${hostT(locale, "（Claude 为立即发送的消息中断了以上回答。）")}`;
 }
 
 /** A cut answer whose send-now input then did not run (stopped or never started). */
 function withInterruptedAnswerNotice(text: string, locale: Locale | undefined): string {
   if (!text.trim()) return text;
-  return `${text}\n\n${hostT(locale ?? "en", "（以上回答在中途被中断。）")}`;
+  return `${text}\n\n${hostT(locale, "（以上回答在中途被中断。）")}`;
 }
 
 /** A Claude error answer to a native input control: nothing was done. */
@@ -676,7 +676,7 @@ function nativeControlRejection(error: ClaudeControlError): NativeInputControlRe
 
 function withDroppedSteerNotice(text: string, dropped: number, locale: Locale | undefined): string {
   if (dropped <= 0) return text;
-  const notice = hostT(locale ?? "en", "（运行中补充的 {0} 条消息未进入本轮，如仍需要请重新发送。）", dropped);
+  const notice = hostT(locale, "（运行中补充的 {0} 条消息未进入本轮，如仍需要请重新发送。）", dropped);
   return text ? `${text}\n\n${notice}` : notice;
 }
 
@@ -1523,7 +1523,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
         // Only this typed pre-prompt handshake failure is safe to retry. Never
         // replay a model turn after an engine/tool/publish failure or user stop.
         if (!(error instanceof ClaudeAppMcpInitializationError) || input.abortSignal?.aborted || this.destroyPromise) throw error;
-        const notice = hostT(input.locale ?? "en", "Claude 原生 App 工具初始化失败，本轮已改用兼容文件交付；其他会话不受影响。");
+        const notice = hostT(input.locale, "Claude 原生 App 工具初始化失败，本轮已改用兼容文件交付；其他会话不受影响。");
         await this.emitEngineEvent(worker, { type: "assistant_text", text: notice, sessionId: worker.currentSessionId ?? undefined }, input.onEngineEvent);
         worker = await this.getOrCreateWorker(sessionId, agentInstructions, input.instructions ?? null, approvalMode, effectiveWorkspace, engineOptions);
         // A deterministic rejection disables only this fallback worker. A slow

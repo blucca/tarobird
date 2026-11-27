@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { Locale } from "../runtime/locale.js";
+import { normalizeLocale, type Locale } from "../runtime/locale.js";
 import { parsePiModels, type PiModelChoice } from "./pi-models.js";
 import {
   PiNativeBridgeUnavailableError, PiNativeBusyError, PiNativeRejectedError, PiNativeUncertainError,
@@ -1659,7 +1659,7 @@ async function hasSessionCommand(context: PiNativeCommandContext, name: string):
 export async function runPiNativeCommand(text: string, context: PiNativeCommandContext): Promise<PiNativeCommandResult> {
   const input = text.trim();
   if (!input) return NOT_HANDLED;
-  const run: Run = { context, t: COPY[context.locale] ?? EN };
+  const run: Run = { context, t: COPY[normalizeLocale(context.locale, "en")] ?? EN };
 
   if (input.startsWith("!")) {
     // `!` adds the output to the model's context, `!!` keeps it out; an empty command is ordinary text (interactive-mode.ts:3471-3487).

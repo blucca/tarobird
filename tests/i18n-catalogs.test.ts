@@ -4,13 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import englishUi from "../client/src/locales/en.json" with { type: "json" };
 import japaneseUi from "../client/src/locales/ja.json" with { type: "json" };
-import { commandDescription, setLocale, syncSystemLocale, t, UI_CATALOGS } from "../client/src/i18n.js";
+import { commandDescription, getLocale, setLocale, syncSystemLocale, t, UI_CATALOGS } from "../client/src/i18n.js";
 import { resolveLocalePreference, storedLocale, systemLocale } from "../client/src/system-locale.js";
 import { renderCoreConfigCard } from "../src/core/config-card.js";
 import { renderCoreUserFacingError, renderedEngineFailure, renderedEngineResetHint } from "../src/core/errors.js";
+import { gatewayNativeCommandHelp, renderGatewayHelp } from "../src/gateway/commands.js";
 import { HOST_EN } from "../src/locales/host-en.js";
 import { HOST_JA } from "../src/locales/host-ja.js";
 import { hostT } from "../src/locales/index.js";
+import { prepareArchiveContinueWorkflow } from "../src/runtime/file-workflow.js";
 import {
   SUPPORTED_LANGUAGES,
   SUPPORTED_LOCALES,
@@ -84,13 +86,24 @@ describe("English fallback for missing keys or unsupported non-Chinese locales",
     expect(translateFromCatalogs("zh", catalogs, "设置")).toBe("设置");
   });
 
-  it("resolves slash command descriptions for ja with en fallback", () => {
+  it("resolves slash command descriptions for ja and BCP-47 tags with en fallback", () => {
     const description = {
       defaultValue: "Fallback",
       i18n: { en_us: "English description", ja_jp: "日本語の説明", zh_cn: "中文说明" },
     };
     expect(commandDescription(description, "ja")).toBe("日本語の説明");
+    expect(commandDescription(description, "ja-JP")).toBe("日本語の説明");
+    expect(commandDescription(description, "zh-CN")).toBe("中文说明");
+    expect(commandDescription(description, "fr-FR")).toBe("English description");
     expect(commandDescription({ defaultValue: "Fallback", i18n: { en_us: "English only" } }, "ja")).toBe("English only");
+  });
+
+  it("normalizes BCP-47 tags in gateway help and native command guidance", () => {
+    expect(renderGatewayHelp("codex", "ja-JP")).toContain("**TaroBird App ヘルプ**");
+    expect(renderGatewayHelp("codex", "zh-CN")).toContain("**TaroBird App 使用帮助**");
+    expect(renderGatewayHelp("codex", "fr-FR")).toContain("**TaroBird App help**");
+    expect(gatewayNativeCommandHelp("group", "ja-JP")).toContain("会話一覧からグループ");
+    expect(gatewayNativeCommandHelp("group", "zh-CN")).toContain("在会话列表创建群组和话题");
   });
 });
 
@@ -154,20 +167,71 @@ describe("Host message catalogs and core Japanese support", () => {
     expect(renderedEngineFailure(jaAuth)).toEqual({ category: "auth" });
   });
 
-  it("renders Japanese option and localized text in core config card", async () => {
+  it("renders Japanese option, BCP-47 selection, and clean Chinese heading in core config card", async () => {
     const stateDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "tarobird-i18n-card-"));
     try {
-      const card = await renderCoreConfigCard({
+      const jaCard = await renderCoreConfigCard({
         stateDir,
         conversationKey: "chat:1",
         bridgeChatType: "private",
-        locale: "ja",
+        larkChatId: "chat_1",
+        bridgeChatId: 1,
+        locale: "ja-JP",
       });
-      const json = JSON.stringify(card);
-      expect(json).toContain("日本語");
-      expect(json).toContain("エンジン");
+      const jaJson = JSON.stringify(jaCard);
+      expect(jaJson).toContain("✓ 日本語");
+      expect(jaJson).toContain("エンジン");
+      expect(jaJson).toContain("**言語**");
+      expect(jaJson).toContain('"initial_option":"ja"');
+
+      const zhCard = await renderCoreConfigCard({
+        stateDir,
+        conversationKey: "chat:1",
+        bridgeChatType: "private",
+        larkChatId: "chat_1",
+        bridgeChatId: 1,
+        locale: "zh",
+      });
+      const zhJson = JSON.stringify(zhCard);
+      expect(zhJson).toContain("**语言**");
+      expect(zhJson).not.toContain("语言区块");
+
+      const enCard = await renderCoreConfigCard({
+        stateDir,
+        conversationKey: "chat:1",
+        bridgeChatType: "private",
+        larkChatId: "chat_1",
+        bridgeChatId: 1,
+        locale: "en",
+      });
+      const enJson = JSON.stringify(enCard);
+      expect(enJson).toContain("**Language**");
+      expect(enJson).toContain("- Locale:");
     } finally {
       await fs.promises.rm(stateDir, { recursive: true, force: true });
     }
+  });
+
+  it("preserves English /board run-succeeded copy and archive continue default locale", async () => {
+    expect(hostT("en", "已通过 {0} 执行 {1}，状态：进入复核。", "Mini Bus writer", "B1"))
+      .toBe("Ran B1 via Mini Bus writer; status: moved to review.");
+    expect(hostT("en", "已通过 {0} 执行 {1}，状态：已完成。", "Agent Bus writer-bot", "B1"))
+      .toBe("Ran B1 via Agent Bus writer-bot; status: done.");
+
+    const stateDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "tarobird-i18n-archive-"));
+    try {
+      const enDefault = await prepareArchiveContinueWorkflow({ stateDir, chatId: 1, text: "/continue" });
+      expect(enDefault).toEqual({ kind: "reply", text: "There is no archive waiting for continued analysis in this chat." });
+      const zhReply = await prepareArchiveContinueWorkflow({ stateDir, chatId: 1, text: "/continue", locale: "zh" });
+      expect(zhReply).toEqual({ kind: "reply", text: "当前聊天中没有等待继续分析的压缩包。" });
+      const jaReply = await prepareArchiveContinueWorkflow({ stateDir, chatId: 1, text: "/continue", locale: "ja-JP" });
+      expect(jaReply).toEqual({ kind: "reply", text: "現在のチャットに解析再開待ちのアーカイブはありません。" });
+    } finally {
+      await fs.promises.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps module-level UI locale deterministic until setLocale is called", () => {
+    expect(getLocale()).toBe("zh");
   });
 });

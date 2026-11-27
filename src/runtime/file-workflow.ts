@@ -467,6 +467,7 @@ export async function prepareArchiveContinueWorkflow(input: {
     text: string;
   };
 }): Promise<FileWorkflowResult | null> {
+  const locale: Locale = input.locale ?? "en";
   const { matches, extraInstructions, targetUploadId, malformedTarget, isSlashCommand } = isContinueAnalysisCommand(input.text);
   if (!matches) {
     return null;
@@ -475,7 +476,7 @@ export async function prepareArchiveContinueWorkflow(input: {
   if (malformedTarget) {
     return {
       kind: "reply",
-      text: hostT(input.locale, "继续分析命令格式不正确。请使用 /continue、点击“继续分析”，或回复压缩包摘要并输入“继续分析”。"),
+      text: hostT(locale, "继续分析命令格式不正确。请使用 /continue、点击“继续分析”，或回复压缩包摘要并输入“继续分析”。"),
     };
   }
 
@@ -498,14 +499,14 @@ export async function prepareArchiveContinueWorkflow(input: {
       if (targetedRecord?.status === "processing") {
         return {
           kind: "reply",
-          text: hostT(input.locale, "这个压缩包正在当前聊天中继续分析。"),
+          text: hostT(locale, "这个压缩包正在当前聊天中继续分析。"),
         };
       }
 
       if (targetedRecord?.status === "completed") {
         return {
           kind: "reply",
-          text: hostT(input.locale, "这个压缩包已经在当前聊天中完成继续分析。"),
+          text: hostT(locale, "这个压缩包已经在当前聊天中完成继续分析。"),
         };
       }
     }
@@ -523,8 +524,8 @@ export async function prepareArchiveContinueWorkflow(input: {
     return {
       kind: "reply",
       text: explicitTarget
-        ? hostT(input.locale, "这个压缩包已不在当前聊天中等待继续分析。")
-        : hostT(input.locale, "当前聊天中没有等待继续分析的压缩包。"),
+        ? hostT(locale, "这个压缩包已不在当前聊天中等待继续分析。")
+        : hostT(locale, "当前聊天中没有等待继续分析的压缩包。"),
     };
   }
 

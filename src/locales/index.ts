@@ -2,7 +2,13 @@ import { normalizeLocale, translateFromCatalogs, type Locale } from "../runtime/
 import { HOST_EN } from "./host-en.js";
 import { HOST_JA } from "./host-ja.js";
 
+/** Chinese display overrides for disambiguated catalog keys. */
+const HOST_ZH: Readonly<Record<string, string>> = {
+  "语言区块": "语言",
+};
+
 export const HOST_MESSAGE_CATALOGS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  zh: HOST_ZH,
   en: HOST_EN,
   ja: HOST_JA,
 };

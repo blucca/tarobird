@@ -1,5 +1,5 @@
 import { decodeBase64 } from "../../src/client-protocol/base64.js";
-import { t, useLocale, type Locale } from "./i18n.js";
+import { normalizeLocale, t, useLocale, type Locale } from "./i18n.js";
 import { useEffect, useRef, useState } from "react";
 import { Excalidraw, CaptureUpdateAction, convertToExcalidrawElements, exportToBlob, restoreElements, serializeAsJSON } from "@excalidraw/excalidraw";
 import type { AppState, BinaryFiles, ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
@@ -101,8 +101,8 @@ function BoardEditor(props: WorkbenchCanvasProps & { restart?(): void }) {
   const signature = useRef(""), fileSnapshot = useRef<{ input: BinaryFiles; json: BoardDocument["files"] } | null>(null);
   const pointerDown = useRef(false);
   const activeLocale = useLocale();
-  const language = props.lang ?? activeLocale;
-  const excalidrawLang = language === "ja" ? "ja-JP" : language === "en" ? "en" : "zh-CN";
+  const normalizedLanguage = normalizeLocale(props.lang ?? activeLocale, "en");
+  const excalidrawLang = normalizedLanguage === "ja" ? "ja-JP" : normalizedLanguage === "zh" ? "zh-CN" : "en";
   const errorText = (code: string) => {
     const messages: Record<string, string> = {
       whiteboard_image_limit: t("支持 PNG、JPEG、WebP 和 GIF，单张图片不超过 16 MB。"),

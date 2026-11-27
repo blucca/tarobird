@@ -4,19 +4,19 @@ import japanese from "./locales/ja.json" with { type: "json" };
 import {
   localeBcp47,
   localeIntlTag,
+  normalizeLocale,
   translateFromCatalogs,
 } from "../../src/runtime/locale.js";
 import {
   resolveLocalePreference,
   SUPPORTED_LANGUAGES,
-  systemLocale,
   type Locale,
   type LocalePreference,
   type SupportedLocale,
 } from "./system-locale.js";
 
 export type { Locale, LocalePreference, SupportedLocale };
-export { localeBcp47, localeIntlTag, SUPPORTED_LANGUAGES };
+export { localeBcp47, localeIntlTag, normalizeLocale, SUPPORTED_LANGUAGES };
 
 export const UI_CATALOGS: Record<string, Record<string, string>> = {
   en: english,
@@ -24,8 +24,12 @@ export const UI_CATALOGS: Record<string, Record<string, string>> = {
 };
 
 let preference: LocalePreference = "system";
-let locale: SupportedLocale = systemLocale();
+let locale: SupportedLocale = "zh";
 const listeners = new Set<() => void>();
+
+export function getLocale(): SupportedLocale {
+  return locale;
+}
 
 export function setLocale(next: LocalePreference): void {
   preference = next;
@@ -76,7 +80,7 @@ export function commandDescription(
   description: { defaultValue?: string; i18n?: Record<string, string | undefined> },
   activeLocale: Locale = locale,
 ): string {
-  const key = COMMAND_I18N_KEYS[activeLocale];
+  const key = COMMAND_I18N_KEYS[normalizeLocale(activeLocale, "en")];
   const i18n = description.i18n;
   if (key && i18n?.[key]) return i18n[key];
   return i18n?.en_us ?? description.defaultValue ?? i18n?.zh_cn ?? "";

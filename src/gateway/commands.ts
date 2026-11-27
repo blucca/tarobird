@@ -1,5 +1,5 @@
 import { CORE_SLASH_COMMANDS } from "../core/slash-command-registry.js";
-import type { Locale } from "../runtime/locale.js";
+import { normalizeLocale, type Locale } from "../runtime/locale.js";
 import { GatewayGroupModeStore, gatewayRequiresMention } from "./group-mode.js";
 import { PI_APP_COMMANDS } from "./pi-commands.js";
 
@@ -57,7 +57,8 @@ export function gatewayCommands(engine: string, query = "", engineCommands: Read
 }
 
 function pickGatewayText(locale: Locale, copy: { en: string; zh: string; ja: string }): string {
-  return locale === "ja" ? copy.ja : locale === "zh" ? copy.zh : copy.en;
+  const normalized = normalizeLocale(locale, "en");
+  return normalized === "ja" ? copy.ja : normalized === "zh" ? copy.zh : copy.en;
 }
 
 /** Hub membership owns access; only this Bot/conversation's reply policy changes.
@@ -121,10 +122,11 @@ export function gatewayNativeCommandHelp(command: string, locale: Locale): strin
 }
 
 export function renderGatewayHelp(engine: string, locale: Locale): string {
+  const normalized = normalizeLocale(locale, "en");
   const commandLine = (command: string, description: { defaultValue: string; i18n: Record<string, string> }) => {
-    const desc = locale === "ja"
+    const desc = normalized === "ja"
       ? (description.i18n.ja_jp || description.defaultValue)
-      : locale === "zh"
+      : normalized === "zh"
         ? (description.i18n.zh_cn || description.defaultValue)
         : description.defaultValue;
     return `- \`/${command}\` — ${desc}`;

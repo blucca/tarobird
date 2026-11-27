@@ -382,7 +382,7 @@ export class DeepSeekHarnessAdapter implements CodexAdapter {
           } catch { if (pending.abortController.signal.aborted) throw abortError(); }
           pending.abortController.signal.throwIfAborted();
           if (nativeAppTools) turnInput = { ...input, instructions: input.appPlatformTools.instructions, turnInstructions: input.appPlatformTools.turnInstructions };
-          else await this.emit(pending, { type: "assistant_text", text: hostT(input.locale ?? "en", "当前 Harness 实例的原生 App 工具不可用，本轮使用兼容交付。"), sessionId });
+          else await this.emit(pending, { type: "assistant_text", text: hostT(input.locale, "当前 Harness 实例的原生 App 工具不可用，本轮使用兼容交付。"), sessionId });
         }
         const content = await this.buildPromptContent(turnInput);
         pending.abortController.signal.throwIfAborted();
