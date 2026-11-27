@@ -1264,4 +1264,38 @@ describe("AntigravityAcpAdapter inactivity watchdog", () => {
     await expect(settleWithin(second, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
     expect(harness.log).toContain("kill:900");
   });
+
+  it("pauses inactivity timeout during reactive wait after invoke_subagent completes on spawn, and re-arms if a subsequent foreground step stalls", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { inactivityTimeoutMs: 80 }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "delegate to subagent", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    // agy completes invoke_subagent immediately when spawning and then holds session/prompt open waiting for the child.
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_sub", name: "invoke_subagent", kind: "other", title: "invoke_subagent", status: "in_progress", rawInput: { TypeName: "self", Role: "Fix PR" } });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_sub", status: "completed", rawOutput: { output: "{\"conversationId\":\"sub-1\"}" } });
+    server.text("Subagent launched, waiting for result.");
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 120, size: 1000 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(harness.log).toEqual([]);
+
+    // Subagent wakes the parent, which runs a foreground tool and then stalls before the next usage_update.
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_read", name: "read_file", kind: "read", title: "read_file", status: "in_progress" });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_read", status: "completed", rawOutput: { output: "ok" } });
+    await expect(settleWithin(reply, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
+    expect(harness.log).toContain("kill:900");
+  });
+
+  it("does not pause inactivity timeout for read-only swarm status calls, only swarm add reactive waits", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { inactivityTimeoutMs: 70 }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "check swarm", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_sw", name: "swarm", kind: "other", title: "swarm", status: "in_progress", rawInput: { action: "status" } });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_sw", status: "completed" });
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 100, size: 1000 });
+    await expect(settleWithin(reply, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
+    expect(harness.log).toContain("kill:900");
+  });
 });
