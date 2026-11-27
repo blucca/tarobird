@@ -57,6 +57,8 @@ import { ConversationFolders } from "./conversation-folders.js";
 import { ConversationPins } from "./conversation-pins.js";
 import { CrossHostFolderOrder } from "./cross-host-folder-order.js";
 import { HostProfile } from "./host-profile.js";
+import { HOST_BALANCE_RESOURCES_PATH } from "../client-protocol/host-balance-resources.js";
+import { readHostBalanceResources } from "./host-balance-resources.js";
 import { hostNameSchema } from "../client-protocol/host-profile.js";
 import { PrivateNetwork } from "./private-network.js";
 import { certificateAuthorityFromChain, lanInterfaceKey, HostRoutes, type ManagedListener } from "./host-routes.js";
@@ -1963,6 +1965,10 @@ export class HubServer {
       if (route === "/api/host-profile" && (req.method === "GET" || req.method === "PATCH")) {
         if (req.method === "GET") await reply(200, await this.profile.read(validateInQueue));
         else { await requireOwner(); await reply(200, await this.profile.update(await this.jsonBody(req), validateInQueue)); }
+        return;
+      }
+      if (route === HOST_BALANCE_RESOURCES_PATH && req.method === "GET") {
+        await reply(200, await readHostBalanceResources(this.store));
         return;
       }
       if (route === "/api/network" && req.method === "GET") {
