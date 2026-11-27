@@ -11,6 +11,7 @@ import {
   QUOTA_EXPIRED_TEXT,
   QUOTA_KIMI_API_KEY_TEXT,
   QUOTA_KIMI_NOT_CODING_PLAN_TEXT,
+  QUOTA_PI_UNSUPPORTED_TEXT,
   QUOTA_REASON_TEXT,
   QUOTA_STATE_TEXT,
 } from "../src/host-cli/engine-quota.js";
@@ -185,6 +186,7 @@ it("CLI status and reason text is the App's own wording in both languages", asyn
     QUOTA_CLAUDE_UNVERIFIABLE_TEXT,
     QUOTA_KIMI_API_KEY_TEXT,
     QUOTA_KIMI_NOT_CODING_PLAN_TEXT,
+    QUOTA_PI_UNSUPPORTED_TEXT,
     QUOTA_EXPIRED_TEXT,
   ];
   for (const [zh, english] of pairs) { expect(app).toContain(`t("${zh}")`); expect(en[zh]).toBe(english); }
@@ -193,7 +195,7 @@ it("CLI status and reason text is the App's own wording in both languages", asyn
 });
 
 it("CLI notes explain why each Bot has no current reading, how to refresh it and where to look", () => {
-  const scope = (id: string, engine: "codex" | "claude" | "kimi", snapshot: ReturnType<typeof unavailableQuota>) =>
+  const scope = (id: string, engine: "codex" | "claude" | "kimi" | "pi", snapshot: ReturnType<typeof unavailableQuota>) =>
     ({ ...snapshot, id, revision: `${id}_rev`, engine, label: `${id} Bot`, botIds: [id], sharing: "unverified" as const });
   const ready = { ...unavailableQuota("codex", "not_loaded", 1000), state: "ready" as const, reason: undefined, capability: { mode: "active" as const }, observedAt: new Date(1000).toISOString() };
   const directory = { generatedAt: new Date(1000).toISOString(), scopes: [
@@ -206,12 +208,14 @@ it("CLI notes explain why each Bot has no current reading, how to refresh it and
     scope("kimi", "kimi", unavailableQuota("kimi", "not_adapted")),
     scope("kimi_key", "kimi", unavailableQuota("kimi", "mode_not_supported", 1000, "api_key")),
     scope("kimi_404", "kimi", { ...unavailableQuota("kimi", "mode_not_supported", 1000, "other"), capability: { mode: "active" as const, reason: "mode_not_supported" as const } }),
+    scope("pi", "pi", unavailableQuota("pi", "mode_not_supported", 1000, "other")),
   ] };
   const notes = engineQuotaNotes(directory, 2000), text = notes.join("\n");
   expect(text).not.toMatch(/current Bot/);
   expect(notes).toContain("expired Bot（Codex）：待更新 — 已过期，需重新读取 / Awaiting update — Expired; refresh required");
   expect(notes).toContain("signin Bot（Codex）：需要登录 — 请先在运行主机上完成引擎登录，再刷新。 / Sign-in required — Sign in to the engine on the Host, then refresh.");
   expect(notes).toContain("apikey Bot（Codex）：暂不支持 — 此授权方式不提供可读取的原生额度。 / Not supported — This authorization mode does not provide readable native quotas.");
+  expect(notes).toContain(`pi Bot（Pi）：暂不支持 — ${QUOTA_PI_UNSUPPORTED_TEXT[0]} / Not supported — ${QUOTA_PI_UNSUPPORTED_TEXT[1]}`);
   expect(text).toContain(`keyring Bot（Codex）：尚无数据 — ${QUOTA_REASON_TEXT.scope_unverifiable[0]}`);
   expect(text).toContain(`keychain Bot（Claude Code）：尚无数据 — ${QUOTA_CLAUDE_UNVERIFIABLE_TEXT[0]}`);
   expect(notes).toContain(`kimi_key Bot（Kimi）：暂不支持 — ${QUOTA_KIMI_API_KEY_TEXT[0]} / Not supported — ${QUOTA_KIMI_API_KEY_TEXT[1]}`);
@@ -220,7 +224,7 @@ it("CLI notes explain why each Bot has no current reading, how to refresh it and
   expect(notes).toContain("  刷新 / Refresh: tarobird engines quota --bot signin --refresh --revision signin_rev");
   expect(notes).toContain("  刷新 / Refresh: tarobird engines quota --bot kimi_404 --refresh --revision kimi_404_rev");
   expect(notes).toContain(`  刷新 / Refresh（${new Date(50_000).toISOString()} 后 / after ${new Date(50_000).toISOString()}）: tarobird engines quota --bot keyring --refresh --revision keyring_rev`);
-  expect(text).not.toMatch(/--bot (apikey|keychain|kimi|kimi_key) /);
+  expect(text).not.toMatch(/--bot (apikey|keychain|kimi|kimi_key|pi) /);
   expect(notes.filter(line => line.includes("官方查看")).length).toBeGreaterThan(0);
   expect(notes.at(-1)).toMatch(/^kimi Bot, kimi_key Bot, kimi_404 Bot: 官方查看/);
 });

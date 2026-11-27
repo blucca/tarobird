@@ -21,6 +21,7 @@ function reasonText(reason: QuotaReason | undefined, engine: QuotaEngine, authMo
           ? t("当前仅配置了 API Key，未登录 Kimi For Coding 套餐账号，无套餐额度可读取。")
           : t("当前账号不是 Kimi For Coding 套餐账号（服务端返回 404），不提供编程套餐额度。");
       }
+      if (engine === "pi") return t("当前供应商不提供可读取的账号额度（Pi 仅统计本会话 token 与费用）。");
       return t("此授权方式不提供可读取的原生额度。");
     case "no_passive_event": return t("尚未收到原生额度状态，仅在正常使用中被动更新。");
     case "login_required": return t("请先在运行主机上完成引擎登录，再刷新。");
@@ -121,7 +122,7 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
           {constraints.length > 0 && <ul className="quota-constraints">{constraints.map((value, index) => <li key={`${value.code}:${index}`}>{constraintText(value)}{value.resetsAt && <span> · {formatResetMeta(value.resetsAt, now, locale, formatTime)}</span>}</li>)}</ul>}
           {scope.pools.map(pool => <div className="quota-pool" key={pool.id}><h5>{pool.label}</h5>{pool.models?.length ? <p className="muted">{pool.models.join(" · ")}</p> : null}
             {pool.windows.map(window => <WindowQuota key={window.id} window={window} stale={stale} now={now} locale={locale} formatTime={formatTime} formatNumber={formatNumber}/>)}
-            {pool.balances.map(balance => <p className="quota-balance" key={balance.id}>{balance.kind === "currency" ? t("加油包余额") : t("原生 credits")}<strong>{balance.unlimited ? t("不限额") : balance.amount === null ? t("尚无数据") : `${balance.amount} ${balance.unit}`}</strong>{(stale || expired(balance, now)) && <small>{t("上次读数，需重新读取")}</small>}</p>)}
+            {pool.balances.map(balance => <p className="quota-balance" key={balance.id}>{balance.kind === "currency" ? (balance.id === "top_up" ? t("加油包余额") : balance.id.startsWith("bonus_") ? t("赠送余额") : balance.id.startsWith("recharge_") ? t("充值余额") : t("账户余额")) : t("原生 credits")}<strong>{balance.unlimited ? t("不限额") : balance.amount === null ? t("尚无数据") : `${balance.amount} ${balance.unit}`}</strong>{(stale || expired(balance, now)) && <small>{t("上次读数，需重新读取")}</small>}</p>)}
           </div>)}
           {quota.errors[scope.id] && <p className="quota-notice" role="alert">{t("本次刷新失败，可重试。保留的读数不代表当前余额。")}</p>}
           <footer className="quota-card-footer"><div>{scope.observedAt && <time dateTime={scope.observedAt}>{t("读取于 {0}", formatTime(scope.observedAt))}</time>}{cooling && <time dateTime={scope.nextRefreshAt}>{t("{0} 后可再刷新", formatTime(scope.nextRefreshAt!))}</time>}</div>

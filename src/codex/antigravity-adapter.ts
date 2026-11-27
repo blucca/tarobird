@@ -20,6 +20,7 @@ import type {
 import { EngineIncompleteResponseError } from "./adapter.js";
 import { AdapterQuotaCache } from "./adapter-account-quota.js";
 import { cancelOwnedAntigravityQuotaReads, readOwnedAntigravityQuota } from "./antigravity-account-quota.js";
+import type { AntigravityLocalProbeDeps } from "./antigravity-local-server.js";
 import { killProcessTree } from "./process-tree.js";
 import { appStopKillOptions } from "../runtime/turn-cancellation.js";
 import { renderPrivateTurnInstructions } from "./turn-instructions.js";
@@ -190,6 +191,7 @@ type AntigravityWorker = {
   userEchoMode: "unknown" | "present" | "absent";
   pendingTurn: AntigravityPendingTurn | null;
   lastActivityAt: number;
+  quotaCredentialAtSpawn: string;
   logDir?: string;
   removed: boolean;
 };
@@ -431,6 +433,7 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
     private readonly inactivityTimeoutMs: number | null = ANTIGRAVITY_PROCESS_INACTIVITY_TIMEOUT_MS,
     private readonly idleWorkerTtlMs: number = DEFAULT_IDLE_WORKER_TTL_MS,
     idleSweepIntervalMs: number = DEFAULT_IDLE_SWEEP_INTERVAL_MS,
+    private readonly localQuotaProbe?: boolean | Partial<AntigravityLocalProbeDeps>,
   ) {
     const buildChildEnv = () => {
       const env = { ...process.env };
@@ -455,9 +458,14 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
   async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
     const captureScope = () => this.quotaCache.capture("process");
     const scope = captureScope();
-    if (this.destroyed) return this.quotaCache.failure(scope, "cancelled");
+    if (this.destroyed || this.destroyPromise) return this.quotaCache.failure(scope, "cancelled");
     const cached = this.quotaCache.response(scope, options);
     if (cached) return cached;
+    const preferredPids = [...new Set([...this.workers.values()]
+      .filter(worker => !worker.removed
+        && worker.quotaCredentialAtSpawn === scope.credentialRevision
+        && typeof worker.child.pid === "number" && worker.child.pid > 0)
+      .map(worker => worker.child.pid as number))];
     return readOwnedAntigravityQuota({
       executable: this.antigravityExecutable,
       cwd: this.workspacePath ?? process.cwd(),
@@ -467,6 +475,8 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
       scope,
       options,
       captureScope,
+      preferredPids,
+      localProbe: this.localQuotaProbe ?? (this.spawnAntigravity === (spawnEngine as unknown as SpawnAntigravity)),
     });
   }
 
@@ -760,6 +770,7 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
       ...(workspace ? ["--add-dir", workspace] : []),
     ];
     const invocation = buildCommandInvocation(this.antigravityExecutable, args);
+    const quotaCredentialAtSpawn = this.quotaCache.capture("spawn").credentialRevision;
     let child: ProcessChildLike;
     try {
       child = this.spawnAntigravity(invocation.command, invocation.args, {
@@ -792,6 +803,7 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
       userEchoMode: "unknown",
       pendingTurn: null,
       lastActivityAt: Date.now(),
+      quotaCredentialAtSpawn,
       ...(logDir ? { logDir } : {}),
       removed: false,
     };

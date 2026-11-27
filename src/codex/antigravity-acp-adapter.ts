@@ -81,6 +81,7 @@ export type AntigravityAcpAdapterOptions = {
   spawnFn?: SpawnAgyAcp;
   /** Starts the one-shot `agy -p /usage` read; never the ACP server. */
   quotaSpawnFn?: AntigravityQuotaSpawn;
+  localQuotaProbe?: boolean | Partial<import("./antigravity-local-server.js").AntigravityLocalProbeDeps>;
   killProcessTreeFn?: (pid: number | undefined, options?: { graceMs: number }) => void;
   initializeTimeoutMs?: number;
   /** Bound for each session/close before the process is ended anyway. */
@@ -220,6 +221,7 @@ type Worker = {
   contextUsage?: { used: number; size: number };
   stderrTail: string;
   lastActivityAt: number;
+  quotaCredentialAtSpawn: string;
   removed: boolean;
   /** Set while initialize and the session request are in flight; ends that wait when the worker is removed. */
   rejectStart?: (error: Error) => void;
@@ -517,18 +519,27 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     return { sessionId: `tarobot-${chatId}` };
   }
 
-  /** Quota belongs to the login, not to the runtime: the same one-shot `agy -p /usage` read as the print
-   * runtime, with its rules (never started without local login state, version checked, zero turns). */
+  /** Quota belongs to the login, not to the runtime: prefers the running `agy acp` / local Antigravity
+   * language server (zero new processes), falling back to `agy -p /usage` when no local server answers. */
   async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
     const captureScope = () => this.quotaCache.capture("process");
     const scope = captureScope();
     if (this.destroyed || this.destroyPromise) return this.quotaCache.failure(scope, "cancelled");
     const cached = this.quotaCache.response(scope, options);
     if (cached) return cached;
+    const preferredPids = [...new Set([...this.workers.values()]
+      .filter(worker => !worker.removed && !worker.closing && !worker.exited
+        && worker.quotaCredentialAtSpawn === scope.credentialRevision
+        && typeof worker.child.pid === "number" && worker.child.pid > 0)
+      .map(worker => worker.child.pid as number))];
+    // Keep unit tests with injected fake spawners hermetic unless `localQuotaProbe` is explicitly supplied.
+    const localProbe = this.options.localQuotaProbe ?? (!this.options.quotaSpawnFn && !this.options.spawnFn);
     return readOwnedAntigravityQuota({
       executable: this.executable, cwd: this.options.workspacePath, env: this.childEnv,
       spawn: this.options.quotaSpawnFn ?? (spawnEngine as unknown as AntigravityQuotaSpawn),
       cache: this.quotaCache, scope, options, captureScope,
+      preferredPids,
+      localProbe,
     });
   }
 
@@ -722,6 +733,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (this.destroyed) throw new Error("Adapter destroyed");
     const args = ["acp", ...permissionFlags(approvalMode), "--add-dir", workspace];
     const invocation = buildCommandInvocation(this.executable, args);
+    const quotaCredentialAtSpawn = this.quotaCache.capture("spawn").credentialRevision;
     const child = this.spawnFn(invocation.command, invocation.args, {
       stdio: ["pipe", "pipe", "pipe"], shell: invocation.shell, env: this.childEnv, cwd: workspace, windowsHide: true,
     });
@@ -737,7 +749,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       .connect(stream);
     worker = {
       child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], planModeRequested: false, announceSession: false, turn: null, reserved: false, wake: null, promptSeq: 0,
-      tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), removed: false, exited: false,
+      tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), quotaCredentialAtSpawn, removed: false, exited: false,
     };
     this.workers.set(requestedId, worker);
     const decoder = new TextDecoder();

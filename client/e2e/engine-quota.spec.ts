@@ -495,3 +495,83 @@ test("Kimi quota card renders plan windows, top-up balance, and distinct 404 / A
     await expect(kimi).toContainText("完成引擎登录");
   } finally { await f.close(); }
 });
+
+test("upgraded App negotiates currency balances for DeepSeek and displays Pi provider guidance", async ({ page }) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "tarobird-quota-currency-ui-"));
+  const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: quotaUiClient ?? path.resolve("dist") });
+  await hub.profile.update({ name: "Quota currency Host", revision: (await hub.profile.read()).revision });
+  const now = Date.now(), stamp = (delta = 0) => new Date(now + delta).toISOString();
+  const snapshots: Record<string, QuotaSnapshot> = {
+    deepseek: {
+      authMode: "subscription",
+      capability: { mode: "active" },
+      state: "ready",
+      availability: "unknown",
+      observedAt: stamp(),
+      lastAttemptAt: stamp(),
+      pools: [{
+        id: "deepseek_wallet",
+        label: "DeepSeek",
+        sharing: "shared",
+        availability: "unknown",
+        windows: [],
+        balances: [
+          { id: "recharge_cny", kind: "currency", unit: "CNY", amount: "42.00", observedAt: stamp(), expiresAt: stamp(60_000) },
+          { id: "bonus_cny", kind: "currency", unit: "CNY", amount: "5.25", observedAt: stamp(), expiresAt: stamp(60_000) },
+        ],
+        constraints: [],
+      }],
+      constraints: [],
+      help: "deepseek_balance",
+    },
+    pi: unavailableQuota("pi", "mode_not_supported", now, "other"),
+  };
+  const gateways = [];
+  try {
+    for (const [id, name, engine] of [["deepseek", "DeepSeek Bot", "deepseek"], ["pi", "Pi Bot", "pi"]] as const) {
+      const stateDir = path.join(root, id), secret = randomBytes(32).toString("base64url");
+      await mkdir(stateDir);
+      await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine }));
+      await hub.store.db.run("INSERT INTO bots(id,name,secret_hash,engine) VALUES(?,?,?,?)", [id, name, hashSecret(secret), engine]);
+      gateways.push(await attachGateway({
+        stateDir,
+        url: hub.instanceUrl.replace("http", "ws") + "/instance",
+        secret,
+        botId: id,
+        engine,
+        runtime: createCoreServiceRuntime(),
+        bridge: {
+          handleAuthorizedMessage: async () => { throw new Error("quota_must_not_send_a_turn"); },
+          readAccountQuota: async () => ({ revision: `${id}_rev`, snapshot: snapshots[id]! }),
+        },
+      }));
+    }
+    await page.goto(hub.url);
+    const invitation = await fixtureInvitation(hub);
+    await page.getByRole("button", { name: "粘贴连接信息", exact: true }).click();
+    await page.getByLabel("配对信息", { exact: true }).fill(pairingLink({ v: 1, kind: "connect", hubPublicKey: hub.auth.publicKey, invite: invitation.invite, routes: [{ name: "Direct", url: hub.url }] }));
+    await page.getByRole("button", { name: "使用配对信息", exact: true }).click();
+    await page.getByRole("button", { name: "配对此设备", exact: true }).click();
+    await hub.auth.approve(await page.getByLabel("配对码", { exact: true }).innerText(), "local-owner");
+    await page.getByLabel("配对码", { exact: true }).waitFor({ state: "hidden" });
+    await expect(page.locator(".host-workspace:not([hidden]) .connection-pill.online")).toBeAttached();
+    await page.getByRole("button", { name: "设置", exact: true }).filter({ visible: true }).click();
+    await page.getByRole("navigation", { name: "设置分类" }).getByRole("button", { name: /^模型额度/ }).click();
+
+    const panel = page.locator(".engine-quota:visible");
+    const dsh = panel.getByRole("region", { name: "DeepSeek Bot · DeepSeek", exact: true });
+    await expect(dsh).toContainText("充值余额");
+    await expect(dsh).toContainText("42.00 CNY");
+    await expect(dsh).toContainText("赠送余额");
+    await expect(dsh).toContainText("5.25 CNY");
+
+    const pi = panel.getByRole("region", { name: "Pi Bot · Pi", exact: true });
+    await expect(pi).toContainText("当前供应商不提供可读取的账号额度（Pi 仅统计本会话 token 与费用）。");
+    await expect(pi.getByRole("button")).toHaveCount(0);
+  } finally {
+    await page.close();
+    for (const gateway of gateways) await gateway.disconnect();
+    await hub.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

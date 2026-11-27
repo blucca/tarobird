@@ -1,4 +1,4 @@
-import { nativeQuotaReplySchema, quotaDirectorySchema, quotaEngineSchema, quotaScopeSchema, type QuotaScope } from "../client-protocol/engine-quota.js";
+import { nativeQuotaReplySchema, projectQuotaScopeForClient, quotaDirectorySchema, quotaEngineSchema, quotaScopeSchema, type QuotaScope } from "../client-protocol/engine-quota.js";
 import { unavailableQuota } from "../codex/account-quota.js";
 import { HubError } from "./errors.js";
 
@@ -43,10 +43,8 @@ export function hubEngineQuotas(options: {
       return fallback(bot, error instanceof HubError && error.code === "bot_timeout" ? "timeout" : "invalid_response");
     }
   };
-  const project = (scope: QuotaScope, includeCurrencyBalances: boolean): QuotaScope => includeCurrencyBalances ? scope : {
-    ...scope,
-    pools: scope.pools.map(pool => ({ ...pool, balances: pool.balances.filter(balance => balance.kind === "credits") })),
-  };
+  // The one place a reply is cut down for a client that did not ask for currency balances (a v1.6.0 App or CLI).
+  const project = (scope: QuotaScope, includeCurrencyBalances: boolean): QuotaScope => projectQuotaScopeForClient(scope, { currencyBalances: includeCurrencyBalances });
   return {
     async directory(readOptions?: { includeCurrencyBalances?: boolean }) {
       const includeCurrency = readOptions?.includeCurrencyBalances === true;

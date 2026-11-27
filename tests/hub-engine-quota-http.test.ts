@@ -8,13 +8,18 @@ import { HubServer } from "../src/hub/server.js";
 import { GatewayTransport } from "../src/gateway/transport.js";
 import { gatewayEngineQuota } from "../src/gateway/engine-quota.js";
 import { unavailableQuota } from "../src/codex/account-quota.js";
-import { quotaDirectorySchema, quotaScopeSchema } from "../src/client-protocol/engine-quota.js";
+import type { EngineQuotaReadOptions, EngineQuotaReadResult } from "../src/codex/adapter-account-quota.js";
+import {
+  ENGINE_QUOTA_CAPABILITY,
+  ENGINE_QUOTA_CURRENCY_CAPABILITY,
+  quotaDirectorySchema,
+  quotaScopeSchema,
+} from "../src/client-protocol/engine-quota.js";
 import { bootstrapTrusted } from "./helpers/pairing-invite.js";
 import { engineQuotaCommand } from "../src/host-cli/engine-quota.js";
-import { ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_CURRENCY_CAPABILITY } from "../src/client-protocol/engine-quota.js";
 
 let root: string, hub: HubServer, token: string, transport: GatewayTransport;
-let read: ReturnType<typeof vi.fn>;
+let read: ReturnType<typeof vi.fn<(options: EngineQuotaReadOptions) => Promise<EngineQuotaReadResult | undefined>>>;
 beforeEach(async () => {
   root = await mkdtemp(path.join(os.tmpdir(), "quota-api-"));
   hub = await HubServer.start({ stateDir: root });
@@ -24,7 +29,11 @@ beforeEach(async () => {
   await bootstrapTrusted(hub.auth, { deviceId: "device", name: "Example device", platform: "web", publicKey: keys.publicKey.export({ type: "spki", format: "der" }).toString("base64") });
   const challenge = await hub.auth.challenge("device", "device", nonce, "fixture");
   token = (await hub.auth.authenticate("device", sign(null, deviceProof("device", challenge.nonce, nonce), keys.privateKey).toString("base64"))).token;
-  read = vi.fn(async () => ({ revision: "revision_one", snapshot: unavailableQuota("codex", "not_loaded"), proof: { scopeStamp: "private_account_proof" } }));
+  read = vi.fn<(options: EngineQuotaReadOptions) => Promise<EngineQuotaReadResult | undefined>>(async () => ({
+    revision: "revision_one",
+    snapshot: unavailableQuota("codex", "not_loaded"),
+    proof: { engine: "codex", scopeStamp: "private_account_proof", accountKey: "private_account_key" },
+  }));
   transport = new GatewayTransport({ stateDir: path.join(root, "gateway"), url: hub.instanceUrl.replace("http", "ws") + "/instance", botId: "quota_bot", secret, engine: "codex" });
   const handle = gatewayEngineQuota({ botId: "quota_bot", engine: "codex", read });
   transport.onCall = (method, params) => { if (method !== "quota.get") throw new Error("unexpected_method"); return handle(params); };
@@ -138,4 +147,72 @@ it("omits currency balances for legacy v1.6.0 HTTP requests and returns them whe
   };
   const cliDir = quotaDirectorySchema.parse(await engineQuotaCommand(cliClient as any, {}));
   expect(cliDir.scopes[0]!.pools[0]!.balances.map(b => b.kind)).toEqual(["credits", "currency"]);
+});
+
+it("gates currency balances behind engines.quota.currency.v1 so v1.6.0 clients stay schema-compatible", async () => {
+  const now = Date.now(), observedAt = new Date(now).toISOString(), expiresAt = new Date(now + 60_000).toISOString();
+  const dshSecret = randomBytes(32).toString("base64url");
+  await hub.store.db.run("INSERT INTO bots(id,name,secret_hash,engine) VALUES('deepseek_bot','DeepSeek Bot',?,'deepseek')", [hashSecret(dshSecret)]);
+  const dshTransport = new GatewayTransport({ stateDir: path.join(root, "gateway-dsh"), url: hub.instanceUrl.replace("http", "ws") + "/instance", botId: "deepseek_bot", secret: dshSecret, engine: "deepseek" });
+  const dshHandle = gatewayEngineQuota({
+    botId: "deepseek_bot",
+    engine: "deepseek",
+    read: async () => ({
+      revision: "dsh_rev",
+      snapshot: {
+        authMode: "subscription",
+        capability: { mode: "active" },
+        state: "ready",
+        availability: "unknown",
+        observedAt,
+        lastAttemptAt: observedAt,
+        pools: [{
+          id: "deepseek_wallet",
+          label: "DeepSeek",
+          sharing: "shared",
+          availability: "unknown",
+          windows: [],
+          balances: [{ id: "recharge_cny", kind: "currency", amount: "42.00", unit: "CNY", observedAt, expiresAt }],
+          constraints: [],
+        }],
+        constraints: [],
+        help: "deepseek_balance",
+      },
+    }),
+  });
+  dshTransport.onCall = (method, params) => { if (method !== "quota.get") throw new Error("unexpected_method"); return dshHandle(params); };
+  let attached!: () => void;
+  const ready = new Promise<void>(resolve => { attached = resolve; });
+  dshTransport.onBoot = async () => attached();
+  await dshTransport.connect();
+  await ready;
+
+  try {
+    // v1.6.0 client: does not ask for currency balances and expects zero kind:"currency" balances.
+    const v1Dir = quotaDirectorySchema.parse(await (await request("/api/engine-quotas")).json());
+    const v1DeepSeek = v1Dir.scopes.find(scope => scope.id === "deepseek_bot");
+    expect(v1DeepSeek).toMatchObject({ id: "deepseek_bot", state: "unknown", pools: [], help: "deepseek_balance" });
+    expect(v1DeepSeek?.observedAt).toBeUndefined();
+    for (const scope of v1Dir.scopes) {
+      for (const pool of scope.pools) {
+        for (const balance of pool.balances) {
+          expect(balance.kind).toBe("credits");
+          expect(balance.unit).toBe("credits");
+        }
+      }
+    }
+    const v1Scope = quotaScopeSchema.parse(await (await request("/api/engine-quotas/deepseek_bot")).json());
+    expect(v1Scope).toMatchObject({ id: "deepseek_bot", state: "unknown", pools: [] });
+
+    // Updated client: asks with ?balances=currency (the Hub advertises engines.quota.currency.v1) and receives full currency balances.
+    const v2Dir = quotaDirectorySchema.parse(await (await request("/api/engine-quotas?balances=currency")).json());
+    const v2DeepSeek = v2Dir.scopes.find(scope => scope.id === "deepseek_bot");
+    expect(v2DeepSeek?.state).toBe("ready");
+    expect(v2DeepSeek?.pools[0]?.balances[0]).toMatchObject({ id: "recharge_cny", kind: "currency", amount: "42.00", unit: "CNY" });
+
+    const v2Scope = quotaScopeSchema.parse(await (await request("/api/engine-quotas/deepseek_bot?balances=currency")).json());
+    expect(v2Scope.pools[0]?.balances[0]).toMatchObject({ id: "recharge_cny", kind: "currency", amount: "42.00", unit: "CNY" });
+  } finally {
+    await dshTransport.disconnect();
+  }
 });

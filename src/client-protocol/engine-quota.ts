@@ -3,7 +3,8 @@ import { z } from "zod";
 export const ENGINE_QUOTA_CAPABILITY = "engines.quota.v1";
 /** Additive Host capability: clients pass `?balances=currency` to receive non-`credits` currency
  * balances; `engines.quota.v1` callers without it receive only `credits` balances so v1.6.0 clients
- * with `z.literal("credits")` never fail schema parsing. */
+ * with `z.literal("credits")` never fail schema parsing. The query parameter is the only negotiation:
+ * the App's native transports refuse any request header outside their short allow-list. */
 export const ENGINE_QUOTA_CURRENCY_CAPABILITY = "engines.quota.currency.v1";
 export const ENGINE_QUOTA_TTL_MS = 60_000;
 /** How long one explicit refresh may take inside an engine. Antigravity's `agy -p /usage` took 4 to 8 seconds
@@ -35,11 +36,16 @@ export const quotaWindowSchema = z.discriminatedUnion("metric", [
   z.object({ ...windowFields, metric: z.literal("percent"), usedPercent: z.number().finite().min(0).max(2147483647) }).strict(),
   z.object({ ...windowFields, metric: z.literal("unknown") }).strict(),
 ]);
-// Native credit or top-up currency balances. They are not token estimates.
-export const quotaBalanceSchema = z.object({
-  id: identifier, kind: z.enum(["credits", "currency"]), amount: z.string().max(80).regex(/^\d+(?:\.\d+)?$/).nullable(),
-  unit: z.string().min(1).max(16).regex(/^[A-Za-z0-9._-]+$/), observedAt: timestamp, expiresAt: timestamp, unlimited: z.boolean().optional(),
-}).strict();
+// Native credit balances, and currency balances (a top-up pack, a wallet). They are not token estimates.
+// A "credits" balance keeps the unit it has always had; only a "currency" balance names its own.
+const balanceFields = {
+  id: identifier, amount: z.string().max(80).regex(/^\d+(?:\.\d+)?$/).nullable(),
+  observedAt: timestamp, expiresAt: timestamp, unlimited: z.boolean().optional(),
+};
+export const quotaBalanceSchema = z.discriminatedUnion("kind", [
+  z.object({ ...balanceFields, kind: z.literal("credits"), unit: z.literal("credits") }).strict(),
+  z.object({ ...balanceFields, kind: z.literal("currency"), unit: z.string().min(1).max(16).regex(/^[A-Za-z0-9._-]+$/) }).strict(),
+]);
 export const quotaConstraintSchema = z.object({
   code: z.enum(["ordinary_usage_blocked", "spend_control", "credits_depleted", "overage_disabled", "other_native_limit"]),
   availability: quotaAvailabilitySchema, resetsAt: timestamp.optional(),
@@ -89,4 +95,32 @@ export function quotaReadingExpired(snapshot: Pick<QuotaSnapshot, "observedAt" |
   if (snapshot.observedAt && Date.parse(snapshot.observedAt) + ENGINE_QUOTA_TTL_MS <= now) return true;
   if ([...snapshot.constraints, ...snapshot.pools.flatMap(pool => pool.constraints)].some(value => past(value.resetsAt))) return true;
   return snapshot.pools.some(pool => [...pool.windows, ...pool.balances].some(value => past(value.expiresAt) || "resetsAt" in value && past(value.resetsAt)));
+}
+
+/** Project a quota scope for v1-only clients (`engines.quota.v1`) that reject
+ * `kind: "currency"` balances in strict schema validation. Only `credits` balances are kept (the one kind a
+ * v1.6.0 client knows); a pool left with nothing is dropped, and a reading left with nothing is "unknown". */
+export function projectQuotaScopeForClient(scope: QuotaScope, options: { currencyBalances: boolean }): QuotaScope {
+  if (options.currencyBalances) return scope;
+  let strippedCurrency = false;
+  const pools: QuotaPool[] = [];
+  for (const pool of scope.pools) {
+    const hadCurrency = pool.balances.some(balance => balance.kind !== "credits");
+    if (!hadCurrency) {
+      pools.push(pool);
+      continue;
+    }
+    strippedCurrency = true;
+    const balances = pool.balances.filter(balance => balance.kind === "credits");
+    if (pool.windows.length > 0 || balances.length > 0 || pool.constraints.length > 0) {
+      pools.push({ ...pool, balances });
+    }
+  }
+  if (!strippedCurrency) return scope;
+  if (pools.length === 0 && scope.constraints.length === 0 && scope.availability === "unknown"
+    && (scope.state === "ready" || scope.state === "stale")) {
+    const { observedAt: _observedAt, ...rest } = scope;
+    return { ...rest, state: "unknown", pools };
+  }
+  return { ...scope, pools };
 }
