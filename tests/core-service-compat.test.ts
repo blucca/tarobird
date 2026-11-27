@@ -1518,11 +1518,12 @@ describe("core service compatibility profile", () => {
     }
   }, 15_000);
 
-  it("notifies Lark users and records a timeline event when a turn waits on the shared engine lock", async () => {
+  it("notifies Lark users and records waiting for and acquiring the shared engine lock", async () => {
     const stateDir = await mkdtemp(path.join(os.tmpdir(), "cctb-lark-lock-wait-"));
     const channel = fakeChannel();
     const bridge = {
       handleAuthorizedMessage: vi.fn(async (input: {
+        onTurnLockAcquired?: (event: { waitedMs: number }) => void | Promise<void>;
         onTurnLockWait?: (event: {
           sessionId: string;
           waitedMs: number;
@@ -1536,6 +1537,7 @@ describe("core service compatibility profile", () => {
           reason: "file_lock",
           lockPath: "/tmp/tarocub-turn-locks/test.lock",
         });
+        await input.onTurnLockAcquired?.({ waitedMs: 10_250 });
         return { text: "Done from bridge" };
       }),
     };
@@ -1572,6 +1574,10 @@ describe("core service compatibility profile", () => {
           larkChatId: "oc_chat",
           larkMessageId: "om_1",
         }),
+      }));
+      expect(timeline).toContainEqual(expect.objectContaining({
+        type: "engine.event", detail: "engine.lock.acquired",
+        metadata: expect.objectContaining({ waitedMs: 10_250 }),
       }));
     } finally {
       await rm(stateDir, { recursive: true, force: true });
