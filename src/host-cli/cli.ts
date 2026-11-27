@@ -933,10 +933,10 @@ export async function runHostCli(argv: string[]): Promise<void> {
           // The same read names what a refusal was about.
           const current = await management.botModel(id);
           if (v.effort !== undefined && v.effort !== "default") {
-            if (current.engine === "pi" && !(PI_THINKING_LEVELS as readonly string[]).includes(v.effort)) throw piLevelArgumentError("--effort", v.effort);
+            if ((current.engine === "pi" || current.engine === "omp") && !(PI_THINKING_LEVELS as readonly string[]).includes(v.effort)) throw piLevelArgumentError("--effort", v.effort, current.engine === "omp" ? "omp" : "pi");
             if (!effortValueSchema.safeParse(v.effort).success) throw effortArgumentError(v.effort);
           }
-          const clearEffort = v.effort === "default" || v.effort === "off" && !["pi", "deepseek"].includes(current.engine);
+          const clearEffort = v.effort === "default" || v.effort === "off" && !["pi", "omp", "deepseek"].includes(current.engine);
           const model = ["default", "off"].includes(v.model) ? "" : v.model;
           try {
             await output(await management.botModel(id, {

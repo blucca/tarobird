@@ -84,13 +84,13 @@ it("CLI refresh uses exactly the same versioned scope and never creates a turn",
   const f = fixture(), value = await f.quotas.scope("bot", false);
   const client = { ready: { serverCapabilities: [ENGINE_QUOTA_CAPABILITY] }, request: vi.fn(async () => value) };
   await engineQuotaCommand(client as never, { bot: "bot", refresh: true, revision: "rev" });
-  expect(client.request).toHaveBeenCalledExactlyOnceWith("/api/engine-quotas/bot?refresh=1&revision=rev");
+  expect(client.request).toHaveBeenCalledExactlyOnceWith("/api/engine-quotas/bot?includeOmp=1&refresh=1&revision=rev");
   await expect(engineQuotaCommand(client as never, { refresh: true })).rejects.toThrow();
   expect(client.request).toHaveBeenCalledOnce();
 
   const upgraded = { ready: { serverCapabilities: [ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_CURRENCY_CAPABILITY] }, request: vi.fn(async () => value) };
   await engineQuotaCommand(upgraded as never, { bot: "bot", refresh: true, revision: "rev" });
-  expect(upgraded.request).toHaveBeenCalledExactlyOnceWith("/api/engine-quotas/bot?refresh=1&revision=rev&balances=currency");
+  expect(upgraded.request).toHaveBeenCalledExactlyOnceWith("/api/engine-quotas/bot?includeOmp=1&refresh=1&revision=rev&balances=currency");
   expect(SERVER_CAPABILITIES).toContain(ENGINE_QUOTA_CURRENCY_CAPABILITY);
   expect(CAPABILITIES).not.toContain(ENGINE_QUOTA_CURRENCY_CAPABILITY);
 });
@@ -155,6 +155,28 @@ it("strips non-credits currency balances by default for v1.6.0 compatibility and
   expect((await quotas.scope("kimi_bot", false, undefined, { includeCurrencyBalances: true })).pools[0]?.balances).toEqual([
     expect.objectContaining({ id: "top_up", kind: "currency", amount: "45.50", unit: "CNY" }),
   ]);
+});
+
+it("gates omp Bots behind includeOmp so 1.6.0 clients never receive unknown engine values", async () => {
+  const bots = async () => [
+    { id: "codex_bot", name: "Codex Bot", engine: "codex" },
+    { id: "omp_bot", name: "OMP Bot", engine: "omp" },
+  ];
+  const make = (includeOmp?: boolean) => hubEngineQuotas({
+    bots,
+    includeOmp,
+    connection: () => undefined,
+    call: vi.fn(),
+    validate: async () => {},
+  });
+
+  const legacy = make();
+  expect((await legacy.directory()).scopes.map(s => s.id)).toEqual(["codex_bot"]);
+  await expect(legacy.scope("omp_bot", false)).rejects.toMatchObject({ status: 404, code: "quota_scope_missing" });
+
+  const modern = make(true);
+  expect((await modern.directory()).scopes.map(s => [s.id, s.engine])).toEqual([["codex_bot", "codex"], ["omp_bot", "omp"]]);
+  expect(await modern.scope("omp_bot", false)).toMatchObject({ id: "omp_bot", engine: "omp", reason: "offline" });
 });
 
 // #47-C: the verified official viewing guidance reaches CLI users without changing the JSON contract.

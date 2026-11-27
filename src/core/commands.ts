@@ -1,9 +1,9 @@
 import { getEngineEffortValidationError } from "../state/instance-config.js";
-import { PI_THINKING_LEVELS } from "../codex/pi-models.js";
+import { decodePiModel, PI_THINKING_LEVELS } from "../codex/pi-models.js";
 import { modelSettings } from "../runtime/model-settings.js";
 import { effortValueSchema } from "../client-protocol/effort.js";
 import { effortSettings } from "../runtime/effort-settings.js";
-import { modelCatalog, modelEffortChoices } from "../runtime/model-catalog.js";
+import { modelCatalog, modelEffortChoices, readModelCatalog } from "../runtime/model-catalog.js";
 import { antigravityPresetEffort } from "../codex/antigravity-models.js";
 import path from "node:path";
 import { channelProfile } from "./channel-profile.js";
@@ -93,7 +93,7 @@ const goalPursuitCompletions = new WeakMap<CoreServiceRuntime, Map<string, Promi
 const goalCommandLocks = new WeakMap<CoreServiceRuntime, Map<string, Promise<unknown>>>();
 
 const VALID_LARK_EFFORT_LEVELS: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
-const LARK_ENGINE_CHOICES: InstanceEngine[] = ["claude", "codex", "kimi", "deepseek", "antigravity", "pi"];
+const LARK_ENGINE_CHOICES: InstanceEngine[] = ["claude", "codex", "kimi", "deepseek", "antigravity", "pi", "omp"];
 
 type RequestCoreApproval = (input: {
   channel: CoreChannelLike;
@@ -578,6 +578,18 @@ async function handleCoreSessionCommand(
           };
         })
       : undefined,
+    scanRecentOmpSessions: input.bridge.listExternalSessions
+      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+          const modifiedAt = new Date(session.updatedAt ?? 0);
+          return {
+            sessionId: session.sessionId,
+            dirName: session.sessionId,
+            workspacePath: session.cwd,
+            modifiedAt: Number.isNaN(modifiedAt.getTime()) ? new Date(0) : modifiedAt,
+            displayName: session.title || session.sessionId,
+          };
+        })
+      : undefined,
     sendResumeScanResult: async ({ kind, visibleSessions }) => {
       await sendCoreCardWithFallback({
         channel: input.channel,
@@ -599,7 +611,7 @@ async function handleCoreSessionCommand(
 }
 
 function renderCoreResumeFallback(
-  kind: "claude" | "antigravity" | "kimi" | "deepseek" | "pi",
+  kind: "claude" | "antigravity" | "kimi" | "deepseek" | "pi" | "omp",
   sessions: ScannedSession[],
   locale: Locale,
 ): string {
@@ -1053,7 +1065,7 @@ function parseCoreGoalCommand(text: string, engine: InstanceEngine): CoreGoalCom
   const rest = match[1]?.trim() ?? "";
   if (!rest || /^status$/i.test(rest)) return { kind: "status" };
   if (/^(clear|off|reset)$/i.test(rest) || ((engine === "claude" || engine === "antigravity") && /^(stop|cancel|none)$/i.test(rest))) return { kind: "clear" };
-  if (engine === "codex") {
+  if (engine === "codex" || engine === "omp") {
     if (/^(pause|resume)$/i.test(rest)) return { kind: rest.toLowerCase() as "pause" | "resume" };
     if (/^(pause|resume)\s/i.test(rest)) return { kind: "invalid", reason: "invalid_control" };
     const edit = rest.match(/^edit(?:\s+([\s\S]+))?$/i);
@@ -1075,7 +1087,7 @@ function parseCoreGoalCommand(text: string, engine: InstanceEngine): CoreGoalCom
     }
   }
   const parsed = parseCoreSetGoal(rest);
-  if ((engine === "codex" || engine === "claude") && parsed.kind === "set" && parsed.objective.length > 4000) return { kind: "invalid", reason: "too_long" };
+  if ((engine === "codex" || engine === "claude" || engine === "omp") && parsed.kind === "set" && parsed.objective.length > 4000) return { kind: "invalid", reason: "too_long" };
   return parsed;
 }
 
@@ -1655,6 +1667,7 @@ async function renderCoreStatusMessage(
       ...(cfg.engine === "kimi" && currentSession ? [`Current Kimi session: ${currentSession.codexSessionId}`] : []),
       ...(cfg.engine === "deepseek" && currentSession ? [`Current DeepSeek Harness session: ${currentSession.codexSessionId}`] : []),
       ...(cfg.engine === "pi" && currentSession ? [`Current Pi session: ${currentSession.codexSessionId}`] : []),
+      ...(cfg.engine === "omp" && currentSession ? [`Current omp session: ${currentSession.codexSessionId}`] : []),
       ...workflowLines,
       `Active run: ${activeRun ? "yes" : "no"}`,
       `Pending approvals: ${runtime.pendingApprovals.size}`,
@@ -1696,6 +1709,7 @@ async function renderCoreStatusMessage(
     ...(cfg.engine === "kimi" && currentSession ? [`当前 Kimi session：${currentSession.codexSessionId}`] : []),
     ...(cfg.engine === "deepseek" && currentSession ? [`当前 DeepSeek Harness session：${currentSession.codexSessionId}`] : []),
     ...(cfg.engine === "pi" && currentSession ? [`当前 Pi session：${currentSession.codexSessionId}`] : []),
+    ...(cfg.engine === "omp" && currentSession ? [`当前 omp session：${currentSession.codexSessionId}`] : []),
     ...workflowLines,
     `当前运行：${activeRun ? "是" : "否"}`,
     `待处理审批：${runtime.pendingApprovals.size}`,
@@ -1711,6 +1725,9 @@ function renderCoreEngineUsageNote(engine: InstanceConfig["engine"], locale: Loc
   if (engine === "pi") return locale === "en"
     ? "Pi reports usage and cost when supplied by the provider. Cost may be estimated; a Host budget check does not impose a native per-turn spending limit."
     : "Pi 会记录提供商返回的用量和费用，费用可能为估算值；主机预算检查不等于原生单轮费用上限。";
+  if (engine === "omp") return locale === "en"
+    ? "omp reports usage and cost when supplied by the provider. Cost may be estimated; a Host budget check does not impose a native per-turn spending limit."
+    : "omp 会记录提供商返回的用量和费用，费用可能为估算值；主机预算检查不等于原生单轮费用上限。";
   if (engine === "kimi") {
     return locale === "en"
       ? `Note: Kimi ACP does not currently report structured per-turn tokens or cost; Kimi turns are excluded from these totals${budgetConfigured ? " and the configured budget cap cannot track them" : ""}.`
@@ -1892,6 +1909,21 @@ function renderCoreModelSelectionMessage(cfg: InstanceConfig, locale: Locale): s
           "DeepSeek Harness 会通过 session model API 校验该选择。",
         ].join("\n");
   }
+  if (cfg.engine === "omp") {
+    return locale === "en"
+      ? [
+          `Current model: ${current}`,
+          "Use /model <provider/model> with a model advertised by oh-my-pi (omp).",
+          "/model off",
+          "omp validates the selection through its RPC session model API.",
+        ].join("\n")
+      : [
+          `当前模型: ${current}`,
+          "用 /model <provider/model> 选择 oh-my-pi (omp) 提供的模型。",
+          "/model off",
+          "omp 会通过 RPC 会话模型 API 校验该选择。",
+        ].join("\n");
+  }
   if (locale === "en") {
     return [
       `Current model: ${current}`,
@@ -1971,6 +2003,11 @@ async function handleCoreModelCommand(
       ? `${normalizedModel} is incompatible with current effort ${cfg.effort}; reset /effort default before changing the model.`
       : `${normalizedModel} 与当前 effort ${cfg.effort} 不兼容；请先用 /effort default 重置，再切换模型。`;
   }
+  if (cfg.engine === "omp" && !decodePiModel(normalizedModel)) {
+    return locale === "en"
+      ? "omp models require a provider prefix, such as /model provider/model (or /model off)."
+      : "omp 模型必须包含提供商前缀，例如 /model provider/model（或 /model off）。";
+  }
   await updateInstanceConfig(stateDir, (config) => {
     config.model = normalizedModel;
   });
@@ -1999,7 +2036,7 @@ async function handleCoreEffortCommand(
     if (!result.ok) return deepSeekSettingsError(result.error, locale);
     return effort ? (locale === "en" ? `Effort set to ${effort}.` : `Effort 已设为 ${effort}。`) : (locale === "en" ? "Effort reset to default." : "Effort 已恢复默认。");
   }
-  if (level === "default" || level === "off" && cfg.engine !== "pi") {
+  if (level === "default" || level === "off" && cfg.engine !== "pi" && cfg.engine !== "omp") {
     await updateInstanceConfig(stateDir, (config) => {
       delete config.effort;
     });
@@ -2018,6 +2055,25 @@ async function handleCoreEffortCommand(
     return locale === "en"
       ? `Bot default thinking level set to ${level} for the whole Bot: all of this Bot's conversations use it from their next turn, including ones that chose a level with /thinking. To change only this conversation, use /thinking ${level}.`
       : `已把 Bot 默认思考强度设为 ${level}，作用于整个 Bot：这个 Bot 的所有对话从下一轮起都改用这一档，包括在对话里用 /thinking 选过档位的。只改当前对话请用 /thinking ${level}。`;
+  }
+  if (cfg.engine === "omp") {
+    if (!PI_THINKING_LEVELS.includes(level as typeof PI_THINKING_LEVELS[number])) {
+      return locale === "en"
+        ? `omp thinking level supports only ${PI_THINKING_LEVELS.join(", ")}, or default.`
+        : `omp 思考强度仅支持 ${PI_THINKING_LEVELS.join("、")} 或 default。`;
+    }
+    const catalog = await readModelCatalog("omp", process.env, cfg.workspacePath ?? cfg.resume?.workspacePath ?? path.join(stateDir, "workspace"));
+    if (catalog.status === "ready") {
+      const levels = modelEffortChoices("omp", cfg.model ?? "", catalog.choices);
+      const modelKnown = !cfg.model || catalog.choices.some(choice => choice.id === cfg.model);
+      if (modelKnown && !levels.includes(level as EffortLevel)) {
+        return locale === "en"
+          ? "omp has not confirmed this thinking level for the selected model. Refresh the model list or use /effort default."
+          : "omp 尚未确认当前模型支持这个思考档位。请重新读取模型列表，或使用 /effort default。";
+      }
+    }
+    await updateInstanceConfig(stateDir, config => { config.effort = level; });
+    return locale === "en" ? `Effort set to ${level}.` : `Effort 已设为 ${level}。`;
   }
   if (cfg.engine === "claude" && level === "ultra") {
     return locale === "en"
@@ -2256,24 +2312,26 @@ async function handleCoreEngineCommand(
       return [
         `Current engine: ${cfg.engine}`,
         "Choose an engine with /engine <name>:",
-        ...LARK_ENGINE_CHOICES.filter(choice => choice !== "pi" || cfg.role !== "dispatcher").map((choice) => `/engine ${choice}`),
+        ...LARK_ENGINE_CHOICES.filter(choice => (choice !== "pi" && choice !== "omp") || cfg.role !== "dispatcher").map((choice) => `/engine ${choice}`),
         restartNote,
       ].join("\n");
     }
     return [
       `当前引擎：${cfg.engine}`,
       "用 /engine <名称> 选择引擎：",
-      ...LARK_ENGINE_CHOICES.filter(choice => choice !== "pi" || cfg.role !== "dispatcher").map((choice) => `/engine ${choice}`),
+      ...LARK_ENGINE_CHOICES.filter(choice => (choice !== "pi" && choice !== "omp") || cfg.role !== "dispatcher").map((choice) => `/engine ${choice}`),
       restartNote,
     ].join("\n");
   }
   if (invalid || !LARK_ENGINE_CHOICES.includes(engine as InstanceEngine)) {
-    return locale === "en" ? "Usage: /engine [claude|codex|kimi|deepseek|antigravity|pi]" : "用法: /engine [claude|codex|kimi|deepseek|antigravity|pi]";
+    return locale === "en" ? "Usage: /engine [claude|codex|kimi|deepseek|antigravity|pi|omp]" : "用法: /engine [claude|codex|kimi|deepseek|antigravity|pi|omp]";
   }
 
   const selectedEngine = engine as InstanceEngine;
-  if (selectedEngine === "pi" && cfg.role === "dispatcher") {
-    return locale === "en" ? "Pi is available for ordinary Bots, not Superagent Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
+  if ((selectedEngine === "pi" || selectedEngine === "omp") && cfg.role === "dispatcher") {
+    return selectedEngine === "omp"
+      ? (locale === "en" ? "omp is available for ordinary Bots, not Superagent Bots." : "omp 仅用于普通 Bot，不支持幕僚长。")
+      : (locale === "en" ? "Pi is available for ordinary Bots, not Superagent Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。");
   }
   const engineChanged = cfg.engine !== selectedEngine;
   let resetSessionBindings = false;
@@ -2338,6 +2396,9 @@ async function handleCoreYoloCommand(stateDir: string, action: string, locale: L
     if (cfg.engine === "pi") return locale === "en"
       ? "Pi does not provide sandboxed full-auto. Permissions were not changed. Use /yolo off for normal approval or /yolo unsafe to skip approval without an OS sandbox."
       : "Pi 不提供带沙箱的 full-auto，权限未更改。普通审批请用 /yolo off；跳过审批请用 /yolo unsafe，这不会提供 OS 沙箱。";
+    if (cfg.engine === "omp") return locale === "en"
+      ? "omp does not provide sandboxed full-auto. Permissions were not changed. Use /yolo off for tool approval or /yolo unsafe for native access without an OS sandbox."
+      : "omp 不提供带沙箱的 full-auto，权限未更改。工具审批请用 /yolo off；原生访问请用 /yolo unsafe，这不会提供 OS 沙箱。";
     const engine = await updateInstanceApprovalMode(stateDir, "full-auto");
     if (engine === "kimi") {
       return locale === "en"
@@ -2440,7 +2501,7 @@ export async function tryHandleCoreGoalControlBeforeQueue(input: CoreCommandInpu
   return withCoreGoalCommandLock(input.runtime, normalized.conversationKey, async () => {
     const cfg = await loadInstanceConfig(input.stateDir);
     const action = parseCoreGoalCommand(text, cfg.engine);
-    if (cfg.engine !== "codex" || !action || action.kind === "set") return false;
+    if ((cfg.engine !== "codex" && cfg.engine !== "omp") || !action || action.kind === "set") return false;
     const current = () => input.channel.canSteerConversation?.(normalized.chatId) ?? true;
     if (!await current()) return false;
     const { record, warning } = await new SessionStore(path.join(input.stateDir, "session.json")).findByConversationKeySafe(normalized.conversationKey);
@@ -2560,7 +2621,7 @@ async function applyCoreGoalCommand(
     // run card to interrupted. Guard on goalWatch so a normal turn sharing the
     // activeRuns slot is NOT killed (nor falsely reported "cleared") by /goal clear.
     const activeGoalRun = input.runtime.activeRuns.get(conversationKey);
-    if (cfg.engine !== "codex" && activeGoalRun?.goalWatch) {
+    if (cfg.engine !== "codex" && cfg.engine !== "omp" && activeGoalRun?.goalWatch) {
       // End the PURSUIT specifically: abortGoal bypasses the stop routing that
       // would otherwise divert a plain abort() into an ordinary turn currently
       // running alongside the pursuit — /goal clear must kill the goal, never
@@ -2750,13 +2811,14 @@ async function applyCoreGoalCommand(
           });
           goalSessionId ??= result.sessionId ?? result.goal?.threadId;
           const watched = result.goal;
-          if (abort.signal.aborted || (cfg.engine !== "codex" && watched && !["complete", "budgetLimited"].includes(watched.status))) {
+          const retainsNativeGoal = cfg.engine === "codex" || cfg.engine === "omp";
+          if (abort.signal.aborted || (!retainsNativeGoal && watched && !["complete", "budgetLimited"].includes(watched.status))) {
             // Stopped: clear the goal so the engine halts its autonomous pursuit
             // (aborting the watcher alone only stops us listening), then flip the card to "已中断".
-            if (cfg.engine !== "codex" && goalSessionId) { try { await clearThreadGoal?.({ ...goalInput, sessionId: goalSessionId, origin: "automatic" }); } catch { /* best-effort */ } }
+            if (!retainsNativeGoal && goalSessionId) { try { await clearThreadGoal?.({ ...goalInput, sessionId: goalSessionId, origin: "automatic" }); } catch { /* best-effort */ } }
             releaseGoalRun();
             await runCard.interrupt();
-          } else if (cfg.engine === "codex" && (!watched || watched.status !== "complete")) {
+          } else if (retainsNativeGoal && (!watched || watched.status !== "complete")) {
             releaseGoalRun();
             const summary = watched ? renderCoreGoal(watched, locale)
               : locale === "en" ? "Goal cleared." : "目标已清除。";
@@ -2765,9 +2827,9 @@ async function applyCoreGoalCommand(
             // objective completed or destroy its native state and usage.
             await runCard.interrupt(answer ? `${answer}\n\n---\n\n${summary}` : summary);
           } else {
-            // Codex retains completed state for native status/edit/resume. Keep
+            // Codex and omp retain completed state for native status/edit/resume. Keep
             // the existing cleanup contract for other structured adapters.
-            if (cfg.engine !== "codex" && goalSessionId) { try { await clearThreadGoal?.({ ...goalInput, sessionId: goalSessionId, origin: "automatic" }); } catch { /* best-effort */ } }
+            if (!retainsNativeGoal && goalSessionId) { try { await clearThreadGoal?.({ ...goalInput, sessionId: goalSessionId, origin: "automatic" }); } catch { /* best-effort */ } }
             releaseGoalRun();
             const answer = goalFinalAnswer.trim() || runCard.resolveFinalText("").trim();
             const summary = watched ? renderCoreGoal(watched, locale)
@@ -2780,7 +2842,7 @@ async function applyCoreGoalCommand(
           }
         } catch (error) {
           if (abort.signal.aborted) {
-            if (cfg.engine !== "codex" && goalSessionId) {
+            if (cfg.engine !== "codex" && cfg.engine !== "omp" && goalSessionId) {
               try { await clearThreadGoal?.({ ...goalInput, sessionId: goalSessionId, origin: "automatic" }); } catch { /* best-effort */ }
             }
             releaseGoalRun();

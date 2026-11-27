@@ -6,6 +6,7 @@ export async function engineQuotaCommand(client: Pick<LocalHostClient, "request"
   if (flags.refresh && (!flags.bot || !flags.revision) || flags.revision && !flags.refresh) throw new Error("刷新前先读取额度，再使用 engines quota --bot BOT --refresh --revision REV / Read quotas before refreshing a Bot scope.");
   if (flags.bot && !/^[A-Za-z0-9_-]{1,128}$/.test(flags.bot) || flags.revision && !/^[a-zA-Z0-9_.:-]{1,128}$/.test(flags.revision)) throw new Error("Invalid quota scope or revision");
   const params = new URLSearchParams();
+  params.set("includeOmp", "1");
   if (flags.refresh) {
     params.set("refresh", "1");
     params.set("revision", flags.revision!);
@@ -73,7 +74,7 @@ export const QUOTA_KIMI_API_KEY_TEXT: Text = ["当前仅配置了 API Key，未�
 export const QUOTA_KIMI_NOT_CODING_PLAN_TEXT: Text = ["当前账号不是 Kimi For Coding 套餐账号（服务端返回 404），不提供编程套餐额度。", "This account is not a Kimi For Coding subscription account (404), so coding plan quotas are not available."];
 export const QUOTA_PI_UNSUPPORTED_TEXT: Text = ["当前供应商不提供可读取的账号额度（Pi 仅统计本会话 token 与费用）。", "This provider does not provide account quotas (Pi only tracks local session tokens and cost)."];
 export const QUOTA_EXPIRED_TEXT: Text = ["已过期，需重新读取", "Expired; refresh required"];
-const ENGINE_NAMES: Record<QuotaEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi" };
+const ENGINE_NAMES: Record<QuotaEngine, string> = { codex: "Codex", claude: "Claude Code", antigravity: "Antigravity", kimi: "Kimi", deepseek: "DeepSeek", pi: "Pi", omp: "oh-my-pi (omp)" };
 
 /** Human explanation for standard error in normal mode: why each Bot has no current reading, how to
  * refresh it, and where to check officially. Built only from protocol enums, the Bot label and the

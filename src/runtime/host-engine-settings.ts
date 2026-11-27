@@ -11,8 +11,8 @@ import {
   setCanonicalWindowsPath,
 } from "./windows-registry-path.js";
 
-export const ENGINE_COMMANDS = { codex: "codex", claude: "claude", antigravity: "agy", kimi: "kimi", deepseek: "dsh", pi: "pi" } as const;
-export const ENGINE_ENV_KEYS = { codex: "CODEX_EXECUTABLE", claude: "CLAUDE_EXECUTABLE", antigravity: "ANTIGRAVITY_EXECUTABLE", kimi: "KIMI_EXECUTABLE", deepseek: "DSH_EXECUTABLE", pi: "PI_EXECUTABLE" } as const;
+export const ENGINE_COMMANDS = { codex: "codex", claude: "claude", antigravity: "agy", kimi: "kimi", deepseek: "dsh", pi: "pi", omp: "omp" } as const;
+export const ENGINE_ENV_KEYS = { codex: "CODEX_EXECUTABLE", claude: "CLAUDE_EXECUTABLE", antigravity: "ANTIGRAVITY_EXECUTABLE", kimi: "KIMI_EXECUTABLE", deepseek: "DSH_EXECUTABLE", pi: "PI_EXECUTABLE", omp: "OMP_EXECUTABLE" } as const;
 export const engineSettingsFile = (directory: string) => path.join(directory, "engine-settings.json");
 export const storedEngineSettingsSchema = z.object({
   format: z.literal(1), revision: z.string().min(1).max(100), paths: z.partialRecord(hostEngineSchema, enginePathSchema),

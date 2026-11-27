@@ -5,7 +5,7 @@
 <h3 align="center">你的 AI 智能体，运行在你自己的电脑上。<br>桌面与手机，延续同一段对话。</h3>
 
 <p align="center">
-  Codex · Claude Code · Kimi Code · DeepSeek Harness · Antigravity · Pi
+  Codex · Claude Code · Kimi Code · DeepSeek Harness · Antigravity · Pi · oh-my-pi (omp)
 </p>
 
 <p align="center">
@@ -216,6 +216,8 @@ TaroBird 是一款自托管的 AI 智能体工作空间。它把电脑或服务�
 在运行 Bot 的电脑上安装并登录任意一种引擎即可开始使用；TaroBird 不附带 AI 引擎、模型账号或额度。各引擎的适配差异见[引擎对照](docs/details.zh-CN.md#引擎对照)。
 
 **1.6.0 起支持 Pi：** [Pi 原生接入](docs/client/pi-engine.md)，按提供商选择模型，并支持原生对话控制。Pi 仅作为普通 Bot，不加入幕僚长及其派工引擎。
+
+**oh-my-pi（`omp`）原生接入：** [oh-my-pi 引擎接入说明](docs/client/omp-engine.md)，作为独立引擎接入 `omp --mode rpc-ui` 协议（支持 v2 协议协商、`prompt_result` + `session_settled` 轮次边界、三队列 `steer` / `follow_up` / `aside` 及原生子代理任务面板），与 Pi 并存且互不混淆。
 
 <a id="引擎"></a>
 

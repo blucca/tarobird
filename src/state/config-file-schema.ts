@@ -37,7 +37,7 @@ export const MeetingConfigFileSchema = z.object({
 }).passthrough();
 
 export const ConfigFileSchema = z.object({
-  engine: z.enum(["codex", "claude", "antigravity", "kimi", "deepseek", "pi"]).optional(),
+  engine: z.enum(["codex", "claude", "antigravity", "kimi", "deepseek", "pi", "omp"]).optional(),
   /** Set once by the Hub when a dispatcher Bot is created. */
   role: z.enum(["dispatcher"]).optional(),
   approvalMode: z.enum(["normal", "full-auto", "bypass"]).optional(),

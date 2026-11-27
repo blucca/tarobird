@@ -34,6 +34,19 @@ export function gatewayCommands(engine: string, query = "", engineCommands: Read
         },
       },
     });
+  if (engine === "omp" && engineCommands.length) {
+    const prefix = query.replace(/^\//, "").toLowerCase();
+    const taken = new Set(CORE_SLASH_COMMANDS.map(({ command }) => command));
+    const seen = new Set<string>();
+    const omp = engineCommands.flatMap(({ name, description }) => {
+      const command = name.toLowerCase();
+      if (taken.has(command) || seen.has(command) || !command.startsWith(prefix)) return [];
+      seen.add(command);
+      const text = description?.trim() || name;
+      return [{ command: name, description: { defaultValue: text, i18n: { en_us: text, zh_cn: text } } }];
+    });
+    return [...shared, ...omp];
+  }
   if (engine === "antigravity") {
     const prefix = query.replace(/^\//, "").toLowerCase();
     const taken = new Set(CORE_SLASH_COMMANDS.map(({ command }) => command));

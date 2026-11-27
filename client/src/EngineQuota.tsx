@@ -17,6 +17,7 @@ const engines: Record<QuotaEngine, string> = {
   kimi: "Kimi",
   deepseek: "DeepSeek",
   pi: "Pi",
+  omp: "oh-my-pi (omp)",
 };
 
 function reasonText(reason: QuotaReason | undefined, engine: QuotaEngine, authMode?: QuotaAuthMode): string {

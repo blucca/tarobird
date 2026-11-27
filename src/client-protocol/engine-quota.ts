@@ -17,7 +17,7 @@ export const ENGINE_QUOTA_HUB_REFRESH_MS = ENGINE_QUOTA_REFRESH_MS + 3_000;
 const identifier = z.string().min(1).max(128).regex(/^[a-zA-Z0-9_.:-]+$/);
 const label = z.string().min(1).max(120).refine(value => !/[\x00-\x1f\x7f]/.test(value));
 const timestamp = z.string().datetime({ offset: true });
-export const quotaEngineSchema = z.enum(["codex", "claude", "antigravity", "kimi", "deepseek", "pi"]);
+export const quotaEngineSchema = z.enum(["codex", "claude", "antigravity", "kimi", "deepseek", "pi", "omp"]);
 export const quotaStateSchema = z.enum(["ready", "stale", "unknown", "login_required", "offline", "unavailable", "unsupported"]);
 export const quotaAvailabilitySchema = z.enum(["allowed", "warning", "blocked", "unknown"]);
 export const quotaReasonSchema = z.enum([

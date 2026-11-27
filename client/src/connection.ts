@@ -1228,12 +1228,12 @@ export class HubConnection {
     this.refreshCache();
   }
   async readEngineQuotas(signal?: AbortSignal) {
-    const query = this.state.engineQuotaCurrencyAvailable ? "?balances=currency" : "";
+    const query = this.state.engineQuotaCurrencyAvailable ? "?includeOmp=1&balances=currency" : "?includeOmp=1";
     return quotaDirectorySchema.parse(await this.http(`/api/engine-quotas${query}`, { signal }));
   }
   /** One Bot's quota as the Host holds it now; nothing is asked of the engine. */
   async readEngineQuota(botId: string, signal?: AbortSignal) {
-    const query = this.state.engineQuotaCurrencyAvailable ? "?balances=currency" : "";
+    const query = this.state.engineQuotaCurrencyAvailable ? "?includeOmp=1&balances=currency" : "?includeOmp=1";
     const value = quotaScopeSchema.parse(await this.http(`/api/engine-quotas/${encodeURIComponent(botId)}${query}`, { signal }));
     if (value.id !== botId) throw new Error("quota_scope_mismatch");
     return value;
@@ -1243,7 +1243,7 @@ export class HubConnection {
     return contextUsageSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/context-usage?botId=${encodeURIComponent(botId)}`, { signal }));
   }
   async refreshEngineQuota(scope: Pick<QuotaScope, "id" | "revision">, signal?: AbortSignal) {
-    const query = new URLSearchParams({ refresh: "1", revision: scope.revision });
+    const query = new URLSearchParams({ refresh: "1", revision: scope.revision, includeOmp: "1" });
     if (this.state.engineQuotaCurrencyAvailable) query.set("balances", "currency");
     const value = quotaScopeSchema.parse(await this.http(`/api/engine-quotas/${encodeURIComponent(scope.id)}?${query}`, { signal }));
     if (value.id !== scope.id) throw new Error("quota_scope_mismatch");

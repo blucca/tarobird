@@ -1764,8 +1764,9 @@ export class HubServer {
       if (quotaRoute && req.method === "GET") {
         await requireOwner();
         const url = new URL(req.url ?? "/", "http://hub"), refresh = url.searchParams.get("refresh") === "1", revision = url.searchParams.get("revision") ?? undefined, includeCurrencyBalances = url.searchParams.get("balances") === "currency";
+        const includeOmp = url.searchParams.get("includeOmp") === "1";
         if (revision && (revision.length > 128 || !/^[a-zA-Z0-9_.:-]+$/.test(revision)) || refresh && !quotaRoute[1]) throw new HubError("quota_request_invalid", 400);
-        const quotas = hubEngineQuotas({ bots: () => this.store.bots(userId), validate,
+        const quotas = hubEngineQuotas({ bots: () => this.store.bots(userId), validate, includeOmp,
           connection: id => { const connection = this.bots.get(id); return connection ? { key: connection, supported: connection.engineQuota, ready: connection.ready } : undefined; },
           call: (id, request) => this.callBot(id, "quota.get", request, request.refresh ? ENGINE_QUOTA_HUB_REFRESH_MS : 2_500),
           proofStore: this.quotaAccountProofs,
@@ -1824,9 +1825,11 @@ export class HubServer {
           await this.engineSettings.refresh();
           view = this.engineSettings.status(idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined));
         }
-        // Existing clients validate a closed five-engine enum. Keep their
-        // complete settings page usable until they opt into Pi support.
-        await reply(200, url.searchParams.get("includePi") === "1" ? view : { ...view, engines: view.engines.filter(engine => engine.id !== "pi") }); return;
+        // Existing clients validate a closed engine enum (five pre-Pi, six in v1.6.0).
+        // Gate Pi on includePi=1 and omp on includeOmp=1 so older clients stay compatible.
+        const includePi = url.searchParams.get("includePi") === "1";
+        const includeOmp = url.searchParams.get("includeOmp") === "1";
+        await reply(200, { ...view, engines: view.engines.filter(engine => (engine.id !== "pi" || includePi) && (engine.id !== "omp" || includeOmp)) }); return;
       }
       if (route === "/api/settings/widgets" && ["GET", "PUT"].includes(req.method ?? "")) {
         await requireOwner();
@@ -2401,9 +2404,11 @@ export class HubServer {
           const refresh = createBotSchema.shape.engine.optional().parse(url.searchParams.get("refresh") ?? undefined);
           const redetect = url.searchParams.get("redetect") === "1";
           const catalog = await this.botManager.catalog(z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined), refresh, { forceRefresh: redetect });
-          // Existing clients do not understand Pi's provider/effort settings.
-          // New App and CLI catalog readers opt in, just as engine settings do.
-          await reply(200, url.searchParams.get("includePi") === "1" ? catalog : { ...catalog, engines: catalog.engines.filter(engine => engine.id !== "pi") });
+          // Existing clients validate closed engine enums (five pre-Pi, six in v1.6.0).
+          // Gate Pi on includePi=1 and omp on includeOmp=1 independently.
+          const includePi = url.searchParams.get("includePi") === "1";
+          const includeOmp = url.searchParams.get("includeOmp") === "1";
+          await reply(200, { ...catalog, engines: catalog.engines.filter(engine => (engine.id !== "pi" || includePi) && (engine.id !== "omp" || includeOmp)) });
         }
         else await reply(201, await this.botManager.create(userId, createBotSchema.parse(await this.jsonBody(req)), validateInQueue));
         return;

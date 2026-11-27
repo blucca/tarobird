@@ -1,4 +1,5 @@
 import { resolvePiExecutable } from "../runtime/pi-executable.js";
+import { resolveOmpExecutable } from "../runtime/omp-executable.js";
 import { ENGINE_SETTINGS_REPAIR_HINT } from "../client-protocol/engine-settings.js";
 import path from "node:path";
 import { hostEngineEnvironment } from "../runtime/host-engine-settings.js";
@@ -20,6 +21,7 @@ export function inspectEngines(env: NodeJS.ProcessEnv = process.env) {
   return ([
     ["codex", env.CODEX_EXECUTABLE || "codex"], ["claude", env.CLAUDE_EXECUTABLE || "claude"],
     ["pi", resolvePiExecutable(env)],
+    ["omp", resolveOmpExecutable(env)],
     ["antigravity", env.ANTIGRAVITY_EXECUTABLE || "agy"], ["kimi", env.KIMI_EXECUTABLE || "kimi"],
     ["deepseek", resolveDeepSeekExecutable(env)],
   ] as const).map(([engine, command]) => {

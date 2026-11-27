@@ -143,6 +143,7 @@
   "tarobotHostCapabilities": [
     "service-extra-environment-v1",
     "pi-state-v1",
+    "omp-state-v1",
     "windows-state-admission-v1"
   ]
 }

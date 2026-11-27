@@ -543,7 +543,7 @@ async function runAcceptedCoreMessage(
   // Codex goal controls must remain reachable while an ordinary turn runs.
   // Native Claude commands still execute through its serialized input stream.
   // Never switch the App's selected session underneath a live turn here.
-  if (isCoreGoalControlCommand(commandText) && (await loadInstanceConfig(input.stateDir)).engine === "codex"
+  if (isCoreGoalControlCommand(commandText) && ["codex", "omp"].includes((await loadInstanceConfig(input.stateDir)).engine)
     && (!input.channel.canSteerConversation || await input.channel.canSteerConversation(normalized.chatId))) {
     if (!(await checkPreQueueAccess("/goal"))) return true;
     if (await tryHandleCoreGoalControlBeforeQueue({ ...input, requestApproval: requestCoreApproval, createRunCard: createCoreRunCardController }, normalized, commandText)) return true;
@@ -2494,7 +2494,7 @@ async function runNormalizedCoreMessage(
           conversationKey: normalized.conversationKey,
           workspaceOverride,
         };
-        if (cfg.engine === "codex") {
+        if (cfg.engine === "codex" || cfg.engine === "omp") {
           await withCoreGoalCommandLock(input.runtime, normalized.conversationKey, async () => {
             if (input.runtime.activeRuns.get(normalized.conversationKey)?.goalWatch) return;
             // A failed compatibility/status read must not turn every ordinary

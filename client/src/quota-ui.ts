@@ -15,6 +15,7 @@ const GENERIC_POOL_LABELS: Record<QuotaEngine, ReadonlySet<string>> = {
   kimi: new Set(["kimi"]),
   deepseek: new Set(["deepseek"]),
   pi: new Set(["pi"]),
+  omp: new Set(["omp", "oh-my-pi", "oh-my-pi (omp)"]),
 };
 
 /** "Opus · 7 days", "Coding · 30 days": a scope, then the window. */

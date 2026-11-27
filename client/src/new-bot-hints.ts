@@ -7,6 +7,7 @@ export const NEW_BOT_ENGINE_LABELS: Record<CreateBotInput["engine"], string> = {
   kimi: "Kimi",
   deepseek: "DeepSeek",
   pi: "Pi",
+  omp: "oh-my-pi (omp)",
 };
 
 export interface UnavailableEnginesSummary {

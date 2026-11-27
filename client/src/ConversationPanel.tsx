@@ -29,7 +29,7 @@ export function ConversationPanel({ connection, conversation, group, pinned, glo
   const advancedId = useId();
   // A dispatcher's hidden engine worker only runs its ticket conversations.
   const engineWorker = !!state.dispatchWorkers?.some(bot => bot.id === targetBot);
-  const compactSupported = ["claude", "kimi", "deepseek", "pi"].includes(state.bots.find(bot => bot.id === targetBot)?.engine ?? "");
+  const compactSupported = ["claude", "kimi", "deepseek", "pi", "omp"].includes(state.bots.find(bot => bot.id === targetBot)?.engine ?? "");
   const [refreshFailed, setRefreshFailed] = useState(false), [queuedCommands, setQueuedCommands] = useState<string[]>([]);
   const [busy, setBusy] = useState(false), busyRef = useRef(false);
   const [confirmation, setConfirmation] = useState<"discard" | "reset" | "unbind" | "new" | "detach">();
