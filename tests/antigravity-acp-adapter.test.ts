@@ -1392,3 +1392,145 @@ describe("AntigravityAcpAdapter session config failures", () => {
     ]);
   });
 });
+
+describe("AntigravityAcpAdapter inactivity watchdog", () => {
+  it("still times out a stalled foreground turn or wedged foreground command", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { inactivityTimeoutMs: 70 }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "hang", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_fg", name: "run_command", kind: "execute", title: "sleep 9999", status: "in_progress", rawInput: { CommandLine: "sleep 9999" } });
+    await expect(settleWithin(reply, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
+    expect(harness.log).toContain("kill:900");
+  });
+
+  it("pauses inactivity timeout while a background workflow or subagent from this turn runs, and re-arms once it completes", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { inactivityTimeoutMs: 80 }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "run workflow", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_wf", name: "run_workflow", kind: "other", title: "Audit PRs", status: "in_progress", rawInput: { Description: "Audit PRs" } });
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 100, size: 1000 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Still alive past 2.5x inactivityTimeoutMs, and visible in listTasks as a background subagent task.
+    expect(harness.log).toEqual([]);
+    const tasks = await adapter.listTasks(SESSION_A);
+    expect(tasks.tasks).toEqual([expect.objectContaining({ label: "Audit PRs", kind: "subagent", mode: "background", status: "running", canStop: false, owner: "bound" })]);
+    // Once the workflow finishes, if the model stalls afterwards the inactivity watchdog fires.
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_wf", status: "completed", rawOutput: { output: "done" } });
+    await expect(settleWithin(reply, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
+    expect(harness.log).toContain("kill:900");
+  });
+
+  it("pauses inactivity timeout while an async background run_command from this turn runs, and finishes normally when it returns", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { inactivityTimeoutMs: 80 }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "run bg", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_bg", name: "run_command", kind: "execute", title: "npm test", status: "in_progress", rawInput: { CommandLine: "npm test", WaitMsBeforeAsync: 500 } });
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 100, size: 1000 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(harness.log).toEqual([]);
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_bg", status: "completed", rawOutput: { output: "ok", exit_code: 0 } });
+    server.text("all tests passed");
+    server.respondPrompt();
+    await expect(settleWithin(reply)).resolves.toMatchObject({ text: "all tests passed", sessionId: SESSION_A });
+  });
+
+  it("pauses inactivity timeout while waiting for a user permission approval and re-arms after the decision", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "normal" }, { inactivityTimeoutMs: 80 }));
+    let resolveApproval!: (decision: { behavior: "allow"; scope: "once" }) => void;
+    const approvalSeen = new Promise<void>((resolve) => {
+      const reply = adapter.sendUserMessage("tarobot-1", {
+        text: "run cmd",
+        files: [],
+        onApprovalRequest: () => {
+          resolve();
+          return new Promise((done) => { resolveApproval = done; });
+        },
+      });
+      // Attach reply via harness reference below
+      (harness as unknown as { activeReply: Promise<unknown> }).activeReply = reply;
+    });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const permId = server.requestPermission("call_perm", { CommandLine: "rm -f tmp.txt" });
+    await approvalSeen;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(harness.log).toEqual([]);
+    resolveApproval({ behavior: "allow", scope: "once" });
+    await waitFor(() => server.clientResponses.has(permId));
+    // After approval resolves with no further progress, the inactivity watchdog re-arms and fires.
+    const reply = (harness as unknown as { activeReply: Promise<unknown> }).activeReply;
+    await expect(settleWithin(reply, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
+    expect(harness.log).toContain("kill:900");
+  });
+
+  it("still enforces the hard turnTimeoutMs ceiling while a background workflow runs", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { inactivityTimeoutMs: 60, turnTimeoutMs: 180 }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "wf ceiling", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_wf", name: "run_workflow", kind: "other", title: "Long workflow", status: "in_progress" });
+    await expect(settleWithin(reply, 1_500)).rejects.toThrow(/Antigravity ACP turn timed out/);
+    expect(harness.log).toContain("kill:900");
+  });
+
+  it("does not let an earlier turn's background command suppress the inactivity timeout of a new turn", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { inactivityTimeoutMs: 80 }));
+    const first = adapter.sendUserMessage("tarobot-1", { text: "start daemon", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_daemon", name: "run_command", kind: "execute", title: "npm run dev", status: "in_progress", rawInput: { CommandLine: "npm run dev" } });
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 90, size: 1000 });
+    server.text("started");
+    server.respondPrompt();
+    await settleWithin(first);
+
+    // A new turn starts while call_daemon from turn 1 is still open; if turn 2 stalls, it still times out.
+    const second = adapter.sendUserMessage(SESSION_A, { text: "stalled follow-up", files: [] });
+    await waitFor(() => server.prompts.length === 2);
+    await expect(settleWithin(second, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
+    expect(harness.log).toContain("kill:900");
+  });
+
+  it("pauses inactivity timeout during reactive wait after invoke_subagent completes on spawn, and re-arms if a subsequent foreground step stalls", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { inactivityTimeoutMs: 80 }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "delegate to subagent", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    // agy completes invoke_subagent immediately when spawning and then holds session/prompt open waiting for the child.
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_sub", name: "invoke_subagent", kind: "other", title: "invoke_subagent", status: "in_progress", rawInput: { TypeName: "self", Role: "Fix PR" } });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_sub", status: "completed", rawOutput: { output: "{\"conversationId\":\"sub-1\"}" } });
+    server.text("Subagent launched, waiting for result.");
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 120, size: 1000 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(harness.log).toEqual([]);
+
+    // Subagent wakes the parent, which runs a foreground tool and then stalls before the next usage_update.
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_read", name: "read_file", kind: "read", title: "read_file", status: "in_progress" });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_read", status: "completed", rawOutput: { output: "ok" } });
+    await expect(settleWithin(reply, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
+    expect(harness.log).toContain("kill:900");
+  });
+
+  it("does not pause inactivity timeout for read-only swarm status calls, only swarm add reactive waits", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }, { inactivityTimeoutMs: 70 }));
+    const reply = adapter.sendUserMessage("tarobot-1", { text: "check swarm", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    server.sendUpdate({ sessionUpdate: "tool_call", toolCallId: "call_sw", name: "swarm", kind: "other", title: "swarm", status: "in_progress", rawInput: { action: "status" } });
+    server.sendUpdate({ sessionUpdate: "tool_call_update", toolCallId: "call_sw", status: "completed" });
+    server.sendUpdate({ sessionUpdate: "usage_update", used: 100, size: 1000 });
+    await expect(settleWithin(reply, 1_500)).rejects.toThrow(/Antigravity ACP turn became inactive/);
+    expect(harness.log).toContain("kill:900");
+  });
+});

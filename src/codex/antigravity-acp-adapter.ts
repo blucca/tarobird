@@ -156,6 +156,10 @@ type Turn = {
   declinedAt?: number;
   /** The prompt is exactly the native /compact, which agy completes without text. */
   compact: boolean;
+  /** This turn spawned an async subagent/swarm worker whose ACP tool_call completed immediately on spawn. */
+  hasAsyncSubagent: boolean;
+  /** The model completed an LLM step (`usage_update`) with no active foreground tool and is waiting for reactive wakeup. */
+  awaitingReactiveWake: boolean;
   locale?: CodexUserMessageInput["locale"];
   onProgress?: CodexUserMessageInput["onProgress"];
   onEngineEvent?: CodexUserMessageInput["onEngineEvent"];
@@ -238,6 +242,15 @@ export const ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS = 30 * 60_000;
 const STOPPED_BY_USER = "Task was stopped by user";
 const DEFAULT_STEER_ADMISSION_TIMEOUT_MS = 10_000;
 const MAX_NATIVE_COMMANDS = 500;
+/** Orchestration tools whose child agents/workflows/timers run inside `agy` without emitting parent ACP updates. */
+const SILENT_LONG_RUNNING_TOOLS = new Set(["run_workflow", "invoke_subagent", "schedule"]);
+
+function spawnsReactiveSubagent(tool: ToolState): boolean {
+  const name = tool.name || tool.title || "";
+  if (name === "invoke_subagent") return true;
+  if (name === "swarm") return asRecord(tool.rawInput)?.action === "add";
+  return false;
+}
 const NATIVE_COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const ANTIGRAVITY_EFFORTS: ReadonlySet<string> = new Set(ANTIGRAVITY_EFFORT_LEVELS);
 const PRESET_SUFFIX = /-(low|medium|high|xhigh|max|ultra)$/;
@@ -571,11 +584,18 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const tasks: EngineTask[] = [];
     for (const tool of worker.tools.values()) {
       if (!tool.background || (tool.status !== "pending" && tool.status !== "in_progress")) continue;
-      if (tool.name !== "run_command" && !(tool.kind === "execute" && !tool.name)) continue;
-      const commandLine = asRecord(tool.rawInput)?.CommandLine;
-      const label = (tool.title || (typeof commandLine === "string" ? commandLine : "") || "run_command").slice(0, 500);
-      tasks.push({ id: tool.token, label, kind: "shell", mode: "background", status: "running", canStop: false,
-        startedAt: tool.startedAt, updatedAt: tool.updatedAt, owner: tool.turn ? "bound" : "unattributed" });
+      if (tool.name === "run_command" || (tool.kind === "execute" && !tool.name)) {
+        const commandLine = asRecord(tool.rawInput)?.CommandLine;
+        const label = (tool.title || (typeof commandLine === "string" ? commandLine : "") || "run_command").slice(0, 500);
+        tasks.push({ id: tool.token, label, kind: "shell", mode: "background", status: "running", canStop: false,
+          startedAt: tool.startedAt, updatedAt: tool.updatedAt, owner: tool.turn ? "bound" : "unattributed" });
+      } else if (SILENT_LONG_RUNNING_TOOLS.has(tool.name || tool.title || "")) {
+        const input = asRecord(tool.rawInput);
+        const desc = typeof input?.Description === "string" ? input.Description : typeof input?.Role === "string" ? input.Role : "";
+        const label = (tool.title || desc || tool.name || "workflow").slice(0, 500);
+        tasks.push({ id: tool.token, label, kind: "subagent", mode: "background", status: "running", canStop: false,
+          startedAt: tool.startedAt, updatedAt: tool.updatedAt, owner: tool.turn ? "bound" : "unattributed" });
+      }
     }
     return { supported: true, tasks: tasks.slice(-128) };
   }
@@ -829,7 +849,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private runTurn(worker: Worker, prompt: ContentBlock[], input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     return new Promise<CodexAdapterResponse>((resolve, reject) => {
       const turn: Turn = {
-        worker, prompts: [], text: "", usage: undefined, toolSeen: false, permissionTools: new Map(), compact: input.text.trim() === "/compact", locale: input.locale,
+        worker, prompts: [], text: "", usage: undefined, toolSeen: false, permissionTools: new Map(), compact: input.text.trim() === "/compact",
+        hasAsyncSubagent: false, awaitingReactiveWake: false, locale: input.locale,
         onProgress: input.onProgress, onEngineEvent: input.onEngineEvent, onApprovalRequest: input.onApprovalRequest,
         approvals: new AbortController(), eventChain: Promise.resolve(), stopRequested: false,
         timeoutsDisabled: input.disableRuntimeTimeout === true, done: false, resolve, reject,
@@ -860,6 +881,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const worker = turn.worker;
     const entry: PromptEntry = { seq: ++worker.promptSeq, settled: false, ...(admission ? { admission, steer: true } : {}) };
     turn.prompts.push(entry);
+    turn.awaitingReactiveWake = false;
     this.markActivity(worker);
     worker.connection.agent.request(acpMethods.agent.session.prompt, { sessionId: worker.sessionId!, prompt }).then(
       (result) => this.promptSettled(turn, entry, { result }),
@@ -973,10 +995,31 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     this.armInactivity(turn);
   }
 
+  /**
+   * True when this turn is legitimately waiting without parent ACP stream updates:
+   * awaiting a user permission decision, waiting on its own background tools /
+   * multi-agent orchestration tools (`run_workflow`, `invoke_subagent`, `schedule`),
+   * or sitting in `agy`'s reactive wakeup wait after spawning an async subagent/swarm.
+   * Unrelated background tools from earlier turns do not suppress this turn's watchdog.
+   */
+  private hasSilentLongRunningWait(turn: Turn): boolean {
+    const worker = turn.worker;
+    if (worker.pendingPermissions > 0) return true;
+    let hasForegroundTool = false;
+    for (const tool of worker.tools.values()) {
+      if (tool.status !== "pending" && tool.status !== "in_progress") continue;
+      if (tool.turn !== turn) continue;
+      if (tool.background || SILENT_LONG_RUNNING_TOOLS.has(tool.name || tool.title || "")) return true;
+      hasForegroundTool = true;
+    }
+    return !hasForegroundTool && turn.hasAsyncSubagent && turn.awaitingReactiveWake;
+  }
+
   private armInactivity(turn: Turn): void {
     if (turn.inactivityTimer) clearTimeout(turn.inactivityTimer);
     turn.inactivityTimer = undefined;
-    if (turn.timeoutsDisabled || !this.inactivityTimeoutMs || this.inactivityTimeoutMs <= 0) return;
+    if (turn.done || turn.timeoutsDisabled || !this.inactivityTimeoutMs || this.inactivityTimeoutMs <= 0) return;
+    if (this.hasSilentLongRunningWait(turn)) return;
     turn.inactivityTimer = setTimeout(() => {
       void this.closeWorker(turn.worker, new Error(`Antigravity ACP turn became inactive after ${Math.max(1, Math.round(this.inactivityTimeoutMs! / 60_000))} minutes`));
     }, this.inactivityTimeoutMs);
@@ -1019,16 +1062,25 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       }).slice(0, MAX_NATIVE_COMMANDS);
     }
     const turn = worker.turn;
-    if (kind === "tool_call" || kind === "tool_call_update") this.trackTool(worker, update, turn);
+    if (kind === "tool_call" || kind === "tool_call_update") {
+      if (turn) turn.awaitingReactiveWake = false;
+      this.trackTool(worker, update, turn);
+    }
+    if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
+      if (turn) turn.awaitingReactiveWake = false;
+    }
     if (kind === "usage_update") {
       // A model call after a still-running tool means the model left it running in the background.
       for (const tool of worker.tools.values()) if (tool.status === "pending" || tool.status === "in_progress") tool.background = true;
+      if (turn && turn.hasAsyncSubagent) turn.awaitingReactiveWake = true;
     }
     if (!turn) this.trackWake(worker, kind, update);
     // A finished call is no longer needed: its result and any wake-up owner were taken above.
     if ((kind === "tool_call" || kind === "tool_call_update") && (update.status === "completed" || update.status === "failed") && typeof update.toolCallId === "string") {
       worker.tools.delete(update.toolCallId);
     }
+    // Re-sync the inactivity timer after worker.tools reflects newly started, backgrounded, or finished tools.
+    if (turn) this.armInactivity(turn);
     if (!turn) return;
     const sessionId = worker.sessionId!;
     if (kind === "agent_message_chunk") {
@@ -1182,6 +1234,9 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
     if ((tool.status === "completed" || tool.status === "failed") && !tool.emittedResult) {
       tool.emittedResult = true;
+      if (tool.status === "completed" && spawnsReactiveSubagent(tool)) {
+        owner.hasAsyncSubagent = true;
+      }
       const output = toolText(update);
       const exitCode = asRecord(update.rawOutput)?.exit_code;
       this.emit(owner, {
@@ -1238,6 +1293,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       this.emit(turn, { type: "permission_request", toolName, toolInput: approval.toolInput, toolUseId: toolCall.toolCallId, sessionId: worker.sessionId! });
     }
     worker.pendingPermissions += 1;
+    this.armInactivity(turn);
     let decision: EngineApprovalDecision;
     try {
       decision = await turn.onApprovalRequest(approval);
@@ -1245,6 +1301,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       decision = { behavior: "deny" };
     } finally {
       worker.pendingPermissions = Math.max(0, worker.pendingPermissions - 1);
+      if (worker.turn === turn && !turn.done) this.armInactivity(turn);
     }
     if (turn.approvals.signal.aborted || turn.done) return { outcome: { outcome: "cancelled" } };
     if (decision.behavior === "allow" && allow) return { outcome: { outcome: "selected", optionId: allow } };
