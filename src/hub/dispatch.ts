@@ -1380,16 +1380,22 @@ export class HubDispatch {
   }
   private async sweepOnce(): Promise<void> {
     const generation = this.generation;
-    const { rows, hasPendingNotices } = await this.db.serial(async () => {
+    const { rows, hasPendingNotices, hasPendingSummaries, hasQueuedBatches } = await this.db.serial(async () => {
       const batch = await this.db.all<TicketRow>("SELECT * FROM dispatch_tickets WHERE status='working' AND id>? ORDER BY id LIMIT 64", [this.sweepCursor]);
       const rows = batch.length || !this.sweepCursor ? batch : await this.db.all<TicketRow>("SELECT * FROM dispatch_tickets WHERE status='working' ORDER BY id LIMIT 64");
-      const hasPendingNotices = !!await this.db.get("SELECT 1 FROM meta WHERE key LIKE ? LIMIT 1", [`${PENDING_NOTICE_PREFIX}%`]);
-      return { rows, hasPendingNotices };
+      // One cheap existence probe for the rest of the sweep's work, so an idle
+      // Host skips the source lookup, the summary scan and auto-advance.
+      const pending = await this.db.get<{ notices: number; summaries: number; queued: number }>(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key LIKE ?) AS notices, EXISTS(SELECT 1 FROM meta WHERE key LIKE ?) AS summaries, EXISTS(SELECT 1 FROM dispatch_tickets WHERE batch_id IS NOT NULL AND status='queued' AND paused=0) AS queued",
+        [`${PENDING_NOTICE_PREFIX}%`, `${PENDING_BATCH_SUMMARY_PREFIX}%`],
+      );
+      return { rows, hasPendingNotices: !!pending?.notices, hasPendingSummaries: !!pending?.summaries, hasQueuedBatches: !!pending?.queued };
     });
     this.sweepCursor = rows.at(-1)?.id ?? "";
+    if (!rows.length && !hasPendingNotices && !hasPendingSummaries && !hasQueuedBatches) return;
     const source = await this.options.source();
     if (hasPendingNotices) await this.flushPendingNotices(source);
-    const pendingSummaries = await this.db.serial(() => this.db.all<{ value: string }>(
+    const pendingSummaries = !hasPendingSummaries ? [] : await this.db.serial(() => this.db.all<{ value: string }>(
       "SELECT value FROM meta WHERE key LIKE ? ORDER BY key LIMIT 64", [`${PENDING_BATCH_SUMMARY_PREFIX}%`],
     ));
     for (const pending of pendingSummaries) await this.maybePublishBatchSummary(pending.value, source).catch(() => undefined);
