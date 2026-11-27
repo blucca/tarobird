@@ -7,6 +7,7 @@ import { DESIGN_SHARE_CLIENT_CAPABILITY } from "../client-protocol/workbench-des
 import { HubRemoteScreen } from "./remote-screen.js";
 import { RemoteScreenSockets } from "./remote-screen-sockets.js";
 import { signedScreenConfigureSchema, screenStopSchema, SCREEN_MAX_CONTROL_BYTES } from "../client-protocol/remote-screen.js";
+import type { ScreenRouteKind } from "../client-protocol/screen-metrics.js";
 import { WorkbenchBroker, type WorkbenchActor, type WorkbenchPeer } from "./workbench.js";
 import { readWorkbenchTurnMetadata, type WorkbenchContextReceipt } from "./workbench-history.js";
 import type { WorkbenchContext } from "../client-protocol/workbench.js";
@@ -130,7 +131,7 @@ import { CONVERSATION_SYNC_CAPABILITY, SNAPSHOT_ACTIVITY_CAPABILITY, SNAPSHOT_DE
 import { botPublishSchema, instanceFrameSchema } from "../client-protocol/instance.js";
 import { HubAttachments } from "./attachments.js";
 import { HubAuth, hashSecret, parsePublicKey, type AuthSession } from "./auth.js";
-import { assertSafeBind, isLocalNetworkAddress, isLoopback, NATIVE_ORIGINS, type ListenerExposure } from "./network.js";
+import { assertSafeBind, isLocalNetworkAddress, isLoopback, isTailscaleAddress, NATIVE_ORIGINS, type ListenerExposure } from "./network.js";
 import { HubError, HubStore, newId } from "./store.js";
 import { NOTIFICATION_OPTION_KEYS, notificationPreferencesSchema, pushSubscriptionSchema, pushRotationSchema } from "../client-protocol/push.js";
 import { allowedApnsTopics, assertApnsTopicAllowed, createPushSender, validatePushDestination, type PushConfig } from "./push/providers.js";
@@ -484,13 +485,19 @@ export class HubServer {
     });
     server.on("upgrade", (req, socket, head) => {
       if (!this.stopping && this.originAllowed(req) && this.screenSockets.handles(req.url ?? "")) {
-        this.screenSockets.upgrade(req, socket, head, instance && !tls && isLoopback(req.socket.remoteAddress ?? ""), isLocalNetworkAddress(req.socket.remoteAddress ?? "")); return;
+        this.screenSockets.upgrade(req, socket, head, instance && !tls && isLoopback(req.socket.remoteAddress ?? ""), isLocalNetworkAddress(req.socket.remoteAddress ?? ""), this.screenRouteFromSource(this.relaySources.source(req.socket))); return;
       }
       // A relay arrives from loopback, so the socket address alone cannot
       // distinguish an instance connection from an untrusted remote client.
       if (this.stopping || !this.originAllowed(req) || !["/ws", "/instance"].includes(req.url ?? "") || (req.url === "/instance" && (!instance || !isLoopback(req.socket.remoteAddress ?? "")))) { socket.destroy(); return; }
       this.sockets.handleUpgrade(req, socket, head, (ws) => req.url === "/instance" ? this.instanceSocket(ws) : this.clientSocket(ws, this.relaySources.source(req.socket)));
     });
+  }
+  private screenRouteFromSource(source: string): ScreenRouteKind {
+    if (source.startsWith("relay:")) return "tcp_vps_relay";
+    if (isTailscaleAddress(source)) return "tcp_tailscale";
+    if (isLocalNetworkAddress(source) || isLoopback(source)) return "tcp_lan_direct";
+    return "tcp_default";
   }
   private trackTask(work: Promise<unknown>): void {
     this.httpTasks.add(work);
@@ -1782,11 +1789,16 @@ export class HubServer {
         } catch (error) { if (error instanceof VoiceSettingsError) throw new HubError(error.code, error.status); throw error; }
       }
       // `includeWindows=1`: this client can read a Windows desktop. Older ones parse the reply strictly as a Mac's.
-      const screenViewer = { windows: url.searchParams.get("includeWindows") === "1" };
+      // `includeUdpStatus=1`: this client can read `udpStatus` and `policy.udpBoost`. Older ones parse the reply strictly.
+      const screenViewer = {
+        windows: url.searchParams.get("includeWindows") === "1",
+        udpStatus: url.searchParams.get("includeUdpStatus") === "1",
+        route: this.screenRouteFromSource(source),
+      };
       if (route === "/api/screens/status" && req.method === "GET") { await reply(200, await this.remoteScreen.status(session, screenViewer)); return; }
       if (route === "/api/screens/configure" && req.method === "POST") {
         const { command, proof } = signedScreenConfigureSchema.parse(await this.jsonBody(req, SCREEN_MAX_CONTROL_BYTES));
-        await reply(200, await this.remoteScreen.configure(session, command, proof)); return;
+        await reply(200, await this.remoteScreen.configure(session, command, proof, screenViewer)); return;
       }
       if (route === "/api/screens/sessions" && req.method === "POST") { await reply(201, await this.remoteScreen.open(session, await this.jsonBody(req, SCREEN_MAX_CONTROL_BYTES), screenViewer)); return; }
       if (route === "/api/screens/stop" && req.method === "POST") { const input = screenStopSchema.parse(await this.jsonBody(req, 4096)); await this.remoteScreen.stop(session, input.sessionId); await reply(200, { ok: true }); return; }
