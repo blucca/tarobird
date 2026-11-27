@@ -366,3 +366,59 @@ test("forgetting a computer on this device also forgets its saved quota readings
     expect(left.afterRemoval).toEqual({ other: { gamma: {} } });
   } finally { await server.close(); }
 });
+
+test("Kimi conversation UsageDetails separates Monthly vs Coding 30-day rows and excludes extra_monthly from battery", async ({ page }) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "usage-kimi-"));
+  const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: path.resolve("dist") });
+  await hub.profile.update({ name: "测试主机", revision: (await hub.profile.read()).revision });
+  const stateDir = path.join(root, "kimi_bot"), secret = randomBytes(32).toString("base64url");
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "kimi", model: "kimi-for-coding", locale: "zh" }));
+  await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES(?,?,?)", ["kimi_bot", "Kimi Bot", hashSecret(secret)]);
+  const now = Date.now(), at = new Date(now).toISOString(), expiresAt = new Date(now + 60_000).toISOString();
+  const kimiSnapshot: QuotaSnapshot = {
+    authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "unknown",
+    observedAt: at, lastAttemptAt: at, constraints: [], help: "kimi_usage",
+    pools: [{
+      id: "kimi", label: "Kimi Code", sharing: "shared", availability: "unknown", constraints: [],
+      windows: [
+        { id: "five_hour", label: "5 hours", metric: "percent", usedPercent: 5, availability: "unknown", observedAt: at, expiresAt, periodSeconds: 18_000 },
+        { id: "seven_day", label: "7 days", metric: "percent", usedPercent: 20, availability: "unknown", observedAt: at, expiresAt, periodSeconds: 604_800 },
+        { id: "month_total", label: "Monthly", metric: "percent", usedPercent: 10, availability: "unknown", observedAt: at, expiresAt, periodSeconds: 30 * 86_400 },
+        { id: "month_code", label: "Coding · 30 days", metric: "percent", usedPercent: 15, availability: "unknown", observedAt: at, expiresAt, periodSeconds: 30 * 86_400 },
+        { id: "extra_monthly", label: "Top-up monthly limit", metric: "percent", usedPercent: 100, availability: "unknown", observedAt: at, expiresAt, periodSeconds: 30 * 86_400 },
+      ],
+      balances: [{ id: "top_up", kind: "currency", amount: "10.00", unit: "CNY", observedAt: at, expiresAt }],
+    }],
+  };
+  const gateway = await attachGateway({
+    stateDir, url: hub.instanceUrl.replace("http", "ws") + "/instance", secret, botId: "kimi_bot", engine: "kimi", model: "kimi-for-coding",
+    runtime: createCoreServiceRuntime(),
+    bridge: {
+      handleAuthorizedMessage: async () => ({ text: "好的" }),
+      readAccountQuota: async () => ({ revision: "kimi_rev", snapshot: kimiSnapshot }),
+    },
+  });
+  try {
+    await hub.store.createConversation("owner", ["kimi_bot"], "Kimi 额度", "kimi_conv");
+    await page.goto(hub.url); await preparePairing(page, hub); await page.getByRole("button", { name: "配对此设备", exact: true }).click();
+    await hub.auth.approve(await page.getByLabel("配对码", { exact: true }).innerText(), "local-owner");
+    await page.getByLabel("配对码", { exact: true }).waitFor({ state: "hidden" }); await waitForClientOnline(page);
+    await selectConversation(page, "Kimi 额度");
+    const ws = workspace(page), indicators = ws.locator(".usage-indicators"), battery = indicators.locator("[data-usage=quota]");
+    // 100%-used extra_monthly must NOT drop battery from 80% (seven_day remaining) to 0%.
+    await expect(battery).toHaveText("80%");
+    await expect(battery).toHaveAttribute("data-tone", "ok");
+    await indicators.click();
+    const panel = page.getByRole("group", { name: "上下文与额度", exact: true });
+    const rows = panel.getByRole("region", { name: "额度 · Kimi Code", exact: true }).locator(".usage-window");
+    await expect(rows).toHaveCount(4);
+    await expect(rows.nth(0)).toContainText("5 小时");
+    await expect(rows.nth(1)).toContainText("7 天");
+    await expect(rows.nth(2)).toContainText("30 天");
+    await expect(rows.nth(2)).not.toContainText("编程 · 30 天");
+    await expect(rows.nth(3)).toContainText("编程 · 30 天");
+  } finally {
+    await page.close(); await gateway.disconnect(); await hub.close(); await rm(root, { recursive: true, force: true });
+  }
+});

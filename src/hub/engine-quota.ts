@@ -43,23 +43,29 @@ export function hubEngineQuotas(options: {
       return fallback(bot, error instanceof HubError && error.code === "bot_timeout" ? "timeout" : "invalid_response");
     }
   };
+  const project = (scope: QuotaScope, includeCurrencyBalances: boolean): QuotaScope => includeCurrencyBalances ? scope : {
+    ...scope,
+    pools: scope.pools.map(pool => ({ ...pool, balances: pool.balances.filter(balance => balance.kind === "credits") })),
+  };
   return {
-    async directory() {
+    async directory(readOptions?: { includeCurrencyBalances?: boolean }) {
+      const includeCurrency = readOptions?.includeCurrencyBalances === true;
       const bots = await list(), scopes: QuotaScope[] = [], deadline = Date.now() + 5_000;
       // Bound concurrent worker reads. These are cache-only; none launches a CLI.
       for (let i = 0; i < Math.min(bots.length, 256); i += 4) scopes.push(...await Promise.all(bots.slice(i, Math.min(i + 4, 256)).map(bot => read(bot, false, undefined, deadline))));
       const visible = new Map((await list()).map(bot => [bot.id, bot]));
       await options.validate();
-      return quotaDirectorySchema.parse({ generatedAt: new Date().toISOString(), scopes: scopes.filter(scope => visible.has(scope.id)).map(scope => current(visible.get(scope.id)!, scope)), ...(bots.length > 256 ? { truncated: true } : {}) });
+      return quotaDirectorySchema.parse({ generatedAt: new Date().toISOString(), scopes: scopes.filter(scope => visible.has(scope.id)).map(scope => project(current(visible.get(scope.id)!, scope), includeCurrency)), ...(bots.length > 256 ? { truncated: true } : {}) });
     },
-    async scope(id: string, refresh: boolean, revision?: string) {
+    async scope(id: string, refresh: boolean, revision?: string, readOptions?: { includeCurrencyBalances?: boolean }) {
+      const includeCurrency = readOptions?.includeCurrencyBalances === true;
       if (refresh && !revision) throw new HubError("quota_revision_required", 400);
       const bot = (await list()).find(bot => bot.id === id);
       if (!bot) throw new HubError("quota_scope_missing", 404);
       const result = await read(bot, refresh, revision);
       const latest = (await list()).find(bot => bot.id === id);
       if (!latest) throw new HubError("quota_scope_missing", 404);
-      await options.validate(); return current(latest, result);
+      await options.validate(); return project(current(latest, result), includeCurrency);
     },
   };
 }

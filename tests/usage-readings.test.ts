@@ -55,6 +55,23 @@ describe("quota left for one Bot", () => {
     expect(quotaView(claude, "claude-opus-5-5", now)!.left).toBe(0);
     expect(quotaView(claude, "", now)).toMatchObject({ left: 60, windows: [{ label: "five_hour" }, { label: "seven_day" }] });
   });
+  it("excludes Kimi's extra_monthly top-up spend cap from the conversation battery and window list", () => {
+    const kimi = scope("kimi", [{ label: "Kimi Code", windows: [
+      window("five_hour", 5, { label: "5 hours", periodSeconds: 18_000 }),
+      window("seven_day", 20, { label: "7 days", periodSeconds: 604_800 }),
+      window("month_total", 10, { label: "Monthly", periodSeconds: 30 * 86_400 }),
+      window("month_code", 15, { label: "Coding · 30 days", periodSeconds: 30 * 86_400 }),
+      window("extra_monthly", 100, { label: "Top-up monthly limit", periodSeconds: 30 * 86_400 }),
+    ] }]);
+    const view = quotaView(kimi, "kimi-for-coding", now)!;
+    expect(view.left).toBe(80);
+    expect(view.windows.map(item => [item.id, item.label])).toEqual([
+      ["p0:five_hour", "5 hours"],
+      ["p0:seven_day", "7 days"],
+      ["p0:month_total", "Monthly"],
+      ["p0:month_code", "Coding · 30 days"],
+    ]);
+  });
   it("counts a Claude model's own weekly pool only for a Bot on that model family", () => {
     const claude = scope("claude", [{ label: "Claude", windows: [window("seven_day", 31)] }, { label: "Fable", models: ["Fable"], windows: [window("seven_day", 64)] }]);
     for (const model of ["claude-fable-5-2", "fable", "Fable[1m]"]) expect(quotaView(claude, model, now)).toMatchObject({ left: 36, windows: [{ pool: "Claude", left: 69 }, { pool: "Fable", left: 36 }] });
@@ -162,6 +179,7 @@ describe("what the App holds and when it asks the engine", () => {
     expect(mayAskEngine(without("offline", { revision: "offline", state: "offline" }), undefined, undefined, now, 60_000)).toBe(false);
     expect(mayAskEngine({ ...without("no_passive_event"), capability: { mode: "passive" } }, undefined, undefined, now, 60_000)).toBe(false);
     expect(mayAskEngine({ ...without("mode_not_supported", { state: "unsupported" }), capability: { mode: "unsupported" } }, undefined, undefined, now, 60_000)).toBe(false);
+    expect(mayAskEngine({ ...without("mode_not_supported", { state: "unsupported" }), capability: { mode: "active", reason: "mode_not_supported" } }, undefined, undefined, now, 60_000)).toBe(false);
   });
 });
 

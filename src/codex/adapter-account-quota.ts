@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { openSync, readSync, fstatSync, closeSync, constants } from "node:fs";
+import { openSync, readSync, readdirSync, fstatSync, statSync, closeSync, constants, type BigIntStats } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { QuotaAuthMode, QuotaEngine, QuotaSnapshot } from "../client-protocol/engine-quota.js";
@@ -80,11 +80,79 @@ function envMaterial(env: NodeJS.ProcessEnv, prefix: RegExp, platform: NodeJS.Pl
     .sort((a, b) => compareCodeUnits(a[0], b[0]));
 }
 
+const KIMI_MAX_DIR_ENTRIES = 256;
+const KIMI_MAX_DIR_DEPTH = 2;
+
+function formatStat(st: BigIntStats): string {
+  const kind = st.isDirectory() ? "d" : st.isFile() ? "f" : "o";
+  return `${kind}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+}
+
+function statMetadata(file: string): string {
+  try {
+    return formatStat(statSync(file, { bigint: true }));
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return "missing";
+    throw new Error("scope_unverifiable");
+  }
+}
+
+function fingerprintKimiDir(dir: string, depth = 0): { meta: string; entries: unknown[]; fileCount: number } {
+  let st: BigIntStats;
+  try {
+    st = statSync(dir, { bigint: true });
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return { meta: "missing", entries: [], fileCount: 0 };
+    }
+    throw new Error("scope_unverifiable");
+  }
+  const meta = formatStat(st);
+  if (st.isFile()) return { meta, entries: [], fileCount: 1 };
+  if (!st.isDirectory()) throw new Error("scope_unverifiable");
+  if (depth >= KIMI_MAX_DIR_DEPTH) throw new Error("scope_unverifiable");
+
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return { meta: "missing", entries: [], fileCount: 0 };
+    }
+    throw new Error("scope_unverifiable");
+  }
+  if (names.length > KIMI_MAX_DIR_ENTRIES) throw new Error("scope_unverifiable");
+  names.sort();
+
+  const entries: unknown[] = [];
+  let fileCount = 0;
+  for (const name of names) {
+    const entryPath = path.join(dir, name);
+    let entryStat: BigIntStats;
+    try {
+      entryStat = statSync(entryPath, { bigint: true });
+    } catch {
+      throw new Error("scope_unverifiable");
+    }
+    if (entryStat.isDirectory()) {
+      const nested = fingerprintKimiDir(entryPath, depth + 1);
+      entries.push([name, nested.meta, nested.entries]);
+      fileCount += nested.fileCount;
+    } else if (entryStat.isFile()) {
+      entries.push([name, formatStat(entryStat)]);
+      if (name !== ".DS_Store") fileCount++;
+    } else {
+      throw new Error("scope_unverifiable");
+    }
+  }
+  return { meta, entries, fileCount };
+}
+
 /** Private in-memory scope guard. No credential values, hashes or file paths are emitted to logs/public DTOs. */
 export class AdapterQuotaCache {
   readonly proofKey = randomBytes(32);
   private cached?: { revision: string; snapshot: QuotaSnapshot; proof?: QuotaAccountProof };
-  constructor(private readonly engine: "codex" | "claude" | "antigravity", private readonly executable: string, private readonly env: NodeJS.ProcessEnv, private readonly cwd?: string, private readonly configPath?: string, private readonly platform: NodeJS.Platform = process.platform) {}
+  constructor(private readonly engine: "codex" | "claude" | "antigravity" | "kimi", private readonly executable: string, private readonly env: NodeJS.ProcessEnv, private readonly cwd?: string, private readonly configPath?: string, private readonly platform: NodeJS.Platform = process.platform) {}
 
   capture(workerGeneration: string): AdapterQuotaScope {
     const digest = (value: unknown) => createHmac("sha256", this.proofKey).update(JSON.stringify(value)).digest("hex");
@@ -93,7 +161,9 @@ export class AdapterQuotaCache {
       ? readPlatformEnv(this.env, "CODEX_HOME", this.platform)?.trim() || path.join(home, ".codex")
       : this.engine === "claude"
         ? readPlatformEnv(this.env, "CLAUDE_CONFIG_DIR", this.platform)?.trim() || path.join(home, ".claude")
-        : path.join(home, ".gemini", "antigravity-cli");
+        : this.engine === "kimi"
+          ? this.env.KIMI_CODE_HOME || path.join(home, ".kimi-code")
+          : path.join(home, ".gemini", "antigravity-cli");
     let authMode: QuotaAuthMode = "unknown", verifiable = false;
     let material: unknown;
     try {
@@ -128,6 +198,45 @@ export class AdapterQuotaCache {
         // The macOS CLI may prefer Keychain over the plaintext file. Only an explicit env token proves that source here.
         verifiable = !opaque && authMode !== "unknown" && (this.platform !== "darwin" || Boolean(oauthEnv || apiKey) || cloud);
         material = [this.executable, engineHome, configured, settings, project, authText, env];
+      } else if (this.engine === "kimi") {
+        // Never read or copy Kimi's credential bytes; track login/config changes via filesystem metadata only.
+        // Any non-ENOENT error throws `scope_unverifiable`, failing closed instead of reusing stale quotas.
+        const legacyHome = path.join(home, ".kimi");
+        const credDirs = [
+          fingerprintKimiDir(path.join(engineHome, "credentials")),
+          fingerprintKimiDir(path.join(engineHome, "oauth")),
+          fingerprintKimiDir(path.join(legacyHome, "credentials")),
+          fingerprintKimiDir(path.join(legacyHome, "oauth")),
+        ];
+        const metaFiles = [
+          statMetadata(path.join(engineHome, "config.toml")),
+          statMetadata(path.join(engineHome, "region")),
+          statMetadata(path.join(engineHome, "credentials.json")),
+          statMetadata(path.join(engineHome, "oauth.json")),
+          statMetadata(path.join(legacyHome, "config.toml")),
+          statMetadata(path.join(legacyHome, "region")),
+          statMetadata(path.join(legacyHome, "credentials.json")),
+          statMetadata(path.join(legacyHome, "oauth.json")),
+        ];
+        const hasCredentialFiles = credDirs.some(dir => dir.fileCount > 0)
+          || metaFiles[2] !== "missing"
+          || metaFiles[3] !== "missing"
+          || metaFiles[6] !== "missing"
+          || metaFiles[7] !== "missing";
+        const hasApiKeyOnly = Boolean(this.env.KIMI_API_KEY) && !hasCredentialFiles;
+        const envFlags = [
+          Boolean(this.env.KIMI_API_KEY),
+          this.env.KIMI_CODE_HOME ?? "",
+          this.env.KIMI_BASE_URL ?? "",
+          this.env.KIMI_CODE_BASE_URL ?? "",
+          this.env.KIMI_CODE_OAUTH_HOST ?? "",
+          this.env.KIMI_OAUTH_HOST ?? "",
+          this.env.KIMI_CODE_REGION ?? "",
+          this.env.KIMI_REGION ?? "",
+        ];
+        authMode = hasApiKeyOnly ? "api_key" : "subscription";
+        verifiable = true;
+        material = [this.executable, engineHome, configured, credDirs, metaFiles, envFlags];
       } else {
         const geminiHome = path.join(home, ".gemini");
         const settings = readBounded(path.join(engineHome, "settings.json"));
@@ -175,7 +284,7 @@ export class AdapterQuotaCache {
     }
     if (scope.authMode !== "subscription") { this.cached = undefined; return { revision: scope.revision, snapshot: unavailableQuota(this.engine, "mode_not_supported", Date.now(), scope.authMode) }; }
     if (this.cached?.revision !== scope.revision) this.cached = undefined;
-    if (options.refresh && (this.engine === "codex" || this.engine === "antigravity")) {
+    if (options.refresh && (this.engine === "codex" || this.engine === "antigravity" || this.engine === "kimi")) {
       // `agy` may open a browser sign-in each time it is asked while signed out. Once it has said so, it is
       // not started again for the same login state until this long has passed.
       if (this.engine === "antigravity" && this.cached?.snapshot.state === "login_required" && this.cached.snapshot.lastAttemptAt

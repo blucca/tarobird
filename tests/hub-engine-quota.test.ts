@@ -1,9 +1,27 @@
 import { expect, it, vi } from "vitest";
+import { z } from "zod";
 import { hubEngineQuotas } from "../src/hub/engine-quota.js";
 import { HubError } from "../src/hub/errors.js";
 import { unavailableQuota } from "../src/codex/account-quota.js";
-import { engineQuotaCommand, engineQuotaGuidance, engineQuotaNotes, QUOTA_CLAUDE_UNVERIFIABLE_TEXT, QUOTA_EXPIRED_TEXT, QUOTA_REASON_TEXT, QUOTA_STATE_TEXT } from "../src/host-cli/engine-quota.js";
-import { ENGINE_QUOTA_CAPABILITY, quotaHelpSchema, quotaReasonSchema, quotaStateSchema } from "../src/client-protocol/engine-quota.js";
+import {
+  engineQuotaCommand,
+  engineQuotaGuidance,
+  engineQuotaNotes,
+  QUOTA_CLAUDE_UNVERIFIABLE_TEXT,
+  QUOTA_EXPIRED_TEXT,
+  QUOTA_KIMI_API_KEY_TEXT,
+  QUOTA_KIMI_NOT_CODING_PLAN_TEXT,
+  QUOTA_REASON_TEXT,
+  QUOTA_STATE_TEXT,
+} from "../src/host-cli/engine-quota.js";
+import {
+  ENGINE_QUOTA_CAPABILITY,
+  ENGINE_QUOTA_CURRENCY_CAPABILITY,
+  quotaHelpSchema,
+  quotaReasonSchema,
+  quotaStateSchema,
+} from "../src/client-protocol/engine-quota.js";
+import { CAPABILITIES, SERVER_CAPABILITIES } from "../src/client-protocol/index.js";
 
 function fixture() {
   let key = {}, visible = true, authorized = true;
@@ -68,6 +86,74 @@ it("CLI refresh uses exactly the same versioned scope and never creates a turn",
   expect(client.request).toHaveBeenCalledExactlyOnceWith("/api/engine-quotas/bot?refresh=1&revision=rev");
   await expect(engineQuotaCommand(client as never, { refresh: true })).rejects.toThrow();
   expect(client.request).toHaveBeenCalledOnce();
+
+  const upgraded = { ready: { serverCapabilities: [ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_CURRENCY_CAPABILITY] }, request: vi.fn(async () => value) };
+  await engineQuotaCommand(upgraded as never, { bot: "bot", refresh: true, revision: "rev" });
+  expect(upgraded.request).toHaveBeenCalledExactlyOnceWith("/api/engine-quotas/bot?refresh=1&revision=rev&balances=currency");
+  expect(SERVER_CAPABILITIES).toContain(ENGINE_QUOTA_CURRENCY_CAPABILITY);
+  expect(CAPABILITIES).not.toContain(ENGINE_QUOTA_CURRENCY_CAPABILITY);
+});
+
+it("strips non-credits currency balances by default for v1.6.0 compatibility and includes them when opted in", async () => {
+  const now = new Date("2026-11-24T08:00:00Z").toISOString();
+  const expiresAt = new Date("2026-11-24T08:01:00Z").toISOString();
+  const key = {};
+  const quotas = hubEngineQuotas({
+    bots: async () => [
+      { id: "codex_bot", name: "Codex", engine: "codex" },
+      { id: "kimi_bot", name: "Kimi", engine: "kimi" },
+    ],
+    connection: () => ({ key, supported: true, ready: true }),
+    validate: async () => undefined,
+    call: async id => ({
+      scopeId: id,
+      revision: `${id}_rev`,
+      value: {
+        id,
+        revision: `${id}_rev`,
+        engine: id === "kimi_bot" ? "kimi" : "codex",
+        label: id,
+        botIds: [id],
+        sharing: "unverified",
+        authMode: "subscription",
+        capability: { mode: "active" },
+        state: "ready",
+        availability: "unknown",
+        observedAt: now,
+        constraints: [],
+        pools: [{
+          id: "pool",
+          label: id === "kimi_bot" ? "Kimi Code" : "Codex",
+          sharing: "shared",
+          availability: "unknown",
+          windows: [{ id: "five_hour", label: "5 hours", metric: "percent", usedPercent: 10, availability: "unknown", observedAt: now, expiresAt }],
+          balances: [id === "kimi_bot"
+            ? { id: "top_up", kind: "currency", amount: "45.50", unit: "CNY", observedAt: now, expiresAt }
+            : { id: "credits", kind: "credits", amount: "12.00", unit: "credits", observedAt: now, expiresAt }],
+          constraints: [],
+        }],
+      },
+    }),
+  });
+
+  const v1BalanceSchema = z.object({ kind: z.literal("credits"), unit: z.literal("credits") }).passthrough();
+  const v1Dir = await quotas.directory();
+  for (const scope of v1Dir.scopes) {
+    for (const pool of scope.pools) {
+      for (const balance of pool.balances) expect(v1BalanceSchema.safeParse(balance).success).toBe(true);
+    }
+  }
+  expect(v1Dir.scopes.find(s => s.id === "codex_bot")?.pools[0]?.balances).toHaveLength(1);
+  expect(v1Dir.scopes.find(s => s.id === "kimi_bot")?.pools[0]?.balances).toEqual([]);
+  expect((await quotas.scope("kimi_bot", false)).pools[0]?.balances).toEqual([]);
+
+  const v2Dir = await quotas.directory({ includeCurrencyBalances: true });
+  expect(v2Dir.scopes.find(s => s.id === "kimi_bot")?.pools[0]?.balances).toEqual([
+    expect.objectContaining({ id: "top_up", kind: "currency", amount: "45.50", unit: "CNY" }),
+  ]);
+  expect((await quotas.scope("kimi_bot", false, undefined, { includeCurrencyBalances: true })).pools[0]?.balances).toEqual([
+    expect.objectContaining({ id: "top_up", kind: "currency", amount: "45.50", unit: "CNY" }),
+  ]);
 });
 
 // #47-C: the verified official viewing guidance reaches CLI users without changing the JSON contract.
@@ -93,7 +179,14 @@ it("CLI status and reason text is the App's own wording in both languages", asyn
   const { readFile } = await import("node:fs/promises");
   const app = await readFile(new URL("../client/src/EngineQuota.tsx", import.meta.url), "utf8");
   const en = JSON.parse(await readFile(new URL("../client/src/locales/en.json", import.meta.url), "utf8")) as Record<string, string>;
-  const pairs = [...Object.values(QUOTA_STATE_TEXT), ...Object.values(QUOTA_REASON_TEXT), QUOTA_CLAUDE_UNVERIFIABLE_TEXT, QUOTA_EXPIRED_TEXT];
+  const pairs = [
+    ...Object.values(QUOTA_STATE_TEXT),
+    ...Object.values(QUOTA_REASON_TEXT),
+    QUOTA_CLAUDE_UNVERIFIABLE_TEXT,
+    QUOTA_KIMI_API_KEY_TEXT,
+    QUOTA_KIMI_NOT_CODING_PLAN_TEXT,
+    QUOTA_EXPIRED_TEXT,
+  ];
   for (const [zh, english] of pairs) { expect(app).toContain(`t("${zh}")`); expect(en[zh]).toBe(english); }
   expect(Object.keys(QUOTA_REASON_TEXT).sort()).toEqual([...quotaReasonSchema.options].sort());
   expect(Object.keys(QUOTA_STATE_TEXT).sort()).toEqual([...quotaStateSchema.options].sort());
@@ -111,6 +204,8 @@ it("CLI notes explain why each Bot has no current reading, how to refresh it and
     scope("keyring", "codex", { ...unavailableQuota("codex", "scope_unverifiable"), nextRefreshAt: new Date(50_000).toISOString() }),
     scope("keychain", "claude", unavailableQuota("claude", "scope_unverifiable")),
     scope("kimi", "kimi", unavailableQuota("kimi", "not_adapted")),
+    scope("kimi_key", "kimi", unavailableQuota("kimi", "mode_not_supported", 1000, "api_key")),
+    scope("kimi_404", "kimi", { ...unavailableQuota("kimi", "mode_not_supported", 1000, "other"), capability: { mode: "active" as const, reason: "mode_not_supported" as const } }),
   ] };
   const notes = engineQuotaNotes(directory, 2000), text = notes.join("\n");
   expect(text).not.toMatch(/current Bot/);
@@ -119,10 +214,13 @@ it("CLI notes explain why each Bot has no current reading, how to refresh it and
   expect(notes).toContain("apikey Bot（Codex）：暂不支持 — 此授权方式不提供可读取的原生额度。 / Not supported — This authorization mode does not provide readable native quotas.");
   expect(text).toContain(`keyring Bot（Codex）：尚无数据 — ${QUOTA_REASON_TEXT.scope_unverifiable[0]}`);
   expect(text).toContain(`keychain Bot（Claude Code）：尚无数据 — ${QUOTA_CLAUDE_UNVERIFIABLE_TEXT[0]}`);
+  expect(notes).toContain(`kimi_key Bot（Kimi）：暂不支持 — ${QUOTA_KIMI_API_KEY_TEXT[0]} / Not supported — ${QUOTA_KIMI_API_KEY_TEXT[1]}`);
+  expect(notes).toContain(`kimi_404 Bot（Kimi）：暂不支持 — ${QUOTA_KIMI_NOT_CODING_PLAN_TEXT[0]} / Not supported — ${QUOTA_KIMI_NOT_CODING_PLAN_TEXT[1]}`);
   // Refresh commands only for active readers that can refresh, with the App's cooldown.
   expect(notes).toContain("  刷新 / Refresh: tarobird engines quota --bot signin --refresh --revision signin_rev");
+  expect(notes).toContain("  刷新 / Refresh: tarobird engines quota --bot kimi_404 --refresh --revision kimi_404_rev");
   expect(notes).toContain(`  刷新 / Refresh（${new Date(50_000).toISOString()} 后 / after ${new Date(50_000).toISOString()}）: tarobird engines quota --bot keyring --refresh --revision keyring_rev`);
-  expect(text).not.toMatch(/--bot (apikey|keychain|kimi) /);
+  expect(text).not.toMatch(/--bot (apikey|keychain|kimi|kimi_key) /);
   expect(notes.filter(line => line.includes("官方查看")).length).toBeGreaterThan(0);
-  expect(notes.at(-1)).toMatch(/^kimi Bot: 官方查看/);
+  expect(notes.at(-1)).toMatch(/^kimi Bot, kimi_key Bot, kimi_404 Bot: 官方查看/);
 });

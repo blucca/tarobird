@@ -21,14 +21,24 @@ export function QuotaBattery({ left, height = 16 }: { left: number; height?: num
   </svg>;
 }
 
-function windowLabel(window: QuotaWindowView, now: number, locale: Locale): string {
-  // The Host labels a per-model window "Opus · 7 days"; preserve any model prefix.
-  const model = /^(.+?) · /.exec(window.label)?.[1];
-  const remaining = formatTimeRemaining(window.resetsAt, now, locale);
-  if (remaining) return model ? `${model} · ${remaining}` : remaining;
+export function periodLabel(window: QuotaWindowView, siblings?: readonly QuotaWindowView[]): string {
   const hours = (window.periodSeconds ?? 0) / 3600;
   const period = hours >= 48 && hours % 24 === 0 ? t("{0} 天", hours / 24) : hours >= 1 && Number.isInteger(hours) ? t("{0} 小时", hours) : undefined;
-  return period ? model ? `${model} · ${period}` : period : window.label;
+  // The Host labels a per-model or scoped window "Opus · 7 days" / "Coding · 30 days"; an unknown window keeps the engine's own name.
+  const rawPrefix = /^(.+?) · /.exec(window.label)?.[1];
+  const prefix = rawPrefix === "Coding" ? t("编程") : rawPrefix;
+  if (siblings && period && !rawPrefix && siblings.some(other => other.id !== window.id && other.periodSeconds === window.periodSeconds && !/^.+? · /.test(other.label))) {
+    return window.label;
+  }
+  return period ? prefix ? `${prefix} · ${period}` : period : window.label;
+}
+function windowLabel(window: QuotaWindowView, now: number, locale: Locale, siblings?: readonly QuotaWindowView[]): string {
+  // The time left comes first; a per-model or scoped window ("Opus · 7 days", "Coding · 30 days") keeps its prefix.
+  const rawPrefix = /^(.+?) · /.exec(window.label)?.[1];
+  const prefix = rawPrefix === "Coding" ? t("编程") : rawPrefix;
+  const remaining = formatTimeRemaining(window.resetsAt, now, locale);
+  if (remaining) return prefix ? `${prefix} · ${remaining}` : remaining;
+  return periodLabel(window, siblings);
 }
 function clock(value: string, locale: Locale, now = new Date()): string {
   const date = new Date(value), sameDay = date.toDateString() === now.toDateString();
@@ -69,7 +79,7 @@ export function UsageDetails({ context, quota }: { context?: ContextView; quota?
       return <section key={pool} aria-label={t("额度 · {0}", pool)}>
         <h4><QuotaBattery left={Math.min(...windows.map(window => window.left))} height={13}/>{t("额度 · {0}", pool)}</h4>
         {windows.map(window => {
-          const heading = windowLabel(window, now, locale);
+          const heading = windowLabel(window, now, locale, windows);
           return <div className="usage-window" key={window.id}>
             <div className="usage-row"><b data-tone={usageTone(window.left)}>{heading}<span className="usage-gap"/>{window.left}%</b>{window.resetsAt && <span>{t("{0} 重置", clock(window.resetsAt, locale, new Date(now)))}</span>}</div>
             <Bar left={window.left} label={t("{0} 额度可用", heading)}/>
