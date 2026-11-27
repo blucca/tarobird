@@ -27,7 +27,7 @@ async function fixture(page: Page) {
 const panel = (page: Page) => page.getByRole("complementary", { name: "工作台", exact: true });
 
 
-for (const surface of ['canvas-background','canvas-artboard','slides'] as const) test(`wheel motion stays controlled on ${surface}`, async ({page})=>{
+for (const surface of ['slides'] as const) test(`wheel motion stays controlled on ${surface}`, async ({page})=>{
  const f=await fixture(page);
  try {
   const format=surface==='slides'?'slides':'canvas';

@@ -40,7 +40,7 @@ describe('presentation routing does not infer Baoyu from bare Design or a select
   it.each(['browser', 'widgets'] as const)('%s capability returns the same explicit selection boundary', topic => {
     checkSelection(appCapabilityInstructions(topic, { widgetsEnabled: true }));
   });
-  it.each(['baoyu-design', 'baoyu-ppt'])('%s skill metadata cannot capture bare Design + PPT requests', name => {
+  it.each(['baoyu-ppt'])('%s skill metadata cannot capture bare Design + PPT requests', name => {
     const text = readFileSync(new URL(`../skills/${name}/SKILL.md`, import.meta.url), 'utf8');
     expect(text.split('---')[1]).toContain('Design alone');
     expect(text).toContain('用 Design 做 PPT');

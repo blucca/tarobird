@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 describe("Workbench editor and authoring resource provenance", () => {
-  for (const [editor, skill] of [["baoyu-design", "baoyu-design"], ["baoyu-slides", "baoyu-ppt"]]) {
+  for (const [editor, skill] of [["baoyu-slides", "baoyu-ppt"]]) {
     it(`${skill} carries the exact references for its bundled editor`, () => {
       const vendor = join("client/vendor", editor), adapted = join("skills", skill);
       const editorPin = JSON.parse(readFileSync(join(vendor, "UPSTREAM.json"), "utf8"));

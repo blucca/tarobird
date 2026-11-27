@@ -8,7 +8,7 @@ function fixture() {
   const sent: any[] = [], changes = new Set<() => void>(), commands = new Set<(frame: any) => void>();
   const registrations = new Map<string, WorkbenchRegistration>();
   let eligible = true, gate: Promise<unknown> | undefined;
-  const state = { status: "online", user: { id: "owner" }, workbenchDesignOpenAvailable: true };
+  const state = { status: "online", user: { id: "owner" }, workbenchDesignOpenAvailable: true, workbenchSlidesAvailable: true };
   const connection = {
     state, identity: { deviceId: "phone", hubPublicKey: "host" }, sessionEpoch: 1, isClosed: false, isReadOnly: false,
     cache: { readWorkbench: vi.fn(() => { throw new Error("Must stay lazy"); }) },
@@ -31,14 +31,14 @@ function fixture() {
   };
   const issued = new Map<string, WorkbenchCommandFrame>();
   const real: WorkbenchRegistration = { conversationId: "chat", windowId: "real", generation: "real_generation", visible: true,
-    capabilities: ["design.v1"], tabs: [{ id: "design", kind: "design", title: "Design", revision: 3 }], activeTabId: "design" };
+    capabilities: ["design.slides.v1"], tabs: [{ id: "design", kind: "design", designFormat: "slides", title: "PPT", revision: 3 }], activeTabId: "design" };
   const open = vi.fn(async (_id: string, check: () => void) => {
     check(); return { registration: real, target: { deviceId: "phone", windowId: "real", tabId: "design" }, revision: 3, created: false };
   });
   const endpoint = new WorkbenchDesignOpener(connection as unknown as HubConnection, "chat", { eligible: () => eligible, open });
   const frame = (id: string, overrides: Partial<WorkbenchCommandFrame> = {}): WorkbenchCommandFrame => ({ v: 1, type: "workbench.command", dispatchId: id, deadline: Date.now() + 10000,
     userId: "owner", conversationId: "chat", generation: endpoint.generation, target: { deviceId: "phone", windowId: endpoint.windowId },
-    request: { requestId: id, operation: "design.open", payload: {} }, ...overrides });
+    request: { requestId: id, operation: "design.open", payload: { format: "slides" } }, ...overrides });
   const emit = (value: any) => { if (value.type === "workbench.command") issued.set(value.dispatchId, value); for (const listener of commands) listener(value); };
   const receipt = (id: string) => sent.find(value => value.type === "workbench.receipt" && value.dispatchId === id)?.receipt;
   return { connection, endpoint, frame, emit, receipt, open, sent, real, gate: (value: Promise<unknown>) => { gate = value; }, leave: () => { eligible = false; } };
@@ -111,6 +111,18 @@ describe("the lightweight Design opener", () => {
     const endpoint = new WorkbenchDesignOpener(f.connection as unknown as HubConnection, "chat", { eligible: () => true, open: f.open });
     try { expect(await endpoint.context()).toBeUndefined(); expect(f.sent).toHaveLength(0); }
     finally { endpoint.dispose(); }
+  });
+  it("hosts without workbenchSlidesAvailable never register an opener or freeze openTarget", async () => {
+    const f = fixture(); f.endpoint.dispose();
+    f.connection.state.workbenchDesignOpenAvailable = true;
+    f.connection.state.workbenchSlidesAvailable = false;
+    f.sent.length = 0; f.connection.http.mockClear();
+    const endpoint = new WorkbenchDesignOpener(f.connection as unknown as HubConnection, "chat", { eligible: () => true, open: f.open });
+    try {
+      expect(await endpoint.context()).toBeUndefined();
+      expect(f.sent).toHaveLength(0);
+      expect(f.connection.http).not.toHaveBeenCalled();
+    } finally { endpoint.dispose(); }
   });
   it("a retired opener cannot be reused by another chat view", async () => {
     const f = fixture(); const old = f.frame("old"); f.endpoint.dispose();
