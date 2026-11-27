@@ -728,8 +728,11 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       scroll.current.scrollTop = scroll.current.scrollHeight;
     }
   }, [messages, selected, messageHeight, focusTarget, searchResults, virtualizer, chatVisible]);
+  const pendingBubbleRange = hasPendingBubbleTiming(selected, "main")
+    ? virtualizer.getVirtualItems().map((item) => item.index).join(",")
+    : "";
   useLayoutEffect(() => {
-    if (!hasPendingBubbleTiming(selected) || !displayedMessages.length) return;
+    if (!hasPendingBubbleTiming(selected, "main") || !displayedMessages.length) return;
     markSendTimingBubbleVisible(selected, displayedMessages, (id) => {
       const children = historyRows.current?.children;
       if (!children) return false;
@@ -738,9 +741,9 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       }
       return false;
     });
-  }, [displayedMessages, selected, messagesReady]);
+  }, [displayedMessages, selected, messagesReady, pendingBubbleRange]);
   useLayoutEffect(() => {
-    if (!draft && hasPendingComposerTiming(selected)) markSendTimingComposerCleared(selected);
+    if (!draft && hasPendingComposerTiming(selected, "main")) markSendTimingComposerCleared(selected, "main");
   }, [draft, selected]);
   useEffect(() => { let active = true; if (!shell && !pane) { void cache.preferences().then((saved) => { if (active) { setPreferences(saved); setPreferencesReady(true); } }).catch(() => { if (active) setPreferencesReady(true); }); void connection.start().catch(() => undefined); } return () => { active = false; if (!shell && !pane) connection.close(); }; }, [connection]);
   useEffect(() => {
@@ -1152,7 +1155,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const forwardReturn = useMemo(() => ({ get current() { const origin = forwardOrigin.current; return origin ? messageFocus(origin.conversationId, origin.messageId, forwardTrigger.current) : forwardTrigger.current; } }), []);
   const composerContent = useRef({ files, reply }); composerContent.current = { files, reply };
   const steer = async (ordinarySend = false, immediately = false, origin?: { context?: WorkbenchContext }, expectedTargetId?: string, queueIfRejected = false, parentTiming?: SendTimingTrace) => {
-    if (!current || !richDraftReady || sendBusy.current) return;
+    if (!current || !richDraftReady || sendBusy.current) { parentTiming?.fail("aborted"); return; }
     const timing = parentTiming ?? beginSendTiming({
       conversationId: current.id,
       kind: current.type === "group" ? "group" : "direct",
@@ -1178,10 +1181,10 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       // optional context: a failed opener must not add a second wait to chat.
       const openContext = origin ? origin.context : await designOpener.context();
       if (!origin) timing?.mark("workbenchDoneAt");
-      if (currentSelection.current !== conversationId) { if (!parentTiming) timing?.fail("conversation_changed"); return; }
+      if (currentSelection.current !== conversationId) { timing?.fail("conversation_changed"); return; }
       const boundTarget = expectedTargetId ?? (codexDirect ? steeringCapability.targetId : undefined);
       const receipt = await sendSteering(connection, conversationId, targets[0]!, text, () => currentSelection.current === conversationId, ordinarySend, immediately, openContext, boundTarget, timing);
-      if (!receipt) { if (!parentTiming) timing?.fail("conversation_changed"); return; }
+      if (!receipt) { timing?.fail("conversation_changed"); return; }
       const result = receipt.blocks.find((block) => block.type === "steering");
       if (result?.outcome === "rejected") throw new SteeringNotDeliveredError(result.reason, ordinarySend);
       if (result?.outcome !== "accepted") throw new Error(ordinarySend ? nativeInputReason(result?.reason) : steerReason(result?.reason));
@@ -1228,8 +1231,8 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
         // Only a fresh native status explicitly reporting idle permits the
         // terminal's idle Ctrl+Enter behavior. Missing capability or failed
         // probes never silently become an ordinary in-flight send.
-        if (immediately && error.reason === "idle" && unchanged) return "idle" as const;
-        if (!immediately && error.canQueue && unchanged) return "queue" as const;
+        if (immediately && error.reason === "idle" && unchanged) { timing?.resetForFallback(); return "idle" as const; }
+        if (!immediately && error.canQueue && unchanged) { timing?.resetForFallback(); return "queue" as const; }
         if (immediately) throw new Error(t("当前 CLI 或任务状态不支持立即发送，消息已保留。"));
       }
       throw error;
@@ -1237,6 +1240,10 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     } catch (error) { if (!parentTiming) timing?.fail(error); throw error; }
   };
   const sendImmediately = async () => {
+    const useOrdinarySend = draft.trimStart().startsWith("/") || workbenchVisible || !!workbenchDraft;
+    if (useOrdinarySend
+      ? (!selected || !richDraftReady || recording || (!draft.trim() && !files.length) || sendBusy.current)
+      : (!selected || !current || !richDraftReady || sendBusy.current)) return;
     const timing = beginSendTiming({
       conversationId: selected,
       kind: current?.type === "group" ? "group" : "direct",
@@ -1244,10 +1251,11 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       messageLength: draft.length,
       historyCount: messages.length,
       matchText: draft,
+      existingMessages: current?.type === "group" ? messages : undefined,
     });
     try {
       // Commands retain their existing local/durable handling, never native text injection.
-      if (draft.trimStart().startsWith("/") || workbenchVisible || workbenchDraft) { await send(false, false, timing); return; }
+      if (useOrdinarySend) { await send(false, false, timing); return; }
       if (await steer(true, true, undefined, undefined, false, timing) === "idle") await send(false, false, timing);
     } catch (error) { timing?.fail(error); throw error; }
   };
@@ -1345,7 +1353,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     return () => { observer.disconnect(); cancelAnimationFrame(fitFrame); };
   }, [chatVisible, selected, focusTarget, searchResults, tailElement, tailMessageId, followingTail, showLatest, messagesReady, displayedMessages.length]);
   const send = async (nextTurn = false, literalUnknown = false, parentTiming?: SendTimingTrace) => {
-    if (!selected || !richDraftReady || recording || (!draft.trim() && !files.length) || sendBusy.current) return;
+    if (!selected || !richDraftReady || recording || (!draft.trim() && !files.length) || sendBusy.current) { parentTiming?.fail("aborted"); return; }
     const timing = parentTiming ?? beginSendTiming({
       conversationId: selected,
       kind: current?.type === "group" ? "group" : "direct",
@@ -1353,6 +1361,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       messageLength: draft.length,
       historyCount: messages.length,
       matchText: draft,
+      existingMessages: current?.type === "group" ? messages : undefined,
     });
     try {
     history.assertCanSend();
@@ -1452,19 +1461,21 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
       // annotation resolution must not dispatch the abandoned conversation.
       if (controller.signal.aborted || currentSelection.current !== selected) throw new Error(t("上传已取消，已完成的分块会保留。"));
       const frame = { v: 1 as const, type: "message.send" as const, conversationId: selected, clientMsgId: newId("client"), text, attachments, ...(workbenchContext ? {workbench:workbenchContext} : {}), previewUrl: selectedPreviewUrl(text, previewChoice), previewStyle, ...(reply ? { replyTo: reply.id } : {}), ...(mentions?.length ? { mentions } : {}) };
-      timing?.setClientMsgId(frame.clientMsgId);
-      timing?.setRoute(current?.type === "group" ? (automaticComposer(replyMode) ? (replyMode?.activeRun ? "discussion_note" : "discussion_start") : "queue") : "queue");
-      const finishDiscussionSend = current?.type === "group"
-        ? await sendGroupComposerMessage(connection, frame, replyMode, controller.signal, value => { if (currentSelection.current === selected) setGroupReplyMode(value); }, () => groupReplyModeRef.current, intent, imageDraft)
-        : (await connection.send(frame, imageDraft?.context.kind === "design" ? imageDraft : undefined), undefined);
-      if (finishDiscussionSend) timing?.mark("outboxFlushSentAt");
+      let finishDiscussionSend: (() => Promise<void>) | undefined;
+      if (current?.type === "group") {
+        finishDiscussionSend = await sendGroupComposerMessage(connection, frame, replyMode, controller.signal, value => { if (currentSelection.current === selected) setGroupReplyMode(value); }, () => groupReplyModeRef.current, intent, imageDraft, timing);
+      } else {
+        timing?.setRoute("queue");
+        timing?.setClientMsgId(frame.clientMsgId);
+        await connection.send(frame, imageDraft?.context.kind === "design" ? imageDraft : undefined);
+      }
       void nativeHaptic().catch(() => undefined);
       const unchangedText = (draftVersions.current.get(selected) ?? 0) === version && (!intent || groupDraft(selected).intent?.id === intent.id);
       try {
         clearSentRichDraft(unchangedText);
-        if (unchangedText) { await clearSentDraft(selected, text, intent); if (currentSelection.current === selected && (draftVersions.current.get(selected) ?? 0) === version && (!intent || groupDraft(selected).intent?.empty)) { if (text) timing?.expectComposerClear(); setDraft(""); } else timing?.skipComposerClear(); } else timing?.skipComposerClear();
+        if (unchangedText) { await clearSentDraft(selected, text, intent); if (currentSelection.current === selected && (draftVersions.current.get(selected) ?? 0) === version && (!intent || groupDraft(selected).intent?.empty)) { if (text) timing?.expectComposerClear(); else timing?.skipComposerClear(); setDraft(""); } else timing?.skipComposerClear(); } else timing?.skipComposerClear();
         if (finishDiscussionSend) { await flushRichDraft(); await finishDiscussionSend(); }
-      } catch { setError(t("消息已发送，但本机草稿清理未完成。请先核对聊天记录，避免重复发送。")); }
+      } catch { timing?.skipComposerClear(); setError(t("消息已发送，但本机草稿清理未完成。请先核对聊天记录，避免重复发送。")); }
       if (retainComposerFocus && currentSelection.current === selected && composer.current === sentFrom && sentFrom?.isConnected && sentFrom.getClientRects().length) sentFrom.focus({ preventScroll: true });
     } finally { document.removeEventListener("focusin", leaveComposer, true); document.removeEventListener("pointerdown", leaveComposer, true); sendBusy.current = false; setSending(false); if (uploadController.current === controller) uploadController.current = null; setUploadProgress(undefined); setUploadRecovering(false); }
     } catch (error) { timing?.fail(error); throw error; }

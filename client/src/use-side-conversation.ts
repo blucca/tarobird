@@ -213,7 +213,8 @@ class SideSession {
       timing?.mark("outboxFlushSentAt");
       if (serial !== this.generation) { timing?.fail("stale_generation"); return; }
       if (!result.ok) { timing?.fail(result.error); this.uncertain = undefined; this.setError(sideErrorText(result.error)); return; }
-      if (text) timing?.expectComposerClear();
+      if (text && this.snapshot.draft.trim() === pending.text) timing?.expectComposerClear();
+      else timing?.skipComposerClear();
       this.uncertain = undefined; this.clearSent(pending); if (result.view) this.accept(result.view);
       if (this.stopRequested) await this.requestStop(id, serial, true);
     } catch (error) {

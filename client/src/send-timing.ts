@@ -1,10 +1,11 @@
-import { blocksText, type ClientFrame, type Message } from "../../src/client-protocol/index.js";
+import type { ClientFrame, Message } from "../../src/client-protocol/index.js";
 
 export const SEND_TIMING_STORAGE_KEY = "tarobird.debug.sendTiming";
 const MAX_RECORDS = 200;
 const MAX_PENDING_AGE_MS = 30_000;
 
 export type SendTimingRoute = "queue" | "steer" | "native_message" | "discussion_start" | "discussion_note" | "side";
+export type SendTimingSurface = "main" | "side";
 export type SendTimingStage =
   | "workbenchDoneAt"
   | "steeringPreflightDoneAt"
@@ -49,11 +50,13 @@ export interface SendTimingDebugApi {
   latest(): SendTimingRecord | undefined;
 }
 
+type ComposerClearState = "pending" | "armed" | "skipped";
+
 interface ActiveTrace {
   record: SendTimingRecord;
   matchText?: string;
-  createdEpochMs: number;
-  expectComposerClear: boolean;
+  baselineMessageIds?: Set<string>;
+  composerClear: ComposerClearState;
   retired: boolean;
 }
 
@@ -62,7 +65,9 @@ export interface SendTimingTrace {
   mark(stage: SendTimingStage, at?: number): void;
   setRoute(route: SendTimingRoute): void;
   setClientMsgId(clientMsgId?: string, messageId?: string): void;
+  setMatchText(text: string): void;
   setHistoryCount(count: number): void;
+  resetForFallback(): void;
   expectComposerClear(): void;
   skipComposerClear(): void;
   fail(reason: unknown): void;
@@ -72,6 +77,10 @@ let nextId = 1;
 let testHookEnabled = false;
 const records: SendTimingRecord[] = [];
 const pending: ActiveTrace[] = [];
+
+function surfaceOf(kind: SendTimingRecord["kind"]): SendTimingSurface {
+  return kind === "side" ? "side" : "main";
+}
 
 export function setSendTimingTestHook(enabled: boolean): void {
   testHookEnabled = enabled;
@@ -91,14 +100,21 @@ export function hasActiveSendTiming(): boolean {
   return pending.length > 0;
 }
 
-export function hasPendingBubbleTiming(conversationId: string): boolean {
+export function hasPendingBubbleTiming(conversationId: string, surface: SendTimingSurface = "main"): boolean {
   if (!pending.length || !conversationId) return false;
-  return pending.some(item => !item.retired && item.record.conversationId === conversationId && item.record.bubbleVisibleAt === undefined);
+  return pending.some(item => !item.retired
+    && item.record.conversationId === conversationId
+    && surfaceOf(item.record.kind) === surface
+    && item.record.bubbleVisibleAt === undefined);
 }
 
-export function hasPendingComposerTiming(conversationId: string): boolean {
+export function hasPendingComposerTiming(conversationId: string, surface: SendTimingSurface = "main"): boolean {
   if (!pending.length || !conversationId) return false;
-  return pending.some(item => !item.retired && item.record.conversationId === conversationId && item.expectComposerClear && item.record.composerClearedAt === undefined);
+  return pending.some(item => !item.retired
+    && item.record.conversationId === conversationId
+    && surfaceOf(item.record.kind) === surface
+    && item.composerClear === "armed"
+    && item.record.composerClearedAt === undefined);
 }
 
 function ensureGlobalApi(): void {
@@ -119,8 +135,9 @@ function ensureGlobalApi(): void {
 function prunePending(now: number): void {
   for (let i = pending.length - 1; i >= 0; i--) {
     const item = pending[i]!;
+    const composerDone = item.composerClear === "skipped" || item.record.composerClearedAt !== undefined;
     const done = item.retired
-      || (item.record.bubbleVisibleAt !== undefined && (!item.expectComposerClear || item.record.composerClearedAt !== undefined))
+      || (item.record.bubbleVisibleAt !== undefined && composerDone)
       || now - item.record.enterAt > MAX_PENDING_AGE_MS;
     if (done) pending.splice(i, 1);
   }
@@ -136,11 +153,21 @@ function findByFrame(frame: ClientFrame): ActiveTrace | undefined {
   return undefined;
 }
 
+function messageText(message: Message): string {
+  return message.blocks.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
+}
+
 function matchesDiscussionMessage(item: ActiveTrace, message: Message): boolean {
-  if (item.record.kind !== "group" || !item.matchText || message.authorType !== "user") return false;
-  if (!message.clientMsgId?.startsWith("gdtopic_") && !message.clientMsgId?.startsWith("gdnote_")) return false;
-  if (message.createdAt < item.createdEpochMs - 5000) return false;
-  return blocksText(message.blocks) === item.matchText;
+  if (item.record.kind !== "group" || message.authorType !== "user") return false;
+  const prefix = item.record.route === "discussion_start" ? "gdtopic_"
+    : item.record.route === "discussion_note" ? "gdnote_"
+    : undefined;
+  if (!prefix || !message.clientMsgId?.startsWith(prefix)) return false;
+  if (item.baselineMessageIds?.has(message.id)) return false;
+  if (item.matchText === undefined) return false;
+  if (messageText(message) !== item.matchText) return false;
+  if (!item.matchText && !message.blocks.some(block => "attachmentId" in block)) return false;
+  return true;
 }
 
 function matchesTraceMessage(item: ActiveTrace, message: Message): boolean {
@@ -160,6 +187,7 @@ export function beginSendTiming(init: {
   historyCount?: number;
   matchText?: string;
   clientMsgId?: string;
+  existingMessages?: readonly Message[];
 }): SendTimingTrace | undefined {
   if (!isSendTimingEnabled()) return undefined;
   ensureGlobalApi();
@@ -181,8 +209,8 @@ export function beginSendTiming(init: {
   const active: ActiveTrace = {
     record,
     matchText: init.matchText,
-    createdEpochMs: Date.now(),
-    expectComposerClear: init.messageLength > 0,
+    baselineMessageIds: init.existingMessages ? new Set(init.existingMessages.map(message => message.id)) : undefined,
+    composerClear: init.messageLength > 0 ? "pending" : "skipped",
     retired: false,
   };
   pending.push(active);
@@ -201,15 +229,37 @@ export function beginSendTiming(init: {
       if (clientMsgId) record.clientMsgId = clientMsgId;
       if (messageId) record.messageId = messageId;
     },
+    setMatchText(text) {
+      if (!active.retired) active.matchText = text;
+    },
     setHistoryCount(count) {
       if (!active.retired) record.historyCount = count;
     },
+    resetForFallback() {
+      if (active.retired) return;
+      delete record.route;
+      delete record.clientMsgId;
+      delete record.messageId;
+      delete record.historySettledDoneAt;
+      delete record.enqueueDoneAt;
+      delete record.outboxFlushSentAt;
+      delete record.outboxReloadDoneAt;
+      delete record.historyReadDoneAt;
+      delete record.historyReadGapWaitMs;
+      delete record.historyReadCostMs;
+      delete record.bubbleVisibleAt;
+      delete record.composerClearedAt;
+      if (active.composerClear === "armed") {
+        active.composerClear = record.messageLength > 0 ? "pending" : "skipped";
+      }
+      if (!pending.includes(active)) pending.push(active);
+    },
     expectComposerClear() {
-      if (!active.retired) active.expectComposerClear = true;
+      if (!active.retired && record.composerClearedAt === undefined) active.composerClear = "armed";
     },
     skipComposerClear() {
       if (active.retired) return;
-      active.expectComposerClear = false;
+      active.composerClear = "skipped";
       prunePending(performance.now());
     },
     fail(reason) {
@@ -237,7 +287,7 @@ export function markSendTimingOutboxReload(
   const now = performance.now();
   for (let i = pending.length - 1; i >= 0; i--) {
     const active = pending[i]!;
-    if (active.retired || active.record.conversationId !== conversationId) continue;
+    if (active.retired || active.record.kind === "side" || active.record.conversationId !== conversationId) continue;
     if (active.record.enqueueDoneAt === undefined || active.record.outboxReloadDoneAt !== undefined) continue;
     const id = active.record.clientMsgId;
     if (!id || entries.some(entry => entry.id === id) || settledIds?.has(id)) {
@@ -256,9 +306,13 @@ export function markSendTimingHistoryRead(
   if (!pending.length) return;
   for (let i = pending.length - 1; i >= 0; i--) {
     const active = pending[i]!;
-    if (active.retired || active.record.conversationId !== conversationId) continue;
+    if (active.retired || active.record.kind === "side" || active.record.conversationId !== conversationId) continue;
     if (active.record.historyReadDoneAt !== undefined) continue;
-    if (!active.record.clientMsgId && !active.record.messageId && active.record.kind !== "group") continue;
+    if (active.record.kind === "group" && !active.record.route && active.baselineMessageIds) {
+      for (const message of messages) active.baselineMessageIds.add(message.id);
+      continue;
+    }
+    if (!active.record.clientMsgId && !active.record.messageId && active.record.route !== "discussion_start" && active.record.route !== "discussion_note") continue;
     for (let j = messages.length - 1; j >= 0; j--) {
       const message = messages[j]!;
       if (matchesTraceMessage(active, message)) {
@@ -282,7 +336,7 @@ export function markSendTimingBubbleVisible(
   const now = performance.now();
   for (let i = pending.length - 1; i >= 0; i--) {
     const active = pending[i]!;
-    if (active.retired || active.record.conversationId !== conversationId) continue;
+    if (active.retired || active.record.kind === "side" || active.record.conversationId !== conversationId) continue;
     if (active.record.bubbleVisibleAt !== undefined) continue;
     for (let j = displayedMessages.length - 1; j >= 0; j--) {
       const message = displayedMessages[j]!;
@@ -297,27 +351,31 @@ export function markSendTimingBubbleVisible(
   prunePending(now);
 }
 
-export function markSendTimingSideVisible(conversationId: string, questionText: string): void {
+export function markSendTimingSideVisible(conversationId: string, questionText: string, exchangeId?: string): void {
   if (!pending.length) return;
   const now = performance.now();
   for (let i = pending.length - 1; i >= 0; i--) {
     const active = pending[i]!;
     if (active.retired || active.record.conversationId !== conversationId || active.record.kind !== "side") continue;
     if (active.record.bubbleVisibleAt !== undefined) continue;
-    if (active.matchText === undefined || active.matchText === questionText) {
+    if (exchangeId !== undefined) {
+      if (active.record.clientMsgId === exchangeId) {
+        active.record.bubbleVisibleAt = now;
+      }
+    } else if (active.matchText === undefined || active.matchText === questionText) {
       active.record.bubbleVisibleAt = now;
     }
   }
   prunePending(now);
 }
 
-export function markSendTimingComposerCleared(conversationId: string): void {
+export function markSendTimingComposerCleared(conversationId: string, surface: SendTimingSurface = "main"): void {
   if (!pending.length) return;
   const now = performance.now();
   for (let i = pending.length - 1; i >= 0; i--) {
     const active = pending[i]!;
-    if (active.retired || active.record.conversationId !== conversationId) continue;
-    if (active.expectComposerClear && active.record.composerClearedAt === undefined) {
+    if (active.retired || active.record.conversationId !== conversationId || surfaceOf(active.record.kind) !== surface) continue;
+    if (active.composerClear === "armed" && active.record.composerClearedAt === undefined) {
       active.record.composerClearedAt = now;
     }
   }

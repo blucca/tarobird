@@ -87,7 +87,10 @@ export async function sendSteering(connection: HubConnection, conversationId: st
   timing?.setRoute(ordinary && attempt.mode ? "native_message" : "steer");
   timing?.setClientMsgId(attempt.requestId);
   const receipt = await deliverAttempt(connection, conversationId, attempt, ordinary);
-  timing?.setClientMsgId(receipt.clientMsgId ?? attempt.requestId, receipt.id);
+  const steeringOutcome = receipt.blocks.find(block => block.type === "steering")?.outcome;
+  if (steeringOutcome !== "rejected") {
+    timing?.setClientMsgId(receipt.clientMsgId ?? attempt.requestId, receipt.id);
+  }
   if (expectedTargetId && attempt.targetId !== expectedTargetId && receipt.blocks.some(block => block.type === "steering" && block.outcome === "accepted")) {
     throw new Error(t("这段文字已补充到之前的任务，未发送给当前任务。如需再次发送，请修改内容。"));
   }

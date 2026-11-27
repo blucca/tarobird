@@ -80,12 +80,14 @@ export function useConversationMessages(connection: HubConnection, conversationI
             const messages = await reading;
             // Publish each completed read so a continuous stream cannot starve
             // rendering. A revision received during it requests one fresh read.
-            const visibleMessages = messages.filter(message => message.status !== "deleted");
-            const readEndAt = performance.now();
-            markSendTimingHistoryRead(conversationId, visibleMessages, readEndAt, wait > 0 ? wait : 0, readEndAt - started);
-            if (!disposed) setView(previous => ({ connection, conversationId, failed: false, readRevision,
-              messages: previous?.connection === connection && previous.conversationId === conversationId ? shareMessages(previous.messages, visibleMessages) : visibleMessages,
-            }));
+            if (!disposed) {
+              const visibleMessages = messages.filter(message => message.status !== "deleted");
+              const readEndAt = performance.now();
+              markSendTimingHistoryRead(conversationId, visibleMessages, readEndAt, wait > 0 ? wait : 0, readEndAt - started);
+              setView(previous => ({ connection, conversationId, failed: false, readRevision,
+                messages: previous?.connection === connection && previous.conversationId === conversationId ? shareMessages(previous.messages, visibleMessages) : visibleMessages,
+              }));
+            }
           } catch {
             if (!disposed) setView(previous => ({ connection, conversationId,
               messages: previous?.connection === connection && previous.conversationId === conversationId ? previous.messages : emptyMessages,
