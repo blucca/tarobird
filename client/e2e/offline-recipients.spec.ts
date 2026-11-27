@@ -82,11 +82,13 @@ for (const phone of [false, true]) test(`offline cold starts retain group recipi
     await expect(page.locator(".queued-message")).toHaveCount(3);
     if (phone) await offlineNotice.locator("summary").click();
     await expect(offlineNotice.getByText("3 条消息将在重连后发送。")).toBeVisible();
-    hub = await HubServer.start({ stateDir: root, port, clientDir: path.resolve("dist") });
+    const resumed = await HubServer.start({ stateDir: root, port, clientDir: path.resolve("dist") });
+    hub = resumed;
     await waitForClientOnline(page);
-    await expect(page.locator(".queued-message")).toHaveCount(0);
-    const sent = (await hub.store.snapshot("owner", group.id)).messages.filter(message => message.authorType === "user");
-    expect(sent.map(message => blocksText(message.blocks))).toEqual(texts);
+    const readSent = async () => (await resumed.store.snapshot("owner", group.id)).messages.filter(message => message.authorType === "user");
+    await expect.poll(async () => (await readSent()).map(message => blocksText(message.blocks))).toEqual(texts);
+    await expect(page.locator(".queued-message, .message.user.is-pending-outbox")).toHaveCount(0);
+    const sent = await readSent();
     expect(sent.map(message => message.mentions)).toEqual([["beta"], ["beta"], ["beta"]]);
     expect(new Set(sent.map(message => message.clientMsgId)).size).toBe(3);
     await page.reload(); await waitForClientOnline(page);
