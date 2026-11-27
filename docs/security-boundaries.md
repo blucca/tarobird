@@ -766,6 +766,22 @@ sending membership metadata. A TLS-terminating relay cannot substitute its own
 valid certificate and forward the peer's identity proof. Pins are bounded and
 expire after five minutes; certificate rotation requires a fresh proof.
 
+Host recovery (`reinstate` and generation-bearing manifests) is gated by
+signed peer capability advertisement (`private-network.recovery.v1`) on
+`/api/network/peer`, rather than unauthenticated headers or manifest changes
+that would break 1.6.0 strict schema validators. The coordinator refuses
+`reinstate` with `network_recovery_upgrade_required` whenever any other active
+host in the directory has not confirmed `private-network.recovery.v1` (or has
+since synced without it after a rollback), and refuses non-recovery-capable
+active peer syncs once a directory uses generation fields. Owner `/api/network`
+and `/api/network/manage` replies omit `hostCapabilities` unless the caller
+explicitly negotiates `?capabilities=1`, preserving strict 1.6.0 client
+compatibility, and upgraded peers fall back once to a 1.6.0-strict signed peer
+request if a 1.6.0 coordinator rejects the extended request with HTTP 400.
+Residual limit: the coordinator cannot remotely inspect the version of an
+offline 1.6.0 App; operators must update both hosts and Apps in the network
+before reinstating a host.
+
 ## Cross-host Bot messages
 
 The [Bot message MVP](client/cross-host-bot-messages-2026-10-17.md) does not widen Agent Bus. Network membership alone grants no Bot messaging access. Recipient-local grants bind a source Hub key and source Bot to a target Bot; owner grant/revoke operations require an enrolled loopback controller plus a fresh, one-use device signature over the command digest. Gateway instance credentials cannot grant access.

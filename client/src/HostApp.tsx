@@ -863,16 +863,20 @@ function HostManager({ registry, entries, pool, close, add, settings, history }:
   return <CreationDialog mobilePage title={t("此设备的连接")} close={close} closeLabel={t("关闭连接管理")} busy={busy} showHost={false} className="saved-host-manager">
     <p className="muted">{t("这些连接保存在此设备。移除连接不会让主机退出网络，也不会删除主机上的 Bot。")}</p>
     {!entries.length && <p className="settings-note">{t("还没有保存的主机连接。")}</p>}
-    {entries.map(entry => <section className="host-manager-row" aria-label={entry.host.name} key={entry.host.registrationId}>
-      <div className="saved-host-heading"><Monitor size={20} aria-hidden="true"/><div><strong>{entry.host.name}</strong><small>{t("公钥尾号 {0}", entry.host.publicKey.slice(-8))}</small></div><span className="saved-host-state">{networkHostBlocked(entry, pool.localHostKey) ? t("网络授权已失效") : pairingState(entry.connection?.identity) ? pairingStateLabel(pairingState(entry.connection?.identity)!) : entry.connection?.state.status === "online" ? t("已连接") : t("离线")}</span></div>
-      {networkHostBlocked(entry, pool.localHostKey) && <p className="muted">{t("历史和草稿仍保留。再次连接需先移除此旧连接，再扫描新的配对二维码。")}</p>}
+    {entries.map(entry => {
+      const blocked = networkHostBlocked(entry, pool.localHostKey);
+      const revoked = !blocked && !!entry.connection?.isRevoked;
+      return <section className="host-manager-row" aria-label={entry.host.name} key={entry.host.registrationId}>
+      <div className="saved-host-heading"><Monitor size={20} aria-hidden="true"/><div><strong>{entry.host.name}</strong><small>{t("公钥尾号 {0}", entry.host.publicKey.slice(-8))}</small></div><span className="saved-host-state">{blocked ? t("网络授权已失效") : revoked ? t("设备授权已撤销") : pairingState(entry.connection?.identity) ? pairingStateLabel(pairingState(entry.connection?.identity)!) : entry.connection?.state.status === "online" ? t("已连接") : t("离线")}</span></div>
+      {(blocked || revoked) && <p className="muted">{t("历史和草稿仍保留。再次连接需先移除此旧连接，再扫描新的配对二维码。")}</p>}
       <div className="quick-actions">
-        {networkHostBlocked(entry, pool.localHostKey) && <button disabled={busy || !entry.connection} onClick={() => history(entry.host.id)}>{t("查看历史记录")}</button>}
+        {blocked && <button disabled={busy || !entry.connection} onClick={() => history(entry.host.id)}>{t("查看历史记录")}</button>}
         <button disabled={busy || !canRename(entry)} onClick={() => { setSavedName(""); setError(""); setEditingName(entry.host.registrationId); }}>{t("修改名称")}</button>
-        <button disabled={!entry.connection || busy || networkHostBlocked(entry, pool.localHostKey)} onClick={event => { event.currentTarget.focus({ preventScroll: true }); settings(entry.host.id); }}>{t("设置连接")}</button>
+        <button disabled={!entry.connection || busy || blocked || revoked} onClick={event => { event.currentTarget.focus({ preventScroll: true }); settings(entry.host.id); }}>{t("设置连接")}</button>
         <button className="text-danger" disabled={busy} onClick={event => { event.currentTarget.focus({ preventScroll: true }); if (entry.host.state === "removing") void remove(entry); else void inspect(entry); }}>{entry.host.state === "removing" ? t("重试清理") : t("从此设备移除")}</button>
       </div>
-    </section>)}
+    </section>;
+    })}
     {renameEntry && <CreationDialog mobilePage title={t("修改主机名称")} close={closeRename} closeLabel={t("返回此设备的连接")} busy={busy} showHost={false}>
       <form className="network-form" onSubmit={event => { event.preventDefault(); void saveName(renameEntry); }}><label className="network-field">{t("主机名称")}<input maxLength={100} disabled={busy} value={names[renameEntry.host.id] ?? renameEntry.host.name} onChange={event => setNames(old => ({ ...old, [renameEntry.host.id]: event.target.value }))}/></label><p className="muted">{t("名称会同步到连接这台主机的其他设备。")}</p>{error && <p role="alert" className="error-text">{error}</p>}<footer className="network-actions"><button type="button" disabled={busy} onClick={closeRename}>{t("取消")}</button><button type="submit" className="primary" disabled={busy || !canRename(renameEntry) || !hostNameSchema.safeParse(names[renameEntry.host.id] ?? renameEntry.host.name).success}>{t("保存名称")}</button></footer></form>
     </CreationDialog>}

@@ -45,7 +45,7 @@ import { HostNetwork, verifyCliNetworkMembership, verifyCliNetworkProposal } fro
 import { formatLocalRoutes } from "./network-local.js";
 import { tailscaleDiagnostic } from "./tailscale-status.js";
 import { isTailscaleAddress } from "../hub/network.js";
-import { networkCanonical, sharedRoutesSchema, type NetworkCommand } from "../client-protocol/private-network.js";
+import { PRIVATE_NETWORK_RECOVERY_CAPABILITY, networkCanonical, sharedRoutesSchema, unreadyRecoveryHosts, type NetworkCommand } from "../client-protocol/private-network.js";
 import { localRoutesSchema, routesSchema, type Route } from "../client-protocol/routes.js";
 import { selectPairingInviteRoutes, type NetworkCandidateMeta, type WindowsFirewallStatus } from "../client-protocol/network-candidates.js";
 import { createBotSchema } from "../client-protocol/bots.js";
@@ -259,11 +259,12 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   network local [--tailscale] [--json] 只读查看本机局域网/Tailscale 线路与共享线路
   network select-lan --from FILE --yes 选择已监听的局域网线路，保留已共享的 Tailscale
   network offer --out FILE
-  network propose --from OFFER --out PROPOSAL --yes
+  network propose --from OFFER --out PROPOSAL [--recover] --yes
   network admit --from PROPOSAL --out ADMISSION --yes
   network join --from ADMISSION --yes
   network inspect --from FILE
   network recover --from RECEIPT --out NEW_FILE
+  network reinstate PUBLIC_KEY --yes [--out OFFER]
   network leave --yes | remove PUBLIC_KEY --yes
   update stage --from PACKAGE_DIRECTORY | status
   update apply REVISION --yes [--wait SECONDS] | rollback --yes
@@ -328,7 +329,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     host: { type: "string" }, to: { type: "string" }, "source-bot": { type: "string" }, delivery: { type: "string" }, "cross-host": { type: "boolean" }, "context-message": { type: "string" }, file: { type: "string", multiple: true }, "new-conversation": { type: "string" }, timeout: { type: "string" },
     "reply-to": { type: "string" }, ids: { type: "string" }, conversation: { type: "string" }, sort: { type: "string" }, text: { type: "string" }, "text-file": { type: "string" }, run: { type: "string" },
     coordinator: { type: "string" }, members: { type: "string" },
-    participants: { type: "string" }, supersedes: { type: "string" }, then: { type: "string" }, "if-running": { type: "boolean" },
+    participants: { type: "string" }, supersedes: { type: "string" }, then: { type: "string" }, "if-running": { type: "boolean" }, recover: { type: "boolean" },
   } });
   const [command, sub, argument, ...extra] = p;
   const seenOptions = new Set<string>();
@@ -337,7 +338,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     if (seenOptions.has(token.name) && !repeatable) throw new Error(`${command} 命令不能重复 --${token.name}。`);
     seenOptions.add(token.name);
   }
-  if (command === "network" && !v.help && !["local", "select-lan", "status", "inspect", "recover", "create", "offer", "routes", "propose", "admit", "join", "leave", "remove"].includes(sub ?? "")) throw new Error("未知 network 命令。请执行 tarobot network --help。");
+  if (command === "network" && !v.help && !["local", "select-lan", "status", "inspect", "recover", "create", "offer", "routes", "propose", "admit", "join", "reinstate", "leave", "remove"].includes(sub ?? "")) throw new Error("未知 network 命令。请执行 tarobot network --help。");
   if (v.help || !command || command === "help") { console.log(HOST_CLI_HELP); return; }
   if (extra.length) throw new Error("多余的位置参数。请执行 tarobot --help。");
   const commands = ["history", "attachments", "screens", "workbench", "init", "run", "start", "stop", "restart", "status", "logs", "doctor", "enroll", "name", "drain", "drain-cancel", "service", "bots", "queue", "side", "tasks", "steer", "changes", "bus", "groups", "messages", "tickets", "widgets", "engines", "folders", "conversations", "devices", "pair", "network", "update", "backups", "backup", "restore", "directory", "integrations"];
@@ -351,7 +352,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     integrations: ["yes", "request-id", "mode", "enabled", "adapter", "threshold-seconds", "revision"], directory: ["from"], init: ["name"], stop: ["wait", "force"], restart: ["wait", "force"], enroll: ["reset", "yes"], name: ["name"], drain: ["wait"],
     service: ["yes"], bots: ["name", "engine", "model", "effort", "workspace", "permission", "request-id", "expected-name", "yes", "revision", "enabled", "role", "dispatch-mode", "max-concurrent", "allow", "from"],
     tickets: ["bot", "conversation", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
-    devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "v2", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
+    devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "v2", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale", "recover"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
     folders: ["enabled", "revision", "unfiled"],
     conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session", "enabled", "global", "engine", "title", "workspace"],
     widgets: ["html-file", "report-file", "title", "summary", "request-id", "enabled", "revision"],
@@ -391,7 +392,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
   const positionalLimit: Record<string, number> = { history: 3, screens: 3, workbench: 3, engines: 2, backups: 2, integrations: 3, directory: 2, name: 2, bots: 3, queue: 3, tasks: 3, steer: 3, side: 3, changes: 3, bus: 3, groups: 3, messages: 3, tickets: 3, widgets: 3, folders: 3, conversations: 2, devices: 3, service: 2, network: 3, update: 3, backup: 2, restore: 2 };
   if (command === "conversations" && (sub === "pi-session" || sub === "pin")) positionalLimit.conversations = 3;
   if (command === "bus" && ["list", "create", "prepare"].includes(sub ?? "")) positionalLimit.bus = 2;
-  if (command === "bots" && ["list", "catalog", "create"].includes(sub ?? "") || command === "devices" && ["list", "pending", "invites"].includes(sub ?? "") || command === "network" && sub !== "remove" || command === "update" && sub !== "apply") positionalLimit[command] = 2;
+  if (command === "bots" && ["list", "catalog", "create"].includes(sub ?? "") || command === "devices" && ["list", "pending", "invites"].includes(sub ?? "") || command === "network" && !["remove", "reinstate"].includes(sub ?? "") || command === "update" && sub !== "apply") positionalLimit[command] = 2;
   if (p.length > (positionalLimit[command] ?? 1)) throw new Error("此命令不接受额外的位置参数。请执行 tarobot --help。");
   if (v.force && !["stop", "restart", "tickets"].includes(command)) throw new Error("--force 仅支持 stop、restart 或 tickets dispatch。");
   if (v.reset && command !== "enroll") throw new Error("--reset 仅支持本机 CLI 控制器重新登记。");
@@ -399,6 +400,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
   if (v.delivery !== undefined && !(command === "messages" && sub === "send")) throw new Error("--delivery 仅支持 messages send。");
   if (command === "messages" && v.enabled !== undefined && sub !== "steering") throw new Error("messages 只有 steering 接受 --enabled。");
   if (command === "network" && v.tailscale && sub !== "local") throw new Error("--tailscale 仅支持 network local。");
+  if (command === "network" && v.recover && sub !== "propose") throw new Error("--recover 仅支持 network propose。");
   if (command === "network" && sub === "local" && (v.name || v.from || v.out || v.yes)) throw new Error("network local 只读，不接受 --name/--from/--out/--yes。");
   if (command === "update") {
     if (v["dry-run"] && !["apply", "rollback"].includes(sub ?? "")) throw new Error("--dry-run 仅支持 update apply/rollback；prune 默认只预览。");
@@ -987,22 +989,53 @@ export async function runHostCli(argv: string[]): Promise<void> {
         return;
       }
       yes();
+      const recoveryUpgradeMessage = "请先将网络内所有主机和 App 更新到最新版本后再恢复主机。 / Update all hosts and Apps in this network before reinstating a host.";
       let action: NetworkCommand;
       if (sub === "routes") action = { operation: "routes", networkId: view.membership?.manifest.id ?? "", routes: sharedRoutesSchema.parse(raw) };
       else if (sub === "propose") {
-        const offer = verifyCliNetworkMembership(raw);
-        action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)) };
+        const offer = verifyCliNetworkMembership(raw?.membership ?? raw);
+        const own = offer.manifest.hosts.find(host => host.publicKey === management.client.publicKey);
+        if (own?.revoked) {
+          if (!v.recover) throw new Error("这台主机曾退出或被移出此网络。请先在协调主机执行 tarobot network reinstate PUBLIC_KEY --yes --out OFFER，再使用 tarobot network propose --from OFFER --out PROPOSAL --recover --yes。");
+          if (!management.client.supports(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) throw new Error(recoveryUpgradeMessage);
+          const nextGen = (own.generation ?? 1) + 1;
+          if (own.reinstated !== nextGen) throw new Error("协调主机尚未允许这台主机重新加入。请先在协调主机执行 tarobot network reinstate PUBLIC_KEY --yes --out OFFER。");
+          action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)), generation: nextGen, recover: true };
+        } else if (own?.state === "pending" && (own.generation ?? 1) > 1) {
+          if (!v.recover) throw new Error("这台主机正在恢复加入此网络。请使用 tarobot network propose --from OFFER --out PROPOSAL --recover --yes 重新发起恢复申请。");
+          if (!management.client.supports(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) throw new Error(recoveryUpgradeMessage);
+          action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)), generation: own.generation!, recover: true };
+        } else {
+          action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)) };
+        }
       } else if (sub === "admit") action = { operation: "admit", proposal: verifyCliNetworkProposal(raw) };
       else if (sub === "join") {
         const admission = z.object({ membership: z.unknown(), nonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict().parse(raw);
         action = { operation: "join", membership: verifyCliNetworkMembership(admission.membership, management.client.publicKey), nonce: admission.nonce };
+      } else if (sub === "reinstate") {
+        if (!management.client.supports(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) throw new Error(recoveryUpgradeMessage);
+        const manifest = view.membership?.manifest;
+        const target = manifest?.hosts.find(host => host.publicKey === argument && host.revoked);
+        if (!manifest || !target) throw new Error("没有找到此网络中已退出或被移出的目标主机公钥。");
+        if (manifest.authorityKey === management.client.publicKey && (manifest.v !== 2 || unreadyRecoveryHosts(manifest, view.hostCapabilities).length > 0)) {
+          throw new Error(recoveryUpgradeMessage);
+        }
+        action = { operation: "reinstate", networkId: manifest.id, publicKey: target.publicKey, expectedGeneration: target.generation ?? 1 };
       } else if (sub === "leave") action = { operation: "leave", networkId: view.membership?.manifest.id ?? "", expectedState: view.membership ? view.host.state : "standalone" };
       else if (sub === "remove") {
         const target = view.membership?.manifest.hosts.find(host => host.publicKey === argument && !host.revoked);
         if (!target) throw new Error("没有找到此网络中的目标主机公钥。");
         action = { operation: "remove", networkId: view.membership!.manifest.id, publicKey: target.publicKey, expectedState: target.state };
       } else throw new Error("未知 network 命令。");
-      const transfer = await executeNetworkTransfer(directory, action, v.out, () => network.command(action));
+      const transfer = await executeNetworkTransfer(directory, action, v.out, async () => {
+        try { return await network.command(action); }
+        catch (error) {
+          if (error instanceof Error && error.message === "network_recovery_upgrade_required") {
+            throw Object.assign(new Error(recoveryUpgradeMessage), { code: "network_recovery_upgrade_required", cause: error });
+          }
+          throw error;
+        }
+      });
       await output(transfer.document);
       return;
     }
