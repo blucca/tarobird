@@ -23,6 +23,8 @@ export type RemoteScreenViewerOptions = {
   routeHint?: ScreenRouteKind;
   udpRequested?: boolean;
   udpConnected?: boolean;
+  /** NTP-midpoint estimated server-minus-client clock offset (ms) from screenOpen. */
+  serverTimeOffsetMs?: number;
 };
 /** One controller object per explicit viewing session; never reconnects/replays. */
 export class RemoteScreenViewer {
@@ -31,7 +33,7 @@ export class RemoteScreenViewer {
   private frames = new Map<number, { generation: number; at: number; captureMs: number }>();
   private readonly metricsTracker = new ScreenMetricsTracker();
   private readonly serverTimeOffsetMs: number;
-  private lastMetricsAt = 0;
+  private lastMetricsAt: number;
   private picture?: { sequence: number; expiresAt: number; at: number };
   private lease?: { id: string; challenge: string }; private usedChallenge = ""; private sequence = 0;
   private disposed = false; private visible = true; private requestedVisible = true; private nativeVisible = true; private timer: ReturnType<typeof setInterval>;
@@ -49,7 +51,10 @@ export class RemoteScreenViewer {
     this.reportHeld = options.flight !== undefined;
     this.flight = Math.min(SCREEN_FLIGHT_MAX, Math.max(SCREEN_FLIGHT_MIN, Math.floor(options.flight ?? SCREEN_FLIGHT_MIN)));
     this.state.controlAllowed = join.session.controlAllowed;
-    this.serverTimeOffsetMs = join.serverTime - Date.now();
+    this.serverTimeOffsetMs = options.serverTimeOffsetMs !== undefined && Number.isFinite(options.serverTimeOffsetMs)
+      ? options.serverTimeOffsetMs
+      : join.serverTime - Date.now();
+    this.lastMetricsAt = performance.now();
     this.metricsTracker.setRoute(options.routeHint ?? "tcp_default", {
       udpRequested: options.udpRequested ?? false,
       udpConnected: options.udpConnected ?? false,
@@ -62,11 +67,19 @@ export class RemoteScreenViewer {
         this.usedChallenge = this.lease.challenge;
         this.send({ type: "renew", leaseId: this.lease.id, challenge: this.lease.challenge, frameSequence: this.picture!.sequence });
       }
-      if (!this.disposed && now - this.lastMetricsAt >= 500) {
+      if (!this.disposed && this.port && this.visible && this.state.state !== "closed" && now - this.lastMetricsAt >= 500) {
         this.lastMetricsAt = now;
         this.update({ metrics: this.metricsTracker.snapshot(now) });
       }
     }, 500);
+  }
+  setRoute(route: ScreenRouteKind, options: { udpRequested?: boolean; udpConnected?: boolean } = {}) {
+    this.metricsTracker.setRoute(route, options);
+    if (!this.disposed && this.port && this.visible && this.state.state !== "closed") {
+      const now = performance.now();
+      this.lastMetricsAt = now;
+      this.update({ metrics: this.metricsTracker.snapshot(now) });
+    }
   }
   private update(next: Partial<ViewerState>) {
     const changed = (Object.keys(next) as (keyof ViewerState)[]).some(key => this.state[key] !== next[key]);
@@ -91,7 +104,7 @@ export class RemoteScreenViewer {
   }
   private attach(port: ScreenViewerPort) {
     if (this.disposed) { port.close(); return; }
-    this.port = port; port.start(data => { void this.message(data).catch(error => this.fail(error instanceof Error ? error.message : "screen_decode_failed")); });
+    this.port = port; this.lastMetricsAt = performance.now(); port.start(data => { void this.message(data).catch(error => this.fail(error instanceof Error ? error.message : "screen_decode_failed")); });
     if (!this.visible) this.sendVisibility();
   }
   private checkQuality(value: {width:number;height:number;codec:string}) {
@@ -134,6 +147,7 @@ export class RemoteScreenViewer {
     if ((value as { type: string }).type === "stream") {
       const stream = screenStreamSchema.parse(value); this.checkQuality(stream); if (stream.streamGeneration < this.minimumGeneration) return; this.minimumGeneration = stream.streamGeneration; const epoch = ++this.streamEpoch;
       this.clearMove(); this.picture = undefined; this.frames.clear(); this.closeDecoder(); this.stream = stream;
+      this.metricsTracker.resetStream(stream.streamGeneration);
       this.update({ fresh: false, controlling: false, width: stream.width, height: stream.height });
       const config: VideoDecoderConfig = { codec: stream.codecString, codedWidth: stream.width, codedHeight: stream.height, optimizeForLatency: true, hardwareAcceleration: "no-preference" };
       // isConfigSupported is probed before opening; configure synchronously here
@@ -153,7 +167,7 @@ export class RemoteScreenViewer {
               const heldMs = Math.min(SCREEN_HELD_MAX_MS, Math.max(0, Math.round(paintAt - record.at)));
               const estServerNow = Date.now() + this.serverTimeOffsetMs;
               const rawLatency = estServerNow - record.captureMs;
-              const latencyMs = rawLatency >= 0 && rawLatency <= 30_000 ? rawLatency : heldMs;
+              const latencyMs = rawLatency >= 0 && rawLatency <= 30_000 ? Math.max(heldMs, Math.round(rawLatency)) : heldMs;
               this.metricsTracker.recordFrameRendered({ nowMs: paintAt, latencyMs });
               this.frames.delete(sequence);
               this.send({ type: "ack", frameSequence: sequence, ...(this.reportHeld ? { heldMs } : {}) });
@@ -170,7 +184,7 @@ export class RemoteScreenViewer {
       this.update({ fresh: true });
     } else if (event.type === "state") {
       if (event.session.generation !== this.join.session.generation || event.session.id !== this.join.session.id) throw new Error("screen_session_changed");
-      if (event.streamGeneration && this.stream && event.streamGeneration > this.stream.streamGeneration) { this.clearMove(); this.picture = undefined; this.frames.clear(); this.closeDecoder(); this.stream = undefined; ++this.streamEpoch; }
+      if (event.streamGeneration && this.stream && event.streamGeneration > this.stream.streamGeneration) { this.clearMove(); this.picture = undefined; this.frames.clear(); this.closeDecoder(); this.stream = undefined; ++this.streamEpoch; this.metricsTracker.resetStream(event.streamGeneration); }
       if (!event.session.controlAllowed || event.session.reason && !event.lease && !event.controlPending) this.controlRequested = false;
       const permitted = this.controlRequested && this.visible && (event.streamGeneration ?? 0) >= this.controlGeneration;
       const lease = permitted ? event.lease : undefined;
@@ -193,6 +207,7 @@ export class RemoteScreenViewer {
     const visible = this.requestedVisible && this.nativeVisible;
     if (this.visible === visible) return;
     this.visible = visible; this.release(); this.stream = undefined; this.closeDecoder(); ++this.streamEpoch; this.picture = undefined; this.frames.clear();
+    this.metricsTracker.resetStream(this.minimumGeneration);
     this.sendVisibility(); this.update({ fresh: false });
   }
   wheel(event: Extract<ScreenInputEvent, { kind: "wheel" }>) {

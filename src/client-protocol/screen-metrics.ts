@@ -29,6 +29,37 @@ export const screenUdpStatusSchema = z.object({
 }).strict();
 export type ScreenUdpStatus = z.infer<typeof screenUdpStatusSchema>;
 
+/** Map a client connection route name to its corresponding TCP screen route label. */
+export function tcpRouteFromConnectionRoute(routeName?: "Direct" | "Tailscale" | "VPS"): ScreenRouteKind {
+  switch (routeName) {
+    case "Direct": return "tcp_lan_direct";
+    case "Tailscale": return "tcp_tailscale";
+    case "VPS": return "tcp_vps_relay";
+    default: return "tcp_default";
+  }
+}
+
+/**
+ * Estimate server-minus-client clock offset using the NTP round-trip midpoint
+ * (`serverTime - (requestStart + requestEnd) / 2`) so symmetric one-way network
+ * transit delay is preserved in capture-to-display latency measurements.
+ * Falls back to `monotonicRttMs` if wall clock stepped backward during the request.
+ */
+export function estimateServerTimeOffset(
+  serverTimeMs: number,
+  requestStartMs: number,
+  requestEndMs: number,
+  monotonicRttMs?: number,
+): number {
+  const wallRttMs = requestEndMs >= requestStartMs ? requestEndMs - requestStartMs : undefined;
+  const rttMs = wallRttMs !== undefined
+    ? wallRttMs
+    : monotonicRttMs !== undefined && Number.isFinite(monotonicRttMs) && monotonicRttMs >= 0
+      ? monotonicRttMs
+      : 0;
+  return serverTimeMs - (requestEndMs - rttMs / 2);
+}
+
 export interface ScreenPerformanceSnapshot {
   fps: number;
   latencyMs: number | null;
@@ -49,10 +80,15 @@ export interface ScreenPerformanceSnapshot {
 interface FrameSample {
   at: number;
   bytes: number;
-  latencyMs?: number;
+}
+
+interface LatencySample {
+  at: number;
+  latencyMs: number;
 }
 
 const WINDOW_MS = 1000;
+const LATENCY_WINDOW_MS = 2000;
 const MAX_LATENCY_SAMPLES = 60;
 
 /**
@@ -63,7 +99,7 @@ const MAX_LATENCY_SAMPLES = 60;
 export class ScreenMetricsTracker {
   private readonly receivedSamples: FrameSample[] = [];
   private readonly renderedSamples: FrameSample[] = [];
-  private readonly latencyRing: number[] = [];
+  private readonly latencySamples: LatencySample[] = [];
   private lastSequence = 0;
   private lastGeneration = 0;
   private width = 0;
@@ -84,6 +120,9 @@ export class ScreenMetricsTracker {
   resetStream(generation: number): void {
     this.lastGeneration = generation;
     this.lastSequence = 0;
+    this.receivedSamples.length = 0;
+    this.renderedSamples.length = 0;
+    this.latencySamples.length = 0;
   }
 
   recordFrameReceived(input: {
@@ -123,10 +162,10 @@ export class ScreenMetricsTracker {
     const latency = input.latencyMs !== undefined && Number.isFinite(input.latencyMs) && input.latencyMs >= 0
       ? Math.round(input.latencyMs)
       : undefined;
-    this.renderedSamples.push({ at: input.nowMs, bytes: 0, ...(latency !== undefined ? { latencyMs: latency } : {}) });
+    this.renderedSamples.push({ at: input.nowMs, bytes: 0 });
     if (latency !== undefined) {
-      this.latencyRing.push(latency);
-      if (this.latencyRing.length > MAX_LATENCY_SAMPLES) this.latencyRing.shift();
+      this.latencySamples.push({ at: input.nowMs, latencyMs: latency });
+      if (this.latencySamples.length > MAX_LATENCY_SAMPLES) this.latencySamples.shift();
     }
     this.prune(input.nowMs);
   }
@@ -139,6 +178,10 @@ export class ScreenMetricsTracker {
     while (this.renderedSamples.length > 0 && this.renderedSamples[0]!.at < cutoff) {
       this.renderedSamples.shift();
     }
+    const latencyCutoff = nowMs - LATENCY_WINDOW_MS;
+    while (this.latencySamples.length > 0 && this.latencySamples[0]!.at < latencyCutoff) {
+      this.latencySamples.shift();
+    }
   }
 
   snapshot(nowMs: number): ScreenPerformanceSnapshot {
@@ -146,10 +189,10 @@ export class ScreenMetricsTracker {
     const totalBytes = this.receivedSamples.reduce((sum, s) => sum + s.bytes, 0);
     const bitrateKbps = Math.round((totalBytes * 8) / 1000);
     const fps = this.renderedSamples.length;
-    const latestLatency = this.latencyRing.length > 0 ? this.latencyRing[this.latencyRing.length - 1]! : null;
+    const latestLatency = this.latencySamples.length > 0 ? this.latencySamples[this.latencySamples.length - 1]!.latencyMs : null;
     let p95LatencyMs: number | null = null;
-    if (this.latencyRing.length > 0) {
-      const sorted = [...this.latencyRing].sort((a, b) => a - b);
+    if (this.latencySamples.length > 0) {
+      const sorted = this.latencySamples.map(s => s.latencyMs).sort((a, b) => a - b);
       const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
       p95LatencyMs = sorted[idx]!;
     }
@@ -166,7 +209,7 @@ export class ScreenMetricsTracker {
       route: this.route,
       udpRequested: this.udpRequested,
       udpConnected: this.udpConnected,
-      sampleCount: this.latencyRing.length,
+      sampleCount: this.latencySamples.length,
       updatedAt: nowMs,
     };
   }
@@ -205,10 +248,12 @@ export function simulateScreenNetwork(
 ): FakeNetworkSimulationResult {
   const targetFps = options.targetFps ?? 60;
   const durationSec = options.durationSec ?? 2;
+  if (!Number.isFinite(targetFps) || targetFps <= 0) throw new RangeError("targetFps must be positive");
+  if (!Number.isFinite(durationSec) || durationSec <= 0) throw new RangeError("durationSec must be positive");
   const frameBytes = options.frameBytes ?? 14_000;
   const width = options.width ?? 1920;
   const height = options.height ?? 1080;
-  const totalFrames = targetFps * durationSec;
+  const totalFrames = Math.floor(targetFps * durationSec);
   const intervalMs = 1000 / targetFps;
   const tracker = new ScreenMetricsTracker();
   tracker.setRoute(profile.route, {
@@ -226,9 +271,11 @@ export function simulateScreenNetwork(
   let bytesInSecond = 0;
   let secondStart = 0;
   let holStallUntilMs = 0;
+  let wireSequence = 0;
   let rendered = 0;
   let latencySum = 0;
   let totalBytesSent = 0;
+  const allLatencies: number[] = [];
   const maxBytesPerSec = (profile.bandwidthKbps * 1000) / 8;
 
   for (let i = 1; i <= totalFrames; i++) {
@@ -238,11 +285,12 @@ export function simulateScreenNetwork(
       bytesInSecond = 0;
     }
 
-    // Bandwidth gate: skip frame when pacing budget is exhausted.
+    // Bandwidth gate: skip frame before transmission when pacing budget is exhausted.
     if (bytesInSecond + frameBytes > maxBytesPerSec) {
       tracker.recordFrameSkipped(1);
       continue;
     }
+    wireSequence++;
     bytesInSecond += frameBytes;
     totalBytesSent += frameBytes;
 
@@ -272,7 +320,7 @@ export function simulateScreenNetwork(
     const displayMs = arriveMs + decodeMs;
     const e2eLatency = displayMs - captureMs;
     tracker.recordFrameReceived({
-      sequence: i,
+      sequence: wireSequence,
       streamGeneration: 1,
       bytes: frameBytes,
       width,
@@ -283,16 +331,23 @@ export function simulateScreenNetwork(
     tracker.recordFrameRendered({ nowMs: displayMs, latencyMs: e2eLatency });
     rendered++;
     latencySum += e2eLatency;
+    allLatencies.push(e2eLatency);
   }
 
+  let p95LatencyMs = 0;
+  if (allLatencies.length > 0) {
+    const sorted = [...allLatencies].sort((a, b) => a - b);
+    const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+    p95LatencyMs = sorted[idx]!;
+  }
   const snap = tracker.snapshot(Math.round(totalFrames * intervalMs) + profile.baseRttMs + 20);
   return {
     profile,
-    framesSent: totalFrames,
+    framesSent: wireSequence,
     framesRendered: rendered,
     avgFps: Math.round((rendered / durationSec) * 10) / 10,
     avgLatencyMs: rendered > 0 ? Math.round(latencySum / rendered) : 0,
-    p95LatencyMs: snap.p95LatencyMs ?? 0,
+    p95LatencyMs,
     droppedFrames: snap.droppedFrames,
     skippedFrames: snap.skippedFrames,
     effectiveBitrateKbps: Math.round((totalBytesSent * 8) / (durationSec * 1000)),

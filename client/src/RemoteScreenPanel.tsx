@@ -4,7 +4,7 @@ import { Capacitor } from "@capacitor/core";
 import { Activity, Maximize, Maximize2, Minimize, Minimize2, X, Monitor, MoreHorizontal, ChevronDown, Unplug, Keyboard, Plug, MousePointer2, CornerDownLeft } from "lucide-react";
 import type { HubConnection } from "./connection.js";
 import type { ScreenStatus } from "../../src/client-protocol/remote-screen.js";
-import type { ScreenPerformanceSnapshot, ScreenRouteKind } from "../../src/client-protocol/screen-metrics.js";
+import { estimateServerTimeOffset, tcpRouteFromConnectionRoute, type ScreenPerformanceSnapshot, type ScreenRouteKind } from "../../src/client-protocol/screen-metrics.js";
 import { screenInputEventSchema, screenKeyCodeSchema } from "../../src/client-protocol/remote-screen.js";
 import { RemoteScreenViewer, supportedScreenCodecs, type ViewerState } from "./remote-screen-viewer.js";
 import { screenError } from "./screen-errors.js";
@@ -48,9 +48,19 @@ function formatBitrate(kbps: number): string {
   return `${kbps} kbps`;
 }
 
-function ScreenMetricsOverlay({ metrics, status, fallbackWidth, fallbackHeight }: {
+function resolveScreenRoute(routeName?: "Direct" | "Tailscale" | "VPS", udpStatus?: ScreenStatus["udpStatus"]): ScreenRouteKind {
+  if (udpStatus?.state === "connected") return udpStatus.route;
+  if (routeName === "VPS") return "tcp_vps_relay";
+  if (routeName === "Tailscale") return "tcp_tailscale";
+  if (routeName === "Direct") return udpStatus?.route === "tcp_tailscale" ? "tcp_tailscale" : "tcp_lan_direct";
+  return udpStatus?.route ?? tcpRouteFromConnectionRoute(routeName);
+}
+
+function ScreenMetricsOverlay({ metrics, activeRoute, udpRequested, udpConnected, fallbackWidth, fallbackHeight }: {
   metrics?: ScreenPerformanceSnapshot;
-  status?: ScreenStatus;
+  activeRoute: ScreenRouteKind;
+  udpRequested: boolean;
+  udpConnected: boolean;
   fallbackWidth?: number;
   fallbackHeight?: number;
 }) {
@@ -63,20 +73,21 @@ function ScreenMetricsOverlay({ metrics, status, fallbackWidth, fallbackHeight }
   const codec = metrics?.codec ? metrics.codec.toUpperCase() : "";
   const dropped = metrics?.droppedFrames ?? 0;
   const skipped = metrics?.skippedFrames ?? 0;
-  const route = metrics?.route ?? status?.udpStatus?.route ?? "tcp_default";
-  const udpRequested = metrics?.udpRequested ?? status?.udpStatus?.enabled ?? false;
-  const udpConnected = metrics?.udpConnected ?? status?.udpStatus?.state === "connected";
+  const route = metrics?.route ?? activeRoute;
+  const isUdpRequested = metrics?.udpRequested ?? udpRequested;
+  const isUdpConnected = metrics?.udpConnected ?? udpConnected;
   return <div className="screen-metrics-overlay" role="region" aria-label={t("屏幕性能数据")}>
     <div className="screen-metrics-row"><span>{t("帧率")}</span><strong>{fps} fps</strong></div>
     <div className="screen-metrics-row"><span>{t("端到端延迟")}</span><strong>{latency !== null && latency !== undefined ? `${latency} ms${p95 !== null && p95 !== undefined ? ` (p95 ${p95})` : ""}` : "—"}</strong></div>
     <div className="screen-metrics-row"><span>{t("码率与分辨率")}</span><strong>{bitrate}{w && h ? ` · ${w}×${h}` : ""}{codec ? ` · ${codec}` : ""}</strong></div>
     <div className="screen-metrics-row"><span>{t("丢帧 / 跳帧")}</span><strong>{dropped} / {skipped}</strong></div>
-    <div className="screen-metrics-row"><span>{t("当前链路")}</span><strong>{routeDisplayLabel(route, udpRequested, udpConnected)}</strong></div>
+    <div className="screen-metrics-row"><span>{t("当前链路")}</span><strong>{routeDisplayLabel(route, isUdpRequested, isUdpConnected)}</strong></div>
   </div>;
 }
 
 export function RemoteScreenPanel({connection,hostName,visible,close,openSettings,standalone=false}:{connection:HubConnection;hostName:string;visible:boolean;close:()=>void;openSettings?:()=>void;standalone?:boolean}) {
   const locale = useLocale(), windows = window.tarobotDesktop?.platform === "win32", mobile = isMobileScreenApp(), landscape = useLandscapePhone(mobile);
+  const connState = useSyncExternalStore(notify => typeof connection.subscribe === "function" ? connection.subscribe(notify) : () => {}, () => connection.state);
   const landscapeNow = useRef(landscape); landscapeNow.current = landscape;
   // Android hardware keyboards use Ctrl-based shortcuts; iOS keeps Mac keys.
   // Explicit on-screen shortcuts already contain the target's codes.
@@ -171,12 +182,18 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
       const explicit=connection.state.screenQualityAvailable&&!legacy;
       // What this App can hold unacknowledged, named only to a Host that knows the field.
       const flight=connection.state.screenFlightAvailable?await screenViewerFlight():undefined;if(n!==attempt.current)return;
+      const openStartMs = Date.now(), openMonoStart = performance.now();
       const result=await connection.screenOpen({desktopId:s.desktop.desktopId,displayId:d.id,displayRevision:d.revision,requestId:crypto.randomUUID(),codecs,...(explicit?{quality:requested}:{}),...(flight?{flight}:{})});
+      const openEndMs = Date.now(), openMonoRtt = Math.max(0, performance.now() - openMonoStart);
+      const serverTimeOffsetMs = typeof (result as { serverTimeOffsetMs?: number }).serverTimeOffsetMs === "number"
+        ? (result as { serverTimeOffsetMs: number }).serverTimeOffsetMs
+        : estimateServerTimeOffset(result.join.serverTime, openStartMs, openEndMs, openMonoRtt);
       lifecycle.sessions.add(result.join.session.id);cleanupOnError=true;
       if(n!==attempt.current||!canvas.current){cleanupOnError=false;await retire();return;}
       if(explicit&&result.join.quality!==requested)throw new Error("screen_quality_unconfirmed");
       setQuality(result.join.quality??SCREEN_DEFAULT_QUALITY);
-      const metricsOpts = { routeHint: s.udpStatus?.route ?? "tcp_default", udpRequested: s.udpStatus?.enabled ?? false, udpConnected: s.udpStatus?.state === "connected" };
+      const connectRoute = resolveScreenRoute(connection.state.route?.name, s.udpStatus);
+      const metricsOpts = { routeHint: connectRoute, udpRequested: s.udpStatus?.enabled ?? false, udpConnected: s.udpStatus?.state === "connected", serverTimeOffsetMs };
       const next=new RemoteScreenViewer(result.join,canvas.current,value=>{if(n===attempt.current){if(mobile&&value.state==="closed")clearPicture();setState(value);}},mobile?{...metricsOpts,transport:mobileScreenViewerTransport,flight,inputActive:()=>activeNow.current&&document.hasFocus()&&document.visibilityState==="visible"&&!!panel.current?.contains(document.activeElement)}:{...metricsOpts,flight});viewer.current=next;
       next.visibility(visibleNow.current&&document.visibilityState==="visible");await next.open(result.network);
       if(n!==attempt.current){next.dispose();cleanupOnError=false;await retire();return;}next.visibility(visibleNow.current&&document.visibilityState==="visible");
@@ -232,6 +249,12 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
   // control, keep focus in the viewer so its input gate stays open.
   const lastFocus=useRef<Element|null>(null);
   useLayoutEffect(()=>{const node=lastFocus.current;if(!mobile||!node||node.isConnected||document.activeElement&&document.activeElement!==document.body||!activeNow.current||!document.hasFocus())return;(state.state!=="closed"?canvas.current:keyboardButton.current)?.focus({preventScroll:true});},[landscape]);
+  const activeRoute = resolveScreenRoute(connState.route?.name, status?.udpStatus);
+  const udpRequested = status?.udpStatus?.enabled ?? false;
+  const udpConnected = status?.udpStatus?.state === "connected";
+  useEffect(() => {
+    viewer.current?.setRoute(activeRoute, { udpRequested, udpConnected });
+  }, [activeRoute, udpRequested, udpConnected]);
   const settingsShown=state.state==="closed"&&!!openSettings&&!!(blocked||statusError||error);
   const legacyConnect=()=>{setLegacyQuality(true);setQuality(SCREEN_DEFAULT_QUALITY);void connect(SCREEN_DEFAULT_QUALITY,true);};
   const rail=RAIL_LABELS[locale];
@@ -274,7 +297,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
     {tools&&<div className="screen-tools-popover" role="region" aria-label={t("屏幕更多操作")}>
     {mobile&&<><label className="screen-display">{t("画面清晰度")}{qualitySelect}</label><button onMouseDown={e=>e.preventDefault()} onClick={()=>{touch.current?.fit();setTools(false);}}>{t("适应窗口")}</button><p className="screen-touch-help">{t("查看时拖动画面、双指缩放。控制时点按左键、长按右键、单指拖动、双指滚动；捏合只缩放画面。")}</p></>}
     {landscape&&<p className="screen-touch-help">{t("仅在开始控制后，点击发送才会提交文本。")}</p>}
-    <label className="screen-display"><span>{t("性能数据覆盖层")}</span><input type="checkbox" checked={showMetrics} onChange={e=>setShowMetrics(e.target.checked)}/></label>
+    <label className="screen-display screen-metrics-toggle" onMouseDown={e=>e.preventDefault()}><span>{t("性能数据覆盖层")}</span><input type="checkbox" checked={showMetrics} onMouseDown={e=>e.preventDefault()} onChange={e=>setShowMetrics(e.target.checked)}/></label>
     <label className="screen-display">{t("显示器")}<select aria-label={t("显示器")} value={display} onChange={e=>{disconnect();setDisplay(e.target.value);}}>{status?.desktop?.displays.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>
     <div className="screen-shortcuts"><details><summary onMouseDown={e=>e.preventDefault()}>{t("发送组合键")}</summary><div>{screenShortcuts(target).map(shortcut=><button key={shortcut.id} disabled={!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={e=>{canvas.current?.focus();for(const code of shortcut.codes)viewer.current?.input({kind:"key",code,down:true});for(const code of [...shortcut.codes].reverse())viewer.current?.input({kind:"key",code,down:false});e.currentTarget.closest("details")?.removeAttribute("open");}}>{shortcut.label[locale]}</button>)}</div></details>{remap&&<select aria-label={controller==="windows"?t("Windows 修饰键"):t("Mac 修饰键")} value={modifierMode} onChange={e=>{viewer.current?.release();setModifierMode(e.target.value as ScreenModifierMode);}}>{controller==="windows"?<><option value="command">Ctrl → ⌘ · Win → ⌃</option><option value="physical">Ctrl → ⌃ · Win → ⌘</option></>:<><option value="command">⌘ → Ctrl · ⌃ → Win</option><option value="physical">⌃ → Ctrl · ⌘ → Win</option></>}</select>}</div>
     {!mobile&&<div className="screen-bottom"><button onClick={()=>{viewer.current?.release();setShowText(v=>!v);}}>{t("发送文本")}</button><span>{target==="windows"?<>{remap&&<>{modifierMode==="command"?t("Command 对应 Ctrl，Control 对应 Win，Option 对应 Alt"):t("Control 对应 Ctrl，Command 对应 Win，Option 对应 Alt")}{" · "}</>}{t("按键按键位发送，字符由目标电脑的键盘布局决定。")}</>:windows?(modifierMode==="command"?t("Ctrl 对应 Command，Win 对应 Control，Alt 对应 Option"):t("Windows：Ctrl 对应 Control，Win 对应 Command，Alt 对应 Option")):t("点击聊天输入框会立即停止远端控制。")}</span></div>}
@@ -282,6 +305,7 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
     </div>}
     </div>
     {mobile&&showText&&<div ref={tray} className="screen-mobile-keyboard"><div className="screen-mobile-keys" aria-label={t("快捷键")}>{["Escape","Tab","Enter","Backspace","ArrowLeft","ArrowUp","ArrowDown","ArrowRight"].map(code=><button key={code} disabled={!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={()=>shortcut([code])} aria-label={landscape&&code==="Enter"?"Enter":undefined}>{landscape&&code==="Enter"?<CornerDownLeft size={16} aria-hidden="true"/>:({Escape:"Esc",Backspace:"⌫",ArrowLeft:"←",ArrowUp:"↑",ArrowDown:"↓",ArrowRight:"→"} as Record<string,string>)[code]??code}</button>)}{screenShortcuts(target).map(item=><button key={item.id} disabled={!state.controlling} onMouseDown={e=>e.preventDefault()} onClick={()=>shortcut(item.codes)}>{item.label[locale]}</button>)}</div><div className="screen-text" onPointerDownCapture={e=>{if(e.target instanceof HTMLButtonElement&&e.target.disabled)e.preventDefault();}}><textarea aria-label={t("发送到远端的文本")} maxLength={2048} value={text} onCompositionStart={()=>{composing.current=true;setImeComposing(true);}} onCompositionEnd={()=>{composing.current=false;setImeComposing(false);}} onChange={e=>setText(e.target.value)} placeholder={t("在这里输入或粘贴中文文本，不会同步剪贴板。")}/><button disabled={imeComposing||!state.controlling||!screenInputEventSchema.safeParse({kind:"text",text}).success} onMouseDown={e=>e.preventDefault()} onClick={()=>{if(composing.current)return;if(viewer.current?.input({kind:"text",text}))setText("");}} aria-label={landscape?t("发送到远端"):undefined}>{landscape?rail.send:t("发送到远端")}</button><small>{imeComposing?t("请先在键盘上确认候选词，再发送。"):t("仅在开始控制后，点击发送才会提交文本。")}</small></div></div>}
+    <div className="screen-stage">
     <div ref={viewport} className={`screen-viewport${!mobile&&scale==="fit"?" screen-fit":""}`} onPointerDown={e=>{if(!mobile||e.pointerType==="mouse")return;e.preventDefault();canvas.current?.focus({preventScroll:true});e.currentTarget.setPointerCapture(e.pointerId);touch.current?.down(e.pointerId,touchPoint(e),performance.now());clearTimeout(holdTimer.current);holdTimer.current=setTimeout(()=>touch.current?.hold(performance.now()),SCREEN_TOUCH_HOLD_MS);}} onPointerMove={e=>{if(!mobile||e.pointerType==="mouse")return;e.preventDefault();touch.current?.move(e.pointerId,touchPoint(e));if(!touchFrame.current)touchFrame.current=requestAnimationFrame(()=>{touchFrame.current=0;touch.current?.flush();});}} onPointerUp={e=>{if(!mobile||e.pointerType==="mouse")return;e.preventDefault();clearTimeout(holdTimer.current);touch.current?.up(e.pointerId);if(e.currentTarget.hasPointerCapture(e.pointerId))e.currentTarget.releasePointerCapture(e.pointerId);}} onPointerCancel={()=>{if(mobile)clearTouch();}} onLostPointerCapture={e=>{if(mobile&&touch.current?.hasPointer(e.pointerId))clearTouch();}}>
       <canvas ref={canvas} tabIndex={0} aria-label={t("{0}的远程屏幕",hostName)} className={[state.fresh?"":"screen-stale",hideLocalPointer?"screen-pointer-hidden":""].filter(Boolean).join(" ")} style={mobile?{width:fitSize.width,height:fitSize.height,transform:`translate(-50%,-50%) translate(${transform.x}px,${transform.y}px) scale(${transform.zoom})`}:scale==="fit"?{aspectRatio:state.width&&state.height?`${state.width}/${state.height}`:undefined,width:`min(100cqw, calc(100cqh * ${state.width&&state.height?state.width/state.height:16/9}))`}:{width:(state.width??640)*Number(scale),height:(state.height??360)*Number(scale)}}
         onBlur={e=>{if(!mobile||!panel.current?.contains(e.relatedTarget as Node|null))viewer.current?.release();}} onContextMenu={e=>{if(state.controlling||mobile)e.preventDefault();}}
@@ -291,7 +315,8 @@ export function RemoteScreenPanel({connection,hostName,visible,close,openSetting
         onKeyDown={e=>{if(!state.controlling)return;if(e.code==="Escape"&&e.ctrlKey&&e.altKey&&e.shiftKey){e.preventDefault();viewer.current?.release();return;}if(e.nativeEvent.isComposing||!screenKeyCodeSchema.safeParse(e.code).success)return;e.preventDefault();viewer.current?.input({kind:"key",code:screenControllerCode(e.code,controller,modifierMode,target),down:true});}}
         onKeyUp={e=>{if(!state.controlling||e.nativeEvent.isComposing||!screenKeyCodeSchema.safeParse(e.code).success)return;e.preventDefault();viewer.current?.input({kind:"key",code:screenControllerCode(e.code,controller,modifierMode,target),down:false});}}
       />
-      {showMetrics&&<ScreenMetricsOverlay metrics={state.metrics} status={status} fallbackWidth={state.width} fallbackHeight={state.height}/>}
+    </div>
+    {showMetrics&&<ScreenMetricsOverlay metrics={state.metrics} activeRoute={activeRoute} udpRequested={udpRequested} udpConnected={udpConnected} fallbackWidth={state.width} fallbackHeight={state.height}/>}
     </div>
 
   </aside>;

@@ -13,6 +13,8 @@ export const REMOTE_SCREEN_CAPABILITY = "desktop.screen.v1";
 export const REMOTE_SCREEN_QUALITY_CAPABILITY = "desktop.screen.quality.v1";
 /** Hub → App (`serverCapabilities`): `screenOpen` accepts `flight` and a viewer's `ack` may carry `heldMs`. */
 export const REMOTE_SCREEN_FLIGHT_CAPABILITY = "desktop.screen.flight.v1";
+/** Hub → App (`serverCapabilities`): `screenConfigure` accepts `udpBoost`, and `includeUdpStatus=1` returns `udpStatus` and `policy.udpBoost`. */
+export const REMOTE_SCREEN_UDP_BOOST_CAPABILITY = "desktop.screen.udp-boost.v1";
 /** Host control socket → target (`controlCapabilities`): the hello may carry `features`. */
 export const SCREEN_CONTROL_QUALITY_CAPABILITY = "screen-quality-v1";
 /** Host control socket → target (`controlCapabilities`): this Host accepts a
