@@ -1,4 +1,5 @@
 import type { ClientFrame, Message } from "../../src/client-protocol/index.js";
+import type { SideErrorCode } from "../../src/client-protocol/side.js";
 
 export const SEND_TIMING_STORAGE_KEY = "tarobird.debug.sendTiming";
 const MAX_RECORDS = 200;
@@ -41,7 +42,47 @@ export interface SendTimingRecord {
   historyReadDoneAt?: number;
   bubbleVisibleAt?: number;
   composerClearedAt?: number;
+  /** A `SendTimingFailureCode` or an error's class name, never its message. */
   error?: string;
+}
+
+/** Why a send stopped, as a call site may name it. The Host's side-conversation
+ *  refusal codes are a closed list and pass through unchanged. */
+export type SendTimingFailureCode =
+  | "aborted"
+  | "conversation_changed"
+  | "local_command"
+  | "stale_generation"
+  | "file_rejected"
+  | SideErrorCode;
+
+const FAILURE_CODES: Record<SendTimingFailureCode, true> = {
+  aborted: true,
+  conversation_changed: true,
+  local_command: true,
+  stale_generation: true,
+  file_rejected: true,
+  unsupported: true,
+  no_main_session: true,
+  busy: true,
+  limit_reached: true,
+  budget_exhausted: true,
+  expired: true,
+  cancelled: true,
+  failed: true,
+  attachment_unavailable: true,
+  attachment_unsupported: true,
+  attachment_too_large: true,
+};
+
+/** Records are readable from `window.__tarobirdSendTiming`, and the text of an
+ *  error can quote what the user typed (an unresolved @name of a group draft,
+ *  an attachment's file name). Only a fixed code is kept: a listed call-site
+ *  code, or the class name of a thrown error. */
+function failureCode(reason: unknown): string {
+  if (typeof reason === "string") return Object.hasOwn(FAILURE_CODES, reason) ? reason : "failed";
+  if (reason instanceof Error) return /^[A-Za-z][A-Za-z0-9]{0,47}$/.test(reason.name) ? reason.name : "Error";
+  return "aborted";
 }
 
 export interface SendTimingDebugApi {
@@ -70,6 +111,8 @@ export interface SendTimingTrace {
   resetForFallback(): void;
   expectComposerClear(): void;
   skipComposerClear(): void;
+  /** Pass a `SendTimingFailureCode`, or whatever was thrown: the record keeps
+   *  a fixed code only (see `failureCode`), never the text of an error. */
   fail(reason: unknown): void;
 }
 
@@ -265,7 +308,7 @@ export function beginSendTiming(init: {
     fail(reason) {
       if (active.retired) return;
       active.retired = true;
-      record.error = reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "aborted";
+      record.error = failureCode(reason);
       prunePending(performance.now());
     },
   };

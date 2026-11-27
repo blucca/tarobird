@@ -202,7 +202,8 @@ class SideSession {
     if (!id || !this.online || this.snapshot.sending || !text && !files.length || text.length > SIDE_QUESTION_LIMIT || this.snapshot.view?.phase !== "idle" || this.snapshot.ended) return;
     const timing = beginSendTiming({ conversationId: this.conversationId, kind: "side", engine: "side", route: "side", messageLength: text.length, matchText: text });
     const fileError = this.validateFiles(files);
-    if (fileError) { timing?.fail(fileError); this.setError(fileError); return; }
+    // The text names the rejected file: the probe gets a code, the user the text.
+    if (fileError) { timing?.fail("file_rejected"); this.setError(fileError); return; }
     this.patch({ sending: true, error: "" }); this.stopRequested = false;
     let submitted = false;
     try {
