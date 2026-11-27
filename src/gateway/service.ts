@@ -274,7 +274,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   const engineTasks = gatewayEngineTasks(bridge, channel, options.stateDir);
   const contextUsage = gatewayContextUsage(bridge, channel);
   const piSession = gatewayPiSession(bridge, channel, options.stateDir, options.botId);
-  const history = gatewayConversationHistory(bridge, channel, runtime, options.stateDir, options.botId, () => (sideSessions?.activeCount() ?? 0) > 0);
+  const history = gatewayConversationHistory(bridge, channel, runtime, options.stateDir, options.botId, (conversationId) => sideSessions?.hasOpenSession(conversationId) ?? false);
   // Side audio uses the main transcriber and cloud policy, without its chat progress cards.
   sideSessions = gatewaySideSessions(surface, options.stateDir, options.botId, conversationId => channel.canSteerConversation!(conversationId), instanceAttachmentDownload(channel.transport), runtime.transcribeMedia ?? createDefaultTranscribeVoice(), channel);
   const schedules = gatewaySchedules(options, channel);

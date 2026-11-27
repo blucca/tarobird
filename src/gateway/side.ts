@@ -118,7 +118,8 @@ export function gatewaySideSessions(bridge: CoreBridgeLike, stateDir: string, bo
   };
   const scopeWithId = sideScopeSchema.extend({ sideId: idSchema });
   return {
-    activeCount: () => sessions.activeCount(),
+    activeCount: (conversationId?: string) => sessions.activeCount(conversationId),
+    hasOpenSession: (conversationId: string) => sessions.hasOpenSession(conversationId),
     close: () => { sessionWorkspaces.clear(); return sessions.closeAll(); },
     async call(method: string, raw: unknown) {
       try {

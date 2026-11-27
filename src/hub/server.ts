@@ -1,5 +1,5 @@
 import { HISTORY_RELEASE_AFTER_MS, HubConversationHistory } from "./conversation-history.js";
-import { CONVERSATION_HISTORY_CAPABILITY, historyChangeSchema } from "../client-protocol/conversation-history.js";
+import { CONVERSATION_HISTORY_CAPABILITY, HISTORY_SIDE_REASON_QUERY, compatHistoryReason, historyChangeSchema } from "../client-protocol/conversation-history.js";
 import { hubEngineQuotas } from "./engine-quota.js";
 import { ENGINE_QUOTA_CAPABILITY, ENGINE_QUOTA_HUB_REFRESH_MS } from "../client-protocol/engine-quota.js";
 import { DesignShareBroker, metaDesignShareRepository, type DesignSharePeer } from "./workbench-design-sharing.js";
@@ -2085,24 +2085,31 @@ export class HubServer {
       const historyRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/history(?:\/(anchors|operations)(?:\/([A-Za-z0-9_-]+)(\/reconcile)?)?)?$/);
       if (historyRoute) {
         const conversationId = historyRoute[1]!, part = historyRoute[2], requestId = historyRoute[3];
+        // Older v1.6.0 clients parse `historyReasonSchema` strictly without `side_session`.
+        // Project `side_session` back to `background_work` unless the caller opted in via `?sideReason=1`.
+        const allowSideReason = url.searchParams.get(HISTORY_SIDE_REASON_QUERY) === "1";
+        const projectSnapshot = <T extends { blocked?: import("../client-protocol/conversation-history.js").HistoryReason }>(value: T): T =>
+          value.blocked === "side_session" && !allowSideReason ? { ...value, blocked: compatHistoryReason(value.blocked, false) } : value;
+        const projectOperation = <T extends { reason?: import("../client-protocol/conversation-history.js").HistoryReason }>(value: T): T =>
+          value.reason === "side_session" && !allowSideReason ? { ...value, reason: compatHistoryReason(value.reason, false) } : value;
         if (req.method === "POST" && part === "operations" && requestId && historyRoute[4]) {
           const input = historyChangeSchema.parse(await this.jsonBody(req, 16384));
           if (input.requestId !== requestId) throw new HubError("history_request_conflict", 409);
-          await reply(200, await this.conversationHistory.reconcile(userId, conversationId, input, validateInQueue)); return;
+          await reply(200, projectOperation(await this.conversationHistory.reconcile(userId, conversationId, input, validateInQueue))); return;
         }
         if (historyRoute[4]) throw new HubError("method_not_allowed", 405);
         if (req.method === "POST" && part === "operations" && !requestId) {
           const input = historyChangeSchema.parse(await this.jsonBody(req, 16384));
-          await reply(200, await this.conversationHistory.start(userId, conversationId, input, validateInQueue)); return;
+          await reply(200, projectOperation(await this.conversationHistory.start(userId, conversationId, input, validateInQueue))); return;
         }
         if (req.method !== "GET") throw new HubError("method_not_allowed", 405);
         const botId = idSchema.parse(url.searchParams.get("botId"));
-        if (!part) { await reply(200, await this.conversationHistory.snapshot(userId, botId, conversationId, validateInQueue)); return; }
+        if (!part) { await reply(200, projectSnapshot(await this.conversationHistory.snapshot(userId, botId, conversationId, validateInQueue))); return; }
         if (part === "anchors" && !requestId) {
           const query = { messageId: idSchema.optional().parse(url.searchParams.get("messageId") ?? undefined), cursor: idSchema.optional().parse(url.searchParams.get("cursor") ?? undefined) };
           await reply(200, await this.conversationHistory.anchors(userId, botId, conversationId, query, validateInQueue)); return;
         }
-        if (part === "operations" && requestId) { await reply(200, await this.conversationHistory.status(userId, botId, conversationId, requestId, validateInQueue)); return; }
+        if (part === "operations" && requestId) { await reply(200, projectOperation(await this.conversationHistory.status(userId, botId, conversationId, requestId, validateInQueue))); return; }
         throw new HubError("not_found", 404);
       }
       const piSessionRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/pi-session$/);

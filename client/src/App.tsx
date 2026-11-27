@@ -147,7 +147,7 @@ import { ConversationPanel } from "./ConversationPanel.js";
 import { ArchivedConversations } from "./ArchivedConversations.js";
 import { ConversationFiles } from "./ConversationFiles.js";
 import { BackgroundTaskGroup, BackgroundTaskDock } from "./BackgroundTaskGroup.js";
-import { groupBackgroundTasks } from "./background-task-groups.js";
+import { groupBackgroundTasks, taskCounts } from "./background-task-groups.js";
 import { EngineTasks } from "./EngineTasks.js";
 import { PromptQueue, useSteeringCapability } from "./PromptQueue.js";
 import { DispatchNotice, DispatchTickets } from "./DispatchTickets.js";
@@ -1724,7 +1724,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const recipientNames = recipients.map((id) => labels.get(id) ?? botDirectory.find((b) => b.id === id)?.name ?? id);
   const defaultAllReplies = replyMode?.mode === "parallel";
   const recipientSummary = !recipientNames.length ? defaultAllReplies ? t("全员回复") : replyMode && replyMode.delivery !== "legacy" ? t("不指定回复") : t("选择回复的 Bot") : recipientNames.length === 1 ? recipientNames[0]! : t("{0} 等 {1} 个 Bot", recipientNames[0]!, recipientNames.length);
-  const history = useConversationHistory({ connection, conversation: current, forkTitles: conversations.filter(value => current && value.historyOrigin?.sourceConversationId === current.id).map(value => value.title), enabled: visible && chatVisible && searchResults === undefined, activity: replying, pendingMessages: queued.some(item => !item.error), localBusy: sending || steeringBusy || uploadProgress !== undefined || recording, fallback: scroll, opened: conversation => {
+  const history = useConversationHistory({ connection, conversation: current, forkTitles: conversations.filter(value => current && value.historyOrigin?.sourceConversationId === current.id).map(value => value.title), enabled: visible && chatVisible && searchResults === undefined, activity: replying, backgroundBusy: backgroundGroups.groups.some(item => taskCounts(item).running > 0), sideState: `${side.shown ? 1 : 0}:${side.view?.phase ?? ""}:${side.closingRevision}`, pendingMessages: queued.some(item => !item.error), localBusy: sending || steeringBusy || uploadProgress !== undefined || recording, fallback: scroll, opened: conversation => {
     setConversations(old => [...old.filter(value => value.id !== conversation.id), conversation]);
     setDetails(false); setManage(false); setChatActions(false); closeMenu();
     if (pane) pane.navigate(conversation.id, undefined, conversation.title); else setSelected(conversation.id);

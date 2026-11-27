@@ -261,9 +261,10 @@ export class Bridge {
   ) {
     this.supportsTurnScopedEnv = adapter.supportsTurnScopedEnv !== false;
     this.history = new ConversationHistoryController(sessionManager, adapter as CodexAdapter & NativeConversationHistoryAdapter,
-      sessionId => (this.sideSessionReaders.get(sessionId) ?? 0) > 0 || !!this.sessionTurnOwner(sessionId),
+      sessionId => !!this.sessionTurnOwner(sessionId),
       sessionId => { if (this.historyMutations.has(sessionId) || (this.sideSessionReaders.get(sessionId) ?? 0) > 0) return undefined;
-        this.historyMutations.add(sessionId); return () => { this.historyMutations.delete(sessionId); }; });
+        this.historyMutations.add(sessionId); return () => { this.historyMutations.delete(sessionId); }; },
+      sessionId => (this.sideSessionReaders.get(sessionId) ?? 0) > 0);
   }
 
   async readAccountQuota(options: import("../codex/adapter.js").EngineQuotaReadOptions): Promise<import("../codex/adapter.js").EngineQuotaReadResult | undefined> {

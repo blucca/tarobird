@@ -1,5 +1,5 @@
 import { WORKSPACE_FILES_CAPABILITY } from "../../src/client-protocol/workspace-files.js";
-import { CONVERSATION_HISTORY_CAPABILITY, historySnapshotSchema, historyAnchorPageSchema, historyChangeSchema, historyOperationSchema, type HistoryChange, type HistoryOperation } from "../../src/client-protocol/conversation-history.js";
+import { CONVERSATION_HISTORY_CAPABILITY, HISTORY_SIDE_REASON_QUERY, historyClientSnapshotSchema, historyAnchorPageSchema, historyChangeSchema, historyClientOperationSchema, type HistoryChange, type HistoryClientOperation } from "../../src/client-protocol/conversation-history.js";
 import { CONVERSATION_BOT_COMMS_CAPABILITY } from "../../src/client-protocol/workspace-comms.js";
 import { historyPendingSchema, historyRecordKey } from "./conversation-history-state.js";
 import { ENGINE_QUOTA_CAPABILITY, quotaDirectorySchema, quotaScopeSchema, type QuotaScope } from "../../src/client-protocol/engine-quota.js";
@@ -1211,7 +1211,7 @@ export class HubConnection {
   }
   async historySnapshot(conversationId: string, botId: string, signal?: AbortSignal) {
     if (!this.state.historyAvailable) throw new Error("history_unavailable");
-    return historySnapshotSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history?botId=${encodeURIComponent(botId)}`, { signal: signal ?? timeoutSignal(15_000) }));
+    return historyClientSnapshotSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history?botId=${encodeURIComponent(botId)}&${HISTORY_SIDE_REASON_QUERY}=1`, { signal: signal ?? timeoutSignal(15_000) }));
   }
   async historyAnchors(conversationId: string, botId: string, messageId: string, signal?: AbortSignal) {
     if (!this.state.historyAvailable) throw new Error("history_unavailable");
@@ -1220,21 +1220,21 @@ export class HubConnection {
   async changeHistory(conversationId: string, change: HistoryChange) {
     if (!this.state.historyAvailable || this.isReadOnly || this.state.status !== "online") throw new Error("history_unavailable");
     const body = historyChangeSchema.parse(change);
-    return historyOperationSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/operations`, { method: "POST", body: JSON.stringify(body), signal: timeoutSignal(20_000) }));
+    return historyClientOperationSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/operations?${HISTORY_SIDE_REASON_QUERY}=1`, { method: "POST", body: JSON.stringify(body), signal: timeoutSignal(20_000) }));
   }
   /** Receipt lookup only: recovery must never repeat a native history operation. */
   async historyOperation(conversationId: string, botId: string, requestId: string) {
     if (!this.state.historyAvailable) throw new Error("history_unavailable");
-    return historyOperationSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/operations/${encodeURIComponent(requestId)}?botId=${encodeURIComponent(botId)}`, { signal: timeoutSignal(15_000) }));
+    return historyClientOperationSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/operations/${encodeURIComponent(requestId)}?botId=${encodeURIComponent(botId)}&${HISTORY_SIDE_REASON_QUERY}=1`, { signal: timeoutSignal(15_000) }));
   }
   /** Explicit recovery may tombstone a never-admitted request. The Host only
    * reconciles this exact receipt and never reapplies a native history action. */
   async reconcileHistory(conversationId: string, change: HistoryChange) {
     if (!this.state.historyAvailable || this.isReadOnly || this.state.status !== "online") throw new Error("history_unavailable");
     const body = historyChangeSchema.parse(change);
-    return historyOperationSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/operations/${encodeURIComponent(body.requestId)}/reconcile`, { method: "POST", body: JSON.stringify(body), signal: timeoutSignal(20_000) }));
+    return historyClientOperationSchema.parse(await this.http(`/api/conversations/${encodeURIComponent(conversationId)}/history/operations/${encodeURIComponent(body.requestId)}/reconcile?${HISTORY_SIDE_REASON_QUERY}=1`, { method: "POST", body: JSON.stringify(body), signal: timeoutSignal(20_000) }));
   }
-  async acceptHistoryOperation(conversationId: string, result: HistoryOperation): Promise<Conversation | undefined> {
+  async acceptHistoryOperation(conversationId: string, result: HistoryClientOperation): Promise<Conversation | undefined> {
     if (result.state !== "applied") return;
     const scope = historyRecordKey(this, conversationId);
     const assertScope = () => { if (historyRecordKey(this, conversationId) !== scope) throw new Error("history_owner_changed"); };

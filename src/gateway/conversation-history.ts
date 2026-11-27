@@ -26,7 +26,7 @@ const unknown: HistoryNativeResult = { outcome: "unknown", reason: "uncertain" }
 const reservationSchema = z.object({ identity: z.string(), workspaceOverride: z.string().optional(), workspaceUnreadable: z.literal(true).optional() }).strict();
 const toolsSchema = z.object({ sourceSessionId: z.string().min(1).max(4096), toolVersion: z.string().min(1).max(256).nullable() }).strict();
 
-export function gatewayConversationHistory(bridge: HistoryBridge, channel: GatewayChannel, runtime: CoreServiceRuntime, stateDir: string, botId: string, sideBusy: () => boolean = () => false) {
+export function gatewayConversationHistory(bridge: HistoryBridge, channel: GatewayChannel, runtime: CoreServiceRuntime, stateDir: string, botId: string, sideBusy: (conversationId: string) => boolean = () => false) {
   const receipts = new GatewayReceipts(stateDir);
   const readConfig = () => readValidatedConfigFile(path.join(stateDir, "config.json"), { forExecution: true });
   return async (method: string, raw: unknown): Promise<Json> => {
@@ -53,7 +53,7 @@ export function gatewayConversationHistory(bridge: HistoryBridge, channel: Gatew
       if (workspaceOverride) scope.workspaceOverride = workspaceOverride;
       const result = historyInternalSnapshotSchema.parse(await bridge.getConversationHistory(scope));
       if (!await authorized()) throw new Error("history_forbidden");
-      if (busy()) result.blocked = "busy"; else if (sideBusy()) result.blocked = "background_work";
+      if (busy()) result.blocked = "busy"; else if (sideBusy(p.conversationId)) result.blocked = "side_session";
       return z.json().parse(result);
     }
     const command = applySchema.strip().parse(p), key = `history:${command.userId}:${command.operationId}`;
@@ -112,10 +112,10 @@ export function gatewayConversationHistory(bridge: HistoryBridge, channel: Gatew
       if (reservedScope.workspaceUnreadable) return { outcome: "rejected", reason: "storage_unavailable" };
       if (!bridge.applyConversationHistory || !bridge.getConversationHistory) return { outcome: "rejected", reason: "unsupported" };
       if (busy()) return { outcome: "rejected", reason: "busy" };
-      if (sideBusy()) return { outcome: "rejected", reason: "background_work" };
+      if (sideBusy(p.conversationId)) return { outcome: "rejected", reason: "side_session" };
       if (await channel.canSteerConversation?.(p.conversationId) !== true) return { outcome: "rejected", reason: "binding_pending" };
       const snapshot = historyInternalSnapshotSchema.parse(await bridge.getConversationHistory(scope));
-      if (snapshot.blocked === "busy") return { outcome: "rejected", reason: "busy" };
+      if (snapshot.blocked === "busy" || snapshot.blocked === "side_session") return { outcome: "rejected", reason: snapshot.blocked };
       if (command.anchorGeneration && (snapshot.bindingGeneration !== command.anchorGeneration || snapshot.sourceSessionId !== command.anchorSessionId)) return { outcome: "rejected", reason: "source_changed" };
       const permission = z.object({ allowed: z.boolean() }).strict().parse(await channel.transport.requestLive("history.authorize", { userId: command.userId, conversationId: command.conversationId, operationId: command.operationId, purpose: "apply" }));
       if (!permission.allowed) return unknown;
