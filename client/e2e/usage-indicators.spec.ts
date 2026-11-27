@@ -17,14 +17,16 @@ import { createServer } from "./fixtures/vite.js";
 import type { multipleHosts } from "./fixtures/multiple-hosts.js";
 
 test.use({ serviceWorkers: "block" });
-type Readings = { context?: { used: number; window: number; compact?: number }; limits: Array<{ id: "primary" | "secondary"; used: number; period: number; resetHours: number }> };
+type QuotaLimit = { id: "primary" | "secondary"; used: number; period: number } & ({ resetHours: number } | { resetsAt: string });
+type Readings = { context?: { used: number; window: number; compact?: number }; limits: QuotaLimit[] };
 const plenty = (): Readings => ({ context: { used: 76_000, window: 200_000, compact: 168_000 }, limits: [{ id: "primary", used: 20, period: 18_000, resetHours: 2 }, { id: "secondary", used: 10, period: 604_800, resetHours: 120 }] });
 const nearlyGone = (): Readings => ({ context: { used: 176_000, window: 200_000, compact: 168_000 }, limits: [{ id: "primary", used: 66, period: 18_000, resetHours: 2 }, { id: "secondary", used: 99, period: 604_800, resetHours: 120 }] });
 function quota(limits: Readings["limits"]): QuotaSnapshot {
   const now = Date.now(), at = new Date(now).toISOString(), expiresAt = new Date(now + 60_000).toISOString();
   return { authMode: "subscription", capability: { mode: "active" }, state: "ready", availability: "unknown", observedAt: at, lastAttemptAt: at, constraints: [], help: "codex_usage",
     pools: [{ id: "codex", label: "Codex", sharing: "unspecified", availability: "unknown", balances: [], constraints: [], windows: limits.map(item => ({ id: item.id, label: item.id === "primary" ? "Primary" : "Secondary", metric: "percent" as const, usedPercent: item.used,
-      availability: "unknown" as const, observedAt: at, expiresAt, periodSeconds: item.period, resetsAt: new Date(now + item.resetHours * 3_600_000).toISOString() })) }] };
+      availability: "unknown" as const, observedAt: at, expiresAt, periodSeconds: item.period,
+      resetsAt: "resetsAt" in item ? item.resetsAt : new Date(now + item.resetHours * 3_600_000).toISOString() })) }] };
 }
 /** A Bot whose engine reports the given readings. Like a real engine it has no quota reading until it is asked once. */
 async function bot(hub: HubServer, root: string, id: string, engine: "codex" | "claude", readings?: { value: Readings; quota: boolean; asked: boolean[]; forget?: () => void }) {
@@ -431,18 +433,19 @@ test("in-chat quota details tick live countdowns and honor serverTimeOffset", as
       const frame = JSON.parse(message);
       if (frame.type === "ready" && typeof frame.serverTime === "number") {
         frame.serverTime += hostAheadMs;
+        frame.expiresAt += hostAheadMs;
       }
       socket.send(JSON.stringify(frame));
     });
   });
   const f = await fixture(page);
   try {
-    // Primary resets at browserNow + 1h + 64.5s => Host remaining is ~64.5s ("2 分钟后重置", ticking to "1 分钟后重置" within 8s)
-    // Secondary resets at browserNow + 3h => Host remaining is ~2h ("2 小时后重置", not skewed "3 小时后重置")
+    // Re-reading the same windows must preserve their absolute reset times.
+    const hostNow = Date.now() + hostAheadMs;
     f.readings.value = {
       limits: [
-        { id: "primary", used: 20, period: 18_000, resetHours: (hostAheadMs + 64_500) / 3_600_000 },
-        { id: "secondary", used: 10, period: 604_800, resetHours: (hostAheadMs + 2 * 3_600_000) / 3_600_000 },
+        { id: "primary", used: 20, period: 18_000, resetsAt: new Date(hostNow + 64_500).toISOString() },
+        { id: "secondary", used: 10, period: 604_800, resetsAt: new Date(hostNow + 2 * 3_600_000).toISOString() },
       ],
     };
     const ws = workspace(page), indicators = ws.locator(".usage-indicators");
