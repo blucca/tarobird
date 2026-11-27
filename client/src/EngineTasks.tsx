@@ -94,7 +94,8 @@ export function EngineTasks({ connection, conversationId, botId, active, online,
     const load = async () => {
       const request = queueRequest([controller.signal], 8000);
       try {
-        const value = engineTaskSnapshotSchema.parse(await request.wait(connection.http(`${route}?botId=${encodeURIComponent(botId)}`, { signal: request.signal })));
+        // `swarmTasks=1`: opt into post-1.6.0 Swarm task metadata and board snapshots; older Hosts ignore it.
+        const value = engineTaskSnapshotSchema.parse(await request.wait(connection.http(`${route}?botId=${encodeURIComponent(botId)}&swarmTasks=1`, { signal: request.signal })));
         if (!controller.signal.aborted) {
           // Only an explicit terminal event can retire a stop receipt. An empty
           // snapshot during reconnect must not permit a duplicate mutation.

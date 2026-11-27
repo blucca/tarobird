@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const ENGINE_TASKS_CAPABILITY = "conversations.tasks.v1";
+export const SWARM_TASKS_CAPABILITY = "conversations.tasks.swarm.v1";
 /** Display-only metadata on a saved scoped reply; never a control target. */
 export const scopedTaskLabelSchema = z.object({ version: z.literal(1), label: z.string().min(1).max(500), kind: z.enum(["subagent", "background"]) }).strict();
 const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
@@ -62,3 +63,12 @@ export type SwarmSnapshot = z.infer<typeof swarmSnapshotSchema>;
 export type EngineTask = z.infer<typeof engineTaskSchema>;
 export type EngineTaskSnapshot = z.infer<typeof engineTaskSnapshotSchema>;
 export type EngineTaskControlResult = z.infer<typeof engineTaskControlResultSchema>;
+
+/** Strip post-1.6.0 Swarm fields so strict 1.6.0 clients and Hubs accept the snapshot. */
+export function stripSwarmTaskFields(snapshot: EngineTaskSnapshot): EngineTaskSnapshot {
+  const { swarm: _swarm, ...rest } = snapshot;
+  return {
+    ...rest,
+    tasks: snapshot.tasks.map(({ role: _role, swarmState: _swarmState, model: _model, helper: _helper, ...task }) => task),
+  };
+}

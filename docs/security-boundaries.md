@@ -779,7 +779,11 @@ Normal Codex turns keep native `on-request` approval policy even when a caller
 has no approval UI; such native requests are declined, never silently promoted
 to the explicit full-access policy. Claude child tool approvals may use only
 the currently live owning turn's approval handler. Stale/ambiguous child scopes
-and child access to the parent's App tools remain rejected. DeepSeek session
+and child access to the parent's App tools remain rejected. Antigravity ACP
+`session/request_permission` and `elicitation/create` requests likewise require
+a currently live owning turn: orphan requests arriving after a turn settles
+(including during background or Swarm activity) are declined cleanly and never
+borrow a previous turn's approval handler. DeepSeek session
 consent is keyed to the exact tool name and canonical tool input; a missing
 native call record cannot create a reusable grant. CLI and App share these
 adapter checks.

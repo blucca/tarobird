@@ -125,6 +125,7 @@ test("swarm view omits false individual-stop claim, restricts Message @worker to
   // Opening directly to board before first snapshot finishes must NOT bounce back to tasks tab.
   await expect(dialog.getByRole("tab", { name: /Swarm 看板/ })).toHaveAttribute("aria-selected", "true");
   await expect(dialog).toContainText("Checking token signature");
+  expect(await page.evaluate(() => (window as any).taskFixture.calls.find((c: any) => !c.input)?.route)).toContain("swarmTasks=1");
 
   // Board view: Message @worker renders ONLY for active non-helper author (@auth-fix), NOT killed (@old-worker) or helper (@monitor).
   await expect(dialog.getByRole("button", { name: "向 @auth-fix 发消息", exact: true })).toHaveCount(1);

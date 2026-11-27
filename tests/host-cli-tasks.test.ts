@@ -6,7 +6,7 @@ describe("headless native task controls", () => {
   it("lists live native tasks through the same conversation API", async () => {
     const request = vi.fn(async () => ({ supported: true, tasks: [] }));
     await runTasksCommand({ request }, "list", "chat", { bot: "bot" });
-    expect(request).toHaveBeenCalledExactlyOnceWith("/api/conversations/chat/tasks?botId=bot");
+    expect(request).toHaveBeenCalledExactlyOnceWith("/api/conversations/chat/tasks?botId=bot&swarmTasks=1");
   });
   it("stops exactly one handle and returns its native receipt", async () => {
     const request = vi.fn(async () => ({ outcome: "accepted" })), receipts: string[] = [];

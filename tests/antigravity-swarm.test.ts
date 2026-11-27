@@ -400,7 +400,7 @@ describe("AntigravityAcpAdapter /swarm lifecycle", () => {
     expect(server.prompts).toHaveLength(1);
   });
 
-  it("suppresses inactivity & idle reaper timeouts while swarm workers are working/waiting, handles post-coordinator worker approvals + elicitation + wake-up + /swarm board + @worker + Stop", async () => {
+  it("pauses inactivity & idle reaper within hard cap while swarm works, attributes active-turn approvals/elicitation, rejects orphan post-turn approvals, and stops cleanly", async () => {
     const env = await setupEnv();
     const harness = createSwarmHarness();
     const adapter = new AntigravityAcpAdapter("agy", {
@@ -411,7 +411,8 @@ describe("AntigravityAcpAdapter /swarm lifecycle", () => {
       idleWorkerTtlMs: 30,
       idleSweepIntervalMs: 10,
       inactivityTimeoutMs: 40,
-      turnTimeoutMs: 60,
+      turnTimeoutMs: 2_000,
+      swarmMaxDurationMs: 2_000,
       wakeQuietMs: 10,
       closeTimeoutMs: 50,
       cancelGraceMs: 50,
@@ -451,13 +452,13 @@ describe("AntigravityAcpAdapter /swarm lifecycle", () => {
       ],
     });
 
-    // Wait longer than both inactivityTimeoutMs (40ms) and turnTimeoutMs (60ms) while swarm is active: turn MUST stay open.
+    // Wait longer than inactivityTimeoutMs (40ms) while within hard total cap (2000ms) and swarm worker is actively working: turn stays open.
     await new Promise((r) => setTimeout(r, 100));
     server.text("Coordinator kicked off workers.");
     server.respondPrompt();
     await expect(turnReply).resolves.toMatchObject({ text: "Coordinator kicked off workers.", sessionId: "swarm-sess-1" });
 
-    // Wait longer than idleWorkerTtlMs (30ms) + idleSweepIntervalMs (10ms): idle reaper MUST NOT close ACP session while workers active!
+    // Wait longer than idleWorkerTtlMs (30ms) + idleSweepIntervalMs (10ms) while within swarmMaxDurationMs: idle reaper MUST NOT close ACP session while workers actively work!
     await new Promise((r) => setTimeout(r, 80));
     expect(harness.log.some((entry) => entry.startsWith("close:"))).toBe(false);
     expect(adapter.hasPendingNativeWork()).toBe(true);
@@ -473,7 +474,7 @@ describe("AntigravityAcpAdapter /swarm lifecycle", () => {
     expect(boardReply.text).toContain("@auth-audit");
     expect(server.prompts).toHaveLength(1);
 
-    // @worker message is sent unwrapped ahead of private context.
+    // @worker message is sent unwrapped ahead of private context; active-turn worker approval & elicitation are bridged with workerName attribution.
     const directMention = adapter.sendUserMessage("swarm-sess-1", {
       text: "@auth-audit prioritize OAuth callback",
       files: [],
@@ -489,23 +490,34 @@ describe("AntigravityAcpAdapter /swarm lifecycle", () => {
     await waitFor(() => server.prompts.length === 2);
     const mentionBlocks = server.prompts[1]!.params!.prompt as Array<{ text: string }>;
     expect(mentionBlocks[0]!.text).toBe("@auth-audit prioritize OAuth callback");
-    server.text("Noted for @auth-audit.");
-    server.respondPrompt();
-    await directMention;
 
-    // Post-coordinator worker approval request arrives AFTER coordinator turn finished: must be forwarded with workerName instead of auto-declined!
     const permId = server.requestPermission({ workerName: "auth-audit", command: "npx vitest auth" });
     await waitFor(() => server.clientResponses.has(permId));
     expect(approvals.at(-1)?.workerName).toBe("auth-audit");
     expect(server.clientResponses.get(permId)?.result).toEqual({ outcome: { outcome: "selected", optionId: "allow" } });
 
-    // Post-coordinator elicitation/create maps cleanly to AskUserQuestion with workerName and returns accept content!
     const elicitId = server.requestElicitation({ workerName: "auth-audit" });
     await waitFor(() => pendingQuestions.length === 1);
     expect(pendingQuestions[0]!.req.workerName).toBe("auth-audit");
     pendingQuestions[0]!.resolve({ behavior: "allow", updatedInput: { answers: { "Pick a database engine for auth": "PostgreSQL" } } });
     await waitFor(() => server.clientResponses.has(elicitId));
     expect(server.clientResponses.get(elicitId)?.result).toEqual({ action: "accept", content: { db: "postgres" } });
+
+    server.text("Noted for @auth-audit.");
+    server.respondPrompt();
+    await directMention;
+
+    // Orphan approval & elicitation requests arriving AFTER no turn owns the session MUST be rejected/declined cleanly (never borrow a previous turn's handler!).
+    const approvalCountBeforeOrphan = approvals.length;
+    const orphanPermId = server.requestPermission({ workerName: "auth-audit", command: "rm -rf /tmp/never" });
+    await waitFor(() => server.clientResponses.has(orphanPermId));
+    expect(server.clientResponses.get(orphanPermId)?.result).toEqual({ outcome: { outcome: "selected", optionId: "deny" } });
+    expect(approvals).toHaveLength(approvalCountBeforeOrphan);
+
+    const orphanElicitId = server.requestElicitation({ workerName: "auth-audit" });
+    await waitFor(() => server.clientResponses.has(orphanElicitId));
+    expect(server.clientResponses.get(orphanElicitId)?.result).toEqual({ action: "decline" });
+    expect(approvals).toHaveLength(approvalCountBeforeOrphan);
 
     // Card renderer shows @worker attribution clearly.
     const card = renderCoreApprovalCard({ requestId: "r1", toolName: "run_command", workerName: "auth-audit", locale: "en" });
@@ -530,6 +542,165 @@ describe("AntigravityAcpAdapter /swarm lifecycle", () => {
     const afterStop = await adapter.listTasks("swarm-sess-1");
     expect(afterStop.swarm?.active).toBe(false);
     expect(afterStop.swarm?.members.find((m) => m.name === "auth-audit")?.state).toBe("killed");
+  });
+
+  it("enforces hard total turn timeout and background swarm ceiling even while swarm workers stay working", async () => {
+    const env = await setupEnv();
+
+    // 1. Active turn with working swarm: inactivity timeout is paused, BUT hard total turnTimeoutMs ALWAYS fires.
+    const turnHarness = createSwarmHarness();
+    const turnAdapter = new AntigravityAcpAdapter("agy", {
+      ...env,
+      spawnFn: turnHarness.spawnFn,
+      killProcessTreeFn: turnHarness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+      inactivityTimeoutMs: 35,
+      turnTimeoutMs: 120,
+      swarmMaxDurationMs: 500,
+      idleSweepIntervalMs: 0,
+      closeTimeoutMs: 50,
+    });
+    adapters.push(turnAdapter);
+
+    const activeTurn = turnAdapter.sendUserMessage("tarobot-1", {
+      text: "/swarm hard total cap test",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => turnHarness.children[0]?.server.prompts.length === 1);
+    turnHarness.children[0]!.server.advertiseCommands();
+    await writeSwarmFiles(env.brainDir, "swarm-sess-1", {
+      members: { title: "Long swarm", members: [{ name: "builder", role: "worker", state: "working" }] },
+    });
+
+    await expect(activeTurn).rejects.toThrow(/timed out/i);
+    expect(turnHarness.log).toContain("close:swarm-sess-1");
+    const afterTurnTimeout = await turnAdapter.listTasks("swarm-sess-1");
+    expect(afterTurnTimeout.swarm?.active).toBe(false);
+    expect(afterTurnTimeout.swarm?.statusText).toBe("Swarm timed out");
+
+    // 2. Post-turn background swarm: hard swarmMaxDurationMs ceiling closes worker even when workers keep working and emit activity.
+    const bgEnv = await setupEnv();
+    const bgHarness = createSwarmHarness();
+    const bgAdapter = new AntigravityAcpAdapter("agy", {
+      ...bgEnv,
+      spawnFn: bgHarness.spawnFn,
+      killProcessTreeFn: bgHarness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+      idleWorkerTtlMs: 2_000,
+      idleSweepIntervalMs: 25,
+      inactivityTimeoutMs: 500,
+      turnTimeoutMs: 2_000,
+      swarmMaxDurationMs: 130,
+      closeTimeoutMs: 50,
+    });
+    adapters.push(bgAdapter);
+
+    const launch = bgAdapter.sendUserMessage("tarobot-2", {
+      text: "/swarm background cap test",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => bgHarness.children[0]?.server.prompts.length === 1);
+    const bgServer = bgHarness.children[0]!.server;
+    bgServer.advertiseCommands();
+    await writeSwarmFiles(bgEnv.brainDir, "swarm-sess-1", {
+      members: { title: "Background swarm", members: [{ name: "runner", role: "worker", state: "working" }] },
+    });
+    bgServer.text("Dispatched.");
+    bgServer.respondPrompt();
+    await launch;
+    expect(bgAdapter.hasPendingNativeWork()).toBe(true);
+
+    // Keep emitting heartbeats so lastActivityAt stays fresh — swarmMaxDurationMs MUST still close the session!
+    const pulse = setInterval(() => {
+      bgServer.sendUpdate({ sessionUpdate: "usage_update", used: 100, size: 10_000 });
+    }, 30);
+    try {
+      await waitFor(() => bgHarness.log.includes("close:swarm-sess-1"), 1_500);
+    } finally {
+      clearInterval(pulse);
+    }
+    expect(bgAdapter.hasPendingNativeWork()).toBe(false);
+    const afterBgCap = await bgAdapter.listTasks("swarm-sess-1");
+    expect(afterBgCap.swarm?.active).toBe(false);
+    expect(afterBgCap.swarm?.statusText).toBe("Swarm timed out");
+  });
+
+  it.each(["paused", "waiting"] as const)("does not grant infinite lifetime to %s-only idle swarms (inactivity, idle reaper, drain)", async (idleState) => {
+    // 1. Active turn with paused/waiting-only swarm: inactivityTimeoutMs fires normally (does NOT wait for 6h total cap).
+    const turnEnv = await setupEnv();
+    const turnHarness = createSwarmHarness();
+    const turnAdapter = new AntigravityAcpAdapter("agy", {
+      ...turnEnv,
+      spawnFn: turnHarness.spawnFn,
+      killProcessTreeFn: turnHarness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+      inactivityTimeoutMs: 50,
+      turnTimeoutMs: 5_000,
+      swarmMaxDurationMs: 5_000,
+      idleSweepIntervalMs: 0,
+      closeTimeoutMs: 50,
+    });
+    adapters.push(turnAdapter);
+
+    const turnPromise = turnAdapter.sendUserMessage("tarobot-1", {
+      text: "/swarm quota pause test",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => turnHarness.children[0]?.server.prompts.length === 1);
+    turnHarness.children[0]!.server.advertiseCommands();
+    await writeSwarmFiles(turnEnv.brainDir, "swarm-sess-1", {
+      members: {
+        title: "Idle swarm",
+        members: [
+          { name: "worker-a", role: "worker", state: idleState },
+          { name: "monitor", role: "monitor", state: idleState === "paused" ? "working" : "waiting" },
+        ],
+      },
+    });
+    await expect(turnPromise).rejects.toThrow(/inactive/i);
+    expect(turnHarness.log).toContain("close:swarm-sess-1");
+
+    // 2. Post-turn idle worker with paused/waiting-only swarm: does NOT block drain and IS reaped after idleWorkerTtlMs.
+    const idleEnv = await setupEnv();
+    const idleHarness = createSwarmHarness();
+    const idleAdapter = new AntigravityAcpAdapter("agy", {
+      ...idleEnv,
+      spawnFn: idleHarness.spawnFn,
+      killProcessTreeFn: idleHarness.killProcessTreeFn,
+      supportsSwarmFn: async () => true,
+      idleWorkerTtlMs: 40,
+      idleSweepIntervalMs: 15,
+      inactivityTimeoutMs: 5_000,
+      turnTimeoutMs: 5_000,
+      swarmMaxDurationMs: 5_000,
+      closeTimeoutMs: 50,
+    });
+    adapters.push(idleAdapter);
+
+    const launch = idleAdapter.sendUserMessage("tarobot-2", {
+      text: "/swarm idle reap test",
+      files: [],
+      onApprovalRequest: async () => ({ behavior: "allow", scope: "once" }),
+    });
+    await waitFor(() => idleHarness.children[0]?.server.prompts.length === 1);
+    const server = idleHarness.children[0]!.server;
+    server.advertiseCommands();
+    await writeSwarmFiles(idleEnv.brainDir, "swarm-sess-1", {
+      members: {
+        title: "Idle post-turn swarm",
+        members: [{ name: "worker-a", role: "worker", state: idleState }],
+      },
+    });
+    server.text("Launched.");
+    server.respondPrompt();
+    await launch;
+
+    expect(idleAdapter.hasPendingNativeWork()).toBe(false);
+    await waitFor(() => idleHarness.log.includes("close:swarm-sess-1"), 1_500);
+    expect(idleHarness.log).toContain("close:swarm-sess-1");
   });
 
   it("supports Antigravity AskUserQuestion approval cards with workerName attribution and Gateway tasks.stop swarm", async () => {

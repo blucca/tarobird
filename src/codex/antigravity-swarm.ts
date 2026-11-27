@@ -35,6 +35,7 @@ export type AcpSwarmMember = SwarmMember & {
 export type AcpSwarmState = {
   active: boolean;
   stoppedByUser: boolean;
+  timedOut?: boolean;
   title?: string;
   startedAt: number;
   updatedAt: number;
@@ -131,6 +132,16 @@ export function swarmStateToEngineStatus(state: SwarmMemberState): EngineTask["s
 
 export function isSwarmMemberActive(state: SwarmMemberState): boolean {
   return state === "working" || state === "waiting" || state === "paused";
+}
+
+/** True only when swarm work is genuinely executing (`working` primary workers, or freshly launched empty roster).
+ * Permanently `paused` (quota-exhausted) or all-`waiting` idle swarms are NOT actively executing. */
+export function hasActiveSwarmExecution(snapshot: SwarmSnapshot | undefined): boolean {
+  if (!snapshot?.active) return false;
+  if (snapshot.members.length === 0) return true;
+  const primary = snapshot.members.filter((m) => !m.helper);
+  const pool = primary.length > 0 ? primary : snapshot.members;
+  return pool.some((m) => m.state === "working");
 }
 
 export function swarmTaskId(sessionId: string, name: string): string {
@@ -550,6 +561,7 @@ export function mergeSwarmSnapshots(
 ): SwarmSnapshot | undefined {
   if (!acpSwarm && !fileSwarm.found) return undefined;
 
+  const terminated = Boolean(acpSwarm?.stoppedByUser || acpSwarm?.timedOut);
   const byName = new Map<string, AcpSwarmMember>();
   for (const member of fileSwarm.members) {
     byName.set(member.name.toLowerCase(), { ...member });
@@ -568,7 +580,7 @@ export function mergeSwarmSnapshots(
           name: existing.name || member.name,
           role: (acpNewer ? member.role : existing.role) ?? member.role ?? existing.role,
           ...(existing.helper || member.helper ? { helper: true } : {}),
-          state: acpSwarm.stoppedByUser && isSwarmMemberActive(existing.state)
+          state: terminated && isSwarmMemberActive(existing.state)
             ? "killed"
             : member.inferredState && existing.state !== "unknown"
               ? existing.state
@@ -583,7 +595,7 @@ export function mergeSwarmSnapshots(
   }
 
   const members = [...byName.values()].map((m): SwarmMember => {
-    const state = acpSwarm?.stoppedByUser && isSwarmMemberActive(m.state) ? "killed" : m.state;
+    const state = terminated && isSwarmMemberActive(m.state) ? "killed" : m.state;
     return {
       name: m.name,
       ...(m.role ? { role: m.role } : {}),
@@ -601,7 +613,7 @@ export function mergeSwarmSnapshots(
   const posts = [...postMap.values()].sort((a, b) => a.createdAt - b.createdAt).slice(-MAX_SWARM_POSTS);
 
   const hasLiveMember = members.some((m) => isSwarmMemberActive(m.state));
-  const active = acpSwarm?.stoppedByUser
+  const active = terminated
     ? false
     : Boolean(hasLiveMember || fileSwarm.active || (acpSwarm?.active && members.length === 0));
   const title = fileSwarm.title ?? acpSwarm?.title;
@@ -614,9 +626,11 @@ export function mergeSwarmSnapshots(
   ) || Date.now();
   const statusText = acpSwarm?.stoppedByUser
     ? "Stopped by user"
-    : active
-      ? (members.length ? undefined : "Swarm running")
-      : undefined;
+    : acpSwarm?.timedOut
+      ? "Swarm timed out"
+      : active
+        ? (members.length ? undefined : "Swarm running")
+        : undefined;
 
   void options.sessionId;
   return {
@@ -827,7 +841,11 @@ export function renderSwarmBoardSummary(snapshot: SwarmSnapshot | undefined, loc
   const title = snapshot.title ? `Swarm · ${snapshot.title}` : "Swarm";
   const status = snapshot.active
     ? (locale === "en" ? "Active" : "进行中")
-    : (snapshot.statusText === "Stopped by user" ? (locale === "en" ? "Stopped" : "已停止") : (locale === "en" ? "Finished" : "已结束"));
+    : (snapshot.statusText === "Stopped by user"
+      ? (locale === "en" ? "Stopped" : "已停止")
+      : snapshot.statusText === "Swarm timed out"
+        ? (locale === "en" ? "Timed out" : "已超时")
+        : (locale === "en" ? "Finished" : "已结束"));
   const lines = [`**${title}** (${status})`];
   if (snapshot.members.length) {
     lines.push("", locale === "en" ? "**Members**" : "**成员状态**");

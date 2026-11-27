@@ -30,6 +30,7 @@ import {
   applySwarmAcpUpdate,
   emptyParsedSwarmFiles,
   extractWorkerAttribution,
+  hasActiveSwarmExecution,
   isSwarmMemberActive,
   isSwarmToolName,
   mergeSwarmSnapshots,
@@ -122,6 +123,8 @@ export type AntigravityAcpAdapterOptions = {
   idleSweepIntervalMs?: number;
   turnTimeoutMs?: number | null;
   inactivityTimeoutMs?: number | null;
+  /** Hard total wall-clock ceiling for an active swarm (default: 6h, aligned with turnTimeoutMs). */
+  swarmMaxDurationMs?: number;
 };
 
 type RuntimeConfig = {
@@ -226,14 +229,11 @@ type Worker = {
   reserved: boolean;
   /** The latest turn's event handler; idle wake-ups without an owner report through it. */
   lastTurnHandler?: CodexUserMessageInput["onEngineEvent"];
-  /** Preserved approval handler for post-coordinator swarm/background worker requests. */
-  lastApprovalHandler?: CodexUserMessageInput["onApprovalRequest"];
-  /** Preserved locale from the latest turn for post-turn elicitation prompts. */
-  lastLocale?: "en" | "zh";
-  /** Aborted when the worker is closed or the user stops the swarm. */
-  backgroundApprovals: AbortController;
   /** Active/recent swarm state observed over ACP for this session. */
   swarm?: AcpSwarmState & { ownerTurn?: Turn };
+  /** Hard ceiling timer enforcing swarmMaxDurationMs on active swarms. */
+  swarmTimer?: ReturnType<typeof setTimeout>;
+  swarmTimerDeadline?: number;
   /** Cached stat/parse result for synchronous board-file checks. */
   swarmFileCache?: SwarmBoardFileCache;
   /** Waiters unblocked if this worker closes while waiting for available_commands_update. */
@@ -266,6 +266,7 @@ const DEFAULT_IDLE_WORKER_TTL_MS = 2 * 60 * 60_000;
 const DEFAULT_IDLE_SWEEP_INTERVAL_MS = 60_000;
 export const ANTIGRAVITY_ACP_TURN_TIMEOUT_MS = 6 * 60 * 60_000;
 export const ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS = 30 * 60_000;
+export const ANTIGRAVITY_ACP_SWARM_MAX_DURATION_MS = 6 * 60 * 60_000;
 const STOPPED_BY_USER = "Task was stopped by user";
 const DEFAULT_STEER_ADMISSION_TIMEOUT_MS = 10_000;
 const DEFAULT_COMMANDS_ADVERTISE_TIMEOUT_MS = 750;
@@ -623,6 +624,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private readonly idleWorkerTtlMs: number;
   private readonly turnTimeoutMs: number | null;
   private readonly inactivityTimeoutMs: number | null;
+  private readonly swarmMaxDurationMs: number;
   private readonly sweepTimer: ReturnType<typeof setInterval> | undefined;
   private reaping = false;
   private destroyPromise: Promise<void> | undefined;
@@ -632,8 +634,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private commandsReceived = false;
   private readonly commandWaiters = new Set<() => void>();
   private swarmVersionSupported: Promise<boolean> | undefined;
-  /** Sessions whose active swarm was stopped by user, surviving worker close so listTasks reflects killed state over stale files. */
-  private readonly stoppedSwarmSessions = new Set<string>();
+  /** Sessions whose active swarm was stopped or timed out, surviving worker close so listTasks reflects ended state over stale files. */
+  private readonly endedSwarmSessions = new Map<string, "stopped" | "timeout">();
   private readonly quotaCache: AdapterQuotaCache;
 
   constructor(private readonly executable: string, private readonly options: AntigravityAcpAdapterOptions) {
@@ -654,6 +656,11 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     this.idleWorkerTtlMs = options.idleWorkerTtlMs ?? DEFAULT_IDLE_WORKER_TTL_MS;
     this.turnTimeoutMs = options.turnTimeoutMs === undefined ? ANTIGRAVITY_ACP_TURN_TIMEOUT_MS : options.turnTimeoutMs;
     this.inactivityTimeoutMs = options.inactivityTimeoutMs === undefined ? ANTIGRAVITY_ACP_INACTIVITY_TIMEOUT_MS : options.inactivityTimeoutMs;
+    const explicitSwarmMax = options.swarmMaxDurationMs !== undefined && Number.isFinite(options.swarmMaxDurationMs) && options.swarmMaxDurationMs > 0
+      ? options.swarmMaxDurationMs
+      : undefined;
+    this.swarmMaxDurationMs = explicitSwarmMax
+      ?? (this.turnTimeoutMs && this.turnTimeoutMs > 0 ? Math.min(ANTIGRAVITY_ACP_SWARM_MAX_DURATION_MS, this.turnTimeoutMs) : ANTIGRAVITY_ACP_SWARM_MAX_DURATION_MS);
     const interval = options.idleSweepIntervalMs ?? DEFAULT_IDLE_SWEEP_INTERVAL_MS;
     if (this.idleWorkerTtlMs > 0 && interval > 0) {
       this.sweepTimer = setInterval(() => { void this.reapIdleWorkers(); }, interval);
@@ -731,11 +738,15 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   hasPendingNativeWork(): boolean {
+    const now = Date.now();
     for (const worker of new Set(this.workers.values())) {
       if (worker.removed || worker.closing) continue;
       if (worker.turn || worker.reserved || worker.pendingPermissions > 0 || worker.wake) return true;
-      this.syncSwarmFromFilesSync(worker);
-      if (worker.swarm?.active && !worker.swarm.stoppedByUser) return true;
+      const fileSwarm = this.syncSwarmFromFilesSync(worker);
+      if (worker.swarm && this.isSwarmWithinHardCap(worker.swarm, now)) {
+        const merged = mergeSwarmSnapshots(worker.swarm, fileSwarm, { sessionId: worker.sessionId ?? undefined });
+        if (hasActiveSwarmExecution(merged)) return true;
+      }
       for (const tool of worker.tools.values()) {
         if (tool.background && (tool.status === "pending" || tool.status === "in_progress")) return true;
       }
@@ -764,12 +775,22 @@ export class AntigravityAcpAdapter implements CodexAdapter {
 
     const rawFileSwarm = await readSwarmBoardFiles(this.brainDir, effectiveSessionId);
     const fileSwarm = worker ? this.syncSwarmFromFileResult(worker, rawFileSwarm) : rawFileSwarm;
-    const stoppedFallback: AcpSwarmState | undefined = !worker?.swarm && (this.stoppedSwarmSessions.has(effectiveSessionId) || this.stoppedSwarmSessions.has(sessionId))
-      ? { active: false, stoppedByUser: true, startedAt: fileSwarm.updatedAt, updatedAt: Date.now(), members: new Map(), posts: [] }
+    const endedReason = this.endedSwarmSessions.get(effectiveSessionId) ?? this.endedSwarmSessions.get(sessionId);
+    const endedFallback: AcpSwarmState | undefined = !worker?.swarm && endedReason
+      ? {
+          active: false,
+          stoppedByUser: endedReason === "stopped",
+          ...(endedReason === "timeout" ? { timedOut: true } : {}),
+          startedAt: fileSwarm.updatedAt,
+          updatedAt: Date.now(),
+          members: new Map(),
+          posts: [],
+        }
       : undefined;
-    const swarm = mergeSwarmSnapshots(worker?.swarm ?? stoppedFallback, fileSwarm, { sessionId: effectiveSessionId });
-    if (worker?.swarm && !worker.swarm.stoppedByUser && swarm) {
+    const swarm = mergeSwarmSnapshots(worker?.swarm ?? endedFallback, fileSwarm, { sessionId: effectiveSessionId });
+    if (worker?.swarm && !worker.swarm.stoppedByUser && !worker.swarm.timedOut && swarm) {
       worker.swarm.active = swarm.active;
+      this.syncSwarmCeilingTimer(worker);
     }
     const tasks: EngineTask[] = swarmMembersToEngineTasks(effectiveSessionId, swarm, worker?.swarm?.startedAt);
 
@@ -810,18 +831,18 @@ export class AntigravityAcpAdapter implements CodexAdapter {
 
     if (swarmActive) {
       if (worker.swarm) {
-        this.markSwarmStopped(worker.swarm, worker.sessionId);
+        this.markSwarmEnded(worker.swarm, "stopped", worker.sessionId);
       } else {
         worker.swarm = {
           active: false, stoppedByUser: true, startedAt: Date.now(), updatedAt: Date.now(), members: new Map(), posts: [],
         };
-        if (worker.sessionId) this.stoppedSwarmSessions.add(worker.sessionId);
+        if (worker.sessionId) this.endedSwarmSessions.set(worker.sessionId, "stopped");
       }
-      this.stoppedSwarmSessions.add(sessionId);
+      this.endedSwarmSessions.set(sessionId, "stopped");
+      this.clearSwarmCeilingTimer(worker);
     }
     if (worker.wake?.timer) clearTimeout(worker.wake.timer);
     worker.wake = null;
-    worker.backgroundApprovals.abort();
     if (worker.sessionId && !worker.exited) {
       void worker.connection.agent.notify(acpMethods.agent.session.cancel, { sessionId: worker.sessionId }).catch(() => undefined);
     }
@@ -998,7 +1019,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       .connect(stream);
     worker = {
       child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, reserved: false,
-      backgroundApprovals: new AbortController(), commandCloseWaiters: new Set(), wake: null, promptSeq: 0,
+      commandCloseWaiters: new Set(), wake: null, promptSeq: 0,
       tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), removed: false, exited: false,
     };
     this.workers.set(requestedId, worker);
@@ -1129,14 +1150,9 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       this.flushWake(worker);
       worker.turn = turn;
       worker.lastTurnHandler = input.onEngineEvent;
-      if (input.locale) worker.lastLocale = input.locale;
-      if (input.onApprovalRequest) {
-        worker.lastApprovalHandler = input.onApprovalRequest;
-        if (worker.backgroundApprovals.signal.aborted) worker.backgroundApprovals = new AbortController();
-      }
       const swarmCmd = parseSwarmCommand(input.text);
       if (swarmCmd?.task) {
-        if (worker.sessionId) this.stoppedSwarmSessions.delete(worker.sessionId);
+        if (worker.sessionId) this.endedSwarmSessions.delete(worker.sessionId);
         worker.swarmFileCache = undefined;
         const baselineMembersSig = worker.sessionId ? snapshotSwarmMembersFileSync(this.brainDir, worker.sessionId) : undefined;
         const now = Date.now();
@@ -1151,8 +1167,10 @@ export class AntigravityAcpAdapter implements CodexAdapter {
           members: new Map(),
           posts: [],
         };
-      } else if (worker.swarm?.active && input.onEngineEvent) {
+        this.syncSwarmCeilingTimer(worker);
+      } else if (worker.swarm?.active && !worker.swarm.stoppedByUser && !worker.swarm.timedOut && input.onEngineEvent) {
         worker.swarm.ownerTurn = turn;
+        this.syncSwarmCeilingTimer(worker);
       }
       if (worker.announceSession) {
         worker.announceSession = false;
@@ -1253,6 +1271,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     turn.approvals.abort();
     for (const entry of turn.prompts) entry.admission?.(undefined);
     worker.lastActivityAt = Date.now();
+    this.syncSwarmCeilingTimer(worker);
     const text = reply ?? turn.text.trim();
     if (!error) this.emit(turn, { type: "result", text, sessionId: worker.sessionId! });
     void turn.eventChain.then(() => {
@@ -1261,18 +1280,65 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     });
   }
 
-  private markSwarmStopped(swarm: AcpSwarmState, sessionId?: string | null): void {
+  private markSwarmEnded(swarm: AcpSwarmState, reason: "stopped" | "timeout", sessionId?: string | null): void {
     const now = Date.now();
     swarm.active = false;
-    swarm.stoppedByUser = true;
+    if (reason === "stopped") swarm.stoppedByUser = true;
+    else swarm.timedOut = true;
     swarm.updatedAt = now;
-    if (sessionId) this.stoppedSwarmSessions.add(sessionId);
+    if (sessionId) this.endedSwarmSessions.set(sessionId, reason);
     for (const member of swarm.members.values()) {
       if (member.state === "working" || member.state === "waiting" || member.state === "paused") {
         member.state = "killed";
         member.updatedAt = now;
       }
     }
+  }
+
+  private isSwarmWithinHardCap(swarm: AcpSwarmState | undefined, now = Date.now()): boolean {
+    if (!swarm || !swarm.active || swarm.stoppedByUser || swarm.timedOut) return false;
+    return now - swarm.startedAt < this.swarmMaxDurationMs;
+  }
+
+  private clearSwarmCeilingTimer(worker: Worker): void {
+    if (worker.swarmTimer) clearTimeout(worker.swarmTimer);
+    worker.swarmTimer = undefined;
+    worker.swarmTimerDeadline = undefined;
+  }
+
+  private syncSwarmCeilingTimer(worker: Worker): void {
+    const swarm = worker.swarm;
+    if (!swarm || !swarm.active || swarm.stoppedByUser || swarm.timedOut || worker.removed || worker.closing) {
+      this.clearSwarmCeilingTimer(worker);
+      return;
+    }
+    const deadline = swarm.startedAt + this.swarmMaxDurationMs;
+    if (worker.swarmTimer && worker.swarmTimerDeadline === deadline) return;
+    this.clearSwarmCeilingTimer(worker);
+    const startedAt = swarm.startedAt;
+    const remaining = Math.max(0, deadline - Date.now());
+    worker.swarmTimerDeadline = deadline;
+    worker.swarmTimer = setTimeout(() => {
+      void this.onSwarmHardTimeout(worker, startedAt);
+    }, remaining);
+    worker.swarmTimer.unref?.();
+  }
+
+  private async onSwarmHardTimeout(worker: Worker, expectedStartedAt: number): Promise<void> {
+    this.clearSwarmCeilingTimer(worker);
+    if (worker.removed || worker.closing || !worker.swarm) return;
+    if (worker.swarm.startedAt !== expectedStartedAt || worker.swarm.stoppedByUser || worker.swarm.timedOut) return;
+    const stillActive = await this.isSwarmActive(worker);
+    if (!stillActive || worker.removed || worker.closing || !worker.swarm || worker.swarm.startedAt !== expectedStartedAt) return;
+    // Respect explicit /timeout off only while that turn is in flight; once it settles, syncSwarmCeilingTimer re-evaluates.
+    if (worker.turn && !worker.turn.done && worker.turn.timeoutsDisabled) return;
+    this.markSwarmEnded(worker.swarm, "timeout", worker.sessionId);
+    if (worker.wake?.timer) clearTimeout(worker.wake.timer);
+    worker.wake = null;
+    if (worker.sessionId && !worker.exited) {
+      void worker.connection.agent.notify(acpMethods.agent.session.cancel, { sessionId: worker.sessionId }).catch(() => undefined);
+    }
+    await this.closeWorker(worker, new Error(`Antigravity ACP swarm timed out after ${Math.max(1, Math.round(this.swarmMaxDurationMs / 60_000))} minutes`));
   }
 
   private hasOpenBackgroundTools(worker: Worker): boolean {
@@ -1283,7 +1349,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   private isStaleInactiveFileSwarm(swarm: AcpSwarmState, fileSwarm: ParsedSwarmFiles): boolean {
-    if (!swarm.active || swarm.stoppedByUser || !fileSwarm.found || fileSwarm.active) return false;
+    if (!swarm.active || swarm.stoppedByUser || swarm.timedOut || !fileSwarm.found || fileSwarm.active) return false;
     if (fileSwarm.membersMtimeMs !== undefined && fileSwarm.membersMtimeMs < swarm.startedAt) return true;
     if (fileSwarm.updatedAt > 0 && fileSwarm.updatedAt < swarm.startedAt) return true;
     if (
@@ -1303,14 +1369,16 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
     if (!fileSwarm.found) return fileSwarm;
     if (worker.swarm) {
-      if (!worker.swarm.stoppedByUser) {
+      if (!worker.swarm.stoppedByUser && !worker.swarm.timedOut) {
         if (fileSwarm.active) {
           worker.swarm.active = true;
           if (fileSwarm.title && !worker.swarm.title) worker.swarm.title = fileSwarm.title;
+          this.syncSwarmCeilingTimer(worker);
         } else if (fileSwarm.members.length > 0 || fileSwarm.explicitlyStopped) {
           const merged = mergeSwarmSnapshots(worker.swarm, fileSwarm, { sessionId: worker.sessionId ?? undefined });
           if (merged && !merged.active) {
             worker.swarm.active = false;
+            this.clearSwarmCeilingTimer(worker);
             for (const fileMember of fileSwarm.members) {
               const key = fileMember.name.toLowerCase();
               const existing = worker.swarm.members.get(key);
@@ -1321,17 +1389,22 @@ export class AntigravityAcpAdapter implements CodexAdapter {
           }
         }
       }
-    } else if (fileSwarm.active && worker.sessionId && !this.stoppedSwarmSessions.has(worker.sessionId)) {
-      const ts = fileSwarm.updatedAt || Date.now();
-      worker.swarm = {
-        active: true,
-        stoppedByUser: false,
-        ...(fileSwarm.title ? { title: fileSwarm.title } : {}),
-        startedAt: ts,
-        updatedAt: ts,
-        members: new Map(fileSwarm.members.map((m) => [m.name.toLowerCase(), { ...m }])),
-        posts: [...fileSwarm.posts],
-      };
+    } else if (fileSwarm.active && worker.sessionId && !this.endedSwarmSessions.has(worker.sessionId)) {
+      const now = Date.now();
+      const ts = fileSwarm.updatedAt || now;
+      // Ignore already-expired on-disk swarm files from earlier processes instead of killing a freshly resumed session.
+      if (now - ts < this.swarmMaxDurationMs) {
+        worker.swarm = {
+          active: true,
+          stoppedByUser: false,
+          ...(fileSwarm.title ? { title: fileSwarm.title } : {}),
+          startedAt: ts,
+          updatedAt: ts,
+          members: new Map(fileSwarm.members.map((m) => [m.name.toLowerCase(), { ...m }])),
+          posts: [...fileSwarm.posts],
+        };
+        this.syncSwarmCeilingTimer(worker);
+      }
     }
     return fileSwarm;
   }
@@ -1372,29 +1445,35 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     });
   }
 
-  private async shouldUnwrapSwarmMention(worker: Worker, text: string): Promise<boolean> {
-    const target = extractLeadingMention(text);
-    if (!target || worker.swarm?.stoppedByUser) return false;
+  private async readMergedSwarm(worker: Worker) {
+    if (worker.swarm?.stoppedByUser || worker.swarm?.timedOut) return undefined;
     const rawFileSwarm = worker.sessionId ? await readSwarmBoardFiles(this.brainDir, worker.sessionId) : emptyParsedSwarmFiles();
     const fileSwarm = this.syncSwarmFromFileResult(worker, rawFileSwarm);
     const merged = mergeSwarmSnapshots(worker.swarm, fileSwarm, { sessionId: worker.sessionId ?? undefined });
-    if (worker.swarm && !worker.swarm.stoppedByUser && merged) {
+    if (worker.swarm && !worker.swarm.stoppedByUser && !worker.swarm.timedOut && merged) {
       worker.swarm.active = merged.active;
+      this.syncSwarmCeilingTimer(worker);
     }
+    return merged;
+  }
+
+  private async shouldUnwrapSwarmMention(worker: Worker, text: string): Promise<boolean> {
+    const target = extractLeadingMention(text);
+    if (!target) return false;
+    const merged = await this.readMergedSwarm(worker);
     if (!merged?.active) return false;
     if (merged.members.length === 0) return true;
     return merged.members.some((m) => m.name.toLowerCase() === target && (isSwarmMemberActive(m.state) || m.state === "unknown"));
   }
 
   private async isSwarmActive(worker: Worker): Promise<boolean> {
-    if (worker.swarm?.stoppedByUser) return false;
-    const rawFileSwarm = worker.sessionId ? await readSwarmBoardFiles(this.brainDir, worker.sessionId) : emptyParsedSwarmFiles();
-    const fileSwarm = this.syncSwarmFromFileResult(worker, rawFileSwarm);
-    const merged = mergeSwarmSnapshots(worker.swarm, fileSwarm, { sessionId: worker.sessionId ?? undefined });
-    if (worker.swarm && !worker.swarm.stoppedByUser && merged) {
-      worker.swarm.active = merged.active;
-    }
-    return Boolean(merged?.active);
+    return Boolean((await this.readMergedSwarm(worker))?.active);
+  }
+
+  private async hasGenuinelyActiveSwarmWithinCap(worker: Worker): Promise<boolean> {
+    const merged = await this.readMergedSwarm(worker);
+    if (!merged || !hasActiveSwarmExecution(merged)) return false;
+    return this.isSwarmWithinHardCap(worker.swarm);
   }
 
   private requestStop(turn: Turn, killOptions?: { graceMs: number }): void {
@@ -1404,12 +1483,12 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     turn.approvals.abort();
     const worker = turn.worker;
     this.syncSwarmFromFilesSync(worker);
-    const swarmKnownActive = Boolean(worker.swarm?.active && !worker.swarm.stoppedByUser);
+    const swarmKnownActive = Boolean(worker.swarm?.active && !worker.swarm.stoppedByUser && !worker.swarm.timedOut);
     if (swarmKnownActive && worker.swarm) {
-      this.markSwarmStopped(worker.swarm, worker.sessionId);
+      this.markSwarmEnded(worker.swarm, "stopped", worker.sessionId);
+      this.clearSwarmCeilingTimer(worker);
       if (worker.wake?.timer) clearTimeout(worker.wake.timer);
       worker.wake = null;
-      worker.backgroundApprovals.abort();
     }
     if (!turn.prompts.length) {
       this.settleTurn(turn, new Error(STOPPED_BY_USER));
@@ -1432,11 +1511,11 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   private async checkAndCloseSwarmOnStop(worker: Worker, turn: Turn, killOptions?: { graceMs: number }): Promise<void> {
-    if (worker.removed || worker.closing || !worker.sessionId || worker.swarm?.stoppedByUser) return;
+    if (worker.removed || worker.closing || !worker.sessionId || worker.swarm?.stoppedByUser || worker.swarm?.timedOut) return;
     const rawFileSwarm = await readSwarmBoardFiles(this.brainDir, worker.sessionId);
     const fileSwarm = this.syncSwarmFromFileResult(worker, rawFileSwarm);
     if (!fileSwarm.active || worker.removed || worker.closing || !turn.stopRequested) return;
-    if (worker.sessionId) this.stoppedSwarmSessions.add(worker.sessionId);
+    if (worker.sessionId) this.endedSwarmSessions.set(worker.sessionId, "stopped");
     worker.swarm = {
       active: false,
       stoppedByUser: true,
@@ -1446,9 +1525,9 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       members: new Map(),
       posts: [],
     };
+    this.clearSwarmCeilingTimer(worker);
     if (worker.wake?.timer) clearTimeout(worker.wake.timer);
     worker.wake = null;
-    worker.backgroundApprovals.abort();
     await this.closeWorker(worker, new Error(STOPPED_BY_USER), killOptions);
   }
 
@@ -1468,11 +1547,12 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     turn.totalTimer.unref?.();
   }
 
+  /** Hard total turn ceiling: never re-armed indefinitely, even while a swarm is active. */
   private async onTotalTimeout(turn: Turn): Promise<void> {
     if (turn.done || turn.stopRequested || turn.worker.removed) return;
-    if (await this.isSwarmActive(turn.worker)) {
-      this.armTotalTimeout(turn);
-      return;
+    if (turn.worker.swarm?.active && !turn.worker.swarm.stoppedByUser && !turn.worker.swarm.timedOut) {
+      this.markSwarmEnded(turn.worker.swarm, "timeout", turn.worker.sessionId);
+      this.clearSwarmCeilingTimer(turn.worker);
     }
     await this.closeWorker(turn.worker, new Error(`Antigravity ACP turn timed out after ${Math.max(1, Math.round(this.turnTimeoutMs! / 60_000))} minutes`));
   }
@@ -1487,11 +1567,17 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     turn.inactivityTimer.unref?.();
   }
 
+  /** Pause inactivity only while swarm work is genuinely executing and within the hard total ceiling.
+   * Permanently `paused` (quota-exhausted) or all-`waiting` idle swarms do not bypass inactivity timeout. */
   private async onInactivityTimeout(turn: Turn): Promise<void> {
     if (turn.done || turn.stopRequested || turn.worker.removed) return;
-    if (await this.isSwarmActive(turn.worker)) {
+    if (await this.hasGenuinelyActiveSwarmWithinCap(turn.worker)) {
       this.armInactivity(turn);
       return;
+    }
+    if (turn.worker.swarm?.active && !turn.worker.swarm.stoppedByUser && !turn.worker.swarm.timedOut) {
+      this.markSwarmEnded(turn.worker.swarm, "timeout", turn.worker.sessionId);
+      this.clearSwarmCeilingTimer(turn.worker);
     }
     await this.closeWorker(turn.worker, new Error(`Antigravity ACP turn became inactive after ${Math.max(1, Math.round(this.inactivityTimeoutMs! / 60_000))} minutes`));
   }
@@ -1538,7 +1624,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (kind === "tool_call" || kind === "tool_call_update") this.trackTool(worker, update, turn);
     const isExplicitSwarmUpdate = (typeof kind === "string" && kind.startsWith("swarm"))
       || isSwarmToolName(update.name);
-    if (isExplicitSwarmUpdate && !worker.swarm?.stoppedByUser) {
+    if (isExplicitSwarmUpdate && !worker.swarm?.stoppedByUser && !worker.swarm?.timedOut) {
       const now = Date.now();
       const rawStatus = typeof update.status === "string" ? update.status.trim().toLowerCase() : "";
       const initialActive = !(typeof kind === "string" && kind.startsWith("swarm") && ["done", "completed", "stopped", "killed", "finished"].includes(rawStatus));
@@ -1552,7 +1638,8 @@ export class AntigravityAcpAdapter implements CodexAdapter {
         posts: [],
       };
       applySwarmAcpUpdate(worker.swarm, update, now);
-    } else if (worker.swarm?.active && !worker.swarm.stoppedByUser) {
+      this.syncSwarmCeilingTimer(worker);
+    } else if (worker.swarm?.active && !worker.swarm.stoppedByUser && !worker.swarm.timedOut) {
       const toolCallId = typeof update.toolCallId === "string" ? update.toolCallId : undefined;
       const trackedWorker = toolCallId ? worker.tools.get(toolCallId)?.workerName : undefined;
       const attributed = extractWorkerAttribution({ _meta: update._meta, toolCall: update }, trackedWorker);
@@ -1593,7 +1680,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   private trackWake(worker: Worker, kind: unknown, update: Record<string, unknown>): void {
-    if (worker.swarm?.stoppedByUser) return;
+    if (worker.swarm?.stoppedByUser || worker.swarm?.timedOut) return;
     if (kind !== "agent_message_chunk" && kind !== "agent_thought_chunk" && kind !== "tool_call" && kind !== "tool_call_update" && kind !== "usage_update") return;
     if (kind === "usage_update" && !worker.wake) return;
     const wake = worker.wake ??= { text: "", openTools: new Set() };
@@ -1630,7 +1717,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     if (!wake) return;
     worker.wake = null;
     if (wake.timer) clearTimeout(wake.timer);
-    if (worker.swarm?.stoppedByUser) return;
+    if (worker.swarm?.stoppedByUser || worker.swarm?.timedOut) return;
     const text = wake.text.trim();
     const handler = wake.owner ?? worker.lastTurnHandler;
     if (!text || !handler || !worker.sessionId) return;
@@ -1677,39 +1764,20 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
   }
 
-  private async resolveApprovalContext(worker: Worker, workerName: string | undefined): Promise<{
-    turn: Turn | null;
-    handler: CodexUserMessageInput["onApprovalRequest"] | undefined;
-    signal: AbortSignal;
-    isBackground: boolean;
-  }> {
-    const turn = worker.turn;
-    if (turn && !turn.done && !turn.stopRequested) {
-      return { turn, handler: turn.onApprovalRequest, signal: turn.approvals.signal, isBackground: false };
-    }
-    // After the coordinator turn finishes, swarm workers or background tasks may still request approvals or ask questions.
-    const canRouteBackground = Boolean(worker.lastApprovalHandler)
-      && !worker.backgroundApprovals.signal.aborted
-      && !worker.swarm?.stoppedByUser
-      && (Boolean(workerName) || this.hasOpenBackgroundTools(worker) || await this.isSwarmActive(worker));
-    if (canRouteBackground) {
-      return { turn: null, handler: worker.lastApprovalHandler, signal: worker.backgroundApprovals.signal, isBackground: true };
-    }
-    return { turn: null, handler: undefined, signal: worker.backgroundApprovals.signal, isBackground: false };
-  }
-
   private async handlePermission(worker: Worker, request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     if (!worker || worker.removed || request.sessionId !== worker.sessionId) return { outcome: { outcome: "cancelled" } };
     this.markActivity(worker);
     const option = (kind: string) => request.options.find((candidate) => candidate.kind === kind)?.optionId;
     const reject = option("reject_once");
+    const turn = worker.turn;
+    // A request made while no turn owns this session (an idle wake-up or post-turn
+    // worker) has no owner who could answer it: it is declined, never borrowed by another turn.
+    if (!turn || turn.done || turn.stopRequested || !turn.onApprovalRequest) {
+      return reject ? { outcome: { outcome: "selected", optionId: reject } } : { outcome: { outcome: "cancelled" } };
+    }
     const toolCall = request.toolCall as unknown as Record<string, unknown>;
     const trackedTool = typeof toolCall.toolCallId === "string" ? worker.tools.get(toolCall.toolCallId) : undefined;
     const workerName = extractWorkerAttribution(request, trackedTool?.workerName);
-    const ctx = await this.resolveApprovalContext(worker, workerName);
-    if (!ctx.handler) {
-      return reject ? { outcome: { outcome: "selected", optionId: reject } } : { outcome: { outcome: "cancelled" } };
-    }
     const rawName = typeof toolCall.name === "string" && toolCall.name ? toolCall.name : typeof toolCall.title === "string" && toolCall.title ? toolCall.title : "Antigravity tool";
     const rawInputRecord = asRecord(toolCall.rawInput);
     const isQuestion = rawName === "AskUserQuestion" || rawName === "ask_user_question" || Array.isArray(rawInputRecord?.questions);
@@ -1732,24 +1800,22 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       ...(workerName ? { workerName } : {}),
       cwd: worker.workspacePath,
       sessionId: worker.sessionId!,
-      abortSignal: ctx.signal,
+      abortSignal: turn.approvals.signal,
       approvalScopes: allow ? { once: "once" } : {},
     };
     if (typeof toolCall.toolCallId === "string") {
-      const permEvent: EngineStreamEvent = { type: "permission_request", toolName, toolInput: approval.toolInput, toolUseId: toolCall.toolCallId, sessionId: worker.sessionId! };
-      if (ctx.turn) this.emit(ctx.turn, permEvent);
-      else if (worker.lastTurnHandler) void Promise.resolve(worker.lastTurnHandler(permEvent)).catch(() => undefined);
+      this.emit(turn, { type: "permission_request", toolName, toolInput: approval.toolInput, toolUseId: toolCall.toolCallId, sessionId: worker.sessionId! });
     }
     worker.pendingPermissions += 1;
     let decision: EngineApprovalDecision;
     try {
-      decision = await ctx.handler(approval);
+      decision = await turn.onApprovalRequest(approval);
     } catch {
       decision = { behavior: "deny" };
     } finally {
       worker.pendingPermissions = Math.max(0, worker.pendingPermissions - 1);
     }
-    if (ctx.signal.aborted || (ctx.turn && ctx.turn.done) || worker.removed || worker.closing) return { outcome: { outcome: "cancelled" } };
+    if (turn.done || turn.stopRequested || worker.removed || worker.closing) return { outcome: { outcome: "cancelled" } };
     if (decision.behavior === "allow") {
       if (isQuestion) {
         const answers = asRecord(asRecord(decision.updatedInput)?.answers);
@@ -1761,7 +1827,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
         return { outcome: { outcome: "selected", optionId: allow } };
       }
     }
-    if (decision.behavior === "deny" && ctx.turn) ctx.turn.declinedAt = ctx.turn.text.length;
+    if (decision.behavior === "deny") turn.declinedAt = turn.text.length;
     return reject ? { outcome: { outcome: "selected", optionId: reject } } : { outcome: { outcome: "cancelled" } };
   }
 
@@ -1770,15 +1836,17 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       return { action: "cancel" };
     }
     this.markActivity(worker);
+    const turn = worker.turn;
+    // An elicitation request arriving while no turn owns this session has no
+    // owner who could answer it: decline cleanly rather than borrowing a previous turn's handler.
+    if (!turn || turn.done || turn.stopRequested || !turn.onApprovalRequest) return { action: "decline" };
     const workerName = extractWorkerAttribution(request);
-    const ctx = await this.resolveApprovalContext(worker, workerName);
-    if (!ctx.handler) return { action: "decline" };
 
     const properties = request.requestedSchema.properties ?? {};
     const entries = Object.entries(properties);
     if (!entries.length) return { action: "decline" };
     const required = new Set(request.requestedSchema.required ?? []);
-    const isZh = (ctx.turn?.locale ?? worker.lastLocale) === "zh";
+    const isZh = turn.locale === "zh";
     const answerKeys = new Set<string>();
     const fieldMap: Array<{
       key: string;
@@ -1889,18 +1957,18 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       ...(workerName ? { workerName } : {}),
       cwd: worker.workspacePath,
       sessionId: worker.sessionId!,
-      abortSignal: ctx.signal,
+      abortSignal: turn.approvals.signal,
     };
     worker.pendingPermissions += 1;
     let decision: EngineApprovalDecision;
     try {
-      decision = await ctx.handler(approval);
+      decision = await turn.onApprovalRequest(approval);
     } catch {
       decision = { behavior: "deny" };
     } finally {
       worker.pendingPermissions = Math.max(0, worker.pendingPermissions - 1);
     }
-    if (ctx.signal.aborted || (ctx.turn && ctx.turn.done) || worker.removed || worker.closing) return { action: "cancel" };
+    if (turn.done || turn.stopRequested || worker.removed || worker.closing) return { action: "cancel" };
     if (decision.behavior !== "allow") return { action: "decline" };
     const answers = asRecord(asRecord(decision.updatedInput)?.answers) ?? {};
     const content: Record<string, ElicitationContentValue> = {};
@@ -1964,7 +2032,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
 
   private removeWorker(worker: Worker): void {
     worker.removed = true;
-    worker.backgroundApprovals.abort();
+    this.clearSwarmCeilingTimer(worker);
     for (const notify of worker.commandCloseWaiters) notify();
     worker.commandCloseWaiters.clear();
     worker.rejectStart?.(worker.failure ?? new Error("Antigravity ACP worker is no longer available"));
@@ -2000,7 +2068,12 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     try {
       const now = Date.now();
       for (const worker of new Set(this.workers.values())) {
-        if (worker.removed || worker.turn || worker.reserved || now - worker.lastActivityAt < this.idleWorkerTtlMs) continue;
+        if (worker.removed || worker.turn || worker.reserved) continue;
+        if (worker.swarm?.active && !worker.swarm.stoppedByUser && !worker.swarm.timedOut && !this.isSwarmWithinHardCap(worker.swarm, now)) {
+          await this.onSwarmHardTimeout(worker, worker.swarm.startedAt);
+          continue;
+        }
+        if (now - worker.lastActivityAt < this.idleWorkerTtlMs) continue;
         if (!await this.isReapable(worker)) continue;
         void this.closeWorker(worker);
       }
@@ -2009,12 +2082,12 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     }
   }
 
-  /** Closing a session stops its background commands and swarm workers, so a session still running one is kept.
-   * An open wake-up is delivered by closeWorker; a live one keeps the worker active anyway. */
+  /** Closing a session stops its background commands and swarm workers, so a session still running one is kept
+   * while genuinely executing and within the hard swarm ceiling. Permanently paused/idle swarms are reapable. */
   private async isReapable(worker: Worker): Promise<boolean> {
     if (worker.pendingPermissions > 0) return false;
     if (this.hasOpenBackgroundTools(worker)) return false;
-    if (await this.isSwarmActive(worker)) return false;
+    if (await this.hasGenuinelyActiveSwarmWithinCap(worker)) return false;
     return true;
   }
 

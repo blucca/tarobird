@@ -9,6 +9,8 @@ describe("client protocol v1 boundaries", () => {
     expect(capabilities.length).toBeLessThanOrEqual(64);
     expect(SERVER_CAPABILITIES).toContain("pi.session.v1");
     expect(CAPABILITIES).not.toContain("pi.session.v1");
+    expect(SERVER_CAPABILITIES).toContain("conversations.tasks.swarm.v1");
+    expect(CAPABILITIES).not.toContain("conversations.tasks.swarm.v1");
     expect(parseClientFrame(JSON.stringify({ v: 1, type: "hello", deviceId: "device", protocolVersions: [1], capabilities, cursors: {}, nonce: "a".repeat(32) }))).toHaveProperty("frame.type", "hello");
   });
   it("keeps queue cancellation status out of copied and indexed prompt text", () => {

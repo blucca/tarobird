@@ -294,7 +294,8 @@ export function ConversationWorkspace({
 
     if (directBot) {
       if (connection.state.engineTasksAvailable && directBot.online) {
-        void connection.http(`/api/conversations/${encodeURIComponent(convId)}/tasks?botId=${encodeURIComponent(directBot.id)}`, { signal: abort.signal })
+        // `swarmTasks=1`: opt into post-1.6.0 Swarm task metadata and board snapshots; older Hosts ignore it.
+        void connection.http(`/api/conversations/${encodeURIComponent(convId)}/tasks?botId=${encodeURIComponent(directBot.id)}&swarmTasks=1`, { signal: abort.signal })
           .then(raw => {
             if (abort.signal.aborted) return;
             const snap = engineTaskSnapshotSchema.parse(raw);

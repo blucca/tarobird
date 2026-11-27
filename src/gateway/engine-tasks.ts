@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { idSchema } from "../client-protocol/index.js";
-import { engineSessionRecoverySchema, engineTaskSnapshotSchema, engineTaskStopSchema, engineTaskControlResultSchema } from "../client-protocol/engine-tasks.js";
+import { SWARM_TASKS_CAPABILITY, stripSwarmTaskFields, engineSessionRecoverySchema, engineTaskSnapshotSchema, engineTaskStopSchema, engineTaskControlResultSchema } from "../client-protocol/engine-tasks.js";
 import { buildCoreConversationKey, stableCoreNumericId } from "../core/message-normalizer.js";
 import { resolveCoreLocale } from "../core/locale.js";
 import type { CoreBridgeLike } from "../core/types.js";
@@ -18,7 +18,9 @@ export function gatewayEngineTasks(bridge: CoreBridgeLike, channel: GatewayChann
       if (!await channel.canSteerConversation?.(conversationId)) return { supported: true, tasks: [] };
       const conversationKey = buildCoreConversationKey(conversationId);
       const snapshot = engineTaskSnapshotSchema.parse(await bridge.listTasks({ chatId: stableCoreNumericId(conversationKey), conversationKey }));
-      return await channel.canSteerConversation?.(conversationId) ? snapshot : { supported: true, tasks: [] };
+      if (!await channel.canSteerConversation?.(conversationId)) return { supported: true, tasks: [] };
+      const hubCapabilities = channel.transport?.capabilities;
+      return hubCapabilities && !hubCapabilities.includes(SWARM_TASKS_CAPABILITY) ? stripSwarmTaskFields(snapshot) : snapshot;
     }
     if (method === "tasks.recover") {
       const p = engineSessionRecoverySchema.omit({ botId: true }).extend({ conversationId: idSchema, userId: idSchema }).strict().parse(raw);
