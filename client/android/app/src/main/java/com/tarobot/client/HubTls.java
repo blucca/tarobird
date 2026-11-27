@@ -122,6 +122,21 @@ final class HubTls implements AutoCloseable {
             if (!verifier.verifySignature(signature)) throw new IOException("tls_identity_mismatch");
         } catch (Exception error) { throw new IOException("tls_identity_mismatch", error); }
     }
+    static void edgeProof(byte[] data, String key, String nonce, String canonicalOrigin) throws IOException {
+        try {
+            if (data.length > MAX_PROOF) throw new IOException("tls_identity_too_large");
+            JSONObject value = new JSONObject(new String(data, StandardCharsets.UTF_8));
+            if (value.length() != 6 || !(value.opt("v") instanceof Number) || ((Number)value.opt("v")).doubleValue() != 1
+                || !"edge.identity".equals(value.opt("type")) || !key.equals(value.opt("publicKey")) || !nonce.equals(value.opt("nonce"))
+                || !canonicalOrigin.equals(value.opt("origin")) || !(value.opt("signature") instanceof String)) throw new IOException("tls_identity_mismatch");
+            byte[] signature = decode(value.getString("signature"));
+            if (signature.length != 64) throw new IOException("tls_identity_mismatch");
+            byte[] message = ("[\"tarocub/edge-identity/v1\",\"" + key + "\",\"" + nonce + "\",\"" + canonicalOrigin + "\"]").getBytes(StandardCharsets.UTF_8);
+            Ed25519Signer verifier = new Ed25519Signer(); verifier.init(false, new Ed25519PublicKeyParameters(key(key), 0));
+            verifier.update(message, 0, message.length);
+            if (!verifier.verifySignature(signature)) throw new IOException("tls_identity_mismatch");
+        } catch (Exception error) { throw new IOException("tls_identity_mismatch", error); }
+    }
     private OkHttpClient client(HttpUrl base, X509Certificate pinned) throws IOException {
         try {
             final byte[] expected = pinned == null ? null : digest(pinned.getEncoded());
@@ -158,6 +173,13 @@ final class HubTls implements AutoCloseable {
         } catch (Exception error) { throw new IOException("native_transport_unavailable", error); }
     }
     Route prepare(String raw, String publicKey, String authority, Track track) throws IOException {
+        return prepare(raw, publicKey, authority, false, track);
+    }
+    Route prepare(String raw, String publicKey, String authority, boolean edgeTls, Track track) throws IOException {
+        if (edgeTls) {
+            if (authority != null) throw new IOException("invalid_host_authority");
+            return prepareEdge(raw, publicKey, track);
+        }
         if(authority==null) return prepare(raw,publicKey,track);
         if(authority.length()>4096) throw new IOException("invalid_host_authority");
         String id=origin(raw)+"\0"+publicKey+"\0"+authority;
@@ -202,6 +224,35 @@ final class HubTls implements AutoCloseable {
                 byte[] data = bounded(response.body().byteStream(), MAX_PROOF);
                 proof(data, publicKey, nonce, certificate.getEncoded());
                 Route next = new Route(base, client(base, certificate));
+                if (entry.route != null) entry.route.retire(); entry.route = next; return next;
+            } catch (IOException error) { throw error; }
+            catch (Exception error) { throw new IOException("tls_identity_mismatch", error); }
+            finally { bootstrap.connectionPool().evictAll(); bootstrap.dispatcher().executorService().shutdown(); }
+        }
+    }
+    Route prepareEdge(String raw, String publicKey, Track track) throws IOException {
+        HttpUrl base = origin(raw);
+        key(publicKey);
+        String canonical = base.toString();
+        if (canonical.endsWith("/")) canonical = canonical.substring(0, canonical.length() - 1);
+        String identity = "edge\0" + routeIdentity(base, publicKey);
+        Entry entry;
+        synchronized (routes) {
+            if (!routes.containsKey(identity) && routes.size() >= 64) { for (Entry previous : routes.values()) if (previous.route != null) previous.route.retire(); routes.clear(); }
+            entry = routes.get(identity); if (entry == null) { entry = new Entry(); routes.put(identity, entry); }
+        }
+        synchronized (entry) {
+            if (entry.route != null && System.nanoTime() - entry.route.created < PIN_AGE_NANOS) return entry.route;
+            byte[] random = new byte[32]; new SecureRandom().nextBytes(random);
+            String nonce = Base64.toBase64String(random).replace('+','-').replace('/','_').replace("=","");
+            OkHttpClient bootstrap = client(base, null);
+            Call call = bootstrap.newCall(new Request.Builder().url(base.newBuilder().encodedPath("/api/edge-identity").addQueryParameter("nonce", nonce).addQueryParameter("origin", canonical).build()).build());
+            call.timeout().timeout(5, TimeUnit.SECONDS); track.call(call);
+            try (Response response = call.execute()) {
+                if (response.code() != 200 || response.body() == null || response.handshake() == null) throw new IOException("hub_tls_identity_required");
+                byte[] data = bounded(response.body().byteStream(), MAX_PROOF);
+                edgeProof(data, publicKey, nonce, canonical);
+                Route next = new Route(base, client(base, null));
                 if (entry.route != null) entry.route.retire(); entry.route = next; return next;
             } catch (IOException error) { throw error; }
             catch (Exception error) { throw new IOException("tls_identity_mismatch", error); }
@@ -284,8 +335,11 @@ final class HubTls implements AutoCloseable {
         if(failed==null) return;
         synchronized(authorities) { for(HubTls scoped:authorities.values()) scoped.forget(origin,key,failed); }
         try { synchronized(routes) {
-            String identity=routeIdentity(origin(origin),key); Entry entry=routes.get(identity);
-            if(entry!=null && entry.route==failed) { routes.remove(identity); failed.retire(); }
+            String identity=routeIdentity(origin(origin),key);
+            for(String candidate:Arrays.asList(identity,"edge\0"+identity)) {
+                Entry entry=routes.get(candidate);
+                if(entry!=null && entry.route==failed) { routes.remove(candidate); failed.retire(); }
+            }
         } } catch(IOException ignored) { }
     }
     public void close() { synchronized(authorities) { for(HubTls scoped:authorities.values()) scoped.close(); authorities.clear(); } synchronized (routes) { for (Entry entry : routes.values()) if (entry.route != null) entry.route.retire(); routes.clear(); } }

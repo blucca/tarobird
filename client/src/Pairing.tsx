@@ -1,6 +1,7 @@
 import { anySignal, timeoutSignal } from "./abort-signals.js";
 import { pairingClockOffset, pairingRemaining } from "./pairing-time.js";
 import { defaultDeviceName } from "./device-presentation.js";
+import { isDirectRoute, isRelayRoute } from "../../src/client-protocol/routes.js";
 import { rememberRouteTrust } from "./route-trust.js";
 import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import { ArrowLeft, ChevronLeft, ClipboardPaste, ImagePlus, LoaderCircle, Monitor, QrCode, ShieldCheck, Smartphone } from "lucide-react";
@@ -104,9 +105,9 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     const next: PendingPairing = { code: "", expiresAt: 0, request: { invite: payload.invite!, requestId: randomNonce() } };
     void (async () => {
       const snapshot = { ...targetConnection.identity };
-      const scannedDirects = payload.routes.filter(route => route.name !== "VPS");
+      const scannedDirects = payload.routes.filter(isDirectRoute);
       const unchanged = !scannedDirects.length || scannedDirects.every(direct =>
-        snapshot.routes.some(route => route.name !== "VPS" && route.url === direct.url && route.certificateAuthority === direct.certificateAuthority)
+        snapshot.routes.some(route => isDirectRoute(route) && route.url === direct.url && route.certificateAuthority === direct.certificateAuthority)
       );
       let repair;
       if (!unchanged) {
@@ -142,12 +143,12 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     setDeployment(payload.deployment);
     // Same bookkeeping as a scanned code: the candidate list always belongs to
     // the details shown, never to an earlier scan of another host.
-    const directRoutes = payload.routes.filter((r) => r.name !== "VPS");
+    const directRoutes = payload.routes.filter(isDirectRoute);
     setImportedRoutes(payload.routes);
     setImportedDirects(directRoutes);
     setLegacyDirect(directRoutes[0]);
     setAddress(directRoutes[0]?.url ?? "");
-    setRelays(payload.routes.filter((r) => r.name === "VPS"));
+    setRelays(payload.routes.filter(isRelayRoute));
     setExpectedKey(payload.hubPublicKey);
     setManual(false);
     setOptionsOpen(false);
@@ -352,6 +353,13 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     setInvite(undefined); setExpectedKey(undefined); setManualKey(""); setDeployment(undefined); setLegacyDirect(undefined); setImportedDirects([]); setImportedRoutes([]); setRelays([]);
     setAddress(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""); setManual(platform === "web"); setOptionsOpen(false); setHostName(t("我的主机"));
   };
+  const relaySummary = (() => {
+    const hasCf = relays.some(route => route.name === "Cloudflare");
+    const hasVps = relays.some(route => route.name === "VPS");
+    if (hasCf && hasVps) return t("VPS 中转 · Cloudflare Tunnel");
+    if (hasCf) return "Cloudflare Tunnel";
+    return t("VPS 中转");
+  })();
   const routeHint = expectedKey && (tailscaleRoute || lanRoute) && <p className="pairing-route-hint">{tailscaleRoute ? t("此连接使用 Tailscale。这台设备也需连接同一 Tailscale 网络，并允许访问目标主机；仅复制地址不会自动建立连接。") : t("此连接包含局域网地址。人在外面时需有可用的 Tailscale 或 VPS 线路；家里的 Wi-Fi 地址通常无法从外部直接访问。")}</p>;
   if (desktop && !remote) return <Suspense fallback={<div className="loading-screen"><BrandMark/><LoaderCircle className="spin" size={16}/></div>}><DesktopWelcome localHostReady={localHostReady || !!preparedLocal} connected={connected} save={saveLocal} beforePair={beforePair} discard={discard} cancel={cancel ?? (preparedLocal ? () => { void Promise.resolve(connected(preparedLocal)).catch(e => showError(String(e))); } : undefined)} pending={!!pending} remote={() => setRemote(true)}/></Suspense>;
   return <main className="pairing-page"><div className="pairing-layout"><div className={`pairing-card${!pending && phone ? " pairing-phone-welcome" : ""}`}>
@@ -435,8 +443,8 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     }
     imported.current = true;
     setFromBrowserLink(false);
-    const directRoutes = payload.routes.filter((r) => r.name !== "VPS");
+    const directRoutes = payload.routes.filter(isDirectRoute);
     setInvite(payload.invite);
-    setDeployment(payload.deployment); setImportedRoutes(payload.routes); setImportedDirects(directRoutes); setLegacyDirect(directRoutes[0]); setAddress(directRoutes[0]?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); clearError(); setRouteFailure(undefined);
+    setDeployment(payload.deployment); setImportedRoutes(payload.routes); setImportedDirects(directRoutes); setLegacyDirect(directRoutes[0]); setAddress(directRoutes[0]?.url ?? ""); setRelays(payload.routes.filter(isRelayRoute)); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); clearError(); setRouteFailure(undefined);
   }}/></Suspense>}</main>;
 }

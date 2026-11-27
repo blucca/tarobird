@@ -1,7 +1,7 @@
 import { ExplanationList } from "./ExplanationList.js";
 import { deviceOperationError } from "./device-errors.js";
 import { routeDiagnosisMessage, routeHealthStatusLabel } from "./route-diagnostics.js";
-import { orderedRoutes } from "../../src/client-protocol/routes.js";
+import { isDirectRoute, isRelayRoute, orderedRoutes } from "../../src/client-protocol/routes.js";
 import { DeploymentGuide } from "./DeploymentGuide.js";
 import { multipathConfiguration } from "./connection-routes.js";
 import { DirectRouteFields, RelaySetupNote, VpsRouteFields, routeTitle } from "./RouteFields.js";
@@ -18,8 +18,8 @@ export function RoutesEditor({ connection, dirtyChange, busyChange, localHost = 
   useLocale();
   const state = useSyncExternalStore((notify) => connection.subscribe(notify), () => connection.state);
   const [editing, setEditing] = useState(false);
-  const [direct, setDirect] = useState<Route[]>(connection.identity.routes.filter((r) => r.name !== "VPS"));
-  const [relays, setRelays] = useState<Route[]>(connection.identity.routes.filter((r) => r.name === "VPS"));
+  const [direct, setDirect] = useState<Route[]>(connection.identity.routes.filter(isDirectRoute));
+  const [relays, setRelays] = useState<Route[]>(connection.identity.routes.filter(isRelayRoute));
   const [status, setStatus] = useState(""), [error, setError] = useState(""), [busy, setBusy] = useState(false), [repairBusy, setRepairBusy] = useState(false);
   const serialized = JSON.stringify({ direct, relays });
   const [baseline, setBaseline] = useState(serialized);
@@ -32,7 +32,7 @@ export function RoutesEditor({ connection, dirtyChange, busyChange, localHost = 
   useLayoutEffect(() => { busyChange?.(busy || repairBusy); }, [busy, repairBusy, busyChange]);
   const reset = () => {
     savedRoutes.current = JSON.stringify(connection.identity.routes);
-    const identity = connection.identity, nextDirect = identity.routes.filter((r) => r.name !== "VPS"), next = identity.routes.filter((r) => r.name === "VPS");
+    const identity = connection.identity, nextDirect = identity.routes.filter(isDirectRoute), next = identity.routes.filter(isRelayRoute);
     setDirect(nextDirect); setRelays(next);
     setBaseline(JSON.stringify({ direct: nextDirect, relays: next })); setError("");
   };

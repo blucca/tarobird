@@ -266,7 +266,7 @@ async function defaultPeerTransport(
   // POST: probe routes without private data first, then transmit ONCE on the proven route.
   for (let attempt = 0; ; attempt++) {
     let chosen: Route | undefined;
-    let pin = "";
+    let pin: string | undefined;
     let cached = false;
     let lastProbeError: unknown;
     for (const route of candidateRoutes) {

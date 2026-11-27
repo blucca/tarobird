@@ -48,12 +48,13 @@ function formatBitrate(kbps: number): string {
   return `${kbps} kbps`;
 }
 
-function resolveScreenRoute(routeName?: "Direct" | "Tailscale" | "VPS", udpStatus?: ScreenStatus["udpStatus"]): ScreenRouteKind {
+function resolveScreenRoute(routeName?: "Direct" | "Tailscale" | "VPS" | "Cloudflare", udpStatus?: ScreenStatus["udpStatus"]): ScreenRouteKind {
   if (udpStatus?.state === "connected") return udpStatus.route;
   if (routeName === "VPS") return "tcp_vps_relay";
   if (routeName === "Tailscale") return "tcp_tailscale";
   if (routeName === "Direct") return udpStatus?.route === "tcp_tailscale" ? "tcp_tailscale" : "tcp_lan_direct";
-  return udpStatus?.route ?? tcpRouteFromConnectionRoute(routeName);
+  // Cloudflare Tunnel has no screen route kind of its own: report the generic TCP kind.
+  return udpStatus?.route ?? tcpRouteFromConnectionRoute(routeName === "Cloudflare" ? undefined : routeName);
 }
 
 function ScreenMetricsOverlay({ metrics, activeRoute, udpRequested, udpConnected, fallbackWidth, fallbackHeight }: {

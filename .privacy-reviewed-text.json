@@ -1756,6 +1756,130 @@
           "fingerprint": "bdf9ce3b6fad26286e88dc74fe508107913344140b3282382d6ee4c290e7175c"
         }
       ]
+    },
+    {
+      "path": "client/e2e/device-invite.spec.ts",
+      "sha256": "4c716782bcb4b9de52b29b5daf63517473be166b33d25bc312fa088e2fcbbbdd",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale fixture addresses after adding Cloudflare route regression tests; no owner data or new exemptions.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/fixtures/device-invite.tsx",
+      "sha256": "a4b2abf6eac74add19bbda9dbdaa48217271a313579037ddd125473ea50114ca",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale fixture addresses after adding Cloudflare route regression tests; no owner data or new exemptions.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/fixtures/local-relay.tsx",
+      "sha256": "8d582c7cbf2589a6cc2e27764a378ec2bd679650d8eec0e6eff1af9805d63eb3",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale fixture addresses after adding Cloudflare route regression tests; no owner data or new exemptions.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/local-relay.spec.ts",
+      "sha256": "a8dd03abdc27d91d1a812e427ec5c35bb6e110f57a783134b776493a1e1a5093",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale fixture addresses after adding Cloudflare route regression tests; no owner data or new exemptions.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "tests/client-multipath-routes.test.ts",
+      "sha256": "a9b4988ca5990fea79026fc05ce17071683c91297ee5fc7c171cf5402a3291af",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale fixture addresses after adding Cloudflare route regression tests; no owner data or new exemptions.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "8308f3a233cf4bd3987f20880945ac60b08eacaa9e85391fd66c5919780196e3"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "63246b8fde0d7ce1f3ac7fdbf4b6c5e9aa9bd23d2d8156036cd57e4ce9308edb"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "258cca7a8e42d54d201f4528b4c562bef41b6ce9022a600d1d7639364a92abeb"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/fixtures/local-relay.tsx",
+      "sha256": "44054305b732a449217fb424a82f7d35e1f133ff1c09baae7315fc509d7bffe2",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale fixture address after updating Cloudflare edge-proxy fixture port and signed action helpers; no owner data or new exemptions.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/local-relay.spec.ts",
+      "sha256": "ff9f681b99e1c074a743538ef7bb62ea54b544117388bf3daab8cb602e69195c",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale fixture address after updating Cloudflare edge-proxy fixture port assertion; no owner data or new exemptions.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/device-invite.spec.ts",
+      "sha256": "d0244cef546374e5e9cb21ce3945ef886e3c328786c53b2c2a35fcf239dfd223",
+      "reviewer": "claude",
+      "note": "Re-reviewed the unchanged synthetic CGNAT Tailscale test addresses after hand-merging PR #129 onto the integration line (same address set as both parents); no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "tests/client-multipath-routes.test.ts",
+      "sha256": "12fc8045f00b267e2d2672b99a79f68ae6a753a5faa343b2f4cdedb757d53bf2",
+      "reviewer": "claude",
+      "note": "Re-reviewed the unchanged synthetic CGNAT Tailscale test addresses after hand-merging PR #129 onto the integration line (same address set as both parents); no real deployment or owner identity.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "8308f3a233cf4bd3987f20880945ac60b08eacaa9e85391fd66c5919780196e3"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "63246b8fde0d7ce1f3ac7fdbf4b6c5e9aa9bd23d2d8156036cd57e4ce9308edb"
+        },
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "258cca7a8e42d54d201f4528b4c562bef41b6ce9022a600d1d7639364a92abeb"
+        }
+      ]
     }
   ]
 }

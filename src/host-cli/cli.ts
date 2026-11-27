@@ -1,6 +1,7 @@
 import { historyCommandFailure, runHistoryCommand } from "./history.js";
 import { engineQuotaCommand, engineQuotaNotes } from "./engine-quota.js";
 import { screenCommand } from "./screens.js";
+import { runCloudflareCommand } from "./cloudflare.js";
 import { runWorkbenchCommand } from "./workbench.js";
 import { runConversationsCommand, runConversationPinsCommand } from './conversations.js';
 import { runBackupsCommand } from "./backups.js";
@@ -258,11 +259,16 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   devices rename ID --name N           修改此主机上的设备名称
                                       本机桌面端共用主机名称，请用 name <名称>
                                       撤销已入网设备会同步全网，不会让主机退出组网
-  pair [--lan | --tailscale | --routes FILE] [--address IP] [--v2] [--out FILE] [--wait SECONDS]
+  pair [--lan | --tailscale | --cloudflare | --routes FILE] [--address IP] [--v2] [--out FILE] [--wait SECONDS]
     需运行新版主机并登记 CLI 控制器（tarobot enroll）；生成 5 分钟有效、仅限一台新设备的邀请。
     默认生成只含一个直连地址的 v1 连接码，所有版本的 App 都能识别；电脑有多个地址时用 --address IP 选择。
     --v2 仅用于高于 1.6.0 的 App：--lan 自动排序并写入最多 4 条直连候选和已共享的中转，新设备会同时尝试；
     1.6.0 及更早的 App 无法识别 v2 连接码。
+  cloudflare status [--json]            查看 cloudflared、专用边缘回环端口、已授权域名与推荐命令
+  cloudflare set [--mode named|quick] [--protocol http2|quic] [--origins URL,URL | --clear-origins] [--from FILE] --yes
+  cloudflare allow|revoke HTTPS_ORIGIN --yes
+  cloudflare quick start [--protocol http2|quic] --yes | stop --yes
+    修改自建 Cloudflare Tunnel 配置或启停 Quick Tunnel 需使用本机已登记控制器并签名确认。
   network status | create --name N | routes --from FILE --yes
   network local [--tailscale] [--json] 只读查看本机局域网/Tailscale 线路与共享线路
   network select-lan --from FILE --yes 选择已监听的局域网线路，保留已共享的 Tailscale
@@ -328,7 +334,8 @@ export async function runHostCli(argv: string[]): Promise<void> {
     days: { type: "string" }, mode: { type: "string" }, adapter: { type: "string" }, "threshold-seconds": { type: "string" }, enabled: { type: "string" }, engine: { type: "string" }, model: { type: "string" }, effort: { type: "string" }, workspace: { type: "string" }, permission: { type: "string" },
     action: { type: "string" }, anchor: { type: "string" }, cursor: { type: "string" }, "request-id": { type: "string" }, "expected-name": { type: "string" }, yes: { type: "boolean" }, force: { type: "boolean" }, abandon: { type: "boolean" },
     wait: { type: "string" }, from: { type: "string" }, out: { type: "string" }, routes: { type: "string" },
-    lan: { type: "boolean" }, tailscale: { type: "boolean" }, address: { type: "string" }, v2: { type: "boolean" }, reset: { type: "boolean" },
+    lan: { type: "boolean" }, tailscale: { type: "boolean" }, cloudflare: { type: "boolean" }, address: { type: "string" }, v2: { type: "boolean" }, reset: { type: "boolean" },
+    protocol: { type: "string" }, origins: { type: "string" }, "clear-origins": { type: "boolean" },
     role: { type: "string" }, "dispatch-mode": { type: "string" }, "max-concurrent": { type: "string" }, allow: { type: "string" }, assist: { type: "string" }, status: { type: "string" }, note: { type: "string" }, open: { type: "boolean" }, match: { type: "string" }, offset: { type: "string" },
     folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, global: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
     "html-file": { type: "string" }, "report-file": { type: "string" }, title: { type: "string" }, summary: { type: "string" },
@@ -350,18 +357,19 @@ export async function runHostCli(argv: string[]): Promise<void> {
   if (command === "network" && !v.help && !["local", "select-lan", "status", "inspect", "recover", "create", "offer", "routes", "propose", "admit", "join", "reinstate", "leave", "remove"].includes(sub ?? "")) throw new Error("未知 network 命令。请执行 tarobot network --help。");
   if (v.help || !command || command === "help") { console.log(HOST_CLI_HELP); return; }
   if (extra.length) throw new Error("多余的位置参数。请执行 tarobot --help。");
-  const commands = ["history", "attachments", "screens", "workbench", "init", "run", "start", "stop", "restart", "status", "logs", "doctor", "enroll", "name", "drain", "drain-cancel", "service", "bots", "queue", "side", "tasks", "steer", "changes", "bus", "groups", "messages", "tickets", "widgets", "engines", "folders", "conversations", "devices", "pair", "network", "update", "backups", "backup", "restore", "directory", "integrations"];
+  const commands = ["history", "attachments", "screens", "cloudflare", "workbench", "init", "run", "start", "stop", "restart", "status", "logs", "doctor", "enroll", "name", "drain", "drain-cancel", "service", "bots", "queue", "side", "tasks", "steer", "changes", "bus", "groups", "messages", "tickets", "widgets", "engines", "folders", "conversations", "devices", "pair", "network", "update", "backups", "backup", "restore", "directory", "integrations"];
   if (!commands.includes(command)) throw new Error(`未知命令：${command}。请执行 tarobot --help。`);
   const allowed: Record<string, string[]> = {
     history: ["bot", "anchor", "message", "cursor", "revision", "request-id", "title", "action"],
     screens: ["from", "yes", "permission", "request-id"],
+    cloudflare: ["mode", "protocol", "origins", "clear-origins", "from", "yes"],
     workbench: ["from", "request-id", "context-message", "file"],
     engines: ["engine", "path", "revision", "request-id", "bot", "refresh"],
     backups: ["days", "revision", "request-id"],
     integrations: ["yes", "request-id", "mode", "enabled", "adapter", "threshold-seconds", "revision"], directory: ["from"], init: ["name"], stop: ["wait", "force"], restart: ["wait", "force"], enroll: ["reset", "yes"], name: ["name"], drain: ["wait"],
     service: ["yes"], bots: ["name", "engine", "model", "effort", "workspace", "permission", "request-id", "expected-name", "yes", "revision", "enabled", "role", "dispatch-mode", "max-concurrent", "allow", "from"],
     tickets: ["bot", "conversation", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
-    devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "v2", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale", "recover"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
+    devices: ["yes", "name"], pair: ["lan", "tailscale", "cloudflare", "address", "v2", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale", "recover"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
     folders: ["enabled", "revision", "unfiled"],
     conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session", "enabled", "global", "engine", "title", "workspace"],
     widgets: ["html-file", "report-file", "title", "summary", "request-id", "enabled", "revision"],
@@ -398,7 +406,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     }
     if (sub !== "pin" && (v.enabled !== undefined || v.global !== undefined)) throw new Error("--enabled 与 --global 仅支持 conversations pin。");
   }
-  const positionalLimit: Record<string, number> = { history: 3, screens: 3, workbench: 3, engines: 2, backups: 2, integrations: 3, directory: 2, name: 2, bots: 3, queue: 3, tasks: 3, steer: 3, side: 3, changes: 3, bus: 3, groups: 3, messages: 3, tickets: 3, widgets: 3, folders: 3, conversations: 2, devices: 3, service: 2, network: 3, update: 3, backup: 2, restore: 2 };
+  const positionalLimit: Record<string, number> = { history: 3, screens: 3, cloudflare: 3, workbench: 3, engines: 2, backups: 2, integrations: 3, directory: 2, name: 2, bots: 3, queue: 3, tasks: 3, steer: 3, side: 3, changes: 3, bus: 3, groups: 3, messages: 3, tickets: 3, widgets: 3, folders: 3, conversations: 2, devices: 3, service: 2, network: 3, update: 3, backup: 2, restore: 2 };
   if (command === "conversations" && (sub === "pi-session" || sub === "pin")) positionalLimit.conversations = 3;
   if (command === "bus" && ["list", "create", "prepare"].includes(sub ?? "")) positionalLimit.bus = 2;
   if (command === "bots" && ["list", "catalog", "create"].includes(sub ?? "") || command === "devices" && ["list", "pending", "invites"].includes(sub ?? "") || command === "network" && !["remove", "reinstate"].includes(sub ?? "") || command === "update" && sub !== "apply") positionalLimit[command] = 2;
@@ -706,7 +714,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
     await output(await hostUpdateStatus(directory)); return;
   }
   if (command === "pair") {
-    if (Number(!!v.lan) + Number(!!v.tailscale) + Number(!!v.routes) > 1) throw new Error("请选择一种配对线路来源。");
+    if (Number(!!v.lan) + Number(!!v.tailscale) + Number(!!v.cloudflare) + Number(!!v.routes) > 1) throw new Error("请选择一种配对线路来源。");
     if (v.address && !v.lan && !v.tailscale) throw new Error("--address 需与 --lan 或 --tailscale 一起使用。");
     const outputFile = v.out ? await open(path.resolve(v.out), "wx", 0o600) : undefined;
     let reserved: Stats | undefined, exported = false;
@@ -763,6 +771,14 @@ export async function runHostCli(argv: string[]): Promise<void> {
         }
         routes = localRoutesSchema.parse(selectPairingInviteRoutes(configured.routes, [], { candidates }));
       }
+    } else if (v.cloudflare) {
+      const client = await LocalHostClient.connect(directory);
+      try {
+        const cf = await runCloudflareCommand(client, "status", undefined, {});
+        const urls = [...new Set([...(cf.activeUrl ? [cf.activeUrl] : []), ...cf.origins])];
+        if (!urls.length) throw new Error("尚未配置已授权的 Cloudflare 域名或运行中的 Quick Tunnel。请先运行 tarobot cloudflare allow <HTTPS_ORIGIN> --yes 或 tarobot cloudflare quick start --yes。");
+        routes = routesSchema.parse(urls.map(url => ({ name: "Cloudflare" as const, url })));
+      } finally { client.close(); }
     } else if (v.routes) routes = (v.v2 ? localRoutesSchema : routesSchema).parse(await readJson(v.routes));
     else {
       const client = await LocalHostClient.connect(directory);
@@ -788,7 +804,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
       if (error instanceof Error && error.message === "pairing_invites_full") throw new Error("有效邀请或待确认设备过多。请用 tarobot devices invites 查看，再用 tarobot devices revoke-invite ID 撤销未使用的邀请，或等待 5 分钟后重试。");
       throw error;
     });
-    const link = hostPairingLink(service.publicKey, routes, invitation.invite, { version: v.v2 ? 2 : 1 });
+    const link = hostPairingLink(service.publicKey, routes, invitation.invite, v.cloudflare ? { version: 1, cloudflare: true } : { version: v.v2 ? 2 : 1 });
     if (outputFile) { await outputFile.writeFile(link + "\n"); await outputFile.sync(); exported = true; }
     if (v.json) await output({ host: await readHostProfile(directory), publicKey: service.publicKey, routes, ...(candidates ? { candidates } : {}), ...(windowsFirewall?.supported ? { windowsFirewall } : {}), link, inviteId: invitation.id, expiresAt: invitation.expiresAt, serverTime: invitation.serverTime });
     else {
@@ -964,6 +980,12 @@ export async function runHostCli(argv: string[]): Promise<void> {
       if (v.from && sub !== "configure" || v.permission && sub !== "allow") throw new Error("--from 仅支持 configure；--permission 仅支持 allow。");
       await output(await screenCommand(management.client, required(sub, "缺少 screens 子命令。"), argument, {
         yes: v.yes, permission: v.permission, requestId: v["request-id"], command: sub === "configure" ? await readJson(required(v.from, "缺少 --from 命令文件。")) : undefined,
+      })); return;
+    }
+    if (command === "cloudflare") {
+      await output(await runCloudflareCommand(management.client, required(sub, "缺少 cloudflare 子命令（status | set | allow | revoke | quick）。"), argument, {
+        yes: v.yes, mode: v.mode, protocol: v.protocol, origins: v.origins, clearOrigins: v["clear-origins"],
+        from: v.from ? await readJson(v.from) : undefined,
       })); return;
     }
     if (command === "devices") {

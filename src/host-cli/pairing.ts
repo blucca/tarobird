@@ -1,12 +1,13 @@
 import { pairingInviteTokenSchema } from "../client-protocol/pairing-invites.js";
 import qrcode from "qrcode-terminal";
-import { localRoutesSchema, routesSchema, type Route } from "../client-protocol/routes.js";
+import { isDirectRoute, localRoutesSchema, routesSchema, type Route } from "../client-protocol/routes.js";
 import { sharedRoutesSchema } from "../client-protocol/private-network.js";
+import { isLoopbackOrUnspecified } from "../client-protocol/loopback-address.js";
 
 /** A phone's one-time pairing route must not replace a configured network route. */
 export function pairingSharedRoutes(existing: Route[], selected: Route): Route[] {
   const current = sharedRoutesSchema.parse(existing), incoming = routesSchema.parse([selected])[0]!;
-  const direct = current.find(route => route.name !== "VPS");
+  const direct = current.find(isDirectRoute);
   if (direct) {
     if (direct.url !== incoming.url) return current;
     // Renew the certificate for the same endpoint, retaining the user's label.
@@ -50,12 +51,24 @@ export function hostPairingLink(
   publicKey: string,
   routes: Route[],
   invite: string,
-  options: { version?: 1 | 2 } = {},
+  options: { version?: 1 | 2; cloudflare?: boolean } = {},
 ): string {
   if (!/^[A-Za-z0-9+/]{59}=$/.test(publicKey)) throw new Error("主机身份公钥无效。");
   // A phone cannot connect to the computer's loopback, even if both use localhost.
+  if (options.cloudflare) {
+    // `pair --cloudflare`: authorized Cloudflare routes only, always a v1 payload
+    // (never mixed into a v2 multi-address code).
+    const parsed = routesSchema.parse(routes);
+    for (const route of parsed) {
+      const u = new URL(route.url);
+      if (u.protocol !== "https:" || isLoopbackOrUnspecified(u.hostname)) throw new Error("network_route_must_be_remote");
+    }
+    const link = `tarocub://pair?data=${encodeURIComponent(JSON.stringify({ v: 1, kind: "connect", hubPublicKey: publicKey, routes: parsed }))}&invite=${pairingInviteTokenSchema.parse(invite)}`;
+    if (link.length > 8192) throw new Error("配对信息过长，请减少同时分享的线路。");
+    return link;
+  }
   for (const route of routes) sharedRoutesSchema.parse([route]);
-  const directCount = routes.filter(route => route.name !== "VPS").length;
+  const directCount = routes.filter(isDirectRoute).length;
   const payload = options.version === 2 && directCount > 1
     ? (() => {
         const parsed = localRoutesSchema.parse(routes);

@@ -208,6 +208,21 @@ enum HubTLS {
         let decoded = try decode(signature)
         guard decoded.count == 64, verifier.isValidSignature(decoded, for: signed) else { throw HubNetworkError("tls_identity_mismatch") }
     }
+
+    static func verifyEdge(_ bytes: Data, publicKey: String, nonce: String, origin: String) throws {
+        let verifier = try self.publicKey(publicKey)
+        guard bytes.count <= proofLimit, let value = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              Set(value.keys) == Set(["v", "type", "publicKey", "nonce", "origin", "signature"]),
+              let version = value["v"] as? NSNumber, CFGetTypeID(version) != CFBooleanGetTypeID(), version.doubleValue == 1,
+              value["type"] as? String == "edge.identity", value["publicKey"] as? String == publicKey,
+              value["nonce"] as? String == nonce, value["origin"] as? String == origin,
+              let signature = value["signature"] as? String else {
+            throw HubNetworkError("tls_identity_mismatch")
+        }
+        let signed = Data("[\"tarocub/edge-identity/v1\",\"\(publicKey)\",\"\(nonce)\",\"\(origin)\"]".utf8)
+        let decoded = try decode(signature)
+        guard decoded.count == 64, verifier.isValidSignature(decoded, for: signed) else { throw HubNetworkError("tls_identity_mismatch") }
+    }
 }
 
 // All methods and delegate callbacks are confined to HubTLSSession.queue.
@@ -225,8 +240,10 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
     let queue: DispatchQueue
     let created = ProcessInfo.processInfo.systemUptime
     private let anchors: [SecCertificate]?
+    private let edgeTls: Bool
     private var observedLeaf: Data?
     private var pin: Data?
+    private var edgeVerified = false
     private var retired = false
     private var cancelled = false
     // Set only when a trust failure deliberately cancels this entire session.
@@ -260,8 +277,8 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
         return URLSession(configuration: configuration, delegate: delegate, delegateQueue: delegates)
     }
 
-    private init(base: URL, queue: DispatchQueue, anchors: [SecCertificate]?) {
-        self.base = base; self.queue = queue; self.anchors = anchors
+    private init(base: URL, queue: DispatchQueue, anchors: [SecCertificate]?, edgeTls: Bool = false) {
+        self.base = base; self.queue = queue; self.anchors = anchors; self.edgeTls = edgeTls
         super.init()
     }
 
@@ -270,14 +287,26 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
     static func prepare(origin: String, publicKey: String, queue: DispatchQueue, anchors: [SecCertificate]? = nil,
                         // Identity probe budget; slow cross-border VPN links need more than 5 s.
                         timeout: TimeInterval = 12,
+                        edgeTls: Bool = false,
                         completion: @escaping (Result<HubTLSSession, Error>) -> Void) throws -> HubTLSSession {
         dispatchPrecondition(condition: .onQueue(queue))
+        if edgeTls && anchors != nil { throw HubNetworkError("invalid_host_authority") }
         let base = try HubTLS.origin(origin)
         _ = try HubTLS.publicKey(publicKey)
         let nonce = try HubTLS.nonce()
-        let connection = HubTLSSession(base: base, queue: queue, anchors: anchors)
+        let connection = HubTLSSession(base: base, queue: queue, anchors: anchors, edgeTls: edgeTls)
         let probe = HubProofHandler(connection: connection, publicKey: publicKey, nonce: nonce, completion: completion)
-        var request = URLRequest(url: try HubTLS.target(base, "/api/tls-identity?nonce=" + nonce))
+        let canonical = base.absoluteString.hasSuffix("/") ? String(base.absoluteString.dropLast()) : base.absoluteString
+        let path: String
+        if edgeTls {
+            var comps = URLComponents()
+            comps.path = "/api/edge-identity"
+            comps.queryItems = [URLQueryItem(name: "nonce", value: nonce), URLQueryItem(name: "origin", value: canonical)]
+            path = comps.string ?? ("/api/edge-identity?nonce=" + nonce)
+        } else {
+            path = "/api/tls-identity?nonce=" + nonce
+        }
+        var request = URLRequest(url: try HubTLS.target(base, path))
         request.timeoutInterval = timeout
         let task = connection.session.dataTask(with: request)
         connection.handlers[task.taskIdentifier] = probe
@@ -292,7 +321,15 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
     }
 
     fileprivate func bindProof(_ bytes: Data, key: String, nonce: String) throws {
-        guard !retired, pin == nil, let leaf = observedLeaf else { throw HubNetworkError("native_tls_identity_unavailable") }
+        guard !retired else { throw HubNetworkError("native_tls_identity_unavailable") }
+        if edgeTls {
+            guard !edgeVerified else { throw HubNetworkError("native_tls_identity_unavailable") }
+            let canonical = base.absoluteString.hasSuffix("/") ? String(base.absoluteString.dropLast()) : base.absoluteString
+            try HubTLS.verifyEdge(bytes, publicKey: key, nonce: nonce, origin: canonical)
+            edgeVerified = true
+            return
+        }
+        guard pin == nil, let leaf = observedLeaf else { throw HubNetworkError("native_tls_identity_unavailable") }
         try HubTLS.verify(bytes, publicKey: key, nonce: nonce, certificate: leaf)
         // Only the no-credential proof task existed before this point. Reuse
         // its verified TLS connection and enforce this immutable pin on every
@@ -309,7 +346,7 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
 
     private func validate(_ request: URLRequest) throws {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard !retired, pin != nil else { throw HubNetworkError("native_route_not_verified") }
+        guard !retired, (pin != nil || edgeVerified) else { throw HubNetworkError("native_route_not_verified") }
         guard let url = request.url, url.scheme == "https", HubTLS.hostname(url) == HubTLS.hostname(base),
               url.port == base.port, url.user == nil, url.password == nil, url.fragment == nil else { throw HubNetworkError("invalid_hub_origin") }
         guard request.httpBody == nil else { throw HubNetworkError("native_single_use_body_required") }
@@ -337,7 +374,7 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
     /// route's verified identity/pin, but never the chat resource deadline.
     func screenConnection(control: HubTaskHandler, media: HubTaskHandler) throws -> HubScreenConnection {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard !retired, pin != nil else { throw HubNetworkError("native_route_not_verified") }
+        guard !retired, (pin != nil || edgeVerified) else { throw HubNetworkError("native_route_not_verified") }
         let connection = HubScreenConnection(owner: self, control: control, media: media)
         screenConnections[ObjectIdentifier(connection)] = connection
         return connection
@@ -346,7 +383,7 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
 
     func socket(handler: HubTaskHandler) throws -> URLSessionWebSocketTask {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard !retired, pin != nil else { throw HubNetworkError("native_route_not_verified") }
+        guard !retired, (pin != nil || edgeVerified) else { throw HubNetworkError("native_route_not_verified") }
         var parts = URLComponents(url: base, resolvingAgainstBaseURL: false)!
         parts.scheme = "wss"; parts.path = "/ws"
         var request = URLRequest(url: parts.url!)
@@ -401,10 +438,12 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
                 self.rejectTrust(code, completion); return
             }
             let leaf = SecCertificateCopyData(certificate) as Data
-            guard (self.pin == nil || self.pin == leaf), (self.observedLeaf == nil || self.observedLeaf == leaf) else {
-                self.rejectTrust("tls_identity_mismatch", completion); return
+            if !self.edgeTls {
+                guard (self.pin == nil || self.pin == leaf), (self.observedLeaf == nil || self.observedLeaf == leaf) else {
+                    self.rejectTrust("tls_identity_mismatch", completion); return
+                }
+                self.observedLeaf = leaf
             }
-            self.observedLeaf = leaf
             completion(.useCredential, URLCredential(trust: trust))
         }
         if status != errSecSuccess { rejectTrust("native_tls_untrusted", completion) }

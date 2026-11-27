@@ -98,7 +98,7 @@ final class HubTransport: @unchecked Sendable {
                 slot.screen = try HubScreenSession(queue: queue, activity: screenActivity, token: token, join: join, now: screenNow,
                     emit: { [weak self, weak slot] value in if let self = self, let slot = slot, self.owns(slot) { self.emit(slot, value) } },
                     failure: { [weak self, weak slot] reason in if let self = self, let slot = slot { self.finish(slot, HubNetworkError(reason)) } })
-                prepare(slot, try Self.text(network, "url"), try Self.text(network, "publicKey"), authority: network["certificateAuthority"] as? String) { connection in
+                prepare(slot, try Self.text(network, "url"), try Self.text(network, "publicKey"), authority: network["certificateAuthority"] as? String, edgeTls: (network["edgeTls"] as? Bool) ?? false) { connection in
                     guard self.screenActivity.permits(token), let screen = slot.screen else { throw HubNetworkError("screen_background") }
                     try screen.open(connection); slot.deadline?.cancel(); slot.deadline = nil
                     let callback = slot.openReply; slot.openReply = nil; callback?(.success([:]))
@@ -130,7 +130,7 @@ final class HubTransport: @unchecked Sendable {
                     let (request, bytes) = try Self.request(input)
                     guard bodyBytes + bytes <= 32 * 1024 * 1024 else { throw HubNetworkError("native_upload_backpressure") }
                     slot.bodyBytes = bytes; bodyBytes += bytes
-                    prepare(slot, origin, key, authority: input["certificateAuthority"] as? String) { connection in
+                    prepare(slot, origin, key, authority: input["certificateAuthority"] as? String, edgeTls: (input["edgeTls"] as? Bool) ?? false) { connection in
                         slot.openingTask = try connection.stream(request) { [weak self, weak slot] result in
                             guard let self = self, let slot = slot, self.owns(slot) else {
                                 if case .success(let stream) = result { stream.task.cancel() }; return
@@ -148,7 +148,7 @@ final class HubTransport: @unchecked Sendable {
                         }
                     }
                 } else {
-                    prepare(slot, try Self.text(args, "origin"), try Self.text(args, "hubKey"), authority: args["certificateAuthority"] as? String) { connection in
+                    prepare(slot, try Self.text(args, "origin"), try Self.text(args, "hubKey"), authority: args["certificateAuthority"] as? String, edgeTls: (args["edgeTls"] as? Bool) ?? false) { connection in
                         let handler = HubSocketHandler(owner: self, slot: slot)
                         let task = try connection.socket(handler: handler)
                         slot.handler = handler; slot.task = task; task.resume()
@@ -270,17 +270,18 @@ final class HubTransport: @unchecked Sendable {
     private func get(_ args: [String: Any], kind: String) throws -> HubSlot {
         guard let slot = slots[try Self.text(args, "id")], slot.kind == kind, owns(slot) else { throw HubNetworkError("native_request_cancelled") }; return slot
     }
-    private func prepare(_ slot: HubSlot, _ origin: String, _ key: String, authority: String? = nil, _ ready: @escaping (HubTLSSession) throws -> Void) {
+    private func prepare(_ slot: HubSlot, _ origin: String, _ key: String, authority: String? = nil, edgeTls: Bool = false, _ ready: @escaping (HubTLSSession) throws -> Void) {
         do {
             let base = try HubTLS.origin(origin); _ = try HubTLS.publicKey(key)
+            if edgeTls && authority != nil { throw HubNetworkError("invalid_host_authority") }
             slot.host = HubTLS.hostname(base)
-            var scopedAnchors = anchors
+            var scopedAnchors = edgeTls ? nil : anchors
             if let authority = authority {
                 guard authority.utf8.count <= 4096, let der = Data(base64Encoded: authority),
                       let certificate = SecCertificateCreateWithData(nil, der as CFData) else { throw HubNetworkError("invalid_host_authority") }
                 scopedAnchors = [certificate]
             }
-            let route = "\(HubTLS.hostname(base)):\(base.port ?? 443)\0\(key)\0\(authority ?? "")"; slot.route = route
+            let route = "\(edgeTls ? "edge\0" : "")\(HubTLS.hostname(base)):\(base.port ?? 443)\0\(key)\0\(authority ?? "")"; slot.route = route
             let callback: (Result<HubTLSSession, Error>) -> Void = { [weak self, weak slot] result in
                 guard let self = self, let slot = slot, self.owns(slot) else { return }
                 do { let session = try result.get(); slot.connection = session; try ready(session) }
@@ -292,7 +293,7 @@ final class HubTransport: @unchecked Sendable {
             }
             if let flight = flights[route] { flight.callbacks.append(callback); return }
             let flight = HubRouteFlight(); flights[route] = flight; flight.callbacks.append(callback)
-            do { flight.session = try HubTLSSession.prepare(origin: origin, publicKey: key, queue: queue, anchors: scopedAnchors) { [weak self, weak flight] result in
+            do { flight.session = try HubTLSSession.prepare(origin: origin, publicKey: key, queue: queue, anchors: scopedAnchors, edgeTls: edgeTls) { [weak self, weak flight] result in
                 guard let self = self, let flight = flight else { return }
                 guard self.flights[route] === flight else { if case .success(let session) = result { session.cancelAll() }; return }
                 self.flights.removeValue(forKey: route)

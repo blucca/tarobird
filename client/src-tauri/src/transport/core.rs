@@ -141,6 +141,42 @@ fn verify_proof(bytes: &[u8], key: &str, nonce: &str, observed: &[u8]) -> Result
     Ok(fingerprint)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EdgeIdentityProof {
+    v: u8,
+    r#type: String,
+    public_key: String,
+    nonce: String,
+    origin: String,
+    signature: String,
+}
+
+fn verify_edge_proof(bytes: &[u8], key: &str, nonce: &str, expected_origin: &str) -> Result<(), String> {
+    let parsed: EdgeIdentityProof =
+        serde_json::from_slice(bytes).map_err(|_| "tls_identity_mismatch")?;
+    if parsed.v != 1
+        || parsed.r#type != "edge.identity"
+        || parsed.public_key != key
+        || parsed.nonce != nonce
+        || parsed.origin != expected_origin
+    {
+        return Err("tls_identity_mismatch".into());
+    }
+    let proof = format!("[\"tarocub/edge-identity/v1\",\"{key}\",\"{nonce}\",\"{expected_origin}\"]");
+    let sig_bytes = STANDARD
+        .decode(&parsed.signature)
+        .map_err(|_| "tls_identity_mismatch")?;
+    if STANDARD.encode(&sig_bytes) != parsed.signature {
+        return Err("tls_identity_mismatch".into());
+    }
+    let sig = Signature::from_slice(&sig_bytes).map_err(|_| "tls_identity_mismatch")?;
+    hub_key(key)?
+        .verify_strict(proof.as_bytes(), &sig)
+        .map_err(|_| "tls_identity_mismatch")?;
+    Ok(())
+}
+
 pub fn origin(raw: &str) -> Result<Url, String> {
     let mut url = Url::parse(raw).map_err(|_| "invalid_hub_origin")?;
     if raw.len() > 2048
@@ -213,6 +249,79 @@ impl Network {
             routes: Mutex::new(HashMap::new()),
             authorities: Mutex::new(HashMap::new()),
         }
+    }
+    pub async fn prepare_route(&self, raw: &str, key: Option<&str>, ca: Option<&str>, edge_tls: bool) -> Result<VerifiedRoute, String> {
+        if edge_tls {
+            if ca.is_some() { return Err("invalid_host_authority".into()); }
+            return self.prepare_edge(raw, key).await;
+        }
+        self.prepare_with_ca(raw, key, ca).await
+    }
+    pub async fn prepare_edge(&self, raw: &str, key: Option<&str>) -> Result<VerifiedRoute, String> {
+        let base = origin(raw)?;
+        if base.scheme() != "https" {
+            return Err("https_required".into());
+        }
+        let key = key
+            .filter(|v| !v.is_empty())
+            .ok_or("trusted_hub_key_required")?;
+        hub_key(key)?;
+        let canonical = base.origin().ascii_serialization();
+        let cache_key = format!("edge\0{canonical}\0{key}");
+        let slot = {
+            let mut routes = self.routes.lock().await;
+            if !routes.contains_key(&cache_key) && routes.len() >= MAX_ROUTES {
+                routes.clear();
+            }
+            routes
+                .entry(cache_key)
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone()
+        };
+        let mut cached = slot.lock().await;
+        if let Some(route) = cached.as_ref().filter(|r| r.created.elapsed() < PIN_AGE) {
+            return Ok(route.clone());
+        }
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random).map_err(|_| "secure_random_unavailable")?;
+        let nonce = URL_SAFE_NO_PAD.encode(random);
+        let mut proof_url = base
+            .join("/api/edge-identity")
+            .map_err(|_| "invalid_hub_origin")?;
+        proof_url
+            .query_pairs_mut()
+            .append_pair("nonce", &nonce)
+            .append_pair("origin", &canonical);
+        // System WebPKI verification only (self.normal); never disables TLS checks.
+        let mut response = self
+            .client(None)?
+            .get(proof_url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| "tls_connection_failed")?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err("hub_tls_identity_required".into());
+        }
+        let mut body = Vec::new();
+        while let Some(bytes) = response
+            .chunk()
+            .await
+            .map_err(|_| "tls_identity_unavailable")?
+        {
+            if body.len() + bytes.len() > MAX_PROOF {
+                return Err("tls_identity_too_large".into());
+            }
+            body.extend_from_slice(&bytes);
+        }
+        verify_edge_proof(&body, key, &nonce, &canonical)?;
+        let route = VerifiedRoute {
+            client: self.client(None)?,
+            base,
+            created: Instant::now(),
+        };
+        *cached = Some(route.clone());
+        Ok(route)
     }
     pub async fn prepare_with_ca(&self, raw: &str, key: Option<&str>, ca: Option<&str>) -> Result<VerifiedRoute, String> {
         let Some(ca) = ca else { return self.prepare(raw, key).await; };
@@ -336,8 +445,13 @@ impl Network {
     }
     pub async fn forget(&self, raw: &str, key: Option<&str>) {
         if let Ok(base) = origin(raw) {
-            let cache_key = format!("{}\0{}", base.origin().ascii_serialization(), key.unwrap_or(""));
-            self.routes.lock().await.remove(&cache_key);
+            let origin_str = base.origin().ascii_serialization();
+            let cache_key = format!("{origin_str}\0{}", key.unwrap_or(""));
+            let edge_key = format!("edge\0{origin_str}\0{}", key.unwrap_or(""));
+            let mut routes = self.routes.lock().await;
+            routes.remove(&cache_key);
+            routes.remove(&edge_key);
+            drop(routes);
             for network in self.authorities.lock().await.values() {
                 network.routes.lock().await.remove(&cache_key);
             }

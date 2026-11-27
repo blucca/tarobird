@@ -527,3 +527,53 @@ test("the waiting notice alone never mints a temporary code before the handoff",
   expect((await calls(page)).http.filter(call => call.path === PAIRING_INVITES_PATH && call.method === "POST")).toHaveLength(1);
   expect((await calls(page)).http.filter(call => call.path === PAIRING_INVITE_REVOKE_PATH)).toEqual([]);
 });
+
+test("LAN, Tailscale, and VPS invites exclude Cloudflare for v1.6.0 compatibility, and VPS vs Cloudflare produce distinct QRs", async ({ page }) => {
+  const cfUrl = "https://cf-hub.example.com";
+  await add(page, "CF", {
+    key: keyA,
+    identityRoutes: [
+      { name: "Direct", url: lan, certificateAuthority: ca },
+      { name: "VPS", url: relay },
+      { name: "Cloudflare", url: cfUrl },
+    ],
+    view: {
+      routes: [
+        managed({ name: "Direct", url: lan, certificateAuthority: ca }),
+        managed({ name: "Tailscale", url: tailnet, certificateAuthority: ca }),
+        shared({ name: "VPS", url: relay }),
+      ],
+      lan: { enabled: true, listening: true },
+      tailscale: { enabled: true, listening: true },
+    },
+  });
+  await show(page, "CF");
+  await scanned(page);
+  const choice = page.getByRole("combobox");
+
+  const decodeFor = async (value: string, expectUrl: string) => {
+    await choice.selectOption(value);
+    await expect.poll(async () => {
+      const links = await page.evaluate(() => window.inviteFixture.decodeAll());
+      if (links.length !== 1) return false;
+      const p = parsePairingLink(links[0]!);
+      return p.kind === "connect" && p.routes[0]?.url === expectUrl;
+    }).toBe(true);
+    return scanned(page);
+  };
+
+  const lanPayload = await decodeFor(lan, lan);
+  expect(lanPayload.routes.some(r => r.name === "Cloudflare")).toBe(false);
+  expect(lanPayload.routes.map(r => r.url)).toEqual([lan, relay]);
+
+  const tsPayload = await decodeFor(tailnet, tailnet);
+  expect(tsPayload.routes.some(r => r.name === "Cloudflare")).toBe(false);
+  expect(tsPayload.routes.map(r => r.url)).toEqual([tailnet, relay]);
+
+  const vpsPayload = await decodeFor(relay, relay);
+  expect(vpsPayload.routes).toEqual([{ name: "VPS", url: relay }]);
+
+  const cfPayload = await decodeFor(cfUrl, cfUrl);
+  expect(cfPayload.routes).toEqual([{ name: "Cloudflare", url: cfUrl }]);
+  expect(vpsPayload.routes).not.toEqual(cfPayload.routes);
+});

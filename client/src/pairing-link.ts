@@ -1,4 +1,7 @@
 import {
+  isDirectRoute,
+  isEdgeTlsRoute,
+  isRelayRoute,
   routesSchema,
   localRoutesSchema,
   deploymentSchema,
@@ -92,7 +95,8 @@ function compactV2ConnectPayload(payload: Omit<ConnectV2Payload, "invite">): z.i
 /** Build a connect QR payload. v1 (one direct route) unless `version: 2` is
  * asked for: Apps up to 1.6.0 accept only v1 and report any other code as
  * damaged. v2 carries several direct candidates for newer Apps to race, and is
- * used only when there is more than one to carry. */
+ * used only when there is more than one to carry. Cloudflare routes are never
+ * written into a v2 code: any Cloudflare route forces v1. */
 export function connectionPairingPayload(
   hubPublicKey: string,
   local: readonly Route[],
@@ -100,16 +104,18 @@ export function connectionPairingPayload(
   activeUrl?: string,
   options?: { version?: 1 | 2 },
 ): Extract<PairingPayload, { kind: "connect" }> {
-  const allDirects = local.filter(route => route.name !== "VPS");
+  const allDirects = local.filter(isDirectRoute);
   const primary = (activeUrl ? allDirects.find(route => route.url === activeUrl) : undefined)
     ?? allDirects.find(route => route.name === "Tailscale")
     ?? allDirects.find(route => route.name === "Direct");
   const orderedDirects = primary
     ? [primary, ...allDirects.filter(route => route.url !== primary.url)].slice(0, MAX_DIRECT_ROUTES)
     : [];
-  const relays = local.filter(route => route.name === "VPS").slice(0, MAX_VPS_ROUTES);
+  // The relay in use (VPS or Cloudflare) goes first.
+  const allRelays = local.filter(isRelayRoute);
+  const relays = (activeUrl ? [...allRelays.filter(route => route.url === activeUrl), ...allRelays.filter(route => route.url !== activeUrl)] : allRelays).slice(0, MAX_VPS_ROUTES);
 
-  if (options?.version !== 2 || orderedDirects.length <= 1) {
+  if (options?.version !== 2 || orderedDirects.length <= 1 || relays.some(isEdgeTlsRoute)) {
     const direct = orderedDirects[0];
     const routes = routesSchema.parse([...(direct ? [direct] : []), ...relays]);
     return {
