@@ -11,6 +11,7 @@ import {
   type AgyAcpChildProcess,
   type SpawnAgyAcp,
 } from "../src/codex/antigravity-acp-adapter.js";
+import { createRunRecord, recordRunEvent, summarizeRun } from "../src/core/run-record.js";
 
 type JsonRpcMessage = {
   jsonrpc: "2.0";
@@ -106,11 +107,24 @@ class FakeAgyServer {
 
   text(text: string): void { this.sendUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } }); }
 
-  requestPermission(toolCallId = "call_1", toolInput: Record<string, unknown> = { CommandLine: "touch x" }): string {
+  requestPermission(
+    toolCallId = "call_1",
+    toolInput: Record<string, unknown> = { CommandLine: "touch x" },
+    toolCallOverrides?: Record<string, unknown>,
+  ): string {
     const id = String(this.nextServerRequestId++);
     this.send({ jsonrpc: "2.0", id, method: "session/request_permission", params: {
       sessionId: this.sessionId,
-      toolCall: { sessionUpdate: "tool_call", toolCallId, name: "run_command", status: "pending", kind: "execute", title: String(toolInput.CommandLine), rawInput: toolInput },
+      toolCall: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        name: "run_command",
+        status: "pending",
+        kind: "execute",
+        title: String(toolInput.CommandLine ?? toolCallId),
+        rawInput: toolInput,
+        ...toolCallOverrides,
+      },
       options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }],
     } });
     return id;
@@ -1155,5 +1169,226 @@ describe("AntigravityAcpAdapter session config failures", () => {
     running.text("b");
     running.respondPrompt();
     await settleWithin(second);
+  });
+
+  it("surfaces brain/<sessionId>/task.md edits as TodoWrite plans without emitting raw task artifact tool noise", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "bypass" }));
+    const events: EngineStreamEvent[] = [];
+    const reply = adapter.sendUserMessage(SESSION_A, {
+      text: "Run a multi-step plan",
+      files: [],
+      onEngineEvent: (event) => { events.push(event); },
+    });
+    await waitFor(() => harness.children.length === 1 && harness.children[0]!.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const taskPath = `/srv/state/.gemini/antigravity-cli/brain/${SESSION_A}/task.md`;
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_task_1",
+      kind: "edit",
+      status: "completed",
+      name: "write_file",
+      title: `File .../brain/${SESSION_A}/task.md`,
+      content: [{ type: "diff", path: taskPath, newText: "# Plan\n- [ ] Read files\n- [ ] Write summary\n" }],
+      rawInput: { ArtifactMetadata: { UserFacing: true, RequestFeedback: false, Summary: "Plan" }, Path: taskPath },
+    });
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_task_2",
+      kind: "edit",
+      status: "completed",
+      name: "edit_file",
+      title: `File .../brain/${SESSION_A}/task.md`,
+      content: [{ type: "diff", path: taskPath, oldText: "- [ ] Read files\n- [ ] Write summary\n", newText: "- [x] Read files\n- [/] Write summary\n" }],
+      rawInput: { ArtifactMetadata: { UserFacing: true, RequestFeedback: false, Summary: "Progress" }, Path: taskPath },
+    });
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_normal_1",
+      kind: "edit",
+      status: "completed",
+      name: "write_file",
+      title: "File /srv/workspace/result.md",
+      content: [{ type: "diff", path: "/srv/workspace/result.md", newText: "- [ ] Not an internal task artifact\n" }],
+      rawInput: { Path: "/srv/workspace/result.md", Content: "- [ ] Not an internal task artifact\n" },
+    });
+    server.text("All done.");
+    server.respondPrompt();
+    await settleWithin(reply);
+
+    const todoEvents = events.filter((event) => event.type === "tool_use" && event.toolName === "TodoWrite");
+    expect(todoEvents).toHaveLength(2);
+    expect(todoEvents[0]).toMatchObject({
+      type: "tool_use",
+      toolName: "TodoWrite",
+      toolInput: { todos: [{ content: "Read files", status: "pending" }, { content: "Write summary", status: "pending" }] },
+    });
+    expect(todoEvents[1]).toMatchObject({
+      type: "tool_use",
+      toolName: "TodoWrite",
+      toolInput: { todos: [{ content: "Read files", status: "completed" }, { content: "Write summary", status: "in_progress" }] },
+    });
+    // Internal task.md writes do not leak as raw write_file/edit_file events, while normal workspace writes still appear.
+    const rawFileWrites = events.filter((event) => event.type === "tool_use" && (event.toolName === "write_file" || event.toolName === "edit_file"));
+    expect(rawFileWrites).toHaveLength(1);
+    expect(rawFileWrites[0]).toMatchObject({ toolUseId: "call_normal_1", toolName: "write_file" });
+  });
+
+  it("never suppresses run_command or workspace /brain/.../task.md edits, and settles task.md calls across permission, pathless, diff-only, failed, and repeated rawInput updates", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness, { approvalMode: "normal" }));
+    const record = createRunRecord();
+    const events: EngineStreamEvent[] = [];
+    const approvals: EngineApprovalRequest[] = [];
+    const reply = adapter.sendUserMessage(SESSION_A, {
+      text: "Verify all task.md edge cases",
+      files: [],
+      onApprovalRequest: async (request) => {
+        approvals.push(request);
+        return { behavior: "allow" };
+      },
+      onEngineEvent: (event) => {
+        events.push(event);
+        recordRunEvent(record, event);
+      },
+    });
+    await waitFor(() => harness.children.length === 1 && harness.children[0]!.server.prompts.length === 1);
+    const server = harness.children[0]!.server;
+    const taskPath = `/srv/state/.gemini/antigravity-cli/brain/${SESSION_A}/task.md`;
+
+    // 1. Arbitrary run_command referencing /workspace/brain/task.md must emit both tool_use and tool_result.
+    server.sendUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "call_rm",
+      kind: "execute",
+      status: "in_progress",
+      name: "run_command",
+      title: "rm -f /workspace/brain/task.md",
+      rawInput: { CommandLine: "rm -f /workspace/brain/task.md" },
+    });
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_rm",
+      status: "completed",
+      rawOutput: { output: "", exit_code: 0 },
+    });
+
+    // 2. Normal workspace edit to /workspace/packages/brain/task.md (no ArtifactMetadata, different session) must NOT be suppressed.
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_ws_brain",
+      kind: "edit",
+      status: "completed",
+      name: "write_file",
+      title: "File /workspace/packages/brain/task.md",
+      content: [{ type: "diff", path: "/workspace/packages/brain/task.md", newText: "- [ ] Workspace task\n" }],
+      rawInput: { Path: "/workspace/packages/brain/task.md", Content: "- [ ] Workspace task\n" },
+    });
+
+    // 3. Normal approval mode: permission_request for task.md followed by completed tool_call_update must settle waiting entry & phase.
+    const permReqId = server.requestPermission(
+      "call_perm_task",
+      { Path: taskPath, Content: "- [ ] Step 1\n", ArtifactMetadata: { UserFacing: true, RequestFeedback: false, Summary: "Plan" } },
+      { name: "write_file", kind: "edit", title: `File .../brain/${SESSION_A}/task.md` },
+    );
+    await waitFor(() => server.clientResponses.has(permReqId));
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_perm_task",
+      status: "completed",
+      content: [{ type: "diff", path: taskPath, newText: "- [ ] Step 1\n" }],
+    });
+    await waitFor(() => record.entries.some((e) => e.callId === "call_perm_task" && e.status === "done"));
+    expect(summarizeRun(record, "running").phase).toBe("working");
+    expect(record.entries.find((e) => e.callId === "call_perm_task")?.status).toBe("done");
+
+    // 4. Pathless initial tool_call (emits tool_use) followed by task.md tool_call_update must also emit matching tool_result.
+    server.sendUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "call_pathless",
+      kind: "edit",
+      status: "in_progress",
+      name: "edit_file",
+      title: "edit_file",
+    });
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_pathless",
+      status: "completed",
+      content: [{ type: "diff", path: taskPath, newText: "- [x] Step 1\n- [ ] Step 2\n" }],
+    });
+    await waitFor(() => record.entries.some((e) => e.callId === "call_pathless" && e.status === "done"));
+    expect(summarizeRun(record, "running").current).toBeUndefined();
+
+    // 5. Path-known tool_call (no markdown yet) followed by diff-only tool_call_update (omitting full path/rawInput/title/kind/name) must still extract & emit updated todos.
+    server.sendUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "call_diff_only",
+      kind: "edit",
+      status: "in_progress",
+      name: "edit_file",
+      title: `File .../brain/${SESSION_A}/task.md`,
+    });
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_diff_only",
+      status: "completed",
+      content: [{ type: "diff", path: "task.md", newText: "- [x] Step 1\n- [/] Step 2\n" }],
+    });
+
+    // 6. Failed task.md update must NOT overwrite lastTaskMarkdown or emit unapplied progress.
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_failed_task",
+      kind: "edit",
+      status: "failed",
+      name: "write_file",
+      content: [{ type: "diff", path: taskPath, newText: "- [x] Failed ghost step\n" }],
+      rawInput: { Path: taskPath, Content: "- [x] Failed ghost step\n" },
+    });
+
+    // 7. Repeated rawInput { Target, Replacement } across tool_call + tool_call_update (where Replacement contains Target) applies only once.
+    const repeatInput = {
+      Path: taskPath,
+      Target: "- [/] Step 2",
+      Replacement: "- [/] Step 2\n  - [ ] Subtask A",
+    };
+    server.sendUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "call_repeat_edit",
+      kind: "edit",
+      status: "in_progress",
+      name: "edit_file",
+      title: "edit_file",
+      rawInput: repeatInput,
+    });
+    server.sendUpdate({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_repeat_edit",
+      status: "completed",
+      rawInput: repeatInput,
+    });
+
+    server.text("Done.");
+    server.respondPrompt();
+    await settleWithin(reply);
+
+    expect(approvals).toHaveLength(1);
+    expect(events.some((e) => e.type === "tool_use" && e.toolUseId === "call_rm")).toBe(true);
+    expect(events.some((e) => e.type === "tool_result" && e.toolUseId === "call_rm")).toBe(true);
+    expect(events.some((e) => e.type === "tool_use" && e.toolUseId === "call_ws_brain")).toBe(true);
+    expect(events.some((e) => e.type === "tool_result" && e.toolUseId === "call_ws_brain")).toBe(true);
+    // Diff-only and repeated-edit calls never emitted raw tool_use, so they must remain suppressed.
+    expect(events.some((e) => e.type === "tool_use" && e.toolUseId === "call_diff_only")).toBe(false);
+    expect(events.some((e) => e.type === "tool_use" && e.toolUseId === "call_repeat_edit")).toBe(false);
+
+    const todoEvents = events.filter((e): e is Extract<EngineStreamEvent, { type: "tool_use" }> => e.type === "tool_use" && e.toolName === "TodoWrite");
+    expect(todoEvents.map((e) => e.toolInput)).toEqual([
+      { todos: [{ content: "Step 1", status: "pending" }] },
+      { todos: [{ content: "Step 1", status: "completed" }, { content: "Step 2", status: "pending" }] },
+      { todos: [{ content: "Step 1", status: "completed" }, { content: "Step 2", status: "in_progress" }] },
+      { todos: [{ content: "Step 1", status: "completed" }, { content: "Step 2", status: "in_progress" }, { content: "Subtask A", status: "pending" }] },
+    ]);
   });
 });

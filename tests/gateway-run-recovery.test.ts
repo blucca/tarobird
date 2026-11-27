@@ -8,6 +8,7 @@ import { HubServer } from "../src/hub/server.js";
 import { hashSecret } from "../src/hub/auth.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
 import { nativeRun } from "../src/client-protocol/run.js";
+import { runPlanPreview } from "../src/client-protocol/run-plan.js";
 import type { Block } from "../src/client-protocol/index.js";
 import { renderCoreQueueWaitCard } from "../src/core/card-renderer.js";
 import { translateCard } from "../src/gateway/card-translator.js";
@@ -242,5 +243,50 @@ it("only decodes active recovery candidates instead of complete native-run histo
     decode.mockRestore();
     expect((await hub.store.messageForUser("owner", active.id)).status).toBe("error");
     expect(await hub.store.db.get("SELECT count(*) AS count FROM messages WHERE id LIKE 'history_%' AND status='complete' AND version=1")).toEqual({ count: 2000 });
+  } finally { await hub.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+it("preserves nativeRunPlan with incremented revision when interrupting active foreground runs", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "plan-run-recovery-"));
+  const hub = await HubServer.start({ stateDir: root });
+  try {
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('alpha','Alpha',?)", [hashSecret("fixture")]);
+    const chat = await hub.store.createConversation("owner", ["alpha"], "Plan recovery", "plan");
+    const validCard: Block = {
+      type: "card",
+      elements: [{ type: "markdown", text: "in progress" }],
+      extra: {
+        nativeRun: { version: 1, id: "run_with_plan", revision: 2, phase: "working", startedAt: 1, updatedAt: 2, count: 0, completed: 0, failed: 0, truncated: false },
+        nativeRunPlan: { version: 1, runId: "run_with_plan", revision: 2, seq: 1, items: [{ content: "Inspect files", status: "completed" }, { content: "Patch bug", status: "in_progress" }] },
+      },
+    };
+    const staleCard: Block = {
+      type: "card",
+      elements: [{ type: "markdown", text: "stale plan" }],
+      extra: {
+        nativeRun: { version: 1, id: "run_stale_plan", revision: 5, phase: "working", startedAt: 1, updatedAt: 2, count: 0, completed: 0, failed: 0, truncated: false },
+        nativeRunPlan: { version: 1, runId: "run_stale_plan", revision: 1, seq: 1, items: [{ content: "Stale item", status: "pending" }] },
+      },
+    };
+    const mValid = await hub.store.publishBotMessage("alpha", { conversationId: chat.id, status: "streaming", blocks: [validCard] });
+    const mStale = await hub.store.publishBotMessage("alpha", { conversationId: chat.id, status: "streaming", blocks: [staleCard] });
+    await hub.store.recoverOrphanRuns("alpha", Date.now());
+
+    const recValid = await hub.store.messageForUser("owner", mValid.id);
+    const cardValid = recValid.blocks[0]!;
+    expect(cardValid.type).toBe("card");
+    const runValid = cardValid.type === "card" ? nativeRun(cardValid) : undefined;
+    expect(runValid).toMatchObject({ id: "run_with_plan", phase: "interrupted", revision: 3 });
+    expect(cardValid.type === "card" && runValid ? runPlanPreview(cardValid, runValid) : undefined).toEqual({
+      version: 1,
+      runId: "run_with_plan",
+      revision: 3,
+      seq: 1,
+      items: [{ content: "Inspect files", status: "completed" }, { content: "Patch bug", status: "in_progress" }],
+    });
+
+    const recStale = await hub.store.messageForUser("owner", mStale.id);
+    const cardStale = recStale.blocks[0]!;
+    expect(cardStale.type === "card" ? cardStale.extra?.nativeRunPlan : undefined).toBeUndefined();
   } finally { await hub.close(); await rm(root, { recursive: true, force: true }); }
 });

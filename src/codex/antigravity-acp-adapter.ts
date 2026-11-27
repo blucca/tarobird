@@ -39,6 +39,7 @@ import type {
 } from "./adapter.js";
 import { EngineIncompleteResponseError, EngineSteeringRejectedError } from "./adapter.js";
 import { killProcessTree } from "./process-tree.js";
+import { extractAntigravityTaskPlan, parseAcpPlanSummary, type AntigravityTodoItem } from "./antigravity-task-plan.js";
 import { renderPrivateTurnInstructions } from "./turn-instructions.js";
 
 type SpawnOptions = {
@@ -122,6 +123,10 @@ type ToolState = {
   background: boolean;
   emittedUse: boolean;
   emittedResult: boolean;
+  emittedPermission: boolean;
+  /** Internal Antigravity brain/<sessionId>/task.md artifact surfaced as TodoWrite plan. */
+  isTaskArtifact?: boolean;
+  lastDiffNewText?: string;
 };
 
 type PromptOutcome = { result?: PromptResponse; error?: unknown };
@@ -143,6 +148,10 @@ type Turn = {
   text: string;
   usage: AdapterUsage | undefined;
   toolSeen: boolean;
+  /** Last emitted TodoWrite payload JSON to deduplicate identical task.md updates. */
+  lastPlanJson?: string;
+  /** Tool calls that emitted permission_request in this turn, so their matching tool_result is never orphaned. */
+  permissionTools: Map<string, { name?: string; kind?: string; title?: string; rawInput?: unknown; isTaskArtifact?: boolean }>;
   /** Length of the reply text when the owner last declined an approval in this turn. */
   declinedAt?: number;
   /** The prompt is exactly the native /compact, which agy completes without text. */
@@ -200,6 +209,7 @@ type Worker = {
   wake: Wake | null;
   promptSeq: number;
   tools: Map<string, ToolState>;
+  lastTaskMarkdown?: string;
   pendingPermissions: number;
   contextUsage?: { used: number; size: number };
   stderrTail: string;
@@ -819,7 +829,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private runTurn(worker: Worker, prompt: ContentBlock[], input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     return new Promise<CodexAdapterResponse>((resolve, reject) => {
       const turn: Turn = {
-        worker, prompts: [], text: "", usage: undefined, toolSeen: false, compact: input.text.trim() === "/compact", locale: input.locale,
+        worker, prompts: [], text: "", usage: undefined, toolSeen: false, permissionTools: new Map(), compact: input.text.trim() === "/compact", locale: input.locale,
         onProgress: input.onProgress, onEngineEvent: input.onEngineEvent, onApprovalRequest: input.onApprovalRequest,
         approvals: new AbortController(), eventChain: Promise.resolve(), stopRequested: false,
         timeoutsDisabled: input.disableRuntimeTimeout === true, done: false, resolve, reject,
@@ -1030,7 +1040,29 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     } else if (kind === "agent_thought_chunk") {
       const content = asRecord(update.content);
       if (content?.type === "text" && typeof content.text === "string" && content.text) this.emit(turn, { type: "thinking", text: content.text, sessionId });
+    } else if (kind === "plan") {
+      const plan = parseAcpPlanSummary(update.entries);
+      if (plan.todos.length) this.emitPlan(turn, sessionId, plan);
     }
+  }
+
+  private emitPlan(
+    turn: Turn,
+    sessionId: string,
+    plan: { todos: AntigravityTodoItem[]; total?: number; completed?: number; truncated?: boolean },
+  ): void {
+    const toolInput = plan.truncated
+      ? {
+        todos: plan.todos,
+        total: plan.total ?? plan.todos.length,
+        completed: plan.completed ?? plan.todos.filter((item) => item.status === "completed").length,
+        truncated: true,
+      }
+      : { todos: plan.todos };
+    const serialized = JSON.stringify(toolInput);
+    if (turn.lastPlanJson === serialized) return;
+    turn.lastPlanJson = serialized;
+    this.emit(turn, { type: "tool_use", toolName: "TodoWrite", toolInput, toolUseId: `agy-task-plan:${sessionId}`, sessionId });
   }
 
   private trackWake(worker: Worker, kind: unknown, update: Record<string, unknown>): void {
@@ -1077,19 +1109,72 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const now = Date.now();
     let tool = worker.tools.get(id);
     if (!tool) {
-      tool = { id, token: randomUUID(), name: "", status: "pending", startedAt: now, updatedAt: now, ...(turn ? { turn } : {}), background: !turn, emittedUse: false, emittedResult: false };
+      tool = { id, token: randomUUID(), name: "", status: "pending", startedAt: now, updatedAt: now, ...(turn ? { turn } : {}), background: !turn, emittedUse: false, emittedResult: false, emittedPermission: false };
       worker.tools.set(id, tool);
+    }
+    const owner = tool.turn && !tool.turn.done ? tool.turn : undefined;
+    const permissionMeta = owner?.permissionTools.get(id);
+    if (permissionMeta) {
+      tool.emittedPermission = true;
+      if (!tool.name && permissionMeta.name) tool.name = permissionMeta.name;
+      if (!tool.title && permissionMeta.title) tool.title = permissionMeta.title;
+      if (!tool.kind && permissionMeta.kind) tool.kind = permissionMeta.kind;
+      if (tool.rawInput === undefined && permissionMeta.rawInput !== undefined) tool.rawInput = permissionMeta.rawInput;
+      if (permissionMeta.isTaskArtifact) tool.isTaskArtifact = true;
     }
     if (typeof update.name === "string" && update.name) tool.name = update.name;
     if (typeof update.title === "string" && update.title) tool.title = update.title;
     if (typeof update.kind === "string") tool.kind = update.kind;
     if (update.rawInput !== undefined) tool.rawInput = update.rawInput;
     if (typeof update.status === "string") tool.status = update.status;
+    if (Array.isArray(update.content)) {
+      for (const item of update.content) {
+        const rec = asRecord(item);
+        if (rec?.type === "diff" && typeof rec.newText === "string") tool.lastDiffNewText = rec.newText;
+      }
+    }
     tool.updatedAt = now;
-    const owner = tool.turn && !tool.turn.done ? tool.turn : undefined;
+    const taskPlan = extractAntigravityTaskPlan(update, worker.sessionId ?? "", worker.lastTaskMarkdown, {
+      toolKind: tool.kind,
+      toolName: tool.name,
+      toolTitle: tool.title,
+      toolStatus: tool.status,
+      toolRawInput: tool.rawInput,
+      toolDiffNewText: tool.lastDiffNewText,
+      alreadyTaskArtifact: Boolean(tool.isTaskArtifact),
+    });
+    if (taskPlan?.isTaskArtifact) {
+      tool.isTaskArtifact = true;
+      if (taskPlan.markdown !== undefined) worker.lastTaskMarkdown = taskPlan.markdown;
+    }
+    if (tool.status === "completed" || tool.status === "failed") {
+      owner?.permissionTools.delete(id);
+    }
     if (!owner) return;
-    owner.toolSeen = true;
     const sessionId = worker.sessionId!;
+    if (tool.isTaskArtifact) {
+      if (taskPlan?.todos.length) this.emitPlan(owner, sessionId, taskPlan);
+      if (!tool.emittedUse && !tool.emittedPermission) return;
+      owner.toolSeen = true;
+      const toolName = tool.name || tool.title || "Antigravity tool";
+      if (tool.emittedPermission && !tool.emittedUse && tool.status === "in_progress") {
+        tool.emittedUse = true;
+        this.emit(owner, { type: "tool_use", toolName, ...(tool.rawInput !== undefined ? { toolInput: tool.rawInput } : {}), toolUseId: id, sessionId });
+      }
+      if ((tool.status === "completed" || tool.status === "failed") && !tool.emittedResult) {
+        tool.emittedResult = true;
+        const output = toolText(update);
+        const exitCode = asRecord(update.rawOutput)?.exit_code;
+        this.emit(owner, {
+          type: "tool_result", toolName, toolUseId: id,
+          ...(output !== undefined ? { output } : {}),
+          ...(typeof exitCode === "number" && Number.isInteger(exitCode) ? { exitCode } : {}),
+          isError: tool.status === "failed", sessionId,
+        });
+      }
+      return;
+    }
+    owner.toolSeen = true;
     const toolName = tool.name || tool.title || "Antigravity tool";
     if (!tool.emittedUse) {
       tool.emittedUse = true;
@@ -1131,7 +1216,27 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       abortSignal: turn.approvals.signal,
       approvalScopes: allow ? { once: "once" } : {},
     };
-    if (typeof toolCall.toolCallId === "string") this.emit(turn, { type: "permission_request", toolName, toolInput: approval.toolInput, toolUseId: toolCall.toolCallId, sessionId: worker.sessionId! });
+    if (typeof toolCall.toolCallId === "string") {
+      const isTaskArtifact = Boolean(extractAntigravityTaskPlan({ ...toolCall, status: "pending" }, worker.sessionId ?? "")?.isTaskArtifact);
+      const meta = {
+        ...(typeof toolCall.name === "string" && toolCall.name ? { name: toolCall.name } : {}),
+        ...(typeof toolCall.kind === "string" ? { kind: toolCall.kind } : {}),
+        ...(typeof toolCall.title === "string" && toolCall.title ? { title: toolCall.title } : {}),
+        ...(toolCall.rawInput !== undefined ? { rawInput: toolCall.rawInput } : {}),
+        ...(isTaskArtifact ? { isTaskArtifact: true } : {}),
+      };
+      turn.permissionTools.set(toolCall.toolCallId, meta);
+      const existing = worker.tools.get(toolCall.toolCallId);
+      if (existing) {
+        existing.emittedPermission = true;
+        if (!existing.name && meta.name) existing.name = meta.name;
+        if (!existing.kind && meta.kind) existing.kind = meta.kind;
+        if (!existing.title && meta.title) existing.title = meta.title;
+        if (existing.rawInput === undefined && meta.rawInput !== undefined) existing.rawInput = meta.rawInput;
+        if (meta.isTaskArtifact) existing.isTaskArtifact = true;
+      }
+      this.emit(turn, { type: "permission_request", toolName, toolInput: approval.toolInput, toolUseId: toolCall.toolCallId, sessionId: worker.sessionId! });
+    }
     worker.pendingPermissions += 1;
     let decision: EngineApprovalDecision;
     try {
