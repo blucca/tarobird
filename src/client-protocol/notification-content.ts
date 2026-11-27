@@ -1,6 +1,7 @@
 import { AGENT_BUS_STAGE_EXTRA, agentBusStageRecordSchema } from "./agent-bus.js";
 import { backgroundTaskNotice, backgroundTaskStatus } from "./background-task.js";
 import { queueNotice } from "./queue-notice.js";
+import { isTranscriptionMessage } from "./voice-presentation.js";
 import { isRunActive, anyRun, nativeRun } from "./run.js";
 import type { CardElement, Message } from "./index.js";
 import type { NotificationTopic, PushPayload } from "./push.js";
@@ -130,6 +131,9 @@ export function classifyNotification(message: Message): NotificationClass | unde
   // Queue bookkeeping is neither an answer nor a request requiring attention.
   // The actual run or delivery failure publishes its own notification.
   if (message.blocks.some(block => block.type === "card" && queueNotice(block, message))) return;
+  // Host audio transcription cards are preparation bookkeeping, not a Bot answer.
+  // Genuine transcription failures post their own failure reply.
+  if (isTranscriptionMessage(message)) return;
   // A stopped independent Bus record is not a completed answer. Keep its
   // terminal message lifecycle for unread tracking; suppress only its notice.
   // Native foreground evidence takes precedence over any record metadata.

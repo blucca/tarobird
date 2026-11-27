@@ -12,6 +12,7 @@ import { runPlanPreview } from "../client-protocol/run-plan.js";
 import { backgroundTaskGroup } from "../client-protocol/background-task-group.js";
 import { answerFollowup, activeAnswerFollowup } from "../client-protocol/answer-followup.js";
 import { queueNotice } from "../client-protocol/queue-notice.js";
+import { transcriptionState } from "../client-protocol/voice-presentation.js";
 import { SEARCH_EXCERPT_CHARS, SEARCH_PAGE_SIZE, searchCursorSchema, searchPageSchema, type SearchFilters, type SearchPage } from "../client-protocol/search.js";
 import { steerResultSchema, type SteerResult } from "../client-protocol/steering.js";
 import { extractLinks, normalizedLink, linkPreviewSchema, linkPreviewStyleSchema, type LinkPreview, type LinkPreviewStyle } from "../client-protocol/links.js";
@@ -178,7 +179,8 @@ export class HubStore {
         AND (status IN ('pending','streaming') OR blocks_json LIKE '%"actionId"%' OR EXISTS
           (SELECT 1 FROM json_each(blocks_json) b WHERE json_extract(b.value,'$.extra.nativeRun.phase') IN (${activeRunPhaseParams})
             OR json_extract(b.value,'$.extra.scopedRun.phase') IN (${activeRunPhaseParams})
-            OR json_extract(b.value,'$.extra.answerFollowup.phase') IN ('queued','processing')))`, [botId, ...activeRunPhases, ...activeRunPhases]);
+            OR json_extract(b.value,'$.extra.answerFollowup.phase') IN ('queued','processing')
+            OR json_type(b.value,'$.extra.appTranscription.active')='true'))`, [botId, ...activeRunPhases, ...activeRunPhases]);
       const events: HubEvent[] = [];
       const actionable = (elements: CardElement[]): boolean => elements.some(e => !!e.actionId || actionable(e.children ?? []));
       const disable = (element: CardElement): CardElement => {
@@ -190,7 +192,7 @@ export class HubStore {
       };
       for (const row of rows) {
         const old = this.decodeMessage(row);
-        const running = ["pending", "streaming"].includes(old.status) || old.blocks.some(b => b.type === "card" && ((anyRun(b) && isRunActive(anyRun(b)!.phase)) || activeAnswerFollowup(answerFollowup(b)) || ["queued", "started"].includes(queueNotice(b, old)?.state ?? "")));
+        const running = ["pending", "streaming"].includes(old.status) || old.blocks.some(b => b.type === "card" && ((anyRun(b) && isRunActive(anyRun(b)!.phase)) || activeAnswerFollowup(answerFollowup(b)) || ["queued", "started"].includes(queueNotice(b, old)?.state ?? "") || transcriptionState(b)?.active === true));
         if (!running && !old.blocks.some(b => b.type === "card" && actionable(b.elements))) continue;
         // Old choices/configuration cards are durable history, not failed runs.
         // Keep their values, titles, terminal metadata and status; retire actions only.
@@ -1048,7 +1050,7 @@ export class HubStore {
       const rows = await this.db.all<MessageRow>("SELECT * FROM messages WHERE conversation_id=? AND reply_to=? AND author_id=? AND author_type='bot' AND status!='deleted'", [input.conversation_id, messageId, botId]);
       for (const row of rows) {
         const old = this.decodeMessage(row);
-        if (!["pending", "streaming"].includes(old.status) && !old.blocks.some((b) => b.type === "card" && (actionable(b.elements) || activeAnswerFollowup(answerFollowup(b)) || (anyRun(b) && isRunActive(anyRun(b)!.phase))))) continue;
+        if (!["pending", "streaming"].includes(old.status) && !old.blocks.some((b) => b.type === "card" && (actionable(b.elements) || activeAnswerFollowup(answerFollowup(b)) || (anyRun(b) && isRunActive(anyRun(b)!.phase)) || transcriptionState(b)?.active === true))) continue;
         const message = this.interruptedRunMessage(old, reason, note);
         await this.saveMessage(message); events.push(await this.append(message.conversationId, "message.updated", message));
       }
@@ -1076,12 +1078,26 @@ export class HubStore {
       const plan = original.type === "card" && original.extra?.scopedRun === undefined && run ? runPlanPreview(original, run) : undefined;
       const answer = original.type === "card" ? answerFollowup(original) : undefined;
       const queue = original.type === "card" ? queueNotice(original, old) : undefined;
+      const transcription = original.type === "card" ? transcriptionState(original) : undefined;
       if (block.type === "card" && queue && ["queued", "started"].includes(queue.state)) {
         const { cancel: _cancel, ...data } = queue;
         const state = orphanQueue ? "expired" : reason === "failed" ? "failed" : "interrupted";
         const summary = orphanQueue ? "排队提示已失效" : reason === "failed" ? "排队任务未能执行" : "排队已中断";
         return { ...block, summary, extra: { ...block.extra, appQueue: { ...data, state } },
           elements: [{ type: "markdown", text: orphanQueue ? "排队提示已失效，实际结果请查看本对话的后续回复。" : note }] };
+      }
+      if (block.type === "card" && transcription?.active) {
+        const en = original.type === "card" && original.elements[0]?.type === "markdown" && /^\*\*Transcribing audio…\*\*$/.test(original.elements[0].text ?? "");
+        const filename = block.elements.length === 3 && block.elements[1]?.type === "markdown" ? [block.elements[1]] : [];
+        return {
+          ...block,
+          extra: { ...block.extra, appTranscription: { ...transcription, active: false } },
+          elements: [
+            { type: "markdown", text: `**${en ? "Transcription interrupted" : "转写已中断"}**` },
+            ...filename,
+            { type: "markdown", text: en ? "Audio transcription was interrupted. The original recording remains in this conversation." : "音频转写已中断，原录音仍保留在对话中。" },
+          ],
+        };
       }
       if (block.type === "card" && answer && activeAnswerFollowup(answer)) {
         const text = answer.locale === "en" ? "Follow-up interrupted. Your answer is kept here; check the conversation before retrying." : "后续处理已中断，你的答案保留在此，请查看对话后再决定是否重试。";
@@ -1094,7 +1110,8 @@ export class HubStore {
       elements: run ? [...block.elements, { type: "markdown", text: note }] : [{ type: "markdown", text: note }, { type: "collapsible", text: block.title ? `中断前：${block.title}` : "查看中断前的内容", open: false, children: block.elements }],
     } : block; }));
     const expiredNoticeOnly = orphanQueue && old.blocks.length > 0 && old.blocks.every(block => block.type === "card" && ["queued", "started"].includes(queueNotice(block, old)?.state ?? ""));
-    return { ...old, version: old.version + 1, status: expiredNoticeOnly ? "complete" : "error", blocks: preserved.length && preserved.every((b) => b.type === "card") ? preserved : [{ type: "text", text: note }, ...preserved] };
+    const transcriptionOnly = old.blocks.length > 0 && old.blocks.every(block => block.type === "card" && transcriptionState(block)?.active === true);
+    return { ...old, version: old.version + 1, status: expiredNoticeOnly || transcriptionOnly ? "complete" : "error", blocks: preserved.length && preserved.every((b) => b.type === "card") ? preserved : [{ type: "text", text: note }, ...preserved] };
   }
   /** Only a new worker attachment invokes this, never an ordinary reconnect.
    * Pending input deliveries have their own durable receipt recovery. Scheduled
@@ -1113,10 +1130,12 @@ export class HubStore {
             OR (json_extract(b.value,'$.extra.answerFollowup.phase') IN ('queued','processing')
             AND json_extract(b.value,'$.extra.answerFollowup.startedAt') < ?)
             OR (json_extract(b.value,'$.extra.appQueue.state') IN ('queued','started') AND json_extract(b.value,'$.extra.appQueue.at') < ?)
+            OR (json_type(b.value,'$.extra.appTranscription.active')='true'
+              AND COALESCE(json_extract(b.value,'$.extra.appTranscription.at'), m.created_at) < ?)
             OR (json_type(b.value,'$.extra.appQueue') IS NULL AND m.created_at < ?
               AND json_extract(b.value,'$.extra.schema')='2.0' AND json_extract(b.value,'$.layout.padding')='8px 12px 8px 12px'
               AND json_array_length(b.value,'$.elements')=2 AND json_extract(b.value,'$.elements[1].value.cctb_lark')='stop')))
-        AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id=m.reply_to AND d.bot_id=m.author_id AND d.status='pending')`, [botId, ...activeRunPhases, before, ...activeRunPhases, before, before, before, before]);
+        AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id=m.reply_to AND d.bot_id=m.author_id AND d.status='pending')`, [botId, ...activeRunPhases, before, ...activeRunPhases, before, before, before, before, before]);
       const events: HubEvent[] = [];
       for (const row of rows) {
         const old = this.decodeMessage(row);
@@ -1126,7 +1145,11 @@ export class HubStore {
           if (block.type !== "card") return false;
           const run = anyRun(block), answer = answerFollowup(block);
           const queue = queueNotice(block, old);
-          return (run && run.startedAt < before && isRunActive(run.phase)) || (answer && answer.startedAt < before && activeAnswerFollowup(answer)) || (queue && ["queued", "started"].includes(queue.state) && queue.at < before);
+          const transcription = transcriptionState(block);
+          return (run && run.startedAt < before && isRunActive(run.phase))
+            || (answer && answer.startedAt < before && activeAnswerFollowup(answer))
+            || (queue && ["queued", "started"].includes(queue.state) && queue.at < before)
+            || (transcription?.active === true && (transcription.at ?? old.createdAt) < before);
         })) continue;
         const message = this.interruptedRunMessage(old, "interrupted", "处理因实例重启而中断，以上内容已保留，待确认操作已关闭。", true);
         await this.saveMessage(message); events.push(await this.append(message.conversationId, "message.updated", message));

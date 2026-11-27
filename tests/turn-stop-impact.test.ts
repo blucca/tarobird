@@ -32,6 +32,14 @@ it("ends consent when the foreground changes, not when background reports update
 });
 
 const busRecord = (): Message => ({ id: "bus_record", conversationId: "chat", authorType: "bot", authorId: "claude", status: "streaming", version: 1, createdAt: 1, blocks: [{ type: "card", elements: [], extra: { agentBusStage: { runId: "run_one", workspaceId: "bus_one", stageId: "s1", status: "running" } } }] });
+
+const transcriptionCard = (): Message => ({
+  id: "transcribe", conversationId: "chat", authorType: "bot", authorId: "claude", status: "streaming", version: 1, createdAt: 1,
+  blocks: [{ type: "card", elements: [{ type: "markdown", text: "**正在转写音频…**" }], extra: { appTranscription: { version: 1, active: true } } }],
+});
+it("does not mistake an active transcription card for a foreground Claude run with background task risk", () => {
+  expect(turnStopImpact([transcriptionCard(), message("background", "claude", true)], bots, "chat")).toEqual({ risk: false, identity: "[]" });
+});
 it("does not target an independent Bus record or let its updates change foreground consent", () => {
   const record = busRecord();
   expect(turnStopImpact([record], bots, "chat")).toEqual({ risk: false, identity: "[]" });
