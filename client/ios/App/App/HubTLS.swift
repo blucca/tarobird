@@ -113,6 +113,14 @@ enum HubTLS {
         return "native_transport_failed"
     }
 
+    static func resolveProofError(failure: Error?, trustFailure: Error?, error: Error?, timedOut: Bool) -> Error? {
+        if let failure = failure { return failure }
+        if let trustFailure = trustFailure { return trustFailure }
+        if let error = error, (error as? URLError)?.code != .cancelled { return error }
+        if timedOut { return HubNetworkError("native_tls_identity_timeout") }
+        return error
+    }
+
     static func verify(_ bytes: Data, publicKey: String, nonce: String, certificate: Data) throws {
         let verifier = try self.publicKey(publicKey)
         guard bytes.count <= proofLimit, let value = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
@@ -199,7 +207,10 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
         request.timeoutInterval = 12
         let task = connection.session.dataTask(with: request)
         connection.handlers[task.taskIdentifier] = probe
-        let deadline = DispatchWorkItem { [weak probe] in probe?.markTimedOut(); task.cancel() }
+        let deadline = DispatchWorkItem { [weak probe] in
+            guard let probe = probe, probe.connection.trustFailure == nil else { return }
+            probe.markTimedOut(); task.cancel()
+        }
         probe.deadline = deadline
         queue.asyncAfter(deadline: .now() + 12, execute: deadline)
         task.resume()
@@ -431,7 +442,10 @@ private final class HubProofHandler: HubTaskHandler {
     private var bytes = Data()
     private var failure: Error?
     private var timedOut = false
-    func markTimedOut() { timedOut = true }
+    func markTimedOut() {
+        guard connection.trustFailure == nil else { return }
+        timedOut = true
+    }
     init(connection: HubTLSSession, publicKey: String, nonce: String, completion: @escaping (Result<HubTLSSession, Error>) -> Void) {
         self.connection = connection; key = publicKey; self.nonce = nonce; self.completion = completion
     }
@@ -450,7 +464,9 @@ private final class HubProofHandler: HubTaskHandler {
     override func completed(_ error: Error?) {
         deadline?.cancel(); deadline = nil
         do {
-            if let error = failure ?? (timedOut ? HubNetworkError("native_tls_identity_timeout") : error) { throw error }
+            if let resolved = HubTLS.resolveProofError(failure: failure, trustFailure: connection.trustFailure, error: error, timedOut: timedOut) {
+                throw resolved
+            }
             try connection.bindProof(bytes, key: key, nonce: nonce)
             completion(.success(connection))
         } catch { connection.cancelAll(); completion(.failure(error)) }

@@ -13,8 +13,10 @@ import {
   connectionVerificationFailure,
   connectionVerificationLabel,
   connectionVerificationMessage,
+  preferredVerificationDiagnostic,
   preferredVerificationFailure,
 } from "../client/src/connection-verification.js";
+import { connectionTiming } from "../client/src/connection-timing.js";
 import { setLocale } from "../client/src/i18n.js";
 
 const prevDocument = (globalThis as { document?: unknown }).document;
@@ -172,5 +174,72 @@ describe("iOS pairing TLS & transport failure diagnostics (#98)", () => {
     }
     expect(connectionDiagnosticCode(new DOMException("aborted", "AbortError"))).toBe("pairing_probe_timeout");
     expect(connectionDiagnosticCode(new Error("arbitrary user secret https://host.local"))).toBeUndefined();
+  });
+
+  it("keeps paired timeouts on auto-retry copy and avoids mislabeling offline probes as security timeouts", () => {
+    // Pairing context classifies generic abort/request timeouts as verification timeouts
+    expect(connectionVerificationFailure(new DOMException("aborted", "AbortError"), "pairing")).toBe("timeout");
+    expect(connectionVerificationFailure(new DOMException("timed out", "TimeoutError"), "pairing")).toBe("timeout");
+    expect(connectionVerificationFailure(new Error("native_request_timeout"), "pairing")).toBe("timeout");
+    expect(connectionVerificationFailure(new Error("native_tls_identity_timeout"), "pairing")).toBe("timeout");
+
+    // Paired context excludes generic AbortError/TimeoutError/native_request_timeout
+    expect(connectionVerificationFailure(new DOMException("aborted", "AbortError"), "paired")).toBeUndefined();
+    expect(connectionVerificationFailure(new DOMException("timed out", "TimeoutError"), "paired")).toBeUndefined();
+    expect(connectionVerificationFailure(new Error("native_request_timeout"), "paired")).toBeUndefined();
+    // Explicit native TLS identity timeout remains classified as timeout, while paired message defers to auto-retry copy
+    expect(connectionVerificationFailure(new Error("native_tls_identity_timeout"), "paired")).toBe("timeout");
+    // Concrete TLS certificate/identity failures still apply in paired context
+    expect(connectionVerificationFailure(new Error("native_tls_hostname_mismatch"), "paired")).toBe("hostname-mismatch");
+    expect(connectionVerificationFailure(new Error("tls_identity_mismatch"), "paired")).toBe("identity-mismatch");
+
+    setLocale("zh");
+    expect(connectionVerificationMessage("timeout", "pairing")).toBe("主机安全验证超时。当前网络或代理延迟较高，请检查网络与代理节点后重试。");
+    expect(connectionVerificationMessage("timeout", "paired")).toBeUndefined();
+    for (const code of ["native_socket_timeout", "native_request_timeout", "native_tls_identity_timeout", "connection_handshake_timeout"]) {
+      expect(connectionErrorMessage(new Error(code))).toBe("主机响应超时，正在自动重试。请确认主机仍在运行。");
+    }
+
+    setLocale("en");
+    expect(connectionVerificationMessage("timeout", "pairing")).toBe("Host security verification timed out. Network or proxy latency may be high — check your connection or proxy node and try again.");
+    expect(connectionVerificationMessage("timeout", "paired")).toBeUndefined();
+    for (const code of ["native_socket_timeout", "native_request_timeout", "native_tls_identity_timeout", "connection_handshake_timeout"]) {
+      expect(connectionErrorMessage(new Error(code))).toBe("The host timed out. Retrying automatically; make sure the host is still running.");
+    }
+    setLocale("zh");
+  });
+
+  it("aligns multi-route pairing diagnostic codes with the preferred failure route", () => {
+    expect(preferredVerificationDiagnostic([
+      new Error("native_connect_failed"),
+      new Error("native_tls_hostname_mismatch"),
+    ])).toEqual({ failure: "hostname-mismatch", code: "native_tls_hostname_mismatch" });
+
+    expect(preferredVerificationDiagnostic([
+      new DOMException("timed out", "TimeoutError"),
+      new Error("tls_identity_mismatch"),
+    ])).toEqual({ failure: "identity-mismatch", code: "tls_identity_mismatch" });
+
+    expect(preferredVerificationDiagnostic([
+      new Error("native_connect_failed"),
+      new Error("native_dns_failed"),
+    ])).toEqual({ failure: undefined, code: "native_connect_failed" });
+
+    expect(preferredVerificationDiagnostic([
+      new Error("unclassified_error"),
+      new Error("native_dns_failed"),
+    ])).toEqual({ failure: undefined, code: "native_dns_failed" });
+  });
+
+  it("gives native pinned reconnect probes a budget above HubTLS's 12 s identity deadline", () => {
+    const nativeTiming = connectionTiming({ name: "VPS", url: "https://relay.example.test" }, true);
+    expect(nativeTiming.probeMs).toBeGreaterThan(12_000);
+    expect(nativeTiming.handshakeMs).toBe(7000);
+
+    const webRemoteTiming = connectionTiming({ name: "VPS", url: "https://relay.example.test" }, false);
+    expect(webRemoteTiming.probeMs).toBe(6000);
+
+    const webLocalTiming = connectionTiming({ name: "Direct", url: "http://127.0.0.1:8788" }, false);
+    expect(webLocalTiming.probeMs).toBe(650);
   });
 });

@@ -408,7 +408,7 @@ export class HubConnection {
       } catch (error) {
         const code = error instanceof Error ? error.message : typeof error === "string" ? error : "";
         if (["native_document_retired", "native_document_unavailable", "native_view_unavailable"].includes(code)) localFailure = connectionErrorMessage(code);
-        const failure = connectionVerificationFailure(error);
+        const failure = connectionVerificationFailure(error, "paired");
         return { url: route.url, status: failure === "identity-mismatch" ? "wrong-hub" : "unreachable", ...(failure ? { failure } : {}) };
       }
     };

@@ -17,7 +17,7 @@ export function connectionErrorMessage(error: unknown): string {
   const code = error instanceof Error ? error.message : typeof error === "string" ? error : "";
   if (code === "device_pairing_required") return t("此安装不能使用旧的设备授权。请在「设备与网络」中移除此主机连接，再扫描主机上的二维码重新绑定。主机上的聊天记录不会删除。");
   const storage = deviceStorageErrorMessage(error); if (storage) return storage;
-  const verified = connectionVerificationMessage(connectionVerificationFailure(error), "paired");
+  const verified = connectionVerificationMessage(connectionVerificationFailure(error, "paired"), "paired");
   if (verified) return verified;
   if (code === "system_keychain_busy") return t("设备安全存储正忙，正在自动重试。配对和草稿仍保留。");
   if (code === "device_signature_pending") return t("正在等待系统确认设备身份。请查看钥匙串授权提示；完成后会自动连接，配对和草稿仍保留。");
@@ -63,8 +63,8 @@ export function connectionDiagnosticCode(error: unknown): string | undefined {
 }
 
 /** Keep native diagnostics machine-readable; translate only at the UI boundary. */
-export function connectionVerificationFailure(error: unknown): ConnectionVerificationFailure | undefined {
-  if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) return "timeout";
+export function connectionVerificationFailure(error: unknown, context: "pairing" | "paired" = "pairing"): ConnectionVerificationFailure | undefined {
+  if (context === "pairing" && error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) return "timeout";
   const code = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
   if (code === "tls_identity_mismatch") return "identity-mismatch";
   if (code === "hub_tls_identity_required" || code === "native_tls_identity_unavailable") return "verification-unavailable";
@@ -74,12 +74,13 @@ export function connectionVerificationFailure(error: unknown): ConnectionVerific
   if (code === "native_tls_cert_policy_rejected" || code === "native_ats_blocked") return "certificate-policy";
   if (code === "native_tls_untrusted" || code === "invalid_host_authority" || code === "native_tls_challenge_rejected") return "certificate-untrusted";
   if (code === "native_tls_handshake_failed") return "tls-handshake";
-  if (code === "native_tls_identity_timeout" || code === "native_request_timeout") return "timeout";
+  if (code === "native_tls_identity_timeout" || (context === "pairing" && code === "native_request_timeout")) return "timeout";
   return undefined;
 }
 export function connectionVerificationMessage(failure: ConnectionVerificationFailure | undefined, context: "pairing" | "paired" = "pairing"): string | undefined {
   if (context === "paired" && failure === "identity-mismatch") return t("主机身份校验未通过，请先核对连接地址。若确认主机已重装或更换身份，请重新配对。");
   if (context === "paired" && failure === "invalid-key") return t("已保存的主机身份公钥缺失或无效，请重新配对此设备。");
+  if (context === "paired" && failure === "timeout") return undefined;
   if (failure === "identity-mismatch") return t("主机身份校验未通过，请核对连接地址和主机身份公钥。");
   if (failure === "hostname-mismatch") return t("主机 TLS 证书未覆盖当前连接域名或 IP（SAN 不匹配），请更新主机证书后重试。");
   if (failure === "certificate-expired") return t("主机 TLS 证书已过期或尚未生效，请检查主机与本机系统时间，或重新生成主机证书。");
@@ -96,6 +97,19 @@ export function preferredVerificationFailure(failures: (ConnectionVerificationFa
     if (failures.includes(kind)) return kind;
   }
   return undefined;
+}
+export function preferredVerificationDiagnostic(
+  reasons: readonly unknown[],
+  context: "pairing" | "paired" = "pairing",
+): { failure: ConnectionVerificationFailure | undefined; code: string | undefined } {
+  const entries = reasons.map((reason) => ({
+    failure: connectionVerificationFailure(reason, context),
+    code: connectionDiagnosticCode(reason),
+  }));
+  const failure = preferredVerificationFailure(entries.map((entry) => entry.failure));
+  const code = (failure ? entries.find((entry) => entry.failure === failure && entry.code)?.code : undefined)
+    ?? entries.find((entry) => entry.code)?.code;
+  return { failure, code };
 }
 export function connectionVerificationLabel(failure: ConnectionVerificationFailure | undefined): string | undefined {
   if (failure === "identity-mismatch") return t("主机身份不匹配");

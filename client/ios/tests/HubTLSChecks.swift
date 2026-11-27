@@ -133,6 +133,20 @@ private final class SocketProbe: HubTaskHandler, @unchecked Sendable {
             try check(HubTLS.classifyTransportError(URLError(.secureConnectionFailed)) == "native_tls_handshake_failed", "classifyHandshakeError")
             try check(HubTLS.classifyTransportError(URLError(.serverCertificateHasBadDate)) == "native_tls_cert_expired", "classifyExpiredError")
             try check(HubTLS.classifyTransportError(HubNetworkError("native_tls_identity_timeout")) == "native_tls_identity_timeout", "classifyIdentityTimeoutError")
+            // Proof error precedence: trust failures and concrete transport errors must never be overwritten by a racing timeout flag.
+            let proofTrustRace = HubTLS.resolveProofError(failure: nil, trustFailure: HubNetworkError("native_tls_hostname_mismatch"), error: URLError(.cancelled), timedOut: true)
+            try check(proofTrustRace.map(HubTLS.classifyTransportError) == "native_tls_hostname_mismatch", "proofErrorTrustBeatsTimeout")
+            let proofTransportRace = HubTLS.resolveProofError(failure: nil, trustFailure: nil, error: URLError(.cannotConnectToHost), timedOut: true)
+            try check(proofTransportRace.map(HubTLS.classifyTransportError) == "native_connect_failed", "proofErrorTransportBeatsTimeout")
+            let proofResponseRace = HubTLS.resolveProofError(failure: HubNetworkError("hub_tls_identity_required"), trustFailure: nil, error: URLError(.cancelled), timedOut: true)
+            try check(proofResponseRace.map(HubTLS.classifyTransportError) == "hub_tls_identity_required", "proofErrorFailureBeatsTimeout")
+            let proofCancelledTimeout = HubTLS.resolveProofError(failure: nil, trustFailure: nil, error: URLError(.cancelled), timedOut: true)
+            try check(proofCancelledTimeout.map(HubTLS.classifyTransportError) == "native_tls_identity_timeout", "proofErrorCancelledSynthesizesTimeout")
+            let proofNilTimeout = HubTLS.resolveProofError(failure: nil, trustFailure: nil, error: nil, timedOut: true)
+            try check(proofNilTimeout.map(HubTLS.classifyTransportError) == "native_tls_identity_timeout", "proofErrorNilSynthesizesTimeout")
+            let proofExternalCancel = HubTLS.resolveProofError(failure: nil, trustFailure: nil, error: URLError(.cancelled), timedOut: false)
+            try check((proofExternalCancel as? URLError)?.code == .cancelled, "proofErrorPreservesNonTimeoutCancel")
+            try check(HubTLS.resolveProofError(failure: nil, trustFailure: nil, error: nil, timedOut: false) == nil, "proofErrorNilOnSuccess")
             try await rejects("activeProxyRejectedBeforeCredentials") { _ = try await prepare(proxy, key, ca) }
             try await rejects("cleartextLoopbackRejected") { _ = try HubTLS.origin("http://127.0.0.1:1") }
             let real = try await prepare(hub, key, ca); sessions.append(real)
