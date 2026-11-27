@@ -1246,6 +1246,13 @@ export class HubDispatch {
             next = await this.requestStop({ ...current, updatedAt: now }, "pause", events); break;
           case "resume":
             if (current.attempts.at(-1)?.stopRequested && !current.attempts.at(-1)?.endedAt) throw new HubError("ticket_stop_pending", 409);
+            {
+              // An owner resume is refused while the ticket's conversation is
+              // archived; only settlement notices are deferred.
+              const home = await this.conversationStateOf(row.dispatcher_bot_id, current.conversationId);
+              if (!home) throw new HubError("dispatcher_conversation_required", 409);
+              if (home.archived) throw new HubError("conversation_archived", 409);
+            }
             next = { ...current, paused: false, updatedAt: now };
             events.push(...[await this.noticeInTransaction(source!, row.dispatcher_bot_id, `resume_${ticketId}_${input.requestId}`, current.id, `【工单恢复】「${current.title}」（${current.id}）已由你恢复，当前状态：${STATUS_LABELS[current.status]}。请继续处理。`)].filter(event => !!event)); break;
           case "cancel":

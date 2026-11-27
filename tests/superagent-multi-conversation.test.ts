@@ -146,6 +146,17 @@ describe("Superagent multiple conversations, groups, and Bot messages (#122)", (
     expect(notices).toHaveLength(1);
   });
 
+  it("refuses to resume a ticket whose conversation is archived", async () => {
+    const ticket = await hub.dispatch.create(owner, "super", { requestId: "resume-arch", title: "Paused Work", request: "Wait", conversationId: firstChat.id });
+    await hub.dispatch.action("owner", ticket.id, { requestId: "resume-arch-pause", action: "pause" });
+    await hub.store.updateConversation("owner", firstChat.id, { archived: true });
+    await expect(hub.dispatch.action("owner", ticket.id, { requestId: "resume-arch-resume", action: "resume" })).rejects.toThrow("conversation_archived");
+    expect((await hub.dispatch.show(owner, ticket.id)).paused).toBe(true);
+    expect(await hub.store.db.all("SELECT key FROM meta WHERE key LIKE 'dispatch:pending-notice:%'")).toEqual([]);
+    await hub.store.updateConversation("owner", firstChat.id, { archived: false });
+    await expect(hub.dispatch.action("owner", ticket.id, { requestId: "resume-arch-resume-2", action: "resume" })).resolves.toMatchObject({ paused: false });
+  });
+
   it("rejects archived targets, skips archived home chats, and settles tickets without wedging concurrency slots or leaking notices", async () => {
     const secondChat = await hub.store.createConversation("owner", ["super"], "Project Beta", "beta");
     const group = await hub.store.createConversation("owner", ["super", "helper"], "Squad", "squad", { type: "group" });
