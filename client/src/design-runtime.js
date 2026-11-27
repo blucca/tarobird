@@ -2,6 +2,7 @@ import { decodeBase64 } from "../../src/client-protocol/base64.js";
 // Runs only in the opaque-origin Design iframe. It has no native bridge,
 // cookies, parent DOM or network access. The MessagePort belongs to one tab.
 import { sha256, sha384, sha512 } from "@noble/hashes/sha2.js";
+import { legacySlideText } from "./workbench-slides-legacy.js";
 export function startDesignRuntime(resources, boot, format = "canvas") {
   // Opaque data: iframes throw SecurityError when accessing localStorage/sessionStorage.
   // Provide an isolated in-memory Storage shim so editor preferences never crash.
@@ -247,7 +248,10 @@ export function startDesignRuntime(resources, boot, format = "canvas") {
           const file = await request("read", { path });
           if (!file) { lastKnownHashes.delete(path); throw artifactError("not_found", `Missing file: ${path}`); }
           if (typeof file.sha256 === "string") lastKnownHashes.set(path, file.sha256);
-          return new TextDecoder("utf-8").decode(bytes(file.base64));
+          const text = new TextDecoder("utf-8").decode(bytes(file.base64));
+          // A slide saved by the 1.6.0 editor: the editor is given a form it places
+          // the same way. The stored file and its hash (the editor's ifMatch) stay.
+          return /^project\/slides\/[^/]+\.html$/.test(path) ? legacySlideText(text) : text;
         },
         async readBytes(path) {
           const file = await request("read", { path });
