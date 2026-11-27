@@ -19,6 +19,7 @@ const execFileAsync = promisify(execFile);
 const HISTORY_LIMIT = 24;
 const MAX_HISTORY_USERS = 128;
 const MIN_HISTORY_INTERVAL_MS = 1_500;
+const DEFAULT_SAMPLE_CACHE_TTL_MS = 2_500;
 const MAX_SELF_PROCESSES = 32;
 const MAX_BOT_GROUPS = 128;
 const MAX_CONVERSATIONS_PER_BOT = 64;
@@ -55,9 +56,13 @@ export interface HostResourcesOptions {
   desktopAppPid?: number | (() => number | undefined);
   platform?: NodeJS.Platform;
   childPids: () => Map<string, number>;
+  /** Optional exact PID linkage (`conversationId -> root child PIDs`) for a Bot with multiple concurrent turns. */
+  turnPids?: (botId: string) => ReadonlyMap<string, readonly number[]> | undefined;
   stopBotTurn: (botId: string, conversationId: string, userId: string) => Promise<boolean>;
   sampleProcesses?: () => Promise<OsProcessSample[]>;
   killPid?: (pid: number) => Promise<void>;
+  sampleCacheTtlMs?: number;
+  now?: () => number;
 }
 
 function roundCpu(value: number): number {
@@ -213,10 +218,74 @@ interface UserHistoryBucket {
   lastSampleAt: number;
 }
 
+interface CachedProcessSample {
+  samples: OsProcessSample[];
+  sampledAt: number;
+  generation: number;
+}
+
+interface InflightProcessSample {
+  promise: Promise<CachedProcessSample>;
+  generation: number;
+}
+
 export class HubHostResources {
   private readonly histories = new Map<string, UserHistoryBucket>();
+  private sampleCache?: CachedProcessSample;
+  private inflightSample?: InflightProcessSample;
+  private sampleGeneration = 0;
 
   constructor(private readonly options: HostResourcesOptions) {}
+
+  private currentTime(): number {
+    return this.options.now ? this.options.now() : Date.now();
+  }
+
+  private invalidateSampleCache(): void {
+    this.sampleGeneration += 1;
+    this.sampleCache = undefined;
+  }
+
+  /**
+   * Short-TTL cache + single-flight request coalescing for OS process sampling.
+   * Raw process samples are shared across concurrent/repeated readers while all
+   * per-user filtering, Bot/conversation authorization, and history stay isolated.
+   */
+  private async readProcessSamples(bypassCache: boolean): Promise<CachedProcessSample> {
+    const ttlMs = this.options.sampleCacheTtlMs ?? DEFAULT_SAMPLE_CACHE_TTL_MS;
+    const now = this.currentTime();
+    if (
+      !bypassCache
+      && ttlMs > 0
+      && this.sampleCache
+      && this.sampleCache.generation === this.sampleGeneration
+      && now - this.sampleCache.sampledAt < ttlMs
+    ) {
+      return this.sampleCache;
+    }
+    if (this.inflightSample && this.inflightSample.generation === this.sampleGeneration) {
+      return this.inflightSample.promise;
+    }
+    const generation = this.sampleGeneration;
+    const platform = this.options.platform ?? process.platform;
+    const samplePromise = (this.options.sampleProcesses ?? (() => sampleOsProcesses(platform)))();
+    const entry: InflightProcessSample = {
+      generation,
+      promise: samplePromise.then((samples) => {
+        const result: CachedProcessSample = { samples, sampledAt: this.currentTime(), generation };
+        if (this.sampleGeneration === generation) {
+          this.sampleCache = result;
+        }
+        return result;
+      }).finally(() => {
+        if (this.inflightSample === entry) {
+          this.inflightSample = undefined;
+        }
+      }),
+    };
+    this.inflightSample = entry;
+    return entry.promise;
+  }
 
   private resolveDesktopAppPid(): number | undefined {
     const configured = typeof this.options.desktopAppPid === "function"
@@ -285,14 +354,16 @@ export class HubHostResources {
 
   async snapshot(userId: string, canStop: boolean, force = false): Promise<HostResourcesSnapshot> {
     const isOwner = canStop;
+    const allowForce = isOwner && force;
     const platform = this.options.platform ?? process.platform;
     const hubPid = this.options.hubPid ?? process.pid;
-    const [samples, bots, conversations, activeTurnsAll] = await Promise.all([
-      (this.options.sampleProcesses ?? (() => sampleOsProcesses(platform)))(),
+    const [sampleResult, bots, conversations, activeTurnsAll] = await Promise.all([
+      this.readProcessSamples(allowForce),
       this.options.store.bots(userId),
       this.options.store.conversations(userId),
       this.allActiveTurns(),
     ]);
+    const samples = sampleResult.samples;
 
     const byPid = new Map<number, OsProcessSample>();
     const byParent = new Map<number, OsProcessSample[]>();
@@ -502,54 +573,78 @@ export class HubHostResources {
         // When `!isOwner` and the single active turn belongs to another user,
         // omit its engine/tool descendants entirely so private activity never leaks.
       } else if (allTurns.length > 1) {
-        const directChildren = (gatewayPid ? byParent.get(gatewayPid) ?? [] : []).slice().sort((a, b) => a.pid - b.pid);
-        if (!isOwner && hasHiddenTurns && directChildren.length < allTurns.length) {
-          // Shared worker serves both visible and hidden turns; expose only the user's
-          // own active conversation entries without leaking another user's subprocesses.
-          for (const turn of visibleTurns) {
+        // Never blindly assign `directChildren[index]` to `allTurns[index]`: persistent
+        // shared workers (Codex app-server, Claude stream, Pi RPC, DeepSeek harness),
+        // helper subprocesses, and PID wraparound make positional matching inaccurate
+        // and unsafe across members. Attribute per-conversation PIDs ONLY when exact
+        // `turnPids` linkage is available; otherwise keep each active conversation
+        // individually stoppable and group shared engine processes under the Bot.
+        const descendantPidSet = new Set(descendants.map((proc) => proc.pid));
+        const rawTurnPids = this.options.turnPids?.(bot.id);
+        const claimedRootsByTurn = new Map<string, number[]>();
+        const allClaimedRoots = new Set<number>();
+        if (rawTurnPids && rawTurnPids.size > 0) {
+          for (const turn of allTurns) {
+            const linked = rawTurnPids.get(turn.conversationId);
+            if (!linked?.length) continue;
+            const roots: number[] = [];
+            for (const pid of linked) {
+              if (!descendantPidSet.has(pid) || allClaimedRoots.has(pid)) continue;
+              allClaimedRoots.add(pid);
+              roots.push(pid);
+            }
+            if (roots.length) claimedRootsByTurn.set(turn.conversationId, roots);
+          }
+        }
+
+        const assignedPids = new Set<number>();
+        for (const turn of allTurns) {
+          const roots = claimedRootsByTurn.get(turn.conversationId) ?? [];
+          const tree: OsProcessSample[] = [];
+          const treeSeen = new Set<number>();
+          for (const rootPid of roots) {
+            const rootSample = byPid.get(rootPid);
+            if (!rootSample || treeSeen.has(rootSample.pid)) continue;
+            treeSeen.add(rootSample.pid);
+            tree.push(rootSample);
+            for (const child of collectDescendants(rootSample.pid, byParent, allClaimedRoots)) {
+              if (treeSeen.has(child.pid)) continue;
+              treeSeen.add(child.pid);
+              tree.push(child);
+            }
+          }
+          for (const proc of tree) assignedPids.add(proc.pid);
+
+          if (conversationIds.has(turn.conversationId)) {
             const title = conversationTitles.get(turn.conversationId) ?? clampString(turn.conversationId, MAX_TITLE_LEN);
+            const allTurnProcesses = tree.map((proc) => buildTurnProcess(turn, title, proc));
+            botProcessCount += allTurnProcesses.length;
             convGroups.push({
               conversationId: turn.conversationId,
               title,
               active: true,
-              cpuPercent: 0,
-              memoryBytes: 0,
+              cpuPercent: roundCpu(allTurnProcesses.reduce((sum, p) => sum + p.cpuPercent, 0)),
+              memoryBytes: allTurnProcesses.reduce((sum, p) => sum + p.memoryBytes, 0),
               stoppable: canStop,
-              processes: [],
+              processes: sortProcessesByUsage(allTurnProcesses).slice(0, MAX_PROCESSES_PER_GROUP),
             });
-          }
-        } else {
-          const assignedPids = new Set<number>();
-          allTurns.forEach((turn, index) => {
-            const root = directChildren[index];
-            const tree = root ? [root, ...collectDescendants(root.pid, byParent)] : [];
-            for (const proc of tree) assignedPids.add(proc.pid);
-            if (conversationIds.has(turn.conversationId)) {
-              const title = conversationTitles.get(turn.conversationId) ?? clampString(turn.conversationId, MAX_TITLE_LEN);
-              const allTurnProcesses = tree.map((proc) => buildTurnProcess(turn, title, proc));
-              botProcessCount += allTurnProcesses.length;
-              convGroups.push({
-                conversationId: turn.conversationId,
-                title,
-                active: true,
-                cpuPercent: roundCpu(allTurnProcesses.reduce((sum, p) => sum + p.cpuPercent, 0)),
-                memoryBytes: allTurnProcesses.reduce((sum, p) => sum + p.memoryBytes, 0),
-                stoppable: canStop,
-                processes: sortProcessesByUsage(allTurnProcesses).slice(0, MAX_PROCESSES_PER_GROUP),
-              });
-            } else if (isOwner) {
-              for (const proc of tree) {
-                botUnattributed.push(buildBotEngineProcess("unattributed", proc));
-              }
-              botProcessCount += tree.length;
-            }
-          });
-          if (isOwner || !hasHiddenTurns) {
-            for (const proc of descendants) {
-              if (assignedPids.has(proc.pid)) continue;
+          } else if (isOwner) {
+            for (const proc of tree) {
               botUnattributed.push(buildBotEngineProcess("unattributed", proc));
-              botProcessCount += 1;
             }
+            botProcessCount += tree.length;
+          }
+        }
+
+        // Unlinked/shared engine descendants remain grouped at the Bot level for owners
+        // or when every active turn on this Bot belongs to the requesting user. When a
+        // non-owner shares a Bot with hidden turns, omit unlinked engine processes so
+        // another user's private activity never leaks.
+        if (isOwner || !hasHiddenTurns) {
+          for (const proc of descendants) {
+            if (assignedPids.has(proc.pid)) continue;
+            botUnattributed.push(buildBotEngineProcess("unattributed", proc));
+            botProcessCount += 1;
           }
         }
       } else {
@@ -606,10 +701,9 @@ export class HubHostResources {
     const engineMem = allBotGroups.reduce((s, b) => s + b.memoryBytes, 0) + allUnattributed.reduce((s, p) => s + p.memoryBytes, 0);
     const totalCpu = roundCpu(hostCpu + appCpu + engineCpu);
     const totalMem = hostMem + appMem + engineMem;
-    const now = Date.now();
+    const now = this.currentTime();
 
     const bucket = this.historyBucket(userId);
-    const allowForce = isOwner && force;
     if (allowForce || !bucket.points.length || now - bucket.lastSampleAt >= MIN_HISTORY_INTERVAL_MS) {
       bucket.lastSampleAt = now;
       bucket.points.push({ at: now, cpuPercent: totalCpu, memoryBytes: totalMem });
@@ -620,7 +714,7 @@ export class HubHostResources {
 
     return hostResourcesSnapshotSchema.parse({
       v: 1,
-      sampledAt: now,
+      sampledAt: sampleResult.sampledAt,
       platform: clampString(platform, MAX_PLATFORM_LEN) || "unknown",
       canStop,
       summary: {
@@ -642,16 +736,18 @@ export class HubHostResources {
     });
   }
 
-  async stop(userId: string, request: HostResourceStopRequest): Promise<HostResourceStopResult> {
+  async stop(userId: string, request: HostResourceStopRequest, beforeAction?: () => Promise<void>): Promise<HostResourceStopResult> {
     if (request.conversationId) {
       const conversations = await this.options.store.conversations(userId);
       const conversation = conversations.find((c) => c.id === request.conversationId);
       if (!conversation || !conversation.botIds.includes(request.botId)) {
         throw new HubError("bot_forbidden", 403);
       }
+      await beforeAction?.();
       // Graceful conversation turn stop never falls through to `killProcessTree`:
       // persistent engine workers (Codex app-server, Claude, Pi RPC, ACP) may serve other active runs.
       const stopped = await this.options.stopBotTurn(request.botId, request.conversationId, userId);
+      this.invalidateSampleCache();
       await this.options.store.audit("host_resources.stopped", userId, {
         botId: request.botId,
         conversationId: request.conversationId,
@@ -670,8 +766,8 @@ export class HubHostResources {
     if (!gatewayPid || request.pid === gatewayPid || request.pid === (this.options.hubPid ?? process.pid)) {
       throw new HubError("resource_process_not_owned", 403);
     }
-    const platform = this.options.platform ?? process.platform;
-    const samples = await (this.options.sampleProcesses ?? (() => sampleOsProcesses(platform)))();
+    this.invalidateSampleCache();
+    const { samples } = await this.readProcessSamples(true);
     const byParent = new Map<number, OsProcessSample[]>();
     for (const sample of samples) {
       const list = byParent.get(sample.ppid);
@@ -682,11 +778,13 @@ export class HubHostResources {
     if (!descendants.some((p) => p.pid === request.pid)) {
       throw new HubError("resource_process_not_owned", 403);
     }
+    await beforeAction?.();
     if (this.options.killPid) {
       await this.options.killPid(request.pid);
     } else {
       await killProcessTree(request.pid);
     }
+    this.invalidateSampleCache();
     await this.options.store.audit("host_resources.stopped", userId, {
       botId: request.botId,
       pid: request.pid,

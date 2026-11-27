@@ -25,7 +25,6 @@ export type ResourceHostEntry = {
   connection: HubConnection;
 };
 
-const POLL_CLOSED_MS = 10_000;
 const POLL_OPEN_MS = 3_000;
 
 function useConnectionState(connection: HubConnection | undefined): ConnectionState | undefined {
@@ -217,6 +216,7 @@ function ResourceTreeBody({
   loading,
   error,
   sort,
+  forceReadOnly = false,
   stoppingKey,
   onRequestStop,
 }: {
@@ -227,6 +227,7 @@ function ResourceTreeBody({
   loading: boolean;
   error: string;
   sort: ResourceSortKey;
+  forceReadOnly?: boolean;
   stoppingKey?: string;
   onRequestStop?: (target: PendingStop) => void;
 }) {
@@ -249,8 +250,8 @@ function ResourceTreeBody({
     return <p className="resources-empty muted" role="status">{loading ? t("正在采样进程资源…") : t("暂无资源数据")}</p>;
   }
 
-  const readOnly = !snapshot.canStop;
-  const canStop = snapshot.canStop;
+  const readOnly = forceReadOnly || !snapshot.canStop;
+  const canStop = !readOnly;
   const toggleBot = (botId: string) => setCollapsed((old) => ({ ...old, [botId]: !old[botId] }));
 
   return (
@@ -327,72 +328,96 @@ function ResourceTreeBody({
                   </button>
                   {!isCollapsed && (
                     <div className="resources-bot-children">
-                      {conversations.map((conv) => {
-                        const convStopKey = `${bot.botId}:${conv.conversationId}`;
+                      {(() => {
+                        const hasSharedMultiTurn = bot.activeTurns > 1
+                          && conversations.some((conv) => conv.processes.length === 0)
+                          && bot.unattributed.some((proc) => proc.kind === "engine");
                         return (
-                          <div key={conv.conversationId} className="resources-conv-group">
-                            <div className="resources-conv-row">
-                              <span className="resources-conv-title" title={conv.title}>{conv.title}</span>
-                              <span className="resources-row-metrics">
-                                <span>{formatCpuPercent(conv.cpuPercent)}</span>
-                                <span>{formatMemoryBytes(conv.memoryBytes)}</span>
-                              </span>
-                              {canStop && conv.stoppable && (
-                                <button
-                                  type="button"
-                                  className="resources-stop-btn"
-                                  disabled={stoppingKey === convStopKey}
-                                  aria-label={t("停止 {0} 中的运行", conv.title)}
-                                  onClick={() => onRequestStop?.({
-                                    mode: "conversation",
-                                    botId: bot.botId,
-                                    botName: bot.botName,
-                                    conversationId: conv.conversationId,
-                                    conversationTitle: conv.title,
-                                  })}
-                                >
-                                  <Square size={11} aria-hidden="true" />
-                                  <span>{t("停止")}</span>
-                                </button>
-                              )}
-                            </div>
-                            {conv.processes.length > 0 && (
-                              <ul className="resources-proc-list">
-                                {conv.processes.map((proc: ResourceProcess) => {
-                                  const procKey = `${bot.botId}:pid:${proc.pid}`;
-                                  return (
-                                    <li key={proc.id} className="resources-proc-row">
-                                      <span className="resources-proc-name">{proc.name}</span>
-                                      <span className="resources-proc-pid">PID {proc.pid}</span>
-                                      <span className="resources-row-metrics">
-                                        <span>{formatCpuPercent(proc.cpuPercent)}</span>
-                                        <span>{formatMemoryBytes(proc.memoryBytes)}</span>
-                                      </span>
-                                      {canStop && proc.stoppable && conv.processes.length > 1 && (
-                                        <button
-                                          type="button"
-                                          className="resources-stop-btn is-subtle"
-                                          disabled={stoppingKey === procKey}
-                                          aria-label={t("停止进程 {0}", proc.pid)}
-                                          onClick={() => onRequestStop?.({
-                                            mode: "process",
-                                            botId: bot.botId,
-                                            botName: bot.botName,
-                                            pid: proc.pid,
-                                            processName: proc.name,
-                                          })}
-                                        >
-                                          <Square size={10} aria-hidden="true" />
-                                        </button>
+                          <>
+                            {conversations.map((conv) => {
+                              const convStopKey = `${bot.botId}:${conv.conversationId}`;
+                              const isSharedMetrics = hasSharedMultiTurn
+                                && conv.processes.length === 0
+                                && conv.cpuPercent === 0
+                                && conv.memoryBytes === 0;
+                              return (
+                                <div key={conv.conversationId} className="resources-conv-group">
+                                  <div className="resources-conv-row">
+                                    <span className="resources-conv-title" title={conv.title}>{conv.title}</span>
+                                    <span className="resources-row-metrics">
+                                      {isSharedMetrics ? (
+                                        <span className="resources-shared-tag">{t("共享进程")}</span>
+                                      ) : (
+                                        <>
+                                          <span>{formatCpuPercent(conv.cpuPercent)}</span>
+                                          <span>{formatMemoryBytes(conv.memoryBytes)}</span>
+                                        </>
                                       )}
-                                    </li>
-                                  );
-                                })}
-                              </ul>
+                                    </span>
+                                    {canStop && conv.stoppable && (
+                                      <button
+                                        type="button"
+                                        className="resources-stop-btn"
+                                        disabled={stoppingKey === convStopKey}
+                                        aria-label={t("停止 {0} 中的运行", conv.title)}
+                                        onClick={() => onRequestStop?.({
+                                          mode: "conversation",
+                                          botId: bot.botId,
+                                          botName: bot.botName,
+                                          conversationId: conv.conversationId,
+                                          conversationTitle: conv.title,
+                                        })}
+                                      >
+                                        <Square size={11} aria-hidden="true" />
+                                        <span>{t("停止")}</span>
+                                      </button>
+                                    )}
+                                  </div>
+                                  {conv.processes.length > 0 && (
+                                    <ul className="resources-proc-list">
+                                      {conv.processes.map((proc: ResourceProcess) => {
+                                        const procKey = `${bot.botId}:pid:${proc.pid}`;
+                                        return (
+                                          <li key={proc.id} className="resources-proc-row">
+                                            <span className="resources-proc-name">{proc.name}</span>
+                                            <span className="resources-proc-pid">PID {proc.pid}</span>
+                                            <span className="resources-row-metrics">
+                                              <span>{formatCpuPercent(proc.cpuPercent)}</span>
+                                              <span>{formatMemoryBytes(proc.memoryBytes)}</span>
+                                            </span>
+                                            {canStop && proc.stoppable && conv.processes.length > 1 && (
+                                              <button
+                                                type="button"
+                                                className="resources-stop-btn is-subtle"
+                                                disabled={stoppingKey === procKey}
+                                                aria-label={t("停止进程 {0}", proc.pid)}
+                                                onClick={() => onRequestStop?.({
+                                                  mode: "process",
+                                                  botId: bot.botId,
+                                                  botName: bot.botName,
+                                                  pid: proc.pid,
+                                                  processName: proc.name,
+                                                })}
+                                              >
+                                                <Square size={10} aria-hidden="true" />
+                                              </button>
+                                            )}
+                                          </li>
+                                        );
+                                      })}
+                                    </ul>
+                                  )}
+                                </div>
+                              );
+                            })}
+                            {hasSharedMultiTurn && (
+                              <p className="resources-shared-note">
+                                {t("多个并发对话共享此 Bot 的引擎进程，进程占用汇总列在下方；仍可按对话分别停止。")}
+                              </p>
                             )}
-                          </div>
+                          </>
                         );
-                      })}
+                      })()}
                       {bot.unattributed.length > 0 && (
                         <ul className="resources-proc-list is-bot-other">
                           {bot.unattributed.map((proc: ResourceProcess) => {
@@ -822,17 +847,110 @@ export function ResourcesManagerDialog({
   );
 }
 
-/** Lightweight Workspace Rail footer icon button that opens the shared Resource Manager dialog. */
-export const ResourcesTriggerButton = forwardRef<HTMLButtonElement, {
-  connection: HubConnection;
+/** Responsive read-only phone Resource Manager page mounted from the Host's tools page. */
+export function MobileResourcesDialog({
+  hosts,
+  activeHostId,
+  visible,
+  onClose,
+}: {
+  hosts: readonly ResourceHostEntry[];
+  activeHostId: string;
   visible: boolean;
+  onClose: () => void;
+}) {
+  useLocale();
+  const [selectedHostId, setSelectedHostId] = useState(activeHostId);
+  const [sort, setSort] = useState<ResourceSortKey>("memory");
+
+  const targetHost = hosts.find((h) => h.id === selectedHostId)
+    ?? hosts.find((h) => h.id === activeHostId)
+    ?? hosts[0];
+
+  useEffect(() => {
+    if (!visible) onClose();
+  }, [visible, onClose]);
+
+  const { snapshot, loading, error, status, available, ready, refresh } = useHostResources(
+    targetHost?.connection,
+    visible,
+    POLL_OPEN_MS,
+  );
+
+  if (!targetHost) return null;
+
+  return (
+    <CreationDialog
+      mobilePage
+      showHost={false}
+      title={t("资源管理")}
+      closeLabel={t("返回")}
+      close={onClose}
+      className="resources-mobile-dialog"
+      headerActions={(
+        <button
+          type="button"
+          className="icon-button"
+          aria-label={t("刷新资源")}
+          title={t("刷新资源")}
+          disabled={loading || !ready}
+          onClick={refresh}
+        >
+          <RefreshCw size={17} className={loading ? "spin" : undefined} />
+        </button>
+      )}
+    >
+      <div className="resources-toolbar">
+        {hosts.length > 1 ? (
+          <label className="resources-select-wrap">
+            <Monitor size={14} aria-hidden="true" />
+            <select
+              aria-label={t("切换主机")}
+              value={targetHost.id}
+              onChange={(e) => setSelectedHostId(e.target.value)}
+            >
+              {hosts.map((host) => (
+                <option key={host.id} value={host.id}>{host.name}</option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <span className="resources-host-label"><Monitor size={14} aria-hidden="true" />{targetHost.name}</span>
+        )}
+        <label className="resources-select-wrap">
+          <span className="screen-reader-only">{t("排序方式")}</span>
+          <select aria-label={t("排序方式")} value={sort} onChange={(e) => setSort(e.target.value as ResourceSortKey)}>
+            <option value="memory">{t("按内存排序")}</option>
+            <option value="cpu">{t("按 CPU 排序")}</option>
+            <option value="name">{t("按名称排序")}</option>
+          </select>
+        </label>
+      </div>
+      <p className="resources-mobile-note">
+        {t("手机端仅支持查看资源占用；如需停止异常引擎进程，请在电脑端操作。")}
+      </p>
+      <ResourceTreeBody
+        hostName={targetHost.name}
+        status={status}
+        available={available}
+        snapshot={snapshot}
+        loading={loading}
+        error={error}
+        sort={sort}
+        forceReadOnly
+      />
+    </CreationDialog>
+  );
+}
+
+/** Lightweight Workspace Rail footer icon button that opens the shared Resource Manager dialog.
+ * Does not poll in the background while the dialog is closed. */
+export const ResourcesTriggerButton = forwardRef<HTMLButtonElement, {
   open: boolean;
   controlsId?: string;
   onOpen: () => void;
-}>(function ResourcesTriggerButton({ connection, visible, open, controlsId, onOpen }, ref) {
+}>(function ResourcesTriggerButton({ open, controlsId, onOpen }, ref) {
   useLocale();
-  const { snapshot } = useHostResources(connection, visible && !open, POLL_CLOSED_MS);
-  const summaryMem = snapshot ? formatMemoryBytes(snapshot.summary.totalMemoryBytes) : "";
 
   return (
     <button
@@ -843,7 +961,7 @@ export const ResourcesTriggerButton = forwardRef<HTMLButtonElement, {
       aria-expanded={open}
       aria-controls={open ? controlsId : undefined}
       aria-label={t("资源")}
-      title={snapshot ? t("资源 · CPU {0} · 内存 {1}", formatCpuPercent(snapshot.summary.totalCpuPercent), summaryMem) : t("资源")}
+      title={t("资源管理")}
       onClick={onOpen}
     >
       <Activity size={15} aria-hidden="true" />
@@ -878,8 +996,6 @@ export function DesktopResourcesBar({
     <>
       <ResourcesTriggerButton
         ref={triggerRef}
-        connection={activeHost.connection}
-        visible={visible}
         open={open}
         controlsId={dialogId}
         onOpen={() => setOpen(true)}

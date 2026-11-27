@@ -317,6 +317,8 @@ CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id,cre
 -- Ticket settlement checks one input's replies repeatedly, not the worker
 -- conversation's full history. Keep the result order in the same small range.
 CREATE INDEX IF NOT EXISTS messages_bot_replies ON messages(conversation_id,reply_to,author_id,created_at,id) WHERE author_type='bot' AND status!='deleted';
+-- Host Resources reads active bot turns on the shared queue without scanning historical message bodies.
+CREATE INDEX IF NOT EXISTS messages_active_bot_turns ON messages(created_at) WHERE author_type='bot' AND status IN ('pending','streaming');
 -- Personal history is ordered by SQLite insertion order, not created_at. The
 -- implicit rowid suffix avoids sorting every historical body for each page.
 CREATE INDEX IF NOT EXISTS messages_personal_history ON messages(conversation_id) WHERE status!='deleted';

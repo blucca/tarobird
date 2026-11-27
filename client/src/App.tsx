@@ -149,7 +149,7 @@ import { UserReplyStatus } from "./UserReplyStatus.js";
 import { userReplyStatuses } from "./user-reply-status.js";
 import { FileCenter } from "./FileCenter.js";
 import { OperationsPanel } from "./OperationsPanel.js";
-import { ResourcesManagerDialog, ResourcesTriggerButton, useAnyHostResourcesAvailable } from "./ResourcesPanel.js";
+import { MobileResourcesDialog, ResourcesManagerDialog, ResourcesTriggerButton, useAnyHostResourcesAvailable } from "./ResourcesPanel.js";
 import { startDesktopUpdateChecks } from "./DesktopUpdates.js";
 import { installPushActions } from "./notifications.js";
 import { runtimeHostId } from "./host-registry.js";
@@ -1590,8 +1590,8 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   );
   const desktopResourcesAvailable = useAnyHostResourcesAvailable(resourceHosts) && !pane && !phone;
   useEffect(() => {
-    if ((!visible || phone) && resourcesOpen) setResourcesOpen(false);
-  }, [visible, phone, resourcesOpen]);
+    if (!visible && resourcesOpen) setResourcesOpen(false);
+  }, [visible, resourcesOpen]);
   // A pane or phone already shows the host connection notice. Suppress only
   // the duplicate generic retry error; retain auth, TLS, message and local errors.
   const duplicatePaneRetry = (!!pane || phone) && !connection.isReadOnly && state.status !== "online"
@@ -1770,7 +1770,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     settingsBot={(hostId, botId) => { if (shell && hostId !== shell.host.id) shell.mobileSelect(hostId, { kind: "bot-settings", botId }); else showBotSettings([botId], document.activeElement as HTMLElement | null); }}
     create={(kind) => { if (shell) shell.create(kind); else if (kind === "bot") setNewBot(true); else if (kind === "schedule") setScheduledTasks("create"); else setNewChat({ kind }); }}
     selectHost={(hostId) => shell?.mobileSelect(hostId, { kind: "home" })}
-    open={(kind) => { if (kind === "settings" || kind === "notifications" || kind === "devices" || kind === "connection" || kind === "screen") { setSettingsFromMenu(false); setSettingsSection(kind === "notifications" ? "notifications" : kind === "devices" ? "devices" : kind === "connection" ? "connection" : kind === "screen" ? "screen" : "general"); setSettings(true); } else if (kind === "files") setFileCenter(true); else if (kind === "capabilities") { setDetailBot(undefined); setCapabilities(true); } else if (kind === "schedules") setScheduledTasks("list"); else if (kind === "operations") setOperations(true); else if (kind === "archives") setArchives(true); else if (kind === "hosts") shell?.manageHosts(); }}
+    open={(kind) => { if (kind === "settings" || kind === "notifications" || kind === "devices" || kind === "connection" || kind === "screen") { setSettingsFromMenu(false); setSettingsSection(kind === "notifications" ? "notifications" : kind === "devices" ? "devices" : kind === "connection" ? "connection" : kind === "screen" ? "screen" : "general"); setSettings(true); } else if (kind === "files") setFileCenter(true); else if (kind === "capabilities") { setDetailBot(undefined); setCapabilities(true); } else if (kind === "schedules") setScheduledTasks("list"); else if (kind === "operations") setOperations(true); else if (kind === "resources") setResourcesOpen(true); else if (kind === "archives") setArchives(true); else if (kind === "hosts") shell?.manageHosts(); }}
     searchHistory={(text) => { setSearchConversation(undefined); setQuery(text); setSearchBot(""); setSearchFrom(""); setSearchTo(""); setSearchFiles(false); setSidebar(false); setFocusTarget(undefined); historySearch.start(new URLSearchParams({ q: text }).toString(), ""); }}/></Suspense>}
   <main ref={attachmentDrop.ref} className={`conversation-main${attachmentDrop.hover ? " is-file-drop-target" : ""}`} {...attachmentDrop.events}>{searching ? <header className="conversation-header history-search-header">
     {phone ? <button className="icon-button" aria-label={t("打开会话列表")} onClick={exitHistorySearch}><ChevronLeft size={24}/></button> : <Search className="history-search-symbol" size={20} aria-hidden="true"/>}
@@ -1881,7 +1881,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     // The button that was pressed is gone with the old conversation's list: the keyboard continues in the
     // conversation that opened, as after any other move between conversations.
     requestAnimationFrame(() => requestAnimationFrame(() => conversationFocus()?.focus({ preventScroll: true })));
-  }} onLocateMessage={(conversationId, messageId) => { setSelected(conversationId); setSidebar(false); closeSearch(); setFocusTarget({ conversationId, messageId }); }} onOpenAllFiles={() => setConversationFiles(current)} onOpenWorkbenchFile={target => { void openLocalLibraryFile(target).catch(reportWorkbenchOpenError); }} footerTools={desktopResourcesAvailable ? <ResourcesTriggerButton ref={resourcesTriggerRef} connection={connection} visible={visible} open={resourcesOpen} controlsId={resourcesDialogId} onOpen={() => { resourcesReturnFocus.current = resourcesTriggerRef.current; setResourcesOpen(true); }} /> : undefined} onOpenTasksModal={current.botIds.length === 1 && !current.archived && !group?.archived && state.engineTasksAvailable ? () => setTaskListRequest({ conversationId: selected, id: Date.now() }) : undefined}/>}
+  }} onLocateMessage={(conversationId, messageId) => { setSelected(conversationId); setSidebar(false); closeSearch(); setFocusTarget({ conversationId, messageId }); }} onOpenAllFiles={() => setConversationFiles(current)} onOpenWorkbenchFile={target => { void openLocalLibraryFile(target).catch(reportWorkbenchOpenError); }} footerTools={desktopResourcesAvailable ? <ResourcesTriggerButton ref={resourcesTriggerRef} open={resourcesOpen} controlsId={resourcesDialogId} onOpen={() => { resourcesReturnFocus.current = resourcesTriggerRef.current; setResourcesOpen(true); }} /> : undefined} onOpenTasksModal={current.botIds.length === 1 && !current.archived && !group?.archived && state.engineTasksAvailable ? () => setTaskListRequest({ conversationId: selected, id: Date.now() }) : undefined}/>}
   {details && current && chatVisible && !searching && <ConversationDetails historySource={conversations.find(value => value.id === current.historyOrigin?.sourceConversationId)} openHistorySource={id => { setDetails(false); selectChat(id); }} key={`details:${current.id}`} suspended={manage || !!conversationFiles || fileCenter || capabilities || operations || resourcesOpen || settings} phone={phone} browseBot={phone ? browseBotConversations : undefined} returnFocus={detailTrigger} connection={connection} conversation={current} group={group} bots={state.bots} hostName={hostName} connectionSummary={connectionSummary} close={() => setDetails(false)} newChat={botId => { setDetails(false); setNewChat({ kind: "direct", botId }); }} open={(destination, botId) => { setDetailBot(botId); if (destination === "manage") setManage(true); else if (destination === "conversation-files") setConversationFiles(current); else if (destination === "files") setFileCenter(true); else if (destination === "capabilities") setCapabilities(true); else if (destination === "operations") { const bot = state.bots.find(value => value.id === botId); setOperationBot(bot ? { botId: bot.id, name: labels.get(bot.id) ?? bot.name, view: "dashboard" } : undefined); setOperations(true); } else { setSettingsSection("connection"); setSettings(true); } }}/>}
   {phone && !discussionComposer && menu === "recipients" && <CreationDialog title={t("回复的 Bot")} closeLabel={t("关闭回复选择")} close={closeMenu} returnFocus={recipientTrigger}><div className="mobile-chat-action-list">{conversationBots.map(bot => <button key={bot.id} role="checkbox" aria-label={labels.get(bot.id) ?? bot.name} aria-checked={recipients.includes(bot.id)} onClick={() => setRecipients(old => old.includes(bot.id) ? old.filter(id => id !== bot.id) : [...old, bot.id])}><span className="recipient-check">{recipients.includes(bot.id) && <Check size={14}/>}</span><Avatar kind="bot" id={bot.id} name={labels.get(bot.id) ?? bot.name} size={26}/><BotName id={bot.id} name={labels.get(bot.id) ?? bot.name} bot={bot}/></button>)}</div><button className="primary full" onClick={closeMenu}>{t("完成")}</button></CreationDialog>}
   {attachments.input}{attachments.sheet}
@@ -1914,7 +1914,11 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
     setCapabilityHelp(undefined); setCapabilities(false); setSidebar(false); closeSearch(); setFocusTarget(undefined); if (!phone) pendingComposerFocus.current = conversation.id;
   }}/> }
   {operations && <OperationsPanel connection={connection} initialBot={operationBot} initialView={operationBot?.view} close={() => { setOperations(false); setOperationBot(undefined); }}/> }
-  {resourcesOpen && !pane && !phone && <ResourcesManagerDialog id={resourcesDialogId} hosts={resourceHosts} activeHostId={shell?.host.id ?? "local"} visible={visible} onClose={() => setResourcesOpen(false)} returnFocus={resourcesReturnFocus}/> }
+  {resourcesOpen && !pane && (
+    phone
+      ? <MobileResourcesDialog hosts={resourceHosts} activeHostId={shell?.host.id ?? "local"} visible={visible} onClose={() => setResourcesOpen(false)}/>
+      : <ResourcesManagerDialog id={resourcesDialogId} hosts={resourceHosts} activeHostId={shell?.host.id ?? "local"} visible={visible} onClose={() => setResourcesOpen(false)} returnFocus={resourcesReturnFocus}/>
+  )}
   <MessageContextMenu historyActions={history.messageActions} opened={(message) => {
     history.inspect(message);
     readHistory(true);

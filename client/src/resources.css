@@ -417,7 +417,25 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1 1 auto;
   min-width: 0;
+}
+
+.resources-shared-tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+}
+
+.resources-shared-note {
+  margin: 0;
+  padding: 2px 4px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--muted);
 }
 
 .resources-proc-row {
@@ -427,6 +445,7 @@
   font-size: 11.5px;
   color: var(--grey);
   padding: 2px 4px;
+  min-width: 0;
 }
 
 .resources-proc-name {
@@ -434,6 +453,8 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text);
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .resources-proc-pid {
@@ -470,4 +491,77 @@
 
 .resources-stop-btn.is-subtle {
   padding: 2px 6px;
+}
+
+.resources-mobile-note {
+  margin: 0;
+  padding: 10px 16px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.resources-mobile-dialog > .settings-dialog-body {
+  padding: 0;
+}
+
+.resources-mobile-dialog .resources-toolbar {
+  padding: 10px 16px;
+  flex-wrap: wrap;
+}
+
+.resources-mobile-dialog .resources-body {
+  overflow: visible;
+  flex: none;
+  padding: 14px 16px 28px;
+}
+
+@media (max-width: 760px), (hover: none) and (pointer: coarse) {
+  .resources-mobile-dialog > .settings-dialog-body {
+    padding: 0;
+  }
+
+  .resources-select-wrap {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .resources-select-wrap select {
+    min-height: 36px;
+    max-width: 100%;
+  }
+
+  .resources-card-head {
+    flex-wrap: wrap;
+  }
+
+  .resources-card-totals {
+    justify-content: flex-start;
+  }
+
+  .resources-sparkline-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .resources-breakdown {
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  }
+
+  .resources-bot-row {
+    min-height: 44px;
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .resources-bot-name {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .resources-row-metrics {
+    gap: 8px;
+  }
 }

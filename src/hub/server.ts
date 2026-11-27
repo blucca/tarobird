@@ -155,7 +155,7 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
 type BotConnection = { botSteer: boolean; engineQuota: boolean; contextUsage: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
-export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; hostResourcesSampler?: () => Promise<OsProcessSample[]>; hostResourcesBotPids?: () => Map<string, number>; hostResourcesKillPid?: (pid: number) => Promise<void>; hostResourcesStopBotTurn?: (botId: string, conversationId: string, userId: string) => Promise<boolean>; hostResourcesDesktopAppPid?: number | (() => number | undefined); stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
+export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; hostResourcesSampler?: () => Promise<OsProcessSample[]>; hostResourcesBotPids?: () => Map<string, number>; hostResourcesTurnPids?: (botId: string) => ReadonlyMap<string, readonly number[]> | undefined; hostResourcesKillPid?: (pid: number) => Promise<void>; hostResourcesStopBotTurn?: (botId: string, conversationId: string, userId: string) => Promise<boolean>; hostResourcesDesktopAppPid?: number | (() => number | undefined); hostResourcesSampleCacheTtlMs?: number; hostResourcesNow?: () => number; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
 export class HubServer {
   private readonly relaySources: RelaySources;
   private readonly fragmentSockets = new WeakSet<WebSocket>();
@@ -363,12 +363,15 @@ export class HubServer {
       store,
       desktopAppPid: options.hostResourcesDesktopAppPid,
       childPids: options.hostResourcesBotPids ?? (() => this.botManager?.childPids() ?? new Map()),
+      turnPids: options.hostResourcesTurnPids,
       stopBotTurn: options.hostResourcesStopBotTurn ?? (async (botId, conversationId, userId) => {
         const result = z.object({ stopped: z.boolean() }).parse(await this.callBot(botId, "stop", { conversationId, userId }));
         return result.stopped;
       }),
       sampleProcesses: options.hostResourcesSampler,
       killPid: options.hostResourcesKillPid,
+      sampleCacheTtlMs: options.hostResourcesSampleCacheTtlMs,
+      now: options.hostResourcesNow,
     });
     const conversationsCreated = (userId: string, conversations: Conversation[]) => {
       for (const conversation of conversations) for (const c of this.clients) if (c.session?.userId === userId && (!conversation.hidden || c.capabilities.includes(DISPATCH_CAPABILITY))) { c.conversationIds.add(conversation.id); this.publishClient(c, { v: 1, type: "conversation.updated", conversation }); }
@@ -1827,7 +1830,8 @@ export class HubServer {
       if (route === HOST_RESOURCES_STOP_PATH && req.method === "POST") {
         await requireOwner();
         const input = hostResourceStopRequestSchema.parse(await this.jsonBody(req));
-        await reply(200, await this.hostResources.stop(userId, input));
+        await requireOwner();
+        await reply(200, await this.hostResources.stop(userId, input, requireOwner));
         return;
       }
       if (route === "/api/host-profile" && (req.method === "GET" || req.method === "PATCH")) {

@@ -6,6 +6,7 @@ import { HOST_PROFILE_KEY } from "../../src/hub/host-profile.js";
 import type { OsProcessSample } from "../../src/hub/host-resources.js";
 import { HubServer } from "../../src/hub/server.js";
 import { clickAppAction } from "./fixtures/desktop-actions.js";
+import { mobileHome, openMobileHome, waitForClientOnline } from "./fixtures/mobile.js";
 import { preparePairing } from "./fixtures/pairing-invite.js";
 
 test.use({ serviceWorkers: "block", actionTimeout: 15_000 });
@@ -25,7 +26,7 @@ async function pair(page: Page, hub: HubServer, name: string, add = false) {
   await page.getByRole("button", { name: "配对此设备", exact: true }).click();
   await hub.auth.approve(await page.getByLabel("配对码", { exact: true }).innerText(), "local-owner");
   await page.getByLabel("配对码", { exact: true }).waitFor({ state: "hidden" });
-  await expect(workspace(page).locator(".connection-pill.online")).toBeVisible();
+  await waitForClientOnline(page);
 }
 
 async function openResourcesFromSidebar(page: Page) {
@@ -70,6 +71,12 @@ test("desktop Resource Manager is reachable from WelcomeHome and rail, separates
       [conv.id, JSON.stringify([{ type: "text", text: "running…" }]), Date.now()],
     );
 
+    const resourceGetUrls: string[] = [];
+    page.on("request", (req) => {
+      if (req.method() === "GET" && new URL(req.url()).pathname === "/api/host-resources") {
+        resourceGetUrls.push(req.url());
+      }
+    });
     await page.route("**/api/host-resources/stop", async (route) => {
       const body = route.request().postDataJSON() as Record<string, unknown>;
       stopPayloads.push(body);
@@ -83,8 +90,20 @@ test("desktop Resource Manager is reachable from WelcomeHome and rail, separates
 
     await pair(page, hub, "主机甲");
 
-    // 1. Reachable directly from persistent sidebar WorkspaceFooter even while Workspace Rail is closed by default!
+    // 0. Zero background /api/host-resources requests while the dialog is closed,
+    //    even after opening the Workspace Rail (which renders ResourcesTriggerButton).
+    await workspace(page).locator(".conversation-row").filter({ hasText: "Alpha Refactor" }).click();
+    await workspace(page).getByRole("button", { name: "会话工作区", exact: true }).click();
+    const railFooterBtn = workspace(page).locator("aside.conversation-workspace-rail").getByRole("button", { name: "资源", exact: true });
+    await expect(railFooterBtn).toBeVisible();
+    await page.waitForTimeout(500);
+    expect(resourceGetUrls).toEqual([]);
+
+    // Close Workspace Rail so we also prove persistent sidebar WorkspaceFooter works when rail is closed
+    await workspace(page).getByRole("button", { name: "会话工作区", exact: true }).click();
     await expect(page.locator("aside.conversation-workspace-rail")).toHaveCount(0);
+
+    // 1. Reachable directly from persistent sidebar WorkspaceFooter even while Workspace Rail is closed!
     await openResourcesFromSidebar(page);
     const dialog = page.getByRole("dialog", { name: "资源管理", exact: true });
     await expect(dialog).toBeVisible();
@@ -93,6 +112,7 @@ test("desktop Resource Manager is reachable from WelcomeHome and rail, separates
     await expect(dialog).toContainText("Alpha Refactor");
     await expect(dialog).toContainText("PID 7101");
     await expect(dialog).toContainText("PID 7102");
+    expect(resourceGetUrls.length).toBeGreaterThanOrEqual(1);
 
     // 2. Conversation Stop sends `{ botId, conversationId }` ONLY (never `pid`), and shows inline error on failure
     failNextStop = true;
@@ -129,9 +149,7 @@ test("desktop Resource Manager is reachable from WelcomeHome and rail, separates
     await expect(dialog).toBeHidden();
 
     // 4. Also reachable from Workspace Rail footer button when a conversation + rail is open
-    await workspace(page).locator(".conversation-row").filter({ hasText: "Alpha Refactor" }).click();
     await workspace(page).getByRole("button", { name: "会话工作区", exact: true }).click();
-    const railFooterBtn = workspace(page).locator("aside.conversation-workspace-rail").getByRole("button", { name: "资源", exact: true });
     await expect(railFooterBtn).toBeVisible();
     await railFooterBtn.click();
     await expect(dialog).toBeVisible();
@@ -237,6 +255,120 @@ test("switching hosts ignores stale responses and keeps the modal usable when a 
     await context.close();
     await hubA.close();
     if (!hubBClosed) await hubB.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("phone Host Resources view is reachable from the Host tools page, responsive, strictly read-only, and polls only while open", async ({ browser }) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "resources-panel-phone-"));
+  const hubPid = process.pid;
+  const samples: OsProcessSample[] = [
+    { pid: hubPid, ppid: 1, cpuPercent: 1.8, memoryBytes: 115 * 1024 * 1024, name: "node" },
+    { pid: 7001, ppid: hubPid, cpuPercent: 0.6, memoryBytes: 42 * 1024 * 1024, name: "node" },
+    { pid: 7101, ppid: 7001, cpuPercent: 28.5, memoryBytes: 410 * 1024 * 1024, name: "codex" },
+    { pid: 7002, ppid: hubPid, cpuPercent: 0.4, memoryBytes: 38 * 1024 * 1024, name: "node" },
+    { pid: 7202, ppid: 7002, cpuPercent: 52.0, memoryBytes: 220 * 1024 * 1024, name: "claude" },
+  ];
+
+  const hub = await HubServer.start({
+    stateDir: path.join(root, "hub-phone"),
+    clientDir: path.resolve("dist"),
+    hostResourcesSampler: async () => samples,
+    hostResourcesBotPids: () => new Map([["bot_alpha", 7001], ["bot_beta", 7002]]),
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    isMobile: true,
+    hasTouch: true,
+    locale: "zh-CN",
+    serviceWorkers: "block",
+  });
+  const page = await context.newPage();
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+
+  try {
+    const now = Date.now();
+    await hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_alpha','Alpha Bot','codex','ha',1)");
+    await hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_beta','Beta Bot','claude','hb',1)");
+    const convA = await hub.store.createConversation("owner", ["bot_alpha"], "Mobile Alpha Task", "conv_pa", { type: "direct" });
+    const convB = await hub.store.createConversation("owner", ["bot_beta"], "Mobile Beta Task", "conv_pb", { type: "direct" });
+    await hub.store.db.run(
+      "INSERT INTO messages(id,conversation_id,author_id,author_type,blocks_json,status,version,created_at) VALUES('msg_pa',?,'bot_alpha','bot',?,'streaming',1,?)",
+      [convA.id, JSON.stringify([{ type: "text", text: "running…" }]), now],
+    );
+    await hub.store.db.run(
+      "INSERT INTO messages(id,conversation_id,author_id,author_type,blocks_json,status,version,created_at) VALUES('msg_pb',?,'bot_beta','bot',?,'streaming',1,?)",
+      [convB.id, JSON.stringify([{ type: "text", text: "running…" }]), now + 100],
+    );
+
+    const resourceGets: string[] = [];
+    page.on("request", (req) => {
+      if (req.method() === "GET" && new URL(req.url()).pathname === "/api/host-resources") {
+        resourceGets.push(req.url());
+      }
+    });
+
+    await pair(page, hub, "手机测试主机");
+    await openMobileHome(page);
+
+    // Zero /api/host-resources calls before opening Host Resources on phone.
+    await mobileHome(page).getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "我的", exact: true }).click();
+    const entry = mobileHome(page).getByRole("button", { name: "资源管理", exact: true });
+    await expect(entry).toBeVisible();
+    await expect(entry).toContainText("CPU 与内存（只读）");
+    expect(resourceGets).toEqual([]);
+
+    // Open mobile Host Resources page.
+    await entry.click();
+    const dialog = page.getByRole("dialog", { name: "资源管理", exact: true });
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText("手机端仅支持查看资源占用");
+    await expect(dialog).toContainText("只读");
+    await expect(dialog).toContainText("Alpha Bot");
+    await expect(dialog).toContainText("Mobile Alpha Task");
+    await expect(dialog).toContainText("Beta Bot");
+    await expect(dialog).toContainText("Mobile Beta Task");
+    await expect(dialog).toContainText("PID 7101");
+    await expect(dialog).toContainText("PID 7202");
+
+    // Strictly read-only on phone even for an owner device: zero Stop buttons anywhere in the dialog.
+    await expect(dialog.locator(".resources-stop-btn")).toHaveCount(0);
+
+    // Responsive check: zero horizontal overflow at 390px phone viewport.
+    const overflow = await dialog.evaluate((node) => ({
+      docScroll: document.documentElement.scrollWidth,
+      docClient: document.documentElement.clientWidth,
+      dialogScroll: node.scrollWidth,
+      dialogClient: node.clientWidth,
+    }));
+    expect(overflow.docScroll).toBeLessThanOrEqual(overflow.docClient);
+    expect(overflow.dialogScroll).toBeLessThanOrEqual(overflow.dialogClient);
+
+    // Default sort is memory (Alpha Bot 452 MB before Beta Bot 258 MB); switching to CPU puts Beta Bot (52.4%) first.
+    const botNames = dialog.locator(".resources-bot-name");
+    await expect(botNames.first()).toHaveText("Alpha Bot");
+    await dialog.getByRole("combobox", { name: "排序方式", exact: true }).selectOption("cpu");
+    await expect(botNames.first()).toHaveText("Beta Bot");
+
+    // Manual refresh sends ?force=1.
+    const countBeforeRefresh = resourceGets.length;
+    await dialog.getByRole("button", { name: "刷新资源", exact: true }).click();
+    await expect.poll(() => resourceGets.length).toBeGreaterThan(countBeforeRefresh);
+    expect(resourceGets.at(-1)).toContain("force=1");
+
+    // Navigate back closes the phone page cleanly and stops polling.
+    await dialog.getByRole("button", { name: "返回", exact: true }).click();
+    await expect(dialog).toBeHidden();
+    const countAfterClose = resourceGets.length;
+    await page.waitForTimeout(400);
+    expect(resourceGets.length).toBe(countAfterClose);
+
+    expect(errors).toEqual([]);
+  } finally {
+    await context.close();
+    await hub.close();
     await rm(root, { recursive: true, force: true });
   }
 });

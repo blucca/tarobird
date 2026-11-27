@@ -5718,5 +5718,8 @@
   "正在连接「{0}」…": "Connecting to \"{0}\"…",
   "主机「{0}」当前离线，恢复连接后可查看资源占用。": "Host \"{0}\" is currently offline. Resource usage will appear once it reconnects.",
   "主机「{0}」暂不支持资源管理，请更新主机后查看。": "Host \"{0}\" does not support Resource Manager yet. Update this Host to view resource usage.",
-  "资源 · CPU {0} · 内存 {1}": "Resources · CPU {0} · Memory {1}"
+  "共享进程": "Shared worker",
+  "多个并发对话共享此 Bot 的引擎进程，进程占用汇总列在下方；仍可按对话分别停止。": "Concurrent conversations share this Bot's engine processes; process usage is listed below and each conversation can still be stopped individually.",
+  "手机端仅支持查看资源占用；如需停止异常引擎进程，请在电脑端操作。": "Phone view is read-only. Stop runaway engine processes from the desktop app.",
+  "CPU 与内存（只读）": "CPU & memory (read-only)"
 }

@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   formatCpuPercent,
   formatMemoryBytes,
@@ -356,6 +356,263 @@ describe("HubHostResources attribution, isolation, bounds, desktop detection, an
       expect(snap.summary.appMemoryBytes).toBe((160 + 240 + 95 + 18) * 1024 * 1024);
       expect(JSON.stringify(snap)).not.toContain(`"pid":8888`);
       expect(JSON.stringify(snap)).not.toContain(`"pid":8889`);
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it("queries active bot turns via partial index messages_active_bot_turns with zero full table scan of messages", async () => {
+    const stateDir = path.join(tempRoot, "hub-query-plan");
+    let hub = await HubServer.start({
+      stateDir,
+      hostResourcesSampler: async () => [
+        { pid: process.pid, ppid: 1, cpuPercent: 1.0, memoryBytes: 100 * 1024 * 1024, name: "node" },
+        { pid: 6001, ppid: process.pid, cpuPercent: 0.5, memoryBytes: 40 * 1024 * 1024, name: "node" },
+        { pid: 6101, ppid: 6001, cpuPercent: 12.0, memoryBytes: 256 * 1024 * 1024, name: "codex" },
+      ],
+      hostResourcesBotPids: () => new Map([["bot_q", 6001]]),
+    });
+
+    try {
+      await hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_q','Query Bot','codex','hq',1)");
+      const conv = await hub.store.createConversation("owner", ["bot_q"], "Query Plan Chat", "conv_q", { type: "direct" });
+      // Seed 500 historical completed/error/deleted messages with non-trivial bodies.
+      await hub.store.db.run(
+        `WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<500)
+         INSERT INTO messages(id,conversation_id,author_id,author_type,blocks_json,status,version,created_at)
+         SELECT 'hist_'||n,?,'bot_q','bot','[{"type":"text","text":"completed historical message body"}]',
+           CASE WHEN n % 10 = 0 THEN 'deleted' WHEN n % 7 = 0 THEN 'error' ELSE 'complete' END,1,n
+         FROM history`,
+        [conv.id],
+      );
+      await hub.store.db.run(
+        "INSERT INTO messages(id,conversation_id,author_id,author_type,blocks_json,status,version,created_at) VALUES('msg_active',?,'bot_q','bot',?,'streaming',1,?)",
+        [conv.id, JSON.stringify([{ type: "text", text: "working…" }]), Date.now()],
+      );
+
+      const verifyIndexedPlan = async (targetHub: HubServer) => {
+        const allSpy = vi.spyOn(targetHub.store.db, "all");
+        try {
+          const snap = hostResourcesSnapshotSchema.parse(await targetHub.hostResources.snapshot("owner", true, true));
+          expect(snap.summary.activeTasks).toBe(1);
+          expect(snap.bots[0]!.conversations[0]!.processes.map((p) => p.pid)).toEqual([6101]);
+
+          const activeTurnCall = allSpy.mock.calls.find(
+            ([sql]) => sql.includes("FROM messages") && sql.includes("author_type='bot'") && sql.includes("pending"),
+          );
+          expect(activeTurnCall).toBeDefined();
+          const plan = await targetHub.store.db.all<{ detail: string }>(`EXPLAIN QUERY PLAN ${activeTurnCall![0]}`);
+          expect(plan.length).toBeGreaterThan(0);
+          expect(plan.some((row) => row.detail.includes("USING INDEX messages_active_bot_turns"))).toBe(true);
+          expect(plan.some((row) => row.detail.includes("TEMP B-TREE"))).toBe(false);
+          // Zero full table scans of `messages`: every step touching `messages` must use an index.
+          expect(plan.some((row) => /\bSCAN\s+messages\b/i.test(row.detail) && !row.detail.includes("USING INDEX") && !row.detail.includes("USING COVERING INDEX"))).toBe(false);
+        } finally {
+          allSpy.mockRestore();
+        }
+      };
+
+      await verifyIndexedPlan(hub);
+
+      // Reopening an existing schema-26 store (e.g. upgraded from 1.6.0) automatically creates the index without bumping schema_version.
+      expect((await hub.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value).toBe("26");
+      await hub.store.db.exec("DROP INDEX messages_active_bot_turns");
+      await hub.close();
+
+      hub = await HubServer.start({
+        stateDir,
+        hostResourcesSampler: async () => [
+          { pid: process.pid, ppid: 1, cpuPercent: 1.0, memoryBytes: 100 * 1024 * 1024, name: "node" },
+          { pid: 6001, ppid: process.pid, cpuPercent: 0.5, memoryBytes: 40 * 1024 * 1024, name: "node" },
+          { pid: 6101, ppid: 6001, cpuPercent: 12.0, memoryBytes: 256 * 1024 * 1024, name: "codex" },
+        ],
+        hostResourcesBotPids: () => new Map([["bot_q", 6001]]),
+      });
+      expect((await hub.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value).toBe("26");
+      await verifyIndexedPlan(hub);
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it("caches OS process samples for a short TTL, coalesces in-flight calls, blocks non-owner force bypass, and invalidates on stop", async () => {
+    const hubPid = process.pid;
+    let fakeNow = 1_700_000_000_000;
+    let sampleCalls = 0;
+    let releaseFirstSample!: () => void;
+    let holdNextSample = true;
+    const firstSampleGate = new Promise<void>((resolve) => { releaseFirstSample = resolve; });
+    let failNextSample = false;
+    let currentEngineMem = 300 * 1024 * 1024;
+    let engineAlive = true;
+
+    const hub = await HubServer.start({
+      stateDir: path.join(tempRoot, "hub-cache-coalesce"),
+      hostResourcesSampleCacheTtlMs: 2_500,
+      hostResourcesNow: () => fakeNow,
+      hostResourcesBotPids: () => new Map([["bot_c", 7201]]),
+      hostResourcesKillPid: async () => { engineAlive = false; },
+      hostResourcesSampler: async () => {
+        sampleCalls += 1;
+        if (holdNextSample) {
+          holdNextSample = false;
+          await firstSampleGate;
+        }
+        if (failNextSample) {
+          failNextSample = false;
+          throw new Error("transient_sampler_failure");
+        }
+        return [
+          { pid: hubPid, ppid: 1, cpuPercent: 1.0, memoryBytes: 100 * 1024 * 1024, name: "node" },
+          { pid: 7201, ppid: hubPid, cpuPercent: 0.4, memoryBytes: 40 * 1024 * 1024, name: "node" },
+          ...(engineAlive ? [{ pid: 7301, ppid: 7201, cpuPercent: 25.0, memoryBytes: currentEngineMem, name: "codex" }] : []),
+        ];
+      },
+    });
+
+    try {
+      await hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_c','Cache Bot','codex','hc',1)");
+      await hub.store.db.run("INSERT INTO users(id,name,role) VALUES('member_cache','Member','member')");
+      await hub.store.db.run("INSERT INTO bot_grants(user_id,bot_id) VALUES('member_cache','bot_c')");
+
+      // 1. Concurrent requests coalesce onto a SINGLE in-flight OS sample.
+      const p1 = hub.hostResources.snapshot("owner", true, false);
+      const p2 = hub.hostResources.snapshot("owner", true, false);
+      const p3 = hub.hostResources.snapshot("member_cache", false, false);
+      releaseFirstSample();
+      const [s1, s2, s3] = await Promise.all([p1, p2, p3]);
+      expect(sampleCalls).toBe(1);
+      expect(s1.summary.engineMemoryBytes).toBe(340 * 1024 * 1024);
+      expect(s2.summary.engineMemoryBytes).toBe(340 * 1024 * 1024);
+      expect(s3.canStop).toBe(false);
+      expect(s3.summary.engineMemoryBytes).toBe(340 * 1024 * 1024);
+
+      // 2. Repeated reads within TTL reuse the cached OS sample without spawning another sample.
+      fakeNow += 1_000;
+      currentEngineMem = 450 * 1024 * 1024;
+      const cachedOwner = await hub.hostResources.snapshot("owner", true, false);
+      expect(sampleCalls).toBe(1);
+      expect(cachedOwner.summary.engineMemoryBytes).toBe(340 * 1024 * 1024);
+
+      // 3. Non-owner `?force=1` MUST NOT bypass the TTL cache.
+      const memberForce = await hub.hostResources.snapshot("member_cache", false, true);
+      expect(sampleCalls).toBe(1);
+      expect(memberForce.summary.engineMemoryBytes).toBe(340 * 1024 * 1024);
+
+      // 4. Owner explicit refresh (`force=true`) bypasses cache and updates it.
+      const ownerForce = await hub.hostResources.snapshot("owner", true, true);
+      expect(sampleCalls).toBe(2);
+      expect(ownerForce.summary.engineMemoryBytes).toBe(490 * 1024 * 1024);
+
+      // 5. After TTL expires, ordinary read refreshes cleanly.
+      fakeNow += 2_600;
+      currentEngineMem = 520 * 1024 * 1024;
+      const afterTtl = await hub.hostResources.snapshot("owner", true, false);
+      expect(sampleCalls).toBe(3);
+      expect(afterTtl.summary.engineMemoryBytes).toBe(560 * 1024 * 1024);
+
+      // 6. Stop by PID forces a fresh ancestry check AND invalidates the cache afterward.
+      const stopRes = await hub.hostResources.stop("owner", { botId: "bot_c", pid: 7301 });
+      expect(stopRes).toEqual({ ok: true, stopped: true, method: "process_tree" });
+      expect(sampleCalls).toBe(4);
+      const afterStop = await hub.hostResources.snapshot("owner", true, false);
+      expect(sampleCalls).toBe(5);
+      expect(afterStop.summary.engineMemoryBytes).toBe(40 * 1024 * 1024);
+
+      // 7. A rejected sample never wedges inflight state; subsequent calls recover.
+      fakeNow += 3_000;
+      failNextSample = true;
+      await expect(hub.hostResources.snapshot("owner", true, false)).rejects.toThrow("transient_sampler_failure");
+      expect(sampleCalls).toBe(6);
+      const recovered = await hub.hostResources.snapshot("owner", true, false);
+      expect(sampleCalls).toBe(7);
+      expect(recovered.summary.engineMemoryBytes).toBe(40 * 1024 * 1024);
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it("avoids blind positional PID assignment on multi-turn Bots and supports exact turnPids linkage when available", async () => {
+    const hubPid = process.pid;
+    let turnPidsMap: ReadonlyMap<string, readonly number[]> | undefined;
+    const samples: OsProcessSample[] = [
+      { pid: hubPid, ppid: 1, cpuPercent: 1.0, memoryBytes: 100 * 1024 * 1024, name: "node" },
+      // Bot gateway + TWO direct children (e.g. shared engine worker + MCP helper, or two workers)
+      { pid: 7500, ppid: hubPid, cpuPercent: 0.5, memoryBytes: 40 * 1024 * 1024, name: "node" },
+      { pid: 7510, ppid: 7500, cpuPercent: 18.0, memoryBytes: 280 * 1024 * 1024, name: "codex-app-server" },
+      { pid: 7511, ppid: 7510, cpuPercent: 22.0, memoryBytes: 120 * 1024 * 1024, name: "pytest" },
+      { pid: 7520, ppid: 7500, cpuPercent: 4.0, memoryBytes: 90 * 1024 * 1024, name: "mcp-helper" },
+    ];
+
+    const hub = await HubServer.start({
+      stateDir: path.join(tempRoot, "hub-multiturn"),
+      hostResourcesSampler: async () => samples,
+      hostResourcesBotPids: () => new Map([["bot_multi", 7500]]),
+      hostResourcesTurnPids: (botId) => (botId === "bot_multi" ? turnPidsMap : undefined),
+    });
+
+    try {
+      const now = Date.now();
+      await hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_multi','Multi Bot','codex','hm',1)");
+      await hub.store.db.run("INSERT INTO users(id,name,role) VALUES('member_m','Member M','member')");
+      await hub.store.db.run("INSERT INTO bot_grants(user_id,bot_id) VALUES('member_m','bot_multi')");
+
+      const ownerConv1 = await hub.store.createConversation("owner", ["bot_multi"], "Owner Task 1", "conv_o1", { type: "direct" });
+      const ownerConv2 = await hub.store.createConversation("owner", ["bot_multi"], "Owner Task 2", "conv_o2", { type: "direct" });
+      await hub.store.db.run(
+        "INSERT INTO messages(id,conversation_id,author_id,author_type,blocks_json,status,version,created_at) VALUES('m_o1',?,'bot_multi','bot',?,'streaming',1,?)",
+        [ownerConv1.id, JSON.stringify([{ type: "text", text: "running 1" }]), now],
+      );
+      await hub.store.db.run(
+        "INSERT INTO messages(id,conversation_id,author_id,author_type,blocks_json,status,version,created_at) VALUES('m_o2',?,'bot_multi','bot',?,'streaming',1,?)",
+        [ownerConv2.id, JSON.stringify([{ type: "text", text: "running 2" }]), now + 100],
+      );
+
+      // Case 1: WITHOUT exact turnPids linkage — NEVER blindly assign 7510 -> Owner Task 1 and 7520 -> Owner Task 2!
+      const unlinkedOwner = hostResourcesSnapshotSchema.parse(await hub.hostResources.snapshot("owner", true, true));
+      const botGroup = unlinkedOwner.bots[0]!;
+      expect(botGroup.activeTurns).toBe(2);
+      expect(botGroup.conversations).toHaveLength(2);
+      expect(botGroup.conversations.every((c) => c.active && c.stoppable && c.processes.length === 0 && c.memoryBytes === 0)).toBe(true);
+      // All engine processes stay truthfully grouped under the Bot and contribute to Bot totals!
+      expect(botGroup.unattributed.map((p) => p.pid).sort((a, b) => a - b)).toEqual([7500, 7510, 7511, 7520]);
+      expect(botGroup.memoryBytes).toBe((40 + 280 + 120 + 90) * 1024 * 1024);
+
+      // Case 2: Member also has an active turn on the same Bot alongside owner's hidden turns, EVEN WITH directChildren.length >= allTurns.length!
+      // Owner's processes (7510, 7511, 7520) MUST NEVER leak to member_m!
+      const memberConv = await hub.store.createConversation("member_m", ["bot_multi"], "Member Task", "conv_m1", { type: "direct" });
+      await hub.store.db.run("DELETE FROM messages WHERE id='m_o2'");
+      await hub.store.db.run(
+        "INSERT INTO messages(id,conversation_id,author_id,author_type,blocks_json,status,version,created_at) VALUES('m_m1',?,'bot_multi','bot',?,'streaming',1,?)",
+        [memberConv.id, JSON.stringify([{ type: "text", text: "member running" }]), now + 200],
+      );
+      const unlinkedMember = hostResourcesSnapshotSchema.parse(await hub.hostResources.snapshot("member_m", false, false));
+      expect(unlinkedMember.bots[0]!.activeTurns).toBe(1);
+      expect(unlinkedMember.bots[0]!.conversations).toHaveLength(1);
+      expect(unlinkedMember.bots[0]!.conversations[0]!.conversationId).toBe(memberConv.id);
+      expect(unlinkedMember.bots[0]!.conversations[0]!.processes).toEqual([]);
+      expect(unlinkedMember.bots[0]!.unattributed.map((p) => p.pid)).toEqual([7500]);
+      for (const hiddenPid of [7510, 7511, 7520]) {
+        expect(JSON.stringify(unlinkedMember)).not.toContain(`"pid":${hiddenPid}`);
+      }
+
+      // Case 3: WITH exact turnPids linkage — each conversation gets its exact linked PID subtree,
+      // while hidden owner turns remain invisible to member_m!
+      turnPidsMap = new Map<string, readonly number[]>([
+        [ownerConv1.id, [7510]],
+        [memberConv.id, [7520]],
+      ]);
+      const linkedMember = hostResourcesSnapshotSchema.parse(await hub.hostResources.snapshot("member_m", false, false));
+      expect(linkedMember.bots[0]!.conversations[0]!.processes.map((p) => p.pid)).toEqual([7520]);
+      expect(JSON.stringify(linkedMember)).not.toContain(`"pid":7510`);
+      expect(JSON.stringify(linkedMember)).not.toContain(`"pid":7511`);
+
+      const linkedOwner = hostResourcesSnapshotSchema.parse(await hub.hostResources.snapshot("owner", true, true));
+      expect(linkedOwner.bots[0]!.conversations).toHaveLength(1);
+      expect(linkedOwner.bots[0]!.conversations[0]!.conversationId).toBe(ownerConv1.id);
+      expect(linkedOwner.bots[0]!.conversations[0]!.processes.map((p) => p.pid).sort((a, b) => a - b)).toEqual([7510, 7511]);
+      // Member's linked PID (7520) is shown under Bot unattributed for owner without leaking member conversation title.
+      expect(linkedOwner.bots[0]!.unattributed.map((p) => p.pid).sort((a, b) => a - b)).toEqual([7500, 7520]);
     } finally {
       await hub.close();
     }
