@@ -91,7 +91,7 @@ for (const phone of [false, true]) test(`complete drafts stay with each conversa
     await messageAction(page, page.locator(`[data-message-id="${quoted.id}"]`), "引用回复");
     await page.locator("input.attachment-picker-input").setInputFiles([
       { name: "方案.txt", mimeType: "text/plain", buffer: Buffer.from("file bytes") },
-      { name: "voice.webm", mimeType: "audio/webm", buffer: Buffer.from("recorded draft bytes") },
+      { name: "voice.webm", mimeType: "audio/webm", buffer: Buffer.from("audio file bytes") },
     ]);
     await revealReplyBots(page);
     // Current groups start without an explicit mention; set the intended
@@ -131,7 +131,8 @@ for (const phone of [false, true]) test(`complete drafts stay with each conversa
     await expect(page.getByRole("textbox", { name: "消息", exact: true })).toHaveValue("");
     const sent = (await hub.store.snapshot("owner", one.id)).messages.find(m => m.authorType === "user")!;
     expect(sent.replyTo).toBe(quoted.id); expect(sent.mentions).toEqual(["beta"]); expect(sent.previewUrl).toBeNull();
-    expect(sent.blocks.map(b => b.type)).toEqual(["text", "file", "audio"]);
+    expect(sent.blocks.map(b => b.type)).toEqual(["text", "file", "file"]);
+    expect(sent.blocks[2]).toMatchObject({ type: "file", name: "voice.webm", mime: "audio/webm" });
     await selectConversation(page, two.title);
     await expect(page.getByRole("textbox", { name: "消息", exact: true })).toHaveValue("另一份独立草稿");
     await expect(page.locator(".attachment-draft")).toContainText("另一份.txt");
