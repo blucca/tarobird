@@ -178,8 +178,16 @@ for (const phone of [false, true]) test(`real Hub mute receipt survives reread f
   else await clickAppAction(page, '对话设置', page.getByRole('button',{name:'对话设置',exact:true}));
   // Opening the phone sheet is asynchronous; verify the committed layout,
   // retaining the same alignment and minimum target-size requirements.
-  await expect(page.locator('.conversation-settings label.settings-row')).toHaveCount(2);
-  await expect.poll(() => page.locator('.conversation-settings label.settings-row').evaluateAll(rows => rows.length === 2 && rows.every(row => {const a=row.querySelector('span')!.getBoundingClientRect(),b=row.querySelector('input')!.getBoundingClientRect();return b.left > a.right && Math.abs(a.top+a.height/2-b.top-b.height/2)<2 && row.getBoundingClientRect().height>=44;}))).toBe(true);
+  const toggleRows = page.locator('.conversation-settings label.settings-row');
+  const toggleLabels = ['全局置顶', '分组置顶', '此对话免打扰'];
+  await expect(toggleRows.locator('span')).toHaveText(toggleLabels);
+  await expect.poll(() => toggleRows.evaluateAll((rows, count) => rows.length === count && rows.every(row => {
+    const label = row.querySelector('span')!.getBoundingClientRect();
+    const toggle = row.querySelector('input')!.getBoundingClientRect();
+    return toggle.left > label.right &&
+      Math.abs(label.top + label.height / 2 - toggle.top - toggle.height / 2) < 2 &&
+      row.getBoundingClientRect().height >= 44;
+  }), toggleLabels.length)).toBe(true);
   await expect(page.getByLabel('此对话免打扰',{exact:true})).toBeEnabled();
   await page.route('**/api/notifications',route=>route.fulfill({status:503,json:{error:'fixture_read_failure'}}));
   await page.getByLabel('此对话免打扰',{exact:true}).click();
