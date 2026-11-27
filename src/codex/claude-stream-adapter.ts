@@ -1,5 +1,5 @@
 import { isLogicalSessionId } from "../runtime/logical-session.js";
-import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
+import { AdapterQuotaCache, type AdapterQuotaScope, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
 import { applyClaudeQuotaEvent, claudeQuotaForModel, parseClaudeUsage, QuotaReadError, QUOTA_TTL_MS, unavailableQuota } from "./account-quota.js";
 import type { QuotaSnapshot } from "../client-protocol/engine-quota.js";
 import { claudeAssistantError, claudeError, claudeResultRepeatsError } from "./claude-errors.js";
@@ -558,7 +558,7 @@ const BACKGROUND_TASK_TURN_SETTLE_GRACE_MS = 1500;
 // (stale only after 12h) and blocking every channel and cron turn on that
 // session. `/timeout off` (disableRuntimeTimeout) disables it per turn.
 export const CLAUDE_STREAM_INACTIVITY_TIMEOUT_MS = ENGINE_DEFAULT_INACTIVITY_TIMEOUT_MS;
-type ClaudeQuotaRecord = { id: number; credentialRevision: string; snapshot?: QuotaSnapshot; usage?: QuotaSnapshot; unasked?: Set<string>;
+type ClaudeQuotaRecord = { id: number; credentialRevision: string; snapshot?: QuotaSnapshot; snapshotSeq?: number; usage?: QuotaSnapshot; unasked?: Set<string>;
   /** The model this process stated when it started a turn. */ model?: string; context?: { sessionId: string | null; usage: EngineContextUsage };
   /** The `get_usage` question this process has not answered yet. One at a time; its answer is kept whenever it comes. */ asking?: Promise<QuotaSnapshot> };
 // Native soft stop (CLI 2.1.307 probes: receipt and interrupted result arrive
@@ -1177,6 +1177,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
   /** How long a `get_usage` question stays out before it is given up (tests shorten it). */
   private usageLateMs = CLAUDE_USAGE_LATE_MS;
   private quotaWorkerSequence = 0;
+  private passiveEventSequence = 0;
   private quotaSource?: ClaudeWorker;
   private readonly sessionUsage: ClaudeSessionUsage;
   private destroyPromise: Promise<void> | undefined;
@@ -1285,6 +1286,35 @@ export class ClaudeStreamAdapter implements CodexAdapter {
     return this.usageIdle(worker) && !this.quotaWorkers.get(worker)?.unasked?.has(request);
   }
 
+  private isLiveQuotaWorker(worker: ClaudeWorker | undefined): worker is ClaudeWorker {
+    return !!worker && !worker.retired && [...this.workers.values()].includes(worker);
+  }
+
+  private isNewerPassiveSnapshot(candidate: ClaudeQuotaRecord, current: ClaudeQuotaRecord): boolean {
+    const candidateMs = candidate.snapshot?.observedAt ? Date.parse(candidate.snapshot.observedAt) : Number.NaN;
+    const currentMs = current.snapshot?.observedAt ? Date.parse(current.snapshot.observedAt) : Number.NaN;
+    if (Number.isFinite(candidateMs) && Number.isFinite(currentMs)) {
+      if (candidateMs !== currentMs) return candidateMs > currentMs;
+      return (candidate.snapshotSeq ?? 0) > (current.snapshotSeq ?? 0);
+    }
+    return Number.isFinite(candidateMs) && !Number.isFinite(currentMs);
+  }
+
+  private promotePassiveSource(worker: ClaudeWorker, entry: ClaudeQuotaRecord, scope: AdapterQuotaScope): boolean {
+    if (!entry.snapshot || !this.isLiveQuotaWorker(worker) || this.newestUsage(entry.credentialRevision)) return false;
+    const current = this.quotaSource;
+    if (current && current !== worker && this.isLiveQuotaWorker(current)) {
+      const currentEntry = this.quotaWorkers.get(current);
+      if (currentEntry?.snapshot && currentEntry.credentialRevision === entry.credentialRevision && !this.isNewerPassiveSnapshot(entry, currentEntry)) {
+        return false;
+      }
+    }
+    this.keptUsage = undefined;
+    this.quotaSource = worker;
+    this.quotaCache.store(scope, { snapshot: entry.snapshot });
+    return true;
+  }
+
   /** One usage request. Asking is not use: the idle clock of a process that was idle is put back, so a reading
    * never keeps a process alive. Only the CLI's own "Unsupported control request subtype" answer is remembered
    * for the process; any other failure may be asked again. */
@@ -1305,8 +1335,7 @@ export class ClaudeStreamAdapter implements CodexAdapter {
         if (request === "get_usage" && entry.snapshot && !worker.retired && !this.destroyPromise) {
           const scope = this.quotaCache.capture(String(entry.id));
           if (scope.verifiable && scope.authMode === "subscription" && scope.credentialRevision === entry.credentialRevision) {
-            this.quotaSource = worker;
-            this.quotaCache.store(scope, { snapshot: entry.snapshot });
+            this.promotePassiveSource(worker, entry, scope);
           } else {
             entry.snapshot = undefined;
             if (this.quotaSource === worker) {
@@ -1365,6 +1394,8 @@ export class ClaudeStreamAdapter implements CodexAdapter {
         if (this.quotaScope().credentialRevision !== entry.credentialRevision) return usage;
         if (usage.capability.mode === "unsupported") { entry.usage = undefined; this.keptUsage = undefined; }
         else { entry.usage = usage; this.keptUsage = entry; }
+        this.quotaSource = undefined;
+        this.quotaCache.invalidate();
         return usage;
         // One question at a time: nothing else can have taken this slot meanwhile.
       } finally { entry.asking = undefined; }
@@ -1404,10 +1435,13 @@ export class ClaudeStreamAdapter implements CodexAdapter {
         if (entry.unasked?.has("get_usage")) {
           const fallbackScope = this.quotaScope();
           if (fallbackScope.credentialRevision !== scope.credentialRevision) return this.quotaCache.failure(fallbackScope, "auth_changed");
-          return this.quotaCache.response(fallbackScope, { ...options, expectedRevision: undefined })
-            ?? this.quotaCache.failure(fallbackScope, "no_passive_event");
+          if (!this.newestUsage(fallbackScope.credentialRevision)) {
+            return this.quotaCache.response(fallbackScope, { ...options, expectedRevision: undefined })
+              ?? this.quotaCache.failure(fallbackScope, "no_passive_event");
+          }
+        } else {
+          failure = error instanceof QuotaReadError ? error.reason : error instanceof ClaudeControlError && error.kind === "timeout" ? "timeout" : "native_error";
         }
-        failure = error instanceof QuotaReadError ? error.reason : error instanceof ClaudeControlError && error.kind === "timeout" ? "timeout" : "native_error";
       } finally { clearTimeout(timer); }
       // The login changed while the question was out: the answer cannot be told to be about the current one.
       after = this.quotaScope();
@@ -1442,12 +1476,12 @@ export class ClaudeStreamAdapter implements CodexAdapter {
       const snapshot = applyClaudeQuotaEvent(entry.snapshot, value);
       if (!snapshot) return;
       entry.snapshot = snapshot;
+      entry.snapshotSeq = ++this.passiveEventSequence;
       // Passive stream events only drive the quota cache once this worker refuses `get_usage`.
       // Promoting them before then changes `quotaScope()`'s revision mid-turn on Windows/Linux
       // (where `.credentials.json` is verifiable) and lets sparse single-window events shadow `get_usage`.
       if (entry.unasked?.has("get_usage")) {
-        this.quotaSource = worker;
-        this.quotaCache.store(scope, { snapshot });
+        this.promotePassiveSource(worker, entry, scope);
       }
     } catch { /* Invalid native quota data must never interrupt the user's conversation. */ }
   }

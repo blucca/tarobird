@@ -932,4 +932,233 @@ describe("Windows Host Claude quota home resolution, invocation, and framing", (
     });
     expect(child.controls).toEqual(["get_usage"]);
   });
+
+  it("does not regress passive quota to an older worker's buffered snapshot when multiple workers refuse get_usage", async () => {
+    const f = await fixture();
+    const winProfile = path.join(f.root, "win-profile");
+    await mkdir(path.join(winProfile, ".claude"), { recursive: true });
+    await writeFile(path.join(winProfile, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-win-multi-refuse" } }));
+
+    const child1 = new Child(); child1.refuse.add("get_usage");
+    const child2 = new Child(); child2.refuse.add("get_usage");
+    const spawn = vi.fn().mockReturnValueOnce(child1).mockReturnValueOnce(child2);
+    const adapter = new ClaudeStreamAdapter("claude", {
+      childEnv: { USERPROFILE: winProfile },
+      spawnFn: spawn,
+      workspacePath: f.root,
+      idleSweepIntervalMs: 0,
+      platform: "win32",
+    });
+    disposals.push(() => adapter.destroy());
+
+    const baseNow = Date.now();
+    let fakeNow = baseNow;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => fakeNow);
+
+    const w1 = await (adapter as any).getOrCreateWorker("tarobot-w1", null, null, "normal", f.root);
+    const w2 = await (adapter as any).getOrCreateWorker("tarobot-w2", null, null, "normal", f.root);
+    w1.lastActivityAt = baseNow + 10;
+    w2.lastActivityAt = baseNow + 20;
+
+    // W1 buffers an older reading; W2 buffers a newer reading, refuses get_usage, and later receives an even newer reading.
+    fakeNow = baseNow + 100;
+    child1.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.20 } });
+    fakeNow = baseNow + 200;
+    child2.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.50 } });
+
+    const first = await adapter.getAccountQuota({ refresh: true });
+    expect(child2.controls).toEqual(["get_usage"]);
+    expect(child1.controls).toEqual([]);
+    expect(first.snapshot.pools[0]?.windows[0]).toMatchObject({ id: "five_hour", usedPercent: 50 });
+
+    fakeNow = baseNow + 300;
+    child2.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.80 } });
+    const beforeW1 = await adapter.getAccountQuota({ refresh: false });
+    expect(beforeW1.revision).toBe(first.revision);
+    expect(beforeW1.snapshot.capability.mode).toBe("active");
+    expect(beforeW1.snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 80 });
+
+    // Next refresh asks W1; W1 refuses get_usage, but its older 20% snapshot must NOT overwrite W2's 80% or flip revision.
+    fakeNow = baseNow + 350;
+    const afterW1 = await adapter.getAccountQuota({ refresh: true, expectedRevision: beforeW1.revision });
+    expect(child1.controls).toEqual(["get_usage"]);
+    expect(afterW1.revision).toBe(beforeW1.revision);
+    expect(afterW1.snapshot.observedAt).toBe(beforeW1.snapshot.observedAt);
+    expect(afterW1.snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 80 });
+    expect((await adapter.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ capability: { mode: "passive" } });
+
+    // Same-millisecond tie-breaking: a newly observed event on W1 after W2 still promotes W1 when it is newer by arrival order.
+    fakeNow = baseNow + 300;
+    child1.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.90 } });
+    const afterNewerW1 = await adapter.getAccountQuota({ refresh: false });
+    expect(afterNewerW1.snapshot.pools[0]?.windows[0]).toMatchObject({ usedPercent: 90 });
+    nowSpy.mockRestore();
+  });
+
+  it("keeps active keptUsage authoritative over passive quotaSource across workers in both directions", async () => {
+    const f = await fixture();
+    const winProfile = path.join(f.root, "win-profile");
+    await mkdir(path.join(winProfile, ".claude"), { recursive: true });
+    await writeFile(path.join(winProfile, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-win-mixed-workers" } }));
+
+    // Direction 1: W1 refuses get_usage first (passive quotaSource), then W2 answers get_usage (active keptUsage).
+    const oldChild = new Child(); oldChild.refuse.add("get_usage");
+    const newChild = new Child(); newChild.answers.get_usage = usageReply();
+    const spawn1 = vi.fn().mockReturnValueOnce(oldChild).mockReturnValueOnce(newChild);
+    const adapter1 = new ClaudeStreamAdapter("claude", {
+      childEnv: { USERPROFILE: winProfile },
+      spawnFn: spawn1,
+      workspacePath: f.root,
+      idleSweepIntervalMs: 0,
+      platform: "win32",
+    });
+    disposals.push(() => adapter1.destroy());
+
+    const wOld = await (adapter1 as any).getOrCreateWorker("tarobot-old", null, null, "normal", f.root);
+    oldChild.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.25 } });
+    const passive = await adapter1.getAccountQuota({ refresh: true });
+    expect(passive.snapshot.pools[0]?.windows).toHaveLength(1);
+
+    await (adapter1 as any).getOrCreateWorker("tarobot-new", null, null, "normal", f.root);
+    const active = await adapter1.getAccountQuota({ refresh: true, expectedRevision: passive.revision });
+    expect(active.revision).not.toBe(passive.revision);
+    expect(active.snapshot).toMatchObject({ state: "ready", capability: { mode: "active" } });
+    expect(active.snapshot.pools[0]?.windows.map(window => [window.id, window.metric === "percent" && window.usedPercent])).toEqual([["five_hour", 12], ["seven_day", 61.5]]);
+
+    // Subsequent passive frames on W1 and retiring W1 must NOT re-pin quotaSource or flip revision.
+    oldChild.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.95 } });
+    const afterOldEvent = await adapter1.getAccountQuota({ refresh: false });
+    expect(afterOldEvent.revision).toBe(active.revision);
+    expect(afterOldEvent.snapshot.pools[0]?.windows).toHaveLength(2);
+
+    wOld.retired = true;
+    const afterOldRetire = await adapter1.getAccountQuota({ refresh: false });
+    expect(afterOldRetire.revision).toBe(active.revision);
+    expect(afterOldRetire.snapshot.pools[0]?.windows).toHaveLength(2);
+
+    // Direction 2: W1 populates active keptUsage first, then W2 refuses get_usage (both without and with a passive event).
+    const activeChild = new Child(); activeChild.answers.get_usage = usageReply();
+    const refusingNoEvent = new Child(); refusingNoEvent.refuse.add("get_usage");
+    const refusingWithEvent = new Child(); refusingWithEvent.refuse.add("get_usage");
+    const spawn2 = vi.fn()
+      .mockReturnValueOnce(activeChild)
+      .mockReturnValueOnce(refusingNoEvent)
+      .mockReturnValueOnce(refusingWithEvent);
+    const adapter2 = new ClaudeStreamAdapter("claude", {
+      childEnv: { USERPROFILE: winProfile },
+      spawnFn: spawn2,
+      workspacePath: f.root,
+      idleSweepIntervalMs: 0,
+      platform: "win32",
+    });
+    disposals.push(() => adapter2.destroy());
+
+    const wActive = await (adapter2 as any).getOrCreateWorker("tarobot-a", null, null, "normal", f.root);
+    const baseline = await adapter2.getAccountQuota({ refresh: true });
+    expect(baseline.snapshot.pools[0]?.windows).toHaveLength(2);
+
+    const wRefuseEmpty = await (adapter2 as any).getOrCreateWorker("tarobot-b", null, null, "normal", f.root);
+    wActive.lastActivityAt = 1_000;
+    wRefuseEmpty.lastActivityAt = 2_000;
+    const afterEmptyRefuse = await adapter2.getAccountQuota({ refresh: true, expectedRevision: baseline.revision });
+    expect(refusingNoEvent.controls).toEqual(["get_usage"]);
+    expect(afterEmptyRefuse.revision).toBe(baseline.revision);
+    expect(afterEmptyRefuse.snapshot).toMatchObject({ state: "ready", capability: { mode: "active" } });
+    expect(afterEmptyRefuse.snapshot.reason).toBeUndefined();
+    expect(afterEmptyRefuse.snapshot.pools[0]?.windows).toHaveLength(2);
+
+    const wRefusePassive = await (adapter2 as any).getOrCreateWorker("tarobot-c", null, null, "normal", f.root);
+    wRefusePassive.lastActivityAt = 3_000;
+    refusingWithEvent.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.77 } });
+    const afterPassiveRefuse = await adapter2.getAccountQuota({ refresh: true, expectedRevision: baseline.revision });
+    expect(refusingWithEvent.controls).toEqual(["get_usage"]);
+    expect(afterPassiveRefuse.revision).toBe(baseline.revision);
+    expect(afterPassiveRefuse.snapshot).toMatchObject({ state: "ready", capability: { mode: "active" } });
+    expect(afterPassiveRefuse.snapshot.pools[0]?.windows.map(window => [window.id, window.metric === "percent" && window.usedPercent])).toEqual([["five_hour", 12], ["seven_day", 61.5]]);
+
+    // Direction 1b: an unsupported get_usage answer also clears any prior passive quotaSource.
+    const oldChild3 = new Child(); oldChild3.refuse.add("get_usage");
+    const unsupportedChild3 = new Child(); unsupportedChild3.answers.get_usage = { rate_limits_available: false, rate_limits: null };
+    const spawn3 = vi.fn().mockReturnValueOnce(oldChild3).mockReturnValueOnce(unsupportedChild3);
+    const adapter3 = new ClaudeStreamAdapter("claude", {
+      childEnv: { USERPROFILE: winProfile },
+      spawnFn: spawn3,
+      workspacePath: f.root,
+      idleSweepIntervalMs: 0,
+      platform: "win32",
+    });
+    disposals.push(() => adapter3.destroy());
+    await (adapter3 as any).getOrCreateWorker("tarobot-u1", null, null, "normal", f.root);
+    oldChild3.event({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.30 } });
+    const priorPassive = await adapter3.getAccountQuota({ refresh: true });
+    expect(priorPassive.snapshot.pools[0]?.windows).toHaveLength(1);
+    await (adapter3 as any).getOrCreateWorker("tarobot-u2", null, null, "normal", f.root);
+    const unsupported = await adapter3.getAccountQuota({ refresh: true, expectedRevision: priorPassive.revision });
+    expect(unsupported.snapshot).toMatchObject({ state: "unsupported", reason: "mode_not_supported", pools: [] });
+    expect((await adapter3.getAccountQuota({ refresh: false })).snapshot).toMatchObject({ reason: "not_loaded", pools: [] });
+  });
+
+  it("handles win32 case-insensitive env lookup and normalization for antigravity", async () => {
+    const f = await fixture();
+    const winProfile = path.join(f.root, "win-profile");
+    await mkdir(winProfile, { recursive: true });
+
+    const apiEnv: NodeJS.ProcessEnv = { UserProfile: winProfile, Gemini_Api_Key: "key-1" };
+    const agyApi = new AdapterQuotaCache("antigravity", "agy", apiEnv, f.root, undefined, "win32");
+    const scope1 = agyApi.capture("process");
+    expect(scope1).toMatchObject({ authMode: "api_key", verifiable: true });
+    expect(agyApi.response(scope1, { refresh: false })?.snapshot).toMatchObject({ state: "unsupported", reason: "mode_not_supported", authMode: "api_key" });
+
+    apiEnv.Gemini_Api_Key = "key-2";
+    const scope2 = agyApi.capture("process");
+    expect(scope2.credentialRevision).not.toBe(scope1.credentialRevision);
+
+    const adcEnv: NodeJS.ProcessEnv = { UserProfile: winProfile, Google_Application_Credentials: path.join(f.root, "adc-a.json") };
+    const agyAdc = new AdapterQuotaCache("antigravity", "agy", adcEnv, f.root, undefined, "win32");
+    const adcScope1 = agyAdc.capture("process");
+    expect(adcScope1).toMatchObject({ authMode: "adc", verifiable: true });
+    expect(agyAdc.response(adcScope1, { refresh: false })?.snapshot).toMatchObject({ state: "unsupported", reason: "mode_not_supported", authMode: "adc" });
+    adcEnv.Google_Application_Credentials = path.join(f.root, "adc-b.json");
+    expect(agyAdc.capture("process").credentialRevision).not.toBe(adcScope1.credentialRevision);
+
+    // POSIX remains case-sensitive for antigravity env vars.
+    const linuxAgy = new AdapterQuotaCache("antigravity", "agy", { HOME: winProfile, Gemini_Api_Key: "key-1" }, f.root, undefined, "linux");
+    const linuxScope = linuxAgy.capture("process");
+    expect(linuxScope.authMode).toBe("unknown");
+    expect(linuxAgy.response(linuxScope, { refresh: false })?.snapshot).toMatchObject({ state: "login_required", reason: "login_required" });
+  });
+
+  it("handles case-colliding Windows env keys consistently across AdapterQuotaCache and resolveClaudeConfigDir", async () => {
+    const f = await fixture();
+    const winProfile = path.join(f.root, "win-profile");
+    const customDir = path.join(f.root, "custom-claude");
+    await mkdir(path.join(winProfile, ".claude"), { recursive: true });
+    await mkdir(customDir, { recursive: true });
+    await writeFile(path.join(winProfile, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-default-dir" } }));
+
+    // 1. Mutating either colliding case variant changes credentialRevision (neither entry is silently dropped).
+    const dupEnv: NodeJS.ProcessEnv = { USERPROFILE: winProfile, ANTHROPIC_API_KEY: "key-a", Anthropic_Api_Key: "key-b" };
+    const dupCache = new AdapterQuotaCache("claude", "claude", dupEnv, f.root, undefined, "win32");
+    const rev1 = dupCache.capture("usage").credentialRevision;
+    dupEnv.ANTHROPIC_API_KEY = "key-c";
+    const rev2 = dupCache.capture("usage").credentialRevision;
+    expect(rev2).not.toBe(rev1);
+    dupEnv.Anthropic_Api_Key = "key-d";
+    const rev3 = dupCache.capture("usage").credentialRevision;
+    expect(rev3).not.toBe(rev2);
+
+    // 2. Explicit canonical empty override ("") clears an inherited mixed-case key instead of falling back to it.
+    const clearedKeyEnv: NodeJS.ProcessEnv = { USERPROFILE: winProfile, ANTHROPIC_API_KEY: "", Anthropic_Api_Key: "stale-key" };
+    const clearedKeyCache = new AdapterQuotaCache("claude", "claude", clearedKeyEnv, f.root, undefined, "win32");
+    expect(clearedKeyCache.capture("usage")).toMatchObject({ authMode: "subscription", verifiable: true });
+
+    // 3. Explicit empty or whitespace CLAUDE_CONFIG_DIR overrides agree between AdapterQuotaCache and resolveClaudeConfigDir.
+    for (const override of ["", "   "]) {
+      const dirEnv: NodeJS.ProcessEnv = { USERPROFILE: winProfile, CLAUDE_CONFIG_DIR: override, Claude_Config_Dir: customDir };
+      expect(resolveClaudeConfigDir(dirEnv, "win32")).toBe(path.join(winProfile, ".claude"));
+      // customDir has no .credentials.json while winProfile/.claude does; verifiable subscription proves AdapterQuotaCache chose winProfile/.claude too.
+      const dirCache = new AdapterQuotaCache("claude", "claude", dirEnv, f.root, undefined, "win32");
+      expect(dirCache.capture("usage")).toMatchObject({ authMode: "subscription", verifiable: true });
+    }
+  });
 });

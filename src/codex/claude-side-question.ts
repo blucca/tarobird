@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { lstat, readdir, rm } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { readPlatformEnv, resolvePlatformHome } from "./adapter-account-quota.js";
 import { killProcessTree } from "./process-tree.js";
 
 /** Native Claude Code side questions (`control_request` subtype
@@ -201,13 +201,9 @@ export class ClaudeSideProcess {
 }
 
 export function resolveClaudeConfigDir(env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): string {
-  const configured = env.CLAUDE_CONFIG_DIR?.trim()
-    || (platform === "win32" ? Object.entries(env).find(([key, value]) => key.toUpperCase() === "CLAUDE_CONFIG_DIR" && value?.trim())?.[1]?.trim() : undefined);
+  const configured = readPlatformEnv(env, "CLAUDE_CONFIG_DIR", platform)?.trim();
   if (configured) return configured;
-  const userProfile = env.USERPROFILE || (platform === "win32" ? Object.entries(env).find(([key, value]) => key.toUpperCase() === "USERPROFILE" && value)?.[1] : undefined);
-  const homeVar = env.HOME || (platform === "win32" ? Object.entries(env).find(([key, value]) => key.toUpperCase() === "HOME" && value)?.[1] : undefined);
-  const home = (platform === "win32" ? userProfile || homeVar : homeVar || userProfile) || os.homedir();
-  return path.join(home, ".claude");
+  return path.join(resolvePlatformHome(env, platform), ".claude");
 }
 
 /** Returns the path when an owned entry is still present after removal. */
