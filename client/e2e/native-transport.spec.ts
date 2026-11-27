@@ -779,13 +779,13 @@ test("paired route probe timeouts stay unavailable and preserve host name withou
     return { error, health: connection.state.routeHealth };
   });
   expect(result).toEqual({
-    error: "暂时无法连接「macmini」，正在自动重试。",
+    error: "无法通过中转或公网地址连接「macmini」，正在自动重试。请确认主机未休眠、TaroBird 正在运行，且中转服务在线。",
     health: [
-      { url: "https://primary.invalid", status: "unreachable" },
-      { url: "https://backup.invalid", status: "unreachable" },
+      { url: "https://primary.invalid", status: "unreachable", reason: "timeout" },
+      { url: "https://backup.invalid", status: "unreachable", reason: "timeout" },
     ],
   });
-  await expect(page.getByText("暂不可用", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("连接超时", { exact: true })).toHaveCount(2);
   await expect(page.getByText("安全验证超时", { exact: true })).toHaveCount(0);
 });
 
