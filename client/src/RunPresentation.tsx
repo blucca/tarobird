@@ -180,7 +180,7 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
       ? t("会话进度已保留，约 {0} 秒后自动重试。可随时停止。", retrySeconds)
       : run.current?.status === "waiting" ? t("会话进度已保留，即将自动重试。可随时停止。")
         : t("正在续接原会话，已完成的工作仍然保留。可随时停止。")}</p>}
-    {thinking && <div className="run-thinking-preview"><span>{t("公开思考摘要")}</span><p>{(thinking.truncated ? "…" : "") + runReportExcerpt(thinking.text, true).replace(/^…/, thinking.truncated ? "" : "…")}</p></div>}
+    {thinking && <ThinkingPreview text={(thinking.truncated ? "…" : "") + runReportExcerpt(thinking.text, true).replace(/^…/, thinking.truncated ? "" : "…")}/>}
     {scoped && !inlineScopedReply ? reportPreview.preview : <div className="native-run-prose">{prose.map((entry, index) => <div className="card-text" key={entry.id ?? index}><MarkdownText text={entry.text!} reply/></div>)}</div>}
     {backgroundNote && <p className="run-notice">{backgroundNote}</p>}
     <div className="native-run-actions">{scoped && !inlineScopedReply && reportPreview.needsReader && <button type="button" ref={reportTrigger} className="run-report-trigger" onClick={() => open({ key, kind: "report" })}>{t("查看完整回复")}</button>}{!scopeUnsupported && <button ref={trigger} className="run-process-trigger" onClick={() => open({ key, kind: "process" })} aria-label={t("查看运行过程")}><ChevronRight size={14}/><span>{run.count ? t("过程 · {0} 个动作", run.count) : t("查看运行过程")}</span></button>}
@@ -190,6 +190,27 @@ export function RunPresentation({ run, block, message, connection, backgroundSou
     {!scoped && active && !interrupted && !disconnected && stopState === "unconfirmed" && <p className="run-notice" role="status">{t("尚未收到停止确认。请核对运行状态，需要时可再次停止。")}</p>}
     {readers}
   </section>;
+}
+
+/** The newest lines of the public thinking summary. Older lines fade once
+ * there is more than one line, and a caret marks the live end. */
+function ThinkingPreview({ text }: { text: string }) {
+  const tail = useRef<HTMLSpanElement>(null);
+  const [multiline, setMultiline] = useState(false);
+  useLayoutEffect(() => {
+    const node = tail.current;
+    if (!node) return;
+    const measure = () => setMultiline(node.offsetHeight > parseFloat(getComputedStyle(node).lineHeight) * 1.5);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [text]);
+  return <div className="run-thinking-preview">
+    <div className="run-thinking-label"><span>{t("思考中")}</span><i className="run-thinking-dots" aria-hidden="true"><b/><b/><b/></i></div>
+    <p data-multiline={multiline || undefined}><span ref={tail}>{text}</span></p>
+  </div>;
 }
 
 function RunDetails({ goalTurnEnded, scoped, run, phase, observedNow, sync, message, connection, view, close, returnFocus, report }: { goalTurnEnded?: boolean; report?: () => void; scoped: boolean; run: RunSummary; phase: RunSummary["phase"]; observedNow: number; sync?: ScopedJournal; message: Message; connection: HubConnection; view: View; close: () => void; returnFocus: React.RefObject<HTMLButtonElement | null> }) {
