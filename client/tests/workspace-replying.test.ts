@@ -78,7 +78,7 @@ describe("buildReplyingEntries", () => {
       resolveBotName,
       attachmentLabel: "Attachment",
     })).toEqual([
-      { key: "reply:bot_arch:reply_1", botId: "bot_arch", botName: "Architect", text: "Compare rollout strategies for the EU region" },
+      { key: "reply:bot_arch:reply_1", botId: "bot_arch", botName: "Architect", text: "Compare rollout strategies for the EU region", startedAt: 10 },
     ]);
   });
 
@@ -100,7 +100,7 @@ describe("buildReplyingEntries", () => {
       resolveBotName,
       attachmentLabel: "Attachment",
     })).toEqual([
-      { key: "reply:bot_arch:reply_1", botId: "bot_arch", botName: "Architect", text: "" },
+      { key: "reply:bot_arch:reply_1", botId: "bot_arch", botName: "Architect", text: "", startedAt: 10 },
     ]);
     expect(previewWorkspaceMessage(input, "Attachment")).toBe("");
   });
@@ -148,7 +148,7 @@ describe("buildReplyingEntries", () => {
       resolveBotName,
       attachmentLabel: "Attachment",
     })).toEqual([
-      { key: "reply:bot_arch:r1", botId: "bot_arch", botName: "Architect", text: "" },
+      { key: "reply:bot_arch:r1", botId: "bot_arch", botName: "Architect", text: "", startedAt: 10 },
     ]);
 
     // When replyTo matches a dispatched item not yet in messages, it resolves that exact item.
@@ -163,7 +163,7 @@ describe("buildReplyingEntries", () => {
       resolveBotName,
       attachmentLabel: "Attachment",
     })).toEqual([
-      { key: "reply:bot_arch:r2", botId: "bot_arch", botName: "Architect", text: "Exact matching dispatched prompt" },
+      { key: "reply:bot_arch:r2", botId: "bot_arch", botName: "Architect", text: "Exact matching dispatched prompt", startedAt: 10 },
     ]);
 
     // When replyTo is absent, falling back to dispatchedItems[0] is still allowed.
@@ -177,7 +177,7 @@ describe("buildReplyingEntries", () => {
       resolveBotName,
       attachmentLabel: "Attachment",
     })).toEqual([
-      { key: "reply:bot_arch:r3", botId: "bot_arch", botName: "Architect", text: "Unrelated second message" },
+      { key: "reply:bot_arch:r3", botId: "bot_arch", botName: "Architect", text: "Unrelated second message", startedAt: 10 },
     ]);
   });
 });

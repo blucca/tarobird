@@ -15,6 +15,8 @@ export interface ReplyingEntry {
   botId: string;
   botName: string;
   text: string;
+  /** When this reply or handed-over message began, for the rail's "working for …" note. */
+  startedAt?: number;
 }
 
 export const WORKSPACE_QUEUE_POLL_MS = 2_000;
@@ -101,7 +103,7 @@ export function buildReplyingEntries({
     }
     coveredBots.add(botId);
     if (sourceId) coveredMessages.add(sourceId);
-    entries.push({ key: `reply:${botId}:${reply.id}`, botId, botName: resolveBotName(botId), text });
+    entries.push({ key: `reply:${botId}:${reply.id}`, botId, botName: resolveBotName(botId), text, startedAt: reply.createdAt });
   }
 
   if (directBotId) {
@@ -114,6 +116,7 @@ export function buildReplyingEntries({
         botId: directBotId,
         botName: resolveBotName(directBotId),
         text: previewWorkspaceMessage(item.message, attachmentLabel),
+        startedAt: item.message.createdAt,
       });
     }
   }
