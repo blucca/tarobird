@@ -532,32 +532,35 @@ test("real Hub: deleted messages do not stick as sent after disconnect-before-AC
     await selectConversation(page, "删除回归");
     await expect(page.locator(".queued-message").filter({ hasText: "RECONNECT_DELETED_MSG" })).toHaveCount(0);
 
+    // A pending outbox bubble also has .message.user while the ACK is held.
+    const committedRows = page.locator(".message.user:not(.is-pending-outbox)");
+
     // 2. Live delete before delayed message.ack.
     holdNextAck = true; releaseHeldAck = undefined;
     await page.getByLabel("消息", { exact: true }).fill("LIVE_DELETED_MSG");
     await page.getByRole("button", { name: "发送消息", exact: true }).click();
-    await expect(page.locator(".message.user").filter({ hasText: "LIVE_DELETED_MSG" })).toBeVisible();
+    await expect(committedRows.filter({ hasText: "LIVE_DELETED_MSG" })).toBeVisible();
     await expect.poll(() => !!releaseHeldAck).toBe(true);
     const liveMsg = (await hub.store.snapshot("owner", chat.id)).messages.find(m => m.blocks.some(b => b.type === "text" && b.text === "LIVE_DELETED_MSG"))!;
     await hub.store.deleteMessages("owner", chat.id, { messageIds: [liveMsg.id] });
-    await expect(page.locator(".message.user").filter({ hasText: "LIVE_DELETED_MSG" })).toHaveCount(0);
+    await expect(committedRows.filter({ hasText: "LIVE_DELETED_MSG" })).toHaveCount(0);
     releaseHeldAck!();
     await expect.poll(outboxIds).toEqual([]);
-    await expect(page.locator(".queued-message").filter({ hasText: "LIVE_DELETED_MSG" })).toHaveCount(0);
+    await expect(page.locator(".queued-message, .message.user").filter({ hasText: "LIVE_DELETED_MSG" })).toHaveCount(0);
     await selectConversation(page, "备用对话");
     await selectConversation(page, "删除回归");
-    await expect(page.locator(".queued-message").filter({ hasText: "LIVE_DELETED_MSG" })).toHaveCount(0);
+    await expect(page.locator(".queued-message, .message.user").filter({ hasText: "LIVE_DELETED_MSG" })).toHaveCount(0);
 
     // 3. Delayed ACK with no local tombstone at all (simulating snapshot omission):
     // bounded fallback reconciliation retires the phantom "已发送" row cleanly.
     holdNextAck = true; releaseHeldAck = undefined;
     await page.getByLabel("消息", { exact: true }).fill("NO_TOMBSTONE_MSG");
     await page.getByRole("button", { name: "发送消息", exact: true }).click();
-    await expect(page.locator(".message.user").filter({ hasText: "NO_TOMBSTONE_MSG" })).toBeVisible();
+    await expect(committedRows.filter({ hasText: "NO_TOMBSTONE_MSG" })).toBeVisible();
     await expect.poll(() => !!releaseHeldAck).toBe(true);
     const noTombstoneMsg = (await hub.store.snapshot("owner", chat.id)).messages.find(m => m.blocks.some(b => b.type === "text" && b.text === "NO_TOMBSTONE_MSG"))!;
     await hub.store.deleteMessages("owner", chat.id, { messageIds: [noTombstoneMsg.id] });
-    await expect(page.locator(".message.user").filter({ hasText: "NO_TOMBSTONE_MSG" })).toHaveCount(0);
+    await expect(committedRows.filter({ hasText: "NO_TOMBSTONE_MSG" })).toHaveCount(0);
     await page.evaluate(async ({ name, messageId, conversationId }) => {
       const request = indexedDB.open(name);
       const db = await new Promise<IDBDatabase>((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
