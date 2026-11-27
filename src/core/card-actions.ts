@@ -816,12 +816,12 @@ export function renderCoreDroppedBurstNotice(count: number, locale: Locale): str
   return hostT(locale, "已同时取消 {0} 条尚未合并成任务的待发送消息。", count);
 }
 
-/** Shared by /stop, the run card and Gateway's composer stop control.
- * Call only after surface authorization. Queued turns are intentionally kept. */
-export async function stopCoreConversation(
+/** Interrupt current work, its outstanding questions and post-turn background
+ * swarms while retaining all pending inputs. Shared by /stop and /restart: the
+ * foreground abort runs synchronously; `backgroundStop` is the swarm stop, if any. */
+export function abortCoreConversation(
   runtime: CoreServiceRuntime,
   conversationKey: string,
-  stateDir?: string,
   bridge?: Pick<CoreBridgeLike, "stopBackgroundWork">,
   locale?: Locale,
 ) {
@@ -844,21 +844,38 @@ export async function stopCoreConversation(
   // its abort handler manages cancellation cleanly (preserving session/cancel
   // grace for ordinary ACP turns while still stopping active swarms). Only stop
   // post-turn background swarms here when no foreground run owns the stop.
-  const background: { stopped: boolean; summary?: string } = !hasForegroundRun && !survivingGoal && bridge?.stopBackgroundWork
-    ? await bridge.stopBackgroundWork({
-      chatId: stableCoreNumericId(conversationKey),
-      conversationKey,
-      scope: "swarm",
-      ...(locale ? { locale: isChineseLocale(locale) ? "zh" as const : "en" as const } : {}),
-    }).catch(() => ({ stopped: false }))
-    : { stopped: false };
-  if (background.stopped) {
-    for (const pending of [...runtime.pendingApprovals.values()]) {
-      if (pending.conversationKey === conversationKey && !pending.cancelled) {
-        pending.abortHandler?.();
+  const backgroundStop: Promise<{ stopped: boolean; summary?: string }> | undefined = !hasForegroundRun && !survivingGoal && bridge?.stopBackgroundWork
+    ? (async () => {
+      const background: { stopped: boolean; summary?: string } = await bridge.stopBackgroundWork!({
+        chatId: stableCoreNumericId(conversationKey),
+        conversationKey,
+        scope: "swarm",
+        ...(locale ? { locale: isChineseLocale(locale) ? "zh" as const : "en" as const } : {}),
+      }).catch(() => ({ stopped: false }));
+      if (background.stopped) {
+        for (const pending of [...runtime.pendingApprovals.values()]) {
+          if (pending.conversationKey === conversationKey && !pending.cancelled) {
+            pending.abortHandler?.();
+          }
+        }
       }
-    }
-  }
+      return background;
+    })()
+    : undefined;
+  return { active, cancelledQuestions: cancelledQuestions.length, backgroundStop };
+}
+
+/** Shared by /stop, the run card and Gateway's composer stop control.
+ * Call only after surface authorization. Queued turns are intentionally kept. */
+export async function stopCoreConversation(
+  runtime: CoreServiceRuntime,
+  conversationKey: string,
+  stateDir?: string,
+  bridge?: Pick<CoreBridgeLike, "stopBackgroundWork">,
+  locale?: Locale,
+) {
+  const { active, cancelledQuestions, backgroundStop } = abortCoreConversation(runtime, conversationKey, bridge, locale);
+  const background = backgroundStop ? await backgroundStop : { stopped: false };
   const droppedBurst = dropPendingCoreAttachmentBurst(runtime, conversationKey);
   if (droppedBurst && stateDir) {
     await Promise.allSettled(droppedBurst.members.map((member) => appendCoreTimelineEvent(stateDir, member, {
@@ -868,7 +885,7 @@ export async function stopCoreConversation(
   return {
     active,
     droppedBurst,
-    cancelledQuestions: cancelledQuestions.length,
+    cancelledQuestions,
     backgroundStopped: background.stopped,
     backgroundSummary: background.summary,
   };

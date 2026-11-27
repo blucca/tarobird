@@ -136,8 +136,8 @@ export async function handleCoreSimpleCommand(
   const commandLocale = await resolveCoreLocale(input.stateDir);
   if (isHelpCommand(commandText)) {
     const help = channelProfile() === "gateway"
-      ? renderGatewayHelp((await loadInstanceConfig(input.stateDir)).engine, commandLocale)
-      : renderCoreHelpMessage(commandLocale);
+      ? renderGatewayHelp((await loadInstanceConfig(input.stateDir)).engine, commandLocale, input.bridge.supportsConversationRestart?.() ?? false)
+      : renderCoreHelpMessage(commandLocale, input.bridge.supportsConversationRestart?.() ?? false);
     await sendCoreCommandMarkdown(input, normalized, "/help", help);
     return true;
   }
@@ -1051,15 +1051,23 @@ export function isCoreGoalControlCommand(text: string): boolean {
   return !!action && action.kind !== "set";
 }
 
+export function isRestartCommand(text: string): boolean {
+  return /^\/restart(?:\s|$)/i.test(text.trim());
+}
+
 export function isStopCommand(text: string): boolean {
   return /^\/stop(?:\s|$)/i.test(text.trim());
 }
 
-function renderCoreHelpMessage(locale: Locale = "zh"): string {
-  return hostT(
+function renderCoreHelpMessage(locale: Locale = "zh", supportsRestart = false): string {
+  const help = hostT(
     locale,
     "**TaroCub · 飞书/Lark**\n\n直接发消息就能用 —— 私聊直接发，群里 @我 触发。也能发文件、图片、音视频（短音频走本地 Qwen ASR，长音频在已配置时走通义听悟）。大部分设置走 `/config` 交互面板。\n\n**会话**\n- `/status` 当前会话 · `/stop` 停当前任务（排队任务在各自排队卡片上取消）· `/reset` 重置会话\n- `/resume [编号]` 选 Claude/Kimi/DeepSeek Harness/Antigravity/Pi 会话 · Claude `/resume <完整 ID>` · Codex `/resume thread <id>` · Kimi/DeepSeek 也支持 `/resume session <id>` · `/detach` 解绑\n- `/goal […]` 设会话目标 · `/btw <问题>` 旁问不影响会话 · `/continue` 继续等待中的压缩包分析\n- `/q <消息>` 强制排队 — Codex/DeepSeek 任务运行中纯文本会注入当前任务，`/q` 则排在后面单独执行\n- `/bg` 列出本实例引擎/后台进程 · `/bg kill <pid>` 停指定进程树 · `/bg killall` 清理孤儿后台进程\n\n**设置**\n- `/config` 交互配置面板（推荐）· `/usage` 用量 · `/account` 当前绑定的飞书应用\n- `/model` · `/effort` · `/engine [claude|codex|kimi|deepseek|antigravity|pi]` · `/fast` Codex 快速模式 · `/yolo` 审批模式\n- `/stream [on|off]` 回答卡片打字机流式开关（off = 整卡刷新）\n- `/timeout [on|off]` 引擎运行时保护（硬上限和/或静默看门狗；off 会全部关闭）\n- `/steer [on|off|<秒数>|unlimited]` 任务中途引导的资格窗口（默认 30 秒，超窗排队）\n\n**群**\n- `/newgroup <名>` / `/newgroup topic <名>` / `/newtopic <名>` 新建并授权普通群 / 话题群（你是群主）\n- `/group [status|allow|deny|all|at]` 群授权与回复模式（`all`=不@也回，`at`=只@才回）\n- `/invite group|user @某人` · `/remove …` 群/用户授权 · `/cron …` 定时提醒与任务\n\n**进阶与协作**\n- `/board …` 持久任务板 · `/mini …` 把群 thread 注册成 peer 互联 · `/ask <实例> <提示>` 委托给别的 bot\n- `/fan` · `/chain` · `/verify` Agent Bus 并行 / 串联 / 验证\n- `/context` Claude/DeepSeek 上下文 · `/compact` Claude/Kimi/DeepSeek 压缩 · `/ultrareview` Claude 深度审查\n- `/approve [session]` · `/deny` 卡片按钮不可用时用文字处理审批\n\n完整命令表见 README 的 Slash Command Index。群里普通消息默认要@；`/group all` 开非@（应用还需有 `im:message` + `im:message.group_msg`）。若开了非@群消息仍收不到，运行 `node dist/src/index.js lark doctor`。",
   );
+  if (!supportsRestart) return help;
+  // Only engines whose adapter can end a session's process list /restart, under the /status line.
+  const restart = hostT(locale, "- `/restart` 结束引擎进程，保留会话，下次发消息时启动");
+  return help.replace(/^- `\/status`.*$/m, line => `${line}\n${restart}`);
 }
 
 function isGroupCommand(text: string): boolean {

@@ -1,3 +1,4 @@
+import { handleCoreRestart } from "./restart-command.js";
 import { isBotControl } from "../client-protocol/bot-messages.js";
 import { isGeneratedVoiceFilename } from "../client-protocol/voice-presentation.js";
 import { backgroundTaskBody, backgroundTaskContext, backgroundTaskReplyTo } from "./background-task-notice.js";
@@ -82,6 +83,7 @@ import {
   isCoreGoalControlCommand,
   tryHandleCoreGoalControlBeforeQueue,
   isCoreLocalEngineCommand,
+  isRestartCommand,
   isStopCommand,
 } from "./commands.js";
 import {
@@ -540,6 +542,12 @@ async function runAcceptedCoreMessage(
       });
     return false;
   };
+
+  if (isRestartCommand(commandText)) {
+    if (!(await checkPreQueueAccess("/restart"))) return true;
+    await handleCoreRestart(input, normalized, messageLocale);
+    return true;
+  }
 
   // Codex goal controls must remain reachable while an ordinary turn runs.
   // Native Claude commands still execute through its serialized input stream.
@@ -1122,7 +1130,7 @@ async function preemptActiveCoreTurnIfEnabled(
   commandText: string,
   locale: Locale,
 ): Promise<void> {
-  if (!input.runtime.queuePolicy.preempt || isSlashCommand(commandText)) {
+  if (!input.runtime.queuePolicy.preempt || isSlashCommand(commandText) || input.runtime.chatQueue.pausedUntil(normalized.conversationKey)) {
     return;
   }
   const active = input.runtime.activeRuns.get(normalized.conversationKey);
@@ -1145,7 +1153,7 @@ async function preemptActiveCoreTurnIfEnabled(
       locale,
     })
     : { kind: "allow" as const };
-  if (accessDecision.kind !== "allow") {
+  if (accessDecision.kind !== "allow" || input.runtime.chatQueue.pausedUntil(normalized.conversationKey)) {
     return;
   }
   if (active?.goalWatch) {
@@ -1227,7 +1235,7 @@ async function trySteerActiveCoreTurn(
   locale: Locale,
 ): Promise<boolean> {
   // App users choose steering explicitly; ordinary sends always use the queue.
-  if (input.channel.profile === "gateway") return false;
+  if (input.channel.profile === "gateway" || input.runtime.chatQueue.pausedUntil(normalized.conversationKey)) return false;
   if (typeof input.bridge.steerActiveTurn !== "function") {
     return false;
   }
@@ -1319,7 +1327,8 @@ async function trySteerActiveCoreTurn(
   try {
     if (input.channel.canSteerConversation && !await input.channel.canSteerConversation(normalized.chatId)) return false;
   } catch { return false; }
-  const isCurrentTurn = () => input.runtime.activeRuns.get(normalized.conversationKey) === activeRun
+  const isCurrentTurn = () => !input.runtime.chatQueue.pausedUntil(normalized.conversationKey)
+    && input.runtime.activeRuns.get(normalized.conversationKey) === activeRun
     && !steerTarget.abortController.signal.aborted
     && (!attachedTurn || (activeRun.abortController instanceof CoreGoalRunController
       && activeRun.abortController.liveConcurrentTurn() === attachedTurn));
@@ -1696,6 +1705,7 @@ async function runNormalizedCoreMessage(
     });
     cfg.resume = undefined;
   }
+  for (let pause; (pause = input.runtime.chatQueue.pausedUntil(normalized.conversationKey));) await pause;
   try { await input.channel.prepareConversation?.(normalized.chatId); }
   catch (error) {
     await appendCoreTimelineEvent(input.stateDir, normalized, { type: "turn.completed", outcome: "error", detail: redactCoreErrorDetail(error), metadata: { phase: "conversation-prepare" } });
@@ -1719,6 +1729,7 @@ async function runNormalizedCoreMessage(
   cfg.resume = conversationResume;
   const workspaceOverride = input.workspaceOverride ?? conversationResume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
 
+  for (let pause; (pause = input.runtime.chatQueue.pausedUntil(normalized.conversationKey));) await pause;
   const commandText = extractCoreMessageBody(normalized.text);
 
   // Claim the conversation's activeRuns slot — or, when a live /goal pursuit

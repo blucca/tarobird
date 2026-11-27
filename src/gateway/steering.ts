@@ -47,7 +47,9 @@ export function gatewaySteering(bridge: ReviewTargetBridge, runtime: CoreService
   const ids = new WeakMap<CoreActiveRun, string>();
   const receipts = new GatewayReceipts(stateDir);
   const current = (conversationId: string) => {
-    const run = runtime.activeRuns.get(buildCoreConversationKey(conversationId));
+    const key = buildCoreConversationKey(conversationId);
+    if (runtime.chatQueue.pausedUntil(key)) return undefined;
+    const run = runtime.activeRuns.get(key);
     const attached = run?.abortController instanceof CoreGoalRunController ? run.abortController.liveConcurrentTurn() : null;
     const target = attached ?? (run?.goalWatch ? undefined : run);
     return target && !target.abortController.signal.aborted && !target.preparingMedia ? target : undefined;

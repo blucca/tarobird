@@ -626,6 +626,29 @@ describe("AntigravityAcpAdapter cleanup", () => {
     await expect(second).resolves.toBeInstanceOf(Error);
   });
 
+  it("restartSession closes only that session's process, and the next turn resumes the same session in a new one", async () => {
+    const harness = createHarness();
+    const adapter = track(await adapterFor(harness));
+    await expect(adapter.restartSession(SESSION_A)).resolves.toEqual({ outcome: "not_running" });
+    const first = adapter.sendUserMessage("tarobot-1", { text: "a", files: [] });
+    await waitFor(() => harness.children[0]?.server.prompts.length === 1);
+    harness.children[0]!.server.text("a");
+    harness.children[0]!.server.respondPrompt();
+    await settleWithin(first);
+    const closing = adapter.restartSession(SESSION_A);
+    await waitFor(() => harness.log.includes("kill:900"));
+    expect(harness.log).toEqual([`close:${SESSION_A}`, "stdin-end:900", "kill:900"]);
+    await expect(closing).resolves.toEqual({ outcome: "closed" });
+    expect(harness.children).toHaveLength(1);
+    await expect(adapter.restartSession(SESSION_A)).resolves.toEqual({ outcome: "not_running" });
+    const next = adapter.sendUserMessage(SESSION_A, { text: "b", files: [] });
+    await waitFor(() => harness.children[1]?.server.prompts.length === 1);
+    expect(harness.children[1]!.server.requests("session/resume")[0]!.params).toMatchObject({ sessionId: SESSION_A });
+    harness.children[1]!.server.text("b");
+    harness.children[1]!.server.respondPrompt();
+    await settleWithin(next);
+  });
+
   it("still kills the process after a short timeout when session/close never answers", async () => {
     const harness = createHarness((server) => { server.answerClose = false; });
     const adapter = await adapterFor(harness);

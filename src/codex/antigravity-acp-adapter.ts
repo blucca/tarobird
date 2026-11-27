@@ -45,7 +45,7 @@ import {
   type SwarmBoardFileCache,
 } from "./antigravity-swarm.js";
 import { spawnEngine } from "../runtime/engine-process.js";
-import { appStopKillOptions } from "../runtime/turn-cancellation.js";
+import { APP_STOP_PROCESS_GRACE_MS, appStopKillOptions } from "../runtime/turn-cancellation.js";
 import { DEFAULT_APPROVAL_MODE, normalizeApprovalMode, type ApprovalMode } from "../state/approval-mode.js";
 import { ANTIGRAVITY_EFFORT_LEVELS, readValidatedConfigFile, resolveEngineOverride } from "../state/instance-config.js";
 import type {
@@ -60,9 +60,11 @@ import type {
   EngineStreamEvent,
   EngineTask,
   EngineTaskSnapshot,
+  EngineSessionRestartResult,
 } from "./adapter.js";
 import { EngineIncompleteResponseError, EngineSteeringRejectedError } from "./adapter.js";
 import { killProcessTree } from "./process-tree.js";
+import { EngineSessionRestarts, observeEngineProcessExit } from "./engine-session-restart.js";
 import { extractAntigravityTaskPlan, parseAcpPlanSummary, type AntigravityTodoItem } from "./antigravity-task-plan.js";
 import { renderPrivateTurnInstructions } from "./turn-instructions.js";
 import { isChineseLocale } from "../runtime/locale.js";
@@ -90,11 +92,13 @@ type AgyWritable = {
 
 export type AgyAcpChildProcess = {
   pid?: number;
+  exitCode?: number | null;
+  signalCode?: NodeJS.Signals | null;
   stdin?: AgyWritable;
   stdout?: AgyReadable;
   stderr?: AgyReadable;
   once(event: "error", listener: (error: Error) => void): void;
-  once(event: "close", listener: (code: number | null, signal?: NodeJS.Signals | null) => void): void;
+  once(event: "exit" | "close", listener: (code: number | null, signal?: NodeJS.Signals | null) => void): void;
 };
 
 export type SpawnAgyAcp = (command: string, args: string[], options: SpawnOptions) => AgyAcpChildProcess;
@@ -646,6 +650,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   private readonly spawnFn: SpawnAgyAcp;
   private readonly killProcessTreeFn: (pid: number | undefined, options?: { graceMs: number }) => void;
   private readonly workers = new Map<string, Worker>();
+  private readonly sessionRestarts = new EngineSessionRestarts();
   private readonly pendingWorkers = new Map<string, Promise<Worker>>();
   private readonly initializeTimeoutMs: number;
   private readonly closeTimeoutMs: number;
@@ -941,6 +946,21 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     return blocks;
   }
 
+  /** session/close, then the `agy acp` process tree of this session only; the next turn loads the session again. */
+  restartSession(sessionId: string): Promise<EngineSessionRestartResult> {
+    const worker = this.workers.get(sessionId);
+    return this.sessionRestarts.close(sessionId, worker && !worker.removed && !this.sessionRestartPending(sessionId) ? {
+      exited: worker.exited ? Promise.resolve() : observeEngineProcessExit(worker.child),
+      stop: () => worker.exited ? undefined : worker.removed
+        ? this.killProcessTreeFn(worker.child.pid, { graceMs: APP_STOP_PROCESS_GRACE_MS })
+        : this.closeWorker(worker, new Error(STOPPED_BY_USER), { graceMs: APP_STOP_PROCESS_GRACE_MS }),
+    } : undefined);
+  }
+
+  sessionRestartPending(sessionId: string): Promise<void> | undefined {
+    return this.sessionRestarts.exiting(sessionId);
+  }
+
   async sendUserMessage(sessionId: string, input: CodexUserMessageInput): Promise<CodexAdapterResponse> {
     if (this.destroyed) throw new Error("Adapter destroyed");
     const config = resolveEngineOverride("antigravity", await this.loadRuntimeConfig(), input.engineOverride);
@@ -1026,6 +1046,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   private async getOrCreateWorker(requestedId: string, workspace: string, launchKey: string, approvalMode: ApprovalMode): Promise<Worker> {
+    if (this.sessionRestartPending(requestedId)) throw new Error("Antigravity's old process is still exiting");
     let sessionId = requestedId;
     const existing = this.liveWorker(sessionId);
     if (existing) {

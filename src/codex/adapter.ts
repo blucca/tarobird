@@ -541,6 +541,8 @@ export interface CodexUserMessageInput {
   engineOverride?: EngineOverride;
 }
 
+export interface EngineSessionRestartResult { outcome: "closed" | "not_running" | "exit_unconfirmed" }
+
 export interface CodexAdapter {
   /** Account quota only: never starts a model turn. Private proof must not enter public replies. */
   getAccountQuota?(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult>;
@@ -650,5 +652,12 @@ export interface CodexAdapter {
     locale?: Locale;
     abortSignal?: AbortSignal;
   }): Promise<EngineSideSession>;
+  /** Request process termination and acknowledge only an observed exit.
+   * Future input lazily reopens the retained native session. */
+  restartSession?(sessionId: string): Promise<EngineSessionRestartResult>;
+  /** While an old process has an outstanding termination, input may wait on its exact exit. */
+  sessionRestartPending?(sessionId: string): Promise<void> | undefined;
+  /** Restart may also interrupt work known from lifecycle receipts outside the task panel. */
+  listRestartTasks?(sessionId: string): Promise<EngineTaskSnapshot["tasks"]>;
   destroy?(): void | Promise<void>;
 }

@@ -37,6 +37,7 @@ export const CORE_SLASH_COMMANDS: readonly CoreSlashCommandDefinition[] = [
   defineCommand("resume", "Find or bind an existing native agent session", "查找或绑定已有原生 Agent 会话", "既存のネイティブ Agent セッションを検索・紐付け"),
   defineCommand("detach", "Detach the current native agent session", "解绑当前原生 Agent 会话", "現在のネイティブ Agent セッションの紐付けを解除"),
   defineCommand("reset", "Reset the current chat session binding", "重置当前聊天的会话绑定", "現在のチャットのセッション紐付けをリセット"),
+  defineCommand("restart", "Close this chat's engine process and reopen the session on the next message", "结束当前对话的引擎进程，保留会话，下次发消息时启动", "このチャットのエンジンプロセスを終了し、セッションを保持したまま次のメッセージで起動"),
   defineCommand("stop", "Stop the current running task", "停止当前正在运行的任务", "現在実行中のタスクを停止"),
   defineCommand("q", "Force a message into the task queue", "强制把消息作为新任务排队", "メッセージを新しいタスクとして強制キューイング"),
   defineCommand("bg", "Inspect or stop engine background processes", "查看或停止引擎后台进程", "エンジンのバックグラウンドプロセスを確認または停止"),

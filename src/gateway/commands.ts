@@ -11,7 +11,7 @@ export const GATEWAY_COMMAND_POLICIES: Readonly<Record<string, "shared" | "nativ
   help: "shared", status: "shared", usage: "shared", btw: "shared", ask: "shared",
   engine: "shared", model: "shared", effort: "shared", fast: "shared", yolo: "shared",
   config: "shared", stream: "shared", timeout: "shared", steer: "native", account: "native",
-  goal: "shared", resume: "shared", detach: "shared", reset: "shared", stop: "shared",
+  goal: "shared", resume: "shared", detach: "shared", reset: "shared", restart: "shared", stop: "shared",
   q: "shared", bg: "shared", continue: "shared", context: "shared",
   compact: "shared", ultrareview: "shared", cron: "shared", board: "shared", mini: "shared",
   fan: "shared", chain: "shared", verify: "shared", group: "native", invite: "native",
@@ -20,11 +20,12 @@ export const GATEWAY_COMMAND_POLICIES: Readonly<Record<string, "shared" | "nativ
 };
 
 /** `engineCommands`: the live engine's own commands (Antigravity ACP). A Host command of the same name wins, since the Host handles it first. */
-export function gatewayCommands(engine: string, query = "", engineCommands: ReadonlyArray<{ name: string; description?: string }> = []) {
+export function gatewayCommands(engine: string, query = "", engineCommands: ReadonlyArray<{ name: string; description?: string }> = [], supportsRestart = engine === "claude" || engine === "pi") {
   const shared = CORE_SLASH_COMMANDS.filter(({ command }) =>
     (GATEWAY_COMMAND_POLICIES[command] === "shared" || command === "group")
     && (command !== "fast" || engine === "codex")
     && (command !== "ultrareview" || engine === "claude")
+    && (command !== "restart" || supportsRestart)
     && command.startsWith(query.replace(/^\//, "").toLowerCase()))
     .map((definition) => definition.command !== "group" ? definition : {
       ...definition,
@@ -150,7 +151,7 @@ export function gatewayNativeCommandHelp(command: string, locale: Locale): strin
   });
 }
 
-export function renderGatewayHelp(engine: string, locale: Locale): string {
+export function renderGatewayHelp(engine: string, locale: Locale, supportsRestart?: boolean): string {
   const normalized = normalizeLocale(locale, "en");
   const commandLine = (command: string, description: { defaultValue: string; i18n: Record<string, string> }) => {
     const desc = normalized === "ja"
@@ -176,7 +177,7 @@ export function renderGatewayHelp(engine: string, locale: Locale): string {
       zh: "消息、文件、回复和卡片操作会同步到已配对设备。图片、文件和录音都可附文字一起发送；消息菜单支持引用和转发。",
       ja: "メッセージ、ファイル、返信、カード操作はペアリング済みデバイス間で同期されます。画像・ファイル・音声録音にテキストを添えて送信でき、メッセージメニューから引用や転送も行えます。",
     }),
-    ...gatewayCommands(engine).map(({ command, description }) => commandLine(command, description)),
+    ...gatewayCommands(engine, "", [], supportsRestart).map(({ command, description }) => commandLine(command, description)),
     engine === "pi" ? pickGatewayText(locale, {
       en: "Pi model and thinking commands apply to the current conversation; Bot defaults remain separate. While Pi is replying, plain-text Send supplements that task; choose Next turn to use the Host queue. If the task can no longer receive input and delivery is definitely rejected, the unchanged message goes to the next turn; uncertain delivery is never resent automatically. Extension commands wait for their own turn; templates and skills can supplement the current task. Use Pi conversation settings to adjust the live model. Login, logout and terminal-only actions explain their native terminal route.",
       zh: "Pi 的模型和思考强度命令只调整当前对话，Bot 默认设置另行管理。回复中发送纯文字会补充当前任务；选择「下一轮」进入主机队列。任务已不能接收补充且确认未送达时，未改动的消息会转到下一轮；结果待确认时不会自动重发。扩展命令会单独排队执行；模板和技能可补充当前任务。「Pi 对话设置」可调整运行中的模型。登录、退出登录和终端专属操作会说明原生终端入口。",
