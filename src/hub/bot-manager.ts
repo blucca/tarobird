@@ -338,6 +338,11 @@ export class BotManager {
     return child;
   }
   async owns(botId: string): Promise<boolean> { return !!await this.store.db.serial(() => this.store.db.get("SELECT 1 FROM managed_bots m JOIN bots b ON b.id=m.bot_id WHERE bot_id=? AND b.deleted_at IS NULL", [botId])); }
+  childPids(): Map<string, number> {
+    const pids = new Map<string, number>();
+    for (const [botId, child] of this.children) if (child.pid) pids.set(botId, child.pid);
+    return pids;
+  }
   serviceStatus(botId: string): { text: string } {
     const child = this.children.get(botId);
     const status = child?.pid ? `PID: ${child.pid}${child.connected ? "" : "\n进程通信已断开，正在等待退出。"}` : this.timers.has(botId) ? (this.failures.get(botId)?.length ?? 0) > 3 ? "近期连续异常退出，正在慢速重试（间隔 1–5 分钟）。也可查看日志后点击空闲后重启。" : "正在等待自动重启。" : "进程尚未运行，可点击空闲后重启。";

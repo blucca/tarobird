@@ -18,6 +18,10 @@ import {
   HOST_BALANCE_RESOURCES_PATH,
   hostBalanceResourcesSchema,
 } from "../src/client-protocol/host-balance-resources.js";
+import {
+  HOST_RESOURCES_CAPABILITY,
+  HOST_RESOURCES_PATH,
+} from "../src/client-protocol/host-resources.js";
 import { SERVER_CAPABILITIES } from "../src/client-protocol/index.js";
 import { deviceProof } from "../src/hub/auth.js";
 import {
@@ -94,9 +98,13 @@ async function authenticateOwner(hub: HubServer) {
 describe("Auto-select Host load balancing (#88)", () => {
   it("advertises host.balance-resources.v1 separately from host.resources.v1", () => {
     expect(SERVER_CAPABILITIES).toContain(HOST_BALANCE_RESOURCES_CAPABILITY);
+    expect(SERVER_CAPABILITIES).toContain(HOST_RESOURCES_CAPABILITY);
     expect(HOST_BALANCE_RESOURCES_CAPABILITY).toBe("host.balance-resources.v1");
+    expect(HOST_RESOURCES_CAPABILITY).toBe("host.resources.v1");
+    expect(HOST_BALANCE_RESOURCES_CAPABILITY).not.toBe(HOST_RESOURCES_CAPABILITY);
     expect(HOST_BALANCE_RESOURCES_PATH).toBe("/api/host-balance-resources");
-    expect(SERVER_CAPABILITIES).not.toContain("host.resources.v1");
+    expect(HOST_RESOURCES_PATH).toBe("/api/host-resources");
+    expect(HOST_BALANCE_RESOURCES_PATH).not.toBe(HOST_RESOURCES_PATH);
   });
 
   it("excludes offline, manual-only, engine-unavailable, login-required, quota-exhausted, missing-resources, and overloaded hosts", () => {

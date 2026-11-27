@@ -1105,3 +1105,36 @@ Host HTTP endpoints with closed engine enums in v1.6.0 clients (`/api/bots/catal
 caller opts in with `includeOmp=1`. Destroying the `omp` adapter aborts and awaits
 in-flight worker startups, and startup failures always close the child process and
 dispose the bridge socket so no orphan process or socket leaks.
+
+## Host resources boundary
+
+`GET /api/host-resources` and `POST /api/host-resources/stop` (`host.resources.v1`,
+advertised in `SERVER_CAPABILITIES` only so 1.6.0 clients ignore it and new clients
+hide the entry against 1.6.0 Hosts) require a currently authenticated device.
+Reads return only the Hub, local desktop App processes, and the Bots and
+conversations the requesting user is authorized to see. All managed Bot gateway
+process trees are tracked regardless of the requesting user so ungranted Bots
+never leak into `unattributed` or desktop App rows; Hub-level `unattributed`
+descendants and per-user sparkline history remain isolated per user, with
+unattributed Hub children exposed to owners only.
+
+OS process sampling uses a short-TTL Host-side cache with single-flight in-flight
+coalescing across readers so concurrent or repeated reads do not spawn `ps` or
+PowerShell CIM queries per request. Only authenticated owners may bypass the
+sample cache with `?force=1`; per-user Bot, conversation, and active-turn
+authorization still runs on every snapshot. Active-turn lookup uses the additive
+partial index `messages_active_bot_turns` without scanning historical message
+bodies or changing `schema_version`. When multiple active turns run concurrently
+on one Bot without exact PID-to-conversation linkage, the Hub does not guess by
+positional PID order: each visible active conversation stays individually
+stoppable while unlinked engine processes remain grouped at the Bot level (and
+are omitted for non-owners whenever hidden turns are present on that Bot).
+
+Stopping requires an authenticated owner (`requireOwner` rechecked after body
+receipt and before execution). Conversation stops route exclusively through
+graceful `stopBotTurn` and never fall through to `killProcessTree`. Explicit PID
+stops invalidate the sample cache, re-sample live OS processes, verify that the
+target PID is a strict descendant of the requested Bot's gateway (never the Hub,
+the gateway itself, another Bot, or an unrelated process), and audit the action.
+The phone UI presents a read-only view; server-side owner authorization remains
+the enforced boundary.
