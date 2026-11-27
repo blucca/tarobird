@@ -75,6 +75,8 @@ function envAllowedOrigins(): string[] {
 export interface HubCloudflareOptions {
   store: HubStore;
   loopbackTarget: () => string;
+  /** Reason the dedicated edge-proxy listener is unavailable for this run, if any. */
+  listenerUnavailable?: () => string | undefined;
   detect?: () => Promise<CloudflaredBinary>;
   spawnProcess?: typeof spawn;
   startTimeoutMs?: number;
@@ -199,13 +201,15 @@ export class HubCloudflareTunnel {
   async view(): Promise<CloudflareView> {
     const [config, bin] = await Promise.all([this.load(), this.binary()]);
     const loopbackTarget = this.options.loopbackTarget();
+    // Reported through the existing `lastError` field; no protocol change.
+    const lastError = this.options.listenerUnavailable?.() ?? this.lastError;
     return cloudflareViewSchema.parse({
       v: 1,
       installed: bin.installed,
       ...(bin.version ? { version: bin.version } : {}),
       running: this.childAlive(this.child) && !this.child.killed,
       ...(this.activeUrl ? { activeUrl: this.activeUrl } : {}),
-      ...(this.lastError ? { lastError: this.lastError } : {}),
+      ...(lastError ? { lastError: lastError.slice(0, 240) } : {}),
       mode: config.mode,
       protocol: config.protocol,
       origins: config.origins,
@@ -241,6 +245,7 @@ export class HubCloudflareTunnel {
     return this.serialize(async () => {
       if (this.closed) throw new HubError("hub_stopping", 503);
       await validate?.();
+      if (this.options.listenerUnavailable?.()) throw new HubError("edge_listener_unavailable", 503);
       const config = await this.load();
       const chosen = protocol ?? config.protocol;
       if (chosen !== config.protocol || config.mode !== "quick") {

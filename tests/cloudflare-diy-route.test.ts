@@ -3,6 +3,7 @@ import { execFileSync, type ChildProcess, type spawn } from "node:child_process"
 import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -12,6 +13,7 @@ import WebSocket from "ws";
 import { HubServer } from "../src/hub/server.js";
 import { deviceProof, hashSecret, parsePublicKey } from "../src/hub/auth.js";
 import { HubCloudflareTunnel } from "../src/hub/cloudflare-tunnel.js";
+import { resolveEdgePort } from "../src/hub/cli.js";
 import { startHubControl } from "../src/hub/service.js";
 import { runHostCli } from "../src/host-cli/cli.js";
 import { signedDeviceAction } from "./helpers/device-actions.js";
@@ -272,6 +274,45 @@ describe("Edge-terminated Hub Ed25519 identity proof, dedicated edge-proxy liste
     expect(() => verifyEdgeIdentity(proof, { publicKey: hub.auth.publicKey, nonce, origin: "https://evil-proxy.example.com" }, verifySignature)).toThrow("tls_identity_mismatch");
     expect(() => verifyEdgeIdentity(proof, { publicKey: hub.auth.publicKey, nonce: randomBytes(32).toString("base64url"), origin: targetOrigin }, verifySignature)).toThrow("tls_identity_mismatch");
     expect(() => verifyEdgeIdentity({ ...proof, signature: "A".repeat(86) + "==" }, { publicKey: hub.auth.publicKey, nonce, origin: targetOrigin }, verifySignature)).toThrow("tls_identity_mismatch");
+  });
+
+  it("starts the Host without the edge-proxy listener when its port is busy, and reports the tunnel route unavailable", async () => {
+    const blocker = net.createServer();
+    await new Promise<void>(resolve => blocker.listen(0, "127.0.0.1", () => resolve()));
+    try {
+      const busyPort = (blocker.address() as net.AddressInfo).port;
+      const dir = await mkdtemp(path.join(os.tmpdir(), "tarobird-cf-busy-"));
+      dirs.push(dir);
+      const warnings: string[] = [];
+      const hub = await HubServer.start({ stateDir: dir, edgePort: busyPort, onWarning: code => warnings.push(code) });
+      hubs.push(hub);
+      // The Host serves normally; only the edge listener is missing.
+      expect(hub.http.listening).toBe(true);
+      expect(hub.edgeHttp.listening).toBe(false);
+      expect(hub.edgeListenerError).toContain(`127.0.0.1:${busyPort}`);
+      expect(warnings.some(code => code.startsWith("edge_listener_unavailable"))).toBe(true);
+      const view = await hub.cloudflare.view();
+      expect(view.lastError).toContain("edge_listener_unavailable");
+      expect(view.loopbackTarget).toBe(`http://127.0.0.1:${busyPort}`);
+      await expect(hub.cloudflare.startQuickTunnel("http2")).rejects.toThrow("edge_listener_unavailable");
+    } finally {
+      await new Promise<void>(resolve => blocker.close(() => resolve()));
+    }
+  });
+
+  it("keeps a busy saved edge-proxy port instead of silently picking another", async () => {
+    const blocker = net.createServer();
+    await new Promise<void>(resolve => blocker.listen(0, "127.0.0.1", () => resolve()));
+    try {
+      const busyPort = (blocker.address() as net.AddressInfo).port;
+      const dir = await mkdtemp(path.join(os.tmpdir(), "tarobird-cf-saved-"));
+      dirs.push(dir);
+      await writeFile(path.join(dir, "edge-proxy-port.json"), JSON.stringify(busyPort));
+      expect(await resolveEdgePort(dir, { instancePort: 1, tlsListeners: [] }, 2)).toBe(busyPort);
+      expect(JSON.parse(await readFile(path.join(dir, "edge-proxy-port.json"), "utf8"))).toBe(busyPort);
+    } finally {
+      await new Promise<void>(resolve => blocker.close(() => resolve()));
+    }
   });
 
   it("serves new edge-identity callers untracked when the edge table is full, but the anonymous table still rejects", async () => {

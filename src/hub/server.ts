@@ -431,7 +431,12 @@ export class HubServer {
       sampleCacheTtlMs: options.hostResourcesSampleCacheTtlMs,
       now: options.hostResourcesNow,
     });
-    this.cloudflare = new HubCloudflareTunnel({ store, loopbackTarget: () => this.edgeUrl });
+    this.cloudflare = new HubCloudflareTunnel({
+      store,
+      // When the edge listener could not bind, status still names the configured port.
+      loopbackTarget: () => this.edgeHttp.listening ? this.edgeUrl : `http://127.0.0.1:${options.edgePort ?? 0}`,
+      listenerUnavailable: () => this.edgeListenerError,
+    });
     const conversationsCreated = (userId: string, conversations: Conversation[]) => {
       for (const conversation of conversations) {
         this.trackTask(this.broadcastConversation(
@@ -625,6 +630,14 @@ export class HubServer {
       if (server !== this.http && !listener.instance && !listener.edgeProxy && ["EADDRNOTAVAIL", "EADDRINUSE", "ENODEV", "ENETUNREACH", "EAFNOSUPPORT"].includes((error as NodeJS.ErrnoException).code ?? "")) {
         this.options.onWarning?.("optional_listener_unavailable"); return;
       }
+      // The Cloudflare edge-proxy listener is optional: the Host starts without it
+      // and the tunnel route stays unavailable for this run (no retry, no other
+      // port: a named tunnel's ingress points at this exact port).
+      if (listener.edgeProxy) {
+        listener.retired = true;
+        this.edgeListenerError = `edge_listener_unavailable: 127.0.0.1:${port} ${(error as NodeJS.ErrnoException).code ?? "bind_failed"}`;
+        this.options.onWarning?.(this.edgeListenerError); return;
+      }
       throw error;
     });
     this.listenerStarts.set(server, work);
@@ -719,6 +732,8 @@ export class HubServer {
   get urls(): string[] { return this.listeners.filter(({ server, edgeProxy }) => server.listening && !edgeProxy).map(({ server, tls }) => this.listenerUrl(server, tls)); }
   get instanceUrl(): string { const listener = this.listeners.find((l) => l.instance)!; return this.listenerUrl(listener.server, false); }
   get edgeUrl(): string { return this.listenerUrl(this.edgeHttp, false); }
+  /** Set when the Cloudflare edge-proxy listener failed to bind at start. */
+  edgeListenerError?: string;
   /** Terminal intent is synchronous, before any maintenance or route I/O.
    * Once accepted, an expired/cancelled CLI drain must never resume work. */
   beginShutdown(): void {

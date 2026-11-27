@@ -60,13 +60,15 @@ async function allocateLoopbackPort(reserved: ReadonlySet<number>): Promise<numb
 
 /** Pick a stable dedicated loopback port for edge-terminated tunnels (never the
  * privileged main/instance port). Explicit config.edgePort wins; otherwise reuse
- * edge-proxy-port.json when bindable so Named Tunnel configs remain stable. */
-async function resolveEdgePort(directory: string, config: Awaited<ReturnType<typeof readHubConfig>>, mainPort: number): Promise<number> {
+ * edge-proxy-port.json so Named Tunnel configs remain stable. A saved port that
+ * is busy is still returned, never replaced: the Hub then starts without the
+ * edge listener and reports it, because a named tunnel points at that port. */
+export async function resolveEdgePort(directory: string, config: Pick<Awaited<ReturnType<typeof readHubConfig>>, "edgePort" | "instancePort" | "tlsListeners">, mainPort: number): Promise<number> {
   if (config.edgePort !== undefined) return config.edgePort;
   const reserved = new Set<number>([mainPort, config.instancePort, ...config.tlsListeners.map(listener => listener.port)]);
   const file = path.join(directory, "edge-proxy-port.json");
   const saved: unknown = await readFile(file, "utf8").then((text) => JSON.parse(text), () => undefined);
-  if (typeof saved === "number" && Number.isInteger(saved) && saved >= 1 && saved <= 65535 && !reserved.has(saved) && await canBindLoopbackPort(saved)) {
+  if (typeof saved === "number" && Number.isInteger(saved) && saved >= 1 && saved <= 65535 && !reserved.has(saved)) {
     return saved;
   }
   const preferred = mainPort === 8788 && config.instancePort === 8789 && !reserved.has(8790) && await canBindLoopbackPort(8790)
@@ -153,7 +155,7 @@ export async function runHubCli(argv: string[]): Promise<void> {
     relay?.start();
     const routeMonitor = config.routeMonitor ? new RouteMonitor(hub.store, config.routeMonitor, hub.auth.publicKey, (botId, alert) => hub.notifyRouteAlert(botId, alert), undefined, undefined, (code) => console.error(`[${new Date().toISOString()}] Hub: ${code}`)) : undefined;
     routeMonitor?.start();
-    console.log(`[${new Date().toISOString()}] TaroBird Hub listening at ${hub.urls.join(", ")}; instances: ${hub.instanceUrl}; edge-proxy: ${hub.edgeUrl}`);
+    console.log(`[${new Date().toISOString()}] TaroBird Hub listening at ${hub.urls.join(", ")}; instances: ${hub.instanceUrl}; edge-proxy: ${hub.edgeListenerError ? "unavailable" : hub.edgeUrl}`);
     const maintenance = new HubMaintenance(hub.store, directory, config.eventHistory), maintenanceSchedule: HubMaintenanceSchedule = {}; let maintenanceTask: Promise<void> | undefined;
     const tick = setInterval(() => {
       const now = Date.now();
