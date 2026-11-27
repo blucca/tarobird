@@ -25,17 +25,24 @@ async function fixture() {
 const cacheEntries = async (state: string) => (await readdir(state)).filter(name => name.startsWith("engine-discovery-cache"));
 const until = async (check: () => boolean) => { while (!check()) await new Promise(resolve => setImmediate(resolve)); };
 
-it.runIf(process.platform !== "win32")("writes no discovery cache or lock after close() when a probe finishes later", async () => {
+it.runIf(process.platform !== "win32")("close() stops a running probe, waits for it, and writes no discovery cache or lock", async () => {
   const { state, env } = await fixture();
-  let finishProbe!: () => void;
-  const probeGate = new Promise<void>(resolve => { finishProbe = resolve; });
-  const runner: CommandRunner = async () => { await probeGate; return { stdout: "", stderr: "" }; };
+  const started: string[] = [];
+  let running = 0;
+  // Stands in for a spawned child: it only "exits" when the owner's close aborts it.
+  const runner: CommandRunner = (file, _args, options) => new Promise((_resolve, reject) => {
+    started.push(file); running++;
+    options.signal?.addEventListener("abort", () => setImmediate(() => { running--; reject(new Error("killed")); }), { once: true });
+  });
   const settings = new HubEngineSettings(state, () => env);
   const warm = settings.warmDiscovery({ runner });
+  await until(() => started.length > 0);
   await settings.close();
-  finishProbe();
-  await warm;
-  expect(settings.hasDiscoverySnapshot).toBe(true);
+  expect(running).toBe(0);
+  await expect(warm).rejects.toThrow("engine_discovery_aborted");
+  // No discovery step starts once closing began.
+  expect(await settings.warmDiscovery({ runner })).toEqual({});
+  expect(started).toHaveLength(1);
   expect(await cacheEntries(state)).toEqual([]);
 });
 

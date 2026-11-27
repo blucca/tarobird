@@ -31,6 +31,7 @@ import {
 } from "../client-protocol/engine-settings.js";
 import {
   cachedExecutableVersion,
+  DiscoveryAbortedError,
   diagnoseExecutableCandidates,
   lookupEnvCaseInsensitive,
   mergeTaggedDirectories,
@@ -60,7 +61,15 @@ export class HubEngineSettings {
   private publishedDiscoverySequence = 0;
   private closing = false;
   private readonly cacheWrites = new Set<Promise<void>>();
+  /** Aborted by close(): kills running discovery children (login shell, package managers, `--version`). */
+  private readonly stopDiscovery = new AbortController();
+  private readonly discoveryTasks = new Set<Promise<unknown>>();
   get hasDiscoverySnapshot(): boolean { return this.liveDiscovery !== undefined; }
+  private track<T>(task: Promise<T>): Promise<T> {
+    this.discoveryTasks.add(task);
+    void task.finally(() => this.discoveryTasks.delete(task)).catch(() => undefined);
+    return task;
+  }
   constructor(readonly directory: string, readonly base: () => NodeJS.ProcessEnv) {}
   private read(): StoredEngineSettings {
     try { return readHostEngineSettings(this.directory); }
@@ -106,11 +115,13 @@ export class HubEngineSettings {
     try { await write; } finally { this.cacheWrites.delete(write); }
   }
 
-  /** Stop writing the discovery cache and wait for a write already in progress,
-   * so neither the cache file nor its lock appears after the owner has closed.
-   * A probe still running finishes in memory only. */
+  /** Stop discovery for good: no new step starts, running discovery children are
+   * killed and their exit awaited, and a cache write already in progress finishes,
+   * so nothing writes into HOME or the state folder after the owner has closed. */
   async close(): Promise<void> {
     this.closing = true;
+    this.stopDiscovery.abort();
+    await Promise.allSettled([...this.discoveryTasks]);
     await Promise.allSettled([...this.cacheWrites]);
   }
 
@@ -118,11 +129,12 @@ export class HubEngineSettings {
    * registry PATH) without executing engine `--version` commands, hydrating the
    * shared live discovery snapshot and opportunistic discovery cache. */
   async warmDiscovery(options: Pick<EngineDiscoveryOptions, "forceRefresh" | "registryRefreshed" | "probeShell" | "runner" | "timeoutMs"> = {}): Promise<LiveEngineDiscovery> {
+    if (this.closing) return this.liveDiscovery ?? {};
     if (!options.forceRefresh && !options.runner && this.warmInFlight) {
       return this.warmInFlight;
     }
     const sequence = ++this.discoverySequence;
-    const work = (async (): Promise<LiveEngineDiscovery> => {
+    const work = this.track((async (): Promise<LiveEngineDiscovery> => {
       const base = this.base();
       const platform = process.platform, windows = platform === "win32";
       const home = windows
@@ -139,6 +151,7 @@ export class HubEngineSettings {
           registryRefreshed: options.registryRefreshed,
           timeoutMs: options.timeoutMs,
           runner: options.runner,
+          signal: this.stopDiscovery.signal,
         })
         : { at: Date.now(), shell: { ok: false, status: "skipped" as const, pathDirs: [], resolvedCommands: {} }, packageManagerDirs: [], windowsRegistryDirs: [] };
       let settings: StoredEngineSettings;
@@ -159,7 +172,7 @@ export class HubEngineSettings {
       };
       await this.publishDiscovery(snapshot, sequence, platform);
       return snapshot;
-    })();
+    })());
 
     if (!options.forceRefresh && !options.runner) {
       this.warmInFlight = work;
@@ -243,6 +256,13 @@ export class HubEngineSettings {
   }
 
   async statusAsync(requestId?: string, options: EngineDiscoveryOptions = {}): Promise<EngineSettingsState> {
+    // After close() began, answer from what is known without starting any discovery child.
+    if (this.closing) return this.statusWithDiscovery(requestId, { ...options, probeShell: false, probeVersions: false, forceRefresh: false });
+    try { return await this.track(this.statusWithDiscovery(requestId, options)); }
+    catch (error) { if (error instanceof DiscoveryAbortedError) throw new HubError("hub_draining", 503); throw error; }
+  }
+
+  private async statusWithDiscovery(requestId: string | undefined, options: EngineDiscoveryOptions): Promise<EngineSettingsState> {
     this.read();
     const base = this.base(), sequence = ++this.discoverySequence;
     const platform = process.platform, windows = platform === "win32";
@@ -261,6 +281,7 @@ export class HubEngineSettings {
         registryRefreshed: options.registryRefreshed,
         timeoutMs: options.timeoutMs,
         runner: options.runner,
+        signal: this.stopDiscovery.signal,
       })
       : { at: Date.now(), shell: { ok: false, status: "skipped" as const, pathDirs: [], resolvedCommands: {} }, packageManagerDirs: [], windowsRegistryDirs: [] };
 
@@ -282,7 +303,7 @@ export class HubEngineSettings {
       let version: string | null = null;
       if (row.executable && options.probeVersions !== false) {
         version = options.probeVersions || options.forceRefresh
-          ? await probeExecutableVersion(row.executable, resolved.enhancedEnv, options.runner, { forceRefresh: options.forceRefresh })
+          ? await probeExecutableVersion(row.executable, resolved.enhancedEnv, options.runner, { forceRefresh: options.forceRefresh, signal: this.stopDiscovery.signal })
           : cachedExecutableVersion(row.executable);
       }
 

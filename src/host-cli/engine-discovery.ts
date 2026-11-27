@@ -35,8 +35,14 @@ export type ShellProbeResult = {
 export type CommandRunner = (
   file: string,
   args: string[],
-  options: { timeout: number; env?: NodeJS.ProcessEnv; windowsHide?: boolean },
+  options: { timeout: number; env?: NodeJS.ProcessEnv; windowsHide?: boolean; signal?: AbortSignal },
 ) => Promise<{ stdout: string; stderr: string }>;
+
+/** Thrown when an owner's close aborts discovery: the result must not be cached or used. */
+export class DiscoveryAbortedError extends Error {
+  constructor() { super("engine_discovery_aborted"); this.name = "DiscoveryAbortedError"; }
+}
+const throwIfAborted = (signal: AbortSignal | undefined) => { if (signal?.aborted) throw new DiscoveryAbortedError(); };
 
 export const SHELL_ENV_PROBE_FLAG = "TAROBIRD_SHELL_ENV_PROBE";
 
@@ -57,6 +63,7 @@ export const defaultCommandRunner: CommandRunner = (file, args, options) =>
     let stderr = "";
     let totalBytes = 0;
     let child: ReturnType<typeof spawnEngine>;
+    if (options.signal?.aborted) { reject(new DiscoveryAbortedError()); return; }
     try {
       child = spawnEngine(file, args, {
         env: options.env,
@@ -69,9 +76,12 @@ export const defaultCommandRunner: CommandRunner = (file, args, options) =>
     }
 
     let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
+    let aborted = false;
     const cleanup = () => {
+      // hardKillTimer is left running: a timed-out interactive shell ignores SIGTERM
+      // and must still get its SIGKILL after the promise has settled.
       if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (hardKillTimer) clearTimeout(hardKillTimer);
+      options.signal?.removeEventListener("abort", onAbort);
     };
     const finish = (err?: Error) => {
       if (settled) return;
@@ -95,6 +105,15 @@ export const defaultCommandRunner: CommandRunner = (file, args, options) =>
         }
       } catch { /* ignore */ }
     };
+    // The owner is closing: terminate the child and settle only once it has exited,
+    // so nothing it spawned keeps writing into HOME or the state folder.
+    function onAbort() {
+      aborted = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (child.exitCode !== null || child.signalCode !== null) { finish(new DiscoveryAbortedError()); return; }
+      killChild();
+    }
+    options.signal?.addEventListener("abort", onAbort, { once: true });
 
     const timeoutTimer = options.timeout > 0
       ? setTimeout(() => {
@@ -122,9 +141,11 @@ export const defaultCommandRunner: CommandRunner = (file, args, options) =>
 
     child.stdout?.on("data", (chunk: Buffer) => onData("stdout", chunk));
     child.stderr?.on("data", (chunk: Buffer) => onData("stderr", chunk));
-    child.once("error", error => finish(error));
+    child.once("error", error => finish(aborted ? new DiscoveryAbortedError() : error));
     child.once("close", (code, signal) => {
-      if (code === 0 && !signal) {
+      if (aborted) {
+        finish(new DiscoveryAbortedError());
+      } else if (code === 0 && !signal) {
         finish();
       } else {
         finish(Object.assign(new Error(`Command failed (${signal ?? code ?? "unknown"})`), {
@@ -362,7 +383,10 @@ export async function probeLoginShellEnvironment(options: {
   timeoutMs?: number;
   shell?: string;
   runner?: CommandRunner;
+  /** Aborted when the owner closes: the shell is killed and DiscoveryAbortedError thrown. */
+  signal?: AbortSignal;
 } = {}): Promise<ShellProbeResult> {
+  throwIfAborted(options.signal);
   const platform = options.platform ?? process.platform;
   if (platform === "win32") return { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
 
@@ -392,7 +416,7 @@ export async function probeLoginShellEnvironment(options: {
   };
 
   try {
-    const { stdout } = await runner(shell, args, { timeout, env: probeEnv });
+    const { stdout } = await runner(shell, args, { timeout, env: probeEnv, signal: options.signal });
     const startIdx = stdout.indexOf(SHELL_PATH_BEGIN);
     const endIdx = stdout.indexOf(SHELL_PATH_END, startIdx >= 0 ? startIdx + SHELL_PATH_BEGIN.length : 0);
     if (startIdx < 0 || endIdx < 0) {
@@ -419,6 +443,7 @@ export async function probeLoginShellEnvironment(options: {
     }
     return { ok: true, status: "ok", pathDirs, resolvedCommands };
   } catch (error) {
+    if (error instanceof DiscoveryAbortedError || options.signal?.aborted) throw new DiscoveryAbortedError();
     const timedOut = isTimeoutError(error);
     return { ok: false, timedOut, status: timedOut ? "timeout" : "failed", pathDirs: [], resolvedCommands: {} };
   }
@@ -450,7 +475,10 @@ export async function probePackageManagerBinDirectories(options: {
   runner?: CommandRunner;
   existsCheck?: (dir: string) => boolean;
   findTool?: (name: string) => string | undefined;
+  /** Aborted when the owner closes: running package managers are killed and awaited. */
+  signal?: AbortSignal;
 } ): Promise<string[]> {
+  throwIfAborted(options.signal);
   const platform = options.platform ?? process.platform;
   const windows = platform === "win32";
   const p = windows ? path.win32 : path.posix;
@@ -500,12 +528,14 @@ export async function probePackageManagerBinDirectories(options: {
     const exe = findTool(q.tool);
     if (!exe) return undefined;
     try {
-      const { stdout } = await runner(exe, q.args, { timeout, env, windowsHide: true });
+      const { stdout } = await runner(exe, q.args, { timeout, env, windowsHide: true, signal: options.signal });
       const dir = q.transform(stdout);
       if (dir && !/[\x00-\x1f\x7f]/.test(dir) && existsCheck(dir)) return dir;
     } catch { /* ignore unavailable/timed-out package manager */ }
     return undefined;
   }));
+  // Every query above has settled (aborted children have exited); report the abort.
+  throwIfAborted(options.signal);
 
   const seen = new Set<string>();
   const out: string[] = [];
@@ -627,7 +657,7 @@ type CachedProbeEntry = {
 const PROBE_CACHE_TTL_MS = 60_000;
 let probeCache: CachedProbeEntry | undefined;
 let probeGeneration = 0;
-let inFlightProbe: { key: string; runner?: CommandRunner; promise: Promise<EnvironmentDiscoveryResult> } | undefined;
+let inFlightProbe: { key: string; runner?: CommandRunner; signal?: AbortSignal; promise: Promise<EnvironmentDiscoveryResult> } | undefined;
 const versionCache = new Map<string, { mtimeMs: number; version: string | null }>();
 
 export function clearDiscoveryCaches(): void {
@@ -647,7 +677,11 @@ export async function runEnvironmentDiscovery(options: {
   registryRefreshed?: boolean;
   timeoutMs?: number;
   runner?: CommandRunner;
+  /** The owner's close signal: no step starts after it fires, running children are
+   * killed and awaited, and the call rejects with DiscoveryAbortedError (nothing cached). */
+  signal?: AbortSignal;
 }): Promise<EnvironmentDiscoveryResult> {
+  throwIfAborted(options.signal);
   const platform = options.platform ?? process.platform;
   const home = options.home ?? os.homedir();
   const basePath = lookupEnvCaseInsensitive(options.baseEnv, "PATH", platform) ?? "";
@@ -681,6 +715,7 @@ export async function runEnvironmentDiscovery(options: {
       env: { ...options.baseEnv, PATH: combinedForPm.join(";") },
       platform,
       runner: options.runner,
+      signal: options.signal,
     });
     const shell: ShellProbeResult = { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
     const at = Date.now();
@@ -703,7 +738,7 @@ export async function runEnvironmentDiscovery(options: {
     };
   }
 
-  if (!options.forceRefresh && inFlightProbe && inFlightProbe.key === cacheKey && inFlightProbe.runner === options.runner) {
+  if (!options.forceRefresh && inFlightProbe && inFlightProbe.key === cacheKey && inFlightProbe.runner === options.runner && inFlightProbe.signal === options.signal) {
     return inFlightProbe.promise;
   }
 
@@ -715,6 +750,7 @@ export async function runEnvironmentDiscovery(options: {
       platform,
       timeoutMs: options.timeoutMs ?? 6_000,
       runner: options.runner,
+      signal: options.signal,
     });
 
     const baseDirs = basePath.split(":").filter(Boolean);
@@ -725,6 +761,7 @@ export async function runEnvironmentDiscovery(options: {
       env: { ...options.baseEnv, PATH: combinedForPm.join(":") },
       platform,
       runner: options.runner,
+      signal: options.signal,
     });
 
     const at = Date.now();
@@ -733,7 +770,7 @@ export async function runEnvironmentDiscovery(options: {
   })();
 
   if (!options.forceRefresh) {
-    const entry = { key: cacheKey, runner: options.runner, promise: work };
+    const entry = { key: cacheKey, runner: options.runner, signal: options.signal, promise: work };
     inFlightProbe = entry;
     void work.finally(() => {
       if (inFlightProbe === entry) inFlightProbe = undefined;
@@ -782,8 +819,9 @@ export async function probeExecutableVersion(
   executable: string,
   env: NodeJS.ProcessEnv = process.env,
   runner: CommandRunner = defaultRunner,
-  options: { forceRefresh?: boolean; timeoutMs?: number } = {},
+  options: { forceRefresh?: boolean; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<string | null> {
+  if (options.signal?.aborted) return null;
   let mtimeMs = 0;
   try { mtimeMs = statSync(executable).mtimeMs; } catch { return null; }
 
@@ -800,7 +838,7 @@ export async function probeExecutableVersion(
   }
 
   try {
-    const { stdout, stderr } = await runner(executable, ["--version"], { timeout: options.timeoutMs ?? 4500, env, windowsHide: true });
+    const { stdout, stderr } = await runner(executable, ["--version"], { timeout: options.timeoutMs ?? 4500, env, windowsHide: true, signal: options.signal });
     const raw = (stdout || stderr).split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? "";
     const version = raw ? raw.slice(0, 80) : null;
     if (version !== null) versionCache.set(executable, { mtimeMs, version });
