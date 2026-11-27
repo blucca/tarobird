@@ -4,23 +4,41 @@ import type { HubConnection } from "./connection.js";
 import { markSendTimingHistoryRead } from "./send-timing.js";
 
 const emptyMessages: Message[] = [];
-type View = { connection: HubConnection; conversationId: string; messages: Message[]; failed: boolean; readRevision: number };
+const emptyDeletedClientMsgIds: ReadonlySet<string> = new Set();
+type FilteredHistory = { visible: Message[]; deletedClientMsgIds: ReadonlySet<string> };
+type View = { connection: HubConnection; conversationId: string; messages: Message[]; deletedClientMsgIds: ReadonlySet<string>; failed: boolean; readRevision: number };
 // Leave decoding room between reads, but a stalled read must not impose an
 // equally long second wait after storage has recovered.
 export const MIN_HISTORY_READ_GAP_MS = 80;
 export const MAX_HISTORY_READ_GAP_MS = 1000;
 
-const filteredMessagesCache = new WeakMap<readonly Message[], Message[]>();
+const filteredHistoryCache = new WeakMap<readonly Message[], FilteredHistory>();
 const lastReadRevisions = new WeakMap<HubConnection, Map<string, number>>();
 const MAX_REVISION_TRACKED = 32;
 
-function visibleFromRaw(raw: readonly Message[]): Message[] {
-  let visible = filteredMessagesCache.get(raw);
-  if (!visible) {
-    visible = raw.filter(message => message.status !== "deleted");
-    filteredMessagesCache.set(raw, visible);
+function filterRawHistory(raw: readonly Message[]): FilteredHistory {
+  let filtered = filteredHistoryCache.get(raw);
+  if (!filtered) {
+    const visible: Message[] = [];
+    let deletedClientMsgIds: Set<string> | undefined;
+    for (const message of raw) {
+      if (message.status === "deleted") {
+        if (message.clientMsgId) (deletedClientMsgIds ??= new Set()).add(message.clientMsgId);
+      } else {
+        visible.push(message);
+      }
+    }
+    filtered = { visible, deletedClientMsgIds: deletedClientMsgIds ?? emptyDeletedClientMsgIds };
+    filteredHistoryCache.set(raw, filtered);
   }
-  return visible;
+  return filtered;
+}
+
+function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a === b) return true;
+  if (a.size !== b.size) return false;
+  for (const value of a) if (!b.has(value)) return false;
+  return true;
 }
 
 function rememberReadRevision(connection: HubConnection, conversationId: string, revision: number): void {
@@ -109,22 +127,25 @@ export function useConversationMessages(connection: HubConnection, conversationI
             rememberReadRevision(connection, conversationId, readRevision);
             // Publish each completed read so a continuous stream cannot starve
             // rendering. A revision received during it requests one fresh read.
-            const visibleMessages = visibleFromRaw(messages);
+            const { visible: visibleMessages, deletedClientMsgIds } = filterRawHistory(messages);
             if (!disposed) {
               const readEndAt = performance.now();
               markSendTimingHistoryRead(conversationId, visibleMessages, readEndAt, wait > 0 ? wait : 0, readEndAt - started);
               setView(previous => {
                 const sameScope = previous?.connection === connection && previous.conversationId === conversationId;
                 const shared = sameScope ? shareMessages(previous.messages, visibleMessages) : visibleMessages;
-                if (sameScope && !previous.failed && previous.readRevision === readRevision && shared === previous.messages) {
+                const sameDeleted = sameScope && sameSet(previous.deletedClientMsgIds, deletedClientMsgIds);
+                const sharedDeleted = sameDeleted ? previous.deletedClientMsgIds : deletedClientMsgIds;
+                if (sameScope && !previous.failed && previous.readRevision === readRevision && shared === previous.messages && sameDeleted) {
                   return previous;
                 }
-                return { connection, conversationId, failed: false, readRevision, messages: shared };
+                return { connection, conversationId, failed: false, readRevision, messages: shared, deletedClientMsgIds: sharedDeleted };
               });
             }
           } catch {
             if (!disposed) setView(previous => ({ connection, conversationId,
               messages: previous?.connection === connection && previous.conversationId === conversationId ? previous.messages : emptyMessages,
+              deletedClientMsgIds: previous?.connection === connection && previous.conversationId === conversationId ? previous.deletedClientMsgIds : emptyDeletedClientMsgIds,
               readRevision: previous?.connection === connection && previous.conversationId === conversationId ? previous.readRevision : -1,
               failed: true,
             }));
@@ -153,8 +174,9 @@ export function useConversationMessages(connection: HubConnection, conversationI
     const peeked = (connection.cache as { peekMessages?: (id: string) => readonly Message[] | undefined }).peekMessages?.(conversationId);
     if (peeked) {
       const readRevision = lastReadRevisions.get(connection)?.get(conversationId) ?? connection.state.cacheRevision;
-      current = { connection, conversationId, messages: visibleFromRaw(peeked), failed: false, readRevision };
+      const { visible: visibleMessages, deletedClientMsgIds } = filterRawHistory(peeked);
+      current = { connection, conversationId, messages: visibleMessages, deletedClientMsgIds, failed: false, readRevision };
     }
   }
-  return { readRevision: current?.readRevision ?? -1, messages: current?.messages ?? emptyMessages, failed: current?.failed ?? false, ready: !!current && !current.failed, retry };
+  return { readRevision: current?.readRevision ?? -1, messages: current?.messages ?? emptyMessages, deletedClientMsgIds: current?.deletedClientMsgIds ?? emptyDeletedClientMsgIds, failed: current?.failed ?? false, ready: !!current && !current.failed, retry };
 }

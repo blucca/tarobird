@@ -313,7 +313,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const closeMenu = () => setMenu(undefined), toggleMenu = (kind: NonNullable<typeof menu>) => setMenu((open) => open === kind ? undefined : kind);
   const menuId = useId(), createTrigger = useRef<HTMLButtonElement>(null), workspaceTrigger = useRef<HTMLButtonElement>(null), recipientTrigger = useRef<HTMLButtonElement>(null);
   const chatVisible = visible && (!phone || !sidebar); const [scheduledTasks, setScheduledTasks] = useState<"create" | "list">(); const [newBot, setNewBot] = useState(false); const [newChat, setNewChat] = useState<ConversationCreation>();
-  const { messages, readRevision: historyRevision, ready: messagesReady, failed: messageReadFailed, retry: retryMessageRead } = useConversationMessages(connection, selected, chatVisible, true);
+  const { messages, deletedClientMsgIds, readRevision: historyRevision, ready: messagesReady, failed: messageReadFailed, retry: retryMessageRead } = useConversationMessages(connection, selected, chatVisible, true);
   const [individualBackgroundRecords, setIndividualBackgroundRecords] = useState(false);
   const backgroundGroups = useMemo(() => groupBackgroundTasks(messages, state.runGroupsAvailable !== false && !individualBackgroundRecords), [messages, state.runGroupsAvailable, individualBackgroundRecords]);
   const displayedMessages = backgroundGroups.messages;
@@ -356,7 +356,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   // Sending follows the device setting; legacy per-draft style is retained only for compatibility.
   const previewStyle = preferences.linkPreviewStyle;
   const [preferencesReady, setPreferencesReady] = useState(false);
-  const queued = useConversationOutbox(connection, selected, chatVisible, historyRevision, messages, true);
+  const queued = useConversationOutbox(connection, selected, chatVisible, historyRevision, messages, true, deletedClientMsgIds);
   const offlinePending = pane ? queued.filter(item => !item.sent && !item.syncing && !item.error).length : state.outbox;
   const [commands, setCommands] = useState<{ command: string; description: { i18n: { zh_cn: string; en_us?: string } } }[]>([]);
   const [piCommands, setPiCommands] = useState<{ scope: string; values: PiSessionCommand[] }>({ scope: "", values: [] });

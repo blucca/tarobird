@@ -79,8 +79,6 @@ export type Bot = { id: string; name: string; engine: string; model: string; eff
 // `role` is open-ended so a newer Host role cannot reject the whole directory; only "dispatcher" has meaning here.
 const botSchema = z.object({ id: z.string(), name: z.string(), engine: z.string(), model: z.string(), effort: z.string(), online: z.number(), managed: z.number().optional(), deletedAt: z.number().optional(), defaultAvatar: z.string().max(64).optional(), role: z.string().max(32).optional(), workspacePath: z.string().max(4096).optional() });
 const readySchema = z.object({ serverCapabilities: z.array(z.string()).default([]), conversationFolders: conversationFoldersSchema.optional(), conversationPins: conversationPinsSchema.optional(), crossHostFolderOrder: crossHostFolderOrderSchema.optional(), uploadLimits: uploadLimitsSchema.optional(), user: profileUserSchema, avatars: z.array(avatarSchema).default([]), sessionToken: z.string(), expiresAt: z.number(), serverTime: z.number().optional(), bots: z.array(botSchema), conversations: z.array(conversationSchema) });
-/** Queued frames refresh only their own conversation; creation has no existing scope. */
-const frameConversation = (frame: ClientFrame): string | undefined => "conversationId" in frame ? frame.conversationId : "groupId" in frame ? frame.groupId : undefined;
 export type RouteSyncSource = "host" | "network";
 export type RouteSyncResult = { limited: boolean };
 export type ConnectionState = ProfileCache & { savedWorkspacesAvailable?: boolean; audioRecordingMarkerAvailable?: boolean; dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ flight })` and an `ack` with `heldMs`. */ screenFlightAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; /** Host accepts `screenConfigure({ udpBoost })` and `includeUdpStatus=1`. */ screenUdpBoostAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; botCommsAvailable?: boolean; historyAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; engineQuotaAvailable?: boolean; /** Host serves a conversation's context usage. */ contextUsageAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; workspaceFilesAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; conversationPins?: ConversationPinsState; pinsAvailable?: boolean; crossHostFolderOrder?: CrossHostFolderOrderState; crossHostFolderOrderAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; routeDiagnosis?: RouteDiagnosis; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
@@ -89,7 +87,7 @@ class RouteDiagnosisError extends Error {
     super(diagnosis.message);
   }
 }
-export type OutboxSettlement = { entry: OutboxEntry; revision: number; messageAccepted: boolean };
+export type OutboxSettlement = { entry: OutboxEntry; revision: number; queueRevision: number; messageAccepted: boolean };
 function isPermanentPinRejection(error: unknown): boolean {
   if (!(error instanceof HubHttpError)) return false;
   if (error.status === 400 && (error.code === "invalid_request" || error.code === "invalid_json")) return true;
@@ -136,15 +134,12 @@ export class HubConnection {
   }
   /** Request fresh local views of one conversation (pending rows, history fences). */
   refreshConversation(id: string): void { this.changedConversations.add(id); this.update({}, true, true); }
-  /** Outbox writes change only the durable queue. The owning conversation still
-   * advances because pending rows and ACK receipts fence on cacheRevision; other
-   * conversations keep their history. Unknown ownership keeps the global refresh. */
-  private outboxChanged(...conversations: (string | undefined)[]): void {
+  /** Outbox writes change only the durable queue, not cached message history.
+   * Notify outbox observers via `outboxRevision` without marking any
+   * conversation's message history dirty or advancing `cacheRevision`. */
+  private outboxChanged(): void {
     this.outboxVersion++;
-    const owners = conversations.filter((id): id is string => !!id);
-    if (!owners.length) { this.refreshCache(); return; }
-    for (const id of owners) this.changedConversations.add(id);
-    this.update({}, true, true);
+    this.update();
   }
   private outboxSettlements = new Set<(receipt: OutboxSettlement) => void>();
   private outboxQueued = new Set<(frame: ClientFrame) => void>();
@@ -281,7 +276,7 @@ export class HubConnection {
   subscribeOutboxQueued(listener: (frame: ClientFrame) => void): () => void { this.outboxQueued.add(listener); return () => this.outboxQueued.delete(listener); }
   private settleOutbox(entry: OutboxEntry | undefined, messageAccepted: boolean): void {
     if (!entry || this.closed) return;
-    const receipt = { entry, revision: this.state.cacheRevision, messageAccepted };
+    const receipt = { entry, revision: this.state.cacheRevision, queueRevision: this.outboxVersion, messageAccepted };
     this.outboxSettlements.forEach(listener => listener(receipt));
   }
   private update(changes: Partial<ConnectionState> = {}, cacheChanged = false, scoped = false): void {
@@ -1288,7 +1283,7 @@ export class HubConnection {
     if (new TextEncoder().encode(JSON.stringify(frame)).byteLength > MAX_FRAME_BYTES) throw new Error(t("消息过大，请作为文件发送"));
     if ("clientMsgId" in frame || "clientActionId" in frame) {
       if (this.cache.isClosed) { this.cacheUnavailable(); throw new Error(connectionErrorMessage("local_cache_unavailable")); }
-      await this.cache.enqueue(frame, designComments ? { identity: this.identity, userId: this.state.user?.id ?? "", draft: designComments } : undefined); markSendTimingByClientMsgId(frame, "enqueueDoneAt"); this.outboxQueued.forEach(listener => listener(frame)); this.outboxChanged(frameConversation(frame)); this.update({ outbox: (await this.cache.outbox()).length }); await this.flush();
+      await this.cache.enqueue(frame, designComments ? { identity: this.identity, userId: this.state.user?.id ?? "", draft: designComments } : undefined); markSendTimingByClientMsgId(frame, "enqueueDoneAt"); this.outboxQueued.forEach(listener => listener(frame)); this.outboxChanged(); this.update({ outbox: (await this.cache.outbox()).length }); await this.flush();
     }
     else { if (this.ws?.readyState !== WebSocket.OPEN || this.state.status !== "online") throw new Error(t("连接恢复后即可操作")); this.ws.send(JSON.stringify(frame)); }
   }
@@ -1296,19 +1291,19 @@ export class HubConnection {
     if (this.isReadOnly || this.state.user?.role !== "owner") throw new Error("diff_review_forbidden");
     const result = await this.cache.enqueueDiffReview(scope, this.identity, expectedRevision);
     if (!result.reused) this.outboxQueued.forEach(listener => listener(result.frame));
-    this.outboxChanged(scope.conversationId); this.update({ outbox: (await this.cache.outbox()).length }); await this.flush();
+    this.outboxChanged(); this.update({ outbox: (await this.cache.outbox()).length }); await this.flush();
     return result;
   }
   async retryDiffReview(scope: DiffReviewScope, clientMsgId: string) {
     if (this.isReadOnly || this.state.user?.role !== "owner") throw new Error("diff_review_forbidden");
     const result = await this.cache.retryDiffReview(scope, this.identity, clientMsgId);
-    this.outboxChanged(scope.conversationId); await this.flush(); return result;
+    this.outboxChanged(); await this.flush(); return result;
   }
   async abandonDiffReview(scope: DiffReviewScope, clientMsgId: string) {
     const draft = await this.cache.abandonDiffReview(scope, this.identity, clientMsgId);
     if (this.inflightEntry?.id === clientMsgId) this.inflightEntry = undefined;
     if (this.inflight === clientMsgId) this.inflight = undefined;
-    this.outboxChanged(scope.conversationId); await this.flush(); return draft;
+    this.outboxChanged(); await this.flush(); return draft;
   }
   /** Take before sending turn.stop: it is never queued or replayed, and the Hub
    * reports only stop_incomplete (without a request ID) to the sending socket. */
@@ -1336,10 +1331,9 @@ export class HubConnection {
     const groupMessageError = typeof frame.requestId === "string" && ["group_discussion_active", "group_discussion_start_required", "group_reply_mode_changed"].includes(String(frame.code));
     if (!expired && !groupMessageError) this.update({ error });
     if (typeof frame.requestId === "string") {
-      const owner = this.inflightEntry?.id === frame.requestId ? this.inflightEntry : (await this.cache.outbox()).find(item => item.id === frame.requestId);
       if (frame.retryable === false) await this.cache.fail(frame.requestId, error);
       else await this.cache.retryableFailure(frame.requestId, t("多次发送未确认，请检查消息记录后重试或移除待发送项。"));
-      this.outboxChanged(owner && frameConversation(owner.frame));
+      this.outboxChanged();
       if (frame.retryable === false && this.inflightEntry?.id === frame.requestId) this.inflightEntry = undefined;
       if (this.inflight === frame.requestId) this.inflight = undefined;
       await this.flush();
@@ -1348,22 +1342,25 @@ export class HubConnection {
   clearError(): void { this.update({ error: undefined, routeDiagnosis: undefined }); }
   async retryFailed(id: string): Promise<void> {
     if (await this.cache.retryFailed(id)) {
-      const entry = (await this.cache.outbox()).find(item => item.id === id);
-      this.outboxChanged(entry && frameConversation(entry.frame)); await this.flush();
+      this.outboxChanged(); await this.flush();
     } else this.refreshCache();
   }
   async discardFailed(id: string): Promise<void> {
     const removed = await this.cache.discardFailed(id);
     if (removed && this.inflightEntry?.id === removed.id && this.inflightEntry.order === removed.order) this.inflightEntry = undefined;
-    this.settleOutbox(removed, false); if (removed) this.outboxChanged(frameConversation(removed.frame)); await this.flush();
+    this.settleOutbox(removed, false); if (removed) this.outboxChanged(); await this.flush();
   }
   private async ack(id: string, messageAccepted = false, acceptance?: DesignCommentAcceptance): Promise<void> {
-    const removed = await this.cache.acknowledge(id, messageAccepted, acceptance);
+    const settled = typeof this.cache.acknowledgeReceipt === "function"
+      ? await this.cache.acknowledgeReceipt(id, messageAccepted, acceptance)
+      : { entry: await this.cache.acknowledge(id, messageAccepted, acceptance), alreadyDeleted: false };
     // Another window sharing this cache may have committed the deletion first.
     // Our own sent entry still proves what this authenticated ACK confirms.
-    this.settleOutbox(removed ?? (messageAccepted && this.inflightEntry?.id === id ? this.inflightEntry : undefined), messageAccepted);
-    const owner = removed ?? (this.inflightEntry?.id === id ? this.inflightEntry : undefined);
-    this.outboxChanged(owner && frameConversation(owner.frame));
+    // An already-committed deletion tombstone retires immediately without
+    // bridging a phantom "sent" row into the outbox UI.
+    const entry = settled.entry ?? (messageAccepted && this.inflightEntry?.id === id ? this.inflightEntry : undefined);
+    this.settleOutbox(entry, messageAccepted && !settled.alreadyDeleted);
+    this.outboxChanged();
     if (this.inflightEntry?.id === id) this.inflightEntry = undefined;
     if (this.inflight === id) this.inflight = undefined;
     await this.flush();
@@ -1392,7 +1389,7 @@ export class HubConnection {
       try { wire = groupReplyWireFrame(entry.frame, this.state); }
       catch (cause) {
         const error = cause instanceof Error ? cause.message : changedGroupReply();
-        await this.cache.fail(entry.id, error); this.outboxChanged(conversation); blocked.add(conversation); continue;
+        await this.cache.fail(entry.id, error); this.outboxChanged(); blocked.add(conversation); continue;
       }
       this.inflight = entry.id; this.inflightEntry = entry; markSendTimingByClientMsgId(entry.frame, "outboxFlushSentAt"); this.ws.send(JSON.stringify(wire)); return;
     }
