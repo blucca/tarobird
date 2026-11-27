@@ -32,7 +32,14 @@ export function orderedRoutes(routes: readonly Route[]): Route[] { return [...ro
 export function deploymentMatchesRoutes(deployment: Deployment | undefined, routes: readonly Route[]): boolean {
   return deployment === "vps-direct" ? routes.some((r) => r.name !== "VPS") : deployment === "vps-relay" ? routes.length > 0 && routes.every((r) => r.name === "VPS") : true;
 }
-export type ConnectionVerificationFailure = "identity-mismatch" | "verification-unavailable" | "invalid-key";
+export type ConnectionVerificationFailure =
+  | "identity-mismatch"
+  | "verification-unavailable"
+  | "invalid-key"
+  | "hostname-mismatch"
+  | "certificate-expired"
+  | "certificate-policy"
+  | "tls-handshake";
 export type RouteTransportFailure =
   | "local-network-denied"
   | "client-offline"

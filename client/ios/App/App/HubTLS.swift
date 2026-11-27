@@ -13,6 +13,7 @@ struct HubNetworkError: LocalizedError {
         var current: NSError? = error as NSError
         var urlCode: URLError.Code?
         var posixCode: Int?
+        var osStatus: OSStatus?
         var nwDnsError = false
         var effectiveHost: String? = host.flatMap { $0.isEmpty ? nil : $0 }
         var depth = 0
@@ -47,14 +48,30 @@ struct HubNetworkError: LocalizedError {
             if ns.domain == NSURLErrorDomain && urlCode == nil {
                 urlCode = URLError.Code(rawValue: ns.code)
             }
+            if ns.domain == NSOSStatusErrorDomain && osStatus == nil {
+                osStatus = OSStatus(truncatingIfNeeded: ns.code)
+            }
             current = ns.userInfo[NSUnderlyingErrorKey] as? NSError
             depth += 1
+        }
+        // Trust evaluation (SecTrustEvaluateAsyncWithError) reports OSStatus
+        // causes; URL loading errors keep their URL-level classification below.
+        if urlCode == nil, let status = osStatus {
+            switch status {
+            case errSecHostNameMismatch: return "native_tls_hostname_mismatch"
+            case errSecCertificateExpired, errSecCertificateNotValidYet: return "native_tls_cert_expired"
+            case errSecInvalidExtendedKeyUsage, errSecInvalidKeyUsageForPolicy, errSecCertificateValidityPeriodTooLong:
+                return "native_tls_cert_policy_rejected"
+            default: break
+            }
         }
         if let code = urlCode {
             switch code {
             case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff: return "native_network_offline"
             case .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
                  .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid: return "native_tls_untrusted"
+            case .clientCertificateRejected, .clientCertificateRequired: return "native_tls_handshake_failed"
+            case .appTransportSecurityRequiresSecureConnection: return "native_ats_blocked"
             case .cannotFindHost, .dnsLookupFailed: return "native_dns_failed"
             default: break
             }
@@ -251,7 +268,8 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
     /// QR-provided roots are scoped to this origin and Hub identity. Hostname,
     /// certificate validity, identity proof and exact-leaf pinning still apply.
     static func prepare(origin: String, publicKey: String, queue: DispatchQueue, anchors: [SecCertificate]? = nil,
-                        timeout: TimeInterval = 5,
+                        // Identity probe budget; slow cross-border VPN links need more than 5 s.
+                        timeout: TimeInterval = 12,
                         completion: @escaping (Result<HubTLSSession, Error>) -> Void) throws -> HubTLSSession {
         dispatchPrecondition(condition: .onQueue(queue))
         let base = try HubTLS.origin(origin)
@@ -368,15 +386,19 @@ final class HubTLSSession: NSObject, URLSessionDataDelegate, URLSessionWebSocket
                   SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess else {
                 rejectTrust("native_tls_untrusted", completion); return
             }
+            // Route-scoped private CAs have no public AIA/OCSP responders;
+            // disable network fetch so restricted/VPN networks never stall trust evaluation.
+            _ = SecTrustSetNetworkFetchAllowed(trust, false)
         }
         // Evaluate the supplied system policies, including hostname and ATS;
         // do not replace them with a weaker custom SSL policy.
         // Trust evaluation can fetch intermediates/revocation information.
         // Keep cancellation, deadlines and other hosts responsive while it runs.
-        let status = SecTrustEvaluateAsyncWithError(trust, queue) { [weak self] trust, trusted, _ in
+        let status = SecTrustEvaluateAsyncWithError(trust, queue) { [weak self] trust, trusted, trustError in
             guard let self = self, !self.cancelled else { completion(.cancelAuthenticationChallenge, nil); return }
             guard trusted, let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let certificate = chain.first else {
-                self.rejectTrust("native_tls_untrusted", completion); return
+                let code = trustError.map { HubNetworkError.classify($0, fallback: "native_tls_untrusted") } ?? "native_tls_untrusted"
+                self.rejectTrust(code, completion); return
             }
             let leaf = SecCertificateCopyData(certificate) as Data
             guard (self.pin == nil || self.pin == leaf), (self.observedLeaf == nil || self.observedLeaf == leaf) else {
@@ -510,11 +532,16 @@ private final class HubProofHandler: HubTaskHandler {
         bytes.append(data)
     }
     func markTimeout() {
+        // A trust failure already recorded on the connection is the real cause;
+        // a later deadline must not mask it.
+        guard connection.trustFailure == nil else { return }
         if failure == nil { failure = HubNetworkError("native_request_timeout") }
     }
     override func completed(_ error: Error?) {
         deadline?.cancel(); deadline = nil
         do {
+            // Precedence: a recorded trust failure, then the deadline (or a
+            // response failure recorded before it), then the task's own error.
             if let error = connection.trustFailure ?? failure ?? error { throw error }
             try connection.bindProof(bytes, key: key, nonce: nonce)
             completion(.success(connection))

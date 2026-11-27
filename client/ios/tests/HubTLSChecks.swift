@@ -142,6 +142,18 @@ private final class SocketProbe: HubTaskHandler, @unchecked Sendable {
         try checkClassify(epermError, "native_host_unreachable", "classifyPosixEpermWithoutHostNotLocalNetwork")
         try checkClassify(NSError(domain: "kCFErrorDomainDNSServiceDiscovery", code: -65555), "local_network_permission_denied", "classifyDnsServiceLocalNetworkDenied")
     }
+    static func trustCauseChecks() throws {
+        func status(_ code: OSStatus) -> NSError { NSError(domain: NSOSStatusErrorDomain, code: Int(code)) }
+        try checkClassify(status(errSecHostNameMismatch), "native_tls_hostname_mismatch", "classifyTrustHostnameMismatch")
+        try checkClassify(status(errSecCertificateExpired), "native_tls_cert_expired", "classifyTrustExpired")
+        try checkClassify(status(errSecCertificateNotValidYet), "native_tls_cert_expired", "classifyTrustNotYetValid")
+        try checkClassify(status(errSecInvalidExtendedKeyUsage), "native_tls_cert_policy_rejected", "classifyTrustPolicy")
+        try check(HubNetworkError.classify(status(errSecNotTrusted), fallback: "native_tls_untrusted") == "native_tls_untrusted", "classifyTrustOtherUntrusted")
+        try checkClassify(URLError(.appTransportSecurityRequiresSecureConnection), "native_ats_blocked", "classifyAtsError")
+        try checkClassify(URLError(.clientCertificateRequired), "native_tls_handshake_failed", "classifyHandshakeError")
+        // URL-level TLS errors keep main's single untrusted code.
+        try checkClassify(URLError(.secureConnectionFailed), "native_tls_untrusted", "classifySecureConnectionFailedUntrusted")
+    }
     static func openSilentLoopbackListener() throws -> (Int32, Int) {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw HubNetworkError("silentListenerSocket") }
@@ -194,7 +206,13 @@ private final class SocketProbe: HubTaskHandler, @unchecked Sendable {
             let hub = peer.peers["hub"]!, proxy = peer.peers["proxy"]!, rotating = peer.peers["rotating"]!, key = peer.peers["key"]!
             let ca = SecCertificateCreateWithData(nil, try Data(contentsOf: URL(fileURLWithPath: scratch + "/ca.der")) as CFData)!
             try await rejects("systemTrustRejectsPrivateCa") { _ = try await prepare(hub, key, nil) }
-            try await rejects("hostnameMismatchRejected") { _ = try await prepare(hub.replacingOccurrences(of: "127.0.0.1", with: "localhost"), key, ca) }
+            do { _ = try await prepare(hub.replacingOccurrences(of: "127.0.0.1", with: "localhost"), key, ca); try check(false, "hostnameMismatchRejected") }
+            catch {
+                let code = HubNetworkError.classify(error)
+                try check(code == "native_tls_hostname_mismatch" || code == "native_tls_untrusted", "hostnameMismatchRejected")
+                results["hostnameMismatchCode"] = code
+            }
+            try trustCauseChecks()
             try await rejects("activeProxyRejectedBeforeCredentials") { _ = try await prepare(proxy, key, ca) }
             try await rejects("cleartextLoopbackRejected") { _ = try HubTLS.origin("http://127.0.0.1:1") }
             let real = try await prepare(hub, key, ca); sessions.append(real)
