@@ -124,7 +124,7 @@ export class HubStore {
   bots(userId: string, includeDeleted = false): Promise<Bot[]> {
     return this.db.serial(async () => {
       const owner = await this.isOwnerInTransaction(userId);
-      const rows = await this.db.all<Omit<Bot, "role" | "workspacePath"> & { role: string; deleted_at: number | null; assigned_avatar: string | null; workspace_path: string | null }>(`SELECT id,name,engine,model,effort,online,role,deleted_at,workspace_path,(SELECT value FROM meta WHERE key=?||bots.id) AS assigned_avatar,EXISTS(SELECT 1 FROM managed_bots m WHERE m.bot_id=bots.id) AS managed FROM bots WHERE (? OR deleted_at IS NULL) AND (EXISTS(SELECT 1 FROM users WHERE id=? AND role='owner') OR id IN (SELECT bot_id FROM bot_grants WHERE user_id=?)) ORDER BY id`, [BOT_AVATAR_DEFAULT_PREFIX, Number(includeDeleted), userId, userId]);
+      const rows = await this.db.all<Omit<Bot, "role" | "workspacePath"> & { role: string; deleted_at: number | null; assigned_avatar: string | null; workspace_path: string | null }>(`SELECT id,name,engine,model,effort,online,role,deleted_at,workspace_path,(SELECT value FROM meta WHERE key=?||bots.id) AS assigned_avatar,EXISTS(SELECT 1 FROM managed_bots m WHERE m.bot_id=bots.id) AS managed FROM bots WHERE (? OR deleted_at IS NULL) AND (EXISTS(SELECT 1 FROM users WHERE id=? AND role='owner') OR (role NOT IN ('dispatcher','worker') AND id IN (SELECT bot_id FROM bot_grants WHERE user_id=?))) ORDER BY id`, [BOT_AVATAR_DEFAULT_PREFIX, Number(includeDeleted), userId, userId]);
       return rows.map(({ deleted_at, assigned_avatar, role, workspace_path, ...bot }) => {
         const assigned = botAvatarById(assigned_avatar), known = botRoleSchema.safeParse(role);
         return { ...bot, ...(known.success ? { role: known.data } : {}), ...(owner && workspace_path ? { workspacePath: workspace_path } : {}), ...(assigned ? { defaultAvatar: assigned.id } : {}), ...(deleted_at ? { online: 0, managed: 0, deletedAt: deleted_at } : {}) };
@@ -279,21 +279,18 @@ export class HubStore {
     const user = await this.db.get<User>("SELECT * FROM users WHERE id=?", [userId]);
     const ids = [...new Set(botIds)];
     if (ids.length === 0) throw new HubError("bots_required");
-    let dispatcher = false;
     for (const id of ids) {
       const bot = await this.db.get<{ role: string }>("SELECT role FROM bots WHERE id=? AND deleted_at IS NULL", [id]);
       if (!bot) throw new HubError("bot_not_found", 404);
       if (!parent && user?.role !== "owner" && !await this.db.get("SELECT 1 FROM bot_grants WHERE user_id=? AND bot_id=?", [userId, id])) throw new HubError("bot_forbidden", 403);
-      dispatcher ||= bot.role === "dispatcher";
       // A dispatcher's engine worker only runs its hidden ticket conversations.
       if (bot.role === "worker" && !options.dispatchWorker) throw new HubError("dispatch_worker_internal", 409);
+      // Dispatchers operate owner-only ticket ledgers and Host CLI workers.
+      if (bot.role === "dispatcher" && user?.role !== "owner") throw new HubError("bot_forbidden", 403);
     }
     const id = newId("gw");
     const type = parent ? "group" : options.type ?? (ids.length === 1 ? "direct" : "group");
     if (type === "direct" && ids.length !== 1) throw new HubError("direct_requires_one_bot");
-    // A dispatcher works through exactly one conversation and is never a group member.
-    if (dispatcher && type === "group") throw new HubError("dispatcher_group_forbidden", 409);
-    if (dispatcher && await this.db.get("SELECT 1 FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id WHERE m.member_type='bot' AND m.member_id=? AND c.type='direct'", [ids[0]!])) throw new HubError("dispatcher_single_conversation", 409);
     const workspacePath = options.workspacePath?.trim() || parent?.workspacePath || null;
     await this.db.run("INSERT INTO conversations(id,type,title,owner_id,created_at,client_action_id,parent_id,workspace_path) VALUES(?,?,?,?,?,?,?,?)", [id, type, title, userId, Date.now(), clientActionId, parent?.id ?? null, workspacePath]);
     if (parent) await this.db.run("INSERT INTO conversation_members SELECT ?,'user',member_id,0 FROM conversation_members WHERE conversation_id=? AND member_type='user'", [id, parent.id]);
@@ -374,8 +371,8 @@ export class HubStore {
       for (const bot of change.botIds.filter(bot => !current.botIds.includes(bot))) {
         const added = await this.db.get<{ role: string }>("SELECT role FROM bots WHERE id=? AND deleted_at IS NULL", [bot]);
         if (!added) throw new HubError("bot_not_found", 404);
-        if (added.role === "dispatcher") throw new HubError("dispatcher_group_forbidden", 409);
         if (added.role === "worker") throw new HubError("dispatch_worker_internal", 409);
+        if (added.role === "dispatcher" && user?.role !== "owner") throw new HubError("bot_forbidden", 403);
         if (user?.role !== "owner" && !await this.db.get("SELECT 1 FROM bot_grants WHERE user_id=? AND bot_id=?", [userId, bot])) throw new HubError("bot_forbidden", 403);
       }
       // A running discussion keeps its participant snapshot; removing one of
@@ -384,9 +381,9 @@ export class HubStore {
       if (active && change.policy?.mode === "parallel") throw new HubError("group_parallel_discussion_active", 409);
       if (active && z.array(z.object({ botId: z.string() }).passthrough()).parse(JSON.parse(active.participants_json)).some(participant => !change.botIds.includes(participant.botId))) throw new HubError("group_discussion_active", 409);
       // Topics inherit membership, including archived topics when restored.
-      // Never remove access while a queued/active delivery still needs it.
+      // Never remove access while a queued/active delivery or working ticket still needs it.
       for (const row of rows) for (const bot of (await this.conversationRow(row.id)).botIds.filter(bot => !change.botIds.includes(bot))) {
-        if (await this.db.get("SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE m.conversation_id=? AND d.bot_id=? AND d.status='pending' UNION ALL SELECT 1 FROM action_deliveries WHERE conversation_id=? AND bot_id=? AND status='pending' UNION ALL SELECT 1 FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND status IN ('pending','streaming') LIMIT 1", [row.id, bot, row.id, bot, row.id, bot])) throw new HubError("group_bot_busy", 409);
+        if (await this.db.get("SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE m.conversation_id=? AND d.bot_id=? AND d.status='pending' UNION ALL SELECT 1 FROM action_deliveries WHERE conversation_id=? AND bot_id=? AND status='pending' UNION ALL SELECT 1 FROM messages WHERE conversation_id=? AND author_type='bot' AND author_id=? AND status IN ('pending','streaming') UNION ALL SELECT 1 FROM dispatch_tickets WHERE conversation_id=? AND dispatcher_bot_id=? AND status='working' LIMIT 1", [row.id, bot, row.id, bot, row.id, bot, row.id, bot])) throw new HubError("group_bot_busy", 409);
       }
       await this.db.run("UPDATE conversations SET title=? WHERE id=?", [change.title, id]);
       for (const row of rows) {

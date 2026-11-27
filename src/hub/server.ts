@@ -35,7 +35,7 @@ import { asrInstallSchema } from "../client-protocol/asr-setup.js";
 import { acquireHostIdentityAdmission, acquireExistingHostIdentityAdmission, HostDirectoryError } from "../host-cli/windows-state-admission.js";
 import { chromePatchSchema, chromeResultSchema } from "../client-protocol/chrome.js";
 import { networkCanonical } from "../client-protocol/private-network.js";
-import { BotMessages } from "./bot-messages.js";
+import { BotMessages, messageHostId } from "./bot-messages.js";
 import { STEER_CALL_TIMEOUT_MS, STEER_RECONCILE_TIMEOUT_MS, STEER_STATUS_TIMEOUT_MS, botMessageSteeringProofTarget } from "./bot-message-steering.js";
 import { BOT_MESSAGE_STEER_CAPABILITY, botMessageSteeringCommandSchema } from "../client-protocol/bot-message-delivery.js";
 import { HubAgentBuses } from "./agent-bus.js";
@@ -1306,7 +1306,7 @@ export class HubServer {
           const groupDiscussion = connection.groupDiscussion ? await this.groupDiscussions.dispatch(id, message.id) : undefined;
           if (!active()) { connection.replayQueue = true; break; }
           const workbenchMetadata = gatewayWorkbenchMetadata(await this.store.db.serial(() => readWorkbenchTurnMetadata(this.store.db, message.id)), connection.designOpen);
-          await this.send(connection.ws, { v: 1, type: "instance.message", message, conversation, ...workbenchMetadata, ...(agentBus ? { agentBus } : {}), ...(groupDiscussion ? { groupDiscussion } : {}) });
+          await this.send(connection.ws, { v: 1, type: "instance.message", message, conversation, ...workbenchMetadata, ...(message.botSource ? { ticketNotice: this.isHostTicketNotice(message) } : {}), ...(agentBus ? { agentBus } : {}), ...(groupDiscussion ? { groupDiscussion } : {}) });
           // Readers see "speaking" instead of "waiting" without polling.
           if (groupDiscussion) this.trackTask(this.groupDiscussions.markDispatched(id, message.id).catch(() => this.options.onWarning?.("group_discussion_settle_failed")));
         }
@@ -1322,6 +1322,10 @@ export class HubServer {
     const tail = work.catch(() => undefined); this.dispatchTails.set(id, tail);
     void tail.then(() => { if (this.dispatchTails.get(id) === tail) this.dispatchTails.delete(id); });
     this.trackTask(work); return work;
+  }
+  private isHostTicketNotice(message: Message): boolean {
+    return message.authorType === "user" && !!message.botSource && /^tn_/.test(message.clientMsgId ?? "")
+      && /^tk_/.test(message.botSource.requestId) && message.botSource.hostId === messageHostId(this.auth.publicKey);
   }
   private scheduleDispatch(botId: string): void {
     // Delivery settlement is an RPC response boundary, not a wait for the next
@@ -1571,7 +1575,7 @@ export class HubServer {
       const message = await new HubPromptQueue(this.store).take(botId, conversationId, active, connection.botMessages);
       if (!message) return null;
       const workbenchMetadata = gatewayWorkbenchMetadata(await this.store.db.serial(() => readWorkbenchTurnMetadata(this.store.db, message.id)), connection.designOpen);
-      return { message, conversation: await this.store.conversationForBot(botId, conversationId), ...workbenchMetadata };
+      return { message, conversation: await this.store.conversationForBot(botId, conversationId), ...workbenchMetadata, ...(message.botSource ? { ticketNotice: this.isHostTicketNotice(message) } : {}) };
     }
     if (method === "run.recover") { const input = z.object({ before: z.number().int().nonnegative().max(Date.now()) }).strict().parse(params); await this.store.recoverOrphanRuns(botId, input.before); await this.store.retireNativeInputs(botId, input.before); await this.settleDiscussion(() => this.groupDiscussions.settleBot(botId)); return null; }
     if (method === "input.progress") { if (!this.bots.get(botId)?.nativeInput) throw new HubError("unsupported", 409); await this.store.applyNativeInputProgress(botId, params); return null; }
@@ -2395,7 +2399,9 @@ export class HubServer {
         if (kind === "dispatcher" && req.method === "GET") { await reply(200, await this.dispatch.settings(userId, botId)); return; }
         if (kind === "dispatcher" && req.method === "PUT") { const result = await this.dispatch.updateSettings(userId, botId, await this.jsonBody(req), validateInQueue); await this.store.audit("dispatch.settings_updated", session.deviceId, { botId }); await reply(200, result); return; }
         if (kind === "tickets" && req.method === "GET") {
-          const query = new URL(req.url ?? "/", "http://hub").searchParams, options = { open: query.get("open") === "1", capabilities: query.get("capabilities") === "1" };
+          const query = new URL(req.url ?? "/", "http://hub").searchParams, rawConversationId = query.get("conversationId");
+          const conversationId = rawConversationId ? idSchema.parse(rawConversationId) : undefined;
+          const options = { open: query.get("open") === "1", capabilities: query.get("capabilities") === "1", ...(conversationId ? { conversationId } : {}) };
           await reply(200, query.get("summary") === "1" ? await this.dispatch.overview(owner, botId, options) : await this.dispatch.list(owner, botId, options)); return;
         }
         if (kind === "tickets" && req.method === "POST") { await reply(201, await this.dispatch.create(owner, botId, await this.jsonBody(req))); return; }
@@ -2927,7 +2933,7 @@ export class HubServer {
         : input.operation === "assist" ? await this.dispatch.requestAssist(actor, input.data)
         : input.operation === "assist-status" ? await this.dispatch.assistStatus(actor)
         : input.operation === "assists" ? await this.dispatch.assists(actor, idSchema.parse(input.data.ticketId))
-        : input.operation === "list" ? await this.dispatch.list(actor, botId, { open: input.data.open === true })
+        : input.operation === "list" ? await this.dispatch.list(actor, botId, { open: input.data.open === true, ...(input.data.conversationId !== undefined ? { conversationId: idSchema.parse(input.data.conversationId) } : {}) })
         : input.operation === "show" ? await this.dispatch.show(actor, idSchema.parse(input.data.ticketId))
         : input.operation === "targets" ? await this.dispatch.targets(actor, botId)
         : input.operation === "capabilities" ? await this.dispatch.capabilities(actor, botId, input.data)

@@ -8,7 +8,7 @@ import { requestTicketAssistanceSchema } from "../client-protocol/dispatch-assis
 import { instanceEndpoint } from "./bot-messages.js";
 import { HostCliError, LocalHostClient } from "./client.js";
 
-export type TicketOptions = { bot?: string; engine?: string; title?: string; text?: string; "text-file"?: string; model?: string; effort?: string; force?: boolean; status?: string; note?: string;
+export type TicketOptions = { bot?: string; conversation?: string; engine?: string; title?: string; text?: string; "text-file"?: string; model?: string; effort?: string; force?: boolean; status?: string; note?: string;
   open?: boolean; match?: string; offset?: string; assist?: string; "request-id"?: string; "context-message"?: string; "dispatch-mode"?: string; "max-concurrent"?: string; allow?: string; revision?: string };
 const OWNER_ONLY = ["pause", "resume", "cancel", "accept", "remove", "engine-reset", "settings"];
 function contextError(missing: boolean, status?: number): HostCliError {
@@ -36,6 +36,7 @@ export function allowedEnginesOption(value: string | undefined): DispatcherSetti
 export async function runTicketsCommand(directory: string, sub: string | undefined, argument: string | undefined, options: TicketOptions, receipt: (id: string) => void): Promise<unknown> {
   const commands = ["list", "show", "targets", "capabilities", "create", "dispatch", "update", "assist", "assist-status", "assists", "engines", ...OWNER_ONLY];
   if (!sub || !commands.includes(sub)) throw new Error(`请使用 tickets ${commands.join("|")}。`);
+  if (options.conversation !== undefined && !["list", "create"].includes(sub)) throw new Error("--conversation 仅支持 tickets list 或 tickets create。");
   const capabilityQuery = sub === "capabilities" ? dispatchCapabilitiesRequestSchema.parse({ engine: required(options.engine, "缺少 --engine。"), ...(options.match !== undefined ? { match: options.match } : {}), ...(options.offset !== undefined ? { offset: Number(options.offset) } : {}) }) : undefined;
   const botId = process.env.TAROBOT_ACTIVE_INSTANCE ?? process.env.TAROBOT_INSTANCE;
   if (botId) {
@@ -51,7 +52,7 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
         throw error;
       }
     };
-    if (sub === "list") return call("list", options.open ? { open: true } : {});
+    if (sub === "list") return call("list", { ...(options.open ? { open: true } : {}), ...(options.conversation ? { conversationId: options.conversation } : {}) });
     if (sub === "engines") return { engines: (await call("list", { open: true })).engines };
     if (sub === "show") return call("show", { ticketId: required(argument, "缺少工单 ID。") });
     if (sub === "targets") return call("targets");
@@ -75,7 +76,12 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
       const engine = required(argument, `缺少引擎名称：${DISPATCH_ENGINES.join("|")}。`);
       return { engines: await client.request(`/api/dispatch/engines/${encodeURIComponent(engine)}/reset`, "POST", {}) };
     }
-    if (sub === "list") return client.request(`/api/bots/${dispatcher().id}/tickets${options.open ? "?open=1" : ""}`);
+    if (sub === "list") {
+      const query = new URLSearchParams();
+      if (options.open) query.set("open", "1");
+      if (options.conversation) query.set("conversationId", options.conversation);
+      return client.request(`/api/bots/${dispatcher().id}/tickets${query.size ? `?${query}` : ""}`);
+    }
     if (sub === "show") return client.request(ticketRoute(required(argument, "缺少工单 ID。")));
     if (sub === "assists") return client.request(`${ticketRoute(required(argument, "缺少工单 ID。"))}/assists`);
     if (sub === "targets") return client.request(`/api/bots/${dispatcher().id}/dispatch-targets`);
@@ -114,7 +120,7 @@ async function mutation(sub: string, argument: string | undefined, options: Tick
   }
   if (sub === "create") {
     const requestId = options["request-id"] ?? randomUUID(); receipt(requestId);
-    return { requestId, title: required(options.title, "缺少 --title。"), request: required(await textOf(options), "缺少 --text 或 --text-file（工单要求）。") };
+    return { requestId, title: required(options.title, "缺少 --title。"), request: required(await textOf(options), "缺少 --text 或 --text-file（工单要求）。"), ...(options.conversation ? { conversationId: options.conversation } : {}) };
   }
   if (sub === "dispatch") {
     const requestId = options["request-id"] ?? randomUUID(); receipt(requestId);

@@ -135,3 +135,30 @@ it("removes cancelled tickets through the owner CLI and retains show and request
   expect(await runTicketsCommand(root, "list", undefined, {}, receipt)).toMatchObject({ tickets: [] });
   expect(await runTicketsCommand(root, "show", created.id, {}, receipt)).toEqual(first);
 });
+
+it("supports --conversation on tickets create and tickets list for both owner and Bot CLI", async () => {
+  const first = await hub.store.createConversation("owner", ["planner"], "Chat A", "chat-a");
+  const second = await hub.store.createConversation("owner", ["planner"], "Chat B", "chat-b");
+  const createdA: any = await runTicketsCommand(root, "create", undefined, { title: "Task A", text: "Work A", conversation: first.id, "request-id": "cli-conv-a" }, receipt);
+  const createdB: any = await runTicketsCommand(root, "create", undefined, { title: "Task B", text: "Work B", conversation: second.id, "request-id": "cli-conv-b" }, receipt);
+  expect(createdA.conversationId).toBe(first.id);
+  expect(createdB.conversationId).toBe(second.id);
+  expect(((await runTicketsCommand(root, "list", undefined, { conversation: first.id }, receipt)) as any).tickets.map((t: any) => t.id)).toEqual([createdA.id]);
+  expect(((await runTicketsCommand(root, "list", undefined, { conversation: second.id }, receipt)) as any).tickets.map((t: any) => t.id)).toEqual([createdB.id]);
+
+  // Verify real CLI entrypoint accepts --conversation on tickets list and tickets create.
+  const output = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  try {
+    await runHostCli(["tickets", "list", "--conversation", second.id, "--state-dir", root, "--json"]);
+    const logged = output.mock.calls.map(call => call.join(" ")).join("\n");
+    expect(logged).toContain(createdB.id);
+    expect(logged).not.toContain(createdA.id);
+  } finally { output.mockRestore(); }
+
+  // Bot CLI also filters tickets list with --conversation.
+  const state = path.join(root, "bots", "planner"); await mkdir(state, { recursive: true });
+  await writeFile(path.join(state, "gateway.key"), secret, { mode: 0o600 }); await chmod(path.join(state, "gateway.key"), 0o600);
+  vi.stubEnv("TAROBOT_ACTIVE_INSTANCE", "planner"); vi.stubEnv("TAROBOT_ACTIVE_STATE_DIR", state);
+  expect(((await runTicketsCommand(root, "list", undefined, { conversation: second.id }, receipt)) as any).tickets.map((t: any) => t.id)).toEqual([createdB.id]);
+  await expect(runTicketsCommand(root, "show", createdB.id, { conversation: second.id }, receipt)).rejects.toThrow("--conversation");
+});

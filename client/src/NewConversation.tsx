@@ -8,18 +8,14 @@ import type { Bot, HubConnection } from "./connection.js";
 import { HubHttpError } from "./http-error.js";
 import { CreationDialog } from "./CreationDialog.js";
 import { t, useLocale } from "./i18n.js";
-import { isDispatcher } from "./dispatcher.js";
 import { useSavedWorkspaces, WorkspaceAddForm } from "./WorkspacePicker.js";
 import "./conversation-creation.css";
 import "./workspace-picker.css";
 
 export type ConversationCreation = { kind: "direct" | "group"; botId?: string } | { kind: "topic"; group: Conversation };
-export function NewConversation({ hostName, connection, bots: allBots, request, created, close, newBot }: { hostName?: string; connection: HubConnection; bots: Bot[]; request: ConversationCreation; created: (conversation: Conversation) => void; close: () => void; newBot: () => void }) {
+export function NewConversation({ hostName, connection, bots, request, created, close, newBot }: { hostName?: string; connection: HubConnection; bots: Bot[]; request: ConversationCreation; created: (conversation: Conversation) => void; close: () => void; newBot: () => void }) {
   useLocale(); const labels = useBotLabels();
   const state = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);
-  // A dispatcher has one conversation and joins no group. Opening it without that
-  // conversation is the only way it is requested here.
-  const bots = allBots.filter(bot => !isDispatcher(bot) || request.kind === "direct" && bot.id === request.botId);
   const [title, setTitle] = useState("");
   const [chosen, setChosen] = useState(request.kind === "topic" ? request.group.botIds : request.botId ? [request.botId] : []);
   const [workspaceOverride, setWorkspaceOverride] = useState<string>("");
@@ -39,7 +35,7 @@ export function NewConversation({ hostName, connection, bots: allBots, request, 
     try { created(await connection.createConversation(submitted.current)); }
     catch (error) {
       if (error instanceof HubHttpError && error.status >= 400 && error.status < 500) {
-        submitted.current = undefined; setError(error.status === 403 ? t("当前账号没有创建此对话的权限。") : error.message === "conversation_archived" ? t("这个群组已归档，请先恢复群组。") : error.message === "dispatcher_single_conversation" ? t("幕僚长只有一个对话，请回到它现有的对话。") : error.message === "dispatcher_group_forbidden" ? t("幕僚长不能加入群组。") : error.message === "workspace_unavailable" ? t("所选工作区在主机上不存在，请选择其他目录。") : t("无法创建，请检查选择的 Bot 和名称。"));
+        submitted.current = undefined; setError(error.status === 403 ? t("当前账号没有创建此对话的权限。") : error.message === "conversation_archived" ? t("这个群组已归档，请先恢复群组。") : error.message === "dispatcher_single_conversation" ? t("此主机版本尚不支持为幕僚长新建对话，请更新主机后重试。") : error.message === "dispatcher_group_forbidden" ? t("此主机版本尚不支持将幕僚长加入群组，请更新主机后重试。") : error.message === "workspace_unavailable" ? t("所选工作区在主机上不存在，请选择其他目录。") : t("无法创建，请检查选择的 Bot 和名称。"));
       } else setError(t("暂未收到创建结果，请重试。重试会继续同一次创建。"));
     }
     finally { setBusy(false); }
