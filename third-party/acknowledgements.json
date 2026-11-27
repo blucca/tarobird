@@ -190,16 +190,16 @@
       "location": "client/licenses/vditor/, vditor/dist/js/lute/lute.min.js"
     },
     {
-      "id": "baoyu-slides",
-      "name": "baoyu-slides",
+      "id": "open-artifact-slides-editor",
+      "name": "Open Artifact slides editor",
       "category": "vendored",
-      "repository": "https://github.com/JimLiu/baoyu-design",
-      "version": "2.15.2 (016a68e1b1ac1c7c291b2cb88d66ff087e50b017)",
-      "license": "Mixed (MIT / upstream notices)",
-      "licenseFile": "client/vendor/baoyu-slides/LICENSE",
-      "noticeFile": "client/vendor/baoyu-slides/NOTICE.md",
-      "usage": "Vendored slides editor, compiler and runtime notices",
-      "location": "client/vendor/baoyu-slides/, skills/baoyu-ppt/"
+      "repository": "https://github.com/JimLiu/open-artifact",
+      "version": "0.14.6 (132c038529e4527d1bc30561a855ffd958aa7302)",
+      "license": "Apache-2.0",
+      "licenseFile": "client/vendor/workbench-slides/LICENSE",
+      "noticeFile": "client/vendor/workbench-slides/NOTICE",
+      "usage": "Workbench presentation editor core (@open-artifact/slides-editor), vendored as a built bundle with the modifications recorded in UPSTREAM.json",
+      "location": "client/vendor/workbench-slides/"
     },
     {
       "id": "deepseek-harness-plugin",
