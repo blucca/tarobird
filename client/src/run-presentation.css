@@ -17,10 +17,10 @@
 .run-thinking-dots>b:nth-child(2){animation-delay:.15s}.run-thinking-dots>b:nth-child(3){animation-delay:.3s}
 .run-thinking-preview>p{margin:5px 0 0;display:flex;flex-direction:column;justify-content:flex-end;max-height:calc(1.7em * 3);overflow:hidden;white-space:pre-line}
 .run-thinking-preview>p[data-multiline]{-webkit-mask-image:linear-gradient(to bottom,#0006 0,#000 2.2em);mask-image:linear-gradient(to bottom,#0006 0,#000 2.2em)}
-.run-thinking-preview>p>span::after{content:"";display:inline-block;width:2px;height:1.05em;margin-left:3px;vertical-align:-.18em;border-radius:1px;background:var(--think);animation:run-thinking-caret 1s steps(1) infinite}
+.run-thinking-preview[data-live]>p>span::after{content:"";display:inline-block;width:2px;height:1.05em;margin-left:3px;vertical-align:-.18em;border-radius:1px;background:var(--think);animation:run-thinking-caret 1s steps(1) infinite}
 @keyframes run-thinking-dot{0%,60%,100%{transform:none;opacity:.45}30%{transform:translateY(-3px);opacity:1}}
 @keyframes run-thinking-caret{50%{opacity:0}}
-@media (prefers-reduced-motion:reduce){.run-thinking-dots>b,.run-thinking-preview>p>span::after{animation:none}}
+@media (prefers-reduced-motion:reduce){.run-thinking-dots>b,.run-thinking-preview[data-live]>p>span::after{animation:none}}
 .native-run-status>svg,.native-run-status>time{flex-shrink:0}
 .native-run-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px 8px;margin-top:8px}
 .native-run-actions button{display:flex;flex-shrink:0;max-width:100%;min-width:0;align-items:center;gap:6px;background:transparent;border:0;min-height:32px;padding:4px 0;font-size:12px;color:var(--muted);text-align:left;white-space:normal;overflow-wrap:anywhere}
