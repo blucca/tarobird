@@ -5101,7 +5101,8 @@ name appears below the icon in its empty state. The top bar keeps tabs and
 actions together in one row; roomy docked headers retain smaller tabs.
 See [empty-state title placement](client/workbench-empty-title-2026-10-31.md).
 Empty-state creation actions wrap inside narrow panels; the product label is
-PPT (画布 / Canvas was removed in #89), with upstream skill routing unchanged. See
+演示文稿 / Presentation (画布 / Canvas was removed in #89 and the PPT label
+replaced in #90). See
 [neutral names and narrow-layout validation](client/workbench-labels-width-2026-11-04.md).
 New content sits immediately after the tabs; only the tab list scrolls, while
 the plus button stays visible. Its menu anchors below the tab group. See
@@ -5305,13 +5306,34 @@ row in Settings → Workbench files only offer export of the stored project as a
 `tests/remove-baoyu-canvas.test.ts`. Canvas statements in the two sections
 below describe earlier versions.
 
+**Presentation editor replaced (#90, 2026-11-27).** `client/vendor/baoyu-slides`
+and `skills/baoyu-ppt` are gone. `+ → 演示文稿` loads the Open Artifact slides
+editor from `client/vendor/workbench-slides`: a built bundle, pinned and hashed
+in its `UPSTREAM.json`, with `LICENSE`, `NOTICE` and our own
+`THIRD-PARTY-NOTICES.txt` beside it, all emitted to
+`dist/licenses/workbench-slides/` by `client/design-assets.ts`.
+`design-runtime.js` gives the editor its `window.openartifact` capabilities over
+the same per-tab bridge; `workbench-slides-pptx-import.ts` imports `.pptx`;
+phones and windows up to 760 px wide get a read-only preview. Storage,
+`deck.json` v4 and the `design.*` contract are unchanged, so a deck written by
+1.6.0 opens as it is; `workbench-slides-legacy.ts` folds the one 1.6.0 construct
+the new editor drops (a translate on `<x-shape>`) into the text handed to the
+editor, never into storage. Bot guidance is `workbenchPptRouting` and
+`workbenchDesignGuidance` in `src/gateway/design-guidance.ts`: no per-turn PPT
+note and no Baoyu skill. Cover `tests/workbench-presentation-routing.test.ts`,
+`client/tests/workbench-presentation-pptx.test.ts`,
+`client/tests/workbench-slides-legacy.test.ts`,
+`client/e2e/workbench-slides.spec.ts` and, with real 1.6.0 projects,
+`client/e2e/workbench-legacy-1.6.0.spec.ts`. The rest of this section records
+the Baoyu integration as it was up to 1.6.0.
+
 [The 2026-11-10 upstream refresh](client/workbench-upstream-2026-11-10.md) pins
 both editors and adapted skills to 2.12.2, keeps offline authoring and native PPT
 routing, and records editor/browser acceptance separately from installed Apps.
 
-`skills/baoyu-ppt` is a TaroBot adapter (`skills/baoyu-design` was its canvas
-counterpart until #89), with pinned
-upstream authoring references, not upstream's local-server workflow. Use it
+Until #90 `skills/baoyu-ppt` was a TaroBot adapter (`skills/baoyu-design` its
+canvas counterpart until #89), with pinned
+upstream authoring references, not upstream's local-server workflow. It was
 for explicit Baoyu PPT requests or an unambiguous continuation of the selected Baoyu
 project; ordinary PPT/design requests retain native engine skills. In particular,
 “用 Design 做 PPT” uses the engine's native presentation skill, even with a Baoyu
@@ -5323,15 +5345,15 @@ skill and distinguishes that from binary PPTX import. New tool contract v13 uses
 neutral labels; old schema digests remain exact and receive the corrected guide.
 `install-skills.sh --skill ...` copies
 references as well as SKILL.md; the Host package includes the same allowlisted
-resources. When this integration is updated, review the skill and editor assets.
-Baoyu PPT updates are not a mandatory pre-release item; see the
-2026-11-15 amendment in [the release checklist](release-checklist.md#full-release-upstream-gate).
+resources. For the present editor's place in the release rules see
+[the release checklist](release-checklist.md#full-release-upstream-gate).
 
 PPT reuses `design.*` and storage but has `format:slides`, `designFormat:slides`,
 `deck.json` v4 and slide HTML. Host `workbench.design.slides.v1` / App
 `design.slides.v1` fence old peers; new tool schema v11 preserves v1–v10 digests.
 The opener, library recovery and import preserve the requested/stored format.
-ADHD auto-opening remains disabled. `client/vendor/baoyu-slides` is pinned and
+ADHD auto-opening remains disabled. The editor bundle (`client/vendor/workbench-slides`,
+before #90 `client/vendor/baoyu-slides`) is pinned and
 patched by `design-assets.ts`; a lazy separate sandbox shares the existing opaque
 loader, virtual file bridge, CAS and quit guards. Never substitute a canvas for
 unsupported PPT or permit external network/Host paths to make upstream tools work.
