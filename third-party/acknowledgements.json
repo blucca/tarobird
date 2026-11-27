@@ -202,6 +202,17 @@
       "location": "client/vendor/workbench-slides/"
     },
     {
+      "id": "open-artifact-slides-editor-bundled",
+      "name": "Components bundled in the Open Artifact slides editor",
+      "category": "vendored",
+      "repository": "https://github.com/JimLiu/open-artifact",
+      "version": "0.14.6 (132c038529e4527d1bc30561a855ffd958aa7302)",
+      "license": "Various (MIT, ISC, OFL-1.1, MIT OR Apache-2.0; notices incomplete)",
+      "licenseFile": "client/vendor/workbench-slides/THIRD-PARTY-NOTICES.txt",
+      "usage": "Third-party code and fonts compiled into the editor bundle: React, Floating UI, zustand, clsx, Lucide, PostCSS, Nano ID, picocolors, Inter, miniz_oxide, crc32fast, smallvec; the file also lists the components whose notices are still to be added",
+      "location": "client/vendor/workbench-slides/editor/"
+    },
+    {
       "id": "deepseek-harness-plugin",
       "name": "deepseek-harness-plugin",
       "category": "vendored",

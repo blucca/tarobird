@@ -136,7 +136,8 @@ export function designAssets(): Plugin {
     generateBundle() {
       this.emitFile({ type: "asset", fileName: "design-loader.html", source: designLoaderHtml() });
       this.emitFile({ type: "asset", fileName: "slides-sandbox.html", source: buildSlides() });
-      for (const name of ["LICENSE", "NOTICE", "UPSTREAM.json"]) {
+      // THIRD-PARTY-NOTICES.txt is ours: upstream ships no notice for what its bundle compiles in.
+      for (const name of ["LICENSE", "NOTICE", "UPSTREAM.json", "THIRD-PARTY-NOTICES.txt"]) {
         this.emitFile({ type: "asset", fileName: `licenses/workbench-slides/${name}`, source: readFileSync(new URL(`./vendor/workbench-slides/${name}`, import.meta.url), "utf8") });
       }
     },

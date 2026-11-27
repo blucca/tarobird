@@ -1464,6 +1464,18 @@
           "fingerprint": "336f8bdbd0706531cd5101c4d599b46522be75cf6d81edddb9e8b20b1d878f51"
         }
       ]
+    },
+    {
+      "path": "client/vendor/workbench-slides/THIRD-PARTY-NOTICES.txt",
+      "sha256": "daddb046ce595b986fd7b32b1c1e23c13d71c672c7bf395b06cfa2f346d472c4",
+      "reviewer": "fable",
+      "note": "Reviewed the one match: the author's contact address inside the copyright line of the clsx MIT licence, reproduced verbatim from that package's own license file as the licence requires. A public licence attribution; no owner, user or deployment data.",
+      "findings": [
+        {
+          "kind": "personal-email",
+          "fingerprint": "bdf9ce3b6fad26286e88dc74fe508107913344140b3282382d6ee4c290e7175c"
+        }
+      ]
     }
   ]
 }

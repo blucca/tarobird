@@ -42,6 +42,8 @@ describe("browser Design sandbox resources", () => {
     expect(files).toContain("licenses/workbench-slides/LICENSE");
     expect(files).toContain("licenses/workbench-slides/NOTICE");
     expect(files).toContain("licenses/workbench-slides/UPSTREAM.json");
+    // Notices for what the bundle compiles in (React, Inter, the wasm crates…) travel with it.
+    expect(files).toContain("licenses/workbench-slides/THIRD-PARTY-NOTICES.txt");
     expect(files.some(name => /baoyu-(?:slides|motion|dashboard|design-system)/.test(name))).toBe(false);
   }, 30_000);
 });
