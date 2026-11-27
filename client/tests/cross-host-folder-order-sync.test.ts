@@ -137,7 +137,7 @@ vi.mock("../src/transport.js", () => ({
   },
 }));
 
-vi.mock("../src/native.js", () => ({ nativePlatform: () => "web" }));
+vi.mock("../src/native.js", () => ({ nativePlatform: () => "web", isNativeAppActive: () => true, NATIVE_ACTIVE_EVENT: "tarocub:native-active" }));
 vi.mock("../src/share-inbox.js", () => ({ syncShareUploadLimit: async () => {} }));
 
 import { ClientCache, type Identity } from "../src/storage.js";
