@@ -48,6 +48,8 @@ import {
   formatModelDisplayName,
   HelperCountArt,
   HostComputerArt,
+  inspectPendingCardMessage,
+  questionPlainSummary,
   SectionHelpButton,
   SignalBarsArt,
   signalStrength,
@@ -55,6 +57,7 @@ import {
   WorkingMotionArt,
   WorkspaceBotAvatar,
   WorkspaceFileThumbnail,
+  type PendingCardResolution,
   type WorkspaceFileKind,
 } from "./workspace-visuals.js";
 import { t, useLocale } from "./i18n.js";
@@ -135,6 +138,7 @@ function workbenchKindLabel(kind: WorkbenchLibraryEntry["kind"]): string {
 
 type WaitingApprovalItem = {
   id: string;
+  kind: "approval" | "question";
   botName: string;
   conversationId?: string;
   messageId: string;
@@ -282,9 +286,18 @@ export function ConversationWorkspace({
   const [filesHasMore, setFilesHasMore] = useState(false);
   const [workbenchItems, setWorkbenchItems] = useState<WorkbenchLibraryEntry[]>([]);
   const [refreshTick, setRefreshTick] = useState(0);
-  const [approvalActions, setApprovalActions] = useState<Record<string, string>>({});
+  const [approvalLookups, setApprovalLookups] = useState<Record<string, PendingCardResolution>>({});
   const [approvingId, setApprovingId] = useState<string | undefined>(undefined);
   const [approvalNotice, setApprovalNotice] = useState<{ id: string; text: string } | undefined>(undefined);
+  const [now, setNow] = useState(Date.now);
+  const approveRefreshTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => () => {
+    if (approveRefreshTimer.current !== undefined) {
+      window.clearTimeout(approveRefreshTimer.current);
+      approveRefreshTimer.current = undefined;
+    }
+  }, []);
 
   const online = connState.status === "online";
   const signal = signalStrength(connState.status, connState.latency);
@@ -295,6 +308,10 @@ export function ConversationWorkspace({
   const directBot = conversation.type === "direct" && convBots.length === 1 ? convBots[0] : undefined;
 
   useEffect(() => {
+    if (approveRefreshTimer.current !== undefined) {
+      window.clearTimeout(approveRefreshTimer.current);
+      approveRefreshTimer.current = undefined;
+    }
     setExpandedComms(new Set());
     setOpenHelp(undefined);
     setCommPage(0);
@@ -305,7 +322,7 @@ export function ConversationWorkspace({
     setFiles([]);
     setFilesHasMore(false);
     setWorkbenchItems([]);
-    setApprovalActions({});
+    setApprovalLookups({});
     setApprovingId(undefined);
     setApprovalNotice(undefined);
     // Another conversation may have no changes, and then no "changes" filter to switch back with.
@@ -441,16 +458,19 @@ export function ConversationWorkspace({
   const subagentTasks = useMemo(() => activeTasks.filter(task => task.kind === "subagent"), [activeTasks]);
   const otherActiveTasks = useMemo(() => activeTasks.filter(task => task.kind !== "subagent"), [activeTasks]);
 
+  const localMessagesById = useMemo(() => {
+    const map = new Map<string, Message>();
+    for (const msg of messages) {
+      if (msg.conversationId === conversation.id) map.set(msg.id, msg);
+    }
+    return map;
+  }, [messages, conversation.id]);
+
   const queuedItems = queue?.items ?? [];
   const dispatchedItems = useMemo(() => queuedItems.filter(item => item.state === "dispatched"), [queuedItems]);
-  const waitingItems = useMemo(() => queuedItems.filter(item => item.state === "queued"), [queuedItems]);
 
   // Deduplicated active replying vs waiting items (#93 coordination).
-  const replyingEntries = useMemo(() => {
-    const byId = new Map<string, Message>();
-    for (const msg of messages) {
-      if (msg.conversationId === conversation.id) byId.set(msg.id, msg);
-    }
+  const { replyingEntries, waitingItems } = useMemo(() => {
     const resolveBotName = (botId: string) => botLabels.get(botId) ?? bots.find(bot => bot.id === botId)?.name ?? botId;
     const entries: { key: string; botId: string; botName: string; text: string; startedAt?: number }[] = [];
     const coveredBots = new Set<string>();
@@ -467,9 +487,12 @@ export function ConversationWorkspace({
           msg.status !== "streaming"
         ) continue;
         activeByBot.set(msg.authorId, msg);
+        if (msg.replyTo) coveredMessages.add(msg.replyTo);
       }
       for (const [botId, reply] of activeByBot) {
-        const source = reply.replyTo ? byId.get(reply.replyTo) : undefined;
+        const source = reply.replyTo
+          ? (localMessagesById.get(reply.replyTo) ?? queuedItems.find(item => item.message.id === reply.replyTo)?.message)
+          : undefined;
         let text = previewMessage(source);
         let sourceId = source?.id ?? reply.replyTo;
         if (!text && directBot?.id === botId && dispatchedItems[0]) {
@@ -484,9 +507,9 @@ export function ConversationWorkspace({
 
     if (directBot) {
       for (const item of dispatchedItems) {
-        if (coveredBots.has(directBot.id) || coveredMessages.has(item.message.id)) continue;
-        coveredBots.add(directBot.id);
         coveredMessages.add(item.message.id);
+        if (coveredBots.has(directBot.id)) continue;
+        coveredBots.add(directBot.id);
         entries.push({
           key: `dispatched:${item.message.id}`,
           botId: directBot.id,
@@ -502,10 +525,34 @@ export function ConversationWorkspace({
         entries.push({ key: `streaming:${name}`, botId: name, botName: name, text: "" });
       }
     }
-    return entries;
-  }, [messages, conversation.id, online, botLabels, bots, directBot, dispatchedItems, streamingBots]);
+
+    const waiting = queuedItems.filter(item => item.state === "queued" && !coveredMessages.has(item.message.id));
+    return { replyingEntries: entries, waitingItems: waiting };
+  }, [messages, localMessagesById, conversation.id, online, botLabels, bots, directBot, queuedItems, dispatchedItems, streamingBots]);
+
+  const hasReplying = replyingEntries.length > 0;
+  useEffect(() => {
+    if (!hasReplying || !online) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasReplying, online]);
+  const observedNow = now + (connState.serverTimeOffset ?? 0);
 
   const commItems = comms?.items ?? [];
+
+  const resolveCommPending = useCallback((comm: BotCommItem): PendingCardResolution | undefined => {
+    const msgId = comm.pendingApproval?.messageId;
+    if (!msgId) return undefined;
+    const isIncoming = comm.direction === "incoming";
+    const approvalConvId = isIncoming ? conversation.id : comm.targetConversationId;
+    if (!approvalConvId) return undefined;
+    if (approvalConvId === conversation.id) {
+      const localMsg = localMessagesById.get(msgId);
+      return localMsg ? inspectPendingCardMessage(localMsg) : { kind: "open_only" };
+    }
+    return approvalLookups[`${approvalConvId}:${msgId}`];
+  }, [conversation.id, localMessagesById, approvalLookups]);
 
   // Pending approvals promoted to the highlighted amber Waiting for you block at the top of Overview.
   const waitingApprovals = useMemo<WaitingApprovalItem[]>(() => {
@@ -513,7 +560,7 @@ export function ConversationWorkspace({
     const seenMessages = new Set<string>();
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i]!;
-      if (msg.conversationId !== conversation.id) continue;
+      if (msg.conversationId !== conversation.id || msg.historyContext) continue;
       if (messageAttention(msg)?.kind !== "approval") continue;
       const allowActionId = findApprovalAllowAction(msg);
       const card = msg.blocks.find((b): b is Extract<Message["blocks"][number], { type: "card" }> => b.type === "card");
@@ -521,6 +568,7 @@ export function ConversationWorkspace({
       seenMessages.add(`${msg.conversationId}:${msg.id}`);
       items.push({
         id: `msg:${msg.id}`,
+        kind: "approval",
         botName: botLabels.get(msg.authorId) ?? bots.find(b => b.id === msg.authorId)?.name ?? msg.authorId,
         conversationId: msg.conversationId,
         messageId: msg.id,
@@ -533,37 +581,59 @@ export function ConversationWorkspace({
     }
     for (const comm of commItems) {
       if (comm.status !== "needs_approval" || !comm.pendingApproval) continue;
-      const msgKey = `${comm.targetConversationId ?? ""}:${comm.pendingApproval.messageId}`;
+      const isIncoming = comm.direction === "incoming";
+      const approvalConversationId = isIncoming ? conversation.id : comm.targetConversationId;
+      const msgId = comm.pendingApproval.messageId;
+      const msgKey = `${approvalConversationId ?? ""}:${msgId}`;
       if (seenMessages.has(msgKey)) continue;
+      const resolution = resolveCommPending(comm);
+      if (resolution?.kind === "excluded") continue;
       seenMessages.add(msgKey);
       items.push({
         id: `comm:${comm.id}`,
+        kind: resolution?.kind === "question" ? "question" : "approval",
         botName: comm.targetBotName,
-        conversationId: comm.targetConversationId,
-        messageId: comm.pendingApproval.messageId,
+        conversationId: approvalConversationId,
+        messageId: msgId,
         title: comm.pendingApproval.title,
         detail: comm.pendingApproval.detail,
-        allowActionId: approvalActions[msgKey],
-        canOpen: comm.canJumpToTarget && !!comm.targetConversationId,
-        isLocalMessage: false,
+        allowActionId: resolution?.kind === "approval" ? resolution.actionId : undefined,
+        canOpen: isIncoming ? true : (comm.canJumpToTarget && !!comm.targetConversationId),
+        isLocalMessage: isIncoming || approvalConversationId === conversation.id,
       });
     }
     return items;
-  }, [messages, conversation.id, botLabels, bots, commItems, approvalActions]);
+  }, [messages, conversation.id, botLabels, bots, commItems, resolveCommPending]);
 
-  // Lazily resolve direct approval button IDs for jumpable Bot-to-Bot approval items.
+  // Lazily resolve direct approval button IDs and card kinds for jumpable outgoing Bot-to-Bot items.
+  // Incoming items own their pending card in the current conversation and never fetch targetConversationId/messages.
+  const remotePendingTargets = useMemo(() => {
+    const out: { key: string; convId: string; msgId: string }[] = [];
+    const seen = new Set<string>();
+    for (const comm of commItems) {
+      if (comm.status !== "needs_approval" || comm.direction === "incoming") continue;
+      if (!comm.canJumpToTarget || !comm.targetConversationId || comm.targetConversationId === conversation.id) continue;
+      const msgId = comm.pendingApproval?.messageId;
+      if (!msgId) continue;
+      const key = `${comm.targetConversationId}:${msgId}`;
+      if (seen.has(key) || key in approvalLookups) continue;
+      seen.add(key);
+      out.push({ key, convId: comm.targetConversationId, msgId });
+    }
+    return out;
+  }, [commItems, conversation.id, approvalLookups]);
+
+  const remotePendingSignature = remotePendingTargets.map(target => target.key).join("\n");
+  const remotePendingTargetsRef = useRef(remotePendingTargets);
+  remotePendingTargetsRef.current = remotePendingTargets;
+
   useEffect(() => {
-    if (!online || connection.isReadOnly) return;
-    const missing = commItems.filter(
-      comm => comm.status === "needs_approval" && comm.canJumpToTarget && comm.targetConversationId && comm.pendingApproval?.messageId
-        && !(`${comm.targetConversationId}:${comm.pendingApproval.messageId}` in approvalActions),
-    );
-    if (!missing.length) return;
+    if (!online || !remotePendingSignature) return;
+    const targets = remotePendingTargetsRef.current;
+    if (!targets.length) return;
     const abort = new AbortController();
-    void Promise.all(missing.map(async comm => {
-      const convId = comm.targetConversationId!;
-      const msgId = comm.pendingApproval!.messageId;
-      const key = `${convId}:${msgId}`;
+    void Promise.all(targets.map(async ({ key, convId, msgId }) => {
+      let resolution: PendingCardResolution = { kind: "open_only" };
       try {
         const cached = await connection.cache.messages(convId).catch(() => []);
         let target = cached.find(m => m.id === msgId);
@@ -571,47 +641,45 @@ export function ConversationWorkspace({
           const raw = await connection.http<{ messages?: Message[] }>(`/api/conversations/${encodeURIComponent(convId)}/messages`, { signal: abort.signal });
           target = raw.messages?.find(m => m.id === msgId);
         }
-        const actionId = findApprovalAllowAction(target);
-        if (!abort.signal.aborted && actionId) {
-          setApprovalActions(prev => prev[key] === actionId ? prev : { ...prev, [key]: actionId });
-        }
-      } catch { /* fallback to Open button */ }
+        resolution = inspectPendingCardMessage(target);
+      } catch {
+        if (abort.signal.aborted) return;
+        resolution = { kind: "open_only" };
+      }
+      if (!abort.signal.aborted) {
+        setApprovalLookups(prev => key in prev ? prev : { ...prev, [key]: resolution });
+      }
     }));
     return () => abort.abort();
-  }, [online, connection, commItems, approvalActions]);
+  }, [online, connection, remotePendingSignature]);
 
   const handleApprove = async (item: WaitingApprovalItem) => {
-    if (!online || connection.isReadOnly || !item.conversationId) return;
+    if (!online || connection.isReadOnly || !item.conversationId || item.kind !== "approval" || !item.allowActionId) return;
     setApprovingId(item.id);
     setApprovalNotice(undefined);
+    let scheduled = false;
     try {
-      let actionId = item.allowActionId;
-      if (!actionId && item.canOpen) {
-        const raw = await connection.http<{ messages?: Message[] }>(`/api/conversations/${encodeURIComponent(item.conversationId)}/messages`);
-        actionId = findApprovalAllowAction(raw.messages?.find(m => m.id === item.messageId));
-      }
-      if (!actionId) {
-        if (item.canOpen) {
-          if (item.isLocalMessage) onLocateMessage(item.conversationId, item.messageId);
-          else onJumpConversation(item.conversationId, item.messageId);
-        }
-        return;
-      }
       await connection.send({
         v: 1,
         type: "interaction.submit",
         conversationId: item.conversationId,
         messageId: item.messageId,
-        actionId,
+        actionId: item.allowActionId,
         values: {},
         clientActionId: `action_${crypto.randomUUID()}`,
       });
       onRefreshComms();
-      window.setTimeout(() => onRefreshComms(), 450);
+      if (approveRefreshTimer.current !== undefined) window.clearTimeout(approveRefreshTimer.current);
+      scheduled = true;
+      approveRefreshTimer.current = window.setTimeout(() => {
+        approveRefreshTimer.current = undefined;
+        onRefreshComms();
+        setApprovingId(current => current === item.id ? undefined : current);
+      }, 450);
     } catch {
       setApprovalNotice({ id: item.id, text: t("暂时无法直接同意，点「去看看」在原对话里处理。") });
     } finally {
-      setApprovingId(current => current === item.id ? undefined : current);
+      if (!scheduled) setApprovingId(current => current === item.id ? undefined : current);
     }
   };
 
@@ -713,6 +781,8 @@ export function ConversationWorkspace({
     const expanded = expandedComms.has(item.id);
     const deliveryLabel = commDeliveryLabel(item.delivery);
     const needsApproval = item.status === "needs_approval";
+    const pendingResolution = needsApproval ? resolveCommPending(item) : undefined;
+    const isQuestion = needsApproval && pendingResolution?.kind === "question";
     const statusClass =
       item.status === "needs_approval" ? "is-needs-approval"
         : item.status === "replied" ? "is-replied"
@@ -738,7 +808,7 @@ export function ConversationWorkspace({
           </div>
           <span className={`workspace-comm-status ${statusClass}`}>
             {commStatusIcon(item.status)}
-            <span>{commStatusLabel(item.status)}</span>
+            <span>{isQuestion ? t("等你回答") : commStatusLabel(item.status)}</span>
           </span>
         </div>
         {!compact && (
@@ -762,7 +832,11 @@ export function ConversationWorkspace({
         )}
         {!compact && needsApproval && item.pendingApproval && (
           <div className="workspace-comm-alert-box">
-            <strong>{approvalPlainSummary(item.targetBotName, item.pendingApproval.title, item.pendingApproval.detail)}</strong>
+            <strong>
+              {isQuestion
+                ? questionPlainSummary(item.targetBotName, item.pendingApproval.title)
+                : approvalPlainSummary(item.targetBotName, item.pendingApproval.title, item.pendingApproval.detail)}
+            </strong>
             {item.pendingApproval.detail && <span title={item.pendingApproval.detail}>{item.pendingApproval.detail}</span>}
           </div>
         )}
@@ -805,10 +879,14 @@ export function ConversationWorkspace({
               type="button"
               className={`workspace-jump-btn${needsApproval ? " is-alert" : ""}`}
               onClick={() => {
-                onJumpConversation(item.targetConversationId!, item.pendingApproval?.messageId ?? item.targetMessageId);
+                if (needsApproval && item.pendingApproval && item.direction === "incoming") {
+                  onLocateMessage(conversation.id, item.pendingApproval.messageId);
+                } else {
+                  onJumpConversation(item.targetConversationId!, item.pendingApproval?.messageId ?? item.targetMessageId);
+                }
               }}
             >
-              <span>{needsApproval ? t("去批准") : t("去看看")}</span>
+              <span>{needsApproval ? (isQuestion ? t("去看看") : t("去批准")) : t("去看看")}</span>
               <ExternalLink size={11} aria-hidden="true"/>
             </button>
           )}
@@ -930,49 +1008,58 @@ export function ConversationWorkspace({
                   </span>
                 </div>
                 <div className="workspace-list">
-                  {waitingApprovals.slice(0, 2).map(item => (
-                    <article key={item.id} className="workspace-waiting-card">
-                      <div className="workspace-waiting-body">
-                        <WaitingHandArt />
-                        <div className="workspace-waiting-text">
-                          <strong className="workspace-waiting-title">
-                            {approvalPlainSummary(item.botName, item.title, item.detail)}
-                          </strong>
-                          {item.detail && (
-                            <span className="workspace-waiting-detail" title={item.detail}>
-                              {item.detail}
-                            </span>
-                          )}
+                  {waitingApprovals.slice(0, 2).map(item => {
+                    const canApprove = item.kind === "approval" && !!item.allowActionId;
+                    return (
+                      <article key={item.id} className="workspace-waiting-card">
+                        <div className="workspace-waiting-body">
+                          <WaitingHandArt />
+                          <div className="workspace-waiting-text">
+                            <strong className="workspace-waiting-title">
+                              {item.kind === "question"
+                                ? questionPlainSummary(item.botName, item.title)
+                                : approvalPlainSummary(item.botName, item.title, item.detail)}
+                            </strong>
+                            {item.detail && (
+                              <span className="workspace-waiting-detail" title={item.detail}>
+                                {item.detail}
+                              </span>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                      <div className="workspace-waiting-actions">
-                        <button
-                          type="button"
-                          className="workspace-approve-btn"
-                          disabled={connection.isReadOnly || !online || approvingId === item.id || (!item.canOpen && !item.allowActionId)}
-                          onClick={() => { void handleApprove(item); }}
-                        >
-                          {approvingId === item.id ? t("正在同意…") : t("同意")}
-                        </button>
-                        {item.canOpen && (
-                          <button
-                            type="button"
-                            className="workspace-open-btn"
-                            onClick={() => {
-                              if (item.isLocalMessage) onLocateMessage(item.conversationId!, item.messageId);
-                              else onJumpConversation(item.conversationId!, item.messageId);
-                            }}
-                          >
-                            <span>{t("去看看")}</span>
-                            <ExternalLink size={11} aria-hidden="true"/>
-                          </button>
+                        {(canApprove || item.canOpen) && (
+                          <div className="workspace-waiting-actions">
+                            {canApprove && (
+                              <button
+                                type="button"
+                                className="workspace-approve-btn"
+                                disabled={connection.isReadOnly || !online || approvingId === item.id}
+                                onClick={() => { void handleApprove(item); }}
+                              >
+                                {approvingId === item.id ? t("正在同意…") : t("同意")}
+                              </button>
+                            )}
+                            {item.canOpen && (
+                              <button
+                                type="button"
+                                className="workspace-open-btn"
+                                onClick={() => {
+                                  if (item.isLocalMessage) onLocateMessage(item.conversationId!, item.messageId);
+                                  else onJumpConversation(item.conversationId!, item.messageId);
+                                }}
+                              >
+                                <span>{t("去看看")}</span>
+                                <ExternalLink size={11} aria-hidden="true"/>
+                              </button>
+                            )}
+                          </div>
                         )}
-                      </div>
-                      {approvalNotice?.id === item.id && (
-                        <p className="workspace-waiting-notice" role="status">{approvalNotice.text}</p>
-                      )}
-                    </article>
-                  ))}
+                        {approvalNotice?.id === item.id && (
+                          <p className="workspace-waiting-notice" role="status">{approvalNotice.text}</p>
+                        )}
+                      </article>
+                    );
+                  })}
                   {waitingApprovals.length > 2 && (
                     <div className="workspace-more-hint">{t("还有 {0} 件事在等你同意", waitingApprovals.length - 2)}</div>
                   )}
@@ -1046,7 +1133,7 @@ export function ConversationWorkspace({
                     <span className="workspace-chip">{t("话题 · {0}", group.title)}</span>
                   )}
                 </div>
-                {contextUsage && (
+                {directBot && contextUsage && (
                   <div className="workspace-memory-row" title={t("对话记忆已用 {0}%，还剩 {1}% 可用", 100 - contextUsage.left, contextUsage.left)}>
                     <span className="workspace-memory-label">{t("记忆")}</span>
                     <span className="workspace-memory-bar" role="meter" aria-label={t("记忆空间")} aria-valuemin={0} aria-valuemax={100} aria-valuenow={contextUsage.left}>
@@ -1096,7 +1183,7 @@ export function ConversationWorkspace({
                         <span className="workspace-item-title" title={entry.text || undefined}>{entry.text || t("正在回复")}</span>
                         <span className="workspace-item-meta">
                           {entry.text ? t("正在回复 · {0}", entry.botName) : entry.botName}
-                          {entry.startedAt ? ` · ${t("已做 {0}", formatElapsedBrief(entry.startedAt))}` : ""}
+                          {entry.startedAt ? ` · ${t("已做 {0}", formatElapsedBrief(entry.startedAt, observedNow))}` : ""}
                         </span>
                       </span>
                     </div>

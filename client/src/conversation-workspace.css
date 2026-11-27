@@ -341,6 +341,11 @@
   letter-spacing: 0;
 }
 
+.ws-help-popover.is-up {
+  top: auto;
+  bottom: calc(100% + 5px);
+}
+
 .ws-help-popover-art {
   flex: none;
   display: inline-flex;
@@ -606,6 +611,8 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
+  max-width: 100%;
   font-weight: 600;
   color: var(--text);
 }

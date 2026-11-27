@@ -1,12 +1,15 @@
-import { useContext, useEffect, useId, useRef, type ReactNode } from "react";
+import { useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { HelpCircle, X } from "lucide-react";
-import type { Message } from "../../src/client-protocol/index.js";
+import type { Conversation, Message } from "../../src/client-protocol/index.js";
 import type { HubConnection } from "./connection.js";
 import { Avatar, AvatarProvider, Profiles } from "./Avatar.js";
 import { RoleStarSuppressed } from "./AgentAvatar.js";
+import { messageAttention } from "./attention.js";
 import { BotMessageHostsContext, botMessageHostId } from "./bot-message-hosts.js";
 import { useAttachment } from "./use-attachment.js";
 import { t } from "./i18n.js";
+
+const EMPTY_CONVERSATIONS: readonly Conversation[] = [];
 
 /** Format a raw model ID (e.g. "claude-sonnet-4-6") into an everyday readable label. */
 export function formatModelDisplayName(model?: string, engine?: string): string | undefined {
@@ -30,7 +33,7 @@ export function formatModelDisplayName(model?: string, engine?: string): string 
     return `Claude ${claudeOld[1]}.${claudeOld[2]} ${family}`;
   }
   if (/^claude-/i.test(cleaned)) {
-    return cleaned.split("-").map(part => part ? part[0]!.toUpperCase() + part.slice(1) : "").join(" ");
+    return cleaned.split("-").filter(Boolean).map(part => part[0]!.toUpperCase() + part.slice(1)).join(" ");
   }
   if (/^gpt-/i.test(cleaned)) {
     return cleaned
@@ -40,17 +43,16 @@ export function formatModelDisplayName(model?: string, engine?: string): string 
       .replace(/-turbo$/i, " Turbo");
   }
   if (/^gemini-/i.test(cleaned)) {
-    return cleaned.split("-").map(part => {
-      if (!part) return "";
+    return cleaned.split("-").filter(Boolean).map(part => {
       if (/^\d+(\.\d+)?$/.test(part)) return part;
       return part[0]!.toUpperCase() + part.slice(1);
     }).join(" ");
   }
   if (/^deepseek-/i.test(cleaned)) {
-    return cleaned.split("-").map(part => part.toLowerCase() === "deepseek" ? "DeepSeek" : part[0]!.toUpperCase() + part.slice(1)).join(" ");
+    return cleaned.split("-").filter(Boolean).map(part => part.toLowerCase() === "deepseek" ? "DeepSeek" : part[0]!.toUpperCase() + part.slice(1)).join(" ");
   }
   if (/^kimi-/i.test(cleaned)) {
-    return cleaned.split("-").map(part => part.toLowerCase() === "kimi" ? "Kimi" : part.toUpperCase() === part ? part : part[0]!.toUpperCase() + part.slice(1)).join(" ");
+    return cleaned.split("-").filter(Boolean).map(part => part.toLowerCase() === "kimi" ? "Kimi" : part.toUpperCase() === part ? part : part[0]!.toUpperCase() + part.slice(1)).join(" ");
   }
   return cleaned;
 }
@@ -105,39 +107,82 @@ export function approvalPlainSummary(botName: string, title?: string, detail?: s
   return t("{0} 有操作需要你点头同意", botName);
 }
 
+/** Plain-language summary of a Bot's pending question card. */
+export function questionPlainSummary(botName: string, title?: string): string {
+  const cleanTitle = title?.trim();
+  if (cleanTitle && !/^(?:问题|question)(?:\s*\d+)?$/i.test(cleanTitle)) {
+    return t("{0} 想确认「{1}」，需要你回答", botName, cleanTitle);
+  }
+  return t("{0} 有问题需要你回答", botName);
+}
+
 export function formatElapsedBrief(startedAt: number, now = Date.now()): string {
   const sec = Math.max(0, Math.floor((now - startedAt) / 1000));
   if (sec < 60) return t("{0} 秒", Math.max(1, sec));
   const min = Math.floor(sec / 60);
   if (min < 60) return t("{0} 分钟", min);
-  return t("{0} 小时", Math.floor(min / 60));
+  return t("{0}小时", Math.floor(min / 60));
 }
 
 export type WorkspaceFileKind = "doc" | "sheet" | "image" | "code" | "pdf" | "workbench" | "file";
 
 export function fileKindInfo(name: string, mime?: string): { kind: WorkspaceFileKind; ext: string; label: string; tone: string } {
-  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
-  if (ext === "pdf" || mime === "application/pdf") {
+  const filename = name.split(/[\\/]/).at(-1)?.trim() ?? "";
+  const dot = filename.lastIndexOf(".");
+  const ext = dot > 0 ? filename.slice(dot + 1).toLowerCase() : "";
+  const mediaType = (mime ?? "").split(";", 1)[0]!.trim().toLowerCase();
+
+  // Match recognized extensions before generic MIME fallbacks (e.g. text/plain on source files).
+  if (ext === "pdf") {
     return { kind: "pdf", ext: "PDF", label: t("PDF 文档"), tone: "is-pdf" };
   }
-  if (["png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "ico"].includes(ext) || mime?.startsWith("image/")) {
+  if (["png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "ico", "heic", "heif", "avif", "tif", "tiff"].includes(ext)) {
+    return { kind: "image", ext: ext.slice(0, 4).toUpperCase(), label: t("图片"), tone: "is-img" };
+  }
+  if (ext === "json") {
+    return { kind: "sheet", ext: "JSON", label: t("数据文件"), tone: "is-sheet" };
+  }
+  if (["csv", "tsv", "xlsx", "xls", "ods"].includes(ext)) {
+    return { kind: "sheet", ext: ext.slice(0, 4).toUpperCase(), label: t("表格"), tone: "is-sheet" };
+  }
+  if (["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go", "rs", "java", "kt", "swift", "c", "cc", "cpp", "h", "hpp", "css", "scss", "html", "htm", "xml", "yml", "yaml", "toml", "sh", "bash", "zsh", "sql"].includes(ext)) {
+    return { kind: "code", ext: ext.slice(0, 4).toUpperCase(), label: t("代码"), tone: "is-code" };
+  }
+  if (["md", "markdown", "txt", "log", "doc", "docx", "rtf", "odt"].includes(ext)) {
+    return { kind: "doc", ext: (ext === "markdown" ? "MD" : ext).slice(0, 4).toUpperCase(), label: t("文档"), tone: "is-md" };
+  }
+
+  // Generic MIME fallbacks for extensionless or uncommon filenames.
+  if (mediaType === "application/pdf") {
+    return { kind: "pdf", ext: "PDF", label: t("PDF 文档"), tone: "is-pdf" };
+  }
+  if (mediaType.startsWith("image/")) {
     return { kind: "image", ext: (ext || "IMG").slice(0, 4).toUpperCase(), label: t("图片"), tone: "is-img" };
   }
-  if (["csv", "tsv", "xlsx", "xls", "ods", "json"].includes(ext) || mime === "text/csv" || mime === "application/json") {
-    return { kind: "sheet", ext: ext.slice(0, 4).toUpperCase(), label: ext === "json" ? t("数据文件") : t("表格"), tone: "is-sheet" };
+  if (mediaType === "application/json") {
+    return { kind: "sheet", ext: (ext || "JSON").slice(0, 4).toUpperCase(), label: t("数据文件"), tone: "is-sheet" };
   }
-  if (["md", "markdown", "txt", "doc", "docx", "rtf"].includes(ext) || mime === "text/markdown" || mime === "text/plain") {
-    return { kind: "doc", ext: (ext === "markdown" ? "MD" : ext || "DOC").slice(0, 4).toUpperCase(), label: t("文档"), tone: "is-md" };
+  if (["text/csv", "text/tab-separated-values", "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.oasis.opendocument.spreadsheet"].includes(mediaType)) {
+    return { kind: "sheet", ext: (ext || "CSV").slice(0, 4).toUpperCase(), label: t("表格"), tone: "is-sheet" };
   }
-  if (["ts", "tsx", "mts", "js", "jsx", "mjs", "py", "go", "rs", "java", "kt", "swift", "c", "cpp", "h", "css", "scss", "html", "yml", "yaml", "toml", "sh", "sql"].includes(ext)) {
-    return { kind: "code", ext: ext.slice(0, 4).toUpperCase(), label: t("代码"), tone: "is-code" };
+  if (["text/javascript", "application/javascript", "text/html", "text/css", "application/xml", "text/xml", "application/yaml", "text/yaml"].includes(mediaType)) {
+    return { kind: "code", ext: (ext || "CODE").slice(0, 4).toUpperCase(), label: t("代码"), tone: "is-code" };
+  }
+  if (["text/markdown", "text/x-markdown", "text/plain", "application/rtf", "text/rtf"].includes(mediaType)) {
+    return { kind: "doc", ext: (ext || (mediaType.includes("markdown") ? "MD" : "DOC")).slice(0, 4).toUpperCase(), label: t("文档"), tone: "is-md" };
   }
   return { kind: "file", ext: (ext || "FILE").slice(0, 4).toUpperCase(), label: t("文件"), tone: "" };
 }
 
+export type PendingCardResolution =
+  | { kind: "approval"; actionId: string }
+  | { kind: "question" }
+  | { kind: "open_only" }
+  | { kind: "excluded" };
+
 /** Extract the direct "allow once" button actionId from an approval card message, if present. */
 export function findApprovalAllowAction(message: Message | undefined): string | undefined {
-  if (!message || message.authorType !== "bot" || message.status === "deleted" || message.status === "error") return undefined;
+  if (!message || message.authorType !== "bot" || message.forwardedFrom || message.historyContext || message.status === "deleted" || message.status === "error") return undefined;
   type CardEl = Extract<Message["blocks"][number], { type: "card" }>["elements"][number];
   const visit = (elements: CardEl[]): string | undefined => {
     for (const element of elements) {
@@ -160,6 +205,19 @@ export function findApprovalAllowAction(message: Message | undefined): string | 
     }
   }
   return undefined;
+}
+
+/** Classify a pending card message so approvals, question forms, open-only cards, and rolled-back cards are handled accurately. */
+export function inspectPendingCardMessage(message: Message | undefined): PendingCardResolution {
+  if (!message) return { kind: "open_only" };
+  if (message.historyContext || message.forwardedFrom || message.status === "deleted" || message.status === "error") {
+    return { kind: "excluded" };
+  }
+  const attention = messageAttention(message);
+  if (attention?.kind === "question") return { kind: "question" };
+  const actionId = findApprovalAllowAction(message);
+  if (actionId) return { kind: "approval", actionId };
+  return { kind: "open_only" };
 }
 
 /** Small computer illustration with integrated online indicator dot. */
@@ -304,13 +362,14 @@ export function FileTypeArt({ kind, ext }: { kind: WorkspaceFileKind; ext?: stri
   );
 }
 
-/** Real thumbnail preview for image attachments, falling back cleanly to FileTypeArt while loading or offline. */
-export function WorkspaceFileThumbnail({ connection, attachmentId, name }: { connection: HubConnection; attachmentId: string; name: string }) {
+/** Real thumbnail preview for image attachments, falling back cleanly to FileTypeArt while loading, offline, or non-decodable. */
+export function WorkspaceFileThumbnail({ connection, attachmentId, name: _name }: { connection: HubConnection; attachmentId: string; name: string }) {
   const { url } = useAttachment(connection, attachmentId, true, false);
-  if (!url) return <FileTypeArt kind="image" ext="IMG" />;
+  const [failedUrl, setFailedUrl] = useState<string>();
+  if (!url || failedUrl === url) return <FileTypeArt kind="image" ext="IMG" />;
   return (
     <span className="ws-file-thumb" aria-hidden="true">
-      <img src={url} alt="" loading="lazy" draggable={false} />
+      <img src={url} alt="" loading="lazy" draggable={false} onError={() => setFailedUrl(url)} />
     </span>
   );
 }
@@ -361,6 +420,7 @@ export function SectionHelpButton({
   description,
   art,
   open,
+  placement = "auto",
   onToggle,
   onClose,
 }: {
@@ -368,11 +428,36 @@ export function SectionHelpButton({
   description: string;
   art: ReactNode;
   open: boolean;
+  placement?: "auto" | "up" | "down";
   onToggle: () => void;
   onClose: () => void;
 }) {
   const popoverId = useId();
   const wrapRef = useRef<HTMLSpanElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const [flipUp, setFlipUp] = useState(placement === "up");
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setFlipUp(placement === "up");
+      return;
+    }
+    if (placement === "up") { setFlipUp(true); return; }
+    if (placement === "down") { setFlipUp(false); return; }
+    const wrap = wrapRef.current;
+    const pop = popoverRef.current;
+    if (!wrap || !pop) return;
+    const container = wrap.closest(".workspace-body") ?? document.documentElement;
+    const containerRect = container.getBoundingClientRect();
+    const header = wrap.closest(".workspace-section-header") ?? wrap;
+    const headerRect = header.getBoundingClientRect();
+    const popHeight = pop.getBoundingClientRect().height;
+    // Stay above the 16px bottom fade mask and scroll viewport edge.
+    const bottomSafeEdge = containerRect.bottom - 18;
+    const spaceBelow = bottomSafeEdge - (headerRect.bottom + 5);
+    const spaceAbove = (headerRect.top - 5) - containerRect.top;
+    setFlipUp(spaceBelow < popHeight && spaceAbove >= spaceBelow);
+  }, [open, placement]);
 
   useEffect(() => {
     if (!open) return;
@@ -404,7 +489,13 @@ export function SectionHelpButton({
         <HelpCircle size={12} aria-hidden="true" />
       </button>
       {open && (
-        <div id={popoverId} className="ws-help-popover" role="region" aria-label={title}>
+        <div
+          id={popoverId}
+          ref={popoverRef}
+          className={`ws-help-popover${flipUp ? " is-up" : ""}`}
+          role="region"
+          aria-label={title}
+        >
           <div className="ws-help-popover-art">{art}</div>
           <div className="ws-help-popover-body">
             <div className="ws-help-popover-head">
@@ -437,28 +528,37 @@ export function WorkspaceBotAvatar({
   const hostEntries = useContext(BotMessageHostsContext);
   const resolvedId = botId || name;
 
-  const remoteConnection = (() => {
-    if (!hostId || !profiles?.connection) return undefined;
-    const currentPub = profiles.connection.identity.hubPublicKey;
-    if (currentPub && botMessageHostId(currentPub) === hostId) return undefined;
-    const match = hostEntries.find(
-      entry => entry.host.publicKey && botMessageHostId(entry.host.publicKey) === hostId && entry.connection && !entry.host.networkBlocked && !entry.connection.isNetworkBlocked,
-    );
-    return match?.connection;
-  })();
+  const currentPub = profiles?.connection?.identity.hubPublicKey;
+  const isRemoteHost = !!hostId && !!currentPub && botMessageHostId(currentPub) !== hostId;
+  const remoteConnection = isRemoteHost
+    ? hostEntries.find(
+        entry => entry.host.publicKey && botMessageHostId(entry.host.publicKey) === hostId && entry.connection && !entry.host.networkBlocked && !entry.connection.isNetworkBlocked,
+      )?.connection
+    : undefined;
 
-  const avatar = (
+  if (remoteConnection) {
+    return (
+      <AvatarProvider connection={remoteConnection} conversations={EMPTY_CONVERSATIONS}>
+        <RoleStarSuppressed.Provider value={true}>
+          <Avatar kind="bot" id={resolvedId} name={name} size={size} />
+        </RoleStarSuppressed.Provider>
+      </AvatarProvider>
+    );
+  }
+
+  if (isRemoteHost) {
+    return (
+      <Profiles.Provider value={null}>
+        <RoleStarSuppressed.Provider value={true}>
+          <Avatar kind="bot" id={`${hostId}:${resolvedId}`} name={name} size={size} />
+        </RoleStarSuppressed.Provider>
+      </Profiles.Provider>
+    );
+  }
+
+  return (
     <RoleStarSuppressed.Provider value={true}>
       <Avatar kind="bot" id={resolvedId} name={name} size={size} />
     </RoleStarSuppressed.Provider>
   );
-
-  if (remoteConnection) {
-    return (
-      <AvatarProvider connection={remoteConnection} conversations={[]} directory={remoteConnection.state.bots}>
-        {avatar}
-      </AvatarProvider>
-    );
-  }
-  return avatar;
 }

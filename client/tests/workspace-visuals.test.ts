@@ -5,7 +5,10 @@ import {
   approvalPlainSummary,
   fileKindInfo,
   findApprovalAllowAction,
+  formatElapsedBrief,
   formatModelDisplayName,
+  inspectPendingCardMessage,
+  questionPlainSummary,
   signalStrength,
 } from "../src/workspace-visuals.js";
 
@@ -35,6 +38,37 @@ describe("workspace-visuals", () => {
     expect(formatModelDisplayName("deepseek-reasoner", "deepseek")).toBe("DeepSeek Reasoner");
     expect(formatModelDisplayName("", "claude")).toBe("Claude Code");
     expect(formatModelDisplayName("default", "codex")).toBe("Codex");
+    // Malformed trailing/consecutive hyphens must not throw.
+    expect(formatModelDisplayName("deepseek-", "deepseek")).toBe("DeepSeek");
+    expect(formatModelDisplayName("kimi--", "kimi")).toBe("Kimi");
+    expect(formatModelDisplayName("claude--", "claude")).toBe("Claude");
+    expect(formatModelDisplayName("gemini--2.5-", "pi")).toBe("Gemini 2.5");
+  });
+
+  it("formats elapsed durations compactly across seconds, minutes, and hours in zh and en", () => {
+    const start = 1_000_000;
+    useTestLocale("zh");
+    expect(formatElapsedBrief(start, start + 5_000)).toBe("5 秒");
+    expect(formatElapsedBrief(start, start + 180_000)).toBe("3 分钟");
+    expect(formatElapsedBrief(start, start + 3_600_000)).toBe("1小时");
+    expect(formatElapsedBrief(start, start + 7_200_000)).toBe("2小时");
+
+    useTestLocale("en");
+    expect(formatElapsedBrief(start, start + 5_000)).toBe("5s");
+    expect(formatElapsedBrief(start, start + 180_000)).toBe("3m");
+    expect(formatElapsedBrief(start, start + 3_600_000)).toBe("1h");
+    expect(formatElapsedBrief(start, start + 7_200_000)).toBe("2h");
+  });
+
+  it("formats pending question cards with plain question copy", () => {
+    useTestLocale("zh");
+    expect(questionPlainSummary("Researcher", "请选择部署环境")).toBe("Researcher 想确认「请选择部署环境」，需要你回答");
+    expect(questionPlainSummary("Researcher", "问题 1")).toBe("Researcher 有问题需要你回答");
+    expect(questionPlainSummary("Researcher", "")).toBe("Researcher 有问题需要你回答");
+
+    useTestLocale("en");
+    expect(questionPlainSummary("Researcher", "Target environment")).toBe("Researcher asks “Target environment” — needs your reply");
+    expect(questionPlainSummary("Researcher", "Question 1")).toBe("Researcher has a question — needs your reply");
   });
 
   it("maps connection status and latency to plain-language signal strength", () => {
@@ -78,10 +112,15 @@ describe("workspace-visuals", () => {
     expect(fileKindInfo("layout-benchmark.json", "application/json")).toMatchObject({ kind: "sheet", ext: "JSON", label: "数据文件" });
     expect(fileKindInfo("diagram.png", "image/png")).toMatchObject({ kind: "image", ext: "PNG", label: "图片" });
     expect(fileKindInfo("ConversationWorkspace.tsx")).toMatchObject({ kind: "code", ext: "TSX", label: "代码" });
+    expect(fileKindInfo("helper.tsx", "text/plain")).toMatchObject({ kind: "code", ext: "TSX", label: "代码", tone: "is-code" });
+    expect(fileKindInfo("config.yaml", "text/plain; charset=utf-8")).toMatchObject({ kind: "code", ext: "YAML", label: "代码", tone: "is-code" });
+    expect(fileKindInfo("payload", "application/json")).toMatchObject({ kind: "sheet", ext: "JSON", label: "数据文件", tone: "is-sheet" });
+    expect(fileKindInfo("export", "text/csv")).toMatchObject({ kind: "sheet", ext: "CSV", label: "表格", tone: "is-sheet" });
+    expect(fileKindInfo("notes", "text/plain")).toMatchObject({ kind: "doc", ext: "DOC", label: "文档", tone: "is-md" });
     expect(fileKindInfo("report.pdf", "application/pdf")).toMatchObject({ kind: "pdf", ext: "PDF", label: "PDF 文档" });
   });
 
-  it("extracts allow_once approval actionId from card messages", () => {
+  it("extracts allow_once approval actionId and classifies question, open-only, and history-excluded cards", () => {
     const msg: Message = {
       id: "m1",
       conversationId: "c1",
@@ -103,6 +142,44 @@ describe("workspace-visuals", () => {
       ],
     };
     expect(findApprovalAllowAction(msg)).toBe("act_allow");
+    expect(inspectPendingCardMessage(msg)).toEqual({ kind: "approval", actionId: "act_allow" });
     expect(findApprovalAllowAction({ ...msg, status: "deleted" })).toBeUndefined();
+    expect(findApprovalAllowAction({ ...msg, historyContext: { excludedBy: "op_rewind_1" } })).toBeUndefined();
+    expect(inspectPendingCardMessage({ ...msg, historyContext: { excludedBy: "op_rewind_1" } })).toEqual({ kind: "excluded" });
+
+    const questionMsg: Message = {
+      ...msg,
+      id: "m_q1",
+      blocks: [
+        {
+          type: "card",
+          title: "请选择部署环境",
+          elements: [
+            { type: "markdown", text: "请选择目标环境" },
+            { type: "button", text: "提交", actionId: "act_submit", value: { cctb_lark: "ask_user_question", requestId: "q1", action: "form_submit" } },
+          ],
+        },
+      ],
+    };
+    expect(findApprovalAllowAction(questionMsg)).toBeUndefined();
+    expect(inspectPendingCardMessage(questionMsg)).toEqual({ kind: "question" });
+
+    const noAllowOnceMsg: Message = {
+      ...msg,
+      id: "m_session_only",
+      blocks: [
+        {
+          type: "card",
+          title: "Approve command",
+          elements: [
+            { type: "button", text: "Allow session", actionId: "act_session", value: { cctb_lark: "approval", requestId: "r2", decision: "allow_session" } },
+            { type: "button", text: "Deny", actionId: "act_deny", value: { cctb_lark: "approval", requestId: "r2", decision: "deny" } },
+          ],
+        },
+      ],
+    };
+    expect(findApprovalAllowAction(noAllowOnceMsg)).toBeUndefined();
+    expect(inspectPendingCardMessage(noAllowOnceMsg)).toEqual({ kind: "open_only" });
+    expect(inspectPendingCardMessage(undefined)).toEqual({ kind: "open_only" });
   });
 });

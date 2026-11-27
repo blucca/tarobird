@@ -1,7 +1,8 @@
 // What a person saw wrong in the workspace rail on 2026-11-22, one test per thing. The states the real Host
 // cannot be driven into quickly are given as a replaced /bot-comms, /tasks or /queue answer.
 import { test, expect, type Page } from "@playwright/test";
-import { closeHub, comms, item, LONG_BOT, makeHub, mockComms, newPage, openConv, pair, setTheme, tr, type Fixture, type Locale } from "./fixtures/workspace-rail.js";
+import { randomUUID } from "node:crypto";
+import { closeHub, comms, item, LONG_BOT, LONG_TITLE_ZH, makeHub, mockComms, newPage, openConv, pair, setTheme, tr, type Fixture, type Locale } from "./fixtures/workspace-rail.js";
 
 test.use({ serviceWorkers: "block", actionTimeout: 15_000 });
 
@@ -331,5 +332,303 @@ test("Waiting for you block approves directly and Replying row deduplicates queu
     await expect(live.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["第二条：排在前面的消息"]);
     await expect(live.locator(".workspace-queue-row")).toHaveCount(1);
     await expect(live.locator(".workspace-queue-row .workspace-item-title")).toHaveText(["第三条：排在后面的消息"]);
+  } finally { await done(); }
+});
+
+test("Waiting-for-you deduplicates incoming Agent Bus approvals, skips history-excluded cards, and handles Bot-to-Bot question forms without re-fetching", async ({ browser }) => {
+  const fetches = new Map<string, number>();
+  let resQuestionConv = "";
+  const { page, f, open, done } = await ready(browser, "zh", 1280, async (page, f) => {
+    const guard = async () => undefined;
+    // Bug 3: a rolled-back (history-excluded) local approval card in mainChat must never appear in Waiting-for-you.
+    const rolledBack = await f.hub.store.publishBotMessage("bot_arch", {
+      conversationId: f.ids.main,
+      replyTo: f.ids.userMsg,
+      blocks: [{
+        type: "card",
+        title: "已回退审批",
+        elements: [
+          { type: "markdown", text: "rm -rf /tmp/old-build" },
+          { type: "button", text: "Allow once", actionId: "act_rolled_back", value: { cctb_lark: "approval", requestId: "perm-rb-1", decision: "allow_once" } },
+        ],
+      }],
+      status: "streaming",
+    });
+    const excludedMessage = { ...rolledBack, historyContext: { excludedBy: "op_rewind_1" }, version: rolledBack.version + 1 };
+    await f.hub.store.db.run(
+      "UPDATE messages SET history_json=?, version=? WHERE id=?",
+      [JSON.stringify(excludedMessage.historyContext), excludedMessage.version, rolledBack.id],
+    );
+    await f.hub.store.db.run(
+      "UPDATE events SET payload_json=? WHERE conversation_id=? AND kind='message.created' AND json_extract(payload_json,'$.id')=?",
+      [JSON.stringify(excludedMessage), f.ids.main, rolledBack.id],
+    );
+
+    // Bug 1: incoming Agent Bus stage in revConv pointing at a local approval card in revConv.
+    const now = Date.now();
+    await f.hub.store.publishBotMessage("bot_rev", {
+      conversationId: f.ids.revConv,
+      blocks: [{
+        type: "card",
+        title: "阶段命令审批",
+        elements: [
+          { type: "markdown", text: "npm run lint" },
+          { type: "button", text: "Allow once", actionId: "act_stage_allow", value: { cctb_lark: "approval", requestId: "perm-stage-1", decision: "allow_once" } },
+        ],
+      }],
+      status: "streaming",
+    });
+    const runId = `abr_${randomUUID().slice(0, 12)}`;
+    await f.hub.store.db.run(
+      "INSERT INTO agent_bus_runs(id,workspace_id,owner_id,coordinator_id,conversation_id,message_id,snapshot_json,text,status,created_at) VALUES(?,?,?,?,?,?,?,?,'running',?)",
+      [runId, "ab_ws_1", "owner", "bot_arch", f.ids.main, `msg_bus_${runId}`, JSON.stringify({ name: "发布协作" }), "协调代码评审", now - 5000],
+    );
+    await f.hub.store.db.run(
+      "INSERT INTO agent_bus_stages(run_id,id,bot_id,conversation_id,status,message_id,started_at,finished_at,error,seq) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      [runId, "stg_rev_1", "bot_rev", f.ids.revConv, "running", null, now - 4000, null, null, 1],
+    );
+
+    // Bug 2: Bot-to-Bot outgoing comm whose target card is an ask_user_question form (no allow_once).
+    const qSent = await f.hub.botMessages.local(
+      { operation: "send", host: "演示主机", bot: "bot_res", conversation: f.ids.resConv, requestId: "req-ui-q1", contextMessage: f.ids.userMsg, data: { text: "确认部署环境" } },
+      "bot_arch",
+      guard,
+    ) as { messageId: string };
+    await f.hub.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id=?", [qSent.messageId, "bot_res"]);
+    await f.hub.store.publishBotMessage("bot_res", {
+      conversationId: f.ids.resConv,
+      replyTo: qSent.messageId,
+      blocks: [{
+        type: "card",
+        title: "请选择部署环境",
+        elements: [
+          { type: "markdown", text: "选择 staging 或 production" },
+          { type: "button", text: "提交回答", actionId: "act_q_submit", value: { cctb_lark: "ask_user_question", requestId: "ask-q-1", action: "form_submit" } },
+        ],
+      }],
+      status: "streaming",
+    });
+    resQuestionConv = f.ids.resConv;
+
+    page.on("request", req => {
+      const m = req.url().match(/\/api\/conversations\/([^/?#]+)\/messages/);
+      if (m && req.method() === "GET") {
+        const id = decodeURIComponent(m[1]!);
+        fetches.set(id, (fetches.get(id) ?? 0) + 1);
+      }
+    });
+  });
+  try {
+    await open();
+    const waiting = rail(page).getByRole("region", { name: "等你确认", exact: true });
+    await expect(waiting).toBeVisible();
+    // 3 valid remote items (Researcher question + Reviewer delegation + outgoing Agent Bus stage);
+    // the rolled-back local card in mainChat is excluded (never 4!).
+    await expect(waiting.locator(".workspace-waiting-count")).toHaveText("3");
+    await expect(waiting).not.toContainText("已回退审批");
+
+    const cards = waiting.locator(".workspace-waiting-card");
+    const questionCard = cards.filter({ hasText: "请选择部署环境" });
+    await expect(questionCard).toContainText("Researcher 想确认「请选择部署环境」，需要你回答");
+    await expect(questionCard).not.toContainText("需要你同意");
+    await expect(questionCard.getByRole("button", { name: "同意", exact: true })).toHaveCount(0);
+    await expect(questionCard.getByRole("button", { name: "去看看", exact: true })).toBeVisible();
+
+    const approvalCard = cards.filter({ hasText: /npm run (test:regression|lint)/ }).first();
+    await expect(approvalCard.getByRole("button", { name: "同意", exact: true })).toBeEnabled();
+
+    // Question lookup is cached (0 if already in local cache, at most 1 HTTP fetch):
+    // refreshing workspace must never re-fetch resConv /messages.
+    const resFetchesBefore = fetches.get(resQuestionConv) ?? 0;
+    expect(resFetchesBefore).toBeLessThanOrEqual(1);
+    const refreshBtn = rail(page).getByRole("button", { name: "刷新工作区", exact: true });
+    await refreshBtn.click();
+    await expect(refreshBtn).toBeEnabled();
+    await refreshBtn.click();
+    await expect(refreshBtn).toBeEnabled();
+    await page.waitForTimeout(200);
+    expect(fetches.get(resQuestionConv) ?? 0).toBe(resFetchesBefore);
+
+    // Uncached remote lookup lacking allow_once fetches /messages exactly ONCE and caches the negative result across refreshes.
+    await mockComms(page, f.ids.empty, comms(f.ids.empty, [
+      item(1, {
+        status: "needs_approval",
+        canJumpToTarget: true,
+        targetConversationId: resQuestionConv,
+        pendingApproval: { messageId: "msg_uncached_no_allow", title: "审批确认", detail: "check target" },
+      }),
+    ]));
+    const uncachedBase = fetches.get(resQuestionConv) ?? 0;
+    await openConv(page, "空白对话");
+    await expect.poll(() => fetches.get(resQuestionConv) ?? 0).toBe(uncachedBase + 1);
+    await expect(waiting.locator(".workspace-waiting-card")).toHaveCount(1);
+    await expect(waiting.getByRole("button", { name: "同意", exact: true })).toHaveCount(0);
+    await expect(waiting.getByRole("button", { name: "去看看", exact: true })).toBeVisible();
+    await refreshBtn.click();
+    await expect(refreshBtn).toBeEnabled();
+    await refreshBtn.click();
+    await expect(refreshBtn).toBeEnabled();
+    await page.waitForTimeout(200);
+    expect(fetches.get(resQuestionConv) ?? 0).toBe(uncachedBase + 1);
+
+    // Jump back to mainChat then to revConv: 2 local approval cards + 1 incoming Agent Bus stage -> count must stay 2
+    // (no duplicate), and coordinator main/messages must never be fetched.
+    await openConv(page, f.mainTitle);
+    await expect(waiting.locator(".workspace-waiting-count")).toHaveText("3");
+    fetches.set(f.ids.main, 0);
+    await waiting.locator(".workspace-waiting-card").filter({ hasText: /npm run (test:regression|lint)/ }).first().getByRole("button", { name: "去看看", exact: true }).click();
+    await expect(waiting.locator(".workspace-waiting-count")).toHaveText("2");
+    await expect(waiting).not.toContainText("还有 1 件事在等你同意");
+    await refreshBtn.click();
+    await expect(refreshBtn).toBeEnabled();
+    await page.waitForTimeout(200);
+    expect(fetches.get(f.ids.main) ?? 0).toBe(0);
+  } finally { await done(); }
+});
+
+test("Workspace rail fixes cross-host avatar isolation, queue dedup race, long Bot truncation, bottom help popover flip, file thumbnails, and group elapsed ticking", async ({ browser }) => {
+  const png1x1 = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
+    "base64",
+  );
+  let raceMsgPayload: Record<string, unknown> | undefined;
+  const { page, f, open, done } = await ready(browser, "zh", 1280, async (page, f) => {
+    // Bug 4: upload a custom PNG avatar for local bot_arch; unpaired remote host with same botId must not show it.
+    await f.hub.store.db.run(
+      "INSERT OR REPLACE INTO profile_avatars(kind,target_id,revision,png) VALUES('bot','bot_arch',1,?)",
+      [png1x1],
+    );
+    await mockComms(page, f.ids.empty, comms(f.ids.empty, [
+      item(1, {
+        direction: "incoming",
+        crossHost: true,
+        sourceHostId: "hub_unpaired_remote_host",
+        sourceHostName: "RemoteMac",
+        sourceBotId: "bot_arch",
+        sourceBotName: "RemoteArch",
+        targetBotId: "bot_ops",
+        targetBotName: "运维小助手",
+      }),
+    ]));
+
+    // Bug 8: text/plain .tsx code file + non-decodable image attachment shared in mainChat.
+    const now = Date.now();
+    await f.hub.store.db.run(
+      "INSERT INTO attachments(id,conversation_id,owner_id,sha256,size,mime,name,stored_name,complete,created_at) VALUES(?,?,?,?,1200,'text/plain','helper.tsx','att_helper_tsx.blob',1,?)",
+      ["att_helper_tsx", f.ids.main, "owner", "c".repeat(64), now + 100],
+    );
+    await f.hub.store.db.run(
+      "INSERT INTO attachments(id,conversation_id,owner_id,sha256,size,mime,name,stored_name,complete,created_at) VALUES(?,?,?,?,2400,'image/png','broken.png','att_broken_png.blob',1,?)",
+      ["att_broken_png", f.ids.main, "owner", "d".repeat(64), now + 200],
+    );
+    await f.hub.store.publishBotMessage("bot_arch", {
+      conversationId: f.ids.main,
+      replyTo: f.ids.userMsg,
+      blocks: [
+        { type: "file", attachmentId: "att_helper_tsx", name: "helper.tsx", size: 1200, mime: "text/plain" },
+        { type: "image", attachmentId: "att_broken_png", name: "broken.png", size: 2400, mime: "image/png" },
+      ],
+      status: "complete",
+    });
+    await page.route("**/api/attachments/att_broken_png*", route => route.fulfill({
+      status: 200,
+      contentType: "image/png",
+      body: Buffer.from("not-a-valid-png"),
+    }));
+
+    // Bug 5: queue endpoint still reports state="queued" while a live streaming Bot reply for the same message exists.
+    const raceInput = (await f.hub.store.sendMessage("owner", {
+      conversationId: f.ids.main,
+      clientMsgId: "race-q-1",
+      text: "竞争条件测试消息",
+      attachments: [],
+      mentions: ["bot_arch"],
+      previewUrl: null,
+    })).message;
+    raceMsgPayload = raceInput as unknown as Record<string, unknown>;
+    await f.hub.store.publishBotMessage("bot_arch", {
+      conversationId: f.ids.main,
+      replyTo: raceInput.id,
+      blocks: [{ type: "text", text: "正在流式回复…" }],
+      status: "streaming",
+    });
+    await page.route(`**/api/conversations/${f.ids.main}/queue*`, route => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        supported: true,
+        items: [{ state: "queued", message: raceMsgPayload }],
+      }),
+    }));
+
+    // Bug 9: streaming Bot reply in group chat so elapsed duration ticks without queue polling.
+    await f.hub.store.publishBotMessage("bot_arch", {
+      conversationId: f.ids.group,
+      blocks: [{ type: "text", text: "群聊思考中…" }],
+      status: "streaming",
+    });
+  });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  try {
+    await open();
+
+    // Bug 5: message being streamed must NOT duplicate in queue rows or "接下来还有" pill.
+    const doing = rail(page).getByRole("region", { name: "现在在做", exact: true });
+    await expect(doing.locator(".workspace-replying-row .workspace-item-title")).toHaveText(["竞争条件测试消息"]);
+    await expect(doing.locator(".workspace-queue-row")).toHaveCount(0);
+    await expect(doing).not.toContainText("接下来还有");
+
+    // Bug 7: when bottom section header sits near the bottom of .workspace-body, "?" popover flips upward
+    // so nothing is clipped below .workspace-body or faded by the 16px bottom mask.
+    const madeHeaderBottom = await rail(page).evaluate(node =>
+      node.querySelector('[aria-label="做出来的东西"] .workspace-section-header')!.getBoundingClientRect().bottom,
+    );
+    await page.setViewportSize({ width: 1280, height: Math.max(620, Math.round(madeHeaderBottom + 50)) });
+    await rail(page).getByRole("button", { name: "说明：做出来的东西" }).click();
+    const popover = rail(page).locator(".ws-help-popover");
+    await expect(popover).toBeVisible();
+    await expect(popover).toHaveClass(/is-up/);
+    const popMetrics = await rail(page).evaluate(node => {
+      const body = node.querySelector(".workspace-body")!.getBoundingClientRect();
+      const pop = node.querySelector(".ws-help-popover")!.getBoundingClientRect();
+      return { bodyTop: body.top, bodyBottom: body.bottom, popTop: pop.top, popBottom: pop.bottom };
+    });
+    expect(popMetrics.popBottom).toBeLessThanOrEqual(popMetrics.bodyBottom - 16);
+    expect(popMetrics.popTop).toBeGreaterThanOrEqual(popMetrics.bodyTop);
+    await rail(page).getByRole("button", { name: "关闭说明" }).click();
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // Bug 8: helper.tsx (text/plain) classifies as code, and broken.png falls back to FileTypeArt instead of broken <img>.
+    await rail(page).getByRole("tab", { name: /^文件/ }).click();
+    const codeTile = rail(page).locator(".workspace-file-tile", { hasText: "helper.tsx" });
+    await expect(codeTile.locator(".ws-file-art.is-code")).toBeVisible();
+    await expect(codeTile).toContainText("代码");
+    const brokenTile = rail(page).locator(".workspace-file-tile", { hasText: "broken.png" });
+    await expect(brokenTile.locator(".ws-file-art.is-img")).toBeVisible();
+    await expect(brokenTile.locator(".ws-file-thumb")).toHaveCount(0);
+
+    // Bug 4: unpaired remote Bot with colliding botId="bot_arch" must not render local bot_arch's uploaded blob avatar.
+    await openConv(page, "空白对话");
+    await rail(page).getByRole("tab", { name: /^总览/ }).click();
+    const remoteAvatar = rail(page).locator('.workspace-comm-card .profile-avatar[data-avatar="bot:hub_unpaired_remote_host:bot_arch"]');
+    await expect(remoteAvatar).toBeVisible();
+    expect(await remoteAvatar.locator("img").getAttribute("src")).not.toMatch(/^blob:/);
+
+    // Bug 6: long Bot name truncates cleanly inside .workspace-env-card without horizontal overflow.
+    await openConv(page, LONG_TITLE_ZH);
+    const envOverflow = await rail(page).locator(".workspace-env-card").evaluate(card => {
+      const bot = card.querySelector(".workspace-env-bot")!.getBoundingClientRect();
+      const box = card.getBoundingClientRect();
+      return { scrollWidth: card.scrollWidth, clientWidth: card.clientWidth, botRight: bot.right, cardRight: box.right };
+    });
+    expect(envOverflow.scrollWidth).toBeLessThanOrEqual(envOverflow.clientWidth + 1);
+    expect(envOverflow.botRight).toBeLessThanOrEqual(envOverflow.cardRight + 1);
+
+    // Bug 9: group chat elapsed duration ticks live even without direct-chat queue polling.
+    await openConv(page, "发布群");
+    const groupMeta = rail(page).locator(".workspace-replying-row .workspace-item-meta").first();
+    await expect(groupMeta).toContainText(/已做 \d+ 秒/);
+    const firstText = await groupMeta.innerText();
+    await expect.poll(async () => await groupMeta.innerText(), { timeout: 4000 }).not.toBe(firstText);
   } finally { await done(); }
 });
