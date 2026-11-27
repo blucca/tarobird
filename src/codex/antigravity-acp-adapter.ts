@@ -190,6 +190,8 @@ type Worker = {
   configKey?: string;
   configOptions: ConfigSelect[];
   currentModeId?: string;
+  /** True only after the user explicitly invoked `/plan` in this live worker. */
+  planModeRequested: boolean;
   /** Created with session/new: the Host learns the native id from the first turn. */
   announceSession: boolean;
   turn: Turn | null;
@@ -385,6 +387,10 @@ function combineInstructions(primary: string | null, secondary: string | null): 
 
 function isSlashCommand(text: string): boolean {
   return /^\/[A-Za-z][\w.:-]*(?:\s|$)/.test(text.trimStart());
+}
+
+function isPlanSlashCommand(text: string): boolean {
+  return /^\/plan(?:\s|$)/i.test(text.trimStart());
 }
 
 async function attachmentBlocks(files: string[]): Promise<ContentBlock[]> {
@@ -619,8 +625,9 @@ export class AntigravityAcpAdapter implements CodexAdapter {
     const worker = await this.startedWorker(sessionId, workspace, launchKey, config.approvalMode, input.abortSignal);
     if (worker.turn || worker.reserved) throw new Error("Antigravity session already has an in-flight turn");
     worker.reserved = true;
+    const entersPlanMode = isPlanSlashCommand(input.text);
     try {
-      await this.applySessionConfig(worker, config);
+      await this.applySessionConfig(worker, config, entersPlanMode);
     } catch (error) {
       // A new conversation's process is reachable by nobody once this message fails (the Host never
       // learned its session id), and after an unanswered write the session's model or mode is unknown
@@ -699,7 +706,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       .onNotification(acpMethods.client.session.update, ({ params }) => { this.handleUpdate(worker, params); })
       .connect(stream);
     worker = {
-      child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], announceSession: false, turn: null, reserved: false, wake: null, promptSeq: 0,
+      child, connection, sessionId: null, workspacePath: workspace, launchKey, configOptions: [], planModeRequested: false, announceSession: false, turn: null, reserved: false, wake: null, promptSeq: 0,
       tools: new Map(), pendingPermissions: 0, stderrTail: "", lastActivityAt: Date.now(), removed: false, exited: false,
     };
     this.workers.set(requestedId, worker);
@@ -766,7 +773,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
   }
 
   /** Bot model/effort/mode for this session through ACP session config. */
-  private async applySessionConfig(worker: Worker, config: RuntimeConfig): Promise<void> {
+  private async applySessionConfig(worker: Worker, config: RuntimeConfig, entersPlanMode = false): Promise<void> {
     const key = JSON.stringify([config.model ?? null, config.effort ?? null]);
     const sessionId = worker.sessionId!;
     if (worker.configKey !== key) {
@@ -799,12 +806,16 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       }
       worker.configKey = key;
     }
-    // TaroBird approval settings define permissions; a plan/auto mode left on
-    // the native conversation must not silently change them.
-    if (worker.currentModeId && worker.currentModeId !== "default") {
+    // TaroBird approval settings define permissions; a stale/auto mode left on
+    // the native conversation must not silently change them. Preserve "plan"
+    // only while the user is actively inside a `/plan` flow started in this worker.
+    const keepPlanMode = worker.currentModeId === "plan" && (worker.planModeRequested || entersPlanMode);
+    if (worker.currentModeId && worker.currentModeId !== "default" && !keepPlanMode) {
       await withTimeout(worker.connection.agent.request(acpMethods.agent.session.setMode, { sessionId, modeId: "default" }), this.initializeTimeoutMs, "Antigravity ACP session/set_mode timed out");
       worker.currentModeId = "default";
+      worker.planModeRequested = false;
     }
+    if (entersPlanMode) worker.planModeRequested = true;
   }
 
   private async setConfigOption(worker: Worker, configId: string, value: string): Promise<void> {
@@ -998,6 +1009,7 @@ export class AntigravityAcpAdapter implements CodexAdapter {
       if (typeof update.used === "number" && typeof update.size === "number") worker.contextUsage = { used: update.used, size: update.size };
     } else if (kind === "current_mode_update" && typeof update.currentModeId === "string") {
       worker.currentModeId = update.currentModeId;
+      if (update.currentModeId === "default") worker.planModeRequested = false;
     } else if (kind === "config_option_update") {
       const next = readSelectOptions(update.configOptions);
       if (next.length) worker.configOptions = next;

@@ -317,6 +317,12 @@ function isNativeGoalCommand(text: string): boolean {
   return /^\/goal(?:\s|$)/i.test(text.trimStart());
 }
 
+/** Matches any native Antigravity slash command (`/swarm`, `/grill-me`, `/plan`, `/goal`, etc.)
+ * while rejecting absolute file paths such as `/workspace/src/file.ts` (second `/` before whitespace). */
+function isNativeAntigravitySlashCommand(text: string): boolean {
+  return /^\/[A-Za-z][\w.:-]*(?:\s|$)/.test(text.trimStart());
+}
+
 function buildAntigravityPrompt(input: {
   instructions: string | null;
   turnInstructions?: string;
@@ -324,12 +330,12 @@ function buildAntigravityPrompt(input: {
   files: string[];
 }): string {
   const parts: string[] = [];
-  const nativeGoal = isNativeGoalCommand(input.text);
-  if (nativeGoal) parts.push(input.text.trimStart());
+  const nativeSlash = isNativeAntigravitySlashCommand(input.text);
+  if (nativeSlash) parts.push(input.text.trimStart());
   if (input.instructions) parts.push(renderPrivateInstructions(input.instructions));
   const turnInstructions = renderPrivateTurnInstructions(input.turnInstructions);
   if (turnInstructions) parts.push(turnInstructions);
-  if (!nativeGoal) parts.push(["<user_message>", input.text, "</user_message>"].join("\n"));
+  if (!nativeSlash) parts.push(["<user_message>", input.text, "</user_message>"].join("\n"));
   if (input.files.length > 0) {
     parts.push(input.files.map((file) => `Attachment: ${file}`).join("\n"));
   }
@@ -525,18 +531,20 @@ export class ProcessAntigravityAdapter implements CodexAdapter {
 
     const workspace = input.workspaceOverride ?? this.workspacePath;
     let logicalSession = isLogicalTelegramSessionId(sessionId);
+    const nativeSlash = isNativeAntigravitySlashCommand(input.text);
     const nativeGoal = isNativeGoalCommand(input.text);
-    if (nativeGoal) {
+    if (nativeSlash) {
       const requestedGoalSessionId = sessionId;
+      const commandKind = nativeGoal ? "/goal" : "slash command";
       if (this.nativeGoalSessions.has(sessionId) || this.pendingWorkers.has(sessionId)) {
-        throw new Error("Antigravity session already has a native /goal in flight");
+        throw new Error(`Antigravity session already has a native ${commandKind} in flight`);
       }
       this.nativeGoalSessions.add(requestedGoalSessionId);
       try {
         const existing = this.workers.get(sessionId);
         if (existing && !existing.removed) {
           if (existing.pendingTurn) {
-            throw new Error("Cannot run Antigravity /goal while another turn is in flight");
+            throw new Error(`Cannot run Antigravity ${commandKind} while another turn is in flight`);
           }
           sessionId = existing.currentSessionId ?? sessionId;
           logicalSession = isLogicalTelegramSessionId(sessionId);
