@@ -415,7 +415,7 @@ describe("HubHostResources attribution, isolation, bounds, desktop detection, an
       await verifyIndexedPlan(hub);
 
       // Reopening an existing schema-26 store (e.g. upgraded from 1.6.0) automatically creates the index without bumping schema_version.
-      expect((await hub.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value).toBe("26");
+      expect((await hub.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value).toBe("27");
       await hub.store.db.exec("DROP INDEX messages_active_bot_turns");
       await hub.close();
 
@@ -428,7 +428,7 @@ describe("HubHostResources attribution, isolation, bounds, desktop detection, an
         ],
         hostResourcesBotPids: () => new Map([["bot_q", 6001]]),
       });
-      expect((await hub.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value).toBe("26");
+      expect((await hub.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key='schema_version'"))?.value).toBe("27");
       await verifyIndexedPlan(hub);
     } finally {
       await hub.close();
