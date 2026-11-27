@@ -1,20 +1,18 @@
 import type { Locale } from "../../runtime/message-renderer.js";
 
 export type AntigravitySlashCommandAction =
-  | { kind: "swarm_board" }
   | { kind: "automation"; request: string };
 
 /**
- * Recognizes Antigravity slash commands that are CLI-only or Antigravity
- * Desktop App-only and therefore cannot run natively over headless ACP/print:
- * - `/swarm board` (interactive TUI board pane; `/swarm <task>` still goes straight to `agy`)
+ * Recognizes Antigravity slash commands that are Antigravity Desktop App-only
+ * and therefore cannot run natively over headless ACP/print:
  * - `/automation` (Antigravity Desktop App-only sidecar scheduler; maps to TaroBird `/cron`)
+ *
+ * `/swarm` and `/swarm board` are handled directly by the Antigravity ACP runtime
+ * and TaroBird's in-App Swarm Board, so they are NOT intercepted here.
  */
 export function parseAntigravityLocalCommand(text: string): AntigravitySlashCommandAction | null {
   const trimmed = text.trim();
-  if (/^\/swarm(?:@[a-z0-9_.-]+)?\s+board(?:\s+[\s\S]*)?$/i.test(trimmed)) {
-    return { kind: "swarm_board" };
-  }
   const automation = trimmed.match(/^\/automation(?:@[a-z0-9_.-]+)?(?:\s+([\s\S]*))?$/i);
   if (automation) {
     return { kind: "automation", request: (automation[1] ?? "").trim() };
@@ -27,33 +25,6 @@ export async function renderAntigravityLocalCommandReply(
   locale: Locale,
 ): Promise<{ commandLabel: string; markdown: string }> {
   const english = locale === "en";
-
-  if (action.kind === "swarm_board") {
-    return {
-      commandLabel: "/swarm board",
-      markdown: english
-        ? [
-            "**Swarm board (`/swarm board`)**",
-            "",
-            "The interactive `/swarm board` view is only available in the Antigravity desktop app (Swarm pane) or CLI terminal; headless ACP sessions cannot open a TUI pane.",
-            "",
-            "- **In this chat**: ask the active swarm coordinator directly (for example: `Show the current swarm status and latest board messages`) and it will read the shared board for you.",
-            "- **Start a new swarm here**: send `/swarm <your task>`.",
-            "- **Open the interactive board locally**: run `/swarm board` in Antigravity CLI or open the Swarm pane in the Antigravity desktop app.",
-          ].join("\n")
-        : [
-            "**Swarm 消息板（`/swarm board`）**",
-            "",
-            "`/swarm board` 交互式看板仅支持 Antigravity 桌面端（Swarm 面板）或本地 CLI 终端，当前无头 ACP 会话无法直接弹出 TUI 面板。",
-            "",
-            "- **在当前对话查看**：直接回复协调者（例如：`查看当前 swarm 状态和最新消息板进展`），即可读取并汇总所有 Worker 状态。",
-            "- **在此发起新的 Swarm**：直接发送 `/swarm <任务说明>`。",
-            "- **打开交互式看板**：在本地终端的 Antigravity CLI 中运行 `/swarm board`，或在 Antigravity 桌面端打开 Swarm 面板。",
-          ].join("\n"),
-    };
-  }
-
-  // action.kind === "automation"
   const samplePrompt = action.request || (english ? "Summarize unread updates" : "汇总今日待办与进展");
   return {
     commandLabel: "/automation",

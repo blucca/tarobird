@@ -484,7 +484,7 @@ async function runAcceptedCoreMessage(
       });
       return true;
     }
-    const stopped = await stopCoreConversation(input.runtime, normalized.conversationKey, input.stateDir);
+    const stopped = await stopCoreConversation(input.runtime, normalized.conversationKey, input.stateDir, input.bridge, messageLocale);
     const { active, droppedBurst } = stopped;
     const stopText = renderCoreConversationStop(stopped, messageLocale);
     if (stopText) {
@@ -495,7 +495,7 @@ async function runAcceptedCoreMessage(
     }
     await appendCoreTimelineEvent(input.stateDir, normalized, {
       type: "command.handled",
-      outcome: active || droppedBurst ? "success" : "noop",
+      outcome: active || droppedBurst || stopped.backgroundStopped ? "success" : "noop",
       detail: "/stop",
       ...(droppedBurst ? { metadata: { cancelledPendingBurst: droppedBurst.members.length } } : {}),
     });
@@ -3118,9 +3118,15 @@ async function runNormalizedCoreMessage(
           ? "Stopping this turn does not clear a native goal. Use /goal to check it or /goal clear to remove it."
           : "停止本轮不会清除原生目标。可用 /goal 查询，或用 /goal clear 清除。"
         : "";
+      const swarmStopNote = cfg.engine === "antigravity" && /^\/swarm(?:\s|$)/i.test(normalized.text.trim())
+        ? locale === "en"
+          ? "Stopped the active swarm and ended all running workers."
+          : "已停止当前 Swarm，并结束所有运行中的 worker。"
+        : "";
+      const stopNote = [goalStopNote, swarmStopNote].filter(Boolean).join("\n\n");
       let engineFailureOutcome: "error" | "partial" = "error";
       if (terminal.kind === "interrupted") {
-        const text = goalStopNote ? [runCard?.resolveFinalText("") ?? "", goalStopNote].filter((part) => part.trim()).join("\n\n") : undefined;
+        const text = stopNote ? [runCard?.resolveFinalText("") ?? "", stopNote].filter((part) => part.trim()).join("\n\n") : undefined;
         await runCard?.interrupt(text);
       } else if (terminal.kind === "idle_timeout") {
         await runCard?.idleTimeout(terminal.minutes);
@@ -3132,7 +3138,7 @@ async function runNormalizedCoreMessage(
       if (!runCard && !(terminal.kind === "interrupted" && activeRun?.hasRunCard)) {
         await input.channel.send(normalized.chatId, {
           text: terminal.kind === "interrupted"
-            ? (goalStopNote || (locale === "en" ? "Stopped." : "已停止。"))
+            ? (stopNote || (locale === "en" ? "Stopped." : "已停止。"))
             : terminal.kind === "idle_timeout"
               ? (locale === "en"
                 ? `No response for ${terminal.minutes} minute(s); the task was auto-stopped. Restart the instance if it keeps happening.`

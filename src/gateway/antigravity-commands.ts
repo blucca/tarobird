@@ -22,8 +22,8 @@ export const ANTIGRAVITY_EXCLUDED_COMMANDS: ReadonlySet<string> = new Set([
 export const ANTIGRAVITY_APP_COMMANDS: readonly CoreSlashCommandDefinition[] = [
   command(
     "swarm",
-    "Run a multi-agent swarm coordinated on a shared message board (preview, quota-heavy)",
-    "启动多代理协同编排（共享消息板与分工核验，预览功能、额度消耗较高）",
+    "Run a multi-agent swarm coordinated on a shared message board (Preview & Quota Heavy)",
+    "启动多代理协同编排（共享消息板与分工核验，Preview & Quota Heavy · 预览 · 高配额消耗）",
   ),
   command(
     "grill-me",

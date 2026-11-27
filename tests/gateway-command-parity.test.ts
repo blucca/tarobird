@@ -150,6 +150,7 @@ it("adds curated and advertised Antigravity native commands to the App menu with
     { name: "grill-me", description: "Interview me to align on a plan." },
     { name: "compact", description: "Compact the conversation now." },
     { name: "boost", description: "Invoke the Boost orchestrator." },
+    { name: "swarm", description: "Start a multi-agent swarm (Preview & Quota Heavy)" },
     { name: "custom-skill", description: "Run a workspace-specific skill." },
   ];
   const menu = gatewayCommands("antigravity", "", native);
@@ -166,6 +167,9 @@ it("adds curated and advertised Antigravity native commands to the App menu with
       },
     },
   });
+  const swarmItem = menu.find((item) => item.command === "swarm");
+  expect(swarmItem?.description.i18n.en_us).toContain("Preview & Quota Heavy");
+  expect(swarmItem?.description.i18n.zh_cn).toContain("Preview & Quota Heavy");
   expect(menu.find((item) => item.command === "custom-skill")).toEqual({
     command: "custom-skill",
     description: { defaultValue: "Run a workspace-specific skill.", i18n: { en_us: "Run a workspace-specific skill.", zh_cn: "Run a workspace-specific skill." } },

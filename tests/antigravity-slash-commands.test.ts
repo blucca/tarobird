@@ -59,9 +59,9 @@ describe("Antigravity slash commands adaptation (#187)", () => {
     expect(renderGatewayHelp("antigravity", "en")).not.toContain("/remote-control");
   });
 
-  it("parses only /swarm board and /automation locally while letting /swarm <task> pass through", () => {
-    expect(parseAntigravityLocalCommand("/swarm board")).toEqual({ kind: "swarm_board" });
-    expect(parseAntigravityLocalCommand("/swarm board --watch")).toEqual({ kind: "swarm_board" });
+  it("parses only /automation locally while letting /swarm board and /swarm <task> pass through to the ACP swarm handler", () => {
+    expect(parseAntigravityLocalCommand("/swarm board")).toBeNull();
+    expect(parseAntigravityLocalCommand("/swarm board --watch")).toBeNull();
     expect(parseAntigravityLocalCommand("/swarm split work across packages")).toBeNull();
     expect(parseAntigravityLocalCommand("/remote-control")).toBeNull();
     expect(parseAntigravityLocalCommand("/automation")).toEqual({ kind: "automation", request: "" });
@@ -73,11 +73,14 @@ describe("Antigravity slash commands adaptation (#187)", () => {
     expect(parseAntigravityLocalCommand("/grill-me")).toBeNull();
   });
 
-  it("renders localized replies for /swarm board and /automation", async () => {
-    const boardZh = await renderAntigravityLocalCommandReply({ kind: "swarm_board" }, "zh");
-    expect(boardZh.commandLabel).toBe("/swarm board");
-    expect(boardZh.markdown).toContain("Swarm");
-    expect(boardZh.markdown).toContain("/swarm <任务说明>");
+  it("renders localized replies for /automation", async () => {
+    const autoEn = await renderAntigravityLocalCommandReply(
+      { kind: "automation", request: "Summarize CI every morning" },
+      "en",
+    );
+    expect(autoEn.commandLabel).toBe("/automation");
+    expect(autoEn.markdown).toContain("/cron add 0 9 * * * Summarize CI every morning");
+    expect(autoEn.markdown).toContain("/schedule Summarize CI every morning");
 
     const autoZh = await renderAntigravityLocalCommandReply(
       { kind: "automation", request: "每天早上9点汇总日报" },
@@ -87,7 +90,7 @@ describe("Antigravity slash commands adaptation (#187)", () => {
     expect(autoZh.markdown).toContain("/schedule 每天早上9点汇总日报");
   });
 
-  it("handles /swarm board and /automation locally on Antigravity while forwarding native commands & /goal stop cleanly", async () => {
+  it("handles /automation locally on Antigravity while forwarding /swarm board, native commands & /goal stop cleanly", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agy-slash-gw-"));
     const stateDir = path.join(root, "bot");
     await mkdir(stateDir);
@@ -133,15 +136,12 @@ describe("Antigravity slash commands adaptation (#187)", () => {
         return replies.map((m) => blocksText(m.blocks)).join("\n");
       };
 
-      const boardReply = await send("/swarm board");
-      expect(boardReply).toContain("/swarm board");
-      expect(forwarded).toHaveLength(0);
-
       const autoReply = await send("/automation 每周一检查依赖");
       expect(autoReply).toContain("/cron add 0 9 * * * 每周一检查依赖");
       expect(forwarded).toHaveLength(0);
 
-      // Native ACP commands pass through intact to the engine.
+      // Native ACP commands and `/swarm board` pass through cleanly to the engine adapter (PR #167 real Swarm board).
+      await send("/swarm board");
       await send("/swarm split across client and host");
       await send("/grill-me design the notification center");
       await send("/plan add dark mode");
@@ -151,6 +151,7 @@ describe("Antigravity slash commands adaptation (#187)", () => {
       await send("/learn capture testing rule");
       await send("/goal stop");
       expect(forwarded).toEqual([
+        "/swarm board",
         "/swarm split across client and host",
         "/grill-me design the notification center",
         "/plan add dark mode",

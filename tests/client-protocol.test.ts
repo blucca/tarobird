@@ -11,6 +11,8 @@ describe("client protocol v1 boundaries", () => {
     expect(capabilities.length).toBeLessThanOrEqual(64);
     expect(SERVER_CAPABILITIES).toContain("pi.session.v1");
     expect(CAPABILITIES).not.toContain("pi.session.v1");
+    expect(SERVER_CAPABILITIES).toContain("conversations.tasks.swarm.v1");
+    expect(CAPABILITIES).not.toContain("conversations.tasks.swarm.v1");
     expect(SERVER_CAPABILITIES).toContain(CONVERSATION_PINS_CAPABILITY);
     expect(CAPABILITIES).not.toContain(CONVERSATION_PINS_CAPABILITY);
     expect(SERVER_CAPABILITIES).toContain(CROSS_HOST_FOLDER_ORDER_CAPABILITY);

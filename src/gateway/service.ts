@@ -53,12 +53,50 @@ import { mergeTurnInstructions } from "../core/agent-instructions.js";
 import { stripAlreadyDeliveredAppArtifacts, type AppDeliveryReceipt } from "./app-delivery.js";
 import { boundedReportText, groupDiscussionInstructions, groupDiscussionReference, isGroupDiscussionPrompt, parseGroupStance } from "./group-discussion.js";
 import { createGroupDiscussionEventHandler } from "./group-discussion-output.js";
+import { antigravitySupportsSwarm, resolveAntigravityExecutable } from "../codex/antigravity-acp-support.js";
 
 export interface GatewayServiceOptions extends GatewayTransportOptions { bridge: CoreBridgeLike; recoverDeliveries?: boolean; notifyRouteAlert?: (alert: RouteAlert) => Promise<void>; requireMentionInGroup?: boolean; runtime: CoreServiceRuntime; getActiveWorkCount?: () => number }
 /** A surface adapter, not another engine/runtime. All maps, the queue, session
  * store, usage ledger, cron runtime and native session lock stay shared. */
+const SWARM_PROBE_NEGATIVE_TTL_MS = 60_000;
+const SWARM_COMMANDS_RACE_MS = 250;
+
 export async function attachGateway(options: GatewayServiceOptions): Promise<GatewayChannel> {
   const attachedAt = Date.now();
+  let swarmProbe: { executable: string; promise: Promise<boolean>; settled: boolean; result?: boolean; expiresAt?: number } | undefined;
+  const startSwarmProbe = () => {
+    const executable = resolveAntigravityExecutable(process.env);
+    const now = Date.now();
+    if (
+      swarmProbe
+      && swarmProbe.executable === executable
+      && (!swarmProbe.settled || swarmProbe.result === true || (swarmProbe.expiresAt !== undefined && swarmProbe.expiresAt > now))
+    ) {
+      return swarmProbe;
+    }
+    const entry: { executable: string; promise: Promise<boolean>; settled: boolean; result?: boolean; expiresAt?: number } = {
+      executable,
+      promise: Promise.resolve(false),
+      settled: false,
+    };
+    entry.promise = antigravitySupportsSwarm(executable, process.env)
+      .catch(() => false)
+      .then((supported) => {
+        entry.settled = true;
+        entry.result = supported;
+        if (!supported) entry.expiresAt = Date.now() + SWARM_PROBE_NEGATIVE_TTL_MS;
+        return supported;
+      });
+    swarmProbe = entry;
+    return entry;
+  };
+  if (options.engine === "antigravity") {
+    void loadInstanceConfig(options.stateDir)
+      .then((cfg) => {
+        if (cfg.engine === "antigravity" && cfg.antigravityRuntime === "acp") void startSwarmProbe();
+      })
+      .catch(() => undefined);
+  }
   const quotaEngine = quotaEngineSchema.safeParse(options.engine);
   const channel = new GatewayChannel(new GatewayTransport({ ...options, engineQuotaAccountMatch: quotaEngine.success }));
   let disconnecting = false;
@@ -325,19 +363,40 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       const conversationKey = buildCoreConversationKey(conversationId);
       // A Hub-scheduled Stop (group discussion End) names its exact input.
       if (messageId) return stopCoreRunForMessage(runtime, conversationKey, messageId);
-      const result = await stopCoreConversation(runtime, conversationKey, options.stateDir);
-      const stopped = !!result.active || !!result.droppedBurst || result.cancelledQuestions > 0;
+      const locale = await resolveCoreLocale(options.stateDir);
+      const result = await stopCoreConversation(runtime, conversationKey, options.stateDir, bridge, locale);
+      const stopped = !!result.active || !!result.droppedBurst || result.cancelledQuestions > 0 || !!result.backgroundStopped;
       await appendTimelineEventBestEffort(options.stateDir, { type: "command.handled", channel: "gateway", conversationKey,
         chatId: stableCoreNumericId(conversationKey), ...(userId ? { userId: stableCoreNumericId(`user:gwuser_${userId}`) } : {}),
-        outcome: stopped ? "success" : "noop", detail: "/stop", metadata: { source: "gateway.stop", cancelledPendingBurst: result.droppedBurst?.members.length ?? 0, cancelledQuestions: result.cancelledQuestions } });
-      const text = renderCoreConversationStop(result, await resolveCoreLocale(options.stateDir));
+        outcome: stopped ? "success" : "noop", detail: "/stop", metadata: { source: "gateway.stop", cancelledPendingBurst: result.droppedBurst?.members.length ?? 0, cancelledQuestions: result.cancelledQuestions, backgroundStopped: result.backgroundStopped } });
+      const text = renderCoreConversationStop(result, locale);
       if (text) await channel.inConversation(conversationId, () => channel.send(conversationId, { text }));
       return { stopped };
     }
     if (method === "commands") {
       const { query } = z.object({ query: z.string() }).parse(raw);
       const config = await loadInstanceConfig(options.stateDir);
-      return gatewayCommands(config.engine, query, config.engine === "antigravity" || config.engine === "omp" ? bridge.advertisedCommands?.() : undefined).map((c) => ({ command: c.command, description: c.description }));
+      let engineCommands = config.engine === "antigravity" || config.engine === "omp" ? (bridge.advertisedCommands?.() ?? []) : undefined;
+      if (config.engine === "antigravity" && config.antigravityRuntime === "acp" && !bridge.hasReceivedAdvertisedCommands?.() && (!engineCommands || engineCommands.length === 0)) {
+        const probe = startSwarmProbe();
+        let supported: boolean;
+        if (probe.settled) {
+          supported = Boolean(probe.result);
+        } else {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          supported = await Promise.race([
+            probe.promise,
+            new Promise<boolean>((resolve) => {
+              timer = setTimeout(() => resolve(false), SWARM_COMMANDS_RACE_MS);
+              timer.unref?.();
+            }),
+          ]).finally(() => { if (timer) clearTimeout(timer); });
+        }
+        if (supported) {
+          engineCommands = [{ name: "swarm", description: "Start a multi-agent swarm (Preview & Quota Heavy)" }];
+        }
+      }
+      return gatewayCommands(config.engine, query, engineCommands).map((c) => ({ command: c.command, description: c.description }));
     }
     // Local authenticated Hub only; client HTTP never accepts state paths.
     if (method === "diagnostics") return z.json().parse(await readBotDiagnostics(options.stateDir, raw));

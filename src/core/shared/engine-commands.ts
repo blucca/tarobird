@@ -25,6 +25,10 @@ function isContextCommand(text: string): boolean {
   return /^\/context(?:@\w+)?(?:\s|$)/i.test(text.trim());
 }
 
+function isSwarmCommand(text: string): boolean {
+  return /^\/swarm(?:@\w+)?(?:\s|$)/i.test(text.trim());
+}
+
 function renderContextUsage(usage: EngineContextUsage | null, locale: Locale, engineName = "DeepSeek Harness"): string {
   const used = usage?.projectedTokens ?? usage?.pressureTokens;
   const window = usage?.contextWindow;
@@ -423,6 +427,22 @@ export async function handleLocalEngineCoreCommand(input: {
       startedAt,
       command: "context",
       responseText: result.text,
+    });
+    return true;
+  }
+
+  if (isSwarmCommand(normalized.text)) {
+    if (cfg.engine !== "antigravity") return false;
+    if (cfg.antigravityRuntime === "acp") return false;
+    const msg = locale === "zh"
+      ? "当前 Antigravity Bot 运行在 print 模式，不支持 `/swarm`（仅 `agy acp` 交互运行时支持 `/swarm`）。本次未向模型发送任何内容；请新建使用 ACP 运行时的 Antigravity Bot 后重试。"
+      : "`/swarm` is not available on Antigravity's print runtime (only the `agy acp` interactive runtime supports `/swarm`). Nothing was sent to the model; create a new Antigravity Bot on the ACP runtime to use `/swarm`.";
+    await context.api.sendMessage(normalized.chatId, msg);
+    await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
+      startedAt,
+      command: "swarm",
+      responseText: msg,
+      metadata: { rejected: "print-runtime" },
     });
     return true;
   }

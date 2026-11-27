@@ -71,7 +71,7 @@ import { permissionPatchSchema, permissionResultSchema } from "../client-protoco
 import { personaPatchSchema, personaResultSchema } from "../client-protocol/persona.js";
 import { steerRequestSchema, steerResultSchema, steerStatusSchema } from "../client-protocol/steering.js";
 import { CONTEXT_USAGE_CAPABILITY, contextUsageSchema } from "../client-protocol/context-usage.js";
-import { ENGINE_TASKS_CAPABILITY, engineSessionRecoverySchema, engineTaskSnapshotSchema, engineTaskStopSchema, engineTaskControlResultSchema } from "../client-protocol/engine-tasks.js";
+import { ENGINE_TASKS_CAPABILITY, SWARM_TASKS_CAPABILITY, stripSwarmTaskFields, engineSessionRecoverySchema, engineTaskSnapshotSchema, engineTaskStopSchema, engineTaskControlResultSchema } from "../client-protocol/engine-tasks.js";
 import { PI_SESSION_CAPABILITY, piSessionChangeSchema, piSessionSnapshotSchema, piSessionResultSchema } from "../client-protocol/pi-session.js";
 import { deviceActionProofSchema } from "../client-protocol/device-actions.js";
 import { effortPatchSchema, effortResultSchema } from "../client-protocol/effort.js";
@@ -1467,7 +1467,7 @@ export class HubServer {
           const ownsConnection = () => active() && this.bots.get(botId!) === connection;
           if (!await new HubPromptQueue(this.store).registerWorker(botId, queueCapable, ownsConnection, frame) || !ownsConnection()) return;
           connection.ready = true;
-          this.send(ws, { v: 1, type: "instance.ready", ...(connection.engineQuotaAccountMatch ? { quotaProofKey: this.quotaProofKey.toString("hex") } : {}), capabilities: [CONVERSATION_HISTORY_CAPABILITY, PI_SESSION_CAPABILITY, WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, RUN_CHANGES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY] });
+          this.send(ws, { v: 1, type: "instance.ready", ...(connection.engineQuotaAccountMatch ? { quotaProofKey: this.quotaProofKey.toString("hex") } : {}), capabilities: [CONVERSATION_HISTORY_CAPABILITY, PI_SESSION_CAPABILITY, WORKBENCH_CAPABILITY, WORKBENCH_MARKDOWN_CAPABILITY, WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY, NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY, STEERING_OUTCOME_CAPABILITY, FRAGMENT_CAPABILITY, RUN_CAPABILITY, RUN_RECOVERY_CAPABILITY, RUN_SCOPES_CAPABILITY, RUN_CHANGES_CAPABILITY, BACKGROUND_TASK_GROUP_CAPABILITY, PROMPT_QUEUE_CAPABILITY, PROMPT_QUEUE_PULL_CAPABILITY, SWARM_TASKS_CAPABILITY] });
           // Never await RPC results in this socket's frame chain: its result
           // frames are handled by that same chain after hello completes.
           if (connection.history) this.trackTask(this.conversationHistory.recoverBot(botId).catch(() => this.options.onWarning?.("history_recovery_failed")));
@@ -2298,6 +2298,7 @@ export class HubServer {
         if (tasksRoute[2] && req.method !== "POST") throw new HubError("not_found", 404);
         const input = req.method === "POST" ? (tasksRoute[2] ? engineSessionRecoverySchema : engineTaskStopSchema).parse(await this.jsonBody(req, 4096)) : undefined;
         const botId = input?.botId ?? idSchema.parse(url.searchParams.get("botId"));
+        const includeSwarmTasks = !input && url.searchParams.get("swarmTasks") === "1";
         const authorize = async () => {
           await this.auth.validateSession(session);
           await serial(async () => { await this.store.requireMember(userId, conversationId); await this.store.requireBot(botId, conversationId); });
@@ -2310,7 +2311,9 @@ export class HubServer {
           ? engineTaskControlResultSchema.parse(await this.callBot(botId, "token" in input ? "tasks.recover" : "tasks.stop", { conversationId, userId, requestId: input.requestId, ...("token" in input ? { token: input.token } : { taskId: input.taskId }) }))
           : engineTaskSnapshotSchema.parse(await this.callBot(botId, "tasks.list", { conversationId }));
         await authorize();
-        await reply(200, result); return;
+        // Swarm task metadata and board snapshots go only to callers that opt in (`?swarmTasks=1`):
+        // 1.6.0 clients validate `engineTaskSchema` and `engineTaskSnapshotSchema` strictly.
+        await reply(200, input || includeSwarmTasks ? result : stripSwarmTaskFields(result as ReturnType<typeof engineTaskSnapshotSchema.parse>)); return;
       }
       const contextRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/context-usage$/);
       if (contextRoute && req.method === "GET") {
