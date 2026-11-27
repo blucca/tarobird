@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HubConnection } from "./connection.js";
 
+export const BOT_SETTINGS_REQUEST_TIMEOUT_MS = 22_000;
 type Result<T> = { connection: HubConnection; botId: string; data?: T; pending?: "read" | "save"; error?: unknown; saved?: boolean };
 /** Settings reads can be abandoned; saves retain an explicit, bounded receipt.
  * A response belongs to one connection and Bot even if membership changes while
@@ -15,7 +16,7 @@ export function useBotSettingsRequest<T>(connection: HubConnection, botId: strin
   const request = useCallback(async (method: "GET" | "PUT", body?: unknown) => {
     if (!botId || current.current?.method === "PUT") return;
     cancel();
-    const controller = new AbortController(), operation = { controller, timer: setTimeout(() => controller.abort(), 20_000), method };
+    const controller = new AbortController(), operation = { controller, timer: setTimeout(() => controller.abort(), BOT_SETTINGS_REQUEST_TIMEOUT_MS), method };
     current.current = operation;
     setResult(previous => ({ connection, botId, ...((method === "PUT" || retainReadData) && previous.connection === connection && previous.botId === botId ? { data: previous.data } : {}), pending: method === "GET" ? "read" : "save" }));
     try {
