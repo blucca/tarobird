@@ -190,18 +190,6 @@
       "location": "client/licenses/vditor/, vditor/dist/js/lute/lute.min.js"
     },
     {
-      "id": "baoyu-design",
-      "name": "baoyu-design",
-      "category": "vendored",
-      "repository": "https://github.com/JimLiu/baoyu-design",
-      "version": "2.15.2 (016a68e1b1ac1c7c291b2cb88d66ff087e50b017)",
-      "license": "Mixed (MIT / upstream notices)",
-      "licenseFile": "client/vendor/baoyu-design/LICENSE",
-      "noticeFile": "client/vendor/baoyu-design/NOTICE.md",
-      "usage": "Vendored design canvas editor, references and runtime notices",
-      "location": "client/vendor/baoyu-design/, skills/baoyu-design/"
-    },
-    {
       "id": "baoyu-slides",
       "name": "baoyu-slides",
       "category": "vendored",

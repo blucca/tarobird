@@ -40,7 +40,6 @@ plus bundled npm runtime dependencies via `npm run acknowledgements:generate`.
 | [Instrument Sans](https://github.com/Instrument/instrument-sans) | `1.x` | OFL-1.1 | `assets/product/fonts/InstrumentSans-Regular.ttf` — Sans-serif typeface used in product artwork |
 | [IBM Plex Mono](https://github.com/IBM/plex) | `1.x` | OFL-1.1 | `assets/product/fonts/IBMPlexMono-Regular.ttf` — Monospace typeface used in product artwork |
 | [Lute (bundled in Vditor)](https://github.com/88250/lute) | `vditor@4.0.1` | MulanPSL-2.0 | `client/licenses/vditor/, vditor/dist/js/lute/lute.min.js` — Markdown parsing and rendering engine bundled locally with Vditor |
-| [baoyu-design](https://github.com/JimLiu/baoyu-design) | `2.15.2 (016a68e1b1ac1c7c291b2cb88d66ff087e50b017)` | Mixed (MIT / upstream notices) | `client/vendor/baoyu-design/, skills/baoyu-design/` — Vendored design canvas editor, references and runtime notices |
 | [baoyu-slides](https://github.com/JimLiu/baoyu-design) | `2.15.2 (016a68e1b1ac1c7c291b2cb88d66ff087e50b017)` | Mixed (MIT / upstream notices) | `client/vendor/baoyu-slides/, skills/baoyu-ppt/` — Vendored slides editor, compiler and runtime notices |
 | [deepseek-harness-plugin](https://github.com/cloveric/tarobird) | `workspace` | MIT | `deepseek-harness-plugin/` — Independently published DeepSeek search MCP plugin |
 | [@anthropic-ai/claude-agent-sdk](https://code.claude.com/docs/en/legal-and-compliance) | `0.3.329` | Anthropic Terms | `dist/licenses/claude-agent-sdk/` — Bundled Claude Code history helper (not covered by AGPL-3.0-only) |
