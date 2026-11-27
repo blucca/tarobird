@@ -115,7 +115,7 @@ describe('Host rejections before dispatch are reported as not executed', () => {
       expect(receipt.hint).toBe('Do not replay with a new requestId. Reconcile the existing operation.');
     });
 
-    it('reports design_canvas_removed as not_executed with Infinite Canvas guidance both before and on channel rejection', async () => {
+    it('reports design_canvas_removed as not_executed, saying only that the canvas was removed and that the user can export, both before and on channel rejection', async () => {
       const workbench = vi.fn().mockRejectedValue(new Error('design_canvas_removed'));
       const signal = new AbortController();
       const tools = createAppPlatformTools({ channel: { sendArtifact: vi.fn(), sendArtifactBatch: vi.fn(), workbench }, stateDir: dir, conversationId: 'conv', requestOutputDir: path.join(dir, 'out'), workspaceOverride: dir, receipts: new GatewayReceipts(dir), signal: signal.signal } as never);
@@ -124,13 +124,16 @@ describe('Host rejections before dispatch are reported as not executed', () => {
       expect(workbench).not.toHaveBeenCalled();
       const localBody = JSON.parse(local.text) as { status: string; error: string; hint: string };
       expect(localBody).toMatchObject({ requestId: 'canvas-create', status: 'not_executed', error: 'design_canvas_removed' });
-      expect(localBody.hint).toContain('Infinite Canvas');
+      expect(localBody.hint).toContain('The Baoyu Design canvas has been removed from the Workbench');
+      expect(localBody.hint).toContain('can only be exported by the user, from its tab or from Settings > Workbench files');
+      // No replacement product is named: none ships with the App.
+      expect(localBody.hint).not.toMatch(/infinite canvas|extension|install/i);
       expect(localBody.hint).toContain("format:'slides'");
       expect(localBody.hint).not.toContain('Design requests use the exact payload');
 
       const remote = await report('design_canvas_removed', designRead);
       expect(remote).toMatchObject({ requestId: 'design_read_1', status: 'not_executed', error: 'design_canvas_removed' });
-      expect(remote.hint).toContain('Infinite Canvas');
+      expect(remote.hint).toBe(localBody.hint);
       expect(remote.hint).not.toContain('Reconcile');
     });
   });

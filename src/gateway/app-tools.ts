@@ -154,7 +154,7 @@ export function createAppPlatformTools(input: {
           if (!input.channel.workbench) return result({ error: "workbench_unavailable" }, true);
           const parsed = workbenchRequestSchema.omit({ contextMessageId: true }).extend({imagePath: z.string().max(4096).optional()}).safeParse(call.arguments);
           if (!parsed.success) return result({ error: "invalid_workbench_request" }, true);
-          const canvasRemovedHint = "The Baoyu Design canvas has been removed from the Workbench (design_canvas_removed). Do not retry canvas creation or opening. Explain to the user that the Baoyu Design canvas was removed and guide them to use or install the optional Infinite Canvas extension. Workbench PPT remains available with payload:{format:'slides'}. Nothing was dispatched.";
+          const canvasRemovedHint = "The Baoyu Design canvas has been removed from the Workbench (design_canvas_removed). Do not retry canvas creation or opening. Explain to the user that the Baoyu Design canvas was removed; a canvas project already saved in their App can only be exported by the user, from its tab or from Settings > Workbench files. Workbench PPT remains available with payload:{format:'slides'}. Nothing was dispatched.";
           const shapeError = workbenchRequestShapeError(parsed.data);
           if (shapeError) return result({requestId:parsed.data.requestId,status:"not_executed",error:shapeError,hint:shapeError === "invalid_workbench_source"
             ? "Unwrap the publication receipt and use its source:{messageId,blockIndex,version}; chart.update also needs previousSource. Read app_capability topic=widgets. No command or file upload was dispatched."

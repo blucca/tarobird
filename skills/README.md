@@ -42,8 +42,8 @@ This is the TaroBot adapter for the pinned slides editor (`claude-slides`). It
 operates App projects with `app_workbench` / `tarobot workbench run`; it does
 not run the upstream filesystem server. Explicit Baoyu/宝玉 PPT requests select
 it; ordinary PPT requests retain each engine's usual presentation skills. (The
-former Baoyu Design canvas editor and `baoyu-design` skill were removed in #89;
-canvas editing is handled by the optional Infinite Canvas extension.)
+former Baoyu Design canvas editor and `baoyu-design` skill were removed in #89.
+Canvas projects kept from earlier versions can only be exported in the App.)
 
 ```bash
 bash scripts/install-skills.sh --skill baoyu-ppt

@@ -14,7 +14,7 @@ import {
 } from "../src/client-protocol/workbench-design.js";
 import { workbenchReceiptSchema, type WorkbenchCommandFrame, type WorkbenchRegistration } from "../src/client-protocol/workbench.js";
 import { appTurnInstructions } from "../src/gateway/agent-instructions.js";
-import { workbenchDesignGuidance } from "../src/gateway/design-guidance.js";
+import { workbenchCanvasRemovedGuidance, workbenchDesignGuidance, workbenchPptRouting } from "../src/gateway/design-guidance.js";
 import { HubError, HubStore } from "../src/hub/store.js";
 import { WorkbenchBroker, type WorkbenchActor, type WorkbenchPeer } from "../src/hub/workbench.js";
 import { DesignShareBroker, metaDesignShareRepository, type DesignSharePeer } from "../src/hub/workbench-design-sharing.js";
@@ -72,7 +72,9 @@ describe("Remove Baoyu Design canvas from Workbench (#89)", () => {
   it("injects canvas-removal Bot guidance on canvas-only prompts and keeps PPT guidance intact", () => {
     expect(workbenchDesignGuidance).not.toContain("format:'canvas'");
     expect(workbenchDesignGuidance).not.toContain(".dc.html");
-    expect(workbenchDesignGuidance).toContain("Infinite Canvas");
+    // Says the canvas was removed and that the user can export a saved project; names no replacement product.
+    expect(workbenchDesignGuidance).toContain("explain that the Baoyu Design canvas has been removed; a canvas project already saved in their App can only be exported by the user");
+    for (const text of [workbenchDesignGuidance, workbenchPptRouting, workbenchCanvasRemovedGuidance]) expect(text).not.toMatch(/infinite canvas|extension/i);
     expect(workbenchDesignGuidance).toContain("format:'slides'");
     for (const prompt of [
       "请用 Baoyu Design 做一个画布",
@@ -83,7 +85,9 @@ describe("Remove Baoyu Design canvas from Workbench (#89)", () => {
     ]) {
       const turn = appTurnInstructions(prompt, { engine: "codex", nativeDelivery: true, nativeWidgets: true });
       expect(turn, prompt).toBeDefined();
-      expect(turn, prompt).toContain("Infinite Canvas");
+      expect(turn, prompt).toContain("tell them the Baoyu Design canvas has been removed from the Workbench.");
+      expect(turn, prompt).toContain("the user can export it in the App, from that project's tab or from Settings > Workbench files");
+      expect(turn, prompt).not.toMatch(/infinite canvas|extension/i);
       expect(turn, prompt).toContain("design_canvas_removed");
       expect(turn, prompt).not.toContain("PPT selection:");
     }

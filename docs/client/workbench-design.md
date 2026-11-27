@@ -1,6 +1,6 @@
 # 工作台「PPT」（原 Baoyu Design 画布已移除）
 
-> **变更说明（#89）**：Baoyu Design 画布编辑器（`claude-design`、`client/vendor/baoyu-design`、`skills/baoyu-design`）已从工作台移除；画布需求交由可选的「无限画布」扩展承接。当前工作台保留幻灯片编辑器（`+ → PPT`，`client/vendor/baoyu-slides`、`skills/baoyu-ppt`），`design.open` / `design.create` 仅接受 `format: "slides"`，画布请求返回 `design_canvas_removed`。PPT 能力由 `workbench.design.slides.v1` / `design.slides.v1` 承载；为保持与 v1.6.0 旧版 App/Host/Gateway 的 PPT 跨版本互操作，Host 在兼容周期内继续声明 `workbench.design.v1`（App 仅在 Host 同时声明两者时附带声明 `design.v1`），并统一在派发前拒绝所有画布操作。
+> **变更说明（#89）**：Baoyu Design 画布编辑器（`claude-design`、`client/vendor/baoyu-design`、`skills/baoyu-design`）已从工作台移除，没有替代的画布编辑器。1.6.0 及更早版本留在本机的画布项目不再打开、编辑、导入、共享或交给 Bot 读写，只能导出或删除：画布标签页显示「导出项目」，「设置 → 工作台文件」中该项目一行显示「导出」，两处都保存与「备份 PPT 项目」相同格式的 `.tarobot-design.json`（1.6.0 及更早版本可以导入它，本版本不能）。当前工作台保留幻灯片编辑器（`+ → PPT`，`client/vendor/baoyu-slides`、`skills/baoyu-ppt`），`design.open` / `design.create` 仅接受 `format: "slides"`，画布请求返回 `design_canvas_removed`。PPT 能力由 `workbench.design.slides.v1` / `design.slides.v1` 承载；为保持与 v1.6.0 旧版 App/Host/Gateway 的 PPT 跨版本互操作，Host 在兼容周期内继续声明 `workbench.design.v1`（App 仅在 Host 同时声明两者时附带声明 `design.v1`），并统一在派发前拒绝所有画布操作。
 
 工作台的 `+ → PPT` 使用 [Jim Liu / baoyu-design](https://github.com/JimLiu/baoyu-design)
 的 claude-slides 幻灯片编辑器，支持编辑幻灯片、文字、布局和素材；可以让当前对话里的 Bot
@@ -32,7 +32,7 @@
 `applied + saved:true` 只证明保存，不能代替画面渲染或真机验收。
 
 旧原生工具线程保持历史摘要；新线程使用当前合同。`design.open/create` 仅接受 `format:slides`，需要 Host 的 `workbench.design.slides.v1` 和 App 的 `design.slides.v1`，缺少 `format` 或传入 `format:canvas` 均返回 `design_canvas_removed`。旧线程可使用当前回合 CLI。
-明确说「用 Baoyu PPT」选择 `baoyu-ppt` 技能；普通 PPT 请求仍使用引擎原有技能；用户明确要求用 Baoyu Design 做画布时提示已移除并引导使用「无限画布」扩展。ADHD 不自动展开。见[技能与 PPT 接入记录](baoyu-design-ppt-skills-2026-11-03.md)。
+明确说「用 Baoyu PPT」选择 `baoyu-ppt` 技能；普通 PPT 请求仍使用引擎原有技能；用户明确要求用 Baoyu Design 做画布时，Bot 只说明画布已移除、已有项目可由用户在 App 中导出，不推荐其他产品。ADHD 不自动展开。见[技能与 PPT 接入记录](baoyu-design-ppt-skills-2026-11-03.md)。
 设计文件路径是 App 内容命名空间，不是 Host 文件路径，也不给 Bot 新增系统权限。
 
 ## 安全和生命周期
