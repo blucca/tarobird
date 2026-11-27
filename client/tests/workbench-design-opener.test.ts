@@ -7,7 +7,7 @@ const deferred = () => { let resolve!: () => void; const promise = new Promise<v
 function fixture() {
   const sent: any[] = [], changes = new Set<() => void>(), commands = new Set<(frame: any) => void>();
   const registrations = new Map<string, WorkbenchRegistration>();
-  let eligible = true, gate: Promise<unknown> | undefined;
+  let eligible = true, gate: Promise<unknown> | undefined, targetsGate: Promise<unknown> | undefined, failTargets = false;
   const state = { status: "online", user: { id: "owner" }, workbenchDesignOpenAvailable: true };
   const connection = {
     state, identity: { deviceId: "phone", hubPublicKey: "host" }, sessionEpoch: 1, isClosed: false, isReadOnly: false,
@@ -20,7 +20,11 @@ function fixture() {
       if (frame.type === "workbench.unregister") registrations.delete(frame.windowId);
     }),
     http: vi.fn(async (url: string, options?: any) => {
-      if (url.endsWith("/targets")) return [...registrations.values()].map(value => ({ ...value, deviceId: "phone" }));
+      if (url.endsWith("/targets")) {
+        await targetsGate;
+        if (failTargets) throw new Error("targets_unavailable");
+        return [...registrations.values()].map(value => ({ ...value, deviceId: "phone" }));
+      }
       if (url === "/api/workbench/admit") {
         await gate;
         const id = JSON.parse(options.body).dispatchId, frame = issued.get(id)!;
@@ -40,8 +44,13 @@ function fixture() {
     userId: "owner", conversationId: "chat", generation: endpoint.generation, target: { deviceId: "phone", windowId: endpoint.windowId },
     request: { requestId: id, operation: "design.open", payload: {} }, ...overrides });
   const emit = (value: any) => { if (value.type === "workbench.command") issued.set(value.dispatchId, value); for (const listener of commands) listener(value); };
+  const emitChange = () => { for (const listener of changes) listener(); };
   const receipt = (id: string) => sent.find(value => value.type === "workbench.receipt" && value.dispatchId === id)?.receipt;
-  return { connection, endpoint, frame, emit, receipt, open, sent, real, gate: (value: Promise<unknown>) => { gate = value; }, leave: () => { eligible = false; } };
+  return { connection, endpoint, frame, emit, emitChange, receipt, open, sent, real,
+    gate: (value: Promise<unknown>) => { gate = value; },
+    targetsGate: (value: Promise<unknown> | undefined) => { targetsGate = value; },
+    setFailTargets: (value: boolean) => { failTargets = value; },
+    leave: () => { eligible = false; } };
 }
 
 describe("the lightweight Design opener", () => {
@@ -117,5 +126,86 @@ describe("the lightweight Design opener", () => {
     const endpoint = new WorkbenchDesignOpener(f.connection as unknown as HubConnection, "chat", { eligible: () => true, open: f.open });
     try { expect(endpoint.windowId).not.toBe(old.target.windowId); f.emit(old); await Promise.resolve(); expect(f.open).not.toHaveBeenCalled(); }
     finally { endpoint.dispose(); }
+  });
+  it("contextSnapshot never blocks on pending registration and attaches openTarget immediately once confirmed", async () => {
+    const pendingTargets = deferred();
+    const f = fixture();
+    f.targetsGate(pendingTargets.promise);
+    f.endpoint.dispose();
+    f.sent.length = 0;
+    f.connection.http.mockClear();
+    const endpoint = new WorkbenchDesignOpener(f.connection as unknown as HubConnection, "chat", { eligible: () => true, open: f.open });
+    const existing = { target: { deviceId: "phone", windowId: "real", tabId: "design" }, kind: "design" as const, revision: 3 };
+    try {
+      expect(endpoint.contextSnapshot()).toBeUndefined();
+      expect(endpoint.contextSnapshot(existing)).toEqual(existing);
+      // Repeated snapshot calls while registration is in flight do not start duplicate registrations.
+      expect(f.sent.filter(value => value.type === "workbench.register")).toHaveLength(1);
+      pendingTargets.resolve();
+      await vi.waitFor(() => expect(endpoint.contextSnapshot()).toEqual({
+        target: { deviceId: "phone", windowId: endpoint.windowId },
+        openTarget: { deviceId: "phone", windowId: endpoint.windowId },
+      }));
+      expect(endpoint.contextSnapshot(existing)).toMatchObject({ ...existing, openTarget: { deviceId: "phone", windowId: endpoint.windowId } });
+      expect(f.connection.http).toHaveBeenCalledTimes(1);
+    } finally { pendingTargets.resolve(); endpoint.dispose(); }
+  });
+  it("contextSnapshot retries failed background registration without stalling and respects epoch and revoke resets", async () => {
+    const f = fixture();
+    f.setFailTargets(true);
+    try {
+      await vi.waitFor(() => expect(f.connection.http).toHaveBeenCalledTimes(1));
+      // Failed background registration clears cleanly; next snapshot kicks off a retry without blocking.
+      expect(f.endpoint.contextSnapshot()).toBeUndefined();
+      f.setFailTargets(false);
+      await vi.waitFor(() => expect(f.endpoint.contextSnapshot()).toMatchObject({
+        openTarget: { deviceId: "phone", windowId: f.endpoint.windowId },
+      }));
+
+      // Reconnect (sessionEpoch bump) resets confirmation and starts background registration for the new epoch.
+      const epoch2Gate = deferred();
+      f.targetsGate(epoch2Gate.promise);
+      f.connection.sessionEpoch = 2;
+      f.emitChange();
+      expect(f.endpoint.contextSnapshot()).toBeUndefined();
+      epoch2Gate.resolve();
+      await vi.waitFor(() => expect(f.endpoint.contextSnapshot()).toMatchObject({
+        openTarget: { deviceId: "phone", windowId: f.endpoint.windowId },
+      }));
+
+      // Revoke/dispose immediately withdraws the opener without blocking or re-registering.
+      const existing = { target: { deviceId: "phone", windowId: "real", tabId: "design" }, kind: "design" as const, revision: 3 };
+      f.endpoint.dispose();
+      expect(f.endpoint.contextSnapshot()).toBeUndefined();
+      expect(f.endpoint.contextSnapshot(existing)).toEqual(existing);
+    } finally { f.endpoint.dispose(); }
+  });
+  it("contextSnapshot omits openTarget while /targets retries after a WS-vs-HTTP race, then attaches once confirmed", async () => {
+    const f = fixture();
+    f.endpoint.dispose();
+    f.sent.length = 0;
+    f.connection.http.mockClear();
+    let targetPolls = 0;
+    const secondPollGate = deferred();
+    const originalHttp = f.connection.http.getMockImplementation()!;
+    f.connection.http.mockImplementation(async (url: string, options?: any) => {
+      if (url.endsWith("/targets")) {
+        targetPolls++;
+        if (targetPolls === 1) return [];
+        await secondPollGate.promise;
+      }
+      return originalHttp(url, options);
+    });
+    const endpoint = new WorkbenchDesignOpener(f.connection as unknown as HubConnection, "chat", { eligible: () => true, open: f.open });
+    try {
+      await vi.waitFor(() => expect(targetPolls).toBe(2));
+      expect(endpoint.contextSnapshot()).toBeUndefined();
+      expect(f.sent.filter(value => value.type === "workbench.register")).toHaveLength(1);
+      secondPollGate.resolve();
+      await vi.waitFor(() => expect(endpoint.contextSnapshot()).toEqual({
+        target: { deviceId: "phone", windowId: endpoint.windowId },
+        openTarget: { deviceId: "phone", windowId: endpoint.windowId },
+      }));
+    } finally { secondPollGate.resolve(); endpoint.dispose(); }
   });
 });

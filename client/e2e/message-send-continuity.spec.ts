@@ -102,7 +102,13 @@ for (const scenario of ["queued", "history-first", "hidden", "prior-cache-delete
     const representation = page.locator(".queued-message, .message.user").filter({ hasText: text });
     await expect(representation).toHaveCount(1);
     await expect(representation).toBeInViewport();
-    await expect(representation).toContainText("已发送");
+    if (scenario === "hidden" && width > 760) {
+      // Returning from another conversation on desktop reopens this history
+      // from the in-memory copy, which already holds the accepted message: it
+      // is a normal bubble at once, and no "已发送" row is drawn beside it.
+      await expect(page.locator(".message.user").filter({ hasText: text })).toHaveCount(1);
+      await expect(page.locator(".queued-message").filter({ hasText: text })).toHaveCount(0);
+    } else await expect(representation).toContainText("已发送");
     await page.screenshot({ path: info.outputPath(`accepted-but-history-held-${width}.png`) });
     await page.evaluate(() => (window as any).sendContinuityFixture.release());
     await expect(page.locator(".message.user").filter({ hasText: scenario === "forward" ? "TRIGGER_HISTORY_READ" : text })).toBeVisible();

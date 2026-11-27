@@ -622,9 +622,10 @@ describe("opt-in send timing probe", () => {
     setSendTimingTestHook(true);
     const failed = beginSendTiming({ conversationId: "c_virt", kind: "direct", engine: "pi", messageLength: 4 })!;
     failed.fail(new Error("offline"));
-    failed.fail("ignored_second_error");
+    failed.fail("conversation_changed");
     expect(hasActiveSendTiming()).toBe(false);
-    expect(getSendTimingRecords()[0]!.error).toBe("offline");
+    // The first failure wins, and an error is recorded by class name only.
+    expect(getSendTimingRecords()[0]!.error).toBe("Error");
 
     const virt = beginSendTiming({ conversationId: "c_virt", kind: "direct", engine: "codex", messageLength: 6 })!;
     virt.setRoute("queue");
@@ -647,5 +648,46 @@ describe("opt-in send timing probe", () => {
     expect(hasPendingBubbleTiming("c_virt", "main")).toBe(false);
     expect(hasActiveSendTiming()).toBe(false);
     expect(getSendTimingRecords()[1]!.bubbleVisibleAt).toBeDefined();
+  });
+
+  it("keeps a fixed code for a failed send and never the text of its error", () => {
+    setSendTimingTestHook(true);
+    const typedMention = "秘密项目代号";
+    const typedFileName = "private-salary-review-2026.pdf";
+    const fail = (reason: unknown) => {
+      const trace = beginSendTiming({ conversationId: "c_fail", kind: "group", engine: "group", messageLength: 24, matchText: `@${typedMention} hello` })!;
+      trace.fail(reason);
+      return getSendTimingRecords().at(-1)!.error;
+    };
+
+    // The two error texts that quote the user: an unresolved @name of a group
+    // draft, and the name of an attachment over the size limit.
+    expect(fail(new Error(`无法识别提及：@${typedMention}。请从 @ 候选中选择具体的 Bot。`))).toBe("Error");
+    expect(fail(new Error(`${typedFileName} 超过单个附件上限 20 MiB，请选择较小文件或调整 Hub 设置。`))).toBe("Error");
+    // The same text given as a plain string is not a listed code either.
+    expect(fail(`${typedFileName} 超过单个附件上限 20 MiB，请选择较小文件或调整 Hub 设置。`)).toBe("failed");
+    expect(fail(typedMention)).toBe("failed");
+    expect(fail("toString")).toBe("failed");
+
+    // An error keeps its class name; a name that is not a plain identifier does not pass.
+    class SteeringNotDeliveredError extends Error { override name = "SteeringNotDeliveredError"; }
+    expect(fail(new SteeringNotDeliveredError(`@${typedMention}`))).toBe("SteeringNotDeliveredError");
+    expect(fail(new DOMException(typedFileName, "AbortError"))).toBe("AbortError");
+    expect(fail(Object.assign(new Error("x"), { name: `@${typedMention} ${typedFileName}` }))).toBe("Error");
+
+    // Codes chosen at a call site, and the Host's side-conversation codes, are kept as given.
+    for (const code of ["aborted", "conversation_changed", "local_command", "stale_generation", "file_rejected", "busy", "attachment_too_large"]) {
+      expect(fail(code)).toBe(code);
+    }
+    expect(fail(undefined)).toBe("aborted");
+    expect(fail({ message: typedMention })).toBe("aborted");
+
+    // Nothing reachable from the window object carries the typed text.
+    const api = (globalThis as { __tarobirdSendTiming?: SendTimingDebugApi }).__tarobirdSendTiming!;
+    const exposed = JSON.stringify({ records: api.records, latest: api.latest() });
+    expect(api.records).toHaveLength(17);
+    expect(exposed).not.toContain(typedMention);
+    expect(exposed).not.toContain(typedFileName);
+    expect(exposed).not.toContain("超过单个附件上限");
   });
 });
