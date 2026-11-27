@@ -178,3 +178,23 @@ test('side width minimum is scaled, monitor bounded, and restored on close or do
   await service.request('desktop_window_side_minimum',{width:2400},()=>true);service.retire();assert.deepEqual(minimum,[600,480]);
   service.dispose();assert.equal(calls.length,5);
 });
+
+test('desktop_network_settings opens the allowlisted Windows network status URI only on win32', async () => {
+  const window = new EventEmitter(), opened = [];
+  Object.assign(window, { isDestroyed: () => false, webContents: { send() {} } });
+  const electron = { shell: { openExternal: async url => { opened.push(url); } } };
+  assert.doesNotThrow(() => validateViewRequest({ command: 'desktop_network_settings', args: {} }, { controller: true }));
+  assert.throws(() => validateViewRequest({ command: 'desktop_network_settings', args: {} }), /native_controller_required/);
+  const service = new DesktopServices(window, electron, { platform: 'win32' });
+  try {
+    assert.equal(await service.request('desktop_network_settings', {}, () => true), null);
+    assert.deepEqual(opened, ['ms-settings:network-status']);
+    await assert.rejects(service.request('desktop_network_settings', { url: 'ms-settings:network-status' }, () => true), /invalid_desktop_args/);
+    await assert.rejects(service.request('desktop_network_settings', {}, () => false), /native_document_retired/);
+    for (const platform of ['darwin', 'linux']) {
+      service.platform = platform;
+      await assert.rejects(service.request('desktop_network_settings', {}, () => true), /network_settings_unavailable/);
+    }
+    assert.deepEqual(opened, ['ms-settings:network-status']);
+  } finally { service.dispose(); }
+});

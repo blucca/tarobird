@@ -12,6 +12,7 @@
   <a href="https://github.com/cloveric/tarobird/releases/latest"><b>Download</b></a> &nbsp;·&nbsp;
   <a href="https://apps.apple.com/app/tarobird/id6828071641"><b>iOS App Store</b></a> &nbsp;·&nbsp;
   <a href="https://testflight.apple.com/join/ByFWEfFW"><b>iOS TestFlight beta</b></a> &nbsp;·&nbsp;
+  <a href="docs/client/web-client.md"><b>Web</b></a> &nbsp;·&nbsp;
   <a href="#quick-start"><b>Quick start</b></a> &nbsp;·&nbsp;
   <a href="#connection-options">Connection options</a> &nbsp;·&nbsp;
   <a href="docs/details.md">Details</a> &nbsp;·&nbsp;
@@ -117,7 +118,7 @@ TaroBird is a self-hosted workspace for AI agents. It brings command-line agents
 </p>
 <p align="center"><sub>App permission UI in 1.2.0 · Real settings and signed authorization with disposable hosts and fictional data; no model ran · Also available through <a href="docs/details.md#bot-to-bot-tasks-across-hosts">CLI authorization</a></sub></p>
 
-This is a foundation for a coordinating Bot or a network of collaborating peers. Automatic host selection, cross-host scheduling and shared ticket tracking are future possibilities, not built-in capabilities today. **Agent Bus, groups and Chancellor ticket dispatch currently stay within one host**; cross-host work uses direct Bot messages.
+This is a foundation for a coordinating Bot or a network of collaborating peers. Automatic host selection, cross-host scheduling and shared ticket tracking are future possibilities, not built-in capabilities today. **Agent Bus, groups and Superagent ticket dispatch currently stay within one host**; cross-host work uses direct Bot messages.
 
 [Permissions and recovery](docs/client/cross-host-message-permissions.md) · [Network setup](docs/details.md#private-network) · [Commands and delivery guarantees](docs/details.md#bot-to-bot-tasks-across-hosts)
 
@@ -186,17 +187,17 @@ This is a foundation for a coordinating Bot or a network of collaborating peers.
 <p align="center"><sub>Desktop App · requires access and macOS permissions on the target Mac · real viewer with a simulated frame and connection in this recording · <a href="docs/client/remote-screen-2026-10-31.md">Controls and permissions</a></sub></p>
 
 <a id="chancellor"></a>
-<h3 align="center">Chancellor · One goal, tracked as tickets</h3>
-<p align="center">Choose Make it a Chancellor when creating a Bot, then describe the goal in its conversation.<br>It splits the work into tickets, runs each with an engine CLI on this host and reports back.</p>
+<h3 align="center">Superagent · One goal, tracked as tickets</h3>
+<p align="center">Choose Make it a Superagent when creating a Bot, then describe the goal in its conversation.<br>It splits the work into tickets, runs each with an engine CLI on this host and reports back.</p>
 
 <p align="center">
-  <a href="assets/product/chancellor-en.png"><img src="assets/product/chancellor-demo-en.gif" width="100%" alt="Chancellor demo: in the Chancellor's conversation, the ticket summary expands into three tickets: Review implementation (active), Summarize feedback (needs your review) and Write the launch brief (queued)"></a>
+  <a href="assets/product/chancellor-en.png"><img src="assets/product/chancellor-demo-en.gif" width="100%" alt="Superagent demo: in the Superagent's conversation, the ticket summary expands into three tickets: Review implementation (active), Summarize feedback (needs your review) and Write the launch brief (queued)"></a>
 </p>
-<p align="center"><sub>Actual UI with demonstration data; ticket states are illustrative and no model ran · <a href="docs/client/dispatcher-bot-2026-11-01.md">Chancellor guide</a></sub></p>
+<p align="center"><sub>Actual UI with demonstration data; ticket states are illustrative and no model ran · <a href="docs/client/dispatcher-bot-2026-11-01.md">Superagent guide</a></sub></p>
 
 - **Visible tickets.** See queued, active, waiting and ready-for-review tickets, and open any ticket's worker conversation.
 - **You set the pace.** Approve each plan or let it dispatch on its own; choose the allowed engines and how many tickets run at once. Pause, cancel or add context at any time.
-- **Pick the right tool.** A Chancellor plans and delegates; Agent Bus runs a workflow you define; ADHD keeps several conversations in view.
+- **Pick the right tool.** A Superagent plans and delegates; Agent Bus runs a workflow you define; ADHD keeps several conversations in view.
 
 See the complete [feature list](docs/details.md#features).
 
@@ -222,7 +223,7 @@ Right-click a folder name or an empty area of the desktop list to group by host,
 
 Install and sign in to any one engine on the computer that runs your Bots to get started; TaroBird does not include AI engines, model accounts or credits. See the [engine comparison](docs/details.md#engine-comparison) for adapter differences.
 
-**Pi, from 1.6.0:** [Pi native integration](docs/client/pi-engine.md) adds provider-aware model selection and native conversation controls for ordinary Bots. Pi is excluded from Chancellor dispatch.
+**Pi, from 1.6.0:** [Pi native integration](docs/client/pi-engine.md) adds provider-aware model selection and native conversation controls for ordinary Bots. Pi is excluded from Superagent dispatch.
 
 <a id="engines"></a>
 

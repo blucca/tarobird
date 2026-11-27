@@ -33,4 +33,13 @@ export function deploymentMatchesRoutes(deployment: Deployment | undefined, rout
   return deployment === "vps-direct" ? routes.some((r) => r.name !== "VPS") : deployment === "vps-relay" ? routes.length > 0 && routes.every((r) => r.name === "VPS") : true;
 }
 export type ConnectionVerificationFailure = "identity-mismatch" | "verification-unavailable" | "invalid-key";
-export type RouteHealth = { failure?: ConnectionVerificationFailure; url: string; status: "reachable" | "unreachable" | "wrong-hub" | "cooldown"; latency?: number };
+export type RouteTransportFailure =
+  | "local-network-denied"
+  | "client-offline"
+  | "timeout"
+  | "connection-refused"
+  | "host-unreachable"
+  | "dns-failed"
+  | "tls-untrusted"
+  | "unreachable";
+export type RouteHealth = { failure?: ConnectionVerificationFailure; reason?: RouteTransportFailure; url: string; status: "reachable" | "unreachable" | "wrong-hub" | "cooldown"; latency?: number };

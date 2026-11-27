@@ -321,6 +321,9 @@ type UnscopedEngineStreamEvent =
       type: "subagent_activity";
       id: string;
       kind: "started" | "interacted" | "interrupted" | "completed";
+      /** True when an "interrupted" receipt is already confirmed settled by the
+       * engine (no separate "completed" receipt follows). */
+      terminal?: boolean;
       agentId: string;
       label: string;
       model?: string;

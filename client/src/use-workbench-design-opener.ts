@@ -72,5 +72,9 @@ export function useWorkbenchDesignOpener(connection: HubConnection, conversation
     if (current.current.scope !== scope || current.current.connection !== connection) return existing;
     return owner.current?.context(existing) ?? existing;
   }, [scope, connection]);
-  return { context, revoke };
+  const contextSnapshot = useCallback((existing?: WorkbenchContext) => {
+    if (current.current.scope !== scope || current.current.connection !== connection) return existing;
+    return owner.current?.contextSnapshot(existing) ?? existing;
+  }, [scope, connection]);
+  return { context, contextSnapshot, revoke };
 }

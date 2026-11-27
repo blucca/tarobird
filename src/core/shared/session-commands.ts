@@ -213,6 +213,7 @@ interface LocalSessionCommandInput {
   startedAt: number;
   locale: Locale;
   cfg: SessionCommandConfig;
+  workspaceOverride?: string;
   normalized: CommandMessage;
   context: CoreTurnContext;
   sessionStore: SessionCommandStore;
@@ -249,6 +250,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
     startedAt,
     locale,
     cfg,
+    workspaceOverride,
     normalized,
     context,
     sessionStore,
@@ -394,7 +396,9 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         if (!validateCodexThread) {
           throw new Error("external session validation unsupported");
         }
-        validatedSession = await validateCodexThread(sessionId);
+        validatedSession = workspaceOverride
+          ? await validateCodexThread(sessionId, { workspaceOverride })
+          : await validateCodexThread(sessionId);
         const candidate = validatedSession?.cwd ?? selectedSession?.workspacePath;
         if (!candidate) {
           throw new Error(`${engineName} session workspace is unavailable`);
@@ -587,7 +591,11 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         if (!validateCodexThread) {
           throw new Error("codex thread validation unsupported");
         }
-        await validateCodexThread(resumeCmd.threadId);
+        if (workspaceOverride) {
+          await validateCodexThread(resumeCmd.threadId, { workspaceOverride });
+        } else {
+          await validateCodexThread(resumeCmd.threadId);
+        }
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         const isNotFound = /could not resume thread|thread not found|no rollout found/i.test(detail);

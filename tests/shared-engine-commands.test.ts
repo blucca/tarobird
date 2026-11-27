@@ -142,6 +142,7 @@ describe("handleLocalEngineTelegramCommand", () => {
     const order: string[] = [];
     const sessionStore = {
       removeByChatId: vi.fn().mockResolvedValue(true),
+      clearAll: vi.fn().mockResolvedValue(2),
       clearAllThen: vi.fn().mockImplementation(async (commit: () => Promise<unknown>) => {
         order.push("clear");
         await commit();
@@ -204,7 +205,8 @@ describe("handleLocalEngineTelegramCommand", () => {
     };
     const sessionStore = {
       removeByChatId: vi.fn().mockResolvedValue(true),
-      clearAllThen: vi.fn(async (commit: () => Promise<unknown>) => { await commit(); return 1; }),
+      clearAll: vi.fn().mockResolvedValue(1),
+      clearAllThen: vi.fn().mockImplementation(async (commit: () => Promise<unknown>) => { await commit(); return 1; }),
     };
     const updateInstanceConfig = vi.fn(async (mutate: (cfg: Record<string, unknown>) => void) => {
       const cfg: Record<string, unknown> = { engine: "codex", model: "gpt-5.4", codexServiceTier: "fast" };
@@ -253,6 +255,7 @@ describe("handleLocalEngineTelegramCommand", () => {
     };
     const sessionStore = {
       removeByChatId: vi.fn().mockResolvedValue(true),
+      clearAll: vi.fn().mockResolvedValue(0),
       clearAllThen: vi.fn().mockRejectedValue(new Error("session store unavailable")),
     };
     const updateInstanceConfig = vi.fn();

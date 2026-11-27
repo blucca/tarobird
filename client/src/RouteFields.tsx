@@ -1,7 +1,7 @@
 import { ArrowDown, ArrowUp, Plus, Trash2 } from "lucide-react";
 import { MAX_DIRECT_ROUTES, MAX_VPS_ROUTES, type Route, type RouteHealth, type Deployment } from "../../src/client-protocol/routes.js";
 import { t } from "./i18n.js";
-import { connectionVerificationLabel } from "./connection-verification.js";
+import { routeHealthStatusLabel } from "./route-diagnostics.js";
 
 export function routeTitle(route: Route, routes: readonly Route[], deployment?: Deployment): string {
   if (route.label) return route.label;
@@ -41,7 +41,7 @@ export function VpsRouteFields({ routes, change, current, health = [], disabled 
   const move = (index: number, offset: number) => { const next = [...routes]; [next[index], next[index + offset]] = [next[index + offset]!, next[index]!]; change(next); };
   return <fieldset className="vps-routes" disabled={disabled}><legend>{t("中转线路（可选）")}</legend><RelaySetupNote/>{routes.length > 0 && <p className="muted">{t("顺序仅用于整理列表；实际连接会比较线路的稳定性与响应速度。")}</p>}
     {routes.map((route, index) => { const status = health.find((h) => h.url === route.url), title = t("中转 {0}", index + 1); return <div className="vps-route" key={index}>
-      <header><strong>{title}</strong>{current === route.url ? <small className="online-label">{t("当前使用")}</small> : status && <small>{connectionVerificationLabel(status.failure) ?? (status.status === "reachable" ? t("可达 · 待连接验证") : status.status === "wrong-hub" ? t("主机身份不匹配") : status.status === "cooldown" ? t("连接失败，稍后重试") : t("暂不可用"))}</small>}
+      <header><strong>{title}</strong>{current === route.url ? <small className="online-label">{t("当前使用")}</small> : status && <small>{routeHealthStatusLabel(status).label}</small>}
       <div><button type="button" className="icon-button" disabled={index === 0} aria-label={t("上移中转 {0}", index + 1)} onClick={() => move(index, -1)}><ArrowUp size={16}/></button><button type="button" className="icon-button" disabled={index === routes.length - 1} aria-label={t("下移中转 {0}", index + 1)} onClick={() => move(index, 1)}><ArrowDown size={16}/></button><button type="button" className="icon-button" aria-label={t("移除中转 {0}", index + 1)} onClick={() => change(routes.filter((_, i) => i !== index))}><Trash2 size={16}/></button></div></header>
       <label>{t("名称（可选）")}<input aria-label={t("中转线路 {0} 名称", index + 1)} value={route.label ?? ""} maxLength={40} placeholder={title} onChange={(e) => update(index, { label: e.target.value || undefined })}/></label>
       <label>{index === 0 ? t("中转地址") : t("备用中转 {0} 地址", index)}<input type="url" inputMode="url" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={route.url} maxLength={2048} placeholder={index === 0 ? "https://primary.example.com" : "https://backup.example.com"} onChange={(e) => update(index, { url: e.target.value })}/></label>

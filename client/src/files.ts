@@ -4,6 +4,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { CHUNK_BYTES, MAX_FILE_BYTES } from "../../src/client-protocol/index.js";
 import type { HubConnection } from "./connection.js";
 import { HubHttpError, transientUploadError } from "./http-error.js";
+import { isRecordedVoiceFile } from "./voice-recording-marker.js";
 
 export type UploadSource = Pick<File, "name" | "size" | "type"> & { readChunk(start: number, end: number): Promise<Blob> };
 type UploadConnection = Pick<HubConnection, "state" | "subscribe" | "http" | "resume" | "isClosed" | "beginFileTransfer">;
@@ -47,7 +48,8 @@ export async function uploadFile(connection: UploadConnection, conversationId: s
     };
     const hash = sha256.create();
     for (let start = 0; start < file.size; start += CHUNK_BYTES) { checkUpload(connection, options.signal); hash.update(new Uint8Array(await (await read(start, start + CHUNK_BYTES)).arrayBuffer())); }
-    const metadata = JSON.stringify({ conversationId, name: file.name, mime: file.type.split(";")[0] || "application/octet-stream", size: file.size, sha256: bytesToHex(hash.digest()) });
+    const mime = (file.type.split(";")[0] || "application/octet-stream").trim();
+    const metadata = JSON.stringify({ conversationId, name: file.name, mime, size: file.size, sha256: bytesToHex(hash.digest()), ...(connection.state.audioRecordingMarkerAvailable && /^audio\//i.test(mime) ? { recording: isRecordedVoiceFile(file) } : {}) });
     let id: string | undefined, failedSince: number | undefined, confirmed = 0;
     for (;;) {
       checkUpload(connection, options.signal);

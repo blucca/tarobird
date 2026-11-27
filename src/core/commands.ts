@@ -37,6 +37,7 @@ import { FileWorkflowStore, type FileWorkflowStatus } from "../state/file-workfl
 import { SessionStore } from "../state/session-store.js";
 import { UsageStore } from "../state/usage-store.js";
 import { handleCronCommand, isCronCommand } from "./shared/cron-commands.js";
+import { parseAntigravityLocalCommand, renderAntigravityLocalCommandReply } from "./shared/antigravity-commands.js";
 import { handleLocalEngineCoreCommand } from "./shared/engine-commands.js";
 import {
   ANTIGRAVITY_EFFORT_LEVELS,
@@ -174,6 +175,16 @@ export async function handleCoreSimpleCommand(
 
   if (await handleCoreLocalEngineCommand(input, normalized, commandText, commandLocale)) {
     return true;
+  }
+
+  const agyLocalAction = parseAntigravityLocalCommand(commandText);
+  if (agyLocalAction) {
+    const cfg = await loadInstanceConfig(input.stateDir);
+    if (cfg.engine === "antigravity") {
+      const { commandLabel, markdown } = await renderAntigravityLocalCommandReply(agyLocalAction, commandLocale);
+      await sendCoreCommandMarkdown(input, normalized, commandLabel, markdown);
+      return true;
+    }
   }
 
   const goalCfg = /^\/goal(?:\s|$)/i.test(commandText.trim()) ? await loadInstanceConfig(input.stateDir) : undefined;
@@ -469,7 +480,7 @@ async function handleCoreLocalEngineCommand(
       role: cfg.role,
       model: cfg.model,
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
-      workspacePath: cfg.workspacePath,
+      workspacePath: input.workspaceOverride ?? normalized.workspaceOverride ?? cfg.workspacePath,
       resume: cfg.resume,
       ...(cfg.antigravityRuntime ? { antigravityRuntime: cfg.antigravityRuntime } : {}),
     },
@@ -505,6 +516,7 @@ async function handleCoreSessionCommand(
       cfg.resume,
     )
     : input.conversationResume ?? undefined;
+  const effectiveWorkspace = input.workspaceOverride ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
   return await handleLocalSessionCoreCommand({
     stateDir: input.stateDir,
     startedAt: Date.now(),
@@ -513,6 +525,7 @@ async function handleCoreSessionCommand(
       engine: cfg.engine,
       resume: cfg.resume,
     },
+    workspaceOverride: effectiveWorkspace,
     normalized: toSessionCommandMessage(normalized, commandText),
     context: {
       api: {
@@ -530,7 +543,7 @@ async function handleCoreSessionCommand(
     scanRecentSessions: input.runtime.sessionRuntime?.scanRecentSessions,
     scanRecentAntigravitySessions: input.runtime.sessionRuntime?.scanRecentAntigravitySessions,
     scanRecentKimiSessions: input.bridge.listExternalSessions
-      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+      ? async () => (await input.bridge.listExternalSessions!({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
           const modifiedAt = new Date(session.updatedAt ?? 0);
           return {
             sessionId: session.sessionId,
@@ -542,7 +555,7 @@ async function handleCoreSessionCommand(
         })
       : undefined,
     scanRecentDeepSeekSessions: input.bridge.listExternalSessions
-      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+      ? async () => (await input.bridge.listExternalSessions!({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
           const modifiedAt = new Date(session.updatedAt ?? 0);
           return {
             sessionId: session.sessionId,
@@ -554,7 +567,7 @@ async function handleCoreSessionCommand(
         })
       : undefined,
     scanRecentPiSessions: input.bridge.listExternalSessions
-      ? async () => (await input.bridge.listExternalSessions!({ limit: 20 })).map((session) => {
+      ? async () => (await input.bridge.listExternalSessions!({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
           const modifiedAt = new Date(session.updatedAt ?? 0);
           return {
             sessionId: session.sessionId,
@@ -1039,7 +1052,7 @@ function parseCoreGoalCommand(text: string, engine: InstanceEngine): CoreGoalCom
   if (!match) return null;
   const rest = match[1]?.trim() ?? "";
   if (!rest || /^status$/i.test(rest)) return { kind: "status" };
-  if (/^(clear|off|reset)$/i.test(rest) || (engine === "claude" && /^(stop|cancel|none)$/i.test(rest))) return { kind: "clear" };
+  if (/^(clear|off|reset)$/i.test(rest) || ((engine === "claude" || engine === "antigravity") && /^(stop|cancel|none)$/i.test(rest))) return { kind: "clear" };
   if (engine === "codex") {
     if (/^(pause|resume)$/i.test(rest)) return { kind: rest.toLowerCase() as "pause" | "resume" };
     if (/^(pause|resume)\s/i.test(rest)) return { kind: "invalid", reason: "invalid_control" };
@@ -2260,7 +2273,7 @@ async function handleCoreEngineCommand(
 
   const selectedEngine = engine as InstanceEngine;
   if (selectedEngine === "pi" && cfg.role === "dispatcher") {
-    return locale === "en" ? "Pi is available for ordinary Bots, not Chief of Staff Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
+    return locale === "en" ? "Pi is available for ordinary Bots, not Superagent Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
   }
   const engineChanged = cfg.engine !== selectedEngine;
   let resetSessionBindings = false;
@@ -2405,8 +2418,8 @@ function toNativeCoreGoalCommandText(
   commandText: string,
   engine: "claude" | "antigravity",
 ): string | null {
-  if (engine === "claude" && action.kind === "status") return "/goal";
-  if (engine === "claude" && action.kind === "clear") return "/goal clear";
+  if ((engine === "claude" || engine === "antigravity") && action.kind === "status") return "/goal";
+  if ((engine === "claude" || engine === "antigravity") && action.kind === "clear") return "/goal clear";
   if (action.kind !== "set") return commandText.trim();
   if (action.tokenBudget === null) {
     return `/goal ${action.objective}`;
@@ -2434,7 +2447,7 @@ export async function tryHandleCoreGoalControlBeforeQueue(input: CoreCommandInpu
     cfg.resume = warning ? undefined : resolveConversationResume(record, cfg.resume);
     if (!await current()) return false;
     const handled = await applyCoreGoalCommand({ ...input,
-      workspaceOverride: input.workspaceOverride ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
+      workspaceOverride: input.workspaceOverride ?? cfg.resume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
       isCurrentGoalSession: current,
     }, normalized, cfg, action, text, await resolveCoreLocale(input.stateDir));
     return handled ?? false;
@@ -2513,7 +2526,7 @@ async function applyCoreGoalCommand(
     userId: normalized.bridgeUserId,
     chatType: normalized.bridgeChatType,
     conversationKey: normalized.conversationKey,
-    workspaceOverride: input.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
+    workspaceOverride: input.workspaceOverride ?? cfg.resume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg),
     ...(input.isCurrentGoalSession ? { isCurrentSession: input.isCurrentGoalSession } : {}),
   };
   // activeRuns key for this conversation — shared by the live watcher (which claims

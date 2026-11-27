@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { addGlobalListener } from "./global-event-hub.js";
 import { Check, ChevronRight, ListOrdered, LoaderCircle, MessageSquare, MessagesSquare, Paperclip, Pause, Play, Settings2, Square } from "lucide-react";
 import { groupDiscussionActive, groupDiscussionViewSchema, groupDiscussionStepSchema, GROUP_DISCUSSION_TEXT_LIMIT, hasVisibleGroupText, type GroupDiscussionAction, type GroupDiscussionRun, type GroupDiscussionStep, type GroupDiscussionView } from "../../src/client-protocol/group-discussion.js";
 import type { Conversation } from "../../src/client-protocol/index.js";
@@ -135,8 +136,8 @@ export function GroupDiscussionBar({ connection, conversation, group, active, se
       if (lastReadRevision.current === connection.groupDiscussionRevision || eventTimer !== undefined) return;
       eventTimer = setTimeout(() => { eventTimer = undefined; if (timer) clearTimeout(timer); void read(); }, 300);
     });
-    void read(); document.addEventListener("visibilitychange", wake);
-    return () => { cancelled = true; if (timer) clearTimeout(timer); if (eventTimer) clearTimeout(eventTimer); unsubscribe(); document.removeEventListener("visibilitychange", wake); };
+    void read(); const stopVisibility = addGlobalListener(document, "visibilitychange", wake);
+    return () => { cancelled = true; if (timer) clearTimeout(timer); if (eventTimer) clearTimeout(eventTimer); unsubscribe(); stopVisibility(); };
   }, [active, online, state.groupDiscussionAvailable, refresh]);
   const editText = (value: string) => {
     setText(value);

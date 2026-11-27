@@ -415,7 +415,7 @@ export function applyEngineSelection(
   config: Record<string, unknown>,
   engine: InstanceEngine,
 ): { clearedModel: boolean; enabledFullAuto: boolean } {
-  if (engine === "pi" && config.role === "dispatcher") throw new Error("Pi is available for ordinary Bots, not Chief of Staff Bots.");
+  if (engine === "pi" && config.role === "dispatcher") throw new Error("Pi is available for ordinary Bots, not Superagent Bots.");
   const previousEngine =
     config.engine === "claude" || config.engine === "codex" || config.engine === "antigravity" || config.engine === "kimi" || config.engine === "deepseek" || config.engine === "pi"
       ? config.engine
